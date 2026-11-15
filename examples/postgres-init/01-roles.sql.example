@@ -1,0 +1,6 @@
+-- Copy to ~/.config/oc-sandbox/postgres-init/01-roles.sql (drop the ".example").
+-- Runs ONCE, when the oc-pg data volume is first created, as OC_PG_USER inside OC_PG_DB.
+-- Changing these files later makes the script ask you to discard the data (see README).
+
+-- Example: an unprivileged application role next to the owner/superuser from postgres.env.
+CREATE ROLE app_runtime WITH LOGIN PASSWORD 'change-me-too' NOSUPERUSER NOCREATEDB NOCREATEROLE;

@@ -1,0 +1,547 @@
+#!/usr/bin/env bash
+# oc-sandbox — idempotent setup + launch + teardown for a sandboxed OpenCode
+# (rootless Podman pod: OpenCode agent + Chromium on your Wayland desktop).
+set -euo pipefail
+# (harmless comment used to test recreate stability)
+
+SB="$HOME/opencode-sandbox"            # mounted at /sandbox in the agent
+PROJECT="$SB/construct"                # OpenCode's working directory
+# This script runs on the HOST (and asks for admin rights), so it must never live inside the directory
+# that is mounted into the agent container, or the agent could rewrite it.
+SCRIPT_REAL=$(readlink -f "$0"); SCRIPT_DIR=${SCRIPT_REAL%/*}
+case $SCRIPT_REAL in
+  "$(readlink -f "$SB")"/*)
+    echo "Refusing to run: $SCRIPT_REAL is inside the sandbox directory $SB," >&2
+    echo "which the agent can write to. Keep the checkout elsewhere (e.g. ~/code/opencode-sandbox)" >&2
+    echo "and symlink it into ~/.local/bin. See README.md." >&2
+    exit 1 ;;
+esac
+STATE="${XDG_DATA_HOME:-$HOME/.local/share}/oc-sandbox"
+BUILD="$STATE/build"
+BIN="$HOME/.local/bin"
+UNITS="$HOME/.config/systemd/user"
+POD=${OC_POD:-oc}
+AGENT_IMG=oc-agent
+CHROME_IMG=oc-chromium
+VOLS=(oc-home oc-chrome)
+PGVOL=oc-pg                            # Postgres data (created by -p, deleted by -d -a)
+CODE_BIN=${OC_CODE_BIN:-/home/linuxbrew/.linuxbrew/bin/code}   # host VS Code (override with OC_CODE_BIN)
+BC_BIN=${OC_BCOMPARE_BIN:-/usr/bin/bcompare}                         # host Beyond Compare (override with OC_BCOMPARE_BIN)
+FWD_ENV=(ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY GOOGLE_API_KEY)
+
+usage() {
+  cat <<EOF
+Usage: ${0##*/} [-r] [-n] [-p] [-K] | -x | -k | -d [-a] [-y] | -h
+
+  (no flags)  Ensure everything exists (images, volumes, host bridge, pod,
+              Chromium), then start OpenCode in $PROJECT.
+              Safe to run repeatedly; only missing/changed pieces are touched.
+              If OpenCode is already running it only completes the setup (like -n).
+  -n          Setup only: do not launch OpenCode.
+  -r          Rebuild images from latest bases and recreate the pod.
+  -d          Delete: remove the pod, host bridge service and handler script.
+              Keeps images, volumes and everything in $SB.
+  -d -a       Delete everything above plus images, volumes (OpenCode login,
+              Chromium profile, Postgres data), generated build files and $SB/.bridge.
+  -y          Skip the confirmation prompt for -d -a.
+  -p          Also run Postgres in the pod (data volume: $PGVOL, survives restarts and
+              -d; only -d -a deletes it). Combine freely: '${0##*/} -p' = Chromium +
+              Postgres + OpenCode; '-n -p' = same without launching OpenCode.
+              There are NO defaults: configure image/user/password/database first
+              (~/.config/oc-sandbox/postgres.env or OC_PG_* variables). See README.md.
+  -x          Open a zsh shell inside the OpenCode container that is already
+              running (from another terminal). Same files, env and vi bindings.
+  -k          List detected FIDO/U2F security keys (what would be passed to
+              Chromium) and exit.
+  -K          Do not pass any security key to Chromium on this run.
+  -h          This help.
+
+Never touched: $SB/construct and your other files in $SB.
+Inside OpenCode: 'code FILE' / 'bcompare A B' open on the host via a
+restricted bridge (files under $SB only).
+EOF
+}
+
+# ---- option parsing ---------------------------------------------------------
+DELETE=0 ALL=0 REBUILD=0 NOLAUNCH=0 YES=0 LISTKEYS=0 NOKEY=0 EXEC=0 PG=0
+while getopts ":hdarnykKxp" o; do
+  case $o in
+    h) usage; exit 0 ;;
+    d) DELETE=1 ;; a) ALL=1 ;; r) REBUILD=1 ;; n) NOLAUNCH=1 ;; y) YES=1 ;;
+    k) LISTKEYS=1 ;; K) NOKEY=1 ;; x) EXEC=1 ;; p) PG=1 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+if (( ALL && !DELETE )); then echo "-a only makes sense with -d" >&2; exit 2; fi
+
+# ---- run podman/systemctl on the host even when invoked from a distrobox ----
+if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null 2>&1; then
+  H=(distrobox-host-exec)
+else
+  H=()
+fi
+pm() { "${H[@]}" podman "$@"; }
+sc() { "${H[@]}" systemctl --user "$@"; }
+log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
+
+# FIDO/U2F security keys: hidraw nodes whose HID usage page is 0xF1D0 (never keyboards/mice).
+# Prints one line per key: /dev/hidrawN|Manufacturer Product|vid:pid
+detect_keys() {
+  "${H[@]}" sh -c 'for h in /sys/class/hidraw/hidraw*; do
+    [ -r "$h/device/report_descriptor" ] || continue
+    [ "$(head -c3 "$h/device/report_descriptor" | od -An -tx1 | tr -d " \n")" = 06d0f1 ] || continue
+    u=$(readlink -f "$h/device")/../..
+    printf "%s|%s %s|%s:%s\n" "/dev/${h##*/}" "$(cat "$u/manufacturer" 2>/dev/null)" \
+      "$(cat "$u/product" 2>/dev/null)" "$(cat "$u/idVendor" 2>/dev/null)" "$(cat "$u/idProduct" 2>/dev/null)"
+  done; true' 2>/dev/null || true
+}
+if (( EXEC )); then
+  if [[ $(pm container inspect --format '{{.State.Status}}' oc-agent 2>/dev/null || true) != running ]]; then
+    echo "OpenCode is not running. Start it first (oc-sandbox) in another terminal." >&2; exit 1
+  fi
+  exec "${H[@]}" podman exec -it -e SHELL=/bin/zsh -w /sandbox/construct oc-agent zsh
+fi
+if (( LISTKEYS )); then
+  keys=$(detect_keys)
+  if [[ -z $keys ]]; then echo "No FIDO/U2F security keys detected."; exit 0; fi
+  echo "Detected FIDO/U2F security keys (passed to Chromium unless -K):"
+  while IFS='|' read -r node name id; do printf '  %-14s %s [%s]\n' "$node" "$name" "$id"; done <<<"$keys"
+  exit 0
+fi
+
+# ---- Postgres settings: NO defaults; must be configured (see README.md) ---------------------------
+# Read from OC_PG_* env vars or ~/.config/oc-sandbox/postgres.env (KEY=VALUE lines; env wins).
+# That file lives OUTSIDE the sandbox, so the agent cannot change which image/credentials get used.
+#   OC_PG_IMAGE     image to run                       (required)
+#   OC_PG_USER      superuser created on first start   (required)
+#   OC_PG_PASSWORD  its password                       (required)
+#   OC_PG_DB        initial database                   (required)
+#   OC_PG_INIT_DIR  dir of *.sql/*.sh run once when the data volume is first created
+#                   (optional; default ~/.config/oc-sandbox/postgres-init if it exists)
+load_pg_config() {
+  local k v missing=()
+  PG_CONF=${OC_PG_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox/postgres.env}
+  if [[ -f $PG_CONF ]]; then
+    while IFS='=' read -r k v; do
+      [[ $k =~ ^OC_PG_[A-Z_]+$ && -z ${!k:-} ]] || continue
+      v=${v%$'\r'}; v=${v#[\"\']}; v=${v%[\"\']}
+      export "$k=$v"
+    done < "$PG_CONF"
+  fi
+  for k in OC_PG_IMAGE OC_PG_USER OC_PG_PASSWORD OC_PG_DB; do
+    [[ -n ${!k:-} ]] || missing+=("$k")
+  done
+  if (( ${#missing[@]} )); then
+    echo "Postgres is not configured (missing: ${missing[*]})." >&2
+    echo "There are deliberately no defaults. Create $PG_CONF" >&2
+    echo "or set those variables; see \"Postgres configuration\" in $SCRIPT_DIR/README.md" >&2
+    exit 1
+  fi
+  PG_IMAGE=$OC_PG_IMAGE PG_USER=$OC_PG_USER PG_PASSWORD=$OC_PG_PASSWORD PG_DB=$OC_PG_DB
+  PG_INIT=${OC_PG_INIT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox/postgres-init}
+}
+
+# ---- teardown -----------------------------------------------------------------
+if (( DELETE )); then
+  log "Removing pod '$POD'"
+  pm pod rm -f "$POD" >/dev/null 2>&1 || true
+  log "Removing host bridge"
+  sc disable --now oc-bridge.path >/dev/null 2>&1 || true
+  rm -f "$UNITS/oc-bridge.path" "$UNITS/oc-bridge.service" "$BIN/oc-bridge"
+  sc daemon-reload >/dev/null 2>&1 || true
+  if (( ALL )); then
+    if (( !YES )); then
+      read -r -p "Also delete volumes ${VOLS[*]} $PGVOL (OpenCode login, Chromium profile, Postgres data), images and build files? [y/N] " a
+      [[ $a == [yY]* ]] || { echo "Skipped -a part."; exit 0; }
+    fi
+    log "Removing images, volumes, build files"
+    pm rmi -f "$AGENT_IMG" "$CHROME_IMG" >/dev/null 2>&1 || true
+    pm volume rm -f "${VOLS[@]}" "$PGVOL" >/dev/null 2>&1 || true
+    log "Removing SELinux module oc_chromium (asks for your admin password)"
+    "${H[@]}" pkexec semodule -r oc_chromium >/dev/null 2>&1 || "${H[@]}" sudo semodule -r oc_chromium || true
+    rm -rf "$STATE" "$SB/.bridge"
+  fi
+  log "Done. $SB/construct left untouched."
+  exit 0
+fi
+
+if (( PG )); then load_pg_config; fi   # fail early, before building or starting anything
+
+# ---- preflight ----------------------------------------------------------------
+pm --version >/dev/null 2>&1 || { echo "podman not found" >&2; exit 1; }
+WL="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-wayland-0}"
+[[ -S $WL ]] || { echo "No Wayland socket at $WL (run from a KDE Wayland session)" >&2; exit 1; }
+"${H[@]}" test -x "$BC_BIN"   || echo "warning: $BC_BIN not found; 'bcompare' bridge will do nothing" >&2
+"${H[@]}" test -x "$CODE_BIN" || echo "warning: $CODE_BIN not found; 'code' bridge will do nothing" >&2
+
+# ---- directories / config -----------------------------------------------------
+mkdir -p "$PROJECT" "$SB/.bridge/requests" "$SB/.bridge/tmp" "$SB/.bridge/files" \
+         "$BUILD" "$BIN" "$UNITS"
+if [[ ! -e $PROJECT/opencode.json ]]; then
+  cat > "$PROJECT/opencode.json" <<'EOF'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "chrome-devtools": {
+      "type": "local",
+      "command": ["npx", "-y", "chrome-devtools-mcp@latest",
+                  "--browserUrl", "http://127.0.0.1:9222"]
+    }
+  }
+}
+EOF
+fi
+
+# ---- build context ------------------------------------------------------------
+cat > "$BUILD/Containerfile.agent" <<'EOF'
+FROM ghcr.io/anomalyco/opencode:latest
+RUN apk add --no-cache nodejs npm git zsh vim tmux jq curl less ripgrep fd ncurses \
+      build-base make perl xz python3 py3-pip postgresql17-client \
+      bash tar unzip
+COPY oh-my-zsh /opt/oh-my-zsh
+COPY zshrc /opt/zsh/.zshrc
+COPY gitconfig /etc/gitconfig
+COPY gitignore_global /etc/gitignore_global
+COPY bridge-open /usr/local/bin/bridge-open
+RUN chmod +x /usr/local/bin/bridge-open \
+ && ln -s bridge-open /usr/local/bin/code \
+ && ln -s bridge-open /usr/local/bin/bcompare
+# PATH: self-updating OpenCode lives in the oc-home volume (/root/.opencode) and wins over the baked copy.
+# TAR_OPTIONS: the updater untars as root without CHOWN (we drop all caps), so skip ownership restore.
+ENV OC_SANDBOX=1 ZDOTDIR=/opt/zsh LANG=en_US.UTF-8 TAR_OPTIONS=--no-same-owner \
+    PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EOF
+
+cat > "$BUILD/Containerfile.chromium" <<'EOF'
+FROM registry.fedoraproject.org/fedora:latest
+RUN dnf install -y chromium curl && dnf clean all
+# Hide the "unsupported command-line flag: --no-sandbox" bar (the container is the sandbox here).
+# This policy only affects that warning; it does not turn the Chromium sandbox back on.
+RUN mkdir -p /etc/chromium/policies/managed \
+ && printf '{"CommandLineFlagSecurityWarningsEnabled": false}\n' > /etc/chromium/policies/managed/oc.json
+EOF
+
+cat > "$BUILD/zshrc" <<'EOF'
+export ZSH=/opt/oh-my-zsh
+ZSH_THEME="robbyrussell"
+DISABLE_AUTO_UPDATE=true
+ZSH_DISABLE_COMPFIX=true
+plugins=(git zsh-vi-mode)        # system-clipboard omitted: no display in this container
+HISTFILE=/root/.zsh_history; HISTSIZE=10000; SAVEHIST=10000
+bindkey -v
+source $ZSH/oh-my-zsh.sh
+# make it obvious this is the sandbox, not your host or distrobox
+PROMPT="%B%F{red}[sandbox]%f%b $PROMPT"
+EOF
+
+cat > "$BUILD/bridge-open" <<'EOF'
+#!/bin/sh
+tool=$(basename "$0"); base=/sandbox/.bridge
+[ -d "$base/requests" ] || { echo "$tool: $base/requests missing (is /sandbox mounted?)" >&2; exit 1; }
+id=$(date +%s)-$$-$(od -An -N4 -tx1 /dev/urandom | tr -d ' ')
+tmp="$base/tmp/$id"; printf '%s\n' "$tool" > "$tmp"
+for a in "$@"; do
+  case "$a" in -*) continue;; esac
+  p=$(realpath "$a" 2>/dev/null) || continue
+  case "$p" in
+    /sandbox/*) ;;
+    *) mkdir -p "$base/files/$id"; cp -a "$p" "$base/files/$id/" 2>/dev/null || continue
+       p="$base/files/$id/$(basename "$p")";;
+  esac
+  printf '%s\n' "$p" >> "$tmp"
+done
+mv "$tmp" "$base/requests/$id.req"
+EOF
+
+# git identity/tools come from the host ~/.gitconfig; tools adapted for the bridge
+rm -f "$BUILD/gitconfig"
+g=(git config --file "$BUILD/gitconfig")
+if [[ -f $HOME/.gitconfig ]]; then
+  for k in user.name user.email; do
+    v=$(git config --file "$HOME/.gitconfig" --get "$k" || true)
+    [[ -n $v ]] && "${g[@]}" "$k" "$v"
+  done
+else
+  : > "$BUILD/gitconfig"
+fi
+"${g[@]}" core.autocrlf input
+"${g[@]}" core.editor vim                 # 'code --wait' cannot block through the bridge
+"${g[@]}" core.excludesfile /etc/gitignore_global
+"${g[@]}" init.defaultBranch main
+"${g[@]}" http.postBuffer 99999999
+"${g[@]}" diff.tool bc                    # difftool opens Beyond Compare on the host
+"${g[@]}" difftool.bc.path bcompare
+"${g[@]}" merge.tool vimdiff              # mergetool must block, so it stays in-container
+"${g[@]}" mergetool.keepBackup false
+if [[ -f $HOME/.gitignore_global ]]; then cp "$HOME/.gitignore_global" "$BUILD/gitignore_global"
+else : > "$BUILD/gitignore_global"; fi
+
+# oh-my-zsh: copy from the host if present (without .git), else clone
+if [[ ! -d $BUILD/oh-my-zsh ]]; then
+  log "Preparing oh-my-zsh"
+  if [[ -d $HOME/.oh-my-zsh ]]; then cp -a "$HOME/.oh-my-zsh" "$BUILD/oh-my-zsh"
+  else git clone -q --depth 1 https://github.com/ohmyzsh/ohmyzsh "$BUILD/oh-my-zsh"; fi
+  if [[ ! -d $BUILD/oh-my-zsh/custom/plugins/zsh-vi-mode ]]; then
+    git clone -q --depth 1 https://github.com/jeffreytse/zsh-vi-mode \
+      "$BUILD/oh-my-zsh/custom/plugins/zsh-vi-mode"
+  fi
+  find "$BUILD/oh-my-zsh" -name .git -prune -exec rm -rf {} +
+fi
+
+# ---- images (rebuilt only when inputs change, or with -r) -------------------------
+ensure_image() {  # name containerfile hash
+  local name=$1 file=$2 want=$3 have
+  have=$(pm image inspect --format '{{index .Labels "oc.hash"}}' "$name" 2>/dev/null || true)
+  if (( REBUILD )) || [[ $have != "$want" ]]; then
+    log "Building $name"
+    pm build "${PULL[@]}" --label "oc.hash=$want" -t "$name" \
+       -f "$BUILD/$file" "$BUILD"
+  else
+    echo "image $name up to date"
+  fi
+}
+agent_hash=$(cd "$BUILD" && cat Containerfile.agent zshrc gitconfig gitignore_global bridge-open | sha256sum | cut -d' ' -f1)
+chrome_hash=$(cd "$BUILD" && sha256sum Containerfile.chromium | cut -d' ' -f1)
+PULL=(); (( REBUILD )) && PULL=(--pull=always)
+ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"
+ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash"
+
+# ---- volumes --------------------------------------------------------------------
+for v in "${VOLS[@]}"; do
+  pm volume exists "$v" 2>/dev/null || pm volume create "$v" >/dev/null
+done
+
+# ---- OpenCode self-update: install once into the persistent volume so 'opencode upgrade' works ----
+# (the image's baked binary has no recognizable install method). PATH is trimmed so the
+# installer does not see the baked copy and skip itself.
+if ! pm run --rm --entrypoint sh --cap-drop=ALL --security-opt=no-new-privileges \
+       -v oc-home:/root:Z "$AGENT_IMG" \
+       -c 'test -x /root/.opencode/bin/opencode || { PATH=/usr/bin:/bin curl -fsSL https://opencode.ai/install | PATH=/usr/bin:/bin bash >/dev/null 2>&1; test -x /root/.opencode/bin/opencode; }'; then
+  echo "warning: could not install self-updating OpenCode (offline?); using the baked-in copy" >&2
+fi
+
+# ---- host bridge: validated 'code' / 'bcompare' requests from the sandbox ---------
+cat > "$BIN/oc-bridge" <<EOF
+#!/usr/bin/env bash
+set -u
+root=\$(realpath "$SB"); dir=\$root/.bridge/requests; n=0
+for f in "\$dir"/*.req; do
+  [ -f "\$f" ] && [ ! -L "\$f" ] || continue
+  (( ++n > 20 )) && break
+  mapfile -t lines < <(head -c 8192 "\$f")
+  tool=\${lines[0]:-}; args=()
+  for l in "\${lines[@]:1}"; do
+    [[ \$l == /sandbox/* ]] || continue
+    p=\$(realpath -e -- "\$root\${l#/sandbox}") || continue
+    [[ \$p == "\$root"/* ]] || continue
+    [[ \$tool == code && ! -f \$p ]] && continue      # code: files only, never folders
+    args+=("\$p")
+  done
+  (( \${#args[@]} )) || continue
+  case \$tool in
+    code)     systemd-run --user --quiet --collect -- "$CODE_BIN" -- "\${args[@]}" ;;
+    bcompare) systemd-run --user --quiet --collect -- "$BC_BIN" "\${args[@]}" ;;
+  esac
+done
+find "\$dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +   # always drain the queue
+EOF
+chmod +x "$BIN/oc-bridge"
+cat > "$UNITS/oc-bridge.service" <<'EOF'
+[Unit]
+Description=Restricted host bridge for the OpenCode sandbox
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/oc-bridge
+EOF
+cat > "$UNITS/oc-bridge.path" <<'EOF'
+[Unit]
+Description=Watch the OpenCode sandbox bridge queue
+[Path]
+DirectoryNotEmpty=%h/opencode-sandbox/.bridge/requests
+Unit=oc-bridge.service
+[Install]
+WantedBy=default.target
+EOF
+sc daemon-reload
+sc enable --now oc-bridge.path >/dev/null 2>&1 || sc start oc-bridge.path
+
+# ---- SELinux policy: dedicated type so ONLY the Chromium container may use the Wayland socket ----
+POLDIR="$STATE/policy"; TPL=/usr/share/udica/templates
+mkdir -p "$POLDIR"
+cat > "$POLDIR/oc_chromium.cil" <<'POL'
+; SELinux type for the sandboxed Chromium container only (oc_chromium.process).
+(block oc_chromium
+    (blockinherit container)
+    (blockinherit net_container)
+    (allow process process (capability (dac_override)))
+    ; use the host Wayland compositor socket (KWin runs unconfined_t)
+    (allow process unconfined_t (unix_stream_socket (connectto)))
+    (allow process unconfined_t (fd (use)))
+    (allow process user_tmp_t (sock_file (write getattr append open)))
+    ; shared-memory buffers passed over the Wayland socket
+    (allow process user_tmp_t (file (read write open getattr map)))
+    (allow process tmpfs_t (file (open map)))
+    (allow process proc_t (filesystem (associate)))
+    ; FIDO security key (hidraw node passed with --device) + udev database for device enumeration
+    (allow process usb_device_t (chr_file (read write open getattr ioctl)))
+    (allow process udev_var_run_t (dir (search open read getattr)))
+    (allow process udev_var_run_t (file (read open getattr)))
+)
+POL
+pol_hash=$(sha256sum "$POLDIR/oc_chromium.cil" | cut -c1-16)
+if [[ $(cat "$POLDIR/installed" 2>/dev/null || true) != "$pol_hash" ]]; then
+  log "Installing SELinux policy module oc_chromium (asks for your admin password)"
+  "${H[@]}" test -f "$TPL/base_container.cil" \
+    || { echo "udica templates missing ($TPL); install the 'udica' package" >&2; exit 1; }
+  if "${H[@]}" pkexec semodule -i "$POLDIR/oc_chromium.cil" "$TPL/base_container.cil" "$TPL/net_container.cil" \
+     || "${H[@]}" sudo semodule -i "$POLDIR/oc_chromium.cil" "$TPL/base_container.cil" "$TPL/net_container.cil"; then
+    echo "$pol_hash" > "$POLDIR/installed"
+  else
+    echo "Policy install failed; Chromium cannot reach the Wayland socket without it." >&2; exit 1
+  fi
+fi
+
+ensure_postgres() {
+  local pg_state pg_cfg want_cfg sig vsig init_hash="" ok=0
+  local pgargs=()
+  if [[ -d $PG_INIT ]] && [[ -n $(ls -A "$PG_INIT" 2>/dev/null) ]]; then
+    init_hash=$(cd "$PG_INIT" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+    pgargs+=(-v "$PG_INIT":/docker-entrypoint-initdb.d:ro,Z)
+  fi
+  # Postgres only reads user/password/db/init scripts when the data volume is first created, so the
+  # volume remembers the settings it was created with; a mismatch is refused instead of silently ignored.
+  sig=$(printf '%s|%s|%s|%s' "$PG_USER" "$PG_PASSWORD" "$PG_DB" "$init_hash" | sha256sum | cut -c1-16)
+  if pm volume exists "$PGVOL" 2>/dev/null; then
+    vsig=$(pm volume inspect "$PGVOL" --format '{{index .Labels "oc.pgcfg"}}' 2>/dev/null || true)
+    if [[ $vsig != "$sig" ]]; then
+      if [[ -z $vsig ]]; then
+        echo "Volume '$PGVOL' has no recorded Postgres settings (created by an older version)." >&2
+      else
+        echo "Postgres settings changed since volume '$PGVOL' was created (user/password/database/init scripts)." >&2
+      fi
+      echo "Postgres ignores those settings on an existing volume. To apply them, discard the data first:" >&2
+      echo "    ${0##*/} -d && podman volume rm $PGVOL     # then rerun with -p" >&2
+      exit 1
+    fi
+  else
+    pm volume create --label "oc.pgcfg=$sig" "$PGVOL" >/dev/null
+  fi
+
+  want_cfg="v2:$sig:$PG_IMAGE"
+  pg_state=$(pm container inspect --format '{{.State.Status}}' oc-postgres 2>/dev/null || echo none)
+  pg_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.pg"}}' oc-postgres 2>/dev/null || true)
+  if [[ $pg_state != none && $pg_cfg != "$want_cfg" ]]; then
+    log "Postgres container settings changed; recreating it (data volume $PGVOL is kept)"
+    pm rm -f oc-postgres >/dev/null; pg_state=none
+  fi
+  case $pg_state in
+    running) echo "Postgres already running." ;;
+    none)
+      log "Creating Postgres in pod '$POD' (image $PG_IMAGE, volume $PGVOL)"
+      pm run -d --name oc-postgres --pod "$POD" --label "oc.pg=$want_cfg" --security-opt=no-new-privileges \
+        --cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID \
+        --cap-add=FOWNER --cap-add=DAC_OVERRIDE \
+        --pids-limit=256 --memory=2g \
+        -v "$PGVOL":/var/lib/postgresql/data:Z "${pgargs[@]}" \
+        -e POSTGRES_USER="$PG_USER" -e POSTGRES_PASSWORD="$PG_PASSWORD" -e POSTGRES_DB="$PG_DB" \
+        "$PG_IMAGE" -c listen_addresses=127.0.0.1 >/dev/null ;;
+    *) log "Starting existing Postgres container (data kept in volume $PGVOL)"
+       pm start oc-postgres >/dev/null ;;
+  esac
+  for _ in $(seq 1 60); do
+    pm exec oc-postgres pg_isready -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" -q 2>/dev/null && { ok=1; break; }
+    sleep 1
+  done
+  (( ok )) || { echo "Postgres did not become ready:" >&2; pm logs --tail 15 oc-postgres >&2; exit 1; }
+  echo "Postgres ready (inside the pod only, not reachable from host or LAN)."
+  echo "  PGPASSWORD=$PG_PASSWORD psql -h 127.0.0.1 -U $PG_USER -d $PG_DB"
+  echo "  DATABASE_URL=postgres://$PG_USER:$PG_PASSWORD@127.0.0.1:5432/$PG_DB"
+}
+
+# ---- pod + Chromium ----------------------------------------------------------------
+(( REBUILD )) && pm pod rm -f "$POD" >/dev/null 2>&1 || true
+pm pod exists "$POD" 2>/dev/null || { log "Creating pod '$POD'"; pm pod create --name "$POD" >/dev/null; }
+
+want_id=$(pm image inspect --format '{{.Id}}' "$CHROME_IMG")
+have_id=$(pm container inspect --format '{{.Image}}' oc-chromium 2>/dev/null || true)
+have_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.cfg"}}' oc-chromium 2>/dev/null || true)
+# Security keys: pass ONLY FIDO hidraw nodes (see detect_keys); -K disables.
+keys=""
+if (( NOKEY )); then echo "Security keys: disabled (-K)"; else keys=$(detect_keys); fi
+fido_nodes=$(printf '%s\n' "$keys" | cut -d'|' -f1 | grep . || true)
+devargs=()
+for n in $fido_nodes; do devargs+=(--device "$n"); done
+(( ${#devargs[@]} )) && devargs+=(-v /run/udev:/run/udev:ro)   # Chromium enumerates HID via udev
+while IFS='|' read -r node name id; do
+  [[ -n $node ]] && echo "Security key: $name [$id] -> $node"
+done <<<"$keys"
+(( NOKEY )) || [[ -n $keys ]] || echo "Security key: none detected (plug one in and rerun to use it)"
+# recreate the container only if its run command, policy, or security-key set changed
+cfg=$( { sed -n '/^# >>>chromium-run/,/^# <<<chromium-run/p' "$0"; echo "$fido_nodes"; cat "$POLDIR/oc_chromium.cil"; } | sha256sum | cut -c1-16)
+if [[ -n $have_id && ( $have_id != "$want_id" || $have_cfg != "$cfg" ) ]]; then
+  log "Chromium image/config changed; recreating container"
+  pm rm -f oc-chromium >/dev/null
+  have_id=
+fi
+if [[ -z $have_id ]]; then
+  # A crash/reboot leaves SingletonLock naming the old pod's hostname; Chromium then refuses the profile.
+  # No Chromium container exists at this point, so clearing the locks is safe.
+  pm run --rm --entrypoint sh --cap-drop=ALL --cap-add=DAC_OVERRIDE -v oc-chrome:/profile:Z "$CHROME_IMG" \
+     -c 'rm -f /profile/SingletonLock /profile/SingletonCookie /profile/SingletonSocket' >/dev/null 2>&1 || true
+  log "Starting Chromium"
+  # DAC_OVERRIDE: Chromium's crashpad handler aborts without it under --cap-drop=ALL.
+  # label type oc_chromium.process: custom SELinux type (see policy dir) that may use the Wayland socket.
+# >>>chromium-run
+  pm run -d --name oc-chromium --pod "$POD" --label "oc.cfg=$cfg" \
+    --cap-drop=ALL --cap-add=DAC_OVERRIDE --security-opt=no-new-privileges \
+    --security-opt label=type:oc_chromium.process \
+    --pids-limit=1024 --memory=4g --shm-size=1g \
+    -v oc-chrome:/profile:Z \
+    "${devargs[@]}" \
+    -v "$WL":/run/xdg/wayland-1 \
+    -e XDG_RUNTIME_DIR=/run/xdg -e WAYLAND_DISPLAY=wayland-1 \
+    "$CHROME_IMG" \
+    chromium-browser --ozone-platform=wayland --no-sandbox --disable-gpu \
+      --no-first-run --no-default-browser-check \
+      --user-data-dir=/profile --remote-debugging-port=9222 >/dev/null
+# <<<chromium-run
+elif [[ $(pm container inspect --format '{{.State.Status}}' oc-chromium) != running ]]; then
+  log "Starting existing Chromium container"
+  pm start oc-chromium >/dev/null
+fi
+
+log "Waiting for Chromium DevTools (127.0.0.1:9222 inside the pod)"
+ok=0
+for _ in $(seq 1 30); do
+  if pm exec oc-chromium curl -sf http://127.0.0.1:9222/json/version >/dev/null 2>&1; then ok=1; break; fi
+  sleep 1
+done
+if (( !ok )); then
+  echo "Chromium did not come up. Last log lines:" >&2
+  pm logs --tail 20 oc-chromium >&2 || true
+  echo "If you see Wayland/permission errors, check: sudo ausearch -m avc -ts recent" >&2
+  exit 1
+fi
+echo "Chromium ready."
+if (( PG )); then ensure_postgres; fi
+
+(( NOLAUNCH )) && { log "Setup complete (-n: not launching OpenCode)."; exit 0; }
+
+# ---- launch OpenCode ------------------------------------------------------------------
+if [[ $(pm container inspect --format '{{.State.Status}}' oc-agent 2>/dev/null || true) == running ]]; then
+  log "OpenCode is already running in another terminal; setup is up to date (acting like -n)."
+  echo "Open a shell in it with:  ${0##*/} -x"
+  exit 0
+fi
+pm rm -f oc-agent >/dev/null 2>&1 || true
+envargs=()
+for v in "${FWD_ENV[@]}"; do [[ -n ${!v:-} ]] && envargs+=(-e "$v"); done
+log "Launching OpenCode in /sandbox/construct"
+exec "${H[@]}" podman run -it --rm --name oc-agent --pod "$POD" \
+  --cap-drop=ALL --security-opt=no-new-privileges \
+  --pids-limit=512 --memory=4g \
+  -v "$SB":/sandbox:Z \
+  -v oc-home:/root:Z \
+  -w /sandbox/construct \
+  "${envargs[@]}" \
+  "$AGENT_IMG"
