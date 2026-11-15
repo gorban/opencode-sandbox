@@ -92,7 +92,7 @@ it) or export them as environment variables (environment wins over the file):
 # ~/.config/oc-sandbox/postgres.env
 OC_PG_IMAGE=docker.io/library/postgres:17   # any Postgres image that honors the standard POSTGRES_* variables
 OC_PG_USER=app_owner                        # superuser created on first start
-OC_PG_PASSWORD=change-me                    # throwaway; the agent can read everything in this database
+OC_PG_PASSWORD=change-me                    # throwaway; see "Postgres authentication" in the security model
 OC_PG_DB=app_dev                            # initial database
 ```
 
@@ -113,7 +113,12 @@ A ready-to-copy version is in [`examples/postgres.env.example`](examples/postgre
   Postgres will still refuse to open an old data directory).
 - Data persists across restarts and `oc-sandbox -d`; only `oc-sandbox -d -a` deletes it.
 - It listens on `127.0.0.1` inside the pod only. Connect from OpenCode or `oc-sandbox -x`:
-  `PGPASSWORD=… psql -h 127.0.0.1 -U <user> -d <db>`. The script prints the exact lines when it is ready.
+  `psql -h 127.0.0.1 -U <user> -d <db>`. **No password is needed.** The settings file is read by the
+  host script, not by `psql` (nothing from it is passed into the agent), and the standard Postgres images
+  use `trust` authentication for `127.0.0.1`, which is exactly how the agent reaches it. The configured
+  password only applies to non-local connections, and there are none. An image that enforces passwords
+  on localhost will ask for one (set `PGPASSWORD`, or use `DATABASE_URL`). The script prints the exact
+  lines when it is ready.
 - The Postgres client (`psql`) is included in the agent image.
 - The container runs with only the extra capabilities the standard image's entrypoint needs
   (`CHOWN SETUID SETGID FOWNER DAC_OVERRIDE`).
@@ -138,6 +143,10 @@ host or LAN. What is **not** a hard boundary, so you know what you are trusting:
   No other container gets these rules. `oc-sandbox -d -a` removes it.
 - **Network:** outbound is open, including your LAN. Services on the host's `127.0.0.1` are unreachable
   from the sandbox, but services bound to `0.0.0.0` are reachable via `host.containers.internal`.
+- **Postgres authentication:** inside the pod, connections to `127.0.0.1` need no password (see above), so
+  the agent, and Chromium, and any page that can make it run commands, can connect as any role, including
+  the superuser. The password protects nothing against them. Treat everything in this database as readable
+  and writable by the agent, and never load real data into it.
 - **Self-updating OpenCode** downloads from the internet at runtime into the `oc-home` volume, which the
   agent can write to. A compromised session could replace the binary and it would persist until you reset
   the volume (`oc-sandbox -d -a`).

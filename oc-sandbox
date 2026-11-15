@@ -454,7 +454,7 @@ ensure_postgres() {
   done
   (( ok )) || { echo "Postgres did not become ready:" >&2; pm logs --tail 15 oc-postgres >&2; exit 1; }
   echo "Postgres ready (inside the pod only, not reachable from host or LAN)."
-  echo "  PGPASSWORD=$PG_PASSWORD psql -h 127.0.0.1 -U $PG_USER -d $PG_DB"
+  echo "  psql -h 127.0.0.1 -U $PG_USER -d $PG_DB     # no password needed on localhost with the standard images"
   echo "  DATABASE_URL=postgres://$PG_USER:$PG_PASSWORD@127.0.0.1:5432/$PG_DB"
 }
 
