@@ -180,3 +180,7 @@ Your files in `~/opencode-sandbox/construct` are never touched.
 - **"profile in use" after a crash:** handled automatically; stale lock files are cleared when the
   Chromium container is recreated.
 - **Restarting from scratch:** `oc-sandbox -d -a -y && oc-sandbox -p`.
+
+## License
+
+BSD 2-Clause. See [LICENSE](LICENSE).
