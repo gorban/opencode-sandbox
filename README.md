@@ -97,6 +97,9 @@ OC_PG_DB=app_dev                            # initial database
 ```
 
 A ready-to-copy version is in [`examples/postgres.env.example`](examples/postgres.env.example).
+Lines are `KEY=VALUE` (an `export ` prefix and spaces around `=` are fine). An unquoted value ends at
+whitespace followed by `#`, so inline comments work. Quote a value (`"..."` or `'...'`) to take it
+literally, for example a password containing ` #`.
 
 **Optional first-start SQL.** Files in `~/.config/oc-sandbox/postgres-init/` (or the directory in
 `OC_PG_INIT_DIR`) run once, when the data volume is first created, as the standard
@@ -154,7 +157,15 @@ host or LAN. What is **not** a hard boundary, so you know what you are trusting:
   (`~/.local/bin/oc-bridge`, outside the sandbox) accepts only the tools `code` and `bcompare`, maps paths
   under `/sandbox` to `~/opencode-sandbox`, resolves symlinks and rejects anything outside, opens only
   **files** (never folders) in VS Code, and caps the work per run. It never runs a shell command taken from
-  a request.
+  a request. Because the agent can write anywhere in `~/opencode-sandbox`, the handler never follows a path
+  through it: if `.bridge` or `.bridge/requests` has been replaced by a symlink it removes the link and
+  does nothing else (and `oc-sandbox` refuses to run until you have looked at it). One race remains: a path
+  is checked and then handed to VS Code, so the agent can swap a directory on that path for a symlink in
+  between. The worst case is that VS Code opens a host file or folder that the agent chose. The agent
+  never receives the contents, and VS Code's Workspace Trust still applies to folders, so do not mark
+  `~/opencode-sandbox` (or a parent of it) as trusted.
+- **Bridge copies:** `code`/`bcompare` on a path outside `/sandbox` copies it into `.bridge/files/` first
+  (the host can only see the sandbox directory). Copies older than 7 days are removed automatically.
 - **Secrets:** only these variables are forwarded into the agent if set: `ANTHROPIC_API_KEY`,
   `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`. Use scoped keys with spend
   limits. The script, Postgres config, and credentials live outside the mounted directory.
