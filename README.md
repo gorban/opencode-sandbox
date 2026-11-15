@@ -33,7 +33,8 @@ oc-sandbox -p        # Chromium + Postgres + OpenCode, from scratch or already r
 - **Security keys:** FIDO/U2F keys (YubiKey etc.) are passed through to Chromium, and only the FIDO
   interface of each key. Never keyboards or mice.
 - **Host bridge:** inside the sandbox, `code FILE` and `bcompare A B` open the files on your host.
-  A host-side service validates every request (see the security model).
+  The host tools get a copy in a host-owned staging directory; saving writes your edit back into the
+  sandbox (see [host bridge](#host-bridge) and the security model).
 - **Shell:** `oc-sandbox -x` opens zsh (oh-my-zsh, vi mode, your git identity) in the running agent,
   with a red `[sandbox]` prompt marker and `OC_SANDBOX=1` set.
 
@@ -43,6 +44,7 @@ oc-sandbox -p        # Chromium + Postgres + OpenCode, from scratch or already r
   installed), and a **Wayland** session (socket at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`).
 - `udica` (its templates in `/usr/share/udica/templates`) and `pkexec` or `sudo`, used once to install
   the SELinux module `oc_chromium`.
+- `python3` >= 3.11 on the host, for the bridge handler.
 - Optional: VS Code at `/home/linuxbrew/.linuxbrew/bin/code` and Beyond Compare at `/usr/bin/bcompare`
   (override with the environment variables `OC_CODE_BIN` and `OC_BCOMPARE_BIN`; the script only warns
   if they are missing).
@@ -90,13 +92,16 @@ it) or export them as environment variables (environment wins over the file):
 
 ```ini
 # ~/.config/oc-sandbox/postgres.env
-OC_PG_IMAGE=docker.io/library/postgres:17   # any Postgres image that honors the standard POSTGRES_* variables
+OC_PG_IMAGE=docker.io/library/postgres:17   # any image that honors POSTGRES_USER/_DB and POSTGRES_PASSWORD_FILE
 OC_PG_USER=app_owner                        # superuser created on first start
 OC_PG_PASSWORD=change-me                    # throwaway; see "Postgres authentication" in the security model
 OC_PG_DB=app_dev                            # initial database
 ```
 
 A ready-to-copy version is in [`examples/postgres.env.example`](examples/postgres.env.example).
+Lines are `KEY=VALUE` (an `export ` prefix and spaces around `=` are fine). An unquoted value ends at
+whitespace followed by `#`, so inline comments work. Quote a value (`"..."` or `'...'`) to take it
+literally, for example a password containing ` #`.
 
 **Optional first-start SQL.** Files in `~/.config/oc-sandbox/postgres-init/` (or the directory in
 `OC_PG_INIT_DIR`) run once, when the data volume is first created, as the standard
@@ -117,11 +122,33 @@ A ready-to-copy version is in [`examples/postgres.env.example`](examples/postgre
   host script, not by `psql` (nothing from it is passed into the agent), and the standard Postgres images
   use `trust` authentication for `127.0.0.1`, which is exactly how the agent reaches it. The configured
   password only applies to non-local connections, and there are none. An image that enforces passwords
-  on localhost will ask for one (set `PGPASSWORD`, or use `DATABASE_URL`). The script prints the exact
-  lines when it is ready.
+  on localhost will ask for one (set `PGPASSWORD` yourself). The script prints the connection lines
+  when it is ready; they never contain the password.
+- **How the password is handled:** it is read into an unexported shell variable (values that came from
+  the environment are un-exported too), sent over stdin into the Podman secret `oc-pg-password`, and
+  mounted into the container as `POSTGRES_PASSWORD_FILE`. It never appears in a command line, in the
+  container's environment or `podman inspect`, or in the output. The settings record on the volume is a
+  hash keyed with a random file (`~/.local/share/oc-sandbox/pg-sig.key`, mode 0600), so it cannot be
+  used to guess the password offline. Volumes made by older versions carry an unkeyed hash; they keep
+  working, with a notice to recreate them.
 - The Postgres client (`psql`) is included in the agent image.
 - The container runs with only the extra capabilities the standard image's entrypoint needs
   (`CHOWN SETUID SETGID FOWNER DAC_OVERRIDE`).
+
+## Host bridge
+
+Inside the sandbox, `code FILE...` opens files in your host VS Code and `bcompare A B` opens Beyond
+Compare (files or folders). The host tools work on a **copy**:
+
+- Saving in VS Code / Beyond Compare writes the file back into the sandbox within about a second.
+- Changes the agent makes while the file is open are not shown in the editor. If the agent changed the
+  file in the meantime, your save goes to `FILE.host-edit` next to it instead of overwriting the agent's
+  version.
+- `code` waits for you to close the tab (`--wait`); the copy is deleted then. Folders opened in Beyond
+  Compare are read-only snapshots (only regular files; symlinks are skipped). Limits: 64 MiB per file,
+  5000 files / 512 MiB per folder snapshot.
+- Symlinks inside the sandbox are not followed by the host; `code` resolves them inside the sandbox
+  first, so links that stay inside the sandbox still work.
 
 ## Security model
 
@@ -150,11 +177,30 @@ host or LAN. What is **not** a hard boundary, so you know what you are trusting:
 - **Self-updating OpenCode** downloads from the internet at runtime into the `oc-home` volume, which the
   agent can write to. A compromised session could replace the binary and it would persist until you reset
   the volume (`oc-sandbox -d -a`).
-- **Host bridge:** requests are text files in `~/opencode-sandbox/.bridge/requests/`. The host handler
-  (`~/.local/bin/oc-bridge`, outside the sandbox) accepts only the tools `code` and `bcompare`, maps paths
-  under `/sandbox` to `~/opencode-sandbox`, resolves symlinks and rejects anything outside, opens only
-  **files** (never folders) in VS Code, and caps the work per run. It never runs a shell command taken from
-  a request.
+- **Everything in `~/opencode-sandbox` is hostile input for host code**: the agent can replace any file
+  or directory there with a symlink at any moment, including between a check and a use. So:
+  - `oc-sandbox` never creates or writes anything inside it from the host. `construct/`, `.bridge/` and
+    `construct/opencode.json` are made by a throwaway container that sees only that directory, so a
+    symlink resolves inside the container and cannot point a write at the host.
+  - The bridge handler (`~/.local/bin/oc-bridge`, Python, outside the sandbox) never resolves a sandbox
+    path by name. See below.
+- **Host bridge:** requests are text files in `~/opencode-sandbox/.bridge/requests/`. The handler accepts
+  only `code` (files) and `bcompare` (files or folders), at most 20 requests per run and 8 paths each. It
+  never runs a command taken from a request, and never hands a path inside the sandbox to VS Code or
+  Beyond Compare. Instead it:
+  - opens every path component with `openat(O_NOFOLLOW)` relative to its parent's descriptor, starting at
+    `~/opencode-sandbox`, so a symlink anywhere on the path is refused instead of followed, and a directory
+    renamed after it was opened stays inside the sandbox;
+  - opens files `O_NONBLOCK` and checks the open descriptor with `fstat`, so FIFOs and devices are refused;
+  - copies the content into `~/.local/share/oc-sandbox/bridge-stage/` (host-owned, 0700, not mounted) and
+    opens that copy;
+  - writes saved edits back by creating a new file `O_EXCL|O_NOFOLLOW` in the pinned parent directory and
+    renaming it over the target, which replaces a directory entry and never follows one. If the file was
+    changed or replaced in the sandbox since it was opened, the edit is saved as `NAME.host-edit` instead;
+  - pins `.bridge/requests` the same way before reading or draining it; a symlink there is removed (only
+    the link) and nothing else happens.
+- **Bridge copies:** `code`/`bcompare` on a path outside `/sandbox` copies it into `.bridge/files/` first
+  (the host can only see the sandbox directory). Copies older than 7 days are removed automatically.
 - **Secrets:** only these variables are forwarded into the agent if set: `ANTHROPIC_API_KEY`,
   `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`. Use scoped keys with spend
   limits. The script, Postgres config, and credentials live outside the mounted directory.
@@ -163,9 +209,9 @@ host or LAN. What is **not** a hard boundary, so you know what you are trusting:
 
 | Where | What |
 |---|---|
-| Podman | pod `oc`; containers `oc-chromium`, `oc-postgres`, `oc-agent`; images `oc-agent`, `oc-chromium`; volumes `oc-home`, `oc-chrome`, `oc-pg` |
+| Podman | pod `oc`; containers `oc-chromium`, `oc-postgres`, `oc-agent`; images `oc-agent`, `oc-chromium`; volumes `oc-home`, `oc-chrome`, `oc-pg`; secret `oc-pg-password` |
 | `~/opencode-sandbox/` | your workspace (`construct/`), plus `.bridge/` (request spool) |
-| `~/.local/share/oc-sandbox/` | generated build files and the SELinux policy |
+| `~/.local/share/oc-sandbox/` | generated build files, the SELinux policy, `pg-sig.key`, and `bridge-stage/` (copies open in VS Code / Beyond Compare) |
 | `~/.local/bin/oc-bridge` and `~/.config/systemd/user/oc-bridge.{path,service}` | the host-side bridge |
 | SELinux | module `oc_chromium` |
 | `~/.config/oc-sandbox/` | **yours**: `postgres.env`, `postgres-init/` (never created or deleted by the script) |
@@ -179,6 +225,13 @@ rm -rf ~/code/opencode-sandbox # the checkout
 ```
 
 Your files in `~/opencode-sandbox/construct` are never touched.
+
+## Tests
+
+`tests/security.sh` runs adversarial regression tests for the host-side code in a temporary directory
+(symlinked and concurrently swapped directories, FIFO requests, `postgres.env` parsing, and password
+exposure in output, argv and child environments). The container test needs Podman and the `oc-agent`
+image; `OC_TEST_NO_PODMAN=1` skips it.
 
 ## Troubleshooting
 

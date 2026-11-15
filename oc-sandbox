@@ -2,7 +2,6 @@
 # oc-sandbox — idempotent setup + launch + teardown for a sandboxed OpenCode
 # (rootless Podman pod: OpenCode agent + Chromium on your Wayland desktop).
 set -euo pipefail
-# (harmless comment used to test recreate stability)
 
 SB="$HOME/opencode-sandbox"            # mounted at /sandbox in the agent
 PROJECT="$SB/construct"                # OpenCode's working directory
@@ -25,6 +24,7 @@ AGENT_IMG=oc-agent
 CHROME_IMG=oc-chromium
 VOLS=(oc-home oc-chrome)
 PGVOL=oc-pg                            # Postgres data (created by -p, deleted by -d -a)
+PGSECRET=oc-pg-password                # Podman secret holding the Postgres password (deleted by -d -a)
 CODE_BIN=${OC_CODE_BIN:-/home/linuxbrew/.linuxbrew/bin/code}   # host VS Code (override with OC_CODE_BIN)
 BC_BIN=${OC_BCOMPARE_BIN:-/usr/bin/bcompare}                         # host Beyond Compare (override with OC_BCOMPARE_BIN)
 FWD_ENV=(ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY GOOGLE_API_KEY)
@@ -119,15 +119,29 @@ fi
 #   OC_PG_INIT_DIR  dir of *.sql/*.sh run once when the data volume is first created
 #                   (optional; default ~/.config/oc-sandbox/postgres-init if it exists)
 load_pg_config() {
-  local k v missing=()
+  local k v line missing=()
   PG_CONF=${OC_PG_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox/postgres.env}
   if [[ -f $PG_CONF ]]; then
-    while IFS='=' read -r k v; do
-      [[ $k =~ ^OC_PG_[A-Z_]+$ && -z ${!k:-} ]] || continue
-      v=${v%$'\r'}; v=${v#[\"\']}; v=${v%[\"\']}
-      export "$k=$v"
+    # KEY=VALUE lines (optional 'export ', spaces around '=' allowed). A quoted value is taken
+    # literally; an unquoted one ends at whitespace followed by '#' (an inline comment).
+    while IFS= read -r line || [[ -n $line ]]; do
+      line=${line%$'\r'}
+      [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?(OC_PG_[A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+      k=${BASH_REMATCH[2]} v=${BASH_REMATCH[3]}
+      [[ -z ${!k:-} ]] || continue                     # environment wins over the file
+      if [[ $v =~ ^\"([^\"]*)\"[[:space:]]*(#.*)?$ || $v =~ ^\'([^\']*)\'[[:space:]]*(#.*)?$ ]]; then
+        v=${BASH_REMATCH[1]}
+      else
+        v=${v%%[[:space:]]#*}
+        v=${v%"${v##*[![:space:]]}"}                   # trailing whitespace
+      fi
+      printf -v "$k" '%s' "$v"                         # a plain shell variable, NOT exported
     done < "$PG_CONF"
   fi
+  # Values that came from the environment are un-exported too, so no child process (podman,
+  # distrobox-host-exec, the agent) inherits the password. It reaches Postgres only as a secret.
+  # shellcheck disable=SC2163  # un-exporting the variable NAMED by $k is the point
+  for k in "${!OC_PG_@}"; do export -n "$k"; done
   for k in OC_PG_IMAGE OC_PG_USER OC_PG_PASSWORD OC_PG_DB; do
     [[ -n ${!k:-} ]] || missing+=("$k")
   done
@@ -157,8 +171,11 @@ if (( DELETE )); then
     log "Removing images, volumes, build files"
     pm rmi -f "$AGENT_IMG" "$CHROME_IMG" >/dev/null 2>&1 || true
     pm volume rm -f "${VOLS[@]}" "$PGVOL" >/dev/null 2>&1 || true
+    pm secret rm "$PGSECRET" >/dev/null 2>&1 || true
     log "Removing SELinux module oc_chromium (asks for your admin password)"
     "${H[@]}" pkexec semodule -r oc_chromium >/dev/null 2>&1 || "${H[@]}" sudo semodule -r oc_chromium || true
+    # Safe on the host: the pod (and with it the agent) is gone, so nothing can change $SB/.bridge
+    # concurrently, and GNU rm -r never follows symlinks (it unlinks them).
     rm -rf "$STATE" "$SB/.bridge"
   fi
   log "Done. $SB/construct left untouched."
@@ -175,10 +192,16 @@ WL="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-wayland-0}"
 "${H[@]}" test -x "$CODE_BIN" || echo "warning: $CODE_BIN not found; 'code' bridge will do nothing" >&2
 
 # ---- directories / config -----------------------------------------------------
-mkdir -p "$PROJECT" "$SB/.bridge/requests" "$SB/.bridge/tmp" "$SB/.bridge/files" \
-         "$BUILD" "$BIN" "$UNITS"
-if [[ ! -e $PROJECT/opencode.json ]]; then
-  cat > "$PROJECT/opencode.json" <<'EOF'
+# Host-owned directories only. Nothing inside $SB is created from the host: see init_sandbox_tree.
+mkdir -p "$SB" "$BUILD" "$BIN" "$UNITS"
+
+# The agent can replace anything inside $SB (e.g. construct/ or .bridge/ with a symlink to a host
+# directory) at any moment, so the host never creates or writes paths in it. A throwaway container
+# that sees ONLY $SB (at /sandbox) does it instead: a symlink there resolves inside that container's
+# own filesystem, so whatever it points to, no write can reach the host outside $SB, and no
+# check-then-use race exists to win. label=disable avoids relabelling $SB while the agent may run;
+# the container has no capabilities, no network, and runs nothing but this fixed command.
+OPENCODE_JSON=$(cat <<'EOF'
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
@@ -190,7 +213,15 @@ if [[ ! -e $PROJECT/opencode.json ]]; then
   }
 }
 EOF
-fi
+)
+init_sandbox_tree() {
+  pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
+    --security-opt=label=disable -v "$SB":/sandbox --entrypoint sh "$AGENT_IMG" -c '
+      set -e; cd /sandbox
+      mkdir -p construct .bridge/requests .bridge/tmp .bridge/files
+      if [ -e construct/opencode.json ] || [ -L construct/opencode.json ]; then exit 0; fi
+      cat > construct/opencode.json' <<<"$OPENCODE_JSON"
+}
 
 # ---- build context ------------------------------------------------------------
 cat > "$BUILD/Containerfile.agent" <<'EOF'
@@ -238,6 +269,8 @@ cat > "$BUILD/bridge-open" <<'EOF'
 #!/bin/sh
 tool=$(basename "$0"); base=/sandbox/.bridge
 [ -d "$base/requests" ] || { echo "$tool: $base/requests missing (is /sandbox mounted?)" >&2; exit 1; }
+# copies of files from outside /sandbox (made below) are dropped after 7 days
+find "$base/files" -mindepth 1 -maxdepth 1 -mtime +6 -exec rm -rf {} + 2>/dev/null
 id=$(date +%s)-$$-$(od -An -N4 -tx1 /dev/urandom | tr -d ' ')
 tmp="$base/tmp/$id"; printf '%s\n' "$tool" > "$tmp"
 for a in "$@"; do
@@ -305,6 +338,7 @@ chrome_hash=$(cd "$BUILD" && sha256sum Containerfile.chromium | cut -d' ' -f1)
 PULL=(); (( REBUILD )) && PULL=(--pull=always)
 ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"
 ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash"
+init_sandbox_tree || { echo "could not create $PROJECT and $SB/.bridge (see above)" >&2; exit 1; }
 
 # ---- volumes --------------------------------------------------------------------
 for v in "${VOLS[@]}"; do
@@ -321,38 +355,21 @@ if ! pm run --rm --entrypoint sh --cap-drop=ALL --security-opt=no-new-privileges
 fi
 
 # ---- host bridge: validated 'code' / 'bcompare' requests from the sandbox ---------
-cat > "$BIN/oc-bridge" <<EOF
-#!/usr/bin/env bash
-set -u
-root=\$(realpath "$SB"); dir=\$root/.bridge/requests; n=0
-for f in "\$dir"/*.req; do
-  [ -f "\$f" ] && [ ! -L "\$f" ] || continue
-  (( ++n > 20 )) && break
-  mapfile -t lines < <(head -c 8192 "\$f")
-  tool=\${lines[0]:-}; args=()
-  for l in "\${lines[@]:1}"; do
-    [[ \$l == /sandbox/* ]] || continue
-    p=\$(realpath -e -- "\$root\${l#/sandbox}") || continue
-    [[ \$p == "\$root"/* ]] || continue
-    [[ \$tool == code && ! -f \$p ]] && continue      # code: files only, never folders
-    args+=("\$p")
-  done
-  (( \${#args[@]} )) || continue
-  case \$tool in
-    code)     systemd-run --user --quiet --collect -- "$CODE_BIN" -- "\${args[@]}" ;;
-    bcompare) systemd-run --user --quiet --collect -- "$BC_BIN" "\${args[@]}" ;;
-  esac
-done
-find "\$dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +   # always drain the queue
-EOF
-chmod +x "$BIN/oc-bridge"
-cat > "$UNITS/oc-bridge.service" <<'EOF'
-[Unit]
-Description=Restricted host bridge for the OpenCode sandbox
-[Service]
-Type=oneshot
-ExecStart=%h/.local/bin/oc-bridge
-EOF
+# oc-bridge.py (next to this script, outside the sandbox) never resolves a path through the
+# agent-writable tree by name and never hands one to VS Code / Beyond Compare: it copies the requested
+# files with descriptor-relative no-follow opens into a host-owned staging directory, opens the copy,
+# and writes saved edits back the same way. See the header of oc-bridge.py.
+[[ -f $SCRIPT_DIR/oc-bridge.py ]] || { echo "missing $SCRIPT_DIR/oc-bridge.py (incomplete checkout?)" >&2; exit 1; }
+"${H[@]}" python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
+  || echo "warning: the host bridge needs python3 >= 3.11 on the host; 'code'/'bcompare' will do nothing" >&2
+install -m 0755 "$SCRIPT_DIR/oc-bridge.py" "$BIN/oc-bridge"
+unit_env() { local v=${2//%/%%}; v=${v//\\/\\\\}; printf 'Environment="%s=%s"\n' "$1" "${v//\"/\\\"}"; }
+{
+  printf '[Unit]\nDescription=Restricted host bridge for the OpenCode sandbox\n[Service]\nType=oneshot\n'
+  unit_env OC_SB "$SB"; unit_env OC_BRIDGE_STAGE "$STATE/bridge-stage"
+  unit_env OC_CODE_BIN "$CODE_BIN"; unit_env OC_BCOMPARE_BIN "$BC_BIN"
+  printf 'ExecStart=%%h/.local/bin/oc-bridge\n'
+} > "$UNITS/oc-bridge.service"
 cat > "$UNITS/oc-bridge.path" <<'EOF'
 [Unit]
 Description=Watch the OpenCode sandbox bridge queue
@@ -401,23 +418,39 @@ if [[ $(cat "$POLDIR/installed" 2>/dev/null || true) != "$pol_hash" ]]; then
   fi
 fi
 
+# Keyed hash of the settings Postgres only reads when its volume is created. The key (random, mode
+# 0600, outside the sandbox) keeps the volume label from being an offline guessable hash of the password.
+pg_sig() {
+  local key=$STATE/pg-sig.key
+  if [[ ! -s $key ]]; then
+    (umask 077; mkdir -p "$STATE"; od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$key")
+  fi
+  { cat "$key"; printf '|%s|%s|%s|%s' "$PG_USER" "$PG_PASSWORD" "$PG_DB" "$1"; } | sha256sum | cut -c1-16
+}
+
 ensure_postgres() {
-  local pg_state pg_cfg want_cfg sig vsig init_hash="" ok=0
+  local pg_state pg_cfg want_cfg sig legacy vsig init_hash="" ok=0
   local pgargs=()
   if [[ -d $PG_INIT ]] && [[ -n $(ls -A "$PG_INIT" 2>/dev/null) ]]; then
     init_hash=$(cd "$PG_INIT" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
-    pgargs+=(-v "$PG_INIT":/docker-entrypoint-initdb.d:ro,Z)
+    pgargs+=(-v "$PG_INIT:/docker-entrypoint-initdb.d:ro,Z")
   fi
   # Postgres only reads user/password/db/init scripts when the data volume is first created, so the
   # volume remembers the settings it was created with; a mismatch is refused instead of silently ignored.
-  sig=$(printf '%s|%s|%s|%s' "$PG_USER" "$PG_PASSWORD" "$PG_DB" "$init_hash" | sha256sum | cut -c1-16)
+  sig=k1:$(pg_sig "$init_hash")
   if pm volume exists "$PGVOL" 2>/dev/null; then
     vsig=$(pm volume inspect "$PGVOL" --format '{{index .Labels "oc.pgcfg"}}' 2>/dev/null || true)
-    if [[ $vsig != "$sig" ]]; then
+    # volumes made by earlier versions carry an unkeyed hash: still accepted, with a notice
+    legacy=$(printf '%s|%s|%s|%s' "$PG_USER" "$PG_PASSWORD" "$PG_DB" "$init_hash" | sha256sum | cut -c1-16)
+    if [[ $vsig == "$legacy" ]]; then
+      echo "note: volume '$PGVOL' (made by an older oc-sandbox) is labelled with an unkeyed hash of the" >&2
+      echo "      Postgres settings; recreate it when convenient: ${0##*/} -d && podman volume rm $PGVOL" >&2
+    elif [[ $vsig != "$sig" ]]; then
       if [[ -z $vsig ]]; then
         echo "Volume '$PGVOL' has no recorded Postgres settings (created by an older version)." >&2
       else
-        echo "Postgres settings changed since volume '$PGVOL' was created (user/password/database/init scripts)." >&2
+        echo "Postgres settings changed since volume '$PGVOL' was created (user/password/database/init scripts)," >&2
+        echo "or $STATE/pg-sig.key was deleted." >&2
       fi
       echo "Postgres ignores those settings on an existing volume. To apply them, discard the data first:" >&2
       echo "    ${0##*/} -d && podman volume rm $PGVOL     # then rerun with -p" >&2
@@ -438,12 +471,17 @@ ensure_postgres() {
     running) echo "Postgres already running." ;;
     none)
       log "Creating Postgres in pod '$POD' (image $PG_IMAGE, volume $PGVOL)"
+      # The password goes over stdin into a Podman secret and is mounted as a file: it never appears
+      # in any argv, in the container's environment, or in 'podman inspect'.
+      printf '%s' "$PG_PASSWORD" | pm secret create --replace "$PGSECRET" - >/dev/null
       pm run -d --name oc-postgres --pod "$POD" --label "oc.pg=$want_cfg" --security-opt=no-new-privileges \
         --cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID \
         --cap-add=FOWNER --cap-add=DAC_OVERRIDE \
         --pids-limit=256 --memory=2g \
         -v "$PGVOL":/var/lib/postgresql/data:Z "${pgargs[@]}" \
-        -e POSTGRES_USER="$PG_USER" -e POSTGRES_PASSWORD="$PG_PASSWORD" -e POSTGRES_DB="$PG_DB" \
+        --secret "$PGSECRET",type=mount,target=/run/secrets/postgres-password \
+        -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password \
+        -e POSTGRES_USER="$PG_USER" -e POSTGRES_DB="$PG_DB" \
         "$PG_IMAGE" -c listen_addresses=127.0.0.1 >/dev/null ;;
     *) log "Starting existing Postgres container (data kept in volume $PGVOL)"
        pm start oc-postgres >/dev/null ;;
@@ -455,7 +493,16 @@ ensure_postgres() {
   (( ok )) || { echo "Postgres did not become ready:" >&2; pm logs --tail 15 oc-postgres >&2; exit 1; }
   echo "Postgres ready (inside the pod only, not reachable from host or LAN)."
   echo "  psql -h 127.0.0.1 -U $PG_USER -d $PG_DB     # no password needed on localhost with the standard images"
-  echo "  DATABASE_URL=postgres://$PG_USER:$PG_PASSWORD@127.0.0.1:5432/$PG_DB"
+  echo "  DATABASE_URL=postgres://$(urlenc "$PG_USER")@127.0.0.1:5432/$(urlenc "$PG_DB")"
+}
+
+urlenc() {  # percent-encode for a URL component (byte-wise, so UTF-8 comes out right)
+  local LC_ALL=C s=$1 out='' c i
+  for (( i = 0; i < ${#s}; i++ )); do
+    c=${s:i:1}
+    case $c in [A-Za-z0-9._~-]) out+=$c ;; *) printf -v c '%%%02X' "'$c"; out+=$c ;; esac
+  done
+  printf '%s' "$out"
 }
 
 # ---- pod + Chromium ----------------------------------------------------------------
@@ -477,7 +524,7 @@ while IFS='|' read -r node name id; do
 done <<<"$keys"
 (( NOKEY )) || [[ -n $keys ]] || echo "Security key: none detected (plug one in and rerun to use it)"
 # recreate the container only if its run command, policy, or security-key set changed
-cfg=$( { sed -n '/^# >>>chromium-run/,/^# <<<chromium-run/p' "$0"; echo "$fido_nodes"; cat "$POLDIR/oc_chromium.cil"; } | sha256sum | cut -c1-16)
+cfg=$( { sed -n '/^# >>>chromium-run/,/^# <<<chromium-run/p' "$SCRIPT_REAL"; echo "$fido_nodes"; cat "$POLDIR/oc_chromium.cil"; } | sha256sum | cut -c1-16)
 if [[ -n $have_id && ( $have_id != "$want_id" || $have_cfg != "$cfg" ) ]]; then
   log "Chromium image/config changed; recreating container"
   pm rm -f oc-chromium >/dev/null
