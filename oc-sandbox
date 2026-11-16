@@ -21,6 +21,11 @@ BIN="$HOME/.local/bin"
 UNITS="$HOME/.config/systemd/user"
 AGENT_IMG=oc-agent
 CHROME_IMG=oc-chromium
+# Images this script built, by full ID (one per line). Only those are ever removed by it: the tag
+# names could belong to anything else, and labels prove nothing (any image built FROM oc-agent
+# inherits them). The role label is informational only.
+IMAGE_LOG="$STATE/built-images"
+OWNER_LABEL=io.github.gorban.opencode-sandbox.image
 DIND_IMG=${OC_DIND_IMAGE:-quay.io/podman/stable:latest}
 HOMEVOL=oc-home                        # OpenCode login, sessions, self-updated binary: shared by all instances
 CODE_BIN=${OC_CODE_BIN:-/home/linuxbrew/.linuxbrew/bin/code}   # host VS Code (override with OC_CODE_BIN)
@@ -74,6 +79,48 @@ Inside OpenCode: 'code FILE' / 'bcompare A B' open copies on the host via a rest
 EOF
 }
 die() { echo "${0##*/}: $*" >&2; exit 2; }
+
+# Host-trusted locations must lie outside $SB, which every agent can write: the state directory holds
+# the image ledger (proof that an image may be deleted), the signature key, the SELinux level and
+# build files; the config directory the Postgres password; plus the bridge binary and systemd units.
+# Checking only the final resolved path is not enough: a path through an agent-owned symlink
+# (XDG_DATA_HOME=$SB/xdg -> /elsewhere) resolves outside, and the agent swaps the link afterwards. So
+# trusted_path walks the path like the kernel does, one component at a time, following every symlink,
+# and fails if ANY step (including each symlink target on the way) is inside $SB. Only components
+# outside $SB, which the agent cannot change, remain; the walked physical path is used from then on.
+# The locations must not contain $SB either (-d -a deletes $STATE). Done before anything is touched.
+sb_real=$(realpath -m -- "$SB")
+in_sb() { [[ $1/ == "$sb_real"/* ]]; }
+trusted_path() {  # absolute path -> its physical path on stdout; 1 if the walk enters $SB
+  local cur="" comp next t n=0 todo=() tc=()
+  [[ $1 == /* ]] || return 1
+  IFS=/ read -ra todo <<<"$1"
+  while (( ${#todo[@]} )); do
+    comp=${todo[0]}; todo=("${todo[@]:1}")
+    case $comp in ""|.) continue ;; ..) cur=${cur%/*}; continue ;; esac
+    next=$cur/$comp
+    in_sb "$next" && return 1
+    if [[ -L $next ]]; then
+      (( ++n <= 40 )) || return 1
+      t=$(readlink -- "$next") || return 1
+      tc=(); IFS=/ read -ra tc <<<"$t"
+      [[ $t == /* ]] && cur=""
+      todo=(${tc[@]+"${tc[@]}"} ${todo[@]+"${todo[@]}"})
+    else cur=$next; fi
+  done
+  printf '%s\n' "${cur:-/}"
+}
+trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
+  local r
+  r=$(trusted_path "$2") || die "refusing to use $2: the path leads into the sandbox directory $SB, which the agent controls (check XDG_DATA_HOME / XDG_CONFIG_HOME and symlinks)"
+  [[ $sb_real/ != "$r"/* ]] || die "refusing to use $2: the sandbox directory $SB is inside it ($r)"
+  printf -v "$1" '%s' "$r"
+}
+trusted_dir STATE "$STATE"
+trusted_dir CONF_DIR "${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox"
+trusted_dir BIN "$BIN"
+trusted_dir UNITS "$UNITS"
+BUILD="$STATE/build" IMAGE_LOG="$STATE/built-images"
 
 # ---- option parsing ---------------------------------------------------------
 DELETE=0 ALL=0 REBUILD=0 NOLAUNCH=0 YES=0 LISTKEYS=0 NOKEY=0 EXEC=0 PG=0 DIND=0 LIST=0
@@ -135,6 +182,37 @@ else
 fi
 pm() { "${H[@]}" podman "$@"; }
 sc() { "${H[@]}" systemctl --user "$@"; }
+# The ledger is only replaced atomically (rename), so a plain read always sees a whole version.
+# Every change (append, rewrite) holds an exclusive flock: parallel instances share the ledger.
+owned_image() { [[ $1 =~ ^[0-9a-f]{64}$ && -f $IMAGE_LOG ]] && grep -qxF "$1" "$IMAGE_LOG"; }
+ledger_locked() {  # command...: run it holding the ledger lock
+  local fd rc=0
+  exec {fd}>>"$IMAGE_LOG.lock"
+  flock "$fd" || { exec {fd}>&-; return 1; }
+  "$@" || rc=$?
+  exec {fd}>&-
+  return $rc
+}
+_ledger_add() { printf '%s\n' "$1" >> "$IMAGE_LOG"; }
+record_image() { [[ $1 =~ ^[0-9a-f]{64}$ ]] && ledger_locked _ledger_add "$1"; }
+_prune() {
+  [[ -f $IMAGE_LOG ]] || return 0
+  local id tags keep=() tmp
+  while read -r id; do
+    [[ $id =~ ^[0-9a-f]{64}$ ]] || continue
+    tags=$(pm image inspect --format '{{len .RepoTags}}' "$id" 2>/dev/null) || continue   # gone
+    # Still tagged (current, or retagged by you) or used by a container (rmi without -f refuses): kept.
+    if [[ $tags == 0 ]] && pm rmi "$id" >/dev/null 2>&1; then continue; fi
+    keep+=("$id")
+  done < <(sort -u "$IMAGE_LOG")
+  tmp=$(mktemp "$IMAGE_LOG.XXXXXX") || return 1
+  if printf '%s\n' ${keep[@]+"${keep[@]}"} > "$tmp" && mv -f "$tmp" "$IMAGE_LOG"; then return 0; fi
+  rm -f "$tmp"; return 1
+}
+prune_images() {  # remove our recorded builds that are now untagged and unused; forget vanished ones
+  [[ -f $IMAGE_LOG ]] || return 0
+  ledger_locked _prune || echo "warning: could not update $IMAGE_LOG" >&2
+}
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 cstate() { pm container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo none; }
 
@@ -223,7 +301,7 @@ fi
 #   OC_PG_INIT_DIR  dir of *.sql/*.sh run once when the data volume is first created
 #                   (optional; default ~/.config/oc-sandbox/postgres-init if it exists)
 load_pg_config() {
-  local k v line missing=() cdir=${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox
+  local k v line missing=() cdir=$CONF_DIR
   PG_CONF=$cdir/postgres.env
   [[ -n $INST && -f $cdir/postgres.$INST.env ]] && PG_CONF=$cdir/postgres.$INST.env
   PG_CONF=${OC_PG_CONF:-$PG_CONF}
@@ -286,7 +364,14 @@ if (( DELETE )); then
       echo "Skipped -a part."; exit 0
     fi
     log "Removing images, volumes, secrets, build files"
-    pm rmi -f "$AGENT_IMG" "$CHROME_IMG" >/dev/null 2>&1 || true
+    # Only images this script built: drop our tag from them (not other tags you gave them), then
+    # remove every recorded build that is untagged and unused. Never -f, never by tag alone.
+    for img in "$AGENT_IMG" "$CHROME_IMG"; do
+      id=$(pm image inspect --format '{{.Id}}' "$img" 2>/dev/null || true)
+      if owned_image "$id"; then pm untag "$id" "localhost/$img:latest" >/dev/null 2>&1 || true
+      elif [[ -n $id ]]; then echo "note: kept image '$img' (${id:0:12}): not built by this oc-sandbox installation" >&2; fi
+    done
+    prune_images
     mapfile -t vols < <({ pm volume ls -q --filter label=oc.sandbox=1; printf '%s\n' "$HOMEVOL" oc-chrome oc-pg; } | sort -u)
     for v in "${vols[@]}"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
     # No matching secret (never used -p) is normal; failing to list them only warns, so the rest of
@@ -491,13 +576,24 @@ if [[ ! -d $BUILD/oh-my-zsh ]]; then
 fi
 
 # ---- images (rebuilt only when inputs change, or with -r) -------------------------
-ensure_image() {  # name containerfile hash
-  local name=$1 file=$2 want=$3 have
-  have=$(pm image inspect --format '{{index .Labels "oc.hash"}}' "$name" 2>/dev/null || true)
-  if (( REBUILD )) || [[ $have != "$want" ]]; then
+ensure_image() {  # name containerfile hash role(agent|chromium)
+  local name=$1 file=$2 want=$3 role=$4 cur="" id="" hash="" new
+  cur=$(pm image inspect --format '{{.Id}} {{index .Labels "oc.hash"}}' "$name" 2>/dev/null || true)
+  read -r id hash <<<"$cur" || true
+  if (( REBUILD )) || [[ $hash != "$want" ]] || ! owned_image "$id"; then
     log "Building $name"
-    pm build "${PULL[@]}" --label "oc.hash=$want" -t "$name" \
+    pm build "${PULL[@]}" --label "$OWNER_LABEL=$role" --label "oc.hash=$want" -t "$name" \
        -f "$BUILD/$file" "$BUILD"
+    new=$(pm image inspect --format '{{.Id}}' "$name")
+    # The build moved the tag to the new image and left the previous one untagged. prune_images
+    # removes it if this script built it; anything else that had the tag is only untagged, never removed.
+    if [[ -n $id && $id != "$new" ]] && ! owned_image "$id"; then
+      echo "note: image '$name' (${id:0:12}) was not built by this oc-sandbox installation (another tool's" \
+           "image, or from an older version); the build untagged it but kept it. Remove it yourself if you" \
+           "do not need it: podman rmi ${id:0:12}" >&2
+    fi
+    record_image "$new"
+    prune_images   # a previous build still used by a container (e.g. a running agent) stays for later
   else
     echo "image $name up to date"
   fi
@@ -505,8 +601,8 @@ ensure_image() {  # name containerfile hash
 agent_hash=$(cd "$BUILD" && cat Containerfile.agent zshrc gitconfig gitignore_global bridge-open opencode-sandbox.json | sha256sum | cut -d' ' -f1)
 chrome_hash=$(cd "$BUILD" && sha256sum Containerfile.chromium | cut -d' ' -f1)
 PULL=(); (( REBUILD )) && PULL=(--pull=always)
-ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"
-ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash"
+ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"  agent
+ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash" chromium
 
 ensure_volume() { pm volume exists "$1" 2>/dev/null \
   || pm volume create --label oc.sandbox=1 --label "oc.instance=$2" "$1" >/dev/null; }
@@ -821,6 +917,9 @@ echo "Chromium ready."
 if (( PG )); then ensure_postgres; fi
 if (( DIND )); then ensure_dind; fi
 for p in "${PORTS[@]}"; do echo "Port: http://127.0.0.1:${p%%:*} on the host -> 127.0.0.1:${p#*:} in pod '$POD'"; done
+# Earlier builds that could not be removed while a container still ran them (e.g. Chromium before
+# its recreation above).
+prune_images
 
 (( NOLAUNCH )) && { log "Setup complete for instance '$ILABEL' (-n: not launching OpenCode)."; exit 0; }
 

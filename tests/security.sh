@@ -216,6 +216,9 @@ echo "\${0##*/} \$*" >> "$T/stub.log"
 case "\$1 \$2" in
   "pod ls") printf 'oc\noc-other\n' ;;
   "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
+  "image inspect")  # STUB_IDS="name=id ...": the image each tag points to; images have no tags left
+    case "\$*" in *RepoTags*) echo 0; exit 0 ;; esac
+    for m in \${STUB_IDS:-}; do [ "\${m%%=*}" = "\$5" ] && { echo "\${m#*=}"; exit 0; }; done; exit 125 ;;
 esac
 exit 0
 EOF
@@ -254,6 +257,50 @@ check "refuses setup flags with -d"        argfail "only apply when setting up" 
 check "refuses stray arguments"            argfail "unexpected argument" -i ok extra
 check "refuses empty -i (no global -d)"    argfail "-i needs an instance name" -i "" -d -a -y
 
+echo "host state outside the sandbox (stubbed)"
+# The agent controls everything under $SB; host state (the image ledger above all) must not be there.
+pathrun() {  # VAR=value... -- script-args...: stderr+rc of a stubbed run with these variables
+  local envs=() rc=0 out
+  while [[ $1 != -- ]]; do envs+=("$1"); shift; done; shift
+  : > "$T/stub.log"
+  out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "${envs[@]}" \
+        "$SCRIPT" "$@" 2>&1 </dev/null) || rc=$?
+  printf '%s\nrc=%s\n' "$out" "$rc"
+}
+DSB=$T/dhome/opencode-sandbox; mkdir -p "$DSB/st/oc-sandbox" "$T/outer/oc-sandbox/h"
+A=$(printf 'a%.0s' {1..64})
+printf '%s\n' "$A" > "$DSB/st/oc-sandbox/built-images"                 # forged by the agent
+echo "$SECRET" > "$T/victim-file"; ln -s "$T/victim-file" "$DSB/st/oc-sandbox/built-images.new"
+ln -sfn "$DSB" "$T/dlink"
+out=$(pathrun XDG_DATA_HOME="$DSB/st" STUB_IDS="oc-agent=$A" -- -d -a -y)
+check "state dir inside the sandbox: refused"         grep -qx 'rc=2' <<<"$out"
+check "...before any podman call (forged ledger unused)" [ ! -s "$T/stub.log" ]
+check "...planted ledger symlink target untouched"   grep -qx "$SECRET" "$T/victim-file"
+check "state dir reaching the sandbox via a symlink: refused" grep -q 'leads into the sandbox directory' \
+  <<<"$(pathrun XDG_DATA_HOME="$T/dlink/st" -- -l)"
+check "config dir inside the sandbox: refused"        grep -q 'leads into the sandbox directory' \
+  <<<"$(pathrun XDG_CONFIG_HOME="$DSB/cfg" -- -l)"
+# Reverse: an agent-owned symlink that points OUT of the sandbox when checked (and can be swapped
+# later); a host symlink into the sandbox that hops back out; a '..' walk through the sandbox.
+mkdir -p "$T/outside" "$T/outside2"; ln -sfn "$T/outside" "$DSB/xdg"; ln -sfn "$T/outside2" "$DSB/hop"
+ln -sfn "$DSB/hop" "$T/hostlink"
+check "agent symlink pointing outside: refused"       grep -q 'leads into the sandbox directory' \
+  <<<"$(pathrun XDG_DATA_HOME="$DSB/xdg" -- -l)"
+check "config via agent symlink pointing outside: refused" grep -q 'leads into the sandbox directory' \
+  <<<"$(pathrun XDG_CONFIG_HOME="$DSB/xdg" -- -l)"
+check "host link -> sandbox link -> outside: refused" grep -q 'leads into the sandbox directory' \
+  <<<"$(pathrun XDG_DATA_HOME="$T/hostlink" -- -l)"
+check "'..' through the sandbox: refused"             grep -q 'leads into the sandbox directory' \
+  <<<"$(pathrun XDG_DATA_HOME="$DSB/../.local/share" -- -l)"
+check "relative XDG_DATA_HOME: refused"               grep -qx 'rc=2' <<<"$(pathrun XDG_DATA_HOME=rel/share -- -l)"
+ln -sfn "$T/outside" "$T/hostonly"
+check "host-only symlink outside the sandbox: accepted" ! grep -qE 'refusing to use|rc=2' \
+  <<<"$(pathrun XDG_DATA_HOME="$T/hostonly" -- -l)"
+check "state dir containing the sandbox: refused"     grep -q 'sandbox directory .* is inside it' \
+  <<<"$(pathrun HOME="$T/outer/oc-sandbox/h" XDG_DATA_HOME="$T/outer" -- -l)"
+check "state dir outside the sandbox: accepted"       ! grep -qE 'refusing to use|rc=2' \
+  <<<"$(pathrun XDG_DATA_HOME="$T/dhome/.local/share" -- -l)"
+
 echo "delete scope (stubbed)"
 out=$(del -i default -d -a -y)
 check "-i default -d -a removes pod oc"                 grep -qx 'podman pod rm -f oc' <<<"$out"
@@ -275,6 +322,15 @@ for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_
 done
 check "-d -a removes only oc Postgres secrets" sh -c "grep -qx 'podman secret rm oc-pg-password' '$T/stub.log' \
   && grep -qx 'podman secret rm oc-x-pg-password' '$T/stub.log' && ! grep -q 'secret rm other' '$T/stub.log'"
+# -d -a with a recorded build on oc-agent and a foreign image on oc-chromium
+A=$(printf 'a%.0s' {1..64}) B=$(printf 'b%.0s' {1..64})
+mkdir -p "$DSTATE"; printf '%s\n' "$A" > "$DSTATE/built-images"; : > "$T/stub.log"
+env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME STUB_IDS="oc-agent=$A oc-chromium=$B" HOME="$T/dhome" \
+  PATH="$T/stub:$PATH" "$SCRIPT" -d -a -y >/dev/null 2>&1 </dev/null
+check "-d -a: our build untagged and removed"   sh -c "grep -qx 'podman untag $A localhost/oc-agent:latest' '$T/stub.log' \
+  && grep -qx 'podman rmi $A' '$T/stub.log'"
+check "-d -a: foreign image on our tag kept"    ! grep -q "$B" <(grep -E 'untag|rmi' "$T/stub.log")
+check "-d -a: never removes images by force or by tag" ! grep -qE 'rmi -f|rmi .*oc-(agent|chromium)|image prune' "$T/stub.log"
 
 echo "sandbox tree, worktrees and relabelling (in containers)"
 if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else
@@ -323,6 +379,67 @@ EOF
     check "relabel: sandbox file gets the agents' level" [ "$(stat -c %C "$T/isb/f")" = system_u:object_r:container_file_t:s0:c7,c9 ]
     check "relabel: symlink targets on the host untouched" [ "$(stat -c %C "$T/iv/keep")" = "$before" ]
   fi
+fi
+
+echo "image ledger under parallel use (podman stubbed)"
+cat > "$T/ledger.sh" <<EOF
+set -euo pipefail
+IMAGE_LOG=$T/ledger/built-images
+$(fn owned_image); $(fn ledger_locked); $(fn _ledger_add); $(fn record_image); $(fn _prune); $(fn prune_images)
+pm() { sleep 0.01; echo 1; }   # every recorded image still tagged: a rewrite must keep them all
+for i in 1 2 3 4 5; do record_image "\$(printf '%064x' \$((\$1 * 100 + i)))"; prune_images; done
+EOF
+rm -rf "$T/ledger"; mkdir -p "$T/ledger"; : > "$T/ledger/built-images"
+pids=(); for w in 1 2 3 4 5 6 7 8; do bash "$T/ledger.sh" $w > "$T/ledger/out.$w" 2>&1 & pids+=($!); done
+lrc=0; for pid in "${pids[@]}"; do wait "$pid" || lrc=1; done
+check "parallel ledger updates: all succeed"          [ $lrc -eq 0 ]
+check "parallel ledger updates: no ID lost (40)"      [ "$(sort -u "$T/ledger/built-images" | grep -c .)" -eq 40 ]
+check "parallel ledger updates: no temp files left"   [ -z "$(find "$T/ledger" -name 'built-images.?*' ! -name '*.lock')" ]
+check "parallel ledger updates: no warnings"          ! grep -q . "$T"/ledger/out.*
+
+echo "image ownership (real Podman, throwaway images FROM scratch)"
+if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else
+  if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null; then H=(distrobox-host-exec); else H=(); fi
+  IT=localhost/oc-imgtest-$$ L=io.github.gorban.opencode-sandbox.image
+  mkdir -p "$T/ib"; printf 'FROM scratch\n' > "$T/ib/Containerfile.t"
+  cat > "$T/img.sh" <<EOF
+set -euo pipefail
+H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }
+IMAGE_LOG=$T/built-images OWNER_LABEL=$L
+$(fn owned_image); $(fn ledger_locked); $(fn _ledger_add); $(fn record_image); $(fn _prune); $(fn prune_images)
+$(fn ensure_image)
+log() { :; }
+REBUILD=1 PULL=() BUILD=$T/ib
+"\$@"
+EOF
+  img() { bash "$T/img.sh" "$@" 2>&1 >/dev/null; }
+  iid() { "${H[@]}" podman image inspect --format '{{.Id}}' "$1" 2>/dev/null; }
+  has() { "${H[@]}" podman image exists "$1"; }
+  pbuild() { "${H[@]}" podman build -q "$@" -f "$T/ib/Containerfile.t" "$T/ib"; }
+  # an unrelated image on our tag, even one carrying our labels
+  foreign=$(pbuild --label oc.hash=x --label "$L=agent" -t "$IT")
+  out=$(img ensure_image "$IT" Containerfile.t h1 agent); ours1=$(iid "$IT")
+  check "real: foreign image on our tag (with our labels) kept" has "$foreign"
+  check "real: user told about the foreign image"   grep -q 'not built by this oc-sandbox' <<<"$out"
+  img ensure_image "$IT" Containerfile.t h2 agent >/dev/null; ours2=$(iid "$IT")
+  check "real: our superseded build removed"        sh -c "[ '$ours1' != '$ours2' ] && ! ${H[*]} podman image exists '$ours1'"
+  # an untagged image derived from ours (inherits every label) and an unrelated dangling oc.hash image
+  printf 'FROM %s\n' "$IT" > "$T/ib/Containerfile.d"
+  derived=$("${H[@]}" podman build -q --label mine=1 -f "$T/ib/Containerfile.d" "$T/ib")
+  dangling=$(pbuild --label oc.hash=y)
+  img prune_images >/dev/null
+  check "real: untagged image derived from ours kept" has "$derived"
+  check "real: unrelated dangling oc.hash image kept" has "$dangling"
+  # a build of ours you tagged yourself, and one a container uses
+  "${H[@]}" podman tag "$ours2" "$IT-backup"
+  img ensure_image "$IT" Containerfile.t h3 agent >/dev/null; ours3=$(iid "$IT")
+  check "real: our build with your own tag kept"    has "$ours2"
+  ctr=$("${H[@]}" podman create "$ours3" /none 2>/dev/null)
+  img ensure_image "$IT" Containerfile.t h4 agent >/dev/null
+  check "real: our build used by a container kept"  has "$ours3"
+  "${H[@]}" podman rm -f "$ctr" >/dev/null 2>&1; img prune_images >/dev/null
+  check "real: ...and removed once it is unused"    ! has "$ours3"
+  "${H[@]}" podman rmi "$IT" "$IT-backup" "$foreign" "$derived" "$dangling" >/dev/null 2>&1 || true
 fi
 
 echo; echo "$pass passed, $fail failed"

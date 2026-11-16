@@ -333,9 +333,9 @@ you are trusting:
 |---|---|
 | Podman (default instance) | pod `oc`; containers `oc-agent`, `oc-chromium`, `oc-postgres`, `oc-dind`; volumes `oc-chrome`, `oc-pg`, `oc-dind`, `oc-dind-run`; secret `oc-pg-password` |
 | Podman (instance `NAME`) | the same with `oc-NAME` in place of `oc` (pod `oc-NAME`, `oc-NAME-agent`, ...) |
-| Podman (shared) | images `oc-agent`, `oc-chromium` (and the pulled `quay.io/podman/stable` for `-D`); volume `oc-home` |
+| Podman (shared) | images `oc-agent`, `oc-chromium` (and the pulled `quay.io/podman/stable` for `-D`); volume `oc-home`. A rebuild removes the previous build once no container uses it and it has no other tag; only images recorded in `built-images` are ever removed, never another image that happens to have these names |
 | `~/opencode-sandbox/` | your workspace (`construct/`, `wt/NAME/`), plus `.bridge/` (request spool) |
-| `~/.local/share/oc-sandbox/` | generated build files, the SELinux policy, `sb-level`, `pg-sig.key`, and `bridge-stage/` (copies open in VS Code / Beyond Compare) |
+| `~/.local/share/oc-sandbox/` | generated build files, the SELinux policy, `sb-level`, `pg-sig.key`, `built-images` (IDs of the images it built), and `bridge-stage/` (copies open in VS Code / Beyond Compare). This, the config directory, `~/.local/bin` and the systemd units must lie outside `~/opencode-sandbox`, and no step of their paths (including symlinks on the way) may pass through it; the script refuses to run otherwise (e.g. with `XDG_DATA_HOME` pointing into it, or at a symlink inside it) |
 | `~/.local/bin/oc-bridge` and `~/.config/systemd/user/oc-bridge.{path,service}` | the host-side bridge |
 | SELinux | module `oc_chromium` |
 | `~/.config/oc-sandbox/` | **yours**: `postgres.env`, `postgres.NAME.env`, `postgres-init/` (never created or deleted by the script) |
