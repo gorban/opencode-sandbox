@@ -333,7 +333,7 @@ you are trusting:
 |---|---|
 | Podman (default instance) | pod `oc`; containers `oc-agent`, `oc-chromium`, `oc-postgres`, `oc-dind`; volumes `oc-chrome`, `oc-pg`, `oc-dind`, `oc-dind-run`; secret `oc-pg-password` |
 | Podman (instance `NAME`) | the same with `oc-NAME` in place of `oc` (pod `oc-NAME`, `oc-NAME-agent`, ...) |
-| Podman (shared) | images `oc-agent`, `oc-chromium` (and the pulled `quay.io/podman/stable` for `-D`); volume `oc-home` | (a rebuild removes the previous build once no container uses it)
+| Podman (shared) | images `oc-agent`, `oc-chromium` (and the pulled `quay.io/podman/stable` for `-D`); volume `oc-home`. A rebuild removes the previous build once no container uses it |
 | `~/opencode-sandbox/` | your workspace (`construct/`, `wt/NAME/`), plus `.bridge/` (request spool) |
 | `~/.local/share/oc-sandbox/` | generated build files, the SELinux policy, `sb-level`, `pg-sig.key`, and `bridge-stage/` (copies open in VS Code / Beyond Compare) |
 | `~/.local/bin/oc-bridge` and `~/.config/systemd/user/oc-bridge.{path,service}` | the host-side bridge |
