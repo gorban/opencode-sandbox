@@ -80,6 +80,19 @@ EOF
 }
 die() { echo "${0##*/}: $*" >&2; exit 2; }
 
+# Host-trusted locations must lie outside $SB, which every agent can write: the state directory holds
+# the image ledger (proof that an image may be deleted), the signature key, the SELinux level and
+# build files; the config directory the Postgres password; plus the bridge binary and systemd units.
+# They must not contain $SB either (-d -a deletes $STATE). Checked on the resolved paths, before any
+# of them is read or written.
+sb_real=$(realpath -m -- "$SB")
+for d in "$STATE" "${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox" "$BIN" "$UNITS"; do
+  r=$(realpath -m -- "$d")
+  case $r/ in "$sb_real"/*) die "refusing to use $d: it resolves to $r, inside the sandbox directory $SB (check XDG_DATA_HOME / XDG_CONFIG_HOME)" ;; esac
+  case $sb_real/ in "$r"/*) die "refusing to use $d: the sandbox directory $SB is inside it ($r)" ;; esac
+done
+unset d r
+
 # ---- option parsing ---------------------------------------------------------
 DELETE=0 ALL=0 REBUILD=0 NOLAUNCH=0 YES=0 LISTKEYS=0 NOKEY=0 EXEC=0 PG=0 DIND=0 LIST=0
 INST="" INST_SET=0 CWD_ARG="" WT_ARG="" PORT_ARGS=()
@@ -140,10 +153,22 @@ else
 fi
 pm() { "${H[@]}" podman "$@"; }
 sc() { "${H[@]}" systemctl --user "$@"; }
+# The ledger is only replaced atomically (rename), so a plain read always sees a whole version.
+# Every change (append, rewrite) holds an exclusive flock: parallel instances share the ledger.
 owned_image() { [[ $1 =~ ^[0-9a-f]{64}$ && -f $IMAGE_LOG ]] && grep -qxF "$1" "$IMAGE_LOG"; }
-prune_images() {  # remove our recorded builds that are now untagged and unused; forget vanished ones
+ledger_locked() {  # command...: run it holding the ledger lock
+  local fd rc=0
+  exec {fd}>>"$IMAGE_LOG.lock"
+  flock "$fd" || { exec {fd}>&-; return 1; }
+  "$@" || rc=$?
+  exec {fd}>&-
+  return $rc
+}
+_ledger_add() { printf '%s\n' "$1" >> "$IMAGE_LOG"; }
+record_image() { [[ $1 =~ ^[0-9a-f]{64}$ ]] && ledger_locked _ledger_add "$1"; }
+_prune() {
   [[ -f $IMAGE_LOG ]] || return 0
-  local id tags keep=()
+  local id tags keep=() tmp
   while read -r id; do
     [[ $id =~ ^[0-9a-f]{64}$ ]] || continue
     tags=$(pm image inspect --format '{{len .RepoTags}}' "$id" 2>/dev/null) || continue   # gone
@@ -151,7 +176,13 @@ prune_images() {  # remove our recorded builds that are now untagged and unused;
     if [[ $tags == 0 ]] && pm rmi "$id" >/dev/null 2>&1; then continue; fi
     keep+=("$id")
   done < <(sort -u "$IMAGE_LOG")
-  printf '%s\n' ${keep[@]+"${keep[@]}"} > "$IMAGE_LOG.new" && mv -f "$IMAGE_LOG.new" "$IMAGE_LOG"
+  tmp=$(mktemp "$IMAGE_LOG.XXXXXX") || return 1
+  if printf '%s\n' ${keep[@]+"${keep[@]}"} > "$tmp" && mv -f "$tmp" "$IMAGE_LOG"; then return 0; fi
+  rm -f "$tmp"; return 1
+}
+prune_images() {  # remove our recorded builds that are now untagged and unused; forget vanished ones
+  [[ -f $IMAGE_LOG ]] || return 0
+  ledger_locked _prune || echo "warning: could not update $IMAGE_LOG" >&2
 }
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 cstate() { pm container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo none; }
@@ -532,7 +563,7 @@ ensure_image() {  # name containerfile hash role(agent|chromium)
            "image, or from an older version); the build untagged it but kept it. Remove it yourself if you" \
            "do not need it: podman rmi ${id:0:12}" >&2
     fi
-    printf '%s\n' "$new" >> "$IMAGE_LOG"
+    record_image "$new"
     prune_images   # a previous build still used by a container (e.g. a running agent) stays for later
   else
     echo "image $name up to date"

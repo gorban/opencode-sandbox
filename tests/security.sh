@@ -257,6 +257,34 @@ check "refuses setup flags with -d"        argfail "only apply when setting up" 
 check "refuses stray arguments"            argfail "unexpected argument" -i ok extra
 check "refuses empty -i (no global -d)"    argfail "-i needs an instance name" -i "" -d -a -y
 
+echo "host state outside the sandbox (stubbed)"
+# The agent controls everything under $SB; host state (the image ledger above all) must not be there.
+pathrun() {  # VAR=value... -- script-args...: stderr+rc of a stubbed run with these variables
+  local envs=() rc=0 out
+  while [[ $1 != -- ]]; do envs+=("$1"); shift; done; shift
+  : > "$T/stub.log"
+  out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "${envs[@]}" \
+        "$SCRIPT" "$@" 2>&1 </dev/null) || rc=$?
+  printf '%s\nrc=%s\n' "$out" "$rc"
+}
+DSB=$T/dhome/opencode-sandbox; mkdir -p "$DSB/st/oc-sandbox" "$T/outer/oc-sandbox/h"
+A=$(printf 'a%.0s' {1..64})
+printf '%s\n' "$A" > "$DSB/st/oc-sandbox/built-images"                 # forged by the agent
+echo "$SECRET" > "$T/victim-file"; ln -s "$T/victim-file" "$DSB/st/oc-sandbox/built-images.new"
+ln -sfn "$DSB" "$T/dlink"
+out=$(pathrun XDG_DATA_HOME="$DSB/st" STUB_IDS="oc-agent=$A" -- -d -a -y)
+check "state dir inside the sandbox: refused"         grep -qx 'rc=2' <<<"$out"
+check "...before any podman call (forged ledger unused)" [ ! -s "$T/stub.log" ]
+check "...planted ledger symlink target untouched"   grep -qx "$SECRET" "$T/victim-file"
+check "state dir reaching the sandbox via a symlink: refused" grep -q 'inside the sandbox directory' \
+  <<<"$(pathrun XDG_DATA_HOME="$T/dlink/st" -- -l)"
+check "config dir inside the sandbox: refused"        grep -q 'inside the sandbox directory' \
+  <<<"$(pathrun XDG_CONFIG_HOME="$DSB/cfg" -- -l)"
+check "state dir containing the sandbox: refused"     grep -q 'sandbox directory .* is inside it' \
+  <<<"$(pathrun HOME="$T/outer/oc-sandbox/h" XDG_DATA_HOME="$T/outer" -- -l)"
+check "state dir outside the sandbox: accepted"       ! grep -qE 'refusing to use|rc=2' \
+  <<<"$(pathrun XDG_DATA_HOME="$T/dhome/.local/share" -- -l)"
+
 echo "delete scope (stubbed)"
 out=$(del -i default -d -a -y)
 check "-i default -d -a removes pod oc"                 grep -qx 'podman pod rm -f oc' <<<"$out"
@@ -337,6 +365,22 @@ EOF
   fi
 fi
 
+echo "image ledger under parallel use (podman stubbed)"
+cat > "$T/ledger.sh" <<EOF
+set -euo pipefail
+IMAGE_LOG=$T/ledger/built-images
+$(fn owned_image); $(fn ledger_locked); $(fn _ledger_add); $(fn record_image); $(fn _prune); $(fn prune_images)
+pm() { sleep 0.01; echo 1; }   # every recorded image still tagged: a rewrite must keep them all
+for i in 1 2 3 4 5; do record_image "\$(printf '%064x' \$((\$1 * 100 + i)))"; prune_images; done
+EOF
+rm -rf "$T/ledger"; mkdir -p "$T/ledger"; : > "$T/ledger/built-images"
+pids=(); for w in 1 2 3 4 5 6 7 8; do bash "$T/ledger.sh" $w > "$T/ledger/out.$w" 2>&1 & pids+=($!); done
+lrc=0; for pid in "${pids[@]}"; do wait "$pid" || lrc=1; done
+check "parallel ledger updates: all succeed"          [ $lrc -eq 0 ]
+check "parallel ledger updates: no ID lost (40)"      [ "$(sort -u "$T/ledger/built-images" | grep -c .)" -eq 40 ]
+check "parallel ledger updates: no temp files left"   [ -z "$(find "$T/ledger" -name 'built-images.?*' ! -name '*.lock')" ]
+check "parallel ledger updates: no warnings"          ! grep -q . "$T"/ledger/out.*
+
 echo "image ownership (real Podman, throwaway images FROM scratch)"
 if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else
   if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null; then H=(distrobox-host-exec); else H=(); fi
@@ -346,7 +390,8 @@ if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; els
 set -euo pipefail
 H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }
 IMAGE_LOG=$T/built-images OWNER_LABEL=$L
-$(fn owned_image); $(fn prune_images); $(fn ensure_image)
+$(fn owned_image); $(fn ledger_locked); $(fn _ledger_add); $(fn record_image); $(fn _prune); $(fn prune_images)
+$(fn ensure_image)
 log() { :; }
 REBUILD=1 PULL=() BUILD=$T/ib
 "\$@"
