@@ -276,10 +276,26 @@ out=$(pathrun XDG_DATA_HOME="$DSB/st" STUB_IDS="oc-agent=$A" -- -d -a -y)
 check "state dir inside the sandbox: refused"         grep -qx 'rc=2' <<<"$out"
 check "...before any podman call (forged ledger unused)" [ ! -s "$T/stub.log" ]
 check "...planted ledger symlink target untouched"   grep -qx "$SECRET" "$T/victim-file"
-check "state dir reaching the sandbox via a symlink: refused" grep -q 'inside the sandbox directory' \
+check "state dir reaching the sandbox via a symlink: refused" grep -q 'leads into the sandbox directory' \
   <<<"$(pathrun XDG_DATA_HOME="$T/dlink/st" -- -l)"
-check "config dir inside the sandbox: refused"        grep -q 'inside the sandbox directory' \
+check "config dir inside the sandbox: refused"        grep -q 'leads into the sandbox directory' \
   <<<"$(pathrun XDG_CONFIG_HOME="$DSB/cfg" -- -l)"
+# Reverse: an agent-owned symlink that points OUT of the sandbox when checked (and can be swapped
+# later); a host symlink into the sandbox that hops back out; a '..' walk through the sandbox.
+mkdir -p "$T/outside" "$T/outside2"; ln -sfn "$T/outside" "$DSB/xdg"; ln -sfn "$T/outside2" "$DSB/hop"
+ln -sfn "$DSB/hop" "$T/hostlink"
+check "agent symlink pointing outside: refused"       grep -q 'leads into the sandbox directory' \
+  <<<"$(pathrun XDG_DATA_HOME="$DSB/xdg" -- -l)"
+check "config via agent symlink pointing outside: refused" grep -q 'leads into the sandbox directory' \
+  <<<"$(pathrun XDG_CONFIG_HOME="$DSB/xdg" -- -l)"
+check "host link -> sandbox link -> outside: refused" grep -q 'leads into the sandbox directory' \
+  <<<"$(pathrun XDG_DATA_HOME="$T/hostlink" -- -l)"
+check "'..' through the sandbox: refused"             grep -q 'leads into the sandbox directory' \
+  <<<"$(pathrun XDG_DATA_HOME="$DSB/../.local/share" -- -l)"
+check "relative XDG_DATA_HOME: refused"               grep -qx 'rc=2' <<<"$(pathrun XDG_DATA_HOME=rel/share -- -l)"
+ln -sfn "$T/outside" "$T/hostonly"
+check "host-only symlink outside the sandbox: accepted" ! grep -qE 'refusing to use|rc=2' \
+  <<<"$(pathrun XDG_DATA_HOME="$T/hostonly" -- -l)"
 check "state dir containing the sandbox: refused"     grep -q 'sandbox directory .* is inside it' \
   <<<"$(pathrun HOME="$T/outer/oc-sandbox/h" XDG_DATA_HOME="$T/outer" -- -l)"
 check "state dir outside the sandbox: accepted"       ! grep -qE 'refusing to use|rc=2' \

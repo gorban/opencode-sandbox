@@ -83,15 +83,44 @@ die() { echo "${0##*/}: $*" >&2; exit 2; }
 # Host-trusted locations must lie outside $SB, which every agent can write: the state directory holds
 # the image ledger (proof that an image may be deleted), the signature key, the SELinux level and
 # build files; the config directory the Postgres password; plus the bridge binary and systemd units.
-# They must not contain $SB either (-d -a deletes $STATE). Checked on the resolved paths, before any
-# of them is read or written.
+# Checking only the final resolved path is not enough: a path through an agent-owned symlink
+# (XDG_DATA_HOME=$SB/xdg -> /elsewhere) resolves outside, and the agent swaps the link afterwards. So
+# trusted_path walks the path like the kernel does, one component at a time, following every symlink,
+# and fails if ANY step (including each symlink target on the way) is inside $SB. Only components
+# outside $SB, which the agent cannot change, remain; the walked physical path is used from then on.
+# The locations must not contain $SB either (-d -a deletes $STATE). Done before anything is touched.
 sb_real=$(realpath -m -- "$SB")
-for d in "$STATE" "${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox" "$BIN" "$UNITS"; do
-  r=$(realpath -m -- "$d")
-  case $r/ in "$sb_real"/*) die "refusing to use $d: it resolves to $r, inside the sandbox directory $SB (check XDG_DATA_HOME / XDG_CONFIG_HOME)" ;; esac
-  case $sb_real/ in "$r"/*) die "refusing to use $d: the sandbox directory $SB is inside it ($r)" ;; esac
-done
-unset d r
+in_sb() { [[ $1/ == "$sb_real"/* ]]; }
+trusted_path() {  # absolute path -> its physical path on stdout; 1 if the walk enters $SB
+  local cur="" comp next t n=0 todo=() tc=()
+  [[ $1 == /* ]] || return 1
+  IFS=/ read -ra todo <<<"$1"
+  while (( ${#todo[@]} )); do
+    comp=${todo[0]}; todo=("${todo[@]:1}")
+    case $comp in ""|.) continue ;; ..) cur=${cur%/*}; continue ;; esac
+    next=$cur/$comp
+    in_sb "$next" && return 1
+    if [[ -L $next ]]; then
+      (( ++n <= 40 )) || return 1
+      t=$(readlink -- "$next") || return 1
+      tc=(); IFS=/ read -ra tc <<<"$t"
+      [[ $t == /* ]] && cur=""
+      todo=(${tc[@]+"${tc[@]}"} ${todo[@]+"${todo[@]}"})
+    else cur=$next; fi
+  done
+  printf '%s\n' "${cur:-/}"
+}
+trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
+  local r
+  r=$(trusted_path "$2") || die "refusing to use $2: the path leads into the sandbox directory $SB, which the agent controls (check XDG_DATA_HOME / XDG_CONFIG_HOME and symlinks)"
+  [[ $sb_real/ != "$r"/* ]] || die "refusing to use $2: the sandbox directory $SB is inside it ($r)"
+  printf -v "$1" '%s' "$r"
+}
+trusted_dir STATE "$STATE"
+trusted_dir CONF_DIR "${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox"
+trusted_dir BIN "$BIN"
+trusted_dir UNITS "$UNITS"
+BUILD="$STATE/build" IMAGE_LOG="$STATE/built-images"
 
 # ---- option parsing ---------------------------------------------------------
 DELETE=0 ALL=0 REBUILD=0 NOLAUNCH=0 YES=0 LISTKEYS=0 NOKEY=0 EXEC=0 PG=0 DIND=0 LIST=0
@@ -272,7 +301,7 @@ fi
 #   OC_PG_INIT_DIR  dir of *.sql/*.sh run once when the data volume is first created
 #                   (optional; default ~/.config/oc-sandbox/postgres-init if it exists)
 load_pg_config() {
-  local k v line missing=() cdir=${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox
+  local k v line missing=() cdir=$CONF_DIR
   PG_CONF=$cdir/postgres.env
   [[ -n $INST && -f $cdir/postgres.$INST.env ]] && PG_CONF=$cdir/postgres.$INST.env
   PG_CONF=${OC_PG_CONF:-$PG_CONF}
