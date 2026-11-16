@@ -287,6 +287,7 @@ if (( DELETE )); then
     fi
     log "Removing images, volumes, secrets, build files"
     pm rmi -f "$AGENT_IMG" "$CHROME_IMG" >/dev/null 2>&1 || true
+    pm image prune -f --filter label=oc.hash >/dev/null 2>&1 || true   # untagged earlier builds
     mapfile -t vols < <({ pm volume ls -q --filter label=oc.sandbox=1; printf '%s\n' "$HOMEVOL" oc-chrome oc-pg; } | sort -u)
     for v in "${vols[@]}"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
     # No matching secret (never used -p) is normal; failing to list them only warns, so the rest of
@@ -492,12 +493,18 @@ fi
 
 # ---- images (rebuilt only when inputs change, or with -r) -------------------------
 ensure_image() {  # name containerfile hash
-  local name=$1 file=$2 want=$3 have
+  local name=$1 file=$2 want=$3 have old new
   have=$(pm image inspect --format '{{index .Labels "oc.hash"}}' "$name" 2>/dev/null || true)
   if (( REBUILD )) || [[ $have != "$want" ]]; then
+    old=$(pm image inspect --format '{{.Id}}' "$name" 2>/dev/null || true)
     log "Building $name"
     pm build "${PULL[@]}" --label "oc.hash=$want" -t "$name" \
        -f "$BUILD/$file" "$BUILD"
+    # The build moved the name to the new image, leaving the previous one untagged (dangling).
+    # Remove it now; without -f, Podman keeps it while a container (e.g. a running agent) uses it,
+    # and prune_images picks it up on a later run.
+    new=$(pm image inspect --format '{{.Id}}' "$name" 2>/dev/null || true)
+    if [[ -n $old && $old != "$new" ]]; then pm rmi "$old" >/dev/null 2>&1 || true; fi
   else
     echo "image $name up to date"
   fi
@@ -821,6 +828,10 @@ echo "Chromium ready."
 if (( PG )); then ensure_postgres; fi
 if (( DIND )); then ensure_dind; fi
 for p in "${PORTS[@]}"; do echo "Port: http://127.0.0.1:${p%%:*} on the host -> 127.0.0.1:${p#*:} in pod '$POD'"; done
+# Earlier builds of our images that are untagged and no longer used: the ones ensure_image could not
+# remove because a container still ran them (e.g. Chromium before its recreation above). Only images
+# with our oc.hash label; prune never removes an image a container uses.
+pm image prune -f --filter label=oc.hash >/dev/null 2>&1 || true
 
 (( NOLAUNCH )) && { log "Setup complete for instance '$ILABEL' (-n: not launching OpenCode)."; exit 0; }
 

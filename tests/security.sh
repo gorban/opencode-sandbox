@@ -275,6 +275,39 @@ for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_
 done
 check "-d -a removes only oc Postgres secrets" sh -c "grep -qx 'podman secret rm oc-pg-password' '$T/stub.log' \
   && grep -qx 'podman secret rm oc-x-pg-password' '$T/stub.log' && ! grep -q 'secret rm other' '$T/stub.log'"
+check "-d -a prunes untagged earlier builds"   grep -qx 'podman image prune -f --filter label=oc.hash' "$T/stub.log"
+
+echo "image rebuilds (podman stubbed)"
+imgrun() {  # REBUILD old-id new-id rmi-status -> log of pm calls
+  cat > "$T/img.sh" <<EOF
+set -euo pipefail
+$(fn ensure_image)
+log() { :; }
+built=0
+pm() {
+  echo "pm \$*" >> $T/img.log
+  case "\$1 \$2" in
+    "image inspect") case "\$*" in *oc.hash*) echo oldhash ;; *) if [ \$built = 1 ]; then echo $3; else echo $2; fi ;; esac
+                     [ -n "\$(if [ \$built = 1 ]; then echo $3; else echo $2; fi)" ] || return 125 ;;
+    "build "*) built=1 ;;
+    "rmi "*) return $4 ;;
+  esac
+  return 0
+}
+REBUILD=$1 PULL=() BUILD=$T
+ensure_image oc-agent Containerfile.agent newhash
+EOF
+  : > "$T/img.log"; bash "$T/img.sh" >/dev/null 2>&1; echo "rc=$?" >> "$T/img.log"; cat "$T/img.log"
+}
+out=$(imgrun 0 oldid newid 0)
+check "rebuild removes the superseded image"    grep -qx 'pm rmi oldid' <<<"$out"
+check "superseded image removed without -f"     ! grep -q 'rmi -f' <<<"$out"
+out=$(imgrun 0 oldid newid 2)
+check "image still in use: rebuild succeeds"    grep -qx 'rc=0' <<<"$out"
+out=$(imgrun 0 "" newid 0)
+check "first build removes nothing"             ! grep -q 'pm rmi' <<<"$out"
+out=$(imgrun 1 sameid sameid 0)
+check "unchanged rebuild keeps the image"       ! grep -q 'pm rmi' <<<"$out"
 
 echo "sandbox tree, worktrees and relabelling (in containers)"
 if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else
