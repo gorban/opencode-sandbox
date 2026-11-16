@@ -179,15 +179,36 @@ check "race: host file never written"       victim_ok
 check "race: edits reached the sandbox file" [ -n "$(find "$SB/construct" -name f -type f -exec grep -l '^race-' {} +)" ]
 
 # ================================================================================================
-echo "argument validation (exits before touching Podman)"
+# Every run of the real script below goes through stubs: Podman, systemctl, pkexec, sudo and
+# distrobox-host-exec only log their arguments, and HOME is a scratch directory. A regression (an
+# argument that should be refused but is not) then deletes nothing real.
+mkdir -p "$T/stub" "$T/dhome"
+for c in podman systemctl pkexec sudo distrobox-host-exec; do
+  printf '#!/bin/sh\necho "%s $*" >> "%s"\n[ "$1 $2" = "pod ls" ] && printf "oc\\noc-other\\n"\nexit 0\n' \
+    "$c" "$T/stub.log" > "$T/stub/$c"
+  chmod +x "$T/stub/$c"
+done
+stubbed() { env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "$SCRIPT" "$@"; }
+del() {  # args... -> log of stubbed commands
+  : > "$T/stub.log"
+  stubbed "$@" >/dev/null 2>&1 </dev/null
+  cat "$T/stub.log"
+}
+
+echo "argument validation (stubbed podman/systemctl; nothing real is touched)"
 argfail() {  # expected-message-fragment args...: must exit 2 with that message
   local want=$1 out rc; shift
-  out=$("$SCRIPT" "$@" 2>&1); rc=$?
+  out=$(stubbed "$@" 2>&1 </dev/null); rc=$?
   [[ $rc -eq 2 && $out == *"$want"* ]]
 }
 check "refuses publishing DevTools 9222"   argfail "refusing to publish pod port 9222" -P 18080:9222
 check "refuses publishing Postgres 5432"   argfail "refusing to publish pod port 5432" -P 18080:5432
-check "refuses privileged host port"       argfail "below" -P 80:80
+# The script refuses host ports below the host's ip_unprivileged_port_start; where that is 0 or 1
+# every port is bindable and there is nothing to refuse. (The stubbed run reads this kernel's value.)
+low=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)
+if (( low > 1 )); then
+  check "refuses privileged host port ($((low - 1)) < $low)" argfail "below" -P "$((low - 1)):80"
+else echo "  skip  privileged host port (ip_unprivileged_port_start=$low: every port is bindable)"; fi
 check "refuses duplicate host port"        argfail "given twice" -P 18080:80,18080:81
 check "refuses malformed mapping"          argfail "is not HOSTPORT:PODPORT" -P 18080
 check "refuses out-of-range port"          argfail "ports are 1-65535" -P 18080:70000
@@ -198,6 +219,16 @@ check "refuses absolute -C"                argfail "plain relative path" -C /etc
 check "refuses -W with .."                 argfail "plain relative path" -W a/../b
 check "refuses setup flags with -d"        argfail "only apply when setting up" -d -P 18080:80
 check "refuses stray arguments"            argfail "unexpected argument" -i ok extra
+check "refuses empty -i (no global -d)"    argfail "-i needs an instance name" -i "" -d -a -y
+
+echo "delete scope (stubbed)"
+out=$(del -i default -d -a -y)
+check "-i default -d -a removes pod oc"                 grep -qx 'podman pod rm -f oc' <<<"$out"
+check "-i default -d -a leaves other instances"         ! grep -q 'oc-other' <<<"$out"
+check "-i default -d -a leaves bridge, images, login"   ! grep -qE '^systemctl|rmi|oc-home|semodule' <<<"$out"
+check "-i default -d -a removes only default volumes"   grep -qx 'podman volume rm -f oc-pg' <<<"$out"
+out=$(del -d)
+check "bare -d still removes every instance pod"        grep -qx 'podman pod rm -f oc-other' <<<"$out"
 
 echo "sandbox tree, worktrees and relabelling (in containers)"
 if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else

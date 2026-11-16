@@ -77,13 +77,13 @@ die() { echo "${0##*/}: $*" >&2; exit 2; }
 
 # ---- option parsing ---------------------------------------------------------
 DELETE=0 ALL=0 REBUILD=0 NOLAUNCH=0 YES=0 LISTKEYS=0 NOKEY=0 EXEC=0 PG=0 DIND=0 LIST=0
-INST="" CWD_ARG="" WT_ARG="" PORT_ARGS=()
+INST="" INST_SET=0 CWD_ARG="" WT_ARG="" PORT_ARGS=()
 while getopts ":hdarnykKxplDi:P:C:W:" o; do
   case $o in
     h) usage; exit 0 ;;
     d) DELETE=1 ;; a) ALL=1 ;; r) REBUILD=1 ;; n) NOLAUNCH=1 ;; y) YES=1 ;;
     k) LISTKEYS=1 ;; K) NOKEY=1 ;; x) EXEC=1 ;; p) PG=1 ;; D) DIND=1 ;; l) LIST=1 ;;
-    i) INST=$OPTARG ;; P) PORT_ARGS+=("$OPTARG") ;; C) CWD_ARG=$OPTARG ;; W) WT_ARG=$OPTARG ;;
+    i) INST=$OPTARG INST_SET=1 ;; P) PORT_ARGS+=("$OPTARG") ;; C) CWD_ARG=$OPTARG ;; W) WT_ARG=$OPTARG ;;
     :) die "-$OPTARG needs a value" ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -98,6 +98,9 @@ fi
 valid_instance() {  # name -> 0/1
   [[ $1 =~ ^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$ ]] && [[ $RESERVED_NAMES != *" $1 "* ]]
 }
+# INST_SET records that -i was given at all: "-i default" selects the default instance only and must
+# never fall through to the all-instances scope of a bare -d (or -d -a).
+if (( INST_SET )) && [[ -z $INST ]]; then die "-i needs an instance name (use 'default' for the default instance)"; fi
 [[ $INST == default ]] && INST=""
 [[ -z $INST ]] || valid_instance "$INST" \
   || die "invalid instance name '$INST' (a-z, 0-9 and inner '-', at most 24 characters; not one of:$RESERVED_NAMES)"
@@ -261,8 +264,8 @@ load_pg_config() {
 # ---- teardown -----------------------------------------------------------------
 confirm() { (( YES )) && return 0; read -r -p "$1 [y/N] " a; [[ $a == [yY]* ]]; }
 if (( DELETE )); then
-  if [[ -n $INST ]]; then                                   # one instance only
-    log "Removing instance '$INST' (pod $POD)"
+  if (( INST_SET )); then                                   # one instance only (also -i default)
+    log "Removing instance '$ILABEL' (pod $POD)"
     pm pod rm -f "$POD" >/dev/null 2>&1 || true
     if (( ALL )); then
       if confirm "Also delete volumes $CHROMEVOL $PGVOL $DINDVOL $DINDRUN (Chromium profile, Postgres data, docker storage)?"; then

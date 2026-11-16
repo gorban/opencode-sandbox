@@ -131,7 +131,8 @@ oc-sandbox -l                               # what is running
 - **Git never runs on the host** inside `~/opencode-sandbox`: the repository is agent-writable, so its
   hooks and config could run code. `-W` runs `git worktree add` in a throwaway container without network,
   with hooks disabled.
-- Instance names: `a-z`, `0-9` and inner `-`, at most 24 characters. `default` means the default instance.
+- Instance names: `a-z`, `0-9` and inner `-`, at most 24 characters. `default` means the default instance
+  (`-i default -d [-a]` removes only the default instance; only a bare `-d` acts on all of them).
 - `oc-sandbox -i NAME -d` leaves the worktree alone; remove it with `git worktree remove` in a sandbox shell.
 
 ## Port mapping (`-P`)
