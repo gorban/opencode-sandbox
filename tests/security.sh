@@ -90,6 +90,33 @@ unkeyed=$(printf '%s|%s|%s|%s' app "$PW" db "" | sha256sum | cut -c1-16)
 check "volume label is not the unkeyed hash" ! grep -qa "$unkeyed" "$T/argv.log"
 check "signature key is private (0600)"    [ "$(stat -c %a "$T/state/pg-sig.key" 2>/dev/null)" = 600 ]
 
+pgmsg() {  # volume-label -> stderr of ensure_postgres for '-i default' with an existing volume
+  cat > "$T/pgm.sh" <<EOF
+set -euo pipefail
+$(fn pg_sig); $(fn urlenc); $(fn ensure_postgres)
+$(grep "^cstate()" "$SCRIPT")
+log() { :; }; sleep() { :; }
+pm() {
+  case "\$1 \${2:-}" in
+    "volume exists") return 0 ;;
+    "volume inspect") echo '$1' ;;
+    "container inspect") return 1 ;;
+  esac
+  return 0
+}
+STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$T/none INST= ILABEL=default
+PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD=pw
+ensure_postgres
+EOF
+  bash "$T/pgm.sh" 2>&1 >/dev/null
+}
+legacy=$(printf '%s|%s|%s|%s' app pw db "" | sha256sum | cut -c1-16)
+out=$(pgmsg "$legacy")
+check "legacy-volume hint keeps -i default"   grep -q -- '-i default -d && podman volume rm oc-pg' <<<"$out"
+out=$(pgmsg mismatch)
+check "settings-mismatch hint keeps -i default" grep -q -- '-i default -d && podman volume rm oc-pg' <<<"$out"
+check "no hint suggests a bare -d"            ! grep -qE '\.sh -d && podman' <<<"$out$(pgmsg "$legacy")"
+
 # ================================================================================================
 echo "host bridge (oc-bridge.py)"
 SB=$T/sb V=$T/victim B=$T/bin
@@ -183,11 +210,17 @@ check "race: edits reached the sandbox file" [ -n "$(find "$SB/construct" -name 
 # distrobox-host-exec only log their arguments, and HOME is a scratch directory. A regression (an
 # argument that should be refused but is not) then deletes nothing real.
 mkdir -p "$T/stub" "$T/dhome"
-for c in podman systemctl pkexec sudo distrobox-host-exec; do
-  printf '#!/bin/sh\necho "%s $*" >> "%s"\n[ "$1 $2" = "pod ls" ] && printf "oc\\noc-other\\n"\nexit 0\n' \
-    "$c" "$T/stub.log" > "$T/stub/$c"
-  chmod +x "$T/stub/$c"
-done
+cat > "$T/stub/podman" <<EOF
+#!/bin/sh
+echo "\${0##*/} \$*" >> "$T/stub.log"
+case "\$1 \$2" in
+  "pod ls") printf 'oc\noc-other\n' ;;
+  "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
+esac
+exit 0
+EOF
+chmod +x "$T/stub/podman"
+for c in systemctl pkexec sudo distrobox-host-exec; do ln -s podman "$T/stub/$c"; done
 stubbed() { env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "$SCRIPT" "$@"; }
 del() {  # args... -> log of stubbed commands
   : > "$T/stub.log"
@@ -229,6 +262,19 @@ check "-i default -d -a leaves bridge, images, login"   ! grep -qE '^systemctl|r
 check "-i default -d -a removes only default volumes"   grep -qx 'podman volume rm -f oc-pg' <<<"$out"
 out=$(del -d)
 check "bare -d still removes every instance pod"        grep -qx 'podman pod rm -f oc-other' <<<"$out"
+DSTATE=$T/dhome/.local/share/oc-sandbox
+for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_FAIL=1" \
+            "secrets present:STUB_SECRETS=oc-pg-password\\nother\\noc-x-pg-password\\n"; do
+  name=${case%%:*} envset=${case#*:}
+  : > "$T/stub.log"; mkdir -p "$DSTATE/build"; rc=0
+  env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME "$envset" HOME="$T/dhome" PATH="$T/stub:$PATH" \
+    "$SCRIPT" -d -a -y >/dev/null 2>&1 </dev/null || rc=$?
+  check "-d -a ($name) completes"              [ $rc -eq 0 ]
+  check "-d -a ($name) removes the state dir"  [ ! -e "$DSTATE" ]
+  check "-d -a ($name) removes SELinux module" grep -q 'semodule -r oc_chromium' "$T/stub.log"
+done
+check "-d -a removes only oc Postgres secrets" sh -c "grep -qx 'podman secret rm oc-pg-password' '$T/stub.log' \
+  && grep -qx 'podman secret rm oc-x-pg-password' '$T/stub.log' && ! grep -q 'secret rm other' '$T/stub.log'"
 
 echo "sandbox tree, worktrees and relabelling (in containers)"
 if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else

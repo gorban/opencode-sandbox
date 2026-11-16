@@ -289,8 +289,13 @@ if (( DELETE )); then
     pm rmi -f "$AGENT_IMG" "$CHROME_IMG" >/dev/null 2>&1 || true
     mapfile -t vols < <({ pm volume ls -q --filter label=oc.sandbox=1; printf '%s\n' "$HOMEVOL" oc-chrome oc-pg; } | sort -u)
     for v in "${vols[@]}"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
-    pm secret ls --format '{{.Name}}' 2>/dev/null | grep -E '^oc(-[a-z0-9-]+)?-pg-password$' \
-      | while read -r s; do pm secret rm "$s" >/dev/null 2>&1 || true; done
+    # No matching secret (never used -p) is normal; failing to list them only warns, so the rest of
+    # the cleanup (SELinux module, state, .bridge) still runs.
+    if secrets=$(pm secret ls --format '{{.Name}}' 2>/dev/null); then
+      while read -r s; do
+        if [[ $s =~ ^oc(-[a-z0-9-]+)?-pg-password$ ]]; then pm secret rm "$s" >/dev/null 2>&1 || true; fi
+      done <<<"$secrets"
+    else echo "warning: could not list Podman secrets; remove any oc-*-pg-password secrets by hand" >&2; fi
     log "Removing SELinux module oc_chromium (asks for your admin password)"
     "${H[@]}" pkexec semodule -r oc_chromium >/dev/null 2>&1 || "${H[@]}" sudo semodule -r oc_chromium || true
     # Safe on the host: every pod (and with it every agent) is gone, so nothing can change $SB/.bridge
@@ -611,7 +616,7 @@ ensure_postgres() {
     legacy=$(printf '%s|%s|%s|%s' "$PG_USER" "$PG_PASSWORD" "$PG_DB" "$init_hash" | sha256sum | cut -c1-16)
     if [[ $vsig == "$legacy" ]]; then
       echo "note: volume '$PGVOL' (made by an older oc-sandbox) is labelled with an unkeyed hash of the" >&2
-      echo "      Postgres settings; recreate it when convenient: ${0##*/}${INST:+ -i $INST} -d && podman volume rm $PGVOL" >&2
+      echo "      Postgres settings; recreate it when convenient: ${0##*/} -i $ILABEL -d && podman volume rm $PGVOL" >&2
     elif [[ $vsig != "$sig" ]]; then
       if [[ -z $vsig ]]; then
         echo "Volume '$PGVOL' has no recorded Postgres settings (created by an older version)." >&2
@@ -620,7 +625,8 @@ ensure_postgres() {
         echo "or $STATE/pg-sig.key was deleted." >&2
       fi
       echo "Postgres ignores those settings on an existing volume. To apply them, discard the data first:" >&2
-      echo "    ${0##*/}${INST:+ -i $INST} -d && podman volume rm $PGVOL     # then rerun with -p" >&2
+      # always '-i NAME' (also '-i default'): a bare -d would remove every instance and the bridge
+      echo "    ${0##*/} -i $ILABEL -d && podman volume rm $PGVOL     # then rerun with -p" >&2
       exit 1
     fi
   else
