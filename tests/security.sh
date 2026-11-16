@@ -216,6 +216,9 @@ echo "\${0##*/} \$*" >> "$T/stub.log"
 case "\$1 \$2" in
   "pod ls") printf 'oc\noc-other\n' ;;
   "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
+  "image inspect")  # STUB_IDS="name=id ...": the image each tag points to; images have no tags left
+    case "\$*" in *RepoTags*) echo 0; exit 0 ;; esac
+    for m in \${STUB_IDS:-}; do [ "\${m%%=*}" = "\$5" ] && { echo "\${m#*=}"; exit 0; }; done; exit 125 ;;
 esac
 exit 0
 EOF
@@ -275,39 +278,15 @@ for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_
 done
 check "-d -a removes only oc Postgres secrets" sh -c "grep -qx 'podman secret rm oc-pg-password' '$T/stub.log' \
   && grep -qx 'podman secret rm oc-x-pg-password' '$T/stub.log' && ! grep -q 'secret rm other' '$T/stub.log'"
-check "-d -a prunes untagged earlier builds"   grep -qx 'podman image prune -f --filter label=oc.hash' "$T/stub.log"
-
-echo "image rebuilds (podman stubbed)"
-imgrun() {  # REBUILD old-id new-id rmi-status -> log of pm calls
-  cat > "$T/img.sh" <<EOF
-set -euo pipefail
-$(fn ensure_image)
-log() { :; }
-built=0
-pm() {
-  echo "pm \$*" >> $T/img.log
-  case "\$1 \$2" in
-    "image inspect") case "\$*" in *oc.hash*) echo oldhash ;; *) if [ \$built = 1 ]; then echo $3; else echo $2; fi ;; esac
-                     [ -n "\$(if [ \$built = 1 ]; then echo $3; else echo $2; fi)" ] || return 125 ;;
-    "build "*) built=1 ;;
-    "rmi "*) return $4 ;;
-  esac
-  return 0
-}
-REBUILD=$1 PULL=() BUILD=$T
-ensure_image oc-agent Containerfile.agent newhash
-EOF
-  : > "$T/img.log"; bash "$T/img.sh" >/dev/null 2>&1; echo "rc=$?" >> "$T/img.log"; cat "$T/img.log"
-}
-out=$(imgrun 0 oldid newid 0)
-check "rebuild removes the superseded image"    grep -qx 'pm rmi oldid' <<<"$out"
-check "superseded image removed without -f"     ! grep -q 'rmi -f' <<<"$out"
-out=$(imgrun 0 oldid newid 2)
-check "image still in use: rebuild succeeds"    grep -qx 'rc=0' <<<"$out"
-out=$(imgrun 0 "" newid 0)
-check "first build removes nothing"             ! grep -q 'pm rmi' <<<"$out"
-out=$(imgrun 1 sameid sameid 0)
-check "unchanged rebuild keeps the image"       ! grep -q 'pm rmi' <<<"$out"
+# -d -a with a recorded build on oc-agent and a foreign image on oc-chromium
+A=$(printf 'a%.0s' {1..64}) B=$(printf 'b%.0s' {1..64})
+mkdir -p "$DSTATE"; printf '%s\n' "$A" > "$DSTATE/built-images"; : > "$T/stub.log"
+env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME STUB_IDS="oc-agent=$A oc-chromium=$B" HOME="$T/dhome" \
+  PATH="$T/stub:$PATH" "$SCRIPT" -d -a -y >/dev/null 2>&1 </dev/null
+check "-d -a: our build untagged and removed"   sh -c "grep -qx 'podman untag $A localhost/oc-agent:latest' '$T/stub.log' \
+  && grep -qx 'podman rmi $A' '$T/stub.log'"
+check "-d -a: foreign image on our tag kept"    ! grep -q "$B" <(grep -E 'untag|rmi' "$T/stub.log")
+check "-d -a: never removes images by force or by tag" ! grep -qE 'rmi -f|rmi .*oc-(agent|chromium)|image prune' "$T/stub.log"
 
 echo "sandbox tree, worktrees and relabelling (in containers)"
 if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else
@@ -356,6 +335,50 @@ EOF
     check "relabel: sandbox file gets the agents' level" [ "$(stat -c %C "$T/isb/f")" = system_u:object_r:container_file_t:s0:c7,c9 ]
     check "relabel: symlink targets on the host untouched" [ "$(stat -c %C "$T/iv/keep")" = "$before" ]
   fi
+fi
+
+echo "image ownership (real Podman, throwaway images FROM scratch)"
+if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else
+  if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null; then H=(distrobox-host-exec); else H=(); fi
+  IT=localhost/oc-imgtest-$$ L=io.github.gorban.opencode-sandbox.image
+  mkdir -p "$T/ib"; printf 'FROM scratch\n' > "$T/ib/Containerfile.t"
+  cat > "$T/img.sh" <<EOF
+set -euo pipefail
+H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }
+IMAGE_LOG=$T/built-images OWNER_LABEL=$L
+$(fn owned_image); $(fn prune_images); $(fn ensure_image)
+log() { :; }
+REBUILD=1 PULL=() BUILD=$T/ib
+"\$@"
+EOF
+  img() { bash "$T/img.sh" "$@" 2>&1 >/dev/null; }
+  iid() { "${H[@]}" podman image inspect --format '{{.Id}}' "$1" 2>/dev/null; }
+  has() { "${H[@]}" podman image exists "$1"; }
+  pbuild() { "${H[@]}" podman build -q "$@" -f "$T/ib/Containerfile.t" "$T/ib"; }
+  # an unrelated image on our tag, even one carrying our labels
+  foreign=$(pbuild --label oc.hash=x --label "$L=agent" -t "$IT")
+  out=$(img ensure_image "$IT" Containerfile.t h1 agent); ours1=$(iid "$IT")
+  check "real: foreign image on our tag (with our labels) kept" has "$foreign"
+  check "real: user told about the foreign image"   grep -q 'not built by this oc-sandbox' <<<"$out"
+  img ensure_image "$IT" Containerfile.t h2 agent >/dev/null; ours2=$(iid "$IT")
+  check "real: our superseded build removed"        sh -c "[ '$ours1' != '$ours2' ] && ! ${H[*]} podman image exists '$ours1'"
+  # an untagged image derived from ours (inherits every label) and an unrelated dangling oc.hash image
+  printf 'FROM %s\n' "$IT" > "$T/ib/Containerfile.d"
+  derived=$("${H[@]}" podman build -q --label mine=1 -f "$T/ib/Containerfile.d" "$T/ib")
+  dangling=$(pbuild --label oc.hash=y)
+  img prune_images >/dev/null
+  check "real: untagged image derived from ours kept" has "$derived"
+  check "real: unrelated dangling oc.hash image kept" has "$dangling"
+  # a build of ours you tagged yourself, and one a container uses
+  "${H[@]}" podman tag "$ours2" "$IT-backup"
+  img ensure_image "$IT" Containerfile.t h3 agent >/dev/null; ours3=$(iid "$IT")
+  check "real: our build with your own tag kept"    has "$ours2"
+  ctr=$("${H[@]}" podman create "$ours3" /none 2>/dev/null)
+  img ensure_image "$IT" Containerfile.t h4 agent >/dev/null
+  check "real: our build used by a container kept"  has "$ours3"
+  "${H[@]}" podman rm -f "$ctr" >/dev/null 2>&1; img prune_images >/dev/null
+  check "real: ...and removed once it is unused"    ! has "$ours3"
+  "${H[@]}" podman rmi "$IT" "$IT-backup" "$foreign" "$derived" "$dangling" >/dev/null 2>&1 || true
 fi
 
 echo; echo "$pass passed, $fail failed"

@@ -21,6 +21,11 @@ BIN="$HOME/.local/bin"
 UNITS="$HOME/.config/systemd/user"
 AGENT_IMG=oc-agent
 CHROME_IMG=oc-chromium
+# Images this script built, by full ID (one per line). Only those are ever removed by it: the tag
+# names could belong to anything else, and labels prove nothing (any image built FROM oc-agent
+# inherits them). The role label is informational only.
+IMAGE_LOG="$STATE/built-images"
+OWNER_LABEL=io.github.gorban.opencode-sandbox.image
 DIND_IMG=${OC_DIND_IMAGE:-quay.io/podman/stable:latest}
 HOMEVOL=oc-home                        # OpenCode login, sessions, self-updated binary: shared by all instances
 CODE_BIN=${OC_CODE_BIN:-/home/linuxbrew/.linuxbrew/bin/code}   # host VS Code (override with OC_CODE_BIN)
@@ -135,6 +140,19 @@ else
 fi
 pm() { "${H[@]}" podman "$@"; }
 sc() { "${H[@]}" systemctl --user "$@"; }
+owned_image() { [[ $1 =~ ^[0-9a-f]{64}$ && -f $IMAGE_LOG ]] && grep -qxF "$1" "$IMAGE_LOG"; }
+prune_images() {  # remove our recorded builds that are now untagged and unused; forget vanished ones
+  [[ -f $IMAGE_LOG ]] || return 0
+  local id tags keep=()
+  while read -r id; do
+    [[ $id =~ ^[0-9a-f]{64}$ ]] || continue
+    tags=$(pm image inspect --format '{{len .RepoTags}}' "$id" 2>/dev/null) || continue   # gone
+    # Still tagged (current, or retagged by you) or used by a container (rmi without -f refuses): kept.
+    if [[ $tags == 0 ]] && pm rmi "$id" >/dev/null 2>&1; then continue; fi
+    keep+=("$id")
+  done < <(sort -u "$IMAGE_LOG")
+  printf '%s\n' ${keep[@]+"${keep[@]}"} > "$IMAGE_LOG.new" && mv -f "$IMAGE_LOG.new" "$IMAGE_LOG"
+}
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 cstate() { pm container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo none; }
 
@@ -286,8 +304,14 @@ if (( DELETE )); then
       echo "Skipped -a part."; exit 0
     fi
     log "Removing images, volumes, secrets, build files"
-    pm rmi -f "$AGENT_IMG" "$CHROME_IMG" >/dev/null 2>&1 || true
-    pm image prune -f --filter label=oc.hash >/dev/null 2>&1 || true   # untagged earlier builds
+    # Only images this script built: drop our tag from them (not other tags you gave them), then
+    # remove every recorded build that is untagged and unused. Never -f, never by tag alone.
+    for img in "$AGENT_IMG" "$CHROME_IMG"; do
+      id=$(pm image inspect --format '{{.Id}}' "$img" 2>/dev/null || true)
+      if owned_image "$id"; then pm untag "$id" "localhost/$img:latest" >/dev/null 2>&1 || true
+      elif [[ -n $id ]]; then echo "note: kept image '$img' (${id:0:12}): not built by this oc-sandbox installation" >&2; fi
+    done
+    prune_images
     mapfile -t vols < <({ pm volume ls -q --filter label=oc.sandbox=1; printf '%s\n' "$HOMEVOL" oc-chrome oc-pg; } | sort -u)
     for v in "${vols[@]}"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
     # No matching secret (never used -p) is normal; failing to list them only warns, so the rest of
@@ -492,19 +516,24 @@ if [[ ! -d $BUILD/oh-my-zsh ]]; then
 fi
 
 # ---- images (rebuilt only when inputs change, or with -r) -------------------------
-ensure_image() {  # name containerfile hash
-  local name=$1 file=$2 want=$3 have old new
-  have=$(pm image inspect --format '{{index .Labels "oc.hash"}}' "$name" 2>/dev/null || true)
-  if (( REBUILD )) || [[ $have != "$want" ]]; then
-    old=$(pm image inspect --format '{{.Id}}' "$name" 2>/dev/null || true)
+ensure_image() {  # name containerfile hash role(agent|chromium)
+  local name=$1 file=$2 want=$3 role=$4 cur="" id="" hash="" new
+  cur=$(pm image inspect --format '{{.Id}} {{index .Labels "oc.hash"}}' "$name" 2>/dev/null || true)
+  read -r id hash <<<"$cur" || true
+  if (( REBUILD )) || [[ $hash != "$want" ]] || ! owned_image "$id"; then
     log "Building $name"
-    pm build "${PULL[@]}" --label "oc.hash=$want" -t "$name" \
+    pm build "${PULL[@]}" --label "$OWNER_LABEL=$role" --label "oc.hash=$want" -t "$name" \
        -f "$BUILD/$file" "$BUILD"
-    # The build moved the name to the new image, leaving the previous one untagged (dangling).
-    # Remove it now; without -f, Podman keeps it while a container (e.g. a running agent) uses it,
-    # and prune_images picks it up on a later run.
-    new=$(pm image inspect --format '{{.Id}}' "$name" 2>/dev/null || true)
-    if [[ -n $old && $old != "$new" ]]; then pm rmi "$old" >/dev/null 2>&1 || true; fi
+    new=$(pm image inspect --format '{{.Id}}' "$name")
+    # The build moved the tag to the new image and left the previous one untagged. prune_images
+    # removes it if this script built it; anything else that had the tag is only untagged, never removed.
+    if [[ -n $id && $id != "$new" ]] && ! owned_image "$id"; then
+      echo "note: image '$name' (${id:0:12}) was not built by this oc-sandbox installation (another tool's" \
+           "image, or from an older version); the build untagged it but kept it. Remove it yourself if you" \
+           "do not need it: podman rmi ${id:0:12}" >&2
+    fi
+    printf '%s\n' "$new" >> "$IMAGE_LOG"
+    prune_images   # a previous build still used by a container (e.g. a running agent) stays for later
   else
     echo "image $name up to date"
   fi
@@ -512,8 +541,8 @@ ensure_image() {  # name containerfile hash
 agent_hash=$(cd "$BUILD" && cat Containerfile.agent zshrc gitconfig gitignore_global bridge-open opencode-sandbox.json | sha256sum | cut -d' ' -f1)
 chrome_hash=$(cd "$BUILD" && sha256sum Containerfile.chromium | cut -d' ' -f1)
 PULL=(); (( REBUILD )) && PULL=(--pull=always)
-ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"
-ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash"
+ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"  agent
+ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash" chromium
 
 ensure_volume() { pm volume exists "$1" 2>/dev/null \
   || pm volume create --label oc.sandbox=1 --label "oc.instance=$2" "$1" >/dev/null; }
@@ -828,10 +857,9 @@ echo "Chromium ready."
 if (( PG )); then ensure_postgres; fi
 if (( DIND )); then ensure_dind; fi
 for p in "${PORTS[@]}"; do echo "Port: http://127.0.0.1:${p%%:*} on the host -> 127.0.0.1:${p#*:} in pod '$POD'"; done
-# Earlier builds of our images that are untagged and no longer used: the ones ensure_image could not
-# remove because a container still ran them (e.g. Chromium before its recreation above). Only images
-# with our oc.hash label; prune never removes an image a container uses.
-pm image prune -f --filter label=oc.hash >/dev/null 2>&1 || true
+# Earlier builds that could not be removed while a container still ran them (e.g. Chromium before
+# its recreation above).
+prune_images
 
 (( NOLAUNCH )) && { log "Setup complete for instance '$ILABEL' (-n: not launching OpenCode)."; exit 0; }
 
