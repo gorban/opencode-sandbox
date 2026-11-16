@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# oc-sandbox — idempotent setup + launch + teardown for a sandboxed OpenCode
-# (rootless Podman pod: OpenCode agent + Chromium on your Wayland desktop).
+# oc-sandbox — idempotent setup + launch + teardown for sandboxed OpenCode instances
+# (one rootless Podman pod per instance: OpenCode agent + Chromium on your Wayland desktop,
+# optional Postgres and docker-in-docker sidecar).
 set -euo pipefail
 
-SB="$HOME/opencode-sandbox"            # mounted at /sandbox in the agent
-PROJECT="$SB/construct"                # OpenCode's working directory
+SB="$HOME/opencode-sandbox"            # mounted at /sandbox in every agent
 # This script runs on the HOST (and asks for admin rights), so it must never live inside the directory
-# that is mounted into the agent container, or the agent could rewrite it.
+# that is mounted into the agent containers, or an agent could rewrite it.
 SCRIPT_REAL=$(readlink -f "$0"); SCRIPT_DIR=${SCRIPT_REAL%/*}
 case $SCRIPT_REAL in
   "$(readlink -f "$SB")"/*)
@@ -19,60 +19,113 @@ STATE="${XDG_DATA_HOME:-$HOME/.local/share}/oc-sandbox"
 BUILD="$STATE/build"
 BIN="$HOME/.local/bin"
 UNITS="$HOME/.config/systemd/user"
-POD=${OC_POD:-oc}
 AGENT_IMG=oc-agent
 CHROME_IMG=oc-chromium
-VOLS=(oc-home oc-chrome)
-PGVOL=oc-pg                            # Postgres data (created by -p, deleted by -d -a)
-PGSECRET=oc-pg-password                # Podman secret holding the Postgres password (deleted by -d -a)
+DIND_IMG=${OC_DIND_IMAGE:-quay.io/podman/stable:latest}
+HOMEVOL=oc-home                        # OpenCode login, sessions, self-updated binary: shared by all instances
 CODE_BIN=${OC_CODE_BIN:-/home/linuxbrew/.linuxbrew/bin/code}   # host VS Code (override with OC_CODE_BIN)
 BC_BIN=${OC_BCOMPARE_BIN:-/usr/bin/bcompare}                         # host Beyond Compare (override with OC_BCOMPARE_BIN)
+AGENT_MEM=${OC_AGENT_MEMORY:-4g} CHROME_MEM=${OC_CHROMIUM_MEMORY:-4g} DIND_MEM=${OC_DIND_MEMORY:-4g}
 FWD_ENV=(ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY GOOGLE_API_KEY)
+# Pod ports that must never be published: a mapped connection reaches the pod as 127.0.0.1, which
+# Chromium DevTools (full browser control) and Postgres (trust auth, any role) accept without a password.
+SENSITIVE_PORTS=(9222 5432)
+RESERVED_NAMES=" agent chromium chrome postgres pg dind home "
 
 usage() {
   cat <<EOF
-Usage: ${0##*/} [-r] [-n] [-p] [-K] | -x | -k | -d [-a] [-y] | -h
+Usage: ${0##*/} [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
+       ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
 
-  (no flags)  Ensure everything exists (images, volumes, host bridge, pod,
-              Chromium), then start OpenCode in $PROJECT.
-              Safe to run repeatedly; only missing/changed pieces are touched.
-              If OpenCode is already running it only completes the setup (like -n).
+  (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
+              OpenCode. Safe to run repeatedly; only missing/changed pieces are touched.
+              If that instance's OpenCode is already running it only completes the setup (like -n).
+  -i NAME     Work on instance NAME (default: the "default" instance). Every instance has its own
+              pod, Chromium (and profile), Postgres data and docker-in-docker storage, so several can
+              run the same app on the same ports at once. Names: a-z, 0-9, '-'.
+  -C DIR      Working directory, relative to $SB (default: construct for the default
+              instance, wt/NAME for others). Created if missing.
+  -W REPO[:BRANCH]
+              Make the working directory a git worktree of $SB/REPO on BRANCH (default: the
+              instance name; created from REPO's HEAD if it does not exist). Runs inside a container.
+  -P HOST:POD Publish pod port POD on the host as 127.0.0.1:HOST (repeatable, or comma-separated).
+              Kept until changed; '-P none' removes all. Changing ports recreates the pod, which is
+              refused while that instance's OpenCode runs. Ports ${SENSITIVE_PORTS[*]} are refused.
+  -p          Also run Postgres in the pod (data volume per instance, survives restarts and -d;
+              only -d -a deletes it). There are NO defaults: configure image/user/password/database
+              first (~/.config/oc-sandbox/postgres.env, postgres.NAME.env, or OC_PG_*). See README.md.
+  -D          Also run a docker-in-docker sidecar (rootless Podman) in the pod; the agent gets
+              'docker' / 'docker compose' (DOCKER_HOST). Weaker isolation than the agent: see README.md.
   -n          Setup only: do not launch OpenCode.
   -r          Rebuild images from latest bases and recreate the pod.
-  -d          Delete: remove the pod, host bridge service and handler script.
-              Keeps images, volumes and everything in $SB.
-  -d -a       Delete everything above plus images, volumes (OpenCode login,
-              Chromium profile, Postgres data), generated build files and $SB/.bridge.
-  -y          Skip the confirmation prompt for -d -a.
-  -p          Also run Postgres in the pod (data volume: $PGVOL, survives restarts and
-              -d; only -d -a deletes it). Combine freely: '${0##*/} -p' = Chromium +
-              Postgres + OpenCode; '-n -p' = same without launching OpenCode.
-              There are NO defaults: configure image/user/password/database first
-              (~/.config/oc-sandbox/postgres.env or OC_PG_* variables). See README.md.
-  -x          Open a zsh shell inside the OpenCode container that is already
-              running (from another terminal). Same files, env and vi bindings.
-  -k          List detected FIDO/U2F security keys (what would be passed to
-              Chromium) and exit.
+  -x          Open a zsh shell inside that instance's running OpenCode container.
+  -l          List instances.
+  -k          List detected FIDO/U2F security keys (what would be passed to Chromium) and exit.
   -K          Do not pass any security key to Chromium on this run.
+  -d          Delete: without -i, remove ALL instance pods and the host bridge; with -i, only that
+              instance's pod. Keeps images, volumes and everything in $SB.
+  -d -a       Also delete volumes (Chromium profile, Postgres data, docker storage; without -i also
+              the OpenCode login, images, build files, SELinux module and $SB/.bridge).
+  -y          Skip the confirmation prompt for -d -a.
   -h          This help.
 
-Never touched: $SB/construct and your other files in $SB.
-Inside OpenCode: 'code FILE' / 'bcompare A B' open on the host via a
-restricted bridge (files under $SB only).
+Never touched: your files in $SB (including worktrees).
+Inside OpenCode: 'code FILE' / 'bcompare A B' open copies on the host via a restricted bridge.
 EOF
 }
+die() { echo "${0##*/}: $*" >&2; exit 2; }
 
 # ---- option parsing ---------------------------------------------------------
-DELETE=0 ALL=0 REBUILD=0 NOLAUNCH=0 YES=0 LISTKEYS=0 NOKEY=0 EXEC=0 PG=0
-while getopts ":hdarnykKxp" o; do
+DELETE=0 ALL=0 REBUILD=0 NOLAUNCH=0 YES=0 LISTKEYS=0 NOKEY=0 EXEC=0 PG=0 DIND=0 LIST=0
+INST="" INST_SET=0 CWD_ARG="" WT_ARG="" PORT_ARGS=()
+while getopts ":hdarnykKxplDi:P:C:W:" o; do
   case $o in
     h) usage; exit 0 ;;
     d) DELETE=1 ;; a) ALL=1 ;; r) REBUILD=1 ;; n) NOLAUNCH=1 ;; y) YES=1 ;;
-    k) LISTKEYS=1 ;; K) NOKEY=1 ;; x) EXEC=1 ;; p) PG=1 ;;
+    k) LISTKEYS=1 ;; K) NOKEY=1 ;; x) EXEC=1 ;; p) PG=1 ;; D) DIND=1 ;; l) LIST=1 ;;
+    i) INST=$OPTARG INST_SET=1 ;; P) PORT_ARGS+=("$OPTARG") ;; C) CWD_ARG=$OPTARG ;; W) WT_ARG=$OPTARG ;;
+    :) die "-$OPTARG needs a value" ;;
     *) usage >&2; exit 2 ;;
   esac
 done
-if (( ALL && !DELETE )); then echo "-a only makes sense with -d" >&2; exit 2; fi
+(( OPTIND > $# )) || die "unexpected argument: ${!OPTIND}"
+if (( ALL && !DELETE )); then die "-a only makes sense with -d"; fi
+if (( DELETE || EXEC || LIST || LISTKEYS )) && { (( PG || DIND || ${#PORT_ARGS[@]} )) || [[ -n $CWD_ARG$WT_ARG ]]; }; then
+  die "-p, -D, -P, -C and -W only apply when setting up or starting an instance"
+fi
+
+# ---- names ----------------------------------------------------------------------------------------
+valid_instance() {  # name -> 0/1
+  [[ $1 =~ ^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$ ]] && [[ $RESERVED_NAMES != *" $1 "* ]]
+}
+# INST_SET records that -i was given at all: "-i default" selects the default instance only and must
+# never fall through to the all-instances scope of a bare -d (or -d -a).
+if (( INST_SET )) && [[ -z $INST ]]; then die "-i needs an instance name (use 'default' for the default instance)"; fi
+[[ $INST == default ]] && INST=""
+[[ -z $INST ]] || valid_instance "$INST" \
+  || die "invalid instance name '$INST' (a-z, 0-9 and inner '-', at most 24 characters; not one of:$RESERVED_NAMES)"
+set_names() {  # derive every per-instance resource name; the default instance keeps the original names
+  local p
+  if [[ -z $INST ]]; then p=oc ILABEL=default DEFAULT_CWD=construct POD=oc; else p=oc-$INST ILABEL=$INST DEFAULT_CWD=wt/$INST POD=$p; fi
+  AGENT=$p-agent CHROME=$p-chromium PGC=$p-postgres DINDC=$p-dind
+  CHROMEVOL=$p-chrome PGVOL=$p-pg PGSECRET=$p-pg-password DINDVOL=$p-dind DINDRUN=$p-dind-run
+}
+set_names
+
+valid_relpath() {  # relative path below $SB without '.', '..' or empty components
+  [[ $1 =~ ^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$ ]] || return 1
+  local IFS=/ c
+  for c in $1; do [[ $c != . && $c != .. ]] || return 1; done
+}
+CWD=${CWD_ARG:-$DEFAULT_CWD}
+valid_relpath "$CWD" || die "-C: '$CWD' must be a plain relative path inside $SB"
+WT_REPO="" WT_BRANCH=""
+if [[ -n $WT_ARG ]]; then
+  WT_REPO=${WT_ARG%%:*}; WT_BRANCH=${WT_ARG#"$WT_REPO"}; WT_BRANCH=${WT_BRANCH#:}
+  WT_BRANCH=${WT_BRANCH:-$ILABEL}
+  valid_relpath "$WT_REPO" || die "-W: '$WT_REPO' must be a plain relative path inside $SB"
+  [[ $WT_BRANCH =~ ^[A-Za-z0-9._/@+-]+$ ]] || die "-W: invalid branch name '$WT_BRANCH'"
+fi
 
 # ---- run podman/systemctl on the host even when invoked from a distrobox ----
 if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null 2>&1; then
@@ -83,6 +136,32 @@ fi
 pm() { "${H[@]}" podman "$@"; }
 sc() { "${H[@]}" systemctl --user "$@"; }
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
+cstate() { pm container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo none; }
+
+# ---- ports ----------------------------------------------------------------------------------------
+PORTS=() PORTS_SET=0
+parse_ports() {  # PORT_ARGS -> PORTS ("HOST:POD"), refusing unsafe or impossible mappings
+  local a it h c s seen=" " low items
+  low=$("${H[@]}" cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)
+  for a in "${PORT_ARGS[@]}"; do
+    PORTS_SET=1
+    if [[ $a == none ]]; then PORTS=(); continue; fi
+    IFS=, read -ra items <<<"$a"
+    for it in "${items[@]}"; do
+      [[ $it =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]] || die "-P: '$it' is not HOSTPORT:PODPORT"
+      h=$((10#${BASH_REMATCH[1]})) c=$((10#${BASH_REMATCH[2]}))
+      (( h >= 1 && h <= 65535 && c >= 1 && c <= 65535 )) || die "-P: '$it': ports are 1-65535"
+      (( h >= low )) || die "-P: host port $h is below $low, which rootless Podman cannot bind; use e.g. $((h + 8000)):$c (the pod side may be any port)"
+      for s in "${SENSITIVE_PORTS[@]}"; do
+        (( c != s )) || die "-P: refusing to publish pod port $c: connections through a mapped port arrive as 127.0.0.1, which Chromium DevTools (9222) and Postgres (5432) trust without a password"
+      done
+      [[ $seen != *" $h "* ]] || die "-P: host port $h given twice"
+      seen+="$h "; PORTS+=("$h:$c")
+    done
+  done
+}
+parse_ports
+ports_label() { local IFS=,; printf '%s' "${PORTS[*]}"; }
 
 # FIDO/U2F security keys: hidraw nodes whose HID usage page is 0xF1D0 (never keyboards/mice).
 # Prints one line per key: /dev/hidrawN|Manufacturer Product|vid:pid
@@ -95,11 +174,35 @@ detect_keys() {
       "$(cat "$u/product" 2>/dev/null)" "$(cat "$u/idVendor" 2>/dev/null)" "$(cat "$u/idProduct" 2>/dev/null)"
   done; true' 2>/dev/null || true
 }
+
+# Pods of all instances: labelled ones, plus the default pod made by versions before labels existed.
+instance_pods() {
+  { pm pod ls --filter label=oc.sandbox=1 --format '{{.Name}}' 2>/dev/null || true
+    if pm pod exists oc 2>/dev/null; then echo oc; fi; } | sort -u
+}
+
+if (( LIST )); then
+  printf '%-14s %-10s %-8s %-22s %-24s %s\n' INSTANCE POD AGENT PORTS "WORKING DIR" SIDECARS
+  while read -r pod; do
+    [[ -n $pod ]] || continue
+    if [[ $pod == oc ]]; then inst=default INST=""; else inst=${pod#oc-} INST=${pod#oc-}; fi
+    set_names
+    ports=$(pm pod inspect "$pod" --format '{{index .Labels "oc.ports"}}' 2>/dev/null || true)
+    wd=$(pm container inspect --format '{{.Config.WorkingDir}}' "$AGENT" 2>/dev/null || true)
+    side=""
+    for c in "$CHROME" "$PGC" "$DINDC"; do
+      s=$(cstate "$c"); [[ $s == none ]] || side+="${c##*-}:$s "
+    done
+    printf '%-14s %-10s %-8s %-22s %-24s %s\n' "$inst" "$pod" "$(cstate "$AGENT")" \
+      "$(sed 's/:/->/g' <<<"${ports:--}")" "${wd:--}" "${side:--}"
+  done < <(instance_pods)
+  exit 0
+fi
 if (( EXEC )); then
-  if [[ $(pm container inspect --format '{{.State.Status}}' oc-agent 2>/dev/null || true) != running ]]; then
-    echo "OpenCode is not running. Start it first (oc-sandbox) in another terminal." >&2; exit 1
-  fi
-  exec "${H[@]}" podman exec -it -e SHELL=/bin/zsh -w /sandbox/construct oc-agent zsh
+  [[ $(cstate "$AGENT") == running ]] \
+    || { echo "OpenCode is not running in instance '$ILABEL'. Start it first (${0##*/}${INST:+ -i $INST}) in another terminal." >&2; exit 1; }
+  wd=$(pm container inspect --format '{{.Config.WorkingDir}}' "$AGENT")
+  exec "${H[@]}" podman exec -it -e SHELL=/bin/zsh -w "${wd:-/sandbox}" "$AGENT" zsh
 fi
 if (( LISTKEYS )); then
   keys=$(detect_keys)
@@ -110,8 +213,9 @@ if (( LISTKEYS )); then
 fi
 
 # ---- Postgres settings: NO defaults; must be configured (see README.md) ---------------------------
-# Read from OC_PG_* env vars or ~/.config/oc-sandbox/postgres.env (KEY=VALUE lines; env wins).
-# That file lives OUTSIDE the sandbox, so the agent cannot change which image/credentials get used.
+# Read from OC_PG_* env vars or ~/.config/oc-sandbox/postgres.env (postgres.NAME.env for instance NAME
+# if it exists; KEY=VALUE lines; env wins). These files live OUTSIDE the sandbox, so the agent cannot
+# change which image/credentials get used.
 #   OC_PG_IMAGE     image to run                       (required)
 #   OC_PG_USER      superuser created on first start   (required)
 #   OC_PG_PASSWORD  its password                       (required)
@@ -119,8 +223,10 @@ fi
 #   OC_PG_INIT_DIR  dir of *.sql/*.sh run once when the data volume is first created
 #                   (optional; default ~/.config/oc-sandbox/postgres-init if it exists)
 load_pg_config() {
-  local k v line missing=()
-  PG_CONF=${OC_PG_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox/postgres.env}
+  local k v line missing=() cdir=${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox
+  PG_CONF=$cdir/postgres.env
+  [[ -n $INST && -f $cdir/postgres.$INST.env ]] && PG_CONF=$cdir/postgres.$INST.env
+  PG_CONF=${OC_PG_CONF:-$PG_CONF}
   if [[ -f $PG_CONF ]]; then
     # KEY=VALUE lines (optional 'export ', spaces around '=' allowed). A quoted value is taken
     # literally; an unquoted one ends at whitespace followed by '#' (an inline comment).
@@ -152,33 +258,51 @@ load_pg_config() {
     exit 1
   fi
   PG_IMAGE=$OC_PG_IMAGE PG_USER=$OC_PG_USER PG_PASSWORD=$OC_PG_PASSWORD PG_DB=$OC_PG_DB
-  PG_INIT=${OC_PG_INIT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox/postgres-init}
+  PG_INIT=${OC_PG_INIT_DIR:-$cdir/postgres-init}
 }
 
 # ---- teardown -----------------------------------------------------------------
+confirm() { (( YES )) && return 0; read -r -p "$1 [y/N] " a; [[ $a == [yY]* ]]; }
 if (( DELETE )); then
-  log "Removing pod '$POD'"
-  pm pod rm -f "$POD" >/dev/null 2>&1 || true
+  if (( INST_SET )); then                                   # one instance only (also -i default)
+    log "Removing instance '$ILABEL' (pod $POD)"
+    pm pod rm -f "$POD" >/dev/null 2>&1 || true
+    if (( ALL )); then
+      if confirm "Also delete volumes $CHROMEVOL $PGVOL $DINDVOL $DINDRUN (Chromium profile, Postgres data, docker storage)?"; then
+        for v in "$CHROMEVOL" "$PGVOL" "$DINDVOL" "$DINDRUN"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
+        pm secret rm "$PGSECRET" >/dev/null 2>&1 || true
+      else echo "Skipped -a part."; fi
+    fi
+    log "Done. $SB/$DEFAULT_CWD (and any other files in $SB) left untouched."
+    exit 0
+  fi
+  for pod in $(instance_pods); do log "Removing pod '$pod'"; pm pod rm -f "$pod" >/dev/null 2>&1 || true; done
   log "Removing host bridge"
   sc disable --now oc-bridge.path >/dev/null 2>&1 || true
   rm -f "$UNITS/oc-bridge.path" "$UNITS/oc-bridge.service" "$BIN/oc-bridge"
   sc daemon-reload >/dev/null 2>&1 || true
   if (( ALL )); then
-    if (( !YES )); then
-      read -r -p "Also delete volumes ${VOLS[*]} $PGVOL (OpenCode login, Chromium profile, Postgres data), images and build files? [y/N] " a
-      [[ $a == [yY]* ]] || { echo "Skipped -a part."; exit 0; }
+    if ! confirm "Also delete ALL oc-sandbox volumes (OpenCode login, Chromium profiles, Postgres data, docker storage), images and build files?"; then
+      echo "Skipped -a part."; exit 0
     fi
-    log "Removing images, volumes, build files"
+    log "Removing images, volumes, secrets, build files"
     pm rmi -f "$AGENT_IMG" "$CHROME_IMG" >/dev/null 2>&1 || true
-    pm volume rm -f "${VOLS[@]}" "$PGVOL" >/dev/null 2>&1 || true
-    pm secret rm "$PGSECRET" >/dev/null 2>&1 || true
+    mapfile -t vols < <({ pm volume ls -q --filter label=oc.sandbox=1; printf '%s\n' "$HOMEVOL" oc-chrome oc-pg; } | sort -u)
+    for v in "${vols[@]}"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
+    # No matching secret (never used -p) is normal; failing to list them only warns, so the rest of
+    # the cleanup (SELinux module, state, .bridge) still runs.
+    if secrets=$(pm secret ls --format '{{.Name}}' 2>/dev/null); then
+      while read -r s; do
+        if [[ $s =~ ^oc(-[a-z0-9-]+)?-pg-password$ ]]; then pm secret rm "$s" >/dev/null 2>&1 || true; fi
+      done <<<"$secrets"
+    else echo "warning: could not list Podman secrets; remove any oc-*-pg-password secrets by hand" >&2; fi
     log "Removing SELinux module oc_chromium (asks for your admin password)"
     "${H[@]}" pkexec semodule -r oc_chromium >/dev/null 2>&1 || "${H[@]}" sudo semodule -r oc_chromium || true
-    # Safe on the host: the pod (and with it the agent) is gone, so nothing can change $SB/.bridge
+    # Safe on the host: every pod (and with it every agent) is gone, so nothing can change $SB/.bridge
     # concurrently, and GNU rm -r never follows symlinks (it unlinks them).
     rm -rf "$STATE" "$SB/.bridge"
   fi
-  log "Done. $SB/construct left untouched."
+  log "Done. Your files in $SB left untouched."
   exit 0
 fi
 
@@ -195,13 +319,86 @@ WL="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-wayland-0}"
 # Host-owned directories only. Nothing inside $SB is created from the host: see init_sandbox_tree.
 mkdir -p "$SB" "$BUILD" "$BIN" "$UNITS"
 
+# One SELinux level (MCS categories) shared by all agents, so several can use $SB at once; generated
+# once per installation. Podman's ':Z' would give every agent a new level (cutting the others off)
+# and would walk the agent-writable tree on the host; relabel_shared does it inside a container instead.
+if [[ ! -s $STATE/sb-level ]]; then
+  a=$((RANDOM % 1024)); b=$(( (a + 1 + RANDOM % 1023) % 1024 )); (( a < b )) || { t=$a; a=$b; b=$t; }
+  printf 's0:c%d,c%d\n' "$a" "$b" > "$STATE/sb-level"
+fi
+LEVEL=$(< "$STATE/sb-level")
+[[ $LEVEL =~ ^s0:c[0-9]+,c[0-9]+$ ]] || { echo "corrupt $STATE/sb-level (delete it and rerun)" >&2; exit 1; }
+
 # The agent can replace anything inside $SB (e.g. construct/ or .bridge/ with a symlink to a host
-# directory) at any moment, so the host never creates or writes paths in it. A throwaway container
-# that sees ONLY $SB (at /sandbox) does it instead: a symlink there resolves inside that container's
-# own filesystem, so whatever it points to, no write can reach the host outside $SB, and no
-# check-then-use race exists to win. label=disable avoids relabelling $SB while the agent may run;
-# the container has no capabilities, no network, and runs nothing but this fixed command.
-OPENCODE_JSON=$(cat <<'EOF'
+# directory) at any moment, so the host never creates, writes, relabels or runs git on paths in it.
+# Throwaway containers that see ONLY $SB (at /sandbox) do it instead: a symlink there resolves inside
+# that container's own filesystem, so whatever it points to, nothing outside $SB can be reached, and
+# no check-then-use race exists to win. label=disable avoids relabelling $SB while agents run; these
+# containers have no network, no capabilities (FOWNER for relabelling only) and run fixed commands.
+safe_run() { pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
+  --security-opt=label=disable -v "$SB":/sandbox "$@"; }
+
+init_sandbox_tree() {  # dest [repo branch]: spool dirs, working directory, optional git worktree
+  safe_run --entrypoint sh "$AGENT_IMG" -c '
+    set -e; cd /sandbox; dest=$1 repo=$2 branch=$3
+    mkdir -p .bridge/requests .bridge/tmp .bridge/files
+    if [ -n "$repo" ] && [ ! -e "$dest/.git" ]; then
+      git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "-W: $repo is not a git repository" >&2; exit 3; }
+      git check-ref-format --branch "$branch" >/dev/null 2>&1 || { echo "-W: invalid branch name $branch" >&2; exit 3; }
+      mkdir -p "$(dirname "$dest")"
+      # hooks off: the repository is agent-controlled (and this container must stay a fixed command)
+      g="git -C $repo -c core.hooksPath=/dev/null worktree add --relative-paths"
+      if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then $g "/sandbox/$dest" "$branch"
+      else $g -b "$branch" "/sandbox/$dest"; fi
+    fi
+    mkdir -p "$dest"' sh "$1" "${2:-}" "${3:-}"
+}
+
+RELABEL_PY='import os, sys
+ctx = sys.argv[1].encode(); bad = 0
+def lab(p):
+    global bad
+    try:
+        if os.getxattr(p, "security.selinux", follow_symlinks=False).rstrip(b"\0") != ctx:
+            os.setxattr(p, "security.selinux", ctx, follow_symlinks=False)
+    except OSError:
+        bad += 1
+for top in sys.argv[2:]:
+    lab(top)
+    for root, dirs, files in os.walk(top):          # never follows symlinks; labels the links themselves
+        for x in dirs + files:
+            lab(os.path.join(root, x))
+if bad:
+    print(f"relabel: {bad} entries could not be relabelled (agents may not be able to use them)", file=sys.stderr)'
+relabel_shared() {  # give $SB and the shared home volume the agents' level (inside a container)
+  safe_run --cap-add=FOWNER -v "$HOMEVOL":/home-vol --entrypoint python3 "$AGENT_IMG" \
+    -I -c "$RELABEL_PY" "system_u:object_r:container_file_t:$LEVEL" /sandbox /home-vol
+}
+
+# ---- build context ------------------------------------------------------------
+cat > "$BUILD/Containerfile.agent" <<'EOF'
+FROM ghcr.io/anomalyco/opencode:latest
+RUN apk add --no-cache nodejs npm git zsh vim tmux jq curl less ripgrep fd ncurses \
+      build-base make perl xz python3 py3-pip postgresql17-client \
+      bash tar unzip docker-cli docker-cli-compose
+COPY oh-my-zsh /opt/oh-my-zsh
+COPY zshrc /opt/zsh/.zshrc
+COPY gitconfig /etc/gitconfig
+COPY gitignore_global /etc/gitignore_global
+COPY bridge-open /usr/local/bin/bridge-open
+COPY opencode-sandbox.json /etc/opencode/oc-sandbox.json
+RUN chmod +x /usr/local/bin/bridge-open \
+ && ln -s bridge-open /usr/local/bin/code \
+ && ln -s bridge-open /usr/local/bin/bcompare
+# PATH: self-updating OpenCode lives in the oc-home volume (/root/.opencode) and wins over the baked copy.
+# TAR_OPTIONS: the updater untars as root without CHOWN (we drop all caps), so skip ownership restore.
+# OPENCODE_CONFIG: extra config (Chromium DevTools MCP) merged with your global and project configs.
+ENV OC_SANDBOX=1 ZDOTDIR=/opt/zsh LANG=en_US.UTF-8 TAR_OPTIONS=--no-same-owner \
+    OPENCODE_CONFIG=/etc/opencode/oc-sandbox.json \
+    PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EOF
+
+cat > "$BUILD/opencode-sandbox.json" <<'EOF'
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
@@ -212,35 +409,6 @@ OPENCODE_JSON=$(cat <<'EOF'
     }
   }
 }
-EOF
-)
-init_sandbox_tree() {
-  pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
-    --security-opt=label=disable -v "$SB":/sandbox --entrypoint sh "$AGENT_IMG" -c '
-      set -e; cd /sandbox
-      mkdir -p construct .bridge/requests .bridge/tmp .bridge/files
-      if [ -e construct/opencode.json ] || [ -L construct/opencode.json ]; then exit 0; fi
-      cat > construct/opencode.json' <<<"$OPENCODE_JSON"
-}
-
-# ---- build context ------------------------------------------------------------
-cat > "$BUILD/Containerfile.agent" <<'EOF'
-FROM ghcr.io/anomalyco/opencode:latest
-RUN apk add --no-cache nodejs npm git zsh vim tmux jq curl less ripgrep fd ncurses \
-      build-base make perl xz python3 py3-pip postgresql17-client \
-      bash tar unzip
-COPY oh-my-zsh /opt/oh-my-zsh
-COPY zshrc /opt/zsh/.zshrc
-COPY gitconfig /etc/gitconfig
-COPY gitignore_global /etc/gitignore_global
-COPY bridge-open /usr/local/bin/bridge-open
-RUN chmod +x /usr/local/bin/bridge-open \
- && ln -s bridge-open /usr/local/bin/code \
- && ln -s bridge-open /usr/local/bin/bcompare
-# PATH: self-updating OpenCode lives in the oc-home volume (/root/.opencode) and wins over the baked copy.
-# TAR_OPTIONS: the updater untars as root without CHOWN (we drop all caps), so skip ownership restore.
-ENV OC_SANDBOX=1 ZDOTDIR=/opt/zsh LANG=en_US.UTF-8 TAR_OPTIONS=--no-same-owner \
-    PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
 
 cat > "$BUILD/Containerfile.chromium" <<'EOF'
@@ -261,8 +429,8 @@ plugins=(git zsh-vi-mode)        # system-clipboard omitted: no display in this 
 HISTFILE=/root/.zsh_history; HISTSIZE=10000; SAVEHIST=10000
 bindkey -v
 source $ZSH/oh-my-zsh.sh
-# make it obvious this is the sandbox, not your host or distrobox
-PROMPT="%B%F{red}[sandbox]%f%b $PROMPT"
+# make it obvious this is the sandbox (and which instance), not your host or distrobox
+PROMPT="%B%F{red}[sandbox${OC_INSTANCE:+:$OC_INSTANCE}]%f%b $PROMPT"
 EOF
 
 cat > "$BUILD/bridge-open" <<'EOF'
@@ -306,6 +474,7 @@ fi
 "${g[@]}" difftool.bc.path bcompare
 "${g[@]}" merge.tool vimdiff              # mergetool must block, so it stays in-container
 "${g[@]}" mergetool.keepBackup false
+"${g[@]}" worktree.useRelativePaths true  # worktree links work both as /sandbox/... and ~/opencode-sandbox/...
 if [[ -f $HOME/.gitignore_global ]]; then cp "$HOME/.gitignore_global" "$BUILD/gitignore_global"
 else : > "$BUILD/gitignore_global"; fi
 
@@ -333,23 +502,26 @@ ensure_image() {  # name containerfile hash
     echo "image $name up to date"
   fi
 }
-agent_hash=$(cd "$BUILD" && cat Containerfile.agent zshrc gitconfig gitignore_global bridge-open | sha256sum | cut -d' ' -f1)
+agent_hash=$(cd "$BUILD" && cat Containerfile.agent zshrc gitconfig gitignore_global bridge-open opencode-sandbox.json | sha256sum | cut -d' ' -f1)
 chrome_hash=$(cd "$BUILD" && sha256sum Containerfile.chromium | cut -d' ' -f1)
 PULL=(); (( REBUILD )) && PULL=(--pull=always)
 ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"
 ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash"
-init_sandbox_tree || { echo "could not create $PROJECT and $SB/.bridge (see above)" >&2; exit 1; }
 
-# ---- volumes --------------------------------------------------------------------
-for v in "${VOLS[@]}"; do
-  pm volume exists "$v" 2>/dev/null || pm volume create "$v" >/dev/null
-done
+ensure_volume() { pm volume exists "$1" 2>/dev/null \
+  || pm volume create --label oc.sandbox=1 --label "oc.instance=$2" "$1" >/dev/null; }
+ensure_volume "$HOMEVOL" shared
+ensure_volume "$CHROMEVOL" "$ILABEL"
+
+init_sandbox_tree "$CWD" "$WT_REPO" "$WT_BRANCH" \
+  || { echo "could not prepare $SB/$CWD and $SB/.bridge (see above)" >&2; exit 1; }
+relabel_shared || { echo "could not relabel $SB for the agents (see above)" >&2; exit 1; }
 
 # ---- OpenCode self-update: install once into the persistent volume so 'opencode upgrade' works ----
 # (the image's baked binary has no recognizable install method). PATH is trimmed so the
 # installer does not see the baked copy and skip itself.
 if ! pm run --rm --entrypoint sh --cap-drop=ALL --security-opt=no-new-privileges \
-       -v oc-home:/root:Z "$AGENT_IMG" \
+       --security-opt "label=level:$LEVEL" -v "$HOMEVOL":/root "$AGENT_IMG" \
        -c 'test -x /root/.opencode/bin/opencode || { PATH=/usr/bin:/bin curl -fsSL https://opencode.ai/install | PATH=/usr/bin:/bin bash >/dev/null 2>&1; test -x /root/.opencode/bin/opencode; }'; then
   echo "warning: could not install self-updating OpenCode (offline?); using the baked-in copy" >&2
 fi
@@ -358,7 +530,7 @@ fi
 # oc-bridge.py (next to this script, outside the sandbox) never resolves a path through the
 # agent-writable tree by name and never hands one to VS Code / Beyond Compare: it copies the requested
 # files with descriptor-relative no-follow opens into a host-owned staging directory, opens the copy,
-# and writes saved edits back the same way. See the header of oc-bridge.py.
+# and writes saved edits back the same way. See the header of oc-bridge.py. Shared by all instances.
 [[ -f $SCRIPT_DIR/oc-bridge.py ]] || { echo "missing $SCRIPT_DIR/oc-bridge.py (incomplete checkout?)" >&2; exit 1; }
 "${H[@]}" python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
   || echo "warning: the host bridge needs python3 >= 3.11 on the host; 'code'/'bcompare' will do nothing" >&2
@@ -382,7 +554,7 @@ EOF
 sc daemon-reload
 sc enable --now oc-bridge.path >/dev/null 2>&1 || sc start oc-bridge.path
 
-# ---- SELinux policy: dedicated type so ONLY the Chromium container may use the Wayland socket ----
+# ---- SELinux policy: dedicated type so ONLY the Chromium containers may use the Wayland socket ----
 POLDIR="$STATE/policy"; TPL=/usr/share/udica/templates
 mkdir -p "$POLDIR"
 cat > "$POLDIR/oc_chromium.cil" <<'POL'
@@ -444,7 +616,7 @@ ensure_postgres() {
     legacy=$(printf '%s|%s|%s|%s' "$PG_USER" "$PG_PASSWORD" "$PG_DB" "$init_hash" | sha256sum | cut -c1-16)
     if [[ $vsig == "$legacy" ]]; then
       echo "note: volume '$PGVOL' (made by an older oc-sandbox) is labelled with an unkeyed hash of the" >&2
-      echo "      Postgres settings; recreate it when convenient: ${0##*/} -d && podman volume rm $PGVOL" >&2
+      echo "      Postgres settings; recreate it when convenient: ${0##*/} -i $ILABEL -d && podman volume rm $PGVOL" >&2
     elif [[ $vsig != "$sig" ]]; then
       if [[ -z $vsig ]]; then
         echo "Volume '$PGVOL' has no recorded Postgres settings (created by an older version)." >&2
@@ -453,19 +625,20 @@ ensure_postgres() {
         echo "or $STATE/pg-sig.key was deleted." >&2
       fi
       echo "Postgres ignores those settings on an existing volume. To apply them, discard the data first:" >&2
-      echo "    ${0##*/} -d && podman volume rm $PGVOL     # then rerun with -p" >&2
+      # always '-i NAME' (also '-i default'): a bare -d would remove every instance and the bridge
+      echo "    ${0##*/} -i $ILABEL -d && podman volume rm $PGVOL     # then rerun with -p" >&2
       exit 1
     fi
   else
-    pm volume create --label "oc.pgcfg=$sig" "$PGVOL" >/dev/null
+    pm volume create --label oc.sandbox=1 --label "oc.instance=$ILABEL" --label "oc.pgcfg=$sig" "$PGVOL" >/dev/null
   fi
 
   want_cfg="v2:$sig:$PG_IMAGE"
-  pg_state=$(pm container inspect --format '{{.State.Status}}' oc-postgres 2>/dev/null || echo none)
-  pg_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.pg"}}' oc-postgres 2>/dev/null || true)
+  pg_state=$(cstate "$PGC")
+  pg_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.pg"}}' "$PGC" 2>/dev/null || true)
   if [[ $pg_state != none && $pg_cfg != "$want_cfg" ]]; then
     log "Postgres container settings changed; recreating it (data volume $PGVOL is kept)"
-    pm rm -f oc-postgres >/dev/null; pg_state=none
+    pm rm -f "$PGC" >/dev/null; pg_state=none
   fi
   case $pg_state in
     running) echo "Postgres already running." ;;
@@ -474,7 +647,7 @@ ensure_postgres() {
       # The password goes over stdin into a Podman secret and is mounted as a file: it never appears
       # in any argv, in the container's environment, or in 'podman inspect'.
       printf '%s' "$PG_PASSWORD" | pm secret create --replace "$PGSECRET" - >/dev/null
-      pm run -d --name oc-postgres --pod "$POD" --label "oc.pg=$want_cfg" --security-opt=no-new-privileges \
+      pm run -d --name "$PGC" --pod "$POD" --label "oc.pg=$want_cfg" --security-opt=no-new-privileges \
         --cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID \
         --cap-add=FOWNER --cap-add=DAC_OVERRIDE \
         --pids-limit=256 --memory=2g \
@@ -484,14 +657,14 @@ ensure_postgres() {
         -e POSTGRES_USER="$PG_USER" -e POSTGRES_DB="$PG_DB" \
         "$PG_IMAGE" -c listen_addresses=127.0.0.1 >/dev/null ;;
     *) log "Starting existing Postgres container (data kept in volume $PGVOL)"
-       pm start oc-postgres >/dev/null ;;
+       pm start "$PGC" >/dev/null ;;
   esac
   for _ in $(seq 1 60); do
-    pm exec oc-postgres pg_isready -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" -q 2>/dev/null && { ok=1; break; }
+    pm exec "$PGC" pg_isready -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" -q 2>/dev/null && { ok=1; break; }
     sleep 1
   done
-  (( ok )) || { echo "Postgres did not become ready:" >&2; pm logs --tail 15 oc-postgres >&2; exit 1; }
-  echo "Postgres ready (inside the pod only, not reachable from host or LAN)."
+  (( ok )) || { echo "Postgres did not become ready:" >&2; pm logs --tail 15 "$PGC" >&2; exit 1; }
+  echo "Postgres ready (inside pod '$POD' only, not reachable from the host, the LAN or other instances)."
   echo "  psql -h 127.0.0.1 -U $PG_USER -d $PG_DB     # no password needed on localhost with the standard images"
   echo "  DATABASE_URL=postgres://$(urlenc "$PG_USER")@127.0.0.1:5432/$(urlenc "$PG_DB")"
 }
@@ -505,13 +678,85 @@ urlenc() {  # percent-encode for a URL component (byte-wise, so UTF-8 comes out 
   printf '%s' "$out"
 }
 
-# ---- pod + Chromium ----------------------------------------------------------------
-(( REBUILD )) && pm pod rm -f "$POD" >/dev/null 2>&1 || true
-pm pod exists "$POD" 2>/dev/null || { log "Creating pod '$POD'"; pm pod create --name "$POD" >/dev/null; }
+# Docker-in-docker: rootless Podman in a sidecar, reachable by the agent only through a socket in a
+# small per-instance volume. It needs what nested rootless containers need (default capabilities,
+# setuid newuidmap, /dev/fuse, /dev/net/tun) and runs SELinux-unconfined (label=disable): weaker than
+# the agent, hence opt-in. Nested containers share the pod's network with --network host.
+ensure_dind() {
+  local want="v1:$DIND_IMG" have state ok=0 pull=()
+  (( REBUILD )) && pull=(--pull=newer)
+  state=$(cstate "$DINDC")
+  have=$(pm container inspect --format '{{index .Config.Labels "oc.dind"}}' "$DINDC" 2>/dev/null || true)
+  if [[ $state != none && $have != "$want" ]]; then
+    log "docker-in-docker settings changed; recreating it (storage volume $DINDVOL is kept)"
+    pm rm -f "$DINDC" >/dev/null; state=none
+  fi
+  ensure_volume "$DINDVOL" "$ILABEL"; ensure_volume "$DINDRUN" "$ILABEL"
+  case $state in
+    running) echo "docker-in-docker already running." ;;
+    none)
+      log "Starting docker-in-docker sidecar in pod '$POD' (image $DIND_IMG, storage $DINDVOL)"
+      pm run -d "${pull[@]}" --name "$DINDC" --pod "$POD" --label "oc.dind=$want" \
+        --user podman --device /dev/fuse --device /dev/net/tun --security-opt label=disable \
+        --pids-limit=4096 --memory="$DIND_MEM" \
+        -v "$DINDVOL":/home/podman/.local/share/containers -v "$DINDRUN":/run/dind:U -v "$SB":/sandbox:ro \
+        "$DIND_IMG" sh -c 's=/run/dind/podman.sock; rm -f $s
+          podman system service --time=0 unix://$s & i=0
+          while [ ! -S $s ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+          chmod 0666 $s; wait' >/dev/null ;;
+    *) log "Starting existing docker-in-docker sidecar"; pm start "$DINDC" >/dev/null ;;
+  esac
+  for _ in $(seq 1 60); do
+    pm exec "$DINDC" curl -sf --unix-socket /run/dind/podman.sock http://d/_ping >/dev/null 2>&1 && { ok=1; break; }
+    sleep 1
+  done
+  (( ok )) || { echo "docker-in-docker did not become ready:" >&2; pm logs --tail 15 "$DINDC" >&2; exit 1; }
+  echo "docker-in-docker ready: 'docker run --network host ...' shares this pod's network (127.0.0.1)."
+}
 
+# ---- pod ------------------------------------------------------------------------------------------
+# Every pod gets pasta's --host-lo-to-ns-lo (published ports reach apps bound to 127.0.0.1 in the pod)
+# and an unprivileged-port sysctl scoped to the pod's network namespace (apps may bind ports < 1024
+# without NET_BIND_SERVICE). Ports are fixed at pod creation; the label records them.
+pod_exists() { pm pod exists "$POD" 2>/dev/null; }
+if pod_exists && (( !PORTS_SET )); then
+  have_ports=$(pm pod inspect "$POD" --format '{{index .Labels "oc.ports"}}' 2>/dev/null || true)
+  if [[ -n $have_ports ]]; then IFS=, read -ra PORTS <<<"$have_ports"; fi
+fi
+want_podcfg="v1|$(ports_label)"
+recreate=""
+if pod_exists; then
+  have_podcfg=$(pm pod inspect "$POD" --format '{{index .Labels "oc.podcfg"}}' 2>/dev/null || true)
+  if (( REBUILD )); then recreate="rebuild (-r)"
+  elif (( PORTS_SET )) && [[ $have_podcfg != "$want_podcfg" ]]; then recreate="port mapping changed"
+  fi
+fi
+if [[ -n $recreate ]]; then
+  if [[ $(cstate "$AGENT") == running ]]; then
+    echo "Cannot recreate pod '$POD' ($recreate): OpenCode is running in instance '$ILABEL'." >&2
+    echo "Exit it first, then rerun this command." >&2
+    exit 1
+  fi
+  # keep the sidecars this instance had (their data lives in volumes)
+  if [[ $(cstate "$PGC") != none ]] && (( !PG )); then PG=1; load_pg_config; fi
+  [[ $(cstate "$DINDC") != none ]] && DIND=1
+  log "Recreating pod '$POD' ($recreate)"
+  pm pod rm -f "$POD" >/dev/null
+fi
+if ! pod_exists; then
+  log "Creating pod '$POD'${PORTS[*]:+ (ports: $(ports_label))}"
+  podargs=()
+  for p in "${PORTS[@]}"; do podargs+=(-p "127.0.0.1:$p"); done
+  pm pod create --name "$POD" --label oc.sandbox=1 --label "oc.instance=$ILABEL" \
+    --label "oc.podcfg=$want_podcfg" --label "oc.ports=$(ports_label)" \
+    --network pasta:--host-lo-to-ns-lo --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+    "${podargs[@]}" >/dev/null
+fi
+
+# ---- Chromium ---------------------------------------------------------------------------------------
 want_id=$(pm image inspect --format '{{.Id}}' "$CHROME_IMG")
-have_id=$(pm container inspect --format '{{.Image}}' oc-chromium 2>/dev/null || true)
-have_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.cfg"}}' oc-chromium 2>/dev/null || true)
+have_id=$(pm container inspect --format '{{.Image}}' "$CHROME" 2>/dev/null || true)
+have_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.cfg"}}' "$CHROME" 2>/dev/null || true)
 # Security keys: pass ONLY FIDO hidraw nodes (see detect_keys); -K disables.
 keys=""
 if (( NOKEY )); then echo "Security keys: disabled (-K)"; else keys=$(detect_keys); fi
@@ -523,72 +768,82 @@ while IFS='|' read -r node name id; do
   [[ -n $node ]] && echo "Security key: $name [$id] -> $node"
 done <<<"$keys"
 (( NOKEY )) || [[ -n $keys ]] || echo "Security key: none detected (plug one in and rerun to use it)"
+# A named instance opens a first tab titled with its name, so its window is easy to tell apart.
+starturl=()
+[[ -n $INST ]] && starturl=("data:text/html,%3Ctitle%3Eoc%20$INST%3C/title%3E%3Ch1%3Eoc-sandbox%20instance%20$INST%3C/h1%3E")
 # recreate the container only if its run command, policy, or security-key set changed
 cfg=$( { sed -n '/^# >>>chromium-run/,/^# <<<chromium-run/p' "$SCRIPT_REAL"; echo "$fido_nodes"; cat "$POLDIR/oc_chromium.cil"; } | sha256sum | cut -c1-16)
 if [[ -n $have_id && ( $have_id != "$want_id" || $have_cfg != "$cfg" ) ]]; then
   log "Chromium image/config changed; recreating container"
-  pm rm -f oc-chromium >/dev/null
+  pm rm -f "$CHROME" >/dev/null
   have_id=
 fi
 if [[ -z $have_id ]]; then
   # A crash/reboot leaves SingletonLock naming the old pod's hostname; Chromium then refuses the profile.
-  # No Chromium container exists at this point, so clearing the locks is safe.
-  pm run --rm --entrypoint sh --cap-drop=ALL --cap-add=DAC_OVERRIDE -v oc-chrome:/profile:Z "$CHROME_IMG" \
+  # No Chromium container for this instance exists at this point, so clearing the locks is safe.
+  pm run --rm --entrypoint sh --cap-drop=ALL --cap-add=DAC_OVERRIDE -v "$CHROMEVOL":/profile:Z "$CHROME_IMG" \
      -c 'rm -f /profile/SingletonLock /profile/SingletonCookie /profile/SingletonSocket' >/dev/null 2>&1 || true
   log "Starting Chromium"
   # DAC_OVERRIDE: Chromium's crashpad handler aborts without it under --cap-drop=ALL.
   # label type oc_chromium.process: custom SELinux type (see policy dir) that may use the Wayland socket.
 # >>>chromium-run
-  pm run -d --name oc-chromium --pod "$POD" --label "oc.cfg=$cfg" \
+  pm run -d --name "$CHROME" --pod "$POD" --label "oc.cfg=$cfg" \
     --cap-drop=ALL --cap-add=DAC_OVERRIDE --security-opt=no-new-privileges \
     --security-opt label=type:oc_chromium.process \
-    --pids-limit=1024 --memory=4g --shm-size=1g \
-    -v oc-chrome:/profile:Z \
+    --pids-limit=1024 --memory="$CHROME_MEM" --shm-size=1g \
+    -v "$CHROMEVOL":/profile:Z \
     "${devargs[@]}" \
     -v "$WL":/run/xdg/wayland-1 \
     -e XDG_RUNTIME_DIR=/run/xdg -e WAYLAND_DISPLAY=wayland-1 \
     "$CHROME_IMG" \
     chromium-browser --ozone-platform=wayland --no-sandbox --disable-gpu \
-      --no-first-run --no-default-browser-check \
-      --user-data-dir=/profile --remote-debugging-port=9222 >/dev/null
+      --no-first-run --no-default-browser-check --class="oc-$ILABEL" \
+      --user-data-dir=/profile --remote-debugging-port=9222 "${starturl[@]}" >/dev/null
 # <<<chromium-run
-elif [[ $(pm container inspect --format '{{.State.Status}}' oc-chromium) != running ]]; then
+elif [[ $(cstate "$CHROME") != running ]]; then
   log "Starting existing Chromium container"
-  pm start oc-chromium >/dev/null
+  pm start "$CHROME" >/dev/null
 fi
 
-log "Waiting for Chromium DevTools (127.0.0.1:9222 inside the pod)"
+log "Waiting for Chromium DevTools (127.0.0.1:9222 inside pod '$POD')"
 ok=0
 for _ in $(seq 1 30); do
-  if pm exec oc-chromium curl -sf http://127.0.0.1:9222/json/version >/dev/null 2>&1; then ok=1; break; fi
+  if pm exec "$CHROME" curl -sf http://127.0.0.1:9222/json/version >/dev/null 2>&1; then ok=1; break; fi
   sleep 1
 done
 if (( !ok )); then
   echo "Chromium did not come up. Last log lines:" >&2
-  pm logs --tail 20 oc-chromium >&2 || true
+  pm logs --tail 20 "$CHROME" >&2 || true
   echo "If you see Wayland/permission errors, check: sudo ausearch -m avc -ts recent" >&2
   exit 1
 fi
 echo "Chromium ready."
 if (( PG )); then ensure_postgres; fi
+if (( DIND )); then ensure_dind; fi
+for p in "${PORTS[@]}"; do echo "Port: http://127.0.0.1:${p%%:*} on the host -> 127.0.0.1:${p#*:} in pod '$POD'"; done
 
-(( NOLAUNCH )) && { log "Setup complete (-n: not launching OpenCode)."; exit 0; }
+(( NOLAUNCH )) && { log "Setup complete for instance '$ILABEL' (-n: not launching OpenCode)."; exit 0; }
 
 # ---- launch OpenCode ------------------------------------------------------------------
-if [[ $(pm container inspect --format '{{.State.Status}}' oc-agent 2>/dev/null || true) == running ]]; then
-  log "OpenCode is already running in another terminal; setup is up to date (acting like -n)."
-  echo "Open a shell in it with:  ${0##*/} -x"
+if [[ $(cstate "$AGENT") == running ]]; then
+  log "OpenCode is already running in instance '$ILABEL'; setup is up to date (acting like -n)."
+  echo "Open a shell in it with:  ${0##*/}${INST:+ -i $INST} -x"
   exit 0
 fi
-pm rm -f oc-agent >/dev/null 2>&1 || true
-envargs=()
+pm rm -f "$AGENT" >/dev/null 2>&1 || true
+envargs=(-e "OC_INSTANCE=$ILABEL")
 for v in "${FWD_ENV[@]}"; do [[ -n ${!v:-} ]] && envargs+=(-e "$v"); done
-log "Launching OpenCode in /sandbox/construct"
-exec "${H[@]}" podman run -it --rm --name oc-agent --pod "$POD" \
-  --cap-drop=ALL --security-opt=no-new-privileges \
-  --pids-limit=512 --memory=4g \
-  -v "$SB":/sandbox:Z \
-  -v oc-home:/root:Z \
-  -w /sandbox/construct \
+if [[ $(cstate "$DINDC") != none ]]; then
+  envargs+=(-v "$DINDRUN":/run/dind -e DOCKER_HOST=unix:///run/dind/podman.sock
+            -e CONTAINER_HOST=unix:///run/dind/podman.sock)
+fi
+log "Launching OpenCode (instance '$ILABEL') in /sandbox/$CWD"
+# No ':Z' on the shared mounts: relabel_shared already gave them this level (see above).
+exec "${H[@]}" podman run -it --rm --name "$AGENT" --pod "$POD" --label oc.sandbox=1 --label "oc.instance=$ILABEL" \
+  --cap-drop=ALL --security-opt=no-new-privileges --security-opt "label=level:$LEVEL" \
+  --pids-limit=512 --memory="$AGENT_MEM" \
+  -v "$SB":/sandbox \
+  -v "$HOMEVOL":/root \
+  -w "/sandbox/$CWD" \
   "${envargs[@]}" \
   "$AGENT_IMG"

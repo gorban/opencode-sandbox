@@ -65,6 +65,7 @@ PW='S3cr3t-pw:@/#'
 cat > "$T/pg.sh" <<EOF
 set -euo pipefail
 $(fn pg_sig); $(fn urlenc); $(fn ensure_postgres)
+$(grep "^cstate()" "$SCRIPT")
 log() { echo "==> \$*"; }
 sleep() { :; }
 pm() {
@@ -75,7 +76,7 @@ pm() {
   esac
   return 0
 }
-STATE=$T/state POD=oc PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$T/none
+STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$T/none INST= ILABEL=default
 PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD='$PW'
 ensure_postgres
 EOF
@@ -88,6 +89,33 @@ check "postgres gets POSTGRES_PASSWORD_FILE" grep -qa POSTGRES_PASSWORD_FILE "$T
 unkeyed=$(printf '%s|%s|%s|%s' app "$PW" db "" | sha256sum | cut -c1-16)
 check "volume label is not the unkeyed hash" ! grep -qa "$unkeyed" "$T/argv.log"
 check "signature key is private (0600)"    [ "$(stat -c %a "$T/state/pg-sig.key" 2>/dev/null)" = 600 ]
+
+pgmsg() {  # volume-label -> stderr of ensure_postgres for '-i default' with an existing volume
+  cat > "$T/pgm.sh" <<EOF
+set -euo pipefail
+$(fn pg_sig); $(fn urlenc); $(fn ensure_postgres)
+$(grep "^cstate()" "$SCRIPT")
+log() { :; }; sleep() { :; }
+pm() {
+  case "\$1 \${2:-}" in
+    "volume exists") return 0 ;;
+    "volume inspect") echo '$1' ;;
+    "container inspect") return 1 ;;
+  esac
+  return 0
+}
+STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$T/none INST= ILABEL=default
+PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD=pw
+ensure_postgres
+EOF
+  bash "$T/pgm.sh" 2>&1 >/dev/null
+}
+legacy=$(printf '%s|%s|%s|%s' app pw db "" | sha256sum | cut -c1-16)
+out=$(pgmsg "$legacy")
+check "legacy-volume hint keeps -i default"   grep -q -- '-i default -d && podman volume rm oc-pg' <<<"$out"
+out=$(pgmsg mismatch)
+check "settings-mismatch hint keeps -i default" grep -q -- '-i default -d && podman volume rm oc-pg' <<<"$out"
+check "no hint suggests a bare -d"            ! grep -qE '\.sh -d && podman' <<<"$out$(pgmsg "$legacy")"
 
 # ================================================================================================
 echo "host bridge (oc-bridge.py)"
@@ -178,32 +206,122 @@ check "race: host file never written"       victim_ok
 check "race: edits reached the sandbox file" [ -n "$(find "$SB/construct" -name f -type f -exec grep -l '^race-' {} +)" ]
 
 # ================================================================================================
-echo "sandbox tree creation (init_sandbox_tree, in a container)"
+# Every run of the real script below goes through stubs: Podman, systemctl, pkexec, sudo and
+# distrobox-host-exec only log their arguments, and HOME is a scratch directory. A regression (an
+# argument that should be refused but is not) then deletes nothing real.
+mkdir -p "$T/stub" "$T/dhome"
+cat > "$T/stub/podman" <<EOF
+#!/bin/sh
+echo "\${0##*/} \$*" >> "$T/stub.log"
+case "\$1 \$2" in
+  "pod ls") printf 'oc\noc-other\n' ;;
+  "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
+esac
+exit 0
+EOF
+chmod +x "$T/stub/podman"
+for c in systemctl pkexec sudo distrobox-host-exec; do ln -s podman "$T/stub/$c"; done
+stubbed() { env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "$SCRIPT" "$@"; }
+del() {  # args... -> log of stubbed commands
+  : > "$T/stub.log"
+  stubbed "$@" >/dev/null 2>&1 </dev/null
+  cat "$T/stub.log"
+}
+
+echo "argument validation (stubbed podman/systemctl; nothing real is touched)"
+argfail() {  # expected-message-fragment args...: must exit 2 with that message
+  local want=$1 out rc; shift
+  out=$(stubbed "$@" 2>&1 </dev/null); rc=$?
+  [[ $rc -eq 2 && $out == *"$want"* ]]
+}
+check "refuses publishing DevTools 9222"   argfail "refusing to publish pod port 9222" -P 18080:9222
+check "refuses publishing Postgres 5432"   argfail "refusing to publish pod port 5432" -P 18080:5432
+# The script refuses host ports below the host's ip_unprivileged_port_start; where that is 0 or 1
+# every port is bindable and there is nothing to refuse. (The stubbed run reads this kernel's value.)
+low=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)
+if (( low > 1 )); then
+  check "refuses privileged host port ($((low - 1)) < $low)" argfail "below" -P "$((low - 1)):80"
+else echo "  skip  privileged host port (ip_unprivileged_port_start=$low: every port is bindable)"; fi
+check "refuses duplicate host port"        argfail "given twice" -P 18080:80,18080:81
+check "refuses malformed mapping"          argfail "is not HOSTPORT:PODPORT" -P 18080
+check "refuses out-of-range port"          argfail "ports are 1-65535" -P 18080:70000
+check "refuses bad instance name"          argfail "invalid instance name" -i Bad
+check "refuses reserved instance name"     argfail "invalid instance name" -i agent
+check "refuses -C with .."                 argfail "plain relative path" -C ../x
+check "refuses absolute -C"                argfail "plain relative path" -C /etc
+check "refuses -W with .."                 argfail "plain relative path" -W a/../b
+check "refuses setup flags with -d"        argfail "only apply when setting up" -d -P 18080:80
+check "refuses stray arguments"            argfail "unexpected argument" -i ok extra
+check "refuses empty -i (no global -d)"    argfail "-i needs an instance name" -i "" -d -a -y
+
+echo "delete scope (stubbed)"
+out=$(del -i default -d -a -y)
+check "-i default -d -a removes pod oc"                 grep -qx 'podman pod rm -f oc' <<<"$out"
+check "-i default -d -a leaves other instances"         ! grep -q 'oc-other' <<<"$out"
+check "-i default -d -a leaves bridge, images, login"   ! grep -qE '^systemctl|rmi|oc-home|semodule' <<<"$out"
+check "-i default -d -a removes only default volumes"   grep -qx 'podman volume rm -f oc-pg' <<<"$out"
+out=$(del -d)
+check "bare -d still removes every instance pod"        grep -qx 'podman pod rm -f oc-other' <<<"$out"
+DSTATE=$T/dhome/.local/share/oc-sandbox
+for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_FAIL=1" \
+            "secrets present:STUB_SECRETS=oc-pg-password\\nother\\noc-x-pg-password\\n"; do
+  name=${case%%:*} envset=${case#*:}
+  : > "$T/stub.log"; mkdir -p "$DSTATE/build"; rc=0
+  env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME "$envset" HOME="$T/dhome" PATH="$T/stub:$PATH" \
+    "$SCRIPT" -d -a -y >/dev/null 2>&1 </dev/null || rc=$?
+  check "-d -a ($name) completes"              [ $rc -eq 0 ]
+  check "-d -a ($name) removes the state dir"  [ ! -e "$DSTATE" ]
+  check "-d -a ($name) removes SELinux module" grep -q 'semodule -r oc_chromium' "$T/stub.log"
+done
+check "-d -a removes only oc Postgres secrets" sh -c "grep -qx 'podman secret rm oc-pg-password' '$T/stub.log' \
+  && grep -qx 'podman secret rm oc-x-pg-password' '$T/stub.log' && ! grep -q 'secret rm other' '$T/stub.log'"
+
+echo "sandbox tree, worktrees and relabelling (in containers)"
 if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else
   if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null; then H=(distrobox-host-exec); else H=(); fi
   if ! "${H[@]}" podman image exists oc-agent 2>/dev/null; then echo "  skip  (no oc-agent image; run oc-sandbox -n first)"; else
-    cat > "$T/init.sh" <<EOF
+    VOL=oc-sectest-$$
+    cat > "$T/lib.sh" <<EOF
 H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }
-AGENT_IMG=oc-agent SB=\$1
-$(sed -n '/^OPENCODE_JSON=/,/^)$/p' "$SCRIPT")
+AGENT_IMG=oc-agent HOMEVOL=$VOL LEVEL=s0:c7,c9 SB=\$1; shift
+$(sed -n '/^safe_run() {/,/; }$/p' "$SCRIPT")
 $(fn init_sandbox_tree)
-init_sandbox_tree
+$(sed -n "/^RELABEL_PY=/,/file=sys.stderr)'\$/p" "$SCRIPT")
+$(fn relabel_shared)
+"\$@"
 EOF
+    lib() { bash "$T/lib.sh" "$@"; }
+    inbox() { "${H[@]}" podman run --rm --network=none --security-opt=label=disable -v "$T/isb":/sandbox -w /sandbox \
+      --entrypoint sh oc-agent -c "$1"; }
     mk() { rm -rf "$T/isb" "$T/iv"; mkdir -p "$T/isb" "$T/iv"; echo "$SECRET" > "$T/iv/keep"; }
-    mk; bash "$T/init.sh" "$T/isb" >/dev/null 2>&1
-    check "normal: construct/opencode.json created" grep -q chrome-devtools "$T/isb/construct/opencode.json"
-    check "normal: bridge spool created"    [ -d "$T/isb/.bridge/requests" ] && [ -d "$T/isb/.bridge/files" ]
-    echo mine > "$T/isb/construct/opencode.json"; bash "$T/init.sh" "$T/isb" >/dev/null 2>&1
-    check "existing opencode.json kept"     [ "$(cat "$T/isb/construct/opencode.json")" = mine ]
+    mk; lib "$T/isb" init_sandbox_tree construct >/dev/null 2>&1
+    check "working directory and bridge spool created" [ -d "$T/isb/construct" ] && [ -d "$T/isb/.bridge/requests" ]
     for target in "$T/iv" ../iv; do
-      mk; ln -s "$target" "$T/isb/construct"; bash "$T/init.sh" "$T/isb" >/dev/null 2>&1
-      check "construct -> $target: nothing written on the host" [ "$(ls -A "$T/iv")" = keep ]
+      mk; ln -s "$target" "$T/isb/construct"; lib "$T/isb" init_sandbox_tree construct/sub >/dev/null 2>&1
+      check "cwd construct -> $target: nothing written on the host" [ "$(ls -A "$T/iv")" = keep ]
     done
     mk; mkdir "$T/isb/construct"; ln -s ../iv "$T/isb/construct.link"
     swap "$T/isb" construct & sw=$!
-    for _ in 1 2 3 4 5; do bash "$T/init.sh" "$T/isb" >/dev/null 2>&1; done
+    for _ in 1 2 3 4 5; do lib "$T/isb" init_sandbox_tree construct/sub >/dev/null 2>&1; done
     kill $sw; wait $sw 2>/dev/null || true
     check "construct swapped during init: host untouched" [ "$(ls -A "$T/iv")" = keep ]
+
+    mk; inbox 'set -e; mkdir repo; cd repo; git init -q -b main; git -c user.email=t@t -c user.name=t commit -q --allow-empty -m i
+      printf "#!/bin/sh\ntouch /sandbox/HOOK-RAN\n" > .git/hooks/post-checkout; chmod +x .git/hooks/post-checkout' >/dev/null 2>&1
+    lib "$T/isb" init_sandbox_tree wt/x repo feature >/dev/null 2>&1
+    check "worktree created on a new branch"  inbox '[ "$(git -C wt/x branch --show-current)" = feature ]'
+    check "worktree link is relative"         grep -q '^gitdir: \.\./\.\./repo/' "$T/isb/wt/x/.git"
+    check "agent-planted git hook not run"    [ ! -e "$T/isb/HOOK-RAN" ]
+    mk; ln -s "$T/iv" "$T/isb/repo"; lib "$T/isb" init_sandbox_tree wt/y repo b >/dev/null 2>&1
+    check "-W repo symlinked to the host: refused, host untouched" [ "$(ls -A "$T/iv")" = keep ] && [ ! -e "$T/isb/wt/y/.git" ]
+
+    mk; echo data > "$T/isb/f"; ln -s "$T/iv/keep" "$T/isb/link-to-host"; ln -s ../iv "$T/isb/rel-link"
+    before=$(stat -c %C "$T/iv/keep")
+    "${H[@]}" podman volume create "$VOL" >/dev/null
+    lib "$T/isb" relabel_shared >/dev/null 2>&1
+    "${H[@]}" podman volume rm -f "$VOL" >/dev/null
+    check "relabel: sandbox file gets the agents' level" [ "$(stat -c %C "$T/isb/f")" = system_u:object_r:container_file_t:s0:c7,c9 ]
+    check "relabel: symlink targets on the host untouched" [ "$(stat -c %C "$T/iv/keep")" = "$before" ]
   fi
 fi
 
