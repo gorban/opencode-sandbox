@@ -1,0 +1,7 @@
+A	permitted;DNS:.oc-sandbox.internal
+B	permitted;DNS:.oc-sandbox.internal,permitted;DNS:oc-sandbox.internal
+C	permitted;DNS:.oc-sandbox.internal,permitted;DNS:oc-sandbox.internal,permitted;IP:127.0.0.0/255.0.0.0,permitted;IP:0:0:0:0:0:0:0:1/ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+D	permitted;DNS:.oc-sandbox.internal,permitted;DNS:oc-sandbox.internal,permitted;IP:127.0.0.0/255.0.0.0,permitted;IP:0:0:0:0:0:0:0:1/ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff,permitted;DNS:localhost
+E	permitted;DNS:.oc-sandbox.internal,permitted;DNS:oc-sandbox.internal,excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:0:0:0:0:0:0:0:0/0:0:0:0:0:0:0:0
+F	permitted;DNS:oc-sandbox.internal
+X	-

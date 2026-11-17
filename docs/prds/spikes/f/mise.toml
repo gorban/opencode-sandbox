@@ -1,0 +1,17 @@
+# Host-side tools for oc-sandbox (spike f). Pinned and checksummed: mise.lock is generated, never hand-edited.
+# Regenerate after changing a version:  mise lock      (platforms come from lockfile_platforms below)
+# mise.lock generated with mise 2026.10.21 (lockfile_version 3). A newer mise (2026.11.8 tested) reads it
+# unchanged and regenerates identical content as lockfile_version 4; compare with lockcmp.py, not diff.
+min_version = "2026.10.21"
+
+[tool_config]
+locked = true
+
+[settings]
+# Without this, `mise lock` also targets macOS and Windows, and conda:nss cannot be solved for windows-x64.
+lockfile_platforms = ["linux-x64", "linux-arm64"]
+
+[tools]
+"aqua:FiloSottile/mkcert" = "1.4.4"
+"conda:nss" = "3.118"        # certutil, pk12util (conda-forge), build nss-3.118-h445c969_0 on linux-x64
+"conda:openssl" = "3.5.9"    # the devbox has no /usr/bin/openssl; same pin as api-agent
