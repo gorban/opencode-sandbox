@@ -1,0 +1,17 @@
+# Leaf profile for a per-instance server certificate (spike e1).
+# OC_SAN is a comma separated list such as
+#   "DNS:feat-a.oc-sandbox.internal,DNS:localhost,IP:127.0.0.1"
+# Section v3_leaf_nosan exists only to test a CN-only certificate.
+[ v3_leaf ]
+basicConstraints       = critical,CA:FALSE
+keyUsage               = critical,digitalSignature
+extendedKeyUsage       = serverAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+subjectAltName         = $ENV::OC_SAN
+[ v3_leaf_nosan ]
+basicConstraints       = critical,CA:FALSE
+keyUsage               = critical,digitalSignature
+extendedKeyUsage       = serverAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always

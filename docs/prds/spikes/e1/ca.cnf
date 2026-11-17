@@ -1,0 +1,25 @@
+# CA profile for the oc-sandbox local CA (spike e1).
+# Name constraints come from the environment so one file serves every variant:
+#   OC_NC="permitted;DNS:.oc-sandbox.internal,permitted;DNS:oc-sandbox.internal"
+# Use section v3_ca_unconstrained only for the control CA.
+[ req ]
+distinguished_name = dn
+prompt             = no
+[ dn ]
+O  = oc-sandbox
+CN = oc-sandbox local CA
+[ v3_ca ]
+basicConstraints       = critical,CA:TRUE,pathlen:0
+keyUsage               = critical,keyCertSign,cRLSign
+subjectKeyIdentifier   = hash
+nameConstraints        = critical,$ENV::OC_NC
+[ v3_ca_unconstrained ]
+basicConstraints       = critical,CA:TRUE,pathlen:0
+keyUsage               = critical,keyCertSign,cRLSign
+subjectKeyIdentifier   = hash
+# Attack (b): what a key holder would sign to get around pathlen:0 and the constraints.
+[ v3_intermediate_unconstrained ]
+basicConstraints       = critical,CA:TRUE
+keyUsage               = critical,keyCertSign,cRLSign
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always

@@ -1,0 +1,319 @@
+
+CA variant A
+             Hvfy   Hvfy+h Avfy   Avfy+h s_cli  curl   py     node   go     psql   chrom  nss
+feat          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+bare          --     --     --     --     --     --     --     --     --     --     --     --
+wild          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+evil          --     --     --     --     --     --     --     --     --     --     --     --
+mixed         --     --     --     --     --     --     --     --     --     --     --     --
+cnonly        --     --     --     --     --     --     --     --     --     --     --     --
+ip127         --     --     --     --     --     --     --     --     ok     --     ok     ok
+ip8888        --     --     --     --     --     --     --     --     ok     --     ok     ok
+ip127cn       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888cn      ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip127nocn     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888nocn    ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+cnevil        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+deep          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+suffixtrick   --     --     --     --     --     --     --     --     --     --     --     --
+localhost     --     --     --     --     --     --     --     --     --     --     --     --
+e2plan        --     --     --     --     --     --     --     --     --     --     --     --
+e2plan6       --     --     --     --     --     --     --     --     --     --     --     --
+e2plan-bare   --     --     --     --     --     --     --     --     --     --     --     --
+applocalhost  --     --     --     --     --     --     --     --     --     --     --     --
+ip127b        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6loop       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6doc        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6map        ok     ok     ok     ok     ok     ok     ok     ok     --     ok     ok     ok
+atkA-twin     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-evil     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-ok       --     --     --     --     --     --     --     --     --     --     --     --
+
+CA variant B
+             Hvfy   Hvfy+h Avfy   Avfy+h s_cli  curl   py     node   go     psql   chrom  nss
+feat          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+bare          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+wild          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+evil          --     --     --     --     --     --     --     --     --     --     --     --
+mixed         --     --     --     --     --     --     --     --     --     --     --     --
+cnonly        --     --     --     --     --     --     --     --     --     --     --     --
+ip127         --     --     --     --     --     --     --     --     ok     --     ok     ok
+ip8888        --     --     --     --     --     --     --     --     ok     --     ok     ok
+ip127cn       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888cn      ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip127nocn     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888nocn    ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+cnevil        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+deep          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+suffixtrick   --     --     --     --     --     --     --     --     --     --     --     --
+localhost     --     --     --     --     --     --     --     --     --     --     --     --
+e2plan        --     --     --     --     --     --     --     --     --     --     --     --
+e2plan6       --     --     --     --     --     --     --     --     --     --     --     --
+e2plan-bare   --     --     --     --     --     --     --     --     --     --     --     --
+applocalhost  --     --     --     --     --     --     --     --     --     --     --     --
+ip127b        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6loop       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6doc        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6map        ok     ok     ok     ok     ok     ok     ok     ok     --     ok     ok     ok
+atkA-twin     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-evil     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-ok       --     --     --     --     --     --     --     --     --     --     --     --
+
+CA variant C
+             Hvfy   Hvfy+h Avfy   Avfy+h s_cli  curl   py     node   go     psql   chrom  nss
+feat          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+bare          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+wild          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+evil          --     --     --     --     --     --     --     --     --     --     --     --
+mixed         --     --     --     --     --     --     --     --     --     --     --     --
+cnonly        --     --     --     --     --     --     --     --     --     --     --     --
+ip127         --     --     --     --     --     --     --     --     ok     --     ok     ok
+ip8888        --     --     --     --     --     --     --     --     --     --     --     --
+ip127cn       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888cn      --     --     --     --     --     --     --     --     --     --     --     --
+ip127nocn     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888nocn    --     --     --     --     --     --     --     --     --     --     --     --
+cnevil        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+deep          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+suffixtrick   --     --     --     --     --     --     --     --     --     --     --     --
+localhost     --     --     --     --     --     --     --     --     --     --     --     --
+e2plan        --     --     --     --     --     --     --     --     --     --     --     --
+e2plan6       --     --     --     --     --     --     --     --     --     --     --     --
+e2plan-bare   --     --     --     --     --     --     --     --     --     --     --     --
+applocalhost  --     --     --     --     --     --     --     --     --     --     --     --
+ip127b        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6loop       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6doc        --     --     --     --     --     --     --     --     --     --     --     --
+ip6map        --     --     --     --     --     --     --     --     --     --     --     --
+atkA-twin     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-evil     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-ok       --     --     --     --     --     --     --     --     --     --     --     --
+
+CA variant D
+             Hvfy   Hvfy+h Avfy   Avfy+h s_cli  curl   py     node   go     psql   chrom  nss
+feat          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+bare          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+wild          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+evil          --     --     --     --     --     --     --     --     --     --     --     --
+mixed         --     --     --     --     --     --     --     --     --     --     --     --
+cnonly        --     --     --     --     --     --     --     --     --     --     --     --
+ip127         --     --     --     --     --     --     --     --     ok     --     ok     ok
+ip8888        --     --     --     --     --     --     --     --     --     --     --     --
+ip127cn       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888cn      --     --     --     --     --     --     --     --     --     --     --     --
+ip127nocn     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888nocn    --     --     --     --     --     --     --     --     --     --     --     --
+cnevil        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+deep          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+suffixtrick   --     --     --     --     --     --     --     --     --     --     --     --
+localhost     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+e2plan        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+e2plan6       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+e2plan-bare   ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+applocalhost  ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip127b        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6loop       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6doc        --     --     --     --     --     --     --     --     --     --     --     --
+ip6map        --     --     --     --     --     --     --     --     --     --     --     --
+atkA-twin     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-evil     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-ok       --     --     --     --     --     --     --     --     --     --     --     --
+
+CA variant E
+             Hvfy   Hvfy+h Avfy   Avfy+h s_cli  curl   py     node   go     psql   chrom  nss
+feat          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+bare          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+wild          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+evil          --     --     --     --     --     --     --     --     --     --     --     --
+mixed         --     --     --     --     --     --     --     --     --     --     --     --
+cnonly        --     --     --     --     --     --     --     --     --     --     --     --
+ip127         --     --     --     --     --     --     --     --     --     --     --     --
+ip8888        --     --     --     --     --     --     --     --     --     --     --     --
+ip127cn       --     --     --     --     --     --     --     --     --     --     --     --
+ip8888cn      --     --     --     --     --     --     --     --     --     --     --     --
+ip127nocn     --     --     --     --     --     --     --     --     --     --     --     --
+ip8888nocn    --     --     --     --     --     --     --     --     --     --     --     --
+cnevil        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+deep          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+suffixtrick   --     --     --     --     --     --     --     --     --     --     --     --
+localhost     --     --     --     --     --     --     --     --     --     --     --     --
+e2plan        --     --     --     --     --     --     --     --     --     --     --     --
+e2plan6       --     --     --     --     --     --     --     --     --     --     --     --
+e2plan-bare   --     --     --     --     --     --     --     --     --     --     --     --
+applocalhost  --     --     --     --     --     --     --     --     --     --     --     --
+ip127b        --     --     --     --     --     --     --     --     --     --     --     --
+ip6loop       --     --     --     --     --     --     --     --     --     --     --     --
+ip6doc        --     --     --     --     --     --     --     --     --     --     --     --
+ip6map        --     --     --     --     --     --     --     --     --     --     --     --
+atkA-twin     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-evil     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-ok       --     --     --     --     --     --     --     --     --     --     --     --
+
+CA variant F
+             Hvfy   Hvfy+h Avfy   Avfy+h s_cli  curl   py     node   go     psql   chrom  nss
+feat          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+bare          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+wild          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+evil          --     --     --     --     --     --     --     --     --     --     --     --
+mixed         --     --     --     --     --     --     --     --     --     --     --     --
+cnonly        --     --     --     --     --     --     --     --     --     --     --     --
+ip127         --     --     --     --     --     --     --     --     ok     --     ok     ok
+ip8888        --     --     --     --     --     --     --     --     ok     --     ok     ok
+ip127cn       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888cn      ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip127nocn     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888nocn    ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+cnevil        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+deep          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+suffixtrick   --     --     --     --     --     --     --     --     --     --     --     --
+localhost     --     --     --     --     --     --     --     --     --     --     --     --
+e2plan        --     --     --     --     --     --     --     --     --     --     --     --
+e2plan6       --     --     --     --     --     --     --     --     --     --     --     --
+e2plan-bare   --     --     --     --     --     --     --     --     --     --     --     --
+applocalhost  --     --     --     --     --     --     --     --     --     --     --     --
+ip127b        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6loop       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6doc        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6map        ok     ok     ok     ok     ok     ok     ok     ok     --     ok     ok     ok
+atkA-twin     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-evil     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-ok       --     --     --     --     --     --     --     --     --     --     --     --
+
+CA variant X (control: no nameConstraints, pathlen:0)
+             Hvfy   Hvfy+h Avfy   Avfy+h s_cli  curl   py     node   go     psql   chrom  nss
+feat          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+bare          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+wild          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+evil          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+mixed         ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+cnonly        ok     ok     ok     ok     ok     ok     ok     ok     --     ok     --     ok
+ip127         ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip127cn       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888cn      ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip127nocn     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip8888nocn    ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+cnevil        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+deep          ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+suffixtrick   ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+localhost     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+e2plan        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+e2plan6       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+e2plan-bare   ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+applocalhost  ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip127b        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6loop       ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6doc        ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+ip6map        ok     ok     ok     ok     ok     ok     ok     ok     --     ok     ok     ok
+atkA-twin     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok     ok
+atkB-evil     --     --     --     --     --     --     --     --     --     --     --     --
+atkB-ok       --     --     --     --     --     --     --     --     --     --     --     --
+
+SUMMARY (cell: all = every client accepts, none = every client rejects, else the accepting subset)
+              CA A                     CA B                     CA C                     CA D                     CA E                     CA F                     CA X
+feat          all                      all                      all                      all                      all                      all                      all
+bare          none                     all                      all                      all                      all                      all                      all
+wild          all                      all                      all                      all                      all                      all                      all
+evil          none                     none                     none                     none                     none                     none                     all
+mixed         none                     none                     none                     none                     none                     none                     all
+cnonly        none                     none                     none                     none                     none                     none                     ok: Hvfy,Hvfy+h,Avfy,Avfy+h,s_cli,curl,py,node,psql,nss
+ip127         ok: go,chrom,nss         ok: go,chrom,nss         ok: go,chrom,nss         ok: go,chrom,nss         none                     ok: go,chrom,nss         all
+ip8888        ok: go,chrom,nss         ok: go,chrom,nss         none                     none                     none                     ok: go,chrom,nss         all
+ip127cn       all                      all                      all                      all                      none                     all                      all
+ip8888cn      all                      all                      none                     none                     none                     all                      all
+ip127nocn     all                      all                      all                      all                      none                     all                      all
+ip8888nocn    all                      all                      none                     none                     none                     all                      all
+cnevil        all                      all                      all                      all                      all                      all                      all
+deep          all                      all                      all                      all                      all                      all                      all
+suffixtrick   none                     none                     none                     none                     none                     none                     all
+localhost     none                     none                     none                     all                      none                     none                     all
+e2plan        none                     none                     none                     all                      none                     none                     all
+e2plan6       none                     none                     none                     all                      none                     none                     all
+e2plan-bare   none                     none                     none                     all                      none                     none                     all
+applocalhost  none                     none                     none                     all                      none                     none                     all
+ip127b        all                      all                      all                      all                      none                     all                      all
+ip6loop       all                      all                      all                      all                      none                     all                      all
+ip6doc        all                      all                      none                     none                     none                     all                      all
+ip6map        ok: Hvfy,Hvfy+h,Avfy,Avfy+h,s_cli,curl,py,node,psql,chrom,nss ok: Hvfy,Hvfy+h,Avfy,Avfy+h,s_cli,curl,py,node,psql,chrom,nss none                     none                     none                     ok: Hvfy,Hvfy+h,Avfy,Avfy+h,s_cli,curl,py,node,psql,chrom,nss ok: Hvfy,Hvfy+h,Avfy,Avfy+h,s_cli,curl,py,node,psql,chrom,nss
+atkA-twin     none                     none                     none                     none                     none                     none                     all
+atkB-evil     none                     none                     none                     none                     none                     none                     none
+atkB-ok       none                     none                     none                     none                     none                     none                     none
+
+clients:
+Hvfy    openssl-verify-4.0.3
+Hvfy+h  openssl-verify+host-4.0.3
+Avfy    openssl-verify-3.5.9
+Avfy+h  openssl-verify+host-3.5.9
+s_cli   openssl-s_client-3.5.9
+curl    curl-8.14.1
+py      py3.12.13-3.5.7
+node    node-v24.22.3-openssl-3.5.9
+go      go1.27.4
+psql    psql-17.10
+chrom   chromium-157.0.8103.78
+nss     nss-tools-3.133.0
+
+Do the error messages name the cause? (rejections under A-F: total / message names a name constraint or path length)
+  Hvfy     96 /  86
+  Hvfy+h   96 /  86
+  Avfy     96 /  86
+  Avfy+h   96 /  86
+  s_cli    96 /  86
+  curl     96 /  86
+  py       96 /  86
+  node     96 /  86
+  go       91 /  67
+  psql     96 /   0
+  chrom    88 /   0
+  nss      88 /   6
+
+failure reasons per client (most frequent first, rejections under A-F):
+  Hvfy     74 x permitted subtree violation
+  Hvfy     12 x path length constraint exceeded
+  Hvfy     10 x excluded subtree violation
+  Hvfy+h   74 x permitted subtree violation
+  Hvfy+h   12 x path length constraint exceeded
+  Hvfy+h   10 x excluded subtree violation
+  Avfy     74 x permitted subtree violation
+  Avfy     12 x path length constraint exceeded
+  Avfy     10 x excluded subtree violation
+  Avfy+h   74 x permitted subtree violation
+  Avfy+h   12 x path length constraint exceeded
+  Avfy+h   10 x excluded subtree violation
+  s_cli    74 x num=47:permitted subtree violation
+  s_cli    12 x num=25:path length constraint exceeded
+  s_cli    10 x num=48:excluded subtree violation
+  curl     74 x SSL certificate problem: permitted subtree violation
+  curl     12 x SSL certificate problem: path length constraint exceeded
+  curl     10 x SSL certificate problem: excluded subtree violation
+  py       74 x permitted subtree violation
+  py       12 x path length constraint exceeded
+  py       10 x excluded subtree violation
+  node     80 x UNSPECIFIED permitted subtree violation
+  node     10 x UNSPECIFIED excluded subtree violation
+  node      6 x PATH_LENGTH_EXCEEDED path length constraint exceeded
+  go       16 x tls: failed to verify certificate: x509: a root or intermediate certificate is not authorized to sign for this name: DNS name "localhost" is not permi
+  go       12 x tls: failed to verify certificate: x509: a root or intermediate certificate is not authorized to sign for this name: DNS name "evil.example.com" is no
+  go       12 x tls: failed to verify certificate: x509: too many intermediates for path length constraint
+  go        6 x tls: failed to verify certificate: x509: a root or intermediate certificate is not authorized to sign for this name: DNS name "example.com" is not per
+  go        6 x tls: failed to verify certificate: x509: certificate relies on legacy Common Name field, use SANs instead
+  go        6 x tls: failed to verify certificate: x509: a root or intermediate certificate is not authorized to sign for this name: DNS name "evil-oc-sandbox.interna
+  go        6 x tls: failed to parse certificate from server: x509: SAN iPAddress contains IPv4-mapped IPv6 address
+  go        6 x tls: failed to verify certificate: x509: a root or intermediate certificate is not authorized to sign for this name: IP address "8.8.8.8" is not permi
+  psql     22 x connection to server at "feat-a.oc-sandbox.internal" (127.0.0.1), port 5432 failed: SSL error: certificate verify failed
+  psql     18 x connection to server at "evil.example.com" (127.0.0.1), port 5432 failed: SSL error: certificate verify failed
+  psql     12 x connection to server at "8.8.8.8", port 5432 failed: SSL error: certificate verify failed
+  psql      8 x connection to server at "127.0.0.1", port 5432 failed: SSL error: certificate verify failed
+  psql      6 x connection to server at "oc-sandbox.internal" (127.0.0.1), port 5432 failed: SSL error: certificate verify failed
+  psql      6 x connection to server at "example.com" (127.0.0.1), port 5432 failed: SSL error: certificate verify failed
+  psql      6 x connection to server at "evil-oc-sandbox.internal" (127.0.0.1), port 5432 failed: SSL error: certificate verify failed
+  psql      5 x connection to server at "localhost" (::1), port 5432 failed: SSL error: certificate verify failed
+  chrom    82 x net::ERR_CERT_INVALID
+  chrom     6 x net::ERR_CERT_COMMON_NAME_INVALID
+  nss      76 x certutil: certificate is invalid: Peer's Certificate issuer is not recognized.
+  nss       6 x certutil: certificate is invalid: The Certifying Authority for this certificate is not permitted to issue a certificate with this name.
+  nss       6 x certutil: certificate is invalid: Peer's certificate issuer has been marked as not trusted by the user.
+
+CHECKS: all passed (rows complete, no connection errors, control X as expected)
+recommended D: leaf verifies, nameConstraints critical, ca.key 0600
+recommended E: leaf verifies, nameConstraints critical, ca.key 0600
