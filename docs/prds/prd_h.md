@@ -34,7 +34,7 @@ Nothing serializes:
 Estimated time: 0.5 day.
 
 Implementation: `codex/foundations-batch`; real parallel acceptance passes 45 checks, with external
-integration review pending. A separate shared/exclusive lifecycle barrier coordinates startup with teardown;
+static review complete (no established P1/P2). A separate shared/exclusive lifecycle barrier coordinates startup with teardown;
 per-instance worktree locks protect selection records. Lock files are retained to preserve one
 locking domain across teardown and restart.
 

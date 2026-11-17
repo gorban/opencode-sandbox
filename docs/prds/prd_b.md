@@ -26,7 +26,7 @@ mid-session. Related: [prd_h](prd_h.md) (warm start: shared setup done once unde
 
 ## Proposal
 
-- [x] Pre-launch upgrade implemented in `codex/foundations-batch` (automated gates passed; external review pending).
+- [x] Pre-launch upgrade implemented in `codex/foundations-batch` (automated gates passed; external static review complete).
       An offline reader snapshots only the binary; the networked installer sees no shared home or
       sandbox. An offline writer promotes a complete candidate after the preceding container is
       verified stopped. Timeouts/offline failures retain the working copy. Shared setup is locked;

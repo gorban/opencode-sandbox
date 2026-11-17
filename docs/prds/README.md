@@ -5,14 +5,14 @@ How this tree works (progressive discovery, checkboxes, the human review gate): 
 
 | PRD | Grouping | Status |
 |---|---|---|
-| [prd_a](prd_a.md) | Postgres reachable from the host (`-P 5432`, `-P 5433:5432`) | implemented; external review pending |
-| [prd_b](prd_b.md) | OpenCode upgrades ready before launch; no drop to the host shell | pre-launch updates implemented; in-app restart open; external review pending |
-| [prd_c](prd_c.md) | Worktree defaults: current repo, `wt/<repo>/NAME`, relaunch | implemented; external review pending |
+| [prd_a](prd_a.md) | Postgres reachable from the host (`-P 5432`, `-P 5433:5432`) | implemented; external static review complete; human review open |
+| [prd_b](prd_b.md) | OpenCode upgrades ready before launch; no drop to the host shell | pre-launch updates implemented; in-app restart open; external static review complete; human review open |
+| [prd_c](prd_c.md) | Worktree defaults: current repo, `wt/<repo>/NAME`, relaunch | implemented; external static review complete; human review open |
 | [prd_d](prd_d.md) | Per-instance address and DNS name (no port mapping needed) | forwarding feasibility measured; implementation open |
 | [prd_e](prd_e.md) | Local HTTPS / TLS per instance (same URL in pod and on host) | CA feasibility measured, including host-browser subset; implementation open; depends on prd_d |
 | [prd_f](prd_f.md) | Host tool dependencies, pinned and organised (mise) | dependency feasibility measured; implementation open |
 | [prd_g](prd_g.md) | Carry-over from the parallel-instances plan | backlog |
-| [prd_h](prd_h.md) | Warm start: shared setup (images, OpenCode install) done once under a lock | implemented; real acceptance passed; external review pending |
+| [prd_h](prd_h.md) | Warm start: shared setup (images, OpenCode install) done once under a lock | implemented; real acceptance passed; external static review complete; human review open |
 
 The imported findings are evidence, not production implementation:
 
