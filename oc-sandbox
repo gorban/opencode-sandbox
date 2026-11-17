@@ -341,6 +341,33 @@ load_pg_config() {
 
 # ---- teardown -----------------------------------------------------------------
 confirm() { (( YES )) && return 0; read -r -p "$1 [y/N] " a; [[ $a == [yY]* ]]; }
+# The module is installed by semodule at its default priority (400). A lower-priority
+# module with the same name belongs to someone else and must not be removed.
+remove_chromium_policy() {
+  local modules admin="" priority name rest present=0
+  if ! modules=$("${H[@]}" semodule -lfull 2>/dev/null); then
+    # Some hosts allow unprivileged listing; on others the module store is private.
+    # Choose the escalation method once: a failed authorization or semodule call is
+    # an error, not evidence that a different authenticator should be tried.
+    if "${H[@]}" sh -c 'command -v pkexec >/dev/null 2>&1'; then admin=pkexec; else admin=sudo; fi
+    if ! modules=$("${H[@]}" "$admin" semodule -lfull); then
+      echo "error: could not list SELinux modules; oc_chromium may still be installed" >&2
+      return 1
+    fi
+  fi
+  while read -r priority name rest; do
+    if [[ $priority == 400 && $name == oc_chromium ]]; then present=1; break; fi
+  done <<<"$modules"
+  (( present )) || return 0
+  if [[ -z $admin ]]; then
+    if "${H[@]}" sh -c 'command -v pkexec >/dev/null 2>&1'; then admin=pkexec; else admin=sudo; fi
+  fi
+  log "Removing SELinux module oc_chromium at priority 400 (asks for your admin password)"
+  if ! "${H[@]}" "$admin" semodule -X 400 -r oc_chromium; then
+    echo "error: could not remove SELinux module oc_chromium at priority 400" >&2
+    return 1
+  fi
+}
 if (( DELETE )); then
   if (( INST_SET )); then                                   # one instance only (also -i default)
     log "Removing instance '$ILABEL' (pod $POD)"
@@ -381,11 +408,16 @@ if (( DELETE )); then
         if [[ $s =~ ^oc(-[a-z0-9-]+)?-pg-password$ ]]; then pm secret rm "$s" >/dev/null 2>&1 || true; fi
       done <<<"$secrets"
     else echo "warning: could not list Podman secrets; remove any oc-*-pg-password secrets by hand" >&2; fi
-    log "Removing SELinux module oc_chromium (asks for your admin password)"
-    "${H[@]}" pkexec semodule -r oc_chromium >/dev/null 2>&1 || "${H[@]}" sudo semodule -r oc_chromium || true
+    teardown_status=0
+    remove_chromium_policy || teardown_status=1
     # Safe on the host: every pod (and with it every agent) is gone, so nothing can change $SB/.bridge
     # concurrently, and GNU rm -r never follows symlinks (it unlinks them).
-    rm -rf "$STATE" "$SB/.bridge"
+    if (( teardown_status == 0 )); then rm -rf "$STATE"; fi
+    rm -rf "$SB/.bridge"
+    if (( teardown_status != 0 )); then
+      echo "Cleanup incomplete; state retained at $STATE. Fix the SELinux error and retry." >&2
+      exit 1
+    fi
   fi
   log "Done. Your files in $SB left untouched."
   exit 0

@@ -213,6 +213,17 @@ mkdir -p "$T/stub" "$T/dhome"
 cat > "$T/stub/podman" <<EOF
 #!/bin/sh
 echo "\${0##*/} \$*" >> "$T/stub.log"
+case "\${0##*/}" in
+  semodule)
+    [ -n "\${STUB_SEMODULE_LIST_FAIL:-}" ] && exit 1
+    printf '%b' "\${STUB_MODULES-400 oc_chromium cil\\n}"; exit 0 ;;
+  pkexec|sudo)
+    if [ "\$1" = semodule ] && [ "\$2" = -lfull ]; then
+      [ -n "\${STUB_ELEV_LIST_FAIL:-}" ] && exit 1
+      printf '%b' "\${STUB_MODULES-400 oc_chromium cil\\n}"; exit 0
+    fi
+    if [ "\$1" = semodule ]; then [ -n "\${STUB_REMOVE_FAIL:-}" ] && exit 1; exit 0; fi ;;
+esac
 case "\$1 \$2" in
   "pod ls") printf 'oc\noc-other\n' ;;
   "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
@@ -223,7 +234,7 @@ esac
 exit 0
 EOF
 chmod +x "$T/stub/podman"
-for c in systemctl pkexec sudo distrobox-host-exec; do ln -s podman "$T/stub/$c"; done
+for c in systemctl pkexec sudo semodule distrobox-host-exec; do ln -s podman "$T/stub/$c"; done
 stubbed() { env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "$SCRIPT" "$@"; }
 del() {  # args... -> log of stubbed commands
   : > "$T/stub.log"
@@ -318,10 +329,36 @@ for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_
     "$SCRIPT" -d -a -y >/dev/null 2>&1 </dev/null || rc=$?
   check "-d -a ($name) completes"              [ $rc -eq 0 ]
   check "-d -a ($name) removes the state dir"  [ ! -e "$DSTATE" ]
-  check "-d -a ($name) removes SELinux module" grep -q 'semodule -r oc_chromium' "$T/stub.log"
+  check "-d -a ($name) removes SELinux module" grep -q 'semodule -X 400 -r oc_chromium' "$T/stub.log"
 done
 check "-d -a removes only oc Postgres secrets" sh -c "grep -qx 'podman secret rm oc-pg-password' '$T/stub.log' \
   && grep -qx 'podman secret rm oc-x-pg-password' '$T/stub.log' && ! grep -q 'secret rm other' '$T/stub.log'"
+
+echo "SELinux module teardown (all calls stubbed; scratch HOME)"
+# No privileged mutation or real -d/-a occurs in these cases.
+for vars in 'STUB_MODULES=' 'STUB_MODULES=200 oc_chromium cil'; do
+  out=$(pathrun "$vars" -- -d -a -y)
+  check "absent priority-400 module succeeds ($vars)" grep -qx 'rc=0' <<<"$out"
+  check "absent module: no escalation ($vars)" ! grep -qE '^(pkexec|sudo) ' "$T/stub.log"
+  check "absent module: no removal claim ($vars)" ! grep -q 'Removing SELinux module' <<<"$out"
+done
+out=$(pathrun 'STUB_MODULES=400 oc_chromium cil' -- -d -a -y)
+check "present module removal succeeds" grep -qx 'rc=0' <<<"$out"
+check "present module: remove only priority 400" grep -qx 'pkexec semodule -X 400 -r oc_chromium' "$T/stub.log"
+out=$(pathrun STUB_SEMODULE_LIST_FAIL=1 STUB_MODULES= -- -d -a -y)
+check "private store: elevated listing finds absence" grep -qx 'rc=0' <<<"$out"
+check "private store: no removal for absent module" ! grep -q ' -r oc_chromium' "$T/stub.log"
+mkdir -p "$DSTATE"
+out=$(pathrun STUB_SEMODULE_LIST_FAIL=1 STUB_ELEV_LIST_FAIL=1 -- -d -a -y)
+check "listing failure returns failure" grep -qx 'rc=1' <<<"$out"
+check "listing failure identifies incomplete cleanup" grep -q 'could not list SELinux modules' <<<"$out"
+check "listing failure does not try sudo" ! grep -q '^sudo ' "$T/stub.log"
+check "listing failure retains state for retry" [ -d "$DSTATE" ]
+out=$(pathrun STUB_REMOVE_FAIL=1 -- -d -a -y)
+check "removal failure returns failure" grep -qx 'rc=1' <<<"$out"
+check "removal failure reports incomplete cleanup" grep -q 'could not remove SELinux module' <<<"$out"
+check "removal failure does not retry with sudo" ! grep -q '^sudo ' "$T/stub.log"
+check "removal failure retains state for retry" [ -d "$DSTATE" ]
 # -d -a with a recorded build on oc-agent and a foreign image on oc-chromium
 A=$(printf 'a%.0s' {1..64}) B=$(printf 'b%.0s' {1..64})
 mkdir -p "$DSTATE"; printf '%s\n' "$A" > "$DSTATE/built-images"; : > "$T/stub.log"
