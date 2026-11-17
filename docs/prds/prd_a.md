@@ -6,34 +6,35 @@
 
 Users want to reach an instance's Postgres from host tools (psql, IDE, migrations). The usual
 convention is `-P 5432` (same port on both sides) or `-P 5433:5432` when the host already uses 5432.
-Port numbers must never be picked automatically: another app may want that port.
+Port numbers must never be picked automatically: another app may want that port. The current implementation is on `codex/foundations-batch`.
 
-## Current behaviour
+## Previous behaviour (before this branch)
 
-- `-P` refuses pod port 5432, because pods use `--host-lo-to-ns-lo`, so host connections reach the pod
+- `-P` previously refused pod port 5432, because pods use `--host-lo-to-ns-lo`, so host connections reach the pod
   as `127.0.0.1`. The official Postgres image **trusts** `127.0.0.1` with no password (initdb default).
   Mapping it would let any host process, as any database user, in without a password.
-- `-P` requires `HOST:POD`; a single port number is rejected.
+- `-P` previously required `HOST:POD`; a single port number was rejected.
 
 ## Proposal
 
-- [ ] Accept `-P PORT` as shorthand for `-P PORT:PORT` (any port, not just Postgres).
-- [ ] Make Postgres require a password on every TCP connection, including `127.0.0.1` (scram-sha-256 in
+- [x] Accept `-P PORT` as shorthand for `-P PORT:PORT` (any port, not just Postgres).
+- [x] Make Postgres require a password on every TCP connection, including `127.0.0.1` (scram-sha-256 in
       `pg_hba.conf`). Keep `trust` only for the Unix socket inside the container. The agent gets a
       `PGPASSFILE` (mode 0600, in the pod only) so its `psql` keeps working without a prompt.
-      **Decision (2026-11-15): rewrite `pg_hba.conf` from a script-owned template on every Postgres
-      start**, so existing and new volumes behave the same. Custom hba edits are not kept; document
-      this.
-- [ ] With per-instance names ([prd_d](prd_d.md)), Postgres is reachable as
+      **Implementation (`codex/foundations-batch`):** supply the script-owned template as the server's
+      read-only `hba_file` from process startup on every new or recreated container. Existing and new
+      volumes behave the same, and volume-local `pg_hba.conf` edits are ignored rather than overwritten.
+      Incompatible existing verifiers fail closed; the data volume is retained.
+- [ ] **Deferred until prd_d implementation:** With per-instance names ([prd_d](prd_d.md)), Postgres is reachable as
       `feat-a.oc-sandbox.internal:5432` once the password requirement is in place. `-P` stays for a fixed
       host port on `127.0.0.1`.
-- [ ] With that in place, allow mapping pod port 5432 **only when `-p` is given** (`-p -P 5432`,
+- [x] With that in place, allow mapping pod port 5432 **only when `-p` is given** (`-p -P 5432`,
       `-p -P 5433:5432`). Keep refusing 9222 (DevTools) unconditionally.
-- [ ] Print the host connection string on start (`postgresql://USER@127.0.0.1:5433/DB`), never the
+- [x] Print the host connection string on start (`postgresql://USER@127.0.0.1:5433/DB`), never the
       password.
-- [ ] Tests: the host connects with a password, fails without one, and `-P 5432` without `-p` is
+- [x] Tests: the host connects with a password, fails without one, and `-P 5432` without `-p` is
       refused.
-- [ ] If [prd_e](prd_e.md) lands: default to TLS (`hostssl`), see [prd_e3](prd_e3.md).
+- [ ] **Deferred until prd_e3 implementation:** If [prd_e](prd_e.md) lands: default to TLS (`hostssl`), see [prd_e3](prd_e3.md).
 
 ### Options for existing data volumes (pg_hba lives in the data directory)
 

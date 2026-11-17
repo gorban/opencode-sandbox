@@ -20,17 +20,22 @@ Nothing serializes:
 
 ## Proposal
 
-- [ ] One **setup lock** (`flock` on `$STATE/setup.lock`) around the shared phase: images, OpenCode
+- [x] One **setup lock** (`flock` on `$STATE/setup.lock`) around the shared phase: images, OpenCode
       install/upgrade ([prd_b](prd_b.md)), bridge, SELinux module, relabel. The first run builds; the
       others print "waiting for instance X to finish shared setup…" and then find everything up to date.
-- [ ] The per-instance phase (pod, Chromium, Postgres, docker-in-docker, worktree) stays parallel,
+- [x] The per-instance phase (pod, Chromium, Postgres, docker-in-docker, worktree) stays parallel,
       outside the lock.
-- [ ] Hold the lock for the build only, not while OpenCode runs. Waiting has no timeout, and the message
+- [x] Hold the lock for shared setup only, not while OpenCode runs. Waiting has no timeout, and the message
       says which PID holds the lock.
-- [ ] Tests: two first-time setups started together build each image once (count `podman build` in a
-      stubbed run, then a real `tests/parallel.sh` timing check); a killed holder releases the lock (flock
+- [x] Tests: two first-time setups started together build each image once (count `podman build` in a
+      stubbed run, then real `tests/parallel.sh` concurrent-start acceptance); a killed holder releases the lock (flock
       does this automatically).
 
 Estimated time: 0.5 day.
+
+Implementation: `codex/foundations-batch`; real parallel acceptance passes 45 checks, with external
+integration review pending. A separate shared/exclusive lifecycle barrier coordinates startup with teardown;
+per-instance worktree locks protect selection records. Lock files are retained to preserve one
+locking domain across teardown and restart.
 
 - [ ] **Human review**: checked only when the user says so

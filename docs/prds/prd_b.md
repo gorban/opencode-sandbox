@@ -26,19 +26,23 @@ mid-session. Related: [prd_h](prd_h.md) (warm start: shared setup done once unde
 
 ## Proposal
 
-- [ ] On every setup (while online), run `opencode upgrade --method curl` in the existing throwaway
-      container that writes to `oc-home` (no Chromium/pod access, same SELinux level). Do it before
-      launch, with a short timeout, and keep the current copy if offline. All instances share one
-      binary, so upgrade under a lock (`flock` in `$STATE`) so two instances starting together don't
-      both write it.
-- [ ] Opt-out and pinning: `OC_OPENCODE_VERSION=2.3.0` pins a version, and `=keep` skips the upgrade.
+- [x] Pre-launch upgrade implemented in `codex/foundations-batch` (automated gates passed; external review pending).
+      An offline reader snapshots only the binary; the networked installer sees no shared home or
+      sandbox. An offline writer promotes a complete candidate after the preceding container is
+      verified stopped. Timeouts/offline failures retain the working copy. Shared setup is locked;
+      unpinned 1.x upgrades request `--major`, and 1.x to a pinned 2.x uses the versioned V2 installer.
+- [x] Opt-out and pinning: `OC_OPENCODE_VERSION=2.3.0` pins a version, and `=keep` skips the upgrade.
 - [ ] Make the agent survive an in-app upgrade: run OpenCode under a tiny wrapper inside the container
       that restarts it once if it exits right after updating its own binary (binary mtime changed),
       instead of ending the container. Ordinary quits still end the session.
-- [ ] Rebuild check: bake a newer base. `ghcr.io/anomalyco/opencode:latest` appears stale (1.19.5), so
-      look for the 2.x image name/tag. This is lower priority: the volume copy wins anyway.
-- [ ] Tests: an upgrade step with a stubbed installer; the wrapper restarts after a binary change and
-      exits on a normal quit; the pinned version is honoured.
+      OpenCode v2.3.0's [Restart action](https://raw.githubusercontent.com/anomalyco/opencode/v2.3.0/packages/tui/src/context/update-notification.tsx)
+      exits normally, like an ordinary quit. A binary change alone cannot distinguish another
+      instance's update, so this remains open pending a reliable upstream restart protocol.
+- [x] Bake the official Alpine-based `ghcr.io/anomalyco/opencode:2.3.0` base; the shared volume copy
+      still takes precedence. The original 1.19.5 observation was from the earlier image.
+- [x] Tests: staged install/upgrade, pinning, offline fallback, concurrent changes and ordinary exits
+      pass the 35-check lifecycle/update suite. Real fresh and warm updates pass; real parallel
+      acceptance passes 45 checks. The in-app restart requirement remains open as above.
 
 Estimated time: 0.5–1 day.
 

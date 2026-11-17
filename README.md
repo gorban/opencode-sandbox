@@ -23,7 +23,7 @@ oc-sandbox -i feat-a -W myrepo -P 3001:3000 -p # a second instance on a worktree
  ~/opencode-sandbox/  ──mounted──►     oc[-NAME]-agent     OpenCode + zsh/git/vim/docker CLI
    construct/   (default instance)     oc[-NAME]-chromium  Chromium on your Wayland desktop,
    wt/NAME/     (other instances)                          DevTools on 127.0.0.1:9222 (pod only)
-   .bridge/     (request spool)        oc[-NAME]-postgres  optional (-p), 127.0.0.1:5432 (pod only)
+   .bridge/     (request spool)        oc[-NAME]-postgres  optional (-p), 127.0.0.1:5432 (SCRAM)
  Wayland socket  ──────────────►       oc[-NAME]-dind      optional (-D), rootless Podman for `docker`
  FIDO/U2F key (hidraw) ────────►       (to Chromium only)
  127.0.0.1:HOST ──── -P ───────►       127.0.0.1:POD in the pod (published ports, loopback only)
@@ -34,7 +34,7 @@ oc-sandbox -i feat-a -W myrepo -P 3001:3000 -p # a second instance on a worktree
   memory limits, only `~/opencode-sandbox` mounted. It updates itself (the binary lives in a volume).
 - **Chromium** is controlled by OpenCode through the Chrome DevTools MCP, configured in the agent image
   (`OPENCODE_CONFIG=/etc/opencode/oc-sandbox.json`, merged with your own OpenCode configs).
-- **Postgres** (`-p`) runs in the same pod, so only that instance's agent and Chromium can reach it.
+- **Postgres** (`-p`) runs in the same pod and can optionally be published to host loopback with `-P`.
 - **Instances** (`-i NAME`): each has its own pod (network namespace), Chromium profile, Postgres data
   and docker storage, so copies of the same app can use the same default ports at the same time.
 - **Port mapping** (`-P HOST:POD`): look at an app in the sandbox from your host, on loopback only.
@@ -77,6 +77,20 @@ script it could run code on your host. The script refuses to run from inside tha
 The first run builds two images (a few minutes) and asks for your admin password once, to install the
 SELinux module.
 
+Concurrent starts serialize shared setup, then create their individual pods and sidecars in parallel.
+A waiting start reports the setup holder when it can identify it. Global teardown waits for active
+starts to finish creating resources; neither lock is held during an interactive OpenCode session.
+The small `setup.lock` and `lifecycle.lock` files under `~/.local/share/oc-sandbox` are retained even
+after `-d -a` so that concurrent commands cannot accidentally lock different inodes.
+
+Each setup checks for an OpenCode update, including `-n`. The download runs in an isolated container
+without the shared home or sandbox mounted; on failure or timeout, the working copy is kept (or the
+image's baked-in copy is used if there is none). Set `OC_OPENCODE_VERSION=keep` to skip the update, or
+set it to a version such as `2.3.0` to pin it. The image also includes OpenCode 2.3.0 as a fallback.
+An in-app update's Restart currently ends the session;
+launch `oc-sandbox` again. OpenCode does not provide a distinct restart signal that can be safely
+distinguished from a normal quit after another instance updates the shared binary.
+
 ## Usage
 
 | Command | What it does |
@@ -99,8 +113,9 @@ SELinux module.
 | `oc-sandbox -d -a [-y]` | Also delete images, all volumes (OpenCode login, profiles, data), build files, and the SELinux module |
 | `oc-sandbox -h` | Help |
 
-Flags combine (`oc-sandbox -i b -W myrepo -P 3001:3000 -p -D`). It is idempotent: rerun it any time
-and only missing or changed pieces are touched. If that instance's OpenCode is already running, it just
+Flags combine (`oc-sandbox -i b -W myrepo -P 3001:3000 -p -D`). It is idempotent: rerun it any time;
+shared images are rebuilt only when their inputs change or `-r` is given, and OpenCode is checked for
+updates on each setup unless `OC_OPENCODE_VERSION=keep`. If that instance's OpenCode is already running, it just
 completes the setup (like `-n`) and tells you to use `-x`. Closing a Chromium window stops that
 container, and the next run starts it again. Memory limits can be changed with `OC_AGENT_MEMORY`,
 `OC_CHROMIUM_MEMORY` and `OC_DIND_MEMORY` (default `4g` each; Postgres has `2g`); they apply per
@@ -124,13 +139,18 @@ oc-sandbox -l                               # what is running
   `postgres.env` for one instance). All agents mount all of `~/opencode-sandbox` (worktrees need the
   main repository's `.git`).
 - **Working directory:** `construct/` for the default instance, `wt/NAME/` for others, or `-C DIR`.
-  `-W REPO[:BRANCH]` turns it into a git worktree of `REPO` on `BRANCH` (default: the instance name,
+  When a named instance is started from inside a sandbox repository, it defaults to a worktree at
+  `wt/<repository path>/NAME` on branch `NAME`; `-W` or `-C` overrides this choice. Relaunching the
+  instance reuses its recorded worktree. `-W REPO[:BRANCH]` turns the working directory into a git
+  worktree of `REPO` on `BRANCH` (default: the instance name,
   created from `REPO`'s current `HEAD` if it does not exist). Worktrees use relative links
   (`git worktree add --relative-paths`; `worktree.useRelativePaths` is also set in the agents), so they
   work both inside the sandbox (`/sandbox/...`) and on the host (`~/opencode-sandbox/...`).
 - **Git never runs on the host** inside `~/opencode-sandbox`: the repository is agent-writable, so its
   hooks and config could run code. `-W` runs `git worktree add` in a throwaway container without network,
-  with hooks disabled.
+  with hooks and fsmonitor disabled. Repository detection also runs in the isolated container;
+  symlinked paths and repositories under `wt/` are refused. Existing worktrees must match the
+  requested repository and branch. `-l` shows recorded worktree details.
 - Instance names: `a-z`, `0-9` and inner `-`, at most 24 characters. `default` means the default instance
   (`-i default -d [-a]` removes only the default instance; only a bare `-d` acts on all of them).
 - `oc-sandbox -i NAME -d` leaves the worktree alone; remove it with `git worktree remove` in a sandbox shell.
@@ -139,6 +159,8 @@ oc-sandbox -l                               # what is running
 
 ```bash
 oc-sandbox -P 8080:80            # host 127.0.0.1:8080 -> pod 127.0.0.1:80
+oc-sandbox -P 3000               # shorthand for 3000:3000
+oc-sandbox -p -P 5433:5432       # password-authenticated Postgres on host loopback
 curl http://127.0.0.1:8080       # on the host
 ```
 
@@ -153,9 +175,10 @@ curl http://127.0.0.1:8080       # on the host
 - Ports are fixed when a pod is created, so changing them **recreates the pod** (Chromium restarts;
   Postgres data, docker storage and the profile are kept, and Postgres / docker-in-docker come back).
   That is refused while the instance's OpenCode runs: exit it first.
-- **Refused:** pod ports 9222 (Chromium DevTools: full control of the browser) and 5432 (Postgres:
-  trusts `127.0.0.1`, any role, no password). A mapped connection appears inside the pod as
-  `127.0.0.1`, so either would be open to every process on your host.
+- **Refused:** pod port 9222 (Chromium DevTools gives full browser control). Publishing pod port 5432
+  requires `-p`, which enforces Postgres password authentication. A later plain `-i NAME` launch keeps
+  an existing mapping after verifying its managed SCRAM server and password file. Mapped connections
+  arrive from `127.0.0.1` and are reachable by every local host user.
 - If the app builds absolute URLs, cookies, CORS origins or OAuth callbacks from its port, prefer the
   same number on both sides for the instance you browse from the host (`-P 3000:3000`).
 
@@ -189,7 +212,7 @@ environment variables (environment wins over the file):
 
 ```ini
 # ~/.config/oc-sandbox/postgres.env
-OC_PG_IMAGE=docker.io/library/postgres:17   # any image that honors POSTGRES_USER/_DB and POSTGRES_PASSWORD_FILE
+OC_PG_IMAGE=docker.io/library/postgres:17   # trusted image with the official docker-entrypoint.sh interface
 OC_PG_USER=app_owner                        # superuser created on first start
 OC_PG_PASSWORD=change-me                    # throwaway; see "Postgres authentication" in the security model
 OC_PG_DB=app_dev                            # initial database
@@ -216,17 +239,24 @@ literally, for example a password containing ` #`.
 - Changing only `OC_PG_IMAGE` keeps the data and recreates the container (a new major version of
   Postgres will still refuse to open an old data directory).
 - Data persists across restarts and `oc-sandbox -d`; only `-d -a` deletes it.
-- It listens on `127.0.0.1` inside the pod only. Connect from OpenCode or `oc-sandbox -x`:
-  `psql -h 127.0.0.1 -U <user> -d <db>`. **No password is needed.** The settings file is read by the
-  host script, not by `psql` (nothing from it is passed into the agent), and the standard Postgres images
-  use `trust` authentication for `127.0.0.1`, which is exactly how the agent reaches it. The configured
-  password only applies to non-local connections, and there are none. An image that enforces passwords
-  on localhost will ask for one (set `PGPASSWORD` yourself). The script prints the connection lines
-  when it is ready; they never contain the password.
+- Postgres listens on `127.0.0.1` inside the pod and requires SCRAM-SHA-256 for **all TCP** clients,
+  including localhost and any `-p -P 5432` host mapping. Unix-socket connections inside the Postgres
+  container use `trust`; that socket is not mounted into the agent. The script supplies a script-owned
+  HBA file at server startup for new and existing volumes. Volume-local `pg_hba.conf` and custom HBA
+  edits are ignored; keep authentication changes out of that file. A pre-existing volume must have a
+  compatible SCRAM verifier for the configured password: if authentication fails, startup stops and
+  retains the data. Migrate older MD5 verifiers through a trusted local administrative procedure before
+  enabling host access; do not put the password on a command line.
+- Inside a newly launched agent, `PGPASSFILE` points to a per-instance mode-0600 secret, so
+  `psql -h 127.0.0.1 -U <user> -d <db>` authenticates without a prompt. Restart an already-running agent
+  before enabling `-p`, because its mounts and environment cannot be changed. For host tools use
+  `oc-sandbox -p -P 5433:5432`, then `postgresql://<user>@127.0.0.1:5433/<db>`; enter the password
+  through your client. Printed URLs never include it.
 - **How the password is handled:** it is read into an unexported shell variable (values that came from
   the environment are un-exported too), sent over stdin into the Podman secret `oc[-NAME]-pg-password`,
   and mounted into the container as `POSTGRES_PASSWORD_FILE`. It never appears in a command line, in the
-  container's environment or `podman inspect`, or in the output. The settings record on the volume is a
+  container's environment or `podman inspect`, or in the output. A separate per-instance Podman secret
+  contains the escaped, mode-0600 agent passfile. The settings record on the volume is a
   hash keyed with a random file (`~/.local/share/oc-sandbox/pg-sig.key`, mode 0600), so it cannot be
   used to guess the password offline. Volumes made by older versions carry an unkeyed hash; they keep
   working, with a notice to recreate them.
@@ -282,8 +312,8 @@ you are trusting:
   from the sandbox, but services bound to `0.0.0.0` are reachable via `host.containers.internal`.
 - **Published ports (`-P`)** bind host `127.0.0.1` only, and arrive in the pod as connections from
   `127.0.0.1`. Anything on your host (any local user or process, and web pages in your host browser via
-  DNS rebinding) can reach a published app as if it were local to the pod. DevTools and Postgres ports
-  are refused for that reason; do not publish other services that trust localhost.
+  DNS rebinding) can reach a published app as if it were local to the pod. DevTools is refused; Postgres
+  publication requires `-p` and SCRAM authentication. Do not publish services that trust localhost.
 - **docker-in-docker (`-D`)** is the weakest part, opt-in. Nested rootless Podman needs the default
   capability set, setuid `newuidmap` (so no `no-new-privileges`), `/dev/fuse`, `/dev/net/tun`, and it runs
   **without SELinux confinement** (`label=disable`, as `spc_t`): confining it with a nested label
@@ -291,10 +321,10 @@ you are trusting:
   `~/opencode-sandbox`, and it is still an unprivileged user namespace, but kernel attack surface is
   larger than for the agent, and the agent (or prompt injection through it) can run arbitrary containers
   there. Your host's Podman or Docker socket is never exposed.
-- **Postgres authentication:** inside the pod, connections to `127.0.0.1` need no password (see above), so
-  the agent, and Chromium, and any page that can make it run commands, can connect as any role, including
-  the superuser. The password protects nothing against them. Treat everything in this database as readable
-  and writable by the agent, and never load real data into it.
+- **Postgres authentication:** all TCP connections require SCRAM, including host mappings and pod
+  loopback. The agent receives the configured database credentials through its private passfile, so
+  treat the database as readable and writable by the agent and never load real data into it. SCRAM
+  authenticates clients but does not encrypt the database connection.
 - **Self-updating OpenCode** downloads from the internet at runtime into the `oc-home` volume, which the
   agents can write to. A compromised session could replace the binary and it would persist (for all
   instances) until you reset the volume (`oc-sandbox -d -a`).
@@ -323,15 +353,16 @@ you are trusting:
     the link) and nothing else happens.
 - **Bridge copies:** `code`/`bcompare` on a path outside `/sandbox` copies it into `.bridge/files/` first
   (the host can only see the sandbox directory). Copies older than 7 days are removed automatically.
-- **Secrets:** only these variables are forwarded into the agent if set: `ANTHROPIC_API_KEY`,
+- **Secrets:** these API key variables are forwarded into the agent if set: `ANTHROPIC_API_KEY`,
   `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`. Use scoped keys with spend
-  limits. The script, Postgres config, and credentials live outside the mounted directory.
+  limits. The script and Postgres config remain outside the mounted directory; `-p` gives the agent its
+  per-instance Postgres passfile through a separate Podman secret.
 
 ## What it creates
 
 | Where | What |
 |---|---|
-| Podman (default instance) | pod `oc`; containers `oc-agent`, `oc-chromium`, `oc-postgres`, `oc-dind`; volumes `oc-chrome`, `oc-pg`, `oc-dind`, `oc-dind-run`; secret `oc-pg-password` |
+| Podman (default instance) | pod `oc`; containers `oc-agent`, `oc-chromium`, `oc-postgres`, `oc-dind`; volumes `oc-chrome`, `oc-pg`, `oc-dind`, `oc-dind-run`; secrets `oc-pg-password`, `oc-pg-passfile`, `oc-pg-hba` |
 | Podman (instance `NAME`) | the same with `oc-NAME` in place of `oc` (pod `oc-NAME`, `oc-NAME-agent`, ...) |
 | Podman (shared) | images `oc-agent`, `oc-chromium` (and the pulled `quay.io/podman/stable` for `-D`); volume `oc-home`. A rebuild removes the previous build once no container uses it and it has no other tag; only images recorded in `built-images` are ever removed, never another image that happens to have these names |
 | `~/opencode-sandbox/` | your workspace (`construct/`, `wt/NAME/`), plus `.bridge/` (request spool) |
@@ -357,10 +388,18 @@ Your files in `~/opencode-sandbox` (including worktrees) are never touched.
   creation and relabelling; FIFO requests; planted git hooks; `postgres.env` parsing; password exposure in
   output, argv and child environments; and argument validation (ports, instance names, paths). The
   container tests need Podman and the `oc-agent` image; `OC_TEST_NO_PODMAN=1` skips them.
-- `tests/parallel.sh` is an acceptance test against the real host (two Chromium windows open for a few
+  `OC_TEST_AGENT_IMAGE=FULL_IMAGE_ID` can select a test-owned image containing Python and Git instead.
+- `tests/postgres-host.sh` checks publication, secret handling and legacy failure paths with Podman
+  stubbed. `tests/postgres-host-real.py` uses isolated, test-owned Podman resources and locally available
+  Postgres 17 and Python Alpine images to check SCRAM, existing volumes and host authentication; run it
+  only when no other test is using the shared Podman host.
+- `python3 tests/parallel-isolated.py --run` runs `tests/parallel.sh` against the real host (two Chromium windows open for a few
   minutes): two instances with worktrees, agents launched in parallel, the same echo server on the same
   port in both, host access through `-P`, per-instance Postgres, docker-in-docker, `-l`, port changes and
-  instance removal. It cleans up after itself (`OC_PTEST_KEEP=1` keeps everything).
+  instance removal. It uses a fresh private Podman store and sandbox home, with synthetic credentials.
+  The existing host SELinux policy and Wayland session are required; user systemd changes are stubbed.
+  Direct execution of `tests/parallel.sh` is refused. Without `--run`, the runner only audits its sources.
+  An interrupted distrobox run retains both private directories if remote processes cannot be verified stopped.
 
 ## Troubleshooting
 
