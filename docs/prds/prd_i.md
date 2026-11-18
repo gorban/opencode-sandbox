@@ -28,16 +28,17 @@ flowchart LR
 ## Scope
 
 - [ ] **Orchestrator** — narrow tools, repo knowledge, versioned profiles, editable layouts and
-      worker health summaries ([prd_i1](prd_i1.md)).
+      near real-time worker direction and progress alerts ([prd_i1](prd_i1.md)).
 - [ ] **Worker fleet** — named hosts, SSH and NAT traversal, live headed browser views, terminal
       attach, CI and cloud work ([prd_i2](prd_i2.md)).
 - [ ] **Credential broker** — named references, human approvals, grants, audit and retry
       notifications ([prd_i3](prd_i3.md)).
 - [ ] **LLM gateway** — worker keys, API-key routes, provider-supported subscriptions and a
       **host-only Claude subscription feasibility spike** ([prd_i4](prd_i4.md)).
-- [ ] **Shared experience** — launch preview with pinned profile, worker, requested grants and
-      estimated cost. Fleet view, approval inbox, searchable job timeline, reconnect and resume,
-      expiring cloud capacity, and one action to revoke a worker's grants.
+- [ ] **Shared experience** — launch preview with feature name, task description for orchestrator
+      launches, pinned profile, worker, requested grants and estimated cost. Fleet view, approval
+      inbox, searchable job timeline, reconnect and resume, expiring cloud capacity, and one
+      action to revoke a worker's grants.
 
 ## Recommended first slice
 

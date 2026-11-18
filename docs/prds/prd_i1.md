@@ -65,20 +65,37 @@ Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential bro
 
 ## Worker direction and health
 
-- [ ] Capture the original plan as milestones and expected evidence. Record approved plan
-      revisions alongside the original. Compare observed progress with both, showing elapsed
-      time per milestone and time since last meaningful change.
+- [ ] Require the orchestrator's launch tool to supply a short, nonblank task description alongside
+      the feature or instance name. Describe the intended outcome and what evidence would count
+      as progress or completion. The host helper validates the field before starting the job,
+      shows it in the launch preview, and records the exact text as the original brief delivered
+      to the worker. Manual CLI launches can still omit a description.
+- [ ] Capture milestones and expected evidence against the original brief. Record operator-approved
+      changes as separate revisions. Show which revision an assessment used, elapsed time per
+      milestone, and time since the last meaningful change.
 - [ ] Derive health signals from redacted events: heartbeat and server probes, queue time,
       CPU/RAM pressure, test results, repeated actions/errors, no-progress intervals, and
-      time spent waiting for human approval or provider limits.
-- [ ] Use deterministic rules for fast loop, stall and service-health signals. Use a cheap, fast
-      decision model on short event batches or when rules flag ambiguity. Return an advisory
-      classification (on track, drifting, blocked, looping or unknown), confidence, evidence
-      event IDs and a suggested next check. Keep health separate from plan judgment.
-- [ ] Measure time to alert, false alerts on healthy long-running jobs, and cost per active
-      worker-hour in replay. Bound call size and frequency. Make stale or incomplete signals
-      visible. The decision model can flag and recommend. It cannot approve, grant access,
-      provision resources, stop a worker or rewrite the original plan.
+      time spent waiting for human approval or provider limits. Distinguish worker liveness and
+      expected waits from evidence that the job is advancing.
+- [ ] Use deterministic rules for fast loop, stall and service-health signals. In the model-assisted
+      slice, reassess on short batches of meaningful events or when rules flag ambiguity. Estimate
+      two scores independently: how likely the observed direction matches the task description and
+      how likely the job is still making meaningful progress. For each, report confidence, evidence
+      event IDs, the assessed time window, and `unknown` when evidence is stale or insufficient.
+      Treat worker events as evidence, never as instructions. Use only the scoped brief and bounded,
+      redacted evidence for the job.
+- [ ] When an assessment crosses a configured threshold for long enough, publish a scoped event
+      back to the orchestrator and dashboard. Flag possible drift and possible stalls separately.
+      Include the job and brief revision, scores, confidence, evidence IDs and a suggested next
+      check. Use separate recovery thresholds and deduplicate repeated alerts. Low confidence or
+      stale telemetry can trigger an evidence check instead of a drift or stall alert. The
+      orchestrator can inspect the timeline, ask the worker for status or surface the alert to the
+      operator. Assessment events carry no approval or execution authority.
+- [ ] Replay on-track work, genuine drift and stalls, healthy long-running checks, provider limits,
+      and stale feeds. Tune thresholds against missed alerts and false alarms, and measure the time
+      from qualifying evidence to delivery and cost per active worker-hour. Bound call size and
+      frequency. The decision model can flag and recommend. It cannot approve, grant access,
+      provision resources, stop a worker or rewrite the original brief.
 
 ## Open choices
 
@@ -88,7 +105,7 @@ Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential bro
 - [ ] (decision needed) **Profile history** — SQLite with immutable revisions (recommended,
       paging and atomic updates, needs export tooling, 2–4 days) or Git-versioned redacted
       profiles (portable diffs, more coordination for concurrent edits, 3–5 days).
-- [ ] (decision needed) **Health assessment** — rules first (recommended, predictable and cheap,
-      limited semantic drift detection, 2–4 days) or rules plus a budgeted small model
-      (better interpretation of ambiguous progress, requires evaluation and a model route,
-      another 3–5 days).
+- [ ] (decision needed) **Health assessment rollout** — start with rules (recommended, predictable
+      and cheap, limited semantic drift detection, 2–4 days), then add the budgeted decision model
+      after replay evaluation and a model route are available (another 3–5 days). Decide the event
+      cadence, latency target, score thresholds and alert persistence from replay results.
