@@ -3,6 +3,25 @@
 How this tree works (progressive discovery, checkboxes, the human review gate): see
 [`AGENTS.md`](../../AGENTS.md#prds-progressive-discovery-in-docsprds).
 
+## Implementation review gates
+
+These gates apply to work from any PRD, including a PRD that has already passed design review.
+
+1. **Before implementation**, write a short pseudocode walkthrough of the proposed behavior.
+   Cover the normal flow, failure and recovery paths, trust boundaries, and how tests will verify
+   them. Include the proposed resolution of every open choice being made during implementation
+   whose selected option did not receive explicit security review in the PRD. Get both a security
+   review and a general PR-style review of the walkthrough and those choices. Address actionable
+   findings and get the revised design re-reviewed before coding.
+2. **After implementation and before merge**, get both reviews on the actual PR diff and test
+   evidence for the exact commit under review. Check that the implementation and the choices it
+   made match the reviewed design. Explain deviations and return material design changes to the
+   first gate. Verify findings, fix them, add regression coverage where required, and get the
+   updated commit re-reviewed until actionable findings are resolved.
+
+Record the reviewed design revision, implementation commit and outcomes in the PRD or PR.
+These gates are in addition to the [Human review gate](../../AGENTS.md#human-review-gate).
+
 | PRD | Grouping | Status |
 |---|---|---|
 | [prd_a](prd_a.md) | Postgres reachable from the host (`-P 5432`, `-P 5433:5432`) | implemented; external static review complete; human review open |
