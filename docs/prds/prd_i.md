@@ -41,10 +41,25 @@ flowchart LR
 
 ## Recommended first slice
 
-One controller, local worker and named SSH worker. Start with a fixed dashboard and a typed
-approval flow. Prove browser view and handoff, terminal reconnect and an API-key route. Then add
-layout editing, Tailcat where needed, model-assisted health summaries and cloud provisioning.
-Run the Claude feasibility spike independently of the API-key route.
+Use one controller, a local worker, a named SSH worker and a fixed dashboard. Each stage depends
+on the preceding stage passing its boundary checks. Choose an implementation option before
+starting any stage that depends on it.
+
+- [ ] Write a threat model and authority matrix for the operator, orchestrator, host helper,
+      worker host and job sandbox. Record who can call each interface, see each class of data
+      and approve each effect.
+- [ ] Verify orchestrator isolation and helper authorization. Enroll workers with pinned SSH
+      host keys and scoped identities. Verify that unauthenticated or revoked peers fail closed.
+- [ ] Prove read-only health, status and reconnect in a fixed, isolated dashboard. Verify that
+      untrusted worker data stays separate from operator controls.
+- [ ] Prove the broker and one API-key route. Managed jobs must pass credential isolation,
+      job-scoped grant and revocation checks before enabling live upstream calls.
+- [ ] Enable approved actions after the approval, immutable-target and retry checks pass.
+- [ ] Add browser and terminal handoff after verifying that managed jobs cannot bypass the input
+      lease and that transferred content is safe to display or export.
+
+Defer editable layouts, Tailcat, model-assisted health and cloud provisioning to later slices.
+Start the Claude feasibility spike independently with the authorization check in [I4](prd_i4.md).
 
 Project code stays BSD-2-Clause. Integrate companion programs through CLI or HTTP where practical
 and carry their notices when redistributing them. Check the exact edition and its bundled code.

@@ -5,9 +5,13 @@ Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential bro
 ## Orchestrator and profiles
 
 - [ ] Launch `oc-sandbox -o` with a dedicated OpenCode configuration and minimal home, using
-      a restricted host process. Deny generic file reads, writes, shell, subagent launch and
-      web fetch/search by default. Allow named MCP tools and curated knowledge lookups. Keep
-      OS-level access restrictions around the process and use trusted configuration and plugins.
+      an OS sandbox that uses a distinct, verifiable identity. Deny generic file reads, writes,
+      shell, subagent launch and web fetch/search by default. Allow named MCP tools and curated
+      knowledge lookups. Run from trusted configuration, plugins and a working directory outside
+      agent-writable trees. Prevent loading user or project configuration and plugins. Deny access
+      to the operator's home, SSH agent, Podman socket, D-Bus and arbitrary network destinations.
+      Allow only the files and connections explicitly needed by this role. Enforce and test this
+      boundary independently of OpenCode's tool permissions.
       See [OpenCode permissions](https://opencode.ai/docs/permissions/) and
       [MCP servers](https://opencode.ai/docs/mcp-servers/).
 - [ ] Search curated repo docs, runbooks and examples. Consider an opt-in search tool with
@@ -20,17 +24,30 @@ Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential bro
       Support diff, restore, archive and unarchive. Hide archived items from default results.
       Expose schema and presence metadata for secret fields. Omit permanent deletion from tools.
 - [ ] Launch a host helper alongside the orchestrator with typed operations over a private local
-      socket. Resolve registered opaque keys to host-owned config entries. Reject inputs shaped
-      like paths and enforce safe file resolution on the host. Open the file in the user's
-      preferred viewer/editor through a human action, with status returned to the orchestrator.
+      Unix socket owned by the helper, with filesystem access limited to authorized peers. Verify
+      kernel-reported peer credentials against the sandbox identity and authorize each operation
+      for that role and target. Bound message sizes and request rates, reject malformed or unknown
+      operations, and reject stale or replayed authority across reconnects and restarts. Resolve
+      registered opaque keys to host-owned config entries using safe file resolution. Open files in
+      the user's preferred viewer/editor only through a human action, with status returned to the
+      orchestrator. Test that the sandbox denies host file and socket access and that the helper
+      rejects wrong peers, oversized requests, unauthorized operations and replay after restart.
       Suggested formats are JSON and JSON Schema for profiles, `mise.toml` and its lock for
       tool pins, and `.env.example` for reference names. Secret values use the broker store.
 
 ## Dashboard
 
-- [ ] Open an operator dashboard in the user's host Chrome profile or another host browser.
-      Keep its trusted session separate from the Chromium profiles workers drive today. Provide
-      fleet overview, approval inbox, browser wall, terminal links and searchable job timeline.
+- [ ] Open the operator dashboard in a dedicated hardened host browser profile or native shell.
+      Isolate it from general browsing, third-party extensions, service workers and worker browser
+      profiles. Keep secret entry and operator controls on this surface. Provide fleet overview,
+      approval inbox, browser wall, terminal links and searchable job timeline.
+- [ ] If served over HTTP, bind the control interface to loopback and require authenticated,
+      expiring operator sessions. Check Host on every request and Origin whenever supplied.
+      Require the exact dashboard Origin for mutations and WebSocket upgrades, and enforce CSRF
+      protection on mutations. Deny cross-origin access and embedding, and apply a restrictive
+      content security policy. Authenticate every status, preview and input stream before opening
+      it, and close it on session expiry or revocation. Test that foreign origins, DNS rebinding
+      and stale sessions cannot read streams or exercise operator controls.
 - [ ] Let the orchestrator propose or edit versioned layouts through a dedicated tool. Support
       views, menus, grouping, filters and component placement using a Glint-style declarative
       catalog. Evaluate [A2UI](https://a2ui.org/) (Apache-2.0) or a small JSON layout schema.

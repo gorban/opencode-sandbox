@@ -7,9 +7,10 @@ Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential bro
 - [ ] Keep the agent runtime, worktree and tools on the worker when the provider supports that
       split. Route model traffic to the trusted host over authenticated transport. Keep
       upstream API credentials and any host-owned subscription login on the trusted side.
-- [ ] Provide API-key routes with per-worker credentials, model allowlists, request/token
-      limits and revocation. Attribute model usage by worker and session. Make API billing
-      and subscription usage visible and require opt-in for paid fallback.
+- [ ] Provide API-key routes with broker identities scoped to a worker and job, model allowlists,
+      request/token limits and revocation. Verify the managed-job credential boundary in
+      [I3](prd_i3.md) before enabling a live route. Attribute model usage by worker and session.
+      Make API billing and subscription usage visible and require opt-in for paid fallback.
 - [ ] Preserve streaming, tool calls, cancellation and session separation. Record model,
       latency, usage and failure metadata for the dashboard and health monitor. Keep raw
       model inputs, outputs and provider credentials out of routine gateway logs.
@@ -28,6 +29,12 @@ Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential bro
 - [ ] **Question** — can remote OpenCode keep its own tools and conversation state on a worker
       while a trusted host runs supported Claude authentication and model calls? Keep the
       provider session on the host and follow the authorization scope of the integration.
+- [ ] **Stage 0: authorization** — confirm with provider documentation or the provider that the
+      exact topology, client, account entitlement, authentication and billing are permitted before
+      any live subscription test. Treat the existing OpenCode integration as evidence for its own
+      design only. Use mocks or the API-key baseline while authorization is unclear. If the proposed
+      subscription route is unsupported, record it as blocked and keep it disabled. See
+      [Anthropic authentication guidance](https://code.claude.com/docs/en/legal-and-compliance).
 - [ ] **Baseline** — OpenCode's built-in Claude Agent provider invokes the user's installed
       Claude Code through the Agent SDK. Its maintainer reports permission for that
       integration, whose specification requires both components on the same machine and
@@ -38,15 +45,21 @@ Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential bro
       [Anthropic guidance](https://code.claude.com/docs/en/agent-sdk/overview) and
       [LiteLLM Claude setup](https://docs.litellm.ai/docs/tutorials/claude_code_max_subscription).
 - [ ] **Compare** — OpenCode and Claude Code on the trusted host with remote tool execution
-      (supported integration to use as baseline, retains controller RAM use), or a thin
+      (closest to the documented integration, retains controller RAM use), or a thin
       host-side native Claude/SDK bridge with remote OpenCode (closer to the target, needs
       technical proof and provider confirmation for the new integration). Include the
       API-key gateway as a baseline and fallback.
-- [ ] **Exit criteria** — confirm permitted auth and billing for the exact flow. Verify there
-      is no provider login or token on the worker. Demonstrate streaming, tool-call round trips,
-      per-session isolation, cancellation, refresh and provider-limit behavior. Measure host
-      memory per active and idle session and proxy latency. Record supported and blocked paths,
-      and recommend proceed, revise or defer. Estimate 3–5 engineering days for the spike,
+- [ ] **Host execution boundary** — run either host client in an OS sandbox that exposes only
+      its own provider session, the required provider connection and the authenticated remote-tool
+      adapter. Deny model access to local files and shell, unrelated host credentials, inherited
+      sockets and arbitrary network destinations. Disable built-in local tools and untrusted config,
+      hooks and plugins. Allow only registered remote tools scoped to the correct job. Verify with
+      mocks that local actions and cross-job requests fail before enabling any live route.
+- [ ] **Exit criteria** — verify no provider login or token reaches the worker and no model action
+      can invoke local host tools. Demonstrate streaming, tool-call round trips, per-session
+      isolation, cancellation, refresh and provider-limit behavior on authorized paths. Measure
+      host memory per active and idle session and proxy latency. Record supported and blocked
+      paths and recommend proceed, revise or defer. Estimate 3–5 engineering days for the spike,
       excluding any wait for provider confirmation.
 
 ## Open choice

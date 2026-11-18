@@ -13,6 +13,12 @@ Parent: [prd_i](prd_i.md) · related: [orchestrator](prd_i1.md), [broker](prd_i3
       enough state to reconnect, resume and scope cleanup after controller restarts. Add
       capacity-aware placement, drain and expiring cloud leases when useful. Keep worktrees and
       sidecars on the worker, with explicit transfer of patches, logs and artifacts.
+- [ ] Treat transferred files and streams as untrusted. Receive bounded blobs into private staging
+      under generated names. Check declared sizes, types and digests and cap expanded size and file
+      count before any supported export. Reject traversal, symlinks, hardlinks and special files.
+      Never auto-extract archives or apply patches on the controller. Export only on operator
+      request to a safe destination. Render logs and diffs as inert text. Test hostile paths,
+      oversized or malformed transfers and active content with scratch fixtures.
 - [ ] Use SSH for reachable workers. Consider a restricted reverse SSH tunnel through a
       reachable bastion where a relay is acceptable. Consider Tailcat for machines behind
       separate NATs and Tailscale/Headscale for a standing fleet that needs centralized
@@ -50,9 +56,13 @@ flowchart LR
       view. Limit preview bandwidth and show disconnect/staleness.
 - [ ] Provide a trusted **Take control** / **Return to agent** action. Grant one expiring input lease
       for the selected browser, suspend agent input while it is held, and show the current owner.
-      Mediate both agent and operator input through the same boundary so switching ownership is
-      enforced. Revoke input on expiry, disconnect or explicit release. Keep the raw CDP endpoint
-      private and separate browser streaming from dashboard approvals.
+      For managed workers, replace today's direct pod-local CDP access with an authenticated arbiter
+      outside the job sandbox. Keep raw CDP and display/input sockets unreachable from agent code.
+      Require both agent tools and operator controls to use that arbiter for all browser mutations.
+      Check ownership and lease generation at dispatch and fence queued commands on handoff. Revoke
+      input on expiry, disconnect, explicit release or arbiter restart. Keep preview streams separate
+      from input and approvals. Test direct socket denial, simultaneous takeover, stale leases and
+      disconnect or restart while commands are queued.
 - [ ] Evaluate [CDP screencast](https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-startScreencast)
       and [input](https://chromedevtools.github.io/devtools-protocol/tot/Input/) for page views.
       Evaluate a nested display with [noVNC](https://github.com/novnc/noVNC) for the full browser
@@ -67,17 +77,25 @@ flowchart LR
       Support read-only attach and explicit input handoff when attaching to an active agent TUI.
       Keep tmux sockets and terminal launch authority in the trusted helper. See
       [tmux control mode](https://github.com/tmux/tmux/wiki/Control-Mode).
+- [ ] Treat worker terminal output as untrusted even in read-only mode. Use a confined terminal
+      renderer with bounded buffers and an allowlist of display controls. Disable clipboard writes,
+      host actions and automatic link opening from escape sequences. Authenticate and scope attach
+      and input to the selected session. Test that read-only attach cannot send input, stale leases
+      cannot write, and terminal output cannot change clipboard state or trusted dashboard controls.
 
 ## CI and cloud
 
 - [ ] Watch GitHub Actions or Concourse jobs. Display status and audit history. Route dispatch,
-      cancellation and deployment through canonical approval requests with workflow, ref and inputs.
-      Keep provider credentials and renewal on the host. Consider scoped GitHub App installation
-      tokens for read and dispatch adapters.
+      cancellation and deployment through canonical approval requests with resolved workflow,
+      commit or run identity and exact inputs. Keep provider credentials and renewal on the host.
+      Consider scoped GitHub App installation tokens for read and dispatch adapters.
 - [ ] Preview Render deployment or temporary job requests with service, plan, estimated cost,
-      runtime limit and cleanup. Require approval for new spend. Verify the worker runtime before
-      treating a Render deployment as a full sandbox host. Render one-off jobs inherit the base
-      service environment and lack its persistent disk. Use a service with scoped configuration.
+      runtime limit and cleanup. Require approval for new spend. Bind it to the approved build and
+      service configuration. Enable deployment only if the adapter can hold that binding through
+      execution. Verify the worker runtime before treating Render as a full sandbox host. Render
+      one-off jobs use the base service's latest successful build, inherit its environment and lack
+      its persistent disk. Use a dedicated service whose inherited environment contains no unrelated
+      credentials, and keep dispatch disabled if the build or configuration cannot be pinned.
       See [Render one-off jobs](https://render.com/docs/one-off-jobs) and
       [GitHub Actions workflows](https://docs.github.com/en/rest/actions/workflows).
 
