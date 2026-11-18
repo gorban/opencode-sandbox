@@ -1,7 +1,7 @@
 # prd_i2: Worker fleet, browser wall and terminals
 
 Parent: [prd_i](prd_i.md) · related: [orchestrator](prd_i1.md), [broker](prd_i3.md),
-[per-instance networking](prd_d.md), [local HTTPS](prd_e.md)
+[warm worker starts](prd_i5.md), [per-instance networking](prd_d.md), [local HTTPS](prd_e.md)
 
 ## Workers and connectivity
 
@@ -13,6 +13,8 @@ Parent: [prd_i](prd_i.md) · related: [orchestrator](prd_i1.md), [broker](prd_i3
       enough state to reconnect, resume and scope cleanup after controller restarts. Add
       capacity-aware placement, drain and expiring cloud leases when useful. Keep worktrees and
       sidecars on the worker, with explicit transfer of patches, logs and artifacts.
+      Use [the warm-start plan](prd_i5.md) for cache-aware placement recommendations and authorized
+      image, checkout and artifact reuse.
 - [ ] Treat transferred files and streams as untrusted. Receive bounded blobs into private staging
       under generated names. Check declared sizes, types and digests and cap expanded size and file
       count before any supported export. Reject traversal, symlinks, hardlinks and special files.

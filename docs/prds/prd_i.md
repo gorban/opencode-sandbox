@@ -1,7 +1,8 @@
 # prd_i: OpenCode orchestrator and sandbox fleet
 
 [Index](README.md) · children: [orchestrator and dashboard](prd_i1.md),
-[worker fleet](prd_i2.md), [credential broker](prd_i3.md), [LLM gateway](prd_i4.md)
+[worker fleet](prd_i2.md), [credential broker](prd_i3.md), [LLM gateway](prd_i4.md),
+[warm worker starts](prd_i5.md)
 
 ## Executive summary
 
@@ -35,6 +36,8 @@ flowchart LR
       notifications ([prd_i3](prd_i3.md)).
 - [ ] **LLM gateway** — worker keys, API-key routes, provider-supported subscriptions and a
       **host-only Claude subscription feasibility spike** ([prd_i4](prd_i4.md)).
+- [ ] **Warm worker starts** — pinned images, restricted package bootstrap, reusable layers and
+      Git checkout seeding ([prd_i5](prd_i5.md)).
 - [ ] **Shared experience** — launch preview with feature name, task description for orchestrator
       launches, pinned profile, worker, requested grants and estimated cost. Fleet view, approval
       inbox, searchable job timeline, reconnect and resume, expiring cloud capacity, and one
