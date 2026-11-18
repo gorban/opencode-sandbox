@@ -2,8 +2,9 @@
 # Acceptance test for parallel instances, port mapping, per-instance Postgres, docker-in-docker and
 # worktrees, against the REAL host (Podman, Wayland, SELinux): two Chromium windows open for a while.
 # Creates instances ptest1/ptest2 and $SB/.oc-ptest-repo, and removes them again (also on failure).
-#   tests/parallel.sh            OC_PTEST_KEEP=1 tests/parallel.sh   (keep everything for inspection)
+# Run through tests/parallel-isolated.py; direct execution is refused.
 set -uo pipefail
+[[ ${OC_PTEST_ISOLATED:-} == 1 ]] || { echo "Use tests/parallel-isolated.py; direct execution is unsafe" >&2; exit 2; }
 REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 OCS=$REPO/oc-sandbox SB=$HOME/opencode-sandbox
 if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null; then H=(distrobox-host-exec); else H=(); fi
@@ -17,22 +18,25 @@ check() { local d=$1 neg=0 r; shift; [[ $1 == '!' ]] && { neg=1; shift; }
   if "$@" >/dev/null 2>&1; then r=0; else r=1; fi; if (( r == neg )); then ok "$d"; else bad "$d"; fi; }
 inbox() {  # run a fixed command in a throwaway container that sees only $SB (never touch $SB from the host)
   P run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges --security-opt=label=disable \
-    -v "$SB":/sandbox -w /sandbox --entrypoint sh oc-agent -c "$@"; }
+    -v "$SB":/sandbox -w /sandbox --entrypoint sh "${OC_PTEST_INBOX_IMAGE:-oc-agent}" -c "$@"; }
 # the test's Postgres settings (environment wins over postgres.env; no init scripts)
 export OC_PG_IMAGE=${OC_PTEST_PG_IMAGE:-docker.io/library/postgres:17} OC_PG_USER=ptest OC_PG_PASSWORD=ptest-pw \
        OC_PG_DB=ptest OC_PG_INIT_DIR=/nonexistent
 cleanup() {
-  [[ -n ${OC_PTEST_KEEP:-} ]] && { echo "(kept: OC_PTEST_KEEP)"; return; }
-  echo "cleanup"
-  jobs -p | xargs -r kill 2>/dev/null
-  for i in ptest1 ptest2; do "$OCS" -i $i -d -a -y >/dev/null 2>&1; done
-  inbox 'rm -rf .oc-ptest-repo wt/ptest1 wt/ptest2; rmdir wt 2>/dev/null; true' >/dev/null 2>&1
+  echo "stopping acceptance-test jobs; private store cleanup follows"
+  local pid
+  for pid in $(jobs -p); do kill "$pid" 2>/dev/null || true; done
+  for pid in $(jobs -p); do wait "$pid" 2>/dev/null || true; done
   rm -rf "$T"
 }
 trap cleanup EXIT
 
+P pod create --name oc >/dev/null || { echo "could not create private default-pod sentinel" >&2; exit 1; }
+
 echo "prepare: test repository inside the sandbox (with a hook that must NOT run)"
-inbox 'set -e; rm -rf .oc-ptest-repo wt/ptest1 wt/ptest2; mkdir .oc-ptest-repo; cd .oc-ptest-repo
+OC_PTEST_INBOX_IMAGE=docker.io/alpine/git:latest inbox 'test -d /sandbox' || { echo "bootstrap container or sandbox mount failed" >&2; exit 1; }
+OC_PTEST_INBOX_IMAGE=docker.io/alpine/git:latest inbox 'd=$(mktemp -d "${TMPDIR:-/tmp}/oc-git-check.XXXXXX") || exit 1; trap '\''rm -rf "$d"'\'' EXIT; mkdir "$d/repo" || exit 1; git -C "$d/repo" init -q || exit 1; git -C "$d/repo" -c user.name=Test -c user.email=test@example.invalid -c core.hooksPath=/dev/null commit --allow-empty -qm init || exit 1; git -C "$d/repo" -c core.hooksPath=/dev/null worktree add -q --relative-paths -b oc-test "$d/wt" || exit 1; IFS= read -r link < "$d/wt/.git" || exit 1; case "$link" in "gitdir: ../repo/.git/worktrees/"*) ;; *) exit 1;; esac' || { echo "could not verify bootstrap Git relative-worktree support" >&2; exit 1; }
+OC_PTEST_INBOX_IMAGE=docker.io/alpine/git:latest inbox 'set -e; rm -rf .oc-ptest-repo wt/ptest1 wt/ptest2; mkdir .oc-ptest-repo; cd .oc-ptest-repo
   git init -q -b main; git config user.email t@t; git config user.name t
   cat > echo.py <<EOF
 import http.server, os
@@ -44,13 +48,16 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(("127.0.0.1", 3000), H).serve_forever()
 EOF
   git add echo.py; git commit -qm init
-  printf "#!/bin/sh\ntouch /sandbox/.oc-ptest-repo/HOOK-RAN\n" > .git/hooks/post-checkout; chmod +x .git/hooks/post-checkout'
+  printf "#!/bin/sh\ntouch /sandbox/.oc-ptest-repo/HOOK-RAN\n" > .git/hooks/post-checkout; chmod +x .git/hooks/post-checkout' || { echo "repository preparation failed" >&2; exit 1; }
 
 echo "setup: two instances (each: own pod, Chromium, Postgres; ptest1 also docker-in-docker)"
-"$OCS" -n -i ptest1 -P 18181:3000 -p -D -W .oc-ptest-repo > $T/ptest1.log 2>&1; r1=$?
-"$OCS" -n -i ptest2 -P 18182:3000,18192:80 -p -W .oc-ptest-repo:other > $T/ptest2.log 2>&1; r2=$?
+"$OCS" -n -i ptest1 -P 18181:3000 -p -D -W .oc-ptest-repo > "$T/ptest1.log" 2>&1 & setup1=$!
+"$OCS" -n -i ptest2 -P 18182:3000,18192:80 -p -W .oc-ptest-repo:other > "$T/ptest2.log" 2>&1 & setup2=$!
+wait "$setup1"; r1=$?; wait "$setup2"; r2=$?
+check "shared agent image built once" [ "$(grep -hcF '==> Building oc-agent' "$T/ptest1.log" "$T/ptest2.log" | awk '{n+=$1} END{print n+0}')" -eq 1 ]
+check "shared Chromium image built once" [ "$(grep -hcF '==> Building oc-chromium' "$T/ptest1.log" "$T/ptest2.log" | awk '{n+=$1} END{print n+0}')" -eq 1 ]
 check "setup ptest1" [ $r1 -eq 0 ]; check "setup ptest2" [ $r2 -eq 0 ]
-(( r1 == 0 && r2 == 0 )) || { tail -15 $T/ptest1.log $T/ptest2.log; exit 1; }
+(( r1 == 0 && r2 == 0 )) || { tail -n 80 -- "$T/ptest1.log" "$T/ptest2.log"; exit 1; }
 LEVEL=$(cat "${XDG_DATA_HOME:-$HOME/.local/share}/oc-sandbox/sb-level")
 
 echo "worktrees"

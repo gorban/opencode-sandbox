@@ -4,6 +4,8 @@
 # optional Postgres and docker-in-docker sidecar).
 set -euo pipefail
 
+CALLER_PWD=$PWD
+CALLER_PHYSICAL=$(pwd -P)
 SB="$HOME/opencode-sandbox"            # mounted at /sandbox in every agent
 # This script runs on the HOST (and asks for admin rights), so it must never live inside the directory
 # that is mounted into the agent containers, or an agent could rewrite it.
@@ -34,7 +36,7 @@ AGENT_MEM=${OC_AGENT_MEMORY:-4g} CHROME_MEM=${OC_CHROMIUM_MEMORY:-4g} DIND_MEM=$
 FWD_ENV=(ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY GOOGLE_API_KEY)
 # Pod ports that must never be published: a mapped connection reaches the pod as 127.0.0.1, which
 # Chromium DevTools (full browser control) and Postgres (trust auth, any role) accept without a password.
-SENSITIVE_PORTS=(9222 5432)
+SENSITIVE_PORTS=(9222)
 RESERVED_NAMES=" agent chromium chrome postgres pg dind home "
 
 usage() {
@@ -49,13 +51,15 @@ Usage: ${0##*/} [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W
               pod, Chromium (and profile), Postgres data and docker-in-docker storage, so several can
               run the same app on the same ports at once. Names: a-z, 0-9, '-'.
   -C DIR      Working directory, relative to $SB (default: construct for the default
-              instance, wt/NAME for others). Created if missing.
+              instance, wt/NAME for others). A named instance started inside a sandbox
+              repository defaults to a worktree under wt/REPO/NAME. Created if missing.
   -W REPO[:BRANCH]
               Make the working directory a git worktree of $SB/REPO on BRANCH (default: the
               instance name; created from REPO's HEAD if it does not exist). Runs inside a container.
-  -P HOST:POD Publish pod port POD on the host as 127.0.0.1:HOST (repeatable, or comma-separated).
+              Existing worktrees must match the requested repository and branch.
+  -P PORT or HOST:POD  Publish a pod port on host loopback (repeatable, or comma-separated).
               Kept until changed; '-P none' removes all. Changing ports recreates the pod, which is
-              refused while that instance's OpenCode runs. Ports ${SENSITIVE_PORTS[*]} are refused.
+              refused while that instance's OpenCode runs. Port 9222 is refused; 5432 requires -p.
   -p          Also run Postgres in the pod (data volume per instance, survives restarts and -d;
               only -d -a deletes it). There are NO defaults: configure image/user/password/database
               first (~/.config/oc-sandbox/postgres.env, postgres.NAME.env, or OC_PG_*). See README.md.
@@ -64,7 +68,7 @@ Usage: ${0##*/} [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W
   -n          Setup only: do not launch OpenCode.
   -r          Rebuild images from latest bases and recreate the pod.
   -x          Open a zsh shell inside that instance's running OpenCode container.
-  -l          List instances.
+  -l          List instances, including recorded worktree repository and branch.
   -k          List detected FIDO/U2F security keys (what would be passed to Chromium) and exit.
   -K          Do not pass any security key to Chromium on this run.
   -d          Delete: without -i, remove ALL instance pods and the host bridge; with -i, only that
@@ -110,6 +114,12 @@ trusted_path() {  # absolute path -> its physical path on stdout; 1 if the walk 
   done
   printf '%s\n' "${cur:-/}"
 }
+trusted_file() { # resolve repository helpers without following a path into the sandbox
+  local r
+  r=$(trusted_path "$1") || return 1
+  [[ -f $r ]] || return 1
+  printf '%s\n' "$r"
+}
 trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
   local r
   r=$(trusted_path "$2") || die "refusing to use $2: the path leads into the sandbox directory $SB, which the agent controls (check XDG_DATA_HOME / XDG_CONFIG_HOME and symlinks)"
@@ -120,7 +130,69 @@ trusted_dir STATE "$STATE"
 trusted_dir CONF_DIR "${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox"
 trusted_dir BIN "$BIN"
 trusted_dir UNITS "$UNITS"
-BUILD="$STATE/build" IMAGE_LOG="$STATE/built-images"
+trusted_dir BUILD "$STATE/build"
+trusted_dir POLDIR "$STATE/policy"
+trusted_dir BRIDGE_STAGE "$STATE/bridge-stage"
+IMAGE_LOG="$STATE/built-images"
+
+# Agent-writable files may have been linked into previously created host state.
+# Validate each script-owned leaf before even listing or deleting state. Parent
+# directories must prevent other users replacing entries between checks and use.
+validate_host_state() {
+  python3 -I - "$STATE" "$BUILD" "$POLDIR" "$BRIDGE_STAGE" "$BIN" "$UNITS" <<'PYCODE'
+import os, stat, sys
+state, build, policy, stage, binary, units = sys.argv[1:]
+uid = os.geteuid()
+def directory(path, owned=False):
+    path = os.path.normpath(path)
+    current = path
+    nearest = True
+    while True:
+        try: st = os.lstat(current)
+        except FileNotFoundError: pass
+        else:
+            if not stat.S_ISDIR(st.st_mode): raise ValueError("not a real directory: " + current)
+            if nearest and (st.st_uid != uid or st.st_mode & 0o022):
+                raise ValueError("nearest host state parent is not owned and protected: " + current)
+            nearest = False
+            # A sticky shared ancestor such as /tmp cannot be used to replace an
+            # entry owned by this user; the actual script-owned directories remain private.
+            sticky_ancestor = (current != path and st.st_uid in (0, 65534)
+                               and bool(st.st_mode & stat.S_ISVTX))
+            if st.st_uid not in (uid, 0) and not sticky_ancestor: raise ValueError("directory has unsafe owner: " + current)
+            if st.st_mode & 0o022 and not sticky_ancestor: raise ValueError("directory is writable by other users: " + current)
+            if current == path and owned and st.st_uid != uid: raise ValueError("directory is not owned by this user: " + current)
+        parent = os.path.dirname(current)
+        if parent == current: break
+        current = parent
+def leaf(path, private=False):
+    try: st = os.lstat(path)
+    except FileNotFoundError: return
+    if (not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_nlink != 1 or st.st_mode & 0o022
+        or (private and stat.S_IMODE(st.st_mode) != 0o600)):
+        raise ValueError("unsafe host state file: " + path)
+try:
+    for path in (state, build, policy, stage, binary, units): directory(path, True)
+    for name in ("sb-level", "built-images", "built-images.lock", "pg-sig.key", "pg-sig.lock"):
+        leaf(os.path.join(state, name), name in ("pg-sig.key", "pg-sig.lock"))
+    for name in ("Containerfile.agent", "Containerfile.chromium", "opencode-sandbox.json", "zshrc", "bridge-open", "gitconfig", "gitignore_global", "oc-opencode-update.py", "oc-opencode-run.py"):
+        leaf(os.path.join(build, name))
+    for name in ("oc_chromium.cil", "installed"): leaf(os.path.join(policy, name))
+    for name in ("oc-bridge.service", "oc-bridge.path"): leaf(os.path.join(units, name))
+    leaf(os.path.join(binary, "oc-bridge"))
+except (OSError, ValueError) as exc:
+    print("unsafe host state: " + str(exc), file=sys.stderr); sys.exit(2)
+PYCODE
+}
+validate_host_state || die "refusing unsafe host state"
+# Write script-owned files by replacement, never by following a destination link.
+atomic_host_file() {  # destination, mode; contents on stdin
+  local target=$1 mode=$2 tmp rc=0
+  tmp=$(mktemp "${target%/*}/.oc-write.XXXXXXXX") || return 1
+  chmod "$mode" "$tmp" && cat > "$tmp" && mv -f -- "$tmp" "$target" || rc=$?
+  [[ ! -e $tmp ]] || rm -f -- "$tmp"
+  return "$rc"
+}
 
 # ---- option parsing ---------------------------------------------------------
 DELETE=0 ALL=0 REBUILD=0 NOLAUNCH=0 YES=0 LISTKEYS=0 NOKEY=0 EXEC=0 PG=0 DIND=0 LIST=0
@@ -155,7 +227,7 @@ set_names() {  # derive every per-instance resource name; the default instance k
   local p
   if [[ -z $INST ]]; then p=oc ILABEL=default DEFAULT_CWD=construct POD=oc; else p=oc-$INST ILABEL=$INST DEFAULT_CWD=wt/$INST POD=$p; fi
   AGENT=$p-agent CHROME=$p-chromium PGC=$p-postgres DINDC=$p-dind
-  CHROMEVOL=$p-chrome PGVOL=$p-pg PGSECRET=$p-pg-password DINDVOL=$p-dind DINDRUN=$p-dind-run
+  CHROMEVOL=$p-chrome PGVOL=$p-pg PGSECRET=$p-pg-password PGPASSSECRET=$p-pg-passfile PGHBASECRET=$p-pg-hba DINDVOL=$p-dind DINDRUN=$p-dind-run
 }
 set_names
 
@@ -182,6 +254,195 @@ else
 fi
 pm() { "${H[@]}" podman "$@"; }
 sc() { "${H[@]}" systemctl --user "$@"; }
+safe_run() { pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
+  --security-opt=label=disable -v "$SB":/sandbox "$@"; }
+
+# These commands execute only in the sandbox-only container. Git receives a clean environment;
+# local configuration remains data read by Git, with hooks and fsmonitor forcibly disabled.
+SANDBOX_TREE_PY='import os, stat, subprocess, sys
+os.chdir("/sandbox")
+def fail(msg):
+    print(msg, file=sys.stderr); sys.exit(3)
+def plain(path):
+    if not path or path.startswith("/") or any(p in ("", ".", "..") for p in path.split("/")):
+        fail("invalid sandbox path")
+    cur = "."
+    for part in path.split("/"):
+        cur = os.path.join(cur, part)
+        try:
+            if stat.S_ISLNK(os.lstat(cur).st_mode): fail("refusing symlink in " + path)
+        except FileNotFoundError: break
+def open_dir(path):
+    if not path or path.startswith("/") or any(x in ("", ".", "..") for x in path.split("/")):
+        fail("invalid sandbox directory")
+    fd = os.open("/sandbox", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.split("/"):
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd); fd = nxt
+        return fd
+    except OSError:
+        os.close(fd); fail("refusing changed or symlinked directory: " + path)
+def same(fd, path):
+    other = open_dir(path)
+    a, b = os.fstat(fd), os.fstat(other)
+    os.close(other)
+    if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino): fail("directory changed: " + path)
+def file_state(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+def snapshot_file(fd):
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > 4096: fail("invalid worktree control file")
+    data = os.pread(fd, 4097, 0)
+    after = os.fstat(fd)
+    if file_state(before) != file_state(after) or len(data) != before.st_size:
+        fail("worktree control file changed while reading")
+    return file_state(after), data
+def verify_file(fd, directory_fd, name, saved):
+    current = snapshot_file(fd)
+    on_path = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if current != saved or file_state(on_path) != saved[0]: fail("worktree control file changed")
+def git(*args, check=True, cwd_fd=None, git_fd=None):
+    env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+    pinned = (["--git-dir=/proc/self/fd/" + str(git_fd), "--work-tree=/proc/self/fd/" + str(cwd_fd)]
+              if git_fd is not None else [])
+    fds = tuple(fd for fd in (cwd_fd, git_fd) if fd is not None)
+    r = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *pinned, *args],
+                       env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                       cwd=("/proc/self/fd/" + str(cwd_fd)) if cwd_fd is not None else "/sandbox",
+                       pass_fds=fds)
+    if check and r.returncode: fail("git failed: " + r.stderr.strip())
+    return r
+def root_for(path):
+    start = open_dir(path)
+    r = git("-C", ".", "rev-parse", "--show-toplevel", check=False, cwd_fd=start)
+    same(start, path)
+    if r.returncode:
+        os.close(start); return ""
+    root = r.stdout.strip()
+    if not root.startswith("/sandbox/"): fail("repository is outside sandbox")
+    rel = root[len("/sandbox/"):]
+    if rel == "wt" or rel.startswith("wt/"): fail("refusing a repository under wt/")
+    repo_fd = open_dir(rel); dotgit = rel + "/.git"; git_fd = open_dir(dotgit)
+    actual = git("-C", ".", "rev-parse", "--path-format=absolute", "--git-common-dir", cwd_fd=repo_fd).stdout.strip()
+    if actual != "/sandbox/" + dotgit: fail("repository git directory does not match its root")
+    same(repo_fd, rel); same(git_fd, dotgit)
+    same(start, path); os.close(start)
+    os.close(repo_fd); os.close(git_fd)
+    return rel
+def replace_text(dir_fd, name, value):
+    # A unique file in the already-open directory; do not follow any planted destination symlink.
+    import secrets
+    tmp = ".oc-link-" + secrets.token_hex(16)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd)
+    try:
+        with os.fdopen(fd, "w") as f: f.write(value + "\n")
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    finally:
+        try: os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError: pass
+def link_worktree(repo, dest, dest_fd, git_fd, previous):
+    # Git resolves /proc/self/fd to a pathname while creating its links. If the source
+    # directory was renamed during Git, rebuild both links relative to the verified paths.
+    import re
+    f = os.open(".git", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dest_fd)
+    with os.fdopen(f) as inp: line = inp.read(4096).strip()
+    m = re.search(r"(?:^|/)worktrees/([A-Za-z0-9._@+-]+)$", line)
+    if not line.startswith("gitdir: ") or not m or m.group(1) in previous:
+        fail("invalid new worktree administrative link")
+    ident = m.group(1)
+    worktrees_fd = os.open("worktrees", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=git_fd)
+    admin_fd = os.open(ident, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=worktrees_fd)
+    os.close(worktrees_fd)
+    source = "/sandbox/" + repo + "/.git/worktrees/" + ident
+    target = "/sandbox/" + dest + "/.git"
+    same(dest_fd, dest); same(git_fd, repo + "/.git")
+    replace_text(admin_fd, "gitdir", os.path.relpath(target, source))
+    replace_text(dest_fd, ".git", "gitdir: " + os.path.relpath(source, "/sandbox/" + dest))
+    same(dest_fd, dest); same(git_fd, repo + "/.git")
+    os.close(admin_fd)
+
+mode = sys.argv[1]
+if mode == "detect":
+    print(root_for(sys.argv[2])); sys.exit(0)
+if mode == "info":
+    path = sys.argv[2]; plain(path)
+    common = git("-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    branch = git("-C", path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    root = common.stdout.strip()
+    if common.returncode or branch.returncode or not root.startswith("/sandbox/") or not root.endswith("/.git"):
+        sys.exit(0)
+    repo = root[len("/sandbox/"):-len("/.git")]
+    if root_for(repo) == repo: print(repo + ":" + branch.stdout.strip())
+    sys.exit(0)
+dest, repo, branch = sys.argv[2:]
+plain(dest)
+if repo:
+    plain(repo)
+    repo_fd = open_dir(repo); git_fd = open_dir(repo + "/.git")
+    if root_for(repo) != repo: fail("-W must name a repository root")
+    if branch.startswith("-") or git("check-ref-format", "--branch", branch, check=False).returncode:
+        fail("invalid branch name: " + branch)
+    same(repo_fd, repo); same(git_fd, repo + "/.git")
+    # Keep both source directories open across Git operations and compare their identities,
+    # rather than resolving two attacker-mutable pathnames after a possible replacement.
+    common = git("-C", ".", "rev-parse", "--path-format=absolute", "--git-common-dir", cwd_fd=repo_fd).stdout.strip()
+    if common != "/sandbox/" + repo + "/.git": fail("repository git directory changed")
+    same(repo_fd, repo); same(git_fd, repo + "/.git")
+    if os.path.lexists(os.path.join(dest, ".git")):
+        dest_fd = open_dir(dest)
+        dot_fd = os.open(".git", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dest_fd)
+        dot_snapshot = snapshot_file(dot_fd)
+        link = os.fsdecode(dot_snapshot[1]).strip()
+        if not link.startswith("gitdir: "): fail("invalid existing worktree link")
+        admin_path = os.path.normpath(os.path.join("/sandbox", dest, link[len("gitdir: "):]))
+        if not admin_path.startswith("/sandbox/"): fail("worktree git directory outside sandbox")
+        admin_fd = open_dir(admin_path[len("/sandbox/"):])
+        common_file = os.open("commondir", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=admin_fd)
+        common_snapshot = snapshot_file(common_file)
+        common_relative = os.fsdecode(common_snapshot[1]).strip()
+        if common_relative != "../..": fail("invalid worktree common directory")
+        target_fd = os.open(common_relative, os.O_RDONLY | os.O_DIRECTORY, dir_fd=admin_fd)
+        source_stat, target_stat = os.fstat(git_fd), os.fstat(target_fd)
+        os.close(target_fd)
+        b = git("-C", ".", "symbolic-ref", "--quiet", "--short", "HEAD", check=False, cwd_fd=dest_fd, git_fd=admin_fd)
+        same(admin_fd, admin_path[len("/sandbox/"):])
+        verify_file(common_file, admin_fd, "commondir", common_snapshot)
+        verify_file(dot_fd, dest_fd, ".git", dot_snapshot)
+        os.close(common_file); os.close(dot_fd); os.close(admin_fd)
+        if ((source_stat.st_dev, source_stat.st_ino) != (target_stat.st_dev, target_stat.st_ino)
+                or b.returncode or b.stdout.strip() != branch):
+            fail("existing worktree does not match requested repository and branch")
+        same(dest_fd, dest); os.close(dest_fd)
+    else:
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        os.makedirs(dest, exist_ok=True)
+        dest_fd = open_dir(dest)
+        try:
+            wt_fd = os.open("worktrees", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=git_fd)
+            previous = set(os.listdir(wt_fd)); os.close(wt_fd)
+        except FileNotFoundError: previous = set()
+        exists = not git("-C", ".", "show-ref", "--verify", "--quiet", "refs/heads/" + branch, check=False, cwd_fd=repo_fd, git_fd=git_fd).returncode
+        args = ["-C", ".", "worktree", "add", "--relative-paths"]
+        if not exists: args += ["-b", branch]
+        args += ["--", "/sandbox/" + dest]
+        if exists: args += [branch]
+        git(*args, cwd_fd=repo_fd, git_fd=git_fd)
+        same(repo_fd, repo); same(git_fd, repo + "/.git"); same(dest_fd, dest)
+        link_worktree(repo, dest, dest_fd, git_fd, previous)
+        same(dest_fd, dest); os.close(dest_fd)
+    same(repo_fd, repo); same(git_fd, repo + "/.git")
+    os.close(git_fd); os.close(repo_fd)
+os.makedirs(dest, exist_ok=True)'
+init_sandbox_tree() {  # dest [repo branch]
+  safe_run --entrypoint python3 "$AGENT_IMG" -c "$SANDBOX_TREE_PY" init "$1" "${2:-}" "${3:-}"
+}
+init_bridge_spool() {
+  safe_run --entrypoint sh "$AGENT_IMG" -c 'cd /sandbox && mkdir -p .bridge/requests .bridge/tmp .bridge/files'
+}
+
+
 # The ledger is only replaced atomically (rename), so a plain read always sees a whole version.
 # Every change (append, rewrite) holds an exclusive flock: parallel instances share the ledger.
 owned_image() { [[ $1 =~ ^[0-9a-f]{64}$ && -f $IMAGE_LOG ]] && grep -qxF "$1" "$IMAGE_LOG"; }
@@ -216,6 +477,88 @@ prune_images() {  # remove our recorded builds that are now untagged and unused;
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 cstate() { pm container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo none; }
 
+# The helper holds an O_NOFOLLOW, owner/identity-checked flock on a persistent inode.
+# Its pipe and parent check release the lock if this shell exits or is killed.
+acquire_guard() {  # name, mode; lifecycle must always precede setup
+  local name=$1 mode=$2 line rfd wfd pid helper guard_name=$1 guard_state=$STATE
+  if [[ $name == worktree ]]; then guard_state=$WT_DIR; fi
+  (umask 077; mkdir -p "$STATE")
+  helper=$(trusted_file "$SCRIPT_DIR/oc-setup-lock.py") || die "missing or unsafe oc-setup-lock.py"
+  coproc OC_LOCK_GUARD { exec python3 -I "$helper" "$guard_state" "$guard_name" "$mode" "$ILABEL" "$$"; }
+  pid=$OC_LOCK_GUARD_PID rfd=${OC_LOCK_GUARD[0]} wfd=${OC_LOCK_GUARD[1]}
+  if ! IFS= read -r -u "$rfd" line || [[ $line != LOCKED ]]; then
+    exec {wfd}>&-; exec {rfd}<&-; wait "$pid" || true
+    die "could not acquire $name lock"
+  fi
+  exec {rfd}<&-
+  if [[ $name == setup ]]; then SETUP_LOCK_FD=$wfd SETUP_LOCK_PID=$pid
+  elif [[ $name == worktree ]]; then WORKTREE_LOCK_FD=$wfd WORKTREE_LOCK_PID=$pid
+  else LIFECYCLE_LOCK_FD=$wfd LIFECYCLE_LOCK_PID=$pid; fi
+}
+release_setup_lock() { exec {SETUP_LOCK_FD}>&-; wait "$SETUP_LOCK_PID" || die "setup lock helper failed"; }
+release_lifecycle_lock() { exec {LIFECYCLE_LOCK_FD}>&-; wait "$LIFECYCLE_LOCK_PID" || die "lifecycle lock helper failed"; }
+release_worktree_lock() { exec {WORKTREE_LOCK_FD}>&-; wait "$WORKTREE_LOCK_PID" || die "worktree lock helper failed"; }
+
+# Host-owned metadata: directory and records are opened relative to a no-follow
+# directory fd, and never trusted if a symlink, hard link or unsafe mode is found.
+worktree_state() {  # create | read NAME | write NAME CWD REPO BRANCH
+  python3 -I -c '
+import os, re, secrets, stat, sys
+state, mode, *args = sys.argv[1:]
+def checked_dir(fd, private=False):
+    st = os.fstat(fd)
+    if st.st_uid != os.geteuid() or (stat.S_IMODE(st.st_mode) != 0o700 if private else st.st_mode & 0o022):
+        raise ValueError("unsafe worktree state directory ownership or mode")
+def record(fd, name):
+    try: f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except FileNotFoundError: return None
+    try:
+        st = os.fstat(f); named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o600
+            or st.st_nlink != 1 or (st.st_dev, st.st_ino) != (named.st_dev, named.st_ino) or st.st_size > 4096):
+            raise ValueError("unsafe worktree record ownership, mode, links or identity")
+        data = os.read(f, 4097)
+        if len(data) != st.st_size: raise ValueError("worktree record changed while reading")
+        return data
+    finally: os.close(f)
+try:
+    try: root = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        if mode == "read": sys.exit(3)
+        raise
+    checked_dir(root)
+    if mode == "create":
+        try: os.mkdir("worktrees", 0o700, dir_fd=root)
+        except FileExistsError: pass
+    try: directory = os.open("worktrees", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+    except FileNotFoundError:
+        if mode == "read": sys.exit(3)
+        raise
+    checked_dir(directory, True)
+    if mode == "create": sys.exit(0)
+    name = args[0]
+    if not re.fullmatch(r"[a-z0-9-]+", name): raise ValueError("invalid worktree record name")
+    existing = record(directory, name)
+    if mode == "read":
+        if existing is None: sys.exit(3)
+        sys.stdout.buffer.write(existing)
+    elif mode == "write":
+        if len(args) != 4: raise ValueError("invalid worktree record")
+        data = ("\n".join(args[1:]) + "\n").encode()
+        tmp = ".record." + secrets.token_hex(16)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        try:
+            with os.fdopen(fd, "wb") as f: f.write(data)
+            os.replace(tmp, name, src_dir_fd=directory, dst_dir_fd=directory)
+        finally:
+            try: os.unlink(tmp, dir_fd=directory)
+            except FileNotFoundError: pass
+    else: raise ValueError("invalid worktree state operation")
+except (OSError, ValueError) as exc:
+    print("unsafe worktree state: " + str(exc), file=sys.stderr)
+    sys.exit(2)
+' "$STATE" "$@"
+}
 # ---- ports ----------------------------------------------------------------------------------------
 PORTS=() PORTS_SET=0
 parse_ports() {  # PORT_ARGS -> PORTS ("HOST:POD"), refusing unsafe or impossible mappings
@@ -226,13 +569,15 @@ parse_ports() {  # PORT_ARGS -> PORTS ("HOST:POD"), refusing unsafe or impossibl
     if [[ $a == none ]]; then PORTS=(); continue; fi
     IFS=, read -ra items <<<"$a"
     for it in "${items[@]}"; do
-      [[ $it =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]] || die "-P: '$it' is not HOSTPORT:PODPORT"
-      h=$((10#${BASH_REMATCH[1]})) c=$((10#${BASH_REMATCH[2]}))
+      [[ $it =~ ^([0-9]{1,5})(:([0-9]{1,5}))?$ ]] || die "-P: '$it' is not PORT or HOSTPORT:PODPORT"
+      h=$((10#${BASH_REMATCH[1]})); c=$h
+      [[ -z ${BASH_REMATCH[3]:-} ]] || c=$((10#${BASH_REMATCH[3]}))
       (( h >= 1 && h <= 65535 && c >= 1 && c <= 65535 )) || die "-P: '$it': ports are 1-65535"
       (( h >= low )) || die "-P: host port $h is below $low, which rootless Podman cannot bind; use e.g. $((h + 8000)):$c (the pod side may be any port)"
       for s in "${SENSITIVE_PORTS[@]}"; do
-        (( c != s )) || die "-P: refusing to publish pod port $c: connections through a mapped port arrive as 127.0.0.1, which Chromium DevTools (9222) and Postgres (5432) trust without a password"
+        (( c != s )) || die "-P: refusing to publish pod port $c: Chromium DevTools trusts localhost"
       done
+      (( c != 5432 || PG )) || die "-P: refusing to publish pod port 5432 without -p (Postgres authentication is required)"
       [[ $seen != *" $h "* ]] || die "-P: host port $h given twice"
       seen+="$h "; PORTS+=("$h:$c")
     done
@@ -271,8 +616,20 @@ if (( LIST )); then
     for c in "$CHROME" "$PGC" "$DINDC"; do
       s=$(cstate "$c"); [[ $s == none ]] || side+="${c##*-}:$s "
     done
-    printf '%-14s %-10s %-8s %-22s %-24s %s\n' "$inst" "$pod" "$(cstate "$AGENT")" \
-      "$(sed 's/:/->/g' <<<"${ports:--}")" "${wd:--}" "${side:--}"
+    wt_info=""
+    record_rc=0
+    record=$(worktree_state read "$inst") || record_rc=$?
+    (( record_rc == 0 || record_rc == 3 )) || die "unsafe worktree record for $inst"
+    if (( record_rc == 0 )); then
+      { IFS= read -r _; IFS= read -r repo; IFS= read -r branch; } <<<"$record" || die "invalid worktree record for $inst"
+      valid_relpath "$repo" && [[ $branch =~ ^[A-Za-z0-9._/@+-]+$ ]] || die "invalid worktree record for $inst"
+      wt_info=" worktree:$repo:$branch"
+    elif [[ $wd == /sandbox/* ]] && valid_relpath "${wd#/sandbox/}"; then
+      info=$(safe_run --entrypoint python3 "$AGENT_IMG" -c "$SANDBOX_TREE_PY" info "${wd#/sandbox/}" 2>/dev/null) || info=""
+      if [[ $info =~ ^[A-Za-z0-9._@+/-]+:[A-Za-z0-9._/@+-]+$ ]]; then wt_info=" worktree:$info"; fi
+    fi
+    printf '%-14s %-10s %-8s %-22s %-24s %s%s\n' "$inst" "$pod" "$(cstate "$AGENT")" \
+      "$(sed 's/:/->/g' <<<"${ports:--}")" "${wd:--}" "${side:--}" "$wt_info"
   done < <(instance_pods)
   exit 0
 fi
@@ -305,6 +662,8 @@ load_pg_config() {
   PG_CONF=$cdir/postgres.env
   [[ -n $INST && -f $cdir/postgres.$INST.env ]] && PG_CONF=$cdir/postgres.$INST.env
   PG_CONF=${OC_PG_CONF:-$PG_CONF}
+  [[ $PG_CONF == /* ]] || PG_CONF="$CALLER_PHYSICAL/$PG_CONF"
+  PG_CONF=$(trusted_path "$PG_CONF") || die "refusing sandbox-controlled Postgres configuration"
   if [[ -f $PG_CONF ]]; then
     # KEY=VALUE lines (optional 'export ', spaces around '=' allowed). A quoted value is taken
     # literally; an unquoted one ends at whitespace followed by '#' (an inline comment).
@@ -336,6 +695,12 @@ load_pg_config() {
     exit 1
   fi
   PG_IMAGE=$OC_PG_IMAGE PG_USER=$OC_PG_USER PG_PASSWORD=$OC_PG_PASSWORD PG_DB=$OC_PG_DB
+  # Assignment preserves an inherited export flag; never export the copied password.
+  export -n PG_PASSWORD
+  # libpq's line-oriented password-file format cannot represent a newline or CR.
+  for v in "$PG_USER" "$PG_PASSWORD" "$PG_DB"; do
+    [[ $v != *$'\n'* && $v != *$'\r'* ]] || die "Postgres user, password and database must not contain newlines"
+  done
   PG_INIT=${OC_PG_INIT_DIR:-$cdir/postgres-init}
 }
 
@@ -369,17 +734,23 @@ remove_chromium_policy() {
   fi
 }
 if (( DELETE )); then
+  acquire_guard lifecycle exclusive
   if (( INST_SET )); then                                   # one instance only (also -i default)
     log "Removing instance '$ILABEL' (pod $POD)"
     pm pod rm -f "$POD" >/dev/null 2>&1 || true
     if (( ALL )); then
       if confirm "Also delete volumes $CHROMEVOL $PGVOL $DINDVOL $DINDRUN (Chromium profile, Postgres data, docker storage)?"; then
         for v in "$CHROMEVOL" "$PGVOL" "$DINDVOL" "$DINDRUN"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
-        pm secret rm "$PGSECRET" >/dev/null 2>&1 || true
+        pm secret rm "$PGSECRET" "$PGPASSSECRET" "$PGHBASECRET" >/dev/null 2>&1 || true
       else echo "Skipped -a part."; fi
     fi
     log "Done. $SB/$DEFAULT_CWD (and any other files in $SB) left untouched."
     exit 0
+  fi
+  # Global teardown shares the persistent setup lock and must never unlink it.
+  acquire_guard setup exclusive
+  if compgen -G "$STATE/opencode-update.*" >/dev/null; then
+    die "unresolved OpenCode updater receipts in $STATE; inspect and clean the recorded container IDs before teardown"
   fi
   for pod in $(instance_pods); do log "Removing pod '$pod'"; pm pod rm -f "$pod" >/dev/null 2>&1 || true; done
   log "Removing host bridge"
@@ -405,14 +776,17 @@ if (( DELETE )); then
     # the cleanup (SELinux module, state, .bridge) still runs.
     if secrets=$(pm secret ls --format '{{.Name}}' 2>/dev/null); then
       while read -r s; do
-        if [[ $s =~ ^oc(-[a-z0-9-]+)?-pg-password$ ]]; then pm secret rm "$s" >/dev/null 2>&1 || true; fi
+        if [[ $s =~ ^oc(-[a-z0-9-]+)?-pg-(password|passfile|hba)$ ]]; then pm secret rm "$s" >/dev/null 2>&1 || true; fi
       done <<<"$secrets"
     else echo "warning: could not list Podman secrets; remove any oc-*-pg-password secrets by hand" >&2; fi
     teardown_status=0
     remove_chromium_policy || teardown_status=1
     # Safe on the host: every pod (and with it every agent) is gone, so nothing can change $SB/.bridge
     # concurrently, and GNU rm -r never follows symlinks (it unlinks them).
-    if (( teardown_status == 0 )); then rm -rf "$STATE"; fi
+    if (( teardown_status == 0 )); then
+      # Keep setup.lock's inode permanently, including across global teardown.
+      find "$STATE" -mindepth 1 -maxdepth 1 ! -name setup.lock ! -name lifecycle.lock -exec rm -rf -- {} +
+    fi
     rm -rf "$SB/.bridge"
     if (( teardown_status != 0 )); then
       echo "Cleanup incomplete; state retained at $STATE. Fix the SELinux error and retry." >&2
@@ -424,6 +798,10 @@ if (( DELETE )); then
 fi
 
 if (( PG )); then load_pg_config; fi   # fail early, before building or starting anything
+OPENCODE_VERSION=${OC_OPENCODE_VERSION:-}
+if [[ -n $OPENCODE_VERSION && $OPENCODE_VERSION != keep && ! $OPENCODE_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]]; then
+  die "OC_OPENCODE_VERSION must be keep or a version such as 2.3.0"
+fi
 
 # ---- preflight ----------------------------------------------------------------
 pm --version >/dev/null 2>&1 || { echo "podman not found" >&2; exit 1; }
@@ -433,15 +811,27 @@ WL="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-wayland-0}"
 "${H[@]}" test -x "$CODE_BIN" || echo "warning: $CODE_BIN not found; 'code' bridge will do nothing" >&2
 
 # ---- directories / config -----------------------------------------------------
+# Hold the shared lifecycle barrier through instance creation; teardown takes it exclusively.
+# Lock ordering is lifecycle before setup. Neither lock is held during the interactive session.
+acquire_guard lifecycle shared
+# Serialize every shared check/write, including build context and shared SELinux level.
+acquire_guard setup exclusive
+if compgen -G "$STATE/opencode-update.*" >/dev/null; then
+  die "unresolved OpenCode updater receipts in $STATE; inspect and clean the recorded container IDs before setup"
+fi
 # Host-owned directories only. Nothing inside $SB is created from the host: see init_sandbox_tree.
-mkdir -p "$SB" "$BUILD" "$BIN" "$UNITS"
+mkdir -p "$SB"
+# New host-owned directories must be private even under a permissive user umask;
+# existing personal directories are never chmodded. Recheck before first write.
+(umask 077; mkdir -p "$BUILD" "$BIN" "$UNITS" "$POLDIR")
+validate_host_state || die "refusing unsafe host state after directory creation"
 
 # One SELinux level (MCS categories) shared by all agents, so several can use $SB at once; generated
 # once per installation. Podman's ':Z' would give every agent a new level (cutting the others off)
 # and would walk the agent-writable tree on the host; relabel_shared does it inside a container instead.
 if [[ ! -s $STATE/sb-level ]]; then
   a=$((RANDOM % 1024)); b=$(( (a + 1 + RANDOM % 1023) % 1024 )); (( a < b )) || { t=$a; a=$b; b=$t; }
-  printf 's0:c%d,c%d\n' "$a" "$b" > "$STATE/sb-level"
+  printf 's0:c%d,c%d\n' "$a" "$b" | atomic_host_file "$STATE/sb-level" 0644
 fi
 LEVEL=$(< "$STATE/sb-level")
 [[ $LEVEL =~ ^s0:c[0-9]+,c[0-9]+$ ]] || { echo "corrupt $STATE/sb-level (delete it and rerun)" >&2; exit 1; }
@@ -452,24 +842,6 @@ LEVEL=$(< "$STATE/sb-level")
 # that container's own filesystem, so whatever it points to, nothing outside $SB can be reached, and
 # no check-then-use race exists to win. label=disable avoids relabelling $SB while agents run; these
 # containers have no network, no capabilities (FOWNER for relabelling only) and run fixed commands.
-safe_run() { pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
-  --security-opt=label=disable -v "$SB":/sandbox "$@"; }
-
-init_sandbox_tree() {  # dest [repo branch]: spool dirs, working directory, optional git worktree
-  safe_run --entrypoint sh "$AGENT_IMG" -c '
-    set -e; cd /sandbox; dest=$1 repo=$2 branch=$3
-    mkdir -p .bridge/requests .bridge/tmp .bridge/files
-    if [ -n "$repo" ] && [ ! -e "$dest/.git" ]; then
-      git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "-W: $repo is not a git repository" >&2; exit 3; }
-      git check-ref-format --branch "$branch" >/dev/null 2>&1 || { echo "-W: invalid branch name $branch" >&2; exit 3; }
-      mkdir -p "$(dirname "$dest")"
-      # hooks off: the repository is agent-controlled (and this container must stay a fixed command)
-      g="git -C $repo -c core.hooksPath=/dev/null worktree add --relative-paths"
-      if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then $g "/sandbox/$dest" "$branch"
-      else $g -b "$branch" "/sandbox/$dest"; fi
-    fi
-    mkdir -p "$dest"' sh "$1" "${2:-}" "${3:-}"
-}
 
 RELABEL_PY='import os, sys
 ctx = sys.argv[1].encode(); bad = 0
@@ -492,9 +864,40 @@ relabel_shared() {  # give $SB and the shared home volume the agents' level (ins
     -I -c "$RELABEL_PY" "system_u:object_r:container_file_t:$LEVEL" /sandbox /home-vol
 }
 
+# Open every per-instance directory component without following symlinks. The proc-fd
+# path anchors the walk to that opened directory even if an agent renames it later.
+RELABEL_CWD_PY='import os, sys
+ctx = sys.argv[1].encode(); parts = sys.argv[2].split("/"); fds = []; bad = 0
+try:
+    fds.append(os.open("/sandbox", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+    for part in parts:
+        if part in ("", ".", ".."): raise ValueError("invalid directory component")
+        fds.append(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[-1]))
+    try:
+        if os.getxattr(fds[-1], "security.selinux").rstrip(b"\0") != ctx:
+            os.setxattr(fds[-1], "security.selinux", ctx)
+    except OSError: bad += 1
+    for root, dirs, files in os.walk("/proc/self/fd/" + str(fds[-1]), followlinks=False):
+        for name in dirs + files:
+            path = os.path.join(root, name)
+            try:
+                if os.getxattr(path, "security.selinux", follow_symlinks=False).rstrip(b"\0") != ctx:
+                    os.setxattr(path, "security.selinux", ctx, follow_symlinks=False)
+            except OSError: bad += 1
+    if bad: print(f"relabel: {bad} entries could not be relabelled", file=sys.stderr)
+except (OSError, ValueError) as exc:
+    print(f"relabel: unsafe instance directory: {exc}", file=sys.stderr); bad += 1
+finally:
+    for fd in reversed(fds): os.close(fd)
+sys.exit(bool(bad))'
+
 # ---- build context ------------------------------------------------------------
-cat > "$BUILD/Containerfile.agent" <<'EOF'
-FROM ghcr.io/anomalyco/opencode:latest
+for helper in oc-opencode-update.py oc-opencode-run.py; do
+  helper_path=$(trusted_file "$SCRIPT_DIR/$helper") || die "missing or unsafe $helper"
+  atomic_host_file "$BUILD/$helper" 0644 < "$helper_path"
+done
+atomic_host_file "$BUILD/Containerfile.agent" 0644 <<'EOF'
+FROM ghcr.io/anomalyco/opencode:2.3.0
 RUN apk add --no-cache nodejs npm git zsh vim tmux jq curl less ripgrep fd ncurses \
       build-base make perl xz python3 py3-pip postgresql17-client \
       bash tar unzip docker-cli docker-cli-compose
@@ -504,6 +907,9 @@ COPY gitconfig /etc/gitconfig
 COPY gitignore_global /etc/gitignore_global
 COPY bridge-open /usr/local/bin/bridge-open
 COPY opencode-sandbox.json /etc/opencode/oc-sandbox.json
+COPY oc-opencode-update.py /usr/local/bin/oc-opencode-update
+COPY oc-opencode-run.py /usr/local/bin/oc-opencode-run
+ENTRYPOINT ["python3", "-I", "/usr/local/bin/oc-opencode-run"]
 RUN chmod +x /usr/local/bin/bridge-open \
  && ln -s bridge-open /usr/local/bin/code \
  && ln -s bridge-open /usr/local/bin/bcompare
@@ -515,7 +921,7 @@ ENV OC_SANDBOX=1 ZDOTDIR=/opt/zsh LANG=en_US.UTF-8 TAR_OPTIONS=--no-same-owner \
     PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
 
-cat > "$BUILD/opencode-sandbox.json" <<'EOF'
+atomic_host_file "$BUILD/opencode-sandbox.json" 0644 <<'EOF'
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
@@ -528,7 +934,7 @@ cat > "$BUILD/opencode-sandbox.json" <<'EOF'
 }
 EOF
 
-cat > "$BUILD/Containerfile.chromium" <<'EOF'
+atomic_host_file "$BUILD/Containerfile.chromium" 0644 <<'EOF'
 FROM registry.fedoraproject.org/fedora:latest
 RUN dnf install -y chromium curl && dnf clean all
 # Hide the "unsupported command-line flag: --no-sandbox" bar (the container is the sandbox here).
@@ -537,7 +943,7 @@ RUN mkdir -p /etc/chromium/policies/managed \
  && printf '{"CommandLineFlagSecurityWarningsEnabled": false}\n' > /etc/chromium/policies/managed/oc.json
 EOF
 
-cat > "$BUILD/zshrc" <<'EOF'
+atomic_host_file "$BUILD/zshrc" 0644 <<'EOF'
 export ZSH=/opt/oh-my-zsh
 ZSH_THEME="robbyrussell"
 DISABLE_AUTO_UPDATE=true
@@ -550,7 +956,7 @@ source $ZSH/oh-my-zsh.sh
 PROMPT="%B%F{red}[sandbox${OC_INSTANCE:+:$OC_INSTANCE}]%f%b $PROMPT"
 EOF
 
-cat > "$BUILD/bridge-open" <<'EOF'
+atomic_host_file "$BUILD/bridge-open" 0644 <<'EOF'
 #!/bin/sh
 tool=$(basename "$0"); base=/sandbox/.bridge
 [ -d "$base/requests" ] || { echo "$tool: $base/requests missing (is /sandbox mounted?)" >&2; exit 1; }
@@ -571,16 +977,27 @@ done
 mv "$tmp" "$base/requests/$id.req"
 EOF
 
+# Host Git must never discover the agent-controlled caller repository, even for --file.
+# Drop inherited Git overrides while retaining the normal host HOME and PATH.
+host_git() {
+  local name; local -a unset_git=()
+  while IFS= read -r name; do [[ $name == GIT_* ]] && unset_git+=(-u "$name"); done < <(compgen -e)
+  (cd "$BUILD" && env "${unset_git[@]}" git "$@")
+}
+# User-managed dotfiles may be symlinks, but no component may pass through $SB.
+HOST_GITCONFIG=$(trusted_path "$HOME/.gitconfig") || die "refusing sandbox-controlled git config"
+HOST_GITIGNORE=$(trusted_path "$HOME/.gitignore_global") || die "refusing sandbox-controlled gitignore"
+HOST_OHMYZSH=$(trusted_path "$HOME/.oh-my-zsh") || die "refusing sandbox-controlled oh-my-zsh"
 # git identity/tools come from the host ~/.gitconfig; tools adapted for the bridge
-rm -f "$BUILD/gitconfig"
-g=(git config --file "$BUILD/gitconfig")
-if [[ -f $HOME/.gitconfig ]]; then
+gitconfig_tmp=$(mktemp "$BUILD/.gitconfig.XXXXXXXX")
+g=(host_git config --file "$gitconfig_tmp")
+if [[ -f $HOST_GITCONFIG ]]; then
   for k in user.name user.email; do
-    v=$(git config --file "$HOME/.gitconfig" --get "$k" || true)
+    v=$(host_git config --file "$HOST_GITCONFIG" --get "$k" || true)
     [[ -n $v ]] && "${g[@]}" "$k" "$v"
   done
 else
-  : > "$BUILD/gitconfig"
+  : > "$gitconfig_tmp"
 fi
 "${g[@]}" core.autocrlf input
 "${g[@]}" core.editor vim                 # 'code --wait' cannot block through the bridge
@@ -592,16 +1009,19 @@ fi
 "${g[@]}" merge.tool vimdiff              # mergetool must block, so it stays in-container
 "${g[@]}" mergetool.keepBackup false
 "${g[@]}" worktree.useRelativePaths true  # worktree links work both as /sandbox/... and ~/opencode-sandbox/...
-if [[ -f $HOME/.gitignore_global ]]; then cp "$HOME/.gitignore_global" "$BUILD/gitignore_global"
-else : > "$BUILD/gitignore_global"; fi
+chmod 0644 "$gitconfig_tmp"
+mv -f -- "$gitconfig_tmp" "$BUILD/gitconfig"
+if [[ -f $HOST_GITIGNORE ]]; then atomic_host_file "$BUILD/gitignore_global" 0644 < "$HOST_GITIGNORE"
+else atomic_host_file "$BUILD/gitignore_global" 0644 </dev/null; fi
 
 # oh-my-zsh: copy from the host if present (without .git), else clone
 if [[ ! -d $BUILD/oh-my-zsh ]]; then
   log "Preparing oh-my-zsh"
-  if [[ -d $HOME/.oh-my-zsh ]]; then cp -a "$HOME/.oh-my-zsh" "$BUILD/oh-my-zsh"
-  else git clone -q --depth 1 https://github.com/ohmyzsh/ohmyzsh "$BUILD/oh-my-zsh"; fi
+  if [[ -d $HOST_OHMYZSH ]]; then cp -a "$HOST_OHMYZSH" "$BUILD/oh-my-zsh"
+  else host_git clone -q --depth 1 https://github.com/ohmyzsh/ohmyzsh "$BUILD/oh-my-zsh"; fi
   if [[ ! -d $BUILD/oh-my-zsh/custom/plugins/zsh-vi-mode ]]; then
-    git clone -q --depth 1 https://github.com/jeffreytse/zsh-vi-mode \
+    trusted_path "$BUILD/oh-my-zsh/custom/plugins/zsh-vi-mode" >/dev/null || die "refusing sandbox-controlled plugin path"
+    host_git clone -q --depth 1 https://github.com/jeffreytse/zsh-vi-mode \
       "$BUILD/oh-my-zsh/custom/plugins/zsh-vi-mode"
   fi
   find "$BUILD/oh-my-zsh" -name .git -prune -exec rm -rf {} +
@@ -630,7 +1050,7 @@ ensure_image() {  # name containerfile hash role(agent|chromium)
     echo "image $name up to date"
   fi
 }
-agent_hash=$(cd "$BUILD" && cat Containerfile.agent zshrc gitconfig gitignore_global bridge-open opencode-sandbox.json | sha256sum | cut -d' ' -f1)
+agent_hash=$(cd "$BUILD" && cat Containerfile.agent zshrc gitconfig gitignore_global bridge-open opencode-sandbox.json oc-opencode-update.py oc-opencode-run.py | sha256sum | cut -d' ' -f1)
 chrome_hash=$(cd "$BUILD" && sha256sum Containerfile.chromium | cut -d' ' -f1)
 PULL=(); (( REBUILD )) && PULL=(--pull=always)
 ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"  agent
@@ -639,19 +1059,29 @@ ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash" chromium
 ensure_volume() { pm volume exists "$1" 2>/dev/null \
   || pm volume create --label oc.sandbox=1 --label "oc.instance=$2" "$1" >/dev/null; }
 ensure_volume "$HOMEVOL" shared
-ensure_volume "$CHROMEVOL" "$ILABEL"
-
-init_sandbox_tree "$CWD" "$WT_REPO" "$WT_BRANCH" \
-  || { echo "could not prepare $SB/$CWD and $SB/.bridge (see above)" >&2; exit 1; }
+# The bridge spool is shared. Per-instance directories and worktrees are prepared after unlocking.
+init_bridge_spool \
+  || { echo "could not prepare $SB/.bridge (see above)" >&2; exit 1; }
 relabel_shared || { echo "could not relabel $SB for the agents (see above)" >&2; exit 1; }
 
-# ---- OpenCode self-update: install once into the persistent volume so 'opencode upgrade' works ----
-# (the image's baked binary has no recognizable install method). PATH is trimmed so the
-# installer does not see the baked copy and skip itself.
-if ! pm run --rm --entrypoint sh --cap-drop=ALL --security-opt=no-new-privileges \
-       --security-opt "label=level:$LEVEL" -v "$HOMEVOL":/root "$AGENT_IMG" \
-       -c 'test -x /root/.opencode/bin/opencode || { PATH=/usr/bin:/bin curl -fsSL https://opencode.ai/install | PATH=/usr/bin:/bin bash >/dev/null 2>&1; test -x /root/.opencode/bin/opencode; }'; then
-  echo "warning: could not install self-updating OpenCode (offline?); using the baked-in copy" >&2
+# ---- OpenCode self-update -----------------------------------------------------
+# An offline reader extracts only the old binary, the networked updater sees no
+# mounts, and an offline writer promotes only a complete candidate. The host-side
+# supervisor verifies each CID-receipted container is gone before the next phase.
+if [[ $OPENCODE_VERSION == keep ]]; then
+  echo "OpenCode: keeping the installed version (OC_OPENCODE_VERSION=keep)"
+else
+  log "Checking OpenCode for updates"
+  supervisor=$(trusted_file "$SCRIPT_DIR/oc-opencode-supervisor.py") || die "missing or unsafe oc-opencode-supervisor.py"
+  update_rc=0
+  python3 -I "$supervisor" "$STATE" "$LEVEL" "$HOMEVOL" \
+    "$AGENT_IMG" "$AGENT_MEM" "$OPENCODE_VERSION" "${H[@]}" </dev/null || update_rc=$?
+  if (( update_rc != 0 )); then
+    if compgen -G "$STATE/opencode-update.*" >/dev/null; then
+      die "OpenCode updater cleanup is uncertain; inspect receipts in $STATE before retrying"
+    fi
+    echo "warning: OpenCode update failed (offline?); keeping the existing copy or baked-in fallback" >&2
+  fi
 fi
 
 # ---- host bridge: validated 'code' / 'bcompare' requests from the sandbox ---------
@@ -662,15 +1092,15 @@ fi
 [[ -f $SCRIPT_DIR/oc-bridge.py ]] || { echo "missing $SCRIPT_DIR/oc-bridge.py (incomplete checkout?)" >&2; exit 1; }
 "${H[@]}" python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
   || echo "warning: the host bridge needs python3 >= 3.11 on the host; 'code'/'bcompare' will do nothing" >&2
-install -m 0755 "$SCRIPT_DIR/oc-bridge.py" "$BIN/oc-bridge"
+atomic_host_file "$BIN/oc-bridge" 0755 < "$SCRIPT_DIR/oc-bridge.py"
 unit_env() { local v=${2//%/%%}; v=${v//\\/\\\\}; printf 'Environment="%s=%s"\n' "$1" "${v//\"/\\\"}"; }
 {
   printf '[Unit]\nDescription=Restricted host bridge for the OpenCode sandbox\n[Service]\nType=oneshot\n'
-  unit_env OC_SB "$SB"; unit_env OC_BRIDGE_STAGE "$STATE/bridge-stage"
+  unit_env OC_SB "$SB"; unit_env OC_BRIDGE_STAGE "$BRIDGE_STAGE"
   unit_env OC_CODE_BIN "$CODE_BIN"; unit_env OC_BCOMPARE_BIN "$BC_BIN"
   printf 'ExecStart=%%h/.local/bin/oc-bridge\n'
-} > "$UNITS/oc-bridge.service"
-cat > "$UNITS/oc-bridge.path" <<'EOF'
+} | atomic_host_file "$UNITS/oc-bridge.service" 0644
+atomic_host_file "$UNITS/oc-bridge.path" 0644 <<'EOF'
 [Unit]
 Description=Watch the OpenCode sandbox bridge queue
 [Path]
@@ -683,9 +1113,8 @@ sc daemon-reload
 sc enable --now oc-bridge.path >/dev/null 2>&1 || sc start oc-bridge.path
 
 # ---- SELinux policy: dedicated type so ONLY the Chromium containers may use the Wayland socket ----
-POLDIR="$STATE/policy"; TPL=/usr/share/udica/templates
-mkdir -p "$POLDIR"
-cat > "$POLDIR/oc_chromium.cil" <<'POL'
+TPL=/usr/share/udica/templates
+atomic_host_file "$POLDIR/oc_chromium.cil" 0644 <<'POL'
 ; SELinux type for the sandboxed Chromium container only (oc_chromium.process).
 (block oc_chromium
     (blockinherit container)
@@ -712,24 +1141,115 @@ if [[ $(cat "$POLDIR/installed" 2>/dev/null || true) != "$pol_hash" ]]; then
     || { echo "udica templates missing ($TPL); install the 'udica' package" >&2; exit 1; }
   if "${H[@]}" pkexec semodule -i "$POLDIR/oc_chromium.cil" "$TPL/base_container.cil" "$TPL/net_container.cil" \
      || "${H[@]}" sudo semodule -i "$POLDIR/oc_chromium.cil" "$TPL/base_container.cil" "$TPL/net_container.cil"; then
-    echo "$pol_hash" > "$POLDIR/installed"
+    printf '%s\n' "$pol_hash" | atomic_host_file "$POLDIR/installed" 0644
   else
     echo "Policy install failed; Chromium cannot reach the Wayland socket without it." >&2; exit 1
   fi
 fi
 
+release_setup_lock
+# Everything below is per-instance: do not hold the shared setup lock across worktrees or pods.
+ensure_volume "$CHROMEVOL" "$ILABEL"
+# Serialize worktree selection and record updates after shared setup. The helper
+# validates the persistent lock without following symlinks or truncating hard links.
+trusted_dir WT_DIR "$STATE/worktrees"
+[[ $WT_DIR == "$STATE/worktrees" ]] || die "refusing a symlinked worktree state directory"
+worktree_state create || die "unsafe worktree state directory"
+acquire_guard worktree exclusive
+# A recorded destination takes precedence on relaunch; it is host-owned, never agent metadata.
+record_rc=0
+record=$(worktree_state read "$ILABEL") || record_rc=$?
+(( record_rc == 0 || record_rc == 3 )) || die "unsafe worktree record for $ILABEL"
+if [[ -z $CWD_ARG ]] && (( record_rc == 0 )); then
+  { IFS= read -r saved_cwd; IFS= read -r saved_repo; IFS= read -r saved_branch; } <<<"$record" \
+    || die "invalid worktree record for $ILABEL"
+  valid_relpath "$saved_cwd" && valid_relpath "$saved_repo" && [[ $saved_branch =~ ^[A-Za-z0-9._/@+-]+$ ]] \
+    || die "invalid worktree record for $ILABEL"
+  CWD=$saved_cwd
+  if [[ -z $WT_ARG ]]; then WT_REPO=$saved_repo WT_BRANCH=$saved_branch; fi
+fi
+if [[ -z $CWD_ARG && -z $WT_ARG && -z $WT_REPO && -n $INST ]]; then
+  here=${CALLER_PWD%/}; relative=""
+  case "$here/" in
+    "$SB/"*) relative=${here#"$SB"/} ;;
+    "$sb_real/"*) relative=${here#"$sb_real"/} ;;
+  esac
+  if [[ -z $relative || $relative == "$here" ]]; then
+    physical=$CALLER_PHYSICAL
+    if [[ $physical/ == "$sb_real/"* && $physical != "$sb_real" ]]; then
+      die "refusing a current directory reached through a sandbox path alias"
+    fi
+  fi
+  if [[ -n $relative && $relative != "$here" ]]; then
+    valid_relpath "$relative" || die "current directory is not a plain sandbox path"
+    WT_REPO=$(safe_run --entrypoint python3 "$AGENT_IMG" -c "$SANDBOX_TREE_PY" detect "$relative") \
+      || die "could not safely inspect the current repository"
+    if [[ -n $WT_REPO ]]; then
+      valid_relpath "$WT_REPO" || die "invalid detected repository path"
+      WT_BRANCH=$ILABEL; CWD="wt/$WT_REPO/$ILABEL"
+      echo "worktree of $WT_REPO on branch $WT_BRANCH at $SB/$CWD (override with -W or -C)"
+    fi
+  fi
+fi
+init_sandbox_tree "$CWD" "$WT_REPO" "$WT_BRANCH" \
+  || { echo "could not prepare $SB/$CWD and $SB/.bridge (see above)" >&2; exit 1; }
+if [[ -n $WT_REPO ]]; then
+  worktree_state write "$ILABEL" "$CWD" "$WT_REPO" "$WT_BRANCH" || die "could not safely record worktree for $ILABEL"
+fi
+release_worktree_lock
+# New worktree/directory entries need the same label; this container can see only $SB.
+safe_run --cap-add=FOWNER --entrypoint python3 "$AGENT_IMG" \
+  -I -c "$RELABEL_CWD_PY" "system_u:object_r:container_file_t:$LEVEL" "$CWD" \
+  || { echo "could not relabel $SB/$CWD (see above)" >&2; exit 1; }
+# A worktree also writes metadata in its source repository after the shared relabel.
+if [[ -n $WT_REPO && $WT_REPO != "$CWD" ]]; then
+  safe_run --cap-add=FOWNER --entrypoint python3 "$AGENT_IMG" \
+    -I -c "$RELABEL_CWD_PY" "system_u:object_r:container_file_t:$LEVEL" "$WT_REPO" \
+    || { echo "could not relabel $SB/$WT_REPO (see above)" >&2; exit 1; }
+fi
+
 # Keyed hash of the settings Postgres only reads when its volume is created. The key (random, mode
 # 0600, outside the sandbox) keeps the volume label from being an offline guessable hash of the password.
 pg_sig() {
-  local key=$STATE/pg-sig.key
+  local key=$STATE/pg-sig.key fd old_umask tmp
+  (umask 077; mkdir -p "$STATE")
+  python3 -I -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+s = os.fstat(fd)
+if s.st_uid != os.geteuid() or s.st_mode & 0o022: sys.exit("unsafe Postgres state directory")' "$STATE" || return 1
+  # The persistent per-key lock serializes first creation. Rename makes a fully
+  # written 0600 key visible at once without transient hard links.
+  old_umask=$(umask); umask 077
+  exec {fd}>>"$STATE/pg-sig.lock"
+  umask "$old_umask"
+  flock "$fd" || { exec {fd}>&-; return 1; }
   if [[ ! -s $key ]]; then
-    (umask 077; mkdir -p "$STATE"; od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$key")
+    tmp=$(mktemp "$STATE/.pg-sig.XXXXXXXX") || { exec {fd}>&-; return 1; }
+    if ! python3 -I -c 'import secrets; print(secrets.token_hex(32), end="")' > "$tmp" \
+      || ! mv -f -- "$tmp" "$key"; then
+      rm -f -- "$tmp"; exec {fd}>&-; return 1
+    fi
   fi
-  { cat "$key"; printf '|%s|%s|%s|%s' "$PG_USER" "$PG_PASSWORD" "$PG_DB" "$1"; } | sha256sum | cut -c1-16
+  { cat "$key"; printf '|%s|%s|%s|%s' "$PG_USER" "$PG_PASSWORD" "$PG_DB" "$1"; } | sha256sum | cut -c1-16 \
+    || { exec {fd}>&-; return 1; }
+  exec {fd}>&-
 }
 
+# libpq password-file fields escape backslashes and colons; keep secrets in shell
+# memory and stream them to Podman, never in arguments or environment variables.
+pgpass_field() {
+  local field=$1
+  field=${field//\\/\\\\}; field=${field//:/\\:}
+  printf '%s' "$field"
+}
+create_pg_auth_secrets() {
+  printf '%s\n' 'local all all trust' 'host all all 0.0.0.0/0 scram-sha-256' 'host all all ::/0 scram-sha-256' |
+    pm secret create --replace "$PGHBASECRET" - >/dev/null || return 1
+  { printf '127.0.0.1:5432:'; pgpass_field "$PG_DB"; printf ':'; pgpass_field "$PG_USER"; printf ':'; pgpass_field "$PG_PASSWORD"; printf '\n'; } |
+    pm secret create --replace "$PGPASSSECRET" - >/dev/null || return 1
+}
 ensure_postgres() {
-  local pg_state pg_cfg want_cfg sig legacy vsig init_hash="" ok=0
+  local pg_state pg_cfg want_cfg sig legacy vsig init_hash="" ok=0 p
   local pgargs=()
   if [[ -d $PG_INIT ]] && [[ -n $(ls -A "$PG_INIT" 2>/dev/null) ]]; then
     init_hash=$(cd "$PG_INIT" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
@@ -761,13 +1281,19 @@ ensure_postgres() {
     pm volume create --label oc.sandbox=1 --label "oc.instance=$ILABEL" --label "oc.pgcfg=$sig" "$PGVOL" >/dev/null
   fi
 
-  want_cfg="v2:$sig:$PG_IMAGE"
+  want_cfg="v3:scram:$sig:$PG_IMAGE"
   pg_state=$(cstate "$PGC")
   pg_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.pg"}}' "$PGC" 2>/dev/null || true)
   if [[ $pg_state != none && $pg_cfg != "$want_cfg" ]]; then
     log "Postgres container settings changed; recreating it (data volume $PGVOL is kept)"
     pm rm -f "$PGC" >/dev/null; pg_state=none
   fi
+  # A stopped container is recreated so every start receives fresh, script-owned
+  # secrets. PostgreSQL reads hba_file at process start, before any TCP listener.
+  if [[ $pg_state != none && $pg_state != running ]]; then
+    pm rm -f "$PGC" >/dev/null || return 1; pg_state=none
+  fi
+  create_pg_auth_secrets || { echo "Could not create Postgres authentication secrets." >&2; return 1; }
   case $pg_state in
     running) echo "Postgres already running." ;;
     none)
@@ -781,20 +1307,35 @@ ensure_postgres() {
         --pids-limit=256 --memory=2g \
         -v "$PGVOL":/var/lib/postgresql/data:Z "${pgargs[@]}" \
         --secret "$PGSECRET",type=mount,target=/run/secrets/postgres-password \
+        --secret "$PGHBASECRET",type=mount,target=/run/secrets/oc-pg-hba,mode=0444 \
+        --secret "$PGPASSSECRET",type=mount,target=/run/secrets/oc-pgpass,mode=0600 \
         -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password \
+        -e POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 \
         -e POSTGRES_USER="$PG_USER" -e POSTGRES_DB="$PG_DB" \
-        "$PG_IMAGE" -c listen_addresses=127.0.0.1 >/dev/null ;;
-    *) log "Starting existing Postgres container (data kept in volume $PGVOL)"
-       pm start "$PGC" >/dev/null ;;
+        --entrypoint docker-entrypoint.sh "$PG_IMAGE" postgres \
+        -c listen_addresses=127.0.0.1 -c hba_file=/run/secrets/oc-pg-hba \
+        -c password_encryption=scram-sha-256 >/dev/null ;;
   esac
   for _ in $(seq 1 60); do
     pm exec "$PGC" pg_isready -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" -q 2>/dev/null && { ok=1; break; }
     sleep 1
   done
   (( ok )) || { echo "Postgres did not become ready:" >&2; pm logs --tail 15 "$PGC" >&2; exit 1; }
-  echo "Postgres ready (inside pod '$POD' only, not reachable from the host, the LAN or other instances)."
-  echo "  psql -h 127.0.0.1 -U $PG_USER -d $PG_DB     # no password needed on localhost with the standard images"
+  # The read-only, script-owned hba_file is passed on the postgres command line,
+  # so volume-local pg_hba.conf is never authoritative, including during initdb.
+  # pg_isready does not authenticate. This TCP login proves that the configured
+  # password and the existing volume's verifier work with SCRAM before reporting ready.
+  if ! pm exec "$PGC" env PGPASSFILE=/run/secrets/oc-pgpass psql -w -X -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" -Atqc 'SELECT 1' >/dev/null 2>&1; then
+    echo "Postgres SCRAM login failed; existing password verifier may need migration. Stopping Postgres." >&2
+    pm stop -t 5 "$PGC" >/dev/null || true; return 1
+  fi
+  echo "Postgres ready (TCP requires SCRAM authentication)."
+  echo "  psql -h 127.0.0.1 -U $PG_USER -d $PG_DB"
   echo "  DATABASE_URL=postgres://$(urlenc "$PG_USER")@127.0.0.1:5432/$(urlenc "$PG_DB")"
+  for p in "${PORTS[@]}"; do
+    [[ ${p#*:} == 5432 ]] && echo "  Host: postgresql://$(urlenc "$PG_USER")@127.0.0.1:${p%%:*}/$(urlenc "$PG_DB")"
+  done
+  return 0
 }
 
 urlenc() {  # percent-encode for a URL component (byte-wise, so UTF-8 comes out right)
@@ -810,6 +1351,32 @@ urlenc() {  # percent-encode for a URL component (byte-wise, so UTF-8 comes out 
 # small per-instance volume. It needs what nested rootless containers need (default capabilities,
 # setuid newuidmap, /dev/fuse, /dev/net/tun) and runs SELinux-unconfined (label=disable): weaker than
 # the agent, hence opt-in. Nested containers share the pod's network with --network host.
+# Reuse a running managed server on a plain relaunch without loading PG config or
+# changing the server. Compare the mounted bytes to the current named secret:
+# --replace can legitimately give identical secrets different Podman IDs.
+agent_pg_passfile() {
+  local state cfg mounted current
+  (( PG )) && return 0
+  state=$(cstate "$PGC")
+  [[ $state != none ]] || return 1
+  if [[ $state != running ]]; then
+    die "Postgres for '$ILABEL' is not running; rerun with -p to start it"
+  fi
+  cfg=$(pm container inspect --format '{{index .Config.Labels "oc.pg"}}' "$PGC" 2>/dev/null) \
+    || die "could not inspect Postgres for '$ILABEL'; rerun with -p"
+  [[ $cfg == v3:scram:* ]] || die "Postgres for '$ILABEL' is not a managed SCRAM server; rerun with -p to upgrade it"
+  mounted=$(pm exec "$PGC" sha256sum /run/secrets/oc-pgpass 2>/dev/null) \
+    || die "Postgres passfile is missing; rerun with -p"
+  current=$(pm run --rm --network=none --cap-drop=ALL --security-opt=no-new-privileges \
+    --security-opt=label=disable --user 0 \
+    --secret "$PGPASSSECRET",type=mount,target=/run/secrets/oc-pgpass,mode=0600 \
+    --entrypoint sha256sum "$AGENT_IMG" /run/secrets/oc-pgpass 2>/dev/null) \
+    || die "Postgres passfile secret is missing; rerun with -p"
+  mounted=${mounted%% *}; current=${current%% *}
+  [[ $mounted =~ ^[0-9a-f]{64}$ && $current == "$mounted" ]] \
+    || die "Postgres passfile secret is stale; rerun with -p to refresh it"
+}
+
 ensure_dind() {
   local want="v1:$DIND_IMG" have state ok=0 pull=()
   (( REBUILD )) && pull=(--pull=newer)
@@ -842,14 +1409,77 @@ ensure_dind() {
   echo "docker-in-docker ready: 'docker run --network host ...' shares this pod's network (127.0.0.1)."
 }
 
+# Stop a legacy Postgres before any pod publishing/recreation can expose it. The
+# versioned label is set only on containers created with the enforced SCRAM HBA.
+if (( PG )) && [[ $(cstate "$PGC") == running ]]; then
+  pg_old_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.pg"}}' "$PGC" 2>/dev/null || true)
+  if [[ $pg_old_cfg != v3:scram:* ]]; then
+    log "Stopping legacy Postgres before enabling authenticated host access"
+    pm stop -t 5 "$PGC" >/dev/null || die "could not stop legacy Postgres; refusing to publish ports"
+  fi
+fi
+
 # ---- pod ------------------------------------------------------------------------------------------
 # Every pod gets pasta's --host-lo-to-ns-lo (published ports reach apps bound to 127.0.0.1 in the pod)
 # and an unprivileged-port sysctl scoped to the pod's network namespace (apps may bind ports < 1024
 # without NET_BIND_SERVICE). Ports are fixed at pod creation; the label records them.
-pod_exists() { pm pod exists "$POD" 2>/dev/null; }
+pod_exists() {
+  local rc=0
+  pm pod exists "$POD" >/dev/null 2>&1 || rc=$?
+  (( rc == 0 )) && return 0
+  (( rc == 1 )) && return 1
+  die "could not determine whether pod '$POD' exists"
+}
+# The stored label is not proof of actual bindings. Refuse malformed, hidden,
+# non-loopback or mismatched mappings before reusing or recreating an existing pod.
+validate_existing_ports() {
+  python3 -c '
+import json, re, sys
+try:
+    bindings = json.loads(sys.argv[1]); label = sys.argv[2]; pg = sys.argv[3] == "1"
+    if bindings is None: bindings = {}
+    if not isinstance(bindings, dict): raise ValueError("invalid bindings")
+    actual = []
+    for key, values in bindings.items():
+        m = re.fullmatch(r"([0-9]+)/tcp", key)
+        if not m or not isinstance(values, list): raise ValueError("unsupported binding")
+        target = int(m.group(1))
+        if not 1 <= target <= 65535: raise ValueError("invalid pod port")
+        if target == 9222: raise ValueError("DevTools port is published")
+        if target == 5432 and not pg: raise ValueError("Postgres port requires -p")
+        for value in values:
+            if not isinstance(value, dict) or value.get("HostIp") != "127.0.0.1": raise ValueError("non-loopback binding")
+            hp = value.get("HostPort", "")
+            if not isinstance(hp, str) or not hp.isdecimal() or not 1 <= int(hp) <= 65535: raise ValueError("invalid host port")
+            actual.append(f"{int(hp)}:{target}")
+    expected = label.split(",") if label else []
+    if any(not re.fullmatch(r"[0-9]+:[0-9]+", p) for p in expected): raise ValueError("malformed port label")
+    if sorted(actual) != sorted(expected): raise ValueError("actual bindings do not match port label")
+except (ValueError, TypeError, json.JSONDecodeError) as e:
+    print(f"unsafe existing pod ports: {e}", file=sys.stderr); sys.exit(1)
+' "$1" "$2" "$3"
+}
+INHERITED_PG_VERIFIED=0
+if pod_exists; then
+  have_ports=$(pm pod inspect "$POD" --format '{{index .Labels "oc.ports"}}') || die "could not read existing pod port label"
+  have_bindings=$(pm pod inspect "$POD" --format '{{json .InfraConfig.PortBindings}}') || die "could not inspect existing pod bindings"
+  if ! validate_existing_ports "$have_bindings" "$have_ports" "$PG" 2>/dev/null; then
+    if (( !PG && !PORTS_SET )) && agent_pg_passfile \
+      && validate_existing_ports "$have_bindings" "$have_ports" 1; then
+      INHERITED_PG_VERIFIED=1
+    else
+      die "refusing to use pod '$POD'; remove or recreate it after inspecting its ports"
+    fi
+  fi
+fi
 if pod_exists && (( !PORTS_SET )); then
-  have_ports=$(pm pod inspect "$POD" --format '{{index .Labels "oc.ports"}}' 2>/dev/null || true)
-  if [[ -n $have_ports ]]; then IFS=, read -ra PORTS <<<"$have_ports"; fi
+  if [[ -n $have_ports ]]; then
+    # A verified existing SCRAM server may retain its recorded binding. Explicit
+    # new -P 5432 mappings still require the user to supply -p during parsing.
+    PORT_ARGS=("$have_ports"); PORTS=()
+    if (( INHERITED_PG_VERIFIED )); then PG=1; parse_ports; PG=0; else parse_ports; fi
+    PORTS_SET=0
+  fi
 fi
 want_podcfg="v1|$(ports_label)"
 recreate=""
@@ -946,35 +1576,58 @@ if (( !ok )); then
   exit 1
 fi
 echo "Chromium ready."
-if (( PG )); then ensure_postgres; fi
+if (( PG )); then
+  ensure_postgres
+  # An already-running agent cannot acquire a new secret mount or environment.
+  if [[ $(cstate "$AGENT") == running ]] && ! pm exec "$AGENT" sh -c \
+      '[ "${PGPASSFILE:-}" = /run/secrets/oc-pgpass ] && [ -r "$PGPASSFILE" ]' >/dev/null 2>&1; then
+    echo "The running agent lacks the Postgres passfile; exit it and rerun with -p." >&2
+    exit 1
+  fi
+fi
 if (( DIND )); then ensure_dind; fi
 for p in "${PORTS[@]}"; do echo "Port: http://127.0.0.1:${p%%:*} on the host -> 127.0.0.1:${p#*:} in pod '$POD'"; done
 # Earlier builds that could not be removed while a container still ran them (e.g. Chromium before
 # its recreation above).
 prune_images
 
-(( NOLAUNCH )) && { log "Setup complete for instance '$ILABEL' (-n: not launching OpenCode)."; exit 0; }
+if (( NOLAUNCH )); then
+  release_lifecycle_lock
+  log "Setup complete for instance '$ILABEL' (-n: not launching OpenCode)."
+  exit 0
+fi
 
 # ---- launch OpenCode ------------------------------------------------------------------
 if [[ $(cstate "$AGENT") == running ]]; then
   log "OpenCode is already running in instance '$ILABEL'; setup is up to date (acting like -n)."
   echo "Open a shell in it with:  ${0##*/}${INST:+ -i $INST} -x"
+  release_lifecycle_lock
   exit 0
 fi
+agent_pg=0
+if agent_pg_passfile; then agent_pg=1; fi
 pm rm -f "$AGENT" >/dev/null 2>&1 || true
 envargs=(-e "OC_INSTANCE=$ILABEL")
 for v in "${FWD_ENV[@]}"; do [[ -n ${!v:-} ]] && envargs+=(-e "$v"); done
+if (( agent_pg )); then
+  envargs+=(--secret "$PGPASSSECRET",type=mount,target=/run/secrets/oc-pgpass,mode=0600 -e PGPASSFILE=/run/secrets/oc-pgpass)
+fi
 if [[ $(cstate "$DINDC") != none ]]; then
   envargs+=(-v "$DINDRUN":/run/dind -e DOCKER_HOST=unix:///run/dind/podman.sock
             -e CONTAINER_HOST=unix:///run/dind/podman.sock)
 fi
-log "Launching OpenCode (instance '$ILABEL') in /sandbox/$CWD"
+log "Preparing OpenCode (instance '$ILABEL') in /sandbox/$CWD"
+# Create while the lifecycle barrier is held; attach only after releasing it.
 # No ':Z' on the shared mounts: relabel_shared already gave them this level (see above).
-exec "${H[@]}" podman run -it --rm --name "$AGENT" --pod "$POD" --label oc.sandbox=1 --label "oc.instance=$ILABEL" \
+agent_id=$(pm create -it --rm --name "$AGENT" --pod "$POD" --label oc.sandbox=1 --label "oc.instance=$ILABEL" \
   --cap-drop=ALL --security-opt=no-new-privileges --security-opt "label=level:$LEVEL" \
   --pids-limit=512 --memory="$AGENT_MEM" \
   -v "$SB":/sandbox \
   -v "$HOMEVOL":/root \
   -w "/sandbox/$CWD" \
   "${envargs[@]}" \
-  "$AGENT_IMG"
+  "$AGENT_IMG")
+[[ $agent_id =~ ^[0-9a-f]{64}$ ]] || die "Podman did not return a complete agent container ID"
+release_lifecycle_lock
+log "Launching OpenCode (instance '$ILABEL') in /sandbox/$CWD"
+exec "${H[@]}" podman start -ai "$agent_id"

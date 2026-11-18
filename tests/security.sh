@@ -6,6 +6,11 @@
 set -uo pipefail
 REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 SCRIPT=$REPO/oc-sandbox BRIDGE=$REPO/oc-bridge.py
+# A test-owned Python/Git image can supply the sandbox-tree fixture without
+# installing or replacing the user's production oc-agent tag.
+TEST_AGENT_IMG=${OC_TEST_AGENT_IMAGE:-oc-agent}
+[[ $TEST_AGENT_IMG == oc-agent || $TEST_AGENT_IMG =~ ^(sha256:)?[0-9a-f]{64}$ ]] \
+  || { echo "OC_TEST_AGENT_IMAGE must be a complete image ID" >&2; exit 2; }
 T=$(mktemp -d "${TMPDIR:-/tmp}/oc-sec.XXXXXX")
 trap 'jobs -p | xargs -r kill 2>/dev/null; rm -rf "$T"' EXIT
 pass=0 fail=0
@@ -32,6 +37,10 @@ NOT_OC=ignored
 EOF
 printf 'OC_PG_INIT_DIR="/x y"' >> "$T/pg.env"                  # final line without newline
 cat > "$T/parse.sh" <<EOF
+$(fn trusted_path)
+in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
+die() { echo "\$*" >&2; exit 2; }
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T
 $(fn load_pg_config)
 SCRIPT_DIR=. OC_PG_CONF=$T/pg.env
 load_pg_config
@@ -51,32 +60,53 @@ check "password not in child environment"  ! grep -q 'p@ss' "$T/child.env"
 check "password not visible to child bash" [ ! -s "$T/child.pw" ]
 # environment wins, and is un-exported as well
 cat > "$T/parse2.sh" <<EOF
+$(fn trusted_path)
+in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
+die() { echo "\$*" >&2; exit 2; }
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T
 $(fn load_pg_config)
 SCRIPT_DIR=. OC_PG_CONF=$T/pg.env
 load_pg_config; echo "\$PG_PASSWORD"; env > $T/child2.env
 EOF
-out=$(env -i HOME="$HOME" PATH="$PATH" OC_PG_PASSWORD=from-env-pw bash "$T/parse2.sh")
+out=$(env -i HOME="$HOME" PATH="$PATH" PG_PASSWORD=inherited OC_PG_PASSWORD=from-env-pw bash "$T/parse2.sh")
 check "environment wins over the file"     [ "$out" = from-env-pw ]
 check "env password un-exported"           ! grep -q from-env-pw "$T/child2.env"
+
+# Config overrides may use host dotfile symlinks but must not traverse the sandbox.
+mkdir -p "$T/pg-sandbox"
+ln -s "$T/pg.env" "$T/pg-host-link"
+ln -s "$T/pg.env" "$T/pg-sandbox/link"
+ln -s "$T/pg-sandbox/link" "$T/pg-bad-link"
+cat > "$T/parse-path.sh" <<EOF
+$(fn trusted_path)
+in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
+die() { echo "\$*" >&2; exit 2; }
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T SCRIPT_DIR=.
+$(fn load_pg_config)
+load_pg_config
+EOF
+check 'host Postgres config symlink outside sandbox is accepted' env -i HOME="$HOME" PATH="$PATH" OC_PG_CONF="$T/pg-host-link" bash "$T/parse-path.sh"
+check 'Postgres config path through sandbox is refused' bash -c '! env -i HOME="$1" PATH="$2" OC_PG_CONF="$3" bash "$4" >/dev/null 2>&1' _ "$HOME" "$PATH" "$T/pg-bad-link" "$T/parse-path.sh"
 
 # ================================================================================================
 echo "Postgres password exposure (podman stubbed)"
 PW='S3cr3t-pw:@/#'
 cat > "$T/pg.sh" <<EOF
 set -euo pipefail
-$(fn pg_sig); $(fn urlenc); $(fn ensure_postgres)
+$(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { echo "==> \$*"; }
 sleep() { :; }
 pm() {
   printf '%s\0' "\$@" >> $T/argv.log; printf '\n' >> $T/argv.log
   case "\$1 \${2:-}" in
-    "secret create") cat >> $T/secret.log ;;
+    "secret create") cat > "$T/secret.\$4" ;;
     "volume exists"|"container inspect") return 1 ;;
   esac
   return 0
 }
 STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$T/none INST= ILABEL=default
+PGHBASECRET=oc-pg-hba PGPASSSECRET=oc-pg-passfile PORTS=()
 PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD='$PW'
 ensure_postgres
 EOF
@@ -84,7 +114,11 @@ bash "$T/pg.sh" > "$T/pg.out" 2>&1; rc=$?
 check "ensure_postgres ran (stubbed)"      [ $rc -eq 0 ]
 check "password absent from output"        ! grep -qF "$PW" "$T/pg.out"
 check "password absent from every argv"    ! grep -qaF "$PW" "$T/argv.log"
-check "password sent only via stdin secret" [ "$(cat "$T/secret.log" 2>/dev/null)" = "$PW" ]
+check "password sent via stdin secret" [ "$(cat "$T/secret.oc-pg-password" 2>/dev/null)" = "$PW" ]
+check "pgpass escapes password colon" grep -qxF '127.0.0.1:5432:db:app:S3cr3t-pw\:@/#' "$T/secret.oc-pg-passfile"
+check "HBA requires SCRAM for TCP" sh -c "grep -qx 'host all all 0.0.0.0/0 scram-sha-256' '$T/secret.oc-pg-hba' && grep -qx 'host all all ::/0 scram-sha-256' '$T/secret.oc-pg-hba' && ! grep -q '^host .*trust' '$T/secret.oc-pg-hba'"
+check "postgres always uses script-owned HBA" grep -qa 'hba_file=/run/secrets/oc-pg-hba' "$T/argv.log"
+check "Postgres password file is private" grep -qa 'oc-pgpass,mode=0600' "$T/argv.log"
 check "postgres gets POSTGRES_PASSWORD_FILE" grep -qa POSTGRES_PASSWORD_FILE "$T/argv.log"
 unkeyed=$(printf '%s|%s|%s|%s' app "$PW" db "" | sha256sum | cut -c1-16)
 check "volume label is not the unkeyed hash" ! grep -qa "$unkeyed" "$T/argv.log"
@@ -93,7 +127,7 @@ check "signature key is private (0600)"    [ "$(stat -c %a "$T/state/pg-sig.key"
 pgmsg() {  # volume-label -> stderr of ensure_postgres for '-i default' with an existing volume
   cat > "$T/pgm.sh" <<EOF
 set -euo pipefail
-$(fn pg_sig); $(fn urlenc); $(fn ensure_postgres)
+$(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { :; }; sleep() { :; }
 pm() {
@@ -105,6 +139,7 @@ pm() {
   return 0
 }
 STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$T/none INST= ILABEL=default
+PGHBASECRET=oc-pg-hba PGPASSSECRET=oc-pg-passfile PORTS=()
 PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD=pw
 ensure_postgres
 EOF
@@ -213,6 +248,42 @@ mkdir -p "$T/stub" "$T/dhome"
 cat > "$T/stub/podman" <<EOF
 #!/bin/sh
 echo "\${0##*/} \$*" >> "$T/stub.log"
+# Optional lifecycle integration stub: every image/volume/pod operation stays in scratch.
+if [ -n "\${STUB_SETUP:-}" ]; then
+  case "\$1 \${2:-}" in
+    "image inspect")
+      case "\$4" in *RepoTags*) echo 1; exit 0;; esac
+      name=\$5; record="$T/lifecycle/images/\$name"
+      [ -f "\$record" ] || exit 125
+      hash=\$(cat "\$record")
+      case "\$name" in oc-agent) id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;;
+        *) id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb;; esac
+      case "\$4" in *oc.hash*) printf '%s %s\n' "\$id" "\$hash";; *) echo "\$id";; esac
+      exit 0;;
+    "pod exists"|"container inspect") exit 1;;
+    "pod create")
+      if [ -n "\${STUB_HOLD_POD:-}" ]; then
+        : > "$T/lifecycle/entered"
+        while [ ! -e "$T/lifecycle/release" ]; do sleep .05; done
+      fi
+      exit 0;;
+    "pod rm") [ -n "\${STUB_DELETE_SIGNAL:-}" ] && : > "$T/lifecycle/deleted"; exit 0;;
+  esac
+  if [ "\$1" = build ]; then
+    shift; tag= hash=
+    while [ \$# -gt 0 ]; do
+      case "\$1" in
+        -t) tag=\$2; shift 2;;
+        --label) case "\$2" in oc.hash=*) hash=\${2#oc.hash=};; esac; shift 2;;
+        *) shift;;
+      esac
+    done
+    echo "\$tag" >> "$T/lifecycle/builds"
+    sleep .3
+    printf '%s\n' "\$hash" > "$T/lifecycle/images/\$tag"
+    exit 0
+  fi
+fi
 case "\${0##*/}" in
   semodule)
     [ -n "\${STUB_SEMODULE_LIST_FAIL:-}" ] && exit 1
@@ -257,7 +328,7 @@ if (( low > 1 )); then
   check "refuses privileged host port ($((low - 1)) < $low)" argfail "below" -P "$((low - 1)):80"
 else echo "  skip  privileged host port (ip_unprivileged_port_start=$low: every port is bindable)"; fi
 check "refuses duplicate host port"        argfail "given twice" -P 18080:80,18080:81
-check "refuses malformed mapping"          argfail "is not HOSTPORT:PODPORT" -P 18080
+check "refuses malformed mapping"          argfail "is not PORT or HOSTPORT:PODPORT" -P bad:80
 check "refuses out-of-range port"          argfail "ports are 1-65535" -P 18080:70000
 check "refuses bad instance name"          argfail "invalid instance name" -i Bad
 check "refuses reserved instance name"     argfail "invalid instance name" -i agent
@@ -279,6 +350,14 @@ pathrun() {  # VAR=value... -- script-args...: stderr+rc of a stubbed run with t
   printf '%s\nrc=%s\n' "$out" "$rc"
 }
 DSB=$T/dhome/opencode-sandbox; mkdir -p "$DSB/st/oc-sandbox" "$T/outer/oc-sandbox/h"
+mkdir -p "$T/helper-repo"
+cp "$SCRIPT" "$T/helper-repo/oc-sandbox"
+printf 'open("%s", "w").write("executed")\n' "$T/helper-executed" > "$DSB/lock-helper.py"
+ln -s "$DSB/lock-helper.py" "$T/helper-repo/oc-setup-lock.py"
+helper_out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" \
+  bash "$T/helper-repo/oc-sandbox" -d -a -y 2>&1 </dev/null || true)
+check "sandbox-linked lock helper refused" grep -q 'missing or unsafe oc-setup-lock.py' <<<"$helper_out"
+check "sandbox-linked lock helper never executed" test ! -e "$T/helper-executed"
 A=$(printf 'a%.0s' {1..64})
 printf '%s\n' "$A" > "$DSB/st/oc-sandbox/built-images"                 # forged by the agent
 echo "$SECRET" > "$T/victim-file"; ln -s "$T/victim-file" "$DSB/st/oc-sandbox/built-images.new"
@@ -328,11 +407,51 @@ for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_
   env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME "$envset" HOME="$T/dhome" PATH="$T/stub:$PATH" \
     "$SCRIPT" -d -a -y >/dev/null 2>&1 </dev/null || rc=$?
   check "-d -a ($name) completes"              [ $rc -eq 0 ]
-  check "-d -a ($name) removes the state dir"  [ ! -e "$DSTATE" ]
+  check "-d -a ($name) retains the persistent setup lock" [ -f "$DSTATE/setup.lock" ]
+  check "-d -a ($name) retains the lifecycle barrier" [ -f "$DSTATE/lifecycle.lock" ]
+  check "-d -a ($name) removes other state"    [ ! -e "$DSTATE/build" ]
   check "-d -a ($name) removes SELinux module" grep -q 'semodule -X 400 -r oc_chromium' "$T/stub.log"
 done
 check "-d -a removes only oc Postgres secrets" sh -c "grep -qx 'podman secret rm oc-pg-password' '$T/stub.log' \
   && grep -qx 'podman secret rm oc-x-pg-password' '$T/stub.log' && ! grep -q 'secret rm other' '$T/stub.log'"
+
+echo "shared setup and teardown barrier (Podman stubbed; scratch HOME)"
+LHOME=$T/lifecycle/home LSTATE=$T/lifecycle/home/.local/share/oc-sandbox
+mkdir -p "$T/lifecycle/images" "$T/lifecycle/runtime" "$LHOME/.oh-my-zsh/custom/plugins/zsh-vi-mode" "$LSTATE/policy"
+# Seed only the scratch policy marker, so these tests never invoke host SELinux tools.
+sed -n '/^; SELinux type/,/^POL$/p' "$SCRIPT" | sed '$d' | sha256sum | cut -c1-16 > "$LSTATE/policy/installed"
+python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); time.sleep(60)' "$T/lifecycle/runtime/wayland-0" &
+LSOCK=$!
+for _ in $(seq 1 100); do [[ -S $T/lifecycle/runtime/wayland-0 ]] && break; sleep .02; done
+life_run() {
+  env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$LHOME" PATH="$T/stub:$PATH" \
+    XDG_RUNTIME_DIR="$T/lifecycle/runtime" WAYLAND_DISPLAY=wayland-0 OC_OPENCODE_VERSION=keep \
+    STUB_SETUP=1 "$@"
+}
+: > "$T/lifecycle/builds"; : > "$T/stub.log"
+life_run timeout 30 "$SCRIPT" -n -i first -K > "$T/lifecycle/first.out" 2>&1 </dev/null & P1=$!
+life_run timeout 30 "$SCRIPT" -n -i second -K > "$T/lifecycle/second.out" 2>&1 </dev/null & P2=$!
+r1=0; wait "$P1" || r1=$?; r2=0; wait "$P2" || r2=$?
+check "two scratch setups complete" test "$r1:$r2" = 0:0
+check "agent image built once across concurrent setups" test "$(grep -c '^oc-agent$' "$T/lifecycle/builds")" = 1
+check "chromium image built once across concurrent setups" test "$(grep -c '^oc-chromium$' "$T/lifecycle/builds")" = 1
+check "keep skips update containers" ! grep -q 'oc-opencode-update' "$T/stub.log"
+check "waiting setup names the holder" grep -qE 'Waiting for setup \(pid=[0-9]+ instance=(first|second)\)' "$T/lifecycle/first.out" "$T/lifecycle/second.out"
+setup_inode=$(stat -c '%d:%i' "$LSTATE/setup.lock" 2>/dev/null || true)
+life_inode=$(stat -c '%d:%i' "$LSTATE/lifecycle.lock" 2>/dev/null || true)
+life_run env STUB_HOLD_POD=1 timeout 30 "$SCRIPT" -n -i third -K > "$T/lifecycle/third.out" 2>&1 </dev/null & P3=$!
+for _ in $(seq 1 200); do [[ -e $T/lifecycle/entered ]] && break; sleep .02; done
+check "setup reached per-instance pod creation" test -e "$T/lifecycle/entered"
+life_run env STUB_DELETE_SIGNAL=1 timeout 30 "$SCRIPT" -d -a -y > "$T/lifecycle/delete.out" 2>&1 </dev/null & P4=$!
+sleep .4
+check "global teardown waits while instance creation is active" test ! -e "$T/lifecycle/deleted"
+touch "$T/lifecycle/release"
+r3=0; wait "$P3" || r3=$?; r4=0; wait "$P4" || r4=$?
+check "setup and subsequent teardown complete" test "$r3:$r4" = 0:0
+check "teardown proceeds after instance creation" test -e "$T/lifecycle/deleted"
+check "setup lock inode survives global teardown" test "$setup_inode" = "$(stat -c '%d:%i' "$LSTATE/setup.lock" 2>/dev/null || true)"
+check "lifecycle lock inode survives global teardown" test "$life_inode" = "$(stat -c '%d:%i' "$LSTATE/lifecycle.lock" 2>/dev/null || true)"
+kill "$LSOCK" 2>/dev/null || true; wait "$LSOCK" 2>/dev/null || true
 
 echo "SELinux module teardown (all calls stubbed; scratch HOME)"
 # No privileged mutation or real -d/-a occurs in these cases.
@@ -372,22 +491,25 @@ check "-d -a: never removes images by force or by tag" ! grep -qE 'rmi -f|rmi .*
 echo "sandbox tree, worktrees and relabelling (in containers)"
 if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else
   if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null; then H=(distrobox-host-exec); else H=(); fi
-  if ! "${H[@]}" podman image exists oc-agent 2>/dev/null; then echo "  skip  (no oc-agent image; run oc-sandbox -n first)"; else
+  if ! "${H[@]}" podman image exists "$TEST_AGENT_IMG" 2>/dev/null; then echo "  skip  (no test agent image; run oc-sandbox -n first or supply OC_TEST_AGENT_IMAGE)"; else
     VOL=oc-sectest-$$
     cat > "$T/lib.sh" <<EOF
 H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }
-AGENT_IMG=oc-agent HOMEVOL=$VOL LEVEL=s0:c7,c9 SB=\$1; shift
+AGENT_IMG=$TEST_AGENT_IMG HOMEVOL=$VOL LEVEL=s0:c7,c9 SB=\$1; shift
 $(sed -n '/^safe_run() {/,/; }$/p' "$SCRIPT")
+$(sed -n "/^SANDBOX_TREE_PY=/,/os.makedirs(dest, exist_ok=True)'$/p" "$SCRIPT")
 $(fn init_sandbox_tree)
+$(fn init_bridge_spool)
 $(sed -n "/^RELABEL_PY=/,/file=sys.stderr)'\$/p" "$SCRIPT")
 $(fn relabel_shared)
 "\$@"
 EOF
     lib() { bash "$T/lib.sh" "$@"; }
     inbox() { "${H[@]}" podman run --rm --network=none --security-opt=label=disable -v "$T/isb":/sandbox -w /sandbox \
-      --entrypoint sh oc-agent -c "$1"; }
+      --entrypoint sh "$TEST_AGENT_IMG" -c "$1"; }
     mk() { rm -rf "$T/isb" "$T/iv"; mkdir -p "$T/isb" "$T/iv"; echo "$SECRET" > "$T/iv/keep"; }
-    mk; lib "$T/isb" init_sandbox_tree construct >/dev/null 2>&1
+    mk; lib "$T/isb" init_bridge_spool >/dev/null 2>&1
+    lib "$T/isb" init_sandbox_tree construct >/dev/null 2>&1
     check "working directory and bridge spool created" [ -d "$T/isb/construct" ] && [ -d "$T/isb/.bridge/requests" ]
     for target in "$T/iv" ../iv; do
       mk; ln -s "$target" "$T/isb/construct"; lib "$T/isb" init_sandbox_tree construct/sub >/dev/null 2>&1
