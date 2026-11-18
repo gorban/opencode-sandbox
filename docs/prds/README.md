@@ -13,6 +13,7 @@ How this tree works (progressive discovery, checkboxes, the human review gate): 
 | [prd_f](prd_f.md) | Host tool dependencies, pinned and organised (mise) | dependency feasibility measured; implementation open |
 | [prd_g](prd_g.md) | Carry-over from the parallel-instances plan | backlog |
 | [prd_h](prd_h.md) | Warm start: shared setup (images, OpenCode install) done once under a lock | implemented; real acceptance passed; external static review complete; human review open |
+| [prd_i](prd_i.md) | OpenCode orchestrator and sandbox fleet | proposed; host-only Claude routing spike open |
 
 The imported findings are evidence, not production implementation:
 
