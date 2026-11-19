@@ -43,4 +43,4 @@
 | **`~/opencode-sandbox/wt/<repo>/NAME`** (today's top-level, grouped by repo; chosen) | never nested inside a repo; one place for all worktrees | not next to the repo; two repos with the same name collide unless the path is encoded | 1 day |
 | Sibling `<repo>.worktrees/NAME` | not nested; next to the repo | clutters the parent folder; unusual | 1 day |
 
-- [ ] **Human review**: checked only when the user says so
+- [x] **Human review**: checked only when the user says so

@@ -81,6 +81,8 @@ ideally at the level of the user's Daybreak Blue reviewer (Mythos / Cyber-level)
 ## PRDs: progressive discovery in `docs/prds/`
 
 - `docs/prds/README.md` is the index: one line per top-level PRD with its status.
+- Follow the [implementation review gates](docs/prds/README.md#implementation-review-gates)
+  before coding from a PRD and again before merging the implementation.
 - **Top-level PRDs** are `prd_a.md`, `prd_b.md`, …, one per main grouping (a feature area or an issue).
 - **Children** add detail where a grouping grows: `prd_a.md` → `prd_a1.md`, `prd_a2.md` →
   `prd_a2a.md`, `prd_a2b.md` → … Nest only as deep as the grouping needs. Each parent links its

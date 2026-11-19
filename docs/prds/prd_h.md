@@ -38,4 +38,4 @@ static review complete (no established P1/P2). A separate shared/exclusive lifec
 per-instance worktree locks protect selection records. Lock files are retained to preserve one
 locking domain across teardown and restart.
 
-- [ ] **Human review**: checked only when the user says so
+- [x] **Human review**: checked only when the user says so

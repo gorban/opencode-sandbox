@@ -3,16 +3,36 @@
 How this tree works (progressive discovery, checkboxes, the human review gate): see
 [`AGENTS.md`](../../AGENTS.md#prds-progressive-discovery-in-docsprds).
 
+## Implementation review gates
+
+These gates apply to work from any PRD, including a PRD that has already passed design review.
+
+1. **Before implementation**, write a short pseudocode walkthrough of the proposed behavior.
+   Cover the normal flow, failure and recovery paths, trust boundaries, and how tests will verify
+   them. Include the proposed resolution of every open choice being made during implementation
+   whose selected option did not receive explicit security review in the PRD. Get both a security
+   review and a general PR-style review of the walkthrough and those choices. Address actionable
+   findings and get the revised design re-reviewed before coding.
+2. **After implementation and before merge**, get both reviews on the actual PR diff and test
+   evidence for the exact commit under review. Check that the implementation and the choices it
+   made match the reviewed design. Explain deviations and return material design changes to the
+   first gate. Verify findings, fix them, add regression coverage where required, and get the
+   updated commit re-reviewed until actionable findings are resolved.
+
+Record the reviewed design revision, implementation commit and outcomes in the PRD or PR.
+These gates are in addition to the [Human review gate](../../AGENTS.md#human-review-gate).
+
 | PRD | Grouping | Status |
 |---|---|---|
-| [prd_a](prd_a.md) | Postgres reachable from the host (`-P 5432`, `-P 5433:5432`) | implemented; external static review complete; human review open |
+| [prd_a](prd_a.md) | Postgres reachable from the host (`-P 5432`, `-P 5433:5432`) | implemented; external static review complete; human review passed |
 | [prd_b](prd_b.md) | OpenCode upgrades ready before launch; no drop to the host shell | pre-launch updates implemented; in-app restart open; external static review complete; human review open |
-| [prd_c](prd_c.md) | Worktree defaults: current repo, `wt/<repo>/NAME`, relaunch | implemented; external static review complete; human review open |
+| [prd_c](prd_c.md) | Worktree defaults: current repo, `wt/<repo>/NAME`, relaunch | implemented; external static review complete; human review passed |
 | [prd_d](prd_d.md) | Per-instance address and DNS name (no port mapping needed) | forwarding feasibility measured; implementation open |
 | [prd_e](prd_e.md) | Local HTTPS / TLS per instance (same URL in pod and on host) | CA feasibility measured, including host-browser subset; implementation open; depends on prd_d |
 | [prd_f](prd_f.md) | Host tool dependencies, pinned and organised (mise) | dependency feasibility measured; implementation open |
 | [prd_g](prd_g.md) | Carry-over from the parallel-instances plan | backlog |
-| [prd_h](prd_h.md) | Warm start: shared setup (images, OpenCode install) done once under a lock | implemented; real acceptance passed; external static review complete; human review open |
+| [prd_h](prd_h.md) | Warm start: shared setup (images, OpenCode install) done once under a lock | implemented; real acceptance passed; external static review complete; human review passed |
+| [prd_i](prd_i.md) | OpenCode orchestrator and sandbox fleet | proposed; host-only Claude routing spike open |
 
 The imported findings are evidence, not production implementation:
 
