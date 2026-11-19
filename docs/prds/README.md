@@ -33,6 +33,7 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 | [prd_g](prd_g.md) | Carry-over from the parallel-instances plan | backlog |
 | [prd_h](prd_h.md) | Warm start: shared setup (images, OpenCode install) done once under a lock | implemented; real acceptance passed; external static review complete; human review passed |
 | [prd_i](prd_i.md) | OpenCode orchestrator and sandbox fleet | proposed; host-only Claude routing spike open |
+| [prd_j](prd_j.md) | Host configuration and bridge merge tool preferences | proposed; TOML and editor design deferred |
 
 The imported findings are evidence, not production implementation:
 
