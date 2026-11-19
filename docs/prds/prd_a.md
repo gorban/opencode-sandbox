@@ -44,4 +44,4 @@ Port numbers must never be picked automatically: another app may want that port.
 | Init script only (`/docker-entrypoint-initdb.d`) | simple | only applies to new volumes; old ones stay `trust` until recreated | 0.25 day |
 | Refuse `-P 5432` until the volume is recreated | no migration code | the user loses data or has to dump and restore | 0.25 day |
 
-- [ ] **Human review**: checked only when the user says so
+- [x] **Human review**: checked only when the user says so
