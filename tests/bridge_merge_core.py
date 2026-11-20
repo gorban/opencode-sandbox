@@ -248,7 +248,7 @@ class MergeCoreTest(unittest.TestCase):
                 self.assertIs(self.session.phase, Phase.RECOVERY)
                 self.assertEqual(self.session.recovery(self.owner).inputs, self.inputs)
 
-    def test_result_needs_completion_finish_confirmation_and_export_confirmation(self):
+    def test_merge_result_needs_verified_completion_and_finish_confirmation(self):
         # The fake tool can intentionally keep one side verbatim, or supply a resolved edit.
         for data in (b"ONE\nTWO\n", self.inputs.agent.contents, self.inputs.host.contents, b""):
             with self.subTest(data=data):
@@ -269,6 +269,20 @@ class MergeCoreTest(unittest.TestCase):
                     self.session.finish_merge(self.owner, replace(finish), output)
                 self.session.finish_merge(self.owner, finish, output)
                 self.assertIs(self.session.phase, Phase.READY)
+
+    def test_export_requires_the_exact_prompt(self):
+        output = self.ready_output()
+        prompt = self.session.offer_export(self.owner, self.exporter.destination())
+
+        with self.assertRaisesRegex(MergeError, "Confirmation"):
+            self.session.begin_export(self.owner, replace(prompt), self.inputs.agent, output)
+        self.assertIs(self.session.phase, Phase.READY)
+        self.assertEqual(self.exporter.files, {})
+        self.assertEqual(self.exporter.receipts, {})
+
+        operation = self.session.begin_export(self.owner, prompt, self.inputs.agent, output)
+        self.assertIs(operation.approved, prompt)
+        self.assertIs(self.session.phase, Phase.EXPORTING)
 
     def test_cancel_retains_recovery_and_unknown_outcome_holds_lease(self):
         output = revision(b"possible result")

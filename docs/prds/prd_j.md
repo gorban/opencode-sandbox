@@ -52,6 +52,18 @@ Git documents [merge tool selection](https://git-scm.com/docs/git-mergetool) and
 [configuration scopes](https://git-scm.com/docs/git-config). Beyond Compare documents its
 [Git integration](https://www.scootersoftware.com/kb/vcs), including three-way merge in Pro.
 
+## Review record
+
+- `oc-sandbox reviewer` cleared the three-way design and tool selector at SHA-256
+  `f302a6ba7f6db3845aaac1ccf9f74637885cd3108693f267577676788fa25c8b`.
+- Independent and external reviewers cleared the offline core at `98b86bf` and the
+  late-receipt repair at `f260b9a` on `codex/bridge-merge-core`.
+- [x] **Human approval of the offline bridge merge core** (`codex/bridge-merge-core`),
+      including the typed selector, merge and finish confirmations, recovery after
+      uncertain receipts, and create-only export with synthetic receipts. Live Git
+      readers, editor behavior, persistent recovery and filesystem publication have
+      separate qualification requirements.
+
 ## Later configuration and editor
 
 - [ ] Propose a versioned TOML schema with safe defaults, typed values, validation, and a clear
