@@ -177,10 +177,10 @@ def suite_scratch(supervisor):
     identity = scratch_identity(directory)
     try:
         yield directory
-    except (CheckError, OSError, ValueError) as exc:
+    except BaseException as exc:
         try:
             remove_scratch(directory, identity, supervisor)
-        except (CheckError, OSError) as cleanup:
+        except BaseException as cleanup:
             exc.add_note(str(cleanup))
         raise
     else:
@@ -253,6 +253,8 @@ def main():
         with supervise() as supervisor:
             phase(supervisor)
             supervisor.check_interrupted()
+        # A handler can still latch a signal during supervisor teardown.
+        supervisor.check_interrupted()
     except (CheckError, OSError, SyntaxError, ValueError) as exc:
         print(f'FAIL {exc}', file=sys.stderr)
         for note in getattr(exc, '__notes__', ()):

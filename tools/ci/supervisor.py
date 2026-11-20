@@ -138,11 +138,11 @@ class Supervisor:
                 if process.returncode is not None and state is Children.LIVE:
                     raise CheckError(f'Command exited with live children: {command!r}')
                 time.sleep(POLL_INTERVAL)
-        except (CheckError, OSError, ValueError) as exc:
+        except BaseException as exc:
             if not self.drained:
                 try:
                     self.drain(process)
-                except (CheckError, OSError, ValueError) as cleanup:
+                except BaseException as cleanup:
                     exc.add_note(f'Child cleanup could not be verified: {cleanup}')
             raise
 

@@ -1,6 +1,6 @@
 """Contract checks for the portable CI runner using scratch fixtures and stubs."""
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from tools.ci import run as ci
+from tools.ci import supervisor as lifecycle
 from tools.ci.supervisor import Supervisor
 
 
@@ -118,6 +119,41 @@ class PortableTests(unittest.TestCase):
         self.assertEqual(failure.exception.status, 143)
         self.assertEqual(stub.call_count, 1)
         self.assertFalse(stub.call_args.kwargs['scratch'].exists())
+
+    def test_interruption_latched_during_supervisor_teardown(self):
+        prctl = lifecycle.prctl
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=sig.name):
+                sets = 0
+
+                def interrupt_on_restore(operation, argument):
+                    nonlocal sets
+                    prctl(operation, argument)
+                    if operation == lifecycle.PR_SET_CHILD_SUBREAPER:
+                        sets += 1
+                        if sets == 2:
+                            signal.getsignal(sig)(sig, None)
+
+                with patch.object(lifecycle, 'prctl', side_effect=interrupt_on_restore), \
+                        patch.object(ci, 'tests') as phase, patch.object(sys, 'argv', ['ci', 'tests']), \
+                        redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(ci.main(), 128 + sig)
+                phase.assert_called_once()
+                self.assertIn(f'Interrupted by {sig.name}', stderr.getvalue())
+
+    def test_scratch_cleanup_error_preserves_original_base_exception(self):
+        failure = KeyboardInterrupt('original portable test failure')
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent) / 'scratch'
+            root.mkdir(mode=0o700)
+            with patch.object(ci.tempfile, 'mkdtemp', return_value=str(root)), \
+                    patch.object(ci, 'remove_scratch', side_effect=AssertionError('cleanup failed')) as cleanup, \
+                    self.assertRaises(KeyboardInterrupt) as caught:
+                with ci.suite_scratch(Supervisor()):
+                    raise failure
+        cleanup.assert_called_once()
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(failure.__notes__, ['cleanup failed'])
 
     def test_supervisor_output_read_is_bounded(self):
         def finish(_command, *, cwd, env, log, timeout):

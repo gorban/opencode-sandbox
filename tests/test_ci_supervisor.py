@@ -44,6 +44,25 @@ if mode == 'uncertain':
         raise OSError('injected cleanup uncertainty')
 
     Supervisor.drain = uncertain_cleanup
+if mode in ('unexpected', 'unexpected-uncertain'):
+    from tools.ci.supervisor import Supervisor
+
+    reap = Supervisor.reap
+    injected = False
+
+    def fail_after_readiness(self, child, signalled):
+        global injected
+        if not injected and (root / 'primary').exists():
+            injected = True
+            raise RuntimeError('injected failure after child readiness')
+        return reap(self, child, signalled)
+
+    Supervisor.reap = fail_after_readiness
+    if mode == 'unexpected-uncertain':
+        def unexpected_cleanup_error(self, child):
+            raise AssertionError('injected unexpected cleanup failure')
+
+        Supervisor.drain = unexpected_cleanup_error
 sys.argv = ['ci', 'tests']
 raise SystemExit(ci.main())
 '''
@@ -196,6 +215,20 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(len(scratch), 1, output)
         self.assertFalse(second_started, output)
         self.assertIn('injected cleanup uncertainty', output)
+        self.assertIn(f'Retained scratch {scratch[0]}', output)
+
+    def test_unexpected_error_after_readiness_drains_before_removing_scratch(self):
+        self.assert_clean_failure(self.execute('unexpected'), 1,
+                                  'RuntimeError: injected failure after child readiness')
+
+    def test_unexpected_cleanup_error_preserves_original_error_and_scratch(self):
+        status, output, empty, scratch, second_started = self.execute('unexpected-uncertain')
+        self.assertEqual(status, 1, output)
+        self.assertFalse(empty, output)
+        self.assertFalse(second_started, output)
+        self.assertEqual(len(scratch), 1, output)
+        self.assertIn('RuntimeError: injected failure after child readiness', output)
+        self.assertIn('Child cleanup could not be verified: injected unexpected cleanup failure', output)
         self.assertIn(f'Retained scratch {scratch[0]}', output)
 
     def test_signal_requires_parenthood_proof_after_pidfd_open(self):
