@@ -167,6 +167,20 @@ class Payload:
 
 @dataclass(frozen=True, slots=True)
 class Status:
+    """Display controller progress and invocation availability.
+
+    Use ``state`` for the primary progress or outcome label, ``revoked`` for a
+    separate grant-revocation label, and ``eligible`` to enable invocation.
+    ``reason`` can explain current eligibility in a status response or describe
+    the transition recorded by an audit event.
+
+    For example, a one-shot operation succeeds and its reply is lost. The operator
+    revokes the grant, then reconciliation confirms the success. The current
+    status has ``state/reason`` of ``succeeded/revoked`` and the settlement event
+    has ``succeeded/succeeded``. Both have ``revoked=True`` and ``eligible=False``.
+    Display "Succeeded · Grant revoked" and disable invocation.
+    """
+
     request_id: str
     target: str
     state: State
