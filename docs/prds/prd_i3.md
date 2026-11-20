@@ -59,6 +59,16 @@ sequenceDiagram
     B-->>W: Result
 ```
 
+## Offline approval core
+
+- `oc-sandbox reviewer` cleared the offline approval design at SHA-256
+  `a2f4cc26dfb6ff214f60dd4f9f8e963e4cb3da306b19ace7bd98fc0c737149f2`.
+- [x] **Human approval of the offline controller approval core**
+      (`codex/controller-approval-core` at `c61637f`), including exact approval binding,
+      revocation, one-shot invocation, uncertain-effect reconciliation and audit status
+      using a synthetic adapter. Live credentials, worker transport and dashboard
+      integration have separate qualification requirements.
+
 ## Open choices
 
 - [ ] (decision needed) **Broker integration** — typed host adapters for CI and model calls
