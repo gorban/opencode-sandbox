@@ -1,0 +1,64 @@
+name: oc-sandbox PR
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Run portable tests on the merge commit
+        run: |
+          checked_sha=$(git rev-parse --verify HEAD)
+          [[ "$checked_sha" == "$GITHUB_SHA" ]]
+          printf 'Checked merge SHA %s\n' "$checked_sha"
+          exec python3 -B tools/ci/run.py tests
+
+  quality:
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check source quality on the merge commit
+        run: |
+          checked_sha=$(git rev-parse --verify HEAD)
+          [[ "$checked_sha" == "$GITHUB_SHA" ]]
+          printf 'Checked merge SHA %s\n' "$checked_sha"
+          exec python3 -B tools/ci/run.py quality
+
+  required:
+    name: oc-sandbox / required
+    needs: [tests, quality]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require both jobs to succeed
+        env:
+          TESTS_RESULT: ${{ needs.tests.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+        run: |
+          printf 'Tests %s, quality %s\n' "$TESTS_RESULT" "$QUALITY_RESULT"
+          [[ "$TESTS_RESULT" == success && "$QUALITY_RESULT" == success ]]
