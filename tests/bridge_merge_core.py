@@ -467,3 +467,212 @@ class MergeCoreTest(unittest.TestCase):
             self.session.discard(self.owner)
         self.assertIs(self.session.phase, Phase.EDITING)
         self.assertEqual(self.session.recovery(self.owner).inputs, self.inputs)
+
+
+    def test_late_verified_merge_requires_separate_finish_after_uncertainty(self):
+        operation = self.open_merge()
+        retained = revision(b"provisional merge")
+        uncertain = replace(self.merge_receipt(operation, retained), outcome=MergeOutcome.UNCERTAIN)
+        with self.assertRaisesRegex(MergeError, "completion"):
+            self.session.complete_merge(self.owner, uncertain)
+        self.assertIs(self.session.recovery(self.owner).output, retained)
+        with self.assertRaisesRegex(MergeError, "still owns"):
+            self.session.discard(self.owner)
+        with self.assertRaises(MergeError):
+            self.session.open_merge(self.owner, operation.approved, self.inputs.agent, self.adapter)
+
+        output = revision(b"verified merge")
+        receipt = self.merge_receipt(operation, output)
+        prompt = self.session.complete_merge(self.owner, receipt)
+        self.assertEqual(prompt.output_digest, output.digest())
+        self.assertIs(prompt.binding, operation.approved.binding)
+        self.assertIs(self.session.recovery(self.owner).output, output)
+        self.assertIs(self.session.phase, Phase.FINISH_REQUIRED)
+        with self.assertRaises(MergeError):
+            self.session.complete_merge(self.owner, receipt)
+        with self.assertRaises(MergeError):
+            self.session.offer_export(self.owner, self.exporter.destination())
+        self.session.finish_merge(self.owner, prompt, output)
+        self.assertIs(self.session.phase, Phase.READY)
+
+    def test_late_merge_rechecks_owner_operation_kind_and_output(self):
+        operation = self.open_merge()
+        retained = revision(b"provisional merge")
+        uncertain = replace(self.merge_receipt(operation, retained), outcome=MergeOutcome.UNCERTAIN)
+        with self.assertRaisesRegex(MergeError, "completion"):
+            self.session.complete_merge(self.owner, uncertain)
+
+        candidate = revision(b"different result")
+        receipt = self.merge_receipt(operation, candidate)
+        destination = self.exporter.destination()
+        forged_export = ExportReceipt(operation, ExportOutcome.EXISTS, destination)
+        with self.assertRaisesRegex(MergeError, "owner"):
+            self.session.complete_merge(object(), receipt)
+        other = self.make_session()
+        other_prompt = other.offer_merge(self.owner, self.preferences, self.adapter)
+        other_operation = other.open_merge(self.owner, other_prompt, self.inputs.agent, self.adapter)
+        for bad in (
+            replace(receipt, operation=replace(operation)),
+            replace(receipt, operation=other_operation),
+            forged_export,
+        ):
+            with self.subTest(bad=type(bad)), self.assertRaisesRegex(MergeError, "current merge operation"):
+                self.session.complete_merge(self.owner, bad)
+        with self.assertRaisesRegex(MergeError, "current export operation"):
+            self.session.complete_export(self.owner, forged_export)
+        for bad, diagnostic in (
+            (replace(receipt, adapter_identity=object()), "different adapter"),
+            (replace(receipt, saved_identity=object()), "verified output"),
+            (self.merge_receipt(operation, revision(b"x" * (MAX_TEXT_BYTES + 1))), "verified output"),
+            (replace(receipt, observed_inputs=replace(self.inputs, host=revision(b"changed"))), "revision"),
+            (replace(receipt, observed_inputs=replace(self.inputs, agent=None)), "revision"),
+            (replace(receipt, outcome=MergeOutcome.UNCERTAIN), "completion"),
+        ):
+            with self.subTest(diagnostic=diagnostic), self.assertRaisesRegex(MergeError, diagnostic):
+                self.session.complete_merge(self.owner, bad)
+            self.assertIs(self.session.recovery(self.owner).output, retained)
+            self.assertIs(self.session.phase, Phase.RECOVERY)
+        with self.assertRaisesRegex(MergeError, "still owns"):
+            self.session.discard(self.owner)
+
+    def test_late_cancel_settles_merge_lease_and_rejects_replay_or_none(self):
+        operation = self.open_merge()
+        output = revision(b"provisional merge")
+        receipt = self.merge_receipt(operation, output)
+        with self.assertRaisesRegex(MergeError, "completion"):
+            self.session.complete_merge(self.owner, replace(receipt, outcome=MergeOutcome.UNCERTAIN))
+        cancelled = replace(
+            self.merge_receipt(operation, revision(b"later unverified candidate")),
+            outcome=MergeOutcome.CANCELLED,
+        )
+        self.assertIsNone(self.session.complete_merge(self.owner, cancelled))
+
+        for bad in (cancelled, replace(receipt, operation=None)):
+            with self.subTest(bad=bad.operation), self.assertRaisesRegex(MergeError, "current merge operation"):
+                self.session.complete_merge(self.owner, bad)
+        forged = ExportReceipt(None, ExportOutcome.EXISTS, self.exporter.destination())
+        with self.assertRaisesRegex(MergeError, "current export operation"):
+            self.session.complete_export(self.owner, forged)
+        self.assertIs(self.session.recovery(self.owner).output, output)
+        self.session.discard(self.owner)
+        self.assertIs(self.session.phase, Phase.CLOSED)
+
+    def test_late_verified_export_settles_the_same_single_creation(self):
+        output = self.ready_output()
+        operation = self.begin_export(output)
+        verified = self.exporter.create(operation)
+        uncertain = ExportReceipt(operation, ExportOutcome.UNCERTAIN, verified.destination)
+        with self.assertRaisesRegex(MergeError, "publication could not be verified"):
+            self.session.complete_export(self.owner, uncertain)
+        self.assertIs(self.session.phase, Phase.RECOVERY)
+        self.assertIs(self.session.recovery(self.owner).output, output)
+        with self.assertRaisesRegex(MergeError, "still owns"):
+            self.session.discard(self.owner)
+
+        self.session.complete_export(self.owner, verified)
+        self.assertIs(self.session.phase, Phase.CLOSED)
+        self.assertEqual(self.exporter.files, {"reviewed.txt": verified.observed_output})
+        self.assertEqual(len(self.exporter.receipts), 1)
+        with self.assertRaises(MergeError):
+            self.session.complete_export(self.owner, verified)
+
+    def test_late_verified_export_conflict_releases_lease_without_publication(self):
+        output = self.ready_output()
+        existing = revision(b"preexisting file")
+        self.exporter.files["reviewed.txt"] = existing
+        operation = self.begin_export(output)
+        conflict = self.exporter.create(operation)
+        self.assertIs(conflict.outcome, ExportOutcome.EXISTS)
+        uncertain = ExportReceipt(operation, ExportOutcome.UNCERTAIN, conflict.destination)
+        with self.assertRaisesRegex(MergeError, "publication could not be verified"):
+            self.session.complete_export(self.owner, uncertain)
+        self.assertIs(self.session.phase, Phase.RECOVERY)
+        with self.assertRaisesRegex(MergeError, "still owns"):
+            self.session.discard(self.owner)
+
+        self.session.complete_export(self.owner, conflict)
+        self.assertIs(self.session.phase, Phase.READY)
+        self.assertIs(self.session.recovery(self.owner).output, output)
+        self.assertEqual(self.exporter.files, {"reviewed.txt": existing})
+        self.assertEqual(len(self.exporter.receipts), 1)
+        with self.assertRaises(MergeError):
+            self.session.complete_export(self.owner, conflict)
+
+    def test_late_export_rechecks_owner_operation_kind_and_publication(self):
+        output = self.ready_output()
+        operation = self.begin_export(output)
+        verified = self.exporter.create(operation)
+        with self.assertRaisesRegex(MergeError, "publication could not be verified"):
+            self.session.complete_export(self.owner, ExportReceipt(operation, ExportOutcome.UNCERTAIN, verified.destination))
+
+        forged_merge = self.merge_receipt(operation, output)
+        with self.assertRaisesRegex(MergeError, "owner"):
+            self.session.complete_export(object(), verified)
+        for bad in (replace(verified, operation=replace(operation)), forged_merge):
+            with self.subTest(bad=type(bad)), self.assertRaisesRegex(MergeError, "current export operation"):
+                self.session.complete_export(self.owner, bad)
+        with self.assertRaisesRegex(MergeError, "current merge operation"):
+            self.session.complete_merge(self.owner, forged_merge)
+        for bad, diagnostic in (
+            (replace(verified, destination=replace(verified.destination, parent_identity=object())), "destination"),
+            (replace(verified, destination=replace(verified.destination, trusted_new_file=False)), "destination"),
+            (replace(verified, observed_output=replace(verified.observed_output, contents=b"changed")), "publication"),
+            (replace(verified, created_identity=object()), "publication"),
+            (replace(verified, observed_output=output, created_identity=output.identity), "publication"),
+        ):
+            with self.subTest(diagnostic=diagnostic), self.assertRaisesRegex(MergeError, diagnostic):
+                self.session.complete_export(self.owner, bad)
+            self.assertIs(self.session.phase, Phase.RECOVERY)
+            self.assertIs(self.session.recovery(self.owner).output, output)
+        with self.assertRaisesRegex(MergeError, "still owns"):
+            self.session.discard(self.owner)
+
+    def test_malformed_merge_receipt_keeps_phase_and_preview_unchanged(self):
+        for phase in (Phase.EDITING, Phase.RECOVERY):
+            for invalid in (
+                {"outcome": "completed"},
+                {"observed_inputs": object()},
+                {"observed_inputs": replace(self.inputs, base=object())},
+                {"observed_inputs": replace(self.inputs, host=object())},
+                {"observed_inputs": replace(self.inputs, agent=object())},
+                {"output": object(), "outcome": MergeOutcome.CANCELLED},
+            ):
+                with self.subTest(phase=phase, fields=invalid.keys()):
+                    self.session = self.make_session()
+                    operation = self.open_merge()
+                    output = revision(b"verified merge")
+                    receipt = self.merge_receipt(operation, output)
+                    if phase is Phase.RECOVERY:
+                        uncertain = replace(
+                            receipt, outcome=MergeOutcome.UNCERTAIN, output=None, saved_identity=None
+                        )
+                        with self.assertRaisesRegex(MergeError, "completion"):
+                            self.session.complete_merge(self.owner, uncertain)
+                    with self.assertRaisesRegex(MergeError, "Malformed merge receipt"):
+                        self.session.complete_merge(self.owner, replace(receipt, **invalid))
+                    self.assertIs(self.session.phase, phase)
+                    self.assertIsNone(self.session.recovery(self.owner).output)
+                    prompt = self.session.complete_merge(self.owner, receipt)
+                    self.session.finish_merge(self.owner, prompt, output)
+                    self.assertIs(self.session.phase, Phase.READY)
+
+    def test_malformed_export_receipt_keeps_active_operation_unchanged(self):
+        for field in ("outcome", "destination", "leaf", "attestation", "output"):
+            with self.subTest(field=field):
+                self.session = self.make_session()
+                output = self.ready_output()
+                operation = self.begin_export(output, f"{field}.txt")
+                verified = self.exporter.create(operation)
+                invalid = {
+                    "outcome": {"outcome": "verified-created"},
+                    "destination": {"destination": object()},
+                    "leaf": {"destination": replace(verified.destination, leaf=object())},
+                    "attestation": {"destination": replace(verified.destination, trusted_new_file=1)},
+                    "output": {"observed_output": object()},
+                }[field]
+                with self.assertRaisesRegex(MergeError, "Malformed export receipt"):
+                    self.session.complete_export(self.owner, replace(verified, **invalid))
+                self.assertIs(self.session.phase, Phase.EXPORTING)
+                self.assertIs(self.session.recovery(self.owner).output, output)
+                self.session.complete_export(self.owner, verified)
+                self.assertIs(self.session.phase, Phase.CLOSED)

@@ -258,6 +258,10 @@ class Recovery:
     preparation_error: str | None
 
 
+def _is_optional_revision(value: object) -> bool:
+    return value is None or type(value) is Revision
+
+
 def _same_revision(expected: Revision | None, observed: Revision | None) -> bool:
     return (
         expected is not None
@@ -374,16 +378,28 @@ class MergeSession:
 
     def complete_merge(self, owner: object, receipt: MergeReceipt) -> FinishPrompt | None:
         with self._lock:
-            self._require(owner, Phase.EDITING)
-            if receipt.operation is not self._operation:
+            self._require(owner, Phase.EDITING, Phase.RECOVERY)
+            operation = self._operation
+            if (
+                type(receipt) is not MergeReceipt
+                or type(operation) is not MergeOperation
+                or receipt.operation is not operation
+            ):
                 raise MergeError("Completion does not match the current merge operation")
+            inputs = receipt.observed_inputs
+            output = receipt.output
+            if type(receipt.outcome) is not MergeOutcome or type(inputs) is not Inputs:
+                raise MergeError("Malformed merge receipt")
+            observed_sources = (inputs.base, inputs.host, inputs.agent)
+            if not all(_is_optional_revision(value) for value in (*observed_sources, output)):
+                raise MergeError("Malformed merge receipt")
+
             self._phase = Phase.RECOVERY
-            if receipt.adapter_identity is not receipt.operation.approved.selection.adapter_identity:
+            if receipt.adapter_identity is not operation.approved.selection.adapter_identity:
                 raise MergeError("Completion came from a different adapter")
             sources = (self._inputs.base, self._inputs.host, self._inputs.agent)
-            output = receipt.output
             digest = None
-            if type(output) is Revision and all(
+            if output is not None and all(
                 output.identity is not source.identity for source in sources
             ):
                 try:
@@ -391,20 +407,20 @@ class MergeSession:
                 except MergeError:
                     pass
                 else:
-                    self._output = output
+                    # Preserve the first usable recovery copy until a result is verified.
+                    if self._output is None:
+                        self._output = output
             # Terminal cancellation settles the lease even if there is no usable output.
             if receipt.outcome is MergeOutcome.CANCELLED:
                 self._operation = None
                 return None
             if receipt.outcome is not MergeOutcome.COMPLETED:
                 raise MergeError("Merge completion could not be verified")
-            for expected, observed in zip(
-                sources,
-                (receipt.observed_inputs.base, receipt.observed_inputs.host, receipt.observed_inputs.agent),
-            ):
+            for expected, observed in zip(sources, observed_sources):
                 self._verify_revision(expected, observed)
             if digest is None or output.identity is not receipt.saved_identity:
                 raise MergeError("Completed merge has no verified output")
+            self._output = output
             self._operation = None
             prompt = FinishPrompt(self._binding, digest)
             self._prompt = prompt
@@ -453,19 +469,35 @@ class MergeSession:
 
     def complete_export(self, owner: object, receipt: ExportReceipt) -> None:
         with self._lock:
-            self._require(owner, Phase.EXPORTING)
-            if receipt.operation is not self._operation:
-                raise MergeError("Publication does not match the current export operation")
-            self._phase = Phase.RECOVERY
-            destination = receipt.operation.approved.destination
+            self._require(owner, Phase.EXPORTING, Phase.RECOVERY)
+            operation = self._operation
             if (
-                receipt.destination.parent_identity is not destination.parent_identity
-                or receipt.destination.leaf != destination.leaf
-                or receipt.destination.trusted_new_file is not True
+                type(receipt) is not ExportReceipt
+                or type(operation) is not ExportOperation
+                or receipt.operation is not operation
+            ):
+                raise MergeError("Publication does not match the current export operation")
+            observed_destination = receipt.destination
+            observed_output = receipt.observed_output
+            if (
+                type(receipt.outcome) is not ExportOutcome
+                or type(observed_destination) is not DestinationFixture
+                or type(observed_destination.leaf) is not str
+                or type(observed_destination.trusted_new_file) is not bool
+                or not _is_optional_revision(observed_output)
+            ):
+                raise MergeError("Malformed export receipt")
+
+            self._phase = Phase.RECOVERY
+            destination = operation.approved.destination
+            if (
+                observed_destination.parent_identity is not destination.parent_identity
+                or observed_destination.leaf != destination.leaf
+                or observed_destination.trusted_new_file is not True
             ):
                 raise MergeError("Export destination could not be verified")
             if receipt.outcome is ExportOutcome.EXISTS:
-                if receipt.created_identity is not None or receipt.observed_output is not None:
+                if receipt.created_identity is not None or observed_output is not None:
                     raise MergeError("Export conflict receipt reports a publication")
                 self._operation = None
                 self._phase = Phase.READY
@@ -473,10 +505,10 @@ class MergeSession:
             private_revisions = (self._output, self._inputs.base, self._inputs.host, self._inputs.agent)
             if (
                 receipt.outcome is not ExportOutcome.VERIFIED_CREATED
-                or receipt.observed_output is None
-                or receipt.observed_output.identity is not receipt.created_identity
+                or observed_output is None
+                or observed_output.identity is not receipt.created_identity
                 or any(receipt.created_identity is revision.identity for revision in private_revisions)
-                or receipt.observed_output.digest() != receipt.operation.approved.output_digest
+                or observed_output.digest() != operation.approved.output_digest
             ):
                 raise MergeError("Export publication could not be verified")
             self._close()
