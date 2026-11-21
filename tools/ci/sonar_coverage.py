@@ -9,7 +9,8 @@ from sonar_exec import PublishError
 
 REPORT_LIMIT = 500_000
 REPORT_HEADER = b'OC-COVERAGE-XML\n'
-CONDITION = re.compile(r'[0-9]{1,3}% \(([0-9]{1,3})/([0-9]{1,3})\)')
+CONDITION = re.compile(r'\d{1,3}% \((\d{1,3})/(\d{1,3})\)', re.ASCII)
+LINE_NUMBER = re.compile(r'\d{1,8}', re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -45,23 +46,18 @@ def canonical_report(output, source, cores):
 
 
 def canonical_lines(entry, destination, line_limit):
-    counts = dict(lines_to_cover=0, uncovered_lines=0, conditions_to_cover=0, uncovered_conditions=0)
+    counts = {'lines_to_cover': 0, 'uncovered_lines': 0, 'conditions_to_cover': 0, 'uncovered_conditions': 0}
     previous = 0
     for line in entry.findall('./lines/line'):
         number, hits = line.get('number', ''), line.get('hits')
-        if not re.fullmatch(r'[0-9]{1,8}', number) or not previous < int(number) <= line_limit or hits not in ('0', '1'):
+        if not LINE_NUMBER.fullmatch(number) or not previous < int(number) <= line_limit or hits not in ('0', '1'):
             raise PublishError('Coverage XML has invalid or duplicate line data')
         previous = int(number)
-        attrs = dict(number=str(previous), hits=hits)
+        attrs = {'number': str(previous), 'hits': hits}
         counts['lines_to_cover'] += 1
         counts['uncovered_lines'] += hits == '0'
         if line.get('branch') == 'true':
-            condition = CONDITION.fullmatch(line.get('condition-coverage', ''))
-            if not condition:
-                raise PublishError('Coverage XML has invalid branch data')
-            covered, total = map(int, condition.groups())
-            if not 0 <= covered <= total <= 255 or total == 0 or (hits == '0' and covered):
-                raise PublishError('Coverage XML has inconsistent branch counts')
+            covered, total = branch_counts(line.get('condition-coverage', ''), hits)
             counts['conditions_to_cover'] += total
             counts['uncovered_conditions'] += total - covered
             attrs.update(branch='true', **{'condition-coverage': f'{covered * 100 // total}% ({covered}/{total})'})
@@ -69,3 +65,13 @@ def canonical_lines(entry, destination, line_limit):
     if not counts['lines_to_cover'] or not counts['conditions_to_cover']:
         raise PublishError('A required core has no line or branch coverage data')
     return counts
+
+
+def branch_counts(value, hits):
+    condition = CONDITION.fullmatch(value)
+    if not condition:
+        raise PublishError('Coverage XML has invalid branch data')
+    covered, total = map(int, condition.groups())
+    if covered > total or not 1 <= total <= 255 or (hits == '0' and covered):
+        raise PublishError('Coverage XML has inconsistent branch counts')
+    return covered, total

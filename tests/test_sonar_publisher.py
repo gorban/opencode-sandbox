@@ -126,6 +126,8 @@ class CoverageTest(unittest.TestCase):
             self.body.replace(PATH, '../core.py'),
             self.body.replace('1/2', '3/2'),
             self.body.replace('number="1"', 'number="3"'),
+            self.body.replace('number="1"', 'number="١"'),
+            self.body.replace('1/2', '١/2'),
             self.body.replace('hits="1"', 'hits="0"'),
             self.body.replace('</line>', '')[:-1],
         ):
@@ -135,8 +137,9 @@ class CoverageTest(unittest.TestCase):
     def test_requires_bounded_framing(self):
         with self.assertRaises(PublishError):
             self.decode('x' * coverage.REPORT_LIMIT)
+        unframed = self.body.encode()
         with self.assertRaises(PublishError):
-            coverage.canonical_report(self.body.encode(), self.source, [PATH])
+            coverage.canonical_report(unframed, self.source, [PATH])
 
 
 class CloudTest(unittest.TestCase):
@@ -218,9 +221,10 @@ class CloudTest(unittest.TestCase):
         with patch.object(cloud, 'github', return_value=response):
             previous = cloud.native_check_id(REVISION)
             self.assertEqual(previous, 15)
+            same_second = SINCE.replace(microsecond=500000)
             with patch.object(cloud.time, 'monotonic', side_effect=(0, 1, 181)):
                 with patch.object(cloud.time, 'sleep'), self.assertRaises(PublishError):
-                    cloud.wait_for_check(REVISION, 'OK', SINCE.replace(microsecond=500000), previous)
+                    cloud.wait_for_check(REVISION, 'OK', same_second, previous)
             response.update(total_count=2, check_runs=[existing, {**existing, 'id': 16, 'html_url': 'new'}])
             self.assertEqual(cloud.wait_for_check(REVISION, 'OK', SINCE, previous), 'new')
 
@@ -231,6 +235,35 @@ class CloudTest(unittest.TestCase):
 
 
 class BootstrapTest(unittest.TestCase):
+    def test_checkout_rejects_unlisted_git_operations_before_subprocess(self):
+        root = Path.cwd()
+        with patch.object(publish.subprocess, 'check_output') as run:
+            with self.assertRaises(ValueError):
+                publish.trusted_git(root, '--version')
+            run.assert_not_called()
+
+    def test_blob_reader_rejects_bad_revision_or_path_before_subprocess(self):
+        root = Path.cwd()
+        with patch.object(publish.subprocess, 'check_output') as run:
+            for revision, path in [('--help', '.sonarcloud.properties'), (HEAD, 'AGENTS.md')]:
+                with self.subTest(revision=revision, path=path), self.assertRaises(ValueError):
+                    publish.publisher_blob(root, revision, path)
+            run.assert_not_called()
+
+    def test_blob_reader_only_reads_a_single_regular_inventory_entry(self):
+        root = Path.cwd()
+        path = '.sonarcloud.properties'
+        record = f'100644 blob {BASE}\t{path}\0'.encode('ascii')
+        with patch.object(publish.subprocess, 'check_output', side_effect=[record, b'reviewed']) as run:
+            self.assertEqual(publish.publisher_blob(root, HEAD, path), b'reviewed')
+            self.assertEqual(run.call_args_list[-1].args[0][-3:], ['cat-file', 'blob', BASE])
+        for entries in [b'', record * 2, record.replace(b'100644', b'120000'),
+                        record.replace(b'.sonarcloud.properties', b'other-file')]:
+            with patch.object(publish.subprocess, 'check_output', return_value=entries) as run:
+                with self.assertRaises(ValueError):
+                    publish.publisher_blob(root, HEAD, path)
+                run.assert_called_once()
+
     def test_caller_environment_is_cleared_before_network_boundary(self):
         options = SimpleNamespace(checkout=Path.cwd(), publisher=HEAD)
         ambient = {'HTTPS_PROXY': 'synthetic-proxy', 'SSL_CERT_FILE': 'synthetic-ca',
@@ -273,15 +306,20 @@ class SandboxTest(unittest.TestCase):
     def test_coverage_has_no_writable_host_mount_or_token(self):
         store = Mock()
         store.run.return_value = (0, coverage.REPORT_HEADER, b'')
-        wheel = Mock(CORES={'core.py': 'test_core.py'})
+        suite = 'test core.py'
+        wheel = Mock(CORES={'core.py': suite})
         sandbox.measure(store, Path('/source'), Path('/inputs'), wheel)
         args, options = store.run.call_args
         self.assertIn('--network=none', args[1])
+        self.assertIn('--tmpfs=/measure:rw,exec,nosuid,nodev,size=192m,mode=0700', args[1])
+        self.assertIn('--env=TMPDIR=/measure', args[1])
         self.assertIn('/source:/work:ro,Z', args[1])
         mounts = [arg for arg in args[1] if ':ro,Z' in arg]
         self.assertEqual(mounts, ['/source:/work:ro,Z', '/inputs:/inputs:ro,Z'])
         self.assertNotIn('payload', options)
         self.assertNotIn('SONAR_TOKEN', ' '.join(args[1] + args[2]))
+        self.assertNotIn(suite, args[2][1])
+        self.assertEqual(args[2][3:], [suite])
 
     def test_scanner_token_goes_only_to_stdin(self):
         store = Mock()

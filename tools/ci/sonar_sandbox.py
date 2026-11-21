@@ -127,26 +127,34 @@ def private_store(root):
         store.cleanup()
 
 
-def mounts(source, inputs):
+def mounts(source, inputs, scratch='/tmp'):
     return ['-v', f'{source}:/work:ro,Z', '-v', f'{inputs}:/inputs:ro,Z', '-w', '/work',
-            '--env=HOME=/tmp/home', '--env=TMPDIR=/tmp']
+            f'--env=HOME={scratch}/home', f'--env=TMPDIR={scratch}']
 
 
 def measure(store, source, tooling, wheel):
     store.require('pull', '--quiet', PYTHON, timeout=300)
-    commands = ['mkdir /tmp/home', 'python -Im venv /tmp/venv',
-                '/tmp/venv/bin/python -Im pip --isolated --disable-pip-version-check install '
-                '--no-index --no-deps --no-cache-dir --require-hashes -r /inputs/requirements.txt']
-    execute = '/tmp/venv/bin/python -IB /inputs/measure.py'
-    commands += [f'{execute} run --append -m unittest discover -s tests -p {suite}'
-                 for suite in wheel.CORES.values()]
-    commands += ['kill -KILL -1 2>/dev/null || :', f'{execute} xml -o /tmp/coverage.xml']
-    test_script = '{\n' + '\n'.join(commands) + "\n} >/tmp/measurement.log 2>&1\nprintf 'OC-COVERAGE-XML\\n'\ncat /tmp/coverage.xml"
+    test_script = r'''
+{
+    mkdir /measure/home
+    python -Im venv /measure/venv
+    /measure/venv/bin/python -Im pip --isolated --disable-pip-version-check install \
+        --no-index --no-deps --no-cache-dir --require-hashes -r /inputs/requirements.txt
+    for suite do
+        /measure/venv/bin/python -IB /inputs/measure.py run --append -m unittest discover -s tests --pattern="$suite"
+    done
+    kill -KILL -1 2>/dev/null || :
+    /measure/venv/bin/python -IB /inputs/measure.py xml -o /measure/coverage.xml
+} >/measure/measurement.log 2>&1
+printf 'OC-COVERAGE-XML\n'
+cat /measure/coverage.xml
+'''
     options = ['--network=none', '--cpus=2', '--pids-limit=64', '--memory=512m',
-               '--tmpfs=/tmp:rw,exec,nosuid,nodev,size=192m,mode=1777',
-               '--env=COVERAGE_RCFILE=/inputs/coverage.ini', '--env=COVERAGE_FILE=/tmp/.coverage',
-               *mounts(source, tooling)]
-    status, out, _ = store.run(PYTHON, options, ['-ec', test_script], limit=REPORT_LIMIT, timeout=180)
+               '--tmpfs=/measure:rw,exec,nosuid,nodev,size=192m,mode=0700',
+               '--env=COVERAGE_RCFILE=/inputs/coverage.ini', '--env=COVERAGE_FILE=/measure/.coverage',
+               *mounts(source, tooling, '/measure')]
+    entry = ['-ec', test_script, 'measure', *wheel.CORES.values()]
+    status, out, _ = store.run(PYTHON, options, entry, limit=REPORT_LIMIT, timeout=180)
     if status:
         raise PublishError(f'Coverage measurement failed (container exit {status})')
     return out

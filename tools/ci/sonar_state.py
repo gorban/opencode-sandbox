@@ -10,6 +10,9 @@ import stat
 from sonar_exec import PublishError
 
 
+BASELINE_NAME = 'main.json'
+
+
 def owner_directory(path, *, private=False):
     info = path.lstat()
     writable = 0o077 if private else 0o022
@@ -49,7 +52,7 @@ def check_directory(directory, fd):
 def read_baseline(directory, fd):
     check_directory(directory, fd)
     try:
-        handle = os.open('main.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        handle = os.open(BASELINE_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     except FileNotFoundError as error:
         raise PublishError('No trusted main receipt. Publish the current main revision first.') from error
     with os.fdopen(handle, 'rb') as stream:
@@ -60,7 +63,7 @@ def read_baseline(directory, fd):
         data = stream.read(32_769)
         if len(data) != info.st_size:
             raise PublishError('Main baseline receipt changed during read')
-        if not os.path.samestat(info, os.stat('main.json', dir_fd=fd, follow_symlinks=False)):
+        if not os.path.samestat(info, os.stat(BASELINE_NAME, dir_fd=fd, follow_symlinks=False)):
             raise PublishError('Main baseline receipt was replaced during read')
     check_directory(directory, fd)
     return json.loads(data)
@@ -76,7 +79,7 @@ def record_baseline(directory, fd, result):
             stream.flush()
             os.fsync(stream.fileno())
         check_directory(directory, fd)
-        os.replace(name, 'main.json', src_dir_fd=fd, dst_dir_fd=fd)
+        os.replace(name, BASELINE_NAME, src_dir_fd=fd, dst_dir_fd=fd)
         os.fsync(fd)
     finally:
         try:

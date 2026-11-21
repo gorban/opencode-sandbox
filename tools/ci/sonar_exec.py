@@ -1,5 +1,6 @@
 """Bounded subprocess I/O for the trusted Sonar publisher."""
 
+from contextlib import suppress
 import os
 import selectors
 import signal
@@ -17,41 +18,44 @@ def capture(command, *, cwd, env, timeout=30, limit=1_000_000, payload=None, mon
     deadline = time.monotonic() + timeout
     with subprocess.Popen(command, cwd=cwd, env=env, stdin=stdin, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, start_new_session=True) as process:
-        streams = {process.stdout: bytearray(), process.stderr: bytearray()}
         try:
             if payload is not None:
-                try:
-                    process.stdin.write(payload)
-                    process.stdin.close()
-                except BrokenPipeError:
-                    pass
-            with selectors.DefaultSelector() as selector:
-                for stream in streams:
-                    selector.register(stream, selectors.EVENT_READ)
-                remaining_bytes = limit
-                while selector.get_map():
-                    remaining_time = deadline - time.monotonic()
-                    if remaining_time <= 0:
-                        raise PublishError('Command timed out')
-                    if monitor is not None:
-                        monitor()
-                    for key, _ in selector.select(min(remaining_time, 0.25)):
-                        data = os.read(key.fd, min(65_536, remaining_bytes + 1))
-                        if not data:
-                            selector.unregister(key.fileobj)
-                            continue
-                        remaining_bytes -= len(data)
-                        if remaining_bytes < 0:
-                            raise PublishError('Command exceeded the output limit')
-                        streams[key.fileobj].extend(data)
+                with suppress(BrokenPipeError), process.stdin as stream:
+                    stream.write(payload)
+            stdout, stderr = drain_output(process, deadline, limit, monitor)
             if monitor is not None:
                 monitor()
             code = process.wait(timeout=max(0, deadline - time.monotonic()))
         except BaseException:
-            try:
+            with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
             process.wait()
             raise
-    return code, bytes(streams[process.stdout]), bytes(streams[process.stderr])
+    return code, stdout, stderr
+
+
+def drain_output(process, deadline, budget, monitor):
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    with selectors.DefaultSelector() as selector:
+        for stream, buffer in streams.items():
+            selector.register(stream, selectors.EVENT_READ, buffer)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PublishError('Command timed out')
+            if monitor is not None:
+                monitor()
+            for key, _ in selector.select(min(remaining, 0.25)):
+                budget -= append_output(selector, key, budget)
+    return bytes(streams[process.stdout]), bytes(streams[process.stderr])
+
+
+def append_output(selector, key, budget):
+    chunk = os.read(key.fd, min(65_536, budget + 1))
+    if not chunk:
+        selector.unregister(key.fileobj)
+    elif len(chunk) > budget:
+        raise PublishError('Command exceeded the output limit')
+    else:
+        key.data.extend(chunk)
+    return len(chunk)

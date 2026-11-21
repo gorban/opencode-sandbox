@@ -21,15 +21,44 @@ import warnings
 MODULES = ('core_coverage', 'sonar_exec', 'sonar_checkout', 'sonar_cloud',
            'sonar_coverage', 'sonar_sandbox', 'sonar_state')
 SHA = re.compile(r'[0-9a-f]{40}')
-
-
-def trusted_git(repo, *args):
-    env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LANG': 'C', 'GIT_CONFIG_NOSYSTEM': '1',
+PUBLISHER_FILES = ('.sonarcloud.properties', *(f'tools/ci/{module}.py' for module in MODULES))
+GIT = ('/usr/bin/git', '--no-pager', '--literal-pathspecs', '-c', 'core.hooksPath=/dev/null',
+       '-c', 'core.fsmonitor=false')
+GIT_ENV = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LANG': 'C', 'GIT_CONFIG_NOSYSTEM': '1',
            'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_TERMINAL_PROMPT': '0'}
+CHECKOUT_READS = {
+    'root': ('rev-parse', '--show-toplevel'),
+    'common-dir': ('rev-parse', '--path-format=absolute', '--git-common-dir'),
+    'git-dir': ('rev-parse', '--path-format=absolute', '--git-dir'),
+    'config': ('config', '--no-includes', '--name-only', '--list'),
+    'replacements': ('for-each-ref', 'refs/replace'),
+    'head': ('rev-parse', 'HEAD'),
+    'status': ('status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none'),
+}
+
+
+def trusted_git(repo, operation):
+    command = CHECKOUT_READS.get(operation)
+    if command is None:
+        raise ValueError('Unsupported publisher checkout operation')
     return subprocess.check_output(
-        ['/usr/bin/git', '--no-pager', '-c', 'core.hooksPath=/dev/null',
-         '-c', 'core.fsmonitor=false', *args],
-        cwd=repo, env=env, stderr=subprocess.DEVNULL, timeout=15,
+        [*GIT, *command], cwd=repo, env=GIT_ENV, stderr=subprocess.DEVNULL, timeout=15,
+    )
+
+
+def publisher_blob(repo, revision, path):
+    if not SHA.fullmatch(revision) or path not in PUBLISHER_FILES:
+        raise ValueError('Publisher blob requires a reviewed commit and inventory path')
+    entries = subprocess.check_output(
+        [*GIT, 'ls-tree', '-z', revision, '--', path],
+        cwd=repo, env=GIT_ENV, stderr=subprocess.DEVNULL, timeout=15,
+    )
+    entry = re.fullmatch(rb'100(?:644|755) blob ([0-9a-f]{40})\t([^\0]+)\0', entries)
+    if not entry or entry[2] != path.encode('ascii'):
+        raise ValueError('Publisher inventory entry must be a single regular Git blob')
+    return subprocess.check_output(
+        [*GIT, 'cat-file', 'blob', entry[1].decode('ascii')],
+        cwd=repo, env=GIT_ENV, stderr=subprocess.DEVNULL, timeout=15,
     )
 
 
@@ -49,31 +78,31 @@ def trusted_directory(path, home):
 
 def trusted_checkout(repo, sha, home):
     trusted_directory(repo, home)
-    if Path(os.fsdecode(trusted_git(repo, 'rev-parse', '--show-toplevel').strip())).resolve() != repo:
+    if Path(os.fsdecode(trusted_git(repo, 'root').strip())).resolve() != repo:
         raise ValueError('Pass the root of the trusted publisher checkout')
-    for flag in ('--git-common-dir', '--git-dir'):
-        directory = Path(os.fsdecode(trusted_git(repo, 'rev-parse', '--path-format=absolute', flag).strip())).resolve()
+    for operation in ('common-dir', 'git-dir'):
+        directory = Path(os.fsdecode(trusted_git(repo, operation).strip())).resolve()
         trusted_directory(directory, home)
         for entry in ('info/grafts', 'objects/info/alternates', 'objects/info/http-alternates', 'shallow'):
             if os.path.lexists(directory / entry):
                 raise ValueError('Trusted checkout uses unsupported Git object indirection')
-    config = trusted_git(repo, 'config', '--no-includes', '--name-only', '--list').lower().splitlines()
+    config = trusted_git(repo, 'config').lower().splitlines()
     if any(key.startswith((b'include.', b'includeif.', b'filter.')) for key in config):
         raise ValueError('Trusted checkout uses an external Git configuration or filter')
-    if trusted_git(repo, 'for-each-ref', 'refs/replace'):
+    if trusted_git(repo, 'replacements'):
         raise ValueError('Trusted checkout contains Git object replacements')
-    if trusted_git(repo, 'rev-parse', 'HEAD').decode().strip() != sha:
+    if trusted_git(repo, 'head').decode().strip() != sha:
         raise ValueError('Trusted checkout HEAD differs from the reviewed publisher commit')
-    if trusted_git(repo, 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none'):
+    if trusted_git(repo, 'status'):
         raise ValueError('Trusted publisher checkout must be clean')
 
 
 def stage_modules(code, opts):
     for module in MODULES:
-        data = trusted_git(opts.checkout, 'show', f'{opts.publisher}:tools/ci/{module}.py')
+        data = publisher_blob(opts.checkout, opts.publisher, f'tools/ci/{module}.py')
         (code / f'{module}.py').write_bytes(data)
     sys.path.insert(0, str(code))
-    config = trusted_git(opts.checkout, 'show', f'{opts.publisher}:.sonarcloud.properties')
+    config = publisher_blob(opts.checkout, opts.publisher, '.sonarcloud.properties')
     return config + b'\nsonar.sca.enabled=false\nsonar.scm.exclusions.disabled=true\n'
 
 
