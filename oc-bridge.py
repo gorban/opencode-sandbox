@@ -11,10 +11,11 @@ a pathname inside OC_SB to anything (desktop tools included), and never resolves
 * Files are opened O_NONBLOCK, then checked with fstat() on the open descriptor, so a FIFO or device
   swapped in cannot block or be read.
 * VS Code / Beyond Compare open a *copy* in OC_BRIDGE_STAGE (host-owned, mode 0700, never mounted).
-  Saved edits are written back through the same descriptor walk: a new file created O_EXCL|O_NOFOLLOW
-  in the pinned parent directory, then renameat() over the target, which replaces a directory entry
-  and never follows it. If the target changed since it was copied, the edit goes to
-  NAME.host-edit instead of overwriting the agent's newer version.
+  The watcher checks and reads each staged save through the same no-follow regular-file descriptor.
+  It writes to a new file created O_EXCL|O_NOFOLLOW in the pinned sandbox parent directory,
+  then uses renameat() to replace the target directory entry. If the target changed, the edit goes to
+  NAME.host-edit instead of overwriting the agent's newer version. A session with an unsuccessful
+  final write-back keeps its staged copies for recovery.
 
 Modes:  oc-bridge                 process the request queue (oc-bridge.service)
         oc-bridge session DIR     run the tool on a staged copy, write edits back (internal)
@@ -37,6 +38,7 @@ CONFIG_VARS = ("OC_SB", "OC_BRIDGE_STAGE", "OC_CODE_BIN", "OC_BCOMPARE_BIN")
 
 MAX_REQUESTS = 20         # per run; the rest of the queue is discarded
 MAX_PATHS = 8             # per request
+MAX_MANIFEST_BYTES = 256 << 10
 MAX_FILE = 64 << 20       # bytes per copied file
 MAX_TREE_FILES = 5000     # per directory snapshot (bcompare only)
 MAX_TREE_BYTES = 512 << 20
@@ -69,9 +71,16 @@ def components(sandbox_path):
     if not sandbox_path.startswith("/sandbox/"):
         raise Refused(f"not under /sandbox: {sandbox_path!r}")
     parts = sandbox_path[len("/sandbox/"):].split("/")
-    if not parts or any(p in ("", ".", "..") for p in parts):
+    if not canonical_parts(parts):
         raise Refused(f"non-canonical path: {sandbox_path!r}")
     return parts
+
+
+def canonical_parts(parts):
+    return isinstance(parts, list) and bool(parts) and all(
+        isinstance(part, str) and part not in ("", ".", "..") and "/" not in part and "\0" not in part
+        for part in parts
+    )
 
 
 def open_dirs(root_fd, parts):
@@ -104,22 +113,50 @@ def ident(st):
     return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns]
 
 
-def copy_fd_to(src_fd, dst_dir_fd, name, limit, mode=0o600):
+def staged_identity(st):
+    return [st.st_ino, st.st_size, st.st_mtime_ns]
+
+
+def copy_identity(st):
+    return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), st.st_nlink,
+            st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def write_all(fd, chunk):
+    remaining = memoryview(chunk)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written == 0:
+            raise OSError(errno.EIO, "file write made no progress")
+        remaining = remaining[written:]
+
+
+def copy_stable_file(source, out, limit):
+    src_fd, before = source
+    if before.st_size > limit:
+        raise Refused(f"file exceeds the {limit}-byte copy limit")
+    total = 0
+    while chunk := os.read(src_fd, 1 << 20):
+        total += len(chunk)
+        if total > limit:
+            raise Refused(f"file exceeds the {limit}-byte copy limit")
+        write_all(out, chunk)
+    os.fsync(out)
+    if total != before.st_size or copy_identity(before) != copy_identity(os.fstat(src_fd)):
+        raise Refused("source changed during the copy")
+    return total
+
+
+def copy_fd_to(source, dst_dir_fd, name, limit, mode=0o600):
     out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                   mode, dir_fd=dst_dir_fd)
-    total = 0
     try:
-        while chunk := os.read(src_fd, 1 << 20):
-            total += len(chunk)
-            if total > limit:
-                raise Refused(f"{name!r} is larger than {limit} bytes")
-            os.write(out, chunk)
+        return copy_stable_file(source, out, limit)
     except BaseException:
         os.unlink(name, dir_fd=dst_dir_fd)
         raise
     finally:
         os.close(out)
-    return total
 
 
 # ---- staging (host-owned) ------------------------------------------------------------------------
@@ -163,9 +200,9 @@ def snapshot_tree(src_fd, dst_fd, budget):
                 budget["files"] -= 1
                 if budget["files"] < 0:
                     raise OverBudget("directory snapshot has too many files")
-                fd, _ = open_regular(src_fd, name)
+                fd, fst = open_regular(src_fd, name)
                 try:
-                    budget["bytes"] -= copy_fd_to(fd, dst_fd, name, min(MAX_FILE, budget["bytes"]), 0o400)
+                    budget["bytes"] -= copy_fd_to((fd, fst), dst_fd, name, min(MAX_FILE, budget["bytes"]), 0o400)
                 finally:
                     os.close(fd)
         except OverBudget:
@@ -212,13 +249,13 @@ def stage_request(tool, paths):
                         else:
                             fd, fst = open_regular(parent, parts[-1])
                             try:
-                                copy_fd_to(fd, dparent, parts[-1], MAX_FILE)
+                                copy_fd_to((fd, fst), dparent, parts[-1], MAX_FILE)
                             finally:
                                 os.close(fd)
                             sst = os.stat(staged)
                             entries.append({"parts": parts, "staged": staged, "kind": "file",
                                             "mode": stat.S_IMODE(fst.st_mode), "target": ident(fst),
-                                            "seen": [sst.st_ino, sst.st_size, sst.st_mtime_ns]})
+                                            "seen": staged_identity(sst)})
                     finally:
                         os.close(dparent)
                 finally:
@@ -238,7 +275,7 @@ def stage_request(tool, paths):
 
 # ---- write-back --------------------------------------------------------------------------------
 
-def write_back(entry):
+def write_back(entry, source):
     """Copy the edited staged file back into the sandbox, never through a symlink."""
     parts, name = entry["parts"], entry["parts"][-1]
     root = open_root()
@@ -256,60 +293,144 @@ def write_back(entry):
         if not unchanged:
             log(f"{'/'.join(parts)} changed in the sandbox since it was opened; saving your edit as {dest}")
         tmp = f".{name}.oc-bridge-{secrets.token_hex(4)}"
-        with open(entry["staged"], "rb") as src:
-            src_fd = src.fileno()
-            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                          entry.get("mode", 0o644) & 0o777, dir_fd=parent)
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                      entry.get("mode", 0o644) & 0o777, dir_fd=parent)
+        try:
+            copy_stable_file(source, out, MAX_FILE)
+            os.rename(tmp, dest, src_dir_fd=parent, dst_dir_fd=parent)
+            if unchanged:
+                entry["target"] = ident(os.fstat(out))
+        except BaseException:
             try:
-                while chunk := os.read(src_fd, 1 << 20):
-                    os.write(out, chunk)
-                os.fsync(out)
-                os.rename(tmp, dest, src_dir_fd=parent, dst_dir_fd=parent)
-                if unchanged:
-                    entry["target"] = ident(os.fstat(out))
-            except BaseException:
-                try:
-                    os.unlink(tmp, dir_fd=parent)
-                except OSError:
-                    pass
-                raise
-            finally:
-                os.close(out)
+                os.unlink(tmp, dir_fd=parent)
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(out)
     finally:
         os.close(parent)
 
 
-def sync(entries):
-    for e in entries:
-        if e["kind"] != "file":
+def open_staged_file(files_fd, parts):
+    parent = open_dirs(files_fd, parts[:-1])
+    try:
+        return open_regular(parent, parts[-1])
+    finally:
+        os.close(parent)
+
+
+def sync(files_fd, entries):
+    complete = True
+    for entry in entries:
+        if entry["kind"] != "file":
+            continue
+        parts = entry["parts"]
+        try:
+            src_fd, st = open_staged_file(files_fd, parts)
+        except (Refused, OSError):
+            complete = False
             continue
         try:
-            st = os.stat(e["staged"])
-        except FileNotFoundError:
-            continue
-        seen = [st.st_ino, st.st_size, st.st_mtime_ns]
-        if seen != e["seen"]:
-            e["seen"] = seen
+            seen = staged_identity(st)
+            if seen != entry["seen"]:
+                write_back(entry, (src_fd, st))
+                entry["seen"] = seen
+        except (Refused, OSError) as err:
+            complete = False
+            log(f"write-back of {'/'.join(parts)} failed: {err}")
+        finally:
+            os.close(src_fd)
+    return complete
+
+
+def valid_identity(value, length):
+    return (isinstance(value, list) and len(value) == length
+            and all(type(number) is int for number in value))
+
+
+def validate_session_entry(tool, entry):
+    if not isinstance(entry, dict) or not canonical_parts(entry.get("parts")):
+        raise Refused("non-canonical staged path")
+    kind = entry.get("kind")
+    if kind == "dir" and tool == "bcompare":
+        return
+    if (kind != "file" or type(entry.get("mode", 0o644)) is not int
+            or not valid_identity(entry.get("seen"), 3)
+            or not valid_identity(entry.get("target"), 4)):
+        raise Refused("invalid staged entry")
+
+
+def read_session_manifest(session_fd):
+    fd, _ = open_regular(session_fd, "manifest.json")
+    with os.fdopen(fd, "rb") as stream:
+        data = stream.read(MAX_MANIFEST_BYTES + 1)
+    if len(data) > MAX_MANIFEST_BYTES:
+        raise Refused("session manifest exceeds the size limit")
+    try:
+        manifest = json.loads(data)
+    except (ValueError, RecursionError) as exc:
+        raise Refused("invalid session manifest") from exc
+    if not isinstance(manifest, dict):
+        raise Refused("invalid session manifest")
+    tool, entries = manifest.get("tool"), manifest.get("entries")
+    if not isinstance(tool, str) or not TOOLS.get(tool):
+        raise Refused("invalid or unconfigured session tool")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_PATHS:
+        raise Refused("invalid session entry count")
+    recorded_paths = set()
+    for entry in entries:
+        validate_session_entry(tool, entry)
+        path = tuple(entry["parts"])
+        if path in recorded_paths:
+            raise Refused("duplicate staged path")
+        recorded_paths.add(path)
+    return tool, entries
+
+
+def staged_arguments(session, files_fd, entries):
+    paths = []
+    for entry in entries:
+        parts = entry["parts"]
+        if entry["kind"] == "dir":
+            os.close(open_dirs(files_fd, parts))
+        else:
+            fd, st = open_staged_file(files_fd, parts)
             try:
-                write_back(e)
-            except (Refused, OSError) as err:
-                log(f"write-back of {'/'.join(e['parts'])} failed: {err}")
+                if staged_identity(st) != entry["seen"] or st.st_size > MAX_FILE:
+                    raise Refused("staged file changed or exceeds the size limit before editor launch")
+            finally:
+                os.close(fd)
+        # Older manifests store an absolute path. The current session and
+        # checked components determine the editor argument.
+        paths.append(os.path.join(session, "files", *parts))
+    return paths
 
 
 def run_session(session):
     real = os.path.realpath(session)
     if os.path.dirname(real) != os.path.realpath(STAGE):
-        raise SystemExit("oc-bridge: session directory is not in the stage directory")
-    with open(os.path.join(real, "manifest.json")) as f:
-        m = json.load(f)
-    staged = [e["staged"] for e in m["entries"]]
-    cmd = [TOOLS["code"], "--wait", "--", *staged] if m["tool"] == "code" else [TOOLS["bcompare"], *staged]
-    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
-    while proc.poll() is None:
-        time.sleep(1)
-        sync(m["entries"])
-    sync(m["entries"])
-    shutil.rmtree(real, ignore_errors=True)
+        raise Refused("session directory is not in the stage directory")
+    session_fd = os.open(real, DIR_FLAGS)
+    try:
+        tool, entries = read_session_manifest(session_fd)
+        files_fd = open_dirs(session_fd, ["files"])
+    finally:
+        os.close(session_fd)
+    try:
+        staged = staged_arguments(real, files_fd, entries)
+        options = ["--wait", "--"] if tool == "code" else []
+        proc = subprocess.Popen([TOOLS[tool], *options, *staged], stdin=subprocess.DEVNULL)
+        while proc.poll() is None:
+            time.sleep(1)
+            sync(files_fd, entries)
+        complete = sync(files_fd, entries)
+    finally:
+        os.close(files_fd)
+    if complete:
+        shutil.rmtree(real, ignore_errors=True)
+    else:
+        log(f"could not copy all staged saves back; recover them in {real!r}")
 
 
 # ---- queue -------------------------------------------------------------------------------------
@@ -399,7 +520,11 @@ def process_queue():
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "session":
-        run_session(sys.argv[2])
+        try:
+            run_session(sys.argv[2])
+        except (Refused, OSError) as exc:
+            log(f"session refused: {exc}")
+            sys.exit(2)
     elif len(sys.argv) == 1:
         process_queue()
     else:

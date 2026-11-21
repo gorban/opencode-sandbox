@@ -38,6 +38,24 @@ def asset(root, rel):
     return p
 
 
+def _load_tls_context(cas, v, leaf, cert, key, stop):
+    if stop.is_set(): raise InterruptedError("stopped during certificate preflight")
+    # Confirm the test setup itself before publishing an endpoint.
+    result = subprocess.run(['openssl', 'verify', '-CAfile', str(cas[v]), '-verify_ip' if leaf == 'ip127' else '-verify_hostname',
+                             NAMES[leaf], str(cert)], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+    if stop.is_set(): raise InterruptedError("stopped during certificate preflight")
+    expected_error = {'evil': 'permitted subtree violation', 'ip127': 'excluded subtree violation'}.get(leaf) if v == 'E' else None
+    if expected_error:
+        if result.returncode == 0 or expected_error not in result.stderr.lower():
+            raise ValueError(f'{v}/{leaf} did not fail with {expected_error}')
+    elif result.returncode != 0:
+        raise ValueError(f'{v}/{leaf} failed certificate verification: {result.stderr.strip()}')
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))  # validates cert/key pair
+    return ctx
+
+
 def checked_assets(path, stop):
     repo = Path(__file__).resolve().parents[4]
     scratch = repo / '.scratch'
@@ -51,21 +69,7 @@ def checked_assets(path, stop):
               for v in cas for l in NAMES}
     contexts = {}
     for (v, leaf), (cert, key) in leaves.items():
-        if stop.is_set(): raise InterruptedError("stopped during certificate preflight")
-        # Confirm the test setup itself before publishing an endpoint.
-        result = subprocess.run(['openssl', 'verify', '-CAfile', str(cas[v]), '-verify_ip' if leaf == 'ip127' else '-verify_hostname',
-                                 NAMES[leaf], str(cert)], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
-        if stop.is_set(): raise InterruptedError("stopped during certificate preflight")
-        expected_error = {'evil': 'permitted subtree violation', 'ip127': 'excluded subtree violation'}.get(leaf) if v == 'E' else None
-        if expected_error:
-            if result.returncode == 0 or expected_error not in result.stderr.lower():
-                raise ValueError(f'{v}/{leaf} did not fail with {expected_error}')
-        elif result.returncode != 0:
-            raise ValueError(f'{v}/{leaf} failed certificate verification: {result.stderr.strip()}')
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(str(cert), str(key))  # validates cert/key pair
-        contexts[v, leaf] = ctx
+        contexts[v, leaf] = _load_tls_context(cas, v, leaf, cert, key, stop)
     fingerprints = {}
     for v, ca in cas.items():
         der = ssl.PEM_cert_to_DER_cert(ca.read_text())
@@ -92,6 +96,7 @@ class TLSHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
 
     def log_message(self, *args):
+        # Keep request logs out of the fixture's launch and shutdown messages.
         pass
 
 
@@ -104,6 +109,16 @@ class TLSServer(Server):
         except BaseException:
             conn.close()
             raise
+
+
+def _relay(client, upstream):
+    while True:
+        ready, _, _ = select.select([client, upstream], [], [], 15)
+        if not ready: return
+        for source in ready:
+            data = source.recv(65536)
+            if not data: return
+            (upstream if source is client else client).sendall(data)
 
 
 class ProxyHandler(socketserver.BaseRequestHandler):
@@ -123,20 +138,14 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             if method != 'CONNECT' or version not in ('HTTP/1.0', 'HTTP/1.1') or authority not in self.server.routes:
                 raise ValueError('not an allowed CONNECT')
             port = self.server.routes[authority]
-        except (UnicodeDecodeError, ValueError):
+        except ValueError:
             client.sendall(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
             return
         # No DNS lookup or arbitrary destination: the only outbound address is loopback.
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as upstream:
             upstream.settimeout(5); upstream.connect((HOST, port))
             client.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-            while True:
-                ready, _, _ = select.select([client, upstream], [], [], 15)
-                if not ready: return
-                for source in ready:
-                    data = source.recv(65536)
-                    if not data: return
-                    (upstream if source is client else client).sendall(data)
+            _relay(client, upstream)
 
 
 def prepare_firefox(scratch, cas, proxy_port, data):
@@ -240,7 +249,7 @@ def main():
             thread.start(); threads.append(thread)
         data = {'proxy': f'{HOST}:{proxy.server_address[1]}', 'urls': endpoints,
                 'ca_sha256': fingerprints, 'marker': marker, 'expires_seconds': args.seconds}
-        run, manifest, launcher = prepare_firefox(Path(args.assets).resolve().parent, cas,
+        _, manifest, launcher = prepare_firefox(Path(args.assets).resolve().parent, cas,
                                                    proxy.server_address[1], data)
         print(f'Fixture ready (loopback only; expires in {args.seconds}s)\n'
               f'Manifest: {manifest}\nFirefox launcher: {launcher}', flush=True)

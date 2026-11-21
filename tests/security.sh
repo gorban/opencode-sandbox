@@ -18,11 +18,12 @@ ok()   { pass=$((pass + 1)); printf '  ok    %s\n' "$*"; }
 bad()  { fail=$((fail + 1)); printf '  FAIL  %s\n' "$*"; }
 check() {  # description, command... ; a leading '!' negates
   local d=$1 neg=0; shift
-  [[ $1 == '!' ]] && { neg=1; shift; }
+  local first_test_arg=$1
+  [[ $first_test_arg == '!' ]] && { neg=1; shift; }
   if "$@"; then r=0; else r=1; fi
   if (( r == neg )); then ok "$d"; else bad "$d"; fi
 }
-fn()   { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }          # extract one function from the script
+fn()   { local requested_function=$1; sed -n "/^$requested_function() {/,/^}/p" "$SCRIPT"; }  # extract one function
 SECRET=TOP-SECRET-HOST-DATA
 
 # ================================================================================================
@@ -55,7 +56,8 @@ check "export prefix and spaces around ="  [ "${got[1]:-}" = app_owner ]
 check "quoted value kept literally"        [ "${got[2]:-}" = "p@ss \$(touch $T/pwned1) \`touch $T/pwned2\` ; | & \" #x" ]
 check "unquoted # without space kept"      [ "${got[3]:-}" = 'app#dev' ]
 check "final line without newline"         [ "${got[4]:-}" = "/x y" ]
-check "no shell expansion of values"       [ ! -e "$T/pwned1" ] && [ ! -e "$T/pwned2" ]
+check "dollar command substitution in values is not evaluated" [ ! -e "$T/pwned1" ]
+check "backtick command substitution in values is not evaluated" [ ! -e "$T/pwned2" ]
 check "password not in child environment"  ! grep -q 'p@ss' "$T/child.env"
 check "password not visible to child bash" [ ! -s "$T/child.pw" ]
 # environment wins, and is un-exported as well
@@ -172,13 +174,17 @@ for a in "\$@"; do case \$a in --*) ;; *)
   if [ -f "\$a" ]; then cat "\$a" >> $T/tool.seen; elif [ -d "\$a" ]; then find "\$a" >> $T/tool.seen; cat \$(find "\$a" -type f) >> $T/tool.seen 2>/dev/null; fi
   [ -n "\${FAKE_AGENT:-}" ] && sh -c "\$FAKE_AGENT"
   [ -n "\${FAKE_EDIT:-}" ] && [ -f "\$a" ] && printf '%s\n' "\$FAKE_EDIT" > "\$a"
+  if [ -n "\${FAKE_ATOMIC_EDIT:-}" ] && [ -f "\$a" ]; then
+    printf '%s\n' "\$FAKE_ATOMIC_EDIT" > "\$a.tmp" && mv -- "\$a.tmp" "\$a"
+  fi
+  [ -n "\${FAKE_SAVE_LINK:-}" ] && ln -sf -- "\$FAKE_SAVE_LINK" "\$a"
 esac; done; exit 0
 EOF
 chmod +x "$B/launch" "$B/tool"
 export OC_SB=$SB OC_BRIDGE_STAGE=$T/stage OC_CODE_BIN=$B/tool OC_BCOMPARE_BIN=$B/tool OC_BRIDGE_LAUNCH=$B/launch
 req() { local id=$1; shift; printf '%s\n' "$@" > "$SB/.bridge/requests/$id.req"; }
 bridge() { timeout 20 python3 -I "$BRIDGE" 2>>"$T/bridge.log"; }
-victim_ok() { [ "$(cat "$V/secret" "$V/requests/precious" "$V/f")" = "$SECRET"$'\n'"$SECRET"$'\n'"$SECRET" ]; }
+victim_ok() { [[ "$(cat "$V/secret" "$V/requests/precious" "$V/f")" == "$SECRET"$'\n'"$SECRET"$'\n'"$SECRET" ]]; }
 reset_tool() { rm -f "$T/tool.args" "$T/tool.seen"; }
 
 reset_tool; req 1 code /sandbox/construct/a.txt; FAKE_EDIT=edited bridge
@@ -200,13 +206,16 @@ reset_tool; mkfifo "$SB/.bridge/requests/fifo.req"; ln -s ../../../victim/secret
 mkdir "$SB/.bridge/requests/dir.req"; ln -s ../../../victim "$SB/.bridge/requests/linkdir"
 bridge; rc=$?
 check "FIFO / symlinked requests do not hang" [ $rc -ne 124 ]
-check "FIFO / symlinked requests not followed" [ ! -e "$T/tool.args" ] && victim_ok
-check "drain removed links, not their targets" [ -z "$(ls -A "$SB/.bridge/requests")" ] && victim_ok
+check "FIFO / symlinked requests not passed to the tool" [ ! -e "$T/tool.args" ]
+check "FIFO / symlinked requests leave host targets intact" victim_ok
+check "drain removed all request entries" [ -z "$(ls -A "$SB/.bridge/requests")" ]
+check "drain leaves request targets intact" victim_ok
 
 mv "$SB/.bridge" "$T/bridge.real"; ln -s ../victim "$SB/.bridge"     # $SB/.bridge -> $V (has requests/)
 bridge
 check ".bridge symlink: target directory untouched" victim_ok
-check ".bridge symlink: link removed"       [ ! -L "$SB/.bridge" ] && [ ! -e "$SB/.bridge" ]
+check ".bridge symlink: link removed"       [ ! -L "$SB/.bridge" ]
+check ".bridge symlink: path is absent"      [ ! -e "$SB/.bridge" ]
 mv "$T/bridge.real" "$SB/.bridge"; rmdir "$SB/.bridge/requests"; ln -s ../../victim/requests "$SB/.bridge/requests"
 bridge
 check "requests symlink: target untouched"  victim_ok
@@ -216,8 +225,222 @@ mkdir "$SB/.bridge/requests"
 # agent swaps the opened file for a symlink to a host file while the editor is open
 reset_tool; echo orig > "$SB/construct/b.txt"; req 4 code /sandbox/construct/b.txt
 FAKE_AGENT="rm $SB/construct/b.txt; ln -s ../../victim/secret $SB/construct/b.txt" FAKE_EDIT=mine bridge
-check "write-back never follows a swapped-in symlink" victim_ok && [ -L "$SB/construct/b.txt" ]
+check "swapped-in symlink leaves the host target intact" victim_ok
+check "write-back preserves the sandbox symlink entry" [ -L "$SB/construct/b.txt" ]
 check "conflicting edit saved as .host-edit"  [ "$(cat "$SB/construct/b.txt.host-edit" 2>/dev/null)" = mine ]
+
+echo original > "$SB/construct/saved.txt"; req 5 code /sandbox/construct/saved.txt
+FAKE_ATOMIC_EDIT=replaced bridge
+check "atomic editor save written back as a regular file" grep -qx replaced "$SB/construct/saved.txt"
+
+echo unrelated > "$T/staged-save-control"; req 6 code /sandbox/construct/saved.txt
+FAKE_SAVE_LINK="$T/staged-save-control" bridge
+check "staged save symlink refused before write-back" grep -qx replaced "$SB/construct/saved.txt"
+
+# Session fixtures use the same metadata as the queue and a fake editor in scratch.
+make_session() {
+  local session=$T/stage/$1 fixture_tool=$2 manifest_padding=$3
+  mkdir -m 700 "$session"
+  mkdir -m 700 -p "$session/files/construct"
+  printf 'fixture\n' > "$session/files/construct/session.txt"
+  python3 -I - "$session" "$fixture_tool" "$manifest_padding" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+session = Path(sys.argv[1])
+staged = session / "files/construct/session.txt"
+st = staged.stat()
+entry = {"kind": "file", "parts": ["construct", "session.txt"], "staged": str(staged),
+         "mode": 0o600, "target": [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns],
+         "seen": [st.st_ino, st.st_size, st.st_mtime_ns]}
+manifest = json.dumps({"tool": sys.argv[2], "entries": [entry]})
+(session / "manifest.json").write_text(manifest + " " * int(sys.argv[3]), encoding="utf-8")
+PY
+}
+run_fixture_session() {
+  local fixture_name=$1
+  timeout 20 python3 -I "$BRIDGE" session "$T/stage/$fixture_name" 2>>"$T/bridge.log"
+}
+session_refused() {
+  local fixture_name=$1
+  run_fixture_session "$fixture_name"
+  [[ $? -eq 2 && ! -e "$T/tool.args" ]]
+}
+
+reset_tool; make_session unknown-tool unknown 0
+check "unknown session tool rejected before editor launch" session_refused unknown-tool
+
+reset_tool; make_session oversized code 262144
+check "oversized session manifest rejected before editor launch" session_refused oversized
+
+reset_tool; make_session non-regular code 0
+ln -sf -- "$T/staged-save-control" "$T/stage/non-regular/files/construct/session.txt"
+check "non-regular staged input rejected before editor launch" session_refused non-regular
+
+mkdir "$SB/construct/save-recovery"
+echo original > "$SB/construct/save-recovery/a.txt"; req 7 code /sandbox/construct/save-recovery/a.txt
+FAKE_AGENT="mv '$SB/construct/save-recovery' '$SB/construct/recovery-original'" FAKE_EDIT=recover-me bridge
+retained_edit() {
+  local path
+  for path in "$T/stage"/*/files/construct/save-recovery/a.txt; do
+    if [[ -f $path ]] && grep -qx recover-me "$path"; then return 0; fi
+  done
+  return 1
+}
+check "failed write-back retains the staged edit" retained_edit
+check "failed write-back preserves the sandbox file" grep -qx original "$SB/construct/recovery-original/a.txt"
+
+bridge_copy_regressions() {
+  timeout 20 python3 -I - "$BRIDGE" "$T" <<'PY'
+import errno
+import json
+import os
+from pathlib import Path
+import runpy
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+bridge_path, scratch = sys.argv[1:]
+base, edit = b"before", b"host edit with more bytes"
+real_write = os.write
+
+
+class CopyTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir=scratch)))
+        sandbox, stage = root / "sandbox", root / "stage"
+        sandbox.mkdir()
+        self.target = sandbox / "edit.txt"
+        self.target.write_bytes(base)
+        self.enterContext(patch.dict(os.environ, OC_SB=str(sandbox), OC_BRIDGE_STAGE=str(stage)))
+        self.bridge = runpy.run_path(bridge_path)["run_session"].__globals__
+
+    def stage(self):
+        session = Path(self.bridge["stage_request"]("code", ["/sandbox/edit.txt"]))
+        staged = session / "files/edit.txt"
+        self.assertEqual(staged.read_bytes(), base)
+        return session, staged
+
+    def test_short_staging_writes(self):
+        with patch.object(os, "write", side_effect=lambda fd, data: real_write(fd, data[:2])):
+            self.stage()
+
+    def test_short_save_writes(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        with patch.object(os, "write", side_effect=lambda fd, data: real_write(fd, data[:2])):
+            self.assertTrue(self.sync(session))
+        self.assertEqual(self.target.read_bytes(), edit)
+
+    def sync(self, session):
+        with (session / "manifest.json").open() as manifest:
+            entry = json.load(manifest)["entries"][0]
+        files_fd = os.open(session / "files", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            return self.bridge["sync"](files_fd, [entry])
+        finally:
+            os.close(files_fd)
+
+    def assert_preserved(self, staged, expected=edit):
+        self.assertEqual(self.target.read_bytes(), base)
+        self.assertEqual(staged.read_bytes(), expected)
+        self.assertEqual(list(self.target.parent.iterdir()), [self.target])
+
+    def test_incomplete_writes_keep_recovery(self):
+        for error in (None, OSError(errno.ENOSPC, "test disk full"), InterruptedError()):
+            with self.subTest(error=error):
+                self.target.write_bytes(base)
+                session, staged = self.stage()
+
+                def editor(*args, **kwargs):
+                    staged.write_bytes(edit)
+                    return SimpleNamespace(poll=lambda: 0)
+
+                def write(fd, data):
+                    if len(data) == len(edit):
+                        return real_write(fd, data[:2])
+                    if error is None:
+                        return 0
+                    raise error
+
+                with patch("subprocess.Popen", side_effect=editor), patch.object(os, "write", side_effect=write):
+                    self.bridge["run_session"](str(session))
+                self.assert_preserved(staged)
+
+    def test_periodic_failure_retries_same_save(self):
+        session, staged = self.stage()
+        observations = iter((None, 0))
+
+        def editor(*args, **kwargs):
+            staged.write_bytes(edit)
+            return SimpleNamespace(poll=lambda: next(observations))
+
+        def write(fd, data):
+            if not attempted:
+                attempted.append(True)
+                raise OSError(errno.ENOSPC, "test disk full")
+            return real_write(fd, data)
+
+        attempted = []
+        with patch("subprocess.Popen", side_effect=editor), patch("time.sleep"), patch.object(os, "write", side_effect=write):
+            self.bridge["run_session"](str(session))
+        self.assertEqual(self.target.read_bytes(), edit)
+        self.assertFalse(session.exists())
+
+    def test_oversized_save_keeps_recovery(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        with patch.dict(self.bridge, MAX_FILE=len(base)):
+            self.assertFalse(self.sync(session))
+        self.assert_preserved(staged)
+
+    def test_source_change_during_copy_keeps_recovery(self):
+        for changed in (edit.upper(), edit + b"more"):
+            with self.subTest(changed=changed):
+                self.target.write_bytes(base)
+                session, staged = self.stage()
+                staged.write_bytes(edit)
+
+                def write(fd, data):
+                    staged.write_bytes(changed)
+                    return real_write(fd, data)
+
+                with patch.dict(self.bridge, MAX_FILE=len(edit)), patch.object(os, "write", side_effect=write):
+                    self.assertFalse(self.sync(session))
+                self.assert_preserved(staged, changed)
+
+    def test_replaced_stage_refused_before_editor(self):
+        session, staged = self.stage()
+        replacement = staged.with_suffix(".replacement")
+        replacement.write_bytes(base)
+        replacement.replace(staged)
+        self.assert_launch_refused(session)
+
+    def test_duplicate_path_refused_before_editor(self):
+        session, _ = self.stage()
+        manifest = session / "manifest.json"
+        data = json.loads(manifest.read_bytes())
+        data["entries"] *= 2
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+        self.assert_launch_refused(session)
+
+    def assert_launch_refused(self, session):
+        with patch("subprocess.Popen") as launch:
+            launch.return_value.poll.return_value = 0
+            with self.assertRaises(self.bridge["Refused"]):
+                self.bridge["run_session"](str(session))
+        launch.assert_not_called()
+        self.assertTrue(session.exists())
+
+
+unittest.main(argv=[sys.argv[0]])
+PY
+}
+check "bounded bridge copies preserve and retry incomplete saves" bridge_copy_regressions
 
 # race: a directory on the path flips between a real directory and a symlink to the host, as fast as
 # possible, while requests (with edits) are processed
@@ -342,8 +565,13 @@ check "refuses empty -i (no global -d)"    argfail "-i needs an instance name" -
 echo "host state outside the sandbox (stubbed)"
 # The agent controls everything under $SB; host state (the image ledger above all) must not be there.
 pathrun() {  # VAR=value... -- script-args...: stderr+rc of a stubbed run with these variables
-  local envs=() rc=0 out
-  while [[ $1 != -- ]]; do envs+=("$1"); shift; done; shift
+  local envs=() rc=0 out next_setting=$1
+  while [[ $next_setting != -- ]]; do
+    envs+=("$next_setting")
+    shift
+    next_setting=$1
+  done
+  shift
   : > "$T/stub.log"
   out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "${envs[@]}" \
         "$SCRIPT" "$@" 2>&1 </dev/null) || rc=$?
@@ -366,21 +594,22 @@ out=$(pathrun XDG_DATA_HOME="$DSB/st" STUB_IDS="oc-agent=$A" -- -d -a -y)
 check "state dir inside the sandbox: refused"         grep -qx 'rc=2' <<<"$out"
 check "...before any podman call (forged ledger unused)" [ ! -s "$T/stub.log" ]
 check "...planted ledger symlink target untouched"   grep -qx "$SECRET" "$T/victim-file"
-check "state dir reaching the sandbox via a symlink: refused" grep -q 'leads into the sandbox directory' \
+sandbox_path_refusal='leads into the sandbox directory'
+check "state dir reaching the sandbox via a symlink: refused" grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_DATA_HOME="$T/dlink/st" -- -l)"
-check "config dir inside the sandbox: refused"        grep -q 'leads into the sandbox directory' \
+check "config dir inside the sandbox: refused"        grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_CONFIG_HOME="$DSB/cfg" -- -l)"
 # Reverse: an agent-owned symlink that points OUT of the sandbox when checked (and can be swapped
 # later); a host symlink into the sandbox that hops back out; a '..' walk through the sandbox.
 mkdir -p "$T/outside" "$T/outside2"; ln -sfn "$T/outside" "$DSB/xdg"; ln -sfn "$T/outside2" "$DSB/hop"
 ln -sfn "$DSB/hop" "$T/hostlink"
-check "agent symlink pointing outside: refused"       grep -q 'leads into the sandbox directory' \
+check "agent symlink pointing outside: refused"       grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_DATA_HOME="$DSB/xdg" -- -l)"
-check "config via agent symlink pointing outside: refused" grep -q 'leads into the sandbox directory' \
+check "config via agent symlink pointing outside: refused" grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_CONFIG_HOME="$DSB/xdg" -- -l)"
-check "host link -> sandbox link -> outside: refused" grep -q 'leads into the sandbox directory' \
+check "host link -> sandbox link -> outside: refused" grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_DATA_HOME="$T/hostlink" -- -l)"
-check "'..' through the sandbox: refused"             grep -q 'leads into the sandbox directory' \
+check "'..' through the sandbox: refused"             grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_DATA_HOME="$DSB/../.local/share" -- -l)"
 check "relative XDG_DATA_HOME: refused"               grep -qx 'rc=2' <<<"$(pathrun XDG_DATA_HOME=rel/share -- -l)"
 ln -sfn "$T/outside" "$T/hostonly"
@@ -492,6 +721,18 @@ echo "sandbox tree, worktrees and relabelling (in containers)"
 if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else
   if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null; then H=(distrobox-host-exec); else H=(); fi
   if ! "${H[@]}" podman image exists "$TEST_AGENT_IMG" 2>/dev/null; then echo "  skip  (no test agent image; run oc-sandbox -n first or supply OC_TEST_AGENT_IMAGE)"; else
+    delimited_update_image() {
+      local id output
+      id=$("${H[@]}" podman create --rm --network=none --cap-drop=ALL --security-opt=no-new-privileges \
+        --entrypoint python3 -- "$TEST_AGENT_IMG" -I -c 'print("update image operand accepted")') || return
+      [[ $id =~ ^[0-9a-f]{64}$ ]] || return 1
+      if ! output=$("${H[@]}" podman start -a "$id"); then
+        "${H[@]}" podman rm -f "$id" >/dev/null 2>&1 || true
+        return 1
+      fi
+      [[ $output == 'update image operand accepted' ]]
+    }
+    check "real Podman accepts the delimited updater image operand" delimited_update_image
     VOL=oc-sectest-$$
     cat > "$T/lib.sh" <<EOF
 H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }
@@ -505,12 +746,16 @@ $(fn relabel_shared)
 "\$@"
 EOF
     lib() { bash "$T/lib.sh" "$@"; }
-    inbox() { "${H[@]}" podman run --rm --network=none --security-opt=label=disable -v "$T/isb":/sandbox -w /sandbox \
-      --entrypoint sh "$TEST_AGENT_IMG" -c "$1"; }
+    inbox() {
+      local shell_code=$1
+      "${H[@]}" podman run --rm --network=none --security-opt=label=disable -v "$T/isb":/sandbox -w /sandbox \
+        --entrypoint sh "$TEST_AGENT_IMG" -c "$shell_code"
+    }
     mk() { rm -rf "$T/isb" "$T/iv"; mkdir -p "$T/isb" "$T/iv"; echo "$SECRET" > "$T/iv/keep"; }
     mk; lib "$T/isb" init_bridge_spool >/dev/null 2>&1
     lib "$T/isb" init_sandbox_tree construct >/dev/null 2>&1
-    check "working directory and bridge spool created" [ -d "$T/isb/construct" ] && [ -d "$T/isb/.bridge/requests" ]
+    check "working directory created" [ -d "$T/isb/construct" ]
+    check "bridge request spool created" [ -d "$T/isb/.bridge/requests" ]
     for target in "$T/iv" ../iv; do
       mk; ln -s "$target" "$T/isb/construct"; lib "$T/isb" init_sandbox_tree construct/sub >/dev/null 2>&1
       check "cwd construct -> $target: nothing written on the host" [ "$(ls -A "$T/iv")" = keep ]
@@ -528,7 +773,8 @@ EOF
     check "worktree link is relative"         grep -q '^gitdir: \.\./\.\./repo/' "$T/isb/wt/x/.git"
     check "agent-planted git hook not run"    [ ! -e "$T/isb/HOOK-RAN" ]
     mk; ln -s "$T/iv" "$T/isb/repo"; lib "$T/isb" init_sandbox_tree wt/y repo b >/dev/null 2>&1
-    check "-W repo symlinked to the host: refused, host untouched" [ "$(ls -A "$T/iv")" = keep ] && [ ! -e "$T/isb/wt/y/.git" ]
+    check "-W repo symlinked to the host leaves the host target intact" [ "$(ls -A "$T/iv")" = keep ]
+    check "-W repo symlinked to the host creates no worktree git link" [ ! -e "$T/isb/wt/y/.git" ]
 
     mk; echo data > "$T/isb/f"; ln -s "$T/iv/keep" "$T/isb/link-to-host"; ln -s ../iv "$T/isb/rel-link"
     before=$(stat -c %C "$T/iv/keep")
@@ -572,8 +818,8 @@ REBUILD=1 PULL=() BUILD=$T/ib
 "\$@"
 EOF
   img() { bash "$T/img.sh" "$@" 2>&1 >/dev/null; }
-  iid() { "${H[@]}" podman image inspect --format '{{.Id}}' "$1" 2>/dev/null; }
-  has() { "${H[@]}" podman image exists "$1"; }
+  iid() { local image_reference=$1; "${H[@]}" podman image inspect --format '{{.Id}}' "$image_reference" 2>/dev/null; }
+  has() { local image_reference=$1; "${H[@]}" podman image exists "$image_reference"; }
   pbuild() { "${H[@]}" podman build -q "$@" -f "$T/ib/Containerfile.t" "$T/ib"; }
   # an unrelated image on our tag, even one carrying our labels
   foreign=$(pbuild --label oc.hash=x --label "$L=agent" -t "$IT")

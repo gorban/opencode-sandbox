@@ -47,10 +47,10 @@ mkdir -p "$t/state"
   SB="$t/sandbox"; sb_real=$SB; AGENT_IMG=oc-agent; SANDBOX_TREE_PY=stub; STATE="$t/state"; ILABEL=second; INST=second
   CALLER_PWD=$PWD; CALLER_PHYSICAL=$(pwd -P)
   CWD_ARG= WT_ARG= WT_REPO= WT_BRANCH= CWD=wt/second
-  valid_relpath() { [[ $1 =~ ^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$ ]]; }
+  valid_relpath() { local candidate_path=$1; [[ $candidate_path =~ ^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$ ]]; }
   die() { echo "$*" >&2; exit 1; }
   SCRIPT_DIR=${SCRIPT%/*}
-  in_sb() { [[ $1/ == "$sb_real"/* ]]; }
+  in_sb() { local candidate_path=$1; [[ $candidate_path/ == "$sb_real"/* ]]; }
   for fn_name in trusted_path trusted_file trusted_dir worktree_state; do
     eval "$(sed -n "/^$fn_name() {/,/^}/p" "$SCRIPT")"
   done

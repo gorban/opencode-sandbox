@@ -8,16 +8,22 @@ set -uo pipefail
 REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 OCS=$REPO/oc-sandbox SB=$HOME/opencode-sandbox
 if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null; then H=(distrobox-host-exec); else H=(); fi
-P() { "${H[@]}" podman "$@"; }
+host_podman() { "${H[@]}" podman "$@"; }
 LEVEL=$(cat "${XDG_DATA_HOME:-$HOME/.local/share}/oc-sandbox/sb-level" 2>/dev/null || true)
 T=$(mktemp -d "${TMPDIR:-/tmp}/oc-ptest.XXXXXX")
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); printf '  ok    %s\n' "$*"; }
 bad() { fail=$((fail + 1)); printf '  FAIL  %s\n' "$*"; }
-check() { local d=$1 neg=0 r; shift; [[ $1 == '!' ]] && { neg=1; shift; }
-  if "$@" >/dev/null 2>&1; then r=0; else r=1; fi; if (( r == neg )); then ok "$d"; else bad "$d"; fi; }
+check() {
+  local description=$1 expected=0 result
+  shift
+  local first_argument=$1
+  if [[ $first_argument == '!' ]]; then expected=1; shift; fi
+  if "$@" >/dev/null 2>&1; then result=0; else result=1; fi
+  if (( result == expected )); then ok "$description"; else bad "$description"; fi
+}
 inbox() {  # run a fixed command in a throwaway container that sees only $SB (never touch $SB from the host)
-  P run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges --security-opt=label=disable \
+  host_podman run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges --security-opt=label=disable \
     -v "$SB":/sandbox -w /sandbox --entrypoint sh "${OC_PTEST_INBOX_IMAGE:-oc-agent}" -c "$@"; }
 # the test's Postgres settings (environment wins over postgres.env; no init scripts)
 export OC_PG_IMAGE=${OC_PTEST_PG_IMAGE:-docker.io/library/postgres:17} OC_PG_USER=ptest OC_PG_PASSWORD=ptest-pw \
@@ -31,7 +37,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-P pod create --name oc >/dev/null || { echo "could not create private default-pod sentinel" >&2; exit 1; }
+host_podman pod create --name oc >/dev/null || { echo "could not create private default-pod sentinel" >&2; exit 1; }
 
 echo "prepare: test repository inside the sandbox (with a hook that must NOT run)"
 OC_PTEST_INBOX_IMAGE=docker.io/alpine/git:latest inbox 'test -d /sandbox' || { echo "bootstrap container or sandbox mount failed" >&2; exit 1; }
@@ -71,52 +77,58 @@ for i in ptest1 ptest2; do
   ( exec script -qec "$OCS -i $i" /dev/null >$T/$i.agent.log 2>&1 ) & sleep 1
 done
 for _ in $(seq 1 60); do
-  [[ $(P container inspect -f '{{.State.Status}}' oc-ptest1-agent 2>/dev/null) == running &&
-     $(P container inspect -f '{{.State.Status}}' oc-ptest2-agent 2>/dev/null) == running ]] && break; sleep 1
+  [[ $(host_podman container inspect -f '{{.State.Status}}' oc-ptest1-agent 2>/dev/null) == running &&
+     $(host_podman container inspect -f '{{.State.Status}}' oc-ptest2-agent 2>/dev/null) == running ]] && break; sleep 1
 done
-check "both agents running at once" [ "$(P ps --filter name='^oc-ptest[12]-agent$' -q | wc -l)" -eq 2 ]
-A() { P exec "oc-$1-agent" sh -c "$2"; }
-check "ptest1 agent cwd is its worktree" [ "$(P container inspect -f '{{.Config.WorkingDir}}' oc-ptest1-agent)" = /sandbox/wt/ptest1 ]
-check "agents share one SELinux level"   [ "$(A ptest1 'cat /proc/self/attr/current' | tr -d '\0')" = "system_u:system_r:container_t:$LEVEL" ]
-check "both agents write the sandbox"    A ptest1 'echo one > /sandbox/wt/ptest1/w1 && cat /sandbox/wt/ptest2/echo.py >/dev/null'
-check "...concurrently"                  A ptest2 'echo two > /sandbox/wt/ptest2/w2 && cat /sandbox/wt/ptest1/w1 | grep -q one'
-check "agent still allowed after the other started" A ptest1 'cat /sandbox/wt/ptest2/w2 | grep -q two'
-check "Chromium MCP config present"      A ptest1 'grep -q chrome-devtools "$OPENCODE_CONFIG"'
-check "instance name in agent env"       [ "$(A ptest2 'echo $OC_INSTANCE')" = ptest2 ]
+check "both agents running at once" [ "$(host_podman ps --filter name='^oc-ptest[12]-agent$' -q | wc -l)" -eq 2 ]
+agent_shell() {
+  local instance=$1 script=$2
+  host_podman exec "oc-${instance}-agent" sh -c "$script"
+}
+check "ptest1 agent cwd is its worktree" [ "$(host_podman container inspect -f '{{.Config.WorkingDir}}' oc-ptest1-agent)" = /sandbox/wt/ptest1 ]
+check "agents share one SELinux level"   [ "$(agent_shell ptest1 'cat /proc/self/attr/current' | tr -d '\0')" = "system_u:system_r:container_t:$LEVEL" ]
+check "both agents write the sandbox"    agent_shell ptest1 'echo one > /sandbox/wt/ptest1/w1 && cat /sandbox/wt/ptest2/echo.py >/dev/null'
+check "...concurrently"                  agent_shell ptest2 'echo two > /sandbox/wt/ptest2/w2 && cat /sandbox/wt/ptest1/w1 | grep -q one'
+check "agent still allowed after the other started" agent_shell ptest1 'cat /sandbox/wt/ptest2/w2 | grep -q two'
+check "Chromium MCP config present"      agent_shell ptest1 'grep -q chrome-devtools "$OPENCODE_CONFIG"'
+check "instance name in agent env"       [ "$(agent_shell ptest2 'echo $OC_INSTANCE')" = ptest2 ]
 
 echo "same app, same port, both instances"
-for i in ptest1 ptest2; do A $i "cd /sandbox/wt/$i && nohup python3 echo.py >/dev/null 2>&1 &"; done; sleep 2
-check "ptest1 agent sees its own app"    [ "$(A ptest1 'curl -s 127.0.0.1:3000' | sed 's|.*>||')" = ptest1 ]
-check "ptest2 agent sees its own app"    [ "$(A ptest2 'curl -s 127.0.0.1:3000' | sed 's|.*>||')" = ptest2 ]
+for i in ptest1 ptest2; do agent_shell $i "cd /sandbox/wt/$i && nohup python3 echo.py >/dev/null 2>&1 &"; done; sleep 2
+check "ptest1 agent sees its own app"    [ "$(agent_shell ptest1 'curl -s 127.0.0.1:3000' | sed 's|.*>||')" = ptest1 ]
+check "ptest2 agent sees its own app"    [ "$(agent_shell ptest2 'curl -s 127.0.0.1:3000' | sed 's|.*>||')" = ptest2 ]
 check "host :18181 -> ptest1"            [ "$("${H[@]}" curl -s -m 3 127.0.0.1:18181 | sed 's|.*>||')" = ptest1 ]
 check "host :18182 -> ptest2"            [ "$("${H[@]}" curl -s -m 3 127.0.0.1:18182 | sed 's|.*>||')" = ptest2 ]
 check "host cannot reach pod port 3000 directly" ! "${H[@]}" curl -s -m 2 127.0.0.1:3000
 lan=$("${H[@]}" sh -c "ip -4 -o route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p'")
 check "mapped port not on the LAN ($lan)" ! "${H[@]}" curl -s -m 2 "$lan:18181"
 for i in ptest1 ptest2; do
-  P exec "oc-$i-chromium" curl -s -X PUT "http://127.0.0.1:9222/json/new?http://127.0.0.1:3000/" >/dev/null
+  host_podman exec "oc-$i-chromium" curl -s -X PUT "http://127.0.0.1:9222/json/new?http://127.0.0.1:3000/" >/dev/null
 done; sleep 3
 check "ptest1 Chromium loads its own app" sh -c "${H[*]} podman exec oc-ptest1-chromium curl -s 127.0.0.1:9222/json/list | grep -q '\"title\": \"instance ptest1\"'"
 check "ptest2 Chromium loads its own app" sh -c "${H[*]} podman exec oc-ptest2-chromium curl -s 127.0.0.1:9222/json/list | grep -q '\"title\": \"instance ptest2\"'"
-check "port 80 in pod (ptest2, no extra capability)" A ptest2 'python3 -c "import socket; s=socket.socket(); s.bind((\"127.0.0.1\", 80))"'
+check "port 80 in pod (ptest2, no extra capability)" agent_shell ptest2 'python3 -c "import socket; s=socket.socket(); s.bind((\"127.0.0.1\", 80))"'
 
 echo "Postgres data is per instance"
-PQ() { P exec "oc-$1-postgres" psql -qtA -U ptest -d ptest -c "$2"; }
-PQ ptest1 'create table only_in_ptest1(x int)' >/dev/null
-check "table exists in ptest1"           [ "$(PQ ptest1 "select to_regclass('only_in_ptest1') is not null")" = t ]
-check "table absent in ptest2"           [ "$(PQ ptest2 "select to_regclass('only_in_ptest1') is not null")" = f ]
-check "agent reaches its Postgres"       A ptest1 'psql -h 127.0.0.1 -U ptest -d ptest -qtAc "select 1" | grep -qx 1'
+postgres_query() {
+  local instance=$1 sql=$2
+  host_podman exec "oc-${instance}-postgres" psql -qtA -U ptest -d ptest -c "$sql"
+}
+postgres_query ptest1 'create table only_in_ptest1(x int)' >/dev/null
+check "table exists in ptest1"           [ "$(postgres_query ptest1 "select to_regclass('only_in_ptest1') is not null")" = t ]
+check "table absent in ptest2"           [ "$(postgres_query ptest2 "select to_regclass('only_in_ptest1') is not null")" = f ]
+check "agent reaches its Postgres"       agent_shell ptest1 'psql -h 127.0.0.1 -U ptest -d ptest -qtAc "select 1" | grep -qx 1'
 
 echo "docker-in-docker (ptest1 only)"
-check "docker CLI talks to the sidecar"  A ptest1 'docker version --format "{{.Server.Version}}"'
-check "docker compose available"         A ptest1 'docker compose version'
-A ptest1 'docker run -d -q --name whoami --network host docker.io/traefik/whoami --port 3001' >/dev/null 2>&1; sleep 3
-check "nested echo server reachable from the agent" A ptest1 'curl -s -m 3 127.0.0.1:3001 | grep -q "^Hostname"'
-check "...and from ptest1's Chromium"    P exec oc-ptest1-chromium curl -s -m 3 127.0.0.1:3001
-check "...but not from ptest2"           ! A ptest2 'curl -s -m 2 127.0.0.1:3001'
-check "nested default network works"     A ptest1 'docker run --rm -q docker.io/library/alpine:3.22 wget -qO- -T 5 http://example.com | grep -qi example'
-check "nested containers can read the sandbox" A ptest1 'docker run --rm -q -v /sandbox/wt/ptest1:/w docker.io/library/alpine:3.22 cat /w/echo.py'
-check "ptest2 has no docker"             ! A ptest2 'docker version'
+check "docker CLI talks to the sidecar"  agent_shell ptest1 'docker version --format "{{.Server.Version}}"'
+check "docker compose available"         agent_shell ptest1 'docker compose version'
+agent_shell ptest1 'docker run -d -q --name whoami --network host docker.io/traefik/whoami --port 3001' >/dev/null 2>&1; sleep 3
+check "nested echo server reachable from the agent" agent_shell ptest1 'curl -s -m 3 127.0.0.1:3001 | grep -q "^Hostname"'
+check "...and from ptest1's Chromium"    host_podman exec oc-ptest1-chromium curl -s -m 3 127.0.0.1:3001
+check "...but not from ptest2"           ! agent_shell ptest2 'curl -s -m 2 127.0.0.1:3001'
+check "nested default network works"     agent_shell ptest1 'docker run --rm -q docker.io/library/alpine:3.22 wget -qO- -T 5 http://example.com | grep -qi example'
+check "nested containers can read the sandbox" agent_shell ptest1 'docker run --rm -q -v /sandbox/wt/ptest1:/w docker.io/library/alpine:3.22 cat /w/echo.py'
+check "ptest2 has no docker"             ! agent_shell ptest2 'docker version'
 
 echo "management"
 "$OCS" -l > $T/ptest.list 2>&1
@@ -125,15 +137,15 @@ check "-l lists both with ports"         sh -c "grep -q '^ptest1 .*18181->3000' 
 check "port change refused while agent runs" sh -c "[ $rc -ne 0 ] && grep -q 'OpenCode is running' $T/ptest.refuse"
 "$OCS" -n -i ptest2 > $T/ptest.rerun 2>&1; rc=$?
 check "rerun without -P keeps the mapping" sh -c "[ $rc -eq 0 ] && ${H[*]} curl -s -m 3 127.0.0.1:18182 | grep -q ptest2"
-P stop -t 2 oc-ptest1-agent >/dev/null 2>&1
+host_podman stop -t 2 oc-ptest1-agent >/dev/null 2>&1
 "$OCS" -n -i ptest1 -P 18183:3000 > $T/ptest.change 2>&1; rc=$?
 check "port change after agent exits"    [ $rc -eq 0 ]
-check "...keeps Postgres data"           [ "$(PQ ptest1 "select to_regclass('only_in_ptest1') is not null")" = t ]
-check "...keeps docker-in-docker"        [ "$(P container inspect -f '{{.State.Status}}' oc-ptest1-dind 2>/dev/null)" = running ]
+check "...keeps Postgres data"           [ "$(postgres_query ptest1 "select to_regclass('only_in_ptest1') is not null")" = t ]
+check "...keeps docker-in-docker"        [ "$(host_podman container inspect -f '{{.State.Status}}' oc-ptest1-dind 2>/dev/null)" = running ]
 check "...old host port gone"            ! "${H[@]}" curl -s -m 2 127.0.0.1:18181
 "$OCS" -d -i ptest1 > /dev/null 2>&1
 check "-d -i removes only that instance" sh -c "! ${H[*]} podman pod exists oc-ptest1 && ${H[*]} podman pod exists oc-ptest2 && ${H[*]} podman pod exists oc"
-check "...and keeps its volumes"         P volume exists oc-ptest1-pg
+check "...and keeps its volumes"         host_podman volume exists oc-ptest1-pg
 
 echo; echo "$pass passed, $fail failed"
 (( fail == 0 ))

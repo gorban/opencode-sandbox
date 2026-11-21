@@ -13,6 +13,8 @@ def main():
             try: child.send_signal(signum)
             except ProcessLookupError: pass
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP): signal.signal(sig, forward)
+    # The image entry point forwards OpenCode arguments within the same agent container.
+    # Its image PATH includes the sandbox's writable OpenCode installation for self-updates.
     try: child = subprocess.Popen(['opencode', *sys.argv[1:]])
     except OSError as exc:
         print(f'cannot start OpenCode: {exc}', file=sys.stderr)

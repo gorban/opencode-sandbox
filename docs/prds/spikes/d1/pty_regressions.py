@@ -55,9 +55,9 @@ with tempfile.TemporaryDirectory(prefix='pty-test.', dir=base) as tmp:
                 if mode != 'native':
                     raise RuntimeError('script is required for the distrobox PTY regression')
                 master, slave = pty.openpty()
-                def make_controlling_terminal():
+                def make_controlling_terminal(terminal_fd=slave):
                     os.setsid()
-                    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+                    fcntl.ioctl(terminal_fd, termios.TIOCSCTTY, 0)
                 process = subprocess.Popen(['timeout', '4', 'bash', str(helper)],
                                            stdin=slave, stdout=slave, stderr=slave,
                                            preexec_fn=make_controlling_terminal,

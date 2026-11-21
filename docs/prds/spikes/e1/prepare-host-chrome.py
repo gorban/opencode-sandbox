@@ -20,6 +20,32 @@ from urllib.parse import urlsplit
 HOSTS = {'feat': 'feat-a.oc-sandbox.internal', 'evil': 'evil.example.com', 'ip127': '127.0.0.1'}
 
 
+def _validate_urls(data, proxy_port):
+    ports = {proxy_port}
+    for label, url in data['urls'].items():
+        u = urlsplit(url); leaf = label.split('/')[1]
+        if (u.scheme != 'https' or u.hostname != HOSTS[leaf] or u.username or u.password
+                or u.path != '/' or u.query or u.fragment or not u.port or not 1024 <= u.port <= 65535
+                or u.port in ports):
+            raise ValueError(f'invalid or duplicate URL: {label}')
+        ports.add(u.port)
+
+
+def _verified_ca_copies(run, data):
+    copies = {}
+    for variant in ('E', 'X'):
+        ca = run / 'ca' / f'{variant}.pem'
+        if ca.is_symlink() or ca.parent.is_symlink() or ca.resolve(strict=True) != ca or not ca.is_file():
+            raise ValueError(f'unsafe {variant} CA path')
+        if data['ca_files'][variant] != str(ca): raise ValueError(f'{variant} CA path does not match manifest')
+        pem = ca.read_bytes()
+        digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem.decode('ascii'))).hexdigest()
+        if digest != data['ca_sha256'][variant]: raise ValueError(f'{variant} CA fingerprint mismatch')
+        copies[variant] = pem
+    if data['ca_sha256']['E'] == data['ca_sha256']['X']: raise ValueError('CAs are not distinct')
+    return copies
+
+
 def checked_manifest(path):
     repo = Path(__file__).resolve().parents[4]
     scratch = repo / '.scratch'
@@ -35,32 +61,15 @@ def checked_manifest(path):
         raise ValueError('fixture directory must be owned by this user and mode 0700')
     data = json.loads(path.read_text())
     proxy = data['proxy']
-    if not isinstance(proxy, str) or not re.fullmatch(r'127\.0\.0\.1:[0-9]{1,5}', proxy):
+    if not isinstance(proxy, str) or not re.fullmatch(r'127\.0\.0\.1:\d{1,5}', proxy, re.ASCII):
         raise ValueError('proxy must be an IPv4 loopback address')
     proxy_port = int(proxy.split(':')[1])
     if not 1024 <= proxy_port <= 65535: raise ValueError('invalid proxy port')
     if not re.fullmatch(r'[0-9a-f]{24}', data['marker']): raise ValueError('invalid fixture marker')
     expected = {f'{v}/{leaf}' for v in ('E', 'X') for leaf in HOSTS}
     if set(data['urls']) != expected: raise ValueError('manifest must contain exactly six fixture URLs')
-    ports = {proxy_port}
-    for label, url in data['urls'].items():
-        u = urlsplit(url); leaf = label.split('/')[1]
-        if (u.scheme != 'https' or u.hostname != HOSTS[leaf] or u.username or u.password
-                or u.path != '/' or u.query or u.fragment or not u.port or not 1024 <= u.port <= 65535
-                or u.port in ports):
-            raise ValueError(f'invalid or duplicate URL: {label}')
-        ports.add(u.port)
-    copies = {}
-    for variant in ('E', 'X'):
-        ca = run / 'ca' / f'{variant}.pem'
-        if ca.is_symlink() or ca.parent.is_symlink() or ca.resolve(strict=True) != ca or not ca.is_file():
-            raise ValueError(f'unsafe {variant} CA path')
-        if data['ca_files'][variant] != str(ca): raise ValueError(f'{variant} CA path does not match manifest')
-        pem = ca.read_bytes()
-        digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem.decode('ascii'))).hexdigest()
-        if digest != data['ca_sha256'][variant]: raise ValueError(f'{variant} CA fingerprint mismatch')
-        copies[variant] = pem
-    if data['ca_sha256']['E'] == data['ca_sha256']['X']: raise ValueError('CAs are not distinct')
+    _validate_urls(data, proxy_port)
+    copies = _verified_ca_copies(run, data)
     return run, data, copies
 
 

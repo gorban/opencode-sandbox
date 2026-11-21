@@ -30,7 +30,7 @@ must() { "$@" || die "setup step failed: $*"; }
 
 # ---------------------------------------------------------------- scratch dir (this run only)
 SCR=$ROOT/.scratch
-[ -L "$SCR" ] && die "$SCR is a symlink"
+[[ -L "$SCR" ]] && die "$SCR is a symlink"
 mkdir -p "$SCR" || die "cannot create $SCR"
 W=$(mktemp -d "$SCR/e1-run.XXXXXX") || die "mktemp failed"
 case $(realpath -e -- "$W") in "$(realpath -e -- "$ROOT")/.scratch/e1-run."*) ;; *) die "scratch dir outside $ROOT/.scratch: $W";; esac
@@ -51,33 +51,37 @@ owned() {
     image) fmt='{{ index .Config.Labels "oc.spike.e1.owner" }}';;
     container) fmt='{{ index .Config.Labels "oc.spike.e1.owner" }}';;
     pod) fmt='{{ index .Labels "oc.spike.e1.owner" }}';;
+    *) return 1;;
   esac
-  [ "$(pm "$kind" inspect --format "$fmt" "$name" 2>/dev/null)" = "$OWNER" ]
+  [[ "$(pm "$kind" inspect --format "$fmt" "$name" 2>/dev/null)" = "$OWNER" ]]
 }
 
 # Files are created by Podman only after resource creation, not from candidate names.
 # Require a full immutable ID: never let an empty, abbreviated or forged value resolve as a name.
 read_id() {
-  local id
-  [ -f "$1" ] && [ ! -L "$1" ] || return 1
-  id=$(<"$1")
+  local receipt=$1 id
+  [[ -f "$receipt" ]] && [[ ! -L "$receipt" ]] || return 1
+  id=$(<"$receipt")
   id=${id#sha256:}
   [[ $id =~ ^[0-9a-f]{64}$ ]] || return 1
   printf '%s' "$id"
 }
 remove_id() {
   local kind=$1 file=$2 id rc
-  [ -e "$file" ] || [ -L "$file" ] || return 0
+  local -a remove_argv
+  case $kind in
+    container) remove_argv=(rm -f);;
+    pod) remove_argv=(pod rm);;
+    image) remove_argv=(rmi);;
+    *) log "unsupported resource kind: $kind"; return 1;;
+  esac
+  [[ -e "$file" ]] || [[ -L "$file" ]] || return 0
   id=$(read_id "$file") || { log "invalid $kind ID receipt: $file"; return 1; }
   pm "$kind" exists "$id" >/dev/null 2>&1; rc=$?
-  [ "$rc" = 1 ] && return 0  # auto-removed one-shot container
-  [ "$rc" = 0 ] || { log "cannot check $kind ID $id"; return 1; }
+  [[ "$rc" = 1 ]] && return 0  # auto-removed one-shot container
+  [[ "$rc" = 0 ]] || { log "cannot check $kind ID $id"; return 1; }
   owned "$kind" "$id" || { log "$kind ID $id does not have this run's owner label"; return 1; }
-  case $kind in
-    container) pm rm -f "$id" >/dev/null;;
-    pod) pm pod rm "$id" >/dev/null;;
-    image) pm rmi "$id" >/dev/null;;
-  esac || { log "could not remove $kind ID $id"; return 1; }
+  pm "${remove_argv[@]}" "$id" >/dev/null || { log "could not remove $kind ID $id"; return 1; }
 }
 cleanup() {
   local status=$? failed=0 f
@@ -85,14 +89,14 @@ cleanup() {
   log "cleanup"
   for f in "$W"/ids/ctr-*; do remove_id container "$f" || failed=1; done
   remove_id pod "$W/ids/pod" || failed=1
-  if [ "$KEEP_IMAGES" = 0 ]; then
+  if [[ "$KEEP_IMAGES" = 0 ]]; then
     for f in "$W"/ids/img-*; do remove_id image "$f" || failed=1; done
   fi
   # Keep receipts if cleanup fails, so the exact IDs can be inspected and removed safely.
-  if [ "$failed" = 1 ]; then
+  if [[ "$failed" = 1 ]]; then
     log "cleanup incomplete; receipts retained in $W/ids"
-    [ "$status" = 0 ] && status=1
-  elif [ "$KEEP_SCRATCH" = 0 ] && [ "${W_OWNED:-0}" = 1 ] && [ -d "$W" ] && [ ! -L "$W" ] &&
+    [[ "$status" = 0 ]] && status=1
+  elif [[ "$KEEP_SCRATCH" = 0 ]] && [[ "${W_OWNED:-0}" = 1 ]] && [[ -d "$W" ]] && [[ ! -L "$W" ]] &&
      [[ $(realpath -e -- "$W") == "$(realpath -e -- "$ROOT")/.scratch/e1-run."* ]]; then
     rm -rf -- "$W"
   fi
@@ -117,11 +121,11 @@ gen() {
     # distrobox-host-exec does not pass the environment on, so the $ENV:: placeholders in the
     # templates are substituted into a per-CA config file here (recommended.sh uses the env form).
     local sect=v3_ca ncv=$NC tmpl; tmpl=$(<"$HERE/ca.cnf")
-    [ "$NC" = - ] && { sect=v3_ca_unconstrained; ncv=x; }
+    [[ "$NC" = - ]] && { sect=v3_ca_unconstrained; ncv=x; }
     printf '%s\n' "${tmpl//'$ENV::OC_NC'/$ncv}" > "$W/ca/$V/ca.cnf"
     must "${HOSTSSL[@]}" req -x509 -new -key "$W/ca/$V/ca.key" -config "$W/ca/$V/ca.cnf" -extensions $sect \
       -days 3650 -sha256 -out "$W/ca/$V/ca.pem"
-    if [ "$NC" != - ]; then   # the constraint really is in the certificate, and critical
+    if [[ "$NC" != - ]]; then   # the constraint really is in the certificate, and critical
       "${HOSTSSL[@]}" x509 -in "$W/ca/$V/ca.pem" -noout -text | grep -q 'Name Constraints: critical' \
         || die "CA $V has no critical nameConstraints"
     fi
@@ -137,13 +141,13 @@ gen() {
     li=0
     while IFS=$'\t' read -r L CN SAN CHECK MODE; do
       mkdir -p "$W/leaf/$L"
-      local subj="/CN=$CN"; [ "$CN" = - ] && subj="/O=oc-sandbox"   # "-" = subject without any CN
-      if [ ! -f "$W/leaf/$L/key.pem" ]; then
+      local subj="/CN=$CN"; [[ "$CN" = - ]] && subj="/O=oc-sandbox"   # "-" = subject without any CN
+      if [[ ! -f "$W/leaf/$L/key.pem" ]]; then
         must "${HOSTSSL[@]}" genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$W/leaf/$L/key.pem"
         must "${HOSTSSL[@]}" req -new -key "$W/leaf/$L/key.pem" -subj "$subj" -out "$W/leaf/$L/req.pem"
       fi
       local lsect=v3_leaf sanv=$SAN ltmpl; ltmpl=$(<"$HERE/leaf.cnf")
-      [ "$SAN" = - ] && { lsect=v3_leaf_nosan; sanv=x; }
+      [[ "$SAN" = - ]] && { lsect=v3_leaf_nosan; sanv=x; }
       printf '%s\n' "${ltmpl//'$ENV::OC_SAN'/$sanv}" > "$W/leaf/$L/leaf.cnf"
       local sca=$W/ca/$V/ca.pem skey=$W/ca/$V/ca.key
       rm -f -- "$W/leaf/$L/$V.chain.pem"
@@ -156,7 +160,7 @@ gen() {
       must "${HOSTSSL[@]}" x509 -req -in "$W/leaf/$L/req.pem" -CA "$sca" -CAkey "$skey" \
         -CAcreateserial -CAserial "$W/ca/$V/serial-$MODE" -extfile "$W/leaf/$L/leaf.cnf" -extensions $lsect \
         -days 30 -sha256 -out "$W/leaf/$L/$V.pem"
-      [ -s "$W/leaf/$L/$V.pem" ] || die "leaf $L/$V was not written"
+      [[ -s "$W/leaf/$L/$V.pem" ]] || die "leaf $L/$V was not written"
       local kind=dns; [[ $CHECK =~ ^[0-9.]+$ || $CHECK == *:* ]] && kind=ip
       printf '%s\t%s\t%s\t%s\t%s\n' "$V" "$L" "$((20000 + vi*100 + li))" "$CHECK" "$kind" >> "$W/combos.tsv"
       li=$((li+1))
@@ -171,16 +175,16 @@ gen() {
 # The exact commands quoted in prd_e1.md, run for the two recommended CA variants (D and E).
 recommended() {
   log "recommended.sh (the PRD snippet) for variants D and E"
-  local V NC san
-  for V in D E; do
-    NC=$(awk -F'\t' -v v=$V '$1==v{print $2}' "$HERE/variants.tsv")
-    san='DNS:feat-a.oc-sandbox.internal'; [ $V = D ] && san='DNS:feat-a.oc-sandbox.internal,DNS:localhost,IP:127.0.0.1,IP:::1'
-    must "${H[@]}" bash "$HERE/recommended.sh" "$W/rec-$V" "$HERE" feat-a.oc-sandbox.internal "$NC" "$san"
-    "${HOSTSSL[@]}" verify -CAfile "$W/rec-$V/ca.pem" -verify_hostname feat-a.oc-sandbox.internal "$W/rec-$V/cert.pem" >/dev/null \
-      || die "recommended leaf for $V does not verify"
-    "${HOSTSSL[@]}" x509 -in "$W/rec-$V/ca.pem" -noout -text | grep -q 'Name Constraints: critical' || die "recommended CA $V lacks nameConstraints"
-    [ "$(stat -c %a "$W/rec-$V/ca.key")" = 600 ] || die "ca.key is not 0600"
-    echo "recommended $V: leaf verifies, nameConstraints critical, ca.key 0600" >> "$W/results/recommended.txt"
+  local variant constraints san
+  for variant in D E; do
+    constraints=$(awk -F'\t' -v v=$variant '$1==v{print $2}' "$HERE/variants.tsv")
+    san='DNS:feat-a.oc-sandbox.internal'; [[ $variant = D ]] && san='DNS:feat-a.oc-sandbox.internal,DNS:localhost,IP:127.0.0.1,IP:::1'
+    must "${H[@]}" bash "$HERE/recommended.sh" "$W/rec-$variant" "$HERE" feat-a.oc-sandbox.internal "$constraints" "$san"
+    "${HOSTSSL[@]}" verify -CAfile "$W/rec-$variant/ca.pem" -verify_hostname feat-a.oc-sandbox.internal "$W/rec-$variant/cert.pem" >/dev/null \
+      || die "recommended leaf for $variant does not verify"
+    "${HOSTSSL[@]}" x509 -in "$W/rec-$variant/ca.pem" -noout -text | grep -q 'Name Constraints: critical' || die "recommended CA $variant lacks nameConstraints"
+    [[ "$(stat -c %a "$W/rec-$variant/ca.key")" = 600 ]] || die "ca.key is not 0600"
+    echo "recommended $variant: leaf verifies, nameConstraints critical, ca.key 0600" >> "$W/results/recommended.txt"
   done
 }
 
@@ -197,7 +201,7 @@ build_images() {
   printf 'FROM docker.io/library/alpine:3.22\nRUN apk add --no-cache openssl curl iproute2 bash\n' > "$W/img/Containerfile.alpine"
   must pm build -q --iidfile "$W/ids/img-alpine" --label "oc.spike.e1.owner=$OWNER" -f "$W/img/Containerfile.alpine" "$W/img" >/dev/null
   ALPINE_ID=$(read_id "$W/ids/img-alpine") || die "missing alpine image ID"
-  if [ $SKIP_CHROMIUM = 0 ]; then
+  if [[ $SKIP_CHROMIUM = 0 ]]; then
     printf 'FROM registry.fedoraproject.org/fedora:latest\nRUN dnf install -y chromium curl nss-tools openssl && dnf clean all\n' > "$W/img/Containerfile.chromium"
     must pm build -q --iidfile "$W/ids/img-chromium" --label "oc.spike.e1.owner=$OWNER" -f "$W/img/Containerfile.chromium" "$W/img" >/dev/null
     CHROMIUM_ID=$(read_id "$W/ids/img-chromium") || die "missing chromium image ID"
@@ -216,36 +220,39 @@ start_pod() {
   want=$(wc -l < "$W/combos.tsv")
   for _ in $(seq 1 60); do
     got=$(pm logs "$SRV_ID" 2>&1 | sed -n 's/^ready \([0-9]*\)$/\1/p' | head -1)
-    [ -n "$got" ] && break; sleep 0.5
+    [[ -n "$got" ]] && break; sleep 0.5
   done
-  [ "$got" = "$want" ] || { pm logs "$SRV_ID" 2>&1 | tail -5 >&2; die "s_server fleet: $got of $want servers listening"; }
+  [[ "$got" = "$want" ]] || { pm logs "$SRV_ID" 2>&1 | tail -5 >&2; die "s_server fleet: $got of $want servers listening"; }
   log "$got servers listening"
 }
 
 # ---------------------------------------------------------------- 3. clients
 run_clients() {
-  local R=$W/results
+  local results=$W/results
   log "openssl verify, host"
-  OC_W=$W bash "$HERE/clients/openssl_verify.sh" "${HOSTSSL[@]}" > "$R/openssl-host-verify.tsv" 2> "$R/openssl-host-verify.err" || die "host OpenSSL client setup failed"
+  OC_W=$W bash "$HERE/clients/openssl_verify.sh" "${HOSTSSL[@]}" > "$results/openssl-host-verify.tsv" 2> "$results/openssl-host-verify.err" || die "host OpenSSL client setup failed"
   log "openssl verify + s_client, curl (alpine)"
-  crun -v "$R":/w/results:rw "$ALPINE_ID" bash -c 'bash /c/openssl_verify.sh openssl > /w/results/openssl-alpine-verify.tsv || exit 1; bash /c/sclient.sh > /w/results/openssl-alpine-sclient.tsv || exit 1; bash /c/curl.sh > /w/results/curl.tsv' 2>>"$R/alpine.err" || die "alpine OpenSSL client setup failed"
+  # Keep the shared workspace read-only. The host owns the result filenames.
+  crun "$ALPINE_ID" bash /c/openssl_verify.sh openssl > "$results/openssl-alpine-verify.tsv" 2>> "$results/alpine.err" || die "alpine OpenSSL client setup failed"
+  crun "$ALPINE_ID" bash /c/sclient.sh > "$results/openssl-alpine-sclient.tsv" 2>> "$results/alpine.err" || die "alpine OpenSSL client setup failed"
+  crun "$ALPINE_ID" bash /c/curl.sh > "$results/curl.tsv" 2>> "$results/alpine.err" || die "alpine OpenSSL client setup failed"
   log "python"
-  crun $PY_IMG python -I /c/py_tls.py > "$R/python.tsv" 2>"$R/python.err" || die "python client failed"
+  crun $PY_IMG python -I /c/py_tls.py > "$results/python.tsv" 2>"$results/python.err" || die "python client failed"
   log "node (NODE_EXTRA_CA_CERTS)"
-  crun $NODE_IMG sh -c 'set -e; for V in $(cut -f1 /w/variants.tsv); do NODE_EXTRA_CA_CERTS=/w/ca/$V/ca.pem node /c/node_tls.js $V; done' > "$R/node.tsv" 2>"$R/node.err" || die "node client failed"
-  if [ $SKIP_GO = 0 ]; then
+  crun $NODE_IMG sh -c 'set -e; for V in $(cut -f1 /w/variants.tsv); do NODE_EXTRA_CA_CERTS=/w/ca/$V/ca.pem node /c/node_tls.mjs $V; done' > "$results/node.tsv" 2>"$results/node.err" || die "node client failed"
+  if [[ $SKIP_GO = 0 ]]; then
     log "go"
-    crun -e GOCACHE=/tmp/gocache -e HOME=/tmp -e GOFLAGS=-mod=mod -e GOTOOLCHAIN=local $GO_IMG sh -c 'cd /tmp && mkdir -p g && cp /c/go_tls.go g/main.go && cd g && go mod init x >/dev/null 2>&1; go run .' > "$R/go.tsv" 2>"$R/go.err" || die "go client failed"
+    crun -e GOCACHE=/tmp/gocache -e HOME=/tmp -e GOFLAGS=-mod=mod -e GOTOOLCHAIN=local $GO_IMG sh -c 'cd /tmp && mkdir -p g && cp /c/go_tls.go g/main.go && cd g && go mod init x >/dev/null 2>&1; go run .' > "$results/go.tsv" 2>"$results/go.err" || die "go client failed"
   fi
-  if [ $SKIP_PG = 0 ]; then
+  if [[ $SKIP_PG = 0 ]]; then
     log "psql sslmode=verify-full against postgres:17"
-    run_pg > "$R/psql.tsv" 2>"$R/psql.err" || die "postgres client setup failed"
+    run_pg > "$results/psql.tsv" 2>"$results/psql.err" || die "postgres client setup failed"
   fi
-  if [ $SKIP_CHROMIUM = 0 ]; then
+  if [[ $SKIP_CHROMIUM = 0 ]]; then
     log "chromium headless (scratch NSS db per CA)"
-    crun "$CHROMIUM_ID" bash /c/chromium.sh > "$R/chromium.tsv" 2>"$R/chromium.err" || die "chromium client failed"
+    crun "$CHROMIUM_ID" bash /c/chromium.sh > "$results/chromium.tsv" 2>"$results/chromium.err" || die "chromium client failed"
     log "nss certutil -V (chain only)"
-    crun "$CHROMIUM_ID" bash /c/nss_certutil.sh > "$R/nss-certutil.tsv" 2>"$R/nss-certutil.err" || die "NSS client setup failed"
+    crun "$CHROMIUM_ID" bash /c/nss_certutil.sh > "$results/nss-certutil.tsv" 2>"$results/nss-certutil.err" || die "NSS client setup failed"
   fi
 }
 
@@ -265,9 +272,10 @@ main() {
   start_pod
   run_clients
   local exp="Hvfy,Hvfy+h,Avfy,Avfy+h,s_cli,curl,py,node"
-  [ $SKIP_GO = 0 ] && exp+=",go"; [ $SKIP_PG = 0 ] && exp+=",psql"; [ $SKIP_CHROMIUM = 0 ] && exp+=",chrom,nss"
-  OC_E1_EXPECT=$exp python3 -I "$HERE/matrix.py" "$W" > "$W/matrix.txt"; local rc=$?
+  [[ $SKIP_GO = 0 ]] && exp+=",go"; [[ $SKIP_PG = 0 ]] && exp+=",psql"; [[ $SKIP_CHROMIUM = 0 ]] && exp+=",chrom,nss"
+  (cd -P -- "$W" && OC_E1_EXPECT=$exp exec python3 -I "$HERE/matrix.py") > "$W/matrix.txt"
+  local rc=$?
   cat "$W/matrix.txt" "$W/results/recommended.txt"
-  [ $rc = 0 ] || { log "PROBE INVALID: see the CHECKS section above"; exit 1; }
+  [[ $rc = 0 ]] || { log "PROBE INVALID: see the CHECKS section above"; exit 1; }
 }
-[ -n "${OC_E1_NOMAIN:-}" ] || main
+[[ -n "${OC_E1_NOMAIN:-}" ]] || main

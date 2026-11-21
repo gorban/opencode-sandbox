@@ -3,14 +3,15 @@
 import os, pathlib, subprocess, sys, tempfile
 
 src = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else pathlib.Path(__file__).parent).resolve()
+PERMITTED_SUBTREE_VIOLATION = 'permitted subtree violation'
 errors = {
-    'openssl-verify-4.0': 'permitted subtree violation',
+    'openssl-verify-4.0': PERMITTED_SUBTREE_VIOLATION,
     'openssl-verify+host-4.0': 'excluded subtree violation',
     'openssl-verify-3.5': 'path length constraint exceeded',
-    'openssl-verify+host-3.5': 'permitted subtree violation',
+    'openssl-verify+host-3.5': PERMITTED_SUBTREE_VIOLATION,
     'openssl-s_client-3.5': 'num=47:permitted subtree violation',
     'curl-8': 'SSL certificate problem: permitted subtree violation',
-    'py-3': 'permitted subtree violation',
+    'py-3': PERMITTED_SUBTREE_VIOLATION,
     'node-24': 'UNSPECIFIED permitted subtree violation',
     'go-1': 'tls: failed to verify certificate: x509: too many intermediates for path length constraint',
     'psql-17': 'connection to server at "localhost" (127.0.0.1), port 5432 failed: SSL error: certificate verify failed',
@@ -34,7 +35,9 @@ with tempfile.TemporaryDirectory(dir=scratch) as td:
         for c, detail in errors.items():
             rows += [f'{c}\tA\tleaf\tFAIL\t{error if c == target else detail}', f'{c}\tX\tleaf\tOK\t']
         (w/'results'/'fixture.tsv').write_text('\n'.join(rows)+'\n')
-        return subprocess.run([sys.executable, str(src/'matrix.py'), str(w)], stdout=subprocess.DEVNULL).returncode
+        return subprocess.run(
+            [sys.executable, str(src/'matrix.py'), '.'], cwd=w, stdout=subprocess.DEVNULL,
+        ).returncode
     assert validate() == 0, 'legitimate verification errors rejected'
     for error in ('net::ERR_SSL_PROTOCOL_ERROR', 'SSL error: wrong version number', 'SSL connect error', 'unknown error'):
         for client in errors:

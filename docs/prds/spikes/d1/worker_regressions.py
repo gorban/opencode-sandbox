@@ -10,6 +10,8 @@ import tempfile
 
 repo = Path(__file__).resolve().parents[4]
 probe = Path(os.environ.get('OC_SPIKE_PROBE', Path(__file__).with_name('probe.sh'))).resolve()
+CLEANUP_HEADER = 'cleanup() {'
+
 source = probe.read_text()
 base = repo / '.scratch'
 if base.is_symlink():
@@ -19,7 +21,7 @@ if '# ---- poll worker control' not in source:
     # Replay the reviewed old cleanup with harmless sleep processes. pidfds are opened
     # while the child is alive, so the fixture's final SIGTERM can never hit a reused PID.
     host = next(line for line in source.splitlines() if line.startswith('host()'))
-    cleanup = source[source.index('cleanup() {'):source.index('\ntrap ', source.index('cleanup() {'))]
+    cleanup = source[source.index(CLEANUP_HEADER):source.index('\ntrap ', source.index(CLEANUP_HEADER))]
     leaks = []
     with tempfile.TemporaryDirectory(prefix='old-worker.', dir=base) as temp:
         root = Path(temp).resolve()
@@ -59,7 +61,7 @@ cleanup; echo CLEANED
         assert not leaks, f'worker survived old cleanup: {leaks}'
     raise SystemExit(0)
 block = source[source.index('# ---- poll worker control'):source.index('# Fail before scratch')]
-cleanup = source[source.index('cleanup() {'):source.index('\ntrap ', source.index('cleanup() {'))]
+cleanup = source[source.index(CLEANUP_HEADER):source.index('\ntrap ', source.index(CLEANUP_HEADER))]
 with tempfile.TemporaryDirectory(prefix='worker-test.', dir=base) as temp:
     root = Path(temp).resolve()
     proxy = root / 'forwarder.sh'
@@ -123,7 +125,7 @@ fi
 BASE_REAL="{d}"; SCR=$(mktemp -d "$BASE_REAL/probe.XXXXXX")
 pm() {{ echo 'UNEXPECTED PODMAN' >&2; return 91; }}
 die() {{ echo "$*" >&2; exit 2; }}
-''' + block + '\n' + cleanup + f'''
+''' + block + '\n' + cleanup + '''
 trap 'rc=$?; cleanup; c=$?; printf "cleanup=%s\\n" "$c"; (( c == 0 )) || rc=1; exit "$rc"' EXIT
 start_worker fixture "$SCR/output" 127.0.0.1 || exit 3
 ln "$worker_lock" "$BASE_REAL/oracle.lock"

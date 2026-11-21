@@ -17,26 +17,35 @@ def load(path):
         return tomllib.load(f)
 
 
+def flatten_platform(prefix, fields, out, extra):
+    for field, value in fields.items():
+        target = out if field in CORE else extra
+        target[(*prefix, field)] = value
+
+
+def flatten_tool_entry(prefix, entry, out, extra):
+    for name, value in entry.items():
+        key = (*prefix, name)
+        if name.startswith("platforms."):
+            flatten_platform(key, value, out, extra)
+        elif name == "options":
+            for field, data in value.items():
+                out[(*key, field)] = data
+        else:
+            target = out if name in ("version", "backend") else extra
+            target[key] = value
+
+
 def flatten(doc):
     out, extra = {}, {}
     for k, v in doc.items():
         if k not in ("lockfile_version", "tools", "conda-packages"):
             extra[("top-level", k)] = v
     for name, entries in doc.get("tools", {}).items():
-        for index, e in enumerate(entries if isinstance(entries, list) else [entries]):
+        for index, entry in enumerate(entries if isinstance(entries, list) else [entries]):
             # [[tools.X]] holds version/backend; [tools.X."platforms.P"] holds artifacts (a dict inside the list
             # entry or beside it, depending on the TOML shape); handle both.
-            for k, v in e.items():
-                if k.startswith("platforms."):
-                    for f, val in v.items():
-                        (out if f in CORE else extra)[(name, index, k, f)] = val
-                elif k == "options":
-                    for f, val in v.items():
-                        out[(name, index, "options", f)] = val
-                elif k in ("version", "backend"):
-                    out[(name, index, k)] = v
-                else:
-                    extra[(name, index, k)] = v
+            flatten_tool_entry((name, index), entry, out, extra)
     for plat, pk in doc.get("conda-packages", {}).items():
         for fn, spec in pk.items():
             for f, val in spec.items():

@@ -153,8 +153,9 @@ class MergeCoreTest(unittest.TestCase):
     def test_no_host_change_has_no_export(self):
         self.session = self.make_session(replace(self.inputs, host=revision(self.inputs.base.contents)))
         self.assertIs(self.session.phase, Phase.NO_HOST_CHANGE)
+        destination = self.exporter.destination()
         with self.assertRaises(MergeError):
-            self.session.offer_export(self.owner, self.exporter.destination())
+            self.session.offer_export(self.owner, destination)
         self.session.discard(self.owner)
         self.assertIs(self.session.phase, Phase.CLOSED)
 
@@ -202,8 +203,8 @@ class MergeCoreTest(unittest.TestCase):
                 self.assertIs(session.phase, Phase.RECOVERY)
                 recovery = session.recovery(self.owner)
                 for role in ("base", "host", "agent"):
-                    self.assertTrue(
-                        getattr(recovery.inputs, role) is getattr(expected, role),
+                    self.assertIs(
+                        getattr(recovery.inputs, role), getattr(expected, role),
                         f"Incorrect recovery retention for {role}",
                     )
                 self.assertTrue(recovery.preparation_error)
@@ -219,8 +220,9 @@ class MergeCoreTest(unittest.TestCase):
                 self.assertIn("Host", recovery.preparation_error)
                 with self.assertRaises(MergeError):
                     session.offer_merge(self.owner, self.preferences, self.adapter)
+                destination = self.exporter.destination()
                 with self.assertRaises(MergeError):
-                    session.offer_export(self.owner, self.exporter.destination())
+                    session.offer_export(self.owner, destination)
 
     def test_exact_confirmation_is_owned_current_and_single_use(self):
         first = self.session.offer_merge(self.owner, self.preferences, self.adapter)
@@ -254,19 +256,23 @@ class MergeCoreTest(unittest.TestCase):
             with self.subTest(data=data):
                 self.session = self.make_session()
                 operation = self.open_merge()
+                destination = self.exporter.destination()
                 with self.assertRaises(MergeError):
-                    self.session.offer_export(self.owner, self.exporter.destination())
+                    self.session.offer_export(self.owner, destination)
                 output = revision(data)
                 receipt = self.merge_receipt(operation, output)
+                receipt_with_copied_operation = replace(receipt, operation=replace(operation))
                 with self.assertRaisesRegex(MergeError, "current merge operation"):
-                    self.session.complete_merge(self.owner, replace(receipt, operation=replace(operation)))
+                    self.session.complete_merge(self.owner, receipt_with_copied_operation)
                 finish = self.session.complete_merge(self.owner, receipt)
                 self.assertEqual(finish.output_digest, output.digest())
                 self.assertIs(finish.binding, operation.approved.binding)
+                destination = self.exporter.destination()
                 with self.assertRaises(MergeError):
-                    self.session.offer_export(self.owner, self.exporter.destination())
+                    self.session.offer_export(self.owner, destination)
+                copied_finish = replace(finish)
                 with self.assertRaisesRegex(MergeError, "Confirmation"):
-                    self.session.finish_merge(self.owner, replace(finish), output)
+                    self.session.finish_merge(self.owner, copied_finish, output)
                 self.session.finish_merge(self.owner, finish, output)
                 self.assertIs(self.session.phase, Phase.READY)
 
@@ -298,8 +304,9 @@ class MergeCoreTest(unittest.TestCase):
                         self.session.complete_merge(self.owner, receipt)
                 self.assertIs(self.session.phase, Phase.RECOVERY)
                 self.assertIs(self.session.recovery(self.owner).output, output)
+                destination = self.exporter.destination()
                 with self.assertRaises(MergeError):
-                    self.session.offer_export(self.owner, self.exporter.destination())
+                    self.session.offer_export(self.owner, destination)
                 if outcome is MergeOutcome.CANCELLED:
                     self.session.discard(self.owner)
                 else:
@@ -324,8 +331,9 @@ class MergeCoreTest(unittest.TestCase):
             with self.subTest(source=source):
                 self.session = self.make_session()
                 operation = self.open_merge()
+                receipt = self.merge_receipt(operation, source)
                 with self.assertRaisesRegex(MergeError, "verified output"):
-                    self.session.complete_merge(self.owner, self.merge_receipt(operation, source))
+                    self.session.complete_merge(self.owner, receipt)
                 recovery = self.session.recovery(self.owner)
                 self.assertEqual(recovery.inputs, self.inputs)
                 self.assertIsNone(recovery.output)
@@ -353,8 +361,9 @@ class MergeCoreTest(unittest.TestCase):
         operation = self.open_merge()
         output = revision(b"merged")
         finish = self.session.complete_merge(self.owner, self.merge_receipt(operation, output))
+        replaced_output = revision(output.contents)
         with self.assertRaisesRegex(MergeError, "revision"):
-            self.session.finish_merge(self.owner, finish, revision(output.contents))
+            self.session.finish_merge(self.owner, finish, replaced_output)
         self.assertIs(self.session.phase, Phase.RECOVERY)
         self.assertIs(self.session.recovery(self.owner).output, output)
 
@@ -378,8 +387,9 @@ class MergeCoreTest(unittest.TestCase):
 
         self.ready_output()
         for leaf in (LongLeaf("x" * 256), "x" * 256, "é" * 128):
+            destination = self.exporter.destination(leaf)
             with self.assertRaisesRegex(MergeError, "trusted destination"):
-                self.session.offer_export(self.owner, self.exporter.destination(leaf))
+                self.session.offer_export(self.owner, destination)
 
     def test_export_is_create_only_and_conflict_keeps_review(self):
         output = self.ready_output()
@@ -390,8 +400,9 @@ class MergeCoreTest(unittest.TestCase):
         self.assertIs(self.session.phase, Phase.READY)
         self.assertIs(self.session.recovery(self.owner).output, output)
         next_operation = self.begin_export(output, "reviewed-new.txt")
+        stale_receipt = self.exporter.create(operation)
         with self.assertRaisesRegex(MergeError, "current export operation"):
-            self.session.complete_export(self.owner, self.exporter.create(operation))
+            self.session.complete_export(self.owner, stale_receipt)
         self.session.complete_export(self.owner, self.exporter.create(next_operation))
         self.assertIs(self.session.phase, Phase.CLOSED)
         with self.assertRaises(MergeError):
@@ -504,8 +515,9 @@ class MergeCoreTest(unittest.TestCase):
         self.assertIs(self.session.phase, Phase.FINISH_REQUIRED)
         with self.assertRaises(MergeError):
             self.session.complete_merge(self.owner, receipt)
+        destination = self.exporter.destination()
         with self.assertRaises(MergeError):
-            self.session.offer_export(self.owner, self.exporter.destination())
+            self.session.offer_export(self.owner, destination)
         self.session.finish_merge(self.owner, prompt, output)
         self.assertIs(self.session.phase, Phase.READY)
 

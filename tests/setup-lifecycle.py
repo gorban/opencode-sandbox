@@ -230,8 +230,10 @@ class UpdateTests(unittest.TestCase):
                             is_old=candidate.read_bytes()==b'old binary'
                             return invalid if is_old == (phase=='old') else 'opencode v2.3.0\n'
                         raise AssertionError(args)
-                    out=io.BytesIO()
-                    with self.assertRaises(ValueError): update.stage(self.snapshot(),'2.3.0',out,fake)
+                    out = io.BytesIO()
+                    snapshot = self.snapshot()
+                    with self.assertRaises(ValueError):
+                        update.stage(snapshot, '2.3.0', out, fake)
                     self.assertEqual(out.getvalue(),b''); self.assertEqual(self.live.read_bytes(),b'old binary')
     def test_stages_then_promotes_atomically_and_honours_pin(self):
         fake,calls=self.runner(version='opencode v2.3.0\n'); frame=self.stage(fake,'2.3.0')
@@ -242,11 +244,15 @@ class UpdateTests(unittest.TestCase):
         for exc in (RuntimeError('offline'),subprocess.TimeoutExpired('updater',1)):
             out=io.BytesIO()
             def fail(*args): raise exc
-            with self.assertRaises(type(exc)): update.stage(self.snapshot(),'',out,fail)
+            snapshot = self.snapshot()
+            with self.assertRaises(type(exc)):
+                update.stage(snapshot, '', out, fail)
             self.assertEqual(out.getvalue(),b''); self.assertEqual(self.live.read_bytes(),b'old binary')
     def test_wrong_pin_and_incomplete_or_corrupt_frame_do_not_promote(self):
         fake,_=self.runner(version='2.3.1'); out=io.BytesIO()
-        with self.assertRaises(ValueError): update.stage(self.snapshot(),'2.3.0',out,fake)
+        snapshot = self.snapshot()
+        with self.assertRaises(ValueError):
+            update.stage(snapshot, '2.3.0', out, fake)
         self.assertEqual(out.getvalue(),b''); self.assertEqual(self.live.read_bytes(),b'old binary')
         fake,_=self.runner(); frame=self.stage(fake)
         for bad in (frame[:-1],frame[:-len(update.END)]+b'bad'):
@@ -357,9 +363,9 @@ sys.exit(125)
         self.env={**os.environ,'HOME':self.tmp.name,'PATH':str(self.bin)+':/usr/bin:/bin',
                   'FAKE_DB':str(self.db),'FAKE_LOG':str(self.log)}
     def tearDown(self): self.tmp.cleanup()
-    def invoke(self, **extra):
+    def invoke(self, *, volume='oc-home', image='oc-agent', memory='4g', version='2.3.0', **extra):
         return subprocess.run([sys.executable,'-I',str(ROOT/'oc-opencode-supervisor.py'),str(self.state),
-                               's0:c1,c2','oc-home','oc-agent','4g','2.3.0'],
+                               's0:c1,c2',volume,image,memory,version],
                               env={**self.env,**extra},stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=15)
     def actions(self):
         import json
@@ -373,6 +379,26 @@ sys.exit(125)
                 self.assertIn('rm',[a[0] for a in acts[:i]])
                 self.assertEqual(sum(a[0]=='rm' for a in acts[:i]),1 if entry[-1]=='stage' else 2)
         self.assertEqual(list(self.db.iterdir()),[]); self.assertEqual(list(self.state.iterdir()),[])
+    def test_container_image_is_delimited_from_options(self):
+        result = self.invoke(memory='4g', version='2.3.0-rc.1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for args in self.actions():
+            if args[0] != 'create':
+                continue
+            phase = args[-1]
+            self.assertEqual(args[-5:], ['--', 'oc-agent', '-I', '/usr/local/bin/oc-opencode-update', phase])
+            self.assertEqual(args.count('--memory=4g'), 1)
+            if phase == 'stage':
+                self.assertEqual(args[args.index('-e') + 1], 'OC_OPENCODE_VERSION=2.3.0-rc.1')
+
+    def test_option_like_container_operands_are_rejected_before_podman(self):
+        for kind in ('image', 'volume'):
+            with self.subTest(kind=kind):
+                result = self.invoke(**{kind: '-fixture'})
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('invalid volume or image name', result.stderr)
+                self.assertFalse(self.log.exists())
+
     def test_failed_stage_never_starts_writer_and_cleans_receipts(self):
         p=self.invoke(FAKE_FAIL='stage'); self.assertEqual(p.returncode,1,p.stderr)
         self.assertNotIn('promote',[x[-1] for x in self.actions() if x[0]=='create'])
@@ -421,6 +447,20 @@ envargs=(); H=("$HOST")
 
 
 class AgentGuardTests(unittest.TestCase):
+    def test_forwarding_preserves_argument_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            exe = Path(temp) / 'opencode'
+            exe.write_text('#!/usr/bin/python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+            exe.chmod(0o755)
+            arguments = ['--title', 'two words', 'literal *', '--', '-fixture']
+            env = {**os.environ, 'PATH': temp + ':/usr/bin:/bin'}
+            result = subprocess.run(
+                [sys.executable, '-I', str(ROOT/'oc-opencode-run.py'), *arguments],
+                env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), arguments)
+
     def run_case(self, changed, rc):
         with tempfile.TemporaryDirectory() as td:
             d=Path(td); exe=d/'opencode'; counter=d/'count'

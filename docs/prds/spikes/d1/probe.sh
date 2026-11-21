@@ -46,8 +46,14 @@ hc()  { host curl -s -m 3 "$@"; }
 say() { printf '%s\n' "$*"; }
 die() { printf 'ABORT: %s\n' "$*" >&2; exit 2; }
 res() { # res PASS|FAIL|INFO name detail
-  case $1 in PASS) PASS=$((PASS+1));; FAIL) FAIL=$((FAIL+1));; esac
-  printf '%-5s %-52s %s\n' "$1" "$2" "$3"
+  local result_label=$1
+  case $result_label in
+    PASS) PASS=$((PASS+1));;
+    FAIL) FAIL=$((FAIL+1));;
+    INFO) ;;
+    *) die "unexpected result label: $result_label";;
+  esac
+  printf '%-5s %-52s %s\n' "$result_label" "$2" "$3"
 }
 
 # ---- poll worker control ----------------------------------------------------------------------------------
@@ -184,7 +190,14 @@ SCR=$(mktemp -d "$BASE_REAL/probe.XXXXXX") || die "mktemp failed"
 SCR_REAL=$(cd "$SCR" && pwd -P)
 [[ $SCR_REAL == "$BASE_REAL"/probe.?????? && ! -L $SCR_REAL ]] || die "unexpected scratch path $SCR_REAL"
 SCR=$SCR_REAL
-id_of() { local v; [[ -f $SCR/pod-$1.id ]] || return 1; read -r v <"$SCR/pod-$1.id"; [[ $v =~ ^[0-9a-f]{64}$ ]] || return 1; printf '%s' "$v"; }
+id_of() {
+  local probe_pod=$1 v
+  local receipt_path="$SCR/pod-${probe_pod}.id"
+  [[ -f $receipt_path ]] || return 1
+  read -r v <"$receipt_path"
+  [[ $v =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$v"
+}
 rmpod() { local id; id=$(id_of "$1") || return 1; pm pod rm -f -t 0 "$id" >/dev/null; }
 cleanup() {
   trap - EXIT
@@ -238,40 +251,53 @@ if life:
 else: s.serve_forever()'
 # srv POD LABEL BIND PORT [life]: starts a server in the pod and waits (10 s) until it prints "bind"; aborts if not
 srv() {
-  local name="$P-$1-s$4-${3//[:.]/_}" i
-  pm run -d --pod "$(id_of "$1")" --name "$name" --cidfile "$SCR/ctr-$name.id" python:3.12-alpine python -c "$SRV" "${@:2}" >/dev/null || die "cannot start server $name"
-  [[ -n ${5:-} ]] && return 0
+  local probe_pod=$1 bind_address=$3 listen_port=$4 lifetime=${5:-} i
+  local name="$P-$probe_pod-s$listen_port-${bind_address//[:.]/_}"
+  pm run -d --pod "$(id_of "$probe_pod")" --name "$name" --cidfile "$SCR/ctr-$name.id" python:3.12-alpine python -c "$SRV" "${@:2}" >/dev/null || die "cannot start server $name"
+  [[ -n $lifetime ]] && return 0
   for i in $(seq 1 40); do
     out=$(pm logs "$name" 2>&1); [[ $out == *bind* ]] && return 0; sleep 0.25
   done
   die "server $name never started listening: $out"
 }
 # inpod POD URL: fetch from a client container inside the pod (positive control that the server is up)
-inpod() { pm run --rm --pod "$(id_of "$1")" --name "$P-$1-cl$RANDOM" --cidfile "$SCR/ctr-client-$BASHPID-$RANDOM.id" python:3.12-alpine python -c "
+inpod() {
+  local probe_pod=$1 probe_url=$2
+  pm run --rm --pod "$(id_of "$probe_pod")" --name "$P-$probe_pod-cl$RANDOM" --cidfile "$SCR/ctr-client-$BASHPID-$RANDOM.id" python:3.12-alpine python -c '
+import sys
 import urllib.request as u
-try: print(u.urlopen('$2',timeout=3).read().decode().strip())
-except Exception as e: print('ERR',e)" 2>&1 | tail -1; }
+try: print(u.urlopen(sys.argv[1],timeout=3).read().decode().strip())
+except Exception as e: print("ERR",e)' "$probe_url" 2>&1 | tail -1
+}
 
 # ---- host-side checks ----------------------------------------------------------------------------------
 want() { # want NAME URL SUBSTR: answers (retry up to 6 s)
-  local out i
+  local check_name=$1 probe_url=$2 expected_text=$3 out i
   for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    out=$(hc "$2") && [[ $out == *"$3"* ]] && { res PASS "$1" "$2 -> $out"; return 0; }
+    out=$(hc "$probe_url") && [[ $out == *"$expected_text"* ]] && { res PASS "$check_name" "$probe_url -> $out"; return 0; }
     sleep 0.5
   done
-  res FAIL "$1" "$2 -> '${out:-no answer}' (wanted '$3')"
+  res FAIL "$check_name" "$probe_url -> '${out:-no answer}' (wanted '$expected_text')"
 }
 nope() { # nope NAME URL CTRL_URL [CTRL_SUBSTR]: URL gives no answer while CTRL_URL (a server that is up) does
-  local out ctl
-  ctl=$(hc "$3")
-  [[ -n $ctl ]] || { res FAIL "$1" "positive control $3 gave no answer; result not meaningful"; return 1; }
-  out=$(hc "$2")
-  [[ -n $out ]] && { res FAIL "$1" "$2 -> $out (wanted no answer; control $3 ok)"; return 1; }
-  res PASS "$1" "$2 -> no answer (control $3 -> ${ctl%% *})"
+  local check_name=$1 probe_url=$2 control_url=$3 out ctl
+  ctl=$(hc "$control_url")
+  [[ -n $ctl ]] || { res FAIL "$check_name" "positive control $control_url gave no answer; result not meaningful"; return 1; }
+  out=$(hc "$probe_url")
+  [[ -n $out ]] && { res FAIL "$check_name" "$probe_url -> $out (wanted no answer; control $control_url ok)"; return 1; }
+  res PASS "$check_name" "$probe_url -> no answer (control $control_url -> ${ctl%% *})"
 }
-info() { local out; out=$(hc "$2"); res INFO "$1" "$2 -> ${out:-no answer}"; }
+info() {
+  local check_name=$1 probe_url=$2 out
+  out=$(hc "$probe_url")
+  res INFO "$check_name" "$probe_url -> ${out:-no answer}"
+}
 # up POD SUFFIX NAME: the server printed "bind" (it is listening inside the pod)
-up() { local out; out=$(pm logs "$P-$1-s$2" 2>&1); [[ $out == *bind* ]] && res PASS "$3" "server s$2 is listening in pod $1" || res FAIL "$3" "server s$2 did not start"; }
+up() {
+  local probe_pod=$1 server_suffix=$2 check_name=$3 out
+  out=$(pm logs "$P-$probe_pod-s$server_suffix" 2>&1)
+  [[ $out == *bind* ]] && res PASS "$check_name" "server s$server_suffix is listening in pod $probe_pod" || res FAIL "$check_name" "server s$server_suffix did not start"
+}
 
 # Require valid samples before, during, and after replacement; every positive control must
 # return the expected server body. Finite sampling observes behavior, not absence of all leaks.
@@ -291,7 +317,10 @@ spec()  { echo "$1/$(for p in $SENS; do printf '~%s,' "$p"; done)auto"; }
 # spec_range ADDR: the variant with an explicit 1024-65535 range (forwards ephemeral ports too, but see hostconf)
 spec_range() { echo "$1/1024-65535,$(for p in $SENS; do printf '~%s,' "$p"; done)auto"; }
 conf()  { # conf POD ADDR: containers.conf override with the pasta options; prints the path
-  printf '[network]\npasta_options = ["--host-lo-to-ns-lo", "-t", "%s"]\n' "$(spec "$2")" >"$SCR/$1.conf"; echo "$SCR/$1.conf"; }
+  local probe_pod=$1 bind_address=$2
+  printf '[network]\npasta_options = ["--host-lo-to-ns-lo", "-t", "%s"]\n' "$(spec "$bind_address")" >"$SCR/$probe_pod.conf"
+  echo "$SCR/$probe_pod.conf"
+}
 pmx()   { # pmx POD podman-args: podman with the pod's override file (as oc-sandbox must do for EVERY start)
   local pod=$1; shift; host env CONTAINERS_CONF_OVERRIDE="$SCR/$pod.conf" podman "$@"; }
 # mkpod MODE NAME ADDR [pod-create args]
@@ -308,12 +337,25 @@ mkpod() {
       pcreate "$name" pm --network "pasta:--host-lo-to-ns-lo,-t,$addr/auto" \
         --sysctl net.ipv4.ip_unprivileged_port_start=0 "$@" >/dev/null || return 1
       pm pod start "$(id_of "$name")" >/dev/null || return 1 ;;
+    *)
+      echo "unknown pod mode: $mode" >&2
+      return 1 ;;
   esac
-  case $mode in full|pasta) pasta_verify "$name" "$addr" || { echo "pasta args wrong for $name: $(pasta_args "$name")" >&2; return 1; } ;; esac
-  case $mode in full|nft) nft_apply "$name" "$SENS" || { echo "nft ruleset wrong for $name" >&2; return 1; } ;; esac
+  if [[ $mode == full || $mode == pasta ]]; then
+    pasta_verify "$name" "$addr" || { echo "pasta args wrong for $name: $(pasta_args "$name")" >&2; return 1; }
+  fi
+  if [[ $mode == full || $mode == nft ]]; then
+    nft_apply "$name" "$SENS" || { echo "nft ruleset wrong for $name" >&2; return 1; }
+  fi
 }
-infra_id() { pm pod inspect --format '{{.InfraContainerID}}' "$(id_of "$1")"; }
-infra_pid() { pm inspect --format '{{.State.Pid}}' "$(infra_id "$1")"; }
+infra_id() {
+  local probe_pod=$1
+  pm pod inspect --format '{{.InfraContainerID}}' "$(id_of "$probe_pod")"
+}
+infra_pid() {
+  local probe_pod=$1
+  pm inspect --format '{{.State.Pid}}' "$(infra_id "$probe_pod")"
+}
 # pasta_args POD: the pasta command line serving this pod (found through the pod's netns path), up to --dns-forward
 pasta_args() {
   local key; key=$(pm inspect --format '{{.NetworkSettings.SandboxKey}}' "$(infra_id "$1")")
@@ -338,23 +380,38 @@ table ip oc_d1 {
 }
 EOT
 }
-nsx()       { host podman unshare nsenter -t "$(infra_pid "$1")" -n "${@:2}"; }
+nsx()       {
+  local probe_pod=$1
+  host podman unshare nsenter -t "$(infra_pid "$probe_pod")" -n "${@:2}"
+}
 # (`| cat`: nft prints nothing when its stdout is the pipe distrobox-host-exec hands it, so list through a second pipe)
-nft_list()  { nsx "$1" bash -o pipefail -c 'nft -s list ruleset 2>&1 | cat'; }
+nft_list()  {
+  local probe_pod=$1
+  nsx "$probe_pod" bash -o pipefail -c 'nft -s list ruleset 2>&1 | cat'
+}
 nft_expect(){ # nft_expect "PORTS" [EXTRA-MATCH]: what nft prints for the same rules in a throwaway netns
-  host podman unshare unshare -n sh -c 'printf "%s\n" "$1" | nft -f - && nft -s list ruleset 2>&1 | cat' _ "$(rules "$1" x "${2:-}")"; }
+  local excluded_ports=$1 extra_match=${2:-}
+  host podman unshare unshare -n sh -c 'printf "%s\n" "$1" | nft -f - && nft -s list ruleset 2>&1 | cat' _ "$(rules "$excluded_ports" x "$extra_match")"
+}
 nft_verify(){ # nft_verify POD "PORTS" [EXTRA]: exact match of the applied ruleset, else non-zero
-  local want got; want=$(nft_expect "$2" "${3:-}") || return 1; got=$(nft_list "$1") || return 1
-  [[ -n $want && $got == "$want" ]]; }
+  local probe_pod=$1 excluded_ports=$2 extra_match=${3:-} want got
+  want=$(nft_expect "$excluded_ports" "$extra_match") || return 1
+  got=$(nft_list "$probe_pod") || return 1
+  [[ -n $want && $got == "$want" ]]
+}
 # nft_apply POD "PORTS" [EXTRA]: apply in one transaction, then READ BACK and compare; non-zero if it is not what was asked for
 nft_apply() {
-  nsx "$1" sh -c 'printf "%s\n" "$1" | nft -f -' _ "$(rules "$2" x "${3:-}")" || return 1
-  nft_verify "$1" "$2" "${3:-}"; }
+  local probe_pod=$1 excluded_ports=$2 extra_match=${3:-}
+  nsx "$probe_pod" sh -c 'printf "%s\n" "$1" | nft -f -' _ "$(rules "$excluded_ports" x "$extra_match")" || return 1
+  nft_verify "$probe_pod" "$excluded_ports" "$extra_match"
+}
 pasta_verify() { # pasta_verify POD ADDR: pasta was started with exactly the expected -t spec
-  [[ $(pasta_args "$1") == *"--host-lo-to-ns-lo -t $(spec "$2")"* ]]; }
+  local probe_pod=$1 bind_address=$2
+  [[ $(pasta_args "$probe_pod") == *"--host-lo-to-ns-lo -t $(spec "$bind_address")"* ]]
+}
 
 sections=${*:-neg matrix main atomic restart dyn}
-has() { [[ " $sections " == *" $1 "* ]]; }
+has() { local section=$1; [[ " $sections " == *" $section "* ]]; }
 
 # ---- neg: the earlier failures, and what does not work ---------------------------------------------------
 if has neg; then
@@ -406,6 +463,7 @@ if has matrix; then
       pasta) exp="sensitive closed, 4000 open, 3000 closed (no redirect)" ;;
       nft)   exp="sensitive closed, 4000 and 3000 open" ;;
       bare)  exp="FAIL-OPEN: 5432 and 9223 open, 9222 (127.0.0.1 only) closed" ;;
+      *) die "unknown matrix mode: $mode" ;;
     esac
     res INFO "matrix $mode: $exp" "$r"
     # assertions; every "closed" claim needs the control (4000 on 0.0.0.0, forwarded in every mode) to answer

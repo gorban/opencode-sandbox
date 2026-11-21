@@ -7,7 +7,7 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/oc-pg-unit.XXXXXX")
 trap 'rm -rf "$T"' EXIT
 pass=0 fail=0
 check() { local label=$1; shift; if "$@"; then echo "  ok    $label"; ((pass+=1)); else echo "  FAIL  $label"; ((fail+=1)); fi; }
-fn() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
+fn() { local requested_function=$1; sed -n "/^$requested_function() {/,/^}/p" "$SCRIPT"; }
 cat >"$T/parse.sh" <<EOF2
 set -u -o pipefail
 H=(); PG=\$1; shift; PORT_ARGS=("\$@"); PORTS=(); PORTS_SET=0
