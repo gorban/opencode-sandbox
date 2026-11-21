@@ -146,7 +146,7 @@ def scanner_properties(revision, cloud):
             f'sonar.projectKey={cloud.PROJECT}', 'project.settings=/inputs/sonar-project.properties',
             f'sonar.scm.revision={revision.head}', 'sonar.scm.provider=git',
             'sonar.python.coverage.reportPaths=/inputs/coverage.xml',
-            'sonar.working.directory=/tmp/scanner', 'sonar.qualitygate.wait=true',
+            'sonar.working.directory=/scan/scanner', 'sonar.qualitygate.wait=true',
             'sonar.qualitygate.timeout=120', 'sonar.scanner.skipJreProvisioning=true']
     if revision.number is not None:
         args += [f'sonar.pullrequest.key={revision.number}', f'sonar.pullrequest.branch={revision.branch}',

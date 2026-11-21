@@ -19,21 +19,21 @@ PODMAN = '/usr/bin/podman'
 SCAN_ENTRY = r'''
 IFS= read -r token
 status=0
-SONAR_TOKEN="$token" /opt/sonar-scanner/bin/sonar-scanner "$@" >/tmp/scan.log 2>&1 || status=$?
+SONAR_TOKEN="$token" /opt/sonar-scanner/bin/sonar-scanner "$@" >/scan/scan.log 2>&1 || status=$?
 unset token
-if ! grep -q 'Parsing .*coverage\.xml' /tmp/scan.log; then
-    if grep -qiE 'not authorized|401|403|authentication|token is invalid' /tmp/scan.log; then exit 21; fi
+if ! grep -q 'Parsing .*coverage\.xml' /scan/scan.log; then
+    if grep -qiE 'not authorized|401|403|authentication|token is invalid' /scan/scan.log; then exit 21; fi
     exit 22
 fi
-if [ "$status" = 0 ] && grep -qF 'QUALITY GATE STATUS: PASSED' /tmp/scan.log; then
+if [ "$status" = 0 ] && grep -qF 'QUALITY GATE STATUS: PASSED' /scan/scan.log; then
     gate=OK
-elif [ "$status" != 0 ] && grep -qF 'QUALITY GATE STATUS: FAILED' /tmp/scan.log; then
+elif [ "$status" != 0 ] && grep -qF 'QUALITY GATE STATUS: FAILED' /scan/scan.log; then
     gate=ERROR
 else
     exit 23
 fi
 printf '%s\n' "$gate"
-sed -n 's/^ceTaskId=//p' /tmp/scanner/report-task.txt
+sed -n 's/^ceTaskId=//p' /scan/scanner/report-task.txt
 '''
 
 
@@ -127,7 +127,7 @@ def private_store(root):
         store.cleanup()
 
 
-def mounts(source, inputs, scratch='/tmp'):
+def mounts(source, inputs, scratch):
     return ['-v', f'{source}:/work:ro,Z', '-v', f'{inputs}:/inputs:ro,Z', '-w', '/work',
             f'--env=HOME={scratch}/home', f'--env=TMPDIR={scratch}']
 
@@ -161,11 +161,12 @@ cat /measure/coverage.xml
 
 
 def scanner(store, source, inputs, properties, token):
-    entry = ['-ec', 'mkdir /tmp/home\n' + SCAN_ENTRY, 'scan', *('-D' + item for item in properties)]
+    entry = ['-ec', 'mkdir /scan/home /scan/scanner-home\n' + SCAN_ENTRY,
+             'scan', *('-D' + item for item in properties)]
     options = ['--network=pasta:--no-map-gw', '--cpus=4', '--pids-limit=200', '--memory=4g',
-               '--tmpfs=/tmp:rw,exec,nosuid,nodev,size=2g,mode=1777',
-               '--env=JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=4', '--env=SONAR_USER_HOME=/tmp/scanner-home',
-               *mounts(source, inputs)]
+               '--tmpfs=/scan:rw,exec,nosuid,nodev,size=2g,mode=0700',
+               '--env=JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=4 -Djava.io.tmpdir=/scan',
+               '--env=SONAR_USER_HOME=/scan/scanner-home', *mounts(source, inputs, '/scan')]
     status, output, _ = store.run(SCANNER, options, entry, limit=8192, timeout=480, payload=token + b'\n')
     if status:
         messages = {21: 'Sonar authentication or permission failed',

@@ -331,6 +331,16 @@ class SandboxTest(unittest.TestCase):
         self.assertEqual(options['payload'], secret + b'\n')
         self.assertNotIn(secret.decode(), str(args))
         self.assertIn('/inputs:/inputs:ro,Z', args[1])
+        self.assertIn('--tmpfs=/scan:rw,exec,nosuid,nodev,size=2g,mode=0700', args[1])
+        self.assertIn('--env=HOME=/scan/home', args[1])
+        self.assertIn('--env=TMPDIR=/scan', args[1])
+        self.assertIn('--env=SONAR_USER_HOME=/scan/scanner-home', args[1])
+        self.assertIn('--env=JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=4 -Djava.io.tmpdir=/scan', args[1])
+        self.assertIn('/scan/scanner/report-task.txt', args[2][1])
+
+    def test_scanner_working_directory_matches_the_task_receipt_path(self):
+        props = publish.scanner_properties(REVISION, cloud)
+        self.assertIn('sonar.working.directory=/scan/scanner', props)
 
 
 class BaselineTest(unittest.TestCase):
