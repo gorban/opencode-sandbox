@@ -17,7 +17,9 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = re.compile(r'v?[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?')
+VERSION = re.compile(r'v?\d+(?:\.\d+){2}(?:[-+][0-9A-Za-z.-]+)?', re.ASCII)
+CHECKSUM = re.compile(r'[0-9a-f]{64}')
+INSTALL_DIRNAME = '.opencode'
 SOURCE_MAGIC = b'OC-OPENCODE-SOURCE-1\n'
 MAGIC = b'OC-OPENCODE-UPDATE-1\n'
 END = b'\nOC-OPENCODE-UPDATE-END\n'
@@ -28,7 +30,7 @@ def run(args, env, timeout):
     proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             env=env, start_new_session=True)
     try:
-        out, err = proc.communicate(timeout=timeout)
+        out, _ = proc.communicate(timeout=timeout)
     except BaseException:
         try: os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError: pass
@@ -41,7 +43,7 @@ def run(args, env, timeout):
 
 def reported_version(output):
     """Accept one complete version line, optionally branded by OpenCode."""
-    match = re.fullmatch(rf'(?:opencode )?({VERSION.pattern})\n?', output)
+    match = re.fullmatch(rf'(?:opencode )?({VERSION.pattern})\n?', output, flags=VERSION.flags)
     if not match: raise ValueError('invalid OpenCode version output')
     return match.group(1)
 
@@ -57,7 +59,7 @@ def open_install_dir(home, create):
     """Open each volume directory without following symlinks."""
     opened = [os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)]
     try:
-        for part in ('.opencode', 'bin'):
+        for part in (INSTALL_DIRNAME, 'bin'):
             if create:
                 try: os.mkdir(part, 0o700, dir_fd=opened[-1])
                 except FileExistsError: pass
@@ -99,7 +101,7 @@ def read_snapshot(stream):
     header = json.loads(raw)
     if (set(header) != {'sha256', 'size'} or type(header['size']) is not int or
         not 0 <= header['size'] <= MAX_BINARY or
-        not (header['sha256'] is None or re.fullmatch(r'[0-9a-f]{64}', header['sha256'])) or
+        not (header['sha256'] is None or CHECKSUM.fullmatch(header['sha256'])) or
         ((header['sha256'] is None) != (header['size'] == 0))):
         raise ValueError('invalid source metadata')
     old = stream.read(header['size'])
@@ -115,7 +117,7 @@ def stage(stream, requested, output, runner=run):
     old = read_snapshot(stream)
     oldhash = None if old is None else hashlib.sha256(old).hexdigest()
     with tempfile.TemporaryDirectory(prefix='oc-opencode-update-') as tmp:
-        base = Path(tmp); stagehome = base/'home'; stagebin = stagehome/'.opencode'/'bin'
+        base = Path(tmp); stagehome = base/'home'; stagebin = stagehome/INSTALL_DIRNAME/'bin'
         stagebin.mkdir(parents=True); candidate = stagebin/'opencode'
         env = dict(os.environ)
         env.update(HOME=str(stagehome), PATH=f'{stagebin}:/usr/bin:/bin', CI='true',
@@ -171,8 +173,8 @@ def promote(home, stream):
     if len(raw) > 1024 or not raw.endswith(b'\n'): raise ValueError('invalid update header')
     header = json.loads(raw)
     if (set(header) != {'old', 'new', 'size', 'version'} or
-        not (header['old'] is None or re.fullmatch(r'[0-9a-f]{64}', header['old'])) or
-        not re.fullmatch(r'[0-9a-f]{64}', header['new']) or
+        not (header['old'] is None or CHECKSUM.fullmatch(header['old'])) or
+        not CHECKSUM.fullmatch(header['new']) or
         type(header['size']) is not int or not 0 < header['size'] <= MAX_BINARY or
         not VERSION.fullmatch(header['version'])):
         raise ValueError('invalid update metadata')
@@ -198,7 +200,7 @@ def promote(home, stream):
         current_hash = None if current is None else hashlib.sha256(current).hexdigest()
         if current_hash != header['old'] or before != named_identity():
             raise ValueError('OpenCode changed during update; keeping current copy')
-        for idx, component in enumerate(('.opencode', 'bin')):
+        for idx, component in enumerate((INSTALL_DIRNAME, 'bin')):
             named = os.stat(component, dir_fd=opened[idx], follow_symlinks=False)
             held = os.fstat(opened[idx+1])
             if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):

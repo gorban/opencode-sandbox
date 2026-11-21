@@ -34,7 +34,7 @@ def guard_holds_lock(pid, opened):
                                 continue
                             if int(fields[6].rsplit(':', 1)[1]) == opened.st_ino:
                                 return True
-                except (OSError, ValueError, IndexError, UnicodeError):
+                except (OSError, ValueError, IndexError):
                     continue
     except OSError:
         pass
@@ -77,7 +77,7 @@ def main():
                         holder = None
                         if name == 'setup':
                             text = os.pread(fd, 256, 0).decode('ascii', 'replace').strip()
-                            match = re.fullmatch(r'pid=([0-9]+) instance=([a-z0-9-]+) guard=([0-9]+)', text)
+                            match = re.fullmatch(r'pid=(\d+) instance=([a-z0-9-]+) guard=(\d+)', text, flags=re.ASCII)
                             if match:
                                 if guard_holds_lock(int(match[3]), os.fstat(fd)):
                                     holder = f'pid={match[1]} instance={match[2]}'
