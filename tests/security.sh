@@ -18,11 +18,12 @@ ok()   { pass=$((pass + 1)); printf '  ok    %s\n' "$*"; }
 bad()  { fail=$((fail + 1)); printf '  FAIL  %s\n' "$*"; }
 check() {  # description, command... ; a leading '!' negates
   local d=$1 neg=0; shift
-  [[ $1 == '!' ]] && { neg=1; shift; }
+  local first_test_arg=$1
+  [[ $first_test_arg == '!' ]] && { neg=1; shift; }
   if "$@"; then r=0; else r=1; fi
   if (( r == neg )); then ok "$d"; else bad "$d"; fi
 }
-fn()   { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }          # extract one function from the script
+fn()   { local requested_function=$1; sed -n "/^$requested_function() {/,/^}/p" "$SCRIPT"; }  # extract one function
 SECRET=TOP-SECRET-HOST-DATA
 
 # ================================================================================================
@@ -55,7 +56,8 @@ check "export prefix and spaces around ="  [ "${got[1]:-}" = app_owner ]
 check "quoted value kept literally"        [ "${got[2]:-}" = "p@ss \$(touch $T/pwned1) \`touch $T/pwned2\` ; | & \" #x" ]
 check "unquoted # without space kept"      [ "${got[3]:-}" = 'app#dev' ]
 check "final line without newline"         [ "${got[4]:-}" = "/x y" ]
-check "no shell expansion of values"       [ ! -e "$T/pwned1" ] && [ ! -e "$T/pwned2" ]
+check "dollar command substitution in values is not evaluated" [ ! -e "$T/pwned1" ]
+check "backtick command substitution in values is not evaluated" [ ! -e "$T/pwned2" ]
 check "password not in child environment"  ! grep -q 'p@ss' "$T/child.env"
 check "password not visible to child bash" [ ! -s "$T/child.pw" ]
 # environment wins, and is un-exported as well
@@ -182,7 +184,7 @@ chmod +x "$B/launch" "$B/tool"
 export OC_SB=$SB OC_BRIDGE_STAGE=$T/stage OC_CODE_BIN=$B/tool OC_BCOMPARE_BIN=$B/tool OC_BRIDGE_LAUNCH=$B/launch
 req() { local id=$1; shift; printf '%s\n' "$@" > "$SB/.bridge/requests/$id.req"; }
 bridge() { timeout 20 python3 -I "$BRIDGE" 2>>"$T/bridge.log"; }
-victim_ok() { [ "$(cat "$V/secret" "$V/requests/precious" "$V/f")" = "$SECRET"$'\n'"$SECRET"$'\n'"$SECRET" ]; }
+victim_ok() { [[ "$(cat "$V/secret" "$V/requests/precious" "$V/f")" == "$SECRET"$'\n'"$SECRET"$'\n'"$SECRET" ]]; }
 reset_tool() { rm -f "$T/tool.args" "$T/tool.seen"; }
 
 reset_tool; req 1 code /sandbox/construct/a.txt; FAKE_EDIT=edited bridge
@@ -204,13 +206,16 @@ reset_tool; mkfifo "$SB/.bridge/requests/fifo.req"; ln -s ../../../victim/secret
 mkdir "$SB/.bridge/requests/dir.req"; ln -s ../../../victim "$SB/.bridge/requests/linkdir"
 bridge; rc=$?
 check "FIFO / symlinked requests do not hang" [ $rc -ne 124 ]
-check "FIFO / symlinked requests not followed" [ ! -e "$T/tool.args" ] && victim_ok
-check "drain removed links, not their targets" [ -z "$(ls -A "$SB/.bridge/requests")" ] && victim_ok
+check "FIFO / symlinked requests not passed to the tool" [ ! -e "$T/tool.args" ]
+check "FIFO / symlinked requests leave host targets intact" victim_ok
+check "drain removed all request entries" [ -z "$(ls -A "$SB/.bridge/requests")" ]
+check "drain leaves request targets intact" victim_ok
 
 mv "$SB/.bridge" "$T/bridge.real"; ln -s ../victim "$SB/.bridge"     # $SB/.bridge -> $V (has requests/)
 bridge
 check ".bridge symlink: target directory untouched" victim_ok
-check ".bridge symlink: link removed"       [ ! -L "$SB/.bridge" ] && [ ! -e "$SB/.bridge" ]
+check ".bridge symlink: link removed"       [ ! -L "$SB/.bridge" ]
+check ".bridge symlink: path is absent"      [ ! -e "$SB/.bridge" ]
 mv "$T/bridge.real" "$SB/.bridge"; rmdir "$SB/.bridge/requests"; ln -s ../../victim/requests "$SB/.bridge/requests"
 bridge
 check "requests symlink: target untouched"  victim_ok
@@ -220,7 +225,8 @@ mkdir "$SB/.bridge/requests"
 # agent swaps the opened file for a symlink to a host file while the editor is open
 reset_tool; echo orig > "$SB/construct/b.txt"; req 4 code /sandbox/construct/b.txt
 FAKE_AGENT="rm $SB/construct/b.txt; ln -s ../../victim/secret $SB/construct/b.txt" FAKE_EDIT=mine bridge
-check "write-back never follows a swapped-in symlink" victim_ok && [ -L "$SB/construct/b.txt" ]
+check "swapped-in symlink leaves the host target intact" victim_ok
+check "write-back preserves the sandbox symlink entry" [ -L "$SB/construct/b.txt" ]
 check "conflicting edit saved as .host-edit"  [ "$(cat "$SB/construct/b.txt.host-edit" 2>/dev/null)" = mine ]
 
 echo original > "$SB/construct/saved.txt"; req 5 code /sandbox/construct/saved.txt
@@ -233,11 +239,11 @@ check "staged save symlink refused before write-back" grep -qx replaced "$SB/con
 
 # Session fixtures use the same metadata as the queue and a fake editor in scratch.
 make_session() {
-  local session=$T/stage/$1
+  local session=$T/stage/$1 fixture_tool=$2 manifest_padding=$3
   mkdir -m 700 "$session"
   mkdir -m 700 -p "$session/files/construct"
   printf 'fixture\n' > "$session/files/construct/session.txt"
-  python3 -I - "$session" "$2" "$3" <<'PY'
+  python3 -I - "$session" "$fixture_tool" "$manifest_padding" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -252,9 +258,13 @@ manifest = json.dumps({"tool": sys.argv[2], "entries": [entry]})
 (session / "manifest.json").write_text(manifest + " " * int(sys.argv[3]), encoding="utf-8")
 PY
 }
-run_fixture_session() { timeout 20 python3 -I "$BRIDGE" session "$T/stage/$1" 2>>"$T/bridge.log"; }
+run_fixture_session() {
+  local fixture_name=$1
+  timeout 20 python3 -I "$BRIDGE" session "$T/stage/$fixture_name" 2>>"$T/bridge.log"
+}
 session_refused() {
-  run_fixture_session "$1"
+  local fixture_name=$1
+  run_fixture_session "$fixture_name"
   [[ $? -eq 2 && ! -e "$T/tool.args" ]]
 }
 
@@ -555,8 +565,13 @@ check "refuses empty -i (no global -d)"    argfail "-i needs an instance name" -
 echo "host state outside the sandbox (stubbed)"
 # The agent controls everything under $SB; host state (the image ledger above all) must not be there.
 pathrun() {  # VAR=value... -- script-args...: stderr+rc of a stubbed run with these variables
-  local envs=() rc=0 out
-  while [[ $1 != -- ]]; do envs+=("$1"); shift; done; shift
+  local envs=() rc=0 out next_setting=$1
+  while [[ $next_setting != -- ]]; do
+    envs+=("$next_setting")
+    shift
+    next_setting=$1
+  done
+  shift
   : > "$T/stub.log"
   out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "${envs[@]}" \
         "$SCRIPT" "$@" 2>&1 </dev/null) || rc=$?
@@ -579,21 +594,22 @@ out=$(pathrun XDG_DATA_HOME="$DSB/st" STUB_IDS="oc-agent=$A" -- -d -a -y)
 check "state dir inside the sandbox: refused"         grep -qx 'rc=2' <<<"$out"
 check "...before any podman call (forged ledger unused)" [ ! -s "$T/stub.log" ]
 check "...planted ledger symlink target untouched"   grep -qx "$SECRET" "$T/victim-file"
-check "state dir reaching the sandbox via a symlink: refused" grep -q 'leads into the sandbox directory' \
+sandbox_path_refusal='leads into the sandbox directory'
+check "state dir reaching the sandbox via a symlink: refused" grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_DATA_HOME="$T/dlink/st" -- -l)"
-check "config dir inside the sandbox: refused"        grep -q 'leads into the sandbox directory' \
+check "config dir inside the sandbox: refused"        grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_CONFIG_HOME="$DSB/cfg" -- -l)"
 # Reverse: an agent-owned symlink that points OUT of the sandbox when checked (and can be swapped
 # later); a host symlink into the sandbox that hops back out; a '..' walk through the sandbox.
 mkdir -p "$T/outside" "$T/outside2"; ln -sfn "$T/outside" "$DSB/xdg"; ln -sfn "$T/outside2" "$DSB/hop"
 ln -sfn "$DSB/hop" "$T/hostlink"
-check "agent symlink pointing outside: refused"       grep -q 'leads into the sandbox directory' \
+check "agent symlink pointing outside: refused"       grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_DATA_HOME="$DSB/xdg" -- -l)"
-check "config via agent symlink pointing outside: refused" grep -q 'leads into the sandbox directory' \
+check "config via agent symlink pointing outside: refused" grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_CONFIG_HOME="$DSB/xdg" -- -l)"
-check "host link -> sandbox link -> outside: refused" grep -q 'leads into the sandbox directory' \
+check "host link -> sandbox link -> outside: refused" grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_DATA_HOME="$T/hostlink" -- -l)"
-check "'..' through the sandbox: refused"             grep -q 'leads into the sandbox directory' \
+check "'..' through the sandbox: refused"             grep -q "$sandbox_path_refusal" \
   <<<"$(pathrun XDG_DATA_HOME="$DSB/../.local/share" -- -l)"
 check "relative XDG_DATA_HOME: refused"               grep -qx 'rc=2' <<<"$(pathrun XDG_DATA_HOME=rel/share -- -l)"
 ln -sfn "$T/outside" "$T/hostonly"
@@ -730,12 +746,16 @@ $(fn relabel_shared)
 "\$@"
 EOF
     lib() { bash "$T/lib.sh" "$@"; }
-    inbox() { "${H[@]}" podman run --rm --network=none --security-opt=label=disable -v "$T/isb":/sandbox -w /sandbox \
-      --entrypoint sh "$TEST_AGENT_IMG" -c "$1"; }
+    inbox() {
+      local shell_code=$1
+      "${H[@]}" podman run --rm --network=none --security-opt=label=disable -v "$T/isb":/sandbox -w /sandbox \
+        --entrypoint sh "$TEST_AGENT_IMG" -c "$shell_code"
+    }
     mk() { rm -rf "$T/isb" "$T/iv"; mkdir -p "$T/isb" "$T/iv"; echo "$SECRET" > "$T/iv/keep"; }
     mk; lib "$T/isb" init_bridge_spool >/dev/null 2>&1
     lib "$T/isb" init_sandbox_tree construct >/dev/null 2>&1
-    check "working directory and bridge spool created" [ -d "$T/isb/construct" ] && [ -d "$T/isb/.bridge/requests" ]
+    check "working directory created" [ -d "$T/isb/construct" ]
+    check "bridge request spool created" [ -d "$T/isb/.bridge/requests" ]
     for target in "$T/iv" ../iv; do
       mk; ln -s "$target" "$T/isb/construct"; lib "$T/isb" init_sandbox_tree construct/sub >/dev/null 2>&1
       check "cwd construct -> $target: nothing written on the host" [ "$(ls -A "$T/iv")" = keep ]
@@ -753,7 +773,8 @@ EOF
     check "worktree link is relative"         grep -q '^gitdir: \.\./\.\./repo/' "$T/isb/wt/x/.git"
     check "agent-planted git hook not run"    [ ! -e "$T/isb/HOOK-RAN" ]
     mk; ln -s "$T/iv" "$T/isb/repo"; lib "$T/isb" init_sandbox_tree wt/y repo b >/dev/null 2>&1
-    check "-W repo symlinked to the host: refused, host untouched" [ "$(ls -A "$T/iv")" = keep ] && [ ! -e "$T/isb/wt/y/.git" ]
+    check "-W repo symlinked to the host leaves the host target intact" [ "$(ls -A "$T/iv")" = keep ]
+    check "-W repo symlinked to the host creates no worktree git link" [ ! -e "$T/isb/wt/y/.git" ]
 
     mk; echo data > "$T/isb/f"; ln -s "$T/iv/keep" "$T/isb/link-to-host"; ln -s ../iv "$T/isb/rel-link"
     before=$(stat -c %C "$T/iv/keep")
@@ -797,8 +818,8 @@ REBUILD=1 PULL=() BUILD=$T/ib
 "\$@"
 EOF
   img() { bash "$T/img.sh" "$@" 2>&1 >/dev/null; }
-  iid() { "${H[@]}" podman image inspect --format '{{.Id}}' "$1" 2>/dev/null; }
-  has() { "${H[@]}" podman image exists "$1"; }
+  iid() { local image_reference=$1; "${H[@]}" podman image inspect --format '{{.Id}}' "$image_reference" 2>/dev/null; }
+  has() { local image_reference=$1; "${H[@]}" podman image exists "$image_reference"; }
   pbuild() { "${H[@]}" podman build -q "$@" -f "$T/ib/Containerfile.t" "$T/ib"; }
   # an unrelated image on our tag, even one carrying our labels
   foreign=$(pbuild --label oc.hash=x --label "$L=agent" -t "$IT")
