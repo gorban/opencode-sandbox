@@ -12,6 +12,51 @@ def section(start, end):
 def run(code):
     return subprocess.run(['bash'], input=code, text=True, capture_output=True, check=True).stdout
 
+results = section('die() {', '\n# ---- poll worker control')
+labels = results + '''
+PASS=0 FAIL=0
+res PASS good detail
+res INFO info detail
+res FAIL bad detail
+echo "after $PASS $FAIL"
+'''
+assert run(labels).splitlines()[-1] == 'after 1 1'
+unknown_label = subprocess.run(
+    ['bash'], input=labels + 'res OTHER wrong detail\n', text=True, capture_output=True, timeout=5,
+)
+assert unknown_label.returncode == 2 and 'unexpected result label' in unknown_label.stderr
+assert unknown_label.stdout == run(labels)
+
+pod_mode = section('mkpod() {', 'infra_id() {')
+mode_fixture = pod_mode + '''
+set -u
+exec 3>&1
+SENS='fixture'
+conf() { echo 'conf' >&3; }
+pcreate() { echo "create $2" >&3; }
+id_of() { echo 'pod-id'; }
+pm() { echo 'start pm' >&3; }
+pmx() { echo 'start pmx' >&3; }
+pasta_verify() { echo 'check pasta' >&3; }
+nft_apply() { echo 'check nft' >&3; }
+mkpod "$1" fixture example.invalid
+'''
+expected = {
+    'full': ['conf', 'create pmx', 'start pmx', 'check pasta', 'check nft'],
+    'pasta': ['conf', 'create pmx', 'start pmx', 'check pasta'],
+    'nft': ['create pm', 'start pm', 'check nft'],
+    'bare': ['create pm', 'start pm'],
+}
+for mode, calls in expected.items():
+    result = subprocess.run(['bash', '-s', mode], input=mode_fixture, text=True, capture_output=True, timeout=5)
+    assert result.returncode == 0 and result.stdout.splitlines() == calls, (mode, result)
+unknown_mode = subprocess.run(
+    ['bash', '-s', 'other'], input=mode_fixture, text=True, capture_output=True, timeout=5,
+)
+assert unknown_mode.returncode == 1 and 'unknown pod mode' in unknown_mode.stderr
+assert not unknown_mode.stdout
+print('PASS: supported D1 results and pod ordering, with unknown labels and modes rejected')
+
 base = Path(__file__).resolve().parents[4] / '.scratch'
 if base.is_symlink():
     raise RuntimeError('scratch directory must not be a symlink')
