@@ -6,7 +6,7 @@ From the repository root, run the portable tests before the quality checks.
 
 ```bash
 python3 -B tools/ci/run.py tests
-python3 -B tools/ci/run.py quality
+python3 -B tools/ci/toolchain.py
 ```
 
 These commands read the working files, including unstaged edits. The runner uses system Python
@@ -21,10 +21,12 @@ failures all fail the suite. The runner stops on interruption and retains scratc
 verify that the suite's children exited.
 
 Quality uses Bash syntax checks, in-memory Python compilation, and ShellCheck at error severity.
-Install **ShellCheck 0.9.0** separately and make it available on `PATH`. This is the compatible
-version required by the current gate. The runner prints tool versions and performs no installation
-or rewrites. It checks active runtime, tests and CI tool sources. Retained probes and source text
-embedded in test fixtures are outside the top-level lint scope.
+The toolchain command requires Linux x86-64, `curl`, and internet access. It verifies a pinned mise
+release and installs **ShellCheck 0.9.0** from the [shared lockfile](../tools/ci/mise.lock) in
+private scratch. It then runs the shared checks through mise. The command uses a fresh toolchain
+for each run. The launcher and the portable test command have their existing platform prerequisites.
+The quality checker covers active runtime, tests and CI tool sources. Retained probes and source
+text embedded in test fixtures are outside the top-level lint scope.
 
 The portable run reports real Podman security, real Postgres, and SELinux/Wayland acceptance as
 skipped because it has no configured isolated fixtures. Remote acceptance is unavailable in this
@@ -67,8 +69,10 @@ synthetic merge SHA from the event. The stable `oc-sandbox / required` job succe
 portable tests and quality succeed. The maintainer verifies the tested SHA and exact observed
 GitHub Actions check identity on an actual PR before selecting it in the ruleset. Enable the
 up-to-date branch requirement when the ruleset must enforce validation against the latest base
-commit. Hosted `ubuntu-24.04` images can change, so verify the reported tool versions on the
-first hosted run and review any version or policy change.
+commit. The hosted quality job checks `/usr/bin/shellcheck` before provisioning the locked
+toolchain. If the runner copy is missing or has a different version, the job reports the expected
+and observed version and fails. Review the tool version, lockfile and policy together when
+updating the pin. Verify the observed versions and check identity on the first hosted run.
 
 CI workflow, runner and policy changes require human review. Changes that install or update tools,
 write hooks or Git state, or enable remote acceptance need separate approval. The

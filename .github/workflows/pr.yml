@@ -45,7 +45,7 @@ jobs:
           checked_sha=$(git rev-parse --verify HEAD)
           [[ "$checked_sha" == "$GITHUB_SHA" ]]
           printf 'Checked merge SHA %s\n' "$checked_sha"
-          exec python3 -B tools/ci/run.py quality
+          exec python3 -B tools/ci/toolchain.py --hosted
 
   required:
     name: oc-sandbox / required

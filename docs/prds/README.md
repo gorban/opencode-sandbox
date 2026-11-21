@@ -25,7 +25,7 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 | PRD | Grouping | Status |
 |---|---|---|
 | [prd_a](prd_a.md) | Postgres reachable from the host (`-P 5432`, `-P 5433:5432`) | implemented; external static review complete; human review passed |
-| [prd_b](prd_b.md) | OpenCode upgrades ready before launch; no drop to the host shell | pre-launch updates implemented; in-app restart open; external static review complete; human review open |
+| [prd_b](prd_b.md) | OpenCode upgrades ready before launch; no drop to the host shell | pre-launch slice human-approved; in-app restart and final review open |
 | [prd_c](prd_c.md) | Worktree defaults: current repo, `wt/<repo>/NAME`, relaunch | implemented; external static review complete; human review passed |
 | [prd_d](prd_d.md) | Per-instance address and DNS name (no port mapping needed) | forwarding feasibility measured; implementation open |
 | [prd_e](prd_e.md) | Local HTTPS / TLS per instance (same URL in pod and on host) | CA feasibility measured, including host-browser subset; implementation open; depends on prd_d |
@@ -34,7 +34,7 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 | [prd_h](prd_h.md) | Warm start: shared setup (images, OpenCode install) done once under a lock | implemented; real acceptance passed; external static review complete; human review passed |
 | [prd_i](prd_i.md) | OpenCode orchestrator and sandbox fleet | proposed; host-only Claude routing spike open |
 | [prd_j](prd_j.md) | Host configuration and bridge merge tool preferences | proposed; TOML and editor design deferred |
-| [prd_k](prd_k.md) | Contributor checks and repository layout | designs reviewed; implementation review and hosted qualification open |
+| [prd_k](prd_k.md) | Contributor checks and repository layout | local CI and documentation PoCs human-approved; hosted qualification and final review open |
 
 The imported findings are evidence, not production implementation:
 

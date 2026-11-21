@@ -60,6 +60,7 @@ SUITES = (
     Suite('Security stubs', 'tests/security.sh', ('bash', 'tests/security.sh'), stub_security=True),
     discover('CI runner contract', 'test_ci.py'),
     discover('CI supervisor contract', 'test_ci_supervisor.py'),
+    discover('CI toolchain contract', 'test_ci_toolchain.py'),
 )
 
 SHELL_FILES = (
@@ -86,11 +87,13 @@ PYTHON_FILES = (
     'tests/setup-lifecycle.py',
     'tests/test_ci.py',
     'tests/test_ci_supervisor.py',
+    'tests/test_ci_toolchain.py',
     'tests/test_controller_core.py',
     'tests/worktree_review_regressions.py',
     'tests/worktree_state_regressions.py',
     'tools/ci/run.py',
     'tools/ci/supervisor.py',
+    'tools/ci/toolchain.py',
 )
 
 SCRATCH_DIRS = {
@@ -243,11 +246,7 @@ def quality(supervisor):
     print(f'Checked {len(SHELL_FILES)} shell files and {len(PYTHON_FILES)} Python files')
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('phase', choices=('tests', 'quality'))
-    args = parser.parse_args()
-    phase = {'tests': tests, 'quality': quality}[args.phase]
+def run_supervised(phase):
     supervisor = None
     try:
         with supervise() as supervisor:
@@ -261,6 +260,13 @@ def main():
             print(note, file=sys.stderr)
         return 128 + supervisor.pending if supervisor and supervisor.pending else getattr(exc, 'status', 1)
     return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('phase', choices=('tests', 'quality'))
+    args = parser.parse_args()
+    return run_supervised({'tests': tests, 'quality': quality}[args.phase])
 
 
 if __name__ == '__main__':

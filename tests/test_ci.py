@@ -43,6 +43,7 @@ class PortableTests(unittest.TestCase):
             ('bash', 'tests/security.sh'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_ci.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_ci_supervisor.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_ci_toolchain.py'),
         ]
         seen = []
         roots = set()
