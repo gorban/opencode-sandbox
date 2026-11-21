@@ -281,6 +281,157 @@ retained_edit() {
 check "failed write-back retains the staged edit" retained_edit
 check "failed write-back preserves the sandbox file" grep -qx original "$SB/construct/recovery-original/a.txt"
 
+bridge_copy_regressions() {
+  timeout 20 python3 -I - "$BRIDGE" "$T" <<'PY'
+import errno
+import json
+import os
+from pathlib import Path
+import runpy
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+bridge_path, scratch = sys.argv[1:]
+base, edit = b"before", b"host edit with more bytes"
+real_write = os.write
+
+
+class CopyTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir=scratch)))
+        sandbox, stage = root / "sandbox", root / "stage"
+        sandbox.mkdir()
+        self.target = sandbox / "edit.txt"
+        self.target.write_bytes(base)
+        self.enterContext(patch.dict(os.environ, OC_SB=str(sandbox), OC_BRIDGE_STAGE=str(stage)))
+        self.bridge = runpy.run_path(bridge_path)["run_session"].__globals__
+
+    def stage(self):
+        session = Path(self.bridge["stage_request"]("code", ["/sandbox/edit.txt"]))
+        staged = session / "files/edit.txt"
+        self.assertEqual(staged.read_bytes(), base)
+        return session, staged
+
+    def test_short_staging_writes(self):
+        with patch.object(os, "write", side_effect=lambda fd, data: real_write(fd, data[:2])):
+            self.stage()
+
+    def test_short_save_writes(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        with patch.object(os, "write", side_effect=lambda fd, data: real_write(fd, data[:2])):
+            self.assertTrue(self.sync(session))
+        self.assertEqual(self.target.read_bytes(), edit)
+
+    def sync(self, session):
+        with (session / "manifest.json").open() as manifest:
+            entry = json.load(manifest)["entries"][0]
+        files_fd = os.open(session / "files", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            return self.bridge["sync"](files_fd, [entry])
+        finally:
+            os.close(files_fd)
+
+    def assert_preserved(self, staged, expected=edit):
+        self.assertEqual(self.target.read_bytes(), base)
+        self.assertEqual(staged.read_bytes(), expected)
+        self.assertEqual(list(self.target.parent.iterdir()), [self.target])
+
+    def test_incomplete_writes_keep_recovery(self):
+        for error in (None, OSError(errno.ENOSPC, "test disk full"), InterruptedError()):
+            with self.subTest(error=error):
+                self.target.write_bytes(base)
+                session, staged = self.stage()
+
+                def editor(*args, **kwargs):
+                    staged.write_bytes(edit)
+                    return SimpleNamespace(poll=lambda: 0)
+
+                def write(fd, data):
+                    if len(data) == len(edit):
+                        return real_write(fd, data[:2])
+                    if error is None:
+                        return 0
+                    raise error
+
+                with patch("subprocess.Popen", side_effect=editor), patch.object(os, "write", side_effect=write):
+                    self.bridge["run_session"](str(session))
+                self.assert_preserved(staged)
+
+    def test_periodic_failure_retries_same_save(self):
+        session, staged = self.stage()
+        observations = iter((None, 0))
+
+        def editor(*args, **kwargs):
+            staged.write_bytes(edit)
+            return SimpleNamespace(poll=lambda: next(observations))
+
+        def write(fd, data):
+            if not attempted:
+                attempted.append(True)
+                raise OSError(errno.ENOSPC, "test disk full")
+            return real_write(fd, data)
+
+        attempted = []
+        with patch("subprocess.Popen", side_effect=editor), patch("time.sleep"), patch.object(os, "write", side_effect=write):
+            self.bridge["run_session"](str(session))
+        self.assertEqual(self.target.read_bytes(), edit)
+        self.assertFalse(session.exists())
+
+    def test_oversized_save_keeps_recovery(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        with patch.dict(self.bridge, MAX_FILE=len(base)):
+            self.assertFalse(self.sync(session))
+        self.assert_preserved(staged)
+
+    def test_source_change_during_copy_keeps_recovery(self):
+        for changed in (edit.upper(), edit + b"more"):
+            with self.subTest(changed=changed):
+                self.target.write_bytes(base)
+                session, staged = self.stage()
+                staged.write_bytes(edit)
+
+                def write(fd, data):
+                    staged.write_bytes(changed)
+                    return real_write(fd, data)
+
+                with patch.dict(self.bridge, MAX_FILE=len(edit)), patch.object(os, "write", side_effect=write):
+                    self.assertFalse(self.sync(session))
+                self.assert_preserved(staged, changed)
+
+    def test_replaced_stage_refused_before_editor(self):
+        session, staged = self.stage()
+        replacement = staged.with_suffix(".replacement")
+        replacement.write_bytes(base)
+        replacement.replace(staged)
+        self.assert_launch_refused(session)
+
+    def test_duplicate_path_refused_before_editor(self):
+        session, _ = self.stage()
+        manifest = session / "manifest.json"
+        data = json.loads(manifest.read_bytes())
+        data["entries"] *= 2
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+        self.assert_launch_refused(session)
+
+    def assert_launch_refused(self, session):
+        with patch("subprocess.Popen") as launch:
+            launch.return_value.poll.return_value = 0
+            with self.assertRaises(self.bridge["Refused"]):
+                self.bridge["run_session"](str(session))
+        launch.assert_not_called()
+        self.assertTrue(session.exists())
+
+
+unittest.main(argv=[sys.argv[0]])
+PY
+}
+check "bounded bridge copies preserve and retry incomplete saves" bridge_copy_regressions
+
 # race: a directory on the path flips between a real directory and a symlink to the host, as fast as
 # possible, while requests (with edits) are processed
 mkdir -p "$SB/construct/d"; echo ok > "$SB/construct/d/f"; ln -s ../../victim "$SB/construct/d.link"

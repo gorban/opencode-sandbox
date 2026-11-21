@@ -113,22 +113,50 @@ def ident(st):
     return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns]
 
 
-def copy_fd_to(src_fd, dst_dir_fd, name, limit, mode=0o600):
+def staged_identity(st):
+    return [st.st_ino, st.st_size, st.st_mtime_ns]
+
+
+def copy_identity(st):
+    return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), st.st_nlink,
+            st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def write_all(fd, chunk):
+    remaining = memoryview(chunk)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written == 0:
+            raise OSError(errno.EIO, "file write made no progress")
+        remaining = remaining[written:]
+
+
+def copy_stable_file(source, out, limit):
+    src_fd, before = source
+    if before.st_size > limit:
+        raise Refused(f"file exceeds the {limit}-byte copy limit")
+    total = 0
+    while chunk := os.read(src_fd, 1 << 20):
+        total += len(chunk)
+        if total > limit:
+            raise Refused(f"file exceeds the {limit}-byte copy limit")
+        write_all(out, chunk)
+    os.fsync(out)
+    if total != before.st_size or copy_identity(before) != copy_identity(os.fstat(src_fd)):
+        raise Refused("source changed during the copy")
+    return total
+
+
+def copy_fd_to(source, dst_dir_fd, name, limit, mode=0o600):
     out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                   mode, dir_fd=dst_dir_fd)
-    total = 0
     try:
-        while chunk := os.read(src_fd, 1 << 20):
-            total += len(chunk)
-            if total > limit:
-                raise Refused(f"{name!r} is larger than {limit} bytes")
-            os.write(out, chunk)
+        return copy_stable_file(source, out, limit)
     except BaseException:
         os.unlink(name, dir_fd=dst_dir_fd)
         raise
     finally:
         os.close(out)
-    return total
 
 
 # ---- staging (host-owned) ------------------------------------------------------------------------
@@ -172,9 +200,9 @@ def snapshot_tree(src_fd, dst_fd, budget):
                 budget["files"] -= 1
                 if budget["files"] < 0:
                     raise OverBudget("directory snapshot has too many files")
-                fd, _ = open_regular(src_fd, name)
+                fd, fst = open_regular(src_fd, name)
                 try:
-                    budget["bytes"] -= copy_fd_to(fd, dst_fd, name, min(MAX_FILE, budget["bytes"]), 0o400)
+                    budget["bytes"] -= copy_fd_to((fd, fst), dst_fd, name, min(MAX_FILE, budget["bytes"]), 0o400)
                 finally:
                     os.close(fd)
         except OverBudget:
@@ -221,13 +249,13 @@ def stage_request(tool, paths):
                         else:
                             fd, fst = open_regular(parent, parts[-1])
                             try:
-                                copy_fd_to(fd, dparent, parts[-1], MAX_FILE)
+                                copy_fd_to((fd, fst), dparent, parts[-1], MAX_FILE)
                             finally:
                                 os.close(fd)
                             sst = os.stat(staged)
                             entries.append({"parts": parts, "staged": staged, "kind": "file",
                                             "mode": stat.S_IMODE(fst.st_mode), "target": ident(fst),
-                                            "seen": [sst.st_ino, sst.st_size, sst.st_mtime_ns]})
+                                            "seen": staged_identity(sst)})
                     finally:
                         os.close(dparent)
                 finally:
@@ -247,7 +275,7 @@ def stage_request(tool, paths):
 
 # ---- write-back --------------------------------------------------------------------------------
 
-def write_back(entry, src_fd):
+def write_back(entry, source):
     """Copy the edited staged file back into the sandbox, never through a symlink."""
     parts, name = entry["parts"], entry["parts"][-1]
     root = open_root()
@@ -268,9 +296,7 @@ def write_back(entry, src_fd):
         out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                       entry.get("mode", 0o644) & 0o777, dir_fd=parent)
         try:
-            while chunk := os.read(src_fd, 1 << 20):
-                os.write(out, chunk)
-            os.fsync(out)
+            copy_stable_file(source, out, MAX_FILE)
             os.rename(tmp, dest, src_dir_fd=parent, dst_dir_fd=parent)
             if unchanged:
                 entry["target"] = ident(os.fstat(out))
@@ -306,9 +332,9 @@ def sync(files_fd, entries):
             complete = False
             continue
         try:
-            seen = [st.st_ino, st.st_size, st.st_mtime_ns]
+            seen = staged_identity(st)
             if seen != entry["seen"]:
-                write_back(entry, src_fd)
+                write_back(entry, (src_fd, st))
                 entry["seen"] = seen
         except (Refused, OSError) as err:
             complete = False
@@ -352,8 +378,13 @@ def read_session_manifest(session_fd):
         raise Refused("invalid or unconfigured session tool")
     if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_PATHS:
         raise Refused("invalid session entry count")
+    recorded_paths = set()
     for entry in entries:
         validate_session_entry(tool, entry)
+        path = tuple(entry["parts"])
+        if path in recorded_paths:
+            raise Refused("duplicate staged path")
+        recorded_paths.add(path)
     return tool, entries
 
 
@@ -362,10 +393,14 @@ def staged_arguments(session, files_fd, entries):
     for entry in entries:
         parts = entry["parts"]
         if entry["kind"] == "dir":
-            fd = open_dirs(files_fd, parts)
+            os.close(open_dirs(files_fd, parts))
         else:
-            fd, _ = open_staged_file(files_fd, parts)
-        os.close(fd)
+            fd, st = open_staged_file(files_fd, parts)
+            try:
+                if staged_identity(st) != entry["seen"] or st.st_size > MAX_FILE:
+                    raise Refused("staged file changed or exceeds the size limit before editor launch")
+            finally:
+                os.close(fd)
         # Older manifests store an absolute path. The current session and
         # checked components determine the editor argument.
         paths.append(os.path.join(session, "files", *parts))
