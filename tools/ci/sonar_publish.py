@@ -197,14 +197,15 @@ def publish(opts, root, state, config):
         token = token_from_terminal()
         try:
             verify_admission(opts, revision, checkout, cloud, state, identity, policy)
+            previous_check_id = cloud.native_check_id(revision) if revision.number else None
             since = cloud.now()
             result = sandbox.scanner(store, source, scan, scanner_properties(revision, cloud), token)
         finally:
             del token
 
-    outcome = cloud.confirm(revision, result, since, report.metrics, required)
+    outcome = cloud.confirm(revision, result, since, report.metrics, required, previous_check_id)
     verify_admission(opts, revision, checkout, cloud, state, identity, policy)
-    receipt.update(policy=policy, result=outcome, phase='published')
+    receipt.update(policy=policy, result=outcome, phase='published', previous_check_id=previous_check_id)
     if revision.number is None:
         record_baseline(*state, receipt)
     print(json.dumps(receipt, sort_keys=True))
@@ -231,11 +232,17 @@ def stop(signum, _frame):
     raise KeyboardInterrupt(f'Interrupted by signal {signum}')
 
 
+def require_host():
+    if (os.getuid() == 0 or os.environ.get('CONTAINER_ID') or not Path('/usr/bin/podman').is_file()
+            or Path('/run/.containerenv').exists() or Path('/.dockerenv').exists()):
+        raise ValueError('Run from a Linux host terminal as an unprivileged rootless Podman user')
+
+
 def main():
     if sys.argv[0] != '-' or not sys.flags.isolated:
         raise ValueError('Launch the reviewed publisher Git object using Python isolated stdin mode')
-    if os.getuid() == 0 or os.environ.get('CONTAINER_ID') or not Path('/usr/bin/podman').is_file():
-        raise ValueError('Run from a Linux host terminal as an unprivileged rootless Podman user')
+    require_host()
+    os.environ.clear()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.umask(0o077)
     signal.signal(signal.SIGHUP, stop)

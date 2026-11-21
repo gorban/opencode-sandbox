@@ -164,16 +164,29 @@ def check_context(check, revision):
             and fields.get('id') == [PROJECT] and fields.get('pullRequest') == [str(revision.number)])
 
 
-def wait_for_check(revision, gate, since):
+def latest_native_check(revision):
+    filters = urlencode({'check_name': 'SonarCloud Code Analysis', 'app_id': 12526,
+                         'filter': 'all', 'per_page': 100})
+    result = github(f'commits/{revision.head}/check-runs?{filters}')
+    if result['total_count'] > len(result['check_runs']):
+        raise PublishError('Could not inventory the existing native GitHub checks')
+    native = [c for c in result['check_runs'] if c['name'] == 'SonarCloud Code Analysis'
+              and c['app']['id'] == 12526 and c['head_sha'] == revision.head
+              and check_context(c, revision)]
+    return max(native, key=lambda c: c['id'], default=None)
+
+
+def native_check_id(revision):
+    current = latest_native_check(revision)
+    return current['id'] if current else 0
+
+
+def wait_for_check(revision, gate, since, previous_id):
     expected = 'success' if gate == 'OK' else 'failure'
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
-        result = github(f'commits/{revision.head}/check-runs?check_name=SonarCloud%20Code%20Analysis&per_page=50')
-        native = [c for c in result['check_runs'] if c['name'] == 'SonarCloud Code Analysis'
-                  and c['app']['id'] == 12526 and c['head_sha'] == revision.head
-                  and check_context(c, revision)]
-        last = max(native, key=lambda c: c['id'], default=None)
-        if last and last['status'] == 'completed' and last['completed_at']:
+        last = latest_native_check(revision)
+        if last and last['id'] > previous_id and last['status'] == 'completed' and last['completed_at']:
             if stamp(last['completed_at']) >= since.replace(microsecond=0):
                 if last['conclusion'] != expected:
                     raise PublishError('Native GitHub check disagrees with the computed Sonar gate')
@@ -182,7 +195,7 @@ def wait_for_check(revision, gate, since):
     raise PublishError('A fresh native GitHub check was not observed on the approved revision')
 
 
-def confirm(revision, output, since, counts, required):
+def confirm(revision, output, since, counts, required, previous_check_id):
     if len(output) != 2 or output[0] not in ('OK', 'ERROR') or not TASK_ID.fullmatch(output[1]):
         raise PublishError('Scanner did not emit a valid task receipt')
     gate, task = output
@@ -193,7 +206,7 @@ def confirm(revision, output, since, counts, required):
     identity = analysis_identity(revision, analysis_id, since, executed)
     result = gate_for(revision, analysis_id, gate)
     matched = verify_metrics(revision, counts, required)
-    check = wait_for_check(revision, gate, since) if revision.number else None
+    check = wait_for_check(revision, gate, since, previous_check_id) if revision.number else None
     now = task_snapshot(revision, task, since)
     if ((now is not None and now != observed)
             or analysis_identity(revision, analysis_id, since, executed) != identity):

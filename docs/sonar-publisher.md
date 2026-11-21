@@ -30,7 +30,9 @@ publish_coverage() (
   /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 \
     GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
     /usr/bin/git --no-pager -C "$trusted" show "${publisher_sha}:tools/ci/sonar_publish.py" |
-    /usr/bin/python3 -IB - --checkout "$trusted" --publisher "$publisher_sha" "$@"
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+      CONTAINER_ID="${CONTAINER_ID-}" \
+      /usr/bin/python3 -IB - --checkout "$trusted" --publisher "$publisher_sha" "$@"
 )
 
 publish_coverage --head "$main_sha" --prepare-only
@@ -72,6 +74,8 @@ The coverage container has a read-only snapshot and no writable host mount.
 After it is removed, the publisher validates and rewrites its report. A separate
 scanner receives a read-only source snapshot, trusted settings and the canonical
 report. It receives the token through standard input. The publisher confirms the
-scanner's exact Sonar task, revision and gate. It verifies imported counters on
+scanner's exact Sonar task, revision and gate, and looks for a new check ID on
+the approved PR head. Public attestation requests use the host system trust
+store and direct network access. The publisher verifies imported counters on
 main and on changed measured files Sonar indexes for a PR. The private main
 receipt lives under `~/.local/state/oc-sandbox/sonar-publisher/`.

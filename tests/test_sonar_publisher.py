@@ -1,9 +1,11 @@
 """Test exact-revision admission and the publisher's untrusted boundaries."""
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
@@ -189,23 +191,66 @@ class CloudTest(unittest.TestCase):
                 cloud.gate_for(REVISION, ANALYSIS, 'OK')
 
     def test_fresh_exact_pr_native_check(self):
-        response = {'check_runs': [{
+        response = {'total_count': 1, 'check_runs': [{
             'id': 1, 'name': 'SonarCloud Code Analysis', 'app': {'id': 12526},
             'head_sha': HEAD, 'status': 'completed', 'conclusion': 'success',
             'completed_at': '2026-11-21T19:12:33Z', 'html_url': 'expected',
             'details_url': f'https://sonarcloud.io/dashboard?id={cloud.PROJECT}&pullRequest=36',
         }]}
         with patch.object(cloud, 'github', return_value=response):
-            self.assertEqual(cloud.wait_for_check(REVISION, 'OK', SINCE), 'expected')
+            self.assertEqual(cloud.wait_for_check(REVISION, 'OK', SINCE, 0), 'expected')
             check = response['check_runs'][0]
             with patch.dict(check, {'conclusion': 'neutral'}), self.assertRaises(PublishError):
-                cloud.wait_for_check(REVISION, 'OK', SINCE)
+                cloud.wait_for_check(REVISION, 'OK', SINCE, 0)
             for overrides in ({'completed_at': '2026-11-21T19:10:00Z'},
                               {'details_url': check['details_url'].replace('36', '37')},
                               {'head_sha': BASE}, {'app': {'id': 57789}}):
                 with patch.dict(check, overrides), patch.object(cloud.time, 'monotonic', side_effect=(0, 1, 181)):
                     with patch.object(cloud.time, 'sleep'), self.assertRaises(PublishError):
-                        cloud.wait_for_check(REVISION, 'OK', SINCE)
+                        cloud.wait_for_check(REVISION, 'OK', SINCE, 0)
+
+    def test_preexisting_same_second_check_cannot_satisfy_freshness(self):
+        existing = {'id': 15, 'name': 'SonarCloud Code Analysis', 'app': {'id': 12526},
+                    'head_sha': HEAD, 'status': 'completed', 'conclusion': 'success',
+                    'completed_at': '2026-11-21T19:12:01Z', 'html_url': 'old',
+                    'details_url': f'https://sonarcloud.io/dashboard?id={cloud.PROJECT}&pullRequest=36'}
+        response = {'total_count': 1, 'check_runs': [existing]}
+        with patch.object(cloud, 'github', return_value=response):
+            previous = cloud.native_check_id(REVISION)
+            self.assertEqual(previous, 15)
+            with patch.object(cloud.time, 'monotonic', side_effect=(0, 1, 181)):
+                with patch.object(cloud.time, 'sleep'), self.assertRaises(PublishError):
+                    cloud.wait_for_check(REVISION, 'OK', SINCE.replace(microsecond=500000), previous)
+            response.update(total_count=2, check_runs=[existing, {**existing, 'id': 16, 'html_url': 'new'}])
+            self.assertEqual(cloud.wait_for_check(REVISION, 'OK', SINCE, previous), 'new')
+
+    def test_incomplete_native_check_inventory_is_rejected(self):
+        with patch.object(cloud, 'github', return_value={'total_count': 101, 'check_runs': []}):
+            with self.assertRaises(PublishError):
+                cloud.native_check_id(REVISION)
+
+
+class BootstrapTest(unittest.TestCase):
+    def test_caller_environment_is_cleared_before_network_boundary(self):
+        options = SimpleNamespace(checkout=Path.cwd(), publisher=HEAD)
+        ambient = {'HTTPS_PROXY': 'synthetic-proxy', 'SSL_CERT_FILE': 'synthetic-ca',
+                   'SSLKEYLOGFILE': 'synthetic-log', 'SONAR_TOKEN': 'synthetic-token'}
+
+        def enter_network_boundary(*args):
+            self.assertFalse(os.environ)
+            return 0
+
+        with (patch.dict(os.environ, ambient, clear=True),
+              patch.object(sys, 'argv', ['-']),
+              patch.object(sys, 'flags', SimpleNamespace(isolated=True)),
+              patch.object(os, 'umask'),
+              patch.object(publish, 'require_host'),
+              patch.object(publish.resource, 'setrlimit'),
+              patch.object(publish.signal, 'signal'),
+              patch.object(publish, 'parse_args', return_value=options),
+              patch.object(publish, 'trusted_checkout'),
+              patch.object(publish, 'run', side_effect=enter_network_boundary)):
+            self.assertEqual(publish.main(), 0)
 
 
 class SandboxTest(unittest.TestCase):
