@@ -111,6 +111,36 @@ def read_snapshot(stream):
     return None if header['sha256'] is None else old
 
 
+def install_v2(installer, requested, env, runner):
+    runner(['curl', '-fsSL', '--connect-timeout', '5', '--max-time', '30',
+            '-o', str(installer), 'https://opencode.ai/v2/install'], env, 35)
+    args = ['bash', str(installer), '--no-modify-path']
+    if requested:
+        args += ['--version', requested]
+    runner(args, env, 90)
+
+
+def update_candidate(candidate, installer, old, requested, env, runner):
+    if old is None:
+        install_v2(installer, requested, env, runner)
+        return
+    candidate.write_bytes(old)
+    candidate.chmod(0o755)
+    current = reported_version(runner([str(candidate), '--version'], env, 10))
+    current_major = int(current.lstrip('v').split('.')[0])
+    requested_major = int(requested.lstrip('v').split('.')[0]) if requested else None
+    if current_major == 1 and requested_major is not None and requested_major >= 2:
+        # V1 rejects a V2 target; use the official versioned V2 installer in staging.
+        install_v2(installer, requested, env, runner)
+        return
+    args = [str(candidate), 'upgrade']
+    if requested:
+        args.append(requested)
+    elif current_major == 1:
+        args.append('--major')
+    runner(args + ['--method', 'curl'], env, 90)
+
+
 def stage(stream, requested, output, runner=run):
     if requested and not VERSION.fullmatch(requested):
         raise ValueError('OC_OPENCODE_VERSION must be keep or a version such as 2.3.0')
@@ -123,29 +153,7 @@ def stage(stream, requested, output, runner=run):
         env.update(HOME=str(stagehome), PATH=f'{stagebin}:/usr/bin:/bin', CI='true',
                    XDG_CONFIG_HOME=str(base/'config'), XDG_DATA_HOME=str(base/'data'),
                    XDG_CACHE_HOME=str(base/'cache'), XDG_STATE_HOME=str(base/'state'))
-        if old is not None:
-            candidate.write_bytes(old); candidate.chmod(0o755)
-            current = reported_version(runner([str(candidate), '--version'], env, 10))
-            current_major = int(current.lstrip('v').split('.')[0])
-            requested_major = int(requested.lstrip('v').split('.')[0]) if requested else None
-            if current_major == 1 and requested_major is not None and requested_major >= 2:
-                # V1 rejects a V2 target; use the official versioned V2 installer in staging.
-                installer = base/'install.sh'
-                runner(['curl', '-fsSL', '--connect-timeout', '5', '--max-time', '30',
-                        '-o', str(installer), 'https://opencode.ai/v2/install'], env, 35)
-                runner(['bash', str(installer), '--no-modify-path', '--version', requested], env, 90)
-            else:
-                args = [str(candidate), 'upgrade']
-                if requested: args.append(requested)
-                elif current_major == 1: args.append('--major')
-                runner(args + ['--method', 'curl'], env, 90)
-        else:
-            installer = base/'install.sh'
-            runner(['curl', '-fsSL', '--connect-timeout', '5', '--max-time', '30',
-                    '-o', str(installer), 'https://opencode.ai/v2/install'], env, 35)
-            cmd = ['bash', str(installer), '--no-modify-path']
-            if requested: cmd += ['--version', requested]
-            runner(cmd, env, 90)
+        update_candidate(candidate, base/'install.sh', old, requested, env, runner)
         if candidate.is_symlink() or not candidate.is_file() or not os.access(candidate, os.X_OK):
             raise ValueError('upgrade did not produce an executable regular file')
         version = reported_version(runner([str(candidate), '--version'], env, 10))
@@ -165,9 +173,9 @@ def stage(stream, requested, output, runner=run):
     output.write(MAGIC + header + payload + END); output.flush()
 
 
-def promote(home, stream):
+def read_candidate_metadata(stream):
     magic = stream.readline(len(MAGIC)+1)
-    if magic == b'': return  # no update, or upstream failed before sending a candidate
+    if magic == b'': return None  # no update, or upstream failed before sending a candidate
     if magic != MAGIC: raise ValueError('invalid update frame')
     raw = stream.readline(1025)
     if len(raw) > 1024 or not raw.endswith(b'\n'): raise ValueError('invalid update header')
@@ -178,6 +186,35 @@ def promote(home, stream):
         type(header['size']) is not int or not 0 < header['size'] <= MAX_BINARY or
         not VERSION.fullmatch(header['version'])):
         raise ValueError('invalid update metadata')
+    return header
+
+
+def check_current_install(home, opened, expected_hash):
+    def named_identity():
+        try:
+            st = os.stat('opencode', dir_fd=opened[-1], follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+    before = named_identity()
+    current = read_old(home)
+    current_hash = None if current is None else hashlib.sha256(current).hexdigest()
+    if current_hash != expected_hash or before != named_identity():
+        raise ValueError('OpenCode changed during update; keeping current copy')
+    for idx, component in enumerate((INSTALL_DIRNAME, 'bin')):
+        named = os.stat(component, dir_fd=opened[idx], follow_symlinks=False)
+        held = os.fstat(opened[idx+1])
+        if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
+            raise ValueError('OpenCode install directory changed during update')
+    if named_identity() != before:
+        raise ValueError('OpenCode changed during promotion')
+
+
+def promote(home, stream):
+    header = read_candidate_metadata(stream)
+    if header is None:
+        return
     opened = open_install_dir(home, True)
     bindir = opened[-1]; tmpname = '.oc-update-' + os.urandom(16).hex()
     try:
@@ -191,21 +228,7 @@ def promote(home, stream):
             out.flush(); os.fsync(out.fileno())
         if h.hexdigest() != header['new'] or stream.read(len(END)) != END or stream.read(1):
             raise ValueError('corrupt or incomplete update frame')
-        def named_identity():
-            try: st = os.stat('opencode', dir_fd=bindir, follow_symlinks=False)
-            except FileNotFoundError: return None
-            return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-        before = named_identity()
-        current = read_old(home)
-        current_hash = None if current is None else hashlib.sha256(current).hexdigest()
-        if current_hash != header['old'] or before != named_identity():
-            raise ValueError('OpenCode changed during update; keeping current copy')
-        for idx, component in enumerate((INSTALL_DIRNAME, 'bin')):
-            named = os.stat(component, dir_fd=opened[idx], follow_symlinks=False)
-            held = os.fstat(opened[idx+1])
-            if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
-                raise ValueError('OpenCode install directory changed during update')
-        if named_identity() != before: raise ValueError('OpenCode changed during promotion')
+        check_current_install(home, opened, header['old'])
         os.replace(tmpname, 'opencode', src_dir_fd=bindir, dst_dir_fd=bindir)
         print('OpenCode: installed ' + header['version'], file=sys.stderr)
     finally:
