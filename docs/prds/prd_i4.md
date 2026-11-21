@@ -1,7 +1,8 @@
 # prd_i4: Host model gateway and subscription routes
 
-Parent: [prd_i](prd_i.md) · children: [outside-in broker, subscriptions, and agy acp](prd_i4a.md) ·
-related: [worker fleet](prd_i2.md), [credential broker](prd_i3.md)
+Parent: [prd_i](prd_i.md) · children: [outside-in broker, subscriptions, and agy acp](prd_i4a.md),
+[security documentation and Meridian qualification](prd_i4b.md) · related: [worker fleet](prd_i2.md),
+[credential broker](prd_i3.md)
 
 ## Gateway
 
