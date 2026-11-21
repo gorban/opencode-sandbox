@@ -83,6 +83,8 @@ the broker host.”
 
 ## Proposed Antigravity backend via Meridian
 
+See the [Gate 1 walkthrough for the synthetic prototype](prd_i4c.md).
+
 The [I4a plan](prd_i4a.md#resolved-open-choices-and-cross-prd-alignment) has a standalone host
 `agy acp` lifecycle and leaves the Antigravity broker route disabled. Evaluate Meridian as a new
 backend of the same broker. Use LiteLLM for API-key routes during the first prototype.
