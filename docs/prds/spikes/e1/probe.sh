@@ -232,7 +232,7 @@ run_clients() {
   log "python"
   crun $PY_IMG python -I /c/py_tls.py > "$R/python.tsv" 2>"$R/python.err" || die "python client failed"
   log "node (NODE_EXTRA_CA_CERTS)"
-  crun $NODE_IMG sh -c 'set -e; for V in $(cut -f1 /w/variants.tsv); do NODE_EXTRA_CA_CERTS=/w/ca/$V/ca.pem node /c/node_tls.js $V; done' > "$R/node.tsv" 2>"$R/node.err" || die "node client failed"
+  crun $NODE_IMG sh -c 'set -e; for V in $(cut -f1 /w/variants.tsv); do NODE_EXTRA_CA_CERTS=/w/ca/$V/ca.pem node /c/node_tls.mjs $V; done' > "$R/node.tsv" 2>"$R/node.err" || die "node client failed"
   if [ $SKIP_GO = 0 ]; then
     log "go"
     crun -e GOCACHE=/tmp/gocache -e HOME=/tmp -e GOFLAGS=-mod=mod -e GOTOOLCHAIN=local $GO_IMG sh -c 'cd /tmp && mkdir -p g && cp /c/go_tls.go g/main.go && cd g && go mod init x >/dev/null 2>&1; go run .' > "$R/go.tsv" 2>"$R/go.err" || die "go client failed"
