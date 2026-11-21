@@ -337,26 +337,7 @@ class Controller:
             ):
                 raise ValueError("invalid or duplicate worker assignment")
             self._operators[worker.enrollment] = worker.operator
-        self._jobs = {}
-        self._jobs_by_channel = {}
-        incarnations = set()
-        for job in jobs:
-            if (
-                type(job) is not Job
-                or not _valid_subject(job.subject)
-                or job.subject.worker_enrollment not in self._operators
-                or job.subject.channel in self._jobs_by_channel
-                or not _valid_principal(job.orchestrator, Role.ORCHESTRATOR)
-                or type(job.proposal_budget) is not int
-                or not 0 < job.proposal_budget <= _MAX_PROPOSALS_PER_JOB
-            ):
-                raise ValueError("invalid or duplicate job assignment")
-            incarnation_key = job.subject.worker_enrollment, job.subject.job_incarnation
-            if incarnation_key in incarnations:
-                raise ValueError("multiple channels for one job incarnation")
-            incarnations.add(incarnation_key)
-            self._jobs[job.subject] = job
-            self._jobs_by_channel[job.subject.channel] = job
+        self._register_jobs(jobs)
         self._capabilities = {}
         for capability in capabilities:
             if (
@@ -389,6 +370,28 @@ class Controller:
         self._aliases = {}
         self._withdrawn = set()
         self._fences = set()
+
+    def _register_jobs(self, jobs: Iterable[Job]) -> None:
+        self._jobs = {}
+        self._jobs_by_channel = {}
+        incarnations = set()
+        for job in jobs:
+            if (
+                type(job) is not Job
+                or not _valid_subject(job.subject)
+                or job.subject.worker_enrollment not in self._operators
+                or job.subject.channel in self._jobs_by_channel
+                or not _valid_principal(job.orchestrator, Role.ORCHESTRATOR)
+                or type(job.proposal_budget) is not int
+                or not 0 < job.proposal_budget <= _MAX_PROPOSALS_PER_JOB
+            ):
+                raise ValueError("invalid or duplicate job assignment")
+            incarnation_key = job.subject.worker_enrollment, job.subject.job_incarnation
+            if incarnation_key in incarnations:
+                raise ValueError("multiple channels for one job incarnation")
+            incarnations.add(incarnation_key)
+            self._jobs[job.subject] = job
+            self._jobs_by_channel[job.subject.channel] = job
 
     def _set_alias(self, alias, target):
         """Change fixture resolution under the same lock as approval and dispatch."""
@@ -669,21 +672,24 @@ class Controller:
             except Exception:
                 outcome = Outcome.UNKNOWN
 
-            if outcome is Outcome.SUCCEEDED or outcome is Outcome.DEFINITE_FAILURE:
-                if one_shot:
-                    self._fences.remove(request.effect_key())
-                if outcome is Outcome.SUCCEEDED:
-                    status = self._transition(request, State.SUCCEEDED, Reason.SUCCEEDED)
-                    return status if one_shot else replace(status, probe_result=ProbeResult.OK)
-                return self._transition(request, State.FAILED, Reason.FAILED)
+            return self._complete_invocation(request, one_shot, outcome)
+
+    def _complete_invocation(self, request: _Request, one_shot: bool, outcome: Outcome) -> Status:
+        if outcome is Outcome.SUCCEEDED or outcome is Outcome.DEFINITE_FAILURE:
             if one_shot:
-                return self._transition(request, State.UNCERTAIN, Reason.UNCERTAIN)
-            if request.attempts >= _PROBE_ATTEMPTS:
-                return self._transition(request, State.FAILED, Reason.ATTEMPTS_EXHAUSTED)
-            still_live = self._live(request)
-            if still_live is not Reason.READY:
-                return self._transition(request, State.FAILED, still_live)
-            return self._transition(request, State.ELIGIBLE_RETRY, Reason.RETRY, Reason.RETRY)
+                self._fences.remove(request.effect_key())
+            if outcome is Outcome.SUCCEEDED:
+                status = self._transition(request, State.SUCCEEDED, Reason.SUCCEEDED)
+                return status if one_shot else replace(status, probe_result=ProbeResult.OK)
+            return self._transition(request, State.FAILED, Reason.FAILED)
+        if one_shot:
+            return self._transition(request, State.UNCERTAIN, Reason.UNCERTAIN)
+        if request.attempts >= _PROBE_ATTEMPTS:
+            return self._transition(request, State.FAILED, Reason.ATTEMPTS_EXHAUSTED)
+        still_live = self._live(request)
+        if still_live is not Reason.READY:
+            return self._transition(request, State.FAILED, still_live)
+        return self._transition(request, State.ELIGIBLE_RETRY, Reason.RETRY, Reason.RETRY)
 
     def _revoke(self, actor, request, now):
         if request.state not in _REVOCABLE or request.revocation is not None:
