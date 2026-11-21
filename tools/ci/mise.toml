@@ -1,0 +1,6 @@
+[settings]
+lockfile = true
+lockfile_platforms = ["linux-x64"]
+
+[tools]
+"github:koalaman/shellcheck" = "0.9.0"

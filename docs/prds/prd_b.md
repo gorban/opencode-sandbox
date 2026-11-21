@@ -43,6 +43,7 @@ mid-session. Related: [prd_h](prd_h.md) (warm start: shared setup done once unde
 - [x] Tests: staged install/upgrade, pinning, offline fallback, concurrent changes and ordinary exits
       pass the 35-check lifecycle/update suite. Real fresh and warm updates pass; real parallel
       acceptance passes 45 checks. The in-app restart requirement remains open as above.
+- [x] **Human approval of the pre-launch update slice** (`codex/foundations-batch`, `d4782b6`).
 
 Estimated time: 0.5–1 day.
 
