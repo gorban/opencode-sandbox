@@ -705,6 +705,18 @@ echo "sandbox tree, worktrees and relabelling (in containers)"
 if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; else
   if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null; then H=(distrobox-host-exec); else H=(); fi
   if ! "${H[@]}" podman image exists "$TEST_AGENT_IMG" 2>/dev/null; then echo "  skip  (no test agent image; run oc-sandbox -n first or supply OC_TEST_AGENT_IMAGE)"; else
+    delimited_update_image() {
+      local id output
+      id=$("${H[@]}" podman create --rm --network=none --cap-drop=ALL --security-opt=no-new-privileges \
+        --entrypoint python3 -- "$TEST_AGENT_IMG" -I -c 'print("update image operand accepted")') || return
+      [[ $id =~ ^[0-9a-f]{64}$ ]] || return 1
+      if ! output=$("${H[@]}" podman start -a "$id"); then
+        "${H[@]}" podman rm -f "$id" >/dev/null 2>&1 || true
+        return 1
+      fi
+      [[ $output == 'update image operand accepted' ]]
+    }
+    check "real Podman accepts the delimited updater image operand" delimited_update_image
     VOL=oc-sectest-$$
     cat > "$T/lib.sh" <<EOF
 H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }

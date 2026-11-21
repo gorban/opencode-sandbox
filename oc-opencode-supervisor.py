@@ -92,7 +92,7 @@ def phase(prefix, directory, token, name, options, image, level, memory, inp, ou
         create = [*prefix, 'podman', 'create', '--cidfile', str(cidfile), '--label', f'{OWNER_LABEL}={token}',
                   '-i', '--http-proxy=false', '--entrypoint', 'python3', '--cap-drop=ALL', '--security-opt=no-new-privileges',
                   '--security-opt', f'label=level:{level}', '--pids-limit=128', f'--memory={memory}',
-                  *options, image, '-I', '/usr/local/bin/oc-opencode-update', name]
+                  *options, '--', image, '-I', '/usr/local/bin/oc-opencode-update', name]
         attempted = True
         rc = command(create, timeout=30, parent=parent)
         try: cid = read_cid(cidfile)
@@ -122,7 +122,8 @@ def main():
     prefix = sys.argv[7:]
     if prefix not in ([], ['distrobox-host-exec']): raise ValueError('invalid host command prefix')
     if not re.fullmatch(r's0:c\d+,c\d+', level, flags=re.ASCII): raise ValueError('invalid SELinux level')
-    if not re.fullmatch(r'[A-Za-z0-9_.-]+', volume) or not re.fullmatch(r'[A-Za-z0-9_.:-]+', image):
+    if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', volume)
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]*', image)):
         raise ValueError('invalid volume or image name')
     state_path = Path(state)
     if state_path.is_symlink() or not state_path.is_dir() or state_path.stat().st_uid != os.geteuid():
