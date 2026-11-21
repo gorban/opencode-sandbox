@@ -7,8 +7,8 @@ while IFS=$'\t' read -r V L port check kind; do
   mode=$(awk -F '\t' -v l="$L" '$1 == l {print $5}' /w/leaves.tsv)
   chain=()
   case "$mode" in
-    plain) [ ! -e "$file" ] || { echo "unexpected chain $V/$L" >&2; exit 1; };;
-    twin|unc) [ -s "$file" ] || { echo "missing chain $V/$L" >&2; exit 1; }; chain=(-cert_chain "$file");;
+    plain) [[ ! -e "$file" ]] || { echo "unexpected chain $V/$L" >&2; exit 1; };;
+    twin|unc) [[ -s "$file" ]] || { echo "missing chain $V/$L" >&2; exit 1; }; chain=(-cert_chain "$file");;
     *) echo "unknown leaf mode $V/$L" >&2; exit 1;;
   esac
   openssl s_server -accept "$port" -cert "/w/leaf/$L/$V.pem" -key "/w/leaf/$L/key.pem" "${chain[@]}" -www -quiet >/dev/null 2>&1 &
