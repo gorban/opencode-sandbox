@@ -16,7 +16,8 @@ Compare counts from the same Python version because the set of traced statements
 SonarQube Cloud automatic analysis continues to report the required zero-new-issues gate.
 It cannot import [coverage reports](https://docs.sonarsource.com/sonarqube-cloud/analyzing-source-code/test-coverage/overview).
 This baseline gives CI and local coverage counts. A required floor and a safe way to
-publish coverage to Sonar for fork pull requests need separate qualification.
+publish coverage have separate qualification. See [the trusted publisher](sonar-publisher.md)
+for the attended import and its scope.
 
 ## CodeQL and dependency review
 

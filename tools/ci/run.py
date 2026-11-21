@@ -59,6 +59,7 @@ SUITES = (
     discover('CI runner contract', 'test_ci.py'),
     discover('CI supervisor contract', 'test_ci_supervisor.py'),
     discover('CI toolchain contract', 'test_ci_toolchain.py'),
+    discover('Sonar publisher contract', 'test_sonar_publisher.py'),
 )
 
 SHELL_FILES = (
@@ -87,10 +88,18 @@ PYTHON_FILES = (
     'tests/test_ci_supervisor.py',
     'tests/test_ci_toolchain.py',
     'tests/test_controller_core.py',
+    'tests/test_sonar_publisher.py',
     'tests/worktree_review_regressions.py',
     'tests/worktree_state_regressions.py',
     'tools/ci/core_coverage.py',
     'tools/ci/run.py',
+    'tools/ci/sonar_checkout.py',
+    'tools/ci/sonar_cloud.py',
+    'tools/ci/sonar_coverage.py',
+    'tools/ci/sonar_exec.py',
+    'tools/ci/sonar_publish.py',
+    'tools/ci/sonar_sandbox.py',
+    'tools/ci/sonar_state.py',
     'tools/ci/supervisor.py',
     'tools/ci/toolchain.py',
 )

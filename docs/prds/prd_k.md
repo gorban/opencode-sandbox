@@ -92,6 +92,17 @@ Sonar's public API reports `NONE` for the gate and indexes `oc_controller.py`; i
 entry for `oc-sandbox`. No open PR targeting `main` or active branch rules were present
 when inspected. This establishes the check identity and a scope gap. PR qualification is open.
 
+- [x] Verify SonarCloud imports Python coverage and reports the native 100% new-code
+  condition on a disposable PR. [PR #36](https://github.com/gorban/opencode-sandbox/pull/36)
+  [failed at 96.6%](https://github.com/gorban/opencode-sandbox/runs/136951953225) and
+  [passed at 100%](https://github.com/gorban/opencode-sandbox/runs/136953956343)
+  over the same 29 lines. Coverage was the only failing condition. Tests ran without
+  credentials, then a separate scanner published the report.
+- [ ] Qualify the [maintainer-run coverage publisher](../sonar-publisher.md) on current
+  `main` and a real PR to `main` during the attended analysis-mode switch. Record
+  the exact analysis, App 12526 check and imported counters. Include a fork PR.
+  Keep Automatic Analysis enabled until the publisher passes external and human review.
+
 [Sonar GitHub analysis](https://docs.sonarsource.com/sonarqube-cloud/getting-started/github) ·
 [Sonar coverage import](https://docs.sonarsource.com/sonarqube-cloud/analyzing-source-code/test-coverage/overview) ·
 [GitHub rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets) ·

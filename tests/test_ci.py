@@ -78,6 +78,7 @@ class PortableTests(unittest.TestCase):
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_ci.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_ci_supervisor.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_ci_toolchain.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_sonar_publisher.py'),
         ]
         seen = []
         roots = set()
