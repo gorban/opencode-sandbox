@@ -203,8 +203,8 @@ class MergeCoreTest(unittest.TestCase):
                 self.assertIs(session.phase, Phase.RECOVERY)
                 recovery = session.recovery(self.owner)
                 for role in ("base", "host", "agent"):
-                    self.assertTrue(
-                        getattr(recovery.inputs, role) is getattr(expected, role),
+                    self.assertIs(
+                        getattr(recovery.inputs, role), getattr(expected, role),
                         f"Incorrect recovery retention for {role}",
                     )
                 self.assertTrue(recovery.preparation_error)
