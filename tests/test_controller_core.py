@@ -201,21 +201,24 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(self.adapter.attempts, [])
 
     def test_fixture_rejects_ambiguous_ownership(self):
+        workers = (
+            Worker(SUBJECT.worker_enrollment, OPERATOR),
+            Worker(SUBJECT.worker_enrollment, OTHER_OPERATOR),
+        )
         with self.assertRaises(ValueError):
-            self.make_controller(workers=(
-                Worker(SUBJECT.worker_enrollment, OPERATOR),
-                Worker(SUBJECT.worker_enrollment, OTHER_OPERATOR),
-            ))
+            self.make_controller(workers=workers)
+        shared_channel = (
+            Job(SUBJECT, ORCHESTRATOR, 1),
+            Job(replace(SIBLING, channel=SUBJECT.channel), OTHER_ORCHESTRATOR, 1),
+        )
         with self.assertRaises(ValueError):
-            self.make_controller(jobs=(
-                Job(SUBJECT, ORCHESTRATOR, 1),
-                Job(replace(SIBLING, channel=SUBJECT.channel), OTHER_ORCHESTRATOR, 1),
-            ))
+            self.make_controller(jobs=shared_channel)
+        shared_job = (
+            Job(SUBJECT, ORCHESTRATOR, 1),
+            Job(replace(SUBJECT, channel=SIBLING.channel), OTHER_ORCHESTRATOR, 1),
+        )
         with self.assertRaises(ValueError):
-            self.make_controller(jobs=(
-                Job(SUBJECT, ORCHESTRATOR, 1),
-                Job(replace(SUBJECT, channel=SIBLING.channel), OTHER_ORCHESTRATOR, 1),
-            ))
+            self.make_controller(jobs=shared_job)
         for job in (Job(SUBJECT, WORKER_HOST, 1), Job(SUBJECT, ORCHESTRATOR, True)):
             with self.subTest(job=job), self.assertRaises(ValueError):
                 self.make_controller(jobs=(job,))
