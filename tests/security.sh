@@ -172,6 +172,10 @@ for a in "\$@"; do case \$a in --*) ;; *)
   if [ -f "\$a" ]; then cat "\$a" >> $T/tool.seen; elif [ -d "\$a" ]; then find "\$a" >> $T/tool.seen; cat \$(find "\$a" -type f) >> $T/tool.seen 2>/dev/null; fi
   [ -n "\${FAKE_AGENT:-}" ] && sh -c "\$FAKE_AGENT"
   [ -n "\${FAKE_EDIT:-}" ] && [ -f "\$a" ] && printf '%s\n' "\$FAKE_EDIT" > "\$a"
+  if [ -n "\${FAKE_ATOMIC_EDIT:-}" ] && [ -f "\$a" ]; then
+    printf '%s\n' "\$FAKE_ATOMIC_EDIT" > "\$a.tmp" && mv -- "\$a.tmp" "\$a"
+  fi
+  [ -n "\${FAKE_SAVE_LINK:-}" ] && ln -sf -- "\$FAKE_SAVE_LINK" "\$a"
 esac; done; exit 0
 EOF
 chmod +x "$B/launch" "$B/tool"
@@ -218,6 +222,64 @@ reset_tool; echo orig > "$SB/construct/b.txt"; req 4 code /sandbox/construct/b.t
 FAKE_AGENT="rm $SB/construct/b.txt; ln -s ../../victim/secret $SB/construct/b.txt" FAKE_EDIT=mine bridge
 check "write-back never follows a swapped-in symlink" victim_ok && [ -L "$SB/construct/b.txt" ]
 check "conflicting edit saved as .host-edit"  [ "$(cat "$SB/construct/b.txt.host-edit" 2>/dev/null)" = mine ]
+
+echo original > "$SB/construct/saved.txt"; req 5 code /sandbox/construct/saved.txt
+FAKE_ATOMIC_EDIT=replaced bridge
+check "atomic editor save written back as a regular file" grep -qx replaced "$SB/construct/saved.txt"
+
+echo unrelated > "$T/staged-save-control"; req 6 code /sandbox/construct/saved.txt
+FAKE_SAVE_LINK="$T/staged-save-control" bridge
+check "staged save symlink refused before write-back" grep -qx replaced "$SB/construct/saved.txt"
+
+# Session fixtures use the same metadata as the queue and a fake editor in scratch.
+make_session() {
+  local session=$T/stage/$1
+  mkdir -m 700 "$session"
+  mkdir -m 700 -p "$session/files/construct"
+  printf 'fixture\n' > "$session/files/construct/session.txt"
+  python3 -I - "$session" "$2" "$3" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+session = Path(sys.argv[1])
+staged = session / "files/construct/session.txt"
+st = staged.stat()
+entry = {"kind": "file", "parts": ["construct", "session.txt"], "staged": str(staged),
+         "mode": 0o600, "target": [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns],
+         "seen": [st.st_ino, st.st_size, st.st_mtime_ns]}
+manifest = json.dumps({"tool": sys.argv[2], "entries": [entry]})
+(session / "manifest.json").write_text(manifest + " " * int(sys.argv[3]), encoding="utf-8")
+PY
+}
+run_fixture_session() { timeout 20 python3 -I "$BRIDGE" session "$T/stage/$1" 2>>"$T/bridge.log"; }
+session_refused() {
+  run_fixture_session "$1"
+  [[ $? -eq 2 && ! -e "$T/tool.args" ]]
+}
+
+reset_tool; make_session unknown-tool unknown 0
+check "unknown session tool rejected before editor launch" session_refused unknown-tool
+
+reset_tool; make_session oversized code 262144
+check "oversized session manifest rejected before editor launch" session_refused oversized
+
+reset_tool; make_session non-regular code 0
+ln -sf -- "$T/staged-save-control" "$T/stage/non-regular/files/construct/session.txt"
+check "non-regular staged input rejected before editor launch" session_refused non-regular
+
+mkdir "$SB/construct/save-recovery"
+echo original > "$SB/construct/save-recovery/a.txt"; req 7 code /sandbox/construct/save-recovery/a.txt
+FAKE_AGENT="mv '$SB/construct/save-recovery' '$SB/construct/recovery-original'" FAKE_EDIT=recover-me bridge
+retained_edit() {
+  local path
+  for path in "$T/stage"/*/files/construct/save-recovery/a.txt; do
+    if [[ -f $path ]] && grep -qx recover-me "$path"; then return 0; fi
+  done
+  return 1
+}
+check "failed write-back retains the staged edit" retained_edit
+check "failed write-back preserves the sandbox file" grep -qx original "$SB/construct/recovery-original/a.txt"
 
 # race: a directory on the path flips between a real directory and a symlink to the host, as fast as
 # possible, while requests (with edits) are processed
