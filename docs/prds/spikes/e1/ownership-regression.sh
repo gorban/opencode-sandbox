@@ -72,3 +72,47 @@ if ! grep -q '^build ' "$t/actions" || grep -Eq '(^| )(-t|--tag)( |$)' "$t/actio
  echo 'image build did not run untagged' >&2; cat "$t/actions" >&2; exit 1
 fi
 echo 'failed creation, name replacement and untagged build regressions passed'
+
+if [[ ${E1_OWNERSHIP_CASE:-all} == all ]]; then
+OC_E1_NOMAIN=1 bash -c '
+ source "$PROBE"
+ set -e
+ trace=$T/helper-actions
+ receipt=$T/helper-receipt
+ fixture_id=$(printf "%064d" 4)
+ exists_status=0
+ observed_owner=$OWNER
+ pm() {
+   printf "%s\n" "$*" >> "$trace"
+   if [[ $2 == exists ]]; then return "$exists_status"; fi
+   if [[ $2 == inspect ]]; then printf "%s\n" "$observed_owner"; fi
+ }
+ : > "$trace"
+ remove_id container "$receipt" || exit 86
+ printf "%s" malformed > "$receipt"
+ if remove_id container "$receipt"; then exit 81; fi
+ [[ ! -s "$trace" ]]
+ printf "%s" "$fixture_id" > "$receipt"
+ exists_status=1
+ remove_id container "$receipt" || exit 87
+ [[ $(<"$trace") == "container exists $fixture_id" ]]
+ : > "$trace"
+ exists_status=2
+ if remove_id container "$receipt"; then exit 82; fi
+ [[ $(<"$trace") == "container exists $fixture_id" ]]
+ : > "$trace"
+ exists_status=0
+ observed_owner=another-owner
+ if remove_id container "$receipt"; then exit 83; fi
+ mapfile -t calls < "$trace"
+ [[ ${#calls[@]} == 2 && ${calls[0]} == "container exists $fixture_id" &&
+    ${calls[1]} == "container inspect --format "*"$fixture_id" ]]
+ : > "$trace"
+ read_id() { echo "read_id" >> "$trace"; printf "%s" "$fixture_id"; }
+ if remove_id unsupported "$receipt"; then exit 84; fi
+ if [[ -s "$trace" ]]; then echo "unsupported removal reached a receipt or Podman" >&2; exit 88; fi
+ if owned unsupported "$fixture_id"; then exit 85; fi
+ [[ ! -s "$trace" ]]
+' 2>"$t/helper-errors" || { cat "$t/helper-errors" >&2; exit 1; }
+echo 'receipt and ownership failures stop cleanup before removal'
+fi

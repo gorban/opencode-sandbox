@@ -46,13 +46,14 @@ hc()  { host curl -s -m 3 "$@"; }
 say() { printf '%s\n' "$*"; }
 die() { printf 'ABORT: %s\n' "$*" >&2; exit 2; }
 res() { # res PASS|FAIL|INFO name detail
-  case $1 in
+  local result_label=$1
+  case $result_label in
     PASS) PASS=$((PASS+1));;
     FAIL) FAIL=$((FAIL+1));;
     INFO) ;;
-    *) die "unexpected result label: $1";;
+    *) die "unexpected result label: $result_label";;
   esac
-  printf '%-5s %-52s %s\n' "$1" "$2" "$3"
+  printf '%-5s %-52s %s\n' "$result_label" "$2" "$3"
 }
 
 # ---- poll worker control ----------------------------------------------------------------------------------

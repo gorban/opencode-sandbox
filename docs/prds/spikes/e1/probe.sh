@@ -51,6 +51,7 @@ owned() {
     image) fmt='{{ index .Config.Labels "oc.spike.e1.owner" }}';;
     container) fmt='{{ index .Config.Labels "oc.spike.e1.owner" }}';;
     pod) fmt='{{ index .Labels "oc.spike.e1.owner" }}';;
+    *) return 1;;
   esac
   [[ "$(pm "$kind" inspect --format "$fmt" "$name" 2>/dev/null)" = "$OWNER" ]]
 }
@@ -58,26 +59,29 @@ owned() {
 # Files are created by Podman only after resource creation, not from candidate names.
 # Require a full immutable ID: never let an empty, abbreviated or forged value resolve as a name.
 read_id() {
-  local id
-  [[ -f "$1" ]] && [[ ! -L "$1" ]] || return 1
-  id=$(<"$1")
+  local receipt=$1 id
+  [[ -f "$receipt" ]] && [[ ! -L "$receipt" ]] || return 1
+  id=$(<"$receipt")
   id=${id#sha256:}
   [[ $id =~ ^[0-9a-f]{64}$ ]] || return 1
   printf '%s' "$id"
 }
 remove_id() {
   local kind=$1 file=$2 id rc
+  local -a remove_argv
+  case $kind in
+    container) remove_argv=(rm -f);;
+    pod) remove_argv=(pod rm);;
+    image) remove_argv=(rmi);;
+    *) log "unsupported resource kind: $kind"; return 1;;
+  esac
   [[ -e "$file" ]] || [[ -L "$file" ]] || return 0
   id=$(read_id "$file") || { log "invalid $kind ID receipt: $file"; return 1; }
   pm "$kind" exists "$id" >/dev/null 2>&1; rc=$?
   [[ "$rc" = 1 ]] && return 0  # auto-removed one-shot container
   [[ "$rc" = 0 ]] || { log "cannot check $kind ID $id"; return 1; }
   owned "$kind" "$id" || { log "$kind ID $id does not have this run's owner label"; return 1; }
-  case $kind in
-    container) pm rm -f "$id" >/dev/null;;
-    pod) pm pod rm "$id" >/dev/null;;
-    image) pm rmi "$id" >/dev/null;;
-  esac || { log "could not remove $kind ID $id"; return 1; }
+  pm "${remove_argv[@]}" "$id" >/dev/null || { log "could not remove $kind ID $id"; return 1; }
 }
 cleanup() {
   local status=$? failed=0 f
@@ -171,16 +175,16 @@ gen() {
 # The exact commands quoted in prd_e1.md, run for the two recommended CA variants (D and E).
 recommended() {
   log "recommended.sh (the PRD snippet) for variants D and E"
-  local V NC san
-  for V in D E; do
-    NC=$(awk -F'\t' -v v=$V '$1==v{print $2}' "$HERE/variants.tsv")
-    san='DNS:feat-a.oc-sandbox.internal'; [[ $V = D ]] && san='DNS:feat-a.oc-sandbox.internal,DNS:localhost,IP:127.0.0.1,IP:::1'
-    must "${H[@]}" bash "$HERE/recommended.sh" "$W/rec-$V" "$HERE" feat-a.oc-sandbox.internal "$NC" "$san"
-    "${HOSTSSL[@]}" verify -CAfile "$W/rec-$V/ca.pem" -verify_hostname feat-a.oc-sandbox.internal "$W/rec-$V/cert.pem" >/dev/null \
-      || die "recommended leaf for $V does not verify"
-    "${HOSTSSL[@]}" x509 -in "$W/rec-$V/ca.pem" -noout -text | grep -q 'Name Constraints: critical' || die "recommended CA $V lacks nameConstraints"
-    [[ "$(stat -c %a "$W/rec-$V/ca.key")" = 600 ]] || die "ca.key is not 0600"
-    echo "recommended $V: leaf verifies, nameConstraints critical, ca.key 0600" >> "$W/results/recommended.txt"
+  local variant constraints san
+  for variant in D E; do
+    constraints=$(awk -F'\t' -v v=$variant '$1==v{print $2}' "$HERE/variants.tsv")
+    san='DNS:feat-a.oc-sandbox.internal'; [[ $variant = D ]] && san='DNS:feat-a.oc-sandbox.internal,DNS:localhost,IP:127.0.0.1,IP:::1'
+    must "${H[@]}" bash "$HERE/recommended.sh" "$W/rec-$variant" "$HERE" feat-a.oc-sandbox.internal "$constraints" "$san"
+    "${HOSTSSL[@]}" verify -CAfile "$W/rec-$variant/ca.pem" -verify_hostname feat-a.oc-sandbox.internal "$W/rec-$variant/cert.pem" >/dev/null \
+      || die "recommended leaf for $variant does not verify"
+    "${HOSTSSL[@]}" x509 -in "$W/rec-$variant/ca.pem" -noout -text | grep -q 'Name Constraints: critical' || die "recommended CA $variant lacks nameConstraints"
+    [[ "$(stat -c %a "$W/rec-$variant/ca.key")" = 600 ]] || die "ca.key is not 0600"
+    echo "recommended $variant: leaf verifies, nameConstraints critical, ca.key 0600" >> "$W/results/recommended.txt"
   done
 }
 
