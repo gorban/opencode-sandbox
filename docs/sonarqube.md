@@ -2,6 +2,8 @@
 
 [Development](development.md) · [PRD K](prds/prd_k.md#first-merge-gate--sonarqube-cloud)
 
+For coverage import, see [Publish coverage from a trusted host](sonar-publisher.md).
+
 ## Project setup
 
 The [SonarQube Cloud project](https://sonarcloud.io/dashboard?id=gorban_opencode-sandbox)
