@@ -230,8 +230,10 @@ class UpdateTests(unittest.TestCase):
                             is_old=candidate.read_bytes()==b'old binary'
                             return invalid if is_old == (phase=='old') else 'opencode v2.3.0\n'
                         raise AssertionError(args)
-                    out=io.BytesIO()
-                    with self.assertRaises(ValueError): update.stage(self.snapshot(),'2.3.0',out,fake)
+                    out = io.BytesIO()
+                    snapshot = self.snapshot()
+                    with self.assertRaises(ValueError):
+                        update.stage(snapshot, '2.3.0', out, fake)
                     self.assertEqual(out.getvalue(),b''); self.assertEqual(self.live.read_bytes(),b'old binary')
     def test_stages_then_promotes_atomically_and_honours_pin(self):
         fake,calls=self.runner(version='opencode v2.3.0\n'); frame=self.stage(fake,'2.3.0')
@@ -242,11 +244,15 @@ class UpdateTests(unittest.TestCase):
         for exc in (RuntimeError('offline'),subprocess.TimeoutExpired('updater',1)):
             out=io.BytesIO()
             def fail(*args): raise exc
-            with self.assertRaises(type(exc)): update.stage(self.snapshot(),'',out,fail)
+            snapshot = self.snapshot()
+            with self.assertRaises(type(exc)):
+                update.stage(snapshot, '', out, fail)
             self.assertEqual(out.getvalue(),b''); self.assertEqual(self.live.read_bytes(),b'old binary')
     def test_wrong_pin_and_incomplete_or_corrupt_frame_do_not_promote(self):
         fake,_=self.runner(version='2.3.1'); out=io.BytesIO()
-        with self.assertRaises(ValueError): update.stage(self.snapshot(),'2.3.0',out,fake)
+        snapshot = self.snapshot()
+        with self.assertRaises(ValueError):
+            update.stage(snapshot, '2.3.0', out, fake)
         self.assertEqual(out.getvalue(),b''); self.assertEqual(self.live.read_bytes(),b'old binary')
         fake,_=self.runner(); frame=self.stage(fake)
         for bad in (frame[:-1],frame[:-len(update.END)]+b'bad'):
