@@ -20,7 +20,7 @@ OC_E1_NOMAIN=1 bash -c '
  IMGS_BUILT=("$P-alpine")
  cleanup
 ' 2>/dev/null || true
-if [ -s "$t/actions" ]; then echo 'deleted resources without creation receipts' >&2; cat "$t/actions" >&2; exit 1; fi
+if [[ -s "$t/actions" ]]; then echo 'deleted resources without creation receipts' >&2; cat "$t/actions" >&2; exit 1; fi
 fi
 if [[ ${E1_OWNERSHIP_CASE:-all} != failed && ${E1_OWNERSHIP_CASE:-all} != build ]]; then
 # Simulate names being replaced between inspection and deletion: only the IDs of
