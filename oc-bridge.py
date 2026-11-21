@@ -323,6 +323,18 @@ def valid_identity(value, length):
             and all(type(number) is int for number in value))
 
 
+def validate_session_entry(tool, entry):
+    if not isinstance(entry, dict) or not canonical_parts(entry.get("parts")):
+        raise Refused("non-canonical staged path")
+    kind = entry.get("kind")
+    if kind == "dir" and tool == "bcompare":
+        return
+    if (kind != "file" or type(entry.get("mode", 0o644)) is not int
+            or not valid_identity(entry.get("seen"), 3)
+            or not valid_identity(entry.get("target"), 4)):
+        raise Refused("invalid staged entry")
+
+
 def read_session_manifest(session_fd):
     fd, _ = open_regular(session_fd, "manifest.json")
     with os.fdopen(fd, "rb") as stream:
@@ -341,15 +353,7 @@ def read_session_manifest(session_fd):
     if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_PATHS:
         raise Refused("invalid session entry count")
     for entry in entries:
-        if not isinstance(entry, dict) or not canonical_parts(entry.get("parts")):
-            raise Refused("non-canonical staged path")
-        kind = entry.get("kind")
-        if kind == "dir" and tool == "bcompare":
-            continue
-        if (kind != "file" or type(entry.get("mode", 0o644)) is not int
-                or not valid_identity(entry.get("seen"), 3)
-                or not valid_identity(entry.get("target"), 4)):
-            raise Refused("invalid staged entry")
+        validate_session_entry(tool, entry)
     return tool, entries
 
 
