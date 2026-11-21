@@ -11,6 +11,13 @@ SonarQube Cloud GitHub App for the repository, and verify **Administration → A
 shows automatic analysis. The app uses its GitHub installation to analyze the repository.
 [Sonar GitHub setup](https://docs.sonarsource.com/sonarqube-cloud/getting-started/github)
 
+[`.sonarcloud.properties`](../.sonarcloud.properties) keeps `tests/` in the test scope and
+uses the rest of the tracked tree as source. It configures Python 3.11 through 3.14, from
+the host minimum through SonarCloud's documented full support. Revisit the upper bound
+when SonarCloud documents full Python 3.15 support.
+[Automatic analysis settings](https://docs.sonarsource.com/sonarqube-cloud/advanced-setup/automatic-analysis#additional-analysis-configuration) ·
+[SonarCloud Python support](https://docs.sonarsource.com/sonarqube-cloud/advanced-setup/languages/python#supported-versions)
+
 Verify **Administration → New Code** and inspect the first analyses of `main`. Record
 the analyzed commit, computed quality gate, and file scope. Sonar may need a second
 analysis to compute the gate. Its PR gate evaluates new code relative to the target branch.
