@@ -1,21 +1,95 @@
-"""Merge results/*.tsv (client V L OK|FAIL detail) into text matrices and run validity checks.
+"""Merge results/*.tsv from the probe's private working directory and run validity checks.
 Exit status 1 when the run cannot be trusted: a client or a row is missing, a rejection lacks recognized per-client certificate verification
 evidence, or the unconstrained control CA X does not
 behave as expected (plain leaves and the CA-twin chain accepted, the unconstrained intermediate
 rejected by pathlen:0). The separate control endpoint and generic certificate errors do not prove each individual cause."""
-import csv, glob, os, re, sys, collections
+import collections
+import csv
+import io
+import os
+import re
+import stat
+import sys
+
 ROW_FORMAT = "%-*s %s"
-W = sys.argv[1]
-res = collections.OrderedDict()   # client -> {(V,L): (r, d)}
-for f in sorted(glob.glob(os.path.join(W, "results", "*.tsv"))):
-    for row in csv.reader(open(f), delimiter="\t"):
-        if len(row) < 4: continue
-        c, V, L, r = row[:4]; d = row[4] if len(row) > 4 else ""
-        res.setdefault(c, {})[(V, L)] = (r, d)
-variants = [l.split("\t")[0] for l in open(os.path.join(W, "variants.tsv")).read().splitlines() if l]
-leaves = [l.split("\t")[0] for l in open(os.path.join(W, "leaves.tsv")).read().splitlines() if l]
-mode = {l.split("\t")[0]: l.split("\t")[4] for l in open(os.path.join(W, "leaves.tsv")).read().splitlines() if l}
-combos = [tuple(l.split("\t")[:2]) for l in open(os.path.join(W, "combos.tsv")).read().splitlines() if l]
+MAX_RESULT_FILES = 32
+MAX_RESULT_BYTES = 1024 * 1024
+
+
+def file_version(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def result_names(directory):
+    names = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.name.startswith(".") or not entry.name.endswith(".tsv"):
+                continue
+            names.append(entry.name)
+            if len(names) > MAX_RESULT_FILES:
+                raise ValueError("too many result files")
+    return sorted(names)
+
+
+def read_result(directory, name):
+    before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError(f"result must be a single-link regular file: {name!r}")
+    if before.st_size > MAX_RESULT_BYTES:
+        raise ValueError(f"result exceeds the byte limit: {name!r}")
+    expected = file_version(before)
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        if file_version(os.fstat(fd)) != expected:
+            raise ValueError(f"result changed before reading: {name!r}")
+        with open(fd, "rb", buffering=0, closefd=False) as result:
+            data = result.read(MAX_RESULT_BYTES + 1)
+        after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (len(data) != before.st_size or file_version(after) != expected
+                or file_version(os.fstat(fd)) != expected):
+            raise ValueError(f"result changed while reading: {name!r}")
+        return data
+    finally:
+        os.close(fd)
+
+
+def read_results():
+    results = collections.OrderedDict()
+    directory = os.open("results", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        expected = file_version(os.fstat(directory))
+        if file_version(os.stat("results", follow_symlinks=False)) != expected:
+            raise ValueError("results directory changed before reading")
+        for name in result_names(directory):
+            data = read_result(directory, name)
+            with io.TextIOWrapper(io.BytesIO(data)) as decoded:
+                for row in csv.reader(decoded, delimiter="\t"):
+                    if len(row) < 4:
+                        continue
+                    client, variant, leaf, result = row[:4]
+                    detail = row[4] if len(row) > 4 else ""
+                    results.setdefault(client, {})[(variant, leaf)] = (result, detail)
+        if (file_version(os.stat("results", follow_symlinks=False)) != expected
+                or file_version(os.fstat(directory)) != expected):
+            raise ValueError("results directory changed while reading")
+    finally:
+        os.close(directory)
+    return results
+
+
+# Historical replays may pass the literal ".". The host sets the workspace through cwd.
+if sys.argv[1:] not in ([], ["."]):
+    sys.exit("Run the matrix from the probe's private working directory")
+try:
+    res = read_results()
+except (OSError, ValueError, csv.Error) as error:
+    sys.exit(f"Cannot read matrix results: {error}")
+variants = [l.split("\t")[0] for l in open("variants.tsv").read().splitlines() if l]
+leaves = [l.split("\t")[0] for l in open("leaves.tsv").read().splitlines() if l]
+mode = {l.split("\t")[0]: l.split("\t")[4] for l in open("leaves.tsv").read().splitlines() if l}
+combos = [tuple(l.split("\t")[:2]) for l in open("combos.tsv").read().splitlines() if l]
 
 def short(c):
     host = "4.0" in c.split("-")[-1] and c.startswith("openssl")

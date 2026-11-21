@@ -35,7 +35,9 @@ with tempfile.TemporaryDirectory(dir=scratch) as td:
         for c, detail in errors.items():
             rows += [f'{c}\tA\tleaf\tFAIL\t{error if c == target else detail}', f'{c}\tX\tleaf\tOK\t']
         (w/'results'/'fixture.tsv').write_text('\n'.join(rows)+'\n')
-        return subprocess.run([sys.executable, str(src/'matrix.py'), str(w)], stdout=subprocess.DEVNULL).returncode
+        return subprocess.run(
+            [sys.executable, str(src/'matrix.py'), '.'], cwd=w, stdout=subprocess.DEVNULL,
+        ).returncode
     assert validate() == 0, 'legitimate verification errors rejected'
     for error in ('net::ERR_SSL_PROTOCOL_ERROR', 'SSL error: wrong version number', 'SSL connect error', 'unknown error'):
         for client in errors:
