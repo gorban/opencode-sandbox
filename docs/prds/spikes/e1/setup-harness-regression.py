@@ -36,6 +36,15 @@ def _read_pty(master, proc, deadline):
     return data
 
 
+def _check_pty_result(data, proc, expected_lines, expect_hang):
+    lines = data.count(b'aborted without a result cell')
+    if expect_hang:
+        assert proc.poll() is None and lines == expected_lines, (proc.poll(), data)
+    else:
+        assert proc.wait(timeout=2) == 0 and lines == expected_lines, data
+    print(f'{"old" if expect_hang else "new"} controlling PTY: {lines} checks, ' + ('blocked as expected' if expect_hang else 'exited successfully'))
+
+
 def pty_run(script, expected_lines, expect_hang=False):
     master, slave = pty.openpty()
     def setup():
@@ -45,12 +54,7 @@ def pty_run(script, expected_lines, expect_hang=False):
     os.close(slave); deadline = time.monotonic() + (4 if expect_hang else 15)
     try:
         data = _read_pty(master, proc, deadline)
-        lines = data.count(b'aborted without a result cell')
-        if expect_hang:
-            assert proc.poll() is None and lines == expected_lines, (proc.poll(), data)
-        else:
-            assert proc.wait(timeout=2) == 0 and lines == expected_lines, data
-        print(f'{"old" if expect_hang else "new"} controlling PTY: {lines} checks, ' + ('blocked as expected' if expect_hang else 'exited successfully'))
+        _check_pty_result(data, proc, expected_lines, expect_hang)
     finally:
         if proc.poll() is None:
             # Give the new harness a chance to clean its own nested fixture session.

@@ -31,6 +31,21 @@ def _validate_urls(data, proxy_port):
         ports.add(u.port)
 
 
+def _verified_ca_copies(run, data):
+    copies = {}
+    for variant in ('E', 'X'):
+        ca = run / 'ca' / f'{variant}.pem'
+        if ca.is_symlink() or ca.parent.is_symlink() or ca.resolve(strict=True) != ca or not ca.is_file():
+            raise ValueError(f'unsafe {variant} CA path')
+        if data['ca_files'][variant] != str(ca): raise ValueError(f'{variant} CA path does not match manifest')
+        pem = ca.read_bytes()
+        digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem.decode('ascii'))).hexdigest()
+        if digest != data['ca_sha256'][variant]: raise ValueError(f'{variant} CA fingerprint mismatch')
+        copies[variant] = pem
+    if data['ca_sha256']['E'] == data['ca_sha256']['X']: raise ValueError('CAs are not distinct')
+    return copies
+
+
 def checked_manifest(path):
     repo = Path(__file__).resolve().parents[4]
     scratch = repo / '.scratch'
@@ -54,17 +69,7 @@ def checked_manifest(path):
     expected = {f'{v}/{leaf}' for v in ('E', 'X') for leaf in HOSTS}
     if set(data['urls']) != expected: raise ValueError('manifest must contain exactly six fixture URLs')
     _validate_urls(data, proxy_port)
-    copies = {}
-    for variant in ('E', 'X'):
-        ca = run / 'ca' / f'{variant}.pem'
-        if ca.is_symlink() or ca.parent.is_symlink() or ca.resolve(strict=True) != ca or not ca.is_file():
-            raise ValueError(f'unsafe {variant} CA path')
-        if data['ca_files'][variant] != str(ca): raise ValueError(f'{variant} CA path does not match manifest')
-        pem = ca.read_bytes()
-        digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem.decode('ascii'))).hexdigest()
-        if digest != data['ca_sha256'][variant]: raise ValueError(f'{variant} CA fingerprint mismatch')
-        copies[variant] = pem
-    if data['ca_sha256']['E'] == data['ca_sha256']['X']: raise ValueError('CAs are not distinct')
+    copies = _verified_ca_copies(run, data)
     return run, data, copies
 
 
