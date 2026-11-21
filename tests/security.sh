@@ -255,7 +255,7 @@ PY
 run_fixture_session() { timeout 20 python3 -I "$BRIDGE" session "$T/stage/$1" 2>>"$T/bridge.log"; }
 session_refused() {
   run_fixture_session "$1"
-  [ "$?" -eq 2 ] && [ ! -e "$T/tool.args" ]
+  [[ $? -eq 2 && ! -e "$T/tool.args" ]]
 }
 
 reset_tool; make_session unknown-tool unknown 0
@@ -274,7 +274,7 @@ FAKE_AGENT="mv '$SB/construct/save-recovery' '$SB/construct/recovery-original'" 
 retained_edit() {
   local path
   for path in "$T/stage"/*/files/construct/save-recovery/a.txt; do
-    if [ -f "$path" ] && grep -qx recover-me "$path"; then return 0; fi
+    if [[ -f $path ]] && grep -qx recover-me "$path"; then return 0; fi
   done
   return 1
 }
