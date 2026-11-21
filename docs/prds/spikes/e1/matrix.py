@@ -4,6 +4,7 @@ evidence, or the unconstrained control CA X does not
 behave as expected (plain leaves and the CA-twin chain accepted, the unconstrained intermediate
 rejected by pathlen:0). The separate control endpoint and generic certificate errors do not prove each individual cause."""
 import csv, glob, os, re, sys, collections
+ROW_FORMAT = "%-*s %s"
 W = sys.argv[1]
 res = collections.OrderedDict()   # client -> {(V,L): (r, d)}
 for f in sorted(glob.glob(os.path.join(W, "results", "*.tsv"))):
@@ -21,7 +22,10 @@ def short(c):
     for pre, nm in (("openssl-verify+host", "vfy+h"), ("openssl-verify", "vfy"), ("openssl-s_client", "s_cli"),
                     ("curl", "curl"), ("py", "py"), ("node", "node"), ("go", "go"), ("psql", "psql"),
                     ("chromium", "chrom"), ("nss", "nss")):
-        if c.startswith(pre): return (("H" if host else "A") + nm) if c.startswith("openssl-verify") else nm
+        if c.startswith(pre):
+            if c.startswith("openssl-verify"):
+                return ("H" if host else "A") + nm
+            return nm
     return c[:5]
 order = ["Hvfy", "Hvfy+h", "Avfy", "Avfy+h", "s_cli", "curl", "py", "node", "go", "psql", "chrom", "nss"]
 clients = sorted(res, key=lambda c: order.index(short(c)) if short(c) in order else 99)
@@ -38,14 +42,15 @@ for c in clients:
     if miss: problems.append("%s: %d of %d rows missing (first %s)" % (short(c), len(miss), len(combos), miss[0]))
 # Fail closed: each client must report recognizable certificate-validation evidence.
 # TLS protocol, connection, and unknown errors are not evidence of a name constraint.
+CONSTRAINT_ERROR = r"^(permitted subtree violation|excluded subtree violation|path length constraint exceeded)$"
 VERIFY = {
-    "Hvfy": r"^(permitted subtree violation|excluded subtree violation|path length constraint exceeded)$",
-    "Hvfy+h": r"^(permitted subtree violation|excluded subtree violation|path length constraint exceeded)$",
-    "Avfy": r"^(permitted subtree violation|excluded subtree violation|path length constraint exceeded)$",
-    "Avfy+h": r"^(permitted subtree violation|excluded subtree violation|path length constraint exceeded)$",
+    "Hvfy": CONSTRAINT_ERROR,
+    "Hvfy+h": CONSTRAINT_ERROR,
+    "Avfy": CONSTRAINT_ERROR,
+    "Avfy+h": CONSTRAINT_ERROR,
     "s_cli": r"^num=(47:permitted subtree violation|48:excluded subtree violation|25:path length constraint exceeded)$",
     "curl": r"^SSL certificate problem: (permitted subtree violation|excluded subtree violation|path length constraint exceeded)$",
-    "py": r"^(permitted subtree violation|excluded subtree violation|path length constraint exceeded)$",
+    "py": CONSTRAINT_ERROR,
     "node": r"^(UNSPECIFIED (permitted|excluded) subtree violation|PATH_LENGTH_EXCEEDED path length constraint exceeded)$",
     "go": r"^tls: failed to (verify certificate: x509: (a root or intermediate certificate is not authorized to sign for this name: .+|too many intermediates for path length constraint|certificate relies on legacy Common Name field, use SANs instead)|parse certificate from server: x509: SAN iPAddress contains IPv4-mapped IPv6 address)$",
     "psql": r"^connection to server at .+ failed: SSL error: certificate verify failed$",
@@ -79,16 +84,24 @@ for V in variants:
         cells = []
         for c in clients:
             r = res[c].get((V, L))
-            cells.append("?     " if r is None else ("ok    " if r[0] == "OK" else "--    "))
-        print(("%-*s %s" % (w, L, " ".join(cells))).rstrip())
+            if r is None:
+                cells.append("?     ")
+            else:
+                cells.append("ok    " if r[0] == "OK" else "--    ")
+        print((ROW_FORMAT % (w, L, " ".join(cells))).rstrip())
 print("\nSUMMARY (cell: all = every client accepts, none = every client rejects, else the accepting subset)")
-print(("%-*s %s" % (w, "", " ".join("%-24s" % ("CA " + V) for V in variants))).rstrip())
+print((ROW_FORMAT % (w, "", " ".join("%-24s" % ("CA " + V) for V in variants))).rstrip())
 for L in leaves:
     cells = []
     for V in variants:
         acc = [short(c) for c in clients if res[c].get((V, L), ("?",))[0] == "OK"]
-        cells.append("all" if len(acc) == len(clients) else "none" if not acc else "ok: " + ",".join(acc))
-    print(("%-*s %s" % (w, L, " ".join("%-24s" % x for x in cells))).rstrip())
+        if len(acc) == len(clients):
+            cells.append("all")
+        elif not acc:
+            cells.append("none")
+        else:
+            cells.append("ok: " + ",".join(acc))
+    print((ROW_FORMAT % (w, L, " ".join("%-24s" % x for x in cells))).rstrip())
 print("\nclients:")
 for c in clients: print("%-7s %s" % (short(c), c))
 NAMED = re.compile(r"permitted subtree|not permitted by any constraint|not permitted to issue|path length|pathlen", re.I)

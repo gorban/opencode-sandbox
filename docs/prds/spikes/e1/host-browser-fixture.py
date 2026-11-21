@@ -92,6 +92,7 @@ class TLSHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
 
     def log_message(self, *args):
+        # Keep request logs out of the fixture's launch and shutdown messages.
         pass
 
 
@@ -123,7 +124,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             if method != 'CONNECT' or version not in ('HTTP/1.0', 'HTTP/1.1') or authority not in self.server.routes:
                 raise ValueError('not an allowed CONNECT')
             port = self.server.routes[authority]
-        except (UnicodeDecodeError, ValueError):
+        except ValueError:
             client.sendall(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
             return
         # No DNS lookup or arbitrary destination: the only outbound address is loopback.
@@ -240,7 +241,7 @@ def main():
             thread.start(); threads.append(thread)
         data = {'proxy': f'{HOST}:{proxy.server_address[1]}', 'urls': endpoints,
                 'ca_sha256': fingerprints, 'marker': marker, 'expires_seconds': args.seconds}
-        run, manifest, launcher = prepare_firefox(Path(args.assets).resolve().parent, cas,
+        _, manifest, launcher = prepare_firefox(Path(args.assets).resolve().parent, cas,
                                                    proxy.server_address[1], data)
         print(f'Fixture ready (loopback only; expires in {args.seconds}s)\n'
               f'Manifest: {manifest}\nFirefox launcher: {launcher}', flush=True)

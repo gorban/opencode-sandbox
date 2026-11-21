@@ -5,6 +5,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+ABORT_PREFIX = 'ABORT:'
+VERSION_PREFIX = '== versions:'
+
 repo = Path(__file__).resolve().parents[4]
 probe = Path(os.environ.get('OC_SPIKE_PROBE', Path(__file__).with_name('probe.sh'))).resolve()
 base = repo / '.scratch'
@@ -81,7 +84,7 @@ esac
     only = os.environ.get('OC_SPIKE_FAILURE_ONLY')
     if only:
         p, calls = run({'FAIL_WHICH': only})
-        assert 'ABORT:' in p.stderr and '== versions:' not in p.stdout, (only, p.stdout, p.stderr)
+        assert ABORT_PREFIX in p.stderr and VERSION_PREFIX not in p.stdout, (only, p.stdout, p.stderr)
         print(f'PASS: {only} failure stopped before resource creation')
         raise SystemExit(0)
 
@@ -165,7 +168,7 @@ inpod a "$FIXTURE_URL"
     for failure in ('host_tools', 'podman_version', 'rpm', 'nft_empty', 'kernel_empty', 'ip_empty',
                     'curl', 'ss', 'iptables', 'nsenter', 'image', 'unshare', 'pods', 'ctrs', 'images'):
         p, calls = run({'FAIL_WHICH': failure})
-        assert 'ABORT:' in p.stderr and '== versions:' not in p.stdout, (failure, p.stdout, p.stderr)
+        assert ABORT_PREFIX in p.stderr and VERSION_PREFIX not in p.stdout, (failure, p.stdout, p.stderr)
     # PATH contains no host-exec, even if one exists elsewhere on this machine.
     empty_path = root / 'no-host-exec'
     empty_path.mkdir()
@@ -173,7 +176,7 @@ inpod a "$FIXTURE_URL"
                              env={**env, 'PATH': str(empty_path), 'CONTAINER_ID': 'fixture'},
                              text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
     assert missing.returncode != 0 and 'distrobox-host-exec is required' in missing.stderr
-    assert '== versions:' not in missing.stdout
+    assert VERSION_PREFIX not in missing.stdout
     unsupported, calls = run({'container': 'podman'})
     assert 'unsupported container environment' in unsupported.stderr
     assert not calls
@@ -182,5 +185,5 @@ inpod a "$FIXTURE_URL"
     timed_out, calls = run({'FAIL_WHICH': 'image', 'FAKE_IMAGE_RC': '124'})
     assert 'host preflight Python image timed out or returned 124 (exit 124)' in timed_out.stderr
     p, calls = run({'CONTAINER_ID': 'fixture', 'FAKE_HOST_EXEC_FAIL': '1'})
-    assert 'ABORT:' in p.stderr and '== versions:' not in p.stdout
+    assert ABORT_PREFIX in p.stderr and VERSION_PREFIX not in p.stdout
 print('PASS: 3 routing cases, 2 helper/worker modes, 15 prerequisite failures, unused info bypass, stage/status diagnostics, unsupported container, missing host-exec and failed host execution; no Podman mutations')
