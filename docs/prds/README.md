@@ -3,6 +3,24 @@
 How this tree works (progressive discovery, checkboxes, the human review gate): see
 [`AGENTS.md`](../../AGENTS.md#prds-progressive-discovery-in-docsprds).
 
+`[*]` means reserved by a named workstream. Leave reserved scope to its owner.
+Use `[ ]` for open work and `[x]` for completed work. Transfer or release a
+reservation explicitly in this index.
+
+## Workstream reservations
+
+- [*] Real subscription connections and sign-in lifecycle
+  ([I4](prd_i4.md), [I3](prd_i3.md)) — **Outside-in integrations**.
+- [*] SSH remote host onboarding and first remote sandbox run
+  ([I2](prd_i2.md#workers-and-connectivity)) — **Outside-in integrations**.
+- [*] Maintainer setup and end-to-end acceptance for these integrations
+  ([I](prd_i.md#recommended-first-slice), [I2](prd_i2.md), [I4](prd_i4.md)) — **Outside-in integrations**.
+
+Coordinate SSH fixtures and remote acceptance with **Warm worker seeding**
+(`codex/warm-worker-seeding`). That workstream owns [I5](prd_i5.md) warm-start
+seeding and cache qualification. The initial SSH onboarding and first run are
+reserved above.
+
 ## Implementation review gates
 
 These gates apply to work from any PRD, including a PRD that has already passed design review.
