@@ -13,9 +13,43 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tools.ci import core_coverage
 from tools.ci import run as ci
 from tools.ci import supervisor as lifecycle
 from tools.ci.supervisor import Supervisor
+
+
+class CoverageTests(unittest.TestCase):
+    def test_checkout_cannot_shadow_coverage_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            python = root / 'venv/bin/python'
+            subprocess.run([sys.executable, '-Im', 'venv', '--without-pip', str(root / 'venv')],
+                           check=True, timeout=30)
+            site_packages = subprocess.check_output(
+                [str(python), '-IB', '-c', 'import sysconfig; print(sysconfig.get_path("purelib"))'],
+                text=True, timeout=10,
+            ).strip()
+            self.assertTrue(Path(site_packages).resolve().is_relative_to(root.resolve()))
+            package = Path(site_packages) / 'coverage'
+            package.mkdir()
+            (package / '__init__.py').touch()
+            (package / 'cmdline.py').write_text(
+                'import sys\nfrom pathlib import Path\n\n'
+                'def main():\n'
+                '    if sys.argv[1] == "run":\n'
+                '        import core_fixture\n'
+                '        assert core_fixture.loaded\n'
+                '    with Path("calls").open("a") as calls:\n'
+                '        print(sys.argv[1], file=calls)\n'
+            )
+            (root / 'core_fixture.py').write_text('loaded = True\n')
+            (root / 'coverage.py').write_text('raise SystemExit(91)\n')
+            with patch.object(core_coverage, 'ROOT', root), \
+                    patch.object(core_coverage, 'install_coverage', return_value=str(python)), \
+                    patch.object(core_coverage, 'report_coverage'):
+                core_coverage.main()
+            self.assertEqual((root / 'calls').read_text().splitlines(), ['run', 'run', 'json', 'xml'])
 
 
 class PortableTests(unittest.TestCase):

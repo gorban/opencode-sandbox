@@ -17,6 +17,22 @@ WHEEL = (
     'coverage-7.11.0-py3-none-any.whl'
 )
 WHEEL_HASH = '4b7589765348d78fb4e5fb6ea35d07564e387da2fc5efff62e0222971f155f68'
+COVERAGE_ENTRY = '''
+from pathlib import Path
+import sys
+
+import coverage
+
+if not Path(coverage.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()):
+    raise SystemExit('Coverage.py must load from the private virtual environment')
+
+from coverage.cmdline import main
+
+if sys.argv[1] == 'run':
+    sys.path.append(str(Path.cwd()))
+
+raise SystemExit(main())
+'''
 CORES = {
     'oc_bridge_merge.py': 'bridge_merge_core.py',
     'oc_controller.py': 'test_controller_core.py',
@@ -63,7 +79,7 @@ def main():
         env.update(COVERAGE_RCFILE=str(config), COVERAGE_FILE=str(scratch / '.coverage'))
 
         def coverage(*args):
-            subprocess.run([python, '-EsB', '-m', 'coverage', *args],
+            subprocess.run([python, '-IB', '-c', COVERAGE_ENTRY, *args],
                            cwd=ROOT, env=env, check=True, timeout=60)
 
         for suite in CORES.values():

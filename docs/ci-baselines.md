@@ -11,6 +11,7 @@ suites and reports covered and total statements and branches for `oc_bridge_merg
 `oc_controller.py`. It verifies repository-relative paths in the XML before discarding
 the private scratch reports. Shell scripts, subprocesses, and separately launched
 interpreters are outside this measurement.
+Compare counts from the same Python version because the set of traced statements can vary.
 
 SonarQube Cloud automatic analysis continues to report the required zero-new-issues gate.
 It cannot import [coverage reports](https://docs.sonarsource.com/sonarqube-cloud/analyzing-source-code/test-coverage/overview).
