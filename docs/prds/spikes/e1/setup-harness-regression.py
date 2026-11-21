@@ -21,24 +21,30 @@ def active(pid):
         return False
     return data.rsplit(')', 1)[1].split()[0] != 'Z'
 
+def _read_pty(master, proc, deadline):
+    data = b''
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.1)
+        if ready:
+            try: data += os.read(master, 65536)
+            except OSError: break
+        if proc.poll() is not None: break
+    # Drain output already written just before the process exited.
+    while select.select([master], [], [], 0)[0]:
+        try: data += os.read(master, 65536)
+        except OSError: break
+    return data
+
+
 def pty_run(script, expected_lines, expect_hang=False):
     master, slave = pty.openpty()
     def setup():
         os.setsid(); fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
     proc = subprocess.Popen([sys.executable, '-u', '-I', str(script), str(HERE)], stdin=slave,
                             stdout=slave, stderr=slave, preexec_fn=setup, close_fds=True)
-    os.close(slave); data = b''; deadline = time.monotonic() + (4 if expect_hang else 15)
+    os.close(slave); deadline = time.monotonic() + (4 if expect_hang else 15)
     try:
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([master], [], [], 0.1)
-            if ready:
-                try: data += os.read(master, 65536)
-                except OSError: break
-            if proc.poll() is not None: break
-        # Drain output already written just before the process exited.
-        while select.select([master], [], [], 0)[0]:
-            try: data += os.read(master, 65536)
-            except OSError: break
+        data = _read_pty(master, proc, deadline)
         lines = data.count(b'aborted without a result cell')
         if expect_hang:
             assert proc.poll() is None and lines == expected_lines, (proc.poll(), data)
