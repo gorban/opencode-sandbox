@@ -224,28 +224,31 @@ start_pod() {
 
 # ---------------------------------------------------------------- 3. clients
 run_clients() {
-  local R=$W/results
+  local results=$W/results
   log "openssl verify, host"
-  OC_W=$W bash "$HERE/clients/openssl_verify.sh" "${HOSTSSL[@]}" > "$R/openssl-host-verify.tsv" 2> "$R/openssl-host-verify.err" || die "host OpenSSL client setup failed"
+  OC_W=$W bash "$HERE/clients/openssl_verify.sh" "${HOSTSSL[@]}" > "$results/openssl-host-verify.tsv" 2> "$results/openssl-host-verify.err" || die "host OpenSSL client setup failed"
   log "openssl verify + s_client, curl (alpine)"
-  crun -v "$R":/w/results:rw "$ALPINE_ID" bash -c 'bash /c/openssl_verify.sh openssl > /w/results/openssl-alpine-verify.tsv || exit 1; bash /c/sclient.sh > /w/results/openssl-alpine-sclient.tsv || exit 1; bash /c/curl.sh > /w/results/curl.tsv' 2>>"$R/alpine.err" || die "alpine OpenSSL client setup failed"
+  # Keep the shared workspace read-only. The host owns the result filenames.
+  crun "$ALPINE_ID" bash /c/openssl_verify.sh openssl > "$results/openssl-alpine-verify.tsv" 2>> "$results/alpine.err" || die "alpine OpenSSL client setup failed"
+  crun "$ALPINE_ID" bash /c/sclient.sh > "$results/openssl-alpine-sclient.tsv" 2>> "$results/alpine.err" || die "alpine OpenSSL client setup failed"
+  crun "$ALPINE_ID" bash /c/curl.sh > "$results/curl.tsv" 2>> "$results/alpine.err" || die "alpine OpenSSL client setup failed"
   log "python"
-  crun $PY_IMG python -I /c/py_tls.py > "$R/python.tsv" 2>"$R/python.err" || die "python client failed"
+  crun $PY_IMG python -I /c/py_tls.py > "$results/python.tsv" 2>"$results/python.err" || die "python client failed"
   log "node (NODE_EXTRA_CA_CERTS)"
-  crun $NODE_IMG sh -c 'set -e; for V in $(cut -f1 /w/variants.tsv); do NODE_EXTRA_CA_CERTS=/w/ca/$V/ca.pem node /c/node_tls.mjs $V; done' > "$R/node.tsv" 2>"$R/node.err" || die "node client failed"
+  crun $NODE_IMG sh -c 'set -e; for V in $(cut -f1 /w/variants.tsv); do NODE_EXTRA_CA_CERTS=/w/ca/$V/ca.pem node /c/node_tls.mjs $V; done' > "$results/node.tsv" 2>"$results/node.err" || die "node client failed"
   if [[ $SKIP_GO = 0 ]]; then
     log "go"
-    crun -e GOCACHE=/tmp/gocache -e HOME=/tmp -e GOFLAGS=-mod=mod -e GOTOOLCHAIN=local $GO_IMG sh -c 'cd /tmp && mkdir -p g && cp /c/go_tls.go g/main.go && cd g && go mod init x >/dev/null 2>&1; go run .' > "$R/go.tsv" 2>"$R/go.err" || die "go client failed"
+    crun -e GOCACHE=/tmp/gocache -e HOME=/tmp -e GOFLAGS=-mod=mod -e GOTOOLCHAIN=local $GO_IMG sh -c 'cd /tmp && mkdir -p g && cp /c/go_tls.go g/main.go && cd g && go mod init x >/dev/null 2>&1; go run .' > "$results/go.tsv" 2>"$results/go.err" || die "go client failed"
   fi
   if [[ $SKIP_PG = 0 ]]; then
     log "psql sslmode=verify-full against postgres:17"
-    run_pg > "$R/psql.tsv" 2>"$R/psql.err" || die "postgres client setup failed"
+    run_pg > "$results/psql.tsv" 2>"$results/psql.err" || die "postgres client setup failed"
   fi
   if [[ $SKIP_CHROMIUM = 0 ]]; then
     log "chromium headless (scratch NSS db per CA)"
-    crun "$CHROMIUM_ID" bash /c/chromium.sh > "$R/chromium.tsv" 2>"$R/chromium.err" || die "chromium client failed"
+    crun "$CHROMIUM_ID" bash /c/chromium.sh > "$results/chromium.tsv" 2>"$results/chromium.err" || die "chromium client failed"
     log "nss certutil -V (chain only)"
-    crun "$CHROMIUM_ID" bash /c/nss_certutil.sh > "$R/nss-certutil.tsv" 2>"$R/nss-certutil.err" || die "NSS client setup failed"
+    crun "$CHROMIUM_ID" bash /c/nss_certutil.sh > "$results/nss-certutil.tsv" 2>"$results/nss-certutil.err" || die "NSS client setup failed"
   fi
 }
 
