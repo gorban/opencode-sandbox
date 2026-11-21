@@ -1,4 +1,4 @@
-"""Merge results/*.tsv (client V L OK|FAIL detail) into text matrices and run validity checks.
+"""Merge results/*.tsv from the probe's private working directory and run validity checks.
 Exit status 1 when the run cannot be trusted: a client or a row is missing, a rejection lacks recognized per-client certificate verification
 evidence, or the unconstrained control CA X does not
 behave as expected (plain leaves and the CA-twin chain accepted, the unconstrained intermediate
@@ -55,12 +55,12 @@ def read_result(directory, name):
         os.close(fd)
 
 
-def read_results(path):
+def read_results():
     results = collections.OrderedDict()
-    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    directory = os.open("results", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         expected = file_version(os.fstat(directory))
-        if file_version(os.stat(path, follow_symlinks=False)) != expected:
+        if file_version(os.stat("results", follow_symlinks=False)) != expected:
             raise ValueError("results directory changed before reading")
         for name in result_names(directory):
             data = read_result(directory, name)
@@ -71,7 +71,7 @@ def read_results(path):
                     client, variant, leaf, result = row[:4]
                     detail = row[4] if len(row) > 4 else ""
                     results.setdefault(client, {})[(variant, leaf)] = (result, detail)
-        if (file_version(os.stat(path, follow_symlinks=False)) != expected
+        if (file_version(os.stat("results", follow_symlinks=False)) != expected
                 or file_version(os.fstat(directory)) != expected):
             raise ValueError("results directory changed while reading")
     finally:
@@ -79,15 +79,17 @@ def read_results(path):
     return results
 
 
-W = sys.argv[1]
+# Historical replays may pass the literal ".". The host sets the workspace through cwd.
+if sys.argv[1:] not in ([], ["."]):
+    sys.exit("Run the matrix from the probe's private working directory")
 try:
-    res = read_results(os.path.join(W, "results"))
+    res = read_results()
 except (OSError, ValueError, csv.Error) as error:
     sys.exit(f"Cannot read matrix results: {error}")
-variants = [l.split("\t")[0] for l in open(os.path.join(W, "variants.tsv")).read().splitlines() if l]
-leaves = [l.split("\t")[0] for l in open(os.path.join(W, "leaves.tsv")).read().splitlines() if l]
-mode = {l.split("\t")[0]: l.split("\t")[4] for l in open(os.path.join(W, "leaves.tsv")).read().splitlines() if l}
-combos = [tuple(l.split("\t")[:2]) for l in open(os.path.join(W, "combos.tsv")).read().splitlines() if l]
+variants = [l.split("\t")[0] for l in open("variants.tsv").read().splitlines() if l]
+leaves = [l.split("\t")[0] for l in open("leaves.tsv").read().splitlines() if l]
+mode = {l.split("\t")[0]: l.split("\t")[4] for l in open("leaves.tsv").read().splitlines() if l}
+combos = [tuple(l.split("\t")[:2]) for l in open("combos.tsv").read().splitlines() if l]
 
 def short(c):
     host = "4.0" in c.split("-")[-1] and c.startswith("openssl")

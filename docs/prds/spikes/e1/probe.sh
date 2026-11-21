@@ -269,7 +269,8 @@ main() {
   run_clients
   local exp="Hvfy,Hvfy+h,Avfy,Avfy+h,s_cli,curl,py,node"
   [[ $SKIP_GO = 0 ]] && exp+=",go"; [[ $SKIP_PG = 0 ]] && exp+=",psql"; [[ $SKIP_CHROMIUM = 0 ]] && exp+=",chrom,nss"
-  OC_E1_EXPECT=$exp python3 -I "$HERE/matrix.py" "$W" > "$W/matrix.txt"; local rc=$?
+  (cd -P -- "$W" && OC_E1_EXPECT=$exp exec python3 -I "$HERE/matrix.py") > "$W/matrix.txt"
+  local rc=$?
   cat "$W/matrix.txt" "$W/results/recommended.txt"
   [[ $rc = 0 ]] || { log "PROBE INVALID: see the CHECKS section above"; exit 1; }
 }

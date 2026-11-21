@@ -96,23 +96,39 @@ class MatrixIngestionTests(unittest.TestCase):
         (self.work / "combos.tsv").write_text("X\tleaf\n")
         (self.results / "good.tsv").write_bytes(b"py-3\tX\tleaf\tOK\r\n")
 
-    def matrix(self):
+    def matrix(self, *args, cwd=None):
         return subprocess.run(
-            [sys.executable, "-I", str(SOURCE / "matrix.py"), str(self.work)],
+            [sys.executable, "-I", str(SOURCE / "matrix.py"), *args],
+            cwd=self.work if cwd is None else cwd,
             env={**os.environ, "OC_E1_EXPECT": "py"}, text=True, capture_output=True, timeout=5,
         )
 
     def test_normal_results_and_hidden_file_filter(self):
-        baseline = self.matrix()
+        baseline = self.matrix(".")
         self.assertEqual(baseline.returncode, 0, baseline.stderr)
         self.assertIn("CHECKS: all passed", baseline.stdout)
         (self.results / ".ignored.tsv").write_bytes(b"py-3\tX\tleaf\tINVALID\n")
-        run = self.matrix()
+        run = self.matrix(".")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(run.stdout, baseline.stdout)
 
-    def assert_rejected(self, diagnostic):
+    def test_no_argument_matches_historical_replay(self):
         run = self.matrix()
+        replay = self.matrix(".")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(run.stdout, replay.stdout)
+
+    def test_rejects_an_alternate_workspace_before_reading(self):
+        empty = self.work / "empty"
+        empty.mkdir()
+        run = self.matrix(str(self.work), cwd=empty)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(run.stdout, "")
+        self.assertEqual(run.stderr, "Run the matrix from the probe's private working directory\n")
+
+    def assert_rejected(self, diagnostic):
+        run = self.matrix(".")
         self.assertEqual(run.returncode, 1, run.stderr)
         self.assertEqual(run.stdout, "")
         self.assertIn("Cannot read matrix results: " + diagnostic, run.stderr)
@@ -148,7 +164,8 @@ class MatrixIngestionTests(unittest.TestCase):
 
         with (
             patch.object(os, "fstat", changed_fstat),
-            patch.object(sys, "argv", ["matrix.py", str(self.work)]),
+            patch.object(sys, "argv", ["matrix.py", "."]),
+            contextlib.chdir(self.work),
             contextlib.redirect_stdout(io.StringIO()),
             self.assertRaises(SystemExit) as failure,
         ):
