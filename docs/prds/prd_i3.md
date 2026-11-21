@@ -1,7 +1,7 @@
 # prd_i3: Host credential broker and approvals
 
 Parent: [prd_i](prd_i.md) · related: [dashboard](prd_i1.md), [worker fleet](prd_i2.md),
-[LLM gateway](prd_i4.md)
+[LLM gateway](prd_i4.md), [outside-in broker and subscriptions](prd_i4a.md)
 
 ## Credential access
 
@@ -71,14 +71,14 @@ sequenceDiagram
 
 ## Open choices
 
-- [ ] (decision needed) **Broker integration** — typed host adapters for CI and model calls
-      (recommended, narrow and easy to audit, protocol work per provider, 3–5 days), or
-      OpenShell as a worker backend (wider network and credential policies, additional runtime
-      integration, 1–2 week spike). Verify placeholder substitution, event coverage, live
-      policy updates and enforcement with the exact release selected.
-- [ ] (decision needed) **Secret storage** — OS keyring (recommended for attended use, native
-      unlock, headless setup varies, 1–2 days), or age-encrypted store (portable files, needs
-      key management and an operator unlock flow, 2–4 days).
+- [ ] **Broker integration** — chosen: **typed host adapters** wired to
+      [oc_controller.py](../../oc_controller.py) (see [prd_i4a](prd_i4a.md) and
+      [prd_i2a](prd_i2a.md)). OpenShell remains deferred.
+- [ ] **Secret storage** — chosen: **generic pluggable password-manager interface** modeled on
+      `api-agent` (`managers.toml` + `version = 1` adapters, shipping with Keeper + interactive
+      PTY recovery and 1Password, custom adapters allowed) with declarative `.toml`/`.env`/ENV/CLI
+      config holding vault/item references only and pulling secrets into trusted host memory on
+      demand (see [prd_i4a](prd_i4a.md)).
 
 Companions include [OpenShell](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
 (Apache-2.0, [sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies)),

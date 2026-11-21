@@ -1,7 +1,8 @@
 # prd_i2: Worker fleet, browser wall and terminals
 
-Parent: [prd_i](prd_i.md) · related: [orchestrator](prd_i1.md), [broker](prd_i3.md),
-[warm worker starts](prd_i5.md), [per-instance networking](prd_d.md), [local HTTPS](prd_e.md)
+Parent: [prd_i](prd_i.md) · children: [SSH remote host onboarding](prd_i2a.md) · related:
+[orchestrator](prd_i1.md), [broker](prd_i3.md), [warm worker starts](prd_i5.md),
+[per-instance networking](prd_d.md), [local HTTPS](prd_e.md)
 
 ## Workers and connectivity
 
@@ -103,10 +104,10 @@ flowchart LR
 
 ## Open choices
 
-- [ ] (decision needed) **Transport** — SSH first (recommended, mature, reachable endpoint
-      required, 3–5 days). Tailcat (direct across compatible NAT, adds pairing and fallback
-      operations, 3–5 day spike). Tailscale/Headscale (fleet enrollment and ACLs, another
-      service or account to operate, 1–2 weeks).
+- [ ] **Transport** — chosen: **SSH first** (see [prd_i2a](prd_i2a.md), targeting a named
+      remote macOS Podman Machine or Linux rootless Podman worker with pinned Ed25519 host key,
+      Keeper SSH Agent, and workstation-only credentials over SSH reverse forward). Tailcat and
+      Tailscale/Headscale remain deferred to later slices.
 - [ ] (decision needed) **Browser view** — page previews via CDP (recommended first, efficient
       tiles, limited browser chrome and dialog visibility, 3–5 day spike) or virtual display
       with noVNC (full window, higher resource cost, 1–2 weeks).

@@ -1,7 +1,8 @@
 # prd_i: OpenCode orchestrator and sandbox fleet
 
 [Index](README.md) · children: [orchestrator and dashboard](prd_i1.md),
-[worker fleet](prd_i2.md), [credential broker](prd_i3.md), [LLM gateway](prd_i4.md),
+[worker fleet](prd_i2.md) ([SSH onboarding](prd_i2a.md)), [credential broker](prd_i3.md),
+[LLM gateway](prd_i4.md) ([outside-in broker and subscriptions](prd_i4a.md)),
 [warm worker starts](prd_i5.md)
 
 ## Executive summary

@@ -1,6 +1,7 @@
 # prd_i4: Host model gateway and subscription routes
 
-Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential broker](prd_i3.md)
+Parent: [prd_i](prd_i.md) · children: [outside-in broker, subscriptions, and agy acp](prd_i4a.md) ·
+related: [worker fleet](prd_i2.md), [credential broker](prd_i3.md)
 
 ## Gateway
 
@@ -64,10 +65,12 @@ Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential bro
 
 ## Open choice
 
-- [ ] (decision needed) **Gateway software** — LiteLLM for API-key routes (recommended first,
-      routing and worker credentials included, adds a service and storage, 2–4 days) or a
-      small provider adapter behind Caddy (smaller single-route deployment, more maintenance
-      as providers grow, 3–5 days for one route). Evaluate subscription support separately.
+- [ ] **Gateway software** — chosen: **thin host broker (`oc_llm_broker.py` + `oc_controller.py`)
+      fronting host-only LiteLLM Proxy** for Gemini, Claude, and GPT API-key routes, plus direct
+      host-brokered **OpenAI Sign in with ChatGPT** (`/v1/models`, `/v1/responses`) reusing
+      `api-agent`'s OAuth/Playwright lifecycle, plus a separate standalone host **`agy acp`**
+      lifecycle client with `antigravity-oauth` and `claude-subscription` fail-closed at the
+      OpenCode proxy dispatch gate (see [prd_i4a](prd_i4a.md)).
 
 [LiteLLM core](https://github.com/BerriAI/litellm/blob/main/LICENSE) uses MIT with separate
 enterprise terms. [Caddy](https://github.com/caddyserver/caddy/blob/master/LICENSE) uses
