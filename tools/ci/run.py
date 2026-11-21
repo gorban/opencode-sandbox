@@ -40,24 +40,22 @@ def discover(name, filename):
     return Suite(name, f'tests/{filename}', command, unittest=True)
 
 
+def script(name, path, *interpreter, unittest=False, stub_security=False):
+    return Suite(name, path, (*interpreter, path), unittest=unittest, stub_security=stub_security)
+
+
 SUITES = (
     discover('Controller core', 'test_controller_core.py'),
     discover('Bridge merge core', 'bridge_merge_core.py'),
-    Suite('Launcher and setup lifecycle', 'tests/setup-lifecycle.py',
-          ('python3', '-B', 'tests/setup-lifecycle.py'), unittest=True),
-    Suite('Host state leaves', 'tests/host_state_leaves.py',
-          ('python3', '-B', 'tests/host_state_leaves.py')),
-    Suite('Worktree shell', 'tests/worktrees.sh', ('bash', 'tests/worktrees.sh')),
-    Suite('Worktree review regressions', 'tests/worktree_review_regressions.py',
-          ('python3', '-B', 'tests/worktree_review_regressions.py')),
-    Suite('Worktree state regressions', 'tests/worktree_state_regressions.py',
-          ('python3', '-B', 'tests/worktree_state_regressions.py')),
-    Suite('Postgres host stubs', 'tests/postgres-host.sh', ('bash', 'tests/postgres-host.sh')),
-    Suite('Isolated parallel runner mocks', 'tests/parallel-isolated-test.py',
-          ('python3', '-B', 'tests/parallel-isolated-test.py')),
-    Suite('Isolated parallel runner source audit', 'tests/parallel-isolated.py',
-          ('python3', '-B', 'tests/parallel-isolated.py')),
-    Suite('Security stubs', 'tests/security.sh', ('bash', 'tests/security.sh'), stub_security=True),
+    script('Launcher and setup lifecycle', 'tests/setup-lifecycle.py', 'python3', '-B', unittest=True),
+    script('Host state leaves', 'tests/host_state_leaves.py', 'python3', '-B'),
+    script('Worktree shell', 'tests/worktrees.sh', 'bash'),
+    script('Worktree review regressions', 'tests/worktree_review_regressions.py', 'python3', '-B'),
+    script('Worktree state regressions', 'tests/worktree_state_regressions.py', 'python3', '-B'),
+    script('Postgres host stubs', 'tests/postgres-host.sh', 'bash'),
+    script('Isolated parallel runner mocks', 'tests/parallel-isolated-test.py', 'python3', '-B'),
+    script('Isolated parallel runner source audit', 'tests/parallel-isolated.py', 'python3', '-B'),
+    script('Security stubs', 'tests/security.sh', 'bash', stub_security=True),
     discover('CI runner contract', 'test_ci.py'),
     discover('CI supervisor contract', 'test_ci_supervisor.py'),
     discover('CI toolchain contract', 'test_ci_toolchain.py'),
@@ -203,7 +201,7 @@ def tests(supervisor):
                 env['OC_TEST_NO_PODMAN'] = '1'
             output = run(suite.command, env, SUITE_TIMEOUT, supervisor, scratch=directory)
         if suite.unittest:
-            counts = re.findall(r'^Ran ([0-9]+) tests? in [0-9.]+s$', output, re.MULTILINE)
+            counts = re.findall(r'^Ran (\d+) tests? in [\d.]+s$', output, re.ASCII | re.MULTILINE)
             if len(counts) != 1 or int(counts[0]) < 1:
                 raise CheckError(f'{suite.name} did not report a positive unittest count')
     print('SKIP real Podman security checks (portable profile has no configured isolated fixture)')

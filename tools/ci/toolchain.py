@@ -21,6 +21,7 @@ else:
 
 
 BACKEND = 'github:koalaman/shellcheck'
+MANIFEST_NAME = 'mise.toml'
 PLATFORM = 'linux-x64'
 SHELLCHECK = ci.SHELLCHECK_VERSION
 SHELLCHECK_URL = (f'https://github.com/koalaman/shellcheck/releases/download/v{SHELLCHECK}/'
@@ -94,8 +95,8 @@ def config_bytes(path):
 
 
 def validated_inputs():
-    files = {name: config_bytes(ci.ROOT / 'tools/ci' / name) for name in ('mise.toml', 'mise.lock')}
-    manifest = tomllib.loads(files['mise.toml'].decode())
+    files = {name: config_bytes(ci.ROOT / 'tools/ci' / name) for name in (MANIFEST_NAME, 'mise.lock')}
+    manifest = tomllib.loads(files[MANIFEST_NAME].decode())
     if manifest != {'settings': {'lockfile': True, 'lockfile_platforms': [PLATFORM]},
                     'tools': {BACKEND: SHELLCHECK}} or manifest['settings']['lockfile'] is not True:
         raise ci.CheckError('Invalid CI mise manifest')
@@ -181,7 +182,7 @@ def mise_environment(scratch, env, empty_config):
         **env, **{key: str(path) for key, path in paths.items()},
         'MISE_TMP_DIR': env['TMPDIR'],
         'MISE_CEILING_PATHS': str(scratch),
-        'MISE_OVERRIDE_CONFIG_FILENAMES': 'mise.toml',
+        'MISE_OVERRIDE_CONFIG_FILENAMES': MANIFEST_NAME,
         'MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES': '.oc-ci-disabled-tool-versions',
         'MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS': '',
         'MISE_GLOBAL_CONFIG_FILE': str(empty_config),
@@ -238,7 +239,7 @@ def managed_quality(supervisor, *, hosted):
         project.mkdir(mode=0o700)
         for name, content in files.items():
             (project / name).write_bytes(content)
-        manifest = project / 'mise.toml'
+        manifest = project / MANIFEST_NAME
         empty_config = scratch / 'empty.toml'
         empty_config.touch()
         env = mise_environment(scratch, env, empty_config)

@@ -250,10 +250,18 @@ class SupervisorTests(unittest.TestCase):
             send.assert_not_called()
 
     def test_watchdog_drains_after_partial_readiness(self):
-        with self.assertRaisesRegex(RuntimeError, 'stopped after first marker'):
+        root = None
+        failure = RuntimeError('stopped after first marker')
+
+        def stop_after_first_marker():
+            nonlocal root
             with fixture_runner('partial') as (root, process):
                 self.wait_ready(root / 'primary', process)
-                raise RuntimeError('stopped after first marker')
+                raise failure
+
+        with self.assertRaises(RuntimeError) as caught:
+            stop_after_first_marker()
+        self.assertIs(caught.exception, failure)
         self.assertTrue(child_tree_empty())
         self.assertFalse(root.exists())
 
@@ -264,8 +272,9 @@ class SupervisorTests(unittest.TestCase):
             parent = Path(scratch)
             root = parent / 'owned'
             root.mkdir(mode=0o700)
+            (root / 'receipt').touch()
             with patch('tempfile.mkdtemp', return_value=str(root)), \
                     self.assertRaisesRegex(CheckError, f'Retained scratch {root}'):
                 with fixture_scratch(watchdog):
-                    (root / 'receipt').touch()
+                    pass
             self.assertTrue((root / 'receipt').is_file())
