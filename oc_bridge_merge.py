@@ -95,20 +95,7 @@ def _tool_name(scalar: Preference) -> ToolName:
     return ToolName.VIMDIFF
 
 
-def select_tool(
-    settings: MergePreferences, preferences: ScopedPreferences, adapter: AdapterFixture
-) -> ToolSelection:
-    if (
-        settings.mode is not MergeMode.THREE_WAY
-        or settings.tool_policy is not ToolPolicy.GIT_PREFERENCE
-    ):
-        raise MergeError("Unsupported merge mode or tool policy")
-    if preferences.repository is RepositoryStatus.ABSENT:
-        if preferences.local is not None:
-            raise MergeError("Repository preference has no verified source")
-    elif preferences.repository is not RepositoryStatus.VERIFIED:
-        raise MergeError("Repository identity is uncertain")
-
+def _preferred_tool(preferences: ScopedPreferences) -> tuple[ToolName, PreferenceSource]:
     if preferences.local is not None:
         name = _tool_name(preferences.local)
         source = PreferenceSource.LOCAL
@@ -124,6 +111,24 @@ def select_tool(
         else:
             name = ToolName.VIMDIFF
             source = PreferenceSource.FALLBACK
+    return name, source
+
+
+def select_tool(
+    settings: MergePreferences, preferences: ScopedPreferences, adapter: AdapterFixture
+) -> ToolSelection:
+    if (
+        settings.mode is not MergeMode.THREE_WAY
+        or settings.tool_policy is not ToolPolicy.GIT_PREFERENCE
+    ):
+        raise MergeError("Unsupported merge mode or tool policy")
+    if preferences.repository is RepositoryStatus.ABSENT:
+        if preferences.local is not None:
+            raise MergeError("Repository preference has no verified source")
+    elif preferences.repository is not RepositoryStatus.VERIFIED:
+        raise MergeError("Repository identity is uncertain")
+
+    name, source = _preferred_tool(preferences)
 
     if adapter.identity is None:
         raise MergeError("vimdiff adapter is unavailable")
@@ -271,6 +276,31 @@ def _same_revision(expected: Revision | None, observed: Revision | None) -> bool
     )
 
 
+def _prepare_inputs(inputs: Inputs) -> tuple[Inputs, list[str], list[str]]:
+    retained_inputs: list[Revision | None] = []
+    digests: list[str] = []
+    errors: list[str] = []
+    for role, revision, keep_non_text in (
+        ("Base", inputs.base, False),
+        ("Host", inputs.host, True),
+        ("Agent", inputs.agent, False),
+    ):
+        retained = None
+        try:
+            if revision is None:
+                raise MergeError("Missing merge input")
+            if type(revision) is not Revision or not revision._has_bounded_bytes():
+                raise MergeError("Invalid or oversized merge input")
+            if keep_non_text:
+                retained = revision
+            digests.append(revision.digest())
+            retained = revision
+        except MergeError as exc:
+            errors.append(f"{role} revision could not be used for merge. {exc}")
+        retained_inputs.append(retained)
+    return Inputs(*retained_inputs), digests, errors
+
+
 class MergeSession:
     def __init__(self, owner: object, target: str, inputs: Inputs):
         if owner is None:
@@ -280,28 +310,8 @@ class MergeSession:
         self._output: Revision | None = None
         self._prompt: MergePrompt | FinishPrompt | ExportPrompt | None = None
         self._operation: MergeOperation | ExportOperation | None = None
-        retained_inputs: list[Revision | None] = []
-        digests: list[str] = []
-        errors: list[str] = []
-        for role, revision, keep_non_text in (
-            ("Base", inputs.base, False),
-            ("Host", inputs.host, True),
-            ("Agent", inputs.agent, False),
-        ):
-            retained = None
-            try:
-                if revision is None:
-                    raise MergeError("Missing merge input")
-                if type(revision) is not Revision or not revision._has_bounded_bytes():
-                    raise MergeError("Invalid or oversized merge input")
-                if keep_non_text:
-                    retained = revision
-                digests.append(revision.digest())
-                retained = revision
-            except MergeError as exc:
-                errors.append(f"{role} revision could not be used for merge. {exc}")
-            retained_inputs.append(retained)
-        self._inputs: Inputs | None = Inputs(*retained_inputs)
+        prepared, digests, errors = _prepare_inputs(inputs)
+        self._inputs: Inputs | None = prepared
         self._preparation_error = ". ".join(errors) if errors else None
         if errors:
             self._phase = Phase.RECOVERY
@@ -398,18 +408,7 @@ class MergeSession:
             if receipt.adapter_identity is not operation.approved.selection.adapter_identity:
                 raise MergeError("Completion came from a different adapter")
             sources = (self._inputs.base, self._inputs.host, self._inputs.agent)
-            digest = None
-            if output is not None and all(
-                output.identity is not source.identity for source in sources
-            ):
-                try:
-                    digest = output.digest()
-                except MergeError:
-                    pass
-                else:
-                    # Preserve the first usable recovery copy until a result is verified.
-                    if self._output is None:
-                        self._output = output
+            digest = self._retain_merge_output(output, sources)
             # Terminal cancellation settles the lease even if there is no usable output.
             if receipt.outcome is MergeOutcome.CANCELLED:
                 self._operation = None
@@ -426,6 +425,23 @@ class MergeSession:
             self._prompt = prompt
             self._phase = Phase.FINISH_REQUIRED
             return prompt
+
+    def _retain_merge_output(
+        self, output: Revision | None, sources: tuple[Revision, ...]
+    ) -> str | None:
+        digest = None
+        if output is not None and all(
+            output.identity is not source.identity for source in sources
+        ):
+            try:
+                digest = output.digest()
+            except MergeError:
+                pass
+            else:
+                # Preserve the first usable recovery copy until a result is verified.
+                if self._output is None:
+                    self._output = output
+        return digest
 
     def finish_merge(self, owner: object, prompt: FinishPrompt, observed_output: Revision | None) -> None:
         with self._lock:
