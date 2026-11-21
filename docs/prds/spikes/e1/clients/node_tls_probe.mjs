@@ -1,16 +1,16 @@
-// Run with NODE_EXTRA_CA_CERTS=/w/ca/<V>/ca.pem; argument: V. Default root store plus the extra CA.
-const tls = require('node:tls');
-const fs = require('node:fs');
+import { readFileSync } from 'node:fs';
+import { connect as connectTls } from 'node:tls';
+
 const ver = 'node-' + process.version + '-openssl-' + process.versions.openssl;
 
-function probe(line) {
+function probe(line, connect, log) {
   const [variant, leaf, port, check, kind] = line.split('\t');
   const options = { host: check, port: +port, timeout: 10000 };
   if (kind === 'dns') options.servername = check;
 
   return new Promise((resolve, reject) => {
     let settled = false;
-    const socket = tls.connect(options, () => report('OK', ''));
+    const socket = connect(options, () => report('OK', ''));
 
     function settle(complete) {
       if (settled) return;
@@ -24,7 +24,7 @@ function probe(line) {
 
     function report(result, detail) {
       settle(() => {
-        console.log([ver, variant, leaf, result, detail].join('\t'));
+        log([ver, variant, leaf, result, detail].join('\t'));
         resolve();
       });
     }
@@ -40,16 +40,20 @@ function probe(line) {
   });
 }
 
-async function main() {
-  const variant = process.argv[2];
-  const rows = fs.readFileSync('/w/combos.tsv', 'utf8').trim().split('\n')
-    .filter(line => line.startsWith(variant + '\t'));
-  for (const line of rows) {
-    await probe(line);
+export async function runProbe(variant, {
+  read = readFileSync,
+  connect = connectTls,
+  log = console.log,
+  logError = console.error,
+} = {}) {
+  try {
+    const rows = read('/w/combos.tsv', 'utf8').trim().split('\n')
+      .filter(line => line.startsWith(variant + '\t'));
+    // Chain each row so the fixture owns only one active socket at a time.
+    await rows.reduce((previous, line) => previous.then(() => probe(line, connect, log)), Promise.resolve());
+    return 0;
+  } catch (error) {
+    logError(`Node TLS probe incomplete: ${error.message}`);
+    return 1;
   }
 }
-
-main().catch(error => {
-  console.error(`Node TLS probe incomplete: ${error.message}`);
-  process.exitCode = 1;
-});

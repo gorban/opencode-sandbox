@@ -1,28 +1,22 @@
 // Run with node --test. Only synthetic sockets and fixture rows are used.
-const assert = require('node:assert/strict');
-const { EventEmitter } = require('node:events');
-const fs = require('node:fs');
-const path = require('node:path');
-const { test } = require('node:test');
-const { setImmediate } = require('node:timers/promises');
-const vm = require('node:vm');
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { test } from 'node:test';
+import { runProbe } from './clients/node_tls_probe.mjs';
 
-const source = fs.readFileSync(path.join(__dirname, 'clients/node_tls.js'), 'utf8');
 const fixture = 'D\tdns-row\t12345\tlocalhost\tdns\nD\tip-row\t12346\t127.0.0.1\tip\n';
 const TLS_ERROR = Object.assign(new Error('test verification error'), { code: 'TEST_VERIFY' });
+const version = `node-${process.version}-openssl-${process.versions.openssl}`;
 
 async function run({ events = [], readError = null, connectError = null }) {
   const rows = [];
   const diagnostics = [];
   const attempts = [];
-  const localProcess = { argv: ['node', 'node_tls.js', 'D'], version: 'v24', versions: { openssl: 'test' }, exitCode: 0 };
-  const fsFixture = {
-    readFileSync() {
+  const exitCode = await runProbe('D', {
+    read() {
       if (readError) throw readError;
       return fixture;
     },
-  };
-  const tlsFixture = {
     connect(options, ready) {
       if (connectError) throw connectError;
       const socket = new EventEmitter();
@@ -41,28 +35,18 @@ async function run({ events = [], readError = null, connectError = null }) {
       });
       return socket;
     },
-  };
-  const promise = vm.runInNewContext(source, {
-    require(name) {
-      if (name === 'node:fs' || name === 'fs') return fsFixture;
-      if (name === 'node:tls' || name === 'tls') return tlsFixture;
-      throw new Error(`Unexpected import ${name}`);
-    },
-    console: { log: row => rows.push(row), error: line => diagnostics.push(line) },
-    process: localProcess,
+    log: row => rows.push(row),
+    logError: line => diagnostics.push(line),
   });
-  // Observe the exit and diagnostics even when an older client left a promise pending.
-  promise?.catch(() => {});
-  await setImmediate();
-  return { rows, diagnostics, attempts, exitCode: localProcess.exitCode };
+  return { rows, diagnostics, attempts, exitCode };
 }
 
 test('normal rows settle once and keep their order and TLS result details', async () => {
   const result = await run({ events: [['ready', 'error', 'close'], ['error', 'close']] });
   assert.equal(result.exitCode, 0);
   assert.deepEqual(result.rows, [
-    'node-v24-openssl-test\tD\tdns-row\tOK\t',
-    'node-v24-openssl-test\tD\tip-row\tFAIL\tTEST_VERIFY test verification error',
+    `${version}\tD\tdns-row\tOK\t`,
+    `${version}\tD\tip-row\tFAIL\tTEST_VERIFY test verification error`,
   ]);
   assert.deepEqual(result.attempts.map(item => item.destroys), [1, 1]);
   assert.equal(result.attempts[0].options.servername, 'localhost');
