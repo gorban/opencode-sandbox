@@ -40,6 +40,21 @@ def validate_export(path, variant, expected, doc_root):
         raise ValueError(f'{variant} export does not match the private CA bytes')
 
 
+def _validate_ca_exports(chrome, data, exports):
+    doc_root = Path('/run/user') / str(os.getuid()) / 'doc'
+    digests = []
+    for variant in ('E', 'X'):
+        ca = chrome / 'ca' / f'{variant}.pem'
+        regular(ca)
+        if data['ca_files'][variant] != str(ca): raise ValueError(f'{variant} CA path mismatch')
+        pem = ca.read_bytes()
+        digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem.decode('ascii'))).hexdigest()
+        if digest != data['ca_sha256'][variant]: raise ValueError(f'{variant} CA fingerprint mismatch')
+        validate_export(exports[variant], variant, pem, doc_root)
+        digests.append(digest)
+    if digests[0] == digests[1]: raise ValueError('CAs are not distinct')
+
+
 def build(manifest, exports):
     repo = Path(__file__).resolve().parents[4]
     scratch = repo / '.scratch'
@@ -59,21 +74,10 @@ def build(manifest, exports):
         data['chrome_launcher'] != str(chrome / 'launch-chrome.sh')):
         raise ValueError('private paths do not match manifest')
     proxy = data['proxy']
-    if not isinstance(proxy, str) or not re.fullmatch(r'127\.0\.0\.1:[0-9]{1,5}', proxy):
+    if not isinstance(proxy, str) or not re.fullmatch(r'127\.0\.0\.1:\d{1,5}', proxy, re.ASCII):
         raise ValueError('proxy must be loopback')
     if not 1024 <= int(proxy.split(':')[1]) <= 65535: raise ValueError('invalid proxy port')
-    doc_root = Path('/run/user') / str(os.getuid()) / 'doc'
-    digests = []
-    for variant in ('E', 'X'):
-        ca = chrome / 'ca' / f'{variant}.pem'
-        regular(ca)
-        if data['ca_files'][variant] != str(ca): raise ValueError(f'{variant} CA path mismatch')
-        pem = ca.read_bytes()
-        digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem.decode('ascii'))).hexdigest()
-        if digest != data['ca_sha256'][variant]: raise ValueError(f'{variant} CA fingerprint mismatch')
-        validate_export(exports[variant], variant, pem, doc_root)
-        digests.append(digest)
-    if digests[0] == digests[1]: raise ValueError('CAs are not distinct')
+    _validate_ca_exports(chrome, data, exports)
     launcher = chrome / 'launch-chrome.sh'
     regular(launcher)
     st = launcher.stat()

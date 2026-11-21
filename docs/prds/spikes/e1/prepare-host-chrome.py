@@ -20,6 +20,17 @@ from urllib.parse import urlsplit
 HOSTS = {'feat': 'feat-a.oc-sandbox.internal', 'evil': 'evil.example.com', 'ip127': '127.0.0.1'}
 
 
+def _validate_urls(data, proxy_port):
+    ports = {proxy_port}
+    for label, url in data['urls'].items():
+        u = urlsplit(url); leaf = label.split('/')[1]
+        if (u.scheme != 'https' or u.hostname != HOSTS[leaf] or u.username or u.password
+                or u.path != '/' or u.query or u.fragment or not u.port or not 1024 <= u.port <= 65535
+                or u.port in ports):
+            raise ValueError(f'invalid or duplicate URL: {label}')
+        ports.add(u.port)
+
+
 def checked_manifest(path):
     repo = Path(__file__).resolve().parents[4]
     scratch = repo / '.scratch'
@@ -35,21 +46,14 @@ def checked_manifest(path):
         raise ValueError('fixture directory must be owned by this user and mode 0700')
     data = json.loads(path.read_text())
     proxy = data['proxy']
-    if not isinstance(proxy, str) or not re.fullmatch(r'127\.0\.0\.1:[0-9]{1,5}', proxy):
+    if not isinstance(proxy, str) or not re.fullmatch(r'127\.0\.0\.1:\d{1,5}', proxy, re.ASCII):
         raise ValueError('proxy must be an IPv4 loopback address')
     proxy_port = int(proxy.split(':')[1])
     if not 1024 <= proxy_port <= 65535: raise ValueError('invalid proxy port')
     if not re.fullmatch(r'[0-9a-f]{24}', data['marker']): raise ValueError('invalid fixture marker')
     expected = {f'{v}/{leaf}' for v in ('E', 'X') for leaf in HOSTS}
     if set(data['urls']) != expected: raise ValueError('manifest must contain exactly six fixture URLs')
-    ports = {proxy_port}
-    for label, url in data['urls'].items():
-        u = urlsplit(url); leaf = label.split('/')[1]
-        if (u.scheme != 'https' or u.hostname != HOSTS[leaf] or u.username or u.password
-                or u.path != '/' or u.query or u.fragment or not u.port or not 1024 <= u.port <= 65535
-                or u.port in ports):
-            raise ValueError(f'invalid or duplicate URL: {label}')
-        ports.add(u.port)
+    _validate_urls(data, proxy_port)
     copies = {}
     for variant in ('E', 'X'):
         ca = run / 'ca' / f'{variant}.pem'
