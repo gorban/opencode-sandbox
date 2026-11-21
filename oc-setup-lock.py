@@ -65,6 +65,14 @@ def setup_holder(fd):
     return None
 
 
+def report_lock_wait(fd, name, wait_started):
+    holder = setup_holder(fd) if name == 'setup' else None
+    if holder is not None or time.monotonic() - wait_started >= 1:
+        print(f'Waiting for {name} ({holder or "holder unknown"}) to finish...', file=sys.stderr, flush=True)
+        return True
+    return False
+
+
 def wait_for_lock(fd, name, mode, parent):
     announced = False
     wait_started = time.monotonic()
@@ -74,11 +82,7 @@ def wait_for_lock(fd, name, mode, parent):
             fcntl.flock(fd, lock | fcntl.LOCK_NB)
             return True
         except BlockingIOError:
-            if not announced:
-                holder = setup_holder(fd) if name == 'setup' else None
-                if holder is not None or time.monotonic() - wait_started >= 1:
-                    print(f'Waiting for {name} ({holder or "holder unknown"}) to finish...', file=sys.stderr, flush=True)
-                    announced = True
+            announced = announced or report_lock_wait(fd, name, wait_started)
             select.select([sys.stdin], [], [], 0.1)
     return False
 
