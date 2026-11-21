@@ -103,16 +103,23 @@ esac
     wrappers = source[source.index('pm()  {'):source.index('say() {')]
     pmx = source[source.index('pmx()   {'):source.index('# mkpod MODE')]
     nsx = source[source.index('nsx()       {'):source.index('\n# (`| cat`')]
+    pcreate = source[source.index('pcreate() {'):source.index('\n\n', source.index('pcreate() {'))]
+    srv = source[source.index('srv() {'):source.index('# inpod POD URL')]
     for mode in ('host', 'distrobox'):
         log.write_text('')
         extra = {'FAKE_HELPERS': '1', 'SCR': str(root / 'with space')}
         if mode == 'distrobox':
             extra.update(CONTAINER_ID='fixture', container='podman')
-        code = route + wrappers + pmx + 'infra_pid() { echo 123; }\n' + nsx + """
+        code = route + wrappers + pmx + 'infra_pid() { echo 123; }\n' + nsx + '\n' + pcreate + '\n' + srv + """
+P=fixture SRV=fixed-server-program
+id_of() { printf pod-a; }
 pm 'arg with space'
 hc 'http://example.invalid/a b'
-pmx a 'arg with space'
-nsx a nft 'arg with space'
+host_timeout 'diagnostic name' podman preflight '' 'arg with space' --fixture --
+pcreate a pm '' 'arg with space' --fixture --
+pmx a '' 'arg with space' --fixture --
+nsx a nft '' 'arg with space' --fixture --
+srv a 'label with space' 127.0.0.1 14001 2
 host bash -c 'printf "%s" "worker arg with space"' &
 wait $!
 """
@@ -122,9 +129,39 @@ wait $!
         calls = log.read_text()
         assert 'args podman <arg with space>' in calls, (mode, calls)
         assert 'args curl <-s> <-m> <3> <http://example.invalid/a b>' in calls, (mode, calls)
-        assert 'args podman <unshare> <nsenter> <-t> <123> <-n> <nft> <arg with space>' in calls, (mode, calls)
+        assert 'args podman <preflight> <> <arg with space> <--fixture> <-->' in calls, (mode, calls)
+        assert f'args podman <pod> <create> <--pod-id-file> <{root}/with space/pod-a.id> <--name> <fixture-a> <> <arg with space> <--fixture> <-->' in calls, (mode, calls)
+        assert 'args podman <> <arg with space> <--fixture> <-->' in calls, (mode, calls)
+        assert 'args podman <unshare> <nsenter> <-t> <123> <-n> <nft> <> <arg with space> <--fixture> <-->' in calls, (mode, calls)
+        assert ' <fixed-server-program> <label with space> <127.0.0.1> <14001> <2>' in calls, (mode, calls)
         assert f'conf <{root}/with space/a.conf>' in calls, (mode, calls)
         assert ('distrobox-host-exec ' in calls) == (mode == 'distrobox')
+    inpod = source[source.index('inpod() {'):source.index('# ---- host-side checks')]
+    client_args = root / 'client-args'
+    client = inpod + '''
+P=fixture
+id_of() { printf pod-a; }
+pm() {
+    printf '%s\\0' "$@" > "$CLIENT_ARGS"
+    printf 'first line\\nfixture response\\n'
+}
+inpod a "$FIXTURE_URL"
+'''
+    programs = []
+    for url in ('http://127.0.0.1:14001/', 'http://127.0.0.1:14002/ready'):
+        result = subprocess.run(
+            ['bash', '-u', '-o', 'pipefail'], input=client, text=True, capture_output=True, timeout=10,
+            env={**env, 'SCR': str(root / 'with space'), 'CLIENT_ARGS': str(client_args), 'FIXTURE_URL': url},
+        )
+        assert result.returncode == 0 and result.stdout == 'fixture response\n', result
+        args = client_args.read_bytes().decode().split('\0')[:-1]
+        assert args[:5] == ['run', '--rm', '--pod', 'pod-a', '--name'], args
+        assert args[5].startswith('fixture-a-cl') and args[6] == '--cidfile', args
+        assert args[7].startswith(f'{root}/with space/ctr-client-') and args[7].endswith('.id'), args
+        assert args[8:11] == ['python:3.12-alpine', 'python', '-c'], args
+        assert 'u.urlopen(sys.argv[1],timeout=3)' in args[11] and args[12:] == [url], args
+        programs.append(args[11])
+    assert programs[0] == programs[1]
     for failure in ('host_tools', 'podman_version', 'rpm', 'nft_empty', 'kernel_empty', 'ip_empty',
                     'curl', 'ss', 'iptables', 'nsenter', 'image', 'unshare', 'pods', 'ctrs', 'images'):
         p, calls = run({'FAIL_WHICH': failure})
