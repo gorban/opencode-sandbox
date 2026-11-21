@@ -46,7 +46,12 @@ hc()  { host curl -s -m 3 "$@"; }
 say() { printf '%s\n' "$*"; }
 die() { printf 'ABORT: %s\n' "$*" >&2; exit 2; }
 res() { # res PASS|FAIL|INFO name detail
-  case $1 in PASS) PASS=$((PASS+1));; FAIL) FAIL=$((FAIL+1));; esac
+  case $1 in
+    PASS) PASS=$((PASS+1));;
+    FAIL) FAIL=$((FAIL+1));;
+    INFO) ;;
+    *) die "unexpected result label: $1";;
+  esac
   printf '%-5s %-52s %s\n' "$1" "$2" "$3"
 }
 
@@ -186,7 +191,7 @@ SCR_REAL=$(cd "$SCR" && pwd -P)
 SCR=$SCR_REAL
 id_of() {
   local probe_pod=$1 v
-  local receipt_path=$SCR/pod-$probe_pod.id
+  local receipt_path="$SCR/pod-${probe_pod}.id"
   [[ -f $receipt_path ]] || return 1
   read -r v <"$receipt_path"
   [[ $v =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -331,9 +336,16 @@ mkpod() {
       pcreate "$name" pm --network "pasta:--host-lo-to-ns-lo,-t,$addr/auto" \
         --sysctl net.ipv4.ip_unprivileged_port_start=0 "$@" >/dev/null || return 1
       pm pod start "$(id_of "$name")" >/dev/null || return 1 ;;
+    *)
+      echo "unknown pod mode: $mode" >&2
+      return 1 ;;
   esac
-  case $mode in full|pasta) pasta_verify "$name" "$addr" || { echo "pasta args wrong for $name: $(pasta_args "$name")" >&2; return 1; } ;; esac
-  case $mode in full|nft) nft_apply "$name" "$SENS" || { echo "nft ruleset wrong for $name" >&2; return 1; } ;; esac
+  if [[ $mode == full || $mode == pasta ]]; then
+    pasta_verify "$name" "$addr" || { echo "pasta args wrong for $name: $(pasta_args "$name")" >&2; return 1; }
+  fi
+  if [[ $mode == full || $mode == nft ]]; then
+    nft_apply "$name" "$SENS" || { echo "nft ruleset wrong for $name" >&2; return 1; }
+  fi
 }
 infra_id() {
   local probe_pod=$1
@@ -450,6 +462,7 @@ if has matrix; then
       pasta) exp="sensitive closed, 4000 open, 3000 closed (no redirect)" ;;
       nft)   exp="sensitive closed, 4000 and 3000 open" ;;
       bare)  exp="FAIL-OPEN: 5432 and 9223 open, 9222 (127.0.0.1 only) closed" ;;
+      *) die "unknown matrix mode: $mode" ;;
     esac
     res INFO "matrix $mode: $exp" "$r"
     # assertions; every "closed" claim needs the control (4000 on 0.0.0.0, forwarded in every mode) to answer
