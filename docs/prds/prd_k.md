@@ -33,6 +33,12 @@
 
 ## Developer tool installation
 
+- [x] **Human approval of the local mise toolchain slice** (`start-ci` at
+  `66c8f837401cf402f42a8d29f71e132a57a77723`). The local runner installs from the mise
+  lock and verifies ShellCheck `0.9.0`. All 11 toolchain tests passed, and a cold local
+  install passed the quality checks. The Ubuntu runner version check passed in a local
+  fixture. Verification on GitHub Actions remains open.
+
 - [ ] Qualify the shared mise toolchain on the first hosted quality job. The local and hosted
   quality commands use the same development-scoped `mise.toml` and `mise.lock`, following
   [PRD F](prd_f.md). The initial pin is ShellCheck 0.9.0 on Linux x86-64. The command verifies a
