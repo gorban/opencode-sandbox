@@ -163,18 +163,23 @@ class PrerequisiteAndBootstrapTests(unittest.TestCase):
                                 ('version: 0.9.0\nversion: invalid report\n', 'malformed output'),
                                 ('version: 0.10.0\n', 'observed 0.10.0'),
                                 ('version: 0.9.0\n', 'checked inputs')):
-            with self.subTest(output=output), patch.object(ci, 'run') as run, \
+            def probe(_command, _env, _timeout, _supervisor, *, scratch, print_output):
+                info = scratch.stat()
+                self.assertEqual((info.st_uid, info.st_mode & 0o777), (os.getuid(), 0o700))
+                self.assertFalse(print_output)
+                if isinstance(output, Exception):
+                    raise output
+                return output
+
+            with self.subTest(output=output), patch.object(ci, 'run', side_effect=probe) as run, \
                     patch.object(tc, 'validated_inputs', side_effect=ci.CheckError('checked inputs')) as validated, \
                     patch.object(tc, 'bootstrap_mise') as bootstrap, redirect_stdout(io.StringIO()):
-                if isinstance(output, Exception):
-                    run.side_effect = output
-                else:
-                    run.return_value = output
                 with self.assertRaisesRegex(ci.CheckError, message):
                     tc.managed_quality(Supervisor(), hosted=True)
                 self.assertEqual(run.call_args.args[:2], (('/usr/bin/shellcheck', '--version'),
                                                          {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C.UTF-8'}))
                 self.assertEqual(run.call_count, 1)
+                self.assertFalse(run.call_args.kwargs['scratch'].exists())
                 self.assertEqual(validated.call_count, int(message == 'checked inputs'))
                 bootstrap.assert_not_called()
 

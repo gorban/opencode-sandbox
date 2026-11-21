@@ -116,7 +116,8 @@ def hosted_shellcheck(supervisor):
     command = ('/usr/bin/shellcheck', '--version')
     env = {'PATH': ci.SYSTEM_PATH, 'LC_ALL': 'C.UTF-8'}
     try:
-        output = ci.run(command, env, ci.TOOL_TIMEOUT, supervisor, print_output=False)
+        with ci.suite_scratch(supervisor) as scratch:
+            output = ci.run(command, env, ci.TOOL_TIMEOUT, supervisor, scratch=scratch, print_output=False)
     except FileNotFoundError:
         raise ci.CheckError(f'Hosted ShellCheck expected {SHELLCHECK}, observed missing') from None
     except (OSError, ci.CheckError) as exc:

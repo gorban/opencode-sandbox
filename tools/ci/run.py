@@ -140,7 +140,7 @@ def suite_environment(scratch):
     return env
 
 
-def run(command, env, timeout, supervisor, *, scratch='/tmp', print_output=True):
+def run(command, env, timeout, supervisor, *, scratch, print_output=True):
     # A file avoids a pipe-reading wait if a descendant keeps the log open.
     with tempfile.TemporaryFile(dir=scratch) as log:
         status = None
@@ -228,21 +228,24 @@ def quality(supervisor):
     bash = tool_required('bash', SYSTEM_PATH)
     shellcheck = tool_required('shellcheck', os.environ.get('PATH', os.defpath))
     env = {'PATH': SYSTEM_PATH, 'LC_ALL': 'C.UTF-8'}
-    print(sys.version.splitlines()[0], flush=True)
-    print(run((bash, '--version'), env, TOOL_TIMEOUT, supervisor, print_output=False).partition('\n')[0], flush=True)
-    version = run((shellcheck, '--version'), env, TOOL_TIMEOUT, supervisor)
-    versions = re.findall(r'^version: (\S+)$', version, re.MULTILINE)
-    if versions != [SHELLCHECK_VERSION]:
-        raise CheckError(f'Quality requires ShellCheck {SHELLCHECK_VERSION}')
+    with suite_scratch(supervisor) as scratch:
+        print(sys.version.splitlines()[0], flush=True)
+        bash_version = run((bash, '--version'), env, TOOL_TIMEOUT, supervisor, scratch=scratch, print_output=False)
+        print(bash_version.partition('\n')[0], flush=True)
+        version = run((shellcheck, '--version'), env, TOOL_TIMEOUT, supervisor, scratch=scratch)
+        versions = re.findall(r'^version: (\S+)$', version, re.MULTILINE)
+        if versions != [SHELLCHECK_VERSION]:
+            raise CheckError(f'Quality requires ShellCheck {SHELLCHECK_VERSION}')
 
-    for name in SHELL_FILES:
-        file_required(name)
-        run((bash, '-n', '--', name), env, TOOL_TIMEOUT, supervisor)
-    for name in PYTHON_FILES:
-        supervisor.check_interrupted()
-        path = file_required(name)
-        compile(path.read_bytes(), name, 'exec', dont_inherit=True)
-    run((shellcheck, '--norc', '--severity=error', '--', *SHELL_FILES), env, TOOL_TIMEOUT, supervisor)
+        for name in SHELL_FILES:
+            file_required(name)
+            run((bash, '-n', '--', name), env, TOOL_TIMEOUT, supervisor, scratch=scratch)
+        for name in PYTHON_FILES:
+            supervisor.check_interrupted()
+            path = file_required(name)
+            compile(path.read_bytes(), name, 'exec', dont_inherit=True)
+        run((shellcheck, '--norc', '--severity=error', '--', *SHELL_FILES),
+            env, TOOL_TIMEOUT, supervisor, scratch=scratch)
     print(f'Checked {len(SHELL_FILES)} shell files and {len(PYTHON_FILES)} Python files')
 
 

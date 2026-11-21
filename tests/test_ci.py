@@ -163,17 +163,19 @@ class PortableTests(unittest.TestCase):
 
         supervisor = Supervisor()
         with patch.object(supervisor, 'execute', side_effect=finish), patch.object(ci, 'MAX_LOG_BYTES', 5), \
-                redirect_stdout(io.StringIO()) as stdout:
+                ci.suite_scratch(supervisor) as scratch, redirect_stdout(io.StringIO()) as stdout:
             with self.assertRaisesRegex(ci.CheckError, 'exceeded the 5-byte log limit'):
-                ci.run(('fixture',), {}, 3, supervisor)
+                ci.run(('fixture',), {}, 3, supervisor, scratch=scratch)
         self.assertEqual(stdout.getvalue(), 'ABCDE')
 
 
 class QualityTests(unittest.TestCase):
     def test_scope_and_shellcheck_invocation(self):
-        def fake_tools(command, env, timeout, supervisor, **kwargs):
+        def fake_tools(command, env, timeout, supervisor, *, scratch, print_output=True):
             self.assertEqual(env, {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C.UTF-8'})
             self.assertGreater(timeout, 0)
+            info = scratch.stat()
+            self.assertEqual((info.st_uid, info.st_mode & 0o777), (os.getuid(), 0o700))
             return '/binary/bash version\n' if command[0].endswith('/bash') else 'version: 0.9.0\n'
 
         shell_files = (
@@ -189,6 +191,9 @@ class QualityTests(unittest.TestCase):
             *(('/binary/bash', '-n', '--', name) for name in shell_files),
             ('/binary/shellcheck', '--norc', '--severity=error', '--', *shell_files),
         ])
+        scratch_paths = {call.kwargs['scratch'] for call in stub.call_args_list}
+        self.assertEqual(len(scratch_paths), 1)
+        self.assertFalse(scratch_paths.pop().exists())
 
     def test_new_active_sources_require_explicit_inventory_entries(self):
         with tempfile.TemporaryDirectory() as scratch, patch.object(ci, 'ROOT', Path(scratch)):
@@ -215,6 +220,7 @@ class QualityTests(unittest.TestCase):
             with self.assertRaisesRegex(ci.CheckError, 'Quality requires ShellCheck 0.9.0'):
                 ci.quality(Supervisor())
             self.assertEqual(stub.call_count, 2)
+            self.assertFalse(stub.call_args.kwargs['scratch'].exists())
 
 
 if __name__ == '__main__':
