@@ -23,6 +23,11 @@ OWNER_LABEL = 'io.github.gorban.opencode-sandbox.update'
 class UnsafeCleanup(Exception): pass
 
 
+def check_output_limit(output, limit):
+    if output is not None and os.fstat(output.fileno()).st_size > limit:
+        raise ValueError('update output exceeds size limit')
+
+
 def command(argv, *, stdin=None, stdout=None, stderr=None, timeout=30, parent=None, max_output=MAX_FRAME):
     proc = subprocess.Popen(argv, stdin=stdin if stdin is not None else subprocess.DEVNULL,
                             stdout=stdout if stdout is not None else subprocess.DEVNULL,
@@ -33,11 +38,9 @@ def command(argv, *, stdin=None, stdout=None, stderr=None, timeout=30, parent=No
         while proc.poll() is None:
             if parent is not None and os.getppid() != parent: raise InterruptedError('calling shell exited')
             if time.monotonic() - start > timeout: raise TimeoutError('host Podman command timed out')
-            if stdout is not None and os.fstat(stdout.fileno()).st_size > max_output:
-                raise ValueError('update output exceeds size limit')
+            check_output_limit(stdout, max_output)
             time.sleep(.05)
-        if stdout is not None and os.fstat(stdout.fileno()).st_size > max_output:
-            raise ValueError('update output exceeds size limit')
+        check_output_limit(stdout, max_output)
         return proc.returncode
     except BaseException:
         try: os.killpg(proc.pid, signal.SIGKILL)
@@ -77,7 +80,7 @@ def cleanup_container(prefix, cid, token, directory):
         if rc != 0: raise UnsafeCleanup('could not remove updater container')
         rc, _ = podman_text(prefix, ['container', 'exists', cid], directory)
         if rc != 1: raise UnsafeCleanup('could not verify updater container removal')
-    except (OSError, TimeoutError, ValueError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise UnsafeCleanup(str(exc)) from exc
 
 
@@ -93,7 +96,7 @@ def phase(prefix, directory, token, name, options, image, level, memory, inp, ou
         attempted = True
         rc = command(create, timeout=30, parent=parent)
         try: cid = read_cid(cidfile)
-        except (OSError, ValueError, UnicodeError) as exc: raise UnsafeCleanup(f'{name}: missing or invalid ID receipt: {exc}') from exc
+        except (OSError, ValueError) as exc: raise UnsafeCleanup(f'{name}: missing or invalid ID receipt: {exc}') from exc
         if rc != 0: raise RuntimeError(f'{name}: container creation failed')
         if inp is not None: inp.seek(0)
         rc = command([*prefix, 'podman', 'start', '-ai', cid], stdin=inp, stdout=out,
@@ -106,7 +109,7 @@ def phase(prefix, directory, token, name, options, image, level, memory, inp, ou
             try:
                 if cid is None:
                     try: cid = read_cid(cidfile)
-                    except (OSError, ValueError, UnicodeError) as exc:
+                    except (OSError, ValueError) as exc:
                         raise UnsafeCleanup(f'{name}: cannot prove which container was created: {exc}') from exc
                 cleanup_container(prefix, cid, token, directory)
             finally:
@@ -118,7 +121,7 @@ def main():
     state, level, volume, image, memory, version = sys.argv[1:7]
     prefix = sys.argv[7:]
     if prefix not in ([], ['distrobox-host-exec']): raise ValueError('invalid host command prefix')
-    if not re.fullmatch(r's0:c[0-9]+,c[0-9]+', level): raise ValueError('invalid SELinux level')
+    if not re.fullmatch(r's0:c\d+,c\d+', level, flags=re.ASCII): raise ValueError('invalid SELinux level')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', volume) or not re.fullmatch(r'[A-Za-z0-9_.:-]+', image):
         raise ValueError('invalid volume or image name')
     state_path = Path(state)
@@ -156,5 +159,5 @@ if __name__ == '__main__':
     try: main()
     except UnsafeCleanup as exc:
         print(f'error: {exc}', file=sys.stderr); sys.exit(2)
-    except (OSError, ValueError, RuntimeError, TimeoutError, InterruptedError, KeyboardInterrupt) as exc:
+    except (OSError, ValueError, RuntimeError, KeyboardInterrupt) as exc:
         print(f'warning: OpenCode update failed; keeping the existing copy: {exc}', file=sys.stderr); sys.exit(1)
