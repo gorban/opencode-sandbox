@@ -89,6 +89,7 @@ PYTHON_FILES = (
     'tests/test_controller_core.py',
     'tests/worktree_review_regressions.py',
     'tests/worktree_state_regressions.py',
+    'tools/ci/core_coverage.py',
     'tools/ci/run.py',
     'tools/ci/supervisor.py',
     'tools/ci/toolchain.py',

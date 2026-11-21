@@ -99,6 +99,8 @@ when inspected. This establishes the check identity and a scope gap. PR qualific
 
 ## Quality ratchet
 
+[Coverage and scanner baselines](../ci-baselines.md) describes the first advisory jobs.
+
 - [ ] Establish reproducible coverage for the two Python policy cores before enforcing per-core
   line or branch floors. Report subprocess and separate-interpreter exclusions. Measure shell
   behavior separately.
