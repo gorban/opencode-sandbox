@@ -12,7 +12,7 @@ This Gate 1 implementation walkthrough covers the coordination lane under
    synchronous hub fence.
 3. The transport-parameterized joint restart qualification suite
    (`test_restart_qualification.py`) and combined-pass SQLite evidence verifier
-   for the [PRD M first PoC split](../../../prd_m.md#first-poc-split).
+   for the [PRD M first PoC split](../../prd_m.md#first-poc-split).
 
 No production launcher wiring, live provider credentials, real sandbox homes, or
 changes under `docs/prds/spikes/m/local/` or `docs/prds/spikes/n/` are in scope.
