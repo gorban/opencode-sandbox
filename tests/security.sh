@@ -736,13 +736,18 @@ if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; els
     VOL=oc-sectest-$$
     cat > "$T/lib.sh" <<EOF
 H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }
-AGENT_IMG=$TEST_AGENT_IMG HOMEVOL=$VOL LEVEL=s0:c7,c9 SB=\$1; shift
+AGENT_IMG=$TEST_AGENT_IMG AGENT_MEM=512m HOMEVOL=$VOL LEVEL=s0:c7,c9 SB=\$1; shift
 $(sed -n '/^safe_run() {/,/; }$/p' "$SCRIPT")
+$(fn tree_run)
 $(sed -n "/^SANDBOX_TREE_PY=/,/os.makedirs(dest, exist_ok=True)'$/p" "$SCRIPT")
 $(fn init_sandbox_tree)
 $(fn init_bridge_spool)
 $(sed -n "/^RELABEL_PY=/,/file=sys.stderr)'\$/p" "$SCRIPT")
 $(fn relabel_shared)
+if [[ \$1 == init_sandbox_tree ]] && declare -F tree_run >/dev/null; then
+  safe_run --cap-add=FOWNER --entrypoint python3 "\$AGENT_IMG" \
+    -I -c "\$RELABEL_PY" "system_u:object_r:container_file_t:\$LEVEL" /sandbox || exit 1
+fi
 "\$@"
 EOF
     lib() { bash "$T/lib.sh" "$@"; }

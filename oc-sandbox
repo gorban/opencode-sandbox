@@ -256,10 +256,16 @@ pm() { "${H[@]}" podman "$@"; }
 sc() { "${H[@]}" systemctl --user "$@"; }
 safe_run() { pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
   --security-opt=label=disable -v "$SB":/sandbox "$@"; }
+tree_run() {
+  "${H[@]}" timeout -k 5s 70s podman run --rm -i --network=none --http-proxy=false \
+    --timeout=60 --cap-drop=ALL --security-opt=no-new-privileges --security-opt "label=level:$LEVEL" \
+    --pids-limit=128 --memory="$AGENT_MEM" -v "$SB":/sandbox \
+    --entrypoint python3 "$AGENT_IMG" -I -c "$SANDBOX_TREE_PY" "$@"
+}
 
 # These commands execute only in the sandbox-only container. Git receives a clean environment;
-# local configuration remains data read by Git, with hooks and fsmonitor forcibly disabled.
-SANDBOX_TREE_PY='import os, stat, subprocess, sys
+# hooks and fsmonitor are disabled. Checkout filters can execute inside the confined, bounded worker.
+SANDBOX_TREE_PY='import os, re, stat, subprocess, sys
 os.chdir("/sandbox")
 def fail(msg):
     print(msg, file=sys.stderr); sys.exit(3)
@@ -298,6 +304,8 @@ def snapshot_file(fd):
     if file_state(before) != file_state(after) or len(data) != before.st_size:
         fail("worktree control file changed while reading")
     return file_state(after), data
+def open_control(directory, name):
+    return os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
 def verify_file(fd, directory_fd, name, saved):
     current = snapshot_file(fd)
     on_path = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -345,9 +353,8 @@ def replace_text(dir_fd, name, value):
 def link_worktree(repo, dest, dest_fd, git_fd, previous):
     # Git resolves /proc/self/fd to a pathname while creating its links. If the source
     # directory was renamed during Git, rebuild both links relative to the verified paths.
-    import re
-    f = os.open(".git", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dest_fd)
-    with os.fdopen(f) as inp: line = inp.read(4096).strip()
+    with os.fdopen(open_control(dest_fd, ".git"), "rb") as inp:
+        line = os.fsdecode(snapshot_file(inp.fileno())[1]).strip()
     m = re.search(r"(?:^|/)worktrees/([A-Za-z0-9._@+-]+)$", line)
     if not line.startswith("gitdir: ") or not m or m.group(1) in previous:
         fail("invalid new worktree administrative link")
@@ -392,14 +399,22 @@ if repo:
     same(repo_fd, repo); same(git_fd, repo + "/.git")
     if os.path.lexists(os.path.join(dest, ".git")):
         dest_fd = open_dir(dest)
-        dot_fd = os.open(".git", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dest_fd)
+        dot_fd = open_control(dest_fd, ".git")
         dot_snapshot = snapshot_file(dot_fd)
         link = os.fsdecode(dot_snapshot[1]).strip()
         if not link.startswith("gitdir: "): fail("invalid existing worktree link")
         admin_path = os.path.normpath(os.path.join("/sandbox", dest, link[len("gitdir: "):]))
-        if not admin_path.startswith("/sandbox/"): fail("worktree git directory outside sandbox")
+        prefix = "/sandbox/" + repo + "/.git/worktrees/"
+        if not admin_path.startswith(prefix) or not re.fullmatch(r"[A-Za-z0-9._@+-]+", admin_path[len(prefix):]):
+            fail("invalid existing worktree administrative directory")
         admin_fd = open_dir(admin_path[len("/sandbox/"):])
-        common_file = os.open("commondir", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=admin_fd)
+        reverse_fd = open_control(admin_fd, "gitdir")
+        reverse_snapshot = snapshot_file(reverse_fd)
+        reverse_link = os.fsdecode(reverse_snapshot[1]).strip()
+        destination = "/sandbox/" + dest + "/.git"
+        if reverse_link not in (destination, os.path.relpath(destination, admin_path)):
+            fail("worktree administrative link does not point back")
+        common_file = open_control(admin_fd, "commondir")
         common_snapshot = snapshot_file(common_file)
         common_relative = os.fsdecode(common_snapshot[1]).strip()
         if common_relative != "../..": fail("invalid worktree common directory")
@@ -409,8 +424,9 @@ if repo:
         b = git("-C", ".", "symbolic-ref", "--quiet", "--short", "HEAD", check=False, cwd_fd=dest_fd, git_fd=admin_fd)
         same(admin_fd, admin_path[len("/sandbox/"):])
         verify_file(common_file, admin_fd, "commondir", common_snapshot)
+        verify_file(reverse_fd, admin_fd, "gitdir", reverse_snapshot)
         verify_file(dot_fd, dest_fd, ".git", dot_snapshot)
-        os.close(common_file); os.close(dot_fd); os.close(admin_fd)
+        os.close(reverse_fd); os.close(common_file); os.close(dot_fd); os.close(admin_fd)
         if ((source_stat.st_dev, source_stat.st_ino) != (target_stat.st_dev, target_stat.st_ino)
                 or b.returncode or b.stdout.strip() != branch):
             fail("existing worktree does not match requested repository and branch")
@@ -436,7 +452,7 @@ if repo:
     os.close(git_fd); os.close(repo_fd)
 os.makedirs(dest, exist_ok=True)'
 init_sandbox_tree() {  # dest [repo branch]
-  safe_run --entrypoint python3 "$AGENT_IMG" -c "$SANDBOX_TREE_PY" init "$1" "${2:-}" "${3:-}"
+  tree_run init "$1" "${2:-}" "${3:-}"
 }
 init_bridge_spool() {
   safe_run --entrypoint sh "$AGENT_IMG" -c 'cd /sandbox && mkdir -p .bridge/requests .bridge/tmp .bridge/files'
@@ -624,8 +640,10 @@ if (( LIST )); then
       { IFS= read -r _; IFS= read -r repo; IFS= read -r branch; } <<<"$record" || die "invalid worktree record for $inst"
       valid_relpath "$repo" && [[ $branch =~ ^[A-Za-z0-9._/@+-]+$ ]] || die "invalid worktree record for $inst"
       wt_info=" worktree:$repo:$branch"
-    elif [[ $wd == /sandbox/* ]] && valid_relpath "${wd#/sandbox/}"; then
-      info=$(safe_run --entrypoint python3 "$AGENT_IMG" -c "$SANDBOX_TREE_PY" info "${wd#/sandbox/}" 2>/dev/null) || info=""
+    elif [[ $wd == /sandbox/* && -f $STATE/sb-level ]] && valid_relpath "${wd#/sandbox/}"; then
+      LEVEL=$(< "$STATE/sb-level")
+      info=""
+      if [[ $LEVEL =~ ^s0:c[0-9]+,c[0-9]+$ ]]; then info=$(tree_run info "${wd#/sandbox/}" 2>/dev/null) || info=""; fi
       if [[ $info =~ ^[A-Za-z0-9._@+/-]+:[A-Za-z0-9._/@+-]+$ ]]; then wt_info=" worktree:$info"; fi
     fi
     printf '%-14s %-10s %-8s %-22s %-24s %s%s\n' "$inst" "$pod" "$(cstate "$AGENT")" \
@@ -1182,7 +1200,7 @@ if [[ -z $CWD_ARG && -z $WT_ARG && -z $WT_REPO && -n $INST ]]; then
   fi
   if [[ -n $relative && $relative != "$here" ]]; then
     valid_relpath "$relative" || die "current directory is not a plain sandbox path"
-    WT_REPO=$(safe_run --entrypoint python3 "$AGENT_IMG" -c "$SANDBOX_TREE_PY" detect "$relative") \
+    WT_REPO=$(tree_run detect "$relative") \
       || die "could not safely inspect the current repository"
     if [[ -n $WT_REPO ]]; then
       valid_relpath "$WT_REPO" || die "invalid detected repository path"
