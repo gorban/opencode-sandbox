@@ -230,8 +230,8 @@ if (( DELETE || EXEC || LIST || LISTKEYS )) && { (( PG || DIND || ${#PORT_ARGS[@
 fi
 
 # ---- names ----------------------------------------------------------------------------------------
-valid_instance() {  # name -> 0/1
-  [[ $1 =~ ^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$ ]] && [[ $RESERVED_NAMES != *" $1 "* ]]
+valid_instance() {  # named instance, excluding the alias for the default instance
+  [[ $1 != default && $1 =~ ^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$ && $RESERVED_NAMES != *" $1 "* ]]
 }
 # INST_SET records that -i was given at all: "-i default" selects the default instance only and must
 # never fall through to the all-instances scope of a bare -d (or -d -a).
@@ -829,6 +829,22 @@ unit_env() {
   v=${v//\\/\\\\}; printf 'Environment="%s=%s"\n' "$1" "${v//\"/\\\"}"
 }
 
+has_unlabelled_instance_resources() {
+  local name pods=$1 volumes=$2
+  while IFS= read -r name; do
+    if [[ $name == oc ]] || { [[ $name == oc-* ]] && valid_instance "${name#oc-}"; }; then
+      return 0
+    fi
+  done <<<"$pods"
+  while IFS= read -r name; do
+    case $name in oc-home|oc-chrome|oc-pg|oc-dind|oc-dind-run) return 0;; esac
+    if [[ $name =~ ^oc-(.+)-(chrome|pg|dind|dind-run)$ ]] && valid_instance "${BASH_REMATCH[1]}"; then
+      return 0
+    fi
+  done <<<"$volumes"
+  return 1
+}
+
 require_empty_installation() {
   local managed_pods pods managed_volumes volumes secrets
   managed_pods=$(pm pod ls --filter label=oc.sandbox=1 --format '{{.Name}}') \
@@ -839,8 +855,7 @@ require_empty_installation() {
   secrets=$(pm secret ls --format '{{.Name}}') || die "could not verify installation secret inventory"
   # Named teardown can also remove these resources when they have no labels.
   if [[ -n $managed_pods || -n $managed_volumes ]] ||
-      grep -qxE 'oc(-[a-z0-9-]+)?' <<<"$pods" ||
-      grep -qxE 'oc-home|oc(-[a-z0-9-]+)?-(chrome|pg|dind(-run)?)' <<<"$volumes" ||
+      has_unlabelled_instance_resources "$pods" "$volumes" ||
       grep -qxE 'oc(-[a-z0-9-]+)?-pg-(password|passfile|hba)' <<<"$secrets"; then
     die "legacy sandbox resources remain without an installation binding; recover the original data root before setup or teardown"
   fi

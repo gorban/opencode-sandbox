@@ -1094,6 +1094,18 @@ check 'teardown refuses an unlabelled named pod without an installation binding'
 check 'unbound named pod produces no binding or removal' \
   bash -c 'test ! -e "$1" && ! grep -qE "^podman (pod|volume) rm|^systemctl" "$2"' _ \
     "$legacy_pod_home/.config/systemd/user/.oc-sandbox/binding" "$T/stub.log"
+unrelated_home=$T/unrelated-pod-home
+mkdir -p "$unrelated_home"
+out=$(pathrun HOME="$unrelated_home" STUB_PODS_ABSENT=1 \
+  STUB_UNLABELLED_PODS=$'oc-default\noc-chromium\n' -- -i team -d)
+check 'unrelated unlabelled pods allow an initial binding' grep -qx 'rc=0' <<<"$out"
+check 'the default alias is not removed as an unlabelled pod' ! grep -q '^podman pod rm .*oc-default$' "$T/stub.log"
+unrelated_home=$T/unrelated-volume-home
+mkdir -p "$unrelated_home"
+out=$(pathrun HOME="$unrelated_home" STUB_PODS_ABSENT=1 \
+  STUB_LEGACY_VOLUMES=$'oc-default-pg\noc-agent-pg\n' -- -i team -d -a -y)
+check 'unrelated unlabelled volumes allow an initial binding' grep -qx 'rc=0' <<<"$out"
+check 'the default alias is not removed as an unlabelled volume' ! grep -q '^podman volume rm .*oc-default-pg$' "$T/stub.log"
 mkdir -p "$DSTATE/bridge-stage/edit"
 printf 'unsaved fixture' > "$DSTATE/bridge-stage/edit/save"
 out=$(pathrun -- -d -a -y)
