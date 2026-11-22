@@ -16,6 +16,7 @@ from dataclasses import replace
 import errno
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -41,6 +42,9 @@ from oc_address import (  # noqa: E402
 )
 from oc_broker_common import _UMASK_LOCK  # noqa: E402
 from oc_coord_contract import (  # noqa: E402
+    MAX_ARTIFACTS_PER_MSG,
+    MAX_STREAM_EVENT_BYTES,
+    ROLE_TO_TRUST_CLASS,
     SANDBOX_LIFECYCLE_STATES,
     ArtifactRef,
     CoordAuthError,
@@ -74,11 +78,12 @@ from oc_schema import (  # noqa: E402
 )
 
 _DB_FILENAME = "registry.sqlite"
-_DB_SIDECAR_SUFFIXES = ("", "-wal", "-shm")
+_DB_SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
 _DEFAULT_THREAD_ID = "main"
 _TUI_SURFACE_KIND = "opencode-tui"
 _MAX_TUI_TOKEN_TTL_S = 5.0
 _MAX_WORKTREE_FILE_BYTES = 4096
+_MAX_DETAIL_DEPTH = 16
 _AUDIT_GENESIS_HASH = "0" * 64
 
 _STATUS_PENDING = "pending"
@@ -108,8 +113,17 @@ _TRUST_CLASS_TO_BADGE: dict[TrustClass, ProvenanceBadge] = {
     TrustClass.SYSTEM_ALERT: ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED,
 }
 
+_TRUST_RANK: dict[TrustClass, int] = {
+    TrustClass.UNTRUSTED_PEER_DATA: 0,
+    TrustClass.SYSTEM_ALERT: 0,
+    TrustClass.PARENT_TASK: 1,
+    TrustClass.OPERATOR_DIRECTIVE: 2,
+}
+
 _UNTRUSTED_DETAIL_KEYS: frozenset[str] = frozenset(
     {
+        "src",
+        "principal",
         "sender",
         "src_actor",
         "src_role",
@@ -354,7 +368,7 @@ def _verify_db_file(path: Path, *, enforce_0600: bool) -> None:
     if not enforce_0600:
         return
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise CoordPolicyError(f"Symlink database file rejected: {path}") from exc
@@ -395,17 +409,59 @@ def _compute_audit_hash(
     return hashlib.sha256(f"{prev_hash}{payload}".encode("utf-8")).hexdigest()
 
 
-def _sanitize_stream_detail(detail: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(detail, Mapping):
-        return {}
+def _safe_timestamp(raw: Any) -> float:
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        val = float(raw)
+        if math.isfinite(val) and val > 0.0:
+            return val
+    return time.time()
+
+
+def _sanitize_detail_value(val: Any, depth: int) -> tuple[bool, Any]:
+    if depth > _MAX_DETAIL_DEPTH:
+        return False, None
+    if val is None or isinstance(val, (bool, int, str)):
+        return True, val
+    if isinstance(val, float):
+        return (True, val) if math.isfinite(val) else (False, None)
+    if isinstance(val, Mapping):
+        return True, _sanitize_detail_mapping(val, depth + 1)
+    if isinstance(val, (list, tuple)):
+        items: list[Any] = []
+        for elem in val:
+            ok, cleaned = _sanitize_detail_value(elem, depth + 1)
+            if ok:
+                items.append(cleaned)
+        return True, items
+    return False, None
+
+
+def _sanitize_detail_mapping(mapping: Mapping[str, Any], depth: int) -> dict[str, Any]:
     clean: dict[str, Any] = {}
-    for key, val in detail.items():
-        if not isinstance(key, str):
+    for key, val in mapping.items():
+        if not isinstance(key, str) or key.strip().lower() in _UNTRUSTED_DETAIL_KEYS:
             continue
-        if key.strip().lower() in _UNTRUSTED_DETAIL_KEYS:
-            continue
-        clean[key] = val
+        ok, cleaned = _sanitize_detail_value(val, depth)
+        if ok:
+            clean[key] = cleaned
     return clean
+
+
+def _sanitize_stream_detail(detail: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+    clean = _sanitize_detail_mapping(detail, 0) if isinstance(detail, Mapping) else {}
+    encoded = canonical_json(clean)
+    if len(encoded.encode("utf-8")) > MAX_STREAM_EVENT_BYTES:
+        raise CoordValidationError("StreamEvent detail exceeds maximum bounded size")
+    return clean, encoded
+
+
+def _sanitize_stream_message_id(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    try:
+        return validate_opaque_token(raw, "message_id")
+    except (AddressError, CoordValidationError):
+        return None
 
 
 def _row_to_sandbox(row: sqlite3.Row) -> SandboxRecord:
@@ -558,6 +614,12 @@ def _validate_sandbox_record(record: SandboxRecord) -> str:
     validate_opaque_token(record.job_id, "job_id")
     if record.status not in SANDBOX_LIFECYCLE_STATES:
         raise CoordValidationError(f"Invalid sandbox status: {record.status!r}")
+    if record.parent_addr is not None:
+        parse_local_target(record.parent_addr)
+    if record.controller_request_id is not None:
+        validate_opaque_token(record.controller_request_id, "controller_request_id")
+    if type(record.depth) is not int or record.depth < 0:
+        raise CoordValidationError("sandbox depth must be a non-negative integer")
     for field_val, label in (
         (record.worker_ref, "worker_ref"),
         (record.instance_name, "instance_name"),
@@ -640,7 +702,7 @@ class CoordRegistry:
         self._conn = self._open_hardened_db()
 
     def _open_hardened_db(self) -> sqlite3.Connection:
-        _verify_all_db_files(self._db_path, enforce_0600=False)
+        _verify_all_db_files(self._db_path, enforce_0600=True)
         with _UMASK_LOCK:
             old_umask = os.umask(0o177)
             try:
@@ -649,18 +711,21 @@ class CoordRegistry:
                     isolation_level=None,
                     check_same_thread=False,
                 )
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA journal_mode = WAL")
-                conn.execute("PRAGMA foreign_keys = ON")
-                conn.execute("PRAGMA synchronous = FULL")
-                conn.execute("PRAGMA busy_timeout = 5000")
-                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    for stmt in _SCHEMA_SQL:
-                        conn.execute(stmt)
-                    conn.execute("COMMIT")
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA journal_mode = WAL")
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    conn.execute("PRAGMA synchronous = FULL")
+                    conn.execute("PRAGMA busy_timeout = 5000")
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        for stmt in _SCHEMA_SQL:
+                            conn.execute(stmt)
+                        conn.execute("COMMIT")
+                    except BaseException:
+                        conn.execute("ROLLBACK")
+                        raise
                 except BaseException:
-                    conn.execute("ROLLBACK")
                     conn.close()
                     raise
             finally:
@@ -899,12 +964,29 @@ class CoordRegistry:
 
     def grant_edge(self, edge: RoutingEdge) -> RoutingEdge:
         threads, kinds = _validate_routing_edge(edge)
-        created_at = edge.created_at if edge.created_at > 0 else time.time()
+        created_at = _safe_timestamp(edge.created_at)
         with self._tx() as conn:
-            if self._is_tombstoned_conn(conn, edge.edge_id, edge.grant_generation):
+            tomb = conn.execute(
+                "SELECT MAX(grant_generation) AS max_gen FROM grant_tombstones WHERE edge_id = ?",
+                (edge.edge_id,),
+            ).fetchone()
+            if tomb is not None and tomb["max_gen"] is not None and edge.grant_generation <= int(tomb["max_gen"]):
                 raise RevokedError(
-                    f"Grant ({edge.edge_id}, gen={edge.grant_generation}) is tombstoned"
+                    f"Grant ({edge.edge_id}, gen={edge.grant_generation}) is at or below tombstoned generation"
                 )
+            existing = conn.execute(
+                "SELECT grant_generation, turns_used FROM routing_edges WHERE edge_id = ?",
+                (edge.edge_id,),
+            ).fetchone()
+            turns_used = edge.turns_used
+            if existing is not None:
+                prev_gen = int(existing["grant_generation"])
+                if edge.grant_generation < prev_gen:
+                    raise RevokedError(
+                        f"Grant ({edge.edge_id}, gen={edge.grant_generation}) cannot downgrade from gen={prev_gen}"
+                    )
+                if edge.grant_generation == prev_gen:
+                    turns_used = max(turns_used, int(existing["turns_used"]))
             conn.execute(
                 """
                 INSERT INTO routing_edges (
@@ -935,7 +1017,7 @@ class CoordRegistry:
                     canonical_json(threads),
                     canonical_json(kinds),
                     edge.max_rounds,
-                    edge.turns_used,
+                    turns_used,
                     edge.rate_limit_rpm,
                     1 if edge.active else 0,
                     edge.lease_request_id,
@@ -1071,13 +1153,37 @@ class CoordRegistry:
         if sb["incarnation_id"] != expected_dst_incarnation:
             raise IncarnationMismatchError("dst_incarnation_mismatch")
 
+    def _verify_source_sandbox_for_send(
+        self,
+        conn: sqlite3.Connection,
+        src_actor: str,
+        expected_src_incarnation: str | None,
+    ) -> None:
+        if expected_src_incarnation is None:
+            return
+        sb = conn.execute(
+            "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?", (src_actor,)
+        ).fetchone()
+        if sb is None:
+            return
+        if sb["status"] == _STATUS_REVOKED:
+            raise RevokedError("src_sandbox_revoked")
+        if sb["incarnation_id"] != expected_src_incarnation:
+            raise IncarnationMismatchError("src_incarnation_mismatch")
+
     def _verify_in_reply_to(
         self,
         conn: sqlite3.Connection,
         edge_row: sqlite3.Row,
+        envelope: Envelope,
         check_in_reply_to: tuple[str, str, str],
     ) -> None:
         ref_msg_id, caller_dst_addr, thread_id = check_in_reply_to
+        if (
+            (envelope.in_reply_to is not None and ref_msg_id != envelope.in_reply_to)
+            or thread_id != envelope.dst_thread_id
+        ):
+            raise CoordValidationError(_ERR_INVALID_IN_REPLY_TO)
         ref_row = conn.execute(
             """
             SELECT src_actor, dst_addr, dst_thread_id FROM event_log
@@ -1213,7 +1319,7 @@ class CoordRegistry:
                 updated_env.edge_id,
                 edge_row["lease_request_id"],
                 int(edge_row["grant_generation"]),
-                edge_row["src_incarnation"],
+                updated_env.src_incarnation,
                 updated_env.dst_incarnation,
                 updated_env.dst_thread_id,
                 priority,
@@ -1260,6 +1366,30 @@ class CoordRegistry:
             },
         )
 
+    def _validate_envelope_for_send(
+        self, envelope: Envelope, expected_src_incarnation: str | None
+    ) -> tuple[str, str, int]:
+        if not isinstance(envelope.src_role, CoordRole) or not isinstance(envelope.trust_class, TrustClass):
+            raise CoordValidationError("Invalid src_role or trust_class")
+        max_trust = ROLE_TO_TRUST_CLASS[envelope.src_role]
+        if _TRUST_RANK[envelope.trust_class] > _TRUST_RANK[max_trust]:
+            raise CoordPolicyError("trust_class_exceeds_role")
+        parse_local_target(envelope.dst_addr)
+        validate_thread_id(envelope.dst_thread_id)
+        validate_msg_kind(envelope.msg_kind)
+        validate_opaque_token(envelope.msg_id, "msg_id")
+        if envelope.in_reply_to is not None:
+            validate_opaque_token(envelope.in_reply_to, "in_reply_to")
+        if expected_src_incarnation is not None:
+            validate_opaque_token(expected_src_incarnation, "expected_src_incarnation")
+        if len(envelope.artifact_refs) > MAX_ARTIFACTS_PER_MSG or any(
+            not isinstance(a, ArtifactRef) for a in envelope.artifact_refs
+        ):
+            raise CoordValidationError("Invalid or excessive artifact_refs")
+        canon_body = canonicalize_body_text(envelope.body_text)
+        canon_sha = sha256_canonical_body(canon_body)
+        return canon_body, canon_sha, len(canon_body.encode("utf-8"))
+
     def admit_and_enqueue_send(
         self,
         *,
@@ -1273,23 +1403,20 @@ class CoordRegistry:
         max_queued_bytes: int,
         check_in_reply_to: tuple[str, str, str] | None = None,
     ) -> tuple[int, Envelope]:
-        parse_local_target(envelope.dst_addr)
-        validate_thread_id(envelope.dst_thread_id)
-        validate_msg_kind(envelope.msg_kind)
-        validate_opaque_token(envelope.msg_id, "msg_id")
-        canon_body = canonicalize_body_text(envelope.body_text)
-        canon_sha = sha256_canonical_body(canon_body)
-        body_bytes = len(canon_body.encode("utf-8"))
+        canon_body, canon_sha, body_bytes = self._validate_envelope_for_send(
+            envelope, expected_src_incarnation
+        )
         priority = 1 if is_control_priority(envelope.trust_class, envelope.msg_kind) else 0
-        now = envelope.created_at if envelope.created_at > 0 else time.time()
+        now = _safe_timestamp(envelope.created_at)
 
         with self._tx() as conn:
             edge_row = self._verify_edge_for_send(
                 conn, edge_id, expected_grant_generation, expected_src_incarnation, envelope
             )
+            self._verify_source_sandbox_for_send(conn, envelope.src_actor, expected_src_incarnation)
             self._verify_target_sandbox_for_send(conn, envelope.dst_addr, expected_dst_incarnation)
             if check_in_reply_to is not None:
-                self._verify_in_reply_to(conn, edge_row, check_in_reply_to)
+                self._verify_in_reply_to(conn, edge_row, envelope, check_in_reply_to)
             if priority == 0:
                 self._check_outbox_backpressure(
                     conn, edge_id, body_bytes, max_queued_msgs, max_queued_bytes
@@ -1298,9 +1425,15 @@ class CoordRegistry:
                 conn, edge_row, edge_id, expected_grant_generation, count_turn
             )
             seq = self._next_seq(conn)
+            effective_src_inc = (
+                expected_src_incarnation
+                if expected_src_incarnation is not None
+                else edge_row["src_incarnation"]
+            )
             updated_env = replace(
                 envelope,
                 seq=seq,
+                src_incarnation=effective_src_inc,
                 dst_incarnation=expected_dst_incarnation,
                 body_text=canon_body,
                 body_sha256=canon_sha,
@@ -1314,6 +1447,51 @@ class CoordRegistry:
     # ------------------------------------------------------------------
     # Fenced Outbox State Machine & Persistent Grant Tombstones
     # ------------------------------------------------------------------
+
+    def _cancel_pending_outbox_msgs(
+        self, conn: sqlite3.Connection, msg_ids: list[str], reason: str, now: float
+    ) -> None:
+        if not msg_ids:
+            return
+        placeholders = ",".join("?" for _ in msg_ids)
+        conn.execute(
+            f"""
+            UPDATE outbox SET status = ?, detail = ?, updated_at = ?
+            WHERE status = ? AND msg_id IN ({placeholders})
+            """,
+            (_STATUS_CANCELLED, reason, now, _STATUS_PENDING, *msg_ids),
+        )
+        conn.execute(
+            f"""
+            DELETE FROM dispatch_receipts
+            WHERE consumed_at IS NULL AND message_id IN ({placeholders})
+            """,
+            tuple(msg_ids),
+        )
+
+    def _revoke_whole_sandbox_conn(
+        self, conn: sqlite3.Connection, target_addr: str, reason: str, now: float
+    ) -> None:
+        conn.execute(
+            "UPDATE sandboxes SET status = ?, updated_at = ? WHERE sandbox_addr = ?",
+            (_STATUS_REVOKED, now, target_addr),
+        )
+        conn.execute(
+            """
+            UPDATE tui_enter_tokens SET consumed_at = ?
+            WHERE sandbox_addr = ? AND consumed_at IS NULL
+            """,
+            (now, target_addr),
+        )
+        rows = conn.execute(
+            """
+            SELECT o.msg_id FROM outbox o
+            JOIN event_log e ON e.msg_id = o.msg_id
+            WHERE o.status = ? AND (e.dst_addr = ? OR e.src_actor = ?)
+            """,
+            (_STATUS_PENDING, target_addr, target_addr),
+        ).fetchall()
+        self._cancel_pending_outbox_msgs(conn, [r["msg_id"] for r in rows], reason, now)
 
     def revoke_grant_and_cancel_outbox(
         self,
@@ -1337,14 +1515,12 @@ class CoordRegistry:
             clauses.append("lease_request_id = ?")
             params.append(lease_request_id)
         where = " AND ".join(clauses)
+        whole_sandbox = target_addr is not None and edge_id is None and lease_request_id is None
         now = time.time()
 
         with self._tx() as conn:
-            if target_addr is not None:
-                conn.execute(
-                    "UPDATE sandboxes SET status = ?, updated_at = ? WHERE sandbox_addr = ?",
-                    (_STATUS_REVOKED, now, target_addr),
-                )
+            if whole_sandbox:
+                self._revoke_whole_sandbox_conn(conn, target_addr, reason, now)
             rows = conn.execute(
                 f"SELECT edge_id, grant_generation FROM routing_edges WHERE {where} ORDER BY edge_id ASC",
                 params,
@@ -1363,30 +1539,20 @@ class CoordRegistry:
                     (eid, gen, reason, now),
                 )
                 conn.execute("UPDATE routing_edges SET active = 0 WHERE edge_id = ?", (eid,))
-                conn.execute(
+                pending_rows = conn.execute(
                     """
-                    UPDATE outbox SET status = ?, detail = ?, updated_at = ?
+                    SELECT msg_id FROM outbox
                     WHERE edge_id = ? AND grant_generation = ? AND status = ?
                     """,
-                    (_STATUS_CANCELLED, reason, now, eid, gen, _STATUS_PENDING),
-                )
-            if target_addr is not None:
-                conn.execute(
-                    """
-                    UPDATE outbox SET status = ?, detail = ?, updated_at = ?
-                    WHERE status = ?
-                      AND msg_id IN (SELECT msg_id FROM event_log WHERE dst_addr = ?)
-                    """,
-                    (_STATUS_CANCELLED, reason, now, _STATUS_PENDING, target_addr),
-                )
-            if lease_request_id is not None:
-                conn.execute(
-                    """
-                    UPDATE outbox SET status = ?, detail = ?, updated_at = ?
-                    WHERE lease_request_id = ? AND status = ?
-                    """,
-                    (_STATUS_CANCELLED, reason, now, lease_request_id, _STATUS_PENDING),
-                )
+                    (eid, gen, _STATUS_PENDING),
+                ).fetchall()
+                self._cancel_pending_outbox_msgs(conn, [r["msg_id"] for r in pending_rows], reason, now)
+            if lease_request_id is not None and edge_id is None and target_addr is None:
+                lease_rows = conn.execute(
+                    "SELECT msg_id FROM outbox WHERE lease_request_id = ? AND status = ?",
+                    (lease_request_id, _STATUS_PENDING),
+                ).fetchall()
+                self._cancel_pending_outbox_msgs(conn, [r["msg_id"] for r in lease_rows], reason, now)
             self._append_audit_conn(
                 conn,
                 "host",
@@ -1422,6 +1588,42 @@ class CoordRegistry:
             ).fetchone()
             return _row_to_envelope(row) if row is not None else None
 
+    def _outbox_fence_allows(
+        self,
+        conn: sqlite3.Connection,
+        edge_id: str,
+        grant_generation: int,
+        src_incarnation: str | None,
+        dst_incarnation: str,
+    ) -> bool:
+        edge = conn.execute(
+            "SELECT src_actor, dst_addr, active, grant_generation FROM routing_edges WHERE edge_id = ?",
+            (edge_id,),
+        ).fetchone()
+        if (
+            edge is None
+            or int(edge["active"]) != 1
+            or int(edge["grant_generation"]) != grant_generation
+            or self._is_tombstoned_conn(conn, edge_id, grant_generation)
+        ):
+            return False
+        dst_sb = conn.execute(
+            "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?",
+            (edge["dst_addr"],),
+        ).fetchone()
+        if dst_sb is None or dst_sb["status"] == _STATUS_REVOKED or dst_sb["incarnation_id"] != dst_incarnation:
+            return False
+        if src_incarnation is not None:
+            src_sb = conn.execute(
+                "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?",
+                (edge["src_actor"],),
+            ).fetchone()
+            if src_sb is not None and (
+                src_sb["status"] == _STATUS_REVOKED or src_sb["incarnation_id"] != src_incarnation
+            ):
+                return False
+        return True
+
     def mark_outbox_dispatch_started(
         self,
         msg_id: str,
@@ -1432,22 +1634,19 @@ class CoordRegistry:
     ) -> bool:
         now = time.time()
         with self._tx() as conn:
-            edge = conn.execute(
-                "SELECT dst_addr, active, grant_generation FROM routing_edges WHERE edge_id = ?",
-                (edge_id,),
+            row = conn.execute(
+                """
+                SELECT src_incarnation FROM outbox
+                WHERE msg_id = ? AND status = ? AND edge_id = ?
+                  AND grant_generation = ? AND dst_incarnation = ?
+                """,
+                (msg_id, _STATUS_PENDING, edge_id, grant_generation, dst_incarnation),
             ).fetchone()
-            if (
-                edge is None
-                or int(edge["active"]) != 1
-                or int(edge["grant_generation"]) != grant_generation
-                or self._is_tombstoned_conn(conn, edge_id, grant_generation)
-            ):
+            if row is None:
                 return False
-            sb = conn.execute(
-                "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?",
-                (edge["dst_addr"],),
-            ).fetchone()
-            if sb is None or sb["status"] == _STATUS_REVOKED or sb["incarnation_id"] != dst_incarnation:
+            if not self._outbox_fence_allows(
+                conn, edge_id, grant_generation, row["src_incarnation"], dst_incarnation
+            ):
                 return False
             cur = conn.execute(
                 """
@@ -1472,12 +1671,21 @@ class CoordRegistry:
         now = time.time()
         with self._tx() as conn:
             row = conn.execute(
-                "SELECT edge_id, grant_generation FROM outbox WHERE msg_id = ? AND status = ?",
+                """
+                SELECT edge_id, grant_generation, src_incarnation, dst_incarnation
+                FROM outbox WHERE msg_id = ? AND status = ?
+                """,
                 (msg_id, _STATUS_DISPATCH_STARTED),
             ).fetchone()
             if row is None:
                 return False
-            if self._is_tombstoned_conn(conn, row["edge_id"], int(row["grant_generation"])):
+            if not self._outbox_fence_allows(
+                conn,
+                row["edge_id"],
+                int(row["grant_generation"]),
+                row["src_incarnation"],
+                row["dst_incarnation"],
+            ):
                 return False
             cur = conn.execute(
                 """
@@ -1543,6 +1751,10 @@ class CoordRegistry:
             )
             if cur.rowcount != 1:
                 raise CoordValidationError(_ERR_INVALID_OUTBOX_TRANSITION)
+            conn.execute(
+                "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?",
+                (msg_id,),
+            )
 
     # ------------------------------------------------------------------
     # Provenance Receipts, TUI Enter Tokens, & Hostile Stream Events
@@ -1556,7 +1768,10 @@ class CoordRegistry:
         message_id: str,
         body_text: str,
     ) -> ProvenanceBadge | None:
-        canon_sha = sha256_canonical_body(body_text)
+        try:
+            canon_sha = sha256_canonical_body(body_text)
+        except CoordValidationError:
+            return None
         now = time.time()
         with self._tx() as conn:
             row = conn.execute(
@@ -1632,14 +1847,14 @@ class CoordRegistry:
             return cur.rowcount == 1
 
     def _resolve_user_message_badge(
-        self, event: StreamEvent, tui_enter_token: str | None
+        self, event: StreamEvent, safe_message_id: str | None, tui_enter_token: str | None
     ) -> ProvenanceBadge:
-        if event.message_id is not None:
+        if safe_message_id is not None:
             receipt_badge = self.consume_dispatch_receipt(
                 event.sandbox_addr,
                 event.incarnation_id,
                 event.thread_id,
-                event.message_id,
+                safe_message_id,
                 event.text,
             )
             if receipt_badge is not None:
@@ -1655,13 +1870,13 @@ class CoordRegistry:
     ) -> dict[str, Any]:
         if not isinstance(event, StreamEvent):
             raise CoordValidationError("event must be a StreamEvent")
-        clean_detail = _sanitize_stream_detail(event.detail)
-        detail_json = canonical_json(clean_detail)
-        now = event.created_at if event.created_at > 0 else time.time()
+        clean_detail, detail_json = _sanitize_stream_detail(event.detail)
+        safe_message_id = _sanitize_stream_message_id(event.message_id)
+        now = _safe_timestamp(event.created_at)
         with self._tx() as conn:
             badge: ProvenanceBadge | None = None
             if event.event_type == "user_message":
-                badge = self._resolve_user_message_badge(event, tui_enter_token)
+                badge = self._resolve_user_message_badge(event, safe_message_id, tui_enter_token)
             seq = self._next_seq(conn)
             badge_val = badge.value if badge is not None else None
             conn.execute(
@@ -1678,7 +1893,7 @@ class CoordRegistry:
                     event.incarnation_id,
                     event.thread_id,
                     event.seq_hint,
-                    event.message_id,
+                    safe_message_id,
                     event.text,
                     event.file_path,
                     detail_json,
@@ -1710,7 +1925,7 @@ class CoordRegistry:
                 "incarnation_id": event.incarnation_id,
                 "thread_id": event.thread_id,
                 "seq_hint": event.seq_hint,
-                "message_id": event.message_id,
+                "message_id": safe_message_id,
                 "text": event.text,
                 "file_path": event.file_path,
                 "detail": clean_detail,
