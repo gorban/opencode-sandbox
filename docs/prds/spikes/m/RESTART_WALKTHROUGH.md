@@ -44,7 +44,7 @@ remain open.
 |---|---|---|
 | `docs/prds/spikes/m/RESTART_WALKTHROUGH.md` | Coordination lane | This Gate 1 walkthrough |
 | `docs/prds/spikes/m/oc_coord_contract.py` | Coordination lane (sole owner) | Additive `DispatchResult.permanent` (strictly validated) and opt-in `ExternallyFencedTransport` protocol (`external_write_fence`, `transport_owner_id`, `confirm_incarnation_terminal`) |
-| `docs/prds/spikes/m/oc_registry.py` | Coordination lane | Durable `external_transport_bindings` table and atomic helpers (`record_transport_binding`, `mark_transport_abort_requested`, `commit_external_revoke`, `mark_transport_terminal_confirmed`, `list_unconfirmed_transport_bindings`, `has_unconfirmed_transport_binding`, `list_unretired_aborted_bindings`, `get_transport_binding`) |
+| `docs/prds/spikes/m/oc_registry.py` | Coordination lane | Durable `external_transport_bindings` table and atomic helpers (`record_transport_binding`, `mark_transport_abort_requested`, `commit_external_revoke`, `list_unconfirmed_transport_bindings`, `has_unconfirmed_transport_binding`, `get_transport_binding`) |
 | `docs/prds/spikes/m/oc_hub.py` | Coordination lane | Narrowly opted-in split-phase dispatch for `ExternallyFencedTransport` (existing transports stay on synchronous fence), operator-only/unmonitored/sole-grant enforcement, pre-dispatch owner binding & durable terminal-confirmation gating, Phase 3 settlement ownership until durable/cleanup transfer, `DispatchResult.permanent` & detail sanitization, minimal-transport post-race abort settlement, validated `confirm_recovery(timeout_s=...)` |
 | `docs/prds/spikes/m/oc_fake_worker.py` | Coordination lane | Test helper script modes (`permanent=True` refusal, paused pre-write / post-receipt hooks) and opt-in externally-fenced fake wrapper implementing exact-owner attestation |
 | `docs/prds/spikes/m/test_restart_qualification.py` | Coordination lane | Transport-parameterized 5-checkpoint qualification suite (with paused-write race on a separate fresh job), explicit separate clean-restart fixture, substituted-transport & double-failure crash/restart fixtures, failed-DB-clear retry fixture, post-receipt barrier fixture, and `verify_combined_pass_evidence()` |
@@ -370,20 +370,29 @@ obligation by returning `False` for an incarnation it never served.
      and writing `grant_tombstones` **never** deletes or clears
      `external_transport_bindings`. Only explicit confirmation by the exact
      `owner_id` flips `terminal_confirmed = 1`.
-   - **No-bypass owner attestation rule:** Whenever an unconfirmed binding
-     `(sandbox_addr, incarnation_id, owner_id)` exists (`terminal_confirmed == 0`),
-     clearing it **strictly requires**:
+   - **No-bypass owner attestation & monotonic retirement rule:** `terminal_confirmed = 1`
+     is the single monotonic completion marker for the exact
+     `(sandbox_addr, incarnation_id, owner_id)` binding and is **never**
+     committed standalone—it is committed **only** inside the atomic
+     `commit_external_revoke()` transaction alongside complete logical
+     retirement (grant tombstoning, pending outbox cancellation, unconsumed
+     receipt deletion, `sandboxes.status = 'revoked'`, and audit). Clearing an
+     unconfirmed binding (`terminal_confirmed == 0`) **strictly requires**:
      1. `isinstance(self._transport, ExternallyFencedTransport)` AND
         `self._transport.external_write_fence is True`, AND
      2. `self._transport.confirm_incarnation_terminal(sandbox_addr, incarnation_id, owner_id=owner_id, reason=reason) is True`, AND
-     3. SQLite `mark_transport_terminal_confirmed(sandbox_addr, incarnation_id, owner_id=owner_id)`
-        commits cleanly (**DB clear BEFORE popping the in-memory
-        `_pending_cleanup_incarnations` entry**, so a transient DB clear error
-        keeps memory and SQLite aligned and retryable!).
+     3. Atomic SQLite `commit_external_revoke(target_addr=sandbox_addr, incarnation_id=incarnation_id, owner_id=owner_id, actor=..., reason=reason)`
+        commits cleanly (**DB commit BEFORE popping the in-memory
+        `_pending_cleanup_incarnations` entry**, across `revoke()`, the
+        background cleanup retry worker, and `confirm_recovery()`).
      - A substituted transport (`FakeWorkerTransport`, minimal `WorkerTransport`,
        or another `ExternallyFencedTransport` that does not own `owner_id`)
        fails step (1) or (2), leaves `terminal_confirmed = 0`, keeps recovery
-       degraded, and keeps replacement blocked.
+       degraded, and keeps replacement blocked. Because `terminal_confirmed = 1`
+       is scoped to the exact `(sandbox_addr, incarnation_id, owner_id)` row and
+       committed atomically with logical retirement, historical retired bindings
+       are never re-inspected via address-only sandbox/edge lookups and cannot
+       be confused with a healthy successor incarnation at the same address.
 
 2. **Exact ordering on `revoke()` — atomic success path, double-failure path, and failed-logical-retirement path:**
    - **Step 1 (in-memory fence):** Fence `_fenced_addrs`, `_fenced_targets`,
@@ -450,23 +459,21 @@ obligation by returning `False` for an incarnation it never served.
    - Refuses to register or replace `sandbox_addr` (`CoordPolicyError("transport_abort_unconfirmed")`)
      whenever **either** `_pending_cleanup_incarnations` contains `sandbox_addr`
      **or** SQLite `has_unconfirmed_transport_binding(sandbox_addr)` is `True`
-     **or** SQLite `list_unretired_aborted_bindings()` contains `sandbox_addr`.
+     (any `external_transport_bindings` row for `sandbox_addr` with
+     `terminal_confirmed == 0`).
 
 4. **Degraded startup reconstruction & `confirm_recovery(caller, *, reason=..., timeout_s: float = 2.0)`:**
    - Validate `timeout_s`: reject `bool`, non-finite (`NaN`/`Inf`), or
      `timeout_s < 0` (`CoordValidationError`).
    - **In `CoordHub.__init__()`:** query `list_unconfirmed_transport_bindings()`
-     and `list_unretired_aborted_bindings()` (any binding with
-     `abort_requested == 1` whose sandbox is not yet `revoked` or still has an
-     active edge / `pending` outbox row). Boot **degraded** (`self._degraded = True`)
-     and reconstruct `_pending_cleanup_incarnations` / `_fenced_targets`
-     whenever:
+     (rows with `terminal_confirmed == 0` only; retired `terminal_confirmed == 1`
+     rows are monotonically complete and never inspected via address-only
+     sandbox or edge queries). Boot **degraded** (`self._degraded = True`) and
+     reconstruct `_pending_cleanup_incarnations` / `_fenced_targets` whenever:
      - `.coord_degraded` or `.coord_session_active` exists, OR
      - Any unconfirmed binding has `abort_requested == 1`, OR
-     - Any unconfirmed binding's sandbox has `status == 'revoked'`, OR
-     - Any `list_unretired_aborted_bindings()` entry exists (defends against
-       unretired logical state even if `terminal_confirmed` were already `1`,
-       including on reopen with a legacy transport), OR
+     - Any unconfirmed binding's sandbox is absent, has `status == 'revoked'`,
+       or has rotated to a different `incarnation_id`, OR
      - Any unconfirmed binding exists whose `owner_id` is not actively owned by
        the currently attached `ExternallyFencedTransport` (i.e. substituted
        transport, legacy transport, or unknown `owner_id`).
@@ -476,18 +483,19 @@ obligation by returning `False` for an incarnation it never served.
        `list_unconfirmed_transport_bindings()` plus active `sandboxes`,
        best-effort sets `abort_requested = 1` for every unconfirmed binding,
        releases `fences`, and immediately runs `_drain_pending_cleanups()`
-       (calling `confirm_incarnation_terminal(..., owner_id=...)` for external
-       bindings and committing `terminal_confirmed = 1` before popping memory).
+       (calling `confirm_incarnation_terminal(..., owner_id=...)` for each
+       unconfirmed external binding and committing atomic
+       `commit_external_revoke()`—logical retirement + `terminal_confirmed = 1`
+       together—before popping memory).
      - Wait on `_inflight_cond` up to `timeout_s` (checking `self._closed`)
        until `_inflight_handoffs` is empty. If wedged past deadline, raise
        `CoordPolicyError(_ERR_CLEANUP_INCOMPLETE)` and remain degraded.
      - Re-run `_drain_pending_cleanups()`, then require **both**
        `not self._has_pending_cleanups()` AND
        `not self._registry.list_unconfirmed_transport_bindings()` before
-       running Phase 2 DB retirements (tombstoning active edges, cancelling
-       pending rows, marking orphaned `dispatch_started` uncertain, setting
-       sandboxes `revoked`, auditing `confirm_recovery`) and unlinking
-       `.coord_degraded`.
+       running Phase 2 DB retirements (remaining non-external edges/sandboxes,
+       orphaned `dispatch_started -> uncertain`, auditing `confirm_recovery`)
+       and unlinking `.coord_degraded`.
 
 ---
 
@@ -570,6 +578,17 @@ explicit authority evidence required before `hub2` dispatches `msg_eligible`:
    `grant_tombstones`.
 5. Unmonitored operator edge (or controller-confirmed-active if controller-bound)
    and live transport grant (`status().revoked is False`).
+
+- **Successor-at-same-address clean restart fixture:** Extend this clean-restart
+  fixture to retire `inc_1` at `sb-addr` (leaving historical
+  `(sb-addr, inc_1, owner_1, abort_requested=1, terminal_confirmed=1)` plus its
+  cancelled old outbox row in SQLite), register successor `inc_2` with `owner_2`
+  at the **exact same `sb-addr`**, grant its sole operator prompt edge, queue a
+  prompt without dispatching, cleanly close Hub 1, and reopen Hub 2 with
+  `inc_2`'s owner. Assert **healthy startup (`hub2.is_degraded is False`)**,
+  **exactly one dispatch** (`completed`, `attempts == 1`) for the new `inc_2`
+  row, and **zero dispatches** (`cancelled`, `attempts == 0`) for the old
+  `inc_1` row.
 
 ### 4.3 Additional Mandatory Adversarial Fixtures in `test_restart_qualification.py`
 
