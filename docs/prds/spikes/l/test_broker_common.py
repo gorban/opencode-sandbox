@@ -82,9 +82,11 @@ class TestBrokerCommon(unittest.TestCase):
                 bound.cleanup()
             self.assertFalse(path.exists())
 
-            with patch.object(socket.socket, "listen", side_effect=OSError("fixture listen failure")):
-                with self.assertRaises(OSError):
-                    bind_trusted_uds(path)
+            with (
+                patch.object(socket.socket, "listen", side_effect=OSError("fixture listen failure")),
+                self.assertRaises(OSError),
+            ):
+                bind_trusted_uds(path)
             self.assertFalse(path.exists())
 
     def test_cidr_validation_and_dns_ssrf_fail_closed(self) -> None:

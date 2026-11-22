@@ -989,15 +989,17 @@ class TestHostPostgresBroker(unittest.TestCase):
             "allow_test_loopback": True,
             "ssl_context": self._client_ssl,
         }
-        with HostPostgresBrokerServer(route, self._make_vault(), lease, **options) as sibling:
-            with HostPostgresBrokerServer(route, self._make_vault(), lease, **options) as broker:
-                with socket.create_connection(("127.0.0.1", broker.bound_port), timeout=4.0) as client:
-                    _client_handshake(client, lease.ocjob_token)
-                    broker.stop()
-                    self.assertEqual(client.recv(1), b"")
-                self.assertTrue(lease.is_active())
-                with socket.create_connection(("127.0.0.1", sibling.bound_port), timeout=4.0) as client:
-                    _client_handshake(client, lease.ocjob_token)
+        with (
+            HostPostgresBrokerServer(route, self._make_vault(), lease, **options) as sibling,
+            HostPostgresBrokerServer(route, self._make_vault(), lease, **options) as broker,
+        ):
+            with socket.create_connection(("127.0.0.1", broker.bound_port), timeout=4.0) as client:
+                _client_handshake(client, lease.ocjob_token)
+                broker.stop()
+                self.assertEqual(client.recv(1), b"")
+            self.assertTrue(lease.is_active())
+            with socket.create_connection(("127.0.0.1", sibling.bound_port), timeout=4.0) as client:
+                _client_handshake(client, lease.ocjob_token)
 
     def test_pg_controller_revocation_sub_second_and_stalled_cancel_nonblocking(self) -> None:
         now = [100]
@@ -1504,41 +1506,44 @@ class TestHostSshBroker(unittest.TestCase):
 
     def test_ssh_fixture_invocation_delivers_once_to_its_caller(self) -> None:
         ctrl, adapter, _, op, job = self._make_ssh_controller()
-        entered, challenger, release = threading.Event(), threading.Event(), threading.Event()
+        reserved, release = threading.Event(), threading.Event()
+        original_reserve = adapter.reserve
         captured = []
+
+        def pause_after_reservation(invocation):
+            original_reserve(invocation)
+            reserved.set()
+            if not release.wait(8.0):
+                raise TimeoutError("fixture reservation was not released")
 
         def runner(argv, **_):
             captured.append(tuple(argv))
-            entered.set()
-            if not release.wait(4.0):
-                raise TimeoutError("fixture runner was not released")
             return SshRawOutput(0, b"owner result", b"")
 
         broker = HostSshBroker(runner=runner, resolver=self._public_resolver)
         command = ("printf", "fixture")
         request_id = self._approve_fixture(broker, ctrl, op, job, command)
 
-        def invoke():
+        def invoke(tokens):
             return broker.run_approved_command(
-                self._make_target(), command, controller=ctrl, adapter=adapter,
+                self._make_target(), tokens, controller=ctrl, adapter=adapter,
                 job_actor=job, request_id=request_id,
             )
 
-        def concurrent_call():
-            challenger.set()
-            return invoke()
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            owner = pool.submit(invoke)
+        with (
+            patch.object(adapter, "reserve", side_effect=pause_after_reservation),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            owner = pool.submit(invoke, command)
             try:
-                self.assertTrue(entered.wait(4.0))
-                other = pool.submit(concurrent_call)
-                self.assertTrue(challenger.wait(4.0))
+                self.assertTrue(reserved.wait(4.0))
+                other = pool.submit(invoke, ("printf", "other-fixture"))
+                with self.assertRaisesRegex(BrokerAuthError, "already reserved"):
+                    other.result(timeout=4.0)
+                self.assertEqual(captured, [])
             finally:
                 release.set()
             self.assertEqual(owner.result(timeout=4.0).stdout, b"owner result")
-            with self.assertRaises(BrokerAuthError):
-                other.result(timeout=4.0)
         self.assertEqual([argv[-1] for argv in captured], ["printf fixture"])
         self.assertEqual(ctrl.status(job, request_id).state, occ.State.SUCCEEDED)
 
@@ -1551,9 +1556,10 @@ class TestHostSshBroker(unittest.TestCase):
         broker = HostSshBroker(runner=runner, resolver=self._public_resolver)
         command = ("printf", "fixture")
         request_id = self._approve_fixture(broker, ctrl, op, job, command)
+        target = self._make_target()
         with self.assertRaises(BrokerAuthError):
             broker.run_approved_command(
-                self._make_target(), command, controller=ctrl, adapter=adapter,
+                target, command, controller=ctrl, adapter=adapter,
                 job_actor=job, request_id=request_id,
             )
         status = ctrl.status(job, request_id)
@@ -1562,11 +1568,12 @@ class TestHostSshBroker(unittest.TestCase):
 
     def test_ssh_custom_commands_require_a_fixture_runner(self) -> None:
         ctrl, _, _, _, job = self._make_ssh_controller()
+        target = self._make_target()
         with patch.object(self, "_public_resolver") as resolver:
             broker = HostSshBroker(resolver=resolver)
             with self.assertRaisesRegex(BrokerPolicyError, "synthetic fixture runner"):
                 broker.propose_custom_command(
-                    self._make_target(), ("printf", "fixture"), controller=ctrl, job_actor=job,
+                    target, ("printf", "fixture"), controller=ctrl, job_actor=job,
                     alias="ssh_ops_alias", reference="ref_ssh_apply", target_id="ssh_ops_host",
                 )
             resolver.assert_not_called()

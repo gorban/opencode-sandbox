@@ -794,9 +794,7 @@ class HostPostgresBrokerServer:
     def _stop_locked(self) -> None:
         if self._listen_sock is None:
             return
-        self._workers.stop(self._listen_sock)
-        if self._bound_uds is not None:
-            self._bound_uds.cleanup()
+        self._workers.stop(self._listen_sock, self._bound_uds)
         self._bound_uds = None
         self._workers = ListenerWorkers()
         self._listen_sock = None

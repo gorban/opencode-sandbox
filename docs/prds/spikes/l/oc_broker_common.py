@@ -374,10 +374,22 @@ def generate_ocjob_token() -> str:
 
 
 _UMASK_LOCK = threading.Lock()
+_LISTENER_TIMEOUT = 2.0
 
 
 def _identity(st: os.stat_result) -> tuple[int, int]:
     return st.st_dev, st.st_ino
+
+
+def _lock_directory(fd: int, deadline: float) -> None:
+    while time.monotonic() < deadline:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            pause = max(0.0, min(0.01, deadline - time.monotonic()))
+            time.sleep(pause)
+    raise BrokerError("Unix socket cleanup or bind incomplete; directory lock deadline exceeded")
 
 
 @dataclass(slots=True)
@@ -395,15 +407,17 @@ class BoundUds:
             raise BrokerPolicyError("Unix socket entry changed before cleanup")
         os.unlink(self.path.name, dir_fd=self.directory_fd)
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, deadline: float | None = None) -> None:
         if self.directory_fd < 0:
             return
+        deadline = time.monotonic() + _LISTENER_TIMEOUT if deadline is None else deadline
+        _lock_directory(self.directory_fd, deadline)
         try:
-            fcntl.flock(self.directory_fd, fcntl.LOCK_EX)
             self.unlink_owned()
         finally:
-            os.close(self.directory_fd)
-            self.directory_fd = -1
+            fcntl.flock(self.directory_fd, fcntl.LOCK_UN)
+        os.close(self.directory_fd)
+        self.directory_fd = -1
 
 
 def _assert_existing_ancestor_chain_trusted(target_dir: Path, *, sandbox_root: Path | None) -> None:
@@ -469,13 +483,16 @@ def bind_trusted_uds(
     bound = None
     srv = None
     try:
-        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        _lock_directory(directory_fd, time.monotonic() + _LISTENER_TIMEOUT)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         _bind_private_socket(srv, phys_sock)
         # Record ownership before running later operations that might fail.
-        entry = os.stat(phys_sock.name, dir_fd=directory_fd, follow_symlinks=False)
+        try:
+            entry = os.stat(phys_sock.name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise BrokerPolicyError("Unix listener ownership unverified after bind; cleanup incomplete") from exc
         if not stat.S_ISSOCK(entry.st_mode):
-            raise BrokerPolicyError("Could not establish ownership of the Unix socket entry")
+            raise BrokerPolicyError("Unix listener ownership unverified after bind; cleanup incomplete")
         bound = BoundUds(phys_sock, directory_fd, _identity(entry))
         if stat.S_IMODE(entry.st_mode) != 0o600:
             raise BrokerPolicyError("Unix listener permissions must be 0600")
@@ -618,8 +635,8 @@ class ListenerWorkers:
                     _safe_shutdown_close(client)
                     slots.release()
 
-    def stop(self, listener: socket.socket, *, timeout: float = 2.0) -> None:
-        deadline = time.monotonic() + timeout
+    def stop(self, listener: socket.socket, endpoint: BoundUds | None = None) -> None:
+        deadline = time.monotonic() + _LISTENER_TIMEOUT
         with self._lock:
             self._stopping = True
             streams = tuple(self._streams)
@@ -631,6 +648,8 @@ class ListenerWorkers:
             worker.join(max(0.0, deadline - time.monotonic()))
         if any(worker.is_alive() for worker in workers):
             raise BrokerError("Broker stop incomplete; workers are still running")
+        if endpoint is not None:
+            endpoint.cleanup(deadline=deadline)
 
 
 class BrokerLease:

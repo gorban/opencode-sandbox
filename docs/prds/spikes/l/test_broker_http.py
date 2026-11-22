@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -624,18 +626,20 @@ class TestBrokerHttpIntegration(unittest.TestCase):
         response = Mock(status=200, headers=[], connection_tokens=frozenset())
         request = Mock(method="POST")
         downstream = Mock(spec=socket.socket)
-        secret = "synthetic-serializer-marker"
+        upstream = Mock()
+        rule = route.wire_policy.allow_rules[0]
+        deadline = time.monotonic() + 1
+        marker = "synthetic-serializer-marker"
         for media in ("application/json", "text/event-stream"):
             with (
                 self.subTest(media=media),
                 patch.object(self.broker, "_validate_upstream_head", return_value=(media, False, False)),
                 patch("oc_broker_http._read_upstream_body_bounded", return_value=b"fixture bytes"),
-                patch("oc_broker_http.filter_mcp_tools_list_response", return_value=secret.encode()),
+                patch("oc_broker_http.filter_mcp_tools_list_response", return_value=marker.encode()),
             ):
                 with self.assertRaises(CanaryLeakError):
                     self.broker._handle_upstream_response(
-                        downstream, Mock(), response, request, route,
-                        route.wire_policy.allow_rules[0], "tools/list", [secret], time.monotonic() + 1,
+                        downstream, upstream, response, request, route, rule, "tools/list", [marker], deadline,
                     )
                 downstream.sendall.assert_not_called()
         with (
@@ -646,10 +650,42 @@ class TestBrokerHttpIntegration(unittest.TestCase):
         ):
             with self.assertRaises(HttpErrorResponse):
                 self.broker._handle_upstream_response(
-                    downstream, Mock(), response, request, route,
-                    route.wire_policy.allow_rules[0], "tools/list", [], time.monotonic() + 1,
+                    downstream, upstream, response, request, route, rule, "tools/list", [], deadline,
                 )
             downstream.sendall.assert_not_called()
+
+    def test_unix_stop_respects_directory_lock_deadline_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, ThreadPoolExecutor(max_workers=1) as pool:
+            endpoint = Path(temp) / "http.sock"
+            broker = HostHttpBrokerServer(self.routes, self.vault, self.lease, socket_path=endpoint)
+            broker.start()
+            lock_fd = os.open(temp, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                stopped = pool.submit(broker.stop)
+                with self.assertRaisesRegex(BrokerError, "directory lock deadline"):
+                    stopped.result(timeout=4.0)
+                self.assertTrue(endpoint.exists())
+            finally:
+                os.close(lock_fd)
+                broker.stop()
+            self.assertFalse(endpoint.exists())
+
+    def test_unix_stop_retries_failed_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            endpoint = Path(temp) / "http.sock"
+            broker = HostHttpBrokerServer(self.routes, self.vault, self.lease, socket_path=endpoint)
+            broker.start()
+            try:
+                with (
+                    patch("oc_broker_common.os.unlink", side_effect=OSError("fixture unlink failure")),
+                    self.assertRaisesRegex(OSError, "fixture unlink failure"),
+                ):
+                    broker.stop()
+                self.assertTrue(endpoint.exists())
+            finally:
+                broker.stop()
+            self.assertFalse(endpoint.exists())
 
     def test_stop_reports_unfinished_worker_and_preserves_sibling(self) -> None:
         entered = threading.Event()

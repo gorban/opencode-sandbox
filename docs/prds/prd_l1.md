@@ -390,15 +390,14 @@ function handle_broker_postgres_conn(client_sock, job_lease, pg_route):
       `CancelRequest`), pure-stdlib SCRAM-SHA-256 (with `v=` verification), synthetic job-local
       `BackendKeyData`, upstream RO/RW role pinning, `ParameterStatus` allowlist scrubbing, and
       length-accurate `ErrorResponse`/`NoticeResponse` scrubbing (`test_broker_pg_ssh.py`).
-- [x] **Host-mediated SSH Command Broker (`oc_broker_ssh.py`)** — implemented on `spike-prd-l1`:
-      fixed-`argv` preset read-only remote commands (strict allowlists + `shlex.quote`, zero shell
-      interpolation) + `oc_controller` `APPLY_ONCE` digest-pinned exec over hardened OpenSSH
-      (`-F /dev/null`, `ForwardAgent=no`, `ClearAllForwardings=yes`, `StrictHostKeyChecking=yes`,
-      DNS-pinned `HostName`/`HostKeyAlias`, pinned `0600` `UserKnownHostsFile`, bounded streaming
-      output + `<1s` revoke kill) (`test_broker_pg_ssh.py`). The host lowers each route into a
-      preset allowlist for its exact lease. The custom command path uses a synthetic runner and
-      binds the approved command to dispatch and outcome recording. Live custom SSH execution
-      requires a separately qualified adapter.
+- [x] **Host-mediated SSH Command Broker (`oc_broker_ssh.py`)** — read-only presets use validated
+      fixed argv and hardened OpenSSH options (`-F /dev/null`, `ForwardAgent=no`,
+      `ClearAllForwardings=yes`, `StrictHostKeyChecking=yes`, DNS-pinned
+      `HostName`/`HostKeyAlias`, owner-only `known_hosts`, and bounded output and revocation).
+      The host lowers each route to a preset allowlist for its exact lease.
+      The synthetic `oc_controller` `APPLY_ONCE` path binds the approved argv to dispatch and
+      records the fixture runner's outcome. Live custom SSH execution requires a separately
+      qualified adapter. See `test_broker_pg_ssh.py` for fixture coverage.
 - [x] **AWS `AWS_ENDPOINT_URL` SigV4 Re-Signer (`oc_broker_http.py`)** — implemented on
       `spike-prd-l1`: inbound `aws-sigv4-job-key` HMAC-SHA256 verification + host-side SigV4
       re-signing + action inspection (`Action=` across query & body with duplicate/encoded

@@ -2256,9 +2256,7 @@ class HostHttpBrokerServer:
     def _stop_locked(self) -> None:
         if self._sock is None:
             return
-        self._workers.stop(self._sock)
-        if self._bound_uds is not None:
-            self._bound_uds.cleanup()
+        self._workers.stop(self._sock, self._bound_uds)
         self._bound_uds = None
         self._workers = ListenerWorkers()
         self._sock = None
