@@ -285,6 +285,19 @@ class SlidingWindowRateLimiter:
             return True
 
 
+def _redact_broker_services(broker_services: dict[str, Any]) -> dict[str, Any]:
+    return {
+        name: {
+            "kind": cfg["kind"],
+            "credential_delivery": cfg["credential_delivery"],
+            "allow_streaming": bool(cfg.get("allow_streaming", False)),
+            "has_read_only_secret": bool(cfg.get("read_only_secret_ref")),
+            "has_write_secret": bool(cfg.get("write_secret_ref")),
+        }
+        for name, cfg in sorted(broker_services.items())
+    }
+
+
 def _redact_object_for_orchestrator(kind: str, doc: dict[str, Any]) -> dict[str, Any]:
     out = dict(doc)
     if kind == "worker":
@@ -297,6 +310,8 @@ def _redact_object_for_orchestrator(kind: str, doc: dict[str, Any]) -> dict[str,
             {"slot": s["slot"], "target": s["target"], "mode": s["mode"], "configured": bool(s["secret_ref"])}
             for s in doc.get("secret_slots", [])
         ]
+    elif kind == "bundle" and "broker_services" in out:
+        out["broker_services"] = _redact_broker_services(doc.get("broker_services", {}))
     return out
 
 

@@ -19,6 +19,8 @@ import tomllib
 from typing import Any
 from urllib.parse import quote, urlparse, urlsplit
 
+from oc_broker_common import BrokerPolicyError, validate_allowed_cidrs
+
 SCHEMA_VERSION = 1
 
 OPAQUE_ID_RE = re.compile(
@@ -79,7 +81,31 @@ CARDINALITIES = frozenset({"singleton", "named-instance"})
 TIERS = frozenset({"interactive", "managed"})
 TOPOLOGIES = frozenset({"pod-shared", "isolated-sidecars"})
 
-# Exact closed set of security_delta triggers (PRD L)
+CREDENTIAL_DELIVERY_MODES = frozenset({"host-brokered", "local-ephemeral", "raw-container-mount"})
+INBOUND_AUTH_MODES = frozenset({"bearer", "basic-token", "aws-sigv4-job-key", "header"})
+BODY_POLICIES = frozenset({"none", "mcp-jsonrpc", "graphql-query-only", "aws-sigv4"})
+HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+SENSITIVE_HTTP_HEADERS = frozenset(
+    {
+        "authorization",
+        "x-api-key",
+        "x-goog-api-key",
+        "cookie",
+        "proxy-authorization",
+        "x-auth-token",
+        "x-access-token",
+    }
+)
+BROKER_SERVICE_KINDS = frozenset({"http", "postgres", "ssh"})
+FORBIDDEN_INBOUND_AUTH_HEADERS = frozenset(
+    {"host", "content-length", "transfer-encoding", "connection", "upgrade", "te", "trailer"}
+)
+HEADER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}$", re.ASCII)
+DB_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,62}$", re.ASCII)
+SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$", re.ASCII)
+ROUTE_ID_RE = re.compile(r"^(?:mcp|http|pg|ssh):[a-z0-9][a-z0-9_-]{0,31}$", re.ASCII)
+
+# Exact closed set of security_delta triggers (PRD L + PRD L1)
 SECURITY_DELTA_TRIGGERS = frozenset(
     {
         "security_profile_elevation",
@@ -93,6 +119,7 @@ SECURITY_DELTA_TRIGGERS = frozenset(
         "persona_changed",
         "remote_endpoint_added",
         "remote_write_granted",
+        "raw_remote_secret_mounted",
         "secret_slot_added",
         "resource_limit_increased",
     }
@@ -500,7 +527,22 @@ def validate_pod_local_url(url: str, context: str) -> str:
     return url
 
 
-def _validate_remote_host(host: str, allowed_hosts: frozenset[str]) -> None:
+def _ip_allowed_by_cidrs(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, allowed_cidrs: tuple[str, ...]) -> bool:
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        return False
+    if ip.is_global:
+        return True
+    if not allowed_cidrs or not isinstance(ip, ipaddress.IPv4Address):
+        return False
+    return any(ip in ipaddress.ip_network(cidr, strict=True) for cidr in allowed_cidrs)
+
+
+def _validate_remote_host(
+    host: str,
+    allowed_hosts: frozenset[str],
+    *,
+    allowed_cidrs: tuple[str, ...] = (),
+) -> None:
     if not host or len(host) > 253:
         raise PolicyError("Remote endpoint missing or oversized hostname")
     if host in allowed_hosts:
@@ -514,7 +556,7 @@ def _validate_remote_host(host: str, allowed_hosts: frozenset[str]) -> None:
     except ValueError:
         ip = None
     if ip is not None:
-        if not ip.is_global:
+        if not _ip_allowed_by_cidrs(ip, allowed_cidrs):
             raise PolicyError(f"Non-global remote endpoint IP {host!r} blocked by SSRF policy")
         return
     # Reject non-canonical numeric/octal/hex IPv4 forms (0177.0.0.1, 2130706433, 0x7f000001, 127.1)
@@ -532,6 +574,7 @@ def validate_remote_endpoint_url(
     *,
     allow_http: bool = False,
     allowed_hosts: frozenset[str] = frozenset(),
+    allowed_cidrs: tuple[str, ...] = (),
 ) -> str:
     _require_str(url, "remote endpoint")
     if any(ch in url for ch in ("\r", "\n", "\x00", " ")):
@@ -551,7 +594,7 @@ def validate_remote_endpoint_url(
     except ValueError as exc:
         raise PolicyError("Remote endpoint has invalid port") from exc
     host = (parsed.hostname or "").strip().lower().rstrip(".")
-    _validate_remote_host(host, allowed_hosts)
+    _validate_remote_host(host, allowed_hosts, allowed_cidrs=allowed_cidrs)
     return url
 
 
@@ -560,9 +603,12 @@ def canonicalize_remote_url(
     *,
     allow_http: bool = False,
     allowed_hosts: frozenset[str] = frozenset(),
+    allowed_cidrs: tuple[str, ...] = (),
 ) -> str:
     """Validate and canonicalize a remote endpoint URL for exact grant matching & Plan IR hashing."""
-    validated = validate_remote_endpoint_url(url, allow_http=allow_http, allowed_hosts=allowed_hosts)
+    validated = validate_remote_endpoint_url(
+        url, allow_http=allow_http, allowed_hosts=allowed_hosts, allowed_cidrs=allowed_cidrs
+    )
     parsed = urlsplit(validated)
     scheme = parsed.scheme.lower()
     host = (parsed.hostname or "").strip().lower().rstrip(".")
@@ -983,6 +1029,10 @@ def validate_service_doc(
     }
 
 
+def has_sensitive_headers(headers: dict[str, str]) -> bool:
+    return any(hk.lower() in SENSITIVE_HTTP_HEADERS for hk in headers)
+
+
 def _validate_mcp_headers(headers: object, context: str) -> dict[str, str]:
     if headers is None:
         return {}
@@ -992,7 +1042,7 @@ def _validate_mcp_headers(headers: object, context: str) -> dict[str, str]:
     for hk, hv in headers.items():
         if type(hk) is not str or type(hv) is not str:
             raise SchemaError(f"Invalid header in {context}")
-        if hk.lower() in ("authorization", "x-api-key", "x-goog-api-key"):
+        if hk.lower() in SENSITIVE_HTTP_HEADERS:
             if (
                 not (hv.startswith("Bearer ") and SECRET_REF_VALUE_RE.fullmatch(hv[7:]))
                 and SECRET_REF_VALUE_RE.fullmatch(hv) is None
@@ -1033,8 +1083,268 @@ def _validate_tool_list(raw: object, context: str) -> list[str]:
     return list(raw)
 
 
+def _validate_schema_allowed_cidrs(raw: object, context: str) -> list[str]:
+    if raw is None:
+        return []
+    try:
+        return list(validate_allowed_cidrs(raw, context=context))
+    except BrokerPolicyError as exc:
+        raise PolicyError(str(exc)) from exc
+
+
+def _validate_path_glob(pat: object, context: str) -> str:
+    if type(pat) is not str or not pat.startswith("/") or len(pat) > 256:
+        raise SchemaError(f"{context} must be a path glob starting with '/'")
+    if any(ord(ch) < 0x21 or ord(ch) >= 0x7F or ch in "\\?#;%" for ch in pat):
+        raise PolicyError(f"Illegal character in path glob {context}: {pat!r}")
+    if "//" in pat or "**" in pat:
+        raise PolicyError(f"Empty segment or cross-segment '**' forbidden in {context}: {pat!r}")
+    if pat != "/":
+        for seg in pat[1:].split("/"):
+            if seg in ("", ".", ".."):
+                raise PolicyError(f"Invalid path segment in {context}: {pat!r}")
+    return pat
+
+
+def _validate_wire_allow_rule(rule: object, context: str) -> dict[str, Any]:
+    if not isinstance(rule, dict):
+        raise SchemaError(f"{context} must be a table")
+    _reject_unknown_keys(rule, frozenset({"methods", "path_patterns", "body_policy"}), context)
+    methods = rule.get("methods")
+    if not isinstance(methods, list) or not methods or any(type(m) is not str or m not in HTTP_METHODS for m in methods):
+        raise SchemaError(f"{context}.methods must be a non-empty list of HTTP methods")
+    patterns = rule.get("path_patterns")
+    if not isinstance(patterns, list) or not patterns:
+        raise SchemaError(f"{context}.path_patterns must be a non-empty list of path globs")
+    norm_patterns = [_validate_path_glob(p, f"{context}.path_patterns[{i}]") for i, p in enumerate(patterns)]
+    body_policy = rule.get("body_policy", "none")
+    if type(body_policy) is not str or body_policy not in BODY_POLICIES:
+        raise SchemaError(f"Invalid {context}.body_policy: {body_policy!r}")
+    return {
+        "methods": list(methods),
+        "path_patterns": norm_patterns,
+        "body_policy": body_policy,
+    }
+
+
+def validate_wire_policy(raw: object, context: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise SchemaError(f"{context} must be a table")
+    _reject_unknown_keys(raw, frozenset({"denied_paths", "allow_rules"}), context)
+    raw_denied = raw.get("denied_paths", [])
+    if not isinstance(raw_denied, list):
+        raise SchemaError(f"{context}.denied_paths must be a list")
+    denied_paths = [_validate_path_glob(p, f"{context}.denied_paths[{i}]") for i, p in enumerate(raw_denied)]
+    raw_rules = raw.get("allow_rules")
+    if not isinstance(raw_rules, list):
+        raise SchemaError(f"{context}.allow_rules must be a list")
+    allow_rules = [_validate_wire_allow_rule(r, f"{context}.allow_rules[{i}]") for i, r in enumerate(raw_rules)]
+    return {"denied_paths": denied_paths, "allow_rules": allow_rules}
+
+
+def _validate_inbound_auth(
+    raw_mode: object, raw_header: object, context: str
+) -> tuple[str, str | None]:
+    mode = "bearer" if raw_mode is None else raw_mode
+    if type(mode) is not str or mode not in INBOUND_AUTH_MODES:
+        raise SchemaError(f"Invalid {context}.inbound_auth: {mode!r}")
+    if mode == "header":
+        if type(raw_header) is not str or HEADER_NAME_RE.fullmatch(raw_header) is None:
+            raise SchemaError(f"{context}.inbound_auth_header must be a valid HTTP header name when inbound_auth='header'")
+        if raw_header.lower() in FORBIDDEN_INBOUND_AUTH_HEADERS:
+            raise PolicyError(f"Forbidden {context}.inbound_auth_header: {raw_header!r}")
+        return mode, raw_header
+    if raw_header is not None:
+        raise SchemaError(f"{context}.inbound_auth_header is only allowed when inbound_auth='header'")
+    return mode, None
+
+
+def _validate_allow_streaming(raw: object, context: str) -> bool:
+    if raw is None:
+        return False
+    if type(raw) is not bool:
+        raise SchemaError(f"{context}.allow_streaming must be boolean")
+    return raw
+
+
+def _validate_credential_delivery(
+    raw: object, context: str, *, for_orchestrator: bool
+) -> str | None:
+    if raw is None:
+        return None
+    if type(raw) is not str or raw not in CREDENTIAL_DELIVERY_MODES:
+        raise SchemaError(f"Invalid {context}.credential_delivery: {raw!r}")
+    if for_orchestrator and raw == "raw-container-mount":
+        raise PolicyError(
+            f"Orchestrator proposals may not request credential_delivery='raw-container-mount' in {context}"
+        )
+    return raw
+
+
+def default_concourse_wire_policy() -> dict[str, Any]:
+    return {
+        "denied_paths": [
+            "/api/v1/teams/*/containers/*/hijack",
+            "/api/v1/teams/*/containers/*/hijack/*",
+        ],
+        "allow_rules": [
+            {
+                "methods": ["GET", "HEAD"],
+                "path_patterns": [
+                    "/api/v1/info",
+                    "/api/v1/teams/*/pipelines",
+                    "/api/v1/teams/*/pipelines/*",
+                    "/api/v1/teams/*/pipelines/*/jobs",
+                    "/api/v1/teams/*/pipelines/*/jobs/*",
+                    "/api/v1/teams/*/pipelines/*/jobs/*/builds",
+                    "/api/v1/builds",
+                    "/api/v1/builds/*",
+                    "/api/v1/builds/*/plan",
+                    "/api/v1/builds/*/events",
+                    "/api/v1/teams/*/builds",
+                    "/api/v1/teams/*/builds/*",
+                ],
+                "body_policy": "none",
+            }
+        ],
+    }
+
+
+def default_k8s_wire_policy() -> dict[str, Any]:
+    return {
+        "denied_paths": [
+            "/api/v1/secrets",
+            "/api/v1/secrets/*",
+            "/api/v1/namespaces/*/secrets",
+            "/api/v1/namespaces/*/secrets/*",
+            "/api/v1/namespaces/*/pods/*/exec",
+            "/api/v1/namespaces/*/pods/*/exec/*",
+            "/api/v1/namespaces/*/pods/*/attach",
+            "/api/v1/namespaces/*/pods/*/attach/*",
+            "/api/v1/namespaces/*/pods/*/portforward",
+            "/api/v1/namespaces/*/pods/*/portforward/*",
+            "/api/v1/namespaces/*/pods/*/proxy",
+            "/api/v1/namespaces/*/pods/*/proxy/*",
+            "/api/v1/namespaces/*/services/*/proxy",
+            "/api/v1/namespaces/*/services/*/proxy/*",
+        ],
+        "allow_rules": [
+            {
+                "methods": ["GET", "HEAD"],
+                "path_patterns": [
+                    "/version",
+                    "/api",
+                    "/apis",
+                    "/api/v1/namespaces/*/pods",
+                    "/api/v1/namespaces/*/pods/*",
+                    "/api/v1/namespaces/*/pods/*/log",
+                    "/api/v1/namespaces/*/events",
+                    "/api/v1/namespaces/*/events/*",
+                    "/api/v1/namespaces/*/services",
+                    "/api/v1/namespaces/*/services/*",
+                    "/apis/apps/v1/namespaces/*/deployments",
+                    "/apis/apps/v1/namespaces/*/deployments/*",
+                ],
+                "body_policy": "none",
+            }
+        ],
+    }
+
+
+def default_sonarqube_wire_policy() -> dict[str, Any]:
+    return {
+        "denied_paths": [],
+        "allow_rules": [
+            {
+                "methods": ["GET", "HEAD"],
+                "path_patterns": [
+                    "/api/qualitygates/*",
+                    "/api/issues/search",
+                    "/api/measures/component",
+                    "/api/measures/component_tree",
+                    "/api/hotspots/search",
+                ],
+                "body_policy": "none",
+            }
+        ],
+    }
+
+
+def default_github_wire_policy() -> dict[str, Any]:
+    return {
+        "denied_paths": [],
+        "allow_rules": [
+            {
+                "methods": ["GET", "HEAD"],
+                "path_patterns": [
+                    "/repos/*/*",
+                    "/repos/*/*/pulls",
+                    "/repos/*/*/pulls/*",
+                    "/repos/*/*/pulls/*/files",
+                    "/repos/*/*/pulls/*/comments",
+                    "/repos/*/*/issues",
+                    "/repos/*/*/issues/*",
+                    "/repos/*/*/issues/*/comments",
+                    "/repos/*/*/commits",
+                    "/repos/*/*/commits/*",
+                ],
+                "body_policy": "none",
+            },
+            {
+                "methods": ["POST"],
+                "path_patterns": ["/graphql"],
+                "body_policy": "graphql-query-only",
+            },
+        ],
+    }
+
+
+def default_aws_wire_policy() -> dict[str, Any]:
+    return {
+        "denied_paths": [],
+        "allow_rules": [
+            {
+                "methods": ["GET", "HEAD", "POST"],
+                "path_patterns": ["/", "/*", "/*/*", "/*/*/*"],
+                "body_policy": "aws-sigv4",
+            }
+        ],
+    }
+
+
+def default_mcp_wire_policy(*, allow_streaming: bool = False) -> dict[str, Any]:
+    rules: list[dict[str, Any]] = [
+        {"methods": ["POST"], "path_patterns": ["/"], "body_policy": "mcp-jsonrpc"}
+    ]
+    if allow_streaming:
+        rules.append({"methods": ["GET"], "path_patterns": ["/"], "body_policy": "none"})
+    return {"denied_paths": [], "allow_rules": rules}
+
+
+_WIRE_POLICY_PRESET_BUILDERS = {
+    "concourse": default_concourse_wire_policy,
+    "k8s": default_k8s_wire_policy,
+    "sonarqube": default_sonarqube_wire_policy,
+    "github": default_github_wire_policy,
+    "aws": default_aws_wire_policy,
+    "mcp": default_mcp_wire_policy,
+}
+
+
+def get_default_wire_policy_preset(name: str) -> dict[str, Any]:
+    builder = _WIRE_POLICY_PRESET_BUILDERS.get(name)
+    if builder is None:
+        raise SchemaError(f"Unknown wire_policy preset: {name!r}")
+    return builder()
+
+
 def _validate_mcp_target(
-    name: str, cfg: dict[str, Any], context: str, *, for_orchestrator: bool
+    name: str,
+    cfg: dict[str, Any],
+    context: str,
+    *,
+    for_orchestrator: bool,
+    allowed_cidrs: tuple[str, ...] = (),
 ) -> tuple[str, str | None]:
     mtype = cfg.get("type")
     if mtype not in ("remote", "pinned-artifact"):
@@ -1045,7 +1355,7 @@ def _validate_mcp_target(
         if scheme == "http":
             return mtype, validate_pod_local_url(url, f"{context}.{name}.url")
         if scheme == "https":
-            return mtype, canonicalize_remote_url(url, allow_http=False)
+            return mtype, canonicalize_remote_url(url, allow_http=False, allowed_cidrs=allowed_cidrs)
         raise PolicyError(f"MCP {name} remote url must be https:// or pod-local http://127.0.0.1:<port>")
     art = _require_str(cfg.get("artifact_id"), f"{context}.{name}.artifact_id")
     if OPAQUE_ID_RE.fullmatch(art) is None:
@@ -1159,6 +1469,44 @@ def _validate_mcp_remote_cfg(
     }
 
 
+def _resolve_pinned_artifact_delivery(
+    name: str,
+    raw_delivery: str | None,
+    norm_headers: dict[str, str],
+    norm_secret_env: dict[str, str],
+) -> str:
+    if raw_delivery == "host-brokered":
+        raise PolicyError(f"pinned-artifact MCP {name!r} cannot use credential_delivery='host-brokered'")
+    if not (norm_secret_env or has_sensitive_headers(norm_headers)):
+        return raw_delivery or "local-ephemeral"
+    if raw_delivery not in ("local-ephemeral", "raw-container-mount"):
+        raise PolicyError(
+            f"pinned-artifact MCP {name!r} with secret_env or sensitive headers requires explicit "
+            f"credential_delivery='local-ephemeral' or interactive break-glass 'raw-container-mount'"
+        )
+    return raw_delivery
+
+
+def _resolve_mcp_credential_delivery(
+    name: str,
+    mtype: str,
+    norm_url: str | None,
+    norm_local: dict[str, Any] | None,
+    raw_delivery: str | None,
+    norm_headers: dict[str, str],
+    norm_secret_env: dict[str, str],
+) -> str | None:
+    if mtype == "pinned-artifact":
+        return _resolve_pinned_artifact_delivery(name, raw_delivery, norm_headers, norm_secret_env)
+    if (norm_url or "").startswith("https://"):
+        if raw_delivery == "local-ephemeral":
+            raise PolicyError(f"Remote MCP {name!r} cannot use credential_delivery='local-ephemeral'")
+        return raw_delivery or "host-brokered"
+    if norm_local is not None:
+        return raw_delivery
+    return raw_delivery or "local-ephemeral"
+
+
 _MCP_ALLOWED_KEYS = frozenset(
     {
         "type",
@@ -1172,6 +1520,12 @@ _MCP_ALLOWED_KEYS = frozenset(
         "write_tools",
         "local",
         "remote",
+        "credential_delivery",
+        "inbound_auth",
+        "inbound_auth_header",
+        "allow_streaming",
+        "allowed_cidrs",
+        "wire_policy",
     }
 )
 
@@ -1182,7 +1536,10 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
     if not isinstance(cfg, dict):
         raise SchemaError(f"{context}.{name} must be a table")
     _reject_unknown_keys(cfg, _MCP_ALLOWED_KEYS, f"{context}.{name}")
-    mtype, norm_url = _validate_mcp_target(name, cfg, context, for_orchestrator=for_orchestrator)
+    allowed_cidrs = _validate_schema_allowed_cidrs(cfg.get("allowed_cidrs"), f"{context}.{name}.allowed_cidrs")
+    mtype, norm_url = _validate_mcp_target(
+        name, cfg, context, for_orchestrator=for_orchestrator, allowed_cidrs=tuple(allowed_cidrs)
+    )
     args = cfg.get("args", [])
     if not isinstance(args, list) or any(type(a) is not str for a in args):
         raise SchemaError(f"{context}.{name}.args must be list of strings")
@@ -1198,6 +1555,18 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
         norm_secret_env=norm_secret_env,
         norm_local=norm_local,
     )
+    raw_delivery = _validate_credential_delivery(
+        cfg.get("credential_delivery"), f"{context}.{name}", for_orchestrator=for_orchestrator
+    )
+    cred_delivery = _resolve_mcp_credential_delivery(
+        name, mtype, norm_url, norm_local, raw_delivery, norm_headers, norm_secret_env
+    )
+    inbound_auth, inbound_auth_header = _validate_inbound_auth(
+        cfg.get("inbound_auth"), cfg.get("inbound_auth_header"), f"{context}.{name}"
+    )
+    allow_streaming = _validate_allow_streaming(cfg.get("allow_streaming"), f"{context}.{name}")
+    raw_wp = cfg.get("wire_policy")
+    wire_policy = validate_wire_policy(raw_wp, f"{context}.{name}.wire_policy") if raw_wp is not None else None
     return {
         "type": mtype,
         "url": norm_url,
@@ -1210,6 +1579,12 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
         "write_tools": list(write_tools),
         "local": norm_local,
         "remote": norm_remote,
+        "credential_delivery": cred_delivery,
+        "inbound_auth": inbound_auth,
+        "inbound_auth_header": inbound_auth_header,
+        "allow_streaming": allow_streaming,
+        "allowed_cidrs": allowed_cidrs,
+        "wire_policy": wire_policy,
     }
 
 
@@ -1309,6 +1684,256 @@ def _validate_bundle_prompt_slots(prompt_slots: object) -> dict[str, str]:
     return norm_slots
 
 
+def _validate_optional_secret_ref(raw: object, context: str, *, required: bool = False) -> str | None:
+    if raw is None:
+        if required:
+            raise SchemaError(f"{context} is required")
+        return None
+    sref = _require_str(raw, context)
+    _check_no_raw_secret_value(sref, context)
+    if SECRET_REF_GRAMMAR_RE.fullmatch(sref) is None:
+        raise SchemaError(f"{context} must match '<scheme>:<reference>' grammar, got {sref!r}")
+    return sref
+
+
+def _validate_client_env_var(raw: object, context: str) -> str | None:
+    if raw is None:
+        return None
+    if type(raw) is not str or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", raw):
+        raise SchemaError(f"Invalid env var name in {context}: {raw!r}")
+    if (
+        raw in FORBIDDEN_ENV_EXACT
+        or any(raw.startswith(p) for p in FORBIDDEN_ENV_PREFIXES)
+        or any(raw.endswith(s) for s in FORBIDDEN_ENV_SUFFIXES)
+    ):
+        raise PolicyError(f"Forbidden env var name in {context}: {raw}")
+    return raw
+
+
+_BROKER_HTTP_KEYS = frozenset(
+    {
+        "kind",
+        "upstream_url",
+        "credential_delivery",
+        "inbound_auth",
+        "inbound_auth_header",
+        "allow_streaming",
+        "allowed_cidrs",
+        "read_only_secret_ref",
+        "write_secret_ref",
+        "preset",
+        "wire_policy",
+        "client_env_var",
+    }
+)
+
+
+def _validate_broker_http_service(
+    name: str, cfg: dict[str, Any], context: str, *, for_orchestrator: bool
+) -> dict[str, Any]:
+    _reject_unknown_keys(cfg, _BROKER_HTTP_KEYS, context)
+    allowed_cidrs = _validate_schema_allowed_cidrs(cfg.get("allowed_cidrs"), f"{context}.allowed_cidrs")
+    upstream_url = canonicalize_remote_url(
+        _require_str(cfg.get("upstream_url"), f"{context}.upstream_url"),
+        allow_http=False,
+        allowed_cidrs=tuple(allowed_cidrs),
+    )
+    raw_delivery = _validate_credential_delivery(
+        cfg.get("credential_delivery"), context, for_orchestrator=for_orchestrator
+    )
+    cred_delivery = raw_delivery or "host-brokered"
+    if cred_delivery == "local-ephemeral":
+        raise PolicyError(f"External HTTP broker service {name!r} cannot use credential_delivery='local-ephemeral'")
+    inbound_auth, inbound_auth_header = _validate_inbound_auth(
+        cfg.get("inbound_auth"), cfg.get("inbound_auth_header"), context
+    )
+    allow_streaming = _validate_allow_streaming(cfg.get("allow_streaming"), context)
+    ro_ref = _validate_optional_secret_ref(cfg.get("read_only_secret_ref"), f"{context}.read_only_secret_ref")
+    wr_ref = _validate_optional_secret_ref(cfg.get("write_secret_ref"), f"{context}.write_secret_ref")
+    if ro_ref is not None and wr_ref is not None and ro_ref == wr_ref:
+        raise PolicyError(f"{context} read_only_secret_ref and write_secret_ref must be distinct")
+    preset = cfg.get("preset")
+    raw_wp = cfg.get("wire_policy")
+    if raw_wp is not None:
+        wire_policy = validate_wire_policy(raw_wp, f"{context}.wire_policy")
+    elif preset is not None:
+        if type(preset) is not str:
+            raise SchemaError(f"{context}.preset must be a string")
+        wire_policy = get_default_wire_policy_preset(preset)
+    else:
+        raise SchemaError(f"{context} must specify wire_policy or preset")
+    client_env_var = _validate_client_env_var(cfg.get("client_env_var"), f"{context}.client_env_var")
+    return {
+        "kind": "http",
+        "upstream_url": upstream_url,
+        "credential_delivery": cred_delivery,
+        "inbound_auth": inbound_auth,
+        "inbound_auth_header": inbound_auth_header,
+        "allow_streaming": allow_streaming,
+        "allowed_cidrs": allowed_cidrs,
+        "read_only_secret_ref": ro_ref,
+        "write_secret_ref": wr_ref,
+        "preset": preset,
+        "wire_policy": wire_policy,
+        "client_env_var": client_env_var,
+    }
+
+
+_BROKER_PG_KEYS = frozenset(
+    {
+        "kind",
+        "host",
+        "port",
+        "database",
+        "sslmode",
+        "read_only_user",
+        "read_only_secret_ref",
+        "write_user",
+        "write_secret_ref",
+        "credential_delivery",
+        "allowed_cidrs",
+    }
+)
+
+
+def _validate_pg_write_creds(
+    cfg: dict[str, Any], ro_user: str, ro_ref: str | None, context: str
+) -> tuple[str | None, str | None]:
+    wr_user = cfg.get("write_user")
+    wr_ref = _validate_optional_secret_ref(cfg.get("write_secret_ref"), f"{context}.write_secret_ref")
+    if (wr_user is None) != (wr_ref is None):
+        raise SchemaError(f"{context} must specify both write_user and write_secret_ref together")
+    if wr_user is None:
+        return None, None
+    if type(wr_user) is not str or DB_IDENT_RE.fullmatch(wr_user) is None:
+        raise SchemaError(f"Invalid {context}.write_user: {wr_user!r}")
+    if wr_user == ro_user:
+        raise PolicyError(f"{context} write_user must be distinct from read_only_user")
+    if wr_ref == ro_ref:
+        raise PolicyError(f"{context} write_secret_ref must be distinct from read_only_secret_ref")
+    return wr_user, wr_ref
+
+
+def _validate_broker_postgres_service(
+    name: str, cfg: dict[str, Any], context: str, *, for_orchestrator: bool
+) -> dict[str, Any]:
+    _reject_unknown_keys(cfg, _BROKER_PG_KEYS, context)
+    allowed_cidrs = _validate_schema_allowed_cidrs(cfg.get("allowed_cidrs"), f"{context}.allowed_cidrs")
+    host = _require_str(cfg.get("host"), f"{context}.host").strip().lower().rstrip(".")
+    _validate_remote_host(host, frozenset(), allowed_cidrs=tuple(allowed_cidrs))
+    port = cfg.get("port", 5432)
+    if type(port) is not int or not (1 <= port <= 65535):
+        raise SchemaError(f"{context}.port must be an integer 1..65535")
+    database = _require_str(cfg.get("database"), f"{context}.database")
+    if DB_IDENT_RE.fullmatch(database) is None:
+        raise SchemaError(f"Invalid {context}.database: {database!r}")
+    sslmode = cfg.get("sslmode", "verify-full")
+    if sslmode != "verify-full":
+        raise PolicyError(f"External Postgres broker service {name!r} requires sslmode='verify-full', got {sslmode!r}")
+    ro_user = _require_str(cfg.get("read_only_user"), f"{context}.read_only_user")
+    if DB_IDENT_RE.fullmatch(ro_user) is None:
+        raise SchemaError(f"Invalid {context}.read_only_user: {ro_user!r}")
+    ro_ref = _validate_optional_secret_ref(
+        cfg.get("read_only_secret_ref"), f"{context}.read_only_secret_ref", required=True
+    )
+    wr_user, wr_ref = _validate_pg_write_creds(cfg, ro_user, ro_ref, context)
+    raw_delivery = _validate_credential_delivery(
+        cfg.get("credential_delivery"), context, for_orchestrator=for_orchestrator
+    )
+    cred_delivery = raw_delivery or "host-brokered"
+    if cred_delivery == "local-ephemeral":
+        raise PolicyError(f"External Postgres broker service {name!r} cannot use credential_delivery='local-ephemeral'")
+    return {
+        "kind": "postgres",
+        "host": host,
+        "port": port,
+        "database": database,
+        "sslmode": sslmode,
+        "read_only_user": ro_user,
+        "read_only_secret_ref": ro_ref,
+        "write_user": wr_user,
+        "write_secret_ref": wr_ref,
+        "credential_delivery": cred_delivery,
+        "allowed_cidrs": allowed_cidrs,
+    }
+
+
+_BROKER_SSH_KEYS = frozenset(
+    {
+        "kind",
+        "host",
+        "port",
+        "user",
+        "known_hosts_ref",
+        "allowed_presets",
+        "credential_delivery",
+        "allowed_cidrs",
+    }
+)
+
+
+def _validate_broker_ssh_service(
+    name: str, cfg: dict[str, Any], context: str, *, for_orchestrator: bool
+) -> dict[str, Any]:
+    _reject_unknown_keys(cfg, _BROKER_SSH_KEYS, context)
+    allowed_cidrs = _validate_schema_allowed_cidrs(cfg.get("allowed_cidrs"), f"{context}.allowed_cidrs")
+    host = _require_str(cfg.get("host"), f"{context}.host").strip().lower().rstrip(".")
+    _validate_remote_host(host, frozenset(), allowed_cidrs=tuple(allowed_cidrs))
+    port = cfg.get("port", 22)
+    if type(port) is not int or not (1 <= port <= 65535):
+        raise SchemaError(f"{context}.port must be an integer 1..65535")
+    user = _require_str(cfg.get("user"), f"{context}.user")
+    if SSH_USER_RE.fullmatch(user) is None:
+        raise SchemaError(f"Invalid {context}.user: {user!r}")
+    kh_ref = _validate_optional_secret_ref(cfg.get("known_hosts_ref"), f"{context}.known_hosts_ref", required=True)
+    presets = _validate_tool_list(cfg.get("allowed_presets"), f"{context}.allowed_presets")
+    if not presets:
+        raise SchemaError(f"{context}.allowed_presets must be non-empty")
+    raw_delivery = _validate_credential_delivery(
+        cfg.get("credential_delivery"), context, for_orchestrator=for_orchestrator
+    )
+    cred_delivery = raw_delivery or "host-brokered"
+    if cred_delivery != "host-brokered":
+        raise PolicyError(f"SSH broker service {name!r} must use credential_delivery='host-brokered'")
+    return {
+        "kind": "ssh",
+        "host": host,
+        "port": port,
+        "user": user,
+        "known_hosts_ref": kh_ref,
+        "allowed_presets": presets,
+        "credential_delivery": cred_delivery,
+        "allowed_cidrs": allowed_cidrs,
+    }
+
+
+def _validate_broker_services(
+    raw: object, context: str, *, for_orchestrator: bool
+) -> dict[str, dict[str, Any]]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise SchemaError(f"{context} must be a table")
+    out: dict[str, dict[str, Any]] = {}
+    for name, cfg in raw.items():
+        if type(name) is not str or SIMPLE_NAME_RE.fullmatch(name) is None:
+            raise SchemaError(f"Invalid broker_services name in {context}: {name!r}")
+        if not isinstance(cfg, dict):
+            raise SchemaError(f"{context}.{name} must be a table")
+        kind = cfg.get("kind")
+        if kind == "http":
+            out[name] = _validate_broker_http_service(name, cfg, f"{context}.{name}", for_orchestrator=for_orchestrator)
+        elif kind == "postgres":
+            out[name] = _validate_broker_postgres_service(
+                name, cfg, f"{context}.{name}", for_orchestrator=for_orchestrator
+            )
+        elif kind == "ssh":
+            out[name] = _validate_broker_ssh_service(name, cfg, f"{context}.{name}", for_orchestrator=for_orchestrator)
+        else:
+            raise SchemaError(f"Unsupported broker_services kind in {context}.{name}: {kind!r}")
+    return out
+
+
 _BUNDLE_ALLOWED_KEYS = frozenset(
     {
         "schema_version",
@@ -1320,6 +1945,7 @@ _BUNDLE_ALLOWED_KEYS = frozenset(
         "requires_services",
         "local_services",
         "mcp",
+        "broker_services",
         "skills",
         "persona",
         "subagents",
@@ -1366,6 +1992,9 @@ def validate_bundle_doc(
         k: _validate_mcp_server(k, v, f"bundle({bid}).mcp", for_orchestrator=for_orchestrator)
         for k, v in raw_mcp.items()
     }
+    broker_services = _validate_broker_services(
+        doc.get("broker_services"), f"bundle({bid}).broker_services", for_orchestrator=for_orchestrator
+    )
     skills = [validate_opaque_id(s, label="bundle.skills[]") for s in doc.get("skills", [])]
     norm_persona = _validate_bundle_persona(doc.get("persona"), bid)
     norm_subagents = _validate_bundle_subagents(doc.get("subagents", []))
@@ -1389,6 +2018,7 @@ def validate_bundle_doc(
         "requires_services": req_services,
         "local_services": local_services,
         "mcp": mcp,
+        "broker_services": broker_services,
         "skills": skills,
         "persona": norm_persona,
         "subagents": norm_subagents,

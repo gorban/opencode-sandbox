@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+import ipaddress
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -22,12 +23,14 @@ from oc_schema import (
     MAX_MISE_TOOLS,
     MAX_MISSION_BYTES,
     MAX_SLOT_FILE_BYTES,
+    ROUTE_ID_RE,
     SIMPLE_NAME_RE,
     SLOT_TOKEN_RE,
     PolicyError,
     SchemaError,
     canonicalize_remote_url,
     capability_satisfies,
+    default_mcp_wire_policy,
     extract_secret_slots,
     is_builtin_id,
     parse_mem_bytes,
@@ -39,6 +42,9 @@ from oc_schema import (
     validate_opaque_id,
     validate_port_request,
 )
+
+DEFAULT_BROKER_HTTP_PORT = 18080
+DEFAULT_BROKER_PG_PORT = 15432
 
 
 class PlanError(ValueError):
@@ -61,6 +67,9 @@ class PlanOverrides:
     remote_write_grants: dict[str, str] = field(default_factory=dict)
     allow_http_remote: bool = False
     allowed_remote_hosts: frozenset[str] = frozenset()
+    allow_raw_remote_mounts: frozenset[str] = frozenset()
+    broker_http_port: int = DEFAULT_BROKER_HTTP_PORT
+    broker_pg_port: int = DEFAULT_BROKER_PG_PORT
 
 
 @dataclass(frozen=True, slots=True)
@@ -676,6 +685,58 @@ def _select_remote_credentials(
     return mode, {}, {}
 
 
+def _require_raw_mount_breakglass(
+    route_id: str,
+    tier: str,
+    allow_raw_remote_mounts: frozenset[str],
+    active_raw_remote_mounts: set[str],
+) -> None:
+    if tier == "managed":
+        raise PolicyError(
+            f"credential_delivery='raw-container-mount' for {route_id!r} is permanently forbidden in 'managed' tier"
+        )
+    if route_id not in allow_raw_remote_mounts:
+        raise PolicyError(
+            f"credential_delivery='raw-container-mount' for {route_id!r} requires explicit "
+            f"PlanOverrides.allow_raw_remote_mounts grant"
+        )
+    active_raw_remote_mounts.add(route_id)
+
+
+def _build_remote_mcp_broker_route(
+    mname: str,
+    mcfg: dict[str, Any],
+    *,
+    resolved_url: str,
+    cred_delivery: str,
+    access_mode: str,
+    eff_headers: dict[str, str],
+    eff_secret_env: dict[str, str],
+    tools: list[str],
+) -> dict[str, Any]:
+    allow_streaming = bool(mcfg.get("allow_streaming", False))
+    base_wp = (
+        mcfg["wire_policy"]
+        if mcfg.get("wire_policy") is not None
+        else default_mcp_wire_policy(allow_streaming=allow_streaming)
+    )
+    return {
+        "route_id": f"mcp:{mname}",
+        "kind": "mcp",
+        "credential_delivery": cred_delivery,
+        "access_mode": access_mode,
+        "inbound_auth": mcfg.get("inbound_auth", "bearer"),
+        "inbound_auth_header": mcfg.get("inbound_auth_header"),
+        "upstream": resolved_url,
+        "upstream_headers": eff_headers,
+        "upstream_secret_env": eff_secret_env,
+        "secret_slots": sorted(extract_secret_slots(eff_headers, eff_secret_env)),
+        "allow_streaming": allow_streaming,
+        "allowed_cidrs": list(mcfg.get("allowed_cidrs", [])),
+        "wire_policy": {**base_wp, "allowed_tools": list(tools)},
+    }
+
+
 def _compile_remote_mcp_entry(
     mname: str,
     mcfg: dict[str, Any],
@@ -683,6 +744,13 @@ def _compile_remote_mcp_entry(
     allow_set: set[str] | None,
     deny_set: set[str],
     effective_remote_write_grants: dict[str, str],
+    *,
+    tier: str,
+    sandbox_broker_host: str,
+    broker_http_port: int,
+    allow_raw_remote_mounts: frozenset[str],
+    active_raw_remote_mounts: set[str],
+    broker_routes: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
     resolved_url = mcfg["url"]
     ro_tools = mcfg.get("read_only_tools")
@@ -714,14 +782,46 @@ def _compile_remote_mcp_entry(
         effective_remote_write_grants[mname] = resolved_url
     if allow_set is not None and candidate_tools and not tools:
         return None
+
+    raw_delivery = mcfg.get("credential_delivery")
+    cred_delivery = "host-brokered" if raw_delivery is None else raw_delivery
+    if cred_delivery == "local-ephemeral":
+        raise PolicyError(
+            f"Remote MCP {mname!r} cannot use credential_delivery='local-ephemeral' when bound remotely"
+        )
+    route_id = f"mcp:{mname}"
+    if cred_delivery == "raw-container-mount":
+        _require_raw_mount_breakglass(route_id, tier, allow_raw_remote_mounts, active_raw_remote_mounts)
+
+    assert resolved_url is not None
+    broker_routes[route_id] = _build_remote_mcp_broker_route(
+        mname,
+        mcfg,
+        resolved_url=resolved_url,
+        cred_delivery=cred_delivery,
+        access_mode=access_mode,
+        eff_headers=eff_headers,
+        eff_secret_env=eff_secret_env,
+        tools=tools,
+    )
+    if cred_delivery == "host-brokered":
+        container_url = f"http://{sandbox_broker_host}:{broker_http_port}/mcp/{mname}"
+        container_headers = {"Authorization": "Bearer {file:/run/secrets/oc_broker_token}"}
+        container_secret_env: dict[str, str] = {}
+    else:
+        container_url = resolved_url
+        container_headers = eff_headers
+        container_secret_env = eff_secret_env
+
     return {
         "type": mcfg["type"],
         "access_mode": access_mode,
-        "url": resolved_url,
+        "credential_delivery": cred_delivery,
+        "url": container_url,
         "artifact_id": mcfg["artifact_id"],
         "args": mcfg["args"],
-        "headers": eff_headers,
-        "secret_env": eff_secret_env,
+        "headers": container_headers,
+        "secret_env": container_secret_env,
         "allowed_tools": tools,
     }
 
@@ -732,6 +832,10 @@ def _compile_local_mcp_entry(
     remote_write_grants: dict[str, str],
     allow_set: set[str] | None,
     deny_set: set[str],
+    *,
+    tier: str,
+    allow_raw_remote_mounts: frozenset[str],
+    active_raw_remote_mounts: set[str],
 ) -> dict[str, Any] | None:
     if mname in remote_write_grants:
         raise PolicyError(
@@ -741,12 +845,19 @@ def _compile_local_mcp_entry(
     tools = _filter_tools_by_persona(mname, candidate_tools, allow_set, deny_set)
     if allow_set is not None and candidate_tools and not tools:
         return None
+    raw_delivery = mcfg.get("credential_delivery")
+    cred_delivery = "local-ephemeral" if raw_delivery is None else raw_delivery
+    if cred_delivery == "host-brokered":
+        raise PolicyError(f"Local MCP {mname!r} cannot use credential_delivery='host-brokered'")
+    if cred_delivery == "raw-container-mount":
+        _require_raw_mount_breakglass(f"mcp:{mname}", tier, allow_raw_remote_mounts, active_raw_remote_mounts)
     lcfg = mcfg.get("local")
     use_local = lcfg is not None and (lcfg["headers"] or lcfg["secret_env"])
     src = lcfg if use_local else mcfg
     return {
         "type": mcfg["type"],
         "access_mode": "local",
+        "credential_delivery": cred_delivery,
         "url": mcfg["url"],
         "artifact_id": mcfg["artifact_id"],
         "args": mcfg["args"],
@@ -778,6 +889,12 @@ def _compile_role_contract(
     remote_bindings: dict[str, str],
     remote_write_grants: dict[str, str],
     tier: str,
+    *,
+    sandbox_broker_host: str,
+    broker_http_port: int,
+    allow_raw_remote_mounts: frozenset[str],
+    active_raw_remote_mounts: set[str],
+    broker_routes: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, str]]:
     primary_persona, subagents, instructions, skills, mcp_servers = _collect_bundle_role_parts(
         store, bundles, remote_bindings
@@ -800,10 +917,30 @@ def _compile_role_contract(
     for mname, mcfg in sorted(mcp_servers.items()):
         compiled_entry = (
             _compile_remote_mcp_entry(
-                mname, mcfg, remote_write_grants, allow_set, deny_set, effective_remote_write_grants
+                mname,
+                mcfg,
+                remote_write_grants,
+                allow_set,
+                deny_set,
+                effective_remote_write_grants,
+                tier=tier,
+                sandbox_broker_host=sandbox_broker_host,
+                broker_http_port=broker_http_port,
+                allow_raw_remote_mounts=allow_raw_remote_mounts,
+                active_raw_remote_mounts=active_raw_remote_mounts,
+                broker_routes=broker_routes,
             )
             if mcfg.get("_is_remote", False)
-            else _compile_local_mcp_entry(mname, mcfg, remote_write_grants, allow_set, deny_set)
+            else _compile_local_mcp_entry(
+                mname,
+                mcfg,
+                remote_write_grants,
+                allow_set,
+                deny_set,
+                tier=tier,
+                allow_raw_remote_mounts=allow_raw_remote_mounts,
+                active_raw_remote_mounts=active_raw_remote_mounts,
+            )
         )
         if compiled_entry is not None:
             filtered_mcp[mname] = compiled_entry
@@ -828,6 +965,151 @@ def _compile_role_contract(
         },
         effective_remote_write_grants,
     )
+
+
+def _merge_bundle_broker_services(bundles: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    owners: dict[str, str] = {}
+    for b in bundles:
+        bid = b["id"]
+        for name, cfg in b.get("broker_services", {}).items():
+            if name in merged and merged[name] != cfg:
+                raise PlanError(
+                    f"Conflicting broker_services.{name!r} between {owners[name]!r} and {bid!r}"
+                )
+            merged[name] = cfg
+            owners[name] = bid
+    return merged
+
+
+def _compile_broker_http_entry(
+    name: str,
+    cfg: dict[str, Any],
+    *,
+    sandbox_broker_host: str,
+    broker_http_port: int,
+    broker_routes: dict[str, dict[str, Any]],
+    broker_client_env: dict[str, str],
+) -> None:
+    route_id = f"http:{name}"
+    cred_delivery = cfg["credential_delivery"]
+    broker_routes[route_id] = {
+        "route_id": route_id,
+        "kind": "http",
+        "credential_delivery": cred_delivery,
+        "access_mode": "remote-ro",
+        "inbound_auth": cfg["inbound_auth"],
+        "inbound_auth_header": cfg["inbound_auth_header"],
+        "upstream": cfg["upstream_url"],
+        "secret_ref": cfg["read_only_secret_ref"],
+        "allow_streaming": cfg["allow_streaming"],
+        "allowed_cidrs": list(cfg["allowed_cidrs"]),
+        "wire_policy": cfg["wire_policy"],
+    }
+    if cred_delivery == "host-brokered":
+        proxy_url = f"http://{sandbox_broker_host}:{broker_http_port}/http/{name}"
+        broker_client_env[f"OC_BROKER_HTTP_{name.upper().replace('-', '_')}_URL"] = proxy_url
+        if cfg.get("client_env_var"):
+            broker_client_env[cfg["client_env_var"]] = proxy_url
+
+
+def _compile_broker_pg_entry(
+    name: str,
+    cfg: dict[str, Any],
+    *,
+    sandbox_broker_host: str,
+    broker_pg_port: int,
+    broker_routes: dict[str, dict[str, Any]],
+    broker_client_env: dict[str, str],
+) -> None:
+    route_id = f"pg:{name}"
+    cred_delivery = cfg["credential_delivery"]
+    broker_routes[route_id] = {
+        "route_id": route_id,
+        "kind": "postgres",
+        "credential_delivery": cred_delivery,
+        "access_mode": "ro",
+        "upstream": {
+            "host": cfg["host"],
+            "port": cfg["port"],
+            "database": cfg["database"],
+            "user": cfg["read_only_user"],
+            "sslmode": cfg["sslmode"],
+        },
+        "secret_ref": cfg["read_only_secret_ref"],
+        "allowed_cidrs": list(cfg["allowed_cidrs"]),
+    }
+    if cred_delivery == "host-brokered":
+        pg_url = (
+            f"postgresql://ocjob:{{file:/run/secrets/oc_broker_token}}"
+            f"@{sandbox_broker_host}:{broker_pg_port}/{cfg['database']}?sslmode=disable"
+        )
+        broker_client_env[f"OC_BROKER_PG_{name.upper().replace('-', '_')}_URL"] = pg_url
+
+
+def _compile_broker_ssh_entry(
+    name: str,
+    cfg: dict[str, Any],
+    *,
+    broker_routes: dict[str, dict[str, Any]],
+) -> None:
+    route_id = f"ssh:{name}"
+    broker_routes[route_id] = {
+        "route_id": route_id,
+        "kind": "ssh",
+        "credential_delivery": "host-brokered",
+        "access_mode": "ro",
+        "upstream": {
+            "host": cfg["host"],
+            "port": cfg["port"],
+            "user": cfg["user"],
+        },
+        "known_hosts_ref": cfg["known_hosts_ref"],
+        "allowed_presets": list(cfg["allowed_presets"]),
+        "allowed_cidrs": list(cfg["allowed_cidrs"]),
+    }
+
+
+def _compile_broker_services(
+    bundles: list[dict[str, Any]],
+    *,
+    tier: str,
+    sandbox_broker_host: str,
+    broker_http_port: int,
+    broker_pg_port: int,
+    allow_raw_remote_mounts: frozenset[str],
+    active_raw_remote_mounts: set[str],
+    broker_routes: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    broker_services = _merge_bundle_broker_services(bundles)
+    broker_client_env: dict[str, str] = {}
+    prefix_map = {"http": "http", "postgres": "pg", "ssh": "ssh"}
+    for name, cfg in sorted(broker_services.items()):
+        kind = cfg["kind"]
+        route_id = f"{prefix_map[kind]}:{name}"
+        if cfg["credential_delivery"] == "raw-container-mount":
+            _require_raw_mount_breakglass(route_id, tier, allow_raw_remote_mounts, active_raw_remote_mounts)
+        if kind == "http":
+            _compile_broker_http_entry(
+                name,
+                cfg,
+                sandbox_broker_host=sandbox_broker_host,
+                broker_http_port=broker_http_port,
+                broker_routes=broker_routes,
+                broker_client_env=broker_client_env,
+            )
+        elif kind == "postgres":
+            _compile_broker_pg_entry(
+                name,
+                cfg,
+                sandbox_broker_host=sandbox_broker_host,
+                broker_pg_port=broker_pg_port,
+                broker_routes=broker_routes,
+                broker_client_env=broker_client_env,
+            )
+        elif kind == "ssh":
+            _compile_broker_ssh_entry(name, cfg, broker_routes=broker_routes)
+    return broker_client_env
 
 
 def _merge_single_mise_source(
@@ -989,6 +1271,57 @@ def _canonicalize_write_grants(ov: PlanOverrides) -> dict[str, str]:
     return canonical_write_grants
 
 
+def _validate_broker_overrides(ov: PlanOverrides, tier: str) -> frozenset[str]:
+    raw_mounts = ov.allow_raw_remote_mounts
+    if not isinstance(raw_mounts, frozenset):
+        raise PolicyError("PlanOverrides.allow_raw_remote_mounts must be a frozenset of explicit route IDs")
+    for rid in raw_mounts:
+        if type(rid) is not str or ROUTE_ID_RE.fullmatch(rid) is None or rid.startswith("ssh:"):
+            raise SchemaError(f"Invalid route ID in allow_raw_remote_mounts: {rid!r}")
+    if tier == "managed" and raw_mounts:
+        raise PolicyError("PlanOverrides.allow_raw_remote_mounts is permanently forbidden in 'managed' tier")
+    for label, port in (("broker_http_port", ov.broker_http_port), ("broker_pg_port", ov.broker_pg_port)):
+        if type(port) is not int or not (1024 <= port <= 65535) or port == 9222:
+            raise PolicyError(f"Invalid {label}: {port!r}")
+    if ov.broker_http_port == ov.broker_pg_port:
+        raise PlanError("broker_http_port and broker_pg_port must be distinct")
+    return raw_mounts
+
+
+def _resolve_sandbox_broker_host(host_provider: dict[str, Any], transport: dict[str, Any]) -> str:
+    if host_provider["id"] == "builtin/podman-macos-vm" and transport["id"] == "builtin/ssh-pinned":
+        return "host.containers.internal"
+    return "127.0.0.1"
+
+
+def _enforce_broker_gates(
+    broker_routes: dict[str, dict[str, Any]],
+    *,
+    tier: str,
+    topology: str,
+    worker_id: str,
+    transport: dict[str, Any],
+    allow_raw_remote_mounts: frozenset[str],
+    active_raw_remote_mounts: set[str],
+) -> None:
+    unmatched = sorted(allow_raw_remote_mounts - active_raw_remote_mounts)
+    if unmatched:
+        raise PolicyError(
+            f"allow_raw_remote_mounts references unknown, inactive, or non-raw-container-mount route(s): "
+            f"{', '.join(unmatched)}"
+        )
+    has_host_brokered = any(r["credential_delivery"] == "host-brokered" for r in broker_routes.values())
+    if not has_host_brokered:
+        return
+    if "open_reverse_channel" not in transport["primitives"]:
+        raise PolicyError(
+            f"Worker {worker_id!r} transport {transport['id']!r} lacks 'open_reverse_channel' "
+            f"required for host-brokered routes"
+        )
+    if tier == "managed" and topology != "isolated-sidecars":
+        raise PolicyError("Host-brokered routes in 'managed' tier require topology='isolated-sidecars'")
+
+
 def compile_plan(
     store: PlanStoreView,
     sandbox_type_id: str,
@@ -999,6 +1332,7 @@ def compile_plan(
     ov = overrides or PlanOverrides()
     validate_opaque_id(sandbox_type_id, label="sandbox_type")
     st = store.get("sandbox-type", sandbox_type_id)
+    allow_raw_mounts = _validate_broker_overrides(ov, st["tier"])
     eff_worker_id = worker_id or st["default_worker"]
     validate_opaque_id(eff_worker_id, label="worker")
     worker = store.get("worker", eff_worker_id)
@@ -1007,6 +1341,7 @@ def compile_plan(
 
     worker_caps = {**host_provider["capabilities"], **worker["capabilities_override"]}
     arch = worker["arch"]
+    sandbox_broker_host = _resolve_sandbox_broker_host(host_provider, transport)
 
     bundles, bundle_closure = _resolve_bundle_dag(store, st["bundles"], ov.with_mods, ov.without_mods)
     active_roots, remote_bindings = _collect_roots_and_bindings(bundles, ov)
@@ -1022,6 +1357,9 @@ def compile_plan(
         store, active_roots, worker_caps, prior_node_count=len(bundles)
     )
     endpoints = _compile_endpoints(resolved_services, st["ports"], ov.cli_ports)
+
+    broker_routes: dict[str, dict[str, Any]] = {}
+    active_raw_remote_mounts: set[str] = set()
     role, effective_remote_write_grants = _compile_role_contract(
         store,
         bundles,
@@ -1030,7 +1368,32 @@ def compile_plan(
         remote_bindings,
         canonical_write_grants,
         st["tier"],
+        sandbox_broker_host=sandbox_broker_host,
+        broker_http_port=ov.broker_http_port,
+        allow_raw_remote_mounts=allow_raw_mounts,
+        active_raw_remote_mounts=active_raw_remote_mounts,
+        broker_routes=broker_routes,
     )
+    broker_client_env = _compile_broker_services(
+        bundles,
+        tier=st["tier"],
+        sandbox_broker_host=sandbox_broker_host,
+        broker_http_port=ov.broker_http_port,
+        broker_pg_port=ov.broker_pg_port,
+        allow_raw_remote_mounts=allow_raw_mounts,
+        active_raw_remote_mounts=active_raw_remote_mounts,
+        broker_routes=broker_routes,
+    )
+    _enforce_broker_gates(
+        broker_routes,
+        tier=st["tier"],
+        topology=st["topology"],
+        worker_id=eff_worker_id,
+        transport=transport,
+        allow_raw_remote_mounts=allow_raw_mounts,
+        active_raw_remote_mounts=active_raw_remote_mounts,
+    )
+
     mise_tools = _merge_mise_tools(bundles, resolved_services, st["mise_overrides"])
     base_image = _bind_image_for_arch(
         st["base_image"], st["base_images_by_arch"], arch, f"sandbox-type({sandbox_type_id})"
@@ -1075,6 +1438,9 @@ def compile_plan(
         "services": compiled_services,
         "remote_bindings": dict(sorted(remote_bindings.items())),
         "remote_write_grants": dict(sorted(effective_remote_write_grants.items())),
+        "raw_remote_mounts": sorted(active_raw_remote_mounts),
+        "broker_routes": dict(sorted(broker_routes.items())),
+        "broker_client_env": dict(sorted(broker_client_env.items())),
         "endpoints": endpoints,
         "role_contract": role,
         "mise_tools": mise_tools,
@@ -1192,6 +1558,27 @@ def _mcp_surface_widened(om: dict[str, Any], mcfg: dict[str, Any]) -> bool:
     )
 
 
+def _delta_existing_mcp(
+    st_id: str,
+    mname: str,
+    om: dict[str, Any],
+    mcfg: dict[str, Any],
+    new_slots: set[str],
+    triggers: set[str],
+    details: list[dict[str, Any]],
+) -> None:
+    added_slots = new_slots - extract_secret_slots(om.get("headers", {}), om.get("secret_env", {}))
+    if added_slots:
+        triggers.add("secret_slot_added")
+        details.append({"trigger": "secret_slot_added", "sandbox_type": st_id, "mcp": mname, "slots": sorted(added_slots)})
+    if mcfg.get("credential_delivery") == "raw-container-mount" and om.get("credential_delivery") != "raw-container-mount":
+        triggers.add("raw_remote_secret_mounted")
+        details.append({"trigger": "raw_remote_secret_mounted", "sandbox_type": st_id, "route": f"mcp:{mname}"})
+    if _mcp_surface_widened(om, mcfg):
+        triggers.add("mcp_tool_surface_widened")
+        details.append({"trigger": "mcp_tool_surface_widened", "sandbox_type": st_id, "mcp": mname})
+
+
 def _delta_mcp(
     st_id: str, old_p: dict[str, Any] | None, new_p: dict[str, Any], triggers: set[str], details: list[dict[str, Any]]
 ) -> None:
@@ -1203,15 +1590,90 @@ def _delta_mcp(
             if new_slots:
                 triggers.add("secret_slot_added")
                 details.append({"trigger": "secret_slot_added", "sandbox_type": st_id, "mcp": mname, "slots": sorted(new_slots)})
+            if mcfg.get("credential_delivery") == "raw-container-mount":
+                triggers.add("raw_remote_secret_mounted")
+                details.append({"trigger": "raw_remote_secret_mounted", "sandbox_type": st_id, "route": f"mcp:{mname}"})
             continue
-        om = old_mcp[mname]
-        added_slots = new_slots - extract_secret_slots(om.get("headers", {}), om.get("secret_env", {}))
-        if added_slots:
-            triggers.add("secret_slot_added")
-            details.append({"trigger": "secret_slot_added", "sandbox_type": st_id, "mcp": mname, "slots": sorted(added_slots)})
-        if _mcp_surface_widened(om, mcfg):
-            triggers.add("mcp_tool_surface_widened")
-            details.append({"trigger": "mcp_tool_surface_widened", "sandbox_type": st_id, "mcp": mname})
+        _delta_existing_mcp(st_id, mname, old_mcp[mname], mcfg, new_slots, triggers, details)
+
+
+def _cidrs_widened(old_cidrs: list[str], new_cidrs: list[str]) -> bool:
+    if not new_cidrs:
+        return False
+    old_nets = [ipaddress.ip_network(c, strict=True) for c in old_cidrs]
+    for c in new_cidrs:
+        net = ipaddress.ip_network(c, strict=True)
+        if not any(net.subnet_of(on) for on in old_nets):
+            return True
+    return False
+
+
+def _wire_policy_widened(old_wp: dict[str, Any] | None, new_wp: dict[str, Any] | None) -> bool:
+    if new_wp is None:
+        return False
+    if old_wp is None:
+        return True
+    if set(old_wp.get("denied_paths", [])) - set(new_wp.get("denied_paths", [])):
+        return True
+    if new_wp.get("allow_rules", []) != old_wp.get("allow_rules", []):
+        return True
+    if set(new_wp.get("allowed_tools", [])) - set(old_wp.get("allowed_tools", [])):
+        return True
+    return False
+
+
+def _delta_broker_route_pair(
+    st_id: str,
+    rid: str,
+    old_r: dict[str, Any],
+    new_r: dict[str, Any],
+    triggers: set[str],
+    details: list[dict[str, Any]],
+) -> None:
+    if new_r.get("credential_delivery") == "raw-container-mount" and old_r.get("credential_delivery") != "raw-container-mount":
+        triggers.add("raw_remote_secret_mounted")
+        details.append({"trigger": "raw_remote_secret_mounted", "sandbox_type": st_id, "route": rid})
+    if new_r.get("upstream") != old_r.get("upstream") or _cidrs_widened(
+        old_r.get("allowed_cidrs", []), new_r.get("allowed_cidrs", [])
+    ):
+        triggers.add("remote_endpoint_added")
+        details.append({"trigger": "remote_endpoint_added", "sandbox_type": st_id, "route": rid})
+    if new_r.get("access_mode") != old_r.get("access_mode") and new_r.get("access_mode") in ("remote-rw", "rw"):
+        triggers.add("remote_write_granted")
+        details.append({"trigger": "remote_write_granted", "sandbox_type": st_id, "route": rid})
+    added_slots = set(new_r.get("secret_slots", [])) - set(old_r.get("secret_slots", []))
+    if added_slots or (new_r.get("secret_ref") and new_r.get("secret_ref") != old_r.get("secret_ref")):
+        triggers.add("secret_slot_added")
+        details.append({"trigger": "secret_slot_added", "sandbox_type": st_id, "route": rid})
+    if (
+        (bool(new_r.get("allow_streaming", False)) and not bool(old_r.get("allow_streaming", False)))
+        or _wire_policy_widened(old_r.get("wire_policy"), new_r.get("wire_policy"))
+        or bool(set(new_r.get("allowed_presets", [])) - set(old_r.get("allowed_presets", [])))
+    ):
+        triggers.add("mcp_tool_surface_widened")
+        details.append({"trigger": "mcp_tool_surface_widened", "sandbox_type": st_id, "route": rid})
+
+
+def _delta_broker_routes(
+    st_id: str, old_p: dict[str, Any] | None, new_p: dict[str, Any], triggers: set[str], details: list[dict[str, Any]]
+) -> None:
+    old_routes = old_p.get("broker_routes", {}) if old_p else {}
+    for rid, new_r in sorted(new_p.get("broker_routes", {}).items()):
+        old_r = old_routes.get(rid)
+        if old_r is None:
+            triggers.add("remote_endpoint_added")
+            details.append({"trigger": "remote_endpoint_added", "sandbox_type": st_id, "route": rid})
+            if new_r.get("credential_delivery") == "raw-container-mount":
+                triggers.add("raw_remote_secret_mounted")
+                details.append({"trigger": "raw_remote_secret_mounted", "sandbox_type": st_id, "route": rid})
+            if new_r.get("access_mode") in ("remote-rw", "rw"):
+                triggers.add("remote_write_granted")
+                details.append({"trigger": "remote_write_granted", "sandbox_type": st_id, "route": rid})
+            if new_r.get("secret_slots") or new_r.get("secret_ref"):
+                triggers.add("secret_slot_added")
+                details.append({"trigger": "secret_slot_added", "sandbox_type": st_id, "route": rid})
+        else:
+            _delta_broker_route_pair(st_id, rid, old_r, new_r, triggers, details)
 
 
 def _delta_misc(
@@ -1231,6 +1693,10 @@ def _delta_misc(
         if old_rw.get(mname) != url:
             triggers.add("remote_write_granted")
             details.append({"trigger": "remote_write_granted", "sandbox_type": st_id, "mcp": mname, "url": url})
+    old_raw_mounts = set(old_p.get("raw_remote_mounts", [])) if old_p else set()
+    for rid in sorted(set(new_p.get("raw_remote_mounts", [])) - old_raw_mounts):
+        triggers.add("raw_remote_secret_mounted")
+        details.append({"trigger": "raw_remote_secret_mounted", "sandbox_type": st_id, "route": rid})
 
 
 def compute_closed_security_delta(
@@ -1250,6 +1716,7 @@ def compute_closed_security_delta(
         _delta_services(st_id, old_p, new_p, triggers, details)
         _delta_endpoints(old_p, new_p, triggers)
         _delta_mcp(st_id, old_p, new_p, triggers, details)
+        _delta_broker_routes(st_id, old_p, new_p, triggers, details)
         _delta_misc(st_id, old_p, new_p, triggers, details)
 
     summary = {"triggers": sorted(triggers), "details": details}
@@ -1301,10 +1768,22 @@ def redact_plan_summary(result: CompiledPlanResult) -> dict[str, Any]:
             k: {
                 "type": v["type"],
                 "access_mode": v.get("access_mode", "local"),
+                "credential_delivery": v.get("credential_delivery", "local-ephemeral"),
                 "allowed_tools": v["allowed_tools"],
             }
             for k, v in p["role_contract"]["opencode_config"]["mcp"].items()
         },
+        "broker_routes": {
+            rid: {
+                "kind": r["kind"],
+                "credential_delivery": r["credential_delivery"],
+                "access_mode": r["access_mode"],
+                "allow_streaming": bool(r.get("allow_streaming", False)),
+            }
+            for rid, r in sorted(p.get("broker_routes", {}).items())
+        },
+        "broker_client_env_keys": sorted(p.get("broker_client_env", {}).keys()),
+        "raw_remote_mounts": list(p.get("raw_remote_mounts", [])),
         "remote_write_granted_mcps": sorted(p.get("remote_write_grants", {}).keys()),
         "mise_tools": p["mise_tools"],
         "toolchain_delivery": p["toolchain_delivery"],

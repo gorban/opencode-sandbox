@@ -155,7 +155,7 @@ class TestPlanCompiler(unittest.TestCase):
         svc_ids = [s["id"] for s in local_res.plan["services"]]
         self.assertEqual(svc_ids, ["builtin/postgres", "builtin/api-demo"])
 
-        # Remote API_ENDPOINT -> prunes BOTH api-demo and transitive postgres
+        # Remote API_ENDPOINT -> prunes BOTH api-demo and transitive postgres; rewrites container URL to host broker
         remote_res = compile_plan(
             self.store,
             "builtin/api-workbench",
@@ -164,6 +164,10 @@ class TestPlanCompiler(unittest.TestCase):
         self.assertEqual(remote_res.plan["services"], [])
         self.assertEqual(
             remote_res.plan["role_contract"]["opencode_config"]["mcp"]["api_client"]["url"],
+            "http://127.0.0.1:18080/mcp/api_client",
+        )
+        self.assertEqual(
+            remote_res.plan["broker_routes"]["mcp:api_client"]["upstream"],
             "https://staging.example.com/mcp",
         )
 
@@ -759,7 +763,8 @@ class TestPlanCompiler(unittest.TestCase):
         )
         self.assertEqual(local_res.plan["remote_write_grants"], {})
 
-        # 2. Remote default (staging): fails closed to read-only tools + remote-RO credential slot
+        # 2. Remote default (staging): fails closed to read-only tools + host-brokered token in container,
+        #    with remote-RO credential slot kept strictly host-side in broker_routes
         remote_ro = compile_plan(
             self.store,
             "builtin/api-workbench",
@@ -767,15 +772,20 @@ class TestPlanCompiler(unittest.TestCase):
         )
         ro_mcp = remote_ro.plan["role_contract"]["opencode_config"]["mcp"]["api_client"]
         self.assertEqual(ro_mcp["access_mode"], "remote-ro")
+        self.assertEqual(ro_mcp["credential_delivery"], "host-brokered")
         self.assertEqual(ro_mcp["allowed_tools"], ["query_ro"])
         self.assertEqual(
             ro_mcp["headers"]["Authorization"],
+            "Bearer {file:/run/secrets/oc_broker_token}",
+        )
+        self.assertEqual(
+            remote_ro.plan["broker_routes"]["mcp:api_client"]["upstream_headers"]["Authorization"],
             "Bearer {file:/run/secrets/api_remote_ro_token}",
         )
         self.assertEqual(remote_ro.plan["remote_write_grants"], {})
 
         # 3. Remote with matching explicit write grant (canonical URL normalized):
-        #    admits write tools, mounts remote-RW slot, changes plan_digest, surfaces security_delta
+        #    admits write tools, switches host-side broker_routes to remote-RW slot, changes plan_digest, surfaces security_delta
         remote_rw = compile_plan(
             self.store,
             "builtin/api-workbench",
@@ -786,9 +796,14 @@ class TestPlanCompiler(unittest.TestCase):
         )
         rw_mcp = remote_rw.plan["role_contract"]["opencode_config"]["mcp"]["api_client"]
         self.assertEqual(rw_mcp["access_mode"], "remote-rw")
+        self.assertEqual(rw_mcp["credential_delivery"], "host-brokered")
         self.assertEqual(rw_mcp["allowed_tools"], ["query_ro", "mutate_write"])
         self.assertEqual(
             rw_mcp["headers"]["Authorization"],
+            "Bearer {file:/run/secrets/oc_broker_token}",
+        )
+        self.assertEqual(
+            remote_rw.plan["broker_routes"]["mcp:api_client"]["upstream_headers"]["Authorization"],
             "Bearer {file:/run/secrets/api_remote_rw_token}",
         )
         self.assertEqual(
@@ -862,6 +877,10 @@ class TestPlanCompiler(unittest.TestCase):
         self.assertEqual(audit_mcp["access_mode"], "remote-ro")
         self.assertEqual(
             audit_mcp["headers"]["Authorization"],
+            "Bearer {file:/run/secrets/oc_broker_token}",
+        )
+        self.assertEqual(
+            audit_rw_attempt.plan["broker_routes"]["mcp:api_client"]["upstream_headers"]["Authorization"],
             "Bearer {file:/run/secrets/api_remote_ro_token}",
         )
         self.assertEqual(audit_rw_attempt.plan["remote_write_grants"], {})
