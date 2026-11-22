@@ -190,7 +190,22 @@ All three child PRDs share three explicit extensions to `oc_controller.py` ([prd
   **GATE 1 CLEARED** at commit `5d618bed556bea41e48c46a8a90d4b453a9f2c85` (prior to embedded
   browser & composable browser bundle additions).
 - Gate 1 design review round 3 (`Security-Focused PR Reviewer Setup`, `5495ae3..d620f70`, embedded
-  browser & composable bundle additions): 3 P1, 2 P2, and 2 P3 findings addressed in this revision.
-- Gate 1 design review round 4 (`Security-Focused PR Reviewer Setup`): pending.
+  browser & composable bundle additions): 3 P1, 2 P2, and 2 P3 findings addressed in `84a4ccf`.
+- Gate 1 design review round 4 (`Security-Focused PR Reviewer Setup`, `d620f70..84a4ccf`):
+  **GATE 1 CLEARED** (full PRD M suite) at commit `84a4ccfde832904bfe2901a950d23f4db7a2034c`:
+  - `docs/prds/prd_m.md` SHA-256: `6b21cc6ff4c3d6d8f1c1b6da25582a41b9d7d83410a7ab4278f0b26406d26270`
+  - `docs/prds/prd_m1.md` SHA-256: `2d2df8b2026c6e46dfe91e1226b6c64c11dfc71d3d28a70c5abc052168ceca50`
+  - `docs/prds/prd_m2.md` SHA-256: `fff8fbeee3b0ecba6f7f92c62dfc57b72be2669ef4f8ba90a78c3fcc5a3b402c`
+  - `docs/prds/prd_m3.md` SHA-256: `05a06cec57e1cecfe31453edb7fecd8bd41a6e8535b0682d8851b860c53a83dd`
+  - Implementation reminders for Gate 2:
+    1. Derive browser `tls_state` dynamically from CDP `Security`/`Page` state
+       (`"sandbox_internal_ca"`, `"http_unencrypted"`, `"tls_error"`) rather than hardcoding it,
+       and bind `frame_meta` + raw JPEG/PNG bytes in a single framed binary envelope (or matching
+       `frame_id`) so metadata cannot desync from dropped frames.
+    2. For `PaidFallbackGrant`, release the durable reservation only if upstream TLS connect fails
+       *before* any request bytes are transmitted; once transmitted, retain the conservative debit
+       on disconnect/abort/crash (and guard `raw_quota is None` when reading `retry_after_sec`).
+    3. Verify null-origin PTY/Browser iframe `script-src` hash/static URL behavior under both
+       WebKitGTK (Linux Tauri v2) and Chromium loopback web mode.
 
 - [ ] **Human review**: checked only when the user says so
