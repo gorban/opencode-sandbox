@@ -767,7 +767,7 @@ class CoordRegistry:
     def _open_hardened_db(self) -> sqlite3.Connection:
         _verify_all_db_files(self._db_path, enforce_0600=True)
         with _UMASK_LOCK:
-            old_umask = os.umask(0o177)
+            old_umask = os.umask(0o077)
             try:
                 conn = sqlite3.connect(
                     str(self._db_path),

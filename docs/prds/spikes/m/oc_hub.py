@@ -355,7 +355,7 @@ def _write_marker_durable(path: Path, parent_dir: Path, payload: bytes) -> None:
     """Atomically write a 0o600 non-symlink marker file and fsync both file and parent dir."""
     flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC | _O_NOFOLLOW
     with _UMASK_LOCK:
-        old_umask = os.umask(0o177)
+        old_umask = os.umask(0o077)
         try:
             fd = os.open(path, flags, 0o600)
         finally:
@@ -614,7 +614,7 @@ class ArtifactSpool:
     def _write_staged_file(path: Path, data: bytes) -> None:
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
         with _UMASK_LOCK:
-            old_umask = os.umask(0o177)
+            old_umask = os.umask(0o077)
             try:
                 fd = os.open(path, flags, 0o600)
             finally:
@@ -919,6 +919,7 @@ class CoordHub:
         self._budgets: dict[tuple[str, str], SubtreeBudget] = {}
         self._leases: dict[str, BrokerLease] = {}
         self._lease_callbacks: dict[str, Callable[[], None]] = {}
+        self._watchdog_threads: set[threading.Thread] = set()
         self._rate_windows: dict[str, deque[float]] = {}
         self._active_streams: dict[tuple[str, str], set[str]] = {}
 
@@ -1085,6 +1086,7 @@ class CoordHub:
             if cb is not None:
                 lease.remove_revoke_callback(cb)
             lease.stop_watchdog()
+        self._join_watchdog_threads()
         with self._meta_lock:
             degraded = self._degraded
         if not degraded:
@@ -1095,6 +1097,14 @@ class CoordHub:
             except (OSError, CoordPolicyError):
                 with self._meta_lock:
                     self._degraded = True
+
+    def _join_watchdog_threads(self, *, timeout_s: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        current = threading.current_thread()
+        with self._meta_lock:
+            threads = [t for t in self._watchdog_threads if t is not current]
+        for worker in threads:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
     def _get_grant_fence(self, edge_id: str) -> threading.RLock:
         with self._meta_lock:
@@ -1230,13 +1240,15 @@ class CoordHub:
         expected_incarnation_id: str,
         expected_lease: BrokerLease,
     ) -> None:
-        """Dispatch incarnation-bound revocation on a daemon thread without re-entering fences."""
+        """Dispatch incarnation-bound revocation on a tracked daemon thread without re-entering fences."""
 
         def _run() -> None:
             watchdog_caller = PrincipalCtx(role=CoordRole.OPERATOR, actor_id="lease-watchdog")
             try:
                 with self._register_lock:
                     with self._meta_lock:
+                        if self._closed:
+                            return
                         current_lease = self._leases.get(sandbox_addr)
                     if current_lease is not expected_lease:
                         return
@@ -1250,8 +1262,16 @@ class CoordHub:
                     )
             except Exception:
                 pass
+            finally:
+                with self._meta_lock:
+                    self._watchdog_threads.discard(threading.current_thread())
 
-        threading.Thread(target=_run, daemon=True).start()
+        worker = threading.Thread(target=_run, daemon=True)
+        with self._meta_lock:
+            if self._closed:
+                return
+            self._watchdog_threads.add(worker)
+        worker.start()
 
     def _resolve_parent_budget(
         self, parent_addr: str | None, active_sandboxes: list[SandboxRecord]

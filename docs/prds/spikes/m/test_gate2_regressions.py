@@ -1734,6 +1734,18 @@ class TestReciprocalReviewRegressions(CoordTestBase):
                 lease_request_id="bad id with spaces",
             )
 
+    def test_delta_close_drains_watchdog_threads_without_spurious_degraded(self) -> None:
+        controller, ctrl_op, lease, req_id = _make_controller_lease("sb-wd", "inc_wd1")
+        reg, _t, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        self._reg_sb(hub, _OP, "sb-wd", "inc_wd1", lease=lease, controller_request_id=req_id)
+        controller.revoke(ctrl_op, req_id)
+        # Immediately close hub + registry while watchdog callback may be racing
+        hub.close()
+        reg.close()
+        self.assertFalse(hub._watchdog_threads)
+        self.assertFalse(hub._degraded_marker.exists())
+        self.assertFalse(hub._session_active_marker.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
