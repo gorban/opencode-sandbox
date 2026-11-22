@@ -64,7 +64,7 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 | [prd_k](prd_k.md) | Contributor checks and repository layout | local CI and documentation PoCs human-approved; hosted qualification and final review open |
 | [prd_l](prd_l.md) | Composable sandbox config, host providers, comm adapters, and orchestrator config MCP | offline spike PoC slice human-approved; external secret isolation ([prd_l1](prd_l1.md)), production port, and final review open |
 | [prd_m](prd_m.md) | Model telemetry (5h/7d quotas & reasoning variants), cross-model orchestration, and unified Tauri/web control plane | proposed; Gate 1 external security review cleared; open decisions & human review pending |
-| [prd_n](prd_n.md) | First-class long-running workflows (`workflow@1`), host metrics, zero-authority System-1 + blind-check supervision, non-blocking Human Inbox, and declarative `oc-ui@1` dashboard surfaces | proposed; Rank #1 direction selected; Gate 1 review, open decisions & human review pending |
+| [prd_n](prd_n.md) | First-class long-running workflows (`workflow@1`), host metrics, zero-authority System-1 + blind-check supervision, non-blocking Human Inbox, and declarative `oc-ui@1` dashboard surfaces | proposed; Rank #1 direction selected; initial Gate 1 external security & PR-style review cleared (`e155caf2`); reciprocal review, open decisions & human review pending |
 
 The imported findings are evidence, not production implementation:
 
