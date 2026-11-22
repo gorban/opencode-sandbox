@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools' / 'ci'))
 
@@ -36,16 +37,22 @@ PATH = 'core.py'
 
 
 class TrustAnchorTransportTest(unittest.TestCase):
+    def setUp(self):
+        opener = patch('urllib.request.OpenerDirector.open', side_effect=AssertionError('generic URL opener used'))
+        opener.start()
+        self.addCleanup(opener.stop)
+
     def test_pinned_wheel_uses_binary_mode_only(self):
         class WheelResponse(BytesIO):
             status = 200
 
-        with patch.object(http, 'build_opener') as build:
-            build.return_value.open.return_value = WheelResponse(b'wheel')
+        with patch.object(http, 'HTTPSConnection', create=True) as connect:
+            connect.return_value.getresponse.return_value = WheelResponse(b'wheel')
             self.assertEqual(http.request(wheel.WHEEL, 300_000, 'wheel'), b'wheel')
-            request = build.return_value.open.call_args.args[0]
-            self.assertEqual(request.full_url, wheel.WHEEL)
-            self.assertIsNone(request.get_header('Accept'))
+            connect.assert_called_once_with('files.pythonhosted.org', timeout=12)
+            request = connect.return_value.request.call_args
+            self.assertEqual(request.args, ('GET', urlsplit(wheel.WHEEL).path))
+            self.assertNotIn('Accept', request.kwargs['headers'])
         for url, mode in ((wheel.WHEEL, 'api'), (wheel.WHEEL + '?changed=1', 'wheel')):
             with self.subTest(url=url, mode=mode), self.assertRaises(ValueError):
                 http.request(url, 300_000, mode)
@@ -78,14 +85,27 @@ class TrustAnchorTransportTest(unittest.TestCase):
             self.assertIn('fixture runtime cleanup failure', stderr.getvalue())
             self.assertIn('fixture runtime cleanup failure', failure.__notes__[0])
 
-    def test_worker_rejects_cleartext_and_redirects(self):
-        for url in ('http://sonarcloud.io/api', 'https://sonarcloud.io@other.invalid/api'):
-            with self.subTest(url=url), self.assertRaises(ValueError):
-                http.request(url, 8)
-        redirect = http.RejectRedirect()
-        for destination in ('http://sonarcloud.io/api', 'https://sonarcloud.io/other'):
-            with self.subTest(destination=destination):
-                self.assertIsNone(redirect.redirect_request(None, None, 302, '', {}, destination))
+    def test_worker_contacts_only_fixed_origins_and_never_follows_redirects(self):
+        class RedirectResponse(BytesIO):
+            status = 302
+
+        with patch.object(http, 'HTTPSConnection', create=True) as connect:
+            for url in ('http://sonarcloud.io/api', 'https://sonarcloud.io@other.invalid/api',
+                        'https://sonarcloud.io:443/api', 'https://sonarcloud.io//other.invalid/api'):
+                with self.subTest(url=url), self.assertRaises(ValueError):
+                    http.request(url, 8)
+            connect.assert_not_called()
+            connect.return_value.getresponse.return_value = RedirectResponse()
+            with self.assertRaises(HTTPError) as failure:
+                http.request('https://sonarcloud.io/api?component=example', 8)
+            self.assertEqual(failure.exception.code, 302)
+            failure.exception.close()
+            connect.assert_called_once_with('sonarcloud.io', timeout=12)
+            connect.return_value.request.assert_called_once_with(
+                'GET', '/api?component=example',
+                headers={'User-Agent': 'opencode-sandbox-sonar-publisher', 'Accept': 'application/json'},
+            )
+            connect.return_value.close.assert_called_once_with()
 
     def test_download_has_one_deadline_and_preserves_only_http_status(self):
         url = 'https://sonarcloud.io/api'

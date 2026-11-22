@@ -29,7 +29,7 @@ def download(url, limit, *, mode='api'):
         [sys.executable, '-IB', str(tooling / 'sonar_http.py'), url, str(limit), mode],
         cwd=tooling, env={'PATH': '/usr/bin:/bin', 'LANG': 'C'}, timeout=12, limit=limit + 8,
     )
-    if status == 1 and re.fullmatch(rb'[345][0-9]{2}\n', diagnostic):
+    if status == 1 and re.fullmatch(rb'[345]\d{2}\n', diagnostic):
         raise HTTPError(url, int(diagnostic), 'Publisher API request failed', None, None)
     if status or diagnostic or len(body) > limit:
         raise PublishError('Publisher API request failed or exceeded the response limits')
