@@ -1265,6 +1265,136 @@ class TestSupervisionCore(unittest.TestCase):
         self.assertEqual(replay_payload["sanitized_last_error_excerpt"], "build exited 1")
         self.assertEqual(replay_payload["canary_question"], "noul(classifier_injection_suspected)")
 
+    def test_split_lease_registry_release_expiry_and_bound_stratum_notes(self) -> None:
+        # 1. Mismatched lease_registry in SupervisionRunContext fails closed at construction (0 adapter calls)!
+        d_adapter = LocalRulesDecisionsAdapter(
+            [
+                DecisionsAdapterResponse(choice="healthy_progress"),
+                DecisionsAdapterResponse(choice="healthy_progress"),
+                DecisionsAdapterResponse(choice="healthy_progress"),
+            ]
+        )
+        h = self._setup_run(decisions_adapter=d_adapter)
+        separate_lanes = LaneLeaseRegistry()
+        with self.assertRaises(SupervisionError):
+            SupervisionRunContext(
+                receipt=h.ctx.receipt,
+                plan=h.ctx.plan,
+                authority_store=h.ctx.authority_store,
+                broker_gate=h.ctx.broker_gate,
+                fleet_budget=h.ctx.fleet_budget,
+                lease_registry=separate_lanes,
+                ledger=h.ctx.ledger,
+            )
+        self.assertEqual(h.d_adapter.invocation_count, 0)
+        self.assertEqual(h.b_verifier.invocation_count, 0)
+
+        # 2. Aggregate stratum_notes ignores refused wrong-workflow & snapshot-target-mismatched records!
+        plan = h.ctx.plan
+        store = h.ctx.authority_store
+        receipt = h.ctx.receipt
+        ledger = h.ctx.ledger
+        empty_sub: frozenset[str] = frozenset()
+
+        rec_valid = CalibrationRecord(
+            sample_id="s_notes_valid",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            target=self.target,
+            stratum="triggered_leading",
+            frozen_snapshot=_snapshot(self.target, stall_s=0, errors=0),
+            sys1_verdict="stalled_loop",
+            blind_tool="health_record_ok",
+            confusion_outcome="FP",
+        )
+        ledger.record_outcome(rec_valid)
+        ledger.record_cap_event(
+            run_id=receipt.run_id, target=self.target, stratum="triggered_leading", outcome="cap_dropped"
+        )
+        grant = CalibrationReplayGrant(
+            grant_id="replay_release_check",
+            requesting_principal="op-1",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            candidate_spec_digest=plan.spec_digest,
+            candidate_rubric_digest=plan.candidate_rubric_digest or "",
+            authorized_sample_scope=frozenset({"triggered_leading"}),
+            approved_decisions_route="decisions:local-rules-v1",
+            approved_model="local-rules-v1",
+            excerpt_disclosure_policy=ExcerptDisclosureSpec(mode="none"),
+            max_replay_samples=5,
+            max_replay_calls=5,
+            max_replay_spend_microusd=10_000,
+            expires_at_wall_s=2000.0,
+        )
+        h.replay_registry.register(grant)
+
+        sc_before = run_calibration_replay(
+            grant.grant_id, plan, ["s_notes_valid"], ledger,
+            authority_store=store, replay_registry=h.replay_registry, broker_gate=h.ctx.broker_gate,
+            model_catalog=self.catalog,
+            caller_id="op-1", caller_role="operator", caller_subtree=empty_sub,
+            clock_provider=self._clock,
+        )
+        self.assertEqual(sc_before.stratum_notes["triggered_leading"]["inclusion_rate"], 0.5)
+
+        # Add wrong-workflow and snapshot-mismatched records -> MUST NOT alter scorecard notes!
+        ledger.record_outcome(
+            CalibrationRecord(
+                sample_id="s_notes_wrong_wf",
+                run_id=receipt.run_id,
+                workflow_id="builtin/other-workflow",
+                target=self.target,
+                stratum="triggered_leading",
+                frozen_snapshot=_snapshot(self.target, stall_s=0, errors=0),
+                sys1_verdict="stalled_loop",
+                blind_tool="health_record_ok",
+                confusion_outcome="FP",
+            )
+        )
+        other_target = TargetIncarnation("local/other", "inc-x")
+        ledger.record_outcome(
+            CalibrationRecord(
+                sample_id="s_notes_bad_snap",
+                run_id=receipt.run_id,
+                workflow_id=plan.spec.id,
+                target=self.target,
+                stratum="triggered_leading",
+                frozen_snapshot=_snapshot(other_target, stall_s=0, errors=0),
+                sys1_verdict="stalled_loop",
+                blind_tool="health_record_ok",
+                confusion_outcome="FP",
+            )
+        )
+        sc_after = run_calibration_replay(
+            grant.grant_id, plan, ["s_notes_valid"], ledger,
+            authority_store=store, replay_registry=h.replay_registry, broker_gate=h.ctx.broker_gate,
+            model_catalog=self.catalog,
+            caller_id="op-1", caller_role="operator", caller_subtree=empty_sub,
+            clock_provider=self._clock,
+        )
+        self.assertEqual(sc_after.stratum_notes["triggered_leading"], sc_before.stratum_notes["triggered_leading"])
+
+        # 3. Advancing clock past grant expiry during the last call withholds scorecard while retaining charge!
+        tick_calls = [0]
+
+        def expiring_clock() -> ClockSnapshot:
+            tick_calls[0] += 1
+            if tick_calls[0] <= 2:
+                return ClockSnapshot(monotonic_s=100.0, wall_s=1000.0)
+            return ClockSnapshot(monotonic_s=1600.0, wall_s=2500.0)
+
+        with self.assertRaises(ReplayAuthorizationError):
+            run_calibration_replay(
+                grant.grant_id, plan, ["s_notes_valid"], ledger,
+                authority_store=store, replay_registry=h.replay_registry, broker_gate=h.ctx.broker_gate,
+                model_catalog=self.catalog,
+                caller_id="op-1", caller_role="operator", caller_subtree=empty_sub,
+                clock_provider=expiring_clock,
+            )
+        # All 3 invocations (sc_before + sc_after + expired attempt) stay charged!
+        self.assertEqual(h.replay_registry.usage(grant.grant_id), (3, 3_000))
+
 
 if __name__ == "__main__":
     unittest.main()

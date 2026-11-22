@@ -718,14 +718,22 @@ class CalibrationLedger:
         caller_role: CallerRole,
         caller_subtree: frozenset[str],
         clock: ClockSnapshot,
+        workflow_id: str | None = None,
     ) -> dict[str, float | int]:
-        """Aggregate inclusion, cap-drop/delay, and abstention notes strictly over authorized run inputs."""
+        """Aggregate inclusion, cap-drop/delay, and abstention notes strictly over bound run inputs."""
         scoped = StratumStats()
         for rec in self.all_records():
             if rec.run_id != run_id or rec.stratum != stratum:
                 continue
-            if not _is_authorized_scope(
-                authority_store, rec.run_id, rec.target, principal_id, caller_role, caller_subtree, clock
+            if not _is_record_bound(
+                rec,
+                expected_run_id=run_id,
+                expected_workflow_id=workflow_id,
+                authority_store=authority_store,
+                principal_id=principal_id,
+                caller_role=caller_role,
+                caller_subtree=caller_subtree,
+                clock=clock,
             ):
                 continue
             scoped.tp += 1  # counts as verified_count in scoped inclusion denominator
@@ -739,7 +747,14 @@ class CalibrationLedger:
             if obs.run_id != run_id or obs.stratum != stratum:
                 continue
             if not _is_authorized_scope(
-                authority_store, obs.run_id, obs.target, principal_id, caller_role, caller_subtree, clock
+                authority_store,
+                obs.run_id,
+                obs.target,
+                principal_id,
+                caller_role,
+                caller_subtree,
+                clock,
+                expected_workflow_id=workflow_id,
             ):
                 continue
             attr = obs_attr[obs.kind]
@@ -755,9 +770,11 @@ def _is_authorized_scope(
     caller_role: CallerRole,
     caller_subtree: frozenset[str],
     clock: ClockSnapshot,
+    *,
+    expected_workflow_id: str | None = None,
 ) -> bool:
     try:
-        authority_store.verify_record_access(
+        auth_record = authority_store.verify_record_access(
             run_id=run_id,
             principal_id=principal_id,
             caller_role=caller_role,
@@ -765,8 +782,67 @@ def _is_authorized_scope(
             target=target,
             clock=clock,
         )
-        return True
     except AuthorityError:
+        return False
+    return expected_workflow_id is None or auth_record.workflow_id == expected_workflow_id
+
+
+def _verify_record_run_binding(
+    record: CalibrationRecord,
+    *,
+    expected_run_id: str | None,
+    expected_workflow_id: str | None,
+    authority_store: RunAuthorityStore,
+    principal_id: str,
+    caller_role: CallerRole,
+    caller_subtree: frozenset[str],
+    clock: ClockSnapshot,
+) -> None:
+    """Single canonical binding check shared across replay selection, scorecard notes, and queries."""
+    if expected_run_id is not None and record.run_id != expected_run_id:
+        raise ReplayAuthorizationError(f"sample {record.sample_id!r} belongs to another run")
+    if record.target != record.frozen_snapshot.trusted.target:
+        raise ReplayAuthorizationError("RECORD_SNAPSHOT_TARGET_MISMATCH")
+    if expected_workflow_id is not None and record.workflow_id != expected_workflow_id:
+        raise ReplayAuthorizationError("REPLAY_RECORD_WORKFLOW_MISMATCH")
+    auth_record = authority_store.verify_record_access(
+        run_id=record.run_id,
+        principal_id=principal_id,
+        caller_role=caller_role,
+        caller_subtree=caller_subtree,
+        target=record.target,
+        clock=clock,
+    )
+    if record.workflow_id != auth_record.workflow_id:
+        raise ReplayAuthorizationError("REPLAY_RECORD_WORKFLOW_MISMATCH")
+    if expected_workflow_id is not None and auth_record.workflow_id != expected_workflow_id:
+        raise ReplayAuthorizationError("REPLAY_RUN_WORKFLOW_MISMATCH")
+
+
+def _is_record_bound(
+    record: CalibrationRecord,
+    *,
+    expected_run_id: str | None,
+    expected_workflow_id: str | None,
+    authority_store: RunAuthorityStore,
+    principal_id: str,
+    caller_role: CallerRole,
+    caller_subtree: frozenset[str],
+    clock: ClockSnapshot,
+) -> bool:
+    try:
+        _verify_record_run_binding(
+            record,
+            expected_run_id=expected_run_id,
+            expected_workflow_id=expected_workflow_id,
+            authority_store=authority_store,
+            principal_id=principal_id,
+            caller_role=caller_role,
+            caller_subtree=caller_subtree,
+            clock=clock,
+        )
+        return True
+    except (AuthorityError, ReplayAuthorizationError):
         return False
 
 
@@ -781,18 +857,21 @@ def query_calibration_examples(
     run_id: str | None = None,
     strata: frozenset[str] | None = None,
 ) -> tuple[tuple[CalibrationRecord, ...], dict[str, int]]:
-    """Per-record authorized query checking exact live incarnation; excludes unauthorized rows."""
+    """Per-record authorized query checking exact live incarnation & run/workflow binding."""
     authorized: list[CalibrationRecord] = []
     aggregates: dict[str, int] = {}
     for rec in ledger.all_records():
-        if run_id is not None and rec.run_id != run_id:
-            continue
         if strata is not None and rec.stratum not in strata:
             continue
-        if rec.target != rec.frozen_snapshot.trusted.target:
-            continue
-        if not _is_authorized_scope(
-            authority_store, rec.run_id, rec.target, principal_id, caller_role, caller_subtree, clock
+        if not _is_record_bound(
+            rec,
+            expected_run_id=run_id,
+            expected_workflow_id=None,
+            authority_store=authority_store,
+            principal_id=principal_id,
+            caller_role=caller_role,
+            caller_subtree=caller_subtree,
+            clock=clock,
         ):
             continue
         authorized.append(rec)
@@ -954,26 +1033,20 @@ def _verify_replay_record_binding(
     caller_subtree: frozenset[str],
     clock: ClockSnapshot,
 ) -> None:
-    if record.run_id != grant.run_id:
-        raise ReplayAuthorizationError(f"sample {record.sample_id!r} belongs to another run")
-    if record.workflow_id != grant.workflow_id:
-        raise ReplayAuthorizationError("REPLAY_RECORD_WORKFLOW_MISMATCH")
     if record.stratum not in grant.authorized_sample_scope:
         raise ReplayAuthorizationError(
             f"sample {record.sample_id!r} stratum {record.stratum!r} excluded by grant.authorized_sample_scope"
         )
-    if record.target != record.frozen_snapshot.trusted.target:
-        raise ReplayAuthorizationError("RECORD_SNAPSHOT_TARGET_MISMATCH")
-    auth_record = authority_store.verify_record_access(
-        run_id=record.run_id,
+    _verify_record_run_binding(
+        record,
+        expected_run_id=grant.run_id,
+        expected_workflow_id=grant.workflow_id,
+        authority_store=authority_store,
         principal_id=caller_id,
         caller_role=caller_role,
         caller_subtree=caller_subtree,
-        target=record.target,
         clock=clock,
     )
-    if auth_record.workflow_id != grant.workflow_id:
-        raise ReplayAuthorizationError("REPLAY_RUN_WORKFLOW_MISMATCH")
 
 
 class SupervisionBrokerGate:
@@ -1015,6 +1088,10 @@ class SupervisionBrokerGate:
     @property
     def authority_store(self) -> RunAuthorityStore:
         return self._authority_store
+
+    @property
+    def lease_registry(self) -> LaneLeaseRegistry:
+        return self._lease_registry
 
     @property
     def replay_registry(self) -> ReplayGrantRegistry:
@@ -1266,6 +1343,48 @@ def _authorize_replay_batch(
     return records
 
 
+def _finalize_replay_notes(
+    *,
+    grant_id: str,
+    candidate_plan: CompiledWorkflowPlan,
+    contributing_records: Sequence[CalibrationRecord],
+    strata: Sequence[str],
+    broker_gate: SupervisionBrokerGate,
+    caller_id: str,
+    caller_role: CallerRole,
+    caller_subtree: frozenset[str],
+    release_clock: ClockSnapshot,
+) -> dict[str, dict[str, float | int]]:
+    """Re-verify grant and every contributing sample at release time before computing scorecard notes."""
+    grant_release = broker_gate.replay_registry.lookup_active(grant_id, clock=release_clock)
+    _verify_grant_against_candidate_plan(
+        grant_release, candidate_plan, caller_id=caller_id, model_catalog=broker_gate.model_catalog
+    )
+    for rec in contributing_records:
+        _verify_replay_record_binding(
+            grant_release,
+            rec,
+            authority_store=broker_gate.authority_store,
+            caller_id=caller_id,
+            caller_role=caller_role,
+            caller_subtree=caller_subtree,
+            clock=release_clock,
+        )
+    return {
+        st: broker_gate.ledger.scoped_stratum_notes(
+            st,
+            run_id=grant_release.run_id,
+            workflow_id=grant_release.workflow_id,
+            authority_store=broker_gate.authority_store,
+            principal_id=caller_id,
+            caller_role=caller_role,
+            caller_subtree=caller_subtree,
+            clock=release_clock,
+        )
+        for st in strata
+    }
+
+
 def run_calibration_replay(
     grant_id: str,
     candidate_plan: CompiledWorkflowPlan,
@@ -1281,7 +1400,7 @@ def run_calibration_replay(
     caller_subtree: frozenset[str],
     clock_provider: Callable[[], ClockSnapshot],
 ) -> ReplayScorecard:
-    """Run batch-preflighted, single-source, rubric-digest-bound replay with run-scoped notes."""
+    """Run batch-preflighted, single-source, release-reverified replay with bound run-scoped notes."""
     if (
         ledger is not broker_gate.ledger
         or authority_store is not broker_gate.authority_store
@@ -1308,9 +1427,9 @@ def run_calibration_replay(
 
     orig_per_stratum: dict[str, dict[str, int]] = {}
     cand_per_stratum: dict[str, dict[str, int]] = {}
-    notes: dict[str, dict[str, float | int]] = {}
     abstentions = 0
     evaluated: list[str] = []
+    contributing: list[CalibrationRecord] = []
 
     for pre_rec in authorized_records:
         t_call = clock_provider()
@@ -1323,6 +1442,7 @@ def run_calibration_replay(
             caller_subtree=caller_subtree,
             clock=t_call,
         )
+        contributing.append(rec)
         evaluated.append(rec.sample_id)
         ob = orig_per_stratum.setdefault(rec.stratum, _empty_confusion_bucket())
         if rec.confusion_outcome in ob:
@@ -1338,16 +1458,18 @@ def run_calibration_replay(
         cb[cand_outcome] += 1
         if cand_outcome == "abstain":
             abstentions += 1
-        if rec.stratum not in notes:
-            notes[rec.stratum] = broker_gate.ledger.scoped_stratum_notes(
-                rec.stratum,
-                run_id=grant.run_id,
-                authority_store=broker_gate.authority_store,
-                principal_id=caller_id,
-                caller_role=caller_role,
-                caller_subtree=caller_subtree,
-                clock=t_call,
-            )
+
+    notes = _finalize_replay_notes(
+        grant_id=grant.grant_id,
+        candidate_plan=candidate_plan,
+        contributing_records=contributing,
+        strata=tuple(orig_per_stratum.keys()),
+        broker_gate=broker_gate,
+        caller_id=caller_id,
+        caller_role=caller_role,
+        caller_subtree=caller_subtree,
+        release_clock=clock_provider(),
+    )
 
     return ReplayScorecard(
         grant_id=grant.grant_id,
@@ -1407,6 +1529,7 @@ class SupervisionRunContext:
             self.fleet_budget is not self.broker_gate.fleet_budget
             or self.ledger is not self.broker_gate.ledger
             or self.authority_store is not self.broker_gate.authority_store
+            or self.lease_registry is not self.broker_gate.lease_registry
         ):
             raise SupervisionError("SPLIT_FIXTURE_STATE")
 
@@ -1471,11 +1594,11 @@ def _execute_post_verdict_action(
         return SupervisionTickResult(status="deferred_post_verdict_human_lease", confusion_outcome=outcome)
 
     try:
-        ctx.lease_registry.assert_can_act(
+        ctx.broker_gate.lease_registry.assert_can_act(
             ctx.receipt,
             lane_state.target,
             action=tool_call.tool,
-            authority_store=ctx.authority_store,
+            authority_store=ctx.broker_gate.authority_store,
             clock=t_action,
         )
     except (AuthorityError, LaneAuthorityError):
