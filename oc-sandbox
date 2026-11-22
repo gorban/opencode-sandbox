@@ -21,6 +21,7 @@ STATE="${XDG_DATA_HOME:-$HOME/.local/share}/oc-sandbox"
 BUILD="$STATE/build"
 BIN="$HOME/.local/bin"
 UNITS="$HOME/.config/systemd/user"
+UNITS_SOURCE=$UNITS
 AGENT_IMG=oc-agent
 CHROME_IMG=oc-chromium
 # Images this script built, by full ID (one per line). Only those are ever removed by it: the tag
@@ -133,6 +134,7 @@ trusted_dir STATE "$STATE"
 trusted_dir CONF_DIR "${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox"
 trusted_dir BIN "$BIN"
 trusted_dir UNITS "$UNITS"
+trusted_dir INSTALL_DIR "$UNITS/.oc-sandbox"
 trusted_dir BUILD "$STATE/build"
 trusted_dir POLDIR "$STATE/policy"
 trusted_dir BRIDGE_STAGE "$STATE/bridge-stage"
@@ -143,7 +145,7 @@ IMAGE_LOG="$STATE/built-images"
 # directories must prevent other users replacing entries between checks and use.
 validate_host_state() {
   local scope=${1:-} command=(python3)
-  local paths=("$STATE" "$BUILD" "$POLDIR" "$BRIDGE_STAGE" "$BIN" "$UNITS")
+  local paths=("$STATE" "$BUILD" "$POLDIR" "$BRIDGE_STAGE" "$BIN" "$UNITS" "$INSTALL_DIR")
   if [[ -n $scope ]]; then paths=("$2"); fi
   if [[ $scope == host ]]; then command=("${H[@]}" /usr/bin/python3); fi
   "${command[@]}" -I - "$scope" "${paths[@]}" <<'PYCODE'
@@ -184,7 +186,7 @@ try:
     if scope:
         print(directory(paths[0], True))
         sys.exit(0)
-    state, build, policy, stage, binary, units = paths
+    state, build, policy, stage, binary, units, install = paths
     for path in paths: directory(path, True)
     for name in ("sb-level", "built-images", "built-images.lock", "pg-sig.key", "pg-sig.lock"):
         leaf(os.path.join(state, name), name in ("pg-sig.key", "pg-sig.lock"))
@@ -192,6 +194,7 @@ try:
         leaf(os.path.join(build, name))
     for name in ("oc_chromium.cil", "installed"): leaf(os.path.join(policy, name))
     for name in ("oc-bridge.service", "oc-bridge.path"): leaf(os.path.join(units, name))
+    leaf(os.path.join(install, "binding"), private=True)
     leaf(os.path.join(binary, "oc-bridge"))
 except (OSError, ValueError) as exc:
     print("unsafe host state: " + str(exc), file=sys.stderr); sys.exit(2)
@@ -227,8 +230,8 @@ if (( DELETE || EXEC || LIST || LISTKEYS )) && { (( PG || DIND || ${#PORT_ARGS[@
 fi
 
 # ---- names ----------------------------------------------------------------------------------------
-valid_instance() {  # name -> 0/1
-  [[ $1 =~ ^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$ ]] && [[ $RESERVED_NAMES != *" $1 "* ]]
+valid_instance() {  # named instance, excluding the alias for the default instance
+  [[ $1 != default && $1 =~ ^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$ && $RESERVED_NAMES != *" $1 "* ]]
 }
 # INST_SET records that -i was given at all: "-i default" selects the default instance only and must
 # never fall through to the all-instances scope of a bare -d (or -d -a).
@@ -311,15 +314,18 @@ inspect_pg_init() { # host only; output the existing digest, or no line for an a
   printf '%s\n' "$digest"
 }
 
+shared_host_directory() {
+  local caller_path=$1 description=$2 host_source=${3:-$1} host_path caller host
+  if (( ! ${#H[@]} )); then printf '%s\n' "$caller_path"; return; fi
+  host_path=$(host_input bridge-stage "$host_source") || die "unsafe host $description directory"
+  caller=$(validate_host_state caller "$caller_path") || die "unsafe launcher $description directory"
+  host=$(validate_host_state host "$host_path") || die "unsafe host $description directory"
+  [[ -n $host && $caller == "$host" ]] || die "launcher and host see different $description directories"
+  printf '%s\n' "$host_path"
+}
+
 verify_bridge_stage() {
-  HOST_BRIDGE_STAGE=$BRIDGE_STAGE
-  (( ${#H[@]} )) || return 0
-  local caller host
-  HOST_BRIDGE_STAGE=$(host_input bridge-stage "$BRIDGE_STAGE") \
-    || die "unsafe host bridge staging directory"
-  caller=$(validate_host_state caller "$BRIDGE_STAGE") || die "unsafe launcher bridge staging directory"
-  host=$(validate_host_state host "$HOST_BRIDGE_STAGE") || die "unsafe host bridge staging directory"
-  [[ -n $host && $caller == "$host" ]] || die "launcher and host see different bridge staging directories"
+  HOST_BRIDGE_STAGE=$(shared_host_directory "$BRIDGE_STAGE" 'bridge staging')
 }
 
 safe_run() { pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
@@ -563,10 +569,11 @@ cstate() { pm container inspect --format '{{.State.Status}}' "$1" 2>/dev/null ||
 
 # The helper holds an O_NOFOLLOW, owner/identity-checked flock on a persistent inode.
 # Its pipe and parent check release the lock if this shell exits or is killed.
-acquire_guard() {  # name, mode; lifecycle must always precede setup
+acquire_guard() {  # name, mode; acquire installation, lifecycle, then setup
   local name=$1 mode=$2 line rfd wfd pid helper guard_name=$1 guard_state=$STATE
   if [[ $name == worktree ]]; then guard_state=$WT_DIR; fi
-  (umask 077; mkdir -p "$STATE")
+  if [[ $name == installation ]]; then guard_state=$INSTALL_DIR; fi
+  (umask 077; mkdir -p "$guard_state")
   helper=$(trusted_file "$SCRIPT_DIR/oc-setup-lock.py") || die "missing or unsafe oc-setup-lock.py"
   coproc OC_LOCK_GUARD { exec python3 -I "$helper" "$guard_state" "$guard_name" "$mode" "$ILABEL" "$$"; }
   pid=$OC_LOCK_GUARD_PID rfd=${OC_LOCK_GUARD[0]} wfd=${OC_LOCK_GUARD[1]}
@@ -575,17 +582,19 @@ acquire_guard() {  # name, mode; lifecycle must always precede setup
     die "could not acquire $name lock"
   fi
   exec {rfd}<&-
-  if [[ $name == setup ]]; then SETUP_LOCK_FD=$wfd SETUP_LOCK_PID=$pid
+  if [[ $name == installation ]]; then INSTALL_LOCK_FD=$wfd INSTALL_LOCK_PID=$pid
+  elif [[ $name == setup ]]; then SETUP_LOCK_FD=$wfd SETUP_LOCK_PID=$pid
   elif [[ $name == worktree ]]; then WORKTREE_LOCK_FD=$wfd WORKTREE_LOCK_PID=$pid
   else LIFECYCLE_LOCK_FD=$wfd LIFECYCLE_LOCK_PID=$pid; fi
 }
+release_installation_lock() { exec {INSTALL_LOCK_FD}>&-; wait "$INSTALL_LOCK_PID" || die "installation lock helper failed"; }
 release_setup_lock() { exec {SETUP_LOCK_FD}>&-; wait "$SETUP_LOCK_PID" || die "setup lock helper failed"; }
 release_lifecycle_lock() { exec {LIFECYCLE_LOCK_FD}>&-; wait "$LIFECYCLE_LOCK_PID" || die "lifecycle lock helper failed"; }
 release_worktree_lock() { exec {WORKTREE_LOCK_FD}>&-; wait "$WORKTREE_LOCK_PID" || die "worktree lock helper failed"; }
 
 # Host-owned metadata: directory and records are opened relative to a no-follow
 # directory fd, and never trusted if a symlink, hard link or unsafe mode is found.
-worktree_state() {  # create | read NAME | write NAME CWD REPO BRANCH
+worktree_state() {  # create | read NAME | drop NAME | write NAME CWD REPO BRANCH
   python3 -I -c '
 import os, re, secrets, stat, sys
 state, mode, *args = sys.argv[1:]
@@ -609,6 +618,7 @@ try:
     try: root = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
         if mode == "read": sys.exit(3)
+        if mode == "drop": sys.exit(0)
         raise
     checked_dir(root)
     if mode == "create":
@@ -617,6 +627,7 @@ try:
     try: directory = os.open("worktrees", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
     except FileNotFoundError:
         if mode == "read": sys.exit(3)
+        if mode == "drop": sys.exit(0)
         raise
     checked_dir(directory, True)
     if mode == "create": sys.exit(0)
@@ -626,6 +637,8 @@ try:
     if mode == "read":
         if existing is None: sys.exit(3)
         sys.stdout.buffer.write(existing)
+    elif mode == "drop":
+        if existing is not None: os.unlink(name, dir_fd=directory)
     elif mode == "write":
         if len(args) != 4: raise ValueError("invalid worktree record")
         data = ("\n".join(args[1:]) + "\n").encode()
@@ -693,11 +706,19 @@ fido_device_nodes() {
 
 # Pods of all instances: labelled ones, plus the default pod made by versions before labels existed.
 instance_pods() {
-  { pm pod ls --filter label=oc.sandbox=1 --format '{{.Name}}' 2>/dev/null || true
-    if pm pod exists oc 2>/dev/null; then echo oc; fi; } | sort -u
+  local pods rc=0
+  pods=$(pm pod ls --filter label=oc.sandbox=1 --format '{{.Name}}') || return 1
+  pm pod exists oc || rc=$?
+  case $rc in
+    0) pods+=$'\noc' ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  if [[ -n $pods ]]; then printf '%s\n' "$pods" | sort -u | sed '/^$/d'; fi
 }
 
 if (( LIST )); then
+  pods=$(instance_pods) || die "could not list instance pods"
   printf '%-14s %-10s %-8s %-22s %-24s %s\n' INSTANCE POD AGENT PORTS "WORKING DIR" SIDECARS
   while read -r pod; do
     [[ -n $pod ]] || continue
@@ -725,7 +746,7 @@ if (( LIST )); then
     fi
     printf '%-14s %-10s %-8s %-22s %-24s %s%s\n' "$inst" "$pod" "$(cstate "$AGENT")" \
       "$(sed 's/:/->/g' <<<"${ports:--}")" "${wd:--}" "${side:--}" "$wt_info"
-  done < <(instance_pods)
+  done <<<"$pods"
   exit 0
 fi
 if (( EXEC )); then
@@ -802,7 +823,99 @@ load_pg_config() {
 }
 
 # ---- teardown -----------------------------------------------------------------
+unit_env() {
+  [[ $2 != *$'\n'* && $2 != *$'\r'* ]] || die "invalid line break in $1"
+  local v=${2//%/%%}
+  v=${v//\\/\\\\}; printf 'Environment="%s=%s"\n' "$1" "${v//\"/\\\"}"
+}
+
+has_unlabelled_instance_resources() {
+  local name pods=$1 volumes=$2
+  while IFS= read -r name; do
+    if [[ $name == oc ]] || { [[ $name == oc-* ]] && valid_instance "${name#oc-}"; }; then
+      return 0
+    fi
+  done <<<"$pods"
+  while IFS= read -r name; do
+    case $name in oc-home|oc-chrome|oc-pg|oc-dind|oc-dind-run) return 0;; esac
+    if [[ $name =~ ^oc-(.+)-(chrome|pg|dind|dind-run)$ ]] && valid_instance "${BASH_REMATCH[1]}"; then
+      return 0
+    fi
+  done <<<"$volumes"
+  return 1
+}
+
+require_empty_installation() {
+  local managed_pods pods managed_volumes volumes secrets
+  managed_pods=$(pm pod ls --filter label=oc.sandbox=1 --format '{{.Name}}') \
+    || die "could not verify managed pod inventory"
+  pods=$(pm pod ls --format '{{.Name}}') || die "could not verify installation pod inventory"
+  managed_volumes=$(pm volume ls -q --filter label=oc.sandbox=1) || die "could not verify managed volume inventory"
+  volumes=$(pm volume ls -q) || die "could not verify legacy volume inventory"
+  secrets=$(pm secret ls --format '{{.Name}}') || die "could not verify installation secret inventory"
+  # Named teardown can also remove these resources when they have no labels.
+  if [[ -n $managed_pods || -n $managed_volumes ]] ||
+      has_unlabelled_instance_resources "$pods" "$volumes" ||
+      grep -qxE 'oc(-[a-z0-9-]+)?-pg-(password|passfile|hba)' <<<"$secrets"; then
+    die "legacy sandbox resources remain without an installation binding; recover the original data root before setup or teardown"
+  fi
+}
+
+bind_installation() {
+  local installed="$UNITS/oc-bridge.service" receipt="$INSTALL_DIR/binding" host_state current expected
+  shared_host_directory "$UNITS" 'systemd user' "$UNITS_SOURCE" >/dev/null || return 1
+  shared_host_directory "$INSTALL_DIR" 'installation binding' "$UNITS_SOURCE/.oc-sandbox" >/dev/null || return 1
+  host_state=$(shared_host_directory "$STATE" 'installation state') || return 1
+  expected=$(printf '%s\n%s\n' "$host_state" "$HOST_BRIDGE_STAGE")
+  acquire_guard installation exclusive
+  validate_host_state || die "refusing unsafe installation binding"
+  if [[ -e $receipt ]]; then
+    current=$(< "$receipt") || die "could not read installation binding"
+    [[ $current == "$expected" ]] || die "installed state or bridge stage differs; use the original XDG_DATA_HOME"
+    return 0
+  fi
+  if [[ -f $installed ]]; then
+    # Adopt only a matching legacy unit. Leave it intact on ambiguity.
+    [[ $(grep -c '^Environment="OC_BRIDGE_STAGE=' "$installed") == 1 ]] &&
+      grep -qxF -e "$(unit_env OC_BRIDGE_STAGE "$HOST_BRIDGE_STAGE")" \
+        -e "$(unit_env OC_BRIDGE_STAGE "$BRIDGE_STAGE")" -- "$installed" \
+      || die "installed bridge stage differs; use the original XDG_DATA_HOME"
+  else
+    require_empty_installation
+  fi
+  printf '%s\n' "$expected" | atomic_host_file "$receipt" 0600 || die "could not record installation binding"
+}
+
 confirm() { (( YES )) && return 0; read -r -p "$1 [y/N] " a; [[ $a == [yY]* ]]; }
+remove_pod() {
+  local rc=0
+  pm pod rm --ignore -f -- "$1" >/dev/null || return 1
+  pm pod exists "$1" || rc=$?
+  (( rc == 1 ))
+}
+remove_instance_storage() {
+  local kind=$1 name=$2 rc=0
+  shift 2
+  pm "$kind" exists "$name" || rc=$?
+  case $rc in
+    1) return 0 ;;
+    0) ;;
+    *) return 1 ;;
+  esac
+  pm "$kind" rm "$@" "$name" >/dev/null || return 1
+  rc=0
+  pm "$kind" exists "$name" || rc=$?
+  (( rc == 1 ))
+}
+stop_bridge() {
+  local unit state
+  for unit in oc-bridge.path oc-bridge.service; do
+    if ! sc stop "$unit" >/dev/null 2>&1; then
+      state=$(sc show --property=ActiveState --value "$unit") || return 1
+      [[ $state == inactive || $state == failed ]] || return 1
+    fi
+  done
+}
 # The module is installed by semodule at its default priority (400). A lower-priority
 # module with the same name belongs to someone else and must not be removed.
 remove_chromium_policy() {
@@ -831,15 +944,23 @@ remove_chromium_policy() {
   fi
 }
 if (( DELETE )); then
-  if (( !INST_SET )); then verify_bridge_stage; fi
+  verify_bridge_stage
+  bind_installation
   acquire_guard lifecycle exclusive
   if (( INST_SET )); then                                   # one instance only (also -i default)
     log "Removing instance '$ILABEL' (pod $POD)"
-    pm pod rm -f "$POD" >/dev/null 2>&1 || true
+    remove_pod "$POD" || die "could not verify that pod '$POD' was removed"
     if (( ALL )); then
       if confirm "Also delete volumes $CHROMEVOL $PGVOL $DINDVOL $DINDRUN (Chromium profile, Postgres data, docker storage)?"; then
-        for v in "$CHROMEVOL" "$PGVOL" "$DINDVOL" "$DINDRUN"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
-        pm secret rm "$PGSECRET" "$PGPASSSECRET" "$PGHBASECRET" >/dev/null 2>&1 || true
+        purge_failed=0
+        for v in "$CHROMEVOL" "$PGVOL" "$DINDVOL" "$DINDRUN"; do
+          remove_instance_storage volume "$v" -f || { echo "could not verify removal of volume '$v'" >&2; purge_failed=1; }
+        done
+        for s in "$PGSECRET" "$PGPASSSECRET" "$PGHBASECRET"; do
+          remove_instance_storage secret "$s" || { echo "could not verify removal of secret '$s'" >&2; purge_failed=1; }
+        done
+        (( purge_failed == 0 )) || die "instance storage cleanup incomplete; worktree selection retained"
+        worktree_state drop "$ILABEL" || die "could not clear the worktree selection for '$ILABEL'"
       else echo "Skipped -a part."; fi
     fi
     log "Done. $SB/$DEFAULT_CWD (and any other files in $SB) left untouched."
@@ -850,14 +971,27 @@ if (( DELETE )); then
   if compgen -G "$STATE/opencode-update.*" >/dev/null; then
     die "unresolved OpenCode updater receipts in $STATE; inspect and clean the recorded container IDs before teardown"
   fi
-  for pod in $(instance_pods); do log "Removing pod '$pod'"; pm pod rm -f "$pod" >/dev/null 2>&1 || true; done
+  pods=$(instance_pods) || die "could not list instance pods; teardown stopped"
+  while IFS= read -r pod; do
+    [[ -n $pod ]] || continue
+    log "Removing pod '$pod'"
+    remove_pod "$pod" || die "could not verify that pod '$pod' was removed"
+  done <<<"$pods"
+  pods=$(instance_pods) || die "could not verify that all instance pods were removed"
+  [[ -z $pods ]] || die "instance pods remain; teardown stopped"
   log "Removing host bridge"
-  sc disable --now oc-bridge.path >/dev/null 2>&1 || true
+  stop_bridge || die "could not confirm the host bridge stopped"
+  sc disable oc-bridge.path >/dev/null 2>&1 || true
   rm -f "$UNITS/oc-bridge.path" "$UNITS/oc-bridge.service" "$BIN/oc-bridge"
   sc daemon-reload >/dev/null 2>&1 || true
   if (( ALL )); then
     if ! confirm "Also delete ALL oc-sandbox volumes (OpenCode login, Chromium profiles, Postgres data, docker storage), images and build files?"; then
       echo "Skipped -a part."; exit 0
+    fi
+    if [[ -d $BRIDGE_STAGE ]]; then
+      staged=$(find "$BRIDGE_STAGE" -mindepth 1 -maxdepth 1 -type d -print -quit) \
+        || die "could not inspect staged editor sessions"
+      [[ -z $staged ]] || die "staged editor sessions remain in $BRIDGE_STAGE; close editors or recover their files and retry"
     fi
     log "Removing images, volumes, secrets, build files"
     # Only images this script built: drop our tag from them (not other tags you gave them), then
@@ -879,13 +1013,14 @@ if (( DELETE )); then
     else echo "warning: could not list Podman secrets; remove any oc-*-pg-password secrets by hand" >&2; fi
     teardown_status=0
     remove_chromium_policy || teardown_status=1
-    # Safe on the host: every pod (and with it every agent) is gone, so nothing can change $SB/.bridge
-    # concurrently, and GNU rm -r never follows symlinks (it unlinks them).
+    # We verified that the pods are gone and stopped the bridge path and service above.
+    # GNU rm -r unlinks symlinks instead of traversing their targets.
     if (( teardown_status == 0 )); then
       # Keep setup.lock's inode permanently, including across global teardown.
       find "$STATE" -mindepth 1 -maxdepth 1 ! -name setup.lock ! -name lifecycle.lock -exec rm -rf -- {} +
+      rm -rf "$SB/.bridge"
+      rm -f "$INSTALL_DIR/binding"
     fi
-    rm -rf "$SB/.bridge"
     if (( teardown_status != 0 )); then
       echo "Cleanup incomplete; state retained at $STATE. Fix the SELinux error and retry." >&2
       exit 1
@@ -915,7 +1050,9 @@ WL="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-wayland-0}"
 # ---- directories / config -----------------------------------------------------
 # Hold the shared lifecycle barrier through instance creation; teardown takes it exclusively.
 # Lock ordering is lifecycle before setup. Neither lock is held during the interactive session.
+bind_installation
 acquire_guard lifecycle shared
+release_installation_lock
 # Serialize every shared check/write, including build context and shared SELinux level.
 acquire_guard setup exclusive
 if compgen -G "$STATE/opencode-update.*" >/dev/null; then
@@ -1195,11 +1332,6 @@ fi
 "${H[@]}" python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
   || echo "warning: the host bridge needs python3 >= 3.11 on the host; 'code'/'bcompare' will do nothing" >&2
 atomic_host_file "$BIN/oc-bridge" 0755 < "$BRIDGE_SRC"
-unit_env() {
-  [[ $2 != *$'\n'* && $2 != *$'\r'* ]] || die "invalid line break in $1"
-  local v=${2//%/%%}
-  v=${v//\\/\\\\}; printf 'Environment="%s=%s"\n' "$1" "${v//\"/\\\"}"
-}
 {
   # Keep batches bounded without allowing a backlog to put the watcher in a failed state.
   printf '[Unit]\nDescription=Restricted host bridge for the OpenCode sandbox\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\nExecStartPre=/usr/bin/sleep 1\n'
