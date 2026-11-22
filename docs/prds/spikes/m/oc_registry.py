@@ -1513,16 +1513,12 @@ class CoordRegistry:
         ).fetchall()
         self._cancel_pending_outbox_msgs(conn, [r["msg_id"] for r in rows], reason, now)
 
-    def revoke_grant_and_cancel_outbox(
+    def _build_revoke_where(
         self,
-        *,
-        target_addr: str | None = None,
-        edge_id: str | None = None,
-        lease_request_id: str | None = None,
-        reason: str = "revoked",
-    ) -> list[str]:
-        if target_addr is None and edge_id is None and lease_request_id is None:
-            raise CoordValidationError("At least one revocation selector is required")
+        target_addr: str | None,
+        edge_id: str | None,
+        lease_request_id: str | None,
+    ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if target_addr is not None:
@@ -1534,40 +1530,59 @@ class CoordRegistry:
         if lease_request_id is not None:
             clauses.append("lease_request_id = ?")
             params.append(lease_request_id)
-        where = " AND ".join(clauses)
+        if not clauses:
+            raise CoordValidationError("At least one revocation selector is required")
+        return " AND ".join(clauses), params
+
+    def _revoke_matching_edges_conn(
+        self, conn: sqlite3.Connection, rows: list[sqlite3.Row], reason: str, now: float
+    ) -> list[str]:
+        revoked_ids: list[str] = []
+        for row in rows:
+            eid = row["edge_id"]
+            gen = int(row["grant_generation"])
+            revoked_ids.append(eid)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO grant_tombstones
+                    (edge_id, grant_generation, reason, revoked_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (eid, gen, reason, now),
+            )
+            conn.execute("UPDATE routing_edges SET active = 0 WHERE edge_id = ?", (eid,))
+            pending_rows = conn.execute(
+                """
+                SELECT msg_id FROM outbox
+                WHERE edge_id = ? AND grant_generation = ? AND status = ?
+                """,
+                (eid, gen, _STATUS_PENDING),
+            ).fetchall()
+            self._cancel_pending_outbox_msgs(conn, [r["msg_id"] for r in pending_rows], reason, now)
+        return revoked_ids
+
+    def revoke_grant_and_cancel_outbox(
+        self,
+        *,
+        target_addr: str | None = None,
+        edge_id: str | None = None,
+        lease_request_id: str | None = None,
+        reason: str = "revoked",
+    ) -> list[str]:
+        where, params = self._build_revoke_where(target_addr, edge_id, lease_request_id)
         whole_sandbox = target_addr is not None and edge_id is None and lease_request_id is None
+        lease_only = lease_request_id is not None and edge_id is None and target_addr is None
         now = time.time()
 
         with self._tx() as conn:
-            if whole_sandbox:
+            if whole_sandbox and target_addr is not None:
                 self._revoke_whole_sandbox_conn(conn, target_addr, reason, now)
             rows = conn.execute(
                 f"SELECT edge_id, grant_generation FROM routing_edges WHERE {where} ORDER BY edge_id ASC",
                 params,
             ).fetchall()
-            revoked_ids: list[str] = []
-            for row in rows:
-                eid = row["edge_id"]
-                gen = int(row["grant_generation"])
-                revoked_ids.append(eid)
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO grant_tombstones
-                        (edge_id, grant_generation, reason, revoked_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (eid, gen, reason, now),
-                )
-                conn.execute("UPDATE routing_edges SET active = 0 WHERE edge_id = ?", (eid,))
-                pending_rows = conn.execute(
-                    """
-                    SELECT msg_id FROM outbox
-                    WHERE edge_id = ? AND grant_generation = ? AND status = ?
-                    """,
-                    (eid, gen, _STATUS_PENDING),
-                ).fetchall()
-                self._cancel_pending_outbox_msgs(conn, [r["msg_id"] for r in pending_rows], reason, now)
-            if lease_request_id is not None and edge_id is None and target_addr is None:
+            revoked_ids = self._revoke_matching_edges_conn(conn, rows, reason, now)
+            if lease_only and lease_request_id is not None:
                 lease_rows = conn.execute(
                     "SELECT msg_id FROM outbox WHERE lease_request_id = ? AND status = ?",
                     (lease_request_id, _STATUS_PENDING),

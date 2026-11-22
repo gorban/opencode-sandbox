@@ -197,6 +197,19 @@ class InMemoryRegistryStore:
                     return edge
             return None
 
+    @staticmethod
+    def _edge_matches_filter(
+        edge: RoutingEdge,
+        dst_addr: str | None,
+        src_actor: str | None,
+        active_only: bool,
+    ) -> bool:
+        if active_only and not edge.active:
+            return False
+        if dst_addr is not None and edge.dst_addr != dst_addr:
+            return False
+        return src_actor is None or edge.src_actor == src_actor
+
     def list_edges(
         self,
         *,
@@ -207,16 +220,11 @@ class InMemoryRegistryStore:
         with self._lock:
             if self.fail_reads:
                 raise OSError("simulated_db_read_failure")
-            out: list[RoutingEdge] = []
-            for edge in self.edges.values():
-                if active_only and not edge.active:
-                    continue
-                if dst_addr is not None and edge.dst_addr != dst_addr:
-                    continue
-                if src_actor is not None and edge.src_actor != src_actor:
-                    continue
-                out.append(edge)
-            return out
+            return [
+                edge
+                for edge in self.edges.values()
+                if self._edge_matches_filter(edge, dst_addr, src_actor, active_only)
+            ]
 
     def reset_edge_turns(self, edge_id: str) -> None:
         with self._lock:

@@ -555,6 +555,32 @@ class UiAuthManager:
             )
         return raw_ticket
 
+    @staticmethod
+    def _verify_ws_scope_match(
+        scope: WsTicketScope,
+        *,
+        canon_target: str,
+        clean_inc: str,
+        clean_surface: str,
+        clean_mode: str,
+    ) -> None:
+        matched = (
+            hmac.compare_digest(scope.target_addr, canon_target)
+            and hmac.compare_digest(scope.incarnation_id, clean_inc)
+            and hmac.compare_digest(scope.surface_kind, clean_surface)
+            and hmac.compare_digest(scope.mode, clean_mode)
+        )
+        if not matched:
+            raise UiAuthDeniedError("WebSocket ticket scope mismatch")
+
+    @staticmethod
+    def _optional_session_digest(expected_session_id: str | None) -> str | None:
+        if expected_session_id is None:
+            return None
+        if type(expected_session_id) is not str or not expected_session_id:
+            raise UiAuthDeniedError(_ERR_INVALID_SESSION)
+        return _sha256_hex(expected_session_id)
+
     def consume_ws_ticket(
         self,
         ticket: str,
@@ -575,12 +601,7 @@ class UiAuthManager:
         )
         if type(ticket) is not str or not ticket:
             raise UiAuthDeniedError(_ERR_INVALID_WS_TICKET)
-        expected_session_digest: str | None = None
-        if expected_session_id is not None:
-            if type(expected_session_id) is not str or not expected_session_id:
-                raise UiAuthDeniedError(_ERR_INVALID_SESSION)
-            expected_session_digest = _sha256_hex(expected_session_id)
-
+        expected_session_digest = self._optional_session_digest(expected_session_id)
         ticket_digest = _sha256_hex(ticket)
 
         with self._lock:
@@ -600,11 +621,11 @@ class UiAuthManager:
                 scope.session_id_hash, expected_session_digest
             ):
                 raise UiAuthDeniedError(_ERR_INVALID_SESSION)
-            if not (
-                hmac.compare_digest(scope.target_addr, canon_target)
-                and hmac.compare_digest(scope.incarnation_id, clean_inc)
-                and hmac.compare_digest(scope.surface_kind, clean_surface)
-                and hmac.compare_digest(scope.mode, clean_mode)
-            ):
-                raise UiAuthDeniedError("WebSocket ticket scope mismatch")
+            self._verify_ws_scope_match(
+                scope,
+                canon_target=canon_target,
+                clean_inc=clean_inc,
+                clean_surface=clean_surface,
+                clean_mode=clean_mode,
+            )
             return scope

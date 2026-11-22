@@ -1124,6 +1124,24 @@ class CoordHub:
             check_in_reply_to=reply_check,
         )
 
+    def _prepare_send_phase1(
+        self,
+        caller: PrincipalCtx,
+        edge: RoutingEdge,
+        target_addr: str,
+        *,
+        control_prio: bool,
+        artifact_blobs: Sequence[bytes],
+    ) -> tuple[str, int, StagingReservation | None]:
+        live_edge, dst_sb = self._verify_grant_live_under_fence(
+            edge.edge_id, edge.grant_generation, target_addr
+        )
+        self._validate_caller_incarnation_and_lease(caller, live_edge)
+        if not control_prio:
+            self._check_rate_limit(live_edge.edge_id, live_edge.rate_limit_rpm)
+        reservation = self.spool.reserve(live_edge.edge_id, artifact_blobs) if artifact_blobs else None
+        return dst_sb.incarnation_id, live_edge.grant_generation, reservation
+
     def send(
         self,
         caller: PrincipalCtx,
@@ -1156,16 +1174,13 @@ class CoordHub:
         reservation: StagingReservation | None = None
         try:
             with fence:
-                live_edge, dst_sb = self._verify_grant_live_under_fence(
-                    edge.edge_id, edge.grant_generation, addr.canonical
+                dst_incarnation, expected_gen, reservation = self._prepare_send_phase1(
+                    caller,
+                    edge,
+                    addr.canonical,
+                    control_prio=control_prio,
+                    artifact_blobs=artifact_blobs,
                 )
-                self._validate_caller_incarnation_and_lease(caller, live_edge)
-                if not control_prio:
-                    self._check_rate_limit(live_edge.edge_id, live_edge.rate_limit_rpm)
-                dst_incarnation = dst_sb.incarnation_id
-                expected_gen = live_edge.grant_generation
-                if artifact_blobs:
-                    reservation = self.spool.reserve(live_edge.edge_id, artifact_blobs)
 
             staged_refs: tuple[ArtifactRef, ...] = (
                 self.spool.stage_blobs(reservation, artifact_blobs)
@@ -1508,22 +1523,28 @@ class CoordHub:
         finally:
             self.wait_graph.exit(caller.canonical_sender, token)
 
+    def _assert_single_target_not_revoked(self, addr: str) -> None:
+        with self._meta_lock:
+            fenced = addr in self._fenced_addrs
+        if fenced:
+            raise RevokedError(_ERR_EDGE_REVOKED)
+        sb = self._registry.get_sandbox(addr)
+        if sb is None or sb.status == _STATUS_REVOKED:
+            raise RevokedError(_ERR_EDGE_REVOKED)
+        with self._meta_lock:
+            target_fenced = (addr, sb.incarnation_id) in self._fenced_targets
+        if target_fenced:
+            raise RevokedError(_ERR_EDGE_REVOKED)
+
     def _assert_targets_not_revoked(
         self, caller_actor: str, target_addrs: Sequence[str]
     ) -> None:
         with self._meta_lock:
-            if caller_actor in self._fenced_addrs:
-                raise RevokedError(_ERR_EDGE_REVOKED)
+            caller_fenced = caller_actor in self._fenced_addrs
+        if caller_fenced:
+            raise RevokedError(_ERR_EDGE_REVOKED)
         for addr in target_addrs:
-            with self._meta_lock:
-                if addr in self._fenced_addrs:
-                    raise RevokedError(_ERR_EDGE_REVOKED)
-            sb = self._registry.get_sandbox(addr)
-            if sb is None or sb.status == _STATUS_REVOKED:
-                raise RevokedError(_ERR_EDGE_REVOKED)
-            with self._meta_lock:
-                if (addr, sb.incarnation_id) in self._fenced_targets:
-                    raise RevokedError(_ERR_EDGE_REVOKED)
+            self._assert_single_target_not_revoked(addr)
 
     def _wait_loop_locked(
         self,
