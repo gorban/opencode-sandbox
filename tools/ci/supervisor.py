@@ -57,7 +57,7 @@ def signal_child(pid, sig):
         return False
     try:
         # A pidfd names one process, and waitid additionally proves it is our child.
-        if os.waitid(os.P_PIDFD, fd, WAIT_FLAGS) is not None:
+        if os.waitid(os.P_PIDFD, fd, WAIT_FLAGS | WAIT_ALL_CHILDREN) is not None:
             return False
         signal.pidfd_send_signal(fd, sig)
         if sig == signal.SIGTERM:
@@ -160,7 +160,7 @@ def supervise():
     try:
         signal.pidfd_send_signal(fd, 0)
         try:
-            os.waitid(os.P_PIDFD, fd, WAIT_FLAGS)
+            os.waitid(os.P_PIDFD, fd, WAIT_FLAGS | WAIT_ALL_CHILDREN)
         except ChildProcessError:
             pass  # The supervisor is never its own child.
         else:

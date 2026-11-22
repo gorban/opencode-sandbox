@@ -1,6 +1,8 @@
 """Test exact-revision admission and the publisher's untrusted boundaries."""
 
 from datetime import datetime, timezone
+from io import BytesIO, StringIO
+import shutil
 import os
 from pathlib import Path
 import sys
@@ -9,13 +11,16 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools' / 'ci'))
 
+import core_coverage as wheel
 import sonar_checkout as checkout
 import sonar_cloud as cloud
 import sonar_coverage as coverage
 from sonar_exec import PublishError, capture
+import sonar_http as http
 import sonar_publish as publish
 import sonar_sandbox as sandbox
 import sonar_state as state
@@ -29,6 +34,110 @@ SINCE = datetime(2026, 11, 21, 19, 12, 1, tzinfo=timezone.utc)
 REVISION = checkout.Revision(HEAD, BASE, 36, 'fix/readme', 'fork/opencode-sandbox')
 COUNTS = {'lines_to_cover': 1, 'uncovered_lines': 0, 'conditions_to_cover': 2, 'uncovered_conditions': 1}
 PATH = 'core.py'
+
+
+class TrustAnchorTransportTest(unittest.TestCase):
+    def setUp(self):
+        opener = patch('urllib.request.OpenerDirector.open', side_effect=AssertionError('generic URL opener used'))
+        opener.start()
+        self.addCleanup(opener.stop)
+
+    def test_pinned_wheel_uses_binary_mode_only(self):
+        class WheelResponse(BytesIO):
+            status = 200
+
+        with patch.object(http, 'HTTPSConnection', create=True) as connect:
+            connect.return_value.getresponse.return_value = WheelResponse(b'wheel')
+            self.assertEqual(http.request(wheel.WHEEL, 300_000, 'wheel'), b'wheel')
+            connect.assert_called_once_with('files.pythonhosted.org', timeout=12)
+            request = connect.return_value.request.call_args
+            self.assertEqual(request.args, ('GET', urlsplit(wheel.WHEEL).path))
+            self.assertNotIn('Accept', request.kwargs['headers'])
+        for url, mode in ((wheel.WHEEL, 'api'), (wheel.WHEEL + '?changed=1', 'wheel')):
+            with self.subTest(url=url, mode=mode), self.assertRaises(ValueError):
+                http.request(url, 300_000, mode)
+
+    def test_store_cleanup_attempts_both_directories_and_preserves_error(self):
+        with TemporaryDirectory() as directory:
+            parent = Path(directory)
+            runtime = parent / 'runtime'
+            runtime.mkdir()
+            root = parent / 'root'
+            remove = shutil.rmtree
+            failure = PublishError('verification failed')
+            stderr = StringIO()
+
+            def remove_tree(path):
+                if path == runtime:
+                    raise PermissionError('fixture runtime cleanup failure')
+                remove(path)
+
+            with patch.object(sandbox, 'owner_directory'), patch.object(sandbox.tempfile, 'mkdtemp',
+                    return_value=str(runtime)), patch.object(sandbox, 'Store', side_effect=failure), \
+                    patch.object(sandbox.shutil, 'rmtree', side_effect=remove_tree), \
+                    patch.object(sys, 'stderr', stderr):
+                with self.assertRaises(PublishError) as result, sandbox.private_store(root):
+                    self.fail('unverified store admitted')
+            self.assertIs(result.exception, failure)
+            self.assertFalse(root.exists())
+            self.assertTrue(runtime.is_dir())
+            self.assertIn(str(runtime), stderr.getvalue())
+            self.assertIn('fixture runtime cleanup failure', stderr.getvalue())
+            self.assertIn('fixture runtime cleanup failure', failure.__notes__[0])
+
+    def test_worker_contacts_only_fixed_origins_and_never_follows_redirects(self):
+        class RedirectResponse(BytesIO):
+            status = 302
+
+        with patch.object(http, 'HTTPSConnection', create=True) as connect:
+            for url in ('http://sonarcloud.io/api', 'https://sonarcloud.io@other.invalid/api',
+                        'https://sonarcloud.io:443/api', 'https://sonarcloud.io//other.invalid/api'):
+                with self.subTest(url=url), self.assertRaises(ValueError):
+                    http.request(url, 8)
+            connect.assert_not_called()
+            connect.return_value.getresponse.return_value = RedirectResponse()
+            with self.assertRaises(HTTPError) as failure:
+                http.request('https://sonarcloud.io/api?component=example', 8)
+            self.assertEqual(failure.exception.code, 302)
+            failure.exception.close()
+            connect.assert_called_once_with('sonarcloud.io', timeout=12)
+            connect.return_value.request.assert_called_once_with(
+                'GET', '/api?component=example',
+                headers={'User-Agent': 'opencode-sandbox-sonar-publisher', 'Accept': 'application/json'},
+            )
+            connect.return_value.close.assert_called_once_with()
+
+    def test_download_has_one_deadline_and_preserves_only_http_status(self):
+        url = 'https://sonarcloud.io/api'
+        with patch.object(cloud, 'urlopen', side_effect=AssertionError('direct fetch'), create=True), \
+                patch.object(cloud, 'capture', side_effect=[(0, b'{}', b''), (1, b'', b'404\n')], create=True) as call:
+            self.assertEqual(cloud.download(url, 8), b'{}')
+            self.assertEqual(call.call_args.kwargs['timeout'], 12)
+            self.assertEqual(call.call_args.kwargs['limit'], 16)
+            with self.assertRaises(HTTPError) as failure:
+                cloud.download(url, 8)
+            self.assertEqual(failure.exception.code, 404)
+            failure.exception.close()
+
+    def test_store_initialization_failure_removes_only_private_paths(self):
+        for failed_at in ('constructor', 'verification'):
+            with self.subTest(failed_at=failed_at), TemporaryDirectory() as directory:
+                parent = Path(directory)
+                runtime = parent / 'private-runtime'
+                runtime.mkdir()
+                root = parent / 'private-store'
+                sentinel = parent / 'untouched'
+                sentinel.touch()
+                with patch.object(sandbox, 'owner_directory'), patch.object(sandbox.tempfile, 'mkdtemp',
+                        return_value=str(runtime)), patch.object(sandbox, 'Store') as store:
+                    if failed_at == 'constructor':
+                        store.side_effect = PublishError('fixture failure')
+                    else:
+                        store.return_value.verify.side_effect = PublishError('fixture failure')
+                    with self.assertRaises(PublishError), sandbox.private_store(root):
+                        self.fail('unverified store admitted')
+                    store.return_value.cleanup.assert_not_called()
+                self.assertEqual(list(parent.iterdir()), [sentinel])
 
 
 def github_pr():
