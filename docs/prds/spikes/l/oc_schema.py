@@ -760,6 +760,23 @@ def _validate_doc_header(
     return obj_id
 
 
+def _is_digest_image(ref: object) -> bool:
+    return type(ref) is str and DIGEST_IMAGE_RE.fullmatch(ref) is not None
+
+
+def _validate_images_by_arch(
+    images_by_arch: object, context: str, arch_field: str
+) -> dict[str, str]:
+    if not isinstance(images_by_arch, dict) or not images_by_arch:
+        raise SchemaError(f"{context}: {arch_field} must be a non-empty table")
+    for arch, ref in images_by_arch.items():
+        if arch not in ("x86_64", "arm64"):
+            raise SchemaError(f"Unsupported arch in {arch_field}: {arch!r}")
+        if not _is_digest_image(ref):
+            raise SchemaError(f"{context}: {arch_field}.{arch} must be digest-pinned")
+    return images_by_arch
+
+
 def _validate_digest_images(
     image: object,
     images_by_arch: object,
@@ -768,19 +785,16 @@ def _validate_digest_images(
     image_field: str = "image",
     arch_field: str = "images_by_arch",
 ) -> tuple[str | None, dict[str, str] | None]:
-    if image is not None and (type(image) is not str or DIGEST_IMAGE_RE.fullmatch(image) is None):
+    if image is not None and not _is_digest_image(image):
         raise SchemaError(f"{context}: {image_field} must be digest-pinned (@sha256:...)")
-    if images_by_arch is not None:
-        if not isinstance(images_by_arch, dict) or not images_by_arch:
-            raise SchemaError(f"{context}: {arch_field} must be a non-empty table")
-        for arch, ref in images_by_arch.items():
-            if arch not in ("x86_64", "arm64"):
-                raise SchemaError(f"Unsupported arch in {arch_field}: {arch!r}")
-            if type(ref) is not str or DIGEST_IMAGE_RE.fullmatch(ref) is None:
-                raise SchemaError(f"{context}: {arch_field}.{arch} must be digest-pinned")
-    if image is None and images_by_arch is None:
+    norm_by_arch = (
+        _validate_images_by_arch(images_by_arch, context, arch_field)
+        if images_by_arch is not None
+        else None
+    )
+    if image is None and norm_by_arch is None:
         raise SchemaError(f"{context} requires digest-pinned {image_field} or {arch_field}")
-    return image, images_by_arch
+    return image, norm_by_arch
 
 
 def _validate_service_resources(resources: object, svc_id: str) -> dict[str, Any]:

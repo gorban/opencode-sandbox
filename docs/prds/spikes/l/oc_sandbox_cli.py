@@ -192,13 +192,94 @@ def _run_config_diff(store: HostConfigStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _redact_mcp_for_cli(mcp_map: dict[str, Any]) -> dict[str, Any]:
+    return {
+        name: {
+            "type": cfg["type"],
+            "url": cfg["url"],
+            "artifact_id": cfg["artifact_id"],
+            "args": cfg["args"],
+            "tools": cfg["tools"],
+            "read_only_tools": cfg["read_only_tools"],
+            "write_tools": cfg["write_tools"],
+        }
+        for name, cfg in mcp_map.items()
+    }
+
+
+def _redact_doc_for_cli(kind: str, doc: dict[str, Any]) -> dict[str, Any]:
+    """Project config documents to display-safe fields without printing credential references."""
+    if kind == "service":
+        return {
+            "schema_version": doc["schema_version"],
+            "kind": doc["kind"],
+            "id": doc["id"],
+            "description": doc["description"],
+            "image": doc["image"],
+            "images_by_arch": doc["images_by_arch"],
+            "provides": doc["provides"],
+            "requires": doc["requires"],
+            "cardinality": doc["cardinality"],
+            "instance_port": doc["instance_port"],
+            "fallback_service": doc["fallback_service"],
+            "required_capabilities": doc["required_capabilities"],
+            "security_profile": doc["security_profile"],
+            "factory_id": doc["factory_id"],
+            "resources": doc["resources"],
+            "endpoints": doc["endpoints"],
+            "volumes": doc["volumes"],
+            "secret_slot_names": [s["slot"] for s in doc["secret_slots"]],
+            "env": doc["env"],
+            "readiness_probe": doc["readiness_probe"],
+            "mise_tools": doc["mise_tools"],
+        }
+    if kind == "bundle":
+        return {
+            "schema_version": doc["schema_version"],
+            "kind": doc["kind"],
+            "id": doc["id"],
+            "description": doc["description"],
+            "includes": doc["includes"],
+            "composition": doc["composition"],
+            "requires_services": doc["requires_services"],
+            "local_services": doc["local_services"],
+            "mcp": _redact_mcp_for_cli(doc["mcp"]),
+            "skills": doc["skills"],
+            "persona": doc["persona"],
+            "subagents": doc["subagents"],
+            "instructions": doc["instructions"],
+            "prompt_slots": doc["prompt_slots"],
+            "mise_tools": doc["mise_tools"],
+        }
+    if kind == "worker":
+        return {
+            "schema_version": doc["schema_version"],
+            "kind": doc["kind"],
+            "id": doc["id"],
+            "description": doc["description"],
+            "host_provider": doc["host_provider"],
+            "transport": doc["transport"],
+            "arch": doc["arch"],
+            "os": doc["os"],
+            "capabilities_override": doc["capabilities_override"],
+            "lease_limits": doc["lease_limits"],
+        }
+    return {
+        "schema_version": doc["schema_version"],
+        "kind": doc["kind"],
+        "id": doc["id"],
+        "description": doc.get("description", ""),
+    }
+
+
 def _run_config_cmd(store: HostConfigStore, args: argparse.Namespace) -> int:
     if args.cfg_cmd == "validate":
         return _run_config_validate(args)
     if args.cfg_cmd == "diff":
         return _run_config_diff(store, args)
     if args.cfg_cmd == "show":
-        print(json.dumps(store.get(args.kind, args.id), indent=2, sort_keys=True))
+        view = _redact_doc_for_cli(args.kind, store.get(args.kind, args.id))
+        print(json.dumps(view, indent=2, sort_keys=True))
         return 0
     simple_handlers = {
         "list": lambda: store.list_ids(args.kind, include_archived=args.include_archived),
@@ -223,7 +304,8 @@ def _run_worker_cmd(store: HostConfigStore, args: argparse.Namespace) -> int:
         print(json.dumps(store.list_ids("worker"), indent=2))
         return 0
     if args.wrk_cmd == "show":
-        print(json.dumps(store.get("worker", args.id), indent=2, sort_keys=True))
+        view = _redact_doc_for_cli("worker", store.get("worker", args.id))
+        print(json.dumps(view, indent=2, sort_keys=True))
         return 0
     return 2
 
