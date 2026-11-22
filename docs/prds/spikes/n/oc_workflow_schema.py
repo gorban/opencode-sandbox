@@ -28,6 +28,7 @@ MAX_AST_DEPTH = 8
 MAX_IN_ITEMS = 16
 MAX_PREDICATE_STR_BYTES = 128
 MAX_EXCERPT_BYTES_CAP = 512
+MAX_SPEND_MICROUSD = 1_000_000_000  # $1,000.00 upper bound per workflow run
 
 ALLOWED_MODES = frozenset({"statechart", "fleet_supervisor"})
 AUTONOMY_ORDER: Mapping[str, int] = {
@@ -135,6 +136,16 @@ class TemplateValidationError(WorkflowSchemaError):
     """Raised when a workflow template violates single-pass placeholder constraints."""
 
 
+def _validate_char(ch: str, field: str, *, allow_multiline: bool) -> None:
+    code = ord(ch)
+    if code == 0 or code in _BIDI_CODEPOINTS:
+        raise WorkflowSchemaError(f"{field}: forbidden NUL or BiDi control character")
+    if allow_multiline and ch in ("\n", "\t"):
+        return
+    if code < 0x20 or code == 0x7F or (0x80 <= code <= 0x9F):
+        raise WorkflowSchemaError(f"{field}: forbidden control character 0x{code:02x}")
+
+
 def validate_clean_str(
     value: Any,
     field: str,
@@ -148,17 +159,14 @@ def validate_clean_str(
         raise WorkflowSchemaError(f"{field}: expected str")
     if not allow_empty and not value:
         raise WorkflowSchemaError(f"{field}: must not be empty")
-    raw = value.encode("utf-8")
+    try:
+        raw = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise WorkflowSchemaError(f"{field}: invalid UTF-8 surrogate sequence") from exc
     if max_bytes is not None and len(raw) > max_bytes:
         raise WorkflowSchemaError(f"{field}: exceeds {max_bytes} bytes")
     for ch in value:
-        code = ord(ch)
-        if code == 0 or code in _BIDI_CODEPOINTS:
-            raise WorkflowSchemaError(f"{field}: forbidden NUL or BiDi control character")
-        if allow_multiline and ch in ("\n", "\t"):
-            continue
-        if code < 0x20 or code == 0x7F or (0x80 <= code <= 0x9F):
-            raise WorkflowSchemaError(f"{field}: forbidden control character 0x{code:02x}")
+        _validate_char(ch, field, allow_multiline=allow_multiline)
     return value
 
 
@@ -201,14 +209,17 @@ def _to_finite_decimal(value: Any, field: str) -> Decimal:
 
 
 def parse_microdollars(value: Any, field: str) -> int:
-    """Parse non-negative USD amount (<= 6 decimal places) to exact integer microdollars."""
+    """Parse non-negative USD amount (<= 6 decimal places, <= $1,000) to exact integer microdollars."""
     dec = _to_finite_decimal(value, field)
     if dec < 0:
         raise WorkflowSchemaError(f"{field}: must be >= 0")
     scaled = dec * Decimal(1_000_000)
-    if scaled != int(scaled):
+    if scaled != scaled.to_integral_value():
         raise WorkflowSchemaError(f"{field}: exceeds 6 decimal places (sub-microdollar)")
-    return int(scaled)
+    micro = int(scaled)
+    if micro > MAX_SPEND_MICROUSD:
+        raise WorkflowSchemaError(f"{field}: exceeds maximum allowed ceiling")
+    return micro
 
 
 def parse_basis_points(value: Any, field: str) -> int:
@@ -217,7 +228,7 @@ def parse_basis_points(value: Any, field: str) -> int:
     if dec < 0 or dec > 1:
         raise WorkflowSchemaError(f"{field}: must be in [0, 1]")
     scaled = dec * Decimal(10_000)
-    if scaled != int(scaled):
+    if scaled != scaled.to_integral_value():
         raise WorkflowSchemaError(f"{field}: exceeds 4 decimal places")
     return int(scaled)
 
@@ -334,9 +345,11 @@ def _scalar_type_tag(val: _ScalarValue) -> str:
     raise PredicateValidationError(f"unsupported scalar type {type(val).__name__}")
 
 
-def _extract_literal_scalar(node: ast.AST) -> _ScalarValue:
+def _extract_literal_scalar(node: ast.AST, *, allow_usub: bool = True) -> _ScalarValue:
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        inner = _extract_literal_scalar(node.operand)
+        if not allow_usub or not isinstance(node.operand, ast.Constant):
+            raise PredicateValidationError("unary '-' permitted only once directly on a numeric literal")
+        inner = _extract_literal_scalar(node.operand, allow_usub=False)
         if _scalar_type_tag(inner) != "num":
             raise PredicateValidationError("unary '-' permitted only on numeric literals")
         return -inner  # type: ignore[operator]
@@ -533,18 +546,18 @@ def _eval_compare(node: ast.Compare, context: Mapping[str, Mapping[str, Any]]) -
             raise PredicateValidationError("RHS of 'in' must be a literal container")
         items = [_extract_literal_scalar(elt) for elt in right_node.elts]
         if _scalar_type_tag(items[0]) != left_tag:
-            return False
+            raise PredicateValidationError("runtime type mismatch in 'in' comparison")
         return any(left == item for item in items)
     right = _eval_node(right_node, context)
     right_tag = _scalar_type_tag(right)
     if left_tag != right_tag:
-        return False
+        raise PredicateValidationError("runtime type mismatch in comparison")
     if isinstance(op, ast.Eq):
         return bool(left == right)
     if isinstance(op, ast.NotEq):
         return bool(left != right)
     if left_tag == "bool":
-        return False
+        raise PredicateValidationError("ordering comparison not permitted on bool")
     if isinstance(op, ast.Lt):
         return bool(left < right)
     if isinstance(op, ast.LtE):
@@ -553,7 +566,7 @@ def _eval_compare(node: ast.Compare, context: Mapping[str, Mapping[str, Any]]) -
         return bool(left > right)
     if isinstance(op, ast.GtE):
         return bool(left >= right)
-    return False
+    raise PredicateValidationError("unsupported comparison operator")
 
 
 def evaluate_predicate(
@@ -1103,6 +1116,38 @@ def _parse_effects(raw: Any, field: str) -> tuple[str, ...]:
     return tuple(sorted(set(items)))
 
 
+def _parse_single_state(
+    idx: int,
+    item: Any,
+    seen: set[str],
+    *,
+    is_builtin: bool,
+    allowlisted_factories: frozenset[str],
+) -> StateSpec:
+    _reject_unknown_keys(item, frozenset({"name", "shape", "effects", "factory_id"}), f"states[{idx}]")
+    name = validate_clean_str(item.get("name"), f"states[{idx}].name", max_bytes=64)
+    if not _FIELD_RE.match(name) or name in seen:
+        raise WorkflowSchemaError(f"states[{idx}].name: invalid or duplicate {name!r}")
+    seen.add(name)
+    shape = validate_clean_str(item.get("shape", "observe"), f"states[{idx}].shape", max_bytes=32)
+    if shape not in ALLOWED_STATE_SHAPES:
+        raise WorkflowSchemaError(f"states[{idx}].shape: unsupported {shape!r}")
+    factory_id: str | None = None
+    raw_factory = item.get("factory_id")
+    if raw_factory is not None:
+        factory_id = validate_clean_str(raw_factory, f"states[{idx}].factory_id", max_bytes=64)
+        if not is_builtin and factory_id not in allowlisted_factories:
+            raise WorkflowSchemaError(
+                f"states[{idx}].factory_id: mutable workflow cannot reference non-allowlisted factory {factory_id!r}"
+            )
+    return StateSpec(
+        name=name,
+        shape=shape,
+        effects=_parse_effects(item.get("effects"), f"states[{idx}].effects"),
+        factory_id=factory_id,
+    )
+
+
 def _parse_states(
     raw_states: Any,
     *,
@@ -1116,32 +1161,12 @@ def _parse_states(
     if len(raw_states) > MAX_STATES:
         raise WorkflowSchemaError(f"states: exceeds maximum of {MAX_STATES}")
     seen: set[str] = set()
-    parsed: list[StateSpec] = []
-    for idx, item in enumerate(raw_states):
-        _reject_unknown_keys(item, frozenset({"name", "shape", "effects", "factory_id"}), f"states[{idx}]")
-        name = validate_clean_str(item.get("name"), f"states[{idx}].name", max_bytes=64)
-        if not _FIELD_RE.match(name) or name in seen:
-            raise WorkflowSchemaError(f"states[{idx}].name: invalid or duplicate {name!r}")
-        seen.add(name)
-        shape = validate_clean_str(item.get("shape", "observe"), f"states[{idx}].shape", max_bytes=32)
-        if shape not in ALLOWED_STATE_SHAPES:
-            raise WorkflowSchemaError(f"states[{idx}].shape: unsupported {shape!r}")
-        factory_id: str | None = None
-        if "factory_id" in item and item["factory_id"] is not None:
-            factory_id = validate_clean_str(item["factory_id"], f"states[{idx}].factory_id", max_bytes=64)
-            if not is_builtin and factory_id not in allowlisted_factories:
-                raise WorkflowSchemaError(
-                    f"states[{idx}].factory_id: mutable workflow cannot reference non-allowlisted factory {factory_id!r}"
-                )
-        parsed.append(
-            StateSpec(
-                name=name,
-                shape=shape,
-                effects=_parse_effects(item.get("effects"), f"states[{idx}].effects"),
-                factory_id=factory_id,
-            )
+    return tuple(
+        _parse_single_state(
+            idx, item, seen, is_builtin=is_builtin, allowlisted_factories=allowlisted_factories
         )
-    return tuple(parsed)
+        for idx, item in enumerate(raw_states)
+    )
 
 
 def _parse_transitions(raw_transitions: Any, state_names: frozenset[str]) -> tuple[TransitionSpec, ...]:
@@ -1205,6 +1230,37 @@ def _parse_signal_handlers(raw_signals: Any) -> tuple[SignalHandlerSpec, ...]:
     return tuple(out)
 
 
+def _parse_workflow_header(doc: Mapping[str, Any], *, is_builtin: bool) -> dict[str, Any]:
+    schema_version = parse_strict_int(doc.get("schema_version"), "schema_version", min_val=1, max_val=1)
+    kind = validate_clean_str(doc.get("kind"), "kind", max_bytes=32)
+    if kind != "workflow@1":
+        raise WorkflowSchemaError("kind must be 'workflow@1'")
+    wf_id, id_ns, id_slug = parse_namespaced_id(doc.get("id"), "id")
+    if is_builtin != (id_ns == "builtin"):
+        raise WorkflowSchemaError("workflow id namespace must match builtin/mutable origin")
+    mode = validate_clean_str(doc.get("mode"), "mode", max_bytes=32)
+    if mode not in ALLOWED_MODES:
+        raise WorkflowSchemaError(f"mode: unsupported {mode!r}")
+    autonomy = validate_clean_str(doc.get("autonomy"), "autonomy", max_bytes=32)
+    if autonomy not in AUTONOMY_ORDER:
+        raise WorkflowSchemaError(f"autonomy: unsupported {autonomy!r}")
+    skill_id, skill_ns, skill_slug = parse_namespaced_id(doc.get("orchestrator_skill"), "orchestrator_skill")
+    return {
+        "autonomy": autonomy,
+        "description": validate_clean_str(doc.get("description", ""), "description", allow_multiline=True, max_bytes=1024, allow_empty=True),
+        "id": wf_id,
+        "id_namespace": id_ns,
+        "id_slug": id_slug,
+        "kind": kind,
+        "mode": mode,
+        "orchestrator_skill": skill_id,
+        "schema_version": schema_version,
+        "skill_namespace": skill_ns,
+        "skill_slug": skill_slug,
+        "survives_restart": parse_strict_bool(doc.get("survives_restart", True), "survives_restart"),
+    }
+
+
 def parse_and_validate_workflow_toml(
     raw_toml: str,
     *,
@@ -1215,34 +1271,15 @@ def parse_and_validate_workflow_toml(
     if not isinstance(raw_toml, str) or not raw_toml.strip():
         raise WorkflowSchemaError("workflow TOML must be a non-empty string")
     try:
-        doc = tomllib.loads(raw_toml)
+        doc = tomllib.loads(raw_toml, parse_float=Decimal)
     except tomllib.TOMLDecodeError as exc:
         raise WorkflowSchemaError(f"invalid TOML: {exc}") from exc
 
     _reject_unknown_keys(doc, _TOP_LEVEL_KEYS, "workflow")
-    schema_version = parse_strict_int(doc.get("schema_version"), "schema_version", min_val=1, max_val=1)
-    kind = validate_clean_str(doc.get("kind"), "kind", max_bytes=32)
-    if kind != "workflow@1":
-        raise WorkflowSchemaError("kind must be 'workflow@1'")
-
-    wf_id, id_ns, id_slug = parse_namespaced_id(doc.get("id"), "id")
-    if is_builtin and id_ns != "builtin":
-        raise WorkflowSchemaError("builtin workflow must use 'builtin/<slug>' id")
-    if not is_builtin and id_ns == "builtin":
-        raise WorkflowSchemaError("mutable workflow cannot claim 'builtin/<slug>' id")
-
-    mode = validate_clean_str(doc.get("mode"), "mode", max_bytes=32)
-    if mode not in ALLOWED_MODES:
-        raise WorkflowSchemaError(f"mode: unsupported {mode!r}")
-    description = validate_clean_str(doc.get("description", ""), "description", allow_multiline=True, max_bytes=1024, allow_empty=True)
-    autonomy = validate_clean_str(doc.get("autonomy"), "autonomy", max_bytes=32)
-    if autonomy not in AUTONOMY_ORDER:
-        raise WorkflowSchemaError(f"autonomy: unsupported {autonomy!r}")
-    skill_id, skill_ns, skill_slug = parse_namespaced_id(doc.get("orchestrator_skill"), "orchestrator_skill")
-    survives_restart = parse_strict_bool(doc.get("survives_restart", True), "survives_restart")
-
+    header = _parse_workflow_header(doc, is_builtin=is_builtin)
     if "scope" not in doc or "limits" not in doc:
         raise WorkflowSchemaError("workflow requires [scope] and [limits] tables")
+
     scope = _parse_scope(doc["scope"])
     limits = _parse_limits(doc["limits"])
     sys1, blind, disclosure = _parse_supervision(doc.get("supervision"))
@@ -1253,23 +1290,12 @@ def parse_and_validate_workflow_toml(
     timers = _parse_timers(doc.get("timers"))
     signal_handlers = _parse_signal_handlers(doc.get("signal_handlers"))
 
-    if mode == "statechart" and not states:
+    if header["mode"] == "statechart" and not states:
         raise WorkflowSchemaError("statechart mode requires at least one state")
 
     rubric_digest = domain_sha256(RUBRIC_DIGEST_DOMAIN, sys1.rubric_payload()) if sys1 is not None else None
     provisional = WorkflowSpec(
-        schema_version=schema_version,
-        kind=kind,
-        id=wf_id,
-        id_namespace=id_ns,
-        id_slug=id_slug,
-        mode=mode,
-        description=description,
-        autonomy=autonomy,
-        orchestrator_skill=skill_id,
-        skill_namespace=skill_ns,
-        skill_slug=skill_slug,
-        survives_restart=survives_restart,
+        **header,
         scope=scope,
         limits=limits,
         excerpt_disclosure=disclosure,
@@ -1285,9 +1311,7 @@ def parse_and_validate_workflow_toml(
         candidate_rubric_digest=rubric_digest,
     )
     spec_digest = domain_sha256(SPEC_DIGEST_DOMAIN, provisional.to_canonical_dict())
-    return WorkflowSpec(
-        **{**provisional.__dict__, "spec_digest": spec_digest}
-    )
+    return WorkflowSpec(**{**provisional.__dict__, "spec_digest": spec_digest})
 
 
 # --- Directional compute_security_delta() ---
@@ -1320,30 +1344,32 @@ def _predicates_signature(spec: WorkflowSpec) -> tuple[tuple[str, str, str | Non
     return tuple((t.src, t.dst, t.predicate.source if t.predicate else None) for t in spec.transitions)
 
 
-def _autonomy_widened(old: WorkflowSpec, new: WorkflowSpec) -> bool:
-    if AUTONOMY_ORDER[new.autonomy] > AUTONOMY_ORDER[old.autonomy]:
-        return True
-    if TARGET_SELECTOR_ORDER[new.scope.target_selector] > TARGET_SELECTOR_ORDER[old.scope.target_selector]:
-        return True
-    if not set(new.scope.bound_targets).issubset(set(old.scope.bound_targets)):
-        return True
-    if not old.scope.allow_remote_workers and new.scope.allow_remote_workers:
-        return True
-    if old.limits.defer_nudge_during_human_lease and not new.limits.defer_nudge_during_human_lease:
-        return True
+def _limits_autonomy_widened(old_lim: LimitsSpec, new_lim: LimitsSpec) -> bool:
     cap_widened = (
-        new.limits.max_nudges_per_target_per_hour > old.limits.max_nudges_per_target_per_hour
-        or new.limits.max_total_nudges_per_run > old.limits.max_total_nudges_per_run
-        or new.limits.fleet_max_concurrent_checks > old.limits.fleet_max_concurrent_checks
-        or new.limits.fleet_max_checks_per_hour > old.limits.fleet_max_checks_per_hour
-        or new.limits.max_open_inbox_items > old.limits.max_open_inbox_items
+        new_lim.max_nudges_per_target_per_hour > old_lim.max_nudges_per_target_per_hour
+        or new_lim.max_total_nudges_per_run > old_lim.max_total_nudges_per_run
+        or new_lim.fleet_max_concurrent_checks > old_lim.fleet_max_concurrent_checks
+        or new_lim.fleet_max_checks_per_hour > old_lim.fleet_max_checks_per_hour
+        or new_lim.max_open_inbox_items > old_lim.max_open_inbox_items
     )
     interval_shortened = (
-        new.limits.min_nudge_interval_s < old.limits.min_nudge_interval_s
-        or new.limits.throttle_period_s < old.limits.throttle_period_s
-        or new.limits.tick_interval_s < old.limits.tick_interval_s
+        new_lim.min_nudge_interval_s < old_lim.min_nudge_interval_s
+        or new_lim.throttle_period_s < old_lim.throttle_period_s
+        or new_lim.tick_interval_s < old_lim.tick_interval_s
+        or new_lim.wake_grace_after_host_sleep_s < old_lim.wake_grace_after_host_sleep_s
     )
     return cap_widened or interval_shortened
+
+
+def _autonomy_widened(old: WorkflowSpec, new: WorkflowSpec) -> bool:
+    scope_or_role_widened = (
+        AUTONOMY_ORDER[new.autonomy] > AUTONOMY_ORDER[old.autonomy]
+        or TARGET_SELECTOR_ORDER[new.scope.target_selector] > TARGET_SELECTOR_ORDER[old.scope.target_selector]
+        or not set(new.scope.bound_targets).issubset(set(old.scope.bound_targets))
+        or (not old.scope.allow_remote_workers and new.scope.allow_remote_workers)
+        or (old.limits.defer_nudge_during_human_lease and not new.limits.defer_nudge_during_human_lease)
+    )
+    return scope_or_role_widened or _limits_autonomy_widened(old.limits, new.limits)
 
 
 def _decisions_route_or_audit_weakened(old: WorkflowSpec, new: WorkflowSpec) -> bool:
@@ -1415,25 +1441,24 @@ def compute_security_delta(
         triggers = _creation_security_delta(new_spec)
         return tuple(t for t in SECURITY_DELTA_TRIGGERS if t in triggers)
 
-    triggers: set[str] = set()
-    if _autonomy_widened(old_spec, new_spec):
-        triggers.add("workflow_autonomy_widened")
-    if _decisions_route_or_audit_weakened(old_spec, new_spec):
-        triggers.add("workflow_decisions_route_added")
-    if _blocking_gate_signature(old_spec) != _blocking_gate_signature(new_spec):
-        triggers.add("workflow_blocking_gate_changed")
-    if old_spec.orchestrator_skill != new_spec.orchestrator_skill or (
-        old_skill_sha256 is not None and new_skill_sha256 is not None and old_skill_sha256 != new_skill_sha256
-    ):
-        triggers.add("workflow_skill_changed")
-    if old_spec.templates != new_spec.templates:
-        triggers.add("workflow_template_changed")
-    if old_spec.candidate_rubric_digest != new_spec.candidate_rubric_digest or _predicates_signature(old_spec) != _predicates_signature(new_spec):
-        triggers.add("workflow_rubric_or_predicate_changed")
-    if old_spec.default_surface != new_spec.default_surface:
-        triggers.add("workflow_default_surface_changed")
-    if _factories_signature(old_spec) != _factories_signature(new_spec):
-        triggers.add("workflow_factory_changed")
-    if _excerpt_disclosure_widened(old_spec.excerpt_disclosure, new_spec.excerpt_disclosure):
-        triggers.add("workflow_excerpt_disclosure_changed")
-    return tuple(t for t in SECURITY_DELTA_TRIGGERS if t in triggers)
+    skill_hash_changed = (
+        old_skill_sha256 is not None
+        and new_skill_sha256 is not None
+        and old_skill_sha256 != new_skill_sha256
+    )
+    checks: tuple[tuple[str, bool], ...] = (
+        ("workflow_autonomy_widened", _autonomy_widened(old_spec, new_spec)),
+        ("workflow_decisions_route_added", _decisions_route_or_audit_weakened(old_spec, new_spec)),
+        ("workflow_blocking_gate_changed", _blocking_gate_signature(old_spec) != _blocking_gate_signature(new_spec)),
+        ("workflow_skill_changed", old_spec.orchestrator_skill != new_spec.orchestrator_skill or skill_hash_changed),
+        ("workflow_template_changed", old_spec.templates != new_spec.templates),
+        (
+            "workflow_rubric_or_predicate_changed",
+            old_spec.candidate_rubric_digest != new_spec.candidate_rubric_digest
+            or _predicates_signature(old_spec) != _predicates_signature(new_spec),
+        ),
+        ("workflow_default_surface_changed", old_spec.default_surface != new_spec.default_surface),
+        ("workflow_factory_changed", _factories_signature(old_spec) != _factories_signature(new_spec)),
+        ("workflow_excerpt_disclosure_changed", _excerpt_disclosure_widened(old_spec.excerpt_disclosure, new_spec.excerpt_disclosure)),
+    )
+    return tuple(name for name, fired in checks if fired)

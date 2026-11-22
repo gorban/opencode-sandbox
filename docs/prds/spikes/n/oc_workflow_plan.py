@@ -7,12 +7,14 @@ import math
 import os
 import secrets
 import stat
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
 from oc_workflow_schema import (
     PLAN_DIGEST_DOMAIN,
+    SPEC_DIGEST_DOMAIN,
     WorkflowSpec,
     canonical_json_bytes,
     domain_sha256,
@@ -20,6 +22,16 @@ from oc_workflow_schema import (
 )
 
 MAX_SKILL_BYTES = 65_536
+SKILL_FILENAME = "SKILL.md"
+
+_STATE_SHAPE_EFFECTS: dict[str, frozenset[str]] = {
+    "ship_lane": frozenset({"spawn_lane", "acquire_lane_lease"}),
+    "scout_lane": frozenset({"spawn_lane", "acquire_lane_lease"}),
+    "parallel_lanes": frozenset({"spawn_lane", "acquire_lane_lease"}),
+    "deterministic": frozenset({"launch_sandbox"}),
+    "human_gate_async": frozenset({"pause_lane_gate"}),
+    "human_gate_blocking": frozenset({"blocking_gate"}),
+}
 
 OBSERVE_ONLY_ALLOWED_EFFECTS = frozenset(
     {
@@ -59,7 +71,12 @@ class MixedLaneRoleError(WorkflowPlanError):
 
 
 class LaneAuthorityError(WorkflowPlanError):
-    """Raised when a run lacks authority to nudge or observe a target incarnation."""
+    """Raised when a run lacks authority to nudge, act on, or observe a target incarnation."""
+
+
+def is_remote_target(sandbox_addr: str) -> bool:
+    """Return True for non-local sandbox addresses (anything outside 'local/...')."""
+    return not sandbox_addr.startswith("local/")
 
 
 @dataclass(frozen=True)
@@ -163,36 +180,42 @@ def compute_reachable_effects(spec: WorkflowSpec) -> frozenset[str]:
     """Compute the complete reachable effect closure across all workflow constructs."""
     effects: set[str] = set()
     if spec.autonomy != "observe_only":
-        effects.add("acquire_lane_lease")
-        effects.add("nudge_sandbox")
+        effects.update(("acquire_lane_lease", "nudge_sandbox"))
     if spec.system1 is not None:
         effects.add("call_decisions_model")
     if spec.blind_check is not None:
         effects.add("call_blind_check_model")
     for st in spec.states:
         effects.update(st.effects)
-        if st.shape in ("ship_lane", "scout_lane", "parallel_lanes"):
-            effects.update({"spawn_lane", "acquire_lane_lease"})
-        elif st.shape == "deterministic":
-            effects.add("launch_sandbox")
-        elif st.shape == "human_gate_async":
-            effects.add("pause_lane_gate")
-        elif st.shape == "human_gate_blocking":
-            effects.add("blocking_gate")
+        effects.update(_STATE_SHAPE_EFFECTS.get(st.shape, ()))
         if st.factory_id is not None:
             effects.add("invoke_factory")
-    for tr in spec.transitions:
-        effects.update(tr.effects)
-    for tm in spec.timers:
-        effects.update(tm.effects)
-    for sig in spec.signal_handlers:
-        effects.update(sig.effects)
-    if not effects:
-        effects.add("read_metrics")
-    return frozenset(effects)
+    for group in (spec.transitions, spec.timers, spec.signal_handlers):
+        for item in group:
+            effects.update(item.effects)
+    return frozenset(effects) if effects else frozenset({"read_metrics"})
 
 
-# --- Trusted ancestry, O_NOFOLLOW, O_NONBLOCK, and dir_fd helpers ---
+def recompute_plan_digests(plan: CompiledWorkflowPlan) -> tuple[str, str, str]:
+    """Recompute (spec_digest, skill_sha256, workflow_plan_digest) from live plan fields & bytes."""
+    spec_digest = domain_sha256(SPEC_DIGEST_DOMAIN, plan.spec.to_canonical_dict())
+    skill_sha256 = hashlib.sha256(plan.skill_bytes).hexdigest()
+    reachable = compute_reachable_effects(plan.spec)
+    plan_body = {
+        "blind_call_cost_microusd": plan.blind_call_cost_microusd,
+        "blind_route": plan.blind_route,
+        "decisions_call_cost_microusd": plan.decisions_call_cost_microusd,
+        "reachable_effects": sorted(reachable),
+        "skill_namespace": plan.spec.skill_namespace,
+        "skill_sha256": skill_sha256,
+        "skill_slug": plan.spec.skill_slug,
+        "spec_digest": spec_digest,
+    }
+    plan_digest = domain_sha256(PLAN_DIGEST_DOMAIN, plan_body)
+    return spec_digest, skill_sha256, plan_digest
+
+
+# --- Descriptor-anchored trusted traversal, O_NOFOLLOW, O_NONBLOCK, and dir_fd helpers ---
 
 
 def _is_root_owned_os_alias(path: Path, st: os.stat_result, checker: Callable[[Path], bool] | None) -> bool:
@@ -201,52 +224,166 @@ def _is_root_owned_os_alias(path: Path, st: os.stat_result, checker: Callable[[P
     return st.st_uid == 0
 
 
-def _verify_trusted_dir_ancestry(
+def _check_ancestor_ownership_and_mode(path: Path, st: os.stat_result, expected_uid: int) -> None:
+    if st.st_uid not in (0, expected_uid):
+        raise MaterializationError(f"ancestor owned by untrusted uid {st.st_uid}: {path}")
+    mode = stat.S_IMODE(st.st_mode)
+    is_root_sticky = st.st_uid == 0 and bool(st.st_mode & stat.S_ISVTX)
+    if (mode & 0o022) != 0 and not is_root_sticky:
+        raise MaterializationError(f"ancestor directory is group/world-writable ({oct(mode)}): {path}")
+
+
+def _resolve_verified_alias_target(
+    cur_fd: int,
+    part: str,
+    cur_path: Path,
+    *,
+    expected_uid: int,
+    root_alias_checker: Callable[[Path], bool] | None,
+    max_hops: int = 8,
+) -> int:
+    """Resolve an approved root-owned symlink alias hop-by-hop, verifying every intermediate target."""
+    link_raw = os.readlink(part, dir_fd=cur_fd)
+    target_path = Path(link_raw) if Path(link_raw).is_absolute() else (cur_path.parent / link_raw)
+    if ".." in target_path.parts:
+        raise MaterializationError(f"symlink alias contains '..' traversal: {cur_path} -> {link_raw}")
+    return _open_ancestor_chain_fd(
+        target_path,
+        expected_uid=expected_uid,
+        root_alias_checker=root_alias_checker,
+        remaining_hops=max_hops - 1,
+    )
+
+
+def _step_ancestor_fd(
+    cur_fd: int,
+    part: str,
+    cur_path: Path,
+    *,
+    expected_uid: int,
+    root_alias_checker: Callable[[Path], bool] | None,
+    remaining_hops: int,
+) -> int:
+    st = os.lstat(part, dir_fd=cur_fd)
+    if stat.S_ISLNK(st.st_mode):
+        if remaining_hops <= 0:
+            raise MaterializationError(f"symlink alias hop limit exceeded: {cur_path}")
+        if not _is_root_owned_os_alias(cur_path, st, root_alias_checker):
+            raise MaterializationError(f"user-owned symlink ancestor rejected: {cur_path}")
+        return _resolve_verified_alias_target(
+            cur_fd,
+            part,
+            cur_path,
+            expected_uid=expected_uid,
+            root_alias_checker=root_alias_checker,
+            max_hops=remaining_hops,
+        )
+    if not stat.S_ISDIR(st.st_mode):
+        raise MaterializationError(f"ancestor is not a directory: {cur_path}")
+    _check_ancestor_ownership_and_mode(cur_path, st, expected_uid)
+    next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
+    try:
+        _check_ancestor_ownership_and_mode(cur_path, os.fstat(next_fd), expected_uid)
+    except Exception:
+        os.close(next_fd)
+        raise
+    return next_fd
+
+
+def _open_ancestor_chain_fd(
+    path: Path,
+    *,
+    expected_uid: int,
+    root_alias_checker: Callable[[Path], bool] | None,
+    remaining_hops: int = 8,
+) -> int:
+    if not path.is_absolute() or ".." in path.parts:
+        raise MaterializationError(f"unsafe ancestor path rejected: {path}")
+    parts = path.parts
+    cur_fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
+    cur_path = Path(parts[0])
+    try:
+        for part in parts[1:]:
+            cur_path = cur_path / part
+            next_fd = _step_ancestor_fd(
+                cur_fd,
+                part,
+                cur_path,
+                expected_uid=expected_uid,
+                root_alias_checker=root_alias_checker,
+                remaining_hops=remaining_hops,
+            )
+            os.close(cur_fd)
+            cur_fd = next_fd
+        return cur_fd
+    except Exception:
+        os.close(cur_fd)
+        raise
+
+
+def _check_fd_not_in_forbidden_roots(root_fd: int, root: Path, forbidden_sandbox_roots: tuple[Path, ...]) -> None:
+    if not forbidden_sandbox_roots:
+        return
+    try:
+        resolved_root = Path(os.readlink(f"/proc/self/fd/{root_fd}")).resolve(strict=False)
+    except OSError:
+        resolved_root = root.resolve(strict=False)
+    root_st = os.fstat(root_fd)
+    for forbidden in forbidden_sandbox_roots:
+        resolved_forbidden = forbidden.resolve(strict=False)
+        if resolved_root == resolved_forbidden or resolved_forbidden in resolved_root.parents:
+            raise MaterializationError(f"path resolves inside forbidden sandbox root: {root}")
+        try:
+            forb_st = os.stat(resolved_forbidden)
+            if (root_st.st_dev, root_st.st_ino) == (forb_st.st_dev, forb_st.st_ino):
+                raise MaterializationError(f"directory inode matches forbidden sandbox root: {root}")
+        except OSError:
+            pass
+
+
+def _open_trusted_root_fd(
     root: Path,
     *,
     expected_uid: int,
     forbidden_sandbox_roots: tuple[Path, ...] = (),
     root_alias_checker: Callable[[Path], bool] | None = None,
-) -> Path:
-    if not root.is_absolute():
-        raise MaterializationError(f"trusted directory must be absolute: {root}")
+) -> int:
+    """Anchor traversal from '/' in dir_fds and return the verified 0o700 root_fd directly."""
+    if not root.is_absolute() or ".." in root.parts:
+        raise MaterializationError(f"trusted directory must be absolute without '..': {root}")
     parts = root.parts
-    cur = Path(parts[0])
-    # Check strict ancestors above root: root-owned OS aliases allowed, user symlinks rejected.
-    for part in parts[1:-1]:
-        cur = cur / part
-        st = os.lstat(cur)
-        if stat.S_ISLNK(st.st_mode):
-            if not _is_root_owned_os_alias(cur, st, root_alias_checker):
-                raise MaterializationError(f"user-owned symlink ancestor rejected: {cur}")
-            target_st = os.stat(cur)
-            if not stat.S_ISDIR(target_st.st_mode):
-                raise MaterializationError(f"symlink ancestor is not a directory: {cur}")
-        elif not stat.S_ISDIR(st.st_mode):
-            raise MaterializationError(f"ancestor is not a directory: {cur}")
+    if len(parts) < 2:
+        raise MaterializationError(f"filesystem root cannot be used as trusted root: {root}")
 
-    # Root itself must NEVER be a symlink, must be exact 0o700 and expected_uid.
-    root_st = os.lstat(root)
-    if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode):
-        raise MaterializationError(f"root must be a real directory (no symlink): {root}")
-    if root_st.st_uid != expected_uid:
-        raise MaterializationError(f"root owned by unexpected uid {root_st.st_uid}: {root}")
-    if stat.S_IMODE(root_st.st_mode) != 0o700:
-        raise MaterializationError(
-            f"root must have exact mode 0o700, got {oct(stat.S_IMODE(root_st.st_mode))}: {root}"
-        )
+    parent_fd = _open_ancestor_chain_fd(
+        root.parent,
+        expected_uid=expected_uid,
+        root_alias_checker=root_alias_checker,
+    )
+    try:
+        root_fd = os.open(parts[-1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:
+        raise MaterializationError(f"failed to open trusted root {root}: {exc}") from exc
+    finally:
+        os.close(parent_fd)
 
-    resolved_root = root.resolve(strict=True)
-    for forbidden in forbidden_sandbox_roots:
-        resolved_forbidden = forbidden.resolve(strict=False)
-        if resolved_root == resolved_forbidden or resolved_forbidden in resolved_root.parents:
-            raise MaterializationError(f"path resolves inside forbidden sandbox root: {root}")
-    return resolved_root
+    try:
+        root_st = os.fstat(root_fd)
+        if root_st.st_uid != expected_uid:
+            raise MaterializationError(f"root owned by unexpected uid {root_st.st_uid}: {root}")
+        if stat.S_IMODE(root_st.st_mode) != 0o700:
+            raise MaterializationError(
+                f"root must have exact mode 0o700, got {oct(stat.S_IMODE(root_st.st_mode))}: {root}"
+            )
+        _check_fd_not_in_forbidden_roots(root_fd, root, forbidden_sandbox_roots)
+        return root_fd
+    except Exception:
+        os.close(root_fd)
+        raise
 
 
-def _open_verified_dir_fd(parent_fd: int | None, name: str, *, expected_uid: int) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    fd = os.open(name, flags) if parent_fd is None else os.open(name, flags, dir_fd=parent_fd)
+def _open_verified_dir_fd(parent_fd: int, name: str, *, expected_uid: int) -> int:
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     try:
         st = os.fstat(fd)
         if st.st_uid != expected_uid:
@@ -275,21 +412,22 @@ def _read_skill_bytes_strict(
     skill_slug: str,
     *,
     expected_uid: int,
+    forbidden_sandbox_roots: tuple[Path, ...] = (),
     root_alias_checker: Callable[[Path], bool] | None = None,
 ) -> bytes:
-    """Read <skill_root>/<ns>/<slug>/SKILL.md strictly: 0o700 dirs, 0o600 reg file, O_NONBLOCK."""
-    _verify_trusted_dir_ancestry(
+    """Read <skill_root>/<ns>/<slug>/SKILL.md anchored strictly on verified root_fd."""
+    root_fd = _open_trusted_root_fd(
         skill_root,
         expected_uid=expected_uid,
+        forbidden_sandbox_roots=forbidden_sandbox_roots,
         root_alias_checker=root_alias_checker,
     )
-    root_fd = _open_verified_dir_fd(None, str(skill_root), expected_uid=expected_uid)
     ns_fd = slug_fd = file_fd = -1
     try:
         ns_fd = _open_verified_dir_fd(root_fd, skill_namespace, expected_uid=expected_uid)
         slug_fd = _open_verified_dir_fd(ns_fd, skill_slug, expected_uid=expected_uid)
         file_fd = os.open(
-            "SKILL.md",
+            SKILL_FILENAME,
             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=slug_fd,
         )
@@ -362,6 +500,7 @@ def compile_workflow_plan(
     skill_root: Path,
     model_catalog: ModelCatalog,
     allowlisted_factories: frozenset[str] = frozenset(),
+    forbidden_sandbox_roots: tuple[Path, ...] = (),
     expected_uid: int | None = None,
     root_alias_checker: Callable[[Path], bool] | None = None,
 ) -> CompiledWorkflowPlan:
@@ -395,6 +534,7 @@ def compile_workflow_plan(
         spec.skill_namespace,
         spec.skill_slug,
         expected_uid=uid,
+        forbidden_sandbox_roots=forbidden_sandbox_roots,
         root_alias_checker=root_alias_checker,
     )
     skill_sha256 = hashlib.sha256(skill_bytes).hexdigest()
@@ -424,21 +564,24 @@ def compile_workflow_plan(
     )
 
 
-# --- Live RunAuthorityStore, AdmissionReceipt & evaluate_admission ---
+# --- Live RunAuthorityStore (with fixture-owned budgets & incarnation tracking) ---
 
 
 @dataclass(frozen=True)
 class EffectiveTargetScope:
-    """Narrowed target scope bound into RunAuthorityRecord."""
+    """Narrowed target scope bound into RunAuthorityRecord, enforcing remote eligibility."""
 
     selector: str
     allowed_targets: frozenset[str]
     all_running_allowed: bool
+    allow_remote_workers: bool
 
     def is_non_vacuous(self) -> bool:
         return self.all_running_allowed or len(self.allowed_targets) > 0
 
     def allows(self, sandbox_addr: str) -> bool:
+        if not self.allow_remote_workers and is_remote_target(sandbox_addr):
+            return False
         if self.all_running_allowed:
             return True
         return sandbox_addr in self.allowed_targets
@@ -457,6 +600,10 @@ class WorkflowRunLease:
     expires_at_wall_s: float
     revoked: bool = False
 
+    def __post_init__(self) -> None:
+        if type(self.expires_at_wall_s) is bool or not math.isfinite(self.expires_at_wall_s):
+            raise AdmissionDeniedError("WorkflowRunLease.expires_at_wall_s must be a finite number")
+
 
 @dataclass(frozen=True)
 class AdmissionReceipt:
@@ -469,6 +616,30 @@ class AdmissionReceipt:
 
 
 @dataclass
+class _RunAccountingState:
+    """Fixture-owned per-(run_id, grant_generation) budget state derived from admitted limits."""
+
+    max_decisions_calls_per_hour: int
+    max_decisions_spend_microusd: int
+    max_blind_spend_microusd: int
+    min_nudge_interval_s: int
+    max_nudges_per_target_per_hour: int
+    max_total_nudges_per_run: int
+    decisions_call_times: deque[float]
+    decisions_spend_microusd_used: int = 0
+    blind_spend_microusd_used: int = 0
+    nudge_target_times: dict[TargetIncarnation, deque[float]] | None = None
+    total_nudges: int = 0
+    seen_dedupe_keys: set[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.nudge_target_times is None:
+            self.nudge_target_times = {}
+        if self.seen_dedupe_keys is None:
+            self.seen_dedupe_keys = set()
+
+
+@dataclass
 class RunAuthorityRecord:
     """Authoritative live in-memory run authority record."""
 
@@ -478,6 +649,7 @@ class RunAuthorityRecord:
     owner_role: CallerRole
     workflow_id: str
     workflow_plan_digest: str
+    approved_plan: CompiledWorkflowPlan
     admission_mode: AdmissionMode
     lane_access: LaneAccess
     effective_target_scope: EffectiveTargetScope
@@ -487,11 +659,51 @@ class RunAuthorityRecord:
 
 
 class RunAuthorityStore:
-    """Fixture-owned single source of live run authority."""
+    """Fixture-owned single source of live run authority, incarnation state, and run budgets."""
 
     def __init__(self) -> None:
         self._records: dict[str, RunAuthorityRecord] = {}
+        self._accounting: dict[tuple[str, int], _RunAccountingState] = {}
+        self._revoked_incarnations: set[TargetIncarnation] = set()
+        self._active_incarnations: dict[str, str] = {}
         self._next_gen = 1
+
+    def register_active_incarnation(self, target: TargetIncarnation) -> None:
+        if target in self._revoked_incarnations:
+            raise AuthorityError("TARGET_INCARNATION_REVOKED")
+        prev = self._active_incarnations.get(target.sandbox_addr)
+        if prev is not None and prev != target.incarnation_id:
+            self._revoked_incarnations.add(TargetIncarnation(target.sandbox_addr, prev))
+        self._active_incarnations[target.sandbox_addr] = target.incarnation_id
+
+    def revoke_target_incarnation(self, target: TargetIncarnation) -> None:
+        self._revoked_incarnations.add(target)
+        if self._active_incarnations.get(target.sandbox_addr) == target.incarnation_id:
+            del self._active_incarnations[target.sandbox_addr]
+
+    def is_incarnation_active(self, target: TargetIncarnation) -> bool:
+        if target in self._revoked_incarnations:
+            return False
+        active = self._active_incarnations.get(target.sandbox_addr)
+        return active is None or active == target.incarnation_id
+
+    def _init_accounting(self, record: RunAuthorityRecord) -> None:
+        lim = record.approved_plan.spec.limits
+        self._accounting[(record.run_id, record.grant_generation)] = _RunAccountingState(
+            max_decisions_calls_per_hour=lim.max_decisions_calls_per_hour,
+            max_decisions_spend_microusd=lim.max_decisions_spend_microusd,
+            max_blind_spend_microusd=lim.max_blind_check_spend_microusd,
+            min_nudge_interval_s=lim.min_nudge_interval_s,
+            max_nudges_per_target_per_hour=lim.max_nudges_per_target_per_hour,
+            max_total_nudges_per_run=lim.max_total_nudges_per_run,
+            decisions_call_times=deque(),
+        )
+
+    def _get_accounting(self, run_id: str, grant_generation: int) -> _RunAccountingState:
+        acct = self._accounting.get((run_id, grant_generation))
+        if acct is None:
+            raise AuthorityError("missing run accounting state")
+        return acct
 
     def mint_record(
         self,
@@ -512,23 +724,28 @@ class RunAuthorityStore:
             raise AdmissionDeniedError("grant_generation must be >= 1")
         if not math.isfinite(expires_at_wall_s):
             raise AdmissionDeniedError("expires_at_wall_s must be finite")
+        spec_d, skill_d, plan_d = recompute_plan_digests(plan)
+        if (spec_d, skill_d, plan_d) != (plan.spec_digest, plan.skill_sha256, plan.workflow_plan_digest):
+            raise AdmissionDeniedError("PLAN_INTEGRITY_MISMATCH")
         record = RunAuthorityRecord(
             run_id=run_id,
             grant_generation=grant_generation,
             principal_id=principal_id,
             owner_role=owner_role,
             workflow_id=plan.spec.id,
-            workflow_plan_digest=plan.workflow_plan_digest,
+            workflow_plan_digest=plan_d,
+            approved_plan=plan,
             admission_mode=admission_mode,
             lane_access=lane_access,
             effective_target_scope=effective_target_scope,
             expires_at_wall_s=expires_at_wall_s,
         )
         self._records[run_id] = record
+        self._init_accounting(record)
         return AdmissionReceipt(
             run_id=run_id,
             grant_generation=grant_generation,
-            workflow_plan_digest=plan.workflow_plan_digest,
+            workflow_plan_digest=plan_d,
             workflow_id=plan.spec.id,
         )
 
@@ -592,8 +809,11 @@ class RunAuthorityStore:
             raise AuthorityError("RECEIPT_DIGEST_MISMATCH")
         if expected_plan_digest is not None and record.workflow_plan_digest != expected_plan_digest:
             raise AuthorityError("PLAN_DIGEST_MISMATCH")
-        if target is not None and not record.effective_target_scope.allows(target.sandbox_addr):
-            raise AuthorityError(f"target {target.sandbox_addr!r} outside effective_target_scope")
+        if target is not None:
+            if not self.is_incarnation_active(target):
+                raise AuthorityError("TARGET_INCARNATION_REVOKED")
+            if not record.effective_target_scope.allows(target.sandbox_addr):
+                raise AuthorityError(f"target {target.sandbox_addr!r} outside effective_target_scope")
         return record
 
     def verify_record_access(
@@ -606,7 +826,7 @@ class RunAuthorityStore:
         target: TargetIncarnation,
         clock: ClockSnapshot,
     ) -> RunAuthorityRecord:
-        """Verify live run & target authorization for calibration queries and replay."""
+        """Verify live run & exact incarnation authorization for calibration queries and replay."""
         record = self._records.get(run_id)
         if record is None:
             raise AuthorityError(f"unknown run_id {run_id!r}")
@@ -614,6 +834,8 @@ class RunAuthorityStore:
             raise AuthorityError("RUN_REVOKED")
         if clock.wall_s >= record.expires_at_wall_s:
             raise AuthorityError("RUN_EXPIRED")
+        if not self.is_incarnation_active(target):
+            raise AuthorityError("TARGET_INCARNATION_REVOKED")
         if not record.effective_target_scope.allows(target.sandbox_addr):
             raise AuthorityError(f"target {target.sandbox_addr!r} outside run target scope")
         if caller_role == "orchestrator":
@@ -623,31 +845,131 @@ class RunAuthorityStore:
                 raise AuthorityError(f"target {target.sandbox_addr!r} outside caller subtree")
         return record
 
+    # --- Authoritative fixture-owned budget operations keyed by (run_id, grant_generation) ---
+
+    def reserve_decisions_budget(
+        self,
+        receipt: AdmissionReceipt,
+        *,
+        calls: int,
+        cost_microusd: int,
+        clock: ClockSnapshot,
+    ) -> bool:
+        record = self.verify_active(receipt, clock=clock)
+        acct = self._get_accounting(record.run_id, record.grant_generation)
+        cutoff = clock.monotonic_s - 3600.0
+        while acct.decisions_call_times and acct.decisions_call_times[0] <= cutoff:
+            acct.decisions_call_times.popleft()
+        if len(acct.decisions_call_times) + calls > acct.max_decisions_calls_per_hour:
+            return False
+        if acct.decisions_spend_microusd_used + cost_microusd > acct.max_decisions_spend_microusd:
+            return False
+        for _ in range(calls):
+            acct.decisions_call_times.append(clock.monotonic_s)
+        acct.decisions_spend_microusd_used += cost_microusd
+        return True
+
+    def can_afford_blind(self, receipt: AdmissionReceipt, *, cost_microusd: int, clock: ClockSnapshot) -> bool:
+        record = self.verify_active(receipt, clock=clock)
+        acct = self._get_accounting(record.run_id, record.grant_generation)
+        return acct.blind_spend_microusd_used + cost_microusd <= acct.max_blind_spend_microusd
+
+    def reserve_blind_budget(
+        self,
+        receipt: AdmissionReceipt,
+        *,
+        cost_microusd: int,
+        clock: ClockSnapshot,
+    ) -> bool:
+        record = self.verify_active(receipt, clock=clock)
+        acct = self._get_accounting(record.run_id, record.grant_generation)
+        if acct.blind_spend_microusd_used + cost_microusd > acct.max_blind_spend_microusd:
+            return False
+        acct.blind_spend_microusd_used += cost_microusd
+        return True
+
+    def allow_and_record_nudge(
+        self,
+        receipt: AdmissionReceipt,
+        target: TargetIncarnation,
+        *,
+        dedupe_key: str,
+        clock: ClockSnapshot,
+    ) -> bool:
+        record = self.verify_active(receipt, clock=clock, target=target)
+        acct = self._get_accounting(record.run_id, record.grant_generation)
+        seen = acct.seen_dedupe_keys
+        target_map = acct.nudge_target_times
+        if seen is None or target_map is None or dedupe_key in seen:
+            return False
+        if acct.total_nudges >= acct.max_total_nudges_per_run:
+            return False
+        times = target_map.setdefault(target, deque())
+        cutoff = clock.monotonic_s - 3600.0
+        while times and times[0] <= cutoff:
+            times.popleft()
+        if len(times) >= acct.max_nudges_per_target_per_hour:
+            return False
+        if times and (clock.monotonic_s - times[-1]) < acct.min_nudge_interval_s:
+            return False
+        times.append(clock.monotonic_s)
+        acct.total_nudges += 1
+        seen.add(dedupe_key)
+        return True
+
+    def run_usage(self, receipt: AdmissionReceipt) -> dict[str, int]:
+        acct = self._get_accounting(receipt.run_id, receipt.grant_generation)
+        return {
+            "blind_spend_microusd_used": acct.blind_spend_microusd_used,
+            "decisions_spend_microusd_used": acct.decisions_spend_microusd_used,
+            "total_nudges": acct.total_nudges,
+        }
+
 
 def _compute_effective_target_scope(
     plan: CompiledWorkflowPlan,
     *,
     caller_role: CallerRole,
     caller_subtree: frozenset[str],
+    project_members: frozenset[str],
 ) -> EffectiveTargetScope:
     selector = plan.spec.scope.target_selector
+    allow_remote = plan.spec.scope.allow_remote_workers
     if selector == "all_running_sandboxes":
         if caller_role != "operator":
             raise AdmissionDeniedError("all_running_sandboxes requires operator role")
-        return EffectiveTargetScope(selector=selector, allowed_targets=frozenset(), all_running_allowed=True)
+        return EffectiveTargetScope(
+            selector=selector,
+            allowed_targets=frozenset(),
+            all_running_allowed=True,
+            allow_remote_workers=allow_remote,
+        )
     if selector == "bound_targets":
         bound = frozenset(plan.spec.scope.bound_targets)
         if not bound:
             raise AdmissionDeniedError("bound_targets cannot be empty")
+        if not allow_remote and any(is_remote_target(addr) for addr in bound):
+            raise AdmissionDeniedError("bound_targets includes remote worker while allow_remote_workers is false")
         if caller_role == "orchestrator" and not bound.issubset(caller_subtree):
             raise AdmissionDeniedError("bound_targets exceed caller_subtree")
-        return EffectiveTargetScope(selector=selector, allowed_targets=bound, all_running_allowed=False)
-    # project_scope
-    if caller_role == "orchestrator":
-        if not caller_subtree:
-            raise AdmissionDeniedError("project_scope requires non-empty caller_subtree")
-        return EffectiveTargetScope(selector=selector, allowed_targets=caller_subtree, all_running_allowed=False)
-    return EffectiveTargetScope(selector=selector, allowed_targets=caller_subtree, all_running_allowed=len(caller_subtree) == 0)
+        return EffectiveTargetScope(
+            selector=selector,
+            allowed_targets=bound,
+            all_running_allowed=False,
+            allow_remote_workers=allow_remote,
+        )
+    # project_scope: NEVER wildcard! Strictly resolved from fixture-owned project_members
+    # (intersected with caller_subtree for orchestrator) and filtered by remote eligibility.
+    candidates = project_members if caller_role == "operator" else (project_members & caller_subtree)
+    eligible = frozenset(addr for addr in candidates if allow_remote or not is_remote_target(addr))
+    if not eligible:
+        raise AdmissionDeniedError("project_scope resolved to empty eligible target set")
+    return EffectiveTargetScope(
+        selector=selector,
+        allowed_targets=eligible,
+        all_running_allowed=False,
+        allow_remote_workers=allow_remote,
+    )
 
 
 def _verify_tier_a_lease(
@@ -670,6 +992,36 @@ def _verify_tier_a_lease(
         raise AdmissionDeniedError("TIER_A_LEASE_PRINCIPAL_MISMATCH")
 
 
+def _validate_positive_ttl(ttl: float, name: str) -> None:
+    if type(ttl) is bool or not isinstance(ttl, (int, float)) or not math.isfinite(ttl) or ttl <= 0:
+        raise AdmissionDeniedError(f"{name} must be a positive finite number")
+
+
+def _can_auto_admit_observe_only(
+    plan: CompiledWorkflowPlan,
+    effective_scope: EffectiveTargetScope,
+    *,
+    active_orchestrator_runs: int,
+    max_active_orchestrator_runs: int,
+) -> bool:
+    lim = plan.spec.limits
+    zero_caps = (
+        lim.max_decisions_spend_microusd == 0
+        and lim.max_blind_check_spend_microusd == 0
+        and lim.max_decisions_calls_per_hour == 0
+        and lim.max_nudges_per_target_per_hour == 0
+        and lim.max_total_nudges_per_run == 0
+    )
+    return (
+        plan.spec.autonomy == "observe_only"
+        and zero_caps
+        and plan.spec.excerpt_disclosure.mode == "none"
+        and effective_scope.is_non_vacuous()
+        and active_orchestrator_runs < max_active_orchestrator_runs
+        and plan.reachable_effects.issubset(OBSERVE_ONLY_ALLOWED_EFFECTS)
+    )
+
+
 def evaluate_admission(
     plan: CompiledWorkflowPlan,
     authority_store: RunAuthorityStore,
@@ -680,20 +1032,24 @@ def evaluate_admission(
     active_orchestrator_runs: int,
     max_active_orchestrator_runs: int,
     clock: ClockSnapshot,
+    project_members: frozenset[str] = frozenset(),
     operator_lease_ttl_s: float = 3600.0,
     auto_observer_ttl_s: float = 3600.0,
     tier_a_lease: WorkflowRunLease | None = None,
 ) -> AdmissionReceipt:
     """Admit a compiled plan and mint its live RunAuthorityRecord."""
-    if operator_lease_ttl_s <= 0 or auto_observer_ttl_s <= 0:
-        raise AdmissionDeniedError("lease TTL must be positive")
+    _validate_positive_ttl(operator_lease_ttl_s, "operator_lease_ttl_s")
+    _validate_positive_ttl(auto_observer_ttl_s, "auto_observer_ttl_s")
     lane_access: LaneAccess = (
         "nonexclusive_observer"
         if plan.spec.autonomy == "observe_only"
         else "exclusive_owner"
     )
     effective_scope = _compute_effective_target_scope(
-        plan, caller_role=caller_role, caller_subtree=caller_subtree
+        plan,
+        caller_role=caller_role,
+        caller_subtree=caller_subtree,
+        project_members=project_members,
     )
 
     if tier_a_lease is not None:
@@ -721,21 +1077,12 @@ def evaluate_admission(
             expires_at_wall_s=clock.wall_s + operator_lease_ttl_s,
         )
 
-    # Orchestrator auto-admission: strict observe_only gate
-    lim = plan.spec.limits
-    auto_ok = (
-        plan.spec.autonomy == "observe_only"
-        and lim.max_decisions_spend_microusd == 0
-        and lim.max_blind_check_spend_microusd == 0
-        and lim.max_decisions_calls_per_hour == 0
-        and lim.max_nudges_per_target_per_hour == 0
-        and lim.max_total_nudges_per_run == 0
-        and plan.spec.excerpt_disclosure.mode == "none"
-        and effective_scope.is_non_vacuous()
-        and active_orchestrator_runs < max_active_orchestrator_runs
-        and plan.reachable_effects.issubset(OBSERVE_ONLY_ALLOWED_EFFECTS)
-    )
-    if not auto_ok:
+    if not _can_auto_admit_observe_only(
+        plan,
+        effective_scope,
+        active_orchestrator_runs=active_orchestrator_runs,
+        max_active_orchestrator_runs=max_active_orchestrator_runs,
+    ):
         raise AdmissionDeniedError("TIER_A_APPROVAL_REQUIRED")
     return authority_store.mint_fresh_run(
         principal_id=principal_id,
@@ -768,33 +1115,42 @@ def materialize_workflow_plan(
     expected_uid: int | None = None,
     root_alias_checker: Callable[[Path], bool] | None = None,
 ) -> MaterializedArtifacts:
-    """Materialize pinned skill bytes and lockfile using dir_fd + O_NOFOLLOW after live authority check."""
+    """Recompute complete plan binding and materialize anchored on verified root_fd into digest-scoped path."""
     uid = os.getuid() if expected_uid is None else expected_uid
     record = authority_store.verify_active(
         receipt, clock=clock, expected_plan_digest=plan.workflow_plan_digest
     )
     if record.materialized:
         raise MaterializationError("RECEIPT_ALREADY_MATERIALIZED")
-    if hashlib.sha256(plan.skill_bytes).hexdigest() != plan.skill_sha256:
-        raise MaterializationError("PINNED_SKILL_DIGEST_MISMATCH")
 
-    _verify_trusted_dir_ancestry(
+    spec_d, skill_d, plan_d = recompute_plan_digests(plan)
+    approved = record.approved_plan
+    if (
+        plan_d != record.workflow_plan_digest
+        or spec_d != approved.spec_digest
+        or skill_d != approved.skill_sha256
+        or plan.skill_bytes != approved.skill_bytes
+    ):
+        raise MaterializationError("PLAN_INTEGRITY_MISMATCH")
+
+    # Digest-specific skill directory prevents successive revisions sharing a slug from colliding!
+    skill_dir_name = f"wf-{approved.skill_namespace}-{approved.skill_slug}-{plan_d[:16]}"
+    lock_filename = f"{plan_d}.lock.json"
+    lock_bytes = canonical_json_bytes(approved.to_lock_dict())
+
+    # Open trusted staging_root ONCE via descriptor-anchored traversal and never reopen by pathname!
+    root_fd = _open_trusted_root_fd(
         staging_root,
         expected_uid=uid,
         forbidden_sandbox_roots=forbidden_sandbox_roots,
         root_alias_checker=root_alias_checker,
     )
-    skill_dir_name = f"wf-{plan.skill_namespace}-{plan.skill_slug}"
-    lock_filename = f"{plan.workflow_plan_digest}.lock.json"
-    lock_bytes = canonical_json_bytes(plan.to_lock_dict())
-
-    root_fd = _open_verified_dir_fd(None, str(staging_root), expected_uid=uid)
     skills_fd = wf_skill_fd = plans_fd = -1
     try:
         skills_fd = _ensure_subdir_fd(root_fd, "skills", expected_uid=uid)
         wf_skill_fd = _ensure_subdir_fd(skills_fd, skill_dir_name, expected_uid=uid)
         plans_fd = _ensure_subdir_fd(root_fd, "plans", expected_uid=uid)
-        _atomic_write_readonly(wf_skill_fd, "SKILL.md", plan.skill_bytes)
+        _atomic_write_readonly(wf_skill_fd, SKILL_FILENAME, approved.skill_bytes)
         _atomic_write_readonly(plans_fd, lock_filename, lock_bytes)
     finally:
         for fd in (plans_fd, wf_skill_fd, skills_fd, root_fd):
@@ -803,9 +1159,9 @@ def materialize_workflow_plan(
 
     authority_store.mark_materialized(record.run_id, record.grant_generation)
     return MaterializedArtifacts(
-        skill_path=staging_root / "skills" / skill_dir_name / "SKILL.md",
+        skill_path=staging_root / "skills" / skill_dir_name / SKILL_FILENAME,
         lockfile_path=staging_root / "plans" / lock_filename,
-        digest=plan.workflow_plan_digest,
+        digest=plan_d,
     )
 
 
@@ -813,7 +1169,7 @@ def materialize_workflow_plan(
 
 
 class LaneLeaseRegistry:
-    """Enforces exclusive lane ownership for active runs and nonexclusive subscriptions for observers."""
+    """Enforces exclusive lane ownership for active runs, nonexclusive observer subs, and pause/action checks."""
 
     def __init__(self) -> None:
         self._exclusive: dict[TargetIncarnation, str] = {}
@@ -830,6 +1186,7 @@ class LaneLeaseRegistry:
         clock: ClockSnapshot,
     ) -> None:
         record = authority_store.verify_active(receipt, clock=clock, target=target)
+        authority_store.register_active_incarnation(target)
         run_id = record.run_id
         if run_id in self._run_roles and self._run_roles[run_id] != record.lane_access:
             raise MixedLaneRoleError(f"run {run_id!r} cannot hold mixed lane roles")
@@ -857,6 +1214,9 @@ class LaneLeaseRegistry:
     def pause(self, run_id: str) -> None:
         self._paused_runs.add(run_id)
 
+    def resume(self, run_id: str) -> None:
+        self._paused_runs.discard(run_id)
+
     def is_paused(self, run_id: str) -> bool:
         return run_id in self._paused_runs
 
@@ -869,6 +1229,8 @@ class LaneLeaseRegistry:
         clock: ClockSnapshot,
     ) -> None:
         record = authority_store.verify_active(receipt, clock=clock, target=target)
+        if self.is_paused(record.run_id):
+            raise LaneAuthorityError("RUN_PAUSED")
         if self._exclusive.get(target) != record.run_id:
             raise LaneAuthorityError(f"run {record.run_id!r} does not hold exclusive lease on {target}")
 
@@ -884,12 +1246,43 @@ class LaneLeaseRegistry:
         if self._exclusive.get(target) != record.run_id and record.run_id not in self._observers.get(target, ()):
             raise LaneAuthorityError(f"run {record.run_id!r} is not attached to {target}")
 
+    def assert_can_act(
+        self,
+        receipt: AdmissionReceipt,
+        target: TargetIncarnation,
+        *,
+        action: str,
+        authority_store: RunAuthorityStore,
+        clock: ClockSnapshot,
+    ) -> None:
+        """Enforce pause, live incarnation binding, and action-specific autonomy permissions."""
+        record = authority_store.verify_active(receipt, clock=clock, target=target)
+        if self.is_paused(record.run_id):
+            raise LaneAuthorityError("RUN_PAUSED")
+        autonomy = record.approved_plan.spec.autonomy
+        if action == "health_nudge_lane":
+            if autonomy not in ("nudge_bounded", "orchestrator_signal"):
+                raise LaneAuthorityError(f"autonomy {autonomy!r} cannot execute health_nudge_lane")
+            if self._exclusive.get(target) != record.run_id:
+                raise LaneAuthorityError("exclusive lane lease required for health_nudge_lane")
+            return
+        if action == "health_wake_orchestrator":
+            if autonomy != "orchestrator_signal":
+                raise LaneAuthorityError(f"autonomy {autonomy!r} cannot execute health_wake_orchestrator")
+            if self._exclusive.get(target) != record.run_id:
+                raise LaneAuthorityError("exclusive lane lease required for health_wake_orchestrator")
+            return
+        if action == "health_escalate_human":
+            self.assert_can_observe(receipt, target, authority_store=authority_store, clock=clock)
+            return
+        raise LaneAuthorityError(f"unsupported action {action!r}")
+
     def release(self, run_id: str) -> None:
         self._paused_runs.discard(run_id)
         self._run_roles.pop(run_id, None)
         for target in [t for t, owner in self._exclusive.items() if owner == run_id]:
             del self._exclusive[target]
-        for target in list(self._observers.keys()):
+        for target in tuple(self._observers):
             subs = self._observers[target]
             subs.discard(run_id)
             if not subs:
@@ -899,6 +1292,12 @@ class LaneLeaseRegistry:
         authority_store.revoke_run(run_id)
         self.release(run_id)
 
-    def revoke_target_incarnation(self, target: TargetIncarnation) -> None:
+    def revoke_target_incarnation(
+        self,
+        target: TargetIncarnation,
+        authority_store: RunAuthorityStore | None = None,
+    ) -> None:
         self._exclusive.pop(target, None)
         self._observers.pop(target, None)
+        if authority_store is not None:
+            authority_store.revoke_target_incarnation(target)

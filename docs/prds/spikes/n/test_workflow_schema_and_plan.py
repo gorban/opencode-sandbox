@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import stat
 import sys
@@ -92,9 +93,14 @@ def _supervisor_toml(
     fp_threshold: str = "0.25",
     selector: str = "all_running_sandboxes",
     bound_targets: str = "[]",
+    allow_remote: bool = True,
+    decisions_spend: str = "0.50",
+    blind_spend: str = "2.00",
+    decisions_calls: int = 120,
     extra_supervision: str = "",
     description: str = "Fleet supervisor",
 ) -> str:
+    remote_str = "true" if allow_remote else "false"
     return f"""
 schema_version = 1
 kind = "workflow@1"
@@ -108,7 +114,7 @@ survives_restart = true
 [scope]
 target_selector = "{selector}"
 bound_targets = {bound_targets}
-allow_remote_workers = true
+allow_remote_workers = {remote_str}
 
 [limits]
 tick_interval_s = 60
@@ -119,9 +125,9 @@ fleet_audit_checks_per_hour = 8
 max_nudges_per_target_per_hour = 2
 min_nudge_interval_s = 300
 max_total_nudges_per_run = 40
-max_decisions_calls_per_hour = 120
-max_decisions_spend_usd = 0.50
-max_blind_check_spend_usd = 2.00
+max_decisions_calls_per_hour = {decisions_calls}
+max_decisions_spend_usd = {decisions_spend}
+max_blind_check_spend_usd = {blind_spend}
 max_open_inbox_items = 16
 defer_nudge_during_human_lease = true
 wake_grace_after_host_sleep_s = 120
@@ -163,12 +169,14 @@ def _observe_only_toml(
     skill: str = "user/observer-guide",
     selector: str = "bound_targets",
     bound_targets: str = '["local/lane-a"]',
+    allow_remote: bool = False,
     extra_states: str = "",
     extra_timers: str = "",
     extra_signals: str = "",
     decisions_calls: int = 0,
     nudges: int = 0,
 ) -> str:
+    remote_str = "true" if allow_remote else "false"
     return f"""
 schema_version = 1
 kind = "workflow@1"
@@ -182,7 +190,7 @@ survives_restart = false
 [scope]
 target_selector = "{selector}"
 bound_targets = {bound_targets}
-allow_remote_workers = false
+allow_remote_workers = {remote_str}
 
 [limits]
 tick_interval_s = 30
@@ -211,70 +219,81 @@ effects = ["read_metrics", "update_health_projection"]
 
 
 class TestWorkflowSchemaAndAst(unittest.TestCase):
-    def test_valid_parsing_and_canonical_numeric_normalization(self) -> None:
+    def test_valid_parsing_and_exact_decimal_precision_boundaries(self) -> None:
         s1 = parse_and_validate_workflow_toml(_supervisor_toml(fp_threshold="0.25"), is_builtin=True)
         s2 = parse_and_validate_workflow_toml(_supervisor_toml(fp_threshold="0.250"), is_builtin=True)
         self.assertEqual(s1.spec_digest, s2.spec_digest)
         self.assertEqual(s1.blind_check.fp_drift_warn_threshold_bps, 2500)  # type: ignore[union-attr]
         self.assertEqual(s1.limits.max_decisions_spend_microusd, 500_000)
-        self.assertEqual(s1.limits.max_blind_check_spend_microusd, 2_000_000)
 
-        s_one = parse_and_validate_workflow_toml(_supervisor_toml(fp_threshold="1"), is_builtin=True)
-        s_one_f = parse_and_validate_workflow_toml(_supervisor_toml(fp_threshold="1.0"), is_builtin=True)
-        self.assertEqual(s_one.spec_digest, s_one_f.spec_digest)
-        self.assertEqual(s_one.blind_check.fp_drift_warn_threshold_bps, 10_000)  # type: ignore[union-attr]
+        # Exact representable boundary values: 0.000001 USD (1 microdollar), 1000.00 USD, 0.0001 bps
+        ok_min = parse_and_validate_workflow_toml(
+            _supervisor_toml(decisions_spend="0.000001", fp_threshold="0.0001"),
+            is_builtin=True,
+        )
+        self.assertEqual(ok_min.limits.max_decisions_spend_microusd, 1)
+        self.assertEqual(ok_min.blind_check.fp_drift_warn_threshold_bps, 1)  # type: ignore[union-attr]
+
+        ok_max = parse_and_validate_workflow_toml(
+            _supervisor_toml(decisions_spend="1000.000000", fp_threshold="1.0000"),
+            is_builtin=True,
+        )
+        self.assertEqual(ok_max.limits.max_decisions_spend_microusd, 1_000_000_000)
+        self.assertEqual(ok_max.blind_check.fp_drift_warn_threshold_bps, 10_000)  # type: ignore[union-attr]
+
+        # Values immediately past precision or magnitude boundaries MUST fail (parse_float=Decimal!)
+        for bad_toml in (
+            _supervisor_toml(decisions_spend="0.0000009"),
+            _supervisor_toml(decisions_spend="0.0000011"),
+            _supervisor_toml(decisions_spend="1000.000001"),
+            _supervisor_toml(decisions_spend="1e20"),
+            _supervisor_toml(fp_threshold="0.00001"),
+            _supervisor_toml(fp_threshold="0.25001"),
+            _supervisor_toml(fp_threshold="1.0001"),
+        ):
+            with self.assertRaises(WorkflowSchemaError):
+                parse_and_validate_workflow_toml(bad_toml, is_builtin=True)
 
     def test_schema_limit_and_sanitization_rejections(self) -> None:
-        # Unknown top-level key
+        bad_extra = _supervisor_toml() + "\nextra_key = 1\n"
         with self.assertRaises(WorkflowSchemaError):
-            parse_and_validate_workflow_toml(_supervisor_toml() + "\nextra_key = 1\n", is_builtin=True)
+            parse_and_validate_workflow_toml(bad_extra, is_builtin=True)
 
-        # Mutable workflow impersonating builtin
+        bad_spoof = _supervisor_toml(wf_id="builtin/spoof")
         with self.assertRaises(WorkflowSchemaError):
-            parse_and_validate_workflow_toml(_supervisor_toml(wf_id="builtin/spoof"), is_builtin=False)
+            parse_and_validate_workflow_toml(bad_spoof, is_builtin=False)
 
-        # Empty bound_targets when selector == bound_targets
+        bad_empty_targets = _observe_only_toml(selector="bound_targets", bound_targets="[]")
         with self.assertRaises(WorkflowSchemaError):
-            parse_and_validate_workflow_toml(
-                _observe_only_toml(selector="bound_targets", bound_targets="[]"),
-                is_builtin=False,
-            )
+            parse_and_validate_workflow_toml(bad_empty_targets, is_builtin=False)
 
-        # tick_interval_s < 10
         bad_tick = _supervisor_toml().replace("tick_interval_s = 60", "tick_interval_s = 5")
         with self.assertRaises(WorkflowSchemaError):
             parse_and_validate_workflow_toml(bad_tick, is_builtin=True)
 
-        # Sub-microdollar USD spend
-        bad_usd = _supervisor_toml().replace("max_decisions_spend_usd = 0.50", "max_decisions_spend_usd = 0.0000001")
+        bad_bidi = _supervisor_toml(description="Bad \u202e text")
         with self.assertRaises(WorkflowSchemaError):
-            parse_and_validate_workflow_toml(bad_usd, is_builtin=True)
+            parse_and_validate_workflow_toml(bad_bidi, is_builtin=True)
 
-        # BiDi control character rejected
-        with self.assertRaises(WorkflowSchemaError):
-            parse_and_validate_workflow_toml(_supervisor_toml(description="Bad \u202e text"), is_builtin=True)
-
-        # Mutable workflow referencing non-allowlisted factory_id rejected
         factory_state = '\n[[states]]\nname = "fan"\nshape = "observe"\nfactory_id = "host_fanout"\n'
+        factory_toml = _observe_only_toml(extra_states=factory_state)
         with self.assertRaises(WorkflowSchemaError):
-            parse_and_validate_workflow_toml(_observe_only_toml(extra_states=factory_state), is_builtin=False)
-        # Allowlisted factory passes
+            parse_and_validate_workflow_toml(factory_toml, is_builtin=False)
         ok_spec = parse_and_validate_workflow_toml(
-            _observe_only_toml(extra_states=factory_state),
+            factory_toml,
             is_builtin=False,
             allowlisted_factories=frozenset({"host_fanout"}),
         )
         self.assertEqual(len(ok_spec.states), 2)
 
-        # >32 states rejected
         many_states = "\n".join(
             f'[[states]]\nname = "s{i}"\nshape = "observe"\neffects = ["read_metrics"]'
             for i in range(33)
         )
+        too_many_toml = _observe_only_toml(extra_states="\n" + many_states)
         with self.assertRaises(WorkflowSchemaError):
-            parse_and_validate_workflow_toml(_observe_only_toml(extra_states="\n" + many_states), is_builtin=False)
+            parse_and_validate_workflow_toml(too_many_toml, is_builtin=False)
 
-        # Invalid oc-ui@1 widget rejected
         bad_widget = _supervisor_toml().replace('type = "status_card"', 'type = "raw_html_iframe"')
         with self.assertRaises(WorkflowSchemaError):
             parse_and_validate_workflow_toml(bad_widget, is_builtin=True)
@@ -288,7 +307,6 @@ class TestWorkflowSchemaAndAst(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(err)
 
-        # bool vs int trap: True == 1 and True in [1, 2] must NOT evaluate True
         p_eq = compile_predicate("metric.flag == 1")
         val_eq, _ = evaluate_predicate(p_eq, {"metric": {"flag": True}})
         self.assertFalse(val_eq)
@@ -297,27 +315,37 @@ class TestWorkflowSchemaAndAst(unittest.TestCase):
         val_in, _ = evaluate_predicate(p_in, {"metric": {"flag": True}})
         self.assertFalse(val_in)
 
-        # Disallowed constructs fail compile_predicate
+        # Runtime type mismatch fails closed EVEN UNDER `not`!
+        p_not_mismatch = compile_predicate('not (metric.x < "abc")')
+        val_not, fault_not = evaluate_predicate(p_not_mismatch, {"metric": {"x": 5}})
+        self.assertFalse(val_not)
+        self.assertIsNotNone(fault_not)
+
+        # Unpaired surrogate raises WorkflowSchemaError (never raw UnicodeEncodeError)
+        bad_surrogate = _supervisor_toml(description="Bad \ud800 text")
+        with self.assertRaises(WorkflowSchemaError):
+            parse_and_validate_workflow_toml(bad_surrogate, is_builtin=True)
+
         for bad in (
-            "1 < metric.x < 10",  # chained comparison
-            '"a" in "abc"',  # str in str
-            "metric.s in 'abcdef'",  # RHS of in not list/tuple
-            "metric.x in [True, 1]",  # mixed bool/int in list
-            "metric.x in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]",  # >16 items
-            "os.system('id') == 0",  # call + disallowed namespace
-            "metric.a.b == 1",  # nested attribute
-            "untrusted.text == 'ok'",  # disallowed namespace
-            "not (not (not (not (not (not (not (not metric.a)))))))",  # depth > 8
-            "-True == -1",  # unary minus on bool
-            "+metric.x == 1",  # unary plus disallowed
-            "metric.a == 'bad\x00nul'",  # NUL in literal
+            "1 < metric.x < 10",
+            '"a" in "abc"',
+            "metric.s in 'abcdef'",
+            "metric.x in [True, 1]",
+            "metric.x in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]",
+            "os.system('id') == 0",
+            "metric.a.b == 1",
+            "untrusted.text == 'ok'",
+            "not (not (not (not (not (not (not (not metric.a)))))))",
+            "metric.x == " + "- " * 20 + "1",
+            "-True == -1",
+            "+metric.x == 1",
+            "metric.a == 'bad\x00nul'",
         ):
             with self.assertRaises(PredicateValidationError, msg=f"should reject: {bad}"):
                 compile_predicate(bad)
 
     def test_literal_single_pass_templates(self) -> None:
         validate_template("ok_tpl", "Lane {target_addr} stalled {stall_seconds}s in {workflow_id}")
-        # Substituted value containing {workflow_id} is NEVER re-expanded
         rendered = render_template(
             "Lane {target_addr} ({workflow_id})",
             {"target_addr": "{workflow_id}", "workflow_id": "builtin/sup"},
@@ -337,45 +365,44 @@ class TestWorkflowSchemaAndAst(unittest.TestCase):
 
     def test_directional_security_delta_all_10_triggers(self) -> None:
         base = parse_and_validate_workflow_toml(_supervisor_toml(), is_builtin=True)
-        # Creation emits workflow_added + enabled capability triggers
         create_delta = compute_security_delta(None, base)
         self.assertIn("workflow_added", create_delta)
         self.assertIn("workflow_autonomy_widened", create_delta)
         self.assertIn("workflow_decisions_route_added", create_delta)
 
-        # Benign description edit -> zero triggers
         desc_only = parse_and_validate_workflow_toml(_supervisor_toml(description="Updated docs"), is_builtin=True)
         self.assertEqual(compute_security_delta(base, desc_only), ())
 
-        # Interval decrease triggers workflow_autonomy_widened
         faster_nudge = parse_and_validate_workflow_toml(
             _supervisor_toml().replace("min_nudge_interval_s = 300", "min_nudge_interval_s = 60"),
             is_builtin=True,
         )
         self.assertIn("workflow_autonomy_widened", compute_security_delta(base, faster_nudge))
 
-        # Disabling human-lease deferral triggers workflow_autonomy_widened
         no_defer = parse_and_validate_workflow_toml(
             _supervisor_toml().replace("defer_nudge_during_human_lease = true", "defer_nudge_during_human_lease = false"),
             is_builtin=True,
         )
         self.assertIn("workflow_autonomy_widened", compute_security_delta(base, no_defer))
 
-        # Increasing scheduled_audit_interval_s weakens FN detection -> workflow_decisions_route_added
+        shorter_wake = parse_and_validate_workflow_toml(
+            _supervisor_toml().replace("wake_grace_after_host_sleep_s = 120", "wake_grace_after_host_sleep_s = 0"),
+            is_builtin=True,
+        )
+        self.assertIn("workflow_autonomy_widened", compute_security_delta(base, shorter_wake))
+
         slower_audit = parse_and_validate_workflow_toml(
             _supervisor_toml().replace("scheduled_audit_interval_s = 900", "scheduled_audit_interval_s = 3600"),
             is_builtin=True,
         )
         self.assertIn("workflow_decisions_route_added", compute_security_delta(base, slower_audit))
 
-        # Decreasing fleet_audit_checks_per_hour -> workflow_decisions_route_added
         less_audit = parse_and_validate_workflow_toml(
             _supervisor_toml().replace("fleet_audit_checks_per_hour = 8", "fleet_audit_checks_per_hour = 2"),
             is_builtin=True,
         )
         self.assertIn("workflow_decisions_route_added", compute_security_delta(base, less_audit))
 
-        # Excerpt disclosure opt-in -> workflow_excerpt_disclosure_changed
         opt_in = (
             'excerpt_disclosure = "opt_in"\n'
             '[supervision.excerpt_disclosure]\n'
@@ -387,7 +414,6 @@ class TestWorkflowSchemaAndAst(unittest.TestCase):
         with_disc = parse_and_validate_workflow_toml(_supervisor_toml(extra_supervision=opt_in), is_builtin=True)
         self.assertIn("workflow_excerpt_disclosure_changed", compute_security_delta(base, with_disc))
 
-        # Rubric edit, template edit, skill sha change, surface change
         rubric_mod = parse_and_validate_workflow_toml(
             _supervisor_toml().replace("Classify strictly from host metrics.", "Classify loosely."),
             is_builtin=True,
@@ -416,166 +442,166 @@ class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
         os.chmod(self.staging, 0o700)
         self.catalog = _sample_catalog()
         self.clock = ClockSnapshot(monotonic_s=100.0, wall_s=1000.0)
+        self.empty_sub: frozenset[str] = frozenset()
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_pure_compile_zero_writes_strict_modes_fifo_and_toctou(self) -> None:
-        skill_root = _make_skill_tree(self.root, "builtin", "firstmate-guide", b"# Original Skill\n")
-        plan = compile_workflow_plan(
-            _supervisor_toml(),
+    def test_pure_compile_zero_writes_strict_modes_fifo_forged_plan_and_digest_scoped_paths(self) -> None:
+        skill_root = _make_skill_tree(self.root, "builtin", "firstmate-guide", b"# Revision 1\n")
+        sup_toml = _supervisor_toml()
+        plan_v1 = compile_workflow_plan(
+            sup_toml,
             is_builtin=True,
             skill_root=skill_root,
             model_catalog=self.catalog,
         )
-        # Pure compile writes ZERO files into staging
         self.assertEqual(list(self.staging.iterdir()), [])
 
-        # Modify disk skill source AFTER compile; materialize must write pinned bytes, NOT disk edits!
+        # Modify disk skill source AFTER compile; materialize must write Revision 1 pinned bytes!
         disk_skill = skill_root / "builtin" / "firstmate-guide" / "SKILL.md"
-        disk_skill.write_bytes(b"# Tampered On Disk\n")
+        disk_skill.write_bytes(b"# Revision 2\n")
         os.chmod(disk_skill, 0o600)
 
         store = RunAuthorityStore()
-        receipt = evaluate_admission(
-            plan,
-            store,
-            principal_id="op-1",
-            caller_role="operator",
-            caller_subtree=frozenset(),
-            active_orchestrator_runs=0,
-            max_active_orchestrator_runs=4,
-            clock=self.clock,
+        r_v1 = evaluate_admission(
+            plan_v1, store, principal_id="op-1", caller_role="operator",
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
         )
-        artifacts = materialize_workflow_plan(
-            plan,
-            receipt,
-            authority_store=store,
-            clock=self.clock,
-            staging_root=self.staging,
+        art_v1 = materialize_workflow_plan(
+            plan_v1, r_v1, authority_store=store, clock=self.clock, staging_root=self.staging,
         )
-        self.assertEqual(artifacts.skill_path.read_bytes(), b"# Original Skill\n")
-        self.assertEqual(stat.S_IMODE(artifacts.skill_path.stat().st_mode), 0o400)
-        self.assertEqual(artifacts.skill_path.parent.name, "wf-builtin-firstmate-guide")
+        self.assertEqual(art_v1.skill_path.read_bytes(), b"# Revision 1\n")
+        self.assertEqual(stat.S_IMODE(art_v1.skill_path.stat().st_mode), 0o400)
 
-        # Tampered pinned bytes fail digest re-verification
-        corrupted = CompiledWorkflowPlan(**{**plan.__dict__, "skill_bytes": b"# Corrupted\n"})
-        receipt2 = evaluate_admission(
-            plan,
-            store,
-            principal_id="op-1",
-            caller_role="operator",
-            caller_subtree=frozenset(),
-            active_orchestrator_runs=0,
-            max_active_orchestrator_runs=4,
-            clock=self.clock,
+        # Two valid revisions sharing the SAME skill slug MUST publish to distinct digest-scoped paths!
+        plan_v2 = compile_workflow_plan(
+            sup_toml, is_builtin=True, skill_root=skill_root, model_catalog=self.catalog,
+        )
+        r_v2 = evaluate_admission(
+            plan_v2, store, principal_id="op-1", caller_role="operator",
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
+        )
+        art_v2 = materialize_workflow_plan(
+            plan_v2, r_v2, authority_store=store, clock=self.clock, staging_root=self.staging,
+        )
+        self.assertNotEqual(art_v1.skill_path, art_v2.skill_path)
+        self.assertEqual(art_v1.skill_path.read_bytes(), b"# Revision 1\n")
+        self.assertEqual(art_v2.skill_path.read_bytes(), b"# Revision 2\n")
+
+        # Forged plan whose cached workflow_plan_digest matches receipt while actual spec differs fails closed!
+        modified_spec = parse_and_validate_workflow_toml(
+            _supervisor_toml(description="Tampered spec"), is_builtin=True,
+        )
+        forged_plan = CompiledWorkflowPlan(
+            **{**plan_v1.__dict__, "spec": modified_spec}
+        )
+        r_forged = evaluate_admission(
+            plan_v1, store, principal_id="op-1", caller_role="operator",
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
         )
         with self.assertRaises(MaterializationError):
             materialize_workflow_plan(
-                corrupted,
-                receipt2,
-                authority_store=store,
-                clock=self.clock,
-                staging_root=self.staging,
+                forged_plan, r_forged, authority_store=store, clock=self.clock, staging_root=self.staging,
             )
 
-        # Reject 0o644 skill file
-        os.chmod(disk_skill, 0o644)
+        # Reject 0o640 and 0o644 skill file
+        os.chmod(disk_skill, 0o640)
         with self.assertRaises(MaterializationError):
-            compile_workflow_plan(_supervisor_toml(), is_builtin=True, skill_root=skill_root, model_catalog=self.catalog)
+            compile_workflow_plan(sup_toml, is_builtin=True, skill_root=skill_root, model_catalog=self.catalog)
+        disk_skill.chmod(0o644)  # NOSONAR(S2612) intentional negative permission test inside 0700 tempdir
+        with self.assertRaises(MaterializationError):
+            compile_workflow_plan(sup_toml, is_builtin=True, skill_root=skill_root, model_catalog=self.catalog)
         os.chmod(disk_skill, 0o600)
 
-        # Reject 0o755 skill dir
-        os.chmod(disk_skill.parent, 0o755)
+        # Reject 0o750 and 0o755 skill dir
+        os.chmod(disk_skill.parent, 0o750)
         with self.assertRaises(MaterializationError):
-            compile_workflow_plan(_supervisor_toml(), is_builtin=True, skill_root=skill_root, model_catalog=self.catalog)
+            compile_workflow_plan(sup_toml, is_builtin=True, skill_root=skill_root, model_catalog=self.catalog)
+        disk_skill.parent.chmod(0o755)  # NOSONAR(S2612) intentional negative permission test inside 0700 tempdir
+        with self.assertRaises(MaterializationError):
+            compile_workflow_plan(sup_toml, is_builtin=True, skill_root=skill_root, model_catalog=self.catalog)
         os.chmod(disk_skill.parent, 0o700)
 
         # Reject named FIFO immediately without stalling (O_NONBLOCK + S_ISREG)
         disk_skill.unlink()
         os.mkfifo(disk_skill, 0o600)
         with self.assertRaises(MaterializationError):
-            compile_workflow_plan(_supervisor_toml(), is_builtin=True, skill_root=skill_root, model_catalog=self.catalog)
+            compile_workflow_plan(sup_toml, is_builtin=True, skill_root=skill_root, model_catalog=self.catalog)
 
-    def test_slug_namespacing_prevents_builtin_user_collision(self) -> None:
-        skill_root = _make_skill_tree(self.root, "builtin", "shared", b"# Builtin\n")
-        _make_skill_tree(self.root, "user", "shared", b"# User\n")
-        p_builtin = compile_workflow_plan(
-            _supervisor_toml(wf_id="builtin/shared", skill="builtin/shared"),
+    def test_project_scope_non_wildcard_and_remote_worker_eligibility(self) -> None:
+        skill_root = _make_skill_tree(self.root, "builtin", "firstmate-guide", b"# Guide\n")
+        store = RunAuthorityStore()
+        lanes = LaneLeaseRegistry()
+
+        # Operator project_scope with EMPTY project_members MUST fail closed (never wildcard!)
+        p_proj = compile_workflow_plan(
+            _supervisor_toml(selector="project_scope", allow_remote=False),
             is_builtin=True,
             skill_root=skill_root,
             model_catalog=self.catalog,
         )
-        p_user = compile_workflow_plan(
-            _observe_only_toml(wf_id="user/shared", skill="user/shared"),
-            is_builtin=False,
+        with self.assertRaises(AdmissionDeniedError):
+            evaluate_admission(
+                p_proj, store, principal_id="op-1", caller_role="operator",
+                caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4,
+                clock=self.clock, project_members=self.empty_sub,
+            )
+
+        # Operator project_scope with fixture-owned project_members containing local + remote target:
+        # allow_remote=False excludes remote target and rejects targets in another project!
+        members = frozenset({"local/proj-a-1", "remote-1/proj-a-r"})
+        r_proj = evaluate_admission(
+            p_proj, store, principal_id="op-1", caller_role="operator",
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4,
+            clock=self.clock, project_members=members,
+        )
+        lanes.attach(TargetIncarnation("local/proj-a-1", "inc-1"), receipt=r_proj, authority_store=store, clock=self.clock)
+        # Different project target rejected
+        other_proj_target = TargetIncarnation("local/proj-b-1", "inc-2")
+        with self.assertRaises(AuthorityError):
+            lanes.attach(other_proj_target, receipt=r_proj, authority_store=store, clock=self.clock)
+        # Remote target excluded when allow_remote_workers=False
+        remote_target = TargetIncarnation("remote-1/proj-a-r", "inc-3")
+        with self.assertRaises(AuthorityError):
+            lanes.attach(remote_target, receipt=r_proj, authority_store=store, clock=self.clock)
+
+        # bound_targets containing remote address rejected when allow_remote_workers=False
+        p_bound_remote = compile_workflow_plan(
+            _supervisor_toml(selector="bound_targets", bound_targets='["remote-1/lane-r"]', allow_remote=False),
+            is_builtin=True,
             skill_root=skill_root,
             model_catalog=self.catalog,
         )
-        store = RunAuthorityStore()
-        r1 = evaluate_admission(
-            p_builtin, store, principal_id="op", caller_role="operator",
-            caller_subtree=frozenset(), active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
-        )
-        r2 = evaluate_admission(
-            p_user, store, principal_id="orch-1", caller_role="orchestrator",
-            caller_subtree=frozenset({"local/lane-a"}), active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
-        )
-        a1 = materialize_workflow_plan(p_builtin, r1, authority_store=store, clock=self.clock, staging_root=self.staging)
-        a2 = materialize_workflow_plan(p_user, r2, authority_store=store, clock=self.clock, staging_root=self.staging)
-        self.assertNotEqual(a1.skill_path, a2.skill_path)
-        self.assertEqual(a1.skill_path.read_bytes(), b"# Builtin\n")
-        self.assertEqual(a2.skill_path.read_bytes(), b"# User\n")
+        with self.assertRaises(AdmissionDeniedError):
+            evaluate_admission(
+                p_bound_remote, store, principal_id="op-1", caller_role="operator",
+                caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4,
+                clock=self.clock,
+            )
 
-    def test_live_authority_receipt_reuse_revocation_and_silverblue_alias(self) -> None:
+    def test_descriptor_anchored_ancestors_revocation_and_silverblue_alias(self) -> None:
         skill_root = _make_skill_tree(self.root, "builtin", "firstmate-guide", b"# Skill\n")
         plan = compile_workflow_plan(_supervisor_toml(), is_builtin=True, skill_root=skill_root, model_catalog=self.catalog)
         store = RunAuthorityStore()
 
-        # operator_direct mints finite lease that expires cleanly
-        receipt = evaluate_admission(
+        # Writable non-sticky ancestor directory causes refusal BEFORE publication
+        anc = self.root / "anc_writable"
+        anc.mkdir(mode=0o700)
+        child_stage = anc / "stage"
+        child_stage.mkdir(mode=0o700)
+        os.chmod(child_stage, 0o700)
+        os.chmod(anc, 0o770)  # group-writable non-sticky ancestor!
+        r_anc = evaluate_admission(
             plan, store, principal_id="op-1", caller_role="operator",
-            caller_subtree=frozenset(), active_orchestrator_runs=0, max_active_orchestrator_runs=4,
-            clock=self.clock, operator_lease_ttl_s=60.0,
-        )
-        expired_clock = ClockSnapshot(monotonic_s=200.0, wall_s=1061.0)
-        with self.assertRaises(AuthorityError):
-            materialize_workflow_plan(plan, receipt, authority_store=store, clock=expired_clock, staging_root=self.staging)
-
-        # Revocation between admission and materialization yields ZERO files written
-        receipt_rev = evaluate_admission(
-            plan, store, principal_id="op-1", caller_role="operator",
-            caller_subtree=frozenset(), active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
-        )
-        store.revoke_run(receipt_rev.run_id)
-        with self.assertRaises(AuthorityError):
-            materialize_workflow_plan(plan, receipt_rev, authority_store=store, clock=self.clock, staging_root=self.staging)
-        self.assertEqual(list(self.staging.iterdir()), [])
-
-        # Receipt reuse for second materialization fails closed
-        receipt_ok = evaluate_admission(
-            plan, store, principal_id="op-1", caller_role="operator",
-            caller_subtree=frozenset(), active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
-        )
-        materialize_workflow_plan(plan, receipt_ok, authority_store=store, clock=self.clock, staging_root=self.staging)
-        with self.assertRaises(MaterializationError):
-            materialize_workflow_plan(plan, receipt_ok, authority_store=store, clock=self.clock, staging_root=self.staging)
-
-        # Forbidden sandbox root rejected
-        sandbox_home = self.root / "sandbox_home"
-        sandbox_home.mkdir(mode=0o700)
-        os.chmod(sandbox_home, 0o700)
-        r_sb = evaluate_admission(
-            plan, store, principal_id="op-1", caller_role="operator",
-            caller_subtree=frozenset(), active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
         )
         with self.assertRaises(MaterializationError):
-            materialize_workflow_plan(
-                plan, r_sb, authority_store=store, clock=self.clock,
-                staging_root=sandbox_home, forbidden_sandbox_roots=(sandbox_home,),
-            )
+            materialize_workflow_plan(plan, r_anc, authority_store=store, clock=self.clock, staging_root=child_stage)
+        self.assertEqual(list(child_stage.iterdir()), [])
+        os.chmod(anc, 0o700)
 
-        # User-owned symlink ancestor rejected; root-owned OS alias (Silverblue pattern) accepted
+        # Swapping ancestor to user-owned symlink causes refusal; root-owned OS alias succeeds
         real_var = self.root / "var_home"
         real_var.mkdir(mode=0o700)
         os.chmod(real_var, 0o700)
@@ -587,57 +613,99 @@ class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
         aliased_stage = home_alias / "stage"
 
         with self.assertRaises(MaterializationError):
-            materialize_workflow_plan(
-                plan, r_sb, authority_store=store, clock=self.clock, staging_root=aliased_stage,
-            )
+            materialize_workflow_plan(plan, r_anc, authority_store=store, clock=self.clock, staging_root=aliased_stage)
         artifacts = materialize_workflow_plan(
-            plan, r_sb, authority_store=store, clock=self.clock,
-            staging_root=aliased_stage,
-            root_alias_checker=lambda p: p == home_alias,
+            plan, r_anc, authority_store=store, clock=self.clock,
+            staging_root=aliased_stage, root_alias_checker=lambda p: p == home_alias,
         )
         self.assertTrue(artifacts.skill_path.exists())
 
-    def test_observe_only_effect_allowlist_scope_narrowing_and_nonexclusive_lane(self) -> None:
+        # Revocation between admission and materialization yields ZERO files written
+        r_rev = evaluate_admission(
+            plan, store, principal_id="op-1", caller_role="operator",
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
+        )
+        store.revoke_run(r_rev.run_id)
+        with self.assertRaises(AuthorityError):
+            materialize_workflow_plan(plan, r_rev, authority_store=store, clock=self.clock, staging_root=self.staging)
+        self.assertEqual(list(self.staging.iterdir()), [])
+
+        # compile_workflow_plan rejects skill_root inside forbidden_sandbox_roots and '..' paths
+        sup_toml = _supervisor_toml()
+        with self.assertRaises(MaterializationError):
+            compile_workflow_plan(
+                sup_toml, is_builtin=True, skill_root=skill_root, model_catalog=self.catalog,
+                forbidden_sandbox_roots=(skill_root,),
+            )
+        dotdot_skill = skill_root / "builtin" / ".." / "builtin"
+        with self.assertRaises(MaterializationError):
+            compile_workflow_plan(sup_toml, is_builtin=True, skill_root=dotdot_skill, model_catalog=self.catalog)
+
+        # Approved root alias pointing to a user-owned 2nd-hop symlink MUST fail closed!
+        hop2_link = self.root / "user_hop2"
+        os.symlink(real_var, hop2_link)
+        hop1_alias = self.root / "root_hop1"
+        os.symlink(hop2_link, hop1_alias)
+        r_hop = evaluate_admission(
+            plan, store, principal_id="op-1", caller_role="operator",
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
+        )
+        hop_stage = hop1_alias / "stage"
+        with self.assertRaises(MaterializationError):
+            materialize_workflow_plan(
+                plan, r_hop, authority_store=store, clock=self.clock,
+                staging_root=hop_stage, root_alias_checker=lambda p: p == hop1_alias,
+            )
+
+        # Boolean TTL and NaN lease expiry rejected
+        with self.assertRaises(AdmissionDeniedError):
+            evaluate_admission(
+                plan, store, principal_id="op-1", caller_role="operator",
+                caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4,
+                clock=self.clock, operator_lease_ttl_s=True,  # type: ignore[arg-type]
+            )
+        with self.assertRaises(AdmissionDeniedError):
+            WorkflowRunLease(
+                run_id="r_nan", grant_generation=1, principal_id="op-1", owner_role="operator",
+                workflow_id=plan.spec.id, workflow_plan_digest=plan.workflow_plan_digest,
+                expires_at_wall_s=math.nan,
+            )
+
+        # Forbidden sandbox root rejected
+        sandbox_home = self.root / "sandbox_home"
+        sandbox_home.mkdir(mode=0o700)
+        os.chmod(sandbox_home, 0o700)
+        r_sb = evaluate_admission(
+            plan, store, principal_id="op-1", caller_role="operator",
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
+        )
+        with self.assertRaises(MaterializationError):
+            materialize_workflow_plan(
+                plan, r_sb, authority_store=store, clock=self.clock,
+                staging_root=sandbox_home, forbidden_sandbox_roots=(sandbox_home,),
+            )
+
+    def test_observe_only_nonexclusive_lane_incarnation_revocation_and_pause(self) -> None:
         skill_root = _make_skill_tree(self.root, "user", "observer-guide", b"# Obs\n")
         _make_skill_tree(self.root, "builtin", "firstmate-guide", b"# Sup\n")
         store = RunAuthorityStore()
         lanes = LaneLeaseRegistry()
+        subtree_a = frozenset({"local/lane-a"})
 
-        # Hidden disallowed effect in signal handler fails observe_only auto-admission even at $0 spend
         bad_sig = '\n[[signal_handlers]]\nsignal = "go"\neffects = ["nudge_sandbox"]\n'
         p_bad = compile_workflow_plan(
-            _observe_only_toml(extra_signals=bad_sig),
-            is_builtin=False,
-            skill_root=skill_root,
-            model_catalog=self.catalog,
+            _observe_only_toml(extra_signals=bad_sig), is_builtin=False, skill_root=skill_root, model_catalog=self.catalog,
         )
         with self.assertRaises(AdmissionDeniedError):
             evaluate_admission(
                 p_bad, store, principal_id="orch-1", caller_role="orchestrator",
-                caller_subtree=frozenset({"local/lane-a"}), active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
+                caller_subtree=subtree_a, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
             )
 
-        # Non-zero decisions call cap fails observe_only auto-admission even at $0 spend
-        p_bad_calls = compile_workflow_plan(
-            _observe_only_toml(decisions_calls=5),
-            is_builtin=False,
-            skill_root=skill_root,
-            model_catalog=self.catalog,
-        )
-        with self.assertRaises(AdmissionDeniedError):
-            evaluate_admission(
-                p_bad_calls, store, principal_id="orch-1", caller_role="orchestrator",
-                caller_subtree=frozenset({"local/lane-a"}), active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
-            )
-
-        # Clean observe_only auto-admits with nonexclusive_observer; scope narrowed to plan.bound_targets!
         p_obs = compile_workflow_plan(
             _observe_only_toml(bound_targets='["local/lane-a"]'),
-            is_builtin=False,
-            skill_root=skill_root,
-            model_catalog=self.catalog,
+            is_builtin=False, skill_root=skill_root, model_catalog=self.catalog,
         )
-        # Caller subtree is wider (includes lane-b), but plan only binds lane-a!
         r_obs = evaluate_admission(
             p_obs, store, principal_id="orch-1", caller_role="orchestrator",
             caller_subtree=frozenset({"local/lane-a", "local/lane-b"}),
@@ -646,49 +714,44 @@ class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
         lane_a = TargetIncarnation("local/lane-a", "inc-1")
         lane_b = TargetIncarnation("local/lane-b", "inc-2")
 
-        # Target inside caller_subtree but OUTSIDE plan.bound_targets MUST FAIL!
+        # Target inside caller_subtree but outside plan.bound_targets fails closed
         with self.assertRaises(AuthorityError):
             lanes.attach(lane_b, receipt=r_obs, authority_store=store, clock=self.clock)
 
-        # Attach observer first (even paused!), then operator starts owning workflow on SAME incarnation!
+        # Observer attaches first (even paused); operator still acquires exclusive lease on SAME incarnation!
         lanes.attach(lane_a, receipt=r_obs, authority_store=store, clock=self.clock)
         lanes.pause(r_obs.run_id)
         self.assertIsNone(lanes.exclusive_owner(lane_a))
         self.assertIn(r_obs.run_id, lanes.observers(lane_a))
-        with self.assertRaises(LaneAuthorityError):
-            lanes.assert_can_nudge(r_obs, lane_a, authority_store=store, clock=self.clock)
-        lanes.assert_can_observe(r_obs, lane_a, authority_store=store, clock=self.clock)
 
         p_owner = compile_workflow_plan(
             _supervisor_toml(), is_builtin=True, skill_root=skill_root, model_catalog=self.catalog,
         )
         r_owner = evaluate_admission(
             p_owner, store, principal_id="op-1", caller_role="operator",
-            caller_subtree=frozenset(), active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
         )
         lanes.attach(lane_a, receipt=r_owner, authority_store=store, clock=self.clock)
-        self.assertEqual(lanes.exclusive_owner(lane_a), r_owner.run_id)
         lanes.assert_can_nudge(r_owner, lane_a, authority_store=store, clock=self.clock)
 
-        # Second exclusive owner on same incarnation fails
+        # Pausing owner blocks assert_can_nudge and assert_can_act!
+        lanes.pause(r_owner.run_id)
+        with self.assertRaises(LaneAuthorityError):
+            lanes.assert_can_nudge(r_owner, lane_a, authority_store=store, clock=self.clock)
+        with self.assertRaises(LaneAuthorityError):
+            lanes.assert_can_act(r_owner, lane_a, action="health_escalate_human", authority_store=store, clock=self.clock)
+        lanes.resume(r_owner.run_id)
+
+        # Second exclusive owner rejected
         r_owner2 = evaluate_admission(
             p_owner, store, principal_id="op-2", caller_role="operator",
-            caller_subtree=frozenset(), active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
         )
         with self.assertRaises(LaneOwnershipConflictError):
             lanes.attach(lane_a, receipt=r_owner2, authority_store=store, clock=self.clock)
 
-        # Operator launching observe_only STILL gets nonexclusive_observer!
-        r_op_obs = evaluate_admission(
-            p_obs, store, principal_id="op-1", caller_role="operator",
-            caller_subtree=frozenset(), active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
-        )
-        lanes.attach(lane_a, receipt=r_op_obs, authority_store=store, clock=self.clock)
-        self.assertEqual(lanes.exclusive_owner(lane_a), r_owner.run_id)
-        self.assertIn(r_op_obs.run_id, lanes.observers(lane_a))
-
-        # Tier-A leased duplicate run_id reuse rejected
-        lease = WorkflowRunLease(
+        # Duplicate Tier-A run_id reuse rejected
+        dup_lease = WorkflowRunLease(
             run_id=r_owner.run_id,
             grant_generation=2,
             principal_id="op-1",
@@ -700,21 +763,23 @@ class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
         with self.assertRaises(AdmissionDeniedError):
             evaluate_admission(
                 p_owner, store, principal_id="op-1", caller_role="operator",
-                caller_subtree=frozenset(), active_orchestrator_runs=0, max_active_orchestrator_runs=4,
-                clock=self.clock, tier_a_lease=lease,
+                caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4,
+                clock=self.clock, tier_a_lease=dup_lease,
             )
 
-        # Revoking target incarnation clears both maps
-        lanes.revoke_target_incarnation(lane_a)
+        # Revoking target incarnation permanently blocks reattachment of that revoked incarnation!
+        lanes.revoke_target_incarnation(lane_a, authority_store=store)
         self.assertIsNone(lanes.exclusive_owner(lane_a))
-        self.assertEqual(lanes.observers(lane_a), frozenset())
+        with self.assertRaises(AuthorityError):
+            lanes.attach(lane_a, receipt=r_owner, authority_store=store, clock=self.clock)
 
-        # Mixed-role guard rejects attaching the same run_id with a conflicting lane_access role
-        lanes.attach(lane_a, receipt=r_obs, authority_store=store, clock=self.clock)
+        # Mixed-role guard tested on a fresh unrevoked incarnation
+        lane_a_fresh = TargetIncarnation("local/lane-a", "inc-fresh")
+        lanes.attach(lane_a_fresh, receipt=r_obs, authority_store=store, clock=self.clock)
         rec_obs = store.verify_active(r_obs, clock=self.clock)
         rec_obs.lane_access = "exclusive_owner"
         with self.assertRaises(MixedLaneRoleError):
-            lanes.attach(lane_a, receipt=r_obs, authority_store=store, clock=self.clock)
+            lanes.attach(lane_a_fresh, receipt=r_obs, authority_store=store, clock=self.clock)
 
 
 if __name__ == "__main__":
