@@ -8,7 +8,6 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
-import secrets
 import shlex
 import socket
 import ssl
@@ -31,6 +30,7 @@ for _p in (str(_SPIKE_DIR), str(_REPO_ROOT)):
 import oc_controller as occ  # noqa: E402
 from oc_broker_common import (  # noqa: E402
     BrokerAuthError,
+    BrokerError,
     BrokerLease,
     BrokerPolicyError,
     CanaryLeakError,
@@ -44,10 +44,13 @@ from oc_broker_pg import (  # noqa: E402
     PG_PROTOCOL_V3,
     PG_SSL_REQUEST,
     PgBrokerRoute,
+    _build_redaction_pattern,
     encode_pg_frame,
     encode_pg_startup,
+    filter_parameter_status_body,
     read_pg_control_frame,
     recv_exact,
+    scrub_error_or_notice_body,
     validate_pg_route,
 )
 from oc_broker_ssh import (  # noqa: E402
@@ -55,6 +58,7 @@ from oc_broker_ssh import (  # noqa: E402
     SshApprovalAdapter,
     SshRawOutput,
     SshTarget,
+    _run_streaming_subprocess,
     compute_ssh_command_digest,
 )
 
@@ -152,6 +156,10 @@ class _MockUpstreamPgServer:
         auth_mode: str = "scram",
         reject_ssl: bool = False,
         corrupt_server_v: bool = False,
+        repeat_auth: bool = False,
+        scram_override: str | None = None,
+        duplicate_backend_key: bool = False,
+        stall_cancel: bool = False,
         real_pid: int = 424242,
         real_key: int = 989898,
     ):
@@ -160,6 +168,10 @@ class _MockUpstreamPgServer:
         self._auth_mode = auth_mode
         self._reject_ssl = reject_ssl
         self._corrupt_server_v = corrupt_server_v
+        self._repeat_auth = repeat_auth
+        self._scram_override = scram_override
+        self._duplicate_backend_key = duplicate_backend_key
+        self._stall_cancel = stall_cancel
         self.real_pid = real_pid
         self.real_key = real_key
         self.state = _MockPgState()
@@ -210,6 +222,9 @@ class _MockUpstreamPgServer:
             if self._reject_ssl:
                 conn.sendall(b"N")
                 return
+            if self._stall_cancel and self.state.startups:
+                time.sleep(2.5)
+                return
             conn.sendall(b"S")
             conn = self._ssl_ctx.wrap_socket(conn, server_side=True)
             self._handle_tls_session(conn)
@@ -239,6 +254,11 @@ class _MockUpstreamPgServer:
         self._query_loop(conn)
 
     def _run_auth(self, conn: socket.socket) -> bool:
+        if self._repeat_auth:
+            conn.sendall(encode_pg_frame(b"R", struct.pack("!I", 3)))
+            read_pg_control_frame(conn)
+            conn.sendall(encode_pg_frame(b"R", struct.pack("!I", 3)))
+            return False
         if self._auth_mode == "ok":
             conn.sendall(encode_pg_frame(b"R", struct.pack("!I", 0)))
             return True
@@ -277,6 +297,21 @@ class _MockUpstreamPgServer:
         c_first_bare = c_first.split(",,", 1)[1]
         c_nonce = c_first_bare.split("r=", 1)[1]
 
+        if self._scram_override == "bad_utf8":
+            conn.sendall(encode_pg_frame(b"R", struct.pack("!I", 11) + b"\xff\xfe"))
+            return False
+        if self._scram_override == "empty_salt":
+            s_first = f"r={c_nonce}srv,s=,i=4096"
+            conn.sendall(encode_pg_frame(b"R", struct.pack("!I", 11) + s_first.encode("utf-8")))
+            return False
+        if self._scram_override == "mandatory_ext":
+            s_first = f"m=unsupported,r={c_nonce}srv,s=MTIzNA==,i=4096"
+            conn.sendall(encode_pg_frame(b"R", struct.pack("!I", 11) + s_first.encode("utf-8")))
+            return False
+
+        return self._finish_scram(conn, c_first_bare, c_nonce)
+
+    def _finish_scram(self, conn: socket.socket, c_first_bare: str, c_nonce: str) -> bool:
         salt = b"0123456789abcdef"
         iters = 4096
         s_nonce = c_nonce + "srvnonce99"
@@ -311,6 +346,8 @@ class _MockUpstreamPgServer:
         conn.sendall(_encode_param_status("session_authorization", self._user))
         conn.sendall(_encode_param_status("application_name", "secret_app"))
         conn.sendall(encode_pg_frame(b"K", struct.pack("!II", self.real_pid, self.real_key)))
+        if self._duplicate_backend_key:
+            conn.sendall(encode_pg_frame(b"K", struct.pack("!II", self.real_pid + 1, self.real_key + 1)))
         conn.sendall(encode_pg_frame(b"Z", b"I"))
 
     def _query_loop(self, conn: socket.socket) -> None:
@@ -335,7 +372,7 @@ class _MockUpstreamPgServer:
             conn.sendall(encode_pg_frame(b"Z", b"I"))
             return
         if sql == "SELECT err":
-            msg = f"host {MOCK_PG_HOST} (127.0.0.1) role {self._user} pw {self._password}"
+            msg = f"host {MOCK_PG_HOST.upper()} (127.0.0.1) role {self._user} pw {self._password}"
             conn.sendall(_encode_kv_frame(b"E", [(b"S", "ERROR"), (b"C", "42501"), (b"M", msg)]))
             conn.sendall(encode_pg_frame(b"Z", b"I"))
             return
@@ -364,18 +401,22 @@ def _client_handshake(
 ) -> tuple[dict[str, str], tuple[int, int] | None]:
     if send_ssl:
         sock.sendall(struct.pack("!II", 8, PG_SSL_REQUEST))
-        assert recv_exact(sock, 1) == b"N"
+        if recv_exact(sock, 1) != b"N":
+            raise AssertionError("Expected 'N' reply to SSLRequest")
     if send_gss:
         sock.sendall(struct.pack("!II", 8, PG_GSSENC_REQUEST))
-        assert recv_exact(sock, 1) == b"N"
+        if recv_exact(sock, 1) != b"N":
+            raise AssertionError("Expected 'N' reply to GSSENCRequest")
     sock.sendall(encode_pg_startup(startup_user, startup_db, startup_options))
 
     mtype, body = read_pg_control_frame(sock)
-    assert mtype == b"R" and struct.unpack("!I", body[:4])[0] == 3
+    if mtype != b"R" or struct.unpack("!I", body[:4])[0] != 3:
+        raise AssertionError("Expected AuthenticationCleartextPassword")
     sock.sendall(encode_pg_frame(b"p", token.encode("utf-8") + b"\x00"))
 
     mtype, body = read_pg_control_frame(sock)
-    assert mtype == b"R" and struct.unpack("!I", body[:4])[0] == 0
+    if mtype != b"R" or struct.unpack("!I", body[:4])[0] != 0:
+        raise AssertionError("Expected AuthenticationOk")
 
     params: dict[str, str] = {}
     key_data: tuple[int, int] | None = None
@@ -401,6 +442,15 @@ def _parse_error_fields(body: bytes) -> dict[str, str]:
         out[code.decode("ascii")] = body[pos + 1 : nul].decode("utf-8")
         pos = nul + 1
     return out
+
+
+def _assert_socket_closed(sock: socket.socket) -> None:
+    try:
+        data = sock.recv(16)
+    except ConnectionResetError:
+        data = b""
+    if data != b"":
+        raise AssertionError(f"Expected closed socket, got {data!r}")
 
 
 def _loopback_resolver(host: str, port: int, **_kw: object) -> list[object]:
@@ -456,7 +506,7 @@ class TestHostPostgresBroker(unittest.TestCase):
             pair_distinct_secret_ref="keeper:pg_rw",
         )
 
-    def test_pg_route_ro_rw_distinctness_fail_closed(self) -> None:
+    def test_pg_route_distinctness_and_control_char_rejection(self) -> None:
         vault = self._make_vault()
         validate_pg_route(self._make_route(5432), vault)
 
@@ -486,6 +536,26 @@ class TestHostPostgresBroker(unittest.TestCase):
         )
         with self.assertRaises(BrokerPolicyError):
             validate_pg_route(same_pw, vault)
+
+        nul_user = PgBrokerRoute(
+            route_id="pg:bad3",
+            upstream_host=MOCK_PG_HOST,
+            upstream_port=5432,
+            upstream_database=MOCK_PG_DB,
+            upstream_user="app\x00options",
+            secret_ref="keeper:pg_ro",
+        )
+        with self.assertRaises(BrokerPolicyError):
+            validate_pg_route(nul_user, vault)
+
+        # Non-loopback TCP listener host rejected
+        with self.assertRaises(BrokerPolicyError):
+            HostPostgresBrokerServer(
+                self._make_route(5432),
+                vault,
+                BrokerLease("job_non_loopback"),
+                host=_ip(0, 0, 0, 0),
+            )
 
     def test_pg_upstream_ssl_refusal_aborts_no_downgrade(self) -> None:
         mock = _MockUpstreamPgServer(self._cert_path, self._key_path, reject_ssl=True)
@@ -558,12 +628,47 @@ class TestHostPostgresBroker(unittest.TestCase):
             srv.stop()
             mock.stop()
 
-    def test_pg_scram_bad_server_v_rejected(self) -> None:
+    def test_pg_scram_edge_cases_and_repeated_auth_rejected(self) -> None:
+        cases = [
+            {"corrupt_server_v": True},
+            {"scram_override": "bad_utf8"},
+            {"scram_override": "empty_salt"},
+            {"scram_override": "mandatory_ext"},
+            {"repeat_auth": True},
+        ]
+        for idx, kwargs in enumerate(cases):
+            mock = _MockUpstreamPgServer(self._cert_path, self._key_path, auth_mode="scram", **kwargs)
+            mock.start()
+            lease = BrokerLease(f"job_scram_edge_{idx}")
+            srv = HostPostgresBrokerServer(
+                self._make_route(mock.port),
+                self._make_vault(),
+                lease,
+                resolver=_loopback_resolver,
+                allow_test_loopback=True,
+                ssl_context=self._client_ssl,
+            )
+            srv.start()
+            try:
+                sock = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
+                try:
+                    sock.sendall(encode_pg_startup("u", "d"))
+                    read_pg_control_frame(sock)
+                    sock.sendall(encode_pg_frame(b"p", lease.ocjob_token.encode("utf-8") + b"\x00"))
+                    with self.subTest(case=kwargs), self.assertRaises(EOFError):
+                        read_pg_control_frame(sock)
+                finally:
+                    sock.close()
+            finally:
+                srv.stop()
+                mock.stop()
+
+    def test_pg_duplicate_backend_key_data_rejected(self) -> None:
         mock = _MockUpstreamPgServer(
-            self._cert_path, self._key_path, auth_mode="scram", corrupt_server_v=True
+            self._cert_path, self._key_path, duplicate_backend_key=True
         )
         mock.start()
-        lease = BrokerLease("job_bad_scram")
+        lease = BrokerLease("job_dup_k")
         srv = HostPostgresBrokerServer(
             self._make_route(mock.port),
             self._make_vault(),
@@ -576,11 +681,8 @@ class TestHostPostgresBroker(unittest.TestCase):
         try:
             sock = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
             try:
-                sock.sendall(encode_pg_startup("u", "d"))
-                read_pg_control_frame(sock)
-                sock.sendall(encode_pg_frame(b"p", lease.ocjob_token.encode("utf-8") + b"\x00"))
                 with self.assertRaises(EOFError):
-                    read_pg_control_frame(sock)
+                    _client_handshake(sock, lease.ocjob_token)
             finally:
                 sock.close()
         finally:
@@ -613,7 +715,7 @@ class TestHostPostgresBroker(unittest.TestCase):
                 srv.stop()
                 mock.stop()
 
-    def test_pg_client_bad_token_and_revoked_lease_errors(self) -> None:
+    def test_pg_client_bad_token_revoked_lease_and_ssl_retry_exhaustion(self) -> None:
         mock = _MockUpstreamPgServer(self._cert_path, self._key_path)
         mock.start()
         lease = BrokerLease("job_auth_err")
@@ -627,6 +729,16 @@ class TestHostPostgresBroker(unittest.TestCase):
         )
         srv.start()
         try:
+            # Exceed SSLRequest retries (>3)
+            sock_ssl = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
+            try:
+                for _ in range(4):
+                    sock_ssl.sendall(struct.pack("!II", 8, PG_SSL_REQUEST))
+                    self.assertEqual(recv_exact(sock_ssl, 1), b"N")
+                _assert_socket_closed(sock_ssl)
+            finally:
+                sock_ssl.close()
+
             sock = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
             try:
                 sock.sendall(encode_pg_startup("u", "d"))
@@ -670,32 +782,25 @@ class TestHostPostgresBroker(unittest.TestCase):
                 _, key_data = _client_handshake(sock, lease.ocjob_token)
                 assert key_data is not None
 
-                # Bad length (12 != 16) rejected
                 bad_c = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
                 try:
                     bad_c.sendall(struct.pack("!III", 12, PG_CANCEL_REQUEST, 1))
-                    try:
-                        data = bad_c.recv(16)
-                    except ConnectionResetError:
-                        data = b""
-                    self.assertEqual(data, b"")
+                    _assert_socket_closed(bad_c)
                 finally:
                     bad_c.close()
 
-                # Cross-job / unknown key ignored
                 other_c = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
                 try:
                     other_c.sendall(struct.pack("!IIII", 16, PG_CANCEL_REQUEST, mock.real_pid, mock.real_key))
-                    self.assertEqual(other_c.recv(16), b"")
+                    _assert_socket_closed(other_c)
                 finally:
                     other_c.close()
                 self.assertEqual(mock.state.cancels, [])
 
-                # Valid job-local cancel forwarded over TLS with real (pid, key) and socket closes
                 good_c = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
                 try:
                     good_c.sendall(struct.pack("!IIII", 16, PG_CANCEL_REQUEST, key_data[0], key_data[1]))
-                    self.assertEqual(good_c.recv(16), b"")
+                    _assert_socket_closed(good_c)
                 finally:
                     good_c.close()
                 self.assertTrue(mock.state.cancel_event.wait(timeout=2.0))
@@ -706,7 +811,7 @@ class TestHostPostgresBroker(unittest.TestCase):
             srv.stop()
             mock.stop()
 
-    def test_pg_frame_length_lt_4_rejected(self) -> None:
+    def test_pg_negative_and_huge_frame_lengths_rejected(self) -> None:
         mock = _MockUpstreamPgServer(self._cert_path, self._key_path)
         mock.start()
         lease = BrokerLease("job_badlen")
@@ -720,11 +825,42 @@ class TestHostPostgresBroker(unittest.TestCase):
         )
         srv.start()
         try:
-            sock = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
+            for bad_frame in (
+                b"Q" + struct.pack("!i", 3),
+                b"d" + struct.pack("!i", -1),
+                b"d" + struct.pack("!i", 0x3FFF_FFFF),
+            ):
+                sock = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
+                try:
+                    _client_handshake(sock, lease.ocjob_token)
+                    sock.sendall(bad_frame)
+                    _assert_socket_closed(sock)
+                finally:
+                    sock.close()
+        finally:
+            srv.stop()
+            mock.stop()
+
+    def test_pg_slowloris_total_handshake_deadline(self) -> None:
+        mock = _MockUpstreamPgServer(self._cert_path, self._key_path)
+        mock.start()
+        lease = BrokerLease("job_slowloris")
+        srv = HostPostgresBrokerServer(
+            self._make_route(mock.port),
+            self._make_vault(),
+            lease,
+            handshake_timeout=0.3,
+            resolver=_loopback_resolver,
+            allow_test_loopback=True,
+            ssl_context=self._client_ssl,
+        )
+        srv.start()
+        try:
+            sock = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=2.0)
             try:
-                _client_handshake(sock, lease.ocjob_token)
-                sock.sendall(b"Q" + struct.pack("!I", 3))
-                self.assertEqual(sock.recv(16), b"")
+                sock.sendall(b"\x00\x00")
+                time.sleep(0.45)
+                _assert_socket_closed(sock)
             finally:
                 sock.close()
         finally:
@@ -751,14 +887,13 @@ class TestHostPostgresBroker(unittest.TestCase):
                 sock.sendall(encode_pg_frame(b"Q", b"SELECT big\x00"))
                 hdr = recv_exact(sock, 5)
                 self.assertEqual(hdr[:1], b"D")
-                frame_len = struct.unpack("!I", hdr[1:5])[0]
+                frame_len = struct.unpack("!i", hdr[1:5])[0]
                 body = recv_exact(sock, frame_len - 4)
                 self.assertEqual(len(body), 6 + 300_000)
                 self.assertEqual(body[6:], b"A" * 300_000)
-                read_pg_control_frame(sock)  # CommandComplete
-                read_pg_control_frame(sock)  # ReadyForQuery
+                read_pg_control_frame(sock)
+                read_pg_control_frame(sock)
 
-                # Canary split across 16 KiB boundary aborts stream without leaking canary
                 sock.sendall(encode_pg_frame(b"Q", b"SELECT canary\x00"))
                 received = bytearray()
                 while True:
@@ -773,7 +908,13 @@ class TestHostPostgresBroker(unittest.TestCase):
             srv.stop()
             mock.stop()
 
-    def test_pg_error_and_notice_scrubbing_length_accurate(self) -> None:
+    def test_pg_error_notice_and_wire_format_strictness(self) -> None:
+        pat = _build_redaction_pattern(MOCK_PG_HOST, "127.0.0.1", MOCK_PG_USER, (MOCK_PG_PASSWORD,))
+        with self.assertRaises(BrokerPolicyError):
+            scrub_error_or_notice_body(b"Mhello\x00\x00trailing", pat)
+        with self.assertRaises(BrokerPolicyError):
+            filter_parameter_status_body(b"server_version\x0016.4\x00extra", pat)
+
         mock = _MockUpstreamPgServer(self._cert_path, self._key_path)
         mock.start()
         lease = BrokerLease("job_scrub")
@@ -794,7 +935,8 @@ class TestHostPostgresBroker(unittest.TestCase):
                 mtype, body = read_pg_control_frame(sock)
                 self.assertEqual(mtype, b"E")
                 fields = _parse_error_fields(body)
-                self.assertNotIn(MOCK_PG_HOST, fields["M"])
+                self.assertNotIn(MOCK_PG_HOST.upper(), fields["M"])
+                self.assertNotIn(MOCK_PG_HOST, fields["M"].lower())
                 self.assertNotIn("127.0.0.1", fields["M"])
                 self.assertNotIn(MOCK_PG_USER, fields["M"])
                 self.assertNotIn(MOCK_PG_PASSWORD, fields["M"])
@@ -816,7 +958,7 @@ class TestHostPostgresBroker(unittest.TestCase):
             srv.stop()
             mock.stop()
 
-    def test_pg_controller_revocation_sub_second_and_tls_cancel(self) -> None:
+    def test_pg_controller_revocation_sub_second_and_stalled_cancel_nonblocking(self) -> None:
         now = [100]
         op = occ.Principal(occ.Role.OPERATOR, "host_op")
         orch = occ.Principal(occ.Role.ORCHESTRATOR, "orch_1")
@@ -837,7 +979,7 @@ class TestHostPostgresBroker(unittest.TestCase):
         view = ctrl.view(op, prop.request_id)
         ctrl.decide(op, prop.request_id, view.payload.revision, view.digest, occ.Decision.APPROVE)
 
-        mock = _MockUpstreamPgServer(self._cert_path, self._key_path)
+        mock = _MockUpstreamPgServer(self._cert_path, self._key_path, stall_cancel=True)
         mock.start()
         lease = BrokerLease(
             "job_revoke_pg",
@@ -868,9 +1010,7 @@ class TestHostPostgresBroker(unittest.TestCase):
                 eof = sock.recv(16)
                 elapsed = time.monotonic() - t0
                 self.assertEqual(eof, b"")
-                self.assertLess(elapsed, 0.9)
-                self.assertTrue(mock.state.cancel_event.wait(timeout=0.9))
-                self.assertEqual(mock.state.cancels, [(mock.real_pid, mock.real_key)])
+                self.assertLess(elapsed, 0.8)
             finally:
                 sock.close()
         finally:
@@ -878,12 +1018,57 @@ class TestHostPostgresBroker(unittest.TestCase):
             srv.stop()
             mock.stop()
 
-    def test_pg_uds_0700_listener(self) -> None:
+    def test_pg_uds_0600_so_peercred_and_nonsocket_refusal(self) -> None:
         mock = _MockUpstreamPgServer(self._cert_path, self._key_path)
         mock.start()
-        lease = BrokerLease("job_uds")
-        uds_path = Path(self._tmpdir.name) / "pg_uds_dir" / "pg.sock"
-        srv = HostPostgresBrokerServer(
+        base = Path(self._tmpdir.name)
+        uds_dir = base / "pg_uds_dir"
+        uds_dir.mkdir(mode=0o700, exist_ok=True)
+
+        # Refuse to unlink an existing regular file
+        reg_file = uds_dir / "not_a_socket"
+        reg_file.write_text("keep me", encoding="utf-8")
+        srv_bad = HostPostgresBrokerServer(
+            self._make_route(mock.port),
+            self._make_vault(),
+            BrokerLease("job_uds_bad"),
+            uds_path=reg_file,
+            resolver=_loopback_resolver,
+            allow_test_loopback=True,
+            ssl_context=self._client_ssl,
+        )
+        with self.assertRaises(BrokerPolicyError):
+            srv_bad.start()
+        self.assertTrue(reg_file.exists())
+
+        # Valid 0o600 UDS + SO_PEERCRED mismatch test
+        uds_path = uds_dir / "pg.sock"
+        lease = BrokerLease("job_uds_ok")
+        srv_uid_mismatch = HostPostgresBrokerServer(
+            self._make_route(mock.port),
+            self._make_vault(),
+            lease,
+            uds_path=uds_path,
+            expected_uid=os.geteuid() + 1,
+            resolver=_loopback_resolver,
+            allow_test_loopback=True,
+            ssl_context=self._client_ssl,
+        )
+        srv_uid_mismatch.start()
+        try:
+            mode = stat.S_IMODE(os.lstat(uds_path).st_mode)
+            self.assertEqual(mode, 0o600)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(str(uds_path))
+                _assert_socket_closed(sock)
+            finally:
+                sock.close()
+        finally:
+            srv_uid_mismatch.stop()
+
+        # Matching UID succeeds
+        srv_ok = HostPostgresBrokerServer(
             self._make_route(mock.port),
             self._make_vault(),
             lease,
@@ -892,10 +1077,8 @@ class TestHostPostgresBroker(unittest.TestCase):
             allow_test_loopback=True,
             ssl_context=self._client_ssl,
         )
-        srv.start()
+        srv_ok.start()
         try:
-            mode = stat.S_IMODE(os.lstat(uds_path).st_mode)
-            self.assertEqual(mode, 0o700)
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 sock.connect(str(uds_path))
@@ -905,7 +1088,7 @@ class TestHostPostgresBroker(unittest.TestCase):
             finally:
                 sock.close()
         finally:
-            srv.stop()
+            srv_ok.stop()
             mock.stop()
 
 
@@ -913,6 +1096,7 @@ class TestHostSshBroker(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
         self._root = Path(self._tmpdir.name)
+        os.chmod(self._root, 0o700)
         self._sandbox = self._root / "sandbox"
         self._sandbox.mkdir(mode=0o700)
         self._kh = self._root / "known_hosts"
@@ -936,7 +1120,7 @@ class TestHostSshBroker(unittest.TestCase):
         kwargs.update(overrides)
         return SshTarget(**kwargs)  # type: ignore[arg-type]
 
-    def test_ssh_presets_exact_argv_shell_false_and_shlex_quote(self) -> None:
+    def test_ssh_presets_exact_hardened_argv_and_dns_pinning(self) -> None:
         calls: list[tuple[list[str], float, bool]] = []
 
         def _fake_runner(argv: list[str], *, timeout: float, shell: bool = False) -> SshRawOutput:
@@ -956,37 +1140,42 @@ class TestHostSshBroker(unittest.TestCase):
         broker.run_preset(target, "podman_ps", {"filter_name": "web_01"})
 
         self.assertEqual(len(calls), 4)
+        expected_ip = _ip(93, 184, 216, 34)
+        expected_prefix = [
+            "ssh",
+            "-F", "/dev/null",
+            "-n",
+            "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ForwardAgent=no",
+            "-o", "ClearAllForwardings=yes",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", f"UserKnownHostsFile={self._kh.resolve()}",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
+            "-o", "ControlPersist=no",
+            "-o", "ProxyCommand=none",
+            "-o", "ProxyJump=none",
+            "-o", "PermitLocalCommand=no",
+            "-o", "Tunnel=no",
+            "-o", f"HostName={expected_ip}",
+            "-o", "HostKeyAlias=ops.example.com",
+            "-o", "ConnectTimeout=10",
+            "-p", "2222",
+            "--",
+            "ops_ro@ops.example.com",
+        ]
         for argv, timeout, shell in calls:
             self.assertFalse(shell)
             self.assertEqual(timeout, 15.0)
-            self.assertEqual(argv[:15], [
-                "ssh",
-                "-o", "BatchMode=yes",
-                "-o", "ForwardAgent=no",
-                "-o", "ClearAllForwardings=yes",
-                "-o", "StrictHostKeyChecking=yes",
-                "-o", f"UserKnownHostsFile={self._kh.resolve()}",
-                "-o", "IdentitiesOnly=yes",
-                "-o", "ConnectTimeout=10",
-            ])
-            self.assertEqual(argv[15:19], ["-p", "2222", "--", "ops_ro@ops.example.com"])
+            self.assertEqual(argv[:-1], expected_prefix)
 
-        self.assertEqual(
-            calls[0][0][19],
-            "journalctl --no-pager -n 50 -u caddy@prod.service",
-        )
-        self.assertEqual(
-            calls[1][0][19],
-            "systemctl status --no-pager -- postgresql.service",
-        )
-        self.assertEqual(
-            calls[2][0][19],
-            "df -h -- /var/lib/containers",
-        )
-        self.assertEqual(
-            calls[3][0][19],
-            "podman ps --format json --filter name=web_01",
-        )
+        self.assertEqual(calls[0][0][-1], "journalctl --no-pager -n 50 -u caddy@prod.service")
+        self.assertEqual(calls[1][0][-1], "systemctl status --no-pager -- postgresql.service")
+        self.assertEqual(calls[2][0][-1], "df -h -- /var/lib/containers")
+        self.assertEqual(calls[3][0][-1], "podman ps --format json --filter name=web_01")
 
     def test_ssh_injection_and_target_validation_fail_closed(self) -> None:
         broker = HostSshBroker(
@@ -1021,7 +1210,6 @@ class TestHostSshBroker(unittest.TestCase):
             with self.subTest(target=bad_target), self.assertRaises(BrokerPolicyError):
                 broker.run_preset(bad_target, "df")
 
-        # Loopback/metadata blocked by default
         loopback_broker = HostSshBroker(
             runner=lambda *_a, **_k: SshRawOutput(0, b"", b""),
             sandbox_root=self._sandbox,
@@ -1036,13 +1224,11 @@ class TestHostSshBroker(unittest.TestCase):
             sandbox_root=self._sandbox,
         )
 
-        # Symlink rejected
         sym = self._root / "kh_symlink"
         sym.symlink_to(self._kh)
         with self.assertRaises(BrokerPolicyError):
             broker.run_preset(self._make_target(known_hosts_path=sym), "df")
 
-        # Hardlink rejected
         hl_src = self._root / "kh_hard_src"
         hl_src.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
         os.chmod(hl_src, 0o600)
@@ -1051,19 +1237,23 @@ class TestHostSshBroker(unittest.TestCase):
         with self.assertRaises(BrokerPolicyError):
             broker.run_preset(self._make_target(known_hosts_path=hl_dst), "df")
 
-        # Group-readable 0o640 rejected
         open_kh = self._root / "kh_open"
         open_kh.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
         os.chmod(open_kh, 0o640)
         with self.assertRaises(BrokerPolicyError):
             broker.run_preset(self._make_target(known_hosts_path=open_kh), "df")
 
-        # Inside $SB rejected
         sb_kh = self._sandbox / "known_hosts"
         sb_kh.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
         os.chmod(sb_kh, 0o600)
         with self.assertRaises(BrokerPolicyError):
             broker.run_preset(self._make_target(known_hosts_path=sb_kh), "df")
+
+        pct_kh = self._root / "kh_%h_expand"
+        pct_kh.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
+        os.chmod(pct_kh, 0o600)
+        with self.assertRaises(BrokerPolicyError):
+            broker.run_preset(self._make_target(known_hosts_path=pct_kh), "df")
 
     def _make_ssh_controller(self) -> tuple[occ.Controller, SshApprovalAdapter, list[int], occ.Principal, occ.Principal]:
         now = [100]
@@ -1085,7 +1275,7 @@ class TestHostSshBroker(unittest.TestCase):
         ctrl._set_alias("ssh_ops_alias", "ssh_ops_host")
         return ctrl, adapter, now, op, job_p
 
-    def test_ssh_controller_apply_once_gate_and_quoting(self) -> None:
+    def test_ssh_controller_apply_once_gate_and_full_target_binding(self) -> None:
         ctrl, adapter, now, op, job_p = self._make_ssh_controller()
         captured: list[list[str]] = []
 
@@ -1102,135 +1292,161 @@ class TestHostSshBroker(unittest.TestCase):
         target = self._make_target()
         cmd = ["systemctl", "restart", "my app;echo pwned"]
 
+        # Reject env-var assignment smuggling and C0 control chars in custom argv
+        with self.assertRaises(BrokerPolicyError):
+            broker.propose_custom_command(
+                target, ["LD_PRELOAD=/tmp/x.so", "id"],
+                controller=ctrl, job_actor=job_p, alias="ssh_ops_alias",
+                reference="ref_ssh_apply", target_id="ssh_ops_host",
+            )
+        with self.assertRaises(BrokerPolicyError):
+            broker.propose_custom_command(
+                target, ["echo", "bad\x1bseq"],
+                controller=ctrl, job_actor=job_p, alias="ssh_ops_alias",
+                reference="ref_ssh_apply", target_id="ssh_ops_host",
+            )
+
         prop, digest = broker.propose_custom_command(
-            target,
-            cmd,
-            controller=ctrl,
-            job_actor=job_p,
-            alias="ssh_ops_alias",
-            reference="ref_ssh_apply",
-            target_id="ssh_ops_host",
+            target, cmd,
+            controller=ctrl, job_actor=job_p, alias="ssh_ops_alias",
+            reference="ref_ssh_apply", target_id="ssh_ops_host",
         )
-        self.assertEqual(digest, compute_ssh_command_digest(target.user, target.host, target.port, cmd))
+        self.assertEqual(
+            digest,
+            compute_ssh_command_digest(
+                target.user, target.host, target.port, cmd,
+                known_hosts_path=self._kh.resolve(), allowed_cidrs=(),
+            ),
+        )
 
         # Unapproved fails closed
         with self.assertRaises(BrokerAuthError):
             broker.run_approved_command(
                 target, cmd, controller=ctrl, adapter=adapter, job_actor=job_p, request_id=prop.request_id
             )
-        self.assertEqual(captured, [])
 
-        # Operator approves
+        # Approve & execute
         view = ctrl.view(op, prop.request_id)
         self.assertEqual(view.payload.pin.revision, digest)
         ctrl.decide(op, prop.request_id, view.payload.revision, view.digest, occ.Decision.APPROVE)
-
-        # Approved command executes with shlex.quote protection on remote token
         res = broker.run_approved_command(
             target, cmd, controller=ctrl, adapter=adapter, job_actor=job_p, request_id=prop.request_id
         )
         self.assertEqual(res.stdout, b"restarted\n")
-        self.assertEqual(len(captured), 1)
-        expected_remote = " ".join(shlex.quote(tok) for tok in cmd)
-        self.assertEqual(captured[0][-1], expected_remote)
-        self.assertIn("'my app;echo pwned'", captured[0][-1])
+        self.assertEqual(captured[0][-1], " ".join(shlex.quote(tok) for tok in cmd))
 
-        # Replay of consumed APPLY_ONCE fails closed
+        # Replay fails closed
         with self.assertRaises(BrokerAuthError):
             broker.run_approved_command(
                 target, cmd, controller=ctrl, adapter=adapter, job_actor=job_p, request_id=prop.request_id
             )
 
-        # Tampered argv after approval fails closed
+        # Tampering known_hosts_path or allowed_cidrs after approval fails closed
+        alt_kh = self._root / "alt_known_hosts"
+        alt_kh.write_text("ops.example.com ssh-ed25519 AAAAalt\n", encoding="utf-8")
+        os.chmod(alt_kh, 0o600)
         prop2, _ = broker.propose_custom_command(
-            target,
-            ["systemctl", "reload", "caddy"],
-            controller=ctrl,
-            job_actor=job_p,
-            alias="ssh_ops_alias",
-            reference="ref_ssh_apply",
-            target_id="ssh_ops_host",
+            target, ["systemctl", "reload", "caddy"],
+            controller=ctrl, job_actor=job_p, alias="ssh_ops_alias",
+            reference="ref_ssh_apply", target_id="ssh_ops_host",
         )
         v2 = ctrl.view(op, prop2.request_id)
         ctrl.decide(op, prop2.request_id, v2.payload.revision, v2.digest, occ.Decision.APPROVE)
         with self.assertRaises(BrokerAuthError):
             broker.run_approved_command(
-                target,
-                ["systemctl", "stop", "caddy"],
-                controller=ctrl,
-                adapter=adapter,
-                job_actor=job_p,
-                request_id=prop2.request_id,
+                self._make_target(known_hosts_path=alt_kh),
+                ["systemctl", "reload", "caddy"],
+                controller=ctrl, adapter=adapter, job_actor=job_p, request_id=prop2.request_id,
             )
 
         # Expired proposal fails closed
         prop3, _ = broker.propose_custom_command(
-            target,
-            ["systemctl", "reload", "nginx"],
-            controller=ctrl,
-            job_actor=job_p,
-            alias="ssh_ops_alias",
-            reference="ref_ssh_apply",
-            target_id="ssh_ops_host",
+            target, ["systemctl", "reload", "nginx"],
+            controller=ctrl, job_actor=job_p, alias="ssh_ops_alias",
+            reference="ref_ssh_apply", target_id="ssh_ops_host",
         )
         v3 = ctrl.view(op, prop3.request_id)
         ctrl.decide(op, prop3.request_id, v3.payload.revision, v3.digest, occ.Decision.APPROVE)
         now[0] += 120
         with self.assertRaises(BrokerAuthError):
             broker.run_approved_command(
-                target,
-                ["systemctl", "reload", "nginx"],
-                controller=ctrl,
-                adapter=adapter,
-                job_actor=job_p,
-                request_id=prop3.request_id,
+                target, ["systemctl", "reload", "nginx"],
+                controller=ctrl, adapter=adapter, job_actor=job_p, request_id=prop3.request_id,
             )
 
         # Revoked proposal fails closed
         prop4, _ = broker.propose_custom_command(
-            target,
-            ["systemctl", "reload", "haproxy"],
-            controller=ctrl,
-            job_actor=job_p,
-            alias="ssh_ops_alias",
-            reference="ref_ssh_apply",
-            target_id="ssh_ops_host",
+            target, ["systemctl", "reload", "haproxy"],
+            controller=ctrl, job_actor=job_p, alias="ssh_ops_alias",
+            reference="ref_ssh_apply", target_id="ssh_ops_host",
         )
         v4 = ctrl.view(op, prop4.request_id)
         ctrl.decide(op, prop4.request_id, v4.payload.revision, v4.digest, occ.Decision.APPROVE)
         ctrl.revoke(op, prop4.request_id)
         with self.assertRaises(BrokerAuthError):
             broker.run_approved_command(
-                target,
-                ["systemctl", "reload", "haproxy"],
-                controller=ctrl,
-                adapter=adapter,
-                job_actor=job_p,
-                request_id=prop4.request_id,
+                target, ["systemctl", "reload", "haproxy"],
+                controller=ctrl, adapter=adapter, job_actor=job_p, request_id=prop4.request_id,
             )
 
-    def test_ssh_output_cap_and_canary_scrubbing(self) -> None:
+    def test_ssh_streaming_subprocess_cap_timeout_revoke_and_stderr_canary(self) -> None:
         secret = "SSH_CANARY_HOST_SECRET_774411/+"
-        target = self._make_target()
 
-        cap_broker = HostSshBroker(
-            runner=lambda *_a, **_k: SshRawOutput(0, b"Z" * 200, b""),
+        # Bounded streaming cap kills huge output producer without buffering in RAM
+        res = _run_streaming_subprocess(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'Z' * 500000)"],
+            timeout=5.0,
             max_output_bytes=64,
-            canary_secrets=[secret],
-            resolver=self._public_resolver,
-            sandbox_root=self._sandbox,
+            canary_secrets=(secret,),
         )
-        res = cap_broker.run_preset(target, "df")
         self.assertTrue(res.truncated)
         self.assertEqual(len(res.stdout), 64)
 
+        # Timeout wraps cleanly into BrokerError without leaking stdout
+        with self.assertRaises(BrokerError):
+            _run_streaming_subprocess(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                timeout=0.25,
+                max_output_bytes=1024,
+                canary_secrets=(secret,),
+            )
+
+        # Lease revocation kills in-flight subprocess in <1s
+        lease = BrokerLease("job_ssh_revoke")
+        def _revoke_soon() -> None:
+            time.sleep(0.1)
+            lease.revoke()
+
+        threading.Thread(target=_revoke_soon, daemon=True).start()
+        t0 = time.monotonic()
+        with self.assertRaises(BrokerAuthError):
+            _run_streaming_subprocess(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                timeout=5.0,
+                max_output_bytes=1024,
+                canary_secrets=(secret,),
+                lease=lease,
+            )
+        self.assertLess(time.monotonic() - t0, 0.9)
+
+        # Stderr canary abort on real streaming runner
+        with self.assertRaises(CanaryLeakError):
+            _run_streaming_subprocess(
+                [sys.executable, "-c", f"import sys; sys.stderr.write('err {secret}\\n')"],
+                timeout=5.0,
+                max_output_bytes=1024,
+                canary_secrets=(secret,),
+            )
+
+        # Stdout encoded canary variants via injectable runner
+        target = self._make_target()
         for leaked_bytes in (
             secret.encode("utf-8"),
             quote(secret, safe="").encode("ascii"),
             base64.b64encode(secret.encode("utf-8")).rstrip(b"="),
         ):
             leak_broker = HostSshBroker(
-                runner=lambda *_a, _b=leaked_bytes, **_k: SshRawOutput(0, b"hdr " + _b + b" end", b""),
+                runner=lambda *_a, _b=leaked_bytes, **_k: SshRawOutput(0, b"", b"err " + _b + b" end"),
                 canary_secrets=[secret],
                 resolver=self._public_resolver,
                 sandbox_root=self._sandbox,

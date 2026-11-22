@@ -1,11 +1,11 @@
 """Per-job message-framed Host Postgres v3 wire proxy for PRD L1 (Path A).
 
 Pure Python standard library only. Terminates sandbox Postgres connections on a
-pod-local TCP or 0o700 UDS listener, authenticates the disposable per-job
-ocjob_ token, connects upstream over strict TLS-only verify-full, pins upstream
-role/database/options, synthesizes job-local BackendKeyData, scrubs
-ParameterStatus/ErrorResponse/NoticeResponse frames, and streams large DataRow
-and CopyData frames without full buffering.
+pod-local loopback TCP or 0o600 UDS listener (with SO_PEERCRED verification),
+authenticates the disposable per-job ocjob_ token, connects upstream over strict
+TLS-only verify-full, pins upstream role/database/options, synthesizes job-local
+BackendKeyData, scrubs ParameterStatus/ErrorResponse/NoticeResponse frames, and
+streams large DataRow/CopyData frames through a serialized selectors loop.
 """
 
 from __future__ import annotations
@@ -15,13 +15,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
 import hmac
+import ipaddress
 import os
 from pathlib import Path
+import re
 import secrets
+import selectors
 import socket
 import ssl
+import stat
 import struct
 import threading
+import time
 from typing import Any
 from urllib.parse import quote, quote_plus
 
@@ -40,6 +45,7 @@ from oc_broker_common import (
     resolve_and_validate_ip,
     validate_allowed_cidrs,
 )
+from oc_schema import PolicyError, assert_trusted_dir, check_not_in_sandbox
 
 PG_PROTOCOL_V3 = 196608
 PG_SSL_REQUEST = 80877103
@@ -51,9 +57,12 @@ DEFAULT_HANDSHAKE_TIMEOUT = 10.0
 DEFAULT_IO_TIMEOUT = 30.0
 MAX_STARTUP_BYTES = 16_384
 MAX_CONTROL_FRAME_BYTES = 65_536
+MAX_STREAM_FRAME_BYTES = 256 * 1024 * 1024
+MAX_PG_FRAME_LEN = 0x7FFF_FFFF
 MAX_NEGOTIATION_RETRIES = 3
 STREAM_CHUNK_BYTES = 16_384
 MAX_SCRAM_ITERATIONS = 1_000_000
+REVOKE_CANCEL_TIMEOUT = 1.5
 
 SAFE_PARAMETER_STATUS_KEYS = frozenset(
     {
@@ -87,16 +96,26 @@ class PgBrokerRoute:
     pair_distinct_secret_ref: str | None = None
 
 
+def _check_clean_field(value: object, label: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise BrokerPolicyError(f"{label} must be a non-empty string")
+    for ch in value:
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F or 0xD800 <= code <= 0xDFFF:
+            raise BrokerPolicyError(f"Illegal control character in {label}")
+    return value
+
+
 def validate_pg_route(route: PgBrokerRoute, vault: HostVaultMemory) -> None:
     """Validate route coordinates, vault presence, and optional RO/RW distinctness."""
     if not isinstance(route, PgBrokerRoute):
         raise BrokerPolicyError("route must be a PgBrokerRoute")
-    if not route.route_id.strip() or not route.upstream_host.strip():
-        raise BrokerPolicyError("route_id and upstream_host must be non-empty")
+    _check_clean_field(route.route_id, "route_id")
+    _check_clean_field(route.upstream_host, "upstream_host")
+    _check_clean_field(route.upstream_database, "upstream_database")
+    _check_clean_field(route.upstream_user, "upstream_user")
     if type(route.upstream_port) is not int or not (1 <= route.upstream_port <= 65535):
         raise BrokerPolicyError("upstream_port must be an integer 1..65535")
-    if not route.upstream_database.strip() or not route.upstream_user.strip():
-        raise BrokerPolicyError("upstream_database and upstream_user must be non-empty")
     if route.access_mode not in ("ro", "rw"):
         raise BrokerPolicyError(f"Unsupported access_mode: {route.access_mode!r}")
     validate_allowed_cidrs(route.allowed_cidrs, context=f"pg:{route.route_id}.allowed_cidrs")
@@ -107,31 +126,48 @@ def validate_pg_route(route: PgBrokerRoute, vault: HostVaultMemory) -> None:
 def _verify_pair_distinctness(
     route: PgBrokerRoute, vault: HostVaultMemory, password: str
 ) -> None:
-    has_user = route.pair_distinct_user is not None
-    has_ref = route.pair_distinct_secret_ref is not None
-    if not has_user and not has_ref:
+    pair_user = route.pair_distinct_user
+    pair_ref = route.pair_distinct_secret_ref
+    if pair_user is None and pair_ref is None:
         return
-    if not (has_user and has_ref):
+    if pair_user is None or pair_ref is None:
         raise BrokerPolicyError(
             "pair_distinct_user and pair_distinct_secret_ref must both be provided"
         )
-    assert route.pair_distinct_user is not None
-    assert route.pair_distinct_secret_ref is not None
-    pair_password = vault.get(route.pair_distinct_secret_ref)
+    pair_password = vault.get(pair_ref)
     HostVaultMemory.assert_distinct_pg_credentials(
         route.upstream_user,
         password,
-        route.pair_distinct_user,
+        pair_user,
         pair_password,
     )
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
-    """Read exactly n bytes from a socket or raise EOFError."""
+def _decode_utf8_strict(data: bytes, label: str) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BrokerPolicyError(f"Invalid UTF-8 in {label}") from exc
+
+
+def _apply_deadline(sock: socket.socket, deadline: float | None) -> None:
+    if deadline is None:
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Postgres handshake deadline exceeded")
+    sock.settimeout(remaining)
+
+
+def recv_exact(
+    sock: socket.socket, n: int, *, deadline: float | None = None
+) -> bytes:
+    """Read exactly n bytes from a socket or raise EOFError/TimeoutError."""
     if n == 0:
         return b""
     buf = bytearray()
     while len(buf) < n:
+        _apply_deadline(sock, deadline)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             raise EOFError("Unexpected EOF on Postgres stream")
@@ -140,10 +176,13 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def encode_pg_frame(msg_type: bytes, body: bytes) -> bytes:
-    """Encode a Postgres v3 message frame with big-endian uint32 length."""
+    """Encode a Postgres v3 message frame with signed int32 length check."""
     if len(msg_type) != 1:
         raise ValueError("msg_type must be a single byte")
-    return msg_type + struct.pack("!I", len(body) + 4) + body
+    total_len = len(body) + 4
+    if total_len > MAX_PG_FRAME_LEN:
+        raise BrokerPolicyError("Postgres frame exceeds signed int32 maximum length")
+    return msg_type + struct.pack("!i", total_len) + body
 
 
 def encode_pg_error_response(
@@ -166,29 +205,37 @@ def encode_pg_startup(user: str, database: str, options: str = "") -> bytes:
     if options:
         params.extend([b"options", options.encode("utf-8")])
     body = struct.pack("!I", PG_PROTOCOL_V3) + b"\x00".join(params) + b"\x00\x00"
-    return struct.pack("!I", len(body) + 4) + body
+    total_len = len(body) + 4
+    if total_len > MAX_STARTUP_BYTES:
+        raise BrokerPolicyError("Upstream StartupMessage exceeds MAX_STARTUP_BYTES")
+    return struct.pack("!i", total_len) + body
 
 
-def read_pg_frame_header(sock: socket.socket) -> tuple[bytes, int]:
-    """Read 1-byte type and 4-byte uint32 length, rejecting length < 4."""
-    header = recv_exact(sock, 5)
+def read_pg_frame_header(
+    sock: socket.socket, *, deadline: float | None = None
+) -> tuple[bytes, int]:
+    """Read 1-byte type and signed int32 length, rejecting length < 4."""
+    header = recv_exact(sock, 5, deadline=deadline)
     msg_type = header[:1]
-    length = struct.unpack("!I", header[1:5])[0]
+    length = struct.unpack("!i", header[1:5])[0]
     if length < 4:
         raise BrokerPolicyError(f"Invalid Postgres v3 frame length: {length}")
     return msg_type, length - 4
 
 
 def read_pg_control_frame(
-    sock: socket.socket, *, max_body: int = MAX_CONTROL_FRAME_BYTES
+    sock: socket.socket,
+    *,
+    max_body: int = MAX_CONTROL_FRAME_BYTES,
+    deadline: float | None = None,
 ) -> tuple[bytes, bytes]:
     """Read a bounded Postgres v3 control frame."""
-    msg_type, body_len = read_pg_frame_header(sock)
+    msg_type, body_len = read_pg_frame_header(sock, deadline=deadline)
     if body_len > max_body:
         raise BrokerPolicyError(
             f"Postgres control frame {msg_type!r} exceeds {max_body} bytes"
         )
-    return msg_type, recv_exact(sock, body_len)
+    return msg_type, recv_exact(sock, body_len, deadline=deadline)
 
 
 def _require_strict_tls_context(ssl_context: ssl.SSLContext | None) -> ssl.SSLContext:
@@ -225,7 +272,7 @@ def pg_connect_strict_tls_only(
 def send_upstream_tls_cancel(
     target: PgUpstreamCancelTarget,
     *,
-    timeout: float = 5.0,
+    timeout: float = REVOKE_CANCEL_TIMEOUT,
 ) -> None:
     """Send a Postgres CancelRequest over strict TLS-only verify-full to pinned IP."""
     sock = pg_connect_strict_tls_only(
@@ -239,10 +286,17 @@ def send_upstream_tls_cancel(
         frame = struct.pack("!IIII", 16, PG_CANCEL_REQUEST, target.real_pid, target.real_key)
         sock.sendall(frame)
     finally:
+        _close_quiet(sock)
+
+
+def _dispatch_async_cancel(target: PgUpstreamCancelTarget) -> None:
+    def _worker() -> None:
         try:
-            sock.close()
-        except OSError:
+            send_upstream_tls_cancel(target, timeout=REVOKE_CANCEL_TIMEOUT)
+        except (OSError, BrokerError, EOFError):
             pass
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _parse_scram_kv(message: str) -> dict[str, str]:
@@ -251,8 +305,8 @@ def _parse_scram_kv(message: str) -> dict[str, str]:
         if "=" not in part:
             raise BrokerPolicyError("Malformed SCRAM-SHA-256 attribute")
         k, v = part.split("=", 1)
-        if k in out:
-            raise BrokerPolicyError("Duplicate SCRAM-SHA-256 attribute")
+        if not k or k in out:
+            raise BrokerPolicyError("Empty or duplicate SCRAM-SHA-256 attribute")
         out[k] = v
     return out
 
@@ -261,6 +315,8 @@ def _compute_scram_exchange(
     client_first_bare: str, server_first: str, password: str, c_nonce: str
 ) -> tuple[str, str]:
     attrs = _parse_scram_kv(server_first)
+    if "m" in attrs:
+        raise BrokerPolicyError("Unsupported mandatory SCRAM-SHA-256 extension")
     s_nonce = attrs.get("r", "")
     salt_b64 = attrs.get("s", "")
     iter_str = attrs.get("i", "")
@@ -271,8 +327,8 @@ def _compute_scram_exchange(
         salt = base64.b64decode(salt_b64, validate=True)
     except (ValueError, TypeError) as exc:
         raise BrokerAuthError("Invalid SCRAM-SHA-256 salt or iteration count") from exc
-    if not (1 <= iterations <= MAX_SCRAM_ITERATIONS):
-        raise BrokerPolicyError("SCRAM-SHA-256 iteration count out of bounds")
+    if not salt or not (1 <= iterations <= MAX_SCRAM_ITERATIONS):
+        raise BrokerPolicyError("SCRAM-SHA-256 salt or iteration count invalid")
 
     salted = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
     client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
@@ -289,9 +345,10 @@ def _compute_scram_exchange(
     return f"{client_final_no_proof},p={proof_b64}", expected_v
 
 
-def _handle_scram_sha256(sock: socket.socket, mech_bytes: bytes, password: str) -> None:
-    mechs = [m.decode("ascii", errors="ignore") for m in mech_bytes.split(b"\x00") if m]
-    if "SCRAM-SHA-256" not in mechs:
+def _handle_scram_sha256(
+    sock: socket.socket, mech_bytes: bytes, password: str, *, deadline: float | None = None
+) -> None:
+    if b"SCRAM-SHA-256" not in mech_bytes.split(b"\x00"):
         raise BrokerPolicyError("Upstream SASL does not offer SCRAM-SHA-256")
 
     c_nonce = base64.b64encode(secrets.token_bytes(18)).decode("ascii")
@@ -300,20 +357,22 @@ def _handle_scram_sha256(sock: socket.socket, mech_bytes: bytes, password: str) 
     init_body = b"SCRAM-SHA-256\x00" + struct.pack("!I", len(client_first)) + client_first
     sock.sendall(encode_pg_frame(b"p", init_body))
 
-    msg_type, body = read_pg_control_frame(sock)
+    msg_type, body = read_pg_control_frame(sock, deadline=deadline)
     if msg_type != b"R" or len(body) < 4 or struct.unpack("!I", body[:4])[0] != 11:
         raise BrokerAuthError("Expected AuthenticationSASLContinue from upstream")
 
+    server_first = _decode_utf8_strict(body[4:], "SCRAM server-first-message")
     client_final, expected_v = _compute_scram_exchange(
-        client_first_bare, body[4:].decode("utf-8"), password, c_nonce
+        client_first_bare, server_first, password, c_nonce
     )
     sock.sendall(encode_pg_frame(b"p", client_final.encode("utf-8")))
 
-    msg_type, body = read_pg_control_frame(sock)
+    msg_type, body = read_pg_control_frame(sock, deadline=deadline)
     if msg_type != b"R" or len(body) < 4 or struct.unpack("!I", body[:4])[0] != 12:
         raise BrokerAuthError("Expected AuthenticationSASLFinal from upstream")
 
-    final_attrs = _parse_scram_kv(body[4:].decode("utf-8"))
+    server_final = _decode_utf8_strict(body[4:], "SCRAM server-final-message")
+    final_attrs = _parse_scram_kv(server_final)
     server_v = final_attrs.get("v", "")
     if "e" in final_attrs or not hmac.compare_digest(server_v, expected_v):
         raise BrokerAuthError("SCRAM-SHA-256 server signature verification failed")
@@ -327,37 +386,61 @@ def _send_md5_password(sock: socket.socket, user: str, password: str, salt: byte
     sock.sendall(encode_pg_frame(b"p", f"md5{outer}\x00".encode("ascii")))
 
 
+def _dispatch_auth_challenge(
+    up_sock: socket.socket,
+    code: int,
+    rest: bytes,
+    route: PgBrokerRoute,
+    password: str,
+    deadline: float | None,
+) -> None:
+    if code == 3:
+        if rest:
+            raise BrokerPolicyError("Unexpected payload in AuthenticationCleartextPassword")
+        up_sock.sendall(encode_pg_frame(b"p", password.encode("utf-8") + b"\x00"))
+        return
+    if code == 5:
+        _send_md5_password(up_sock, route.upstream_user, password, rest)
+        return
+    if code == 10:
+        _handle_scram_sha256(up_sock, rest, password, deadline=deadline)
+        return
+    raise BrokerPolicyError(f"Unsupported upstream Postgres auth code: {code}")
+
+
 def authenticate_upstream_pg(
     up_sock: socket.socket,
     route: PgBrokerRoute,
     password: str,
+    *,
+    deadline: float | None = None,
 ) -> None:
-    """Send pinned StartupMessage and complete upstream Postgres authentication."""
+    """Send pinned StartupMessage and complete at most one upstream auth challenge."""
     options = "-c default_transaction_read_only=on" if route.access_mode == "ro" else ""
     up_sock.sendall(encode_pg_startup(route.upstream_user, route.upstream_database, options))
 
-    while True:
-        msg_type, body = read_pg_control_frame(up_sock)
+    challenged = False
+    for _ in range(2):
+        msg_type, body = read_pg_control_frame(up_sock, deadline=deadline)
         if msg_type == b"E":
             raise BrokerAuthError("Upstream Postgres rejected authentication")
         if msg_type != b"R" or len(body) < 4:
             raise BrokerPolicyError("Unexpected upstream frame during authentication")
         code = struct.unpack("!I", body[:4])[0]
         if code == 0:
+            if len(body) != 4:
+                raise BrokerPolicyError("Unexpected payload in AuthenticationOk")
             return
-        if code == 3:
-            up_sock.sendall(encode_pg_frame(b"p", password.encode("utf-8") + b"\x00"))
-        elif code == 5:
-            _send_md5_password(up_sock, route.upstream_user, password, body[4:])
-        elif code == 10:
-            _handle_scram_sha256(up_sock, body[4:], password)
-        else:
-            raise BrokerPolicyError(f"Unsupported upstream Postgres auth code: {code}")
+        if challenged:
+            raise BrokerPolicyError("Repeated upstream Postgres authentication challenge")
+        challenged = True
+        _dispatch_auth_challenge(up_sock, code, body[4:], route, password, deadline)
+    raise BrokerPolicyError("Upstream Postgres did not complete authentication")
 
 
-def _build_redaction_tokens(
+def _build_redaction_pattern(
     upstream_host: str, upstream_ip: str, upstream_user: str, secrets_list: tuple[str, ...]
-) -> tuple[str, ...]:
+) -> re.Pattern[str] | None:
     tokens: set[str] = set()
     for val in (upstream_host, upstream_ip, upstream_user):
         if val:
@@ -371,66 +454,71 @@ def _build_redaction_tokens(
         tokens.add(quote_plus(sec))
         tokens.add(base64.b64encode(raw).rstrip(b"=").decode("ascii"))
         tokens.add(base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii"))
-    return tuple(sorted(tokens, key=len, reverse=True))
+    if not tokens:
+        return None
+    ordered = sorted(tokens, key=len, reverse=True)
+    return re.compile("|".join(re.escape(t) for t in ordered), re.IGNORECASE)
 
 
-def scrub_text(text: str, redactions: tuple[str, ...]) -> str:
-    """Replace sensitive upstream tokens with [redacted]."""
-    out = text
-    for tok in redactions:
-        if tok in out:
-            out = out.replace(tok, "[redacted]")
-    return out
+def scrub_text(text: str, pattern: re.Pattern[str] | None) -> str:
+    """Case-insensitively replace sensitive upstream tokens with [redacted]."""
+    if pattern is None:
+        return text
+    return pattern.sub("[redacted]", text)
 
 
-def scrub_error_or_notice_body(body: bytes, redactions: tuple[str, ...]) -> bytes:
-    """Parse ErrorResponse/NoticeResponse fields, scrub values, and re-encode."""
+def scrub_error_or_notice_body(body: bytes, pattern: re.Pattern[str] | None) -> bytes:
+    """Parse ErrorResponse/NoticeResponse fields strictly, scrub values, and re-encode."""
     out: list[bytes] = []
     pos = 0
     end = len(body)
+    if end == 0:
+        raise BrokerPolicyError("Empty ErrorResponse/NoticeResponse body")
     while pos < end:
         code = body[pos : pos + 1]
         if code == b"\x00":
+            if pos != end - 1:
+                raise BrokerPolicyError("Trailing bytes after ErrorResponse/NoticeResponse terminator")
             out.append(b"\x00")
-            break
+            return b"".join(out)
         nul = body.find(b"\x00", pos + 1)
         if nul == -1:
             raise BrokerPolicyError("Malformed ErrorResponse/NoticeResponse field")
         val = body[pos + 1 : nul].decode("utf-8", errors="replace")
-        clean_val = scrub_text(val, redactions)
+        clean_val = scrub_text(val, pattern)
         out.append(code + clean_val.encode("utf-8") + b"\x00")
         pos = nul + 1
-    if not out or out[-1] != b"\x00":
-        out.append(b"\x00")
-    return b"".join(out)
+    raise BrokerPolicyError("Unterminated ErrorResponse/NoticeResponse frame")
 
 
 def filter_parameter_status_body(
-    body: bytes, redactions: tuple[str, ...]
+    body: bytes, pattern: re.Pattern[str] | None
 ) -> bytes | None:
-    """Allow only safe libpq ParameterStatus keys, scrubbing values."""
+    """Allow only safe libpq ParameterStatus keys with exact <k>\\0<v>\\0 wire format."""
     parts = body.split(b"\x00")
-    if len(parts) < 2:
-        return None
-    key = parts[0].decode("utf-8", errors="replace")
+    if len(parts) != 3 or parts[2] != b"":
+        raise BrokerPolicyError("Malformed ParameterStatus frame")
+    key = _decode_utf8_strict(parts[0], "ParameterStatus key")
     if key not in SAFE_PARAMETER_STATUS_KEYS:
         return None
     val = parts[1].decode("utf-8", errors="replace")
-    clean_val = scrub_text(val, redactions)
+    clean_val = scrub_text(val, pattern)
     return key.encode("utf-8") + b"\x00" + clean_val.encode("utf-8") + b"\x00"
 
 
-def _read_startup_header(sock: socket.socket) -> tuple[int, int]:
-    length = struct.unpack("!I", recv_exact(sock, 4))[0]
+def _read_startup_header(sock: socket.socket, deadline: float | None) -> tuple[int, int]:
+    length = struct.unpack("!i", recv_exact(sock, 4, deadline=deadline))[0]
     if length < 8 or length > MAX_STARTUP_BYTES:
         raise BrokerPolicyError(f"Invalid Postgres startup packet length: {length}")
-    code = struct.unpack("!I", recv_exact(sock, 4))[0]
+    code = struct.unpack("!I", recv_exact(sock, 4, deadline=deadline))[0]
     return length, code
 
 
-def _read_client_initial_packet(sock: socket.socket) -> tuple[int, bytes]:
+def _read_client_initial_packet(
+    sock: socket.socket, *, deadline: float | None = None
+) -> tuple[int, bytes]:
     for _ in range(MAX_NEGOTIATION_RETRIES + 1):
-        length, code = _read_startup_header(sock)
+        length, code = _read_startup_header(sock, deadline)
         if code in (PG_SSL_REQUEST, PG_GSSENC_REQUEST):
             if length != 8:
                 raise BrokerPolicyError("SSLRequest/GSSENCRequest must be exactly 8 bytes")
@@ -439,19 +527,23 @@ def _read_client_initial_packet(sock: socket.socket) -> tuple[int, bytes]:
         if code == PG_CANCEL_REQUEST:
             if length != 16:
                 raise BrokerPolicyError("CancelRequest must be exactly 16 bytes")
-            return PG_CANCEL_REQUEST, recv_exact(sock, 8)
+            return PG_CANCEL_REQUEST, recv_exact(sock, 8, deadline=deadline)
         if code == PG_PROTOCOL_V3:
-            return PG_PROTOCOL_V3, recv_exact(sock, length - 8)
+            return PG_PROTOCOL_V3, recv_exact(sock, length - 8, deadline=deadline)
         raise BrokerPolicyError(f"Unsupported Postgres startup code: {code}")
     raise BrokerPolicyError("Exceeded maximum Postgres SSL/GSS negotiation retries")
 
 
-def _authenticate_client(client_sock: socket.socket, lease: BrokerLease) -> bool:
+def _authenticate_client(
+    client_sock: socket.socket, lease: BrokerLease, *, deadline: float | None = None
+) -> bool:
     if not lease.is_active():
         client_sock.sendall(encode_pg_error_response("28000", "lease revoked"))
         return False
     client_sock.sendall(encode_pg_frame(b"R", struct.pack("!I", 3)))
-    msg_type, body = read_pg_control_frame(client_sock, max_body=MAX_STARTUP_BYTES)
+    msg_type, body = read_pg_control_frame(
+        client_sock, max_body=MAX_STARTUP_BYTES, deadline=deadline
+    )
     if msg_type != b"p" or not body.endswith(b"\x00"):
         client_sock.sendall(encode_pg_error_response("28P01", "authentication failed"))
         return False
@@ -476,8 +568,10 @@ def _stream_frame_with_canary(
     body_len: int,
     secrets_list: tuple[str, ...],
 ) -> None:
+    if body_len > MAX_STREAM_FRAME_BYTES:
+        raise BrokerPolicyError("Upstream streaming frame exceeds maximum size")
     scanner = OverlapCanaryScanner(secrets_list)
-    dst.sendall(msg_type + struct.pack("!I", body_len + 4))
+    dst.sendall(msg_type + struct.pack("!i", body_len + 4))
     remaining = body_len
     while remaining > 0:
         chunk = recv_exact(src, min(remaining, STREAM_CHUNK_BYTES))
@@ -493,7 +587,9 @@ def _stream_frame_with_canary(
 def _stream_frame_passthrough(
     src: socket.socket, dst: socket.socket, msg_type: bytes, body_len: int
 ) -> None:
-    dst.sendall(msg_type + struct.pack("!I", body_len + 4))
+    if body_len > MAX_STREAM_FRAME_BYTES:
+        raise BrokerPolicyError("Client streaming frame exceeds maximum size")
+    dst.sendall(msg_type + struct.pack("!i", body_len + 4))
     remaining = body_len
     while remaining > 0:
         chunk = recv_exact(src, min(remaining, STREAM_CHUNK_BYTES))
@@ -507,7 +603,7 @@ class _RelayContext:
     route: PgBrokerRoute
     upstream_ip: str
     ssl_context: ssl.SSLContext | None
-    redactions: tuple[str, ...]
+    redaction_pattern: re.Pattern[str] | None
     secrets_list: tuple[str, ...]
     cancel_pair: tuple[int, int] | None = None
     revoke_cb: Callable[[], None] | None = None
@@ -519,6 +615,8 @@ def _handle_backend_key_data(
     body_len: int,
     ctx: _RelayContext,
 ) -> None:
+    if ctx.cancel_pair is not None:
+        raise BrokerPolicyError("Duplicate BackendKeyData frame rejected")
     if body_len != 8:
         raise BrokerPolicyError("Invalid BackendKeyData frame length")
     real_pid, real_key = struct.unpack("!II", recv_exact(up_sock, 8))
@@ -538,7 +636,7 @@ def _handle_backend_key_data(
     def _on_revoke() -> None:
         if not fired.is_set():
             fired.set()
-            send_upstream_tls_cancel(target)
+            _dispatch_async_cancel(target)
 
     ctx.revoke_cb = _on_revoke
     ctx.lease.add_revoke_callback(_on_revoke)
@@ -559,12 +657,12 @@ def _relay_single_upstream_frame(
         raise BrokerPolicyError(f"Upstream control frame {msg_type!r} exceeds limit")
     body = recv_exact(up_sock, body_len)
     if msg_type == b"S":
-        filtered = filter_parameter_status_body(body, ctx.redactions)
+        filtered = filter_parameter_status_body(body, ctx.redaction_pattern)
         if filtered is not None:
             client_sock.sendall(encode_pg_frame(b"S", filtered))
         return
     if msg_type in (b"E", b"N"):
-        scrubbed = scrub_error_or_notice_body(body, ctx.redactions)
+        scrubbed = scrub_error_or_notice_body(body, ctx.redaction_pattern)
         OverlapCanaryScanner(ctx.secrets_list).scan_bytes(scrubbed)
         client_sock.sendall(encode_pg_frame(msg_type, scrubbed))
         return
@@ -572,26 +670,26 @@ def _relay_single_upstream_frame(
     client_sock.sendall(encode_pg_frame(msg_type, body))
 
 
-def _relay_client_to_upstream(
-    client_sock: socket.socket, up_sock: socket.socket, stop_ev: threading.Event
-) -> None:
-    try:
-        while not stop_ev.is_set():
-            msg_type, body_len = read_pg_frame_header(client_sock)
-            if msg_type == b"d":
-                _stream_frame_passthrough(client_sock, up_sock, msg_type, body_len)
-                continue
-            if body_len > MAX_CONTROL_FRAME_BYTES:
-                raise BrokerPolicyError(f"Client control frame {msg_type!r} exceeds limit")
-            body = recv_exact(client_sock, body_len)
-            up_sock.sendall(encode_pg_frame(msg_type, body))
-            if msg_type == b"X":
-                return
-    except (EOFError, OSError, BrokerError):
-        pass
-    finally:
-        stop_ev.set()
-        _shutdown_quiet(up_sock)
+def _relay_single_client_frame(
+    client_sock: socket.socket, up_sock: socket.socket
+) -> bool:
+    """Relay one framed message from client to upstream; return False on Terminate ('X')."""
+    msg_type, body_len = read_pg_frame_header(client_sock)
+    if msg_type == b"d":
+        _stream_frame_passthrough(client_sock, up_sock, msg_type, body_len)
+        return True
+    if body_len > MAX_CONTROL_FRAME_BYTES:
+        raise BrokerPolicyError(f"Client control frame {msg_type!r} exceeds limit")
+    body = recv_exact(client_sock, body_len)
+    up_sock.sendall(encode_pg_frame(msg_type, body))
+    return msg_type != b"X"
+
+
+def _get_peer_uid(conn: socket.socket) -> int:
+    so_peercred = getattr(socket, "SO_PEERCRED", 17)
+    raw = conn.getsockopt(socket.SOL_SOCKET, so_peercred, struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", raw)
+    return uid
 
 
 def _shutdown_quiet(sock: socket.socket) -> None:
@@ -608,8 +706,18 @@ def _close_quiet(sock: socket.socket) -> None:
         pass
 
 
+def _unlink_socket_only(path: Path) -> None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(st.st_mode):
+        raise BrokerPolicyError(f"Refusing to unlink non-socket path: {path}")
+    path.unlink()
+
+
 class HostPostgresBrokerServer:
-    """Bounded per-job message-framed Postgres v3 proxy listener (TCP or 0o700 UDS)."""
+    """Bounded per-job message-framed Postgres v3 proxy listener (loopback TCP or 0o600 UDS)."""
 
     def __init__(
         self,
@@ -620,6 +728,8 @@ class HostPostgresBrokerServer:
         host: str = "127.0.0.1",
         port: int = 0,
         uds_path: Path | None = None,
+        expected_uid: int | None = None,
+        sandbox_root: Path | None = None,
         max_concurrent_conns: int = MAX_CONCURRENT_CONNS,
         handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
         io_timeout: float = DEFAULT_IO_TIMEOUT,
@@ -630,12 +740,16 @@ class HostPostgresBrokerServer:
         validate_pg_route(route, vault)
         if type(max_concurrent_conns) is not int or max_concurrent_conns < 1:
             raise BrokerPolicyError("max_concurrent_conns must be >= 1")
+        if uds_path is None:
+            self._validate_loopback_host(host)
         self.route = route
         self._vault = vault
         self.lease = lease
         self._host = host
         self._port = port
         self._uds_path = uds_path
+        self._expected_uid = os.geteuid() if expected_uid is None else expected_uid
+        self._sandbox_root = sandbox_root
         self._sem = threading.BoundedSemaphore(max_concurrent_conns)
         self._handshake_timeout = handshake_timeout
         self._io_timeout = io_timeout
@@ -644,9 +758,19 @@ class HostPostgresBrokerServer:
         self._ssl_context = ssl_context
 
         self._listen_sock: socket.socket | None = None
+        self._bound_uds_path: Path | None = None
         self._stop_ev = threading.Event()
         self._accept_thread: threading.Thread | None = None
         self._bound_port: int | None = None
+
+    @staticmethod
+    def _validate_loopback_host(host: str) -> None:
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise BrokerPolicyError(f"TCP listener host must be a loopback IP: {host!r}") from exc
+        if not ip.is_loopback:
+            raise BrokerPolicyError(f"TCP listener host must be loopback: {host!r}")
 
     @property
     def bound_port(self) -> int:
@@ -661,27 +785,51 @@ class HostPostgresBrokerServer:
         if self._uds_path is not None:
             self._listen_sock = self._bind_uds(self._uds_path)
         else:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._listen_sock = self._bind_tcp()
+        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread.start()
+
+    def _bind_tcp(self) -> socket.socket:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((self._host, self._port))
             sock.listen(32)
             sock.settimeout(0.2)
-            self._listen_sock = sock
             self._bound_port = int(sock.getsockname()[1])
+            return sock
+        except Exception:
+            _close_quiet(sock)
+            raise
 
-        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
-        self._accept_thread.start()
+    def _bind_uds(self, raw_uds_path: Path) -> socket.socket:
+        uds_path = Path(raw_uds_path)
+        try:
+            if uds_path.parent.is_symlink():
+                raise BrokerPolicyError(f"Symlink UDS parent rejected: {uds_path.parent}")
+            phys_parent = check_not_in_sandbox(uds_path.parent, self._sandbox_root)
+            check_not_in_sandbox(uds_path, self._sandbox_root)
+            phys_parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(phys_parent, 0o700)
+            trusted_parent = assert_trusted_dir(phys_parent, sandbox_root=self._sandbox_root)
+        except PolicyError as exc:
+            raise BrokerPolicyError(str(exc)) from exc
 
-    def _bind_uds(self, uds_path: Path) -> socket.socket:
-        uds_path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(uds_path.parent, 0o700)
-        if uds_path.exists():
-            uds_path.unlink()
+        sock_path = trusted_parent / uds_path.name
+        _unlink_socket_only(sock_path)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(str(uds_path))
-        os.chmod(uds_path, 0o700)
+        old_umask = os.umask(0o177)
+        try:
+            sock.bind(str(sock_path))
+        except Exception:
+            _close_quiet(sock)
+            raise
+        finally:
+            os.umask(old_umask)
+        os.chmod(sock_path, 0o600)
         sock.listen(32)
         sock.settimeout(0.2)
+        self._bound_uds_path = sock_path
         return sock
 
     def stop(self) -> None:
@@ -692,11 +840,12 @@ class HostPostgresBrokerServer:
         if self._accept_thread is not None:
             self._accept_thread.join(timeout=2.0)
             self._accept_thread = None
-        if self._uds_path is not None and self._uds_path.exists():
+        if self._bound_uds_path is not None:
             try:
-                self._uds_path.unlink()
-            except OSError:
+                _unlink_socket_only(self._bound_uds_path)
+            except (OSError, BrokerPolicyError):
                 pass
+            self._bound_uds_path = None
 
     def __enter__(self) -> HostPostgresBrokerServer:
         self.start()
@@ -706,10 +855,12 @@ class HostPostgresBrokerServer:
         self.stop()
 
     def _accept_loop(self) -> None:
-        assert self._listen_sock is not None
+        listen_sock = self._listen_sock
+        if listen_sock is None:
+            return
         while not self._stop_ev.is_set():
             try:
-                client_sock, _ = self._listen_sock.accept()
+                client_sock, _ = listen_sock.accept()
             except socket.timeout:
                 continue
             except OSError:
@@ -723,7 +874,7 @@ class HostPostgresBrokerServer:
     def _serve_client(self, client_sock: socket.socket) -> None:
         try:
             self._handle_connection(client_sock)
-        except (EOFError, OSError, BrokerError, CanaryLeakError):
+        except (EOFError, OSError, TimeoutError, BrokerError, CanaryLeakError):
             pass
         finally:
             _close_quiet(client_sock)
@@ -736,14 +887,24 @@ class HostPostgresBrokerServer:
             send_upstream_tls_cancel(target, timeout=self._handshake_timeout)
 
     def _handle_connection(self, client_sock: socket.socket) -> None:
-        client_sock.settimeout(self._handshake_timeout)
-        code, payload = _read_client_initial_packet(client_sock)
+        if client_sock.family == socket.AF_UNIX:
+            if _get_peer_uid(client_sock) != self._expected_uid:
+                return
+        deadline = time.monotonic() + self._handshake_timeout
+        code, payload = _read_client_initial_packet(client_sock, deadline=deadline)
         if code == PG_CANCEL_REQUEST:
             self._handle_cancel_request(payload)
             return
-        if not _authenticate_client(client_sock, self.lease):
+        if not _authenticate_client(client_sock, self.lease, deadline=deadline):
             return
 
+        self.lease.register_stream(client_sock)
+        try:
+            self._connect_and_bridge(client_sock, deadline)
+        finally:
+            self.lease.unregister_stream(client_sock)
+
+    def _connect_and_bridge(self, client_sock: socket.socket, deadline: float) -> None:
         password = self._vault.get(self.route.secret_ref)
         upstream_ip = resolve_and_validate_ip(
             self.route.upstream_host,
@@ -752,24 +913,16 @@ class HostPostgresBrokerServer:
             resolver=self._resolver,
             allow_test_loopback=self._allow_test_loopback,
         )
+        remaining = max(0.1, deadline - time.monotonic())
         up_sock = pg_connect_strict_tls_only(
             upstream_ip,
             self.route.upstream_port,
             server_hostname=self.route.upstream_host,
             ssl_context=self._ssl_context,
-            timeout=self._handshake_timeout,
+            timeout=remaining,
         )
-        self._bridge_authenticated(client_sock, up_sock, upstream_ip, password)
-
-    def _bridge_authenticated(
-        self,
-        client_sock: socket.socket,
-        up_sock: ssl.SSLSocket,
-        upstream_ip: str,
-        password: str,
-    ) -> None:
         secrets_list = (password,)
-        redactions = _build_redaction_tokens(
+        redaction_pattern = _build_redaction_pattern(
             self.route.upstream_host, upstream_ip, self.route.upstream_user, secrets_list
         )
         ctx = _RelayContext(
@@ -777,54 +930,69 @@ class HostPostgresBrokerServer:
             route=self.route,
             upstream_ip=upstream_ip,
             ssl_context=self._ssl_context,
-            redactions=redactions,
+            redaction_pattern=redaction_pattern,
             secrets_list=secrets_list,
         )
-        self.lease.register_stream(client_sock)
-        self.lease.register_stream(up_sock)
         try:
-            authenticate_upstream_pg(up_sock, self.route, password)
+            self.lease.register_stream(up_sock)
+            authenticate_upstream_pg(up_sock, self.route, password, deadline=deadline)
             client_sock.sendall(encode_pg_frame(b"R", struct.pack("!I", 0)))
             client_sock.settimeout(self._io_timeout)
             up_sock.settimeout(self._io_timeout)
-            self._run_bidirectional_relay(client_sock, up_sock, ctx)
+            self._run_serialized_relay(client_sock, up_sock, ctx)
         finally:
-            self._cleanup_relay(client_sock, up_sock, ctx)
+            self._cleanup_relay(up_sock, ctx)
 
-    def _run_bidirectional_relay(
+    def _run_serialized_relay(
         self,
         client_sock: socket.socket,
         up_sock: ssl.SSLSocket,
         ctx: _RelayContext,
     ) -> None:
-        stop_ev = threading.Event()
-        c2u = threading.Thread(
-            target=_relay_client_to_upstream,
-            args=(client_sock, up_sock, stop_ev),
-            daemon=True,
-        )
-        c2u.start()
+        sel = selectors.DefaultSelector()
+        sel.register(client_sock, selectors.EVENT_READ, data="client")
+        sel.register(up_sock, selectors.EVENT_READ, data="upstream")
+        last_activity = time.monotonic()
         try:
-            while not stop_ev.is_set():
-                _relay_single_upstream_frame(up_sock, client_sock, ctx)
-        except (EOFError, OSError, BrokerError, CanaryLeakError):
+            while self.lease.is_active():
+                if up_sock.pending() > 0:
+                    _relay_single_upstream_frame(up_sock, client_sock, ctx)
+                    last_activity = time.monotonic()
+                    continue
+                events = sel.select(timeout=0.2)
+                if not events:
+                    if time.monotonic() - last_activity > self._io_timeout:
+                        return
+                    continue
+                if not self._process_relay_events(events, client_sock, up_sock, ctx):
+                    return
+                last_activity = time.monotonic()
+        except (EOFError, OSError, TimeoutError, BrokerError, CanaryLeakError):
             pass
         finally:
-            stop_ev.set()
+            sel.close()
             _shutdown_quiet(client_sock)
             _shutdown_quiet(up_sock)
-            c2u.join(timeout=1.0)
 
-    def _cleanup_relay(
+    def _process_relay_events(
         self,
+        events: list[tuple[selectors.SelectorKey, int]],
         client_sock: socket.socket,
         up_sock: ssl.SSLSocket,
         ctx: _RelayContext,
-    ) -> None:
+    ) -> bool:
+        for key, _ in events:
+            if key.data == "upstream":
+                _relay_single_upstream_frame(up_sock, client_sock, ctx)
+            else:
+                if not _relay_single_client_frame(client_sock, up_sock):
+                    return False
+        return True
+
+    def _cleanup_relay(self, up_sock: ssl.SSLSocket, ctx: _RelayContext) -> None:
         if ctx.revoke_cb is not None:
             self.lease.remove_revoke_callback(ctx.revoke_cb)
         if ctx.cancel_pair is not None:
             self.lease.unregister_pg_cancel(*ctx.cancel_pair)
-        self.lease.unregister_stream(client_sock)
         self.lease.unregister_stream(up_sock)
         _close_quiet(up_sock)

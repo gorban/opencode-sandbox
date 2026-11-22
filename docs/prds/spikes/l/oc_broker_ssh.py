@@ -2,9 +2,10 @@
 
 Pure Python standard library only. Never exposes SSH keys or SSH_AUTH_SOCK to
 the sandbox container. Executes strictly validated read-only presets or
-oc_controller APPLY_ONCE-approved commands with non-overridable OpenSSH
-hardening options, shlex.quote() remote token protection, owner-only
-known_hosts verification, bounded output/timeout, and canary scrubbing.
+oc_controller APPLY_ONCE-approved commands with DNS-pinned HostName/HostKeyAlias,
+-F /dev/null non-overridable OpenSSH hardening options, shlex.quote() remote
+token protection, owner-only known_hosts verification, streaming bounded memory
+output/timeout enforcement, lease-revoke process-group kill, and canary scrubbing.
 """
 
 from __future__ import annotations
@@ -12,22 +13,36 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
+import hmac
 import ipaddress
 import json
+import os
 from pathlib import Path
 import re
+import selectors
 import shlex
+import signal
 import subprocess
+import threading
+import time
 from typing import Any
 
 from oc_broker_common import (
     BrokerAuthError,
+    BrokerError,
     BrokerLease,
     BrokerPolicyError,
     OverlapCanaryScanner,
     resolve_and_validate_ip,
+    validate_allowed_cidrs,
 )
-from oc_schema import PolicyError, SchemaError, check_not_in_sandbox, read_regular_no_follow
+from oc_schema import (
+    PolicyError,
+    SchemaError,
+    assert_trusted_dir,
+    check_not_in_sandbox,
+    read_regular_no_follow,
+)
 
 DEFAULT_SSH_TIMEOUT = 15.0
 DEFAULT_CONNECT_TIMEOUT = 10
@@ -36,6 +51,7 @@ MAX_KNOWN_HOSTS_BYTES = 262_144
 MAX_JOURNALCTL_LINES = 500
 MAX_CUSTOM_ARGV_TOKENS = 64
 MAX_TOKEN_LEN = 256
+STREAM_READ_CHUNK = 8192
 
 SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$", re.ASCII)
 DNS_HOST_RE = re.compile(
@@ -46,7 +62,6 @@ DNS_HOST_RE = re.compile(
 UNIT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,127}$", re.ASCII)
 DF_PATH_RE = re.compile(r"^/[a-zA-Z0-9._/@+-]{0,255}$", re.ASCII)
 PODMAN_FILTER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$", re.ASCII)
-FORBIDDEN_CONTROL_CHARS = ("\x00", "\r", "\n")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,30 +97,159 @@ class SshExecResult:
 SshRunner = Callable[..., SshRawOutput]
 
 
-def _default_ssh_runner(
-    argv: list[str], *, timeout: float, shell: bool = False
-) -> SshRawOutput:
-    if shell:
-        raise BrokerPolicyError("SSH broker forbids shell=True execution")
-    proc = subprocess.run(
+def _check_no_ctrl_or_surrogate(value: str, label: str) -> None:
+    for ch in value:
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F or 0xD800 <= code <= 0xDFFF:
+            raise BrokerPolicyError(f"Illegal control or surrogate character in {label}")
+
+
+def _kill_proc_group(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+@dataclass
+class _StreamState:
+    scanner: OverlapCanaryScanner
+    buf: bytearray
+    truncated: bool = False
+
+
+def _drain_stream_chunk(
+    fd: int,
+    state: _StreamState,
+    max_output_bytes: int,
+) -> tuple[bool, bool]:
+    """Read one chunk, scan for canary, append up to cap; return (eof, overflowed)."""
+    chunk = os.read(fd, STREAM_READ_CHUNK)
+    if not chunk:
+        tail = state.scanner.finish()
+        if tail:
+            _append_capped(state, tail, max_output_bytes)
+        return True, state.truncated
+    emitted = state.scanner.feed(chunk)
+    if emitted:
+        _append_capped(state, emitted, max_output_bytes)
+    return False, state.truncated
+
+
+def _append_capped(state: _StreamState, data: bytes, max_output_bytes: int) -> None:
+    room = max_output_bytes - len(state.buf)
+    if len(data) > room:
+        if room > 0:
+            state.buf.extend(data[:room])
+        state.truncated = True
+    else:
+        state.buf.extend(data)
+
+
+def _run_streaming_subprocess(
+    argv: list[str],
+    *,
+    timeout: float,
+    max_output_bytes: int,
+    canary_secrets: tuple[str, ...],
+    lease: BrokerLease | None = None,
+) -> SshExecResult:
+    """Execute argv with shell=False, DEVNULL stdin, bounded RAM, canary scan & revoke kill."""
+    proc = subprocess.Popen(
         argv,
         shell=False,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     )
-    return SshRawOutput(
-        returncode=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-    )
+    revoked_ev = threading.Event()
+
+    def _on_revoke() -> None:
+        revoked_ev.set()
+        _kill_proc_group(proc)
+
+    if lease is not None:
+        lease.add_revoke_callback(_on_revoke)
+
+    sel = selectors.DefaultSelector()
+    out_state = _StreamState(OverlapCanaryScanner(canary_secrets), bytearray())
+    err_state = _StreamState(OverlapCanaryScanner(canary_secrets), bytearray())
+    if proc.stdout is not None:
+        sel.register(proc.stdout, selectors.EVENT_READ, data=out_state)
+    if proc.stderr is not None:
+        sel.register(proc.stderr, selectors.EVENT_READ, data=err_state)
+
+    deadline = time.monotonic() + timeout
+    try:
+        _pump_subprocess_pipes(proc, sel, deadline, max_output_bytes, revoked_ev)
+        if revoked_ev.is_set() or (lease is not None and not lease.is_active()):
+            raise BrokerAuthError("lease_revoked_or_expired")
+        rem = max(0.05, deadline - time.monotonic())
+        try:
+            rc = proc.wait(timeout=rem)
+        except subprocess.TimeoutExpired as exc:
+            _kill_proc_group(proc)
+            proc.wait(timeout=1.0)
+            raise BrokerError("SSH command timed out") from exc
+        return SshExecResult(
+            returncode=rc,
+            stdout=bytes(out_state.buf),
+            stderr=bytes(err_state.buf),
+            truncated=out_state.truncated or err_state.truncated,
+        )
+    except Exception:
+        _kill_proc_group(proc)
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    finally:
+        sel.close()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+        if lease is not None:
+            lease.remove_revoke_callback(_on_revoke)
+
+
+def _pump_subprocess_pipes(
+    proc: subprocess.Popen[bytes],
+    sel: selectors.DefaultSelector,
+    deadline: float,
+    max_output_bytes: int,
+    revoked_ev: threading.Event,
+) -> None:
+    while sel.get_map():
+        if revoked_ev.is_set():
+            _kill_proc_group(proc)
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_proc_group(proc)
+            raise BrokerError("SSH command timed out")
+        events = sel.select(timeout=min(0.1, remaining))
+        for key, _ in events:
+            eof, overflowed = _drain_stream_chunk(key.fd, key.data, max_output_bytes)
+            if overflowed:
+                _kill_proc_group(proc)
+                sel.unregister(key.fileobj)
+                return
+            if eof:
+                sel.unregister(key.fileobj)
 
 
 def _validate_ssh_host_syntax(host: str) -> str:
     if type(host) is not str or not host or len(host) > 253 or host.startswith("-"):
         raise BrokerPolicyError(f"Invalid SSH host: {host!r}")
-    if any(ch in host for ch in (*FORBIDDEN_CONTROL_CHARS, " ", "\t")):
-        raise BrokerPolicyError(f"Illegal character in SSH host: {host!r}")
+    _check_no_ctrl_or_surrogate(host, "SSH host")
+    if any(ch in host for ch in (" ", "\t")):
+        raise BrokerPolicyError(f"Illegal whitespace in SSH host: {host!r}")
     try:
         ipaddress.ip_address(host)
         return host
@@ -119,10 +263,11 @@ def _validate_ssh_host_syntax(host: str) -> str:
 def validate_known_hosts_path(
     known_hosts_path: Path, *, sandbox_root: Path | None = None
 ) -> Path:
-    """Verify known_hosts is a regular, non-symlink, non-hardlink, 0600 file outside $SB."""
+    """Verify known_hosts is a regular, non-symlink, non-hardlink, 0600 file in a trusted dir."""
     path = Path(known_hosts_path)
     try:
         physical = check_not_in_sandbox(path, sandbox_root=sandbox_root)
+        assert_trusted_dir(physical.parent, sandbox_root=sandbox_root)
         content = read_regular_no_follow(
             path,
             max_bytes=MAX_KNOWN_HOSTS_BYTES,
@@ -134,8 +279,9 @@ def validate_known_hosts_path(
     if not content.strip():
         raise BrokerPolicyError(f"known_hosts file must not be empty: {path}")
     phys_str = str(physical)
-    if any(ch in phys_str for ch in (*FORBIDDEN_CONTROL_CHARS, " ", "\t")):
-        raise BrokerPolicyError("known_hosts physical path contains illegal whitespace/control chars")
+    _check_no_ctrl_or_surrogate(phys_str, "known_hosts path")
+    if any(ch in phys_str for ch in (" ", "\t", "%", '"', "'")):
+        raise BrokerPolicyError("known_hosts physical path contains forbidden OpenSSH chars")
     return physical
 
 
@@ -145,8 +291,8 @@ def validate_ssh_target(
     resolver: Callable[..., list[Any]] | None = None,
     allow_test_loopback: bool = False,
     sandbox_root: Path | None = None,
-) -> tuple[str, Path]:
-    """Validate user, host, port, IP policy, and known_hosts; return (resolved_ip, physical_kh)."""
+) -> tuple[str, Path, tuple[str, ...]]:
+    """Validate target and return (resolved_ip, physical_known_hosts, normalized_cidrs)."""
     if not isinstance(target, SshTarget):
         raise BrokerPolicyError("target must be an SshTarget")
     if type(target.user) is not str or SSH_USER_RE.fullmatch(target.user) is None:
@@ -154,9 +300,10 @@ def validate_ssh_target(
     if type(target.port) is not int or not (1 <= target.port <= 65535):
         raise BrokerPolicyError(f"Invalid SSH port: {target.port!r}")
     host = _validate_ssh_host_syntax(target.host)
+    norm_cidrs = validate_allowed_cidrs(target.allowed_cidrs, context="ssh.allowed_cidrs")
     resolved_ip = resolve_and_validate_ip(
         host,
-        target.allowed_cidrs,
+        norm_cidrs,
         port=target.port,
         resolver=resolver,
         allow_test_loopback=allow_test_loopback,
@@ -164,7 +311,7 @@ def validate_ssh_target(
     physical_kh = validate_known_hosts_path(
         target.known_hosts_path, sandbox_root=sandbox_root
     )
-    return resolved_ip, physical_kh
+    return resolved_ip, physical_kh, norm_cidrs
 
 
 def _reject_extra_params(params: Mapping[str, Any], allowed: frozenset[str], preset: str) -> None:
@@ -257,10 +404,9 @@ def validate_custom_remote_argv(remote_argv: Sequence[str]) -> tuple[str, ...]:
     for idx, tok in enumerate(remote_argv):
         if type(tok) is not str or not tok or len(tok) > MAX_TOKEN_LEN:
             raise BrokerPolicyError(f"Invalid remote_argv token at index {idx}")
-        if any(ch in tok for ch in FORBIDDEN_CONTROL_CHARS):
-            raise BrokerPolicyError(f"Control character forbidden in remote_argv token {idx}")
-        if idx == 0 and tok.startswith("-"):
-            raise BrokerPolicyError("remote_argv executable must not start with '-'")
+        _check_no_ctrl_or_surrogate(tok, f"remote_argv[{idx}]")
+        if idx == 0 and (tok.startswith("-") or "=" in tok):
+            raise BrokerPolicyError("remote_argv executable must not start with '-' or contain '='")
         out.append(tok)
     return tuple(out)
 
@@ -273,17 +419,22 @@ def format_remote_command(tokens: Sequence[str]) -> str:
 
 def build_ssh_argv(
     target: SshTarget,
+    resolved_ip: str,
     physical_known_hosts: Path,
     remote_tokens: Sequence[str],
     *,
     connect_timeout: int = DEFAULT_CONNECT_TIMEOUT,
 ) -> list[str]:
-    """Build hardened local ssh argv with non-overridable security options."""
+    """Build hardened local ssh argv pinned to resolved_ip with -F /dev/null."""
     if type(connect_timeout) is not int or not (1 <= connect_timeout <= 60):
         raise BrokerPolicyError("connect_timeout must be int 1..60")
     remote_cmd = format_remote_command(remote_tokens)
     return [
         "ssh",
+        "-F",
+        "/dev/null",
+        "-n",
+        "-T",
         "-o",
         "BatchMode=yes",
         "-o",
@@ -293,9 +444,29 @@ def build_ssh_argv(
         "-o",
         "StrictHostKeyChecking=yes",
         "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
         f"UserKnownHostsFile={physical_known_hosts}",
         "-o",
         "IdentitiesOnly=yes",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "ProxyCommand=none",
+        "-o",
+        "ProxyJump=none",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "Tunnel=no",
+        "-o",
+        f"HostName={resolved_ip}",
+        "-o",
+        f"HostKeyAlias={target.host}",
         "-o",
         f"ConnectTimeout={connect_timeout}",
         "-p",
@@ -307,11 +478,24 @@ def build_ssh_argv(
 
 
 def compute_ssh_command_digest(
-    user: str, host: str, port: int, remote_argv: Sequence[str]
+    user: str,
+    host: str,
+    port: int,
+    remote_argv: Sequence[str],
+    *,
+    known_hosts_path: Path | str,
+    allowed_cidrs: Sequence[str] = (),
 ) -> str:
-    """Compute canonical SHA-256 hex digest pinning (user, host, port, argv)."""
+    """Compute canonical SHA-256 hex digest pinning full target and argv."""
     canonical = json.dumps(
-        {"argv": list(remote_argv), "host": host, "port": port, "user": user},
+        {
+            "allowed_cidrs": list(allowed_cidrs),
+            "argv": list(remote_argv),
+            "host": host,
+            "known_hosts_path": str(known_hosts_path),
+            "port": port,
+            "user": user,
+        },
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -323,35 +507,45 @@ class SshApprovalAdapter:
     """oc_controller.FixtureAdapter binding APPLY_ONCE target revisions to SSH command digests."""
 
     def __init__(self, initial_revisions: dict[str, str] | None = None):
+        self._lock = threading.Lock()
         self._revisions: dict[str, str | None] = dict(initial_revisions or {})
         self._expected_digest: dict[str, str] = {}
         self._journal: dict[tuple[str, int], Any] = {}
 
     def target_revision(self, target: str) -> str | None:
-        return self._revisions.get(target)
+        with self._lock:
+            return self._revisions.get(target)
 
     def set_target_revision(self, target: str, revision: str | None) -> None:
-        self._revisions[target] = revision
+        with self._lock:
+            self._revisions[target] = revision
 
     def expect_digest(self, request_id: str, digest: str) -> None:
-        self._expected_digest[request_id] = digest
+        with self._lock:
+            self._expected_digest[request_id] = digest
 
     def dispatch(self, attempt: Any, payload: Any) -> Any:
         from oc_controller import Outcome
 
-        expected = self._expected_digest.get(attempt.request_id)
-        live_rev = self._revisions.get(payload.pin.target)
-        if expected is None or live_rev != payload.pin.revision or expected != payload.pin.revision:
-            self._journal[(attempt.request_id, attempt.number)] = Outcome.DEFINITE_FAILURE
-            return Outcome.DEFINITE_FAILURE
-        self._journal[(attempt.request_id, attempt.number)] = Outcome.SUCCEEDED
-        return Outcome.SUCCEEDED
+        with self._lock:
+            expected = self._expected_digest.pop(attempt.request_id, None)
+            live_rev = self._revisions.get(payload.pin.target)
+            rev_ok = (
+                expected is not None
+                and live_rev is not None
+                and hmac.compare_digest(live_rev, payload.pin.revision)
+                and hmac.compare_digest(expected, payload.pin.revision)
+            )
+            outcome = Outcome.SUCCEEDED if rev_ok else Outcome.DEFINITE_FAILURE
+            self._journal[(attempt.request_id, attempt.number)] = outcome
+            return outcome
 
     def reconcile(self, attempt: Any, payload: Any) -> Any:
         from oc_controller import Outcome
 
         _ = payload
-        return self._journal.get((attempt.request_id, attempt.number), Outcome.UNKNOWN)
+        with self._lock:
+            return self._journal.get((attempt.request_id, attempt.number), Outcome.UNKNOWN)
 
 
 def _scan_and_cap_output(
@@ -389,7 +583,7 @@ class HostSshBroker:
             raise BrokerPolicyError("timeout must be > 0")
         if type(max_output_bytes) is not int or max_output_bytes < 1:
             raise BrokerPolicyError("max_output_bytes must be >= 1")
-        self._runner = runner or _default_ssh_runner
+        self._runner = runner
         self._timeout = timeout
         self._max_output_bytes = max_output_bytes
         self._canary_secrets = tuple(canary_secrets)
@@ -406,13 +600,21 @@ class HostSshBroker:
     ) -> SshExecResult:
         if lease is not None and not lease.is_active():
             raise BrokerAuthError("lease_revoked_or_expired")
-        _, physical_kh = validate_ssh_target(
+        resolved_ip, physical_kh, _ = validate_ssh_target(
             target,
             resolver=self._resolver,
             allow_test_loopback=self._allow_test_loopback,
             sandbox_root=self._sandbox_root,
         )
-        argv = build_ssh_argv(target, physical_kh, remote_tokens)
+        argv = build_ssh_argv(target, resolved_ip, physical_kh, remote_tokens)
+        if self._runner is None:
+            return _run_streaming_subprocess(
+                argv,
+                timeout=self._timeout,
+                max_output_bytes=self._max_output_bytes,
+                canary_secrets=self._canary_secrets,
+                lease=lease,
+            )
         raw = self._runner(argv, timeout=self._timeout, shell=False)
         return _scan_and_cap_output(raw, self._canary_secrets, self._max_output_bytes)
 
@@ -439,10 +641,10 @@ class HostSshBroker:
         reference: str,
         target_id: str,
     ) -> tuple[Any, str]:
-        """Pin canonical (user, host, port, argv) digest and submit APPLY_ONCE proposal."""
+        """Pin canonical (user, host, port, known_hosts, cidrs, argv) digest and propose APPLY_ONCE."""
         from oc_controller import Intent, Proposal
 
-        validate_ssh_target(
+        _, physical_kh, norm_cidrs = validate_ssh_target(
             target,
             resolver=self._resolver,
             allow_test_loopback=self._allow_test_loopback,
@@ -450,7 +652,12 @@ class HostSshBroker:
         )
         validated_argv = validate_custom_remote_argv(remote_argv)
         cmd_digest = compute_ssh_command_digest(
-            target.user, target.host, target.port, validated_argv
+            target.user,
+            target.host,
+            target.port,
+            validated_argv,
+            known_hosts_path=physical_kh,
+            allowed_cidrs=norm_cidrs,
         )
         controller._set_target_revision(target_id, cmd_digest)
         status = controller.propose(job_actor, Proposal(Intent.APPLY_ONCE, alias, reference))
@@ -472,9 +679,20 @@ class HostSshBroker:
 
         if lease is not None and not lease.is_active():
             raise BrokerAuthError("lease_revoked_or_expired")
+        resolved_ip, physical_kh, norm_cidrs = validate_ssh_target(
+            target,
+            resolver=self._resolver,
+            allow_test_loopback=self._allow_test_loopback,
+            sandbox_root=self._sandbox_root,
+        )
         validated_argv = validate_custom_remote_argv(remote_argv)
         cmd_digest = compute_ssh_command_digest(
-            target.user, target.host, target.port, validated_argv
+            target.user,
+            target.host,
+            target.port,
+            validated_argv,
+            known_hosts_path=physical_kh,
+            allowed_cidrs=norm_cidrs,
         )
         try:
             pre_status = controller.status(job_actor, request_id)
@@ -493,4 +711,14 @@ class HostSshBroker:
             raise BrokerAuthError(
                 f"SSH APPLY_ONCE invoke did not succeed: {invoked.state}/{invoked.reason}"
             )
-        return self._run_validated(target, validated_argv, lease=lease)
+        argv = build_ssh_argv(target, resolved_ip, physical_kh, validated_argv)
+        if self._runner is None:
+            return _run_streaming_subprocess(
+                argv,
+                timeout=self._timeout,
+                max_output_bytes=self._max_output_bytes,
+                canary_secrets=self._canary_secrets,
+                lease=lease,
+            )
+        raw = self._runner(argv, timeout=self._timeout, shell=False)
+        return _scan_and_cap_output(raw, self._canary_secrets, self._max_output_bytes)
