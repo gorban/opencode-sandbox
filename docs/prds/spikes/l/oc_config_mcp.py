@@ -30,6 +30,7 @@ from oc_schema import (
     MAX_CONFIG_FILE_BYTES,
     MUTABLE_ORCHESTRATOR_KINDS,
     PROPOSAL_ACTIONS,
+    PROPOSAL_ID_RE,
     READABLE_ORCHESTRATOR_KINDS,
     SCHEMA_VERSION,
     SECURITY_DELTA_TRIGGERS,
@@ -37,14 +38,25 @@ from oc_schema import (
     SchemaError,
     assert_trusted_dir,
     canonical_json,
+    check_not_host_production_dir,
     check_not_in_sandbox,
     is_builtin_id,
     parse_toml_strict,
+    read_regular_no_follow,
     validate_doc_by_kind,
     validate_opaque_id,
     validate_port_request,
 )
-from oc_store import ConflictError, HostConfigStore, StoreError
+from oc_store import (
+    ConflictError,
+    DigestMismatchError,
+    ExpiredProposalError,
+    HostConfigStore,
+    PublishUncertainError,
+    StaleProposalError,
+    StoreError,
+    _atomic_write_0600,
+)
 
 MAX_FRAME_BYTES = 262_144
 MAX_RESPONSE_BYTES = 524_288
@@ -295,6 +307,7 @@ class OrchestratorConfigMcpServer:
 
     def start(self) -> Path:
         check_not_in_sandbox(self._raw_socket_dir, self.store.sandbox_root)
+        check_not_host_production_dir(self._raw_socket_dir)
         if self._raw_socket_dir.is_symlink():
             raise PolicyError(f"Expected non-symlink socket_dir: {self._raw_socket_dir}")
         self._raw_socket_dir.mkdir(parents=True, exist_ok=True)
@@ -685,3 +698,295 @@ def call_mcp_uds(
         cli.sendall(raw_override if raw_override is not None else encode_content_length_frame(payload))
         resp_bytes = read_content_length_frame(cli)
         return parse_strict_json(resp_bytes)
+
+
+ALLOWED_OPERATOR_METHODS = frozenset(
+    {
+        "operator_approve",
+        "operator_reject",
+        "operator_reconcile",
+        "operator_status",
+    }
+)
+
+
+class OperatorControlServer:
+    """Host-only 0o700 UDS control server for cross-process operator approve/reject/reconcile.
+
+    Strictly separate from OrchestratorConfigMcpServer and NEVER mounted into the
+    orchestrator sandbox. Shares the live HostConfigStore and oc_controller.Controller
+    incarnation; restarting this server rotates both incarnation and operator.token so
+    prior-incarnation proposals fail closed.
+    """
+
+    def __init__(
+        self,
+        store: HostConfigStore,
+        socket_dir: Path,
+        *,
+        expected_uid: int | None = None,
+        rate_limit_max: int = 60,
+        rate_limit_window: float = 60.0,
+        write_timeout: float = WRITE_TIMEOUT_SECONDS,
+    ):
+        self.store = store
+        self._raw_socket_dir = Path(socket_dir)
+        self.socket_dir = self._raw_socket_dir
+        self.expected_uid = os.geteuid() if expected_uid is None else expected_uid
+        self._write_timeout = write_timeout
+        self.operator_token = secrets.token_hex(32)
+        self.rate_limiter = SlidingWindowRateLimiter(rate_limit_max, rate_limit_window)
+        self._conn_sem = threading.BoundedSemaphore(MAX_CONCURRENT_CONNS)
+        self._stop = threading.Event()
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self.socket_path: Path | None = None
+        self.token_path: Path | None = None
+
+    def start(self) -> Path:
+        check_not_in_sandbox(self._raw_socket_dir, self.store.sandbox_root)
+        check_not_host_production_dir(self._raw_socket_dir)
+        if self._raw_socket_dir.is_symlink():
+            raise PolicyError(f"Expected non-symlink operator socket_dir: {self._raw_socket_dir}")
+        self._raw_socket_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self._raw_socket_dir, 0o700)
+        self.socket_dir = assert_trusted_dir(self._raw_socket_dir, sandbox_root=self.store.sandbox_root)
+        sock_path = self.socket_dir / "operator.sock"
+        tok_path = self.socket_dir / "operator.token"
+        try:
+            st = os.lstat(sock_path)
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            if not stat.S_ISSOCK(st.st_mode):
+                raise PolicyError(f"Refusing to unlink non-socket path: {sock_path}")
+            sock_path.unlink()
+        _atomic_write_0600(tok_path, (self.operator_token + "\n").encode("ascii"))
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old_umask = os.umask(0o177)
+        try:
+            srv.bind(str(sock_path))
+        finally:
+            os.umask(old_umask)
+        os.chmod(sock_path, 0o600)
+        srv.listen(16)
+        srv.settimeout(0.2)
+        self._sock = srv
+        self.socket_path = sock_path
+        self.token_path = tok_path
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        return sock_path
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        if self.socket_path is not None:
+            try:
+                st = os.lstat(self.socket_path)
+                if stat.S_ISSOCK(st.st_mode):
+                    self.socket_path.unlink()
+            except OSError:
+                pass
+        if self.token_path is not None:
+            try:
+                st = os.lstat(self.token_path)
+                if stat.S_ISREG(st.st_mode):
+                    self.token_path.unlink()
+            except OSError:
+                pass
+
+    def _accept_loop(self) -> None:
+        assert self._sock is not None
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not self._conn_sem.acquire(blocking=False):
+                conn.close()
+                continue
+            t = threading.Thread(target=self._handle_conn, args=(conn,), daemon=True)
+            t.start()
+
+    def _send(self, conn: socket.socket, payload: dict[str, Any]) -> None:
+        try:
+            frame = encode_content_length_frame(payload)
+            if len(frame) > MAX_RESPONSE_BYTES:
+                frame = encode_content_length_frame(
+                    OrchestratorConfigMcpServer._error(payload.get("id"), -32603, "response_too_large")
+                )
+            conn.settimeout(self._write_timeout)
+            conn.sendall(frame)
+        except (TimeoutError, OSError):
+            pass
+
+    def _handle_conn(self, conn: socket.socket) -> None:
+        try:
+            peer_uid = _get_peer_uid(conn)
+            if peer_uid != self.expected_uid:
+                return
+            if not self.rate_limiter.allow(peer_uid):
+                self._send(conn, OrchestratorConfigMcpServer._error(None, -32002, "rate_limited"))
+                return
+            try:
+                raw_frame = read_content_length_frame(conn)
+                req = parse_strict_json(raw_frame)
+            except (FramingError, StrictJsonError) as exc:
+                self._send(conn, OrchestratorConfigMcpServer._error(None, -32700, str(exc)))
+                return
+
+            extra_rpc = set(req.keys()) - ALLOWED_RPC_KEYS
+            if extra_rpc:
+                self._send(conn, OrchestratorConfigMcpServer._error(None, -32600, "unknown_rpc_keys"))
+                return
+            req_id = req.get("id")
+            if req_id is not None and not (type(req_id) is str or type(req_id) is int):
+                self._send(conn, OrchestratorConfigMcpServer._error(None, -32600, "invalid_request_id"))
+                return
+            if req.get("jsonrpc") != "2.0":
+                self._send(conn, OrchestratorConfigMcpServer._error(req_id, -32600, "invalid_jsonrpc_version"))
+                return
+            tok = req.get("auth_token")
+            if type(tok) is not str or not hmac.compare_digest(tok, self.operator_token):
+                self._send(
+                    conn, OrchestratorConfigMcpServer._error(req_id, -32001, "invalid_or_stale_operator_token")
+                )
+                return
+            method = req.get("method")
+            if method not in ALLOWED_OPERATOR_METHODS:
+                self._send(conn, OrchestratorConfigMcpServer._error(req_id, -32601, "method_not_allowed"))
+                return
+            params = req.get("params", {})
+            if not isinstance(params, dict):
+                self._send(conn, OrchestratorConfigMcpServer._error(req_id, -32602, "params_must_be_object"))
+                return
+            try:
+                resp = self._dispatch(req_id, method, params)
+            except Exception:
+                resp = OrchestratorConfigMcpServer._error(req_id, -32603, "internal_error")
+            self._send(conn, resp)
+        finally:
+            try:
+                conn.close()
+            finally:
+                self._conn_sem.release()
+
+    def _dispatch(self, req_id: Any, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        ok = OrchestratorConfigMcpServer._ok
+        err = OrchestratorConfigMcpServer._error
+        try:
+            if method == "operator_status":
+                OrchestratorConfigMcpServer._check_closed_params(params, frozenset(), method)
+                return ok(
+                    req_id,
+                    {
+                        "incarnation": self.store.incarnation,
+                        "store_revision": self.store.store_revision,
+                    },
+                )
+            if method == "operator_approve":
+                OrchestratorConfigMcpServer._check_closed_params(
+                    params, frozenset({"proposal_id", "digest"}), method
+                )
+                pid = params.get("proposal_id")
+                digest = params.get("digest")
+                if type(pid) is not str or PROPOSAL_ID_RE.fullmatch(pid) is None:
+                    raise SchemaError("Invalid proposal_id")
+                if type(digest) is not str or not digest:
+                    raise SchemaError("Invalid digest")
+                new_rev = self.store.approve_proposal(pid, digest)
+                return ok(req_id, {"approved": True, "revision": new_rev})
+            if method == "operator_reject":
+                OrchestratorConfigMcpServer._check_closed_params(params, frozenset({"proposal_id"}), method)
+                pid = params.get("proposal_id")
+                if type(pid) is not str or PROPOSAL_ID_RE.fullmatch(pid) is None:
+                    raise SchemaError("Invalid proposal_id")
+                prop = self.store.reject_proposal(pid)
+                return ok(req_id, {"rejected": True, "status": prop["status"]})
+            if method == "operator_reconcile":
+                OrchestratorConfigMcpServer._check_closed_params(params, frozenset({"proposal_id"}), method)
+                pid = params.get("proposal_id")
+                if type(pid) is not str or PROPOSAL_ID_RE.fullmatch(pid) is None:
+                    raise SchemaError("Invalid proposal_id")
+                settled = self.store.reconcile_proposal(pid)
+                return ok(req_id, {"reconciled": True, "status": settled})
+            return err(req_id, -32601, "method_not_allowed")
+        except StaleProposalError as exc:
+            return err(req_id, -32010, str(exc))
+        except DigestMismatchError as exc:
+            return err(req_id, -32011, str(exc))
+        except ExpiredProposalError as exc:
+            return err(req_id, -32012, str(exc))
+        except PublishUncertainError as exc:
+            return err(req_id, -32013, str(exc))
+        except ConflictError as exc:
+            return err(req_id, -32004, str(exc))
+        except PolicyError as exc:
+            return err(req_id, -32003, str(exc))
+        except (SchemaError, KeyError, StoreError) as exc:
+            return err(req_id, -32602, str(exc))
+
+
+def call_operator_uds(
+    socket_path: Path,
+    method: str,
+    params: dict[str, Any],
+    *,
+    token: str | None = None,
+    sandbox_root: Path | None = None,
+) -> dict[str, Any]:
+    """Invoke the host-only OperatorControlServer UDS and raise typed store/policy errors on failure."""
+    sock_p = Path(socket_path)
+    check_not_in_sandbox(sock_p, sandbox_root)
+    check_not_host_production_dir(sock_p)
+    parent = assert_trusted_dir(sock_p.parent, sandbox_root=sandbox_root)
+    st = os.lstat(sock_p)
+    if not stat.S_ISSOCK(st.st_mode):
+        raise PolicyError(f"Expected operator Unix socket: {sock_p}")
+    if token is None:
+        tok_path = parent / "operator.token"
+        token = read_regular_no_follow(
+            tok_path,
+            max_bytes=256,
+            require_owner_only=True,
+            confined_root=parent,
+            sandbox_root=sandbox_root,
+        ).decode("ascii").strip()
+    resp = call_mcp_uds(
+        sock_p,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "auth_token": token,
+            "method": method,
+            "params": params,
+        },
+    )
+    if "error" in resp:
+        code = resp["error"].get("code")
+        msg = str(resp["error"].get("message", "operator_error"))
+        if code == -32010:
+            raise StaleProposalError(msg)
+        if code == -32011:
+            raise DigestMismatchError(msg)
+        if code == -32012:
+            raise ExpiredProposalError(msg)
+        if code == -32013:
+            raise PublishUncertainError(msg)
+        if code == -32004:
+            raise ConflictError(msg)
+        if code in (-32001, -32003):
+            raise PolicyError(msg)
+        if code == -32602:
+            raise SchemaError(msg)
+        raise StoreError(f"Operator RPC failed ({code}): {msg}")
+    return resp["result"]

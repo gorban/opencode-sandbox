@@ -14,6 +14,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from oc_config_mcp import call_operator_uds
 from oc_plan import PlanOverrides, compile_plan
 from oc_schema import (
     MAX_CONFIG_FILE_BYTES,
@@ -72,6 +73,13 @@ def main(argv: list[str] | None = None) -> int:
     p_plan.add_argument("--without", dest="without_mods", action="append", default=[])
     p_plan.add_argument("--env-binding", action="append", default=[])
     p_plan.add_argument("--port", action="append", default=[])
+    p_plan.add_argument(
+        "--allow-remote-write",
+        dest="remote_write_grants",
+        action="append",
+        default=[],
+        help="Explicit remote write grant bound to exact canonical URL (MCP_NAME=URL)",
+    )
 
     # config
     p_cfg = sub.add_parser("config", help="Host-operator config management")
@@ -92,12 +100,15 @@ def main(argv: list[str] | None = None) -> int:
     c_app = cfg_sub.add_parser("approve")
     c_app.add_argument("proposal_id")
     c_app.add_argument("--digest", required=True)
+    c_app.add_argument("--operator-socket", type=Path, default=None)
 
     c_rej = cfg_sub.add_parser("reject")
     c_rej.add_argument("proposal_id")
+    c_rej.add_argument("--operator-socket", type=Path, default=None)
 
     c_rec = cfg_sub.add_parser("reconcile")
     c_rec.add_argument("proposal_id")
+    c_rec.add_argument("--operator-socket", type=Path, default=None)
 
     c_hist = cfg_sub.add_parser("history")
     c_hist.add_argument("kind", choices=sorted(READABLE_ORCHESTRATOR_KINDS))
@@ -130,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
             without_mods=tuple(args.without_mods),
             env_bindings=_parse_kv(args.env_binding),
             cli_ports=_parse_port(args.port),
+            remote_write_grants=_parse_kv(args.remote_write_grants),
         )
         res = compile_plan(store, args.sandbox_type, worker_id=args.worker, overrides=ov)
         print(
@@ -159,14 +171,38 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"valid": True, "id": validated["id"]}, indent=2))
             return 0
         if args.cfg_cmd == "approve":
+            if args.operator_socket is not None:
+                res_op = call_operator_uds(
+                    args.operator_socket,
+                    "operator_approve",
+                    {"proposal_id": args.proposal_id, "digest": args.digest},
+                )
+                print(json.dumps(res_op, indent=2))
+                return 0
             new_rev = store.approve_proposal(args.proposal_id, args.digest)
             print(json.dumps({"approved": True, "revision": new_rev}, indent=2))
             return 0
         if args.cfg_cmd == "reject":
+            if args.operator_socket is not None:
+                res_op = call_operator_uds(
+                    args.operator_socket,
+                    "operator_reject",
+                    {"proposal_id": args.proposal_id},
+                )
+                print(json.dumps(res_op, indent=2))
+                return 0
             prop = store.reject_proposal(args.proposal_id)
             print(json.dumps({"rejected": True, "status": prop["status"]}, indent=2))
             return 0
         if args.cfg_cmd == "reconcile":
+            if args.operator_socket is not None:
+                res_op = call_operator_uds(
+                    args.operator_socket,
+                    "operator_reconcile",
+                    {"proposal_id": args.proposal_id},
+                )
+                print(json.dumps(res_op, indent=2))
+                return 0
             settled = store.reconcile_proposal(args.proposal_id)
             print(json.dumps({"reconciled": True, "status": settled}, indent=2))
             return 0

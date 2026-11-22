@@ -26,28 +26,37 @@ instructions = [
 "aqua:astral-sh/uv" = "0.13.6"
 ```
 
-## Pattern 2: `[local]` Conditional Service Acquisition (API -> Transitive Postgres)
+## Pattern 2: `[local]` Conditional Service Acquisition (API -> Transitive Postgres) & Remote Read-Only Default
 
-When a tool or bundle declares `[mcp.<name>.local]` or `[[local_services]]`, leaving `API_ENDPOINT` blank automatically pulls in `builtin/api-demo` AND its transitive `cap:db.postgres@^17.0` (`builtin/postgres`). Supplying a remote `https://staging.example.com/mcp` prunes both local services automatically (while keeping Postgres if another active bundle still requires it):
+When a tool or bundle declares `[mcp.<name>.local]` or `[[local_services]]`, leaving `API_ENDPOINT` blank automatically pulls in `builtin/api-demo` AND its transitive `cap:db.postgres@^17.0` (`builtin/postgres`). Supplying a remote `https://staging.example.com/mcp` prunes both local services automatically (while keeping Postgres if another active bundle still requires it).
+
+Remote MCP endpoints **fail closed to read-only by default** (`read_only_tools` + `remote.read_only_headers`) so shared staging/production targets are never mutated accidentally and write-capable tokens are never mounted into read-only sessions. Remote write tools require an explicit operator opt-in (`--allow-remote-write orders=https://staging.example.com/mcp`) bound to the exact canonical URL, and persona restrictions still override it:
 
 ```toml
 schema_version = 1
 kind = "bundle@1"
 id = "team/orders-api"
-description = "Orders API client with automatic local API + Postgres fallback."
+description = "Orders API client with automatic local API + Postgres fallback and split remote RO/RW credentials."
 
 [mcp.orders]
 type = "remote"
 url = "http://127.0.0.1:8080/mcp"
-tools = ["get_order", "cancel_order"]
-
-[mcp.orders.headers]
-Authorization = "Bearer {file:/run/secrets/orders_token}"
+read_only_tools = ["get_order"]
+write_tools = ["cancel_order"]
 
 [mcp.orders.local]
 binding_key = "ORDERS_API_ENDPOINT"
 service = "builtin/api-demo"
 url = "http://127.0.0.1:8080/mcp"
+
+[mcp.orders.local.headers]
+Authorization = "Bearer {file:/run/secrets/orders_local_token}"
+
+[mcp.orders.remote.read_only_headers]
+Authorization = "Bearer {file:/run/secrets/orders_remote_ro_token}"
+
+[mcp.orders.remote.write_headers]
+Authorization = "Bearer {file:/run/secrets/orders_remote_rw_token}"
 ```
 
 ## Pattern 3: Standing Personas & Role-Filtered MCPs

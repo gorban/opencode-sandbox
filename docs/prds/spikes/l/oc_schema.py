@@ -52,7 +52,11 @@ MISE_EXACT_VERSION_RE = re.compile(
     re.ASCII,
 )
 SECRET_REF_VALUE_RE = re.compile(r"^\{file:/run/secrets/[a-z0-9][a-z0-9_-]{0,47}\}$", re.ASCII)
-RAW_SECRET_PREFIXES = ("sk-", "sk-ant-", "AIza", "ghp_", "gho_", "github_pat_", "xoxb-", "xoxp-")
+SECRET_SLOT_EXTRACT_RE = re.compile(r"\{file:/run/secrets/([a-z0-9][a-z0-9_-]{0,47})\}", re.ASCII)
+RAW_SECRET_PREFIXES = ("sk-ant-", "sk-", "AIza", "ghp_", "gho_", "github_pat_", "xoxb-", "xoxp-")
+RAW_SECRET_RE = re.compile(
+    r"(?:^|[\s=:'\"(\[,])(" + "|".join(re.escape(p) for p in RAW_SECRET_PREFIXES) + r")"
+)
 MEM_LIMIT_RE = re.compile(r"^[1-9][0-9]{0,5}[mMgG]$", re.ASCII)
 HOST_URL_SCHEMES = frozenset({"http", "https", "postgresql", "redis", "tcp"})
 HOST_URL_PLACEHOLDERS = frozenset({"host", "port", "user", "db", "path"})
@@ -87,6 +91,7 @@ SECURITY_DELTA_TRIGGERS = frozenset(
         "new_mise_tool_added",
         "persona_changed",
         "remote_endpoint_added",
+        "remote_write_granted",
         "secret_slot_added",
         "resource_limit_increased",
     }
@@ -197,29 +202,82 @@ def _is_under(candidate: Path, root: Path) -> bool:
     return candidate == root or root in candidate.parents
 
 
-def _walk_check_not_in_sandbox(path: Path, sb: Path, sb_raw: Path, depth: int) -> None:
+def _walk_check_not_under_roots(
+    path: Path,
+    forbidden_roots: list[Path],
+    label: str,
+    depth: int = 0,
+) -> None:
+    """Walk raw uncollapsed components (including '..' and symlink hops) rejecting any forbidden root."""
     if depth > 40:
         raise PolicyError(f"Too many symlink hops checking trusted path: {path}")
-    abs_path = Path(os.path.abspath(str(path)))
-    cur = Path("/")
-    for part in abs_path.parts[1:]:
-        cur = cur / part
-        if _is_under(cur, sb) or _is_under(cur, sb_raw):
-            raise PolicyError(f"Refusing host-trusted path traversing sandbox root: {cur}")
+    raw = Path(path)
+    if raw.is_absolute():
+        cur = Path("/")
+        parts = raw.parts[1:]
+    else:
+        cur = Path.cwd()
+        parts = raw.parts
+        for froot in forbidden_roots:
+            if _is_under(cur, froot):
+                raise PolicyError(f"Refusing host-trusted path traversing {label}: {cur}")
+
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            cur = cur.parent
+        else:
+            cur = cur / part
+        for froot in forbidden_roots:
+            if _is_under(cur, froot):
+                raise PolicyError(f"Refusing host-trusted path traversing {label}: {cur}")
         if cur.is_symlink():
             target = Path(os.readlink(cur))
             hop = (cur.parent / target) if not target.is_absolute() else target
-            _walk_check_not_in_sandbox(hop, sb, sb_raw, depth + 1)
+            _walk_check_not_under_roots(hop, forbidden_roots, label, depth + 1)
+
+
+def _expand_root_variants(root: Path) -> list[Path]:
+    raw = Path(os.path.abspath(str(root)))
+    resolved = root.resolve()
+    return [raw] if raw == resolved else [raw, resolved]
 
 
 def check_not_in_sandbox(path: Path, sandbox_root: Path | None = None) -> None:
-    """Component-by-component trusted_path walk rejecting any prefix or symlink hop inside $SB."""
-    sb = (sandbox_root or (Path.home() / "opencode-sandbox")).resolve()
-    sb_raw = Path(os.path.abspath(str(sandbox_root or (Path.home() / "opencode-sandbox"))))
-    _walk_check_not_in_sandbox(path, sb, sb_raw, 0)
+    """Component-by-component trusted_path walk rejecting any prefix, '..' hop, or symlink hop inside $SB."""
+    sb_base = sandbox_root or (Path.home() / "opencode-sandbox")
+    roots = _expand_root_variants(sb_base)
+    _walk_check_not_under_roots(path, roots, "sandbox root", 0)
     resolved = Path(os.path.abspath(str(path))).resolve()
-    if _is_under(resolved, sb) or _is_under(resolved, sb_raw):
-        raise PolicyError(f"Refusing host-trusted path inside sandbox root: {resolved}")
+    for froot in roots:
+        if _is_under(resolved, froot):
+            raise PolicyError(f"Refusing host-trusted path inside sandbox root: {resolved}")
+
+
+def check_not_host_production_dir(path: Path) -> None:
+    """Refuse initializing or accessing real host oc-sandbox config/data directories from the spike PoC."""
+    candidates: list[Path] = [
+        Path.home() / ".config" / "oc-sandbox",
+        Path.home() / ".local" / "share" / "oc-sandbox",
+    ]
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if xdg_cfg:
+        candidates.append(Path(xdg_cfg) / "oc-sandbox")
+    xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+    if xdg_data:
+        candidates.append(Path(xdg_data) / "oc-sandbox")
+
+    roots: list[Path] = []
+    for cand in candidates:
+        for variant in _expand_root_variants(cand):
+            if variant not in roots:
+                roots.append(variant)
+    _walk_check_not_under_roots(path, roots, "host production config directory", 0)
+    resolved = Path(os.path.abspath(str(path))).resolve()
+    for froot in roots:
+        if _is_under(resolved, froot):
+            raise PolicyError(f"Refusing PoC store inside host production directory: {resolved}")
 
 
 def assert_trusted_dir(path: Path, *, sandbox_root: Path | None = None) -> Path:
@@ -335,9 +393,9 @@ def _require_str(value: object, context: str, *, allow_empty: bool = False) -> s
 
 
 def _check_no_raw_secret_value(value: str, context: str) -> None:
-    for prefix in RAW_SECRET_PREFIXES:
-        if prefix in value:
-            raise SchemaError(f"Raw secret prefix {prefix!r} forbidden in {context}")
+    match = RAW_SECRET_RE.search(value)
+    if match is not None:
+        raise SchemaError(f"Raw secret prefix {match.group(1)!r} forbidden in {context}")
 
 
 def validate_env_map(env: object, context: str) -> dict[str, str]:
@@ -427,6 +485,8 @@ def validate_remote_endpoint_url(
     allowed_schemes = {"https"} | ({"http"} if allow_http else set())
     if parsed.scheme not in allowed_schemes:
         raise PolicyError(f"Remote endpoint scheme {parsed.scheme!r} not allowed")
+    if parsed.fragment:
+        raise PolicyError("Fragment forbidden in remote endpoint URL")
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise PolicyError("Credentials embedded in remote endpoint URL are forbidden")
     try:
@@ -462,6 +522,30 @@ def validate_remote_endpoint_url(
     if len(labels) < 2 or any(DNS_LABEL_RE.fullmatch(lbl) is None for lbl in labels):
         raise PolicyError(f"Invalid remote endpoint DNS hostname: {host!r}")
     return url
+
+
+def canonicalize_remote_url(
+    url: str,
+    *,
+    allow_http: bool = False,
+    allowed_hosts: frozenset[str] = frozenset(),
+) -> str:
+    """Validate and canonicalize a remote endpoint URL for exact grant matching & Plan IR hashing."""
+    validated = validate_remote_endpoint_url(url, allow_http=allow_http, allowed_hosts=allowed_hosts)
+    parsed = urlparse(validated)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    host_fmt = f"[{ip.compressed}]" if isinstance(ip, ipaddress.IPv6Address) else host
+    port = parsed.port
+    default_port = 443 if scheme == "https" else 80
+    netloc = host_fmt if (port is None or port == default_port) else f"{host_fmt}:{port}"
+    path = parsed.path or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{scheme}://{netloc}{path}{query}"
 
 
 def validate_mise_tools(tools: object, context: str) -> dict[str, str]:
@@ -806,6 +890,56 @@ def validate_service_doc(
     }
 
 
+def _validate_mcp_headers(headers: object, context: str) -> dict[str, str]:
+    if headers is None:
+        return {}
+    if not isinstance(headers, dict):
+        raise SchemaError(f"{context} must be a table")
+    norm_headers: dict[str, str] = {}
+    for hk, hv in headers.items():
+        if type(hk) is not str or type(hv) is not str:
+            raise SchemaError(f"Invalid header in {context}")
+        if hk.lower() in ("authorization", "x-api-key", "x-goog-api-key"):
+            if (
+                not (hv.startswith("Bearer ") and SECRET_REF_VALUE_RE.fullmatch(hv[7:]))
+                and SECRET_REF_VALUE_RE.fullmatch(hv) is None
+            ):
+                raise PolicyError(
+                    f"Sensitive header {hk!r} in {context} must use {{file:/run/secrets/<slot>}}"
+                )
+        else:
+            _check_no_raw_secret_value(hv, f"{context}.{hk}")
+        norm_headers[hk] = hv
+    return norm_headers
+
+
+def _validate_mcp_secret_env(secret_env: object, context: str) -> dict[str, str]:
+    if secret_env is None:
+        return {}
+    if not isinstance(secret_env, dict):
+        raise SchemaError(f"{context} must be a table")
+    out: dict[str, str] = {}
+    for ek, ev in secret_env.items():
+        if type(ek) is not str or type(ev) is not str or SECRET_REF_VALUE_RE.fullmatch(ev) is None:
+            raise PolicyError(f"MCP secret_env {ek!r} in {context} must use {{file:/run/secrets/<slot>}}")
+        out[ek] = ev
+    return out
+
+
+def _extract_secret_slots(headers: dict[str, str], secret_env: dict[str, str]) -> set[str]:
+    slots: set[str] = set()
+    for val in list(headers.values()) + list(secret_env.values()):
+        for m in SECRET_SLOT_EXTRACT_RE.finditer(val):
+            slots.add(m.group(1))
+    return slots
+
+
+def _validate_tool_list(raw: object, context: str) -> list[str]:
+    if not isinstance(raw, list) or any(type(t) is not str or SIMPLE_NAME_RE.fullmatch(t) is None for t in raw):
+        raise SchemaError(f"{context} must be a list of tool identifiers")
+    return list(raw)
+
+
 def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrator: bool) -> dict[str, Any]:
     if SIMPLE_NAME_RE.fullmatch(name) is None:
         raise SchemaError(f"Invalid MCP server name in {context}: {name!r}")
@@ -813,19 +947,34 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
         raise SchemaError(f"{context}.{name} must be a table")
     _reject_unknown_keys(
         cfg,
-        frozenset({"type", "url", "artifact_id", "args", "headers", "secret_env", "tools", "local"}),
+        frozenset(
+            {
+                "type",
+                "url",
+                "artifact_id",
+                "args",
+                "headers",
+                "secret_env",
+                "tools",
+                "read_only_tools",
+                "write_tools",
+                "local",
+                "remote",
+            }
+        ),
         f"{context}.{name}",
     )
     mtype = cfg.get("type")
     if mtype not in ("remote", "pinned-artifact"):
         raise PolicyError(f"MCP {name} must use type 'remote' or 'pinned-artifact', got {mtype!r}")
+    norm_url: str | None = None
     if mtype == "remote":
         url = _require_str(cfg.get("url"), f"{context}.{name}.url")
         parsed = urlparse(url)
         if parsed.scheme == "http":
-            validate_pod_local_url(url, f"{context}.{name}.url")
+            norm_url = validate_pod_local_url(url, f"{context}.{name}.url")
         elif parsed.scheme == "https":
-            validate_remote_endpoint_url(url, allow_http=False)
+            norm_url = canonicalize_remote_url(url, allow_http=False)
         else:
             raise PolicyError(f"MCP {name} remote url must be https:// or pod-local http://127.0.0.1:<port>")
     else:
@@ -838,55 +987,122 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
     if not isinstance(args, list) or any(type(a) is not str for a in args):
         raise SchemaError(f"{context}.{name}.args must be list of strings")
 
-    headers = cfg.get("headers", {})
-    if not isinstance(headers, dict):
-        raise SchemaError(f"{context}.{name}.headers must be a table")
-    norm_headers: dict[str, str] = {}
-    for hk, hv in headers.items():
-        if type(hk) is not str or type(hv) is not str:
-            raise SchemaError(f"Invalid header in {context}.{name}")
-        if hk.lower() in ("authorization", "x-api-key", "x-goog-api-key"):
-            if not (hv.startswith("Bearer ") and SECRET_REF_VALUE_RE.fullmatch(hv[7:])) and SECRET_REF_VALUE_RE.fullmatch(hv) is None:
-                raise PolicyError(
-                    f"Sensitive header {hk!r} in {context}.{name} must use {{file:/run/secrets/<slot>}}"
+    norm_headers = _validate_mcp_headers(cfg.get("headers"), f"{context}.{name}.headers")
+    norm_secret_env = _validate_mcp_secret_env(cfg.get("secret_env"), f"{context}.{name}.secret_env")
+
+    raw_ro = cfg.get("read_only_tools")
+    raw_wr = cfg.get("write_tools")
+    raw_tools = cfg.get("tools")
+    read_only_tools: list[str] | None = None
+    write_tools: list[str] = []
+    if raw_ro is not None or raw_wr is not None:
+        read_only_tools = _validate_tool_list(raw_ro if raw_ro is not None else [], f"{context}.{name}.read_only_tools")
+        write_tools = _validate_tool_list(raw_wr if raw_wr is not None else [], f"{context}.{name}.write_tools")
+        overlap = sorted(set(read_only_tools) & set(write_tools))
+        if overlap:
+            raise SchemaError(
+                f"{context}.{name} read_only_tools and write_tools overlap: {', '.join(overlap)}"
+            )
+        combined = list(dict.fromkeys(read_only_tools + write_tools))
+        if raw_tools is not None:
+            explicit_tools = _validate_tool_list(raw_tools, f"{context}.{name}.tools")
+            if set(explicit_tools) != set(combined):
+                raise SchemaError(
+                    f"{context}.{name}.tools must equal read_only_tools U write_tools when both are specified"
                 )
+            tools = explicit_tools
         else:
-            _check_no_raw_secret_value(hv, f"{context}.{name}.headers.{hk}")
-        norm_headers[hk] = hv
-
-    secret_env = cfg.get("secret_env", {})
-    if not isinstance(secret_env, dict):
-        raise SchemaError(f"{context}.{name}.secret_env must be a table")
-    for ek, ev in secret_env.items():
-        if type(ek) is not str or type(ev) is not str or SECRET_REF_VALUE_RE.fullmatch(ev) is None:
-            raise PolicyError(f"MCP secret_env {ek!r} must use {{file:/run/secrets/<slot>}}")
-
-    tools = cfg.get("tools", [])
-    if not isinstance(tools, list) or any(type(t) is not str or SIMPLE_NAME_RE.fullmatch(t) is None for t in tools):
-        raise SchemaError(f"{context}.{name}.tools must be a list of tool identifiers")
+            tools = combined
+    else:
+        tools = _validate_tool_list(raw_tools if raw_tools is not None else [], f"{context}.{name}.tools")
 
     local_cfg = cfg.get("local")
     norm_local = None
     if local_cfg is not None:
         if not isinstance(local_cfg, dict):
             raise SchemaError(f"{context}.{name}.local must be a table")
-        _reject_unknown_keys(local_cfg, frozenset({"binding_key", "service", "url"}), f"{context}.{name}.local")
+        _reject_unknown_keys(
+            local_cfg,
+            frozenset({"binding_key", "service", "url", "headers", "secret_env"}),
+            f"{context}.{name}.local",
+        )
         bkey = _require_str(local_cfg.get("binding_key"), f"{context}.{name}.local.binding_key")
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,47}", bkey):
             raise SchemaError(f"Invalid local.binding_key: {bkey!r}")
         lsvc = validate_opaque_id(local_cfg.get("service"), label=f"{context}.{name}.local.service")
         lurl = validate_pod_local_url(local_cfg.get("url"), f"{context}.{name}.local.url")
-        norm_local = {"binding_key": bkey, "service": lsvc, "url": lurl}
+        lheaders = _validate_mcp_headers(local_cfg.get("headers"), f"{context}.{name}.local.headers")
+        lsecret_env = _validate_mcp_secret_env(local_cfg.get("secret_env"), f"{context}.{name}.local.secret_env")
+        norm_local = {
+            "binding_key": bkey,
+            "service": lsvc,
+            "url": lurl,
+            "headers": lheaders,
+            "secret_env": lsecret_env,
+        }
+
+    remote_cfg = cfg.get("remote")
+    norm_remote = None
+    if remote_cfg is not None:
+        if not isinstance(remote_cfg, dict):
+            raise SchemaError(f"{context}.{name}.remote must be a table")
+        _reject_unknown_keys(
+            remote_cfg,
+            frozenset({"read_only_headers", "read_only_secret_env", "write_headers", "write_secret_env"}),
+            f"{context}.{name}.remote",
+        )
+        ro_headers = _validate_mcp_headers(
+            remote_cfg.get("read_only_headers"), f"{context}.{name}.remote.read_only_headers"
+        )
+        ro_secret_env = _validate_mcp_secret_env(
+            remote_cfg.get("read_only_secret_env"), f"{context}.{name}.remote.read_only_secret_env"
+        )
+        wr_headers = _validate_mcp_headers(
+            remote_cfg.get("write_headers"), f"{context}.{name}.remote.write_headers"
+        )
+        wr_secret_env = _validate_mcp_secret_env(
+            remote_cfg.get("write_secret_env"), f"{context}.{name}.remote.write_secret_env"
+        )
+
+        # Enforce strict credential-slot separation across local, remote-RO, and remote-RW
+        top_slots = _extract_secret_slots(norm_headers, norm_secret_env)
+        local_slots = (
+            _extract_secret_slots(norm_local["headers"], norm_local["secret_env"])
+            if norm_local is not None
+            else set()
+        )
+        ro_slots = _extract_secret_slots(ro_headers, ro_secret_env)
+        wr_slots = _extract_secret_slots(wr_headers, wr_secret_env)
+        if wr_slots & (ro_slots | local_slots | top_slots):
+            shared = sorted(wr_slots & (ro_slots | local_slots | top_slots))
+            raise PolicyError(
+                f"MCP {name} remote write secret slot(s) must be distinct from read-only/local slots: {', '.join(shared)}"
+            )
+        if ro_slots & local_slots:
+            shared = sorted(ro_slots & local_slots)
+            raise PolicyError(
+                f"MCP {name} remote read-only secret slot(s) must be distinct from local slots: {', '.join(shared)}"
+            )
+
+        norm_remote = {
+            "read_only_headers": ro_headers,
+            "read_only_secret_env": ro_secret_env,
+            "write_headers": wr_headers,
+            "write_secret_env": wr_secret_env,
+        }
 
     return {
         "type": mtype,
-        "url": cfg.get("url"),
+        "url": norm_url,
         "artifact_id": cfg.get("artifact_id"),
         "args": list(args),
         "headers": norm_headers,
-        "secret_env": dict(secret_env),
+        "secret_env": norm_secret_env,
         "tools": list(tools),
+        "read_only_tools": read_only_tools,
+        "write_tools": list(write_tools),
         "local": norm_local,
+        "remote": norm_remote,
     }
 
 

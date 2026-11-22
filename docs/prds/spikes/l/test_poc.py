@@ -10,15 +10,18 @@ import os
 from pathlib import Path
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _SPIKE_DIR = Path(__file__).resolve().parent
 if str(_SPIKE_DIR) not in sys.path:
     sys.path.insert(0, str(_SPIKE_DIR))
 
 from oc_config_mcp import (  # noqa: E402
+    OperatorControlServer,
     OrchestratorConfigMcpServer,
     call_mcp_uds,
     encode_content_length_frame,
@@ -35,10 +38,12 @@ from oc_schema import (  # noqa: E402
     PolicyError,
     SchemaError,
     assert_trusted_dir,
+    check_not_in_sandbox,
     validate_host_url_template,
     validate_opaque_id,
 )
 from oc_store import (  # noqa: E402
+    POC_STORE_MARKER,
     ConflictError,
     DigestMismatchError,
     ExpiredProposalError,
@@ -748,6 +753,176 @@ class TestPlanCompiler(unittest.TestCase):
                 ),
             )
 
+    def test_human_review_1_remote_mcp_readonly_default_write_grant_and_credential_split(self) -> None:
+        # 1. Local mode: read + write tools active, local credential slot mounted
+        local_res = compile_plan(self.store, "builtin/api-workbench")
+        local_mcp = local_res.plan["role_contract"]["opencode_config"]["mcp"]["api_client"]
+        self.assertEqual(local_mcp["access_mode"], "local")
+        self.assertEqual(local_mcp["allowed_tools"], ["query_ro", "mutate_write"])
+        self.assertEqual(
+            local_mcp["headers"]["Authorization"],
+            "Bearer {file:/run/secrets/api_local_token}",
+        )
+        self.assertEqual(local_res.plan["remote_write_grants"], {})
+
+        # 2. Remote default (staging): fails closed to read-only tools + remote-RO credential slot
+        remote_ro = compile_plan(
+            self.store,
+            "builtin/api-workbench",
+            overrides=PlanOverrides(env_bindings={"API_ENDPOINT": "https://staging.example.com/mcp"}),
+        )
+        ro_mcp = remote_ro.plan["role_contract"]["opencode_config"]["mcp"]["api_client"]
+        self.assertEqual(ro_mcp["access_mode"], "remote-ro")
+        self.assertEqual(ro_mcp["allowed_tools"], ["query_ro"])
+        self.assertEqual(
+            ro_mcp["headers"]["Authorization"],
+            "Bearer {file:/run/secrets/api_remote_ro_token}",
+        )
+        self.assertEqual(remote_ro.plan["remote_write_grants"], {})
+
+        # 3. Remote with matching explicit write grant (canonical URL normalized):
+        #    admits write tools, mounts remote-RW slot, changes plan_digest, surfaces security_delta
+        remote_rw = compile_plan(
+            self.store,
+            "builtin/api-workbench",
+            overrides=PlanOverrides(
+                env_bindings={"API_ENDPOINT": "https://STAGING.example.com:443/mcp"},
+                remote_write_grants={"api_client": "https://staging.example.com/mcp"},
+            ),
+        )
+        rw_mcp = remote_rw.plan["role_contract"]["opencode_config"]["mcp"]["api_client"]
+        self.assertEqual(rw_mcp["access_mode"], "remote-rw")
+        self.assertEqual(rw_mcp["allowed_tools"], ["query_ro", "mutate_write"])
+        self.assertEqual(
+            rw_mcp["headers"]["Authorization"],
+            "Bearer {file:/run/secrets/api_remote_rw_token}",
+        )
+        self.assertEqual(
+            remote_rw.plan["remote_write_grants"],
+            {"api_client": "https://staging.example.com/mcp"},
+        )
+        self.assertNotEqual(remote_ro.plan_digest, remote_rw.plan_digest)
+        delta = compute_closed_security_delta(
+            {"builtin/api-workbench": remote_ro},
+            {"builtin/api-workbench": remote_rw},
+        )
+        self.assertIn("remote_write_granted", delta["triggers"])
+        self.assertIn("mcp_tool_surface_widened", delta["triggers"])
+        self.assertEqual(classify_drift(remote_ro.plan, remote_rw.plan)["kind"], "recreate-stateless")
+
+        # 4. Remote with mismatched URL grant is refused fail-closed
+        with self.assertRaises(PolicyError):
+            compile_plan(
+                self.store,
+                "builtin/api-workbench",
+                overrides=PlanOverrides(
+                    env_bindings={"API_ENDPOINT": "https://staging.example.com/mcp"},
+                    remote_write_grants={"api_client": "https://other.example.com/mcp"},
+                ),
+            )
+
+        # 5. Remote write grant when MCP is running locally (or unknown MCP) is refused
+        with self.assertRaises(PolicyError):
+            compile_plan(
+                self.store,
+                "builtin/api-workbench",
+                overrides=PlanOverrides(
+                    remote_write_grants={"api_client": "https://staging.example.com/mcp"},
+                ),
+            )
+        with self.assertRaises(PolicyError):
+            compile_plan(
+                self.store,
+                "builtin/api-workbench",
+                overrides=PlanOverrides(
+                    env_bindings={"API_ENDPOINT": "https://staging.example.com/mcp"},
+                    remote_write_grants={"nonexistent_mcp": "https://staging.example.com/mcp"},
+                ),
+            )
+
+        # 6. Persona restriction (builtin/persona-security-reviewer) STILL blocks mutate_write
+        #    AND downgrades mounted credentials back to remote-RO even with matching write grant!
+        audit_rw_attempt = compile_plan(
+            self.store,
+            "builtin/security-audit",
+            overrides=PlanOverrides(
+                env_bindings={"API_ENDPOINT": "https://staging.example.com/mcp"},
+                remote_write_grants={"api_client": "https://staging.example.com/mcp"},
+            ),
+        )
+        audit_mcp = audit_rw_attempt.plan["role_contract"]["opencode_config"]["mcp"]["api_client"]
+        self.assertEqual(audit_mcp["allowed_tools"], ["query_ro"])
+        self.assertEqual(audit_mcp["access_mode"], "remote-ro")
+        self.assertEqual(
+            audit_mcp["headers"]["Authorization"],
+            "Bearer {file:/run/secrets/api_remote_ro_token}",
+        )
+        self.assertEqual(audit_rw_attempt.plan["remote_write_grants"], {})
+
+        # 7. Schema rejects shared secret slot between remote RO and RW (or local and RW)
+        shared_slot_bundle = _sample_bundle_toml(
+            "team/shared-slot",
+            (
+                '[mcp.dup]\ntype = "remote"\nurl = "http://127.0.0.1:8080/mcp"\n'
+                'read_only_tools = ["r"]\nwrite_tools = ["w"]\n'
+                '[mcp.dup.remote.read_only_headers]\nAuthorization = "Bearer {file:/run/secrets/same_tok}"\n'
+                '[mcp.dup.remote.write_headers]\nAuthorization = "Bearer {file:/run/secrets/same_tok}"\n'
+            ),
+        )
+        with self.assertRaises(PolicyError):
+            self.store.create_proposal(
+                kind="bundle", obj_id="team/shared-slot", action="upsert", proposed_toml=shared_slot_bundle
+            )
+
+        # 8. Bundle without explicit read_only_tools fails closed when bound to a remote endpoint
+        no_split_bundle = _sample_bundle_toml(
+            "team/no-ro-split",
+            (
+                '[mcp.legacy_api]\ntype = "remote"\nurl = "http://127.0.0.1:8080/mcp"\n'
+                'tools = ["read_item", "write_item"]\n'
+                '[mcp.legacy_api.local]\nbinding_key = "LEGACY_EP"\n'
+                'service = "builtin/api-demo"\nurl = "http://127.0.0.1:8080/mcp"\n'
+            ),
+        )
+        self.store.operator_direct_upsert("bundle", "team/no-ro-split", no_split_bundle)
+        with self.assertRaisesRegex(PolicyError, "read_only_tools"):
+            compile_plan(
+                self.store,
+                "builtin/api-workbench",
+                overrides=PlanOverrides(
+                    with_mods=("team/no-ro-split",),
+                    env_bindings={
+                        "API_ENDPOINT": "https://staging.example.com/mcp",
+                        "LEGACY_EP": "https://legacy.example.com/mcp",
+                    },
+                ),
+            )
+
+        # 9. P3 regression checks: hyphenated prose words containing "sk-" are allowed,
+        #    while token-boundary raw secret prefixes are still rejected; raw "$SB/../outside" is rejected.
+        prose_bundle = _sample_bundle_toml(
+            "team/prose-ok",
+            'instructions = ["Use task-runner and disk-cache safely at low risk-level."]\n',
+        )
+        prop_ok = self.store.create_proposal(
+            kind="bundle", obj_id="team/prose-ok", action="upsert", proposed_toml=prose_bundle
+        )
+        self.assertEqual(prop_ok["status"], "pending")
+
+        bad_bearer = _sample_bundle_toml(
+            "team/prose-bad",
+            'instructions = ["Do not paste Bearer sk-1234567890 here"]\n',
+        )
+        with self.assertRaises(SchemaError):
+            self.store.create_proposal(
+                kind="bundle", obj_id="team/prose-bad", action="upsert", proposed_toml=bad_bearer
+            )
+
+        sb_dir = Path(self.tmp.name) / "sb_dotdot"
+        sb_dir.mkdir(mode=0o700)
+        with self.assertRaises(PolicyError):
+            check_not_in_sandbox(sb_dir / ".." / "outside", sandbox_root=sb_dir)
+
 
 class TestStoreControllerAndMcp(unittest.TestCase):
     def setUp(self) -> None:
@@ -1257,6 +1432,200 @@ class TestStoreControllerAndMcp(unittest.TestCase):
                         proposed_toml=_sample_bundle_toml("team/ttl-check"),
                         ttl_seconds=bad_ttl,  # type: ignore[arg-type]
                     )
+
+    def test_human_review_2_scratch_config_dir_isolation_and_marker(self) -> None:
+        fake_home = Path(self.tmp.name) / "fake_home"
+        fake_xdg = Path(self.tmp.name) / "fake_xdg"
+        fake_home.mkdir(mode=0o700)
+        fake_xdg.mkdir(mode=0o700)
+        prod_home_cfg = fake_home / ".config" / "oc-sandbox"
+        prod_xdg_cfg = fake_xdg / "oc-sandbox"
+
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(fake_home), "XDG_CONFIG_HOME": str(fake_xdg)},
+        ):
+            # Refuse ~/.config/oc-sandbox, nested paths, $XDG_CONFIG_HOME/oc-sandbox, and CLI entry
+            for target in (prod_home_cfg, prod_home_cfg / "sub", prod_xdg_cfg):
+                with self.subTest(target=str(target)):
+                    with self.assertRaises(PolicyError):
+                        HostConfigStore(target)
+                    self.assertFalse(target.exists(), f"Refused dir should not be created: {target}")
+
+            with self.assertRaises(PolicyError):
+                oc_sandbox_cli.main(["--config-dir", str(prod_home_cfg), "config", "list", "bundle"])
+            self.assertFalse(prod_home_cfg.exists())
+
+            # Refuse symlink pointing into ~/.config/oc-sandbox
+            sym_to_prod = Path(self.tmp.name) / "sym_prod"
+            os.symlink(prod_home_cfg, sym_to_prod)
+            with self.assertRaises(PolicyError):
+                HostConfigStore(sym_to_prod)
+
+        # Refuse initializing into an existing non-empty non-PoC directory (zero side effects!)
+        nonempty = Path(self.tmp.name) / "existing_nonempty"
+        nonempty.mkdir(mode=0o755)
+        (nonempty / "unrelated.txt").write_text("do not touch", encoding="utf-8")
+        with self.assertRaisesRegex(PolicyError, "non-empty non-PoC"):
+            HostConfigStore(nonempty)
+        self.assertFalse((nonempty / "store.lock").exists())
+        self.assertFalse((nonempty / "state.json").exists())
+        self.assertFalse((nonempty / POC_STORE_MARKER).exists())
+        self.assertEqual(stat.S_IMODE(os.lstat(nonempty).st_mode), 0o755)
+
+        # Existing empty directory IS accepted, gets 0o600 marker, and can be re-opened cleanly
+        empty_dir = Path(self.tmp.name) / "empty_scratch"
+        empty_dir.mkdir(mode=0o700)
+        s1 = HostConfigStore(empty_dir)
+        marker = empty_dir / POC_STORE_MARKER
+        self.assertTrue(marker.is_file())
+        self.assertEqual(stat.S_IMODE(os.lstat(marker).st_mode), 0o600)
+        s2 = HostConfigStore(empty_dir)
+        self.assertEqual(s2.store_revision, s1.store_revision)
+
+    def test_human_review_3_cross_process_operator_uds_approve_and_restart_fail_closed(self) -> None:
+        op_sock_dir = Path(self.tmp.name) / "op_sock"
+        op_srv = OperatorControlServer(self.store, op_sock_dir)
+        op_sock = op_srv.start()
+        try:
+            # Verify host-only socket & token permissions
+            self.assertEqual(stat.S_IMODE(os.lstat(op_sock_dir).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.lstat(op_sock).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.lstat(op_sock_dir / "operator.token").st_mode), 0o600)
+
+            # Orchestrator socket NEVER allows operator_approve; operator socket rejects wrong token
+            orch_attempt = self._rpc("operator_approve", {"proposal_id": "prop_" + "0" * 16, "digest": "a" * 64})
+            self.assertEqual(orch_attempt["error"]["code"], -32601)
+            bad_op_tok = call_mcp_uds(
+                op_sock,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "auth_token": "0" * 64,
+                    "method": "operator_status",
+                    "params": {},
+                },
+            )
+            self.assertEqual(bad_op_tok["error"]["code"], -32001)
+
+            # 1. Propose via orchestrator MCP -> approve from a FRESH CLI subprocess via --operator-socket
+            raw_v1 = _sample_bundle_toml("team/cross-proc", 'instructions = ["Cross-process v1"]\n')
+            prop1 = self._rpc(
+                "config_propose_revision",
+                {"kind": "bundle", "id": "team/cross-proc", "action": "upsert", "proposed_toml": raw_v1},
+            )["result"]
+
+            # Without --operator-socket, fresh CLI process has different incarnation and fails closed
+            no_sock_proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(_SPIKE_DIR / "oc_sandbox_cli.py"),
+                    "--config-dir",
+                    str(self.cfg_dir),
+                    "config",
+                    "approve",
+                    prop1["proposal_id"],
+                    "--digest",
+                    prop1["proposal_digest"],
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(no_sock_proc.returncode, 0)
+            self.assertIn("prior helper incarnation", no_sock_proc.stderr)
+
+            # With --operator-socket pointing at the live helper, fresh CLI subprocess succeeds!
+            ok_proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(_SPIKE_DIR / "oc_sandbox_cli.py"),
+                    "--config-dir",
+                    str(self.cfg_dir),
+                    "config",
+                    "approve",
+                    prop1["proposal_id"],
+                    "--digest",
+                    prop1["proposal_digest"],
+                    "--operator-socket",
+                    str(op_sock),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(ok_proc.returncode, 0, f"stderr={ok_proc.stderr}")
+            parsed_out = json.loads(ok_proc.stdout)
+            self.assertEqual(parsed_out, {"approved": True, "revision": 1})
+            self.assertEqual(self.store.get_revision("bundle", "team/cross-proc"), 1)
+
+            # End-to-end CLI --allow-remote-write smoke check in fresh subprocess
+            cli_rw = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(_SPIKE_DIR / "oc_sandbox_cli.py"),
+                    "--config-dir",
+                    str(self.cfg_dir),
+                    "plan",
+                    "--type",
+                    "builtin/api-workbench",
+                    "--env-binding",
+                    "API_ENDPOINT=https://staging.example.com/mcp",
+                    "--allow-remote-write",
+                    "api_client=https://staging.example.com/mcp",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(cli_rw.returncode, 0, f"stderr={cli_rw.stderr}")
+            cli_plan = json.loads(cli_rw.stdout)["plan"]
+            self.assertEqual(
+                cli_plan["role_contract"]["opencode_config"]["mcp"]["api_client"]["access_mode"],
+                "remote-rw",
+            )
+
+            # 2. Propose v2 under incarnation 1, then RESTART helper (incarnation 2) -> must FAIL CLOSED!
+            raw_v2 = _sample_bundle_toml("team/cross-proc", 'instructions = ["Cross-process v2"]\n')
+            prop2 = self._rpc(
+                "config_propose_revision",
+                {"kind": "bundle", "id": "team/cross-proc", "action": "upsert", "proposed_toml": raw_v2},
+            )["result"]
+        finally:
+            op_srv.stop()
+
+        # Start fresh helper incarnation 2 on the SAME config_dir and op_sock_dir
+        restarted_store = HostConfigStore(self.cfg_dir, clock=lambda: self.now)
+        op_srv2 = OperatorControlServer(restarted_store, op_sock_dir)
+        op_sock2 = op_srv2.start()
+        try:
+            stale_proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(_SPIKE_DIR / "oc_sandbox_cli.py"),
+                    "--config-dir",
+                    str(self.cfg_dir),
+                    "config",
+                    "approve",
+                    prop2["proposal_id"],
+                    "--digest",
+                    prop2["proposal_digest"],
+                    "--operator-socket",
+                    str(op_sock2),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(stale_proc.returncode, 0)
+            self.assertIn("prior helper incarnation", stale_proc.stderr)
+            self.assertEqual(restarted_store.get_revision("bundle", "team/cross-proc"), 1)
+        finally:
+            op_srv2.stop()
 
     def test_orchestrator_base_skills_present_with_frontmatter(self) -> None:
         skills_dir = _SPIKE_DIR / "orchestrator_skills"

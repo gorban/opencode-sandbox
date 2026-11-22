@@ -22,9 +22,11 @@ from oc_schema import (
     MAX_MISE_TOOLS,
     MAX_MISSION_BYTES,
     MAX_SLOT_FILE_BYTES,
+    SIMPLE_NAME_RE,
     SLOT_TOKEN_RE,
     PolicyError,
     SchemaError,
+    canonicalize_remote_url,
     capability_satisfies,
     is_builtin_id,
     parse_mem_bytes,
@@ -35,7 +37,6 @@ from oc_schema import (
     sha256_canonical_json,
     validate_opaque_id,
     validate_port_request,
-    validate_remote_endpoint_url,
 )
 
 
@@ -56,6 +57,7 @@ class PlanOverrides:
     without_mods: tuple[str, ...] = ()
     env_bindings: dict[str, str] = field(default_factory=dict)
     cli_ports: tuple[dict[str, Any], ...] = ()
+    remote_write_grants: dict[str, str] = field(default_factory=dict)
     allow_http_remote: bool = False
     allowed_remote_hosts: frozenset[str] = frozenset()
 
@@ -495,8 +497,9 @@ def _compile_role_contract(
     default_agent_override: str | None,
     resolved_services: list[dict[str, Any]],
     remote_bindings: dict[str, str],
+    remote_write_grants: dict[str, str],
     tier: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, str]]:
     primary_persona: dict[str, Any] | None = None
     primary_owner: str | None = None
     subagents: dict[str, dict[str, Any]] = {}
@@ -560,8 +563,15 @@ def _compile_role_contract(
                 bkey = mcfg["local"]["binding_key"]
                 if bkey in remote_bindings:
                     effective_cfg["url"] = remote_bindings[bkey]
+                    effective_cfg["_is_remote"] = True
                 else:
                     effective_cfg["url"] = mcfg["local"]["url"]
+                    effective_cfg["_is_remote"] = False
+            elif mcfg["type"] == "remote":
+                effective_cfg["_is_remote"] = not (mcfg["url"] or "").startswith("http://127.0.0.1:")
+            else:
+                effective_cfg["_is_remote"] = False
+
             if mname in mcp_servers and mcp_servers[mname] != effective_cfg:
                 if "mcp" not in replace_set:
                     raise PlanError(
@@ -571,8 +581,16 @@ def _compile_role_contract(
             mcp_servers[mname] = effective_cfg
             mcp_owners[mname] = bid
 
-    # Apply persona role filtering to MCP tool surface
+    # Fail closed if any remote_write_grant targets an unknown or inactive MCP server
+    unknown_grant_mcps = sorted(set(remote_write_grants) - set(mcp_servers))
+    if unknown_grant_mcps:
+        raise PolicyError(
+            f"Remote write grant references unknown/inactive MCP server(s): {', '.join(unknown_grant_mcps)}"
+        )
+
+    # Apply remote read-only default, explicit write-grant matching, credential separation, and persona filtering
     filtered_mcp: dict[str, dict[str, Any]] = {}
+    effective_remote_write_grants: dict[str, str] = {}
     allow_set = (
         set(primary_persona["allowed_mcp_tools"])
         if primary_persona and primary_persona["allowed_mcp_tools"] is not None
@@ -580,20 +598,96 @@ def _compile_role_contract(
     )
     deny_set = set(primary_persona["denied_mcp_tools"]) if primary_persona else set()
     for mname, mcfg in sorted(mcp_servers.items()):
-        tools = list(mcfg["tools"])
-        if allow_set is not None:
-            tools = [t for t in tools if f"{mname}.{t}" in allow_set or t in allow_set]
-        if deny_set:
-            tools = [t for t in tools if f"{mname}.{t}" not in deny_set and t not in deny_set]
-        if allow_set is not None and mcfg["tools"] and not tools:
-            continue
+        is_remote = bool(mcfg.get("_is_remote", False))
+        resolved_url = mcfg["url"]
+
+        if is_remote:
+            ro_tools = mcfg.get("read_only_tools")
+            wr_tools = mcfg.get("write_tools", [])
+            if ro_tools is None:
+                raise PolicyError(
+                    f"Remote MCP server {mname!r} must explicitly declare read_only_tools (failing closed)"
+                )
+            grant_matched = False
+            if mname in remote_write_grants:
+                granted_url = remote_write_grants[mname]
+                if granted_url != resolved_url:
+                    raise PolicyError(
+                        f"Remote write grant for MCP {mname!r} targets {granted_url!r}, "
+                        f"which does not match bound remote endpoint {resolved_url!r}"
+                    )
+                grant_matched = True
+
+            candidate_tools = list(ro_tools) + (list(wr_tools) if grant_matched else [])
+            tools = list(candidate_tools)
+            if allow_set is not None:
+                tools = [t for t in tools if f"{mname}.{t}" in allow_set or t in allow_set]
+            if deny_set:
+                tools = [t for t in tools if f"{mname}.{t}" not in deny_set and t not in deny_set]
+
+            # Persona narrowing overrides even an explicit remote write grant; never mount RW credentials
+            # if zero write tools survive persona filtering!
+            write_tools_active = grant_matched and any(t in wr_tools for t in tools)
+            rcfg = mcfg.get("remote")
+            if write_tools_active:
+                access_mode = "remote-rw"
+                if rcfg is not None:
+                    eff_headers = dict(rcfg["write_headers"])
+                    eff_secret_env = dict(rcfg["write_secret_env"])
+                else:
+                    if mcfg["headers"] or mcfg["secret_env"]:
+                        raise PolicyError(
+                            f"Remote MCP {mname!r} must declare separate [mcp.{mname}.remote] write credentials "
+                            f"instead of reusing local headers/secret_env"
+                        )
+                    eff_headers, eff_secret_env = {}, {}
+                assert resolved_url is not None
+                effective_remote_write_grants[mname] = resolved_url
+            else:
+                access_mode = "remote-ro"
+                if rcfg is not None:
+                    eff_headers = dict(rcfg["read_only_headers"])
+                    eff_secret_env = dict(rcfg["read_only_secret_env"])
+                else:
+                    if mcfg["headers"] or mcfg["secret_env"]:
+                        raise PolicyError(
+                            f"Remote MCP {mname!r} must declare separate [mcp.{mname}.remote] read_only credentials "
+                            f"instead of reusing local headers/secret_env"
+                        )
+                    eff_headers, eff_secret_env = {}, {}
+
+            if allow_set is not None and candidate_tools and not tools:
+                continue
+        else:
+            if mname in remote_write_grants:
+                raise PolicyError(
+                    f"Remote write grant specified for MCP {mname!r}, which is not bound to a remote endpoint"
+                )
+            access_mode = "local"
+            candidate_tools = list(mcfg["tools"])
+            tools = list(candidate_tools)
+            if allow_set is not None:
+                tools = [t for t in tools if f"{mname}.{t}" in allow_set or t in allow_set]
+            if deny_set:
+                tools = [t for t in tools if f"{mname}.{t}" not in deny_set and t not in deny_set]
+            if allow_set is not None and candidate_tools and not tools:
+                continue
+            lcfg = mcfg.get("local")
+            if lcfg is not None and (lcfg["headers"] or lcfg["secret_env"]):
+                eff_headers = dict(lcfg["headers"])
+                eff_secret_env = dict(lcfg["secret_env"])
+            else:
+                eff_headers = dict(mcfg["headers"])
+                eff_secret_env = dict(mcfg["secret_env"])
+
         filtered_mcp[mname] = {
             "type": mcfg["type"],
-            "url": mcfg["url"],
+            "access_mode": access_mode,
+            "url": resolved_url,
             "artifact_id": mcfg["artifact_id"],
             "args": mcfg["args"],
-            "headers": mcfg["headers"],
-            "secret_env": mcfg["secret_env"],
+            "headers": eff_headers,
+            "secret_env": eff_secret_env,
             "allowed_tools": tools,
         }
 
@@ -618,15 +712,18 @@ def _compile_role_contract(
         "managed_workspace_lockout": tier == "managed",
     }
 
-    return {
-        "default_agent": default_agent,
-        "primary_persona": primary_persona,
-        "subagents": [subagents[k] for k in sorted(subagents)],
-        "instructions": instructions,
-        "services_md": services_md,
-        "skills": sorted(skills.keys()),
-        "opencode_config": opencode_config,
-    }
+    return (
+        {
+            "default_agent": default_agent,
+            "primary_persona": primary_persona,
+            "subagents": [subagents[k] for k in sorted(subagents)],
+            "instructions": instructions,
+            "services_md": services_md,
+            "skills": sorted(skills.keys()),
+            "opencode_config": opencode_config,
+        },
+        effective_remote_write_grants,
+    )
 
 
 def _merge_mise_tools(
@@ -741,7 +838,7 @@ def compile_plan(
             bkey = lsvc["binding_key"]
             ext = ov.env_bindings.get(bkey, "")
             if ext:
-                validated = validate_remote_endpoint_url(
+                validated = canonicalize_remote_url(
                     ext,
                     allow_http=ov.allow_http_remote,
                     allowed_hosts=ov.allowed_remote_hosts,
@@ -761,7 +858,7 @@ def compile_plan(
                 bkey = mcfg["local"]["binding_key"]
                 ext = ov.env_bindings.get(bkey, "")
                 if ext:
-                    validated = validate_remote_endpoint_url(
+                    validated = canonicalize_remote_url(
                         ext,
                         allow_http=ov.allow_http_remote,
                         allowed_hosts=ov.allowed_remote_hosts,
@@ -771,6 +868,16 @@ def compile_plan(
                     active_roots.append(
                         {"target": mcfg["local"]["service"], "provider": None, "instance": None, "instance_port": None}
                     )
+
+    canonical_write_grants: dict[str, str] = {}
+    for g_mcp, g_url in ov.remote_write_grants.items():
+        if type(g_mcp) is not str or SIMPLE_NAME_RE.fullmatch(g_mcp) is None:
+            raise SchemaError(f"Invalid MCP name in remote_write_grants: {g_mcp!r}")
+        canonical_write_grants[g_mcp] = canonicalize_remote_url(
+            g_url,
+            allow_http=ov.allow_http_remote,
+            allowed_hosts=ov.allowed_remote_hosts,
+        )
 
     if active_roots and not bool(worker_caps.get("supports_pods", False)):
         raise PlanError(
@@ -782,8 +889,14 @@ def compile_plan(
         store, active_roots, worker_caps, prior_node_count=len(bundles)
     )
     endpoints = _compile_endpoints(resolved_services, st["ports"], ov.cli_ports)
-    role = _compile_role_contract(
-        store, bundles, st["default_agent"], resolved_services, remote_bindings, st["tier"]
+    role, effective_remote_write_grants = _compile_role_contract(
+        store,
+        bundles,
+        st["default_agent"],
+        resolved_services,
+        remote_bindings,
+        canonical_write_grants,
+        st["tier"],
     )
     mise_tools = _merge_mise_tools(bundles, resolved_services, st["mise_overrides"])
 
@@ -831,6 +944,7 @@ def compile_plan(
         "bundles": [b["id"] for b in bundles],
         "services": compiled_services,
         "remote_bindings": dict(sorted(remote_bindings.items())),
+        "remote_write_grants": dict(sorted(effective_remote_write_grants.items())),
         "endpoints": endpoints,
         "role_contract": role,
         "mise_tools": mise_tools,
@@ -966,6 +1080,12 @@ def compute_closed_security_delta(
         if any(k not in old_rem or old_rem[k] != v for k, v in new_p["remote_bindings"].items()):
             triggers.add("remote_endpoint_added")
 
+        old_rw = old_p.get("remote_write_grants", {}) if old_p else {}
+        for mname, url in new_p.get("remote_write_grants", {}).items():
+            if old_rw.get(mname) != url:
+                triggers.add("remote_write_granted")
+                details.append({"trigger": "remote_write_granted", "sandbox_type": st_id, "mcp": mname, "url": url})
+
     summary = {
         "triggers": sorted(triggers),
         "details": details,
@@ -1018,9 +1138,14 @@ def redact_plan_summary(result: CompiledPlanResult) -> dict[str, Any]:
         "default_agent": p["role_contract"]["default_agent"],
         "skills": p["role_contract"]["skills"],
         "mcp_servers": {
-            k: {"type": v["type"], "allowed_tools": v["allowed_tools"]}
+            k: {
+                "type": v["type"],
+                "access_mode": v.get("access_mode", "local"),
+                "allowed_tools": v["allowed_tools"],
+            }
             for k, v in p["role_contract"]["opencode_config"]["mcp"].items()
         },
+        "remote_write_granted_mcps": sorted(p.get("remote_write_grants", {}).keys()),
         "mise_tools": p["mise_tools"],
         "toolchain_delivery": p["toolchain_delivery"],
     }

@@ -13,12 +13,19 @@ instructions = [
 [mcp.api_client]
 type = "remote"
 url = "http://127.0.0.1:8080/mcp"
-tools = ["query_ro", "mutate_write"]
-
-[mcp.api_client.headers]
-Authorization = "Bearer {file:/run/secrets/api_mcp_token}"
+read_only_tools = ["query_ro"]
+write_tools = ["mutate_write"]
 
 [mcp.api_client.local]
 binding_key = "API_ENDPOINT"
 service = "builtin/api-demo"
 url = "http://127.0.0.1:8080/mcp"
+
+[mcp.api_client.local.headers]
+Authorization = "Bearer {file:/run/secrets/api_local_token}"
+
+[mcp.api_client.remote.read_only_headers]
+Authorization = "Bearer {file:/run/secrets/api_remote_ro_token}"
+
+[mcp.api_client.remote.write_headers]
+Authorization = "Bearer {file:/run/secrets/api_remote_rw_token}"
