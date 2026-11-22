@@ -442,6 +442,24 @@ class InMemoryRegistryStore:
                 row["status"] = "aborted"
                 row["detail"] = reason
 
+    def abort_handed_off_outbox_row_if_open(self, msg_id: str, *, reason: str) -> bool:
+        with self._lock:
+            row = self.outbox.get(msg_id)
+            if row is None or row["status"] != _STATUS_HANDED_OFF:
+                return False
+            row["status"] = "aborted"
+            row["detail"] = reason
+            return True
+
+    def cancel_pending_outbox_row(self, msg_id: str, *, reason: str) -> bool:
+        with self._lock:
+            row = self.outbox.get(msg_id)
+            if row is None or row["status"] != _STATUS_PENDING:
+                return False
+            row["status"] = _STATUS_CANCELLED
+            row["detail"] = reason
+            return True
+
     def cancel_outbox_row(self, msg_id: str, *, reason: str) -> None:
         with self._lock:
             row = self.outbox.get(msg_id)

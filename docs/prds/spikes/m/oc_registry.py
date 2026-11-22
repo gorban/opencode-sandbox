@@ -110,6 +110,9 @@ _SQL_SELECT_SANDBOX_INC_STATUS = (
 _SQL_UPDATE_OUTBOX_STATUS_DETAIL = (
     "UPDATE outbox SET status = ?, detail = ?, updated_at = ? WHERE msg_id = ? AND status = ?"
 )
+_SQL_DELETE_UNCONSUMED_DISPATCH_RECEIPT = (
+    "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?"
+)
 
 
 def _dict_row_factory(cursor: sqlite3.Cursor, row: tuple[Any, ...]) -> dict[str, Any]:
@@ -2164,10 +2167,21 @@ class CoordRegistry:
             )
             if cur.rowcount != 1:
                 raise CoordValidationError(_ERR_INVALID_OUTBOX_TRANSITION)
-            conn.execute(
-                "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?",
-                (msg_id,),
+            conn.execute(_SQL_DELETE_UNCONSUMED_DISPATCH_RECEIPT, (msg_id,))
+
+    def abort_handed_off_outbox_row_if_open(self, msg_id: str, *, reason: str) -> bool:
+        """Conditionally abort a handed_off row; return False if already finalized."""
+        clean_reason = validate_reason_text(reason, "reason")
+        now = time.time()
+        with self._tx() as conn:
+            cur = conn.execute(
+                _SQL_UPDATE_OUTBOX_STATUS_DETAIL,
+                (_STATUS_ABORTED, clean_reason, now, msg_id, _STATUS_HANDED_OFF),
             )
+            if cur.rowcount != 1:
+                return False
+            conn.execute(_SQL_DELETE_UNCONSUMED_DISPATCH_RECEIPT, (msg_id,))
+            return True
 
     def cancel_pending_outbox_row(self, msg_id: str, *, reason: str) -> bool:
         """Conditionally cancel a row ONLY if still pending; return False if already claimed."""
@@ -2180,10 +2194,7 @@ class CoordRegistry:
             )
             if cur.rowcount != 1:
                 return False
-            conn.execute(
-                "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?",
-                (msg_id,),
-            )
+            conn.execute(_SQL_DELETE_UNCONSUMED_DISPATCH_RECEIPT, (msg_id,))
             return True
 
     def cancel_outbox_row(self, msg_id: str, *, reason: str) -> None:
@@ -2199,10 +2210,7 @@ class CoordRegistry:
             )
             if cur.rowcount != 1:
                 raise CoordValidationError(_ERR_INVALID_OUTBOX_TRANSITION)
-            conn.execute(
-                "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?",
-                (msg_id,),
-            )
+            conn.execute(_SQL_DELETE_UNCONSUMED_DISPATCH_RECEIPT, (msg_id,))
 
     # ------------------------------------------------------------------
     # Provenance Receipts, TUI Enter Tokens, & Hostile Stream Events
