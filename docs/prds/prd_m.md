@@ -155,7 +155,20 @@ All three child PRDs share three explicit extensions to `oc_controller.py` ([prd
   follow-up convergence pass resolving untrusted `opencode serve` provenance, dynamic model/variant
   lowering, `xterm.js` vs `libghostty-vt`, and DNS-1123 / `@PEER` addressing.
 - Gate 1 design review round 1 (`Security-Focused PR Reviewer Setup`, `3f43443`): 5 P1, 4 P2, and
-  3 P3 findings addressed in this revision.
-- Gate 1 design review round 2 (`Security-Focused PR Reviewer Setup`): pending.
+  3 P3 findings addressed in `5d618be`.
+- Gate 1 design review round 2 (`Security-Focused PR Reviewer Setup`, `3f43443..5d618be`):
+  **GATE 1 CLEARED** at commit `5d618bed556bea41e48c46a8a90d4b453a9f2c85`:
+  - `docs/prds/prd_m.md` SHA-256: `791f1af59f3dff5c79c19895de5263a51b3723871114778249bb417ef3f762b5`
+  - `docs/prds/prd_m1.md` SHA-256: `2d2df8b2026c6e46dfe91e1226b6c64c11dfc71d3d28a70c5abc052168ceca50`
+  - `docs/prds/prd_m2.md` SHA-256: `fff8fbeee3b0ecba6f7f92c62dfc57b72be2669ef4f8ba90a78c3fcc5a3b402c`
+  - `docs/prds/prd_m3.md` SHA-256: `61d0ad2431a1bd0b32e13f1874dfb87bb40a01e8f856060b5856225d49a313d6`
+  - Implementation reminders for Gate 2:
+    1. Emit the exact bound ephemeral port (`connect-src 'self' ws://127.0.0.1:<bound_port>`) in
+       Trusted Chrome CSP at runtime, and pin the null-origin PTY iframe's `script-src` via CSP
+       hash or exact static origin URL (since `'self'` does not match opaque `null` origins) while
+       keeping `connect-src 'none'`.
+    2. For `PaidFallbackGrant`, release the durable reservation only if upstream TLS connect fails
+       *before* any request bytes are transmitted; once transmitted, retain the conservative debit
+       on disconnect/abort/crash (and guard `raw_quota is None` when reading `retry_after_sec`).
 
 - [ ] **Human review**: checked only when the user says so
