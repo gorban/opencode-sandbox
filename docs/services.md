@@ -8,7 +8,8 @@ configuration. OpenCode merges it with your own configuration. DevTools listens 
 `127.0.0.1:9222` in the pod.
 
 Only FIDO/U2F interfaces of security keys are passed to Chromium. Run `oc-sandbox -k` to list
-the keys it detects or start with `oc-sandbox -K` to withhold them. See the
+the keys it detects or start with `oc-sandbox -K` to withhold them. Displayed device labels use
+printable ASCII. See the
 [browser security limits](security.md#security-model) before signing in.
 
 ## Port mapping (`-P`)
@@ -60,7 +61,11 @@ literally, for example a password containing ` #`.
 
 **Optional first-start SQL.** Files in `~/.config/oc-sandbox/postgres-init/` (or the directory in
 `OC_PG_INIT_DIR`) run once, when the data volume is first created, as the standard
-`/docker-entrypoint-initdb.d` mechanism. See
+`/docker-entrypoint-initdb.d` mechanism. A relative override is resolved from the calling
+directory. Use a dedicated directory outside the sandbox and keep its parent directories under
+trusted control so the path cannot be replaced during setup. The init tree must be owned by you
+or root, with no group or world write access. Podman applies a private SELinux label to the init
+directory on mount. See
 [`examples/postgres-init/01-roles.sql.example`](../examples/postgres-init/01-roles.sql.example).
 
 ### Data, upgrades and connections
@@ -150,5 +155,5 @@ Compare (files or folders). The host tools work on a **copy**:
   first, so links that stay inside the sandbox still work.
 - One bridge serves all instances.
 - VS Code defaults to `/home/linuxbrew/.linuxbrew/bin/code` and Beyond Compare defaults to
-  `/usr/bin/bcompare`. Set `OC_CODE_BIN` or `OC_BCOMPARE_BIN` to override the path. Missing
+  `/usr/bin/bcompare`. Set `OC_CODE_BIN` or `OC_BCOMPARE_BIN` to an absolute host path. Missing
   tools produce a warning and the corresponding command has no effect.

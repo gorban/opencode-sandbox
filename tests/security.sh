@@ -89,6 +89,31 @@ load_pg_config
 EOF
 check 'host Postgres config symlink outside sandbox is accepted' env -i HOME="$HOME" PATH="$PATH" OC_PG_CONF="$T/pg-host-link" bash "$T/parse-path.sh"
 check 'Postgres config path through sandbox is refused' bash -c '! env -i HOME="$1" PATH="$2" OC_PG_CONF="$3" bash "$4" >/dev/null 2>&1' _ "$HOME" "$PATH" "$T/pg-bad-link" "$T/parse-path.sh"
+mkdir -p "$T/pg-init"
+ln -s "$T/pg-sandbox" "$T/init-link"
+sed '$a\printf "%s\\n" "$PG_INIT"' "$T/parse-path.sh" > "$T/parse-init.sh"
+parse_init() { env -i HOME="$HOME" PATH="$PATH" OC_PG_CONF="$T/pg.env" OC_PG_INIT_DIR="$1" bash "$T/parse-init.sh"; }
+check 'relative Postgres init directory becomes a host bind path' test "$(parse_init pg-init)" = "$T/pg-init"
+check 'Postgres init directory entering sandbox is refused' ! parse_init "$T/init-link"
+check 'Postgres init directory containing sandbox is refused' ! parse_init "$T"
+check 'Postgres init rejects the filesystem root before inspecting it' ! parse_init /
+ln -s "$T/pg.env" "$T/pg-init/01.sql"
+cat > "$T/check-init-tree.sh" <<EOF
+set -euo pipefail
+$(fn ensure_postgres)
+PG_INIT=$T/pg-init
+die() { echo "\$*"; exit 2; }
+pg_sig() { :; }
+pm() { echo unexpected-podman-call; exit 4; }
+ensure_postgres
+EOF
+out=$(bash "$T/check-init-tree.sh" 2>&1 || true)
+check 'linked Postgres init file refused before Podman' grep -qx 'Postgres init requires ordinary owner-controlled directories and files without links' <<<"$out"
+check 'linked Postgres init file never reaches Podman' ! grep -q 'unexpected-podman-call' <<<"$out"
+unlink "$T/pg-init/01.sql"
+install -m 0666 /dev/null "$T/pg-init/01.sql"
+out=$(bash "$T/check-init-tree.sh" 2>&1 || true)
+check 'world-writable Postgres init file refused before Podman' grep -q 'owner-controlled' <<<"$out"
 
 # ================================================================================================
 echo "Postgres password exposure (podman stubbed)"
@@ -586,6 +611,40 @@ helper_out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dh
   bash "$T/helper-repo/oc-sandbox" -d -a -y 2>&1 </dev/null || true)
 check "sandbox-linked lock helper refused" grep -q 'missing or unsafe oc-setup-lock.py' <<<"$helper_out"
 check "sandbox-linked lock helper never executed" test ! -e "$T/helper-executed"
+ln -s "$DSB/lock-helper.py" "$T/helper-repo/oc-bridge.py"
+helper_out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" \
+  bash "$T/helper-repo/oc-sandbox" -n 2>&1 </dev/null || true)
+check 'sandbox-linked bridge helper refused before setup' grep -q 'missing or unsafe oc-bridge.py' <<<"$helper_out"
+out=$(pathrun OC_CODE_BIN="$DSB/editor" -- -n)
+check 'sandbox-side editor executable refused' grep -q 'OC_CODE_BIN must be an absolute path outside the sandbox' <<<"$out"
+out=$(pathrun OC_BCOMPARE_BIN=$'/host/editor\nextra' -- -n)
+check 'newline in editor executable refused' grep -q 'OC_BCOMPARE_BIN must be an absolute path outside the sandbox' <<<"$out"
+ln -s "$T/outer"$'\n' "$T/path-linebreak"
+out=$(pathrun XDG_DATA_HOME="$T/path-linebreak" -- -l)
+check 'line break in symlink target refused before path splitting' grep -q 'refusing to use' <<<"$out"
+mkdir -p "$T/hid/hidraw0" "$T/usb/a/b"
+ln -s "$T/usb/a/b" "$T/hid/hidraw0/device"
+printf '\006\320\361' > "$T/usb/a/b/report_descriptor"
+printf 'Vendor|\033\302\233\nother-device\n' > "$T/usb/manufacturer"
+printf 'Product\r' > "$T/usb/product"
+printf '0102' > "$T/usb/idVendor"
+printf '0304' > "$T/usb/idProduct"
+cat > "$T/check-hid.sh" <<EOF
+set -euo pipefail
+H=()
+$(fn detect_keys | sed "s|/sys/class/hidraw|$T/hid|g")
+detect_keys
+EOF
+check 'FIDO display metadata stays on the detected device record' \
+  test "$(bash "$T/check-hid.sh")" = '/dev/hidraw0|Vendorother-device Product|0102:0304'
+printf 'Vendor\302|\233\302\001\233\302\302\233\233' > "$T/usb/manufacturer"
+check 'FIDO filtering cannot join bytes into terminal controls' \
+  test "$(bash "$T/check-hid.sh")" = '/dev/hidraw0|Vendor Product|0102:0304'
+if [[ -n $(fn fido_device_nodes) ]]; then
+  check 'device argument selection accepts only hidraw paths' test \
+    "$(eval "$(fn fido_device_nodes)"; fido_device_nodes <<< $'/dev/hidraw0|legitimate\nnot-a-device|text\n/dev/hidraw1 extra|text')" \
+    = '/dev/hidraw0'
+fi
 A=$(printf 'a%.0s' {1..64})
 printf '%s\n' "$A" > "$DSB/st/oc-sandbox/built-images"                 # forged by the agent
 echo "$SECRET" > "$T/victim-file"; ln -s "$T/victim-file" "$DSB/st/oc-sandbox/built-images.new"
