@@ -255,10 +255,28 @@ class Broker:
             self._granted = True
             self._listener_thread = thread
 
+    def is_bound_to(self, path: Path, *, allow_revoked: bool = False) -> bool:
+        """Verify the live listener and its originally bound, private socket."""
+        if self._path != path:
+            return False
+        with self._lock:
+            if (self._closed or not self._granted or self._listener is None or self._listener.fileno() < 0
+                    or self._listener_thread is None or not self._listener_thread.is_alive()
+                    or (not allow_revoked and self._revoked.is_set())):
+                return False
+            try:
+                info = path.lstat()
+            except OSError:
+                return False
+            return self._owns_socket(info) and info.st_uid == os.getuid() and not (info.st_mode & 0o077)
+
+    def _owns_socket(self, info) -> bool:
+        return self._socket_identity == (info.st_dev, info.st_ino) and stat.S_ISSOCK(info.st_mode)
+
     def _unlink_socket(self):
         with contextlib.suppress(FileNotFoundError):
             info = self._path.lstat()
-            if self._socket_identity == (info.st_dev, info.st_ino) and stat.S_ISSOCK(info.st_mode):
+            if self._owns_socket(info):
                 self._path.unlink()
 
     def _accept(self, listener):
