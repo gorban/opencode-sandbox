@@ -2623,12 +2623,12 @@ class TestReciprocalRound6Fixes(CoordTestBase):
         # 3. Degrade hub and start in-process confirm_recovery(): MUST wait for in-flight handoff!
         hub._mark_degraded("in_process_recovery_test")
         rec_done = threading.Event()
-        rec_err: list[BaseException] = []
+        rec_err: list[Exception] = []
 
         def _do_recover() -> None:
             try:
                 hub.confirm_recovery(_OP, reason="in_process_verified")
-            except BaseException as exc:  # pragma: no cover
+            except Exception as exc:  # pragma: no cover
                 rec_err.append(exc)
             finally:
                 rec_done.set()
@@ -2675,12 +2675,12 @@ class TestReciprocalRound6Fixes(CoordTestBase):
         )
 
         # Part A: waiting register_sandbox must fail after orch-r6 rotates under _register_lock
-        reg_err: list[BaseException] = []
+        reg_err: list[Exception] = []
 
         def _wait_register() -> None:
             try:
                 self._reg_sb(hub, stale_orch, "child-stale", "inc_c1", parent_addr="orch-r6")
-            except BaseException as exc:
+            except Exception as exc:
                 reg_err.append(exc)
 
         hub._register_lock.acquire()
@@ -2698,7 +2698,7 @@ class TestReciprocalRound6Fixes(CoordTestBase):
         self.assertIsNone(reg.get_sandbox("child-stale"))
 
         # Part B: waiting grant_edge must fail after source incarnation rotates under _register_lock
-        grant_err: list[BaseException] = []
+        grant_err: list[Exception] = []
 
         def _wait_grant() -> None:
             try:
@@ -2708,7 +2708,7 @@ class TestReciprocalRound6Fixes(CoordTestBase):
                     src_incarnation="inc_gs1",
                     dst_addr="sb-gdst",
                 )
-            except BaseException as exc:
+            except Exception as exc:
                 grant_err.append(exc)
 
         hub._register_lock.acquire()
@@ -3059,6 +3059,234 @@ class TestReciprocalRound6Fixes(CoordTestBase):
         self.assertTrue(reg.verify_audit_chain()[0])
         self.assertTrue(hub._degraded_marker.exists())
         self.assertTrue(hub._session_active_marker.exists())
+
+
+class TestReciprocalRound7Fixes(CoordTestBase):
+    """Red/green regressions for all five failure-path findings on 0a6b6b40."""
+
+    _open_pair = TestReciprocalRound6Fixes._open_pair
+    _reg_sb = staticmethod(TestReciprocalRound6Fixes._reg_sb)
+    _wait_until = staticmethod(TestReciprocalRound6Fixes._wait_until)
+
+    def test_r7_p1_1_recovery_cancels_lease_and_held_stream_before_failing_db_write(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        lease = BrokerLease("job_rec_fail_r7")
+        self._reg_sb(hub, _OP, "sb-rl", "inc_rl1", lease=lease)
+        edge = hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-rl")
+
+        held_started = threading.Event()
+        held_release = threading.Event()
+        self.addCleanup(held_release.set)
+        transport.queue_script(
+            "sb-rl", TurnScript(on_stream_started=held_started, block_event=held_release)
+        )
+        hub.send(_OP, target="sb-rl", body_text="Held stream during failing recovery")
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(held_started.wait(timeout=1.0))
+
+        hub._mark_degraded("simulated_r7_recovery_db_failure")
+        orig_revoke_grant = reg.revoke_grant_and_cancel_outbox
+        fail_once = {"enabled": True}
+
+        def _failing_revoke_grant(**kwargs: Any) -> list[str]:
+            if fail_once["enabled"]:
+                fail_once["enabled"] = False
+                raise OSError("simulated_db_write_failure_during_recovery")
+            return orig_revoke_grant(**kwargs)
+
+        reg.revoke_grant_and_cancel_outbox = _failing_revoke_grant  # type: ignore[method-assign]
+        with self.assertRaises(OSError):
+            hub.confirm_recovery(_OP, reason="first_attempt_db_fails")
+
+        # BEFORE retry: lease MUST already be locally revoked and held transport aborted!
+        self.assertTrue(hub._is_lease_locally_revoked(lease))
+        self.assertIn(("sb-rl", "inc_rl1"), transport.revoked_incarnations)
+        self.assertTrue(hub.is_degraded)
+
+        # Retry completes durable retirement and reopens cleanly
+        hub.confirm_recovery(_OP, reason="retry_after_db_recovers")
+        self.assertFalse(hub.is_degraded)
+        self.assertEqual(reg.get_sandbox("sb-rl").status, "revoked")  # type: ignore[union-attr]
+        self.assertFalse(reg.get_edge(edge.edge_id).active)  # type: ignore[union-attr]
+
+    def test_r7_p1_2_known_controller_outage_before_handoff_blocks_dispatch_and_keeps_pending(
+        self,
+    ) -> None:
+        controller, ctrl_op, _lease, req_ko = _make_controller_lease("sb-ko", "inc_ko1")
+        reg, transport, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-ko", "inc_ko1", controller_request_id=req_ko)
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-ko")
+        msg_ko = hub.send(_OP, target="sb-ko", body_text="Do not handoff during known outage")[
+            "msg_id"
+        ]
+
+        orig_status = controller.status
+        orig_mark_started = reg.mark_outbox_dispatch_started
+        triggered = {"done": False}
+
+        def _outage(_actor: Any, _req: str) -> Any:
+            raise OSError("known_outage_before_handoff")
+
+        def _mark_started_with_outage(msg_id: str, **kwargs: Any) -> bool:
+            ok = orig_mark_started(msg_id, **kwargs)
+            if ok and not triggered["done"]:
+                triggered["done"] = True
+                controller.status = _outage  # type: ignore[method-assign]
+                self._wait_until(lambda: req_ko in hub._unavailable_requests)
+            return ok
+
+        reg.mark_outbox_dispatch_started = _mark_started_with_outage  # type: ignore[method-assign]
+        try:
+            self.assertEqual(hub.dispatch_once(async_stream=False), 0)
+            self.assertEqual(transport.dispatched_turns("sb-ko"), [])
+            self.assertIn(msg_ko, {r["msg_id"] for r in reg.list_outbox(statuses=("pending",))})
+        finally:
+            controller.status = orig_status  # type: ignore[method-assign]
+            reg.mark_outbox_dispatch_started = orig_mark_started  # type: ignore[method-assign]
+
+        # Once controller recovers, the untouched pending row dispatches cleanly once
+        self.assertEqual(hub.dispatch_once(async_stream=False), 1)
+        self.assertEqual([t.msg_id for t in transport.dispatched_turns("sb-ko")], [msg_ko])
+        self.assertIn(msg_ko, {r["msg_id"] for r in reg.list_outbox(statuses=("completed",))})
+
+    def test_r7_p1_3_failed_handoff_receipt_write_retains_stream_handle_cancels_and_marks_uncertain(
+        self,
+    ) -> None:
+        controller, ctrl_op, _lease, req_hf = _make_controller_lease("sb-hf", "inc_hf1")
+        reg, transport, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-hf", "inc_hf1", controller_request_id=req_hf)
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-hf")
+        transport.queue_script("sb-hf", TurnScript(block_event=threading.Event()))
+        msg_hf = hub.send(_OP, target="sb-hf", body_text="Handoff receipt write fails")["msg_id"]
+
+        orig_abort_stream = transport.abort_stream
+        abort_calls: list[str] = []
+
+        def _flaky_abort(stream_id: str, *, reason: str) -> bool:
+            abort_calls.append(stream_id)
+            if len(abort_calls) == 1:
+                raise RuntimeError("transient_abort_failure_after_handoff_persist_err")
+            return orig_abort_stream(stream_id, reason=reason)
+
+        def _fail_handed_off(_msg_id: str, *, stream_id: str) -> None:
+            _ = stream_id
+            raise OSError("sqlite_write_failed_after_transport_handoff")
+
+        transport.abort_stream = _flaky_abort  # type: ignore[method-assign]
+        reg.mark_outbox_handed_off = _fail_handed_off  # type: ignore[method-assign]
+
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        # Original msg_id MUST be marked uncertain (no replay!) and stream_id immediately targeted
+        self.assertIn(msg_hf, {r["msg_id"] for r in reg.list_outbox(statuses=("uncertain",))})
+        self.assertEqual(len(abort_calls), 1)
+        returned_sid = abort_calls[0]
+        # Handle retained after first abort_stream failure -> monitor retries and clears it
+        self.assertTrue(
+            self._wait_until(
+                lambda: len(abort_calls) >= 2 and returned_sid not in hub._stream_authorities
+            )
+        )
+        # No replay on subsequent dispatch_once
+        self.assertEqual(hub.dispatch_once(async_stream=False), 0)
+        self.assertEqual(len(transport.dispatched_turns("sb-hf")), 1)
+
+    def test_r7_p2_4_failed_monitor_start_leaves_no_durable_registration_or_grant(
+        self,
+    ) -> None:
+        controller, ctrl_op, _lease, req_reg_fail = _make_controller_lease("sb-mfail", "inc_mf1")
+        req_edge_fail = _approve_extra_request(controller, ctrl_op, "sb-mfail")
+        reg, _transport, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+
+        orig_start = threading.Thread.start
+        fail_flag = {"enabled": True}
+
+        def _fail_once(thr: threading.Thread) -> None:
+            if getattr(thr, "_target", None) == hub._run_controller_monitor and fail_flag["enabled"]:
+                fail_flag["enabled"] = False
+                raise RuntimeError("simulated_monitor_start_err")
+            orig_start(thr)
+
+        # Part A: Failed monitor startup on register_sandbox must NOT persist the sandbox
+        with mock.patch.object(threading.Thread, "start", _fail_once):
+            with self.assertRaises(RuntimeError):
+                self._reg_sb(hub, _OP, "sb-mfail", "inc_mf1", controller_request_id=req_reg_fail)
+            self.assertIsNone(reg.get_sandbox("sb-mfail"))
+            self._reg_sb(hub, _OP, "sb-mfail", "inc_mf1", controller_request_id=req_reg_fail)
+            self.assertIsNotNone(reg.get_sandbox("sb-mfail"))
+
+        # Part B: Failed monitor startup on grant_edge must NOT persist the edge
+        fail_flag["enabled"] = True
+        with mock.patch.object(threading.Thread, "start", _fail_once):
+            with self.assertRaises(RuntimeError):
+                hub.grant_edge(
+                    _OP,
+                    src_actor=_OP.canonical_sender,
+                    dst_addr="sb-mfail",
+                    lease_request_id=req_edge_fail,
+                )
+            self.assertEqual(reg.list_edges(dst_addr="sb-mfail", active_only=False), [])
+            edge = hub.grant_edge(
+                _OP,
+                src_actor=_OP.canonical_sender,
+                dst_addr="sb-mfail",
+                lease_request_id=req_edge_fail,
+            )
+            self.assertTrue(reg.get_edge(edge.edge_id).active)  # type: ignore[union-attr]
+
+    def test_r7_p2_5_blocked_waiter_does_not_defeat_close_deadline(self) -> None:
+        reg, _transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self._reg_sb(hub, _OP, "sb-wt", "inc_wt1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-wt")
+
+        in_wait_read = threading.Event()
+        release_wait_read = threading.Event()
+        self.addCleanup(release_wait_read.set)
+        orig_list_events = reg.list_events_since
+
+        def _slow_list_events(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            if not release_wait_read.is_set():
+                in_wait_read.set()
+                release_wait_read.wait(timeout=2.0)
+            return orig_list_events(*args, **kwargs)
+
+        reg.list_events_since = _slow_list_events  # type: ignore[method-assign]
+        wait_errs: list[Exception] = []
+
+        def _run_wait() -> None:
+            try:
+                hub.wait(_OP, targets=("sb-wt",), since_seq=0, timeout_s=5.0)
+            except Exception as exc:
+                wait_errs.append(exc)
+
+        wait_thread = threading.Thread(target=_run_wait, daemon=True)
+        wait_thread.start()
+        self.assertTrue(in_wait_read.wait(timeout=1.0))
+
+        t0 = time.monotonic()
+        with self.assertRaises(CoordPolicyError):
+            hub.close(timeout_s=0.05)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 0.35)
+        self.assertTrue(hub._session_active_marker.exists())
+        self.assertGreaterEqual(hub._state_lock_fd, 0)
+
+        release_wait_read.set()
+        wait_thread.join(timeout=1.5)
+        self.assertEqual(len(wait_errs), 1)
+        self.assertIsInstance(wait_errs[0], CoordPolicyError)
+        hub.close(timeout_s=1.0)
+        self.assertFalse(hub._session_active_marker.exists())
 
 
 if __name__ == "__main__":
