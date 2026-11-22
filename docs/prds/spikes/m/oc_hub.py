@@ -4496,10 +4496,7 @@ class CoordHub:
 
     def _get_pre_entry_stream_abort(self, stream_id: str) -> str | None:
         with self._meta_lock:
-            pre_entry_abort = self._stream_abort_reasons.get(stream_id)
-            if pre_entry_abort is None or stream_id in self._pending_cleanup_streams:
-                return None
-            return pre_entry_abort
+            return self._stream_abort_reasons.get(stream_id)
 
     def _iterate_stream_events(
         self, env: Envelope, stream_id: str

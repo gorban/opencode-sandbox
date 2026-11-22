@@ -2895,6 +2895,11 @@ class TestReciprocalRound6Fixes(CoordTestBase):
                     lambda: any(r["msg_id"] == msg_ho for r in reg_b.list_outbox(statuses=("aborted",)))
                 )
             )
+            self.assertTrue(
+                self._wait_until(
+                    lambda: len(abort_calls) >= 2 and not hub_b._has_pending_cleanups()
+                )
+            )
             self.assertGreaterEqual(len(abort_calls), 2)
             self.assertNotIn(("sb-ho", "inc_ho1"), transport_b.revoked_incarnations)
         finally:
