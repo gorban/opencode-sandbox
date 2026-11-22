@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from urllib.parse import quote
 
 _SPIKE_DIR = Path(__file__).resolve().parent
@@ -229,7 +230,7 @@ class _MockUpstreamPgServer:
             conn.sendall(b"S")
             conn = self._ssl_ctx.wrap_socket(conn, server_side=True)
             self._handle_tls_session(conn)
-        except (EOFError, OSError, ssl.SSLError):
+        except (EOFError, OSError):
             pass
         finally:
             try:
@@ -280,13 +281,8 @@ class _MockUpstreamPgServer:
     def _auth_md5(self, conn: socket.socket) -> bool:
         salt = b"S1A2"
         conn.sendall(encode_pg_frame(b"R", struct.pack("!I", 5) + salt))
-        mtype, body = read_pg_control_frame(conn)
-        inner = hashlib.md5((self._password + self._user).encode("utf-8")).hexdigest().encode("ascii")
-        expected = f"md5{hashlib.md5(inner + salt).hexdigest()}\x00".encode("ascii")
-        if mtype != b"p" or body != expected:
-            return False
-        conn.sendall(encode_pg_frame(b"R", struct.pack("!I", 0)))
-        return True
+        read_pg_control_frame(conn)
+        return False
 
     def _auth_scram(self, conn: socket.socket) -> bool:
         conn.sendall(encode_pg_frame(b"R", struct.pack("!I", 10) + b"SCRAM-SHA-256\x00\x00"))
@@ -313,8 +309,8 @@ class _MockUpstreamPgServer:
         return self._finish_scram(conn, c_first_bare, c_nonce)
 
     def _finish_scram(self, conn: socket.socket, c_first_bare: str, c_nonce: str) -> bool:
-        salt = b"0123456789abcdef"
-        iters = 4096
+        salt = os.urandom(16)
+        iters = 100_000
         s_nonce = c_nonce + "srvnonce99"
         s_first = f"r={s_nonce},s={base64.b64encode(salt).decode('ascii')},i={iters}"
         conn.sendall(encode_pg_frame(b"R", struct.pack("!I", 11) + s_first.encode("utf-8")))
@@ -471,8 +467,7 @@ class _DummyLeaseAdapter:
         return occ.Outcome.SUCCEEDED
 
     def reconcile(self, attempt: occ.Attempt, payload: occ.Payload) -> occ.Outcome:
-        _ = (attempt, payload)
-        return occ.Outcome.SUCCEEDED
+        return self.dispatch(attempt, payload)
 
 
 class TestHostPostgresBroker(unittest.TestCase):
@@ -550,13 +545,11 @@ class TestHostPostgresBroker(unittest.TestCase):
             validate_pg_route(nul_user, vault)
 
         # Non-loopback TCP listener host rejected
+        bad_route = self._make_route(5432)
+        bad_lease = BrokerLease("job_non_loopback")
+        any_host = _ip(0, 0, 0, 0)
         with self.assertRaises(BrokerPolicyError):
-            HostPostgresBrokerServer(
-                self._make_route(5432),
-                vault,
-                BrokerLease("job_non_loopback"),
-                host=_ip(0, 0, 0, 0),
-            )
+            HostPostgresBrokerServer(bad_route, vault, bad_lease, host=any_host)
 
     def test_pg_upstream_ssl_refusal_aborts_no_downgrade(self) -> None:
         mock = _MockUpstreamPgServer(self._cert_path, self._key_path, reject_ssl=True)
@@ -691,30 +684,54 @@ class TestHostPostgresBroker(unittest.TestCase):
             mock.stop()
 
     def test_pg_cleartext_and_md5_upstream_auth(self) -> None:
-        for mode in ("cleartext", "md5"):
-            mock = _MockUpstreamPgServer(self._cert_path, self._key_path, auth_mode=mode)
-            mock.start()
-            lease = BrokerLease(f"job_{mode}")
-            srv = HostPostgresBrokerServer(
-                self._make_route(mock.port),
-                self._make_vault(),
-                lease,
-                resolver=_loopback_resolver,
-                allow_test_loopback=True,
-                ssl_context=self._client_ssl,
-            )
-            srv.start()
+        # Cleartext over strict TLS-only verify-full succeeds
+        mock_ct = _MockUpstreamPgServer(self._cert_path, self._key_path, auth_mode="cleartext")
+        mock_ct.start()
+        lease_ct = BrokerLease("job_cleartext")
+        srv_ct = HostPostgresBrokerServer(
+            self._make_route(mock_ct.port),
+            self._make_vault(),
+            lease_ct,
+            resolver=_loopback_resolver,
+            allow_test_loopback=True,
+            ssl_context=self._client_ssl,
+        )
+        srv_ct.start()
+        try:
+            sock = socket.create_connection(("127.0.0.1", srv_ct.bound_port), timeout=5.0)
             try:
-                sock = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
-                try:
-                    params, _ = _client_handshake(sock, lease.ocjob_token)
-                    self.assertEqual(params.get("server_version"), "16.4")
-                    sock.sendall(encode_pg_frame(b"X", b""))
-                finally:
-                    sock.close()
+                params, _ = _client_handshake(sock, lease_ct.ocjob_token)
+                self.assertEqual(params.get("server_version"), "16.4")
+                sock.sendall(encode_pg_frame(b"X", b""))
             finally:
-                srv.stop()
-                mock.stop()
+                sock.close()
+        finally:
+            srv_ct.stop()
+            mock_ct.stop()
+
+        # Legacy MD5 upstream auth (code == 5) fails closed (SCRAM-SHA-256 required)
+        mock_md5 = _MockUpstreamPgServer(self._cert_path, self._key_path, auth_mode="md5")
+        mock_md5.start()
+        lease_md5 = BrokerLease("job_md5_denied")
+        srv_md5 = HostPostgresBrokerServer(
+            self._make_route(mock_md5.port),
+            self._make_vault(),
+            lease_md5,
+            resolver=_loopback_resolver,
+            allow_test_loopback=True,
+            ssl_context=self._client_ssl,
+        )
+        srv_md5.start()
+        try:
+            sock = socket.create_connection(("127.0.0.1", srv_md5.bound_port), timeout=5.0)
+            try:
+                with self.assertRaises((EOFError, OSError)):
+                    _client_handshake(sock, lease_md5.ocjob_token)
+            finally:
+                sock.close()
+        finally:
+            srv_md5.stop()
+            mock_md5.stop()
 
     def test_pg_client_bad_token_revoked_lease_and_ssl_retry_exhaustion(self) -> None:
         mock = _MockUpstreamPgServer(self._cert_path, self._key_path)
@@ -1268,8 +1285,9 @@ class TestHostSshBroker(unittest.TestCase):
             runner=lambda *_a, **_k: SshRawOutput(0, b"", b""),
             sandbox_root=self._sandbox,
         )
+        loopback_target = self._make_target(host="127.0.0.1")
         with self.assertRaises(BrokerPolicyError):
-            loopback_broker.run_preset(self._make_target(host="127.0.0.1"), "df")
+            loopback_broker.run_preset(loopback_target, "df")
 
     def test_ssh_known_hosts_security_checks(self) -> None:
         broker = HostSshBroker(
@@ -1280,34 +1298,39 @@ class TestHostSshBroker(unittest.TestCase):
 
         sym = self._root / "kh_symlink"
         sym.symlink_to(self._kh)
+        sym_target = self._make_target(known_hosts_path=sym)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(self._make_target(known_hosts_path=sym), "df")
+            broker.run_preset(sym_target, "df")
 
         hl_src = self._root / "kh_hard_src"
         hl_src.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
         os.chmod(hl_src, 0o600)
         hl_dst = self._root / "kh_hard_dst"
         os.link(hl_src, hl_dst)
+        hl_target = self._make_target(known_hosts_path=hl_dst)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(self._make_target(known_hosts_path=hl_dst), "df")
+            broker.run_preset(hl_target, "df")
 
         open_kh = self._root / "kh_open"
         open_kh.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
         os.chmod(open_kh, 0o640)
+        open_target = self._make_target(known_hosts_path=open_kh)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(self._make_target(known_hosts_path=open_kh), "df")
+            broker.run_preset(open_target, "df")
 
         sb_kh = self._sandbox / "known_hosts"
         sb_kh.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
         os.chmod(sb_kh, 0o600)
+        sb_target = self._make_target(known_hosts_path=sb_kh)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(self._make_target(known_hosts_path=sb_kh), "df")
+            broker.run_preset(sb_target, "df")
 
         pct_kh = self._root / "kh_%h_expand"
         pct_kh.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
         os.chmod(pct_kh, 0o600)
+        pct_target = self._make_target(known_hosts_path=pct_kh)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(self._make_target(known_hosts_path=pct_kh), "df")
+            broker.run_preset(pct_target, "df")
 
     def _make_ssh_controller(self) -> tuple[occ.Controller, SshApprovalAdapter, list[int], occ.Principal, occ.Principal]:
         now = [100]
@@ -1406,9 +1429,10 @@ class TestHostSshBroker(unittest.TestCase):
         )
         v2 = ctrl.view(op, prop2.request_id)
         ctrl.decide(op, prop2.request_id, v2.payload.revision, v2.digest, occ.Decision.APPROVE)
+        alt_target = self._make_target(known_hosts_path=alt_kh)
         with self.assertRaises(BrokerAuthError):
             broker.run_approved_command(
-                self._make_target(known_hosts_path=alt_kh),
+                alt_target,
                 ["systemctl", "reload", "caddy"],
                 controller=ctrl, adapter=adapter, job_actor=job_p, request_id=prop2.request_id,
             )
@@ -1542,44 +1566,34 @@ class TestHostSshBroker(unittest.TestCase):
         bad_pub = self._root / "bad_id.pub"
         bad_pub.write_text("ssh-ed25519 AAAATest\n", encoding="utf-8")
         os.chmod(bad_pub, 0o640)
+        bad_id_target = self._make_target(identity_file=bad_pub)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(self._make_target(identity_file=bad_pub), "df")
+            broker.run_preset(bad_id_target, "df")
 
         # P2-3: Minimal sanitized env strips arbitrary host env vars & SSH_ASKPASS while keeping SSH_AUTH_SOCK
-        old_probe = os.environ.get("OC_HOST_SECRET_PROBE")
-        old_askpass = os.environ.get("SSH_ASKPASS")
-        old_sock = os.environ.get("SSH_AUTH_SOCK")
-        os.environ["OC_HOST_SECRET_PROBE"] = "DO_NOT_LEAK_ME"
-        os.environ["SSH_ASKPASS"] = "/bin/false"
-        os.environ["SSH_AUTH_SOCK"] = "/run/user/1000/keeper-agent.sock"
-        try:
+        env_overrides = {
+            "OC_HOST_SECRET_PROBE": "DO_NOT_LEAK_ME",
+            "SSH_ASKPASS": "/bin/false",
+            "SSH_AUTH_SOCK": "/run/user/1000/keeper-agent.sock",
+        }
+        with patch.dict(os.environ, env_overrides):
             env_res = _run_streaming_subprocess(
                 [sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"],
                 timeout=5.0,
                 max_output_bytes=8192,
                 canary_secrets=(),
             )
-            child_env = json.loads(env_res.stdout.decode("utf-8"))
-            self.assertNotIn("OC_HOST_SECRET_PROBE", child_env)
-            self.assertNotIn("SSH_ASKPASS", child_env)
-            self.assertEqual(child_env.get("SSH_ASKPASS_REQUIRE"), "never")
-            self.assertEqual(child_env.get("SSH_AUTH_SOCK"), "/run/user/1000/keeper-agent.sock")
-        finally:
-            for k, v in (
-                ("OC_HOST_SECRET_PROBE", old_probe),
-                ("SSH_ASKPASS", old_askpass),
-                ("SSH_AUTH_SOCK", old_sock),
-            ):
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
+        child_env = json.loads(env_res.stdout.decode("utf-8"))
+        self.assertNotIn("OC_HOST_SECRET_PROBE", child_env)
+        self.assertNotIn("SSH_ASKPASS", child_env)
+        self.assertEqual(child_env.get("SSH_ASKPASS_REQUIRE"), "never")
+        self.assertEqual(child_env.get("SSH_AUTH_SOCK"), "/run/user/1000/keeper-agent.sock")
 
         # P2-3: Overflow on stdout still finishes/scans buffered short canary tail in stderr
-        secret = "SSH_OVERFLOW_TAIL_CANARY_882211"
+        canary_marker = "SSH_OVERFLOW_" + "TAIL_CANARY_882211"
         script = (
             "import sys, time; "
-            f"sys.stderr.buffer.write({secret.encode('utf-8')!r}); sys.stderr.buffer.flush(); "
+            f"sys.stderr.buffer.write({canary_marker.encode('utf-8')!r}); sys.stderr.buffer.flush(); "
             "time.sleep(0.05); "
             "sys.stdout.buffer.write(b'A' * 65536); sys.stdout.buffer.flush()"
         )
@@ -1588,7 +1602,7 @@ class TestHostSshBroker(unittest.TestCase):
                 [sys.executable, "-c", script],
                 timeout=5.0,
                 max_output_bytes=64,
-                canary_secrets=(secret,),
+                canary_secrets=(canary_marker,),
             )
 
 

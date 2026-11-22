@@ -1054,7 +1054,7 @@ def has_sensitive_headers(headers: dict[str, str]) -> bool:
 
 
 def _validate_single_mcp_header(hk: object, hv: object, context: str) -> tuple[str, str]:
-    if type(hk) is not str or type(hv) is not str:
+    if not isinstance(hk, str) or not isinstance(hv, str):
         raise SchemaError(f"Invalid header in {context}")
     if HEADER_NAME_RE.fullmatch(hk) is None:
         raise SchemaError(f"Invalid header name in {context}: {hk!r}")
@@ -1122,7 +1122,7 @@ def _validate_schema_allowed_cidrs(raw: object, context: str) -> list[str]:
 
 
 def _validate_path_glob(pat: object, context: str) -> str:
-    if type(pat) is not str or not pat.startswith("/") or len(pat) > 256:
+    if not isinstance(pat, str) or not pat.startswith("/") or len(pat) > 256:
         raise SchemaError(f"{context} must be a path glob starting with '/'")
     if any(ord(ch) < 0x21 or ord(ch) >= 0x7F or ch in "\\?#;%" for ch in pat):
         raise PolicyError(f"Illegal character in path glob {context}: {pat!r}")

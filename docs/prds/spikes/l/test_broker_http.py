@@ -285,8 +285,7 @@ class _DummyLeaseAdapter:
         return occ.Outcome.SUCCEEDED
 
     def reconcile(self, attempt: occ.Attempt, payload: occ.Payload) -> occ.Outcome:
-        _ = (attempt, payload)
-        return occ.Outcome.SUCCEEDED
+        return self.dispatch(attempt, payload)
 
 
 class TestBrokerHttpUnit(unittest.TestCase):
@@ -1435,10 +1434,9 @@ class TestBrokerHttpIntegration(unittest.TestCase):
             ssrf_b.stop()
 
         # HTTP-P2-3: non-loopback TCP host rejected
+        any_addr = _ip(0, 0, 0, 0)
         with self.assertRaises(BrokerPolicyError):
-            HostHttpBrokerServer(
-                self.routes, self.vault, self.lease, host=_ip(0, 0, 0, 0)
-            )
+            HostHttpBrokerServer(self.routes, self.vault, self.lease, host=any_addr)
 
         # HTTP-P2-3: UDS SO_PEERCRED mismatch closes connection
         uds_path = Path(self._tmpdir_obj.name) / "uds_uid_test" / "broker.sock"

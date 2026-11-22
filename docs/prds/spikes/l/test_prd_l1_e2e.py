@@ -68,8 +68,7 @@ class _E2ELeaseAdapter:
         return occ.Outcome.SUCCEEDED
 
     def reconcile(self, attempt: occ.Attempt, payload: occ.Payload) -> occ.Outcome:
-        _ = (attempt, payload)
-        return occ.Outcome.SUCCEEDED
+        return self.dispatch(attempt, payload)
 
 
 def _lower_plan_http_routes(

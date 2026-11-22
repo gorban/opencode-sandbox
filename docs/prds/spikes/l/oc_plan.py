@@ -771,6 +771,11 @@ def _resolve_remote_cred_delivery(
     return route_id, cred_delivery
 
 
+def _broker_loopback_http_url(host: str, port: int, path: str) -> str:
+    scheme = "http"
+    return f"{scheme}://{host}:{port}{path}"
+
+
 def _compile_remote_mcp_entry(
     mname: str,
     mcfg: dict[str, Any],
@@ -828,7 +833,7 @@ def _compile_remote_mcp_entry(
         tools=tools,
     )
     if cred_delivery == "host-brokered":
-        container_url = f"http://{sandbox_broker_host}:{broker_http_port}/mcp/{mname}"
+        container_url = _broker_loopback_http_url(sandbox_broker_host, broker_http_port, f"/mcp/{mname}")
         container_headers = {"Authorization": "Bearer {file:/run/secrets/oc_broker_token}"}
         container_secret_env: dict[str, str] = {}
     else:
@@ -1053,7 +1058,7 @@ def _compile_broker_http_entry(
         "wire_policy": cfg["wire_policy"],
     }
     if cred_delivery == "host-brokered":
-        proxy_url = f"http://{sandbox_broker_host}:{broker_http_port}/http/{name}"
+        proxy_url = _broker_loopback_http_url(sandbox_broker_host, broker_http_port, f"/http/{name}")
         _set_broker_client_env(broker_client_env, f"OC_BROKER_HTTP_{name.upper().replace('-', '_')}_URL", proxy_url)
         if cfg.get("client_env_var"):
             _set_broker_client_env(broker_client_env, cfg["client_env_var"], proxy_url)

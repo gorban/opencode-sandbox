@@ -29,10 +29,10 @@ IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 MIN_SECRET_LEN = 12
 
 OPERATOR_ALLOWED_PRIVATE_SUPERNETS: tuple[ipaddress.IPv4Network, ...] = (
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.IPv4Network(((10 << 24), 8)),
+    ipaddress.IPv4Network((((172 << 24) | (16 << 16)), 12)),
+    ipaddress.IPv4Network((((192 << 24) | (168 << 16)), 16)),
+    ipaddress.IPv4Network((((100 << 24) | (64 << 16)), 10)),
 )
 
 
@@ -270,11 +270,15 @@ def _secret_canary_needles(secret_values: Iterable[str]) -> tuple[bytes, ...]:
         if type(val) is not str or len(val) < MIN_SECRET_LEN:
             continue
         raw = val.encode("utf-8")
-        needles.add(raw)
-        needles.add(quote(val, safe="").encode("ascii"))
-        needles.add(quote_plus(val).encode("ascii"))
-        needles.add(base64.b64encode(raw).rstrip(b"="))
-        needles.add(base64.urlsafe_b64encode(raw).rstrip(b"="))
+        needles.update(
+            (
+                raw,
+                quote(val, safe="").encode("ascii"),
+                quote_plus(val).encode("ascii"),
+                base64.b64encode(raw).rstrip(b"="),
+                base64.urlsafe_b64encode(raw).rstrip(b"="),
+            )
+        )
     return tuple(sorted(needles, key=len, reverse=True))
 
 

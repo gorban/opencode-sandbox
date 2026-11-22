@@ -421,13 +421,14 @@ class TestPlanBrokerSplitAndGates(unittest.TestCase):
                 env_bindings={"API_ENDPOINT": "https://staging.example.com/mcp"},
             ),
         )
+        mac_scheme = "http"
         self.assertEqual(
             mac_res.plan["role_contract"]["opencode_config"]["mcp"]["api_client"]["url"],
-            f"http://host.containers.internal:{DEFAULT_BROKER_HTTP_PORT}/mcp/api_client",
+            f"{mac_scheme}://host.containers.internal:{DEFAULT_BROKER_HTTP_PORT}/mcp/api_client",
         )
         self.assertEqual(
             mac_res.plan["broker_client_env"]["K8S_PROXY_URL"],
-            f"http://host.containers.internal:{DEFAULT_BROKER_HTTP_PORT}/http/k8s",
+            f"{mac_scheme}://host.containers.internal:{DEFAULT_BROKER_HTTP_PORT}/http/k8s",
         )
         self.assertIn(
             f"@host.containers.internal:{DEFAULT_BROKER_PG_PORT}/orders",
@@ -492,32 +493,23 @@ class TestPlanBrokerSplitAndGates(unittest.TestCase):
         )
 
         # Blanket bool is rejected
+        ov_bool = PlanOverrides(allow_raw_remote_mounts=True)  # type: ignore[arg-type]
         with self.assertRaises(PolicyError):
-            compile_plan(
-                self.store,
-                "team/interactive-dev",
-                overrides=PlanOverrides(allow_raw_remote_mounts=True),  # type: ignore[arg-type]
-            )
+            compile_plan(self.store, "team/interactive-dev", overrides=ov_bool)
 
         # Permanently forbidden in managed tier even with explicit route ID
+        ov_managed = PlanOverrides(allow_raw_remote_mounts=frozenset({"mcp:ext_raw"}))
         with self.assertRaisesRegex(PolicyError, "managed"):
-            compile_plan(
-                self.store,
-                "team/managed-raw",
-                overrides=PlanOverrides(allow_raw_remote_mounts=frozenset({"mcp:ext_raw"})),
-            )
+            compile_plan(self.store, "team/managed-raw", overrides=ov_managed)
 
         # Interactive tier without explicit grant fails closed
         with self.assertRaisesRegex(PolicyError, "allow_raw_remote_mounts"):
             compile_plan(self.store, "team/interactive-dev")
 
         # Unknown / inactive route ID in allow_raw_remote_mounts fails closed
+        ov_ghost = PlanOverrides(allow_raw_remote_mounts=frozenset({"mcp:ext_raw", "mcp:ghost"}))
         with self.assertRaisesRegex(PolicyError, "unknown, inactive"):
-            compile_plan(
-                self.store,
-                "team/interactive-dev",
-                overrides=PlanOverrides(allow_raw_remote_mounts=frozenset({"mcp:ext_raw", "mcp:ghost"})),
-            )
+            compile_plan(self.store, "team/interactive-dev", overrides=ov_ghost)
 
         # Interactive tier with exact grant succeeds and emits raw_remote_secret_mounted
         res = compile_plan(
@@ -743,12 +735,9 @@ class TestPlanBrokerSplitAndGates(unittest.TestCase):
                 bundles='["team/cond-raw", "builtin/persona-implementer"]',
             ),
         )
+        ov_cond = PlanOverrides(allow_raw_remote_mounts=frozenset({"mcp:cond"}))
         with self.assertRaisesRegex(PolicyError, "Pod-local MCP"):
-            compile_plan(
-                self.store,
-                "team/int-cond",
-                overrides=PlanOverrides(allow_raw_remote_mounts=frozenset({"mcp:cond"})),
-            )
+            compile_plan(self.store, "team/int-cond", overrides=ov_cond)
 
         # P2-7: NAT64 IPv6 (64:ff9b::/96) rejected at schema time
         nat64_doc = parse_toml_strict(

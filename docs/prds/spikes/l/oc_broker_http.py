@@ -68,6 +68,8 @@ MAX_GQL_TOKENS = 8_192
 MAX_GQL_DEPTH = 64
 MAX_SIGV4_CLOCK_SKEW_SECONDS = 300
 MAX_CHUNK_LINE_BYTES = 1_024
+_MIME_JSON = "application/json"
+_ERR_GQL_DEPTH = "GraphQL nesting depth exceeded"
 
 CLOSED_MCP_WIRE_METHODS = frozenset(
     {
@@ -1058,7 +1060,7 @@ def _parse_sigv4_auth_header(auth_header: str) -> tuple[list[str], list[str], st
 
 
 def _check_sigv4_clock_skew(amz_date: str, expected_date: str, now_ts: float) -> bool:
-    if len(amz_date) != 16 or amz_date[:8] != expected_date:
+    if len(amz_date) != 16 or not amz_date.startswith(expected_date):
         return False
     try:
         req_dt = datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
@@ -1435,7 +1437,7 @@ class _GraphQLParser:
 
     def _parse_type(self, depth: int) -> None:
         if depth > MAX_GQL_DEPTH:
-            raise GraphQLParseError("GraphQL nesting depth exceeded")
+            raise GraphQLParseError(_ERR_GQL_DEPTH)
         if self._is_punct("["):
             self._next()
             self._parse_type(depth + 1)
@@ -1454,7 +1456,7 @@ class _GraphQLParser:
 
     def _parse_arguments(self, depth: int) -> None:
         if depth > MAX_GQL_DEPTH:
-            raise GraphQLParseError("GraphQL nesting depth exceeded")
+            raise GraphQLParseError(_ERR_GQL_DEPTH)
         self._expect_punct("(")
         if self._is_punct(")"):
             raise GraphQLParseError("Empty argument list")
@@ -1466,7 +1468,7 @@ class _GraphQLParser:
 
     def _parse_value(self, depth: int) -> None:
         if depth > MAX_GQL_DEPTH:
-            raise GraphQLParseError("GraphQL nesting depth exceeded")
+            raise GraphQLParseError(_ERR_GQL_DEPTH)
         tok = self._peek()
         if tok is None:
             raise GraphQLParseError("Unexpected EOF in GraphQL value")
@@ -1501,7 +1503,7 @@ class _GraphQLParser:
 
     def _parse_selection_set(self, depth: int) -> None:
         if depth > MAX_GQL_DEPTH:
-            raise GraphQLParseError("GraphQL nesting depth exceeded")
+            raise GraphQLParseError(_ERR_GQL_DEPTH)
         self._expect_punct("{")
         if self._is_punct("}"):
             raise GraphQLParseError("Empty selection set")
@@ -1569,7 +1571,7 @@ def _media_type_strict(
 def _enforce_mcp_jsonrpc(req: ParsedHttpRequest, policy: WirePolicy) -> tuple[bytes, str]:
     if req.method != "POST":
         raise HttpErrorResponse(403, "mcp_requires_post")
-    if _media_type_strict(req.headers) != "application/json":
+    if _media_type_strict(req.headers) != _MIME_JSON:
         raise HttpErrorResponse(415, "mcp_requires_json_content_type")
     try:
         obj = parse_strict_json_object(req.body)
@@ -1592,7 +1594,7 @@ def _enforce_mcp_jsonrpc(req: ParsedHttpRequest, policy: WirePolicy) -> tuple[by
 def _enforce_graphql_query_only(req: ParsedHttpRequest) -> bytes:
     if req.method != "POST":
         raise HttpErrorResponse(403, "graphql_requires_post")
-    if _media_type_strict(req.headers) != "application/json":
+    if _media_type_strict(req.headers) != _MIME_JSON:
         raise HttpErrorResponse(415, "graphql_requires_json_content_type")
     try:
         obj = parse_strict_json_object(req.body)
@@ -1779,7 +1781,7 @@ def filter_mcp_tools_list_response(
     media_type: str, body: bytes, allowed_tools: frozenset[str]
 ) -> bytes:
     """Filter MCP tools/list response for application/json or text/event-stream; fail closed 502."""
-    if media_type == "application/json":
+    if media_type == _MIME_JSON:
         return _filter_mcp_tools_payload(body, allowed_tools)
     if media_type == "text/event-stream":
         try:
@@ -2136,7 +2138,7 @@ def _send_error_response(conn: socket.socket, err: HttpErrorResponse, write_time
     body = canonical_json_bytes({"error": err.code})
     raw = _format_http_response(
         err.status,
-        [("Content-Type", "application/json")],
+        [("Content-Type", _MIME_JSON)],
         body,
     )
     try:
@@ -2157,6 +2159,19 @@ def _send_error_response(conn: socket.socket, err: HttpErrorResponse, write_time
 # ---------------------------------------------------------------------------
 
 
+_HTTP_BROKER_OPTION_KEYS = frozenset(
+    {
+        "max_concurrent_conns",
+        "read_timeout",
+        "write_timeout",
+        "total_timeout",
+        "max_headers",
+        "max_body",
+        "clock",
+    }
+)
+
+
 class HostHttpBrokerServer:
     """Unified host L7 HTTP policy reverse proxy over loopback TCP or 0o700 UDS."""
 
@@ -2171,17 +2186,14 @@ class HostHttpBrokerServer:
         socket_path: Path | None = None,
         sandbox_root: Path | None = None,
         expected_uid: int | None = None,
-        max_concurrent_conns: int = MAX_CONCURRENT_CONNS,
-        read_timeout: float = READ_TIMEOUT_SECONDS,
-        write_timeout: float = WRITE_TIMEOUT_SECONDS,
-        total_timeout: float = TOTAL_REQUEST_TIMEOUT_SECONDS,
-        max_headers: int = MAX_HEADER_BYTES,
-        max_body: int = MAX_BODY_BYTES,
         ssl_context: ssl.SSLContext | None = None,
         resolver: Callable[..., list[Any]] | None = None,
         allow_test_loopback: bool = False,
-        clock: Callable[[], float] | None = None,
+        **options: Any,
     ):
+        unknown_opts = sorted(set(options) - _HTTP_BROKER_OPTION_KEYS)
+        if unknown_opts:
+            raise TypeError(f"HostHttpBrokerServer unexpected keyword argument(s): {', '.join(unknown_opts)}")
         self.vault = vault
         self.lease = lease
         self.routes_by_prefix = validate_route_table(routes, vault)
@@ -2197,16 +2209,16 @@ class HostHttpBrokerServer:
         self._host = host
         self._port = port
         self._expected_uid = os.geteuid() if expected_uid is None else expected_uid
-        self._conn_sem = threading.BoundedSemaphore(max_concurrent_conns)
-        self._read_timeout = read_timeout
-        self._write_timeout = write_timeout
-        self._total_timeout = total_timeout
-        self._max_headers = max_headers
-        self._max_body = max_body
+        self._conn_sem = threading.BoundedSemaphore(options.get("max_concurrent_conns", MAX_CONCURRENT_CONNS))
+        self._read_timeout = float(options.get("read_timeout", READ_TIMEOUT_SECONDS))
+        self._write_timeout = float(options.get("write_timeout", WRITE_TIMEOUT_SECONDS))
+        self._total_timeout = float(options.get("total_timeout", TOTAL_REQUEST_TIMEOUT_SECONDS))
+        self._max_headers = int(options.get("max_headers", MAX_HEADER_BYTES))
+        self._max_body = int(options.get("max_body", MAX_BODY_BYTES))
         self._ssl_context = ssl_context
         self._resolver = resolver
         self._allow_test_loopback = allow_test_loopback
-        self._clock = clock or time.time
+        self._clock = options.get("clock") or time.time
 
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
@@ -2421,7 +2433,7 @@ class HostHttpBrokerServer:
             scrubbed = b"" if req.method == "HEAD" else canonical_json_bytes({"error": "upstream_error", "status": head.status})
             raw = _format_http_response(
                 head.status,
-                [("Content-Type", "application/json")],
+                [("Content-Type", _MIME_JSON)],
                 scrubbed,
                 include_cl=(req.method != "HEAD"),
             )

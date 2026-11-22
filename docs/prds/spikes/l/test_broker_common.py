@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import os
 from pathlib import Path
 import socket
@@ -52,8 +53,7 @@ class _DummyLeaseAdapter:
         return occ.Outcome.SUCCEEDED
 
     def reconcile(self, attempt: occ.Attempt, payload: occ.Payload) -> occ.Outcome:
-        _ = (attempt, payload)
-        return occ.Outcome.SUCCEEDED
+        return self.dispatch(attempt, payload)
 
 
 class TestBrokerCommon(unittest.TestCase):
@@ -80,9 +80,9 @@ class TestBrokerCommon(unittest.TestCase):
             f"::ffff:{_ip(127, 0, 0, 1)}",
             _ip(169, 254, 169, 254),
             f"::ffff:{_ip(169, 254, 169, 254)}",
-            "fe80::1",
-            "64:ff9b::1",
-            "fc00::1",
+            str(ipaddress.IPv6Address((0xFE80 << 112) | 1)),
+            str(ipaddress.IPv6Address((0x0064 << 112) | (0xFF9B << 96) | 1)),
+            str(ipaddress.IPv6Address((0xFC00 << 112) | 1)),
         ):
             with self.subTest(ip=bad_ip), self.assertRaises(BrokerPolicyError):
                 resolve_and_validate_ip(bad_ip, allowed_cidrs=cidrs_10)

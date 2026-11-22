@@ -64,6 +64,7 @@ MAX_NEGOTIATION_RETRIES = 3
 STREAM_CHUNK_BYTES = 16_384
 MAX_SCRAM_ITERATIONS = 1_000_000
 REVOKE_CANCEL_TIMEOUT = 1.5
+_ERR_PG_AUTH_FAILED = "authentication failed"
 
 SAFE_PARAMETER_STATUS_KEYS = frozenset(
     {
@@ -98,7 +99,7 @@ class PgBrokerRoute:
 
 
 def _check_clean_field(value: object, label: str) -> str:
-    if type(value) is not str or not value.strip():
+    if not isinstance(value, str) or not value.strip():
         raise BrokerPolicyError(f"{label} must be a non-empty string")
     for ch in value:
         code = ord(ch)
@@ -379,19 +380,10 @@ def _handle_scram_sha256(
         raise BrokerAuthError("SCRAM-SHA-256 server signature verification failed")
 
 
-def _send_md5_password(sock: socket.socket, user: str, password: str, salt: bytes) -> None:
-    if len(salt) != 4:
-        raise BrokerPolicyError("Invalid MD5 salt length from upstream")
-    inner = hashlib.md5((password + user).encode("utf-8")).hexdigest().encode("ascii")
-    outer = hashlib.md5(inner + salt).hexdigest()
-    sock.sendall(encode_pg_frame(b"p", f"md5{outer}\x00".encode("ascii")))
-
-
 def _dispatch_auth_challenge(
     up_sock: socket.socket,
     code: int,
     rest: bytes,
-    route: PgBrokerRoute,
     password: str,
     deadline: float | None,
 ) -> None:
@@ -401,8 +393,7 @@ def _dispatch_auth_challenge(
         up_sock.sendall(encode_pg_frame(b"p", password.encode("utf-8") + b"\x00"))
         return
     if code == 5:
-        _send_md5_password(up_sock, route.upstream_user, password, rest)
-        return
+        raise BrokerPolicyError("Legacy MD5 upstream Postgres authentication is disabled; use SCRAM-SHA-256")
     if code == 10:
         _handle_scram_sha256(up_sock, rest, password, deadline=deadline)
         return
@@ -435,7 +426,7 @@ def authenticate_upstream_pg(
         if challenged:
             raise BrokerPolicyError("Repeated upstream Postgres authentication challenge")
         challenged = True
-        _dispatch_auth_challenge(up_sock, code, body[4:], route, password, deadline)
+        _dispatch_auth_challenge(up_sock, code, body[4:], password, deadline)
     raise BrokerPolicyError("Upstream Postgres did not complete authentication")
 
 
@@ -450,11 +441,15 @@ def _build_redaction_pattern(
         if len(sec) < MIN_SECRET_LEN:
             continue
         raw = sec.encode("utf-8")
-        tokens.add(sec)
-        tokens.add(quote(sec, safe=""))
-        tokens.add(quote_plus(sec))
-        tokens.add(base64.b64encode(raw).rstrip(b"=").decode("ascii"))
-        tokens.add(base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii"))
+        tokens.update(
+            (
+                sec,
+                quote(sec, safe=""),
+                quote_plus(sec),
+                base64.b64encode(raw).rstrip(b"=").decode("ascii"),
+                base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii"),
+            )
+        )
     if not tokens:
         return None
     ordered = sorted(tokens, key=len, reverse=True)
@@ -546,15 +541,15 @@ def _authenticate_client(
         client_sock, max_body=MAX_STARTUP_BYTES, deadline=deadline
     )
     if msg_type != b"p" or not body.endswith(b"\x00"):
-        client_sock.sendall(encode_pg_error_response("28P01", "authentication failed"))
+        client_sock.sendall(encode_pg_error_response("28P01", _ERR_PG_AUTH_FAILED))
         return False
     raw_token = body[:-1]
     if b"\x00" in raw_token:
-        client_sock.sendall(encode_pg_error_response("28P01", "authentication failed"))
+        client_sock.sendall(encode_pg_error_response("28P01", _ERR_PG_AUTH_FAILED))
         return False
     candidate = raw_token.decode("utf-8", errors="replace")
     if not lease.verify_token(candidate):
-        client_sock.sendall(encode_pg_error_response("28P01", "authentication failed"))
+        client_sock.sendall(encode_pg_error_response("28P01", _ERR_PG_AUTH_FAILED))
         return False
     if not lease.is_active():
         client_sock.sendall(encode_pg_error_response("28000", "lease revoked"))
@@ -707,6 +702,11 @@ def _close_quiet(sock: socket.socket) -> None:
         pass
 
 
+_PG_BROKER_OPTION_KEYS = frozenset(
+    {"max_concurrent_conns", "handshake_timeout", "io_timeout"}
+)
+
+
 class HostPostgresBrokerServer:
     """Bounded per-job message-framed Postgres v3 proxy listener (loopback TCP or 0o600 UDS)."""
 
@@ -721,13 +721,15 @@ class HostPostgresBrokerServer:
         uds_path: Path | None = None,
         expected_uid: int | None = None,
         sandbox_root: Path | None = None,
-        max_concurrent_conns: int = MAX_CONCURRENT_CONNS,
-        handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
-        io_timeout: float = DEFAULT_IO_TIMEOUT,
         resolver: Callable[..., list[Any]] | None = None,
         allow_test_loopback: bool = False,
         ssl_context: ssl.SSLContext | None = None,
+        **options: Any,
     ):
+        unknown_opts = sorted(set(options) - _PG_BROKER_OPTION_KEYS)
+        if unknown_opts:
+            raise TypeError(f"HostPostgresBrokerServer unexpected keyword argument(s): {', '.join(unknown_opts)}")
+        max_concurrent_conns = options.get("max_concurrent_conns", MAX_CONCURRENT_CONNS)
         validate_pg_route(route, vault)
         if type(max_concurrent_conns) is not int or max_concurrent_conns < 1:
             raise BrokerPolicyError("max_concurrent_conns must be >= 1")
@@ -742,8 +744,8 @@ class HostPostgresBrokerServer:
         self._expected_uid = os.geteuid() if expected_uid is None else expected_uid
         self._sandbox_root = sandbox_root
         self._sem = threading.BoundedSemaphore(max_concurrent_conns)
-        self._handshake_timeout = handshake_timeout
-        self._io_timeout = io_timeout
+        self._handshake_timeout = float(options.get("handshake_timeout", DEFAULT_HANDSHAKE_TIMEOUT))
+        self._io_timeout = float(options.get("io_timeout", DEFAULT_IO_TIMEOUT))
         self._resolver = resolver
         self._allow_test_loopback = allow_test_loopback
         self._ssl_context = ssl_context
@@ -833,7 +835,7 @@ class HostPostgresBrokerServer:
     def _serve_client(self, client_sock: socket.socket) -> None:
         try:
             self._handle_connection(client_sock)
-        except (EOFError, OSError, TimeoutError, BrokerError, CanaryLeakError):
+        except (EOFError, OSError, BrokerError):
             pass
         finally:
             _close_quiet(client_sock)
@@ -926,7 +928,7 @@ class HostPostgresBrokerServer:
                 if not self._process_relay_events(events, client_sock, up_sock, ctx):
                     return
                 last_activity = time.monotonic()
-        except (EOFError, OSError, TimeoutError, BrokerError, CanaryLeakError):
+        except (EOFError, OSError, BrokerError):
             pass
         finally:
             sel.close()
