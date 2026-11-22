@@ -409,37 +409,57 @@ def _compute_audit_hash(
     return hashlib.sha256(f"{prev_hash}{payload}".encode("utf-8")).hexdigest()
 
 
+_MIN_SAFE_INT = -(1 << 63)
+_MAX_SAFE_INT = (1 << 63) - 1
+
+
+def _has_surrogate(text: str) -> bool:
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+
 def _safe_timestamp(raw: Any) -> float:
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-        val = float(raw)
+        try:
+            val = float(raw)
+        except OverflowError:
+            return time.time()
         if math.isfinite(val) and val > 0.0:
             return val
     return time.time()
 
 
+def _sanitize_detail_scalar(val: Any) -> tuple[bool, Any]:
+    if val is None or isinstance(val, bool):
+        return True, val
+    if isinstance(val, int):
+        return (True, val) if _MIN_SAFE_INT <= val <= _MAX_SAFE_INT else (False, None)
+    if isinstance(val, float):
+        return (True, val) if math.isfinite(val) else (False, None)
+    if isinstance(val, str):
+        return (False, None) if _has_surrogate(val) else (True, val)
+    return False, None
+
+
 def _sanitize_detail_value(val: Any, depth: int) -> tuple[bool, Any]:
     if depth > _MAX_DETAIL_DEPTH:
         return False, None
-    if val is None or isinstance(val, (bool, int, str)):
-        return True, val
-    if isinstance(val, float):
-        return (True, val) if math.isfinite(val) else (False, None)
     if isinstance(val, Mapping):
         return True, _sanitize_detail_mapping(val, depth + 1)
     if isinstance(val, (list, tuple)):
-        items: list[Any] = []
-        for elem in val:
-            ok, cleaned = _sanitize_detail_value(elem, depth + 1)
-            if ok:
-                items.append(cleaned)
+        items = [
+            cleaned
+            for elem in val
+            for ok, cleaned in (_sanitize_detail_value(elem, depth + 1),)
+            if ok
+        ]
         return True, items
-    return False, None
+    return _sanitize_detail_scalar(val)
 
 
 def _sanitize_detail_mapping(mapping: Mapping[str, Any], depth: int) -> dict[str, Any]:
     clean: dict[str, Any] = {}
     for key, val in mapping.items():
-        if not isinstance(key, str) or key.strip().lower() in _UNTRUSTED_DETAIL_KEYS:
+        if not isinstance(key, str) or _has_surrogate(key) or key.strip().lower() in _UNTRUSTED_DETAIL_KEYS:
             continue
         ok, cleaned = _sanitize_detail_value(val, depth)
         if ok:

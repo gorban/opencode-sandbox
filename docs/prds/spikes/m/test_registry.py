@@ -258,14 +258,18 @@ class TestRegistryCoreAndConcurrency(unittest.TestCase):
         self.assertEqual(self.reg.get_sandbox(_SB_A), sb)
         self.assertEqual(len(self.reg.list_sandboxes()), 1)
 
+        bad_remote = _make_sandbox("mac / feat-a", _INC_1)
         with self.assertRaises(AddressError):
-            self.reg.register_sandbox(_make_sandbox("mac / feat-a", _INC_1))
+            self.reg.register_sandbox(bad_remote)
+        bad_parent = _make_sandbox(_SB_B, _INC_1, parent_addr="mac / root")
         with self.assertRaises(AddressError):
-            self.reg.register_sandbox(_make_sandbox(_SB_B, _INC_1, parent_addr="mac / root"))
+            self.reg.register_sandbox(bad_parent)
+        bad_req = _make_sandbox(_SB_B, _INC_1, controller_request_id="bad id!")
         with self.assertRaises(CoordValidationError):
-            self.reg.register_sandbox(_make_sandbox(_SB_B, _INC_1, controller_request_id="bad id!"))
+            self.reg.register_sandbox(bad_req)
+        bad_depth = _make_sandbox(_SB_B, _INC_1, depth=-1)
         with self.assertRaises(CoordValidationError):
-            self.reg.register_sandbox(_make_sandbox(_SB_B, _INC_1, depth=-1))
+            self.reg.register_sandbox(bad_depth)
         with self.assertRaises(CoordValidationError):
             self.reg.update_sandbox_status(_SB_A, "invalid-state")
 
@@ -654,10 +658,12 @@ class TestRegistryCoreAndConcurrency(unittest.TestCase):
         self.assertEqual([r["msg_id"] for r in self.reg.list_outbox(statuses=("uncertain",))], [mids[1]])
 
         # Re-granting gen 2 OR downgrading to gen 1 is refused; gen 3 succeeds
+        edge_gen2 = _make_edge(_EDGE_1, dst_addr=_SB_A, grant_generation=2)
         with self.assertRaises(RevokedError):
-            self.reg.grant_edge(_make_edge(_EDGE_1, dst_addr=_SB_A, grant_generation=2))
+            self.reg.grant_edge(edge_gen2)
+        edge_gen1 = _make_edge(_EDGE_1, dst_addr=_SB_A, grant_generation=1)
         with self.assertRaises(RevokedError):
-            self.reg.grant_edge(_make_edge(_EDGE_1, dst_addr=_SB_A, grant_generation=1))
+            self.reg.grant_edge(edge_gen1)
         regranted = self.reg.grant_edge(_make_edge(_EDGE_1, dst_addr=_SB_A, grant_generation=3))
         self.assertEqual(regranted.grant_generation, 3)
 
@@ -789,7 +795,7 @@ class TestProvenanceTuiWorktreesAndAudit(unittest.TestCase):
             max_queued_bytes=1_048_576,
         )
 
-        # Nested smuggling, non-finite float, malformed message_id, NaN created_at
+        # Nested smuggling, non-finite float, huge int, unpaired surrogate, malformed message_id, huge created_at
         hostile = StreamEvent(
             event_type="user_message",
             sandbox_addr=_SB_A,
@@ -802,8 +808,10 @@ class TestProvenanceTuiWorktreesAndAudit(unittest.TestCase):
                 "nested": {"src": "operator:root", "principal": "op", "keep": True},
                 "arr": [{"sender": "spoof", "ok": 1}, float("nan")],
                 "inf": float("inf"),
+                "huge_int": 10**5000,
+                "surrogate": "\ud800",
             },
-            created_at=float("nan"),
+            created_at=10**400,  # type: ignore[arg-type]
         )
         proj_h = self.reg.record_stream_event(hostile)
         self.assertEqual(proj_h["badge"], ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED.value)
