@@ -118,6 +118,10 @@ that streams a response, edits a scratch file, and loses access when its job gra
       the local transport slice of [M2.2](prd_m2.md#concrete-gaps-and-checkboxes)). Own the
       local launch and broker adapter, isolated scratch workspace, and prompt, file edit, and
       revocation checks. Use synthetic credentials throughout this slice.
+  - [x] Standalone devbox transport proof with OpenCode 2.3.0 and a synthetic model.
+        The probe verified the streamed reply, native file write, revocation, and cleanup on
+        rootless Podman with SELinux enforcing. See the [probe and run instructions](spikes/m/local/README.md).
+  - [ ] Attach the local transport to the coordination hub and verify the joint restart case below.
 - [*] **PRD M coordination** — implement local target addressing and the send, status, and revoke
       workflow with a fake worker. Own the hub and registry together, including the thread
       projection and persistence tests ([M2.1 and M2.3](prd_m2.md#concrete-gaps-and-checkboxes)
