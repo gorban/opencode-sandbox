@@ -82,16 +82,39 @@ flowchart LR
     declarative specs), `secret_slots[]`, `env` (strictly filtered, see M8), `resources` (`memory`,
     `pids_limit`), and `security_profile` (partial order with `"standard"` at bottom;
     `"desktop-wayland"` and `"elevated-nested"` are incomparable).
-  - **Active-root `[local]` pruning & remote endpoint validation:** A tool or bundle declaring a
-    `[local]` service branch (e.g., `myapp/api` requiring `cap:db.postgres@^17`) adds `myapp/api` as
-    a root only when its remote endpoint binding (`API_ENDPOINT`) is blank. When a remote endpoint is
-    bound, that `[local]` root edge is omitted: shared transitive dependencies (e.g.,
-    `builtin/postgres`) remain active if another active root still requires them, and are pruned if
-    unreachable from all active roots. Externally bound remote endpoints are validated against scheme
-    (`https` by default; `http` only via explicit host policy) and host policy (rejecting loopback
-    `127.0.0.0/8`, `::1`, link-local `169.254.0.0/16`, `fe80::/10`, cloud metadata, and host-gateway
-    addresses unless explicitly allowlisted by host policy), and the canonical remote binding is
-    included in `plan_digest` and `security_delta`.
+  - **Active-root `[local]` pruning, remote endpoint validation & remote read-only by default:**
+    A tool or bundle declaring a `[local]` service branch (e.g., `myapp/api` requiring
+    `cap:db.postgres@^17`) adds `myapp/api` as a root only when its remote endpoint binding
+    (`API_ENDPOINT`) is blank. When a remote endpoint is bound, that `[local]` root edge is omitted:
+    shared transitive dependencies (e.g., `builtin/postgres`) remain active if another active root
+    still requires them, and are pruned if unreachable from all active roots. Externally bound
+    remote endpoints are validated against scheme (`https` by default; `http` only via explicit host
+    policy) and host policy (rejecting non-global IPs including loopback `127.0.0.0/8`, `::1`,
+    link-local `169.254.0.0/16`, `fe80::/10`, CGNAT `100.64.0.0/10`, cloud metadata, non-canonical
+    numeric/octal/hex IPv4 forms, and host-gateway addresses unless explicitly allowlisted by host
+    policy), and the canonical remote binding is included in `plan_digest` and `security_delta`.
+    - **Remote MCP endpoints are read-only by default:** Because local sidecars are disposable
+      per-instance state while remote endpoints may be shared staging or production services, any
+      MCP server bound to a remote endpoint (either statically via `https://...` or dynamically via
+      `[mcp.<name>.local]` + `env_bindings`) **fails closed to read-only by default**.
+    - **Explicit local vs. remote tool surface & separate credential slots:** `[mcp.<name>]`
+      explicitly declares `read_only_tools` and `write_tools` (never inferred from tool names), plus
+      target-scoped credentials under `[mcp.<name>.local]` (`headers`, `secret_env`) and
+      `[mcp.<name>.remote]` (`read_only_headers`, `read_only_secret_env`, `write_headers`,
+      `write_secret_env`). Any secret slot referenced in `remote.write_*` must be strictly distinct
+      from all slots in `remote.read_only_*` and `local.*` so a write-capable staging token is never
+      mounted into a read-only or local session. If a remote endpoint is active and no explicit
+      `read_only_tools` surface is declared, compilation fails closed.
+    - **Explicit per-endpoint write grant:** Admitting remote `write_tools` (and mounting
+      `remote.write_headers` / `remote.write_secret_env`) requires an explicit operator opt-in
+      (`--allow-remote-write <mcp>=<url>` / `overrides.remote_write_grants`) bound to the **exact
+      canonical remote endpoint URL**. Mismatched or unused write grants fail closed. Granted remote
+      write bindings are hashed into `plan_digest` and surfaced in `security_delta`
+      (`remote_write_granted` and `mcp_tool_surface_widened`). Persona restrictions (such as
+      `builtin/persona-security-reviewer`) still override/narrow `allowed_tools` even when a remote
+      write grant is supplied — and if persona filtering eliminates all `write_tools`, the compiler
+      downgrades effective credentials back to `remote.read_only_*` so a write-capable token is
+      never mounted for a read-only persona.
   - **0-MCP service bundles:** A bundle with `mcp = []` can unconditionally declare
     `requires_services = ["builtin/postgres"]` so the sandbox has Postgres running with
     `PGPASSFILE`/`DATABASE_URL` ready for app development.
@@ -238,11 +261,11 @@ Every `service@1` declares its `endpoints[]` (`name`, `port`, `protocol`, `defau
 
 | Command | Purpose |
 |---|---|
-| `oc-sandbox run [NAME] [--type TYPE] [--host WORKER] [--with MOD]... [--without MOD]... [--port SPEC]... [--worktree REPO[:REF]]` | Compile plan, verify grants/drift, start services and OpenCode sandbox. |
+| `oc-sandbox run [NAME] [--type TYPE] [--host WORKER] [--with MOD]... [--without MOD]... [--port SPEC]... [--allow-remote-write MCP=URL]... [--worktree REPO[:REF]]` | Compile plan, verify grants/drift, start services and OpenCode sandbox. |
 | `oc-sandbox plan [NAME] [...]` | Pure, inert dry-run emitting `plan.lock.json`, `plan_digest`, security elevations, port/auth summary, and drift diff against `applied_plan.json`. |
 | `oc-sandbox build [--type TYPE] [--host WORKER]` | Build/verify pinned images, compiled `mise` OCI toolchain layer, and warm seeds without launching OpenCode. |
 | `oc-sandbox orchestrate` (alias `oc-sandbox -o`) | Launch restricted host orchestrator with typed Config/Orchestration MCP tools and curated base Skills (no generic host file/shell/Podman/SSH access). |
-| `oc-sandbox config {list,show,validate,diff,history,approve,reject,restore,lock}` | Host-operator config inspection, revision approval (`--digest`), rollback, and `mise.lock` compilation. |
+| `oc-sandbox config {list,show,validate,diff,history,approve,reject,reconcile,restore,lock}` | Host-operator config inspection, live-helper approval/rejection/reconciliation (`--operator-socket`, `--digest`), rollback, and `mise.lock` compilation. |
 | `oc-sandbox worker {list,enroll,probe,bootstrap,reconcile}` | Enroll pinned SSH/Tailcat/cloud workers, probe capabilities, run opt-in previewed bootstrap, reap verified orphans. |
 | `oc-sandbox ps` / `attach NAME` / `down NAME [--purge]` / `rollback NAME` | Inspect running sandboxes/services, attach, tear down via ownership labels/receipts, or restore prior `applied_plan.json`. |
 
@@ -306,7 +329,8 @@ generic host file reads/writes, shell, Podman socket, SSH agent, or raw secret a
     **`security_delta`** (`security_profile_elevation`, `exposure_widened`,
     `auth_requirement_changed`, `new_service_added`, `service_image_changed`,
     `new_mcp_server_added`, `mcp_tool_surface_widened`, `new_mise_tool_added`, `persona_changed`,
-    `remote_endpoint_added`, `secret_slot_added`, `resource_limit_increased`).
+    `remote_endpoint_added`, `remote_write_granted`, `secret_slot_added`,
+    `resource_limit_increased`).
   - Persists an immutable proposal record (`status = "pending"`, closed `action` in
     `("upsert", "archive", "unarchive")` — permanent deletion forbidden per `prd_i1`, with
     `proposed_toml is None` required for `"archive"`/`"unarchive"`, TTL `expires_at`, bounded quota
@@ -322,9 +346,17 @@ generic host file reads/writes, shell, Podman socket, SSH agent, or raw secret a
     closed and must be re-proposed in the new incarnation (matching `prd_i1` replay-after-restart
     rejection). Any `"uncertain"` proposal left from a crash is reconciled against the on-disk
     journal before accepting new publishes.
-  - **Operator-only publish (`operator_approve_config_proposal`):** Under the same exclusive
-    persistent-inode `flock` (`O_NOFOLLOW`, `0o600`, lock file never unlinked, matching
-    `oc-setup-lock.py`):
+  - **Operator-only publish (`operator_approve_config_proposal`) & host-only operator UDS:**
+    The live helper exposes a **separate** host-only `0o700` operator control socket
+    (`operator.sock`, mode `0o600`, paired with a `0o600` per-incarnation `operator.token`, NEVER
+    mounted into the orchestrator sandbox) guarded by `SO_PEERCRED` (`uid == expected_uid`),
+    Content-Length framing, strict JSON parsing, and a closed operator method allowlist
+    (`operator_approve`, `operator_reject`, `operator_reconcile`, `operator_status`). Fresh host
+    CLI invocations (`oc-sandbox config approve/reject/reconcile --operator-socket ...`) invoke the
+    live helper incarnation over this UDS so in-incarnation approvals succeed cross-process while
+    restarting the helper rotates the incarnation and rejects prior pending proposals fail-closed.
+    Under the same exclusive persistent-inode `flock` (`O_NOFOLLOW`, `0o600`, lock file never
+    unlinked, matching `oc-setup-lock.py`):
     1. Verifies `proposal.incarnation == controller.incarnation`, `proposal.status == "pending"`,
        `now() < proposal.expires_at`, and constant-time `proposal.digest == expected_digest`.
     2. Verifies `store.store_revision == proposal.base_store_revision` AND `closure_digest` still
@@ -427,19 +459,27 @@ function compile_plan(store, sandbox_type_id, worker_spec, overrides, applied_pl
         # Validates host_url_template against closed schemes & placeholders (no password placeholder)
 
     # 4. Compile Structured Role Contract (singular persona + instructions + skills + filtered MCPs)
-    role = compile_role_contract(bundles, st.default_agent, services)
+    role, granted_remote_writes = compile_role_contract(
+        bundles, st.default_agent, services, remote_bindings, overrides.remote_write_grants
+    )
         # Rejects >1 primary persona without [composition] replace = ["persona"]
         # Generates SERVICES.md from resolved services; enforces 16 KiB byte cap on instructions
         # Expands {{slot}} in a single non-recursive pass from O_NOFOLLOW bundle-confined files
-        # Filters MCP tools by persona allowlist; enforces typed SecretRef / {file:/run/secrets/...}
-        # Rejects forbidden env keys (PATH, LD_*, PYTHON*, NODE_OPTIONS, *_API_KEY, etc.)
+        # Remote MCP endpoints default to explicit read_only_tools + remote.read_only_* creds
+        # (failing closed if no read_only_tools declared); remote write_tools + remote.write_* creds
+        # require an exact canonical-URL match in overrides.remote_write_grants AND surviving persona
+        # write tools (mismatched/unused grants fail closed; persona narrowing still downgrades creds
+        # back to remote.read_only_* if no write tools survive).
+        # Enforces typed SecretRef / {file:/run/secrets/...}; rejects forbidden env keys.
 
     # 5. Merge constrained mise executables.toml (data-only [tools], <= 64 manifests / 64 tools)
     mise_tools = merge_executable_pins(bundles, services, st.mise_overrides)
         # Fails closed on version conflict, moving channel ('latest'), or hooks/env/tasks keys
 
     # 6. Target-bind digests for worker_spec.arch and hash IMMUTABLE Plan IR BEFORE drift
-    plan = build_canonical_plan_ir(st, worker_spec, services, remote_bindings, endpoints, role, mise_tools)
+    plan = build_canonical_plan_ir(
+        st, worker_spec, services, remote_bindings, granted_remote_writes, endpoints, role, mise_tools
+    )
     plan_digest = sha256_canonical_json(plan)                   # excludes mutable drift!
     drift = classify_drift(applied_plan, plan)                  # hot-safe | recreate-stateless | stateful-migration-required
     return CompiledPlanResult(plan=plan, plan_digest=plan_digest, drift=drift)
@@ -573,9 +613,12 @@ function operator_reconcile_uncertain_proposal(proposal_id):
 ## PoC Scope (Spike Branch `spike-outside-in-poc`)
 
 Per [AGENTS.md](../../AGENTS.md#branches), the spike PoC lives strictly under
-`docs/prds/spikes/l/` (Python stdlib only; 100% offline; requires explicit `--config-dir` and never
-touches real `~/.config/oc-sandbox/`; leaves `oc-sandbox`, `oc-bridge.py`, `oc_controller.py`, and
-production tests untouched):
+`docs/prds/spikes/l/` (Python stdlib only; 100% offline; requires explicit scratch `--config-dir`,
+enforces refusal of real `~/.config/oc-sandbox` / `$XDG_CONFIG_HOME/oc-sandbox` and existing
+non-empty non-PoC directories via `.oc-sandbox-poc-store` marker; leaves `oc-sandbox`,
+`oc-bridge.py`, `oc_controller.py`, and production tests untouched). Inside Distrobox where `/tmp`
+may be owned by a mapped UID, run tests and CLI examples with a user-owned `TMPDIR` (e.g.
+`mktemp -d -p "${XDG_RUNTIME_DIR:-$HOME/.cache}"`) rather than weakening `assert_trusted_dir`:
 
 - [x] **Pure-Python Plan Compiler & Schema (`docs/prds/spikes/l/oc_plan.py`, `oc_schema.py`)** —
       `schema_version = 1` TOML loader (host-state validation, unknown-key rejection, structural
@@ -591,32 +634,42 @@ production tests untouched):
       `service/dind`, `host-provider/{podman-linux,podman-macos-vm,cloud-render}`,
       `transport/{local,ssh-pinned,tailcat,cloud-https}`, and example `sandbox-type` / `bundle`
       definitions (including 0-MCP Postgres app-dev and read-only security-reviewer persona).
-- [x] **Restricted Orchestrator Config MCP Server + Curated Base Skills (`docs/prds/spikes/l/oc_config_mcp.py`, `oc_store.py`, `docs/prds/spikes/l/orchestrator_skills/`)** —
+- [x] **Restricted Orchestrator Config MCP Server + Host-Only Operator Control UDS + Curated Base Skills (`docs/prds/spikes/l/oc_config_mcp.py`, `oc_store.py`, `docs/prds/spikes/l/orchestrator_skills/`)** —
       Content-Length framed strict JSON-RPC MCP server over private `0o700` UDS (per-incarnation
       256-bit session token + `SO_PEERCRED` UID check + early rate limiting + byte/depth caps,
       closed `READABLE`/`MUTABLE` allowlists, `builtin/*` immutability, redacted `plan_preview`,
       `config_propose_revision` wired to real `oc_controller.Controller` via `ConfigPublishAdapter`,
       persistent-inode `flock`, monotonic revisions, durable proposal state machine with
       `"applying"`/`"uncertain"` recovery, `decide()` expiry/staleness check, `unarchive`
-      re-validation, transitive closure re-verification, and safe `restore`/`archive`), plus the 4
-      curated orchestrator base Skills.
-- [x] **Reworked CLI PoC (`docs/prds/spikes/l/oc_sandbox_cli.py`)** — implements `plan`, `config`,
-      and `worker` subcommands against an explicit `--config-dir`.
+      re-validation, transitive closure re-verification, and safe `restore`/`archive`), separate
+      host-only `OperatorControlServer` UDS (`operator.sock` + `operator.token`) for cross-process
+      CLI `approve`/`reject`/`reconcile` against the live helper incarnation, scratch-only
+      `--config-dir` isolation + `.oc-sandbox-poc-store` marker, plus the 4 curated orchestrator
+      base Skills.
+- [x] **Reworked CLI PoC (`docs/prds/spikes/l/oc_sandbox_cli.py`)** — implements `plan` (including
+      `--allow-remote-write MCP=URL`), `config` (including `--operator-socket` for live-helper
+      `approve`/`reject`/`reconcile`), and `worker` subcommands against an explicit scratch
+      `--config-dir`.
 - [x] **Comprehensive Offline Adversarial & Unit Test Suite (`docs/prds/spikes/l/test_poc.py`)** —
-      29 tests verifying DAG cycles, ambiguous provider & diamond conflicts, fallback inside DAG
+      32 tests verifying DAG cycles, ambiguous provider & diamond conflicts, fallback inside DAG
       (and refusing escalating/incomparable fallbacks), alternate-port builtin capability
       downgrade prevention, same-service multi-instance `instance_port` & `service@instance`
       disambiguation, `[local]` active-root pruning + remote-endpoint SSRF denial (including
-      CGNAT `100.64.0.0/10` and octal/decimal/hex IPv4), pod-local MCP SSRF & port `9222`
-      rejection, 0-MCP Postgres wiring, endpoint exposure denial (`9222`, unauthenticated `5432`),
-      persona conflict & `[composition] replace`, single-pass `{{slot}}` & symlink rejection,
-      multi-hop `$SB` symlink rejection, MCP role filtering, structural secret & forbidden-env
-      rejection, `executables.toml` hook/latest rejection, 64-node DAG cap, `plan_digest`
-      invariance across drift, `security_delta` & `classify_drift` coverage, injective `/` -> `@`
-      store paths, and orchestrator MCP framing/write-timeout/redacted-`config_diff`/duplicate-key/
-      depth/token/restart-rotation/opaque-ID/allowlist/`builtin/*`/archive-dependent/`unarchive`-
-      revalidation/stale-closure/`"applying"`-and-`"uncertain"`-recovery/rollback-replay/digest-
-      mismatch/TTL-bound/CLI-`O_NOFOLLOW` rejection.
+      CGNAT `100.64.0.0/10` and octal/decimal/hex IPv4), remote MCP read-only default + explicit
+      canonical-URL write grant + separate local/remote-RO/remote-RW credential slots + persona
+      override & credential downgrade, pod-local MCP SSRF & port `9222` rejection, 0-MCP Postgres
+      wiring, endpoint exposure denial (`9222`, unauthenticated `5432`), persona conflict &
+      `[composition] replace`, single-pass `{{slot}}` & symlink rejection, multi-hop and `..` `$SB`
+      rejection, scratch-only `--config-dir` isolation (refusing `~/.config/oc-sandbox`,
+      `$XDG_CONFIG_HOME/oc-sandbox`, and existing non-empty non-PoC dirs), cross-process CLI
+      `config approve` via `--operator-socket` (and fail-closed rejection after helper restart),
+      MCP role filtering, token-boundary raw secret & forbidden-env checks, `executables.toml`
+      hook/latest rejection, 64-node DAG cap, `plan_digest` invariance across drift,
+      `security_delta` (`remote_write_granted`, etc.) & `classify_drift` coverage, injective
+      `/` -> `@` store paths, and orchestrator MCP framing/write-timeout/redacted-`config_diff`/
+      duplicate-key/depth/token/restart-rotation/opaque-ID/allowlist/`builtin/*`/archive-dependent/
+      `unarchive`-revalidation/stale-closure/`"applying"`-and-`"uncertain"`-recovery/rollback-
+      replay/digest-mismatch/TTL-bound/CLI-`O_NOFOLLOW` rejection.
 
 ## Review record
 
@@ -633,11 +686,11 @@ production tests untouched):
 - Gate 2 PoC implementation review round 2 (`Security-Focused PR Reviewer Setup`,
   `3a7f22b02f69..9ab446ba19ca`): **CLEARED** at commit `9ab446ba19ca28dcca555aa43ebbd99eb1c96726`
   (29/29 tests passing; full Gate 2 range `325ab192f9c1..9ab446ba19ca`).
-  - Non-blocking P3 notes recorded for the future production port:
-    1. Anchor `_check_no_raw_secret_value` prefixes at token boundaries (avoiding false positives
-       for hyphenated prose words containing `sk-` such as `task-runner` or `disk-cache`).
-    2. Walk raw uncollapsed path components (before `os.path.abspath`) in
-       `_walk_check_not_in_sandbox` so `$SB/../outside` is rejected as transiting `$SB`, matching
-       production `oc-sandbox`'s `trusted_path()`.
+- Human-review follow-up delta (post-`84001c0`): addressed all 3 user review items (remote MCP
+  read-only by default + explicit canonical-URL write grant + separate local/remote-RO/remote-RW
+  credential slots; scratch-only `--config-dir` isolation + `.oc-sandbox-poc-store` marker;
+  separate host-only `OperatorControlServer` UDS for cross-process CLI `approve`/`reject`/
+  `reconcile` with restart fail-closed preserved) plus both Gate 2 Round 2 P3 notes (token-boundary
+  raw secret regex and raw uncollapsed `..` path walk). Delta review pending.
 
 - [ ] **Human review**: checked only when the user says so
