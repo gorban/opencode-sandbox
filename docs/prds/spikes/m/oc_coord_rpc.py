@@ -779,8 +779,12 @@ class CoordUdsRpcServer:
     def _read_and_validate_conn(
         self, conn: socket.socket, peer_uid: int, *, uid_allowed: bool
     ) -> tuple[Any, PrincipalCtx, str, dict[str, Any]] | dict[str, Any]:
-        read_timeout = self._read_timeout if uid_allowed else min(self._read_timeout, 1.0)
-        total_timeout = min(TOTAL_REQUEST_TIMEOUT_SECONDS, read_timeout * 3.0)
+        # Production deployments should bind a dedicated operator UDS for full transport isolation;
+        # on shared multi-principal sockets, use a tight overflow timeout for operator reserve checks.
+        read_timeout = self._read_timeout if uid_allowed else min(self._read_timeout, 0.25)
+        total_timeout = min(
+            TOTAL_REQUEST_TIMEOUT_SECONDS, read_timeout * (3.0 if uid_allowed else 2.0)
+        )
         try:
             raw_frame = read_content_length_frame(
                 conn,

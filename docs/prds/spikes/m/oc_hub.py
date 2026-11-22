@@ -97,6 +97,7 @@ _ERR_ADMIN_ONLY = "operator_or_orchestrator_required"
 _STATUS_REVOKED = "revoked"
 _STATUS_RUNNING = "running"
 _STATUS_PENDING = "pending"
+_STATUS_DISPATCH_STARTED = "dispatch_started"
 _STAGING_DIR_NAME = ".staging"
 _SPOOL_DIR_NAME = "inbox-spool"
 _DEGRADED_MARKER_NAME = ".coord_degraded"
@@ -368,6 +369,25 @@ def _write_marker_durable(path: Path, parent_dir: Path, payload: bytes) -> None:
     finally:
         os.close(fd)
     _fsync_dir(parent_dir)
+
+
+def _read_marker_text_nofollow(path: Path) -> str | None:
+    """Read a regular non-symlink marker file text (up to 256 bytes), or None if absent."""
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise CoordPolicyError(f"Symlink marker rejected: {path}") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise CoordPolicyError(f"Non-regular marker rejected: {path}")
+        return os.read(fd, 256).decode("utf-8", errors="replace").strip()
+    finally:
+        os.close(fd)
 
 
 def _unlink_marker_durable(path: Path, parent_dir: Path) -> None:
@@ -888,6 +908,8 @@ class CoordHub:
 
         self._meta_lock = threading.Lock()
         self._register_lock = threading.Lock()
+        self._session_id = mint_crypto_id("sess")
+        self._closed = False
         self._degraded = self._init_recovery_seal()
         self._grant_fences: dict[str, threading.RLock] = {}
         self._fenced_generations: set[tuple[str, int]] = set()
@@ -923,7 +945,7 @@ class CoordHub:
             _write_marker_durable(
                 self._session_active_marker,
                 self._state_dir,
-                f"{time.time():.6f}:pid={os.getpid()}\n".encode("utf-8"),
+                f"{self._session_id}\n".encode("utf-8"),
             )
         except OSError:
             return True
@@ -991,7 +1013,7 @@ class CoordHub:
             self.spool.has_verified_blob(dst_inc, ref) for ref in refs
         )
         if not blobs_ok:
-            if status == _STATUS_PENDING and msg_id:
+            if status in (_STATUS_PENDING, _STATUS_DISPATCH_STARTED) and msg_id:
                 try:
                     self._registry.cancel_outbox_row(
                         msg_id, reason="artifact_unreconciled_after_crash"
@@ -1018,12 +1040,16 @@ class CoordHub:
             raise CoordAuthError("operator_required:confirm_recovery")
         clean_reason = validate_reason_text(reason, "reason")
         with self._register_lock:
-            _unlink_marker_durable(self._degraded_marker, self._state_dir)
+            with self._meta_lock:
+                if self._closed:
+                    raise CoordPolicyError("hub_closed")
+            # Write session seal FIRST so a failure before unlink never drops degraded protection.
             _write_marker_durable(
                 self._session_active_marker,
                 self._state_dir,
-                f"{time.time():.6f}:pid={os.getpid()}:recovered\n".encode("utf-8"),
+                f"{self._session_id}\n".encode("utf-8"),
             )
+            _unlink_marker_durable(self._degraded_marker, self._state_dir)
             with self._meta_lock:
                 self._degraded = False
             self._reconcile_artifacts_on_startup()
@@ -1044,21 +1070,28 @@ class CoordHub:
         self.dispatcher.start()
 
     def close(self) -> None:
-        self.dispatcher.stop()
         with self._meta_lock:
+            if self._closed:
+                return
+            self._closed = True
             leases = list(self._leases.items())
             callbacks = dict(self._lease_callbacks)
             self._leases.clear()
             self._lease_callbacks.clear()
             degraded = self._degraded
+        self.dispatcher.stop()
         for addr, lease in leases:
             cb = callbacks.get(addr)
             if cb is not None:
                 lease.remove_revoke_callback(cb)
             lease.stop_watchdog()
+        with self._meta_lock:
+            degraded = self._degraded
         if not degraded:
             try:
-                _unlink_marker_durable(self._session_active_marker, self._state_dir)
+                owner = _read_marker_text_nofollow(self._session_active_marker)
+                if owner == self._session_id:
+                    _unlink_marker_durable(self._session_active_marker, self._state_dir)
             except (OSError, CoordPolicyError):
                 with self._meta_lock:
                     self._degraded = True
@@ -1081,16 +1114,38 @@ class CoordHub:
         if caller.role not in (CoordRole.OPERATOR, CoordRole.ORCHESTRATOR):
             raise CoordAuthError(f"{_ERR_ADMIN_ONLY}:{action}")
 
-    def _check_controller_request_active(self, request_id: str) -> bool:
+    def _check_controller_request_active(
+        self,
+        request_id: str,
+        *,
+        controller: Controller | None = None,
+        actor: Principal | None = None,
+    ) -> bool:
         if request_id.startswith(_EPHEMERAL_LEASE_PREFIX):
             return False
-        if self._controller is None or self._controller_actor is None:
+        ctrl = controller if controller is not None else self._controller
+        act = actor if actor is not None else self._controller_actor
+        if ctrl is None or act is None:
             return False
         try:
-            st = self._controller.status(self._controller_actor, request_id)
+            st = ctrl.status(act, request_id)
         except Exception:
             return False
         return bool(st.eligible and not st.revoked)
+
+    def _check_in_memory_lease_active(
+        self, lease: BrokerLease, controller_request_id: str | None
+    ) -> bool:
+        if not lease.is_active():
+            return False
+        if controller_request_id is None:
+            return True
+        lease_req = getattr(lease, "_controller_request_id", None)
+        if lease_req is None and controller_request_id == self._ephemeral_authority_id(lease):
+            return True
+        if lease_req == controller_request_id:
+            return True
+        return self._check_controller_request_active(controller_request_id)
 
     def _check_lease_active(
         self, sandbox_addr: str, *, controller_request_id: str | None = None
@@ -1098,20 +1153,11 @@ class CoordHub:
         with self._meta_lock:
             lease = self._leases.get(sandbox_addr)
         if lease is not None:
-            if not lease.is_active():
-                return False
-            if controller_request_id is not None:
-                if controller_request_id == self._ephemeral_authority_id(lease):
-                    return True
-                lease_req = getattr(lease, "_controller_request_id", None)
-                if lease_req != controller_request_id:
-                    return self._check_controller_request_active(controller_request_id)
-            return True
+            return self._check_in_memory_lease_active(lease, controller_request_id)
         req_id = controller_request_id
         if req_id is None:
             sb = self._registry.get_sandbox(sandbox_addr)
-            if sb is not None:
-                req_id = sb.controller_request_id
+            req_id = sb.controller_request_id if sb is not None else None
         if req_id is not None:
             return self._check_controller_request_active(req_id)
         return True
@@ -1317,7 +1363,9 @@ class CoordHub:
         if callable(invalidate):
             invalidate(addr, new_incarnation, reason="incarnation_rotated")
 
-    def _bind_lease_controller(self, lease: BrokerLease) -> str | None:
+    def _inspect_lease_controller(
+        self, caller: PrincipalCtx, lease: BrokerLease
+    ) -> tuple[str | None, Controller | None, Principal | None]:
         if not lease.is_active():
             raise RevokedError("lease_already_revoked")
         lease_controller = getattr(lease, "_controller", None)
@@ -1327,19 +1375,31 @@ class CoordHub:
             and lease_controller is not self._controller
         ):
             raise CoordPolicyError("lease_controller_mismatch")
-        if self._controller is None and lease_controller is not None:
-            self._controller = lease_controller
+        eff_controller = self._controller
+        if eff_controller is None and lease_controller is not None:
+            if caller.role is not CoordRole.OPERATOR:
+                raise CoordAuthError("operator_required_to_bind_controller")
+            eff_controller = lease_controller
         lease_actor = getattr(lease, "_controller_actor", None)
-        if self._controller_actor is None and lease_actor is not None:
-            self._controller_actor = lease_actor
+        eff_actor = self._controller_actor
+        if eff_actor is None and lease_actor is not None:
+            if caller.role is not CoordRole.OPERATOR:
+                raise CoordAuthError("operator_required_to_bind_controller")
+            eff_actor = lease_actor
         raw_lease_req = getattr(lease, "_controller_request_id", None)
-        if raw_lease_req is None:
-            return None
-        return validate_opaque_token(raw_lease_req, _LABEL_CTRL_REQ_ID)
+        lease_req = (
+            validate_opaque_token(raw_lease_req, _LABEL_CTRL_REQ_ID)
+            if raw_lease_req is not None
+            else None
+        )
+        return lease_req, eff_controller, eff_actor
 
     def _resolve_register_authority(
-        self, lease: BrokerLease | None, controller_request_id: str | None
-    ) -> str | None:
+        self,
+        caller: PrincipalCtx,
+        lease: BrokerLease | None,
+        controller_request_id: str | None,
+    ) -> tuple[str | None, Controller | None, Principal | None]:
         clean_req = (
             validate_opaque_token(controller_request_id, _LABEL_CTRL_REQ_ID)
             if controller_request_id is not None
@@ -1350,16 +1410,18 @@ class CoordHub:
         if lease is None:
             if clean_req is not None and not self._check_controller_request_active(clean_req):
                 raise RevokedError("controller_request_not_active")
-            return clean_req
-        lease_req = self._bind_lease_controller(lease)
+            return clean_req, self._controller, self._controller_actor
+        lease_req, eff_controller, eff_actor = self._inspect_lease_controller(caller, lease)
         if clean_req is not None and lease_req is not None and clean_req != lease_req:
             raise CoordPolicyError("lease_controller_request_id_mismatch")
         effective_req = clean_req if clean_req is not None else lease_req
         if effective_req is None:
-            return self._ephemeral_authority_id(lease)
-        if not self._check_controller_request_active(effective_req):
+            return self._ephemeral_authority_id(lease), eff_controller, eff_actor
+        if not self._check_controller_request_active(
+            effective_req, controller=eff_controller, actor=eff_actor
+        ):
             raise RevokedError("controller_request_not_active")
-        return effective_req
+        return effective_req, eff_controller, eff_actor
 
     def register_sandbox(
         self,
@@ -1384,7 +1446,6 @@ class CoordHub:
         clean_inc = validate_opaque_token(incarnation_id, _LABEL_INCARNATION)
         clean_brief = validate_task_brief(task_brief)
         clean_parent = parse_local_target(parent_addr).canonical if parent_addr is not None else None
-        effective_req_id = self._resolve_register_authority(lease, controller_request_id)
 
         with self._register_lock:
             existing = self._registry.get_sandbox(addr.canonical)
@@ -1395,6 +1456,9 @@ class CoordHub:
                 parent_addr=clean_parent,
                 sandbox_type=sandbox_type,
                 child_budget=child_budget,
+            )
+            effective_req_id, eff_controller, eff_actor = self._resolve_register_authority(
+                caller, lease, controller_request_id
             )
             if existing is not None:
                 self._rotate_existing_sandbox(addr.canonical, existing, clean_inc)
@@ -1418,6 +1482,10 @@ class CoordHub:
                 updated_at=now,
             )
             persisted = self._registry.register_sandbox(record)
+            if self._controller is None and eff_controller is not None:
+                self._controller = eff_controller
+            if self._controller_actor is None and eff_actor is not None:
+                self._controller_actor = eff_actor
             save_budget = getattr(self._registry, "save_sandbox_budget", None)
             if callable(save_budget):
                 save_budget(addr.canonical, clean_inc, effective_budget)
@@ -1532,10 +1600,17 @@ class CoordHub:
             if src_incarnation is not None
             else None
         )
+        clean_lease_req = (
+            validate_opaque_token(lease_request_id, "lease_request_id")
+            if lease_request_id is not None
+            else None
+        )
+        if clean_lease_req is not None and clean_lease_req.startswith(_EPHEMERAL_LEASE_PREFIX):
+            raise CoordValidationError("ephemeral_lease_prefix_reserved")
         clean_src_inc = self._enforce_grant_edge_scope(
             caller, src_actor, dst.canonical, clean_src_inc
         )
-        self._require_dst_sandbox_live(dst.canonical, lease_request_id)
+        self._require_dst_sandbox_live(dst.canonical, clean_lease_req)
 
         edge = RoutingEdge(
             edge_id=mint_crypto_id("edge"),
@@ -1548,7 +1623,7 @@ class CoordHub:
             turns_used=0,
             rate_limit_rpm=rate_limit_rpm,
             active=True,
-            lease_request_id=lease_request_id,
+            lease_request_id=clean_lease_req,
             grant_generation=grant_generation,
             created_at=time.time(),
         )

@@ -1565,7 +1565,7 @@ class TestReciprocalReviewRegressions(CoordTestBase):
 
     def test_rec_ui_auth_ws_ticket_pins_minting_origin_across_multi_origin_config(self) -> None:
         host_b = "localhost:47110"
-        origin_b = f"http://{host_b}"
+        origin_b = f"https://{host_b}"
         mgr = UiAuthManager(allowed_hosts=[_HOST, host_b], allowed_origins=[_ORIGIN, origin_b])
         code = mgr.mint_bootstrap_code(actor_id="op1")
         _rec, csrf, set_cookie = mgr.exchange_bootstrap_code(
@@ -1616,6 +1616,123 @@ class TestReciprocalReviewRegressions(CoordTestBase):
             expected_session_id=session_id,
         )
         self.assertEqual(scope.minting_origin, _ORIGIN)
+
+    def test_delta_p1_1_duplicate_close_and_failed_recovery_preserve_degraded_protection(
+        self,
+    ) -> None:
+        # 1. Duplicate hub1.close() must NOT unlink hub2's active session seal
+        reg1, _t1, hub1 = self._open_pair()
+        hub1.close()
+        reg1.close()
+
+        reg2, _t2, hub2 = self._open_pair()
+        self.assertFalse(hub2.is_degraded)
+        # Duplicate close on old hub1 must be a no-op and leave hub2's seal intact
+        hub1.close()
+        reg2.close()  # Simulate hub2 crash (no hub2.close())
+
+        reg3, _t3, hub3 = self._open_pair()
+        try:
+            self.assertTrue(hub3.is_degraded)
+            # 2. If writing session seal fails during confirm_recovery, .coord_degraded stays intact
+            hub3._mark_degraded("simulated_persist_err")
+            orig_marker = hub3._session_active_marker
+            hub3._session_active_marker = self.state_dir / "nonexistent_dir" / "seal"
+            with self.assertRaises(OSError):
+                hub3.confirm_recovery(_OP, reason="will_fail")
+            hub3._session_active_marker = orig_marker
+            self.assertTrue(hub3.is_degraded)
+            self.assertTrue(hub3._degraded_marker.exists())
+        finally:
+            hub3.close()
+            reg3.close()
+
+        reg4, _t4, hub4 = self._open_pair()
+        try:
+            self.assertTrue(hub4.is_degraded)
+        finally:
+            hub4.close()
+            reg4.close()
+
+    def test_delta_p1_2_failed_or_sub_orchestrator_register_cannot_mutate_hub_controller(
+        self,
+    ) -> None:
+        reg, _t, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sub-o", "inc_so1")
+        sub_ctx = PrincipalCtx(
+            CoordRole.ORCHESTRATOR, "sub-o", sandbox_addr="sub-o", incarnation_id="inc_so1"
+        )
+        rogue_ctrl, _rogue_op, rogue_lease, _rogue_req = _make_controller_lease("c1", "inc_c1")
+        # Unauthorized parent_addr=None fails BEFORE touching hub._controller
+        with self.assertRaises(CoordAuthError):
+            self._reg_sb(hub, sub_ctx, "c1", "inc_c1", parent_addr=None, lease=rogue_lease)
+        self.assertIsNone(hub._controller)
+        self.assertIsNone(hub._controller_actor)
+        # Even with valid parent_addr, sub-orchestrator cannot bind hub._controller
+        with self.assertRaises(CoordAuthError):
+            self._reg_sb(hub, sub_ctx, "c1", "inc_c1", parent_addr="sub-o", lease=rogue_lease)
+        self.assertIsNone(hub._controller)
+        self.assertIsNone(hub._controller_actor)
+        _ = rogue_ctrl
+
+    def test_delta_p2_1_startup_reconciles_missing_artifact_in_dispatch_started_status(
+        self,
+    ) -> None:
+        reg1, _t1, hub1 = self._open_pair()
+        blob = b"diff --git a/c.py b/c.py\n+lost\n"
+        try:
+            self._reg_sb(hub1, _OP, "sb-ds", "inc_ds1")
+            edge = hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-ds")
+            res = hub1.send(_OP, target="sb-ds", body_text="Started", artifact_blobs=[blob])
+            msg_id = res["msg_id"]
+            env = reg1.get_envelope(msg_id)
+            self.assertIsNotNone(env)
+            digest = env.artifact_refs[0].blob_sha256
+            started = reg1.mark_outbox_dispatch_started(
+                msg_id,
+                edge_id=edge.edge_id,
+                grant_generation=edge.grant_generation,
+                dst_incarnation="inc_ds1",
+            )
+            self.assertTrue(started)
+            os.unlink(hub1.spool.spool_root / "inc_ds1" / f"{digest}.patch")
+        finally:
+            hub1.close()
+            reg1.close()
+
+        reg2, _t2, hub2 = self._open_pair()
+        try:
+            cancelled = reg2.list_outbox(statuses=("cancelled",))
+            self.assertTrue(any(r["msg_id"] == msg_id for r in cancelled))
+            still_started = reg2.list_outbox(statuses=("dispatch_started",))
+            self.assertEqual(still_started, [])
+        finally:
+            hub2.close()
+            reg2.close()
+
+    def test_delta_p2_2_grant_edge_rejects_ephemeral_prefix_and_invalid_lease_request_id(
+        self,
+    ) -> None:
+        reg, _t, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-g", "inc_g1", lease=BrokerLease("job_fake"))
+        with self.assertRaises(CoordValidationError):
+            hub.grant_edge(
+                _OP,
+                src_actor=_OP.canonical_sender,
+                dst_addr="sb-g",
+                lease_request_id="ephemeral-lease:job_fake",
+            )
+        with self.assertRaises(CoordValidationError):
+            hub.grant_edge(
+                _OP,
+                src_actor=_OP.canonical_sender,
+                dst_addr="sb-g",
+                lease_request_id="bad id with spaces",
+            )
 
 
 if __name__ == "__main__":
