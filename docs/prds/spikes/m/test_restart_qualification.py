@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import math
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -1474,10 +1475,23 @@ class TestRestartQualification(unittest.TestCase):
             hub2.close()
             reg2.close()
 
-        # Reopen with a legacy FakeWorkerTransport and attempt to reuse retired inc_term1 -> MUST raise RevokedError
-        reg3, hub3 = self._open_hub(FakeWorkerTransport())
+        # Reopen with a legacy FakeWorkerTransport, run a healthy live successor with an active grant
+        # and a queued turn, and attempt to reuse retired inc_term1 -> MUST raise RevokedError
+        # WITHOUT stopping or invalidating the healthy live successor!
+        legacy_transport = FakeWorkerTransport()
+        abort_calls: list[tuple[str, str]] = []
+        orig_abort_inc = legacy_transport.abort_incarnation
+
+        def _spy_abort_inc(sb_addr: str, inc_id: str, *, reason: str) -> bool:
+            abort_calls.append((sb_addr, inc_id))
+            return orig_abort_inc(sb_addr, inc_id, reason=reason)
+
+        legacy_transport.abort_incarnation = _spy_abort_inc  # type: ignore[method-assign]
+        reg3, hub3 = self._open_hub(legacy_transport)
         self.addCleanup(reg3.close)
         self.addCleanup(hub3.close)
+        self._reg_and_grant(hub3, _ADDR_SUCC, "inc_leg_live")
+        msg_live = hub3.send(_OP, target=_ADDR_SUCC, body_text="Keep successor alive")["msg_id"]
         with self.assertRaises(RevokedError):
             hub3.register_sandbox(
                 _OP,
@@ -1488,6 +1502,18 @@ class TestRestartQualification(unittest.TestCase):
                 branch=_BRANCH,
                 task_brief=_BRIEF,
             )
+        self.assertEqual(abort_calls, [])
+        sb_live = reg3.get_sandbox(_ADDR_SUCC)
+        self.assertIsNotNone(sb_live)
+        assert sb_live is not None
+        self.assertEqual(sb_live.incarnation_id, "inc_leg_live")
+        self.assertEqual(sb_live.status, "running")
+        self.assertTrue(reg3.list_edges(dst_addr=_ADDR_SUCC, active_only=True))
+        live_row_before = {r["msg_id"]: r for r in reg3.list_outbox(statuses=_STATUS_ALL)}[msg_live]
+        self.assertEqual(live_row_before["status"], "pending")
+        self.assertEqual(hub3.dispatch_once(async_stream=False), 1)
+        live_row_after = {r["msg_id"]: r for r in reg3.list_outbox(statuses=_STATUS_ALL)}[msg_live]
+        self.assertEqual(live_row_after["status"], "completed")
 
     def test_oc_p2_1_crash_after_durable_handoff_settles_orphaned_row_on_recovery(self) -> None:
         owner = ExternallyFencedFakeTransport({("sb-ho", "inc_ho1"): _OWNER_A})
@@ -1581,6 +1607,252 @@ class TestRestartQualification(unittest.TestCase):
                 expected_revoked_sandboxes=("sb-hp",),
             ),
         )
+
+    def test_oc2_p1_1_cleanup_sweep_does_not_discard_late_handoff_registered_after_physical_confirm(
+        self,
+    ) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-sw", "inc_sw1"): _OWNER_A})
+        reg, hub = self._open_hub(owner)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_and_grant(hub, "sb-sw", "inc_sw1")
+
+        # Seed an incarnation cleanup obligation and inject a late stream AFTER the first
+        # physical confirm returns, BEFORE _drain_pending_cleanup_incarnations reacquires _meta_lock.
+        with hub._meta_lock:
+            hub._pending_cleanup_incarnations[("sb-sw", "inc_sw1")] = "recovery_retired"
+        injected = {"done": False}
+        orig_confirm = owner.confirm_incarnation_terminal
+
+        def _confirm_with_late_arrival(
+            sb_addr: str, inc_id: str, *, owner_id: str, reason: str
+        ) -> bool:
+            ok = orig_confirm(sb_addr, inc_id, owner_id=owner_id, reason=reason)
+            if ok and not injected["done"]:
+                injected["done"] = True
+                with hub._meta_lock:
+                    hub._pending_cleanup_streams["str-late-after-confirm"] = (
+                        "sb-sw",
+                        "inc_sw1",
+                        "recovery_retired",
+                    )
+                    hub._pending_cleanup_incarnations.setdefault(
+                        ("sb-sw", "inc_sw1"), "recovery_retired"
+                    )
+            return ok
+
+        owner.confirm_incarnation_terminal = _confirm_with_late_arrival  # type: ignore[method-assign]
+        try:
+            hub._drain_pending_cleanup_incarnations()
+            # Late stream MUST NOT have been discarded by the sweep that never confirmed it.
+            self.assertIn("str-late-after-confirm", hub._pending_cleanup_streams)
+            self.assertIn(("sb-sw", "inc_sw1"), hub._pending_cleanup_incarnations)
+            self.assertEqual(len(owner.confirm_calls), 1)
+            # Subsequent drain must physically confirm AGAIN before clearing the late obligation.
+            self.assertTrue(hub._drain_pending_cleanups())
+            self.assertNotIn("str-late-after-confirm", hub._pending_cleanup_streams)
+            self.assertNotIn(("sb-sw", "inc_sw1"), hub._pending_cleanup_incarnations)
+            self.assertGreaterEqual(len(owner.confirm_calls), 2)
+        finally:
+            owner.confirm_incarnation_terminal = orig_confirm  # type: ignore[method-assign]
+
+    def test_oc2_p1_2_cleanup_retry_stops_held_stream_with_cached_owner_during_db_outage(
+        self,
+    ) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-out", "inc_out1"): _OWNER_A})
+        started = threading.Event()
+        never_done = threading.Event()
+        self.addCleanup(never_done.set)
+        owner.inner.queue_script(
+            "sb-out", TurnScript(on_stream_started=started, block_event=never_done)
+        )
+        reg, hub = self._open_hub(owner)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_and_grant(hub, "sb-out", "inc_out1")
+        hub.send(_OP, target="sb-out", body_text="Hold stream across outage")
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(started.wait(timeout=1.0))
+
+        # First physical confirm fails -> revoke fails closed, keeping cached owner + held stream.
+        owner.fail_confirm_keys.add(("sb-out", "inc_out1"))
+        with self.assertRaises(CoordPolicyError):
+            hub.revoke(_OP, target="sb-out", reason="initial_revoke")
+        self.assertTrue(hub.is_degraded)
+        self.assertIn(("sb-out", "inc_out1"), hub._external_owners)
+        self.assertIn(("sb-out", "inc_out1"), hub._pending_cleanup_incarnations)
+
+        # Transport recovers, but SQLite binding reads now suffer an outage.
+        owner.fail_confirm_keys.discard(("sb-out", "inc_out1"))
+        calls_before_outage = len(owner.confirm_calls)
+        orig_get = reg.get_transport_binding
+
+        def _db_outage(sb_addr: str, inc_id: str) -> dict[str, Any] | None:
+            raise sqlite3.OperationalError("binding_read_outage")
+
+        reg.get_transport_binding = _db_outage  # type: ignore[method-assign]
+        try:
+            drained = hub._drain_pending_cleanups()
+            self.assertFalse(drained)
+            self.assertIn(("sb-out", "inc_out1"), hub._pending_cleanup_incarnations)
+            self.assertGreater(len(owner.confirm_calls), calls_before_outage)
+            self.assertEqual(owner.confirm_calls[-1][:3], ("sb-out", "inc_out1", _OWNER_A))
+            # Recovery must remain closed until SQLite confirms durable retirement.
+            with self.assertRaises(CoordPolicyError):
+                hub.confirm_recovery(_OP, reason="during_db_outage")
+            # Cold-cache hub must still refuse without calling transport during DB outage.
+            owner_cold = ExternallyFencedFakeTransport({("sb-out", "inc_out1"): _OWNER_A})
+            cold_dir = self.state_dir.parent / "cold_state"
+            cold_dir.mkdir(mode=0o700, exist_ok=True)
+            hub_cold = CoordHub(reg, owner_cold, cold_dir, sandbox_root=self.sandbox_root)
+            self.addCleanup(hub_cold.close)
+            with hub_cold._meta_lock:
+                hub_cold._external_owners.clear()
+                hub_cold._pending_cleanup_incarnations[("sb-out", "inc_out1")] = "cold_outage"
+            self.assertFalse(hub_cold._drain_pending_cleanups())
+            self.assertEqual(owner_cold.confirm_calls, [])
+        finally:
+            reg.get_transport_binding = orig_get  # type: ignore[method-assign]
+
+        # Once SQLite recovers, confirm_recovery commits durable retirement and reopens.
+        hub.confirm_recovery(_OP, reason="after_db_outage")
+        self.assertFalse(hub.is_degraded)
+        binding = reg.get_transport_binding("sb-out", "inc_out1")
+        self.assertTrue(binding["terminal_confirmed"])
+
+    def test_oc2_p2_1_orphan_handed_off_settlement_preserves_raced_terminal_and_propagates_storage_error(
+        self,
+    ) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-rc", "inc_rc1"): _OWNER_A})
+        started = threading.Event()
+        never_done = threading.Event()
+        self.addCleanup(never_done.set)
+        owner.inner.queue_script(
+            "sb-rc", TurnScript(on_stream_started=started, block_event=never_done)
+        )
+        reg1, hub1 = self._open_hub(owner)
+        try:
+            self._reg_and_grant(hub1, "sb-rc", "inc_rc1")
+            msg_raced = hub1.send(_OP, target="sb-rc", body_text="Race finalizer")["msg_id"]
+            self.assertEqual(hub1.dispatch_once(async_stream=True), 1)
+            self.assertTrue(started.wait(timeout=1.0))
+        finally:
+            reg1.mark_outbox_aborted = lambda *a, **k: None  # type: ignore[method-assign]
+            reg1.mark_outbox_completed = lambda *a, **k: None  # type: ignore[method-assign]
+            never_done.set()
+            owner.inner.abort_incarnation("sb-rc", "inc_rc1", reason="sim_crash")
+            hub1.dispatcher.join_streams(time.monotonic() + 1.0)
+            self._abandon_hub_for_crash(hub1, reg1)
+
+        # Part A: live stream finalizer completes the row between list_outbox and orphan abort.
+        reg2, hub2 = self._open_hub(owner)
+        self.addCleanup(reg2.close)
+        self.addCleanup(hub2.close)
+        orig_list = reg2.list_outbox
+        raced_once = {"done": False}
+
+        def _list_and_finalize(statuses: tuple[str, ...] | None = None, **kwargs: Any) -> list[dict[str, Any]]:
+            rows = orig_list(statuses=statuses, **kwargs)
+            if statuses == ("handed_off",) and rows and not raced_once["done"]:
+                raced_once["done"] = True
+                reg2.mark_outbox_completed(msg_raced)
+            return rows
+
+        reg2.list_outbox = _list_and_finalize  # type: ignore[method-assign]
+        try:
+            hub2.confirm_recovery(_OP, reason="raced_finalizer")
+        finally:
+            reg2.list_outbox = orig_list  # type: ignore[method-assign]
+        self.assertFalse(hub2.is_degraded)
+        row_a = {r["msg_id"]: r for r in reg2.list_outbox(statuses=_STATUS_ALL)}[msg_raced]
+        self.assertEqual(row_a["status"], "completed")
+        hub2.close()
+        reg2.close()
+
+        # Part B: genuine SQLite storage error during orphan settlement MUST propagate and keep recovery closed.
+        owner_b = ExternallyFencedFakeTransport({("sb-rc2", "inc_rc2"): _OWNER_B})
+        started_b = threading.Event()
+        never_b = threading.Event()
+        self.addCleanup(never_b.set)
+        owner_b.inner.queue_script(
+            "sb-rc2", TurnScript(on_stream_started=started_b, block_event=never_b)
+        )
+        reg3, hub3 = self._open_hub(owner_b)
+        try:
+            self._reg_and_grant(hub3, "sb-rc2", "inc_rc2")
+            hub3.send(_OP, target="sb-rc2", body_text="Storage failure during orphan abort")
+            self.assertEqual(hub3.dispatch_once(async_stream=True), 1)
+            self.assertTrue(started_b.wait(timeout=1.0))
+        finally:
+            reg3.mark_outbox_aborted = lambda *a, **k: None  # type: ignore[method-assign]
+            reg3.mark_outbox_completed = lambda *a, **k: None  # type: ignore[method-assign]
+            never_b.set()
+            owner_b.inner.abort_incarnation("sb-rc2", "inc_rc2", reason="sim_crash_b")
+            hub3.dispatcher.join_streams(time.monotonic() + 1.0)
+            self._abandon_hub_for_crash(hub3, reg3)
+
+        reg4, hub4 = self._open_hub(owner_b)
+        self.addCleanup(reg4.close)
+        self.addCleanup(hub4.close)
+
+        def _raise_storage_error(msg_id: str, *, reason: str = "x") -> bool:
+            raise sqlite3.OperationalError("disk_io_error")
+
+        orig_abort_open = reg4.abort_handed_off_outbox_row_if_open
+        orig_mark_aborted = reg4.mark_outbox_aborted
+        reg4.abort_handed_off_outbox_row_if_open = _raise_storage_error  # type: ignore[method-assign]
+        reg4.mark_outbox_aborted = _raise_storage_error  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                hub4.confirm_recovery(_OP, reason="storage_err_recovery")
+            self.assertTrue(hub4.is_degraded)
+        finally:
+            reg4.abort_handed_off_outbox_row_if_open = orig_abort_open  # type: ignore[method-assign]
+            reg4.mark_outbox_aborted = orig_mark_aborted  # type: ignore[method-assign]
+        hub4.confirm_recovery(_OP, reason="storage_err_cleared")
+
+    def test_oc2_p2_2_pending_only_cancel_enforced_for_in_memory_and_minimal_stores(self) -> None:
+        from test_hub import InMemoryRegistryStore
+
+        mem = InMemoryRegistryStore()
+        transport = FakeWorkerTransport()
+        mem_dir = self.state_dir.parent / "mem_state"
+        mem_dir.mkdir(mode=0o700, exist_ok=True)
+        hub = CoordHub(mem, transport, mem_dir, sandbox_root=self.sandbox_root)
+        self.addCleanup(hub.close)
+        edge_id = self._reg_and_grant(hub, "sb-mem", "inc_mem1")
+        msg_id = hub.send(_OP, target="sb-mem", body_text="Protect dispatch_started")["msg_id"]
+        self.assertTrue(
+            mem.mark_outbox_dispatch_started(
+                msg_id,
+                edge_id=edge_id,
+                grant_generation=mem.edges[edge_id].grant_generation,
+                dst_incarnation="inc_mem1",
+            )
+        )
+        self.assertFalse(mem.cancel_pending_outbox_row(msg_id, reason="stale_dispatcher"))
+        self.assertEqual(mem.outbox[msg_id]["status"], "dispatch_started")
+
+        # Minimal store omitting cancel_pending_outbox_row must NOT fall back to cancel_outbox_row.
+        cancel_fallback_calls: list[str] = []
+
+        class _MinimalStore:
+            def __getattr__(self, name: str) -> Any:
+                if name == "cancel_pending_outbox_row":
+                    raise AttributeError(name)
+                return getattr(mem, name)
+
+            def cancel_outbox_row(self, mid: str, *, reason: str) -> None:
+                cancel_fallback_calls.append(mid)
+                mem.cancel_outbox_row(mid, reason=reason)
+
+        min_dir = self.state_dir.parent / "min_state"
+        min_dir.mkdir(mode=0o700, exist_ok=True)
+        hub_min = CoordHub(_MinimalStore(), transport, min_dir, sandbox_root=self.sandbox_root)  # type: ignore[arg-type]
+        self.addCleanup(hub_min.close)
+        hub_min._cancel_if_still_pending(msg_id, reason="stale_minimal")
+        self.assertEqual(cancel_fallback_calls, [])
+        self.assertEqual(mem.outbox[msg_id]["status"], "dispatch_started")
 
 
 if __name__ == "__main__":

@@ -272,6 +272,8 @@ class RegistryStore(Protocol):
 
     def mark_outbox_completed(self, msg_id: str) -> None: ...
 
+    def cancel_pending_outbox_row(self, msg_id: str, *, reason: str) -> bool: ...
+
     def cancel_outbox_row(self, msg_id: str, *, reason: str) -> None: ...
 
     def save_sandbox_budget(
@@ -1447,6 +1449,13 @@ class CoordHub:
     ) -> tuple[bool, bool]:
         state, owner_id = self._lookup_external_binding(sb_addr, inc_id)
         if state == "error":
+            with self._meta_lock:
+                cached_owner = self._external_owners.get((sb_addr, inc_id))
+            if cached_owner is not None:
+                aborted = self._confirm_external_physical_only(
+                    sb_addr, inc_id, cached_owner, reason
+                )
+                return False, aborted
             return False, False
         if state == "settled" and owner_id is not None:
             if not force_physical_if_settled and not self._has_pending_streams_for_incarnation(
@@ -1466,15 +1475,39 @@ class CoordHub:
         except Exception:
             return False, False
 
-    def _settle_streams_for_incarnation_locked(
+    def _snapshot_streams_for_incarnation_locked(
         self, sb_addr: str, inc_id: str
-    ) -> None:
-        """Settle all pending stream cleanups covered by a successful terminal incarnation abort."""
-        covered = [
+    ) -> frozenset[str]:
+        return frozenset(
             sid
             for sid, (dst_addr, dst_inc, _st_reason) in self._pending_cleanup_streams.items()
             if dst_addr == sb_addr and dst_inc == inc_id
-        ]
+        )
+
+    def _settle_streams_for_incarnation_locked(
+        self,
+        sb_addr: str,
+        inc_id: str,
+        *,
+        covered_sids: frozenset[str] | None = None,
+    ) -> bool:
+        """Settle only the snapshotted pending streams covered by a terminal incarnation abort.
+
+        Returns True iff no unconfirmed pending streams remain for ``(sb_addr, inc_id)``.
+        """
+        if covered_sids is None:
+            covered = [
+                sid
+                for sid, (dst_addr, dst_inc, _st_reason) in self._pending_cleanup_streams.items()
+                if dst_addr == sb_addr and dst_inc == inc_id
+            ]
+        else:
+            covered = [
+                sid
+                for sid in covered_sids
+                if sid in self._pending_cleanup_streams
+                and self._pending_cleanup_streams[sid][:2] == (sb_addr, inc_id)
+            ]
         for sid in covered:
             self._pending_cleanup_streams.pop(sid, None)
             if self._stream_abort_reasons.get(sid) in (
@@ -1483,22 +1516,36 @@ class CoordHub:
             ):
                 self._stream_authorities.pop(sid, None)
                 self._stream_abort_reasons.pop(sid, None)
+        return not any(
+            dst_addr == sb_addr and dst_inc == inc_id
+            for dst_addr, dst_inc, _st_reason in self._pending_cleanup_streams.values()
+        )
 
     def _drain_pending_cleanup_incarnations(self) -> None:
         with self._meta_lock:
-            items = tuple(self._pending_cleanup_incarnations.items())
-        for (sb_addr, inc_id), reason in items:
+            items = [
+                (
+                    sb_addr,
+                    inc_id,
+                    reason,
+                    self._snapshot_streams_for_incarnation_locked(sb_addr, inc_id),
+                )
+                for (sb_addr, inc_id), reason in self._pending_cleanup_incarnations.items()
+            ]
+        for sb_addr, inc_id, reason, covered_sids in items:
             settled, _aborted = self._abort_incarnation_confirmed(
                 sb_addr, inc_id, reason, actor="cleanup-retry"
             )
             if not settled:
                 continue
             with self._meta_lock:
-                self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
-                self._settle_streams_for_incarnation_locked(sb_addr, inc_id)
+                if self._settle_streams_for_incarnation_locked(
+                    sb_addr, inc_id, covered_sids=covered_sids
+                ):
+                    self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
 
     def _settle_stream_without_abort_stream(
-        self, dst_addr: str, dst_inc: str, reason: str
+        self, dst_addr: str, dst_inc: str, reason: str, *, covered_sid: str | None = None
     ) -> bool:
         if reason not in (
             _REASON_RECOVERY_RETIRED,
@@ -1515,7 +1562,12 @@ class CoordHub:
         )
         if settled:
             with self._meta_lock:
-                self._pending_cleanup_incarnations.pop((dst_addr, dst_inc), None)
+                other_pending = any(
+                    sid != covered_sid and a == dst_addr and i == dst_inc
+                    for sid, (a, i, _r) in self._pending_cleanup_streams.items()
+                )
+                if not other_pending:
+                    self._pending_cleanup_incarnations.pop((dst_addr, dst_inc), None)
         return settled
 
     def _drain_pending_cleanup_streams(self) -> None:
@@ -1526,7 +1578,9 @@ class CoordHub:
             if has_abort_stream:
                 ok = self._try_abort_stream(sid, reason=reason)
             else:
-                ok = self._settle_stream_without_abort_stream(dst_addr, dst_inc, reason)
+                ok = self._settle_stream_without_abort_stream(
+                    dst_addr, dst_inc, reason, covered_sid=sid
+                )
             if ok:
                 with self._meta_lock:
                     self._pending_cleanup_streams.pop(sid, None)
@@ -1742,14 +1796,22 @@ class CoordHub:
                 )
 
     def _abort_orphaned_handed_off_rows(self) -> None:
+        abort_if_open = getattr(self._registry, "abort_handed_off_outbox_row_if_open", None)
         mark_aborted = getattr(self._registry, "mark_outbox_aborted", None)
-        if not callable(mark_aborted):
+        if not callable(abort_if_open) and not callable(mark_aborted):
             return
         rows = self._registry.list_outbox(statuses=("handed_off",))
         for row in rows:
             msg_id = str(row.get("msg_id", ""))
-            if msg_id:
+            if not msg_id:
+                continue
+            if callable(abort_if_open):
+                abort_if_open(msg_id, reason="recovery_handed_off_orphaned")
+                continue
+            try:
                 mark_aborted(msg_id, reason="recovery_handed_off_orphaned")
+            except CoordValidationError:
+                pass
 
     def _wait_inflight_handoffs_drained(self, deadline: float) -> bool:
         with self._inflight_cond:
@@ -2699,6 +2761,21 @@ class CoordHub:
             if binding is None or bool(binding.get("abort_requested")):
                 raise CoordPolicyError(_ERR_TRANSPORT_ABORT_UNCONFIRMED)
 
+    def _assert_requested_identity_reusable(
+        self, addr: str, clean_inc: str, *, external_owner_id: str | None
+    ) -> None:
+        """Fail fast before rotating any live successor if ``(addr, clean_inc)`` is retired or owned."""
+        get_binding = getattr(self._registry, "get_transport_binding", None)
+        if not callable(get_binding):
+            return
+        binding = get_binding(addr, clean_inc)
+        if binding is None:
+            return
+        if bool(binding.get("terminal_confirmed")):
+            raise RevokedError("cannot_reregister_revoked_incarnation")
+        if external_owner_id is None or binding.get("owner_id") != external_owner_id:
+            raise CoordPolicyError(_ERR_TRANSPORT_ABORT_UNCONFIRMED)
+
     def _resolve_external_register_owner(
         self,
         caller: PrincipalCtx,
@@ -2939,6 +3016,9 @@ class CoordHub:
             self._assert_no_unconfirmed_abort_for_addr(addr.canonical, existing, clean_inc)
             external_owner_id = self._resolve_external_register_owner(
                 caller, addr.canonical, clean_inc, clean_parent, lease, controller_request_id
+            )
+            self._assert_requested_identity_reusable(
+                addr.canonical, clean_inc, external_owner_id=external_owner_id
             )
             depth, effective_budget = self._validate_sandbox_budget(
                 parent_addr=clean_parent,
@@ -3701,11 +3781,6 @@ class CoordHub:
         cancel_pending = getattr(self._registry, "cancel_pending_outbox_row", None)
         if callable(cancel_pending):
             cancel_pending(msg_id, reason=reason)
-            return
-        try:
-            self._registry.cancel_outbox_row(msg_id, reason=reason)
-        except CoordValidationError:
-            pass
 
     def _prepare_dispatch_phase1_locked(
         self,
@@ -3966,7 +4041,7 @@ class CoordHub:
             settled = self._try_abort_stream(sid, reason=reason)
         else:
             settled = self._settle_stream_without_abort_stream(
-                env.dst_addr, env.dst_incarnation, reason
+                env.dst_addr, env.dst_incarnation, reason, covered_sid=sid
             )
         if not settled:
             self._record_pending_cleanup_stream(sid, env.dst_addr, env.dst_incarnation, reason)
@@ -4720,6 +4795,8 @@ class CoordHub:
                 mark_req(addr, incarnation_id, reason=clean_reason)
             except Exception:
                 self._mark_degraded("revoke_abort_mark_failed")
+        with self._meta_lock:
+            covered_sids = self._snapshot_streams_for_incarnation_locked(addr, incarnation_id)
         confirmed = False
         if self._is_externally_fenced():
             try:
@@ -4769,12 +4846,14 @@ class CoordHub:
             self._ensure_cleanup_retry_worker()
             raise CoordPolicyError(_ERR_REVOKED_UNCONFIRMED) from exc
         with self._meta_lock:
-            self._pending_cleanup_incarnations.pop((addr, incarnation_id), None)
-            self._external_owners.pop((addr, incarnation_id), None)
+            if self._settle_streams_for_incarnation_locked(
+                addr, incarnation_id, covered_sids=covered_sids
+            ):
+                self._pending_cleanup_incarnations.pop((addr, incarnation_id), None)
+                self._external_owners.pop((addr, incarnation_id), None)
             known = self._known_incarnations.get(addr)
             if known is not None:
                 known.discard(incarnation_id)
-            self._settle_streams_for_incarnation_locked(addr, incarnation_id)
         elapsed_ms = (time.monotonic() - start_ts) * 1000.0
         return RevocationStatus(
             target_addr=addr,
@@ -4785,14 +4864,18 @@ class CoordHub:
         )
 
     def _abort_detached_incarnation(self, sb_addr: str, inc_id: str, reason: str) -> bool:
+        with self._meta_lock:
+            covered_sids = self._snapshot_streams_for_incarnation_locked(sb_addr, inc_id)
         settled, aborted = self._abort_incarnation_confirmed(
             sb_addr, inc_id, reason, actor="revoke"
         )
         if not settled:
             return False
         with self._meta_lock:
-            self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
-            self._settle_streams_for_incarnation_locked(sb_addr, inc_id)
+            if self._settle_streams_for_incarnation_locked(
+                sb_addr, inc_id, covered_sids=covered_sids
+            ):
+                self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
         return aborted
 
     def _revoke_detached_lease(self, lease: BrokerLease | None) -> None:
