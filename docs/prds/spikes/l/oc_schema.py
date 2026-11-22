@@ -5,6 +5,7 @@ Pure Python standard library only. Never touches real ~/.config/oc-sandbox/.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import errno
 import hashlib
@@ -16,7 +17,7 @@ import re
 import stat
 import tomllib
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlsplit
 
 SCHEMA_VERSION = 1
 
@@ -206,36 +207,64 @@ def _walk_check_not_under_roots(
     path: Path,
     forbidden_roots: list[Path],
     label: str,
-    depth: int = 0,
-) -> None:
-    """Walk raw uncollapsed components (including '..' and symlink hops) rejecting any forbidden root."""
-    if depth > 40:
-        raise PolicyError(f"Too many symlink hops checking trusted path: {path}")
+) -> Path:
+    """Kernel-equivalent component worklist resolving symlinks and '..' in kernel order.
+
+    Checks every intermediate component, '..' step, and symlink target against forbidden_roots,
+    and returns the resulting verified physical Path without calling os.path.abspath() first.
+    """
     raw = Path(path)
+    worklist: deque[str] = deque()
     if raw.is_absolute():
         cur = Path("/")
-        parts = raw.parts[1:]
+        for p in raw.parts[1:]:
+            if p not in ("", "."):
+                worklist.append(p)
     else:
-        cur = Path.cwd()
-        parts = raw.parts
-        for froot in forbidden_roots:
-            if _is_under(cur, froot):
-                raise PolicyError(f"Refusing host-trusted path traversing {label}: {cur}")
+        cur = Path("/")
+        for p in Path.cwd().parts[1:]:
+            if p not in ("", "."):
+                worklist.append(p)
+        for p in raw.parts:
+            if p not in ("", "."):
+                worklist.append(p)
 
-    for part in parts:
+    def _check_cur(p: Path) -> None:
+        for froot in forbidden_roots:
+            if _is_under(p, froot):
+                raise PolicyError(f"Refusing host-trusted path traversing {label}: {p}")
+
+    _check_cur(cur)
+    total_hops = 0
+    while worklist:
+        part = worklist.popleft()
         if part in ("", "."):
             continue
         if part == "..":
             cur = cur.parent
-        else:
-            cur = cur / part
-        for froot in forbidden_roots:
-            if _is_under(cur, froot):
-                raise PolicyError(f"Refusing host-trusted path traversing {label}: {cur}")
-        if cur.is_symlink():
+            _check_cur(cur)
+            continue
+        cur = cur / part
+        _check_cur(cur)
+        try:
+            is_link = stat.S_ISLNK(os.lstat(cur).st_mode)
+        except OSError:
+            is_link = False
+        if is_link:
+            total_hops += 1
+            if total_hops > 40:
+                raise PolicyError(f"Too many symlink hops checking trusted path: {path}")
             target = Path(os.readlink(cur))
-            hop = (cur.parent / target) if not target.is_absolute() else target
-            _walk_check_not_under_roots(hop, forbidden_roots, label, depth + 1)
+            if target.is_absolute():
+                cur = Path("/")
+                tparts = [tp for tp in target.parts[1:] if tp not in ("", ".")]
+            else:
+                cur = cur.parent
+                tparts = [tp for tp in target.parts if tp not in ("", ".")]
+            _check_cur(cur)
+            for tp in reversed(tparts):
+                worklist.appendleft(tp)
+    return cur
 
 
 def _expand_root_variants(root: Path) -> list[Path]:
@@ -244,18 +273,18 @@ def _expand_root_variants(root: Path) -> list[Path]:
     return [raw] if raw == resolved else [raw, resolved]
 
 
-def check_not_in_sandbox(path: Path, sandbox_root: Path | None = None) -> None:
-    """Component-by-component trusted_path walk rejecting any prefix, '..' hop, or symlink hop inside $SB."""
+def check_not_in_sandbox(path: Path, sandbox_root: Path | None = None) -> Path:
+    """Kernel-order component walk rejecting any prefix, '..' hop, or symlink hop inside $SB."""
     sb_base = sandbox_root or (Path.home() / "opencode-sandbox")
     roots = _expand_root_variants(sb_base)
-    _walk_check_not_under_roots(path, roots, "sandbox root", 0)
-    resolved = Path(os.path.abspath(str(path))).resolve()
+    physical = _walk_check_not_under_roots(path, roots, "sandbox root")
     for froot in roots:
-        if _is_under(resolved, froot):
-            raise PolicyError(f"Refusing host-trusted path inside sandbox root: {resolved}")
+        if _is_under(physical, froot):
+            raise PolicyError(f"Refusing host-trusted path inside sandbox root: {physical}")
+    return physical
 
 
-def check_not_host_production_dir(path: Path) -> None:
+def check_not_host_production_dir(path: Path) -> Path:
     """Refuse initializing or accessing real host oc-sandbox config/data directories from the spike PoC."""
     candidates: list[Path] = [
         Path.home() / ".config" / "oc-sandbox",
@@ -273,15 +302,15 @@ def check_not_host_production_dir(path: Path) -> None:
         for variant in _expand_root_variants(cand):
             if variant not in roots:
                 roots.append(variant)
-    _walk_check_not_under_roots(path, roots, "host production config directory", 0)
-    resolved = Path(os.path.abspath(str(path))).resolve()
+    physical = _walk_check_not_under_roots(path, roots, "host production config directory")
     for froot in roots:
-        if _is_under(resolved, froot):
-            raise PolicyError(f"Refusing PoC store inside host production directory: {resolved}")
+        if _is_under(physical, froot):
+            raise PolicyError(f"Refusing PoC store inside host production directory: {physical}")
+    return physical
 
 
 def assert_trusted_dir(path: Path, *, sandbox_root: Path | None = None) -> Path:
-    check_not_in_sandbox(path, sandbox_root)
+    physical = check_not_in_sandbox(path, sandbox_root)
     st = os.lstat(path)
     if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
         raise PolicyError(f"Expected non-symlink directory: {path}")
@@ -291,7 +320,7 @@ def assert_trusted_dir(path: Path, *, sandbox_root: Path | None = None) -> Path:
     if st.st_mode & 0o077:
         raise PolicyError(f"Directory permissions too open (require 0700): {path}")
     # Walk ancestors ensuring no group/world-writable non-sticky directories
-    cur = path.resolve().parent
+    cur = physical.parent
     while True:
         ast = os.lstat(cur)
         if ast.st_uid not in (uid, 0):
@@ -301,7 +330,7 @@ def assert_trusted_dir(path: Path, *, sandbox_root: Path | None = None) -> Path:
         if cur.parent == cur:
             break
         cur = cur.parent
-    return path.resolve()
+    return physical
 
 
 def read_regular_no_follow(
@@ -485,6 +514,8 @@ def validate_remote_endpoint_url(
     allowed_schemes = {"https"} | ({"http"} if allow_http else set())
     if parsed.scheme not in allowed_schemes:
         raise PolicyError(f"Remote endpoint scheme {parsed.scheme!r} not allowed")
+    if parsed.params or ";" in urlsplit(url).path:
+        raise PolicyError("Path parameters (';') forbidden in remote endpoint URL")
     if parsed.fragment:
         raise PolicyError("Fragment forbidden in remote endpoint URL")
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
@@ -532,7 +563,7 @@ def canonicalize_remote_url(
 ) -> str:
     """Validate and canonicalize a remote endpoint URL for exact grant matching & Plan IR hashing."""
     validated = validate_remote_endpoint_url(url, allow_http=allow_http, allowed_hosts=allowed_hosts)
-    parsed = urlparse(validated)
+    parsed = urlsplit(validated)
     scheme = parsed.scheme.lower()
     host = (parsed.hostname or "").strip().lower().rstrip(".")
     try:
@@ -926,7 +957,7 @@ def _validate_mcp_secret_env(secret_env: object, context: str) -> dict[str, str]
     return out
 
 
-def _extract_secret_slots(headers: dict[str, str], secret_env: dict[str, str]) -> set[str]:
+def extract_secret_slots(headers: dict[str, str], secret_env: dict[str, str]) -> set[str]:
     slots: set[str] = set()
     for val in list(headers.values()) + list(secret_env.values()):
         for m in SECRET_SLOT_EXTRACT_RE.finditer(val):
@@ -1065,21 +1096,21 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
         )
 
         # Enforce strict credential-slot separation across local, remote-RO, and remote-RW
-        top_slots = _extract_secret_slots(norm_headers, norm_secret_env)
+        top_slots = extract_secret_slots(norm_headers, norm_secret_env)
         local_slots = (
-            _extract_secret_slots(norm_local["headers"], norm_local["secret_env"])
+            extract_secret_slots(norm_local["headers"], norm_local["secret_env"])
             if norm_local is not None
             else set()
         )
-        ro_slots = _extract_secret_slots(ro_headers, ro_secret_env)
-        wr_slots = _extract_secret_slots(wr_headers, wr_secret_env)
+        ro_slots = extract_secret_slots(ro_headers, ro_secret_env)
+        wr_slots = extract_secret_slots(wr_headers, wr_secret_env)
         if wr_slots & (ro_slots | local_slots | top_slots):
             shared = sorted(wr_slots & (ro_slots | local_slots | top_slots))
             raise PolicyError(
                 f"MCP {name} remote write secret slot(s) must be distinct from read-only/local slots: {', '.join(shared)}"
             )
-        if ro_slots & local_slots:
-            shared = sorted(ro_slots & local_slots)
+        if ro_slots & (local_slots | top_slots):
+            shared = sorted(ro_slots & (local_slots | top_slots))
             raise PolicyError(
                 f"MCP {name} remote read-only secret slot(s) must be distinct from local slots: {', '.join(shared)}"
             )

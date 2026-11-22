@@ -257,40 +257,42 @@ class HostConfigStore:
     ):
         self.sandbox_root = sandbox_root
         raw_config_dir = Path(config_dir)
-        check_not_in_sandbox(raw_config_dir, sandbox_root)
-        check_not_host_production_dir(raw_config_dir)
         if raw_config_dir.is_symlink():
             raise PolicyError(f"Expected non-symlink config_dir: {raw_config_dir}")
-        if raw_config_dir.exists():
-            st = os.lstat(raw_config_dir)
+        phys_config_dir = check_not_in_sandbox(raw_config_dir, sandbox_root)
+        check_not_host_production_dir(raw_config_dir)
+        if phys_config_dir.is_symlink():
+            raise PolicyError(f"Expected non-symlink config_dir: {phys_config_dir}")
+        if phys_config_dir.exists():
+            st = os.lstat(phys_config_dir)
             if not stat.S_ISDIR(st.st_mode):
-                raise PolicyError(f"Expected directory for config_dir: {raw_config_dir}")
+                raise PolicyError(f"Expected directory for config_dir: {phys_config_dir}")
             if st.st_uid != os.geteuid():
-                raise PolicyError(f"Directory not owned by current user: {raw_config_dir}")
-            if any(raw_config_dir.iterdir()):
-                marker_path = raw_config_dir / POC_STORE_MARKER
+                raise PolicyError(f"Directory not owned by current user: {phys_config_dir}")
+            if any(phys_config_dir.iterdir()):
+                marker_path = phys_config_dir / POC_STORE_MARKER
                 if not marker_path.exists():
                     raise PolicyError(
-                        f"Refusing to initialize PoC store in existing non-empty non-PoC directory: {raw_config_dir}"
+                        f"Refusing to initialize PoC store in existing non-empty non-PoC directory: {phys_config_dir}"
                     )
                 try:
                     marker_raw = read_regular_no_follow(
                         marker_path,
                         max_bytes=1024,
                         require_owner_only=True,
-                        confined_root=raw_config_dir,
+                        confined_root=phys_config_dir,
                         sandbox_root=sandbox_root,
                     )
                     marker_doc = json.loads(marker_raw.decode("utf-8"))
                 except Exception as exc:
-                    raise PolicyError(f"Invalid PoC store marker in {raw_config_dir}: {exc}") from exc
+                    raise PolicyError(f"Invalid PoC store marker in {phys_config_dir}: {exc}") from exc
                 if not isinstance(marker_doc, dict) or marker_doc.get("poc_store_version") != 1:
-                    raise PolicyError(f"Invalid PoC store marker contents in {raw_config_dir}")
-            os.chmod(raw_config_dir, 0o700)
+                    raise PolicyError(f"Invalid PoC store marker contents in {phys_config_dir}")
+            os.chmod(phys_config_dir, 0o700)
         else:
-            raw_config_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(raw_config_dir, 0o700)
-        self.config_dir = assert_trusted_dir(raw_config_dir, sandbox_root=sandbox_root)
+            phys_config_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(phys_config_dir, 0o700)
+        self.config_dir = assert_trusted_dir(phys_config_dir, sandbox_root=sandbox_root)
         self.builtin_dir = builtin_dir.resolve()
         self._clock = clock or (lambda: int(time.monotonic()))
         self._ensure_layout()

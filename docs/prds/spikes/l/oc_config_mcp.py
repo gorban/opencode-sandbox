@@ -279,6 +279,14 @@ def _redact_object_for_orchestrator(kind: str, doc: dict[str, Any]) -> dict[str,
     return out
 
 
+def _path_exists_or_symlink(path: Path) -> bool:
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
 class OrchestratorConfigMcpServer:
     """Private 0o700 UDS JSON-RPC server mediating read-only queries & human-gated proposals."""
 
@@ -306,13 +314,21 @@ class OrchestratorConfigMcpServer:
         self.socket_path: Path | None = None
 
     def start(self) -> Path:
-        check_not_in_sandbox(self._raw_socket_dir, self.store.sandbox_root)
-        check_not_host_production_dir(self._raw_socket_dir)
         if self._raw_socket_dir.is_symlink():
             raise PolicyError(f"Expected non-symlink socket_dir: {self._raw_socket_dir}")
-        self._raw_socket_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(self._raw_socket_dir, 0o700)
-        self.socket_dir = assert_trusted_dir(self._raw_socket_dir, sandbox_root=self.store.sandbox_root)
+        phys_dir = check_not_in_sandbox(self._raw_socket_dir, self.store.sandbox_root)
+        check_not_host_production_dir(self._raw_socket_dir)
+        if phys_dir.is_symlink():
+            raise PolicyError(f"Expected non-symlink socket_dir: {phys_dir}")
+        if _path_exists_or_symlink(phys_dir / "operator.sock") or _path_exists_or_symlink(
+            phys_dir / "operator.token"
+        ):
+            raise PolicyError(
+                f"Refusing to start orchestrator MCP server in an operator socket directory: {phys_dir}"
+            )
+        phys_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(phys_dir, 0o700)
+        self.socket_dir = assert_trusted_dir(phys_dir, sandbox_root=self.store.sandbox_root)
         sock_path = self.socket_dir / "mcp.sock"
         try:
             st = os.lstat(sock_path)
@@ -744,13 +760,19 @@ class OperatorControlServer:
         self.token_path: Path | None = None
 
     def start(self) -> Path:
-        check_not_in_sandbox(self._raw_socket_dir, self.store.sandbox_root)
-        check_not_host_production_dir(self._raw_socket_dir)
         if self._raw_socket_dir.is_symlink():
             raise PolicyError(f"Expected non-symlink operator socket_dir: {self._raw_socket_dir}")
-        self._raw_socket_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(self._raw_socket_dir, 0o700)
-        self.socket_dir = assert_trusted_dir(self._raw_socket_dir, sandbox_root=self.store.sandbox_root)
+        phys_dir = check_not_in_sandbox(self._raw_socket_dir, self.store.sandbox_root)
+        check_not_host_production_dir(self._raw_socket_dir)
+        if phys_dir.is_symlink():
+            raise PolicyError(f"Expected non-symlink operator socket_dir: {phys_dir}")
+        if _path_exists_or_symlink(phys_dir / "mcp.sock"):
+            raise PolicyError(
+                f"Refusing to start host-only operator control server in an orchestrator socket directory: {phys_dir}"
+            )
+        phys_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(phys_dir, 0o700)
+        self.socket_dir = assert_trusted_dir(phys_dir, sandbox_root=self.store.sandbox_root)
         sock_path = self.socket_dir / "operator.sock"
         tok_path = self.socket_dir / "operator.token"
         try:
@@ -880,6 +902,14 @@ class OperatorControlServer:
             finally:
                 self._conn_sem.release()
 
+    def _verify_config_dir_param(self, params: dict[str, Any]) -> None:
+        cfg = params.get("config_dir")
+        if cfg is not None:
+            if type(cfg) is not str or cfg != str(self.store.config_dir):
+                raise PolicyError(
+                    f"Operator socket serves config_dir {str(self.store.config_dir)!r}, not {cfg!r}"
+                )
+
     def _dispatch(self, req_id: Any, method: str, params: dict[str, Any]) -> dict[str, Any]:
         ok = OrchestratorConfigMcpServer._ok
         err = OrchestratorConfigMcpServer._error
@@ -891,12 +921,14 @@ class OperatorControlServer:
                     {
                         "incarnation": self.store.incarnation,
                         "store_revision": self.store.store_revision,
+                        "config_dir": str(self.store.config_dir),
                     },
                 )
             if method == "operator_approve":
                 OrchestratorConfigMcpServer._check_closed_params(
-                    params, frozenset({"proposal_id", "digest"}), method
+                    params, frozenset({"proposal_id", "digest", "config_dir"}), method
                 )
+                self._verify_config_dir_param(params)
                 pid = params.get("proposal_id")
                 digest = params.get("digest")
                 if type(pid) is not str or PROPOSAL_ID_RE.fullmatch(pid) is None:
@@ -906,14 +938,20 @@ class OperatorControlServer:
                 new_rev = self.store.approve_proposal(pid, digest)
                 return ok(req_id, {"approved": True, "revision": new_rev})
             if method == "operator_reject":
-                OrchestratorConfigMcpServer._check_closed_params(params, frozenset({"proposal_id"}), method)
+                OrchestratorConfigMcpServer._check_closed_params(
+                    params, frozenset({"proposal_id", "config_dir"}), method
+                )
+                self._verify_config_dir_param(params)
                 pid = params.get("proposal_id")
                 if type(pid) is not str or PROPOSAL_ID_RE.fullmatch(pid) is None:
                     raise SchemaError("Invalid proposal_id")
                 prop = self.store.reject_proposal(pid)
                 return ok(req_id, {"rejected": True, "status": prop["status"]})
             if method == "operator_reconcile":
-                OrchestratorConfigMcpServer._check_closed_params(params, frozenset({"proposal_id"}), method)
+                OrchestratorConfigMcpServer._check_closed_params(
+                    params, frozenset({"proposal_id", "config_dir"}), method
+                )
+                self._verify_config_dir_param(params)
                 pid = params.get("proposal_id")
                 if type(pid) is not str or PROPOSAL_ID_RE.fullmatch(pid) is None:
                     raise SchemaError("Invalid proposal_id")
@@ -942,16 +980,25 @@ def call_operator_uds(
     params: dict[str, Any],
     *,
     token: str | None = None,
+    expected_config_dir: Path | None = None,
+    expected_peer_uid: int | None = None,
     sandbox_root: Path | None = None,
 ) -> dict[str, Any]:
     """Invoke the host-only OperatorControlServer UDS and raise typed store/policy errors on failure."""
     sock_p = Path(socket_path)
-    check_not_in_sandbox(sock_p, sandbox_root)
+    if sock_p.is_symlink():
+        raise PolicyError(f"Expected non-symlink operator Unix socket: {sock_p}")
+    phys_sock = check_not_in_sandbox(sock_p, sandbox_root)
     check_not_host_production_dir(sock_p)
-    parent = assert_trusted_dir(sock_p.parent, sandbox_root=sandbox_root)
-    st = os.lstat(sock_p)
+    parent = assert_trusted_dir(phys_sock.parent, sandbox_root=sandbox_root)
+    st = os.lstat(phys_sock)
     if not stat.S_ISSOCK(st.st_mode):
-        raise PolicyError(f"Expected operator Unix socket: {sock_p}")
+        raise PolicyError(f"Expected operator Unix socket: {phys_sock}")
+    want_uid = os.geteuid() if expected_peer_uid is None else expected_peer_uid
+    if st.st_uid != os.geteuid():
+        raise PolicyError(f"Operator socket not owned by current user: {phys_sock}")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        raise PolicyError(f"Operator socket permissions too open (require 0600): {phys_sock}")
     if token is None:
         tok_path = parent / "operator.token"
         token = read_regular_no_follow(
@@ -961,16 +1008,31 @@ def call_operator_uds(
             confined_root=parent,
             sandbox_root=sandbox_root,
         ).decode("ascii").strip()
-    resp = call_mcp_uds(
-        sock_p,
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "auth_token": token,
-            "method": method,
-            "params": params,
-        },
-    )
+
+    send_params = dict(params)
+    if expected_config_dir is not None:
+        exp_phys = check_not_in_sandbox(Path(expected_config_dir), sandbox_root)
+        check_not_host_production_dir(Path(expected_config_dir))
+        if method != "operator_status":
+            send_params["config_dir"] = str(exp_phys)
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "auth_token": token,
+        "method": method,
+        "params": send_params,
+    }
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
+        cli.settimeout(5.0)
+        cli.connect(str(phys_sock))
+        # Verify server SO_PEERCRED UID BEFORE sending operator.token!
+        if _get_peer_uid(cli) != want_uid:
+            raise PolicyError("Operator socket peer UID mismatch; refusing to send operator token")
+        cli.sendall(encode_content_length_frame(payload))
+        resp_bytes = read_content_length_frame(cli)
+        resp = parse_strict_json(resp_bytes)
+
     if "error" in resp:
         code = resp["error"].get("code")
         msg = str(resp["error"].get("message", "operator_error"))

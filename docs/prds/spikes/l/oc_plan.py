@@ -28,6 +28,7 @@ from oc_schema import (
     SchemaError,
     canonicalize_remote_url,
     capability_satisfies,
+    extract_secret_slots,
     is_builtin_id,
     parse_mem_bytes,
     read_regular_no_follow,
@@ -1053,10 +1054,23 @@ def compute_closed_security_delta(
         old_mcp = (old_p["role_contract"]["opencode_config"]["mcp"] if old_p else {})
         new_mcp = new_p["role_contract"]["opencode_config"]["mcp"]
         for mname, mcfg in new_mcp.items():
+            new_mcp_slots = extract_secret_slots(mcfg.get("headers", {}), mcfg.get("secret_env", {}))
             if mname not in old_mcp:
                 triggers.add("new_mcp_server_added")
+                if new_mcp_slots:
+                    triggers.add("secret_slot_added")
+                    details.append(
+                        {"trigger": "secret_slot_added", "sandbox_type": st_id, "mcp": mname, "slots": sorted(new_mcp_slots)}
+                    )
             else:
                 om = old_mcp[mname]
+                old_mcp_slots = extract_secret_slots(om.get("headers", {}), om.get("secret_env", {}))
+                added_mcp_slots = new_mcp_slots - old_mcp_slots
+                if added_mcp_slots:
+                    triggers.add("secret_slot_added")
+                    details.append(
+                        {"trigger": "secret_slot_added", "sandbox_type": st_id, "mcp": mname, "slots": sorted(added_mcp_slots)}
+                    )
                 if (
                     set(mcfg["allowed_tools"]) - set(om["allowed_tools"])
                     or mcfg.get("url") != om.get("url")

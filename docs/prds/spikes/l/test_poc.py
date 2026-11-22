@@ -24,6 +24,7 @@ from oc_config_mcp import (  # noqa: E402
     OperatorControlServer,
     OrchestratorConfigMcpServer,
     call_mcp_uds,
+    call_operator_uds,
     encode_content_length_frame,
 )
 from oc_plan import (  # noqa: E402
@@ -808,7 +809,20 @@ class TestPlanCompiler(unittest.TestCase):
         )
         self.assertIn("remote_write_granted", delta["triggers"])
         self.assertIn("mcp_tool_surface_widened", delta["triggers"])
+        self.assertIn("secret_slot_added", delta["triggers"])
         self.assertEqual(classify_drift(remote_ro.plan, remote_rw.plan)["kind"], "recreate-stateless")
+
+        # P3-1: ';params' in remote endpoint URL must be rejected, not silently stripped
+        with self.assertRaises(PolicyError):
+            compile_plan(
+                self.store,
+                "builtin/api-workbench",
+                overrides=PlanOverrides(env_bindings={"API_ENDPOINT": "https://staging.example.com/mcp;foo=bar"}),
+            )
+
+        # P3-2: duplicate CLI --env-binding / --allow-remote-write keys fail closed
+        with self.assertRaises(SchemaError):
+            oc_sandbox_cli._parse_kv(["api_client=https://a.example.com/mcp", "api_client=https://b.example.com/mcp"])
 
         # 4. Remote with mismatched URL grant is refused fail-closed
         with self.assertRaises(PolicyError):
@@ -859,7 +873,7 @@ class TestPlanCompiler(unittest.TestCase):
         )
         self.assertEqual(audit_rw_attempt.plan["remote_write_grants"], {})
 
-        # 7. Schema rejects shared secret slot between remote RO and RW (or local and RW)
+        # 7. Schema rejects shared secret slot between remote RO and RW, or top-level headers and remote RO
         shared_slot_bundle = _sample_bundle_toml(
             "team/shared-slot",
             (
@@ -872,6 +886,22 @@ class TestPlanCompiler(unittest.TestCase):
         with self.assertRaises(PolicyError):
             self.store.create_proposal(
                 kind="bundle", obj_id="team/shared-slot", action="upsert", proposed_toml=shared_slot_bundle
+            )
+
+        # P2-1: remote.read_only_* cannot overlap top-level local-fallback headers/secret_env
+        shared_top_ro_bundle = _sample_bundle_toml(
+            "team/shared-top-ro",
+            (
+                '[mcp.dup_top]\ntype = "remote"\nurl = "http://127.0.0.1:8080/mcp"\n'
+                'read_only_tools = ["r"]\nwrite_tools = ["w"]\n'
+                '[mcp.dup_top.headers]\nAuthorization = "Bearer {file:/run/secrets/shared_top}"\n'
+                '[mcp.dup_top.local]\nbinding_key = "DUP_EP"\nservice = "builtin/api-demo"\nurl = "http://127.0.0.1:8080/mcp"\n'
+                '[mcp.dup_top.remote.read_only_headers]\nAuthorization = "Bearer {file:/run/secrets/shared_top}"\n'
+            ),
+        )
+        with self.assertRaises(PolicyError):
+            self.store.create_proposal(
+                kind="bundle", obj_id="team/shared-top-ro", action="upsert", proposed_toml=shared_top_ro_bundle
             )
 
         # 8. Bundle without explicit read_only_tools fails closed when bound to a remote endpoint
@@ -1626,6 +1656,90 @@ class TestStoreControllerAndMcp(unittest.TestCase):
             self.assertEqual(restarted_store.get_revision("bundle", "team/cross-proc"), 1)
         finally:
             op_srv2.stop()
+
+    def test_delta_p1_1_symlink_dotdot_and_p2_2_operator_uds_boundaries(self) -> None:
+        # P1-1 Attack A: base/link -> base/a/b, base/a/evil_prod -> $HOME/.config/oc-sandbox
+        # HostConfigStore(base/link/../evil_prod/poc_sub) must fail BEFORE mkdir/chmod!
+        fake_home = Path(self.tmp.name) / "p1_home"
+        prod_dir = fake_home / ".config" / "oc-sandbox"
+        prod_dir.mkdir(parents=True, mode=0o700)
+        base = Path(self.tmp.name) / "p1_base"
+        (base / "a" / "b").mkdir(parents=True, mode=0o700)
+        os.symlink(base / "a" / "b", base / "link")
+        os.symlink(prod_dir, base / "a" / "evil_prod")
+        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
+            with self.assertRaises(PolicyError):
+                HostConfigStore(base / "link" / ".." / "evil_prod" / "poc_sub")
+        self.assertFalse((prod_dir / "poc_sub").exists())
+
+        # P1-1 Attack B: base/link -> base/a/b, base/a/via_sb -> $SB/hop, $SB/hop -> outside_target
+        sb = Path(self.tmp.name) / "p1_sb"
+        sb.mkdir(mode=0o700)
+        outside = Path(self.tmp.name) / "p1_outside"
+        outside.mkdir(mode=0o700)
+        os.symlink(outside, sb / "hop")
+        os.symlink(sb / "hop", base / "a" / "via_sb")
+        with self.assertRaises(PolicyError):
+            HostConfigStore(base / "link" / ".." / "via_sb" / "store_dir", sandbox_root=sb)
+        self.assertFalse((outside / "store_dir").exists())
+
+        # P2-2a: Refuse shared socket_dir between OrchestratorConfigMcpServer and OperatorControlServer
+        with self.assertRaises(PolicyError):
+            OperatorControlServer(self.store, self.sock_dir).start()
+
+        op_dir = Path(self.tmp.name) / "p2_op_dir"
+        op_srv = OperatorControlServer(self.store, op_dir)
+        op_sock = op_srv.start()
+        try:
+            with self.assertRaises(PolicyError):
+                OrchestratorConfigMcpServer(self.store, op_dir).start()
+
+            # P2-2b: Mismatched --config-dir with --operator-socket fails closed AND does NOT create the dir
+            prop = self._rpc(
+                "config_propose_revision",
+                {
+                    "kind": "bundle",
+                    "id": "team/mismatch-cfg",
+                    "action": "upsert",
+                    "proposed_toml": _sample_bundle_toml("team/mismatch-cfg"),
+                },
+            )["result"]
+            wrong_cfg = Path(self.tmp.name) / "never_create_me"
+            mismatch_proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(_SPIKE_DIR / "oc_sandbox_cli.py"),
+                    "--config-dir",
+                    str(wrong_cfg),
+                    "config",
+                    "approve",
+                    prop["proposal_id"],
+                    "--digest",
+                    prop["proposal_digest"],
+                    "--operator-socket",
+                    str(op_sock),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(mismatch_proc.returncode, 0)
+            self.assertFalse(wrong_cfg.exists(), "CLI must not create --config-dir on --operator-socket mismatch")
+            self.assertEqual(self.store.get_revision("bundle", "team/mismatch-cfg"), 0)
+
+            # P2-2c: Client-side socket permission check (0o644 rejected) & peer UID check before sending token
+            os.chmod(op_sock, 0o644)
+            try:
+                with self.assertRaisesRegex(PolicyError, "permissions too open"):
+                    call_operator_uds(op_sock, "operator_status", {})
+            finally:
+                os.chmod(op_sock, 0o600)
+
+            with self.assertRaisesRegex(PolicyError, "peer UID mismatch"):
+                call_operator_uds(op_sock, "operator_status", {}, expected_peer_uid=os.geteuid() + 1)
+        finally:
+            op_srv.stop()
 
     def test_orchestrator_base_skills_present_with_frontmatter(self) -> None:
         skills_dir = _SPIKE_DIR / "orchestrator_skills"

@@ -34,6 +34,8 @@ def _parse_kv(items: list[str]) -> dict[str, str]:
         if "=" not in item:
             raise SchemaError(f"Expected KEY=VALUE, got {item!r}")
         k, v = item.split("=", 1)
+        if k in out:
+            raise SchemaError(f"Duplicate CLI key: {k!r}")
         out[k] = v
     return out
 
@@ -133,6 +135,41 @@ def main(argv: list[str] | None = None) -> int:
     w_show.add_argument("id")
 
     args = parser.parse_args(argv)
+
+    # Operator UDS calls talk directly to the live helper incarnation and must NOT initialize
+    # args.config_dir as a side effect; the helper verifies config_dir matches its live store.
+    if (
+        args.cmd == "config"
+        and args.cfg_cmd in ("approve", "reject", "reconcile")
+        and args.operator_socket is not None
+    ):
+        if args.cfg_cmd == "approve":
+            res_op = call_operator_uds(
+                args.operator_socket,
+                "operator_approve",
+                {"proposal_id": args.proposal_id, "digest": args.digest},
+                expected_config_dir=args.config_dir,
+            )
+            print(json.dumps(res_op, indent=2))
+            return 0
+        if args.cfg_cmd == "reject":
+            res_op = call_operator_uds(
+                args.operator_socket,
+                "operator_reject",
+                {"proposal_id": args.proposal_id},
+                expected_config_dir=args.config_dir,
+            )
+            print(json.dumps(res_op, indent=2))
+            return 0
+        res_op = call_operator_uds(
+            args.operator_socket,
+            "operator_reconcile",
+            {"proposal_id": args.proposal_id},
+            expected_config_dir=args.config_dir,
+        )
+        print(json.dumps(res_op, indent=2))
+        return 0
+
     store = HostConfigStore(args.config_dir)
 
     if args.cmd == "plan":
@@ -171,38 +208,14 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"valid": True, "id": validated["id"]}, indent=2))
             return 0
         if args.cfg_cmd == "approve":
-            if args.operator_socket is not None:
-                res_op = call_operator_uds(
-                    args.operator_socket,
-                    "operator_approve",
-                    {"proposal_id": args.proposal_id, "digest": args.digest},
-                )
-                print(json.dumps(res_op, indent=2))
-                return 0
             new_rev = store.approve_proposal(args.proposal_id, args.digest)
             print(json.dumps({"approved": True, "revision": new_rev}, indent=2))
             return 0
         if args.cfg_cmd == "reject":
-            if args.operator_socket is not None:
-                res_op = call_operator_uds(
-                    args.operator_socket,
-                    "operator_reject",
-                    {"proposal_id": args.proposal_id},
-                )
-                print(json.dumps(res_op, indent=2))
-                return 0
             prop = store.reject_proposal(args.proposal_id)
             print(json.dumps({"rejected": True, "status": prop["status"]}, indent=2))
             return 0
         if args.cfg_cmd == "reconcile":
-            if args.operator_socket is not None:
-                res_op = call_operator_uds(
-                    args.operator_socket,
-                    "operator_reconcile",
-                    {"proposal_id": args.proposal_id},
-                )
-                print(json.dumps(res_op, indent=2))
-                return 0
             settled = store.reconcile_proposal(args.proposal_id)
             print(json.dumps({"reconciled": True, "status": settled}, indent=2))
             return 0
