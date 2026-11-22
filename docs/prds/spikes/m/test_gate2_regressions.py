@@ -1518,21 +1518,51 @@ class TestReciprocalReviewRegressions(CoordTestBase):
         job_a = PrincipalCtx(
             CoordRole.JOB, "job-sat", sandbox_addr="sb-sat", incarnation_id="inc_sat1"
         )
-        op_sock = self.sock_dir / "operator.sock"
-        job_sock = self.sock_dir / "job.sock"
+        op_dir = self.sock_dir / "op"
+        job_dir = self.sock_dir / "job"
+        op_dir.mkdir(mode=0o700)
+        job_dir.mkdir(mode=0o700)
+        op_sock = op_dir / "operator.sock"
+        job_sock = job_dir / "job.sock"
+        # Reject wrong role, empty credentials, overlapping tokens, and shared socket directory
         with self.assertRaises(ValueError):
             CoordSplitUdsRpcServer(
                 hub,
                 operator_socket_path=op_sock,
                 job_socket_path=job_sock,
-                job_token_principals={"tok_op": _OP},
+                operator_token_principals={"tok_op": _OP},
+                job_token_principals={"tok_op_bad": _OP},
+            )
+        with self.assertRaises(ValueError):
+            CoordSplitUdsRpcServer(
+                hub,
+                operator_socket_path=op_sock,
+                job_socket_path=job_sock,
+                operator_token_principals={},
+                job_token_principals={"tok_job": job_a},
+            )
+        with self.assertRaises(ValueError):
+            CoordSplitUdsRpcServer(
+                hub,
+                operator_socket_path=op_sock,
+                job_socket_path=job_sock,
+                operator_token_principals={"shared_tok": _OP},
+                job_token_principals={"shared_tok": job_a},
+            )
+        with self.assertRaises(ValueError):
+            CoordSplitUdsRpcServer(
+                hub,
+                operator_socket_path=self.sock_dir / "op_same.sock",
+                job_socket_path=self.sock_dir / "job_same.sock",
+                operator_token_principals={"tok_op": _OP},
+                job_token_principals={"tok_job": job_a},
             )
         rpc = CoordSplitUdsRpcServer(
             hub,
             operator_socket_path=op_sock,
             job_socket_path=job_sock,
-            job_token_principals={"tok_job": job_a},
             operator_token_principals={"tok_op": _OP},
+            job_token_principals={"tok_job": job_a},
             sandbox_root=self.sandbox_root,
             operator_max_concurrent_conns=2,
             job_max_concurrent_conns=2,
@@ -1814,8 +1844,12 @@ class TestReciprocalReviewRegressions(CoordTestBase):
             diag = hub2.status(_OP, target="target-b")
             self.assertTrue(diag["degraded"])
             self.assertIn("projects", hub2.projection(_OP))
-            # Recover, start a live sleeping peer waiter, then degrade -> wake-up fails closed
+            # Recover: stale pre-crash edge MUST be invalidated (not silently reopened)
             hub2.confirm_recovery(_OP, reason="diag_ok")
+            with self.assertRaises(CoordAuthError):
+                hub2.status(peer_a, target="target-b")
+            # Grant a fresh post-recovery edge, start sleeping peer waiter, then degrade
+            hub2.grant_edge(_OP, src_actor="peer-a", dst_addr="target-b")
             wait_err: list[Exception] = []
 
             def _sleep_wait() -> None:
@@ -1983,29 +2017,54 @@ class TestReciprocalReviewRegressions(CoordTestBase):
         self.assertIsNotNone(edge_after)
         self.assertFalse(edge_after.active)
 
-    def test_r3_p1_5_partially_bound_lease_enforces_live_hub_controller_revoke(self) -> None:
-        controller, ctrl_op, _full_lease, req_id = _make_controller_lease("sb-pb", "inc_pb1")
-        # Lease has durable controller_request_id, but NO bound _controller
+    def test_r3_p1_5_partially_bound_lease_rejected_and_bound_lease_aborts_held_stream(
+        self,
+    ) -> None:
+        controller, ctrl_op, full_lease, req_id = _make_controller_lease("sb-pb", "inc_pb1")
+        # 1. Partially bound lease (request ID set, no controller) rejected at registration
         partial_lease = BrokerLease(
             "job_partial_bound",
             controller=None,
             controller_actor=None,
             controller_request_id=req_id,
         )
-        reg, _t, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        ephemeral_lease = BrokerLease("job_no_ctrl_arg")
+        reg, transport, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
         self.addCleanup(reg.close)
         self.addCleanup(hub.close)
-        self._reg_sb(hub, _OP, "sb-pb", "inc_pb1", lease=partial_lease)
-        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-pb")
-        hub.send(_OP, target="sb-pb", body_text="Allowed while controller active")
+        with self.assertRaises(CoordPolicyError):
+            self._reg_sb(hub, _OP, "sb-pb", "inc_pb1", lease=partial_lease)
+        with self.assertRaises(CoordPolicyError):
+            self._reg_sb(
+                hub, _OP, "sb-pb2", "inc_pb2", lease=ephemeral_lease, controller_request_id=req_id
+            )
 
-        # Revoke in hub's controller -> partial_lease.is_active() stays True, hub MUST still deny!
+        # 2. Properly bound lease tears down an actively held stream on controller revoke
+        self._reg_sb(hub, _OP, "sb-pb", "inc_pb1", lease=full_lease)
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-pb")
+        started = threading.Event()
+        never_release = threading.Event()
+        transport.queue_script(
+            "sb-pb",
+            TurnScript(on_stream_started=started, block_event=never_release),
+        )
+        hub.send(_OP, target="sb-pb", body_text="Held turn before controller revoke")
+        hub.dispatch_once(async_stream=True)
+        self.assertTrue(started.wait(timeout=1.0))
+
         controller.revoke(ctrl_op, req_id)
-        self.assertTrue(partial_lease.is_active())
-        with self.assertRaises(RevokedError):
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            sb = reg.get_sandbox("sb-pb")
+            if sb is not None and sb.status == "revoked" and ("sb-pb", "inc_pb1") in transport.revoked_incarnations:
+                break
+            time.sleep(0.02)
+        self.assertIn(("sb-pb", "inc_pb1"), transport.revoked_incarnations)
+        sb_after = reg.get_sandbox("sb-pb")
+        self.assertIsNotNone(sb_after)
+        self.assertEqual(sb_after.status, "revoked")
+        with self.assertRaises(CoordAuthError):
             hub.send(_OP, target="sb-pb", body_text="Must deny after controller revoke")
-        with self.assertRaises(RevokedError):
-            hub.wait(_OP, targets=["sb-pb"], since_seq=0, timeout_s=0.05)
 
     def test_r3_p2_2_rpc_start_captures_uds_startup_error_endpoint_for_retry_stop(self) -> None:
         reg, _t, hub = self._open_pair()
@@ -2021,15 +2080,164 @@ class TestReciprocalReviewRegressions(CoordTestBase):
                 cleaned.append(True)
 
         fake_ep = _FakeEndpoint()
-        with mock.patch("oc_coord_rpc.bind_trusted_uds", side_effect=UdsStartupError(fake_ep)):  # type: ignore[arg-type]
-            with self.assertRaises(UdsStartupError):
-                rpc.start()
+        with (
+            mock.patch("oc_coord_rpc.bind_trusted_uds", side_effect=UdsStartupError(fake_ep)),  # type: ignore[arg-type]
+            self.assertRaises(UdsStartupError),
+        ):
+            rpc.start()
         self.assertIs(rpc._bound, fake_ep)
         with self.assertRaises(BrokerError):
             rpc.start()
         rpc.stop()
         self.assertEqual(cleaned, [True])
         self.assertIsNone(rpc._bound)
+
+    def test_r4_p1_1_sync_dispatch_held_stream_retains_state_lock_until_close_settles(
+        self,
+    ) -> None:
+        reg1, transport1, hub1 = self._open_pair()
+        self._reg_sb(hub1, _OP, "sb-sync", "inc_s1")
+        hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-sync")
+        started = threading.Event()
+        release = threading.Event()
+        transport1.queue_script(
+            "sb-sync",
+            TurnScript(on_stream_started=started, block_event=release),
+        )
+        hub1.send(_OP, target="sb-sync", body_text="Sync held stream")
+        sync_thread = threading.Thread(
+            target=lambda: hub1.dispatch_once(async_stream=False), daemon=True
+        )
+        sync_thread.start()
+        self.assertTrue(started.wait(timeout=1.0))
+
+        # close() MUST retain session seal and flock while synchronous dispatch is held
+        with self.assertRaises(CoordPolicyError):
+            hub1.close(timeout_s=0.05)
+        self.assertTrue(hub1._session_active_marker.exists())
+        reg2 = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
+        transport2 = FakeWorkerTransport()
+        try:
+            with self.assertRaises(CoordPolicyError):
+                CoordHub(reg2, transport2, self.state_dir, sandbox_root=self.sandbox_root)
+        finally:
+            reg2.close()
+
+        release.set()
+        sync_thread.join(timeout=1.0)
+        hub1.close(timeout_s=1.0)
+        self.assertFalse(hub1._session_active_marker.exists())
+        reg1.close()
+
+    def test_r4_p1_2_confirm_recovery_keeps_closed_on_audit_failure_and_concurrent_close(
+        self,
+    ) -> None:
+        # 1. Failing recovery audit must keep degraded=True and .coord_degraded on disk
+        reg1, _t1, hub1 = self._open_pair()
+        hub1._mark_degraded("need_recovery_audit_test")
+        orig_audit = reg1.append_audit
+
+        def _fail_audit(*_args: Any, **_kwargs: Any) -> int:
+            raise OSError("audit_disk_full")
+
+        reg1.append_audit = _fail_audit  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(OSError):
+                hub1.confirm_recovery(_OP, reason="audit_will_fail")
+        finally:
+            reg1.append_audit = orig_audit  # type: ignore[method-assign]
+        self.assertTrue(hub1.is_degraded)
+        self.assertTrue(hub1._degraded_marker.exists())
+
+        # 2. Concurrent close() while confirm_recovery() is paused prevents post-close reopen
+        entered = threading.Event()
+        release = threading.Event()
+        orig_rec = hub1._reconcile_artifacts_on_startup
+
+        def _paused_rec(*, raise_on_error: bool = False) -> None:
+            entered.set()
+            release.wait(timeout=2.0)
+            orig_rec(raise_on_error=raise_on_error)
+
+        hub1._reconcile_artifacts_on_startup = _paused_rec  # type: ignore[method-assign]
+        rec_excs: list[Exception] = []
+
+        def _do_recover() -> None:
+            try:
+                hub1.confirm_recovery(_OP, reason="race_with_close")
+            except Exception as exc:
+                rec_excs.append(exc)
+
+        rt = threading.Thread(target=_do_recover, daemon=True)
+        rt.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+        with self.assertRaises(CoordPolicyError):
+            hub1.close(timeout_s=0.05)
+        release.set()
+        rt.join(timeout=1.0)
+        self.assertEqual(len(rec_excs), 1)
+        self.assertIsInstance(rec_excs[0], CoordPolicyError)
+        self.assertTrue(hub1.is_degraded)
+        self.assertTrue(hub1._degraded_marker.exists())
+        hub1.close(timeout_s=1.0)
+        reg1.close()
+
+    def test_r4_p1_3_close_cutoff_persists_late_lease_revoke_without_orphan_watchdog(
+        self,
+    ) -> None:
+        reg, _t, hub = self._open_pair()
+        lease = BrokerLease("job_late_close_revoke")
+        self._reg_sb(hub, _OP, "sb-late", "inc_late1", lease=lease)
+        edge = hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-late")
+
+        late_callbacks: list[bool] = []
+        orig_cb = hub._on_lease_revoked
+
+        def _spy_cb(*args: Any, **kwargs: Any) -> None:
+            late_callbacks.append(True)
+            orig_cb(*args, **kwargs)
+
+        hub._on_lease_revoked = _spy_cb  # type: ignore[method-assign]
+        orig_join = hub._join_watchdog_threads
+
+        def _revoke_during_close(*, timeout_s: float = 2.0) -> bool:
+            ok = orig_join(timeout_s=timeout_s)
+            # Simulate lease-local revoke firing right at close cutoff
+            lease.revoke()
+            return ok
+
+        hub._join_watchdog_threads = _revoke_during_close  # type: ignore[method-assign]
+        hub.close(timeout_s=1.0)
+        sb_after = reg.get_sandbox("sb-late")
+        edge_after = reg.get_edge(edge.edge_id)
+        reg.close()
+        self.assertEqual(late_callbacks, [])
+        self.assertIsNotNone(sb_after)
+        self.assertEqual(sb_after.status, "revoked")
+        self.assertIsNotNone(edge_after)
+        self.assertFalse(edge_after.active)
+        self.assertFalse(hub._watchdog_threads)
+
+    def test_r4_p2_1_mid_dispatch_close_or_degrade_leaves_valid_pending_row_uncancelled(
+        self,
+    ) -> None:
+        reg, _t, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-pend", "inc_p1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-pend")
+        res = hub.send(_OP, target="sb-pend", body_text="Keep pending on shutdown")
+        msg_id = res["msg_id"]
+        rows = reg.list_outbox(statuses=("pending",))
+        self.assertEqual(len(rows), 1)
+
+        # Simulate degrade/close happening AFTER list_outbox() and BEFORE _dispatch_single_row()
+        hub._mark_degraded("transient_shutdown")
+        self.assertFalse(hub._dispatch_single_row(rows[0], async_stream=False))
+        pending_after = reg.list_outbox(statuses=("pending",))
+        cancelled_after = reg.list_outbox(statuses=("cancelled",))
+        self.assertTrue(any(r["msg_id"] == msg_id for r in pending_after))
+        self.assertEqual(cancelled_after, [])
 
 
 if __name__ == "__main__":

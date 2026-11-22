@@ -843,8 +843,8 @@ class CoordSplitUdsRpcServer:
         *,
         operator_socket_path: Path,
         job_socket_path: Path,
+        operator_token_principals: Mapping[str, PrincipalCtx],
         job_token_principals: Mapping[str, PrincipalCtx],
-        operator_token_principals: Mapping[str, PrincipalCtx] | None = None,
         sandbox_root: Path | None = None,
         expected_uid: int | None = None,
         operator_max_concurrent_conns: int = MAX_CONCURRENT_CONNS,
@@ -853,12 +853,30 @@ class CoordSplitUdsRpcServer:
         rate_limit_window: float = 60.0,
         io_timeout: float = READ_TIMEOUT_SECONDS,
     ) -> None:
-        if any(p.role is CoordRole.OPERATOR for p in job_token_principals.values()):
-            raise ValueError("job_token_principals must not contain OPERATOR principals")
-        if operator_token_principals is not None and any(
-            p.role is not CoordRole.OPERATOR for p in operator_token_principals.values()
+        if not operator_token_principals or not job_token_principals:
+            raise ValueError(
+                "operator_token_principals and job_token_principals must both be non-empty"
+            )
+        if any(
+            not isinstance(p, PrincipalCtx) or p.role is CoordRole.OPERATOR
+            for p in job_token_principals.values()
         ):
-            raise ValueError("operator_token_principals must contain only OPERATOR principals")
+            raise ValueError("job_token_principals must contain only non-OPERATOR PrincipalCtx values")
+        if any(
+            not isinstance(p, PrincipalCtx) or p.role is not CoordRole.OPERATOR
+            for p in operator_token_principals.values()
+        ):
+            raise ValueError("operator_token_principals must contain only OPERATOR PrincipalCtx values")
+        op_hashes = {_hash_token(t) for t in operator_token_principals if type(t) is str and t}
+        job_hashes = {_hash_token(t) for t in job_token_principals if type(t) is str and t}
+        if op_hashes & job_hashes:
+            raise ValueError("operator_token_principals and job_token_principals must be disjoint")
+        op_dir = Path(operator_socket_path).parent.resolve()
+        job_dir = Path(job_socket_path).parent.resolve()
+        if op_dir == job_dir or job_dir in op_dir.parents or op_dir in job_dir.parents:
+            raise ValueError(
+                "operator_socket_path and job_socket_path must reside in distinct non-nested directories"
+            )
         self.operator_server = CoordUdsRpcServer(
             hub,
             operator_socket_path,

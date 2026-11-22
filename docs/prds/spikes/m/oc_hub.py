@@ -94,6 +94,7 @@ _ERR_STATE_LOCKED = "hub_state_dir_locked"
 _ERR_CLOSE_INCOMPLETE = "hub_close_incomplete_workers_running"
 _ERR_ARTIFACT_RECONCILE = "artifact_reconciliation_failed"
 _ATTR_WATCH_THREAD = "_watch_thread"
+_ATTR_LEASE_REQ_ID = "_controller_request_id"
 _ERR_EDGE_REVOKED = "edge_revoked"
 _ERR_NO_ACTIVE_EDGE = "no_active_edge"
 _ERR_REVOKED_UNCONFIRMED = "revoked_locally_persistence_unconfirmed"
@@ -890,6 +891,8 @@ class OutboxDispatcher:
 
     def start(self) -> None:
         with self._lock:
+            if self._hub._is_closed():
+                raise CoordPolicyError(_ERR_HUB_CLOSED)
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stop_event.clear()
@@ -927,17 +930,21 @@ class OutboxDispatcher:
         deadline = time.monotonic() + timeout_s
         with self._lock:
             pump = self._thread
-            streams = list(self._stream_threads)
         if pump is not None:
             pump.join(timeout=max(0.0, deadline - time.monotonic()))
-        for worker in streams:
-            worker.join(timeout=max(0.0, deadline - time.monotonic()))
         pump_alive = pump is not None and pump.is_alive()
         with self._lock:
             if not pump_alive and self._thread is pump:
                 self._thread = None
-            streams_alive = any(w.is_alive() for w in self._stream_threads)
-        return not pump_alive and not streams_alive
+        while True:
+            with self._lock:
+                alive_streams = [w for w in self._stream_threads if w.is_alive()]
+            if not alive_streams:
+                return not pump_alive
+            if deadline - time.monotonic() <= 0:
+                return False
+            for worker in alive_streams:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 class CoordHub:
@@ -973,9 +980,13 @@ class CoordHub:
 
             self._meta_lock = threading.Lock()
             self._register_lock = threading.Lock()
+            self._close_lock = threading.Lock()
+            self._fg_cond = threading.Condition(self._meta_lock)
+            self._fg_ops = 0
             self._session_id = mint_crypto_id("sess")
             self._closed = False
             self._shutdown_settled = False
+            self._accept_watchdog_spawns = True
             self._wait_cond = threading.Condition()
             self._waiters: set[_WaiterState] = set()
             self._degraded = self._init_recovery_seal()
@@ -1131,35 +1142,79 @@ class CoordHub:
             edge_counts[edge_id] = edge_counts.get(edge_id, 0) + len(refs)
             edge_bytes[edge_id] = edge_bytes.get(edge_id, 0) + sum(r.size_bytes for r in refs)
 
+    def _enter_fg_op(self) -> None:
+        with self._meta_lock:
+            if self._closed:
+                raise CoordPolicyError(_ERR_HUB_CLOSED)
+            self._fg_ops += 1
+
+    def _exit_fg_op(self) -> None:
+        with self._meta_lock:
+            self._fg_ops = max(0, self._fg_ops - 1)
+            if self._fg_ops == 0:
+                self._fg_cond.notify_all()
+
+    def _wait_fg_ops(self, deadline: float) -> bool:
+        with self._fg_cond:
+            while self._fg_ops > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._fg_cond.wait(timeout=remaining)
+            return True
+
+    def _reconcile_grants_for_recovery(self) -> int:
+        """Invalidate pre-recovery active grant generations and revoked controller leases."""
+        invalidated = 0
+        for edge in self._registry.list_edges(active_only=True):
+            revoked = self._registry.revoke_grant_and_cancel_outbox(
+                edge_id=edge.edge_id, reason="recovery_grant_generation_invalidated"
+            )
+            invalidated += len(revoked)
+        for sb in self._registry.list_sandboxes():
+            if sb.status == _STATUS_REVOKED or sb.controller_request_id is None:
+                continue
+            if not self._check_controller_request_active(sb.controller_request_id):
+                self._registry.update_sandbox_status(
+                    sb.sandbox_addr, _STATUS_REVOKED, incarnation_id=sb.incarnation_id
+                )
+        return invalidated
+
     def confirm_recovery(
         self, caller: PrincipalCtx, *, reason: str = "operator_verified_recovery"
     ) -> None:
-        """Operator-only explicit recovery keeping admission closed through reconciliation."""
+        """Operator-only recovery: reconcile artifacts, invalidate stale grants, audit, then reopen."""
         if caller.role is not CoordRole.OPERATOR:
             raise CoordAuthError("operator_required:confirm_recovery")
         clean_reason = validate_reason_text(reason, "reason")
-        with self._register_lock:
-            with self._meta_lock:
-                if self._closed:
+        self._enter_fg_op()
+        try:
+            with self._register_lock:
+                if self._is_closed():
                     raise CoordPolicyError(_ERR_HUB_CLOSED)
-            # Reconcile BEFORE clearing _degraded so dispatch/admission stays closed throughout.
-            self._reconcile_artifacts_on_startup(raise_on_error=True)
-            # Write session seal BEFORE unlinking .coord_degraded so failure never drops protection.
-            _write_marker_durable(
-                self._session_active_marker,
-                self._state_dir,
-                f"{self._session_id}\n".encode("utf-8"),
-            )
-            _unlink_marker_durable(self._degraded_marker, self._state_dir)
-            with self._meta_lock:
-                self._degraded = False
-            self._registry.append_audit(
-                caller.canonical_sender,
-                "confirm_recovery",
-                "hub",
-                _OUTCOME_OK,
-                {"reason": clean_reason},
-            )
+                # Keep _degraded=True through artifact reconciliation, grant invalidation, and audit.
+                self._reconcile_artifacts_on_startup(raise_on_error=True)
+                invalidated_grants = self._reconcile_grants_for_recovery()
+                if self._is_closed():
+                    raise CoordPolicyError(_ERR_HUB_CLOSED)
+                self._registry.append_audit(
+                    caller.canonical_sender,
+                    "confirm_recovery",
+                    "hub",
+                    _OUTCOME_OK,
+                    {"reason": clean_reason, "invalidated_grants": invalidated_grants},
+                )
+                # Write session seal BEFORE unlinking .coord_degraded so failure never drops protection.
+                _write_marker_durable(
+                    self._session_active_marker,
+                    self._state_dir,
+                    f"{self._session_id}\n".encode("utf-8"),
+                )
+                _unlink_marker_durable(self._degraded_marker, self._state_dir)
+                with self._meta_lock:
+                    self._degraded = False
+        finally:
+            self._exit_fg_op()
 
     @property
     def is_degraded(self) -> bool:
@@ -1171,23 +1226,53 @@ class CoordHub:
             return self._closed
 
     def start_dispatcher(self) -> None:
-        if self._is_closed():
-            raise CoordPolicyError(_ERR_HUB_CLOSED)
         self.dispatcher.start()
 
-    def _settle_pending_lease_revocations(self) -> None:
-        with self._meta_lock:
-            leases = list(self._leases.items())
-        watchdog_caller = PrincipalCtx(role=CoordRole.OPERATOR, actor_id="lease-watchdog")
+    @staticmethod
+    def _detach_lease_callbacks(
+        leases: Sequence[tuple[str, BrokerLease]],
+        callbacks: Mapping[str, Callable[[], None]],
+    ) -> None:
         for addr, lease in leases:
+            cb = callbacks.get(addr)
+            if cb is not None:
+                lease.remove_revoke_callback(cb)
             try:
                 if getattr(lease, _ATTR_WATCH_THREAD, None) is not threading.current_thread():
                     lease.stop_watchdog()
             except Exception:
                 pass
+
+    def _finalize_settled_close(self, leases: Sequence[tuple[str, BrokerLease]]) -> Exception | None:
+        with self._register_lock:
+            settle_err = self._settle_leases_locked(leases)
+            with self._meta_lock:
+                self._leases.clear()
+                self._lease_callbacks.clear()
+                degraded = self._degraded
+            if not degraded:
+                try:
+                    owner = _read_marker_text_nofollow(self._session_active_marker)
+                    if owner == self._session_id:
+                        _unlink_marker_durable(self._session_active_marker, self._state_dir)
+                except (OSError, CoordPolicyError):
+                    with self._meta_lock:
+                        self._degraded = True
+            with self._meta_lock:
+                lock_fd = self._state_lock_fd
+                self._state_lock_fd = -1
+            _release_state_dir_lock(lock_fd)
+            with self._meta_lock:
+                self._shutdown_settled = True
+            return settle_err
+
+    def _settle_leases_locked(self, leases: Sequence[tuple[str, BrokerLease]]) -> Exception | None:
+        watchdog_caller = PrincipalCtx(role=CoordRole.OPERATOR, actor_id="lease-watchdog")
+        first_err: Exception | None = None
+        for addr, lease in leases:
             if lease.is_active():
                 continue
-            with self._register_lock:
+            try:
                 with self._meta_lock:
                     live_lease = self._leases.get(addr)
                 if live_lease is not lease:
@@ -1199,42 +1284,33 @@ class CoordHub:
                         target=addr,
                         reason="controller_lease_revoked",
                     )
+            except Exception as exc:
+                if first_err is None:
+                    first_err = exc
+        return first_err
 
     def close(self, *, timeout_s: float = 2.0) -> None:
-        with self._meta_lock:
-            if self._shutdown_settled:
-                return
-            self._closed = True
-        self._notify_waiters()
-        deadline = time.monotonic() + timeout_s
-        disp_ok = self.dispatcher.stop(timeout_s=max(0.0, deadline - time.monotonic()))
-        self._settle_pending_lease_revocations()
-        wd_ok = self._join_watchdog_threads(timeout_s=max(0.0, deadline - time.monotonic()))
-        if not disp_ok or not wd_ok:
-            raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
-        with self._meta_lock:
-            leases = list(self._leases.items())
-            callbacks = dict(self._lease_callbacks)
-            self._leases.clear()
-            self._lease_callbacks.clear()
-            degraded = self._degraded
-        for addr, lease in leases:
-            cb = callbacks.get(addr)
-            if cb is not None:
-                lease.remove_revoke_callback(cb)
-        if not degraded:
-            try:
-                owner = _read_marker_text_nofollow(self._session_active_marker)
-                if owner == self._session_id:
-                    _unlink_marker_durable(self._session_active_marker, self._state_dir)
-            except (OSError, CoordPolicyError):
+        with self._close_lock:
+            with self._meta_lock:
+                if self._shutdown_settled:
+                    return
+                self._closed = True
+            self._notify_waiters()
+            deadline = time.monotonic() + timeout_s
+            disp_ok = self.dispatcher.stop(timeout_s=max(0.0, deadline - time.monotonic()))
+            fg_ok = self._wait_fg_ops(deadline)
+            with self._register_lock:
                 with self._meta_lock:
-                    self._degraded = True
-        lock_fd = self._state_lock_fd
-        self._state_lock_fd = -1
-        _release_state_dir_lock(lock_fd)
-        with self._meta_lock:
-            self._shutdown_settled = True
+                    self._accept_watchdog_spawns = False
+                    leases = list(self._leases.items())
+                    callbacks = dict(self._lease_callbacks)
+            self._detach_lease_callbacks(leases, callbacks)
+            wd_ok = self._join_watchdog_threads(timeout_s=max(0.0, deadline - time.monotonic()))
+            if not disp_ok or not fg_ok or not wd_ok:
+                raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
+            settle_err = self._finalize_settled_close(leases)
+            if settle_err is not None:
+                raise settle_err
 
     def _join_watchdog_threads(self, *, timeout_s: float = 2.0) -> bool:
         deadline = time.monotonic() + timeout_s
@@ -1300,7 +1376,7 @@ class CoordHub:
     ) -> bool:
         if not lease.is_active():
             return False
-        lease_req = getattr(lease, "_controller_request_id", None)
+        lease_req = getattr(lease, _ATTR_LEASE_REQ_ID, None)
         if controller_request_id is None:
             if lease_req is None:
                 return True
@@ -1424,7 +1500,7 @@ class CoordHub:
 
         worker = threading.Thread(target=_run, daemon=True)
         with self._meta_lock:
-            if self._shutdown_settled:
+            if not self._accept_watchdog_spawns or self._shutdown_settled:
                 return
             self._watchdog_threads.add(worker)
         worker.start()
@@ -1562,7 +1638,7 @@ class CoordHub:
             if caller.role is not CoordRole.OPERATOR:
                 raise CoordAuthError("operator_required_to_bind_controller")
             eff_actor = lease_actor
-        raw_lease_req = getattr(lease, "_controller_request_id", None)
+        raw_lease_req = getattr(lease, _ATTR_LEASE_REQ_ID, None)
         lease_req = (
             validate_opaque_token(raw_lease_req, _LABEL_CTRL_REQ_ID)
             if raw_lease_req is not None
@@ -1593,6 +1669,14 @@ class CoordHub:
         effective_req = clean_req if clean_req is not None else lease_req
         if effective_req is None:
             return self._ephemeral_authority_id(lease), eff_controller, eff_actor
+        # Durable authority requires the lease itself to poll the same controller & request ID so
+        # its watchdog can tear down held streams on out-of-band controller revocation.
+        if (
+            getattr(lease, "_controller", None) is not eff_controller
+            or getattr(lease, _ATTR_LEASE_REQ_ID, None) != effective_req
+            or getattr(lease, "_controller_actor", None) is None
+        ):
+            raise CoordPolicyError("lease_controller_binding_incomplete")
         if not self._check_controller_request_active(
             effective_req, controller=eff_controller, actor=eff_actor
         ):
@@ -1624,6 +1708,7 @@ class CoordHub:
         clean_parent = parse_local_target(parent_addr).canonical if parent_addr is not None else None
 
         with self._register_lock:
+            self._require_not_degraded()
             existing = self._registry.get_sandbox(addr.canonical)
             self._enforce_register_caller_scope(
                 caller, addr.canonical, clean_parent, existing, clean_inc
@@ -1667,9 +1752,8 @@ class CoordHub:
                 save_budget(addr.canonical, clean_inc, effective_budget)
             self._registry.ensure_thread(addr.canonical, clean_inc, _THREAD_MAIN, title=clean_brief[:64])
             self._record_registered_meta(addr.canonical, clean_inc, effective_budget, lease)
-
-        if lease is not None:
-            self._attach_lease_watchdog(addr.canonical, clean_inc, lease)
+            if lease is not None:
+                self._attach_lease_watchdog(addr.canonical, clean_inc, lease)
 
         self._registry.append_audit(
             caller.canonical_sender,
@@ -1751,6 +1835,37 @@ class CoordHub:
             raise CoordValidationError("grant_generation must be >= 1")
 
     def grant_edge(
+        self,
+        caller: PrincipalCtx,
+        *,
+        src_actor: str,
+        dst_addr: str,
+        allowed_threads: Iterable[str] = (_THREAD_MAIN,),
+        allowed_msg_kinds: Iterable[str] = (_KIND_PROMPT,),
+        max_rounds: int = DEFAULT_EDGE_MAX_ROUNDS,
+        rate_limit_rpm: int = 60,
+        src_incarnation: str | None = None,
+        lease_request_id: str | None = None,
+        grant_generation: int = 1,
+    ) -> RoutingEdge:
+        self._enter_fg_op()
+        try:
+            return self._grant_edge_tracked(
+                caller,
+                src_actor=src_actor,
+                dst_addr=dst_addr,
+                allowed_threads=allowed_threads,
+                allowed_msg_kinds=allowed_msg_kinds,
+                max_rounds=max_rounds,
+                rate_limit_rpm=rate_limit_rpm,
+                src_incarnation=src_incarnation,
+                lease_request_id=lease_request_id,
+                grant_generation=grant_generation,
+            )
+        finally:
+            self._exit_fg_op()
+
+    def _grant_edge_tracked(
         self,
         caller: PrincipalCtx,
         *,
@@ -1875,7 +1990,7 @@ class CoordHub:
         if not self._check_lease_active(sb_addr, controller_request_id=src_sb.controller_request_id):
             raise RevokedError(_ERR_EDGE_REVOKED)
 
-    def _verify_grant_live_under_fence(
+    def _check_grant_pins_live_under_fence(
         self,
         edge_id: str,
         expected_gen: int,
@@ -1884,7 +1999,6 @@ class CoordHub:
         expected_dst_incarnation: str | None = None,
         expected_src_incarnation: str | None = None,
     ) -> tuple[RoutingEdge, SandboxRecord]:
-        self._require_not_degraded()
         edge = self._registry.get_edge(edge_id)
         if edge is None or not edge.active or edge.grant_generation != expected_gen:
             raise RevokedError(_ERR_EDGE_REVOKED)
@@ -1898,6 +2012,24 @@ class CoordHub:
         if expected_dst_incarnation is not None and sandbox.incarnation_id != expected_dst_incarnation:
             raise IncarnationMismatchError("Target sandbox incarnation rotated")
         return edge, sandbox
+
+    def _verify_grant_live_under_fence(
+        self,
+        edge_id: str,
+        expected_gen: int,
+        dst_addr: str,
+        *,
+        expected_dst_incarnation: str | None = None,
+        expected_src_incarnation: str | None = None,
+    ) -> tuple[RoutingEdge, SandboxRecord]:
+        self._require_not_degraded()
+        return self._check_grant_pins_live_under_fence(
+            edge_id,
+            expected_gen,
+            dst_addr,
+            expected_dst_incarnation=expected_dst_incarnation,
+            expected_src_incarnation=expected_src_incarnation,
+        )
 
     def _validate_caller_incarnation_and_lease(
         self, caller: PrincipalCtx, edge: RoutingEdge
@@ -1997,6 +2129,33 @@ class CoordHub:
         artifact_blobs: Sequence[bytes] = (),
         artifact_refs: Sequence[ArtifactRef] = (),
     ) -> dict[str, Any]:
+        self._enter_fg_op()
+        try:
+            return self._send_tracked(
+                caller,
+                target=target,
+                thread_id=thread_id,
+                msg_kind=msg_kind,
+                body_text=body_text,
+                in_reply_to=in_reply_to,
+                artifact_blobs=artifact_blobs,
+                artifact_refs=artifact_refs,
+            )
+        finally:
+            self._exit_fg_op()
+
+    def _send_tracked(
+        self,
+        caller: PrincipalCtx,
+        *,
+        target: str,
+        thread_id: str = _THREAD_MAIN,
+        msg_kind: str = _KIND_PROMPT,
+        body_text: str,
+        in_reply_to: str | None = None,
+        artifact_blobs: Sequence[bytes] = (),
+        artifact_refs: Sequence[ArtifactRef] = (),
+    ) -> dict[str, Any]:
         self._require_not_degraded()
         self._verify_caller_live(caller)
         addr = parse_local_target(target)
@@ -2083,7 +2242,7 @@ class CoordHub:
                 self._mark_degraded("artifact_publish_rollback_failed")
             raise
 
-    def _row_is_live_under_fence(
+    def _classify_row_liveness_under_fence(
         self,
         edge_id: str,
         grant_gen: int,
@@ -2091,18 +2250,25 @@ class CoordHub:
         dst_incarnation: str,
         *,
         src_incarnation: str | None = None,
-    ) -> bool:
+    ) -> str:
+        """Return 'live', 'fenced' (confirmed stale pin), or 'unavailable' (transient/shutdown)."""
         try:
-            self._verify_grant_live_under_fence(
+            self._check_grant_pins_live_under_fence(
                 edge_id,
                 grant_gen,
                 dst_addr,
                 expected_dst_incarnation=dst_incarnation,
                 expected_src_incarnation=src_incarnation,
             )
-            return True
+            return "live"
+        except (RevokedError, IncarnationMismatchError):
+            return "fenced"
+        except CoordPolicyError as exc:
+            if str(exc) == _ERR_SANDBOX_NOT_FOUND:
+                return "fenced"
+            return "unavailable"
         except Exception:
-            return False
+            return "unavailable"
 
     def _resolve_row_dst_addr(
         self, row: dict[str, Any], env: Envelope | None, edge: RoutingEdge | None
@@ -2145,16 +2311,21 @@ class CoordHub:
         fence = self._get_grant_fence(edge_id)
         stream_task: Callable[[], None] | None = None
         with fence:
+            if self._is_closed() or self.is_degraded:
+                return False
             env = self._registry.get_envelope(msg_id)
             edge = self._registry.get_edge(edge_id)
             dst_addr = self._resolve_row_dst_addr(row, env, edge)
             if dst_addr is None or env is None:
                 self._registry.cancel_outbox_row(msg_id, reason="envelope_missing")
                 return False
-            if not self._row_is_live_under_fence(
+            liveness = self._classify_row_liveness_under_fence(
                 edge_id, grant_gen, dst_addr, dst_inc, src_incarnation=src_inc
-            ):
+            )
+            if liveness == "fenced":
                 self._registry.cancel_outbox_row(msg_id, reason="grant_or_incarnation_fenced")
+                return False
+            if liveness != "live":
                 return False
             if not self._registry.mark_outbox_dispatch_started(
                 msg_id, edge_id=edge_id, grant_generation=grant_gen, dst_incarnation=dst_inc
@@ -2189,13 +2360,14 @@ class CoordHub:
         grant_gen: int,
     ) -> Callable[[], None] | None:
         if result.outcome is DispatchOutcome.ZERO_BYTES_SENT:
-            if self._row_is_live_under_fence(
+            liveness = self._classify_row_liveness_under_fence(
                 edge_id,
                 grant_gen,
                 env.dst_addr,
                 env.dst_incarnation,
                 src_incarnation=env.src_incarnation,
-            ):
+            )
+            if liveness != "fenced":
                 self._registry.return_outbox_to_pending(env.msg_id, detail=result.detail)
             else:
                 cancel_reason = result.detail or _STATUS_REVOKED
@@ -2345,20 +2517,30 @@ class CoordHub:
             self._notify_waiters()
 
     def dispatch_once(self, *, async_stream: bool = False) -> int:
-        if self._is_closed() or self.is_degraded:
-            return 0
-        rows = self._registry.list_outbox(statuses=(_STATUS_PENDING,))
-        if not rows:
-            return 0
-        prioritized = sorted(
-            rows,
-            key=lambda r: (-int(r.get("priority", 0)), int(r.get("seq", 0))),
-        )
-        processed = 0
-        for row in prioritized:
-            if self._dispatch_single_row(row, async_stream=async_stream):
-                processed += 1
-        return processed
+        is_pump = threading.current_thread() is self.dispatcher._thread
+        if not is_pump:
+            try:
+                self._enter_fg_op()
+            except CoordPolicyError:
+                return 0
+        try:
+            if self._is_closed() or self.is_degraded:
+                return 0
+            rows = self._registry.list_outbox(statuses=(_STATUS_PENDING,))
+            if not rows:
+                return 0
+            prioritized = sorted(
+                rows,
+                key=lambda r: (-int(r.get("priority", 0)), int(r.get("seq", 0))),
+            )
+            processed = 0
+            for row in prioritized:
+                if self._dispatch_single_row(row, async_stream=async_stream):
+                    processed += 1
+            return processed
+        finally:
+            if not is_pump:
+                self._exit_fg_op()
 
     def _notify_waiters(self) -> None:
         with self._wait_cond:
