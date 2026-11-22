@@ -1614,13 +1614,14 @@ def _enforce_graphql_query_only(req: ParsedHttpRequest) -> bytes:
 def _extract_action_params(raw_encoded: str) -> list[str]:
     if not raw_encoded:
         return []
-    actions: list[str] = []
-    for k, v in parse_qsl(raw_encoded, keep_blank_values=True):
-        if k.lower() == "action":
-            if ";" in raw_encoded or ";" in v:
-                raise HttpErrorResponse(403, "aws_invalid_action_delimiter")
-            actions.append(v)
-    return actions
+    if ";" in raw_encoded or "%3b" in raw_encoded.lower():
+        split_semi = parse_qsl(raw_encoded.replace(";", "&"), keep_blank_values=True)
+        split_unq = parse_qsl(unquote(raw_encoded).replace(";", "&"), keep_blank_values=True)
+        if any(k.lower() == "action" for k, _ in split_semi) or any(
+            k.lower() == "action" for k, _ in split_unq
+        ):
+            raise HttpErrorResponse(403, "aws_invalid_action_delimiter")
+    return [v for k, v in parse_qsl(raw_encoded, keep_blank_values=True) if k.lower() == "action"]
 
 
 def _extract_body_action_params(req: ParsedHttpRequest) -> list[str]:

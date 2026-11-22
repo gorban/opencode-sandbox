@@ -1773,6 +1773,59 @@ class TestBrokerHttpIntegration(unittest.TestCase):
             finally:
                 b6.stop()
 
+    def test_gate2_r2_aws_semicolon_action_smuggling_all_variants(self) -> None:
+        job_ak, job_sk = derive_job_aws_credentials(self.lease.ocjob_token)
+        aws_route = build_aws_ro_route(
+            "sts",
+            f"https://upstream.test:{self.up_port}",
+            "vault:aws_ak",
+            "vault:aws_sk",
+            allowed_aws_actions=["sts:Get*", "sts:POST:/public/*"],
+        )
+        b_aws = HostHttpBrokerServer(
+            [aws_route],
+            self.vault,
+            self.lease,
+            ssl_context=self._tls_ctx,
+            resolver=_make_resolver("127.0.0.1"),
+            allow_test_loopback=True,
+        )
+        addr_aws = b_aws.start()
+        try:
+            cases = (
+                ("body_semi", "/aws/sts", "Action=GetCallerIdentity", b"Version=2011-06-15;Action=AssumeRole"),
+                ("query_semi", "/aws/sts", "Version=2011-06-15;Action=AssumeRole", b"Action=GetCallerIdentity"),
+                ("rest_body_semi", "/aws/sts/public/a", "", b"Version=2011-06-15;Action=AssumeRole"),
+                ("body_pct3b", "/aws/sts", "Action=GetCallerIdentity", b"Version=2011-06-15%3BAction=AssumeRole"),
+                ("body_pct41", "/aws/sts", "Action=GetCallerIdentity", b"Version=2011-06-15;%41ction=AssumeRole"),
+            )
+            for label, path, query, body in cases:
+                sig = sign_aws_sigv4(
+                    method="POST",
+                    raw_path=path,
+                    raw_query=query,
+                    host_header="127.0.0.1",
+                    body=body,
+                    access_key=job_ak,
+                    secret_key=job_sk,
+                    region="us-east-1",
+                    service="sts",
+                )
+                target = f"{path}?{query}" if query else path
+                st, _h, _b = _raw_http_exchange(
+                    addr_aws,
+                    _build_req(
+                        "POST",
+                        target,
+                        headers={"Content-Type": "application/x-www-form-urlencoded", **sig},
+                        body=body,
+                    ),
+                )
+                with self.subTest(case=label):
+                    self.assertEqual(st, 403)
+        finally:
+            b_aws.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1312,8 +1312,7 @@ def _canonicalize_write_grants(ov: PlanOverrides, bundles: list[dict[str, Any]])
     mcp_cidrs: dict[str, tuple[str, ...]] = {}
     for b in bundles:
         for mname, mcfg in b.get("mcp", {}).items():
-            if mcfg.get("allowed_cidrs"):
-                mcp_cidrs[mname] = tuple(mcfg["allowed_cidrs"])
+            mcp_cidrs[mname] = tuple(mcfg.get("allowed_cidrs", ()))
     canonical_write_grants: dict[str, str] = {}
     for g_mcp, g_url in ov.remote_write_grants.items():
         if type(g_mcp) is not str or SIMPLE_NAME_RE.fullmatch(g_mcp) is None:
