@@ -6,9 +6,9 @@ Parent: [prd_m](prd_m.md) · related: [LLM gateway](prd_i4.md),
 ## Problem statement and ACP investigation findings
 
 When running OpenCode inside isolated sandboxes routed through our host LLM proxy with **Codex**
-(OAuth subscription / Responses API / `codex app-server`) and **Claude** (Claude Code OAuth
-subscription, gated on [prd_i4](prd_i4.md) Stage 0 authorization, and Anthropic API keys), three
-capabilities are essential for both the human operator and the orchestrator:
+(OAuth subscription / Responses API / host-confined `codex app-server`) and **Claude** (Claude Code
+OAuth subscription, gated on [prd_i4](prd_i4.md) Stage 0 authorization, and Anthropic API keys),
+three capabilities are essential for both the human operator and the orchestrator:
 
 1. Accurate **model listing** restricted to host-authorized routes/models.
 2. Lossless **reasoning-effort / thinking-level** selection (`low`, `medium`, `high`, `xhigh`, `max`).
@@ -42,32 +42,55 @@ capabilities are essential for both the human operator and the orchestrator:
 
 **Architectural conclusion:** Never rely on ACP or external `models.dev` fetches for model schemas
 or multi-window quotas. Separate the problem into **three clean host-owned subplanes**:
-1. **Inference & Auth Adapters** (unified `/llm/*` routes on `oc_broker_http.py`),
+1. **Inference & Auth Adapters** (unified `/llm/*` routes on `oc_broker_http.py` with strict
+   request-body allowlisting),
 2. **Host `ModelCatalog` + Lossless Variant Lowering**, and
-3. **Passive-First $N$-Window `QuotaLedger` + Pre-Dispatch Admission**.
+3. **Passive-First $N$-Window `QuotaLedger` + Durable Pre-Flight Admission & Spend Reservation**.
 
 ## Design specification
 
-### 1. Unified per-job LLM + L7 broker mux
+### 1. Unified per-job LLM + L7 broker mux & request-body egress firewall
 
 - Mount LLM routes (`/llm/codex/v1/*`, `/llm/anthropic/v1/messages`, `/llm/litellm/v1/*`) onto the
   same per-job `HostHttpBrokerServer` (`oc_broker_http.py`, [prd_l1](prd_l1.md)) using the same
   per-job `BrokerLease`, `ocjob_...` `/run/secrets/oc_broker_token`, and `<1s` `oc_controller`
   revocation teardown.
-- **Passive header capture order invariant:** Upstream rate-limit headers (`x-codex-*`,
-  `anthropic-ratelimit-unified-*`, `x-ratelimit-*`, `retry-after`) MUST be tapped into `QuotaLedger`
-  **inside the host broker before** `SAFE_RESPONSE_HEADERS` scrubbing strips them from the sandbox
-  response. When LiteLLM UDS is used for API-key routes, either bypass LiteLLM for direct
-  Anthropic/OpenAI endpoints or configure raw upstream header passthrough so rate-limit headers are
-  not stripped before `oc_broker_http.py` observes them.
+- **Strict per-provider request-body allowlisting (blocks provider-side egress exfiltration and
+  cost-multiplier smuggling):**
+  - Never pass arbitrary sandbox JSON fields upstream. Reconstruct the upstream body from a closed
+    per-provider allowlist of inference fields (`model`, `messages`/`input`, `system`/`instructions`,
+    `tools` [local function definitions ONLY], `tool_choice`, `stream`, `temperature`, `top_p`,
+    clamped `max_tokens`/`max_output_tokens`, and broker-lowered reasoning fields).
+  - **Block provider-executed network/compute tools fail-closed by default (mandatory in
+    `tier == "managed"`):** Reject any OpenAI Responses `tools[]` entry whose `type != "function"`
+    (blocking `mcp` with `server_url`, `web_search*`, `code_interpreter`, `computer_use*`,
+    `file_search`), and reject Anthropic `mcp_servers`, `container`, and server-executed `tools[]`
+    types (`web_fetch*`, `web_search*`, `code_execution*`, `computer*`, `bash*`, `text_editor*`) so
+    a compromised `--network=none` sandbox cannot exfiltrate data via the model provider's cloud.
+  - **Block cost-multiplier & data-retention smuggling:** Strip/reject client-supplied
+    `service_tier`, `speed`, `store` (force `store: false` where supported), `background`, and
+    arbitrary `metadata`; clamp `max_tokens` / `max_output_tokens` to the lease/model cap.
+  - **Host-owned beta/feature headers:** Strip any inbound `anthropic-beta` / `openai-beta` header
+    from sandboxes; the host broker injects only its own explicitly allowlisted beta headers needed
+    for supported capabilities (e.g., prompt caching / adaptive thinking).
+- **Passive header capture & error-body scrubbing invariant:**
+  - Tap upstream rate-limit headers (`x-codex-*`, `anthropic-ratelimit-unified-*`, `x-ratelimit-*`,
+    `retry-after`) into `QuotaLedger` **inside the host broker before** `SAFE_RESPONSE_HEADERS`
+    scrubbing strips them from the sandbox response.
+  - Scrub **all** upstream `4xx` and `5xx` response bodies (including `429`) before replying to the
+    sandbox, returning only safe broker-synthesized JSON (e.g., `{"error": "upstream_rate_limited",
+    "retry_after_sec": <int>}`) so raw upstream account/org IDs or credentials are never reflected.
+  - When LiteLLM UDS is used for API-key routes, either bypass LiteLLM for direct Anthropic/OpenAI
+    endpoints or configure raw upstream header passthrough so rate-limit headers are not stripped
+    before `oc_broker_http.py` observes them.
 
 ### 2. Host `ModelCatalog`, OpenCode compile-time sync, and host-side variant lowering
 
 - Set `OPENCODE_DISABLE_MODELS_DEV=1` in managed sandboxes (mandatory under `--network=none` and to
   prevent stale upstream registry drift).
 - At plan compilation (`oc_plan.py`), populate `/run/oc-config/opencode.json` **strictly** from the
-  host `ModelCatalog` (seeded from `codex app-server` `model/list` + host Anthropic capability
-  metadata), emitting ONLY models authorized by the sandbox's `lease.allowed_models`:
+  host `ModelCatalog` (seeded from OS-confined `codex app-server` `model/list` + host Anthropic
+  capability metadata), emitting ONLY models authorized by the sandbox's `lease.allowed_models`:
   - Each model entry carries explicit `context` / `output` limits and symbolic `variants`
     (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) that serialize a single normalized
     `x_oc_effort` / `variant` parameter rather than raw provider-specific `budget_tokens`.
@@ -82,10 +105,12 @@ or multi-window quotas. Separate the problem into **three clean host-owned subpl
   - **Claude adaptive models (4.6+):** `thinking: { type: "adaptive" }` + `output_config: { effort: "low"|"medium"|"high"|"max" }` (stripping any client-supplied `budget_tokens`).
   - **Claude legacy extended-thinking models:** `thinking: { type: "enabled", budget_tokens: <mapped> }`.
 
-### 3. Generalized $N$-window `QuotaLedger` and pre-dispatch admission
+### 3. Generalized $N$-window `QuotaLedger`, host `codex app-server` confinement, and durable `PaidFallbackGrant`
 
-Store account-scoped telemetry in host-only `$CONF_DIR/telemetry/quota_state.json` (`0o600`, atomic
-rename, never mounted into sandboxes):
+Store account-scoped telemetry in host-only runtime state under `$STATE`
+(`~/.local/share/oc-sandbox/telemetry/quota_state.json`, `0o600`, verified via `check_not_in_sandbox`,
+`assert_trusted_dir`, `O_NOFOLLOW`, atomic rename, guarded by `check_not_host_production_dir` in
+tests; never stored under static `$CONF_DIR` or mounted into sandboxes):
 
 ```json
 {
@@ -131,11 +156,11 @@ rename, never mounted into sandboxes):
 
 | Tier | Source | Providers & Signals | Guardrails |
 |---|---|---|---|
-| **Tier 1 (Primary, 0 extra calls)** | Passive HTTP response headers + streaming SSE usage chunks tapped on every `200` and `429` | **Codex:** `x-codex-primary-{used-percent,window-minutes,reset-at}`, `x-codex-secondary-*`, `x-codex-rate-limit-reached-type`, `response.completed.response.usage`. **Claude:** `anthropic-ratelimit-unified-5h-{utilization,reset,status}`, `anthropic-ratelimit-unified-7d-*`, `anthropic-ratelimit-unified-representative-claim`, `message_start`/`message_delta` usage. **API keys:** `x-ratelimit-*` + cumulative USD spend. | Monotonic merge (`signal.observed_at >= window.observed_at` or authoritative `429`); strip upstream headers before forwarding to sandbox. |
-| **Tier 2 (Local host RPC)** | Host-resident `codex app-server` JSON-RPC | `account/rateLimits/read` on cold start + push `account/rateLimits/updated` (`primary` 300m + `secondary` 10080m). | Host-confined process only; credentials never enter sandboxes. |
+| **Tier 1 (Primary, 0 extra calls)** | Passive HTTP response headers + streaming SSE usage chunks tapped on every `200` and `429` | **Codex:** `x-codex-primary-{used-percent,window-minutes,reset-at}`, `x-codex-secondary-*`, `x-codex-rate-limit-reached-type`, `response.completed.response.usage`. **Claude:** `anthropic-ratelimit-unified-5h-{utilization,reset,status}`, `anthropic-ratelimit-unified-7d-*`, `anthropic-ratelimit-unified-representative-claim`, `message_start`/`message_delta` usage. **API keys:** `x-ratelimit-*` + durable USD spend ledger. | Monotonic merge (`signal.observed_at >= window.observed_at` or authoritative `429`); strip upstream headers and scrub `4xx`/`5xx` bodies before forwarding to sandbox. |
+| **Tier 2 (OS-confined host RPC)** | Host-confined `codex app-server` JSON-RPC | `model/list`, `account/rateLimits/read` on cold start + push `account/rateLimits/updated` (`primary` 300m + `secondary` 10080m). | **Mandatory OS confinement matching [prd_i4](prd_i4.md):** dedicated minimal isolated `$HOME`, zero access to operator `$HOME`/workspaces/SSH agent/Podman/D-Bus, local tools/exec disabled, network restricted strictly to documented OpenAI endpoints, used only for metadata/rate-limits/authorized host inference. |
 | **Tier 3 (Single-flight jittered fallback)** | Explicit user refresh or cold-start pre-dispatch when `state == "unknown"` | Only when no Tier 1/2 observation exists within `staleness_ttl_sec`. | Per-bucket single-flight lock; minimum `>= 600s + jitter(0..60s)` floor; **429 circuit-breaker** (on `429` from `/api/oauth/usage`, ignore `Retry-After: 0`, back off `15m -> 30m -> 60m` without poisoning inference state). Never background-poll `/api/oauth/usage`. |
 
-#### Time-decay, `unknown` lattice, and pre-dispatch admission (`admit_lane`)
+#### Time-decay, `unknown` lattice, pre-dispatch admission, and atomic `PaidFallbackGrant` accounting
 
 - **Never fabricate 100%:** An unobserved bucket reports `state = "unknown"` until a real signal
   arrives.
@@ -148,9 +173,22 @@ rename, never mounted into sandboxes):
   - If `0 < headroom < soft_reserve_threshold` (default `0.10`): surface warning in launch preview
     and orchestrator `quota_status()` tool so non-critical lanes can downgrade effort or switch
     provider family.
-- **No silent billing escalation ([prd_i4](prd_i4.md)):** Switching from an exhausted OAuth
-  subscription bucket to a metered `api_key` route NEVER happens automatically; it requires an
-  explicit operator-approved `PaidFallbackGrant(max_spend_usd, expires_at)` bound in `oc_controller`.
+- **Explicit route-bound `PaidFallbackGrant` with durable pre-flight spend reservation:**
+  - Switching from an exhausted OAuth subscription bucket to a metered `api_key` route NEVER happens
+    automatically ([prd_i4](prd_i4.md)).
+  - Operator approval in `oc_controller` binds `PaidFallbackGrant(grant_id, source_bucket_id,
+    target_api_route_id, allowed_models, max_spend_usd, max_concurrent, expires_at)` — explicitly
+    naming the metered `target_api_route_id` and its `api_key` credential.
+  - **Atomic worst-case reservation (prevents concurrent overshoot & abort-before-usage bypass):**
+    Before dialing `target_api_route_id`, `QuotaLedger` acquires a per-grant SQLite transaction lock,
+    computes `worst_case_usd = estimate_input_usd(wire_body) + estimate_output_usd(clamped_max_tokens)`,
+    verifies `active_concurrent < grant.max_concurrent` and
+    `spent_usd + reserved_usd + worst_case_usd <= grant.max_spend_usd`, and **durably persists** the
+    reservation in `$STATE/registry.sqlite` (surviving daemon/controller restarts).
+  - On stream completion with verified usage, the reservation reconciles to `actual_usd`.
+  - If the sandbox aborts or drops the connection before the final `usage` SSE chunk arrives, the
+    ledger retains a **conservative debit** (`max(estimate_input_usd + streamed_bytes_output_usd,
+    0.5 * worst_case_usd)`, never `$0`) so hostile disconnects cannot bypass `max_spend_usd`.
 
 ## Gate 1 pseudocode walkthrough
 
@@ -158,9 +196,9 @@ rename, never mounted into sandboxes):
 function handle_llm_broker_request(conn, lease, route, req):
     if not controller.check_lease_active(lease.request_id):
         return http_error(403, "lease_revoked_or_expired")
-    body = parse_strict_json_object(req.body, max_bytes=MAX_LLM_BODY)
-    model_id = body.get("model")
-    effort   = body.pop("x_oc_effort", None) or route.default_effort
+    raw_body = parse_strict_json_object(req.body, max_bytes=MAX_LLM_BODY)
+    model_id = raw_body.get("model")
+    effort   = raw_body.get("x_oc_effort") or route.default_effort
     if model_id not in lease.allowed_models:
         return http_error(403, "model_not_allowed")
 
@@ -168,31 +206,60 @@ function handle_llm_broker_request(conn, lease, route, req):
     if desc is None or not desc.supports_effort(effort):
         return http_error(400, "unsupported_model_or_effort")
 
-    # Pre-flight quota check (never silently escalate subscription -> metered API key)
-    admission = quota_ledger.check_bucket(desc.quota_bucket_id, model_id, now=clock())
-    if admission.hard_blocked and not controller.has_active_paid_fallback(lease, route):
-        return http_error(503, "quota_exhausted",
-                          retry_after=admission.seconds_until_reset,
-                          blocking_window=admission.blocking_window)
+    # 1. Strict body allowlist & provider-executed egress-tool rejection (mandatory in managed tier)
+    sanitized_body, clamped_max_tokens = sanitize_and_lower_llm_body(
+        desc, raw_body, effort, tier=lease.tier, max_tokens_cap=lease.max_output_tokens
+    )
+        # Rejects non-function OpenAI tools (mcp, web_search, code_interpreter, computer_use)
+        # and Anthropic mcp_servers/container/web_fetch/web_search/code_execution;
+        # strips service_tier/speed/background/client anthropic-beta; forces store=false;
+        # lowers effort -> adaptive thinking+effort (Claude 4.6+) or reasoning.effort (Codex)
 
-    wire_body = lower_reasoning_payload(desc, body, effort)
-        # Adaptive Claude 4.6+: thinking={type:"adaptive"} + output_config={effort}; strips budget_tokens
-        # Codex/OpenAI: reasoning={effort, summary:"auto"}
-    ip = resolve_and_validate_ip(route.upstream_host, route.allowed_cidrs)
-    up_sock = connect_tls_pinned_ip(ip, route.upstream_port, server_hostname=route.upstream_host)
+    # 2. Pre-flight quota check & explicit PaidFallbackGrant route switch + durable reservation
+    effective_route = route
+    reservation_id  = None
+    admission = quota_ledger.check_bucket(desc.quota_bucket_id, model_id, now=clock())
+    if admission.hard_blocked:
+        grant = controller.get_active_paid_fallback(lease, source_bucket_id=desc.quota_bucket_id, model_id=model_id)
+        if grant is None:
+            return http_error(503, "quota_exhausted",
+                              retry_after=admission.seconds_until_reset,
+                              blocking_window=admission.blocking_window)
+        effective_route = broker_routes.get(grant.target_api_route_id)
+        if effective_route is None or effective_route.auth_mode != "api_key":
+            return http_error(503, "invalid_paid_fallback_route")
+        worst_case_usd = estimate_worst_case_usd(desc, sanitized_body, clamped_max_tokens)
+        reservation_id = quota_ledger.reserve_spend_durable(grant.grant_id, worst_case_usd, grant.max_concurrent)
+        if reservation_id is None:
+            return http_error(429, "paid_fallback_budget_or_concurrency_exceeded")
+
+    ip = resolve_and_validate_ip(effective_route.upstream_host, effective_route.allowed_cidrs)
+    up_sock = connect_tls_pinned_ip(ip, effective_route.upstream_port,
+                                    server_hostname=effective_route.upstream_host)
     lease.register_stream(up_sock)
+    usage = None
+    streamed_bytes = 0
     try:
-        up_resp = forward_with_host_auth(up_sock, route, wire_body, follow_redirects=False)
+        up_resp = forward_with_host_auth(up_sock, effective_route, sanitized_body,
+                                         allowlisted_beta_headers=effective_route.host_beta_headers,
+                                         follow_redirects=False)
         # Tap rate-limit headers BEFORE SAFE_RESPONSE_HEADERS scrubbing!
-        raw_quota = extract_provider_quota_headers(route.provider_family, up_resp.headers, up_resp.status)
+        raw_quota = extract_provider_quota_headers(effective_route.provider_family, up_resp.headers, up_resp.status)
         if raw_quota is not None:
-            quota_ledger.merge_monotonic(desc.quota_bucket_id, raw_quota, observed_at=clock())
-        # Stream scrubbed response to sandbox while tapping final SSE token usage chunk
-        usage = stream_scrubbed_sse_and_tap_usage(up_resp, conn, lease, canary_secrets=route.secrets)
-        if usage is not None:
-            quota_ledger.record_session_usage(lease.job_id, model_id, usage)
+            quota_ledger.merge_monotonic(effective_route.quota_bucket_id, raw_quota, observed_at=clock())
+        if up_resp.status >= 400:
+            # Scrub ALL 4xx/5xx bodies (including 429) so raw account IDs/secrets never reflect
+            return send_scrubbed_llm_error(conn, up_resp.status, retry_after=raw_quota.retry_after_sec)
+        usage, streamed_bytes = stream_scrubbed_sse_and_tap_usage(
+            up_resp, conn, lease, canary_secrets=effective_route.secrets
+        )
     finally:
         lease.unregister_stream(up_sock)
+        if reservation_id is not None:
+            quota_ledger.reconcile_or_forfeit_durable(reservation_id, usage=usage,
+                                                      streamed_bytes=streamed_bytes)
+        elif usage is not None:
+            quota_ledger.record_session_usage(lease.job_id, model_id, usage)
 ```
 
 ### Failure, recovery, and verification tests
@@ -202,36 +269,44 @@ function handle_llm_broker_request(conn, lease, route, req):
     `state = "unknown"` without failing inference.
   - Telemetry-endpoint `429` trips the Tier 3 circuit breaker only; active inference continues via
     Tier 1 passive header updates.
+  - If `oc_daemon` crashes mid-stream during a `PaidFallbackGrant` call, uncommitted durable
+    reservations are reconciled conservatively on startup (never reset to `$0`).
   - `oc_controller.revoke()` terminates in-flight SSE inference streams in `<1s`.
 - **Verification tests (offline fixtures + live qualification):**
-  1. Unit tests verifying passive capture of `x-codex-{primary,secondary}-*` and
-     `anthropic-ratelimit-unified-{5h,7d}-*` headers BEFORE `SAFE_RESPONSE_HEADERS` scrubbing, plus
-     proof that scrubbed headers do not leak raw account/org identifiers to sandboxes.
-  2. Unit tests verifying adaptive Claude 4.6 lowering strips `budget_tokens` and emits `effort`,
+  1. Provider-tool egress smuggling tests proving OpenAI `tools: [{"type": "mcp", ...}]` /
+     `web_search` and Anthropic `mcp_servers` / `web_fetch` / `code_execution` / `service_tier` /
+     client `anthropic-beta` are rejected fail-closed in `managed` pods.
+  2. Header capture & error scrubbing tests proving passive capture of `x-codex-{primary,secondary}-*`
+     and `anthropic-ratelimit-unified-{5h,7d}-*` BEFORE `SAFE_RESPONSE_HEADERS` scrubbing, plus
+     proof that `429`/`4xx`/`5xx` bodies never leak account/org IDs or secrets to sandboxes.
+  3. Adaptive Claude 4.6 lowering tests verifying `budget_tokens` is stripped and `effort` emitted,
      while unleased models fail closed with `403`.
-  3. Unit tests verifying `admit_lane` blocks pod launch on `used_ratio == 1.0` (`5h_rolling` OR
-     `7d_weekly`), allows canary turn after `resets_at`, and refuses silent subscription -> API-key
-     fallback without an active `oc_controller` grant.
-  4. Unit tests verifying `/api/oauth/usage` `429` with `Retry-After: 0` engages exponential backoff
-     (`15m -> 30m -> 60m`) and never retries in a tight loop.
-  5. Unit tests verifying `oc_plan.py` emits explicit `variant:` alongside `model:` on every
-     compiled OpenCode subagent and sets `OPENCODE_DISABLE_MODELS_DEV=1`.
+  4. `PaidFallbackGrant` concurrency, abort, and restart tests proving 16 parallel requests cannot
+     overshoot `max_spend_usd`, client-side disconnect before terminal `usage` still debits a
+     conservative cost (never `$0`), and daemon restart preserves `spent_usd` + routes strictly to
+     `target_api_route_id`.
+  5. Tier 3 circuit-breaker test proving `/api/oauth/usage` `429` with `Retry-After: 0` backs off
+     (`15m -> 30m -> 60m`) without tight polling; `oc_plan.py` test verifying explicit subagent
+     `variant:` emission and `OPENCODE_DISABLE_MODELS_DEV=1`.
 
 ## Concrete gaps and checkboxes
 
-- [ ] **Gap M1.1 — Unify `/llm/*` routes onto `oc_broker_http.py`:** merge `oc_llm_broker.py`
-      routes into the shared per-job `HostHttpBrokerServer` and ensure LiteLLM UDS does not swallow
-      upstream rate-limit headers.
+- [ ] **Gap M1.1 — Unify `/llm/*` routes onto `oc_broker_http.py` with request-body egress
+      firewall:** merge `oc_llm_broker.py` routes into `HostHttpBrokerServer`, enforce per-provider
+      body allowlisting (blocking server-executed network tools, cost multipliers, and client beta
+      headers), scrub all `4xx`/`5xx` bodies, and ensure LiteLLM UDS preserves upstream rate-limit
+      headers.
 - [ ] **Gap M1.2 — Schema & compiler `model` + `variant` support (`oc_schema.py`, `oc_plan.py`):**
       add `model`/`variant` to `bundle.persona`, `bundle.subagents[]`, and `sandbox-type@1`; emit
       host-authorized `ModelCatalog` + symbolic `variants` into `/run/oc-config/opencode.json` with
       `OPENCODE_DISABLE_MODELS_DEV=1` and explicit subagent `variant:` propagation.
-- [ ] **Gap M1.3 — `QuotaLedger` & pre-dispatch `admit_lane` (`oc_quota.py`):** implement
-      $N$-window schema (`5h_rolling`, `7d_weekly`, model subcaps, `rpm`/`tpm`, `spend_cap_usd`),
-      passive header parsers, `codex app-server` `account/rateLimits/read` adapter, Tier 3
-      429-safe circuit breaker, and `oc_controller`-gated `PaidFallbackGrant`.
+- [ ] **Gap M1.3 — `QuotaLedger`, OS-confined `codex app-server`, and durable `PaidFallbackGrant`
+      (`oc_quota.py`):** implement `$STATE`-backed $N$-window telemetry (`5h_rolling`, `7d_weekly`,
+      model subcaps, `rpm`/`tpm`, `spend_cap_usd`), passive header parsers, OS-confined `codex
+      app-server` (`prd_i4` boundary), Tier 3 429-safe circuit breaker, and atomic pre-flight
+      spend reservation/reconciliation across daemon restarts.
 - [ ] **Gap M1.4 — Live SIWC 5h/7d header check & Claude Stage 0 gate ([prd_i4](prd_i4.md)):**
       verify empirically during live qualification whether `api.openai.com/v1/responses` (SIWC)
-      emits `x-codex-{primary,secondary}-*` headers or requires a host `codex app-server`
+      emits `x-codex-{primary,secondary}-*` headers or requires an OS-confined `codex app-server`
       companion; keep live Claude OAuth subscription traffic disabled fail-closed until
       [prd_i4](prd_i4.md) Stage 0 provider authorization is cleared.
