@@ -12,10 +12,23 @@ import unittest
 from unittest.mock import patch
 
 from tools.ci.run import remove_scratch, scratch_identity
-from tools.ci.supervisor import CheckError, Supervisor, child_event, signal_child, supervise
+from tools.ci.supervisor import CheckError, Supervisor, WAIT_ALL_CHILDREN, child_event, signal_child, supervise
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class OwnershipFlagsTest(unittest.TestCase):
+    def test_pidfd_check_includes_non_sigchld_children(self):
+        def waitid(_kind, _fd, flags):
+            if not flags & WAIT_ALL_CHILDREN:
+                raise ChildProcessError
+            return None
+
+        with patch.object(os, 'pidfd_open', return_value=-1), patch.object(os, 'close'), \
+                patch.object(os, 'waitid', side_effect=waitid), patch.object(signal, 'pidfd_send_signal') as send:
+            self.assertTrue(signal_child(123, signal.SIGKILL))
+            send.assert_called_once_with(-1, signal.SIGKILL)
 
 HARNESS = '''
 import sys
@@ -236,7 +249,7 @@ class SupervisorTests(unittest.TestCase):
                 patch('os.waitid', side_effect=ChildProcessError) as wait, \
                 patch('signal.pidfd_send_signal') as send:
             self.assertFalse(signal_child(123, signal.SIGTERM))
-        wait.assert_called_once_with(os.P_PIDFD, 42, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        wait.assert_called_once_with(os.P_PIDFD, 42, os.WEXITED | os.WNOHANG | os.WNOWAIT | WAIT_ALL_CHILDREN)
         close.assert_called_once_with(42)
         send.assert_not_called()
 
