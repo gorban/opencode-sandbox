@@ -26,6 +26,7 @@ import threading
 import time
 from typing import Any
 import unittest
+from unittest import mock
 
 _SPIKE_M_DIR = Path(__file__).resolve().parent
 _SPIKE_L_DIR = _SPIKE_M_DIR.parent / "l"
@@ -1909,11 +1910,8 @@ class TestRestartQualification(unittest.TestCase):
                 raise RuntimeError("cannot_start_reader_thread")
             orig_start(thread_self)
 
-        threading.Thread.start = _fail_first_thread_start  # type: ignore[method-assign]
-        try:
+        with mock.patch.object(threading.Thread, "start", _fail_first_thread_start):
             self.assertEqual(hub.dispatch_once(async_stream=True), 1)
-        finally:
-            threading.Thread.start = orig_start  # type: ignore[method-assign]
 
         self.assertTrue(hub.is_degraded)
         self.assertIn(("sb-st", "inc_st1"), hub._fenced_targets)
@@ -2034,6 +2032,140 @@ class TestRestartQualification(unittest.TestCase):
         with self.assertRaises(CoordPolicyError):
             hub_b.confirm_recovery(_OP, reason="recover_spurious_reject")
         self.assertTrue(hub_b.is_degraded)
+
+    def test_oc4_p1_1_inflight_handoff_retains_owner_cache_across_revoke_and_binding_outage(
+        self,
+    ) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-inf", "inc_inf1"): _OWNER_A})
+        reg, hub = self._open_hub(owner)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_and_grant(hub, "sb-inf", "inc_inf1")
+        hub.send(_OP, target="sb-inf", body_text="Inflight handoff across revoke + outage")
+
+        entered_p2 = threading.Event()
+        release_p2 = threading.Event()
+        self.addCleanup(release_p2.set)
+
+        def _pause_p2(_mid: str, _res: Any) -> None:
+            entered_p2.set()
+            release_p2.wait(timeout=2.0)
+
+        hub._on_post_receipt_hook = _pause_p2
+        t = threading.Thread(target=hub.dispatch_once, kwargs={"async_stream": False})
+        t.start()
+        self.assertTrue(entered_p2.wait(timeout=1.0))
+
+        # Revoke completes while dispatch is still paused in Phase 2 (no pending stream yet).
+        hub.revoke(_OP, target="sb-inf", reason="revoke_while_inflight")
+        self.assertEqual(len(owner.confirm_calls), 1)
+        self.assertIn(("sb-inf", "inc_inf1"), hub._external_owners)
+
+        # Now binding reads fail with a DB outage when the late HANDED_OFF receipt settles.
+        orig_get = reg.get_transport_binding
+
+        def _binding_outage(sb_addr: str, inc_id: str) -> dict[str, Any] | None:
+            raise sqlite3.OperationalError("binding_read_outage_post_revoke")
+
+        reg.get_transport_binding = _binding_outage  # type: ignore[method-assign]
+        try:
+            release_p2.set()
+            t.join(timeout=2.0)
+            self.assertFalse(t.is_alive())
+            self.assertGreaterEqual(len(owner.confirm_calls), 2)
+            self.assertEqual(owner.confirm_calls[-1][:3], ("sb-inf", "inc_inf1", _OWNER_A))
+        finally:
+            reg.get_transport_binding = orig_get  # type: ignore[method-assign]
+            hub._on_post_receipt_hook = None
+
+        self.assertTrue(hub._drain_pending_cleanups())
+        self.assertNotIn(("sb-inf", "inc_inf1"), hub._external_owners)
+
+    def test_oc4_p2_1_async_dispatch_applies_immediate_abort_before_reader_enters(self) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-ord", "inc_ord1"): _OWNER_A})
+        reg, hub = self._open_hub(owner)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_and_grant(hub, "sb-ord", "inc_ord1")
+        msg_id = hub.send(_OP, target="sb-ord", body_text="Abort before async reader")["msg_id"]
+
+        entered_p2 = threading.Event()
+        release_p2 = threading.Event()
+        self.addCleanup(release_p2.set)
+        order: list[str] = []
+        orig_confirm = owner.confirm_incarnation_terminal
+        orig_stream = owner.stream_events
+
+        def _trace_confirm(
+            sb_addr: str, inc_id: str, *, owner_id: str, reason: str
+        ) -> bool:
+            order.append("abort")
+            return orig_confirm(sb_addr, inc_id, owner_id=owner_id, reason=reason)
+
+        def _trace_stream(stream_id: str) -> Any:
+            order.append("stream_events")
+            return orig_stream(stream_id)
+
+        def _pause_p2(_mid: str, _res: Any) -> None:
+            entered_p2.set()
+            release_p2.wait(timeout=2.0)
+
+        owner.confirm_incarnation_terminal = _trace_confirm  # type: ignore[method-assign]
+        owner.stream_events = _trace_stream  # type: ignore[method-assign]
+        hub._on_post_receipt_hook = _pause_p2
+        t = threading.Thread(target=hub.dispatch_once, kwargs={"async_stream": True})
+        t.start()
+        self.assertTrue(entered_p2.wait(timeout=1.0))
+        hub.revoke(_OP, target="sb-ord", reason="revoke_before_async_reader")
+        order.clear()
+        release_p2.set()
+        t.join(timeout=2.0)
+        self.assertFalse(t.is_alive())
+        hub._on_post_receipt_hook = None
+        hub.dispatcher.join_streams(time.monotonic() + 2.0)
+
+        self.assertIn("abort", order)
+        if "stream_events" in order:
+            self.assertLess(order.index("abort"), order.index("stream_events"))
+        row = {r["msg_id"]: r for r in reg.list_outbox(statuses=_STATUS_ALL)}[msg_id]
+        self.assertEqual(row["status"], "aborted")
+
+    def test_oc4_p2_2_phase3_exception_schedules_cleanup_worker_before_recovery_or_close(
+        self,
+    ) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-p3", "inc_p3_1"): _OWNER_A})
+        reg, hub = self._open_hub(owner)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_and_grant(hub, "sb-p3", "inc_p3_1")
+        hub.send(_OP, target="sb-p3", body_text="Phase 3 persistence exception")
+
+        orig_dispatch = owner.dispatch_turn
+        orig_uncertain = reg.mark_outbox_uncertain
+
+        def _raise_dispatch(turn: Any) -> Any:
+            raise RuntimeError("phase2_transport_boom")
+
+        def _raise_uncertain(msg_id: str, *, detail: str) -> None:
+            raise sqlite3.OperationalError("phase3_uncertain_persist_boom")
+
+        owner.dispatch_turn = _raise_dispatch  # type: ignore[method-assign]
+        reg.mark_outbox_uncertain = _raise_uncertain  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                hub.dispatch_once(async_stream=False)
+        finally:
+            owner.dispatch_turn = orig_dispatch  # type: ignore[method-assign]
+            reg.mark_outbox_uncertain = orig_uncertain  # type: ignore[method-assign]
+
+        # Background cleanup retry worker MUST be scheduled and perform exact-owner confirmation
+        # BEFORE any explicit confirm_recovery() or close() call.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not owner.confirm_calls:
+            time.sleep(0.02)
+        self.assertTrue(
+            any(c[0] == "sb-p3" and c[1] == "inc_p3_1" and c[2] == _OWNER_A for c in owner.confirm_calls)
+        )
 
 
 if __name__ == "__main__":

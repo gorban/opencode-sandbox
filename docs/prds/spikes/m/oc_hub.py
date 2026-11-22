@@ -1519,10 +1519,22 @@ class CoordHub:
                 _REASON_HANDOFF_PERSIST_FAILED,
                 _REASON_RECOVERY_RETIRED,
                 _REASON_STREAM_START_FAILED,
+                _ERR_PHASE3_SETTLEMENT,
             ):
                 self._stream_authorities.pop(sid, None)
                 self._stream_abort_reasons.pop(sid, None)
         return not any(
+            dst_addr == sb_addr and dst_inc == inc_id
+            for dst_addr, dst_inc, _st_reason in self._pending_cleanup_streams.values()
+        )
+
+    def _has_inflight_or_pending_streams_locked(self, sb_addr: str, inc_id: str) -> bool:
+        if any(
+            inf.dst_addr == sb_addr and inf.dst_incarnation == inc_id
+            for inf in self._inflight_handoffs.values()
+        ):
+            return True
+        return any(
             dst_addr == sb_addr and dst_inc == inc_id
             for dst_addr, dst_inc, _st_reason in self._pending_cleanup_streams.values()
         )
@@ -1540,10 +1552,11 @@ class CoordHub:
         )
         if all_settled:
             self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
-            self._external_owners.pop((sb_addr, inc_id), None)
-            known = self._known_incarnations.get(sb_addr)
-            if known is not None:
-                known.discard(inc_id)
+            if not self._has_inflight_or_pending_streams_locked(sb_addr, inc_id):
+                self._external_owners.pop((sb_addr, inc_id), None)
+                known = self._known_incarnations.get(sb_addr)
+                if known is not None:
+                    known.discard(inc_id)
         return all_settled
 
     def _drain_pending_cleanup_incarnations(self) -> None:
@@ -1575,6 +1588,7 @@ class CoordHub:
             _REASON_RECOVERY_RETIRED,
             _REASON_HANDOFF_PERSIST_FAILED,
             _REASON_STREAM_START_FAILED,
+            _ERR_PHASE3_SETTLEMENT,
             _STATUS_REVOKED,
         ):
             return False
@@ -1609,6 +1623,7 @@ class CoordHub:
                         _REASON_HANDOFF_PERSIST_FAILED,
                         _REASON_RECOVERY_RETIRED,
                         _REASON_STREAM_START_FAILED,
+                        _ERR_PHASE3_SETTLEMENT,
                     ):
                         self._stream_authorities.pop(sid, None)
                         self._stream_abort_reasons.pop(sid, None)
@@ -3884,6 +3899,17 @@ class CoordHub:
         turn = self._build_turn_dispatch(env, edge, grant_gen)
         return env, turn, inflight, start_rec_gen
 
+    def _maybe_evict_settled_owner_locked(self, sb_addr: str, inc_id: str) -> None:
+        if (
+            (sb_addr, inc_id) in self._fenced_targets
+            and (sb_addr, inc_id) not in self._pending_cleanup_incarnations
+            and not self._has_inflight_or_pending_streams_locked(sb_addr, inc_id)
+        ):
+            self._external_owners.pop((sb_addr, inc_id), None)
+            known = self._known_incarnations.get(sb_addr)
+            if known is not None:
+                known.discard(inc_id)
+
     def _release_inflight_owner(
         self,
         env: Envelope,
@@ -3909,6 +3935,13 @@ class CoordHub:
             if self._inflight_handoffs.get(env.msg_id) is inflight:
                 self._inflight_handoffs.pop(env.msg_id, None)
                 self._inflight_cond.notify_all()
+            if settled:
+                self._maybe_evict_settled_owner_locked(env.dst_addr, env.dst_incarnation)
+        if not settled:
+            try:
+                self._ensure_cleanup_retry_worker()
+            except Exception:
+                pass
 
     def _settle_recovery_rotated_result_locked(
         self,
@@ -4009,11 +4042,9 @@ class CoordHub:
                         pop_inflight=False,
                     )
                 settled = True
-                if not async_stream:
-                    with self._meta_lock:
-                        if self._inflight_handoffs.get(env.msg_id) is inflight:
-                            self._inflight_handoffs.pop(env.msg_id, None)
-                            self._inflight_cond.notify_all()
+                if stream_task is None and immediate_abort is None:
+                    self._pop_inflight_exact(env.msg_id, inflight)
+            self._apply_immediate_stream_abort(env, immediate_abort)
             if async_stream and stream_task is not None:
                 self._start_async_stream_with_cleanup(env, returned_stream_id, stream_task)
         finally:
@@ -4021,12 +4052,17 @@ class CoordHub:
                 env, inflight, settled=settled, returned_stream_id=returned_stream_id
             )
 
-        self._apply_immediate_stream_abort(env, immediate_abort)
         if not async_stream:
             self._run_stream_task(
                 env, returned_stream_id, stream_task, async_stream=False
             )
         return True
+
+    def _pop_inflight_exact(self, msg_id: str, inflight: _InflightAuth) -> None:
+        with self._meta_lock:
+            if self._inflight_handoffs.get(msg_id) is inflight:
+                self._inflight_handoffs.pop(msg_id, None)
+                self._inflight_cond.notify_all()
 
     def _dispatch_single_row(self, row: dict[str, Any], *, async_stream: bool) -> bool:
         edge_id = str(row["edge_id"])
@@ -4458,26 +4494,41 @@ class CoordHub:
         self._notify_waiters()
         return cap_reason
 
-    def _consume_stream(self, env: Envelope, stream_id: str) -> None:
+    def _get_pre_entry_stream_abort(self, stream_id: str) -> str | None:
+        with self._meta_lock:
+            pre_entry_abort = self._stream_abort_reasons.get(stream_id)
+            if pre_entry_abort is None or stream_id in self._pending_cleanup_streams:
+                return None
+            return pre_entry_abort
+
+    def _iterate_stream_events(
+        self, env: Envelope, stream_id: str
+    ) -> tuple[bool, str | None]:
         total_seen = 0
+        saw_completed = False
+        for raw_ev in self._transport.stream_events(stream_id):
+            pre_abort = self._get_stream_abort_reason(stream_id)
+            if pre_abort is not None:
+                return saw_completed, pre_abort
+            if total_seen >= MAX_TURN_STREAM_EVENTS:
+                return saw_completed, self._record_stream_cap_event(env, stream_id)
+            total_seen += 1
+            done, err_reason = self._process_single_stream_event(env, stream_id, raw_ev)
+            if done:
+                saw_completed = True
+            if err_reason is not None:
+                return saw_completed, err_reason
+        return saw_completed, None
+
+    def _consume_stream(self, env: Envelope, stream_id: str) -> None:
         saw_completed = False
         abort_reason: str | None = None
         try:
-            for raw_ev in self._transport.stream_events(stream_id):
-                pre_abort = self._get_stream_abort_reason(stream_id)
-                if pre_abort is not None:
-                    abort_reason = pre_abort
-                    break
-                if total_seen >= MAX_TURN_STREAM_EVENTS:
-                    abort_reason = self._record_stream_cap_event(env, stream_id)
-                    break
-                total_seen += 1
-                done, err_reason = self._process_single_stream_event(env, stream_id, raw_ev)
-                if done:
-                    saw_completed = True
-                if err_reason is not None:
-                    abort_reason = err_reason
-                    break
+            pre_entry_abort = self._get_pre_entry_stream_abort(stream_id)
+            if pre_entry_abort is not None:
+                abort_reason = pre_entry_abort
+            else:
+                saw_completed, abort_reason = self._iterate_stream_events(env, stream_id)
         except Exception as exc:
             abort_reason = "stream_exception"
             self._registry.append_audit(
