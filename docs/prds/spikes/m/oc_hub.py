@@ -4494,10 +4494,6 @@ class CoordHub:
         self._notify_waiters()
         return cap_reason
 
-    def _get_pre_entry_stream_abort(self, stream_id: str) -> str | None:
-        with self._meta_lock:
-            return self._stream_abort_reasons.get(stream_id)
-
     def _iterate_stream_events(
         self, env: Envelope, stream_id: str
     ) -> tuple[bool, str | None]:
@@ -4521,7 +4517,7 @@ class CoordHub:
         saw_completed = False
         abort_reason: str | None = None
         try:
-            pre_entry_abort = self._get_pre_entry_stream_abort(stream_id)
+            pre_entry_abort = self._get_stream_abort_reason(stream_id)
             if pre_entry_abort is not None:
                 abort_reason = pre_entry_abort
             else:
