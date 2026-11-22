@@ -348,7 +348,7 @@ def write_back(entry, source, session_fd):
         try:
             copy_stable_file(source, out, MAX_FILE)
             if SELINUX_LEVEL is not None:
-                if not re.fullmatch(r"s0:c[0-9]+,c[0-9]+", SELINUX_LEVEL):
+                if not re.fullmatch(r"s0:c\d+,c\d+", SELINUX_LEVEL, flags=re.ASCII):
                     raise Refused("invalid configured bridge SELinux level")
                 context = f"system_u:object_r:container_file_t:{SELINUX_LEVEL}"
                 os.setxattr(out, "security.selinux", context.encode("ascii"))
