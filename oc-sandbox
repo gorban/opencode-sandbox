@@ -616,6 +616,7 @@ instance_pods() {
 }
 
 if (( LIST )); then
+  pods=$(instance_pods) || die "could not list instance pods"
   printf '%-14s %-10s %-8s %-22s %-24s %s\n' INSTANCE POD AGENT PORTS "WORKING DIR" SIDECARS
   while read -r pod; do
     [[ -n $pod ]] || continue
@@ -641,7 +642,7 @@ if (( LIST )); then
     fi
     printf '%-14s %-10s %-8s %-22s %-24s %s%s\n' "$inst" "$pod" "$(cstate "$AGENT")" \
       "$(sed 's/:/->/g' <<<"${ports:--}")" "${wd:--}" "${side:--}" "$wt_info"
-  done < <(instance_pods)
+  done <<<"$pods"
   exit 0
 fi
 if (( EXEC )); then
@@ -723,6 +724,20 @@ remove_pod() {
   pm pod exists "$1" || rc=$?
   (( rc == 1 ))
 }
+remove_instance_storage() {
+  local kind=$1 name=$2 rc=0
+  shift 2
+  pm "$kind" exists "$name" || rc=$?
+  case $rc in
+    1) return 0 ;;
+    0) ;;
+    *) return 1 ;;
+  esac
+  pm "$kind" rm "$@" "$name" >/dev/null || return 1
+  rc=0
+  pm "$kind" exists "$name" || rc=$?
+  (( rc == 1 ))
+}
 stop_bridge() {
   local unit state
   for unit in oc-bridge.path oc-bridge.service; do
@@ -766,8 +781,14 @@ if (( DELETE )); then
     remove_pod "$POD" || die "could not verify that pod '$POD' was removed"
     if (( ALL )); then
       if confirm "Also delete volumes $CHROMEVOL $PGVOL $DINDVOL $DINDRUN (Chromium profile, Postgres data, docker storage)?"; then
-        for v in "$CHROMEVOL" "$PGVOL" "$DINDVOL" "$DINDRUN"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
-        pm secret rm "$PGSECRET" "$PGPASSSECRET" "$PGHBASECRET" >/dev/null 2>&1 || true
+        purge_failed=0
+        for v in "$CHROMEVOL" "$PGVOL" "$DINDVOL" "$DINDRUN"; do
+          remove_instance_storage volume "$v" -f || { echo "could not verify removal of volume '$v'" >&2; purge_failed=1; }
+        done
+        for s in "$PGSECRET" "$PGPASSSECRET" "$PGHBASECRET"; do
+          remove_instance_storage secret "$s" || { echo "could not verify removal of secret '$s'" >&2; purge_failed=1; }
+        done
+        (( purge_failed == 0 )) || die "instance storage cleanup incomplete; worktree selection retained"
         worktree_state drop "$ILABEL" || die "could not clear the worktree selection for '$ILABEL'"
       else echo "Skipped -a part."; fi
     fi

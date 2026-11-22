@@ -527,8 +527,14 @@ case "\$1 \$2" in
       fi
     done ;;
   "pod exists")
+    [ -n "\${STUB_POD_EXISTS_FAIL:-}" ] && exit 125
     if [ -z "\${STUB_POD_REMAINS:-}" ] && grep -Fqx "podman pod rm --ignore -f -- \$3" "$T/stub.log"; then exit 1; fi ;;
   "pod rm") [ -n "\${STUB_POD_REMOVE_FAIL:-}" ] && exit 125 ;;
+  "volume exists"|"secret exists")
+    if grep -Fqx "podman \$1 rm \$3" "$T/stub.log" || \
+       grep -Fqx "podman \$1 rm -f \$3" "$T/stub.log"; then exit 1; fi ;;
+  "volume rm") [ "\${STUB_VOLUME_REMOVE_FAIL:-}" = "\${4:-}" ] && exit 125 ;;
+  "secret rm") [ "\${STUB_SECRET_REMOVE_FAIL:-}" = "\${3:-}" ] && exit 125 ;;
   "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
   "image inspect")  # STUB_IDS="name=id ...": the image each tag points to; images have no tags left
     case "\$*" in *RepoTags*) echo 0; exit 0 ;; esac
@@ -652,9 +658,17 @@ for fault in STUB_LIST_PODS_FAIL STUB_POD_REMOVE_FAIL STUB_POD_REMAINS STUB_BRID
 done
 mkdir -m 700 -p "$DSTATE/worktrees"
 (umask 077; printf 'wt/repo/other\nrepo\nother\n' > "$DSTATE/worktrees/other")
+for fault in STUB_VOLUME_REMOVE_FAIL=oc-other-pg STUB_SECRET_REMOVE_FAIL=oc-other-pg-password; do
+  out=$(pathrun "$fault" -- -i other -d -a -y)
+  check "partial instance purge ($fault) reports failure" grep -q 'instance storage cleanup incomplete' <<<"$out"
+  check "partial instance purge ($fault) retains selection" test -f "$DSTATE/worktrees/other"
+done
 out=$(pathrun -- -i other -d -a -y)
 check 'instance -d -a clears only the stale selection record' test ! -e "$DSTATE/worktrees/other"
 check 'clearing the selection record succeeds' grep -qx 'rc=0' <<<"$out"
+out=$(pathrun STUB_POD_EXISTS_FAIL=1 -- -l)
+check 'instance listing reports incomplete inventory' grep -q 'could not list instance pods' <<<"$out"
+check 'instance listing prints no successful table on inventory failure' ! grep -q '^INSTANCE' <<<"$out"
 for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_FAIL=1" \
             "secrets present:STUB_SECRETS=oc-pg-password\\nother\\noc-x-pg-password\\n"; do
   name=${case%%:*} envset=${case#*:}

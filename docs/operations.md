@@ -123,6 +123,9 @@ oc-sandbox -l                               # what is running
 
 ## Uninstall
 
+A named `-d -a` clears the saved worktree selection after the instance's volumes and secrets
+are confirmed absent. If storage cleanup fails, the selection is retained for retry.
+
 Global `-d -a` deletes OpenCode login and sessions, Chromium profiles, Postgres data and
 Docker-in-Docker storage. It removes `~/opencode-sandbox/.bridge/` with its queued requests and
 copies. If any editor staging directories remain in `bridge-stage/`, teardown stops
