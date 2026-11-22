@@ -23,7 +23,7 @@ from oc_workflow_plan import (
     compile_workflow_plan,
     evaluate_admission,
 )
-from oc_workflow_schema import ExcerptDisclosureSpec, parse_and_validate_workflow_toml
+from oc_workflow_schema import ExcerptDisclosureSpec, WorkflowSpec, parse_and_validate_workflow_toml
 from oc_workflow_supervision import (
     BlindCheckResponse,
     BlindToolCall,
@@ -171,6 +171,11 @@ class TestSupervisionCore(unittest.TestCase):
         lanes.attach(self.target, receipt=receipt, authority_store=store, clock=self._clock())
         replay_registry = ReplayGrantRegistry()
         ledger = CalibrationLedger()
+        fleet_budget = FleetCheckBudget(
+            max_concurrent=fleet_max_concurrent,
+            max_checks_per_hour=fleet_max_hr,
+            reserved_audit_checks_per_hour=fleet_audit_hr,
+        )
         d_adapter = decisions_adapter or LocalRulesDecisionsAdapter()
         b_verifier = blind_verifier or ScriptedBlindVerifier()
         gate = SupervisionBrokerGate(
@@ -181,6 +186,7 @@ class TestSupervisionCore(unittest.TestCase):
             lease_registry=lanes,
             ledger=ledger,
             model_catalog=self.catalog,
+            fleet_budget=fleet_budget,
             replay_registry=replay_registry,
         )
         ctx = SupervisionRunContext(
@@ -188,11 +194,7 @@ class TestSupervisionCore(unittest.TestCase):
             plan=plan,
             authority_store=store,
             broker_gate=gate,
-            fleet_budget=FleetCheckBudget(
-                max_concurrent=fleet_max_concurrent,
-                max_checks_per_hour=fleet_max_hr,
-                reserved_audit_checks_per_hour=fleet_audit_hr,
-            ),
+            fleet_budget=fleet_budget,
             lease_registry=lanes,
             ledger=ledger,
         )
@@ -237,6 +239,7 @@ class TestSupervisionCore(unittest.TestCase):
         d_adapter2 = LocalRulesDecisionsAdapter()
         b_verifier2 = ScriptedBlindVerifier()
         ledger2 = CalibrationLedger()
+        fleet2 = FleetCheckBudget(max_concurrent=2, max_checks_per_hour=30, reserved_audit_checks_per_hour=8)
         gate2 = SupervisionBrokerGate(
             decisions_adapter=d_adapter2,
             blind_verifier=b_verifier2,
@@ -245,6 +248,7 @@ class TestSupervisionCore(unittest.TestCase):
             lease_registry=h.ctx.lease_registry,
             ledger=ledger2,
             model_catalog=self.catalog,
+            fleet_budget=fleet2,
             replay_registry=h.replay_registry,
         )
         ctx2 = SupervisionRunContext(
@@ -252,7 +256,7 @@ class TestSupervisionCore(unittest.TestCase):
             plan=h.ctx.plan,
             authority_store=h.ctx.authority_store,
             broker_gate=gate2,
-            fleet_budget=FleetCheckBudget(max_concurrent=2, max_checks_per_hour=30, reserved_audit_checks_per_hour=8),
+            fleet_budget=fleet2,
             lease_registry=h.ctx.lease_registry,
             ledger=ledger2,
         )
@@ -883,7 +887,7 @@ class TestSupervisionCore(unittest.TestCase):
             run_id=receipt2.run_id, target=lane2, stratum="triggered_leading", outcome="cap_dropped"
         )
         ledger.record_abstention(
-            run_id=receipt2.run_id, target=lane2, stratum="triggered_leading", source="system1"
+            run_id=receipt2.run_id, target=lane2, stratum="triggered_leading", source="sys1"
         )
         ledger.record_outcome(
             CalibrationRecord(
@@ -994,6 +998,272 @@ class TestSupervisionCore(unittest.TestCase):
         self.assertEqual(notes["sys1_abstentions"], 0)
         self.assertEqual(notes["blind_abstentions"], 0)
         self.assertEqual(notes["inclusion_rate"], 1.0)
+
+    def test_broker_owned_fleet_budget_post_entry_budget_error_and_interrupt(self) -> None:
+        # Post-entry BudgetExhaustedError from verifier MUST NOT refund hourly slot or swallow as tier0 fallback!
+        def raise_budget(_payload: bytes) -> None:
+            raise BudgetExhaustedError("upstream provider quota")
+
+        h_budget = self._setup_run(
+            blind_verifier=ScriptedBlindVerifier(on_call=raise_budget),
+            fleet_max_concurrent=1,
+            fleet_max_hr=1,
+            fleet_audit_hr=0,
+        )
+        snap = _snapshot(self.target)
+        snap_fn = lambda _t: snap
+        with self.assertRaises(BudgetExhaustedError):
+            process_supervision_tick(
+                h_budget.ctx, h_budget.lane_state, snap_fn, self._clock, sleep_detector=h_budget.sleep
+            )
+        self.assertEqual(h_budget.ctx.fleet_budget.active_count, 0)
+        res_after = process_supervision_tick(
+            h_budget.ctx, LaneSupervisionState(target=self.target), snap_fn, self._clock,
+            sleep_detector=HostSleepDetector(),
+        )
+        self.assertEqual(res_after.status, "triggered_leading_cap_dropped")
+
+        # Post-entry BaseException (KeyboardInterrupt) releases concurrency in finally and retains hourly slot!
+        def raise_interrupt(_payload: bytes) -> None:
+            raise KeyboardInterrupt("simulated interrupt")
+
+        h_int = self._setup_run(
+            blind_verifier=ScriptedBlindVerifier(on_call=raise_interrupt),
+            fleet_max_concurrent=1,
+            fleet_max_hr=1,
+            fleet_audit_hr=0,
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            process_supervision_tick(
+                h_int.ctx, h_int.lane_state, snap_fn, self._clock, sleep_detector=h_int.sleep
+            )
+        self.assertEqual(h_int.ctx.fleet_budget.active_count, 0)
+        res_int_after = process_supervision_tick(
+            h_int.ctx, LaneSupervisionState(target=self.target), snap_fn, self._clock,
+            sleep_detector=HostSleepDetector(),
+        )
+        self.assertEqual(res_int_after.status, "triggered_leading_cap_dropped")
+
+    def test_replay_single_ledger_duplicate_id_workflow_binding_and_rubric_recompute(self) -> None:
+        d_adapter = LocalRulesDecisionsAdapter([DecisionsAdapterResponse(choice="healthy_progress")])
+        h = self._setup_run(decisions_adapter=d_adapter)
+        plan = h.ctx.plan
+        store = h.ctx.authority_store
+        receipt = h.ctx.receipt
+        ledger = h.ctx.ledger
+        empty_sub: frozenset[str] = frozenset()
+        now_t = self._clock()
+
+        rec_broker = CalibrationRecord(
+            sample_id="s_dup_1",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            target=self.target,
+            stratum="triggered_leading",
+            frozen_snapshot=_snapshot(self.target, stall_s=0, errors=0),
+            sys1_verdict="stalled_loop",
+            blind_tool="health_record_ok",
+            confusion_outcome="FP",
+        )
+        ledger.record_outcome(rec_broker)
+        # Duplicate sample_id replacement in CalibrationLedger fails closed!
+        with self.assertRaises(SupervisionError):
+            ledger.record_outcome(rec_broker)
+
+        # Two-ledger fixture with distinct benign verdict fails BEFORE any adapter invocation!
+        other_ledger = CalibrationLedger()
+        other_ledger.record_outcome(
+            CalibrationRecord(
+                sample_id="s_dup_1",
+                run_id=receipt.run_id,
+                workflow_id=plan.spec.id,
+                target=self.target,
+                stratum="triggered_leading",
+                frozen_snapshot=_snapshot(self.target, stall_s=0, errors=0),
+                sys1_verdict="healthy_progress",
+                blind_tool="health_record_ok",
+                confusion_outcome="TN",
+            )
+        )
+        grant = CalibrationReplayGrant(
+            grant_id="replay_single_src",
+            requesting_principal="op-1",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            candidate_spec_digest=plan.spec_digest,
+            candidate_rubric_digest=plan.candidate_rubric_digest or "",
+            authorized_sample_scope=frozenset({"triggered_leading"}),
+            approved_decisions_route="decisions:local-rules-v1",
+            approved_model="local-rules-v1",
+            excerpt_disclosure_policy=ExcerptDisclosureSpec(mode="none"),
+            max_replay_samples=5,
+            max_replay_calls=5,
+            max_replay_spend_microusd=10_000,
+            expires_at_wall_s=2000.0,
+        )
+        h.replay_registry.register(grant)
+        with self.assertRaises(ReplayAuthorizationError):
+            run_calibration_replay(
+                grant.grant_id, plan, ["s_dup_1"], other_ledger,
+                authority_store=store, replay_registry=h.replay_registry, broker_gate=h.ctx.broker_gate,
+                model_catalog=self.catalog,
+                caller_id="op-1", caller_role="operator", caller_subtree=empty_sub,
+                clock_provider=self._clock,
+            )
+
+        # Sample whose workflow_id disagrees with grant.workflow_id fails BEFORE invocation!
+        rec_wrong_wf = CalibrationRecord(
+            sample_id="s_wrong_wf",
+            run_id=receipt.run_id,
+            workflow_id="builtin/other-supervisor",
+            target=self.target,
+            stratum="triggered_leading",
+            frozen_snapshot=_snapshot(self.target, stall_s=0, errors=0),
+            sys1_verdict="stalled_loop",
+            blind_tool="health_record_ok",
+            confusion_outcome="FP",
+        )
+        ledger.record_outcome(rec_wrong_wf)
+        with self.assertRaises(ReplayAuthorizationError):
+            h.ctx.broker_gate.invoke_decisions_replay(
+                grant_id=grant.grant_id,
+                candidate_plan=plan,
+                sample_id=rec_wrong_wf.sample_id,
+                caller_id="op-1",
+                caller_role="operator",
+                caller_subtree=empty_sub,
+                clock=now_t,
+            )
+
+        # Forged cached candidate_rubric_digest fails replay even when grant carries the forged digest!
+        forged_digest = "f" * 64
+        forged_spec = WorkflowSpec(**{**plan.spec.__dict__, "candidate_rubric_digest": forged_digest})
+        forged_plan = CompiledWorkflowPlan(**{**plan.__dict__, "spec": forged_spec})
+        grant_forged = CalibrationReplayGrant(
+            grant_id="replay_forged_rubric",
+            requesting_principal="op-1",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            candidate_spec_digest=plan.spec_digest,
+            candidate_rubric_digest=forged_digest,
+            authorized_sample_scope=frozenset({"triggered_leading"}),
+            approved_decisions_route="decisions:local-rules-v1",
+            approved_model="local-rules-v1",
+            excerpt_disclosure_policy=ExcerptDisclosureSpec(mode="none"),
+            max_replay_samples=5,
+            max_replay_calls=5,
+            max_replay_spend_microusd=10_000,
+            expires_at_wall_s=2000.0,
+        )
+        h.replay_registry.register(grant_forged)
+        with self.assertRaises(ReplayAuthorizationError):
+            h.ctx.broker_gate.invoke_decisions_replay(
+                grant_id=grant_forged.grant_id,
+                candidate_plan=forged_plan,
+                sample_id=rec_broker.sample_id,
+                caller_id="op-1",
+                caller_role="operator",
+                caller_subtree=empty_sub,
+                clock=now_t,
+            )
+        self.assertEqual(d_adapter.invocation_count, 0)
+        self.assertEqual(h.replay_registry.usage(grant.grant_id), (0, 0))
+        self.assertEqual(h.replay_registry.usage(grant_forged.grant_id), (0, 0))
+
+    def test_opted_in_excerpt_forces_canary_question_on_live_and_replay_payloads(self) -> None:
+        opt_in_toml = _supervisor_toml(
+            extra_supervision=(
+                'excerpt_disclosure = "opt_in"\n'
+                '[supervision.excerpt_disclosure]\n'
+                'source = "sanitized_last_error_excerpt"\n'
+                'max_bytes = 256\n'
+                'allowed_routes = ["decisions:local-rules-v1"]\n'
+                'permitted_uses = ["live", "replay"]\n'
+            )
+        ).replace("canary_injection_question = true", "canary_injection_question = false")
+        plan = compile_workflow_plan(
+            opt_in_toml, is_builtin=True, skill_root=self.skill_root, model_catalog=self.catalog
+        )
+        store = RunAuthorityStore()
+        store.register_active_incarnation(self.target)
+        now_t = self._clock()
+        empty_sub: frozenset[str] = frozenset()
+        receipt = evaluate_admission(
+            plan, store, principal_id="op-1", caller_role="operator",
+            caller_subtree=empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=now_t,
+        )
+        lanes = LaneLeaseRegistry()
+        lanes.attach(self.target, receipt=receipt, authority_store=store, clock=now_t)
+        ledger = CalibrationLedger()
+        replay_registry = ReplayGrantRegistry()
+        d_adapter = LocalRulesDecisionsAdapter()
+        gate = SupervisionBrokerGate(
+            decisions_adapter=d_adapter,
+            blind_verifier=ScriptedBlindVerifier(),
+            canary_scanner=OverlapCanaryScanner(),
+            authority_store=store,
+            lease_registry=lanes,
+            ledger=ledger,
+            model_catalog=self.catalog,
+            replay_registry=replay_registry,
+        )
+
+        # Live direct broker call with include_canary_question=False MUST still attach canary_question!
+        live_snap = _snapshot(self.target, excerpt="lint step timed out")
+        gate.invoke_decisions_live(
+            receipt=receipt,
+            target=self.target,
+            snapshot=live_snap,
+            include_canary_question=False,
+            metrics_only_override=False,
+            clock=now_t,
+        )
+        live_payload = json.loads(d_adapter.payload_history[0].decode("utf-8"))
+        self.assertEqual(live_payload["sanitized_last_error_excerpt"], "lint step timed out")
+        self.assertEqual(live_payload["canary_question"], "noul(classifier_injection_suspected)")
+
+        # Replay call with canary_injection_question=False in TOML MUST still attach canary_question!
+        rec_replay = CalibrationRecord(
+            sample_id="s_excerpt_replay",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            target=self.target,
+            stratum="triggered_leading",
+            frozen_snapshot=_snapshot(self.target, excerpt="build exited 1"),
+            sys1_verdict="stalled_loop",
+            blind_tool="health_record_ok",
+            confusion_outcome="FP",
+        )
+        ledger.record_outcome(rec_replay)
+        grant = CalibrationReplayGrant(
+            grant_id="replay_opt_in_canary",
+            requesting_principal="op-1",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            candidate_spec_digest=plan.spec_digest,
+            candidate_rubric_digest=plan.candidate_rubric_digest or "",
+            authorized_sample_scope=frozenset({"triggered_leading"}),
+            approved_decisions_route="decisions:local-rules-v1",
+            approved_model="local-rules-v1",
+            excerpt_disclosure_policy=plan.spec.excerpt_disclosure,
+            max_replay_samples=5,
+            max_replay_calls=5,
+            max_replay_spend_microusd=10_000,
+            expires_at_wall_s=2000.0,
+        )
+        replay_registry.register(grant)
+        gate.invoke_decisions_replay(
+            grant_id=grant.grant_id,
+            candidate_plan=plan,
+            sample_id=rec_replay.sample_id,
+            caller_id="op-1",
+            caller_role="operator",
+            caller_subtree=empty_sub,
+            clock=now_t,
+        )
+        replay_payload = json.loads(d_adapter.payload_history[1].decode("utf-8"))
+        self.assertEqual(replay_payload["sanitized_last_error_excerpt"], "build exited 1")
+        self.assertEqual(replay_payload["canary_question"], "noul(classifier_injection_suspected)")
 
 
 if __name__ == "__main__":

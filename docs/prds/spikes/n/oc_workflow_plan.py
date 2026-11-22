@@ -18,6 +18,7 @@ from oc_workflow_schema import (
     SPEC_DIGEST_DOMAIN,
     WorkflowSpec,
     canonical_json_bytes,
+    compute_rubric_digest,
     domain_sha256,
     parse_and_validate_workflow_toml,
 )
@@ -218,10 +219,12 @@ def recompute_plan_digests(plan: CompiledWorkflowPlan) -> tuple[str, str, str]:
 
 
 def _verify_plan_binding(plan: CompiledWorkflowPlan) -> tuple[str, str, str]:
-    """Verify plan wrapper fields agree with spec and recomputed digests."""
+    """Verify plan wrapper fields and rubric digest agree with spec and recomputed digests."""
     spec_d, skill_d, plan_d = recompute_plan_digests(plan)
     if (spec_d, skill_d, plan_d) != (plan.spec_digest, plan.skill_sha256, plan.workflow_plan_digest):
         raise AdmissionDeniedError("PLAN_INTEGRITY_MISMATCH")
+    if plan.spec.candidate_rubric_digest != compute_rubric_digest(plan.spec):
+        raise AdmissionDeniedError("PLAN_RUBRIC_DIGEST_MISMATCH")
     if plan.reachable_effects != compute_reachable_effects(plan.spec):
         raise AdmissionDeniedError("PLAN_REACHABLE_EFFECTS_MISMATCH")
     if (plan.skill_namespace, plan.skill_slug) != (plan.spec.skill_namespace, plan.spec.skill_slug):
@@ -867,6 +870,8 @@ class RunAuthorityStore:
         cost_microusd: int,
         clock: ClockSnapshot,
     ) -> bool:
+        if type(calls) is not int or calls <= 0 or type(cost_microusd) is not int or cost_microusd < 0:
+            raise AuthorityError("decisions reservation calls must be positive int and cost non-negative int")
         record = self.verify_active(receipt, clock=clock)
         acct = self._get_accounting(record.run_id, record.grant_generation)
         cutoff = clock.monotonic_s - 3600.0
@@ -882,6 +887,8 @@ class RunAuthorityStore:
         return True
 
     def can_afford_blind(self, receipt: AdmissionReceipt, *, cost_microusd: int, clock: ClockSnapshot) -> bool:
+        if type(cost_microusd) is not int or cost_microusd < 0:
+            raise AuthorityError("blind cost_microusd must be a non-negative int")
         record = self.verify_active(receipt, clock=clock)
         acct = self._get_accounting(record.run_id, record.grant_generation)
         return acct.blind_spend_microusd_used + cost_microusd <= acct.max_blind_spend_microusd
@@ -893,6 +900,8 @@ class RunAuthorityStore:
         cost_microusd: int,
         clock: ClockSnapshot,
     ) -> bool:
+        if type(cost_microusd) is not int or cost_microusd < 0:
+            raise AuthorityError("blind cost_microusd must be a non-negative int")
         record = self.verify_active(receipt, clock=clock)
         acct = self._get_accounting(record.run_id, record.grant_generation)
         if acct.blind_spend_microusd_used + cost_microusd > acct.max_blind_spend_microusd:

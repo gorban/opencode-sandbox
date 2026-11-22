@@ -1287,6 +1287,13 @@ def _parse_workflow_header(doc: Mapping[str, Any], *, is_builtin: bool) -> dict[
     }
 
 
+def compute_rubric_digest(spec: WorkflowSpec) -> str | None:
+    """Recompute the domain-separated candidate_rubric_digest directly from spec.system1."""
+    if spec.system1 is None:
+        return None
+    return domain_sha256(RUBRIC_DIGEST_DOMAIN, spec.system1.rubric_payload())
+
+
 def parse_and_validate_workflow_toml(
     raw_toml: str,
     *,

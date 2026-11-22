@@ -35,6 +35,7 @@ from oc_workflow_schema import (
     PredicateValidationError,
     TemplateValidationError,
     WorkflowSchemaError,
+    WorkflowSpec,
     compile_predicate,
     compute_security_delta,
     evaluate_predicate,
@@ -435,12 +436,33 @@ class TestWorkflowSchemaAndAst(unittest.TestCase):
         )
 
 
-def _trusted_temp_dir() -> tempfile.TemporaryDirectory[str]:
-    """Create a disposable tempdir inside a private owner-owned 0o700 cache directory."""
-    base = Path.home().resolve() / ".cache" / "oc-sandbox-spike-n-tests"
-    base.mkdir(parents=True, exist_ok=True)
-    os.chmod(base, 0o700)
-    return tempfile.TemporaryDirectory(dir=str(base))
+def _verify_private_dir_nofollow(path: Path, *, require_private_mode: bool) -> None:
+    """Atomically create path (0o700) if absent or verify existing dir via O_NOFOLLOW without chmod."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise PermissionError(f"untrusted directory owner/type: {path}")
+        bad_mask = 0o077 if require_private_mode else 0o022
+        if (st.st_mode & bad_mask) != 0:
+            raise PermissionError(f"untrusted directory mode {oct(stat.S_IMODE(st.st_mode))}: {path}")
+    finally:
+        os.close(fd)
+
+
+def _trusted_temp_dir(cache_base: Path | None = None) -> tempfile.TemporaryDirectory[str]:
+    """Create a disposable 0o700 tempdir without ever calling chmod on a pre-existing directory."""
+    if cache_base is None:
+        home = Path.home().resolve()
+        cache_root = home / ".cache"
+        _verify_private_dir_nofollow(cache_root, require_private_mode=False)
+        cache_base = cache_root / "oc-sandbox-spike-n-tests"
+    _verify_private_dir_nofollow(cache_base, require_private_mode=True)
+    return tempfile.TemporaryDirectory(dir=str(cache_base))
 
 
 class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
@@ -845,6 +867,16 @@ class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
             )
         self.assertEqual(list(self.staging.iterdir()), [])
 
+        # Forged cached candidate_rubric_digest on spec fails admission BEFORE minting a receipt!
+        forged_rubric_spec = WorkflowSpec(**{**p_sup.spec.__dict__, "candidate_rubric_digest": "0" * 64})
+        forged_rubric_plan = CompiledWorkflowPlan(**{**p_sup.__dict__, "spec": forged_rubric_spec})
+        with self.assertRaises(AdmissionDeniedError):
+            evaluate_admission(
+                forged_rubric_plan, store, principal_id="op-1", caller_role="operator",
+                caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4,
+                clock=self.clock,
+            )
+
         # Strict fixture-owned incarnation inventory: unregistered targets fail closed at first attach AND after retire!
         unregistered = TargetIncarnation("local/lane-unreg", "inc-1")
         with self.assertRaises(AuthorityError):
@@ -858,6 +890,19 @@ class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
             lanes.attach(unregistered_replacement, receipt=r_sup, authority_store=store, clock=self.clock)
         store.register_active_incarnation(unregistered_replacement)
         lanes.attach(unregistered_replacement, receipt=r_sup, authority_store=store, clock=self.clock)
+
+        # _trusted_temp_dir refuses existing symlink without altering target directory mode!
+        target_dir = self.root / "symlink_target_dir"
+        target_dir.mkdir(mode=0o750)
+        os.chmod(target_dir, 0o750)
+        symlink_cache = self.root / "symlink_cache"
+        os.symlink(target_dir, symlink_cache)
+        with self.assertRaises(OSError):
+            _trusted_temp_dir(cache_base=symlink_cache)
+        self.assertEqual(stat.S_IMODE(target_dir.stat().st_mode), 0o750)
+        with self.assertRaises(PermissionError):
+            _trusted_temp_dir(cache_base=target_dir)
+        self.assertEqual(stat.S_IMODE(target_dir.stat().st_mode), 0o750)
 
 
 if __name__ == "__main__":

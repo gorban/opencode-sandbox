@@ -29,6 +29,7 @@ from oc_workflow_schema import (
     ExcerptDisclosureSpec,
     System1Spec,
     canonical_json_bytes,
+    compute_rubric_digest,
     render_template,
 )
 
@@ -105,6 +106,18 @@ class CanaryLeakError(DisclosureBlockedError):
 
 class BudgetExhaustedError(SupervisionError):
     """Raised when a per-run or replay call/microdollar budget is exhausted."""
+
+
+class PreEntryBudgetExhaustedError(BudgetExhaustedError):
+    """Raised exclusively when the broker refuses a call BEFORE adapter entry due to run budget."""
+
+
+class FleetCapRefusedError(SupervisionError):
+    """Raised when the broker-owned FleetCheckBudget denies admission (cap_delayed or cap_dropped)."""
+
+    def __init__(self, outcome: Literal["cap_delayed", "cap_dropped"]) -> None:
+        super().__init__(f"fleet check cap refused: {outcome}")
+        self.outcome = outcome
 
 
 class ReplayAuthorizationError(SupervisionError):
@@ -643,6 +656,8 @@ class CalibrationLedger:
         return tuple(self._records[sid] for sid in self._order)
 
     def record_outcome(self, record: CalibrationRecord) -> None:
+        if record.sample_id in self._records:
+            raise SupervisionError(f"DUPLICATE_SAMPLE_ID: {record.sample_id!r}")
         self._records[record.sample_id] = record
         self._order.append(record.sample_id)
         st = self._stratum(record.stratum)
@@ -845,7 +860,13 @@ def _build_decisions_payload(
         "store": False,
         "trusted_metrics": snapshot.trusted.to_payload_dict(),
     }
-    if include_canary_question:
+    disclosure_enabled = (
+        not metrics_only_override
+        and plan.spec.excerpt_disclosure.mode == "opt_in"
+        and use in plan.spec.excerpt_disclosure.permitted_uses
+        and effective_route in plan.spec.excerpt_disclosure.allowed_routes
+    )
+    if include_canary_question or disclosure_enabled or excerpt is not None:
         payload["canary_question"] = "noul(classifier_injection_suspected)"
     if excerpt is not None:
         payload["sanitized_last_error_excerpt"] = excerpt
@@ -890,23 +911,28 @@ def _verify_grant_against_candidate_plan(
     *,
     caller_id: str,
     model_catalog: ModelCatalog,
-) -> tuple[System1Spec, int]:
-    if grant.requesting_principal != caller_id:
-        raise ReplayAuthorizationError("REPLAY_PRINCIPAL_MISMATCH")
-    if grant.workflow_id != candidate_plan.spec.id:
-        raise ReplayAuthorizationError("REPLAY_WORKFLOW_MISMATCH")
+) -> tuple[System1Spec, int, str]:
+    if grant.requesting_principal != caller_id or grant.workflow_id != candidate_plan.spec.id:
+        raise ReplayAuthorizationError("REPLAY_PRINCIPAL_OR_WORKFLOW_MISMATCH")
     sys1 = candidate_plan.spec.system1
-    if sys1 is None or candidate_plan.candidate_rubric_digest is None:
-        raise ReplayAuthorizationError("candidate plan has no system1 rubric")
-    recomputed_spec, _, _ = recompute_plan_digests(candidate_plan)
-    if candidate_plan.candidate_rubric_digest != grant.candidate_rubric_digest:
+    recomputed_rubric = compute_rubric_digest(candidate_plan.spec)
+    if sys1 is None or recomputed_rubric is None or candidate_plan.candidate_rubric_digest != recomputed_rubric:
         raise ReplayAuthorizationError("RUBRIC_DIGEST_MISMATCH")
-    if recomputed_spec != grant.candidate_spec_digest or candidate_plan.spec_digest != grant.candidate_spec_digest:
+    if recomputed_rubric != grant.candidate_rubric_digest:
+        raise ReplayAuthorizationError("RUBRIC_DIGEST_MISMATCH")
+    recomputed_spec, _, recomputed_plan = recompute_plan_digests(candidate_plan)
+    if (
+        recomputed_spec != grant.candidate_spec_digest
+        or candidate_plan.spec_digest != grant.candidate_spec_digest
+        or recomputed_plan != candidate_plan.workflow_plan_digest
+    ):
         raise ReplayAuthorizationError("SPEC_DIGEST_MISMATCH")
-    if sys1.route != grant.approved_decisions_route or sys1.model != grant.approved_model:
-        raise ReplayAuthorizationError("REPLAY_ROUTE_OR_MODEL_MISMATCH")
-    if candidate_plan.spec.excerpt_disclosure != grant.excerpt_disclosure_policy:
-        raise ReplayAuthorizationError("REPLAY_DISCLOSURE_POLICY_MISMATCH")
+    if (
+        sys1.route != grant.approved_decisions_route
+        or sys1.model != grant.approved_model
+        or candidate_plan.spec.excerpt_disclosure != grant.excerpt_disclosure_policy
+    ):
+        raise ReplayAuthorizationError("REPLAY_ROUTE_MODEL_OR_DISCLOSURE_MISMATCH")
     try:
         catalog_cost = model_catalog.lookup_decisions(
             grant.approved_decisions_route, grant.approved_model
@@ -915,7 +941,7 @@ def _verify_grant_against_candidate_plan(
         raise ReplayAuthorizationError(str(exc)) from exc
     if candidate_plan.decisions_call_cost_microusd != catalog_cost:
         raise ReplayAuthorizationError("REPLAY_TARIFF_MISMATCH")
-    return sys1, catalog_cost
+    return sys1, catalog_cost, recomputed_rubric
 
 
 def _verify_replay_record_binding(
@@ -930,13 +956,15 @@ def _verify_replay_record_binding(
 ) -> None:
     if record.run_id != grant.run_id:
         raise ReplayAuthorizationError(f"sample {record.sample_id!r} belongs to another run")
+    if record.workflow_id != grant.workflow_id:
+        raise ReplayAuthorizationError("REPLAY_RECORD_WORKFLOW_MISMATCH")
     if record.stratum not in grant.authorized_sample_scope:
         raise ReplayAuthorizationError(
             f"sample {record.sample_id!r} stratum {record.stratum!r} excluded by grant.authorized_sample_scope"
         )
     if record.target != record.frozen_snapshot.trusted.target:
         raise ReplayAuthorizationError("RECORD_SNAPSHOT_TARGET_MISMATCH")
-    authority_store.verify_record_access(
+    auth_record = authority_store.verify_record_access(
         run_id=record.run_id,
         principal_id=caller_id,
         caller_role=caller_role,
@@ -944,6 +972,8 @@ def _verify_replay_record_binding(
         target=record.target,
         clock=clock,
     )
+    if auth_record.workflow_id != grant.workflow_id:
+        raise ReplayAuthorizationError("REPLAY_RUN_WORKFLOW_MISMATCH")
 
 
 class SupervisionBrokerGate:
@@ -959,6 +989,7 @@ class SupervisionBrokerGate:
         lease_registry: LaneLeaseRegistry,
         ledger: CalibrationLedger,
         model_catalog: ModelCatalog,
+        fleet_budget: FleetCheckBudget | None = None,
         replay_registry: ReplayGrantRegistry | None = None,
     ) -> None:
         self._decisions_adapter = decisions_adapter
@@ -968,7 +999,30 @@ class SupervisionBrokerGate:
         self._lease_registry = lease_registry
         self._ledger = ledger
         self._model_catalog = model_catalog
+        self._fleet_budget = fleet_budget or FleetCheckBudget(
+            max_concurrent=2, max_checks_per_hour=30, reserved_audit_checks_per_hour=8
+        )
         self._replay_registry = replay_registry or ReplayGrantRegistry()
+
+    @property
+    def fleet_budget(self) -> FleetCheckBudget:
+        return self._fleet_budget
+
+    @property
+    def ledger(self) -> CalibrationLedger:
+        return self._ledger
+
+    @property
+    def authority_store(self) -> RunAuthorityStore:
+        return self._authority_store
+
+    @property
+    def replay_registry(self) -> ReplayGrantRegistry:
+        return self._replay_registry
+
+    @property
+    def model_catalog(self) -> ModelCatalog:
+        return self._model_catalog
 
     def invoke_decisions_live(
         self,
@@ -1000,7 +1054,7 @@ class SupervisionBrokerGate:
         if not self._authority_store.reserve_decisions_budget(
             receipt, calls=1, cost_microusd=plan.decisions_call_cost_microusd, clock=clock
         ):
-            raise BudgetExhaustedError("decisions run budget exhausted")
+            raise PreEntryBudgetExhaustedError("decisions run budget exhausted")
         return self._decisions_adapter.evaluate(payload_bytes)
 
     def invoke_blind_check_live(
@@ -1010,8 +1064,9 @@ class SupervisionBrokerGate:
         target: TargetIncarnation,
         snapshot_for_model: MetricSnapshot,
         clock: ClockSnapshot,
-        on_adapter_entry: Callable[[], None] | None = None,
+        fleet_kind: Literal["triggered", "scheduled_audit"] = "triggered",
     ) -> BlindCheckResponse:
+        """Own fleet slot acquisition, pre-entry rollback, and post-entry concurrency release."""
         if snapshot_for_model.trusted.target != target:
             raise AuthorityError("SNAPSHOT_TARGET_MISMATCH")
         record = self._authority_store.verify_active(receipt, clock=clock, target=target)
@@ -1027,15 +1082,30 @@ class SupervisionBrokerGate:
             blind_route=plan.blind_route,
         )
         self._canary_scanner.scan(payload_bytes, decoded_leaves=leaves)
-        if not self._authority_store.reserve_blind_budget(
+        if not self._authority_store.can_afford_blind(
             receipt, cost_microusd=plan.blind_call_cost_microusd, clock=clock
         ):
-            raise BudgetExhaustedError("blind check run budget exhausted")
-        if on_adapter_entry is not None:
-            on_adapter_entry()
-        return self._blind_verifier.check(payload_bytes)
+            raise PreEntryBudgetExhaustedError("blind check run budget exhausted")
 
-    def invoke_decisions_replay(
+        slot = self._fleet_budget.acquire(kind=fleet_kind, clock=clock)
+        if slot != "admitted":
+            raise FleetCapRefusedError(slot)
+
+        entered_verifier = False
+        try:
+            if not self._authority_store.reserve_blind_budget(
+                receipt, cost_microusd=plan.blind_call_cost_microusd, clock=clock
+            ):
+                raise PreEntryBudgetExhaustedError("blind check run budget exhausted")
+            entered_verifier = True
+            return self._blind_verifier.check(payload_bytes)
+        finally:
+            if entered_verifier:
+                self._fleet_budget.release()
+            else:
+                self._fleet_budget.rollback(fleet_kind)
+
+    def evaluate_replay_sample(
         self,
         *,
         grant_id: str,
@@ -1045,10 +1115,10 @@ class SupervisionBrokerGate:
         caller_role: CallerRole,
         caller_subtree: frozenset[str],
         clock: ClockSnapshot,
-    ) -> DecisionsAdapterResponse:
-        """Resolve sample from fixture ledger and enforce full grant, tariff, sample, and budget checks."""
+    ) -> tuple[CalibrationRecord, DecisionsAdapterResponse]:
+        """Resolve sample from broker ledger, enforce full grant/tariff/budget checks, and return (record, resp)."""
         grant = self._replay_registry.lookup_active(grant_id, clock=clock)
-        sys1, catalog_cost = _verify_grant_against_candidate_plan(
+        sys1, catalog_cost, _ = _verify_grant_against_candidate_plan(
             grant, candidate_plan, caller_id=caller_id, model_catalog=self._model_catalog
         )
         record = self._ledger.get_record(sample_id)
@@ -1078,8 +1148,31 @@ class SupervisionBrokerGate:
             cost_microusd=catalog_cost,
             clock=clock,
         ):
-            raise BudgetExhaustedError("replay grant sample, call, or spend budget exhausted")
-        return self._decisions_adapter.evaluate(payload_bytes)
+            raise PreEntryBudgetExhaustedError("replay grant sample, call, or spend budget exhausted")
+        return record, self._decisions_adapter.evaluate(payload_bytes)
+
+    def invoke_decisions_replay(
+        self,
+        *,
+        grant_id: str,
+        candidate_plan: CompiledWorkflowPlan,
+        sample_id: str,
+        caller_id: str,
+        caller_role: CallerRole,
+        caller_subtree: frozenset[str],
+        clock: ClockSnapshot,
+    ) -> DecisionsAdapterResponse:
+        """Resolve sample from fixture ledger and enforce full grant, tariff, sample, and budget checks."""
+        _, resp = self.evaluate_replay_sample(
+            grant_id=grant_id,
+            candidate_plan=candidate_plan,
+            sample_id=sample_id,
+            caller_id=caller_id,
+            caller_role=caller_role,
+            caller_subtree=caller_subtree,
+            clock=clock,
+        )
+        return resp
 
 
 @dataclass(frozen=True)
@@ -1188,17 +1281,25 @@ def run_calibration_replay(
     caller_subtree: frozenset[str],
     clock_provider: Callable[[], ClockSnapshot],
 ) -> ReplayScorecard:
-    """Run batch-preflighted, rubric-digest-bound replay with unified before/after & run-scoped notes."""
+    """Run batch-preflighted, single-source, rubric-digest-bound replay with run-scoped notes."""
+    if (
+        ledger is not broker_gate.ledger
+        or authority_store is not broker_gate.authority_store
+        or replay_registry is not broker_gate.replay_registry
+        or model_catalog is not broker_gate.model_catalog
+    ):
+        raise ReplayAuthorizationError("REPLAY_FIXTURE_SOURCE_MISMATCH")
+
     t_start = clock_provider()
-    grant = replay_registry.lookup_active(grant_id, clock=t_start)
-    sys1, _ = _verify_grant_against_candidate_plan(
-        grant, candidate_plan, caller_id=caller_id, model_catalog=model_catalog
+    grant = broker_gate.replay_registry.lookup_active(grant_id, clock=t_start)
+    sys1, _, recomputed_rubric = _verify_grant_against_candidate_plan(
+        grant, candidate_plan, caller_id=caller_id, model_catalog=broker_gate.model_catalog
     )
     authorized_records = _authorize_replay_batch(
         grant,
         sample_ids,
-        ledger,
-        authority_store=authority_store,
+        broker_gate.ledger,
+        authority_store=broker_gate.authority_store,
         caller_id=caller_id,
         caller_role=caller_role,
         caller_subtree=caller_subtree,
@@ -1211,12 +1312,12 @@ def run_calibration_replay(
     abstentions = 0
     evaluated: list[str] = []
 
-    for rec in authorized_records:
+    for pre_rec in authorized_records:
         t_call = clock_provider()
-        resp = broker_gate.invoke_decisions_replay(
+        rec, resp = broker_gate.evaluate_replay_sample(
             grant_id=grant.grant_id,
             candidate_plan=candidate_plan,
-            sample_id=rec.sample_id,
+            sample_id=pre_rec.sample_id,
             caller_id=caller_id,
             caller_role=caller_role,
             caller_subtree=caller_subtree,
@@ -1238,10 +1339,10 @@ def run_calibration_replay(
         if cand_outcome == "abstain":
             abstentions += 1
         if rec.stratum not in notes:
-            notes[rec.stratum] = ledger.scoped_stratum_notes(
+            notes[rec.stratum] = broker_gate.ledger.scoped_stratum_notes(
                 rec.stratum,
                 run_id=grant.run_id,
-                authority_store=authority_store,
+                authority_store=broker_gate.authority_store,
                 principal_id=caller_id,
                 caller_role=caller_role,
                 caller_subtree=caller_subtree,
@@ -1250,7 +1351,7 @@ def run_calibration_replay(
 
     return ReplayScorecard(
         grant_id=grant.grant_id,
-        candidate_rubric_digest=candidate_plan.candidate_rubric_digest or "",
+        candidate_rubric_digest=recomputed_rubric,
         original_per_stratum=orig_per_stratum,
         candidate_per_stratum=cand_per_stratum,
         stratum_notes=notes,
@@ -1291,7 +1392,7 @@ class SupervisionTickResult:
 
 @dataclass(frozen=True)
 class SupervisionRunContext:
-    """Immutable bundle referencing fixture-owned authority/budgets, broker gate, fleet budget, and ledger."""
+    """Immutable bundle referencing broker-owned authority/budgets, fleet budget, and ledger."""
 
     receipt: AdmissionReceipt
     plan: CompiledWorkflowPlan
@@ -1300,6 +1401,14 @@ class SupervisionRunContext:
     fleet_budget: FleetCheckBudget
     lease_registry: LaneLeaseRegistry
     ledger: CalibrationLedger
+
+    def __post_init__(self) -> None:
+        if (
+            self.fleet_budget is not self.broker_gate.fleet_budget
+            or self.ledger is not self.broker_gate.ledger
+            or self.authority_store is not self.broker_gate.authority_store
+        ):
+            raise SupervisionError("SPLIT_FIXTURE_STATE")
 
 
 def _is_valid_sys1_response(resp: DecisionsAdapterResponse, choices: tuple[str, ...]) -> bool:
@@ -1416,31 +1525,10 @@ def dispatch_blind_with_post_verdict_freshness(
     fleet_kind: Literal["triggered", "scheduled_audit"],
     update_throttle_window: bool = False,
 ) -> SupervisionTickResult:
-    """Execute blind check via SupervisionBrokerGate using record.approved_plan throughout."""
+    """Execute blind check via SupervisionBrokerGate using broker-owned fleet budget and approved_plan."""
     t_pre = clock_provider()
     record = ctx.authority_store.verify_active(ctx.receipt, clock=t_pre, target=lane_state.target)
     approved_plan = record.approved_plan
-    if not ctx.authority_store.can_afford_blind(
-        ctx.receipt, cost_microusd=approved_plan.blind_call_cost_microusd, clock=t_pre
-    ):
-        return SupervisionTickResult(
-            status="blind_budget_exhausted_tier0_only",
-            fleet_notice_key=f"budget_exhausted:{ctx.receipt.run_id}:blind",
-        )
-
-    slot = ctx.fleet_budget.acquire(kind=fleet_kind, clock=t_pre)
-    if slot != "admitted":
-        ctx.ledger.record_cap_event(
-            run_id=ctx.receipt.run_id, target=lane_state.target, stratum=stratum, outcome=slot
-        )
-        if slot == "cap_dropped" and update_throttle_window:
-            lane_state.enter_throttled(t_pre.monotonic_s + approved_plan.spec.limits.throttle_period_s)
-        return SupervisionTickResult(status=f"{stratum}_{slot}")
-
-    attempted = [False]
-
-    def _mark_attempted() -> None:
-        attempted[0] = True
 
     try:
         blind_resp = ctx.broker_gate.invoke_blind_check_live(
@@ -1448,23 +1536,20 @@ def dispatch_blind_with_post_verdict_freshness(
             target=lane_state.target,
             snapshot_for_model=frozen_snapshot,
             clock=clock_provider(),
-            on_adapter_entry=_mark_attempted,
+            fleet_kind=fleet_kind,
         )
-    except BudgetExhaustedError:
-        ctx.fleet_budget.rollback(fleet_kind)
+    except FleetCapRefusedError as exc:
+        ctx.ledger.record_cap_event(
+            run_id=ctx.receipt.run_id, target=lane_state.target, stratum=stratum, outcome=exc.outcome
+        )
+        if exc.outcome == "cap_dropped" and update_throttle_window:
+            lane_state.enter_throttled(t_pre.monotonic_s + approved_plan.spec.limits.throttle_period_s)
+        return SupervisionTickResult(status=f"{stratum}_{exc.outcome}")
+    except PreEntryBudgetExhaustedError:
         return SupervisionTickResult(
             status="blind_budget_exhausted_tier0_only",
             fleet_notice_key=f"budget_exhausted:{ctx.receipt.run_id}:blind",
         )
-    except Exception:
-        # Distinguish refusal BEFORE adapter entry (rollback) from failure AFTER entry (retain hourly charge)!
-        if attempted[0]:
-            ctx.fleet_budget.release()
-        else:
-            ctx.fleet_budget.rollback(fleet_kind)
-        raise
-    else:
-        ctx.fleet_budget.release()
 
     if update_throttle_window:
         lane_state.enter_throttled(t_pre.monotonic_s + approved_plan.spec.limits.throttle_period_s)
