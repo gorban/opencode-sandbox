@@ -17,6 +17,7 @@ import threading
 import time
 from typing import Any
 import unittest
+from unittest.mock import Mock, patch
 from urllib.parse import quote
 
 _SPIKE_DIR = Path(__file__).resolve().parent
@@ -27,8 +28,10 @@ for _p in (str(_SPIKE_DIR), str(_REPO_ROOT)):
 
 import oc_controller as occ  # noqa: E402
 from oc_broker_common import (  # noqa: E402
+    BrokerError,
     BrokerLease,
     BrokerPolicyError,
+    CanaryLeakError,
     HostVaultMemory,
     build_strict_tls_context,
 )
@@ -36,6 +39,7 @@ from oc_broker_http import (  # noqa: E402
     AllowRule,
     HostHttpBrokerServer,
     HttpBrokerRoute,
+    HttpErrorResponse,
     WirePolicy,
     all_graphql_operations_are_query,
     build_aws_ro_route,
@@ -614,6 +618,62 @@ class TestBrokerHttpIntegration(unittest.TestCase):
         self.assertEqual(
             self.upstream.recorded[-1].headers.get("x-api-key"), "CANARY_CUSTOM_HDR_SECRET_9999"
         )
+
+    def test_mcp_serialized_response_is_checked_before_sending(self) -> None:
+        route = self.routes[0]
+        response = Mock(status=200, headers=[], connection_tokens=frozenset())
+        request = Mock(method="POST")
+        downstream = Mock(spec=socket.socket)
+        secret = "synthetic-serializer-marker"
+        for media in ("application/json", "text/event-stream"):
+            with (
+                self.subTest(media=media),
+                patch.object(self.broker, "_validate_upstream_head", return_value=(media, False, False)),
+                patch("oc_broker_http._read_upstream_body_bounded", return_value=b"fixture bytes"),
+                patch("oc_broker_http.filter_mcp_tools_list_response", return_value=secret.encode()),
+            ):
+                with self.assertRaises(CanaryLeakError):
+                    self.broker._handle_upstream_response(
+                        downstream, Mock(), response, request, route,
+                        route.wire_policy.allow_rules[0], "tools/list", [secret], time.monotonic() + 1,
+                    )
+                downstream.sendall.assert_not_called()
+        with (
+            patch.object(self.broker, "_validate_upstream_head", return_value=("application/json", False, False)),
+            patch.object(self.broker, "_max_body", 16),
+            patch("oc_broker_http._read_upstream_body_bounded", return_value=b"fixture"),
+            patch("oc_broker_http.filter_mcp_tools_list_response", return_value=b"x" * 17),
+        ):
+            with self.assertRaises(HttpErrorResponse):
+                self.broker._handle_upstream_response(
+                    downstream, Mock(), response, request, route,
+                    route.wire_policy.allow_rules[0], "tools/list", [], time.monotonic() + 1,
+                )
+            downstream.sendall.assert_not_called()
+
+    def test_stop_reports_unfinished_worker_and_preserves_sibling(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def wait_for_fixture(_conn: socket.socket) -> None:
+            entered.set()
+            release.wait(10.0)
+
+        broker = HostHttpBrokerServer(self.routes, self.vault, self.lease)
+        with patch.object(broker, "_handle_conn", side_effect=wait_for_fixture):
+            address = broker.start()
+            self.assertIsInstance(address, tuple)
+            try:
+                with socket.create_connection(address, timeout=4.0) as client:
+                    self.assertTrue(entered.wait(4.0))
+                    with self.assertRaisesRegex(BrokerError, "stop incomplete"):
+                        broker.stop()
+                    self.assertEqual(client.recv(1), b"")
+                    status, _, _ = _raw_http_exchange(self.addr, _build_req("GET", "/unmapped", headers={}))
+                    self.assertEqual(status, 404)
+            finally:
+                release.set()
+                broker.stop()
 
     def test_mcp_jsonrpc_and_tools_list_json_and_sse_filtering(self) -> None:
         hdrs = {**self._auth_hdr(), "Content-Type": "application/json"}

@@ -7,11 +7,13 @@ import ipaddress
 import os
 from pathlib import Path
 import socket
+import ssl
 import stat
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
 from urllib.parse import quote
 
 _SPIKE_DIR = Path(__file__).resolve().parent
@@ -31,7 +33,7 @@ from oc_broker_common import (  # noqa: E402
     PgUpstreamCancelTarget,
     bind_loopback_tcp,
     bind_trusted_uds,
-    cleanup_uds_socket,
+    connect_tls_pinned_ip,
     resolve_and_validate_ip,
     validate_allowed_cidrs,
 )
@@ -57,6 +59,34 @@ class _DummyLeaseAdapter:
 
 
 class TestBrokerCommon(unittest.TestCase):
+    def test_tls_context_is_verified_before_connecting(self) -> None:
+        context = Mock(spec=ssl.SSLContext, verify_mode=ssl.CERT_REQUIRED, check_hostname=False)
+        with patch("oc_broker_common.connect_tcp_pinned_ip", side_effect=AssertionError("unexpected fixture dial")) as dial:
+            with self.assertRaises(BrokerPolicyError):
+                connect_tls_pinned_ip("127.0.0.1", 443, server_hostname="fixture.test", ssl_context=context)
+            dial.assert_not_called()
+
+    def test_unix_listener_owns_its_entry_and_cleans_up_partial_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "broker.sock"
+            listener, bound = bind_trusted_uds(path)
+            try:
+                with self.assertRaises(BrokerPolicyError):
+                    bind_trusted_uds(path)
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.connect(str(path))
+                    peer, _ = listener.accept()
+                    peer.close()
+            finally:
+                listener.close()
+                bound.cleanup()
+            self.assertFalse(path.exists())
+
+            with patch.object(socket.socket, "listen", side_effect=OSError("fixture listen failure")):
+                with self.assertRaises(OSError):
+                    bind_trusted_uds(path)
+            self.assertFalse(path.exists())
+
     def test_cidr_validation_and_dns_ssrf_fail_closed(self) -> None:
         valid = validate_allowed_cidrs([f"{_ip(10, 20, 0, 0)}/16", f"{_ip(100, 64, 0, 0)}/10"])
         self.assertEqual(len(valid), 2)
@@ -259,12 +289,12 @@ class TestBrokerCommon(unittest.TestCase):
 
             sock, bound = bind_trusted_uds(root / "ok_sub" / "broker.sock", sandbox_root=sandbox)
             try:
-                self.assertEqual(stat.S_IMODE(os.lstat(bound.parent).st_mode), 0o700)
-                self.assertEqual(stat.S_IMODE(os.lstat(bound).st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(os.lstat(bound.path.parent).st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(os.lstat(bound.path).st_mode), 0o600)
             finally:
                 sock.close()
-                cleanup_uds_socket(bound)
-            self.assertFalse(bound.exists())
+                bound.cleanup()
+            self.assertFalse(bound.path.exists())
 
         # P3-1: bind_loopback_tcp supports IPv6 ::1 and rejects non-loopback
         with self.assertRaises(BrokerPolicyError):

@@ -30,22 +30,24 @@ from typing import Any
 from urllib.parse import quote, quote_plus
 
 from oc_broker_common import (
+    BoundUds,
     BrokerAuthError,
     BrokerError,
     BrokerLease,
     BrokerPolicyError,
     CanaryLeakError,
     HostVaultMemory,
+    ListenerWorkers,
     MIN_SECRET_LEN,
     OverlapCanaryScanner,
     PgUpstreamCancelTarget,
     bind_loopback_tcp,
     bind_trusted_uds,
-    build_strict_tls_context,
-    cleanup_uds_socket,
     connect_tcp_pinned_ip,
+    require_strict_tls_context,
     resolve_and_validate_ip,
     validate_allowed_cidrs,
+    wrap_pinned_tls,
 )
 
 PG_PROTOCOL_V3 = 196608
@@ -240,15 +242,6 @@ def read_pg_control_frame(
     return msg_type, recv_exact(sock, body_len, deadline=deadline)
 
 
-def _require_strict_tls_context(ssl_context: ssl.SSLContext | None) -> ssl.SSLContext:
-    ctx = ssl_context if ssl_context is not None else build_strict_tls_context()
-    if ctx.verify_mode != ssl.CERT_REQUIRED or not ctx.check_hostname:
-        raise BrokerPolicyError("Upstream Postgres TLS context must enforce verify-full")
-    if ctx.minimum_version < ssl.TLSVersion.TLSv1_2:
-        raise BrokerPolicyError("Upstream Postgres TLS context must require TLS >= 1.2")
-    return ctx
-
-
 def pg_connect_strict_tls_only(
     ip: str,
     port: int,
@@ -256,25 +249,30 @@ def pg_connect_strict_tls_only(
     server_hostname: str,
     ssl_context: ssl.SSLContext | None = None,
     timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
+    workers: ListenerWorkers | None = None,
 ) -> ssl.SSLSocket:
     """Connect TCP to pinned IP, negotiate Postgres SSLRequest, and abort if refused."""
-    ctx = _require_strict_tls_context(ssl_context)
-    raw_sock = connect_tcp_pinned_ip(ip, port, timeout=timeout)
+    ctx = require_strict_tls_context(ssl_context)
+    raw_sock = connect_tcp_pinned_ip(ip, port, timeout=timeout, workers=workers)
     try:
         raw_sock.sendall(struct.pack("!II", 8, PG_SSL_REQUEST))
         reply = recv_exact(raw_sock, 1)
         if reply != b"S":
             raise BrokerPolicyError("Upstream Postgres refused TLS (cleartext downgrade blocked)")
-        return ctx.wrap_socket(raw_sock, server_hostname=server_hostname)
-    except Exception:
+        return wrap_pinned_tls(raw_sock, ctx, server_hostname, workers)
+    except BaseException:
         raw_sock.close()
         raise
+    finally:
+        if workers is not None:
+            workers.forget(raw_sock)
 
 
 def send_upstream_tls_cancel(
     target: PgUpstreamCancelTarget,
     *,
     timeout: float = REVOKE_CANCEL_TIMEOUT,
+    workers: ListenerWorkers | None = None,
 ) -> None:
     """Send a Postgres CancelRequest over strict TLS-only verify-full to pinned IP."""
     sock = pg_connect_strict_tls_only(
@@ -283,22 +281,22 @@ def send_upstream_tls_cancel(
         server_hostname=target.server_hostname,
         ssl_context=target.ssl_context,
         timeout=timeout,
+        workers=workers,
     )
     try:
         frame = struct.pack("!IIII", 16, PG_CANCEL_REQUEST, target.real_pid, target.real_key)
         sock.sendall(frame)
     finally:
+        if workers is not None:
+            workers.forget(sock)
         _close_quiet(sock)
 
 
-def _dispatch_async_cancel(target: PgUpstreamCancelTarget) -> None:
-    def _worker() -> None:
-        try:
-            send_upstream_tls_cancel(target, timeout=REVOKE_CANCEL_TIMEOUT)
-        except (OSError, BrokerError, EOFError):
-            pass
-
-    threading.Thread(target=_worker, daemon=True).start()
+def _cancel_on_revoke(target: PgUpstreamCancelTarget, workers: ListenerWorkers) -> None:
+    try:
+        send_upstream_tls_cancel(target, timeout=REVOKE_CANCEL_TIMEOUT, workers=workers)
+    except (OSError, BrokerError, EOFError):
+        pass
 
 
 def _parse_scram_kv(message: str) -> dict[str, str]:
@@ -596,6 +594,7 @@ def _stream_frame_passthrough(
 @dataclass
 class _RelayContext:
     lease: BrokerLease
+    workers: ListenerWorkers
     route: PgBrokerRoute
     upstream_ip: str
     ssl_context: ssl.SSLContext | None
@@ -632,7 +631,7 @@ def _handle_backend_key_data(
     def _on_revoke() -> None:
         if not fired.is_set():
             fired.set()
-            _dispatch_async_cancel(target)
+            ctx.workers.start(_cancel_on_revoke, target, ctx.workers)
 
     ctx.revoke_cb = _on_revoke
     ctx.lease.add_revoke_callback(_on_revoke)
@@ -743,17 +742,17 @@ class HostPostgresBrokerServer:
         self._uds_path = uds_path
         self._expected_uid = os.geteuid() if expected_uid is None else expected_uid
         self._sandbox_root = sandbox_root
-        self._sem = threading.BoundedSemaphore(max_concurrent_conns)
+        self._capacity = max_concurrent_conns
         self._handshake_timeout = float(options.get("handshake_timeout", DEFAULT_HANDSHAKE_TIMEOUT))
         self._io_timeout = float(options.get("io_timeout", DEFAULT_IO_TIMEOUT))
         self._resolver = resolver
         self._allow_test_loopback = allow_test_loopback
         self._ssl_context = ssl_context
 
+        self._lifecycle = threading.Lock()
+        self._workers = ListenerWorkers()
         self._listen_sock: socket.socket | None = None
-        self._bound_uds_path: Path | None = None
-        self._stop_ev = threading.Event()
-        self._accept_thread: threading.Thread | None = None
+        self._bound_uds: BoundUds | None = None
         self._bound_port: int | None = None
 
     @staticmethod
@@ -772,41 +771,36 @@ class HostPostgresBrokerServer:
         return self._bound_port
 
     def start(self) -> None:
-        if self._listen_sock is not None:
-            return
-        self._stop_ev.clear()
-        if self._uds_path is not None:
-            self._listen_sock = self._bind_uds(self._uds_path)
-        else:
-            self._listen_sock = self._bind_tcp()
-        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
-        self._accept_thread.start()
-
-    def _bind_tcp(self) -> socket.socket:
-        sock, bound_port = bind_loopback_tcp(self._host, self._port, backlog=32)
-        self._bound_port = bound_port
-        return sock
-
-    def _bind_uds(self, raw_uds_path: Path) -> socket.socket:
-        sock, bound_path = bind_trusted_uds(
-            raw_uds_path,
-            sandbox_root=self._sandbox_root,
-            backlog=32,
-        )
-        self._bound_uds_path = bound_path
-        return sock
+        with self._lifecycle:
+            if self._listen_sock is not None:
+                raise BrokerPolicyError("Postgres broker has already started; stop it first")
+            if self._uds_path is not None:
+                srv, self._bound_uds = bind_trusted_uds(
+                    self._uds_path, sandbox_root=self._sandbox_root
+                )
+            else:
+                srv, self._bound_port = bind_loopback_tcp(self._host, self._port)
+            self._listen_sock = srv
+            try:
+                self._workers.start(self._workers.serve, srv, self._serve_client, self._capacity)
+            except BaseException:
+                self._stop_locked()
+                raise
 
     def stop(self) -> None:
-        self._stop_ev.set()
-        if self._listen_sock is not None:
-            _close_quiet(self._listen_sock)
-            self._listen_sock = None
-        if self._accept_thread is not None:
-            self._accept_thread.join(timeout=2.0)
-            self._accept_thread = None
-        if self._bound_uds_path is not None:
-            cleanup_uds_socket(self._bound_uds_path)
-            self._bound_uds_path = None
+        with self._lifecycle:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        if self._listen_sock is None:
+            return
+        self._workers.stop(self._listen_sock)
+        if self._bound_uds is not None:
+            self._bound_uds.cleanup()
+        self._bound_uds = None
+        self._workers = ListenerWorkers()
+        self._listen_sock = None
+        self._bound_port = None
 
     def __enter__(self) -> HostPostgresBrokerServer:
         self.start()
@@ -815,37 +809,17 @@ class HostPostgresBrokerServer:
     def __exit__(self, *_exc: object) -> None:
         self.stop()
 
-    def _accept_loop(self) -> None:
-        listen_sock = self._listen_sock
-        if listen_sock is None:
-            return
-        while not self._stop_ev.is_set():
-            try:
-                client_sock, _ = listen_sock.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                return
-            if not self._sem.acquire(blocking=False):
-                _close_quiet(client_sock)
-                continue
-            t = threading.Thread(target=self._serve_client, args=(client_sock,), daemon=True)
-            t.start()
-
     def _serve_client(self, client_sock: socket.socket) -> None:
         try:
             self._handle_connection(client_sock)
         except (EOFError, OSError, BrokerError):
             pass
-        finally:
-            _close_quiet(client_sock)
-            self._sem.release()
 
     def _handle_cancel_request(self, payload: bytes) -> None:
         local_pid, local_key = struct.unpack("!II", payload)
         target = self.lease.lookup_pg_cancel(local_pid, local_key)
         if target is not None:
-            send_upstream_tls_cancel(target, timeout=self._handshake_timeout)
+            send_upstream_tls_cancel(target, timeout=self._handshake_timeout, workers=self._workers)
 
     def _handle_connection(self, client_sock: socket.socket) -> None:
         if client_sock.family == socket.AF_UNIX:
@@ -881,6 +855,7 @@ class HostPostgresBrokerServer:
             server_hostname=self.route.upstream_host,
             ssl_context=self._ssl_context,
             timeout=remaining,
+            workers=self._workers,
         )
         secrets_list = (password,)
         redaction_pattern = _build_redaction_pattern(
@@ -888,6 +863,7 @@ class HostPostgresBrokerServer:
         )
         ctx = _RelayContext(
             lease=self.lease,
+            workers=self._workers,
             route=self.route,
             upstream_ip=upstream_ip,
             ssl_context=self._ssl_context,
@@ -956,4 +932,5 @@ class HostPostgresBrokerServer:
         if ctx.cancel_pair is not None:
             self.lease.unregister_pg_cancel(*ctx.cancel_pair)
         self.lease.unregister_stream(up_sock)
+        self._workers.forget(up_sock)
         _close_quiet(up_sock)

@@ -374,14 +374,16 @@ function handle_broker_postgres_conn(client_sock, job_lease, pg_route):
       `"host-brokered"` / `"raw-container-mount"`), `pinned-artifact` local bypass closure,
       expanded 7-header sensitive-header validation, `isolated-sidecars` + `open_reverse_channel`
       transport gating, exact `PlanOverrides.allow_raw_remote_mounts` break-glass binding, and
-      `raw_remote_secret_mounted` in `SECURITY_DELTA_TRIGGERS` (`test_plan_broker.py`).
+      `raw_remote_secret_mounted` in `SECURITY_DELTA_TRIGGERS` (`test_plan_broker.py`). The spike
+      admits one host-brokered Postgres route per listener plan.
 - [x] **Unified Host L7 HTTP Policy Proxy (`oc_broker_http.py`)** — implemented on `spike-prd-l1`:
       global `denied_paths` + ordered per-rule `(methods, path_patterns, body_policy)` allow rules,
       per-route `inbound_auth`, connect-time DNS-pinned IP validation + TLS SNI, hard
       `follow_redirects=False` (`502` on `3xx`), unconditional HTTP `Upgrade`/`101` rejection,
       `Accept-Encoding: identity`, MCP JSON-RPC & SSE `tools/list` filtering, pure-stdlib GraphQL
       AST query-only enforcement, safe response header allowlisting + overlap canary scanning, and
-      `<1s` `oc_controller` revocation (`test_broker_http.py`).
+      `<1s` `oc_controller` revocation (`test_broker_http.py`). The broker also checks the size
+      and canaries of filtered MCP output after serialization and before sending it.
 - [x] **Per-job Message-Framed Host Postgres Wire Proxy (`oc_broker_pg.py`)** — implemented on
       `spike-prd-l1`: bounded single-threaded `selectors` v3 framed proxy handling
       `SSLRequest`/`GSSENCRequest`, strict TLS-only `verify-full` upstream (including TLS
@@ -393,17 +395,32 @@ function handle_broker_postgres_conn(client_sock, job_lease, pg_route):
       interpolation) + `oc_controller` `APPLY_ONCE` digest-pinned exec over hardened OpenSSH
       (`-F /dev/null`, `ForwardAgent=no`, `ClearAllForwardings=yes`, `StrictHostKeyChecking=yes`,
       DNS-pinned `HostName`/`HostKeyAlias`, pinned `0600` `UserKnownHostsFile`, bounded streaming
-      output + `<1s` revoke kill) (`test_broker_pg_ssh.py`).
+      output + `<1s` revoke kill) (`test_broker_pg_ssh.py`). The host lowers each route into a
+      preset allowlist for its exact lease. The custom command path uses a synthetic runner and
+      binds the approved command to dispatch and outcome recording. Live custom SSH execution
+      requires a separately qualified adapter.
 - [x] **AWS `AWS_ENDPOINT_URL` SigV4 Re-Signer (`oc_broker_http.py`)** — implemented on
       `spike-prd-l1`: inbound `aws-sigv4-job-key` HMAC-SHA256 verification + host-side SigV4
       re-signing + action inspection (`Action=` across query & body with duplicate/encoded
       smuggling rejection, `X-Amz-Target`, REST verb+path) (`test_broker_http.py`).
-- [x] **Gate 2 external security review & offline synthetic canary qualification** — cleared on
-      `spike-prd-l1` at commit `72ac4444bcd8583d139c16d737612aba5770fe23` (97/97 offline unit,
-      adversarial, and cross-lane E2E canary tests passing in `docs/prds/spikes/l/`).
+- [ ] **Gate 2 external security review & offline synthetic canary qualification** — the earlier
+      clearance applies to `72ac444`. Review of the subsequent PR #47 head reopened this gate.
+      The spike suite exercises local HTTP and Postgres protocol behavior and an injected SSH
+      runner that records argv. Live host transport and the live custom SSH adapter carry
+      separate qualification gates.
 - [ ] **Live host transport & SELinux qualification** — live Linux (`pasta -T` / `managed` UDS
       SELinux relabeling) and macOS (`ssh -R`) host qualification pending prior to production
       promotion.
+
+## Running the offline spike suite
+
+Use Python 3.11 or newer, OpenSSL on `PATH` for fixture certificates, and a short trusted
+scratch path for Unix sockets. If the default temporary directory has an unmapped owner
+inside a container, set `TMPDIR` to a user-owned runtime directory shared with the host.
+
+```sh
+python3 -B -m unittest discover -s docs/prds/spikes/l -p 'test_*.py'
+```
 
 ## Review record
 
@@ -428,3 +445,9 @@ function handle_broker_postgres_conn(client_sock, job_lease, pg_route):
 - Gate 2 implementation review round 3 (`Security-Focused PR Reviewer Setup`, `5691af5..72ac444`):
   **GATE 2 CLEARED** at commit `72ac4444bcd8583d139c16d737612aba5770fe23` (97/97 offline tests
   passing; live host transport qualification and user Human Review remain open).
+
+
+- PR #47 head `4f323bb` underwent a fresh external review. The follow-up binds synthetic SSH
+  dispatch to the approved command, enforces lease-specific preset policy, checks final MCP
+  response bytes and HTTPS verification settings, restricts the Postgres listener plan, and
+  gives each server ownership of its Unix socket and worker shutdown.

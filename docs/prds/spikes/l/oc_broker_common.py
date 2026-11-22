@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+import fcntl
 import hmac
 import ipaddress
 import os
@@ -21,6 +22,7 @@ import socket
 import ssl
 import stat
 import threading
+import time
 from typing import Any
 from urllib.parse import quote, quote_plus
 
@@ -185,17 +187,51 @@ def build_strict_tls_context(*, cafile: str | None = None) -> ssl.SSLContext:
     return ctx
 
 
-def connect_tcp_pinned_ip(ip: str, port: int, *, timeout: float = 5.0) -> socket.socket:
+def require_strict_tls_context(ssl_context: ssl.SSLContext | None) -> ssl.SSLContext:
+    ctx = ssl_context if ssl_context is not None else build_strict_tls_context()
+    if ctx.verify_mode != ssl.CERT_REQUIRED or not ctx.check_hostname:
+        raise BrokerPolicyError("Upstream TLS context must enforce verify-full")
+    if ctx.minimum_version < ssl.TLSVersion.TLSv1_2:
+        raise BrokerPolicyError("Upstream TLS context must require TLS >= 1.2")
+    return ctx
+
+
+def connect_tcp_pinned_ip(
+    ip: str, port: int, *, timeout: float = 5.0, workers: ListenerWorkers | None = None
+) -> socket.socket:
     parsed = ipaddress.ip_address(ip)
     family = socket.AF_INET6 if isinstance(parsed, ipaddress.IPv6Address) else socket.AF_INET
     raw_sock = socket.socket(family, socket.SOCK_STREAM)
-    raw_sock.settimeout(timeout)
     try:
+        if workers is not None:
+            workers.track(raw_sock)
+        raw_sock.settimeout(timeout)
         raw_sock.connect((str(parsed), port))
-    except OSError:
+    except BaseException:
+        if workers is not None:
+            workers.forget(raw_sock)
         raw_sock.close()
         raise
     return raw_sock
+
+
+def wrap_pinned_tls(
+    raw_sock: socket.socket,
+    ctx: ssl.SSLContext,
+    server_hostname: str,
+    workers: ListenerWorkers | None,
+) -> ssl.SSLSocket:
+    tls_sock = ctx.wrap_socket(raw_sock, server_hostname=server_hostname, do_handshake_on_connect=False)
+    try:
+        if workers is not None:
+            workers.track(tls_sock)
+        tls_sock.do_handshake()
+        return tls_sock
+    except BaseException:
+        if workers is not None:
+            workers.forget(tls_sock)
+        tls_sock.close()
+        raise
 
 
 def connect_tls_pinned_ip(
@@ -205,15 +241,19 @@ def connect_tls_pinned_ip(
     server_hostname: str,
     ssl_context: ssl.SSLContext | None = None,
     timeout: float = 5.0,
+    workers: ListenerWorkers | None = None,
 ) -> ssl.SSLSocket:
     """Connect TCP directly to a pre-validated IP and wrap with strict TLS SNI verification."""
-    ctx = ssl_context or build_strict_tls_context()
-    raw_sock = connect_tcp_pinned_ip(ip, port, timeout=timeout)
+    ctx = require_strict_tls_context(ssl_context)
+    raw_sock = connect_tcp_pinned_ip(ip, port, timeout=timeout, workers=workers)
     try:
-        return ctx.wrap_socket(raw_sock, server_hostname=server_hostname)
-    except Exception:
+        return wrap_pinned_tls(raw_sock, ctx, server_hostname, workers)
+    except BaseException:
         raw_sock.close()
         raise
+    finally:
+        if workers is not None:
+            workers.forget(raw_sock)
 
 
 class HostVaultMemory:
@@ -336,23 +376,34 @@ def generate_ocjob_token() -> str:
 _UMASK_LOCK = threading.Lock()
 
 
-def _unlink_uds_socket_only(sock_path: Path) -> None:
-    try:
-        st = os.lstat(sock_path)
-    except FileNotFoundError:
-        return
-    if not stat.S_ISSOCK(st.st_mode):
-        raise BrokerPolicyError(f"Refusing to unlink non-socket path: {sock_path}")
-    sock_path.unlink()
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    return st.st_dev, st.st_ino
 
 
-def cleanup_uds_socket(sock_path: Path | None) -> None:
-    if sock_path is None:
-        return
-    try:
-        _unlink_uds_socket_only(sock_path)
-    except (OSError, BrokerPolicyError):
-        pass
+@dataclass(slots=True)
+class BoundUds:
+    path: Path
+    directory_fd: int
+    identity: tuple[int, int]
+
+    def unlink_owned(self) -> None:
+        try:
+            entry = os.stat(self.path.name, dir_fd=self.directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(entry.st_mode) or _identity(entry) != self.identity:
+            raise BrokerPolicyError("Unix socket entry changed before cleanup")
+        os.unlink(self.path.name, dir_fd=self.directory_fd)
+
+    def cleanup(self) -> None:
+        if self.directory_fd < 0:
+            return
+        try:
+            fcntl.flock(self.directory_fd, fcntl.LOCK_EX)
+            self.unlink_owned()
+        finally:
+            os.close(self.directory_fd)
+            self.directory_fd = -1
 
 
 def _assert_existing_ancestor_chain_trusted(target_dir: Path, *, sandbox_root: Path | None) -> None:
@@ -382,7 +433,7 @@ def bind_trusted_uds(
     *,
     sandbox_root: Path | None = None,
     backlog: int = 32,
-) -> tuple[socket.socket, Path]:
+) -> tuple[socket.socket, BoundUds]:
     """Verify trust boundaries before creating/binding a 0o600 UDS under a shared umask lock."""
     from oc_schema import (
         PolicyError,
@@ -414,22 +465,44 @@ def bind_trusted_uds(
         raise BrokerPolicyError(str(exc)) from exc
 
     phys_sock = trusted_parent / sock_p.name
-    _unlink_uds_socket_only(phys_sock)
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    directory_fd = os.open(trusted_parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    bound = None
+    srv = None
     try:
-        with _UMASK_LOCK:
-            old_umask = os.umask(0o177)
-            try:
-                srv.bind(str(phys_sock))
-            finally:
-                os.umask(old_umask)
-        os.chmod(phys_sock, 0o600)
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        _bind_private_socket(srv, phys_sock)
+        # Record ownership before running later operations that might fail.
+        entry = os.stat(phys_sock.name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISSOCK(entry.st_mode):
+            raise BrokerPolicyError("Could not establish ownership of the Unix socket entry")
+        bound = BoundUds(phys_sock, directory_fd, _identity(entry))
+        if stat.S_IMODE(entry.st_mode) != 0o600:
+            raise BrokerPolicyError("Unix listener permissions must be 0600")
         srv.listen(backlog)
         srv.settimeout(0.2)
-        return srv, phys_sock
-    except Exception:
-        srv.close()
+        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        return srv, bound
+    except BaseException:
+        try:
+            if srv is not None:
+                srv.close()
+            if bound is not None:
+                bound.unlink_owned()
+        finally:
+            os.close(directory_fd)
         raise
+
+
+def _bind_private_socket(sock: socket.socket, path: Path) -> None:
+    with _UMASK_LOCK:
+        old_umask = os.umask(0o177)
+        try:
+            sock.bind(str(path))
+        except OSError as exc:
+            raise BrokerPolicyError(f"Could not bind Unix listener: {path}") from exc
+        finally:
+            os.umask(old_umask)
 
 
 def bind_loopback_tcp(host: str, port: int, *, backlog: int = 32) -> tuple[socket.socket, int]:
@@ -467,6 +540,97 @@ def _safe_shutdown_close(sock: socket.socket) -> None:
         sock.close()
     except OSError:
         pass
+
+
+class ListenerWorkers:
+    """Track one listener's threads and streams independently of the job lease."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stopping = False
+        self._workers: set[threading.Thread] = set()
+        self._streams: set[socket.socket] = set()
+
+    def start(self, task: Callable[..., None], *args: Any) -> bool:
+        def run() -> None:
+            try:
+                task(*args)
+            finally:
+                with self._lock:
+                    self._workers.discard(threading.current_thread())
+
+        with self._lock:
+            if self._stopping:
+                return False
+            worker = threading.Thread(target=run, daemon=True)
+            self._workers.add(worker)
+            try:
+                worker.start()
+            except BaseException:
+                self._workers.discard(worker)
+                raise
+            return True
+
+    def track(self, sock: socket.socket) -> None:
+        with self._lock:
+            if not self._stopping:
+                self._streams.add(sock)
+                return
+        _safe_shutdown_close(sock)
+        raise BrokerError("Broker listener is stopping")
+
+    def forget(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._streams.discard(sock)
+
+    def serve(
+        self, listener: socket.socket, handler: Callable[[socket.socket], None], capacity: int
+    ) -> None:
+        slots = threading.BoundedSemaphore(capacity)
+
+        def handle(client: socket.socket) -> None:
+            try:
+                handler(client)
+            finally:
+                self.forget(client)
+                _safe_shutdown_close(client)
+                slots.release()
+
+        while True:
+            try:
+                client, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            if not slots.acquire(blocking=False):
+                client.close()
+                continue
+            started = False
+            try:
+                self.track(client)
+                started = self.start(handle, client)
+            except BrokerError:
+                return
+            finally:
+                if not started:
+                    self.forget(client)
+                    _safe_shutdown_close(client)
+                    slots.release()
+
+    def stop(self, listener: socket.socket, *, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self._lock:
+            self._stopping = True
+            streams = tuple(self._streams)
+            workers = tuple(self._workers)
+        _safe_shutdown_close(listener)
+        for sock in streams:
+            _safe_shutdown_close(sock)
+        for worker in workers:
+            worker.join(max(0.0, deadline - time.monotonic()))
+        if any(worker.is_alive() for worker in workers):
+            raise BrokerError("Broker stop incomplete; workers are still running")
 
 
 class BrokerLease:

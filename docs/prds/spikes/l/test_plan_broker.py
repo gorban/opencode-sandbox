@@ -358,6 +358,37 @@ class TestPlanBrokerSplitAndGates(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_only_one_postgres_route_can_use_the_broker_listener(self) -> None:
+        def pg(name: str, delivery: str) -> str:
+            return (
+                f'[broker_services.{name}]\nkind = "postgres"\nhost = "{name}.example.com"\n'
+                f'database = "{name}"\nread_only_user = "reporting"\n'
+                f'read_only_secret_ref = "keeper:{name}"\ncredential_delivery = "{delivery}"\n'
+            )
+
+        self.store.operator_direct_upsert(
+            "sandbox-type", "team/interactive-pg",
+            _sandbox_type_toml("team/interactive-pg"),
+        )
+        for second in ("host-brokered", "raw-container-mount"):
+            with self.subTest(second=second):
+                self.store.operator_direct_upsert(
+                    "bundle", "team/pg-pair",
+                    _bundle_toml("team/pg-pair", pg("primary", "host-brokered") + pg("secondary", second)),
+                )
+                options = PlanOverrides(
+                    with_mods=("team/pg-pair",),
+                    allow_raw_remote_mounts=frozenset({"pg:secondary"}) if second != "host-brokered" else frozenset(),
+                )
+                if second == "host-brokered":
+                    with self.assertRaisesRegex(PlanError, "only one host-brokered Postgres route"):
+                        compile_plan(self.store, "team/interactive-pg", overrides=options)
+                else:
+                    result = compile_plan(self.store, "team/interactive-pg", overrides=options)
+                    self.assertEqual(
+                        result.plan["broker_routes"]["pg:secondary"]["credential_delivery"], second
+                    )
+
     def test_host_brokered_split_linux_vs_macos_and_broker_client_env(self) -> None:
         self.store.operator_direct_upsert(
             "bundle",

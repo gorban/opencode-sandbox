@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import base64
 from dataclasses import dataclass, field
 import hashlib
@@ -976,6 +978,27 @@ class TestHostPostgresBroker(unittest.TestCase):
             srv.stop()
             mock.stop()
 
+    def test_stop_closes_established_postgres_session_without_revoking_sibling(self) -> None:
+        mock = _MockUpstreamPgServer(self._cert_path, self._key_path)
+        mock.start()
+        self.addCleanup(mock.stop)
+        lease = BrokerLease("shared_postgres_fixture")
+        route = self._make_route(mock.port)
+        options = {
+            "resolver": _loopback_resolver,
+            "allow_test_loopback": True,
+            "ssl_context": self._client_ssl,
+        }
+        with HostPostgresBrokerServer(route, self._make_vault(), lease, **options) as sibling:
+            with HostPostgresBrokerServer(route, self._make_vault(), lease, **options) as broker:
+                with socket.create_connection(("127.0.0.1", broker.bound_port), timeout=4.0) as client:
+                    _client_handshake(client, lease.ocjob_token)
+                    broker.stop()
+                    self.assertEqual(client.recv(1), b"")
+                self.assertTrue(lease.is_active())
+                with socket.create_connection(("127.0.0.1", sibling.bound_port), timeout=4.0) as client:
+                    _client_handshake(client, lease.ocjob_token)
+
     def test_pg_controller_revocation_sub_second_and_stalled_cancel_nonblocking(self) -> None:
         now = [100]
         op = occ.Principal(occ.Role.OPERATOR, "host_op")
@@ -1168,6 +1191,7 @@ class TestHostSshBroker(unittest.TestCase):
         os.chmod(self._root, 0o700)
         self._sandbox = self._root / "sandbox"
         self._sandbox.mkdir(mode=0o700)
+        self._ssh_lease = BrokerLease("ssh_test_job")
         self._kh = self._root / "known_hosts"
         self._kh.write_text("ops.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAtest\n", encoding="utf-8")
         os.chmod(self._kh, 0o600)
@@ -1181,6 +1205,8 @@ class TestHostSshBroker(unittest.TestCase):
 
     def _make_target(self, **overrides: object) -> SshTarget:
         kwargs: dict[str, object] = {
+            "allowed_presets": frozenset({"journalctl", "systemctl_status", "df", "podman_ps"}),
+            "lease": self._ssh_lease,
             "user": "ops_ro",
             "host": "ops.example.com",
             "port": 2222,
@@ -1203,10 +1229,10 @@ class TestHostSshBroker(unittest.TestCase):
         )
         target = self._make_target()
 
-        broker.run_preset(target, "journalctl", {"unit": "caddy@prod.service", "lines": 50})
-        broker.run_preset(target, "systemctl_status", {"unit": "postgresql.service"})
-        broker.run_preset(target, "df", {"path": "/var/lib/containers"})
-        broker.run_preset(target, "podman_ps", {"filter_name": "web_01"})
+        broker.run_preset(target, "journalctl", {"unit": "caddy@prod.service", "lines": 50}, lease=self._ssh_lease)
+        broker.run_preset(target, "systemctl_status", {"unit": "postgresql.service"}, lease=self._ssh_lease)
+        broker.run_preset(target, "df", {"path": "/var/lib/containers"}, lease=self._ssh_lease)
+        broker.run_preset(target, "podman_ps", {"filter_name": "web_01"}, lease=self._ssh_lease)
 
         self.assertEqual(len(calls), 4)
         expected_ip = _ip(93, 184, 216, 34)
@@ -1270,7 +1296,7 @@ class TestHostSshBroker(unittest.TestCase):
         ]
         for preset, params in bad_preset_calls:
             with self.subTest(preset=preset, params=params), self.assertRaises(BrokerPolicyError):
-                broker.run_preset(target, preset, params)
+                broker.run_preset(target, preset, params, lease=self._ssh_lease)
 
         for bad_target in (
             self._make_target(user="-oProxyCommand=id"),
@@ -1279,7 +1305,7 @@ class TestHostSshBroker(unittest.TestCase):
             self._make_target(port=70000),
         ):
             with self.subTest(target=bad_target), self.assertRaises(BrokerPolicyError):
-                broker.run_preset(bad_target, "df")
+                broker.run_preset(bad_target, "df", lease=self._ssh_lease)
 
         loopback_broker = HostSshBroker(
             runner=lambda *_a, **_k: SshRawOutput(0, b"", b""),
@@ -1287,7 +1313,7 @@ class TestHostSshBroker(unittest.TestCase):
         )
         loopback_target = self._make_target(host="127.0.0.1")
         with self.assertRaises(BrokerPolicyError):
-            loopback_broker.run_preset(loopback_target, "df")
+            loopback_broker.run_preset(loopback_target, "df", lease=self._ssh_lease)
 
     def test_ssh_known_hosts_security_checks(self) -> None:
         broker = HostSshBroker(
@@ -1300,7 +1326,7 @@ class TestHostSshBroker(unittest.TestCase):
         sym.symlink_to(self._kh)
         sym_target = self._make_target(known_hosts_path=sym)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(sym_target, "df")
+            broker.run_preset(sym_target, "df", lease=self._ssh_lease)
 
         hl_src = self._root / "kh_hard_src"
         hl_src.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
@@ -1309,28 +1335,28 @@ class TestHostSshBroker(unittest.TestCase):
         os.link(hl_src, hl_dst)
         hl_target = self._make_target(known_hosts_path=hl_dst)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(hl_target, "df")
+            broker.run_preset(hl_target, "df", lease=self._ssh_lease)
 
         open_kh = self._root / "kh_open"
         open_kh.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
         os.chmod(open_kh, 0o640)
         open_target = self._make_target(known_hosts_path=open_kh)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(open_target, "df")
+            broker.run_preset(open_target, "df", lease=self._ssh_lease)
 
         sb_kh = self._sandbox / "known_hosts"
         sb_kh.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
         os.chmod(sb_kh, 0o600)
         sb_target = self._make_target(known_hosts_path=sb_kh)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(sb_target, "df")
+            broker.run_preset(sb_target, "df", lease=self._ssh_lease)
 
         pct_kh = self._root / "kh_%h_expand"
         pct_kh.write_text("ops.example.com ssh-ed25519 AAAAtest\n", encoding="utf-8")
         os.chmod(pct_kh, 0o600)
         pct_target = self._make_target(known_hosts_path=pct_kh)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(pct_target, "df")
+            broker.run_preset(pct_target, "df", lease=self._ssh_lease)
 
     def _make_ssh_controller(self) -> tuple[occ.Controller, SshApprovalAdapter, list[int], occ.Principal, occ.Principal]:
         now = [100]
@@ -1467,6 +1493,84 @@ class TestHostSshBroker(unittest.TestCase):
                 controller=ctrl, adapter=adapter, job_actor=job_p, request_id=prop4.request_id,
             )
 
+    def _approve_fixture(self, broker, ctrl, op, job, command):
+        proposed, _ = broker.propose_custom_command(
+            self._make_target(), command, controller=ctrl, job_actor=job,
+            alias="ssh_ops_alias", reference="ref_ssh_apply", target_id="ssh_ops_host",
+        )
+        view = ctrl.view(op, proposed.request_id)
+        ctrl.decide(op, proposed.request_id, view.payload.revision, view.digest, occ.Decision.APPROVE)
+        return proposed.request_id
+
+    def test_ssh_fixture_invocation_delivers_once_to_its_caller(self) -> None:
+        ctrl, adapter, _, op, job = self._make_ssh_controller()
+        entered, challenger, release = threading.Event(), threading.Event(), threading.Event()
+        captured = []
+
+        def runner(argv, **_):
+            captured.append(tuple(argv))
+            entered.set()
+            if not release.wait(4.0):
+                raise TimeoutError("fixture runner was not released")
+            return SshRawOutput(0, b"owner result", b"")
+
+        broker = HostSshBroker(runner=runner, resolver=self._public_resolver)
+        command = ("printf", "fixture")
+        request_id = self._approve_fixture(broker, ctrl, op, job, command)
+
+        def invoke():
+            return broker.run_approved_command(
+                self._make_target(), command, controller=ctrl, adapter=adapter,
+                job_actor=job, request_id=request_id,
+            )
+
+        def concurrent_call():
+            challenger.set()
+            return invoke()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            owner = pool.submit(invoke)
+            try:
+                self.assertTrue(entered.wait(4.0))
+                other = pool.submit(concurrent_call)
+                self.assertTrue(challenger.wait(4.0))
+            finally:
+                release.set()
+            self.assertEqual(owner.result(timeout=4.0).stdout, b"owner result")
+            with self.assertRaises(BrokerAuthError):
+                other.result(timeout=4.0)
+        self.assertEqual([argv[-1] for argv in captured], ["printf fixture"])
+        self.assertEqual(ctrl.status(job, request_id).state, occ.State.SUCCEEDED)
+
+    def test_ssh_fixture_runner_failure_remains_uncertain(self) -> None:
+        ctrl, adapter, _, op, job = self._make_ssh_controller()
+
+        def runner(_argv, **_):
+            raise OSError("synthetic runner ended without a result")
+
+        broker = HostSshBroker(runner=runner, resolver=self._public_resolver)
+        command = ("printf", "fixture")
+        request_id = self._approve_fixture(broker, ctrl, op, job, command)
+        with self.assertRaises(BrokerAuthError):
+            broker.run_approved_command(
+                self._make_target(), command, controller=ctrl, adapter=adapter,
+                job_actor=job, request_id=request_id,
+            )
+        status = ctrl.status(job, request_id)
+        self.assertEqual(status.state, occ.State.UNCERTAIN)
+        self.assertTrue(status.consumed)
+
+    def test_ssh_custom_commands_require_a_fixture_runner(self) -> None:
+        ctrl, _, _, _, job = self._make_ssh_controller()
+        with patch.object(self, "_public_resolver") as resolver:
+            broker = HostSshBroker(resolver=resolver)
+            with self.assertRaisesRegex(BrokerPolicyError, "synthetic fixture runner"):
+                broker.propose_custom_command(
+                    self._make_target(), ("printf", "fixture"), controller=ctrl, job_actor=job,
+                    alias="ssh_ops_alias", reference="ref_ssh_apply", target_id="ssh_ops_host",
+                )
+            resolver.assert_not_called()
+
     def test_ssh_streaming_subprocess_cap_timeout_revoke_and_stderr_canary(self) -> None:
         secret = "SSH_CANARY_HOST_SECRET_774411/+"
 
@@ -1530,7 +1634,7 @@ class TestHostSshBroker(unittest.TestCase):
                 sandbox_root=self._sandbox,
             )
             with self.subTest(leak=leaked_bytes[:12]), self.assertRaises(CanaryLeakError):
-                leak_broker.run_preset(target, "df")
+                leak_broker.run_preset(target, "df", lease=self._ssh_lease)
 
     def test_gate2_r1_ssh_identity_file_env_and_overflow_tail_canary(self) -> None:
         # P2-3: Pinned identity_file emits IdentitiesOnly=yes + IdentityFile and binds digest
@@ -1545,7 +1649,7 @@ class TestHostSshBroker(unittest.TestCase):
             sandbox_root=self._sandbox,
         )
         pinned = self._make_target(identity_file=pub_key)
-        broker.run_preset(pinned, "df")
+        broker.run_preset(pinned, "df", lease=self._ssh_lease)
         self.assertIn("IdentitiesOnly=yes", captured[-1])
         self.assertIn(f"IdentityFile={pub_key.resolve()}", captured[-1])
 
@@ -1568,7 +1672,7 @@ class TestHostSshBroker(unittest.TestCase):
         os.chmod(bad_pub, 0o640)
         bad_id_target = self._make_target(identity_file=bad_pub)
         with self.assertRaises(BrokerPolicyError):
-            broker.run_preset(bad_id_target, "df")
+            broker.run_preset(bad_id_target, "df", lease=self._ssh_lease)
 
         # P2-3: Minimal sanitized env strips arbitrary host env vars & SSH_ASKPASS while keeping SSH_AUTH_SOCK
         env_overrides = {

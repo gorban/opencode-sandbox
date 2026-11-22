@@ -26,6 +26,7 @@ for _p in (str(_SPIKE_DIR), str(_REPO_ROOT)):
 
 import oc_controller as occ  # noqa: E402
 from oc_broker_common import (  # noqa: E402
+    BrokerAuthError,
     BrokerLease,
     BrokerPolicyError,
     HostVaultMemory,
@@ -409,15 +410,15 @@ class TestPrdL1EndToEnd(unittest.TestCase):
                 resolver=_make_resolver("127.0.0.1"),
                 allow_test_loopback=True,
             )
-            target = SshTarget(
-                user=ssh_route["upstream"]["user"],
-                host=ssh_route["upstream"]["host"],
-                known_hosts_path=kh_file,
-                port=ssh_route["upstream"]["port"],
-            )
+            target = SshTarget.from_route(ssh_route, known_hosts_path=kh_file, lease=lease)
             res = ssh_broker.run_preset(target, "df", {"path": "/var/log"}, lease=lease)
             self.assertEqual(res.returncode, 0)
             self.assertIn("ForwardAgent=no", seen_argv[-1])
+            with self.assertRaisesRegex(BrokerPolicyError, "unavailable on this route"):
+                ssh_broker.run_preset(target, "podman_ps", lease=lease)
+            with self.assertRaises(BrokerAuthError):
+                ssh_broker.run_preset(target, "df", lease=BrokerLease("other_fixture_job"))
+            self.assertEqual(len(seen_argv), 1)
             with self.assertRaises(BrokerPolicyError):
                 ssh_broker.run_preset(target, "df", {"path": "/var; rm -rf /"}, lease=lease)
 

@@ -37,15 +37,16 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 from oc_broker_common import (
+    BoundUds,
     BrokerAuthError,
     BrokerLease,
     BrokerPolicyError,
     CanaryLeakError,
     HostVaultMemory,
+    ListenerWorkers,
     OverlapCanaryScanner,
     bind_loopback_tcp,
     bind_trusted_uds,
-    cleanup_uds_socket,
     connect_tls_pinned_ip,
     resolve_and_validate_ip,
     validate_allowed_cidrs,
@@ -2199,7 +2200,7 @@ class HostHttpBrokerServer:
         self.routes_by_prefix = validate_route_table(routes, vault)
         self._socket_path = Path(socket_path) if socket_path is not None else None
         self._sandbox_root = sandbox_root
-        self._bound_uds_path: Path | None = None
+        self._bound_uds: BoundUds | None = None
         if self._socket_path is None:
             try:
                 if not ipaddress.ip_address(host).is_loopback:
@@ -2209,7 +2210,9 @@ class HostHttpBrokerServer:
         self._host = host
         self._port = port
         self._expected_uid = os.geteuid() if expected_uid is None else expected_uid
-        self._conn_sem = threading.BoundedSemaphore(options.get("max_concurrent_conns", MAX_CONCURRENT_CONNS))
+        self._capacity = options.get("max_concurrent_conns", MAX_CONCURRENT_CONNS)
+        if type(self._capacity) is not int or self._capacity < 1:
+            raise BrokerPolicyError("max_concurrent_conns must be >= 1")
         self._read_timeout = float(options.get("read_timeout", READ_TIMEOUT_SECONDS))
         self._write_timeout = float(options.get("write_timeout", WRITE_TIMEOUT_SECONDS))
         self._total_timeout = float(options.get("total_timeout", TOTAL_REQUEST_TIMEOUT_SECONDS))
@@ -2220,54 +2223,46 @@ class HostHttpBrokerServer:
         self._allow_test_loopback = allow_test_loopback
         self._clock = options.get("clock") or time.time
 
-        self._stop = threading.Event()
+        self._lifecycle = threading.Lock()
+        self._workers = ListenerWorkers()
         self._sock: socket.socket | None = None
-        self._thread: threading.Thread | None = None
         self.bound_address: tuple[str, int] | Path | None = None
 
     def start(self) -> tuple[str, int] | Path:
-        if self._socket_path is not None:
-            srv, phys_sock = bind_trusted_uds(
-                self._socket_path, sandbox_root=self._sandbox_root, backlog=32
-            )
-            self._bound_uds_path = phys_sock
-            self.bound_address = phys_sock
-        else:
-            srv, bound_port = bind_loopback_tcp(self._host, self._port, backlog=32)
-            self.bound_address = (str(ipaddress.ip_address(self._host)), bound_port)
-        self._sock = srv
-        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
-        self._thread.start()
-        return self.bound_address
+        with self._lifecycle:
+            if self._sock is not None:
+                raise BrokerPolicyError("HTTP broker has already started; stop it first")
+            if self._socket_path is not None:
+                srv, self._bound_uds = bind_trusted_uds(
+                    self._socket_path, sandbox_root=self._sandbox_root
+                )
+                address = self._bound_uds.path
+            else:
+                srv, port = bind_loopback_tcp(self._host, self._port)
+                address = (str(ipaddress.ip_address(self._host)), port)
+            self._sock = srv
+            try:
+                self._workers.start(self._workers.serve, srv, self._handle_conn, self._capacity)
+            except BaseException:
+                self._stop_locked()
+                raise
+            self.bound_address = address
+            return address
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-        cleanup_uds_socket(self._bound_uds_path)
-        self._bound_uds_path = None
+        with self._lifecycle:
+            self._stop_locked()
 
-    def _accept_loop(self) -> None:
-        srv = self._sock
-        if srv is None:
+    def _stop_locked(self) -> None:
+        if self._sock is None:
             return
-        while not self._stop.is_set():
-            try:
-                conn, _ = srv.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            if not self._conn_sem.acquire(blocking=False):
-                conn.close()
-                continue
-            t = threading.Thread(target=self._handle_conn, args=(conn,), daemon=True)
-            t.start()
+        self._workers.stop(self._sock)
+        if self._bound_uds is not None:
+            self._bound_uds.cleanup()
+        self._bound_uds = None
+        self._workers = ListenerWorkers()
+        self._sock = None
+        self.bound_address = None
 
     def _handle_conn(self, conn: socket.socket) -> None:
         try:
@@ -2299,10 +2294,6 @@ class HostHttpBrokerServer:
                 )
         finally:
             self.lease.unregister_stream(conn)
-            try:
-                conn.close()
-            finally:
-                self._conn_sem.release()
 
     def _process_request(self, conn: socket.socket) -> None:
         if not self.lease.is_active():
@@ -2371,6 +2362,7 @@ class HostHttpBrokerServer:
                 server_hostname=upstream.host,
                 ssl_context=self._ssl_context,
                 timeout=self._read_timeout,
+                workers=self._workers,
             )
         except Exception as exc:
             raise HttpErrorResponse(502, "upstream_connect_failed") from exc
@@ -2388,6 +2380,7 @@ class HostHttpBrokerServer:
             )
         finally:
             self.lease.unregister_stream(up_sock)
+            self._workers.forget(up_sock)
             try:
                 up_sock.close()
             except OSError:
@@ -2447,9 +2440,12 @@ class HostHttpBrokerServer:
             )
             scanned = OverlapCanaryScanner(secrets_list).scan_bytes(raw_body)
             filtered = filter_mcp_tools_list_response(media, scanned, route.wire_policy.allowed_tools)
+            if len(filtered) > self._max_body:
+                raise HttpErrorResponse(502, "upstream_body_too_large")
+            checked = OverlapCanaryScanner(secrets_list).scan_bytes(filtered)
             safe_hdrs = _filter_safe_response_headers(head.headers, head.connection_tokens, secrets_list)
             client_sock.settimeout(self._write_timeout)
-            client_sock.sendall(_format_http_response(head.status, safe_hdrs, filtered))
+            client_sock.sendall(_format_http_response(head.status, safe_hdrs, checked))
             return
 
         if is_sse:

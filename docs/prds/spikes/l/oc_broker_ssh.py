@@ -1,11 +1,12 @@
 """Host-mediated fixed-argv SSH command broker for PRD L1 (Path A).
 
 Pure Python standard library only. Never exposes SSH keys or SSH_AUTH_SOCK to
-the sandbox container. Executes strictly validated read-only presets or
-oc_controller APPLY_ONCE-approved commands with DNS-pinned HostName/HostKeyAlias,
+the sandbox container. Executes strictly validated read-only presets with
+DNS-pinned HostName/HostKeyAlias,
 -F /dev/null non-overridable OpenSSH hardening options, shlex.quote() remote
 token protection, owner-only known_hosts verification, streaming bounded memory
 output/timeout enforcement, lease-revoke process-group kill, and canary scrubbing.
+Custom APPLY_ONCE commands are available only to injected offline fixture runners.
 """
 
 from __future__ import annotations
@@ -76,6 +77,24 @@ class SshTarget:
     port: int = 22
     allowed_cidrs: tuple[str, ...] = ()
     identity_file: Path | None = None
+    allowed_presets: frozenset[str] = frozenset()
+    lease: BrokerLease | None = None
+
+    @classmethod
+    def from_route(
+        cls, route: Mapping[str, Any], *, known_hosts_path: Path, lease: BrokerLease
+    ) -> SshTarget:
+        """Lower host-only compiled policy for this exact job lease."""
+        if (route["kind"], route["credential_delivery"], route["access_mode"]) != (
+            "ssh", "host-brokered", "ro"
+        ):
+            raise BrokerPolicyError("Expected a host-brokered read-only SSH route")
+        upstream = route["upstream"]
+        return cls(
+            user=upstream["user"], host=upstream["host"], port=upstream["port"],
+            known_hosts_path=known_hosts_path, allowed_cidrs=tuple(route["allowed_cidrs"]),
+            allowed_presets=frozenset(route["allowed_presets"]), lease=lease,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -589,13 +608,30 @@ def compute_ssh_command_digest(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class _FixtureCommand:
+    request_id: str
+    target_id: str
+    subject_channel: str
+    digest: str
+    argv: tuple[str, ...]
+
+
+@dataclass(eq=False, slots=True)
+class _FixtureInvocation:
+    command: _FixtureCommand
+    run: Callable[[tuple[str, ...]], SshExecResult]
+    started: bool = False
+    result: SshExecResult | None = None
+
+
 class SshApprovalAdapter:
-    """oc_controller.FixtureAdapter binding APPLY_ONCE target revisions to SSH command digests."""
+    """Dispatch a reserved synthetic command under the fixture controller's lock."""
 
     def __init__(self, initial_revisions: dict[str, str] | None = None):
         self._lock = threading.Lock()
         self._revisions: dict[str, str | None] = dict(initial_revisions or {})
-        self._expected_digest: dict[str, str] = {}
+        self._invocations: dict[str, _FixtureInvocation] = {}
         self._journal: dict[tuple[str, int], Any] = {}
 
     def target_revision(self, target: str) -> str | None:
@@ -606,25 +642,58 @@ class SshApprovalAdapter:
         with self._lock:
             self._revisions[target] = revision
 
-    def expect_digest(self, request_id: str, digest: str) -> None:
+    def reserve(self, invocation: _FixtureInvocation) -> None:
+        key = invocation.command.request_id
         with self._lock:
-            self._expected_digest[request_id] = digest
+            if key in self._invocations:
+                raise BrokerAuthError("SSH invocation already reserved")
+            self._invocations[key] = invocation
+
+    def release(self, invocation: _FixtureInvocation) -> None:
+        key = invocation.command.request_id
+        with self._lock:
+            if self._invocations.get(key) is invocation:
+                del self._invocations[key]
+
+    def _claim(self, attempt: Any, payload: Any) -> _FixtureInvocation | None:
+        from oc_controller import Intent, Operation
+
+        if (attempt.number != 1 or payload.request_id != attempt.request_id
+                or payload.intent is not Intent.APPLY_ONCE
+                or payload.operation is not Operation.APPLY or payload.scope != "fixture:apply"):
+            return None
+        with self._lock:
+            invocation = self._invocations.get(attempt.request_id)
+            if invocation is None or invocation.started:
+                return None
+            command = invocation.command
+            live_rev = self._revisions.get(payload.pin.target)
+            if (command.subject_channel != payload.subject.channel
+                    or command.target_id != payload.pin.target or live_rev is None
+                    or not hmac.compare_digest(live_rev, payload.pin.revision)
+                    or not hmac.compare_digest(command.digest, payload.pin.revision)):
+                return None
+            invocation.started = True
+            return invocation
 
     def dispatch(self, attempt: Any, payload: Any) -> Any:
         from oc_controller import Outcome
 
+        invocation = self._claim(attempt, payload)
+        if invocation is None:
+            outcome = Outcome.DEFINITE_FAILURE
+        else:
+            outcome = Outcome.UNKNOWN
+            try:
+                invocation.result = invocation.run(invocation.command.argv)
+                if invocation.result.returncode == 0:
+                    outcome = Outcome.SUCCEEDED
+            except Exception:
+                # Once entered, a failed runner cannot prove the effect did not happen.
+                pass
         with self._lock:
-            expected = self._expected_digest.pop(attempt.request_id, None)
-            live_rev = self._revisions.get(payload.pin.target)
-            rev_ok = (
-                expected is not None
-                and live_rev is not None
-                and hmac.compare_digest(live_rev, payload.pin.revision)
-                and hmac.compare_digest(expected, payload.pin.revision)
-            )
-            outcome = Outcome.SUCCEEDED if rev_ok else Outcome.DEFINITE_FAILURE
             self._journal[(attempt.request_id, attempt.number)] = outcome
-            return outcome
+        return outcome
 
     def reconcile(self, attempt: Any, payload: Any) -> Any:
         from oc_controller import Outcome
@@ -677,14 +746,19 @@ class HostSshBroker:
         self._allow_test_loopback = allow_test_loopback
         self._sandbox_root = sandbox_root
 
+    def _require_fixture_runner(self) -> SshRunner:
+        if self._runner is None:
+            raise BrokerPolicyError("Custom SSH commands require a synthetic fixture runner")
+        return self._runner
+
     def _run_validated(
         self,
         target: SshTarget,
         remote_tokens: Sequence[str],
         *,
-        lease: BrokerLease | None = None,
+        lease: BrokerLease,
     ) -> SshExecResult:
-        if lease is not None and not lease.is_active():
+        if not lease.is_active():
             raise BrokerAuthError("lease_revoked_or_expired")
         resolved_ip, physical_kh, _, physical_id = validate_ssh_target(
             target,
@@ -699,6 +773,8 @@ class HostSshBroker:
             remote_tokens,
             physical_identity_file=physical_id,
         )
+        if not lease.is_active():
+            raise BrokerAuthError("lease_revoked_or_expired")
         if self._runner is None:
             return _run_streaming_subprocess(
                 argv,
@@ -716,9 +792,13 @@ class HostSshBroker:
         preset: str,
         params: Mapping[str, Any] | None = None,
         *,
-        lease: BrokerLease | None = None,
+        lease: BrokerLease,
     ) -> SshExecResult:
-        """Execute an allowlisted fixed-argv read-only preset."""
+        """Execute a fixed-argv preset authorized by the lease's compiled route."""
+        if lease is None or target.lease is not lease:
+            raise BrokerAuthError("SSH route belongs to another job lease")
+        if type(preset) is not str or preset not in target.allowed_presets:
+            raise BrokerPolicyError("SSH preset is unavailable on this route")
         remote_tokens = build_preset_remote_tokens(preset, params)
         return self._run_validated(target, remote_tokens, lease=lease)
 
@@ -736,6 +816,7 @@ class HostSshBroker:
         """Pin canonical (user, host, port, known_hosts, identity_file, cidrs, argv) digest and propose APPLY_ONCE."""
         from oc_controller import Intent, Proposal
 
+        self._require_fixture_runner()
         _, physical_kh, norm_cidrs, physical_id = validate_ssh_target(
             target,
             resolver=self._resolver,
@@ -767,9 +848,12 @@ class HostSshBroker:
         request_id: str,
         lease: BrokerLease | None = None,
     ) -> SshExecResult:
-        """Execute a non-preset SSH command strictly after oc_controller APPLY_ONCE approval."""
+        """Send the exact approved command to the controller's synthetic adapter."""
         from oc_controller import Conflict, Denied, InvalidRequest, State
 
+        runner = self._require_fixture_runner()
+        if controller._adapter is not adapter:
+            raise BrokerAuthError("SSH adapter does not belong to this controller")
         if lease is not None and not lease.is_active():
             raise BrokerAuthError("lease_revoked_or_expired")
         resolved_ip, physical_kh, norm_cidrs, physical_id = validate_ssh_target(
@@ -778,47 +862,33 @@ class HostSshBroker:
             allow_test_loopback=self._allow_test_loopback,
             sandbox_root=self._sandbox_root,
         )
-        validated_argv = validate_custom_remote_argv(remote_argv)
-        cmd_digest = compute_ssh_command_digest(
-            target.user,
-            target.host,
-            target.port,
-            validated_argv,
-            known_hosts_path=physical_kh,
-            allowed_cidrs=norm_cidrs,
-            identity_file=physical_id,
+        tokens = validate_custom_remote_argv(remote_argv)
+        digest = compute_ssh_command_digest(
+            target.user, target.host, target.port, tokens,
+            known_hosts_path=physical_kh, allowed_cidrs=norm_cidrs, identity_file=physical_id,
         )
+        argv = tuple(build_ssh_argv(target, resolved_ip, physical_kh, tokens, physical_identity_file=physical_id))
+
+        def run(frozen_argv: tuple[str, ...]) -> SshExecResult:
+            raw = runner(list(frozen_argv), timeout=self._timeout, shell=False)
+            return _scan_and_cap_output(raw, self._canary_secrets, self._max_output_bytes)
+
         try:
-            pre_status = controller.status(job_actor, request_id)
-        except (Denied, InvalidRequest) as exc:
-            raise BrokerAuthError(f"Controller rejected SSH command status: {exc}") from exc
-        if not pre_status.eligible or pre_status.revoked or pre_status.consumed:
-            raise BrokerAuthError(
-                f"SSH command not eligible for execution: {pre_status.state}/{pre_status.reason}"
+            status = controller.status(job_actor, request_id)
+            if not status.eligible or status.revoked or status.consumed:
+                raise BrokerAuthError("SSH command is not eligible for execution")
+            if lease is not None and not lease.is_active():
+                raise BrokerAuthError("lease_revoked_or_expired")
+            invocation = _FixtureInvocation(
+                _FixtureCommand(request_id, status.target, job_actor.identifier, digest, argv), run
             )
-        adapter.expect_digest(request_id, cmd_digest)
-        try:
-            invoked = controller.invoke(job_actor, request_id)
+            adapter.reserve(invocation)
+            try:
+                invoked = controller.invoke(job_actor, request_id)
+                if invoked.state is not State.SUCCEEDED or invocation.result is None:
+                    raise BrokerAuthError(f"SSH fixture did not succeed: {invoked.state}/{invoked.reason}")
+                return invocation.result
+            finally:
+                adapter.release(invocation)
         except (Conflict, Denied, InvalidRequest) as exc:
-            raise BrokerAuthError(f"Controller refused SSH APPLY_ONCE invoke: {exc}") from exc
-        if invoked.state is not State.SUCCEEDED:
-            raise BrokerAuthError(
-                f"SSH APPLY_ONCE invoke did not succeed: {invoked.state}/{invoked.reason}"
-            )
-        argv = build_ssh_argv(
-            target,
-            resolved_ip,
-            physical_kh,
-            validated_argv,
-            physical_identity_file=physical_id,
-        )
-        if self._runner is None:
-            return _run_streaming_subprocess(
-                argv,
-                timeout=self._timeout,
-                max_output_bytes=self._max_output_bytes,
-                canary_secrets=self._canary_secrets,
-                lease=lease,
-            )
-        raw = self._runner(argv, timeout=self._timeout, shell=False)
-        return _scan_and_cap_output(raw, self._canary_secrets, self._max_output_bytes)
+            raise BrokerAuthError("Controller refused SSH APPLY_ONCE invocation") from exc

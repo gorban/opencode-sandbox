@@ -1133,6 +1133,12 @@ def _compile_broker_services(
     broker_routes: dict[str, dict[str, Any]],
 ) -> dict[str, str]:
     broker_services = _merge_bundle_broker_services(bundles)
+    postgres_routes = sum(
+        cfg["kind"] == "postgres" and cfg["credential_delivery"] == "host-brokered"
+        for cfg in broker_services.values()
+    )
+    if postgres_routes > 1:
+        raise PlanError("The spike supports only one host-brokered Postgres route per plan")
     broker_client_env: dict[str, str] = {}
     prefix_map = {"http": "http", "postgres": "pg", "ssh": "ssh"}
     for name, cfg in sorted(broker_services.items()):
