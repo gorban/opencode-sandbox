@@ -1,11 +1,12 @@
 """Private rootless Podman environments for measuring and publishing coverage."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 
 from sonar_coverage import REPORT_LIMIT
@@ -115,12 +116,27 @@ class Store:
 @contextmanager
 def private_store(root):
     root.mkdir(mode=0o700)
-    session = Path(f'/run/user/{os.getuid()}')
-    owner_directory(session, private=True)
-    # pasta must open its namespace under the host session runtime directory.
-    runtime = Path(tempfile.mkdtemp(prefix='oc-sonar-runtime-', dir=session))
-    store = Store(root, runtime)
-    store.verify()
+    runtime = None
+    try:
+        session = Path(f'/run/user/{os.getuid()}')
+        owner_directory(session, private=True)
+        # pasta must open its namespace under the host session runtime directory.
+        runtime = Path(tempfile.mkdtemp(prefix='oc-sonar-runtime-', dir=session))
+        store = Store(root, runtime)
+        store.verify()
+    except BaseException as failure:
+        # No containers or images have been created. Never ask an unverified engine to clean up.
+        for directory in (runtime, root):
+            if directory is None:
+                continue
+            try:
+                shutil.rmtree(directory)
+            except OSError as error:
+                note = f'Could not remove private publisher directory {str(directory)!r} ({error})'
+                failure.add_note(note)
+                with suppress(OSError):
+                    print(note, file=sys.stderr)
+        raise
     try:
         yield store
     finally:

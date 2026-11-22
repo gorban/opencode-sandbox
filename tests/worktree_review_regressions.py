@@ -14,6 +14,47 @@ def cmd(*args, **kwargs):
 failures = []
 with tempfile.TemporaryDirectory(prefix='oc-c-review-') as tmp:
     base = pathlib.Path(tmp)
+    sb = base / 'worktree-control'
+    sb.mkdir()
+    repo = sb / 'a'
+    cmd('git', 'init', '-q', '-b', 'main', str(repo))
+    cmd('git', '-C', str(repo), '-c', 'user.name=test', '-c', 'user.email=test@example.invalid',
+        'commit', '--allow-empty', '-qm', 'init')
+    cmd('git', '-C', str(repo), 'worktree', 'add', '--relative-paths', '-b', 'feature', str(sb / 'dest'))
+    admin = repo / '.git' / 'worktrees' / 'dest'
+    worker = [sys.executable, '-c', program.replace('/sandbox', str(sb)), 'init', 'dest', 'a', 'feature']
+    for path in (sb / 'dest' / '.git', admin / 'commondir', admin / 'gitdir'):
+        original = path.read_bytes()
+        path.unlink(); os.mkfifo(path)
+        try:
+            result = subprocess.run(worker, capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 or 'invalid worktree control file' not in result.stderr:
+                failures.append('FIFO control was not refused: ' + path.name)
+        except subprocess.TimeoutExpired:
+            failures.append('worktree control blocked on FIFO: ' + path.name)
+        finally:
+            path.unlink(); path.write_bytes(original)
+    (admin / 'gitdir').write_text('wrong-target\n')
+    result = subprocess.run(worker, capture_output=True, text=True, timeout=2)
+    if result.returncode == 0:
+        failures.append('accepted administrative link to a different worktree')
+
+    if 'tree_run() {' not in source:
+        failures.append('worktree worker has no confined and bounded launch path')
+    else:
+        start_run = source.index('tree_run() {')
+        tree_run = source[start_run:source.index('\n}', start_run) + 2]
+        fixture = '''
+H=(); LEVEL=s0:c7,c9; SB=/fixture; AGENT_MEM=512m; AGENT_IMG=fixture; SANDBOX_TREE_PY=stub
+timeout() { printf '%s\\n' "$@"; }
+tree_run init dest a feature
+'''
+        launch = cmd('bash', '-c', tree_run + '\n' + fixture).stdout.splitlines()
+        if (launch[:3] != ['-k', '5s', '70s'] or '--timeout=60' not in launch
+                or '--network=none' not in launch or 'label=level:s0:c7,c9' not in launch
+                or 'label=disable' in launch):
+            failures.append('unsafe worktree worker launch arguments')
+
     for swap in ('symlink', 'directory'):
         sb = base / swap; sb.mkdir()
         for name in ('a', 'b'):

@@ -1,0 +1,12 @@
+schema_version = 1
+kind = "sandbox-type@1"
+id = "builtin/security-audit"
+description = "Read-only security audit sandbox replacing implementer persona and narrowing MCP tools."
+tier = "managed"
+topology = "isolated-sidecars"
+default_worker = "builtin/local-workstation"
+bundles = ["builtin/api-dev", "builtin/persona-implementer", "builtin/persona-security-reviewer"]
+
+[base_images_by_arch]
+x86_64 = "ghcr.io/anomalyco/opencode@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+arm64  = "ghcr.io/anomalyco/opencode@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"

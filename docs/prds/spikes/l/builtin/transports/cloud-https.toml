@@ -1,0 +1,6 @@
+schema_version = 1
+kind = "transport@1"
+id = "builtin/cloud-https"
+description = "Authenticated HTTPS control API for one-off cloud jobs."
+primitives = ["exec_bounded", "transfer_blob"]
+requires_host_pinning = false

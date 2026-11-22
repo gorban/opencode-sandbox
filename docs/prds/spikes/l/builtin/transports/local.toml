@@ -1,0 +1,6 @@
+schema_version = 1
+kind = "transport@1"
+id = "builtin/local"
+description = "Direct local host exec + UDS/pasta reverse channels."
+primitives = ["exec_bounded", "open_reverse_channel", "transfer_blob", "attach_session"]
+requires_host_pinning = false

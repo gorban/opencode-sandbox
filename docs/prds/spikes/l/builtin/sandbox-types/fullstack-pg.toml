@@ -1,0 +1,18 @@
+schema_version = 1
+kind = "sandbox-type@1"
+id = "builtin/fullstack-pg"
+description = "Managed full-stack sandbox with 0-MCP Postgres app dev, browser QA, and implementer persona."
+tier = "managed"
+topology = "isolated-sidecars"
+default_worker = "builtin/local-workstation"
+bundles = ["builtin/postgres-app", "builtin/browser-desktop", "builtin/persona-implementer"]
+
+[base_images_by_arch]
+x86_64 = "ghcr.io/anomalyco/opencode@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+arm64  = "ghcr.io/anomalyco/opencode@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+[[ports]]
+service = "builtin/postgres"
+endpoint = "pg"
+exposure = "host-loopback"
+host_port = 5432

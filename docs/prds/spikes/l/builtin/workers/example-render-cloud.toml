@@ -1,0 +1,11 @@
+schema_version = 1
+kind = "worker@1"
+id = "builtin/example-render-cloud"
+description = "Example cloud one-off job worker with strict spend/TTL cap."
+host_provider = "builtin/cloud-render"
+transport = "builtin/cloud-https"
+arch = "x86_64"
+os = "linux"
+
+[lease_limits]
+spend_cap_usd = 2.0

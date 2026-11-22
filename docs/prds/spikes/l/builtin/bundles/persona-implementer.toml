@@ -1,0 +1,13 @@
+schema_version = 1
+kind = "bundle@1"
+id = "builtin/persona-implementer"
+description = "Standing implementer persona for feature development sandboxes."
+
+[prompt_slots]
+guardrails = "slots/implementer_guardrails.md"
+
+[persona]
+name = "implementer"
+authority = "implementer"
+mission = "Implement requested changes cleanly with tests. {{guardrails}}"
+denied_mcp_tools = []

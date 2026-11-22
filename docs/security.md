@@ -43,18 +43,22 @@ default. The containers share your host kernel. A microVM runtime such as libkru
   loopback. The agent receives the configured database credentials through its private passfile, so
   treat the database as readable and writable by the agent and never load real data into it. SCRAM
   authenticates clients but does not encrypt the database connection.
-- **Self-updating OpenCode** downloads from the internet at runtime into the `oc-home` volume, which the
-  agents can write to. A compromised session could replace the binary and it would persist (for all
-  instances) until you reset the volume (`oc-sandbox -d -a`).
+- **OpenCode updates:** setup downloads a fresh release in a networked updater with no sandbox or
+  shared home mounts. An offline worker supplies only the current binary's digest and a separate
+  offline worker promotes the new release. Agents can still replace the binary in the shared
+  `oc-home` volume used by agent sessions. See [OpenCode updates](operations.md#startup-updates-and-rebuilds).
 - **Everything in `~/opencode-sandbox` is hostile input for host code**: an agent can replace any file
   or directory there with a symlink at any moment, including between a check and a use.
   - The launcher prepares working directories and the `.bridge/` spool, manages Git worktrees and
     relabels files in throwaway containers. They see only the workspace or agent volume required
     for that operation and run without network, with capabilities dropped except `FOWNER` for
     relabelling. Symlinks resolve inside the container.
-  - Global `-d -a` removes the workspace's `.bridge/` spool after attempting pod removal and
-    clears host state, including the private editor staging directory. It unlinks symlinks in
-    the spool. Project files and worktrees are kept. See [Uninstall](operations.md#uninstall).
+  - Git hooks and fsmonitor are disabled for worktree operations. Checkout filters can still
+    run in the offline worktree container, which uses the agents' SELinux label and a time limit.
+  - Global `-d -a` verifies pod removal and stops the bridge path and service. It stops before
+    purging volumes if editor staging directories remain. Successful cleanup removes the `.bridge/`
+    spool without following its symlinks. Project files and worktrees are kept. See
+    [Uninstall](operations.md#uninstall).
   - The bridge handler (`~/.local/bin/oc-bridge`, Python, outside the sandbox) never resolves a sandbox
     path by name. See below.
 - **Host bridge:** requests are text files in `~/opencode-sandbox/.bridge/requests/`. The handler accepts
@@ -67,11 +71,14 @@ default. The containers share your host kernel. A microVM runtime such as libkru
   - opens files `O_NONBLOCK` and checks the open descriptor with `fstat`, so FIFOs and devices are refused;
   - copies the content into `~/.local/share/oc-sandbox/bridge-stage/` (host-owned, 0700, not mounted) and
     opens that copy;
-  - writes saved edits back by creating a new file `O_EXCL|O_NOFOLLOW` in the pinned parent directory and
-    renaming it over the target, which replaces a directory entry and never follows one. If the file was
-    changed or replaced in the sandbox since it was opened, the edit is saved as `NAME.host-edit` instead;
-  - pins `.bridge/requests` the same way before reading or draining it; a symlink there is removed (only
-    the link) and nothing else happens.
+  - prepares saved edits in private host staging and applies the sandbox's SELinux label before
+    publication. It checks the target before renaming and verifies the published inode. A detected
+    conflict gets a new sibling copy, usually `NAME.host-edit`. If the destination exists, its
+    identity changes during publication, or publication crosses a mount boundary, the staged save
+    remains available for recovery. A concurrent edit can still race the final check and rename;
+  - pins `.bridge/requests` the same way before draining it in paced batches. A symlink there is
+    unlinked. Invalid nonempty directories are moved out of the queue without traversing their
+    contents. The move leaves them under `.bridge/` until sandbox bridge cleanup.
 - **Bridge copies:** `code`/`bcompare` on a path outside `/sandbox` copies it into `.bridge/files/` first
   (the host can only see the sandbox directory). Copies older than 7 days are removed automatically.
 - **Secrets:** these API key variables are forwarded into the agent if set: `ANTHROPIC_API_KEY`,

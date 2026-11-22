@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 
 SOURCE = Path(sys.argv.pop(1)).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parent
+MATRIX_SCRIPT = "matrix.py"
 VERIFY_CLIENT = "/c/openssl_verify.sh"
 ALPINE_OUTPUTS = (
     (VERIFY_CLIENT, "openssl-alpine-verify.tsv"),
@@ -98,7 +99,7 @@ class MatrixIngestionTests(unittest.TestCase):
 
     def matrix(self, *args, cwd=None):
         return subprocess.run(
-            [sys.executable, "-I", str(SOURCE / "matrix.py"), *args],
+            [sys.executable, "-I", str(SOURCE / MATRIX_SCRIPT), *args],
             cwd=self.work if cwd is None else cwd,
             env={**os.environ, "OC_E1_EXPECT": "py"}, text=True, capture_output=True, timeout=5,
         )
@@ -164,12 +165,12 @@ class MatrixIngestionTests(unittest.TestCase):
 
         with (
             patch.object(os, "fstat", changed_fstat),
-            patch.object(sys, "argv", ["matrix.py", "."]),
+            patch.object(sys, "argv", [MATRIX_SCRIPT, "."]),
             contextlib.chdir(self.work),
             contextlib.redirect_stdout(io.StringIO()),
             self.assertRaises(SystemExit) as failure,
         ):
-            runpy.run_path(str(SOURCE / "matrix.py"), run_name="__main__")
+            runpy.run_path(str(SOURCE / MATRIX_SCRIPT), run_name="__main__")
         self.assertIn("Cannot read matrix results: result changed while reading", str(failure.exception))
 
 

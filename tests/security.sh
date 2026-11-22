@@ -24,6 +24,13 @@ check() {  # description, command... ; a leading '!' negates
   if (( r == neg )); then ok "$d"; else bad "$d"; fi
 }
 fn()   { local requested_function=$1; sed -n "/^$requested_function() {/,/^}/p" "$SCRIPT"; }  # extract one function
+host_input_functions() {
+  fn in_sb
+  fn trusted_path
+  fn host_input
+  fn inspect_pg_init
+  printf 'SB=%q\nH=()\n' "$T/pg-sandbox"
+}
 SECRET=TOP-SECRET-HOST-DATA
 
 # ================================================================================================
@@ -41,7 +48,9 @@ cat > "$T/parse.sh" <<EOF
 $(fn trusted_path)
 in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
 die() { echo "\$*" >&2; exit 2; }
-sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T
+$(fn host_input); $(fn inspect_pg_init)
+SB=$T/pg-sandbox H=()
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T CALLER_PWD=$T
 $(fn load_pg_config)
 SCRIPT_DIR=. OC_PG_CONF=$T/pg.env
 load_pg_config
@@ -65,7 +74,9 @@ cat > "$T/parse2.sh" <<EOF
 $(fn trusted_path)
 in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
 die() { echo "\$*" >&2; exit 2; }
-sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T
+$(fn host_input); $(fn inspect_pg_init)
+SB=$T/pg-sandbox H=()
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T CALLER_PWD=$T
 $(fn load_pg_config)
 SCRIPT_DIR=. OC_PG_CONF=$T/pg.env
 load_pg_config; echo "\$PG_PASSWORD"; env > $T/child2.env
@@ -83,18 +94,47 @@ cat > "$T/parse-path.sh" <<EOF
 $(fn trusted_path)
 in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
 die() { echo "\$*" >&2; exit 2; }
-sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T SCRIPT_DIR=.
+$(fn host_input); $(fn inspect_pg_init)
+SB=$T/pg-sandbox H=()
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T CALLER_PWD=$T SCRIPT_DIR=.
 $(fn load_pg_config)
 load_pg_config
 EOF
 check 'host Postgres config symlink outside sandbox is accepted' env -i HOME="$HOME" PATH="$PATH" OC_PG_CONF="$T/pg-host-link" bash "$T/parse-path.sh"
 check 'Postgres config path through sandbox is refused' bash -c '! env -i HOME="$1" PATH="$2" OC_PG_CONF="$3" bash "$4" >/dev/null 2>&1' _ "$HOME" "$PATH" "$T/pg-bad-link" "$T/parse-path.sh"
+mkdir -p "$T/pg-init"
+ln -s "$T/pg-sandbox" "$T/init-link"
+sed '$a\printf "%s\\n" "$PG_INIT"' "$T/parse-path.sh" > "$T/parse-init.sh"
+parse_init() { env -i HOME="$HOME" PATH="$PATH" OC_PG_CONF="$T/pg.env" OC_PG_INIT_DIR="$1" bash "$T/parse-init.sh"; }
+check 'relative Postgres init directory becomes a host bind path' test "$(parse_init pg-init)" = "$T/pg-init"
+check 'Postgres init directory entering sandbox is refused' ! parse_init "$T/init-link"
+check 'Postgres init directory containing sandbox is refused' ! parse_init "$T"
+check 'Postgres init rejects the filesystem root before inspecting it' ! parse_init /
+ln -s "$T/pg.env" "$T/pg-init/01.sql"
+cat > "$T/check-init-tree.sh" <<EOF
+set -euo pipefail
+$(host_input_functions)
+$(fn ensure_postgres)
+PG_INIT=$T/pg-init
+die() { echo "\$*"; exit 2; }
+pg_sig() { :; }
+pm() { echo unexpected-podman-call; exit 4; }
+ensure_postgres
+EOF
+out=$(bash "$T/check-init-tree.sh" 2>&1 || true)
+check 'linked Postgres init file refused before Podman' grep -qx 'Postgres init requires ordinary owner-controlled directories and files without links' <<<"$out"
+check 'linked Postgres init file never reaches Podman' ! grep -q 'unexpected-podman-call' <<<"$out"
+unlink "$T/pg-init/01.sql"
+install -m 0666 /dev/null "$T/pg-init/01.sql"
+out=$(bash "$T/check-init-tree.sh" 2>&1 || true)
+check 'world-writable Postgres init file refused before Podman' grep -q 'owner-controlled' <<<"$out"
 
 # ================================================================================================
 echo "Postgres password exposure (podman stubbed)"
 PW='S3cr3t-pw:@/#'
 cat > "$T/pg.sh" <<EOF
 set -euo pipefail
+$(host_input_functions)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { echo "==> \$*"; }
@@ -126,9 +166,10 @@ unkeyed=$(printf '%s|%s|%s|%s' app "$PW" db "" | sha256sum | cut -c1-16)
 check "volume label is not the unkeyed hash" ! grep -qa "$unkeyed" "$T/argv.log"
 check "signature key is private (0600)"    [ "$(stat -c %a "$T/state/pg-sig.key" 2>/dev/null)" = 600 ]
 
-pgmsg() {  # volume-label -> stderr of ensure_postgres for '-i default' with an existing volume
+pgmsg() {  # volume-label [init-directory] -> stderr of ensure_postgres with an existing volume
   cat > "$T/pgm.sh" <<EOF
 set -euo pipefail
+$(host_input_functions)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { :; }; sleep() { :; }
@@ -140,7 +181,7 @@ pm() {
   esac
   return 0
 }
-STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$T/none INST= ILABEL=default
+STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$(printf '%q' "${2:-$T/none}") INST= ILABEL=default
 PGHBASECRET=oc-pg-hba PGPASSSECRET=oc-pg-passfile PORTS=()
 PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD=pw
 ensure_postgres
@@ -153,6 +194,10 @@ check "legacy-volume hint keeps -i default"   grep -q -- '-i default -d && podma
 out=$(pgmsg mismatch)
 check "settings-mismatch hint keeps -i default" grep -q -- '-i default -d && podman volume rm oc-pg' <<<"$out"
 check "no hint suggests a bare -d"            ! grep -qE '\.sh -d && podman' <<<"$out$(pgmsg "$legacy")"
+mkdir -p "$T/directory-init/empty-subdirectory"
+directory_sig=$({ cat "$T/state/pg-sig.key"; printf '|app|pw|db|abcfa6a9d4df344d'; } | sha256sum | cut -c1-16)
+check "existing volume keeps its directory-only Postgres init signature" \
+  pgmsg "k1:$directory_sig" "$T/directory-init"
 
 # ================================================================================================
 echo "host bridge (oc-bridge.py)"
@@ -194,6 +239,17 @@ check "saved edit written back into the sandbox" [ "$(cat "$SB/construct/a.txt")
 check "staging cleaned after the session"   [ -z "$(ls -A "$T/stage")" ]
 check "queue drained"                       [ -z "$(ls -A "$SB/.bridge/requests")" ]
 
+reset_tool
+echo '{}' > "$SB/construct/test.code-workspace"
+req workspace code /sandbox/construct/test.code-workspace
+{ printf 'code\n/sandbox/construct/a.txt\n'; head -c 8192 /dev/zero | tr '\0' a; } > "$SB/.bridge/requests/over.req"
+bridge
+check 'workspace definitions and oversized requests never reach the host editor' [ ! -e "$T/tool.args" ]
+check 'bridge drains rejected requests' [ -z "$(ls -A "$SB/.bridge/requests")" ]
+req failed-launch code /sandbox/construct/a.txt
+OC_BRIDGE_LAUNCH=/usr/bin/false bridge
+check 'known editor launch failure reclaims its staging directory' [ -z "$(ls -A "$T/stage")" ]
+
 reset_tool; req 2 code /sandbox/construct/dir /etc/passwd /sandbox/../victim/secret \
   /sandbox/construct/link/secret /sandbox/construct/./a.txt; bridge
 check "folders, escapes, symlink components refused" [ ! -e "$T/tool.args" ]
@@ -210,6 +266,20 @@ check "FIFO / symlinked requests not passed to the tool" [ ! -e "$T/tool.args" ]
 check "FIFO / symlinked requests leave host targets intact" victim_ok
 check "drain removed all request entries" [ -z "$(ls -A "$SB/.bridge/requests")" ]
 check "drain leaves request targets intact" victim_ok
+
+mkdir -p "$SB/.bridge/requests/stuck/nested"
+ln -s "$V" "$SB/.bridge/tmp"
+bridge
+check 'nonempty junk leaves the watched queue even with a substituted tmp' test ! -e "$SB/.bridge/requests/stuck"
+check 'quarantining junk keeps the substituted target intact' victim_ok
+unlink "$SB/.bridge/tmp"
+for (( entry=0; entry<1300; entry++ )); do : > "$SB/.bridge/requests/junk-$entry"; done
+for (( batch=0; batch<6; batch++ )); do bridge; done
+check 'queue backlog drains in bounded batches' [ -z "$(ls -A "$SB/.bridge/requests")" ]
+reset_tool; req after-backlog code /sandbox/construct/a.txt; bridge
+check 'bridge still handles requests after backlog' test -s "$T/tool.args"
+check 'bridge units pace bounded batches without tripping the start limits' bash -c \
+  'grep -qF "ExecStartPre=/usr/bin/sleep 1" "$1" && grep -qF "StartLimitIntervalSec=0" "$1" && grep -qF "TriggerLimitIntervalSec=0" "$1"' _ "$SCRIPT"
 
 mv "$SB/.bridge" "$T/bridge.real"; ln -s ../victim "$SB/.bridge"     # $SB/.bridge -> $V (has requests/)
 bridge
@@ -294,6 +364,7 @@ check "failed write-back preserves the sandbox file" grep -qx original "$SB/cons
 bridge_copy_regressions() {
   timeout 20 python3 -I - "$BRIDGE" "$T" <<'PY'
 import errno
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -329,6 +400,49 @@ class CopyTests(unittest.TestCase):
         with patch.object(os, "write", side_effect=lambda fd, data: real_write(fd, data[:2])):
             self.stage()
 
+    def test_bounded_directory_and_session_staging(self):
+        tree = self.target.parent / "tree"
+        (tree / "a" / "b").mkdir(parents=True)
+        for limits in ({"MAX_TREE_DEPTH": 2}, {"MAX_TREE_FILES": 1}):
+            with self.subTest(limits=limits), patch.dict(self.bridge, limits):
+                with self.assertRaises(self.bridge["Refused"]):
+                    self.bridge["stage_request"]("bcompare", ["/sandbox/tree"])
+                self.assertEqual(list(Path(self.bridge["STAGE"]).iterdir()), [])
+        other = self.target.with_name("more.txt")
+        other.write_bytes(base)
+        with patch.dict(self.bridge, MAX_SESSION_BYTES=len(base)):
+            with self.assertRaises(self.bridge["Refused"]):
+                self.bridge["stage_request"]("code", ["/sandbox/edit.txt", "/sandbox/more.txt"])
+        with patch.dict(self.bridge, MAX_STAGE_SESSIONS=1):
+            self.stage()
+            with self.assertRaises(self.bridge["Refused"]):
+                self.stage()
+
+    def test_save_does_not_replace_existing_conflict_copy_or_concurrent_edit(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        conflict = self.target.with_name("edit.txt.host-edit")
+        conflict.write_bytes(b"older host save")
+        fsync = os.fsync
+
+        def edited_during_copy(fd):
+            fsync(fd)
+            self.target.write_bytes(b"agent updated during copy")
+
+        with patch.object(os, "fsync", side_effect=edited_during_copy):
+            self.assertFalse(self.sync(session))
+        self.assertEqual(self.target.read_bytes(), b"agent updated during copy")
+        self.assertEqual(conflict.read_bytes(), b"older host save")
+        self.assertEqual(staged.read_bytes(), edit)
+
+    def test_label_failure_preserves_target_and_staged_edit(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        with patch.dict(self.bridge, SELINUX_LEVEL='s0:c7,c9'), \
+                patch.object(os, 'setxattr', side_effect=PermissionError('fixture')):
+            self.assertFalse(self.sync(session))
+        self.assert_preserved(staged)
+
     def test_short_save_writes(self):
         session, staged = self.stage()
         staged.write_bytes(edit)
@@ -336,14 +450,87 @@ class CopyTests(unittest.TestCase):
             self.assertTrue(self.sync(session))
         self.assertEqual(self.target.read_bytes(), edit)
 
+    def test_pending_save_name_is_private(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        fsync = os.fsync
+
+        def during_copy(fd):
+            fsync(fd)
+            self.assertEqual(list(self.target.parent.glob(".oc-bridge-*")), [])
+
+        with patch.object(os, "fsync", side_effect=during_copy):
+            self.assertTrue(self.sync(session))
+        self.assertEqual(self.target.read_bytes(), edit)
+
+    def test_replaced_publication_keeps_private_save(self):
+        for changed in (False, True):
+            with self.subTest(conflict=changed):
+                self.target.write_bytes(base)
+                session, staged = self.stage()
+                staged.write_bytes(edit)
+                dest = self.target
+                operation = "rename"
+                if changed:
+                    self.target.write_bytes(b"concurrent edit")
+                    dest = self.target.with_name("edit.txt.host-edit")
+                    operation = "link"
+                publish = getattr(os, operation)
+
+                def replace_published_inode(*args, **kwargs):
+                    publish(*args, **kwargs)
+                    replacement = dest.with_name("other-inode")
+                    replacement.write_bytes(b"replacement")
+                    os.replace(replacement, dest)
+
+                with patch.object(os, operation, side_effect=replace_published_inode):
+                    self.assertFalse(self.sync(session))
+                self.assertEqual(dest.read_bytes(), b"replacement")
+                self.assertEqual(staged.read_bytes(), edit)
+
+    def test_cross_mount_preserves_private_save(self):
+        session, staged = self.stage()
+        observations = iter((None, None, None, 0))
+        saves = iter((edit, b"next host edit", b"latest host edit"))
+        errors = StringIO()
+        with patch("subprocess.Popen", return_value=SimpleNamespace(poll=lambda: next(observations))), \
+                patch("time.sleep", side_effect=lambda _: staged.write_bytes(next(saves))), \
+                patch.object(os, "rename", side_effect=OSError(errno.EXDEV, "fixture")) as publish, \
+                patch.object(sys, "stderr", errors):
+            self.bridge["run_session"](str(session))
+        self.assertEqual(publish.call_count, 1)
+        self.assert_preserved(staged, expected=b"latest host edit")
+        self.assertEqual(errors.getvalue().count("must share a mount"), 1)
+        self.assertEqual(errors.getvalue().count(str(session)), 1)
+
+    def test_abandoned_prepared_save_expires_with_session(self):
+        session, staged = self.stage()
+
+        def editor(*args, **kwargs):
+            staged.write_bytes(edit)
+            return SimpleNamespace(poll=lambda: 0)
+
+        with patch("subprocess.Popen", side_effect=editor), \
+                patch.object(os, "rename", side_effect=OSError(errno.EXDEV, "fixture")), \
+                patch.object(os, "unlink", side_effect=PermissionError("interrupted cleanup fixture")):
+            self.bridge["run_session"](str(session))
+        self.assertEqual(len(list(session.glob(".oc-bridge-*"))), 1)
+        os.utime(session, (1, 1))
+        self.bridge["expire_stage"]()
+        self.assertEqual(list(session.parent.iterdir()), [])
+
     def sync(self, session):
         with (session / "manifest.json").open() as manifest:
             entry = json.load(manifest)["entries"][0]
-        files_fd = os.open(session / "files", os.O_RDONLY | os.O_DIRECTORY)
+        session_fd = os.open(session, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            return self.bridge["sync"](files_fd, [entry])
+            files_fd = os.open("files", os.O_RDONLY | os.O_DIRECTORY, dir_fd=session_fd)
+            try:
+                return self.bridge["sync"](session_fd, files_fd, [entry], set())
+            finally:
+                os.close(files_fd)
         finally:
-            os.close(files_fd)
+            os.close(session_fd)
 
     def assert_preserved(self, staged, expected=edit):
         self.assertEqual(self.target.read_bytes(), base)
@@ -461,7 +648,8 @@ kill $swapper; wait $swapper 2>/dev/null || true
 check "race: host file never shown to the tool ($(grep -c . "$T/tool.args" 2>/dev/null || echo 0) opened)" \
   ! grep -q "$SECRET" "$T/tool.seen" 2>/dev/null
 check "race: host file never written"       victim_ok
-check "race: edits reached the sandbox file" [ -n "$(find "$SB/construct" -name f -type f -exec grep -l '^race-' {} +)" ]
+check "race: at least one save was published or retained privately" \
+  [ -n "$(find "$SB/construct" "$T/stage" \( -name f -o -name f.host-edit \) -type f -exec grep -l '^race-' {} +)" ]
 
 # ================================================================================================
 # Every run of the real script below goes through stubs: Podman, systemctl, pkexec, sudo and
@@ -474,6 +662,7 @@ echo "\${0##*/} \$*" >> "$T/stub.log"
 # Optional lifecycle integration stub: every image/volume/pod operation stays in scratch.
 if [ -n "\${STUB_SETUP:-}" ]; then
   case "\$1 \${2:-}" in
+    "pod ls") [ -s "$T/lifecycle/builds" ] || exit 0;;
     "image inspect")
       case "\$4" in *RepoTags*) echo 1; exit 0;; esac
       name=\$5; record="$T/lifecycle/images/\$name"
@@ -519,18 +708,68 @@ case "\${0##*/}" in
     if [ "\$1" = semodule ]; then [ -n "\${STUB_REMOVE_FAIL:-}" ] && exit 1; exit 0; fi ;;
 esac
 case "\$1 \$2" in
-  "pod ls") printf 'oc\noc-other\n' ;;
+  "pod ls")
+    [ -n "\${STUB_LIST_PODS_FAIL:-}" ] && exit 125
+    if [ "\${3:-}" = --format ]; then printf '%b' "\${STUB_UNLABELLED_PODS:-}"; fi
+    [ -n "\${STUB_PODS_ABSENT:-}" ] && exit 0
+    for name in oc oc-other; do
+      if [ -n "\${STUB_POD_REMAINS:-}" ] || ! grep -Fqx "podman pod rm --ignore -f -- \$name" "$T/stub.log"; then
+        printf '%s\\n' "\$name"
+      fi
+    done ;;
+  "pod exists")
+    [ -n "\${STUB_POD_EXISTS_FAIL:-}" ] && exit 125
+    [ -n "\${STUB_PODS_ABSENT:-}" ] && exit 1
+    if [ -z "\${STUB_POD_REMAINS:-}" ] && grep -Fqx "podman pod rm --ignore -f -- \$3" "$T/stub.log"; then exit 1; fi ;;
+  "pod rm") [ -n "\${STUB_POD_REMOVE_FAIL:-}" ] && exit 125 ;;
+  "volume exists"|"secret exists")
+    if grep -Fqx "podman \$1 rm \$3" "$T/stub.log" || \
+       grep -Fqx "podman \$1 rm -f \$3" "$T/stub.log"; then exit 1; fi ;;
+  "volume rm") [ "\${STUB_VOLUME_REMOVE_FAIL:-}" = "\${4:-}" ] && exit 125 ;;
+  "volume ls") [ "\${4:-}" = --filter ] || printf '%b' "\${STUB_LEGACY_VOLUMES:-}" ;;
+  "secret rm") [ "\${STUB_SECRET_REMOVE_FAIL:-}" = "\${3:-}" ] && exit 125 ;;
   "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
   "image inspect")  # STUB_IDS="name=id ...": the image each tag points to; images have no tags left
     case "\$*" in *RepoTags*) echo 0; exit 0 ;; esac
     for m in \${STUB_IDS:-}; do [ "\${m%%=*}" = "\$5" ] && { echo "\${m#*=}"; exit 0; }; done; exit 125 ;;
 esac
+if [ "\${0##*/}" = systemctl ] && [ -n "\${STUB_BRIDGE_STAYS_ACTIVE:-}" ]; then
+  case "\$2" in stop) exit 1 ;; show) echo active; exit 0 ;; esac
+fi
 exit 0
 EOF
 chmod +x "$T/stub/podman"
-for c in systemctl pkexec sudo semodule distrobox-host-exec; do ln -s podman "$T/stub/$c"; done
+for c in systemctl pkexec sudo semodule; do ln -s podman "$T/stub/$c"; done
+cat > "$T/stub/distrobox-host-exec" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+if [[ $1 == /usr/bin/bash ]]; then
+  args=("$@")
+  # Model a shared-looking path that points into the sandbox on the host only.
+  if [[ ${args[-1]} == "$HOME/guest-only-path" ]]; then
+    args[-1]="$HOME/opencode-sandbox/host-path"
+  fi
+  if [[ ${args[-2]} == bridge-stage && -n ${STUB_HOST_STAGE_PATH:-} ]]; then
+    args[-1]=$STUB_HOST_STAGE_PATH
+  fi
+  if [[ ${args[-1]} == "$HOME/.config/systemd/user" && -n ${STUB_HOST_UNITS_PATH:-} ]]; then
+    args[-1]=$STUB_HOST_UNITS_PATH
+  fi
+  exec "${args[@]}"
+fi
+case $1 in
+  cat|podman|systemctl|/usr/bin/python3) exec "$@" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$T/stub/distrobox-host-exec"
 stubbed() { env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "$SCRIPT" "$@"; }
+seed_default_binding() {  # known fake installation used by deletion tests
+  local state="$T/dhome/.local/share/oc-sandbox" directory="$T/dhome/.config/systemd/user/.oc-sandbox"
+  (umask 077; mkdir -p "$directory"; printf '%s\n%s\n' "$state" "$state/bridge-stage" > "$directory/binding")
+}
 del() {  # args... -> log of stubbed commands
+  seed_default_binding
   : > "$T/stub.log"
   stubbed "$@" >/dev/null 2>&1 </dev/null
   cat "$T/stub.log"
@@ -565,13 +804,17 @@ check "refuses empty -i (no global -d)"    argfail "-i needs an instance name" -
 echo "host state outside the sandbox (stubbed)"
 # The agent controls everything under $SB; host state (the image ledger above all) must not be there.
 pathrun() {  # VAR=value... -- script-args...: stderr+rc of a stubbed run with these variables
-  local envs=() rc=0 out next_setting=$1
+  local envs=() rc=0 out next_setting=$1 default_binding=1 option
   while [[ $next_setting != -- ]]; do
     envs+=("$next_setting")
+    case $next_setting in HOME=*|XDG_DATA_HOME=*) default_binding=0 ;; esac
     shift
     next_setting=$1
   done
   shift
+  if (( default_binding )); then
+    for option in "$@"; do [[ $option != -d ]] || { seed_default_binding; break; }; done
+  fi
   : > "$T/stub.log"
   out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "${envs[@]}" \
         "$SCRIPT" "$@" 2>&1 </dev/null) || rc=$?
@@ -586,6 +829,63 @@ helper_out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dh
   bash "$T/helper-repo/oc-sandbox" -d -a -y 2>&1 </dev/null || true)
 check "sandbox-linked lock helper refused" grep -q 'missing or unsafe oc-setup-lock.py' <<<"$helper_out"
 check "sandbox-linked lock helper never executed" test ! -e "$T/helper-executed"
+ln -s "$DSB/lock-helper.py" "$T/helper-repo/oc-bridge.py"
+helper_out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" \
+  bash "$T/helper-repo/oc-sandbox" -n 2>&1 </dev/null || true)
+check 'sandbox-linked bridge helper refused before setup' grep -q 'missing or unsafe oc-bridge.py' <<<"$helper_out"
+out=$(pathrun OC_CODE_BIN="$DSB/editor" -- -n)
+check 'sandbox-side editor executable refused' grep -q 'OC_CODE_BIN must be an absolute path outside the sandbox' <<<"$out"
+out=$(pathrun OC_BCOMPARE_BIN=$'/host/editor\nextra' -- -n)
+check 'newline in editor executable refused' grep -q 'OC_BCOMPARE_BIN must be an absolute path outside the sandbox' <<<"$out"
+out=$(pathrun CONTAINER_ID=fixture OC_CODE_BIN="$T/dhome/guest-only-path" -- -n)
+check 'editor path is refused when it enters the sandbox on the host only' \
+  grep -q 'OC_CODE_BIN must be an absolute path outside the sandbox' <<<"$out"
+out=$(pathrun CONTAINER_ID=fixture OC_PG_IMAGE=fixture OC_PG_USER=fixture \
+  OC_PG_PASSWORD=fixture OC_PG_DB=fixture OC_PG_INIT_DIR="$T/dhome/guest-only-path" -- -p -n)
+check 'Postgres init path is refused when it enters the sandbox on the host only' \
+  grep -q 'refusing unsafe host Postgres init directory' <<<"$out"
+out=$(pathrun CONTAINER_ID=fixture STUB_HOST_STAGE_PATH="$DSB/host-stage" -- -n)
+check 'setup refuses staging that enters the sandbox on the host only' \
+  grep -q 'unsafe host bridge staging directory' <<<"$out"
+check 'unsafe stage is refused before systemd' ! grep -q '^systemctl' "$T/stub.log"
+out=$(pathrun CONTAINER_ID=fixture STUB_HOST_STAGE_PATH="$DSB/host-stage" -- -d -a -y)
+check 'global teardown refuses staging that enters the sandbox on the host only' \
+  grep -q 'unsafe host bridge staging directory' <<<"$out"
+check 'unsafe stage is refused before teardown removes pods' ! grep -q '^podman pod rm' "$T/stub.log"
+mkdir -m 700 "$T/other-host-stage"
+out=$(pathrun CONTAINER_ID=fixture STUB_HOST_STAGE_PATH="$T/other-host-stage" -- -n)
+check 'setup refuses different launcher and host staging directory identities' \
+  grep -q 'launcher and host see different bridge staging directories' <<<"$out"
+mkdir -m 0777 "$T/unprotected-host-stage"
+out=$(pathrun CONTAINER_ID=fixture STUB_HOST_STAGE_PATH="$T/unprotected-host-stage" -- -n)
+check 'setup refuses an unprotected host staging directory' \
+  grep -q 'unsafe host bridge staging directory' <<<"$out"
+ln -s "$T/outer"$'\n' "$T/path-linebreak"
+out=$(pathrun XDG_DATA_HOME="$T/path-linebreak" -- -l)
+check 'line break in symlink target refused before path splitting' grep -q 'refusing to use' <<<"$out"
+mkdir -p "$T/hid/hidraw0" "$T/usb/a/b"
+ln -s "$T/usb/a/b" "$T/hid/hidraw0/device"
+printf '\006\320\361' > "$T/usb/a/b/report_descriptor"
+printf 'Vendor|\033\302\233\nother-device\n' > "$T/usb/manufacturer"
+printf 'Product\r' > "$T/usb/product"
+printf '0102' > "$T/usb/idVendor"
+printf '0304' > "$T/usb/idProduct"
+cat > "$T/check-hid.sh" <<EOF
+set -euo pipefail
+H=()
+$(fn detect_keys | sed "s|/sys/class/hidraw|$T/hid|g")
+detect_keys
+EOF
+check 'FIDO display metadata stays on the detected device record' \
+  test "$(bash "$T/check-hid.sh")" = '/dev/hidraw0|Vendorother-device Product|0102:0304'
+printf 'Vendor\302|\233\302\001\233\302\302\233\233' > "$T/usb/manufacturer"
+check 'FIDO filtering cannot join bytes into terminal controls' \
+  test "$(bash "$T/check-hid.sh")" = '/dev/hidraw0|Vendor Product|0102:0304'
+if [[ -n $(fn fido_device_nodes) ]]; then
+  check 'device argument selection accepts only hidraw paths' test \
+    "$(eval "$(fn fido_device_nodes)"; fido_device_nodes <<< $'/dev/hidraw0|legitimate\nnot-a-device|text\n/dev/hidraw1 extra|text')" \
+    = '/dev/hidraw0'
+fi
 A=$(printf 'a%.0s' {1..64})
 printf '%s\n' "$A" > "$DSB/st/oc-sandbox/built-images"                 # forged by the agent
 echo "$SECRET" > "$T/victim-file"; ln -s "$T/victim-file" "$DSB/st/oc-sandbox/built-images.new"
@@ -622,15 +922,38 @@ check "state dir outside the sandbox: accepted"       ! grep -qE 'refusing to us
 
 echo "delete scope (stubbed)"
 out=$(del -i default -d -a -y)
-check "-i default -d -a removes pod oc"                 grep -qx 'podman pod rm -f oc' <<<"$out"
+check "-i default -d -a removes pod oc"                 grep -qx 'podman pod rm --ignore -f -- oc' <<<"$out"
 check "-i default -d -a leaves other instances"         ! grep -q 'oc-other' <<<"$out"
 check "-i default -d -a leaves bridge, images, login"   ! grep -qE '^systemctl|rmi|oc-home|semodule' <<<"$out"
 check "-i default -d -a removes only default volumes"   grep -qx 'podman volume rm -f oc-pg' <<<"$out"
 out=$(del -d)
-check "bare -d still removes every instance pod"        grep -qx 'podman pod rm -f oc-other' <<<"$out"
+check "bare -d still removes every instance pod"        grep -qx 'podman pod rm --ignore -f -- oc-other' <<<"$out"
+check 'bare -d stops the active bridge service' grep -qx 'systemctl --user stop oc-bridge.service' <<<"$out"
 DSTATE=$T/dhome/.local/share/oc-sandbox
+for fault in STUB_LIST_PODS_FAIL STUB_POD_REMOVE_FAIL STUB_POD_REMAINS STUB_BRIDGE_STAYS_ACTIVE; do
+  mkdir -p "$DSB/.bridge" "$DSTATE/build"
+  : > "$DSB/.bridge/keep"
+  out=$(pathrun "$fault=1" -- -d -a -y)
+  check "teardown preserves bridge data on $fault" test -f "$DSB/.bridge/keep"
+  check "teardown reports failure on $fault" ! grep -qx 'rc=0' <<<"$out"
+  check "teardown preserves build state on $fault" test -d "$DSTATE/build"
+done
+mkdir -m 700 -p "$DSTATE/worktrees"
+(umask 077; printf 'wt/repo/other\nrepo\nother\n' > "$DSTATE/worktrees/other")
+for fault in STUB_VOLUME_REMOVE_FAIL=oc-other-pg STUB_SECRET_REMOVE_FAIL=oc-other-pg-password; do
+  out=$(pathrun "$fault" -- -i other -d -a -y)
+  check "partial instance purge ($fault) reports failure" grep -q 'instance storage cleanup incomplete' <<<"$out"
+  check "partial instance purge ($fault) retains selection" test -f "$DSTATE/worktrees/other"
+done
+out=$(pathrun -- -i other -d -a -y)
+check 'instance -d -a clears only the stale selection record' test ! -e "$DSTATE/worktrees/other"
+check 'clearing the selection record succeeds' grep -qx 'rc=0' <<<"$out"
+out=$(pathrun STUB_POD_EXISTS_FAIL=1 -- -l)
+check 'instance listing reports incomplete inventory' grep -q 'could not list instance pods' <<<"$out"
+check 'instance listing prints no successful table on inventory failure' ! grep -q '^INSTANCE' <<<"$out"
 for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_FAIL=1" \
             "secrets present:STUB_SECRETS=oc-pg-password\\nother\\noc-x-pg-password\\n"; do
+  seed_default_binding
   name=${case%%:*} envset=${case#*:}
   : > "$T/stub.log"; mkdir -p "$DSTATE/build"; rc=0
   env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME "$envset" HOME="$T/dhome" PATH="$T/stub:$PATH" \
@@ -702,14 +1025,99 @@ check "listing failure returns failure" grep -qx 'rc=1' <<<"$out"
 check "listing failure identifies incomplete cleanup" grep -q 'could not list SELinux modules' <<<"$out"
 check "listing failure does not try sudo" ! grep -q '^sudo ' "$T/stub.log"
 check "listing failure retains state for retry" [ -d "$DSTATE" ]
+mkdir -p "$DSB/.bridge"
+: > "$DSB/.bridge/keep"
 out=$(pathrun STUB_REMOVE_FAIL=1 -- -d -a -y)
+check 'SELinux cleanup failure keeps the bridge spool for retry' test -f "$DSB/.bridge/keep"
 check "removal failure returns failure" grep -qx 'rc=1' <<<"$out"
 check "removal failure reports incomplete cleanup" grep -q 'could not remove SELinux module' <<<"$out"
 check "removal failure does not retry with sudo" ! grep -q '^sudo ' "$T/stub.log"
 check "removal failure retains state for retry" [ -d "$DSTATE" ]
+binding_home=$T/binding-home
+binding_stage="$binding_home/.local/share/oc-sandbox/bridge-stage"
+binding_units="$binding_home/.config/systemd/user"
+mkdir -p "$binding_stage/edit" "$binding_units" "$T/alternate-data"
+printf 'unsaved fixture' > "$binding_stage/edit/save"
+printf '[Service]\nEnvironment="OC_BRIDGE_STAGE=%s"\n' "$binding_stage" > "$binding_units/oc-bridge.service"
+out=$(pathrun HOME="$binding_home" XDG_DATA_HOME="$T/alternate-data" -- -d -a -y)
+check 'purge refuses a caller root different from the installed legacy stage' \
+  grep -q 'installed bridge stage differs' <<<"$out"
+check 'legacy stage mismatch is refused before resource removal' \
+  ! grep -qE '^podman (pod|volume) rm|^systemctl' "$T/stub.log"
+check 'legacy stage mismatch preserves the installed service' test -f "$binding_units/oc-bridge.service"
+out=$(pathrun HOME="$binding_home" -- -d -a -y)
+check 'matching legacy stage protects its outstanding save' grep -q 'staged editor sessions remain' <<<"$out"
+check 'refused purge retains the installation binding' test -f "$binding_units/.oc-sandbox/binding"
+out=$(pathrun HOME="$binding_home" XDG_DATA_HOME="$T/alternate-data" -- -d -a -y)
+check 'retry with a different root is refused after dispatcher removal' \
+  grep -q 'installed state or bridge stage differs' <<<"$out"
+check 'different-root retry is refused before resource removal' \
+  ! grep -qE '^podman (pod|volume) rm|^systemctl' "$T/stub.log"
+check 'different-root retry leaves the outstanding save intact' grep -qx 'unsaved fixture' "$binding_stage/edit/save"
+unlink "$binding_stage/edit/save"
+rmdir "$binding_stage/edit"
+out=$(pathrun HOME="$binding_home" -- -d -a -y)
+check 'successful matching purge releases the installation binding' test ! -e "$binding_units/.oc-sandbox/binding"
+alias_home=$T/units-alias-home
+mkdir -p "$alias_home" "$T/caller-config/systemd/user" "$T/host-config/systemd/user"
+ln -s "$T/caller-config" "$alias_home/.config"
+out=$(pathrun CONTAINER_ID=fixture HOME="$alias_home" STUB_HOST_UNITS_PATH="$T/host-config/systemd/user" -- -d -a -y)
+check 'teardown independently resolves the original systemd user path on the host' \
+  grep -q 'launcher and host see different systemd user directories' <<<"$out"
+check 'systemd namespace mismatch is refused before resource removal' \
+  ! grep -qE '^podman (pod|volume) rm|^systemctl' "$T/stub.log"
+legacy_home=$T/legacy-no-unit
+legacy_stage="$legacy_home/.local/share/oc-sandbox/bridge-stage"
+mkdir -p "$legacy_stage/edit"
+printf 'legacy unsaved fixture' > "$legacy_stage/edit/save"
+out=$(pathrun HOME="$legacy_home" XDG_DATA_HOME="$T/alternate-data" STUB_PODS_ABSENT=1 \
+  STUB_LEGACY_VOLUMES=$'oc-home\n' -- -d -a -y)
+check 'teardown refuses legacy volumes without a unit or binding' \
+  grep -q 'legacy sandbox resources remain without an installation binding' <<<"$out"
+check 'unbound legacy teardown is refused before resource removal' \
+  ! grep -qE '^podman (pod|volume) rm|^systemctl' "$T/stub.log"
+check 'unbound legacy teardown preserves the original staged edit' grep -qx 'legacy unsaved fixture' "$legacy_stage/edit/save"
+check 'unbound legacy teardown does not create a binding' test ! -e "$legacy_home/.config/systemd/user/.oc-sandbox/binding"
+out=$(pathrun HOME="$legacy_home" XDG_DATA_HOME="$T/alternate-data" STUB_PODS_ABSENT=1 \
+  STUB_LEGACY_VOLUMES=$'oc-team-pg\n' -- -i team -d -a -y)
+check 'teardown refuses an unlabelled named volume without an installation binding' \
+  grep -q 'legacy sandbox resources remain without an installation binding' <<<"$out"
+check 'unbound named volume produces no binding or removal' \
+  bash -c 'test ! -e "$1" && ! grep -qE "^podman (pod|volume) rm|^systemctl" "$2"' _ \
+    "$legacy_home/.config/systemd/user/.oc-sandbox/binding" "$T/stub.log"
+legacy_pod_home=$T/legacy-named-pod
+mkdir -p "$legacy_pod_home"
+out=$(pathrun HOME="$legacy_pod_home" XDG_DATA_HOME="$T/alternate-data" STUB_PODS_ABSENT=1 \
+  STUB_UNLABELLED_PODS=$'oc-team\n' -- -i team -d -a -y)
+check 'teardown refuses an unlabelled named pod without an installation binding' \
+  grep -q 'legacy sandbox resources remain without an installation binding' <<<"$out"
+check 'unbound named pod produces no binding or removal' \
+  bash -c 'test ! -e "$1" && ! grep -qE "^podman (pod|volume) rm|^systemctl" "$2"' _ \
+    "$legacy_pod_home/.config/systemd/user/.oc-sandbox/binding" "$T/stub.log"
+unrelated_home=$T/unrelated-pod-home
+mkdir -p "$unrelated_home"
+out=$(pathrun HOME="$unrelated_home" STUB_PODS_ABSENT=1 \
+  STUB_UNLABELLED_PODS=$'oc-default\noc-chromium\n' -- -i team -d)
+check 'unrelated unlabelled pods allow an initial binding' grep -qx 'rc=0' <<<"$out"
+check 'the default alias is not removed as an unlabelled pod' ! grep -q '^podman pod rm .*oc-default$' "$T/stub.log"
+unrelated_home=$T/unrelated-volume-home
+mkdir -p "$unrelated_home"
+out=$(pathrun HOME="$unrelated_home" STUB_PODS_ABSENT=1 \
+  STUB_LEGACY_VOLUMES=$'oc-default-pg\noc-agent-pg\n' -- -i team -d -a -y)
+check 'unrelated unlabelled volumes allow an initial binding' grep -qx 'rc=0' <<<"$out"
+check 'the default alias is not removed as an unlabelled volume' ! grep -q '^podman volume rm .*oc-default-pg$' "$T/stub.log"
+mkdir -p "$DSTATE/bridge-stage/edit"
+printf 'unsaved fixture' > "$DSTATE/bridge-stage/edit/save"
+out=$(pathrun -- -d -a -y)
+check 'global purge refuses while staged edits remain' grep -q 'staged editor sessions remain' <<<"$out"
+check 'global purge preserves staged edit' grep -qx 'unsaved fixture' "$DSTATE/bridge-stage/edit/save"
+check 'global purge does not remove volumes with staged edits' ! grep -q '^podman volume rm' "$T/stub.log"
+unlink "$DSTATE/bridge-stage/edit/save"
+rmdir "$DSTATE/bridge-stage/edit"
 # -d -a with a recorded build on oc-agent and a foreign image on oc-chromium
 A=$(printf 'a%.0s' {1..64}) B=$(printf 'b%.0s' {1..64})
 mkdir -p "$DSTATE"; printf '%s\n' "$A" > "$DSTATE/built-images"; : > "$T/stub.log"
+seed_default_binding
 env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME STUB_IDS="oc-agent=$A oc-chromium=$B" HOME="$T/dhome" \
   PATH="$T/stub:$PATH" "$SCRIPT" -d -a -y >/dev/null 2>&1 </dev/null
 check "-d -a: our build untagged and removed"   sh -c "grep -qx 'podman untag $A localhost/oc-agent:latest' '$T/stub.log' \
@@ -733,16 +1141,56 @@ if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; els
       [[ $output == 'update image operand accepted' ]]
     }
     check "real Podman accepts the delimited updater image operand" delimited_update_image
+    real_bridge_mcs() {
+      local fixture=$T/bridge-mcs
+      mkdir -p "$fixture/sandbox" "$fixture/stage"
+      printf 'old' > "$fixture/sandbox/file"
+      "${H[@]}" python3 -I - "$BRIDGE" "$fixture" <<'PYCODE'
+import os
+from pathlib import Path
+import runpy
+import sys
+
+script, directory = sys.argv[1:]
+root = Path(directory)
+os.environ.update(OC_SB=str(root / "sandbox"), OC_BRIDGE_STAGE=str(root / "stage"),
+                  OC_BRIDGE_SELINUX_LEVEL="s0:c7,c9")
+bridge = runpy.run_path(script)
+target = root / "sandbox" / "file"
+for conflict in (False, True):
+    identity = bridge["ident"](target.stat())
+    if conflict:
+        target.write_bytes(b"changed source")
+    with (root / "stage" / "edit").open("w+b") as edit:
+        edit.write(b"saved bytes")
+        edit.seek(0)
+        stage_fd = os.open(root / "stage", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            bridge["write_back"]({"parts": ["file"], "target": identity},
+                                 (edit.fileno(), os.fstat(edit.fileno())), stage_fd)
+        finally:
+            os.close(stage_fd)
+    destination = target.with_name("file.host-edit") if conflict else target
+    assert destination.read_bytes() == b"saved bytes"
+    assert os.getxattr(destination, "security.selinux").rstrip(b"\0") == b"system_u:object_r:container_file_t:s0:c7,c9"
+PYCODE
+    }
+    check "real SELinux bridge saves keep the sandbox MCS label" real_bridge_mcs
     VOL=oc-sectest-$$
     cat > "$T/lib.sh" <<EOF
 H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }
-AGENT_IMG=$TEST_AGENT_IMG HOMEVOL=$VOL LEVEL=s0:c7,c9 SB=\$1; shift
+AGENT_IMG=$TEST_AGENT_IMG AGENT_MEM=512m HOMEVOL=$VOL LEVEL=s0:c7,c9 SB=\$1; shift
 $(sed -n '/^safe_run() {/,/; }$/p' "$SCRIPT")
+$(fn tree_run)
 $(sed -n "/^SANDBOX_TREE_PY=/,/os.makedirs(dest, exist_ok=True)'$/p" "$SCRIPT")
 $(fn init_sandbox_tree)
 $(fn init_bridge_spool)
 $(sed -n "/^RELABEL_PY=/,/file=sys.stderr)'\$/p" "$SCRIPT")
 $(fn relabel_shared)
+if [[ \$1 == init_sandbox_tree ]] && declare -F tree_run >/dev/null; then
+  safe_run --cap-add=FOWNER --entrypoint python3 "\$AGENT_IMG" \
+    -I -c "\$RELABEL_PY" "system_u:object_r:container_file_t:\$LEVEL" /sandbox || exit 1
+fi
 "\$@"
 EOF
     lib() { bash "$T/lib.sh" "$@"; }

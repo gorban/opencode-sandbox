@@ -1,0 +1,40 @@
+schema_version = 1
+kind = "service@1"
+id = "builtin/api-demo"
+description = "Local demo API sidecar requiring PostgreSQL 17."
+provides = ["cap:api.demo@1.0"]
+requires = ["cap:db.postgres@^17.0"]
+cardinality = "singleton"
+security_profile = "standard"
+required_capabilities = ["supports_pods"]
+
+[images_by_arch]
+x86_64 = "ghcr.io/example/demo-api@sha256:3333333333333333333333333333333333333333333333333333333333333333"
+arm64  = "ghcr.io/example/demo-api@sha256:4444444444444444444444444444444444444444444444444444444444444444"
+
+[resources]
+memory = "512m"
+pids_limit = 128
+
+[[endpoints]]
+name = "http"
+port = 8080
+protocol = "http"
+default_exposure = "pod-only"
+max_exposure = "instance-dns"
+requires_auth = false
+tls_policy = "optional"
+host_url_template = "http://{host}:{port}{path}"
+
+[env]
+APP_ENV = "sandbox"
+
+[[secret_slots]]
+slot = "api_local_token"
+target = "/run/secrets/api_local_token"
+mode = "0400"
+secret_ref = "derived:api-demo-local-token"
+
+[readiness_probe]
+kind = "http_local"
+port = 8080

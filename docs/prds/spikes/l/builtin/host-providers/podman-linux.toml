@@ -1,0 +1,18 @@
+schema_version = 1
+kind = "host-provider@1"
+id = "builtin/podman-linux"
+description = "Rootless Podman on Linux with pasta --no-map-gw,-T and native OCI image mounts."
+engine = "podman-linux"
+
+[capabilities]
+supports_pods = true
+supports_pasta = true
+supports_image_mounts = true
+supports_reflink = true
+supports_wayland = true
+supports_dind = true
+multi_tenant_loopback = true
+
+[lease_limits]
+max_ttl_seconds = 86400
+idle_timeout_seconds = 3600
