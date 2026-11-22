@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 import json
+from math import isfinite
 from pathlib import Path
 import re
 import select
@@ -22,6 +23,7 @@ MAX_STREAM = 4 * 1024 * 1024
 JSON_MEDIA_TYPE = "application/json"
 WORKSPACE = "/workspace"
 MESSAGE_ID = re.compile(r"msg_[A-Za-z0-9]{1,92}")
+INVALID_JSON_CHAR = re.compile(r"[\x00\ud800-\udfff]")
 
 
 class ProbeError(RuntimeError):
@@ -48,9 +50,30 @@ def unique_fields(pairs):
     return fields
 
 
+def finite_float(text: str) -> float:
+    number = float(text)
+    if not isfinite(number):
+        raise ValueError("nonfinite JSON number")
+    return number
+
+
+def validate_json_strings(value) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            validate_json_strings(key)
+            validate_json_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            validate_json_strings(item)
+    elif isinstance(value, str) and INVALID_JSON_CHAR.search(value):
+        raise ValueError("invalid JSON string character")
+
+
 def object_json(data: bytes) -> dict:
     try:
-        result = json.loads(data.decode("utf-8"), object_pairs_hook=unique_fields)
+        result = json.loads(data.decode("utf-8"), object_pairs_hook=unique_fields,
+                            parse_float=finite_float, parse_constant=finite_float)
+        validate_json_strings(result)
     except (ValueError, RecursionError) as error:
         raise ProbeError("invalid JSON response") from error
     if not isinstance(result, dict):
@@ -232,7 +255,7 @@ class Response:
         transfer = headers.get(b"transfer-encoding")
         length = headers.get(b"content-length")
         self.length = None
-        if transfer is None and length is not None and re.fullmatch(rb"\d{1,8}", length):
+        if transfer is None and length is not None and re.fullmatch(rb"(?:0|[1-9]\d{0,7})", length):
             self.length = int(length)
         elif transfer != b"chunked" or length is not None:
             raise ProbeError("unsupported HTTP response framing")

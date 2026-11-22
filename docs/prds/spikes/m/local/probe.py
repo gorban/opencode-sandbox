@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import re
 import secrets
@@ -18,7 +19,7 @@ from broker import Broker, EARLY_TEXT, HOLD_TEXT, MODEL_ID, MODEL_PATH, PROOF_CO
 from client import (
     DispatchOutcome, OpenCode, ProbeError, Response, TurnEvent, TurnEvents, TurnPins, remaining, request, unix_wire,
 )
-from runtime import Job, RuntimeError as JobError
+from runtime import Job, JobRuntimeError
 
 
 IMAGE_ID = re.compile(r"(?:sha256:)?[a-f0-9]{64}")
@@ -127,7 +128,7 @@ def prove(job: Job, broker: Broker, attended: bool) -> None:
         # worker-facing write until the host releases this pause.
         with client.pause_prompt(pins(job, thread), "Verify the revoked fixture sends zero bytes.",
                                  time.monotonic() + 10) as paused:
-            report("Paused a separate worker-facing write before the grant check.")
+            report("Paused a separate request before dialing the worker.")
             events.assert_open()
             broker.revoke()
             job.revoke()
@@ -164,7 +165,7 @@ def close_resources(job: Job, broker: Broker | None, error: str | None) -> str |
             error = error or "Broker cleanup failed."
     try:
         job.close()
-    except JobError as exc:
+    except JobRuntimeError as exc:
         print(str(exc), file=sys.stderr)
         error = error or "Container cleanup failed."
     except Exception as exc:
@@ -198,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         interrupted = True
         error = "Run interrupted."
-    except (ProbeError, JobError) as exc:
+    except (ProbeError, JobRuntimeError) as exc:
         error = str(exc)
     except Exception as exc:
         error = f"Run failed ({type(exc).__name__})."
@@ -218,4 +219,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    os.umask(0o077)
     sys.exit(main())

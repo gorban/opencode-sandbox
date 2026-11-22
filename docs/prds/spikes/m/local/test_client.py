@@ -1,12 +1,17 @@
 from dataclasses import replace
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import time
 import unittest
 from unittest.mock import patch
 
 from client import DispatchOutcome, OpenCode, ProbeError, RelayExchange, Response, TurnEvent, TurnEvents, TurnPins, Wire
 from probe import observe
+
+
+INVALID_JSON = "invalid JSON response"
 
 
 def event(kind, session="ses_pinned", **data):
@@ -20,6 +25,10 @@ class ClientTests(unittest.TestCase):
         with peer:
             peer.sendall(raw)
         return Response(Wire(client, time.monotonic() + 1), status=200, media=media)
+
+    def json_response(self, body):
+        head = f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode("ascii")
+        return self.response(head + body)
 
     def test_decode_chunked_events_across_boundaries(self):
         head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
@@ -43,6 +52,64 @@ class ClientTests(unittest.TestCase):
         response = self.response(b"HTTP/1.1 200 OK\r\nContent-Length: 65537\r\n\r\n")
         with self.assertRaisesRegex(ProbeError, "size"):
             response.json()
+
+    def test_require_canonical_content_length(self):
+        for length in (b"00", b"01", b"00000001"):
+            raw = b"HTTP/1.1 200 OK\r\nContent-Length: " + length + b"\r\n\r\n"
+            with self.subTest(length=length), self.assertRaisesRegex(ProbeError, "framing"):
+                self.response(raw)
+        response = self.json_response(b"")
+        self.assertEqual(list(response.chunks(0)), [])
+
+    def test_reject_nonfinite_json_numbers(self):
+        for number in (b"NaN", b"Infinity", b"-Infinity", b"1e400", b"-1e400"):
+            with self.subTest(number=number):
+                response = self.json_response(b'{"data":[{"number":' + number + b"}]}")
+                with self.assertRaisesRegex(ProbeError, INVALID_JSON):
+                    response.json()
+
+    def test_reject_nul_and_unpaired_surrogates_in_nested_json_strings(self):
+        for escaped in (rb"\u0000", rb"\ud800", rb"\udfff"):
+            for body in (
+                b'{"data":{"' + escaped + b'":0}}',
+                b'{"data":[{"value":"' + escaped + b'"}]}',
+            ):
+                with self.subTest(body=body):
+                    response = self.json_response(body)
+                    with self.assertRaisesRegex(ProbeError, INVALID_JSON):
+                        response.json()
+
+    def test_accept_valid_escaped_json_and_utf8(self):
+        body = rb'{"value":"\ud83d\ude80\n\\u0000 ' + "café".encode() + b'", "number":1e20}'
+        response = self.json_response(body)
+        self.assertEqual(response.json(), {"value": "🚀\n\\u0000 café", "number": 1e20})
+
+    def test_apply_json_validation_to_sse_data(self):
+        body = b'data: {"type":"server.connected","data":{"n":1e400}}\n\n'
+        events = self.json_response(body).events()
+        with self.assertRaisesRegex(ProbeError, INVALID_JSON):
+            next(events)
+
+    def test_cli_entrypoint_sets_owner_only_umask_without_import_side_effect(self):
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", """
+import os
+import runpy
+import sys
+
+os.umask(0o022)
+import probe
+assert os.umask(0o022) == 0o022, "import changed the caller's umask"
+sys.argv[1:] = ["--help"]
+try:
+    runpy.run_module("probe", run_name="__main__")
+except SystemExit as exit:
+    assert exit.code == 0
+assert os.umask(0o077) == 0o077, "CLI entrypoint did not set umask 077"
+"""],
+            cwd=Path(__file__).resolve().parent, capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_close_evidence_requires_peer_eof(self):
         client, peer = socket.socketpair()

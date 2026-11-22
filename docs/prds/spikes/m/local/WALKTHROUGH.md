@@ -14,14 +14,17 @@ run. No provider account, production launcher, or existing sandbox home is neede
    Podman, and SELinux enforcing on the workstation. Validate full, locally
    available OpenCode and Python image IDs before creating resources. Keep
    explicit receipts for both containers using a random run label and immutable
-   IDs. A broker started directly on the tested Fedora workstation received
-   SELinux `EACCES` on the relay's connection. The devbox path uses the existing
-   policy and labels.
+   IDs. Validate scratch ancestry before populating the directory and run host
+   commands with an explicit environment. A broker started directly on the
+   tested Fedora workstation received SELinux `EACCES` on the relay's
+   connection. The devbox path uses the existing policy and labels.
 2. Create the OpenCode container without external networking. Give it temporary
    home and workspace state and one synthetic provider on its loopback. Install
    a fixed configuration and distinct synthetic OpenCode and broker credentials.
    Disable inherited credentials, host proxy settings, capabilities and privilege
-   escalation. Leave host ports and personal paths out of the mounts.
+   escalation. Pass the synthetic worker environment through a mode-0600 file
+   outside the mounts and remove it after create. Leave host ports and personal
+   paths out of the mounts.
 3. Start a Python relay in the same isolated network namespace. Give it only a
    read-only source copy, the read-only model socket and grant directories, and
    its private writable control socket directory. Verify the expected images,
@@ -47,8 +50,9 @@ run. No provider account, production launcher, or existing sandbox home is neede
    each dispatch's target, incarnation, grant generation, and selected session
    with the adapter's pins before opening the socket.
 2. The host and relay use the same fixed file-lock inode. State binds incarnation
-   and generation. The relay receives a bounded, single control request and
-   prepares its worker connection. Under the shared fence, it rechecks the
+   and generation. The relay receives a bounded, single control request, denies
+   a terminal grant before dialing, and prepares the worker connection only for
+   an admitted request. Under the shared fence, it rechecks the
    current grant and attempts one nonblocking write to the worker. ZERO requires
    positive evidence that the worker received no bytes. A partial write is UNCERTAIN.
    A fully submitted request reports HANDED_OFF for transport progress only.
@@ -64,9 +68,10 @@ run. No provider account, production launcher, or existing sandbox home is neede
    report failure. Verify refusal of a new request with
    the correct stale bearer while the containers remain running. Record whether
    the held response shut down before teardown.
-4. Exercise the final write boundary separately. Pause a relay request just
-   before taking the fence, revoke and confirm terminal state, then release the
-   pause. Require a zero-write receipt and no new fake-upstream admission.
+4. Pause a relay request before dialing the worker, revoke and confirm terminal
+   state, then release the pause. Require a zero-write receipt and no new
+   fake-upstream admission. A socket fixture covers the later race where grant
+   revocation falls between the initial admission check and the fenced write.
 5. Mark a create pending in the private receipt before calling Podman. Close
    sockets and remove resources by verified label and immutable ID. Check the
    complete run-label inventory before reporting cleanup. An unacknowledged

@@ -1,5 +1,6 @@
 """Loopback relay for the offline PoC. Copy this file into the isolated sidecar."""
 
+import contextlib
 import fcntl
 import os
 from pathlib import Path
@@ -186,17 +187,26 @@ def control(client: socket.socket, active: bytes) -> None:
     if mode not in (b"N", b"P") or not 0 < length <= REQUEST_LIMIT:
         return
     request = read_exact(client, length, deadline)
+    client.settimeout(FRAME_TIMEOUT)
+    # Reject closed grants before dialing. Handoff checks again under the write fence.
+    if not grant_active(GRANT, active):
+        client.sendall(b"Z")
+        return
+    if mode == b"P":
+        # Standalone probe handshake. An integration must opt in to this test-only pause.
+        client.sendall(b"P")
+        if read_exact(client, 1, time.monotonic() + FRAME_TIMEOUT) != b"G":
+            return
+        client.settimeout(FRAME_TIMEOUT)
+        if not grant_active(GRANT, active):
+            client.sendall(b"Z")
+            return
     try:
         worker = socket.create_connection(WORKER, timeout=FRAME_TIMEOUT)
     except OSError:
         client.sendall(b"Z")
         return
     with worker:
-        if mode == b"P":
-            client.settimeout(FRAME_TIMEOUT)
-            client.sendall(b"P")
-            if read_exact(client, 1, time.monotonic() + FRAME_TIMEOUT) != b"G":
-                return
         worker.setblocking(False)
         status = handoff(worker, request, GRANT, active)
         client.settimeout(FRAME_TIMEOUT)
@@ -251,7 +261,12 @@ def serve(active: bytes) -> None:
                     if not slots.acquire(blocking=False):
                         client.close()
                         continue
-                    threading.Thread(target=handle, args=(client, handler, slots), daemon=True).start()
+                    try:
+                        threading.Thread(target=handle, args=(client, handler, slots), daemon=True).start()
+                    except RuntimeError:
+                        slots.release()
+                        with contextlib.suppress(OSError):
+                            client.close()
 
 
 if __name__ == "__main__":

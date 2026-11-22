@@ -8,8 +8,10 @@ session bus in `devbox`, with
 `/usr/bin/getfattr` available on the host. The driver and its in-process model
 broker run in `devbox`. The driver verifies its private scratch directory under
 `/tmp` is shared with the host, then uses bounded host calls without a PTY to
-start two containers in an isolated network namespace. It generates both
-credentials for the run.
+start two containers in an isolated network namespace. The host commands use
+an explicit environment. The probe generates synthetic credentials and passes
+the worker environment through a private temporary file outside its mounts.
+Podman inspection can still show the container's synthetic environment.
 
 On this Fedora policy, launching Python directly in the workstation's
 `unconfined_t` context caused SELinux to deny the relay's Unix-socket connection
@@ -50,7 +52,7 @@ receipt, even if the final inventory is empty.
    write tool. The host independently checks that the scratch file contains exactly
    `local OpenCode proof` followed by a newline.
 3. The host sees a second response held open and pauses a separate prompt
-   before the relay's worker-facing write. It confirms that the control
+   before the relay dials the worker. It confirms that the control
    event stream is still open, revokes the grant, and verifies peer EOF on
    that stream and shutdown of the held broker socket. Releasing the paused
    attempt yields `zero_bytes_sent`.
