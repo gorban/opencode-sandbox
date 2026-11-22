@@ -134,6 +134,9 @@ copies. If any editor staging directories remain in `bridge-stage/`, teardown st
 before deleting volumes. Close the editors or recover the saved copies before retrying.
 Use the same `XDG_DATA_HOME` for setup and teardown. The launcher retains the installed state and
 staging paths for retries, even after stopping the bridge and removing its units.
+If an older teardown removed the service before recording that binding, the launcher refuses to
+adopt leftover pods, volumes or secrets. Restore the original service file from a trusted backup
+or recover the staged edits and back up the legacy volumes before removing those resources by name.
 Successful teardown clears the installation binding and host state and retains the lock files.
 A SELinux removal failure keeps host state and the workspace's `.bridge/` spool for retry.
 Remove the checkout or extracted ZIP directory once teardown succeeds. The example uses the

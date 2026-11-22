@@ -662,6 +662,7 @@ echo "\${0##*/} \$*" >> "$T/stub.log"
 # Optional lifecycle integration stub: every image/volume/pod operation stays in scratch.
 if [ -n "\${STUB_SETUP:-}" ]; then
   case "\$1 \${2:-}" in
+    "pod ls") [ -s "$T/lifecycle/builds" ] || exit 0;;
     "image inspect")
       case "\$4" in *RepoTags*) echo 1; exit 0;; esac
       name=\$5; record="$T/lifecycle/images/\$name"
@@ -709,6 +710,7 @@ esac
 case "\$1 \$2" in
   "pod ls")
     [ -n "\${STUB_LIST_PODS_FAIL:-}" ] && exit 125
+    [ -n "\${STUB_PODS_ABSENT:-}" ] && exit 0
     for name in oc oc-other; do
       if [ -n "\${STUB_POD_REMAINS:-}" ] || ! grep -Fqx "podman pod rm --ignore -f -- \$name" "$T/stub.log"; then
         printf '%s\\n' "\$name"
@@ -716,12 +718,14 @@ case "\$1 \$2" in
     done ;;
   "pod exists")
     [ -n "\${STUB_POD_EXISTS_FAIL:-}" ] && exit 125
+    [ -n "\${STUB_PODS_ABSENT:-}" ] && exit 1
     if [ -z "\${STUB_POD_REMAINS:-}" ] && grep -Fqx "podman pod rm --ignore -f -- \$3" "$T/stub.log"; then exit 1; fi ;;
   "pod rm") [ -n "\${STUB_POD_REMOVE_FAIL:-}" ] && exit 125 ;;
   "volume exists"|"secret exists")
     if grep -Fqx "podman \$1 rm \$3" "$T/stub.log" || \
        grep -Fqx "podman \$1 rm -f \$3" "$T/stub.log"; then exit 1; fi ;;
   "volume rm") [ "\${STUB_VOLUME_REMOVE_FAIL:-}" = "\${4:-}" ] && exit 125 ;;
+  "volume ls") [ "\${4:-}" = --filter ] || printf '%b' "\${STUB_LEGACY_VOLUMES:-}" ;;
   "secret rm") [ "\${STUB_SECRET_REMOVE_FAIL:-}" = "\${3:-}" ] && exit 125 ;;
   "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
   "image inspect")  # STUB_IDS="name=id ...": the image each tag points to; images have no tags left
@@ -747,6 +751,9 @@ if [[ $1 == /usr/bin/bash ]]; then
   if [[ ${args[-2]} == bridge-stage && -n ${STUB_HOST_STAGE_PATH:-} ]]; then
     args[-1]=$STUB_HOST_STAGE_PATH
   fi
+  if [[ ${args[-1]} == "$HOME/.config/systemd/user" && -n ${STUB_HOST_UNITS_PATH:-} ]]; then
+    args[-1]=$STUB_HOST_UNITS_PATH
+  fi
   exec "${args[@]}"
 fi
 case $1 in
@@ -756,7 +763,12 @@ esac
 EOF
 chmod +x "$T/stub/distrobox-host-exec"
 stubbed() { env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "$SCRIPT" "$@"; }
+seed_default_binding() {  # known fake installation used by deletion tests
+  local state="$T/dhome/.local/share/oc-sandbox" directory="$T/dhome/.config/systemd/user/.oc-sandbox"
+  (umask 077; mkdir -p "$directory"; printf '%s\n%s\n' "$state" "$state/bridge-stage" > "$directory/binding")
+}
 del() {  # args... -> log of stubbed commands
+  seed_default_binding
   : > "$T/stub.log"
   stubbed "$@" >/dev/null 2>&1 </dev/null
   cat "$T/stub.log"
@@ -791,13 +803,17 @@ check "refuses empty -i (no global -d)"    argfail "-i needs an instance name" -
 echo "host state outside the sandbox (stubbed)"
 # The agent controls everything under $SB; host state (the image ledger above all) must not be there.
 pathrun() {  # VAR=value... -- script-args...: stderr+rc of a stubbed run with these variables
-  local envs=() rc=0 out next_setting=$1
+  local envs=() rc=0 out next_setting=$1 default_binding=1 option
   while [[ $next_setting != -- ]]; do
     envs+=("$next_setting")
+    case $next_setting in HOME=*|XDG_DATA_HOME=*) default_binding=0 ;; esac
     shift
     next_setting=$1
   done
   shift
+  if (( default_binding )); then
+    for option in "$@"; do [[ $option != -d ]] || { seed_default_binding; break; }; done
+  fi
   : > "$T/stub.log"
   out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "${envs[@]}" \
         "$SCRIPT" "$@" 2>&1 </dev/null) || rc=$?
@@ -936,6 +952,7 @@ check 'instance listing reports incomplete inventory' grep -q 'could not list in
 check 'instance listing prints no successful table on inventory failure' ! grep -q '^INSTANCE' <<<"$out"
 for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_FAIL=1" \
             "secrets present:STUB_SECRETS=oc-pg-password\\nother\\noc-x-pg-password\\n"; do
+  seed_default_binding
   name=${case%%:*} envset=${case#*:}
   : > "$T/stub.log"; mkdir -p "$DSTATE/build"; rc=0
   env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME "$envset" HOME="$T/dhome" PATH="$T/stub:$PATH" \
@@ -1040,6 +1057,26 @@ unlink "$binding_stage/edit/save"
 rmdir "$binding_stage/edit"
 out=$(pathrun HOME="$binding_home" -- -d -a -y)
 check 'successful matching purge releases the installation binding' test ! -e "$binding_units/.oc-sandbox/binding"
+alias_home=$T/units-alias-home
+mkdir -p "$alias_home" "$T/caller-config/systemd/user" "$T/host-config/systemd/user"
+ln -s "$T/caller-config" "$alias_home/.config"
+out=$(pathrun CONTAINER_ID=fixture HOME="$alias_home" STUB_HOST_UNITS_PATH="$T/host-config/systemd/user" -- -d -a -y)
+check 'teardown independently resolves the original systemd user path on the host' \
+  grep -q 'launcher and host see different systemd user directories' <<<"$out"
+check 'systemd namespace mismatch is refused before resource removal' \
+  ! grep -qE '^podman (pod|volume) rm|^systemctl' "$T/stub.log"
+legacy_home=$T/legacy-no-unit
+legacy_stage="$legacy_home/.local/share/oc-sandbox/bridge-stage"
+mkdir -p "$legacy_stage/edit"
+printf 'legacy unsaved fixture' > "$legacy_stage/edit/save"
+out=$(pathrun HOME="$legacy_home" XDG_DATA_HOME="$T/alternate-data" STUB_PODS_ABSENT=1 \
+  STUB_LEGACY_VOLUMES=$'oc-home\n' -- -d -a -y)
+check 'teardown refuses legacy volumes without a unit or binding' \
+  grep -q 'legacy sandbox resources remain without an installation binding' <<<"$out"
+check 'unbound legacy teardown is refused before resource removal' \
+  ! grep -qE '^podman (pod|volume) rm|^systemctl' "$T/stub.log"
+check 'unbound legacy teardown preserves the original staged edit' grep -qx 'legacy unsaved fixture' "$legacy_stage/edit/save"
+check 'unbound legacy teardown does not create a binding' test ! -e "$legacy_home/.config/systemd/user/.oc-sandbox/binding"
 mkdir -p "$DSTATE/bridge-stage/edit"
 printf 'unsaved fixture' > "$DSTATE/bridge-stage/edit/save"
 out=$(pathrun -- -d -a -y)
@@ -1051,6 +1088,7 @@ rmdir "$DSTATE/bridge-stage/edit"
 # -d -a with a recorded build on oc-agent and a foreign image on oc-chromium
 A=$(printf 'a%.0s' {1..64}) B=$(printf 'b%.0s' {1..64})
 mkdir -p "$DSTATE"; printf '%s\n' "$A" > "$DSTATE/built-images"; : > "$T/stub.log"
+seed_default_binding
 env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME STUB_IDS="oc-agent=$A oc-chromium=$B" HOME="$T/dhome" \
   PATH="$T/stub:$PATH" "$SCRIPT" -d -a -y >/dev/null 2>&1 </dev/null
 check "-d -a: our build untagged and removed"   sh -c "grep -qx 'podman untag $A localhost/oc-agent:latest' '$T/stub.log' \

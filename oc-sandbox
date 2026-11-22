@@ -21,6 +21,7 @@ STATE="${XDG_DATA_HOME:-$HOME/.local/share}/oc-sandbox"
 BUILD="$STATE/build"
 BIN="$HOME/.local/bin"
 UNITS="$HOME/.config/systemd/user"
+UNITS_SOURCE=$UNITS
 AGENT_IMG=oc-agent
 CHROME_IMG=oc-chromium
 # Images this script built, by full ID (one per line). Only those are ever removed by it: the tag
@@ -314,9 +315,9 @@ inspect_pg_init() { # host only; output the existing digest, or no line for an a
 }
 
 shared_host_directory() {
-  local caller_path=$1 description=$2 host_path caller host
+  local caller_path=$1 description=$2 host_source=${3:-$1} host_path caller host
   if (( ! ${#H[@]} )); then printf '%s\n' "$caller_path"; return; fi
-  host_path=$(host_input bridge-stage "$caller_path") || die "unsafe host $description directory"
+  host_path=$(host_input bridge-stage "$host_source") || die "unsafe host $description directory"
   caller=$(validate_host_state caller "$caller_path") || die "unsafe launcher $description directory"
   host=$(validate_host_state host "$host_path") || die "unsafe host $description directory"
   [[ -n $host && $caller == "$host" ]] || die "launcher and host see different $description directories"
@@ -828,10 +829,23 @@ unit_env() {
   v=${v//\\/\\\\}; printf 'Environment="%s=%s"\n' "$1" "${v//\"/\\\"}"
 }
 
+require_empty_installation() {
+  local pods managed_volumes volumes secrets
+  pods=$(instance_pods) || die "could not verify installation pod inventory"
+  managed_volumes=$(pm volume ls -q --filter label=oc.sandbox=1) || die "could not verify managed volume inventory"
+  volumes=$(pm volume ls -q) || die "could not verify legacy volume inventory"
+  secrets=$(pm secret ls --format '{{.Name}}') || die "could not verify installation secret inventory"
+  if [[ -n $pods || -n $managed_volumes ]] ||
+      grep -qxE 'oc-(home|chrome|pg|dind|dind-run)' <<<"$volumes" ||
+      grep -qxE 'oc(-[a-z0-9-]+)?-pg-(password|passfile|hba)' <<<"$secrets"; then
+    die "legacy sandbox resources remain without an installation binding; recover the original data root before setup or teardown"
+  fi
+}
+
 bind_installation() {
   local installed="$UNITS/oc-bridge.service" receipt="$INSTALL_DIR/binding" host_state current expected
-  shared_host_directory "$INSTALL_DIR" 'installation binding' >/dev/null || return 1
-  shared_host_directory "$UNITS" 'systemd user' >/dev/null || return 1
+  shared_host_directory "$UNITS" 'systemd user' "$UNITS_SOURCE" >/dev/null || return 1
+  shared_host_directory "$INSTALL_DIR" 'installation binding' "$UNITS_SOURCE/.oc-sandbox" >/dev/null || return 1
   host_state=$(shared_host_directory "$STATE" 'installation state') || return 1
   expected=$(printf '%s\n%s\n' "$host_state" "$HOST_BRIDGE_STAGE")
   acquire_guard installation exclusive
@@ -847,6 +861,8 @@ bind_installation() {
       grep -qxF -e "$(unit_env OC_BRIDGE_STAGE "$HOST_BRIDGE_STAGE")" \
         -e "$(unit_env OC_BRIDGE_STAGE "$BRIDGE_STAGE")" -- "$installed" \
       || die "installed bridge stage differs; use the original XDG_DATA_HOME"
+  else
+    require_empty_installation
   fi
   printf '%s\n' "$expected" | atomic_host_file "$receipt" 0600 || die "could not record installation binding"
 }

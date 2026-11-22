@@ -37,8 +37,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-host_podman pod create --name oc >/dev/null || { echo "could not create private default-pod sentinel" >&2; exit 1; }
-
 echo "prepare: test repository inside the sandbox (with a hook that must NOT run)"
 OC_PTEST_INBOX_IMAGE=docker.io/alpine/git:latest inbox 'test -d /sandbox' || { echo "bootstrap container or sandbox mount failed" >&2; exit 1; }
 OC_PTEST_INBOX_IMAGE=docker.io/alpine/git:latest inbox 'd=$(mktemp -d "${TMPDIR:-/tmp}/oc-git-check.XXXXXX") || exit 1; trap '\''rm -rf "$d"'\'' EXIT; mkdir "$d/repo" || exit 1; git -C "$d/repo" init -q || exit 1; git -C "$d/repo" -c user.name=Test -c user.email=test@example.invalid -c core.hooksPath=/dev/null commit --allow-empty -qm init || exit 1; git -C "$d/repo" -c core.hooksPath=/dev/null worktree add -q --relative-paths -b oc-test "$d/wt" || exit 1; IFS= read -r link < "$d/wt/.git" || exit 1; case "$link" in "gitdir: ../repo/.git/worktrees/"*) ;; *) exit 1;; esac' || { echo "could not verify bootstrap Git relative-worktree support" >&2; exit 1; }
@@ -64,6 +62,9 @@ check "shared agent image built once" [ "$(grep -hcF '==> Building oc-agent' "$T
 check "shared Chromium image built once" [ "$(grep -hcF '==> Building oc-chromium' "$T/ptest1.log" "$T/ptest2.log" | awk '{n+=$1} END{print n+0}')" -eq 1 ]
 check "setup ptest1" [ $r1 -eq 0 ]; check "setup ptest2" [ $r2 -eq 0 ]
 (( r1 == 0 && r2 == 0 )) || { tail -n 80 -- "$T/ptest1.log" "$T/ptest2.log"; exit 1; }
+# The named-removal test needs a default pod. Keep the bootstrap store empty
+# until setup has recorded its installation binding.
+host_podman pod create --name oc >/dev/null || { echo "could not create private default-pod sentinel" >&2; exit 1; }
 LEVEL=$(cat "${XDG_DATA_HOME:-$HOME/.local/share}/oc-sandbox/sb-level")
 
 echo "worktrees"
