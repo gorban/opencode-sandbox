@@ -519,12 +519,24 @@ case "\${0##*/}" in
     if [ "\$1" = semodule ]; then [ -n "\${STUB_REMOVE_FAIL:-}" ] && exit 1; exit 0; fi ;;
 esac
 case "\$1 \$2" in
-  "pod ls") printf 'oc\noc-other\n' ;;
+  "pod ls")
+    [ -n "\${STUB_LIST_PODS_FAIL:-}" ] && exit 125
+    for name in oc oc-other; do
+      if [ -n "\${STUB_POD_REMAINS:-}" ] || ! grep -Fqx "podman pod rm --ignore -f -- \$name" "$T/stub.log"; then
+        printf '%s\\n' "\$name"
+      fi
+    done ;;
+  "pod exists")
+    if [ -z "\${STUB_POD_REMAINS:-}" ] && grep -Fqx "podman pod rm --ignore -f -- \$3" "$T/stub.log"; then exit 1; fi ;;
+  "pod rm") [ -n "\${STUB_POD_REMOVE_FAIL:-}" ] && exit 125 ;;
   "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
   "image inspect")  # STUB_IDS="name=id ...": the image each tag points to; images have no tags left
     case "\$*" in *RepoTags*) echo 0; exit 0 ;; esac
     for m in \${STUB_IDS:-}; do [ "\${m%%=*}" = "\$5" ] && { echo "\${m#*=}"; exit 0; }; done; exit 125 ;;
 esac
+if [ "\${0##*/}" = systemctl ] && [ -n "\${STUB_BRIDGE_STAYS_ACTIVE:-}" ]; then
+  case "\$2" in stop) exit 1 ;; show) echo active; exit 0 ;; esac
+fi
 exit 0
 EOF
 chmod +x "$T/stub/podman"
@@ -622,13 +634,27 @@ check "state dir outside the sandbox: accepted"       ! grep -qE 'refusing to us
 
 echo "delete scope (stubbed)"
 out=$(del -i default -d -a -y)
-check "-i default -d -a removes pod oc"                 grep -qx 'podman pod rm -f oc' <<<"$out"
+check "-i default -d -a removes pod oc"                 grep -qx 'podman pod rm --ignore -f -- oc' <<<"$out"
 check "-i default -d -a leaves other instances"         ! grep -q 'oc-other' <<<"$out"
 check "-i default -d -a leaves bridge, images, login"   ! grep -qE '^systemctl|rmi|oc-home|semodule' <<<"$out"
 check "-i default -d -a removes only default volumes"   grep -qx 'podman volume rm -f oc-pg' <<<"$out"
 out=$(del -d)
-check "bare -d still removes every instance pod"        grep -qx 'podman pod rm -f oc-other' <<<"$out"
+check "bare -d still removes every instance pod"        grep -qx 'podman pod rm --ignore -f -- oc-other' <<<"$out"
+check 'bare -d stops the active bridge service' grep -qx 'systemctl --user stop oc-bridge.service' <<<"$out"
 DSTATE=$T/dhome/.local/share/oc-sandbox
+for fault in STUB_LIST_PODS_FAIL STUB_POD_REMOVE_FAIL STUB_POD_REMAINS STUB_BRIDGE_STAYS_ACTIVE; do
+  mkdir -p "$DSB/.bridge" "$DSTATE/build"
+  : > "$DSB/.bridge/keep"
+  out=$(pathrun "$fault=1" -- -d -a -y)
+  check "teardown preserves bridge data on $fault" test -f "$DSB/.bridge/keep"
+  check "teardown reports failure on $fault" ! grep -qx 'rc=0' <<<"$out"
+  check "teardown preserves build state on $fault" test -d "$DSTATE/build"
+done
+mkdir -m 700 -p "$DSTATE/worktrees"
+(umask 077; printf 'wt/repo/other\nrepo\nother\n' > "$DSTATE/worktrees/other")
+out=$(pathrun -- -i other -d -a -y)
+check 'instance -d -a clears only the stale selection record' test ! -e "$DSTATE/worktrees/other"
+check 'clearing the selection record succeeds' grep -qx 'rc=0' <<<"$out"
 for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_FAIL=1" \
             "secrets present:STUB_SECRETS=oc-pg-password\\nother\\noc-x-pg-password\\n"; do
   name=${case%%:*} envset=${case#*:}
@@ -702,11 +728,22 @@ check "listing failure returns failure" grep -qx 'rc=1' <<<"$out"
 check "listing failure identifies incomplete cleanup" grep -q 'could not list SELinux modules' <<<"$out"
 check "listing failure does not try sudo" ! grep -q '^sudo ' "$T/stub.log"
 check "listing failure retains state for retry" [ -d "$DSTATE" ]
+mkdir -p "$DSB/.bridge"
+: > "$DSB/.bridge/keep"
 out=$(pathrun STUB_REMOVE_FAIL=1 -- -d -a -y)
+check 'SELinux cleanup failure keeps the bridge spool for retry' test -f "$DSB/.bridge/keep"
 check "removal failure returns failure" grep -qx 'rc=1' <<<"$out"
 check "removal failure reports incomplete cleanup" grep -q 'could not remove SELinux module' <<<"$out"
 check "removal failure does not retry with sudo" ! grep -q '^sudo ' "$T/stub.log"
 check "removal failure retains state for retry" [ -d "$DSTATE" ]
+mkdir -p "$DSTATE/bridge-stage/edit"
+printf 'unsaved fixture' > "$DSTATE/bridge-stage/edit/save"
+out=$(pathrun -- -d -a -y)
+check 'global purge refuses while staged edits remain' grep -q 'staged editor sessions remain' <<<"$out"
+check 'global purge preserves staged edit' grep -qx 'unsaved fixture' "$DSTATE/bridge-stage/edit/save"
+check 'global purge does not remove volumes with staged edits' ! grep -q '^podman volume rm' "$T/stub.log"
+unlink "$DSTATE/bridge-stage/edit/save"
+rmdir "$DSTATE/bridge-stage/edit"
 # -d -a with a recorded build on oc-agent and a foreign image on oc-chromium
 A=$(printf 'a%.0s' {1..64}) B=$(printf 'b%.0s' {1..64})
 mkdir -p "$DSTATE"; printf '%s\n' "$A" > "$DSTATE/built-images"; : > "$T/stub.log"

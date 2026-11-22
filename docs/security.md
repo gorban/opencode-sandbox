@@ -52,9 +52,10 @@ default. The containers share your host kernel. A microVM runtime such as libkru
     relabels files in throwaway containers. They see only the workspace or agent volume required
     for that operation and run without network, with capabilities dropped except `FOWNER` for
     relabelling. Symlinks resolve inside the container.
-  - Global `-d -a` removes the workspace's `.bridge/` spool after attempting pod removal and
-    clears host state, including the private editor staging directory. It unlinks symlinks in
-    the spool. Project files and worktrees are kept. See [Uninstall](operations.md#uninstall).
+  - Global `-d -a` verifies pod removal and stops the bridge path and service. It stops before
+    purging volumes if editor staging directories remain. Successful cleanup removes the `.bridge/`
+    spool without following its symlinks. Project files and worktrees are kept. See
+    [Uninstall](operations.md#uninstall).
   - The bridge handler (`~/.local/bin/oc-bridge`, Python, outside the sandbox) never resolves a sandbox
     path by name. See below.
 - **Host bridge:** requests are text files in `~/opencode-sandbox/.bridge/requests/`. The handler accepts

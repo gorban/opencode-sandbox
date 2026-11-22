@@ -501,7 +501,7 @@ release_worktree_lock() { exec {WORKTREE_LOCK_FD}>&-; wait "$WORKTREE_LOCK_PID" 
 
 # Host-owned metadata: directory and records are opened relative to a no-follow
 # directory fd, and never trusted if a symlink, hard link or unsafe mode is found.
-worktree_state() {  # create | read NAME | write NAME CWD REPO BRANCH
+worktree_state() {  # create | read NAME | drop NAME | write NAME CWD REPO BRANCH
   python3 -I -c '
 import os, re, secrets, stat, sys
 state, mode, *args = sys.argv[1:]
@@ -525,6 +525,7 @@ try:
     try: root = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
         if mode == "read": sys.exit(3)
+        if mode == "drop": sys.exit(0)
         raise
     checked_dir(root)
     if mode == "create":
@@ -533,6 +534,7 @@ try:
     try: directory = os.open("worktrees", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
     except FileNotFoundError:
         if mode == "read": sys.exit(3)
+        if mode == "drop": sys.exit(0)
         raise
     checked_dir(directory, True)
     if mode == "create": sys.exit(0)
@@ -542,6 +544,8 @@ try:
     if mode == "read":
         if existing is None: sys.exit(3)
         sys.stdout.buffer.write(existing)
+    elif mode == "drop":
+        if existing is not None: os.unlink(name, dir_fd=directory)
     elif mode == "write":
         if len(args) != 4: raise ValueError("invalid worktree record")
         data = ("\n".join(args[1:]) + "\n").encode()
@@ -600,8 +604,15 @@ detect_keys() {
 
 # Pods of all instances: labelled ones, plus the default pod made by versions before labels existed.
 instance_pods() {
-  { pm pod ls --filter label=oc.sandbox=1 --format '{{.Name}}' 2>/dev/null || true
-    if pm pod exists oc 2>/dev/null; then echo oc; fi; } | sort -u
+  local pods rc=0
+  pods=$(pm pod ls --filter label=oc.sandbox=1 --format '{{.Name}}') || return 1
+  pm pod exists oc || rc=$?
+  case $rc in
+    0) pods+=$'\noc' ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  if [[ -n $pods ]]; then printf '%s\n' "$pods" | sort -u | sed '/^$/d'; fi
 }
 
 if (( LIST )); then
@@ -706,6 +717,21 @@ load_pg_config() {
 
 # ---- teardown -----------------------------------------------------------------
 confirm() { (( YES )) && return 0; read -r -p "$1 [y/N] " a; [[ $a == [yY]* ]]; }
+remove_pod() {
+  local rc=0
+  pm pod rm --ignore -f -- "$1" >/dev/null || return 1
+  pm pod exists "$1" || rc=$?
+  (( rc == 1 ))
+}
+stop_bridge() {
+  local unit state
+  for unit in oc-bridge.path oc-bridge.service; do
+    if ! sc stop "$unit" >/dev/null 2>&1; then
+      state=$(sc show --property=ActiveState --value "$unit") || return 1
+      [[ $state == inactive || $state == failed ]] || return 1
+    fi
+  done
+}
 # The module is installed by semodule at its default priority (400). A lower-priority
 # module with the same name belongs to someone else and must not be removed.
 remove_chromium_policy() {
@@ -737,11 +763,12 @@ if (( DELETE )); then
   acquire_guard lifecycle exclusive
   if (( INST_SET )); then                                   # one instance only (also -i default)
     log "Removing instance '$ILABEL' (pod $POD)"
-    pm pod rm -f "$POD" >/dev/null 2>&1 || true
+    remove_pod "$POD" || die "could not verify that pod '$POD' was removed"
     if (( ALL )); then
       if confirm "Also delete volumes $CHROMEVOL $PGVOL $DINDVOL $DINDRUN (Chromium profile, Postgres data, docker storage)?"; then
         for v in "$CHROMEVOL" "$PGVOL" "$DINDVOL" "$DINDRUN"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
         pm secret rm "$PGSECRET" "$PGPASSSECRET" "$PGHBASECRET" >/dev/null 2>&1 || true
+        worktree_state drop "$ILABEL" || die "could not clear the worktree selection for '$ILABEL'"
       else echo "Skipped -a part."; fi
     fi
     log "Done. $SB/$DEFAULT_CWD (and any other files in $SB) left untouched."
@@ -752,14 +779,27 @@ if (( DELETE )); then
   if compgen -G "$STATE/opencode-update.*" >/dev/null; then
     die "unresolved OpenCode updater receipts in $STATE; inspect and clean the recorded container IDs before teardown"
   fi
-  for pod in $(instance_pods); do log "Removing pod '$pod'"; pm pod rm -f "$pod" >/dev/null 2>&1 || true; done
+  pods=$(instance_pods) || die "could not list instance pods; teardown stopped"
+  while IFS= read -r pod; do
+    [[ -n $pod ]] || continue
+    log "Removing pod '$pod'"
+    remove_pod "$pod" || die "could not verify that pod '$pod' was removed"
+  done <<<"$pods"
+  pods=$(instance_pods) || die "could not verify that all instance pods were removed"
+  [[ -z $pods ]] || die "instance pods remain; teardown stopped"
   log "Removing host bridge"
-  sc disable --now oc-bridge.path >/dev/null 2>&1 || true
+  stop_bridge || die "could not confirm the host bridge stopped"
+  sc disable oc-bridge.path >/dev/null 2>&1 || true
   rm -f "$UNITS/oc-bridge.path" "$UNITS/oc-bridge.service" "$BIN/oc-bridge"
   sc daemon-reload >/dev/null 2>&1 || true
   if (( ALL )); then
     if ! confirm "Also delete ALL oc-sandbox volumes (OpenCode login, Chromium profiles, Postgres data, docker storage), images and build files?"; then
       echo "Skipped -a part."; exit 0
+    fi
+    if [[ -d $BRIDGE_STAGE ]]; then
+      staged=$(find "$BRIDGE_STAGE" -mindepth 1 -maxdepth 1 -type d -print -quit) \
+        || die "could not inspect staged editor sessions"
+      [[ -z $staged ]] || die "staged editor sessions remain in $BRIDGE_STAGE; close editors or recover their files and retry"
     fi
     log "Removing images, volumes, secrets, build files"
     # Only images this script built: drop our tag from them (not other tags you gave them), then
@@ -781,13 +821,13 @@ if (( DELETE )); then
     else echo "warning: could not list Podman secrets; remove any oc-*-pg-password secrets by hand" >&2; fi
     teardown_status=0
     remove_chromium_policy || teardown_status=1
-    # Safe on the host: every pod (and with it every agent) is gone, so nothing can change $SB/.bridge
-    # concurrently, and GNU rm -r never follows symlinks (it unlinks them).
+    # We verified that the pods are gone and stopped the bridge path and service above.
+    # GNU rm -r unlinks symlinks instead of traversing their targets.
     if (( teardown_status == 0 )); then
       # Keep setup.lock's inode permanently, including across global teardown.
       find "$STATE" -mindepth 1 -maxdepth 1 ! -name setup.lock ! -name lifecycle.lock -exec rm -rf -- {} +
+      rm -rf "$SB/.bridge"
     fi
-    rm -rf "$SB/.bridge"
     if (( teardown_status != 0 )); then
       echo "Cleanup incomplete; state retained at $STATE. Fix the SELinux error and retry." >&2
       exit 1

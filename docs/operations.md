@@ -125,10 +125,11 @@ oc-sandbox -l                               # what is running
 
 Global `-d -a` deletes OpenCode login and sessions, Chromium profiles, Postgres data and
 Docker-in-Docker storage. It removes `~/opencode-sandbox/.bridge/` with its queued requests and
-copies. Successful teardown clears host state, including staged editor copies in
-`bridge-stage/`, and retains the setup and lifecycle lock files. A SELinux removal failure
-keeps host state for retry. Save any needed edits before running teardown. Remove the checkout
-or extracted ZIP directory once teardown succeeds. The example uses the
+copies. If any editor staging directories remain in `bridge-stage/`, teardown stops
+before deleting volumes. Close the editors or recover the saved copies before retrying.
+Successful teardown clears host state and retains the setup and lifecycle lock files. A SELinux
+removal failure keeps host state and the bridge files for retry. Remove the checkout or extracted
+ZIP directory once teardown succeeds. The example uses the
 [default install path](../README.md#install).
 
 ```bash
