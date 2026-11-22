@@ -89,9 +89,10 @@ def phase(prefix, directory, token, name, options, image, level, memory, inp, ou
     cid = None
     attempted = False
     try:
+        label = [] if name == 'stage' else ['--security-opt', f'label=level:{level}']
         create = [*prefix, 'podman', 'create', '--cidfile', str(cidfile), '--label', f'{OWNER_LABEL}={token}',
                   '-i', '--http-proxy=false', '--entrypoint', 'python3', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-                  '--security-opt', f'label=level:{level}', '--pids-limit=128', f'--memory={memory}',
+                  *label, '--pids-limit=128', f'--memory={memory}',
                   *options, '--', image, '-I', '/usr/local/bin/oc-opencode-update', name]
         attempted = True
         rc = command(create, timeout=30, parent=parent)

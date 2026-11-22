@@ -1065,7 +1065,7 @@ init_bridge_spool \
 relabel_shared || { echo "could not relabel $SB for the agents (see above)" >&2; exit 1; }
 
 # ---- OpenCode self-update -----------------------------------------------------
-# An offline reader extracts only the old binary, the networked updater sees no
+# An offline reader hashes the current binary, the networked updater sees no
 # mounts, and an offline writer promotes only a complete candidate. The host-side
 # supervisor verifies each CID-receipted container is gone before the next phase.
 if [[ $OPENCODE_VERSION == keep ]]; then

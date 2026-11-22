@@ -6,12 +6,20 @@ import subprocess
 import sys
 
 
+WAIT_ALL_CHILDREN = 0x40000000  # Linux __WALL includes non-SIGCHLD clone children.
+
+
 def main():
-    child = None
+    child_fd = None
+    pending = set()
+    def deliver(signum):
+        try: signal.pidfd_send_signal(child_fd, signum)
+        except ProcessLookupError: pass
     def forward(signum, _frame):
-        if child is not None and child.poll() is None:
-            try: child.send_signal(signum)
-            except ProcessLookupError: pass
+        if child_fd is None:
+            pending.add(signum)
+        else:
+            deliver(signum)
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP): signal.signal(sig, forward)
     # The image entry point forwards OpenCode arguments within the same agent container.
     # Its image PATH includes the sandbox's writable OpenCode installation for self-updates.
@@ -19,11 +27,21 @@ def main():
     except OSError as exc:
         print(f'cannot start OpenCode: {exc}', file=sys.stderr)
         return 127
-    rc = child.wait()
+    child_fd = os.pidfd_open(child.pid)
+    try:
+        for sig in pending:
+            deliver(sig)
+        while child.returncode is None:
+            pid, status = os.waitpid(-1, WAIT_ALL_CHILDREN)
+            if pid == child.pid:
+                child.returncode = os.waitstatus_to_exitcode(status)
+    finally:
+        fd, child_fd = child_fd, None
+        os.close(fd)
+    rc = child.returncode
     while True:
         try:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-            if pid == 0: break
+            if os.waitpid(-1, os.WNOHANG | WAIT_ALL_CHILDREN)[0] == 0: break
         except ChildProcessError: break
     return rc if rc >= 0 else 128 - rc
 

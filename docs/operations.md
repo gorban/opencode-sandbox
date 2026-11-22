@@ -47,10 +47,12 @@ starts to finish creating resources; neither lock is held during an interactive 
 The small `setup.lock` and `lifecycle.lock` files under `~/.local/share/oc-sandbox` are retained even
 after `-d -a` so that concurrent commands cannot accidentally lock different inodes.
 
-Each setup checks for an OpenCode update, including `-n`. The download runs in an isolated container
-with neither the shared home nor sandbox mounted. On failure or timeout, setup keeps the working
-copy or uses the image's baked-in copy if needed. Set `OC_OPENCODE_VERSION=keep` to skip the update, or
-set it to a version such as `2.3.0` to pin it. The image also includes OpenCode 2.3.0 as a fallback.
+Each setup checks for an OpenCode update, including `-n`. The networked updater has its own SELinux
+label and has neither the shared home nor sandbox mounted. It stages a fresh release and receives
+only a digest of the current binary for change detection and promotion. Set
+`OC_OPENCODE_VERSION=keep` to skip the update or specify a version such as `2.3.0` to stage it with
+the official versioned installer. On failure or timeout, setup keeps the working copy or uses the
+image's baked-in copy if needed.
 Choosing Restart after an in-app update currently ends the session. Launch `oc-sandbox` again.
 An update in another instance and quitting OpenCode can produce the same signal as Restart.
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stage OpenCode with a read-only shared home; promote via a separate offline writer.
 
-An offline reader sees the shared home read-only and sends only the current
-binary to a networked updater with no mounts. The offline writer alone sees the
+An offline reader sees the shared home read-only and sends only the digest of
+the current binary to a networked updater with no mounts. The offline writer alone sees the
 shared home writable; it promotes a complete verified candidate atomically.
 """
 import hashlib
@@ -20,7 +20,7 @@ import tempfile
 VERSION = re.compile(r'v?\d+(?:\.\d+){2}(?:[-+][0-9A-Za-z.-]+)?', re.ASCII)
 CHECKSUM = re.compile(r'[0-9a-f]{64}')
 INSTALL_DIRNAME = '.opencode'
-SOURCE_MAGIC = b'OC-OPENCODE-SOURCE-1\n'
+SOURCE_MAGIC = b'OC-OPENCODE-SOURCE-2\n'
 MAGIC = b'OC-OPENCODE-UPDATE-1\n'
 END = b'\nOC-OPENCODE-UPDATE-END\n'
 MAX_BINARY = 512 * 1024 * 1024
@@ -74,7 +74,7 @@ def read_old(home):
     try: opened = open_install_dir(home, False)
     except FileNotFoundError: return None
     try:
-        try: fd = os.open('opencode', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=opened[-1])
+        try: fd = os.open('opencode', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=opened[-1])
         except FileNotFoundError: return None
         with os.fdopen(fd, 'rb') as f:
             st = os.fstat(f.fileno())
@@ -90,62 +90,36 @@ def read_old(home):
 def snapshot(home, output):
     old = read_old(home)
     digest = None if old is None else hashlib.sha256(old).hexdigest()
-    header = json.dumps({'sha256': digest, 'size': 0 if old is None else len(old)}, separators=(',', ':')).encode('ascii') + b'\n'
-    output.write(SOURCE_MAGIC + header + (old or b'') + END); output.flush()
+    output.write(SOURCE_MAGIC + json.dumps(digest).encode('ascii') + b'\n' + END)
+    output.flush()
 
 
 def read_snapshot(stream):
     if stream.readline(len(SOURCE_MAGIC)+1) != SOURCE_MAGIC: raise ValueError('invalid source frame')
-    raw = stream.readline(1025)
-    if len(raw) > 1024 or not raw.endswith(b'\n'): raise ValueError('invalid source header')
-    header = json.loads(raw)
-    if (set(header) != {'sha256', 'size'} or type(header['size']) is not int or
-        not 0 <= header['size'] <= MAX_BINARY or
-        not (header['sha256'] is None or CHECKSUM.fullmatch(header['sha256'])) or
-        ((header['sha256'] is None) != (header['size'] == 0))):
-        raise ValueError('invalid source metadata')
-    old = stream.read(header['size'])
-    if (len(old) != header['size'] or stream.read(len(END)) != END or stream.read(1) or
-        (header['sha256'] is not None and hashlib.sha256(old).hexdigest() != header['sha256'])):
+    raw = stream.readline(67)
+    if not raw.endswith(b'\n'): raise ValueError('invalid source digest')
+    digest = json.loads(raw)
+    if digest is not None and (type(digest) is not str or not CHECKSUM.fullmatch(digest)):
+        raise ValueError('invalid source digest')
+    if stream.read(len(END)) != END or stream.read(1):
         raise ValueError('corrupt or incomplete source frame')
-    return None if header['sha256'] is None else old
+    return digest
 
-
-def install_v2(installer, requested, env, runner):
+def install_release(installer, requested, env, runner):
+    v1_pin = requested and int(requested.lstrip('v').partition('.')[0]) < 2
+    url = 'https://opencode.ai/install' if v1_pin else 'https://opencode.ai/v2/install'
     runner(['curl', '-fsSL', '--connect-timeout', '5', '--max-time', '30',
-            '-o', str(installer), 'https://opencode.ai/v2/install'], env, 35)
+            '-o', str(installer), url], env, 35)
     args = ['bash', str(installer), '--no-modify-path']
     if requested:
         args += ['--version', requested]
     runner(args, env, 90)
 
 
-def update_candidate(candidate, installer, old, requested, env, runner):
-    if old is None:
-        install_v2(installer, requested, env, runner)
-        return
-    candidate.write_bytes(old)
-    candidate.chmod(0o755)
-    current = reported_version(runner([str(candidate), '--version'], env, 10))
-    current_major = int(current.lstrip('v').split('.')[0])
-    requested_major = int(requested.lstrip('v').split('.')[0]) if requested else None
-    if current_major == 1 and requested_major is not None and requested_major >= 2:
-        # V1 rejects a V2 target; use the official versioned V2 installer in staging.
-        install_v2(installer, requested, env, runner)
-        return
-    args = [str(candidate), 'upgrade']
-    if requested:
-        args.append(requested)
-    elif current_major == 1:
-        args.append('--major')
-    runner(args + ['--method', 'curl'], env, 90)
-
-
 def stage(stream, requested, output, runner=run):
     if requested and not VERSION.fullmatch(requested):
         raise ValueError('OC_OPENCODE_VERSION must be keep or a version such as 2.3.0')
-    old = read_snapshot(stream)
-    oldhash = None if old is None else hashlib.sha256(old).hexdigest()
+    oldhash = read_snapshot(stream)
     with tempfile.TemporaryDirectory(prefix='oc-opencode-update-') as tmp:
         base = Path(tmp); stagehome = base/'home'; stagebin = stagehome/INSTALL_DIRNAME/'bin'
         stagebin.mkdir(parents=True); candidate = stagebin/'opencode'
@@ -153,7 +127,7 @@ def stage(stream, requested, output, runner=run):
         env.update(HOME=str(stagehome), PATH=f'{stagebin}:/usr/bin:/bin', CI='true',
                    XDG_CONFIG_HOME=str(base/'config'), XDG_DATA_HOME=str(base/'data'),
                    XDG_CACHE_HOME=str(base/'cache'), XDG_STATE_HOME=str(base/'state'))
-        update_candidate(candidate, base/'install.sh', old, requested, env, runner)
+        install_release(base/'install.sh', requested, env, runner)
         if candidate.is_symlink() or not candidate.is_file() or not os.access(candidate, os.X_OK):
             raise ValueError('upgrade did not produce an executable regular file')
         version = reported_version(runner([str(candidate), '--version'], env, 10))

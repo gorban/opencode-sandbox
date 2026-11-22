@@ -187,8 +187,11 @@ class UpdateTests(unittest.TestCase):
         calls=[]
         def fake(args,env,timeout):
             calls.append((args,timeout))
-            if 'upgrade' in args:
+            if args[0] == 'curl':
+                return ''
+            if args[0] == 'bash':
                 (Path(env['HOME'])/'.opencode/bin/opencode').write_bytes(new)
+                (Path(env['HOME'])/'.opencode/bin/opencode').chmod(0o755)
                 return ''
             if args[-1]=='--version': return version
             raise AssertionError(args)
@@ -198,47 +201,20 @@ class UpdateTests(unittest.TestCase):
     def test_version_output_is_not_trimmed_by_real_runner(self):
         script=Path(self.tmp.name)/'version'; script.write_text('#!/bin/sh\nprintf "opencode v2.3.0\\n\\n"\n'); script.chmod(0o755)
         self.assertEqual(update.run([str(script)],os.environ,10),'opencode v2.3.0\n\n')
-    def test_branded_versions_select_upgrade_path_and_frame(self):
-        for old in ('opencode v1.19.2\n','opencode v2.2.0\n','1.19.2\n','v2.2.0\n'):
-            with self.subTest(old=old):
-                calls=[]
-                def fake(args,env,timeout):
-                    calls.append(args); candidate=Path(env['HOME'])/'.opencode/bin/opencode'
-                    if 'upgrade' in args: candidate.write_bytes(b'new binary'); return ''
-                    if args[-1]=='--version': return old if candidate.read_bytes()==b'old binary' else 'opencode v2.3.0\n'
-                    raise AssertionError(args)
-                frame=self.stage(fake)
-                upgrade=next(args for args in calls if 'upgrade' in args)
-                self.assertEqual('--major' in upgrade, '1.19.2' in old)
-                header=json.loads(frame[len(update.MAGIC):].split(b'\n',1)[0])
-                self.assertEqual(header['version'],'v2.3.0')
-                update.promote(self.home,io.BytesIO(frame))
-                self.assertEqual(self.live.read_bytes(),b'new binary')
-                self.live.write_bytes(b'old binary')
-    def test_rejects_extra_or_control_version_output_in_both_phases(self):
-        bad_outputs=('prefix opencode v2.3.0\n','opencode v2.3.0 trailing\n',
-                     'warning\nopencode v2.3.0\n','opencode v2.3.0\nextra\n',
-                     'opencode v2.3.0\n\n','opencode v2.3.0\r\n',
-                     'opencode v2.3.0\x00\n',' opencode v2.3.0\n')
-        for invalid in bad_outputs:
-            for phase in ('old','new'):
-                with self.subTest(output=repr(invalid),phase=phase):
-                    def fake(args,env,timeout):
-                        candidate=Path(env['HOME'])/'.opencode/bin/opencode'
-                        if 'upgrade' in args: candidate.write_bytes(b'new binary'); return ''
-                        if args[-1]=='--version':
-                            is_old=candidate.read_bytes()==b'old binary'
-                            return invalid if is_old == (phase=='old') else 'opencode v2.3.0\n'
-                        raise AssertionError(args)
-                    out = io.BytesIO()
-                    snapshot = self.snapshot()
-                    with self.assertRaises(ValueError):
-                        update.stage(snapshot, '2.3.0', out, fake)
-                    self.assertEqual(out.getvalue(),b''); self.assertEqual(self.live.read_bytes(),b'old binary')
+    def test_rejects_extra_or_control_version_output(self):
+        for suffix in (' trailing', '\r', '\x00', '\nextra'):
+            with self.subTest(suffix=suffix):
+                fake, _ = self.runner(version='opencode v2.3.0' + suffix)
+                with self.assertRaises(ValueError):
+                    self.stage(fake)
+                self.assertEqual(self.live.read_bytes(), b'old binary')
+
     def test_stages_then_promotes_atomically_and_honours_pin(self):
         fake,calls=self.runner(version='opencode v2.3.0\n'); frame=self.stage(fake,'2.3.0')
         self.assertEqual(self.live.read_bytes(),b'old binary')
-        self.assertEqual(next(args for args,_ in calls if 'upgrade' in args)[1:],['upgrade','2.3.0','--method','curl'])
+        self.assertEqual(calls[0][0][-1], 'https://opencode.ai/v2/install')
+        self.assertEqual(calls[1][0][-2:], ['--version', '2.3.0'])
+        self.assertEqual(len(calls), 3)
         update.promote(self.home,io.BytesIO(frame)); self.assertEqual(self.live.read_bytes(),b'new binary')
     def test_offline_and_timeout_do_not_modify_live_binary(self):
         for exc in (RuntimeError('offline'),subprocess.TimeoutExpired('updater',1)):
@@ -266,35 +242,43 @@ class UpdateTests(unittest.TestCase):
     def test_up_to_date_still_checks_each_time_and_sends_no_update(self):
         fake,calls=self.runner(new=b'old binary')
         self.assertEqual(self.stage(fake),b''); self.assertEqual(self.stage(fake),b'')
-        self.assertEqual(sum('upgrade' in args for args,_ in calls),2)
-    def test_unpinned_legacy_version_requests_major_upgrade(self):
-        calls=[]
-        def fake(args,env,timeout):
-            calls.append(args)
-            candidate=Path(env['HOME'])/'.opencode/bin/opencode'
-            if 'upgrade' in args:
-                if '--major' in args: candidate.write_bytes(b'version two')
-                return ''
-            if args[-1]=='--version':
-                return '1.19.2' if candidate.read_bytes() == b'old binary' else '2.3.0'
-            raise AssertionError(args)
-        frame=self.stage(fake)
-        self.assertTrue(frame)
-        self.assertIn('--major', next(args for args in calls if 'upgrade' in args))
-        update.promote(self.home,io.BytesIO(frame))
-        self.assertEqual(self.live.read_bytes(),b'version two')
+        self.assertEqual(sum(args[0] == 'curl' for args,_ in calls),2)
+    def test_unpinned_uses_fresh_installer_without_running_previous_binary(self):
+        fake, calls = self.runner(version='opencode v2.3.0\n')
+        frame = self.stage(fake)
+        self.assertEqual([args[0] for args, _ in calls][:2], ['curl', 'bash'])
+        self.assertEqual(calls[0][0][-1], 'https://opencode.ai/v2/install')
+        self.assertEqual(len(calls), 3)
+        update.promote(self.home, io.BytesIO(frame))
+        self.assertEqual(self.live.read_bytes(), b'new binary')
+
     def test_legacy_to_v2_pin_uses_versioned_v2_installer(self):
         calls=[]
         def fake(args,env,timeout):
             calls.append(args)
             candidate=Path(env['HOME'])/'.opencode/bin/opencode'
             if args[0]=='curl': Path(args[args.index('-o')+1]).write_text('fixture'); return ''
-            if args[0]=='bash': candidate.write_bytes(b'version two'); return ''
-            if args[-1]=='--version': return 'opencode v1.19.2\n' if candidate.read_bytes()==b'old binary' else 'opencode v2.3.0\n'
+            if args[0]=='bash': candidate.write_bytes(b'version two'); candidate.chmod(0o755); return ''
+            if args[-1]=='--version': return 'opencode v2.3.0\n'
             raise AssertionError(args)
         frame=self.stage(fake,'2.3.0')
         self.assertEqual(next(a for a in calls if a[0]=='bash')[-3:],['--no-modify-path','--version','2.3.0'])
         update.promote(self.home,io.BytesIO(frame)); self.assertEqual(self.live.read_bytes(),b'version two')
+    def test_v1_pin_selects_official_v1_installer_without_running_previous_binary(self):
+        fake, calls = self.runner(version='1.19.2')
+        self.stage(fake, '1.19.2')
+        self.assertEqual(calls[0][0][-1], 'https://opencode.ai/install')
+        self.assertEqual(calls[1][0][-2:], ['--version', '1.19.2'])
+        self.assertEqual(len(calls), 3)
+    def test_snapshot_refuses_fifo_without_a_writer(self):
+        self.live.unlink()
+        os.mkfifo(self.live)
+        script = ('import runpy, sys; from pathlib import Path; '
+                  'runpy.run_path(sys.argv[1])["read_old"](Path(sys.argv[2]))')
+        result = subprocess.run([sys.executable, '-I', '-c', script, str(ROOT/'oc-opencode-update.py'), str(self.home)],
+                                capture_output=True, timeout=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'not an executable regular file', result.stderr)
     def test_symlinked_binary_never_reaches_target(self):
         victim=Path(self.tmp.name)/'victim'; victim.write_bytes(b'untouched'); victim.chmod(0o755)
         self.live.unlink(); self.live.symlink_to(victim)
@@ -304,7 +288,8 @@ class UpdateTests(unittest.TestCase):
         secret=self.home/'auth'; secret.write_bytes(b'PRIVATE-TEST-CREDENTIAL')
         source=self.snapshot().getvalue()
         self.assertNotIn(b'PRIVATE-TEST-CREDENTIAL',source)
-        self.assertEqual(update.read_snapshot(io.BytesIO(source)),b'old binary')
+        self.assertNotIn(b'old binary', source)
+        self.assertEqual(update.read_snapshot(io.BytesIO(source)), hashlib.sha256(b'old binary').hexdigest())
     def test_first_install_uses_official_pinned_installer_in_staging(self):
         self.live.unlink(); source=self.snapshot(); calls=[]
         def fake(args,env,timeout):
@@ -374,6 +359,9 @@ sys.exit(125)
         p=self.invoke(); self.assertEqual(p.returncode,0,p.stderr)
         acts=self.actions(); create=[x for x in acts if x[0]=='create']; self.assertEqual([x[-1] for x in create],['snapshot','stage','promote'])
         self.assertIn('--network=none',create[0]); self.assertIn('oc-home:/source:ro',create[0]); self.assertNotIn('-v',create[1]); self.assertIn('--http-proxy=false',create[1]); self.assertIn('--network=none',create[2]); self.assertIn('oc-home:/root',create[2])
+        self.assertIn('label=level:s0:c1,c2', create[0])
+        self.assertFalse(any(option.startswith('label=level:') for option in create[1]))
+        self.assertIn('label=level:s0:c1,c2', create[2])
         for i,entry in enumerate(acts):
             if entry[0]=='create' and entry[-1] in ('stage','promote'):
                 self.assertIn('rm',[a[0] for a in acts[:i]])
@@ -447,6 +435,62 @@ envargs=(); H=("$HOST")
 
 
 class AgentGuardTests(unittest.TestCase):
+    def test_signal_during_spawn_is_forwarded_and_all_children_are_reaped(self):
+        import runpy
+        main = runpy.run_path(str(ROOT / 'oc-opencode-run.py'))['main']
+        child = SimpleNamespace(pid=42, returncode=None, wait=lambda: 0)
+        handlers = {}
+
+        def spawn(_):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return child
+
+        with patch.object(signal, 'signal', side_effect=handlers.__setitem__), \
+                patch.object(subprocess, 'Popen', side_effect=spawn), \
+                patch.object(os, 'pidfd_open', return_value=99), \
+                patch.object(os, 'close'), patch.object(signal, 'pidfd_send_signal') as send, \
+                patch.object(os, 'waitpid', side_effect=[(42, 0), (0, 0)]) as wait:
+            self.assertEqual(main(), 0)
+        send.assert_called_once_with(99, signal.SIGTERM)
+        self.assertEqual([call.args for call in wait.call_args_list],
+                         [(-1, 0x40000000), (-1, os.WNOHANG | 0x40000000)])
+
+    def test_reaps_adopted_children_while_opencode_is_still_running(self):
+        with tempfile.TemporaryDirectory() as temp:
+            exe = Path(temp) / 'opencode'
+            exe.write_text('''#!/usr/bin/python3
+import os
+from pathlib import Path
+import time
+
+reader, writer = os.pipe()
+intermediate = os.fork()
+if intermediate == 0:
+    orphan = os.fork()
+    if orphan == 0:
+        os._exit(0)
+    os.write(writer, str(orphan).encode())
+    os._exit(0)
+os.close(writer)
+orphan = int(os.read(reader, 30))
+os.waitpid(intermediate, 0)
+deadline = time.monotonic() + 2
+while time.monotonic() < deadline:
+    if not Path(f'/proc/{orphan}').exists():
+        os._exit(0)
+    time.sleep(0.02)
+os._exit(9)
+''')
+            exe.chmod(0o755)
+            # Make the wrapper the adoptive parent without needing a system-wide PID namespace.
+            script = ('import ctypes, runpy, sys; '
+                      'assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0; '
+                      'runpy.run_path(sys.argv[1], run_name="__main__")')
+            env = {**os.environ, 'PATH': temp + ':/usr/bin:/bin'}
+            result = subprocess.run([sys.executable, '-I', '-c', script, str(ROOT/'oc-opencode-run.py')],
+                                    env=env, capture_output=True, timeout=6)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_forwarding_preserves_argument_boundaries(self):
         with tempfile.TemporaryDirectory() as temp:
             exe = Path(temp) / 'opencode'
