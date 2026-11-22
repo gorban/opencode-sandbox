@@ -2,9 +2,11 @@
 
 [Index](README.md) · children: [model selection, reasoning variants & dual-window quotas](prd_m1.md),
 [cross-model & cross-sandbox orchestration](prd_m2.md),
-[unified control plane, threads & confined terminals](prd_m3.md) · related:
-[orchestrator fleet](prd_i.md), [credential broker](prd_i3.md), [LLM gateway](prd_i4.md),
-[composable config & external brokers](prd_l.md), [host credential brokering](prd_l1.md)
+[unified control plane, threads, embedded browser & confined terminals](prd_m3.md) · related:
+[per-instance DNS](prd_d.md), [local HTTPS/TLS](prd_e.md), [orchestrator fleet](prd_i.md),
+[worker fleet & browser wall](prd_i2.md), [credential broker](prd_i3.md),
+[LLM gateway](prd_i4.md), [composable config & external brokers](prd_l.md),
+[host credential brokering](prd_l1.md)
 
 ## Executive summary
 
@@ -27,15 +29,19 @@ a cohesive, zero-trust multi-model control plane covering three tightly linked a
    ([prd_m3](prd_m3.md)) replacing per-sandbox Chrome windows and terminals with a single
    `Project -> Sandbox -> Thread` workspace where both the human operator and the root orchestrator
    message the same targets, alongside confined embedded terminal emulation (`opencode-tui` and
-   `shell`) inside a zero-network null-origin iframe behind a strict allowlist host ANSI scrubber
-   and `oc_controller` generation-fenced input leases.
+   `shell`) and **opt-in embedded sandbox browser views** (per-sandbox `Browser` tab + fleet-wide
+   PiP "Browser Wall" shown only for sandboxes with `cap:browser.chromium@1.0`, powered by pod-local
+   `builtin/chromium-managed`, [prd_d](prd_d.md) `<NAME>.oc-sandbox.internal` DNS, [prd_e](prd_e.md)
+   name-constrained leaf certs, composable browser bundles defaulting to token-efficient
+   `builtin/browser-axi`, and an authenticated CDP arbiter) inside zero-network null-origin iframes
+   with `oc_controller` generation-fenced input leases.
 
 ```mermaid
 flowchart TB
     subgraph UI["Trusted Control Surface (Tauri v2 Native UDS Bridge + Loopback Web UI)"]
         CHROME["Trusted Host Chrome\n(Project -> Sandbox -> Thread, Approvals, 5h/7d Quotas, Lease & WS Owner)"]
         THREADS["Inert Thread View\n(Host Write-Ahead Provenance Badges)"]
-        PTY["Confined PTY Frame\n(Null-Origin Sandboxed xterm.js, connect-src 'none', MessageChannel Only)"]
+        PTY["Confined PTY & Browser Frames\n(Null-Origin Sandboxed xterm.js & Browser Canvas, connect-src 'none')"]
     end
 
     subgraph HOST["Trusted Workstation Daemon (oc_daemon · $STATE/registry.sqlite)"]
@@ -44,12 +50,12 @@ flowchart TB
         QUOTA["QuotaLedger ($STATE)\n(Passive Header Tap + Durable Pre-Flight Reservation)"]
         HUB["oc_hub\n(Command/Event/Projection, RoutingEdge ACLs, Read-Only Spool)"]
         MUX["Unified Per-Job Broker\n(oc_broker_http /llm/* Allowlist + /mcp/oc-swarm)"]
-        ANSI["Allowlist Host VT/UTF-8 Scrubber + Non-Blocking PTY Relay"]
+        ANSI["Allowlist Host VT/UTF-8 Scrubber + CDP Browser Arbiter"]
     end
 
     subgraph FLEET["Untrusted Sandboxes (Local Podman & Remote SSH Workers)"]
         ORCH["Root Orchestrator (-o)\nOS-Sandboxed, Depth 0 (PARENT_TASK)"]
-        SB_LOCAL["Local Sandbox 'NAME'\n(opencode serve job UDS + tmux + task subagents)"]
+        SB_LOCAL["Local Sandbox 'NAME'\n(opencode serve job UDS + tmux + opt-in chromium-managed)"]
         SB_REMOTE["Remote Sandbox 'REMOTE / NAME'\n(Cross-Model Reviewer over SSH ControlMaster)"]
         EXT["External Stream '@PEER'\n(0o600 UDS + ocpeer_ Token, UNTRUSTED_PEER_DATA)"]
     end
@@ -58,14 +64,14 @@ flowchart TB
     CHROME <--> CTRL
     CHROME <--> QUOTA
     THREADS <--> HUB
-    CHROME <-->|"Dedicated MessageChannel (No Lease Token in Iframe)"| PTY
-    CHROME <-->|"Authenticated Binary PTY WS (Ticket + Origin Pin)"| ANSI
+    CHROME <-->|"Dedicated MessageChannel (No Lease Token in Iframes)"| PTY
+    CHROME <-->|"Authenticated PTY & Browser WS (Ticket + Origin Pin)"| ANSI
     ORCH <-->|"0o700 UDS MCP"| HUB
     EXT <-->|"0o600 UDS + ocpeer_"| HUB
     HUB <-->|"Hardened HTTP/SSE Client (No Redirects/Gzip) -> Job UDS"| SB_LOCAL
     HUB <-->|"Hardened HTTP/SSE Client -> ssh -L Remote Job UDS"| SB_REMOTE
-    ANSI <-->|"podman exec / Hardened SSH tmux -f /dev/null"| SB_LOCAL
-    ANSI <-->|"Hardened SSH tmux -f /dev/null"| SB_REMOTE
+    ANSI <-->|"podman exec / Job UDS (PTY + Managed CDP Arbiter)"| SB_LOCAL
+    ANSI <-->|"Hardened SSH tmux / ssh -L Remote Job UDS"| SB_REMOTE
     SB_LOCAL & SB_REMOTE & ORCH -->|"ocjob_ Bearer (Zero MITM)"| MUX
     MUX -->|"Passive Header & SSE Usage Tap"| QUOTA
     CAT --> MUX & HUB
@@ -91,13 +97,14 @@ All three child PRDs share three explicit extensions to `oc_controller.py` ([prd
 2. **`PaidFallbackGrant`:** Durable operator-approved record bound to
    `(source_bucket_id, target_api_route_id, allowed_models, max_spend_usd, max_concurrent, expires_at)`
    with persistent `spent_usd` and pre-flight reservations surviving daemon/controller restarts.
-3. **`InputLease`:** Strictly ephemeral in-memory PTY write lease bound to
-   `(operator_session, target_addr, pty_kind, generation, expires_at)`. On `oc_daemon` or
-   `oc_controller` restart, all `InputLease`s invalidate immediately and bump `generation`
-   ([prd_i2](prd_i2.md)).
+3. **`InputLease`:** Strictly ephemeral in-memory interactive write lease bound to
+   `(operator_session, target_addr, surface_kind: "opencode-tui" | "shell" | "browser", generation,
+   expires_at)`. On `oc_daemon` or `oc_controller` restart, all `InputLease`s invalidate
+   immediately and bump `generation` ([prd_i2](prd_i2.md)).
 4. **Unified `<1s` Revocation Cascade:** Revoking a sandbox, worker, or `@PEER` in `oc_controller`
    cascades in `<1s` across `/llm/*` streams, `/mcp/oc-swarm`, `oc_hub` (`RoutingEdge` removal +
-   waking blocked `agent_wait` callers), and `oc_pty_relay` (`InputLease` revocation + PTY disconnect).
+   waking blocked `agent_wait` callers), `oc_pty_relay`, and the browser CDP arbiter (`InputLease`
+   revocation + PTY/browser stream disconnect).
 
 ## Scope and phased milestones
 
@@ -117,14 +124,18 @@ All three child PRDs share three explicit extensions to `oc_controller.py` ([prd
       messaging with monotonic `SubtreeBudget` attenuation, per-edge turn budgets, nonce-framed
       `UNTRUSTED_PEER_DATA`, cycle-free waits, and host-owned `:ro` `/run/oc-inbox/` patch staging.
       *(Estimated: 5–7 days.)*
-- [ ] **M3 — Unified Tauri v2 + hardened web control plane and confined embedded PTY**
-      ([prd_m3](prd_m3.md)): build `oc_daemon.py` (`$STATE/registry.sqlite` Command/Event/Projection
-      + Outbox, auto-importing host-trusted `$STATE/worktrees/<NAME>` via `O_NOFOLLOW`), React +
-      Vite SPA served via Tauri v2 minimal Rust UDS bridge and hardened loopback web mode
-      (bootstrap-code exchange + `HttpOnly` cookie + CSRF + single-use WS tickets), full-key
-      write-ahead provenance receipts, Trusted Chrome Approval Inbox + 5h/7d quota bar, and
-      zero-network null-origin `xterm.js` iframe behind an allowlist host VT/UTF-8 scrubber +
-      non-blocking PTY relay + generation-fenced `InputLease`. *(Estimated: 8–12 days.)*
+- [ ] **M3 — Unified Tauri v2 + hardened web control plane, confined PTY, and opt-in embedded
+      browser views** ([prd_m3](prd_m3.md)): build `oc_daemon.py` (`$STATE/registry.sqlite`
+      Command/Event/Projection + Outbox, auto-importing host-trusted `$STATE/worktrees/<NAME>` via
+      `O_NOFOLLOW`), React + Vite SPA served via Tauri v2 minimal Rust UDS bridge and hardened
+      loopback web mode (bootstrap-code exchange + `HttpOnly` cookie + CSRF + single-use WS
+      tickets), full-key write-ahead provenance receipts, Trusted Chrome Approval Inbox + 5h/7d
+      quota bar, zero-network null-origin `xterm.js` iframe behind an allowlist host VT/UTF-8
+      scrubber + non-blocking PTY relay, opt-in per-sandbox `Browser` view + fleet PiP Browser Wall
+      (backed by `builtin/chromium-managed`, [prd_d](prd_d.md)/[prd_e](prd_e.md) internal HTTPS,
+      authenticated `managed` CDP arbiter, and composable `builtin/browser-axi` / MCP bundles),
+      and Pattern 4 in `orchestrator_skills/oc-sandbox-authoring/SKILL.md`.
+      *(Estimated: 10–15 days including M3 browser views & arbiter.)*
 
 ## Open decisions
 
@@ -140,6 +151,25 @@ All three child PRDs share three explicit extensions to `oc_controller.py` ([prd
       bindings, requires `wasm-unsafe-eval`, and WASM linear memory does not shrink after output
       floods without worker recycling (keep `MessageChannel` iframe interface pluggable for later
       upgrade).
+- [ ] (decision needed) **Embedded browser streaming mode** ([prd_i2](prd_i2.md), [prd_m3](prd_m3.md))
+      — **CDP screencast (`Page.startScreencast`) + authenticated host arbiter (recommended
+      first)**: lightweight JPEG/PNG frames ideal for PiP Browser Wall tiles and remote SSH links,
+      no X11/VNC server in pod, ~3–5 days; limited to page viewport (no full browser URL bar, tabs,
+      DevTools, or native dialogs); *vs.* **Pod-local virtual display + noVNC / WayVNC**: renders
+      complete browser chrome (URL bar, HTTPS lock icon, tabs, DevTools, dialogs), higher CPU/RAM
+      footprint and MPL-2.0 companion terms for `noVNC`, ~1–2 weeks (can be added as an optional
+      full-chrome escalation mode sharing the exact same `InputLease` and confined iframe boundary).
+- [ ] (decision needed) **Default opt-in browser automation bundle** ([prd_m3](prd_m3.md),
+      [prd_l](prd_l.md)) — **0-MCP `builtin/browser-axi` (`chrome-devtools-axi`, recommended
+      default)**: pinned CLI + progressive-disclosure skill using TOON-compressed a11y snapshots
+      with generation-prefixed refs (`STALE_REF` protection) and bundled multi-step actions,
+      cutting token usage ~40–66% while preserving console/network/perf debugging with zero MCP
+      server schema bloat (~2–3 days; requires version/checksum pin in `mise.lock` and supply-chain
+      license check); *vs.* **`chrome-devtools-mcp` (current baseline)**: mature DevTools MCP
+      working in shell-restricted personas, higher token/schema overhead (~1–2 days); *vs.*
+      **`@playwright/mcp`**: ARIA ref-based E2E ergonomics, heavier Playwright runtime and weaker
+      low-level DevTools profiling (~2–3 days). All three remain swappable `bundle@1` variants over
+      the same `cap:browser.chromium@1.0` / CDP arbiter endpoint.
 - [ ] (decision needed) **Worker ID migration (`prd_l` compatibility)** — migrate `worker@1` IDs
       from `OPAQUE_ID_RE` (`builtin/local-workstation`) to strict slash-free `WORKER_NAME_RE`
       (`"local"` & `"peer"` permanently reserved; update `oc_schema.py`'s `is_builtin_id()`
@@ -157,18 +187,9 @@ All three child PRDs share three explicit extensions to `oc_controller.py` ([prd
 - Gate 1 design review round 1 (`Security-Focused PR Reviewer Setup`, `3f43443`): 5 P1, 4 P2, and
   3 P3 findings addressed in `5d618be`.
 - Gate 1 design review round 2 (`Security-Focused PR Reviewer Setup`, `3f43443..5d618be`):
-  **GATE 1 CLEARED** at commit `5d618bed556bea41e48c46a8a90d4b453a9f2c85`:
-  - `docs/prds/prd_m.md` SHA-256: `791f1af59f3dff5c79c19895de5263a51b3723871114778249bb417ef3f762b5`
-  - `docs/prds/prd_m1.md` SHA-256: `2d2df8b2026c6e46dfe91e1226b6c64c11dfc71d3d28a70c5abc052168ceca50`
-  - `docs/prds/prd_m2.md` SHA-256: `fff8fbeee3b0ecba6f7f92c62dfc57b72be2669ef4f8ba90a78c3fcc5a3b402c`
-  - `docs/prds/prd_m3.md` SHA-256: `61d0ad2431a1bd0b32e13f1874dfb87bb40a01e8f856060b5856225d49a313d6`
-  - Implementation reminders for Gate 2:
-    1. Emit the exact bound ephemeral port (`connect-src 'self' ws://127.0.0.1:<bound_port>`) in
-       Trusted Chrome CSP at runtime, and pin the null-origin PTY iframe's `script-src` via CSP
-       hash or exact static origin URL (since `'self'` does not match opaque `null` origins) while
-       keeping `connect-src 'none'`.
-    2. For `PaidFallbackGrant`, release the durable reservation only if upstream TLS connect fails
-       *before* any request bytes are transmitted; once transmitted, retain the conservative debit
-       on disconnect/abort/crash (and guard `raw_quota is None` when reading `retry_after_sec`).
+  **GATE 1 CLEARED** at commit `5d618bed556bea41e48c46a8a90d4b453a9f2c85` (prior to embedded
+  browser & composable browser bundle additions).
+- Gate 1 design review round 3 (covering embedded browser views, CDP arbiter, composable browser
+  bundles, AXI vs MCP comparison, and orchestrator skill Pattern 4): pending.
 
 - [ ] **Human review**: checked only when the user says so
