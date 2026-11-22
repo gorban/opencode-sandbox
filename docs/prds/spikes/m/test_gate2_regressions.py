@@ -3289,5 +3289,228 @@ class TestReciprocalRound7Fixes(CoordTestBase):
         self.assertFalse(hub._session_active_marker.exists())
 
 
+class TestReciprocalRound8Fixes(CoordTestBase):
+    """Red/green regressions for all four cleanup/waiter findings on b0b26deb."""
+
+    _open_pair = TestReciprocalRound6Fixes._open_pair
+    _reg_sb = staticmethod(TestReciprocalRound6Fixes._reg_sb)
+    _wait_until = staticmethod(TestReciprocalRound6Fixes._wait_until)
+
+    def test_r8_p1_1_recovery_cancels_lease_and_held_stream_before_failing_artifact_reconcile(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        lease = BrokerLease("job_rec_art_r8")
+        self._reg_sb(hub, _OP, "sb-ar", "inc_ar1", lease=lease)
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-ar")
+
+        held_started = threading.Event()
+        held_release = threading.Event()
+        self.addCleanup(held_release.set)
+        transport.queue_script(
+            "sb-ar", TurnScript(on_stream_started=held_started, block_event=held_release)
+        )
+        hub.send(_OP, target="sb-ar", body_text="Held turn during failing artifact repair")
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(held_started.wait(timeout=1.0))
+
+        # Queue a second turn with a staged artifact blob, then remove the blob so artifact repair writes
+        hub.send(
+            _OP,
+            target="sb-ar",
+            body_text="Pending with artifact",
+            artifact_blobs=[b"patch-bytes-r8"],
+        )
+        for p in (self.state_dir / "inbox-spool" / "inc_ar1").glob("*.patch"):
+            p.unlink()
+
+        hub._mark_degraded("simulated_art_repair_degrade")
+        orig_cancel = reg.cancel_outbox_row
+        fail_once = {"enabled": True}
+
+        def _failing_cancel(msg_id: str, *, reason: str) -> None:
+            if fail_once["enabled"]:
+                fail_once["enabled"] = False
+                raise OSError("artifact_repair_cancel_write_failed")
+            orig_cancel(msg_id, reason=reason)
+
+        reg.cancel_outbox_row = _failing_cancel  # type: ignore[method-assign]
+        with self.assertRaises(CoordPolicyError):
+            hub.confirm_recovery(_OP, reason="art_repair_fails_first")
+
+        # BEFORE retry: lease MUST already be locally revoked and held transport already aborted!
+        self.assertTrue(hub._is_lease_locally_revoked(lease))
+        self.assertIn(("sb-ar", "inc_ar1"), transport.revoked_incarnations)
+        self.assertTrue(hub.is_degraded)
+
+        # Retry succeeds once DB write recovers
+        hub.confirm_recovery(_OP, reason="art_repair_retry_ok")
+        self.assertFalse(hub.is_degraded)
+
+    def test_r8_p1_2_recovery_and_close_refuse_completion_while_local_cleanup_unresolved(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        lease1 = BrokerLease("job_uc1_r8")
+        self._reg_sb(hub, _OP, "sb-uc1", "inc_uc1", lease=lease1)
+        hub._mark_degraded("degraded_before_cleanup_fault")
+
+        orig_revoke1 = lease1.revoke
+        orig_abort = transport.abort_incarnation
+        fail_state = {"lease": True, "abort": True}
+
+        def _flaky_revoke1() -> None:
+            if fail_state["lease"]:
+                raise RuntimeError("lease_revoke_failed")
+            orig_revoke1()
+
+        def _flaky_abort(sb_addr: str, inc_id: str, *, reason: str) -> bool:
+            if fail_state["abort"]:
+                raise RuntimeError("abort_incarnation_failed")
+            return orig_abort(sb_addr, inc_id, reason=reason)
+
+        lease1.revoke = _flaky_revoke1  # type: ignore[method-assign]
+        transport.abort_incarnation = _flaky_abort  # type: ignore[method-assign]
+
+        # Part A: confirm_recovery MUST NOT reopen while lease revoke or transport abort fails
+        with self.assertRaises(CoordPolicyError):
+            hub.confirm_recovery(_OP, reason="cleanup_fails_first")
+        self.assertTrue(hub.is_degraded)
+        self.assertTrue(hub._degraded_marker.exists())
+        self.assertFalse(hub._is_lease_locally_revoked(lease1))
+
+        # Clear faults -> recovery retry settles both handles and reopens cleanly
+        fail_state["lease"] = False
+        fail_state["abort"] = False
+        hub.confirm_recovery(_OP, reason="cleanup_retry_ok")
+        self.assertFalse(hub.is_degraded)
+        self.assertTrue(hub._is_lease_locally_revoked(lease1))
+        self.assertIn(("sb-uc1", "inc_uc1"), transport.revoked_incarnations)
+
+        # Part B: close() MUST NOT release lock or settle while lease revoke fails
+        lease2 = BrokerLease("job_uc2_r8")
+        self._reg_sb(hub, _OP, "sb-uc2", "inc_uc2", lease=lease2)
+        orig_revoke2 = lease2.revoke
+        fail_close_lease = {"enabled": True}
+
+        def _flaky_revoke2() -> None:
+            if fail_close_lease["enabled"]:
+                raise RuntimeError("close_lease_revoke_failed")
+            orig_revoke2()
+
+        lease2.revoke = _flaky_revoke2  # type: ignore[method-assign]
+        with self.assertRaises(RuntimeError):
+            hub.close(timeout_s=1.0)
+        self.assertTrue(hub._session_active_marker.exists())
+        self.assertGreaterEqual(hub._state_lock_fd, 0)
+        self.assertFalse(hub._shutdown_settled)
+
+        # Clear fault -> close retry revokes lease and settles cleanly
+        fail_close_lease["enabled"] = False
+        hub.close(timeout_s=1.0)
+        self.assertTrue(hub._is_lease_locally_revoked(lease2))
+        self.assertTrue(hub._shutdown_settled)
+
+    def test_r8_p1_3_unmonitored_failed_receipt_stream_has_retry_owner_and_blocks_close_until_settled(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        # No controller_request_id and no lease -> zero controller monitors
+        self._reg_sb(hub, _OP, "sb-um", "inc_um1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-um")
+        transport.queue_script("sb-um", TurnScript(block_event=threading.Event()))
+        msg_um = hub.send(_OP, target="sb-um", body_text="Unmonitored failed receipt")["msg_id"]
+
+        orig_abort_stream = transport.abort_stream
+        allow_abort = {"ok": False}
+        abort_calls: list[str] = []
+
+        def _gated_abort(stream_id: str, *, reason: str) -> bool:
+            abort_calls.append(stream_id)
+            if not allow_abort["ok"]:
+                return False
+            return orig_abort_stream(stream_id, reason=reason)
+
+        def _fail_handed_off(_msg_id: str, *, stream_id: str) -> None:
+            _ = stream_id
+            raise OSError("unmonitored_handoff_write_failed")
+
+        transport.abort_stream = _gated_abort  # type: ignore[method-assign]
+        reg.mark_outbox_handed_off = _fail_handed_off  # type: ignore[method-assign]
+
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertEqual(hub._request_monitors, {})
+        self.assertIn(msg_um, {r["msg_id"] for r in reg.list_outbox(statuses=("uncertain",))})
+
+        # Part A: Background cleanup retry worker retries abort_stream without any controller monitor
+        self.assertTrue(self._wait_until(lambda: len(abort_calls) >= 2))
+        returned_sid = abort_calls[0]
+        self.assertIn(returned_sid, hub._pending_cleanup_streams)
+
+        # Part B: close() refuses to settle while failed-receipt stream remains uncancelled
+        with self.assertRaises(CoordPolicyError):
+            hub.close(timeout_s=1.0)
+        self.assertTrue(hub._session_active_marker.exists())
+        self.assertGreaterEqual(hub._state_lock_fd, 0)
+        self.assertIn(returned_sid, hub._pending_cleanup_streams)
+
+        # Allow abort_stream to succeed -> close retry settles cleanly and clears handle
+        allow_abort["ok"] = True
+        hub.close(timeout_s=1.0)
+        self.assertNotIn(returned_sid, hub._pending_cleanup_streams)
+        self.assertNotIn(returned_sid, hub._stream_authorities)
+        self.assertTrue(hub._shutdown_settled)
+
+    def test_r8_p1_4_waiter_rejects_nonempty_batch_when_revoked_during_read(
+        self,
+    ) -> None:
+        reg, _transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-wr", "inc_wr1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-wr")
+        hub.send(_OP, target="sb-wr", body_text="Produce nonempty batch")
+        self.assertEqual(hub.dispatch_once(async_stream=False), 1)
+
+        in_read = threading.Event()
+        release_read = threading.Event()
+        self.addCleanup(release_read.set)
+        orig_list_events = reg.list_events_since
+
+        def _paused_list_events(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            events = orig_list_events(*args, **kwargs)
+            if events and not release_read.is_set():
+                in_read.set()
+                release_read.wait(timeout=2.0)
+            return events
+
+        reg.list_events_since = _paused_list_events  # type: ignore[method-assign]
+        wait_res: list[dict[str, Any]] = []
+        wait_err: list[Exception] = []
+
+        def _run_waiter() -> None:
+            try:
+                wait_res.append(hub.wait(_OP, targets=("sb-wr",), since_seq=0, timeout_s=5.0))
+            except Exception as exc:
+                wait_err.append(exc)
+
+        t_wait = threading.Thread(target=_run_waiter, daemon=True)
+        t_wait.start()
+        self.assertTrue(in_read.wait(timeout=1.0))
+
+        # Revoke target WHILE waiter is paused with a nonempty batch ready to return
+        hub.revoke(_OP, target="sb-wr", reason="revoked_mid_read")
+        release_read.set()
+        t_wait.join(timeout=1.5)
+
+        self.assertEqual(wait_res, [])
+        self.assertEqual(len(wait_err), 1)
+        self.assertIsInstance(wait_err[0], RevokedError)
+
+
 if __name__ == "__main__":
     unittest.main()

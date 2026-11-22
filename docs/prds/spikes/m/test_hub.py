@@ -1206,6 +1206,7 @@ class TestCoordHub(unittest.TestCase):
         self.assertIn((_TARGET_ALPHA, _INC_A1), self.transport.revoked_incarnations)
         self.assertTrue(self.hub.is_degraded)
 
+        self.transport.abort_incarnation = orig_abort  # type: ignore[method-assign]
         self.registry.fail_reads = False
         with self.assertRaises(CoordPolicyError):
             self.hub.send(self.operator, target=_TARGET_BETA, body_text="blocked by degraded")

@@ -94,6 +94,7 @@ _ERR_STATE_LOCKED = "hub_state_dir_locked"
 _ERR_CLOSE_INCOMPLETE = "hub_close_incomplete_workers_running"
 _ERR_ARTIFACT_RECONCILE = "artifact_reconciliation_failed"
 _ERR_LEASE_SETTLE = "close_lease_settlement_failed"
+_ERR_CLEANUP_INCOMPLETE = "local_cleanup_incomplete"
 _ERR_CTRL_UNAVAILABLE = "controller_authority_unavailable"
 _ERR_MISSING_STREAM_ABORT = "transport_missing_stream_abort"
 _REASON_RECOVERY_RETIRED = "recovery_incarnation_retired"
@@ -1052,7 +1053,11 @@ class CoordHub:
             self._leases: dict[str, BrokerLease] = {}
             self._lease_callbacks: dict[str, Callable[[], None]] = {}
             self._pending_close_retirements: dict[str, BrokerLease] = {}
-            self._pending_recovery_leases: list[BrokerLease] = []
+            self._pending_cleanup_leases: list[BrokerLease] = []
+            self._pending_cleanup_incarnations: dict[tuple[str, str], str] = {}
+            self._pending_cleanup_streams: dict[str, tuple[str, str, str]] = {}
+            self._cleanup_stop_ev = threading.Event()
+            self._cleanup_thread: threading.Thread | None = None
             self._settlement_thread: threading.Thread | None = None
             self._settlement_error: Exception | None = None
             self._watchdog_threads: set[threading.Thread] = set()
@@ -1225,33 +1230,151 @@ class CoordHub:
                 self._fg_cond.wait(timeout=remaining)
             return True
 
+    def _record_pending_cleanup_lease(self, lease: BrokerLease) -> None:
+        with self._meta_lock:
+            if lease not in self._pending_cleanup_leases:
+                self._pending_cleanup_leases.append(lease)
+
+    def _record_pending_cleanup_incarnation(
+        self, sb_addr: str, inc_id: str, reason: str
+    ) -> None:
+        with self._meta_lock:
+            self._pending_cleanup_incarnations.setdefault((sb_addr, inc_id), reason)
+
+    def _record_pending_cleanup_stream(
+        self, stream_id: str, dst_addr: str, dst_incarnation: str, reason: str
+    ) -> None:
+        with self._meta_lock:
+            self._pending_cleanup_streams[stream_id] = (dst_addr, dst_incarnation, reason)
+
+    def _drain_pending_cleanup_leases(self) -> None:
+        with self._meta_lock:
+            leases = tuple(self._pending_cleanup_leases)
+        for lease in leases:
+            try:
+                lease.revoke()
+            except Exception:
+                continue
+            with self._meta_lock:
+                if lease in self._pending_cleanup_leases:
+                    self._pending_cleanup_leases.remove(lease)
+
+    def _drain_pending_cleanup_incarnations(self) -> None:
+        with self._meta_lock:
+            items = tuple(self._pending_cleanup_incarnations.items())
+        for (sb_addr, inc_id), reason in items:
+            try:
+                self._transport.abort_incarnation(sb_addr, inc_id, reason=reason)
+            except Exception:
+                continue
+            with self._meta_lock:
+                self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
+
+    def _drain_pending_cleanup_streams(self) -> None:
+        with self._meta_lock:
+            items = tuple(self._pending_cleanup_streams.items())
+        for sid, (dst_addr, dst_inc, reason) in items:
+            ok = self._try_abort_stream(sid, reason=reason)
+            if not ok and reason == _REASON_HANDOFF_PERSIST_FAILED and not callable(
+                getattr(self._transport, "abort_stream", None)
+            ):
+                try:
+                    self._transport.abort_incarnation(dst_addr, dst_inc, reason=reason)
+                    ok = True
+                except Exception:
+                    ok = False
+            if ok:
+                with self._meta_lock:
+                    self._pending_cleanup_streams.pop(sid, None)
+                    if self._stream_abort_reasons.get(sid) == _REASON_HANDOFF_PERSIST_FAILED:
+                        self._stream_authorities.pop(sid, None)
+                        self._stream_abort_reasons.pop(sid, None)
+
+    def _has_pending_cleanups(self) -> bool:
+        with self._meta_lock:
+            return bool(
+                self._pending_cleanup_leases
+                or self._pending_cleanup_incarnations
+                or self._pending_cleanup_streams
+            )
+
+    def _drain_pending_cleanups(self) -> bool:
+        """Attempt settlement of every retained cleanup handle; return True only when empty."""
+        self._drain_pending_cleanup_leases()
+        self._drain_pending_cleanup_incarnations()
+        self._drain_pending_cleanup_streams()
+        return not self._has_pending_cleanups()
+
+    def _ensure_cleanup_retry_worker(self) -> None:
+        """Ensure a hub-owned retry worker drains retained cleanup handles without a monitor."""
+        with self._meta_lock:
+            if not self._accept_watchdog_spawns or self._shutdown_settled:
+                return
+            if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
+                return
+            self._cleanup_stop_ev.clear()
+            worker = threading.Thread(target=self._run_cleanup_retry_loop, daemon=True)
+            self._cleanup_thread = worker
+        try:
+            worker.start()
+        except Exception:
+            with self._meta_lock:
+                if self._cleanup_thread is worker:
+                    self._cleanup_thread = None
+
+    def _run_cleanup_retry_loop(self) -> None:
+        try:
+            while not self._cleanup_stop_ev.wait(self._watchdog_interval_s):
+                if self._drain_pending_cleanups():
+                    return
+        finally:
+            with self._meta_lock:
+                if self._cleanup_thread is threading.current_thread():
+                    self._cleanup_thread = None
+
+    def _stop_cleanup_retry_worker(self, deadline: float) -> bool:
+        current = threading.current_thread()
+        with self._meta_lock:
+            self._cleanup_stop_ev.set()
+            worker = self._cleanup_thread
+        if worker is not None and worker is not current:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            return not worker.is_alive()
+        return True
+
     def _fence_all_for_recovery_locked(
         self,
         all_edges: Sequence[RoutingEdge],
         sandboxes: Sequence[SandboxRecord],
-    ) -> tuple[list[tuple[str, str]], list[str]]:
-        detached_incs: set[tuple[str, str]] = set()
+    ) -> None:
         with self._meta_lock:
             for edge in all_edges:
                 self._fenced_generations.add((edge.edge_id, edge.grant_generation))
             for sb in sandboxes:
                 self._fenced_targets.add((sb.sandbox_addr, sb.incarnation_id))
-                detached_incs.add((sb.sandbox_addr, sb.incarnation_id))
+                self._pending_cleanup_incarnations.setdefault(
+                    (sb.sandbox_addr, sb.incarnation_id), _REASON_RECOVERY_RETIRED
+                )
             for sb_addr, inc_set in self._known_incarnations.items():
                 for inc_id in inc_set:
                     self._fenced_targets.add((sb_addr, inc_id))
-                    detached_incs.add((sb_addr, inc_id))
-            detached_sids: list[str] = []
+                    self._pending_cleanup_incarnations.setdefault(
+                        (sb_addr, inc_id), _REASON_RECOVERY_RETIRED
+                    )
             for sid, auth in self._stream_authorities.items():
                 self._stream_abort_reasons.setdefault(sid, _REASON_RECOVERY_RETIRED)
                 self._fenced_targets.add((auth.dst_addr, auth.dst_incarnation))
-                detached_incs.add((auth.dst_addr, auth.dst_incarnation))
-                detached_sids.append(sid)
+                self._pending_cleanup_incarnations.setdefault(
+                    (auth.dst_addr, auth.dst_incarnation), _REASON_RECOVERY_RETIRED
+                )
+                self._pending_cleanup_streams.setdefault(
+                    sid, (auth.dst_addr, auth.dst_incarnation, _REASON_RECOVERY_RETIRED)
+                )
             leases = tuple(self._leases.items())
             callbacks = dict(self._lease_callbacks)
             for _addr, lease in leases:
-                if lease not in self._pending_recovery_leases:
-                    self._pending_recovery_leases.append(lease)
+                if lease not in self._pending_cleanup_leases:
+                    self._pending_cleanup_leases.append(lease)
             self._leases.clear()
             self._lease_callbacks.clear()
             self._retire_all_monitors_locked()
@@ -1261,7 +1384,6 @@ class CoordHub:
             self._wait_gen += 1
             self._wait_cond.notify_all()
         self._detach_lease_callbacks(leases, callbacks)
-        return sorted(detached_incs), detached_sids
 
     def _mark_orphaned_dispatch_started_uncertain(self) -> None:
         rows = self._registry.list_outbox(statuses=(_STATUS_DISPATCH_STARTED,))
@@ -1272,61 +1394,46 @@ class CoordHub:
                     msg_id, detail="recovery_dispatch_started_uncertain"
                 )
 
-    def _drain_pending_recovery_leases(self) -> None:
-        with self._meta_lock:
-            leases = tuple(self._pending_recovery_leases)
-        remaining: list[BrokerLease] = []
-        for lease in leases:
-            try:
-                lease.revoke()
-            except Exception:
-                remaining.append(lease)
-        with self._meta_lock:
-            self._pending_recovery_leases = remaining
-
-    def _teardown_recovery_detached(
+    def _fence_and_cancel_for_recovery(
         self,
-        detached_incarnations: Sequence[tuple[str, str]],
-        detached_sids: Sequence[str],
-    ) -> None:
-        for sb_addr, inc_id in detached_incarnations:
-            try:
-                self._transport.abort_incarnation(
-                    sb_addr, inc_id, reason=_REASON_RECOVERY_RETIRED
-                )
-            except Exception:
-                pass
-        for sid in detached_sids:
-            if self._try_abort_stream(sid, reason=_REASON_RECOVERY_RETIRED):
-                self._clear_unpersisted_stream_if_aborted(sid)
-        self._drain_pending_recovery_leases()
-        self._notify_waiters()
-
-    def _reconcile_grants_and_incarnations_for_recovery(self) -> tuple[int, int]:
-        """Fence grants/streams, issue local cancellation immediately, then persist retirements."""
-        all_edges = self._registry.list_edges(active_only=False)
-        active_edges = [e for e in all_edges if e.active]
+    ) -> tuple[list[RoutingEdge], list[SandboxRecord]]:
+        """Phase 1 of recovery: fence live work and cancel leases/streams BEFORE any DB writes."""
+        read_err: Exception | None = None
+        all_edges: list[RoutingEdge] = []
+        sandboxes: list[SandboxRecord] = []
+        try:
+            all_edges = self._registry.list_edges(active_only=False)
+            sandboxes = self._registry.list_sandboxes()
+        except Exception as exc:
+            read_err = exc
         with self._meta_lock:
-            extra_eids = {inf.edge_id for inf in self._inflight_handoffs.values()} | {
-                auth.edge_id for auth in self._stream_authorities.values()
-            }
+            extra_eids = (
+                {inf.edge_id for inf in self._inflight_handoffs.values()}
+                | {auth.edge_id for auth in self._stream_authorities.values()}
+                | set(self._grant_fences)
+            )
         edge_ids = sorted({e.edge_id for e in all_edges} | extra_eids)
         fences = [self._get_grant_fence(eid) for eid in edge_ids]
         for fence in fences:
             fence.acquire()
         try:
-            sandboxes = self._registry.list_sandboxes()
-            detached_incs, detached_sids = self._fence_all_for_recovery_locked(
-                all_edges, sandboxes
-            )
+            self._fence_all_for_recovery_locked(all_edges, sandboxes)
         finally:
             for fence in reversed(fences):
                 fence.release()
-        # Local cancellation runs BEFORE durable DB writes so slow/failing writes never retain active leases/streams.
-        self._teardown_recovery_detached(detached_incs, detached_sids)
+        self._drain_pending_cleanups()
+        self._notify_waiters()
+        if read_err is not None:
+            raise read_err
+        return all_edges, sandboxes
 
+    def _persist_recovery_retirements(
+        self, all_edges: Sequence[RoutingEdge], sandboxes: Sequence[SandboxRecord]
+    ) -> tuple[int, int]:
         invalidated_grants = 0
-        for edge in active_edges:
+        for edge in all_edges:
+            if not edge.active:
+                continue
             revoked = self._registry.revoke_grant_and_cancel_outbox(
                 edge_id=edge.edge_id, reason="recovery_grant_generation_invalidated"
             )
@@ -1345,7 +1452,7 @@ class CoordHub:
     def confirm_recovery(
         self, caller: PrincipalCtx, *, reason: str = "operator_verified_recovery"
     ) -> None:
-        """Operator-only recovery: retire all pre-recovery grants/incarnations, audit, then reopen."""
+        """Operator-only recovery: cancel live work first, reconcile artifacts/grants, require cleanup settlement, then reopen."""
         if caller.role is not CoordRole.OPERATOR:
             raise CoordAuthError("operator_required:confirm_recovery")
         clean_reason = validate_reason_text(reason, "reason")
@@ -1358,11 +1465,16 @@ class CoordHub:
                     return
                 with self._meta_lock:
                     self._recovery_generation += 1
-                # Keep _degraded=True through artifact reconciliation, invalidation, and audit.
+                # Phase 1: Fence and cancel live leases/streams BEFORE any artifact or DB writes.
+                all_edges, sandboxes = self._fence_and_cancel_for_recovery()
+                # Phase 2: Artifact reconciliation and durable retirement writes.
                 self._reconcile_artifacts_on_startup(raise_on_error=True)
-                invalidated_grants, retired_incarnations = (
-                    self._reconcile_grants_and_incarnations_for_recovery()
+                invalidated_grants, retired_incarnations = self._persist_recovery_retirements(
+                    all_edges, sandboxes
                 )
+                # Phase 3: Require all retained local cleanup handles to settle before reopening.
+                if not self._drain_pending_cleanups():
+                    raise CoordPolicyError(_ERR_CLEANUP_INCOMPLETE)
                 if self._is_closed():
                     raise CoordPolicyError(_ERR_HUB_CLOSED)
                 self._registry.append_audit(
@@ -1423,12 +1535,12 @@ class CoordHub:
         try:
             lease.revoke()
         except Exception:
-            pass
+            self._record_pending_cleanup_lease(lease)
+            raise
         with self._meta_lock:
             self._pending_close_retirements.pop(addr, None)
 
     def _retire_pending_leases_locked(self) -> None:
-        self._drain_pending_recovery_leases()
         watchdog_caller = PrincipalCtx(role=CoordRole.OPERATOR, actor_id="lease-watchdog")
         first_err: Exception | None = None
         with self._meta_lock:
@@ -1456,6 +1568,9 @@ class CoordHub:
         try:
             with self._register_lock:
                 self._retire_pending_leases_locked()
+                if not self._drain_pending_cleanups():
+                    self._mark_degraded(_ERR_CLEANUP_INCOMPLETE)
+                    raise CoordPolicyError(_ERR_CLEANUP_INCOMPLETE)
                 with self._meta_lock:
                     self._leases.clear()
                     self._lease_callbacks.clear()
@@ -1550,9 +1665,10 @@ class CoordHub:
             finally:
                 self._register_lock.release()
             mon_ok = self._stop_all_controller_monitors(deadline)
+            cl_ok = self._stop_cleanup_retry_worker(deadline)
             self._detach_lease_callbacks(leases, callbacks)
             wd_ok = self._join_watchdog_threads(timeout_s=max(0.0, deadline - time.monotonic()))
-            if not mon_ok or not wd_ok:
+            if not mon_ok or not cl_ok or not wd_ok:
                 raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
             self._finalize_settled_close(deadline)
         finally:
@@ -1728,6 +1844,7 @@ class CoordHub:
     def _clear_unpersisted_stream_if_aborted(self, stream_id: str) -> None:
         """Release an unpersisted stream handle once transport cancellation succeeds."""
         with self._meta_lock:
+            self._pending_cleanup_streams.pop(stream_id, None)
             if self._stream_abort_reasons.get(stream_id) == _REASON_HANDOFF_PERSIST_FAILED:
                 self._stream_authorities.pop(stream_id, None)
                 self._stream_abort_reasons.pop(stream_id, None)
@@ -3026,19 +3143,13 @@ class CoordHub:
         if immediate_abort is None:
             return
         sid, reason = immediate_abort
-        if self._try_abort_stream(sid, reason=reason):
-            self._clear_unpersisted_stream_if_aborted(sid)
+        if reason == _REASON_HANDOFF_PERSIST_FAILED:
+            if not self._drain_pending_cleanups():
+                self._ensure_cleanup_retry_worker()
             return
-        if reason == _REASON_HANDOFF_PERSIST_FAILED and not callable(
-            getattr(self._transport, "abort_stream", None)
-        ):
-            try:
-                if self._transport.abort_incarnation(
-                    env.dst_addr, env.dst_incarnation, reason=reason
-                ):
-                    self._clear_unpersisted_stream_if_aborted(sid)
-            except Exception:
-                pass
+        if not self._try_abort_stream(sid, reason=reason):
+            self._record_pending_cleanup_stream(sid, env.dst_addr, env.dst_incarnation, reason)
+            self._ensure_cleanup_retry_worker()
 
     def _run_stream_task(
         self, stream_task: Callable[[], None] | None, *, async_stream: bool
@@ -3066,6 +3177,42 @@ class CoordHub:
             return self._stream_abort_reasons[stream_id]
         return None
 
+    def _handle_zero_bytes_result(
+        self, env: Envelope, result: Any, edge_id: str, grant_gen: int
+    ) -> None:
+        liveness = self._classify_row_liveness_under_fence(
+            edge_id,
+            grant_gen,
+            env.dst_addr,
+            env.dst_incarnation,
+            src_incarnation=env.src_incarnation,
+        )
+        if liveness != "fenced":
+            self._registry.return_outbox_to_pending(env.msg_id, detail=result.detail)
+            return
+        cancel_reason = result.detail or _STATUS_REVOKED
+        try:
+            self._registry.cancel_outbox_row(env.msg_id, reason=cancel_reason)
+        except Exception:
+            pass
+
+    def _handle_handoff_persist_failure(
+        self, env: Envelope, stream_id: str, exc: Exception
+    ) -> None:
+        with self._meta_lock:
+            self._stream_abort_reasons[stream_id] = _REASON_HANDOFF_PERSIST_FAILED
+            self._pending_cleanup_streams[stream_id] = (
+                env.dst_addr,
+                env.dst_incarnation,
+                _REASON_HANDOFF_PERSIST_FAILED,
+            )
+        try:
+            self._registry.mark_outbox_uncertain(
+                env.msg_id, detail=f"{_REASON_HANDOFF_PERSIST_FAILED}:{exc}"
+            )
+        except Exception:
+            self._mark_degraded(_REASON_HANDOFF_PERSIST_FAILED)
+
     def _handle_dispatch_result_locked(
         self,
         env: Envelope,
@@ -3077,21 +3224,7 @@ class CoordHub:
         if result.outcome is DispatchOutcome.ZERO_BYTES_SENT:
             with self._meta_lock:
                 self._inflight_handoffs.pop(env.msg_id, None)
-            liveness = self._classify_row_liveness_under_fence(
-                edge_id,
-                grant_gen,
-                env.dst_addr,
-                env.dst_incarnation,
-                src_incarnation=env.src_incarnation,
-            )
-            if liveness != "fenced":
-                self._registry.return_outbox_to_pending(env.msg_id, detail=result.detail)
-            else:
-                cancel_reason = result.detail or _STATUS_REVOKED
-                try:
-                    self._registry.cancel_outbox_row(env.msg_id, reason=cancel_reason)
-                except Exception:
-                    pass
+            self._handle_zero_bytes_result(env, result, edge_id, grant_gen)
             return None, None
 
         if result.outcome is DispatchOutcome.UNCERTAIN:
@@ -3124,14 +3257,7 @@ class CoordHub:
         try:
             self._registry.mark_outbox_handed_off(env.msg_id, stream_id=stream_id)
         except Exception as exc:
-            with self._meta_lock:
-                self._stream_abort_reasons[stream_id] = _REASON_HANDOFF_PERSIST_FAILED
-            try:
-                self._registry.mark_outbox_uncertain(
-                    env.msg_id, detail=f"{_REASON_HANDOFF_PERSIST_FAILED}:{exc}"
-                )
-            except Exception:
-                self._mark_degraded(_REASON_HANDOFF_PERSIST_FAILED)
+            self._handle_handoff_persist_failure(env, stream_id, exc)
             return None, (stream_id, _REASON_HANDOFF_PERSIST_FAILED)
 
         def _consume() -> None:
@@ -3532,6 +3658,25 @@ class CoordHub:
                 allowed_map[addr] = allowed
         return allowed_map
 
+    def _wait_snapshot_gen(self, waiter: _WaiterState) -> int:
+        with self._wait_cond:
+            if waiter.revoked:
+                raise RevokedError(_ERR_EDGE_REVOKED)
+            return self._wait_gen
+
+    def _wait_commit_or_sleep(
+        self, waiter: _WaiterState, seen_gen: int, *, wait_timeout: float | None
+    ) -> bool:
+        """Under _wait_cond, reject revoked waiter; return True if generation changed (retry)."""
+        with self._wait_cond:
+            if waiter.revoked:
+                raise RevokedError(_ERR_EDGE_REVOKED)
+            if self._wait_gen != seen_gen:
+                return True
+            if wait_timeout is not None:
+                self._wait_cond.wait(timeout=wait_timeout)
+            return False
+
     def _wait_loop(
         self,
         waiter: _WaiterState,
@@ -3544,10 +3689,7 @@ class CoordHub:
         exclude_trust: frozenset[str],
     ) -> dict[str, Any]:
         while True:
-            with self._wait_cond:
-                if waiter.revoked:
-                    raise RevokedError(_ERR_EDGE_REVOKED)
-                seen_gen = self._wait_gen
+            seen_gen = self._wait_snapshot_gen(waiter)
             self._require_operational(allow_operator_diagnostic=True, caller=caller)
             self._assert_targets_not_revoked(caller.canonical_sender, target_addrs)
             live_threads = self._reauthorize_wait_targets(caller, target_addrs)
@@ -3556,16 +3698,14 @@ class CoordHub:
                 target_addrs, since_seq, eff_threads, req_incs, exclude_trust
             )
             if events:
+                if self._wait_commit_or_sleep(waiter, seen_gen, wait_timeout=None):
+                    continue
                 return {"events": events, "last_seq": events[-1]["seq"], "timed_out": False}
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self._wait_snapshot_gen(waiter)
                 return {"events": [], "last_seq": since_seq, "timed_out": True}
-            with self._wait_cond:
-                if waiter.revoked:
-                    raise RevokedError(_ERR_EDGE_REVOKED)
-                if self._wait_gen != seen_gen:
-                    continue
-                self._wait_cond.wait(timeout=remaining)
+            self._wait_commit_or_sleep(waiter, seen_gen, wait_timeout=remaining)
 
     def _fence_target_in_memory(
         self,
@@ -3625,6 +3765,16 @@ class CoordHub:
             lease.remove_revoke_callback(cb)
         return [(target_addr, inc_id) for inc_id in sorted(inc_set)], outbound_sids, lease
 
+    def _abort_detached_outbound_stream(self, sid: str, reason: str) -> bool:
+        if self._try_abort_stream(sid, reason=reason):
+            return True
+        with self._meta_lock:
+            auth = self._stream_authorities.get(sid)
+        if auth is not None:
+            self._record_pending_cleanup_stream(sid, auth.dst_addr, auth.dst_incarnation, reason)
+            self._ensure_cleanup_retry_worker()
+        return False
+
     def _teardown_detached(
         self,
         detached_incarnations: list[tuple[str, str]],
@@ -3639,9 +3789,9 @@ class CoordHub:
                 if self._transport.abort_incarnation(sb_addr, inc_id, reason=reason):
                     aborted = True
             except Exception:
-                pass
+                self._record_pending_cleanup_incarnation(sb_addr, inc_id, reason)
         for sid in outbound_sids:
-            if self._try_abort_stream(sid, reason=reason):
+            if self._abort_detached_outbound_stream(sid, reason):
                 aborted = True
         if detached_waiters:
             try:
@@ -3652,7 +3802,7 @@ class CoordHub:
             try:
                 lease.revoke()
             except Exception:
-                pass
+                self._record_pending_cleanup_lease(lease)
         return aborted
 
     def _lookup_revoke_metadata(
