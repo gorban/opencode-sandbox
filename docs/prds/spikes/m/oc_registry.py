@@ -1947,6 +1947,8 @@ class CoordRegistry:
             binding = conn.execute(_SQL_SELECT_BINDING, (clean_addr, clean_inc)).fetchone()
             if binding is None or binding["owner_id"] != clean_owner:
                 raise CoordPolicyError("transport_owner_mismatch")
+            if int(binding["terminal_confirmed"]) != 0:
+                return []
             revoked_ids = self._retire_binding_logical_state_conn(
                 conn, clean_addr, clean_inc, clean_reason, now
             )

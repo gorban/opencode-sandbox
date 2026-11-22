@@ -166,6 +166,14 @@ def _verify_unconsumed_receipts_absent(
         raise AssertionError(f"Unconsumed dispatch_receipts remain for terminated rows: {leaked}")
 
 
+_UNVERIFIED_USER_BADGES: frozenset[str] = frozenset(
+    {
+        ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED.value,
+        ProvenanceBadge.TUI_INPUT.value,
+    }
+)
+
+
 def _verify_single_event_badge(row: Mapping[str, Any]) -> None:
     badge = row["badge"]
     if row["event_type"] != "user_message":
@@ -174,9 +182,15 @@ def _verify_single_event_badge(row: Mapping[str, Any]) -> None:
                 f"Non-user stream event seq={row['seq']} has non-null badge={badge!r}"
             )
         return
-    if badge is None or row["env_trust_class"] is None:
+    if badge is None:
+        raise AssertionError(f"user_message event seq={row['seq']} missing provenance badge")
+    if row["env_trust_class"] is None:
+        if badge not in _UNVERIFIED_USER_BADGES:
+            raise AssertionError(
+                f"Forged or elevated badge on unlinked user_message seq={row['seq']}: {badge!r}"
+            )
         return
-    if _BADGE_RANK.get(badge, 99) > _TRUST_RANK.get(row["env_trust_class"], -1):
+    if badge not in _BADGE_RANK or _BADGE_RANK[badge] > _TRUST_RANK.get(row["env_trust_class"], -1):
         raise AssertionError(
             f"Provenance elevation detected on seq={row['seq']}: {badge!r}"
         )
@@ -292,6 +306,18 @@ class TestRestartQualification(unittest.TestCase):
         reg = CoordRegistry(target_dir, sandbox_root=self.sandbox_root)
         hub = CoordHub(reg, transport, target_dir, sandbox_root=self.sandbox_root)
         return reg, hub
+
+    @staticmethod
+    def _abandon_hub_for_crash(hub: CoordHub, reg: CoordRegistry) -> None:
+        """Simulate an abrupt host crash without clean close, releasing only test fds/threads."""
+        from oc_hub import _release_state_dir_lock
+
+        hub._stop_cleanup_retry_worker(time.monotonic() + 1.0)
+        os_lock = hub._state_lock_fd
+        hub._state_lock_fd = -1
+        if os_lock >= 0:
+            _release_state_dir_lock(os_lock)
+        reg.close()
 
     @staticmethod
     def _reg_and_grant(
@@ -601,14 +627,7 @@ class TestRestartQualification(unittest.TestCase):
                     task_brief=_BRIEF,
                 )
         finally:
-            hub1._stop_cleanup_retry_worker(time.monotonic() + 1.0)
-            os_lock = hub1._state_lock_fd
-            hub1._state_lock_fd = -1
-            if os_lock >= 0:
-                from oc_hub import _release_state_dir_lock
-
-                _release_state_dir_lock(os_lock)
-            reg1.close()
+            self._abandon_hub_for_crash(hub1, reg1)
 
         # (a) Reopen with plain FakeWorkerTransport: boots degraded, CANNOT clear external obligation
         reg2, hub2 = self._open_hub(FakeWorkerTransport())
@@ -619,14 +638,7 @@ class TestRestartQualification(unittest.TestCase):
             self.assertTrue(hub2.is_degraded)
             self.assertFalse(reg2.get_transport_binding("sb-sub", "inc_sub1")["terminal_confirmed"])
         finally:
-            hub2._stop_cleanup_retry_worker(time.monotonic() + 1.0)
-            os_lock = hub2._state_lock_fd
-            hub2._state_lock_fd = -1
-            if os_lock >= 0:
-                from oc_hub import _release_state_dir_lock
-
-                _release_state_dir_lock(os_lock)
-            reg2.close()
+            self._abandon_hub_for_crash(hub2, reg2)
 
         # (b) Reopen with wrong-owner ExternallyFencedFakeTransport: CANNOT clear obligation
         wrong_owner = ExternallyFencedFakeTransport({("sb-sub", "inc_sub1"): "local-relay:wrong"})
@@ -637,14 +649,7 @@ class TestRestartQualification(unittest.TestCase):
                 hub3.confirm_recovery(_OP, reason="wrong_owner_must_fail")
             self.assertTrue(hub3.is_degraded)
         finally:
-            hub3._stop_cleanup_retry_worker(time.monotonic() + 1.0)
-            os_lock = hub3._state_lock_fd
-            hub3._state_lock_fd = -1
-            if os_lock >= 0:
-                from oc_hub import _release_state_dir_lock
-
-                _release_state_dir_lock(os_lock)
-            reg3.close()
+            self._abandon_hub_for_crash(hub3, reg3)
 
         # (c) Reopen with exact owner1 once fault clears -> confirms terminal, reopens, allows inc_sub2
         owner1.fail_confirm_keys.discard(("sb-sub", "inc_sub1"))
@@ -682,14 +687,7 @@ class TestRestartQualification(unittest.TestCase):
             self.assertFalse(b["terminal_confirmed"])
         finally:
             reg1.mark_transport_abort_requested = orig_mark  # type: ignore[method-assign]
-            hub1._stop_cleanup_retry_worker(time.monotonic() + 1.0)
-            os_lock = hub1._state_lock_fd
-            hub1._state_lock_fd = -1
-            if os_lock >= 0:
-                from oc_hub import _release_state_dir_lock
-
-                _release_state_dir_lock(os_lock)
-            reg1.close()
+            self._abandon_hub_for_crash(hub1, reg1)
 
         # Reopen after simulated crash: replacement blocked until exact owner confirms terminal
         reg2, hub2 = self._open_hub(owner1)
@@ -729,14 +727,7 @@ class TestRestartQualification(unittest.TestCase):
             self.assertTrue(b["abort_requested"])
         finally:
             reg1.commit_external_revoke = orig_commit  # type: ignore[method-assign]
-            hub1._stop_cleanup_retry_worker(time.monotonic() + 1.0)
-            os_lock = hub1._state_lock_fd
-            hub1._state_lock_fd = -1
-            if os_lock >= 0:
-                from oc_hub import _release_state_dir_lock
-
-                _release_state_dir_lock(os_lock)
-            reg1.close()
+            self._abandon_hub_for_crash(hub1, reg1)
 
         # Reopen with legacy transport -> stays degraded, zero dispatch, refuses recovery
         reg2, hub2 = self._open_hub(FakeWorkerTransport())
@@ -746,14 +737,7 @@ class TestRestartQualification(unittest.TestCase):
             with self.assertRaises(CoordPolicyError):
                 hub2.confirm_recovery(_OP, reason="legacy_cannot_clear")
         finally:
-            hub2._stop_cleanup_retry_worker(time.monotonic() + 1.0)
-            os_lock = hub2._state_lock_fd
-            hub2._state_lock_fd = -1
-            if os_lock >= 0:
-                from oc_hub import _release_state_dir_lock
-
-                _release_state_dir_lock(os_lock)
-            reg2.close()
+            self._abandon_hub_for_crash(hub2, reg2)
 
         # Reopen with exact owner1 -> confirm_recovery finishes logical retirement & terminal_confirmed=1
         reg3, hub3 = self._open_hub(owner1)
@@ -1078,6 +1062,257 @@ class TestRestartQualification(unittest.TestCase):
         release.set()
         disp_thread.join(timeout=2.0)
         hub.close(timeout_s=1.5)
+
+    def test_g2_p1_1_late_handed_off_after_terminal_sweep_reconfirms_physical_close(
+        self,
+    ) -> None:
+        # Both revoke() and confirm_recovery() races must re-invoke confirm_incarnation_terminal
+        # to close a late stream reader registered after the first sweep set terminal_confirmed=1.
+        for mode in ("revoke", "recovery"):
+            sub_dir = self._tmp / f"state-p1-1-{mode}"
+            owner = ExternallyFencedFakeTransport({("sb-lr", "inc_lr"): _OWNER_A})
+            reg, hub = self._open_hub(owner, state_dir=sub_dir)
+            try:
+                self._reg_and_grant(hub, "sb-lr", "inc_lr")
+                msg_id = hub.send(_OP, target="sb-lr", body_text="Late reader turn")["msg_id"]
+                at_dispatch = threading.Event()
+                release_dispatch = threading.Event()
+                self.addCleanup(release_dispatch.set)
+                stream_state = {"closed": False}
+
+                orig_dispatch = owner.dispatch_turn
+                orig_confirm = owner.confirm_incarnation_terminal
+
+                def _late_dispatch(turn: Any) -> DispatchResult:
+                    at_dispatch.set()
+                    release_dispatch.wait(timeout=3.0)
+                    stream_state["closed"] = False
+                    owner.inner._revoked_incarnations.discard(("sb-lr", "inc_lr"))
+                    return orig_dispatch(turn)
+
+                def _tracking_confirm(
+                    sb_addr: str, inc_id: str, *, owner_id: str, reason: str
+                ) -> bool:
+                    ok = orig_confirm(sb_addr, inc_id, owner_id=owner_id, reason=reason)
+                    if ok:
+                        stream_state["closed"] = True
+                    return ok
+
+                owner.dispatch_turn = _late_dispatch  # type: ignore[method-assign]
+                owner.confirm_incarnation_terminal = _tracking_confirm  # type: ignore[method-assign]
+
+                disp_thread = threading.Thread(
+                    target=lambda: hub.dispatch_once(async_stream=False), daemon=True
+                )
+                disp_thread.start()
+                self.assertTrue(at_dispatch.wait(timeout=1.0))
+
+                if mode == "revoke":
+                    hub.revoke(_OP, target="sb-lr", reason="sweep_before_late_stream")
+                    calls_after_sweep = len(owner.confirm_calls)
+                    release_dispatch.set()
+                    disp_thread.join(timeout=2.0)
+                else:
+                    hub._mark_degraded("recovery_sweep_before_late_stream")
+                    rec_done = threading.Event()
+                    rec_err: list[Exception] = []
+
+                    def _do_rec() -> None:
+                        try:
+                            hub.confirm_recovery(_OP, reason="late_stream_recovery", timeout_s=2.0)
+                        except Exception as exc:
+                            rec_err.append(exc)
+                        finally:
+                            rec_done.set()
+
+                    rec_thread = threading.Thread(target=_do_rec, daemon=True)
+                    rec_thread.start()
+                    self.assertTrue(
+                        _wait_until(
+                            lambda: bool(
+                                reg.get_transport_binding("sb-lr", "inc_lr")["terminal_confirmed"]
+                            )
+                        )
+                    )
+                    calls_after_sweep = len(owner.confirm_calls)
+                    release_dispatch.set()
+                    self.assertTrue(rec_done.wait(timeout=2.0))
+                    disp_thread.join(timeout=2.0)
+                    self.assertEqual(rec_err, [])
+
+                self.assertGreater(len(owner.confirm_calls), calls_after_sweep)
+                self.assertTrue(stream_state["closed"])
+                self.assertEqual(hub._pending_cleanup_streams, {})
+            finally:
+                hub.close(timeout_s=1.5)
+                reg.close()
+
+    def test_g2_p1_2_binding_lookup_sqlite_error_fails_closed_without_legacy_fallback(
+        self,
+    ) -> None:
+        reg, hub = self._open_hub(FakeWorkerTransport())
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        orig_get = reg.get_transport_binding
+
+        def _failing_get(sb_addr: str, inc_id: str) -> dict[str, Any] | None:
+            raise RuntimeError("sqlite_io_error")
+
+        reg.get_transport_binding = _failing_get  # type: ignore[method-assign]
+        try:
+            settled, aborted = hub._abort_incarnation_confirmed("sb-x", "inc_x", "revoked")
+            self.assertFalse(settled)
+            self.assertFalse(aborted)
+        finally:
+            reg.get_transport_binding = orig_get  # type: ignore[method-assign]
+
+    def test_g2_p1_3_verifier_rejects_forged_unlinked_and_malformed_badges(self) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-v", "inc_v1"): _OWNER_A})
+        reg, hub = self._open_hub(owner)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_and_grant(hub, "sb-v", "inc_v1")
+        msg_ok = hub.send(_OP, target="sb-v", body_text="Legit turn")["msg_id"]
+        self.assertEqual(hub.dispatch_once(async_stream=False), 1)
+
+        # (a) Forged user_message with dispatch_msg_id IS NULL and badge='Operator' must fail
+        with reg._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO stream_events
+                    (seq, event_type, sandbox_addr, incarnation_id, thread_id,
+                     seq_hint, message_id, dispatch_msg_id, text, file_path,
+                     detail_json, badge, created_at)
+                VALUES (9001, 'user_message', 'sb-v', 'inc_v1', 'main',
+                        1, NULL, NULL, 'forged', NULL, '{}', 'Operator', 1.0)
+                """
+            )
+        with self.assertRaises(AssertionError):
+            verify_combined_pass_evidence(
+                reg,
+                CombinedPassExpectations(
+                    completed_msg_ids=(msg_ok,),
+                    expected_unconfirmed_bindings=(("sb-v", "inc_v1"),),
+                ),
+            )
+
+        # (b) Null badge on user_message must fail
+        with reg._tx() as conn:
+            conn.execute("UPDATE stream_events SET badge = NULL WHERE seq = 9001")
+        with self.assertRaises(AssertionError):
+            verify_combined_pass_evidence(
+                reg,
+                CombinedPassExpectations(
+                    completed_msg_ids=(msg_ok,),
+                    expected_unconfirmed_bindings=(("sb-v", "inc_v1"),),
+                ),
+            )
+
+        # (c) Non-null badge on text_delta must fail
+        with reg._tx() as conn:
+            conn.execute(
+                "UPDATE stream_events SET event_type = 'text_delta', badge = 'Operator' WHERE seq = 9001"
+            )
+        with self.assertRaises(AssertionError):
+            verify_combined_pass_evidence(
+                reg,
+                CombinedPassExpectations(
+                    completed_msg_ids=(msg_ok,),
+                    expected_unconfirmed_bindings=(("sb-v", "inc_v1"),),
+                ),
+            )
+
+    def test_g2_p2_1_startup_reconciliation_fences_all_unconfirmed_bindings_symmetrically(
+        self,
+    ) -> None:
+        owner = ExternallyFencedFakeTransport(
+            {("sb-early", "inc_e1"): _OWNER_A, ("sb-late", "inc_l1"): _OWNER_B}
+        )
+        reg1, hub1 = self._open_hub(owner)
+        try:
+            self._reg_and_grant(hub1, "sb-early", "inc_e1")
+            self._reg_and_grant(hub1, "sb-late", "inc_l1")
+            # Mark ONLY the later binding abort_requested=1; earlier binding stays healthy
+            reg1.mark_transport_abort_requested("sb-late", "inc_l1", reason="late_abort_req")
+        finally:
+            hub1.close()
+            reg1.close()
+
+        reg2, hub2 = self._open_hub(owner)
+        self.addCleanup(reg2.close)
+        self.addCleanup(hub2.close)
+        self.assertTrue(hub2.is_degraded)
+        self.assertIn(("sb-early", "inc_e1"), hub2._fenced_targets)
+        self.assertIn(("sb-late", "inc_l1"), hub2._fenced_targets)
+        self.assertIn(("sb-early", "inc_e1"), hub2._pending_cleanup_incarnations)
+        self.assertIn(("sb-late", "inc_l1"), hub2._pending_cleanup_incarnations)
+        hub2.confirm_recovery(_OP, reason="settle_both")
+        self.assertFalse(hub2.is_degraded)
+
+    def test_g2_p2_2_idempotent_second_revoke_and_settled_known_incarnation_pruning(
+        self,
+    ) -> None:
+        owner1 = ExternallyFencedFakeTransport({("sb-idem", "inc_i1"): _OWNER_A})
+        reg1, hub1 = self._open_hub(owner1)
+        try:
+            self._reg_and_grant(hub1, "sb-idem", "inc_i1")
+            hub1.revoke(_OP, target="sb-idem", reason="first_revoke")
+            # Direct idempotent commit_external_revoke returns [] without adding duplicate audit
+            _ok_before, count_before = reg1.verify_audit_chain()
+            self.assertEqual(
+                reg1.commit_external_revoke(
+                    target_addr="sb-idem",
+                    incarnation_id="inc_i1",
+                    owner_id=_OWNER_A,
+                    actor=_OP.canonical_sender,
+                    reason="dup_commit",
+                ),
+                [],
+            )
+            _ok_after, count_after = reg1.verify_audit_chain()
+            self.assertEqual(count_after, count_before)
+        finally:
+            hub1.close()
+            reg1.close()
+
+        # Reopen with successor-only transport (does NOT know inc_i1): second revoke must succeed cleanly
+        owner2 = ExternallyFencedFakeTransport({("sb-idem", "inc_i2"): _OWNER_B})
+        reg2, hub2 = self._open_hub(owner2)
+        self.addCleanup(reg2.close)
+        self.addCleanup(hub2.close)
+        hub2.revoke(_OP, target="sb-idem", reason="second_idempotent_revoke")
+        self.assertEqual(hub2._pending_cleanup_incarnations, {})
+
+    def test_g2_p2_3_uncertain_and_dispatch_exception_details_sanitized(self) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-san", "inc_s1"): _OWNER_A})
+        bad_detail = "bad\ud800\x00\u202e\n" + ("X" * 1024)
+        owner.inner.queue_script(
+            "sb-san", TurnScript(outcome=DispatchOutcome.UNCERTAIN, detail=bad_detail)
+        )
+        reg, hub = self._open_hub(owner)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_and_grant(hub, "sb-san", "inc_s1")
+
+        msg_unc = hub.send(_OP, target="sb-san", body_text="Uncertain hostile detail")["msg_id"]
+        self.assertEqual(hub.dispatch_once(async_stream=False), 1)
+
+        def _raising_dispatch(turn: Any) -> DispatchResult:
+            raise RuntimeError("boom\ud800\x07\u202e\n" + ("Y" * 1024))
+
+        owner.dispatch_turn = _raising_dispatch  # type: ignore[method-assign]
+        msg_exc = hub.send(_OP, target="sb-san", body_text="Exception hostile detail")["msg_id"]
+        self.assertEqual(hub.dispatch_once(async_stream=False), 1)
+
+        outbox = {r["msg_id"]: r for r in reg.list_outbox(statuses=_STATUS_ALL)}
+        for mid in (msg_unc, msg_exc):
+            self.assertEqual(outbox[mid]["status"], "uncertain")
+            self.assertLessEqual(len(outbox[mid]["detail"].encode("utf-8")), 256)
+            self.assertNotIn("\x00", outbox[mid]["detail"])
+            self.assertNotIn("\u202e", outbox[mid]["detail"])
+        ok, count = reg.verify_audit_chain()
+        self.assertTrue(ok)
+        self.assertGreater(count, 0)
 
 
 if __name__ == "__main__":

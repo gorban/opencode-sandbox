@@ -138,6 +138,7 @@ _SESSION_ACTIVE_MARKER_NAME = ".coord_session_active"
 _STATE_LOCK_NAME = ".coord_hub.lock"
 _EPHEMERAL_LEASE_PREFIX = "ephemeral-lease:"
 _ORCH_ACTOR_PREFIX = "orchestrator:"
+_OP_ACTOR_PREFIX = "operator:"
 _PATCH_SUFFIX = ".patch"
 
 
@@ -1334,41 +1335,48 @@ class CoordHub:
         except Exception:
             self._mark_degraded("external_binding_startup_check_failed")
             return
-        needs_degrade = False
-        for binding in bindings:
-            sb_addr = str(binding["sandbox_addr"])
-            inc_id = str(binding["incarnation_id"])
-            owner_id = str(binding["owner_id"])
+        if not bindings:
+            return
+        with self._meta_lock:
+            for binding in bindings:
+                self._external_owners[
+                    (str(binding["sandbox_addr"]), str(binding["incarnation_id"]))
+                ] = str(binding["owner_id"])
+        needs_degrade = any(self._binding_requires_degraded_startup(b) for b in bindings)
+        if needs_degrade or self._degraded:
             with self._meta_lock:
-                self._external_owners[(sb_addr, inc_id)] = owner_id
-            if self._binding_requires_degraded_startup(binding):
-                needs_degrade = True
-            if needs_degrade or self._degraded:
-                reason = str(binding.get("reason") or _REASON_RECOVERY_RETIRED)
-                with self._meta_lock:
-                    self._fenced_targets.add((sb_addr, inc_id))
-                    self._pending_cleanup_incarnations.setdefault((sb_addr, inc_id), reason)
+                for binding in bindings:
+                    key = (str(binding["sandbox_addr"]), str(binding["incarnation_id"]))
+                    reason = str(binding.get("reason") or _REASON_RECOVERY_RETIRED)
+                    self._fenced_targets.add(key)
+                    self._pending_cleanup_incarnations.setdefault(key, reason)
         if needs_degrade:
             self._mark_degraded("unconfirmed_external_transport_binding")
 
-    def _resolve_external_owner_id(self, sb_addr: str, inc_id: str) -> str | None:
+    def _lookup_external_binding(self, sb_addr: str, inc_id: str) -> tuple[str, str | None]:
+        """Return 4-state lookup: ('settled'|'unconfirmed'|'none'|'error', owner_id)."""
+        get_binding = getattr(self._registry, "get_transport_binding", None)
+        if callable(get_binding):
+            try:
+                binding = get_binding(sb_addr, inc_id)
+            except Exception:
+                return "error", None
+            if binding is not None:
+                owner_id = str(binding["owner_id"])
+                if bool(binding.get("terminal_confirmed")):
+                    return "settled", owner_id
+                with self._meta_lock:
+                    self._external_owners[(sb_addr, inc_id)] = owner_id
+                return "unconfirmed", owner_id
         with self._meta_lock:
             cached = self._external_owners.get((sb_addr, inc_id))
         if cached is not None:
-            return cached
-        get_binding = getattr(self._registry, "get_transport_binding", None)
-        if not callable(get_binding):
-            return None
-        try:
-            binding = get_binding(sb_addr, inc_id)
-        except Exception:
-            return None
-        if binding is None or bool(binding.get("terminal_confirmed")):
-            return None
-        owner_id = str(binding["owner_id"])
-        with self._meta_lock:
-            self._external_owners[(sb_addr, inc_id)] = owner_id
-        return owner_id
+            return "unconfirmed", cached
+        return "none", None
+
+    def _resolve_external_owner_id(self, sb_addr: str, inc_id: str) -> str | None:
+        state, owner_id = self._lookup_external_binding(sb_addr, inc_id)
+        return owner_id if state == "unconfirmed" else None
 
     def _has_unconfirmed_external_bindings(self) -> bool:
         list_unconfirmed = getattr(self._registry, "list_unconfirmed_transport_bindings", None)
@@ -1376,13 +1384,13 @@ class CoordHub:
             return False
         return bool(list_unconfirmed())
 
-    def _confirm_external_binding_terminal(
-        self, sb_addr: str, inc_id: str, owner_id: str, reason: str, *, actor: str
+    def _confirm_external_physical_only(
+        self, sb_addr: str, inc_id: str, owner_id: str, reason: str
     ) -> bool:
         if not self._is_externally_fenced():
             return False
         try:
-            confirmed = (
+            return (
                 self._transport.confirm_incarnation_terminal(  # type: ignore[union-attr]
                     sb_addr, inc_id, owner_id=owner_id, reason=reason
                 )
@@ -1390,7 +1398,11 @@ class CoordHub:
             )
         except Exception:
             return False
-        if not confirmed:
+
+    def _confirm_external_binding_terminal(
+        self, sb_addr: str, inc_id: str, owner_id: str, reason: str, *, actor: str
+    ) -> bool:
+        if not self._confirm_external_physical_only(sb_addr, inc_id, owner_id, reason):
             return False
         commit_fn = getattr(self._registry, "commit_external_revoke", None)
         if not callable(commit_fn):
@@ -1405,28 +1417,45 @@ class CoordHub:
             )
             with self._meta_lock:
                 self._external_owners.pop((sb_addr, inc_id), None)
+                known = self._known_incarnations.get(sb_addr)
+                if known is not None:
+                    known.discard(inc_id)
             return True
         except Exception:
             return False
 
     def _is_external_binding_terminal_confirmed(self, sb_addr: str, inc_id: str) -> bool:
         """Return True iff an exact external_transport_bindings row is monotonically terminal_confirmed."""
-        get_binding = getattr(self._registry, "get_transport_binding", None)
-        if not callable(get_binding):
-            return False
-        try:
-            binding = get_binding(sb_addr, inc_id)
-        except Exception:
-            return False
-        return binding is not None and bool(binding.get("terminal_confirmed"))
+        state, _owner = self._lookup_external_binding(sb_addr, inc_id)
+        return state == "settled"
+
+    def _has_pending_streams_for_incarnation(self, sb_addr: str, inc_id: str) -> bool:
+        with self._meta_lock:
+            return any(
+                dst_addr == sb_addr and dst_inc == inc_id
+                for dst_addr, dst_inc, _r in self._pending_cleanup_streams.values()
+            )
 
     def _abort_incarnation_confirmed(
-        self, sb_addr: str, inc_id: str, reason: str, *, actor: str = "hub"
+        self,
+        sb_addr: str,
+        inc_id: str,
+        reason: str,
+        *,
+        actor: str = "hub",
+        force_physical_if_settled: bool = False,
     ) -> tuple[bool, bool]:
-        if self._is_external_binding_terminal_confirmed(sb_addr, inc_id):
-            return True, False
-        owner_id = self._resolve_external_owner_id(sb_addr, inc_id)
-        if owner_id is not None:
+        state, owner_id = self._lookup_external_binding(sb_addr, inc_id)
+        if state == "error":
+            return False, False
+        if state == "settled" and owner_id is not None:
+            if not force_physical_if_settled and not self._has_pending_streams_for_incarnation(
+                sb_addr, inc_id
+            ):
+                return True, False
+            ok = self._confirm_external_physical_only(sb_addr, inc_id, owner_id, reason)
+            return ok, ok
+        if state == "unconfirmed" and owner_id is not None:
             ok = self._confirm_external_binding_terminal(
                 sb_addr, inc_id, owner_id, reason, actor=actor
             )
@@ -1478,7 +1507,11 @@ class CoordHub:
         ):
             return False
         settled, _aborted = self._abort_incarnation_confirmed(
-            dst_addr, dst_inc, reason, actor="stream-cleanup"
+            dst_addr,
+            dst_inc,
+            reason,
+            actor="stream-cleanup",
+            force_physical_if_settled=True,
         )
         if settled:
             with self._meta_lock:
@@ -1655,25 +1688,25 @@ class CoordHub:
         sandboxes: Sequence[SandboxRecord],
         bindings: Sequence[Mapping[str, Any]] = (),
     ) -> None:
-        settled_sb_keys = {
-            (sb.sandbox_addr, sb.incarnation_id)
-            for sb in sandboxes
-            if self._is_external_binding_terminal_confirmed(sb.sandbox_addr, sb.incarnation_id)
+        with self._meta_lock:
+            known_pairs = [
+                (sb_addr, inc_id)
+                for sb_addr, inc_set in self._known_incarnations.items()
+                for inc_id in inc_set
+            ]
+        candidate_keys = {(sb.sandbox_addr, sb.incarnation_id) for sb in sandboxes} | set(known_pairs)
+        settled_keys = {
+            key
+            for key in candidate_keys
+            if self._is_external_binding_terminal_confirmed(key[0], key[1])
         }
         with self._meta_lock:
             for edge in all_edges:
                 self._fenced_generations.add((edge.edge_id, edge.grant_generation))
-            for sb in sandboxes:
-                key = (sb.sandbox_addr, sb.incarnation_id)
+            for key in candidate_keys:
                 self._fenced_targets.add(key)
-                if key not in settled_sb_keys:
+                if key not in settled_keys:
                     self._pending_cleanup_incarnations.setdefault(key, _REASON_RECOVERY_RETIRED)
-            for sb_addr, inc_set in self._known_incarnations.items():
-                for inc_id in inc_set:
-                    self._fenced_targets.add((sb_addr, inc_id))
-                    self._pending_cleanup_incarnations.setdefault(
-                        (sb_addr, inc_id), _REASON_RECOVERY_RETIRED
-                    )
             for sid, auth in self._stream_authorities.items():
                 self._stream_abort_reasons.setdefault(sid, _REASON_RECOVERY_RETIRED)
                 self._fenced_targets.add((auth.dst_addr, auth.dst_incarnation))
@@ -2990,7 +3023,7 @@ class CoordHub:
     ) -> str | None:
         if caller.role is not CoordRole.ORCHESTRATOR:
             return clean_src_inc
-        if src_actor.startswith("operator:"):
+        if src_actor.startswith(_OP_ACTOR_PREFIX):
             raise CoordAuthError("orchestrator_cannot_grant_operator_edge")
         if caller.sandbox_addr is None:
             return clean_src_inc
@@ -3069,7 +3102,7 @@ class CoordHub:
         if (
             caller.role is not CoordRole.OPERATOR
             or src_actor != caller.canonical_sender
-            or not src_actor.startswith("operator:")
+            or not src_actor.startswith(_OP_ACTOR_PREFIX)
             or clean_src_inc is not None
             or clean_lease_req is not None
         ):
@@ -3345,7 +3378,7 @@ class CoordHub:
             return None
         if (
             src_role is not CoordRole.OPERATOR
-            or not src_actor.startswith("operator:")
+            or not src_actor.startswith(_OP_ACTOR_PREFIX)
             or src_incarnation is not None
             or edge is None
             or edge.lease_request_id is not None
@@ -3821,7 +3854,10 @@ class CoordHub:
                     )
                 elif dispatch_exc is not None:
                     self._registry.mark_outbox_uncertain(
-                        env.msg_id, detail=f"dispatch_exception:{dispatch_exc}"
+                        env.msg_id,
+                        detail=_sanitize_reason_detail(
+                            f"dispatch_exception:{dispatch_exc}", fallback="dispatch_exception"
+                        ),
                     )
                 else:
                     stream_task, immediate_abort = self._handle_dispatch_result_locked(
@@ -3869,7 +3905,12 @@ class CoordHub:
                 with self._meta_lock:
                     self._inflight_handoffs.pop(env.msg_id, None)
                     self._inflight_cond.notify_all()
-                self._registry.mark_outbox_uncertain(env.msg_id, detail=f"dispatch_exception:{exc}")
+                self._registry.mark_outbox_uncertain(
+                    env.msg_id,
+                    detail=_sanitize_reason_detail(
+                        f"dispatch_exception:{exc}", fallback="dispatch_exception"
+                    ),
+                )
                 return True
             stream_task, immediate_abort = self._handle_dispatch_result_locked(
                 env, result, edge_id, grant_gen, inflight, start_rec_gen=start_rec_gen
@@ -4006,7 +4047,11 @@ class CoordHub:
             )
         try:
             self._registry.mark_outbox_uncertain(
-                env.msg_id, detail=f"{_REASON_HANDOFF_PERSIST_FAILED}:{exc}"
+                env.msg_id,
+                detail=_sanitize_reason_detail(
+                    f"{_REASON_HANDOFF_PERSIST_FAILED}:{exc}",
+                    fallback=_REASON_HANDOFF_PERSIST_FAILED,
+                ),
             )
         except Exception:
             self._mark_degraded(_REASON_HANDOFF_PERSIST_FAILED)
@@ -4044,7 +4089,8 @@ class CoordHub:
         if result.outcome is DispatchOutcome.UNCERTAIN:
             self._pop_inflight_if_requested(env.msg_id, pop_inflight)
             self._registry.mark_outbox_uncertain(
-                env.msg_id, detail=result.detail or "uncertain_handoff"
+                env.msg_id,
+                detail=_sanitize_reason_detail(result.detail, fallback="uncertain_handoff"),
             )
             return None, None
 
@@ -4679,6 +4725,9 @@ class CoordHub:
         with self._meta_lock:
             self._pending_cleanup_incarnations.pop((addr, incarnation_id), None)
             self._external_owners.pop((addr, incarnation_id), None)
+            known = self._known_incarnations.get(addr)
+            if known is not None:
+                known.discard(incarnation_id)
             self._settle_streams_for_incarnation_locked(addr, incarnation_id)
         elapsed_ms = (time.monotonic() - start_ts) * 1000.0
         return RevocationStatus(
@@ -4690,9 +4739,10 @@ class CoordHub:
         )
 
     def _abort_detached_incarnation(self, sb_addr: str, inc_id: str, reason: str) -> bool:
-        try:
-            aborted = bool(self._transport.abort_incarnation(sb_addr, inc_id, reason=reason))
-        except Exception:
+        settled, aborted = self._abort_incarnation_confirmed(
+            sb_addr, inc_id, reason, actor="revoke"
+        )
+        if not settled:
             return False
         with self._meta_lock:
             self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
