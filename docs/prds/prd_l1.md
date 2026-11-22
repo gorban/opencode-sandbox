@@ -367,9 +367,8 @@ function handle_broker_postgres_conn(client_sock, job_lease, pg_route):
 
 ## Open Implementation & Qualification Checkboxes
 
-- [ ] **Gate 1 external security review of `prd_l1.md`** — clear Path A architecture, per-rule
-      `broker_routes` schema, L7 policy rules, framed Postgres wire proxy design, `managed` egress
-      plumbing, and all 8 red-team invariants before coding.
+- [x] **Gate 1 external security review of `prd_l1.md`** — cleared at commit `a8ef3c5d031f`
+      (SHA-256 `53cbcb1aeac334b2d3add6f1cac8d87393d704b2722d489872c45eb8e9080d0a`).
 - [ ] **Plan IR host-vs-container split (`oc_schema.py`, `oc_plan.py`)** — add `broker_routes`,
       `credential_delivery` enum (`"local-ephemeral"` / `"host-brokered"` / `"raw-container-mount"`),
       close `pinned-artifact` local bypass, expand sensitive-header validation, enforce
@@ -402,5 +401,12 @@ function handle_broker_postgres_conn(client_sock, job_lease, pg_route):
 - Gate 1 design review round 1 (`Security-Focused PR Reviewer Setup`, `97b6771..06ea0a7`,
   SHA-256 `b10c97a35f0d7744d05540d6fadb5a6a44f24db9e181120dc139ea13ea63e45b`): 3 P1, 3 P2, and 3 P3
   findings addressed.
-- Gate 1 design review round 2 (`Security-Focused PR Reviewer Setup`): pending.
+- Gate 1 design review round 2 (`Security-Focused PR Reviewer Setup`, `06ea0a7..a8ef3c5`):
+  **CLEARED** at commit `a8ef3c5d031f9f9e18ef145beec9c2b6fec2055c` (`docs/prds/prd_l1.md` SHA-256
+  `53cbcb1aeac334b2d3add6f1cac8d87393d704b2722d489872c45eb8e9080d0a`).
+  - Implementation reminders for Gate 2:
+    1. Because segment-bounded `*` does not cross `/`, list explicit multi-segment patterns where
+       needed (e.g., `/api/v1/namespaces/*/pods/*` and `/api/v1/namespaces/*/pods/*/log`).
+    2. Enforce bounded concurrent connections and read/write timeouts on HTTP and Postgres broker
+       listeners (matching `oc_config_mcp.py`).
 - Gate 2 implementation review (`Security-Focused PR Reviewer Setup`): pending.
