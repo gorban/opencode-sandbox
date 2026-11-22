@@ -651,25 +651,29 @@ may be owned by a mapped UID, run tests and CLI examples with a user-owned `TMPD
       `approve`/`reject`/`reconcile`), and `worker` subcommands against an explicit scratch
       `--config-dir`.
 - [x] **Comprehensive Offline Adversarial & Unit Test Suite (`docs/prds/spikes/l/test_poc.py`)** —
-      32 tests verifying DAG cycles, ambiguous provider & diamond conflicts, fallback inside DAG
+      33 tests verifying DAG cycles, ambiguous provider & diamond conflicts, fallback inside DAG
       (and refusing escalating/incomparable fallbacks), alternate-port builtin capability
       downgrade prevention, same-service multi-instance `instance_port` & `service@instance`
       disambiguation, `[local]` active-root pruning + remote-endpoint SSRF denial (including
-      CGNAT `100.64.0.0/10` and octal/decimal/hex IPv4), remote MCP read-only default + explicit
-      canonical-URL write grant + separate local/remote-RO/remote-RW credential slots + persona
-      override & credential downgrade, pod-local MCP SSRF & port `9222` rejection, 0-MCP Postgres
-      wiring, endpoint exposure denial (`9222`, unauthenticated `5432`), persona conflict &
-      `[composition] replace`, single-pass `{{slot}}` & symlink rejection, multi-hop and `..` `$SB`
+      CGNAT `100.64.0.0/10`, octal/decimal/hex IPv4, and `;` path parameters), remote MCP read-only
+      default + explicit canonical-URL write grant + separate local/remote-RO/remote-RW credential
+      slots (including top-level overlap rejection) + persona override & credential downgrade,
+      pod-local MCP SSRF & port `9222` rejection, 0-MCP Postgres wiring, endpoint exposure denial
+      (`9222`, unauthenticated `5432`), persona conflict & `[composition] replace`, single-pass
+      `{{slot}}` & symlink rejection, kernel-order `symlink/..` & multi-hop `$SB` / host-production
       rejection, scratch-only `--config-dir` isolation (refusing `~/.config/oc-sandbox`,
       `$XDG_CONFIG_HOME/oc-sandbox`, and existing non-empty non-PoC dirs), cross-process CLI
-      `config approve` via `--operator-socket` (and fail-closed rejection after helper restart),
-      MCP role filtering, token-boundary raw secret & forbidden-env checks, `executables.toml`
-      hook/latest rejection, 64-node DAG cap, `plan_digest` invariance across drift,
-      `security_delta` (`remote_write_granted`, etc.) & `classify_drift` coverage, injective
-      `/` -> `@` store paths, and orchestrator MCP framing/write-timeout/redacted-`config_diff`/
-      duplicate-key/depth/token/restart-rotation/opaque-ID/allowlist/`builtin/*`/archive-dependent/
-      `unarchive`-revalidation/stale-closure/`"applying"`-and-`"uncertain"`-recovery/rollback-
-      replay/digest-mismatch/TTL-bound/CLI-`O_NOFOLLOW` rejection.
+      `config approve` via `--operator-socket` (with shared-socket-dir refusal, `config_dir` match
+      verification without side-effect dir creation, socket mode & `SO_PEERCRED` peer UID check
+      before sending `operator.token`, and fail-closed rejection after helper restart), MCP role
+      filtering, token-boundary raw secret & forbidden-env checks, `executables.toml` hook/latest
+      rejection, 64-node DAG cap, `plan_digest` invariance across drift, `security_delta`
+      (`remote_write_granted`, MCP `secret_slot_added`, etc.) & `classify_drift` coverage,
+      injective `/` -> `@` store paths, duplicate CLI key rejection, and orchestrator MCP framing/
+      write-timeout/redacted-`config_diff`/duplicate-key/depth/token/restart-rotation/opaque-ID/
+      allowlist/`builtin/*`/archive-dependent/`unarchive`-revalidation/stale-closure/`"applying"`-
+      and-`"uncertain"`-recovery/rollback-replay/digest-mismatch/TTL-bound/CLI-`O_NOFOLLOW`
+      rejection.
 
 ## Review record
 
@@ -686,11 +690,14 @@ may be owned by a mapped UID, run tests and CLI examples with a user-owned `TMPD
 - Gate 2 PoC implementation review round 2 (`Security-Focused PR Reviewer Setup`,
   `3a7f22b02f69..9ab446ba19ca`): **CLEARED** at commit `9ab446ba19ca28dcca555aa43ebbd99eb1c96726`
   (29/29 tests passing; full Gate 2 range `325ab192f9c1..9ab446ba19ca`).
-- Human-review follow-up delta (post-`84001c0`): addressed all 3 user review items (remote MCP
-  read-only by default + explicit canonical-URL write grant + separate local/remote-RO/remote-RW
-  credential slots; scratch-only `--config-dir` isolation + `.oc-sandbox-poc-store` marker;
-  separate host-only `OperatorControlServer` UDS for cross-process CLI `approve`/`reject`/
-  `reconcile` with restart fail-closed preserved) plus both Gate 2 Round 2 P3 notes (token-boundary
-  raw secret regex and raw uncollapsed `..` path walk). Delta review pending.
+- Human-review follow-up delta round 1 (`Security-Focused PR Reviewer Setup`,
+  `84001c046ee6..c38cde791b7a`): implemented all 3 human-review items (remote MCP read-only by
+  default + explicit canonical-URL write grant + separate credential slots; scratch-only
+  `--config-dir` isolation + `.oc-sandbox-poc-store` marker; separate host-only
+  `OperatorControlServer` UDS + `--operator-socket`) plus both Gate 2 Round 2 P3 notes; 1 P1, 2 P2,
+  and 3 P3 findings addressed in `0de621d7ec91`.
+- Human-review follow-up delta round 2 (`Security-Focused PR Reviewer Setup`,
+  `c38cde791b7a..0de621d7ec91`, full delta `84001c046ee6..0de621d7ec91`): **CLEARED** at commit
+  `0de621d7ec9166f36e53e2ecc9e036a98e51e06c` (33/33 tests passing; zero remaining findings).
 
 - [ ] **Human review**: checked only when the user says so
