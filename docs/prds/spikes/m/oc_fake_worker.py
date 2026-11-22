@@ -33,6 +33,7 @@ class TurnScript:
 
     outcome: DispatchOutcome = DispatchOutcome.HANDED_OFF
     detail: str = ""
+    permanent: bool = False
     echo_user_message: bool = True
     text_chunks: tuple[str, ...] = ("ack",)
     file_edits: tuple[str, ...] = ()
@@ -40,6 +41,8 @@ class TurnScript:
     terminal_text: str = ""
     block_event: threading.Event | None = None
     on_stream_started: threading.Event | None = None
+    pre_write_pause: threading.Event | None = None
+    on_pre_write_paused: threading.Event | None = None
     flood_count: int = 0
     hostile_spoof_user_msg: dict[str, Any] | None = None
     hostile_raw_events: tuple[Any, ...] = ()
@@ -110,6 +113,46 @@ class FakeWorkerTransport:
                 return self._default_scripts[key]
         return TurnScript()
 
+    def _finalize_dispatch_locked(
+        self, turn: TurnDispatch, script: TurnScript
+    ) -> DispatchResult:
+        inc_key = (turn.sandbox_addr, turn.incarnation_id)
+        dedup_key = (turn.incarnation_id, turn.msg_id)
+        if inc_key in self._revoked_incarnations:
+            return DispatchResult(
+                outcome=DispatchOutcome.ZERO_BYTES_SENT,
+                detail=_ERR_INCARNATION_REVOKED,
+            )
+        existing = self._dispatched_by_key.get(dedup_key)
+        if existing is not None:
+            return existing
+        self._dispatched_turns.append(turn)
+        if script.outcome is DispatchOutcome.ZERO_BYTES_SENT:
+            return DispatchResult(
+                outcome=DispatchOutcome.ZERO_BYTES_SENT,
+                detail=script.detail or "refused_before_write",
+                permanent=script.permanent,
+            )
+        if script.outcome is DispatchOutcome.UNCERTAIN:
+            res = DispatchResult(
+                outcome=DispatchOutcome.UNCERTAIN,
+                detail=script.detail or "uncertain_disconnect",
+            )
+            self._dispatched_by_key[dedup_key] = res
+            self._last_error[inc_key] = res.detail
+            return res
+        stream_id = mint_crypto_id("stream")
+        state = _StreamState(stream_id=stream_id, turn=turn, script=script)
+        self._streams[stream_id] = state
+        self._active_by_incarnation.setdefault(inc_key, set()).add(stream_id)
+        res = DispatchResult(
+            outcome=DispatchOutcome.HANDED_OFF,
+            stream_id=stream_id,
+            detail=script.detail,
+        )
+        self._dispatched_by_key[dedup_key] = res
+        return res
+
     def dispatch_turn(self, turn: TurnDispatch) -> DispatchResult:
         inc_key = (turn.sandbox_addr, turn.incarnation_id)
         dedup_key = (turn.incarnation_id, turn.msg_id)
@@ -122,35 +165,15 @@ class FakeWorkerTransport:
             existing = self._dispatched_by_key.get(dedup_key)
             if existing is not None:
                 return existing
-
             script = self._next_script_locked(turn.sandbox_addr, turn.thread_id)
-            self._dispatched_turns.append(turn)
+            if script.pre_write_pause is None:
+                return self._finalize_dispatch_locked(turn, script)
 
-            if script.outcome is DispatchOutcome.ZERO_BYTES_SENT:
-                return DispatchResult(
-                    outcome=DispatchOutcome.ZERO_BYTES_SENT,
-                    detail=script.detail or "refused_before_write",
-                )
-            if script.outcome is DispatchOutcome.UNCERTAIN:
-                res = DispatchResult(
-                    outcome=DispatchOutcome.UNCERTAIN,
-                    detail=script.detail or "uncertain_disconnect",
-                )
-                self._dispatched_by_key[dedup_key] = res
-                self._last_error[inc_key] = res.detail
-                return res
-
-            stream_id = mint_crypto_id("stream")
-            state = _StreamState(stream_id=stream_id, turn=turn, script=script)
-            self._streams[stream_id] = state
-            self._active_by_incarnation.setdefault(inc_key, set()).add(stream_id)
-            res = DispatchResult(
-                outcome=DispatchOutcome.HANDED_OFF,
-                stream_id=stream_id,
-                detail=script.detail,
-            )
-            self._dispatched_by_key[dedup_key] = res
-            return res
+        if script.on_pre_write_paused is not None:
+            script.on_pre_write_paused.set()
+        script.pre_write_pause.wait(timeout=5.0)
+        with self._lock:
+            return self._finalize_dispatch_locked(turn, script)
 
     def _make_revoked_event(self, state: _StreamState) -> StreamEvent:
         return StreamEvent(
@@ -342,3 +365,105 @@ class FakeWorkerTransport:
             revoked=revoked,
             last_error=last_err,
         )
+
+
+class ExternallyFencedFakeTransport:
+    """Opt-in ExternallyFencedTransport fake mirroring the real local adapter (no abort_stream)."""
+
+    def __init__(
+        self,
+        owned_incarnations: dict[tuple[str, str], str] | None = None,
+        *,
+        inner: FakeWorkerTransport | None = None,
+        max_wire_frame_bytes: int | None = None,
+        reject_artifacts: bool = True,
+    ) -> None:
+        self._inner = inner if inner is not None else FakeWorkerTransport()
+        self._lock = threading.Lock()
+        self._owned: dict[tuple[str, str], str] = dict(owned_incarnations or {})
+        self._max_wire_frame_bytes = max_wire_frame_bytes
+        self._reject_artifacts = reject_artifacts
+        self.fail_confirm_keys: set[tuple[str, str]] = set()
+        self.confirm_calls: list[tuple[str, str, str, str]] = []
+        self.dispatch_calls: list[TurnDispatch] = []
+
+    @property
+    def external_write_fence(self) -> bool:
+        return True
+
+    @property
+    def inner(self) -> FakeWorkerTransport:
+        return self._inner
+
+    def register_owner(self, sandbox_addr: str, incarnation_id: str, owner_id: str) -> None:
+        with self._lock:
+            self._owned[(sandbox_addr, incarnation_id)] = owner_id
+
+    def transport_owner_id(self, sandbox_addr: str, incarnation_id: str) -> str:
+        with self._lock:
+            owner_id = self._owned.get((sandbox_addr, incarnation_id))
+        if owner_id is None:
+            raise KeyError(f"unknown_incarnation:{sandbox_addr}:{incarnation_id}")
+        return owner_id
+
+    def confirm_incarnation_terminal(
+        self,
+        sandbox_addr: str,
+        incarnation_id: str,
+        *,
+        owner_id: str,
+        reason: str,
+    ) -> bool:
+        key = (sandbox_addr, incarnation_id)
+        with self._lock:
+            self.confirm_calls.append((sandbox_addr, incarnation_id, owner_id, reason))
+            expected = self._owned.get(key)
+            fail_key = key in self.fail_confirm_keys
+        if expected is None or expected != owner_id or fail_key:
+            return False
+        self._inner.abort_incarnation(sandbox_addr, incarnation_id, reason=reason)
+        return True
+
+    def dispatch_turn(self, turn: TurnDispatch) -> DispatchResult:
+        key = (turn.sandbox_addr, turn.incarnation_id)
+        with self._lock:
+            self.dispatch_calls.append(turn)
+            owned = key in self._owned
+        if not owned:
+            return DispatchResult(
+                outcome=DispatchOutcome.ZERO_BYTES_SENT,
+                detail="unknown_external_incarnation",
+                permanent=True,
+            )
+        if self._reject_artifacts and turn.artifact_refs:
+            return DispatchResult(
+                outcome=DispatchOutcome.ZERO_BYTES_SENT,
+                detail="unsupported_artifact_refs",
+                permanent=True,
+            )
+        if (
+            self._max_wire_frame_bytes is not None
+            and len(turn.wire_text.encode("utf-8")) > self._max_wire_frame_bytes
+        ):
+            return DispatchResult(
+                outcome=DispatchOutcome.ZERO_BYTES_SENT,
+                detail="frame_exceeds_transport_limit",
+                permanent=True,
+            )
+        return self._inner.dispatch_turn(turn)
+
+    def stream_events(self, stream_id: str) -> Iterable[StreamEvent]:
+        return self._inner.stream_events(stream_id)
+
+    def abort_incarnation(
+        self, sandbox_addr: str, incarnation_id: str, *, reason: str
+    ) -> bool:
+        key = (sandbox_addr, incarnation_id)
+        with self._lock:
+            owned = key in self._owned
+        if not owned:
+            raise KeyError(f"unknown_incarnation:{sandbox_addr}:{incarnation_id}")
+        return self._inner.abort_incarnation(sandbox_addr, incarnation_id, reason=reason)
+
+    def status(self, sandbox_addr: str, incarnation_id: str) -> WorkerStatus:
+        return self._inner.status(sandbox_addr, incarnation_id)

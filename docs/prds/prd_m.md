@@ -121,7 +121,10 @@ that streams a response, edits a scratch file, and loses access when its job gra
   - [x] Standalone devbox transport proof with OpenCode 2.3.0 and a synthetic model.
         The probe verified the streamed reply, native file write, revocation, and cleanup on
         rootless Podman with SELinux enforcing. See the [probe and run instructions](spikes/m/local/README.md).
-  - [ ] Attach the local transport to the coordination hub and verify the joint restart case below.
+  - [x] Attach the local transport to the coordination hub and verify the joint restart case below.
+        The [joint synthetic proof](spikes/m/local/README.md#joint-coordhub-proof)
+        verified live stream revocation, zero delivery on reopen against the same worker,
+        and a fresh incarnation at the original address.
 - [*] **PRD M coordination** — implement local target addressing and the send, status, and revoke
       workflow with a fake worker. Own the hub and registry together, including the thread
       projection and persistence tests ([M2.1 and M2.3](prd_m2.md#concrete-gaps-and-checkboxes)
