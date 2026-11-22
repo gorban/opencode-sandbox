@@ -70,11 +70,14 @@ default. The containers share your host kernel. A microVM runtime such as libkru
   - opens files `O_NONBLOCK` and checks the open descriptor with `fstat`, so FIFOs and devices are refused;
   - copies the content into `~/.local/share/oc-sandbox/bridge-stage/` (host-owned, 0700, not mounted) and
     opens that copy;
-  - writes saved edits back by creating a new file `O_EXCL|O_NOFOLLOW` in the pinned parent directory and
-    renaming it over the target, which replaces a directory entry and never follows one. If the file was
-    changed or replaced in the sandbox since it was opened, the edit is saved as `NAME.host-edit` instead;
-  - pins `.bridge/requests` the same way before reading or draining it; a symlink there is removed (only
-    the link) and nothing else happens.
+  - prepares saved edits in private host staging and applies the sandbox's SELinux label before
+    publication. It checks the target before renaming and verifies the published inode. A detected
+    conflict gets a new sibling copy, usually `NAME.host-edit`. If the destination exists, its
+    identity changes during publication, or publication crosses a mount boundary, the staged save
+    remains available for recovery. A concurrent edit can still race the final check and rename;
+  - pins `.bridge/requests` the same way before draining it in paced batches. A symlink there is
+    unlinked. Invalid nonempty directories are moved out of the queue without traversing their
+    contents. The move leaves them under `.bridge/` until sandbox bridge cleanup.
 - **Bridge copies:** `code`/`bcompare` on a path outside `/sandbox` copies it into `.bridge/files/` first
   (the host can only see the sandbox directory). Copies older than 7 days are removed automatically.
 - **Secrets:** these API key variables are forwarded into the agent if set: `ANTHROPIC_API_KEY`,

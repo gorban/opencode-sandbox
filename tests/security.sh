@@ -239,6 +239,17 @@ check "saved edit written back into the sandbox" [ "$(cat "$SB/construct/a.txt")
 check "staging cleaned after the session"   [ -z "$(ls -A "$T/stage")" ]
 check "queue drained"                       [ -z "$(ls -A "$SB/.bridge/requests")" ]
 
+reset_tool
+echo '{}' > "$SB/construct/test.code-workspace"
+req workspace code /sandbox/construct/test.code-workspace
+{ printf 'code\n/sandbox/construct/a.txt\n'; head -c 8192 /dev/zero | tr '\0' a; } > "$SB/.bridge/requests/over.req"
+bridge
+check 'workspace definitions and oversized requests never reach the host editor' [ ! -e "$T/tool.args" ]
+check 'bridge drains rejected requests' [ -z "$(ls -A "$SB/.bridge/requests")" ]
+req failed-launch code /sandbox/construct/a.txt
+OC_BRIDGE_LAUNCH=/usr/bin/false bridge
+check 'known editor launch failure reclaims its staging directory' [ -z "$(ls -A "$T/stage")" ]
+
 reset_tool; req 2 code /sandbox/construct/dir /etc/passwd /sandbox/../victim/secret \
   /sandbox/construct/link/secret /sandbox/construct/./a.txt; bridge
 check "folders, escapes, symlink components refused" [ ! -e "$T/tool.args" ]
@@ -255,6 +266,20 @@ check "FIFO / symlinked requests not passed to the tool" [ ! -e "$T/tool.args" ]
 check "FIFO / symlinked requests leave host targets intact" victim_ok
 check "drain removed all request entries" [ -z "$(ls -A "$SB/.bridge/requests")" ]
 check "drain leaves request targets intact" victim_ok
+
+mkdir -p "$SB/.bridge/requests/stuck/nested"
+ln -s "$V" "$SB/.bridge/tmp"
+bridge
+check 'nonempty junk leaves the watched queue even with a substituted tmp' test ! -e "$SB/.bridge/requests/stuck"
+check 'quarantining junk keeps the substituted target intact' victim_ok
+unlink "$SB/.bridge/tmp"
+for (( entry=0; entry<1300; entry++ )); do : > "$SB/.bridge/requests/junk-$entry"; done
+for (( batch=0; batch<6; batch++ )); do bridge; done
+check 'queue backlog drains in bounded batches' [ -z "$(ls -A "$SB/.bridge/requests")" ]
+reset_tool; req after-backlog code /sandbox/construct/a.txt; bridge
+check 'bridge still handles requests after backlog' test -s "$T/tool.args"
+check 'bridge units pace bounded batches without tripping the start limits' bash -c \
+  'grep -qF "ExecStartPre=/usr/bin/sleep 1" "$1" && grep -qF "StartLimitIntervalSec=0" "$1" && grep -qF "TriggerLimitIntervalSec=0" "$1"' _ "$SCRIPT"
 
 mv "$SB/.bridge" "$T/bridge.real"; ln -s ../victim "$SB/.bridge"     # $SB/.bridge -> $V (has requests/)
 bridge
@@ -339,6 +364,7 @@ check "failed write-back preserves the sandbox file" grep -qx original "$SB/cons
 bridge_copy_regressions() {
   timeout 20 python3 -I - "$BRIDGE" "$T" <<'PY'
 import errno
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -374,6 +400,49 @@ class CopyTests(unittest.TestCase):
         with patch.object(os, "write", side_effect=lambda fd, data: real_write(fd, data[:2])):
             self.stage()
 
+    def test_bounded_directory_and_session_staging(self):
+        tree = self.target.parent / "tree"
+        (tree / "a" / "b").mkdir(parents=True)
+        for limits in ({"MAX_TREE_DEPTH": 2}, {"MAX_TREE_FILES": 1}):
+            with self.subTest(limits=limits), patch.dict(self.bridge, limits):
+                with self.assertRaises(self.bridge["Refused"]):
+                    self.bridge["stage_request"]("bcompare", ["/sandbox/tree"])
+                self.assertEqual(list(Path(self.bridge["STAGE"]).iterdir()), [])
+        other = self.target.with_name("more.txt")
+        other.write_bytes(base)
+        with patch.dict(self.bridge, MAX_SESSION_BYTES=len(base)):
+            with self.assertRaises(self.bridge["Refused"]):
+                self.bridge["stage_request"]("code", ["/sandbox/edit.txt", "/sandbox/more.txt"])
+        with patch.dict(self.bridge, MAX_STAGE_SESSIONS=1):
+            self.stage()
+            with self.assertRaises(self.bridge["Refused"]):
+                self.stage()
+
+    def test_save_does_not_replace_existing_conflict_copy_or_concurrent_edit(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        conflict = self.target.with_name("edit.txt.host-edit")
+        conflict.write_bytes(b"older host save")
+        fsync = os.fsync
+
+        def edited_during_copy(fd):
+            fsync(fd)
+            self.target.write_bytes(b"agent updated during copy")
+
+        with patch.object(os, "fsync", side_effect=edited_during_copy):
+            self.assertFalse(self.sync(session))
+        self.assertEqual(self.target.read_bytes(), b"agent updated during copy")
+        self.assertEqual(conflict.read_bytes(), b"older host save")
+        self.assertEqual(staged.read_bytes(), edit)
+
+    def test_label_failure_preserves_target_and_staged_edit(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        with patch.dict(self.bridge, SELINUX_LEVEL='s0:c7,c9'), \
+                patch.object(os, 'setxattr', side_effect=PermissionError('fixture')):
+            self.assertFalse(self.sync(session))
+        self.assert_preserved(staged)
+
     def test_short_save_writes(self):
         session, staged = self.stage()
         staged.write_bytes(edit)
@@ -381,14 +450,87 @@ class CopyTests(unittest.TestCase):
             self.assertTrue(self.sync(session))
         self.assertEqual(self.target.read_bytes(), edit)
 
+    def test_pending_save_name_is_private(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        fsync = os.fsync
+
+        def during_copy(fd):
+            fsync(fd)
+            self.assertEqual(list(self.target.parent.glob(".oc-bridge-*")), [])
+
+        with patch.object(os, "fsync", side_effect=during_copy):
+            self.assertTrue(self.sync(session))
+        self.assertEqual(self.target.read_bytes(), edit)
+
+    def test_replaced_publication_keeps_private_save(self):
+        for changed in (False, True):
+            with self.subTest(conflict=changed):
+                self.target.write_bytes(base)
+                session, staged = self.stage()
+                staged.write_bytes(edit)
+                dest = self.target
+                operation = "rename"
+                if changed:
+                    self.target.write_bytes(b"concurrent edit")
+                    dest = self.target.with_name("edit.txt.host-edit")
+                    operation = "link"
+                publish = getattr(os, operation)
+
+                def replace_published_inode(*args, **kwargs):
+                    publish(*args, **kwargs)
+                    replacement = dest.with_name("other-inode")
+                    replacement.write_bytes(b"replacement")
+                    os.replace(replacement, dest)
+
+                with patch.object(os, operation, side_effect=replace_published_inode):
+                    self.assertFalse(self.sync(session))
+                self.assertEqual(dest.read_bytes(), b"replacement")
+                self.assertEqual(staged.read_bytes(), edit)
+
+    def test_cross_mount_preserves_private_save(self):
+        session, staged = self.stage()
+        observations = iter((None, None, None, 0))
+        saves = iter((edit, b"next host edit", b"latest host edit"))
+        errors = StringIO()
+        with patch("subprocess.Popen", return_value=SimpleNamespace(poll=lambda: next(observations))), \
+                patch("time.sleep", side_effect=lambda _: staged.write_bytes(next(saves))), \
+                patch.object(os, "rename", side_effect=OSError(errno.EXDEV, "fixture")) as publish, \
+                patch.object(sys, "stderr", errors):
+            self.bridge["run_session"](str(session))
+        self.assertEqual(publish.call_count, 1)
+        self.assert_preserved(staged, expected=b"latest host edit")
+        self.assertEqual(errors.getvalue().count("must share a mount"), 1)
+        self.assertEqual(errors.getvalue().count(str(session)), 1)
+
+    def test_abandoned_prepared_save_expires_with_session(self):
+        session, staged = self.stage()
+
+        def editor(*args, **kwargs):
+            staged.write_bytes(edit)
+            return SimpleNamespace(poll=lambda: 0)
+
+        with patch("subprocess.Popen", side_effect=editor), \
+                patch.object(os, "rename", side_effect=OSError(errno.EXDEV, "fixture")), \
+                patch.object(os, "unlink", side_effect=PermissionError("interrupted cleanup fixture")):
+            self.bridge["run_session"](str(session))
+        self.assertEqual(len(list(session.glob(".oc-bridge-*"))), 1)
+        os.utime(session, (1, 1))
+        self.bridge["expire_stage"]()
+        self.assertEqual(list(session.parent.iterdir()), [])
+
     def sync(self, session):
         with (session / "manifest.json").open() as manifest:
             entry = json.load(manifest)["entries"][0]
-        files_fd = os.open(session / "files", os.O_RDONLY | os.O_DIRECTORY)
+        session_fd = os.open(session, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            return self.bridge["sync"](files_fd, [entry])
+            files_fd = os.open("files", os.O_RDONLY | os.O_DIRECTORY, dir_fd=session_fd)
+            try:
+                return self.bridge["sync"](session_fd, files_fd, [entry], set())
+            finally:
+                os.close(files_fd)
         finally:
-            os.close(files_fd)
+            os.close(session_fd)
 
     def assert_preserved(self, staged, expected=edit):
         self.assertEqual(self.target.read_bytes(), base)
@@ -506,7 +648,8 @@ kill $swapper; wait $swapper 2>/dev/null || true
 check "race: host file never shown to the tool ($(grep -c . "$T/tool.args" 2>/dev/null || echo 0) opened)" \
   ! grep -q "$SECRET" "$T/tool.seen" 2>/dev/null
 check "race: host file never written"       victim_ok
-check "race: edits reached the sandbox file" [ -n "$(find "$SB/construct" -name f -type f -exec grep -l '^race-' {} +)" ]
+check "race: at least one save was published or retained privately" \
+  [ -n "$(find "$SB/construct" "$T/stage" \( -name f -o -name f.host-edit \) -type f -exec grep -l '^race-' {} +)" ]
 
 # ================================================================================================
 # Every run of the real script below goes through stubs: Podman, systemctl, pkexec, sudo and
@@ -583,10 +726,13 @@ if [[ $1 == /usr/bin/bash ]]; then
   if [[ ${args[-1]} == "$HOME/guest-only-path" ]]; then
     args[-1]="$HOME/opencode-sandbox/host-path"
   fi
+  if [[ ${args[-2]} == bridge-stage && -n ${STUB_HOST_STAGE_PATH:-} ]]; then
+    args[-1]=$STUB_HOST_STAGE_PATH
+  fi
   exec "${args[@]}"
 fi
 case $1 in
-  cat|podman|systemctl) exec "$@" ;;
+  cat|podman|systemctl|/usr/bin/python3) exec "$@" ;;
   *) exit 1 ;;
 esac
 EOF
@@ -663,6 +809,22 @@ out=$(pathrun CONTAINER_ID=fixture OC_PG_IMAGE=fixture OC_PG_USER=fixture \
   OC_PG_PASSWORD=fixture OC_PG_DB=fixture OC_PG_INIT_DIR="$T/dhome/guest-only-path" -- -p -n)
 check 'Postgres init path is refused when it enters the sandbox on the host only' \
   grep -q 'refusing unsafe host Postgres init directory' <<<"$out"
+out=$(pathrun CONTAINER_ID=fixture STUB_HOST_STAGE_PATH="$DSB/host-stage" -- -n)
+check 'setup refuses staging that enters the sandbox on the host only' \
+  grep -q 'unsafe host bridge staging directory' <<<"$out"
+check 'unsafe stage is refused before systemd' ! grep -q '^systemctl' "$T/stub.log"
+out=$(pathrun CONTAINER_ID=fixture STUB_HOST_STAGE_PATH="$DSB/host-stage" -- -d -a -y)
+check 'global teardown refuses staging that enters the sandbox on the host only' \
+  grep -q 'unsafe host bridge staging directory' <<<"$out"
+check 'unsafe stage is refused before teardown removes pods' ! grep -q '^podman pod rm' "$T/stub.log"
+mkdir -m 700 "$T/other-host-stage"
+out=$(pathrun CONTAINER_ID=fixture STUB_HOST_STAGE_PATH="$T/other-host-stage" -- -n)
+check 'setup refuses different launcher and host staging directory identities' \
+  grep -q 'launcher and host see different bridge staging directories' <<<"$out"
+mkdir -m 0777 "$T/unprotected-host-stage"
+out=$(pathrun CONTAINER_ID=fixture STUB_HOST_STAGE_PATH="$T/unprotected-host-stage" -- -n)
+check 'setup refuses an unprotected host staging directory' \
+  grep -q 'unsafe host bridge staging directory' <<<"$out"
 ln -s "$T/outer"$'\n' "$T/path-linebreak"
 out=$(pathrun XDG_DATA_HOME="$T/path-linebreak" -- -l)
 check 'line break in symlink target refused before path splitting' grep -q 'refusing to use' <<<"$out"
@@ -836,6 +998,41 @@ if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; els
       [[ $output == 'update image operand accepted' ]]
     }
     check "real Podman accepts the delimited updater image operand" delimited_update_image
+    real_bridge_mcs() {
+      local fixture=$T/bridge-mcs
+      mkdir -p "$fixture/sandbox" "$fixture/stage"
+      printf 'old' > "$fixture/sandbox/file"
+      "${H[@]}" python3 -I - "$BRIDGE" "$fixture" <<'PYCODE'
+import os
+from pathlib import Path
+import runpy
+import sys
+
+script, directory = sys.argv[1:]
+root = Path(directory)
+os.environ.update(OC_SB=str(root / "sandbox"), OC_BRIDGE_STAGE=str(root / "stage"),
+                  OC_BRIDGE_SELINUX_LEVEL="s0:c7,c9")
+bridge = runpy.run_path(script)
+target = root / "sandbox" / "file"
+for conflict in (False, True):
+    identity = bridge["ident"](target.stat())
+    if conflict:
+        target.write_bytes(b"changed source")
+    with (root / "stage" / "edit").open("w+b") as edit:
+        edit.write(b"saved bytes")
+        edit.seek(0)
+        stage_fd = os.open(root / "stage", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            bridge["write_back"]({"parts": ["file"], "target": identity},
+                                 (edit.fileno(), os.fstat(edit.fileno())), stage_fd)
+        finally:
+            os.close(stage_fd)
+    destination = target.with_name("file.host-edit") if conflict else target
+    assert destination.read_bytes() == b"saved bytes"
+    assert os.getxattr(destination, "security.selinux").rstrip(b"\0") == b"system_u:object_r:container_file_t:s0:c7,c9"
+PYCODE
+    }
+    check "real SELinux bridge saves keep the sandbox MCS label" real_bridge_mcs
     VOL=oc-sectest-$$
     cat > "$T/lib.sh" <<EOF
 H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }

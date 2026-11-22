@@ -145,13 +145,18 @@ curl 127.0.0.1:3001               # agent, this instance's Chromium, and -P mapp
 Inside the sandbox, `code FILE...` opens files in your host VS Code and `bcompare A B` opens Beyond
 Compare (files or folders). The host tools work on a **copy**:
 
-- Saving in VS Code / Beyond Compare writes the file back into the sandbox within about a second.
+- When launched from Distrobox, the launcher and the host service must see the same protected
+  staging directory. Use a shared host path for the configured data directory.
+- Saving in VS Code / Beyond Compare writes the file back into the sandbox within about a second
+  when the sandbox and host staging share a mount. If write-back fails, the bridge retains the
+  staged save and logs its recovery path.
 - Changes the agent makes while the file is open are not shown in the editor. If the agent changed the
   file in the meantime, your save goes to `FILE.host-edit` next to it instead of overwriting the agent's
   version.
-- `code` waits for you to close the tab (`--wait`); the copy is deleted then. Folders opened in Beyond
-  Compare are read-only snapshots (only regular files; symlinks are skipped). Limits: 64 MiB per file,
-  5000 files / 512 MiB per folder snapshot.
+- `code` waits for you to close the tab (`--wait`); the copy is deleted after successful write-back. Folders opened in Beyond
+  Compare are read-only snapshots (ordinary files and directories). `code` refuses `.code-workspace`
+  definitions. Snapshots are limited to 64 MiB per file, 512 MiB and 5000 visited entries per
+  session, and 64 levels of nesting. At most eight staging directories are admitted at once.
 - Symlinks inside the sandbox are not followed by the host; `code` resolves them inside the sandbox
   first, so links that stay inside the sandbox still work.
 - One bridge serves all instances.
