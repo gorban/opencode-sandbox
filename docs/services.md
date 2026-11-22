@@ -8,7 +8,8 @@ configuration. OpenCode merges it with your own configuration. DevTools listens 
 `127.0.0.1:9222` in the pod.
 
 Only FIDO/U2F interfaces of security keys are passed to Chromium. Run `oc-sandbox -k` to list
-the keys it detects or start with `oc-sandbox -K` to withhold them. See the
+the keys it detects or start with `oc-sandbox -K` to withhold them. Displayed device labels use
+printable ASCII. See the
 [browser security limits](security.md#security-model) before signing in.
 
 ## Port mapping (`-P`)
@@ -60,7 +61,12 @@ literally, for example a password containing ` #`.
 
 **Optional first-start SQL.** Files in `~/.config/oc-sandbox/postgres-init/` (or the directory in
 `OC_PG_INIT_DIR`) run once, when the data volume is first created, as the standard
-`/docker-entrypoint-initdb.d` mechanism. See
+`/docker-entrypoint-initdb.d` mechanism. A relative override is resolved from the calling
+directory. Path checks and content hashing run on the Podman host, including when invoked
+from Distrobox. Use a dedicated directory outside the sandbox and keep its parent directories under
+trusted control so the path cannot be replaced during setup. The init tree must be owned by you
+or root, with no group or world write access. Podman applies a private SELinux label to the init
+directory on mount. See
 [`examples/postgres-init/01-roles.sql.example`](../examples/postgres-init/01-roles.sql.example).
 
 ### Data, upgrades and connections
@@ -139,16 +145,21 @@ curl 127.0.0.1:3001               # agent, this instance's Chromium, and -P mapp
 Inside the sandbox, `code FILE...` opens files in your host VS Code and `bcompare A B` opens Beyond
 Compare (files or folders). The host tools work on a **copy**:
 
-- Saving in VS Code / Beyond Compare writes the file back into the sandbox within about a second.
+- When launched from Distrobox, the launcher and the host service must see the same protected
+  staging directory. Use a shared host path for the configured data directory.
+- Saving in VS Code / Beyond Compare writes the file back into the sandbox within about a second
+  when the sandbox and host staging share a mount. If write-back fails, the bridge retains the
+  staged save and logs its recovery path.
 - Changes the agent makes while the file is open are not shown in the editor. If the agent changed the
   file in the meantime, your save goes to `FILE.host-edit` next to it instead of overwriting the agent's
   version.
-- `code` waits for you to close the tab (`--wait`); the copy is deleted then. Folders opened in Beyond
-  Compare are read-only snapshots (only regular files; symlinks are skipped). Limits: 64 MiB per file,
-  5000 files / 512 MiB per folder snapshot.
+- `code` waits for you to close the tab (`--wait`); the copy is deleted after successful write-back. Folders opened in Beyond
+  Compare are read-only snapshots (ordinary files and directories). `code` refuses `.code-workspace`
+  definitions. Snapshots are limited to 64 MiB per file, 512 MiB and 5000 visited entries per
+  session, and 64 levels of nesting. At most eight staging directories are admitted at once.
 - Symlinks inside the sandbox are not followed by the host; `code` resolves them inside the sandbox
   first, so links that stay inside the sandbox still work.
 - One bridge serves all instances.
 - VS Code defaults to `/home/linuxbrew/.linuxbrew/bin/code` and Beyond Compare defaults to
-  `/usr/bin/bcompare`. Set `OC_CODE_BIN` or `OC_BCOMPARE_BIN` to override the path. Missing
+  `/usr/bin/bcompare`. Set `OC_CODE_BIN` or `OC_BCOMPARE_BIN` to an absolute host path. Missing
   tools produce a warning and the corresponding command has no effect.

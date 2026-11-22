@@ -76,17 +76,23 @@ with tempfile.TemporaryDirectory(prefix='oc-leaf-') as tmp:
     sb2 = check_home / 'opencode-sandbox'; sb2.mkdir()
     build2 = state2 / 'build'; policy2 = state2 / 'policy'; stage2 = state2 / 'bridge-stage'
     bin2 = check_home / '.local/bin'; units2 = check_home / '.config/systemd/user'
-    validator = ''
-    if 'validate_host_state() {' in text:
-        a = text.index('validate_host_state() {'); b = text.index('\n}', a) + 2
-        validator = text[a:b]
-    harness = validator + '\ndie() { echo "$*" >&2; exit 2; }\numask 0002\n' + setup_block
+    validators = []
+    for name in ('validate_host_state', 'shared_host_directory', 'verify_bridge_stage'):
+        function = name + '() {'
+        if function in text:
+            start = text.index(function)
+            end = text.index('\n}', start) + 2
+            validators.append(text[start:end])
+    harness = '\n'.join(validators) + '\ndie() { echo "$*" >&2; exit 2; }\nH=()\numask 0002\n' + setup_block
     creation_env = {**env, 'HOME': str(check_home), 'SB': str(sb2), 'STATE': str(state2),
                     'BUILD': str(build2), 'POLDIR': str(policy2), 'BRIDGE_STAGE': str(stage2),
-                    'BIN': str(bin2), 'UNITS': str(units2)}
+                    'BIN': str(bin2), 'UNITS': str(units2), 'INSTALL_DIR': str(units2 / '.oc-sandbox')}
     r = subprocess.run(['bash', '-eu', '-o', 'pipefail', '-c', harness], cwd=base,
                        env=creation_env, capture_output=True, text=True)
-    if r.returncode or any(not path.is_dir() or path.stat().st_mode & 0o022 for path in (build2, policy2, bin2, units2)):
+    created = [build2, policy2, bin2, units2]
+    if 'mkdir -p "$BUILD" "$BIN" "$UNITS" "$POLDIR" "$BRIDGE_STAGE"' in setup_block:
+        created.append(stage2)
+    if r.returncode or any(not path.is_dir() or path.stat().st_mode & 0o022 for path in created):
         failures.append('permissive umask created unsafe managed directories')
     if failures:
         print('FAIL: ' + ', '.join(failures)); sys.exit(1)

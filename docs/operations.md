@@ -47,10 +47,12 @@ starts to finish creating resources; neither lock is held during an interactive 
 The small `setup.lock` and `lifecycle.lock` files under `~/.local/share/oc-sandbox` are retained even
 after `-d -a` so that concurrent commands cannot accidentally lock different inodes.
 
-Each setup checks for an OpenCode update, including `-n`. The download runs in an isolated container
-with neither the shared home nor sandbox mounted. On failure or timeout, setup keeps the working
-copy or uses the image's baked-in copy if needed. Set `OC_OPENCODE_VERSION=keep` to skip the update, or
-set it to a version such as `2.3.0` to pin it. The image also includes OpenCode 2.3.0 as a fallback.
+Each setup checks for an OpenCode update, including `-n`. The networked updater has its own SELinux
+label and has neither the shared home nor sandbox mounted. It stages a fresh release and receives
+only a digest of the current binary for change detection and promotion. Set
+`OC_OPENCODE_VERSION=keep` to skip the update or specify a version such as `2.3.0` to stage it with
+the official versioned installer. On failure or timeout, setup keeps the working copy or uses the
+image's baked-in copy if needed.
 Choosing Restart after an in-app update currently ends the session. Launch `oc-sandbox` again.
 An update in another instance and quitting OpenCode can produce the same signal as Restart.
 
@@ -130,9 +132,11 @@ Global `-d -a` deletes OpenCode login and sessions, Chromium profiles, Postgres 
 Docker-in-Docker storage. It removes `~/opencode-sandbox/.bridge/` with its queued requests and
 copies. If any editor staging directories remain in `bridge-stage/`, teardown stops
 before deleting volumes. Close the editors or recover the saved copies before retrying.
-Successful teardown clears host state and retains the setup and lifecycle lock files. A SELinux
-removal failure keeps host state and the bridge files for retry. Remove the checkout or extracted
-ZIP directory once teardown succeeds. The example uses the
+Use the same `XDG_DATA_HOME` for setup and teardown. The launcher retains the installed state and
+staging paths for retries, even after stopping the bridge and removing its units.
+Successful teardown clears the installation binding and host state and retains the lock files.
+A SELinux removal failure keeps host state and the workspace's `.bridge/` spool for retry.
+Remove the checkout or extracted ZIP directory once teardown succeeds. The example uses the
 [default install path](../README.md#install).
 
 ```bash

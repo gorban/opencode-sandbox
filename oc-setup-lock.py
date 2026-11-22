@@ -88,12 +88,12 @@ def wait_for_lock(fd, name, mode, parent):
 
 
 def main():
-    if (len(sys.argv) != 6 or sys.argv[2] not in ('setup', 'lifecycle', 'worktree') or
+    if (len(sys.argv) != 6 or sys.argv[2] not in ('installation', 'setup', 'lifecycle', 'worktree') or
         sys.argv[3] not in ('shared', 'exclusive') or not sys.argv[5].isdigit() or
         not re.fullmatch(r'[a-z0-9-]+', sys.argv[4])):
         raise ValueError('invalid setup-lock arguments')
     state, name, mode, instance, parent = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
-    if name in ('setup', 'worktree') and mode != 'exclusive': raise ValueError('setup and worktree locks must be exclusive')
+    if name != 'lifecycle' and mode != 'exclusive': raise ValueError('this setup lock must be exclusive')
     filename = instance + '.lock' if name == 'worktree' else name + '.lock'
     directory = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
