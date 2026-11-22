@@ -1095,8 +1095,10 @@ fi
 atomic_host_file "$BIN/oc-bridge" 0755 < "$SCRIPT_DIR/oc-bridge.py"
 unit_env() { local v=${2//%/%%}; v=${v//\\/\\\\}; printf 'Environment="%s=%s"\n' "$1" "${v//\"/\\\"}"; }
 {
-  printf '[Unit]\nDescription=Restricted host bridge for the OpenCode sandbox\n[Service]\nType=oneshot\n'
+  # Keep batches bounded without allowing a backlog to put the watcher in a failed state.
+  printf '[Unit]\nDescription=Restricted host bridge for the OpenCode sandbox\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\nExecStartPre=/usr/bin/sleep 1\n'
   unit_env OC_SB "$SB"; unit_env OC_BRIDGE_STAGE "$BRIDGE_STAGE"
+  unit_env OC_BRIDGE_SELINUX_LEVEL "$LEVEL"
   unit_env OC_CODE_BIN "$CODE_BIN"; unit_env OC_BCOMPARE_BIN "$BC_BIN"
   printf 'ExecStart=%%h/.local/bin/oc-bridge\n'
 } | atomic_host_file "$UNITS/oc-bridge.service" 0644
@@ -1105,11 +1107,13 @@ atomic_host_file "$UNITS/oc-bridge.path" 0644 <<'EOF'
 Description=Watch the OpenCode sandbox bridge queue
 [Path]
 DirectoryNotEmpty=%h/opencode-sandbox/.bridge/requests
+TriggerLimitIntervalSec=0
 Unit=oc-bridge.service
 [Install]
 WantedBy=default.target
 EOF
 sc daemon-reload
+sc reset-failed oc-bridge.path oc-bridge.service >/dev/null 2>&1 || true
 sc enable --now oc-bridge.path >/dev/null 2>&1 || sc start oc-bridge.path
 
 # ---- SELinux policy: dedicated type so ONLY the Chromium containers may use the Wayland socket ----

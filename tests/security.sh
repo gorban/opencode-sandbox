@@ -194,6 +194,17 @@ check "saved edit written back into the sandbox" [ "$(cat "$SB/construct/a.txt")
 check "staging cleaned after the session"   [ -z "$(ls -A "$T/stage")" ]
 check "queue drained"                       [ -z "$(ls -A "$SB/.bridge/requests")" ]
 
+reset_tool
+echo '{}' > "$SB/construct/test.code-workspace"
+req workspace code /sandbox/construct/test.code-workspace
+{ printf 'code\n/sandbox/construct/a.txt\n'; head -c 8192 /dev/zero | tr '\0' a; } > "$SB/.bridge/requests/over.req"
+bridge
+check 'workspace definitions and oversized requests never reach the host editor' [ ! -e "$T/tool.args" ]
+check 'bridge drains rejected requests' [ -z "$(ls -A "$SB/.bridge/requests")" ]
+req failed-launch code /sandbox/construct/a.txt
+OC_BRIDGE_LAUNCH=/usr/bin/false bridge
+check 'known editor launch failure reclaims its staging directory' [ -z "$(ls -A "$T/stage")" ]
+
 reset_tool; req 2 code /sandbox/construct/dir /etc/passwd /sandbox/../victim/secret \
   /sandbox/construct/link/secret /sandbox/construct/./a.txt; bridge
 check "folders, escapes, symlink components refused" [ ! -e "$T/tool.args" ]
@@ -210,6 +221,20 @@ check "FIFO / symlinked requests not passed to the tool" [ ! -e "$T/tool.args" ]
 check "FIFO / symlinked requests leave host targets intact" victim_ok
 check "drain removed all request entries" [ -z "$(ls -A "$SB/.bridge/requests")" ]
 check "drain leaves request targets intact" victim_ok
+
+mkdir -p "$SB/.bridge/requests/stuck/nested"
+ln -s "$V" "$SB/.bridge/tmp"
+bridge
+check 'nonempty junk leaves the watched queue even with a substituted tmp' test ! -e "$SB/.bridge/requests/stuck"
+check 'quarantining junk keeps the substituted target intact' victim_ok
+unlink "$SB/.bridge/tmp"
+for (( entry=0; entry<1300; entry++ )); do : > "$SB/.bridge/requests/junk-$entry"; done
+for (( batch=0; batch<6; batch++ )); do bridge; done
+check 'queue backlog drains in bounded batches' [ -z "$(ls -A "$SB/.bridge/requests")" ]
+reset_tool; req after-backlog code /sandbox/construct/a.txt; bridge
+check 'bridge still handles requests after backlog' test -s "$T/tool.args"
+check 'bridge units pace bounded batches without tripping the start limits' bash -c \
+  'grep -qF "ExecStartPre=/usr/bin/sleep 1" "$1" && grep -qF "StartLimitIntervalSec=0" "$1" && grep -qF "TriggerLimitIntervalSec=0" "$1"' _ "$SCRIPT"
 
 mv "$SB/.bridge" "$T/bridge.real"; ln -s ../victim "$SB/.bridge"     # $SB/.bridge -> $V (has requests/)
 bridge
@@ -328,6 +353,49 @@ class CopyTests(unittest.TestCase):
     def test_short_staging_writes(self):
         with patch.object(os, "write", side_effect=lambda fd, data: real_write(fd, data[:2])):
             self.stage()
+
+    def test_bounded_directory_and_session_staging(self):
+        tree = self.target.parent / "tree"
+        (tree / "a" / "b").mkdir(parents=True)
+        for limits in ({"MAX_TREE_DEPTH": 2}, {"MAX_TREE_FILES": 1}):
+            with self.subTest(limits=limits), patch.dict(self.bridge, limits):
+                with self.assertRaises(self.bridge["Refused"]):
+                    self.bridge["stage_request"]("bcompare", ["/sandbox/tree"])
+                self.assertEqual(list(Path(self.bridge["STAGE"]).iterdir()), [])
+        other = self.target.with_name("more.txt")
+        other.write_bytes(base)
+        with patch.dict(self.bridge, MAX_SESSION_BYTES=len(base)):
+            with self.assertRaises(self.bridge["Refused"]):
+                self.bridge["stage_request"]("code", ["/sandbox/edit.txt", "/sandbox/more.txt"])
+        with patch.dict(self.bridge, MAX_STAGE_SESSIONS=1):
+            self.stage()
+            with self.assertRaises(self.bridge["Refused"]):
+                self.stage()
+
+    def test_save_does_not_replace_existing_conflict_copy_or_concurrent_edit(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        conflict = self.target.with_name("edit.txt.host-edit")
+        conflict.write_bytes(b"older host save")
+        fsync = os.fsync
+
+        def edited_during_copy(fd):
+            fsync(fd)
+            self.target.write_bytes(b"agent updated during copy")
+
+        with patch.object(os, "fsync", side_effect=edited_during_copy):
+            self.assertFalse(self.sync(session))
+        self.assertEqual(self.target.read_bytes(), b"agent updated during copy")
+        self.assertEqual(conflict.read_bytes(), b"older host save")
+        self.assertEqual(staged.read_bytes(), edit)
+
+    def test_label_failure_preserves_target_and_staged_edit(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        with patch.dict(self.bridge, SELINUX_LEVEL='s0:c7,c9'), \
+                patch.object(os, 'setxattr', side_effect=PermissionError('fixture')):
+            self.assertFalse(self.sync(session))
+        self.assert_preserved(staged)
 
     def test_short_save_writes(self):
         session, staged = self.stage()
@@ -733,6 +801,36 @@ if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; els
       [[ $output == 'update image operand accepted' ]]
     }
     check "real Podman accepts the delimited updater image operand" delimited_update_image
+    real_bridge_mcs() {
+      local fixture=$T/bridge-mcs
+      mkdir -p "$fixture/sandbox" "$fixture/stage"
+      printf 'old' > "$fixture/sandbox/file"
+      "${H[@]}" python3 -I - "$BRIDGE" "$fixture" <<'PYCODE'
+import os
+from pathlib import Path
+import runpy
+import sys
+
+script, directory = sys.argv[1:]
+root = Path(directory)
+os.environ.update(OC_SB=str(root / "sandbox"), OC_BRIDGE_STAGE=str(root / "stage"),
+                  OC_BRIDGE_SELINUX_LEVEL="s0:c7,c9")
+bridge = runpy.run_path(script)
+target = root / "sandbox" / "file"
+for conflict in (False, True):
+    identity = bridge["ident"](target.stat())
+    if conflict:
+        target.write_bytes(b"changed source")
+    with (root / "stage" / "edit").open("w+b") as edit:
+        edit.write(b"saved bytes")
+        edit.seek(0)
+        bridge["write_back"]({"parts": ["file"], "target": identity}, (edit.fileno(), os.fstat(edit.fileno())))
+    destination = target.with_name("file.host-edit") if conflict else target
+    assert destination.read_bytes() == b"saved bytes"
+    assert os.getxattr(destination, "security.selinux").rstrip(b"\0") == b"system_u:object_r:container_file_t:s0:c7,c9"
+PYCODE
+    }
+    check "real SELinux bridge saves keep the sandbox MCS label" real_bridge_mcs
     VOL=oc-sectest-$$
     cat > "$T/lib.sh" <<EOF
 H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }

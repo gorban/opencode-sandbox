@@ -13,16 +13,19 @@ a pathname inside OC_SB to anything (desktop tools included), and never resolves
 * VS Code / Beyond Compare open a *copy* in OC_BRIDGE_STAGE (host-owned, mode 0700, never mounted).
   The watcher checks and reads each staged save through the same no-follow regular-file descriptor.
   It writes to a new file created O_EXCL|O_NOFOLLOW in the pinned sandbox parent directory,
-  then uses renameat() to replace the target directory entry. If the target changed, the edit goes to
-  NAME.host-edit instead of overwriting the agent's newer version. A session with an unsuccessful
-  final write-back keeps its staged copies for recovery.
+  then checks the target before renaming. An observed conflict is saved under a new sibling name
+  without replacing an older conflict copy. An edit can still race the final check and rename.
+  A session with an unsuccessful final write-back keeps its staged copies for recovery.
 
 Modes:  oc-bridge                 process the request queue (oc-bridge.service)
         oc-bridge session DIR     run the tool on a staged copy, write edits back (internal)
 """
 import errno
+import fcntl
+from itertools import islice
 import json
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -34,14 +37,19 @@ SB = os.environ.get("OC_SB", os.path.expanduser("~/opencode-sandbox"))
 STAGE = os.environ.get("OC_BRIDGE_STAGE", os.path.expanduser("~/.local/share/oc-sandbox/bridge-stage"))
 TOOLS = {"code": os.environ.get("OC_CODE_BIN", ""), "bcompare": os.environ.get("OC_BCOMPARE_BIN", "")}
 LAUNCH = os.environ.get("OC_BRIDGE_LAUNCH", "systemd-run --user --quiet --collect").split()
-CONFIG_VARS = ("OC_SB", "OC_BRIDGE_STAGE", "OC_CODE_BIN", "OC_BCOMPARE_BIN")
+SELINUX_LEVEL = os.environ.get("OC_BRIDGE_SELINUX_LEVEL")
+CONFIG_VARS = ("OC_SB", "OC_BRIDGE_STAGE", "OC_CODE_BIN", "OC_BCOMPARE_BIN", "OC_BRIDGE_SELINUX_LEVEL")
 
-MAX_REQUESTS = 20         # per run; the rest of the queue is discarded
+MAX_REQUESTS = 20         # per run
+MAX_QUEUE_SCAN = 256
+MAX_REQUEST_BYTES = 8192
 MAX_PATHS = 8             # per request
 MAX_MANIFEST_BYTES = 256 << 10
 MAX_FILE = 64 << 20       # bytes per copied file
 MAX_TREE_FILES = 5000     # per directory snapshot (bcompare only)
-MAX_TREE_BYTES = 512 << 20
+MAX_TREE_DEPTH = 64
+MAX_SESSION_BYTES = 512 << 20
+MAX_STAGE_SESSIONS = 8
 STAGE_MAX_AGE = 7 * 86400
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -77,7 +85,7 @@ def components(sandbox_path):
 
 
 def canonical_parts(parts):
-    return isinstance(parts, list) and bool(parts) and all(
+    return isinstance(parts, list) and 0 < len(parts) <= MAX_TREE_DEPTH and all(
         isinstance(part, str) and part not in ("", ".", "..") and "/" not in part and "\0" not in part
         for part in parts
     )
@@ -180,35 +188,67 @@ def stage_dir_fd(base_fd, parts):
     return fd
 
 
-def snapshot_tree(src_fd, dst_fd, budget):
+def snapshot_tree(src_fd, dst_fd, budget, depth=0):
     """Copy a directory (regular files and subdirectories only; symlinks etc. are skipped)."""
-    for name in sorted(os.listdir(src_fd)):
-        try:
-            st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
-            if stat.S_ISDIR(st.st_mode):
-                sub = os.open(name, DIR_FLAGS, dir_fd=src_fd)
+    if depth >= MAX_TREE_DEPTH:
+        raise OverBudget("directory snapshot is too deep")
+    with os.scandir(src_fd) as entries:
+        for entry in entries:
+            budget["files"] -= 1
+            if budget["files"] < 0:
+                raise OverBudget("directory snapshot has too many entries")
+            snapshot_entry(src_fd, dst_fd, entry.name, budget, depth)
+
+
+def snapshot_entry(src_fd, dst_fd, name, budget, depth):
+    try:
+        st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+        if stat.S_ISDIR(st.st_mode):
+            sub = os.open(name, DIR_FLAGS, dir_fd=src_fd)
+            try:
+                os.mkdir(name, 0o700, dir_fd=dst_fd)
+                dsub = os.open(name, DIR_FLAGS, dir_fd=dst_fd)
                 try:
-                    os.mkdir(name, 0o700, dir_fd=dst_fd)
-                    dsub = os.open(name, DIR_FLAGS, dir_fd=dst_fd)
-                    try:
-                        snapshot_tree(sub, dsub, budget)
-                    finally:
-                        os.close(dsub)
+                    snapshot_tree(sub, dsub, budget, depth + 1)
                 finally:
-                    os.close(sub)
-            elif stat.S_ISREG(st.st_mode):
-                budget["files"] -= 1
-                if budget["files"] < 0:
-                    raise OverBudget("directory snapshot has too many files")
-                fd, fst = open_regular(src_fd, name)
-                try:
-                    budget["bytes"] -= copy_fd_to((fd, fst), dst_fd, name, min(MAX_FILE, budget["bytes"]), 0o400)
-                finally:
-                    os.close(fd)
-        except OverBudget:
-            raise
-        except (OSError, Refused) as e:
-            log(f"snapshot: skipped {name!r}: {e}")
+                    os.close(dsub)
+            finally:
+                os.close(sub)
+        elif stat.S_ISREG(st.st_mode):
+            fd, fst = open_regular(src_fd, name)
+            try:
+                copy_into_session((fd, fst), dst_fd, name, budget, 0o400)
+            finally:
+                os.close(fd)
+    except OverBudget:
+        raise
+    except (OSError, Refused) as e:
+        log(f"snapshot: skipped {name!r}: {e}")
+
+
+def copy_into_session(source, directory, name, budget, mode=0o600):
+    if source[1].st_size > budget["bytes"]:
+        raise OverBudget("session snapshot exceeds the byte limit")
+    budget["bytes"] -= copy_fd_to(source, directory, name, min(MAX_FILE, budget["bytes"]), mode)
+
+
+def reserve_session():
+    mkdirs_private(STAGE)
+    stage_fd = os.open(STAGE, DIR_FLAGS)
+    try:
+        fcntl.flock(stage_fd, fcntl.LOCK_EX)
+        with os.scandir(stage_fd) as contents:
+            if sum(entry.is_dir(follow_symlinks=False) for entry in contents) >= MAX_STAGE_SESSIONS:
+                raise OverBudget("too many staged editor sessions")
+        sid = time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(4)
+        os.mkdir(sid, 0o700, dir_fd=stage_fd)
+        return os.path.join(STAGE, sid)
+    finally:
+        os.close(stage_fd)
+
+
+def code_workspace(tool, leaf):
+    return tool == "code" and leaf.casefold().endswith(".code-workspace")
 
 
 def stage_request(tool, paths):
@@ -216,16 +256,34 @@ def stage_request(tool, paths):
         raise Refused(f"unknown tool {tool!r}")
     if not TOOLS[tool]:
         raise Refused(f"{tool} is not configured")
-    sid = time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(4)
-    session = os.path.join(STAGE, sid)
-    mkdirs_private(STAGE)
-    os.mkdir(session, 0o700)
-    entries, root = [], open_root()
-    base = os.open(session, DIR_FLAGS)
+    session = reserve_session()
     try:
-        for sp in dict.fromkeys(paths[:MAX_PATHS]):         # de-duplicated, in order
+        entries = stage_files(session, tool, paths)
+        if entries:
+            with open(os.path.join(session, "manifest.json"), "x") as f:
+                json.dump({"tool": tool, "entries": entries}, f)
+            return session
+    except BaseException:
+        shutil.rmtree(session, ignore_errors=True)
+        raise
+    shutil.rmtree(session, ignore_errors=True)
+    return None
+
+
+def stage_files(session, tool, paths):
+    budget = {"files": MAX_TREE_FILES, "bytes": MAX_SESSION_BYTES}
+    entries, root = [], open_root()
+    try:
+        base = os.open(session, DIR_FLAGS)
+    except BaseException:
+        os.close(root)
+        raise
+    try:
+        for sp in dict.fromkeys(paths[:MAX_PATHS]):
             try:
                 parts = components(sp)
+                if code_workspace(tool, parts[-1]):
+                    raise Refused("code does not open workspace definition files")
                 parent = open_dirs(root, parts[:-1])
                 try:
                     st = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
@@ -240,7 +298,7 @@ def stage_request(tool, paths):
                                 os.mkdir(parts[-1], 0o700, dir_fd=dparent)
                                 dst = os.open(parts[-1], DIR_FLAGS, dir_fd=dparent)
                                 try:
-                                    snapshot_tree(src, dst, {"files": MAX_TREE_FILES, "bytes": MAX_TREE_BYTES})
+                                    snapshot_tree(src, dst, budget)
                                 finally:
                                     os.close(dst)
                             finally:
@@ -249,7 +307,7 @@ def stage_request(tool, paths):
                         else:
                             fd, fst = open_regular(parent, parts[-1])
                             try:
-                                copy_fd_to((fd, fst), dparent, parts[-1], MAX_FILE)
+                                copy_into_session((fd, fst), dparent, parts[-1], budget)
                             finally:
                                 os.close(fd)
                             sst = os.stat(staged)
@@ -260,17 +318,14 @@ def stage_request(tool, paths):
                         os.close(dparent)
                 finally:
                     os.close(parent)
+            except OverBudget:
+                raise
             except (Refused, OSError) as e:
                 log(f"{tool}: skipped {sp!r}: {e}")
     finally:
         os.close(base)
         os.close(root)
-    if not entries:
-        shutil.rmtree(session, ignore_errors=True)
-        return None
-    with open(os.path.join(session, "manifest.json"), "x") as f:
-        json.dump({"tool": tool, "entries": entries}, f)
-    return session
+    return entries
 
 
 # ---- write-back --------------------------------------------------------------------------------
@@ -284,29 +339,35 @@ def write_back(entry, source):
     finally:
         os.close(root)
     try:
-        try:
-            cur = os.stat(name, dir_fd=parent, follow_symlinks=False)
-            unchanged = stat.S_ISREG(cur.st_mode) and ident(cur) == entry["target"]
-        except FileNotFoundError:
-            unchanged = False
-        dest = name if unchanged else name + ".host-edit"
-        if not unchanged:
-            log(f"{'/'.join(parts)} changed in the sandbox since it was opened; saving your edit as {dest}")
-        tmp = f".{name}.oc-bridge-{secrets.token_hex(4)}"
+        tmp = f".oc-bridge-{secrets.token_hex(12)}"
         out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                       entry.get("mode", 0o644) & 0o777, dir_fd=parent)
         try:
             copy_stable_file(source, out, MAX_FILE)
-            os.rename(tmp, dest, src_dir_fd=parent, dst_dir_fd=parent)
+            if SELINUX_LEVEL is not None:
+                if not re.fullmatch(r"s0:c[0-9]+,c[0-9]+", SELINUX_LEVEL):
+                    raise Refused("invalid configured bridge SELinux level")
+                context = f"system_u:object_r:container_file_t:{SELINUX_LEVEL}"
+                os.setxattr(out, "security.selinux", context.encode("ascii"))
+            try:
+                cur = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                unchanged = stat.S_ISREG(cur.st_mode) and ident(cur) == entry["target"]
+            except FileNotFoundError:
+                unchanged = False
             if unchanged:
+                os.rename(tmp, name, src_dir_fd=parent, dst_dir_fd=parent)
                 entry["target"] = ident(os.fstat(out))
-        except BaseException:
+            else:
+                dest = name + ".host-edit"
+                if len(os.fsencode(dest)) > os.fpathconf(parent, 'PC_NAME_MAX'):
+                    dest = "host-edit-" + secrets.token_hex(12)
+                os.link(tmp, dest, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                log(f"{'/'.join(parts)} changed in the sandbox; saved your edit as {dest}")
+        finally:
             try:
                 os.unlink(tmp, dir_fd=parent)
             except OSError:
                 pass
-            raise
-        finally:
             os.close(out)
     finally:
         os.close(parent)
@@ -352,6 +413,8 @@ def valid_identity(value, length):
 def validate_session_entry(tool, entry):
     if not isinstance(entry, dict) or not canonical_parts(entry.get("parts")):
         raise Refused("non-canonical staged path")
+    if code_workspace(tool, entry["parts"][-1]):
+        raise Refused("code does not open workspace definition files")
     kind = entry.get("kind")
     if kind == "dir" and tool == "bcompare":
         return
@@ -435,44 +498,44 @@ def run_session(session):
 
 # ---- queue -------------------------------------------------------------------------------------
 
-def unlink_entry(dir_fd, name):
-    """Remove one directory entry without following it (a directory is removed recursively)."""
+def unlink_entry(bridge_fd, dir_fd, name):
+    """Discard a queue entry without following it or walking any nested directory."""
     try:
         st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
         if stat.S_ISDIR(st.st_mode):
-            shutil.rmtree(name, dir_fd=dir_fd)              # fd-based, symlink-attack resistant
+            try:
+                os.rmdir(name, dir_fd=dir_fd)
+            except OSError as error:
+                if error.errno != errno.ENOTEMPTY:
+                    raise
+                os.rename(name, "ignored-" + secrets.token_hex(12),
+                          src_dir_fd=dir_fd, dst_dir_fd=bridge_fd)
         else:
             os.unlink(name, dir_fd=dir_fd)
-    except OSError:
+    except (Refused, OSError):
         pass
 
 
-def open_queue(root):
-    """Pin $SB/.bridge/requests. A symlink in its place is removed (only the link) and nothing is done."""
-    fd = root
-    for name in (".bridge", "requests"):
-        try:
-            nfd = os.open(name, DIR_FLAGS, dir_fd=fd)
-        except OSError as e:
-            if e.errno in (errno.ELOOP, errno.ENOTDIR):
-                log(f"{name} is not a real directory; removing it (oc-sandbox recreates it)")
-                try:
-                    os.unlink(name, dir_fd=fd)              # never removes a directory
-                except OSError:
-                    pass
-            if fd != root:
-                os.close(fd)
-            return None
-        if fd != root:
-            os.close(fd)
-        fd = nfd
-    return fd
+def open_queue_dir(parent, name):
+    """Open a queue component without following links, removing an invalid leaf if possible."""
+    try:
+        return os.open(name, DIR_FLAGS, dir_fd=parent)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            log(f"{name} is not a real directory; removing it (oc-sandbox recreates it)")
+            try:
+                os.unlink(name, dir_fd=parent)
+            except OSError:
+                pass
+        return None
 
 
 def read_request(q, name):
-    fd, _ = open_regular(q, name)
+    fd, before = open_regular(q, name)
     try:
-        data = os.read(fd, 8192)
+        data = os.read(fd, MAX_REQUEST_BYTES + 1)
+        if len(data) > MAX_REQUEST_BYTES or before.st_size != len(data):
+            raise Refused("oversized or incomplete bridge request")
     finally:
         os.close(fd)
     lines = data.decode("utf-8", "surrogateescape").split("\n")
@@ -490,32 +553,51 @@ def expire_stage():
 
 
 def process_queue():
+    expire_stage()
     root = open_root()
     try:
-        q = open_queue(root)
-        if q is None:
-            return
-        try:
-            names = sorted(os.listdir(q))
-            for name in [n for n in names if n.endswith(".req")][:MAX_REQUESTS]:
-                try:
-                    tool, paths = read_request(q, name)
-                    session = stage_request(tool, paths)
-                    if session:
-                        # the session runs in its own transient unit, which does not inherit our
-                        # environment: pass the configuration explicitly
-                        setenv = [f"--setenv={k}={os.environ[k]}" for k in CONFIG_VARS if k in os.environ]
-                        subprocess.run([*LAUNCH, *setenv, "--", sys.executable, "-I", os.path.realpath(__file__),
-                                        "session", session], check=False, stdin=subprocess.DEVNULL)
-                except (Refused, OSError) as e:
-                    log(f"request {name!r} ignored: {e}")
-            for name in names:                              # always drain the queue
-                unlink_entry(q, name)
-        finally:
-            os.close(q)
+        bridge = open_queue_dir(root, ".bridge")
     finally:
         os.close(root)
-    expire_stage()
+    if bridge is None:
+        return
+    try:
+        q = open_queue_dir(bridge, "requests")
+        if q is not None:
+            try:
+                drain_queue(bridge, q)
+            finally:
+                os.close(q)
+    finally:
+        os.close(bridge)
+
+
+def drain_queue(bridge, q):
+    with os.scandir(q) as contents:
+        names = sorted(entry.name for entry in islice(contents, MAX_QUEUE_SCAN))
+    try:
+        for name in [n for n in names if n.endswith(".req")][:MAX_REQUESTS]:
+            try:
+                tool, paths = read_request(q, name)
+                session = stage_request(tool, paths)
+                if session:
+                    launch_session(session)
+            except (Refused, OSError, subprocess.CalledProcessError) as e:
+                log(f"request {name!r} ignored: {e}")
+    finally:
+        for name in names:
+            unlink_entry(bridge, q, name)
+
+
+def launch_session(session):
+    # The transient unit does not inherit our environment.
+    setenv = [f"--setenv={k}={os.environ[k]}" for k in CONFIG_VARS if k in os.environ]
+    try:
+        subprocess.run([*LAUNCH, *setenv, "--", sys.executable, "-I", os.path.realpath(__file__),
+                        "session", session], check=True, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        shutil.rmtree(session, ignore_errors=True)
+        raise
 
 
 if __name__ == "__main__":
