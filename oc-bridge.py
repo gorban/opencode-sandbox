@@ -68,6 +68,10 @@ class OverBudget(Refused):
     pass
 
 
+class CrossMount(Refused):
+    pass
+
+
 # ---- descriptor-relative traversal of the sandbox ------------------------------------------------
 
 def open_root():
@@ -330,7 +334,7 @@ def stage_files(session, tool, paths):
 
 # ---- write-back --------------------------------------------------------------------------------
 
-def write_back(entry, source):
+def write_back(entry, source, session_fd):
     """Copy the edited staged file back into the sandbox, never through a symlink."""
     root = open_root()
     try:
@@ -338,32 +342,28 @@ def write_back(entry, source):
     finally:
         os.close(root)
     try:
-        stage = os.open(STAGE, DIR_FLAGS)
+        tmp = f".oc-bridge-{secrets.token_hex(12)}"
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                      entry.get("mode", 0o644) & 0o777, dir_fd=session_fd)
         try:
-            tmp = f".oc-bridge-{secrets.token_hex(12)}"
-            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                          entry.get("mode", 0o644) & 0o777, dir_fd=stage)
+            copy_stable_file(source, out, MAX_FILE)
+            if SELINUX_LEVEL is not None:
+                if not re.fullmatch(r"s0:c[0-9]+,c[0-9]+", SELINUX_LEVEL):
+                    raise Refused("invalid configured bridge SELinux level")
+                context = f"system_u:object_r:container_file_t:{SELINUX_LEVEL}"
+                os.setxattr(out, "security.selinux", context.encode("ascii"))
             try:
-                copy_stable_file(source, out, MAX_FILE)
-                if SELINUX_LEVEL is not None:
-                    if not re.fullmatch(r"s0:c[0-9]+,c[0-9]+", SELINUX_LEVEL):
-                        raise Refused("invalid configured bridge SELinux level")
-                    context = f"system_u:object_r:container_file_t:{SELINUX_LEVEL}"
-                    os.setxattr(out, "security.selinux", context.encode("ascii"))
-                try:
-                    publish_save(entry, parent, stage, tmp, ident(os.fstat(out)))
-                except OSError as error:
-                    if error.errno == errno.EXDEV:
-                        raise Refused("host stage and sandbox must share a mount for write-back") from error
-                    raise
-            finally:
-                os.close(out)
-                try:
-                    os.unlink(tmp, dir_fd=stage)
-                except FileNotFoundError:
-                    pass
+                publish_save(entry, parent, session_fd, tmp, ident(os.fstat(out)))
+            except OSError as error:
+                if error.errno == errno.EXDEV:
+                    raise CrossMount("host stage and sandbox must share a mount for write-back") from error
+                raise
         finally:
-            os.close(stage)
+            os.close(out)
+            try:
+                os.unlink(tmp, dir_fd=session_fd)
+            except FileNotFoundError:
+                pass
     finally:
         os.close(parent)
 
@@ -399,12 +399,16 @@ def open_staged_file(files_fd, parts):
         os.close(parent)
 
 
-def sync(files_fd, entries):
+def sync(session_fd, files_fd, entries, cross_mounts):
     complete = True
     for entry in entries:
         if entry["kind"] != "file":
             continue
         parts = entry["parts"]
+        key = tuple(parts)
+        if key in cross_mounts:
+            complete = False
+            continue
         try:
             src_fd, st = open_staged_file(files_fd, parts)
         except (Refused, OSError):
@@ -413,9 +417,11 @@ def sync(files_fd, entries):
         try:
             seen = staged_identity(st)
             if seen != entry["seen"]:
-                write_back(entry, (src_fd, st))
+                write_back(entry, (src_fd, st), session_fd)
                 entry["seen"] = seen
         except (Refused, OSError) as err:
+            if isinstance(err, CrossMount):
+                cross_mounts.add(key)
             complete = False
             log(f"write-back of {'/'.join(parts)} failed: {err}")
         finally:
@@ -496,18 +502,19 @@ def run_session(session):
     try:
         tool, entries = read_session_manifest(session_fd)
         files_fd = open_dirs(session_fd, ["files"])
+        try:
+            staged = staged_arguments(real, files_fd, entries)
+            options = ["--wait", "--"] if tool == "code" else []
+            proc = subprocess.Popen([TOOLS[tool], *options, *staged], stdin=subprocess.DEVNULL)
+            cross_mounts = set()
+            while proc.poll() is None:
+                time.sleep(1)
+                sync(session_fd, files_fd, entries, cross_mounts)
+            complete = sync(session_fd, files_fd, entries, cross_mounts)
+        finally:
+            os.close(files_fd)
     finally:
         os.close(session_fd)
-    try:
-        staged = staged_arguments(real, files_fd, entries)
-        options = ["--wait", "--"] if tool == "code" else []
-        proc = subprocess.Popen([TOOLS[tool], *options, *staged], stdin=subprocess.DEVNULL)
-        while proc.poll() is None:
-            time.sleep(1)
-            sync(files_fd, entries)
-        complete = sync(files_fd, entries)
-    finally:
-        os.close(files_fd)
     if complete:
         shutil.rmtree(real, ignore_errors=True)
     else:

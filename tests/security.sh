@@ -319,6 +319,7 @@ check "failed write-back preserves the sandbox file" grep -qx original "$SB/cons
 bridge_copy_regressions() {
   timeout 20 python3 -I - "$BRIDGE" "$T" <<'PY'
 import errno
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -444,19 +445,47 @@ class CopyTests(unittest.TestCase):
 
     def test_cross_mount_preserves_private_save(self):
         session, staged = self.stage()
-        staged.write_bytes(edit)
-        with patch.object(os, "rename", side_effect=OSError(errno.EXDEV, "fixture")):
-            self.assertFalse(self.sync(session))
-        self.assert_preserved(staged)
+        observations = iter((None, None, None, 0))
+        saves = iter((edit, b"next host edit", b"latest host edit"))
+        errors = StringIO()
+        with patch("subprocess.Popen", return_value=SimpleNamespace(poll=lambda: next(observations))), \
+                patch("time.sleep", side_effect=lambda _: staged.write_bytes(next(saves))), \
+                patch.object(os, "rename", side_effect=OSError(errno.EXDEV, "fixture")) as publish, \
+                patch.object(sys, "stderr", errors):
+            self.bridge["run_session"](str(session))
+        self.assertEqual(publish.call_count, 1)
+        self.assert_preserved(staged, expected=b"latest host edit")
+        self.assertEqual(errors.getvalue().count("must share a mount"), 1)
+        self.assertEqual(errors.getvalue().count(str(session)), 1)
+
+    def test_abandoned_prepared_save_expires_with_session(self):
+        session, staged = self.stage()
+
+        def editor(*args, **kwargs):
+            staged.write_bytes(edit)
+            return SimpleNamespace(poll=lambda: 0)
+
+        with patch("subprocess.Popen", side_effect=editor), \
+                patch.object(os, "rename", side_effect=OSError(errno.EXDEV, "fixture")), \
+                patch.object(os, "unlink", side_effect=PermissionError("interrupted cleanup fixture")):
+            self.bridge["run_session"](str(session))
+        self.assertEqual(len(list(session.glob(".oc-bridge-*"))), 1)
+        os.utime(session, (1, 1))
+        self.bridge["expire_stage"]()
+        self.assertEqual(list(session.parent.iterdir()), [])
 
     def sync(self, session):
         with (session / "manifest.json").open() as manifest:
             entry = json.load(manifest)["entries"][0]
-        files_fd = os.open(session / "files", os.O_RDONLY | os.O_DIRECTORY)
+        session_fd = os.open(session, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            return self.bridge["sync"](files_fd, [entry])
+            files_fd = os.open("files", os.O_RDONLY | os.O_DIRECTORY, dir_fd=session_fd)
+            try:
+                return self.bridge["sync"](session_fd, files_fd, [entry], set())
+            finally:
+                os.close(files_fd)
         finally:
-            os.close(files_fd)
+            os.close(session_fd)
 
     def assert_preserved(self, staged, expected=edit):
         self.assertEqual(self.target.read_bytes(), base)
@@ -870,7 +899,12 @@ for conflict in (False, True):
     with (root / "stage" / "edit").open("w+b") as edit:
         edit.write(b"saved bytes")
         edit.seek(0)
-        bridge["write_back"]({"parts": ["file"], "target": identity}, (edit.fileno(), os.fstat(edit.fileno())))
+        stage_fd = os.open(root / "stage", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            bridge["write_back"]({"parts": ["file"], "target": identity},
+                                 (edit.fileno(), os.fstat(edit.fileno())), stage_fd)
+        finally:
+            os.close(stage_fd)
     destination = target.with_name("file.host-edit") if conflict else target
     assert destination.read_bytes() == b"saved bytes"
     assert os.getxattr(destination, "security.selinux").rstrip(b"\0") == b"system_u:object_r:container_file_t:s0:c7,c9"
