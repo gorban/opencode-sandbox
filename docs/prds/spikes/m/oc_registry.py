@@ -968,18 +968,21 @@ class CoordRegistry:
             same_owner = external_owner_id is not None and row["owner_id"] == external_owner_id
             if not same_inc or not same_owner or int(row["abort_requested"]) != 0:
                 raise CoordPolicyError(_ERR_TRANSPORT_ABORT_UNCONFIRMED)
-        if external_owner_id is None:
-            return
-        clean_owner = validate_opaque_token(external_owner_id, _LABEL_TRANSPORT_OWNER)
         existing = conn.execute(
             _SQL_SELECT_BINDING, (sandbox_addr, incarnation_id)
         ).fetchone()
         if existing is not None:
             if int(existing["terminal_confirmed"]) != 0:
                 raise RevokedError("cannot_reregister_revoked_incarnation")
+            if external_owner_id is None:
+                raise CoordPolicyError(_ERR_TRANSPORT_ABORT_UNCONFIRMED)
+            clean_owner = validate_opaque_token(external_owner_id, _LABEL_TRANSPORT_OWNER)
             if existing["owner_id"] != clean_owner:
                 raise CoordPolicyError(_ERR_TRANSPORT_ABORT_UNCONFIRMED)
             return
+        if external_owner_id is None:
+            return
+        clean_owner = validate_opaque_token(external_owner_id, _LABEL_TRANSPORT_OWNER)
         conn.execute(
             """
             INSERT INTO external_transport_bindings (
@@ -2165,6 +2168,23 @@ class CoordRegistry:
                 "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?",
                 (msg_id,),
             )
+
+    def cancel_pending_outbox_row(self, msg_id: str, *, reason: str) -> bool:
+        """Conditionally cancel a row ONLY if still pending; return False if already claimed."""
+        clean_reason = validate_reason_text(reason, "reason")
+        now = time.time()
+        with self._tx() as conn:
+            cur = conn.execute(
+                _SQL_UPDATE_OUTBOX_STATUS_DETAIL,
+                (_STATUS_CANCELLED, clean_reason, now, msg_id, _STATUS_PENDING),
+            )
+            if cur.rowcount != 1:
+                return False
+            conn.execute(
+                "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?",
+                (msg_id,),
+            )
+            return True
 
     def cancel_outbox_row(self, msg_id: str, *, reason: str) -> None:
         clean_reason = validate_reason_text(reason, "reason")

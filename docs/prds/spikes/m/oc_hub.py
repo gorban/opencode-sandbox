@@ -1741,6 +1741,16 @@ class CoordHub:
                     msg_id, detail="recovery_dispatch_started_uncertain"
                 )
 
+    def _abort_orphaned_handed_off_rows(self) -> None:
+        mark_aborted = getattr(self._registry, "mark_outbox_aborted", None)
+        if not callable(mark_aborted):
+            return
+        rows = self._registry.list_outbox(statuses=("handed_off",))
+        for row in rows:
+            msg_id = str(row.get("msg_id", ""))
+            if msg_id:
+                mark_aborted(msg_id, reason="recovery_handed_off_orphaned")
+
     def _wait_inflight_handoffs_drained(self, deadline: float) -> bool:
         with self._inflight_cond:
             while self._inflight_handoffs:
@@ -1807,6 +1817,7 @@ class CoordHub:
             )
             invalidated_grants += len(revoked)
         self._mark_orphaned_dispatch_started_uncertain()
+        self._abort_orphaned_handed_off_rows()
         retired_incarnations = 0
         for sb in sandboxes:
             if sb.status == _STATUS_REVOKED:
@@ -3686,6 +3697,16 @@ class CoordHub:
                 return None
         return req_ids
 
+    def _cancel_if_still_pending(self, msg_id: str, *, reason: str) -> None:
+        cancel_pending = getattr(self._registry, "cancel_pending_outbox_row", None)
+        if callable(cancel_pending):
+            cancel_pending(msg_id, reason=reason)
+            return
+        try:
+            self._registry.cancel_outbox_row(msg_id, reason=reason)
+        except CoordValidationError:
+            pass
+
     def _prepare_dispatch_phase1_locked(
         self,
         row: dict[str, Any],
@@ -3701,13 +3722,13 @@ class CoordHub:
         edge = self._registry.get_edge(edge_id)
         dst_addr = self._resolve_row_dst_addr(row, env, edge)
         if dst_addr is None or env is None:
-            self._registry.cancel_outbox_row(msg_id, reason="envelope_missing")
+            self._cancel_if_still_pending(msg_id, reason="envelope_missing")
             return None
         liveness = self._classify_row_liveness_under_fence(
             edge_id, grant_gen, dst_addr, dst_inc, src_incarnation=src_inc
         )
         if liveness == "fenced":
-            self._registry.cancel_outbox_row(msg_id, reason="grant_or_incarnation_fenced")
+            self._cancel_if_still_pending(msg_id, reason="grant_or_incarnation_fenced")
             return None
         if liveness != "live":
             return None
@@ -3752,7 +3773,12 @@ class CoordHub:
         return env, turn, inflight, start_rec_gen
 
     def _release_inflight_owner(
-        self, env: Envelope, *, settled: bool, returned_stream_id: str | None
+        self,
+        env: Envelope,
+        inflight: _InflightAuth,
+        *,
+        settled: bool,
+        returned_stream_id: str | None,
     ) -> None:
         if not settled:
             self._mark_degraded(_ERR_PHASE3_SETTLEMENT)
@@ -3768,8 +3794,9 @@ class CoordHub:
                         _ERR_PHASE3_SETTLEMENT,
                     )
         with self._meta_lock:
-            self._inflight_handoffs.pop(env.msg_id, None)
-            self._inflight_cond.notify_all()
+            if self._inflight_handoffs.get(env.msg_id) is inflight:
+                self._inflight_handoffs.pop(env.msg_id, None)
+                self._inflight_cond.notify_all()
 
     def _settle_recovery_rotated_result_locked(
         self,
@@ -3870,9 +3897,13 @@ class CoordHub:
                         pop_inflight=False,
                     )
                 settled = True
+                with self._meta_lock:
+                    if self._inflight_handoffs.get(env.msg_id) is inflight:
+                        self._inflight_handoffs.pop(env.msg_id, None)
+                        self._inflight_cond.notify_all()
         finally:
             self._release_inflight_owner(
-                env, settled=settled, returned_stream_id=returned_stream_id
+                env, inflight, settled=settled, returned_stream_id=returned_stream_id
             )
 
         self._apply_immediate_stream_abort(env, immediate_abort)
@@ -4038,6 +4069,7 @@ class CoordHub:
     def _handle_handoff_persist_failure(
         self, env: Envelope, stream_id: str, exc: Exception
     ) -> None:
+        is_ext = self._is_externally_fenced()
         with self._meta_lock:
             self._stream_abort_reasons[stream_id] = _REASON_HANDOFF_PERSIST_FAILED
             self._pending_cleanup_streams[stream_id] = (
@@ -4045,6 +4077,20 @@ class CoordHub:
                 env.dst_incarnation,
                 _REASON_HANDOFF_PERSIST_FAILED,
             )
+            if is_ext or (env.dst_addr, env.dst_incarnation) in self._external_owners:
+                self._fenced_targets.add((env.dst_addr, env.dst_incarnation))
+                self._pending_cleanup_incarnations.setdefault(
+                    (env.dst_addr, env.dst_incarnation), _REASON_HANDOFF_PERSIST_FAILED
+                )
+        if is_ext:
+            mark_req = getattr(self._registry, "mark_transport_abort_requested", None)
+            if callable(mark_req):
+                try:
+                    mark_req(
+                        env.dst_addr, env.dst_incarnation, reason=_REASON_HANDOFF_PERSIST_FAILED
+                    )
+                except Exception:
+                    self._mark_degraded(_REASON_HANDOFF_PERSIST_FAILED)
         try:
             self._registry.mark_outbox_uncertain(
                 env.msg_id,
@@ -4820,18 +4866,25 @@ class CoordHub:
 
     def _find_external_revoke_binding(
         self, addr: str, incarnation_id: str | None, *, lookup_failed: bool
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, bool]:
         if incarnation_id is not None:
-            owner = self._resolve_external_owner_id(addr, incarnation_id)
-            if owner is not None:
-                return incarnation_id, owner
+            state, owner = self._lookup_external_binding(addr, incarnation_id)
+            if state == "unconfirmed" and owner is not None:
+                return incarnation_id, owner, False
+            if state == "error":
+                with self._meta_lock:
+                    cached = self._external_owners.get((addr, incarnation_id))
+                if cached is not None:
+                    return incarnation_id, cached, False
+                return incarnation_id, None, True
+            return incarnation_id, None, False
         if not lookup_failed:
-            return incarnation_id, None
+            return incarnation_id, None, False
         with self._meta_lock:
             for (ext_addr, ext_inc), ext_owner in self._external_owners.items():
                 if ext_addr == addr:
-                    return ext_inc, ext_owner
-        return incarnation_id, None
+                    return ext_inc, ext_owner, False
+        return incarnation_id, None, False
 
     def _revoke_unlocked(
         self,
@@ -4862,9 +4915,15 @@ class CoordHub:
             addr, incarnation_id, edges, clean_reason
         )
 
-        incarnation_id, external_owner = self._find_external_revoke_binding(
+        incarnation_id, external_owner, binding_lookup_failed = self._find_external_revoke_binding(
             addr, incarnation_id, lookup_failed=lookup_failed
         )
+        if binding_lookup_failed:
+            self._mark_degraded("revoke_binding_lookup_failed")
+            if detached_waiters:
+                self._notify_waiters()
+            self._ensure_cleanup_retry_worker()
+            raise CoordPolicyError(_ERR_REVOKED_UNCONFIRMED)
         if external_owner is not None and incarnation_id is not None:
             return self._revoke_external_target(
                 caller, addr, incarnation_id, external_owner, detached_waiters, clean_reason, start_ts

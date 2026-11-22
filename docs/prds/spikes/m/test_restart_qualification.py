@@ -1063,89 +1063,92 @@ class TestRestartQualification(unittest.TestCase):
         disp_thread.join(timeout=2.0)
         hub.close(timeout_s=1.5)
 
+    def _run_late_handed_off_after_sweep_case(self, mode: str) -> None:
+        sub_dir = self._tmp / f"state-p1-1-{mode}"
+        owner = ExternallyFencedFakeTransport({("sb-lr", "inc_lr"): _OWNER_A})
+        reg, hub = self._open_hub(owner, state_dir=sub_dir)
+        try:
+            self._reg_and_grant(hub, "sb-lr", "inc_lr")
+            hub.send(_OP, target="sb-lr", body_text="Late reader turn")
+            at_dispatch = threading.Event()
+            release_dispatch = threading.Event()
+            self.addCleanup(release_dispatch.set)
+            stream_state = {"closed": False}
+
+            orig_dispatch = owner.dispatch_turn
+            orig_confirm = owner.confirm_incarnation_terminal
+
+            def _late_dispatch(turn: Any) -> DispatchResult:
+                at_dispatch.set()
+                release_dispatch.wait(timeout=3.0)
+                stream_state["closed"] = False
+                owner.inner._revoked_incarnations.discard(("sb-lr", "inc_lr"))
+                return orig_dispatch(turn)
+
+            def _tracking_confirm(
+                sb_addr: str, inc_id: str, *, owner_id: str, reason: str
+            ) -> bool:
+                ok = orig_confirm(sb_addr, inc_id, owner_id=owner_id, reason=reason)
+                if ok:
+                    stream_state["closed"] = True
+                return ok
+
+            owner.dispatch_turn = _late_dispatch  # type: ignore[method-assign]
+            owner.confirm_incarnation_terminal = _tracking_confirm  # type: ignore[method-assign]
+
+            disp_thread = threading.Thread(
+                target=lambda: hub.dispatch_once(async_stream=False), daemon=True
+            )
+            disp_thread.start()
+            self.assertTrue(at_dispatch.wait(timeout=1.0))
+
+            if mode == "revoke":
+                hub.revoke(_OP, target="sb-lr", reason="sweep_before_late_stream")
+                calls_after_sweep = len(owner.confirm_calls)
+                release_dispatch.set()
+                disp_thread.join(timeout=2.0)
+            else:
+                hub._mark_degraded("recovery_sweep_before_late_stream")
+                rec_done = threading.Event()
+                rec_err: list[Exception] = []
+
+                def _do_rec() -> None:
+                    try:
+                        hub.confirm_recovery(_OP, reason="late_stream_recovery", timeout_s=2.0)
+                    except Exception as exc:
+                        rec_err.append(exc)
+                    finally:
+                        rec_done.set()
+
+                rec_thread = threading.Thread(target=_do_rec, daemon=True)
+                rec_thread.start()
+                self.assertTrue(
+                    _wait_until(
+                        lambda: bool(
+                            reg.get_transport_binding("sb-lr", "inc_lr")["terminal_confirmed"]
+                        )
+                    )
+                )
+                calls_after_sweep = len(owner.confirm_calls)
+                release_dispatch.set()
+                self.assertTrue(rec_done.wait(timeout=2.0))
+                disp_thread.join(timeout=2.0)
+                self.assertEqual(rec_err, [])
+
+            self.assertGreater(len(owner.confirm_calls), calls_after_sweep)
+            self.assertTrue(stream_state["closed"])
+            self.assertEqual(hub._pending_cleanup_streams, {})
+        finally:
+            hub.close(timeout_s=1.5)
+            reg.close()
+
     def test_g2_p1_1_late_handed_off_after_terminal_sweep_reconfirms_physical_close(
         self,
     ) -> None:
         # Both revoke() and confirm_recovery() races must re-invoke confirm_incarnation_terminal
         # to close a late stream reader registered after the first sweep set terminal_confirmed=1.
-        for mode in ("revoke", "recovery"):
-            sub_dir = self._tmp / f"state-p1-1-{mode}"
-            owner = ExternallyFencedFakeTransport({("sb-lr", "inc_lr"): _OWNER_A})
-            reg, hub = self._open_hub(owner, state_dir=sub_dir)
-            try:
-                self._reg_and_grant(hub, "sb-lr", "inc_lr")
-                msg_id = hub.send(_OP, target="sb-lr", body_text="Late reader turn")["msg_id"]
-                at_dispatch = threading.Event()
-                release_dispatch = threading.Event()
-                self.addCleanup(release_dispatch.set)
-                stream_state = {"closed": False}
-
-                orig_dispatch = owner.dispatch_turn
-                orig_confirm = owner.confirm_incarnation_terminal
-
-                def _late_dispatch(turn: Any) -> DispatchResult:
-                    at_dispatch.set()
-                    release_dispatch.wait(timeout=3.0)
-                    stream_state["closed"] = False
-                    owner.inner._revoked_incarnations.discard(("sb-lr", "inc_lr"))
-                    return orig_dispatch(turn)
-
-                def _tracking_confirm(
-                    sb_addr: str, inc_id: str, *, owner_id: str, reason: str
-                ) -> bool:
-                    ok = orig_confirm(sb_addr, inc_id, owner_id=owner_id, reason=reason)
-                    if ok:
-                        stream_state["closed"] = True
-                    return ok
-
-                owner.dispatch_turn = _late_dispatch  # type: ignore[method-assign]
-                owner.confirm_incarnation_terminal = _tracking_confirm  # type: ignore[method-assign]
-
-                disp_thread = threading.Thread(
-                    target=lambda: hub.dispatch_once(async_stream=False), daemon=True
-                )
-                disp_thread.start()
-                self.assertTrue(at_dispatch.wait(timeout=1.0))
-
-                if mode == "revoke":
-                    hub.revoke(_OP, target="sb-lr", reason="sweep_before_late_stream")
-                    calls_after_sweep = len(owner.confirm_calls)
-                    release_dispatch.set()
-                    disp_thread.join(timeout=2.0)
-                else:
-                    hub._mark_degraded("recovery_sweep_before_late_stream")
-                    rec_done = threading.Event()
-                    rec_err: list[Exception] = []
-
-                    def _do_rec() -> None:
-                        try:
-                            hub.confirm_recovery(_OP, reason="late_stream_recovery", timeout_s=2.0)
-                        except Exception as exc:
-                            rec_err.append(exc)
-                        finally:
-                            rec_done.set()
-
-                    rec_thread = threading.Thread(target=_do_rec, daemon=True)
-                    rec_thread.start()
-                    self.assertTrue(
-                        _wait_until(
-                            lambda: bool(
-                                reg.get_transport_binding("sb-lr", "inc_lr")["terminal_confirmed"]
-                            )
-                        )
-                    )
-                    calls_after_sweep = len(owner.confirm_calls)
-                    release_dispatch.set()
-                    self.assertTrue(rec_done.wait(timeout=2.0))
-                    disp_thread.join(timeout=2.0)
-                    self.assertEqual(rec_err, [])
-
-                self.assertGreater(len(owner.confirm_calls), calls_after_sweep)
-                self.assertTrue(stream_state["closed"])
-                self.assertEqual(hub._pending_cleanup_streams, {})
-            finally:
-                hub.close(timeout_s=1.5)
-                reg.close()
+        self._run_late_handed_off_after_sweep_case("revoke")
+        self._run_late_handed_off_after_sweep_case("recovery")
 
     def test_g2_p1_2_binding_lookup_sqlite_error_fails_closed_without_legacy_fallback(
         self,
@@ -1175,6 +1178,10 @@ class TestRestartQualification(unittest.TestCase):
         msg_ok = hub.send(_OP, target="sb-v", body_text="Legit turn")["msg_id"]
         self.assertEqual(hub.dispatch_once(async_stream=False), 1)
 
+        exp = CombinedPassExpectations(
+            completed_msg_ids=(msg_ok,),
+            expected_unconfirmed_bindings=(("sb-v", "inc_v1"),),
+        )
         # (a) Forged user_message with dispatch_msg_id IS NULL and badge='Operator' must fail
         with reg._tx() as conn:
             conn.execute(
@@ -1188,25 +1195,13 @@ class TestRestartQualification(unittest.TestCase):
                 """
             )
         with self.assertRaises(AssertionError):
-            verify_combined_pass_evidence(
-                reg,
-                CombinedPassExpectations(
-                    completed_msg_ids=(msg_ok,),
-                    expected_unconfirmed_bindings=(("sb-v", "inc_v1"),),
-                ),
-            )
+            verify_combined_pass_evidence(reg, exp)
 
         # (b) Null badge on user_message must fail
         with reg._tx() as conn:
             conn.execute("UPDATE stream_events SET badge = NULL WHERE seq = 9001")
         with self.assertRaises(AssertionError):
-            verify_combined_pass_evidence(
-                reg,
-                CombinedPassExpectations(
-                    completed_msg_ids=(msg_ok,),
-                    expected_unconfirmed_bindings=(("sb-v", "inc_v1"),),
-                ),
-            )
+            verify_combined_pass_evidence(reg, exp)
 
         # (c) Non-null badge on text_delta must fail
         with reg._tx() as conn:
@@ -1214,13 +1209,7 @@ class TestRestartQualification(unittest.TestCase):
                 "UPDATE stream_events SET event_type = 'text_delta', badge = 'Operator' WHERE seq = 9001"
             )
         with self.assertRaises(AssertionError):
-            verify_combined_pass_evidence(
-                reg,
-                CombinedPassExpectations(
-                    completed_msg_ids=(msg_ok,),
-                    expected_unconfirmed_bindings=(("sb-v", "inc_v1"),),
-                ),
-            )
+            verify_combined_pass_evidence(reg, exp)
 
     def test_g2_p2_1_startup_reconciliation_fences_all_unconfirmed_bindings_symmetrically(
         self,
@@ -1313,6 +1302,285 @@ class TestRestartQualification(unittest.TestCase):
         ok, count = reg.verify_audit_chain()
         self.assertTrue(ok)
         self.assertGreater(count, 0)
+
+    def test_oc_p1_1_stale_dispatcher_cannot_cancel_another_dispatchers_inflight_write(
+        self,
+    ) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-race", "inc_r1"): _OWNER_A})
+        reg, hub = self._open_hub(owner)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_and_grant(hub, "sb-race", "inc_r1")
+        msg_id = hub.send(_OP, target="sb-race", body_text="Held across revoke")["msg_id"]
+        stale_row = reg.list_outbox(statuses=("pending",))[0]
+
+        in_transport = threading.Event()
+        release_transport = threading.Event()
+        self.addCleanup(release_transport.set)
+
+        def _held_uncertain_dispatch(turn: Any) -> DispatchResult:
+            in_transport.set()
+            release_transport.wait(timeout=3.0)
+            return DispatchResult(outcome=DispatchOutcome.UNCERTAIN, detail="held_lost_receipt")
+
+        owner.dispatch_turn = _held_uncertain_dispatch  # type: ignore[method-assign]
+        t1 = threading.Thread(target=lambda: hub.dispatch_once(async_stream=False), daemon=True)
+        t1.start()
+        self.assertTrue(in_transport.wait(timeout=1.0))
+
+        # Revoke while Dispatcher 1 holds dispatch_started in Phase 2
+        hub.revoke(_OP, target="sb-race", reason="revoke_while_inflight")
+
+        # Stale Dispatcher 2 snapshots the old pending row and enters Phase 1 -> MUST NOT cancel dispatch_started!
+        self.assertFalse(hub._dispatch_single_row(stale_row, async_stream=False))
+        row_mid = {r["msg_id"]: r for r in reg.list_outbox(statuses=_STATUS_ALL)}[msg_id]
+        self.assertEqual(row_mid["status"], "dispatch_started")
+
+        # Release Dispatcher 1 -> true UNCERTAIN outcome is recorded without being clobbered by cancelled
+        release_transport.set()
+        t1.join(timeout=2.0)
+        row_end = {r["msg_id"]: r for r in reg.list_outbox(statuses=_STATUS_ALL)}[msg_id]
+        self.assertEqual(row_end["status"], "uncertain")
+
+    def test_oc_p1_2_completed_attempt_cannot_erase_retry_settlement_owner(self) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-rtry", "inc_rt1"): _OWNER_A})
+        reg, hub = self._open_hub(owner)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_and_grant(hub, "sb-rtry", "inc_rt1")
+        msg_id = hub.send(_OP, target="sb-rtry", body_text="Retry owner race")["msg_id"]
+
+        attempt2_paused = threading.Event()
+        attempt2_release = threading.Event()
+        self.addCleanup(attempt2_release.set)
+        attempt1_after_fence = threading.Event()
+        attempt1_allow_finally = threading.Event()
+        self.addCleanup(attempt1_allow_finally.set)
+        calls = {"n": 0}
+
+        def _scripted_dispatch(turn: Any) -> DispatchResult:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return DispatchResult(
+                    outcome=DispatchOutcome.ZERO_BYTES_SENT, detail="busy_retry", permanent=False
+                )
+            attempt2_paused.set()
+            attempt2_release.wait(timeout=3.0)
+            return DispatchResult(outcome=DispatchOutcome.UNCERTAIN, detail="attempt2_uncertain")
+
+        owner.dispatch_turn = _scripted_dispatch  # type: ignore[method-assign]
+        orig_release = hub._release_inflight_owner
+
+        def _delayed_release(
+            env: Any, inflight: Any, *, settled: bool, returned_stream_id: str | None
+        ) -> None:
+            if not attempt1_after_fence.is_set():
+                attempt1_after_fence.set()
+                attempt1_allow_finally.wait(timeout=3.0)
+            orig_release(env, inflight, settled=settled, returned_stream_id=returned_stream_id)
+
+        hub._release_inflight_owner = _delayed_release  # type: ignore[method-assign]
+
+        t1 = threading.Thread(target=lambda: hub.dispatch_once(async_stream=False), daemon=True)
+        t1.start()
+        self.assertTrue(attempt1_after_fence.wait(timeout=1.0))
+
+        # Attempt 2 claims the requeued pending row and pauses in Phase 2
+        t2 = threading.Thread(target=lambda: hub.dispatch_once(async_stream=False), daemon=True)
+        t2.start()
+        self.assertTrue(attempt2_paused.wait(timeout=1.0))
+
+        # Now let Attempt 1 run its finally: it MUST NOT erase Attempt 2's settlement owner!
+        attempt1_allow_finally.set()
+        t1.join(timeout=2.0)
+        self.assertIn(msg_id, hub._inflight_handoffs)
+
+        # Recovery MUST stay closed while Attempt 2 is still paused!
+        hub._mark_degraded("recovery_during_retry_attempt2")
+        rec_done = threading.Event()
+        rec_err: list[Exception] = []
+
+        def _do_rec() -> None:
+            try:
+                hub.confirm_recovery(_OP, reason="wait_for_retry_attempt2", timeout_s=2.0)
+            except Exception as exc:
+                rec_err.append(exc)
+            finally:
+                rec_done.set()
+
+        rec_thread = threading.Thread(target=_do_rec, daemon=True)
+        rec_thread.start()
+        self.assertFalse(rec_done.wait(timeout=0.08))
+        self.assertTrue(hub.is_degraded)
+
+        attempt2_release.set()
+        self.assertTrue(rec_done.wait(timeout=2.0))
+        t2.join(timeout=2.0)
+        self.assertEqual(rec_err, [])
+        self.assertFalse(hub.is_degraded)
+
+    def test_oc_p1_3_cold_cache_unreadable_binding_during_revoke_fails_closed(self) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-cold", "inc_c1"): _OWNER_A})
+        reg1, hub1 = self._open_hub(owner)
+        try:
+            self._reg_and_grant(hub1, "sb-cold", "inc_c1")
+        finally:
+            hub1.close()
+            reg1.close()
+
+        reg2, hub2 = self._open_hub(owner)
+        self.addCleanup(reg2.close)
+        # Clear in-memory owner cache (cold cache) and fail get_transport_binding() while sandbox/edges stay readable
+        with hub2._meta_lock:
+            hub2._external_owners.clear()
+        orig_get = reg2.get_transport_binding
+
+        def _fail_binding(sb_addr: str, inc_id: str) -> dict[str, Any] | None:
+            raise RuntimeError("binding_read_io_error")
+
+        reg2.get_transport_binding = _fail_binding  # type: ignore[method-assign]
+        _ok_b, audit_before = reg2.verify_audit_chain()
+        try:
+            with self.assertRaises(CoordPolicyError):
+                hub2.revoke(_OP, target="sb-cold", reason="cold_cache_binding_err")
+            self.assertTrue(hub2.is_degraded)
+            self.assertIn(("sb-cold", "inc_c1"), hub2._pending_cleanup_incarnations)
+            self.assertEqual(owner.confirm_calls, [])
+            # Must NOT have emitted a legacy "ok" revoke audit
+            _ok_a, audit_after = reg2.verify_audit_chain()
+            self.assertEqual(audit_after, audit_before)
+        finally:
+            reg2.get_transport_binding = orig_get  # type: ignore[method-assign]
+        hub2.confirm_recovery(_OP, reason="recovered_after_binding_read")
+        hub2.close()
+
+    def test_oc_p1_4_legacy_registration_cannot_reuse_terminal_external_identity(self) -> None:
+        owner1 = ExternallyFencedFakeTransport({(_ADDR_SUCC, "inc_term1"): _OWNER_A})
+        reg1, hub1 = self._open_hub(owner1)
+        try:
+            self._reg_and_grant(hub1, _ADDR_SUCC, "inc_term1")
+            hub1.revoke(_OP, target=_ADDR_SUCC, reason="retire_term1")
+        finally:
+            hub1.close()
+            reg1.close()
+
+        # Occupy address with successor inc_term2 and close cleanly
+        owner2 = ExternallyFencedFakeTransport({(_ADDR_SUCC, "inc_term2"): _OWNER_B})
+        reg2, hub2 = self._open_hub(owner2)
+        try:
+            self._reg_and_grant(hub2, _ADDR_SUCC, "inc_term2")
+            hub2.revoke(_OP, target=_ADDR_SUCC, reason="retire_term2")
+        finally:
+            hub2.close()
+            reg2.close()
+
+        # Reopen with a legacy FakeWorkerTransport and attempt to reuse retired inc_term1 -> MUST raise RevokedError
+        reg3, hub3 = self._open_hub(FakeWorkerTransport())
+        self.addCleanup(reg3.close)
+        self.addCleanup(hub3.close)
+        with self.assertRaises(RevokedError):
+            hub3.register_sandbox(
+                _OP,
+                name=_ADDR_SUCC,
+                incarnation_id="inc_term1",
+                project_id=_PROJ_ID,
+                project_name=_PROJ_NAME,
+                branch=_BRANCH,
+                task_brief=_BRIEF,
+            )
+
+    def test_oc_p2_1_crash_after_durable_handoff_settles_orphaned_row_on_recovery(self) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-ho", "inc_ho1"): _OWNER_A})
+        started = threading.Event()
+        never_done = threading.Event()
+        self.addCleanup(never_done.set)
+        owner.inner.queue_script(
+            "sb-ho", TurnScript(on_stream_started=started, block_event=never_done)
+        )
+        reg1, hub1 = self._open_hub(owner)
+        try:
+            self._reg_and_grant(hub1, "sb-ho", "inc_ho1")
+            msg_ho = hub1.send(_OP, target="sb-ho", body_text="Crash after handed_off")["msg_id"]
+            self.assertEqual(hub1.dispatch_once(async_stream=True), 1)
+            self.assertTrue(started.wait(timeout=1.0))
+            ho_row = {r["msg_id"]: r for r in reg1.list_outbox(statuses=_STATUS_ALL)}[msg_ho]
+            self.assertEqual(ho_row["status"], "handed_off")
+            orig_stream_id = ho_row["stream_id"]
+            self.assertTrue(orig_stream_id)
+        finally:
+            # Simulate abrupt host crash BEFORE stream finalization touches SQLite
+            reg1.mark_outbox_aborted = lambda *a, **k: None  # type: ignore[method-assign]
+            reg1.mark_outbox_completed = lambda *a, **k: None  # type: ignore[method-assign]
+            never_done.set()
+            owner.inner.abort_incarnation("sb-ho", "inc_ho1", reason="simulated_reader_exit")
+            hub1.dispatcher.join_streams(time.monotonic() + 1.0)
+            self._abandon_hub_for_crash(hub1, reg1)
+
+        # Reopen Hub 2 -> row is genuinely orphaned as handed_off; confirm_recovery settles it to aborted
+        reg2, hub2 = self._open_hub(owner)
+        self.addCleanup(reg2.close)
+        self.addCleanup(hub2.close)
+        self.assertTrue(hub2.is_degraded)
+        orphan_before = {r["msg_id"]: r for r in reg2.list_outbox(statuses=_STATUS_ALL)}[msg_ho]
+        self.assertEqual(orphan_before["status"], "handed_off")
+        before_calls = len(owner.dispatch_calls)
+        hub2.confirm_recovery(_OP, reason="settle_orphaned_handoff")
+        self.assertFalse(hub2.is_degraded)
+        self.assertEqual(hub2.dispatch_once(async_stream=False), 0)
+        self.assertEqual(len(owner.dispatch_calls), before_calls)
+
+        settled_row = {r["msg_id"]: r for r in reg2.list_outbox(statuses=_STATUS_ALL)}[msg_ho]
+        self.assertEqual(settled_row["status"], "aborted")
+        self.assertEqual(settled_row["stream_id"], orig_stream_id)
+        self.assertEqual(settled_row["attempts"], 1)
+        verify_combined_pass_evidence(
+            reg2,
+            CombinedPassExpectations(
+                aborted_msg_ids=(msg_ho,),
+                expected_attempts={msg_ho: 1},
+                expected_revoked_sandboxes=("sb-ho",),
+            ),
+        )
+
+    def test_oc_p2_2_failed_handoff_persist_with_abort_stream_still_retires_external_incarnation(
+        self,
+    ) -> None:
+        class _ExternalWithAbortStream(ExternallyFencedFakeTransport):
+            def abort_stream(self, stream_id: str, *, reason: str) -> bool:
+                return self._inner.abort_stream(stream_id, reason=reason)
+
+        owner = _ExternalWithAbortStream({("sb-hp", "inc_hp1"): _OWNER_A})
+        reg, hub = self._open_hub(owner)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_and_grant(hub, "sb-hp", "inc_hp1")
+        msg_id = hub.send(_OP, target="sb-hp", body_text="Handoff persist failure")["msg_id"]
+
+        orig_mark_ho = reg.mark_outbox_handed_off
+
+        def _fail_mark_ho(mid: str, *, stream_id: str) -> None:
+            raise RuntimeError("sqlite_handoff_persist_failed")
+
+        reg.mark_outbox_handed_off = _fail_mark_ho  # type: ignore[method-assign]
+        try:
+            self.assertEqual(hub.dispatch_once(async_stream=False), 1)
+        finally:
+            reg.mark_outbox_handed_off = orig_mark_ho  # type: ignore[method-assign]
+
+        # Even though abort_stream() succeeded, the external incarnation MUST be retired via exact owner!
+        self.assertTrue(
+            any(c[0] == "sb-hp" and c[1] == "inc_hp1" and c[2] == _OWNER_A for c in owner.confirm_calls)
+        )
+        binding = reg.get_transport_binding("sb-hp", "inc_hp1")
+        self.assertTrue(binding["terminal_confirmed"])
+        verify_combined_pass_evidence(
+            reg,
+            CombinedPassExpectations(
+                uncertain_msg_ids=(msg_id,),
+                expected_attempts={msg_id: 1},
+                expected_revoked_sandboxes=("sb-hp",),
+            ),
+        )
 
 
 if __name__ == "__main__":
