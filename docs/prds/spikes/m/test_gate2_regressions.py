@@ -309,7 +309,7 @@ class TestGate2Round1Regressions(CoordTestBase):
             hub.read_artifact(stale_b, sandbox_addr="target-b", ref=op_ref)
 
     def test_p1_4_hub_restart_enforces_controller_revoke_and_durable_degraded_marker(self) -> None:
-        controller, ctrl_op, lease, req_id = _make_controller_lease("sb1", "inc_ctrl_1")
+        controller, ctrl_op, _lease, req_id = _make_controller_lease("sb1", "inc_ctrl_1")
         reg1 = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
         transport = FakeWorkerTransport()
         hub1 = CoordHub(
@@ -317,6 +317,7 @@ class TestGate2Round1Regressions(CoordTestBase):
             transport,
             self.state_dir,
             controller=controller,
+            controller_actor=ctrl_op,
             sandbox_root=self.sandbox_root,
         )
         try:
@@ -328,7 +329,6 @@ class TestGate2Round1Regressions(CoordTestBase):
                 project_name="P1",
                 branch="main",
                 task_brief="Controller lease sandbox",
-                lease=lease,
                 controller_request_id=req_id,
             )
             hub1.grant_edge(
@@ -352,6 +352,7 @@ class TestGate2Round1Regressions(CoordTestBase):
             transport,
             self.state_dir,
             controller=controller,
+            controller_actor=ctrl_op,
             sandbox_root=self.sandbox_root,
         )
         try:
@@ -890,7 +891,7 @@ class TestGate2Round2Regressions(CoordTestBase):
     def test_r2_p1_2_restarted_hub_rejects_revoked_sandbox_request_with_distinct_edge_lease(
         self,
     ) -> None:
-        controller, ctrl_op, lease_sb, req_sb, req_edge = _make_dual_request_controller()
+        controller, ctrl_op, _lease_sb, req_sb, req_edge = _make_dual_request_controller()
         reg1 = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
         transport = FakeWorkerTransport()
         hub1 = CoordHub(
@@ -910,7 +911,6 @@ class TestGate2Round2Regressions(CoordTestBase):
                 project_name="P1",
                 branch="main",
                 task_brief="Dual lease sandbox",
-                lease=lease_sb,
                 controller_request_id=req_sb,
             )
             hub1.grant_edge(
@@ -1409,6 +1409,10 @@ class TestReciprocalReviewRegressions(CoordTestBase):
             self.assertEqual(rec_ctrl.controller_request_id, req_ctrl)
             hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-ctrl")
 
+            # Controller-only registration survives clean close and checks controller after restart
+            self._reg_sb(hub1, _OP, "sb-ctrl-only", "inc_co1", controller_request_id=req_ctrl)
+            hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-ctrl-only")
+
             # Ephemeral lease works before restart
             rec_eph = self._reg_sb(hub1, _OP, "sb-eph", "inc_e1", lease=lease_eph)
             self.assertIsNotNone(rec_eph.controller_request_id)
@@ -1422,12 +1426,16 @@ class TestReciprocalReviewRegressions(CoordTestBase):
 
         reg2, _t2, hub2 = self._open_pair(controller=controller, controller_actor=ctrl_op)
         try:
-            # Derived controller authority detects out-of-band revoke after restart
-            with self.assertRaises(RevokedError):
-                hub2.send(_OP, target="sb-ctrl", body_text="Must deny after controller revoke")
-            # Ephemeral lease has no recoverable controller authority -> fails closed after restart
-            with self.assertRaises(RevokedError):
+            # Lease-backed incarnations are durably retired at clean close
+            self.assertEqual(reg2.get_sandbox("sb-ctrl").status, "revoked")  # type: ignore[union-attr]
+            self.assertEqual(reg2.get_sandbox("sb-eph").status, "revoked")  # type: ignore[union-attr]
+            with self.assertRaises(CoordAuthError):
+                hub2.send(_OP, target="sb-ctrl", body_text="Must deny retired lease")
+            with self.assertRaises(CoordAuthError):
                 hub2.send(_OP, target="sb-eph", body_text="Must deny ephemeral after restart")
+            # Controller-only registration detects out-of-band revoke after restart
+            with self.assertRaises(RevokedError):
+                hub2.send(_OP, target="sb-ctrl-only", body_text="Must deny after controller revoke")
         finally:
             hub2.close()
             reg2.close()
@@ -1844,17 +1852,24 @@ class TestReciprocalReviewRegressions(CoordTestBase):
             diag = hub2.status(_OP, target="target-b")
             self.assertTrue(diag["degraded"])
             self.assertIn("projects", hub2.projection(_OP))
-            # Recover: stale pre-crash edge MUST be invalidated (not silently reopened)
+            # Recover: ALL pre-recovery grants AND incarnations are retired until fresh registration
             hub2.confirm_recovery(_OP, reason="diag_ok")
-            with self.assertRaises(CoordAuthError):
+            with self.assertRaises(RevokedError):
+                hub2.status(peer_a, target="peer-a")
+            with self.assertRaises(RevokedError):
                 hub2.status(peer_a, target="target-b")
-            # Grant a fresh post-recovery edge, start sleeping peer waiter, then degrade
+            # Fresh incarnations + fresh edge restore service; mid-wait degrade wakes & denies
+            self._reg_sb(hub2, _OP, "peer-a", "inc_a2")
+            self._reg_sb(hub2, _OP, "target-b", "inc_b2")
             hub2.grant_edge(_OP, src_actor="peer-a", dst_addr="target-b")
+            peer_a2 = PrincipalCtx(
+                CoordRole.JOB, "peer-a", sandbox_addr="peer-a", incarnation_id="inc_a2"
+            )
             wait_err: list[Exception] = []
 
             def _sleep_wait() -> None:
                 try:
-                    hub2.wait(peer_a, targets=["target-b"], since_seq=9999, timeout_s=2.0)
+                    hub2.wait(peer_a2, targets=["target-b"], since_seq=9999, timeout_s=2.0)
                 except Exception as exc:
                     wait_err.append(exc)
 
@@ -2238,6 +2253,240 @@ class TestReciprocalReviewRegressions(CoordTestBase):
         cancelled_after = reg.list_outbox(statuses=("cancelled",))
         self.assertTrue(any(r["msg_id"] == msg_id for r in pending_after))
         self.assertEqual(cancelled_after, [])
+
+    def test_r5_c1_lease_retirement_durable_on_close_and_retry_after_settlement_error(
+        self,
+    ) -> None:
+        # 1. Controller stays eligible; lease revoked locally after detachment -> fresh hub refuses old inc
+        controller, ctrl_op, lease_ok, req_ok = _make_controller_lease("sb-ret", "inc_ret1")
+        reg1, _t1, hub1 = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        self._reg_sb(hub1, _OP, "sb-ret", "inc_ret1", lease=lease_ok)
+        edge1 = hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-ret")
+        hub1.close(timeout_s=1.0)
+        lease_ok.revoke()
+        reg1.close()
+
+        reg2, _t2, hub2 = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        try:
+            self.assertFalse(hub2.is_degraded)
+            sb_after = reg2.get_sandbox("sb-ret")
+            edge_after = reg2.get_edge(edge1.edge_id)
+            self.assertIsNotNone(sb_after)
+            self.assertEqual(sb_after.status, "revoked")
+            self.assertIsNotNone(edge_after)
+            self.assertFalse(edge_after.active)
+            # 2. Inject settlement failure on close() -> seal & retry state preserved; retry finishes it
+            c2, op2, lease2, _r2 = _make_controller_lease("sb-err", "inc_err1")
+            hub2._controller = c2
+            hub2._controller_actor = op2
+            self._reg_sb(hub2, _OP, "sb-err", "inc_err1", lease=lease2)
+            edge2 = hub2.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-err")
+            orig_get_sb = reg2.get_sandbox
+
+            def _fail_get(addr: str) -> Any:
+                raise OSError("db_settlement_io_error")
+
+            reg2.get_sandbox = _fail_get  # type: ignore[method-assign]
+            try:
+                with self.assertRaises(OSError):
+                    hub2.close(timeout_s=1.0)
+            finally:
+                reg2.get_sandbox = orig_get_sb  # type: ignore[method-assign]
+            self.assertTrue(hub2.is_degraded)
+            self.assertTrue(hub2._session_active_marker.exists())
+            self.assertTrue(hub2._degraded_marker.exists())
+            self.assertFalse(hub2._shutdown_settled)
+            # Retry close() finishes retirement of sb-err and releases lock (keeping degraded markers)
+            hub2.close(timeout_s=1.0)
+            self.assertTrue(hub2._shutdown_settled)
+            self.assertEqual(reg2.get_sandbox("sb-err").status, "revoked")  # type: ignore[union-attr]
+            self.assertFalse(reg2.get_edge(edge2.edge_id).active)  # type: ignore[union-attr]
+            self.assertTrue(hub2._session_active_marker.exists())
+            self.assertTrue(hub2._degraded_marker.exists())
+        finally:
+            reg2.close()
+
+    def test_r5_c2_degraded_recovery_retires_all_incarnations_and_healthy_duplicate_noop(
+        self,
+    ) -> None:
+        reg1, _t1, hub1 = self._open_pair()
+        self._reg_sb(hub1, _OP, "orch-r", "inc_o1")
+        orch_old = PrincipalCtx(
+            CoordRole.ORCHESTRATOR, "orch-r", sandbox_addr="orch-r", incarnation_id="inc_o1"
+        )
+        self._reg_sb(hub1, orch_old, "leaf-r", "inc_l1", parent_addr="orch-r")
+        leaf_old = PrincipalCtx(
+            CoordRole.JOB, "leaf-r", sandbox_addr="leaf-r", incarnation_id="inc_l1"
+        )
+        self._simulate_crash(hub1, reg1)
+
+        reg2, _t2, hub2 = self._open_pair()
+        try:
+            self.assertTrue(hub2.is_degraded)
+            hub2.confirm_recovery(_OP, reason="retire_all_old")
+            self.assertFalse(hub2.is_degraded)
+            # Old principals lose self-read and orchestrator authority
+            with self.assertRaises(RevokedError):
+                hub2.status(leaf_old, target="leaf-r")
+            with self.assertRaises(RevokedError):
+                hub2.projection(orch_old)
+            # Fresh registration restores ONLY new incarnations
+            self._reg_sb(hub2, _OP, "orch-r", "inc_o2")
+            orch_new = PrincipalCtx(
+                CoordRole.ORCHESTRATOR, "orch-r", sandbox_addr="orch-r", incarnation_id="inc_o2"
+            )
+            self._reg_sb(hub2, orch_new, "leaf-r2", "inc_l2", parent_addr="orch-r")
+            fresh_edge = hub2.grant_edge(orch_new, src_actor=orch_new.canonical_sender, dst_addr="leaf-r2")
+            # Duplicate confirm_recovery() on healthy hub is a no-op and preserves fresh grants
+            hub2.confirm_recovery(_OP, reason="duplicate_noop")
+            self.assertTrue(reg2.get_edge(fresh_edge.edge_id).active)  # type: ignore[union-attr]
+            self.assertIn("projects", hub2.projection(orch_new))
+        finally:
+            hub2.close()
+            reg2.close()
+
+    def test_r5_c3_unavailable_controller_aborts_held_stream_preserves_pending_then_revoke_cancels(
+        self,
+    ) -> None:
+        controller, ctrl_op, lease, req_id = _make_controller_lease("sb-u", "inc_u1")
+        reg, transport, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-u", "inc_u1", lease=lease)
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-u")
+
+        started = threading.Event()
+        never_done = threading.Event()
+        transport.queue_script("sb-u", TurnScript(on_stream_started=started, block_event=never_done))
+        res1 = hub.send(_OP, target="sb-u", body_text="Held turn 1")
+        msg1 = res1["msg_id"]
+        hub.dispatch_once(async_stream=True)
+        self.assertTrue(started.wait(timeout=1.0))
+
+        # Queue Turn 2 while Turn 1 is actively held
+        res2 = hub.send(_OP, target="sb-u", body_text="Queued turn 2")
+        msg2 = res2["msg_id"]
+
+        # Make controller lookup transiently unavailable -> held stream aborts, queued stays pending
+        orig_status = controller.status
+
+        def _outage(_actor: Any, _req: str) -> Any:
+            raise OSError("controller_temporarily_unreachable")
+
+        controller.status = _outage  # type: ignore[method-assign]
+        try:
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                aborted_rows = reg.list_outbox(statuses=("aborted",))
+                if any(r["msg_id"] == msg1 for r in aborted_rows):
+                    break
+                time.sleep(0.02)
+            aborted_ids = {r["msg_id"] for r in reg.list_outbox(statuses=("aborted",))}
+            self.assertIn(msg1, aborted_ids)
+            # Pending Turn 2 must NOT be cancelled during transient unavailability
+            self.assertEqual(hub.dispatch_once(), 0)
+            pending_ids = {r["msg_id"] for r in reg.list_outbox(statuses=("pending",))}
+            self.assertIn(msg2, pending_ids)
+        finally:
+            controller.status = orig_status  # type: ignore[method-assign]
+
+        # Authority restored: ONLY Turn 2 dispatches (Turn 1 stays aborted, never retried!)
+        self.assertEqual(hub.dispatch_once(async_stream=False), 1)
+        dispatched_ids = [t.msg_id for t in transport.dispatched_turns("sb-u")]
+        self.assertEqual(dispatched_ids.count(msg1), 1)
+        self.assertEqual(dispatched_ids.count(msg2), 1)
+        self.assertIn(msg1, {r["msg_id"] for r in reg.list_outbox(statuses=("aborted",))})
+
+        # Queue Turn 3, then issue confirmed controller revoke -> cancels Turn 3 & revokes sandbox
+        res3 = hub.send(_OP, target="sb-u", body_text="Queued turn 3")
+        msg3 = res3["msg_id"]
+        controller.revoke(ctrl_op, req_id)
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if any(r["msg_id"] == msg3 for r in reg.list_outbox(statuses=("cancelled",))):
+                break
+            time.sleep(0.02)
+        self.assertIn(msg3, {r["msg_id"] for r in reg.list_outbox(statuses=("cancelled",))})
+
+    def test_r5_c4_restored_controller_only_target_installs_monitor_and_aborts_held_stream(
+        self,
+    ) -> None:
+        controller, ctrl_op, _lease, req_id = _make_controller_lease("sb-rmon", "inc_rm1")
+        reg1, _t1, hub1 = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        try:
+            self._reg_sb(hub1, _OP, "sb-rmon", "inc_rm1", controller_request_id=req_id)
+            hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-rmon")
+            hub1.send(_OP, target="sb-rmon", body_text="Queued for restored hub")
+        finally:
+            hub1.close()
+            reg1.close()
+
+        reg2, transport2, hub2 = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        try:
+            started = threading.Event()
+            never_done = threading.Event()
+            transport2.queue_script(
+                "sb-rmon", TurnScript(on_stream_started=started, block_event=never_done)
+            )
+            self.assertEqual(hub2.dispatch_once(async_stream=True), 1)
+            self.assertTrue(started.wait(timeout=1.0))
+
+            # Controller revokes AFTER the recovered stream has started -> monitor aborts it!
+            controller.revoke(ctrl_op, req_id)
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                if ("sb-rmon", "inc_rm1") in transport2.revoked_incarnations:
+                    break
+                time.sleep(0.02)
+            self.assertIn(("sb-rmon", "inc_rm1"), transport2.revoked_incarnations)
+            self.assertEqual(reg2.get_sandbox("sb-rmon").status, "revoked")  # type: ignore[union-attr]
+        finally:
+            hub2.close()
+            reg2.close()
+
+    def test_r5_c5_close_deadline_bounded_and_drains_async_producers_and_register_audit(
+        self,
+    ) -> None:
+        # 1. close(timeout_s=0.05) while register_sandbox trailing audit is blocked stays within budget
+        reg, transport, hub = self._open_pair()
+        audit_entered = threading.Event()
+        audit_release = threading.Event()
+        orig_audit = reg.append_audit
+
+        def _slow_audit(actor: str, action: str, target: str, outcome: str, detail: Any = None) -> int:
+            if action == "register_sandbox":
+                audit_entered.set()
+                audit_release.wait(timeout=2.0)
+            return orig_audit(actor, action, target, outcome, detail)
+
+        reg.append_audit = _slow_audit  # type: ignore[method-assign]
+        rt = threading.Thread(
+            target=lambda: self._reg_sb(hub, _OP, "sb-aud", "inc_aud1"), daemon=True
+        )
+        rt.start()
+        self.assertTrue(audit_entered.wait(timeout=1.0))
+
+        t0 = time.monotonic()
+        with self.assertRaises(CoordPolicyError):
+            hub.close(timeout_s=0.05)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 0.35)
+        self.assertTrue(hub._session_active_marker.exists())
+        # Second hub stays excluded while trailing audit is still running
+        reg_other = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
+        t_other = FakeWorkerTransport()
+        try:
+            with self.assertRaises(CoordPolicyError):
+                CoordHub(reg_other, t_other, self.state_dir, sandbox_root=self.sandbox_root)
+        finally:
+            reg_other.close()
+
+        audit_release.set()
+        rt.join(timeout=1.0)
+        hub.close(timeout_s=1.0)
+        self.assertFalse(hub._session_active_marker.exists())
+        reg.close()
+        _ = transport
 
 
 if __name__ == "__main__":

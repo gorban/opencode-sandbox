@@ -37,7 +37,7 @@ from oc_address import (  # noqa: E402
     validate_thread_id,
 )
 from oc_broker_common import BrokerLease, _UMASK_LOCK  # noqa: E402
-from oc_controller import Controller, Principal  # noqa: E402
+from oc_controller import Controller, Denied, Principal  # noqa: E402
 from oc_coord_contract import (  # noqa: E402
     DEFAULT_EDGE_MAX_ROUNDS,
     EDGE_MAX_QUEUED_BYTES,
@@ -93,7 +93,8 @@ _ERR_HUB_CLOSED = "hub_closed"
 _ERR_STATE_LOCKED = "hub_state_dir_locked"
 _ERR_CLOSE_INCOMPLETE = "hub_close_incomplete_workers_running"
 _ERR_ARTIFACT_RECONCILE = "artifact_reconciliation_failed"
-_ATTR_WATCH_THREAD = "_watch_thread"
+_ERR_LEASE_SETTLE = "close_lease_settlement_failed"
+_ERR_CTRL_UNAVAILABLE = "controller_authority_unavailable"
 _ATTR_LEASE_REQ_ID = "_controller_request_id"
 _ERR_EDGE_REVOKED = "edge_revoked"
 _ERR_NO_ACTIVE_EDGE = "no_active_edge"
@@ -101,10 +102,16 @@ _ERR_REVOKED_UNCONFIRMED = "revoked_locally_persistence_unconfirmed"
 _ERR_SANDBOX_NOT_FOUND = "sandbox_not_found"
 _ERR_SANDBOX_REVOKED = "sandbox_revoked"
 _ERR_ADMIN_ONLY = "operator_or_orchestrator_required"
+_STATUS_ACTIVE = "active"
+_STATUS_UNAVAILABLE = "unavailable"
 _STATUS_REVOKED = "revoked"
 _STATUS_RUNNING = "running"
 _STATUS_PENDING = "pending"
 _STATUS_DISPATCH_STARTED = "dispatch_started"
+
+
+class _AuthorityUnavailableError(CoordPolicyError):
+    """Controller authority lookup failed transiently (distinct from confirmed revocation)."""
 _STAGING_DIR_NAME = ".staging"
 _SPOOL_DIR_NAME = "inbox-spool"
 _DEGRADED_MARKER_NAME = ".coord_degraded"
@@ -924,10 +931,9 @@ class OutboxDispatcher:
                 pass
             self._wake_event.wait(timeout=self._poll_interval_s)
 
-    def stop(self, *, timeout_s: float = 2.0) -> bool:
+    def stop_pump(self, deadline: float) -> bool:
         self._stop_event.set()
         self._wake_event.set()
-        deadline = time.monotonic() + timeout_s
         with self._lock:
             pump = self._thread
         if pump is not None:
@@ -936,15 +942,24 @@ class OutboxDispatcher:
         with self._lock:
             if not pump_alive and self._thread is pump:
                 self._thread = None
+        return not pump_alive
+
+    def join_streams(self, deadline: float) -> bool:
         while True:
             with self._lock:
                 alive_streams = [w for w in self._stream_threads if w.is_alive()]
             if not alive_streams:
-                return not pump_alive
+                return True
             if deadline - time.monotonic() <= 0:
                 return False
             for worker in alive_streams:
                 worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    def stop(self, *, timeout_s: float = 2.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        pump_ok = self.stop_pump(deadline)
+        streams_ok = self.join_streams(deadline)
+        return pump_ok and streams_ok
 
 
 class CoordHub:
@@ -987,6 +1002,7 @@ class CoordHub:
             self._closed = False
             self._shutdown_settled = False
             self._accept_watchdog_spawns = True
+            self._recovery_generation = 0
             self._wait_cond = threading.Condition()
             self._waiters: set[_WaiterState] = set()
             self._degraded = self._init_recovery_seal()
@@ -998,7 +1014,12 @@ class CoordHub:
             self._budgets: dict[tuple[str, str], SubtreeBudget] = {}
             self._leases: dict[str, BrokerLease] = {}
             self._lease_callbacks: dict[str, Callable[[], None]] = {}
+            self._pending_close_retirements: dict[str, BrokerLease] = {}
             self._watchdog_threads: set[threading.Thread] = set()
+            self._controller_monitors: dict[
+                tuple[str, str, str], tuple[threading.Event, threading.Thread]
+            ] = {}
+            self._unavailable_aborted_streams: set[str] = set()
             self._rate_windows: dict[str, deque[float]] = {}
             self._active_streams: dict[tuple[str, str], set[str]] = {}
             self._reconcile_artifacts_on_startup()
@@ -1163,27 +1184,32 @@ class CoordHub:
                 self._fg_cond.wait(timeout=remaining)
             return True
 
-    def _reconcile_grants_for_recovery(self) -> int:
-        """Invalidate pre-recovery active grant generations and revoked controller leases."""
-        invalidated = 0
+    def _reconcile_grants_and_incarnations_for_recovery(self) -> tuple[int, int]:
+        """Invalidate all pre-recovery active grant generations and unconfirmed sandbox incarnations."""
+        invalidated_grants = 0
         for edge in self._registry.list_edges(active_only=True):
             revoked = self._registry.revoke_grant_and_cancel_outbox(
                 edge_id=edge.edge_id, reason="recovery_grant_generation_invalidated"
             )
-            invalidated += len(revoked)
+            invalidated_grants += len(revoked)
+        retired_incarnations = 0
         for sb in self._registry.list_sandboxes():
-            if sb.status == _STATUS_REVOKED or sb.controller_request_id is None:
+            if sb.status == _STATUS_REVOKED:
                 continue
-            if not self._check_controller_request_active(sb.controller_request_id):
-                self._registry.update_sandbox_status(
-                    sb.sandbox_addr, _STATUS_REVOKED, incarnation_id=sb.incarnation_id
-                )
-        return invalidated
+            self._detach_prior_lease(sb.sandbox_addr)
+            self._stop_monitors_for_target(sb.sandbox_addr)
+            with self._meta_lock:
+                self._fenced_targets.add((sb.sandbox_addr, sb.incarnation_id))
+            self._registry.update_sandbox_status(
+                sb.sandbox_addr, _STATUS_REVOKED, incarnation_id=sb.incarnation_id
+            )
+            retired_incarnations += 1
+        return invalidated_grants, retired_incarnations
 
     def confirm_recovery(
         self, caller: PrincipalCtx, *, reason: str = "operator_verified_recovery"
     ) -> None:
-        """Operator-only recovery: reconcile artifacts, invalidate stale grants, audit, then reopen."""
+        """Operator-only recovery: retire all pre-recovery grants/incarnations, audit, then reopen."""
         if caller.role is not CoordRole.OPERATOR:
             raise CoordAuthError("operator_required:confirm_recovery")
         clean_reason = validate_reason_text(reason, "reason")
@@ -1192,9 +1218,15 @@ class CoordHub:
             with self._register_lock:
                 if self._is_closed():
                     raise CoordPolicyError(_ERR_HUB_CLOSED)
-                # Keep _degraded=True through artifact reconciliation, grant invalidation, and audit.
+                if not self.is_degraded:
+                    return
+                with self._meta_lock:
+                    self._recovery_generation += 1
+                # Keep _degraded=True through artifact reconciliation, invalidation, and audit.
                 self._reconcile_artifacts_on_startup(raise_on_error=True)
-                invalidated_grants = self._reconcile_grants_for_recovery()
+                invalidated_grants, retired_incarnations = (
+                    self._reconcile_grants_and_incarnations_for_recovery()
+                )
                 if self._is_closed():
                     raise CoordPolicyError(_ERR_HUB_CLOSED)
                 self._registry.append_audit(
@@ -1202,7 +1234,11 @@ class CoordHub:
                     "confirm_recovery",
                     "hub",
                     _OUTCOME_OK,
-                    {"reason": clean_reason, "invalidated_grants": invalidated_grants},
+                    {
+                        "reason": clean_reason,
+                        "invalidated_grants": invalidated_grants,
+                        "retired_incarnations": retired_incarnations,
+                    },
                 )
                 # Write session seal BEFORE unlinking .coord_degraded so failure never drops protection.
                 _write_marker_durable(
@@ -1237,15 +1273,45 @@ class CoordHub:
             cb = callbacks.get(addr)
             if cb is not None:
                 lease.remove_revoke_callback(cb)
-            try:
-                if getattr(lease, _ATTR_WATCH_THREAD, None) is not threading.current_thread():
-                    lease.stop_watchdog()
-            except Exception:
-                pass
 
-    def _finalize_settled_close(self, leases: Sequence[tuple[str, BrokerLease]]) -> Exception | None:
-        with self._register_lock:
-            settle_err = self._settle_leases_locked(leases)
+    def _retire_pending_leases_locked(self) -> None:
+        watchdog_caller = PrincipalCtx(role=CoordRole.OPERATOR, actor_id="lease-watchdog")
+        first_err: Exception | None = None
+        for addr, lease in list(self._pending_close_retirements.items()):
+            try:
+                sb = self._registry.get_sandbox(addr)
+                if sb is not None and sb.status != _STATUS_REVOKED:
+                    self._revoke_unlocked(
+                        watchdog_caller,
+                        target=addr,
+                        reason="hub_close_lease_retired",
+                    )
+                else:
+                    try:
+                        lease.revoke()
+                    except Exception:
+                        pass
+                self._pending_close_retirements.pop(addr, None)
+            except Exception as exc:
+                self._mark_degraded(_ERR_LEASE_SETTLE)
+                with self._meta_lock:
+                    self._fenced_addrs.add(addr)
+                if first_err is None:
+                    first_err = exc
+        if first_err is not None:
+            raise first_err
+
+    def _acquire_lock_by_deadline(self, lock: threading.Lock, deadline: float) -> bool:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return lock.acquire(blocking=False)
+        return lock.acquire(timeout=remaining)
+
+    def _finalize_settled_close(self, deadline: float) -> None:
+        if not self._acquire_lock_by_deadline(self._register_lock, deadline):
+            raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
+        try:
+            self._retire_pending_leases_locked()
             with self._meta_lock:
                 self._leases.clear()
                 self._lease_callbacks.clear()
@@ -1264,53 +1330,48 @@ class CoordHub:
             _release_state_dir_lock(lock_fd)
             with self._meta_lock:
                 self._shutdown_settled = True
-            return settle_err
+        finally:
+            self._register_lock.release()
 
-    def _settle_leases_locked(self, leases: Sequence[tuple[str, BrokerLease]]) -> Exception | None:
-        watchdog_caller = PrincipalCtx(role=CoordRole.OPERATOR, actor_id="lease-watchdog")
-        first_err: Exception | None = None
-        for addr, lease in leases:
-            if lease.is_active():
-                continue
-            try:
-                with self._meta_lock:
-                    live_lease = self._leases.get(addr)
-                if live_lease is not lease:
-                    continue
-                sb = self._registry.get_sandbox(addr)
-                if sb is not None and sb.status != _STATUS_REVOKED:
-                    self._revoke_unlocked(
-                        watchdog_caller,
-                        target=addr,
-                        reason="controller_lease_revoked",
-                    )
-            except Exception as exc:
-                if first_err is None:
-                    first_err = exc
-        return first_err
+    def _drain_producers_and_streams(self, deadline: float) -> None:
+        pump_ok = self.dispatcher.stop_pump(deadline)
+        fg_ok = self._wait_fg_ops(deadline)
+        if not pump_ok or not fg_ok:
+            raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
+        streams_ok = self.dispatcher.join_streams(deadline)
+        if not streams_ok:
+            raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
 
     def close(self, *, timeout_s: float = 2.0) -> None:
-        with self._close_lock:
+        deadline = time.monotonic() + timeout_s
+        if not self._acquire_lock_by_deadline(self._close_lock, deadline):
+            raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
+        try:
             with self._meta_lock:
                 if self._shutdown_settled:
                     return
                 self._closed = True
             self._notify_waiters()
-            deadline = time.monotonic() + timeout_s
-            disp_ok = self.dispatcher.stop(timeout_s=max(0.0, deadline - time.monotonic()))
-            fg_ok = self._wait_fg_ops(deadline)
-            with self._register_lock:
+            self._drain_producers_and_streams(deadline)
+            if not self._acquire_lock_by_deadline(self._register_lock, deadline):
+                raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
+            try:
                 with self._meta_lock:
                     self._accept_watchdog_spawns = False
+                    for addr, lease in self._leases.items():
+                        self._pending_close_retirements.setdefault(addr, lease)
                     leases = list(self._leases.items())
                     callbacks = dict(self._lease_callbacks)
+            finally:
+                self._register_lock.release()
+            mon_ok = self._stop_all_controller_monitors(deadline)
             self._detach_lease_callbacks(leases, callbacks)
             wd_ok = self._join_watchdog_threads(timeout_s=max(0.0, deadline - time.monotonic()))
-            if not disp_ok or not fg_ok or not wd_ok:
+            if not mon_ok or not wd_ok:
                 raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
-            settle_err = self._finalize_settled_close(leases)
-            if settle_err is not None:
-                raise settle_err
+            self._finalize_settled_close(deadline)
+        finally:
+            self._close_lock.release()
 
     def _join_watchdog_threads(self, *, timeout_s: float = 2.0) -> bool:
         deadline = time.monotonic() + timeout_s
@@ -1352,6 +1413,37 @@ class CoordHub:
         if caller.role not in (CoordRole.OPERATOR, CoordRole.ORCHESTRATOR):
             raise CoordAuthError(f"{_ERR_ADMIN_ONLY}:{action}")
 
+    @staticmethod
+    def _is_lease_locally_revoked(lease: BrokerLease) -> bool:
+        """Read BrokerLease local revocation flag without mutating it on controller lookup error."""
+        lock = getattr(lease, "_lock", None)
+        if lock is not None:
+            with lock:
+                return bool(getattr(lease, "_revoked", False))
+        return bool(getattr(lease, "_revoked", False))
+
+    def _probe_controller_request(
+        self,
+        request_id: str,
+        *,
+        controller: Controller | None = None,
+        actor: Principal | None = None,
+    ) -> str:
+        """Return 'active', 'revoked' (authoritative deny), or 'unavailable' (lookup error)."""
+        if request_id.startswith(_EPHEMERAL_LEASE_PREFIX):
+            return _STATUS_REVOKED
+        ctrl = controller if controller is not None else self._controller
+        act = actor if actor is not None else self._controller_actor
+        if ctrl is None or act is None:
+            return _STATUS_UNAVAILABLE
+        try:
+            st = ctrl.status(act, request_id)
+        except Denied:
+            return _STATUS_REVOKED
+        except Exception:
+            return _STATUS_UNAVAILABLE
+        return _STATUS_ACTIVE if (st.eligible and not st.revoked) else _STATUS_REVOKED
+
     def _check_controller_request_active(
         self,
         request_id: str,
@@ -1359,50 +1451,175 @@ class CoordHub:
         controller: Controller | None = None,
         actor: Principal | None = None,
     ) -> bool:
-        if request_id.startswith(_EPHEMERAL_LEASE_PREFIX):
-            return False
-        ctrl = controller if controller is not None else self._controller
-        act = actor if actor is not None else self._controller_actor
-        if ctrl is None or act is None:
-            return False
-        try:
-            st = ctrl.status(act, request_id)
-        except Exception:
-            return False
-        return bool(st.eligible and not st.revoked)
+        return (
+            self._probe_controller_request(request_id, controller=controller, actor=actor)
+            == _STATUS_ACTIVE
+        )
 
-    def _check_in_memory_lease_active(
+    @staticmethod
+    def _require_authority_status_active(status: str, revoked_msg: str) -> None:
+        if status == _STATUS_ACTIVE:
+            return
+        if status == _STATUS_UNAVAILABLE:
+            raise _AuthorityUnavailableError(_ERR_CTRL_UNAVAILABLE)
+        raise RevokedError(revoked_msg)
+
+    def _check_in_memory_lease_status(
         self, lease: BrokerLease, controller_request_id: str | None
-    ) -> bool:
-        if not lease.is_active():
-            return False
+    ) -> str:
+        if self._is_lease_locally_revoked(lease):
+            return _STATUS_REVOKED
         lease_req = getattr(lease, _ATTR_LEASE_REQ_ID, None)
         if controller_request_id is None:
             if lease_req is None:
-                return True
-            return self._check_controller_request_active(lease_req)
+                return _STATUS_ACTIVE
+            return self._probe_controller_request(lease_req)
         if lease_req is None and controller_request_id == self._ephemeral_authority_id(lease):
-            return True
-        if not self._check_controller_request_active(controller_request_id):
-            return False
+            return _STATUS_ACTIVE
+        primary = self._probe_controller_request(controller_request_id)
+        if primary != _STATUS_ACTIVE:
+            return primary
         if lease_req is not None and lease_req != controller_request_id:
-            return self._check_controller_request_active(lease_req)
-        return True
+            return self._probe_controller_request(lease_req)
+        return _STATUS_ACTIVE
 
-    def _check_lease_active(
+    def _check_lease_status(
         self, sandbox_addr: str, *, controller_request_id: str | None = None
-    ) -> bool:
+    ) -> str:
         with self._meta_lock:
             lease = self._leases.get(sandbox_addr)
         if lease is not None:
-            return self._check_in_memory_lease_active(lease, controller_request_id)
+            return self._check_in_memory_lease_status(lease, controller_request_id)
         req_id = controller_request_id
         if req_id is None:
             sb = self._registry.get_sandbox(sandbox_addr)
             req_id = sb.controller_request_id if sb is not None else None
         if req_id is not None:
-            return self._check_controller_request_active(req_id)
-        return True
+            return self._probe_controller_request(req_id)
+        return _STATUS_ACTIVE
+
+    def _check_lease_active(
+        self, sandbox_addr: str, *, controller_request_id: str | None = None
+    ) -> bool:
+        return (
+            self._check_lease_status(sandbox_addr, controller_request_id=controller_request_id)
+            == _STATUS_ACTIVE
+        )
+
+    def _abort_unavailable_target_streams(
+        self, sandbox_addr: str, incarnation_id: str
+    ) -> None:
+        """Fence output and locally abort held streams on transient controller unavailability."""
+        inc_key = (sandbox_addr, incarnation_id)
+        with self._meta_lock:
+            active_ids = list(self._active_streams.pop(inc_key, ()))
+            for sid in active_ids:
+                self._unavailable_aborted_streams.add(sid)
+        if not active_ids:
+            return
+        abort_stream = getattr(self._transport, "abort_stream", None)
+        if callable(abort_stream):
+            for sid in active_ids:
+                try:
+                    abort_stream(sid, reason=_ERR_CTRL_UNAVAILABLE)
+                except Exception:
+                    pass
+        else:
+            try:
+                self._transport.abort_incarnation(
+                    sandbox_addr, incarnation_id, reason=_ERR_CTRL_UNAVAILABLE
+                )
+            except Exception:
+                pass
+        self._notify_waiters()
+
+    def _revoke_monitored_target(self, sandbox_addr: str, expected_incarnation_id: str) -> None:
+        watchdog_caller = PrincipalCtx(role=CoordRole.OPERATOR, actor_id="controller-monitor")
+        try:
+            with self._register_lock:
+                if self._shutdown_settled:
+                    return
+                sb = self._registry.get_sandbox(sandbox_addr)
+                if sb is None or sb.incarnation_id != expected_incarnation_id:
+                    return
+                if sb.status == _STATUS_REVOKED:
+                    return
+                self._revoke_unlocked(
+                    watchdog_caller,
+                    target=sandbox_addr,
+                    reason="controller_lease_revoked",
+                )
+        except Exception:
+            self._mark_degraded("controller_monitor_revoke_failed")
+
+    def _ensure_controller_monitor(
+        self, sandbox_addr: str, incarnation_id: str, request_id: str
+    ) -> None:
+        """Ensure a tracked hub controller-grant monitor polls request_id for (addr, inc)."""
+        if request_id.startswith(_EPHEMERAL_LEASE_PREFIX):
+            return
+        if self._controller is None or self._controller_actor is None:
+            raise _AuthorityUnavailableError(_ERR_CTRL_UNAVAILABLE)
+        key = (sandbox_addr, incarnation_id, request_id)
+        with self._meta_lock:
+            if not self._accept_watchdog_spawns or self._shutdown_settled:
+                return
+            existing = self._controller_monitors.get(key)
+            if existing is not None and existing[1].is_alive():
+                return
+            stop_ev = threading.Event()
+            worker = threading.Thread(
+                target=self._run_controller_monitor,
+                args=(stop_ev, sandbox_addr, incarnation_id, request_id),
+                daemon=True,
+            )
+            self._controller_monitors[key] = (stop_ev, worker)
+        worker.start()
+
+    def _run_controller_monitor(
+        self,
+        stop_ev: threading.Event,
+        sandbox_addr: str,
+        incarnation_id: str,
+        request_id: str,
+    ) -> None:
+        key = (sandbox_addr, incarnation_id, request_id)
+        try:
+            while not stop_ev.wait(self._watchdog_interval_s):
+                state = self._probe_controller_request(request_id)
+                if state == _STATUS_REVOKED:
+                    self._revoke_monitored_target(sandbox_addr, incarnation_id)
+                    return
+                if state == _STATUS_UNAVAILABLE:
+                    self._abort_unavailable_target_streams(sandbox_addr, incarnation_id)
+        finally:
+            with self._meta_lock:
+                entry = self._controller_monitors.get(key)
+                if entry is not None and entry[0] is stop_ev:
+                    self._controller_monitors.pop(key, None)
+
+    def _stop_monitors_for_target(self, sandbox_addr: str) -> None:
+        with self._meta_lock:
+            for key, (stop_ev, _thr) in list(self._controller_monitors.items()):
+                if key[0] == sandbox_addr:
+                    stop_ev.set()
+
+    def _stop_all_controller_monitors(self, deadline: float) -> bool:
+        current = threading.current_thread()
+        with self._meta_lock:
+            items = list(self._controller_monitors.items())
+            for _key, (stop_ev, _thr) in items:
+                stop_ev.set()
+        for _key, (_stop_ev, thr) in items:
+            if thr is not current:
+                thr.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._meta_lock:
+            still_alive = [
+                thr
+                for _key, (_ev, thr) in self._controller_monitors.items()
+                if thr is not current and thr.is_alive()
+            ]
+        return not still_alive
 
     @staticmethod
     def _ephemeral_authority_id(lease: BrokerLease) -> str:
@@ -1428,8 +1645,10 @@ class CoordHub:
         with self._meta_lock:
             if (addr, sb.incarnation_id) in self._fenced_targets:
                 raise RevokedError(_ERR_SANDBOX_REVOKED)
-        if not self._check_lease_active(addr, controller_request_id=sb.controller_request_id):
-            raise RevokedError(_ERR_SANDBOX_REVOKED)
+        self._require_authority_status_active(
+            self._check_lease_status(addr, controller_request_id=sb.controller_request_id),
+            _ERR_SANDBOX_REVOKED,
+        )
 
     def _subtree_addrs(self, root_addr: str) -> set[str]:
         all_sbs = self._registry.list_sandboxes()
@@ -1450,6 +1669,7 @@ class CoordHub:
         return target_addr in self._subtree_addrs(ancestor_addr)
 
     def _detach_prior_lease(self, sandbox_addr: str) -> None:
+        self._stop_monitors_for_target(sandbox_addr)
         with self._meta_lock:
             old_lease = self._leases.pop(sandbox_addr, None)
             old_cb = self._lease_callbacks.pop(sandbox_addr, None)
@@ -1458,11 +1678,6 @@ class CoordHub:
                 old_lease.remove_revoke_callback(old_cb)
             try:
                 old_lease.revoke()
-            except Exception:
-                pass
-            try:
-                if getattr(old_lease, _ATTR_WATCH_THREAD, None) is not threading.current_thread():
-                    old_lease.stop_watchdog()
             except Exception:
                 pass
 
@@ -1493,7 +1708,7 @@ class CoordHub:
                         reason="controller_lease_revoked",
                     )
             except Exception:
-                pass
+                self._mark_degraded("lease_watchdog_revoke_failed")
             finally:
                 with self._meta_lock:
                     self._watchdog_threads.discard(threading.current_thread())
@@ -1618,7 +1833,7 @@ class CoordHub:
     def _inspect_lease_controller(
         self, caller: PrincipalCtx, lease: BrokerLease
     ) -> tuple[str | None, Controller | None, Principal | None]:
-        if not lease.is_active():
+        if self._is_lease_locally_revoked(lease):
             raise RevokedError("lease_already_revoked")
         lease_controller = getattr(lease, "_controller", None)
         if (
@@ -1660,8 +1875,10 @@ class CoordHub:
         if clean_req is not None and clean_req.startswith(_EPHEMERAL_LEASE_PREFIX):
             raise CoordValidationError("ephemeral_lease_prefix_reserved")
         if lease is None:
-            if clean_req is not None and not self._check_controller_request_active(clean_req):
-                raise RevokedError("controller_request_not_active")
+            if clean_req is not None:
+                self._require_authority_status_active(
+                    self._probe_controller_request(clean_req), "controller_request_not_active"
+                )
             return clean_req, self._controller, self._controller_actor
         lease_req, eff_controller, eff_actor = self._inspect_lease_controller(caller, lease)
         if clean_req is not None and lease_req is not None and clean_req != lease_req:
@@ -1669,21 +1886,57 @@ class CoordHub:
         effective_req = clean_req if clean_req is not None else lease_req
         if effective_req is None:
             return self._ephemeral_authority_id(lease), eff_controller, eff_actor
-        # Durable authority requires the lease itself to poll the same controller & request ID so
-        # its watchdog can tear down held streams on out-of-band controller revocation.
+        # Durable authority requires the lease itself to carry the same controller & request ID.
         if (
             getattr(lease, "_controller", None) is not eff_controller
             or getattr(lease, _ATTR_LEASE_REQ_ID, None) != effective_req
             or getattr(lease, "_controller_actor", None) is None
         ):
             raise CoordPolicyError("lease_controller_binding_incomplete")
-        if not self._check_controller_request_active(
-            effective_req, controller=eff_controller, actor=eff_actor
-        ):
-            raise RevokedError("controller_request_not_active")
+        self._require_authority_status_active(
+            self._probe_controller_request(
+                effective_req, controller=eff_controller, actor=eff_actor
+            ),
+            "controller_request_not_active",
+        )
         return effective_req, eff_controller, eff_actor
 
     def register_sandbox(
+        self,
+        caller: PrincipalCtx,
+        *,
+        name: str,
+        incarnation_id: str,
+        project_id: str,
+        project_name: str,
+        branch: str,
+        sandbox_type: str = "default",
+        task_brief: str,
+        parent_addr: str | None = None,
+        child_budget: SubtreeBudget | None = None,
+        lease: BrokerLease | None = None,
+        controller_request_id: str | None = None,
+    ) -> SandboxRecord:
+        self._enter_fg_op()
+        try:
+            return self._register_sandbox_tracked(
+                caller,
+                name=name,
+                incarnation_id=incarnation_id,
+                project_id=project_id,
+                project_name=project_name,
+                branch=branch,
+                sandbox_type=sandbox_type,
+                task_brief=task_brief,
+                parent_addr=parent_addr,
+                child_budget=child_budget,
+                lease=lease,
+                controller_request_id=controller_request_id,
+            )
+        finally:
+            self._exit_fg_op()
+
+    def _register_sandbox_tracked(
         self,
         caller: PrincipalCtx,
         *,
@@ -1754,6 +2007,8 @@ class CoordHub:
             self._record_registered_meta(addr.canonical, clean_inc, effective_budget, lease)
             if lease is not None:
                 self._attach_lease_watchdog(addr.canonical, clean_inc, lease)
+            if effective_req_id is not None and not effective_req_id.startswith(_EPHEMERAL_LEASE_PREFIX):
+                self._ensure_controller_monitor(addr.canonical, clean_inc, effective_req_id)
 
         self._registry.append_audit(
             caller.canonical_sender,
@@ -1789,7 +2044,6 @@ class CoordHub:
                 return
             self._lease_callbacks[sandbox_addr] = _cb
         lease.add_revoke_callback(_cb)
-        lease.start_watchdog(poll_interval=self._watchdog_interval_s)
 
     def _enforce_grant_edge_scope(
         self,
@@ -1879,6 +2133,8 @@ class CoordHub:
         lease_request_id: str | None = None,
         grant_generation: int = 1,
     ) -> RoutingEdge:
+        with self._meta_lock:
+            start_rec_gen = self._recovery_generation
         self._require_not_degraded()
         self._require_admin_role(caller, "grant_edge")
         self._verify_caller_live(caller)
@@ -1918,7 +2174,12 @@ class CoordHub:
             grant_generation=grant_generation,
             created_at=time.time(),
         )
-        persisted = self._registry.grant_edge(edge)
+        with self._register_lock:
+            self._require_not_degraded()
+            with self._meta_lock:
+                if self._recovery_generation != start_rec_gen:
+                    raise CoordPolicyError(_ERR_DEGRADED)
+            persisted = self._registry.grant_edge(edge)
         self._registry.append_audit(
             caller.canonical_sender,
             "grant_edge",
@@ -1936,14 +2197,15 @@ class CoordHub:
             raise CoordPolicyError(_ERR_SANDBOX_NOT_FOUND)
         if sandbox.status == _STATUS_REVOKED or self._is_target_fenced(dst_addr, sandbox.incarnation_id):
             raise RevokedError(_ERR_SANDBOX_REVOKED)
-        if not self._check_lease_active(dst_addr, controller_request_id=sandbox.controller_request_id):
-            raise RevokedError(_ERR_SANDBOX_REVOKED)
-        if (
-            lease_request_id is not None
-            and lease_request_id != sandbox.controller_request_id
-            and not self._check_lease_active(dst_addr, controller_request_id=lease_request_id)
-        ):
-            raise RevokedError(_ERR_SANDBOX_REVOKED)
+        self._require_authority_status_active(
+            self._check_lease_status(dst_addr, controller_request_id=sandbox.controller_request_id),
+            _ERR_SANDBOX_REVOKED,
+        )
+        if lease_request_id is not None and lease_request_id != sandbox.controller_request_id:
+            self._require_authority_status_active(
+                self._check_lease_status(dst_addr, controller_request_id=lease_request_id),
+                _ERR_SANDBOX_REVOKED,
+            )
         return sandbox
 
     def _check_rate_limit(self, edge_id: str, rate_limit_rpm: int) -> None:
@@ -1987,8 +2249,10 @@ class CoordHub:
             raise RevokedError(_ERR_EDGE_REVOKED)
         if expected_src_incarnation is not None and src_sb.incarnation_id != expected_src_incarnation:
             raise IncarnationMismatchError("src_incarnation_mismatch")
-        if not self._check_lease_active(sb_addr, controller_request_id=src_sb.controller_request_id):
-            raise RevokedError(_ERR_EDGE_REVOKED)
+        self._require_authority_status_active(
+            self._check_lease_status(sb_addr, controller_request_id=src_sb.controller_request_id),
+            _ERR_EDGE_REVOKED,
+        )
 
     def _check_grant_pins_live_under_fence(
         self,
@@ -2156,6 +2420,8 @@ class CoordHub:
         artifact_blobs: Sequence[bytes] = (),
         artifact_refs: Sequence[ArtifactRef] = (),
     ) -> dict[str, Any]:
+        with self._meta_lock:
+            start_rec_gen = self._recovery_generation
         self._require_not_degraded()
         self._verify_caller_live(caller)
         addr = parse_local_target(target)
@@ -2193,6 +2459,9 @@ class CoordHub:
             all_refs = validated_refs + staged_refs
 
             with fence:
+                with self._meta_lock:
+                    if self._recovery_generation != start_rec_gen:
+                        raise CoordPolicyError(_ERR_DEGRADED)
                 live_edge, _dst_sb = self._verify_grant_live_under_fence(
                     edge.edge_id,
                     expected_gen,
@@ -2266,9 +2535,9 @@ class CoordHub:
         except CoordPolicyError as exc:
             if str(exc) == _ERR_SANDBOX_NOT_FOUND:
                 return "fenced"
-            return "unavailable"
+            return _STATUS_UNAVAILABLE
         except Exception:
-            return "unavailable"
+            return _STATUS_UNAVAILABLE
 
     def _resolve_row_dst_addr(
         self, row: dict[str, Any], env: Envelope | None, edge: RoutingEdge | None
@@ -2300,6 +2569,19 @@ class CoordHub:
             grant_generation=grant_gen,
         )
 
+    def _ensure_turn_controller_monitors(
+        self, dst_addr: str, dst_inc: str, edge: RoutingEdge | None
+    ) -> None:
+        sb = self._registry.get_sandbox(dst_addr)
+        req_ids: set[str] = set()
+        if sb is not None and sb.controller_request_id is not None:
+            req_ids.add(sb.controller_request_id)
+        if edge is not None and edge.lease_request_id is not None:
+            req_ids.add(edge.lease_request_id)
+        for req_id in sorted(req_ids):
+            if not req_id.startswith(_EPHEMERAL_LEASE_PREFIX):
+                self._ensure_controller_monitor(dst_addr, dst_inc, req_id)
+
     def _dispatch_single_row(self, row: dict[str, Any], *, async_stream: bool) -> bool:
         msg_id = str(row["msg_id"])
         edge_id = str(row["edge_id"])
@@ -2326,6 +2608,10 @@ class CoordHub:
                 self._registry.cancel_outbox_row(msg_id, reason="grant_or_incarnation_fenced")
                 return False
             if liveness != "live":
+                return False
+            try:
+                self._ensure_turn_controller_monitors(dst_addr, dst_inc, edge)
+            except _AuthorityUnavailableError:
                 return False
             if not self._registry.mark_outbox_dispatch_started(
                 msg_id, edge_id=edge_id, grant_generation=grant_gen, dst_incarnation=dst_inc
@@ -2442,9 +2728,15 @@ class CoordHub:
         except Exception:
             pass
 
+    def _is_stream_unavailable_aborted(self, stream_id: str) -> bool:
+        with self._meta_lock:
+            return stream_id in self._unavailable_aborted_streams
+
     def _process_single_stream_event(
         self, env: Envelope, stream_id: str, raw_ev: Any
     ) -> tuple[bool, str | None]:
+        if self._is_stream_unavailable_aborted(stream_id):
+            return False, _ERR_CTRL_UNAVAILABLE
         target_fenced = self._is_target_fenced(env.dst_addr, env.dst_incarnation)
         valid_ev = self._validate_untrusted_event(
             raw_ev,
@@ -2477,6 +2769,9 @@ class CoordHub:
         abort_reason: str | None = None
         try:
             for raw_ev in self._transport.stream_events(stream_id):
+                if self._is_stream_unavailable_aborted(stream_id):
+                    abort_reason = _ERR_CTRL_UNAVAILABLE
+                    break
                 if total_seen >= MAX_TURN_STREAM_EVENTS:
                     abort_reason = "stream_event_cap_exceeded"
                     cap_ev = StreamEvent(
@@ -2511,6 +2806,10 @@ class CoordHub:
                 active_set = self._active_streams.get(inc_key)
                 if active_set is not None:
                     active_set.discard(stream_id)
+                if stream_id in self._unavailable_aborted_streams:
+                    self._unavailable_aborted_streams.discard(stream_id)
+                    if abort_reason is None:
+                        abort_reason = _ERR_CTRL_UNAVAILABLE
             self._finalize_stream_outbox(
                 env.msg_id, saw_completed=saw_completed, abort_reason=abort_reason
             )
@@ -2712,8 +3011,10 @@ class CoordHub:
             target_fenced = (addr, sb.incarnation_id) in self._fenced_targets
         if target_fenced:
             raise RevokedError(_ERR_EDGE_REVOKED)
-        if not self._check_lease_active(addr, controller_request_id=sb.controller_request_id):
-            raise RevokedError(_ERR_SANDBOX_REVOKED)
+        self._require_authority_status_active(
+            self._check_lease_status(addr, controller_request_id=sb.controller_request_id),
+            _ERR_SANDBOX_REVOKED,
+        )
 
     def _assert_targets_not_revoked(
         self, caller_actor: str, target_addrs: Sequence[str]
@@ -2803,6 +3104,7 @@ class CoordHub:
         incarnation_id: str | None,
         edges: Sequence[RoutingEdge],
     ) -> tuple[list[tuple[str, str]], BrokerLease | None]:
+        self._stop_monitors_for_target(target_addr)
         with self._meta_lock:
             self._fenced_addrs.add(target_addr)
             inc_set: set[str] = set(self._known_incarnations.get(target_addr, ()))
@@ -2850,11 +3152,6 @@ class CoordHub:
                 lease.revoke()
             except Exception:
                 pass
-            try:
-                if getattr(lease, _ATTR_WATCH_THREAD, None) is not threading.current_thread():
-                    lease.stop_watchdog()
-            except Exception:
-                pass
         return aborted
 
     def _lookup_revoke_metadata(
@@ -2879,12 +3176,14 @@ class CoordHub:
         target: str,
         reason: str = "operator_revoked",
     ) -> RevocationStatus:
-        if self._is_closed():
-            raise CoordPolicyError(_ERR_HUB_CLOSED)
-        with self._register_lock:
-            if self._is_closed():
-                raise CoordPolicyError(_ERR_HUB_CLOSED)
-            return self._revoke_unlocked(caller, target=target, reason=reason)
+        self._enter_fg_op()
+        try:
+            with self._register_lock:
+                if self._is_closed():
+                    raise CoordPolicyError(_ERR_HUB_CLOSED)
+                return self._revoke_unlocked(caller, target=target, reason=reason)
+        finally:
+            self._exit_fg_op()
 
     def _revoke_unlocked(
         self,
@@ -2988,8 +3287,10 @@ class CoordHub:
         with self._meta_lock:
             if (addr, sandbox.incarnation_id) in self._fenced_targets:
                 raise RevokedError(_ERR_SANDBOX_REVOKED)
-        if not self._check_lease_active(addr, controller_request_id=sandbox.controller_request_id):
-            raise RevokedError(_ERR_SANDBOX_REVOKED)
+        self._require_authority_status_active(
+            self._check_lease_status(addr, controller_request_id=sandbox.controller_request_id),
+            _ERR_SANDBOX_REVOKED,
+        )
         has_committed = getattr(self._registry, "has_committed_artifact", None)
         if callable(has_committed) and not has_committed(addr, sandbox.incarnation_id, ref.blob_sha256):
             raise CoordAuthError("artifact_not_committed_to_sandbox_incarnation")

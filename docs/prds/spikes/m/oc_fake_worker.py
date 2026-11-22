@@ -295,6 +295,16 @@ class FakeWorkerTransport:
                 if active_set is not None:
                     active_set.discard(stream_id)
 
+    def abort_stream(self, stream_id: str, *, reason: str) -> bool:
+        """Abort one active stream without permanently revoking its sandbox incarnation."""
+        with self._lock:
+            state = self._streams.get(stream_id)
+        if state is None:
+            return False
+        state.abort_reason = reason
+        state.abort_event.set()
+        return True
+
     def abort_incarnation(
         self, sandbox_addr: str, incarnation_id: str, *, reason: str
     ) -> bool:
