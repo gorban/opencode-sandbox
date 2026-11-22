@@ -24,6 +24,13 @@ check() {  # description, command... ; a leading '!' negates
   if (( r == neg )); then ok "$d"; else bad "$d"; fi
 }
 fn()   { local requested_function=$1; sed -n "/^$requested_function() {/,/^}/p" "$SCRIPT"; }  # extract one function
+host_input_functions() {
+  fn in_sb
+  fn trusted_path
+  fn host_input
+  fn inspect_pg_init
+  printf 'SB=%q\nH=()\n' "$T/pg-sandbox"
+}
 SECRET=TOP-SECRET-HOST-DATA
 
 # ================================================================================================
@@ -41,7 +48,9 @@ cat > "$T/parse.sh" <<EOF
 $(fn trusted_path)
 in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
 die() { echo "\$*" >&2; exit 2; }
-sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T
+$(fn host_input); $(fn inspect_pg_init)
+SB=$T/pg-sandbox H=()
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T CALLER_PWD=$T
 $(fn load_pg_config)
 SCRIPT_DIR=. OC_PG_CONF=$T/pg.env
 load_pg_config
@@ -65,7 +74,9 @@ cat > "$T/parse2.sh" <<EOF
 $(fn trusted_path)
 in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
 die() { echo "\$*" >&2; exit 2; }
-sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T
+$(fn host_input); $(fn inspect_pg_init)
+SB=$T/pg-sandbox H=()
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T CALLER_PWD=$T
 $(fn load_pg_config)
 SCRIPT_DIR=. OC_PG_CONF=$T/pg.env
 load_pg_config; echo "\$PG_PASSWORD"; env > $T/child2.env
@@ -83,7 +94,9 @@ cat > "$T/parse-path.sh" <<EOF
 $(fn trusted_path)
 in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
 die() { echo "\$*" >&2; exit 2; }
-sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T SCRIPT_DIR=.
+$(fn host_input); $(fn inspect_pg_init)
+SB=$T/pg-sandbox H=()
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T CALLER_PWD=$T SCRIPT_DIR=.
 $(fn load_pg_config)
 load_pg_config
 EOF
@@ -100,6 +113,7 @@ check 'Postgres init rejects the filesystem root before inspecting it' ! parse_i
 ln -s "$T/pg.env" "$T/pg-init/01.sql"
 cat > "$T/check-init-tree.sh" <<EOF
 set -euo pipefail
+$(host_input_functions)
 $(fn ensure_postgres)
 PG_INIT=$T/pg-init
 die() { echo "\$*"; exit 2; }
@@ -120,6 +134,7 @@ echo "Postgres password exposure (podman stubbed)"
 PW='S3cr3t-pw:@/#'
 cat > "$T/pg.sh" <<EOF
 set -euo pipefail
+$(host_input_functions)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { echo "==> \$*"; }
@@ -154,6 +169,7 @@ check "signature key is private (0600)"    [ "$(stat -c %a "$T/state/pg-sig.key"
 pgmsg() {  # volume-label -> stderr of ensure_postgres for '-i default' with an existing volume
   cat > "$T/pgm.sh" <<EOF
 set -euo pipefail
+$(host_input_functions)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { :; }; sleep() { :; }
@@ -553,7 +569,24 @@ esac
 exit 0
 EOF
 chmod +x "$T/stub/podman"
-for c in systemctl pkexec sudo semodule distrobox-host-exec; do ln -s podman "$T/stub/$c"; done
+for c in systemctl pkexec sudo semodule; do ln -s podman "$T/stub/$c"; done
+cat > "$T/stub/distrobox-host-exec" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+if [[ $1 == /usr/bin/bash ]]; then
+  args=("$@")
+  # Model a shared-looking path that points into the sandbox on the host only.
+  if [[ ${args[-1]} == "$HOME/guest-only-path" ]]; then
+    args[-1]="$HOME/opencode-sandbox/host-path"
+  fi
+  exec "${args[@]}"
+fi
+case $1 in
+  cat|podman|systemctl) exec "$@" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$T/stub/distrobox-host-exec"
 stubbed() { env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "$SCRIPT" "$@"; }
 del() {  # args... -> log of stubbed commands
   : > "$T/stub.log"
@@ -619,6 +652,13 @@ out=$(pathrun OC_CODE_BIN="$DSB/editor" -- -n)
 check 'sandbox-side editor executable refused' grep -q 'OC_CODE_BIN must be an absolute path outside the sandbox' <<<"$out"
 out=$(pathrun OC_BCOMPARE_BIN=$'/host/editor\nextra' -- -n)
 check 'newline in editor executable refused' grep -q 'OC_BCOMPARE_BIN must be an absolute path outside the sandbox' <<<"$out"
+out=$(pathrun CONTAINER_ID=fixture OC_CODE_BIN="$T/dhome/guest-only-path" -- -n)
+check 'editor path is refused when it enters the sandbox on the host only' \
+  grep -q 'OC_CODE_BIN must be an absolute path outside the sandbox' <<<"$out"
+out=$(pathrun CONTAINER_ID=fixture OC_PG_IMAGE=fixture OC_PG_USER=fixture \
+  OC_PG_PASSWORD=fixture OC_PG_DB=fixture OC_PG_INIT_DIR="$T/dhome/guest-only-path" -- -p -n)
+check 'Postgres init path is refused when it enters the sandbox on the host only' \
+  grep -q 'refusing unsafe host Postgres init directory' <<<"$out"
 ln -s "$T/outer"$'\n' "$T/path-linebreak"
 out=$(pathrun XDG_DATA_HOME="$T/path-linebreak" -- -l)
 check 'line break in symlink target refused before path splitting' grep -q 'refusing to use' <<<"$out"

@@ -109,7 +109,10 @@ def main(scratch):
     state = scratch / 'state'; state.mkdir()
     registry = scratch / 'ids'; registry.write_text('')
     script = scratch / 'exercise.sh'
-    shell_functions = '\n'.join(source_function(n) for n in ('pg_sig', 'urlenc', 'pgpass_field', 'create_pg_auth_secrets', 'ensure_postgres'))
+    shell_functions = '\n'.join(source_function(n) for n in (
+        'in_sb', 'trusted_path', 'host_input', 'inspect_pg_init',
+        'pg_sig', 'urlenc', 'pgpass_field', 'create_pg_auth_secrets', 'ensure_postgres',
+    ))
     script.write_text('''#!/usr/bin/env bash
 set -euo pipefail
 H=(); if [[ -n ${CONTAINER_ID:-} ]]; then H=(distrobox-host-exec); fi
@@ -127,7 +130,7 @@ log() { :; }
 ''' + shell_functions + '''
 STATE=$TEST_STATE POD=$TEST_POD PGC=$TEST_PGC PGVOL=$TEST_VOL
 PGSECRET=$TEST_RAW PGPASSSECRET=$TEST_PASS PGHBASECRET=$TEST_HBA
-PG_INIT=$TEST_INIT INST= ILABEL=$TEST_OWNER PG_IMAGE=$TEST_IMAGE
+SB=$STATE/sandbox PG_INIT=$TEST_INIT INST= ILABEL=$TEST_OWNER PG_IMAGE=$TEST_IMAGE
 PG_USER=pgtest PG_DB=pgtest PG_PASSWORD='fixture:password\\value' PORTS=("$TEST_PORT:5432")
 ensure_postgres
 ''')

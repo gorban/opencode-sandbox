@@ -94,7 +94,9 @@ die() { echo "${0##*/}: $*" >&2; exit 2; }
 # outside $SB, which the agent cannot change, remain; the walked physical path is used from then on.
 # The locations must not contain $SB either (-d -a deletes $STATE). Done before anything is touched.
 sb_real=$(realpath -m -- "$SB")
-in_sb() { [[ $1/ == "$sb_real"/* ]]; }
+in_sb() {
+  [[ $1/ == "$sb_real"/* ]]
+}
 trusted_path() {  # absolute path -> its physical path on stdout; 1 if the walk enters $SB
   local cur="" comp next t n=0 todo=() tc=()
   [[ $1 == /* && $1 != *$'\n'* && $1 != *$'\r'* ]] || return 1
@@ -255,6 +257,47 @@ else
 fi
 pm() { "${H[@]}" podman "$@"; }
 sc() { "${H[@]}" systemctl --user "$@"; }
+
+host_input() { # resolve paths in the same filesystem that Podman and systemd use
+  local checks
+  checks=$(declare -f in_sb trusted_path inspect_pg_init) || return 1
+  "${H[@]}" /usr/bin/bash -p -c "$checks"$'\n''
+    set -euo pipefail
+    PATH=/usr/bin:/bin
+    sb_real=$(realpath -m -- "$1")
+    path=$(trusted_path "$3")
+    case $2 in
+      editor) printf "%s\n" "$path" ;;
+      postgres-path|postgres-init)
+        [[ $sb_real/ != "${path%/}"/* && $path != *:* ]] || {
+          echo "unsafe Postgres init directory" >&2; exit 1;
+        }
+        printf "%s\n" "$path"
+        if [[ $2 == postgres-init ]]; then inspect_pg_init "$path"; fi ;;
+      *) exit 2 ;;
+    esac
+  ' _ "$SB" "$@"
+}
+
+inspect_pg_init() { # host only; output the existing digest, or no line for an absent or empty tree
+  local dir=$1 entries invalid owner_id digest
+  [[ -e $dir ]] || return 0
+  [[ -d $dir ]] || { echo "Postgres init path is not a directory" >&2; return 1; }
+  entries=$(find "$dir" -mindepth 1 -printf x -quit) || return 1
+  [[ -n $entries ]] || return 0
+  owner_id=$(id -u) || return 1
+  invalid=$(find "$dir" \( ! -type d ! -type f -o -type f -links +1 \
+    -o \( ! -uid "$owner_id" ! -uid 0 \) -o -perm /022 \) -printf x -quit) || return 1
+  [[ -z $invalid ]] || {
+    echo "Postgres init requires ordinary owner-controlled directories and files without links" >&2
+    return 1
+  }
+  # A directory-only tree keeps the digest of an empty stream.
+  digest=$(cd "$dir" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum | sha256sum | cut -c1-16) \
+    || return 1
+  printf '%s\n' "$digest"
+}
+
 safe_run() { pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
   --security-opt=label=disable -v "$SB":/sandbox "$@"; }
 
@@ -712,9 +755,8 @@ load_pg_config() {
     [[ $v != *$'\n'* && $v != *$'\r'* ]] || die "Postgres user, password and database must not contain newlines"
   done
   PG_INIT=${OC_PG_INIT_DIR:-$cdir/postgres-init}
-  [[ $PG_INIT == /* ]] || PG_INIT="$CALLER_PHYSICAL/$PG_INIT"
-  PG_INIT=$(trusted_path "$PG_INIT") || die "refusing sandbox-controlled Postgres init directory"
-  [[ $sb_real/ != "${PG_INIT%/}"/* && $PG_INIT != *:* ]] || die "unsafe Postgres init directory"
+  [[ $PG_INIT == /* ]] || PG_INIT="$CALLER_PWD/$PG_INIT"
+  PG_INIT=$(host_input postgres-path "$PG_INIT") || die "refusing unsafe host Postgres init directory"
 }
 
 # ---- teardown -----------------------------------------------------------------
@@ -812,8 +854,8 @@ fi
 
 if (( PG )); then load_pg_config; fi   # fail early, before building or starting anything
 BRIDGE_SRC=$(trusted_file "$SCRIPT_DIR/oc-bridge.py") || die "missing or unsafe oc-bridge.py beside the launcher"
-CODE_BIN=$(trusted_path "$CODE_BIN") || die "OC_CODE_BIN must be an absolute path outside the sandbox"
-BC_BIN=$(trusted_path "$BC_BIN") || die "OC_BCOMPARE_BIN must be an absolute path outside the sandbox"
+CODE_BIN=$(host_input editor "$CODE_BIN") || die "OC_CODE_BIN must be an absolute path outside the sandbox"
+BC_BIN=$(host_input editor "$BC_BIN") || die "OC_BCOMPARE_BIN must be an absolute path outside the sandbox"
 OPENCODE_VERSION=${OC_OPENCODE_VERSION:-}
 if [[ -n $OPENCODE_VERSION && $OPENCODE_VERSION != keep && ! $OPENCODE_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]]; then
   die "OC_OPENCODE_VERSION must be keep or a version such as 2.3.0"
@@ -1268,23 +1310,15 @@ create_pg_auth_secrets() {
     pm secret create --replace "$PGPASSSECRET" - >/dev/null || return 1
 }
 ensure_postgres() {
-  local pg_state pg_cfg want_cfg sig legacy vsig init_hash="" ok=0 p invalid files owner_id
-  local pgargs=()
-  if [[ -d $PG_INIT ]] && [[ -n $(ls -A "$PG_INIT" 2>/dev/null) ]]; then
-    owner_id=$(id -u) || die "could not determine Postgres init owner"
-    invalid=$(find "$PG_INIT" \( ! -type d ! -type f -o -type f -links +1 \
-      -o \( ! -uid "$owner_id" ! -uid 0 \) -o -perm /022 \) -printf x -quit) \
-      || die "could not inspect the Postgres init directory"
-    [[ -z $invalid ]] || die "Postgres init requires ordinary owner-controlled directories and files without links"
-    files=$(find "$PG_INIT" -type f -printf x -quit) || die "could not inspect the Postgres init directory"
-    if [[ -n $files ]]; then
-      init_hash=$(cd "$PG_INIT" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum | sha256sum | cut -c1-16) \
-        || die "could not hash Postgres init files"
-    else
-      # Keep the existing signature for a nonempty tree containing only directories.
-      init_hash=$(sha256sum </dev/null | sha256sum | cut -c1-16)
-    fi
-    pgargs+=(-v "$PG_INIT:/docker-entrypoint-initdb.d:ro,Z")
+  local pg_state pg_cfg want_cfg sig legacy vsig init_hash ok=0 p init
+  local pgargs=() init_fields=()
+  init=$(host_input postgres-init "$PG_INIT") || die "could not inspect the host Postgres init directory"
+  mapfile -t init_fields <<<"$init"
+  init_hash=${init_fields[1]:-}
+  [[ ${init_fields[0]:-} == /* && ${#init_fields[@]} -le 2 && $init_hash =~ ^([0-9a-f]{16})?$ ]] \
+    || die "invalid host Postgres init metadata"
+  if [[ -n $init_hash ]]; then
+    pgargs+=(-v "${init_fields[0]}:/docker-entrypoint-initdb.d:ro,Z")
   fi
   # Postgres only reads user/password/db/init scripts when the data volume is first created, so the
   # volume remembers the settings it was created with; a mismatch is refused instead of silently ignored.

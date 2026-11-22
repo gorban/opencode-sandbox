@@ -62,7 +62,8 @@ literally, for example a password containing ` #`.
 **Optional first-start SQL.** Files in `~/.config/oc-sandbox/postgres-init/` (or the directory in
 `OC_PG_INIT_DIR`) run once, when the data volume is first created, as the standard
 `/docker-entrypoint-initdb.d` mechanism. A relative override is resolved from the calling
-directory. Use a dedicated directory outside the sandbox and keep its parent directories under
+directory. Path checks and content hashing run on the Podman host, including when invoked
+from Distrobox. Use a dedicated directory outside the sandbox and keep its parent directories under
 trusted control so the path cannot be replaced during setup. The init tree must be owned by you
 or root, with no group or world write access. Podman applies a private SELinux label to the init
 directory on mount. See
