@@ -35,6 +35,7 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 | [prd_i](prd_i.md) | OpenCode orchestrator and sandbox fleet | proposed; host-only Claude routing spike open |
 | [prd_j](prd_j.md) | Host configuration and bridge merge tool preferences | proposed; TOML and editor design deferred |
 | [prd_k](prd_k.md) | Contributor checks and repository layout | local CI and documentation PoCs human-approved; hosted qualification and final review open |
+| [prd_l](prd_l.md) | Composable sandbox config, host providers, comm adapters, and orchestrator config MCP | proposed; Gate 1 review and spike PoC open |
 
 The imported findings are evidence, not production implementation:
 
