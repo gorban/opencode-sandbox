@@ -18,6 +18,12 @@ reservation explicitly in this index.
 
 - [*] PRD M first PoC — local worker addressing, orchestration, and thread projection
   ([M first PoC split](prd_m.md#first-poc-split)) — **PRD M coordination**.
+- [*] PRD N planning & initial workflow/supervision slices — first-class `workflow@1`,
+  host-authoritative metrics, zero-authority System-1 + blind verification supervision,
+  three-tier Human Inbox, and declarative `oc-ui@1` surfaces
+  ([N milestones](prd_n.md#phased-milestones-and-ownership)) — **PRD N workflows & supervision**
+  *(builds on the in-progress `[*] PRD M coordination` slice; re-coordinate ownership at the
+  start of the next phase)*.
 
 Coordinate SSH fixtures and remote acceptance with **Warm worker seeding**
 (`codex/warm-worker-seeding`). That workstream owns [I5](prd_i5.md) warm-start
@@ -58,6 +64,7 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 | [prd_k](prd_k.md) | Contributor checks and repository layout | local CI and documentation PoCs human-approved; hosted qualification and final review open |
 | [prd_l](prd_l.md) | Composable sandbox config, host providers, comm adapters, and orchestrator config MCP | offline spike PoC slice human-approved; external secret isolation ([prd_l1](prd_l1.md)), production port, and final review open |
 | [prd_m](prd_m.md) | Model telemetry (5h/7d quotas & reasoning variants), cross-model orchestration, and unified Tauri/web control plane | proposed; Gate 1 external security review cleared; open decisions & human review pending |
+| [prd_n](prd_n.md) | First-class long-running workflows (`workflow@1`), host metrics, zero-authority System-1 + blind-check supervision, non-blocking Human Inbox, and declarative `oc-ui@1` dashboard surfaces | proposed; Rank #1 direction selected; Gate 1 review, open decisions & human review pending |
 
 The imported findings are evidence, not production implementation:
 
