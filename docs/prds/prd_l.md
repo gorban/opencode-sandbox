@@ -21,6 +21,18 @@ At the same time, give the restricted **`oc-sandbox orchestrate` (`-o`)** agent 
 configuration-management capabilities via typed MCP tools and curated base Skills — **without**
 granting generic host filesystem, shell, Podman, or SSH access.
 
+## Coordination with active workstreams and open PRD choices
+
+- **Warm worker seeding (`codex/warm-worker-seeding` / [prd_i5](prd_i5.md)):** Tier-2 dependency
+  seeding, OCI provenance verification, and cache-aware placement remain owned by `prd_i5`. This
+  PRD consumes `prd_i5`'s digest-pinned image/seed layer contracts without duplicating or altering
+  `prd_i5.md`.
+- **Open choices in [prd_i1](prd_i1.md) and [prd_j](prd_j.md):** This spike PoC uses an
+  append-only, file-backed monotonic revision journal under an explicit `--config-dir` (pure Python
+  stdlib, zero new dependencies) so it does not prematurely force `prd_i1`'s SQLite-vs-Git profile
+  history choice or `prd_j`'s plain-editor-vs-TUI choice; the store interface stays cleanly
+  pluggable behind a `ConfigStore` protocol.
+
 ## Architecture: 3-Axis Compiler Model
 
 ```mermaid
@@ -33,7 +45,7 @@ flowchart LR
     end
 
     subgraph COMP["Trusted Host Compiler (Pure Python, Inert, Zero Side Effects)"]
-        DAG["Capability & [local] DAG Resolver + Conflict/Port Checker"]
+        DAG["Capability & [local] DAG Resolver + Fallback & Port Checker"]
         POL["Endpoint Policy Engine + Role Contract Compiler"]
         IR["Immutable Resolved Plan IR (plan.lock.json + plan_digest)"]
         ST --> DAG
@@ -53,32 +65,56 @@ flowchart LR
 
 ### Axis 1: Workload (Named Sandbox Types, Bundles, Services)
 
-- **Inert `schema_version = 1` TOML by default**, with an optional **host-trusted lazy Python
-  `file.py:factory`** (`version = 1`) for complex services, custom sandbox types, or custom host
-  providers.
+- **Inert `schema_version = 1` TOML by default**, with an optional **host-only registered Python
+  factory (`factory_id`)** for complex built-in or host-installed services and providers.
 - Discovery, `--help`, `plan`, and validation read **only** declarative TOML; zero Python executes
-  until runtime activation. Python factories are loaded exclusively from host-trusted directories
-  (`<repo>/cfg/builtin/` or `~/.config/oc-sandbox/`, verified by `trusted_path` + ancestor walk +
-  `O_NOFOLLOW` fd-only byte capture + size cap per [prd_i4a](prd_i4a.md), zero TOCTOU).
+  until runtime activation. Mutable workload TOML (`sandbox-type`, `bundle`, `service`) **never**
+  accepts a raw `file.py:factory` path — it may reference only an opaque `factory_id` mapped by a
+  separate host-only registry (`factories.toml`, outside orchestrator MCP reach), whose files are
+  loaded exclusively from host-trusted directories (`<repo>/cfg/builtin/` or
+  `~/.config/oc-sandbox/`, verified via `trusted_path` + ancestor walk + `O_NOFOLLOW` fd-only byte
+  capture + size cap per [prd_i4a](prd_i4a.md), zero TOCTOU).
 - **Recursive Capability DAG with `api-agent`-style `[local]` Conditional Acquisition:**
   - Services (`service@1`) declare `provides` (e.g., `cap:db.postgres@17.4`), `requires` (e.g.,
-    `cap:db.postgres@^17`), `cardinality` (`singleton` | `named-instance`), `readiness_probe`,
-    `endpoints[]`, `volumes[]`, `secret_slots[]`, `resources` (`memory`, `pids_limit`), and
-    `security_profile` (`standard` | `elevated-nested` | `desktop-wayland`).
-  - A tool or bundle declaring a `[local]` service branch (e.g., `myapp/api` requiring
-    `cap:db.postgres@^17`) pulls in the local API and its transitive Postgres **only** when no
-    remote `API_ENDPOINT` is supplied.
-  - A bundle with **0 MCP tools** can unconditionally declare `requires_services = ["builtin/postgres"]`
-    so the sandbox has Postgres running with `PGPASSFILE`/`DATABASE_URL` ready for app development.
-  - Cycles, unsatisfied capabilities, incompatible version constraints, duplicate pod ports, and
-    silent overwrites fail closed at compile time unless resolved explicitly via
-    `[composition] replace = [...]` or named service aliases (e.g., `pg-primary` vs. `pg-analytics`).
-- **Built-in Service Modules replace hardcoded flags:** `builtin/postgres` (preserving 100% of
-  [prd_a](prd_a.md) SCRAM `hba_file`, `PGPASSFILE` `mode=0600` secret, HMAC-keyed `oc.pgcfg` volume
-  signature, and `5432` auth gate), `builtin/dind` (`security_profile = "elevated-nested"`),
-  `builtin/chromium-wayland` (local desktop), and `builtin/chromium-managed-cdp` (managed/remote).
-  Legacy CLI flags (`-p`, `-D`, etc.) are dropped cleanly in the reworked CLI (single-user clean
-  slate; existing volume naming compatibility is preserved where configured).
+    `cap:db.postgres@^17`), `cardinality` (`singleton` | `named-instance`), `image` (digest-pinned
+    `@sha256:<64hex>`), `readiness_probe`, `endpoints[]`, `volumes[]` (named volumes, `tmpfs`, or
+    digest-pinned RO image mounts ONLY — **never** arbitrary host bind-mount paths in mutable
+    declarative specs), `secret_slots[]`, `env` (strictly filtered, see M8), `resources` (`memory`,
+    `pids_limit`), and `security_profile` (`standard` < `desktop-wayland` < `elevated-nested`).
+  - **Active-root `[local]` pruning & remote endpoint validation:** A tool or bundle declaring a
+    `[local]` service branch (e.g., `myapp/api` requiring `cap:db.postgres@^17`) adds `myapp/api` as
+    a root only when its remote endpoint binding (`API_ENDPOINT`) is blank. When a remote endpoint is
+    bound, that `[local]` root edge is omitted: shared transitive dependencies (e.g.,
+    `builtin/postgres`) remain active if another active root still requires them, and are pruned if
+    unreachable from all active roots. Externally bound remote endpoints are validated against scheme
+    (`https` by default; `http` only via explicit host policy) and host policy (rejecting loopback
+    `127.0.0.0/8`, `::1`, link-local `169.254.0.0/16`, `fe80::/10`, cloud metadata, and host-gateway
+    addresses unless explicitly allowlisted by host policy), and the canonical remote binding is
+    included in `plan_digest` and `security_delta`.
+  - **0-MCP service bundles:** A bundle with `mcp = []` can unconditionally declare
+    `requires_services = ["builtin/postgres"]` so the sandbox has Postgres running with
+    `PGPASSFILE`/`DATABASE_URL` ready for app development.
+  - **Deterministic provider/fallback selection, diamonds, and named instances:**
+    - Provider matching and explicit `fallback_service` selection run **inside** DAG resolution
+      (before Kahn topological sort, diamond unification, and port-collision validation).
+    - If multiple services satisfy a capability without an explicit `provider` / `instance` pin,
+      compilation **fails closed** (never relying on filesystem or dictionary iteration order).
+    - A fallback service is rejected if it has a higher `security_profile` rank or wider
+      `max_exposure` than the primary service.
+    - `cardinality = "named-instance"` services (e.g., `pg-primary`, `pg-analytics`) declare an
+      explicit `instance_port` (bound in the Plan IR) and consumers bind explicitly via
+      `{capability = "cap:db.postgres@^17", instance = "pg-analytics"}` so pod ports never collide
+      and wiring is unambiguous.
+    - Cycles, unsatisfied capabilities, incompatible version diamonds, duplicate pod ports, and
+      silent overwrites fail closed at compile time unless resolved explicitly via
+      `[composition] replace = [...]` (which cannot weaken or replace `builtin/*` security
+      invariants).
+- **Built-in Service Modules (`builtin/*`, strictly immutable/non-overridable via orchestrator):**
+  `builtin/postgres` (preserving 100% of [prd_a](prd_a.md) SCRAM `hba_file`, `PGPASSFILE`
+  `mode=0600` secret, HMAC-keyed `oc.pgcfg` volume signature, and `5432` auth gate), `builtin/dind`
+  (`security_profile = "elevated-nested"`), `builtin/chromium-wayland` (local desktop), and
+  `builtin/chromium-managed-cdp` (managed/remote). Legacy CLI flags (`-p`, `-D`, etc.) are dropped
+  cleanly in the reworked CLI.
 
 ### Axis 2: Runtime Engine (`host-provider@1`)
 
@@ -92,14 +128,15 @@ flowchart LR
 - Every Runtime Engine advertises a **Capability Manifest** (`arch`, `os`, `supports_pods`,
   `supports_pasta`, `supports_image_mounts`, `supports_reflink`, `supports_wayland`,
   `supports_dind`, `multi_tenant_loopback`). The compiler fails closed at plan time if a Sandbox
-  Type demands an unsupported capability (unless an explicit fallback module is declared).
+  Type demands an unsupported capability (unless a validated, non-escalating `fallback_service`
+  satisfies it during DAG resolution).
 
 ### Axis 3: Communication Adapter (`transport@1`)
 
 - Exposes four narrow typed primitives:
   1. `exec_bounded(argv, stdin_stream, max_stdout, timeout)` — zero remote shell interpolation.
   2. `open_reverse_channel(local_host_uds) -> remote_endpoint` — bridges host-only
-     `oc_llm_broker.py` or Tier-1 caching proxy UDS into the worker.
+     `oc_llm_broker.py` or Tier-1 reverse-proxy mirror UDS into the worker.
   3. `transfer_blob(digest, stream, direction)` — bounded, digest-verified transfers for Git
      bundles/artifacts ([prd_i5](prd_i5.md)).
   4. `attach_session(target_id, mode)` — PTY/tmux or browser arbiter stream ([prd_i2](prd_i2.md)).
@@ -116,13 +153,22 @@ v2 primitives** staged read-only under `/run/oc-config/`:
 | Artifact | Merge Rule | Compiled Target in `/run/oc-config/` |
 |---|---|---|
 | **Primary Persona** | **Singular (non-merging).** One standing mission, authority posture, and completion rubric per sandbox. Conflicting primary personas fail compile unless `[composition] replace = ["persona"]`. | `agents/<name>.md` (`default_agent` in `opencode.json`) + concise `MISSION.md`. Additional bundle personas register as callable `subagent`s. |
-| **Standing Invariants** | Topological post-order deduplicated list, byte-capped (e.g., 16 KiB total), optional symlink-confined `{{slot}}` templates (`api-agent` `[prompt_slots]`). | `instructions/<nn>-<bundle>.md` referenced in `opencode.json` `instructions` array (appends without replacing OpenCode's core prompt). |
+| **Standing Invariants** | Topological post-order deduplicated list, byte-capped (16 KiB total), optional single-pass `{{slot}}` templates (see below). | `instructions/<nn>-<bundle>.md` referenced in `opencode.json` `instructions` array (appends without replacing OpenCode's core prompt). |
 | **Services Inventory** | Auto-synthesized fact table from resolved Plan IR (never drifts). | `SERVICES.md` (included in `instructions`). |
 | **Skills (0..N)** | Set union (conflict on identical skill ID fails closed). | `skills/<name>/SKILL.md` (progressive disclosure; 0 tokens until invoked). |
-| **MCPs (0..N)** | Strict map merge + **Role-Filtered Tool Surface** (persona can narrow allowed tools, e.g., read-only DB queries for a reviewer). | `opencode.json` `mcp` map; secrets strictly via `{file:/run/secrets/<name>}`. |
+| **MCPs (0..N)** | Strict map merge + **Role-Filtered Tool Surface** (persona can narrow allowed tools, e.g., read-only DB queries for a reviewer). | `opencode.json` `mcp` map; secrets strictly via typed `{file:/run/secrets/<slot>}`. |
 
-In `managed` tier, workspace `./opencode.json` and `.opencode/` plugins are locked out so untrusted
-repos in `~/opencode-sandbox` cannot override broker routing, MCP permissions, or persona rules.
+- **Safe `{{slot}}` expansion:** Slot files must live strictly inside the declaring host-trusted
+  bundle directory, opened with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` + `fstat` (`S_ISREG`,
+  `st_uid == euid`, `st_mode & 0o022 == 0`, `st_nlink == 1`, size <= 16 KiB), and expanded in a
+  **single non-recursive regex pass** (never `str.format`, never re-expanding `{{...}}` tokens
+  appearing inside slot content).
+- **Managed-tier workspace lockout (explicit assumption to verify against real OpenCode v2):** In
+  `managed` tier, we assume OpenCode v2 can be configured/launched to ignore workspace
+  `./opencode.json` and `.opencode/` plugins so untrusted repos in `~/opencode-sandbox` cannot
+  override broker routing, MCP permissions, or persona rules. Verifying the exact OpenCode v2 flags
+  and precedence behavior against a live container is out of scope for the offline spike PoC and is
+  a required qualification check before production managed-tier launch.
 
 ## Compiled Workload `mise`, Base Images, and Minimal Worker Bootstrap
 
@@ -131,7 +177,8 @@ repos in `~/opencode-sandbox` cannot override broker routing, MCP permissions, o
     workstation (`MISE_PARANOID=1`, scrubbed inherited `MISE_*`).
   - Workload `mise` comes strictly from constrained data-only `executables.toml` manifests inside
     host-trusted bundles (exact pinned `[tools]` only; max 64 manifests / 64 tools; no `[hooks]`,
-    `[env]`, or `[tasks]`; version conflicts fail closed unless overridden in the leaf Sandbox Type).
+    `[env]`, or `[tasks]`; no moving channels such as `latest` or ranges; version conflicts fail
+    closed unless overridden in the leaf Sandbox Type).
 - **Compile-time lock merging -> Immutable RO OCI Toolchain Image:**
   - `oc-sandbox config lock` merges `executables.toml` pins into a multi-platform `mise.lock`
     (`linux-x64`, `linux-arm64`), verified with `lockcmp.py`, and builds a content-addressed
@@ -140,8 +187,8 @@ repos in `~/opencode-sandbox` cannot override broker routing, MCP permissions, o
     (0ms startup, zero base-image rebuilds across tool combinations, unpoisonable), with automatic
     `COPY --from=` fallback for engines without image mounts.
 - **Base Containerfile & post-install hooks:** Base images are digest-pinned (`@sha256:...`).
-  Optional `mise` post-install hooks are allowed **only** from host-trusted profiles/bundles and run
-  **strictly inside an offline, networkless, credential-free Phase-2 builder container**
+  Optional `mise` post-install hooks are host-only (never mutable via orchestrator MCP proposals)
+  and run **strictly inside an offline, networkless, credential-free Phase-2 builder container**
   ([prd_i5](prd_i5.md)), hashed into the image cache key — never on the host.
 - **Minimal zero-trust remote worker TCB:** Remote SSH/Tailcat workers do **not** require host
   `mise` — only rootless `podman` (or `podman machine`) and hardened `sshd` (`GatewayPorts no`) /
@@ -152,16 +199,19 @@ repos in `~/opencode-sandbox` cannot override broker routing, MCP permissions, o
 
 Shared writable package caches across sandboxes are prohibited (cross-sandbox poisoning and private
 package disclosure). Self-hosted Artifactory/Nexus is out of scope as a managed component (pointing
-at an *existing external* Artifactory URL via config is supported).
+at an *existing external* Artifactory URL via config is supported). *(Both tiers are documented
+for architectural completeness and are out of scope for the offline spike PoC.)*
 
-1. **Tier 1 (Default, Universal):** A lightweight host/worker **read-through caching and
-   auth-injecting HTTP forward proxy** (reachable only over `pasta -T` / internal socket; `GET`-only
-   from sandboxes; caches immutable `.tgz`/`.whl`/`.crate`/`.nupkg` blobs from allowlisted upstreams
-   verified by client lockfiles; holds private registry credentials strictly on the host side;
-   partitioned by job grant scope). Accelerates partial lockfile diffs across all ecosystems.
-2. **Tier 2 (Hot-Path Acceleration, coordinated with [prd_i5](prd_i5.md)):** Content-addressed
-   immutable materialized dependency layers built offline via Tier 1, mounted locally via Podman
-   `:O` overlay or Btrfs reflink and promoted to signed OCI Image Volumes for remote/cloud workers.
+1. **Tier 1 (Default, Universal):** A lightweight host/worker **reverse-proxy registry mirror**
+   (plain HTTP on `pasta -T` / internal UDS configured via ecosystem index URLs such as
+   `NPM_CONFIG_REGISTRY`, `UV_INDEX_URL`, `CARGO_REGISTRIES_*`; **zero TLS MITM** — the host proxy
+   originates verified TLS to allowlisted upstreams, validates redirects, exposes `GET`/`HEAD` only
+   to sandboxes, caches immutable `.tgz`/`.whl`/`.crate`/`.nupkg` blobs verified by client lockfiles,
+   injects private registry credentials strictly on the host side, and partitions private-registry
+   cache entries by job grant scope).
+2. **Tier 2 (Hot-Path Acceleration, owned by [prd_i5](prd_i5.md)):** Content-addressed immutable
+   materialized dependency layers built offline via Tier 1, mounted locally via Podman `:O` overlay
+   or Btrfs reflink and promoted to signed OCI Image Volumes for remote/cloud workers.
 
 ## Universal Capability-Scoped Endpoint Policy Engine
 
@@ -177,6 +227,9 @@ Every `service@1` declares its `endpoints[]` (`name`, `port`, `protocol`, `defau
   enforcer is attached and its authenticated `readiness_probe` passes.
 - `tls_policy = "required-when-ca-ready"` automatically wires [prd_e](prd_e.md)/[prd_e3](prd_e3.md)
   instance leaf certificates when the constrained host CA is active.
+- **`host_url_template` hardening:** Accepts only closed schemes (`http`, `https`, `postgresql`,
+  `redis`, `tcp`) and closed placeholders (`{host}`, `{port}`, `{user}`, `{db}`, `{path}`) with
+  strict URL percent-encoding; password placeholders are permanently forbidden.
 
 ## Reworked Clean-Slate CLI Interface
 
@@ -197,41 +250,84 @@ generic host file reads/writes, shell, Podman socket, SSH agent, or raw secret a
 
 ### Typed Host Config MCP Surface (Over Private `0o700` UDS)
 
-- Connected via a helper-owned `0o700` Unix domain socket verifying kernel `SO_PEERCRED` against the
-  orchestrator sandbox identity, with strict per-message byte caps (256 KiB), rate limits, and
-  closed method allowlist.
-- **Read-only MCP tools (opaque registered IDs only — never raw filesystem paths):**
-  - `config_list(kind, include_archived=false, cursor, limit)` — lists sandbox types, bundles,
-    services, workers, and host providers (returns secret **presence/ref metadata only**, never
-    secret values).
-  - `config_get(kind, id)` — returns the validated TOML/Markdown document and current revision hash.
+- **Defense-in-depth peer authentication:**
+  - Helper creates a fresh per-incarnation `0o700` socket directory under
+    `$XDG_RUNTIME_DIR/oc-sandbox/orch-<incarnation>/mcp.sock` mounted/exposed exclusively to the
+    orchestrator sandbox.
+  - Helper generates a fresh **per-incarnation 256-bit random session token** delivered to the
+    orchestrator via a `mode=0400` secret mount and verified in constant time
+    (`hmac.compare_digest`) on every request; restarting the helper rotates the incarnation and
+    token so stale/replayed authority fails closed.
+  - Helper additionally verifies kernel `SO_PEERCRED` (`uid == expected_uid`, plus `gid`/`pidfd`
+    or sandbox cgroup/SELinux peer checks in production; in the offline single-host PoC test
+    harness, verifies `uid == os.geteuid()` plus the per-incarnation session token and restart
+    rotation).
+- **Strict framing, bounds, and JSON rules:**
+  - `Content-Length: <n>\r\n\r\n<json>` framing over UDS; max frame `256 KiB`; per-read timeout
+    (5s) and overall request deadline (15s); max 8 concurrent connections; per-client rate limiter.
+  - Strict JSON parser rejecting duplicate keys (`object_pairs_hook`), `NaN`/`Infinity`, unpaired
+    surrogates, nesting depth > 32, and trailing/pipelined junk bytes.
+- **Exact opaque ID grammar:**
+  - Every object ID must match `^[a-z0-9][a-z0-9_-]{0,31}(/[a-z0-9][a-z0-9_-]{0,31})?$` (at most
+    one `/` namespace separator, no leading/trailing `/`, no `//`, no `..`, max 65 chars).
+  - Namespace `builtin/*` is strictly **read-only and non-overridable**.
+- **Closed read-only vs. mutable kind allowlists:**
+  - `READABLE_ORCHESTRATOR_KINDS = ("sandbox-type", "bundle", "service", "worker", "host-provider", "transport")`
+    (returns redacted metadata only — no host filesystem paths, no raw secrets, no private worker
+    IPs/hostnames beyond registered logical name/arch/capabilities).
+  - `MUTABLE_ORCHESTRATOR_KINDS = ("sandbox-type", "bundle", "service")` — **strict allowlist**
+    (all other kinds — `worker`, `host-provider`, `transport`, `factory`, `known_hosts`, `manager`,
+    `policy` — are permanently refused to orchestrator mutations).
+  - Additional orchestrator-proposal prohibitions: cannot modify or shadow `builtin/*`; cannot
+    register a service claiming a `builtin/*` capability with weakened `requires_auth`,
+    `auth_enforcer`, or `max_exposure`; cannot specify `file.py:factory` paths, host bind mounts,
+    unpinned container images (missing `@sha256:`), arbitrary shell `post_install_hooks`, or
+    arbitrary host-path MCP commands.
+- **Read-only MCP tools:**
+  - `config_list(kind, include_archived=false, cursor=None, limit=50)` — bounded `limit` (1..100)
+    and validated opaque `cursor`; secret presence/ref metadata only.
+  - `config_get(kind, id)` — returns validated TOML/Markdown document and monotonic revision number.
   - `config_schema(kind)` — returns `schema_version = 1` schema, built-in capabilities, and valid
     enum values.
-  - `plan_preview(spec_or_draft)` — compiles an existing or proposed draft config through the pure
-    Plan Compiler and returns `plan_digest`, resolved DAG, security elevations, exposed endpoints,
-    and drift classification (zero side effects).
-  - `config_diff(kind, id, from_rev, to_rev)` and `config_history(kind, id)`.
-- **Human-gated mutation MCP tool (`config_propose_revision`):**
-  - Validates the complete proposed TOML/Markdown against `schema_version = 1`, rejects unknown keys
-    and raw secrets, rejects host-path escapes, runs the pure Plan Compiler dry-run, computes a
-    canonical unified diff + security delta summary (e.g., new elevated profiles, new exposed ports,
-    new `mise` pins, new external endpoints), and creates an immutable **pending proposal** bound to
-    `base_revision` and `proposal_digest` inside [oc_controller.py](../../oc_controller.py).
-  - **Operator-only publish:** Only the human operator (via `oc-sandbox config approve <proposal_id>
-    --digest <proposal_digest>` or trusted host dashboard) can apply a proposal. At publish time,
-    the host helper re-verifies `proposal_digest`, re-checks `current_revision == base_revision`
-    (rejecting stale/replayed approvals), writes atomically (`O_CREAT|O_EXCL` + `fsync` +
-    `os.replace`), and appends an immutable revision record.
-- **Hard non-writable boundary (permanently refused to orchestrator MCP):**
-  - Python `file.py:factory` adapter code, `known_hosts` host-key pins, password-manager
-    `managers.toml` and vault credentials, and `oc_controller` policy envelopes. The orchestrator
-    may only *reference* already host-registered factory/secret/worker IDs.
+  - `plan_preview(sandbox_type, worker, overrides, draft=None)` — overlays at most 16 validated
+    in-memory draft objects (each <= 64 KiB, strictly within `MUTABLE_ORCHESTRATOR_KINDS`, never
+    `builtin/*`, max 64 DAG nodes), runs `compile_plan`, and returns a **redacted plan summary**
+    (no host filesystem paths, vault IDs, or private worker addresses).
+  - `config_diff(kind, id, from_rev, to_rev)` and `config_history(kind, id, cursor=None, limit=50)`.
+- **Human-gated mutation MCP tool (`config_propose_revision`) & durable `oc_controller.py` flow:**
+  - Validates the proposed TOML against `schema_version = 1`, structural secret/env rules, and
+    `MUTABLE_ORCHESTRATOR_KINDS` / `builtin/*` protections.
+  - Captures `base_store_revision` (store-wide monotonic integer) AND `closure_digest` (SHA-256 of
+    canonical `(kind, id, rev)` tuples for the target + every transitively referenced object), runs
+    the pure Plan Compiler across affected sandbox types, and computes a closed-set
+    **`security_delta`** (`security_profile_elevation`, `exposure_widened`,
+    `auth_requirement_changed`, `new_service_added`, `service_image_changed`,
+    `new_mcp_server_added`, `mcp_tool_surface_widened`, `new_mise_tool_added`, `persona_changed`,
+    `remote_endpoint_added`, `secret_slot_added`, `resource_limit_increased`).
+  - Persists an immutable proposal record (`status = "pending"`, TTL `expires_at`, bounded quota of
+    at most 32 pending proposals) and submits an `Intent.APPLY_ONCE` `Proposal` into the real
+    [oc_controller.py](../../oc_controller.py) `Controller` API via a spike `ConfigPublishAdapter`
+    (no modifications to production `oc_controller.py`).
+  - **Operator-only publish (`operator_approve_config_proposal`):** Under a persistent-inode `flock`
+    (`O_NOFOLLOW`, `0o600`, lock file never unlinked, matching `oc-setup-lock.py`):
+    1. Verifies `proposal.status == "pending"`, `now() < proposal.expires_at`, and constant-time
+       `proposal.digest == expected_digest`.
+    2. Verifies `store.store_revision == proposal.base_store_revision` AND `closure_digest` still
+       matches (eliminating transitive-dependency TOCTOU).
+    3. Re-runs `compile_plan` + re-computes `security_delta` and asserts exact digest match.
+    4. Transitions proposal durably to `applying` (`fsync`), calls `controller.decide(..., APPROVE)`
+       and `controller.invoke(...)` whose journaled `ConfigPublishAdapter` atomically writes
+       monotonic revision `N + 1` (`O_CREAT|O_EXCL` + `0o600` + `fsync` + `os.replace`) and commits
+       the journal entry (supporting `reconcile()` after crash), then transitions proposal to
+       `applied`.
+    5. Archiving a resource still referenced by any non-archived spec fails closed; `restore`
+       always publishes a new monotonic revision `N + 1` so prior approvals can never replay.
 
 ### Curated Orchestrator Base Skills (`/run/oc-config/skills/`, mounted `:ro`)
 
 1. **`oc-config-architecture`** — explains the 3-axis model (`Workload` × `Runtime Engine` ×
    `Comm Adapter`), `plan.lock.json` IR, trust boundaries (host-trusted vs. hostile workspace,
-   `O_NOFOLLOW` factories, zero raw secrets), and the clean-slate CLI.
+   `factory_id` indirection, zero raw secrets), and the clean-slate CLI.
 2. **`oc-sandbox-authoring`** — step-by-step authoring guide and complete examples:
    - Full-stack app sandbox with `builtin/postgres` and **0 MCP tools** (app dev against local DB).
    - API sandbox using `[local]` conditional acquisition (auto-spins local API + transitive
@@ -247,9 +343,11 @@ generic host file reads/writes, shell, Podman socket, SSH agent, or raw secret a
 
 ## Additional Hardening Invariants (M1–M8)
 
-- **M1 (Host-trusted vs. hostile workspace):** Never parse or load factories, Containerfiles, `mise`
-  hooks, or MCP commands from `~/opencode-sandbox`; any future repo `.oc-sandbox.toml` is parsed
-  inside `safe_run --network=none` as non-authoritative capability hints only.
+- **M1 (Host-trusted vs. hostile workspace):** Validate all `$CONF_DIR` files (`0o700` dirs,
+  `0o600` files, `st_nlink == 1`, `trusted_path` outside `~/opencode-sandbox`). Never parse or load
+  factories, Containerfiles, `mise` hooks, or MCP commands from `~/opencode-sandbox`; any future
+  repo `.oc-sandbox.toml` is parsed inside `safe_run --network=none` as non-authoritative capability
+  hints only.
 - **M2 (Retire shared `oc-home` & `npx -y ...@latest`):** Managed sandboxes use isolated per-job
   homes, read-only OpenCode binary mounts, and digest-pinned RO MCP layers.
 - **M3 (Cross-arch determinism):** Logical Plans stay arch-agnostic; multi-arch OCI digests and
@@ -257,16 +355,21 @@ generic host file reads/writes, shell, Podman socket, SSH agent, or raw secret a
 - **M4 (Drift detection & rollback):** Persist `applied_plan.json` per instance under `$CONF_DIR`;
   classify relaunch deltas as `hot-safe`, `recreate-stateless`, or `stateful-migration-required`
   (fail closed); support `oc-sandbox rollback NAME`.
-- **M5 (Diamond & port conflicts):** Fail closed on incompatible SemVer/pin diamonds or duplicate
-  pod ports unless resolved by named service instances or `[composition] replace`.
+- **M5 (Diamond & port conflicts):** Fail closed on incompatible SemVer/pin diamonds, ambiguous
+  capability providers, or duplicate pod ports unless resolved by named service instances or
+  `[composition] replace`.
 - **M6 (Universal ownership & cloud leases):** Standardize ownership labels (`oc.sandbox=1`,
   `oc.instance`, `oc.service`, `oc.volume.durable`, `oc.incarnation`), write-before-create receipts
   (`$CONF_DIR/remote-state/`), and mandatory `max_ttl`/`idle_timeout`/`spend_cap_usd` cloud leases.
 - **M7 (Intra-pod topology & resource baselines):** Support explicit `pod-shared` vs.
   `isolated-sidecars` topology modes; enforce mandatory `memory`/`pids_limit`/`--cap-drop=ALL`/
   `--security-opt=no-new-privileges` on every service.
-- **M8 (Universal Secret Materializer):** Generalize HMAC `pg_sig()` + stdin `podman secret`
-  (`mode=0400`) + [prd_i4a](prd_i4a.md) `managers.toml` vault refs to all services and MCPs.
+- **M8 (Universal Secret Materializer & Structural Env Filtering):** Generalize HMAC `pg_sig()` +
+  stdin `podman secret` (`mode=0400`) + [prd_i4a](prd_i4a.md) `managers.toml` vault refs to all
+  services and MCPs. Secret slots and sensitive MCP headers accept **only** typed `SecretRef` /
+  `{file:/run/secrets/<slot>}` schemas; declarative `env` maps reject dangerous keys (`PATH`,
+  `LD_*`, `PYTHON*`, `NODE_OPTIONS`, `GIT_*`, `MISE_*`, `OPENCODE_CONFIG*`, `SSH_AUTH_SOCK`,
+  `DBUS_*`, `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`).
 
 ## Gate 1: Pseudocode Walkthrough (PoC Scope)
 
@@ -277,104 +380,154 @@ function compile_plan(store, sandbox_type_id, worker_spec, overrides, applied_pl
     st = store.load_trusted_sandbox_type(sandbox_type_id)       # schema_version == 1; no Python imported
     bundles = resolve_bundle_dag_topological(store, st.bundles, overrides.with_mods, overrides.without_mods)
         # Fails closed on cycle, missing bundle, or unacknowledged [composition] replace collision
+        # Rejects any [composition] replace targeting builtin/* security invariants
 
-    # 1. Resolve service DAG with [local] conditional pruning & capability matching
-    active_service_reqs = collect_service_requests(bundles, overrides.env_bindings)
-        # If a tool's [local] slot has an external remote endpoint bound, prune its local service branch
-    services = resolve_service_dag(store, active_service_reqs)
-        # Topological sort (Kahn); rejects cycles, unsatisfied capabilities, incompatible diamonds,
-        # and duplicate pod ports across services
+    # 1. Collect active roots (applying [local] pruning + validating external remote endpoints)
+    active_roots, remote_bindings = collect_active_service_roots(bundles, overrides.env_bindings, host_policy)
+        # If a tool's [local] slot has an external remote endpoint bound, validate scheme/host policy
+        # (reject loopback/link-local/metadata unless allowlisted) and omit that local root edge;
+        # shared transitive deps survive if still reachable from another active root.
 
-    # 2. Validate against target HostProvider Capability Manifest & arch
-    caps = worker_spec.capabilities
-    for svc in services:
-        if not caps.satisfies(svc.required_capabilities):
-            if svc.fallback_service and caps.satisfies(svc.fallback_service.required_capabilities):
-                svc = substitute_explicit_fallback(svc)
-            else:
-                raise CapabilityMismatch(f"{svc.id} requires {svc.required_capabilities}; worker lacks them")
+    # 2. Resolve service DAG with capability-aware provider & fallback selection INSIDE DAG resolution
+    services = resolve_service_dag(store, active_roots, worker_spec.capabilities)
+        # For each required capability/service:
+        #   - Resolve deterministically (fail closed on >1 matching provider without explicit pin)
+        #   - If worker lacks required_capabilities, select explicit fallback_service ONLY if
+        #     fallback.security_profile <= primary.security_profile AND fallback.max_exposure <= primary.max_exposure
+        #   - Recursively traverse selected service's `requires`
+        # Then run Kahn topological sort; reject cycles, incompatible version diamonds,
+        # un-remapped named-instance collisions, and duplicate pod ports.
 
     # 3. Compile Endpoint Exposure Policy (zero hardcoded port numbers)
     endpoints = compile_endpoints(services, st.ports, overrides.cli_ports)
         # Rejects any requested exposure exceeding endpoint.max_exposure (e.g., 9222 -> pod-only)
         # Rejects any host/DNS exposure of requires_auth=true without verified auth_enforcer
+        # Validates host_url_template against closed schemes & placeholders (no password placeholder)
 
     # 4. Compile Structured Role Contract (singular persona + instructions + skills + filtered MCPs)
     role = compile_role_contract(bundles, st.default_agent, services)
         # Rejects >1 primary persona without [composition] replace = ["persona"]
-        # Generates SERVICES.md from resolved services; enforces byte cap on instructions
-        # Validates symlink-confined {{slot}} files; filters MCP tools by persona allowlist
-        # Rejects any raw secret literals in MCP env/headers (must be {file:/run/secrets/...})
+        # Generates SERVICES.md from resolved services; enforces 16 KiB byte cap on instructions
+        # Expands {{slot}} in a single non-recursive pass from O_NOFOLLOW bundle-confined files
+        # Filters MCP tools by persona allowlist; enforces typed SecretRef / {file:/run/secrets/...}
+        # Rejects forbidden env keys (PATH, LD_*, PYTHON*, NODE_OPTIONS, *_API_KEY, etc.)
 
     # 5. Merge constrained mise executables.toml (data-only [tools], <= 64 manifests / 64 tools)
     mise_tools = merge_executable_pins(bundles, services, st.mise_overrides)
         # Fails closed on version conflict, moving channel ('latest'), or hooks/env/tasks keys
 
-    # 6. Target-bind digests for worker_spec.arch and compute immutable plan_digest
-    plan = build_canonical_plan_ir(st, worker_spec, services, endpoints, role, mise_tools)
-    plan.drift = classify_drift(applied_plan, plan)             # hot-safe | recreate-stateless | stateful-migration-required
-    plan.plan_digest = sha256_canonical_json(plan)
-    return plan
+    # 6. Target-bind digests for worker_spec.arch and hash IMMUTABLE Plan IR BEFORE drift
+    plan = build_canonical_plan_ir(st, worker_spec, services, remote_bindings, endpoints, role, mise_tools)
+    plan_digest = sha256_canonical_json(plan)                   # excludes mutable drift!
+    drift = classify_drift(applied_plan, plan)                  # hot-safe | recreate-stateless | stateful-migration-required
+    return CompiledPlanResult(plan=plan, plan_digest=plan_digest, drift=drift)
 ```
 
 ### 2. Restricted Orchestrator Config MCP Server & Human-Gated Publish
 
 ```text
-function handle_orchestrator_mcp_request(peer_cred, raw_frame):
-    assert_peer_matches_orchestrator_uid_pid(peer_cred)
-    assert len(raw_frame) <= 262_144 and rate_limiter.allow(peer_cred)
-    req = parse_strict_json_rpc(raw_frame)                      # closed method allowlist only
+function handle_orchestrator_mcp_connection(conn, peer_cred, expected_uid, incarnation_token):
+    if peer_cred.uid != expected_uid:
+        close_immediately(conn); return
+    raw_frame = read_content_length_frame(conn, max_bytes=262_144, read_timeout=5s, total_timeout=15s)
+        # Rejects trailing/pipelined junk bytes, missing/invalid Content-Length, oversized frames
+    req = parse_strict_json_rpc(raw_frame, max_depth=32)
+        # Rejects duplicate keys, NaN/Infinity, unpaired surrogates
+    if not hmac.compare_digest(req.auth_token, incarnation_token):
+        return json_rpc_error(-32001, "invalid_or_stale_session_token")
+    if not rate_limiter.allow(peer_cred.uid):
+        return json_rpc_error(-32002, "rate_limited")
     if req.method not in ALLOWED_MCP_METHODS:
         return json_rpc_error(-32601, "method_not_allowed")
 
     if req.method in ("config_list", "config_get", "config_schema", "config_diff", "config_history"):
-        validate_opaque_id(req.params)                          # ^[a-z0-9][a-z0-9/_-]{0,63}$; no '..' or '/'
-        return execute_read_only_store_query(req.method, req.params)   # strips secret values; metadata only
+        validate_kind_in(req.params.kind, READABLE_ORCHESTRATOR_KINDS)
+        validate_opaque_id_if_present(req.params.id)            # ^[a-z0-9][a-z0-9_-]{0,31}(/[a-z0-9][a-z0-9_-]{0,31})?$
+        validate_paging(req.params.limit, req.params.cursor)    # 1 <= limit <= 100
+        return execute_read_only_store_query(req.method, req.params)
 
     if req.method == "plan_preview":
-        draft_store = overlay_validated_in_memory_draft(host_store, req.params.draft)
-        plan = compile_plan(draft_store, req.params.sandbox_type, req.params.worker, req.params.overrides)
-        return redacted_plan_summary(plan)
+        draft_store = overlay_validated_draft(host_store, req.params.draft,
+                                              allowed_kinds=MUTABLE_ORCHESTRATOR_KINDS,
+                                              forbid_builtin=True, max_objects=16, max_bytes=65_536)
+        res = compile_plan(draft_store, req.params.sandbox_type, req.params.worker, req.params.overrides)
+        return redact_plan_summary(res)                         # omits host paths, vault IDs, private worker hosts
 
     if req.method == "config_propose_revision":
-        kind, obj_id, proposed_toml, base_rev = validate_proposal_inputs(req.params)
-        if kind in FORBIDDEN_ORCHESTRATOR_KINDS:                # factories, known_hosts, managers, policy
-            return json_rpc_error(-32003, "host_only_resource_forbidden")
-        reject_unknown_keys_raw_secrets_and_path_escapes(proposed_toml)
-        # Dry-run compile every affected sandbox type to guarantee validity before queuing approval
-        draft_store = host_store.with_in_memory_overlay(kind, obj_id, proposed_toml)
-        security_delta = compute_security_delta(host_store, draft_store, kind, obj_id)
-        proposal = create_immutable_proposal(kind, obj_id, base_rev, proposed_toml, security_delta)
-        controller_req_id = controller.propose_config_change(proposal.digest, proposal.summary)
-        return {"proposal_id": proposal.id, "controller_request_id": controller_req_id,
-                "proposal_digest": proposal.digest, "security_delta": security_delta, "status": "pending_approval"}
+        kind, obj_id, proposed_toml, action = validate_proposal_inputs(req.params)
+        if kind not in MUTABLE_ORCHESTRATOR_KINDS or obj_id.startswith("builtin/"):
+            return json_rpc_error(-32003, "kind_or_namespace_not_mutable")
+        validate_schema_and_orchestrator_limits(kind, proposed_toml)
+            # Rejects file.py:factory paths, host bind mounts, unpinned images, shell post_install_hooks,
+            # builtin/* capability downgrade, unknown keys, forbidden env keys, and raw secrets
+        with host_store.read_snapshot_lock():
+            if action == "archive" and host_store.has_active_dependents(kind, obj_id):
+                return json_rpc_error(-32004, "referenced_by_active_config")
+            base_store_rev = host_store.store_revision
+            draft_store = host_store.with_in_memory_overlay(kind, obj_id, proposed_toml, action)
+            affected_plans, closure_digest = dry_run_compile_affected(host_store, draft_store, kind, obj_id)
+            security_delta = compute_closed_security_delta(host_store, draft_store, affected_plans)
+            proposal = host_store.create_pending_proposal(
+                kind, obj_id, action, proposed_toml,
+                base_store_rev=base_store_rev, closure_digest=closure_digest,
+                security_delta=security_delta, ttl_seconds=900, max_pending=32,
+            )
+            # Submit via real oc_controller.Controller API (Intent.APPLY_ONCE + ConfigPublishAdapter)
+            ctrl_view = controller.propose(orchestrator_principal,
+                                           Proposal(Intent.APPLY_ONCE, f"config:{kind}:{obj_id}", "config-store:apply"))
+            host_store.bind_controller_request(proposal.id, ctrl_view.payload.request_id, ctrl_view.digest)
+            return {"proposal_id": proposal.id, "proposal_digest": proposal.digest,
+                    "controller_request_id": ctrl_view.payload.request_id,
+                    "security_delta": security_delta, "status": "pending"}
 
 function operator_approve_config_proposal(operator_principal, proposal_id, expected_digest):
-    with host_store.write_lock():
+    with host_store.persistent_flock():                         # O_NOFOLLOW, 0o600, lock file never unlinked
         proposal = host_store.load_proposal(proposal_id)
+        if proposal.status != "pending":
+            raise Conflict("Proposal is not pending")
+        if now() >= proposal.expires_at:
+            host_store.mark_proposal_terminal(proposal.id, "expired")
+            raise Expired("Proposal expired")
         if not hmac.compare_digest(proposal.digest, expected_digest):
-            raise DigestMismatch("Approval digest does not match canonical proposal")
-        current_rev = host_store.current_revision(proposal.kind, proposal.obj_id)
-        if current_rev != proposal.base_revision:
-            raise StaleProposal("Target config changed since proposal; re-propose against latest revision")
-        controller.approve_and_consume_once(operator_principal, proposal.controller_request_id, expected_digest)
-        # Atomic host-trusted write (O_CREAT|O_EXCL temp + 0o600 + fsync + os.replace) + immutable journal entry
-        new_rev = host_store.publish_atomic(proposal.kind, proposal.obj_id, proposal.proposed_toml)
-        return new_rev
+            raise DigestMismatch("Approval digest mismatch")
+        if host_store.store_revision != proposal.base_store_revision:
+            raise StaleProposal("Store changed since proposal; re-propose against latest revision")
+        # Re-verify closure & security_delta under write lock to prevent transitive TOCTOU
+        draft_store = host_store.with_in_memory_overlay(proposal.kind, proposal.obj_id,
+                                                        proposal.proposed_toml, proposal.action)
+        affected_plans, cur_closure = dry_run_compile_affected(host_store, draft_store,
+                                                               proposal.kind, proposal.obj_id)
+        cur_delta = compute_closed_security_delta(host_store, draft_store, affected_plans)
+        if cur_closure != proposal.closure_digest or cur_delta.digest != proposal.security_delta_digest:
+            raise StaleProposal("Transitive dependencies or security delta changed")
+        host_store.mark_proposal_state(proposal.id, "applying") # durable fsync before invoke
+        controller.decide(operator_principal, proposal.controller_request_id,
+                          proposal.controller_rev, proposal.controller_digest, Decision.APPROVE)
+        # ConfigPublishAdapter.dispatch atomically publishes monotonic rev N+1 (O_EXCL + fsync + os.replace)
+        # and appends the durable journal record; reconcile() heals partial crashes idempotently.
+        status = controller.invoke(host_job_principal, proposal.controller_request_id)
+        if status.state == State.SUCCEEDED:
+            host_store.mark_proposal_terminal(proposal.id, "applied")
+            return host_store.current_revision(proposal.kind, proposal.obj_id)
+        host_store.mark_proposal_terminal(proposal.id, "failed")
+        raise PublishFailed(status.reason)
 ```
 
 ## PoC Scope (Spike Branch `spike-outside-in-poc`)
 
-Per [AGENTS.md](../../AGENTS.md#branches), the spike PoC lives cleanly under
-`docs/prds/spikes/l/` (leaving `oc-sandbox`, `oc-bridge.py`, and production tests untouched until a
-dedicated feature PR branches from `main`):
+Per [AGENTS.md](../../AGENTS.md#branches), the spike PoC lives strictly under
+`docs/prds/spikes/l/` (Python stdlib only; 100% offline; requires explicit `--config-dir` and never
+touches real `~/.config/oc-sandbox/`; leaves `oc-sandbox`, `oc-bridge.py`, `oc_controller.py`, and
+production tests untouched):
 
 - [ ] **Pure-Python Plan Compiler & Schema (`docs/prds/spikes/l/oc_plan.py`)** — `schema_version = 1`
-      TOML loader (trusted-path + unknown-key + raw-secret rejection), recursive capability &
-      `[local]` service DAG resolver, diamond/cycle/port-collision checks, HostProvider Capability
-      Manifest matching, Universal Endpoint Policy Engine, Structured Role Contract -> OpenCode v2
-      config/instructions/skills/MCP emitter, constrained `executables.toml` merger, `applied_plan`
-      drift classifier, and deterministic `plan_digest`.
+      TOML loader (host-state validation, unknown-key rejection, structural secret & forbidden-env
+      checks), active-root `[local]` pruning & remote-endpoint policy, capability-aware DAG +
+      non-escalating fallback resolver, diamond/cycle/named-instance/port-collision checks,
+      Universal Endpoint Policy Engine (closed `host_url_template`), Structured Role Contract ->
+      OpenCode v2 config/instructions/skills/MCP emitter (single-pass `O_NOFOLLOW` `{{slot}}`),
+      constrained `executables.toml` merger, immutable `plan_digest` (excluding `drift`), and
+      `applied_plan` drift classifier.
 - [ ] **Built-in Reference Catalog (`docs/prds/spikes/l/builtin/`)** — `service/postgres` (full
       SCRAM + `PGPASSFILE` + `5432` policy), `service/api-demo` (requiring `cap:db.postgres@^17`
       with `[local]` conditional pruning), `service/chromium-wayland`, `service/chromium-managed`,
@@ -382,21 +535,30 @@ dedicated feature PR branches from `main`):
       `transport/{local,ssh-pinned,tailcat,cloud-https}`, and example `sandbox-type` / `bundle`
       definitions (including 0-MCP Postgres app-dev and read-only security-reviewer persona).
 - [ ] **Restricted Orchestrator Config MCP Server + Curated Base Skills (`docs/prds/spikes/l/oc_config_mcp.py`, `docs/prds/spikes/l/orchestrator_skills/`)** —
-      typed JSON-RPC MCP server over private `0o700` UDS (with `SO_PEERCRED`, byte/rate caps,
-      opaque IDs, forbidden-kind rejection, `plan_preview`, `config_propose_revision`, and
-      operator-only stale-safe `approve`/`rollback`), plus the 4 curated orchestrator base Skills.
+      Content-Length framed strict JSON-RPC MCP server over private `0o700` UDS (per-incarnation
+      256-bit session token + `SO_PEERCRED` UID check + byte/depth/rate caps, closed
+      `READABLE`/`MUTABLE` allowlists, `builtin/*` immutability, redacted `plan_preview`,
+      `config_propose_revision` wired to real `oc_controller.Controller` via `ConfigPublishAdapter`,
+      persistent-inode `flock`, monotonic revisions, durable proposal state machine, transitive
+      closure re-verification, and safe `restore`/`archive`), plus the 4 curated orchestrator base
+      Skills.
 - [ ] **Reworked CLI PoC (`docs/prds/spikes/l/oc_sandbox_cli.py`)** — implements `plan`, `config`,
-      and `worker` subcommands against the compiler & store.
+      and `worker` subcommands against an explicit `--config-dir`.
 - [ ] **Comprehensive Offline Adversarial & Unit Test Suite (`docs/prds/spikes/l/test_poc.py`)** —
-      verifies DAG cycles, diamond conflicts, `[local]` pruning, 0-MCP Postgres wiring, endpoint
-      exposure denial (`9222`, unauthenticated `5432`), persona conflict & `[composition] replace`,
-      MCP role filtering, raw-secret rejection, `executables.toml` hook/latest rejection, drift
-      classification, orchestrator MCP path-traversal/forbidden-kind/stale-approval/digest-mismatch
-      rejection, and `SO_PEERCRED`/byte-cap enforcement.
+      verifies DAG cycles, ambiguous provider & diamond conflicts, fallback inside DAG (and
+      refusing escalating fallbacks), `[local]` active-root pruning + remote-endpoint SSRF denial,
+      0-MCP Postgres wiring, named-instance port allocation, endpoint exposure denial (`9222`,
+      unauthenticated `5432`), persona conflict & `[composition] replace`, single-pass `{{slot}}`
+      & symlink rejection, MCP role filtering, structural secret & forbidden-env rejection,
+      `executables.toml` hook/latest rejection, `plan_digest` invariance across drift, orchestrator
+      MCP framing/duplicate-key/depth/token/restart-rotation/opaque-ID/allowlist/`builtin/*`/
+      archive-dependent/stale-closure/rollback-replay/digest-mismatch rejection.
 
 ## Review record
 
-- Gate 1 design review (`Security-Focused PR Reviewer Setup`): pending.
+- Gate 1 design review round 1 (`Security-Focused PR Reviewer Setup`, `9b67f520932e..3b5d95d1d0d1`):
+  5 P1 and 4 P2 findings addressed in this revision.
+- Gate 1 design review round 2 (`Security-Focused PR Reviewer Setup`): pending.
 - Gate 2 PoC implementation review (`Security-Focused PR Reviewer Setup`): pending.
 
 - [ ] **Human review**: checked only when the user says so
