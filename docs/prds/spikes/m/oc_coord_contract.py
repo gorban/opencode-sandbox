@@ -491,6 +491,21 @@ class DispatchResult:
     outcome: DispatchOutcome
     stream_id: str | None = None
     detail: str = ""
+    permanent: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, DispatchOutcome):
+            raise CoordValidationError("outcome must be DispatchOutcome")
+        if type(self.permanent) is not bool:
+            raise CoordValidationError("permanent must be a bool")
+        if not isinstance(self.detail, str):
+            raise CoordValidationError("detail must be a string")
+        if self.stream_id is not None and not isinstance(self.stream_id, str):
+            raise CoordValidationError("stream_id must be a string or None")
+        if self.permanent and self.outcome is not DispatchOutcome.ZERO_BYTES_SENT:
+            raise CoordValidationError(
+                "permanent refusal requires DispatchOutcome.ZERO_BYTES_SENT"
+            )
 
     @property
     def proves_zero_bytes_sent(self) -> bool:
@@ -570,6 +585,31 @@ class WorkerTransport(Protocol):
 
     def status(self, sandbox_addr: str, incarnation_id: str) -> WorkerStatus:
         """Return current transport status for the given sandbox incarnation."""
+        ...
+
+
+@runtime_checkable
+class ExternallyFencedTransport(WorkerTransport, Protocol):
+    """Opt-in protocol for an operator-only, unmonitored, whole-incarnation relay adapter."""
+
+    @property
+    def external_write_fence(self) -> bool:
+        """Return True to opt into CoordHub's narrow operator-only split-phase handoff."""
+        ...
+
+    def transport_owner_id(self, sandbox_addr: str, incarnation_id: str) -> str:
+        """Return the stable opaque trusted owner/job identity for this exact incarnation; raise if unknown."""
+        ...
+
+    def confirm_incarnation_terminal(
+        self,
+        sandbox_addr: str,
+        incarnation_id: str,
+        *,
+        owner_id: str,
+        reason: str,
+    ) -> bool:
+        """Confirm terminal grant or verified stop for the exact (sandbox_addr, incarnation_id, owner_id); return True iff positively confirmed."""
         ...
 
 

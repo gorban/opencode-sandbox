@@ -29,12 +29,15 @@ from oc_coord_contract import (  # noqa: E402
     CoordValidationError,
     DispatchOutcome,
     DispatchResult,
+    ExternallyFencedTransport,
     PrincipalCtx,
     RoutingEdge,
     StreamEvent,
     SubtreeBudget,
     TrustClass,
     TurnDispatch,
+    WorkerStatus,
+    WorkerTransport,
     canonicalize_body_text,
     frame_untrusted_peer_message,
     mint_crypto_id,
@@ -226,6 +229,79 @@ class TestAddressAndContract(unittest.TestCase):
             grant_generation=edge.grant_generation,
         )
         self.assertEqual(turn.grant_generation, 3)
+
+    def test_dispatch_result_permanent_and_strict_validation(self) -> None:
+        perm_zero = DispatchResult(
+            DispatchOutcome.ZERO_BYTES_SENT,
+            detail="frame_exceeds_transport_limit",
+            permanent=True,
+        )
+        self.assertTrue(perm_zero.proves_zero_bytes_sent)
+        self.assertTrue(perm_zero.permanent)
+
+        for bad_kwargs in (
+            {"outcome": "zero_bytes_sent"},
+            {"outcome": DispatchOutcome.ZERO_BYTES_SENT, "permanent": 1},
+            {"outcome": DispatchOutcome.ZERO_BYTES_SENT, "permanent": "yes"},
+            {"outcome": DispatchOutcome.ZERO_BYTES_SENT, "detail": 123},
+            {"outcome": DispatchOutcome.HANDED_OFF, "stream_id": 42},
+            {"outcome": DispatchOutcome.HANDED_OFF, "stream_id": "s1", "permanent": True},
+            {"outcome": DispatchOutcome.UNCERTAIN, "permanent": True},
+        ):
+            with self.assertRaises(CoordValidationError):
+                DispatchResult(**bad_kwargs)  # type: ignore[arg-type]
+
+    def test_externally_fenced_transport_protocol_check(self) -> None:
+        class _PlainTransport:
+            def dispatch_turn(self, turn: TurnDispatch) -> DispatchResult:
+                return DispatchResult(DispatchOutcome.ZERO_BYTES_SENT)
+
+            def stream_events(self, stream_id: str) -> list[StreamEvent]:
+                return []
+
+            def abort_incarnation(
+                self, sandbox_addr: str, incarnation_id: str, *, reason: str
+            ) -> bool:
+                return False
+
+            def status(self, sandbox_addr: str, incarnation_id: str) -> WorkerStatus:
+                return WorkerStatus(sandbox_addr, incarnation_id, "running")
+
+        class _ExternalTransport(_PlainTransport):
+            @property
+            def external_write_fence(self) -> bool:
+                return True
+
+            def transport_owner_id(self, sandbox_addr: str, incarnation_id: str) -> str:
+                return f"local-relay:{incarnation_id}"
+
+            def confirm_incarnation_terminal(
+                self,
+                sandbox_addr: str,
+                incarnation_id: str,
+                *,
+                owner_id: str,
+                reason: str,
+            ) -> bool:
+                return owner_id == f"local-relay:{incarnation_id}"
+
+        plain = _PlainTransport()
+        ext = _ExternalTransport()
+        self.assertIsInstance(plain, WorkerTransport)
+        self.assertNotIsInstance(plain, ExternallyFencedTransport)
+        self.assertIsInstance(ext, WorkerTransport)
+        self.assertIsInstance(ext, ExternallyFencedTransport)
+        self.assertTrue(ext.external_write_fence)
+        self.assertTrue(
+            ext.confirm_incarnation_terminal(
+                "feat-a", "inc_1", owner_id="local-relay:inc_1", reason="revoked"
+            )
+        )
+        self.assertFalse(
+            ext.confirm_incarnation_terminal(
+                "feat-a", "inc_1", owner_id="local-relay:other", reason="revoked"
+            )
+        )
 
 
 if __name__ == "__main__":
