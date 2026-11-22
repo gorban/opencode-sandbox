@@ -402,10 +402,10 @@ function handle_broker_postgres_conn(client_sock, job_lease, pg_route):
       `spike-prd-l1`: inbound `aws-sigv4-job-key` HMAC-SHA256 verification + host-side SigV4
       re-signing + action inspection (`Action=` across query & body with duplicate/encoded
       smuggling rejection, `X-Amz-Target`, REST verb+path) (`test_broker_http.py`).
-- [ ] **Gate 2 external security review & offline synthetic canary qualification** — the earlier
-      clearance applies to `72ac444`. Review of the subsequent PR #47 head reopened this gate.
-      The spike suite exercises local HTTP and Postgres protocol behavior and an injected SSH
-      runner that records argv. Live host transport and the live custom SSH adapter carry
+- [x] **Gate 2 external security review & offline synthetic canary qualification** — source
+      review cleared the fixes at `1834a3bca0a5d4945ac5c64a46b430092274c80c` in PR #47.
+      All 109 spike tests passed. The suite exercises local HTTP and Postgres protocol behavior
+      and an injected SSH runner that records argv. Live host transport and live custom SSH carry
       separate qualification gates.
 - [ ] **Live host transport & SELinux qualification** — live Linux (`pasta -T` / `managed` UDS
       SELinux relabeling) and macOS (`ssh -R`) host qualification pending prior to production
@@ -445,8 +445,10 @@ python3 -B -m unittest discover -s docs/prds/spikes/l -p 'test_*.py'
   **GATE 2 CLEARED** at commit `72ac4444bcd8583d139c16d737612aba5770fe23` (97/97 offline tests
   passing; live host transport qualification and user Human Review remain open).
 
-
 - PR #47 head `4f323bb` underwent a fresh external review. The follow-up binds synthetic SSH
   dispatch to the approved command, enforces lease-specific preset policy, checks final MCP
   response bytes and HTTPS verification settings, restricts the Postgres listener plan, and
   gives each server ownership of its Unix socket and worker shutdown.
+- External re-review at `1834a3b` cleared the last partial-start cleanup finding.
+  The same fixture verifies receipt retention on rollback failure, cleanup by identity, and
+  rebinding. A follow-up extracts the rollback helper to meet the SonarCloud complexity gate.

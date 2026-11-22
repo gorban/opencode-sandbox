@@ -509,21 +509,27 @@ def bind_trusted_uds(
         fcntl.flock(directory_fd, fcntl.LOCK_UN)
         return srv, bound
     except BaseException:
-        retain_receipt = False
-        try:
-            if srv is not None:
-                _safe_shutdown_close(srv)
-            if bound is not None:
-                try:
-                    bound.unlink_owned()
-                except (OSError, BrokerError) as cleanup_error:
-                    fcntl.flock(directory_fd, fcntl.LOCK_UN)
-                    retain_receipt = True
-                    raise UdsStartupError(bound) from cleanup_error
-        finally:
-            if not retain_receipt:
-                os.close(directory_fd)
+        _rollback_uds_bind(srv, bound, directory_fd)
         raise
+
+
+def _rollback_uds_bind(
+    listener: socket.socket | None, endpoint: BoundUds | None, directory_fd: int
+) -> None:
+    retain_receipt = False
+    try:
+        if listener is not None:
+            _safe_shutdown_close(listener)
+        if endpoint is not None:
+            try:
+                endpoint.unlink_owned()
+            except (OSError, BrokerError) as cleanup_error:
+                fcntl.flock(directory_fd, fcntl.LOCK_UN)
+                retain_receipt = True
+                raise UdsStartupError(endpoint) from cleanup_error
+    finally:
+        if not retain_receipt:
+            os.close(directory_fd)
 
 
 def _bind_private_socket(sock: socket.socket, path: Path) -> None:
