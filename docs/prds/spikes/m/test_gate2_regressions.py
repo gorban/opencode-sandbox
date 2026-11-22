@@ -5,6 +5,7 @@ Every test reproduces a specific Round 1 or Round 2 finding and verifies its fix
 
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 from pathlib import Path
 import socket
@@ -2258,7 +2259,7 @@ class TestReciprocalReviewRegressions(CoordTestBase):
         self,
     ) -> None:
         # 1. Controller stays eligible; lease revoked locally after detachment -> fresh hub refuses old inc
-        controller, ctrl_op, lease_ok, req_ok = _make_controller_lease("sb-ret", "inc_ret1")
+        controller, ctrl_op, lease_ok, _ = _make_controller_lease("sb-ret", "inc_ret1")
         reg1, _t1, hub1 = self._open_pair(controller=controller, controller_actor=ctrl_op)
         self._reg_sb(hub1, _OP, "sb-ret", "inc_ret1", lease=lease_ok)
         edge1 = hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-ret")
@@ -2487,6 +2488,577 @@ class TestReciprocalReviewRegressions(CoordTestBase):
         self.assertFalse(hub._session_active_marker.exists())
         reg.close()
         _ = transport
+
+
+class _NoAbortStreamTransport:
+    """Minimal WorkerTransport proxy implementing only abort_incarnation (no abort_stream)."""
+
+    def __init__(self, inner: FakeWorkerTransport) -> None:
+        self._inner = inner
+
+    def dispatch_turn(self, turn: Any) -> Any:
+        return self._inner.dispatch_turn(turn)
+
+    def stream_events(self, stream_id: str) -> Any:
+        return self._inner.stream_events(stream_id)
+
+    def abort_incarnation(self, sandbox_addr: str, incarnation_id: str, *, reason: str) -> bool:
+        return self._inner.abort_incarnation(sandbox_addr, incarnation_id, reason=reason)
+
+    def status(self, sandbox_addr: str, incarnation_id: str) -> Any:
+        return self._inner.status(sandbox_addr, incarnation_id)
+
+
+def _approve_extra_request(controller: Controller, ctrl_op: Principal, job_name: str) -> str:
+    job_actor = Principal(Role.JOB, f"chan-{job_name}")
+    st = controller.propose(job_actor, Proposal(Intent.PROBE_GRANT, "alias-e2e", "ref-probe"))
+    view = controller.view(ctrl_op, st.request_id)
+    controller.decide(ctrl_op, st.request_id, view.payload.revision, view.digest, Decision.APPROVE)
+    return st.request_id
+
+
+class TestReciprocalRound6Fixes(CoordTestBase):
+    """Red/green regressions for all six reciprocal review findings on fd761776."""
+
+    def _open_pair(
+        self,
+        *,
+        controller: Controller | None = None,
+        controller_actor: Principal | None = None,
+        transport: Any | None = None,
+    ) -> tuple[CoordRegistry, Any, CoordHub]:
+        reg = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
+        actual_transport = transport if transport is not None else FakeWorkerTransport()
+        hub = CoordHub(
+            reg,
+            actual_transport,
+            self.state_dir,
+            controller=controller,
+            controller_actor=controller_actor,
+            sandbox_root=self.sandbox_root,
+            watchdog_interval_s=0.02,
+        )
+        return reg, actual_transport, hub
+
+    @staticmethod
+    def _reg_sb(
+        hub: CoordHub,
+        caller: PrincipalCtx,
+        name: str,
+        inc: str,
+        *,
+        parent_addr: str | None = None,
+        lease: BrokerLease | None = None,
+        controller_request_id: str | None = None,
+    ) -> Any:
+        return hub.register_sandbox(
+            caller,
+            name=name,
+            incarnation_id=inc,
+            project_id="p_r6",
+            project_name="PR6",
+            branch="main",
+            task_brief=f"Task {name}",
+            parent_addr=parent_addr,
+            lease=lease,
+            controller_request_id=controller_request_id,
+        )
+
+    @staticmethod
+    def _wait_until(predicate: Any, timeout_s: float = 1.5) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return bool(predicate())
+
+    def test_r6_p1_1_in_process_recovery_fences_inflight_handoff_and_aborts_held_stream(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-rec1", "inc_rec1")
+        self._reg_sb(hub, _OP, "sb-rec2", "inc_rec2")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-rec1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-rec2")
+
+        # 1. Start a held stream on sb-rec2 that would emit ordinary events after unblock
+        held_started = threading.Event()
+        held_release = threading.Event()
+        transport.queue_script(
+            "sb-rec2",
+            TurnScript(
+                on_stream_started=held_started,
+                block_event=held_release,
+                text_chunks=("STALE_ORDINARY_DELTA_MUST_DROP",),
+            ),
+        )
+        msg_held = hub.send(_OP, target="sb-rec2", body_text="Held before recovery")["msg_id"]
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(held_started.wait(timeout=1.0))
+
+        # 2. Pause an in-flight handoff on sb-rec1 inside dispatch_turn()
+        in_handoff = threading.Event()
+        release_handoff = threading.Event()
+        orig_dispatch = transport.dispatch_turn
+
+        def _blocked_dispatch(turn: Any) -> Any:
+            if turn.sandbox_addr == "sb-rec1":
+                in_handoff.set()
+                release_handoff.wait(timeout=2.0)
+            return orig_dispatch(turn)
+
+        transport.dispatch_turn = _blocked_dispatch  # type: ignore[method-assign]
+        transport.queue_script("sb-rec1", TurnScript(text_chunks=("LATE_HANDOFF_MUST_ABORT",)))
+        msg_inf = hub.send(_OP, target="sb-rec1", body_text="Inflight handoff")["msg_id"]
+
+        disp_thread = threading.Thread(
+            target=lambda: hub.dispatch_once(async_stream=True), daemon=True
+        )
+        disp_thread.start()
+        self.assertTrue(in_handoff.wait(timeout=1.0))
+
+        # 3. Degrade hub and start in-process confirm_recovery(): MUST wait for in-flight handoff!
+        hub._mark_degraded("in_process_recovery_test")
+        rec_done = threading.Event()
+        rec_err: list[BaseException] = []
+
+        def _do_recover() -> None:
+            try:
+                hub.confirm_recovery(_OP, reason="in_process_verified")
+            except BaseException as exc:  # pragma: no cover
+                rec_err.append(exc)
+            finally:
+                rec_done.set()
+
+        rec_thread = threading.Thread(target=_do_recover, daemon=True)
+        rec_thread.start()
+        # Must NOT reopen while dispatch_turn() is still executing under the fence!
+        self.assertFalse(rec_done.wait(timeout=0.08))
+        self.assertTrue(hub.is_degraded)
+
+        release_handoff.set()
+        self.assertTrue(rec_done.wait(timeout=1.5))
+        self.assertEqual(rec_err, [])
+        self.assertFalse(hub.is_degraded)
+        held_release.set()
+        disp_thread.join(timeout=1.5)
+
+        # Both retired incarnations must be aborted and ZERO ordinary deltas recorded
+        self.assertIn(("sb-rec1", "inc_rec1"), transport.revoked_incarnations)
+        self.assertIn(("sb-rec2", "inc_rec2"), transport.revoked_incarnations)
+        self.assertTrue(
+            self._wait_until(
+                lambda: {msg_held, msg_inf}.issubset(
+                    {r["msg_id"] for r in reg.list_outbox(statuses=("aborted",))}
+                )
+            )
+        )
+        events = reg.list_events_since(("sb-rec1", "sb-rec2"), 0)
+        texts = [str(ev.get("text", "")) for ev in events]
+        self.assertFalse(any("STALE_ORDINARY_DELTA_MUST_DROP" in t for t in texts))
+        self.assertFalse(any("LATE_HANDOFF_MUST_ABORT" in t for t in texts))
+
+    def test_r6_p1_2_stale_caller_blocked_under_register_lock_on_register_and_grant(
+        self,
+    ) -> None:
+        reg, _transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        orig_orch = self._reg_sb(hub, _OP, "orch-r6", "inc_o1")
+        orig_src = self._reg_sb(hub, _OP, "sb-gsrc", "inc_gs1")
+        self._reg_sb(hub, _OP, "sb-gdst", "inc_gd1")
+        stale_orch = PrincipalCtx(
+            CoordRole.ORCHESTRATOR, "o1", sandbox_addr="orch-r6", incarnation_id="inc_o1"
+        )
+
+        # Part A: waiting register_sandbox must fail after orch-r6 rotates under _register_lock
+        reg_err: list[BaseException] = []
+
+        def _wait_register() -> None:
+            try:
+                self._reg_sb(hub, stale_orch, "child-stale", "inc_c1", parent_addr="orch-r6")
+            except BaseException as exc:
+                reg_err.append(exc)
+
+        hub._register_lock.acquire()
+        try:
+            t_reg = threading.Thread(target=_wait_register, daemon=True)
+            t_reg.start()
+            time.sleep(0.05)
+            reg.register_sandbox(replace(orig_orch, incarnation_id="inc_o2"))
+            hub._budgets[("orch-r6", "inc_o2")] = SubtreeBudget()
+        finally:
+            hub._register_lock.release()
+        t_reg.join(timeout=1.5)
+        self.assertEqual(len(reg_err), 1)
+        self.assertIsInstance(reg_err[0], (IncarnationMismatchError, RevokedError))
+        self.assertIsNone(reg.get_sandbox("child-stale"))
+
+        # Part B: waiting grant_edge must fail after source incarnation rotates under _register_lock
+        grant_err: list[BaseException] = []
+
+        def _wait_grant() -> None:
+            try:
+                hub.grant_edge(
+                    _OP,
+                    src_actor="sb-gsrc",
+                    src_incarnation="inc_gs1",
+                    dst_addr="sb-gdst",
+                )
+            except BaseException as exc:
+                grant_err.append(exc)
+
+        hub._register_lock.acquire()
+        try:
+            t_grant = threading.Thread(target=_wait_grant, daemon=True)
+            t_grant.start()
+            time.sleep(0.05)
+            reg.register_sandbox(replace(orig_src, incarnation_id="inc_gs2"))
+        finally:
+            hub._register_lock.release()
+        t_grant.join(timeout=1.5)
+        self.assertEqual(len(grant_err), 1)
+        self.assertIsInstance(grant_err[0], (IncarnationMismatchError, RevokedError))
+        self.assertEqual(reg.list_edges(src_actor="sb-gsrc", active_only=True), [])
+
+    def test_r6_p1_3_distinct_edge_revoke_preserves_destination_and_source_outage_aborts_outbound(
+        self,
+    ) -> None:
+        controller, ctrl_op, _lease, req_src = _make_controller_lease("sb-src", "inc_s1")
+        req_dst = _approve_extra_request(controller, ctrl_op, "sb-src")
+        req_edge1 = _approve_extra_request(controller, ctrl_op, "sb-src")
+
+        reg, transport, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-src", "inc_s1", controller_request_id=req_src)
+        self._reg_sb(hub, _OP, "sb-dst", "inc_d1", controller_request_id=req_dst)
+        edge1 = hub.grant_edge(
+            _OP,
+            src_actor="sb-src",
+            src_incarnation="inc_s1",
+            dst_addr="sb-dst",
+            lease_request_id=req_edge1,
+        )
+        edge2 = hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-dst")
+
+        src_ctx = PrincipalCtx(CoordRole.JOB, "js1", sandbox_addr="sb-src", incarnation_id="inc_s1")
+        s1_started = threading.Event()
+        s1_release = threading.Event()
+        s2_started = threading.Event()
+        s2_release = threading.Event()
+        self.addCleanup(s1_release.set)
+        self.addCleanup(s2_release.set)
+        transport.queue_script(
+            "sb-dst", TurnScript(on_stream_started=s1_started, block_event=s1_release)
+        )
+        transport.queue_script(
+            "sb-dst", TurnScript(on_stream_started=s2_started, block_event=s2_release)
+        )
+        msg_e1 = hub.send(src_ctx, target="sb-dst", body_text="Edge1 outbound")["msg_id"]
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(s1_started.wait(timeout=1.0))
+
+        msg_e2 = hub.send(_OP, target="sb-dst", body_text="Edge2 independent")["msg_id"]
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(s2_started.wait(timeout=1.0))
+
+        # 1. Source request outage aborts ONLY edge1 outbound stream; edge2 stays handed_off
+        orig_status = controller.status
+
+        def _src_outage(actor: Any, req: str) -> Any:
+            if req == req_src:
+                raise OSError("source_controller_outage")
+            return orig_status(actor, req)
+
+        controller.status = _src_outage  # type: ignore[method-assign]
+        try:
+            self.assertTrue(
+                self._wait_until(
+                    lambda: any(r["msg_id"] == msg_e1 for r in reg.list_outbox(statuses=("aborted",)))
+                )
+            )
+            self.assertIn(msg_e2, {r["msg_id"] for r in reg.list_outbox(statuses=("handed_off",))})
+            self.assertEqual(reg.get_sandbox("sb-dst").status, "running")  # type: ignore[union-attr]
+        finally:
+            controller.status = orig_status  # type: ignore[method-assign]
+
+        # 2. Revoking distinct edge1 lease revokes ONLY edge1; sb-dst & edge2 survive intact!
+        s1b_started = threading.Event()
+        s1b_release = threading.Event()
+        self.addCleanup(s1b_release.set)
+        transport.queue_script(
+            "sb-dst", TurnScript(on_stream_started=s1b_started, block_event=s1b_release)
+        )
+        msg_e1b = hub.send(src_ctx, target="sb-dst", body_text="Edge1 active before revoke")["msg_id"]
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(s1b_started.wait(timeout=1.0))
+        msg_e1b_q = hub.send(src_ctx, target="sb-dst", body_text="Edge1 queued")["msg_id"]
+        msg_e2_q = hub.send(_OP, target="sb-dst", body_text="Edge2 queued")["msg_id"]
+
+        controller.revoke(ctrl_op, req_edge1)
+        self.assertTrue(
+            self._wait_until(
+                lambda: (
+                    not reg.get_edge(edge1.edge_id).active  # type: ignore[union-attr]
+                    and any(r["msg_id"] == msg_e1b for r in reg.list_outbox(statuses=("aborted",)))
+                    and any(r["msg_id"] == msg_e1b_q for r in reg.list_outbox(statuses=("cancelled",)))
+                )
+            )
+        )
+        self.assertEqual(reg.get_sandbox("sb-dst").status, "running")  # type: ignore[union-attr]
+        self.assertNotIn(("sb-dst", "inc_d1"), transport.revoked_incarnations)
+        self.assertTrue(reg.get_edge(edge2.edge_id).active)  # type: ignore[union-attr]
+        s2_release.set()
+        self.assertTrue(
+            self._wait_until(
+                lambda: any(r["msg_id"] == msg_e2 for r in reg.list_outbox(statuses=("completed",)))
+            )
+        )
+        self.assertEqual(hub.dispatch_once(async_stream=False), 1)
+        self.assertIn(msg_e2_q, {r["msg_id"] for r in reg.list_outbox(statuses=("completed",))})
+
+    def test_r6_p1_4_outage_across_handoff_retryable_abort_stream_and_require_stream_abort_cap(
+        self,
+    ) -> None:
+        # Part A: Transport lacking abort_stream is rejected BEFORE admitting monitored turn
+        ctrl_a, op_a, _lease_a, req_a = _make_controller_lease("sb-cap", "inc_cap1")
+        inner_t = FakeWorkerTransport()
+        proxy_t = _NoAbortStreamTransport(inner_t)
+        reg_a, _ta, hub_a = self._open_pair(
+            controller=ctrl_a, controller_actor=op_a, transport=proxy_t
+        )
+        try:
+            self._reg_sb(hub_a, _OP, "sb-cap", "inc_cap1", controller_request_id=req_a)
+            hub_a.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-cap")
+            msg_cap = hub_a.send(_OP, target="sb-cap", body_text="Need abort_stream")["msg_id"]
+            with self.assertRaises(CoordPolicyError):
+                hub_a.dispatch_once()
+            self.assertEqual(inner_t.dispatched_turns("sb-cap"), [])
+            self.assertIn(msg_cap, {r["msg_id"] for r in reg_a.list_outbox(statuses=("pending",))})
+            self.assertNotIn(("sb-cap", "inc_cap1"), inner_t.revoked_incarnations)
+        finally:
+            hub_a.close()
+            reg_a.close()
+
+        # Part B: Outage during handoff + failed first abort_stream retried until stream exits
+        ctrl_b, op_b, _lease_b, req_b = _make_controller_lease("sb-ho", "inc_ho1")
+        reg_b, transport_b, hub_b = self._open_pair(controller=ctrl_b, controller_actor=op_b)
+        self.addCleanup(reg_b.close)
+        self.addCleanup(hub_b.close)
+        self._reg_sb(hub_b, _OP, "sb-ho", "inc_ho1", controller_request_id=req_b)
+        hub_b.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-ho")
+
+        in_handoff = threading.Event()
+        release_handoff = threading.Event()
+        orig_dispatch = transport_b.dispatch_turn
+        orig_abort_stream = transport_b.abort_stream
+        abort_calls: list[str] = []
+
+        def _paused_dispatch(turn: Any) -> Any:
+            in_handoff.set()
+            release_handoff.wait(timeout=2.0)
+            return orig_dispatch(turn)
+
+        def _flaky_abort_stream(stream_id: str, *, reason: str) -> bool:
+            abort_calls.append(stream_id)
+            if len(abort_calls) == 1:
+                raise RuntimeError("transient_abort_stream_failure")
+            return orig_abort_stream(stream_id, reason=reason)
+
+        transport_b.dispatch_turn = _paused_dispatch  # type: ignore[method-assign]
+        transport_b.abort_stream = _flaky_abort_stream  # type: ignore[method-assign]
+        transport_b.queue_script("sb-ho", TurnScript(block_event=threading.Event()))
+        msg_ho = hub_b.send(_OP, target="sb-ho", body_text="Outage across handoff")["msg_id"]
+
+        t_disp = threading.Thread(
+            target=lambda: hub_b.dispatch_once(async_stream=True), daemon=True
+        )
+        t_disp.start()
+        self.assertTrue(in_handoff.wait(timeout=1.0))
+
+        # Trigger controller outage WHILE dispatch_turn() is paused (before stream registration)
+        orig_status = ctrl_b.status
+
+        def _outage_b(_actor: Any, _req: str) -> Any:
+            raise OSError("outage_during_handoff")
+
+        ctrl_b.status = _outage_b  # type: ignore[method-assign]
+        try:
+            time.sleep(0.08)
+            release_handoff.set()
+            t_disp.join(timeout=1.5)
+            self.assertTrue(
+                self._wait_until(
+                    lambda: any(r["msg_id"] == msg_ho for r in reg_b.list_outbox(statuses=("aborted",)))
+                )
+            )
+            self.assertGreaterEqual(len(abort_calls), 2)
+            self.assertNotIn(("sb-ho", "inc_ho1"), transport_b.revoked_incarnations)
+        finally:
+            ctrl_b.status = orig_status  # type: ignore[method-assign]
+
+    def test_r6_p1_5_concurrent_monitor_install_reserves_single_owner_and_rolls_back_failed_start(
+        self,
+    ) -> None:
+        controller, ctrl_op, _lease, req_id = _make_controller_lease("sb-mon", "inc_m1")
+        req_fail = _approve_extra_request(controller, ctrl_op, "sb-mon")
+        reg1, _t1, hub1 = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        try:
+            self._reg_sb(hub1, _OP, "sb-mon", "inc_m1", controller_request_id=req_id)
+            self._reg_sb(hub1, _OP, "sb-mon-s1", "inc_ms1")
+            self._reg_sb(hub1, _OP, "sb-mon-s2", "inc_ms2")
+            hub1.grant_edge(_OP, src_actor="sb-mon-s1", dst_addr="sb-mon")
+            hub1.grant_edge(_OP, src_actor="sb-mon-s2", dst_addr="sb-mon")
+            s1_ctx = PrincipalCtx(
+                CoordRole.JOB, "jm1", sandbox_addr="sb-mon-s1", incarnation_id="inc_ms1"
+            )
+            s2_ctx = PrincipalCtx(
+                CoordRole.JOB, "jm2", sandbox_addr="sb-mon-s2", incarnation_id="inc_ms2"
+            )
+            hub1.send(s1_ctx, target="sb-mon", body_text="Concurrent monitor trigger 1")
+            hub1.send(s2_ctx, target="sb-mon", body_text="Concurrent monitor trigger 2")
+        finally:
+            hub1.close()
+            reg1.close()
+
+        reg, _transport, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        rows = reg.list_outbox(statuses=("pending",))
+        self.assertEqual(len(rows), 2)
+
+        # Part A: Two concurrent dispatches for the same key start ONLY ONE monitor thread
+        start_entered = threading.Event()
+        release_start = threading.Event()
+        orig_start = threading.Thread.start
+        monitor_starts = 0
+        start_lock = threading.Lock()
+
+        def _intercept_start(thr: threading.Thread) -> None:
+            nonlocal monitor_starts
+            target = getattr(thr, "_target", None)
+            if target == hub._run_controller_monitor:
+                with start_lock:
+                    monitor_starts += 1
+                    first = monitor_starts == 1
+                if first:
+                    start_entered.set()
+                    release_start.wait(timeout=2.0)
+            orig_start(thr)
+
+        with mock.patch.object(threading.Thread, "start", _intercept_start):
+            t1 = threading.Thread(
+                target=lambda: hub._dispatch_single_row(rows[0], async_stream=False), daemon=True
+            )
+            t2 = threading.Thread(
+                target=lambda: hub._dispatch_single_row(rows[1], async_stream=False), daemon=True
+            )
+            t1.start()
+            self.assertTrue(start_entered.wait(timeout=1.0))
+            t2.start()
+            time.sleep(0.05)
+            release_start.set()
+            t1.join(timeout=1.5)
+            t2.join(timeout=1.5)
+
+        self.assertEqual(monitor_starts, 1)
+
+        # Part B: Failed monitor start() rolls back reservation cleanly so retry succeeds
+        failed_once = False
+
+        def _fail_once_start(thr: threading.Thread) -> None:
+            nonlocal failed_once
+            target = getattr(thr, "_target", None)
+            if target == hub._run_controller_monitor and not failed_once:
+                failed_once = True
+                raise RuntimeError("simulated_thread_start_failure")
+            orig_start(thr)
+
+        with mock.patch.object(threading.Thread, "start", _fail_once_start):
+            with self.assertRaises(RuntimeError):
+                self._reg_sb(hub, _OP, "sb-mon-f", "inc_mf1", controller_request_id=req_fail)
+            self._reg_sb(hub, _OP, "sb-mon-f", "inc_mf2", controller_request_id=req_fail)
+            self.assertIn(req_fail, hub._request_monitors)
+
+    def test_r6_p2_6_close_settlement_respects_deadline_and_retry_completes_missing_audit(
+        self,
+    ) -> None:
+        reg, _transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        lease = BrokerLease("job_settle_r6")
+        self._reg_sb(hub, _OP, "sb-settle", "inc_st1", lease=lease)
+
+        in_settlement = threading.Event()
+        release_settlement = threading.Event()
+        orig_update = reg.update_sandbox_status
+        orig_audit = reg.append_audit
+        fail_revoke_audit = {"enabled": True}
+
+        def _slow_update(
+            sandbox_addr: str, status: str, *, incarnation_id: str | None = None
+        ) -> None:
+            if sandbox_addr == "sb-settle" and not release_settlement.is_set():
+                in_settlement.set()
+                release_settlement.wait(timeout=2.0)
+            orig_update(sandbox_addr, status, incarnation_id=incarnation_id)
+
+        def _flaky_audit(
+            actor: str, action: str, target: str, outcome: str, detail: Any = None
+        ) -> int:
+            if action == "revoke" and target == "sb-settle" and fail_revoke_audit["enabled"]:
+                fail_revoke_audit["enabled"] = False
+                raise OSError("simulated_audit_write_failure")
+            return orig_audit(actor, action, target, outcome, detail)
+
+        reg.update_sandbox_status = _slow_update  # type: ignore[method-assign]
+        reg.append_audit = _flaky_audit  # type: ignore[method-assign]
+
+        # 1. close(timeout_s=0.05) blocked INSIDE settlement must return within deadline
+        t0 = time.monotonic()
+        with self.assertRaises(CoordPolicyError):
+            hub.close(timeout_s=0.05)
+        elapsed = time.monotonic() - t0
+        self.assertTrue(in_settlement.is_set())
+        self.assertLess(elapsed, 0.35)
+        self.assertTrue(hub._session_active_marker.exists())
+        self.assertGreaterEqual(hub._state_lock_fd, 0)
+
+        # Second hub stays locked out while settlement worker is still active
+        reg_other = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
+        t_other = FakeWorkerTransport()
+        try:
+            with self.assertRaises(CoordPolicyError):
+                CoordHub(reg_other, t_other, self.state_dir, sandbox_root=self.sandbox_root)
+        finally:
+            reg_other.close()
+
+        # 2. Unblock settlement -> status writes 'revoked', then audit fails -> close fails & retains state
+        release_settlement.set()
+        with self.assertRaises(CoordPolicyError):
+            hub.close(timeout_s=1.0)
+        self.assertEqual(reg.get_sandbox("sb-settle").status, "revoked")  # type: ignore[union-attr]
+        self.assertTrue(hub._session_active_marker.exists())
+        self.assertGreaterEqual(hub._state_lock_fd, 0)
+        def _count_revoke_audits() -> int:
+            with reg._lock:
+                row = reg._conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM audit_log WHERE action = 'revoke' AND target = ?",
+                    ("sb-settle",),
+                ).fetchone()
+                return int(row["cnt"]) if row is not None else 0
+
+        self.assertEqual(_count_revoke_audits(), 0)
+
+        # 3. Retry close() completes the missing revoke audit even though status is already 'revoked'!
+        hub.close(timeout_s=1.0)
+        self.assertEqual(_count_revoke_audits(), 1)
+        self.assertTrue(reg.verify_audit_chain()[0])
+        self.assertTrue(hub._degraded_marker.exists())
+        self.assertTrue(hub._session_active_marker.exists())
 
 
 if __name__ == "__main__":
