@@ -1168,6 +1168,21 @@ class TestBrokerHttpIntegration(unittest.TestCase):
         finally:
             b2.stop()
 
+        # HTTP-P2-R1: Non-ASCII percent-encoded UTF-8 path re-encoded cleanly on wire (no crash)
+        st_utf8, _h, _b = _raw_http_exchange(
+            self.addr,
+            _build_req(
+                "GET",
+                "/http/k8s/api/v1/namespaces/default/pods/caf%C3%A9",
+                headers=self._auth_hdr(),
+            ),
+        )
+        self.assertEqual(st_utf8, 200)
+        self.assertEqual(
+            self.upstream.recorded[-1].target,
+            "/api/v1/namespaces/default/pods/caf%C3%A9",
+        )
+
         # HTTP-P1-6: unconditional stripping of auth/credential/override/Expect headers
         st_c, _h, _b = _raw_http_exchange(
             self.addr,
@@ -1229,17 +1244,29 @@ class TestBrokerHttpIntegration(unittest.TestCase):
         st_dup_ct, _h, _b = _raw_http_exchange(self.addr, dup_ct_raw)
         self.assertEqual(st_dup_ct, 400)
 
-        # Non-form Content-Type with Action=AssumeRole body alongside ?Action=GetCallerIdentity -> 403
-        st_nf, _h, _b = _raw_http_exchange(
-            self.addr,
-            _build_req(
-                "POST",
-                "/aws/sts?Action=GetCallerIdentity",
-                headers={"Content-Type": "text/plain", **sig},
-                body=body,
-            ),
-        )
-        self.assertEqual(st_nf, 403)
+        # Non-form Content-Type with Action=AssumeRole or %41ction=AssumeRole body -> 403
+        for smuggle_body in (body, b"%41ction=AssumeRole"):
+            smuggle_sig = sign_aws_sigv4(
+                method="POST",
+                raw_path="/aws/sts",
+                raw_query="Action=GetCallerIdentity",
+                host_header="127.0.0.1",
+                body=smuggle_body,
+                access_key=job_ak,
+                secret_key=job_sk,
+                region="us-east-1",
+                service="sts",
+            )
+            st_nf, _h, _b = _raw_http_exchange(
+                self.addr,
+                _build_req(
+                    "POST",
+                    "/aws/sts?Action=GetCallerIdentity",
+                    headers={"Content-Type": "text/plain", **smuggle_sig},
+                    body=smuggle_body,
+                ),
+            )
+            self.assertEqual(st_nf, 403)
 
         # Case-insensitive action= smuggling -> 403
         q_case = "Action=GetCallerIdentity&action=AssumeRole"

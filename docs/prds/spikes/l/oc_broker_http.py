@@ -1410,7 +1410,8 @@ class _GraphQLParser:
 
     def _parse_definition(self) -> None:
         tok = self._peek()
-        assert tok is not None
+        if tok is None:
+            raise GraphQLParseError("Unexpected end of GraphQL document")
         if tok.kind == "PUNCT" and tok.value == "{":
             self.operation_types.append("query")
             self._parse_selection_set(1)
@@ -1656,7 +1657,8 @@ def _extract_body_action_params(req: ParsedHttpRequest) -> list[str]:
         except UnicodeDecodeError as exc:
             raise HttpErrorResponse(400, "invalid_form_encoding") from exc
         return _extract_action_params(body_text)
-    if b"action=" in req.body.lower():
+    body_text = req.body.decode("utf-8", errors="replace")
+    if _extract_action_params(body_text) or "action=" in unquote(body_text).lower():
         raise HttpErrorResponse(403, "aws_ambiguous_action_denied")
     return []
 
@@ -1860,7 +1862,8 @@ def _build_upstream_request_bytes(
     out_body: bytes,
 ) -> tuple[bytes, list[str]]:
     upstream_path = join_upstream_path(upstream.base_path, rel_path)
-    target = f"{upstream_path}?{raw_query}" if raw_query else upstream_path
+    wire_path = "/".join(quote(seg, safe="-_.~:@!$&'()*+,=") for seg in upstream_path.split("/"))
+    target = f"{wire_path}?{raw_query}" if raw_query else wire_path
     host_header = upstream.host if upstream.port == 443 else f"{upstream.host}:{upstream.port}"
 
     strip_names = HOP_BY_HOP_HEADERS | req.connection_tokens | IGNORED_INBOUND_HEADERS
@@ -2251,10 +2254,12 @@ class HostHttpBrokerServer:
                 pass
 
     def _accept_loop(self) -> None:
-        assert self._sock is not None
+        srv = self._sock
+        if srv is None:
+            return
         while not self._stop.is_set():
             try:
-                conn, _ = self._sock.accept()
+                conn, _ = srv.accept()
             except TimeoutError:
                 continue
             except OSError:
