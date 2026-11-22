@@ -176,7 +176,13 @@ routing:
      verified, no auto-apply per [prd_i2](prd_i2.md)) and stored strictly in a host-owned `0o700`
      spool under `$STATE/inbox-spool/<job_id>/` outside `~/opencode-sandbox`, exposed to the
      recipient **either** as a `:ro` bind mount at `/run/oc-inbox/<msg_id>.patch` or via an
-     authenticated `/mcp/oc-swarm` `artifact_read(blob_sha256)` tool.
+     authenticated `/mcp/oc-swarm` `artifact_read(blob_sha256)` tool. Before copying data, verify
+     the current grant, source reference ownership, rate, and mailbox capacity. Reserve bounded
+     per-edge and global staging bytes and work slots. Keep staged entries private. Revalidate
+     the original admission in the outbox transaction and transfer the manifest only on commit.
+     On rejection, release failed admission reservations and reclaim uncommitted files. After
+     restart, reconcile staging manifests with committed rows and reclaim abandoned entries
+     after fencing the previous writer.
    - **Deadlock freedom:** All sends are asynchronous mailbox appends; `agent_wait(targets, since_seq,
      timeout_s)` maintains an in-memory `WaitForGraph` and immediately rejects any wait closing a
      cycle (`DeadlockCycleRejected`).
@@ -206,9 +212,6 @@ function handle_bus_send(caller_principal, req):
     if len(req.body_text.encode("utf-8")) > 65536:
         return error(413, "inline_body_too_large_use_artifact")
 
-    # Stage bounded artifacts privately. Publish them only through the same delivery fence.
-    staged_blobs = stage_verified_blobs_to_host_ro_spool(req.artifact_refs, target_addr)
-    host_msg_id = mint_crypto_msg_id_128bit()
     with controller.routing_fence(caller_principal, target_addr, thread_id), registry_db.transaction():
         edge = routing_table.find_active_edge(caller_principal, target_addr, thread_id, msg_kind)
         if edge is None or not controller.check_current_grant(edge.lease_id, edge.generation):
@@ -216,15 +219,24 @@ function handle_bus_send(caller_principal, req):
         src_inc, dst_inc = require_current_edge_incarnations(edge, caller_principal, target_addr)
         if req.in_reply_to is not None:
             require_replyable(req.in_reply_to, caller_principal, edge.edge_id, thread_id)
-        enforce_rate_and_mailbox_limits(edge)
-        turn = routing_table.consume_turn_if_available(edge, caller_principal.role)
-        env = stamp_host_envelope(host_msg_id, caller_principal, src_inc, target_addr, dst_inc,
-                                  thread_id, msg_kind, req, turn, staged_blobs)
-        seq = event_log.append(env)
-        dispatch_receipts.insert(target_addr, dst_inc, thread_id, host_msg_id,
-                                 sha256(env.body_text), caller_principal)
-        outbox.enqueue_delivery(seq, host_msg_id, edge.id, edge.lease_id, edge.generation,
-                                src_inc, dst_inc, thread_id)
+        require_owned_bounded_artifact_refs(caller_principal, req.artifact_refs)
+        admission = reserve_rate_mailbox_and_staging_capacity(edge, src_inc, dst_inc, req)
+    try:
+        staged_blobs = stage_private_verified_blobs(req.artifact_refs, admission)
+        host_msg_id = mint_crypto_msg_id_128bit()
+        with controller.routing_fence_for_admission(admission), registry_db.transaction():
+            edge = require_current_admission(admission)
+            turn = routing_table.consume_turn_if_available(edge, caller_principal.role)
+            env = stamp_host_envelope(host_msg_id, caller_principal, src_inc, target_addr, dst_inc,
+                                      thread_id, msg_kind, req, turn, staged_blobs)
+            seq = event_log.append(env)
+            dispatch_receipts.insert(target_addr, dst_inc, thread_id, host_msg_id,
+                                     sha256(env.body_text), caller_principal)
+            outbox.enqueue_delivery(seq, host_msg_id, edge.id, edge.lease_id, edge.generation,
+                                    src_inc, dst_inc, thread_id)
+            commit_staging_manifest_and_consume_mailbox_reservation(admission, host_msg_id)
+    finally:
+        reclaim_uncommitted_staging_and_release_failed_admission(admission)
     wake_waiters(target_addr, seq)
     return {"msg_id": host_msg_id, "seq": seq}
 
@@ -245,9 +257,15 @@ function dispatch_pending(row):
 
 function revoke_edge(edge):
     with controller.routing_fence_for_edge(edge):
-        controller.fence_dispatch_immediately(edge)
-        registry_db.persist_revocation_and_cancel_pending_rows(edge)
-    close_issued_streams_and_wake_waiters(edge)
+        affected = controller.fence_dispatch_and_detach_local_work(edge)
+    # Cancel every detached stream and wake every waiter, without waiting for the database.
+    cancel_issued_streams_and_wake_waiters_nonblocking(affected)
+    try:
+        registry_db.persist_revocation_and_cancel_pending_rows(edge.pins)
+    except PersistenceError:
+        controller.keep_revocation_fence_and_mark_store_degraded(edge)
+        return error(503, "revoked_locally_persistence_unconfirmed")
+    return status("revoked")
 ```
 
 ### Failure, recovery, and verification tests
@@ -260,10 +278,12 @@ function revoke_edge(edge):
     without proof that zero bytes were sent leaves the outcome uncertain. Keep the original
     `msg_id` for reconciliation and require trusted terminal evidence before retry. A worker's
     status alone cannot prove non-delivery.
-  - Revocation persists a tombstone for the old grant generation. If writing it fails, remain
-    fenced and fail closed through recovery until the grant state can be confirmed. Revoking a
-    sandbox, worker, or `@PEER` removes all incident edges, closes dispatched streams, and wakes
-    blocked `agent_wait` callers with `edge_revoked`. Qualify the `<1s` cascade separately.
+  - Revocation immediately fences the old generation and detaches its streams and waiters.
+    Issue nonblocking local cancellation and `edge_revoked` notifications before attempting
+    the durable tombstone. A failure to notify one detached consumer cannot skip the others.
+    If persistence fails, report incomplete durability, keep admission closed, and require
+    confirmed grant state before reopening. After a controller restart, the fresh grant
+    requirement still applies. Qualify the `<1s` cascade separately.
 - **Verification tests:**
   1. Fuzz/property tests on `parse_canonical_addr` / `format_canonical_addr` proving bijection,
      rejection of `/`, `local / foo`, `peer / foo`, `RESERVED_NAMES`, `..`, bidi overrides, and
@@ -288,6 +308,10 @@ function revoke_edge(edge):
      restarts the outbox with the worker incarnation unchanged. Verify zero worker deliveries.
      Also cover handoff winning the race, uncertain delivery after a crash, and two concurrent
      sends contesting the final available turn.
+  7. Hold one stream open and one waiter blocked while the tombstone write fails. Confirm the
+     local cancellation and waiter notification still run and recovered admission stays closed.
+     Exercise a denied send and a revoke during artifact staging. Verify zero published artifacts,
+     release of staging capacity, and recovery of the same capacity after a staging crash.
 
 ## Concrete gaps and checkboxes
 

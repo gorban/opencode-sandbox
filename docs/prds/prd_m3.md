@@ -459,8 +459,7 @@ function handle_browser_websocket(ws, ws_ticket):
                         input_q.discard(pending)
             if ws.has_client_frame():
                 if claim.mode == "pip_wall":
-                    ws.send_json({"type": "input_rejected", "reason": "pip_wall_read_only"})
-                    continue
+                    return close(ws, 4403, "pip_wall_read_only")
                 ev = parse_browser_input_event(ws.recv(), max_bytes=1024, viewport=hub_sub.viewport)
                     # Closed allowlist (mouse/wheel/key/viewport); coordinates clamped; no clipboard
                 with controller.surface_fence(sandbox, "browser"):
@@ -524,7 +523,8 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
      is rejected as `[Sandbox-Local / Unverified]`.
   3. Lease-fencing tests stall a PTY or browser queue, advance the generation, and verify zero
      old-generation writes after handoff, including the remainder of a partial PTY write.
-     Exercise expiry, disconnect, restart, read-only attach, and PiP. Verify backpressure
+     Exercise expiry, disconnect, restart, and read-only attach. One prohibited PiP frame
+     must close that connection once and produce zero CDP input dispatches. Verify backpressure
      never holds the surface fence while waiting for I/O.
   4. Auth, Origin, CSRF, WS-ticket, and iframe isolation tests verifying `Origin: null` and foreign
      origins are rejected on WS/mutations, single-use bootstrap codes & WS tickets cannot replay,
