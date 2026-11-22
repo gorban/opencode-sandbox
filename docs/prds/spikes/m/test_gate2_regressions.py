@@ -824,5 +824,413 @@ class TestGate2Round1Regressions(unittest.TestCase):
         self.assertEqual(len(reg.list_outbox(statuses=("cancelled",))), 1)
 
 
+def _make_dual_request_controller() -> tuple[Controller, Principal, BrokerLease, str, str]:
+    operator = Principal(Role.OPERATOR, "op-r2")
+    orchestrator = Principal(Role.ORCHESTRATOR, "orch-r2")
+    job_actor = Principal(Role.JOB, "chan-r2")
+    subject = Subject("worker-local", "inc_dual_1", "chan-r2")
+    controller = Controller(
+        incarnation="c" * 32,
+        clock=lambda: 100,
+        lifetime=3600,
+        workers=[Worker("worker-local", operator)],
+        jobs=[Job(subject, orchestrator, proposal_budget=8)],
+        capabilities=[
+            Capability("cap-sb", Operation.PROBE, "tgt-sb"),
+            Capability("cap-edge", Operation.PROBE, "tgt-edge"),
+        ],
+        references=[
+            Reference("ref-sb", "cap-sb"),
+            Reference("ref-edge", "cap-edge"),
+        ],
+        adapter=_RegFixtureAdapter(),
+    )
+    controller._set_alias("alias-sb", "tgt-sb")
+    controller._set_alias("alias-edge", "tgt-edge")
+    st_sb = controller.propose(job_actor, Proposal(Intent.PROBE_GRANT, "alias-sb", "ref-sb"))
+    v_sb = controller.view(operator, st_sb.request_id)
+    controller.decide(operator, st_sb.request_id, v_sb.payload.revision, v_sb.digest, Decision.APPROVE)
+    st_edge = controller.propose(job_actor, Proposal(Intent.PROBE_GRANT, "alias-edge", "ref-edge"))
+    v_edge = controller.view(operator, st_edge.request_id)
+    controller.decide(
+        operator, st_edge.request_id, v_edge.payload.revision, v_edge.digest, Decision.APPROVE
+    )
+    lease_sb = BrokerLease(
+        "job-dual",
+        controller=controller,
+        controller_actor=operator,
+        controller_request_id=st_sb.request_id,
+    )
+    return controller, operator, lease_sb, st_sb.request_id, st_edge.request_id
+
+
+class TestGate2Round2Regressions(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.state_dir = self.root / "state"
+        self.state_dir.mkdir(mode=0o700)
+        self.sandbox_root = self.root / "sandbox-home"
+        self.sandbox_root.mkdir(mode=0o700)
+        self.sock_dir = self.root / "run"
+        self.sock_dir.mkdir(mode=0o700)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _new_stack(self) -> tuple[CoordRegistry, FakeWorkerTransport, CoordHub]:
+        reg = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
+        transport = FakeWorkerTransport()
+        hub = CoordHub(reg, transport, self.state_dir, sandbox_root=self.sandbox_root)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        return reg, transport, hub
+
+    def test_r2_p1_1_shared_thread_wait_hides_operator_stream_and_catches_mid_wait_edge_revoke(
+        self,
+    ) -> None:
+        reg, transport, hub = self._new_stack()
+        hub.register_sandbox(
+            _OP,
+            name="peer-a",
+            incarnation_id="inc_a1",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Peer A",
+        )
+        hub.register_sandbox(
+            _OP,
+            name="target-b",
+            incarnation_id="inc_b1",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Target B",
+        )
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="target-b")
+        peer_edge = hub.grant_edge(
+            _OP,
+            src_actor="peer-a",
+            src_incarnation="inc_a1",
+            dst_addr="target-b",
+            allowed_threads=(_THREAD_MAIN,),
+            allowed_msg_kinds=("review_request",),
+        )
+        transport.queue_script(
+            "target-b",
+            TurnScript(
+                text_chunks=("TOP_SECRET_OPERATOR_ANSWER",),
+                file_edits=("secrets.env",),
+            ),
+            thread_id=_THREAD_MAIN,
+        )
+        hub.send(_OP, target="target-b", thread_id=_THREAD_MAIN, body_text="Operator secret")
+        hub.dispatch_once()
+
+        peer_a = PrincipalCtx(
+            CoordRole.JOB, "job-a", sandbox_addr="peer-a", incarnation_id="inc_a1"
+        )
+        # 1. Peer on shared 'main' thread MUST NOT see Operator's assistant text_delta/file_edit/turn_completed
+        wait_res = hub.wait(peer_a, targets=["target-b"], since_seq=0, timeout_s=0.05)
+        self.assertEqual(wait_res["events"], [])
+        self.assertTrue(wait_res["timed_out"])
+
+        # 2. Mid-wait single-edge revocation must raise RevokedError on wakeup (not return post-revoke events)
+        wait_exc: list[BaseException] = []
+        started = threading.Event()
+
+        def _waiter() -> None:
+            started.set()
+            try:
+                hub.wait(peer_a, targets=["target-b"], since_seq=0, timeout_s=2.0)
+            except BaseException as exc:
+                wait_exc.append(exc)
+
+        wt = threading.Thread(target=_waiter, daemon=True)
+        wt.start()
+        self.assertTrue(started.wait(timeout=1.0))
+        time.sleep(0.05)
+        reg.revoke_grant_and_cancel_outbox(edge_id=peer_edge.edge_id, reason="single_edge_revoked")
+        hub._notify_waiters()
+        wt.join(timeout=1.0)
+        self.assertEqual(len(wait_exc), 1)
+        self.assertIsInstance(wait_exc[0], RevokedError)
+
+    def test_r2_p1_2_restarted_hub_rejects_revoked_sandbox_request_with_distinct_edge_lease(
+        self,
+    ) -> None:
+        controller, ctrl_op, lease_sb, req_sb, req_edge = _make_dual_request_controller()
+        reg1 = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
+        transport = FakeWorkerTransport()
+        hub1 = CoordHub(
+            reg1,
+            transport,
+            self.state_dir,
+            controller=controller,
+            controller_actor=ctrl_op,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            hub1.register_sandbox(
+                _OP,
+                name="sb-dual",
+                incarnation_id="inc_dual_1",
+                project_id="p1",
+                project_name="P1",
+                branch="main",
+                task_brief="Dual lease sandbox",
+                lease=lease_sb,
+                controller_request_id=req_sb,
+            )
+            hub1.grant_edge(
+                _OP,
+                src_actor=_OP.canonical_sender,
+                dst_addr="sb-dual",
+                lease_request_id=req_edge,
+            )
+            hub1.send(_OP, target="sb-dual", body_text="Queued turn")
+        finally:
+            hub1.close()
+            reg1.close()
+
+        # Revoke ONLY sandbox controller_request_id (leaving distinct edge lease_request_id active!)
+        controller.revoke(ctrl_op, req_sb)
+
+        reg2 = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
+        hub2 = CoordHub(
+            reg2,
+            transport,
+            self.state_dir,
+            controller=controller,
+            controller_actor=ctrl_op,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            self.assertEqual(hub2.dispatch_once(), 0)
+            self.assertEqual(transport.dispatched_turns("sb-dual"), [])
+            with self.assertRaises(RevokedError):
+                hub2.send(_OP, target="sb-dual", body_text="Should fail closed")
+        finally:
+            hub2.close()
+            reg2.close()
+
+    def test_r2_p2_1_sql_where_pushdown_prevents_operator_flood_starving_peer_wait(self) -> None:
+        reg, transport, hub = self._new_stack()
+        hub.register_sandbox(
+            _OP,
+            name="peer-a",
+            incarnation_id="inc_a1",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Peer A",
+        )
+        hub.register_sandbox(
+            _OP,
+            name="target-b",
+            incarnation_id="inc_b1",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Target B",
+        )
+        hub.grant_edge(
+            _OP,
+            src_actor=_OP.canonical_sender,
+            dst_addr="target-b",
+            allowed_threads=(_THREAD_MAIN,),
+        )
+        hub.grant_edge(
+            _OP,
+            src_actor="peer-a",
+            src_incarnation="inc_a1",
+            dst_addr="target-b",
+            allowed_threads=(_THREAD_REVIEW,),
+            allowed_msg_kinds=("review_request",),
+        )
+        # Emit 850 operator stream events on 'main' (> 4 * 200)
+        transport.queue_script(
+            "target-b",
+            TurnScript(text_chunks=tuple(f"op-{i}" for i in range(850))),
+            thread_id=_THREAD_MAIN,
+        )
+        hub.send(_OP, target="target-b", thread_id=_THREAD_MAIN, body_text="Long op turn")
+        hub.dispatch_once()
+
+        peer_a = PrincipalCtx(
+            CoordRole.JOB, "job-a", sandbox_addr="peer-a", incarnation_id="inc_a1"
+        )
+        transport.queue_script(
+            "target-b",
+            TurnScript(text_chunks=("LGTM",)),
+            thread_id=_THREAD_REVIEW,
+        )
+        hub.send(
+            peer_a,
+            target="target-b",
+            thread_id=_THREAD_REVIEW,
+            msg_kind="review_request",
+            body_text="Check diff",
+        )
+        hub.dispatch_once()
+
+        wait_res = hub.wait(peer_a, targets=["target-b"], since_seq=0, timeout_s=0.1)
+        texts = [ev.get("text") for ev in wait_res["events"]]
+        self.assertIn("LGTM", texts)
+
+    def test_r2_p2_2_multi_principal_rpc_rate_limiter_isolates_noisy_job_from_operator(
+        self,
+    ) -> None:
+        _reg, _transport, hub = self._new_stack()
+        hub.register_sandbox(
+            _OP,
+            name="sb-rl",
+            incarnation_id="inc_rl1",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Rate limit isolation",
+        )
+        job_a = PrincipalCtx(CoordRole.JOB, "job-rl", sandbox_addr="sb-rl", incarnation_id="inc_rl1")
+        sock_path = self.sock_dir / "multi.sock"
+        rpc = CoordUdsRpcServer(
+            hub,
+            sock_path,
+            sandbox_root=self.sandbox_root,
+            token_principals={"tok_job_a": job_a, "tok_op": _OP},
+            rate_limit_max=2,
+            rate_limit_window=60.0,
+        )
+        rpc.start()
+        self.addCleanup(rpc.stop)
+
+        # Noisy job exhausts its own per-principal limit (2 allowed, 3rd denied)
+        r1 = uds_rpc_call(sock_path, "coord.status", {"target": "sb-rl"}, auth_token="tok_job_a")
+        r2 = uds_rpc_call(sock_path, "coord.status", {"target": "sb-rl"}, auth_token="tok_job_a")
+        r3 = uds_rpc_call(sock_path, "coord.status", {"target": "sb-rl"}, auth_token="tok_job_a")
+        self.assertIn("result", r1)
+        self.assertIn("result", r2)
+        self.assertEqual(r3["error"]["message"], "principal_rate_limited")
+
+        # Operator on the same multi-principal socket must NOT be starved by job_a
+        op_resp = uds_rpc_call(sock_path, "coord.status", {"target": "sb-rl"}, auth_token="tok_op")
+        self.assertIn("result", op_resp)
+
+    def test_r2_p2_3_reregister_revoked_incarnation_denied_and_rotation_cleans_unpinned_edges(
+        self,
+    ) -> None:
+        reg, _transport, hub = self._new_stack()
+        hub.register_sandbox(
+            _OP,
+            name="sb-r",
+            incarnation_id="inc_same",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Revoked inc test",
+        )
+        hub.register_sandbox(
+            _OP,
+            name="sb-dst",
+            incarnation_id="inc_dst",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Dest",
+        )
+        # Revoke sb-r at inc_same, then attempt to re-register with the SAME inc_same -> MUST FAIL
+        hub.revoke(_OP, target="sb-r", reason="kill")
+        with self.assertRaises(RevokedError):
+            hub.register_sandbox(
+                _OP,
+                name="sb-r",
+                incarnation_id="inc_same",
+                project_id="p1",
+                project_name="P1",
+                branch="main",
+                task_brief="Attempt same-inc revival",
+            )
+
+        # Legitimate rotation on sb-rot: unpinned outgoing edge (src_incarnation=None) must be revoked
+        hub.register_sandbox(
+            _OP,
+            name="sb-rot",
+            incarnation_id="inc_rot_1",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Rotatable",
+        )
+        unpinned = hub.grant_edge(
+            _OP,
+            src_actor="sb-rot",
+            src_incarnation=None,
+            dst_addr="sb-dst",
+        )
+        hub.register_sandbox(
+            _OP,
+            name="sb-rot",
+            incarnation_id="inc_rot_2",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Rotated to v2",
+        )
+        edge_after = reg.get_edge(unpinned.edge_id)
+        self.assertIsNotNone(edge_after)
+        self.assertFalse(edge_after.active)
+        self.assertTrue(hub._is_target_fenced("sb-rot", "inc_rot_1"))
+
+    def test_r2_p3_1_and_p3_2_seq_hint_bounds_and_sub_orchestrator_child_edge_pinning(
+        self,
+    ) -> None:
+        reg, _transport, hub = self._new_stack()
+        # R2-P3-1: Invalid seq_hint (negative or > 64-bit int or bool) rejected in record_stream_event
+        bad_ev = StreamEvent("text_delta", "sb-a", "inc_1", _THREAD_MAIN, seq_hint=-1, text="x")
+        with self.assertRaises(CoordValidationError):
+            reg.record_stream_event(bad_ev)
+
+        # R2-P3-2: Sub-orchestrator granting child-to-child edge checks live source & pins incarnation
+        hub.register_sandbox(
+            _OP,
+            name="orch-sub",
+            incarnation_id="inc_os1",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Sub orch",
+        )
+        orch_ctx = PrincipalCtx(
+            CoordRole.ORCHESTRATOR, "orch-sub", sandbox_addr="orch-sub", incarnation_id="inc_os1"
+        )
+        hub.register_sandbox(
+            orch_ctx,
+            name="child-1",
+            incarnation_id="inc_c1",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Child 1",
+            parent_addr="orch-sub",
+        )
+        hub.register_sandbox(
+            orch_ctx,
+            name="child-2",
+            incarnation_id="inc_c2",
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief="Child 2",
+            parent_addr="orch-sub",
+        )
+        edge = hub.grant_edge(orch_ctx, src_actor="child-1", dst_addr="child-2")
+        self.assertEqual(edge.src_incarnation, "inc_c1")
+
+        hub.revoke(orch_ctx, target="child-1", reason="stop-child-1")
+        with self.assertRaises(RevokedError):
+            hub.grant_edge(orch_ctx, src_actor="child-1", dst_addr="child-2")
+
+
 if __name__ == "__main__":
     unittest.main()

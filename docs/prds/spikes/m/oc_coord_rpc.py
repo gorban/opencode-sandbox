@@ -602,7 +602,12 @@ class CoordUdsRpcServer:
         self._token_table: dict[str, tuple[str, PrincipalCtx]] | None = (
             _build_token_table(token_principals) if token_principals is not None else None
         )
-        self.rate_limiter = SlidingWindowRateLimiter(rate_limit_max, rate_limit_window)
+        uid_rate_max = (
+            min(rate_limit_max * max(1, len(self._token_table)), rate_limit_max * 16)
+            if self._token_table is not None
+            else rate_limit_max
+        )
+        self.rate_limiter = SlidingWindowRateLimiter(uid_rate_max, rate_limit_window)
         self.principal_rate_limiter = SlidingWindowRateLimiter(rate_limit_max, rate_limit_window)
         self._workers = ListenerWorkers()
         self._listener: socket.socket | None = None

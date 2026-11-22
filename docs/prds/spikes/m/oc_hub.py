@@ -1055,7 +1055,14 @@ class CoordHub:
         addr: str,
         clean_parent: str | None,
         existing: SandboxRecord | None,
+        clean_inc: str,
     ) -> None:
+        if (
+            existing is not None
+            and existing.status == _STATUS_REVOKED
+            and existing.incarnation_id == clean_inc
+        ) or self._is_target_fenced(addr, clean_inc):
+            raise RevokedError("cannot_reregister_revoked_incarnation")
         if caller.role is CoordRole.ORCHESTRATOR:
             if existing is not None:
                 raise CoordPolicyError("orchestrator_cannot_overwrite_sandbox")
@@ -1066,16 +1073,25 @@ class CoordHub:
         self, addr: str, existing: SandboxRecord, new_incarnation: str
     ) -> None:
         self._detach_prior_lease(addr)
-        if existing.incarnation_id != new_incarnation:
-            try:
-                self._transport.abort_incarnation(
-                    addr, existing.incarnation_id, reason="incarnation_rotated"
-                )
-            except Exception:
-                pass
-            invalidate = getattr(self._registry, "invalidate_prior_incarnation", None)
-            if callable(invalidate):
-                invalidate(addr, new_incarnation, reason="incarnation_rotated")
+        if existing.incarnation_id == new_incarnation:
+            return
+        with self._meta_lock:
+            self._fenced_targets.add((addr, existing.incarnation_id))
+        orch_actor = f"{_ORCH_ACTOR_PREFIX}{addr}"
+        with self._wait_cond:
+            for w in self._waiters:
+                if addr in w.targets or w.caller_actor in (addr, orch_actor):
+                    w.revoked = True
+            self._wait_cond.notify_all()
+        try:
+            self._transport.abort_incarnation(
+                addr, existing.incarnation_id, reason="incarnation_rotated"
+            )
+        except Exception:
+            pass
+        invalidate = getattr(self._registry, "invalidate_prior_incarnation", None)
+        if callable(invalidate):
+            invalidate(addr, new_incarnation, reason="incarnation_rotated")
 
     def _check_register_lease(self, lease: BrokerLease | None) -> None:
         if lease is None:
@@ -1113,7 +1129,9 @@ class CoordHub:
 
         with self._register_lock:
             existing = self._registry.get_sandbox(addr.canonical)
-            self._enforce_register_caller_scope(caller, addr.canonical, clean_parent, existing)
+            self._enforce_register_caller_scope(
+                caller, addr.canonical, clean_parent, existing, clean_inc
+            )
             depth, effective_budget = self._validate_sandbox_budget(
                 parent_addr=clean_parent,
                 sandbox_type=sandbox_type,
@@ -1200,7 +1218,10 @@ class CoordHub:
         src_sb_addr = _sandbox_addr_from_actor(src_actor)
         if src_sb_addr is None or src_sb_addr not in subtree or src_sb_addr == caller.sandbox_addr:
             raise CoordAuthError("orchestrator_edge_source_outside_subtree")
-        return clean_src_inc
+        src_sb = self._require_dst_sandbox_live(src_sb_addr, None)
+        if clean_src_inc is not None and clean_src_inc != src_sb.incarnation_id:
+            raise IncarnationMismatchError("Source child incarnation mismatch")
+        return src_sb.incarnation_id
 
     @staticmethod
     def _validate_edge_bounds(
@@ -1281,15 +1302,14 @@ class CoordHub:
         sandbox = self._registry.get_sandbox(dst_addr)
         if sandbox is None:
             raise CoordPolicyError(_ERR_SANDBOX_NOT_FOUND)
-        if sandbox.status == _STATUS_REVOKED:
+        if sandbox.status == _STATUS_REVOKED or self._is_target_fenced(dst_addr, sandbox.incarnation_id):
             raise RevokedError(_ERR_SANDBOX_REVOKED)
-        with self._meta_lock:
-            dst_fenced = (
-                dst_addr in self._fenced_addrs
-                or (dst_addr, sandbox.incarnation_id) in self._fenced_targets
-            )
-        if dst_fenced or not self._check_lease_active(
-            dst_addr, controller_request_id=lease_request_id or sandbox.controller_request_id
+        if not self._check_lease_active(dst_addr, controller_request_id=sandbox.controller_request_id):
+            raise RevokedError(_ERR_SANDBOX_REVOKED)
+        if (
+            lease_request_id is not None
+            and lease_request_id != sandbox.controller_request_id
+            and not self._check_lease_active(dst_addr, controller_request_id=lease_request_id)
         ):
             raise RevokedError(_ERR_SANDBOX_REVOKED)
         return sandbox
@@ -1992,6 +2012,19 @@ class CoordHub:
         for addr in target_addrs:
             self._assert_single_target_not_revoked(addr)
 
+    def _reauthorize_wait_targets(
+        self, caller: PrincipalCtx, target_addrs: Sequence[str]
+    ) -> dict[str, frozenset[str]]:
+        allowed_map: dict[str, frozenset[str]] = {}
+        for addr in target_addrs:
+            try:
+                allowed = self._authorize_target_read(caller, addr)
+            except CoordAuthError as exc:
+                raise RevokedError(_ERR_EDGE_REVOKED) from exc
+            if allowed is not None:
+                allowed_map[addr] = allowed
+        return allowed_map
+
     def _wait_loop_locked(
         self,
         waiter: _WaiterState,
@@ -2007,9 +2040,10 @@ class CoordHub:
             if waiter.revoked:
                 raise RevokedError(_ERR_EDGE_REVOKED)
             self._assert_targets_not_revoked(caller.canonical_sender, target_addrs)
-            self._verify_caller_live(caller)
+            live_threads = self._reauthorize_wait_targets(caller, target_addrs)
+            eff_threads = live_threads if threads_filter is not None else None
             events = self._list_scoped_wait_events(
-                target_addrs, since_seq, threads_filter, req_incs, exclude_trust
+                target_addrs, since_seq, eff_threads, req_incs, exclude_trust
             )
             if events:
                 return {"events": events, "last_seq": events[-1]["seq"], "timed_out": False}

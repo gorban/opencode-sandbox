@@ -1593,7 +1593,7 @@ class CoordRegistry:
                 JOIN event_log e ON e.msg_id = o.msg_id
                 WHERE o.status = ? AND (
                     (e.dst_addr = ? AND o.dst_incarnation != ?)
-                    OR ((e.src_actor = ? OR e.src_actor = ?) AND o.src_incarnation IS NOT NULL AND o.src_incarnation != ?)
+                    OR ((e.src_actor = ? OR e.src_actor = ?) AND (o.src_incarnation IS NULL OR o.src_incarnation != ?))
                 )
                 """,
                 (_STATUS_PENDING, clean_addr, new_incarnation_id, clean_addr, orch_actor, new_incarnation_id),
@@ -1606,7 +1606,7 @@ class CoordRegistry:
                 SELECT edge_id, grant_generation FROM routing_edges
                 WHERE active = 1 AND (
                     dst_addr = ?
-                    OR ((src_actor = ? OR src_actor = ?) AND src_incarnation IS NOT NULL AND src_incarnation != ?)
+                    OR ((src_actor = ? OR src_actor = ?) AND (src_incarnation IS NULL OR src_incarnation != ?))
                 )
                 ORDER BY edge_id ASC
                 """,
@@ -2073,6 +2073,8 @@ class CoordRegistry:
             raise CoordValidationError("event must be a StreamEvent")
         if event.event_type not in STREAM_EVENT_TYPES:
             raise CoordValidationError(f"Unsupported StreamEvent type: {event.event_type!r}")
+        if type(event.seq_hint) is not int or not (0 <= event.seq_hint <= (1 << 63) - 1):
+            raise CoordValidationError("StreamEvent seq_hint must be a non-negative 64-bit integer")
         parse_local_target(event.sandbox_addr)
         validate_opaque_token(event.incarnation_id, "incarnation_id")
         validate_thread_id(event.thread_id)
@@ -2148,35 +2150,53 @@ class CoordRegistry:
             }
 
     @staticmethod
-    def _event_trust_excluded(item: dict[str, Any], exclude_trust_classes: frozenset[str]) -> bool:
-        if not exclude_trust_classes:
-            return False
-        trust = item.get("trust_class")
-        if trust is not None and str(trust) in exclude_trust_classes:
-            return True
-        return (
-            item.get("badge") == ProvenanceBadge.OPERATOR.value
-            and TrustClass.OPERATOR_DIRECTIVE.value in exclude_trust_classes
-        )
-
-    @staticmethod
-    def _event_allowed_by_scope(
-        item: dict[str, Any],
+    def _build_per_sandbox_sql_filter(
+        addrs: list[str],
         *,
+        addr_col: str,
+        inc_col: str,
+        thread_col: str,
         allowed_threads_by_sandbox: Mapping[str, frozenset[str]] | None,
         required_incarnations: Mapping[str, str] | None,
+    ) -> tuple[str | None, list[Any]]:
+        per_addr: list[str] = []
+        params: list[Any] = []
+        for addr in addrs:
+            parts = [f"{addr_col} = ?"]
+            sub_params: list[Any] = [addr]
+            if required_incarnations is not None:
+                req_inc = required_incarnations.get(addr)
+                if req_inc is None:
+                    continue
+                parts.append(f"{inc_col} = ?")
+                sub_params.append(req_inc)
+            if allowed_threads_by_sandbox is not None:
+                threads = sorted(allowed_threads_by_sandbox.get(addr, ()))
+                if not threads:
+                    continue
+                t_ph = ",".join("?" for _ in threads)
+                parts.append(f"{thread_col} IN ({t_ph})")
+                sub_params.extend(threads)
+            per_addr.append("(" + " AND ".join(parts) + ")")
+            params.extend(sub_params)
+        if not per_addr:
+            return None, []
+        return "(" + " OR ".join(per_addr) + ")", params
+
+    @staticmethod
+    def _build_stream_trust_sql_filter(
         exclude_trust_classes: frozenset[str],
-    ) -> bool:
-        addr = str(item.get("dst_addr") or item.get("sandbox_addr") or "")
-        inc = str(item.get("dst_incarnation") or item.get("incarnation_id") or "")
-        thread_id = str(item.get("dst_thread_id") or item.get("thread_id") or "")
-        if required_incarnations is not None and required_incarnations.get(addr) != inc:
-            return False
-        if allowed_threads_by_sandbox is not None:
-            allowed_threads = allowed_threads_by_sandbox.get(addr)
-            if allowed_threads is None or thread_id not in allowed_threads:
-                return False
-        return not CoordRegistry._event_trust_excluded(item, exclude_trust_classes)
+    ) -> tuple[list[str], list[Any]]:
+        if not exclude_trust_classes:
+            return [], []
+        excluded = sorted(exclude_trust_classes)
+        ph = ",".join("?" for _ in excluded)
+        clauses = [f"(e.trust_class IS NULL OR e.trust_class NOT IN ({ph}))"]
+        params: list[Any] = list(excluded)
+        if TrustClass.OPERATOR_DIRECTIVE.value in exclude_trust_classes:
+            clauses.append("(s.badge IS NULL OR s.badge != ?)")
+            params.append(ProvenanceBadge.OPERATOR.value)
+        return clauses, params
 
     def has_committed_artifact(
         self, sandbox_addr: str, incarnation_id: str, blob_sha256: str
@@ -2216,39 +2236,58 @@ class CoordRegistry:
         addrs = sorted({str(a) for a in sandbox_addrs})
         if not addrs:
             return []
-        placeholders = ",".join("?" for _ in addrs)
-        fetch_limit = limit * 4 if (allowed_threads_by_sandbox or required_incarnations or exclude_trust_classes) else limit
+        ev_scope_sql, ev_params = self._build_per_sandbox_sql_filter(
+            addrs,
+            addr_col="dst_addr",
+            inc_col="dst_incarnation",
+            thread_col="dst_thread_id",
+            allowed_threads_by_sandbox=allowed_threads_by_sandbox,
+            required_incarnations=required_incarnations,
+        )
+        st_scope_sql, st_params = self._build_per_sandbox_sql_filter(
+            addrs,
+            addr_col="s.sandbox_addr",
+            inc_col="s.incarnation_id",
+            thread_col="s.thread_id",
+            allowed_threads_by_sandbox=allowed_threads_by_sandbox,
+            required_incarnations=required_incarnations,
+        )
+        if ev_scope_sql is None or st_scope_sql is None:
+            return []
+
+        ev_clauses = [ev_scope_sql, "seq > ?"]
+        ev_params.append(since_seq)
+        if exclude_trust_classes:
+            excluded = sorted(exclude_trust_classes)
+            ph = ",".join("?" for _ in excluded)
+            ev_clauses.append(f"trust_class NOT IN ({ph})")
+            ev_params.extend(excluded)
+        ev_params.append(limit)
+
+        st_clauses = [st_scope_sql, "s.seq > ?"]
+        st_params.append(since_seq)
+        trust_clauses, trust_params = self._build_stream_trust_sql_filter(exclude_trust_classes)
+        st_clauses.extend(trust_clauses)
+        st_params.extend(trust_params)
+        st_params.append(limit)
+
         with self._lock:
             ev_rows = self._conn.execute(
-                f"""
-                SELECT * FROM event_log
-                WHERE dst_addr IN ({placeholders}) AND seq > ?
-                ORDER BY seq ASC LIMIT ?
-                """,
-                (*addrs, since_seq, fetch_limit),
+                f"SELECT * FROM event_log WHERE {' AND '.join(ev_clauses)} ORDER BY seq ASC LIMIT ?",
+                tuple(ev_params),
             ).fetchall()
             st_rows = self._conn.execute(
                 f"""
-                SELECT * FROM stream_events
-                WHERE sandbox_addr IN ({placeholders}) AND seq > ?
-                ORDER BY seq ASC LIMIT ?
+                SELECT s.* FROM stream_events s
+                LEFT JOIN event_log e ON e.msg_id = s.message_id
+                WHERE {' AND '.join(st_clauses)}
+                ORDER BY s.seq ASC LIMIT ?
                 """,
-                (*addrs, since_seq, fetch_limit),
+                tuple(st_params),
             ).fetchall()
         merged = [_row_to_event_log_dict(r) for r in ev_rows] + [
             _row_to_stream_event_dict(r) for r in st_rows
         ]
-        if allowed_threads_by_sandbox is not None or required_incarnations is not None or exclude_trust_classes:
-            merged = [
-                item
-                for item in merged
-                if self._event_allowed_by_scope(
-                    item,
-                    allowed_threads_by_sandbox=allowed_threads_by_sandbox,
-                    required_incarnations=required_incarnations,
-                    exclude_trust_classes=exclude_trust_classes,
-                )
-            ]
         merged.sort(key=lambda item: int(item["seq"]))
         return merged[:limit]
 
