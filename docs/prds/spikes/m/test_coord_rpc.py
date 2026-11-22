@@ -414,14 +414,16 @@ class TestCoordUdsRpcServer(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sock_path = Path(tmp) / "rpc_dir" / "operator.sock"
             # Reject invalid server configs
+            nan_timeout = float("nan")
+            op_principal = PrincipalCtx(CoordRole.OPERATOR, "op1")
             with self.assertRaises(ValueError):
-                CoordUdsRpcServer(hub, sock_path, io_timeout=float("nan"))
+                CoordUdsRpcServer(hub, sock_path, io_timeout=nan_timeout)
             with self.assertRaises(ValueError):
                 CoordUdsRpcServer(
                     hub,
                     sock_path,
                     required_auth_token="tok_a",
-                    token_principals={"tok_b": PrincipalCtx(CoordRole.OPERATOR, "op1")},
+                    token_principals={"tok_b": op_principal},
                 )
 
             with CoordUdsRpcServer(hub, sock_path, max_concurrent_conns=1, io_timeout=0.15):

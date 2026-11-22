@@ -159,21 +159,23 @@ def _is_loopback_hostname(hostname: str) -> bool:
         return False
 
 
-def _extract_raw_port(host_entry: str) -> str | None:
+def _validate_raw_port(host_entry: str) -> None:
     if host_entry.startswith("["):
         closing = host_entry.find("]")
         if closing == -1:
             raise UiAuthValidationError(f"Malformed IPv6 host entry: {host_entry!r}")
         tail = host_entry[closing + 1 :]
         if not tail:
-            return None
+            return
         if not tail.startswith(":"):
             raise UiAuthValidationError(f"Malformed IPv6 port suffix: {host_entry!r}")
-        return tail[1:]
-    if ":" not in host_entry:
-        return None
-    _, port_part = host_entry.rsplit(":", 1)
-    return port_part
+        raw_port = tail[1:]
+    elif ":" in host_entry:
+        _, raw_port = host_entry.rsplit(":", 1)
+    else:
+        return
+    if not raw_port or not (raw_port.isascii() and raw_port.isdigit()) or raw_port.startswith("0"):
+        raise UiAuthValidationError(f"Invalid port in allowed host: {host_entry!r}")
 
 
 def _validate_loopback_host_entry(raw: object) -> str:
@@ -183,10 +185,7 @@ def _validate_loopback_host_entry(raw: object) -> str:
         raise UiAuthValidationError(str(exc)) from exc
     if not text or any(ch.isspace() for ch in text) or "/" in text or "@" in text:
         raise UiAuthValidationError(f"Invalid allowed host entry: {raw!r}")
-    raw_port = _extract_raw_port(text)
-    if raw_port is not None:
-        if not raw_port or not (raw_port.isascii() and raw_port.isdigit()) or raw_port.startswith("0"):
-            raise UiAuthValidationError(f"Invalid port in allowed host: {raw!r}")
+    _validate_raw_port(text)
     parsed = urlsplit(f"http://{text}")
     if parsed.netloc != text or parsed.hostname is None:
         raise UiAuthValidationError(f"Malformed allowed host entry: {raw!r}")
