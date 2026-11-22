@@ -97,7 +97,7 @@ All three child PRDs share three explicit extensions to `oc_controller.py` ([prd
 2. **`PaidFallbackGrant`:** Durable operator-approved record bound to
    `(source_bucket_id, target_api_route_id, allowed_models, max_spend_usd, max_concurrent, expires_at)`
    with persistent `spent_usd` and pre-flight reservations surviving daemon/controller restarts.
-3. **`InputLease`:** Strictly ephemeral in-memory interactive write lease bound to
+3. **`InputLease`:** Strictly ephemeral in-memory PTY and Browser write lease bound to
    `(operator_session, target_addr, surface_kind: "opencode-tui" | "shell" | "browser", generation,
    expires_at)`. On `oc_daemon` or `oc_controller` restart, all `InputLease`s invalidate
    immediately and bump `generation` ([prd_i2](prd_i2.md)).
@@ -189,7 +189,8 @@ All three child PRDs share three explicit extensions to `oc_controller.py` ([prd
 - Gate 1 design review round 2 (`Security-Focused PR Reviewer Setup`, `3f43443..5d618be`):
   **GATE 1 CLEARED** at commit `5d618bed556bea41e48c46a8a90d4b453a9f2c85` (prior to embedded
   browser & composable browser bundle additions).
-- Gate 1 design review round 3 (covering embedded browser views, CDP arbiter, composable browser
-  bundles, AXI vs MCP comparison, and orchestrator skill Pattern 4): pending.
+- Gate 1 design review round 3 (`Security-Focused PR Reviewer Setup`, `5495ae3..d620f70`, embedded
+  browser & composable bundle additions): 3 P1, 2 P2, and 2 P3 findings addressed in this revision.
+- Gate 1 design review round 4 (`Security-Focused PR Reviewer Setup`): pending.
 
 - [ ] **Human review**: checked only when the user says so

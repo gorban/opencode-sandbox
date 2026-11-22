@@ -118,7 +118,10 @@ Sidebar Tree (3-Level Hierarchy)
   - **Null-Origin Sandboxed Iframes (PTY & Browser Canvas):** Because `<iframe sandbox="allow-scripts">`
     assigns an opaque `null` origin where `'self'` does not match, pin iframe scripts via an
     explicit CSP SHA-256 hash or exact static origin URL (`script-src 'sha256-...'` /
-    `http://127.0.0.1:<bound_port>/static/confined/`), with `connect-src 'none'` and `default-src 'none'`.
+    `http://127.0.0.1:<bound_port>/static/confined/`), with `default-src 'none'; connect-src 'none'`.
+    The Browser Canvas iframe additionally locks `img-src 'none'; worker-src 'none'` and decodes
+    host-verified JPEG/PNG `ArrayBuffer` frames strictly onto `<canvas>` via
+    `createImageBitmap(new Blob(...))`.
   - The Sidebar Tree, Model/Variant Picker, 5h/7d Quota Bar, Paid-Fallback Lock, **Approval Inbox**
     (rendering `oc_controller.view(operator, request_id)` with exact `security_delta`, `plan_digest`,
     and `(request_id, revision, digest)` binding), **Revoke Grants**, and **Input Lease Bar** live
@@ -202,83 +205,125 @@ sequenceDiagram
     (`<= 1–2 fps`, capped JPEG/PNG frame bytes, explicit staleness/disconnect indicator) strictly
     for running sandboxes with `cap:browser.chromium@1.0`; clicking any tile expands it into the
     live per-sandbox `Browser` view.
-- **Pod-Local `builtin/chromium-managed` + Internal HTTPS (`prd_d` + `prd_e`), Zero Host Ports:**
+- **Pod-Local `builtin/chromium-managed`, Unidirectional `isolated-sidecars` Wiring, & Internal
+  HTTPS (`prd_d` + `prd_e`), Zero Host Ports:**
   - Keeps Chromium strictly inside the sandbox pod (`builtin/chromium-managed`,
     `security_profile = "standard"`, `memory = "2g"`, `pids_limit = 256` — **no host Wayland
     Chrome window required even on local workstations**).
-  - Pod creation sets `--add-host <NAME>.oc-sandbox.internal:127.0.0.1` ([prd_d](prd_d.md)) and
-    mounts **only** that instance's leaf certificate + key issued by `oc-sandbox`'s
-    name-constrained CA ([prd_e](prd_e.md), CA private key NEVER enters the sandbox, leaf SAN
-    restricted strictly to `<NAME>.oc-sandbox.internal`, Profile E excluding IP SANs).
-  - Result: every sandbox's embedded Chromium reaches `https://<NAME>.oc-sandbox.internal` (port
-    `443`) and any other pod-local port with valid TLS certificates, **zero exposed host ports, and
-    zero port collisions across parallel local and `REMOTE` sandboxes**.
-  - DevTools port `9222` (`max_exposure = "pod-only"`, [prd_d](prd_d.md)) is **never** published on
-    the host or LAN. Host `oc_daemon` reaches the browser surface/arbiter solely over a per-job
-    `0o600` UDS (or pinned-hostkey SSH `-L <local_uds>:<remote_job_uds>` on `REMOTE` workers).
+  - **Container/OS confinement + Chromium managed enterprise policy (primary browser egress &
+    scheme boundary):** In `managed` (`isolated-sidecars`), Chromium's sidecar runs with
+    `--network=none` (blocking all external egress even via JS `fetch`/`WebSocket`), an empty
+    disposable filesystem (zero `/run/secrets/`, zero host files), and a read-only
+    `/etc/chromium/policies/managed/oc-policy.json` (`URLBlocklist: ["file://*", "chrome://*",
+    "chrome-extension://*", "devtools://*", "javascript:*"]`, `DownloadRestrictions: 3`,
+    `ExtensionInstallBlocklist: ["*"]`, `AllowFileSelectionDialogs: false`,
+    `DefaultClipboardSetting: 2`).
+  - **Internal HTTPS & strict cert separation (`prd_d` + `prd_e`):** Both containers receive
+    `--add-host <NAME>.oc-sandbox.internal:127.0.0.1` ([prd_d](prd_d.md)). The CA private key
+    NEVER enters the sandbox; `builtin/chromium-managed` receives **only the CA public certificate**
+    (read-only trust store), while the instance's **leaf private key + certificate** (SAN restricted
+    strictly to `<NAME>.oc-sandbox.internal`, Profile E recommended in [prd_e1](prd_e1.md) excluding
+    IP SANs) stays **strictly in the app container** (never mounted into Chromium).
+  - **Unidirectional `isolated-sidecars` network wiring (zero raw `:9222` to agent or host):**
+    - DevTools port `9222` (`max_exposure = "pod-only"`, [prd_d](prd_d.md)) is **never** published
+      on the host or LAN.
+    - In `managed` (`isolated-sidecars`), Chromium's isolated sidecar binds raw CDP strictly on a
+      **Chromium-only `0o600` UDS** (never mounted into the agent container; reachable only by the
+      host CDP arbiter locally or via pinned-hostkey `ssh -L <local_uds>:<remote_job_uds>` on
+      `REMOTE` workers).
+    - Because Chromium's isolated netns has its own `127.0.0.1`, a unidirectional host/pod UDS
+      forwarder (or `nftables`-scoped internal link blocking all `agent -> chromium` traffic)
+      bridges **only declared app preview port(s)** (e.g., `443` / app HTTP port — **never**
+      `9222`, `4096`, or broker ports) from Chromium's `127.0.0.1:<app_port>` to the agent
+      container's app listener. Every sandbox's Chromium therefore reaches
+      `https://<NAME>.oc-sandbox.internal` with valid TLS, zero exposed host ports, and zero port
+      collisions across parallel `local` and `REMOTE` sandboxes.
 - **Two In-App Browser Streaming Modes (Open Decision in [prd_m](prd_m.md)):**
 
 | Mode | Visual Fidelity | Footprint & Transport | License & Trade-Offs |
 |---|---|---|---|
-| **(a) CDP Screencast (`Page.startScreencast`) + Authenticated Host Arbiter (Recommended First)** | Page viewport only (no browser URL bar, HTTPS lock icon, tabs, DevTools UI, or native OS dialogs; Trusted Chrome displays verified current URL/security state from CDP `Page`/`Security` events). | Lightweight throttled JPEG/PNG frames; ideal for PiP Browser Wall tiles and remote SSH links; zero X11/Wayland/VNC daemon in pod. | Pure BSD-2-Clause host arbiter; fastest path (~3–5 days). |
+| **(a) CDP Screencast (`Page.startScreencast`) + Authenticated Host Arbiter (Recommended First)** | Page viewport only (no browser URL bar, HTTPS lock icon, tabs, DevTools UI, or native OS dialogs; Trusted Chrome displays punycode-sanitized URL and explicit `Sandbox HTTPS (Internal CA)` state). | Lightweight throttled JPEG/PNG frames via a **single per-sandbox `ScreencastHub` fan-out** in `oc_daemon` (managing `Page.screencastFrameAck` backpressure once per sandbox so PiP Wall + expanded Browser views never clobber Chromium's single screencast); zero X11/VNC daemon in pod. | Pure BSD-2-Clause host arbiter; fastest path (~3–5 days). |
 | **(b) Pod-Local Virtual Display (Xvfb / headless Wayland) + noVNC / WayVNC** | Full Chromium window: native URL bar, HTTPS lock icon, tab strip, interactive DevTools, file/print/auth dialogs. | Higher pod CPU/RAM and RFB/VNC framebuffer bandwidth; requires virtual display + VNC sidecar/entrypoint inside pod. | `noVNC` carries MPL-2.0 companion file-level terms ([prd_i2](prd_i2.md)); ~1–2 weeks; can layer on later as an optional "Full Chrome" view using the same confined iframe & `InputLease`. |
 
-- **Identical Zero-Trust Isolation & `InputLease` Model as Embedded PTYs:**
+- **Identical Zero-Trust Isolation, Frame Validation, PiP Lockout, & `InputLease` Model as PTYs:**
   - Untrusted browser pixels render strictly inside a **zero-network null-origin `<iframe
-    sandbox="allow-scripts">` (`connect-src 'none'`)** over a dedicated **`MessageChannel`** owned
-    by **Trusted Host Chrome** (which owns the operator session, CSRF-minted single-use WS ticket
-    bound to `(session_id, target_addr, surface_kind="browser")`, and `InputLease` token).
-  - Opens strictly **read-only (`observe`)** with a persistent Trusted Chrome warning that rendered
-    pixels are untrusted sandbox content (never enter host credentials or click fake approval modals
-    drawn inside the page).
-  - Clicking **"Take Control"** / **"Return to Agent"** mints/releases an ephemeral `oc_controller`
-    `InputLease(target, surface_kind="browser", generation=g, ttl)` that **suspends and fences
-    agent CDP mutations** (`browser_operator_lease_active`) while held, bumping `generation` on
-    release, disconnect, or daemon/controller restart ([prd_i2](prd_i2.md)).
+    sandbox="allow-scripts">` (`connect-src 'none'; img-src 'none'; worker-src 'none'`)** over a
+    dedicated **`MessageChannel`** owned by **Trusted Host Chrome** (which owns the operator
+    session, CSRF-minted single-use WS ticket bound to `(session_id, target_addr,
+    surface_kind="browser", mode in {"pip_wall", "interactive_view"})`, and `InputLease` token).
+  - **Strict binary frame & URL validation in `oc_daemon`:** Allowlist MIME strictly to
+    `"image/jpeg"` and `"image/png"` (**never** `image/svg+xml`), verify exact magic bytes
+    (`\xff\xd8\xff` / `\x89PNG\r\n\x1a\n`), transfer as binary `ArrayBuffer` for `<canvas>`
+    `createImageBitmap`, and sanitize display URLs by stripping control/bidi chars, converting IDN
+    hosts to ASCII punycode, capping length (`<= 2048`), and labeling TLS explicitly as
+    sandbox-internal (never implying host trust).
+  - **Read-only default, PiP input lockout, & non-blocking input bounds:** Opens strictly
+    **read-only (`observe`)** with a persistent Trusted Chrome warning that rendered pixels are
+    untrusted sandbox content (never enter host credentials or click fake approval modals drawn
+    inside the page). `pip_wall` mode **unconditionally rejects all input frames** (no blind
+    clicking on tiny PiP tiles). In `interactive_view`, clicking **"Take Control"** / **"Return to
+    Agent"** mints/releases an ephemeral `oc_controller` `InputLease(target,
+    surface_kind="browser", generation=g, ttl)` with capped input payloads (`<= 1 KiB`),
+    viewport-clamped coordinates, input rate limits, and a non-blocking bounded dispatch queue
+    (`<= 64` events).
   - Disable RFB/VNC clipboard sync (`ClientCutText`/`ServerCutText`), host drag-and-drop/file
     chooser access, and automatic pop-out links by default.
 
 ### 6. Composable opt-in browser bundles, authenticated CDP arbiter, AXI vs. MCP, and orchestrator skill
 
 - **Opt-In Composable Dependency Grouping (Mirroring `builtin/postgres-app`, [prd_l](prd_l.md)):**
-  - Browser capability is strictly an optional `bundle@1` requiring `cap:browser.chromium@1.0`
-    (selecting `builtin/chromium-managed` by default so no host Wayland window opens; opt-in
-    `builtin/browser-desktop` remains available when a native local Wayland window is explicitly
-    wanted).
+  - Browser capability is strictly an optional `bundle@1` declaring capability requirement
+    `{ capability = "cap:browser.chromium@1.0", provider = "builtin/chromium-managed" }` (so
+    swapping to `builtin/browser-desktop` composes cleanly without singleton conflicts and zero
+    host Wayland windows open by default).
   - Toggleable per `sandbox-type@1` or per launch via `with_mods` / `without_mods`: backend,
     library, and adversarial security-reviewer sandboxes incur **0 MiB Chromium RAM** and **zero
     CDP attack surface** by default.
-- **Agent CDP Access (`interactive` vs. `managed` Authenticated CDP Arbiter):**
-  - **`interactive` (`pod-shared`):** Agent tools (AXI CLI, `chrome-devtools-mcp`, or
-    `@playwright/mcp`) connect to pod-local `127.0.0.1:9222` (never published to host).
-  - **`managed` (`isolated-sidecars`, [prd_i2](prd_i2.md), [prd_l1](prd_l1.md)):** Chromium runs in
-    its own isolated sidecar network namespace so raw CDP (`9222`) is **unreachable from agent
-    code**. Both agent browser tools AND operator Take Control route through an **authenticated CDP
-    arbiter outside the agent container** (authenticated via per-job `ocjob_...` token over the
-    per-job reverse channel / UDS) enforcing:
-    1. **Generation-fenced `InputLease` arbitration:** Rejects/pauses agent CDP input/navigation
-       mutations while an operator `InputLease(surface_kind="browser")` is active.
-    2. **Closed CDP domain/method firewall (fail-closed):** Permits safe inspection & interaction
-       methods (`Page.navigate` [URL-checked], `Page.captureScreenshot`, `Accessibility.*`, `DOM.*`,
-       `Runtime.evaluate`, `Input.*`, `Console.*`, `Log.*`, `Network.enable`/read-only events,
-       `Performance.*`, `Emulation.*`), while **blocking** `Browser.close`,
-       `Browser.setDownloadBehavior`, `Browser.grantPermissions`, `Page.setDownloadBehavior`,
-       `Target.createBrowserContext` (proxy overrides), `Fetch.*` / `Network.setExtraHTTPHeaders`
-       (auth injection), `SystemInfo.*`, `Tethering.*`, host-path `Page.setInterceptFileChooserDialog`
-       / `DOM.setFileInputFiles` outside `/sandbox`, and navigation to `file://`, `chrome://`,
-       `chrome-extension://`, or non-allowlisted origins (in `--network=none` managed pods, pinned
-       to `<NAME>.oc-sandbox.internal` and pod-local loopback origins only).
+  - **Offline `--network=none` delivery (`prd_l` `toolchain_delivery`):** Browser automation CLIs
+    (`chrome-devtools-axi`) and MCP servers are pre-baked into a digest-pinned image or read-only
+    image volume verified by exact `X.Y.Z` semver + checksums in `mise.lock` — never fetched via
+    `npm` at runtime inside `--network=none` managed sandboxes.
+- **Agent CDP Access (`interactive` vs. `managed` Authenticated CDP Arbiter & Loopback Shim):**
+  - **`interactive` (`pod-shared`):** Agent tools connect directly to pod-local `127.0.0.1:9222`
+    (never published to host).
+  - **`managed` (`isolated-sidecars`, [prd_i2](prd_i2.md), [prd_l1](prd_l1.md)):** Raw Chromium
+    CDP lives on the Chromium-only `0o600` UDS unreachable from agent code. Because standard CDP
+    clients (`chrome-devtools-axi`, `chrome-devtools-mcp`, `@playwright/mcp`) do not send custom
+    `Authorization: Bearer <ocjob_token>` headers on CDP HTTP/WS calls, the per-job container-side
+    loopback TCP->UDS shim ([prd_l1](prd_l1.md)) listens on agent-local `127.0.0.1:9222`
+    (`$OC_CDP_URL=http://127.0.0.1:9222`), dials the job-exclusive SELinux-labeled `0o700` UDS
+    (`$XDG_RUNTIME_DIR/oc-sandbox/jobs/<job_id>/cdp.sock`), and injects `ocjob_...` auth to the
+    host **CDP arbiter** enforcing:
+    1. **Strict `InputLease` fencing (blocks both mutations and input observation):** While an
+       operator holds `InputLease(surface_kind="browser")`, the arbiter rejects **all** agent CDP
+       mutations AND script/page-inspection commands that could keylog, hijack, or spoof during
+       Take Control (`Input.*`, `Page.*` mutations, `DOM.*` mutations, `Runtime.*`, `Emulation.*`,
+       `Target.*`, `Network.getResponseBody`, `Network.getRequestPostData`), returning
+       `423 browser_operator_lease_active`.
+    2. **Explicit closed CDP method allowlist (no `DOM.*`/`Runtime.*`/`Emulation.*` wildcards):**
+       Permits only an enumerated closed set of safe inspection & interaction methods (e.g.,
+       `Page.navigate` [URL-checked as defense-in-depth behind Chromium enterprise policy],
+       `Page.reload`, `Page.captureScreenshot`, `Accessibility.getFullAXTree`,
+       `Accessibility.queryAXTree`, `DOM.getDocument`, `DOM.querySelector`, `DOM.querySelectorAll`,
+       `DOM.describeNode`, `DOM.getBoxModel`, `Runtime.evaluate`, `Input.dispatchMouseEvent`,
+       `Input.dispatchKeyEvent`, `Input.insertText`, `Console.enable`, `Log.enable`,
+       `Network.enable`, `Performance.getMetrics`, `Emulation.setDeviceMetricsOverride`), while
+       unconditionally rejecting `DOM.setFileInputFiles`, `Page.setDownloadBehavior`,
+       `Page.setInterceptFileChooserDialog`, `Page.addScriptToEvaluateOnNewDocument`,
+       `Page.setDocumentContent`, `Page.navigateToHistoryEntry`, `Runtime.addBinding`,
+       `Target.createBrowserContext`, `Target.createTarget`, `Fetch.*`,
+       `Network.setExtraHTTPHeaders`, `Browser.*`, `SystemInfo.*`, and `Tethering.*`.
 - **Swappable Browser Automation Bundles — AXI vs. MCP Comparison (Open Decision in [prd_m](prd_m.md)):**
 
 | Bundle (`bundle@1`) | Mechanism | Pros | Cons / Risks | Effort |
 |---|---|---|---|---|
-| **`builtin/browser-axi` (`chrome-devtools-axi`, Recommended Default)** | **0-MCP** pinned CLI (`mise.toml` + `mise.lock`) + progressive-disclosure skill talking to CDP / CDP arbiter. | Cuts token consumption **~40–66%** via TOON-compressed a11y snapshots, short generation-prefixed refs (`STALE_REF` guard), and bundled multi-step actions; keeps full console/network/perf debugging; zero extra MCP server process or tool-schema bloat (same 0-MCP pattern as `builtin/postgres-app`). | Newer CLI tool — must pin exact version/checksum in `mise.lock` and audit license/supply chain before promoting to `builtin/*`; requires agent shell execution (cannot be used by shell-disabled personas). | **2–3 days** |
-| **`builtin/browser-devtools-mcp` (`chrome-devtools-mcp`, Current Baseline)** | MCP server wrapping CDP (`pinned-artifact` or pod-local). | Mature DevTools inspection; works cleanly in shell-disabled or MCP-only personas with per-tool persona filtering (`allowed_mcp_tools`). | Higher upfront MCP tool-schema tokens + verbose JSON/a11y payloads per turn. | **1–2 days** |
+| **`builtin/browser-axi` (`chrome-devtools-axi`, Recommended Default)** | **0-MCP** pre-baked CLI (`mise.toml` exact `X.Y.Z` + `mise.lock` image volume) + progressive-disclosure skill talking to `$OC_CDP_URL` (pod-local or CDP arbiter shim). | Cuts token consumption **~40–66%** via TOON-compressed a11y snapshots, short generation-prefixed refs (`STALE_REF` guard), and bundled multi-step actions; keeps full console/network/perf debugging; zero extra MCP server process or tool-schema bloat (same 0-MCP pattern as `builtin/postgres-app`). | Newer CLI tool — must pin exact semver/checksum in `mise.lock` and audit license/supply chain before promoting to `builtin/*`; requires agent shell execution (cannot be used by shell-disabled personas). | **2–3 days** |
+| **`builtin/browser-devtools-mcp` (`chrome-devtools-mcp`, Current Baseline)** | MCP server wrapping CDP (`pinned-artifact` or pre-baked pod-local). | Mature DevTools inspection; works cleanly in shell-disabled or MCP-only personas with per-tool persona filtering (`allowed_mcp_tools`). | Higher upfront MCP tool-schema tokens + verbose JSON/a11y payloads per turn. | **1–2 days** |
 | **`builtin/browser-playwright-mcp` (`@playwright/mcp`)** | MCP server with ARIA ref-based Playwright E2E automation. | Strong ergonomics for multi-step form/E2E assertions and auto-waiting selectors. | Heavier Playwright runtime footprint; less direct low-level DevTools network/performance profiling than CDP-native tools. | **2–3 days** |
 
-All three bundles require the exact same `cap:browser.chromium@1.0` service and point at the exact
-same pod-local CDP / `managed` CDP arbiter endpoint, so switching between them is a one-line
-`bundle@1` swap (`with_mods` / `without_mods`).
+All three bundles require the exact same `cap:browser.chromium@1.0` capability and talk to
+`$OC_CDP_URL` (`http://127.0.0.1:9222`), so switching between them is a one-line `bundle@1` swap
+(`with_mods` / `without_mods`).
 
 - **Orchestrator Authoring Skill Update (`docs/prds/spikes/l/orchestrator_skills/oc-sandbox-authoring/SKILL.md`):**
   Add **Pattern 4: Opt-In Composable Browser Bundles (`builtin/browser-axi` default, zero Chrome
@@ -291,14 +336,16 @@ schema_version = 1
 kind = "bundle@1"
 id = "builtin/browser-axi"
 description = "0-MCP token-efficient Chromium automation (chrome-devtools-axi over pod-local/arbiter CDP, zero host Chrome windows)."
-requires_services = ["builtin/chromium-managed"]
+requires_services = [
+  { capability = "cap:browser.chromium@1.0", provider = "builtin/chromium-managed" }
+]
 skills = ["builtin/browser-axi-qa"]
 instructions = [
-  "Managed Chromium runs in-pod with valid HTTPS for https://<NAME>.oc-sandbox.internal; inspect via `chrome-devtools-axi` against $OC_CDP_URL (no host Chrome window needed)."
+  "Managed Chromium runs in-pod with valid HTTPS for https://<NAME>.oc-sandbox.internal; inspect via pre-baked `chrome-devtools-axi` against $OC_CDP_URL (no host Chrome window needed)."
 ]
 
 [mise_tools]
-"npm:chrome-devtools-axi" = "<pinned-version>"
+"npm:chrome-devtools-axi" = "1.2.0" # example exact semver; pre-baked & verified via mise.lock
 ```
 
 ## Gate 1 pseudocode walkthrough
@@ -353,7 +400,7 @@ function handle_pty_websocket(ws, ws_ticket):
 function handle_browser_websocket(ws, ws_ticket):
     require_exact_host_and_origin(ws.headers)                # rejects null/foreign origins
     claim = controller.consume_single_use_ws_ticket(ws_ticket)
-    if claim is None or claim.surface_kind != "browser":
+    if claim is None or claim.surface_kind != "browser" or claim.mode not in ("pip_wall", "interactive_view"):
         return close(ws, 4401, "invalid_or_expired_ws_ticket")
     sandbox = registry.resolve_running_sandbox(claim.target_addr)
     if not sandbox.has_capability("cap:browser.chromium@1.0"):
@@ -361,39 +408,51 @@ function handle_browser_websocket(ws, ws_ticket):
     if not browser_pool.acquire_slot(claim.session_id, sandbox.sandbox_id):
         return close(ws, 4429, "max_concurrent_browser_views_exceeded")
 
-    # Connect to pod browser arbiter over per-job 0o600 UDS (or ssh -L remote job UDS; never host :9222)
-    arbiter = connect_job_browser_arbiter(sandbox)
-    max_fps = 2 if claim.mode == "pip_wall" else 15
+    # Subscribe to single per-sandbox ScreencastHub (manages one CDP Page.startScreencast + Ack)
+    hub_sub = screencast_hub.subscribe(sandbox, max_fps=(2 if claim.mode == "pip_wall" else 15))
+    input_q = BoundedEventQueue(max_events=64)
     try:
-        arbiter.start_screencast(max_fps=max_fps, max_frame_bytes=512*1024)
         while ws.open and sandbox.is_running() and controller.is_session_active(claim.session_id):
-            if arbiter.has_frame():
-                frame = arbiter.read_bounded_frame(max_bytes=512*1024)
-                ws.send_json({"type": "frame", "mime": frame.mime, "b64": frame.b64,
-                              "url": sanitize_display_url(frame.url), "tls_state": frame.tls_state})
+            if hub_sub.has_frame():
+                frame = hub_sub.pop_latest_frame(max_bytes=512*1024)
+                if frame.mime not in ("image/jpeg", "image/png") or not verify_image_magic(frame.mime, frame.raw_bytes):
+                    continue                                 # rejects SVG or malformed payloads
+                ws.send_json({"type": "frame_meta", "mime": frame.mime,
+                              "url": sanitize_punycode_url(frame.url, max_len=2048),
+                              "tls_state": "sandbox_internal_ca"})
+                ws.send_binary(frame.raw_bytes)              # decoded to <canvas> via createImageBitmap
+            if input_q.nonempty() and hub_sub.arbiter_writable():
+                hub_sub.dispatch_operator_input_nonblocking(input_q.pop())
             if ws.has_client_frame():
-                ev = parse_browser_input_event(ws.recv())    # allowlist: mouse/wheel/key/viewport only; no clipboard
+                if claim.mode == "pip_wall":
+                    ws.send_json({"type": "input_rejected", "reason": "pip_wall_read_only"})
+                    continue
+                ev = parse_browser_input_event(ws.recv(), max_bytes=1024, viewport=hub_sub.viewport)
+                    # Closed allowlist (mouse/wheel/key/viewport); coordinates clamped; no clipboard
                 if not controller.verify_input_lease(claim.session_id, sandbox, "browser", ev.gen):
                     ws.send_json({"type": "input_rejected", "reason": "no_or_stale_input_lease"})
                     continue
-                arbiter.dispatch_operator_input(ev)
+                if not input_q.try_enqueue_rate_limited(ev):
+                    ws.send_json({"type": "input_backpressure", "reason": "browser_input_rate_or_queue"})
     finally:
         controller.release_input_lease_for_conn(ws.id)       # bumps generation & resumes agent CDP
         browser_pool.release_slot(claim.session_id, sandbox.sandbox_id)
-        arbiter.close()
+        hub_sub.close()
 
 function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
     if not controller.check_lease_active(job_lease.request_id):
         return cdp_error(403, "lease_revoked_or_expired")
-    if cdp_req.method not in ALLOWED_AGENT_CDP_METHODS:
+    if cdp_req.method not in CLOSED_ALLOWED_AGENT_CDP_METHODS:
         return cdp_error(403, "cdp_method_denied")
-    if cdp_req.is_mutation() and controller.has_active_input_lease(sandbox, surface_kind="browser"):
+    if (cdp_req.method in LEASE_FENCED_CDP_METHODS
+            and controller.has_active_input_lease(sandbox, surface_kind="browser")):
+        # Blocks Input.*, Page/DOM mutations, Runtime.*, Emulation.*, Target.*,
+        # Network.getResponseBody / getRequestPostData while operator holds Take Control
         return cdp_error(423, "browser_operator_lease_active")
     if cdp_req.method == "Page.navigate":
         validate_sandbox_browser_url(cdp_req.params.get("url"), sandbox)
-            # Rejects file://, chrome://, chrome-extension://; in --network=none managed pods
-            # permits only <NAME>.oc-sandbox.internal and pod-local loopback origins
-    return forward_cdp_to_sidecar_9222(sandbox, cdp_req, timeout_s=10)
+            # Defense-in-depth behind Chromium --network=none + managed enterprise URLBlocklist
+    return forward_cdp_to_chromium_only_uds(sandbox, cdp_req, timeout_s=10)
 ```
 
 ### Failure, recovery, and verification tests
@@ -403,8 +462,8 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
     `InputLease`s (`opencode-tui`, `shell`, and `browser`) immediately invalidate and bump
     `generation`, returning attached views to read-only `observe` on reconnect; container-side
     `tmux` and `builtin/chromium-managed` preserve running sessions seamlessly.
-  - A `SIGSTOP`ped sandbox fills `write_q` (`16 KiB`) and yields `stdin_backpressure` without ever
-    blocking `oc_daemon`'s event loop or preventing lease release/teardown.
+  - A `SIGSTOP`ped sandbox fills `write_q` (`16 KiB`) or `input_q` (`64` events) and yields
+    backpressure without ever blocking `oc_daemon`'s event loop or preventing lease release/teardown.
   - Stopping or disconnecting a remote sandbox marks its sidebar node `offline/stopped` and marks
     any PiP Browser Wall tile stale/disconnected while keeping cached threads and audit history
     readable from `$STATE/registry.sqlite`.
@@ -418,23 +477,29 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
      with `OPENCODE_SERVER_PASSWORD` can NEVER earn `[Operator]` / `[Orchestrator -o]`, and
      replaying a host-dispatched `(message_id, body_sha256)` on a different `session_id` or sandbox
      is rejected as `[Sandbox-Local / Unverified]`.
-  3. Lease-fencing & `SIGSTOP` stall tests proving read-only attach drops `stdin`/browser input,
-     taking control pauses queued `-o` TUI turns AND blocks agent CDP mutations with
+  3. Lease-fencing & `SIGSTOP` stall tests proving read-only attach and `pip_wall` mode drop
+     `stdin`/browser input, taking control pauses queued `-o` TUI turns AND blocks agent CDP
+     mutations + `Runtime.evaluate` / `Network.getResponseBody` with
      `browser_operator_lease_active`, stale-generation input after disconnect/restart fails closed,
-     and a `SIGSTOP`ped PTY returns `stdin_backpressure` without hanging `oc_daemon`.
+     and a `SIGSTOP`ped PTY/browser returns backpressure without hanging `oc_daemon`.
   4. Auth, Origin, CSRF, WS-ticket, and iframe isolation tests verifying `Origin: null` and foreign
      origins are rejected on WS/mutations, single-use bootstrap codes & WS tickets cannot replay,
-     and scripts inside null-origin PTY/Browser iframes (`connect-src 'none'`) cannot reach
-     `oc_daemon`, cookies, `lease_token`, Tauri IPC, or `oc_controller` approvals.
-  5. Browser opt-in, internal HTTPS, & CDP arbiter security tests verifying:
+     and scripts inside null-origin PTY/Browser iframes (`connect-src 'none'`; `img-src 'none';
+     worker-src 'none'` on Browser Canvas) cannot reach `oc_daemon`, cookies, `lease_token`, Tauri
+     IPC, or `oc_controller` approvals; SVG/bad-magic frames are dropped and IDN URLs convert to
+     ASCII punycode.
+  5. Browser opt-in, `isolated-sidecars` topology, internal HTTPS, & CDP arbiter security tests:
      - Sandboxes without a browser bundle render no `Browser` tab/PiP tile, spawn zero Chromium
        containers, and return `4404 browser_service_not_enabled` on browser WS attach;
-     - Two parallel sandboxes (`feat-a`, `feat-b`) each reach `https://<NAME>.oc-sandbox.internal`
-       with valid name-constrained leaf certs and zero host port bindings or collisions;
-     - In `managed` (`isolated-sidecars`), agent code cannot connect directly to raw `:9222`, and
-       the CDP arbiter rejects `Browser.setDownloadBehavior`, `Fetch.*`, `file://`, `chrome://`,
-       and cross-origin URLs in `--network=none` pods while allowing `chrome-devtools-axi` / MCP
-       workflows cleanly.
+     - Two parallel sandboxes (`feat-a`, `feat-b`) reach `https://<NAME>.oc-sandbox.internal` over
+       the unidirectional app-port bridge with Chromium holding only the CA public cert (never leaf
+       private keys), zero host port bindings, and concurrent PiP Wall + Browser tab views sharing
+       one `ScreencastHub` without clobbering `Page.startScreencast`;
+     - In `managed` (`isolated-sidecars`), agent code cannot reach Chromium's raw CDP UDS directly,
+       Chromium `--network=none` + managed `oc-policy.json` blocks `Runtime.evaluate` `file://` /
+       `chrome://` / external `fetch` bypasses, and the CDP arbiter rejects `DOM.setFileInputFiles`,
+       `Page.addScriptToEvaluateOnNewDocument`, `Browser.*`, and `Fetch.*` while allowing pre-baked
+       `chrome-devtools-axi` / MCP workflows via the `$OC_CDP_URL` loopback->UDS auth shim.
 
 ## Concrete gaps and checkboxes
 
