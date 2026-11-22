@@ -1260,17 +1260,20 @@ class CoordHub:
                 if lease in self._pending_cleanup_leases:
                     self._pending_cleanup_leases.remove(lease)
 
-    def _settle_recovery_streams_for_incarnation_locked(
+    def _settle_streams_for_incarnation_locked(
         self, sb_addr: str, inc_id: str
     ) -> None:
-        """Settle recovery stream handles covered by a successful terminal incarnation abort."""
+        """Settle all pending stream cleanups covered by a successful terminal incarnation abort."""
         covered = [
             sid
-            for sid, (dst_addr, dst_inc, st_reason) in self._pending_cleanup_streams.items()
-            if dst_addr == sb_addr and dst_inc == inc_id and st_reason == _REASON_RECOVERY_RETIRED
+            for sid, (dst_addr, dst_inc, _st_reason) in self._pending_cleanup_streams.items()
+            if dst_addr == sb_addr and dst_inc == inc_id
         ]
         for sid in covered:
             self._pending_cleanup_streams.pop(sid, None)
+            if self._stream_abort_reasons.get(sid) == _REASON_HANDOFF_PERSIST_FAILED:
+                self._stream_authorities.pop(sid, None)
+                self._stream_abort_reasons.pop(sid, None)
 
     def _drain_pending_cleanup_incarnations(self) -> None:
         with self._meta_lock:
@@ -1282,7 +1285,7 @@ class CoordHub:
                 continue
             with self._meta_lock:
                 self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
-                self._settle_recovery_streams_for_incarnation_locked(sb_addr, inc_id)
+                self._settle_streams_for_incarnation_locked(sb_addr, inc_id)
 
     def _settle_stream_without_abort_stream(
         self, dst_addr: str, dst_inc: str, reason: str
@@ -2957,6 +2960,11 @@ class CoordHub:
             edge.edge_id, edge.grant_generation, target_addr
         )
         self._validate_caller_incarnation_and_lease(caller, live_edge)
+        req_ids = self._collect_turn_req_ids(target_addr, live_edge)
+        if (req_ids or self._requires_independent_sender_abort(live_edge, target_addr)) and not callable(
+            getattr(self._transport, "abort_stream", None)
+        ):
+            raise CoordPolicyError(_ERR_MISSING_STREAM_ABORT)
         if not control_prio:
             self._check_rate_limit(live_edge.edge_id, live_edge.rate_limit_rpm)
         reservation = self.spool.reserve(live_edge.edge_id, artifact_blobs) if artifact_blobs else None
@@ -3184,6 +3192,24 @@ class CoordHub:
         src_addr = _sandbox_addr_from_actor(edge.src_actor)
         return src_addr is not None and src_addr != dst_addr
 
+    def _prepare_dispatch_monitors_or_skip(
+        self, dst_addr: str, edge: RoutingEdge | None
+    ) -> frozenset[str] | None:
+        req_ids = self._collect_turn_req_ids(dst_addr, edge)
+        needs_stream_abort = self._requires_independent_sender_abort(edge, dst_addr)
+        try:
+            self._prepare_turn_monitors(req_ids, require_stream_abort=needs_stream_abort)
+        except _AuthorityUnavailableError:
+            return None
+        except CoordPolicyError as exc:
+            if str(exc) == _ERR_MISSING_STREAM_ABORT:
+                return None
+            raise
+        with self._meta_lock:
+            if req_ids & self._unavailable_requests:
+                return None
+        return req_ids
+
     def _dispatch_single_row(self, row: dict[str, Any], *, async_stream: bool) -> bool:
         msg_id = str(row["msg_id"])
         edge_id = str(row["edge_id"])
@@ -3212,15 +3238,9 @@ class CoordHub:
                 return False
             if liveness != "live":
                 return False
-            req_ids = self._collect_turn_req_ids(dst_addr, edge)
-            needs_stream_abort = self._requires_independent_sender_abort(edge, dst_addr)
-            try:
-                self._prepare_turn_monitors(req_ids, require_stream_abort=needs_stream_abort)
-            except _AuthorityUnavailableError:
+            req_ids = self._prepare_dispatch_monitors_or_skip(dst_addr, edge)
+            if req_ids is None:
                 return False
-            with self._meta_lock:
-                if req_ids & self._unavailable_requests:
-                    return False
             if not self._registry.mark_outbox_dispatch_started(
                 msg_id, edge_id=edge_id, grant_generation=grant_gen, dst_incarnation=dst_inc
             ):
@@ -3906,7 +3926,7 @@ class CoordHub:
             return False
         with self._meta_lock:
             self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
-            self._settle_recovery_streams_for_incarnation_locked(sb_addr, inc_id)
+            self._settle_streams_for_incarnation_locked(sb_addr, inc_id)
         return aborted
 
     def _revoke_detached_lease(self, lease: BrokerLease | None) -> None:

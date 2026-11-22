@@ -2834,11 +2834,10 @@ class TestReciprocalRound6Fixes(CoordTestBase):
         try:
             self._reg_sb(hub_a, _OP, "sb-cap", "inc_cap1", controller_request_id=req_a)
             hub_a.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-cap")
-            msg_cap = hub_a.send(_OP, target="sb-cap", body_text="Need abort_stream")["msg_id"]
             with self.assertRaises(CoordPolicyError):
-                hub_a.dispatch_once()
+                hub_a.send(_OP, target="sb-cap", body_text="Need abort_stream")
             self.assertEqual(inner_t.dispatched_turns("sb-cap"), [])
-            self.assertIn(msg_cap, {r["msg_id"] for r in reg_a.list_outbox(statuses=("pending",))})
+            self.assertEqual(reg_a.list_outbox(statuses=("pending",)), [])
             self.assertNotIn(("sb-cap", "inc_cap1"), inner_t.revoked_incarnations)
         finally:
             hub_a.close()
@@ -3519,6 +3518,64 @@ class TestReciprocalRound9Fixes(CoordTestBase):
     _reg_sb = staticmethod(TestReciprocalRound6Fixes._reg_sb)
     _wait_until = staticmethod(TestReciprocalRound6Fixes._wait_until)
 
+    def _assert_concurrent_cleanup_single_owner(
+        self, hub: CoordHub, allow_s2: dict[str, bool]
+    ) -> None:
+        start_entered = threading.Event()
+        release_start = threading.Event()
+        orig_start = threading.Thread.start
+        worker_starts = 0
+        start_lock = threading.Lock()
+
+        def _intercept_start(thr: threading.Thread) -> None:
+            nonlocal worker_starts
+            if getattr(thr, "_target", None) == hub._run_cleanup_retry_loop:
+                with start_lock:
+                    worker_starts += 1
+                    first = worker_starts == 1
+                if first:
+                    start_entered.set()
+                    release_start.wait(timeout=2.0)
+            orig_start(thr)
+
+        allow_s2["ok"] = False
+        hub._record_pending_cleanup_stream("sid_r9_2", "sb-cw", "inc_cw1", "handoff_persist_failed")
+        with mock.patch.object(threading.Thread, "start", _intercept_start):
+            t1 = threading.Thread(target=hub._ensure_cleanup_retry_worker, daemon=True)
+            t2 = threading.Thread(target=hub._ensure_cleanup_retry_worker, daemon=True)
+            t1.start()
+            self.assertTrue(start_entered.wait(timeout=1.0))
+            t2.start()
+            time.sleep(0.05)
+            release_start.set()
+            t1.join(timeout=1.5)
+            t2.join(timeout=1.5)
+        self.assertEqual(worker_starts, 1)
+        allow_s2["ok"] = True
+        self.assertTrue(self._wait_until(lambda: not hub._has_pending_cleanups()))
+        self.assertTrue(self._wait_until(lambda: hub._cleanup_state is None))
+
+    def _assert_cleanup_start_error_surfaced(
+        self, hub: CoordHub, allow_s2: dict[str, bool]
+    ) -> None:
+        orig_start = threading.Thread.start
+        allow_s2["ok"] = False
+        hub._record_pending_cleanup_stream("sid_r9_2", "sb-cw", "inc_cw1", "handoff_persist_failed")
+
+        def _fail_start(thr: threading.Thread) -> None:
+            if getattr(thr, "_target", None) == hub._run_cleanup_retry_loop:
+                raise RuntimeError("cleanup_worker_start_failed")
+            orig_start(thr)
+
+        with (
+            mock.patch.object(threading.Thread, "start", _fail_start),
+            self.assertRaises(RuntimeError),
+        ):
+            hub._ensure_cleanup_retry_worker()
+        self.assertTrue(hub.is_degraded)
+        self.assertIn("sid_r9_2", hub._pending_cleanup_streams)
+        allow_s2["ok"] = True
+
     def test_r9_p1_1_cleanup_worker_atomic_retirement_single_owner_and_start_error_surfaced(
         self,
     ) -> None:
@@ -3564,58 +3621,9 @@ class TestReciprocalRound9Fixes(CoordTestBase):
         self.assertTrue(self._wait_until(lambda: not hub._has_pending_cleanups()))
         hub._drain_pending_cleanups = orig_drain  # type: ignore[method-assign]
 
-        # Part B: Concurrent _ensure_cleanup_retry_worker() starts ONLY ONE worker thread
-        start_entered = threading.Event()
-        release_start = threading.Event()
-        orig_start = threading.Thread.start
-        worker_starts = 0
-        start_lock = threading.Lock()
-
-        def _intercept_start(thr: threading.Thread) -> None:
-            nonlocal worker_starts
-            if getattr(thr, "_target", None) == hub._run_cleanup_retry_loop:
-                with start_lock:
-                    worker_starts += 1
-                    first = worker_starts == 1
-                if first:
-                    start_entered.set()
-                    release_start.wait(timeout=2.0)
-            orig_start(thr)
-
-        allow_s2["ok"] = False
-        hub._record_pending_cleanup_stream("sid_r9_2", "sb-cw", "inc_cw1", "handoff_persist_failed")
-        with mock.patch.object(threading.Thread, "start", _intercept_start):
-            t1 = threading.Thread(target=hub._ensure_cleanup_retry_worker, daemon=True)
-            t2 = threading.Thread(target=hub._ensure_cleanup_retry_worker, daemon=True)
-            t1.start()
-            self.assertTrue(start_entered.wait(timeout=1.0))
-            t2.start()
-            time.sleep(0.05)
-            release_start.set()
-            t1.join(timeout=1.5)
-            t2.join(timeout=1.5)
-        self.assertEqual(worker_starts, 1)
-        allow_s2["ok"] = True
-        self.assertTrue(self._wait_until(lambda: not hub._has_pending_cleanups()))
-        self.assertTrue(self._wait_until(lambda: hub._cleanup_state is None))
-
-        # Part C: Startup failure surfaces RuntimeError, marks degraded, and retains handle
-        allow_s2["ok"] = False
-        hub._record_pending_cleanup_stream("sid_r9_2", "sb-cw", "inc_cw1", "handoff_persist_failed")
-
-        def _fail_start(thr: threading.Thread) -> None:
-            if getattr(thr, "_target", None) == hub._run_cleanup_retry_loop:
-                raise RuntimeError("cleanup_worker_start_failed")
-            orig_start(thr)
-
-        with (
-            mock.patch.object(threading.Thread, "start", _fail_start),
-            self.assertRaises(RuntimeError),
-        ):
-            hub._ensure_cleanup_retry_worker()
-        self.assertTrue(hub.is_degraded)
-        self.assertIn("sid_r9_2", hub._pending_cleanup_streams)
-        allow_s2["ok"] = True
+        # Part B & C: Single-owner concurrent startup and surfaced startup failure
+        self._assert_concurrent_cleanup_single_owner(hub, allow_s2)
+        self._assert_cleanup_start_error_surfaced(hub, allow_s2)
 
     def test_r9_p1_2_failed_inbound_revoke_abort_retries_automatically_and_unblocks_close(
         self,
@@ -3786,14 +3794,10 @@ class TestReciprocalRound10Fixes(CoordTestBase):
         self._reg_sb(hub, _OP, "sb-p2", "inc_p2")
         hub.grant_edge(_OP, src_actor="sb-p1", src_incarnation="inc_p1", dst_addr="sb-p2")
         p1_ctx = PrincipalCtx(CoordRole.JOB, "jp1", sandbox_addr="sb-p1", incarnation_id="inc_p1")
-        msg_p = hub.send(p1_ctx, target="sb-p2", body_text="Peer turn needs abort_stream")[
-            "msg_id"
-        ]
-
         with self.assertRaises(CoordPolicyError):
-            hub.dispatch_once(async_stream=True)
+            hub.send(p1_ctx, target="sb-p2", body_text="Peer turn needs abort_stream")
         self.assertEqual(inner.dispatched_turns("sb-p2"), [])
-        self.assertIn(msg_p, {r["msg_id"] for r in reg.list_outbox(statuses=("pending",))})
+        self.assertEqual(reg.list_outbox(statuses=("pending",)), [])
 
     def test_r10_p2_3_stalled_pre_join_cleanup_drain_respects_close_deadline(
         self,
@@ -3873,6 +3877,117 @@ class TestReciprocalRound10Fixes(CoordTestBase):
         hub.confirm_recovery(_OP, reason="purging_transport_recovered")
         self.assertFalse(hub.is_degraded)
         self.assertEqual(hub._pending_cleanup_streams, {})
+        hub.close(timeout_s=1.0)
+        self.assertFalse(hub._session_active_marker.exists())
+
+
+class TestReciprocalRound11Fixes(CoordTestBase):
+    """Red/green regressions for the two P2 findings on a4421111."""
+
+    _open_pair = TestReciprocalRound6Fixes._open_pair
+    _reg_sb = staticmethod(TestReciprocalRound6Fixes._reg_sb)
+
+    def test_r11_p2_1_unsupported_pending_peer_turn_does_not_block_eligible_turn_and_new_send_rejected(
+        self,
+    ) -> None:
+        # Phase 1: Enqueue an unsupported peer turn AND an eligible operator turn while full transport is attached
+        reg1, _t1, hub1 = self._open_pair()
+        try:
+            self._reg_sb(hub1, _OP, "sb-psrc", "inc_ps1")
+            self._reg_sb(hub1, _OP, "sb-pdst", "inc_pd1")
+            self._reg_sb(hub1, _OP, "sb-elig", "inc_el1")
+            hub1.grant_edge(_OP, src_actor="sb-psrc", src_incarnation="inc_ps1", dst_addr="sb-pdst")
+            hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-elig")
+            p_ctx = PrincipalCtx(
+                CoordRole.JOB, "jp11", sandbox_addr="sb-psrc", incarnation_id="inc_ps1"
+            )
+            # Peer row has earlier seq than eligible row (same priority)
+            msg_peer = hub1.send(p_ctx, target="sb-pdst", body_text="Unsupported peer row")[
+                "msg_id"
+            ]
+            msg_elig = hub1.send(_OP, target="sb-elig", body_text="Eligible operator row")[
+                "msg_id"
+            ]
+        finally:
+            hub1.close()
+            reg1.close()
+
+        # Phase 2: Reopen on minimal transport (no abort_stream)
+        inner = FakeWorkerTransport()
+        proxy = _NoAbortStreamTransport(inner)
+        reg2, _t2, hub2 = self._open_pair(transport=proxy)
+        self.addCleanup(reg2.close)
+        self.addCleanup(hub2.close)
+
+        # New unsupported peer send is rejected upfront before enqueue
+        with self.assertRaises(CoordPolicyError):
+            hub2.send(p_ctx, target="sb-pdst", body_text="Rejected upfront")
+
+        # Already-pending unsupported peer row sends nothing, yet eligible row STILL dispatches!
+        self.assertEqual(hub2.dispatch_once(async_stream=False), 1)
+        self.assertEqual(inner.dispatched_turns("sb-pdst"), [])
+        self.assertEqual([t.msg_id for t in inner.dispatched_turns("sb-elig")], [msg_elig])
+        self.assertIn(msg_peer, {r["msg_id"] for r in reg2.list_outbox(statuses=("pending",))})
+        self.assertIn(msg_elig, {r["msg_id"] for r in reg2.list_outbox(statuses=("completed",))})
+
+    def test_r11_p2_2_recovery_terminal_abort_settles_failed_receipt_stream_on_purging_transport(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self._reg_sb(hub, _OP, "sb-frp", "inc_frp1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-frp")
+        transport.queue_script("sb-frp", TurnScript(block_event=threading.Event()))
+        msg_frp = hub.send(_OP, target="sb-frp", body_text="Failed receipt before purging recovery")[
+            "msg_id"
+        ]
+
+        orig_abort_stream = transport.abort_stream
+        orig_abort_inc = transport.abort_incarnation
+        fail_abort_stream = {"on": True}
+
+        def _gated_abort_stream(stream_id: str, *, reason: str) -> bool:
+            if fail_abort_stream["on"]:
+                return False
+            return orig_abort_stream(stream_id, reason=reason)
+
+        def _purging_abort_incarnation(
+            sandbox_addr: str, incarnation_id: str, *, reason: str
+        ) -> bool:
+            res = orig_abort_inc(sandbox_addr, incarnation_id, reason=reason)
+            with transport._lock:
+                for sid in tuple(transport._streams):
+                    st = transport._streams[sid]
+                    if (
+                        st.turn.sandbox_addr == sandbox_addr
+                        and st.turn.incarnation_id == incarnation_id
+                    ):
+                        transport._streams.pop(sid, None)
+            fail_abort_stream["on"] = False
+            return res
+
+        def _fail_handed_off(_msg_id: str, *, stream_id: str) -> None:
+            _ = stream_id
+            raise OSError("receipt_write_failed_before_recovery")
+
+        transport.abort_stream = _gated_abort_stream  # type: ignore[method-assign]
+        transport.abort_incarnation = _purging_abort_incarnation  # type: ignore[method-assign]
+        reg.mark_outbox_handed_off = _fail_handed_off  # type: ignore[method-assign]
+
+        # Dispatch creates a retained failed-receipt stream (reason=handoff_persist_failed)
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertIn(msg_frp, {r["msg_id"] for r in reg.list_outbox(statuses=("uncertain",))})
+        self.assertTrue(bool(hub._pending_cleanup_streams))
+
+        # Now degrade & recover: abort_incarnation purges stream handles so abort_stream returns False
+        hub._mark_degraded("degraded_with_failed_receipt_on_purging_transport")
+        hub.confirm_recovery(_OP, reason="terminal_abort_settles_failed_receipt")
+
+        self.assertFalse(hub.is_degraded)
+        self.assertEqual(hub._pending_cleanup_streams, {})
+        self.assertEqual(hub._stream_authorities, {})
+        self.assertEqual(hub._stream_abort_reasons, {})
+        self.assertIn(msg_frp, {r["msg_id"] for r in reg.list_outbox(statuses=("uncertain",))})
         hub.close(timeout_s=1.0)
         self.assertFalse(hub._session_active_marker.exists())
 
