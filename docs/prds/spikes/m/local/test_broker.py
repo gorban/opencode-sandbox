@@ -3,6 +3,7 @@
 import contextlib
 import http.client
 import json
+import secrets
 import socket
 import tempfile
 import threading
@@ -15,7 +16,7 @@ from broker import (COMPLETE_TEXT, EARLY_TEXT, HOLD_TEXT, MAX_BODY, MODEL_ID, MO
                     PROOF_CONTENT, PROOF_PATH, WRITE_CALL_ID, Broker)
 
 
-TOKEN = "synthetic-fixture-bearer"
+TOKEN = secrets.token_hex(24)
 
 
 def _payload(*, path_field=None, tool_result=False):
@@ -145,7 +146,7 @@ class BrokerTest(unittest.TestCase):
         for options, status in [
             ({"path": "/v1/models"}, 404),
             ({"path": MODEL_PATH + "?fixture=true"}, 404),
-            ({"token": "different-synthetic-bearer"}, 403),
+            ({"token": secrets.token_hex(24)}, 403),
             ({"extra": b"Transfer-Encoding: chunked\r\n"}, 400),
             ({"extra": b"Content-Encoding: gzip\r\n"}, 400),
             ({"extra": b"Content-Length: 10\r\n"}, 400),
@@ -187,25 +188,31 @@ class BrokerTest(unittest.TestCase):
         path = self.path.with_name("retry.sock")
         broker = Broker(path, TOKEN)
         self.addCleanup(broker.close)
-        with patch.object(threading.Thread, "start", side_effect=RuntimeError("synthetic thread failure")):
-            with self.assertRaisesRegex(RuntimeError, "synthetic thread failure"):
-                broker.start()
+        with (
+            patch.object(threading.Thread, "start", side_effect=RuntimeError("synthetic thread failure")),
+            self.assertRaisesRegex(RuntimeError, "synthetic thread failure"),
+        ):
+            broker.start()
         self.assertFalse(path.exists())
         broker.start()
         self.assertTrue(path.is_socket())
 
     def test_client_thread_start_failure_releases_its_only_slot(self):
         with patch.object(broker_module, "MAX_CLIENTS", 1):
-            with patch.object(threading.Thread, "start", side_effect=RuntimeError("synthetic thread failure")):
-                with self._connect() as conn:
-                    self.assertEqual(conn.recv(1), b"")
+            with (
+                patch.object(threading.Thread, "start", side_effect=RuntimeError("synthetic thread failure")),
+                self._connect() as conn,
+            ):
+                self.assertEqual(conn.recv(1), b"")
             self.assertEqual(self.broker.snapshot(), {"admitted": 0, "active": 0, "rejected": 1})
             self.assertEqual(self._exchange(_payload(path_field="path"))[0], 200)
 
     def test_cleanup_unlinks_the_socket_even_if_join_fails(self):
-        with patch.object(self.broker._listener_thread, "join", side_effect=RuntimeError("synthetic join failure")):
-            with self.assertRaisesRegex(RuntimeError, "synthetic join failure"):
-                self.broker.close()
+        with (
+            patch.object(self.broker._listener_thread, "join", side_effect=RuntimeError("synthetic join failure")),
+            self.assertRaisesRegex(RuntimeError, "synthetic join failure"),
+        ):
+            self.broker.close()
         self.assertFalse(self.path.exists())
 
 

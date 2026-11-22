@@ -24,6 +24,7 @@ GRANT_POLL = 0.05
 PROVIDER_SOCKET = "/provider/provider.sock"
 CONTROL_SOCKET = "/control/control.sock"
 GRANT = Path("/grant")
+PEER_CLOSED = select.POLLRDHUP | select.POLLHUP | select.POLLERR | select.POLLNVAL
 
 
 def grant_record(incarnation: str, generation: int, active: bool) -> bytes:
@@ -99,6 +100,52 @@ def handoff(worker: socket.socket, request: bytes, grant: Path, active: bytes) -
         return b"Z"
 
 
+def _write_ready(peers, pending, writing) -> bool:
+    for source, data in list(pending.items()):
+        target = peers[source]
+        if target not in writing:
+            continue
+        try:
+            sent = target.send(data)
+        except BlockingIOError:
+            continue
+        if not sent:
+            return False
+        if sent == len(data):
+            del pending[source]
+        else:
+            pending[source] = data[sent:]
+    return True
+
+
+def _read_ready(peers, pending, sources, totals, reading, eof_peer) -> bool:
+    for source in reading:
+        try:
+            data = source.recv(CHUNK)
+        except BlockingIOError:
+            continue
+        if not data:
+            if source is eof_peer:
+                return False
+            sources.remove(source)
+            peers[source].shutdown(socket.SHUT_WR)
+            continue
+        totals[source] += len(data)
+        if totals[source] > WIRE_LIMIT:
+            return False
+        pending[source] = data
+    return True
+
+
+def _stream_ended(deadline, grant, active, peer_poll) -> bool:
+    # Check hangup without considering extra input a second request.
+    return (
+        not grant_active(grant, active)
+        or time.monotonic() >= deadline
+        or any(flags & PEER_CLOSED for _, flags in peer_poll.poll(0))
+    )
+
+
 def copy_streams(
     peers: dict[socket.socket, socket.socket],
     eof_peer: socket.socket,
@@ -115,7 +162,6 @@ def copy_streams(
     sources = set(peers)
     pending: dict[socket.socket, bytes] = {}
     peer_poll = select.poll()
-    closed = select.POLLRDHUP | select.POLLHUP | select.POLLERR | select.POLLNVAL
     if watch_peer is not None:
         peer_poll.register(watch_peer, select.POLLRDHUP)
     while (sources or pending) and grant_active(grant, active):
@@ -125,40 +171,10 @@ def copy_streams(
         reading, writing, _ = select.select(
             sources - pending.keys(), [peers[source] for source in pending], [], min(remaining, GRANT_POLL),
         )
-        if not grant_active(grant, active) or time.monotonic() >= deadline:
+        if _stream_ended(deadline, grant, active, peer_poll):
             return
-        if watch_peer is not None and any(flags & closed for _, flags in peer_poll.poll(0)):
-            # Check hangup without considering extra input a second request.
+        if not _write_ready(peers, pending, writing) or not _read_ready(peers, pending, sources, totals, reading, eof_peer):
             return
-        for source, data in list(pending.items()):
-            target = peers[source]
-            if target not in writing:
-                continue
-            try:
-                sent = target.send(data)
-            except BlockingIOError:
-                continue
-            if not sent:
-                return
-            if sent == len(data):
-                del pending[source]
-            else:
-                pending[source] = data[sent:]
-        for source in reading:
-            try:
-                data = source.recv(CHUNK)
-            except BlockingIOError:
-                continue
-            if not data:
-                if source is eof_peer:
-                    return
-                sources.remove(source)
-                peers[source].shutdown(socket.SHUT_WR)
-                continue
-            totals[source] += len(data)
-            if totals[source] > WIRE_LIMIT:
-                return
-            pending[source] = data
 
 
 def control(client: socket.socket, active: bytes) -> None:

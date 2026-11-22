@@ -1,8 +1,11 @@
+from dataclasses import replace
+from pathlib import Path
 import socket
 import time
 import unittest
+from unittest.mock import patch
 
-from client import DispatchOutcome, ProbeError, RelayExchange, Response, TurnEvent, TurnEvents, TurnPins, Wire
+from client import DispatchOutcome, OpenCode, ProbeError, RelayExchange, Response, TurnEvent, TurnEvents, TurnPins, Wire
 from probe import observe
 
 
@@ -46,8 +49,9 @@ class ClientTests(unittest.TestCase):
         with client, peer:
             wire = Wire(client, time.monotonic() + 1)
             peer.sendall(b"trailing bytes")
+            deadline = time.monotonic() + 0.02
             with self.assertRaisesRegex(ProbeError, "left the control event stream open"):
-                wire.await_eof(time.monotonic() + 0.02)
+                wire.await_eof(deadline)
             peer.shutdown(socket.SHUT_WR)
             wire.await_eof(time.monotonic() + 0.2)
 
@@ -114,6 +118,49 @@ class ClientTests(unittest.TestCase):
         interleaved = event("session.text.delta", assistantMessageID="msg_one", ordinal=1, delta="other")
         matching = event("session.text.delta", assistantMessageID="msg_one", ordinal=0, delta="text")
         observe([*prefix, interleaved, matching, terminal], TurnEvents(pins), "fixture text", wait_for_terminal=False)
+
+    def test_prompt_checks_all_selected_job_and_session_pins_before_exchange(self):
+        client = OpenCode(Path("/unused"), "fixture", sandbox_addr="local-poc",
+                          incarnation_id="inc_current", grant_generation=2)
+        valid = TurnPins("local-poc", "inc_current", "ses_pinned", "msg_pinned", 2)
+        deadline = time.monotonic() + 1
+        with patch("client.unix_wire") as open_socket:
+            with self.assertRaisesRegex(ProbeError, "pinned job and session"):
+                client.prompt(valid, "fixture", deadline)
+            open_socket.assert_not_called()
+
+        with patch.object(client, "_response") as response:
+            result = response.return_value.__enter__.return_value
+            result.json.return_value = {"data": {"id": valid.thread_id, "location": {"directory": "/workspace"}}}
+            self.assertEqual(client.create_session(deadline), valid.thread_id)
+            response.reset_mock()
+            with self.assertRaisesRegex(ProbeError, "session already pinned"):
+                client.create_session(deadline)
+            response.assert_not_called()
+
+        changes = (
+            {"sandbox_addr": "other-target"},
+            {"incarnation_id": "inc_previous"},
+            {"thread_id": "ses_other"},
+            {"grant_generation": 1},
+            {"grant_generation": 2.0},
+        )
+        def paused_prompt(pins, text, deadline):
+            with client.pause_prompt(pins, text, deadline):
+                self.fail("mismatched prompt reached the relay exchange")
+
+        for send in (client.prompt, paused_prompt):
+            with patch("client.unix_wire") as open_socket:
+                for change in changes:
+                    with self.subTest(send=send.__name__, change=change):
+                        mismatched = replace(valid, **change)
+                        with self.assertRaisesRegex(ProbeError, "pinned job and session"):
+                            send(mismatched, "fixture", deadline)
+                open_socket.assert_not_called()
+
+        with patch.object(client, "_exchange") as exchange:
+            client.pause_prompt(valid, "fixture", deadline)
+            exchange.assert_called_once()
 
 
 if __name__ == "__main__":

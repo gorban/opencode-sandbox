@@ -19,6 +19,7 @@ MAX_HEADERS = 16_384
 MAX_EVENT = 262_144
 MAX_EVENTS = 2_048
 MAX_STREAM = 4 * 1024 * 1024
+JSON_MEDIA_TYPE = "application/json"
 WORKSPACE = "/workspace"
 MESSAGE_ID = re.compile(r"msg_[A-Za-z0-9]{1,92}")
 
@@ -65,7 +66,7 @@ def request(method: str, path: str, *, host: str, auth: str, accept: str,
         "Connection: close", f"Accept: {accept}", "Accept-Encoding: identity",
     ]
     if body is not None:
-        headers.extend(["Content-Type: application/json", f"Content-Length: {len(data)}"])
+        headers.extend([f"Content-Type: {JSON_MEDIA_TYPE}", f"Content-Length: {len(data)}"])
     raw = "\r\n".join(headers).encode("ascii") + b"\r\n\r\n" + data
     if len(raw) > MAX_REQUEST:
         raise ProbeError("request exceeds the relay limit")
@@ -171,11 +172,44 @@ class RelayExchange:
         }.get(value, DispatchOutcome.UNCERTAIN)
 
 
+class _EventFrame:
+    def __init__(self):
+        self.data: list[bytes] = []
+        self.size = 0
+        self.line_count = 0
+        self.event_count = 0
+
+    def add_line(self, line: bytes) -> dict | None:
+        self.line_count += 1
+        if self.line_count > MAX_EVENTS * 8:
+            raise ProbeError("event stream exceeds its line limit")
+        if len(line) + self.size + 1 > MAX_EVENT:
+            raise ProbeError("event exceeds its size limit")
+        line = line.removesuffix(b"\r")
+        if line.startswith(b"data:"):
+            self.data.append(line[5:].removeprefix(b" "))
+            self.size += len(line) + 1
+            return None
+        if line:
+            if not line.startswith(b":"):
+                raise ProbeError("unsupported event stream field")
+            return None
+        if not self.data:
+            return None
+        self.event_count += 1
+        if self.event_count > MAX_EVENTS:
+            raise ProbeError("event stream exceeds its event limit")
+        event = object_json(b"\n".join(self.data))
+        self.data.clear()
+        self.size = 0
+        return event
+
+
 class Response:
     def __init__(self, wire: Wire, *, status: int, media: str | None = None):
         self.wire = wire
         lines = wire.through(b"\r\n\r\n", MAX_HEADERS)[:-4].split(b"\r\n")
-        match = re.fullmatch(rb"HTTP/1\.[01] ([1-5][0-9][0-9])(?: [\x20-\x7e]*)?", lines[0])
+        match = re.fullmatch(rb"HTTP/1\.[01] ([1-5]\d{2})(?: [\x20-\x7e]*)?", lines[0])
         if match is None:
             raise ProbeError("invalid HTTP response status")
         actual_status = int(match.group(1))
@@ -198,69 +232,51 @@ class Response:
         transfer = headers.get(b"transfer-encoding")
         length = headers.get(b"content-length")
         self.length = None
-        if transfer is None and length is not None and re.fullmatch(rb"[0-9]{1,8}", length):
+        if transfer is None and length is not None and re.fullmatch(rb"\d{1,8}", length):
             self.length = int(length)
         elif transfer != b"chunked" or length is not None:
             raise ProbeError("unsupported HTTP response framing")
 
     def chunks(self, limit: int):
         if self.length is not None:
-            if self.length > limit:
-                raise ProbeError("HTTP body exceeds its size limit")
-            for offset in range(0, self.length, 16_384):
-                yield self.wire.take(min(16_384, self.length - offset))
+            yield from self._read_block(self.length, limit)
             return
-        while True:
-            line = self.wire.through(b"\r\n", 18)[:-2]
-            if not re.fullmatch(rb"[0-9a-fA-F]{1,16}", line):
-                raise ProbeError("invalid HTTP chunk size")
-            length = int(line, 16)
-            if length == 0:
-                if self.wire.take(2) != b"\r\n":
-                    raise ProbeError("HTTP chunk trailers refused")
-                return
-            if length > limit:
-                raise ProbeError("HTTP body exceeds its size limit")
+        while length := self._chunk_length():
+            yield from self._read_block(length, limit)
             limit -= length
-            for offset in range(0, length, 16_384):
-                yield self.wire.take(min(16_384, length - offset))
             if self.wire.take(2) != b"\r\n":
                 raise ProbeError("invalid HTTP chunk terminator")
+        if self.wire.take(2) != b"\r\n":
+            raise ProbeError("HTTP chunk trailers refused")
+
+    def _chunk_length(self) -> int:
+        line = self.wire.through(b"\r\n", 18)[:-2]
+        if not re.fullmatch(rb"[0-9a-fA-F]{1,16}", line):
+            raise ProbeError("invalid HTTP chunk size")
+        return int(line, 16)
+
+    def _read_block(self, length: int, limit: int):
+        if length > limit:
+            raise ProbeError("HTTP body exceeds its size limit")
+        for offset in range(0, length, 16_384):
+            yield self.wire.take(min(16_384, length - offset))
 
     def json(self) -> dict:
         return object_json(b"".join(self.chunks(MAX_REQUEST)))
 
     def events(self):
         pending = b""
-        data = []
-        size = 0
-        line_count = 0
-        event_count = 0
+        frame = _EventFrame()
         for chunk in self.chunks(MAX_STREAM):
             lines = (pending + chunk).split(b"\n")
             pending = lines.pop()
             for line in lines:
-                line_count += 1
-                if line_count > MAX_EVENTS * 8:
-                    raise ProbeError("event stream exceeds its line limit")
-                if len(line) + size + 1 > MAX_EVENT:
-                    raise ProbeError("event exceeds its size limit")
-                line = line.removesuffix(b"\r")
-                if line.startswith(b"data:"):
-                    data.append(line[5:].removeprefix(b" "))
-                    size += len(line) + 1
-                elif line and not line.startswith(b":"):
-                    raise ProbeError("unsupported event stream field")
-                elif not line and data:
-                    event_count += 1
-                    if event_count > MAX_EVENTS:
-                        raise ProbeError("event stream exceeds its event limit")
-                    yield object_json(b"\n".join(data))
-                    data.clear()
-                    size = 0
-            if len(pending) + size > MAX_EVENT:
+                event = frame.add_line(line)
+                if event is not None:
+                    yield event
+            if len(pending) + frame.size > MAX_EVENT:
                 raise ProbeError("event exceeds its size limit")
-        if pending or data:
+        if pending or frame.data:
             raise ProbeError("incomplete event stream frame")
 
 
@@ -334,12 +350,15 @@ class TurnEvents:
 
 
 class OpenCode:
-    def __init__(self, path: Path, password: str):
+    def __init__(self, path: Path, password: str, *, sandbox_addr: str, incarnation_id: str,
+                 grant_generation: int):
         self.path = path
         self.auth = "Basic " + b64encode(f"opencode:{password}".encode()).decode("ascii")
+        self._job_pins = (sandbox_addr, incarnation_id, grant_generation)
+        self._thread_id: str | None = None
 
     def _request(self, method: str, path: str, body: dict | None = None,
-                 accept: str = "application/json") -> bytes:
+                 accept: str = JSON_MEDIA_TYPE) -> bytes:
         return request(method, path, host="127.0.0.1:4096", auth=self.auth, accept=accept, body=body)
 
     @contextmanager
@@ -356,8 +375,10 @@ class OpenCode:
             yield Response(exchange.wire, status=200, media=media)
 
     def create_session(self, deadline: float) -> str:
+        if self._thread_id is not None:
+            raise ProbeError("native session already pinned")
         raw = self._request("POST", "/api/session?directory=%2Fworkspace", {"title": "Local fixture"})
-        with self._response(raw, deadline, "application/json") as response:
+        with self._response(raw, deadline, JSON_MEDIA_TYPE) as response:
             data = response.json().get("data")
         if not isinstance(data, dict):
             raise ProbeError("session response lacks an identity")
@@ -367,6 +388,7 @@ class OpenCode:
             raise ProbeError("invalid native session ID")
         if not isinstance(location, dict) or location.get("directory") != WORKSPACE:
             raise ProbeError("session was not created in the disposable workspace")
+        self._thread_id = thread_id
         return thread_id
 
     @contextmanager
@@ -376,12 +398,18 @@ class OpenCode:
             yield Subscription(response)
 
     def _prompt(self, pins: TurnPins, text: str) -> bytes:
+        pinned = (pins.sandbox_addr, pins.incarnation_id, pins.grant_generation, pins.thread_id)
+        if (self._thread_id is None or type(pins.grant_generation) is not int
+                or pinned != (*self._job_pins, self._thread_id)):
+            raise ProbeError("prompt does not match the pinned job and session")
+        if not isinstance(pins.msg_id, str) or not MESSAGE_ID.fullmatch(pins.msg_id):
+            raise ProbeError("invalid prompt message ID")
         return self._request("POST", f"/api/session/{pins.thread_id}/prompt", {
             "id": pins.msg_id, "text": text, "resume": True,
         })
 
     def prompt(self, pins: TurnPins, text: str, deadline: float) -> None:
-        with self._response(self._prompt(pins, text), deadline, "application/json") as response:
+        with self._response(self._prompt(pins, text), deadline, JSON_MEDIA_TYPE) as response:
             data = response.json().get("data")
         if (not isinstance(data, dict) or data.get("id") != pins.msg_id
                 or data.get("sessionID") != pins.thread_id or data.get("type") != "user"):

@@ -16,12 +16,13 @@ import time
 
 from broker import Broker, EARLY_TEXT, HOLD_TEXT, MODEL_ID, MODEL_PATH, PROOF_CONTENT, PROOF_PATH
 from client import (
-    DispatchOutcome, OpenCode, ProbeError, Response, TurnEvents, TurnPins, remaining, request, unix_wire,
+    DispatchOutcome, OpenCode, ProbeError, Response, TurnEvent, TurnEvents, TurnPins, remaining, request, unix_wire,
 )
 from runtime import Job, RuntimeError as JobError
 
 
 IMAGE_ID = re.compile(r"(?:sha256:)?[a-f0-9]{64}")
+TARGET = "local-poc"
 
 
 def image_id(value: str) -> str:
@@ -40,7 +41,15 @@ def check(condition: bool, message: str) -> None:
 
 
 def pins(job: Job, thread: str) -> TurnPins:
-    return TurnPins("local-poc", job.incarnation, thread, "msg_" + secrets.token_hex(12), job.generation)
+    return TurnPins(TARGET, job.incarnation, thread, "msg_" + secrets.token_hex(12), job.generation)
+
+
+def marker_matches(event: TurnEvent, tails: dict[tuple[str, int], str], marker: str) -> bool:
+    if event.text_part is None:
+        return False
+    seen = tails.get(event.text_part, "") + event.text
+    tails[event.text_part] = seen[-len(marker):]
+    return marker in seen
 
 
 def observe(events, turn: TurnEvents, marker: str, *, wait_for_terminal: bool) -> None:
@@ -50,14 +59,11 @@ def observe(events, turn: TurnEvents, marker: str, *, wait_for_terminal: bool) -
         event = turn.accept(native)
         if event is None:
             continue
-        if event.text_part is not None and not found:
-            seen = tails.get(event.text_part, "") + event.text
-            found = marker in seen
-            tails[event.text_part] = seen[-len(marker):]
-            if found:
-                if not wait_for_terminal:
-                    return
-                report("Observed the fixture text delta before the terminal event.")
+        if not found and marker_matches(event, tails, marker):
+            if not wait_for_terminal:
+                return
+            found = True
+            report("Observed the fixture text delta before the terminal event.")
         if event.kind == "turn_completed":
             check(found and wait_for_terminal, "turn completed before the expected text delta")
             return
@@ -87,7 +93,8 @@ def pause_for_operator() -> None:
 
 
 def prove(job: Job, broker: Broker, attended: bool) -> None:
-    client = OpenCode(job.control_socket, job.password)
+    client = OpenCode(job.control_socket, job.password, sandbox_addr=TARGET,
+                      incarnation_id=job.incarnation, grant_generation=job.generation)
     job.assert_file(None)
     report("Verified the scratch proof file is absent.")
     thread = client.create_session(time.monotonic() + 12)
@@ -145,6 +152,27 @@ def interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
 
+def close_resources(job: Job, broker: Broker | None, error: str | None) -> str | None:
+    # A second signal should not interrupt verified cleanup.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if broker is not None:
+        try:
+            broker.close()
+        except Exception as exc:
+            print(f"Broker cleanup failed ({type(exc).__name__}).", file=sys.stderr)
+            error = error or "Broker cleanup failed."
+    try:
+        job.close()
+    except JobError as exc:
+        print(str(exc), file=sys.stderr)
+        error = error or "Container cleanup failed."
+    except Exception as exc:
+        print(f"Container cleanup failed ({type(exc).__name__}).", file=sys.stderr)
+        error = error or "Container cleanup failed."
+    return error
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--opencode-image", required=True, type=image_id, help="full local OpenCode 2.3.0 image ID")
@@ -175,23 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         error = f"Run failed ({type(exc).__name__})."
     finally:
-        # A second signal should not interrupt verified cleanup.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        if broker is not None:
-            try:
-                broker.close()
-            except Exception as exc:
-                print(f"Broker cleanup failed ({type(exc).__name__}).", file=sys.stderr)
-                error = error or "Broker cleanup failed."
-        try:
-            job.close()
-        except JobError as exc:
-            print(str(exc), file=sys.stderr)
-            error = error or "Container cleanup failed."
-        except Exception as exc:
-            print(f"Container cleanup failed ({type(exc).__name__}).", file=sys.stderr)
-            error = error or "Container cleanup failed."
+        error = close_resources(job, broker, error)
 
     if error is None:
         try:

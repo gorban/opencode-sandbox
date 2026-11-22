@@ -25,8 +25,11 @@ run. No provider account, production launcher, or existing sandbox home is neede
 3. Start a Python relay in the same isolated network namespace. Give it only a
    read-only source copy, the read-only model socket and grant directories, and
    its private writable control socket directory. Verify the expected images,
-   network, mounts, and port settings before running each container. Confirm the
-   namespace join. Keep SELinux enabled. The worker sees neither host socket.
+   network, explicit mounts, port settings, and hard memory limits before
+   starting the containers. Disable configured Podman subscription mounts for
+   this run and require the host FIPS setting to be off. Confirm the namespace
+   join and check both effective cgroup memory and swap limits before the first
+   prompt. Keep SELinux enabled. The worker sees neither host socket.
 4. The host grants exactly one incarnation and generation before dispatch. The
    broker authenticates eligible requests against that grant and registers their
    response sockets in the same critical section as revoke. Bearer possession
@@ -40,7 +43,9 @@ run. No provider account, production launcher, or existing sandbox home is neede
    the turn. The absence of the proof file is checked independently inside the
    job. Bound the request, response framing, and event sizes. Accept no redirects
    or compressed responses. Treat worker output as untrusted and bind each
-   accepted event to the pinned session and host-assigned identifiers.
+   accepted event to the pinned session and host-assigned identifiers. Compare
+   each dispatch's target, incarnation, grant generation, and selected session
+   with the adapter's pins before opening the socket.
 2. The host and relay use the same fixed file-lock inode. State binds incarnation
    and generation. The relay receives a bounded, single control request and
    prepares its worker connection. Under the shared fence, it rechecks the
@@ -62,9 +67,11 @@ run. No provider account, production launcher, or existing sandbox home is neede
 4. Exercise the final write boundary separately. Pause a relay request just
    before taking the fence, revoke and confirm terminal state, then release the
    pause. Require a zero-write receipt and no new fake-upstream admission.
-5. Close sockets and remove resources by verified label and immutable ID. Check
-   the complete run-label inventory before reporting cleanup. A failed or
-   uncertain removal keeps the private receipt and returns an error.
+5. Mark a create pending in the private receipt before calling Podman. Close
+   sockets and remove resources by verified label and immutable ID. Check the
+   complete run-label inventory before reporting cleanup. An unacknowledged
+   create keeps cleanup unconfirmed even if the inventory is empty. A failed or
+   uncertain operation keeps the private receipt and returns an error.
 
 The cross-lane contract uses host-assigned target, incarnation, thread, message,
 and grant pins, bounded events, and conservative handoff outcomes. The harness

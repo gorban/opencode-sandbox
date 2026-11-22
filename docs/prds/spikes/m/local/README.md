@@ -1,9 +1,10 @@
 # Local OpenCode 2.3.0 proof
 
 Run this disposable probe from a trusted checkout inside the existing `devbox`
-distrobox. It needs Python 3.10 or later in `devbox`, rootless Podman with SELinux
-enforcing on the host, and locally cached OpenCode 2.3.0 and Python 3.12 Alpine
-images. Use the existing `/usr/bin/host-spawn` and session bus in `devbox`, with
+distrobox. It needs Python 3.10 or later in `devbox`, rootless Podman with cgroup
+v2, SELinux enforcing and FIPS disabled on the host, and locally cached OpenCode
+2.3.0 and Python 3.12 Alpine images. Use the existing `/usr/bin/host-spawn` and
+session bus in `devbox`, with
 `/usr/bin/getfattr` available on the host. The driver and its in-process model
 broker run in `devbox`. The driver verifies its private scratch directory under
 `/tmp` is shared with the host, then uses bounded host calls without a PTY to
@@ -33,9 +34,11 @@ Add `--attended` from a terminal to pause after the streamed turn and file proof
 Press Enter within 30 seconds to start the held turn and revocation. Each socket
 exchange, provider hold, and Podman operation has a time limit. Ctrl+C triggers
 cleanup. A failed or interrupted run reports the private receipt directory
-under `/tmp/ocm-*`. The receipt records only owned container names, immutable
-IDs, and the run label. Cleanup checks the complete label inventory and the
-exact recorded IDs before reporting success.
+under `/tmp/ocm-*`. The receipt records owned container names, immutable IDs,
+the run label, and any container role with a pending create acknowledgment.
+Cleanup checks the complete label inventory and the exact recorded IDs before
+reporting success. A pending create leaves cleanup unconfirmed and retains the
+receipt, even if the final inventory is empty.
 
 ## Expected evidence
 

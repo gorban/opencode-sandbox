@@ -84,7 +84,7 @@ def _request(conn):
                 or not re.fullmatch(rb"[ -~]+", value)):
             raise _Rejected()
         headers[name] = value
-    if not re.fullmatch(rb"fixture\.local|(?:127\.0\.0\.1|localhost)(?::[0-9]{1,5})?",
+    if not re.fullmatch(rb"fixture\.local|(?:127\.0\.0\.1|localhost)(?::\d{1,5})?",
                         headers.get(b"host", b"")):
         raise _Rejected()
     if headers.get(b"connection", b"close").lower() not in (b"close", b"keep-alive"):
@@ -94,7 +94,7 @@ def _request(conn):
     ):
         raise _Rejected()
     length = headers.get(b"content-length", b"")
-    if not re.fullmatch(rb"[1-9][0-9]{0,5}", length):
+    if not re.fullmatch(rb"[1-9]\d{0,5}", length):
         raise _Rejected()
     length = int(length)
     if length > MAX_BODY:

@@ -17,9 +17,19 @@ from relay import grant_record, take_fence
 LABEL = "io.oc-sandbox.local-poc"
 ROLE_LABEL = f"{LABEL}.role"
 IMAGE_ID = re.compile(r"[0-9a-f]{64}")
+SHA256_PREFIX = "sha256:"
+RELAY_FILE = "relay.py"
+WORKSPACE = "/workspace"
+WORKER_TEMP = "/job-tmp"
+NETNS_PATH = "/proc/self/ns/net"
+NETNS_LINK = re.compile(rb"net:\[\d+\]")
+PROCESS_LABEL = re.compile(r"[^:]+:[^:]+:container_t:s0:c\d+,c\d+", re.ASCII)
+MOUNT_LABEL = re.compile(r"[^:]+:[^:]+:container_file_t:s0:c\d+,c\d+", re.ASCII)
 SAFE_PIN = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 TMPFS_OPTIONS = "rw,nosuid,nodev,noexec,mode=0700"
 ROLES = ("relay", "worker")
+MEMORY_LIMITS = {"relay": 128 * 1024**2, "worker": 1024**3}
+FIPS_STATUS = "/proc/sys/crypto/fips_enabled"
 IMAGE_ENV = {
     "worker": {"PATH", "BUN_RUNTIME_TRANSPILER_CACHE_PATH"},
     "relay": {"PATH", "LANG", "GPG_KEY", "PYTHON_VERSION", "PYTHON_SHA256", "PYTHONDONTWRITEBYTECODE"},
@@ -34,7 +44,7 @@ PROBE_TCP = (
     "socket.create_connection(('127.0.0.1', 4096), 0.5).close()"
 )
 PROBE_FILE = (
-    'p=/workspace/proof.txt; '
+    f'p={WORKSPACE}/proof.txt; '
     'if [ -L "$p" ]; then exit 2; fi; '
     'if [ ! -e "$p" ]; then printf A; exit; fi; '
     'if [ ! -f "$p" ]; then exit 2; fi; '
@@ -78,7 +88,7 @@ def host_output(program: str, *args: str) -> bytes:
 
 def podman(*args: str, timeout: int = 12, check: bool = True) -> subprocess.CompletedProcess:
     try:
-        result = host_command("podman", "--remote=false", *args, timeout=timeout)
+        result = host_command("podman", "--remote=false", "--default-mounts-file=/dev/null", *args, timeout=timeout)
     except RuntimeError:
         raise RuntimeError(f"Podman {args[0]} failed or timed out") from None
     if check and result.returncode != 0:
@@ -92,7 +102,7 @@ def inspected(*args: str) -> dict:
         if not isinstance(value, dict):
             raise ValueError
         return value
-    except (UnicodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         raise RuntimeError(f"Invalid Podman {args[0]} receipt") from None
 
 
@@ -158,7 +168,7 @@ class Job:
         generation: int = 1,
     ):
         self.root = root.absolute()
-        self.images = {"worker": opencode_image.removeprefix("sha256:"), "relay": relay_image.removeprefix("sha256:")}
+        self.images = {"worker": opencode_image.removeprefix(SHA256_PREFIX), "relay": relay_image.removeprefix(SHA256_PREFIX)}
         self.incarnation = incarnation
         self.generation = generation
         self.token = token
@@ -167,6 +177,7 @@ class Job:
         self.names = {role: f"oc-poc-{self.run_label}-{role}" for role in ROLES}
         self.ids: dict[str, str] = {}
         self.recorded_ids: dict[str, str] = {}
+        self.pending_create: set[str] = set()
         self.image_env: dict[str, list[str]] = {}
         self.provider_socket = self.root / "provider" / "provider.sock"
         self.control_socket = self.root / "control" / "control.sock"
@@ -182,6 +193,7 @@ class Job:
             "label": f"{LABEL}={self.run_label}",
             "names": self.names,
             "ids": self.ids,
+            "pending_create": sorted(self.pending_create),
         }, sort_keys=True) + "\n").encode("ascii"))
         self.recorded_ids = self.ids.copy()
 
@@ -218,8 +230,8 @@ class Job:
         take_fence(self.lifetime)
         atomic_write(self.grant / "state", grant_record(self.incarnation, self.generation, True))
         atomic_write(self.root / "fixture" / "opencode.json", json.dumps(worker_config()).encode("ascii"))
-        shutil.copyfile(Path(__file__).with_name("relay.py"), self.root / "source" / "relay.py")
-        (self.root / "source" / "relay.py").chmod(0o600)
+        shutil.copyfile(Path(__file__).with_name(RELAY_FILE), self.root / "source" / RELAY_FILE)
+        (self.root / "source" / RELAY_FILE).chmod(0o600)
         self._write_receipt()
 
     def _check_bridge(self, info: os.stat_result) -> None:
@@ -261,15 +273,18 @@ class Job:
         if not enforcing:
             raise RuntimeError("This PoC requires SELinux enforcing on the Podman host")
         mode = podman(
-            "info", "--format", "{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}}"
+            "info", "--format", "{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}} {{.Host.CgroupsVersion}}"
         ).stdout.strip()
-        if os.geteuid() == 0 or mode != b"true true":
-            raise RuntimeError("This PoC requires local rootless Podman with SELinux labeling")
+        if os.geteuid() == 0 or mode != b"true true v2":
+            raise RuntimeError("This PoC requires local rootless Podman with SELinux labeling and cgroup v2")
+        # Podman can add FIPS mounts separately from its default subscription file.
+        if host_output("cat", FIPS_STATUS).strip() != b"0":
+            raise RuntimeError("This PoC requires the Podman host FIPS mode to be disabled")
         for role, image in self.images.items():
             if not IMAGE_ID.fullmatch(image):
                 raise RuntimeError(f"{role} image must be a full local image ID")
             details = inspected("image", "inspect", image)
-            if details.get("Id", "").removeprefix("sha256:") != image:
+            if details.get("Id", "").removeprefix(SHA256_PREFIX) != image:
                 raise RuntimeError(f"{role} local image ID did not match")
             env = (details.get("Config") or {}).get("Env") or []
             names = {entry.partition("=")[0] for entry in env}
@@ -288,12 +303,14 @@ class Job:
         command: list[str],
         workdir: str,
     ) -> None:
+        memory = f"{MEMORY_LIMITS[role]}b"
         args = ["create", "--pull=never", "--network", mode,
                 "--name", self.names[role], "--label", f"{LABEL}={self.run_label}",
                 "--label", f"{ROLE_LABEL}={role}", "--http-proxy=false",
                 "--user=0:0", "--cap-drop=all", "--security-opt=no-new-privileges",
                 "--read-only", "--read-only-tmpfs=false", "--image-volume=ignore",
                 "--log-driver=none", "--restart=no", "--pids-limit=192", "--ipc=private",
+                "--memory", memory, "--memory-swap", memory, "--cgroupns=private",
                 "--workdir", workdir]
         for destination, (source, writable) in mounts.items():
             access = "rw" if writable else "ro"
@@ -302,6 +319,8 @@ class Job:
             args.extend(("--tmpfs", f"{destination}:{options}"))
         for name, value in env.items():
             args.extend(("--env", f"{name}={value}"))
+        self.pending_create.add(role)
+        self._write_receipt()
         self.attempted_create = True
         result = podman(*args, self.images[role], *command)
         try:
@@ -311,6 +330,7 @@ class Job:
         if not IMAGE_ID.fullmatch(container_id):
             raise RuntimeError(f"Invalid {role} create receipt")
         self.ids[role] = container_id
+        self.pending_create.remove(role)
         self._write_receipt()
         self._verify_container(role, mode, mounts, tmpfs, env)
 
@@ -328,11 +348,22 @@ class Job:
 
     def _verify_container(self, role, mode, mounts, tmpfs, env) -> None:
         details = self._identity(role, self.ids[role])
+        self._verify_isolation(role, mode, details)
+        expected_env = {
+            name: value for name, value in (entry.split("=", 1) for entry in self.image_env[role])
+        }
+        expected_env.update(container="podman", **env)
+        actual_env = {name: value for name, value in (entry.split("=", 1) for entry in details["Config"]["Env"])}
+        if actual_env != expected_env:
+            raise RuntimeError(f"Unexpected {role} environment")
+        self._verify_mounts(role, mounts, tmpfs, details)
+
+    def _verify_isolation(self, role, mode, details) -> None:
         host = details["HostConfig"]
         network = details["NetworkSettings"]
         config = details["Config"]
         if (
-            details.get("Image", "").removeprefix("sha256:") != self.images[role]
+            details.get("Image", "").removeprefix(SHA256_PREFIX) != self.images[role]
             or host.get("NetworkMode") != mode
             or host.get("PortBindings")
             or host.get("PublishAllPorts")
@@ -350,18 +381,16 @@ class Job:
             or host.get("CapAdd")
             or details.get("EffectiveCaps")
             or host.get("SecurityOpt") != ["no-new-privileges"]
-            or not re.fullmatch(r"[^:]+:[^:]+:container_t:s0:c[0-9]+,c[0-9]+", details.get("ProcessLabel") or "")
-            or not re.fullmatch(
-                r"[^:]+:[^:]+:container_file_t:s0:c[0-9]+,c[0-9]+", details.get("MountLabel") or ""
-            )
+            or host.get("Memory") != MEMORY_LIMITS[role]
+            or host.get("MemorySwap") != MEMORY_LIMITS[role]
+            or host.get("CgroupMode") != "private"
+            or not PROCESS_LABEL.fullmatch(details.get("ProcessLabel") or "")
+            or not MOUNT_LABEL.fullmatch(details.get("MountLabel") or "")
             or details["ProcessLabel"].split(":", 3)[-1] != details["MountLabel"].split(":", 3)[-1]
         ):
             raise RuntimeError(f"Unexpected {role} isolation settings")
-        expected_env = dict(entry.split("=", 1) for entry in self.image_env[role])
-        expected_env.update(container="podman", **env)
-        actual_env = dict(entry.split("=", 1) for entry in config["Env"])
-        if actual_env != expected_env:
-            raise RuntimeError(f"Unexpected {role} environment")
+
+    def _verify_mounts(self, role, mounts, tmpfs, details) -> None:
         actual_mounts = details["Mounts"] or []
         if len(actual_mounts) != len(mounts) or {mount.get("Destination") for mount in actual_mounts} != set(mounts):
             raise RuntimeError(f"Unexpected {role} mount count")
@@ -379,7 +408,7 @@ class Job:
                 raise RuntimeError(f"Unexpected {role} bind mount")
         actual_tmpfs = {
             path: set(options.split(",")) - {"rprivate", "tmpcopyup"}
-            for path, options in (host.get("Tmpfs") or {}).items()
+            for path, options in (details["HostConfig"].get("Tmpfs") or {}).items()
         }
         if actual_tmpfs != {path: set(options.split(",")) for path, options in tmpfs.items()}:
             raise RuntimeError(f"Unexpected {role} tmpfs mounts")
@@ -406,6 +435,13 @@ class Job:
             if label != expected_mount_label:
                 raise RuntimeError(f"Unexpected effective {role} bind mount label")
 
+    def _verify_memory(self, role: str) -> None:
+        limits = podman(
+            "exec", self.ids[role], "cat", "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.swap.max",
+        ).stdout.splitlines()
+        if limits != [str(MEMORY_LIMITS[role]).encode("ascii"), b"0"]:
+            raise RuntimeError(f"Unexpected effective {role} memory or swap limit")
+
     def start(self) -> None:
         if (
             self.attempted_create or self.terminal or self.lifetime is None
@@ -416,7 +452,7 @@ class Job:
         self._create(
             "worker", mode="none", env={
                 "HOME": "/job-home",
-                "PWD": "/workspace",
+                "TMPDIR": WORKER_TEMP,
                 "OPENCODE_CONFIG": "/fixture/opencode.json",
                 "OPENCODE_PASSWORD": self.password,
                 "OC_POC_MODEL_TOKEN": self.token,
@@ -424,14 +460,15 @@ class Job:
             mounts={"/fixture": (self.root / "fixture", False)},
             tmpfs={
                 "/job-home": f"{TMPFS_OPTIONS},size=96m",
-                "/workspace": f"{TMPFS_OPTIONS},size=32m",
-                "/tmp": f"{TMPFS_OPTIONS},size=32m",
+                WORKSPACE: f"{TMPFS_OPTIONS},size=32m",
+                WORKER_TEMP: f"{TMPFS_OPTIONS},size=32m",
             },
             command=["serve", "--hostname", "127.0.0.1", "--port", "4096", "--log-level", "none"],
-            workdir="/workspace",
+            workdir=WORKSPACE,
         )
         podman("start", self.ids["worker"])
         self._verify_running_label("worker")
+        self._verify_memory("worker")
         version = podman("exec", self.ids["worker"], "opencode", "--version").stdout.strip()
         if version != b"opencode v2.3.0":
             raise RuntimeError("Pinned worker did not report OpenCode 2.3.0")
@@ -443,23 +480,24 @@ class Job:
                 "/grant": (self.grant, False),
                 "/control": (self.control_socket.parent, True),
             },
-            tmpfs={}, command=["python3", "-B", "/source/relay.py", self.incarnation, str(self.generation)],
+            tmpfs={}, command=["python3", "-B", f"/source/{RELAY_FILE}", self.incarnation, str(self.generation)],
             workdir="/",
         )
         podman("start", self.ids["relay"])
         self.assert_running()
         self._verify_running_label("relay")
+        self._verify_memory("relay")
         namespaces = {
-            podman("exec", self.ids[role], "readlink", "/proc/self/ns/net").stdout.strip()
+            podman("exec", self.ids[role], "readlink", NETNS_PATH).stdout.strip()
             for role in ROLES
         }
         host_namespace = (
-            host_output("readlink", "/proc/self/ns/net").strip() if HOST_MODE == "distrobox"
-            else os.readlink("/proc/self/ns/net").encode("ascii")
+            host_output("readlink", NETNS_PATH).strip() if HOST_MODE == "distrobox"
+            else os.readlink(NETNS_PATH).encode("ascii")
         )
-        if len(namespaces) != 1 or not all(re.fullmatch(rb"net:\[\d+\]", item) for item in namespaces):
+        if len(namespaces) != 1 or not all(NETNS_LINK.fullmatch(item) for item in namespaces):
             raise RuntimeError("Relay did not join the worker network namespace")
-        if not re.fullmatch(rb"net:\[\d+\]", host_namespace) or host_namespace in namespaces:
+        if not NETNS_LINK.fullmatch(host_namespace) or host_namespace in namespaces:
             raise RuntimeError("Worker joined the host network namespace")
 
         deadline = time.monotonic() + 12
@@ -571,7 +609,7 @@ class Job:
                 os.close(self.held_fence)
                 self.held_fence = None
 
-    def _remove_containers(self) -> None:
+    def _discover_containers(self) -> dict[str, str]:
         # The command that created a container may have timed out before returning
         # its ID. Adopt only freshly verified label/name/role matches.
         try:
@@ -590,14 +628,9 @@ class Job:
                 # Continue with other exact IDs even if one inspection failed.
                 pass
 
-        self.ids.update(candidates)
-        if self.ids != self.recorded_ids:
-            try:
-                self._write_receipt()
-            except OSError:
-                # An ID without a confirmed receipt is left for recovery.
-                pass
+        return candidates
 
+    def _remove_recorded(self, candidates: dict[str, str]) -> None:
         for role in ROLES:
             container_id = candidates.get(role)
             if not container_id or self.recorded_ids.get(role) != container_id:
@@ -609,6 +642,7 @@ class Job:
                 # Timeout or loss of the result is reconciled independently below.
                 pass
 
+    def _check_removed(self, candidates: dict[str, str]) -> None:
         try:
             clean = not self._inventory()
         except RuntimeError:
@@ -621,4 +655,19 @@ class Job:
             clean = clean and absent
         if not clean:
             raise RuntimeError("Job container cleanup unconfirmed; receipt retained")
+
+    def _remove_containers(self) -> None:
+        candidates = self._discover_containers()
+        self.ids.update(candidates)
+        if self.ids != self.recorded_ids:
+            try:
+                self._write_receipt()
+            except OSError:
+                # An ID without a confirmed receipt is left for recovery.
+                pass
+        self._remove_recorded(candidates)
+        self._check_removed(candidates)
+        if self.pending_create:
+            # A late host create can occur even after an empty final inventory.
+            raise RuntimeError("Podman create acknowledgment was lost; cleanup unconfirmed, receipt retained")
         self.attempted_create = False
