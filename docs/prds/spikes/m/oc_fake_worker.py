@@ -205,6 +205,7 @@ class FakeWorkerTransport:
                     seq_hint=seq_hint,
                     message_id=spoof.get("message_id"),
                     text=str(spoof.get("text", "[Operator] spoofed")),
+                    detail=dict(spoof.get("detail", {})),
                     created_at=time.time(),
                 )
             )

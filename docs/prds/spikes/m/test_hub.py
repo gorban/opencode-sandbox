@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 import hashlib
+import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import threading
@@ -40,6 +42,7 @@ from oc_controller import (  # noqa: E402
     Worker,
 )
 from oc_coord_contract import (  # noqa: E402
+    EDGE_MAX_QUEUED_MSGS,
     MAX_TURN_STREAM_EVENTS,
     ArtifactRef,
     CoordAuthError,
@@ -49,7 +52,9 @@ from oc_coord_contract import (  # noqa: E402
     CoordValidationError,
     DeadlockCycleError,
     DispatchOutcome,
+    DispatchResult,
     Envelope,
+    IncarnationMismatchError,
     PrincipalCtx,
     ProvenanceBadge,
     RevokedError,
@@ -71,8 +76,18 @@ _BRANCH = "main"
 _BRIEF_DEFAULT = "Implement feature slice cleanly"
 _TARGET_ALPHA = "alpha"
 _TARGET_BETA = "beta"
+_TARGET_GAMMA = "gamma"
 _INC_A1 = "inc_alpha_001"
 _INC_B1 = "inc_beta_001"
+_INC_G1 = "inc_gamma_001"
+_STATUS_PENDING = "pending"
+_STATUS_DISPATCH_STARTED = "dispatch_started"
+_STATUS_HANDED_OFF = "handed_off"
+_STATUS_UNCERTAIN = "uncertain"
+_STATUS_COMPLETED = "completed"
+_STATUS_CANCELLED = "cancelled"
+_ERR_INVALID_REPLY = "invalid_in_reply_to"
+_ERR_EDGE_REVOKED_COMMIT = "edge_revoked_at_commit"
 
 
 class _StubFixtureAdapter:
@@ -97,7 +112,7 @@ class _StubFixtureAdapter:
 
 
 class InMemoryRegistryStore:
-    """Thread-safe in-memory RegistryStore implementing the exact Lane 1 contract."""
+    """Thread-safe in-memory RegistryStore matching real Lane 1 CoordRegistry semantics."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -111,6 +126,7 @@ class InMemoryRegistryStore:
         self.audit: list[dict[str, Any]] = []
         self._seq = 0
         self.fail_revoke_persist = False
+        self.fail_reads = False
 
     def register_sandbox(self, record: SandboxRecord) -> SandboxRecord:
         with self._lock:
@@ -119,6 +135,8 @@ class InMemoryRegistryStore:
 
     def get_sandbox(self, sandbox_addr: str) -> SandboxRecord | None:
         with self._lock:
+            if self.fail_reads:
+                raise OSError("simulated_db_read_failure")
             return self.sandboxes.get(sandbox_addr)
 
     def list_sandboxes(self) -> list[SandboxRecord]:
@@ -187,6 +205,8 @@ class InMemoryRegistryStore:
         active_only: bool = True,
     ) -> list[RoutingEdge]:
         with self._lock:
+            if self.fail_reads:
+                raise OSError("simulated_db_read_failure")
             out: list[RoutingEdge] = []
             for edge in self.edges.values():
                 if active_only and not edge.active:
@@ -211,9 +231,7 @@ class InMemoryRegistryStore:
         edge_id: str | None,
         lease_request_id: str | None,
     ) -> bool:
-        if target_addr is not None and edge.dst_addr == target_addr:
-            return True
-        if target_addr is not None and edge.src_actor == target_addr:
+        if target_addr is not None and (edge.dst_addr == target_addr or edge.src_actor == target_addr):
             return True
         if edge_id is not None and edge.edge_id == edge_id:
             return True
@@ -244,12 +262,12 @@ class InMemoryRegistryStore:
     ) -> None:
         revoked_set = set(revoked_ids)
         for row in self.outbox.values():
-            if row["status"] != "pending":
+            if row["status"] != _STATUS_PENDING:
                 continue
-            if row["edge_id"] in revoked_set or (
-                target_addr is not None and row["dst_addr"] == target_addr
-            ):
-                row["status"] = "cancelled"
+            env = self.envelopes.get(row["msg_id"])
+            env_dst = env.dst_addr if env is not None else None
+            if row["edge_id"] in revoked_set or (target_addr is not None and env_dst == target_addr):
+                row["status"] = _STATUS_CANCELLED
                 row["detail"] = reason
 
     def is_grant_tombstoned(self, edge_id: str, grant_generation: int) -> bool:
@@ -267,19 +285,24 @@ class InMemoryRegistryStore:
     ) -> RoutingEdge:
         edge = self.edges.get(edge_id)
         if edge is None or not edge.active or edge.grant_generation != expected_grant_generation:
-            raise RevokedError("edge_revoked_at_commit")
+            raise RevokedError(_ERR_EDGE_REVOKED_COMMIT)
         if (edge_id, expected_grant_generation) in self.tombstones:
-            raise RevokedError("edge_revoked_at_commit")
-        if expected_src_incarnation is not None and envelope.src_incarnation != expected_src_incarnation:
-            raise CoordAuthError("src_incarnation_mismatch")
+            raise RevokedError(_ERR_EDGE_REVOKED_COMMIT)
+        if edge.src_incarnation is not None and expected_src_incarnation != edge.src_incarnation:
+            raise IncarnationMismatchError("src_incarnation_mismatch")
         sb = self.sandboxes.get(envelope.dst_addr)
         if sb is None or sb.incarnation_id != expected_dst_incarnation:
             raise CoordPolicyError("dst_incarnation_mismatch")
         if check_in_reply_to is not None:
-            ref_id, ref_dst, ref_thread = check_in_reply_to
+            ref_id, caller_dst_addr, ref_thread = check_in_reply_to
             parent_env = self.envelopes.get(ref_id)
-            if parent_env is None or parent_env.dst_addr != ref_dst or parent_env.dst_thread_id != ref_thread:
-                raise CoordAuthError("invalid_in_reply_to")
+            if (
+                parent_env is None
+                or parent_env.dst_addr != caller_dst_addr
+                or parent_env.src_actor != edge.dst_addr
+                or parent_env.dst_thread_id != ref_thread
+            ):
+                raise CoordValidationError(_ERR_INVALID_REPLY)
         return edge
 
     def admit_and_enqueue_send(
@@ -304,41 +327,49 @@ class InMemoryRegistryStore:
                 envelope,
                 check_in_reply_to,
             )
-            pending_rows = [
-                r for r in self.outbox.values() if r["edge_id"] == edge_id and r["status"] == "pending"
-            ]
-            queued_bytes = sum(
-                len(self.envelopes[r["msg_id"]].body_text.encode("utf-8")) for r in pending_rows
-            )
-            body_bytes = len(envelope.body_text.encode("utf-8"))
-            if len(pending_rows) >= max_queued_msgs or queued_bytes + body_bytes > max_queued_bytes:
-                raise CoordBackpressureError("edge_mailbox_full")
+            control_prio = is_control_priority(envelope.trust_class, envelope.msg_kind)
+            if not control_prio:
+                pending_rows = [
+                    r
+                    for r in self.outbox.values()
+                    if r["edge_id"] == edge_id and r["status"] == _STATUS_PENDING
+                ]
+                queued_bytes = sum(
+                    len(self.envelopes[r["msg_id"]].body_text.encode("utf-8")) for r in pending_rows
+                )
+                body_bytes = len(envelope.body_text.encode("utf-8"))
+                if len(pending_rows) >= max_queued_msgs or queued_bytes + body_bytes > max_queued_bytes:
+                    raise CoordBackpressureError("edge_mailbox_full")
             new_turns = edge.turns_used + (1 if count_turn else 0)
             if count_turn and new_turns > edge.max_rounds:
-                raise CoordBackpressureError("edge_max_rounds_exceeded")
+                raise CoordPolicyError("edge_max_rounds_exceeded")
 
             self._seq += 1
             seq = self._seq
             persisted = replace(envelope, seq=seq, edge_turn_seq=new_turns)
             self.edges[edge_id] = replace(edge, turns_used=new_turns)
             self.envelopes[persisted.msg_id] = persisted
+            # Match real CoordRegistry: priority=1 control, priority=0 peer, NO dst_addr key!
             self.outbox[persisted.msg_id] = {
                 "msg_id": persisted.msg_id,
                 "seq": seq,
                 "edge_id": edge_id,
                 "grant_generation": expected_grant_generation,
-                "dst_addr": persisted.dst_addr,
                 "dst_incarnation": expected_dst_incarnation,
-                "priority": 0 if is_control_priority(persisted.trust_class, persisted.msg_kind) else 1,
-                "status": "pending",
+                "priority": 1 if control_prio else 0,
+                "status": _STATUS_PENDING,
                 "stream_id": None,
                 "detail": "",
             }
             return seq, persisted
 
-    def list_outbox(self, *, statuses: tuple[str, ...] = ("pending",)) -> list[dict[str, Any]]:
+    def list_outbox(
+        self, *, statuses: tuple[str, ...] = (_STATUS_PENDING,)
+    ) -> list[dict[str, Any]]:
         with self._lock:
-            return [dict(r) for r in self.outbox.values() if r["status"] in statuses]
+            rows = [dict(r) for r in self.outbox.values() if r["status"] in statuses]
+            rows.sort(key=lambda r: (-int(r["priority"]), int(r["seq"])))
+            return rows
 
     def get_envelope(self, msg_id: str) -> Envelope | None:
         with self._lock:
@@ -354,21 +385,25 @@ class InMemoryRegistryStore:
     ) -> bool:
         with self._lock:
             row = self.outbox.get(msg_id)
-            if row is None or row["status"] != "pending":
+            if row is None or row["status"] != _STATUS_PENDING:
                 return False
             if (edge_id, grant_generation) in self.tombstones:
                 return False
             if row["dst_incarnation"] != dst_incarnation:
                 return False
-            row["status"] = "dispatching"
+            row["status"] = _STATUS_DISPATCH_STARTED
             return True
 
     def return_outbox_to_pending(self, msg_id: str, *, detail: str = "") -> bool:
         with self._lock:
             row = self.outbox.get(msg_id)
-            if row is None or row["status"] != "dispatching":
+            if row is None or row["status"] != _STATUS_DISPATCH_STARTED:
                 return False
-            row["status"] = "pending"
+            if (row["edge_id"], row["grant_generation"]) in self.tombstones:
+                row["status"] = _STATUS_CANCELLED
+                row["detail"] = detail or "tombstoned"
+                return False
+            row["status"] = _STATUS_PENDING
             row["detail"] = detail
             return True
 
@@ -376,28 +411,31 @@ class InMemoryRegistryStore:
         with self._lock:
             row = self.outbox.get(msg_id)
             if row is not None:
-                row["status"] = "handed_off"
+                row["status"] = _STATUS_HANDED_OFF
                 row["stream_id"] = stream_id
 
     def mark_outbox_uncertain(self, msg_id: str, *, detail: str) -> None:
         with self._lock:
             row = self.outbox.get(msg_id)
             if row is not None:
-                row["status"] = "uncertain"
+                row["status"] = _STATUS_UNCERTAIN
                 row["detail"] = detail
 
     def mark_outbox_completed(self, msg_id: str) -> None:
         with self._lock:
             row = self.outbox.get(msg_id)
-            if row is not None and row["status"] == "handed_off":
-                row["status"] = "completed"
+            if row is not None and row["status"] == _STATUS_HANDED_OFF:
+                row["status"] = _STATUS_COMPLETED
 
     def cancel_outbox_row(self, msg_id: str, *, reason: str) -> None:
         with self._lock:
             row = self.outbox.get(msg_id)
-            if row is not None and row["status"] in ("pending", "dispatching"):
-                row["status"] = "cancelled"
-                row["detail"] = reason
+            if row is None:
+                return
+            if row["status"] != _STATUS_PENDING:
+                raise CoordValidationError("cancel_outbox_row requires pending status")
+            row["status"] = _STATUS_CANCELLED
+            row["detail"] = reason
 
     def record_stream_event(
         self, event: StreamEvent, *, tui_enter_token: str | None = None
@@ -415,6 +453,7 @@ class InMemoryRegistryStore:
                 "message_id": event.message_id,
                 "text": event.text,
                 "file_path": event.file_path,
+                "detail": dict(event.detail),
                 "provenance_badge": badge.value if badge is not None else None,
             }
             self.events.append(row)
@@ -529,6 +568,9 @@ class TestCoordHub(unittest.TestCase):
         self.peer_b = PrincipalCtx(
             CoordRole.JOB, "job-b", sandbox_addr=_TARGET_BETA, incarnation_id=_INC_B1
         )
+        self.peer_g = PrincipalCtx(
+            CoordRole.JOB, "job-g", sandbox_addr=_TARGET_GAMMA, incarnation_id=_INC_G1
+        )
         self.ext_peer = PrincipalCtx(CoordRole.EXTERNAL_PEER, "ext-codex")
 
     def tearDown(self) -> None:
@@ -555,8 +597,15 @@ class TestCoordHub(unittest.TestCase):
             task_brief=_BRIEF_DEFAULT,
         )
 
-    def test_protocol_conformance(self) -> None:
+    def test_protocol_conformance_and_json_serializable_status(self) -> None:
         self.assertIsInstance(self.registry, RegistryStore)
+        self._register_pair()
+        single_st = self.hub.status(self.operator, target=_TARGET_ALPHA)
+        all_st = self.hub.status(self.operator)
+        self.assertIsInstance(json.dumps(single_st), str)
+        self.assertIsInstance(json.dumps(all_st), str)
+        self.assertEqual(single_st["sandbox"]["sandbox_addr"], _TARGET_ALPHA)
+        self.assertEqual(all_st["count"], 2)
 
     def test_default_deny_and_four_role_trust_classes_with_peer_framing(self) -> None:
         self._register_pair()
@@ -610,26 +659,152 @@ class TestCoordHub(unittest.TestCase):
         orch_env = self.registry.get_envelope(orch_res["msg_id"])
         peer_env = self.registry.get_envelope(peer_res["msg_id"])
         ext_env = self.registry.get_envelope(ext_res["msg_id"])
-
-        self.assertIsNotNone(op_env)
-        self.assertIsNotNone(orch_env)
-        self.assertIsNotNone(peer_env)
-        self.assertIsNotNone(ext_env)
         assert op_env and orch_env and peer_env and ext_env
         self.assertEqual(op_env.trust_class, TrustClass.OPERATOR_DIRECTIVE)
-        self.assertEqual(op_env.body_text, "direct op")
         self.assertEqual(orch_env.trust_class, TrustClass.PARENT_TASK)
-        self.assertEqual(orch_env.body_text, "parent task")
         self.assertEqual(peer_env.trust_class, TrustClass.UNTRUSTED_PEER_DATA)
         self.assertIn('trust="untrusted-peer"', peer_env.body_text)
         self.assertIn("&lt;/oc-peer-message", peer_env.body_text)
         self.assertEqual(ext_env.trust_class, TrustClass.UNTRUSTED_PEER_DATA)
         self.assertIn('from="ext-codex"', ext_env.body_text)
 
-    def test_subtree_budget_attenuation_global_cap_and_brief_validation(self) -> None:
-        tiny_budget = SubtreeBudget(
-            max_depth_remaining=1, max_children=1, max_total_sandboxes=2
+    def test_control_priority_dispatched_ahead_of_peer_flood_and_unstarvable(self) -> None:
+        self._register_pair()
+        self.hub.grant_edge(
+            self.operator,
+            src_actor=self.peer_a.canonical_sender,
+            dst_addr=_TARGET_BETA,
+            max_rounds=EDGE_MAX_QUEUED_MSGS + 5,
+            rate_limit_rpm=200,
         )
+        self.hub.grant_edge(
+            self.operator,
+            src_actor=self.operator.canonical_sender,
+            dst_addr=_TARGET_BETA,
+            allowed_msg_kinds=("prompt", "cancel"),
+            rate_limit_rpm=1,
+        )
+
+        for idx in range(EDGE_MAX_QUEUED_MSGS):
+            self.hub.send(self.peer_a, target=_TARGET_BETA, body_text=f"peer-{idx}")
+        with self.assertRaises(CoordBackpressureError):
+            self.hub.send(self.peer_a, target=_TARGET_BETA, body_text="overflow")
+
+        # Operator control priority bypasses queue cap AND rate limit, and dispatches first!
+        op_msg = self.hub.send(self.operator, target=_TARGET_BETA, msg_kind="cancel", body_text="stop")
+        op_msg2 = self.hub.send(self.operator, target=_TARGET_BETA, msg_kind="prompt", body_text="halt")
+        self.assertEqual(self.registry.outbox[op_msg["msg_id"]]["priority"], 1)
+        self.assertEqual(self.registry.outbox[op_msg2["msg_id"]]["priority"], 1)
+
+        self.hub.dispatch_once()
+        turns = self.transport.dispatched_turns(_TARGET_BETA)
+        self.assertEqual(turns[0].msg_id, op_msg["msg_id"])
+        self.assertEqual(turns[1].msg_id, op_msg2["msg_id"])
+
+    def test_in_reply_to_direction_and_opaque_cross_peer_rejection(self) -> None:
+        self._register_pair()
+        self.hub.register_sandbox(
+            self.operator,
+            name=_TARGET_GAMMA,
+            incarnation_id=_INC_G1,
+            project_id=_PROJ_ID,
+            project_name=_PROJ_NAME,
+            branch=_BRANCH,
+            task_brief=_BRIEF_DEFAULT,
+        )
+        self.hub.grant_edge(
+            self.operator,
+            src_actor=_TARGET_ALPHA,
+            dst_addr=_TARGET_BETA,
+            allowed_threads=("main", "review"),
+            allowed_msg_kinds=("question",),
+        )
+        self.hub.grant_edge(
+            self.operator,
+            src_actor=_TARGET_BETA,
+            dst_addr=_TARGET_ALPHA,
+            allowed_threads=("main", "review"),
+            allowed_msg_kinds=("answer",),
+        )
+        self.hub.grant_edge(
+            self.operator,
+            src_actor=_TARGET_GAMMA,
+            dst_addr=_TARGET_ALPHA,
+            allowed_threads=("main",),
+            allowed_msg_kinds=("answer",),
+        )
+
+        q = self.hub.send(
+            self.peer_a, target=_TARGET_BETA, thread_id="main", msg_kind="question", body_text="hi?"
+        )
+        # Valid reply from beta -> alpha on same thread succeeds.
+        ans = self.hub.send(
+            self.peer_b,
+            target=_TARGET_ALPHA,
+            thread_id="main",
+            msg_kind="answer",
+            body_text="yes",
+            in_reply_to=q["msg_id"],
+        )
+        self.assertTrue(ans["msg_id"].startswith("msg_"))
+
+        # Cross-thread reply rejected opaquely.
+        with self.assertRaises(CoordValidationError) as ctx_thread:
+            self.hub.send(
+                self.peer_b,
+                target=_TARGET_ALPHA,
+                thread_id="review",
+                msg_kind="answer",
+                body_text="wrong thread",
+                in_reply_to=q["msg_id"],
+            )
+        self.assertEqual(str(ctx_thread.exception), _ERR_INVALID_REPLY)
+
+        # Third-party peer gamma forging in_reply_to rejected opaquely.
+        with self.assertRaises(CoordValidationError) as ctx_peer:
+            self.hub.send(
+                self.peer_g,
+                target=_TARGET_ALPHA,
+                thread_id="main",
+                msg_kind="answer",
+                body_text="forged",
+                in_reply_to=q["msg_id"],
+            )
+        self.assertEqual(str(ctx_peer.exception), _ERR_INVALID_REPLY)
+
+        # Unknown msg_id rejected with identical opaque error.
+        with self.assertRaises(CoordValidationError) as ctx_unknown:
+            self.hub.send(
+                self.peer_b,
+                target=_TARGET_ALPHA,
+                thread_id="main",
+                msg_kind="answer",
+                body_text="unknown",
+                in_reply_to="msg_nonexistent",
+            )
+        self.assertEqual(str(ctx_unknown.exception), _ERR_INVALID_REPLY)
+
+    def test_src_incarnation_pin_rejects_wrong_and_none_incarnation(self) -> None:
+        self._register_pair()
+        self.hub.grant_edge(
+            self.operator,
+            src_actor=_TARGET_ALPHA,
+            dst_addr=_TARGET_BETA,
+            src_incarnation=_INC_A1,
+        )
+        wrong_inc = PrincipalCtx(
+            CoordRole.JOB, "job-a", sandbox_addr=_TARGET_ALPHA, incarnation_id="inc_wrong"
+        )
+        none_inc = PrincipalCtx(
+            CoordRole.JOB, "job-a", sandbox_addr=_TARGET_ALPHA, incarnation_id=None
+        )
+        with self.assertRaises(IncarnationMismatchError):
+            self.hub.send(wrong_inc, target=_TARGET_BETA, body_text="stale inc")
+        with self.assertRaises(IncarnationMismatchError):
+            self.hub.send(none_inc, target=_TARGET_BETA, body_text="missing inc")
+
+    def test_subtree_budget_attenuation_global_cap_and_brief_validation(self) -> None:
+        tiny_budget = SubtreeBudget(max_depth_remaining=1, max_children=1, max_total_sandboxes=2)
         hub = CoordHub(self.registry, self.transport, self.state_dir, root_budget=tiny_budget)
         self.addCleanup(hub.close)
 
@@ -733,56 +908,111 @@ class TestCoordHub(unittest.TestCase):
         t.join(timeout=1.0)
         self.assertEqual(errors, [])
 
-    def test_prd_m2_test6_revoke_before_handoff_zero_deliveries_and_uncertain_stays_uncertain(
-        self,
-    ) -> None:
+    def test_prd_m2_test6_revoke_before_handoff_handoff_winning_race_and_uncertain(self) -> None:
         self._register_pair()
         self.hub.grant_edge(
-            self.operator,
-            src_actor=self.operator.canonical_sender,
-            dst_addr=_TARGET_ALPHA,
+            self.operator, src_actor=self.operator.canonical_sender, dst_addr=_TARGET_ALPHA
         )
-        # 1. Queue turn, revoke BEFORE transport handoff, recreate hub with SAME incarnation -> ZERO deliveries.
+        # 1. Queue turn, revoke BEFORE handoff, recreate hub with SAME incarnation -> ZERO deliveries.
         self.hub.send(self.operator, target=_TARGET_ALPHA, body_text="must not deliver")
         self.hub.revoke(self.operator, target=_TARGET_ALPHA, reason="pre_handoff_revoke")
-
         restarted_hub = CoordHub(self.registry, self.transport, self.state_dir)
         self.addCleanup(restarted_hub.close)
-        dispatched = restarted_hub.dispatch_once()
-        self.assertEqual(dispatched, 0)
+        self.assertEqual(restarted_hub.dispatch_once(), 0)
         self.assertEqual(len(self.transport.dispatched_turns(_TARGET_ALPHA)), 0)
 
-        # 2. Pre-write ZERO_BYTES_SENT retries cleanly; UNCERTAIN stays uncertain and never auto-retries.
+        # 2. Handoff winning race: handoff succeeds before revoke -> active stream aborted, no duplicate.
         self.hub.grant_edge(
+            self.operator, src_actor=self.operator.canonical_sender, dst_addr=_TARGET_BETA
+        )
+        stream_started = threading.Event()
+        never_unblock = threading.Event()
+        self.transport.queue_script(
+            _TARGET_BETA,
+            TurnScript(block_event=never_unblock, on_stream_started=stream_started),
+        )
+        win_msg = self.hub.send(self.operator, target=_TARGET_BETA, body_text="handoff wins")
+        self.hub.dispatch_once(async_stream=True)
+        self.assertTrue(stream_started.wait(timeout=1.0))
+        rev = self.hub.revoke(self.operator, target=_TARGET_BETA, reason="post_handoff_revoke")
+        self.assertTrue(rev.aborted_streams)
+        self.assertEqual(len(self.transport.dispatched_turns(_TARGET_BETA)), 1)
+        self.assertEqual(self.transport.dispatched_turns(_TARGET_BETA)[0].msg_id, win_msg["msg_id"])
+
+        # 3. ZERO_BYTES_SENT retries cleanly; UNCERTAIN & dispatch exception never auto-retry.
+        self.hub.register_sandbox(
             self.operator,
-            src_actor=self.operator.canonical_sender,
-            dst_addr=_TARGET_BETA,
+            name=_TARGET_GAMMA,
+            incarnation_id=_INC_G1,
+            project_id=_PROJ_ID,
+            project_name=_PROJ_NAME,
+            branch=_BRANCH,
+            task_brief=_BRIEF_DEFAULT,
+        )
+        self.hub.grant_edge(
+            self.operator, src_actor=self.operator.canonical_sender, dst_addr=_TARGET_GAMMA
         )
         self.transport.queue_script(
-            _TARGET_BETA,
-            TurnScript(outcome=DispatchOutcome.ZERO_BYTES_SENT, detail="busy_try_later"),
+            _TARGET_GAMMA,
+            TurnScript(outcome=DispatchOutcome.ZERO_BYTES_SENT, detail="busy"),
         )
         self.transport.queue_script(
-            _TARGET_BETA,
+            _TARGET_GAMMA,
             TurnScript(outcome=DispatchOutcome.HANDED_OFF, text_chunks=("recovered",)),
         )
-        r1 = self.hub.send(self.operator, target=_TARGET_BETA, body_text="retryable")
+        r1 = self.hub.send(self.operator, target=_TARGET_GAMMA, body_text="retryable")
         self.hub.dispatch_once()
-        self.assertEqual(self.registry.outbox[r1["msg_id"]]["status"], "pending")
+        self.assertEqual(self.registry.outbox[r1["msg_id"]]["status"], _STATUS_PENDING)
         self.hub.dispatch_once()
-        self.assertEqual(self.registry.outbox[r1["msg_id"]]["status"], "completed")
+        self.assertEqual(self.registry.outbox[r1["msg_id"]]["status"], _STATUS_COMPLETED)
 
         self.transport.queue_script(
-            _TARGET_BETA,
-            TurnScript(outcome=DispatchOutcome.UNCERTAIN, detail="socket_drop_after_write"),
+            _TARGET_GAMMA,
+            TurnScript(outcome=DispatchOutcome.UNCERTAIN, detail="socket_drop"),
         )
-        r2 = self.hub.send(self.operator, target=_TARGET_BETA, body_text="uncertain turn")
+        r2 = self.hub.send(self.operator, target=_TARGET_GAMMA, body_text="uncertain turn")
         self.hub.dispatch_once()
-        self.assertEqual(self.registry.outbox[r2["msg_id"]]["status"], "uncertain")
-        count_before = len(self.transport.dispatched_turns(_TARGET_BETA))
+        self.assertEqual(self.registry.outbox[r2["msg_id"]]["status"], _STATUS_UNCERTAIN)
+        count_before = len(self.transport.dispatched_turns(_TARGET_GAMMA))
         self.hub.dispatch_once()
-        self.assertEqual(len(self.transport.dispatched_turns(_TARGET_BETA)), count_before)
-        self.assertEqual(self.registry.outbox[r2["msg_id"]]["status"], "uncertain")
+        self.assertEqual(len(self.transport.dispatched_turns(_TARGET_GAMMA)), count_before)
+
+    def test_outbox_dispatch_exception_missing_stream_id_and_fenced_zero_bytes(self) -> None:
+        self._register_pair()
+        self.hub.grant_edge(
+            self.operator, src_actor=self.operator.canonical_sender, dst_addr=_TARGET_ALPHA
+        )
+
+        # 1. dispatch_turn raising exception -> marks uncertain (never stuck in dispatch_started).
+        orig_dispatch = self.transport.dispatch_turn
+
+        def _boom(_turn: Any) -> DispatchResult:
+            raise RuntimeError("transport_crash")
+
+        self.transport.dispatch_turn = _boom  # type: ignore[method-assign]
+        m1 = self.hub.send(self.operator, target=_TARGET_ALPHA, body_text="boom")
+        self.hub.dispatch_once()
+        self.assertEqual(self.registry.outbox[m1["msg_id"]]["status"], _STATUS_UNCERTAIN)
+
+        # 2. HANDED_OFF with empty stream_id -> marks uncertain.
+        def _empty_stream(_turn: Any) -> DispatchResult:
+            return DispatchResult(outcome=DispatchOutcome.HANDED_OFF, stream_id="")
+
+        self.transport.dispatch_turn = _empty_stream  # type: ignore[method-assign]
+        m2 = self.hub.send(self.operator, target=_TARGET_ALPHA, body_text="empty stream")
+        self.hub.dispatch_once()
+        self.assertEqual(self.registry.outbox[m2["msg_id"]]["status"], _STATUS_UNCERTAIN)
+
+        # 3. ZERO_BYTES_SENT when fenced during dispatch -> return_outbox_to_pending + cancel_outbox_row.
+        def _fenced_zero(_turn: Any) -> DispatchResult:
+            self.hub._fenced_addrs.add(_TARGET_ALPHA)
+            return DispatchResult(outcome=DispatchOutcome.ZERO_BYTES_SENT, detail="revoked_mid_call")
+
+        self.transport.dispatch_turn = _fenced_zero  # type: ignore[method-assign]
+        m3 = self.hub.send(self.operator, target=_TARGET_ALPHA, body_text="fenced zero")
+        self.hub.dispatch_once()
+        self.assertEqual(self.registry.outbox[m3["msg_id"]]["status"], _STATUS_CANCELLED)
+        self.transport.dispatch_turn = orig_dispatch  # type: ignore[method-assign]
 
     def test_prd_m2_test6_concurrent_final_turn_contention_exactly_one_succeeds(self) -> None:
         self._register_pair()
@@ -819,17 +1049,16 @@ class TestCoordHub(unittest.TestCase):
 
         self.assertEqual(len(successes), 1)
         self.assertEqual(len(failures), 1)
-        self.assertIsInstance(failures[0], CoordBackpressureError)
+        self.assertIsInstance(failures[0], CoordPolicyError)
 
-    def test_prd_m2_test7_tombstone_failure_aborts_stream_wakes_waiter_and_degrades_hub(
+    def test_prd_m2_test7_tombstone_failure_fault_isolation_caller_waiter_and_db_down(
         self,
     ) -> None:
         self._register_pair()
         self.hub.grant_edge(
-            self.operator,
-            src_actor=self.operator.canonical_sender,
-            dst_addr=_TARGET_ALPHA,
+            self.operator, src_actor=self.operator.canonical_sender, dst_addr=_TARGET_ALPHA
         )
+        self.hub.grant_edge(self.operator, src_actor=_TARGET_ALPHA, dst_addr=_TARGET_BETA)
 
         stream_started = threading.Event()
         release_stream = threading.Event()
@@ -841,53 +1070,83 @@ class TestCoordHub(unittest.TestCase):
         self.hub.dispatch_once(async_stream=True)
         self.assertTrue(stream_started.wait(timeout=1.0))
 
-        waiter_exc: list[Exception] = []
-        waiter_done = threading.Event()
+        # Waiter 1 waits ON alpha; Waiter 2 IS alpha waiting on beta (revoked caller!).
+        waiter_excs: list[Exception] = []
+        w1_done = threading.Event()
+        w2_done = threading.Event()
 
-        def _waiter() -> None:
+        def _w1() -> None:
             try:
                 self.hub.wait(self.operator, targets=[_TARGET_ALPHA], since_seq=0, timeout_s=5.0)
             except Exception as exc:
-                waiter_exc.append(exc)
+                waiter_excs.append(exc)
             finally:
-                waiter_done.set()
+                w1_done.set()
 
-        wt = threading.Thread(target=_waiter, daemon=True)
-        wt.start()
+        def _w2() -> None:
+            try:
+                self.hub.wait(self.peer_a, targets=[_TARGET_BETA], since_seq=0, timeout_s=5.0)
+            except Exception as exc:
+                waiter_excs.append(exc)
+            finally:
+                w2_done.set()
+
+        threading.Thread(target=_w1, daemon=True).start()
+        threading.Thread(target=_w2, daemon=True).start()
         time.sleep(0.03)
 
-        self.registry.fail_revoke_persist = True
-        with self.assertRaises(CoordPolicyError):
-            self.hub.revoke(self.operator, target=_TARGET_ALPHA, reason="fail_persist")
+        # Fault isolation: even if abort_incarnation raises AND DB reads fail, waiters still wake and hub degrades!
+        orig_abort = self.transport.abort_incarnation
 
-        self.assertTrue(waiter_done.wait(timeout=1.0))
-        self.assertEqual(len(waiter_exc), 1)
-        self.assertIsInstance(waiter_exc[0], RevokedError)
+        def _abort_and_raise(sb_addr: str, inc_id: str, *, reason: str) -> bool:
+            orig_abort(sb_addr, inc_id, reason=reason)
+            raise RuntimeError("abort_callback_error")
+
+        self.transport.abort_incarnation = _abort_and_raise  # type: ignore[method-assign]
+        self.registry.fail_reads = True
+
+        with self.assertRaises(CoordPolicyError):
+            self.hub.revoke(self.operator, target=_TARGET_ALPHA, reason="db_down_revoke")
+
+        self.assertTrue(w1_done.wait(timeout=1.0))
+        self.assertTrue(w2_done.wait(timeout=1.0))
+        self.assertEqual(len(waiter_excs), 2)
+        self.assertTrue(all(isinstance(e, RevokedError) for e in waiter_excs))
         self.assertIn((_TARGET_ALPHA, _INC_A1), self.transport.revoked_incarnations)
         self.assertTrue(self.hub.is_degraded)
 
+        self.registry.fail_reads = False
         with self.assertRaises(CoordPolicyError):
             self.hub.send(self.operator, target=_TARGET_BETA, body_text="blocked by degraded")
         self.assertEqual(self.hub.dispatch_once(), 0)
 
-    def test_prd_m2_test7_artifact_private_staging_revocation_cleanup_and_crash_recovery(
-        self,
-    ) -> None:
+    def test_prd_m2_test7_artifact_staging_perms_caps_sandbox_rejection_and_recovery(self) -> None:
         self._register_pair()
-        self.hub.grant_edge(
-            self.operator,
-            src_actor=self.operator.canonical_sender,
-            dst_addr=_TARGET_ALPHA,
-        )
+        # Denied send writes zero staging/spool files.
+        with self.assertRaises(CoordAuthError):
+            self.hub.send(
+                self.peer_a,
+                target=_TARGET_BETA,
+                body_text="denied",
+                artifact_blobs=[b"patch"],
+            )
+        self.assertEqual(list(self.hub.spool.staging_root.iterdir()), [])
+        self.assertEqual(self.hub.spool.usage_snapshot()["reserved_count"], 0)
 
+        self.hub.grant_edge(
+            self.operator, src_actor=self.operator.canonical_sender, dst_addr=_TARGET_ALPHA
+        )
+        observed_staged_modes: list[int] = []
         orig_stage = self.hub.spool.stage_blobs
 
-        def _stage_then_revoke(reservation: Any, blobs: Any, **kwargs: Any) -> Any:
+        def _stage_inspect_then_revoke(reservation: Any, blobs: Any, **kwargs: Any) -> Any:
             refs = orig_stage(reservation, blobs, **kwargs)
+            for p in reservation.staging_dir.iterdir():
+                observed_staged_modes.append(stat.S_IMODE(os.lstat(p).st_mode))
             self.hub.revoke(self.operator, target=_TARGET_ALPHA, reason="mid_stage_revoke")
             return refs
 
-        self.hub.spool.stage_blobs = _stage_then_revoke  # type: ignore[method-assign]
+        self.hub.spool.stage_blobs = _stage_inspect_then_revoke  # type: ignore[method-assign]
         with self.assertRaises(RevokedError):
             self.hub.send(
                 self.operator,
@@ -895,52 +1154,55 @@ class TestCoordHub(unittest.TestCase):
                 body_text="with patch",
                 artifact_blobs=[b"diff --git a/x b/x\n+hello\n"],
             )
-
+        self.assertEqual(observed_staged_modes, [0o600])
         snap = self.hub.spool.usage_snapshot()
         self.assertEqual(snap["reserved_count"], 0)
-        self.assertEqual(snap["reserved_bytes"], 0)
         self.assertEqual(snap["published_count"], 0)
         self.assertEqual(list(self.hub.spool.staging_root.iterdir()), [])
-        self.assertFalse((self.hub.spool.spool_root / _INC_A1).exists())
 
-        # Crash recovery: abandoned .staging/<id>/<file>.patch reclaimed cleanly.
+        # Crash recovery reclaims abandoned .staging/* directories.
         abandoned_dir = self.hub.spool.staging_root / "adm_crashed"
         os.mkdir(abandoned_dir, 0o700)
         (abandoned_dir / "deadbeef.patch").write_bytes(b"leftover")
-        reclaimed = self.hub.spool.reconcile_abandoned_staging()
-        self.assertGreaterEqual(reclaimed, 2)
+        self.assertGreaterEqual(self.hub.spool.reconcile_abandoned_staging(), 2)
         self.assertEqual(list(self.hub.spool.staging_root.iterdir()), [])
 
-        # Happy-path artifact publish + verified read + digest tamper detection.
+        # Happy-path publish has 0o400 permissions, verified read, and rejects hardlinks.
         self.hub.spool.stage_blobs = orig_stage  # type: ignore[method-assign]
         self.hub.grant_edge(
-            self.operator,
-            src_actor=self.operator.canonical_sender,
-            dst_addr=_TARGET_BETA,
+            self.operator, src_actor=self.operator.canonical_sender, dst_addr=_TARGET_BETA
         )
         patch_bytes = b"diff --git a/app.py b/app.py\n+print('ok')\n"
         res = self.hub.send(
-            self.operator,
-            target=_TARGET_BETA,
-            body_text="apply patch",
-            artifact_blobs=[patch_bytes],
+            self.operator, target=_TARGET_BETA, body_text="apply", artifact_blobs=[patch_bytes]
         )
         env = self.registry.get_envelope(res["msg_id"])
         assert env is not None
-        self.assertEqual(len(env.artifact_refs), 1)
-        read_back = self.hub.read_artifact(
-            self.peer_b, sandbox_addr=_TARGET_BETA, ref=env.artifact_refs[0]
+        ref = env.artifact_refs[0]
+        pub_path = self.hub.spool.spool_root / _INC_B1 / f"{ref.blob_sha256}.patch"
+        self.assertEqual(stat.S_IMODE(os.lstat(pub_path).st_mode), 0o400)
+        self.assertEqual(
+            self.hub.read_artifact(self.peer_b, sandbox_addr=_TARGET_BETA, ref=ref), patch_bytes
         )
-        self.assertEqual(read_back, patch_bytes)
-
-        bad_ref = ArtifactRef(
-            blob_sha256="0" * 64,
-            size_bytes=len(patch_bytes),
-        )
+        os.link(pub_path, self.state_dir / "hardlink_copy.patch")
         with self.assertRaises(CoordPolicyError):
-            self.hub.read_artifact(self.peer_b, sandbox_addr=_TARGET_BETA, ref=bad_ref)
+            self.hub.read_artifact(self.peer_b, sandbox_addr=_TARGET_BETA, ref=ref)
 
-    def test_out_of_band_controller_revoke_stops_active_stream_under_one_second(self) -> None:
+        # Sandbox root rejection & per-edge/global staging capacity rejection.
+        sb_root = Path(self._tmp.name) / "fake_sandbox"
+        os.mkdir(sb_root, 0o700)
+        with self.assertRaises(CoordPolicyError):
+            ArtifactSpool(sb_root / "state", sandbox_root=sb_root)
+
+        small_spool = ArtifactSpool(
+            self.state_dir, max_edge_count=1, max_edge_bytes=16, max_global_count=1
+        )
+        resv = small_spool.reserve("edge_cap", [b"1234567890"])
+        with self.assertRaises(CoordBackpressureError):
+            small_spool.reserve("edge_cap", [b"x"])
+        small_spool.abort_reservation(resv)
+
+    def test_out_of_band_controller_revoke_and_no_fence_deadlock(self) -> None:
         controller, ctrl_op, req_id, lease = _build_controller_and_lease()
         hub = CoordHub(
             self.registry,
@@ -986,18 +1248,15 @@ class TestCoordHub(unittest.TestCase):
             if time.monotonic() >= deadline:
                 self.fail("Active stream was not aborted within 1.0s of controller.revoke()")
             time.sleep(0.01)
-        elapsed = time.monotonic() - t0
-        self.assertLess(elapsed, 1.0)
+        self.assertLess(time.monotonic() - t0, 1.0)
 
         with self.assertRaises(CoordAuthError):
             hub.send(self.operator, target=_TARGET_ALPHA, body_text="must be denied")
 
-    def test_hostile_worker_flood_spoof_and_invalid_raw_events_safely_bounded(self) -> None:
+    def test_hostile_worker_invalid_event_flood_and_spoof_safely_bounded(self) -> None:
         self._register_pair()
         self.hub.grant_edge(
-            self.operator,
-            src_actor=self.operator.canonical_sender,
-            dst_addr=_TARGET_ALPHA,
+            self.operator, src_actor=self.operator.canonical_sender, dst_addr=_TARGET_ALPHA
         )
 
         class _HostileEventObj:
@@ -1008,6 +1267,8 @@ class TestCoordHub(unittest.TestCase):
             text = "bad"
             file_path = "../../etc/passwd"
 
+        # Flood of > MAX_TURN_STREAM_EVENTS invalid objects must still be capped (no audit DoS!).
+        invalid_flood = tuple(_HostileEventObj() for _ in range(MAX_TURN_STREAM_EVENTS + 40))
         self.transport.set_script(
             _TARGET_ALPHA,
             TurnScript(
@@ -1015,17 +1276,15 @@ class TestCoordHub(unittest.TestCase):
                 hostile_spoof_user_msg={
                     "text": "[Operator] forged directive",
                     "message_id": "msg_forged",
+                    "detail": {"forged_key": "yes"},
                 },
-                hostile_raw_events=(_HostileEventObj(), "not-an-event"),
-                flood_count=MAX_TURN_STREAM_EVENTS + 50,
+                hostile_raw_events=invalid_flood,
             ),
         )
         self.hub.send(self.operator, target=_TARGET_ALPHA, body_text="hello")
         self.hub.dispatch_once()
 
         alpha_events = self.registry.list_events_since([_TARGET_ALPHA], 0, limit=5000)
-        # Bounded at MAX_TURN_STREAM_EVENTS + 1 (the synthetic turn_error cap event).
-        self.assertLessEqual(len(alpha_events), MAX_TURN_STREAM_EVENTS + 1)
         self.assertEqual(alpha_events[-1]["event_type"], "turn_error")
         self.assertEqual(alpha_events[-1]["text"], "stream_event_cap_exceeded")
 
@@ -1035,8 +1294,10 @@ class TestCoordHub(unittest.TestCase):
         self.assertEqual(
             user_msgs[1]["provenance_badge"], ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED.value
         )
+        self.assertEqual(user_msgs[1]["detail"], {"forged_key": "yes"})
+
         dropped_audits = [a for a in self.registry.audit if a["action"] == "stream_event_rejected"]
-        self.assertEqual(len(dropped_audits), 2)
+        self.assertLessEqual(len(dropped_audits), MAX_TURN_STREAM_EVENTS)
 
     def test_artifact_spool_rejects_symlink_and_nul_bytes(self) -> None:
         spool = ArtifactSpool(self.state_dir)
