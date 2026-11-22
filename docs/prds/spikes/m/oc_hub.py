@@ -1734,7 +1734,7 @@ class CoordHub:
             if raw_ev.file_path is not None:
                 validate_sandbox_rel_path(raw_ev.file_path)
             encoded_detail = json.dumps(raw_ev.detail, separators=(",", ":")).encode("utf-8")
-        except (AddressError, CoordValidationError, TypeError, ValueError, UnicodeEncodeError):
+        except (CoordValidationError, TypeError, ValueError):
             return None
         if len(encoded_detail) > MAX_STREAM_EVENT_BYTES:
             return None
@@ -2091,10 +2091,14 @@ class CoordHub:
             inc_set: set[str] = set(self._known_incarnations.get(target_addr, ()))
             if incarnation_id is not None:
                 inc_set.add(incarnation_id)
-            for sb_addr, inc_id in list(self._active_streams.keys()):
-                if sb_addr == target_addr:
-                    inc_set.add(inc_id)
-                    self._active_streams.pop((sb_addr, inc_id), None)
+            matching_streams = [
+                (sb_addr, inc_id)
+                for sb_addr, inc_id in self._active_streams
+                if sb_addr == target_addr
+            ]
+            for key in matching_streams:
+                inc_set.add(key[1])
+                self._active_streams.pop(key, None)
             for inc_id in inc_set:
                 self._fenced_targets.add((target_addr, inc_id))
             for edge in edges:

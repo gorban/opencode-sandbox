@@ -102,6 +102,17 @@ _STATUS_CANCELLED = "cancelled"
 _STATUS_REVOKED = "revoked"
 _REPLYABLE_OUTBOX_STATUSES = (_STATUS_HANDED_OFF, _STATUS_COMPLETED, _STATUS_UNCERTAIN)
 _ORCH_ACTOR_PREFIX = "orchestrator:"
+_SQL_SELECT_EDGE_BY_ID = "SELECT * FROM routing_edges WHERE edge_id = ?"
+_SQL_SELECT_SANDBOX_INC_STATUS = (
+    "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?"
+)
+_SQL_UPDATE_OUTBOX_STATUS_DETAIL = (
+    "UPDATE outbox SET status = ?, detail = ?, updated_at = ? WHERE msg_id = ? AND status = ?"
+)
+
+
+def _dict_row_factory(cursor: sqlite3.Cursor, row: tuple[Any, ...]) -> dict[str, Any]:
+    return {col[0]: row[idx] for idx, col in enumerate(cursor.description or ())}
 
 
 def _sandbox_addr_from_actor(actor: str) -> str | None:
@@ -505,7 +516,7 @@ def _sanitize_stream_message_id(raw: str | None) -> str | None:
         return None
 
 
-def _row_to_sandbox(row: sqlite3.Row) -> SandboxRecord:
+def _row_to_sandbox(row: Mapping[str, Any]) -> SandboxRecord:
     return SandboxRecord(
         sandbox_addr=row["sandbox_addr"],
         worker_ref=row["worker_ref"],
@@ -526,7 +537,7 @@ def _row_to_sandbox(row: sqlite3.Row) -> SandboxRecord:
     )
 
 
-def _row_to_thread(row: sqlite3.Row) -> ThreadRecord:
+def _row_to_thread(row: Mapping[str, Any]) -> ThreadRecord:
     return ThreadRecord(
         sandbox_addr=row["sandbox_addr"],
         incarnation_id=row["incarnation_id"],
@@ -538,7 +549,7 @@ def _row_to_thread(row: sqlite3.Row) -> ThreadRecord:
     )
 
 
-def _row_to_edge(row: sqlite3.Row) -> RoutingEdge:
+def _row_to_edge(row: Mapping[str, Any]) -> RoutingEdge:
     return RoutingEdge(
         edge_id=row["edge_id"],
         src_actor=row["src_actor"],
@@ -556,7 +567,7 @@ def _row_to_edge(row: sqlite3.Row) -> RoutingEdge:
     )
 
 
-def _row_to_envelope(row: sqlite3.Row) -> Envelope:
+def _row_to_envelope(row: Mapping[str, Any]) -> Envelope:
     raw_arts = json.loads(row["artifact_refs_json"])
     arts = tuple(
         ArtifactRef(
@@ -587,7 +598,7 @@ def _row_to_envelope(row: sqlite3.Row) -> Envelope:
     )
 
 
-def _row_to_outbox_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _row_to_outbox_dict(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "seq": int(row["seq"]),
         "msg_id": row["msg_id"],
@@ -607,7 +618,7 @@ def _row_to_outbox_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _row_to_stream_event_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _row_to_stream_event_dict(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "source": "stream_event",
         "seq": int(row["seq"]),
@@ -625,7 +636,7 @@ def _row_to_stream_event_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _row_to_event_log_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _row_to_event_log_dict(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "source": "event_log",
         "seq": int(row["seq"]),
@@ -753,7 +764,7 @@ class CoordRegistry:
                     check_same_thread=False,
                 )
                 try:
-                    conn.row_factory = sqlite3.Row
+                    conn.row_factory = _dict_row_factory
                     conn.execute("PRAGMA journal_mode = WAL")
                     conn.execute("PRAGMA foreign_keys = ON")
                     conn.execute("PRAGMA synchronous = FULL")
@@ -1067,14 +1078,14 @@ class CoordRegistry:
                 ),
             )
             row = conn.execute(
-                "SELECT * FROM routing_edges WHERE edge_id = ?", (edge.edge_id,)
+                _SQL_SELECT_EDGE_BY_ID, (edge.edge_id,)
             ).fetchone()
             return _row_to_edge(row)
 
     def get_edge(self, edge_id: str) -> RoutingEdge | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM routing_edges WHERE edge_id = ?", (edge_id,)
+                _SQL_SELECT_EDGE_BY_ID, (edge_id,)
             ).fetchone()
             return _row_to_edge(row) if row is not None else None
 
@@ -1152,9 +1163,9 @@ class CoordRegistry:
         expected_grant_generation: int,
         expected_src_incarnation: str | None,
         envelope: Envelope,
-    ) -> sqlite3.Row:
+    ) -> Mapping[str, Any]:
         edge_row = conn.execute(
-            "SELECT * FROM routing_edges WHERE edge_id = ?", (edge_id,)
+            _SQL_SELECT_EDGE_BY_ID, (edge_id,)
         ).fetchone()
         if edge_row is None:
             raise CoordAuthError("edge_not_found")
@@ -1185,7 +1196,7 @@ class CoordRegistry:
         self, conn: sqlite3.Connection, dst_addr: str, expected_dst_incarnation: str
     ) -> None:
         sb = conn.execute(
-            "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?", (dst_addr,)
+            _SQL_SELECT_SANDBOX_INC_STATUS, (dst_addr,)
         ).fetchone()
         if sb is None:
             raise CoordValidationError(f"Target sandbox not found: {dst_addr!r}")
@@ -1203,7 +1214,7 @@ class CoordRegistry:
         sb_addr = _sandbox_addr_from_actor(src_actor)
         sb = (
             conn.execute(
-                "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?", (sb_addr,)
+                _SQL_SELECT_SANDBOX_INC_STATUS, (sb_addr,)
             ).fetchone()
             if sb_addr is not None
             else None
@@ -1220,7 +1231,7 @@ class CoordRegistry:
     def _verify_in_reply_to(
         self,
         conn: sqlite3.Connection,
-        edge_row: sqlite3.Row,
+        edge_row: Mapping[str, Any],
         envelope: Envelope,
         check_in_reply_to: tuple[str, str, str],
         expected_src_incarnation: str | None = None,
@@ -1268,7 +1279,7 @@ class CoordRegistry:
     def _consume_edge_turn(
         self,
         conn: sqlite3.Connection,
-        edge_row: sqlite3.Row,
+        edge_row: Mapping[str, Any],
         edge_id: str,
         expected_grant_generation: int,
         count_turn: bool,
@@ -1293,7 +1304,7 @@ class CoordRegistry:
     def _persist_admitted_send(
         self,
         conn: sqlite3.Connection,
-        edge_row: sqlite3.Row,
+        edge_row: Mapping[str, Any],
         updated_env: Envelope,
         priority: int,
         body_bytes: int,
@@ -1637,7 +1648,7 @@ class CoordRegistry:
         return " AND ".join(clauses), params
 
     def _revoke_matching_edges_conn(
-        self, conn: sqlite3.Connection, rows: list[sqlite3.Row], reason: str, now: float
+        self, conn: sqlite3.Connection, rows: list[Mapping[str, Any]], reason: str, now: float
     ) -> list[str]:
         revoked_ids: list[str] = []
         for row in rows:
@@ -1764,7 +1775,7 @@ class CoordRegistry:
         ):
             return False
         dst_sb = conn.execute(
-            "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?",
+            _SQL_SELECT_SANDBOX_INC_STATUS,
             (edge["dst_addr"],),
         ).fetchone()
         if dst_sb is None or dst_sb["status"] == _STATUS_REVOKED or dst_sb["incarnation_id"] != dst_incarnation:
@@ -1772,7 +1783,7 @@ class CoordRegistry:
         src_sb_addr = _sandbox_addr_from_actor(edge["src_actor"])
         src_sb = (
             conn.execute(
-                "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?",
+                _SQL_SELECT_SANDBOX_INC_STATUS,
                 (src_sb_addr,),
             ).fetchone()
             if src_sb_addr is not None
@@ -1850,10 +1861,7 @@ class CoordRegistry:
             ):
                 return False
             cur = conn.execute(
-                """
-                UPDATE outbox SET status = ?, detail = ?, updated_at = ?
-                WHERE msg_id = ? AND status = ?
-                """,
+                _SQL_UPDATE_OUTBOX_STATUS_DETAIL,
                 (_STATUS_PENDING, detail, now, msg_id, _STATUS_DISPATCH_STARTED),
             )
             return cur.rowcount == 1
@@ -1876,10 +1884,7 @@ class CoordRegistry:
         now = time.time()
         with self._tx() as conn:
             cur = conn.execute(
-                """
-                UPDATE outbox SET status = ?, detail = ?, updated_at = ?
-                WHERE msg_id = ? AND status = ?
-                """,
+                _SQL_UPDATE_OUTBOX_STATUS_DETAIL,
                 (_STATUS_UNCERTAIN, detail, now, msg_id, _STATUS_DISPATCH_STARTED),
             )
             if cur.rowcount != 1:
@@ -1906,10 +1911,7 @@ class CoordRegistry:
         now = time.time()
         with self._tx() as conn:
             cur = conn.execute(
-                """
-                UPDATE outbox SET status = ?, detail = ?, updated_at = ?
-                WHERE msg_id = ? AND status = ?
-                """,
+                _SQL_UPDATE_OUTBOX_STATUS_DETAIL,
                 (_STATUS_ABORTED, clean_reason, now, msg_id, _STATUS_HANDED_OFF),
             )
             if cur.rowcount != 1:
@@ -1945,7 +1947,7 @@ class CoordRegistry:
         self, conn: sqlite3.Connection, sandbox_addr: str, incarnation_id: str
     ) -> bool:
         sb = conn.execute(
-            "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?",
+            _SQL_SELECT_SANDBOX_INC_STATUS,
             (sandbox_addr,),
         ).fetchone()
         if sb is None:
@@ -2013,7 +2015,7 @@ class CoordRegistry:
         expires_at = time.time() + float(ttl_s)
         with self._tx() as conn:
             sb = conn.execute(
-                "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?",
+                _SQL_SELECT_SANDBOX_INC_STATUS,
                 (sandbox_addr,),
             ).fetchone()
             if sb is not None and (

@@ -186,7 +186,7 @@ def _validate_loopback_host_entry(raw: object) -> str:
     if not text or any(ch.isspace() for ch in text) or "/" in text or "@" in text:
         raise UiAuthValidationError(f"Invalid allowed host entry: {raw!r}")
     _validate_raw_port(text)
-    parsed = urlsplit(f"http://{text}")
+    parsed = urlsplit(f"https://{text}")
     if parsed.netloc != text or parsed.hostname is None:
         raise UiAuthValidationError(f"Malformed allowed host entry: {raw!r}")
     try:

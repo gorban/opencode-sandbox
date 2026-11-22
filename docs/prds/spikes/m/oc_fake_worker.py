@@ -209,8 +209,7 @@ class FakeWorkerTransport:
                     created_at=time.time(),
                 )
             )
-        for raw_ev in script.hostile_raw_events:
-            events.append(raw_ev)
+        events.extend(script.hostile_raw_events)
         for chunk in script.text_chunks:
             seq_hint += 1
             events.append(
@@ -319,7 +318,12 @@ class FakeWorkerTransport:
             revoked = inc_key in self._revoked_incarnations
             active_count = len(self._active_by_incarnation.get(inc_key, ()))
             last_err = self._last_error.get(inc_key)
-        state_str = "revoked" if revoked else ("busy" if active_count > 0 else "running")
+        if revoked:
+            state_str = "revoked"
+        elif active_count > 0:
+            state_str = "busy"
+        else:
+            state_str = "running"
         return WorkerStatus(
             sandbox_addr=sandbox_addr,
             incarnation_id=incarnation_id,

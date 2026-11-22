@@ -750,7 +750,7 @@ class CoordUdsRpcServer:
             return _rpc_ok(req_id, result)
         except (CoordValidationError, AddressError) as exc:
             return _rpc_error(req_id, ERR_CODE_INVALID_PARAMS, str(exc))
-        except (RevokedError, CoordAuthError) as exc:
+        except CoordAuthError as exc:
             return _rpc_error(req_id, ERR_CODE_AUTH, str(exc))
         except CoordBackpressureError as exc:
             return _rpc_error(req_id, ERR_CODE_RATE_LIMIT, str(exc))

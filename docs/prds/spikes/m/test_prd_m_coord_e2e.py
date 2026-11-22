@@ -130,7 +130,9 @@ def _find_thread_messages(
     return []
 
 
-class TestPrdMCoordEndToEnd(unittest.TestCase):
+class CoordTestBase(unittest.TestCase):
+    """Shared temporary state, sandbox, and socket directory harness for PRD M tests."""
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
@@ -144,6 +146,8 @@ class TestPrdMCoordEndToEnd(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
+
+class TestPrdMCoordEndToEnd(CoordTestBase):
     def test_e2e_operator_turn_projection_spoof_reopen_and_controller_revoke(self) -> None:
         controller, ctrl_op, lease, req_id = _create_controller_lease(
             sandbox_name="feat-a", incarnation_id="inc_e2e_1"
@@ -530,13 +534,13 @@ class TestPrdMCoordEndToEnd(unittest.TestCase):
 
             # Mutual wait must immediately reject cycle with DeadlockCycleError
             ready = threading.Event()
-            wait_err: list[BaseException] = []
+            wait_err: list[Exception] = []
 
             def _wait_a() -> None:
                 ready.set()
                 try:
                     hub.wait(impl_ctx, targets=["lane-rev"], since_seq=999_999, timeout_s=0.4)
-                except BaseException as exc:  # pragma: no cover
+                except Exception as exc:  # pragma: no cover
                     wait_err.append(exc)
 
             ta = threading.Thread(target=_wait_a, daemon=True)

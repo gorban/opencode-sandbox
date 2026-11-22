@@ -1,28 +1,27 @@
-"""Dedicated Gate 2 Round 1 adversarial regression tests for PRD M coordination.
+"""Dedicated Gate 2 adversarial regression tests for PRD M coordination.
 
-Every test in this module reproduces a specific P1, P2, or P3 finding from
-Gate 2 Round 1 against commit f4cc88e9 and verifies the root-cause fix.
+Every test reproduces a specific Round 1 or Round 2 finding and verifies its fix.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 import sys
-import tempfile
 import threading
 import time
 import unittest
 from typing import Any
 
 _SPIKE_M_DIR = Path(__file__).resolve().parent
-_SPIKE_L_DIR = _SPIKE_M_DIR.parent / "l"
-_REPO_ROOT = _SPIKE_M_DIR.parents[3]
-for _p in (str(_SPIKE_M_DIR), str(_SPIKE_L_DIR), str(_REPO_ROOT)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if str(_SPIKE_M_DIR) not in sys.path:
+    sys.path.insert(0, str(_SPIKE_M_DIR))
 
+from test_prd_m_coord_e2e import (  # noqa: E402
+    CoordTestBase,
+    _E2eFixtureAdapter,
+    _create_controller_lease,
+)
 from oc_broker_common import BrokerLease  # noqa: E402
 from oc_controller import (  # noqa: E402
     Capability,
@@ -31,9 +30,7 @@ from oc_controller import (  # noqa: E402
     Intent,
     Job,
     Operation,
-    Outcome,
     Principal,
-    ProbeResult,
     Proposal,
     Reference,
     Role,
@@ -54,7 +51,6 @@ from oc_coord_contract import (  # noqa: E402
     RevokedError,
     StreamEvent,
     SubtreeBudget,
-    TrustClass,
 )
 from oc_coord_rpc import CoordUdsRpcServer, uds_rpc_call  # noqa: E402
 from oc_fake_worker import FakeWorkerTransport, TurnScript  # noqa: E402
@@ -70,64 +66,13 @@ _THREAD_REVIEW = "review"
 _KIND_PROMPT = "prompt"
 
 
-class _RegFixtureAdapter:
-    def target_revision(self, target: str) -> str:
-        return "rev-1"
-
-    def set_target_revision(self, target: str, revision: str) -> None:
-        return None
-
-    def dispatch(self, *_args: Any, **_kwargs: Any) -> ProbeResult:
-        return ProbeResult(Outcome.SUCCEEDED, "ok")
-
-    def reconcile(self, *_args: Any, **_kwargs: Any) -> ProbeResult:
-        return ProbeResult(Outcome.SUCCEEDED, "ok")
-
-
 def _make_controller_lease(
     sandbox_name: str, incarnation_id: str
 ) -> tuple[Controller, Principal, BrokerLease, str]:
-    operator = Principal(Role.OPERATOR, "op-reg")
-    orchestrator = Principal(Role.ORCHESTRATOR, "orch-reg")
-    job_actor = Principal(Role.JOB, f"chan-{sandbox_name}")
-    subject = Subject("worker-local", incarnation_id, f"chan-{sandbox_name}")
-    controller = Controller(
-        incarnation="b" * 32,
-        clock=lambda: 100,
-        lifetime=3600,
-        workers=[Worker("worker-local", operator)],
-        jobs=[Job(subject, orchestrator, proposal_budget=4)],
-        capabilities=[Capability("cap-probe", Operation.PROBE, "tgt-reg")],
-        references=[Reference("ref-probe", "cap-probe")],
-        adapter=_RegFixtureAdapter(),
-    )
-    controller._set_alias("alias-reg", "tgt-reg")
-    st = controller.propose(job_actor, Proposal(Intent.PROBE_GRANT, "alias-reg", "ref-probe"))
-    view = controller.view(operator, st.request_id)
-    controller.decide(operator, st.request_id, view.payload.revision, view.digest, Decision.APPROVE)
-    lease = BrokerLease(
-        f"job-{sandbox_name}",
-        controller=controller,
-        controller_actor=operator,
-        controller_request_id=st.request_id,
-    )
-    return controller, operator, lease, st.request_id
+    return _create_controller_lease(sandbox_name=sandbox_name, incarnation_id=incarnation_id)
 
 
-class TestGate2Round1Regressions(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-        self.state_dir = self.root / "state"
-        self.state_dir.mkdir(mode=0o700)
-        self.sandbox_root = self.root / "sandbox-home"
-        self.sandbox_root.mkdir(mode=0o700)
-        self.sock_dir = self.root / "run"
-        self.sock_dir.mkdir(mode=0o700)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
-
+class TestGate2Round1Regressions(CoordTestBase):
     def _new_stack(
         self,
         *,
@@ -188,7 +133,7 @@ class TestGate2Round1Regressions(unittest.TestCase):
         self.assertFalse(wayland.attenuates(SubtreeBudget(max_depth_remaining=0, max_security_profile="elevated-nested")))
 
     def test_p1_2_revoked_sub_orchestrator_blocked_and_orchestrator_subtree_scoped(self) -> None:
-        reg, transport, hub = self._new_stack()
+        _, transport, hub = self._new_stack()
         hub.register_sandbox(
             _OP,
             name="orch-1",
@@ -453,10 +398,6 @@ class TestGate2Round1Regressions(unittest.TestCase):
         msg1 = send1["msg_id"]
         orig_dispatch = transport.dispatch_turn
 
-        def _zero_and_revoke(turn: Any) -> Any:
-            hub.revoke(_OP, target="sb-a", reason="mid-zero-revoke")
-            return TurnScript(outcome=DispatchOutcome.ZERO_BYTES_SENT, detail="revoked").outcome
-
         transport.queue_script(
             "sb-a", TurnScript(outcome=DispatchOutcome.ZERO_BYTES_SENT, detail="pre-write-refused")
         )
@@ -586,7 +527,7 @@ class TestGate2Round1Regressions(unittest.TestCase):
             reg.record_stream_event(forged_ev)
 
     def test_p2_1_near_64k_peer_message_frames_and_consumes_receipt_cleanly(self) -> None:
-        reg, transport, hub = self._new_stack()
+        reg, _, hub = self._new_stack()
         hub.register_sandbox(
             _OP,
             name="peer-src",
@@ -843,7 +784,7 @@ def _make_dual_request_controller() -> tuple[Controller, Principal, BrokerLease,
             Reference("ref-sb", "cap-sb"),
             Reference("ref-edge", "cap-edge"),
         ],
-        adapter=_RegFixtureAdapter(),
+        adapter=_E2eFixtureAdapter(),
     )
     controller._set_alias("alias-sb", "tgt-sb")
     controller._set_alias("alias-edge", "tgt-edge")
@@ -864,20 +805,7 @@ def _make_dual_request_controller() -> tuple[Controller, Principal, BrokerLease,
     return controller, operator, lease_sb, st_sb.request_id, st_edge.request_id
 
 
-class TestGate2Round2Regressions(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-        self.state_dir = self.root / "state"
-        self.state_dir.mkdir(mode=0o700)
-        self.sandbox_root = self.root / "sandbox-home"
-        self.sandbox_root.mkdir(mode=0o700)
-        self.sock_dir = self.root / "run"
-        self.sock_dir.mkdir(mode=0o700)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
-
+class TestGate2Round2Regressions(CoordTestBase):
     def _new_stack(self) -> tuple[CoordRegistry, FakeWorkerTransport, CoordHub]:
         reg = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
         transport = FakeWorkerTransport()
@@ -937,14 +865,14 @@ class TestGate2Round2Regressions(unittest.TestCase):
         self.assertTrue(wait_res["timed_out"])
 
         # 2. Mid-wait single-edge revocation must raise RevokedError on wakeup (not return post-revoke events)
-        wait_exc: list[BaseException] = []
+        wait_exc: list[Exception] = []
         started = threading.Event()
 
         def _waiter() -> None:
             started.set()
             try:
                 hub.wait(peer_a, targets=["target-b"], since_seq=0, timeout_s=2.0)
-            except BaseException as exc:
+            except Exception as exc:
                 wait_exc.append(exc)
 
         wt = threading.Thread(target=_waiter, daemon=True)
@@ -1016,7 +944,7 @@ class TestGate2Round2Regressions(unittest.TestCase):
             reg2.close()
 
     def test_r2_p2_1_sql_where_pushdown_prevents_operator_flood_starving_peer_wait(self) -> None:
-        reg, transport, hub = self._new_stack()
+        _, transport, hub = self._new_stack()
         hub.register_sandbox(
             _OP,
             name="peer-a",

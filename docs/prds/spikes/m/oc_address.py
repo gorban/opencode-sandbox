@@ -28,6 +28,7 @@ VALID_MSG_KINDS: frozenset[str] = frozenset(
 _INSTANCE_RE = re.compile(r"^[a-z\d](?:[a-z\d-]{0,22}[a-z\d])?$", re.ASCII)
 _REMOTE_RE = re.compile(r"^[a-z\d](?:[a-z\d-]{0,30}[a-z\d])?$", re.ASCII)
 _THREAD_ID_RE = re.compile(r"^[a-z\d](?:[a-z\d-]{0,30}[a-z\d])?$", re.ASCII)
+_LABEL_SANDBOX_INSTANCE = "sandbox instance name"
 
 _BIDI_CODEPOINTS: frozenset[int] = frozenset(
     list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)) + [0x200E, 0x200F, 0x061C]
@@ -107,10 +108,10 @@ def format_canonical_addr(addr: TargetAddr) -> str:
     if addr.kind == "local":
         if addr.remote is not None:
             raise AddressError("Local TargetAddr must not carry a remote worker")
-        return _validate_instance_atom(addr.name, "sandbox instance name")
+        return _validate_instance_atom(addr.name, _LABEL_SANDBOX_INSTANCE)
     if addr.kind == "remote":
         rem = _validate_remote_atom(addr.remote)
-        inst = _validate_instance_atom(addr.name, "sandbox instance name")
+        inst = _validate_instance_atom(addr.name, _LABEL_SANDBOX_INSTANCE)
         return f"{rem} / {inst}"
     if addr.kind == "peer":
         if addr.remote is not None:
@@ -135,11 +136,11 @@ def parse_canonical_addr(raw: object) -> TargetAddr:
         if len(parts) != 2:
             raise AddressError(f"Invalid remote target address: {text!r}")
         rem = _validate_remote_atom(parts[0])
-        inst = _validate_instance_atom(parts[1], "sandbox instance name")
+        inst = _validate_instance_atom(parts[1], _LABEL_SANDBOX_INSTANCE)
         return TargetAddr(kind="remote", name=inst, remote=rem)
     if "/" in text or " " in text:
         raise AddressError(f"Non-canonical separator or whitespace in target address: {text!r}")
-    inst = _validate_instance_atom(text, "sandbox instance name")
+    inst = _validate_instance_atom(text, _LABEL_SANDBOX_INSTANCE)
     return TargetAddr(kind="local", name=inst)
 
 

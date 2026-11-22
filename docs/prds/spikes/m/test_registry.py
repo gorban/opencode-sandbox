@@ -202,9 +202,11 @@ class TestRegistrySecurityAndBoundaries(unittest.TestCase):
                 fpath = Path(f"{db_path}{suffix}")
                 if fpath.exists():
                     self.assertEqual(stat.S_IMODE(os.lstat(fpath).st_mode), 0o600)
-            journal = reg._conn.execute("PRAGMA journal_mode").fetchone()[0]
+            journal = reg._conn.execute("PRAGMA journal_mode").fetchone()["journal_mode"]
             self.assertEqual(str(journal).lower(), "wal")
-            self.assertEqual(int(reg._conn.execute("PRAGMA foreign_keys").fetchone()[0]), 1)
+            self.assertEqual(
+                int(reg._conn.execute("PRAGMA foreign_keys").fetchone()["foreign_keys"]), 1
+            )
         finally:
             reg.close()
 

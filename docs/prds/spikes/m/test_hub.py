@@ -107,8 +107,7 @@ class _StubFixtureAdapter:
         return Outcome.SUCCEEDED
 
     def reconcile(self, attempt: Attempt, payload: Payload) -> Outcome:
-        _ = (attempt, payload)
-        return Outcome.SUCCEEDED
+        return self.dispatch(attempt, payload)
 
 
 class InMemoryRegistryStore:
@@ -257,7 +256,7 @@ class InMemoryRegistryStore:
             if self.fail_revoke_persist:
                 raise OSError("simulated_tombstone_db_failure")
             revoked_ids: list[str] = []
-            for eid, edge in list(self.edges.items()):
+            for eid, edge in self.edges.items():
                 if self._edge_matches_revoke(edge, target_addr, edge_id, lease_request_id):
                     self.edges[eid] = replace(edge, active=False)
                     self.tombstones.add((eid, edge.grant_generation))
@@ -696,7 +695,14 @@ class TestCoordHub(unittest.TestCase):
         orch_env = self.registry.get_envelope(orch_res["msg_id"])
         peer_env = self.registry.get_envelope(peer_res["msg_id"])
         ext_env = self.registry.get_envelope(ext_res["msg_id"])
-        assert op_env and orch_env and peer_env and ext_env
+        self.assertIsNotNone(op_env)
+        self.assertIsNotNone(orch_env)
+        self.assertIsNotNone(peer_env)
+        self.assertIsNotNone(ext_env)
+        assert op_env is not None
+        assert orch_env is not None
+        assert peer_env is not None
+        assert ext_env is not None
         self.assertEqual(op_env.trust_class, TrustClass.OPERATOR_DIRECTIVE)
         self.assertEqual(orch_env.trust_class, TrustClass.PARENT_TASK)
         self.assertEqual(peer_env.trust_class, TrustClass.UNTRUSTED_PEER_DATA)

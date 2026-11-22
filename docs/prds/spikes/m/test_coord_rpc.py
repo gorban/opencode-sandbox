@@ -548,7 +548,7 @@ class TestUiAuthManager(unittest.TestCase):
         def worker() -> None:
             barrier.wait()
             try:
-                rec, csrf, cookie = mgr.exchange_bootstrap_code(
+                rec, _, cookie = mgr.exchange_bootstrap_code(
                     race_code, host_header=_TEST_HOST, origin_header=_TEST_ORIGIN
                 )
                 with res_lock:
@@ -858,7 +858,7 @@ class TestUiAuthManager(unittest.TestCase):
         # Trailing empty colon and leading-zero ports rejected
         for bad_host in ("127.0.0.1:", "[::1]:", "localhost:", "127.0.0.1:047110", "[::1]:080"):
             with self.assertRaises(UiAuthValidationError):
-                UiAuthManager([bad_host], [f"http://{bad_host}"], clock=clock)
+                UiAuthManager([bad_host], [f"https://{bad_host}"], clock=clock)
         # Huge int TTL rejected cleanly without OverflowError
         with self.assertRaises(UiAuthValidationError):
             UiAuthManager([_TEST_HOST], [_TEST_ORIGIN], idle_ttl_s=10**400, clock=clock)
