@@ -166,7 +166,7 @@ unkeyed=$(printf '%s|%s|%s|%s' app "$PW" db "" | sha256sum | cut -c1-16)
 check "volume label is not the unkeyed hash" ! grep -qa "$unkeyed" "$T/argv.log"
 check "signature key is private (0600)"    [ "$(stat -c %a "$T/state/pg-sig.key" 2>/dev/null)" = 600 ]
 
-pgmsg() {  # volume-label -> stderr of ensure_postgres for '-i default' with an existing volume
+pgmsg() {  # volume-label [init-directory] -> stderr of ensure_postgres with an existing volume
   cat > "$T/pgm.sh" <<EOF
 set -euo pipefail
 $(host_input_functions)
@@ -181,7 +181,7 @@ pm() {
   esac
   return 0
 }
-STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$T/none INST= ILABEL=default
+STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$(printf '%q' "${2:-$T/none}") INST= ILABEL=default
 PGHBASECRET=oc-pg-hba PGPASSSECRET=oc-pg-passfile PORTS=()
 PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD=pw
 ensure_postgres
@@ -194,6 +194,10 @@ check "legacy-volume hint keeps -i default"   grep -q -- '-i default -d && podma
 out=$(pgmsg mismatch)
 check "settings-mismatch hint keeps -i default" grep -q -- '-i default -d && podman volume rm oc-pg' <<<"$out"
 check "no hint suggests a bare -d"            ! grep -qE '\.sh -d && podman' <<<"$out$(pgmsg "$legacy")"
+mkdir -p "$T/directory-init/empty-subdirectory"
+directory_sig=$({ cat "$T/state/pg-sig.key"; printf '|app|pw|db|abcfa6a9d4df344d'; } | sha256sum | cut -c1-16)
+check "existing volume keeps its directory-only Postgres init signature" \
+  pgmsg "k1:$directory_sig" "$T/directory-init"
 
 # ================================================================================================
 echo "host bridge (oc-bridge.py)"

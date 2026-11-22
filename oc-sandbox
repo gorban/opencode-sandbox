@@ -292,8 +292,8 @@ inspect_pg_init() { # host only; output the existing digest, or no line for an a
     echo "Postgres init requires ordinary owner-controlled directories and files without links" >&2
     return 1
   }
-  # A directory-only tree keeps the digest of an empty stream.
-  digest=$(cd "$dir" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum | sha256sum | cut -c1-16) \
+  # Keep the original inner sha256sum even for an init tree without files.
+  digest=$(cd "$dir" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16) \
     || return 1
   printf '%s\n' "$digest"
 }
