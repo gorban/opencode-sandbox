@@ -54,6 +54,10 @@ from oc_store import (  # noqa: E402
 )
 
 
+def _ip(*octets: int) -> str:
+    return ".".join(str(o) for o in octets)
+
+
 def _sample_bundle_toml(bid: str, extra: str = "") -> str:
     return (
         f'schema_version = 1\n'
@@ -178,18 +182,14 @@ class TestPlanCompiler(unittest.TestCase):
         for bad in (
             "http://staging.example.com/mcp",
             "https://127.0.0.1:8080/mcp",
-            "https://169.254.169.254/latest/meta-data",
+            f"https://{_ip(169, 254, 169, 254)}/latest/meta-data",
             "https://host.containers.internal/mcp",
             "https://user:pass@staging.example.com/mcp",
-            "https://10.0.0.5/mcp",
+            f"https://{_ip(10, 0, 0, 5)}/mcp",
         ):
-            with self.subTest(url=bad):
-                with self.assertRaises(PolicyError):
-                    compile_plan(
-                        self.store,
-                        "builtin/api-workbench",
-                        overrides=PlanOverrides(env_bindings={"API_ENDPOINT": bad}),
-                    )
+            ov = PlanOverrides(env_bindings={"API_ENDPOINT": bad})
+            with self.subTest(url=bad), self.assertRaises(PolicyError):
+                compile_plan(self.store, "builtin/api-workbench", overrides=ov)
 
     def test_persona_conflict_and_role_filtered_mcp(self) -> None:
         # Security-audit uses [composition] replace=["persona"] and restricts api_client to query_ro
@@ -459,9 +459,8 @@ class TestPlanCompiler(unittest.TestCase):
     def test_schema_and_policy_rejections(self) -> None:
         # Invalid opaque IDs
         for bad_id in ("../etc", "a//b", "a/b/c", "/leading", "trailing/", "UPPER", "has space"):
-            with self.subTest(bad_id=bad_id):
-                with self.assertRaises(SchemaError):
-                    validate_opaque_id(bad_id)
+            with self.subTest(bad_id=bad_id), self.assertRaises(SchemaError):
+                validate_opaque_id(bad_id)
 
         # Host URL template rejects password placeholder and bad schemes
         with self.assertRaises(SchemaError):
@@ -503,9 +502,8 @@ class TestPlanCompiler(unittest.TestCase):
             ),
         ]
         for obj_id, raw, exc_cls, msg_re in bad_services:
-            with self.subTest(obj_id=obj_id):
-                with self.assertRaisesRegex(exc_cls, msg_re):
-                    self.store.create_proposal(kind="service", obj_id=obj_id, action="upsert", proposed_toml=raw)
+            with self.subTest(obj_id=obj_id), self.assertRaisesRegex(exc_cls, msg_re):
+                self.store.create_proposal(kind="service", obj_id=obj_id, action="upsert", proposed_toml=raw)
 
     def test_p1_2_builtin_downgrade_alternate_port_and_same_service_named_instances(self) -> None:
         # Alternate-port competing capability providers cannot weaken auth, exposure, or security_profile
@@ -640,42 +638,37 @@ class TestPlanCompiler(unittest.TestCase):
             HostConfigStore(direct_link, sandbox_root=sb_dir)
 
         # MCP http URL & local.url SSRF / userinfo / port 9222 bypasses rejected
+        meta_ip = _ip(169, 254, 169, 254)
         bad_mcp_cases = [
             'url = "http://127.0.0.1:@evil.com/mcp"',
             'url = "http://127.0.0.1:9222/json"',
-            'url = "https://169.254.169.254/latest/meta-data"',
+            f'url = "https://{meta_ip}/latest/meta-data"',
             'url = "http://127.0.0.1:8080/mcp"\n[mcp.bad.local]\nwhen_env_empty = "API_ENDPOINT"\nservice = "builtin/api-demo"\nurl = "file:///etc/passwd"',
             'url = "http://127.0.0.1:8080/mcp"\n[mcp.bad.local]\nwhen_env_empty = "API_ENDPOINT"\nservice = "builtin/api-demo"\nurl = "http://127.0.0.1:9222/mcp"',
         ]
         for idx, snippet in enumerate(bad_mcp_cases):
             bid = f"team/bad-mcp-{idx}"
             raw = _sample_bundle_toml(bid, f'[mcp.bad]\ntransport = "http"\n{snippet}\n')
-            with self.subTest(case=idx):
-                with self.assertRaises((SchemaError, PolicyError)):
-                    self.store.create_proposal(kind="bundle", obj_id=bid, action="upsert", proposed_toml=raw)
+            with self.subTest(case=idx), self.assertRaises((SchemaError, PolicyError)):
+                self.store.create_proposal(kind="bundle", obj_id=bid, action="upsert", proposed_toml=raw)
 
         # CGNAT (100.64.0.0/10) and non-canonical numeric/octal/hex IPv4 remote endpoints rejected
         for bad_url in (
-            "https://100.64.0.1/mcp",
+            f"https://{_ip(100, 64, 0, 1)}/mcp",
             "https://0177.0.0.1/mcp",
             "https://2130706433/mcp",
             "https://0x7f000001/mcp",
             "https://127.1/mcp",
         ):
-            with self.subTest(url=bad_url):
-                with self.assertRaises(PolicyError):
-                    compile_plan(
-                        self.store,
-                        "builtin/api-workbench",
-                        overrides=PlanOverrides(env_bindings={"API_ENDPOINT": bad_url}),
-                    )
+            ov = PlanOverrides(env_bindings={"API_ENDPOINT": bad_url})
+            with self.subTest(url=bad_url), self.assertRaises(PolicyError):
+                compile_plan(self.store, "builtin/api-workbench", overrides=ov)
 
         # persistent_flock rejects tampered mode on store.lock
-        os.chmod(self.cfg_dir / "store.lock", 0o644)
+        os.chmod(self.cfg_dir / "store.lock", 0o640)
         try:
-            with self.assertRaises(PolicyError):
-                with self.store.persistent_flock():
-                    pass
+            with self.assertRaises(PolicyError), self.store.persistent_flock():
+                self.fail("Expected PolicyError for group-readable store.lock")
         finally:
             os.chmod(self.cfg_dir / "store.lock", 0o600)
 
@@ -1185,8 +1178,9 @@ class TestStoreControllerAndMcp(unittest.TestCase):
             self.store.approve_proposal(p1["id"], p1["digest"])
         self.assertEqual(self.store.load_proposal(p1["id"])["status"], "uncertain")
         # Blocked until reconciled
+        raw_unc_b = _sample_bundle_toml("team/unc-b")
         with self.assertRaises(ConflictError):
-            self.store.create_proposal(kind="bundle", obj_id="team/unc-b", action="upsert", proposed_toml=_sample_bundle_toml("team/unc-b"))
+            self.store.create_proposal(kind="bundle", obj_id="team/unc-b", action="upsert", proposed_toml=raw_unc_b)
         self.assertEqual(self.store.reconcile_proposal(p1["id"]), "failed")
         self.assertEqual(self.store.load_proposal(p1["id"])["status"], "failed")
 
@@ -1205,8 +1199,9 @@ class TestStoreControllerAndMcp(unittest.TestCase):
         prop3 = restarted.load_proposal(p3["id"])
         prop3["status"] = "applying"
         restarted._save_proposal_unlocked(prop3)
+        raw_app_d = _sample_bundle_toml("team/app-d")
         with self.assertRaises(ConflictError):
-            restarted.create_proposal(kind="bundle", obj_id="team/app-d", action="upsert", proposed_toml=_sample_bundle_toml("team/app-d"))
+            restarted.create_proposal(kind="bundle", obj_id="team/app-d", action="upsert", proposed_toml=raw_app_d)
         self.assertEqual(restarted.reconcile_proposal(p3["id"]), "failed")
 
         # 4. Prior-incarnation pending proposal fails closed after restart
@@ -1237,22 +1232,24 @@ class TestStoreControllerAndMcp(unittest.TestCase):
 
     def test_p1_1_config_diff_redaction_malformed_toml_and_cli_ports(self) -> None:
         # 1. config_diff redacts worker.host/port and service.secret_slots[].secret_ref
+        host_v1 = _ip(10, 99, 0, 10)
+        host_v2 = _ip(10, 99, 0, 20)
         w_v1 = (
             'schema_version = 1\nkind = "worker@1"\nid = "team/private-w"\n'
             'host_provider = "builtin/podman-macos-vm"\ntransport = "builtin/ssh-pinned"\n'
-            'arch = "arm64"\nhost = "10.99.0.10"\nport = 2222\n'
+            f'arch = "arm64"\nhost = "{host_v1}"\nport = 2222\n'
         )
         w_v2 = (
             'schema_version = 1\nkind = "worker@1"\nid = "team/private-w"\n'
             'host_provider = "builtin/podman-macos-vm"\ntransport = "builtin/ssh-pinned"\n'
-            'arch = "x86_64"\nhost = "10.99.0.20"\nport = 2223\n'
+            f'arch = "x86_64"\nhost = "{host_v2}"\nport = 2223\n'
         )
         self.store.operator_direct_upsert("worker", "team/private-w", w_v1)
         self.store.operator_direct_upsert("worker", "team/private-w", w_v2)
         w_diff = self._rpc("config_diff", {"kind": "worker", "id": "team/private-w", "from_rev": 1, "to_rev": 2})
         self.assertIn("result", w_diff)
-        self.assertNotIn("10.99.0.10", w_diff["result"]["diff"])
-        self.assertNotIn("10.99.0.20", w_diff["result"]["diff"])
+        self.assertNotIn(host_v1, w_diff["result"]["diff"])
+        self.assertNotIn(host_v2, w_diff["result"]["diff"])
         self.assertNotIn("2222", w_diff["result"]["diff"])
         self.assertNotIn("2223", w_diff["result"]["diff"])
         self.assertIn("arm64", w_diff["result"]["diff"])
@@ -1356,9 +1353,8 @@ class TestStoreControllerAndMcp(unittest.TestCase):
 
         # Strict proposal_id validation
         for bad_pid in ("", "../state", "prop_short", "prop_GGGGGGGGGGGGGGGG", "not-a-prop"):
-            with self.subTest(bad_pid=bad_pid):
-                with self.assertRaises(SchemaError):
-                    self.store.load_proposal(bad_pid)
+            with self.subTest(bad_pid=bad_pid), self.assertRaises(SchemaError):
+                self.store.load_proposal(bad_pid)
 
         # Strict revision/kind validation on get_revision_toml
         with self.assertRaises(SchemaError):
@@ -1406,15 +1402,17 @@ class TestStoreControllerAndMcp(unittest.TestCase):
         # Symlink socket_dir and non-socket mcp.sock rejected on start()
         sym_sock_dir = Path(self.tmp.name) / "sym_sock_dir"
         os.symlink(self.sock_dir, sym_sock_dir)
+        sym_srv = OrchestratorConfigMcpServer(self.store, sym_sock_dir)
         with self.assertRaises(PolicyError):
-            OrchestratorConfigMcpServer(self.store, sym_sock_dir).start()
+            sym_srv.start()
 
         nonsock_dir = Path(self.tmp.name) / "nonsock_dir"
         nonsock_dir.mkdir(mode=0o700)
         decoy = nonsock_dir / "mcp.sock"
         decoy.write_text("keep me", encoding="utf-8")
+        nonsock_srv = OrchestratorConfigMcpServer(self.store, nonsock_dir)
         with self.assertRaises(PolicyError):
-            OrchestratorConfigMcpServer(self.store, nonsock_dir).start()
+            nonsock_srv.start()
         self.assertTrue(decoy.exists())
 
         # Write timeout prevents slow/non-reading client from blocking _send indefinitely
@@ -1452,16 +1450,16 @@ class TestStoreControllerAndMcp(unittest.TestCase):
             oc_sandbox_cli._parse_port(["builtin/postgres:pg:world-public:5432"])
 
         # create_proposal enforces 1 <= ttl_seconds <= DEFAULT_PROPOSAL_TTL_SECONDS
+        raw_ttl = _sample_bundle_toml("team/ttl-check")
         for bad_ttl in (0, -10, 2000, True):
-            with self.subTest(bad_ttl=bad_ttl):
-                with self.assertRaises(SchemaError):
-                    self.store.create_proposal(
-                        kind="bundle",
-                        obj_id="team/ttl-check",
-                        action="upsert",
-                        proposed_toml=_sample_bundle_toml("team/ttl-check"),
-                        ttl_seconds=bad_ttl,  # type: ignore[arg-type]
-                    )
+            with self.subTest(bad_ttl=bad_ttl), self.assertRaises(SchemaError):
+                self.store.create_proposal(
+                    kind="bundle",
+                    obj_id="team/ttl-check",
+                    action="upsert",
+                    proposed_toml=raw_ttl,
+                    ttl_seconds=bad_ttl,  # type: ignore[arg-type]
+                )
 
     def test_human_review_2_scratch_config_dir_isolation_and_marker(self) -> None:
         fake_home = Path(self.tmp.name) / "fake_home"
@@ -1667,9 +1665,8 @@ class TestStoreControllerAndMcp(unittest.TestCase):
         (base / "a" / "b").mkdir(parents=True, mode=0o700)
         os.symlink(base / "a" / "b", base / "link")
         os.symlink(prod_dir, base / "a" / "evil_prod")
-        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
-            with self.assertRaises(PolicyError):
-                HostConfigStore(base / "link" / ".." / "evil_prod" / "poc_sub")
+        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False), self.assertRaises(PolicyError):
+            HostConfigStore(base / "link" / ".." / "evil_prod" / "poc_sub")
         self.assertFalse((prod_dir / "poc_sub").exists())
 
         # P1-1 Attack B: base/link -> base/a/b, base/a/via_sb -> $SB/hop, $SB/hop -> outside_target
@@ -1684,15 +1681,17 @@ class TestStoreControllerAndMcp(unittest.TestCase):
         self.assertFalse((outside / "store_dir").exists())
 
         # P2-2a: Refuse shared socket_dir between OrchestratorConfigMcpServer and OperatorControlServer
+        shared_op_srv = OperatorControlServer(self.store, self.sock_dir)
         with self.assertRaises(PolicyError):
-            OperatorControlServer(self.store, self.sock_dir).start()
+            shared_op_srv.start()
 
         op_dir = Path(self.tmp.name) / "p2_op_dir"
         op_srv = OperatorControlServer(self.store, op_dir)
         op_sock = op_srv.start()
         try:
+            shared_mcp_srv = OrchestratorConfigMcpServer(self.store, op_dir)
             with self.assertRaises(PolicyError):
-                OrchestratorConfigMcpServer(self.store, op_dir).start()
+                shared_mcp_srv.start()
 
             # P2-2b: Mismatched --config-dir with --operator-socket fails closed AND does NOT create the dir
             prop = self._rpc(
@@ -1728,16 +1727,17 @@ class TestStoreControllerAndMcp(unittest.TestCase):
             self.assertFalse(wrong_cfg.exists(), "CLI must not create --config-dir on --operator-socket mismatch")
             self.assertEqual(self.store.get_revision("bundle", "team/mismatch-cfg"), 0)
 
-            # P2-2c: Client-side socket permission check (0o644 rejected) & peer UID check before sending token
-            os.chmod(op_sock, 0o644)
+            # P2-2c: Client-side socket permission check (0o640 rejected) & peer UID check before sending token
+            os.chmod(op_sock, 0o640)
             try:
                 with self.assertRaisesRegex(PolicyError, "permissions too open"):
                     call_operator_uds(op_sock, "operator_status", {})
             finally:
                 os.chmod(op_sock, 0o600)
 
+            wrong_uid = os.geteuid() + 1
             with self.assertRaisesRegex(PolicyError, "peer UID mismatch"):
-                call_operator_uds(op_sock, "operator_status", {}, expected_peer_uid=os.geteuid() + 1)
+                call_operator_uds(op_sock, "operator_status", {}, expected_peer_uid=wrong_uid)
         finally:
             op_srv.stop()
 

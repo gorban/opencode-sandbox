@@ -30,7 +30,7 @@ SLOT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$", re.ASCII)
 PROPOSAL_ID_RE = re.compile(r"^prop_[0-9a-f]{16}$", re.ASCII)
 SECRET_REF_GRAMMAR_RE = re.compile(r"^[a-z][a-z0-9_-]{0,23}:[a-zA-Z0-9._/@:-]{1,128}$", re.ASCII)
 DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.ASCII)
-NUMERIC_LABEL_RE = re.compile(r"^(?:0[xX][0-9a-fA-F]+|[0-9]+)$", re.ASCII)
+NUMERIC_LABEL_RE = re.compile(r"^(?:0[xX][0-9a-fA-F]+|\d+)$", re.ASCII)
 DIGEST_IMAGE_RE = re.compile(
     r"^[a-z0-9][a-z0-9._/:@-]{1,200}@sha256:[0-9a-f]{64}$",
     re.ASCII,
@@ -58,10 +58,10 @@ RAW_SECRET_PREFIXES = ("sk-ant-", "sk-", "AIza", "ghp_", "gho_", "github_pat_", 
 RAW_SECRET_RE = re.compile(
     r"(?:^|[\s=:'\"(\[,])(" + "|".join(re.escape(p) for p in RAW_SECRET_PREFIXES) + r")"
 )
-MEM_LIMIT_RE = re.compile(r"^[1-9][0-9]{0,5}[mMgG]$", re.ASCII)
+MEM_LIMIT_RE = re.compile(r"^[1-9]\d{0,5}[mMgG]$", re.ASCII)
 HOST_URL_SCHEMES = frozenset({"http", "https", "postgresql", "redis", "tcp"})
 HOST_URL_PLACEHOLDERS = frozenset({"host", "port", "user", "db", "path"})
-TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_]+)\}")
+TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}", re.ASCII)
 SLOT_TOKEN_RE = re.compile(r"\{\{([a-z0-9][a-z0-9_-]{0,31})\}\}")
 
 READABLE_ORCHESTRATOR_KINDS = frozenset(
@@ -154,7 +154,7 @@ class PolicyError(ValueError):
 def parse_toml_strict(text: str, *, context: str = "TOML") -> dict[str, Any]:
     try:
         parsed = tomllib.loads(text)
-    except (tomllib.TOMLDecodeError, ValueError) as exc:
+    except ValueError as exc:
         raise SchemaError(f"Malformed {context}: {exc}") from exc
     if not isinstance(parsed, dict):
         raise SchemaError(f"{context} root must be a table")
@@ -203,6 +203,37 @@ def _is_under(candidate: Path, root: Path) -> bool:
     return candidate == root or root in candidate.parents
 
 
+def _init_path_worklist(raw: Path) -> deque[str]:
+    parts = raw.parts[1:] if raw.is_absolute() else (*Path.cwd().parts[1:], *raw.parts)
+    return deque(p for p in parts if p not in ("", "."))
+
+
+def _assert_not_under(candidate: Path, forbidden_roots: list[Path], label: str) -> None:
+    for froot in forbidden_roots:
+        if _is_under(candidate, froot):
+            raise PolicyError(f"Refusing host-trusted path traversing {label}: {candidate}")
+
+
+def _is_symlink_path(candidate: Path) -> bool:
+    try:
+        return stat.S_ISLNK(os.lstat(candidate).st_mode)
+    except OSError:
+        return False
+
+
+def _expand_symlink_hop(cur: Path, worklist: deque[str]) -> Path:
+    target = Path(os.readlink(cur))
+    if target.is_absolute():
+        next_cur = Path("/")
+        tparts = [tp for tp in target.parts[1:] if tp not in ("", ".")]
+    else:
+        next_cur = cur.parent
+        tparts = [tp for tp in target.parts if tp not in ("", ".")]
+    for tp in reversed(tparts):
+        worklist.appendleft(tp)
+    return next_cur
+
+
 def _walk_check_not_under_roots(
     path: Path,
     forbidden_roots: list[Path],
@@ -213,57 +244,23 @@ def _walk_check_not_under_roots(
     Checks every intermediate component, '..' step, and symlink target against forbidden_roots,
     and returns the resulting verified physical Path without calling os.path.abspath() first.
     """
-    raw = Path(path)
-    worklist: deque[str] = deque()
-    if raw.is_absolute():
-        cur = Path("/")
-        for p in raw.parts[1:]:
-            if p not in ("", "."):
-                worklist.append(p)
-    else:
-        cur = Path("/")
-        for p in Path.cwd().parts[1:]:
-            if p not in ("", "."):
-                worklist.append(p)
-        for p in raw.parts:
-            if p not in ("", "."):
-                worklist.append(p)
-
-    def _check_cur(p: Path) -> None:
-        for froot in forbidden_roots:
-            if _is_under(p, froot):
-                raise PolicyError(f"Refusing host-trusted path traversing {label}: {p}")
-
-    _check_cur(cur)
+    worklist = _init_path_worklist(Path(path))
+    cur = Path("/")
+    _assert_not_under(cur, forbidden_roots, label)
     total_hops = 0
     while worklist:
         part = worklist.popleft()
         if part in ("", "."):
             continue
-        if part == "..":
-            cur = cur.parent
-            _check_cur(cur)
+        cur = cur.parent if part == ".." else cur / part
+        _assert_not_under(cur, forbidden_roots, label)
+        if part == ".." or not _is_symlink_path(cur):
             continue
-        cur = cur / part
-        _check_cur(cur)
-        try:
-            is_link = stat.S_ISLNK(os.lstat(cur).st_mode)
-        except OSError:
-            is_link = False
-        if is_link:
-            total_hops += 1
-            if total_hops > 40:
-                raise PolicyError(f"Too many symlink hops checking trusted path: {path}")
-            target = Path(os.readlink(cur))
-            if target.is_absolute():
-                cur = Path("/")
-                tparts = [tp for tp in target.parts[1:] if tp not in ("", ".")]
-            else:
-                cur = cur.parent
-                tparts = [tp for tp in target.parts if tp not in ("", ".")]
-            _check_cur(cur)
-            for tp in reversed(tparts):
-                worklist.appendleft(tp)
+        total_hops += 1
+        if total_hops > 40:
+            raise PolicyError(f"Too many symlink hops checking trusted path: {path}")
+        cur = _expand_symlink_hop(cur, worklist)
+        _assert_not_under(cur, forbidden_roots, label)
     return cur
 
 
@@ -333,6 +330,65 @@ def assert_trusted_dir(path: Path, *, sandbox_root: Path | None = None) -> Path:
     return physical
 
 
+def _resolve_confined_parts(path: Path, confined_root: Path | None) -> tuple[Path, tuple[str, ...]]:
+    effective_root = path.parent if confined_root is None else confined_root
+    root_real = effective_root.resolve()
+    try:
+        rel = path.relative_to(effective_root)
+    except ValueError:
+        try:
+            rel = path.relative_to(root_real)
+        except ValueError as exc:
+            raise PolicyError(f"Path escapes confined root: {path}") from exc
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+        raise PolicyError(f"Invalid or root-equal confined path: {path}")
+    return root_real, rel.parts
+
+
+def _open_confined_fd(path: Path, confined_root: Path | None) -> int:
+    root_real, parts = _resolve_confined_parts(path, confined_root)
+    dir_fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = nxt
+        return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PolicyError(f"Symlink rejected in confined path: {path}") from exc
+        raise
+    finally:
+        os.close(dir_fd)
+
+
+def _read_verified_fd(fd: int, path: Path, max_bytes: int, require_owner_only: bool) -> bytes:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise PolicyError(f"Non-regular file rejected: {path}")
+    if st.st_nlink != 1:
+        raise PolicyError(f"Hardlinked file rejected: {path}")
+    if st.st_uid != os.geteuid():
+        raise PolicyError(f"File not owned by current user: {path}")
+    if require_owner_only and (st.st_mode & 0o077):
+        raise PolicyError(f"File permissions too open (require 0600): {path}")
+    if st.st_mode & 0o022:
+        raise PolicyError(f"Group/world-writable file rejected: {path}")
+    if st.st_size > max_bytes:
+        raise SchemaError(f"File exceeds {max_bytes} byte limit: {path}")
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(fd, 8192)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise SchemaError(f"File exceeded {max_bytes} byte limit during read: {path}")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def read_regular_no_follow(
     path: Path,
     *,
@@ -341,68 +397,11 @@ def read_regular_no_follow(
     confined_root: Path | None = None,
     sandbox_root: Path | None = None,
 ) -> bytes:
-    """Open regular file without following symlinks and verify descriptor metadata."""
+    """Open regular file via confined dir_fd without following symlinks and verify metadata."""
     check_not_in_sandbox(path, sandbox_root)
-    if confined_root is not None:
-        root_real = confined_root.resolve()
-        try:
-            rel = path.relative_to(confined_root)
-        except ValueError:
-            try:
-                rel = path.relative_to(root_real)
-            except ValueError as exc:
-                raise PolicyError(f"Path escapes confined root: {path}") from exc
-        if rel.is_absolute() or ".." in rel.parts or not rel.parts:
-            raise PolicyError(f"Invalid or root-equal confined path: {path}")
-        dir_fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            parts = rel.parts
-            for part in parts[:-1]:
-                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
-                os.close(dir_fd)
-                dir_fd = nxt
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-            fd = os.open(parts[-1], flags, dir_fd=dir_fd)
-        except OSError as exc:
-            if exc.errno == errno.ELOOP:
-                raise PolicyError(f"Symlink rejected in confined path: {path}") from exc
-            raise
-        finally:
-            os.close(dir_fd)
-    else:
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-        try:
-            fd = os.open(path, flags)
-        except OSError as exc:
-            if exc.errno == errno.ELOOP:
-                raise PolicyError(f"Symlink rejected: {path}") from exc
-            raise
-
+    fd = _open_confined_fd(path, confined_root)
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise PolicyError(f"Non-regular file rejected: {path}")
-        if st.st_nlink != 1:
-            raise PolicyError(f"Hardlinked file rejected: {path}")
-        if st.st_uid != os.geteuid():
-            raise PolicyError(f"File not owned by current user: {path}")
-        if require_owner_only and (st.st_mode & 0o077):
-            raise PolicyError(f"File permissions too open (require 0600): {path}")
-        if st.st_mode & 0o022:
-            raise PolicyError(f"Group/world-writable file rejected: {path}")
-        if st.st_size > max_bytes:
-            raise SchemaError(f"File exceeds {max_bytes} byte limit: {path}")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(fd, 8192)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > max_bytes:
-                raise SchemaError(f"File exceeded {max_bytes} byte limit during read: {path}")
-            chunks.append(chunk)
-        return b"".join(chunks)
+        return _read_verified_fd(fd, path, max_bytes, require_owner_only)
     finally:
         os.close(fd)
 
@@ -501,6 +500,33 @@ def validate_pod_local_url(url: str, context: str) -> str:
     return url
 
 
+def _validate_remote_host(host: str, allowed_hosts: frozenset[str]) -> None:
+    if not host or len(host) > 253:
+        raise PolicyError("Remote endpoint missing or oversized hostname")
+    if host in allowed_hosts:
+        return
+    if host in ("localhost", "host.containers.internal", "host.docker.internal") or host.endswith(
+        ".localhost"
+    ):
+        raise PolicyError(f"Remote endpoint host {host!r} blocked by SSRF policy")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        if not ip.is_global:
+            raise PolicyError(f"Non-global remote endpoint IP {host!r} blocked by SSRF policy")
+        return
+    # Reject non-canonical numeric/octal/hex IPv4 forms (0177.0.0.1, 2130706433, 0x7f000001, 127.1)
+    labels = host.split(".")
+    if all(NUMERIC_LABEL_RE.fullmatch(lbl) is not None for lbl in labels):
+        raise PolicyError(f"Non-canonical numeric IP host {host!r} blocked by SSRF policy")
+    if NUMERIC_LABEL_RE.fullmatch(labels[-1]) is not None:
+        raise PolicyError(f"Numeric TLD host {host!r} blocked by SSRF policy")
+    if len(labels) < 2 or any(DNS_LABEL_RE.fullmatch(lbl) is None for lbl in labels):
+        raise PolicyError(f"Invalid remote endpoint DNS hostname: {host!r}")
+
+
 def validate_remote_endpoint_url(
     url: str,
     *,
@@ -511,7 +537,7 @@ def validate_remote_endpoint_url(
     if any(ch in url for ch in ("\r", "\n", "\x00", " ")):
         raise PolicyError("Remote endpoint contains illegal characters")
     parsed = urlparse(url)
-    allowed_schemes = {"https"} | ({"http"} if allow_http else set())
+    allowed_schemes = {"https", "http"} if allow_http else {"https"}
     if parsed.scheme not in allowed_schemes:
         raise PolicyError(f"Remote endpoint scheme {parsed.scheme!r} not allowed")
     if parsed.params or ";" in urlsplit(url).path:
@@ -525,33 +551,7 @@ def validate_remote_endpoint_url(
     except ValueError as exc:
         raise PolicyError("Remote endpoint has invalid port") from exc
     host = (parsed.hostname or "").strip().lower().rstrip(".")
-    if not host or len(host) > 253:
-        raise PolicyError("Remote endpoint missing or oversized hostname")
-    if host in allowed_hosts:
-        return url
-    if host in ("localhost", "host.containers.internal", "host.docker.internal") or host.endswith(
-        ".localhost"
-    ):
-        raise PolicyError(f"Remote endpoint host {host!r} blocked by SSRF policy")
-
-    # Canonical IP check: reject ANY non-global IP (including CGNAT 100.64.0.0/10, loopback, private, link-local)
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        ip = None
-    if ip is not None:
-        if not ip.is_global:
-            raise PolicyError(f"Non-global remote endpoint IP {host!r} blocked by SSRF policy")
-        return url
-
-    # Reject non-canonical numeric/octal/hex IPv4 forms (0177.0.0.1, 2130706433, 0x7f000001, 127.1)
-    labels = host.split(".")
-    if all(NUMERIC_LABEL_RE.fullmatch(lbl) is not None for lbl in labels):
-        raise PolicyError(f"Non-canonical numeric IP host {host!r} blocked by SSRF policy")
-    if NUMERIC_LABEL_RE.fullmatch(labels[-1]) is not None:
-        raise PolicyError(f"Numeric TLD host {host!r} blocked by SSRF policy")
-    if len(labels) < 2 or any(DNS_LABEL_RE.fullmatch(lbl) is None for lbl in labels):
-        raise PolicyError(f"Invalid remote endpoint DNS hostname: {host!r}")
+    _validate_remote_host(host, allowed_hosts)
     return url
 
 
@@ -698,140 +698,92 @@ def _validate_volume(vol: object, context: str, *, for_orchestrator: bool) -> di
     }
 
 
+def _validate_optional_instance_and_port(
+    inst: object, iport: object, context: str
+) -> tuple[str | None, int | None]:
+    if inst is not None and (type(inst) is not str or SIMPLE_NAME_RE.fullmatch(inst) is None):
+        raise SchemaError(f"Invalid {context}.instance: {inst!r}")
+    if iport is not None and (type(iport) is not int or not (1 <= iport <= 65535)):
+        raise SchemaError(f"Invalid {context}.instance_port: {iport!r}")
+    return inst, iport
+
+
 def _validate_service_requirement(req: object, context: str) -> dict[str, Any]:
     if isinstance(req, str):
         if CAPABILITY_REQUIRES_RE.fullmatch(req) is None and OPAQUE_ID_RE.fullmatch(req) is None:
             raise SchemaError(f"Invalid {context} requirement: {req!r}")
         return {"target": req, "provider": None, "instance": None, "instance_port": None}
-    if isinstance(req, dict):
-        _reject_unknown_keys(
-            req,
-            frozenset({"capability", "service", "provider", "instance", "instance_port"}),
-            context,
-        )
-        target = req.get("capability") or req.get("service")
-        if type(target) is not str:
-            raise SchemaError(f"{context} entry must specify capability or service")
-        if req.get("capability") and CAPABILITY_REQUIRES_RE.fullmatch(target) is None:
-            raise SchemaError(f"Invalid capability requirement in {context}: {target!r}")
-        if req.get("service"):
-            validate_opaque_id(target, label=f"{context}.service")
-        prov = req.get("provider")
-        if prov is not None:
-            validate_opaque_id(prov, label=f"{context}.provider")
-        inst = req.get("instance")
-        if inst is not None and (type(inst) is not str or SIMPLE_NAME_RE.fullmatch(inst) is None):
-            raise SchemaError(f"Invalid {context}.instance: {inst!r}")
-        iport = req.get("instance_port")
-        if iport is not None and (type(iport) is not int or not (1 <= iport <= 65535)):
-            raise SchemaError(f"Invalid {context}.instance_port: {iport!r}")
-        return {"target": target, "provider": prov, "instance": inst, "instance_port": iport}
-    raise SchemaError(f"{context} item must be string or table")
-
-
-def validate_service_doc(
-    doc: dict[str, Any],
-    *,
-    expected_id: str | None = None,
-    for_orchestrator: bool = False,
-) -> dict[str, Any]:
-    if not isinstance(doc, dict):
-        raise SchemaError("service document must be a TOML table")
-    if doc.get("schema_version") != SCHEMA_VERSION:
-        raise SchemaError(f"service schema_version must be {SCHEMA_VERSION}")
-    if doc.get("kind") != "service@1":
-        raise SchemaError("service kind must be 'service@1'")
-    if "factory" in doc or "implementation" in doc:
-        raise PolicyError("Raw factory/implementation paths forbidden; use opaque factory_id")
-    allowed = frozenset(
-        {
-            "schema_version",
-            "kind",
-            "id",
-            "description",
-            "image",
-            "images_by_arch",
-            "provides",
-            "requires",
-            "cardinality",
-            "instance_port",
-            "fallback_service",
-            "required_capabilities",
-            "security_profile",
-            "factory_id",
-            "resources",
-            "endpoints",
-            "volumes",
-            "secret_slots",
-            "env",
-            "readiness_probe",
-            "mise_tools",
-            "post_install_hook",
-        }
+    if not isinstance(req, dict):
+        raise SchemaError(f"{context} item must be string or table")
+    _reject_unknown_keys(
+        req,
+        frozenset({"capability", "service", "provider", "instance", "instance_port"}),
+        context,
     )
-    _reject_unknown_keys(doc, allowed, "service")
-    svc_id = validate_opaque_id(doc.get("id"), label="service.id")
-    if expected_id is not None and svc_id != expected_id:
-        raise SchemaError(f"service.id {svc_id!r} does not match expected {expected_id!r}")
-    if for_orchestrator and is_builtin_id(svc_id):
-        raise PolicyError("builtin/* services are strictly immutable")
+    target = req.get("capability") or req.get("service")
+    if type(target) is not str:
+        raise SchemaError(f"{context} entry must specify capability or service")
+    if req.get("capability") and CAPABILITY_REQUIRES_RE.fullmatch(target) is None:
+        raise SchemaError(f"Invalid capability requirement in {context}: {target!r}")
+    if req.get("service"):
+        validate_opaque_id(target, label=f"{context}.service")
+    prov = req.get("provider")
+    if prov is not None:
+        validate_opaque_id(prov, label=f"{context}.provider")
+    inst, iport = _validate_optional_instance_and_port(req.get("instance"), req.get("instance_port"), context)
+    return {"target": target, "provider": prov, "instance": inst, "instance_port": iport}
 
-    image = doc.get("image")
-    images_by_arch = doc.get("images_by_arch")
-    if image is not None:
-        if type(image) is not str or DIGEST_IMAGE_RE.fullmatch(image) is None:
-            raise SchemaError(f"service {svc_id}: image must be digest-pinned (@sha256:...)")
+
+def _validate_doc_header(
+    doc: object,
+    *,
+    kind_name: str,
+    kind_tag: str,
+    allowed_keys: frozenset[str],
+    expected_id: str | None,
+    for_orchestrator: bool,
+) -> str:
+    if not isinstance(doc, dict):
+        raise SchemaError(f"{kind_name} document must be a TOML table")
+    if doc.get("schema_version") != SCHEMA_VERSION:
+        raise SchemaError(f"{kind_name} schema_version must be {SCHEMA_VERSION}")
+    if doc.get("kind") != kind_tag:
+        raise SchemaError(f"{kind_name} kind must be {kind_tag!r}")
+    if kind_name == "service" and ("factory" in doc or "implementation" in doc):
+        raise PolicyError("Raw factory/implementation paths forbidden; use opaque factory_id")
+    _reject_unknown_keys(doc, allowed_keys, kind_name)
+    obj_id = validate_opaque_id(doc.get("id"), label=f"{kind_name}.id")
+    if expected_id is not None and obj_id != expected_id:
+        raise SchemaError(f"{kind_name}.id {obj_id!r} does not match expected {expected_id!r}")
+    if for_orchestrator and is_builtin_id(obj_id):
+        raise PolicyError(f"builtin/* {kind_name}s are strictly immutable")
+    return obj_id
+
+
+def _validate_digest_images(
+    image: object,
+    images_by_arch: object,
+    *,
+    context: str,
+    image_field: str = "image",
+    arch_field: str = "images_by_arch",
+) -> tuple[str | None, dict[str, str] | None]:
+    if image is not None and (type(image) is not str or DIGEST_IMAGE_RE.fullmatch(image) is None):
+        raise SchemaError(f"{context}: {image_field} must be digest-pinned (@sha256:...)")
     if images_by_arch is not None:
         if not isinstance(images_by_arch, dict) or not images_by_arch:
-            raise SchemaError(f"service {svc_id}: images_by_arch must be a non-empty table")
+            raise SchemaError(f"{context}: {arch_field} must be a non-empty table")
         for arch, ref in images_by_arch.items():
             if arch not in ("x86_64", "arm64"):
-                raise SchemaError(f"Unsupported arch in images_by_arch: {arch!r}")
+                raise SchemaError(f"Unsupported arch in {arch_field}: {arch!r}")
             if type(ref) is not str or DIGEST_IMAGE_RE.fullmatch(ref) is None:
-                raise SchemaError(f"service {svc_id}: images_by_arch.{arch} must be digest-pinned")
+                raise SchemaError(f"{context}: {arch_field}.{arch} must be digest-pinned")
     if image is None and images_by_arch is None:
-        raise SchemaError(f"service {svc_id} requires digest-pinned image or images_by_arch")
+        raise SchemaError(f"{context} requires digest-pinned {image_field} or {arch_field}")
+    return image, images_by_arch
 
-    if doc.get("post_install_hook") is not None and for_orchestrator:
-        raise PolicyError("Orchestrator proposals may not define post_install_hook")
 
-    factory_id = doc.get("factory_id")
-    if factory_id is not None:
-        if type(factory_id) is not str or SIMPLE_NAME_RE.fullmatch(factory_id) is None:
-            raise SchemaError(f"Invalid opaque factory_id: {factory_id!r}")
-
-    sec_profile = doc.get("security_profile", "standard")
-    if sec_profile not in SECURITY_PROFILES:
-        raise SchemaError(f"Invalid security_profile: {sec_profile!r}")
-
-    cardinality = doc.get("cardinality", "singleton")
-    if cardinality not in CARDINALITIES:
-        raise SchemaError(f"Invalid cardinality: {cardinality!r}")
-    instance_port = doc.get("instance_port")
-    if instance_port is not None and (type(instance_port) is not int or not 1 <= instance_port <= 65535):
-        raise SchemaError("instance_port must be 1..65535")
-
-    provides = doc.get("provides", [])
-    if not isinstance(provides, list):
-        raise SchemaError("service.provides must be a list")
-    for cap in provides:
-        if type(cap) is not str or CAPABILITY_PROVIDES_RE.fullmatch(cap) is None:
-            raise SchemaError(f"Invalid capability provide spec: {cap!r}")
-
-    requires = doc.get("requires", [])
-    if not isinstance(requires, list):
-        raise SchemaError("service.requires must be a list")
-    norm_requires = [_validate_service_requirement(r, "service.requires[]") for r in requires]
-
-    fallback = doc.get("fallback_service")
-    if fallback is not None:
-        validate_opaque_id(fallback, label="service.fallback_service")
-
-    req_caps = doc.get("required_capabilities", [])
-    if not isinstance(req_caps, list) or any(type(c) is not str or SIMPLE_NAME_RE.fullmatch(c) is None for c in req_caps):
-        raise SchemaError("service.required_capabilities must be a list of capability identifiers")
-
-    resources = doc.get("resources")
+def _validate_service_resources(resources: object, svc_id: str) -> dict[str, Any]:
     if not isinstance(resources, dict):
         raise SchemaError(f"service {svc_id} must declare bounded resources table")
     _reject_unknown_keys(resources, frozenset({"memory", "pids_limit"}), "service.resources")
@@ -840,11 +792,10 @@ def validate_service_doc(
     pids = resources.get("pids_limit")
     if type(pids) is not int or not (16 <= pids <= 4096):
         raise SchemaError("service.resources.pids_limit must be an int in 16..4096")
+    return {"memory": mem, "pids_limit": pids}
 
-    endpoints = [_validate_endpoint(e, f"service({svc_id}).endpoints[{i}]") for i, e in enumerate(doc.get("endpoints", []))]
-    volumes = [_validate_volume(v, f"service({svc_id}).volumes[{i}]", for_orchestrator=for_orchestrator) for i, v in enumerate(doc.get("volumes", []))]
 
-    secret_slots = doc.get("secret_slots", [])
+def _validate_secret_slots(secret_slots: object) -> list[dict[str, Any]]:
     if not isinstance(secret_slots, list):
         raise SchemaError("service.secret_slots must be a list")
     norm_secrets: list[dict[str, Any]] = []
@@ -868,33 +819,130 @@ def validate_service_doc(
                 f"secret_slots[{i}].secret_ref must match '<scheme>:<reference>' grammar, got {sref!r}"
             )
         norm_secrets.append({"slot": sname, "target": starget, "mode": smode, "secret_ref": sref})
+    return norm_secrets
 
+
+def _validate_readiness_probe(probe: object, *, for_orchestrator: bool) -> dict[str, Any] | None:
+    if probe is None:
+        return None
+    if not isinstance(probe, dict):
+        raise SchemaError("service.readiness_probe must be a table")
+    _reject_unknown_keys(probe, frozenset({"kind", "port", "command"}), "service.readiness_probe")
+    pkind = probe.get("kind")
+    if pkind not in ("tcp", "exec_auth", "http_local"):
+        raise SchemaError(f"Unsupported readiness_probe.kind: {pkind!r}")
+    pport = probe.get("port")
+    if pport is not None and (type(pport) is not int or not (1 <= pport <= 65535)):
+        raise SchemaError("service.readiness_probe.port must be int 1..65535")
+    pcmd = probe.get("command")
+    if pcmd is not None:
+        if for_orchestrator:
+            raise PolicyError("Orchestrator proposals may not specify custom readiness_probe.command")
+        if (
+            not isinstance(pcmd, list)
+            or not pcmd
+            or any(type(a) is not str or not a or "\x00" in a for a in pcmd)
+        ):
+            raise SchemaError("service.readiness_probe.command must be non-empty list of strings")
+    return {"kind": pkind, "port": pport, "command": list(pcmd) if pcmd is not None else None}
+
+
+def _validate_service_capabilities(doc: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]], str | None, list[str]]:
+    provides = doc.get("provides", [])
+    if not isinstance(provides, list):
+        raise SchemaError("service.provides must be a list")
+    for cap in provides:
+        if type(cap) is not str or CAPABILITY_PROVIDES_RE.fullmatch(cap) is None:
+            raise SchemaError(f"Invalid capability provide spec: {cap!r}")
+    requires = doc.get("requires", [])
+    if not isinstance(requires, list):
+        raise SchemaError("service.requires must be a list")
+    norm_requires = [_validate_service_requirement(r, "service.requires[]") for r in requires]
+    fallback = doc.get("fallback_service")
+    if fallback is not None:
+        validate_opaque_id(fallback, label="service.fallback_service")
+    req_caps = doc.get("required_capabilities", [])
+    if not isinstance(req_caps, list) or any(
+        type(c) is not str or SIMPLE_NAME_RE.fullmatch(c) is None for c in req_caps
+    ):
+        raise SchemaError("service.required_capabilities must be a list of capability identifiers")
+    return list(provides), norm_requires, fallback, list(req_caps)
+
+
+_SERVICE_ALLOWED_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "id",
+        "description",
+        "image",
+        "images_by_arch",
+        "provides",
+        "requires",
+        "cardinality",
+        "instance_port",
+        "fallback_service",
+        "required_capabilities",
+        "security_profile",
+        "factory_id",
+        "resources",
+        "endpoints",
+        "volumes",
+        "secret_slots",
+        "env",
+        "readiness_probe",
+        "mise_tools",
+        "post_install_hook",
+    }
+)
+
+
+def validate_service_doc(
+    doc: dict[str, Any],
+    *,
+    expected_id: str | None = None,
+    for_orchestrator: bool = False,
+) -> dict[str, Any]:
+    svc_id = _validate_doc_header(
+        doc,
+        kind_name="service",
+        kind_tag="service@1",
+        allowed_keys=_SERVICE_ALLOWED_KEYS,
+        expected_id=expected_id,
+        for_orchestrator=for_orchestrator,
+    )
+    image, images_by_arch = _validate_digest_images(
+        doc.get("image"), doc.get("images_by_arch"), context=f"service {svc_id}"
+    )
+    if doc.get("post_install_hook") is not None and for_orchestrator:
+        raise PolicyError("Orchestrator proposals may not define post_install_hook")
+
+    factory_id = doc.get("factory_id")
+    if factory_id is not None and (type(factory_id) is not str or SIMPLE_NAME_RE.fullmatch(factory_id) is None):
+        raise SchemaError(f"Invalid opaque factory_id: {factory_id!r}")
+
+    sec_profile = doc.get("security_profile", "standard")
+    if sec_profile not in SECURITY_PROFILES:
+        raise SchemaError(f"Invalid security_profile: {sec_profile!r}")
+
+    cardinality = doc.get("cardinality", "singleton")
+    if cardinality not in CARDINALITIES:
+        raise SchemaError(f"Invalid cardinality: {cardinality!r}")
+    instance_port = doc.get("instance_port")
+    if instance_port is not None and (type(instance_port) is not int or not 1 <= instance_port <= 65535):
+        raise SchemaError("instance_port must be 1..65535")
+
+    provides, norm_requires, fallback, req_caps = _validate_service_capabilities(doc)
+    resources = _validate_service_resources(doc.get("resources"), svc_id)
+    endpoints = [_validate_endpoint(e, f"service({svc_id}).endpoints[{i}]") for i, e in enumerate(doc.get("endpoints", []))]
+    volumes = [
+        _validate_volume(v, f"service({svc_id}).volumes[{i}]", for_orchestrator=for_orchestrator)
+        for i, v in enumerate(doc.get("volumes", []))
+    ]
+    norm_secrets = _validate_secret_slots(doc.get("secret_slots", []))
     env = validate_env_map(doc.get("env"), f"service({svc_id}).env")
     mise_tools = validate_mise_tools(doc.get("mise_tools"), f"service({svc_id}).mise_tools")
-
-    probe = doc.get("readiness_probe")
-    norm_probe = None
-    if probe is not None:
-        if not isinstance(probe, dict):
-            raise SchemaError("service.readiness_probe must be a table")
-        _reject_unknown_keys(probe, frozenset({"kind", "port", "command"}), "service.readiness_probe")
-        pkind = probe.get("kind")
-        if pkind not in ("tcp", "exec_auth", "http_local"):
-            raise SchemaError(f"Unsupported readiness_probe.kind: {pkind!r}")
-        pport = probe.get("port")
-        if pport is not None and (type(pport) is not int or not (1 <= pport <= 65535)):
-            raise SchemaError("service.readiness_probe.port must be int 1..65535")
-        pcmd = probe.get("command")
-        if pcmd is not None:
-            if for_orchestrator:
-                raise PolicyError("Orchestrator proposals may not specify custom readiness_probe.command")
-            if (
-                not isinstance(pcmd, list)
-                or not pcmd
-                or any(type(a) is not str or not a or "\x00" in a for a in pcmd)
-            ):
-                raise SchemaError("service.readiness_probe.command must be non-empty list of strings")
-        norm_probe = {"kind": pkind, "port": pport, "command": list(pcmd) if pcmd is not None else None}
+    norm_probe = _validate_readiness_probe(doc.get("readiness_probe"), for_orchestrator=for_orchestrator)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -903,15 +951,15 @@ def validate_service_doc(
         "description": str(doc.get("description", "")),
         "image": image,
         "images_by_arch": images_by_arch,
-        "provides": list(provides),
+        "provides": provides,
         "requires": norm_requires,
         "cardinality": cardinality,
         "instance_port": instance_port,
         "fallback_service": fallback,
-        "required_capabilities": list(req_caps),
+        "required_capabilities": req_caps,
         "security_profile": sec_profile,
         "factory_id": factory_id,
-        "resources": {"memory": mem, "pids_limit": pids},
+        "resources": resources,
         "endpoints": endpoints,
         "volumes": volumes,
         "secret_slots": norm_secrets,
@@ -971,157 +1019,171 @@ def _validate_tool_list(raw: object, context: str) -> list[str]:
     return list(raw)
 
 
+def _validate_mcp_target(
+    name: str, cfg: dict[str, Any], context: str, *, for_orchestrator: bool
+) -> tuple[str, str | None]:
+    mtype = cfg.get("type")
+    if mtype not in ("remote", "pinned-artifact"):
+        raise PolicyError(f"MCP {name} must use type 'remote' or 'pinned-artifact', got {mtype!r}")
+    if mtype == "remote":
+        url = _require_str(cfg.get("url"), f"{context}.{name}.url")
+        scheme = urlparse(url).scheme
+        if scheme == "http":
+            return mtype, validate_pod_local_url(url, f"{context}.{name}.url")
+        if scheme == "https":
+            return mtype, canonicalize_remote_url(url, allow_http=False)
+        raise PolicyError(f"MCP {name} remote url must be https:// or pod-local http://127.0.0.1:<port>")
+    art = _require_str(cfg.get("artifact_id"), f"{context}.{name}.artifact_id")
+    if OPAQUE_ID_RE.fullmatch(art) is None:
+        raise SchemaError(f"Invalid MCP artifact_id: {art!r}")
+    if for_orchestrator and not is_builtin_id(art):
+        raise PolicyError("Orchestrator MCP proposals must reference registered builtin/* artifacts")
+    return mtype, None
+
+
+def _validate_mcp_tool_sets(
+    name: str, cfg: dict[str, Any], context: str
+) -> tuple[list[str], list[str] | None, list[str]]:
+    raw_ro = cfg.get("read_only_tools")
+    raw_wr = cfg.get("write_tools")
+    raw_tools = cfg.get("tools")
+    if raw_ro is None and raw_wr is None:
+        tools = _validate_tool_list(raw_tools if raw_tools is not None else [], f"{context}.{name}.tools")
+        return tools, None, []
+    read_only_tools = _validate_tool_list(raw_ro if raw_ro is not None else [], f"{context}.{name}.read_only_tools")
+    write_tools = _validate_tool_list(raw_wr if raw_wr is not None else [], f"{context}.{name}.write_tools")
+    overlap = sorted(set(read_only_tools) & set(write_tools))
+    if overlap:
+        raise SchemaError(f"{context}.{name} read_only_tools and write_tools overlap: {', '.join(overlap)}")
+    combined = list(dict.fromkeys(read_only_tools + write_tools))
+    if raw_tools is None:
+        return combined, read_only_tools, write_tools
+    explicit_tools = _validate_tool_list(raw_tools, f"{context}.{name}.tools")
+    if set(explicit_tools) != set(combined):
+        raise SchemaError(
+            f"{context}.{name}.tools must equal read_only_tools U write_tools when both are specified"
+        )
+    return explicit_tools, read_only_tools, write_tools
+
+
+def _validate_mcp_local_cfg(name: str, local_cfg: object, context: str) -> dict[str, Any] | None:
+    if local_cfg is None:
+        return None
+    if not isinstance(local_cfg, dict):
+        raise SchemaError(f"{context}.{name}.local must be a table")
+    _reject_unknown_keys(
+        local_cfg,
+        frozenset({"binding_key", "service", "url", "headers", "secret_env"}),
+        f"{context}.{name}.local",
+    )
+    bkey = _require_str(local_cfg.get("binding_key"), f"{context}.{name}.local.binding_key")
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,47}", bkey):
+        raise SchemaError(f"Invalid local.binding_key: {bkey!r}")
+    return {
+        "binding_key": bkey,
+        "service": validate_opaque_id(local_cfg.get("service"), label=f"{context}.{name}.local.service"),
+        "url": validate_pod_local_url(local_cfg.get("url"), f"{context}.{name}.local.url"),
+        "headers": _validate_mcp_headers(local_cfg.get("headers"), f"{context}.{name}.local.headers"),
+        "secret_env": _validate_mcp_secret_env(local_cfg.get("secret_env"), f"{context}.{name}.local.secret_env"),
+    }
+
+
+def _validate_mcp_remote_cfg(
+    name: str,
+    remote_cfg: object,
+    context: str,
+    *,
+    norm_headers: dict[str, str],
+    norm_secret_env: dict[str, str],
+    norm_local: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if remote_cfg is None:
+        return None
+    if not isinstance(remote_cfg, dict):
+        raise SchemaError(f"{context}.{name}.remote must be a table")
+    _reject_unknown_keys(
+        remote_cfg,
+        frozenset({"read_only_headers", "read_only_secret_env", "write_headers", "write_secret_env"}),
+        f"{context}.{name}.remote",
+    )
+    ro_headers = _validate_mcp_headers(
+        remote_cfg.get("read_only_headers"), f"{context}.{name}.remote.read_only_headers"
+    )
+    ro_secret_env = _validate_mcp_secret_env(
+        remote_cfg.get("read_only_secret_env"), f"{context}.{name}.remote.read_only_secret_env"
+    )
+    wr_headers = _validate_mcp_headers(
+        remote_cfg.get("write_headers"), f"{context}.{name}.remote.write_headers"
+    )
+    wr_secret_env = _validate_mcp_secret_env(
+        remote_cfg.get("write_secret_env"), f"{context}.{name}.remote.write_secret_env"
+    )
+    # Enforce strict credential-slot separation across local, remote-RO, and remote-RW
+    top_slots = extract_secret_slots(norm_headers, norm_secret_env)
+    local_slots = (
+        extract_secret_slots(norm_local["headers"], norm_local["secret_env"])
+        if norm_local is not None
+        else set()
+    )
+    ro_slots = extract_secret_slots(ro_headers, ro_secret_env)
+    wr_slots = extract_secret_slots(wr_headers, wr_secret_env)
+    if wr_slots & (ro_slots | local_slots | top_slots):
+        shared = sorted(wr_slots & (ro_slots | local_slots | top_slots))
+        raise PolicyError(
+            f"MCP {name} remote write secret slot(s) must be distinct from read-only/local slots: {', '.join(shared)}"
+        )
+    if ro_slots & (local_slots | top_slots):
+        shared = sorted(ro_slots & (local_slots | top_slots))
+        raise PolicyError(
+            f"MCP {name} remote read-only secret slot(s) must be distinct from local slots: {', '.join(shared)}"
+        )
+    return {
+        "read_only_headers": ro_headers,
+        "read_only_secret_env": ro_secret_env,
+        "write_headers": wr_headers,
+        "write_secret_env": wr_secret_env,
+    }
+
+
+_MCP_ALLOWED_KEYS = frozenset(
+    {
+        "type",
+        "url",
+        "artifact_id",
+        "args",
+        "headers",
+        "secret_env",
+        "tools",
+        "read_only_tools",
+        "write_tools",
+        "local",
+        "remote",
+    }
+)
+
+
 def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrator: bool) -> dict[str, Any]:
     if SIMPLE_NAME_RE.fullmatch(name) is None:
         raise SchemaError(f"Invalid MCP server name in {context}: {name!r}")
     if not isinstance(cfg, dict):
         raise SchemaError(f"{context}.{name} must be a table")
-    _reject_unknown_keys(
-        cfg,
-        frozenset(
-            {
-                "type",
-                "url",
-                "artifact_id",
-                "args",
-                "headers",
-                "secret_env",
-                "tools",
-                "read_only_tools",
-                "write_tools",
-                "local",
-                "remote",
-            }
-        ),
-        f"{context}.{name}",
-    )
-    mtype = cfg.get("type")
-    if mtype not in ("remote", "pinned-artifact"):
-        raise PolicyError(f"MCP {name} must use type 'remote' or 'pinned-artifact', got {mtype!r}")
-    norm_url: str | None = None
-    if mtype == "remote":
-        url = _require_str(cfg.get("url"), f"{context}.{name}.url")
-        parsed = urlparse(url)
-        if parsed.scheme == "http":
-            norm_url = validate_pod_local_url(url, f"{context}.{name}.url")
-        elif parsed.scheme == "https":
-            norm_url = canonicalize_remote_url(url, allow_http=False)
-        else:
-            raise PolicyError(f"MCP {name} remote url must be https:// or pod-local http://127.0.0.1:<port>")
-    else:
-        art = _require_str(cfg.get("artifact_id"), f"{context}.{name}.artifact_id")
-        if OPAQUE_ID_RE.fullmatch(art) is None:
-            raise SchemaError(f"Invalid MCP artifact_id: {art!r}")
-        if for_orchestrator and not is_builtin_id(art):
-            raise PolicyError("Orchestrator MCP proposals must reference registered builtin/* artifacts")
+    _reject_unknown_keys(cfg, _MCP_ALLOWED_KEYS, f"{context}.{name}")
+    mtype, norm_url = _validate_mcp_target(name, cfg, context, for_orchestrator=for_orchestrator)
     args = cfg.get("args", [])
     if not isinstance(args, list) or any(type(a) is not str for a in args):
         raise SchemaError(f"{context}.{name}.args must be list of strings")
-
     norm_headers = _validate_mcp_headers(cfg.get("headers"), f"{context}.{name}.headers")
     norm_secret_env = _validate_mcp_secret_env(cfg.get("secret_env"), f"{context}.{name}.secret_env")
-
-    raw_ro = cfg.get("read_only_tools")
-    raw_wr = cfg.get("write_tools")
-    raw_tools = cfg.get("tools")
-    read_only_tools: list[str] | None = None
-    write_tools: list[str] = []
-    if raw_ro is not None or raw_wr is not None:
-        read_only_tools = _validate_tool_list(raw_ro if raw_ro is not None else [], f"{context}.{name}.read_only_tools")
-        write_tools = _validate_tool_list(raw_wr if raw_wr is not None else [], f"{context}.{name}.write_tools")
-        overlap = sorted(set(read_only_tools) & set(write_tools))
-        if overlap:
-            raise SchemaError(
-                f"{context}.{name} read_only_tools and write_tools overlap: {', '.join(overlap)}"
-            )
-        combined = list(dict.fromkeys(read_only_tools + write_tools))
-        if raw_tools is not None:
-            explicit_tools = _validate_tool_list(raw_tools, f"{context}.{name}.tools")
-            if set(explicit_tools) != set(combined):
-                raise SchemaError(
-                    f"{context}.{name}.tools must equal read_only_tools U write_tools when both are specified"
-                )
-            tools = explicit_tools
-        else:
-            tools = combined
-    else:
-        tools = _validate_tool_list(raw_tools if raw_tools is not None else [], f"{context}.{name}.tools")
-
-    local_cfg = cfg.get("local")
-    norm_local = None
-    if local_cfg is not None:
-        if not isinstance(local_cfg, dict):
-            raise SchemaError(f"{context}.{name}.local must be a table")
-        _reject_unknown_keys(
-            local_cfg,
-            frozenset({"binding_key", "service", "url", "headers", "secret_env"}),
-            f"{context}.{name}.local",
-        )
-        bkey = _require_str(local_cfg.get("binding_key"), f"{context}.{name}.local.binding_key")
-        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,47}", bkey):
-            raise SchemaError(f"Invalid local.binding_key: {bkey!r}")
-        lsvc = validate_opaque_id(local_cfg.get("service"), label=f"{context}.{name}.local.service")
-        lurl = validate_pod_local_url(local_cfg.get("url"), f"{context}.{name}.local.url")
-        lheaders = _validate_mcp_headers(local_cfg.get("headers"), f"{context}.{name}.local.headers")
-        lsecret_env = _validate_mcp_secret_env(local_cfg.get("secret_env"), f"{context}.{name}.local.secret_env")
-        norm_local = {
-            "binding_key": bkey,
-            "service": lsvc,
-            "url": lurl,
-            "headers": lheaders,
-            "secret_env": lsecret_env,
-        }
-
-    remote_cfg = cfg.get("remote")
-    norm_remote = None
-    if remote_cfg is not None:
-        if not isinstance(remote_cfg, dict):
-            raise SchemaError(f"{context}.{name}.remote must be a table")
-        _reject_unknown_keys(
-            remote_cfg,
-            frozenset({"read_only_headers", "read_only_secret_env", "write_headers", "write_secret_env"}),
-            f"{context}.{name}.remote",
-        )
-        ro_headers = _validate_mcp_headers(
-            remote_cfg.get("read_only_headers"), f"{context}.{name}.remote.read_only_headers"
-        )
-        ro_secret_env = _validate_mcp_secret_env(
-            remote_cfg.get("read_only_secret_env"), f"{context}.{name}.remote.read_only_secret_env"
-        )
-        wr_headers = _validate_mcp_headers(
-            remote_cfg.get("write_headers"), f"{context}.{name}.remote.write_headers"
-        )
-        wr_secret_env = _validate_mcp_secret_env(
-            remote_cfg.get("write_secret_env"), f"{context}.{name}.remote.write_secret_env"
-        )
-
-        # Enforce strict credential-slot separation across local, remote-RO, and remote-RW
-        top_slots = extract_secret_slots(norm_headers, norm_secret_env)
-        local_slots = (
-            extract_secret_slots(norm_local["headers"], norm_local["secret_env"])
-            if norm_local is not None
-            else set()
-        )
-        ro_slots = extract_secret_slots(ro_headers, ro_secret_env)
-        wr_slots = extract_secret_slots(wr_headers, wr_secret_env)
-        if wr_slots & (ro_slots | local_slots | top_slots):
-            shared = sorted(wr_slots & (ro_slots | local_slots | top_slots))
-            raise PolicyError(
-                f"MCP {name} remote write secret slot(s) must be distinct from read-only/local slots: {', '.join(shared)}"
-            )
-        if ro_slots & (local_slots | top_slots):
-            shared = sorted(ro_slots & (local_slots | top_slots))
-            raise PolicyError(
-                f"MCP {name} remote read-only secret slot(s) must be distinct from local slots: {', '.join(shared)}"
-            )
-
-        norm_remote = {
-            "read_only_headers": ro_headers,
-            "read_only_secret_env": ro_secret_env,
-            "write_headers": wr_headers,
-            "write_secret_env": wr_secret_env,
-        }
-
+    tools, read_only_tools, write_tools = _validate_mcp_tool_sets(name, cfg, context)
+    norm_local = _validate_mcp_local_cfg(name, cfg.get("local"), context)
+    norm_remote = _validate_mcp_remote_cfg(
+        name,
+        cfg.get("remote"),
+        context,
+        norm_headers=norm_headers,
+        norm_secret_env=norm_secret_env,
+        norm_local=norm_local,
+    )
     return {
         "type": mtype,
         "url": norm_url,
@@ -1137,63 +1199,9 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
     }
 
 
-def validate_bundle_doc(
-    doc: dict[str, Any],
-    *,
-    expected_id: str | None = None,
-    for_orchestrator: bool = False,
-) -> dict[str, Any]:
-    if not isinstance(doc, dict):
-        raise SchemaError("bundle document must be a TOML table")
-    if doc.get("schema_version") != SCHEMA_VERSION:
-        raise SchemaError(f"bundle schema_version must be {SCHEMA_VERSION}")
-    if doc.get("kind") != "bundle@1":
-        raise SchemaError("bundle kind must be 'bundle@1'")
-    _reject_unknown_keys(
-        doc,
-        frozenset(
-            {
-                "schema_version",
-                "kind",
-                "id",
-                "description",
-                "includes",
-                "composition",
-                "requires_services",
-                "local_services",
-                "mcp",
-                "skills",
-                "persona",
-                "subagents",
-                "instructions",
-                "prompt_slots",
-                "mise_tools",
-            }
-        ),
-        "bundle",
-    )
-    bid = validate_opaque_id(doc.get("id"), label="bundle.id")
-    if expected_id is not None and bid != expected_id:
-        raise SchemaError(f"bundle.id {bid!r} does not match expected {expected_id!r}")
-    if for_orchestrator and is_builtin_id(bid):
-        raise PolicyError("builtin/* bundles are strictly immutable")
-
-    includes = [validate_opaque_id(x, label="bundle.includes[]") for x in doc.get("includes", [])]
-    comp = doc.get("composition", {})
-    if not isinstance(comp, dict):
-        raise SchemaError("bundle.composition must be a table")
-    _reject_unknown_keys(comp, frozenset({"replace"}), "bundle.composition")
-    replace_list = comp.get("replace", [])
-    if not isinstance(replace_list, list) or any(r not in ("persona", "mcp") for r in replace_list):
-        raise SchemaError("bundle.composition.replace may only contain 'persona' or 'mcp'")
-
-    req_services = [
-        _validate_service_requirement(item, "bundle.requires_services[]")
-        for item in doc.get("requires_services", [])
-    ]
-
+def _validate_bundle_local_services(raw_items: list[Any]) -> list[dict[str, Any]]:
     local_services = []
-    for i, item in enumerate(doc.get("local_services", [])):
+    for i, item in enumerate(raw_items):
         if not isinstance(item, dict):
             raise SchemaError(f"bundle.local_services[{i}] must be a table")
         _reject_unknown_keys(
@@ -1205,65 +1213,55 @@ def validate_bundle_doc(
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,47}", bkey):
             raise SchemaError(f"Invalid local_services binding_key: {bkey!r}")
         lsvc = validate_opaque_id(item.get("service"), label=f"local_services[{i}].service")
-        inst = item.get("instance")
-        if inst is not None and (type(inst) is not str or SIMPLE_NAME_RE.fullmatch(inst) is None):
-            raise SchemaError(f"Invalid local_services instance: {inst!r}")
-        iport = item.get("instance_port")
-        if iport is not None and (type(iport) is not int or not (1 <= iport <= 65535)):
-            raise SchemaError(f"Invalid local_services instance_port: {iport!r}")
+        inst, iport = _validate_optional_instance_and_port(
+            item.get("instance"), item.get("instance_port"), "local_services"
+        )
         local_services.append({"binding_key": bkey, "service": lsvc, "instance": inst, "instance_port": iport})
+    return local_services
 
-    raw_mcp = doc.get("mcp", {})
-    if not isinstance(raw_mcp, dict):
-        raise SchemaError("bundle.mcp must be a table")
-    mcp = {
-        k: _validate_mcp_server(k, v, f"bundle({bid}).mcp", for_orchestrator=for_orchestrator)
-        for k, v in raw_mcp.items()
+
+def _validate_bundle_persona(persona: object, bid: str) -> dict[str, Any] | None:
+    if persona is None:
+        return None
+    if not isinstance(persona, dict):
+        raise SchemaError("bundle.persona must be a table")
+    _reject_unknown_keys(
+        persona,
+        frozenset({"name", "mission", "authority", "allowed_mcp_tools", "denied_mcp_tools", "checklists"}),
+        "bundle.persona",
+    )
+    pname = _require_str(persona.get("name"), "bundle.persona.name")
+    if SIMPLE_NAME_RE.fullmatch(pname) is None:
+        raise SchemaError(f"Invalid persona name: {pname!r}")
+    mission = _require_str(persona.get("mission"), "bundle.persona.mission")
+    _check_no_raw_secret_value(mission, f"bundle({bid}).persona.mission")
+    if len(mission.encode("utf-8")) > MAX_MISSION_BYTES:
+        raise SchemaError("bundle.persona.mission exceeds byte limit")
+    auth = persona.get("authority", "implementer")
+    if auth not in ("implementer", "reviewer", "triage", "ops-ro"):
+        raise SchemaError(f"Invalid persona authority: {auth!r}")
+    allowed_tools = persona.get("allowed_mcp_tools")
+    if allowed_tools is not None and (
+        not isinstance(allowed_tools, list) or any(type(t) is not str for t in allowed_tools)
+    ):
+        raise SchemaError("persona.allowed_mcp_tools must be a list of strings")
+    denied_tools = persona.get("denied_mcp_tools", [])
+    if not isinstance(denied_tools, list) or any(type(t) is not str for t in denied_tools):
+        raise SchemaError("persona.denied_mcp_tools must be a list of strings")
+    checklists = persona.get("checklists", {})
+    if not isinstance(checklists, dict):
+        raise SchemaError("persona.checklists must be a table")
+    return {
+        "name": pname,
+        "mission": mission,
+        "authority": auth,
+        "allowed_mcp_tools": list(allowed_tools) if allowed_tools is not None else None,
+        "denied_mcp_tools": list(denied_tools),
+        "checklists": checklists,
     }
 
-    skills = [validate_opaque_id(s, label="bundle.skills[]") for s in doc.get("skills", [])]
 
-    persona = doc.get("persona")
-    norm_persona = None
-    if persona is not None:
-        if not isinstance(persona, dict):
-            raise SchemaError("bundle.persona must be a table")
-        _reject_unknown_keys(
-            persona,
-            frozenset({"name", "mission", "authority", "allowed_mcp_tools", "denied_mcp_tools", "checklists"}),
-            "bundle.persona",
-        )
-        pname = _require_str(persona.get("name"), "bundle.persona.name")
-        if SIMPLE_NAME_RE.fullmatch(pname) is None:
-            raise SchemaError(f"Invalid persona name: {pname!r}")
-        mission = _require_str(persona.get("mission"), "bundle.persona.mission")
-        _check_no_raw_secret_value(mission, f"bundle({bid}).persona.mission")
-        if len(mission.encode("utf-8")) > MAX_MISSION_BYTES:
-            raise SchemaError("bundle.persona.mission exceeds byte limit")
-        auth = persona.get("authority", "implementer")
-        if auth not in ("implementer", "reviewer", "triage", "ops-ro"):
-            raise SchemaError(f"Invalid persona authority: {auth!r}")
-        allowed_tools = persona.get("allowed_mcp_tools")
-        if allowed_tools is not None and (
-            not isinstance(allowed_tools, list) or any(type(t) is not str for t in allowed_tools)
-        ):
-            raise SchemaError("persona.allowed_mcp_tools must be a list of strings")
-        denied_tools = persona.get("denied_mcp_tools", [])
-        if not isinstance(denied_tools, list) or any(type(t) is not str for t in denied_tools):
-            raise SchemaError("persona.denied_mcp_tools must be a list of strings")
-        checklists = persona.get("checklists", {})
-        if not isinstance(checklists, dict):
-            raise SchemaError("persona.checklists must be a table")
-        norm_persona = {
-            "name": pname,
-            "mission": mission,
-            "authority": auth,
-            "allowed_mcp_tools": list(allowed_tools) if allowed_tools is not None else None,
-            "denied_mcp_tools": list(denied_tools),
-            "checklists": checklists,
-        }
-
-    subagents = doc.get("subagents", [])
+def _validate_bundle_subagents(subagents: object) -> list[dict[str, Any]]:
     if not isinstance(subagents, list):
         raise SchemaError("bundle.subagents must be a list")
     norm_subagents = []
@@ -1281,14 +1279,10 @@ def validate_bundle_doc(
                 "authority": sa.get("authority", "reviewer"),
             }
         )
+    return norm_subagents
 
-    instructions = doc.get("instructions", [])
-    if not isinstance(instructions, list) or any(type(x) is not str for x in instructions):
-        raise SchemaError("bundle.instructions must be a list of strings")
-    for text in instructions:
-        _check_no_raw_secret_value(text, f"bundle({bid}).instructions")
 
-    prompt_slots = doc.get("prompt_slots", {})
+def _validate_bundle_prompt_slots(prompt_slots: object) -> dict[str, str]:
     if not isinstance(prompt_slots, dict):
         raise SchemaError("bundle.prompt_slots must be a table")
     norm_slots: dict[str, str] = {}
@@ -1298,7 +1292,77 @@ def validate_bundle_doc(
         if type(sv) is not str or sv.startswith("/") or ".." in Path(sv).parts or not sv.endswith((".md", ".txt")):
             raise PolicyError(f"prompt_slot {sk!r} must be a relative .md/.txt file inside bundle root")
         norm_slots[sk] = sv
+    return norm_slots
 
+
+_BUNDLE_ALLOWED_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "id",
+        "description",
+        "includes",
+        "composition",
+        "requires_services",
+        "local_services",
+        "mcp",
+        "skills",
+        "persona",
+        "subagents",
+        "instructions",
+        "prompt_slots",
+        "mise_tools",
+    }
+)
+
+
+def validate_bundle_doc(
+    doc: dict[str, Any],
+    *,
+    expected_id: str | None = None,
+    for_orchestrator: bool = False,
+) -> dict[str, Any]:
+    bid = _validate_doc_header(
+        doc,
+        kind_name="bundle",
+        kind_tag="bundle@1",
+        allowed_keys=_BUNDLE_ALLOWED_KEYS,
+        expected_id=expected_id,
+        for_orchestrator=for_orchestrator,
+    )
+    includes = [validate_opaque_id(x, label="bundle.includes[]") for x in doc.get("includes", [])]
+    comp = doc.get("composition", {})
+    if not isinstance(comp, dict):
+        raise SchemaError("bundle.composition must be a table")
+    _reject_unknown_keys(comp, frozenset({"replace"}), "bundle.composition")
+    replace_list = comp.get("replace", [])
+    if not isinstance(replace_list, list) or any(r not in ("persona", "mcp") for r in replace_list):
+        raise SchemaError("bundle.composition.replace may only contain 'persona' or 'mcp'")
+
+    req_services = [
+        _validate_service_requirement(item, "bundle.requires_services[]")
+        for item in doc.get("requires_services", [])
+    ]
+    local_services = _validate_bundle_local_services(doc.get("local_services", []))
+
+    raw_mcp = doc.get("mcp", {})
+    if not isinstance(raw_mcp, dict):
+        raise SchemaError("bundle.mcp must be a table")
+    mcp = {
+        k: _validate_mcp_server(k, v, f"bundle({bid}).mcp", for_orchestrator=for_orchestrator)
+        for k, v in raw_mcp.items()
+    }
+    skills = [validate_opaque_id(s, label="bundle.skills[]") for s in doc.get("skills", [])]
+    norm_persona = _validate_bundle_persona(doc.get("persona"), bid)
+    norm_subagents = _validate_bundle_subagents(doc.get("subagents", []))
+
+    instructions = doc.get("instructions", [])
+    if not isinstance(instructions, list) or any(type(x) is not str for x in instructions):
+        raise SchemaError("bundle.instructions must be a list of strings")
+    for text in instructions:
+        _check_no_raw_secret_value(text, f"bundle({bid}).instructions")
+
+    norm_slots = _validate_bundle_prompt_slots(doc.get("prompt_slots", {}))
     mise_tools = validate_mise_tools(doc.get("mise_tools"), f"bundle({bid}).mise_tools")
 
     return {
@@ -1346,46 +1410,40 @@ def validate_port_request(entry: object, context: str) -> dict[str, Any]:
     return {"service": svc, "endpoint": ep, "exposure": exp, "host_port": hp}
 
 
+_SANDBOX_TYPE_ALLOWED_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "id",
+        "description",
+        "tier",
+        "topology",
+        "base_image",
+        "base_images_by_arch",
+        "default_worker",
+        "bundles",
+        "default_agent",
+        "ports",
+        "mise_overrides",
+        "factory_id",
+    }
+)
+
+
 def validate_sandbox_type_doc(
     doc: dict[str, Any],
     *,
     expected_id: str | None = None,
     for_orchestrator: bool = False,
 ) -> dict[str, Any]:
-    if not isinstance(doc, dict):
-        raise SchemaError("sandbox-type document must be a TOML table")
-    if doc.get("schema_version") != SCHEMA_VERSION:
-        raise SchemaError(f"sandbox-type schema_version must be {SCHEMA_VERSION}")
-    if doc.get("kind") != "sandbox-type@1":
-        raise SchemaError("sandbox-type kind must be 'sandbox-type@1'")
-    _reject_unknown_keys(
+    stid = _validate_doc_header(
         doc,
-        frozenset(
-            {
-                "schema_version",
-                "kind",
-                "id",
-                "description",
-                "tier",
-                "topology",
-                "base_image",
-                "base_images_by_arch",
-                "default_worker",
-                "bundles",
-                "default_agent",
-                "ports",
-                "mise_overrides",
-                "factory_id",
-            }
-        ),
-        "sandbox-type",
+        kind_name="sandbox-type",
+        kind_tag="sandbox-type@1",
+        allowed_keys=_SANDBOX_TYPE_ALLOWED_KEYS,
+        expected_id=expected_id,
+        for_orchestrator=for_orchestrator,
     )
-    stid = validate_opaque_id(doc.get("id"), label="sandbox-type.id")
-    if expected_id is not None and stid != expected_id:
-        raise SchemaError(f"sandbox-type.id {stid!r} does not match expected {expected_id!r}")
-    if for_orchestrator and is_builtin_id(stid):
-        raise PolicyError("builtin/* sandbox-types are strictly immutable")
-
     tier = doc.get("tier", "managed")
     if tier not in TIERS:
         raise SchemaError(f"Invalid sandbox-type.tier: {tier!r}")
@@ -1393,29 +1451,22 @@ def validate_sandbox_type_doc(
     if topology not in TOPOLOGIES:
         raise SchemaError(f"Invalid sandbox-type.topology: {topology!r}")
 
-    base_image = doc.get("base_image")
-    base_by_arch = doc.get("base_images_by_arch")
-    if base_image is not None and (type(base_image) is not str or DIGEST_IMAGE_RE.fullmatch(base_image) is None):
-        raise SchemaError("sandbox-type.base_image must be digest-pinned (@sha256:...)")
-    if base_by_arch is not None:
-        if not isinstance(base_by_arch, dict) or not base_by_arch:
-            raise SchemaError("base_images_by_arch must be a non-empty table")
-        for arch, ref in base_by_arch.items():
-            if arch not in ("x86_64", "arm64") or type(ref) is not str or DIGEST_IMAGE_RE.fullmatch(ref) is None:
-                raise SchemaError(f"Invalid base_images_by_arch[{arch!r}]")
-    if base_image is None and base_by_arch is None:
-        raise SchemaError("sandbox-type requires digest-pinned base_image or base_images_by_arch")
-
+    base_image, base_by_arch = _validate_digest_images(
+        doc.get("base_image"),
+        doc.get("base_images_by_arch"),
+        context="sandbox-type",
+        image_field="base_image",
+        arch_field="base_images_by_arch",
+    )
     default_worker = doc.get("default_worker", "builtin/local-workstation")
     validate_opaque_id(default_worker, label="sandbox-type.default_worker")
-
     bundles = [validate_opaque_id(b, label="sandbox-type.bundles[]") for b in doc.get("bundles", [])]
+
     default_agent = doc.get("default_agent")
     if default_agent is not None and (type(default_agent) is not str or SIMPLE_NAME_RE.fullmatch(default_agent) is None):
         raise SchemaError(f"Invalid default_agent: {default_agent!r}")
 
     ports = [validate_port_request(p, f"sandbox-type.ports[{i}]") for i, p in enumerate(doc.get("ports", []))]
-
     mise_overrides = validate_mise_tools(doc.get("mise_overrides"), "sandbox-type.mise_overrides")
     factory_id = doc.get("factory_id")
     if factory_id is not None and (type(factory_id) is not str or SIMPLE_NAME_RE.fullmatch(factory_id) is None):

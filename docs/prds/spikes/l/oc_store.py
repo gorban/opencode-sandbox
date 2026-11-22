@@ -256,7 +256,41 @@ class HostConfigStore:
         sandbox_root: Path | None = None,
     ):
         self.sandbox_root = sandbox_root
-        raw_config_dir = Path(config_dir)
+        phys_config_dir = self._prepare_config_dir(Path(config_dir), sandbox_root)
+        self.config_dir = assert_trusted_dir(phys_config_dir, sandbox_root=sandbox_root)
+        self.builtin_dir = builtin_dir.resolve()
+        self._clock = clock or (lambda: int(time.monotonic()))
+        self._ensure_layout()
+        self._builtins: dict[tuple[str, str], dict[str, Any]] = {}
+        self._builtin_paths: dict[tuple[str, str], Path] = {}
+        self._load_builtins()
+
+        self.incarnation = incarnation or secrets.token_hex(16)
+        self.principals, self.adapter, self.controller = self._init_controller()
+
+    @staticmethod
+    def _verify_poc_marker(phys_config_dir: Path, sandbox_root: Path | None) -> None:
+        marker_path = phys_config_dir / POC_STORE_MARKER
+        if not marker_path.exists():
+            raise PolicyError(
+                f"Refusing to initialize PoC store in existing non-empty non-PoC directory: {phys_config_dir}"
+            )
+        try:
+            marker_raw = read_regular_no_follow(
+                marker_path,
+                max_bytes=1024,
+                require_owner_only=True,
+                confined_root=phys_config_dir,
+                sandbox_root=sandbox_root,
+            )
+            marker_doc = json.loads(marker_raw.decode("utf-8"))
+        except Exception as exc:
+            raise PolicyError(f"Invalid PoC store marker in {phys_config_dir}: {exc}") from exc
+        if not isinstance(marker_doc, dict) or marker_doc.get("poc_store_version") != 1:
+            raise PolicyError(f"Invalid PoC store marker contents in {phys_config_dir}")
+
+    @classmethod
+    def _prepare_config_dir(cls, raw_config_dir: Path, sandbox_root: Path | None) -> Path:
         if raw_config_dir.is_symlink():
             raise PolicyError(f"Expected non-symlink config_dir: {raw_config_dir}")
         phys_config_dir = check_not_in_sandbox(raw_config_dir, sandbox_root)
@@ -270,55 +304,32 @@ class HostConfigStore:
             if st.st_uid != os.geteuid():
                 raise PolicyError(f"Directory not owned by current user: {phys_config_dir}")
             if any(phys_config_dir.iterdir()):
-                marker_path = phys_config_dir / POC_STORE_MARKER
-                if not marker_path.exists():
-                    raise PolicyError(
-                        f"Refusing to initialize PoC store in existing non-empty non-PoC directory: {phys_config_dir}"
-                    )
-                try:
-                    marker_raw = read_regular_no_follow(
-                        marker_path,
-                        max_bytes=1024,
-                        require_owner_only=True,
-                        confined_root=phys_config_dir,
-                        sandbox_root=sandbox_root,
-                    )
-                    marker_doc = json.loads(marker_raw.decode("utf-8"))
-                except Exception as exc:
-                    raise PolicyError(f"Invalid PoC store marker in {phys_config_dir}: {exc}") from exc
-                if not isinstance(marker_doc, dict) or marker_doc.get("poc_store_version") != 1:
-                    raise PolicyError(f"Invalid PoC store marker contents in {phys_config_dir}")
-            os.chmod(phys_config_dir, 0o700)
+                cls._verify_poc_marker(phys_config_dir, sandbox_root)
         else:
             phys_config_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(phys_config_dir, 0o700)
-        self.config_dir = assert_trusted_dir(phys_config_dir, sandbox_root=sandbox_root)
-        self.builtin_dir = builtin_dir.resolve()
-        self._clock = clock or (lambda: int(time.monotonic()))
-        self._ensure_layout()
-        self._builtins: dict[tuple[str, str], dict[str, Any]] = {}
-        self._builtin_paths: dict[tuple[str, str], Path] = {}
-        self._load_builtins()
+        os.chmod(phys_config_dir, 0o700)
+        return phys_config_dir
 
-        self.incarnation = incarnation or secrets.token_hex(16)
-        self.principals = ApprovalPrincipals(
+    def _init_controller(self) -> tuple[ApprovalPrincipals, ConfigPublishAdapter, occ.Controller]:
+        principals = ApprovalPrincipals(
             operator=occ.Principal(occ.Role.OPERATOR, "host_operator"),
             orchestrator=occ.Principal(occ.Role.ORCHESTRATOR, "oc_orchestrator"),
             config_job=occ.Principal(occ.Role.JOB, "config_publisher"),
             subject=occ.Subject("host_controller", f"cfg_{self.incarnation[:12]}", "config_publisher"),
         )
-        self.adapter = ConfigPublishAdapter(self)
-        self.controller = occ.Controller(
+        adapter = ConfigPublishAdapter(self)
+        controller = occ.Controller(
             incarnation=self.incarnation,
             clock=self._clock,
             lifetime=DEFAULT_PROPOSAL_TTL_SECONDS,
-            workers=[occ.Worker("host_controller", self.principals.operator)],
-            jobs=[occ.Job(self.principals.subject, self.principals.orchestrator, 256)],
+            workers=[occ.Worker("host_controller", principals.operator)],
+            jobs=[occ.Job(principals.subject, principals.orchestrator, 256)],
             capabilities=[occ.Capability("cap_config_apply", occ.Operation.APPLY, "config_store_target")],
             references=[occ.Reference("config_store_apply", "cap_config_apply")],
-            adapter=self.adapter,
+            adapter=adapter,
         )
-        self.controller._set_alias("config_store", "config_store_target")
+        controller._set_alias("config_store", "config_store_target")
+        return principals, adapter, controller
 
     def _ensure_layout(self) -> None:
         check_not_host_production_dir(self.config_dir)
@@ -570,39 +581,55 @@ class HostConfigStore:
                 overrides[key] = doc
         return _OverlayStoreView(self, overrides, archived)
 
+    def _bundle_dependents(self, obj_id: str) -> list[str]:
+        refs = [
+            f"sandbox-type:{st_id}"
+            for st_id in self.list_ids("sandbox-type", include_archived=False)
+            if obj_id in self.get("sandbox-type", st_id)["bundles"]
+        ]
+        refs.extend(
+            f"bundle:{b_id}"
+            for b_id in self.list_ids("bundle", include_archived=False)
+            if b_id != obj_id and obj_id in self.get("bundle", b_id)["includes"]
+        )
+        return refs
+
+    @staticmethod
+    def _bundle_service_targets(bundle: dict[str, Any]) -> set[str]:
+        targets = {r["target"] for r in bundle["requires_services"]}
+        targets.update(r["provider"] for r in bundle["requires_services"] if r["provider"])
+        targets.update(ls["service"] for ls in bundle["local_services"])
+        targets.update(m["local"]["service"] for m in bundle["mcp"].values() if m["local"])
+        return targets
+
+    @staticmethod
+    def _service_ref_targets(svc: dict[str, Any]) -> set[str]:
+        targets = {r["target"] for r in svc["requires"]}
+        targets.update(r["provider"] for r in svc["requires"] if r["provider"])
+        if svc["fallback_service"]:
+            targets.add(svc["fallback_service"])
+        return targets
+
+    def _service_dependents(self, obj_id: str) -> list[str]:
+        refs = [
+            f"bundle:{b_id}"
+            for b_id in self.list_ids("bundle", include_archived=False)
+            if obj_id in self._bundle_service_targets(self.get("bundle", b_id))
+        ]
+        refs.extend(
+            f"service:{s_id}"
+            for s_id in self.list_ids("service", include_archived=False)
+            if s_id != obj_id and obj_id in self._service_ref_targets(self.get("service", s_id))
+        )
+        return refs
+
     def has_active_dependents(self, kind: str, obj_id: str) -> list[str]:
         """Return active objects referencing (kind, obj_id)."""
-        refs: list[str] = []
         if kind == "bundle":
-            for st_id in self.list_ids("sandbox-type", include_archived=False):
-                if obj_id in self.get("sandbox-type", st_id)["bundles"]:
-                    refs.append(f"sandbox-type:{st_id}")
-            for b_id in self.list_ids("bundle", include_archived=False):
-                if b_id != obj_id and obj_id in self.get("bundle", b_id)["includes"]:
-                    refs.append(f"bundle:{b_id}")
-        elif kind == "service":
-            for b_id in self.list_ids("bundle", include_archived=False):
-                b = self.get("bundle", b_id)
-                targets = (
-                    [r["target"] for r in b["requires_services"]]
-                    + [r["provider"] for r in b["requires_services"] if r["provider"]]
-                    + [ls["service"] for ls in b["local_services"]]
-                    + [m["local"]["service"] for m in b["mcp"].values() if m["local"]]
-                )
-                if obj_id in targets:
-                    refs.append(f"bundle:{b_id}")
-            for s_id in self.list_ids("service", include_archived=False):
-                if s_id == obj_id:
-                    continue
-                s = self.get("service", s_id)
-                targets = (
-                    [r["target"] for r in s["requires"]]
-                    + [r["provider"] for r in s["requires"] if r["provider"]]
-                    + ([s["fallback_service"]] if s["fallback_service"] else [])
-                )
-                if obj_id in targets:
-                    refs.append(f"service:{s_id}")
-        return sorted(refs)
+            return sorted(self._bundle_dependents(obj_id))
+        if kind == "service":
+            return sorted(self._service_dependents(obj_id))
+        return []
 
     def _list_proposals_unlocked(self) -> list[dict[str, Any]]:
         pdir = self.config_dir / "proposals"
@@ -683,6 +710,74 @@ class HostConfigStore:
 
         return old_plans, new_plans, sha256_canonical_json(closure_items)
 
+    @staticmethod
+    def _validate_proposal_request(
+        kind: str,
+        obj_id: str,
+        action: str,
+        proposed_toml: str | None,
+        ttl_seconds: int,
+    ) -> dict[str, Any] | None:
+        if kind not in MUTABLE_ORCHESTRATOR_KINDS:
+            raise PolicyError(f"Kind {kind!r} is not mutable via proposals")
+        validate_opaque_id(obj_id, label="id")
+        if is_builtin_id(obj_id):
+            raise PolicyError("builtin/* namespace is strictly immutable")
+        if action not in PROPOSAL_ACTIONS:
+            raise SchemaError(f"Invalid proposal action: {action!r}")
+        if type(ttl_seconds) is not int or not (1 <= ttl_seconds <= DEFAULT_PROPOSAL_TTL_SECONDS):
+            raise SchemaError(f"ttl_seconds must be an integer in 1..{DEFAULT_PROPOSAL_TTL_SECONDS}")
+        if action != "upsert":
+            if proposed_toml is not None:
+                raise SchemaError(f"action={action!r} requires proposed_toml=None")
+            return None
+        if type(proposed_toml) is not str or not proposed_toml.strip():
+            raise SchemaError("upsert requires non-empty proposed_toml")
+        if len(proposed_toml.encode("utf-8")) > MAX_CONFIG_FILE_BYTES:
+            raise SchemaError("proposed_toml exceeds byte limit")
+        return validate_doc_by_kind(
+            kind,
+            parse_toml_strict(proposed_toml, context=f"proposed_toml({kind}/{obj_id})"),
+            expected_id=obj_id,
+            for_orchestrator=True,
+        )
+
+    def _prepare_archive_action_unlocked(
+        self, kind: str, obj_id: str, action: str, validated_doc: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if action == "archive":
+            if self.get_revision(kind, obj_id) == 0:
+                raise KeyError(f"{kind}/{obj_id} does not exist")
+            deps = self.has_active_dependents(kind, obj_id)
+            if deps:
+                raise ConflictError(f"Cannot archive {kind}/{obj_id}; referenced by: {', '.join(deps)}")
+            return None
+        if action == "unarchive":
+            if not self.is_archived(kind, obj_id):
+                raise ConflictError(f"{kind}/{obj_id} is not archived")
+            # Gate 2 note #3: re-validate archived TOML against current schema/orchestrator rules
+            archived_raw = self.get_raw_toml(kind, obj_id, include_archived=True)
+            return validate_doc_by_kind(
+                kind,
+                parse_toml_strict(archived_raw, context=f"archived({kind}/{obj_id})"),
+                expected_id=obj_id,
+                for_orchestrator=True,
+            )
+        return validated_doc
+
+    def _sweep_pending_quota_unlocked(self, now: int) -> None:
+        active_pending = 0
+        for existing in self._list_proposals_unlocked():
+            if existing["status"] != "pending":
+                continue
+            if now >= existing["expires_at"]:
+                existing["status"] = "expired"
+                self._save_proposal_unlocked(existing)
+            elif existing["incarnation"] == self.incarnation:
+                active_pending += 1
+        if active_pending >= MAX_PENDING_PROPOSALS:
+            raise ConflictError(f"Pending proposal quota exceeded (max {MAX_PENDING_PROPOSALS})")
+
     def create_proposal(
         self,
         *,
@@ -692,65 +787,13 @@ class HostConfigStore:
         proposed_toml: str | None,
         ttl_seconds: int = DEFAULT_PROPOSAL_TTL_SECONDS,
     ) -> dict[str, Any]:
-        if kind not in MUTABLE_ORCHESTRATOR_KINDS:
-            raise PolicyError(f"Kind {kind!r} is not mutable via proposals")
-        validate_opaque_id(obj_id, label="id")
-        if is_builtin_id(obj_id):
-            raise PolicyError("builtin/* namespace is strictly immutable")
-        if action not in PROPOSAL_ACTIONS:
-            raise SchemaError(f"Invalid proposal action: {action!r}")
-        if type(ttl_seconds) is not int or not (1 <= ttl_seconds <= DEFAULT_PROPOSAL_TTL_SECONDS):
-            raise SchemaError(
-                f"ttl_seconds must be an integer in 1..{DEFAULT_PROPOSAL_TTL_SECONDS}"
-            )
-
-        validated_doc: dict[str, Any] | None = None
-        if action == "upsert":
-            if type(proposed_toml) is not str or not proposed_toml.strip():
-                raise SchemaError("upsert requires non-empty proposed_toml")
-            if len(proposed_toml.encode("utf-8")) > MAX_CONFIG_FILE_BYTES:
-                raise SchemaError("proposed_toml exceeds byte limit")
-            validated_doc = validate_doc_by_kind(
-                kind,
-                parse_toml_strict(proposed_toml, context=f"proposed_toml({kind}/{obj_id})"),
-                expected_id=obj_id,
-                for_orchestrator=True,
-            )
-        else:
-            if proposed_toml is not None:
-                raise SchemaError(f"action={action!r} requires proposed_toml=None")
+        validated_doc = self._validate_proposal_request(kind, obj_id, action, proposed_toml, ttl_seconds)
 
         with self.persistent_flock():
             self.assert_no_unresolved_uncertain_proposals()
-            if action == "archive":
-                if self.get_revision(kind, obj_id) == 0:
-                    raise KeyError(f"{kind}/{obj_id} does not exist")
-                deps = self.has_active_dependents(kind, obj_id)
-                if deps:
-                    raise ConflictError(f"Cannot archive {kind}/{obj_id}; referenced by: {', '.join(deps)}")
-            elif action == "unarchive":
-                if not self.is_archived(kind, obj_id):
-                    raise ConflictError(f"{kind}/{obj_id} is not archived")
-                # Gate 2 note #3: re-validate archived TOML against current schema/orchestrator rules
-                archived_raw = self.get_raw_toml(kind, obj_id, include_archived=True)
-                validated_doc = validate_doc_by_kind(
-                    kind,
-                    parse_toml_strict(archived_raw, context=f"archived({kind}/{obj_id})"),
-                    expected_id=obj_id,
-                    for_orchestrator=True,
-                )
-
+            validated_doc = self._prepare_archive_action_unlocked(kind, obj_id, action, validated_doc)
             now = self._clock()
-            active_pending = 0
-            for existing in self._list_proposals_unlocked():
-                if existing["status"] == "pending":
-                    if now >= existing["expires_at"]:
-                        existing["status"] = "expired"
-                        self._save_proposal_unlocked(existing)
-                    elif existing["incarnation"] == self.incarnation:
-                        active_pending += 1
-            if active_pending >= MAX_PENDING_PROPOSALS:
-                raise ConflictError(f"Pending proposal quota exceeded (max {MAX_PENDING_PROPOSALS})")
+            self._sweep_pending_quota_unlocked(now)
 
             base_store_rev = self.store_revision
             old_plans, new_plans, closure_digest = self._dry_run_affected_plans(
@@ -834,54 +877,87 @@ class HostConfigStore:
         )
         return new_rev
 
+    def _verify_pending_proposal_unlocked(
+        self, proposal: dict[str, Any], proposal_id: str, expected_digest: str
+    ) -> None:
+        if proposal["incarnation"] != self.incarnation:
+            raise StaleProposalError("Proposal belongs to a prior helper incarnation; re-propose")
+        if proposal["status"] != "pending":
+            raise ConflictError(f"Proposal {proposal_id} is not pending (status={proposal['status']})")
+        if self._clock() >= proposal["expires_at"]:
+            proposal["status"] = "expired"
+            self._save_proposal_unlocked(proposal)
+            raise ExpiredProposalError("Proposal expired")
+        if not hmac.compare_digest(proposal["digest"], expected_digest):
+            raise DigestMismatchError("Approval digest mismatch")
+        if self.store_revision != proposal["base_store_revision"]:
+            raise StaleProposalError("Store revision changed since proposal; re-propose")
+
+    def _revalidate_proposal_closure_unlocked(self, proposal: dict[str, Any]) -> None:
+        kind, obj_id, action = proposal["kind"], proposal["obj_id"], proposal["action"]
+        validated_doc: dict[str, Any] | None = None
+        if action == "archive":
+            deps = self.has_active_dependents(kind, obj_id)
+            if deps:
+                raise ConflictError(f"Target {kind}/{obj_id} now referenced by: {', '.join(deps)}")
+        elif action == "unarchive":
+            archived_raw = self.get_raw_toml(kind, obj_id, include_archived=True)
+            validated_doc = validate_doc_by_kind(
+                kind,
+                parse_toml_strict(archived_raw, context=f"archived({kind}/{obj_id})"),
+                expected_id=obj_id,
+                for_orchestrator=True,
+            )
+        else:
+            validated_doc = validate_doc_by_kind(
+                kind,
+                parse_toml_strict(proposal["proposed_toml"], context=f"proposed_toml({kind}/{obj_id})"),
+                expected_id=obj_id,
+                for_orchestrator=True,
+            )
+        old_plans, new_plans, cur_closure = self._dry_run_affected_plans(kind, obj_id, action, validated_doc)
+        cur_delta = compute_closed_security_delta(old_plans, new_plans)
+        if cur_closure != proposal["closure_digest"] or cur_delta["digest"] != proposal["security_delta_digest"]:
+            raise StaleProposalError("Transitive dependencies or security delta changed")
+
+    def _check_decide_status_unlocked(self, proposal: dict[str, Any], decide_status: Any) -> None:
+        if decide_status.state is occ.State.APPROVED:
+            return
+        if decide_status.state is occ.State.EXPIRED:
+            proposal["status"] = "expired"
+            self._save_proposal_unlocked(proposal)
+            raise ExpiredProposalError("Controller approval expired")
+        proposal["status"] = "failed"
+        self._save_proposal_unlocked(proposal)
+        if decide_status.state is occ.State.STALE:
+            raise StaleProposalError("Controller marked approval stale")
+        raise StoreError(f"Unexpected controller decide state: {decide_status.state}")
+
+    def _settle_invoke_status_unlocked(self, proposal: dict[str, Any], inv_status: Any) -> int:
+        if inv_status.state is occ.State.SUCCEEDED:
+            proposal["status"] = "applied"
+            self._save_proposal_unlocked(proposal)
+            return self.get_revision(proposal["kind"], proposal["obj_id"])
+        if inv_status.state is occ.State.UNCERTAIN:
+            proposal["status"] = "uncertain"
+            self._save_proposal_unlocked(proposal)
+            raise PublishUncertainError(
+                f"Publish outcome uncertain for {proposal['id']}; run config reconcile"
+            )
+        if inv_status.state is occ.State.EXPIRED:
+            proposal["status"] = "expired"
+            self._save_proposal_unlocked(proposal)
+            raise ExpiredProposalError("Controller approval expired during invoke")
+        proposal["status"] = "failed"
+        self._save_proposal_unlocked(proposal)
+        raise StoreError(f"Publish failed: {inv_status.reason}")
+
     def approve_proposal(self, proposal_id: str, expected_digest: str) -> int:
         with self.persistent_flock():
             self.assert_no_unresolved_uncertain_proposals()
             proposal = self.load_proposal(proposal_id)
-            if proposal["incarnation"] != self.incarnation:
-                raise StaleProposalError("Proposal belongs to a prior helper incarnation; re-propose")
-            if proposal["status"] != "pending":
-                raise ConflictError(f"Proposal {proposal_id} is not pending (status={proposal['status']})")
-            if self._clock() >= proposal["expires_at"]:
-                proposal["status"] = "expired"
-                self._save_proposal_unlocked(proposal)
-                raise ExpiredProposalError("Proposal expired")
-            if not hmac.compare_digest(proposal["digest"], expected_digest):
-                raise DigestMismatchError("Approval digest mismatch")
-            if self.store_revision != proposal["base_store_revision"]:
-                raise StaleProposalError("Store revision changed since proposal; re-propose")
-
-            kind, obj_id, action = proposal["kind"], proposal["obj_id"], proposal["action"]
-            validated_doc: dict[str, Any] | None = None
-            if action == "archive":
-                deps = self.has_active_dependents(kind, obj_id)
-                if deps:
-                    raise ConflictError(f"Target {kind}/{obj_id} now referenced by: {', '.join(deps)}")
-            elif action == "unarchive":
-                archived_raw = self.get_raw_toml(kind, obj_id, include_archived=True)
-                validated_doc = validate_doc_by_kind(
-                    kind,
-                    parse_toml_strict(archived_raw, context=f"archived({kind}/{obj_id})"),
-                    expected_id=obj_id,
-                    for_orchestrator=True,
-                )
-            else:
-                validated_doc = validate_doc_by_kind(
-                    kind,
-                    parse_toml_strict(proposal["proposed_toml"], context=f"proposed_toml({kind}/{obj_id})"),
-                    expected_id=obj_id,
-                    for_orchestrator=True,
-                )
-
-            old_plans, new_plans, cur_closure = self._dry_run_affected_plans(
-                kind, obj_id, action, validated_doc
-            )
-            cur_delta = compute_closed_security_delta(old_plans, new_plans)
-            if (
-                cur_closure != proposal["closure_digest"]
-                or cur_delta["digest"] != proposal["security_delta_digest"]
-            ):
-                raise StaleProposalError("Transitive dependencies or security delta changed")
+            self._verify_pending_proposal_unlocked(proposal, proposal_id, expected_digest)
+            self._revalidate_proposal_closure_unlocked(proposal)
 
             proposal["status"] = "applying"
             self._save_proposal_unlocked(proposal)
@@ -895,39 +971,12 @@ class HostConfigStore:
                 proposal["controller_digest"],
                 occ.Decision.APPROVE,
             )
-            if decide_status.state is occ.State.EXPIRED:
-                proposal["status"] = "expired"
-                self._save_proposal_unlocked(proposal)
-                raise ExpiredProposalError("Controller approval expired")
-            if decide_status.state is occ.State.STALE:
-                proposal["status"] = "failed"
-                self._save_proposal_unlocked(proposal)
-                raise StaleProposalError("Controller marked approval stale")
-            if decide_status.state is not occ.State.APPROVED:
-                proposal["status"] = "failed"
-                self._save_proposal_unlocked(proposal)
-                raise StoreError(f"Unexpected controller decide state: {decide_status.state}")
+            self._check_decide_status_unlocked(proposal, decide_status)
 
             inv_status = self.controller.invoke(
                 self.principals.config_job, proposal["controller_request_id"]
             )
-            if inv_status.state is occ.State.SUCCEEDED:
-                proposal["status"] = "applied"
-                self._save_proposal_unlocked(proposal)
-                return self.get_revision(kind, obj_id)
-            if inv_status.state is occ.State.UNCERTAIN:
-                proposal["status"] = "uncertain"
-                self._save_proposal_unlocked(proposal)
-                raise PublishUncertainError(
-                    f"Publish outcome uncertain for {proposal_id}; run config reconcile"
-                )
-            if inv_status.state is occ.State.EXPIRED:
-                proposal["status"] = "expired"
-                self._save_proposal_unlocked(proposal)
-                raise ExpiredProposalError("Controller approval expired during invoke")
-            proposal["status"] = "failed"
-            self._save_proposal_unlocked(proposal)
-            raise StoreError(f"Publish failed: {inv_status.reason}")
+            return self._settle_invoke_status_unlocked(proposal, inv_status)
 
     def reject_proposal(self, proposal_id: str) -> dict[str, Any]:
         with self.persistent_flock():
