@@ -1,0 +1,120 @@
+import socket
+import time
+import unittest
+
+from client import DispatchOutcome, ProbeError, RelayExchange, Response, TurnEvent, TurnEvents, TurnPins, Wire
+from probe import observe
+
+
+def event(kind, session="ses_pinned", **data):
+    return {"type": kind, "data": {"sessionID": session, **data}}
+
+
+class ClientTests(unittest.TestCase):
+    def response(self, raw, media=None):
+        client, peer = socket.socketpair()
+        self.addCleanup(client.close)
+        with peer:
+            peer.sendall(raw)
+        return Response(Wire(client, time.monotonic() + 1), status=200, media=media)
+
+    def test_decode_chunked_events_across_boundaries(self):
+        head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n")
+        chunks = [b"data: {\"type\":", b"\"server.connected\"}\n\n: heartbeat\n\n"]
+        wire = b"".join(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n" for chunk in chunks)
+        response = self.response(head + wire + b"0\r\n\r\n", "text/event-stream")
+        self.assertEqual(list(response.events()), [{"type": "server.connected"}])
+
+    def test_refuse_redirect_and_compression(self):
+        for raw, message in [
+            (b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n", "status 302"),
+            (b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n", "compressed"),
+        ]:
+            with self.subTest(message=message), self.assertRaisesRegex(ProbeError, message):
+                self.response(raw)
+
+    def test_refuse_ambiguous_or_oversized_http_body(self):
+        with self.assertRaisesRegex(ProbeError, "framing"):
+            self.response(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n")
+        response = self.response(b"HTTP/1.1 200 OK\r\nContent-Length: 65537\r\n\r\n")
+        with self.assertRaisesRegex(ProbeError, "size"):
+            response.json()
+
+    def test_close_evidence_requires_peer_eof(self):
+        client, peer = socket.socketpair()
+        with client, peer:
+            wire = Wire(client, time.monotonic() + 1)
+            peer.sendall(b"trailing bytes")
+            with self.assertRaisesRegex(ProbeError, "left the control event stream open"):
+                wire.await_eof(time.monotonic() + 0.02)
+            peer.shutdown(socket.SHUT_WR)
+            wire.await_eof(time.monotonic() + 0.2)
+
+    def test_preclosed_peer_fails_liveness_even_with_queued_data(self):
+        client, peer = socket.socketpair()
+        with client, peer:
+            wire = Wire(client, time.monotonic() + 1)
+            peer.sendall(b"trailing event data")
+            wire.assert_open()
+            peer.shutdown(socket.SHUT_WR)
+            with self.assertRaisesRegex(ProbeError, "closed before revoke"):
+                wire.assert_open()
+
+    def test_map_only_explicit_handoff_receipts(self):
+        for raw, expected in [
+            (b"H", DispatchOutcome.HANDED_OFF),
+            (b"Z", DispatchOutcome.ZERO_BYTES_SENT),
+            (b"U", DispatchOutcome.UNCERTAIN),
+        ]:
+            with self.subTest(raw=raw):
+                client, peer = socket.socketpair()
+                with client, peer:
+                    peer.sendall(raw)
+                    exchange = RelayExchange(Wire(client, time.monotonic() + 1), b"request", pause=False)
+                    self.assertIs(exchange.receipt(), expected)
+                    self.assertEqual(peer.recv(12), b"N\x00\x00\x00\x07request")
+        client, peer = socket.socketpair()
+        with client, peer:
+            exchange = RelayExchange(Wire(client, time.monotonic() + 1), b"request", pause=False)
+            peer.shutdown(socket.SHUT_WR)
+            self.assertIs(exchange.receipt(), DispatchOutcome.UNCERTAIN)
+
+    def test_turn_filters_session_input_and_assistant_identity(self):
+        turn = TurnEvents(TurnPins("local-poc", "inc", "ses_pinned", "msg_pinned", 1))
+
+        delta = event("session.text.delta", assistantMessageID="msg_native", ordinal=0, delta="fixture")
+        terminal = event("session.execution.succeeded")
+        self.assertIsNone(turn.accept(delta))
+        self.assertIsNone(turn.accept(event("session.inbox.delivered", "ses_other", inboxID="msg_pinned")))
+        self.assertIsNone(turn.accept(event("session.inbox.delivered", inboxID="msg_other")))
+        self.assertIsNone(turn.accept(terminal))
+        self.assertIsNone(turn.accept(event("session.inbox.delivered", inboxID="msg_pinned")))
+        self.assertIsNone(turn.accept(delta))
+        self.assertIsNone(turn.accept(event("session.step.started", assistantMessageID="msg_native")))
+        self.assertEqual(turn.accept(delta), TurnEvent("text_delta", "fixture", ("msg_native", 0)))
+        self.assertIsNone(turn.accept(event("session.execution.succeeded", "ses_other")))
+        self.assertEqual(turn.accept(terminal), TurnEvent("turn_completed"))
+
+    def test_marker_assembles_only_within_one_assistant_text_part(self):
+        pins = TurnPins("local-poc", "inc", "ses_pinned", "msg_pinned", 1)
+        prefix = [
+            event("session.inbox.delivered", inboxID="msg_pinned"),
+            event("session.step.started", assistantMessageID="msg_one"),
+            event("session.step.started", assistantMessageID="msg_two"),
+            event("session.text.delta", assistantMessageID="msg_one", ordinal=0, delta="fixture "),
+        ]
+        terminal = event("session.execution.succeeded")
+        for assistant, ordinal in [("msg_one", 1), ("msg_two", 0), ("msg_one", None), ("msg_one", False)]:
+            with self.subTest(assistant=assistant, ordinal=ordinal):
+                unrelated = event("session.text.delta", assistantMessageID=assistant, ordinal=ordinal, delta="text")
+                with self.assertRaisesRegex(ProbeError, "before the expected text delta"):
+                    observe([*prefix, unrelated, terminal], TurnEvents(pins), "fixture text", wait_for_terminal=False)
+
+        interleaved = event("session.text.delta", assistantMessageID="msg_one", ordinal=1, delta="other")
+        matching = event("session.text.delta", assistantMessageID="msg_one", ordinal=0, delta="text")
+        observe([*prefix, interleaved, matching, terminal], TurnEvents(pins), "fixture text", wait_for_terminal=False)
+
+
+if __name__ == "__main__":
+    unittest.main()
