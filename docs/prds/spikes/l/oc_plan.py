@@ -16,9 +16,11 @@ from oc_schema import (
     CAPABILITY_PROVIDES_RE,
     CAPABILITY_REQUIRES_RE,
     EXPOSURE_RANK,
+    MAX_DAG_NODES,
     MAX_INSTRUCTIONS_TOTAL_BYTES,
     MAX_MISE_MANIFESTS,
     MAX_MISE_TOOLS,
+    MAX_MISSION_BYTES,
     MAX_SLOT_FILE_BYTES,
     SLOT_TOKEN_RE,
     PolicyError,
@@ -32,6 +34,7 @@ from oc_schema import (
     security_profile_elevates,
     sha256_canonical_json,
     validate_opaque_id,
+    validate_port_request,
     validate_remote_endpoint_url,
 )
 
@@ -86,6 +89,8 @@ def _resolve_bundle_dag(
             raise PlanError(f"Cycle detected in bundle includes: {cycle}")
         if st == 2:
             return
+        if len(ordered) + len(stack) >= MAX_DAG_NODES:
+            raise PlanError(f"Bundle DAG exceeds maximum {MAX_DAG_NODES} nodes")
         state[bid] = 1
         doc = store.get("bundle", bid)
         for inc in doc["includes"]:
@@ -126,7 +131,7 @@ def _check_fallback_non_escalating(primary: dict[str, Any], fallback: dict[str, 
 
 
 def _check_no_builtin_capability_downgrade(store: PlanStoreView, svc: dict[str, Any]) -> None:
-    """Prevent non-builtin services from claiming a builtin/* capability with weaker security."""
+    """Enforce builtin/* capability security floors across ALL endpoints (regardless of port number)."""
     if is_builtin_id(svc["id"]):
         return
     builtin_services = [
@@ -142,22 +147,32 @@ def _check_no_builtin_capability_downgrade(store: PlanStoreView, svc: dict[str, 
                 bcm = CAPABILITY_PROVIDES_RE.fullmatch(bcap)
                 if not bcm or bcm.group(1) != cap_name:
                     continue
-                b_eps = {ep["port"]: ep for ep in bsvc["endpoints"]}
+                if not security_profile_allows_fallback(bsvc["security_profile"], svc["security_profile"]):
+                    raise PolicyError(
+                        f"Service {svc['id']!r} cannot provide {cap_name} with elevated security_profile "
+                        f"{svc['security_profile']!r} over builtin {bsvc['security_profile']!r}"
+                    )
+                if not bsvc["endpoints"]:
+                    continue
+                builtin_max_rank = max(EXPOSURE_RANK[ep["max_exposure"]] for ep in bsvc["endpoints"])
+                builtin_requires_auth = any(ep["requires_auth"] for ep in bsvc["endpoints"])
+                builtin_enforcers = {
+                    ep["auth_enforcer"] for ep in bsvc["endpoints"] if ep["auth_enforcer"]
+                }
                 for ep in svc["endpoints"]:
-                    bep = b_eps.get(ep["port"])
-                    if bep is None:
-                        continue
-                    if bep["requires_auth"] and not ep["requires_auth"]:
+                    if EXPOSURE_RANK[ep["max_exposure"]] > builtin_max_rank:
                         raise PolicyError(
-                            f"Service {svc['id']!r} cannot provide {cap_name} with weakened requires_auth"
+                            f"Service {svc['id']!r} cannot provide {cap_name} with widened max_exposure "
+                            f"{ep['max_exposure']!r} on port {ep['port']}"
                         )
-                    if EXPOSURE_RANK[ep["max_exposure"]] > EXPOSURE_RANK[bep["max_exposure"]]:
+                    if builtin_requires_auth and not ep["requires_auth"]:
                         raise PolicyError(
-                            f"Service {svc['id']!r} cannot provide {cap_name} with widened max_exposure"
+                            f"Service {svc['id']!r} cannot provide {cap_name} with weakened requires_auth "
+                            f"on port {ep['port']}"
                         )
-                    if bep["auth_enforcer"] and ep["auth_enforcer"] != bep["auth_enforcer"]:
+                    if builtin_enforcers and ep["auth_enforcer"] not in builtin_enforcers:
                         raise PolicyError(
-                            f"Service {svc['id']!r} cannot replace builtin auth_enforcer {bep['auth_enforcer']!r}"
+                            f"Service {svc['id']!r} cannot replace builtin auth_enforcer on port {ep['port']}"
                         )
 
 
@@ -172,10 +187,11 @@ def _select_service_for_requirement(
     store: PlanStoreView,
     req: dict[str, Any],
     worker_caps: dict[str, Any],
-) -> tuple[dict[str, Any], str | None]:
+) -> tuple[dict[str, Any], str | None, int | None]:
     target = req["target"]
     explicit_provider = req.get("provider")
     instance_alias = req.get("instance")
+    instance_port_override = req.get("instance_port")
 
     if CAPABILITY_REQUIRES_RE.fullmatch(target):
         if explicit_provider is not None:
@@ -229,28 +245,33 @@ def _select_service_for_requirement(
         raise PlanError(
             f"Service {primary['id']!r} has cardinality={primary['cardinality']!r}, cannot bind instance {instance_alias!r}"
         )
+    if instance_port_override is not None and primary["cardinality"] != "named-instance":
+        raise PlanError(
+            f"instance_port override only allowed for named-instance services, not {primary['id']!r}"
+        )
     if primary["cardinality"] == "named-instance" and instance_alias is None:
         instance_alias = primary["id"].replace("/", "-")
-    return primary, instance_alias
+    return primary, instance_alias, instance_port_override
 
 
 def _resolve_service_dag(
     store: PlanStoreView,
     active_roots: list[dict[str, Any]],
     worker_caps: dict[str, Any],
+    *,
+    prior_node_count: int = 0,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str, int]]]:
     """Resolve recursive service DAG with fallback selection, diamond checks, and Kahn sort."""
     selected: dict[str, dict[str, Any]] = {}  # key -> resolved node
     deps_of: dict[str, set[str]] = {}
-    cap_constraints: dict[str, list[str]] = {}  # service_key -> all capability constraints targeting it
+    cap_constraints: dict[str, list[str]] = {}
     visiting: list[str] = []
 
     def resolve_req(req: dict[str, Any]) -> str:
-        svc, inst = _select_service_for_requirement(store, req, worker_caps)
+        svc, inst, inst_port = _select_service_for_requirement(store, req, worker_caps)
         node_key = f"{svc['id']}@{inst}" if inst else svc["id"]
         if CAPABILITY_REQUIRES_RE.fullmatch(req["target"]):
             cap_constraints.setdefault(node_key, []).append(req["target"])
-            # Verify diamond compatibility against all existing constraints on this node
             for c in cap_constraints[node_key]:
                 if not any(capability_satisfies(p, c) for p in svc["provides"]):
                     raise PlanError(f"Incompatible diamond constraint {c!r} on {node_key!r}")
@@ -258,7 +279,16 @@ def _resolve_service_dag(
             cycle = " -> ".join(visiting[visiting.index(node_key) :] + [node_key])
             raise PlanError(f"Cycle detected in service dependencies: {cycle}")
         if node_key in selected:
+            prev_port = selected[node_key]["instance_port"]
+            if inst_port is not None and prev_port is not None and inst_port != prev_port:
+                raise PlanError(
+                    f"Conflicting instance_port for {node_key!r}: {prev_port} vs {inst_port}"
+                )
+            if inst_port is not None and prev_port is None:
+                selected[node_key]["instance_port"] = inst_port
             return node_key
+        if prior_node_count + len(selected) + len(visiting) >= MAX_DAG_NODES:
+            raise PlanError(f"Resolved DAG exceeds maximum {MAX_DAG_NODES} nodes")
         visiting.append(node_key)
         node_deps: set[str] = set()
         for child_req in svc["requires"]:
@@ -268,6 +298,7 @@ def _resolve_service_dag(
         selected[node_key] = {
             "key": node_key,
             "instance": inst,
+            "instance_port": inst_port if inst_port is not None else svc.get("instance_port"),
             "doc": svc,
         }
         deps_of[node_key] = node_deps
@@ -309,7 +340,7 @@ def _resolve_service_dag(
     if len(ordered_keys) != len(selected):
         raise PlanError("Cycle detected in service DAG")
 
-    # Pod port-collision validation across all resolved services (accounting for named-instance ports)
+    # Pod port-collision validation across all resolved services (accounting for per-instance ports)
     used_pod_ports: dict[int, str] = {}
     resolved_services: list[dict[str, Any]] = []
     closure: list[tuple[str, str, int]] = []
@@ -318,11 +349,12 @@ def _resolve_service_dag(
         node = selected[key]
         svc = node["doc"]
         inst = node["instance"]
+        eff_inst_port = node["instance_port"]
         effective_endpoints = []
         for idx, ep in enumerate(svc["endpoints"]):
             port = ep["port"]
-            if svc["cardinality"] == "named-instance" and svc.get("instance_port") is not None and idx == 0:
-                port = svc["instance_port"]
+            if svc["cardinality"] == "named-instance" and eff_inst_port is not None and idx == 0:
+                port = eff_inst_port
             if port in used_pod_ports:
                 raise PlanError(
                     f"Pod port collision on {port}: both {used_pod_ports[port]!r} and {key!r} bind port {port}"
@@ -351,6 +383,10 @@ def _compile_endpoints(
     type_ports: list[dict[str, Any]],
     cli_ports: tuple[dict[str, Any], ...],
 ) -> list[dict[str, Any]]:
+    id_counts: dict[str, int] = {}
+    for rsvc in resolved_services:
+        id_counts[rsvc["id"]] = id_counts.get(rsvc["id"], 0) + 1
+
     by_svc_ep: dict[tuple[str, str], dict[str, Any]] = {}
     out: list[dict[str, Any]] = []
 
@@ -370,16 +406,23 @@ def _compile_endpoints(
                 "host_port": None,
                 "host_url_template": ep["host_url_template"],
             }
-            by_svc_ep[(rsvc["id"], ep["name"])] = entry
             by_svc_ep[(rsvc["key"], ep["name"])] = entry
+            # Only bind short (id, ep) alias when that service id is unique in the plan
+            if id_counts[rsvc["id"]] == 1:
+                by_svc_ep[(rsvc["id"], ep["name"])] = entry
             out.append(entry)
 
     used_host_ports: dict[int, str] = {}
-    for req in list(type_ports) + list(cli_ports):
+    validated_cli = [validate_port_request(p, f"cli_ports[{i}]") for i, p in enumerate(cli_ports)]
+    for req in list(type_ports) + validated_cli:
         svc_ref = req["service"]
         ep_name = req["endpoint"]
-        desired_exp = req.get("exposure", "host-loopback")
-        host_port = req.get("host_port")
+        desired_exp = req["exposure"]
+        host_port = req["host_port"]
+        if "@" not in svc_ref and id_counts.get(svc_ref, 0) > 1:
+            raise PlanError(
+                f"Ambiguous port target {svc_ref}:{ep_name}; specify named instance as '{svc_ref}@<instance>'"
+            )
         entry = by_svc_ep.get((svc_ref, ep_name))
         if entry is None:
             raise PolicyError(
@@ -395,13 +438,12 @@ def _compile_endpoints(
                 f"but no auth_enforcer is configured"
             )
         if host_port is not None:
-            if host_port in used_host_ports and used_host_ports[host_port] != f"{svc_ref}:{ep_name}":
+            if host_port in used_host_ports and used_host_ports[host_port] != f"{entry['service_key']}:{ep_name}":
                 raise PlanError(f"Duplicate host_port {host_port}")
-            used_host_ports[host_port] = f"{svc_ref}:{ep_name}"
+            used_host_ports[host_port] = f"{entry['service_key']}:{ep_name}"
         entry["exposure"] = desired_exp
         entry["host_port"] = host_port
 
-    # Validate any host_url_template rendering cleanly with safe sample placeholders
     for entry in out:
         if entry["host_url_template"] and entry["exposure"] != "pod-only":
             render_host_url(
@@ -476,15 +518,14 @@ def _compile_role_contract(
                     f"Conflicting primary persona between {primary_owner!r} and {bid!r}; "
                     f"declare [composition] replace = ['persona'] explicitly"
                 )
-            if primary_persona is not None and primary_owner and is_builtin_id(primary_owner):
-                # Replacing persona is allowed (user can specialize a builtin persona),
-                # but builtin security invariants in services remain untouched.
-                pass
+            expanded_mission = _expand_slots_single_pass(
+                b["persona"]["mission"], bid, b["prompt_slots"], broot
+            )
+            if len(expanded_mission.encode("utf-8")) > MAX_MISSION_BYTES:
+                raise SchemaError(f"Expanded persona.mission in {bid!r} exceeds {MAX_MISSION_BYTES} bytes")
             primary_persona = {
                 **b["persona"],
-                "mission": _expand_slots_single_pass(
-                    b["persona"]["mission"], bid, b["prompt_slots"], broot
-                ),
+                "mission": expanded_mission,
             }
             primary_owner = bid
 
@@ -556,7 +597,6 @@ def _compile_role_contract(
             "allowed_tools": tools,
         }
 
-    # Auto-generate SERVICES.md from resolved services (never drifts)
     service_lines = ["# Active Sandbox Services", ""]
     if not resolved_services:
         service_lines.append("- None")
@@ -595,7 +635,7 @@ def _merge_mise_tools(
     overrides: dict[str, str],
 ) -> dict[str, str]:
     manifest_count = 0
-    merged: dict[str, tuple[str, str]] = {}  # tool -> (version, source)
+    merged: dict[str, tuple[str, str]] = {}
     sources = [(b["id"], b["mise_tools"]) for b in bundles] + [
         (rs["id"], rs["doc"]["mise_tools"]) for rs in resolved_services
     ]
@@ -631,6 +671,17 @@ def _bind_image_for_arch(image: str | None, images_by_arch: dict[str, str] | Non
     return image
 
 
+def _runtime_role_projection(plan: dict[str, Any]) -> dict[str, Any]:
+    """Runtime-affecting subset of role_contract (changes here require container/process recreation)."""
+    rc = plan.get("role_contract", {})
+    oc = rc.get("opencode_config", {})
+    return {
+        "default_agent": rc.get("default_agent"),
+        "mcp": oc.get("mcp"),
+        "managed_workspace_lockout": oc.get("managed_workspace_lockout"),
+    }
+
+
 def classify_drift(applied_plan: dict[str, Any] | None, desired_plan: dict[str, Any]) -> dict[str, Any]:
     if applied_plan is None:
         return {"kind": "fresh", "reasons": ["no_applied_plan"]}
@@ -638,7 +689,6 @@ def classify_drift(applied_plan: dict[str, Any] | None, desired_plan: dict[str, 
         return {"kind": "none", "reasons": []}
 
     reasons: list[str] = []
-    # Check stateful volume / durable service changes first -> fail-closed migration required
     old_svcs = {s["key"]: s for s in applied_plan.get("services", [])}
     new_svcs = {s["key"]: s for s in desired_plan.get("services", [])}
     for key, old_s in old_svcs.items():
@@ -653,11 +703,11 @@ def classify_drift(applied_plan: dict[str, Any] | None, desired_plan: dict[str, 
     if reasons:
         return {"kind": "stateful-migration-required", "reasons": sorted(reasons)}
 
-    # Check if only role instructions/skills changed (hot-safe) vs container/ports/tools (recreate-stateless)
+    # Only non-runtime prose/skills changes are hot-safe; MCP/default_agent/lockout changes require recreate-stateless
     stripped_old = {k: v for k, v in applied_plan.items() if k != "role_contract"}
     stripped_new = {k: v for k, v in desired_plan.items() if k != "role_contract"}
-    if stripped_old == stripped_new:
-        return {"kind": "hot-safe", "reasons": ["role_contract_updated"]}
+    if stripped_old == stripped_new and _runtime_role_projection(applied_plan) == _runtime_role_projection(desired_plan):
+        return {"kind": "hot-safe", "reasons": ["role_instructions_or_skills_updated"]}
     return {"kind": "recreate-stateless", "reasons": ["runtime_plan_changed"]}
 
 
@@ -682,7 +732,6 @@ def compile_plan(
 
     bundles, bundle_closure = _resolve_bundle_dag(store, st["bundles"], ov.with_mods, ov.without_mods)
 
-    # Collect active roots with [local] conditional pruning + remote endpoint policy
     active_roots: list[dict[str, Any]] = []
     remote_bindings: dict[str, str] = {}
     for b in bundles:
@@ -700,7 +749,12 @@ def compile_plan(
                 remote_bindings[bkey] = validated
             else:
                 active_roots.append(
-                    {"target": lsvc["service"], "provider": None, "instance": lsvc["instance"]}
+                    {
+                        "target": lsvc["service"],
+                        "provider": None,
+                        "instance": lsvc["instance"],
+                        "instance_port": lsvc.get("instance_port"),
+                    }
                 )
         for mcfg in b["mcp"].values():
             if mcfg["local"] is not None:
@@ -715,7 +769,7 @@ def compile_plan(
                     remote_bindings[bkey] = validated
                 else:
                     active_roots.append(
-                        {"target": mcfg["local"]["service"], "provider": None, "instance": None}
+                        {"target": mcfg["local"]["service"], "provider": None, "instance": None, "instance_port": None}
                     )
 
     if active_roots and not bool(worker_caps.get("supports_pods", False)):
@@ -724,7 +778,9 @@ def compile_plan(
             f"cannot run sidecar services"
         )
 
-    resolved_services, svc_closure = _resolve_service_dag(store, active_roots, worker_caps)
+    resolved_services, svc_closure = _resolve_service_dag(
+        store, active_roots, worker_caps, prior_node_count=len(bundles)
+    )
     endpoints = _compile_endpoints(resolved_services, st["ports"], ov.cli_ports)
     role = _compile_role_contract(
         store, bundles, st["default_agent"], resolved_services, remote_bindings, st["tier"]
@@ -820,6 +876,23 @@ def compute_closed_security_delta(
         new_p = new_plans[st_id].plan if st_id in new_plans else None
         if new_p is None:
             continue
+
+        # Sandbox-type level changes: base_image, tier downgrade, topology downgrade
+        if old_p is not None:
+            if old_p["base_image"] != new_p["base_image"]:
+                triggers.add("service_image_changed")
+                details.append({"trigger": "service_image_changed", "sandbox_type": st_id, "service": "base_image"})
+            if old_p["tier"] == "managed" and new_p["tier"] == "interactive":
+                triggers.add("security_profile_elevation")
+                details.append({"trigger": "security_profile_elevation", "sandbox_type": st_id, "change": "tier:managed->interactive"})
+            if old_p["topology"] == "isolated-sidecars" and new_p["topology"] == "pod-shared":
+                triggers.add("security_profile_elevation")
+                details.append({"trigger": "security_profile_elevation", "sandbox_type": st_id, "change": "topology:isolated-sidecars->pod-shared"})
+        else:
+            if new_p["tier"] == "interactive" or new_p["topology"] == "pod-shared":
+                triggers.add("security_profile_elevation")
+                details.append({"trigger": "security_profile_elevation", "sandbox_type": st_id, "change": "new_elevated_tier_or_topology"})
+
         old_svcs = {s["key"]: s for s in (old_p["services"] if old_p else [])}
         new_svcs = {s["key"]: s for s in new_p["services"]}
 
@@ -868,8 +941,18 @@ def compute_closed_security_delta(
         for mname, mcfg in new_mcp.items():
             if mname not in old_mcp:
                 triggers.add("new_mcp_server_added")
-            elif set(mcfg["allowed_tools"]) - set(old_mcp[mname]["allowed_tools"]):
-                triggers.add("mcp_tool_surface_widened")
+            else:
+                om = old_mcp[mname]
+                if (
+                    set(mcfg["allowed_tools"]) - set(om["allowed_tools"])
+                    or mcfg.get("url") != om.get("url")
+                    or mcfg.get("artifact_id") != om.get("artifact_id")
+                    or mcfg.get("args") != om.get("args")
+                    or mcfg.get("headers") != om.get("headers")
+                    or mcfg.get("secret_env") != om.get("secret_env")
+                ):
+                    triggers.add("mcp_tool_surface_widened")
+                    details.append({"trigger": "mcp_tool_surface_widened", "sandbox_type": st_id, "mcp": mname})
 
         old_mise = old_p["mise_tools"] if old_p else {}
         if any(k not in old_mise or old_mise[k] != v for k, v in new_p["mise_tools"].items()):

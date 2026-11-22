@@ -19,10 +19,10 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import stat
 import struct
 import threading
 import time
-import tomllib
 from typing import Any
 
 from oc_plan import PlanError, PlanOverrides, compile_plan, redact_plan_summary
@@ -35,19 +35,30 @@ from oc_schema import (
     SECURITY_DELTA_TRIGGERS,
     PolicyError,
     SchemaError,
+    assert_trusted_dir,
     canonical_json,
+    check_not_in_sandbox,
     is_builtin_id,
+    parse_toml_strict,
     validate_doc_by_kind,
     validate_opaque_id,
+    validate_port_request,
 )
 from oc_store import ConflictError, HostConfigStore, StoreError
 
 MAX_FRAME_BYTES = 262_144
+MAX_RESPONSE_BYTES = 524_288
 MAX_JSON_DEPTH = 32
 MAX_CONCURRENT_CONNS = 8
 READ_TIMEOUT_SECONDS = 5.0
+WRITE_TIMEOUT_SECONDS = 5.0
 TOTAL_REQUEST_TIMEOUT_SECONDS = 15.0
 MAX_PREVIEW_DRAFT_OBJECTS = 16
+
+ALLOWED_HEADERS = frozenset({"content-length", "content-type"})
+ALLOWED_RPC_KEYS = frozenset({"jsonrpc", "id", "auth_token", "method", "params"})
+ALLOWED_DRAFT_KEYS = frozenset({"kind", "id", "toml"})
+ALLOWED_OVERRIDE_KEYS = frozenset({"with_mods", "without_mods", "env_bindings", "cli_ports"})
 
 ALLOWED_MCP_METHODS = frozenset(
     {
@@ -144,7 +155,12 @@ def read_content_length_frame(
         if rem <= 0:
             raise FramingError("Request deadline exceeded")
         conn.settimeout(min(read_timeout, rem))
-        return conn.recv(limit)
+        try:
+            return conn.recv(limit)
+        except (TimeoutError, socket.timeout) as exc:
+            raise FramingError("Socket read timeout") from exc
+        except OSError as exc:
+            raise FramingError(f"Socket read error: {exc}") from exc
 
     while header_end == -1:
         chunk = _recv_into(1024)
@@ -157,18 +173,27 @@ def read_content_length_frame(
 
     header_bytes = bytes(buf[:header_end])
     rest = bytes(buf[header_end + 4 :])
+    try:
+        header_text = header_bytes.decode("ascii", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise FramingError("Non-ASCII header bytes rejected") from exc
+
     headers: dict[str, str] = {}
-    for line in header_bytes.decode("ascii", errors="strict").split("\r\n"):
+    for line in header_text.split("\r\n"):
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in line):
+            raise FramingError("Control character rejected in header")
         if ":" not in line:
             raise FramingError("Malformed header line")
         k, v = line.split(":", 1)
         lk = k.strip().lower()
+        if lk not in ALLOWED_HEADERS:
+            raise FramingError(f"Unsupported header rejected: {lk}")
         if lk in headers:
             raise FramingError(f"Duplicate header: {lk}")
         headers[lk] = v.strip()
 
     cl_raw = headers.get("content-length")
-    if cl_raw is None or not cl_raw.isdigit():
+    if cl_raw is None or not (cl_raw.isascii() and cl_raw.isdigit()):
         raise FramingError("Missing or invalid Content-Length")
     content_length = int(cl_raw)
     if content_length <= 0 or content_length > max_bytes:
@@ -191,10 +216,10 @@ def read_content_length_frame(
         extra = conn.recv(1, socket.MSG_PEEK)
         if extra:
             raise FramingError("Pipelined trailing bytes rejected")
-    except (BlockingIOError, ConnectionResetError):
+    except (BlockingIOError, ConnectionResetError, OSError):
         pass
     finally:
-        conn.setblocking(True)
+        conn.settimeout(read_timeout)
 
     return bytes(body)
 
@@ -253,10 +278,13 @@ class OrchestratorConfigMcpServer:
         expected_uid: int | None = None,
         rate_limit_max: int = 60,
         rate_limit_window: float = 60.0,
+        write_timeout: float = WRITE_TIMEOUT_SECONDS,
     ):
         self.store = store
-        self.socket_dir = socket_dir.resolve()
+        self._raw_socket_dir = Path(socket_dir)
+        self.socket_dir = self._raw_socket_dir
         self.expected_uid = os.geteuid() if expected_uid is None else expected_uid
+        self._write_timeout = write_timeout
         self.session_token = secrets.token_hex(32)  # per-incarnation 256-bit token
         self.rate_limiter = SlidingWindowRateLimiter(rate_limit_max, rate_limit_window)
         self._conn_sem = threading.BoundedSemaphore(MAX_CONCURRENT_CONNS)
@@ -266,10 +294,20 @@ class OrchestratorConfigMcpServer:
         self.socket_path: Path | None = None
 
     def start(self) -> Path:
-        self.socket_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.socket_dir, 0o700)
+        check_not_in_sandbox(self._raw_socket_dir, self.store.sandbox_root)
+        if self._raw_socket_dir.is_symlink():
+            raise PolicyError(f"Expected non-symlink socket_dir: {self._raw_socket_dir}")
+        self._raw_socket_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self._raw_socket_dir, 0o700)
+        self.socket_dir = assert_trusted_dir(self._raw_socket_dir, sandbox_root=self.store.sandbox_root)
         sock_path = self.socket_dir / "mcp.sock"
-        if sock_path.exists():
+        try:
+            st = os.lstat(sock_path)
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            if not stat.S_ISSOCK(st.st_mode):
+                raise PolicyError(f"Refusing to unlink non-socket path: {sock_path}")
             sock_path.unlink()
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         old_umask = os.umask(0o177)
@@ -295,9 +333,11 @@ class OrchestratorConfigMcpServer:
                 pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        if self.socket_path is not None and self.socket_path.exists():
+        if self.socket_path is not None:
             try:
-                self.socket_path.unlink()
+                st = os.lstat(self.socket_path)
+                if stat.S_ISSOCK(st.st_mode):
+                    self.socket_path.unlink()
             except OSError:
                 pass
 
@@ -332,7 +372,15 @@ class OrchestratorConfigMcpServer:
                 self._send(conn, self._error(None, -32700, str(exc)))
                 return
 
+            extra_rpc = set(req.keys()) - ALLOWED_RPC_KEYS
+            if extra_rpc:
+                self._send(conn, self._error(None, -32600, "unknown_rpc_keys"))
+                return
+
             req_id = req.get("id")
+            if req_id is not None and not (type(req_id) is str or type(req_id) is int):
+                self._send(conn, self._error(None, -32600, "invalid_request_id"))
+                return
             if req.get("jsonrpc") != "2.0":
                 self._send(conn, self._error(req_id, -32600, "invalid_jsonrpc_version"))
                 return
@@ -350,7 +398,10 @@ class OrchestratorConfigMcpServer:
                 self._send(conn, self._error(req_id, -32602, "params_must_be_object"))
                 return
 
-            resp = self._dispatch(req_id, method, params)
+            try:
+                resp = self._dispatch(req_id, method, params)
+            except Exception:
+                resp = self._error(req_id, -32603, "internal_error")
             self._send(conn, resp)
         finally:
             try:
@@ -360,8 +411,14 @@ class OrchestratorConfigMcpServer:
 
     def _send(self, conn: socket.socket, payload: dict[str, Any]) -> None:
         try:
-            conn.sendall(encode_content_length_frame(payload))
-        except OSError:
+            frame = encode_content_length_frame(payload)
+            if len(frame) > MAX_RESPONSE_BYTES:
+                frame = encode_content_length_frame(
+                    self._error(payload.get("id"), -32603, "response_too_large")
+                )
+            conn.settimeout(self._write_timeout)
+            conn.sendall(frame)
+        except (TimeoutError, OSError):
             pass
 
     @staticmethod
@@ -373,6 +430,19 @@ class OrchestratorConfigMcpServer:
         return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
     @staticmethod
+    def _check_closed_params(params: dict[str, Any], allowed: frozenset[str], method: str) -> None:
+        extra = sorted(set(params.keys()) - allowed)
+        if extra:
+            raise SchemaError(f"Unknown params for {method}: {', '.join(extra)}")
+
+    @staticmethod
+    def _require_bool_param(params: dict[str, Any], key: str, default: bool = False) -> bool:
+        val = params.get(key, default)
+        if type(val) is not bool:
+            raise SchemaError(f"{key} must be boolean")
+        return val
+
+    @staticmethod
     def _validate_paging(params: dict[str, Any]) -> tuple[int, int]:
         limit = params.get("limit", 50)
         if type(limit) is not int or not (1 <= limit <= 100):
@@ -381,7 +451,11 @@ class OrchestratorConfigMcpServer:
         if cursor is None:
             offset = 0
         else:
-            if type(cursor) is not str or not cursor.startswith("off:") or not cursor[4:].isdigit():
+            if (
+                type(cursor) is not str
+                or not cursor.startswith("off:")
+                or not (cursor[4:].isascii() and cursor[4:].isdigit())
+            ):
                 raise SchemaError("invalid paging cursor")
             offset = int(cursor[4:])
         return offset, limit
@@ -389,6 +463,7 @@ class OrchestratorConfigMcpServer:
     def _dispatch(self, req_id: Any, method: str, params: dict[str, Any]) -> dict[str, Any]:
         try:
             if method == "config_schema":
+                self._check_closed_params(params, frozenset({"kind"}), method)
                 kind = params.get("kind")
                 if kind is not None and kind not in READABLE_ORCHESTRATOR_KINDS:
                     raise SchemaError(f"Unknown kind: {kind!r}")
@@ -404,10 +479,13 @@ class OrchestratorConfigMcpServer:
                 )
 
             if method == "config_list":
+                self._check_closed_params(
+                    params, frozenset({"kind", "include_archived", "limit", "cursor"}), method
+                )
                 kind = params.get("kind")
                 if kind not in READABLE_ORCHESTRATOR_KINDS:
                     raise SchemaError(f"Unsupported kind: {kind!r}")
-                include_archived = bool(params.get("include_archived", False))
+                include_archived = self._require_bool_param(params, "include_archived", False)
                 offset, limit = self._validate_paging(params)
                 ids = self.store.list_ids(kind, include_archived=include_archived)
                 page = ids[offset : offset + limit]
@@ -424,11 +502,13 @@ class OrchestratorConfigMcpServer:
                 return self._ok(req_id, {"items": items, "next_cursor": next_cursor})
 
             if method == "config_get":
+                self._check_closed_params(params, frozenset({"kind", "id", "include_archived"}), method)
                 kind = params.get("kind")
                 if kind not in READABLE_ORCHESTRATOR_KINDS:
                     raise SchemaError(f"Unsupported kind: {kind!r}")
                 oid = validate_opaque_id(params.get("id"), label="id")
-                doc = self.store.get(kind, oid, include_archived=bool(params.get("include_archived", False)))
+                include_archived = self._require_bool_param(params, "include_archived", False)
+                doc = self.store.get(kind, oid, include_archived=include_archived)
                 return self._ok(
                     req_id,
                     {
@@ -441,6 +521,7 @@ class OrchestratorConfigMcpServer:
                 )
 
             if method == "config_history":
+                self._check_closed_params(params, frozenset({"kind", "id", "limit", "cursor"}), method)
                 kind = params.get("kind")
                 if kind not in READABLE_ORCHESTRATOR_KINDS:
                     raise SchemaError(f"Unsupported kind: {kind!r}")
@@ -452,6 +533,7 @@ class OrchestratorConfigMcpServer:
                 return self._ok(req_id, {"history": page, "next_cursor": next_cursor})
 
             if method == "config_diff":
+                self._check_closed_params(params, frozenset({"kind", "id", "from_rev", "to_rev"}), method)
                 kind = params.get("kind")
                 if kind not in READABLE_ORCHESTRATOR_KINDS:
                     raise SchemaError(f"Unsupported kind: {kind!r}")
@@ -460,12 +542,21 @@ class OrchestratorConfigMcpServer:
                 to_rev = params.get("to_rev")
                 if type(from_rev) is not int or type(to_rev) is not int or from_rev < 1 or to_rev < 1:
                     raise SchemaError("from_rev and to_rev must be positive integers")
-                a = self.store.get_revision_toml(kind, oid, from_rev).splitlines(keepends=True)
-                b = self.store.get_revision_toml(kind, oid, to_rev).splitlines(keepends=True)
+                doc_a = _redact_object_for_orchestrator(
+                    kind, self.store.get_revision_doc(kind, oid, from_rev)
+                )
+                doc_b = _redact_object_for_orchestrator(
+                    kind, self.store.get_revision_doc(kind, oid, to_rev)
+                )
+                a = (json.dumps(doc_a, indent=2, sort_keys=True) + "\n").splitlines(keepends=True)
+                b = (json.dumps(doc_b, indent=2, sort_keys=True) + "\n").splitlines(keepends=True)
                 diff = "".join(difflib.unified_diff(a, b, fromfile=f"r{from_rev}", tofile=f"r{to_rev}"))
                 return self._ok(req_id, {"diff": diff})
 
             if method == "plan_preview":
+                self._check_closed_params(
+                    params, frozenset({"sandbox_type", "worker", "draft", "overrides"}), method
+                )
                 st_id = validate_opaque_id(params.get("sandbox_type"), label="sandbox_type")
                 worker_id = params.get("worker")
                 if worker_id is not None:
@@ -479,17 +570,25 @@ class OrchestratorConfigMcpServer:
                     for item in draft:
                         if not isinstance(item, dict):
                             raise SchemaError("draft entry must be object")
+                        extra_draft = sorted(set(item.keys()) - ALLOWED_DRAFT_KEYS)
+                        if extra_draft:
+                            raise SchemaError(f"Unknown keys in draft entry: {', '.join(extra_draft)}")
                         dkind = item.get("kind")
                         if dkind not in MUTABLE_ORCHESTRATOR_KINDS:
                             raise PolicyError(f"Draft kind {dkind!r} not allowed")
                         did = validate_opaque_id(item.get("id"), label="draft.id")
                         if is_builtin_id(did):
                             raise PolicyError("Draft may not overlay builtin/*")
+                        if (dkind, did) in entries:
+                            raise SchemaError(f"Duplicate draft entry for {dkind}/{did}")
                         dtoml = item.get("toml")
                         if type(dtoml) is not str or len(dtoml.encode("utf-8")) > MAX_CONFIG_FILE_BYTES:
                             raise SchemaError("draft.toml must be a bounded string")
                         doc = validate_doc_by_kind(
-                            dkind, tomllib.loads(dtoml), expected_id=did, for_orchestrator=True
+                            dkind,
+                            parse_toml_strict(dtoml, context=f"draft({dkind}/{did})"),
+                            expected_id=did,
+                            for_orchestrator=True,
                         )
                         entries[(dkind, did)] = ("upsert", doc)
                     view = self.store.with_in_memory_overlay(entries)
@@ -497,16 +596,48 @@ class OrchestratorConfigMcpServer:
                 raw_ov = params.get("overrides", {})
                 if not isinstance(raw_ov, dict):
                     raise SchemaError("overrides must be object")
+                extra_ov = sorted(set(raw_ov.keys()) - ALLOWED_OVERRIDE_KEYS)
+                if extra_ov:
+                    raise SchemaError(f"Unknown keys in overrides: {', '.join(extra_ov)}")
+
+                raw_with = raw_ov.get("with_mods", [])
+                raw_without = raw_ov.get("without_mods", [])
+                if not isinstance(raw_with, list) or not isinstance(raw_without, list):
+                    raise SchemaError("overrides.with_mods and without_mods must be lists")
+                with_mods = tuple(validate_opaque_id(x, label="overrides.with_mods[]") for x in raw_with)
+                without_mods = tuple(
+                    validate_opaque_id(x, label="overrides.without_mods[]") for x in raw_without
+                )
+
+                raw_env = raw_ov.get("env_bindings", {})
+                if not isinstance(raw_env, dict):
+                    raise SchemaError("overrides.env_bindings must be an object")
+                env_bindings: dict[str, str] = {}
+                for ek, ev in raw_env.items():
+                    if type(ek) is not str or type(ev) is not str:
+                        raise SchemaError("overrides.env_bindings keys and values must be strings")
+                    env_bindings[ek] = ev
+
+                raw_ports = raw_ov.get("cli_ports", [])
+                if not isinstance(raw_ports, list):
+                    raise SchemaError("overrides.cli_ports must be a list")
+                cli_ports = tuple(
+                    validate_port_request(p, "overrides.cli_ports[]") for p in raw_ports
+                )
+
                 ov = PlanOverrides(
-                    with_mods=tuple(raw_ov.get("with_mods", ())),
-                    without_mods=tuple(raw_ov.get("without_mods", ())),
-                    env_bindings=dict(raw_ov.get("env_bindings", {})),
-                    cli_ports=tuple(raw_ov.get("cli_ports", ())),
+                    with_mods=with_mods,
+                    without_mods=without_mods,
+                    env_bindings=env_bindings,
+                    cli_ports=cli_ports,
                 )
                 compiled = compile_plan(view, st_id, worker_id=worker_id, overrides=ov)
                 return self._ok(req_id, redact_plan_summary(compiled))
 
             if method == "config_propose_revision":
+                self._check_closed_params(
+                    params, frozenset({"kind", "id", "action", "proposed_toml"}), method
+                )
                 kind = params.get("kind")
                 if kind not in MUTABLE_ORCHESTRATOR_KINDS:
                     return self._error(req_id, -32003, "kind_or_namespace_not_mutable")

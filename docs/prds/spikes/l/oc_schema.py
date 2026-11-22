@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import tomllib
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -25,6 +26,10 @@ OPAQUE_ID_RE = re.compile(
 )
 SIMPLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$", re.ASCII)
 SLOT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$", re.ASCII)
+PROPOSAL_ID_RE = re.compile(r"^prop_[0-9a-f]{16}$", re.ASCII)
+SECRET_REF_GRAMMAR_RE = re.compile(r"^[a-z][a-z0-9_-]{0,23}:[a-zA-Z0-9._/@:-]{1,128}$", re.ASCII)
+DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.ASCII)
+NUMERIC_LABEL_RE = re.compile(r"^(?:0[xX][0-9a-fA-F]+|[0-9]+)$", re.ASCII)
 DIGEST_IMAGE_RE = re.compile(
     r"^[a-z0-9][a-z0-9._/:@-]{1,200}@sha256:[0-9a-f]{64}$",
     re.ASCII,
@@ -126,8 +131,10 @@ FORBIDDEN_ENV_SUFFIXES = (
 MAX_CONFIG_FILE_BYTES = 65_536
 MAX_SLOT_FILE_BYTES = 16_384
 MAX_INSTRUCTIONS_TOTAL_BYTES = 16_384
+MAX_MISSION_BYTES = 16_384
 MAX_MISE_MANIFESTS = 64
 MAX_MISE_TOOLS = 64
+MAX_DAG_NODES = 64
 
 
 class SchemaError(ValueError):
@@ -136,6 +143,16 @@ class SchemaError(ValueError):
 
 class PolicyError(ValueError):
     """Security policy violation (exposure, auth, fallback escalation, forbidden resource)."""
+
+
+def parse_toml_strict(text: str, *, context: str = "TOML") -> dict[str, Any]:
+    try:
+        parsed = tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, ValueError) as exc:
+        raise SchemaError(f"Malformed {context}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise SchemaError(f"{context} root must be a table")
+    return parsed
 
 
 def canonical_json(obj: Any) -> str:
@@ -176,10 +193,32 @@ def parse_mem_bytes(spec: str) -> int:
     return num * (1024**2 if unit == "m" else 1024**3)
 
 
+def _is_under(candidate: Path, root: Path) -> bool:
+    return candidate == root or root in candidate.parents
+
+
+def _walk_check_not_in_sandbox(path: Path, sb: Path, sb_raw: Path, depth: int) -> None:
+    if depth > 40:
+        raise PolicyError(f"Too many symlink hops checking trusted path: {path}")
+    abs_path = Path(os.path.abspath(str(path)))
+    cur = Path("/")
+    for part in abs_path.parts[1:]:
+        cur = cur / part
+        if _is_under(cur, sb) or _is_under(cur, sb_raw):
+            raise PolicyError(f"Refusing host-trusted path traversing sandbox root: {cur}")
+        if cur.is_symlink():
+            target = Path(os.readlink(cur))
+            hop = (cur.parent / target) if not target.is_absolute() else target
+            _walk_check_not_in_sandbox(hop, sb, sb_raw, depth + 1)
+
+
 def check_not_in_sandbox(path: Path, sandbox_root: Path | None = None) -> None:
+    """Component-by-component trusted_path walk rejecting any prefix or symlink hop inside $SB."""
     sb = (sandbox_root or (Path.home() / "opencode-sandbox")).resolve()
-    resolved = path.resolve()
-    if resolved == sb or sb in resolved.parents:
+    sb_raw = Path(os.path.abspath(str(sandbox_root or (Path.home() / "opencode-sandbox"))))
+    _walk_check_not_in_sandbox(path, sb, sb_raw, 0)
+    resolved = Path(os.path.abspath(str(path))).resolve()
+    if _is_under(resolved, sb) or _is_under(resolved, sb_raw):
         raise PolicyError(f"Refusing host-trusted path inside sandbox root: {resolved}")
 
 
@@ -204,7 +243,7 @@ def assert_trusted_dir(path: Path, *, sandbox_root: Path | None = None) -> Path:
         if cur.parent == cur:
             break
         cur = cur.parent
-    return path
+    return path.resolve()
 
 
 def read_regular_no_follow(
@@ -219,13 +258,15 @@ def read_regular_no_follow(
     check_not_in_sandbox(path, sandbox_root)
     if confined_root is not None:
         root_real = confined_root.resolve()
-        # Walk every component from confined_root to path with O_NOFOLLOW
         try:
             rel = path.relative_to(confined_root)
-        except ValueError as exc:
-            raise PolicyError(f"Path escapes confined root: {path}") from exc
-        if rel.is_absolute() or ".." in rel.parts:
-            raise PolicyError(f"Path traversal rejected: {path}")
+        except ValueError:
+            try:
+                rel = path.relative_to(root_real)
+            except ValueError as exc:
+                raise PolicyError(f"Path escapes confined root: {path}") from exc
+        if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+            raise PolicyError(f"Invalid or root-equal confined path: {path}")
         dir_fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY)
         try:
             parts = rel.parts
@@ -295,7 +336,7 @@ def _require_str(value: object, context: str, *, allow_empty: bool = False) -> s
 
 def _check_no_raw_secret_value(value: str, context: str) -> None:
     for prefix in RAW_SECRET_PREFIXES:
-        if value.startswith(prefix):
+        if prefix in value:
             raise SchemaError(f"Raw secret prefix {prefix!r} forbidden in {context}")
 
 
@@ -350,6 +391,29 @@ def render_host_url(template: str, values: dict[str, Any]) -> str:
     return TEMPLATE_PLACEHOLDER_RE.sub(_sub, template)
 
 
+def validate_pod_local_url(url: str, context: str) -> str:
+    """Validate strictly pod-local http://127.0.0.1:<port>/... URLs (forbids userinfo, authority tricks, port 9222)."""
+    _require_str(url, context)
+    if any(ch in url for ch in ("\r", "\n", "\x00", " ")):
+        raise PolicyError(f"{context} contains illegal characters")
+    parsed = urlparse(url)
+    if parsed.scheme != "http":
+        raise PolicyError(f"{context} must use http://127.0.0.1:<port>")
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise PolicyError(f"{context} must not contain userinfo")
+    if parsed.hostname != "127.0.0.1":
+        raise PolicyError(f"{context} hostname must be exact 127.0.0.1, got {parsed.hostname!r}")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise PolicyError(f"{context} has invalid port") from exc
+    if port is None or not (1 <= port <= 65535):
+        raise PolicyError(f"{context} must specify an explicit valid port")
+    if port == 9222:
+        raise PolicyError(f"{context} may not target pod Chromium DevTools port 9222")
+    return url
+
+
 def validate_remote_endpoint_url(
     url: str,
     *,
@@ -363,30 +427,40 @@ def validate_remote_endpoint_url(
     allowed_schemes = {"https"} | ({"http"} if allow_http else set())
     if parsed.scheme not in allowed_schemes:
         raise PolicyError(f"Remote endpoint scheme {parsed.scheme!r} not allowed")
-    if parsed.username or parsed.password:
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise PolicyError("Credentials embedded in remote endpoint URL are forbidden")
-    host = (parsed.hostname or "").strip().lower()
-    if not host:
-        raise PolicyError("Remote endpoint missing hostname")
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise PolicyError("Remote endpoint has invalid port") from exc
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host or len(host) > 253:
+        raise PolicyError("Remote endpoint missing or oversized hostname")
     if host in allowed_hosts:
         return url
     if host in ("localhost", "host.containers.internal", "host.docker.internal") or host.endswith(
         ".localhost"
     ):
         raise PolicyError(f"Remote endpoint host {host!r} blocked by SSRF policy")
+
+    # Canonical IP check: reject ANY non-global IP (including CGNAT 100.64.0.0/10, loopback, private, link-local)
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
+        ip = None
+    if ip is not None:
+        if not ip.is_global:
+            raise PolicyError(f"Non-global remote endpoint IP {host!r} blocked by SSRF policy")
         return url
-    if (
-        ip.is_loopback
-        or ip.is_link_local
-        or ip.is_private
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    ):
-        raise PolicyError(f"Remote endpoint IP {host!r} blocked by SSRF policy")
+
+    # Reject non-canonical numeric/octal/hex IPv4 forms (0177.0.0.1, 2130706433, 0x7f000001, 127.1)
+    labels = host.split(".")
+    if all(NUMERIC_LABEL_RE.fullmatch(lbl) is not None for lbl in labels):
+        raise PolicyError(f"Non-canonical numeric IP host {host!r} blocked by SSRF policy")
+    if NUMERIC_LABEL_RE.fullmatch(labels[-1]) is not None:
+        raise PolicyError(f"Numeric TLD host {host!r} blocked by SSRF policy")
+    if len(labels) < 2 or any(DNS_LABEL_RE.fullmatch(lbl) is None for lbl in labels):
+        raise PolicyError(f"Invalid remote endpoint DNS hostname: {host!r}")
     return url
 
 
@@ -509,6 +583,37 @@ def _validate_volume(vol: object, context: str, *, for_orchestrator: bool) -> di
     }
 
 
+def _validate_service_requirement(req: object, context: str) -> dict[str, Any]:
+    if isinstance(req, str):
+        if CAPABILITY_REQUIRES_RE.fullmatch(req) is None and OPAQUE_ID_RE.fullmatch(req) is None:
+            raise SchemaError(f"Invalid {context} requirement: {req!r}")
+        return {"target": req, "provider": None, "instance": None, "instance_port": None}
+    if isinstance(req, dict):
+        _reject_unknown_keys(
+            req,
+            frozenset({"capability", "service", "provider", "instance", "instance_port"}),
+            context,
+        )
+        target = req.get("capability") or req.get("service")
+        if type(target) is not str:
+            raise SchemaError(f"{context} entry must specify capability or service")
+        if req.get("capability") and CAPABILITY_REQUIRES_RE.fullmatch(target) is None:
+            raise SchemaError(f"Invalid capability requirement in {context}: {target!r}")
+        if req.get("service"):
+            validate_opaque_id(target, label=f"{context}.service")
+        prov = req.get("provider")
+        if prov is not None:
+            validate_opaque_id(prov, label=f"{context}.provider")
+        inst = req.get("instance")
+        if inst is not None and (type(inst) is not str or SIMPLE_NAME_RE.fullmatch(inst) is None):
+            raise SchemaError(f"Invalid {context}.instance: {inst!r}")
+        iport = req.get("instance_port")
+        if iport is not None and (type(iport) is not int or not (1 <= iport <= 65535)):
+            raise SchemaError(f"Invalid {context}.instance_port: {iport!r}")
+        return {"target": target, "provider": prov, "instance": inst, "instance_port": iport}
+    raise SchemaError(f"{context} item must be string or table")
+
+
 def validate_service_doc(
     doc: dict[str, Any],
     *,
@@ -521,6 +626,8 @@ def validate_service_doc(
         raise SchemaError(f"service schema_version must be {SCHEMA_VERSION}")
     if doc.get("kind") != "service@1":
         raise SchemaError("service kind must be 'service@1'")
+    if "factory" in doc or "implementation" in doc:
+        raise PolicyError("Raw factory/implementation paths forbidden; use opaque factory_id")
     allowed = frozenset(
         {
             "schema_version",
@@ -548,8 +655,6 @@ def validate_service_doc(
         }
     )
     _reject_unknown_keys(doc, allowed, "service")
-    if "factory" in doc or "implementation" in doc:
-        raise PolicyError("Raw factory/implementation paths forbidden; use opaque factory_id")
     svc_id = validate_opaque_id(doc.get("id"), label="service.id")
     if expected_id is not None and svc_id != expected_id:
         raise SchemaError(f"service.id {svc_id!r} does not match expected {expected_id!r}")
@@ -601,30 +706,7 @@ def validate_service_doc(
     requires = doc.get("requires", [])
     if not isinstance(requires, list):
         raise SchemaError("service.requires must be a list")
-    norm_requires: list[dict[str, Any]] = []
-    for req in requires:
-        if isinstance(req, str):
-            if CAPABILITY_REQUIRES_RE.fullmatch(req) is None and OPAQUE_ID_RE.fullmatch(req) is None:
-                raise SchemaError(f"Invalid service requirement: {req!r}")
-            norm_requires.append({"target": req, "provider": None, "instance": None})
-        elif isinstance(req, dict):
-            _reject_unknown_keys(req, frozenset({"capability", "service", "provider", "instance"}), "service.requires[]")
-            target = req.get("capability") or req.get("service")
-            if type(target) is not str:
-                raise SchemaError("service.requires entry must specify capability or service")
-            if req.get("capability") and CAPABILITY_REQUIRES_RE.fullmatch(target) is None:
-                raise SchemaError(f"Invalid capability requirement: {target!r}")
-            if req.get("service"):
-                validate_opaque_id(target, label="service.requires.service")
-            prov = req.get("provider")
-            if prov is not None:
-                validate_opaque_id(prov, label="service.requires.provider")
-            inst = req.get("instance")
-            if inst is not None and (type(inst) is not str or SIMPLE_NAME_RE.fullmatch(inst) is None):
-                raise SchemaError(f"Invalid service.requires.instance: {inst!r}")
-            norm_requires.append({"target": target, "provider": prov, "instance": inst})
-        else:
-            raise SchemaError("service.requires item must be string or table")
+    norm_requires = [_validate_service_requirement(r, "service.requires[]") for r in requires]
 
     fallback = doc.get("fallback_service")
     if fallback is not None:
@@ -666,12 +748,17 @@ def validate_service_doc(
             raise SchemaError(f"Secret mode must be '0400' or '0600', got {smode!r}")
         sref = _require_str(slot.get("secret_ref"), f"secret_slots[{i}].secret_ref")
         _check_no_raw_secret_value(sref, f"secret_slots[{i}].secret_ref")
+        if SECRET_REF_GRAMMAR_RE.fullmatch(sref) is None:
+            raise SchemaError(
+                f"secret_slots[{i}].secret_ref must match '<scheme>:<reference>' grammar, got {sref!r}"
+            )
         norm_secrets.append({"slot": sname, "target": starget, "mode": smode, "secret_ref": sref})
 
     env = validate_env_map(doc.get("env"), f"service({svc_id}).env")
     mise_tools = validate_mise_tools(doc.get("mise_tools"), f"service({svc_id}).mise_tools")
 
     probe = doc.get("readiness_probe")
+    norm_probe = None
     if probe is not None:
         if not isinstance(probe, dict):
             raise SchemaError("service.readiness_probe must be a table")
@@ -679,6 +766,20 @@ def validate_service_doc(
         pkind = probe.get("kind")
         if pkind not in ("tcp", "exec_auth", "http_local"):
             raise SchemaError(f"Unsupported readiness_probe.kind: {pkind!r}")
+        pport = probe.get("port")
+        if pport is not None and (type(pport) is not int or not (1 <= pport <= 65535)):
+            raise SchemaError("service.readiness_probe.port must be int 1..65535")
+        pcmd = probe.get("command")
+        if pcmd is not None:
+            if for_orchestrator:
+                raise PolicyError("Orchestrator proposals may not specify custom readiness_probe.command")
+            if (
+                not isinstance(pcmd, list)
+                or not pcmd
+                or any(type(a) is not str or not a or "\x00" in a for a in pcmd)
+            ):
+                raise SchemaError("service.readiness_probe.command must be non-empty list of strings")
+        norm_probe = {"kind": pkind, "port": pport, "command": list(pcmd) if pcmd is not None else None}
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -700,7 +801,7 @@ def validate_service_doc(
         "volumes": volumes,
         "secret_slots": norm_secrets,
         "env": env,
-        "readiness_probe": probe,
+        "readiness_probe": norm_probe,
         "mise_tools": mise_tools,
     }
 
@@ -720,13 +821,18 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
         raise PolicyError(f"MCP {name} must use type 'remote' or 'pinned-artifact', got {mtype!r}")
     if mtype == "remote":
         url = _require_str(cfg.get("url"), f"{context}.{name}.url")
-        if not (url.startswith("http://127.0.0.1:") or url.startswith("https://")):
-            raise PolicyError(f"MCP {name} remote url must be https:// or pod-local 127.0.0.1")
+        parsed = urlparse(url)
+        if parsed.scheme == "http":
+            validate_pod_local_url(url, f"{context}.{name}.url")
+        elif parsed.scheme == "https":
+            validate_remote_endpoint_url(url, allow_http=False)
+        else:
+            raise PolicyError(f"MCP {name} remote url must be https:// or pod-local http://127.0.0.1:<port>")
     else:
         art = _require_str(cfg.get("artifact_id"), f"{context}.{name}.artifact_id")
         if OPAQUE_ID_RE.fullmatch(art) is None:
             raise SchemaError(f"Invalid MCP artifact_id: {art!r}")
-        if for_orchestrator and ("/" not in art or not art.startswith("builtin/")):
+        if for_orchestrator and not is_builtin_id(art):
             raise PolicyError("Orchestrator MCP proposals must reference registered builtin/* artifacts")
     args = cfg.get("args", [])
     if not isinstance(args, list) or any(type(a) is not str for a in args):
@@ -769,7 +875,7 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,47}", bkey):
             raise SchemaError(f"Invalid local.binding_key: {bkey!r}")
         lsvc = validate_opaque_id(local_cfg.get("service"), label=f"{context}.{name}.local.service")
-        lurl = _require_str(local_cfg.get("url"), f"{context}.{name}.local.url")
+        lurl = validate_pod_local_url(local_cfg.get("url"), f"{context}.{name}.local.url")
         norm_local = {"binding_key": bkey, "service": lsvc, "url": lurl}
 
     return {
@@ -834,36 +940,20 @@ def validate_bundle_doc(
     if not isinstance(replace_list, list) or any(r not in ("persona", "mcp") for r in replace_list):
         raise SchemaError("bundle.composition.replace may only contain 'persona' or 'mcp'")
 
-    req_services = []
-    for item in doc.get("requires_services", []):
-        if isinstance(item, str):
-            if CAPABILITY_REQUIRES_RE.fullmatch(item) is None and OPAQUE_ID_RE.fullmatch(item) is None:
-                raise SchemaError(f"Invalid bundle.requires_services item: {item!r}")
-            req_services.append({"target": item, "provider": None, "instance": None})
-        elif isinstance(item, dict):
-            _reject_unknown_keys(item, frozenset({"capability", "service", "provider", "instance"}), "bundle.requires_services[]")
-            target = item.get("capability") or item.get("service")
-            if type(target) is not str:
-                raise SchemaError("bundle.requires_services entry must set capability or service")
-            if item.get("capability") and CAPABILITY_REQUIRES_RE.fullmatch(target) is None:
-                raise SchemaError(f"Invalid capability requirement: {target!r}")
-            if item.get("service"):
-                validate_opaque_id(target, label="bundle.requires_services.service")
-            prov = item.get("provider")
-            if prov is not None:
-                validate_opaque_id(prov, label="provider")
-            inst = item.get("instance")
-            if inst is not None and (type(inst) is not str or SIMPLE_NAME_RE.fullmatch(inst) is None):
-                raise SchemaError(f"Invalid instance name: {inst!r}")
-            req_services.append({"target": target, "provider": prov, "instance": inst})
-        else:
-            raise SchemaError("bundle.requires_services items must be string or table")
+    req_services = [
+        _validate_service_requirement(item, "bundle.requires_services[]")
+        for item in doc.get("requires_services", [])
+    ]
 
     local_services = []
     for i, item in enumerate(doc.get("local_services", [])):
         if not isinstance(item, dict):
             raise SchemaError(f"bundle.local_services[{i}] must be a table")
-        _reject_unknown_keys(item, frozenset({"binding_key", "service", "instance"}), f"local_services[{i}]")
+        _reject_unknown_keys(
+            item,
+            frozenset({"binding_key", "service", "instance", "instance_port"}),
+            f"local_services[{i}]",
+        )
         bkey = _require_str(item.get("binding_key"), f"local_services[{i}].binding_key")
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,47}", bkey):
             raise SchemaError(f"Invalid local_services binding_key: {bkey!r}")
@@ -871,7 +961,10 @@ def validate_bundle_doc(
         inst = item.get("instance")
         if inst is not None and (type(inst) is not str or SIMPLE_NAME_RE.fullmatch(inst) is None):
             raise SchemaError(f"Invalid local_services instance: {inst!r}")
-        local_services.append({"binding_key": bkey, "service": lsvc, "instance": inst})
+        iport = item.get("instance_port")
+        if iport is not None and (type(iport) is not int or not (1 <= iport <= 65535)):
+            raise SchemaError(f"Invalid local_services instance_port: {iport!r}")
+        local_services.append({"binding_key": bkey, "service": lsvc, "instance": inst, "instance_port": iport})
 
     raw_mcp = doc.get("mcp", {})
     if not isinstance(raw_mcp, dict):
@@ -897,6 +990,9 @@ def validate_bundle_doc(
         if SIMPLE_NAME_RE.fullmatch(pname) is None:
             raise SchemaError(f"Invalid persona name: {pname!r}")
         mission = _require_str(persona.get("mission"), "bundle.persona.mission")
+        _check_no_raw_secret_value(mission, f"bundle({bid}).persona.mission")
+        if len(mission.encode("utf-8")) > MAX_MISSION_BYTES:
+            raise SchemaError("bundle.persona.mission exceeds byte limit")
         auth = persona.get("authority", "implementer")
         if auth not in ("implementer", "reviewer", "triage", "ops-ro"):
             raise SchemaError(f"Invalid persona authority: {auth!r}")
@@ -977,6 +1073,32 @@ def validate_bundle_doc(
     }
 
 
+def validate_port_request(entry: object, context: str) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        raise SchemaError(f"{context} must be a table")
+    _reject_unknown_keys(entry, frozenset({"service", "endpoint", "exposure", "host_port"}), context)
+    svc = entry.get("service")
+    if type(svc) is not str or not svc:
+        raise SchemaError(f"{context}.service must be a non-empty string")
+    if "@" in svc:
+        base_id, inst = svc.split("@", 1)
+        validate_opaque_id(base_id, label=f"{context}.service")
+        if SIMPLE_NAME_RE.fullmatch(inst) is None:
+            raise SchemaError(f"Invalid service instance alias in {context}: {inst!r}")
+    else:
+        validate_opaque_id(svc, label=f"{context}.service")
+    ep = _require_str(entry.get("endpoint"), f"{context}.endpoint")
+    if SIMPLE_NAME_RE.fullmatch(ep) is None:
+        raise SchemaError(f"Invalid endpoint name in {context}: {ep!r}")
+    exp = entry.get("exposure", "host-loopback")
+    if type(exp) is not str or exp not in EXPOSURE_RANK:
+        raise SchemaError(f"Invalid port exposure in {context}: {exp!r}")
+    hp = entry.get("host_port")
+    if hp is not None and (type(hp) is not int or not (1024 <= hp <= 65535)):
+        raise SchemaError(f"{context}.host_port must be an integer 1024..65535")
+    return {"service": svc, "endpoint": ep, "exposure": exp, "host_port": hp}
+
+
 def validate_sandbox_type_doc(
     doc: dict[str, Any],
     *,
@@ -1045,20 +1167,7 @@ def validate_sandbox_type_doc(
     if default_agent is not None and (type(default_agent) is not str or SIMPLE_NAME_RE.fullmatch(default_agent) is None):
         raise SchemaError(f"Invalid default_agent: {default_agent!r}")
 
-    ports = []
-    for i, p in enumerate(doc.get("ports", [])):
-        if not isinstance(p, dict):
-            raise SchemaError(f"sandbox-type.ports[{i}] must be a table")
-        _reject_unknown_keys(p, frozenset({"service", "endpoint", "exposure", "host_port"}), f"ports[{i}]")
-        svc = validate_opaque_id(p.get("service"), label=f"ports[{i}].service")
-        ep = _require_str(p.get("endpoint"), f"ports[{i}].endpoint")
-        exp = p.get("exposure", "host-loopback")
-        if exp not in EXPOSURE_RANK:
-            raise SchemaError(f"Invalid port exposure: {exp!r}")
-        hp = p.get("host_port")
-        if hp is not None and (type(hp) is not int or not 1024 <= hp <= 65535):
-            raise SchemaError("host_port must be 1024..65535")
-        ports.append({"service": svc, "endpoint": ep, "exposure": exp, "host_port": hp})
+    ports = [validate_port_request(p, f"sandbox-type.ports[{i}]") for i, p in enumerate(doc.get("ports", []))]
 
     mise_overrides = validate_mise_tools(doc.get("mise_overrides"), "sandbox-type.mise_overrides")
     factory_id = doc.get("factory_id")

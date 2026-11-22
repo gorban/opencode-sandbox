@@ -16,9 +16,9 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
 import sys
 import time
-import tomllib
 from typing import Any, Iterator
 
 # Import production oc_controller.py from repository root (read-only)
@@ -38,12 +38,15 @@ from oc_schema import (  # noqa: E402
     MAX_CONFIG_FILE_BYTES,
     MUTABLE_ORCHESTRATOR_KINDS,
     PROPOSAL_ACTIONS,
+    PROPOSAL_ID_RE,
     READABLE_ORCHESTRATOR_KINDS,
     PolicyError,
     SchemaError,
     assert_trusted_dir,
     canonical_json,
+    check_not_in_sandbox,
     is_builtin_id,
+    parse_toml_strict,
     read_regular_no_follow,
     sha256_canonical_json,
     validate_doc_by_kind,
@@ -121,7 +124,19 @@ def _append_journal_0600(journal_path: Path, entry: dict[str, Any]) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
     fd = os.open(journal_path, flags, 0o600)
     try:
-        os.write(fd, line)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PolicyError(f"Non-regular journal file rejected: {journal_path}")
+        if st.st_nlink != 1:
+            raise PolicyError(f"Hardlinked journal file rejected: {journal_path}")
+        if st.st_uid != os.geteuid():
+            raise PolicyError(f"Journal file not owned by current user: {journal_path}")
+        if st.st_mode & 0o077:
+            raise PolicyError(f"Journal file permissions too open (require 0600): {journal_path}")
+        view = memoryview(line)
+        written = 0
+        while written < len(view):
+            written += os.write(fd, view[written:])
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -238,9 +253,15 @@ class HostConfigStore:
         incarnation: str | None = None,
         sandbox_root: Path | None = None,
     ):
-        self.config_dir = config_dir.resolve()
-        self.builtin_dir = builtin_dir.resolve()
         self.sandbox_root = sandbox_root
+        raw_config_dir = Path(config_dir)
+        check_not_in_sandbox(raw_config_dir, sandbox_root)
+        if raw_config_dir.is_symlink():
+            raise PolicyError(f"Expected non-symlink config_dir: {raw_config_dir}")
+        raw_config_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(raw_config_dir, 0o700)
+        self.config_dir = assert_trusted_dir(raw_config_dir, sandbox_root=sandbox_root)
+        self.builtin_dir = builtin_dir.resolve()
         self._clock = clock or (lambda: int(time.monotonic()))
         self._ensure_layout()
         self._builtins: dict[tuple[str, str], dict[str, Any]] = {}
@@ -268,17 +289,25 @@ class HostConfigStore:
         self.controller._set_alias("config_store", "config_store_target")
 
     def _ensure_layout(self) -> None:
-        self.config_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.config_dir, 0o700)
         assert_trusted_dir(self.config_dir, sandbox_root=self.sandbox_root)
         for sub in ("objects", "proposals", "revisions"):
             d = self.config_dir / sub
+            if d.is_symlink():
+                raise PolicyError(f"Expected non-symlink store subdirectory: {d}")
             d.mkdir(parents=True, exist_ok=True)
             os.chmod(d, 0o700)
+            assert_trusted_dir(d, sandbox_root=self.sandbox_root)
         self._lock_path = self.config_dir / "store.lock"
         # Create persistent-inode lock file without ever unlinking it
         fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        os.close(fd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1:
+                raise PolicyError(f"Untrusted lock file: {self._lock_path}")
+            if stat.S_IMODE(st.st_mode) != 0o600:
+                os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
         self._state_path = self.config_dir / "state.json"
         self._journal_path = self.config_dir / "journal.jsonl"
         if not self._state_path.exists():
@@ -289,14 +318,29 @@ class HostConfigStore:
 
     @contextmanager
     def persistent_flock(self) -> Iterator[None]:
-        """Persistent-inode exclusive flock (O_NOFOLLOW, 0o600, never unlinked)."""
+        """Persistent-inode exclusive flock (O_NOFOLLOW, 0o600, fstat + inode verified, never unlinked)."""
         fd = os.open(self._lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        locked = False
         try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise PolicyError(f"Non-regular lock file rejected: {self._lock_path}")
+            if st.st_uid != os.geteuid():
+                raise PolicyError(f"Lock file not owned by current user: {self._lock_path}")
+            if stat.S_IMODE(st.st_mode) != 0o600:
+                raise PolicyError(f"Lock file mode must be 0600: {self._lock_path}")
+            if st.st_nlink != 1:
+                raise PolicyError(f"Hardlinked lock file rejected: {self._lock_path}")
             fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+            lst = os.lstat(self._lock_path)
+            if (lst.st_dev, lst.st_ino) != (st.st_dev, st.st_ino):
+                raise PolicyError(f"Lock file inode replaced during flock: {self._lock_path}")
             yield
         finally:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                if locked:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
 
@@ -307,7 +351,7 @@ class HostConfigStore:
                 continue
             for path in sorted(kdir.glob("*.toml")):
                 raw = read_regular_no_follow(path, max_bytes=MAX_CONFIG_FILE_BYTES, confined_root=self.builtin_dir)
-                parsed = tomllib.loads(raw.decode("utf-8"))
+                parsed = parse_toml_strict(raw.decode("utf-8"), context=str(path.name))
                 doc = validate_doc_by_kind(kind, parsed, for_orchestrator=False)
                 if not is_builtin_id(doc["id"]):
                     raise SchemaError(f"Builtin file {path} must declare builtin/* id")
@@ -319,6 +363,7 @@ class HostConfigStore:
             self._state_path,
             max_bytes=1_048_576,
             require_owner_only=True,
+            confined_root=self.config_dir,
             sandbox_root=self.sandbox_root,
         )
         return json.loads(raw.decode("utf-8"))
@@ -333,21 +378,36 @@ class HostConfigStore:
     def _obj_key(self, kind: str, obj_id: str) -> str:
         return f"{kind}:{obj_id}"
 
+    @staticmethod
+    def _encode_id(obj_id: str) -> str:
+        # Injective: '@' is forbidden by OPAQUE_ID_RE, so "team/foo" -> "team@foo" never collides with "team__foo".
+        validate_opaque_id(obj_id, label="id")
+        return obj_id.replace("/", "@")
+
     def _obj_file(self, kind: str, obj_id: str) -> Path:
-        safe = obj_id.replace("/", "__")
+        if kind not in READABLE_ORCHESTRATOR_KINDS:
+            raise SchemaError(f"Unknown kind: {kind!r}")
+        safe = self._encode_id(obj_id)
         return self.config_dir / "objects" / f"{kind}__{safe}.toml"
 
     def _rev_file(self, kind: str, obj_id: str, rev: int) -> Path:
-        safe = obj_id.replace("/", "__")
-        return self.config_dir / "revisions" / f"{kind}__{safe}__r{rev}.toml"
+        if kind not in READABLE_ORCHESTRATOR_KINDS:
+            raise SchemaError(f"Unknown kind: {kind!r}")
+        if type(rev) is not int or rev < 1:
+            raise SchemaError(f"Invalid revision: {rev!r}")
+        safe = self._encode_id(obj_id)
+        return self.config_dir / "revisions" / f"{kind}__{safe}.r{rev}.toml"
 
     def _proposal_file(self, proposal_id: str) -> Path:
+        if type(proposal_id) is not str or PROPOSAL_ID_RE.fullmatch(proposal_id) is None:
+            raise SchemaError("Invalid proposal_id")
         return self.config_dir / "proposals" / f"{proposal_id}.json"
 
     def bundle_asset_root(self, bundle_id: str) -> Path | None:
+        validate_opaque_id(bundle_id, label="bundle_id")
         if ("bundle", bundle_id) in self._builtin_paths:
             return self._builtin_paths[("bundle", bundle_id)]
-        asset_dir = self.config_dir / "assets" / bundle_id.replace("/", "__")
+        asset_dir = self.config_dir / "assets" / self._encode_id(bundle_id)
         return asset_dir if asset_dir.is_dir() else None
 
     def is_archived(self, kind: str, obj_id: str) -> bool:
@@ -363,6 +423,8 @@ class HostConfigStore:
         return int(st["revision"]) if st else 0
 
     def get_raw_toml(self, kind: str, obj_id: str, *, include_archived: bool = False) -> str:
+        if kind not in READABLE_ORCHESTRATOR_KINDS:
+            raise SchemaError(f"Unknown kind: {kind!r}")
         validate_opaque_id(obj_id, label="id")
         if (kind, obj_id) in self._builtins:
             name = obj_id.split("/", 1)[1] + ".toml"
@@ -374,17 +436,24 @@ class HostConfigStore:
         if not p.exists():
             raise KeyError(f"{kind}/{obj_id} not found")
         return read_regular_no_follow(
-            p, require_owner_only=True, sandbox_root=self.sandbox_root
+            p,
+            require_owner_only=True,
+            confined_root=self.config_dir / "objects",
+            sandbox_root=self.sandbox_root,
         ).decode("utf-8")
 
     def get(self, kind: str, obj_id: str, *, include_archived: bool = False) -> dict[str, Any]:
+        if kind not in READABLE_ORCHESTRATOR_KINDS:
+            raise SchemaError(f"Unknown kind: {kind!r}")
         validate_opaque_id(obj_id, label="id")
         if (kind, obj_id) in self._builtins:
             return self._builtins[(kind, obj_id)]
         if not include_archived and self.is_archived(kind, obj_id):
             raise KeyError(f"{kind}/{obj_id} is archived")
         raw = self.get_raw_toml(kind, obj_id, include_archived=include_archived)
-        return validate_doc_by_kind(kind, tomllib.loads(raw), expected_id=obj_id, for_orchestrator=False)
+        return validate_doc_by_kind(
+            kind, parse_toml_strict(raw, context=f"{kind}/{obj_id}"), expected_id=obj_id, for_orchestrator=False
+        )
 
     def list_ids(self, kind: str, *, include_archived: bool = False) -> list[str]:
         if kind not in READABLE_ORCHESTRATOR_KINDS:
@@ -401,12 +470,16 @@ class HostConfigStore:
         return sorted(ids)
 
     def get_history(self, kind: str, obj_id: str) -> list[dict[str, Any]]:
+        if kind not in READABLE_ORCHESTRATOR_KINDS:
+            raise SchemaError(f"Unknown kind: {kind!r}")
+        validate_opaque_id(obj_id, label="id")
         if not self._journal_path.exists():
             return []
         raw = read_regular_no_follow(
             self._journal_path,
             max_bytes=4_194_304,
             require_owner_only=True,
+            confined_root=self.config_dir,
             sandbox_root=self.sandbox_root,
         ).decode("utf-8")
         entries = []
@@ -419,12 +492,26 @@ class HostConfigStore:
         return entries
 
     def get_revision_toml(self, kind: str, obj_id: str, rev: int) -> str:
+        if kind not in READABLE_ORCHESTRATOR_KINDS:
+            raise SchemaError(f"Unknown kind: {kind!r}")
+        validate_opaque_id(obj_id, label="id")
+        if type(rev) is not int or rev < 1:
+            raise SchemaError("Revision must be a positive integer")
         p = self._rev_file(kind, obj_id, rev)
         if not p.exists():
             raise KeyError(f"Revision {rev} not found for {kind}/{obj_id}")
         return read_regular_no_follow(
-            p, require_owner_only=True, sandbox_root=self.sandbox_root
+            p,
+            require_owner_only=True,
+            confined_root=self.config_dir / "revisions",
+            sandbox_root=self.sandbox_root,
         ).decode("utf-8")
+
+    def get_revision_doc(self, kind: str, obj_id: str, rev: int) -> dict[str, Any]:
+        raw = self.get_revision_toml(kind, obj_id, rev)
+        return validate_doc_by_kind(
+            kind, parse_toml_strict(raw, context=f"{kind}/{obj_id}@r{rev}"), expected_id=obj_id, for_orchestrator=False
+        )
 
     def with_in_memory_overlay(
         self,
@@ -482,18 +569,25 @@ class HostConfigStore:
         pdir = self.config_dir / "proposals"
         out = []
         for p in sorted(pdir.glob("*.json")):
-            raw = read_regular_no_follow(p, require_owner_only=True, sandbox_root=self.sandbox_root)
+            raw = read_regular_no_follow(
+                p, require_owner_only=True, confined_root=pdir, sandbox_root=self.sandbox_root
+            )
             out.append(json.loads(raw.decode("utf-8")))
         return out
 
     def load_proposal(self, proposal_id: str) -> dict[str, Any]:
-        if not proposal_id or "/" in proposal_id or ".." in proposal_id:
+        if type(proposal_id) is not str or PROPOSAL_ID_RE.fullmatch(proposal_id) is None:
             raise SchemaError("Invalid proposal_id")
         p = self._proposal_file(proposal_id)
         if not p.exists():
             raise KeyError(f"Proposal not found: {proposal_id}")
         return json.loads(
-            read_regular_no_follow(p, require_owner_only=True, sandbox_root=self.sandbox_root).decode("utf-8")
+            read_regular_no_follow(
+                p,
+                require_owner_only=True,
+                confined_root=self.config_dir / "proposals",
+                sandbox_root=self.sandbox_root,
+            ).decode("utf-8")
         )
 
     def _save_proposal_unlocked(self, proposal: dict[str, Any]) -> None:
@@ -517,6 +611,7 @@ class HostConfigStore:
             self._journal_path,
             max_bytes=4_194_304,
             require_owner_only=True,
+            confined_root=self.config_dir,
             sandbox_root=self.sandbox_root,
         ).decode("utf-8")
         for line in raw.splitlines():
@@ -565,6 +660,10 @@ class HostConfigStore:
             raise PolicyError("builtin/* namespace is strictly immutable")
         if action not in PROPOSAL_ACTIONS:
             raise SchemaError(f"Invalid proposal action: {action!r}")
+        if type(ttl_seconds) is not int or not (1 <= ttl_seconds <= DEFAULT_PROPOSAL_TTL_SECONDS):
+            raise SchemaError(
+                f"ttl_seconds must be an integer in 1..{DEFAULT_PROPOSAL_TTL_SECONDS}"
+            )
 
         validated_doc: dict[str, Any] | None = None
         if action == "upsert":
@@ -573,7 +672,10 @@ class HostConfigStore:
             if len(proposed_toml.encode("utf-8")) > MAX_CONFIG_FILE_BYTES:
                 raise SchemaError("proposed_toml exceeds byte limit")
             validated_doc = validate_doc_by_kind(
-                kind, tomllib.loads(proposed_toml), expected_id=obj_id, for_orchestrator=True
+                kind,
+                parse_toml_strict(proposed_toml, context=f"proposed_toml({kind}/{obj_id})"),
+                expected_id=obj_id,
+                for_orchestrator=True,
             )
         else:
             if proposed_toml is not None:
@@ -593,7 +695,10 @@ class HostConfigStore:
                 # Gate 2 note #3: re-validate archived TOML against current schema/orchestrator rules
                 archived_raw = self.get_raw_toml(kind, obj_id, include_archived=True)
                 validated_doc = validate_doc_by_kind(
-                    kind, tomllib.loads(archived_raw), expected_id=obj_id, for_orchestrator=True
+                    kind,
+                    parse_toml_strict(archived_raw, context=f"archived({kind}/{obj_id})"),
+                    expected_id=obj_id,
+                    for_orchestrator=True,
                 )
 
             now = self._clock()
@@ -631,10 +736,13 @@ class HostConfigStore:
             proposal_digest = sha256_canonical_json(canonical_body)
 
             # Submit through real oc_controller.Controller API (Role.JOB + _ID-compliant names)
-            ctrl_status = self.controller.propose(
-                self.principals.config_job,
-                occ.Proposal(occ.Intent.APPLY_ONCE, "config_store", "config_store_apply"),
-            )
+            try:
+                ctrl_status = self.controller.propose(
+                    self.principals.config_job,
+                    occ.Proposal(occ.Intent.APPLY_ONCE, "config_store", "config_store_apply"),
+                )
+            except occ.CapacityExceeded as exc:
+                raise ConflictError("Controller pending proposal capacity exceeded") from exc
             ctrl_view = self.controller.view(self.principals.operator, ctrl_status.request_id)
 
             proposal = {
@@ -713,11 +821,17 @@ class HostConfigStore:
             elif action == "unarchive":
                 archived_raw = self.get_raw_toml(kind, obj_id, include_archived=True)
                 validated_doc = validate_doc_by_kind(
-                    kind, tomllib.loads(archived_raw), expected_id=obj_id, for_orchestrator=True
+                    kind,
+                    parse_toml_strict(archived_raw, context=f"archived({kind}/{obj_id})"),
+                    expected_id=obj_id,
+                    for_orchestrator=True,
                 )
             else:
                 validated_doc = validate_doc_by_kind(
-                    kind, tomllib.loads(proposal["proposed_toml"]), expected_id=obj_id, for_orchestrator=True
+                    kind,
+                    parse_toml_strict(proposal["proposed_toml"], context=f"proposed_toml({kind}/{obj_id})"),
+                    expected_id=obj_id,
+                    for_orchestrator=True,
                 )
 
             old_plans, new_plans, cur_closure = self._dry_run_affected_plans(
@@ -823,25 +937,36 @@ class HostConfigStore:
             self._save_proposal_unlocked(proposal)
             return settled
 
-    def operator_direct_upsert(self, kind: str, obj_id: str, raw_toml: str) -> int:
-        """Host-operator direct publish (for non-orchestrator kinds or operator CLI restore)."""
+    def _operator_direct_upsert_unlocked(self, kind: str, obj_id: str, raw_toml: str) -> int:
+        if kind not in READABLE_ORCHESTRATOR_KINDS:
+            raise SchemaError(f"Unknown kind: {kind!r}")
         validate_opaque_id(obj_id, label="id")
         if is_builtin_id(obj_id):
             raise PolicyError("builtin/* namespace is strictly immutable")
-        validate_doc_by_kind(kind, tomllib.loads(raw_toml), expected_id=obj_id, for_orchestrator=False)
+        validate_doc_by_kind(
+            kind,
+            parse_toml_strict(raw_toml, context=f"operator_upsert({kind}/{obj_id})"),
+            expected_id=obj_id,
+            for_orchestrator=False,
+        )
+        self.assert_no_unresolved_uncertain_proposals()
+        fake_prop = {
+            "id": f"op_{secrets.token_hex(6)}",
+            "kind": kind,
+            "obj_id": obj_id,
+            "action": "upsert",
+            "proposed_toml": raw_toml,
+            "digest": hashlib.sha256(raw_toml.encode("utf-8")).hexdigest(),
+        }
+        return self._commit_proposal_effect_unlocked(fake_prop, f"operator_{secrets.token_hex(8)}")
+
+    def operator_direct_upsert(self, kind: str, obj_id: str, raw_toml: str) -> int:
+        """Host-operator direct publish (for non-orchestrator kinds or operator CLI restore)."""
         with self.persistent_flock():
-            self.assert_no_unresolved_uncertain_proposals()
-            fake_prop = {
-                "id": f"op_{secrets.token_hex(6)}",
-                "kind": kind,
-                "obj_id": obj_id,
-                "action": "upsert",
-                "proposed_toml": raw_toml,
-                "digest": hashlib.sha256(raw_toml.encode("utf-8")).hexdigest(),
-            }
-            return self._commit_proposal_effect_unlocked(fake_prop, f"operator_{secrets.token_hex(8)}")
+            return self._operator_direct_upsert_unlocked(kind, obj_id, raw_toml)
 
     def operator_restore_revision(self, kind: str, obj_id: str, target_rev: int) -> int:
-        """Restore a prior revision by publishing it as a NEW monotonic revision N+1."""
-        raw_toml = self.get_revision_toml(kind, obj_id, target_rev)
-        return self.operator_direct_upsert(kind, obj_id, raw_toml)
+        """Restore a prior revision by publishing it as a NEW monotonic revision N+1 under one lock."""
+        with self.persistent_flock():
+            raw_toml = self.get_revision_toml(kind, obj_id, target_rev)
+            return self._operator_direct_upsert_unlocked(kind, obj_id, raw_toml)

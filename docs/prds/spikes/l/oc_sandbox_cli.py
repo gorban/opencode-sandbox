@@ -12,11 +12,18 @@ import difflib
 import json
 from pathlib import Path
 import sys
-import tomllib
 from typing import Any
 
 from oc_plan import PlanOverrides, compile_plan
-from oc_schema import READABLE_ORCHESTRATOR_KINDS, validate_doc_by_kind
+from oc_schema import (
+    MAX_CONFIG_FILE_BYTES,
+    READABLE_ORCHESTRATOR_KINDS,
+    SchemaError,
+    parse_toml_strict,
+    read_regular_no_follow,
+    validate_doc_by_kind,
+    validate_port_request,
+)
 from oc_store import HostConfigStore
 
 
@@ -24,7 +31,7 @@ def _parse_kv(items: list[str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for item in items:
         if "=" not in item:
-            raise ValueError(f"Expected KEY=VALUE, got {item!r}")
+            raise SchemaError(f"Expected KEY=VALUE, got {item!r}")
         k, v = item.split("=", 1)
         out[k] = v
     return out
@@ -33,17 +40,22 @@ def _parse_kv(items: list[str]) -> dict[str, str]:
 def _parse_port(items: list[str]) -> tuple[dict[str, Any], ...]:
     out = []
     for item in items:
-        # Format: service:endpoint[:exposure[:host_port]]
+        # Format: service[@instance]:endpoint[:exposure[:host_port]]
         parts = item.split(":")
         if len(parts) < 2 or len(parts) > 4:
-            raise ValueError(f"Expected service:endpoint[:exposure[:host_port]], got {item!r}")
+            raise SchemaError(f"Expected service:endpoint[:exposure[:host_port]], got {item!r}")
+        host_port: int | None = None
+        if len(parts) == 4 and parts[3]:
+            if not (parts[3].isascii() and parts[3].isdigit()):
+                raise SchemaError(f"Invalid host_port in --port {item!r}")
+            host_port = int(parts[3])
         entry: dict[str, Any] = {
             "service": parts[0],
             "endpoint": parts[1],
             "exposure": parts[2] if len(parts) >= 3 and parts[2] else "host-loopback",
-            "host_port": int(parts[3]) if len(parts) == 4 and parts[3] else None,
+            "host_port": host_port,
         }
-        out.append(entry)
+        out.append(validate_port_request(entry, f"cli --port {item!r}"))
     return tuple(out)
 
 
@@ -141,7 +153,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(store.get(args.kind, args.id), indent=2, sort_keys=True))
             return 0
         if args.cfg_cmd == "validate":
-            doc = tomllib.loads(args.file.read_text("utf-8"))
+            raw = read_regular_no_follow(args.file, max_bytes=MAX_CONFIG_FILE_BYTES)
+            doc = parse_toml_strict(raw.decode("utf-8"), context=str(args.file))
             validated = validate_doc_by_kind(args.kind, doc)
             print(json.dumps({"valid": True, "id": validated["id"]}, indent=2))
             return 0
