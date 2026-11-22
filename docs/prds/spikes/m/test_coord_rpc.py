@@ -239,7 +239,7 @@ class TestCoordUdsRpcServer(unittest.TestCase):
                 sock_mode = stat.S_IMODE(sock_path.stat().st_mode)
                 self.assertEqual(dir_mode, 0o700)
                 self.assertEqual(sock_mode, 0o600)
-                self.assertEqual(srv.socket_path, sock_path)
+                self.assertEqual(srv.socket_path, sock_path.resolve())
 
                 send_resp = uds_rpc_call(
                     sock_path,
@@ -537,7 +537,7 @@ class TestUiAuthManager(unittest.TestCase):
         exp_code = mgr.mint_bootstrap_code()
         clock.advance(60.0)
         with self.assertRaises(UiAuthDeniedError):
-            mgr.exchange_bootstrap_code(exp_code, host_header=_TEST_HOST)
+            mgr.exchange_bootstrap_code(exp_code, host_header=_TEST_HOST, origin_header=_TEST_ORIGIN)
 
         race_code = mgr.mint_bootstrap_code()
         barrier = threading.Barrier(8)
@@ -648,6 +648,7 @@ class TestUiAuthManager(unittest.TestCase):
                 expected_incarnation_id=_TEST_INCARNATION,
                 expected_surface_kind=SURFACE_OPENCODE_TUI,
                 expected_mode=MODE_OBSERVE,
+                expected_session_id=sid,
             )
 
         race_tk = mgr.mint_ws_ticket(
@@ -671,6 +672,7 @@ class TestUiAuthManager(unittest.TestCase):
                     expected_incarnation_id=_TEST_INCARNATION,
                     expected_surface_kind=SURFACE_SHELL,
                     expected_mode=MODE_INTERACTIVE,
+                    expected_session_id=sid,
                 )
 
         barrier = threading.Barrier(8)
@@ -690,6 +692,7 @@ class TestUiAuthManager(unittest.TestCase):
                     expected_incarnation_id=_TEST_INCARNATION,
                     expected_surface_kind=SURFACE_SHELL,
                     expected_mode=MODE_INTERACTIVE,
+                    expected_session_id=sid,
                 )
                 with lock:
                     ok_count += 1
@@ -761,6 +764,7 @@ class TestUiAuthManager(unittest.TestCase):
                     expected_incarnation_id=exp_inc,
                     expected_surface_kind=exp_surface,
                     expected_mode=exp_mode,
+                    expected_session_id=sid,
                 )
 
         # Revoked session invalidates pending WS tickets
@@ -784,6 +788,7 @@ class TestUiAuthManager(unittest.TestCase):
                 expected_incarnation_id=_TEST_INCARNATION,
                 expected_surface_kind=SURFACE_BROWSER,
                 expected_mode=MODE_PIP_WALL,
+                expected_session_id=sid,
             )
 
     def test_bounded_tables_and_expired_eviction(self) -> None:
@@ -802,7 +807,9 @@ class TestUiAuthManager(unittest.TestCase):
         self._new_session(mgr)
         extra_code = mgr.mint_bootstrap_code()
         with self.assertRaises(UiAuthDeniedError):
-            mgr.exchange_bootstrap_code(extra_code, host_header=_TEST_HOST)
+            mgr.exchange_bootstrap_code(
+                extra_code, host_header=_TEST_HOST, origin_header=_TEST_ORIGIN
+            )
 
         mgr.mint_ws_ticket(
             sid1,
@@ -900,6 +907,7 @@ class TestUiAuthManager(unittest.TestCase):
                 expected_incarnation_id=_TEST_INCARNATION,
                 expected_surface_kind=SURFACE_EVENTS,
                 expected_mode=MODE_OBSERVE,
+                expected_session_id=sid,
             )
 
     def test_ws_ticket_session_pinning_idle_expiry_and_surrogate_revoke(self) -> None:
@@ -976,6 +984,7 @@ class TestUiAuthManager(unittest.TestCase):
                 expected_incarnation_id=_TEST_INCARNATION,
                 expected_surface_kind=SURFACE_EVENTS,
                 expected_mode=MODE_OBSERVE,
+                expected_session_id=sid_a,
             )
 
         # Unpaired surrogate in revoke_session returns False cleanly

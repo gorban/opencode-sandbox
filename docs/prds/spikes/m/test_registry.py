@@ -444,6 +444,16 @@ class TestRegistryCoreAndConcurrency(unittest.TestCase):
             max_queued_bytes=1_048_576,
         )
 
+        self.assertTrue(
+            self.reg.mark_outbox_dispatch_started(
+                sent_q.msg_id,
+                edge_id="edge_ab",
+                grant_generation=1,
+                dst_incarnation=_INC_2,
+            )
+        )
+        self.reg.mark_outbox_handed_off(sent_q.msg_id, stream_id="stream_q1")
+
         a_env = _make_envelope(
             _SB_A,
             _INC_1,
@@ -855,13 +865,10 @@ class TestProvenanceTuiWorktreesAndAudit(unittest.TestCase):
             ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED.value,
         )
 
-        nul_ev = StreamEvent(
-            "user_message", _SB_A, _INC_1, _THREAD_MAIN, message_id="msg_2", text="bad\x00nul"
-        )
-        self.assertEqual(
-            self.reg.record_stream_event(nul_ev)["badge"],
-            ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED.value,
-        )
+        with self.assertRaises(CoordValidationError):
+            StreamEvent(
+                "user_message", _SB_A, _INC_1, _THREAD_MAIN, message_id="msg_2", text="bad\x00nul"
+            )
 
         huge_detail_ev = StreamEvent(
             "text_delta", _SB_A, _INC_1, _THREAD_MAIN, detail={"blob": "x" * (MAX_STREAM_EVENT_BYTES + 64)}

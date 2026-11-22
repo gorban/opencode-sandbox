@@ -397,12 +397,11 @@ class UiAuthManager:
         code: str,
         *,
         host_header: str,
-        origin_header: str | None = None,
+        origin_header: str | None,
     ) -> tuple[SessionRecord, str, str]:
         """Atomically exchange a one-time bootstrap code for a session, CSRF token, and Set-Cookie."""
         valid_host = self._require_valid_host(host_header)
-        if origin_header is not None:
-            self._require_valid_origin(origin_header, host_header=valid_host)
+        self._require_valid_origin(origin_header, host_header=valid_host)
         if type(code) is not str or not code:
             raise UiAuthDeniedError(_ERR_INVALID_BOOTSTRAP_CODE)
 
@@ -574,9 +573,7 @@ class UiAuthManager:
             raise UiAuthDeniedError("WebSocket ticket scope mismatch")
 
     @staticmethod
-    def _optional_session_digest(expected_session_id: str | None) -> str | None:
-        if expected_session_id is None:
-            return None
+    def _require_session_digest(expected_session_id: str | None) -> str:
         if type(expected_session_id) is not str or not expected_session_id:
             raise UiAuthDeniedError(_ERR_INVALID_SESSION)
         return _sha256_hex(expected_session_id)
@@ -591,7 +588,7 @@ class UiAuthManager:
         expected_incarnation_id: str,
         expected_surface_kind: str,
         expected_mode: str,
-        expected_session_id: str | None = None,
+        expected_session_id: str | None,
     ) -> WsTicketScope:
         """Atomically consume a single-use WS ticket after verifying Host, Origin, TTL, session, and scope pins."""
         valid_host = self._require_valid_host(host_header)
@@ -601,7 +598,7 @@ class UiAuthManager:
         )
         if type(ticket) is not str or not ticket:
             raise UiAuthDeniedError(_ERR_INVALID_WS_TICKET)
-        expected_session_digest = self._optional_session_digest(expected_session_id)
+        expected_session_digest = self._require_session_digest(expected_session_id)
         ticket_digest = _sha256_hex(ticket)
 
         with self._lock:
@@ -617,9 +614,7 @@ class UiAuthManager:
             scope = entry.scope
             if scope.session_id_hash not in self._sessions:
                 raise UiAuthDeniedError(_ERR_INVALID_SESSION)
-            if expected_session_digest is not None and not hmac.compare_digest(
-                scope.session_id_hash, expected_session_digest
-            ):
+            if not hmac.compare_digest(scope.session_id_hash, expected_session_digest):
                 raise UiAuthDeniedError(_ERR_INVALID_SESSION)
             self._verify_ws_scope_match(
                 scope,

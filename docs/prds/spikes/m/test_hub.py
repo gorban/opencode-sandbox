@@ -435,13 +435,20 @@ class InMemoryRegistryStore:
             if row is not None and row["status"] == _STATUS_HANDED_OFF:
                 row["status"] = _STATUS_COMPLETED
 
+    def mark_outbox_aborted(self, msg_id: str, *, reason: str = "stream_aborted") -> None:
+        with self._lock:
+            row = self.outbox.get(msg_id)
+            if row is not None and row["status"] == _STATUS_HANDED_OFF:
+                row["status"] = "aborted"
+                row["detail"] = reason
+
     def cancel_outbox_row(self, msg_id: str, *, reason: str) -> None:
         with self._lock:
             row = self.outbox.get(msg_id)
             if row is None:
                 return
-            if row["status"] != _STATUS_PENDING:
-                raise CoordValidationError("cancel_outbox_row requires pending status")
+            if row["status"] not in (_STATUS_PENDING, _STATUS_DISPATCH_STARTED):
+                raise CoordValidationError("cancel_outbox_row requires pending or dispatch_started")
             row["status"] = _STATUS_CANCELLED
             row["detail"] = reason
 
@@ -488,9 +495,31 @@ class InMemoryRegistryStore:
         }
         return role_map[env.src_role]
 
+    def has_committed_artifact(
+        self, sandbox_addr: str, incarnation_id: str, blob_sha256: str
+    ) -> bool:
+        with self._lock:
+            for msg_id, env in self.envelopes.items():
+                if env.dst_addr != sandbox_addr or env.dst_incarnation != incarnation_id:
+                    continue
+                ob = self.outbox.get(msg_id)
+                if ob is not None and ob["status"] == _STATUS_CANCELLED:
+                    continue
+                if any(ref.blob_sha256 == blob_sha256 for ref in env.artifact_refs):
+                    return True
+            return False
+
     def list_events_since(
-        self, sandbox_addrs: Iterable[str], since_seq: int, *, limit: int = 200
+        self,
+        sandbox_addrs: Iterable[str],
+        since_seq: int,
+        *,
+        limit: int = 200,
+        allowed_threads_by_sandbox: Any = None,
+        required_incarnations: Any = None,
+        exclude_trust_classes: frozenset[str] = frozenset(),
     ) -> list[dict[str, Any]]:
+        _ = (allowed_threads_by_sandbox, required_incarnations, exclude_trust_classes)
         addr_set = set(sandbox_addrs)
         with self._lock:
             matched = [
@@ -803,13 +832,10 @@ class TestCoordHub(unittest.TestCase):
         wrong_inc = PrincipalCtx(
             CoordRole.JOB, "job-a", sandbox_addr=_TARGET_ALPHA, incarnation_id="inc_wrong"
         )
-        none_inc = PrincipalCtx(
-            CoordRole.JOB, "job-a", sandbox_addr=_TARGET_ALPHA, incarnation_id=None
-        )
         with self.assertRaises(IncarnationMismatchError):
             self.hub.send(wrong_inc, target=_TARGET_BETA, body_text="stale inc")
-        with self.assertRaises(IncarnationMismatchError):
-            self.hub.send(none_inc, target=_TARGET_BETA, body_text="missing inc")
+        with self.assertRaises(CoordValidationError):
+            PrincipalCtx(CoordRole.JOB, "job-a", sandbox_addr=_TARGET_ALPHA, incarnation_id=None)
 
     def test_subtree_budget_attenuation_global_cap_and_brief_validation(self) -> None:
         tiny_budget = SubtreeBudget(max_depth_remaining=1, max_children=1, max_total_sandboxes=2)
@@ -1202,8 +1228,10 @@ class TestCoordHub(unittest.TestCase):
         with self.assertRaises(CoordPolicyError):
             ArtifactSpool(sb_root / "state", sandbox_root=sb_root)
 
+        small_state = Path(self._tmp.name) / "small_state"
+        os.mkdir(small_state, 0o700)
         small_spool = ArtifactSpool(
-            self.state_dir, max_edge_count=1, max_edge_bytes=16, max_global_count=1
+            small_state, max_edge_count=1, max_edge_bytes=16, max_global_count=1
         )
         resv = small_spool.reserve("edge_cap", [b"1234567890"])
         with self.assertRaises(CoordBackpressureError):

@@ -57,6 +57,7 @@ from oc_coord_contract import (  # noqa: E402
     PrincipalCtx,
     RevocationStatus,
     RevokedError,
+    validate_reason_text,
 )
 
 MAX_FRAME_BYTES = 131_072
@@ -68,6 +69,7 @@ READ_TIMEOUT_SECONDS = 5.0
 WRITE_TIMEOUT_SECONDS = 5.0
 TOTAL_REQUEST_TIMEOUT_SECONDS = 15.0
 MAX_WAIT_TIMEOUT_SECONDS = 60.0
+MAX_WAIT_TARGETS = 64
 MAX_RATE_LIMITER_KEYS = 1_024
 MAX_SEQ_INT = (1 << 63) - 1
 
@@ -501,8 +503,11 @@ def _parse_wait_params(params: dict[str, Any]) -> tuple[tuple[str, ...], int, fl
     raw_targets = params.get("targets")
     if not isinstance(raw_targets, list) or not raw_targets:
         raise CoordValidationError("targets must be a non-empty list of strings")
+    if len(raw_targets) > MAX_WAIT_TARGETS:
+        raise CoordValidationError(f"targets exceeds maximum of {MAX_WAIT_TARGETS}")
     if any(type(t) is not str for t in raw_targets):
         raise CoordValidationError("every target in targets must be a string")
+    deduped_targets = tuple(dict.fromkeys(raw_targets))
     since_seq = params.get("since_seq", 0)
     if type(since_seq) is not int or not (0 <= since_seq <= MAX_SEQ_INT):
         raise CoordValidationError(f"since_seq must be an integer in 0..{MAX_SEQ_INT}")
@@ -515,7 +520,7 @@ def _parse_wait_params(params: dict[str, Any]) -> tuple[tuple[str, ...], int, fl
         raise CoordValidationError("timeout_s must be a finite number") from exc
     if not math.isfinite(timeout_s) or not (0.0 <= timeout_s <= MAX_WAIT_TIMEOUT_SECONDS):
         raise CoordValidationError(f"timeout_s must be in 0..{MAX_WAIT_TIMEOUT_SECONDS}")
-    return tuple(raw_targets), since_seq, timeout_s
+    return deduped_targets, since_seq, timeout_s
 
 
 def _serialize_revocation(status: RevocationStatus) -> dict[str, Any]:
@@ -574,6 +579,8 @@ class CoordUdsRpcServer:
         valid_io_timeout = _validate_finite_positive(io_timeout, "io_timeout")
         if token_principals is not None and required_auth_token is not None:
             raise ValueError("Specify at most one of token_principals or required_auth_token")
+        if token_principals is None and role in (CoordRole.JOB, CoordRole.EXTERNAL_PEER):
+            raise ValueError("JOB and EXTERNAL_PEER sockets require token_principals")
         if required_auth_token is not None and (
             type(required_auth_token) is not str or not required_auth_token
         ):
@@ -596,6 +603,7 @@ class CoordUdsRpcServer:
             _build_token_table(token_principals) if token_principals is not None else None
         )
         self.rate_limiter = SlidingWindowRateLimiter(rate_limit_max, rate_limit_window)
+        self.principal_rate_limiter = SlidingWindowRateLimiter(rate_limit_max, rate_limit_window)
         self._workers = ListenerWorkers()
         self._listener: socket.socket | None = None
         self._bound: BoundUds | None = None
@@ -717,7 +725,9 @@ class CoordUdsRpcServer:
             targets, since_seq, timeout_s = _parse_wait_params(params)
             return self._hub.wait(caller, targets=targets, since_seq=since_seq, timeout_s=timeout_s)
         if method == METHOD_REVOKE:
-            reason = _optional_str_default(params, "reason", "operator_revoked")
+            reason = validate_reason_text(
+                _optional_str_default(params, "reason", "operator_revoked")
+            )
             rev_status = self._hub.revoke(
                 caller, target=_require_str(params, _KEY_TARGET), reason=reason
             )
@@ -773,6 +783,11 @@ class CoordUdsRpcServer:
             self._send(conn, validated)
             return
         req_id, caller, method, params = validated
+        if self._token_table is not None and not self.principal_rate_limiter.allow(
+            caller.canonical_sender
+        ):
+            self._send(conn, _rpc_error(req_id, ERR_CODE_RATE_LIMIT, "principal_rate_limited"))
+            return
         self._send(conn, self._execute_request(req_id, caller, method, params))
 
     def _send(self, conn: socket.socket, payload: dict[str, Any]) -> None:

@@ -26,7 +26,9 @@ from oc_address import (
 )
 
 MAX_INLINE_BODY_BYTES = 65_536
+MAX_FRAMED_BODY_BYTES = MAX_INLINE_BODY_BYTES + 4_096
 MAX_STREAM_EVENT_BYTES = 262_144
+MAX_REASON_BYTES = 256
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACTS_PER_MSG = 8
 MAX_ARTIFACTS_PER_EDGE = 64
@@ -142,24 +144,63 @@ def validate_opaque_token(value: object, label: str) -> str:
     return text
 
 
-def canonicalize_body_text(text: object) -> str:
+_SECURITY_PROFILE_RANK: dict[str, int] = {
+    "standard": 0,
+    "desktop-wayland": 1,
+    "elevated-nested": 2,
+}
+
+
+def validate_reason_text(reason: object, label: str = "reason") -> str:
+    """Validate a bounded control/bidi-free operational reason string."""
+    text = check_no_control_or_bidi(reason, label)
+    if len(text.encode("utf-8")) > MAX_REASON_BYTES:
+        raise CoordValidationError(f"{label} exceeds {MAX_REASON_BYTES} bytes")
+    return text
+
+
+def _has_unpaired_surrogate(text: str) -> bool:
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+
+def validate_stream_text(text: object) -> str:
+    """Validate bounded UTF-8 stream event text with zero NUL or unpaired surrogates."""
+    if not isinstance(text, str):
+        raise CoordValidationError("StreamEvent text must be a string")
+    if "\x00" in text or _has_unpaired_surrogate(text):
+        raise CoordValidationError("StreamEvent text contains NUL or unpaired surrogate")
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CoordValidationError("StreamEvent text is not valid UTF-8") from exc
+    if len(encoded) > MAX_STREAM_EVENT_BYTES:
+        raise CoordValidationError("StreamEvent text exceeds maximum bounded size")
+    return text
+
+
+def canonicalize_body_text(text: object, *, max_bytes: int = MAX_INLINE_BODY_BYTES) -> str:
     """Canonicalize inline text identically on write-ahead dispatch and event ingestion."""
     if not isinstance(text, str):
         raise CoordValidationError("body_text must be a string")
     if "\x00" in text:
         raise CoordValidationError("NUL byte forbidden in body_text")
-    for ch in text:
-        if 0xD800 <= ord(ch) <= 0xDFFF:
-            raise CoordValidationError("Unpaired surrogate forbidden in body_text")
+    if _has_unpaired_surrogate(text):
+        raise CoordValidationError("Unpaired surrogate forbidden in body_text")
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    if len(normalized.encode("utf-8")) > MAX_INLINE_BODY_BYTES:
-        raise CoordValidationError(f"body_text exceeds {MAX_INLINE_BODY_BYTES} bytes; use artifact_refs")
+    try:
+        encoded = normalized.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CoordValidationError("body_text is not valid UTF-8") from exc
+    if len(encoded) > max_bytes:
+        raise CoordValidationError(f"body_text exceeds {max_bytes} bytes; use artifact_refs")
     return normalized
 
 
-def sha256_canonical_body(text: str) -> str:
+def sha256_canonical_body(text: str, *, max_bytes: int = MAX_FRAMED_BODY_BYTES) -> str:
     """Compute canonical UTF-8 SHA-256 hex digest of normalized body text."""
-    return hashlib.sha256(canonicalize_body_text(text).encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        canonicalize_body_text(text, max_bytes=max_bytes).encode("utf-8")
+    ).hexdigest()
 
 
 def validate_sandbox_rel_path(path: object) -> str:
@@ -206,7 +247,12 @@ def frame_untrusted_peer_message(
         f'kind="{kind_clean}" trust="untrusted-peer">'
     )
     close_tag = f'</oc-peer-message nonce="{chosen_nonce}">'
-    return f"{open_tag}\n{neutralized}\n{close_tag}", chosen_nonce
+    framed = f"{open_tag}\n{neutralized}\n{close_tag}"
+    if len(framed.encode("utf-8")) > MAX_FRAMED_BODY_BYTES:
+        raise CoordValidationError(
+            f"Framed peer message exceeds {MAX_FRAMED_BODY_BYTES} bytes; use artifact_refs"
+        )
+    return framed, chosen_nonce
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +272,12 @@ class PrincipalCtx:
             parse_canonical_addr(self.sandbox_addr)
         if self.incarnation_id is not None:
             validate_opaque_token(self.incarnation_id, "incarnation_id")
+        if self.role is CoordRole.JOB and (
+            self.sandbox_addr is None or self.incarnation_id is None
+        ):
+            raise CoordValidationError("JOB principal requires sandbox_addr and incarnation_id")
+        if self.role is CoordRole.ORCHESTRATOR and self.sandbox_addr is not None and self.incarnation_id is None:
+            raise CoordValidationError("Sandbox-bound ORCHESTRATOR requires incarnation_id")
 
     @property
     def trust_class(self) -> TrustClass:
@@ -236,7 +288,8 @@ class PrincipalCtx:
         if self.role is CoordRole.OPERATOR:
             return f"operator:{self.actor_id}"
         if self.role is CoordRole.ORCHESTRATOR:
-            return f"orchestrator:{self.actor_id}"
+            target = self.sandbox_addr if self.sandbox_addr is not None else self.actor_id
+            return f"orchestrator:{target}"
         if self.sandbox_addr is not None:
             return self.sandbox_addr
         return self.actor_id
@@ -260,17 +313,32 @@ class ArtifactRef:
             raise CoordValidationError(f"Invalid artifact media_type: {mt!r}")
 
 
+def _optional_subset(
+    parent_set: frozenset[str] | None, child_set: frozenset[str] | None
+) -> bool:
+    if parent_set is None:
+        return True
+    if child_set is None:
+        return False
+    return child_set.issubset(parent_set)
+
+
 @dataclass(frozen=True, slots=True)
 class SubtreeBudget:
-    """Monotonic capability budget delegated to a root or sub-orchestrator."""
+    """Monotonic capability budget delegated to a root or sub-orchestrator.
+
+    Empty frozenset() ALWAYS means deny-all (never unrestricted). For models and
+    variants, None explicitly represents unrestricted; once narrowed to a
+    frozenset, descendants can never widen back to None or add entries.
+    """
 
     max_depth_remaining: int = DEFAULT_MAX_SUBTREE_DEPTH
     max_children: int = DEFAULT_MAX_CHILDREN_PER_PARENT
     max_total_sandboxes: int = DEFAULT_MAX_TOTAL_SANDBOXES
     allowed_workers: frozenset[str] = frozenset({"local"})
     allowed_sandbox_types: frozenset[str] = frozenset({"default"})
-    allowed_models: frozenset[str] = frozenset()
-    allowed_variants: frozenset[str] = frozenset()
+    allowed_models: frozenset[str] | None = None
+    allowed_variants: frozenset[str] | None = None
     allowed_broker_routes: frozenset[str] = frozenset()
     max_security_profile: str = "standard"
 
@@ -281,28 +349,28 @@ class SubtreeBudget:
             raise CoordValidationError("max_children out of bounds")
         if type(self.max_total_sandboxes) is not int or not (1 <= self.max_total_sandboxes <= 64):
             raise CoordValidationError("max_total_sandboxes out of bounds")
-        if self.max_security_profile not in ("standard", "desktop-wayland", "elevated-nested"):
+        if self.max_security_profile not in _SECURITY_PROFILE_RANK:
             raise CoordValidationError(f"Invalid max_security_profile: {self.max_security_profile!r}")
 
     def attenuates(self, child: SubtreeBudget) -> bool:
-        """Return True iff child is strictly <= self along every capability axis."""
-        if child.max_depth_remaining >= self.max_depth_remaining and self.max_depth_remaining > 0:
-            return False
-        if self.max_depth_remaining == 0 and child.max_depth_remaining != 0:
+        """Return True iff self can delegate child with strictly narrower depth and <= capability."""
+        if self.max_depth_remaining == 0 or child.max_depth_remaining >= self.max_depth_remaining:
             return False
         if child.max_children > self.max_children or child.max_total_sandboxes > self.max_total_sandboxes:
             return False
-        if not child.allowed_workers.issubset(self.allowed_workers):
+        sets_ok = (
+            child.allowed_workers.issubset(self.allowed_workers)
+            and child.allowed_sandbox_types.issubset(self.allowed_sandbox_types)
+            and child.allowed_broker_routes.issubset(self.allowed_broker_routes)
+            and _optional_subset(self.allowed_models, child.allowed_models)
+            and _optional_subset(self.allowed_variants, child.allowed_variants)
+        )
+        if not sets_ok:
             return False
-        if not child.allowed_sandbox_types.issubset(self.allowed_sandbox_types):
-            return False
-        if self.allowed_models and not child.allowed_models.issubset(self.allowed_models):
-            return False
-        if self.allowed_variants and not child.allowed_variants.issubset(self.allowed_variants):
-            return False
-        if self.allowed_broker_routes and not child.allowed_broker_routes.issubset(self.allowed_broker_routes):
-            return False
-        return child.max_security_profile == "standard" or child.max_security_profile == self.max_security_profile
+        return (
+            _SECURITY_PROFILE_RANK[child.max_security_profile]
+            <= _SECURITY_PROFILE_RANK[self.max_security_profile]
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,8 +471,7 @@ class StreamEvent:
         parse_canonical_addr(self.sandbox_addr)
         validate_opaque_token(self.incarnation_id, "incarnation_id")
         validate_thread_id(self.thread_id)
-        if not isinstance(self.text, str) or len(self.text.encode("utf-8")) > MAX_STREAM_EVENT_BYTES:
-            raise CoordValidationError("StreamEvent text exceeds maximum bounded size")
+        validate_stream_text(self.text)
         if self.file_path is not None:
             validate_sandbox_rel_path(self.file_path)
 

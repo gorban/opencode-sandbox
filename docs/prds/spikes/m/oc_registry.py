@@ -43,9 +43,12 @@ from oc_address import (  # noqa: E402
 from oc_broker_common import _UMASK_LOCK  # noqa: E402
 from oc_coord_contract import (  # noqa: E402
     MAX_ARTIFACTS_PER_MSG,
+    MAX_FRAMED_BODY_BYTES,
+    MAX_INLINE_BODY_BYTES,
     MAX_STREAM_EVENT_BYTES,
     ROLE_TO_TRUST_CLASS,
     SANDBOX_LIFECYCLE_STATES,
+    STREAM_EVENT_TYPES,
     ArtifactRef,
     CoordAuthError,
     CoordBackpressureError,
@@ -65,6 +68,9 @@ from oc_coord_contract import (  # noqa: E402
     is_control_priority,
     sha256_canonical_body,
     validate_opaque_token,
+    validate_reason_text,
+    validate_sandbox_rel_path,
+    validate_stream_text,
     validate_task_brief,
 )
 from oc_schema import (  # noqa: E402
@@ -91,8 +97,22 @@ _STATUS_DISPATCH_STARTED = "dispatch_started"
 _STATUS_HANDED_OFF = "handed_off"
 _STATUS_UNCERTAIN = "uncertain"
 _STATUS_COMPLETED = "completed"
+_STATUS_ABORTED = "aborted"
 _STATUS_CANCELLED = "cancelled"
 _STATUS_REVOKED = "revoked"
+_REPLYABLE_OUTBOX_STATUSES = (_STATUS_HANDED_OFF, _STATUS_COMPLETED, _STATUS_UNCERTAIN)
+_ORCH_ACTOR_PREFIX = "orchestrator:"
+
+
+def _sandbox_addr_from_actor(actor: str) -> str | None:
+    """Resolve a canonical sender actor string to its underlying local sandbox address, if any."""
+    if not isinstance(actor, str) or not actor:
+        return None
+    candidate = actor[len(_ORCH_ACTOR_PREFIX) :] if actor.startswith(_ORCH_ACTOR_PREFIX) else actor
+    try:
+        return parse_local_target(candidate).canonical
+    except AddressError:
+        return None
 _STATUS_IDLE = "idle"
 
 _VALID_OUTBOX_STATUSES: frozenset[str] = frozenset(
@@ -102,6 +122,7 @@ _VALID_OUTBOX_STATUSES: frozenset[str] = frozenset(
         _STATUS_HANDED_OFF,
         _STATUS_UNCERTAIN,
         _STATUS_COMPLETED,
+        _STATUS_ABORTED,
         _STATUS_CANCELLED,
     }
 )
@@ -1179,16 +1200,21 @@ class CoordRegistry:
         src_actor: str,
         expected_src_incarnation: str | None,
     ) -> None:
-        if expected_src_incarnation is None:
-            return
-        sb = conn.execute(
-            "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?", (src_actor,)
-        ).fetchone()
+        sb_addr = _sandbox_addr_from_actor(src_actor)
+        sb = (
+            conn.execute(
+                "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?", (sb_addr,)
+            ).fetchone()
+            if sb_addr is not None
+            else None
+        )
         if sb is None:
+            if expected_src_incarnation is not None:
+                raise IncarnationMismatchError("src_sandbox_not_found")
             return
         if sb["status"] == _STATUS_REVOKED:
             raise RevokedError("src_sandbox_revoked")
-        if sb["incarnation_id"] != expected_src_incarnation:
+        if expected_src_incarnation is not None and sb["incarnation_id"] != expected_src_incarnation:
             raise IncarnationMismatchError("src_incarnation_mismatch")
 
     def _verify_in_reply_to(
@@ -1197,6 +1223,7 @@ class CoordRegistry:
         edge_row: sqlite3.Row,
         envelope: Envelope,
         check_in_reply_to: tuple[str, str, str],
+        expected_src_incarnation: str | None = None,
     ) -> None:
         ref_msg_id, caller_dst_addr, thread_id = check_in_reply_to
         if (
@@ -1206,12 +1233,16 @@ class CoordRegistry:
             raise CoordValidationError(_ERR_INVALID_IN_REPLY_TO)
         ref_row = conn.execute(
             """
-            SELECT src_actor, dst_addr, dst_thread_id FROM event_log
-            WHERE msg_id = ? AND dst_addr = ? AND dst_thread_id = ?
+            SELECT e.src_actor, e.dst_addr, e.dst_thread_id, e.dst_incarnation, o.status AS outbox_status
+            FROM event_log e
+            LEFT JOIN outbox o ON o.msg_id = e.msg_id
+            WHERE e.msg_id = ? AND e.dst_addr = ? AND e.dst_thread_id = ?
             """,
             (ref_msg_id, caller_dst_addr, thread_id),
         ).fetchone()
-        if ref_row is None:
+        if ref_row is None or ref_row["outbox_status"] not in _REPLYABLE_OUTBOX_STATUSES:
+            raise CoordValidationError(_ERR_INVALID_IN_REPLY_TO)
+        if expected_src_incarnation is not None and ref_row["dst_incarnation"] != expected_src_incarnation:
             raise CoordValidationError(_ERR_INVALID_IN_REPLY_TO)
         if edge_row["src_actor"] != caller_dst_addr or edge_row["dst_addr"] != ref_row["src_actor"]:
             raise CoordValidationError(_ERR_INVALID_IN_REPLY_TO)
@@ -1406,8 +1437,13 @@ class CoordRegistry:
             not isinstance(a, ArtifactRef) for a in envelope.artifact_refs
         ):
             raise CoordValidationError("Invalid or excessive artifact_refs")
-        canon_body = canonicalize_body_text(envelope.body_text)
-        canon_sha = sha256_canonical_body(canon_body)
+        max_body = (
+            MAX_FRAMED_BODY_BYTES
+            if envelope.trust_class is TrustClass.UNTRUSTED_PEER_DATA
+            else MAX_INLINE_BODY_BYTES
+        )
+        canon_body = canonicalize_body_text(envelope.body_text, max_bytes=max_body)
+        canon_sha = sha256_canonical_body(canon_body, max_bytes=max_body)
         return canon_body, canon_sha, len(canon_body.encode("utf-8"))
 
     def admit_and_enqueue_send(
@@ -1435,8 +1471,22 @@ class CoordRegistry:
             )
             self._verify_source_sandbox_for_send(conn, envelope.src_actor, expected_src_incarnation)
             self._verify_target_sandbox_for_send(conn, envelope.dst_addr, expected_dst_incarnation)
-            if check_in_reply_to is not None:
-                self._verify_in_reply_to(conn, edge_row, envelope, check_in_reply_to)
+            effective_src_inc = (
+                expected_src_incarnation
+                if expected_src_incarnation is not None
+                else edge_row["src_incarnation"]
+            )
+            effective_reply = check_in_reply_to
+            if effective_reply is None and envelope.in_reply_to is not None:
+                effective_reply = (
+                    envelope.in_reply_to,
+                    envelope.src_actor,
+                    envelope.dst_thread_id,
+                )
+            if effective_reply is not None:
+                self._verify_in_reply_to(
+                    conn, edge_row, envelope, effective_reply, effective_src_inc
+                )
             if priority == 0:
                 self._check_outbox_backpressure(
                     conn, edge_id, body_bytes, max_queued_msgs, max_queued_bytes
@@ -1445,11 +1495,6 @@ class CoordRegistry:
                 conn, edge_row, edge_id, expected_grant_generation, count_turn
             )
             seq = self._next_seq(conn)
-            effective_src_inc = (
-                expected_src_incarnation
-                if expected_src_incarnation is not None
-                else edge_row["src_incarnation"]
-            )
             updated_env = replace(
                 envelope,
                 seq=seq,
@@ -1492,6 +1537,7 @@ class CoordRegistry:
     def _revoke_whole_sandbox_conn(
         self, conn: sqlite3.Connection, target_addr: str, reason: str, now: float
     ) -> None:
+        orch_actor = f"{_ORCH_ACTOR_PREFIX}{target_addr}"
         conn.execute(
             "UPDATE sandboxes SET status = ?, updated_at = ? WHERE sandbox_addr = ?",
             (_STATUS_REVOKED, now, target_addr),
@@ -1503,15 +1549,70 @@ class CoordRegistry:
             """,
             (now, target_addr),
         )
+        conn.execute(
+            "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND sandbox_addr = ?",
+            (target_addr,),
+        )
         rows = conn.execute(
             """
             SELECT o.msg_id FROM outbox o
             JOIN event_log e ON e.msg_id = o.msg_id
-            WHERE o.status = ? AND (e.dst_addr = ? OR e.src_actor = ?)
+            WHERE o.status = ? AND (e.dst_addr = ? OR e.src_actor = ? OR e.src_actor = ?)
             """,
-            (_STATUS_PENDING, target_addr, target_addr),
+            (_STATUS_PENDING, target_addr, target_addr, orch_actor),
         ).fetchall()
         self._cancel_pending_outbox_msgs(conn, [r["msg_id"] for r in rows], reason, now)
+
+    def invalidate_prior_incarnation(
+        self, sandbox_addr: str, new_incarnation_id: str, *, reason: str = "incarnation_rotated"
+    ) -> list[str]:
+        """Invalidate prior-incarnation edges, pending outbox rows, receipts, and TUI tokens."""
+        clean_addr = parse_local_target(sandbox_addr).canonical
+        validate_opaque_token(new_incarnation_id, "new_incarnation_id")
+        clean_reason = validate_reason_text(reason, "reason")
+        orch_actor = f"{_ORCH_ACTOR_PREFIX}{clean_addr}"
+        now = time.time()
+        with self._tx() as conn:
+            conn.execute(
+                """
+                UPDATE tui_enter_tokens SET consumed_at = ?
+                WHERE sandbox_addr = ? AND incarnation_id != ? AND consumed_at IS NULL
+                """,
+                (now, clean_addr, new_incarnation_id),
+            )
+            conn.execute(
+                """
+                DELETE FROM dispatch_receipts
+                WHERE consumed_at IS NULL AND sandbox_addr = ? AND incarnation_id != ?
+                """,
+                (clean_addr, new_incarnation_id),
+            )
+            stale_outbox = conn.execute(
+                """
+                SELECT o.msg_id FROM outbox o
+                JOIN event_log e ON e.msg_id = o.msg_id
+                WHERE o.status = ? AND (
+                    (e.dst_addr = ? AND o.dst_incarnation != ?)
+                    OR ((e.src_actor = ? OR e.src_actor = ?) AND o.src_incarnation IS NOT NULL AND o.src_incarnation != ?)
+                )
+                """,
+                (_STATUS_PENDING, clean_addr, new_incarnation_id, clean_addr, orch_actor, new_incarnation_id),
+            ).fetchall()
+            self._cancel_pending_outbox_msgs(
+                conn, [r["msg_id"] for r in stale_outbox], clean_reason, now
+            )
+            edge_rows = conn.execute(
+                """
+                SELECT edge_id, grant_generation FROM routing_edges
+                WHERE active = 1 AND (
+                    dst_addr = ?
+                    OR ((src_actor = ? OR src_actor = ?) AND src_incarnation IS NOT NULL AND src_incarnation != ?)
+                )
+                ORDER BY edge_id ASC
+                """,
+                (clean_addr, clean_addr, orch_actor, new_incarnation_id),
+            ).fetchall()
+            return self._revoke_matching_edges_conn(conn, edge_rows, clean_reason, now)
 
     def _build_revoke_where(
         self,
@@ -1522,8 +1623,9 @@ class CoordRegistry:
         clauses: list[str] = []
         params: list[Any] = []
         if target_addr is not None:
-            clauses.append("(dst_addr = ? OR src_actor = ?)")
-            params.extend((target_addr, target_addr))
+            orch_actor = f"{_ORCH_ACTOR_PREFIX}{target_addr}"
+            clauses.append("(dst_addr = ? OR src_actor = ? OR src_actor = ?)")
+            params.extend((target_addr, target_addr, orch_actor))
         if edge_id is not None:
             clauses.append("edge_id = ?")
             params.append(edge_id)
@@ -1551,15 +1653,37 @@ class CoordRegistry:
                 (eid, gen, reason, now),
             )
             conn.execute("UPDATE routing_edges SET active = 0 WHERE edge_id = ?", (eid,))
-            pending_rows = conn.execute(
-                """
-                SELECT msg_id FROM outbox
-                WHERE edge_id = ? AND grant_generation = ? AND status = ?
-                """,
-                (eid, gen, _STATUS_PENDING),
+            all_edge_msgs = conn.execute(
+                "SELECT msg_id, status FROM outbox WHERE edge_id = ? AND grant_generation = ?",
+                (eid, gen),
             ).fetchall()
-            self._cancel_pending_outbox_msgs(conn, [r["msg_id"] for r in pending_rows], reason, now)
+            pending_ids = [r["msg_id"] for r in all_edge_msgs if r["status"] == _STATUS_PENDING]
+            self._cancel_pending_outbox_msgs(conn, pending_ids, reason, now)
+            all_ids = [r["msg_id"] for r in all_edge_msgs]
+            if all_ids:
+                placeholders = ",".join("?" for _ in all_ids)
+                conn.execute(
+                    f"DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id IN ({placeholders})",
+                    tuple(all_ids),
+                )
         return revoked_ids
+
+    def _revoke_lease_only_outbox_conn(
+        self, conn: sqlite3.Connection, lease_request_id: str, reason: str, now: float
+    ) -> None:
+        lease_rows = conn.execute(
+            "SELECT msg_id, status FROM outbox WHERE lease_request_id = ?",
+            (lease_request_id,),
+        ).fetchall()
+        pending_ids = [r["msg_id"] for r in lease_rows if r["status"] == _STATUS_PENDING]
+        self._cancel_pending_outbox_msgs(conn, pending_ids, reason, now)
+        all_lease_ids = [r["msg_id"] for r in lease_rows]
+        if all_lease_ids:
+            placeholders = ",".join("?" for _ in all_lease_ids)
+            conn.execute(
+                f"DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id IN ({placeholders})",
+                tuple(all_lease_ids),
+            )
 
     def revoke_grant_and_cancel_outbox(
         self,
@@ -1569,6 +1693,7 @@ class CoordRegistry:
         lease_request_id: str | None = None,
         reason: str = "revoked",
     ) -> list[str]:
+        clean_reason = validate_reason_text(reason, "reason")
         where, params = self._build_revoke_where(target_addr, edge_id, lease_request_id)
         whole_sandbox = target_addr is not None and edge_id is None and lease_request_id is None
         lease_only = lease_request_id is not None and edge_id is None and target_addr is None
@@ -1576,25 +1701,21 @@ class CoordRegistry:
 
         with self._tx() as conn:
             if whole_sandbox and target_addr is not None:
-                self._revoke_whole_sandbox_conn(conn, target_addr, reason, now)
+                self._revoke_whole_sandbox_conn(conn, target_addr, clean_reason, now)
             rows = conn.execute(
                 f"SELECT edge_id, grant_generation FROM routing_edges WHERE {where} ORDER BY edge_id ASC",
                 params,
             ).fetchall()
-            revoked_ids = self._revoke_matching_edges_conn(conn, rows, reason, now)
+            revoked_ids = self._revoke_matching_edges_conn(conn, rows, clean_reason, now)
             if lease_only and lease_request_id is not None:
-                lease_rows = conn.execute(
-                    "SELECT msg_id FROM outbox WHERE lease_request_id = ? AND status = ?",
-                    (lease_request_id, _STATUS_PENDING),
-                ).fetchall()
-                self._cancel_pending_outbox_msgs(conn, [r["msg_id"] for r in lease_rows], reason, now)
+                self._revoke_lease_only_outbox_conn(conn, lease_request_id, clean_reason, now)
             self._append_audit_conn(
                 conn,
                 "host",
                 "revoke_grant_and_cancel_outbox",
                 target_addr or edge_id or lease_request_id or "",
                 _STATUS_REVOKED,
-                {"revoked_edges": revoked_ids, "reason": reason},
+                {"revoked_edges": revoked_ids, "reason": clean_reason},
             )
             return revoked_ids
 
@@ -1648,15 +1769,21 @@ class CoordRegistry:
         ).fetchone()
         if dst_sb is None or dst_sb["status"] == _STATUS_REVOKED or dst_sb["incarnation_id"] != dst_incarnation:
             return False
-        if src_incarnation is not None:
-            src_sb = conn.execute(
+        src_sb_addr = _sandbox_addr_from_actor(edge["src_actor"])
+        src_sb = (
+            conn.execute(
                 "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?",
-                (edge["src_actor"],),
+                (src_sb_addr,),
             ).fetchone()
-            if src_sb is not None and (
-                src_sb["status"] == _STATUS_REVOKED or src_sb["incarnation_id"] != src_incarnation
-            ):
-                return False
+            if src_sb_addr is not None
+            else None
+        )
+        if src_sb is None:
+            return src_incarnation is None
+        if src_sb["status"] == _STATUS_REVOKED:
+            return False
+        if src_incarnation is not None and src_sb["incarnation_id"] != src_incarnation:
+            return False
         return True
 
     def mark_outbox_dispatch_started(
@@ -1774,7 +1901,8 @@ class CoordRegistry:
             if cur.rowcount != 1:
                 raise CoordValidationError(_ERR_INVALID_OUTBOX_TRANSITION)
 
-    def cancel_outbox_row(self, msg_id: str, *, reason: str) -> None:
+    def mark_outbox_aborted(self, msg_id: str, *, reason: str = "stream_aborted") -> None:
+        clean_reason = validate_reason_text(reason, "reason")
         now = time.time()
         with self._tx() as conn:
             cur = conn.execute(
@@ -1782,7 +1910,25 @@ class CoordRegistry:
                 UPDATE outbox SET status = ?, detail = ?, updated_at = ?
                 WHERE msg_id = ? AND status = ?
                 """,
-                (_STATUS_CANCELLED, reason, now, msg_id, _STATUS_PENDING),
+                (_STATUS_ABORTED, clean_reason, now, msg_id, _STATUS_HANDED_OFF),
+            )
+            if cur.rowcount != 1:
+                raise CoordValidationError(_ERR_INVALID_OUTBOX_TRANSITION)
+            conn.execute(
+                "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?",
+                (msg_id,),
+            )
+
+    def cancel_outbox_row(self, msg_id: str, *, reason: str) -> None:
+        clean_reason = validate_reason_text(reason, "reason")
+        now = time.time()
+        with self._tx() as conn:
+            cur = conn.execute(
+                """
+                UPDATE outbox SET status = ?, detail = ?, updated_at = ?
+                WHERE msg_id = ? AND status IN (?, ?)
+                """,
+                (_STATUS_CANCELLED, clean_reason, now, msg_id, _STATUS_PENDING, _STATUS_DISPATCH_STARTED),
             )
             if cur.rowcount != 1:
                 raise CoordValidationError(_ERR_INVALID_OUTBOX_TRANSITION)
@@ -1795,6 +1941,17 @@ class CoordRegistry:
     # Provenance Receipts, TUI Enter Tokens, & Hostile Stream Events
     # ------------------------------------------------------------------
 
+    def _sandbox_is_live_conn(
+        self, conn: sqlite3.Connection, sandbox_addr: str, incarnation_id: str
+    ) -> bool:
+        sb = conn.execute(
+            "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?",
+            (sandbox_addr,),
+        ).fetchone()
+        if sb is None:
+            return False
+        return sb["status"] != _STATUS_REVOKED and sb["incarnation_id"] == incarnation_id
+
     def consume_dispatch_receipt(
         self,
         sandbox_addr: str,
@@ -1804,11 +1961,13 @@ class CoordRegistry:
         body_text: str,
     ) -> ProvenanceBadge | None:
         try:
-            canon_sha = sha256_canonical_body(body_text)
+            canon_sha = sha256_canonical_body(body_text, max_bytes=MAX_FRAMED_BODY_BYTES)
         except CoordValidationError:
             return None
         now = time.time()
         with self._tx() as conn:
+            if not self._sandbox_is_live_conn(conn, sandbox_addr, incarnation_id):
+                return None
             row = conn.execute(
                 """
                 SELECT badge FROM dispatch_receipts
@@ -1853,6 +2012,14 @@ class CoordRegistry:
         token_sha = hashlib.sha256(token.encode("utf-8")).hexdigest()
         expires_at = time.time() + float(ttl_s)
         with self._tx() as conn:
+            sb = conn.execute(
+                "SELECT incarnation_id, status FROM sandboxes WHERE sandbox_addr = ?",
+                (sandbox_addr,),
+            ).fetchone()
+            if sb is not None and (
+                sb["status"] == _STATUS_REVOKED or sb["incarnation_id"] != incarnation_id
+            ):
+                raise RevokedError("sandbox_revoked_or_rotated")
             conn.execute(
                 """
                 INSERT INTO tui_enter_tokens
@@ -1900,11 +2067,23 @@ class CoordRegistry:
             return ProvenanceBadge.TUI_INPUT
         return ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED
 
+    @staticmethod
+    def _validate_stream_event_fields(event: StreamEvent) -> None:
+        if not isinstance(event, StreamEvent):
+            raise CoordValidationError("event must be a StreamEvent")
+        if event.event_type not in STREAM_EVENT_TYPES:
+            raise CoordValidationError(f"Unsupported StreamEvent type: {event.event_type!r}")
+        parse_local_target(event.sandbox_addr)
+        validate_opaque_token(event.incarnation_id, "incarnation_id")
+        validate_thread_id(event.thread_id)
+        validate_stream_text(event.text)
+        if event.file_path is not None:
+            validate_sandbox_rel_path(event.file_path)
+
     def record_stream_event(
         self, event: StreamEvent, *, tui_enter_token: str | None = None
     ) -> dict[str, Any]:
-        if not isinstance(event, StreamEvent):
-            raise CoordValidationError("event must be a StreamEvent")
+        self._validate_stream_event_fields(event)
         clean_detail, detail_json = _sanitize_stream_detail(event.detail)
         safe_message_id = _sanitize_stream_message_id(event.message_id)
         now = _safe_timestamp(event.created_at)
@@ -1968,8 +2147,69 @@ class CoordRegistry:
                 "created_at": now,
             }
 
+    @staticmethod
+    def _event_trust_excluded(item: dict[str, Any], exclude_trust_classes: frozenset[str]) -> bool:
+        if not exclude_trust_classes:
+            return False
+        trust = item.get("trust_class")
+        if trust is not None and str(trust) in exclude_trust_classes:
+            return True
+        return (
+            item.get("badge") == ProvenanceBadge.OPERATOR.value
+            and TrustClass.OPERATOR_DIRECTIVE.value in exclude_trust_classes
+        )
+
+    @staticmethod
+    def _event_allowed_by_scope(
+        item: dict[str, Any],
+        *,
+        allowed_threads_by_sandbox: Mapping[str, frozenset[str]] | None,
+        required_incarnations: Mapping[str, str] | None,
+        exclude_trust_classes: frozenset[str],
+    ) -> bool:
+        addr = str(item.get("dst_addr") or item.get("sandbox_addr") or "")
+        inc = str(item.get("dst_incarnation") or item.get("incarnation_id") or "")
+        thread_id = str(item.get("dst_thread_id") or item.get("thread_id") or "")
+        if required_incarnations is not None and required_incarnations.get(addr) != inc:
+            return False
+        if allowed_threads_by_sandbox is not None:
+            allowed_threads = allowed_threads_by_sandbox.get(addr)
+            if allowed_threads is None or thread_id not in allowed_threads:
+                return False
+        return not CoordRegistry._event_trust_excluded(item, exclude_trust_classes)
+
+    def has_committed_artifact(
+        self, sandbox_addr: str, incarnation_id: str, blob_sha256: str
+    ) -> bool:
+        """Return True iff blob_sha256 was committed to (sandbox_addr, incarnation_id) on a non-cancelled envelope."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT e.artifact_refs_json FROM event_log e
+                LEFT JOIN outbox o ON o.msg_id = e.msg_id
+                WHERE e.dst_addr = ? AND e.dst_incarnation = ?
+                  AND (o.status IS NULL OR o.status != ?)
+                """,
+                (sandbox_addr, incarnation_id, _STATUS_CANCELLED),
+            ).fetchall()
+        for row in rows:
+            try:
+                refs = json.loads(row["artifact_refs_json"] or "[]")
+            except ValueError:
+                continue
+            if any(isinstance(r, dict) and r.get("blob_sha256") == blob_sha256 for r in refs):
+                return True
+        return False
+
     def list_events_since(
-        self, sandbox_addrs: Iterable[str], since_seq: int, *, limit: int = 200
+        self,
+        sandbox_addrs: Iterable[str],
+        since_seq: int,
+        *,
+        limit: int = 200,
+        allowed_threads_by_sandbox: Mapping[str, frozenset[str]] | None = None,
+        required_incarnations: Mapping[str, str] | None = None,
+        exclude_trust_classes: frozenset[str] = frozenset(),
     ) -> list[dict[str, Any]]:
         if type(limit) is not int or limit < 1:
             raise CoordValidationError("limit must be a positive integer")
@@ -1977,6 +2217,7 @@ class CoordRegistry:
         if not addrs:
             return []
         placeholders = ",".join("?" for _ in addrs)
+        fetch_limit = limit * 4 if (allowed_threads_by_sandbox or required_incarnations or exclude_trust_classes) else limit
         with self._lock:
             ev_rows = self._conn.execute(
                 f"""
@@ -1984,7 +2225,7 @@ class CoordRegistry:
                 WHERE dst_addr IN ({placeholders}) AND seq > ?
                 ORDER BY seq ASC LIMIT ?
                 """,
-                (*addrs, since_seq, limit),
+                (*addrs, since_seq, fetch_limit),
             ).fetchall()
             st_rows = self._conn.execute(
                 f"""
@@ -1992,11 +2233,22 @@ class CoordRegistry:
                 WHERE sandbox_addr IN ({placeholders}) AND seq > ?
                 ORDER BY seq ASC LIMIT ?
                 """,
-                (*addrs, since_seq, limit),
+                (*addrs, since_seq, fetch_limit),
             ).fetchall()
         merged = [_row_to_event_log_dict(r) for r in ev_rows] + [
             _row_to_stream_event_dict(r) for r in st_rows
         ]
+        if allowed_threads_by_sandbox is not None or required_incarnations is not None or exclude_trust_classes:
+            merged = [
+                item
+                for item in merged
+                if self._event_allowed_by_scope(
+                    item,
+                    allowed_threads_by_sandbox=allowed_threads_by_sandbox,
+                    required_incarnations=required_incarnations,
+                    exclude_trust_classes=exclude_trust_classes,
+                )
+            ]
         merged.sort(key=lambda item: int(item["seq"]))
         return merged[:limit]
 
