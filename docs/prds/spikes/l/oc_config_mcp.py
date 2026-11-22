@@ -285,6 +285,31 @@ class SlidingWindowRateLimiter:
             return True
 
 
+def _redact_broker_services(broker_services: dict[str, Any]) -> dict[str, Any]:
+    return {
+        name: {
+            "kind": cfg["kind"],
+            "credential_delivery": cfg["credential_delivery"],
+            "allow_streaming": bool(cfg.get("allow_streaming", False)),
+            "has_read_only_secret": bool(cfg.get("read_only_secret_ref")),
+            "has_write_secret": bool(cfg.get("write_secret_ref")),
+        }
+        for name, cfg in sorted(broker_services.items())
+    }
+
+
+def _redact_bundle_mcp(mcp_map: dict[str, Any]) -> dict[str, Any]:
+    redacted: dict[str, Any] = {}
+    for name, cfg in sorted(mcp_map.items()):
+        entry = dict(cfg)
+        entry.pop("allowed_cidrs", None)
+        url = entry.get("url")
+        if isinstance(url, str) and url.lower().startswith("https://"):
+            entry["url"] = "<redacted-remote-url>"
+        redacted[name] = entry
+    return redacted
+
+
 def _redact_object_for_orchestrator(kind: str, doc: dict[str, Any]) -> dict[str, Any]:
     out = dict(doc)
     if kind == "worker":
@@ -297,6 +322,11 @@ def _redact_object_for_orchestrator(kind: str, doc: dict[str, Any]) -> dict[str,
             {"slot": s["slot"], "target": s["target"], "mode": s["mode"], "configured": bool(s["secret_ref"])}
             for s in doc.get("secret_slots", [])
         ]
+    elif kind == "bundle":
+        if "broker_services" in out:
+            out["broker_services"] = _redact_broker_services(doc.get("broker_services", {}))
+        if "mcp" in out:
+            out["mcp"] = _redact_bundle_mcp(doc.get("mcp", {}))
     return out
 
 
@@ -408,10 +438,12 @@ class _BaseUdsRpcServer:
         self._cleanup_extra()
 
     def _accept_loop(self) -> None:
-        assert self._sock is not None
+        sock = self._sock
+        if sock is None:
+            return
         while not self._stop.is_set():
             try:
-                conn, _ = self._sock.accept()
+                conn, _ = sock.accept()
             except TimeoutError:
                 continue
             except OSError:
