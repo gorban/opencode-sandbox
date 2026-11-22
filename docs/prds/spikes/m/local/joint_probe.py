@@ -7,7 +7,6 @@ import argparse
 from collections.abc import Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import replace
 import os
 from pathlib import Path
 import secrets
@@ -394,7 +393,7 @@ def prove_pause(args: argparse.Namespace, state_dir: Path) -> None:
 
 
 def prove_replacement(args: argparse.Namespace, state_dir: Path, prior: CombinedPassExpectations) -> None:
-    from test_restart_qualification import verify_combined_pass_evidence
+    from test_restart_qualification import CombinedPassExpectations, verify_combined_pass_evidence
 
     with live_job(args, generation=2) as (job, broker):
         transport = ProofTransport(job, broker)
@@ -403,13 +402,18 @@ def prove_replacement(args: argparse.Namespace, state_dir: Path, prior: Combined
             msg_id = prove_edit(hub, registry, transport, job, broker)
             hub.revoke(OPERATOR, target=TARGET)
             assert_terminal(registry, transport, job)
-            verify_combined_pass_evidence(registry, replace(
-                prior,
+            evidence = CombinedPassExpectations(
                 completed_msg_ids=(*prior.completed_msg_ids, msg_id),
+                cancelled_msg_ids=prior.cancelled_msg_ids,
+                uncertain_msg_ids=prior.uncertain_msg_ids,
+                aborted_msg_ids=prior.aborted_msg_ids,
                 expected_attempts={**prior.expected_attempts, msg_id: 1},
                 tombstoned_grants=(*prior.tombstoned_grants, grant),
                 expected_stream_substrings={**prior.expected_stream_substrings, msg_id: EARLY_TEXT},
-            ))
+                expected_revoked_sandboxes=prior.expected_revoked_sandboxes,
+                expected_unconfirmed_bindings=prior.expected_unconfirmed_bindings,
+            )
+            verify_combined_pass_evidence(registry, evidence)
             report("Verified a fresh authorized incarnation completed at the original address.")
 
 

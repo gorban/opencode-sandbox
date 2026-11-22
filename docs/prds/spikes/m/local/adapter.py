@@ -33,6 +33,7 @@ SUBSCRIPTION_TIMEOUT = 40
 SESSION_LIMIT = 2
 STREAM_UNCONFIRMED = "native_stream_unconfirmed"
 INVALID_PROMPT_FRAME = "invalid_prompt_frame"
+LOCAL_GRANT_UNAVAILABLE = "local grant is unavailable"
 
 
 class PauseBarrier:
@@ -156,7 +157,7 @@ class LocalOpenCodeTransport:
         """Create and subscribe a fresh native session before binding a hub message."""
         with self._lock:
             if self._closed_admission or self._edge_id is None:
-                raise ProbeError("local grant is unavailable")
+                raise ProbeError(LOCAL_GRANT_UNAVAILABLE)
             if self._preparing or self._reservation is not None or len(self._sessions) >= SESSION_LIMIT:
                 raise ProbeError("local session slot is unavailable")
             self._preparing = True
@@ -173,7 +174,7 @@ class LocalOpenCodeTransport:
         session = client.create_session(time.monotonic() + REPLY_TIMEOUT)
         with self._lock:
             if self._closed_admission:
-                raise ProbeError("local grant is unavailable")
+                raise ProbeError(LOCAL_GRANT_UNAVAILABLE)
             if session in self._sessions:
                 self._closed_admission = True
                 self._last_error = "native_session_reused"
@@ -185,7 +186,7 @@ class LocalOpenCodeTransport:
             events = owner.enter_context(client.events(time.monotonic() + SUBSCRIPTION_TIMEOUT))
             with self._lock:
                 if self._closed_admission or not self._job_is_live():
-                    raise ProbeError("local grant is unavailable")
+                    raise ProbeError(LOCAL_GRANT_UNAVAILABLE)
                 self._reservation = _Reservation(client, events, owner.pop_all(), pins)
 
     def bind(self, msg_id: str) -> None:
@@ -369,6 +370,7 @@ class LocalOpenCodeTransport:
 
     def confirm_incarnation_terminal(self, sandbox_addr: str, incarnation_id: str, *,
                                      owner_id: str, reason: str) -> bool:
+        """Confirm the exact relay while CoordHub handles reason reporting."""
         if not self._target_matches(sandbox_addr, incarnation_id) or owner_id != self._owner_id:
             return False
         try:
@@ -378,6 +380,7 @@ class LocalOpenCodeTransport:
         return True
 
     def abort_incarnation(self, sandbox_addr: str, incarnation_id: str, *, reason: str) -> bool:
+        """Fence the owned job independently of the reason recorded by CoordHub."""
         self.transport_owner_id(sandbox_addr, incarnation_id)
         return self._abort()
 

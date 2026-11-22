@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 import json
 from pathlib import Path
+from secrets import token_hex
 import socket
 import sys
 from tempfile import TemporaryDirectory
@@ -146,7 +147,7 @@ class AdapterTests(unittest.TestCase):
         self.job = Mock(
             incarnation=INCARNATION, generation=1, run_label="a" * 32,
             ids={"relay": "b" * 64}, recorded_ids={"relay": "b" * 64},
-            control_socket=Path("/unused"), password="synthetic", terminal=False, assert_running=Mock(),
+            control_socket=Path("/unused"), password=token_hex(24), terminal=False, assert_running=Mock(),
             provider_socket=Path("/unused-provider"),
         )
         self.job.revoke.side_effect = self._mark_terminal
