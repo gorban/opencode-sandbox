@@ -1506,15 +1506,23 @@ class CoordRegistry:
                 conn, edge_row, edge_id, expected_grant_generation, count_turn
             )
             seq = self._next_seq(conn)
-            updated_env = replace(
-                envelope,
+            updated_env = Envelope(
+                msg_id=envelope.msg_id,
                 seq=seq,
+                src_role=envelope.src_role,
+                src_actor=envelope.src_actor,
                 src_incarnation=effective_src_inc,
+                dst_addr=envelope.dst_addr,
+                dst_thread_id=envelope.dst_thread_id,
                 dst_incarnation=expected_dst_incarnation,
+                trust_class=envelope.trust_class,
+                msg_kind=envelope.msg_kind,
                 body_text=canon_body,
                 body_sha256=canon_sha,
                 edge_id=edge_id,
                 edge_turn_seq=turn_seq,
+                in_reply_to=envelope.in_reply_to,
+                artifact_refs=envelope.artifact_refs,
                 created_at=now,
             )
             self._persist_admitted_send(conn, edge_row, updated_env, priority, body_bytes)
