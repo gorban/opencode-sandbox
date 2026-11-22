@@ -53,6 +53,8 @@ default. The containers share your host kernel. A microVM runtime such as libkru
     relabels files in throwaway containers. They see only the workspace or agent volume required
     for that operation and run without network, with capabilities dropped except `FOWNER` for
     relabelling. Symlinks resolve inside the container.
+  - Git hooks and fsmonitor are disabled for worktree operations. Checkout filters can still
+    run in the offline worktree container, which uses the agents' SELinux label and a time limit.
   - Global `-d -a` removes the workspace's `.bridge/` spool after attempting pod removal and
     clears host state, including the private editor staging directory. It unlinks symlinks in
     the spool. Project files and worktrees are kept. See [Uninstall](operations.md#uninstall).

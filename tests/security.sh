@@ -24,6 +24,13 @@ check() {  # description, command... ; a leading '!' negates
   if (( r == neg )); then ok "$d"; else bad "$d"; fi
 }
 fn()   { local requested_function=$1; sed -n "/^$requested_function() {/,/^}/p" "$SCRIPT"; }  # extract one function
+host_input_functions() {
+  fn in_sb
+  fn trusted_path
+  fn host_input
+  fn inspect_pg_init
+  printf 'SB=%q\nH=()\n' "$T/pg-sandbox"
+}
 SECRET=TOP-SECRET-HOST-DATA
 
 # ================================================================================================
@@ -41,7 +48,9 @@ cat > "$T/parse.sh" <<EOF
 $(fn trusted_path)
 in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
 die() { echo "\$*" >&2; exit 2; }
-sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T
+$(fn host_input); $(fn inspect_pg_init)
+SB=$T/pg-sandbox H=()
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T CALLER_PWD=$T
 $(fn load_pg_config)
 SCRIPT_DIR=. OC_PG_CONF=$T/pg.env
 load_pg_config
@@ -65,7 +74,9 @@ cat > "$T/parse2.sh" <<EOF
 $(fn trusted_path)
 in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
 die() { echo "\$*" >&2; exit 2; }
-sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T
+$(fn host_input); $(fn inspect_pg_init)
+SB=$T/pg-sandbox H=()
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T CALLER_PWD=$T
 $(fn load_pg_config)
 SCRIPT_DIR=. OC_PG_CONF=$T/pg.env
 load_pg_config; echo "\$PG_PASSWORD"; env > $T/child2.env
@@ -83,18 +94,47 @@ cat > "$T/parse-path.sh" <<EOF
 $(fn trusted_path)
 in_sb() { [[ \$1/ == "\$sb_real"/* ]]; }
 die() { echo "\$*" >&2; exit 2; }
-sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T SCRIPT_DIR=.
+$(fn host_input); $(fn inspect_pg_init)
+SB=$T/pg-sandbox H=()
+sb_real=$T/pg-sandbox CALLER_PHYSICAL=$T CALLER_PWD=$T SCRIPT_DIR=.
 $(fn load_pg_config)
 load_pg_config
 EOF
 check 'host Postgres config symlink outside sandbox is accepted' env -i HOME="$HOME" PATH="$PATH" OC_PG_CONF="$T/pg-host-link" bash "$T/parse-path.sh"
 check 'Postgres config path through sandbox is refused' bash -c '! env -i HOME="$1" PATH="$2" OC_PG_CONF="$3" bash "$4" >/dev/null 2>&1' _ "$HOME" "$PATH" "$T/pg-bad-link" "$T/parse-path.sh"
+mkdir -p "$T/pg-init"
+ln -s "$T/pg-sandbox" "$T/init-link"
+sed '$a\printf "%s\\n" "$PG_INIT"' "$T/parse-path.sh" > "$T/parse-init.sh"
+parse_init() { env -i HOME="$HOME" PATH="$PATH" OC_PG_CONF="$T/pg.env" OC_PG_INIT_DIR="$1" bash "$T/parse-init.sh"; }
+check 'relative Postgres init directory becomes a host bind path' test "$(parse_init pg-init)" = "$T/pg-init"
+check 'Postgres init directory entering sandbox is refused' ! parse_init "$T/init-link"
+check 'Postgres init directory containing sandbox is refused' ! parse_init "$T"
+check 'Postgres init rejects the filesystem root before inspecting it' ! parse_init /
+ln -s "$T/pg.env" "$T/pg-init/01.sql"
+cat > "$T/check-init-tree.sh" <<EOF
+set -euo pipefail
+$(host_input_functions)
+$(fn ensure_postgres)
+PG_INIT=$T/pg-init
+die() { echo "\$*"; exit 2; }
+pg_sig() { :; }
+pm() { echo unexpected-podman-call; exit 4; }
+ensure_postgres
+EOF
+out=$(bash "$T/check-init-tree.sh" 2>&1 || true)
+check 'linked Postgres init file refused before Podman' grep -qx 'Postgres init requires ordinary owner-controlled directories and files without links' <<<"$out"
+check 'linked Postgres init file never reaches Podman' ! grep -q 'unexpected-podman-call' <<<"$out"
+unlink "$T/pg-init/01.sql"
+install -m 0666 /dev/null "$T/pg-init/01.sql"
+out=$(bash "$T/check-init-tree.sh" 2>&1 || true)
+check 'world-writable Postgres init file refused before Podman' grep -q 'owner-controlled' <<<"$out"
 
 # ================================================================================================
 echo "Postgres password exposure (podman stubbed)"
 PW='S3cr3t-pw:@/#'
 cat > "$T/pg.sh" <<EOF
 set -euo pipefail
+$(host_input_functions)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { echo "==> \$*"; }
@@ -126,9 +166,10 @@ unkeyed=$(printf '%s|%s|%s|%s' app "$PW" db "" | sha256sum | cut -c1-16)
 check "volume label is not the unkeyed hash" ! grep -qa "$unkeyed" "$T/argv.log"
 check "signature key is private (0600)"    [ "$(stat -c %a "$T/state/pg-sig.key" 2>/dev/null)" = 600 ]
 
-pgmsg() {  # volume-label -> stderr of ensure_postgres for '-i default' with an existing volume
+pgmsg() {  # volume-label [init-directory] -> stderr of ensure_postgres with an existing volume
   cat > "$T/pgm.sh" <<EOF
 set -euo pipefail
+$(host_input_functions)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { :; }; sleep() { :; }
@@ -140,7 +181,7 @@ pm() {
   esac
   return 0
 }
-STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$T/none INST= ILABEL=default
+STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password PG_INIT=$(printf '%q' "${2:-$T/none}") INST= ILABEL=default
 PGHBASECRET=oc-pg-hba PGPASSSECRET=oc-pg-passfile PORTS=()
 PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD=pw
 ensure_postgres
@@ -153,6 +194,10 @@ check "legacy-volume hint keeps -i default"   grep -q -- '-i default -d && podma
 out=$(pgmsg mismatch)
 check "settings-mismatch hint keeps -i default" grep -q -- '-i default -d && podman volume rm oc-pg' <<<"$out"
 check "no hint suggests a bare -d"            ! grep -qE '\.sh -d && podman' <<<"$out$(pgmsg "$legacy")"
+mkdir -p "$T/directory-init/empty-subdirectory"
+directory_sig=$({ cat "$T/state/pg-sig.key"; printf '|app|pw|db|abcfa6a9d4df344d'; } | sha256sum | cut -c1-16)
+check "existing volume keeps its directory-only Postgres init signature" \
+  pgmsg "k1:$directory_sig" "$T/directory-init"
 
 # ================================================================================================
 echo "host bridge (oc-bridge.py)"
@@ -528,7 +573,24 @@ esac
 exit 0
 EOF
 chmod +x "$T/stub/podman"
-for c in systemctl pkexec sudo semodule distrobox-host-exec; do ln -s podman "$T/stub/$c"; done
+for c in systemctl pkexec sudo semodule; do ln -s podman "$T/stub/$c"; done
+cat > "$T/stub/distrobox-host-exec" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+if [[ $1 == /usr/bin/bash ]]; then
+  args=("$@")
+  # Model a shared-looking path that points into the sandbox on the host only.
+  if [[ ${args[-1]} == "$HOME/guest-only-path" ]]; then
+    args[-1]="$HOME/opencode-sandbox/host-path"
+  fi
+  exec "${args[@]}"
+fi
+case $1 in
+  cat|podman|systemctl) exec "$@" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$T/stub/distrobox-host-exec"
 stubbed() { env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "$SCRIPT" "$@"; }
 del() {  # args... -> log of stubbed commands
   : > "$T/stub.log"
@@ -586,6 +648,47 @@ helper_out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dh
   bash "$T/helper-repo/oc-sandbox" -d -a -y 2>&1 </dev/null || true)
 check "sandbox-linked lock helper refused" grep -q 'missing or unsafe oc-setup-lock.py' <<<"$helper_out"
 check "sandbox-linked lock helper never executed" test ! -e "$T/helper-executed"
+ln -s "$DSB/lock-helper.py" "$T/helper-repo/oc-bridge.py"
+helper_out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" \
+  bash "$T/helper-repo/oc-sandbox" -n 2>&1 </dev/null || true)
+check 'sandbox-linked bridge helper refused before setup' grep -q 'missing or unsafe oc-bridge.py' <<<"$helper_out"
+out=$(pathrun OC_CODE_BIN="$DSB/editor" -- -n)
+check 'sandbox-side editor executable refused' grep -q 'OC_CODE_BIN must be an absolute path outside the sandbox' <<<"$out"
+out=$(pathrun OC_BCOMPARE_BIN=$'/host/editor\nextra' -- -n)
+check 'newline in editor executable refused' grep -q 'OC_BCOMPARE_BIN must be an absolute path outside the sandbox' <<<"$out"
+out=$(pathrun CONTAINER_ID=fixture OC_CODE_BIN="$T/dhome/guest-only-path" -- -n)
+check 'editor path is refused when it enters the sandbox on the host only' \
+  grep -q 'OC_CODE_BIN must be an absolute path outside the sandbox' <<<"$out"
+out=$(pathrun CONTAINER_ID=fixture OC_PG_IMAGE=fixture OC_PG_USER=fixture \
+  OC_PG_PASSWORD=fixture OC_PG_DB=fixture OC_PG_INIT_DIR="$T/dhome/guest-only-path" -- -p -n)
+check 'Postgres init path is refused when it enters the sandbox on the host only' \
+  grep -q 'refusing unsafe host Postgres init directory' <<<"$out"
+ln -s "$T/outer"$'\n' "$T/path-linebreak"
+out=$(pathrun XDG_DATA_HOME="$T/path-linebreak" -- -l)
+check 'line break in symlink target refused before path splitting' grep -q 'refusing to use' <<<"$out"
+mkdir -p "$T/hid/hidraw0" "$T/usb/a/b"
+ln -s "$T/usb/a/b" "$T/hid/hidraw0/device"
+printf '\006\320\361' > "$T/usb/a/b/report_descriptor"
+printf 'Vendor|\033\302\233\nother-device\n' > "$T/usb/manufacturer"
+printf 'Product\r' > "$T/usb/product"
+printf '0102' > "$T/usb/idVendor"
+printf '0304' > "$T/usb/idProduct"
+cat > "$T/check-hid.sh" <<EOF
+set -euo pipefail
+H=()
+$(fn detect_keys | sed "s|/sys/class/hidraw|$T/hid|g")
+detect_keys
+EOF
+check 'FIDO display metadata stays on the detected device record' \
+  test "$(bash "$T/check-hid.sh")" = '/dev/hidraw0|Vendorother-device Product|0102:0304'
+printf 'Vendor\302|\233\302\001\233\302\302\233\233' > "$T/usb/manufacturer"
+check 'FIDO filtering cannot join bytes into terminal controls' \
+  test "$(bash "$T/check-hid.sh")" = '/dev/hidraw0|Vendor Product|0102:0304'
+if [[ -n $(fn fido_device_nodes) ]]; then
+  check 'device argument selection accepts only hidraw paths' test \
+    "$(eval "$(fn fido_device_nodes)"; fido_device_nodes <<< $'/dev/hidraw0|legitimate\nnot-a-device|text\n/dev/hidraw1 extra|text')" \
+    = '/dev/hidraw0'
+fi
 A=$(printf 'a%.0s' {1..64})
 printf '%s\n' "$A" > "$DSB/st/oc-sandbox/built-images"                 # forged by the agent
 echo "$SECRET" > "$T/victim-file"; ln -s "$T/victim-file" "$DSB/st/oc-sandbox/built-images.new"
@@ -736,13 +839,18 @@ if [[ -n ${OC_TEST_NO_PODMAN:-} ]]; then echo "  skip  (OC_TEST_NO_PODMAN)"; els
     VOL=oc-sectest-$$
     cat > "$T/lib.sh" <<EOF
 H=(${H[*]}); pm() { "\${H[@]}" podman "\$@"; }
-AGENT_IMG=$TEST_AGENT_IMG HOMEVOL=$VOL LEVEL=s0:c7,c9 SB=\$1; shift
+AGENT_IMG=$TEST_AGENT_IMG AGENT_MEM=512m HOMEVOL=$VOL LEVEL=s0:c7,c9 SB=\$1; shift
 $(sed -n '/^safe_run() {/,/; }$/p' "$SCRIPT")
+$(fn tree_run)
 $(sed -n "/^SANDBOX_TREE_PY=/,/os.makedirs(dest, exist_ok=True)'$/p" "$SCRIPT")
 $(fn init_sandbox_tree)
 $(fn init_bridge_spool)
 $(sed -n "/^RELABEL_PY=/,/file=sys.stderr)'\$/p" "$SCRIPT")
 $(fn relabel_shared)
+if [[ \$1 == init_sandbox_tree ]] && declare -F tree_run >/dev/null; then
+  safe_run --cap-add=FOWNER --entrypoint python3 "\$AGENT_IMG" \
+    -I -c "\$RELABEL_PY" "system_u:object_r:container_file_t:\$LEVEL" /sandbox || exit 1
+fi
 "\$@"
 EOF
     lib() { bash "$T/lib.sh" "$@"; }

@@ -76,6 +76,8 @@ set -u -o pipefail
 STATE=$T/state POD=oc PGC=oc-postgres PGVOL=oc-pg PGSECRET=oc-pg-password
 PGPASSSECRET=oc-pg-passfile PGHBASECRET=oc-pg-hba PG_INIT=$T/no-init INST= ILABEL=default
 PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD='p:a\\b' PORTS=(15432:5432)
+SB=$T/sandbox H=()
+$(fn in_sb); $(fn trusted_path); $(fn host_input); $(fn inspect_pg_init)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 cstate() { printf '%s\\n' "\${FAKE_STATE:-none}"; }
 log() { :; }; sleep() { :; }

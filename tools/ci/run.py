@@ -95,6 +95,7 @@ PYTHON_FILES = (
     'tools/ci/run.py',
     'tools/ci/sonar_checkout.py',
     'tools/ci/sonar_cloud.py',
+    'tools/ci/sonar_http.py',
     'tools/ci/sonar_coverage.py',
     'tools/ci/sonar_exec.py',
     'tools/ci/sonar_publish.py',
