@@ -1,0 +1,19 @@
+schema_version = 1
+kind = "host-provider@1"
+id = "builtin/cloud-render"
+description = "One-off cloud job provider (no sidecar pods; requires pinned build and spend cap)."
+engine = "cloud-render"
+
+[capabilities]
+supports_pods = false
+supports_pasta = false
+supports_image_mounts = false
+supports_reflink = false
+supports_wayland = false
+supports_dind = false
+multi_tenant_loopback = false
+
+[lease_limits]
+max_ttl_seconds = 3600
+idle_timeout_seconds = 600
+spend_cap_usd = 5.0

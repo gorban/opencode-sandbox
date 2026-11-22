@@ -1,0 +1,26 @@
+schema_version = 1
+kind = "service@1"
+id = "builtin/chromium-wayland"
+description = "Interactive visible Wayland Chromium sidecar with strict pod-only CDP ceiling."
+provides = ["cap:browser.chromium@1.0"]
+cardinality = "singleton"
+security_profile = "desktop-wayland"
+fallback_service = "builtin/chromium-managed"
+required_capabilities = ["supports_pods", "supports_wayland"]
+
+[images_by_arch]
+x86_64 = "localhost/oc-chromium@sha256:5555555555555555555555555555555555555555555555555555555555555555"
+arm64  = "localhost/oc-chromium@sha256:6666666666666666666666666666666666666666666666666666666666666666"
+
+[resources]
+memory = "4g"
+pids_limit = 512
+
+[[endpoints]]
+name = "devtools"
+port = 9222
+protocol = "http"
+default_exposure = "pod-only"
+max_exposure = "pod-only"
+requires_auth = false
+tls_policy = "none"

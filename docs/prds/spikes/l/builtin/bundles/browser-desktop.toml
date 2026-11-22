@@ -1,0 +1,6 @@
+schema_version = 1
+kind = "bundle@1"
+id = "builtin/browser-desktop"
+description = "Chromium browser bundle (uses Wayland on local desktop, auto-falls back to managed Chromium on remote workers)."
+requires_services = ["builtin/chromium-wayland"]
+skills = ["builtin/browser-qa"]

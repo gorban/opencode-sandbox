@@ -1,0 +1,10 @@
+schema_version = 1
+kind = "worker@1"
+id = "builtin/example-macos-arm64"
+description = "Example remote Apple Silicon macOS Podman Machine worker over pinned SSH."
+host_provider = "builtin/podman-macos-vm"
+transport = "builtin/ssh-pinned"
+arch = "arm64"
+os = "darwin"
+host = "example-macos-worker.internal"
+port = 22

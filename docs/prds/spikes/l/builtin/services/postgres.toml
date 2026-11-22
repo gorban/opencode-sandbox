@@ -1,0 +1,52 @@
+schema_version = 1
+kind = "service@1"
+id = "builtin/postgres"
+description = "Authenticated PostgreSQL 17 sidecar with SCRAM-SHA-256 hba_file, PGPASSFILE secret, and HMAC config signature."
+provides = ["cap:db.postgres@17.4"]
+cardinality = "singleton"
+security_profile = "standard"
+factory_id = "postgres_scram_service"
+required_capabilities = ["supports_pods"]
+
+[images_by_arch]
+x86_64 = "docker.io/library/postgres@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+arm64  = "docker.io/library/postgres@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+
+[resources]
+memory = "1g"
+pids_limit = 256
+
+[[endpoints]]
+name = "pg"
+port = 5432
+protocol = "postgres"
+default_exposure = "pod-only"
+max_exposure = "instance-dns"
+requires_auth = true
+auth_enforcer = "pg-scram-ro-hba"
+tls_policy = "required-when-ca-ready"
+host_url_template = "postgresql://{user}@{host}:{port}/{db}"
+
+[[volumes]]
+name = "pg-data"
+kind = "named"
+target = "/var/lib/postgresql/data"
+durable = true
+read_only = false
+
+[[secret_slots]]
+slot = "pg_password"
+target = "/run/secrets/oc-pg-password"
+mode = "0400"
+secret_ref = "vault:postgres/password"
+
+[[secret_slots]]
+slot = "pgpass"
+target = "/run/secrets/oc-pgpass"
+mode = "0600"
+secret_ref = "derived:pgpass"
+
+[readiness_probe]
+kind = "exec_auth"
+port = 5432
+command = ["psql", "-w", "-X", "-h", "127.0.0.1", "-Atqc", "SELECT 1"]
