@@ -128,6 +128,7 @@ def prove(job: Job, broker: Broker, attended: bool) -> None:
         # worker-facing write until the host releases this pause.
         with client.pause_prompt(pins(job, thread), "Verify the revoked fixture sends zero bytes.",
                                  time.monotonic() + 10) as paused:
+            check(paused.pause_acknowledged, "relay did not acknowledge a pending pause before revoke")
             report("Paused a separate request before dialing the worker.")
             events.assert_open()
             broker.revoke()

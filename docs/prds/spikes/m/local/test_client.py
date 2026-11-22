@@ -1,14 +1,17 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 import socket
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import time
 import unittest
 from unittest.mock import patch
 
 from client import DispatchOutcome, OpenCode, ProbeError, RelayExchange, Response, TurnEvent, TurnEvents, TurnPins, Wire
 from probe import observe
+import relay
 
 
 INVALID_JSON = "invalid JSON response"
@@ -150,6 +153,52 @@ assert os.umask(0o077) == 0o077, "CLI entrypoint did not set umask 077"
             exchange = RelayExchange(Wire(client, time.monotonic() + 1), b"request", pause=False)
             peer.shutdown(socket.SHUT_WR)
             self.assertIs(exchange.receipt(), DispatchOutcome.UNCERTAIN)
+
+    def test_already_terminal_pause_returns_zero_without_dial_or_release(self):
+        active = relay.grant_record("fixture", 1, True)
+        client, peer = socket.socketpair()
+        with client, peer, TemporaryDirectory() as directory:
+            grant = Path(directory)
+            (grant / "state").write_bytes(relay.grant_record("fixture", 1, False))
+            with ((grant / "lifetime").open("xb") as lifetime,
+                  patch.object(relay, "GRANT", grant),
+                  patch.object(relay.socket, "create_connection") as dial,
+                  ThreadPoolExecutor(max_workers=1) as pool):
+                relay.take_fence(lifetime.fileno())
+                handled = pool.submit(relay.control, peer, active)
+                exchange = RelayExchange(Wire(client, time.monotonic() + 1), b"request", pause=True)
+                self.assertFalse(exchange.pause_acknowledged)
+                self.assertIs(exchange.receipt(), DispatchOutcome.ZERO_BYTES_SENT)
+                handled.result(timeout=1)
+                dial.assert_not_called()
+                peer.setblocking(False)
+                with self.assertRaises(BlockingIOError):
+                    peer.recv(1)
+
+    def test_pause_requires_acknowledgment_before_releasing(self):
+        client, peer = socket.socketpair()
+        with client, peer:
+            peer.sendall(b"PZ")
+            deadline = time.monotonic() + 1
+            exchange = RelayExchange(Wire(client, deadline), b"request", pause=True)
+            self.assertTrue(exchange.pause_acknowledged)
+            self.assertIs(exchange.receipt(), DispatchOutcome.ZERO_BYTES_SENT)
+            self.assertEqual(relay.read_exact(peer, 13, deadline), b"P\x00\x00\x00\x07requestG")
+
+        for reply in (b"H", b"U", b""):
+            with self.subTest(reply=reply):
+                client, peer = socket.socketpair()
+                with client, peer:
+                    peer.sendall(reply)
+                    peer.shutdown(socket.SHUT_WR)
+                    deadline = time.monotonic() + 1
+                    wire = Wire(client, deadline)
+                    with self.assertRaisesRegex(ProbeError, "outcome uncertain"):
+                        RelayExchange(wire, b"request", pause=True)
+                    self.assertEqual(relay.read_exact(peer, 12, deadline), b"P\x00\x00\x00\x07request")
+                    peer.setblocking(False)
+                    with self.assertRaises(BlockingIOError):
+                        peer.recv(1)
 
     def test_turn_filters_session_input_and_assistant_identity(self):
         turn = TurnEvents(TurnPins("local-poc", "inc", "ses_pinned", "msg_pinned", 1))

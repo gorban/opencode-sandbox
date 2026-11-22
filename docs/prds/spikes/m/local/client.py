@@ -170,12 +170,17 @@ class RelayExchange:
 
     def __init__(self, wire: Wire, raw: bytes, *, pause: bool):
         self.wire = wire
-        self.paused = pause
+        self.pause_acknowledged = False
+        self._early_zero = False
         self.read_receipt = False
         try:
             wire.write((b"P" if pause else b"N") + len(raw).to_bytes(4, "big") + raw)
-            if pause and wire.take(1) != b"P":
-                raise ProbeError("relay did not confirm the pre-write pause")
+            if pause:
+                reply = wire.take(1)
+                self.pause_acknowledged = reply == b"P"
+                self._early_zero = reply == b"Z"
+                if not (self.pause_acknowledged or self._early_zero):
+                    raise ProbeError("unexpected pause response")
         except (OSError, ProbeError) as error:
             raise ProbeError("relay outcome uncertain before receipt") from error
 
@@ -183,8 +188,10 @@ class RelayExchange:
         if self.read_receipt:
             raise ProbeError("relay receipt already consumed")
         self.read_receipt = True
+        if self._early_zero:
+            return DispatchOutcome.ZERO_BYTES_SENT
         try:
-            if self.paused:
+            if self.pause_acknowledged:
                 self.wire.write(b"G")
             value = self.wire.take(1)
         except (OSError, ProbeError):

@@ -39,7 +39,9 @@ SELINUX_ENFORCE = Path("/sys/fs/selinux/enforce")
 SELINUX_PROCESS = Path("/proc/self/attr/current")
 HOST_MODE = os.environ.get("OC_POC_PODMAN_HOST", "local")
 HOST_SPAWN = "/usr/bin/host-spawn"
-SHARED_TMP = Path("/tmp")
+# Before writing, verify root ownership and the sticky bit on the parent, and
+# match its host and guest device/inode in devbox. Open the private 0700 leaf without following symlinks.
+SHARED_TMP = Path("/tmp")  # NOSONAR(S5443)
 SYSTEM_HOME = Path("/home")
 NETWORK_LEAK_FIELDS = ("Gateway", "IPAddress", "IPv6Gateway", "GlobalIPv6Address", "MacAddress")
 PROBE_TCP = (
