@@ -398,9 +398,12 @@ function handle_broker_postgres_conn(client_sock, job_lease, pg_route):
       `spike-prd-l1`: inbound `aws-sigv4-job-key` HMAC-SHA256 verification + host-side SigV4
       re-signing + action inspection (`Action=` across query & body with duplicate/encoded
       smuggling rejection, `X-Amz-Target`, REST verb+path) (`test_broker_http.py`).
-- [ ] **Adversarial & live canary qualification + Gate 2 review** — offline cross-lane synthetic
-      canary suite (`test_prd_l1_e2e.py`) passing on `spike-prd-l1`; Gate 2 external review and
-      live Linux (`pasta -T` / `managed` UDS) + macOS (`ssh -R`) host qualification pending.
+- [x] **Gate 2 external security review & offline synthetic canary qualification** — cleared on
+      `spike-prd-l1` at commit `72ac4444bcd8583d139c16d737612aba5770fe23` (97/97 offline unit,
+      adversarial, and cross-lane E2E canary tests passing in `docs/prds/spikes/l/`).
+- [ ] **Live host transport & SELinux qualification** — live Linux (`pasta -T` / `managed` UDS
+      SELinux relabeling) and macOS (`ssh -R`) host qualification pending prior to production
+      promotion.
 
 ## Review record
 
@@ -416,4 +419,12 @@ function handle_broker_postgres_conn(client_sock, job_lease, pg_route):
        needed (e.g., `/api/v1/namespaces/*/pods/*` and `/api/v1/namespaces/*/pods/*/log`).
     2. Enforce bounded concurrent connections and read/write timeouts on HTTP and Postgres broker
        listeners (matching `oc_config_mcp.py`).
-- Gate 2 implementation review (`Security-Focused PR Reviewer Setup`): pending.
+- Gate 2 implementation review round 1 (`Security-Focused PR Reviewer Setup`, `1b5dd3d..4ee66c8`):
+  4 P1, 3 P2, and 4 P3 findings identified and addressed at commit `5691af5`.
+- Gate 2 implementation review round 2 (`Security-Focused PR Reviewer Setup`, `4ee66c8..5691af5`):
+  10/11 findings verified resolved; 1 residual AWS semicolon smuggling bypass in
+  `_extract_action_params()` (and 1 optional `_canonicalize_write_grants()` nit) addressed at
+  commit `72ac444`.
+- Gate 2 implementation review round 3 (`Security-Focused PR Reviewer Setup`, `5691af5..72ac444`):
+  **GATE 2 CLEARED** at commit `72ac4444bcd8583d139c16d737612aba5770fe23` (97/97 offline tests
+  passing; live host transport qualification and user Human Review remain open).
