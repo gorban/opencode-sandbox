@@ -16,6 +16,9 @@ reservation explicitly in this index.
 - [*] Maintainer setup and end-to-end acceptance for these integrations
   ([I](prd_i.md#recommended-first-slice), [I2](prd_i2.md), [I4](prd_i4.md)) — **Outside-in integrations**.
 
+- [*] PRD M first PoC — local worker addressing, orchestration, and thread projection
+  ([M first PoC split](prd_m.md#first-poc-split)) — **PRD M coordination**.
+
 Coordinate SSH fixtures and remote acceptance with **Warm worker seeding**
 (`codex/warm-worker-seeding`). That workstream owns [I5](prd_i5.md) warm-start
 seeding and cache qualification. The initial SSH onboarding and first run are

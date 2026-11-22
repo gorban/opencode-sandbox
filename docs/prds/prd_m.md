@@ -106,6 +106,35 @@ All three child PRDs share three explicit extensions to `oc_controller.py` ([prd
    waking blocked `agent_wait` callers), `oc_pty_relay`, and the browser CDP arbiter (`InputLease`
    revocation + PTY/browser stream disconnect).
 
+## First PoC split
+
+Build two local PoCs in parallel. The first integration test is one operator-driven OpenCode turn
+that streams a response, edits a scratch file, and loses access when its job grant is revoked.
+
+- [ ] **Local OpenCode integration** — launch one real OpenCode worker in a disposable Podman job.
+      Use a private job endpoint and one model route through a host broker with a synthetic
+      upstream ([I4](prd_i4.md), [M1.1–M1.2](prd_m1.md#concrete-gaps-and-checkboxes), and
+      the local transport slice of [M2.2](prd_m2.md#concrete-gaps-and-checkboxes)). Own the
+      local launch and broker adapter, isolated scratch workspace, and prompt, file edit, and
+      revocation checks. Use synthetic credentials throughout this slice.
+- [*] **PRD M coordination** — implement local target addressing and the send, status, and revoke
+      workflow with a fake worker. Own the hub and registry together, including the thread
+      projection and persistence tests ([M2.1 and M2.3](prd_m2.md#concrete-gaps-and-checkboxes)
+      and [M3.1](prd_m3.md#concrete-gaps-and-checkboxes)). Start with the local address grammar
+      and leave the worker ID migration, remote peers, and cross-model handoff for later slices.
+
+Agree on one small command/event contract before implementation, with host-assigned job and thread
+identities, bounded events with provenance, and terminal revocation semantics. Use the same fixture
+in both lanes. The coordination lane owns the registry and outbox. The local integration lane
+owns the worker transport and broker lifecycle. Make shared controller and schema changes through a
+single coordinated integration change. The joint test replaces the fake worker with the local
+OpenCode job and verifies that revocation stops its stream and denies the next call.
+
+The [existing reservations](README.md#workstream-reservations) cover real subscription sign-in,
+first SSH onboarding, and maintainer acceptance. Those integrations, full quota telemetry,
+desktop and browser surfaces, and human review remain open. Review each lane's implementation
+walkthrough and final diff under the [implementation review gates](README.md#implementation-review-gates).
+
 ## Scope and phased milestones
 
 - [ ] **M1 — Model selection, reasoning variants, and dual-window (`5h` + `7d`) quota telemetry**
