@@ -1,6 +1,7 @@
 # prd_l: Composable sandbox configuration, host providers, communication adapters, and orchestrator config management
 
-[Index](README.md) · related: [Postgres host access](prd_a.md), [per-instance networking](prd_d.md),
+[Index](README.md) · children: [external secret isolation](prd_l1.md) · related:
+[Postgres host access](prd_a.md), [per-instance networking](prd_d.md),
 [local HTTPS](prd_e.md), [host tools](prd_f.md), [orchestrator](prd_i.md),
 [orchestrator UI and profiles](prd_i1.md), [SSH onboarding](prd_i2a.md),
 [credential broker](prd_i3.md), [host LLM broker](prd_i4a.md),
@@ -674,6 +675,22 @@ may be owned by a mapped UID, run tests and CLI examples with a user-owned `TMPD
       allowlist/`builtin/*`/archive-dependent/`unarchive`-revalidation/stale-closure/`"applying"`-
       and-`"uncertain"`-recovery/rollback-replay/digest-mismatch/TTL-bound/CLI-`O_NOFOLLOW`
       rejection.
+- [x] **Human approval of the offline spike PoC slice** (`spike-outside-in-poc` at `2f95207`).
+      Covers the offline compiler, schema/SSRF/path-walk guards, remote MCP read-only default &
+      canonical-URL write grant policy, scratch-only `--config-dir` isolation, restricted `-o`
+      orchestrator MCP + host-only `OperatorControlServer` UDS, and 4 base Skills (safe for local
+      ephemeral sidecars and offline config governance). External secret isolation against
+      exfiltration from unrestricted sandboxes is explicitly split out below.
+
+## Open Follow-Up & Production Port Items
+
+- [ ] **External secret isolation for unrestricted sandboxes** — tracked in child PRD
+      [prd_l1](prd_l1.md) (coordinated with [prd_i3](prd_i3.md) and [prd_i4a](prd_i4a.md));
+      required before mounting or brokering credentials for real external, accessible targets.
+- [ ] **Production port & live qualification** — port reviewed compiler/store/MCP/CLI onto
+      production `oc-sandbox`, qualify live OpenCode v2 `managed`-tier workspace lockout flags,
+      wire real Podman / SSH-macOS / Render runtime engines, and integrate Tier-1 registry mirror +
+      [prd_i5](prd_i5.md) warm seeding.
 
 ## Review record
 
