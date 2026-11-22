@@ -98,9 +98,10 @@ All three child PRDs share three explicit extensions to `oc_controller.py` ([prd
    `(source_bucket_id, target_api_route_id, allowed_models, max_spend_usd, max_concurrent, expires_at)`
    with persistent `spent_usd` and pre-flight reservations surviving daemon/controller restarts.
 3. **`InputLease`:** Strictly ephemeral in-memory PTY and Browser write lease bound to
-   `(operator_session, target_addr, surface_kind: "opencode-tui" | "shell" | "browser", generation,
-   expires_at)`. On `oc_daemon` or `oc_controller` restart, all `InputLease`s invalidate
-   immediately and bump `generation` ([prd_i2](prd_i2.md)).
+   `(operator_session, connection_id, target_addr, sandbox_incarnation, surface_kind, generation,
+   expires_at)`, with surfaces `opencode-tui`, `shell`, and `browser`. Expiry, handoff, or a
+   daemon/controller restart invalidates old stamps. Enforce the stamp at actual dispatch and
+   discard queued input for the previous generation ([prd_m3](prd_m3.md)).
 4. **Unified `<1s` Revocation Cascade:** Revoking a sandbox, worker, or `@PEER` in `oc_controller`
    cascades in `<1s` across `/llm/*` streams, `/mcp/oc-swarm`, `oc_hub` (`RoutingEdge` removal +
    waking blocked `agent_wait` callers), `oc_pty_relay`, and the browser CDP arbiter (`InputLease`
@@ -128,7 +129,9 @@ identities, bounded events with provenance, and terminal revocation semantics. U
 in both lanes. The coordination lane owns the registry and outbox. The local integration lane
 owns the worker transport and broker lifecycle. Make shared controller and schema changes through a
 single coordinated integration change. The joint test replaces the fake worker with the local
-OpenCode job and verifies that revocation stops its stream and denies the next call.
+OpenCode job and verifies that revocation stops its stream and denies the next call. It also
+queues a turn, revokes before transport handoff, restarts the outbox with the same worker
+incarnation, and verifies zero delivery under the old grant ([M2 recovery](prd_m2.md#failure-recovery-and-verification-tests)).
 
 The [existing reservations](README.md#workstream-reservations) cover real subscription sign-in,
 first SSH onboarding, and maintainer acceptance. Those integrations, full quota telemetry,
@@ -227,14 +230,17 @@ walkthrough and final diff under the [implementation review gates](README.md#imp
   - `docs/prds/prd_m2.md` SHA-256: `fff8fbeee3b0ecba6f7f92c62dfc57b72be2669ef4f8ba90a78c3fcc5a3b402c`
   - `docs/prds/prd_m3.md` SHA-256: `05a06cec57e1cecfe31453edb7fecd8bd41a6e8535b0682d8851b860c53a83dd`
   - Implementation reminders for Gate 2:
-    1. Derive browser `tls_state` dynamically from CDP `Security`/`Page` state
-       (`"sandbox_internal_ca"`, `"http_unencrypted"`, `"tls_error"`) rather than hardcoding it,
-       and bind `frame_meta` + raw JPEG/PNG bytes in a single framed binary envelope (or matching
-       `frame_id`) so metadata cannot desync from dropped frames.
-    2. For `PaidFallbackGrant`, release the durable reservation only if upstream TLS connect fails
-       *before* any request bytes are transmitted; once transmitted, retain the conservative debit
-       on disconnect/abort/crash (and guard `raw_quota is None` when reading `retry_after_sec`).
+    1. Qualify the paired browser frame and metadata envelope and observed TLS label against
+       dropped frames and missing security evidence.
+    2. Qualify the target-route spend bound and durable send transition. A proven pre-send
+       failure may release the reservation. Uncertain transmission holds the full bound.
     3. Verify null-origin PTY/Browser iframe `script-src` hash/static URL behavior under both
        WebKitGTK (Linux Tauri v2) and Chromium loopback web mode.
+
+- Independent review of PR #48 at `a06276e` raised four security findings and one design
+  consistency finding. The follow-up pins outbox deliveries and surface input to current grants
+  at handoff, scopes managed browser takeover to the arbiter, pairs frames with observed TLS
+  evidence, and reserves the full worst-case cost of the selected paid route. The new verification
+  cases describe planned evidence for the PoCs and later qualifications.
 
 - [ ] **Human review**: checked only when the user says so

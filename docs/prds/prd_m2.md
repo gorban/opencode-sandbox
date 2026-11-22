@@ -155,8 +155,18 @@ routing:
 3. **Anti-Ping-Pong Per-Edge Turn Caps, Verified `in_reply_to`, Deadlock Freedom, and Backpressure:**
    - **Durable monotonic per-edge turn budget (cannot be bypassed by omitting `in_reply_to`):**
      Every `RoutingEdge` persists `turns_used` against `edge.max_rounds` (default `16`) in
-     `$STATE/registry.sqlite`. Every non-operator send increments `turns_used` unconditionally —
-     resettable **only** by an explicit `OPERATOR_DIRECTIVE` or operator grant.
+     `$STATE/registry.sqlite`. Every admitted non-operator send consumes a turn, regardless of
+     `in_reply_to` or its eventual delivery outcome. Only an explicit operator action can reset
+     the budget. Admission checks the live edge, its grant generation, and both incarnations,
+     consumes the available turn conditionally, and writes the outbox row in one transaction.
+   - **Fenced delivery:** Each row pins the edge, lease, grant generation, sender and recipient
+     incarnations, and thread. The host controller orders enqueue, dispatch handoff, and revocation
+     through the same per-grant fence. Dispatch revalidates all pins immediately before its
+     bounded, nonblocking first write to the trusted transport. A buffered adapter must enforce
+     the fence at its actual send boundary. Revocation that wins this ordering invalidates queued
+     deliveries, including same-incarnation rows and rows recovered after restart. If handoff
+     wins, bytes already sent can take effect. Revocation stops further dispatch and closes the
+     active stream. The controller holds no network wait under the fence.
    - **Strict `in_reply_to` binding:** If `in_reply_to` is provided, `oc_hub` verifies that the
      referenced envelope exists, was delivered to `caller_principal` on the same `(edge, thread_id)`,
      and returns an opaque error otherwise (preventing cross-sandbox `msg_id` probing).
@@ -196,56 +206,64 @@ function handle_bus_send(caller_principal, req):
     if len(req.body_text.encode("utf-8")) > 65536:
         return error(413, "inline_body_too_large_use_artifact")
 
-    # 1. Verify capability edge (default-deny lateral movement)
-    edge = routing_table.find_active_edge(caller_principal, target_addr, thread_id, msg_kind)
-    if edge is None or not controller.check_lease_active(edge.lease_id):
-        audit_log.append_denied(caller_principal, target_addr, "no_capability_edge")
-        return error(403, "target_not_authorized")
-
-    # 2. Validate in_reply_to ownership & enforce durable monotonic per-edge turn cap
-    if req.in_reply_to is not None:
-        if not event_log.is_replyable_by(req.in_reply_to, caller_principal, edge.edge_id, thread_id):
-            return error(400, "invalid_in_reply_to")
-    if caller_principal.role != Role.OPERATOR:
-        if edge.turns_used >= edge.max_rounds:
-            return error(409, "edge_turn_budget_exhausted")
-    if not edge.rate_limiter.allow() or mailbox.edge_queued(edge.edge_id) >= EDGE_MAX_MSGS:
-        return error(429, "backpressure_retry_after")
-
-    # 3. Host stamps unforgeable 4-role trust_class, stages blobs in host :ro spool, & records receipt
-    trust_class = {
-        Role.OPERATOR:      "OPERATOR_DIRECTIVE",
-        Role.ORCHESTRATOR:  "PARENT_TASK",               # NEVER OPERATOR_DIRECTIVE
-        Role.JOB:           "UNTRUSTED_PEER_DATA",
-        Role.EXTERNAL_PEER: "UNTRUSTED_PEER_DATA",
-    }[caller_principal.role]
+    # Stage bounded artifacts privately. Publish them only through the same delivery fence.
     staged_blobs = stage_verified_blobs_to_host_ro_spool(req.artifact_refs, target_addr)
-    dst_inc = resolve_incarnation(target_addr)
     host_msg_id = mint_crypto_msg_id_128bit()
-    env = Envelope(msg_id=host_msg_id, src=caller_principal.canonical_src(),
-                   dst=(target_addr, thread_id, dst_inc), trust_class=trust_class,
-                   msg_kind=msg_kind, in_reply_to=req.in_reply_to,
-                   edge_turn_seq=edge.turns_used + 1, body_text=req.body_text,
-                   artifact_refs=staged_blobs)
-    with registry_db.transaction():
-        if caller_principal.role != Role.OPERATOR:
-            routing_table.increment_turns_used(edge.edge_id)
+    with controller.routing_fence(caller_principal, target_addr, thread_id), registry_db.transaction():
+        edge = routing_table.find_active_edge(caller_principal, target_addr, thread_id, msg_kind)
+        if edge is None or not controller.check_current_grant(edge.lease_id, edge.generation):
+            return error(403, "target_not_authorized")
+        src_inc, dst_inc = require_current_edge_incarnations(edge, caller_principal, target_addr)
+        if req.in_reply_to is not None:
+            require_replyable(req.in_reply_to, caller_principal, edge.edge_id, thread_id)
+        enforce_rate_and_mailbox_limits(edge)
+        turn = routing_table.consume_turn_if_available(edge, caller_principal.role)
+        env = stamp_host_envelope(host_msg_id, caller_principal, src_inc, target_addr, dst_inc,
+                                  thread_id, msg_kind, req, turn, staged_blobs)
         seq = event_log.append(env)
         dispatch_receipts.insert(target_addr, dst_inc, thread_id, host_msg_id,
                                  sha256(env.body_text), caller_principal)
-        outbox.enqueue_delivery(seq, host_msg_id)
+        outbox.enqueue_delivery(seq, host_msg_id, edge.id, edge.lease_id, edge.generation,
+                                src_inc, dst_inc, thread_id)
     wake_waiters(target_addr, seq)
-    return { "msg_id": host_msg_id, "seq": seq }
+    return {"msg_id": host_msg_id, "seq": seq}
+
+function dispatch_pending(row):
+    with controller.routing_fence_for_row(row):
+        if not controller.current_edge_and_grant_match(row.pins):
+            outbox.cancel(row, "revoked_or_stale")
+            return
+        # Persist before attempting the first transport write. Recovery trusts this boundary.
+        if not outbox.mark_pending_as_dispatch_started_durable(row):
+            return
+        result = transport.first_write_nonblocking(row)
+        if result.proves_zero_bytes_sent:
+            outbox.return_to_pending_under_same_pins(row)
+        else:
+            outbox.record_handoff_or_uncertainty(row, result)
+    # Any continuation also checks the grant at its send boundary.
+
+function revoke_edge(edge):
+    with controller.routing_fence_for_edge(edge):
+        controller.fence_dispatch_immediately(edge)
+        registry_db.persist_revocation_and_cancel_pending_rows(edge)
+    close_issued_streams_and_wake_waiters(edge)
 ```
 
 ### Failure, recovery, and verification tests
 
 - **Failure / recovery:**
-  - Outbox worker retries transient delivery failures (e.g., remote SSH reconnect) idempotently using
-    `msg_id` deduplication; if target `incarnation_id` changed, fails closed (`incarnation_mismatch`)
-    instead of delivering stale instructions to a newly recreated sandbox.
-  - Revoking a sandbox, worker, or `@PEER` in `oc_controller` cascades in `<1s`, removing all
-    incident `RoutingEdge`s and waking blocked `agent_wait` callers with `edge_revoked`.
+  - On recovery, keep dispatch closed until the authoritative grants and incarnations are loaded.
+    A controller restart invalidates the old grant generations and requires fresh grants.
+    Recovered rows may not silently rebind to a new grant. A pending row can retry only when
+    all its original pins remain current. A durable dispatch-start record
+    without proof that zero bytes were sent leaves the outcome uncertain. Keep the original
+    `msg_id` for reconciliation and require trusted terminal evidence before retry. A worker's
+    status alone cannot prove non-delivery.
+  - Revocation persists a tombstone for the old grant generation. If writing it fails, remain
+    fenced and fail closed through recovery until the grant state can be confirmed. Revoking a
+    sandbox, worker, or `@PEER` removes all incident edges, closes dispatched streams, and wakes
+    blocked `agent_wait` callers with `edge_revoked`. Qualify the `<1s` cascade separately.
 - **Verification tests:**
   1. Fuzz/property tests on `parse_canonical_addr` / `format_canonical_addr` proving bijection,
      rejection of `/`, `local / foo`, `peer / foo`, `RESERVED_NAMES`, `..`, bidi overrides, and
@@ -266,6 +284,10 @@ function handle_bus_send(caller_principal, req):
   5. Cycle-detection test ($A \to B \to A \implies$ `DeadlockCycleRejected`), priority backpressure
      test, and mid-thread cross-model handoff test proving `admit_lane` + `PaidFallbackGrant`
      enforcement across a Codex implementor + Claude reviewer + `@PEER` fixture.
+  6. The shared local PoC fixture queues a turn, revokes its grant before transport handoff, and
+     restarts the outbox with the worker incarnation unchanged. Verify zero worker deliveries.
+     Also cover handoff winning the race, uncertain delivery after a crash, and two concurrent
+     sends contesting the final available turn.
 
 ## Concrete gaps and checkboxes
 

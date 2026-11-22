@@ -179,16 +179,18 @@ tests; never stored under static `$CONF_DIR` or mounted into sandboxes):
   - Operator approval in `oc_controller` binds `PaidFallbackGrant(grant_id, source_bucket_id,
     target_api_route_id, allowed_models, max_spend_usd, max_concurrent, expires_at)` — explicitly
     naming the metered `target_api_route_id` and its `api_key` credential.
-  - **Atomic worst-case reservation (prevents concurrent overshoot & abort-before-usage bypass):**
-    Before dialing `target_api_route_id`, `QuotaLedger` acquires a per-grant SQLite transaction lock,
-    computes `worst_case_usd = estimate_input_usd(wire_body) + estimate_output_usd(clamped_max_tokens)`,
-    verifies `active_concurrent < grant.max_concurrent` and
-    `spent_usd + reserved_usd + worst_case_usd <= grant.max_spend_usd`, and **durably persists** the
-    reservation in `$STATE/registry.sqlite` (surviving daemon/controller restarts).
-  - On stream completion with verified usage, the reservation reconciles to `actual_usd`.
-  - If the sandbox aborts or drops the connection before the final `usage` SSE chunk arrives, the
-    ledger retains a **conservative debit** (`max(estimate_input_usd + streamed_bytes_output_usd,
-    0.5 * worst_case_usd)`, never `$0`) so hostile disconnects cannot bypass `max_spend_usd`.
+  - **Atomic worst-case reservation:** Revalidate the selected paid route, model, effort and
+    output cap against the lease and grant. Lower the body with the paid route's descriptor and
+    get a conservative upper bound using that route's pinned tariff, including all billable
+    tokens and fees. Refuse the fallback if a bound cannot be enforced. Before dialing,
+    atomically check `active_concurrent < grant.max_concurrent` and
+    `spent_usd + reserved_usd + upper_bound_usd <= grant.max_spend_usd`. Persist the reservation
+    and its route, model, tariff revision, and request ID in `$STATE/registry.sqlite`.
+  - **Durable send boundary:** Persist `may_have_sent` before making the first upstream request
+    write. A verified pre-send failure may release a reservation. Once transmission may have
+    occurred, retain the full bound across disconnects, missing usage and restarts. Reduce it
+    only on authoritative, request-bound settlement. If the provider reports a charge above the
+    bound, record the charge and suspend the route pending price or limit requalification.
 
 ## Gate 1 pseudocode walkthrough
 
@@ -206,58 +208,55 @@ function handle_llm_broker_request(conn, lease, route, req):
     if desc is None or not desc.supports_effort(effort):
         return http_error(400, "unsupported_model_or_effort")
 
-    # 1. Strict body allowlist & provider-executed egress-tool rejection (mandatory in managed tier)
-    sanitized_body, clamped_max_tokens = sanitize_and_lower_llm_body(
-        desc, raw_body, effort, tier=lease.tier, max_tokens_cap=lease.max_output_tokens
-    )
-        # Rejects non-function OpenAI tools (mcp, web_search, code_interpreter, computer_use)
-        # and Anthropic mcp_servers/container/web_fetch/web_search/code_execution;
-        # strips service_tier/speed/background/client anthropic-beta; forces store=false;
-        # lowers effort -> adaptive thinking+effort (Claude 4.6+) or reasoning.effort (Codex)
-
-    # 2. Pre-flight quota check & explicit PaidFallbackGrant route switch + durable reservation
     effective_route = route
-    reservation_id  = None
+    effective_desc = desc
+    grant = None
     admission = quota_ledger.check_bucket(desc.quota_bucket_id, model_id, now=clock())
     if admission.hard_blocked:
-        grant = controller.get_active_paid_fallback(lease, source_bucket_id=desc.quota_bucket_id, model_id=model_id)
+        grant = controller.get_active_paid_fallback(lease, source_bucket_id=desc.quota_bucket_id,
+                                                    model_id=model_id)
         if grant is None:
-            return http_error(503, "quota_exhausted",
-                              retry_after=admission.seconds_until_reset,
+            return http_error(503, "quota_exhausted", retry_after=admission.seconds_until_reset,
                               blocking_window=admission.blocking_window)
-        effective_route = broker_routes.get(grant.target_api_route_id)
-        if effective_route is None or effective_route.auth_mode != "api_key":
-            return http_error(503, "invalid_paid_fallback_route")
-        worst_case_usd = estimate_worst_case_usd(desc, sanitized_body, clamped_max_tokens)
-        reservation_id = quota_ledger.reserve_spend_durable(grant.grant_id, worst_case_usd, grant.max_concurrent)
+        effective_route, effective_desc = require_approved_paid_target(grant, lease, model_id, effort)
+        # Verify API-key route, exact approved route/model, and target-side effort/limits.
+
+    # Enforce the closed body allowlist and lower using the selected route's descriptor.
+    sanitized_body, clamped_max_tokens = sanitize_and_lower_llm_body(
+        effective_desc, raw_body, effort, tier=lease.tier, max_tokens_cap=lease.max_output_tokens
+    )
+    reservation_id = None
+    if grant is not None:
+        bound = require_hard_billable_bound(effective_desc, sanitized_body, clamped_max_tokens)
+        reservation_id = quota_ledger.reserve_spend_durable(grant, effective_desc, bound)
         if reservation_id is None:
             return http_error(429, "paid_fallback_budget_or_concurrency_exceeded")
 
-    ip = resolve_and_validate_ip(effective_route.upstream_host, effective_route.allowed_cidrs)
-    up_sock = connect_tls_pinned_ip(ip, effective_route.upstream_port,
-                                    server_hostname=effective_route.upstream_host)
-    lease.register_stream(up_sock)
+    up_sock = None
     usage = None
-    streamed_bytes = 0
     try:
+        ip = resolve_and_validate_ip(effective_route.upstream_host, effective_route.allowed_cidrs)
+        up_sock = connect_tls_pinned_ip(ip, effective_route.upstream_port,
+                                        server_hostname=effective_route.upstream_host)
+        lease.register_stream(up_sock)
+        if reservation_id is not None:
+            # Denies stale grant or tariff revision; never send without the persisted boundary.
+            quota_ledger.mark_may_have_sent_durable(reservation_id, grant, effective_desc)
         up_resp = forward_with_host_auth(up_sock, effective_route, sanitized_body,
                                          allowlisted_beta_headers=effective_route.host_beta_headers,
                                          follow_redirects=False)
-        # Tap rate-limit headers BEFORE SAFE_RESPONSE_HEADERS scrubbing!
         raw_quota = extract_provider_quota_headers(effective_route.provider_family, up_resp.headers, up_resp.status)
         if raw_quota is not None:
             quota_ledger.merge_monotonic(effective_route.quota_bucket_id, raw_quota, observed_at=clock())
         if up_resp.status >= 400:
-            # Scrub ALL 4xx/5xx bodies (including 429) so raw account IDs/secrets never reflect
-            return send_scrubbed_llm_error(conn, up_resp.status, retry_after=raw_quota.retry_after_sec)
-        usage, streamed_bytes = stream_scrubbed_sse_and_tap_usage(
-            up_resp, conn, lease, canary_secrets=effective_route.secrets
-        )
+            retry_after = raw_quota.retry_after_sec if raw_quota is not None else None
+            return send_scrubbed_llm_error(conn, up_resp.status, retry_after=retry_after)
+        usage = stream_scrubbed_sse_and_tap_verified_usage(up_resp, conn, lease,
+                                                           canary_secrets=effective_route.secrets)
     finally:
-        lease.unregister_stream(up_sock)
+        close_and_unregister_if_open(up_sock, lease)
         if reservation_id is not None:
-            quota_ledger.reconcile_or_forfeit_durable(reservation_id, usage=usage,
-                                                      streamed_bytes=streamed_bytes)
+            quota_ledger.settle_verified_or_hold_full_bound(reservation_id, usage)
         elif usage is not None:
             quota_ledger.record_session_usage(lease.job_id, model_id, usage)
 ```
@@ -269,8 +268,10 @@ function handle_llm_broker_request(conn, lease, route, req):
     `state = "unknown"` without failing inference.
   - Telemetry-endpoint `429` trips the Tier 3 circuit breaker only; active inference continues via
     Tier 1 passive header updates.
-  - If `oc_daemon` crashes mid-stream during a `PaidFallbackGrant` call, uncommitted durable
-    reservations are reconciled conservatively on startup (never reset to `$0`).
+  - On restart, reconcile reservations by their durable send state. Release pre-send rows only
+    after confirming the previous writer is fenced and that no transmission was possible.
+    Retain the full bound for `may_have_sent` rows pending authoritative settlement, including
+    when a provider returns an error with incomplete usage.
   - `oc_controller.revoke()` terminates in-flight SSE inference streams in `<1s`.
 - **Verification tests (offline fixtures + live qualification):**
   1. Provider-tool egress smuggling tests proving OpenAI `tools: [{"type": "mcp", ...}]` /
@@ -281,10 +282,11 @@ function handle_llm_broker_request(conn, lease, route, req):
      proof that `429`/`4xx`/`5xx` bodies never leak account/org IDs or secrets to sandboxes.
   3. Adaptive Claude 4.6 lowering tests verifying `budget_tokens` is stripped and `effort` emitted,
      while unleased models fail closed with `403`.
-  4. `PaidFallbackGrant` concurrency, abort, and restart tests proving 16 parallel requests cannot
-     overshoot `max_spend_usd`, client-side disconnect before terminal `usage` still debits a
-     conservative cost (never `$0`), and daemon restart preserves `spent_usd` + routes strictly to
-     `target_api_route_id`.
+  4. Synthetic `PaidFallbackGrant` tests cover a fallback with different pricing and model limits,
+     concurrent requests at the cap, verified pre-send connection failure, and a disconnect or
+     crash after the durable send mark. Missing usage holds the full target-route bound across
+     restart and blocks a call that would exceed the cap. Verify idempotent settlement, refusal
+     when no hard bound is available, and route suspension on out-of-bound provider charge.
   5. Tier 3 circuit-breaker test proving `/api/oauth/usage` `429` with `Retry-After: 0` backs off
      (`15m -> 30m -> 60m`) without tight polling; `oc_plan.py` test verifying explicit subagent
      `variant:` emission and `OPENCODE_DISABLE_MODELS_DEV=1`.

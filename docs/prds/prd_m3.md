@@ -194,7 +194,14 @@ sequenceDiagram
     generation=g, ttl)` in `oc_controller` and pauses queued `-o`/peer injections on `opencode-tui`.
   - Host PTY writes are strictly **non-blocking** (`O_NONBLOCK`) with a bounded per-PTY outbound
     queue (`<= 16 KiB`), per-frame stdin cap (`<= 4 KiB`), and clamped `cols`/`rows` (`10..500` ×
-    `4..200`) so a `SIGSTOP`ped sandbox cannot stall `oc_daemon` or block lease release.
+    `4..200`) so a stalled sandbox cannot block lease release.
+  - Bind each queued operation to the host-verified lease, connection, generation, and sandbox
+    incarnation. At the final trusted write boundary, order each nonblocking write or resize
+    against expiry, release, and handoff using the same surface fence. Discard old queue entries
+    on transition, including bytes left after a partial write. Only committed input can produce
+    a TUI Enter receipt. A transport with its own buffers must enforce the same fence at the
+    final sink before enabling operator writes. Leave that surface in observe mode until this
+    boundary is qualified.
 
 ### 5. Unified embedded sandbox browser views (opt-in, zero separate Chrome windows)
 
@@ -255,17 +262,25 @@ sequenceDiagram
     `"image/jpeg"` and `"image/png"` (**never** `image/svg+xml`), verify exact magic bytes
     (`\xff\xd8\xff` / `\x89PNG\r\n\x1a\n`), transfer as binary `ArrayBuffer` for `<canvas>`
     `createImageBitmap`, and sanitize display URLs by stripping control/bidi chars, converting IDN
-    hosts to ASCII punycode, capping length (`<= 2048`), and labeling TLS explicitly as
-    sandbox-internal (never implying host trust).
+    hosts to ASCII punycode and capping length (`<= 2048`). Bind the verified image, frame ID,
+    browser target and incarnation, navigation ID, sanitized URL, and observed TLS state in a
+    single bounded frame envelope. Derive TLS state from trusted browser security and navigation
+    observations for that same document. Use `sandbox_internal_ca` only when verification and
+    the sandbox CA match. Distinguish `http_unencrypted`, `tls_error`, and `unknown`. Missing or
+    mismatched evidence is `unknown`. Trusted Chrome commits the image and its label together
+    after successful decoding and discards stale or mismatched frames as a unit.
   - **Read-only default, PiP input lockout, & non-blocking input bounds:** Opens strictly
     **read-only (`observe`)** with a persistent Trusted Chrome warning that rendered pixels are
     untrusted sandbox content (never enter host credentials or click fake approval modals drawn
     inside the page). `pip_wall` mode **unconditionally rejects all input frames** (no blind
-    clicking on tiny PiP tiles). In `interactive_view`, clicking **"Take Control"** / **"Return to
-    Agent"** mints/releases an ephemeral `oc_controller` `InputLease(target,
-    surface_kind="browser", generation=g, ttl)` with capped input payloads (`<= 1 KiB`),
+    clicking on tiny PiP tiles). In `interactive_view`, managed browsers use **Take Control** and
+    **Return to Agent**. Direct CDP mode shows **Enable Shared Input** and **Stop Input**.
+    The host mints/releases an ephemeral `oc_controller` `InputLease` under the mode's control
+    rules, with capped input payloads (`<= 1 KiB`),
     viewport-clamped coordinates, input rate limits, and a non-blocking bounded dispatch queue
-    (`<= 64` events).
+    (`<= 64` events). The control acknowledgement follows mode-specific takeover below.
+    Bind queued events to the owning lease generation and sandbox incarnation.
+    Recheck at actual dispatch under the surface fence and discard old events on handoff.
   - Disable RFB/VNC clipboard sync (`ClientCutText`/`ServerCutText`), host drag-and-drop/file
     chooser access, and automatic pop-out links by default.
 
@@ -285,7 +300,8 @@ sequenceDiagram
     `npm` at runtime inside `--network=none` managed sandboxes.
 - **Agent CDP Access (`interactive` vs. `managed` Authenticated CDP Arbiter & Loopback Shim):**
   - **`interactive` (`pod-shared`):** Agent tools connect directly to pod-local `127.0.0.1:9222`
-    (never published to host).
+    (never published to host). The operator control is cooperative in this mode. Trusted Chrome
+    labels it shared input because the agent retains its direct CDP access.
   - **`managed` (`isolated-sidecars`, [prd_i2](prd_i2.md), [prd_l1](prd_l1.md)):** Raw Chromium
     CDP lives on the Chromium-only `0o600` UDS unreachable from agent code. Because standard CDP
     clients (`chrome-devtools-axi`, `chrome-devtools-mcp`, `@playwright/mcp`) do not send custom
@@ -294,12 +310,16 @@ sequenceDiagram
     (`$OC_CDP_URL=http://127.0.0.1:9222`), dials the job-exclusive SELinux-labeled `0o700` UDS
     (`$XDG_RUNTIME_DIR/oc-sandbox/jobs/<job_id>/cdp.sock`), and injects `ocjob_...` auth to the
     host **CDP arbiter** enforcing:
-    1. **Strict `InputLease` fencing (blocks both mutations and input observation):** While an
-       operator holds `InputLease(surface_kind="browser")`, the arbiter rejects **all** agent CDP
-       mutations AND script/page-inspection commands that could keylog, hijack, or spoof during
-       Take Control (`Input.*`, `Page.*` mutations, `DOM.*` mutations, `Runtime.*`, `Emulation.*`,
-       `Target.*`, `Network.getResponseBody`, `Network.getRequestPostData`), returning
-       `423 browser_operator_lease_active`.
+    1. **Managed CDP takeover:** Close agent admission under the browser fence. Detach existing agent
+       sessions, retire subscriptions, and discard queued agent commands, replies, and events.
+       Wait for accepted commands to complete or establish cancellation before acknowledging
+       exclusive arbiter control. Merely closing a connection does not prove cancellation. If
+       quiescence cannot be established within the bound, keep the view in observe mode, or
+       replace the browser target and validate the new incarnation before granting input.
+       While takeover is pending or active, deny all agent CDP commands and event delivery.
+       On return, require fresh agent sessions for the current generation. This governs
+       the arbiter channel. Page code and data remain untrusted throughout, including any
+       activity initiated before takeover, so operators must keep host secrets out of the page.
     2. **Explicit closed CDP method allowlist (no `DOM.*`/`Runtime.*`/`Emulation.*` wildcards):**
        Permits only an enumerated closed set of safe inspection & interaction methods (e.g.,
        `Page.navigate` [URL-checked as defense-in-depth behind Chromium enterprise policy],
@@ -365,7 +385,7 @@ function handle_pty_websocket(ws, ws_ticket):
     scrubber = AllowlistVtUtf8Scrubber(max_ring_bytes=8*1024*1024)
     pty_fd   = open_confined_tmux_attach(sandbox, claim.surface_kind, nonblocking=True)
         # local podman exec tmux -f /dev/null OR oc_broker_ssh-hardened ssh attach
-    write_q  = BoundedByteQueue(max_bytes=16384)
+    write_q  = BoundedInputQueue(max_bytes=16384)  # entries retain the full lease stamp
     try:
         while ws.open and sandbox.is_running() and controller.is_session_active(claim.session_id):
             if pty_fd.readable():
@@ -373,21 +393,27 @@ function handle_pty_websocket(ws, ws_ticket):
                 if clean:
                     ws.send_binary(clean)
             if write_q.nonempty() and pty_fd.writable():
-                written = pty_fd.write_nonblocking(write_q.peek())
-                write_q.consume(written)
+                with controller.surface_fence(sandbox, claim.surface_kind):
+                    pending = write_q.peek()
+                    if not controller.current_input_stamp_matches(pending.stamp, sandbox):
+                        write_q.discard(pending)  # includes any unwritten remainder
+                    else:
+                        written = pty_fd.write_nonblocking(pending.remaining)
+                        record_tui_enter_only_in_written_bytes(claim, pending, written)
+                        write_q.consume(written)
             if ws.has_client_frame():
                 frame = parse_pty_client_frame(ws.recv(), max_stdin_bytes=4096)
-                if not controller.verify_input_lease(claim.session_id, sandbox, claim.surface_kind, frame.gen):
-                    ws.send_json({"type": "input_rejected", "reason": "no_or_stale_input_lease"})
-                    continue
-                if frame.kind == "resize":
-                    pty_fd.resize_clamped(frame.cols, frame.rows, max_cols=500, max_rows=200)
-                elif frame.kind == "stdin":
-                    if not write_q.try_enqueue(frame.data):
-                        ws.send_json({"type": "stdin_backpressure", "reason": "pty_stalled"})
-                        continue
-                    if claim.surface_kind == "opencode-tui" and (b"\r" in frame.data or b"\n" in frame.data):
-                        record_one_shot_tui_enter_token(sandbox, now=clock())
+                with controller.surface_fence(sandbox, claim.surface_kind):
+                    stamp = controller.authorize_input_stamp(claim, sandbox, ws.id, frame.gen)
+                    if stamp is None:
+                        rejection = "no_or_stale_input_lease"
+                    elif frame.kind == "resize":
+                        pty_fd.resize_clamped(frame.cols, frame.rows, max_cols=500, max_rows=200)
+                        rejection = None
+                    else:
+                        rejection = None if write_q.try_enqueue(stamp, frame.data) else "pty_stalled"
+                if rejection is not None:
+                    ws.send_json({"type": "input_rejected", "reason": rejection})
     finally:
         controller.release_input_lease_for_conn(ws.id)       # bumps generation immediately on disconnect
         pty_pool.release_slot(claim.session_id, sandbox.sandbox_id)
@@ -417,42 +443,60 @@ function handle_browser_websocket(ws, ws_ticket):
                 frame = hub_sub.pop_latest_frame(max_bytes=512*1024)
                 if frame.mime not in ("image/jpeg", "image/png") or not verify_image_magic(frame.mime, frame.raw_bytes):
                     continue                                 # rejects SVG or malformed payloads
-                ws.send_json({"type": "frame_meta", "mime": frame.mime,
-                              "url": sanitize_punycode_url(frame.url, max_len=2048),
-                              "tls_state": "sandbox_internal_ca"})
-                ws.send_binary(frame.raw_bytes)              # decoded to <canvas> via createImageBitmap
+                meta = observed_frame_metadata(frame.target, frame.incarnation, frame.navigation_id)
+                tls_state = classify_observed_tls_state(meta)  # unknown when evidence is missing
+                safe_url = sanitize_punycode_url(meta.url, max_len=2048) if meta else None
+                ws.send_binary(encode_bounded_frame(
+                    frame.id, frame.target, frame.incarnation, frame.navigation_id, frame.mime,
+                    safe_url, tls_state, frame.raw_bytes
+                ))
             if input_q.nonempty() and hub_sub.arbiter_writable():
-                hub_sub.dispatch_operator_input_nonblocking(input_q.pop())
+                with controller.surface_fence(sandbox, "browser"):
+                    pending = input_q.peek()
+                    if not controller.current_input_stamp_matches(pending.stamp, sandbox):
+                        input_q.discard(pending)
+                    elif hub_sub.dispatch_at_arbiter_nonblocking(pending):
+                        input_q.discard(pending)
             if ws.has_client_frame():
                 if claim.mode == "pip_wall":
                     ws.send_json({"type": "input_rejected", "reason": "pip_wall_read_only"})
                     continue
                 ev = parse_browser_input_event(ws.recv(), max_bytes=1024, viewport=hub_sub.viewport)
                     # Closed allowlist (mouse/wheel/key/viewport); coordinates clamped; no clipboard
-                if not controller.verify_input_lease(claim.session_id, sandbox, "browser", ev.gen):
-                    ws.send_json({"type": "input_rejected", "reason": "no_or_stale_input_lease"})
-                    continue
-                if not input_q.try_enqueue_rate_limited(ev):
-                    ws.send_json({"type": "input_backpressure", "reason": "browser_input_rate_or_queue"})
+                with controller.surface_fence(sandbox, "browser"):
+                    stamp = controller.authorize_input_stamp(claim, sandbox, ws.id, ev.gen)
+                    if stamp is None:
+                        rejection = "no_or_stale_input_lease"
+                    else:
+                        added = input_q.try_enqueue_rate_limited(stamp, ev)
+                        rejection = None if added else "browser_input_rate_or_queue"
+                if rejection is not None:
+                    ws.send_json({"type": "input_rejected", "reason": rejection})
     finally:
-        controller.release_input_lease_for_conn(ws.id)       # bumps generation & resumes agent CDP
+        controller.release_input_lease_for_conn(ws.id)       # invalidates old-generation input
         browser_pool.release_slot(claim.session_id, sandbox.sandbox_id)
         hub_sub.close()
 
+function take_managed_browser_control(operator, sandbox, connection):
+    with controller.surface_fence(sandbox, "browser"):
+        attempt = arbiter.begin_quiescence(operator, sandbox, connection)
+        arbiter.close_agent_admission_and_retire_generation(attempt)
+    # Outside the fence: detach subscriptions, drain pending responses, and confirm accepted
+    # commands have finished or been canceled. On failure this view stays in observe.
+    proof = arbiter.await_bounded_quiescence(attempt)
+    with controller.surface_fence(sandbox, "browser"):
+        # Verify proof, operator session, connection, and target incarnation are still current.
+        return controller.grant_input_from_current_quiescence(attempt, proof)
+
 function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
-    if not controller.check_lease_active(job_lease.request_id):
-        return cdp_error(403, "lease_revoked_or_expired")
-    if cdp_req.method not in CLOSED_ALLOWED_AGENT_CDP_METHODS:
-        return cdp_error(403, "cdp_method_denied")
-    if (cdp_req.method in LEASE_FENCED_CDP_METHODS
-            and controller.has_active_input_lease(sandbox, surface_kind="browser")):
-        # Blocks Input.*, Page/DOM mutations, Runtime.*, Emulation.*, Target.*,
-        # Network.getResponseBody / getRequestPostData while operator holds Take Control
-        return cdp_error(423, "browser_operator_lease_active")
-    if cdp_req.method == "Page.navigate":
-        validate_sandbox_browser_url(cdp_req.params.get("url"), sandbox)
-            # Defense-in-depth behind Chromium --network=none + managed enterprise URLBlocklist
-    return forward_cdp_to_chromium_only_uds(sandbox, cdp_req, timeout_s=10)
+    validate_closed_agent_cdp_method_and_params(cdp_req, sandbox)
+    with controller.surface_fence(sandbox, "browser"):
+        if not controller.check_current_job_grant(job_lease, sandbox.incarnation):
+            return cdp_error(403, "lease_revoked_or_expired")
+        if not arbiter.agent_generation_accepts(cdp_req) or arbiter.operator_pending_or_active():
+            return cdp_error(423, "browser_operator_lease_active")
+        return write_to_chromium_only_uds_nonblocking(sandbox, cdp_req)
+    # Response/event forwarding also checks the active agent generation.
 ```
 
 ### Failure, recovery, and verification tests
@@ -460,8 +504,9 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
 - **Failure / recovery:**
   - On WebSocket disconnect, `oc_daemon` restart, or `oc_controller` restart, all ephemeral
     `InputLease`s (`opencode-tui`, `shell`, and `browser`) immediately invalidate and bump
-    `generation`, returning attached views to read-only `observe` on reconnect; container-side
-    `tmux` and `builtin/chromium-managed` preserve running sessions seamlessly.
+    `generation`. Purge queued old-generation input, including partial PTY remainders, and return
+    attached views to read-only `observe` on reconnect. A browser that cannot prove managed
+    quiescence remains in observe or is replaced and requalified before granting input.
   - A `SIGSTOP`ped sandbox fills `write_q` (`16 KiB`) or `input_q` (`64` events) and yields
     backpressure without ever blocking `oc_daemon`'s event loop or preventing lease release/teardown.
   - Stopping or disconnecting a remote sandbox marks its sidebar node `offline/stopped` and marks
@@ -477,11 +522,10 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
      with `OPENCODE_SERVER_PASSWORD` can NEVER earn `[Operator]` / `[Orchestrator -o]`, and
      replaying a host-dispatched `(message_id, body_sha256)` on a different `session_id` or sandbox
      is rejected as `[Sandbox-Local / Unverified]`.
-  3. Lease-fencing & `SIGSTOP` stall tests proving read-only attach and `pip_wall` mode drop
-     `stdin`/browser input, taking control pauses queued `-o` TUI turns AND blocks agent CDP
-     mutations + `Runtime.evaluate` / `Network.getResponseBody` with
-     `browser_operator_lease_active`, stale-generation input after disconnect/restart fails closed,
-     and a `SIGSTOP`ped PTY/browser returns backpressure without hanging `oc_daemon`.
+  3. Lease-fencing tests stall a PTY or browser queue, advance the generation, and verify zero
+     old-generation writes after handoff, including the remainder of a partial PTY write.
+     Exercise expiry, disconnect, restart, read-only attach, and PiP. Verify backpressure
+     never holds the surface fence while waiting for I/O.
   4. Auth, Origin, CSRF, WS-ticket, and iframe isolation tests verifying `Origin: null` and foreign
      origins are rejected on WS/mutations, single-use bootstrap codes & WS tickets cannot replay,
      and scripts inside null-origin PTY/Browser iframes (`connect-src 'none'`; `img-src 'none';
@@ -500,6 +544,12 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
        `chrome://` / external `fetch` bypasses, and the CDP arbiter rejects `DOM.setFileInputFiles`,
        `Page.addScriptToEvaluateOnNewDocument`, `Browser.*`, and `Fetch.*` while allowing pre-baked
        `chrome-devtools-axi` / MCP workflows via the `$OC_CDP_URL` loopback->UDS auth shim.
+  6. Managed browser takeover fixtures keep an agent event subscription and request in flight.
+     Verify no exclusive grant before quiescence and no old-generation delivery after it.
+     A quiescence timeout stays in observe. Direct CDP mode reports shared input.
+  7. Navigation fixtures drop a frame while the URL and TLS state change. Verify the UI pairs
+     only the matching image, navigation ID, and observed TLS state and shows `unknown` when
+     same-document TLS evidence is unavailable.
 
 ## Concrete gaps and checkboxes
 
