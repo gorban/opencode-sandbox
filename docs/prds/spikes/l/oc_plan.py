@@ -778,7 +778,8 @@ def _compile_remote_mcp_entry(
         mname, mcfg, write_active=write_active
     )
     if write_active:
-        assert resolved_url is not None
+        if resolved_url is None:
+            raise PlanError(f"Remote MCP {mname!r} missing resolved_url")
         effective_remote_write_grants[mname] = resolved_url
     if allow_set is not None and candidate_tools and not tools:
         return None
@@ -793,7 +794,8 @@ def _compile_remote_mcp_entry(
     if cred_delivery == "raw-container-mount":
         _require_raw_mount_breakglass(route_id, tier, allow_raw_remote_mounts, active_raw_remote_mounts)
 
-    assert resolved_url is not None
+    if resolved_url is None:
+        raise PlanError(f"Remote MCP {mname!r} missing resolved_url")
     broker_routes[route_id] = _build_remote_mcp_broker_route(
         mname,
         mcfg,

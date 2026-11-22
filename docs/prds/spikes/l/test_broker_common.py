@@ -67,6 +67,7 @@ class TestBrokerCommon(unittest.TestCase):
                 validate_allowed_cidrs([bad_cidr])
 
         # Non-overridably blocked ranges including IPv4-mapped IPv6 and NAT64
+        cidrs_10 = [f"{_ip(10, 0, 0, 0)}/8"]
         for bad_ip in (
             "127.0.0.1",
             "::1",
@@ -78,7 +79,7 @@ class TestBrokerCommon(unittest.TestCase):
             "fc00::1",
         ):
             with self.subTest(ip=bad_ip), self.assertRaises(BrokerPolicyError):
-                resolve_and_validate_ip(bad_ip, allowed_cidrs=[f"{_ip(10, 0, 0, 0)}/8"])
+                resolve_and_validate_ip(bad_ip, allowed_cidrs=cidrs_10)
 
         # RFC1918 blocked by default, allowed ONLY when explicitly pinned
         priv = _ip(10, 42, 1, 9)
@@ -118,12 +119,15 @@ class TestBrokerCommon(unittest.TestCase):
             HostVaultMemory.assert_distinct_pg_credentials("app_ro", "pw1_long_secret", "app_ro", "pw2_long_secret")
 
         # Raw split across chunks
+        def _feed_chunked(scanner: OverlapCanaryScanner, data: bytes, step: int) -> bytes:
+            parts = [scanner.feed(data[idx : idx + step]) for idx in range(0, len(data), step)]
+            parts.append(scanner.finish())
+            return b"".join(parts)
+
         sc_raw = OverlapCanaryScanner([secret_ro])
         raw_bytes = b"prefix " + secret_ro.encode("utf-8") + b" suffix"
         with self.assertRaises(CanaryLeakError):
-            for idx in range(0, len(raw_bytes), 5):
-                sc_raw.feed(raw_bytes[idx : idx + 5])
-            sc_raw.finish()
+            _feed_chunked(sc_raw, raw_bytes, 5)
 
         # URL-encoded & unpadded base64 split across chunks
         for variant in (
@@ -134,9 +138,7 @@ class TestBrokerCommon(unittest.TestCase):
             sc = OverlapCanaryScanner([secret_ro])
             payload = b"ok:" + variant + b":end"
             with self.subTest(variant=variant[:12]), self.assertRaises(CanaryLeakError):
-                sc.feed(payload[:15])
-                sc.feed(payload[15:])
-                sc.finish()
+                _feed_chunked(sc, payload, 15)
 
         # Clean stream passes intact including flushed tail
         sc_ok = OverlapCanaryScanner([secret_ro])

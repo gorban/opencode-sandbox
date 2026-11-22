@@ -369,31 +369,38 @@ function handle_broker_postgres_conn(client_sock, job_lease, pg_route):
 
 - [x] **Gate 1 external security review of `prd_l1.md`** — cleared at commit `a8ef3c5d031f`
       (SHA-256 `53cbcb1aeac334b2d3add6f1cac8d87393d704b2722d489872c45eb8e9080d0a`).
-- [ ] **Plan IR host-vs-container split (`oc_schema.py`, `oc_plan.py`)** — add `broker_routes`,
-      `credential_delivery` enum (`"local-ephemeral"` / `"host-brokered"` / `"raw-container-mount"`),
-      close `pinned-artifact` local bypass, expand sensitive-header validation, enforce
-      `isolated-sidecars` + `open_reverse_channel` transport gating, and add
-      `raw_remote_secret_mounted` to `SECURITY_DELTA_TRIGGERS`.
-- [ ] **Unified Host L7 HTTP Policy Proxy** — extend `oc_llm_broker.py` with global `denied_paths`
-      + ordered per-rule `(methods, path_patterns, body_policy)` allow rules, per-route
-      `inbound_auth`, connect-time DNS-pinned IP validation + TLS SNI, hard `follow_redirects=False`
-      (`502` on `3xx`), unconditional HTTP `Upgrade`/`101` rejection, `Accept-Encoding: identity`,
-      MCP JSON-RPC & SSE `tools/list` filtering, GraphQL AST query-only enforcement, safe response
-      header allowlisting + overlap canary scanning, and `<1s` `oc_controller` revocation.
-- [ ] **Per-job Message-Framed Host Postgres Wire Proxy** — pure-Python `asyncio` v3 framed proxy
-      handling `SSLRequest`/`GSSENCRequest`, strict TLS-only `verify-full` upstream (including TLS
-      `CancelRequest`), synthetic job-local `BackendKeyData`, upstream RO/RW role pinning, and
-      length-accurate `ErrorResponse`/`NoticeResponse` scrubbing.
-- [ ] **Host-mediated SSH Command Broker / MCP** — fixed-`argv` preset read-only remote commands
-      (zero shell interpolation) + `oc_controller`-approved exec over host Keeper SSH agent
-      (`ForwardAgent=no`, `ClearAllForwardings=yes`, `StrictHostKeyChecking=yes`, pinned
-      `UserKnownHostsFile`).
-- [ ] **AWS `AWS_ENDPOINT_URL` SigV4 Re-Signer (optional adapter)** — host-side SigV4 re-signing +
-      `sts:AssumeRole` RO session-policy scoping + action inspection (`Action=`, `X-Amz-Target`,
-      REST verb+path).
-- [ ] **Adversarial & live canary qualification + Gate 2 review** — prove zero secret leakage and
-      fail-closed L7/Postgres/SSH enforcement across Linux (`pasta -T` / `managed` UDS) and macOS
-      SSH (`ssh -R`).
+- [x] **Plan IR host-vs-container split (`oc_schema.py`, `oc_plan.py`)** — implemented on
+      `spike-prd-l1`: `broker_routes`, `credential_delivery` enum (`"local-ephemeral"` /
+      `"host-brokered"` / `"raw-container-mount"`), `pinned-artifact` local bypass closure,
+      expanded 7-header sensitive-header validation, `isolated-sidecars` + `open_reverse_channel`
+      transport gating, exact `PlanOverrides.allow_raw_remote_mounts` break-glass binding, and
+      `raw_remote_secret_mounted` in `SECURITY_DELTA_TRIGGERS` (`test_plan_broker.py`).
+- [x] **Unified Host L7 HTTP Policy Proxy (`oc_broker_http.py`)** — implemented on `spike-prd-l1`:
+      global `denied_paths` + ordered per-rule `(methods, path_patterns, body_policy)` allow rules,
+      per-route `inbound_auth`, connect-time DNS-pinned IP validation + TLS SNI, hard
+      `follow_redirects=False` (`502` on `3xx`), unconditional HTTP `Upgrade`/`101` rejection,
+      `Accept-Encoding: identity`, MCP JSON-RPC & SSE `tools/list` filtering, pure-stdlib GraphQL
+      AST query-only enforcement, safe response header allowlisting + overlap canary scanning, and
+      `<1s` `oc_controller` revocation (`test_broker_http.py`).
+- [x] **Per-job Message-Framed Host Postgres Wire Proxy (`oc_broker_pg.py`)** — implemented on
+      `spike-prd-l1`: bounded single-threaded `selectors` v3 framed proxy handling
+      `SSLRequest`/`GSSENCRequest`, strict TLS-only `verify-full` upstream (including TLS
+      `CancelRequest`), pure-stdlib SCRAM-SHA-256 (with `v=` verification), synthetic job-local
+      `BackendKeyData`, upstream RO/RW role pinning, `ParameterStatus` allowlist scrubbing, and
+      length-accurate `ErrorResponse`/`NoticeResponse` scrubbing (`test_broker_pg_ssh.py`).
+- [x] **Host-mediated SSH Command Broker (`oc_broker_ssh.py`)** — implemented on `spike-prd-l1`:
+      fixed-`argv` preset read-only remote commands (strict allowlists + `shlex.quote`, zero shell
+      interpolation) + `oc_controller` `APPLY_ONCE` digest-pinned exec over hardened OpenSSH
+      (`-F /dev/null`, `ForwardAgent=no`, `ClearAllForwardings=yes`, `StrictHostKeyChecking=yes`,
+      DNS-pinned `HostName`/`HostKeyAlias`, pinned `0600` `UserKnownHostsFile`, bounded streaming
+      output + `<1s` revoke kill) (`test_broker_pg_ssh.py`).
+- [x] **AWS `AWS_ENDPOINT_URL` SigV4 Re-Signer (`oc_broker_http.py`)** — implemented on
+      `spike-prd-l1`: inbound `aws-sigv4-job-key` HMAC-SHA256 verification + host-side SigV4
+      re-signing + action inspection (`Action=` across query & body with duplicate/encoded
+      smuggling rejection, `X-Amz-Target`, REST verb+path) (`test_broker_http.py`).
+- [ ] **Adversarial & live canary qualification + Gate 2 review** — offline cross-lane synthetic
+      canary suite (`test_prd_l1_e2e.py`) passing on `spike-prd-l1`; Gate 2 external review and
+      live Linux (`pasta -T` / `managed` UDS) + macOS (`ssh -R`) host qualification pending.
 
 ## Review record
 
