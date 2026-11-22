@@ -671,6 +671,27 @@ class TestBrokerHttpIntegration(unittest.TestCase):
                 broker.stop()
             self.assertFalse(endpoint.exists())
 
+    def test_unix_stop_recovers_ownership_after_startup_rollback_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            endpoint = Path(temp) / "startup.sock"
+            broker = HostHttpBrokerServer(self.routes, self.vault, self.lease, socket_path=endpoint)
+            try:
+                with (
+                    patch.object(socket.socket, "listen", side_effect=OSError("fixture listen failure")),
+                    patch("oc_broker_common.os.unlink", side_effect=OSError("fixture rollback failure")),
+                    self.assertRaisesRegex(BrokerError, "startup rollback incomplete"),
+                ):
+                    broker.start()
+                self.assertTrue(endpoint.exists())
+            finally:
+                broker.stop()
+            self.assertFalse(endpoint.exists())
+            try:
+                self.assertEqual(broker.start(), endpoint)
+            finally:
+                broker.stop()
+            self.assertFalse(endpoint.exists())
+
     def test_unix_stop_retries_failed_unlink(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             endpoint = Path(temp) / "http.sock"

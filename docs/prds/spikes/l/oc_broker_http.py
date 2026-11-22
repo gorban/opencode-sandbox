@@ -45,6 +45,7 @@ from oc_broker_common import (
     HostVaultMemory,
     ListenerWorkers,
     OverlapCanaryScanner,
+    UdsStartupError,
     bind_loopback_tcp,
     bind_trusted_uds,
     connect_tls_pinned_ip,
@@ -2230,12 +2231,16 @@ class HostHttpBrokerServer:
 
     def start(self) -> tuple[str, int] | Path:
         with self._lifecycle:
-            if self._sock is not None:
+            if self._sock is not None or self._bound_uds is not None:
                 raise BrokerPolicyError("HTTP broker has already started; stop it first")
             if self._socket_path is not None:
-                srv, self._bound_uds = bind_trusted_uds(
-                    self._socket_path, sandbox_root=self._sandbox_root
-                )
+                try:
+                    srv, self._bound_uds = bind_trusted_uds(
+                        self._socket_path, sandbox_root=self._sandbox_root
+                    )
+                except UdsStartupError as exc:
+                    self._bound_uds = exc.endpoint
+                    raise
                 address = self._bound_uds.path
             else:
                 srv, port = bind_loopback_tcp(self._host, self._port)
@@ -2254,7 +2259,7 @@ class HostHttpBrokerServer:
             self._stop_locked()
 
     def _stop_locked(self) -> None:
-        if self._sock is None:
+        if self._sock is None and self._bound_uds is None:
             return
         self._workers.stop(self._sock, self._bound_uds)
         self._bound_uds = None

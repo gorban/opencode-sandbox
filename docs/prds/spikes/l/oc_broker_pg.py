@@ -41,6 +41,7 @@ from oc_broker_common import (
     MIN_SECRET_LEN,
     OverlapCanaryScanner,
     PgUpstreamCancelTarget,
+    UdsStartupError,
     bind_loopback_tcp,
     bind_trusted_uds,
     connect_tcp_pinned_ip,
@@ -772,12 +773,16 @@ class HostPostgresBrokerServer:
 
     def start(self) -> None:
         with self._lifecycle:
-            if self._listen_sock is not None:
+            if self._listen_sock is not None or self._bound_uds is not None:
                 raise BrokerPolicyError("Postgres broker has already started; stop it first")
             if self._uds_path is not None:
-                srv, self._bound_uds = bind_trusted_uds(
-                    self._uds_path, sandbox_root=self._sandbox_root
-                )
+                try:
+                    srv, self._bound_uds = bind_trusted_uds(
+                        self._uds_path, sandbox_root=self._sandbox_root
+                    )
+                except UdsStartupError as exc:
+                    self._bound_uds = exc.endpoint
+                    raise
             else:
                 srv, self._bound_port = bind_loopback_tcp(self._host, self._port)
             self._listen_sock = srv
@@ -792,7 +797,7 @@ class HostPostgresBrokerServer:
             self._stop_locked()
 
     def _stop_locked(self) -> None:
-        if self._listen_sock is None:
+        if self._listen_sock is None and self._bound_uds is None:
             return
         self._workers.stop(self._listen_sock, self._bound_uds)
         self._bound_uds = None

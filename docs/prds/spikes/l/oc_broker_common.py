@@ -420,6 +420,14 @@ class BoundUds:
         self.directory_fd = -1
 
 
+class UdsStartupError(BrokerError):
+    """A failed Unix bind sequence with an owned endpoint still to clean up."""
+
+    def __init__(self, endpoint: BoundUds):
+        super().__init__("Unix listener startup rollback incomplete; retry with stop")
+        self.endpoint = endpoint
+
+
 def _assert_existing_ancestor_chain_trusted(target_dir: Path, *, sandbox_root: Path | None) -> None:
     """Verify every existing ancestor of target_dir is owned by current user/root and not world-writable."""
     uid = os.geteuid()
@@ -501,13 +509,20 @@ def bind_trusted_uds(
         fcntl.flock(directory_fd, fcntl.LOCK_UN)
         return srv, bound
     except BaseException:
+        retain_receipt = False
         try:
             if srv is not None:
-                srv.close()
+                _safe_shutdown_close(srv)
             if bound is not None:
-                bound.unlink_owned()
+                try:
+                    bound.unlink_owned()
+                except (OSError, BrokerError) as cleanup_error:
+                    fcntl.flock(directory_fd, fcntl.LOCK_UN)
+                    retain_receipt = True
+                    raise UdsStartupError(bound) from cleanup_error
         finally:
-            os.close(directory_fd)
+            if not retain_receipt:
+                os.close(directory_fd)
         raise
 
 
@@ -635,13 +650,14 @@ class ListenerWorkers:
                     _safe_shutdown_close(client)
                     slots.release()
 
-    def stop(self, listener: socket.socket, endpoint: BoundUds | None = None) -> None:
+    def stop(self, listener: socket.socket | None, endpoint: BoundUds | None = None) -> None:
         deadline = time.monotonic() + _LISTENER_TIMEOUT
         with self._lock:
             self._stopping = True
             streams = tuple(self._streams)
             workers = tuple(self._workers)
-        _safe_shutdown_close(listener)
+        if listener is not None:
+            _safe_shutdown_close(listener)
         for sock in streams:
             _safe_shutdown_close(sock)
         for worker in workers:
