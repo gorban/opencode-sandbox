@@ -138,9 +138,16 @@ def _sha256_hex(raw: str) -> str:
 
 
 def _validate_finite_number(value: object, label: str) -> float:
-    if type(value) not in (int, float) or not math.isfinite(float(value)):
-        raise UiAuthValidationError(f"{label} must be a finite number")
-    return float(value)
+    err_msg = f"{label} must be a finite number"
+    if type(value) not in (int, float):
+        raise UiAuthValidationError(err_msg)
+    try:
+        num = float(value)
+    except OverflowError as exc:
+        raise UiAuthValidationError(err_msg) from exc
+    if not math.isfinite(num):
+        raise UiAuthValidationError(err_msg)
+    return num
 
 
 def _is_loopback_hostname(hostname: str) -> bool:
@@ -152,6 +159,23 @@ def _is_loopback_hostname(hostname: str) -> bool:
         return False
 
 
+def _extract_raw_port(host_entry: str) -> str | None:
+    if host_entry.startswith("["):
+        closing = host_entry.find("]")
+        if closing == -1:
+            raise UiAuthValidationError(f"Malformed IPv6 host entry: {host_entry!r}")
+        tail = host_entry[closing + 1 :]
+        if not tail:
+            return None
+        if not tail.startswith(":"):
+            raise UiAuthValidationError(f"Malformed IPv6 port suffix: {host_entry!r}")
+        return tail[1:]
+    if ":" not in host_entry:
+        return None
+    _, port_part = host_entry.rsplit(":", 1)
+    return port_part
+
+
 def _validate_loopback_host_entry(raw: object) -> str:
     try:
         text = check_no_control_or_bidi(raw, "allowed_host")
@@ -159,6 +183,10 @@ def _validate_loopback_host_entry(raw: object) -> str:
         raise UiAuthValidationError(str(exc)) from exc
     if not text or any(ch.isspace() for ch in text) or "/" in text or "@" in text:
         raise UiAuthValidationError(f"Invalid allowed host entry: {raw!r}")
+    raw_port = _extract_raw_port(text)
+    if raw_port is not None:
+        if not raw_port or not (raw_port.isascii() and raw_port.isdigit()) or raw_port.startswith("0"):
+            raise UiAuthValidationError(f"Invalid port in allowed host: {raw!r}")
     parsed = urlsplit(f"http://{text}")
     if parsed.netloc != text or parsed.hostname is None:
         raise UiAuthValidationError(f"Malformed allowed host entry: {raw!r}")
@@ -239,6 +267,11 @@ class UiAuthManager:
         origins = frozenset(_validate_loopback_origin_entry(o) for o in allowed_origins)
         if not hosts or not origins:
             raise UiAuthValidationError("allowed_hosts and allowed_origins must be non-empty")
+        for origin in origins:
+            if urlsplit(origin).netloc not in hosts:
+                raise UiAuthValidationError(
+                    f"Allowed origin authority must appear in allowed_hosts: {origin!r}"
+                )
         boot_ttl = _validate_finite_number(bootstrap_ttl_s, "bootstrap_ttl_s")
         idle_ttl = _validate_finite_number(idle_ttl_s, "idle_ttl_s")
         abs_ttl = _validate_finite_number(absolute_ttl_s, "absolute_ttl_s")
@@ -271,12 +304,15 @@ class UiAuthManager:
         self._sessions: dict[str, _SessionState] = {}
         self._ws_tickets: dict[str, _WsTicketEntry] = {}
 
-    def _require_valid_host(self, host_header: object) -> None:
+    def _require_valid_host(self, host_header: object) -> str:
         if type(host_header) is not str or host_header not in self._allowed_hosts:
             raise UiAuthDeniedError(_ERR_INVALID_HOST)
+        return host_header
 
-    def _require_valid_origin(self, origin_header: object) -> None:
+    def _require_valid_origin(self, origin_header: object, *, host_header: str) -> None:
         if type(origin_header) is not str or origin_header not in self._allowed_origins:
+            raise UiAuthDeniedError(_ERR_INVALID_ORIGIN)
+        if urlsplit(origin_header).netloc != host_header:
             raise UiAuthDeniedError(_ERR_INVALID_ORIGIN)
 
     def _purge_expired_locked(self, now: float) -> None:
@@ -345,8 +381,8 @@ class UiAuthManager:
 
         raw_code = secrets.token_urlsafe(32)
         digest = _sha256_hex(raw_code)
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._purge_expired_locked(now)
             if len(self._pending_codes) >= self._max_pending_codes:
                 raise UiAuthDeniedError("Pending bootstrap code table capacity exceeded")
@@ -365,20 +401,20 @@ class UiAuthManager:
         origin_header: str | None = None,
     ) -> tuple[SessionRecord, str, str]:
         """Atomically exchange a one-time bootstrap code for a session, CSRF token, and Set-Cookie."""
-        self._require_valid_host(host_header)
+        valid_host = self._require_valid_host(host_header)
         if origin_header is not None:
-            self._require_valid_origin(origin_header)
+            self._require_valid_origin(origin_header, host_header=valid_host)
         if type(code) is not str or not code:
             raise UiAuthDeniedError(_ERR_INVALID_BOOTSTRAP_CODE)
 
         digest = _sha256_hex(code)
-        now = self._clock()
         raw_session_id = secrets.token_urlsafe(32)
         csrf_token = secrets.token_urlsafe(32)
         session_hash = _sha256_hex(raw_session_id)
         csrf_hash = _sha256_hex(csrf_token)
 
         with self._lock:
+            now = self._clock()
             self._purge_expired_locked(now)
             entry = self._pending_codes.pop(digest, None)
             if (
@@ -406,8 +442,8 @@ class UiAuthManager:
     ) -> SessionRecord:
         """Verify Host and active session (enforcing both idle and absolute TTLs)."""
         self._require_valid_host(host_header)
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             state = self._get_active_session_locked(session_id, now, touch=touch)
             return state.record
 
@@ -415,7 +451,11 @@ class UiAuthManager:
         """Revoke one session by raw session ID and purge all WS tickets bound to it."""
         if type(session_id) is not str or not session_id:
             return False
-        return self.revoke_session_by_hash(_sha256_hex(session_id))
+        try:
+            digest = _sha256_hex(session_id)
+        except UiAuthDeniedError:
+            return False
+        return self.revoke_session_by_hash(digest)
 
     def revoke_session_by_hash(self, session_id_hash: str) -> bool:
         """Revoke one session by its SHA-256 digest and purge all WS tickets bound to it."""
@@ -449,13 +489,13 @@ class UiAuthManager:
         csrf_token: str | None,
     ) -> SessionRecord:
         """Enforce exact Host, exact Origin (rejecting missing/null/foreign), session, and CSRF."""
-        self._require_valid_host(host_header)
-        self._require_valid_origin(origin_header)
+        valid_host = self._require_valid_host(host_header)
+        self._require_valid_origin(origin_header, host_header=valid_host)
         if type(csrf_token) is not str or not csrf_token:
             raise UiAuthDeniedError(_ERR_MISSING_CSRF)
         csrf_digest = _sha256_hex(csrf_token)
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             state = self._get_active_session_locked(session_id, now, touch=False)
             if not hmac.compare_digest(state.csrf_hash, csrf_digest):
                 raise UiAuthDeniedError(_ERR_CSRF_MISMATCH)
@@ -475,8 +515,8 @@ class UiAuthManager:
         ttl_s: float | None = None,
     ) -> str:
         """Mint a single-use 256-bit WS ticket pinned to session + target + incarnation + surface + mode."""
-        self._require_valid_host(host_header)
-        self._require_valid_origin(origin_header)
+        valid_host = self._require_valid_host(host_header)
+        self._require_valid_origin(origin_header, host_header=valid_host)
         if type(csrf_token) is not str or not csrf_token:
             raise UiAuthDeniedError(_ERR_MISSING_CSRF)
         canon_target, clean_inc, clean_surface, clean_mode = _validate_ws_scope(
@@ -493,9 +533,9 @@ class UiAuthManager:
         csrf_digest = _sha256_hex(csrf_token)
         raw_ticket = secrets.token_urlsafe(32)
         ticket_digest = _sha256_hex(raw_ticket)
-        now = self._clock()
 
         with self._lock:
+            now = self._clock()
             state = self._get_active_session_locked(session_id, now, touch=False)
             if not hmac.compare_digest(state.csrf_hash, csrf_digest):
                 raise UiAuthDeniedError(_ERR_CSRF_MISMATCH)
@@ -526,20 +566,26 @@ class UiAuthManager:
         expected_incarnation_id: str,
         expected_surface_kind: str,
         expected_mode: str,
+        expected_session_id: str | None = None,
     ) -> WsTicketScope:
-        """Atomically consume a single-use WS ticket after verifying Host, Origin, TTL, session, and all 4 scope pins."""
-        self._require_valid_host(host_header)
-        self._require_valid_origin(origin_header)
+        """Atomically consume a single-use WS ticket after verifying Host, Origin, TTL, session, and scope pins."""
+        valid_host = self._require_valid_host(host_header)
+        self._require_valid_origin(origin_header, host_header=valid_host)
         canon_target, clean_inc, clean_surface, clean_mode = _validate_ws_scope(
             expected_target_addr, expected_incarnation_id, expected_surface_kind, expected_mode
         )
         if type(ticket) is not str or not ticket:
             raise UiAuthDeniedError(_ERR_INVALID_WS_TICKET)
+        expected_session_digest: str | None = None
+        if expected_session_id is not None:
+            if type(expected_session_id) is not str or not expected_session_id:
+                raise UiAuthDeniedError(_ERR_INVALID_SESSION)
+            expected_session_digest = _sha256_hex(expected_session_id)
 
         ticket_digest = _sha256_hex(ticket)
-        now = self._clock()
 
         with self._lock:
+            now = self._clock()
             self._purge_expired_locked(now)
             entry = self._ws_tickets.pop(ticket_digest, None)
             if (
@@ -548,9 +594,13 @@ class UiAuthManager:
                 or now >= entry.scope.expires_at
             ):
                 raise UiAuthDeniedError(_ERR_INVALID_WS_TICKET)
-            if entry.scope.session_id_hash not in self._sessions:
-                raise UiAuthDeniedError(_ERR_INVALID_SESSION)
             scope = entry.scope
+            if scope.session_id_hash not in self._sessions:
+                raise UiAuthDeniedError(_ERR_INVALID_SESSION)
+            if expected_session_digest is not None and not hmac.compare_digest(
+                scope.session_id_hash, expected_session_digest
+            ):
+                raise UiAuthDeniedError(_ERR_INVALID_SESSION)
             if not (
                 hmac.compare_digest(scope.target_addr, canon_target)
                 and hmac.compare_digest(scope.incarnation_id, clean_inc)

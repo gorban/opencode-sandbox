@@ -6,8 +6,8 @@ Pure Python standard library only. Enforces:
 - Pre-parse sliding-window rate limiting so flood connections fail fast
 - Bounded concurrent connections via ListenerWorkers and per-connection timeouts
 - Bounded Content-Length framing (max 128 KiB, no pipelined trailing bytes)
-- Strict JSON parsing (rejects duplicate keys, NaN/Infinity, NUL bytes, unpaired
-  surrogates, nesting depth > 32, oversized payloads, non-object top-level JSON)
+- Strict JSON parsing (rejects duplicate keys, NaN/Infinity/overflow floats, NUL bytes,
+  unpaired surrogates, nesting depth > 32, oversized payloads, non-object top-level JSON)
 - Unforgeable PrincipalCtx binding derived solely from socket role or constant-time
   token binding, rejecting any client-forged identity fields with JSON-RPC -32602
 """
@@ -44,6 +44,7 @@ from oc_broker_common import (  # noqa: E402
     bind_trusted_uds,
 )
 from oc_coord_contract import (  # noqa: E402
+    MAX_ARTIFACTS_PER_MSG,
     ArtifactRef,
     CoordAuthError,
     CoordBackpressureError,
@@ -68,10 +69,26 @@ WRITE_TIMEOUT_SECONDS = 5.0
 TOTAL_REQUEST_TIMEOUT_SECONDS = 15.0
 MAX_WAIT_TIMEOUT_SECONDS = 60.0
 MAX_RATE_LIMITER_KEYS = 1_024
+MAX_SEQ_INT = (1 << 63) - 1
+
+_UTF8 = "utf-8"
+_STRICT = "strict"
+_KEY_JSONRPC = "jsonrpc"
+_KEY_ID = "id"
+_KEY_AUTH_TOKEN = "auth_token"
+_KEY_METHOD = "method"
+_KEY_PARAMS = "params"
+_KEY_TARGET = "target"
+_KEY_BLOB_SHA256 = "blob_sha256"
+_KEY_SIZE_BYTES = "size_bytes"
 
 ALLOWED_HEADERS: frozenset[str] = frozenset({"content-length", "content-type"})
-ALLOWED_RPC_KEYS: frozenset[str] = frozenset({"jsonrpc", "id", "auth_token", "method", "params"})
-ALLOWED_ARTIFACT_REF_KEYS: frozenset[str] = frozenset({"blob_sha256", "size_bytes", "media_type"})
+ALLOWED_RPC_KEYS: frozenset[str] = frozenset(
+    {_KEY_JSONRPC, _KEY_ID, _KEY_AUTH_TOKEN, _KEY_METHOD, _KEY_PARAMS}
+)
+ALLOWED_ARTIFACT_REF_KEYS: frozenset[str] = frozenset(
+    {_KEY_BLOB_SHA256, _KEY_SIZE_BYTES, "media_type"}
+)
 
 FORBIDDEN_IDENTITY_KEYS: frozenset[str] = frozenset(
     {"src", "src_role", "src_actor", "trust_class", "principal", "badge", "caller"}
@@ -89,11 +106,11 @@ ALLOWED_METHODS: frozenset[str] = frozenset(
 
 _METHOD_PARAM_ALLOWLISTS: dict[str, frozenset[str]] = {
     METHOD_SEND: frozenset(
-        {"target", "thread_id", "msg_kind", "body_text", "in_reply_to", "artifact_refs"}
+        {_KEY_TARGET, "thread_id", "msg_kind", "body_text", "in_reply_to", "artifact_refs"}
     ),
-    METHOD_STATUS: frozenset({"target"}),
+    METHOD_STATUS: frozenset({_KEY_TARGET}),
     METHOD_WAIT: frozenset({"targets", "since_seq", "timeout_s"}),
-    METHOD_REVOKE: frozenset({"target", "reason"}),
+    METHOD_REVOKE: frozenset({_KEY_TARGET, "reason"}),
     METHOD_PROJECTION: frozenset(),
 }
 
@@ -107,6 +124,7 @@ ERR_CODE_RATE_LIMIT = -32002
 ERR_CODE_POLICY = -32003
 
 _TRAILING_BYTES_MSG = "Trailing or pipelined bytes after Content-Length frame"
+_HEADER_TOO_LARGE_MSG = "Header section too large"
 
 
 class FramingError(ValueError):
@@ -160,6 +178,19 @@ class CoordHubProtocol(Protocol):
     def projection(self, caller: PrincipalCtx) -> dict[str, Any]: ...
 
 
+def _validate_finite_positive(value: object, label: str) -> float:
+    err_msg = f"{label} must be a finite positive number"
+    if type(value) not in (int, float):
+        raise ValueError(err_msg)
+    try:
+        num = float(value)
+    except OverflowError as exc:
+        raise ValueError(err_msg) from exc
+    if not math.isfinite(num) or num <= 0.0:
+        raise ValueError(err_msg)
+    return num
+
+
 def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, val in pairs:
@@ -177,25 +208,29 @@ def _validate_json_string(text: str) -> None:
     if "\x00" in text:
         raise StrictJsonError("NUL byte rejected in JSON string")
     try:
-        text.encode("utf-8", errors="strict")
+        text.encode(_UTF8, errors=_STRICT)
     except UnicodeEncodeError as exc:
         raise StrictJsonError("Unpaired UTF-16 surrogate rejected") from exc
 
 
-def _check_depth_and_strings(obj: Any, depth: int, max_depth: int) -> None:
+def _check_depth_and_values(obj: Any, depth: int, max_depth: int) -> None:
     if depth > max_depth:
         raise StrictJsonError(f"JSON nesting depth exceeds {max_depth}")
     if isinstance(obj, str):
         _validate_json_string(obj)
         return
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            raise StrictJsonError("Non-finite float value rejected")
+        return
     if isinstance(obj, list):
         for item in obj:
-            _check_depth_and_strings(item, depth + 1, max_depth)
+            _check_depth_and_values(item, depth + 1, max_depth)
         return
     if isinstance(obj, dict):
         for key, val in obj.items():
-            _check_depth_and_strings(key, depth + 1, max_depth)
-            _check_depth_and_strings(val, depth + 1, max_depth)
+            _check_depth_and_values(key, depth + 1, max_depth)
+            _check_depth_and_values(val, depth + 1, max_depth)
 
 
 def parse_strict_json(
@@ -212,7 +247,7 @@ def parse_strict_json(
     if b"\x00" in raw:
         raise StrictJsonError("NUL byte rejected in JSON payload")
     try:
-        text = bytes(raw).decode("utf-8", errors="strict")
+        text = bytes(raw).decode(_UTF8, errors=_STRICT)
     except UnicodeDecodeError as exc:
         raise StrictJsonError("Invalid UTF-8 payload") from exc
     try:
@@ -227,7 +262,7 @@ def parse_strict_json(
         raise StrictJsonError(f"JSON nesting depth exceeds {max_depth}") from exc
     except Exception as exc:
         raise StrictJsonError(f"Invalid JSON: {exc}") from exc
-    _check_depth_and_strings(data, 0, max_depth)
+    _check_depth_and_values(data, 0, max_depth)
     if not isinstance(data, dict):
         raise StrictJsonError("JSON-RPC payload must be a JSON object")
     return data
@@ -241,7 +276,7 @@ def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
         ensure_ascii=False,
         allow_nan=False,
     )
-    return encoded.encode("utf-8")
+    return encoded.encode(_UTF8)
 
 
 def encode_content_length_frame(payload: dict[str, Any]) -> bytes:
@@ -281,7 +316,9 @@ def _read_header_section(
         buf.extend(chunk)
         header_end = buf.find(b"\r\n\r\n")
         if header_end == -1 and len(buf) > max_header_bytes:
-            raise FramingError("Header section too large")
+            raise FramingError(_HEADER_TOO_LARGE_MSG)
+    if header_end > max_header_bytes:
+        raise FramingError(_HEADER_TOO_LARGE_MSG)
     return bytes(buf[:header_end]), bytes(buf[header_end + 4 :])
 
 
@@ -301,7 +338,7 @@ def _parse_header_line(line: str, headers: dict[str, str]) -> None:
 
 def _parse_content_length(header_bytes: bytes, max_bytes: int) -> int:
     try:
-        header_text = header_bytes.decode("ascii", errors="strict")
+        header_text = header_bytes.decode("ascii", errors=_STRICT)
     except UnicodeDecodeError as exc:
         raise FramingError("Non-ASCII header bytes rejected") from exc
 
@@ -324,8 +361,6 @@ def _reject_pipelined_bytes(conn: socket.socket, read_timeout: float) -> None:
         extra = conn.recv(1, socket.MSG_PEEK)
         if extra:
             raise FramingError(_TRAILING_BYTES_MSG)
-    except BlockingIOError:
-        pass
     except OSError:
         pass
     finally:
@@ -382,12 +417,11 @@ class SlidingWindowRateLimiter:
     ):
         if type(max_requests) is not int or max_requests < 1:
             raise ValueError("max_requests must be a positive integer")
-        if window_seconds <= 0:
-            raise ValueError("window_seconds must be positive")
+        valid_window = _validate_finite_positive(window_seconds, "window_seconds")
         if type(max_keys) is not int or max_keys < 1:
             raise ValueError("max_keys must be a positive integer")
         self.max_requests = max_requests
-        self.window_seconds = float(window_seconds)
+        self.window_seconds = valid_window
         self._max_keys = max_keys
         self._clock = clock
         self._lock = threading.Lock()
@@ -399,9 +433,9 @@ class SlidingWindowRateLimiter:
             del self._hits[key]
 
     def allow(self, key: Hashable) -> bool:
-        now = self._clock()
-        cutoff = now - self.window_seconds
         with self._lock:
+            now = self._clock()
+            cutoff = now - self.window_seconds
             q = self._hits.get(key)
             if q is None:
                 if len(self._hits) >= self._max_keys:
@@ -419,7 +453,7 @@ class SlidingWindowRateLimiter:
 
 
 def _hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return hashlib.sha256(token.encode(_UTF8)).hexdigest()
 
 
 def _parse_artifact_ref(raw: Any) -> ArtifactRef:
@@ -428,12 +462,12 @@ def _parse_artifact_ref(raw: Any) -> ArtifactRef:
     extra = sorted(set(raw.keys()) - ALLOWED_ARTIFACT_REF_KEYS)
     if extra:
         raise CoordValidationError(f"Unknown artifact_ref keys: {', '.join(extra)}")
-    if "blob_sha256" not in raw or "size_bytes" not in raw:
+    if _KEY_BLOB_SHA256 not in raw or _KEY_SIZE_BYTES not in raw:
         raise CoordValidationError("artifact_ref requires blob_sha256 and size_bytes")
     media_type = raw.get("media_type", "text/x-patch")
     return ArtifactRef(
-        blob_sha256=raw["blob_sha256"],
-        size_bytes=raw["size_bytes"],
+        blob_sha256=raw[_KEY_BLOB_SHA256],
+        size_bytes=raw[_KEY_SIZE_BYTES],
         media_type=media_type,
     )
 
@@ -470,13 +504,16 @@ def _parse_wait_params(params: dict[str, Any]) -> tuple[tuple[str, ...], int, fl
     if any(type(t) is not str for t in raw_targets):
         raise CoordValidationError("every target in targets must be a string")
     since_seq = params.get("since_seq", 0)
-    if type(since_seq) is not int or since_seq < 0:
-        raise CoordValidationError("since_seq must be a non-negative integer")
+    if type(since_seq) is not int or not (0 <= since_seq <= MAX_SEQ_INT):
+        raise CoordValidationError(f"since_seq must be an integer in 0..{MAX_SEQ_INT}")
     raw_timeout = params.get("timeout_s", 5.0)
-    if type(raw_timeout) not in (int, float) or not math.isfinite(float(raw_timeout)):
+    if type(raw_timeout) not in (int, float):
         raise CoordValidationError("timeout_s must be a finite number")
-    timeout_s = float(raw_timeout)
-    if not (0.0 <= timeout_s <= MAX_WAIT_TIMEOUT_SECONDS):
+    try:
+        timeout_s = float(raw_timeout)
+    except OverflowError as exc:
+        raise CoordValidationError("timeout_s must be a finite number") from exc
+    if not math.isfinite(timeout_s) or not (0.0 <= timeout_s <= MAX_WAIT_TIMEOUT_SECONDS):
         raise CoordValidationError(f"timeout_s must be in 0..{MAX_WAIT_TIMEOUT_SECONDS}")
     return tuple(raw_targets), since_seq, timeout_s
 
@@ -492,11 +529,25 @@ def _serialize_revocation(status: RevocationStatus) -> dict[str, Any]:
 
 
 def _rpc_ok(req_id: Any, result: Any) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+    return {_KEY_JSONRPC: "2.0", _KEY_ID: req_id, "result": result}
 
 
 def _rpc_error(req_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+    return {_KEY_JSONRPC: "2.0", _KEY_ID: req_id, "error": {"code": code, "message": message}}
+
+
+def _build_token_table(
+    token_principals: Mapping[str, PrincipalCtx],
+) -> dict[str, tuple[str, PrincipalCtx]]:
+    table: dict[str, tuple[str, PrincipalCtx]] = {}
+    for tok, principal in token_principals.items():
+        if type(tok) is not str or not tok:
+            raise ValueError("token_principals keys must be non-empty strings")
+        if not isinstance(principal, PrincipalCtx):
+            raise ValueError("token_principals values must be PrincipalCtx instances")
+        digest = _hash_token(tok)
+        table[digest] = (digest, principal)
+    return table
 
 
 class CoordUdsRpcServer:
@@ -520,24 +571,30 @@ class CoordUdsRpcServer:
     ):
         if type(max_concurrent_conns) is not int or max_concurrent_conns < 1:
             raise ValueError("max_concurrent_conns must be a positive integer")
+        valid_io_timeout = _validate_finite_positive(io_timeout, "io_timeout")
+        if token_principals is not None and required_auth_token is not None:
+            raise ValueError("Specify at most one of token_principals or required_auth_token")
+        if required_auth_token is not None and (
+            type(required_auth_token) is not str or not required_auth_token
+        ):
+            raise ValueError("required_auth_token must be a non-empty string")
+
         self._hub = hub
         self._raw_socket_path = Path(socket_path)
         self._sandbox_root = sandbox_root
         self._role = role
         self._expected_uid = os.geteuid() if expected_uid is None else expected_uid
         self._max_concurrent_conns = max_concurrent_conns
-        self._read_timeout = io_timeout
-        self._write_timeout = io_timeout
+        self._read_timeout = valid_io_timeout
+        self._write_timeout = valid_io_timeout
         self._peer_uid_getter = peer_uid_getter
         self._required_token_hash = (
             _hash_token(required_auth_token) if required_auth_token is not None else None
         )
         self._token_lock = threading.Lock()
-        self._token_table: dict[str, PrincipalCtx] | None = None
-        if token_principals is not None:
-            self._token_table = {
-                _hash_token(tok): principal for tok, principal in token_principals.items()
-            }
+        self._token_table: dict[str, tuple[str, PrincipalCtx]] | None = (
+            _build_token_table(token_principals) if token_principals is not None else None
+        )
         self.rate_limiter = SlidingWindowRateLimiter(rate_limit_max, rate_limit_window)
         self._workers = ListenerWorkers()
         self._listener: socket.socket | None = None
@@ -581,18 +638,19 @@ class CoordUdsRpcServer:
         if listener is not None or bound is not None:
             self._workers.stop(listener, bound)
 
-    def _resolve_principal(
-        self, peer_uid: int, auth_token: Any
-    ) -> PrincipalCtx | None:
-        if self._token_table is not None:
-            if type(auth_token) is not str or not auth_token:
-                return None
-            digest = _hash_token(auth_token)
-            with self._token_lock:
-                for stored_digest, principal in self._token_table.items():
-                    if hmac.compare_digest(stored_digest, digest):
-                        return principal
+    def _lookup_token_principal(self, auth_token: Any) -> PrincipalCtx | None:
+        if type(auth_token) is not str or not auth_token or self._token_table is None:
             return None
+        digest = _hash_token(auth_token)
+        with self._token_lock:
+            entry = self._token_table.get(digest)
+        if entry is not None and hmac.compare_digest(entry[0], digest):
+            return entry[1]
+        return None
+
+    def _resolve_principal(self, peer_uid: int, auth_token: Any) -> PrincipalCtx | None:
+        if self._token_table is not None:
+            return self._lookup_token_principal(auth_token)
         if self._required_token_hash is not None:
             if type(auth_token) is not str or not auth_token:
                 return None
@@ -605,18 +663,18 @@ class CoordUdsRpcServer:
     ) -> tuple[Any, PrincipalCtx, str, dict[str, Any]] | dict[str, Any]:
         if set(req.keys()) - ALLOWED_RPC_KEYS:
             return _rpc_error(None, ERR_CODE_INVALID_REQUEST, "unknown_rpc_keys")
-        req_id = req.get("id")
+        req_id = req.get(_KEY_ID)
         if req_id is not None and type(req_id) not in (str, int):
             return _rpc_error(None, ERR_CODE_INVALID_REQUEST, "invalid_request_id")
-        if req.get("jsonrpc") != "2.0":
+        if req.get(_KEY_JSONRPC) != "2.0":
             return _rpc_error(req_id, ERR_CODE_INVALID_REQUEST, "invalid_jsonrpc_version")
-        caller = self._resolve_principal(peer_uid, req.get("auth_token"))
+        caller = self._resolve_principal(peer_uid, req.get(_KEY_AUTH_TOKEN))
         if caller is None:
             return _rpc_error(req_id, ERR_CODE_AUTH, "invalid_auth_token")
-        method = req.get("method")
+        method = req.get(_KEY_METHOD)
         if type(method) is not str or method not in ALLOWED_METHODS:
             return _rpc_error(req_id, ERR_CODE_METHOD_NOT_FOUND, "method_not_allowed")
-        params = req.get("params", {})
+        params = req.get(_KEY_PARAMS, {})
         if not isinstance(params, dict):
             return _rpc_error(req_id, ERR_CODE_INVALID_PARAMS, "params_must_be_object")
         return req_id, caller, method, params
@@ -639,10 +697,14 @@ class CoordUdsRpcServer:
             raw_refs = params.get("artifact_refs", [])
             if not isinstance(raw_refs, list):
                 raise CoordValidationError("artifact_refs must be a list")
+            if len(raw_refs) > MAX_ARTIFACTS_PER_MSG:
+                raise CoordValidationError(
+                    f"artifact_refs exceeds maximum of {MAX_ARTIFACTS_PER_MSG}"
+                )
             refs = tuple(_parse_artifact_ref(item) for item in raw_refs)
             return self._hub.send(
                 caller,
-                target=_require_str(params, "target"),
+                target=_require_str(params, _KEY_TARGET),
                 thread_id=_optional_str_default(params, "thread_id", "main"),
                 msg_kind=_optional_str_default(params, "msg_kind", "prompt"),
                 body_text=_require_str(params, "body_text"),
@@ -650,14 +712,14 @@ class CoordUdsRpcServer:
                 artifact_refs=refs,
             )
         if method == METHOD_STATUS:
-            return self._hub.status(caller, target=_optional_str(params, "target"))
+            return self._hub.status(caller, target=_optional_str(params, _KEY_TARGET))
         if method == METHOD_WAIT:
             targets, since_seq, timeout_s = _parse_wait_params(params)
             return self._hub.wait(caller, targets=targets, since_seq=since_seq, timeout_s=timeout_s)
         if method == METHOD_REVOKE:
             reason = _optional_str_default(params, "reason", "operator_revoked")
             rev_status = self._hub.revoke(
-                caller, target=_require_str(params, "target"), reason=reason
+                caller, target=_require_str(params, _KEY_TARGET), reason=reason
             )
             return _serialize_revocation(rev_status)
         return self._hub.projection(caller)
@@ -694,12 +756,13 @@ class CoordUdsRpcServer:
         if not self.rate_limiter.allow(peer_uid):
             self._send(conn, _rpc_error(None, ERR_CODE_RATE_LIMIT, "rate_limited"))
             return
+        total_timeout = min(TOTAL_REQUEST_TIMEOUT_SECONDS, self._read_timeout * 3.0)
         try:
             raw_frame = read_content_length_frame(
                 conn,
                 max_bytes=MAX_FRAME_BYTES,
                 read_timeout=self._read_timeout,
-                total_timeout=TOTAL_REQUEST_TIMEOUT_SECONDS,
+                total_timeout=total_timeout,
             )
             req = parse_strict_json(raw_frame, max_depth=MAX_JSON_DEPTH, max_bytes=MAX_FRAME_BYTES)
         except (FramingError, StrictJsonError) as exc:
@@ -714,10 +777,15 @@ class CoordUdsRpcServer:
 
     def _send(self, conn: socket.socket, payload: dict[str, Any]) -> None:
         try:
-            frame = encode_content_length_frame(payload)
+            try:
+                frame = encode_content_length_frame(payload)
+            except (TypeError, ValueError):
+                frame = encode_content_length_frame(
+                    _rpc_error(payload.get(_KEY_ID), ERR_CODE_INTERNAL, "response_serialization_error")
+                )
             if len(frame) > MAX_RESPONSE_BYTES:
                 frame = encode_content_length_frame(
-                    _rpc_error(payload.get("id"), ERR_CODE_INTERNAL, "response_too_large")
+                    _rpc_error(payload.get(_KEY_ID), ERR_CODE_INTERNAL, "response_too_large")
                 )
             conn.settimeout(self._write_timeout)
             conn.sendall(frame)
@@ -736,13 +804,13 @@ def uds_rpc_call(
 ) -> dict[str, Any]:
     """Send one Content-Length framed JSON-RPC 2.0 request to a CoordUdsRpcServer."""
     payload: dict[str, Any] = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": method,
-        "params": params,
+        _KEY_JSONRPC: "2.0",
+        _KEY_ID: request_id,
+        _KEY_METHOD: method,
+        _KEY_PARAMS: params,
     }
     if auth_token is not None:
-        payload["auth_token"] = auth_token
+        payload[_KEY_AUTH_TOKEN] = auth_token
     frame = encode_content_length_frame(payload)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:

@@ -17,6 +17,7 @@ if str(_SPIKE_M_DIR) not in sys.path:
     sys.path.insert(0, str(_SPIKE_M_DIR))
 
 from oc_coord_contract import (  # noqa: E402
+    MAX_ARTIFACTS_PER_MSG,
     ArtifactRef,
     CoordAuthError,
     CoordBackpressureError,
@@ -28,12 +29,16 @@ from oc_coord_contract import (  # noqa: E402
 )
 from oc_coord_rpc import (  # noqa: E402
     ERR_CODE_AUTH,
+    ERR_CODE_INTERNAL,
     ERR_CODE_INVALID_PARAMS,
+    ERR_CODE_INVALID_REQUEST,
     ERR_CODE_PARSE,
     ERR_CODE_POLICY,
     ERR_CODE_RATE_LIMIT,
     FORBIDDEN_IDENTITY_KEYS,
     MAX_FRAME_BYTES,
+    MAX_HEADER_BYTES,
+    MAX_SEQ_INT,
     CoordHubProtocol,
     CoordUdsRpcServer,
     SlidingWindowRateLimiter,
@@ -174,6 +179,8 @@ class TestStrictJsonAndRateLimiter(unittest.TestCase):
             b'{"v":NaN}',
             b'{"v":Infinity}',
             b'{"v":-Infinity}',
+            b'{"v":1e999}',
+            b'{"v":-1e999}',
             b'{"s":"\\ud800"}',
             b'{"s":"\\udfff"}',
             b'{"s":"ok\x00bad"}',
@@ -212,6 +219,10 @@ class TestStrictJsonAndRateLimiter(unittest.TestCase):
         clock.advance(11.0)
         self.assertTrue(limiter.allow("k3"))
         self.assertTrue(limiter.allow("k1"))
+
+        for bad_window in (0.0, -1.0, float("nan"), float("inf"), True):
+            with self.assertRaises(ValueError):
+                SlidingWindowRateLimiter(5, bad_window)
 
 
 class TestCoordUdsRpcServer(unittest.TestCase):
@@ -397,6 +408,108 @@ class TestCoordUdsRpcServer(unittest.TestCase):
                     hub.next_error = exc
                     err_resp = uds_rpc_call(sock_path, "coord.projection", {}, auth_token=tok)
                     self.assertEqual(err_resp["error"]["code"], code)
+
+    def test_rpc_dos_bounds_slowloris_concurrency_and_config_validation(self) -> None:
+        hub = _StubCoordHub()
+        with tempfile.TemporaryDirectory() as tmp:
+            sock_path = Path(tmp) / "rpc_dir" / "operator.sock"
+            # Reject invalid server configs
+            with self.assertRaises(ValueError):
+                CoordUdsRpcServer(hub, sock_path, io_timeout=float("nan"))
+            with self.assertRaises(ValueError):
+                CoordUdsRpcServer(
+                    hub,
+                    sock_path,
+                    required_auth_token="tok_a",
+                    token_principals={"tok_b": PrincipalCtx(CoordRole.OPERATOR, "op1")},
+                )
+
+            with CoordUdsRpcServer(hub, sock_path, max_concurrent_conns=1, io_timeout=0.15):
+                # Top-level forged identity key rejected with -32600
+                c_top = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    c_top.settimeout(2.0)
+                    c_top.connect(str(sock_path))
+                    c_top.sendall(
+                        encode_content_length_frame(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "src": "forged",
+                                "method": "coord.projection",
+                                "params": {},
+                            }
+                        )
+                    )
+                    top_resp = parse_strict_json(read_content_length_frame(c_top))
+                    self.assertEqual(top_resp["error"]["code"], ERR_CODE_INVALID_REQUEST)
+                finally:
+                    c_top.close()
+
+                # Oversized header section > MAX_HEADER_BYTES rejected even on final chunk
+                c_hdr = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    c_hdr.settimeout(2.0)
+                    c_hdr.connect(str(sock_path))
+                    pad = " " * (MAX_HEADER_BYTES + 16)
+                    c_hdr.sendall(f"Content-Length:{pad}2\r\n\r\n{{}}".encode("ascii"))
+                    hdr_resp = parse_strict_json(read_content_length_frame(c_hdr))
+                    self.assertEqual(hdr_resp["error"]["code"], ERR_CODE_PARSE)
+                finally:
+                    c_hdr.close()
+
+                # Huge wait timeout_s, out-of-range since_seq, and too many artifact_refs rejected
+                bad_wait_timeout = uds_rpc_call(
+                    sock_path, "coord.wait", {"targets": [_TEST_TARGET], "timeout_s": 10**400}
+                )
+                self.assertEqual(bad_wait_timeout["error"]["code"], ERR_CODE_INVALID_PARAMS)
+                bad_wait_seq = uds_rpc_call(
+                    sock_path, "coord.wait", {"targets": [_TEST_TARGET], "since_seq": MAX_SEQ_INT + 1}
+                )
+                self.assertEqual(bad_wait_seq["error"]["code"], ERR_CODE_INVALID_PARAMS)
+                too_many_refs = [
+                    {"blob_sha256": _TEST_SHA256, "size_bytes": 1}
+                    for _ in range(MAX_ARTIFACTS_PER_MSG + 1)
+                ]
+                bad_refs = uds_rpc_call(
+                    sock_path,
+                    "coord.send",
+                    {"target": _TEST_TARGET, "body_text": "hi", "artifact_refs": too_many_refs},
+                )
+                self.assertEqual(bad_refs["error"]["code"], ERR_CODE_INVALID_PARAMS)
+
+                # Slowloris + max_concurrent_conns=1 enforcement: hold 1 slot idle, 2nd conn dropped
+                slow = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                second = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    slow.settimeout(2.0)
+                    slow.connect(str(sock_path))
+                    slow.sendall(b"Content-Length: 20\r\n")
+                    second.settimeout(1.0)
+                    second.connect(str(sock_path))
+                    try:
+                        extra_data = second.recv(64)
+                    except (ConnectionResetError, BrokenPipeError):
+                        extra_data = b""
+                    self.assertEqual(extra_data, b"")
+                    # Slowloris client times out and receives parse/framing error -32700
+                    slow_resp = parse_strict_json(read_content_length_frame(slow, read_timeout=2.0))
+                    self.assertEqual(slow_resp["error"]["code"], ERR_CODE_PARSE)
+                finally:
+                    second.close()
+                    slow.close()
+
+    def test_non_serializable_hub_response_returns_internal_error(self) -> None:
+        class _BadHub(_StubCoordHub):
+            def projection(self, caller: PrincipalCtx) -> dict[str, Any]:
+                return {"bad": object()}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sock_path = Path(tmp) / "rpc_dir" / "operator.sock"
+            with CoordUdsRpcServer(_BadHub(), sock_path):
+                resp = uds_rpc_call(sock_path, "coord.projection", {})
+                self.assertEqual(resp["error"]["code"], ERR_CODE_INTERNAL)
+                self.assertEqual(resp["error"]["message"], "response_serialization_error")
 
 
 class TestUiAuthManager(unittest.TestCase):
@@ -724,6 +837,147 @@ class TestUiAuthManager(unittest.TestCase):
         self.assertEqual(mgr.revoke_all_sessions(), 2)
         with self.assertRaises(UiAuthDeniedError):
             mgr.validate_session(sid1, host_header=_TEST_HOST)
+
+    def test_cross_authority_host_origin_mismatch_and_host_port_validation(self) -> None:
+        clock = _ManualClock(6000.0)
+        alt_host = "localhost:47110"
+        alt_origin = "http://localhost:47110"
+
+        # Origin authority not in allowed_hosts rejected at init
+        with self.assertRaises(UiAuthValidationError):
+            UiAuthManager([_TEST_HOST], [alt_origin], clock=clock)
+        # Trailing empty colon and leading-zero ports rejected
+        for bad_host in ("127.0.0.1:", "[::1]:", "localhost:", "127.0.0.1:047110", "[::1]:080"):
+            with self.assertRaises(UiAuthValidationError):
+                UiAuthManager([bad_host], [f"http://{bad_host}"], clock=clock)
+        # Huge int TTL rejected cleanly without OverflowError
+        with self.assertRaises(UiAuthValidationError):
+            UiAuthManager([_TEST_HOST], [_TEST_ORIGIN], idle_ttl_s=10**400, clock=clock)
+
+        mgr = UiAuthManager(
+            [_TEST_HOST, alt_host],
+            [_TEST_ORIGIN, alt_origin],
+            clock=clock,
+        )
+        code = mgr.mint_bootstrap_code()
+        with self.assertRaises(UiAuthDeniedError):
+            mgr.exchange_bootstrap_code(code, host_header=_TEST_HOST, origin_header=alt_origin)
+
+        sid, csrf, _ = self._new_session(mgr)
+        with self.assertRaises(UiAuthDeniedError):
+            mgr.verify_http_mutation(
+                sid, host_header=_TEST_HOST, origin_header=alt_origin, csrf_token=csrf
+            )
+        with self.assertRaises(UiAuthDeniedError):
+            mgr.mint_ws_ticket(
+                sid,
+                host_header=_TEST_HOST,
+                origin_header=alt_origin,
+                csrf_token=csrf,
+                target_addr=_TEST_TARGET,
+                incarnation_id=_TEST_INCARNATION,
+                surface_kind=SURFACE_EVENTS,
+                mode=MODE_OBSERVE,
+            )
+        tk = mgr.mint_ws_ticket(
+            sid,
+            host_header=_TEST_HOST,
+            origin_header=_TEST_ORIGIN,
+            csrf_token=csrf,
+            target_addr=_TEST_TARGET,
+            incarnation_id=_TEST_INCARNATION,
+            surface_kind=SURFACE_EVENTS,
+            mode=MODE_OBSERVE,
+        )
+        with self.assertRaises(UiAuthDeniedError):
+            mgr.consume_ws_ticket(
+                tk,
+                host_header=_TEST_HOST,
+                origin_header=alt_origin,
+                expected_target_addr=_TEST_TARGET,
+                expected_incarnation_id=_TEST_INCARNATION,
+                expected_surface_kind=SURFACE_EVENTS,
+                expected_mode=MODE_OBSERVE,
+            )
+
+    def test_ws_ticket_session_pinning_idle_expiry_and_surrogate_revoke(self) -> None:
+        clock = _ManualClock(7000.0)
+        mgr = self._make_mgr(clock, idle_ttl_s=20.0, absolute_ttl_s=100.0)
+        sid_a, csrf_a, hash_a = self._new_session(mgr, actor_id="op_a")
+        sid_b, _, _ = self._new_session(mgr, actor_id="op_b")
+
+        # Session B cannot consume Session A's ticket when expected_session_id is pinned
+        tk_a = mgr.mint_ws_ticket(
+            sid_a,
+            host_header=_TEST_HOST,
+            origin_header=_TEST_ORIGIN,
+            csrf_token=csrf_a,
+            target_addr=_TEST_TARGET,
+            incarnation_id=_TEST_INCARNATION,
+            surface_kind=SURFACE_SHELL,
+            mode=MODE_OBSERVE,
+        )
+        with self.assertRaises(UiAuthDeniedError):
+            mgr.consume_ws_ticket(
+                tk_a,
+                host_header=_TEST_HOST,
+                origin_header=_TEST_ORIGIN,
+                expected_target_addr=_TEST_TARGET,
+                expected_incarnation_id=_TEST_INCARNATION,
+                expected_surface_kind=SURFACE_SHELL,
+                expected_mode=MODE_OBSERVE,
+                expected_session_id=sid_b,
+            )
+
+        # Matching expected_session_id succeeds
+        tk_ok = mgr.mint_ws_ticket(
+            sid_a,
+            host_header=_TEST_HOST,
+            origin_header=_TEST_ORIGIN,
+            csrf_token=csrf_a,
+            target_addr=_TEST_TARGET,
+            incarnation_id=_TEST_INCARNATION,
+            surface_kind=SURFACE_SHELL,
+            mode=MODE_OBSERVE,
+        )
+        scope = mgr.consume_ws_ticket(
+            tk_ok,
+            host_header=_TEST_HOST,
+            origin_header=_TEST_ORIGIN,
+            expected_target_addr=_TEST_TARGET,
+            expected_incarnation_id=_TEST_INCARNATION,
+            expected_surface_kind=SURFACE_SHELL,
+            expected_mode=MODE_OBSERVE,
+            expected_session_id=sid_a,
+        )
+        self.assertEqual(scope.session_id_hash, hash_a)
+
+        # Idle-expired session invalidates a still-unexpired (30s) WS ticket
+        tk_idle = mgr.mint_ws_ticket(
+            sid_a,
+            host_header=_TEST_HOST,
+            origin_header=_TEST_ORIGIN,
+            csrf_token=csrf_a,
+            target_addr=_TEST_TARGET,
+            incarnation_id=_TEST_INCARNATION,
+            surface_kind=SURFACE_EVENTS,
+            mode=MODE_OBSERVE,
+            ttl_s=30.0,
+        )
+        clock.advance(21.0)
+        with self.assertRaises(UiAuthDeniedError):
+            mgr.consume_ws_ticket(
+                tk_idle,
+                host_header=_TEST_HOST,
+                origin_header=_TEST_ORIGIN,
+                expected_target_addr=_TEST_TARGET,
+                expected_incarnation_id=_TEST_INCARNATION,
+                expected_surface_kind=SURFACE_EVENTS,
+                expected_mode=MODE_OBSERVE,
+            )
+
+        # Unpaired surrogate in revoke_session returns False cleanly
+        self.assertFalse(mgr.revoke_session("\ud800"))
 
 
 if __name__ == "__main__":
