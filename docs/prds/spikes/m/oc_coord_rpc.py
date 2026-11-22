@@ -41,6 +41,7 @@ from oc_broker_common import (  # noqa: E402
     BoundUds,
     BrokerError,
     ListenerWorkers,
+    UdsStartupError,
     bind_trusted_uds,
 )
 from oc_coord_contract import (  # noqa: E402
@@ -603,10 +604,6 @@ class CoordUdsRpcServer:
         self._token_table: dict[str, tuple[str, PrincipalCtx]] | None = (
             _build_token_table(token_principals) if token_principals is not None else None
         )
-        self._has_operator_principal = bool(
-            self._token_table is not None
-            and any(p.role is CoordRole.OPERATOR for _, p in self._token_table.values())
-        )
         uid_rate_max = (
             min(rate_limit_max * max(1, len(self._token_table)), rate_limit_max * 16)
             if self._token_table is not None
@@ -631,11 +628,15 @@ class CoordUdsRpcServer:
         with self._lifecycle:
             if self._listener is not None or self._bound is not None:
                 raise BrokerError("CoordUdsRpcServer is already running or awaiting stop cleanup")
-            srv, bound = bind_trusted_uds(
-                self._raw_socket_path,
-                sandbox_root=self._sandbox_root,
-                backlog=max(16, self._max_concurrent_conns * 2),
-            )
+            try:
+                srv, bound = bind_trusted_uds(
+                    self._raw_socket_path,
+                    sandbox_root=self._sandbox_root,
+                    backlog=max(16, self._max_concurrent_conns * 2),
+                )
+            except UdsStartupError as exc:
+                self._bound = exc.endpoint
+                raise
             self._listener = srv
             self._bound = bound
             try:
@@ -776,36 +777,6 @@ class CoordUdsRpcServer:
         except Exception:
             return _rpc_error(req_id, ERR_CODE_INTERNAL, "internal_error")
 
-    def _read_and_validate_conn(
-        self, conn: socket.socket, peer_uid: int, *, uid_allowed: bool
-    ) -> tuple[Any, PrincipalCtx, str, dict[str, Any]] | dict[str, Any]:
-        # Production deployments should bind a dedicated operator UDS for full transport isolation;
-        # on shared multi-principal sockets, use a tight overflow timeout for operator reserve checks.
-        read_timeout = self._read_timeout if uid_allowed else min(self._read_timeout, 0.25)
-        total_timeout = min(
-            TOTAL_REQUEST_TIMEOUT_SECONDS, read_timeout * (3.0 if uid_allowed else 2.0)
-        )
-        try:
-            raw_frame = read_content_length_frame(
-                conn,
-                max_bytes=MAX_FRAME_BYTES,
-                read_timeout=read_timeout,
-                total_timeout=total_timeout,
-            )
-            req = parse_strict_json(raw_frame, max_depth=MAX_JSON_DEPTH, max_bytes=MAX_FRAME_BYTES)
-        except (FramingError, StrictJsonError) as exc:
-            if not uid_allowed:
-                return _rpc_error(None, ERR_CODE_RATE_LIMIT, _ERR_RATE_LIMITED)
-            return _rpc_error(None, ERR_CODE_PARSE, str(exc))
-        validated = self._validate_envelope(req, peer_uid)
-        if isinstance(validated, dict):
-            if not uid_allowed:
-                return _rpc_error(None, ERR_CODE_RATE_LIMIT, _ERR_RATE_LIMITED)
-            return validated
-        if not uid_allowed and validated[1].role is not CoordRole.OPERATOR:
-            return _rpc_error(validated[0], ERR_CODE_RATE_LIMIT, _ERR_RATE_LIMITED)
-        return validated
-
     def _handle_conn(self, conn: socket.socket) -> None:
         try:
             peer_uid = self._peer_uid_getter(conn)
@@ -813,11 +784,22 @@ class CoordUdsRpcServer:
             return
         if peer_uid != self._expected_uid:
             return
-        uid_allowed = self.rate_limiter.allow(peer_uid)
-        if not uid_allowed and not self._has_operator_principal:
+        if not self.rate_limiter.allow(peer_uid):
             self._send(conn, _rpc_error(None, ERR_CODE_RATE_LIMIT, _ERR_RATE_LIMITED))
             return
-        validated = self._read_and_validate_conn(conn, peer_uid, uid_allowed=uid_allowed)
+        total_timeout = min(TOTAL_REQUEST_TIMEOUT_SECONDS, self._read_timeout * 3.0)
+        try:
+            raw_frame = read_content_length_frame(
+                conn,
+                max_bytes=MAX_FRAME_BYTES,
+                read_timeout=self._read_timeout,
+                total_timeout=total_timeout,
+            )
+            req = parse_strict_json(raw_frame, max_depth=MAX_JSON_DEPTH, max_bytes=MAX_FRAME_BYTES)
+        except (FramingError, StrictJsonError) as exc:
+            self._send(conn, _rpc_error(None, ERR_CODE_PARSE, str(exc)))
+            return
+        validated = self._validate_envelope(req, peer_uid)
         if isinstance(validated, dict):
             self._send(conn, validated)
             return
@@ -845,6 +827,89 @@ class CoordUdsRpcServer:
             conn.sendall(frame)
         except OSError:
             pass
+
+
+class CoordSplitUdsRpcServer:
+    """Dual-socket RPC server giving OPERATOR an independently admitted listener & worker budget.
+
+    Job/peer connections are confined to `job_socket_path` (with its own ListenerWorkers pool and
+    pre-parse rate limiter), while OPERATOR control runs on `operator_socket_path` with an isolated
+    listener, worker pool, and rate limiter so held job slots cannot starve operator control.
+    """
+
+    def __init__(
+        self,
+        hub: CoordHubProtocol,
+        *,
+        operator_socket_path: Path,
+        job_socket_path: Path,
+        job_token_principals: Mapping[str, PrincipalCtx],
+        operator_token_principals: Mapping[str, PrincipalCtx] | None = None,
+        sandbox_root: Path | None = None,
+        expected_uid: int | None = None,
+        operator_max_concurrent_conns: int = MAX_CONCURRENT_CONNS,
+        job_max_concurrent_conns: int = MAX_CONCURRENT_CONNS,
+        rate_limit_max: int = 60,
+        rate_limit_window: float = 60.0,
+        io_timeout: float = READ_TIMEOUT_SECONDS,
+    ) -> None:
+        if any(p.role is CoordRole.OPERATOR for p in job_token_principals.values()):
+            raise ValueError("job_token_principals must not contain OPERATOR principals")
+        if operator_token_principals is not None and any(
+            p.role is not CoordRole.OPERATOR for p in operator_token_principals.values()
+        ):
+            raise ValueError("operator_token_principals must contain only OPERATOR principals")
+        self.operator_server = CoordUdsRpcServer(
+            hub,
+            operator_socket_path,
+            sandbox_root=sandbox_root,
+            role=CoordRole.OPERATOR,
+            token_principals=operator_token_principals,
+            expected_uid=expected_uid,
+            max_concurrent_conns=operator_max_concurrent_conns,
+            rate_limit_max=rate_limit_max,
+            rate_limit_window=rate_limit_window,
+            io_timeout=io_timeout,
+        )
+        self.job_server = CoordUdsRpcServer(
+            hub,
+            job_socket_path,
+            sandbox_root=sandbox_root,
+            role=CoordRole.JOB,
+            token_principals=job_token_principals,
+            expected_uid=expected_uid,
+            max_concurrent_conns=job_max_concurrent_conns,
+            rate_limit_max=rate_limit_max,
+            rate_limit_window=rate_limit_window,
+            io_timeout=io_timeout,
+        )
+
+    def __enter__(self) -> CoordSplitUdsRpcServer:
+        self.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.stop()
+
+    def start(self) -> tuple[Path, Path]:
+        op_path = self.operator_server.start()
+        try:
+            job_path = self.job_server.start()
+        except Exception:
+            self.operator_server.stop()
+            raise
+        return op_path, job_path
+
+    def stop(self) -> None:
+        first_err: Exception | None = None
+        for srv in (self.job_server, self.operator_server):
+            try:
+                srv.stop()
+            except Exception as exc:
+                if first_err is None:
+                    first_err = exc
+        if first_err is not None:
+            raise first_err
 
 
 def uds_rpc_call(
