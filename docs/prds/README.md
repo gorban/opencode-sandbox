@@ -36,6 +36,7 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 | [prd_j](prd_j.md) | Host configuration and bridge merge tool preferences | proposed; TOML and editor design deferred |
 | [prd_k](prd_k.md) | Contributor checks and repository layout | local CI and documentation PoCs human-approved; hosted qualification and final review open |
 | [prd_l](prd_l.md) | Composable sandbox config, host providers, comm adapters, and orchestrator config MCP | offline spike PoC slice human-approved; external secret isolation ([prd_l1](prd_l1.md)), production port, and final review open |
+| [prd_m](prd_m.md) | Model telemetry (5h/7d quotas & reasoning variants), cross-model orchestration, and unified Tauri/web control plane | proposed; Gate 1 external security review pending |
 
 The imported findings are evidence, not production implementation:
 
