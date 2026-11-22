@@ -80,7 +80,8 @@ flowchart LR
     `@sha256:<64hex>`), `readiness_probe`, `endpoints[]`, `volumes[]` (named volumes, `tmpfs`, or
     digest-pinned RO image mounts ONLY — **never** arbitrary host bind-mount paths in mutable
     declarative specs), `secret_slots[]`, `env` (strictly filtered, see M8), `resources` (`memory`,
-    `pids_limit`), and `security_profile` (`standard` < `desktop-wayland` < `elevated-nested`).
+    `pids_limit`), and `security_profile` (partial order with `"standard"` at bottom;
+    `"desktop-wayland"` and `"elevated-nested"` are incomparable).
   - **Active-root `[local]` pruning & remote endpoint validation:** A tool or bundle declaring a
     `[local]` service branch (e.g., `myapp/api` requiring `cap:db.postgres@^17`) adds `myapp/api` as
     a root only when its remote endpoint binding (`API_ENDPOINT`) is blank. When a remote endpoint is
@@ -99,8 +100,10 @@ flowchart LR
       (before Kahn topological sort, diamond unification, and port-collision validation).
     - If multiple services satisfy a capability without an explicit `provider` / `instance` pin,
       compilation **fails closed** (never relying on filesystem or dictionary iteration order).
-    - A fallback service is rejected if it has a higher `security_profile` rank or wider
-      `max_exposure` than the primary service.
+    - A fallback service is rejected if its `security_profile` is neither equal to the primary's
+      nor `"standard"` (partial-order non-escalation: `"desktop-wayland"` and `"elevated-nested"`
+      never fall back to each other), or if **any** fallback endpoint widens `max_exposure`, adds
+      an exposed endpoint absent from the primary, or relaxes `requires_auth = true` to `false`.
     - `cardinality = "named-instance"` services (e.g., `pg-primary`, `pg-analytics`) declare an
       explicit `instance_port` (bound in the Plan IR) and consumers bind explicitly via
       `{capability = "cap:db.postgres@^17", instance = "pg-analytics"}` so pod ports never collide
@@ -304,22 +307,40 @@ generic host file reads/writes, shell, Podman socket, SSH agent, or raw secret a
     `auth_requirement_changed`, `new_service_added`, `service_image_changed`,
     `new_mcp_server_added`, `mcp_tool_surface_widened`, `new_mise_tool_added`, `persona_changed`,
     `remote_endpoint_added`, `secret_slot_added`, `resource_limit_increased`).
-  - Persists an immutable proposal record (`status = "pending"`, TTL `expires_at`, bounded quota of
-    at most 32 pending proposals) and submits an `Intent.APPLY_ONCE` `Proposal` into the real
-    [oc_controller.py](../../oc_controller.py) `Controller` API via a spike `ConfigPublishAdapter`
-    (no modifications to production `oc_controller.py`).
-  - **Operator-only publish (`operator_approve_config_proposal`):** Under a persistent-inode `flock`
-    (`O_NOFOLLOW`, `0o600`, lock file never unlinked, matching `oc-setup-lock.py`):
-    1. Verifies `proposal.status == "pending"`, `now() < proposal.expires_at`, and constant-time
-       `proposal.digest == expected_digest`.
+  - Persists an immutable proposal record (`status = "pending"`, closed `action` in
+    `("upsert", "archive", "unarchive")` — permanent deletion forbidden per `prd_i1`, with
+    `proposed_toml is None` required for `"archive"`/`"unarchive"`, TTL `expires_at`, bounded quota
+    of at most 32 pending proposals) under the store's exclusive persistent-inode `flock`, and
+    submits an `Intent.APPLY_ONCE` `Proposal` into the real
+    [oc_controller.py](../../oc_controller.py) `Controller` API using `_ID`-compliant identifiers
+    (`alias = "config_store"`, `reference = "config_store_apply"`, `target = "config_store_target"`,
+    `target_revision = sha256(f"store-rev:{store_revision}")`), proposed by a `Role.JOB` principal
+    and inspected via `controller.view(operator_principal, request_id)` (no modifications to
+    production `oc_controller.py`).
+  - **Restart & crash boundary:** Because `oc_controller.Controller` is in-memory and
+    incarnation-scoped, across a helper restart all prior-incarnation `"pending"` proposals fail
+    closed and must be re-proposed in the new incarnation (matching `prd_i1` replay-after-restart
+    rejection). Any `"uncertain"` proposal left from a crash is reconciled against the on-disk
+    journal before accepting new publishes.
+  - **Operator-only publish (`operator_approve_config_proposal`):** Under the same exclusive
+    persistent-inode `flock` (`O_NOFOLLOW`, `0o600`, lock file never unlinked, matching
+    `oc-setup-lock.py`):
+    1. Verifies `proposal.incarnation == controller.incarnation`, `proposal.status == "pending"`,
+       `now() < proposal.expires_at`, and constant-time `proposal.digest == expected_digest`.
     2. Verifies `store.store_revision == proposal.base_store_revision` AND `closure_digest` still
-       matches (eliminating transitive-dependency TOCTOU).
+       matches (eliminating transitive-dependency TOCTOU); if `action == "archive"`, re-verifies
+       `not store.has_active_dependents(kind, obj_id)`.
     3. Re-runs `compile_plan` + re-computes `security_delta` and asserts exact digest match.
     4. Transitions proposal durably to `applying` (`fsync`), calls `controller.decide(..., APPROVE)`
-       and `controller.invoke(...)` whose journaled `ConfigPublishAdapter` atomically writes
-       monotonic revision `N + 1` (`O_CREAT|O_EXCL` + `0o600` + `fsync` + `os.replace`) and commits
-       the journal entry (supporting `reconcile()` after crash), then transitions proposal to
-       `applied`.
+       with `(view.payload.revision, view.digest)` and `controller.invoke(config_job_principal, ...)`
+       whose journaled `ConfigPublishAdapter` atomically writes monotonic revision `N + 1`
+       (`O_CREAT|O_EXCL` + `0o600` + `fsync` + `os.replace`) and commits the durable journal entry:
+       - `State.SUCCEEDED` -> mark proposal terminal `"applied"`.
+       - `State.UNCERTAIN` -> mark proposal **non-terminal `"uncertain"`** (preserving the
+         controller's one-shot fence until settled via `ConfigPublishAdapter.reconcile()` ->
+         `controller._reconcile(request_id)` -> `"applied"` or `"failed"`).
+       - `State.FAILED` / `State.STALE` / `State.EXPIRED` -> mark proposal terminal `"failed"` /
+         `"expired"` accordingly.
     5. Archiving a resource still referenced by any non-archived spec fails closed; `restore`
        always publishes a new monotonic revision `N + 1` so prior approvals can never replay.
 
@@ -393,7 +414,8 @@ function compile_plan(store, sandbox_type_id, worker_spec, overrides, applied_pl
         # For each required capability/service:
         #   - Resolve deterministically (fail closed on >1 matching provider without explicit pin)
         #   - If worker lacks required_capabilities, select explicit fallback_service ONLY if
-        #     fallback.security_profile <= primary.security_profile AND fallback.max_exposure <= primary.max_exposure
+        #     fallback.security_profile in (primary.security_profile, "standard") AND
+        #     every fallback endpoint preserves per-endpoint max_exposure and requires_auth (no widening/relaxation)
         #   - Recursively traverse selected service's `requires`
         # Then run Kahn topological sort; reject cycles, incompatible version diamonds,
         # un-remapped named-instance collisions, and duplicate pod ports.
@@ -429,14 +451,14 @@ function compile_plan(store, sandbox_type_id, worker_spec, overrides, applied_pl
 function handle_orchestrator_mcp_connection(conn, peer_cred, expected_uid, incarnation_token):
     if peer_cred.uid != expected_uid:
         close_immediately(conn); return
+    if not rate_limiter.allow(peer_cred.uid):                   # check BEFORE reading/parsing 256 KiB JSON
+        return json_rpc_error(-32002, "rate_limited")
     raw_frame = read_content_length_frame(conn, max_bytes=262_144, read_timeout=5s, total_timeout=15s)
         # Rejects trailing/pipelined junk bytes, missing/invalid Content-Length, oversized frames
     req = parse_strict_json_rpc(raw_frame, max_depth=32)
         # Rejects duplicate keys, NaN/Infinity, unpaired surrogates
     if not hmac.compare_digest(req.auth_token, incarnation_token):
         return json_rpc_error(-32001, "invalid_or_stale_session_token")
-    if not rate_limiter.allow(peer_cred.uid):
-        return json_rpc_error(-32002, "rate_limited")
     if req.method not in ALLOWED_MCP_METHODS:
         return json_rpc_error(-32601, "method_not_allowed")
 
@@ -455,12 +477,15 @@ function handle_orchestrator_mcp_connection(conn, peer_cred, expected_uid, incar
 
     if req.method == "config_propose_revision":
         kind, obj_id, proposed_toml, action = validate_proposal_inputs(req.params)
+            # Closed action enum: ("upsert", "archive", "unarchive"); proposed_toml MUST be None for archive/unarchive
         if kind not in MUTABLE_ORCHESTRATOR_KINDS or obj_id.startswith("builtin/"):
             return json_rpc_error(-32003, "kind_or_namespace_not_mutable")
-        validate_schema_and_orchestrator_limits(kind, proposed_toml)
-            # Rejects file.py:factory paths, host bind mounts, unpinned images, shell post_install_hooks,
-            # builtin/* capability downgrade, unknown keys, forbidden env keys, and raw secrets
-        with host_store.read_snapshot_lock():
+        if action == "upsert":
+            validate_schema_and_orchestrator_limits(kind, proposed_toml)
+                # Rejects file.py:factory paths, host bind mounts, unpinned images, shell post_install_hooks,
+                # builtin/* capability downgrade, unknown keys, forbidden env keys, and raw secrets
+        with host_store.persistent_flock():                     # exclusive lock prevents quota/publish races
+            host_store.assert_no_unresolved_uncertain_proposals()
             if action == "archive" and host_store.has_active_dependents(kind, obj_id):
                 return json_rpc_error(-32004, "referenced_by_active_config")
             base_store_rev = host_store.store_revision
@@ -469,20 +494,27 @@ function handle_orchestrator_mcp_connection(conn, peer_cred, expected_uid, incar
             security_delta = compute_closed_security_delta(host_store, draft_store, affected_plans)
             proposal = host_store.create_pending_proposal(
                 kind, obj_id, action, proposed_toml,
+                incarnation=controller.incarnation,
                 base_store_rev=base_store_rev, closure_digest=closure_digest,
                 security_delta=security_delta, ttl_seconds=900, max_pending=32,
             )
-            # Submit via real oc_controller.Controller API (Intent.APPLY_ONCE + ConfigPublishAdapter)
-            ctrl_view = controller.propose(orchestrator_principal,
-                                           Proposal(Intent.APPLY_ONCE, f"config:{kind}:{obj_id}", "config-store:apply"))
-            host_store.bind_controller_request(proposal.id, ctrl_view.payload.request_id, ctrl_view.digest)
+            # Submit via real oc_controller.Controller API (Role.JOB + _ID-compliant alias/reference)
+            # Adapter target_revision("config_store_target") returns sha256(f"store-rev:{store_revision}")
+            ctrl_status = controller.propose(config_job_principal,
+                                             Proposal(Intent.APPLY_ONCE, "config_store", "config_store_apply"))
+            ctrl_view = controller.view(operator_principal, ctrl_status.request_id)
+            host_store.bind_controller_request(proposal.id, ctrl_status.request_id,
+                                               ctrl_view.payload.revision, ctrl_view.digest)
             return {"proposal_id": proposal.id, "proposal_digest": proposal.digest,
-                    "controller_request_id": ctrl_view.payload.request_id,
+                    "controller_request_id": ctrl_status.request_id,
                     "security_delta": security_delta, "status": "pending"}
 
 function operator_approve_config_proposal(operator_principal, proposal_id, expected_digest):
     with host_store.persistent_flock():                         # O_NOFOLLOW, 0o600, lock file never unlinked
+        host_store.assert_no_unresolved_uncertain_proposals()
         proposal = host_store.load_proposal(proposal_id)
+        if proposal.incarnation != controller.incarnation:
+            raise StaleProposal("Proposal belongs to a prior helper incarnation; re-propose")
         if proposal.status != "pending":
             raise Conflict("Proposal is not pending")
         if now() >= proposal.expires_at:
@@ -492,6 +524,8 @@ function operator_approve_config_proposal(operator_principal, proposal_id, expec
             raise DigestMismatch("Approval digest mismatch")
         if host_store.store_revision != proposal.base_store_revision:
             raise StaleProposal("Store changed since proposal; re-propose against latest revision")
+        if proposal.action == "archive" and host_store.has_active_dependents(proposal.kind, proposal.obj_id):
+            raise Conflict("Target is now referenced by an active config; cannot archive")
         # Re-verify closure & security_delta under write lock to prevent transitive TOCTOU
         draft_store = host_store.with_in_memory_overlay(proposal.kind, proposal.obj_id,
                                                         proposal.proposed_toml, proposal.action)
@@ -504,13 +538,36 @@ function operator_approve_config_proposal(operator_principal, proposal_id, expec
         controller.decide(operator_principal, proposal.controller_request_id,
                           proposal.controller_rev, proposal.controller_digest, Decision.APPROVE)
         # ConfigPublishAdapter.dispatch atomically publishes monotonic rev N+1 (O_EXCL + fsync + os.replace)
-        # and appends the durable journal record; reconcile() heals partial crashes idempotently.
-        status = controller.invoke(host_job_principal, proposal.controller_request_id)
-        if status.state == State.SUCCEEDED:
+        # and appends the durable journal record; reconcile() settles uncertain outcomes idempotently.
+        status = controller.invoke(config_job_principal, proposal.controller_request_id)
+        if status.state is State.SUCCEEDED:
             host_store.mark_proposal_terminal(proposal.id, "applied")
             return host_store.current_revision(proposal.kind, proposal.obj_id)
+        if status.state is State.UNCERTAIN:
+            host_store.mark_proposal_state(proposal.id, "uncertain")   # non-terminal; reconcile before next publish
+            raise PublishUncertain("Publish outcome uncertain; run config reconcile")
+        if status.state is State.EXPIRED:
+            host_store.mark_proposal_terminal(proposal.id, "expired")
+            raise Expired("Controller approval expired")
         host_store.mark_proposal_terminal(proposal.id, "failed")
         raise PublishFailed(status.reason)
+
+function operator_reconcile_uncertain_proposal(proposal_id):
+    with host_store.persistent_flock():
+        proposal = host_store.load_proposal(proposal_id)
+        if proposal.status != "uncertain":
+            raise Conflict("Proposal is not uncertain")
+        if proposal.incarnation == controller.incarnation:
+            status = controller._reconcile(proposal.controller_request_id)
+            if status.state is State.SUCCEEDED:
+                host_store.mark_proposal_terminal(proposal.id, "applied")
+            elif status.state is State.FAILED:
+                host_store.mark_proposal_terminal(proposal.id, "failed")
+            return status.state
+        # Cross-restart crash recovery: settle strictly from durable on-disk journal
+        settled = host_store.reconcile_from_journal(proposal.id)
+        host_store.mark_proposal_terminal(proposal.id, settled) # "applied" or "failed"
+        return settled
 ```
 
 ## PoC Scope (Spike Branch `spike-outside-in-poc`)
@@ -558,7 +615,11 @@ production tests untouched):
 
 - Gate 1 design review round 1 (`Security-Focused PR Reviewer Setup`, `9b67f520932e..3b5d95d1d0d1`):
   5 P1 and 4 P2 findings addressed in this revision.
-- Gate 1 design review round 2 (`Security-Focused PR Reviewer Setup`): pending.
+- Gate 1 design review round 2 (`Security-Focused PR Reviewer Setup`, `3b5d95d1d0d1..3ce6887cc8f7`):
+  1 P1 (`oc_controller.py` `_ID`/principal/`view()`/`State.UNCERTAIN`/exclusive lock/restart
+  boundary) and 2 P2 (`security_profile` partial order + per-endpoint fallback checks, early rate
+  limit + closed `action` enum) addressed in this revision.
+- Gate 1 design review round 3 (`Security-Focused PR Reviewer Setup`): pending.
 - Gate 2 PoC implementation review (`Security-Focused PR Reviewer Setup`): pending.
 
 - [ ] **Human review**: checked only when the user says so
