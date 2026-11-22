@@ -710,6 +710,7 @@ esac
 case "\$1 \$2" in
   "pod ls")
     [ -n "\${STUB_LIST_PODS_FAIL:-}" ] && exit 125
+    if [ "\${3:-}" = --format ]; then printf '%b' "\${STUB_UNLABELLED_PODS:-}"; fi
     [ -n "\${STUB_PODS_ABSENT:-}" ] && exit 0
     for name in oc oc-other; do
       if [ -n "\${STUB_POD_REMAINS:-}" ] || ! grep -Fqx "podman pod rm --ignore -f -- \$name" "$T/stub.log"; then
@@ -1077,6 +1078,22 @@ check 'unbound legacy teardown is refused before resource removal' \
   ! grep -qE '^podman (pod|volume) rm|^systemctl' "$T/stub.log"
 check 'unbound legacy teardown preserves the original staged edit' grep -qx 'legacy unsaved fixture' "$legacy_stage/edit/save"
 check 'unbound legacy teardown does not create a binding' test ! -e "$legacy_home/.config/systemd/user/.oc-sandbox/binding"
+out=$(pathrun HOME="$legacy_home" XDG_DATA_HOME="$T/alternate-data" STUB_PODS_ABSENT=1 \
+  STUB_LEGACY_VOLUMES=$'oc-team-pg\n' -- -i team -d -a -y)
+check 'teardown refuses an unlabelled named volume without an installation binding' \
+  grep -q 'legacy sandbox resources remain without an installation binding' <<<"$out"
+check 'unbound named volume produces no binding or removal' \
+  bash -c 'test ! -e "$1" && ! grep -qE "^podman (pod|volume) rm|^systemctl" "$2"' _ \
+    "$legacy_home/.config/systemd/user/.oc-sandbox/binding" "$T/stub.log"
+legacy_pod_home=$T/legacy-named-pod
+mkdir -p "$legacy_pod_home"
+out=$(pathrun HOME="$legacy_pod_home" XDG_DATA_HOME="$T/alternate-data" STUB_PODS_ABSENT=1 \
+  STUB_UNLABELLED_PODS=$'oc-team\n' -- -i team -d -a -y)
+check 'teardown refuses an unlabelled named pod without an installation binding' \
+  grep -q 'legacy sandbox resources remain without an installation binding' <<<"$out"
+check 'unbound named pod produces no binding or removal' \
+  bash -c 'test ! -e "$1" && ! grep -qE "^podman (pod|volume) rm|^systemctl" "$2"' _ \
+    "$legacy_pod_home/.config/systemd/user/.oc-sandbox/binding" "$T/stub.log"
 mkdir -p "$DSTATE/bridge-stage/edit"
 printf 'unsaved fixture' > "$DSTATE/bridge-stage/edit/save"
 out=$(pathrun -- -d -a -y)

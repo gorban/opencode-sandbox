@@ -830,13 +830,17 @@ unit_env() {
 }
 
 require_empty_installation() {
-  local pods managed_volumes volumes secrets
-  pods=$(instance_pods) || die "could not verify installation pod inventory"
+  local managed_pods pods managed_volumes volumes secrets
+  managed_pods=$(pm pod ls --filter label=oc.sandbox=1 --format '{{.Name}}') \
+    || die "could not verify managed pod inventory"
+  pods=$(pm pod ls --format '{{.Name}}') || die "could not verify installation pod inventory"
   managed_volumes=$(pm volume ls -q --filter label=oc.sandbox=1) || die "could not verify managed volume inventory"
   volumes=$(pm volume ls -q) || die "could not verify legacy volume inventory"
   secrets=$(pm secret ls --format '{{.Name}}') || die "could not verify installation secret inventory"
-  if [[ -n $pods || -n $managed_volumes ]] ||
-      grep -qxE 'oc-(home|chrome|pg|dind|dind-run)' <<<"$volumes" ||
+  # Named teardown can also remove these resources when they have no labels.
+  if [[ -n $managed_pods || -n $managed_volumes ]] ||
+      grep -qxE 'oc(-[a-z0-9-]+)?' <<<"$pods" ||
+      grep -qxE 'oc-home|oc(-[a-z0-9-]+)?-(chrome|pg|dind(-run)?)' <<<"$volumes" ||
       grep -qxE 'oc(-[a-z0-9-]+)?-pg-(password|passfile|hba)' <<<"$secrets"; then
     die "legacy sandbox resources remain without an installation binding; recover the original data root before setup or teardown"
   fi
