@@ -43,9 +43,10 @@ default. The containers share your host kernel. A microVM runtime such as libkru
   loopback. The agent receives the configured database credentials through its private passfile, so
   treat the database as readable and writable by the agent and never load real data into it. SCRAM
   authenticates clients but does not encrypt the database connection.
-- **Self-updating OpenCode** downloads from the internet at runtime into the `oc-home` volume, which the
-  agents can write to. A compromised session could replace the binary and it would persist (for all
-  instances) until you reset the volume (`oc-sandbox -d -a`).
+- **OpenCode updates:** setup downloads a fresh release in a networked updater with no sandbox or
+  shared home mounts. An offline worker supplies only the current binary's digest and a separate
+  offline worker promotes the new release. Agents can still replace the binary in the shared
+  `oc-home` volume used by agent sessions. See [OpenCode updates](operations.md#startup-updates-and-rebuilds).
 - **Everything in `~/opencode-sandbox` is hostile input for host code**: an agent can replace any file
   or directory there with a symlink at any moment, including between a check and a use.
   - The launcher prepares working directories and the `.bridge/` spool, manages Git worktrees and
