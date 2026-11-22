@@ -123,6 +123,27 @@ def atomic_write(path: Path, data: bytes) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def check_host() -> None:
+    try:
+        source = (
+            host_output("cat", str(SELINUX_ENFORCE))
+            if HOST_MODE == "distrobox" else SELINUX_ENFORCE.read_bytes()
+        )
+        enforcing = source.strip() == b"1"
+    except (OSError, RuntimeError):
+        enforcing = False
+    if not enforcing:
+        raise RuntimeError("This PoC requires SELinux enforcing on the Podman host")
+    mode = podman(
+        "info", "--format", "{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}} {{.Host.CgroupsVersion}}"
+    ).stdout.strip()
+    if os.geteuid() == 0 or mode != b"true true v2":
+        raise RuntimeError("This PoC requires local rootless Podman with SELinux labeling and cgroup v2")
+    # Podman can add FIPS mounts separately from its default subscription file.
+    if host_output("cat", FIPS_STATUS).strip() != b"0":
+        raise RuntimeError("This PoC requires the Podman host FIPS mode to be disabled")
+
+
 def worker_config() -> dict:
     return {
         "model": "local/fixture-model",
@@ -154,6 +175,14 @@ def worker_config() -> dict:
             {"action": "provider.use", "resource": "local", "effect": "allow"},
         ],
     }
+
+
+def parse_env(entries: list[str]) -> dict[str, str]:
+    values = {}
+    for entry in entries:
+        name, value = entry.split("=", 1)
+        values[name] = value
+    return values
 
 
 class Job:
@@ -262,24 +291,7 @@ class Job:
             raise RuntimeError("Devbox and Podman host did not share the expected private run directory")
 
     def _check_images(self) -> None:
-        try:
-            source = (
-                host_output("cat", str(SELINUX_ENFORCE))
-                if HOST_MODE == "distrobox" else SELINUX_ENFORCE.read_bytes()
-            )
-            enforcing = source.strip() == b"1"
-        except (OSError, RuntimeError):
-            enforcing = False
-        if not enforcing:
-            raise RuntimeError("This PoC requires SELinux enforcing on the Podman host")
-        mode = podman(
-            "info", "--format", "{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}} {{.Host.CgroupsVersion}}"
-        ).stdout.strip()
-        if os.geteuid() == 0 or mode != b"true true v2":
-            raise RuntimeError("This PoC requires local rootless Podman with SELinux labeling and cgroup v2")
-        # Podman can add FIPS mounts separately from its default subscription file.
-        if host_output("cat", FIPS_STATUS).strip() != b"0":
-            raise RuntimeError("This PoC requires the Podman host FIPS mode to be disabled")
+        check_host()
         for role, image in self.images.items():
             if not IMAGE_ID.fullmatch(image):
                 raise RuntimeError(f"{role} image must be a full local image ID")
@@ -349,11 +361,9 @@ class Job:
     def _verify_container(self, role, mode, mounts, tmpfs, env) -> None:
         details = self._identity(role, self.ids[role])
         self._verify_isolation(role, mode, details)
-        expected_env = {
-            name: value for name, value in (entry.split("=", 1) for entry in self.image_env[role])
-        }
+        expected_env = parse_env(self.image_env[role])
         expected_env.update(container="podman", **env)
-        actual_env = {name: value for name, value in (entry.split("=", 1) for entry in details["Config"]["Env"])}
+        actual_env = parse_env(details["Config"]["Env"])
         if actual_env != expected_env:
             raise RuntimeError(f"Unexpected {role} environment")
         self._verify_mounts(role, mounts, tmpfs, details)

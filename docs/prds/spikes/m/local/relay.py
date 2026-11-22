@@ -101,7 +101,9 @@ def handoff(worker: socket.socket, request: bytes, grant: Path, active: bytes) -
 
 
 def _write_ready(peers, pending, writing) -> bool:
-    for source, data in list(pending.items()):
+    # A completed write can delete its pending entry.
+    ready_chunks = pending.copy()
+    for source, data in ready_chunks.items():
         target = peers[source]
         if target not in writing:
             continue
