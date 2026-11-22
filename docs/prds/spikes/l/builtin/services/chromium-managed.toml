@@ -1,0 +1,25 @@
+schema_version = 1
+kind = "service@1"
+id = "builtin/chromium-managed"
+description = "Headless/managed Chromium sidecar for remote or non-Wayland workers (standard profile, pod-only CDP)."
+provides = ["cap:browser.chromium@1.0"]
+cardinality = "singleton"
+security_profile = "standard"
+required_capabilities = ["supports_pods"]
+
+[images_by_arch]
+x86_64 = "localhost/oc-chromium-managed@sha256:7777777777777777777777777777777777777777777777777777777777777777"
+arm64  = "localhost/oc-chromium-managed@sha256:8888888888888888888888888888888888888888888888888888888888888888"
+
+[resources]
+memory = "2g"
+pids_limit = 256
+
+[[endpoints]]
+name = "devtools"
+port = 9222
+protocol = "http"
+default_exposure = "pod-only"
+max_exposure = "pod-only"
+requires_auth = false
+tls_policy = "none"

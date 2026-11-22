@@ -1,0 +1,11 @@
+schema_version = 1
+kind = "bundle@1"
+id = "builtin/postgres-app"
+description = "0-MCP bundle providing authenticated PostgreSQL 17 for app development."
+requires_services = ["builtin/postgres"]
+instructions = [
+  "Connect to local PostgreSQL via PGPASSFILE at /run/secrets/oc-pgpass on 127.0.0.1:5432."
+]
+
+[mise_tools]
+"core:python" = "3.13.18"

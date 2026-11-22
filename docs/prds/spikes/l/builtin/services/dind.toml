@@ -1,0 +1,23 @@
+schema_version = 1
+kind = "service@1"
+id = "builtin/dind"
+description = "Rootless Docker-in-Docker sidecar (elevated-nested security profile)."
+provides = ["cap:runtime.dind@1.0"]
+cardinality = "singleton"
+security_profile = "elevated-nested"
+required_capabilities = ["supports_pods", "supports_dind"]
+
+[images_by_arch]
+x86_64 = "docker.io/library/docker@sha256:9999999999999999999999999999999999999999999999999999999999999999"
+arm64  = "docker.io/library/docker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[resources]
+memory = "4g"
+pids_limit = 512
+
+[[volumes]]
+name = "dind-storage"
+kind = "named"
+target = "/home/rootless/.local/share/docker"
+durable = true
+read_only = false

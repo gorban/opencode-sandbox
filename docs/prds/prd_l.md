@@ -577,49 +577,51 @@ Per [AGENTS.md](../../AGENTS.md#branches), the spike PoC lives strictly under
 touches real `~/.config/oc-sandbox/`; leaves `oc-sandbox`, `oc-bridge.py`, `oc_controller.py`, and
 production tests untouched):
 
-- [ ] **Pure-Python Plan Compiler & Schema (`docs/prds/spikes/l/oc_plan.py`)** — `schema_version = 1`
-      TOML loader (host-state validation, unknown-key rejection, structural secret & forbidden-env
-      checks), active-root `[local]` pruning & remote-endpoint policy, capability-aware DAG +
-      non-escalating fallback resolver, diamond/cycle/named-instance/port-collision checks,
-      Universal Endpoint Policy Engine (closed `host_url_template`), Structured Role Contract ->
-      OpenCode v2 config/instructions/skills/MCP emitter (single-pass `O_NOFOLLOW` `{{slot}}`),
-      constrained `executables.toml` merger, immutable `plan_digest` (excluding `drift`), and
-      `applied_plan` drift classifier.
-- [ ] **Built-in Reference Catalog (`docs/prds/spikes/l/builtin/`)** — `service/postgres` (full
+- [x] **Pure-Python Plan Compiler & Schema (`docs/prds/spikes/l/oc_plan.py`, `oc_schema.py`)** —
+      `schema_version = 1` TOML loader (host-state validation, unknown-key rejection, structural
+      secret & forbidden-env checks), active-root `[local]` pruning & remote-endpoint policy,
+      capability-aware DAG + non-escalating fallback resolver, diamond/cycle/named-instance/
+      port-collision checks, Universal Endpoint Policy Engine (closed `host_url_template`),
+      Structured Role Contract -> OpenCode v2 config/instructions/skills/MCP emitter (single-pass
+      `O_NOFOLLOW` `{{slot}}`), constrained `executables.toml` merger, immutable `plan_digest`
+      (excluding `drift`), and `applied_plan` drift classifier.
+- [x] **Built-in Reference Catalog (`docs/prds/spikes/l/builtin/`)** — `service/postgres` (full
       SCRAM + `PGPASSFILE` + `5432` policy), `service/api-demo` (requiring `cap:db.postgres@^17`
       with `[local]` conditional pruning), `service/chromium-wayland`, `service/chromium-managed`,
       `service/dind`, `host-provider/{podman-linux,podman-macos-vm,cloud-render}`,
       `transport/{local,ssh-pinned,tailcat,cloud-https}`, and example `sandbox-type` / `bundle`
       definitions (including 0-MCP Postgres app-dev and read-only security-reviewer persona).
-- [ ] **Restricted Orchestrator Config MCP Server + Curated Base Skills (`docs/prds/spikes/l/oc_config_mcp.py`, `docs/prds/spikes/l/orchestrator_skills/`)** —
+- [x] **Restricted Orchestrator Config MCP Server + Curated Base Skills (`docs/prds/spikes/l/oc_config_mcp.py`, `oc_store.py`, `docs/prds/spikes/l/orchestrator_skills/`)** —
       Content-Length framed strict JSON-RPC MCP server over private `0o700` UDS (per-incarnation
-      256-bit session token + `SO_PEERCRED` UID check + byte/depth/rate caps, closed
-      `READABLE`/`MUTABLE` allowlists, `builtin/*` immutability, redacted `plan_preview`,
+      256-bit session token + `SO_PEERCRED` UID check + early rate limiting + byte/depth caps,
+      closed `READABLE`/`MUTABLE` allowlists, `builtin/*` immutability, redacted `plan_preview`,
       `config_propose_revision` wired to real `oc_controller.Controller` via `ConfigPublishAdapter`,
-      persistent-inode `flock`, monotonic revisions, durable proposal state machine, transitive
-      closure re-verification, and safe `restore`/`archive`), plus the 4 curated orchestrator base
-      Skills.
-- [ ] **Reworked CLI PoC (`docs/prds/spikes/l/oc_sandbox_cli.py`)** — implements `plan`, `config`,
+      persistent-inode `flock`, monotonic revisions, durable proposal state machine with
+      `"applying"`/`"uncertain"` recovery, `decide()` expiry/staleness check, `unarchive`
+      re-validation, transitive closure re-verification, and safe `restore`/`archive`), plus the 4
+      curated orchestrator base Skills.
+- [x] **Reworked CLI PoC (`docs/prds/spikes/l/oc_sandbox_cli.py`)** — implements `plan`, `config`,
       and `worker` subcommands against an explicit `--config-dir`.
-- [ ] **Comprehensive Offline Adversarial & Unit Test Suite (`docs/prds/spikes/l/test_poc.py`)** —
-      verifies DAG cycles, ambiguous provider & diamond conflicts, fallback inside DAG (and
-      refusing escalating fallbacks), `[local]` active-root pruning + remote-endpoint SSRF denial,
-      0-MCP Postgres wiring, named-instance port allocation, endpoint exposure denial (`9222`,
-      unauthenticated `5432`), persona conflict & `[composition] replace`, single-pass `{{slot}}`
-      & symlink rejection, MCP role filtering, structural secret & forbidden-env rejection,
-      `executables.toml` hook/latest rejection, `plan_digest` invariance across drift, orchestrator
-      MCP framing/duplicate-key/depth/token/restart-rotation/opaque-ID/allowlist/`builtin/*`/
-      archive-dependent/stale-closure/rollback-replay/digest-mismatch rejection.
+- [x] **Comprehensive Offline Adversarial & Unit Test Suite (`docs/prds/spikes/l/test_poc.py`)** —
+      22 tests verifying DAG cycles, ambiguous provider & diamond conflicts, fallback inside DAG
+      (and refusing escalating/incomparable fallbacks), `[local]` active-root pruning + remote-
+      endpoint SSRF denial, 0-MCP Postgres wiring, named-instance port allocation, endpoint
+      exposure denial (`9222`, unauthenticated `5432`), persona conflict & `[composition] replace`,
+      single-pass `{{slot}}` & symlink rejection, MCP role filtering, structural secret &
+      forbidden-env rejection, `executables.toml` hook/latest rejection, `plan_digest` invariance
+      across drift, orchestrator MCP framing/duplicate-key/depth/token/restart-rotation/opaque-ID/
+      allowlist/`builtin/*`/archive-dependent/`unarchive`-revalidation/stale-closure/
+      `"applying"`-and-`"uncertain"`-recovery/rollback-replay/digest-mismatch rejection.
 
 ## Review record
 
 - Gate 1 design review round 1 (`Security-Focused PR Reviewer Setup`, `9b67f520932e..3b5d95d1d0d1`):
-  5 P1 and 4 P2 findings addressed in this revision.
+  5 P1 and 4 P2 findings addressed.
 - Gate 1 design review round 2 (`Security-Focused PR Reviewer Setup`, `3b5d95d1d0d1..3ce6887cc8f7`):
-  1 P1 (`oc_controller.py` `_ID`/principal/`view()`/`State.UNCERTAIN`/exclusive lock/restart
-  boundary) and 2 P2 (`security_profile` partial order + per-endpoint fallback checks, early rate
-  limit + closed `action` enum) addressed in this revision.
-- Gate 1 design review round 3 (`Security-Focused PR Reviewer Setup`): pending.
+  1 P1 and 2 P2 findings addressed.
+- Gate 1 design review round 3 (`Security-Focused PR Reviewer Setup`, `3ce6887cc8f7..325ab192f9c1`):
+  **CLEARED** at commit `325ab192f9c151043cd8a9f8a689f67e1d190f64` (`docs/prds/prd_l.md` SHA-256
+  `dd848a069a9937fffda9b955264b2ebb48ff91473ead9a562a065d28308d4310`).
 - Gate 2 PoC implementation review (`Security-Focused PR Reviewer Setup`): pending.
 
 - [ ] **Human review**: checked only when the user says so

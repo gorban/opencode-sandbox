@@ -1,0 +1,8 @@
+schema_version = 1
+kind = "worker@1"
+id = "builtin/local-workstation"
+description = "Default local Linux rootless Podman workstation."
+host_provider = "builtin/podman-linux"
+transport = "builtin/local"
+arch = "x86_64"
+os = "linux"
