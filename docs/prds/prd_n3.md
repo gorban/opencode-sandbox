@@ -78,12 +78,24 @@ Workspace Header (Trusted Host Chrome)
   1. Executes an immediate containerized `safe_run` `git rev-parse HEAD` + `git rev-parse HEAD^{tree}`
      check (and/or verifies the immutable staged `:ro` artifact digest in `$STATE/inbox-spool/`)
      without ever running host `git` inside `~/opencode-sandbox`.
-  2. Atomically compares **both** the displayed card pins (`displayed_item_revision`,
-     `displayed_content_digest`, `expected_workflow_seq`) against the live SQLite row **and** the
-     live workspace/spool hashes inside the same SQLite transaction that consumes the
-     `OPERATOR_ONLY` awakeable and commits `HumanDecisionReceipt`. If the card was refreshed in a
-     stale tab or the workspace drifted (`STALE_ITEM_REVISION` / `TARGET_CHANGED`), the click fails
-     closed and requires a fresh decision on the updated card.
+  2. Atomically verifies ALL of the following inside the **single SQLite transaction** before
+     consuming the `OPERATOR_ONLY` awakeable, committing `HumanDecisionReceipt`, or enqueueing any
+     forwarded `inbox_resolution` directive:
+     - The displayed card pins (`displayed_item_revision`, `displayed_content_digest`,
+       `expected_workflow_seq`) match the live `human_inbox_items` row;
+     - The selected `action_id` belongs to the exact action list declared in that
+       `displayed_item_revision`;
+     - For workflow-gated items, the live `workflow_runs` / lane state is **still positioned on the
+       exact awaiting `(lane_key, step_id, expected_workflow_seq)`** and **still owns the exact
+       same live, unconsumed, unexpired (`consumed_at IS NULL AND now < expires_at`) `OPERATOR_ONLY`
+       awakeable** bound to that inbox item (never satisfied by matching a stale inbox row after the
+       lane has advanced, timed out, migrated, completed, or been revoked);
+     - The live containerized `safe_run` workspace/spool hashes match `(expected_commit_sha,
+       expected_tree_oid, expected_artifact_digest)`.
+     If **any** check fails (`STALE_ITEM_REVISION`, `INVALID_ACTION_FOR_REVISION`,
+     `STEP_SUPERSEDED`, `AWAKEABLE_EXPIRED`, or `TARGET_CHANGED`), the transaction rolls back and
+     fails closed: **an unchanged card for a superseded or expired step MUST produce zero awakeable
+     consumption, zero `HumanDecisionReceipt`, and zero forwarded `inbox_resolution` directive.**
   3. Binds the exact verified `(commit_sha, tree_oid, artifact_digest)` into the resumed workflow
      bindings so downstream steps operate exclusively on that pinned SHA/digest (never floating
      `HEAD`).
@@ -137,11 +149,11 @@ token + strict JSON + closed param allowlists; leaf sandboxes receive zero acces
 | Namespace | MCP Tools | Guardrails |
 |---|---|---|
 | **Config (existing `prd_l`)** | `config_list/get/schema/diff/history/propose_revision(kind="workflow", ...)` | Human-gated via Tier-A `Approval Inbox` with 10 `SECURITY_DELTA_TRIGGERS`; `builtin/*` immutable. |
-| **Workflow** | `workflow_plan_preview`, `workflow_start`, `workflow_status`, `workflow_signal`, `workflow_pause`, `workflow_resume`, `workflow_stop` | `observe_only` + `$0` spend auto-admits **only** when compiled reachable effects pass the observe-only allowlist (zero launches/patches/nudges/lane-pausing/factories) within `SubtreeBudget` and `max_active_workflow_runs` / rate limits; all other runs require `WorkflowRunLease` in Tier-A `Approval Inbox`. `-o` may `pause`/`resume`/`stop`/`signal` **only** `-o`-owned runs (or allowlisted signals in `WorkflowRunLease`), never operator-owned supervisors. |
+| **Workflow** | `workflow_plan_preview`, `workflow_start`, `workflow_status`, `workflow_signal`, `workflow_pause`, `workflow_resume`, `workflow_stop` | `observe_only` + `$0` spend auto-admits **only** when compiled reachable effects pass the observe-only allowlist (zero launches/patches/nudges/lane-pausing/factories), attaches strictly via a **nonexclusive observer subscription** (never acquiring or retaining `workflow_lane_leases`), and stays within `SubtreeBudget` and `max_active_workflow_runs` / rate limits; all other runs and **every** live migration to a new digest require a Tier-A `WorkflowRunLease`. `-o` may `pause`/`resume`/`stop`/`signal` **only** `-o`-owned runs (or allowlisted signals in `WorkflowRunLease`), never operator-owned supervisors. |
 | **Metrics & Bearings** | `metrics_query`, `metrics_anomalies`, `fleet_bearings_snapshot(format="toon")` | Strictly read-only, enforcing per-record `(caller, run_id, SubtreeBudget, target_incarnation)` authorization on every row and aggregate input. TOON table emits **only** host-authoritative numeric/enum/validated-identifier fields (preventing TOON row spoofing); any opted-in untrusted snippets are emitted separately inside 128-bit random-nonce `<oc-untrusted-data nonce="...">` blocks. |
 | **Human Inbox** | `inbox_post`, `inbox_list`, `inbox_get`, `inbox_note`, `inbox_receipts` | Per-record `(caller, run_id, SubtreeBudget, target_incarnation)` authorization on every read/write/note/receipt; rate-limited; partitioned `dedupe_key` prevents collision with operator gates; `<= 16 KiB`; `-o`'s `inbox_post` creates advisory (`lane_paused = 0`) items only. |
 | **Dashboard** | `dashboard_surface_upsert`, `dashboard_surface_patch`, `dashboard_surface_delete` | Per-record `(caller, run_id, SubtreeBudget, target_incarnation)` authorization; restricted to `owner_kind="orchestrator_overlay"`, closed `oc-ui@1` catalog, read-only navigation `action_chips` only, max 8 overlays/run, `<= 32 KiB`; cannot modify `workflow_default` surfaces. |
-| **Calibration** | `calibration_examples_query`, `workflow_calibration_replay` | Per-record `(caller, run_id, SubtreeBudget, target_incarnation)` authorization on every record, `sample_id`, and aggregate input (never `workflow_id` alone). `workflow_calibration_replay` requires a prior Tier-A-approved `CalibrationReplayGrant`, pins replay to the grant's route/model/disclosure policy, and runs `OverlapCanaryScanner` on the final payload; tuning edits require a separate Tier-A `config_propose_revision` approval. |
+| **Calibration** | `calibration_examples_query`, `workflow_calibration_propose_replay`, `workflow_calibration_replay` | Per-record `(caller, run_id, SubtreeBudget, target_incarnation)` authorization on every record, `sample_id`, and aggregate input (never `workflow_id` alone). Candidate preparation happens locally offline first via pure `compile_workflow_plan()`; `workflow_calibration_propose_replay` submits the exact outbound `rubric`/`choices` and `candidate_rubric_digest` to Tier A; `workflow_calibration_replay` requires that prior Tier-A `CalibrationReplayGrant`, verifies exact `candidate_rubric_digest` / `candidate_spec_digest`, route, model, and disclosure pinning (any candidate edit requires fresh Tier-A authority), and runs `OverlapCanaryScanner` on the final payload; tuning edits require a separate Tier-A `config_propose_revision` approval. |
 
 **Compiled workflow `SKILL.md` (progressive disclosure):**
 Each `workflow@1` references an `orchestrator_skill` staged `:ro` under `prd_l`'s existing

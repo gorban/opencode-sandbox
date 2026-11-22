@@ -192,9 +192,13 @@ Only after admission succeeds (auto-admitted effect-allowlisted `observe_only` o
 1. **Pinned snapshots & full-effect safe-point migration:** Running instances stay pinned to their
    starting `spec_digest`. Because `WorkflowRunLease` binds an exact `(spec_digest,
    grant_generation)`, **every** live migration (`workflow migrate <run_id> --to <new_spec_digest>`)
-   requires:
-   - **Fresh authority bound to the new `(new_spec_digest, new_grant_generation)`** (approved in
-     Tier A unless the migrated plan satisfies the strict `observe_only` effect allowlist below);
+   to a new digest unconditionally requires:
+   - **Fresh Tier-A `Approval Inbox` authority (`WorkflowRunLease`) bound to the new
+     `(new_spec_digest, new_grant_generation)`**—with no automatic `observe_only` carve-out on live
+     migrations (matching [prd_n](prd_n.md) Trap T10 and preventing any caller from silently
+     downgrading an operator-owned supervisor; `-o` may never initiate or migrate an
+     operator-owned run). Fresh `observe_only` starts remain governed by §5 below, and daemon
+     restart UX remains governed by the open restart decision in §5;
    - **Full quiescent safe-point** across **all** outstanding effects—zero in-flight `oc_hub`
      outbox dispatches, zero in-flight `/decisions/*` or blind-check upstream requests, zero firing
      timers, and zero unresolved `workflow_awakeables` or pending human decisions;
@@ -221,18 +225,34 @@ single-writer ACID transactions as `oc_hub` outbox & revocation tombstones):
 - **`workflow_step_log`**: append-only transition/action/decision journal for crash idempotency and audit.
 - **`workflow_timers`**: durable `(timer_id, run_id, lane_key, fire_at_monotonic_offset, fire_at_wall, kind, payload_json, status)` supporting clean sleep/wake adjustment.
 - **`workflow_awakeables`**: single-use 128-bit cryptographic correlation tokens bound to
-  `(token_hash, run_id, allowed_resolver_role, expected_seq, expected_commit_sha, expected_tree_oid, expected_artifact_digest, on_timeout, consumed_at, expires_at)`:
+  `(token_hash, run_id, lane_key, step_id, expected_workflow_seq, allowed_resolver_role,
+  expected_commit_sha, expected_tree_oid, expected_artifact_digest, on_timeout, consumed_at,
+  expires_at)`:
   - `allowed_resolver_role` is strictly `OPERATOR_ONLY | HOST_INTERNAL | ORCHESTRATOR_SUBTREE`.
   - `OPERATOR_ONLY` tokens are **never** exposed to `-o` and can be consumed only atomically with a
-    `Role.OPERATOR` `HumanDecisionReceipt`.
-  - Atomic `UPDATE ... WHERE consumed_at IS NULL` enforces single-use; expired tokens execute their
-    declared `on_timeout` transition (`escalate | fail | cancel`).
-- **`workflow_lane_leases`** *(Trap T9)*: keyed by `(sandbox_addr, incarnation_id, owner_workflow_run_id)`
-  with `UNIQUE(sandbox_addr, incarnation_id)` enforcing **at most one owning workflow per live
-  sandbox incarnation**. Released atomically in the same SQLite transaction that transitions the
-  owning run to `completed | failed | revoked` (while `paused` retains lane ownership and permits
-  read-only Tier-0 advisory alerts). A `fleet_supervisor` workflow sends advisory signals to the
-  owning workflow rather than competing to nudge the sandbox directly.
+    `Role.OPERATOR` `HumanDecisionReceipt` **while the live lane is still positioned on that exact
+    `(run_id, lane_key, step_id, expected_workflow_seq)` awaiting `token_hash` and
+    `now < expires_at`**.
+  - Atomic `UPDATE ... WHERE consumed_at IS NULL AND expires_at > :now` enforces single-use and
+    live-expiry checks; any lane advance, migration, revocation, or timeout invalidates superseded
+    awakeables in the same SQLite transaction (expired tokens execute their declared `on_timeout`
+    transition `escalate | fail | cancel`).
+- **`workflow_lane_leases` vs. nonexclusive `workflow_observer_subscriptions`** *(Trap T9)*:
+  - **`workflow_lane_leases`** is keyed by `(sandbox_addr, incarnation_id, owner_workflow_run_id)`
+    with `UNIQUE(sandbox_addr, incarnation_id)` enforcing **at most one owning workflow per live
+    sandbox incarnation** for active/owning runs (`autonomy != "observe_only"`). Released
+    atomically in the same SQLite transaction that transitions the owning run to `completed |
+    failed | revoked` (while `paused` retains lane ownership and permits read-only Tier-0 advisory
+    alerts). A `fleet_supervisor` workflow sends advisory signals to the owning workflow rather
+    than competing to nudge the sandbox directly.
+  - **Nonexclusive observer subscriptions (`workflow_observer_subscriptions`):** Auto-admitted (and
+    all `observe_only`) observers attach strictly via a **nonexclusive read-only subscription**
+    keyed by `(run_id, sandbox_addr, incarnation_id)` and are **forbidden at compile time and
+    runtime from acquiring, holding, or retaining a `workflow_lane_leases` row** (whether `running`
+    or `paused`). **Acceptance invariant:** starting an `observe_only` observer first on
+    `(sandbox_addr, incarnation_id)` MUST leave the operator (or an authorized owning workflow)
+    completely free to acquire `workflow_lane_leases` and start the owning workflow on that same
+    incarnation.
 - **Degraded-store halt & budget-exhaustion fallback (Trap T13):**
   - Whenever `oc_hub` / `$STATE/registry.sqlite` is degraded (`.coord_degraded` or unclean-shutdown
     `.coord_session_active` seal), `WorkflowEngine` halts **all** ticks, timers, `/decisions/*`
@@ -264,9 +284,14 @@ single-writer ACID transactions as `oc_hub` outbox & revocation tombstones):
        staging, `ship_lane`/`scout_lane` spawns, nudges/sends, `lane_paused = 1` /
        `human_gate_async` / `human_gate_blocking` stages, upstream model calls, or `factory_id`
        invocations.
-    3. The executor enforces the exact same effect allowlist at runtime. Any `observe_only` plan
-       containing a reachable disallowed effect **fails admission** even with `$0` model spend;
-       all other runs require explicit **Approval Inbox (Tier A)** grant.
+    3. The observer attaches strictly via a **nonexclusive `workflow_observer_subscriptions` entry**
+       and **never acquires or retains an exclusive `workflow_lane_leases` row** (even while
+       `paused`), so an auto-admitted observer can never block the operator or an owning workflow
+       from claiming that sandbox incarnation.
+    4. The executor enforces the exact same effect allowlist and nonexclusive-subscription rule at
+       runtime. Any `observe_only` plan containing a reachable disallowed effect or requesting an
+       exclusive lane lease **fails admission** even with `$0` model spend; all other runs require
+       explicit **Approval Inbox (Tier A)** grant.
   - `-o` can invoke `workflow_pause`, `workflow_resume`, `workflow_stop`, or `workflow_signal`
     **only** on `-o`-owned runs (or signals explicitly listed in
     `WorkflowRunLease.allowed_orchestrator_signals`)—never disabling an operator-launched
@@ -284,8 +309,8 @@ single-writer ACID transactions as `oc_hub` outbox & revocation tombstones):
   freezes stall timers and defers nudges until lease release + grace window.
 - **Unified `<1s` revocation cascade:** Revoking a `WorkflowRunLease` fences the runner, aborts
   in-flight `/decisions/*` and blind-check upstream sockets on `BrokerLease`, revokes
-  `workflow:<run_id>` `RoutingEdge`s, cancels pending outbox rows, releases `workflow_lane_leases`,
-  and marks the run `revoked`.
+  `workflow:<run_id>` `RoutingEdge`s, cancels pending outbox rows, releases `workflow_lane_leases` /
+  `workflow_observer_subscriptions`, and marks the run `revoked`.
 
 ---
 
@@ -301,9 +326,11 @@ single-writer ACID transactions as `oc_hub` outbox & revocation tombstones):
       `oc_controller.py` / `oc_coord_contract.py` with `<1s` revocation cascade and `InputLease`
       auto-suspend.
 - [ ] Implement the event-sourced `WorkflowEngine` in `oc_daemon` (`workflow_runs`,
-      `workflow_step_log`, `workflow_timers`, `workflow_awakeables`, `workflow_lane_leases`) with
-      the unified migration/restart outstanding-effects safe-point, fresh `(spec_digest,
-      grant_generation)` re-authorization, and late tool-result re-verification fence.
+      `workflow_step_log`, `workflow_timers`, `workflow_awakeables`, `workflow_lane_leases`,
+      nonexclusive `workflow_observer_subscriptions`) with the unified migration/restart
+      outstanding-effects safe-point, unconditional Tier-A `(new_spec_digest,
+      new_grant_generation)` re-authorization on every live migration, and late tool-result
+      re-verification fence.
 - [ ] **(decision needed)** Restart behavior for active `nudge_bounded` / metered workflows after
       `oc_daemon` restart (Trap T13):
   - **Option A (Recommended):** `observe_only` runs auto-resume; active/metered runs boot into

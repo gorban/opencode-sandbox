@@ -80,12 +80,19 @@ durable pre-flight spend reservations, [prd_m1](prd_m1.md)):
   - `decisions:local-rules-v1` — mandatory deterministic offline fixture for CI and air-gapped hosts
 - **Closed request construction (`"decisions-typed"`):**
   - `model` must exist in host `ModelCatalog` with `capability == "decisions"`.
-  - **Rubric provenance:** For **live** supervision, `rubric` comes strictly from immutable compiled
-    `workflow_plan.lock.json` (never from untrusted sandbox text). For **human-triggered replay**
-    (`workflow_calibration_replay`), `candidate_toml` is compiled through `compile_workflow_plan()`,
-    pinned strictly to the target workflow's already-approved `/decisions/*` route and model, and
-    scanned through `OverlapCanaryScanner` before any upstream call under a short-TTL
-    `CalibrationReplayGrant`.
+  - **Rubric provenance & Tier-A outbound binding:** For **live** supervision, `rubric` and `choices`
+    come strictly from immutable compiled `workflow_plan.lock.json` (never from untrusted sandbox
+    text). For **human-triggered calibration replay** (`workflow_calibration_replay`), `-o` (or the
+    operator) first prepares the candidate **locally offline** via pure side-effect-free
+    `compile_workflow_plan()` (zero upstream calls) to produce the canonical outbound `rubric`,
+    `choices`, and `candidate_rubric_digest = sha256(canonical_rubric_and_choices)` (or selects a
+    host-approved immutable variant). **Approval Inbox (Tier A)** displays that exact outbound
+    rubric/choices diff and cryptographically binds `candidate_rubric_digest` (and
+    `candidate_spec_digest`) into the short-TTL `CalibrationReplayGrant` alongside the pinned
+    `/decisions/*` route and model. No free-text `candidate_toml` may be supplied after approval:
+    any change to the candidate rubric or choices invalidates the grant and requires fresh Tier-A
+    authority before transmission (in addition to `OverlapCanaryScanner` on the exact final
+    serialized payload).
   - **Metrics-only default & explicit excerpt disclosure rule (P2 disclosure invariant):**
     External supervision (`/decisions/*` and blind-check upstream calls) defaults strictly to
     **host-allowlisted numeric/enum metrics only** (`excerpt_disclosure = "none"`). Control-char
@@ -234,27 +241,35 @@ sample_stratum, inclusion_status)` metadata:
    `FN_24h >= fn_drift_warn_count_24h` (`2`), `oc_daemon` posts a deduplicated **Tier-B Human
    Inbox** item: *"Classifier drift on `builtin/firstmate-supervisor` — [Request Calibration Replay
    in Approval Inbox]"*.
-3. **Two-step Tier-A-gated calibration & tuning (zero Tier-B grant authority):** Workflows never
-   self-modify, and **Tier B has zero authority to mint paid replay grants**. Clicking the Tier-B
-   button (or running the operator CLI) **only creates a Tier-A `oc_controller` proposal** for a
-   short-TTL **`CalibrationReplayGrant`**:
-   - Before issuing the grant, **Approval Inbox (Tier A)** explicitly displays and cryptographically
-     binds `(requesting_principal, run_id, workflow_id, authorized_sample_scope,
-     approved_decisions_route, approved_model, excerpt_disclosure_policy, max_replay_samples,
-     max_replay_calls, max_replay_spend_usd, expires_at)` with pre-flight reservation in
-     `QuotaLedger`. **A later Tier-A approval of a config edit cannot retroactively authorize an
-     earlier paid replay.**
+3. **Two-step Tier-A-gated calibration & tuning (zero Tier-B grant authority; rubric-bound replay):**
+   Workflows never self-modify, and **Tier B has zero authority to mint paid replay grants**.
+   Candidate preparation happens **locally offline first** (zero upstream calls): `-o` reads
+   authorized samples via `calibration_examples_query` and prepares a candidate via pure
+   `compile_workflow_plan()` (or selects a host-approved named variant) to derive the exact
+   canonical outbound `rubric`, `choices`, and `candidate_rubric_digest` / `candidate_spec_digest`.
+   Submitting a replay request (via the Tier-B button, `-o` proposal, or operator CLI) **only
+   creates a Tier-A `oc_controller` proposal** for a short-TTL **`CalibrationReplayGrant`**:
+   - Before issuing the grant, **Approval Inbox (Tier A)** explicitly displays the exact outbound
+     candidate `rubric` & `choices` (with diff against the active rubric) and cryptographically
+     binds `(requesting_principal, run_id, workflow_id, candidate_spec_digest,
+     candidate_rubric_digest, authorized_sample_scope, approved_decisions_route, approved_model,
+     excerpt_disclosure_policy, max_replay_samples, max_replay_calls, max_replay_spend_usd,
+     expires_at)` with pre-flight reservation in `QuotaLedger`. **A later Tier-A approval of a
+     config edit cannot retroactively authorize an earlier paid replay, and `-o` cannot supply
+     unapproved free-text `candidate_toml` after grant issuance—any change to the candidate rubric
+     or choices requires a fresh Tier-A grant before transmission.**
    - **Per-record authorization:** Every `calibration_examples_query(run_id, outcomes, strata,
-     limit)` and `workflow_calibration_replay(grant_id, run_id, candidate_toml, sample_ids)` call
-     authorizes **every individual record, `sample_id`, and aggregate input** against the current
-     caller, `run_id` ownership, caller's live `SubtreeBudget`, and target `(sandbox_addr,
+     limit)` and `workflow_calibration_replay(grant_id, run_id, candidate_spec_digest, sample_ids)`
+     call authorizes **every individual record, `sample_id`, and aggregate input** against the
+     current caller, `run_id` ownership, caller's live `SubtreeBudget`, and target `(sandbox_addr,
      incarnation_id)` (never authorizing by `workflow_id` alone; cross-run or out-of-subtree
      `sample_ids` fail closed and unauthorized rows are excluded from aggregates).
-   - `workflow_calibration_replay` compiles `candidate_toml` via pure `compile_workflow_plan()`,
-     enforces exact route/model/disclosure pinning to the `CalibrationReplayGrant`, runs
-     `OverlapCanaryScanner` on the exact final serialized payload before any upstream call, and
-     returns a stratified **before vs. after reference-verdict scorecard** (including abstentions
-     and cap-drop notes).
+   - `workflow_calibration_replay` loads the pinned candidate artifact for `candidate_spec_digest`,
+     verifies that its compiled outbound `rubric` and `choices` match the grant's exact
+     `candidate_rubric_digest` byte-for-byte, enforces exact route/model/disclosure pinning to the
+     `CalibrationReplayGrant`, runs `OverlapCanaryScanner` on the exact final serialized payload
+     before any upstream call, and returns a stratified **before vs. after reference-verdict
+     scorecard** (including abstentions and cap-drop notes).
    - `-o` then submits `config_propose_revision(kind="workflow" | "sandbox-type", ...)` -> a
      **separate Tier-A `Approval Inbox`** grant displaying both `security_delta` (including
      `workflow_rubric_or_predicate_changed`, `workflow_template_changed`, and
@@ -285,8 +300,8 @@ sample_stratum, inclusion_status)` metadata:
 - [ ] Implement stateless, 4-tool blind real-model verifier (metrics-only default + explicit opt-in
       excerpt disclosure policy + final-payload `OverlapCanaryScanner`), independent host-verified
       progress freshness guard, scheduled active-lane audits with stratum/inclusion-rate/cap-drop
-      accounting, `supervision_calibration_log`, and `CalibrationReplayGrant`-gated
-      `workflow_calibration_replay` with per-record authorization.
+      accounting, `supervision_calibration_log`, and rubric-digest-bound
+      `CalibrationReplayGrant`-gated `workflow_calibration_replay` with per-record authorization.
 - [ ] Author `builtin/firstmate-supervisor.toml` and its `:ro` `orchestrator_skill`.
 - [ ] **(decision needed)** Dedicated model tier for the blind real-model health check (Trap T2):
   - **Option A (Recommended):** Allow `workflow@1` (`[supervision.blind_check].model_profile`) to
