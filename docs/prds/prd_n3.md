@@ -40,16 +40,19 @@ Workspace Header (Trusted Host Chrome)
 | Tier | Backing Store & Authority | Blocks Agents? | Typical Items |
 |---|---|---|---|
 | **Tier A — `Approval Inbox`** | `oc_controller.view(operator, request_id)` (cryptographic `(request_id, revision, digest)` + `security_delta`) | **Yes** (requesting action waits) | Sandbox launch plans, `PaidFallbackGrant`, `WorkflowRunLease`, `config_propose_revision` (including calibration tuning), `InputLease` |
-| **Tier B — `Human Inbox`** | `$STATE/registry.sqlite` (`human_inbox_items`); **zero** approval/execution authority | **No by default** (`blocking = 0`; optional `blocking = 1` pauses *only* its owning workflow step when declared in compiled `workflow@1`) | PRD `Human review` gates, `captain_hold` design questions, persistent post-nudge stuck-lane escalations, classifier FP/FN drift alerts |
+| **Tier B — `Human Inbox`** | `$STATE/registry.sqlite` (`human_inbox_items`); **zero** approval/execution authority | **No** (siblings always keep running; host `WorkflowEngine` may set `lane_paused = 1` on a declared `human_gate_async` to pause *only* that single lane until its `OPERATOR_ONLY` awakeable is resolved) | PRD `Human review` gates, `captain_hold` design questions, persistent post-nudge stuck-lane escalations, classifier FP/FN drift alerts |
 | **Tier C — Health Ribbon** | Live projection / ephemeral badges | **No** | Transient telemetry (`5h quota 88%`, `rev-1 auto-nudged 1/2`); auto-clears on recovery, never creates Inbox noise |
 
 #### Human Inbox lifecycle, `firstmate` verb parity, & TOCTOU protection (Trap T7)
 - **Durable SQLite schema (`human_inbox_items`):**
-  `(item_id, kind, severity, blocking, status, source_kind, source_id, workflow_run_id, target_addr,
-  thread_id, title, summary_md, evidence_json, actions_json, dedupe_key, expected_commit_sha,
-  expected_artifact_digest, expected_workflow_seq, snooze_until, resolution_decision,
-  resolution_note, resolved_by, created_at, updated_at)`
+  `(item_id, kind, severity, lane_paused, awakeable_token_hash, status, source_kind, source_id,
+  workflow_run_id, target_addr, thread_id, title, summary_md, evidence_json, actions_json,
+  dedupe_key, expected_commit_sha, expected_tree_oid, expected_artifact_digest,
+  expected_workflow_seq, snooze_until, resolution_decision, resolution_note, resolved_by,
+  created_at, updated_at)`
   with `UNIQUE INDEX` on `(dedupe_key) WHERE status = 'open' AND dedupe_key IS NOT NULL`.
+  Only the host `WorkflowEngine` may set `lane_paused = 1` and attach an `OPERATOR_ONLY`
+  `awakeable_token_hash`; `-o`'s `inbox_post` creates advisory (`lane_paused = 0`) items only.
 - **Idempotent inbox verbs (ported cleanly from `fm-inbox.sh` + `fm-captain-hold.sh`):**
   - `note` (idempotent `request_id`, coalesced single wake), `reply` (sequence-stamped),
     `receipts` (bounded cursor view), `ready` (read-only readiness projection), `status`
@@ -58,15 +61,26 @@ Workspace Header (Trusted Host Chrome)
 - **Self-healing auto-resolve:** Items carrying an `auto_resolve_guard` (e.g., stuck-lane escalation
   whose lane resumes host-verified progress) transition automatically to `auto_resolved`—archived
   with full audit history so stale items never pile up.
-- **TOCTOU cryptographic fingerprint pinning (Trap T7):** Actionable review gates (e.g., PRD
-  `Human review` at commit `abc123`) store `(expected_commit_sha, expected_artifact_digest,
-  expected_workflow_seq)`. When the operator clicks **Approve / Resolve**, `oc_daemon` re-verifies
-  the fingerprint atomically inside SQLite; if an agent pushed `def456` in the meantime, the action
-  fails closed (`TARGET_CHANGED`) and refreshes the card with the new diff link.
-- **Auditable decision receipts:** Resolving a Tier-B item writes an append-only
+- **TOCTOU cryptographic fingerprint pinning & live `safe_run` verification (Trap T7):**
+  Actionable review gates (e.g., PRD `Human review` at commit `abc123`) store
+  `(expected_commit_sha, expected_tree_oid, expected_artifact_digest, expected_workflow_seq)`.
+  When the operator clicks **Approve / Resolve**, `oc_daemon`:
+  1. Executes an immediate containerized `safe_run` `git rev-parse HEAD` + `git rev-parse HEAD^{tree}`
+     check (and/or verifies the immutable staged `:ro` artifact digest in `$STATE/inbox-spool/`)
+     without ever running host `git` inside `~/opencode-sandbox`.
+  2. Atomically compares the live result against the pinned fingerprint inside SQLite; if an agent
+     pushed `def456` in the meantime, the click fails closed (`TARGET_CHANGED`) and refreshes the
+     card with the new diff link.
+  3. Commits `HumanDecisionReceipt` and binds the exact verified `(commit_sha, tree_oid,
+     artifact_digest)` into the resumed workflow bindings so downstream steps operate exclusively on
+     that pinned SHA/digest (never floating `HEAD`).
+- **Auditable decision receipts & event forwarding:** Resolving a Tier-B item writes an append-only
   `HumanDecisionReceipt(operator_session, item_id, workflow_run_id, spec_digest, verified_sha,
-  action_id, ts)` into `audit_log`, emits an `OPERATOR_DIRECTIVE` `human_inbox_resolved` event, and
-  triggers any bound `workflow_awakeables` token.
+  verified_tree_oid, action_id, ts)` into `audit_log`, records a `human_inbox_resolved` projection
+  event on `oc_daemon`, atomically consumes any bound `OPERATOR_ONLY` `workflow_awakeables` token,
+  and—when `-o` is subscribed—forwards the resolution via `oc_hub` as a host-originated
+  `OPERATOR_DIRECTIVE` turn with `msg_kind = "inbox_resolution"` (explicit coordinated
+  `oc_coord_contract.py` extension).
 
 ### 2. Declarative dashboard surfaces (`oc-ui@1`) — zero untrusted JS in Trusted Host Chrome
 
@@ -80,16 +94,22 @@ host-owned React component catalog:
   where `owner_kind IN ('workflow_default', 'orchestrator_overlay')` and `state_json <= 32 KiB`.
 - **Closed React component allowlist:**
   `status_card | metric_kpi | kv_table | lane_health_matrix | timeline_log | checklist_progress | sparkline_series | action_chips`
-- **Safe `action_chips` allowlist:** Only non-privileged UI navigation and typed workflow signals
-  (`open_thread`, `open_pty_observe`, `open_diff`, `open_inbox_item`, `workflow_signal`,
-  `trigger_calibration_review`)—**never** `approve_controller_request` or `take_input_lease`.
-- **Unforgeable provenance separation:**
+- **Strict `action_chips` split (prevents overlay clickjacking):**
+  - On `owner_kind = "orchestrator_overlay"` surfaces: **strictly read-only navigation chips**
+    (`open_thread`, `open_pty_observe`, `open_diff`, `open_inbox_item`)—zero state-mutating actions.
+  - On immutable host-compiled `owner_kind = "workflow_default"` surfaces only: read-only navigation
+    chips **plus** host-declared `workflow_signal` and `trigger_calibration_review` chips, always
+    rendered with canonical host-derived action labels (never arbitrary `-o` text) and **never**
+    `approve_controller_request` or `take_input_lease`.
+- **Unforgeable provenance & strict Markdown AST:**
   - **`[Deterministic Workflow]`** surfaces compile directly from `workflow@1`, update from
     host-authoritative metrics with zero LLM tokens, and are **immutable** to `-o`.
   - **`[Orchestrator Overlay]`** surfaces (max 8 per workflow run) are authored by `-o` via
-    `dashboard_surface_upsert/patch`, rendered strictly via inert Markdown AST / plain typed fields
-    under Trusted Chrome's `default-src 'none'; script-src 'self'` CSP, and visually badged so `-o`
-    can never spoof host telemetry or security approvals.
+    `dashboard_surface_upsert/patch`, rendered strictly via an inert Markdown AST with raw HTML
+    disabled, `javascript:` / `data:` URLs rejected, and external `https:` image/media loads
+    blocked (`img-src 'none'` / host-bundled local assets only) under Trusted Chrome's
+    `default-src 'none'; script-src 'self'` CSP, and visually badged so `-o` can never spoof host
+    telemetry or security approvals.
 
 ### 3. Orchestrator (`-o`) MCP tool surface & workflow skills
 
@@ -98,16 +118,17 @@ token + strict JSON + closed param allowlists; leaf sandboxes receive zero acces
 
 | Namespace | MCP Tools | Guardrails |
 |---|---|---|
-| **Config (existing `prd_l`)** | `config_list/get/schema/diff/history/propose_revision(kind="workflow", ...)` | Human-gated via Tier-A `Approval Inbox`; `builtin/*` immutable. |
-| **Workflow** | `workflow_plan_preview`, `workflow_start`, `workflow_status`, `workflow_signal`, `workflow_pause`, `workflow_resume`, `workflow_stop` | `observe_only` + `\$0` spend auto-admits within `SubtreeBudget`; active/metered runs require `WorkflowRunLease` in Tier-A `Approval Inbox`. |
-| **Metrics & Bearings** | `metrics_query`, `metrics_anomalies`, `fleet_bearings_snapshot(format="toon")` | Strictly read-only, scoped to `-o`'s subtree; compact TOON format minimizes `-o` context burn. |
-| **Human Inbox** | `inbox_post`, `inbox_list`, `inbox_get`, `inbox_note`, `inbox_receipts` | Rate-limited, `dedupe_key` enforced, `<= 16 KiB`; `blocking=True` allowed only if bound compiled workflow declares a blocking gate. |
-| **Dashboard** | `dashboard_surface_upsert`, `dashboard_surface_patch`, `dashboard_surface_delete` | Restricted to `owner_kind="orchestrator_overlay"`, closed `oc-ui@1` catalog, max 8 overlays/run, `<= 32 KiB`; cannot modify `workflow_default` surfaces. |
-| **Calibration** | `calibration_examples_query`, `workflow_calibration_replay` | Read-only historical snapshots + bounded host-side replay producing before/after confusion-matrix scorecards; tuning edits still require `config_propose_revision` -> Tier-A `Approval Inbox`. |
+| **Config (existing `prd_l`)** | `config_list/get/schema/diff/history/propose_revision(kind="workflow", ...)` | Human-gated via Tier-A `Approval Inbox` with 9 `SECURITY_DELTA_TRIGGERS`; `builtin/*` immutable. |
+| **Workflow** | `workflow_plan_preview`, `workflow_start`, `workflow_status`, `workflow_signal`, `workflow_pause`, `workflow_resume`, `workflow_stop` | `observe_only` + `$0` spend auto-admits within `SubtreeBudget` and `max_active_workflow_runs` / rate limits; active/metered runs require `WorkflowRunLease` in Tier-A `Approval Inbox`. `-o` may `pause`/`resume`/`stop`/`signal` **only** `-o`-owned runs (or signals explicitly allowlisted in `WorkflowRunLease`), never operator-owned supervisors. |
+| **Metrics & Bearings** | `metrics_query`, `metrics_anomalies`, `fleet_bearings_snapshot(format="toon")` | Strictly read-only, scoped to `-o`'s `SubtreeBudget`. TOON table emits **only** host-authoritative numeric/enum/validated-identifier fields (preventing TOON newline/delimiter row spoofing); any untrusted snippets are emitted separately inside 128-bit random-nonce `<oc-untrusted-data nonce="...">` blocks. |
+| **Human Inbox** | `inbox_post`, `inbox_list`, `inbox_get`, `inbox_note`, `inbox_receipts` | Rate-limited, `dedupe_key` enforced, `<= 16 KiB`; `-o`'s `inbox_post` creates advisory (`lane_paused = 0`) items only (never lane-pausing or blocking gates). |
+| **Dashboard** | `dashboard_surface_upsert`, `dashboard_surface_patch`, `dashboard_surface_delete` | Restricted to `owner_kind="orchestrator_overlay"`, closed `oc-ui@1` catalog, read-only navigation `action_chips` only, max 8 overlays/run, `<= 32 KiB`; cannot modify `workflow_default` surfaces. |
+| **Calibration** | `calibration_examples_query`, `workflow_calibration_replay` | Scoped strictly to `workflow_id` within `-o`'s `SubtreeBudget` (nonce-framed excerpts). `workflow_calibration_replay` requires a host-minted short-TTL `CalibrationReplayGrant`, pins replay to the workflow's already-approved `/decisions/*` route/model, and runs `OverlapCanaryScanner`; tuning edits still require `config_propose_revision` -> Tier-A `Approval Inbox`. |
 
 **Compiled workflow `SKILL.md` (progressive disclosure):**
-Each `workflow@1` references an `orchestrator_skill` staged `:ro` at
-`/run/oc-config/skills/wf-<slug>/SKILL.md` (0 base tokens until invoked). The skill teaches `-o`:
+Each `workflow@1` references an `orchestrator_skill` staged `:ro` under `prd_l`'s existing
+`orchestrator_skills` discovery tree at `/run/oc-config/skills/wf-<slug>/SKILL.md` (`O_NOFOLLOW`,
+host-owned `0o700`/`0o600` source, 0 base tokens until invoked). The skill teaches `-o`:
 1. Required `bindings` and how to invoke `workflow_plan_preview` / `workflow_start`.
 2. How to read `fleet_bearings_snapshot(format="toon")` and `metrics_query` instead of polling raw
    threads.

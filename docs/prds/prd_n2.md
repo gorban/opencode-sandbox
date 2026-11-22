@@ -37,9 +37,13 @@ Maintain a hard namespace boundary inside `oc_daemon` and `$STATE/registry.sqlit
    - **Runtime / Cgroup / Worker Probes (`HostProvider.probe()`):** container CPU time delta, RSS,
      block I/O, worker RTT, available host RAM/disk (distinguishes active local compilation from a
      wedged idle container).
-   - **Host-Verified Workspace Velocity (via throwaway containerized `safe_run`):** git diff-stat
-     delta, commit SHA advances, verified test exit transitions (never running host `git` or
-     walking worktrees inside `~/opencode-sandbox`).
+   - **Host-Verified Workspace Velocity (via lazy containerized `safe_run`, Trap T14):** git
+     diff-stat delta, commit SHA advances, and verified test exit transitions (never running host
+     `git` or walking worktrees inside `~/opencode-sandbox`). To prevent container-launch thrash,
+     `safe_run` workspace probes run **lazily / on-demand**—triggered only when Tier-0
+     broker/hub/cgroup metrics flag a candidate stall, during pre-action freshness checks, before
+     commit-pinned Tier-B Human Inbox verification, or on a slow bounded cadence—with per-lane
+     concurrency `1` and a hard execution timeout.
    - **Supervision & Calibration Metrics:** System-1 call count/latency/spend, throttled/coalesced
      trigger count, blind-check call count/spend, `TP`, `FP`, `TN`, `FN`, `class_mismatch`,
      precision, sampling-adjusted miss rate, and nudge outcomes.
@@ -50,31 +54,47 @@ Maintain a hard namespace boundary inside `oc_daemon` and `$STATE/registry.sqlit
 `oc_daemon` and flush every `5–10s` into ring-bounded SQLite buckets (`1m` resolution for 24h,
 `5m` / `1h` rollups for 30d) to avoid SQLite WAL write amplification.
 
-### 2. `/decisions/*` broker route (`oc_broker_http.py`, `"decisions-typed"` policy)
+### 2. Host-internal `/decisions/*` & blind-check broker (`"decisions-typed"` policy)
 
-Mount `/decisions/<provider>/v1/evaluate` onto `HostHttpBrokerServer`, reusing `HostVaultMemory`,
-`BrokerLease`, DNS-pinned IP validation, `follow_redirects=False`, `OverlapCanaryScanner`, error
-scrubbing, and `QuotaLedger` durable pre-flight spend reservations ([prd_m1](prd_m1.md)):
+Run a **dedicated host-internal `oc_daemon`-only supervision broker instance** reusing
+`oc_broker_http.py`'s security primitives (`HostVaultMemory`, `BrokerLease`, DNS-pinned IP
+validation, `follow_redirects=False`, `OverlapCanaryScanner`, error scrubbing, and `QuotaLedger`
+durable pre-flight spend reservations, [prd_m1](prd_m1.md)):
 
-- **Internal-only default:** Accessible only to `oc_daemon`'s host `WorkflowEngine` (zero
-  `/decisions/*` routes exposed to untrusted leaf sandboxes).
-- **Provider adapters:**
-  - `decisions:openai-luna` — OpenAI Decisions API (`gpt-6-luna`)
-  - `decisions:gemini-decision-1` — Google Gemini Decisions API (`gemini-decision-1`)
-  - `decisions:local-rules-v1` — deterministic offline fixture for CI and air-gapped hosts
+- **Strict UDS isolation (never container-mounted):** This host-internal broker does **not** share
+  the container-mounted per-job `HostHttpBrokerServer` UDS listeners (`/run/oc-broker/http.sock`),
+  is never mounted into any sandbox or `-o` container, never accepts `ocjob_` or `-o` bearer tokens,
+  and is gated exclusively by `WorkflowRunLease` (live checks) or `CalibrationReplayGrant`
+  (human-triggered replay).
+- **Provider adapters & `ModelCatalog` abstraction:** Model IDs such as `gpt-6-luna` and
+  `gemini-decision-1` are illustrative host `ModelCatalog` entries (`capability == "decisions"`)
+  rather than hardcoded constants; every adapter validates upstream responses against a strict
+  typed schema:
+  - `decisions:openai-luna` — OpenAI Decisions API adapter (e.g., `gpt-6-luna`)
+  - `decisions:gemini-decision-1` — Google Gemini Decisions API adapter (e.g., `gemini-decision-1`)
+  - `decisions:local-rules-v1` — mandatory deterministic offline fixture for CI and air-gapped hosts
 - **Closed request construction (`"decisions-typed"`):**
   - `model` must exist in host `ModelCatalog` with `capability == "decisions"`.
-  - `rubric` comes strictly from immutable compiled `workflow_plan.lock.json` (never from untrusted
-    sandbox text).
+  - **Rubric provenance:** For **live** supervision, `rubric` comes strictly from immutable compiled
+    `workflow_plan.lock.json` (never from untrusted sandbox text). For **human-triggered replay**
+    (`workflow_calibration_replay`), `candidate_toml` is compiled through `compile_workflow_plan()`,
+    pinned strictly to the target workflow's already-approved `/decisions/*` route and model, and
+    scanned through `OverlapCanaryScanner` before any upstream call under a short-TTL
+    `CalibrationReplayGrant`.
   - `evidence` is a flat JSON object (`<= 8 KiB`) containing host-verified numeric metrics plus an
     optional `sanitized_last_error_excerpt` (truncated `<= 512` bytes, control/bidi/ANSI stripped,
     explicitly tagged as untrusted data).
   - Enforces zero-output-token single-pass evaluation (`noul` / `choice` / `score`), `store: false`,
     and zero provider-side tools.
   - Batches a **`noul("classifier_injection_suspected")`** self-defense canary into every call.
-- **Fail-closed output:** Any malformed payload, unknown enum label, timeout, HTTP error, or
-  positive injection canary logs a security/degraded metric and fails closed to `abstain_default`
-  (triggering fallback to Tier-0 deterministic backstops).
+- **Fail-closed error vs. positive injection-canary handling:**
+  - Any malformed payload, unknown enum label, timeout, or upstream HTTP error logs a degraded
+    metric and fails closed to `abstain_default` (falling back to Tier-0 deterministic backstops).
+  - A **positive `classifier_injection_suspected` canary does NOT default to `"healthy_progress"`**
+    (which would reward suppression attacks): instead, `oc_daemon` logs a high-severity security
+    event, strips `sanitized_last_error_excerpt` and re-evaluates strictly on host-verified numeric
+    metrics, and on repeated canary hits enqueues a throttled blind check plus a deduplicated
+    Tier-B security-anomaly notice.
 
 ### 3. Zero-authority System-1 + leading/single-trailing coalesced throttler
 
@@ -107,10 +127,12 @@ State: THROTTLED(window_end, trailing_queued, suppressed_count)
       -> Transition to IDLE
 ```
 
-- **Fleet-wide outer cap (Trap T3):** Pair per-lane throttlers with a fleet-wide concurrency and
-  hourly rate cap (`fleet_max_concurrent_checks`, `fleet_max_checks_per_hour`, round-robin across
-  lanes) so synchronized spam across N compromised sandboxes cannot burst N simultaneous System-2
-  checks.
+- **Fleet-wide outer cap + non-starvable audit floor (Trap T3):** Pair per-lane throttlers with a
+  fleet-wide concurrency and hourly rate cap (`fleet_max_concurrent_checks`,
+  `fleet_max_checks_per_hour`, round-robin across lanes) **plus** a dedicated non-starvable
+  reserved audit slice (`fleet_audit_checks_per_hour`, e.g., `>= 25%` of the fleet hourly budget)
+  so synchronized alerts from compromised sandboxes cannot starve scheduled unalerted `FN` audits
+  on other active lanes.
 
 ### 4. Blind real-model verification, freshness guard & `TP / FP / TN / FN` confusion matrix
 
@@ -120,13 +142,18 @@ attacks:
 - **Stateless, tool-restricted, blind context (Trap T2):** The real-model health check runs in a
   dedicated single-turn host-brokered context (never full `-o` with spawn/config tools). It
   receives **only** a generic *"Routine Lane Health Check"* prompt + the frozen `MetricSnapshot`—**no
-  indication** whether System-1 alerted or a routine schedule fired.
+  indication** whether System-1 alerted or a routine schedule fired. Any untrusted excerpt is
+  wrapped inside `prd_m2`'s 128-bit random-nonce `<oc-untrusted-data nonce="...">` framing and
+  breakout-escaped.
 - **Closed 4-tool surface:**
   1. `health_record_ok()`
   2. `health_nudge_lane(template_id)` *(closed enum of host-static templates only)*
   3. `health_escalate_human(category)` *(creates/updates deduplicated Tier-B Inbox item using static
      host summary + host metrics)*
-  4. `health_wake_orchestrator(reason_code)` *(delivers compact Host-Verified Incident Dossier to `-o`)*
+  4. `health_wake_orchestrator(reason_code)` *(delivers a compact Host-Verified Incident Dossier to
+     `-o` containing strictly host-verified numeric/enum metrics and closed `reason_code` in the
+     trusted envelope; any optional untrusted excerpt is wrapped in 128-bit random-nonce
+     `<oc-untrusted-data nonce="...">` framing)*
 - **Dual execution paths:**
   1. **Triggered checks** (leading `S1` or trailing `S_now` from throttler).
   2. **Scheduled unalerted active-lane audits** (periodic timer on active lanes where System-1 did
@@ -135,19 +162,23 @@ attacks:
 
 | Run Origin | System-1 Verdict | Blind Real-Model Tool Call | Confusion Outcome | Live Side Effect |
 |---|---|---|---|---|
-| Triggered (`S1`) | Alert (`class X`) | Matching tool (`class X`) | `TP` | Execute *(if freshness guard passes)* |
-| Triggered (`S1`) | Alert (`class X`) | Different action tool (`class Y`) | `class_mismatch` (Action-Verified) | Execute `Y` *(if freshness guard passes)* |
-| Triggered (`S1`) | Alert (`class X`) | `health_record_ok` | `FP` (False Alert) | None |
+| Triggered Leading (`S1`) | Alert (`class X`) | Matching tool (`class X`) | `TP` | Execute *(if freshness guard passes)* |
+| Triggered Leading (`S1`) | Alert (`class X`) | Different action tool (`class Y`) | `class_mismatch` (Action-Verified) | Execute `Y` *(if freshness guard passes)* |
+| Triggered Leading (`S1`) | Alert (`class X`) | `health_record_ok` | `FP` (False Alert) | None |
+| Triggered Trailing (`S_now`) | *(Bypassed — coalesced burst)* | Any tool | **Excluded from System-1 `TP/FP`** *(unless shadow-scored on `S_now`)* | Execute if action tool *(if freshness guard passes)* |
 | Scheduled Audit (`S_audit`) | No Alert | `health_record_ok` | `TN` | None |
 | Scheduled Audit (`S_audit`) | No Alert | Any action tool (`class Y`) | `FN` (Missed Alert) | **Execute `Y` directly from real-model alert** *(if freshness guard passes)* |
 
 - **Point-in-time scoring vs. freshness-gated execution (Trap T4):**
   - `TP / FP` is always scored against the **exact frozen snapshot `S1`** System-1 evaluated so a
-    fast self-recovery does not falsely mark System-1 as an FP.
+    fast self-recovery does not falsely mark System-1 as an FP. Because `triggered_trailing`
+    evaluates fresh `S_now` without re-running System-1, it is excluded from System-1 `TP/FP`
+    accuracy metrics (unless System-1 also evaluates `S_now` in shadow mode without gating
+    dispatch).
   - Before dispatching any nudge or Human Inbox escalation, `oc_daemon` runs a deterministic
-    **freshness check** (did `turn_completed`, a new commit SHA, or an active human `InputLease`
-    occur since `S1`?). If self-recovered, log `action_suppressed_self_recovered` and skip the stale
-    nudge while keeping the `TP` credit.
+    **freshness check** (did `turn_completed`, a new commit SHA via lazy `safe_run`, or an active
+    human `InputLease` occur since `S1`?). If self-recovered, log `action_suppressed_self_recovered`
+    and skip the stale nudge while keeping the `TP` credit.
 - **Host-verified progress-hash reset (Trap T5):** Stall timers and per-incident nudge counts reset
   **only** on host-verified progress (new commit SHA, diff hash delta, verified test transition, or
   workflow state advance)—never on agent chat text (`"Got it, continuing!"`).
@@ -172,16 +203,23 @@ bounded ring buffer, e.g., 30 days):
    `FP_rate > fp_drift_warn_threshold` (`0.25`) or `FN_24h >= fn_drift_warn_count_24h` (`2`),
    `oc_daemon` posts a deduplicated **Tier-B Human Inbox** item: *"Classifier drift on
    `builtin/firstmate-supervisor` — [Ask Orchestrator to Propose Tuning]"*.
-3. **Human-triggered tuning (default):** Workflows never self-modify. When the operator triggers
-   `-o` (via the Inbox button or chat):
+3. **Human-triggered tuning with `CalibrationReplayGrant` (default):** Workflows never self-modify,
+   and `-o` cannot invoke upstream replay without explicit operator initiation. Clicking the Tier-B
+   `[Ask Orchestrator to Propose Tuning]` control (or running the operator CLI) mints a short-TTL
+   **`CalibrationReplayGrant`** in `oc_controller` bound to `(grant_id, workflow_id,
+   approved_decisions_route, approved_model, max_replay_samples, max_replay_calls,
+   max_replay_spend_usd, expires_at)` with pre-flight reservation in `QuotaLedger`:
    - `-o` inspects disagreements via read-only `calibration_examples_query(workflow_id, outcomes, limit)`
-     (excerpts strictly bounded and fenced).
-   - `-o` evaluates candidate rubric/threshold edits via bounded host-side
-     `workflow_calibration_replay(workflow_id, candidate_toml, sample_ids)` generating a **before vs.
-     after confusion-matrix scorecard**.
+     restricted strictly to `workflow_id` within `-o`'s `SubtreeBudget`, with any untrusted excerpts
+     wrapped in 128-bit random-nonce `<oc-untrusted-data nonce="...">` framing.
+   - `-o` calls `workflow_calibration_replay(grant_id, workflow_id, candidate_toml, sample_ids)`:
+     the host compiles `candidate_toml` via `compile_workflow_plan()`, enforces exact route/model
+     pinning to `grant.approved_decisions_route` & `grant.approved_model` (rejecting provider/route
+     changes during replay), scans candidate text through `OverlapCanaryScanner` before any
+     upstream call, and returns a **before vs. after confusion-matrix scorecard**.
    - `-o` submits `config_propose_revision(kind="workflow" | "sandbox-type", ...)` -> **`Approval
-     Inbox (Tier A)`**, displaying both `security_delta` and the replay scorecard for explicit human
-     approval.
+     Inbox (Tier A)`**, displaying both `security_delta` (including `workflow_rubric_or_predicate_changed`
+     and `workflow_template_changed`) and the replay scorecard for explicit human approval.
 
 ### 6. Clean-room `firstmate` pattern extraction matrix
 

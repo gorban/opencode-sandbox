@@ -58,19 +58,22 @@ flowchart TB
     end
 
     subgraph DAEMON["Trusted Workstation Daemon (oc_daemon · $STATE/registry.sqlite)"]
-        CTRL["oc_controller\n(WorkflowRunLease, InputLease, <1s Revoke)"]
+        CTRL["oc_controller\n(WorkflowRunLease, CalibrationReplayGrant, InputLease, <1s Revoke)"]
         WF["WorkflowEngine\n(Pinned workflow@1 Statechart + Awakeables)"]
-        MET["Metrics Collector\n(Broker/Quota/Hub/Cgroup/safe_run Rollups)"]
+        MET["Metrics Collector\n(Broker/Quota/Hub/Cgroup/Lazy safe_run Rollups)"]
         T0["Tier-0 Deterministic Guards\n(Sleep/Wake, 429, CPU, agent_wait, Correlated Coalesce)"]
-        THROT["Leading + Single-Trailing Throttler\n(Per-Lane + Fleet Outer Cap)"]
-        S1["Tier-1 System-1 Classifier\n(Zero Authority · /decisions/*)"]
+        THROT["Leading + Single-Trailing Throttler\n(Per-Lane + Fleet Cap + Reserved Audit Floor)"]
+        S1["Tier-1 System-1 Classifier\n(Zero Authority · Host-Internal /decisions/*)"]
         BLIND["Tier-2 Blind Real-Model Health Check\n(Stateless · 4 Closed Tools · Freshness Guard)"]
-        CAL["Calibration & Replay Store\n(TP / FP / TN / FN History)"]
+        CAL["Calibration & Replay Store\n(TP / FP / TN / FN History · Human-Gated Replay)"]
     end
 
-    subgraph BROKER["oc_broker_http + oc_hub"]
-        DEC["/decisions/* Route\n(gpt-6-luna / gemini-decision-1 / local-rules-v1)"]
-        HUB["oc_hub\n(CoordRole.WORKFLOW -> SYSTEM_ALERT, RoutingEdge)"]
+    subgraph HOST_BROKER["Host-Internal Supervision Broker (oc_daemon Only · Never Mounted in Containers)"]
+        DEC["/decisions/* + Blind-Check Upstream\n(ModelCatalog Adapters · HostVaultMemory · QuotaLedger)"]
+    end
+
+    subgraph JOB_BROKER["Container-Facing Broker & Hub"]
+        HUB["oc_hub + Container oc_broker_http\n(CoordRole.WORKFLOW -> SYSTEM_ALERT, RoutingEdge)"]
     end
 
     subgraph FLEET["Untrusted Sandboxes (Local Podman & REMOTE / NAME)"]
@@ -78,7 +81,9 @@ flowchart TB
         SB["Leaf Sandboxes\n(NAME / REMOTE / NAME)"]
     end
 
-    CHROME <--> CTRL & WF & TIERB & MET
+    TIERA <--> CTRL
+    TIERB <--> WF & CAL
+    TIERC <--> WF & MET
     WF --> HUB
     MET --> T0 & ORCH & TIERC
     T0 -->|"Ambiguous Stall / Anomaly"| S1
@@ -86,11 +91,12 @@ flowchart TB
     S1 -->|"Trigger Hint Only"| THROT
     T0 -->|"Scheduled Active-Lane Audit"| BLIND
     THROT -->|"At Most 1 Check / Window T"| BLIND
+    BLIND --> DEC
     BLIND -->|"Record TP/FP/TN/FN"| CAL
     BLIND -->|"Static Template Nudge (Freshness OK)"| HUB
     BLIND -->|"Persistent Escalation"| TIERB
     CAL -->|"Human-Triggered Drift Item"| TIERB
-    ORCH <-->|"0o700 UDS MCP"| WF & MET & TIERB & TIERC
+    ORCH <-->|"0o700 UDS MCP"| WF & MET & TIERB & TIERC & CAL
     HUB <--> SB
 ```
 
@@ -136,9 +142,16 @@ design notes, zero MIT code copied, zero Bash runtime adopted; see the extractio
    `oc_controller`'s **Approval Inbox (Tier A)**. Async workflow/PRD reviews and escalations live
    in the **Human Inbox (Tier B)** with zero approval/execution authority. Transient warnings live
    in the **Health Ribbon (Tier C)**.
-5. **Single ACID Revocation & Fencing Domain:** `WorkflowRunLease`, `CoordRole.WORKFLOW`
-   (`TrustClass.SYSTEM_ALERT`, rank `0`), workflow outbox intents, and `workflow_awakeables` live in
-   `$STATE/registry.sqlite` and participate in `oc_controller`'s unified `<1s` revocation cascade.
+5. **Single ACID Revocation, Degraded-Store Halt & Fencing Domain:** `WorkflowRunLease`,
+   `CalibrationReplayGrant`, `CoordRole.WORKFLOW` (`TrustClass.SYSTEM_ALERT`, coordinated
+   `oc_coord_contract.py` extension strictly below `OPERATOR_DIRECTIVE` and `cancel`), workflow
+   outbox intents, and role-fenced `workflow_awakeables` live in `$STATE/registry.sqlite`, halt
+   automatically whenever the store is degraded (`.coord_degraded` / unclean-shutdown seal), and
+   participate in `oc_controller`'s unified `<1s` revocation cascade.
+6. **Host-Internal Supervision Broker Isolation:** `/decisions/*` and blind real-model verifier
+   requests execute through a dedicated host-internal `oc_daemon`-only broker instance (reusing
+   `oc_broker_http`'s vault/DNS/canary/quota primitives)—never sharing the container-mounted
+   per-job `HostHttpBrokerServer` UDS listeners.
 
 ---
 
@@ -151,20 +164,20 @@ or is a **non-negotiable baseline invariant**:
 
 | # | Hidden Trap / Missing Requirement | Mitigation in Rank #1 | Approval / Decision Requirement | Where Specified |
 |---|---|---|---|---|
-| **T1** | **Prompt injection against System-1 classifier** (false-alert flood OR suppression attack blinding the classifier) | Zero-authority System-1; leading + single-trailing coalesced throttler; blind real-model verification; scheduled unalerted active-lane audits (defeats suppression); `noul("classifier_injection_suspected")` canary; bounded sanitized excerpts (`<= 512 B`). | **Mandatory security invariant** (no opt-out). **Runtime Approval Inbox** required to enable/widen `/decisions/*` routes or spend caps (`WorkflowRunLease`). | [prd_n2](prd_n2.md) |
-| **T2** | **Prompt injection against the System-2 blind health-check model** | Stateless single-turn host context (not full `-o`); closed 4-tool surface (`health_record_ok`, `health_nudge_lane(template_id)`, `health_escalate_human(category)`, `health_wake_orchestrator(reason_code)`); static host nudge templates only; `WorkflowRunLease` hard caps + `dedupe_key`. | **Mandatory security invariant** (no opt-out). **Design decision needed** on dedicated lightweight blind-check model profile vs. reusing `-o` model tier. | [prd_n2](prd_n2.md#concrete-checkboxes-and-open-decisions) |
-| **T3** | **Fleet-wide synchronized trigger burst** (10 compromised sandboxes all triggering at `t0`) | Per-lane leading+trailing throttler **plus** fleet-wide concurrency & rate-limit outer cap (round-robin queued). | **Mandatory security invariant**; fleet ceiling configurable in workflow/host policy (**Approval Inbox** to raise). | [prd_n2](prd_n2.md) |
-| **T4** | **Stale nudge after fast self-recovery vs. fair classifier FP scoring** | Score `TP/FP` on the **exact frozen point-in-time snapshot `S1`** System-1 saw, **then** run a deterministic host **freshness guard** before executing any nudge/escalation (suppressing stale action if lane self-recovered, while preserving `TP` accuracy credit). Trailing boundary recheck evaluates fresh `S_now` while logging suppressed burst snapshots separately. | **Mandatory behavioral invariant** (no runtime approval per check; prevents false FP penalty and prevents stale nudges). | [prd_n2](prd_n2.md) |
-| **T5** | **"Polite ack" false progress resets** (nudged agent replies `"Got it, continuing!"` without advancing code/tests) | Reset incident stall timer & nudge count **only** on host-verified progress (new commit SHA via `safe_run`, changed diff hash, verified test/tool-hash transition, or workflow state advance)—never on chat text alone. | **Mandatory invariant** (zero opt-out in builtin supervisor). | [prd_n2](prd_n2.md) |
+| **T1** | **Prompt injection against System-1 classifier** (false-alert flood OR suppression attack blinding the classifier) | Zero-authority System-1; host-internal `/decisions/*` broker (never container-mounted); leading + single-trailing coalesced throttler; blind real-model verification; scheduled unalerted active-lane audits (defeats suppression); `noul("classifier_injection_suspected")` canary (positive canary strips excerpt & re-evaluates on numeric metrics rather than defaulting to healthy); bounded sanitized excerpts (`<= 512 B`). | **Mandatory security invariant** (no opt-out). **Runtime Approval Inbox** required to enable/widen `/decisions/*` routes or spend caps (`WorkflowRunLease`). | [prd_n2](prd_n2.md) |
+| **T2** | **Prompt injection against the System-2 blind health-check model** | Stateless single-turn host context (not full `-o`); closed 4-tool surface (`health_record_ok`, `health_nudge_lane(template_id)`, `health_escalate_human(category)`, `health_wake_orchestrator(reason_code)`); static host nudge templates (literal single-pass substitution, zero untrusted text); 128-bit nonce framing for any untrusted excerpt in dossiers/TOON/calibration; `WorkflowRunLease` hard caps + `dedupe_key`. | **Mandatory security invariant** (no opt-out). **Design decision needed** on dedicated lightweight blind-check model profile vs. reusing `-o` model tier. | [prd_n2](prd_n2.md#concrete-checkboxes-and-open-decisions) |
+| **T3** | **Fleet-wide synchronized trigger burst & audit starvation** (10 compromised sandboxes all triggering at `t0`) | Per-lane leading+trailing throttler **plus** fleet-wide concurrency & hourly cap (round-robin queued) **plus** a dedicated non-starvable audit floor (`fleet_audit_checks_per_hour`) reserved for scheduled unalerted `FN` audits. | **Mandatory security invariant**; fleet ceiling configurable in workflow/host policy (**Approval Inbox** to raise). | [prd_n2](prd_n2.md) |
+| **T4** | **Stale nudge after fast self-recovery vs. fair classifier FP scoring** | Score `TP/FP` on the **exact frozen point-in-time snapshot `S1`** System-1 saw, **then** run a deterministic host **freshness guard** before executing any nudge/escalation (suppressing stale action if lane self-recovered, while preserving `TP` accuracy credit). Trailing boundary recheck evaluates fresh `S_now` and is excluded from System-1 `TP/FP` scoring (unless shadow-scored). | **Mandatory behavioral invariant** (no runtime approval per check; prevents false FP penalty and prevents stale nudges). | [prd_n2](prd_n2.md) |
+| **T5** | **"Polite ack" false progress resets** (nudged agent replies `"Got it, continuing!"` without advancing code/tests) | Reset incident stall timer & nudge count **only** on host-verified progress (new commit SHA via lazy `safe_run`, changed diff hash, verified test/tool-hash transition, or workflow state advance)—never on chat text alone. | **Mandatory invariant** (zero opt-out in builtin supervisor). | [prd_n2](prd_n2.md) |
 | **T6** | **Workstation laptop sleep/suspend thundering herd** (lid closed 8h falsely triggers 8h stall on every lane) | Detect `wall_delta - monotonic_delta > 30s` in `oc_daemon`; enter wake grace window (default `120s`), re-probe worker/SSH liveness first, and exclude host-sleep intervals from dwell-time metrics. | **Mandatory invariant**; grace window duration configurable (default `120s`, no approval needed unless widening limits). | [prd_n2](prd_n2.md) |
-| **T7** | **TOCTOU on async Human Inbox reviews** (agent pushes `def456` while human reviews PRD gate at `abc123`) | Bind every actionable Human Inbox gate to `(expected_commit_sha / expected_artifact_digest, workflow_seq)`; atomic re-check on operator click fails closed (`TARGET_CHANGED`) and refreshes card with new SHA. | **Mandatory security invariant** for all review/approval gates. | [prd_n3](prd_n3.md) |
+| **T7** | **TOCTOU on async Human Inbox reviews** (agent pushes `def456` while human reviews PRD gate at `abc123`, or right after click) | Bind every actionable Tier-B Human Inbox gate to `(expected_commit_sha, expected_tree_oid, expected_artifact_digest, expected_workflow_seq)`; on operator click run an immediate containerized `safe_run` `git rev-parse HEAD` / `:ro` spool digest check right before committing `HumanDecisionReceipt` (`TARGET_CHANGED` fails closed), and pass the pinned SHA/digest into downstream workflow bindings (never floating `HEAD`). | **Mandatory security invariant** for all review/approval gates. | [prd_n3](prd_n3.md) |
 | **T8** | **Correlated fleet-outage inbox storms** (provider `503` or dropped remote SSH host stalls 8 lanes at once) | Tier-0 correlated-fault coalescer groups by `(provider_route, remote_worker, error_class)` and emits **one** fleet-scoped Tier-B Inbox item referencing all affected lanes. | **Mandatory UX/anti-spam invariant**. | [prd_n2](prd_n2.md), [prd_n3](prd_n3.md) |
-| **T9** | **Multi-workflow contention & fighting the human's keyboard** | Single-owner lane lease (`owner_workflow_id`) in SQLite (global watchdogs send advisory signals to owning workflow rather than nudging directly); auto-suspend supervision whenever `oc_controller` holds an active human `InputLease` on that sandbox. | **Mandatory safety invariant** (respects `prd_m3` `InputLease`). | [prd_n1](prd_n1.md) |
-| **T10** | **Long-running workflow hot-reload / mid-run versioning** (editing `workflow@1` TOML while a run is 12h in) | Running instances pin immutable `spec_digest` (`workflow_spec_snapshots`). Edits apply to new runs; explicit `workflow migrate` allowed only at quiescent safe-points. | **Mandatory durability invariant**; **Runtime Approval Inbox** required to publish revised `workflow@1` TOML (`config_propose_revision`) or migrate with widened autonomy. | [prd_n1](prd_n1.md) |
-| **T11** | **Unbiased `FN` sampling & sampling-adjusted miss-rate math** | Run scheduled blind audits only on active lanes (not idle/parked); have System-1 score the exact audit snapshot; display both raw counts (`TP/FP/TN/FN`) and sampling-adjusted miss rate on dashboard. | **Design decision needed** on default audit cadence & optional near-threshold stratification. | [prd_n2](prd_n2.md#concrete-checkboxes-and-open-decisions) |
-| **T12** | **Classifier drift calibration & config thrash** | Default is **human-triggered only**: drift over minimum sample floor posts a non-blocking **Human Inbox (Tier B)** alert; operator triggers `-o` to inspect `calibration_examples_query`, run `workflow_calibration_replay` (before/after confusion-matrix diff), and submit `config_propose_revision` → **Runtime `Approval Inbox` (Tier A)** before changing live workflow/sandbox configs. | **Requires explicit human trigger** (Tier B) + **Runtime Approval Inbox** (Tier A) for every config mutation. | [prd_n2](prd_n2.md) |
-| **T13** | **Daemon restart re-authorization ergonomics** (invalidating in-memory `WorkflowRunLease`s on restart) | `observe_only` runs auto-resume; active `nudge_bounded` / metered runs pause on restart and present a single batched **"Resume N paused workflows"** card in **Approval Inbox (Tier A)**. | **Runtime Approval Inbox** (Tier A) after restart unless user explicitly opts into a scoped durable lease policy (**Design decision needed**). | [prd_n1](prd_n1.md#concrete-checkboxes-and-open-decisions) |
-| **T14** | **SQLite metrics write amplification** (high-frequency SSE token chunks thrashing WAL) | Aggregate high-frequency telemetry in memory inside `oc_daemon` and flush rolled-up buckets to `metrics_rollups` every `5–10s`, pruned to a bounded ring (e.g., 7–30 days). | **Mandatory implementation invariant**. | [prd_n2](prd_n2.md) |
+| **T9** | **Multi-workflow contention, supervisor self-disablement & fighting the human's keyboard** | Single-owner lane lease `(sandbox_addr, incarnation_id, owner_workflow_run_id)` in SQLite; `-o` cannot pause/stop/signal operator-owned supervisors; `workflow_awakeables` role-fenced (`OPERATOR_ONLY` never exposed to `-o`); auto-suspend supervision whenever `oc_controller` holds an active human `InputLease` on that sandbox. | **Mandatory safety invariant** (respects `prd_m3` `InputLease`). | [prd_n1](prd_n1.md), [prd_n3](prd_n3.md) |
+| **T10** | **Long-running workflow hot-reload / mid-run versioning** (editing `workflow@1` TOML while a run is 12h in) | Running instances pin immutable `spec_digest` (`workflow_spec_snapshots`). Edits apply to new runs; explicit `workflow migrate` allowed only at quiescent safe-points. Complete `SECURITY_DELTA_TRIGGERS` cover templates, rubrics/predicates, default surfaces, routes, autonomy, and factories. | **Mandatory durability invariant**; **Runtime Approval Inbox** required to publish revised `workflow@1` TOML (`config_propose_revision`) or migrate with widened autonomy. | [prd_n1](prd_n1.md) |
+| **T11** | **Unbiased `FN` sampling & sampling-adjusted miss-rate math** | Run scheduled blind audits only on active lanes (not idle/parked) under a reserved non-starvable fleet audit floor; have System-1 score the exact audit snapshot; display both raw counts (`TP/FP/TN/FN`) and sampling-adjusted miss rate on dashboard. | **Design decision needed** on default audit cadence & optional near-threshold stratification. | [prd_n2](prd_n2.md#concrete-checkboxes-and-open-decisions) |
+| **T12** | **Classifier drift calibration, unleased replay spend & config thrash** | Default is **human-triggered only**: drift over minimum sample floor posts a non-blocking **Human Inbox (Tier B)** alert; operator action mints a short-TTL, route-pinned, `QuotaLedger`-capped `CalibrationReplayGrant` enabling `-o` to inspect nonce-framed `calibration_examples_query`, run `OverlapCanaryScanner`-checked `workflow_calibration_replay`, and submit `config_propose_revision` -> **Runtime `Approval Inbox` (Tier A)** before changing live workflow/sandbox configs. | **Requires explicit human trigger** (Tier B + `CalibrationReplayGrant`) + **Runtime Approval Inbox** (Tier A) for every config mutation. | [prd_n2](prd_n2.md) |
+| **T13** | **Daemon restart re-authorization, degraded-store halt & budget exhaustion** | `observe_only` runs auto-resume (rate/concurrency-capped); active/metered runs pause on restart for a batched **"Resume N paused workflows"** card in **Approval Inbox (Tier A)**. Any `.coord_degraded` / unclean-shutdown state halts `WorkflowEngine` completely until `confirm_recovery()`. Spend exhaustion falls back to Tier-0 deterministic monitoring + Tier-B notice. | **Runtime Approval Inbox** (Tier A) after restart unless user explicitly opts into a scoped durable lease policy (**Design decision needed**). | [prd_n1](prd_n1.md#concrete-checkboxes-and-open-decisions) |
+| **T14** | **SQLite metrics write amplification & container-probe thrash** | Aggregate high-frequency telemetry in memory inside `oc_daemon` and flush rolled-up buckets to `metrics_rollups` every `5–10s` (pruned ring). Run containerized `safe_run` git probes lazily/on-demand (per-lane concurrency `1`, hard timeout) rather than every `60s` tick. | **Mandatory implementation invariant**. | [prd_n2](prd_n2.md) |
 
 ---
 
