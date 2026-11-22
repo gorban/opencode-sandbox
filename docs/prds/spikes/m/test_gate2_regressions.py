@@ -3711,5 +3711,171 @@ class TestReciprocalRound9Fixes(CoordTestBase):
         self.assertEqual(res["events"], [])
 
 
+class TestReciprocalRound10Fixes(CoordTestBase):
+    """Red/green regressions for the four boundary findings on b01543f9."""
+
+    _open_pair = TestReciprocalRound6Fixes._open_pair
+    _reg_sb = staticmethod(TestReciprocalRound6Fixes._reg_sb)
+    _wait_until = staticmethod(TestReciprocalRound6Fixes._wait_until)
+
+    def test_r10_p1_1_revoke_retry_worker_start_failure_does_not_strand_detached_lease(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        lease = BrokerLease("job_strand_r10")
+        self._reg_sb(hub, _OP, "sb-r10s", "inc_s1", lease=lease)
+        self._reg_sb(hub, _OP, "sb-r10d", "inc_d1")
+        hub.grant_edge(_OP, src_actor="sb-r10s", src_incarnation="inc_s1", dst_addr="sb-r10d")
+
+        started = threading.Event()
+        never_done = threading.Event()
+        self.addCleanup(never_done.set)
+        transport.queue_script(
+            "sb-r10d", TurnScript(on_stream_started=started, block_event=never_done)
+        )
+        src_ctx = PrincipalCtx(
+            CoordRole.JOB, "jr10", sandbox_addr="sb-r10s", incarnation_id="inc_s1"
+        )
+        hub.send(src_ctx, target="sb-r10d", body_text="Held outbound turn")
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(started.wait(timeout=1.0))
+
+        orig_abort_stream = transport.abort_stream
+        fail_abort_stream = {"on": True}
+
+        def _flaky_abort_stream(stream_id: str, *, reason: str) -> bool:
+            if fail_abort_stream["on"]:
+                return False
+            return orig_abort_stream(stream_id, reason=reason)
+
+        orig_start = threading.Thread.start
+
+        def _fail_worker_start(thr: threading.Thread) -> None:
+            if getattr(thr, "_target", None) == hub._run_cleanup_retry_loop:
+                raise RuntimeError("retry_worker_start_failed")
+            orig_start(thr)
+
+        transport.abort_stream = _flaky_abort_stream  # type: ignore[method-assign]
+        with (
+            mock.patch.object(threading.Thread, "start", _fail_worker_start),
+            self.assertRaises(RuntimeError),
+        ):
+            hub.revoke(_OP, target="sb-r10s", reason="revoke_with_worker_start_err")
+
+        # Detached lease MUST already be revoked (not stranded active!), hub degraded, stream retained
+        self.assertTrue(hub._is_lease_locally_revoked(lease))
+        self.assertTrue(hub.is_degraded)
+        self.assertTrue(bool(hub._pending_cleanup_streams))
+
+        fail_abort_stream["on"] = False
+        hub.confirm_recovery(_OP, reason="recovered_after_worker_start_err")
+        self.assertFalse(hub.is_degraded)
+        self.assertEqual(hub._pending_cleanup_streams, {})
+
+    def test_r10_p1_2_peer_turn_on_minimal_transport_rejected_without_abort_stream(
+        self,
+    ) -> None:
+        inner = FakeWorkerTransport()
+        proxy = _NoAbortStreamTransport(inner)
+        reg, _transport, hub = self._open_pair(transport=proxy)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-p1", "inc_p1")
+        self._reg_sb(hub, _OP, "sb-p2", "inc_p2")
+        hub.grant_edge(_OP, src_actor="sb-p1", src_incarnation="inc_p1", dst_addr="sb-p2")
+        p1_ctx = PrincipalCtx(CoordRole.JOB, "jp1", sandbox_addr="sb-p1", incarnation_id="inc_p1")
+        msg_p = hub.send(p1_ctx, target="sb-p2", body_text="Peer turn needs abort_stream")[
+            "msg_id"
+        ]
+
+        with self.assertRaises(CoordPolicyError):
+            hub.dispatch_once(async_stream=True)
+        self.assertEqual(inner.dispatched_turns("sb-p2"), [])
+        self.assertIn(msg_p, {r["msg_id"] for r in reg.list_outbox(statuses=("pending",))})
+
+    def test_r10_p2_3_stalled_pre_join_cleanup_drain_respects_close_deadline(
+        self,
+    ) -> None:
+        reg, _transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        lease = BrokerLease("job_prejoin_r10")
+        self._reg_sb(hub, _OP, "sb-pj", "inc_pj1", lease=lease)
+
+        in_drain = threading.Event()
+        release_drain = threading.Event()
+        self.addCleanup(release_drain.set)
+        orig_revoke = lease.revoke
+
+        def _stalled_revoke() -> None:
+            if not release_drain.is_set():
+                in_drain.set()
+                release_drain.wait(timeout=2.0)
+            orig_revoke()
+
+        lease.revoke = _stalled_revoke  # type: ignore[method-assign]
+        # Enqueue lease directly in pending cleanups (e.g. from prior failed revoke)
+        hub._record_pending_cleanup_lease(lease)
+
+        t0 = time.monotonic()
+        with self.assertRaises(CoordPolicyError):
+            hub.close(timeout_s=0.05)
+        elapsed = time.monotonic() - t0
+        self.assertTrue(in_drain.is_set())
+        self.assertLess(elapsed, 0.35)
+        self.assertTrue(hub._session_active_marker.exists())
+        self.assertGreaterEqual(hub._state_lock_fd, 0)
+        self.assertIn(lease, hub._pending_cleanup_leases)
+
+        release_drain.set()
+        hub.close(timeout_s=1.0)
+        self.assertTrue(hub._is_lease_locally_revoked(lease))
+        self.assertFalse(hub._session_active_marker.exists())
+
+    def test_r10_p2_4_recovery_settles_streams_when_abort_incarnation_purges_stream_handles(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self._reg_sb(hub, _OP, "sb-pg", "inc_pg1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-pg")
+
+        started = threading.Event()
+        never_done = threading.Event()
+        self.addCleanup(never_done.set)
+        transport.queue_script(
+            "sb-pg", TurnScript(on_stream_started=started, block_event=never_done)
+        )
+        hub.send(_OP, target="sb-pg", body_text="Held turn before purging abort_incarnation")
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(started.wait(timeout=1.0))
+
+        orig_abort_inc = transport.abort_incarnation
+
+        def _purging_abort_incarnation(
+            sandbox_addr: str, incarnation_id: str, *, reason: str
+        ) -> bool:
+            res = orig_abort_inc(sandbox_addr, incarnation_id, reason=reason)
+            # Simulate a transport that removes stream handles during abort_incarnation so abort_stream returns False
+            with transport._lock:
+                for sid in tuple(transport._streams):
+                    st = transport._streams[sid]
+                    if (
+                        st.turn.sandbox_addr == sandbox_addr
+                        and st.turn.incarnation_id == incarnation_id
+                    ):
+                        transport._streams.pop(sid, None)
+            return res
+
+        transport.abort_incarnation = _purging_abort_incarnation  # type: ignore[method-assign]
+        hub._mark_degraded("purging_transport_degrade")
+        hub.confirm_recovery(_OP, reason="purging_transport_recovered")
+        self.assertFalse(hub.is_degraded)
+        self.assertEqual(hub._pending_cleanup_streams, {})
+        hub.close(timeout_s=1.0)
+        self.assertFalse(hub._session_active_marker.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

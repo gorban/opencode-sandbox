@@ -1058,6 +1058,7 @@ class CoordHub:
             self._pending_cleanup_streams: dict[str, tuple[str, str, str]] = {}
             self._cleanup_state: _RequestMonitorState | None = None
             self._retired_cleanup_states: set[_RequestMonitorState] = set()
+            self._pre_join_drain_thread: threading.Thread | None = None
             self._settlement_thread: threading.Thread | None = None
             self._settlement_error: Exception | None = None
             self._watchdog_threads: set[threading.Thread] = set()
@@ -1259,6 +1260,18 @@ class CoordHub:
                 if lease in self._pending_cleanup_leases:
                     self._pending_cleanup_leases.remove(lease)
 
+    def _settle_recovery_streams_for_incarnation_locked(
+        self, sb_addr: str, inc_id: str
+    ) -> None:
+        """Settle recovery stream handles covered by a successful terminal incarnation abort."""
+        covered = [
+            sid
+            for sid, (dst_addr, dst_inc, st_reason) in self._pending_cleanup_streams.items()
+            if dst_addr == sb_addr and dst_inc == inc_id and st_reason == _REASON_RECOVERY_RETIRED
+        ]
+        for sid in covered:
+            self._pending_cleanup_streams.pop(sid, None)
+
     def _drain_pending_cleanup_incarnations(self) -> None:
         with self._meta_lock:
             items = tuple(self._pending_cleanup_incarnations.items())
@@ -1269,6 +1282,7 @@ class CoordHub:
                 continue
             with self._meta_lock:
                 self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
+                self._settle_recovery_streams_for_incarnation_locked(sb_addr, inc_id)
 
     def _settle_stream_without_abort_stream(
         self, dst_addr: str, dst_inc: str, reason: str
@@ -1694,12 +1708,43 @@ class CoordHub:
         if not settled:
             raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
 
+    def _run_pre_join_cleanup_drain(self) -> None:
+        try:
+            self._drain_pending_cleanups()
+        finally:
+            with self._meta_lock:
+                if self._pre_join_drain_thread is threading.current_thread():
+                    self._pre_join_drain_thread = None
+
+    def _drain_pending_cleanups_bounded(self, deadline: float) -> bool:
+        with self._meta_lock:
+            worker = self._pre_join_drain_thread
+            if worker is None:
+                if not self._has_pending_cleanups_locked():
+                    return True
+                worker = threading.Thread(target=self._run_pre_join_cleanup_drain, daemon=True)
+                self._pre_join_drain_thread = worker
+                should_start = True
+            else:
+                should_start = False
+        if should_start:
+            try:
+                worker.start()
+            except Exception:
+                with self._meta_lock:
+                    if self._pre_join_drain_thread is worker:
+                        self._pre_join_drain_thread = None
+                raise
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        return not worker.is_alive()
+
     def _drain_producers_and_streams(self, deadline: float) -> None:
         pump_ok = self.dispatcher.stop_pump(deadline)
         fg_ok = self._wait_fg_ops(deadline)
         if not pump_ok or not fg_ok:
             raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
-        self._drain_pending_cleanups()
+        if not self._drain_pending_cleanups_bounded(deadline):
+            raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
         streams_ok = self.dispatcher.join_streams(deadline)
         if not streams_ok:
             raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
@@ -3122,13 +3167,22 @@ class CoordHub:
                     req_ids.add(src_sb.controller_request_id)
         return frozenset(r for r in req_ids if not r.startswith(_EPHEMERAL_LEASE_PREFIX))
 
-    def _prepare_turn_monitors(self, req_ids: frozenset[str]) -> None:
-        if not req_ids:
-            return
-        if not callable(getattr(self._transport, "abort_stream", None)):
+    def _prepare_turn_monitors(
+        self, req_ids: frozenset[str], *, require_stream_abort: bool = False
+    ) -> None:
+        if (req_ids or require_stream_abort) and not callable(
+            getattr(self._transport, "abort_stream", None)
+        ):
             raise CoordPolicyError(_ERR_MISSING_STREAM_ABORT)
         for req_id in sorted(req_ids):
             self._ensure_controller_monitor(req_id)
+
+    @staticmethod
+    def _requires_independent_sender_abort(edge: RoutingEdge | None, dst_addr: str) -> bool:
+        if edge is None:
+            return False
+        src_addr = _sandbox_addr_from_actor(edge.src_actor)
+        return src_addr is not None and src_addr != dst_addr
 
     def _dispatch_single_row(self, row: dict[str, Any], *, async_stream: bool) -> bool:
         msg_id = str(row["msg_id"])
@@ -3159,8 +3213,9 @@ class CoordHub:
             if liveness != "live":
                 return False
             req_ids = self._collect_turn_req_ids(dst_addr, edge)
+            needs_stream_abort = self._requires_independent_sender_abort(edge, dst_addr)
             try:
-                self._prepare_turn_monitors(req_ids)
+                self._prepare_turn_monitors(req_ids, require_stream_abort=needs_stream_abort)
             except _AuthorityUnavailableError:
                 return False
             with self._meta_lock:
@@ -3783,6 +3838,7 @@ class CoordHub:
         target_addr: str,
         incarnation_id: str | None,
         edges: Sequence[RoutingEdge],
+        reason: str,
     ) -> tuple[list[tuple[str, str]], list[str], list[_WaiterState], BrokerLease | None]:
         edge_ids = sorted(e.edge_id for e in edges)
         fences = [self._get_grant_fence(eid) for eid in edge_ids]
@@ -3791,7 +3847,7 @@ class CoordHub:
             fence.acquire()
         try:
             detached_incarnations, outbound_sids, lease = self._detach_meta_for_target(
-                target_addr, incarnation_id, edges
+                target_addr, incarnation_id, edges, reason
             )
             with self._wait_cond:
                 detached_waiters = [
@@ -3812,6 +3868,7 @@ class CoordHub:
         target_addr: str,
         incarnation_id: str | None,
         edges: Sequence[RoutingEdge],
+        reason: str,
     ) -> tuple[list[tuple[str, str]], list[str], BrokerLease | None]:
         edge_id_set = {edge.edge_id for edge in edges}
         with self._meta_lock:
@@ -3825,28 +3882,43 @@ class CoordHub:
                     inc_set.add(auth.dst_incarnation)
                 elif auth.edge_id in edge_id_set:
                     self._stream_abort_reasons.setdefault(sid, _STATUS_REVOKED)
+                    self._pending_cleanup_streams.setdefault(
+                        sid, (auth.dst_addr, auth.dst_incarnation, reason)
+                    )
                     outbound_sids.append(sid)
             for inc_id in inc_set:
                 self._fenced_targets.add((target_addr, inc_id))
+                self._pending_cleanup_incarnations.setdefault((target_addr, inc_id), reason)
             for edge in edges:
                 self._fenced_generations.add((edge.edge_id, edge.grant_generation))
             lease = self._leases.pop(target_addr, None)
             cb = self._lease_callbacks.pop(target_addr, None)
+            if lease is not None and lease not in self._pending_cleanup_leases:
+                self._pending_cleanup_leases.append(lease)
         if lease is not None and cb is not None:
             lease.remove_revoke_callback(cb)
         return [(target_addr, inc_id) for inc_id in sorted(inc_set)], outbound_sids, lease
 
-    def _abort_detached_outbound_stream(self, sid: str, reason: str) -> bool:
-        if not callable(getattr(self._transport, "abort_stream", None)):
+    def _abort_detached_incarnation(self, sb_addr: str, inc_id: str, reason: str) -> bool:
+        try:
+            aborted = bool(self._transport.abort_incarnation(sb_addr, inc_id, reason=reason))
+        except Exception:
             return False
-        if self._try_abort_stream(sid, reason=reason):
-            return True
         with self._meta_lock:
-            auth = self._stream_authorities.get(sid)
-        if auth is not None:
-            self._record_pending_cleanup_stream(sid, auth.dst_addr, auth.dst_incarnation, reason)
-            self._ensure_cleanup_retry_worker()
-        return False
+            self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
+            self._settle_recovery_streams_for_incarnation_locked(sb_addr, inc_id)
+        return aborted
+
+    def _revoke_detached_lease(self, lease: BrokerLease | None) -> None:
+        if lease is None:
+            return
+        try:
+            lease.revoke()
+        except Exception:
+            return
+        with self._meta_lock:
+            if lease in self._pending_cleanup_leases:
+                self._pending_cleanup_leases.remove(lease)
 
     def _teardown_detached(
         self,
@@ -3857,29 +3929,21 @@ class CoordHub:
         reason: str,
     ) -> bool:
         aborted = False
-        needs_retry = False
         for sb_addr, inc_id in detached_incarnations:
-            try:
-                if self._transport.abort_incarnation(sb_addr, inc_id, reason=reason):
-                    aborted = True
-            except Exception:
-                self._record_pending_cleanup_incarnation(sb_addr, inc_id, reason)
-                needs_retry = True
-        for sid in outbound_sids:
-            if self._abort_detached_outbound_stream(sid, reason):
+            if self._abort_detached_incarnation(sb_addr, inc_id, reason):
                 aborted = True
+        for sid in outbound_sids:
+            if self._try_abort_stream(sid, reason=reason):
+                aborted = True
+                with self._meta_lock:
+                    self._pending_cleanup_streams.pop(sid, None)
         if detached_waiters:
             try:
                 self._notify_waiters()
             except Exception:
                 pass
-        if lease is not None:
-            try:
-                lease.revoke()
-            except Exception:
-                self._record_pending_cleanup_lease(lease)
-                needs_retry = True
-        if needs_retry:
+        self._revoke_detached_lease(lease)
+        if self._has_pending_cleanups():
             self._ensure_cleanup_retry_worker()
         return aborted
 
@@ -3940,7 +4004,7 @@ class CoordHub:
 
         # Step 1: Fence target & grant generations in memory and detach streams + waiters.
         detached_incarnations, outbound_sids, detached_waiters, lease = self._fence_target_in_memory(
-            addr, incarnation_id, edges
+            addr, incarnation_id, edges, clean_reason
         )
 
         # Step 2: OUTSIDE DB, nonblocking, fault-isolated teardown of streams, waiters, lease.
