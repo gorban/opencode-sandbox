@@ -18,7 +18,7 @@ import tempfile
 import warnings
 
 
-MODULES = ('core_coverage', 'sonar_exec', 'sonar_checkout', 'sonar_cloud',
+MODULES = ('core_coverage', 'sonar_exec', 'sonar_checkout', 'sonar_cloud', 'sonar_http',
            'sonar_coverage', 'sonar_sandbox', 'sonar_state')
 SHA = re.compile(r'[0-9a-f]{40}')
 PUBLISHER_FILES = ('.sonarcloud.properties', *(f'tools/ci/{module}.py' for module in MODULES))
@@ -203,7 +203,7 @@ def publish(opts, root, state, config):
     required = checkout.changed_cores(source, git_env, merge_base, revision, wheel.CORES)
     measurement = root / 'measure'
     measurement.mkdir(mode=0o700)
-    sandbox.measurement_inputs(measurement, wheel, cloud.download(wheel.WHEEL, 300_000))
+    sandbox.measurement_inputs(measurement, wheel, cloud.download(wheel.WHEEL, 300_000, mode='wheel'))
     print(f'Measuring coverage for {revision.head} without credentials.', flush=True)
     with sandbox.private_store(root / 'measure-store') as store:
         raw = sandbox.measure(store, source, measurement, wheel)

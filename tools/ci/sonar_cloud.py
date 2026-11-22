@@ -3,14 +3,15 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
+from pathlib import Path
 import re
+import sys
 import time
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlencode, urlsplit
-from urllib.request import Request, urlopen
 
 from sonar_checkout import REPOSITORY
-from sonar_exec import PublishError
+from sonar_exec import PublishError, capture
 
 
 ORGANIZATION = 'gorban'
@@ -22,13 +23,17 @@ SKEW = timedelta(seconds=10)
 METRICS = 'lines_to_cover,uncovered_lines,conditions_to_cover,uncovered_conditions'
 
 
-def download(url, limit):
-    req = Request(url, headers={'User-Agent': 'opencode-sandbox-sonar-publisher', 'Accept': 'application/json'})
-    with urlopen(req, timeout=12) as response:
-        data = response.read(limit + 1)
-    if len(data) > limit:
-        raise PublishError('Remote response exceeded the byte limit')
-    return data
+def download(url, limit, *, mode='api'):
+    tooling = Path(__file__).resolve().parent
+    status, body, diagnostic = capture(
+        [sys.executable, '-IB', str(tooling / 'sonar_http.py'), url, str(limit), mode],
+        cwd=tooling, env={'PATH': '/usr/bin:/bin', 'LANG': 'C'}, timeout=12, limit=limit + 8,
+    )
+    if status == 1 and re.fullmatch(rb'[345][0-9]{2}\n', diagnostic):
+        raise HTTPError(url, int(diagnostic), 'Publisher API request failed', None, None)
+    if status or diagnostic or len(body) > limit:
+        raise PublishError('Publisher API request failed or exceeded the response limits')
+    return body
 
 
 def github(endpoint):
@@ -128,6 +133,7 @@ def verify_metrics(revision, expected, required):
             result = sonar('measures/component', component=f'{PROJECT}:{path}', metricKeys=METRICS,
                            **context(revision))['component']
         except HTTPError as error:
+            error.close()
             if error.code == 404 and path not in required:
                 continue
             raise
