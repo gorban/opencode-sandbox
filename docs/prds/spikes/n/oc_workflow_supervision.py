@@ -85,7 +85,7 @@ _CANARY_PREFIX_RE = re.compile(
     r"|begin\s+[a-z0-9 ]*private\s+key"
     r")"
 )
-_UNTRUSTED_TAG_RE = re.compile(r"<(\s*/?\s*oc-untrusted-data)", re.IGNORECASE)
+_UNTRUSTED_TAG_RE = re.compile(r"<[ \t\r\n]*(?:/[ \t\r\n]*)?oc-untrusted-data", re.IGNORECASE)
 _CONTROL_STRIP_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
@@ -192,7 +192,7 @@ class MetricSnapshot:
 def frame_untrusted_excerpt(text: str) -> str:
     """Wrap permitted untrusted excerpt in 128-bit random-nonce breakout-escaped framing."""
     nonce = secrets.token_hex(16)
-    escaped = _UNTRUSTED_TAG_RE.sub(r"&lt;\1", text)
+    escaped = _UNTRUSTED_TAG_RE.sub(lambda m: "&lt;" + m.group(0)[1:], text)
     return f'<oc-untrusted-data nonce="{nonce}">{escaped}</oc-untrusted-data nonce="{nonce}">'
 
 

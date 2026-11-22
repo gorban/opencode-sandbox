@@ -432,9 +432,25 @@ class TestWorkflowSchemaAndAst(unittest.TestCase):
         )
 
 
+def _trusted_temp_dir() -> tempfile.TemporaryDirectory[str]:
+    """Create a disposable tempdir under a root- or owner-owned parent (safe inside distrobox)."""
+    env_tmp = os.environ.get("TMPDIR")
+    if env_tmp:
+        try:
+            st = os.stat(env_tmp)
+            if st.st_uid in (0, os.getuid()):
+                return tempfile.TemporaryDirectory(dir=env_tmp)
+        except OSError:
+            pass
+    base = Path.home().resolve() / ".cache" / "oc-sandbox-spike-n-tests"
+    base.mkdir(parents=True, exist_ok=True)
+    os.chmod(base, 0o700)
+    return tempfile.TemporaryDirectory(dir=str(base))
+
+
 class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = _trusted_temp_dir()
         self.root = Path(self._tmp.name)
         os.chmod(self.root, 0o700)
         self.staging = self.root / "staging"

@@ -345,17 +345,7 @@ def _scalar_type_tag(val: _ScalarValue) -> str:
     raise PredicateValidationError(f"unsupported scalar type {type(val).__name__}")
 
 
-def _extract_literal_scalar(node: ast.AST, *, allow_usub: bool = True) -> _ScalarValue:
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        if not allow_usub or not isinstance(node.operand, ast.Constant):
-            raise PredicateValidationError("unary '-' permitted only once directly on a numeric literal")
-        inner = _extract_literal_scalar(node.operand, allow_usub=False)
-        if _scalar_type_tag(inner) != "num":
-            raise PredicateValidationError("unary '-' permitted only on numeric literals")
-        return -inner  # type: ignore[operator]
-    if not isinstance(node, ast.Constant):
-        raise PredicateValidationError("expected scalar literal")
-    val = node.value
+def _extract_constant_scalar(val: Any) -> _ScalarValue:
     if type(val) is bool or type(val) is int:
         return val
     if isinstance(val, float):
@@ -368,6 +358,19 @@ def _extract_literal_scalar(node: ast.AST, *, allow_usub: bool = True) -> _Scala
         except WorkflowSchemaError as exc:
             raise PredicateValidationError(str(exc)) from exc
     raise PredicateValidationError(f"unsupported literal type {type(val).__name__}")
+
+
+def _extract_literal_scalar(node: ast.AST, *, allow_usub: bool = True) -> _ScalarValue:
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        if not allow_usub or not isinstance(node.operand, ast.Constant):
+            raise PredicateValidationError("unary '-' permitted only once directly on a numeric literal")
+        inner = _extract_constant_scalar(node.operand.value)
+        if _scalar_type_tag(inner) != "num":
+            raise PredicateValidationError("unary '-' permitted only on numeric literals")
+        return -inner  # type: ignore[operator]
+    if not isinstance(node, ast.Constant):
+        raise PredicateValidationError("expected scalar literal")
+    return _extract_constant_scalar(node.value)
 
 
 class _PredicateValidator:

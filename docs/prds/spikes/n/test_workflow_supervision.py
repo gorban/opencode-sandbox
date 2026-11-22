@@ -7,7 +7,6 @@ import json
 import math
 import os
 import sys
-import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,7 +55,7 @@ from oc_workflow_supervision import (
     run_calibration_replay,
     run_scheduled_audit,
 )
-from test_workflow_schema_and_plan import _make_skill_tree, _sample_catalog, _supervisor_toml
+from test_workflow_schema_and_plan import _make_skill_tree, _sample_catalog, _supervisor_toml, _trusted_temp_dir
 
 
 def _fp(commit: str = "aaa111", tree: str = "ttt111", test_seq: int = 1) -> ProgressFingerprint:
@@ -118,7 +117,7 @@ class _Harness:
 
 class TestSupervisionCore(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = _trusted_temp_dir()
         self.root = Path(self._tmp.name)
         os.chmod(self.root, 0o700)
         self.skill_root = _make_skill_tree(self.root, "builtin", "firstmate-guide", b"# Guide\n")
