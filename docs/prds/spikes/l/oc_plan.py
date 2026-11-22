@@ -545,7 +545,7 @@ def _bind_bundle_mcp_entry(mcfg: dict[str, Any], remote_bindings: dict[str, str]
             effective_cfg["url"] = mcfg["local"]["url"]
             effective_cfg["_is_remote"] = False
     elif mcfg["type"] == "remote":
-        effective_cfg["_is_remote"] = not (mcfg["url"] or "").startswith("http://127.0.0.1:")
+        effective_cfg["_is_remote"] = not (mcfg["url"] or "").lower().startswith("http://127.0.0.1:")
     else:
         effective_cfg["_is_remote"] = False
     return effective_cfg
@@ -850,8 +850,10 @@ def _compile_local_mcp_entry(
     if cred_delivery == "host-brokered":
         raise PolicyError(f"Local MCP {mname!r} cannot use credential_delivery='host-brokered'")
     if cred_delivery == "raw-container-mount":
+        if mcfg["type"] != "pinned-artifact":
+            raise PolicyError(f"Pod-local MCP {mname!r} cannot use credential_delivery='raw-container-mount'")
         _require_raw_mount_breakglass(f"mcp:{mname}", tier, allow_raw_remote_mounts, active_raw_remote_mounts)
-    lcfg = mcfg.get("local")
+    lcfg = mcfg.get("local") if mcfg["type"] != "pinned-artifact" else None
     use_local = lcfg is not None and (lcfg["headers"] or lcfg["secret_env"])
     src = lcfg if use_local else mcfg
     return {
@@ -982,6 +984,12 @@ def _merge_bundle_broker_services(bundles: list[dict[str, Any]]) -> dict[str, di
     return merged
 
 
+def _set_broker_client_env(env_map: dict[str, str], key: str, value: str) -> None:
+    if key in env_map and env_map[key] != value:
+        raise PlanError(f"Conflicting broker_client_env variable {key!r}")
+    env_map[key] = value
+
+
 def _compile_broker_http_entry(
     name: str,
     cfg: dict[str, Any],
@@ -1008,9 +1016,9 @@ def _compile_broker_http_entry(
     }
     if cred_delivery == "host-brokered":
         proxy_url = f"http://{sandbox_broker_host}:{broker_http_port}/http/{name}"
-        broker_client_env[f"OC_BROKER_HTTP_{name.upper().replace('-', '_')}_URL"] = proxy_url
+        _set_broker_client_env(broker_client_env, f"OC_BROKER_HTTP_{name.upper().replace('-', '_')}_URL", proxy_url)
         if cfg.get("client_env_var"):
-            broker_client_env[cfg["client_env_var"]] = proxy_url
+            _set_broker_client_env(broker_client_env, cfg["client_env_var"], proxy_url)
 
 
 def _compile_broker_pg_entry(
@@ -1044,7 +1052,7 @@ def _compile_broker_pg_entry(
             f"postgresql://ocjob:{{file:/run/secrets/oc_broker_token}}"
             f"@{sandbox_broker_host}:{broker_pg_port}/{cfg['database']}?sslmode=disable"
         )
-        broker_client_env[f"OC_BROKER_PG_{name.upper().replace('-', '_')}_URL"] = pg_url
+        _set_broker_client_env(broker_client_env, f"OC_BROKER_PG_{name.upper().replace('-', '_')}_URL", pg_url)
 
 
 def _compile_broker_ssh_entry(
@@ -1622,6 +1630,26 @@ def _wire_policy_widened(old_wp: dict[str, Any] | None, new_wp: dict[str, Any] |
     return False
 
 
+def _broker_route_auth_changed(old_r: dict[str, Any], new_r: dict[str, Any]) -> bool:
+    return (
+        new_r.get("known_hosts_ref") != old_r.get("known_hosts_ref")
+        or new_r.get("inbound_auth") != old_r.get("inbound_auth")
+        or new_r.get("inbound_auth_header") != old_r.get("inbound_auth_header")
+        or new_r.get("upstream_headers") != old_r.get("upstream_headers")
+        or new_r.get("upstream_secret_env") != old_r.get("upstream_secret_env")
+    )
+
+
+def _broker_route_surface_widened(old_r: dict[str, Any], new_r: dict[str, Any]) -> bool:
+    return (
+        (bool(new_r.get("allow_streaming", False)) and not bool(old_r.get("allow_streaming", False)))
+        or _wire_policy_widened(old_r.get("wire_policy"), new_r.get("wire_policy"))
+        or bool(set(new_r.get("allowed_presets", [])) - set(old_r.get("allowed_presets", [])))
+        or new_r.get("upstream_headers") != old_r.get("upstream_headers")
+        or new_r.get("upstream_secret_env") != old_r.get("upstream_secret_env")
+    )
+
+
 def _delta_broker_route_pair(
     st_id: str,
     rid: str,
@@ -1645,11 +1673,10 @@ def _delta_broker_route_pair(
     if added_slots or (new_r.get("secret_ref") and new_r.get("secret_ref") != old_r.get("secret_ref")):
         triggers.add("secret_slot_added")
         details.append({"trigger": "secret_slot_added", "sandbox_type": st_id, "route": rid})
-    if (
-        (bool(new_r.get("allow_streaming", False)) and not bool(old_r.get("allow_streaming", False)))
-        or _wire_policy_widened(old_r.get("wire_policy"), new_r.get("wire_policy"))
-        or bool(set(new_r.get("allowed_presets", [])) - set(old_r.get("allowed_presets", [])))
-    ):
+    if _broker_route_auth_changed(old_r, new_r):
+        triggers.add("auth_requirement_changed")
+        details.append({"trigger": "auth_requirement_changed", "sandbox_type": st_id, "route": rid})
+    if _broker_route_surface_widened(old_r, new_r):
         triggers.add("mcp_tool_surface_widened")
         details.append({"trigger": "mcp_tool_surface_widened", "sandbox_type": st_id, "route": rid})
 

@@ -19,7 +19,11 @@ import tomllib
 from typing import Any
 from urllib.parse import quote, urlparse, urlsplit
 
-from oc_broker_common import BrokerPolicyError, validate_allowed_cidrs
+from oc_broker_common import (
+    NON_OVERRIDABLE_BLOCKED_V6_NETWORKS,
+    BrokerPolicyError,
+    validate_allowed_cidrs,
+)
 
 SCHEMA_VERSION = 1
 
@@ -509,6 +513,8 @@ def validate_pod_local_url(url: str, context: str) -> str:
     _require_str(url, context)
     if any(ch in url for ch in ("\r", "\n", "\x00", " ")):
         raise PolicyError(f"{context} contains illegal characters")
+    if not url.startswith("http://"):
+        raise PolicyError(f"{context} must use lowercase http://127.0.0.1:<port>")
     parsed = urlparse(url)
     if parsed.scheme != "http":
         raise PolicyError(f"{context} must use http://127.0.0.1:<port>")
@@ -528,7 +534,11 @@ def validate_pod_local_url(url: str, context: str) -> str:
 
 
 def _ip_allowed_by_cidrs(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, allowed_cidrs: tuple[str, ...]) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
     if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and any(ip in net for net in NON_OVERRIDABLE_BLOCKED_V6_NETWORKS):
         return False
     if ip.is_global:
         return True
@@ -1033,6 +1043,26 @@ def has_sensitive_headers(headers: dict[str, str]) -> bool:
     return any(hk.lower() in SENSITIVE_HTTP_HEADERS for hk in headers)
 
 
+def _validate_single_mcp_header(hk: object, hv: object, context: str) -> tuple[str, str]:
+    if type(hk) is not str or type(hv) is not str:
+        raise SchemaError(f"Invalid header in {context}")
+    if HEADER_NAME_RE.fullmatch(hk) is None:
+        raise SchemaError(f"Invalid header name in {context}: {hk!r}")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in hv):
+        raise PolicyError(f"Control character forbidden in header {hk!r} of {context}")
+    if hk.lower() in SENSITIVE_HTTP_HEADERS:
+        if (
+            not (hv.startswith("Bearer ") and SECRET_REF_VALUE_RE.fullmatch(hv[7:]))
+            and SECRET_REF_VALUE_RE.fullmatch(hv) is None
+        ):
+            raise PolicyError(
+                f"Sensitive header {hk!r} in {context} must use {{file:/run/secrets/<slot>}}"
+            )
+    else:
+        _check_no_raw_secret_value(hv, f"{context}.{hk}")
+    return hk, hv
+
+
 def _validate_mcp_headers(headers: object, context: str) -> dict[str, str]:
     if headers is None:
         return {}
@@ -1040,19 +1070,8 @@ def _validate_mcp_headers(headers: object, context: str) -> dict[str, str]:
         raise SchemaError(f"{context} must be a table")
     norm_headers: dict[str, str] = {}
     for hk, hv in headers.items():
-        if type(hk) is not str or type(hv) is not str:
-            raise SchemaError(f"Invalid header in {context}")
-        if hk.lower() in SENSITIVE_HTTP_HEADERS:
-            if (
-                not (hv.startswith("Bearer ") and SECRET_REF_VALUE_RE.fullmatch(hv[7:]))
-                and SECRET_REF_VALUE_RE.fullmatch(hv) is None
-            ):
-                raise PolicyError(
-                    f"Sensitive header {hk!r} in {context} must use {{file:/run/secrets/<slot>}}"
-                )
-        else:
-            _check_no_raw_secret_value(hv, f"{context}.{hk}")
-        norm_headers[hk] = hv
+        k, v = _validate_single_mcp_header(hk, hv, context)
+        norm_headers[k] = v
     return norm_headers
 
 
@@ -1504,6 +1523,8 @@ def _resolve_mcp_credential_delivery(
         return raw_delivery or "host-brokered"
     if norm_local is not None:
         return raw_delivery
+    if raw_delivery in ("host-brokered", "raw-container-mount"):
+        raise PolicyError(f"Pod-local MCP {name!r} cannot use credential_delivery={raw_delivery!r}")
     return raw_delivery or "local-ephemeral"
 
 
@@ -1540,6 +1561,8 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
     mtype, norm_url = _validate_mcp_target(
         name, cfg, context, for_orchestrator=for_orchestrator, allowed_cidrs=tuple(allowed_cidrs)
     )
+    if mtype == "pinned-artifact" and (cfg.get("local") is not None or cfg.get("remote") is not None):
+        raise PolicyError(f"pinned-artifact MCP {name!r} may not declare [local] or [remote] subtables")
     args = cfg.get("args", [])
     if not isinstance(args, list) or any(type(a) is not str for a in args):
         raise SchemaError(f"{context}.{name}.args must be list of strings")
@@ -1564,6 +1587,8 @@ def _validate_mcp_server(name: str, cfg: object, context: str, *, for_orchestrat
     inbound_auth, inbound_auth_header = _validate_inbound_auth(
         cfg.get("inbound_auth"), cfg.get("inbound_auth_header"), f"{context}.{name}"
     )
+    if inbound_auth != "bearer":
+        raise SchemaError(f"MCP {name!r} only supports inbound_auth='bearer', got {inbound_auth!r}")
     allow_streaming = _validate_allow_streaming(cfg.get("allow_streaming"), f"{context}.{name}")
     raw_wp = cfg.get("wire_policy")
     wire_policy = validate_wire_policy(raw_wp, f"{context}.{name}.wire_policy") if raw_wp is not None else None

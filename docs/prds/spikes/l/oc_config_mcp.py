@@ -298,6 +298,18 @@ def _redact_broker_services(broker_services: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _redact_bundle_mcp(mcp_map: dict[str, Any]) -> dict[str, Any]:
+    redacted: dict[str, Any] = {}
+    for name, cfg in sorted(mcp_map.items()):
+        entry = dict(cfg)
+        entry.pop("allowed_cidrs", None)
+        url = entry.get("url")
+        if isinstance(url, str) and url.lower().startswith("https://"):
+            entry["url"] = "<redacted-remote-url>"
+        redacted[name] = entry
+    return redacted
+
+
 def _redact_object_for_orchestrator(kind: str, doc: dict[str, Any]) -> dict[str, Any]:
     out = dict(doc)
     if kind == "worker":
@@ -310,8 +322,11 @@ def _redact_object_for_orchestrator(kind: str, doc: dict[str, Any]) -> dict[str,
             {"slot": s["slot"], "target": s["target"], "mode": s["mode"], "configured": bool(s["secret_ref"])}
             for s in doc.get("secret_slots", [])
         ]
-    elif kind == "bundle" and "broker_services" in out:
-        out["broker_services"] = _redact_broker_services(doc.get("broker_services", {}))
+    elif kind == "bundle":
+        if "broker_services" in out:
+            out["broker_services"] = _redact_broker_services(doc.get("broker_services", {}))
+        if "mcp" in out:
+            out["mcp"] = _redact_bundle_mcp(doc.get("mcp", {}))
     return out
 
 

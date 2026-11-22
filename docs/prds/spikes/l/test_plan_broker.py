@@ -19,6 +19,7 @@ from oc_config_mcp import OrchestratorConfigMcpServer, call_mcp_uds  # noqa: E40
 from oc_plan import (  # noqa: E402
     DEFAULT_BROKER_HTTP_PORT,
     DEFAULT_BROKER_PG_PORT,
+    PlanError,
     PlanOverrides,
     compile_plan,
     compute_closed_security_delta,
@@ -677,6 +678,181 @@ class TestPlanBrokerSplitAndGates(unittest.TestCase):
             self.assertNotIn("keeper:secret_pg_ref", body)
             self.assertNotIn("pg-priv.example.com", body)
             self.assertNotIn(priv_cidr, body)
+        finally:
+            srv.stop()
+
+    def test_review_regressions_p1_p2_p3(self) -> None:
+        # P1-1: pinned-artifact cannot declare [local] or [remote] subtables
+        pa_local = parse_toml_strict(
+            _bundle_toml(
+                "team/pa-local",
+                '[mcp.sneaky]\ntype = "pinned-artifact"\nartifact_id = "builtin/helper"\ntools = ["run"]\n'
+                '[mcp.sneaky.local]\nbinding_key = "EXT_EP"\nservice = "builtin/api-demo"\n'
+                'url = "http://127.0.0.1:8080/mcp"\n'
+                '[mcp.sneaky.local.secret_env]\nEXT_TOKEN = "{file:/run/secrets/prod_secret}"\n',
+            )
+        )
+        with self.assertRaises(PolicyError):
+            validate_bundle_doc(pa_local, expected_id="team/pa-local", for_orchestrator=True)
+
+        # P1-2: unvalidated header names (trailing space/tab) and CRLF in header values rejected
+        for bad_hdr_line, exc_cls in (
+            ('"Authorization " = "Bearer plaintext-jwt"', SchemaError),
+            ('"Cookie\\t" = "session=secret"', SchemaError),
+            ('"X-Custom" = "ok\\r\\nX-Injected: evil"', PolicyError),
+        ):
+            doc = parse_toml_strict(
+                _bundle_toml(
+                    "team/bad-hdr-name",
+                    f'[mcp.s]\ntype = "remote"\nurl = "http://127.0.0.1:8080/mcp"\ntools = ["r"]\n'
+                    f'[mcp.s.headers]\n{bad_hdr_line}\n',
+                )
+            )
+            with self.subTest(line=bad_hdr_line), self.assertRaises(exc_cls):
+                validate_bundle_doc(doc, expected_id="team/bad-hdr-name")
+
+        # P2-5 & P2-6: uppercase HTTP://127.0.0.1, host-brokered or raw-container-mount on pod-local URL rejected
+        for snippet in (
+            'url = "HTTP://127.0.0.1:8080/mcp"\ntools = ["r"]',
+            'url = "http://127.0.0.1:8080/mcp"\ncredential_delivery = "host-brokered"\ntools = ["r"]',
+            'url = "http://127.0.0.1:8080/mcp"\ncredential_delivery = "raw-container-mount"\ntools = ["r"]',
+        ):
+            doc = parse_toml_strict(_bundle_toml("team/pod-local-bad", f'[mcp.loc]\ntype = "remote"\n{snippet}\n'))
+            with self.subTest(snippet=snippet), self.assertRaises(PolicyError):
+                validate_bundle_doc(doc, expected_id="team/pod-local-bad")
+
+        # P2-6 (plan-time): conditional [local] MCP running locally rejects raw-container-mount even with grant
+        self.store.operator_direct_upsert(
+            "bundle",
+            "team/cond-raw",
+            _bundle_toml(
+                "team/cond-raw",
+                '[mcp.cond]\ntype = "remote"\nurl = "http://127.0.0.1:8080/mcp"\n'
+                'credential_delivery = "raw-container-mount"\nread_only_tools = ["r"]\n'
+                '[mcp.cond.local]\nbinding_key = "COND_EP"\nservice = "builtin/api-demo"\n'
+                'url = "http://127.0.0.1:8080/mcp"\n',
+            ),
+        )
+        self.store.operator_direct_upsert(
+            "sandbox-type",
+            "team/int-cond",
+            _sandbox_type_toml(
+                "team/int-cond",
+                tier="interactive",
+                topology="pod-shared",
+                bundles='["team/cond-raw", "builtin/persona-implementer"]',
+            ),
+        )
+        with self.assertRaisesRegex(PolicyError, "Pod-local MCP"):
+            compile_plan(
+                self.store,
+                "team/int-cond",
+                overrides=PlanOverrides(allow_raw_remote_mounts=frozenset({"mcp:cond"})),
+            )
+
+        # P2-7: NAT64 IPv6 (64:ff9b::/96) rejected at schema time
+        nat64_doc = parse_toml_strict(
+            _bundle_toml(
+                "team/nat64",
+                '[broker_services.s]\nkind = "http"\nupstream_url = "https://[64:ff9b::a9fe:a9fe]/api"\n'
+                'preset = "sonarqube"\n',
+            )
+        )
+        with self.assertRaises(PolicyError):
+            validate_bundle_doc(nat64_doc, expected_id="team/nat64")
+
+        # P3-9: remote MCP rejects non-bearer inbound_auth
+        non_bearer_mcp = parse_toml_strict(
+            _bundle_toml(
+                "team/mcp-auth",
+                '[mcp.m]\ntype = "remote"\nurl = "https://api.example.com/mcp"\n'
+                'inbound_auth = "basic-token"\nread_only_tools = ["r"]\n',
+            )
+        )
+        with self.assertRaises(SchemaError):
+            validate_bundle_doc(non_bearer_mcp, expected_id="team/mcp-auth")
+
+    def test_review_regressions_delta_redaction_and_env_collision(self) -> None:
+        # P1-3: security_delta detects known_hosts_ref, inbound_auth, and upstream_headers mutations
+        self.store.operator_direct_upsert(
+            "bundle",
+            "team/delta-ext",
+            _bundle_toml(
+                "team/delta-ext",
+                '[broker_services.ops]\nkind = "ssh"\nhost = "ops.example.com"\n'
+                'user = "ro"\nknown_hosts_ref = "file:kh_v1"\nallowed_presets = ["df"]\n'
+                '[broker_services.sonar]\nkind = "http"\nupstream_url = "https://sonar.example.com"\n'
+                'inbound_auth = "bearer"\npreset = "sonarqube"\n',
+            ),
+        )
+        base = compile_plan(
+            self.store,
+            "builtin/api-workbench",
+            overrides=PlanOverrides(
+                with_mods=("team/delta-ext",),
+                env_bindings={"API_ENDPOINT": "https://staging.example.com/mcp"},
+            ),
+        )
+        for label, mutator, expected in (
+            ("known_hosts_swap", lambda p: p["broker_routes"]["ssh:ops"].__setitem__("known_hosts_ref", "file:kh_evil"), "auth_requirement_changed"),
+            ("inbound_auth_change", lambda p: p["broker_routes"]["http:sonar"].__setitem__("inbound_auth", "basic-token"), "auth_requirement_changed"),
+            ("upstream_header_mutation", lambda p: p["broker_routes"]["mcp:api_client"]["upstream_headers"].__setitem__("X-Admin-Bypass", "true"), "mcp_tool_surface_widened"),
+        ):
+            mut_plan = json.loads(json.dumps(base.plan))
+            mutator(mut_plan)
+            delta = compute_closed_security_delta(
+                {"builtin/api-workbench": base},
+                {"builtin/api-workbench": _FakeCompiled(mut_plan)},  # type: ignore[dict-item]
+            )
+            with self.subTest(case=label):
+                self.assertIn(expected, delta["triggers"])
+
+        # P3-8: broker_client_env collision raises PlanError
+        self.store.operator_direct_upsert(
+            "bundle",
+            "team/env-collide",
+            _bundle_toml(
+                "team/env-collide",
+                '[broker_services.foo-bar]\nkind = "http"\nupstream_url = "https://a.example.com"\npreset = "sonarqube"\n'
+                '[broker_services.foo_bar]\nkind = "http"\nupstream_url = "https://b.example.com"\npreset = "sonarqube"\n',
+            ),
+        )
+        with self.assertRaisesRegex(PlanError, "Conflicting broker_client_env"):
+            compile_plan(
+                self.store,
+                "builtin/api-workbench",
+                overrides=PlanOverrides(with_mods=("team/env-collide",)),
+            )
+
+        # P2-4: orchestrator config_get & config_diff redact mcp.allowed_cidrs and private https:// URLs
+        priv_cidr = _cidr(10, 42, 0, 0, 16)
+        priv_ip = _ip(10, 42, 1, 5)
+        self.store.operator_direct_upsert(
+            "bundle",
+            "team/priv-mcp",
+            _bundle_toml(
+                "team/priv-mcp",
+                f'[mcp.priv]\ntype = "remote"\nurl = "https://{priv_ip}:8443/mcp"\n'
+                f'allowed_cidrs = ["{priv_cidr}"]\nread_only_tools = ["r"]\n',
+            ),
+        )
+        sock_dir = Path(self.tmp.name) / "sock-p24"
+        srv = OrchestratorConfigMcpServer(self.store, sock_dir)
+        sock_path = srv.start()
+        try:
+            get_resp = call_mcp_uds(
+                sock_path,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "auth_token": srv.session_token,
+                    "method": "config_get",
+                    "params": {"kind": "bundle", "id": "team/priv-mcp"},
+                },
+            )
+            body = json.dumps(get_resp["result"])
+            self.assertNotIn(priv_cidr, body)
+            self.assertNotIn(priv_ip, body)
         finally:
             srv.stop()
 
