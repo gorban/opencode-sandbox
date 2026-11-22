@@ -32,7 +32,7 @@ without ever executing untrusted scripts on the host.
 **`oc_schema.py` / `oc_store.py` additions:**
 - `KIND_DIRS["workflow"] = "workflows"`; add `"workflow"` to `READABLE_ORCHESTRATOR_KINDS` and
   `MUTABLE_ORCHESTRATOR_KINDS`.
-- Extend `SECURITY_DELTA_TRIGGERS` with 9 closed triggers surfaced in `Approval Inbox`:
+- Extend `SECURITY_DELTA_TRIGGERS` with 10 closed triggers surfaced in `Approval Inbox`:
   1. `workflow_added`
   2. `workflow_autonomy_widened` (adding nudge/orchestrator-wake actions, widening target scope, or
      raising nudge/check caps)
@@ -45,6 +45,8 @@ without ever executing untrusted scripts on the host.
      statechart transition predicates)
   8. `workflow_default_surface_changed` (modifying `[dashboard.default_surface]` widgets/chips)
   9. `workflow_factory_changed` (adding/changing any allowlisted `factory_id`)
+  10. `workflow_excerpt_disclosure_changed` (enabling or widening any workspace/error excerpt
+      disclosure policy to external `/decisions/*` or blind-check routes)
 - `-o` authors or tunes workflows strictly through existing `oc_config_mcp.py` (`config_list`,
   `config_get`, `config_schema`, `config_diff`, `config_history`, `config_propose_revision`) ->
   `oc_controller` `Approval Inbox` (never direct disk writes).
@@ -102,7 +104,13 @@ choices = [
 ]
 abstain_default = "healthy_progress"
 canary_injection_question = true            # adds noul("classifier_injection_suspected") in same pass
-evidence_max_excerpt_bytes = 512
+excerpt_disclosure = "none"                 # default: metrics-only; opt-in requires explicit disclosure block
+# Optional opt-in (triggers workflow_excerpt_disclosure_changed in Approval Inbox):
+# [supervision.excerpt_disclosure]
+# source = "sanitized_last_error_excerpt"
+# max_bytes = 512
+# allowed_routes = ["decisions:openai-luna", "blind:fast-verifier"]
+# permitted_uses = ["live"]                 # ["live"] | ["live", "replay"]
 
 [supervision.blind_check]
 model_profile = "fast-verifier"             # host ModelCatalog profile (separate from heavy -o)
@@ -148,10 +156,11 @@ columns = ["target_addr", "status", "stall_seconds", "consecutive_errors", "quot
 - `human_gate_blocking`: routes privilege/spend escalation strictly to `oc_controller` Tier-A
   Approval Inbox.
 
-### 3. Plan compilation, immutable snapshots & safe-point live versioning (`oc_plan.py`)
+### 3. Pure plan compilation, approved materialization & unified migration/restart rule (`oc_plan.py`)
 
-`compile_workflow_plan(store, workflow_id, bindings, model_catalog)` performs pure, side-effect-free
-compilation:
+#### Pure compilation (`compile_workflow_plan()` / `workflow_plan_preview`)
+`compile_workflow_plan(store, workflow_id, bindings, model_catalog)` is **strictly
+side-effect-free** (no filesystem writes, no skill staging, no lockfile publication):
 1. Validates closed statechart reachability, bounded predicate AST (comparisons and boolean ops over
    host-verified `metric.*`, `event.*`, `lane.*`, `state.*`, `limits.*` only—no loops, calls, or
    unbounded regex), closed action enum, bounded `rubric` length (`<= 2048` bytes), **literal
@@ -159,19 +168,48 @@ compilation:
    or index traversal; strictly host-validated scalar placeholders `{target_addr}`,
    `{stall_seconds}`, `{workflow_id}` and zero untrusted sandbox text), and closed `oc-ui@1` widget
    schema.
-2. Verifies referenced `/decisions/*` and `blind_check` model profiles against host `ModelCatalog`
-   and checks tariff upper bounds fit within `max_decisions_spend_usd` / `max_blind_check_spend_usd`.
-3. Stages the workflow's `orchestrator_skill` read-only under the existing `prd_l`
-   `orchestrator_skills` staging/discovery tree as `/run/oc-config/skills/wf-<slug>/SKILL.md`
-   (`:ro` bind mount, `O_NOFOLLOW`, host-owned `0o700`/`0o600` source) for progressive disclosure
-   to `-o`.
-4. Emits immutable `workflow_plan.lock.json` and **`workflow_plan_digest = sha256_canonical_json(plan)`**.
-5. **Pinned snapshots & live migration (Trap T10):** Starting a workflow persists its compiled plan
-   in `workflow_spec_snapshots(spec_digest, plan_json)`. Editing a `workflow@1` TOML on disk affects
-   only *new* instances; in-flight 12h+ runs stay pinned to their starting snapshot. Explicit
-   `workflow migrate <run_id> --to <spec_digest>` is permitted only at quiescent safe-points (zero
-   in-flight outbox dispatches) after schema compatibility verification and (if autonomy/routes
-   widened) a fresh `WorkflowRunLease` approval.
+2. Computes the **complete reachable effect set** across all states, transitions, `workflow_signal`
+   handlers, `workflow_timers`, and `factory_id` bindings, and embeds that computed effect manifest
+   in the compiled plan (enforced at both admission and execution).
+3. Verifies referenced `/decisions/*` and `blind_check` model profiles against host `ModelCatalog`,
+   validates `excerpt_disclosure` policy bindings (default `"none"`), and checks tariff upper bounds
+   fit within `max_decisions_spend_usd` / `max_blind_check_spend_usd`.
+4. Reads the referenced `orchestrator_skill` (`SKILL.md`, `O_NOFOLLOW`, host-owned `0o700`/`0o600`
+   source) into memory and **pins its exact content bytes + SHA-256 digest** inside the compiled
+   plan object—never staging or writing files during compilation/preview.
+5. Computes immutable **`workflow_plan_digest = sha256_canonical_json(plan)`**.
+
+#### Approved materialization (`materialize_workflow_plan()`)
+Only after admission succeeds (auto-admitted effect-allowlisted `observe_only` or approved Tier-A
+`WorkflowRunLease`) does `materialize_workflow_plan()` perform side effects:
+1. Re-verifies the pinned skill content bytes against their SHA-256 digest in `plan`, then stages
+   those exact verified bytes read-only under `prd_l`'s `orchestrator_skills` discovery tree at
+   `/run/oc-config/skills/wf-<slug>/SKILL.md` (`:ro` bind mount, `O_NOFOLLOW`).
+2. Atomically publishes `workflow_plan.lock.json` and records the immutable snapshot in
+   `workflow_spec_snapshots(spec_digest, plan_json)`.
+
+#### Unified rule for migration, restart & outstanding effects (Trap T10 / `prd_m1` parity)
+1. **Pinned snapshots & full-effect safe-point migration:** Running instances stay pinned to their
+   starting `spec_digest`. Because `WorkflowRunLease` binds an exact `(spec_digest,
+   grant_generation)`, **every** live migration (`workflow migrate <run_id> --to <new_spec_digest>`)
+   requires:
+   - **Fresh authority bound to the new `(new_spec_digest, new_grant_generation)`** (approved in
+     Tier A unless the migrated plan satisfies the strict `observe_only` effect allowlist below);
+   - **Full quiescent safe-point** across **all** outstanding effects—zero in-flight `oc_hub`
+     outbox dispatches, zero in-flight `/decisions/*` or blind-check upstream requests, zero firing
+     timers, and zero unresolved `workflow_awakeables` or pending human decisions;
+   - **Explicit invalidation** of all callbacks, timers, and pending decisions bound to the prior
+     `(spec_digest, grant_generation)`.
+2. **Durable first-write & uncertain settlement for supervision calls (`prd_m1` parity):** Every
+   `/decisions/*` and blind-check upstream call follows `prd_m1`'s durable pre-flight reservation
+   (`QuotaLedger`) + durable first-write step record before transmission. A crash after possible
+   transmission **retains the spend reservation** and marks the supervision step **`uncertain`**
+   (never silently releasing spend or auto-retrying blindly).
+3. **Late tool-result fence (applies under every restart UX option):** Any late blind-check tool
+   result or callback arriving after migration, restart, or concurrent operator action MUST
+   re-verify **current** `WorkflowRunLease` `(run_id, spec_digest, grant_generation)`, live target
+   `(sandbox_addr, incarnation_id)`, active `workflow_lane_leases` ownership, and absence of human
+   `InputLease` atomically before acting.
 
 ### 4. Durable event-sourced SQLite kernel & single-owner lane leases (`oc_registry.py`)
 
@@ -213,10 +251,22 @@ single-writer ACID transactions as `oc_hub` outbox & revocation tombstones):
   - Operator-launched runs mint the lease directly. `target_selector = "all_running_sandboxes"`
     requires `Role.OPERATOR` (any `-o`-launched run is dynamically clamped strictly to `-o`'s
     `SubtreeBudget`, never observing or nudging operator-only sandboxes).
-  - `-o`-launched runs auto-admit **only** if `autonomy == "observe_only"`, spend caps are `0`,
-    `target_scope` is within `-o`'s `SubtreeBudget`, and host/per-`-o` concurrency + rate ceilings
-    (`max_active_workflow_runs`, `workflow_start` rate limit) are not exceeded; otherwise they route
-    to **Approval Inbox (Tier A)**.
+  - **`observe_only` auto-admission compiled effect allowlist (hard gate):** `-o`-launched runs
+    auto-admit **only** if ALL of the following hold:
+    1. Declared `autonomy == "observe_only"`, spend caps (`max_decisions_spend_usd`,
+       `max_blind_check_spend_usd`) are `0`, `excerpt_disclosure == "none"`, `target_scope` is
+       within `-o`'s `SubtreeBudget`, and host/per-`-o` concurrency + rate ceilings
+       (`max_active_workflow_runs`, `workflow_start` rate limit) are not exceeded; **and**
+    2. The compiler's **reachable effect set** (spanning all states, transitions, `workflow_signal`
+       handlers, `workflow_timers`, and `factory_id` bindings) contains **exclusively** allowlisted
+       observe-only effects: read-only metric queries, Tier-0/Tier-C health projection updates, and
+       advisory (`lane_paused = 0`) Tier-B notices—with **zero** reachable sandbox launches, patch
+       staging, `ship_lane`/`scout_lane` spawns, nudges/sends, `lane_paused = 1` /
+       `human_gate_async` / `human_gate_blocking` stages, upstream model calls, or `factory_id`
+       invocations.
+    3. The executor enforces the exact same effect allowlist at runtime. Any `observe_only` plan
+       containing a reachable disallowed effect **fails admission** even with `$0` model spend;
+       all other runs require explicit **Approval Inbox (Tier A)** grant.
   - `-o` can invoke `workflow_pause`, `workflow_resume`, `workflow_stop`, or `workflow_signal`
     **only** on `-o`-owned runs (or signals explicitly listed in
     `WorkflowRunLease.allowed_orchestrator_signals`)—never disabling an operator-launched
@@ -243,14 +293,17 @@ single-writer ACID transactions as `oc_hub` outbox & revocation tombstones):
 
 - [ ] Extend `oc_schema.py`, `oc_store.py`, and `oc_config_mcp.py` for `workflow@1` storage,
       `SECURITY_DELTA_TRIGGERS`, and human-gated authoring.
-- [ ] Implement `compile_workflow_plan()` in `oc_plan.py` with bounded predicate AST validation,
-      immutable `workflow_plan_digest`, `:ro` skill staging, and `workflow_spec_snapshots`.
+- [ ] Implement pure side-effect-free `compile_workflow_plan()` (bounded predicate AST validation,
+      compiled reachable-effect `observe_only` allowlist, pinned skill bytes/SHA-256, immutable
+      `workflow_plan_digest`) and post-approval `materialize_workflow_plan()` (`:ro` skill staging,
+      `workflow_spec_snapshots`, lockfile publication) in `oc_plan.py`.
 - [ ] Add `WorkflowRunLease` and `CoordRole.WORKFLOW` (`TrustClass.SYSTEM_ALERT`) to
       `oc_controller.py` / `oc_coord_contract.py` with `<1s` revocation cascade and `InputLease`
       auto-suspend.
 - [ ] Implement the event-sourced `WorkflowEngine` in `oc_daemon` (`workflow_runs`,
       `workflow_step_log`, `workflow_timers`, `workflow_awakeables`, `workflow_lane_leases`) with
-      quiescent safe-point migration.
+      the unified migration/restart outstanding-effects safe-point, fresh `(spec_digest,
+      grant_generation)` re-authorization, and late tool-result re-verification fence.
 - [ ] **(decision needed)** Restart behavior for active `nudge_bounded` / metered workflows after
       `oc_daemon` restart (Trap T13):
   - **Option A (Recommended):** `observe_only` runs auto-resume; active/metered runs boot into

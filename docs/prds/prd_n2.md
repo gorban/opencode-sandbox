@@ -31,24 +31,29 @@ Maintain a hard namespace boundary inside `oc_daemon` and `$STATE/registry.sqlit
      `PaidFallbackGrant` burn, `/mcp/*` per-tool latency/error counts, and normalized
      `(tool_name, args_sha256)` repetition counts (detects repeating the same failing tool call
      deterministically).
-   - **Coordination Hub (`oc_hub`):** turn latency (`handed_off` -> `turn_completed`), live
-     `stall_seconds` (`now - last_stream_event_at` while working), outbox queue depth, active
-     `agent_wait` edges, inter-sandbox ping-pong round count.
+   - **Coordination Hub (`oc_hub`):** turn dispatch timestamps (`handed_off`), outbox queue depth,
+     active `agent_wait` edges, inter-sandbox ping-pong round count, and **`last_transport_frame_at`**
+     (recording solely *"the host received a stream frame / `turn_completed` from the worker"* as
+     **transport activity only**—never as proof of task progress or self-recovery).
    - **Runtime / Cgroup / Worker Probes (`HostProvider.probe()`):** container CPU time delta, RSS,
      block I/O, worker RTT, available host RAM/disk (distinguishes active local compilation from a
      wedged idle container).
    - **Host-Verified Workspace Velocity (via lazy containerized `safe_run`, Trap T14):** git
-     diff-stat delta, commit SHA advances, and verified test exit transitions (never running host
-     `git` or walking worktrees inside `~/opencode-sandbox`). To prevent container-launch thrash,
-     `safe_run` workspace probes run **lazily / on-demand**—triggered only when Tier-0
-     broker/hub/cgroup metrics flag a candidate stall, during pre-action freshness checks, before
-     commit-pinned Tier-B Human Inbox verification, or on a slow bounded cadence—with per-lane
-     concurrency `1` and a hard execution timeout.
+     diff-stat delta, commit SHA & tree OID advances, and verified test exit transitions (never
+     running host `git` or walking worktrees inside `~/opencode-sandbox`). To prevent
+     container-launch thrash, `safe_run` workspace probes run **lazily / on-demand**—triggered only
+     when Tier-0 broker/hub/cgroup metrics flag a candidate stall, during pre-action freshness
+     checks, before commit-pinned Tier-B Human Inbox verification, or on a slow bounded cadence—with
+     per-lane concurrency `1` and a hard execution timeout.
    - **Supervision & Calibration Metrics:** System-1 call count/latency/spend, throttled/coalesced
-     trigger count, blind-check call count/spend, `TP`, `FP`, `TN`, `FN`, `class_mismatch`,
-     precision, sampling-adjusted miss rate, and nudge outcomes.
-2. **`untrusted_claims` (agent self-reported progress/notes):** rendered only with untrusted
-   provenance badges; **never** allowed in deterministic guards or stall-timer resets.
+     trigger count, cap-dropped/delayed check counts, abstention counts, blind-check call
+     count/spend, reference-verdict confusion counts (`TP`, `FP`, `TN`, `FN`, `class_mismatch`)
+     broken out by explicit sample stratum, precision, inclusion-adjusted miss rate, and nudge
+     outcomes.
+2. **`untrusted_claims` (agent self-reported progress/notes & worker-supplied `turn_completed`
+   content):** rendered only with untrusted provenance badges; **never** allowed to satisfy
+   deterministic guards, declare self-recovery, reset stall timers, or auto-resolve escalations
+   without corroborating host-verified task progress.
 
 **Storage (`metrics_rollups`, Trap T14):** High-frequency events aggregate in memory inside
 `oc_daemon` and flush every `5–10s` into ring-bounded SQLite buckets (`1m` resolution for 24h,
@@ -81,12 +86,24 @@ durable pre-flight spend reservations, [prd_m1](prd_m1.md)):
     pinned strictly to the target workflow's already-approved `/decisions/*` route and model, and
     scanned through `OverlapCanaryScanner` before any upstream call under a short-TTL
     `CalibrationReplayGrant`.
-  - `evidence` is a flat JSON object (`<= 8 KiB`) containing host-verified numeric metrics plus an
-    optional `sanitized_last_error_excerpt` (truncated `<= 512` bytes, control/bidi/ANSI stripped,
-    explicitly tagged as untrusted data).
+  - **Metrics-only default & explicit excerpt disclosure rule (P2 disclosure invariant):**
+    External supervision (`/decisions/*` and blind-check upstream calls) defaults strictly to
+    **host-allowlisted numeric/enum metrics only** (`excerpt_disclosure = "none"`). Control-char
+    stripping, nonce framing, `store: false`, and injection checks do **not** authorize disclosing
+    confidential workspace text to a third-party provider. Including any
+    `sanitized_last_error_excerpt` (`<= 512` bytes) requires an explicit opt-in
+    `[supervision.excerpt_disclosure]` policy in `workflow@1` (gated in Tier-A `Approval Inbox` via
+    `workflow_excerpt_disclosure_changed` and bound in `WorkflowRunLease` /
+    `CalibrationReplayGrant`) that pins `(source, allowed_routes, permitted_uses = ["live" |
+    "replay"])`; redaction, `OverlapCanaryScanner`, and disclosure enforcement run on the **exact
+    final serialized payload** immediately before upstream transmission.
   - Enforces zero-output-token single-pass evaluation (`noul` / `choice` / `score`), `store: false`,
     and zero provider-side tools.
-  - Batches a **`noul("classifier_injection_suspected")`** self-defense canary into every call.
+  - Batches a **`noul("classifier_injection_suspected")`** self-defense canary into every call
+    (when excerpt disclosure is enabled).
+  - Applies `prd_m1`'s durable pre-flight spend reservation (`QuotaLedger`) + durable first-write
+    step record before transmission; a crash after possible transmission retains the reservation
+    and marks the call **`uncertain`**.
 - **Fail-closed error vs. positive injection-canary handling:**
   - Any malformed payload, unknown enum label, timeout, or upstream HTTP error logs a degraded
     metric and fails closed to `abstain_default` (falling back to Tier-0 deterministic backstops).
@@ -141,10 +158,15 @@ attacks:
 
 - **Stateless, tool-restricted, blind context (Trap T2):** The real-model health check runs in a
   dedicated single-turn host-brokered context (never full `-o` with spawn/config tools). It
-  receives **only** a generic *"Routine Lane Health Check"* prompt + the frozen `MetricSnapshot`—**no
-  indication** whether System-1 alerted or a routine schedule fired. Any untrusted excerpt is
-  wrapped inside `prd_m2`'s 128-bit random-nonce `<oc-untrusted-data nonce="...">` framing and
-  breakout-escaped.
+  receives **only** a generic *"Routine Lane Health Check"* prompt + the frozen `MetricSnapshot`
+  (allowlisted host metrics only by default; any opted-in excerpt obeys the exact same
+  `[supervision.excerpt_disclosure]` source/route/use policy, final-payload `OverlapCanaryScanner`
+  scan, and 128-bit random-nonce `<oc-untrusted-data nonce="...">` breakout-escaped framing)—with
+  **no indication** whether System-1 alerted or a routine schedule fired. Every call follows
+  `prd_m1`'s durable pre-flight spend reservation + first-write record (retaining reservation and
+  marking `uncertain` on crash after possible transmission), and any late tool result MUST
+  re-verify active `WorkflowRunLease`, `(sandbox_addr, incarnation_id)`, lane ownership, and
+  absence of human `InputLease` before acting.
 - **Closed 4-tool surface:**
   1. `health_record_ok()`
   2. `health_nudge_lane(template_id)` *(closed enum of host-static templates only)*
@@ -169,19 +191,22 @@ attacks:
 | Scheduled Audit (`S_audit`) | No Alert | `health_record_ok` | `TN` | None |
 | Scheduled Audit (`S_audit`) | No Alert | Any action tool (`class Y`) | `FN` (Missed Alert) | **Execute `Y` directly from real-model alert** *(if freshness guard passes)* |
 
-- **Point-in-time scoring vs. freshness-gated execution (Trap T4):**
-  - `TP / FP` is always scored against the **exact frozen snapshot `S1`** System-1 evaluated so a
-    fast self-recovery does not falsely mark System-1 as an FP. Because `triggered_trailing`
-    evaluates fresh `S_now` without re-running System-1, it is excluded from System-1 `TP/FP`
-    accuracy metrics (unless System-1 also evaluates `S_now` in shadow mode without gating
-    dispatch).
+- **Point-in-time scoring vs. corroborated-progress freshness guard (Trap T4 & T5):**
+  - `TP / FP` is always scored as agreement with the blind model's **reference verdict** (not
+    assumed infallible ground truth) against the **exact frozen snapshot `S1`** System-1 evaluated.
+    Because `triggered_trailing` evaluates fresh `S_now` without re-running System-1, it is kept in
+    its own stratum and excluded from System-1 `TP/FP` metrics (unless System-1 also shadow-scores
+    `S_now` without gating dispatch).
   - Before dispatching any nudge or Human Inbox escalation, `oc_daemon` runs a deterministic
-    **freshness check** (did `turn_completed`, a new commit SHA via lazy `safe_run`, or an active
-    human `InputLease` occur since `S1`?). If self-recovered, log `action_suppressed_self_recovered`
-    and skip the stale nudge while keeping the `TP` credit.
-- **Host-verified progress-hash reset (Trap T5):** Stall timers and per-incident nudge counts reset
-  **only** on host-verified progress (new commit SHA, diff hash delta, verified test transition, or
-  workflow state advance)—never on agent chat text (`"Got it, continuing!"`).
+    **freshness guard** requiring **independent, host-verified, task-bound progress** since `S1`
+    (new commit SHA or tree OID / diff-hash delta via lazy `safe_run`, verified test/check exit
+    transition, host-observed broker/PR state transition, or verified workflow state advance) or an
+    active human `InputLease`. A worker-supplied `stream_event` or synthetic `turn_completed` frame
+    with **no corroborating host-verified progress** records transport activity only—it **never**
+    suppresses a verified action, resets an incident, or auto-resolves an escalation!
+- **Host-verified progress-hash reset (Trap T5):** Stall timers, per-incident nudge counts, and
+  escalation auto-resolve reset **only** on independent host-verified task progress—never on agent
+  chat text (`"Got it, continuing!"`) or uncorroborated `turn_completed` frames.
 - **Sleep/suspend detection (Trap T6):** `oc_daemon` compares wall-clock vs. monotonic elapsed time
   (`wall_delta - monotonic_delta > 30s`). On host wake, supervision pauses for
   `wake_grace_after_host_sleep_s` (`120s`), re-probes worker/SSH liveness first, and excludes host
@@ -193,33 +218,47 @@ attacks:
 ### 5. Human-triggered calibration and replay loop (Trap T12)
 
 Paired verification records persist in `$STATE/registry.sqlite` (`supervision_calibration_log`,
-bounded ring buffer, e.g., 30 days):
+bounded ring buffer, e.g., 30 days) with explicit `(run_id, target_addr, target_incarnation_id,
+sample_stratum, inclusion_status)` metadata:
 
-1. **Dashboard telemetry:** The workflow's `[Deterministic Workflow]` card shows live raw counts
-   (`TP`, `FP`, `TN`, `FN`, `class_mismatch`), precision (`TP / (TP + FP)`), **sampling-adjusted
-   miss rate** (accounting for triggered 100% sampling vs. audit fraction `p`), throttle coalesce
-   rate, and System-1 vs. blind-check spend.
-2. **Non-blocking drift alert:** Once `N >= min_calibration_samples` (default `10`), if
-   `FP_rate > fp_drift_warn_threshold` (`0.25`) or `FN_24h >= fn_drift_warn_count_24h` (`2`),
-   `oc_daemon` posts a deduplicated **Tier-B Human Inbox** item: *"Classifier drift on
-   `builtin/firstmate-supervisor` — [Ask Orchestrator to Propose Tuning]"*.
-3. **Human-triggered tuning with `CalibrationReplayGrant` (default):** Workflows never self-modify,
-   and `-o` cannot invoke upstream replay without explicit operator initiation. Clicking the Tier-B
-   `[Ask Orchestrator to Propose Tuning]` control (or running the operator CLI) mints a short-TTL
-   **`CalibrationReplayGrant`** in `oc_controller` bound to `(grant_id, workflow_id,
-   approved_decisions_route, approved_model, max_replay_samples, max_replay_calls,
-   max_replay_spend_usd, expires_at)` with pre-flight reservation in `QuotaLedger`:
-   - `-o` inspects disagreements via read-only `calibration_examples_query(workflow_id, outcomes, limit)`
-     restricted strictly to `workflow_id` within `-o`'s `SubtreeBudget`, with any untrusted excerpts
-     wrapped in 128-bit random-nonce `<oc-untrusted-data nonce="...">` framing.
-   - `-o` calls `workflow_calibration_replay(grant_id, workflow_id, candidate_toml, sample_ids)`:
-     the host compiles `candidate_toml` via `compile_workflow_plan()`, enforces exact route/model
-     pinning to `grant.approved_decisions_route` & `grant.approved_model` (rejecting provider/route
-     changes during replay), scans candidate text through `OverlapCanaryScanner` before any
-     upstream call, and returns a **before vs. after confusion-matrix scorecard**.
-   - `-o` submits `config_propose_revision(kind="workflow" | "sandbox-type", ...)` -> **`Approval
-     Inbox (Tier A)`**, displaying both `security_delta` (including `workflow_rubric_or_predicate_changed`
-     and `workflow_template_changed`) and the replay scorecard for explicit human approval.
+1. **Dashboard telemetry (reference verdicts + cap/abstention accounting):** The workflow's
+   `[Deterministic Workflow]` card shows live raw counts against the blind model's **reference
+   verdict** (`TP`, `FP`, `TN`, `FN`, `class_mismatch`) separated by **explicit sample stratum**
+   (`triggered_leading`, `triggered_trailing`, `scheduled_audit_uniform`,
+   `scheduled_audit_near_threshold`), alongside **actual inclusion rates, cap-dropped/delayed
+   trigger counts, and abstention counts** (never assuming 100% triggered sampling when fleet caps
+   drop or delay checks), precision (`TP / (TP + FP)`), inclusion-adjusted miss rate, and System-1
+   vs. blind-check spend.
+2. **Non-blocking drift alert:** Once `N >= min_calibration_samples` (default `10`) within the
+   relevant stratum, if `FP_rate > fp_drift_warn_threshold` (`0.25`) or
+   `FN_24h >= fn_drift_warn_count_24h` (`2`), `oc_daemon` posts a deduplicated **Tier-B Human
+   Inbox** item: *"Classifier drift on `builtin/firstmate-supervisor` — [Request Calibration Replay
+   in Approval Inbox]"*.
+3. **Two-step Tier-A-gated calibration & tuning (zero Tier-B grant authority):** Workflows never
+   self-modify, and **Tier B has zero authority to mint paid replay grants**. Clicking the Tier-B
+   button (or running the operator CLI) **only creates a Tier-A `oc_controller` proposal** for a
+   short-TTL **`CalibrationReplayGrant`**:
+   - Before issuing the grant, **Approval Inbox (Tier A)** explicitly displays and cryptographically
+     binds `(requesting_principal, run_id, workflow_id, authorized_sample_scope,
+     approved_decisions_route, approved_model, excerpt_disclosure_policy, max_replay_samples,
+     max_replay_calls, max_replay_spend_usd, expires_at)` with pre-flight reservation in
+     `QuotaLedger`. **A later Tier-A approval of a config edit cannot retroactively authorize an
+     earlier paid replay.**
+   - **Per-record authorization:** Every `calibration_examples_query(run_id, outcomes, strata,
+     limit)` and `workflow_calibration_replay(grant_id, run_id, candidate_toml, sample_ids)` call
+     authorizes **every individual record, `sample_id`, and aggregate input** against the current
+     caller, `run_id` ownership, caller's live `SubtreeBudget`, and target `(sandbox_addr,
+     incarnation_id)` (never authorizing by `workflow_id` alone; cross-run or out-of-subtree
+     `sample_ids` fail closed and unauthorized rows are excluded from aggregates).
+   - `workflow_calibration_replay` compiles `candidate_toml` via pure `compile_workflow_plan()`,
+     enforces exact route/model/disclosure pinning to the `CalibrationReplayGrant`, runs
+     `OverlapCanaryScanner` on the exact final serialized payload before any upstream call, and
+     returns a stratified **before vs. after reference-verdict scorecard** (including abstentions
+     and cap-drop notes).
+   - `-o` then submits `config_propose_revision(kind="workflow" | "sandbox-type", ...)` -> a
+     **separate Tier-A `Approval Inbox`** grant displaying both `security_delta` (including
+     `workflow_rubric_or_predicate_changed`, `workflow_template_changed`, and
+     `workflow_excerpt_disclosure_changed`) and the stratified replay scorecard.
 
 ### 6. Clean-room `firstmate` pattern extraction matrix
 
@@ -243,8 +282,11 @@ bounded ring buffer, e.g., 30 days):
       pre-flight reservations and injection canary support.
 - [ ] Implement per-lane leading+single-trailing coalesced throttler + fleet-wide outer cap +
       sleep/wake gap detector + correlated-fault coalescer.
-- [ ] Implement stateless, 4-tool blind real-model verifier, freshness guard, scheduled active-lane
-      audits, `supervision_calibration_log`, and `workflow_calibration_replay`.
+- [ ] Implement stateless, 4-tool blind real-model verifier (metrics-only default + explicit opt-in
+      excerpt disclosure policy + final-payload `OverlapCanaryScanner`), independent host-verified
+      progress freshness guard, scheduled active-lane audits with stratum/inclusion-rate/cap-drop
+      accounting, `supervision_calibration_log`, and `CalibrationReplayGrant`-gated
+      `workflow_calibration_replay` with per-record authorization.
 - [ ] Author `builtin/firstmate-supervisor.toml` and its `:ro` `orchestrator_skill`.
 - [ ] **(decision needed)** Dedicated model tier for the blind real-model health check (Trap T2):
   - **Option A (Recommended):** Allow `workflow@1` (`[supervision.blind_check].model_profile`) to
@@ -262,9 +304,12 @@ bounded ring buffer, e.g., 30 days):
     - *Effort:* ~0 days extra.
 - [ ] **(decision needed)** Scheduled unalerted audit sampling strategy (Trap T11):
   - **Option A (Recommended):** Periodic active-lane audit (`scheduled_audit_interval_s = 900`,
-    uniform across active lanes for unbiased `FN` estimation) plus optional tagged `near_threshold`
-    audits (kept in a separate stratum so they do not bias the headline miss-rate metric).
-    - *Pros:* Statistically unbiased miss-rate estimate AND faster discovery of borderline FNs.
+    uniform across active lanes for uniform-stratum reference-verdict `FN` estimation with actual
+    inclusion-rate, cap-drop, and abstention accounting) plus optional tagged `near_threshold`
+    audits (kept in a separate stratum so they do not mix with the uniform-stratum miss-rate
+    metric).
+    - *Pros:* Clean uniform-stratum reference-verdict miss-rate estimate AND faster discovery of
+      borderline FNs.
     - *Cons:* Slightly more SQLite schema fields (`audit_stratum`).
     - *Effort:* ~0.5 days.
   - **Option B:** Fixed periodic active-lane audit only (no near-threshold stratum).

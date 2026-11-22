@@ -18,12 +18,12 @@ reservation explicitly in this index.
 
 - [*] PRD M first PoC — local worker addressing, orchestration, and thread projection
   ([M first PoC split](prd_m.md#first-poc-split)) — **PRD M coordination**.
-- [*] PRD N planning & initial workflow/supervision slices — first-class `workflow@1`,
-  host-authoritative metrics, zero-authority System-1 + blind verification supervision,
-  three-tier Human Inbox, and declarative `oc-ui@1` surfaces
+- [*] PRD N planning & initial workflow/supervision slices (**N0–N2** only; **N3** three-tier
+  Human Inbox UI & declarative `oc-ui@1` surfaces remain open `[ ]`) — `workflow@1` schema/kernel,
+  host-authoritative metrics, and zero-authority System-1 + blind verification supervision
   ([N milestones](prd_n.md#phased-milestones-and-ownership)) — **PRD N workflows & supervision**
-  *(builds on the in-progress `[*] PRD M coordination` slice; re-coordinate ownership at the
-  start of the next phase)*.
+  *(builds on `[*] PRD M coordination` and open PRD I/L/M prerequisites; re-coordinate ownership
+  at the start of the next phase)*.
 
 Coordinate SSH fixtures and remote acceptance with **Warm worker seeding**
 (`codex/warm-worker-seeding`). That workstream owns [I5](prd_i5.md) warm-start
