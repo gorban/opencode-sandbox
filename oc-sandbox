@@ -94,10 +94,12 @@ die() { echo "${0##*/}: $*" >&2; exit 2; }
 # outside $SB, which the agent cannot change, remain; the walked physical path is used from then on.
 # The locations must not contain $SB either (-d -a deletes $STATE). Done before anything is touched.
 sb_real=$(realpath -m -- "$SB")
-in_sb() { [[ $1/ == "$sb_real"/* ]]; }
+in_sb() {
+  [[ $1/ == "$sb_real"/* ]]
+}
 trusted_path() {  # absolute path -> its physical path on stdout; 1 if the walk enters $SB
   local cur="" comp next t n=0 todo=() tc=()
-  [[ $1 == /* ]] || return 1
+  [[ $1 == /* && $1 != *$'\n'* && $1 != *$'\r'* ]] || return 1
   IFS=/ read -ra todo <<<"$1"
   while (( ${#todo[@]} )); do
     comp=${todo[0]}; todo=("${todo[@]:1}")
@@ -106,7 +108,8 @@ trusted_path() {  # absolute path -> its physical path on stdout; 1 if the walk 
     in_sb "$next" && return 1
     if [[ -L $next ]]; then
       (( ++n <= 40 )) || return 1
-      t=$(readlink -- "$next") || return 1
+      IFS= read -r -d '' t < <(readlink -z -- "$next") || return 1
+      [[ $t != *$'\n'* && $t != *$'\r'* ]] || return 1
       tc=(); IFS=/ read -ra tc <<<"$t"
       [[ $t == /* ]] && cur=""
       todo=(${tc[@]+"${tc[@]}"} ${todo[@]+"${todo[@]}"})
@@ -123,7 +126,7 @@ trusted_file() { # resolve repository helpers without following a path into the 
 trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
   local r
   r=$(trusted_path "$2") || die "refusing to use $2: the path leads into the sandbox directory $SB, which the agent controls (check XDG_DATA_HOME / XDG_CONFIG_HOME and symlinks)"
-  [[ $sb_real/ != "$r"/* ]] || die "refusing to use $2: the sandbox directory $SB is inside it ($r)"
+  [[ $sb_real/ != "${r%/}"/* ]] || die "refusing to use $2: the sandbox directory $SB is inside it ($r)"
   printf -v "$1" '%s' "$r"
 }
 trusted_dir STATE "$STATE"
@@ -254,6 +257,47 @@ else
 fi
 pm() { "${H[@]}" podman "$@"; }
 sc() { "${H[@]}" systemctl --user "$@"; }
+
+host_input() { # resolve paths in the same filesystem that Podman and systemd use
+  local checks
+  checks=$(declare -f in_sb trusted_path inspect_pg_init) || return 1
+  "${H[@]}" /usr/bin/bash -p -c "$checks"$'\n''
+    set -euo pipefail
+    PATH=/usr/bin:/bin
+    sb_real=$(realpath -m -- "$1")
+    path=$(trusted_path "$3")
+    case $2 in
+      editor) printf "%s\n" "$path" ;;
+      postgres-path|postgres-init)
+        [[ $sb_real/ != "${path%/}"/* && $path != *:* ]] || {
+          echo "unsafe Postgres init directory" >&2; exit 1;
+        }
+        printf "%s\n" "$path"
+        if [[ $2 == postgres-init ]]; then inspect_pg_init "$path"; fi ;;
+      *) exit 2 ;;
+    esac
+  ' _ "$SB" "$@"
+}
+
+inspect_pg_init() { # host only; output the existing digest, or no line for an absent or empty tree
+  local dir=$1 entries invalid owner_id digest
+  [[ -e $dir ]] || return 0
+  [[ -d $dir ]] || { echo "Postgres init path is not a directory" >&2; return 1; }
+  entries=$(find "$dir" -mindepth 1 -printf x -quit) || return 1
+  [[ -n $entries ]] || return 0
+  owner_id=$(id -u) || return 1
+  invalid=$(find "$dir" \( ! -type d ! -type f -o -type f -links +1 \
+    -o \( ! -uid "$owner_id" ! -uid 0 \) -o -perm /022 \) -printf x -quit) || return 1
+  [[ -z $invalid ]] || {
+    echo "Postgres init requires ordinary owner-controlled directories and files without links" >&2
+    return 1
+  }
+  # Keep the original inner sha256sum even for an init tree without files.
+  digest=$(cd "$dir" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16) \
+    || return 1
+  printf '%s\n' "$digest"
+}
+
 safe_run() { pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
   --security-opt=label=disable -v "$SB":/sandbox "$@"; }
 
@@ -589,13 +633,22 @@ ports_label() { local IFS=,; printf '%s' "${PORTS[*]}"; }
 # FIDO/U2F security keys: hidraw nodes whose HID usage page is 0xF1D0 (never keyboards/mice).
 # Prints one line per key: /dev/hidrawN|Manufacturer Product|vid:pid
 detect_keys() {
-  "${H[@]}" sh -c 'for h in /sys/class/hidraw/hidraw*; do
+  "${H[@]}" sh -c 'display_field() { LC_ALL=C tr -cd " -~" < "$1" | LC_ALL=C tr -d "|"; }
+  for h in /sys/class/hidraw/hidraw*; do
+    node=${h##*/}
+    case ${node#hidraw} in ""|*[!0-9]*) continue ;; esac
     [ -r "$h/device/report_descriptor" ] || continue
     [ "$(head -c3 "$h/device/report_descriptor" | od -An -tx1 | tr -d " \n")" = 06d0f1 ] || continue
     u=$(readlink -f "$h/device")/../..
-    printf "%s|%s %s|%s:%s\n" "/dev/${h##*/}" "$(cat "$u/manufacturer" 2>/dev/null)" \
-      "$(cat "$u/product" 2>/dev/null)" "$(cat "$u/idVendor" 2>/dev/null)" "$(cat "$u/idProduct" 2>/dev/null)"
+    printf "%s|%s %s|%s:%s\n" "/dev/$node" "$(display_field "$u/manufacturer" 2>/dev/null)" \
+      "$(display_field "$u/product" 2>/dev/null)" "$(display_field "$u/idVendor" 2>/dev/null)" "$(display_field "$u/idProduct" 2>/dev/null)"
   done; true' 2>/dev/null || true
+}
+fido_device_nodes() {
+  local node rest
+  while IFS='|' read -r node rest; do
+    if [[ $node =~ ^/dev/hidraw[0-9]+$ ]]; then printf '%s\n' "$node"; fi
+  done
 }
 
 # Pods of all instances: labelled ones, plus the default pod made by versions before labels existed.
@@ -702,6 +755,8 @@ load_pg_config() {
     [[ $v != *$'\n'* && $v != *$'\r'* ]] || die "Postgres user, password and database must not contain newlines"
   done
   PG_INIT=${OC_PG_INIT_DIR:-$cdir/postgres-init}
+  [[ $PG_INIT == /* ]] || PG_INIT="$CALLER_PWD/$PG_INIT"
+  PG_INIT=$(host_input postgres-path "$PG_INIT") || die "refusing unsafe host Postgres init directory"
 }
 
 # ---- teardown -----------------------------------------------------------------
@@ -798,6 +853,9 @@ if (( DELETE )); then
 fi
 
 if (( PG )); then load_pg_config; fi   # fail early, before building or starting anything
+BRIDGE_SRC=$(trusted_file "$SCRIPT_DIR/oc-bridge.py") || die "missing or unsafe oc-bridge.py beside the launcher"
+CODE_BIN=$(host_input editor "$CODE_BIN") || die "OC_CODE_BIN must be an absolute path outside the sandbox"
+BC_BIN=$(host_input editor "$BC_BIN") || die "OC_BCOMPARE_BIN must be an absolute path outside the sandbox"
 OPENCODE_VERSION=${OC_OPENCODE_VERSION:-}
 if [[ -n $OPENCODE_VERSION && $OPENCODE_VERSION != keep && ! $OPENCODE_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]]; then
   die "OC_OPENCODE_VERSION must be keep or a version such as 2.3.0"
@@ -1089,11 +1147,14 @@ fi
 # agent-writable tree by name and never hands one to VS Code / Beyond Compare: it copies the requested
 # files with descriptor-relative no-follow opens into a host-owned staging directory, opens the copy,
 # and writes saved edits back the same way. See the header of oc-bridge.py. Shared by all instances.
-[[ -f $SCRIPT_DIR/oc-bridge.py ]] || { echo "missing $SCRIPT_DIR/oc-bridge.py (incomplete checkout?)" >&2; exit 1; }
 "${H[@]}" python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
   || echo "warning: the host bridge needs python3 >= 3.11 on the host; 'code'/'bcompare' will do nothing" >&2
-atomic_host_file "$BIN/oc-bridge" 0755 < "$SCRIPT_DIR/oc-bridge.py"
-unit_env() { local v=${2//%/%%}; v=${v//\\/\\\\}; printf 'Environment="%s=%s"\n' "$1" "${v//\"/\\\"}"; }
+atomic_host_file "$BIN/oc-bridge" 0755 < "$BRIDGE_SRC"
+unit_env() {
+  [[ $2 != *$'\n'* && $2 != *$'\r'* ]] || die "invalid line break in $1"
+  local v=${2//%/%%}
+  v=${v//\\/\\\\}; printf 'Environment="%s=%s"\n' "$1" "${v//\"/\\\"}"
+}
 {
   printf '[Unit]\nDescription=Restricted host bridge for the OpenCode sandbox\n[Service]\nType=oneshot\n'
   unit_env OC_SB "$SB"; unit_env OC_BRIDGE_STAGE "$BRIDGE_STAGE"
@@ -1249,11 +1310,15 @@ create_pg_auth_secrets() {
     pm secret create --replace "$PGPASSSECRET" - >/dev/null || return 1
 }
 ensure_postgres() {
-  local pg_state pg_cfg want_cfg sig legacy vsig init_hash="" ok=0 p
-  local pgargs=()
-  if [[ -d $PG_INIT ]] && [[ -n $(ls -A "$PG_INIT" 2>/dev/null) ]]; then
-    init_hash=$(cd "$PG_INIT" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
-    pgargs+=(-v "$PG_INIT:/docker-entrypoint-initdb.d:ro,Z")
+  local pg_state pg_cfg want_cfg sig legacy vsig init_hash ok=0 p init
+  local pgargs=() init_fields=()
+  init=$(host_input postgres-init "$PG_INIT") || die "could not inspect the host Postgres init directory"
+  mapfile -t init_fields <<<"$init"
+  init_hash=${init_fields[1]:-}
+  [[ ${init_fields[0]:-} == /* && ${#init_fields[@]} -le 2 && $init_hash =~ ^([0-9a-f]{16})?$ ]] \
+    || die "invalid host Postgres init metadata"
+  if [[ -n $init_hash ]]; then
+    pgargs+=(-v "${init_fields[0]}:/docker-entrypoint-initdb.d:ro,Z")
   fi
   # Postgres only reads user/password/db/init scripts when the data volume is first created, so the
   # volume remembers the settings it was created with; a mismatch is refused instead of silently ignored.
@@ -1518,9 +1583,9 @@ have_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.cfg"}}' "$C
 # Security keys: pass ONLY FIDO hidraw nodes (see detect_keys); -K disables.
 keys=""
 if (( NOKEY )); then echo "Security keys: disabled (-K)"; else keys=$(detect_keys); fi
-fido_nodes=$(printf '%s\n' "$keys" | cut -d'|' -f1 | grep . || true)
+fido_nodes=$(fido_device_nodes <<<"$keys")
 devargs=()
-for n in $fido_nodes; do devargs+=(--device "$n"); done
+while IFS= read -r n; do [[ -z $n ]] || devargs+=(--device "$n"); done <<<"$fido_nodes"
 (( ${#devargs[@]} )) && devargs+=(-v /run/udev:/run/udev:ro)   # Chromium enumerates HID via udev
 while IFS='|' read -r node name id; do
   [[ -n $node ]] && echo "Security key: $name [$id] -> $node"
