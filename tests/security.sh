@@ -404,6 +404,51 @@ class CopyTests(unittest.TestCase):
             self.assertTrue(self.sync(session))
         self.assertEqual(self.target.read_bytes(), edit)
 
+    def test_pending_save_name_is_private(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        fsync = os.fsync
+
+        def during_copy(fd):
+            fsync(fd)
+            self.assertEqual(list(self.target.parent.glob(".oc-bridge-*")), [])
+
+        with patch.object(os, "fsync", side_effect=during_copy):
+            self.assertTrue(self.sync(session))
+        self.assertEqual(self.target.read_bytes(), edit)
+
+    def test_replaced_publication_keeps_private_save(self):
+        for changed in (False, True):
+            with self.subTest(conflict=changed):
+                self.target.write_bytes(base)
+                session, staged = self.stage()
+                staged.write_bytes(edit)
+                dest = self.target
+                operation = "rename"
+                if changed:
+                    self.target.write_bytes(b"concurrent edit")
+                    dest = self.target.with_name("edit.txt.host-edit")
+                    operation = "link"
+                publish = getattr(os, operation)
+
+                def replace_published_inode(*args, **kwargs):
+                    publish(*args, **kwargs)
+                    replacement = dest.with_name("other-inode")
+                    replacement.write_bytes(b"replacement")
+                    os.replace(replacement, dest)
+
+                with patch.object(os, operation, side_effect=replace_published_inode):
+                    self.assertFalse(self.sync(session))
+                self.assertEqual(dest.read_bytes(), b"replacement")
+                self.assertEqual(staged.read_bytes(), edit)
+
+    def test_cross_mount_preserves_private_save(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        with patch.object(os, "rename", side_effect=OSError(errno.EXDEV, "fixture")):
+            self.assertFalse(self.sync(session))
+        self.assert_preserved(staged)
+
     def sync(self, session):
         with (session / "manifest.json").open() as manifest:
             entry = json.load(manifest)["entries"][0]
@@ -529,7 +574,8 @@ kill $swapper; wait $swapper 2>/dev/null || true
 check "race: host file never shown to the tool ($(grep -c . "$T/tool.args" 2>/dev/null || echo 0) opened)" \
   ! grep -q "$SECRET" "$T/tool.seen" 2>/dev/null
 check "race: host file never written"       victim_ok
-check "race: edits reached the sandbox file" [ -n "$(find "$SB/construct" -name f -type f -exec grep -l '^race-' {} +)" ]
+check "race: at least one save was published or retained privately" \
+  [ -n "$(find "$SB/construct" "$T/stage" \( -name f -o -name f.host-edit \) -type f -exec grep -l '^race-' {} +)" ]
 
 # ================================================================================================
 # Every run of the real script below goes through stubs: Podman, systemctl, pkexec, sudo and

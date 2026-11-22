@@ -12,8 +12,8 @@ a pathname inside OC_SB to anything (desktop tools included), and never resolves
   swapped in cannot block or be read.
 * VS Code / Beyond Compare open a *copy* in OC_BRIDGE_STAGE (host-owned, mode 0700, never mounted).
   The watcher checks and reads each staged save through the same no-follow regular-file descriptor.
-  It writes to a new file created O_EXCL|O_NOFOLLOW in the pinned sandbox parent directory,
-  then checks the target before renaming. An observed conflict is saved under a new sibling name
+  It writes a replacement in private host staging and checks the target before renaming
+  into its pinned sandbox parent. An observed conflict is saved under a new sibling name
   without replacing an older conflict copy. An edit can still race the final check and rename.
   A session with an unsuccessful final write-back keeps its staged copies for recovery.
 
@@ -332,45 +332,63 @@ def stage_files(session, tool, paths):
 
 def write_back(entry, source):
     """Copy the edited staged file back into the sandbox, never through a symlink."""
-    parts, name = entry["parts"], entry["parts"][-1]
     root = open_root()
     try:
-        parent = open_dirs(root, parts[:-1])
+        parent = open_dirs(root, entry["parts"][:-1])
     finally:
         os.close(root)
     try:
-        tmp = f".oc-bridge-{secrets.token_hex(12)}"
-        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                      entry.get("mode", 0o644) & 0o777, dir_fd=parent)
+        stage = os.open(STAGE, DIR_FLAGS)
         try:
-            copy_stable_file(source, out, MAX_FILE)
-            if SELINUX_LEVEL is not None:
-                if not re.fullmatch(r"s0:c[0-9]+,c[0-9]+", SELINUX_LEVEL):
-                    raise Refused("invalid configured bridge SELinux level")
-                context = f"system_u:object_r:container_file_t:{SELINUX_LEVEL}"
-                os.setxattr(out, "security.selinux", context.encode("ascii"))
+            tmp = f".oc-bridge-{secrets.token_hex(12)}"
+            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                          entry.get("mode", 0o644) & 0o777, dir_fd=stage)
             try:
-                cur = os.stat(name, dir_fd=parent, follow_symlinks=False)
-                unchanged = stat.S_ISREG(cur.st_mode) and ident(cur) == entry["target"]
-            except FileNotFoundError:
-                unchanged = False
-            if unchanged:
-                os.rename(tmp, name, src_dir_fd=parent, dst_dir_fd=parent)
-                entry["target"] = ident(os.fstat(out))
-            else:
-                dest = name + ".host-edit"
-                if len(os.fsencode(dest)) > os.fpathconf(parent, 'PC_NAME_MAX'):
-                    dest = "host-edit-" + secrets.token_hex(12)
-                os.link(tmp, dest, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
-                log(f"{'/'.join(parts)} changed in the sandbox; saved your edit as {dest}")
+                copy_stable_file(source, out, MAX_FILE)
+                if SELINUX_LEVEL is not None:
+                    if not re.fullmatch(r"s0:c[0-9]+,c[0-9]+", SELINUX_LEVEL):
+                        raise Refused("invalid configured bridge SELinux level")
+                    context = f"system_u:object_r:container_file_t:{SELINUX_LEVEL}"
+                    os.setxattr(out, "security.selinux", context.encode("ascii"))
+                try:
+                    publish_save(entry, parent, stage, tmp, ident(os.fstat(out)))
+                except OSError as error:
+                    if error.errno == errno.EXDEV:
+                        raise Refused("host stage and sandbox must share a mount for write-back") from error
+                    raise
+            finally:
+                os.close(out)
+                try:
+                    os.unlink(tmp, dir_fd=stage)
+                except FileNotFoundError:
+                    pass
         finally:
-            try:
-                os.unlink(tmp, dir_fd=parent)
-            except OSError:
-                pass
-            os.close(out)
+            os.close(stage)
     finally:
         os.close(parent)
+
+
+def publish_save(entry, parent, stage, tmp, prepared):
+    parts, name = entry["parts"], entry["parts"][-1]
+    try:
+        cur = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        unchanged = stat.S_ISREG(cur.st_mode) and ident(cur) == entry["target"]
+    except FileNotFoundError:
+        unchanged = False
+    if unchanged:
+        dest = name
+        os.rename(tmp, dest, src_dir_fd=stage, dst_dir_fd=parent)
+    else:
+        dest = name + ".host-edit"
+        if len(os.fsencode(dest)) > os.fpathconf(parent, 'PC_NAME_MAX'):
+            dest = "host-edit-" + secrets.token_hex(12)
+        os.link(tmp, dest, src_dir_fd=stage, dst_dir_fd=parent, follow_symlinks=False)
+    if ident(os.stat(dest, dir_fd=parent, follow_symlinks=False)) != prepared:
+        raise Refused("published file changed before verification")
+    if unchanged:
+        entry["target"] = prepared
+    else:
+        log(f"{'/'.join(parts)} changed in the sandbox; saved your edit as {dest}")
 
 
 def open_staged_file(files_fd, parts):

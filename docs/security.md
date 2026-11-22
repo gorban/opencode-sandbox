@@ -67,11 +67,11 @@ default. The containers share your host kernel. A microVM runtime such as libkru
   - opens files `O_NONBLOCK` and checks the open descriptor with `fstat`, so FIFOs and devices are refused;
   - copies the content into `~/.local/share/oc-sandbox/bridge-stage/` (host-owned, 0700, not mounted) and
     opens that copy;
-  - writes saved edits back by creating a new file `O_EXCL|O_NOFOLLOW` in the pinned parent directory and
-    applying the sandbox's SELinux label before publishing it. It checks the target just before
-    renaming. A detected conflict gets a new sibling copy, usually
-    `NAME.host-edit`. If that destination exists, the staged save remains available for recovery.
-    A concurrent edit can still race the final check and rename;
+  - prepares saved edits in private host staging and applies the sandbox's SELinux label before
+    publication. It checks the target before renaming and verifies the published inode. A detected
+    conflict gets a new sibling copy, usually `NAME.host-edit`. If the destination exists, its
+    identity changes during publication, or publication crosses a mount boundary, the staged save
+    remains available for recovery. A concurrent edit can still race the final check and rename;
   - pins `.bridge/requests` the same way before draining it in paced batches. A symlink there is
     unlinked. Invalid nonempty directories are moved out of the queue without traversing their
     contents. The move leaves them under `.bridge/` until sandbox bridge cleanup.
