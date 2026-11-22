@@ -9,6 +9,16 @@ import sys
 WAIT_ALL_CHILDREN = 0x40000000  # Linux __WALL includes non-SIGCHLD clone children.
 
 
+def reap_exited_children():
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG | WAIT_ALL_CHILDREN)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
 def main():
     child_fd = None
     pending = set()
@@ -38,11 +48,8 @@ def main():
     finally:
         fd, child_fd = child_fd, None
         os.close(fd)
+    reap_exited_children()
     rc = child.returncode
-    while True:
-        try:
-            if os.waitpid(-1, os.WNOHANG | WAIT_ALL_CHILDREN)[0] == 0: break
-        except ChildProcessError: break
     return rc if rc >= 0 else 128 - rc
 
 
