@@ -603,15 +603,20 @@ production tests untouched):
 - [x] **Reworked CLI PoC (`docs/prds/spikes/l/oc_sandbox_cli.py`)** — implements `plan`, `config`,
       and `worker` subcommands against an explicit `--config-dir`.
 - [x] **Comprehensive Offline Adversarial & Unit Test Suite (`docs/prds/spikes/l/test_poc.py`)** —
-      22 tests verifying DAG cycles, ambiguous provider & diamond conflicts, fallback inside DAG
-      (and refusing escalating/incomparable fallbacks), `[local]` active-root pruning + remote-
-      endpoint SSRF denial, 0-MCP Postgres wiring, named-instance port allocation, endpoint
-      exposure denial (`9222`, unauthenticated `5432`), persona conflict & `[composition] replace`,
-      single-pass `{{slot}}` & symlink rejection, MCP role filtering, structural secret &
-      forbidden-env rejection, `executables.toml` hook/latest rejection, `plan_digest` invariance
-      across drift, orchestrator MCP framing/duplicate-key/depth/token/restart-rotation/opaque-ID/
-      allowlist/`builtin/*`/archive-dependent/`unarchive`-revalidation/stale-closure/
-      `"applying"`-and-`"uncertain"`-recovery/rollback-replay/digest-mismatch rejection.
+      29 tests verifying DAG cycles, ambiguous provider & diamond conflicts, fallback inside DAG
+      (and refusing escalating/incomparable fallbacks), alternate-port builtin capability
+      downgrade prevention, same-service multi-instance `instance_port` & `service@instance`
+      disambiguation, `[local]` active-root pruning + remote-endpoint SSRF denial (including
+      CGNAT `100.64.0.0/10` and octal/decimal/hex IPv4), pod-local MCP SSRF & port `9222`
+      rejection, 0-MCP Postgres wiring, endpoint exposure denial (`9222`, unauthenticated `5432`),
+      persona conflict & `[composition] replace`, single-pass `{{slot}}` & symlink rejection,
+      multi-hop `$SB` symlink rejection, MCP role filtering, structural secret & forbidden-env
+      rejection, `executables.toml` hook/latest rejection, 64-node DAG cap, `plan_digest`
+      invariance across drift, `security_delta` & `classify_drift` coverage, injective `/` -> `@`
+      store paths, and orchestrator MCP framing/write-timeout/redacted-`config_diff`/duplicate-key/
+      depth/token/restart-rotation/opaque-ID/allowlist/`builtin/*`/archive-dependent/`unarchive`-
+      revalidation/stale-closure/`"applying"`-and-`"uncertain"`-recovery/rollback-replay/digest-
+      mismatch/TTL-bound/CLI-`O_NOFOLLOW` rejection.
 
 ## Review record
 
@@ -622,6 +627,17 @@ production tests untouched):
 - Gate 1 design review round 3 (`Security-Focused PR Reviewer Setup`, `3ce6887cc8f7..325ab192f9c1`):
   **CLEARED** at commit `325ab192f9c151043cd8a9f8a689f67e1d190f64` (`docs/prds/prd_l.md` SHA-256
   `dd848a069a9937fffda9b955264b2ebb48ff91473ead9a562a065d28308d4310`).
-- Gate 2 PoC implementation review (`Security-Focused PR Reviewer Setup`): pending.
+- Gate 2 PoC implementation review round 1 (`Security-Focused PR Reviewer Setup`,
+  `325ab192f9c1..3a7f22b02f69`): 4 P1 and 4 P2 findings addressed with 7 new regression tests
+  verified failing on `3a7f22b` and passing on `9ab446b`.
+- Gate 2 PoC implementation review round 2 (`Security-Focused PR Reviewer Setup`,
+  `3a7f22b02f69..9ab446ba19ca`): **CLEARED** at commit `9ab446ba19ca28dcca555aa43ebbd99eb1c96726`
+  (29/29 tests passing; full Gate 2 range `325ab192f9c1..9ab446ba19ca`).
+  - Non-blocking P3 notes recorded for the future production port:
+    1. Anchor `_check_no_raw_secret_value` prefixes at token boundaries (avoiding false positives
+       for hyphenated prose words containing `sk-` such as `task-runner` or `disk-cache`).
+    2. Walk raw uncollapsed path components (before `os.path.abspath`) in
+       `_walk_check_not_in_sandbox` so `$SB/../outside` is rejected as transiting `$SB`, matching
+       production `oc-sandbox`'s `trusted_path()`.
 
 - [ ] **Human review**: checked only when the user says so
