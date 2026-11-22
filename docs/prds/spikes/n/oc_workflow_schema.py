@@ -208,29 +208,52 @@ def _to_finite_decimal(value: Any, field: str) -> Decimal:
     return dec
 
 
+def _scale_exact_decimal(
+    dec: Decimal,
+    *,
+    max_decimals: int,
+    max_scaled: int,
+    field: str,
+) -> int:
+    """Scale a non-negative Decimal using exact (sign, digits, exp) with zero context rounding."""
+    sign, digits, exp = dec.as_tuple()
+    if not isinstance(exp, int):
+        raise WorkflowSchemaError(f"{field}: non-finite decimal rejected")
+    if sign != 0 and any(d != 0 for d in digits):
+        raise WorkflowSchemaError(f"{field}: must be >= 0")
+    if not any(d != 0 for d in digits):
+        return 0
+    # Strip trailing zeros so e.g. 0.2500000 -> (25, -2) without touching Decimal context.
+    trimmed = list(digits)
+    while trimmed and trimmed[-1] == 0:
+        trimmed.pop()
+        exp += 1
+    if exp < -max_decimals:
+        raise WorkflowSchemaError(f"{field}: exceeds {max_decimals} decimal places")
+    # Check digit magnitude BEFORE computing giant integer powers (e.g. 1e100000).
+    shift = max_decimals + exp
+    max_digits = len(str(max_scaled))
+    if len(trimmed) + shift > max_digits:
+        raise WorkflowSchemaError(f"{field}: exceeds maximum allowed ceiling")
+    coeff = 0
+    for d in trimmed:
+        coeff = coeff * 10 + d
+    scaled = coeff * (10 ** shift)
+    if scaled > max_scaled:
+        raise WorkflowSchemaError(f"{field}: exceeds maximum allowed ceiling")
+    return scaled
+
+
 def parse_microdollars(value: Any, field: str) -> int:
     """Parse non-negative USD amount (<= 6 decimal places, <= $1,000) to exact integer microdollars."""
     dec = _to_finite_decimal(value, field)
-    if dec < 0:
-        raise WorkflowSchemaError(f"{field}: must be >= 0")
-    scaled = dec * Decimal(1_000_000)
-    if scaled != scaled.to_integral_value():
-        raise WorkflowSchemaError(f"{field}: exceeds 6 decimal places (sub-microdollar)")
-    micro = int(scaled)
-    if micro > MAX_SPEND_MICROUSD:
-        raise WorkflowSchemaError(f"{field}: exceeds maximum allowed ceiling")
-    return micro
+    return _scale_exact_decimal(dec, max_decimals=6, max_scaled=MAX_SPEND_MICROUSD, field=field)
 
 
 def parse_basis_points(value: Any, field: str) -> int:
     """Parse [0, 1] ratio (<= 4 decimal places) to exact integer basis points (0..10_000)."""
     dec = _to_finite_decimal(value, field)
-    if dec < 0 or dec > 1:
-        raise WorkflowSchemaError(f"{field}: must be in [0, 1]")
-    scaled = dec * Decimal(10_000)
-    if scaled != scaled.to_integral_value():
-        raise WorkflowSchemaError(f"{field}: exceeds 4 decimal places")
-    return int(scaled)
+    return _scale_exact_decimal(dec, max_decimals=4, max_scaled=10_000, field=field)
 
 
 def parse_namespaced_id(value: Any, field: str) -> tuple[str, str, str]:

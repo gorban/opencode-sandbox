@@ -241,14 +241,17 @@ class TestWorkflowSchemaAndAst(unittest.TestCase):
         self.assertEqual(ok_max.limits.max_decisions_spend_microusd, 1_000_000_000)
         self.assertEqual(ok_max.blind_check.fp_drift_warn_threshold_bps, 10_000)  # type: ignore[union-attr]
 
-        # Values immediately past precision or magnitude boundaries MUST fail (parse_float=Decimal!)
+        # Values immediately past precision, beyond 28-digit Decimal context, or past magnitude bounds MUST fail
         for bad_toml in (
             _supervisor_toml(decisions_spend="0.0000009"),
             _supervisor_toml(decisions_spend="0.0000011"),
+            _supervisor_toml(decisions_spend="1.00000000000000000000000000000001"),
             _supervisor_toml(decisions_spend="1000.000001"),
             _supervisor_toml(decisions_spend="1e20"),
+            _supervisor_toml(decisions_spend="1e1000"),
             _supervisor_toml(fp_threshold="0.00001"),
             _supervisor_toml(fp_threshold="0.25001"),
+            _supervisor_toml(fp_threshold="0.25000000000000000000000000000001"),
             _supervisor_toml(fp_threshold="1.0001"),
         ):
             with self.assertRaises(WorkflowSchemaError):
@@ -564,13 +567,17 @@ class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
             caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4,
             clock=self.clock, project_members=members,
         )
-        lanes.attach(TargetIncarnation("local/proj-a-1", "inc-1"), receipt=r_proj, authority_store=store, clock=self.clock)
-        # Different project target rejected
+        proj_a_target = TargetIncarnation("local/proj-a-1", "inc-1")
         other_proj_target = TargetIncarnation("local/proj-b-1", "inc-2")
+        remote_target = TargetIncarnation("remote-1/proj-a-r", "inc-3")
+        store.register_active_incarnation(proj_a_target)
+        store.register_active_incarnation(other_proj_target)
+        store.register_active_incarnation(remote_target)
+        lanes.attach(proj_a_target, receipt=r_proj, authority_store=store, clock=self.clock)
+        # Different project target rejected
         with self.assertRaises(AuthorityError):
             lanes.attach(other_proj_target, receipt=r_proj, authority_store=store, clock=self.clock)
         # Remote target excluded when allow_remote_workers=False
-        remote_target = TargetIncarnation("remote-1/proj-a-r", "inc-3")
         with self.assertRaises(AuthorityError):
             lanes.attach(remote_target, receipt=r_proj, authority_store=store, clock=self.clock)
 
@@ -721,6 +728,8 @@ class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
         )
         lane_a = TargetIncarnation("local/lane-a", "inc-1")
         lane_b = TargetIncarnation("local/lane-b", "inc-2")
+        store.register_active_incarnation(lane_a)
+        store.register_active_incarnation(lane_b)
 
         # Target inside caller_subtree but outside plan.bound_targets fails closed
         with self.assertRaises(AuthorityError):
@@ -781,13 +790,74 @@ class TestCompileMaterializeAndLaneAuthority(unittest.TestCase):
         with self.assertRaises(AuthorityError):
             lanes.attach(lane_a, receipt=r_owner, authority_store=store, clock=self.clock)
 
-        # Mixed-role guard tested on a fresh unrevoked incarnation
+        # Mixed-role guard tested on a fresh explicitly registered incarnation
         lane_a_fresh = TargetIncarnation("local/lane-a", "inc-fresh")
+        store.register_active_incarnation(lane_a_fresh)
         lanes.attach(lane_a_fresh, receipt=r_obs, authority_store=store, clock=self.clock)
         rec_obs = store.verify_active(r_obs, clock=self.clock)
         rec_obs.lane_access = "exclusive_owner"
         with self.assertRaises(MixedLaneRoleError):
             lanes.attach(lane_a_fresh, receipt=r_obs, authority_store=store, clock=self.clock)
+
+    def test_admission_reauthenticates_forged_plan_fields_and_strict_incarnation_inventory(self) -> None:
+        skill_root = _make_skill_tree(self.root, "user", "observer-guide", b"# Obs\n")
+        _make_skill_tree(self.root, "builtin", "firstmate-guide", b"# Sup\n")
+        store = RunAuthorityStore()
+        lanes = LaneLeaseRegistry()
+        subtree_a = frozenset({"local/lane-a"})
+
+        # Forged CompiledWorkflowPlan claiming observe-only reachable_effects while spec contains nudge_sandbox
+        bad_sig = '\n[[signal_handlers]]\nsignal = "go"\neffects = ["nudge_sandbox"]\n'
+        p_real_nudge = compile_workflow_plan(
+            _observe_only_toml(extra_signals=bad_sig),
+            is_builtin=False,
+            skill_root=skill_root,
+            model_catalog=self.catalog,
+        )
+        forged_effects_plan = CompiledWorkflowPlan(
+            **{**p_real_nudge.__dict__, "reachable_effects": frozenset({"read_metrics"})}
+        )
+        with self.assertRaises(AdmissionDeniedError):
+            evaluate_admission(
+                forged_effects_plan, store, principal_id="orch-1", caller_role="orchestrator",
+                caller_subtree=subtree_a, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=self.clock,
+            )
+
+        # Forged skill_slug disagreeing with spec.skill_slug fails admission AND materialization before writes!
+        p_sup = compile_workflow_plan(
+            _supervisor_toml(), is_builtin=True, skill_root=skill_root, model_catalog=self.catalog,
+        )
+        forged_slug_plan = CompiledWorkflowPlan(**{**p_sup.__dict__, "skill_slug": "../escape"})
+        with self.assertRaises(AdmissionDeniedError):
+            evaluate_admission(
+                forged_slug_plan, store, principal_id="op-1", caller_role="operator",
+                caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4,
+                clock=self.clock,
+            )
+        r_sup = evaluate_admission(
+            p_sup, store, principal_id="op-1", caller_role="operator",
+            caller_subtree=self.empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4,
+            clock=self.clock,
+        )
+        with self.assertRaises(MaterializationError):
+            materialize_workflow_plan(
+                forged_slug_plan, r_sup, authority_store=store, clock=self.clock, staging_root=self.staging,
+            )
+        self.assertEqual(list(self.staging.iterdir()), [])
+
+        # Strict fixture-owned incarnation inventory: unregistered targets fail closed at first attach AND after retire!
+        unregistered = TargetIncarnation("local/lane-unreg", "inc-1")
+        with self.assertRaises(AuthorityError):
+            lanes.attach(unregistered, receipt=r_sup, authority_store=store, clock=self.clock)
+        store.register_active_incarnation(unregistered)
+        lanes.attach(unregistered, receipt=r_sup, authority_store=store, clock=self.clock)
+        lanes.revoke_target_incarnation(unregistered, authority_store=store)
+
+        unregistered_replacement = TargetIncarnation("local/lane-unreg", "inc-2")
+        with self.assertRaises(AuthorityError):
+            lanes.attach(unregistered_replacement, receipt=r_sup, authority_store=store, clock=self.clock)
+        store.register_active_incarnation(unregistered_replacement)
+        lanes.attach(unregistered_replacement, receipt=r_sup, authority_store=store, clock=self.clock)
 
 
 if __name__ == "__main__":

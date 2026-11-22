@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import secrets
 import stat
 from collections import deque
@@ -23,6 +24,7 @@ from oc_workflow_schema import (
 
 MAX_SKILL_BYTES = 65_536
 SKILL_FILENAME = "SKILL.md"
+_SAFE_DIR_COMPONENT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
 _STATE_SHAPE_EFFECTS: dict[str, frozenset[str]] = {
     "ship_lane": frozenset({"spawn_lane", "acquire_lane_lease"}),
@@ -213,6 +215,18 @@ def recompute_plan_digests(plan: CompiledWorkflowPlan) -> tuple[str, str, str]:
     }
     plan_digest = domain_sha256(PLAN_DIGEST_DOMAIN, plan_body)
     return spec_digest, skill_sha256, plan_digest
+
+
+def _verify_plan_binding(plan: CompiledWorkflowPlan) -> tuple[str, str, str]:
+    """Verify plan wrapper fields agree with spec and recomputed digests."""
+    spec_d, skill_d, plan_d = recompute_plan_digests(plan)
+    if (spec_d, skill_d, plan_d) != (plan.spec_digest, plan.skill_sha256, plan.workflow_plan_digest):
+        raise AdmissionDeniedError("PLAN_INTEGRITY_MISMATCH")
+    if plan.reachable_effects != compute_reachable_effects(plan.spec):
+        raise AdmissionDeniedError("PLAN_REACHABLE_EFFECTS_MISMATCH")
+    if (plan.skill_namespace, plan.skill_slug) != (plan.spec.skill_namespace, plan.spec.skill_slug):
+        raise AdmissionDeniedError("PLAN_SKILL_IDENTITY_MISMATCH")
+    return spec_d, skill_d, plan_d
 
 
 # --- Descriptor-anchored trusted traversal, O_NOFOLLOW, O_NONBLOCK, and dir_fd helpers ---
@@ -682,10 +696,10 @@ class RunAuthorityStore:
             del self._active_incarnations[target.sandbox_addr]
 
     def is_incarnation_active(self, target: TargetIncarnation) -> bool:
+        """Require exact match against independently registered fixture inventory."""
         if target in self._revoked_incarnations:
             return False
-        active = self._active_incarnations.get(target.sandbox_addr)
-        return active is None or active == target.incarnation_id
+        return self._active_incarnations.get(target.sandbox_addr) == target.incarnation_id
 
     def _init_accounting(self, record: RunAuthorityRecord) -> None:
         lim = record.approved_plan.spec.limits
@@ -724,9 +738,7 @@ class RunAuthorityStore:
             raise AdmissionDeniedError("grant_generation must be >= 1")
         if not math.isfinite(expires_at_wall_s):
             raise AdmissionDeniedError("expires_at_wall_s must be finite")
-        spec_d, skill_d, plan_d = recompute_plan_digests(plan)
-        if (spec_d, skill_d, plan_d) != (plan.spec_digest, plan.skill_sha256, plan.workflow_plan_digest):
-            raise AdmissionDeniedError("PLAN_INTEGRITY_MISMATCH")
+        _, _, plan_d = _verify_plan_binding(plan)
         record = RunAuthorityRecord(
             run_id=run_id,
             grant_generation=grant_generation,
@@ -1018,7 +1030,7 @@ def _can_auto_admit_observe_only(
         and plan.spec.excerpt_disclosure.mode == "none"
         and effective_scope.is_non_vacuous()
         and active_orchestrator_runs < max_active_orchestrator_runs
-        and plan.reachable_effects.issubset(OBSERVE_ONLY_ALLOWED_EFFECTS)
+        and compute_reachable_effects(plan.spec).issubset(OBSERVE_ONLY_ALLOWED_EFFECTS)
     )
 
 
@@ -1038,6 +1050,7 @@ def evaluate_admission(
     tier_a_lease: WorkflowRunLease | None = None,
 ) -> AdmissionReceipt:
     """Admit a compiled plan and mint its live RunAuthorityRecord."""
+    _verify_plan_binding(plan)
     _validate_positive_ttl(operator_lease_ttl_s, "operator_lease_ttl_s")
     _validate_positive_ttl(auto_observer_ttl_s, "auto_observer_ttl_s")
     lane_access: LaneAccess = (
@@ -1123,7 +1136,10 @@ def materialize_workflow_plan(
     if record.materialized:
         raise MaterializationError("RECEIPT_ALREADY_MATERIALIZED")
 
-    spec_d, skill_d, plan_d = recompute_plan_digests(plan)
+    try:
+        spec_d, skill_d, plan_d = _verify_plan_binding(plan)
+    except AdmissionDeniedError as exc:
+        raise MaterializationError("PLAN_INTEGRITY_MISMATCH") from exc
     approved = record.approved_plan
     if (
         plan_d != record.workflow_plan_digest
@@ -1133,8 +1149,10 @@ def materialize_workflow_plan(
     ):
         raise MaterializationError("PLAN_INTEGRITY_MISMATCH")
 
-    # Digest-specific skill directory prevents successive revisions sharing a slug from colliding!
-    skill_dir_name = f"wf-{approved.skill_namespace}-{approved.skill_slug}-{plan_d[:16]}"
+    # Digest-specific skill directory derived strictly from verified spec & validated as one component!
+    skill_dir_name = f"wf-{approved.spec.skill_namespace}-{approved.spec.skill_slug}-{plan_d[:16]}"
+    if not _SAFE_DIR_COMPONENT_RE.match(skill_dir_name):
+        raise MaterializationError(f"invalid skill directory component: {skill_dir_name!r}")
     lock_filename = f"{plan_d}.lock.json"
     lock_bytes = canonical_json_bytes(approved.to_lock_dict())
 
@@ -1186,7 +1204,6 @@ class LaneLeaseRegistry:
         clock: ClockSnapshot,
     ) -> None:
         record = authority_store.verify_active(receipt, clock=clock, target=target)
-        authority_store.register_active_incarnation(target)
         run_id = record.run_id
         if run_id in self._run_roles and self._run_roles[run_id] != record.lane_access:
             raise MixedLaneRoleError(f"run {run_id!r} cannot hold mixed lane roles")

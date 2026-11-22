@@ -16,13 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from oc_workflow_plan import (
     AuthorityError,
     ClockSnapshot,
+    CompiledWorkflowPlan,
     LaneLeaseRegistry,
     RunAuthorityStore,
     TargetIncarnation,
     compile_workflow_plan,
     evaluate_admission,
 )
-from oc_workflow_schema import ExcerptDisclosureSpec
+from oc_workflow_schema import ExcerptDisclosureSpec, parse_and_validate_workflow_toml
 from oc_workflow_supervision import (
     BlindCheckResponse,
     BlindToolCall,
@@ -160,6 +161,7 @@ class TestSupervisionCore(unittest.TestCase):
             model_catalog=self.catalog,
         )
         store = RunAuthorityStore()
+        store.register_active_incarnation(self.target)
         receipt = evaluate_admission(
             plan, store, principal_id="op-1", caller_role="operator",
             caller_subtree=frozenset(), active_orchestrator_runs=0, max_active_orchestrator_runs=4,
@@ -168,6 +170,7 @@ class TestSupervisionCore(unittest.TestCase):
         lanes = LaneLeaseRegistry()
         lanes.attach(self.target, receipt=receipt, authority_store=store, clock=self._clock())
         replay_registry = ReplayGrantRegistry()
+        ledger = CalibrationLedger()
         d_adapter = decisions_adapter or LocalRulesDecisionsAdapter()
         b_verifier = blind_verifier or ScriptedBlindVerifier()
         gate = SupervisionBrokerGate(
@@ -176,6 +179,8 @@ class TestSupervisionCore(unittest.TestCase):
             canary_scanner=OverlapCanaryScanner(corpus),
             authority_store=store,
             lease_registry=lanes,
+            ledger=ledger,
+            model_catalog=self.catalog,
             replay_registry=replay_registry,
         )
         ctx = SupervisionRunContext(
@@ -189,7 +194,7 @@ class TestSupervisionCore(unittest.TestCase):
                 reserved_audit_checks_per_hour=fleet_audit_hr,
             ),
             lease_registry=lanes,
-            ledger=CalibrationLedger(),
+            ledger=ledger,
         )
         return _Harness(
             ctx=ctx,
@@ -211,18 +216,35 @@ class TestSupervisionCore(unittest.TestCase):
         self.assertEqual(r1.status, "verified_ok")
         self.assertEqual(h.b_verifier.invocation_count, 1)
         sys1_payload = json.loads(h.d_adapter.payload_history[0].decode("utf-8"))
+        blind_payload = json.loads(h.b_verifier.payload_history[0].decode("utf-8"))
+        expected_metric_keys = {
+            "consecutive_errors",
+            "error_class",
+            "http_429_count",
+            "http_5xx_count",
+            "human_input_lease_active",
+            "last_transport_frame_at",
+            "quota_5h_remaining_pct",
+            "stall_seconds",
+        }
         self.assertEqual(sys1_payload["canary_question"], "noul(classifier_injection_suspected)")
         self.assertNotIn("sanitized_last_error_excerpt", sys1_payload)
+        self.assertNotIn("sanitized_last_error_excerpt", blind_payload)
+        self.assertEqual(set(sys1_payload["trusted_metrics"].keys()), expected_metric_keys)
+        self.assertEqual(set(blind_payload["trusted_metrics"].keys()), expected_metric_keys)
 
         # Second independent SupervisionBrokerGate & context using the SAME store/receipt MUST see 0 blind balance left!
         d_adapter2 = LocalRulesDecisionsAdapter()
         b_verifier2 = ScriptedBlindVerifier()
+        ledger2 = CalibrationLedger()
         gate2 = SupervisionBrokerGate(
             decisions_adapter=d_adapter2,
             blind_verifier=b_verifier2,
             canary_scanner=OverlapCanaryScanner(),
             authority_store=h.ctx.authority_store,
             lease_registry=h.ctx.lease_registry,
+            ledger=ledger2,
+            model_catalog=self.catalog,
             replay_registry=h.replay_registry,
         )
         ctx2 = SupervisionRunContext(
@@ -232,7 +254,7 @@ class TestSupervisionCore(unittest.TestCase):
             broker_gate=gate2,
             fleet_budget=FleetCheckBudget(max_concurrent=2, max_checks_per_hour=30, reserved_audit_checks_per_hour=8),
             lease_registry=h.ctx.lease_registry,
-            ledger=CalibrationLedger(),
+            ledger=ledger2,
         )
         r2 = process_supervision_tick(
             ctx2, LaneSupervisionState(target=self.target), snap_fn, self._clock, sleep_detector=HostSleepDetector()
@@ -418,6 +440,7 @@ class TestSupervisionCore(unittest.TestCase):
         )
         for idx in range(3):
             lane = TargetIncarnation(f"local/lane-{idx}", f"inc-{idx}")
+            h.ctx.authority_store.register_active_incarnation(lane)
             h.ctx.lease_registry.attach(lane, receipt=h.ctx.receipt, authority_store=h.ctx.authority_store, clock=self._clock())
             st = LaneSupervisionState(target=lane)
             lane_snap = _snapshot(lane)
@@ -608,7 +631,9 @@ class TestSupervisionCore(unittest.TestCase):
             confusion_outcome="TN",
         )
         ledger.record_outcome(rec_fp)
-        ledger.record_cap_event(stratum="triggered_leading", outcome="cap_dropped")
+        ledger.record_cap_event(
+            run_id=receipt.run_id, target=self.target, stratum="triggered_leading", outcome="cap_dropped"
+        )
         ledger.record_outcome(rec_audit)
 
         grant = CalibrationReplayGrant(
@@ -635,7 +660,7 @@ class TestSupervisionCore(unittest.TestCase):
             h.ctx.broker_gate.invoke_decisions_replay(
                 grant_id=grant.grant_id,
                 candidate_plan=plan,
-                record=rec_audit,
+                sample_id=rec_audit.sample_id,
                 caller_id="op-1",
                 caller_role="operator",
                 caller_subtree=empty_sub,
@@ -655,7 +680,7 @@ class TestSupervisionCore(unittest.TestCase):
             h.ctx.broker_gate.invoke_decisions_replay(
                 grant_id=grant.grant_id,
                 candidate_plan=tampered_plan,
-                record=rec_fp,
+                sample_id=rec_fp.sample_id,
                 caller_id="op-1",
                 caller_role="operator",
                 caller_subtree=empty_sub,
@@ -668,6 +693,7 @@ class TestSupervisionCore(unittest.TestCase):
         scorecard = run_calibration_replay(
             grant.grant_id, plan, ["s_fp_1"], ledger,
             authority_store=store, replay_registry=h.replay_registry, broker_gate=h.ctx.broker_gate,
+            model_catalog=self.catalog,
             caller_id="op-1", caller_role="operator", caller_subtree=empty_sub,
             clock_provider=self._clock,
         )
@@ -682,6 +708,7 @@ class TestSupervisionCore(unittest.TestCase):
         run_calibration_replay(
             grant.grant_id, plan, ["s_fp_1"], ledger,
             authority_store=store, replay_registry=h.replay_registry, broker_gate=h.ctx.broker_gate,
+            model_catalog=self.catalog,
             caller_id="op-1", caller_role="operator", caller_subtree=empty_sub,
             clock_provider=self._clock,
         )
@@ -689,6 +716,7 @@ class TestSupervisionCore(unittest.TestCase):
             run_calibration_replay(
                 grant.grant_id, plan, ["s_fp_1"], ledger,
                 authority_store=store, replay_registry=h.replay_registry, broker_gate=h.ctx.broker_gate,
+                model_catalog=self.catalog,
                 caller_id="op-1", caller_role="operator", caller_subtree=empty_sub,
                 clock_provider=self._clock,
             )
@@ -723,19 +751,249 @@ class TestSupervisionCore(unittest.TestCase):
             canary_scanner=OverlapCanaryScanner(),
             authority_store=store,
             lease_registry=h.ctx.lease_registry,
+            ledger=ledger,
+            model_catalog=self.catalog,
             replay_registry=h.replay_registry,
         )
         with self.assertRaises(ReplayAuthorizationError):
             new_gate.invoke_decisions_replay(
                 grant_id=grant.grant_id,
                 candidate_plan=plan,
-                record=rec_fp,
+                sample_id=rec_fp.sample_id,
                 caller_id="op-1",
                 caller_role="operator",
                 caller_subtree=empty_sub,
                 clock=now_t,
             )
         self.assertEqual(d_adapter_new.invocation_count, 0)
+
+    def test_admitted_plan_used_over_tampered_ctx_plan_and_verifier_crash_retains_hourly_slot(self) -> None:
+        nudge_resp = BlindCheckResponse(tool_calls=(BlindToolCall("health_nudge_lane", {"template_id": "nudge_stalled"}),))
+        h = self._setup_run(blind_verifier=ScriptedBlindVerifier([nudge_resp, nudge_resp]))
+
+        # Tamper ctx.plan while preserving cached workflow_plan_digest: runtime MUST use record.approved_plan!
+        tampered_toml = (
+            _supervisor_toml()
+            .replace("defer_nudge_during_human_lease = true", "defer_nudge_during_human_lease = false")
+            .replace("Check lane", "TAMPERED")
+        )
+        tampered_spec = parse_and_validate_workflow_toml(tampered_toml, is_builtin=True)
+        tampered_ctx_plan = CompiledWorkflowPlan(**{**h.ctx.plan.__dict__, "spec": tampered_spec})
+        tampered_ctx = SupervisionRunContext(
+            receipt=h.ctx.receipt,
+            plan=tampered_ctx_plan,
+            authority_store=h.ctx.authority_store,
+            broker_gate=h.ctx.broker_gate,
+            fleet_budget=h.ctx.fleet_budget,
+            lease_registry=h.ctx.lease_registry,
+            ledger=h.ctx.ledger,
+        )
+
+        # Human lease deferral still honors admitted plan (True), NOT tampered ctx.plan (False)!
+        snap_human = _snapshot(self.target, human_lease=True)
+        res_def = process_supervision_tick(
+            tampered_ctx, h.lane_state, lambda _t: snap_human, self._clock, sleep_detector=h.sleep
+        )
+        self.assertEqual(res_def.status, "deferred_human_lease")
+
+        # Action rendering uses admitted plan's template, NOT tampered ctx.plan's template!
+        self.now[0] = ClockSnapshot(monotonic_s=500.0, wall_s=1400.0)
+        snap_free = _snapshot(self.target, human_lease=False)
+        res_act = process_supervision_tick(
+            tampered_ctx, LaneSupervisionState(target=self.target), lambda _t: snap_free, self._clock,
+            sleep_detector=HostSleepDetector(),
+        )
+        self.assertEqual(res_act.status, "action_executed")
+        self.assertIsNotNone(res_act.rendered_nudge)
+        self.assertTrue((res_act.rendered_nudge or "").startswith("Check lane "))
+        self.assertNotIn("TAMPERED", res_act.rendered_nudge or "")
+
+        # Post-entry blind verifier crash releases concurrency slot while retaining hourly consumption!
+        def crash_verifier(_payload: bytes) -> None:
+            raise RuntimeError("simulated verifier crash")
+
+        h_crash = self._setup_run(
+            blind_verifier=ScriptedBlindVerifier(on_call=crash_verifier),
+            fleet_max_concurrent=1,
+            fleet_max_hr=1,
+            fleet_audit_hr=0,
+        )
+        crash_snap = _snapshot(self.target)
+        crash_provider = lambda _t: crash_snap
+        with self.assertRaises(RuntimeError):
+            process_supervision_tick(
+                h_crash.ctx, h_crash.lane_state, crash_provider, self._clock, sleep_detector=h_crash.sleep
+            )
+        self.assertEqual(h_crash.ctx.fleet_budget.active_count, 0)
+        res_next = process_supervision_tick(
+            h_crash.ctx, LaneSupervisionState(target=self.target), crash_provider, self._clock,
+            sleep_detector=HostSleepDetector(),
+        )
+        self.assertEqual(res_next.status, "triggered_leading_cap_dropped")
+
+    def test_replay_unknown_sample_zero_samples_tariff_scoped_notes_and_unified_classification(self) -> None:
+        d_adapter = LocalRulesDecisionsAdapter(
+            [
+                DecisionsAdapterResponse(choice="escalate_human"),
+                DecisionsAdapterResponse(choice="stalled_loop"),
+            ]
+        )
+        h = self._setup_run(decisions_adapter=d_adapter)
+        plan = h.ctx.plan
+        store = h.ctx.authority_store
+        receipt = h.ctx.receipt
+        ledger = h.ctx.ledger
+        empty_sub: frozenset[str] = frozenset()
+        now_t = self._clock()
+
+        # Run 1 samples: class_mismatch on triggered_leading + excluded stratum triggered_trailing
+        rec_mismatch = CalibrationRecord(
+            sample_id="s_mismatch_1",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            target=self.target,
+            stratum="triggered_leading",
+            frozen_snapshot=_snapshot(self.target, stall_s=700, errors=4),
+            sys1_verdict="escalate_human",
+            blind_tool="health_nudge_lane",
+            confusion_outcome="class_mismatch",
+        )
+        rec_trailing = CalibrationRecord(
+            sample_id="s_trailing_1",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            target=self.target,
+            stratum="triggered_trailing",
+            frozen_snapshot=_snapshot(self.target, stall_s=700, errors=4),
+            sys1_verdict="stalled_loop",
+            blind_tool="health_nudge_lane",
+            confusion_outcome="excluded",
+        )
+        ledger.record_outcome(rec_mismatch)
+        ledger.record_outcome(rec_trailing)
+
+        # Second run adds cap_dropped, abstention, and FP in triggered_leading -> MUST NOT pollute Run 1 notes!
+        lane2 = TargetIncarnation("local/lane-b", "inc-b1")
+        store.register_active_incarnation(lane2)
+        receipt2 = evaluate_admission(
+            plan, store, principal_id="op-2", caller_role="operator",
+            caller_subtree=empty_sub, active_orchestrator_runs=0, max_active_orchestrator_runs=4, clock=now_t,
+        )
+        ledger.record_cap_event(
+            run_id=receipt2.run_id, target=lane2, stratum="triggered_leading", outcome="cap_dropped"
+        )
+        ledger.record_abstention(
+            run_id=receipt2.run_id, target=lane2, stratum="triggered_leading", source="system1"
+        )
+        ledger.record_outcome(
+            CalibrationRecord(
+                sample_id="s_run2_fp",
+                run_id=receipt2.run_id,
+                workflow_id=plan.spec.id,
+                target=lane2,
+                stratum="triggered_leading",
+                frozen_snapshot=_snapshot(lane2, stall_s=0, errors=0),
+                sys1_verdict="stalled_loop",
+                blind_tool="health_record_ok",
+                confusion_outcome="FP",
+            )
+        )
+
+        grant_ok = CalibrationReplayGrant(
+            grant_id="replay_unified_1",
+            requesting_principal="op-1",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            candidate_spec_digest=plan.spec_digest,
+            candidate_rubric_digest=plan.candidate_rubric_digest or "",
+            authorized_sample_scope=frozenset({"triggered_leading", "triggered_trailing"}),
+            approved_decisions_route="decisions:local-rules-v1",
+            approved_model="local-rules-v1",
+            excerpt_disclosure_policy=ExcerptDisclosureSpec(mode="none"),
+            max_replay_samples=5,
+            max_replay_calls=5,
+            max_replay_spend_microusd=10_000,
+            expires_at_wall_s=2000.0,
+        )
+        h.replay_registry.register(grant_ok)
+
+        # Direct broker call with unknown sample_id fails closed with 0 calls & 0 spend
+        with self.assertRaises(ReplayAuthorizationError):
+            h.ctx.broker_gate.invoke_decisions_replay(
+                grant_id=grant_ok.grant_id,
+                candidate_plan=plan,
+                sample_id="s_missing",
+                caller_id="op-1",
+                caller_role="operator",
+                caller_subtree=empty_sub,
+                clock=now_t,
+            )
+
+        # Direct broker call with mismatched/negative candidate tariff fails closed with 0 calls & 0 spend
+        for bad_cost in (0, -500):
+            forged_cost_plan = CompiledWorkflowPlan(**{**plan.__dict__, "decisions_call_cost_microusd": bad_cost})
+            with self.assertRaises(ReplayAuthorizationError):
+                h.ctx.broker_gate.invoke_decisions_replay(
+                    grant_id=grant_ok.grant_id,
+                    candidate_plan=forged_cost_plan,
+                    sample_id=rec_mismatch.sample_id,
+                    caller_id="op-1",
+                    caller_role="operator",
+                    caller_subtree=empty_sub,
+                    clock=now_t,
+                )
+
+        # Direct broker call against grant with max_replay_samples=0 hits BudgetExhaustedError (0 calls & 0 spend)
+        grant_zero = CalibrationReplayGrant(
+            grant_id="replay_zero_samples",
+            requesting_principal="op-1",
+            run_id=receipt.run_id,
+            workflow_id=plan.spec.id,
+            candidate_spec_digest=plan.spec_digest,
+            candidate_rubric_digest=plan.candidate_rubric_digest or "",
+            authorized_sample_scope=frozenset({"triggered_leading"}),
+            approved_decisions_route="decisions:local-rules-v1",
+            approved_model="local-rules-v1",
+            excerpt_disclosure_policy=ExcerptDisclosureSpec(mode="none"),
+            max_replay_samples=0,
+            max_replay_calls=5,
+            max_replay_spend_microusd=10_000,
+            expires_at_wall_s=2000.0,
+        )
+        h.replay_registry.register(grant_zero)
+        with self.assertRaises(BudgetExhaustedError):
+            h.ctx.broker_gate.invoke_decisions_replay(
+                grant_id=grant_zero.grant_id,
+                candidate_plan=plan,
+                sample_id=rec_mismatch.sample_id,
+                caller_id="op-1",
+                caller_role="operator",
+                caller_subtree=empty_sub,
+                clock=now_t,
+            )
+        self.assertEqual(d_adapter.invocation_count, 0)
+        self.assertEqual(h.replay_registry.usage(grant_ok.grant_id), (0, 0))
+        self.assertEqual(h.replay_registry.usage(grant_zero.grant_id), (0, 0))
+
+        # Authorized replay scorecard: unified class_mismatch + excluded classification AND run-scoped notes!
+        scorecard = run_calibration_replay(
+            grant_ok.grant_id, plan, ["s_mismatch_1", "s_trailing_1"], ledger,
+            authority_store=store, replay_registry=h.replay_registry, broker_gate=h.ctx.broker_gate,
+            model_catalog=self.catalog,
+            caller_id="op-1", caller_role="operator", caller_subtree=empty_sub,
+            clock_provider=self._clock,
+        )
+        self.assertEqual(scorecard.original_per_stratum["triggered_leading"]["class_mismatch"], 1)
+        self.assertEqual(scorecard.candidate_per_stratum["triggered_leading"]["class_mismatch"], 1)
+        self.assertEqual(scorecard.candidate_per_stratum["triggered_leading"]["TP"], 0)
+        self.assertEqual(scorecard.original_per_stratum["triggered_trailing"]["excluded"], 1)
+        self.assertEqual(scorecard.candidate_per_stratum["triggered_trailing"]["excluded"], 1)
+        # Run 2's cap_dropped / abstention / FP MUST NOT appear in Run 1's scoped notes!
+        notes = scorecard.stratum_notes["triggered_leading"]
+        self.assertEqual(notes["cap_dropped"], 0)
+        self.assertEqual(notes["sys1_abstentions"], 0)
+        self.assertEqual(notes["blind_abstentions"], 0)
+        self.assertEqual(notes["inclusion_rate"], 1.0)
 
 
 if __name__ == "__main__":

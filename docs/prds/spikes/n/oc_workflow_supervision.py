@@ -19,8 +19,10 @@ from oc_workflow_plan import (
     CompiledWorkflowPlan,
     LaneAuthorityError,
     LaneLeaseRegistry,
+    ModelCatalog,
     RunAuthorityStore,
     TargetIncarnation,
+    WorkflowPlanError,
     recompute_plan_digests,
 )
 from oc_workflow_schema import (
@@ -125,7 +127,7 @@ class ProgressFingerprint:
 
 @dataclass(frozen=True)
 class TrustedMetrics:
-    """Host-observed metrics plane with closed allowlisted error_class."""
+    """Host-observed metrics plane; outbound projection emits strictly numeric/boolean/closed-enum fields."""
 
     target: TargetIncarnation
     stall_seconds: int
@@ -141,12 +143,12 @@ class TrustedMetrics:
     error_class: str = ""
 
     def __post_init__(self) -> None:
-        if self.error_class not in ALLOWED_HOST_ERROR_CLASSES:
-            raise SupervisionError(f"unallowlisted host error_class {self.error_class!r}")
+        _validate_trusted_metric_values(self)
 
-    def to_payload_dict(self, *, metrics_only_strict: bool = False) -> dict[str, Any]:
-        """Project trusted metrics; strict mode emits strictly numeric/boolean/closed-enum fields."""
-        base: dict[str, Any] = {
+    def to_payload_dict(self) -> dict[str, Any]:
+        """Validate and project strictly numeric/boolean/closed-enum fields for outbound model payloads."""
+        _validate_trusted_metric_values(self)
+        return {
             "consecutive_errors": self.consecutive_errors,
             "error_class": self.error_class,
             "http_429_count": self.http_429_count,
@@ -156,17 +158,26 @@ class TrustedMetrics:
             "quota_5h_remaining_pct": self.quota_5h_remaining_pct,
             "stall_seconds": self.stall_seconds,
         }
-        if metrics_only_strict:
-            return base
-        base.update(
-            {
-                "provider_route": self.provider_route,
-                "remote_worker": self.remote_worker,
-                "target_addr": self.target.sandbox_addr,
-                "target_incarnation_id": self.target.incarnation_id,
-            }
-        )
-        return base
+
+
+def _validate_trusted_metric_values(m: TrustedMetrics) -> None:
+    if m.error_class not in ALLOWED_HOST_ERROR_CLASSES:
+        raise SupervisionError(f"unallowlisted host error_class {m.error_class!r}")
+    for name, val in (
+        ("stall_seconds", m.stall_seconds),
+        ("consecutive_errors", m.consecutive_errors),
+        ("http_429_count", m.http_429_count),
+        ("http_5xx_count", m.http_5xx_count),
+        ("quota_5h_remaining_pct", m.quota_5h_remaining_pct),
+    ):
+        if type(val) is not int or val < 0:
+            raise SupervisionError(f"trusted metric {name!r} must be a non-negative int")
+    if m.quota_5h_remaining_pct > 100:
+        raise SupervisionError("quota_5h_remaining_pct must be <= 100")
+    if type(m.human_input_lease_active) is not bool:
+        raise SupervisionError("human_input_lease_active must be bool")
+    if type(m.last_transport_frame_at) is bool or not math.isfinite(m.last_transport_frame_at):
+        raise SupervisionError("last_transport_frame_at must be a finite number")
 
 
 @dataclass(frozen=True)
@@ -315,6 +326,10 @@ class FleetCheckBudget:
         self._triggered_times: deque[float] = deque()
         self._audit_times: deque[float] = deque()
 
+    @property
+    def active_count(self) -> int:
+        return self._active
+
     def _prune(self, now_mono: float) -> None:
         cutoff = now_mono - 3600.0
         while self._triggered_times and self._triggered_times[0] <= cutoff:
@@ -349,7 +364,7 @@ class FleetCheckBudget:
             self._active -= 1
 
     def rollback(self, kind: Literal["triggered", "scheduled_audit"]) -> None:
-        """Roll back an admitted slot when the downstream broker gate blocks before invocation."""
+        """Roll back an admitted slot ONLY when the broker refuses BEFORE adapter entry."""
         self.release()
         bucket = self._triggered_times if kind == "triggered" else self._audit_times
         if bucket:
@@ -378,6 +393,13 @@ class CalibrationReplayGrant:
     def __post_init__(self) -> None:
         if type(self.expires_at_wall_s) is bool or not math.isfinite(self.expires_at_wall_s):
             raise ReplayAuthorizationError("CalibrationReplayGrant.expires_at_wall_s must be finite")
+        for name, val in (
+            ("max_replay_samples", self.max_replay_samples),
+            ("max_replay_calls", self.max_replay_calls),
+            ("max_replay_spend_microusd", self.max_replay_spend_microusd),
+        ):
+            if type(val) is not int or val < 0:
+                raise ReplayAuthorizationError(f"CalibrationReplayGrant.{name} must be a non-negative int")
 
 
 @dataclass
@@ -385,11 +407,12 @@ class _RegisteredReplayGrant:
     grant: CalibrationReplayGrant
     calls_used: int = 0
     spend_microusd_used: int = 0
+    evaluated_sample_ids: set[str] = field(default_factory=set)
     revoked: bool = False
 
 
 class ReplayGrantRegistry:
-    """Fixture-owned authoritative registry for approved replay grants, balances, and revocation."""
+    """Fixture-owned authoritative registry for approved replay grants, balances, sample allowances, and revocation."""
 
     def __init__(self) -> None:
         self._grants: dict[str, _RegisteredReplayGrant] = {}
@@ -414,14 +437,27 @@ class ReplayGrantRegistry:
             raise ReplayAuthorizationError("REPLAY_GRANT_EXPIRED")
         return entry.grant
 
-    def reserve(self, grant_id: str, *, cost_microusd: int, clock: ClockSnapshot) -> bool:
+    def reserve(
+        self,
+        grant_id: str,
+        *,
+        sample_id: str,
+        cost_microusd: int,
+        clock: ClockSnapshot,
+    ) -> bool:
+        if type(cost_microusd) is not int or cost_microusd < 0:
+            raise ReplayAuthorizationError("replay cost_microusd must be a non-negative int")
         entry = self._grants.get(grant_id)
         if entry is None or entry.revoked or clock.wall_s >= entry.grant.expires_at_wall_s:
+            return False
+        next_samples = entry.evaluated_sample_ids | {sample_id}
+        if entry.grant.max_replay_samples <= 0 or len(next_samples) > entry.grant.max_replay_samples:
             return False
         if entry.calls_used + 1 > entry.grant.max_replay_calls:
             return False
         if entry.spend_microusd_used + cost_microusd > entry.grant.max_replay_spend_microusd:
             return False
+        entry.evaluated_sample_ids.add(sample_id)
         entry.calls_used += 1
         entry.spend_microusd_used += cost_microusd
         return True
@@ -527,7 +563,7 @@ class ScriptedBlindVerifier:
         return BlindCheckResponse(tool_calls=(BlindToolCall(tool="health_record_ok"),))
 
 
-# --- Stratified CalibrationLedger & Replay ---
+# --- Run- & Incarnation-Scoped CalibrationLedger ---
 
 
 @dataclass(frozen=True)
@@ -541,6 +577,16 @@ class CalibrationRecord:
     sys1_verdict: str | None
     blind_tool: str
     confusion_outcome: str  # TP | FP | TN | FN | class_mismatch | excluded
+
+
+@dataclass(frozen=True)
+class SupervisionObservation:
+    """Scoped abstention or cap-drop/delay observation retaining exact run and incarnation."""
+
+    run_id: str
+    target: TargetIncarnation
+    stratum: str
+    kind: Literal["sys1_abstain", "blind_abstain", "cap_delayed", "cap_dropped"]
 
 
 @dataclass
@@ -576,11 +622,12 @@ class StratumStats:
 
 
 class CalibrationLedger:
-    """Stratified reference-verdict confusion, inclusion-rate, cap-drop, and abstention ledger."""
+    """Stratified reference-verdict ledger with run- and incarnation-scoped observations."""
 
     def __init__(self) -> None:
         self._records: dict[str, CalibrationRecord] = {}
         self._order: list[str] = []
+        self._observations: list[SupervisionObservation] = []
         self._stats: dict[str, StratumStats] = {}
 
     def _stratum(self, name: str) -> StratumStats:
@@ -611,19 +658,101 @@ class CalibrationLedger:
         if attr is not None:
             setattr(st, attr, getattr(st, attr) + 1)
 
-    def record_abstention(self, *, stratum: str, source: Literal["sys1", "blind"]) -> None:
+    def record_abstention(
+        self,
+        *,
+        run_id: str,
+        target: TargetIncarnation,
+        stratum: str,
+        source: Literal["sys1", "blind"],
+    ) -> None:
+        kind: Literal["sys1_abstain", "blind_abstain"] = "sys1_abstain" if source == "sys1" else "blind_abstain"
+        self._observations.append(
+            SupervisionObservation(run_id=run_id, target=target, stratum=stratum, kind=kind)
+        )
         st = self._stratum(stratum)
         if source == "sys1":
             st.sys1_abstentions += 1
         else:
             st.blind_abstentions += 1
 
-    def record_cap_event(self, *, stratum: str, outcome: Literal["cap_delayed", "cap_dropped"]) -> None:
+    def record_cap_event(
+        self,
+        *,
+        run_id: str,
+        target: TargetIncarnation,
+        stratum: str,
+        outcome: Literal["cap_delayed", "cap_dropped"],
+    ) -> None:
+        self._observations.append(
+            SupervisionObservation(run_id=run_id, target=target, stratum=stratum, kind=outcome)
+        )
         st = self._stratum(stratum)
         if outcome == "cap_delayed":
             st.cap_delayed += 1
         else:
             st.cap_dropped += 1
+
+    def scoped_stratum_notes(
+        self,
+        stratum: str,
+        *,
+        run_id: str,
+        authority_store: RunAuthorityStore,
+        principal_id: str,
+        caller_role: CallerRole,
+        caller_subtree: frozenset[str],
+        clock: ClockSnapshot,
+    ) -> dict[str, float | int]:
+        """Aggregate inclusion, cap-drop/delay, and abstention notes strictly over authorized run inputs."""
+        scoped = StratumStats()
+        for rec in self.all_records():
+            if rec.run_id != run_id or rec.stratum != stratum:
+                continue
+            if not _is_authorized_scope(
+                authority_store, rec.run_id, rec.target, principal_id, caller_role, caller_subtree, clock
+            ):
+                continue
+            scoped.tp += 1  # counts as verified_count in scoped inclusion denominator
+        obs_attr = {
+            "sys1_abstain": "sys1_abstentions",
+            "blind_abstain": "blind_abstentions",
+            "cap_delayed": "cap_delayed",
+            "cap_dropped": "cap_dropped",
+        }
+        for obs in self._observations:
+            if obs.run_id != run_id or obs.stratum != stratum:
+                continue
+            if not _is_authorized_scope(
+                authority_store, obs.run_id, obs.target, principal_id, caller_role, caller_subtree, clock
+            ):
+                continue
+            attr = obs_attr[obs.kind]
+            setattr(scoped, attr, getattr(scoped, attr) + 1)
+        return scoped.notes_dict()
+
+
+def _is_authorized_scope(
+    authority_store: RunAuthorityStore,
+    run_id: str,
+    target: TargetIncarnation,
+    principal_id: str,
+    caller_role: CallerRole,
+    caller_subtree: frozenset[str],
+    clock: ClockSnapshot,
+) -> bool:
+    try:
+        authority_store.verify_record_access(
+            run_id=run_id,
+            principal_id=principal_id,
+            caller_role=caller_role,
+            caller_subtree=caller_subtree,
+            target=target,
+            clock=clock,
+        )
+        return True
+    except AuthorityError:
+        return False
 
 
 def query_calibration_examples(
@@ -647,16 +776,9 @@ def query_calibration_examples(
             continue
         if rec.target != rec.frozen_snapshot.trusted.target:
             continue
-        try:
-            authority_store.verify_record_access(
-                run_id=rec.run_id,
-                principal_id=principal_id,
-                caller_role=caller_role,
-                caller_subtree=caller_subtree,
-                target=rec.target,
-                clock=clock,
-            )
-        except AuthorityError:
+        if not _is_authorized_scope(
+            authority_store, rec.run_id, rec.target, principal_id, caller_role, caller_subtree, clock
+        ):
             continue
         authorized.append(rec)
         aggregates[rec.confusion_outcome] = aggregates.get(rec.confusion_outcome, 0) + 1
@@ -721,7 +843,7 @@ def _build_decisions_payload(
         "route": effective_route,
         "rubric": sys1.rubric,
         "store": False,
-        "trusted_metrics": snapshot.trusted.to_payload_dict(metrics_only_strict=metrics_only_override),
+        "trusted_metrics": snapshot.trusted.to_payload_dict(),
     }
     if include_canary_question:
         payload["canary_question"] = "noul(classifier_injection_suspected)"
@@ -753,7 +875,7 @@ def _build_blind_payload(
         "prompt": "Routine Lane Health Check",
         "route": blind_route,
         "store": False,
-        "trusted_metrics": snapshot.trusted.to_payload_dict(metrics_only_strict=False),
+        "trusted_metrics": snapshot.trusted.to_payload_dict(),
     }
     if excerpt is not None:
         payload["untrusted_excerpt_framed"] = frame_untrusted_excerpt(excerpt)
@@ -767,7 +889,8 @@ def _verify_grant_against_candidate_plan(
     candidate_plan: CompiledWorkflowPlan,
     *,
     caller_id: str,
-) -> System1Spec:
+    model_catalog: ModelCatalog,
+) -> tuple[System1Spec, int]:
     if grant.requesting_principal != caller_id:
         raise ReplayAuthorizationError("REPLAY_PRINCIPAL_MISMATCH")
     if grant.workflow_id != candidate_plan.spec.id:
@@ -784,7 +907,15 @@ def _verify_grant_against_candidate_plan(
         raise ReplayAuthorizationError("REPLAY_ROUTE_OR_MODEL_MISMATCH")
     if candidate_plan.spec.excerpt_disclosure != grant.excerpt_disclosure_policy:
         raise ReplayAuthorizationError("REPLAY_DISCLOSURE_POLICY_MISMATCH")
-    return sys1
+    try:
+        catalog_cost = model_catalog.lookup_decisions(
+            grant.approved_decisions_route, grant.approved_model
+        ).max_call_cost_microusd
+    except WorkflowPlanError as exc:
+        raise ReplayAuthorizationError(str(exc)) from exc
+    if candidate_plan.decisions_call_cost_microusd != catalog_cost:
+        raise ReplayAuthorizationError("REPLAY_TARIFF_MISMATCH")
+    return sys1, catalog_cost
 
 
 def _verify_replay_record_binding(
@@ -826,6 +957,8 @@ class SupervisionBrokerGate:
         canary_scanner: OverlapCanaryScanner,
         authority_store: RunAuthorityStore,
         lease_registry: LaneLeaseRegistry,
+        ledger: CalibrationLedger,
+        model_catalog: ModelCatalog,
         replay_registry: ReplayGrantRegistry | None = None,
     ) -> None:
         self._decisions_adapter = decisions_adapter
@@ -833,6 +966,8 @@ class SupervisionBrokerGate:
         self._canary_scanner = canary_scanner
         self._authority_store = authority_store
         self._lease_registry = lease_registry
+        self._ledger = ledger
+        self._model_catalog = model_catalog
         self._replay_registry = replay_registry or ReplayGrantRegistry()
 
     def invoke_decisions_live(
@@ -875,6 +1010,7 @@ class SupervisionBrokerGate:
         target: TargetIncarnation,
         snapshot_for_model: MetricSnapshot,
         clock: ClockSnapshot,
+        on_adapter_entry: Callable[[], None] | None = None,
     ) -> BlindCheckResponse:
         if snapshot_for_model.trusted.target != target:
             raise AuthorityError("SNAPSHOT_TARGET_MISMATCH")
@@ -895,6 +1031,8 @@ class SupervisionBrokerGate:
             receipt, cost_microusd=plan.blind_call_cost_microusd, clock=clock
         ):
             raise BudgetExhaustedError("blind check run budget exhausted")
+        if on_adapter_entry is not None:
+            on_adapter_entry()
         return self._blind_verifier.check(payload_bytes)
 
     def invoke_decisions_replay(
@@ -902,15 +1040,20 @@ class SupervisionBrokerGate:
         *,
         grant_id: str,
         candidate_plan: CompiledWorkflowPlan,
-        record: CalibrationRecord,
+        sample_id: str,
         caller_id: str,
         caller_role: CallerRole,
         caller_subtree: frozenset[str],
         clock: ClockSnapshot,
     ) -> DecisionsAdapterResponse:
-        """Enforce full grant, candidate digest, stratum, incarnation, disclosure, and budget checks at adapter boundary."""
+        """Resolve sample from fixture ledger and enforce full grant, tariff, sample, and budget checks."""
         grant = self._replay_registry.lookup_active(grant_id, clock=clock)
-        sys1 = _verify_grant_against_candidate_plan(grant, candidate_plan, caller_id=caller_id)
+        sys1, catalog_cost = _verify_grant_against_candidate_plan(
+            grant, candidate_plan, caller_id=caller_id, model_catalog=self._model_catalog
+        )
+        record = self._ledger.get_record(sample_id)
+        if record is None:
+            raise ReplayAuthorizationError(f"UNKNOWN_SAMPLE_ID: {sample_id!r}")
         _verify_replay_record_binding(
             grant,
             record,
@@ -931,16 +1074,17 @@ class SupervisionBrokerGate:
         self._canary_scanner.scan(payload_bytes, decoded_leaves=leaves)
         if not self._replay_registry.reserve(
             grant.grant_id,
-            cost_microusd=candidate_plan.decisions_call_cost_microusd,
+            sample_id=sample_id,
+            cost_microusd=catalog_cost,
             clock=clock,
         ):
-            raise BudgetExhaustedError("replay grant call or spend budget exhausted")
+            raise BudgetExhaustedError("replay grant sample, call, or spend budget exhausted")
         return self._decisions_adapter.evaluate(payload_bytes)
 
 
 @dataclass(frozen=True)
 class ReplayScorecard:
-    """Stratified before-vs-after reference-verdict scorecard with scoped inclusion and drop notes."""
+    """Stratified before-vs-after reference-verdict scorecard with run-scoped inclusion and drop notes."""
 
     grant_id: str
     candidate_rubric_digest: str
@@ -951,19 +1095,49 @@ class ReplayScorecard:
     evaluated_sample_ids: tuple[str, ...]
 
 
-def _classify_replay_bucket(
+def _empty_confusion_bucket() -> dict[str, int]:
+    return {"TP": 0, "FP": 0, "TN": 0, "FN": 0, "class_mismatch": 0, "excluded": 0, "abstain": 0}
+
+
+def _classify_confusion(
+    *,
+    stratum: str,
+    sys1_verdict: str | None,
+    healthy_choice: str,
+    blind_tool: str,
+) -> str:
+    if stratum in ("triggered_trailing", "canary_escalation") or sys1_verdict is None:
+        return "excluded"
+    sys1_alert = sys1_verdict != healthy_choice
+    blind_action = blind_tool != "health_record_ok"
+    if not stratum.startswith("scheduled_audit") and sys1_verdict == "escalate_human" and blind_action:
+        return "TP" if blind_tool == "health_escalate_human" else "class_mismatch"
+    table = {
+        (True, True): "TP",
+        (True, False): "FP",
+        (False, True): "FN",
+        (False, False): "TN",
+    }
+    return table[(sys1_alert, blind_action)]
+
+
+def _classify_replay_candidate(
     resp: DecisionsAdapterResponse,
     *,
+    stratum: str,
     choices: tuple[str, ...],
     abstain_default: str,
-    ref_action: bool,
+    blind_tool: str,
 ) -> str:
+    """Apply the EXACT same classification & exclusion rules as live scoring."""
     if resp.malformed or resp.injection_canary_positive or resp.choice not in choices:
         return "abstain"
-    is_alert = resp.choice != abstain_default
-    if is_alert:
-        return "TP" if ref_action else "FP"
-    return "FN" if ref_action else "TN"
+    return _classify_confusion(
+        stratum=stratum,
+        sys1_verdict=resp.choice,
+        healthy_choice=abstain_default,
+        blind_tool=blind_tool,
+    )
 
 
 def _authorize_replay_batch(
@@ -979,13 +1153,13 @@ def _authorize_replay_batch(
 ) -> list[CalibrationRecord]:
     if not sample_ids or len(sample_ids) != len(set(sample_ids)):
         raise ReplayAuthorizationError("sample_ids must be non-empty and deduplicated")
-    if len(sample_ids) > grant.max_replay_samples:
+    if grant.max_replay_samples <= 0 or len(sample_ids) > grant.max_replay_samples:
         raise ReplayAuthorizationError("sample_ids exceed max_replay_samples")
     records: list[CalibrationRecord] = []
     for sid in sample_ids:
         rec = ledger.get_record(sid)
         if rec is None:
-            raise ReplayAuthorizationError(f"unknown sample_id {sid!r}")
+            raise ReplayAuthorizationError(f"UNKNOWN_SAMPLE_ID: {sid!r}")
         _verify_replay_record_binding(
             grant,
             rec,
@@ -1008,15 +1182,18 @@ def run_calibration_replay(
     authority_store: RunAuthorityStore,
     replay_registry: ReplayGrantRegistry,
     broker_gate: SupervisionBrokerGate,
+    model_catalog: ModelCatalog,
     caller_id: str,
     caller_role: CallerRole,
     caller_subtree: frozenset[str],
     clock_provider: Callable[[], ClockSnapshot],
 ) -> ReplayScorecard:
-    """Run batch-preflighted, rubric-digest-bound calibration replay with before/after scorecard."""
+    """Run batch-preflighted, rubric-digest-bound replay with unified before/after & run-scoped notes."""
     t_start = clock_provider()
     grant = replay_registry.lookup_active(grant_id, clock=t_start)
-    sys1 = _verify_grant_against_candidate_plan(grant, candidate_plan, caller_id=caller_id)
+    sys1, _ = _verify_grant_against_candidate_plan(
+        grant, candidate_plan, caller_id=caller_id, model_catalog=model_catalog
+    )
     authorized_records = _authorize_replay_batch(
         grant,
         sample_ids,
@@ -1035,33 +1212,41 @@ def run_calibration_replay(
     evaluated: list[str] = []
 
     for rec in authorized_records:
+        t_call = clock_provider()
         resp = broker_gate.invoke_decisions_replay(
             grant_id=grant.grant_id,
             candidate_plan=candidate_plan,
-            record=rec,
+            sample_id=rec.sample_id,
             caller_id=caller_id,
             caller_role=caller_role,
             caller_subtree=caller_subtree,
-            clock=clock_provider(),
+            clock=t_call,
         )
         evaluated.append(rec.sample_id)
-        ob = orig_per_stratum.setdefault(
-            rec.stratum, {"TP": 0, "FP": 0, "TN": 0, "FN": 0, "class_mismatch": 0, "excluded": 0}
-        )
+        ob = orig_per_stratum.setdefault(rec.stratum, _empty_confusion_bucket())
         if rec.confusion_outcome in ob:
             ob[rec.confusion_outcome] += 1
-        cb = cand_per_stratum.setdefault(rec.stratum, {"TP": 0, "FP": 0, "TN": 0, "FN": 0, "abstain": 0})
-        cand_outcome = _classify_replay_bucket(
+        cb = cand_per_stratum.setdefault(rec.stratum, _empty_confusion_bucket())
+        cand_outcome = _classify_replay_candidate(
             resp,
+            stratum=rec.stratum,
             choices=sys1.choices,
             abstain_default=sys1.abstain_default,
-            ref_action=(rec.blind_tool != "health_record_ok"),
+            blind_tool=rec.blind_tool,
         )
         cb[cand_outcome] += 1
         if cand_outcome == "abstain":
             abstentions += 1
         if rec.stratum not in notes:
-            notes[rec.stratum] = ledger.stats_for(rec.stratum).notes_dict()
+            notes[rec.stratum] = ledger.scoped_stratum_notes(
+                rec.stratum,
+                run_id=grant.run_id,
+                authority_store=authority_store,
+                principal_id=caller_id,
+                caller_role=caller_role,
+                caller_subtree=caller_subtree,
+                clock=t_call,
+            )
 
     return ReplayScorecard(
         grant_id=grant.grant_id,
@@ -1123,7 +1308,7 @@ def _is_valid_sys1_response(resp: DecisionsAdapterResponse, choices: tuple[str, 
 
 def _validate_blind_response(
     resp: BlindCheckResponse,
-    plan: CompiledWorkflowPlan,
+    approved_plan: CompiledWorkflowPlan,
 ) -> BlindToolCall | None:
     if resp.malformed or len(resp.tool_calls) != 1:
         return None
@@ -1131,7 +1316,7 @@ def _validate_blind_response(
     if call.tool == "health_record_ok":
         return call if not call.args else None
     arg_checks: dict[str, tuple[str, frozenset[str] | set[str]]] = {
-        "health_nudge_lane": ("template_id", set(plan.spec.templates_map.keys())),
+        "health_nudge_lane": ("template_id", set(approved_plan.spec.templates_map.keys())),
         "health_escalate_human": ("category", ALLOWED_ESCALATION_CATEGORIES),
         "health_wake_orchestrator": ("reason_code", ALLOWED_WAKE_REASON_CODES),
     }
@@ -1144,28 +1329,6 @@ def _validate_blind_response(
     return call if call.args[key] in allowed_values else None
 
 
-def _classify_confusion(
-    *,
-    stratum: str,
-    sys1_verdict: str | None,
-    healthy_choice: str,
-    blind_tool: str,
-) -> str:
-    if stratum in ("triggered_trailing", "canary_escalation") or sys1_verdict is None:
-        return "excluded"
-    sys1_alert = sys1_verdict != healthy_choice
-    blind_action = blind_tool != "health_record_ok"
-    if not stratum.startswith("scheduled_audit") and sys1_verdict == "escalate_human" and blind_action:
-        return "TP" if blind_tool == "health_escalate_human" else "class_mismatch"
-    table = {
-        (True, True): "TP",
-        (True, False): "FP",
-        (False, True): "FN",
-        (False, False): "TN",
-    }
-    return table[(sys1_alert, blind_action)]
-
-
 def _execute_post_verdict_action(
     *,
     ctx: SupervisionRunContext,
@@ -1176,19 +1339,28 @@ def _execute_post_verdict_action(
     tool_call: BlindToolCall,
     outcome: str,
 ) -> SupervisionTickResult:
-    """Fetch fresh snapshot & clock, check freshness, pause, incarnation & action permissions, then act."""
+    """Fetch fresh snapshot & clock, resolve admitted approved_plan, check freshness/pause/action, then act."""
     fresh_snapshot = snapshot_provider(lane_state.target)
     t_action = clock_provider()
     if fresh_snapshot.trusted.target != lane_state.target:
         return SupervisionTickResult(status="suppressed_snapshot_target_mismatch", confusion_outcome=outcome)
+
+    try:
+        record = ctx.authority_store.verify_active(ctx.receipt, clock=t_action, target=lane_state.target)
+    except AuthorityError:
+        return SupervisionTickResult(
+            status="suppressed_post_verdict_authority_or_pause",
+            confusion_outcome=outcome,
+        )
+    approved_plan = record.approved_plan
+
     if fresh_snapshot.trusted.progress_fingerprint != frozen_snapshot.trusted.progress_fingerprint:
         lane_state.last_progress = fresh_snapshot.trusted.progress_fingerprint
         lane_state.incident_seq += 1
         return SupervisionTickResult(status="suppressed_by_freshness_progress", confusion_outcome=outcome)
-    if fresh_snapshot.trusted.human_input_lease_active and ctx.plan.spec.limits.defer_nudge_during_human_lease:
+    if fresh_snapshot.trusted.human_input_lease_active and approved_plan.spec.limits.defer_nudge_during_human_lease:
         return SupervisionTickResult(status="deferred_post_verdict_human_lease", confusion_outcome=outcome)
 
-    # Final decision point: enforce live run authority, unrevoked incarnation, pause state, AND action permissions!
     try:
         ctx.lease_registry.assert_can_act(
             ctx.receipt,
@@ -1217,11 +1389,11 @@ def _execute_post_verdict_action(
     ):
         return SupervisionTickResult(status="nudge_rate_or_dedupe_suppressed", confusion_outcome=outcome)
     rendered = render_template(
-        ctx.plan.spec.templates_map[tid],
+        approved_plan.spec.templates_map[tid],
         {
             "stall_seconds": fresh_snapshot.trusted.stall_seconds,
             "target_addr": lane_state.target.sandbox_addr,
-            "workflow_id": ctx.plan.spec.id,
+            "workflow_id": approved_plan.spec.id,
         },
     )
     return SupervisionTickResult(
@@ -1244,13 +1416,12 @@ def dispatch_blind_with_post_verdict_freshness(
     fleet_kind: Literal["triggered", "scheduled_audit"],
     update_throttle_window: bool = False,
 ) -> SupervisionTickResult:
-    """Execute blind check through SupervisionBrokerGate and apply post-verdict fresh snapshot & clock."""
+    """Execute blind check via SupervisionBrokerGate using record.approved_plan throughout."""
     t_pre = clock_provider()
-    ctx.authority_store.verify_active(
-        ctx.receipt, clock=t_pre, expected_plan_digest=ctx.plan.workflow_plan_digest, target=lane_state.target
-    )
+    record = ctx.authority_store.verify_active(ctx.receipt, clock=t_pre, target=lane_state.target)
+    approved_plan = record.approved_plan
     if not ctx.authority_store.can_afford_blind(
-        ctx.receipt, cost_microusd=ctx.plan.blind_call_cost_microusd, clock=t_pre
+        ctx.receipt, cost_microusd=approved_plan.blind_call_cost_microusd, clock=t_pre
     ):
         return SupervisionTickResult(
             status="blind_budget_exhausted_tier0_only",
@@ -1259,20 +1430,26 @@ def dispatch_blind_with_post_verdict_freshness(
 
     slot = ctx.fleet_budget.acquire(kind=fleet_kind, clock=t_pre)
     if slot != "admitted":
-        ctx.ledger.record_cap_event(stratum=stratum, outcome=slot)
+        ctx.ledger.record_cap_event(
+            run_id=ctx.receipt.run_id, target=lane_state.target, stratum=stratum, outcome=slot
+        )
         if slot == "cap_dropped" and update_throttle_window:
-            lane_state.enter_throttled(t_pre.monotonic_s + ctx.plan.spec.limits.throttle_period_s)
+            lane_state.enter_throttled(t_pre.monotonic_s + approved_plan.spec.limits.throttle_period_s)
         return SupervisionTickResult(status=f"{stratum}_{slot}")
 
-    invoked = False
+    attempted = [False]
+
+    def _mark_attempted() -> None:
+        attempted[0] = True
+
     try:
         blind_resp = ctx.broker_gate.invoke_blind_check_live(
             receipt=ctx.receipt,
             target=lane_state.target,
             snapshot_for_model=frozen_snapshot,
             clock=clock_provider(),
+            on_adapter_entry=_mark_attempted,
         )
-        invoked = True
     except BudgetExhaustedError:
         ctx.fleet_budget.rollback(fleet_kind)
         return SupervisionTickResult(
@@ -1280,21 +1457,26 @@ def dispatch_blind_with_post_verdict_freshness(
             fleet_notice_key=f"budget_exhausted:{ctx.receipt.run_id}:blind",
         )
     except Exception:
-        ctx.fleet_budget.rollback(fleet_kind)
-        raise
-    finally:
-        if invoked:
+        # Distinguish refusal BEFORE adapter entry (rollback) from failure AFTER entry (retain hourly charge)!
+        if attempted[0]:
             ctx.fleet_budget.release()
+        else:
+            ctx.fleet_budget.rollback(fleet_kind)
+        raise
+    else:
+        ctx.fleet_budget.release()
 
     if update_throttle_window:
-        lane_state.enter_throttled(t_pre.monotonic_s + ctx.plan.spec.limits.throttle_period_s)
+        lane_state.enter_throttled(t_pre.monotonic_s + approved_plan.spec.limits.throttle_period_s)
 
-    tool_call = _validate_blind_response(blind_resp, ctx.plan)
+    tool_call = _validate_blind_response(blind_resp, approved_plan)
     if tool_call is None:
-        ctx.ledger.record_abstention(stratum=stratum, source="blind")
+        ctx.ledger.record_abstention(
+            run_id=ctx.receipt.run_id, target=lane_state.target, stratum=stratum, source="blind"
+        )
         return SupervisionTickResult(status="blind_abstained")
 
-    healthy = ctx.plan.spec.system1.abstain_default if ctx.plan.spec.system1 else "healthy_progress"
+    healthy = approved_plan.spec.system1.abstain_default if approved_plan.spec.system1 else "healthy_progress"
     outcome = _classify_confusion(
         stratum=stratum,
         sys1_verdict=sys1_verdict,
@@ -1305,7 +1487,7 @@ def dispatch_blind_with_post_verdict_freshness(
         CalibrationRecord(
             sample_id=f"sample_{secrets.token_hex(6)}",
             run_id=ctx.receipt.run_id,
-            workflow_id=ctx.plan.spec.id,
+            workflow_id=approved_plan.spec.id,
             target=lane_state.target,
             stratum=stratum,
             frozen_snapshot=frozen_snapshot,
@@ -1331,13 +1513,14 @@ def dispatch_blind_with_post_verdict_freshness(
 def _handle_positive_canary(
     *,
     ctx: SupervisionRunContext,
+    approved_plan: CompiledWorkflowPlan,
     lane_state: LaneSupervisionState,
     frozen_snapshot: MetricSnapshot,
     snapshot_provider: Callable[[TargetIncarnation], MetricSnapshot],
     clock_provider: Callable[[], ClockSnapshot],
     repeated_canary_threshold: int,
 ) -> tuple[DecisionsAdapterResponse | None, SupervisionTickResult | None]:
-    sys1 = _require_system1(ctx.plan)
+    sys1 = _require_system1(approved_plan)
     lane_state.canary_hits += 1
     try:
         reeval = ctx.broker_gate.invoke_decisions_live(
@@ -1354,7 +1537,9 @@ def _handle_positive_canary(
             fleet_notice_key=f"security_canary:{lane_state.target.sandbox_addr}",
         )
     if not _is_valid_sys1_response(reeval, sys1.choices):
-        ctx.ledger.record_abstention(stratum="canary_escalation", source="sys1")
+        ctx.ledger.record_abstention(
+            run_id=ctx.receipt.run_id, target=lane_state.target, stratum="canary_escalation", source="sys1"
+        )
         return None, SupervisionTickResult(status="canary_reeval_abstained")
     if lane_state.canary_hits >= repeated_canary_threshold:
         res = dispatch_blind_with_post_verdict_freshness(
@@ -1375,6 +1560,7 @@ def _handle_positive_canary(
 def _evaluate_system1_with_canary(
     *,
     ctx: SupervisionRunContext,
+    approved_plan: CompiledWorkflowPlan,
     lane_state: LaneSupervisionState,
     frozen_snapshot: MetricSnapshot,
     snapshot_provider: Callable[[TargetIncarnation], MetricSnapshot],
@@ -1382,7 +1568,7 @@ def _evaluate_system1_with_canary(
     abstain_stratum: str,
     repeated_canary_threshold: int,
 ) -> tuple[DecisionsAdapterResponse | None, SupervisionTickResult | None]:
-    sys1 = _require_system1(ctx.plan)
+    sys1 = _require_system1(approved_plan)
     try:
         sys1_resp = ctx.broker_gate.invoke_decisions_live(
             receipt=ctx.receipt,
@@ -1398,12 +1584,15 @@ def _evaluate_system1_with_canary(
             fleet_notice_key=f"budget_exhausted:{ctx.receipt.run_id}:decisions",
         )
     if not _is_valid_sys1_response(sys1_resp, sys1.choices):
-        ctx.ledger.record_abstention(stratum=abstain_stratum, source="sys1")
+        ctx.ledger.record_abstention(
+            run_id=ctx.receipt.run_id, target=lane_state.target, stratum=abstain_stratum, source="sys1"
+        )
         return None, SupervisionTickResult(status="sys1_abstained_fail_closed")
     if not sys1_resp.injection_canary_positive:
         return sys1_resp, None
     return _handle_positive_canary(
         ctx=ctx,
+        approved_plan=approved_plan,
         lane_state=lane_state,
         frozen_snapshot=frozen_snapshot,
         snapshot_provider=snapshot_provider,
@@ -1422,16 +1611,16 @@ def process_supervision_tick(
     fault_coalescer: CorrelatedFaultCoalescer | None = None,
     repeated_canary_threshold: int = 2,
 ) -> SupervisionTickResult:
-    """Run one supervision tick with sleep detection, throttler-before-System-1, and broker gate."""
+    """Run one supervision tick using strictly record.approved_plan from live RunAuthorityStore."""
     t0 = clock_provider()
-    ctx.authority_store.verify_active(
-        ctx.receipt, clock=t0, expected_plan_digest=ctx.plan.workflow_plan_digest, target=lane_state.target
-    )
-    if sleep_detector.observe_and_in_grace(t0, wake_grace_s=ctx.plan.spec.limits.wake_grace_after_host_sleep_s):
+    approved_plan = ctx.authority_store.verify_active(
+        ctx.receipt, clock=t0, target=lane_state.target
+    ).approved_plan
+    if sleep_detector.observe_and_in_grace(t0, wake_grace_s=approved_plan.spec.limits.wake_grace_after_host_sleep_s):
         return SupervisionTickResult(status="deferred_wake_grace")
 
     frozen_snapshot = snapshot_provider(lane_state.target)
-    if frozen_snapshot.trusted.human_input_lease_active and ctx.plan.spec.limits.defer_nudge_during_human_lease:
+    if frozen_snapshot.trusted.human_input_lease_active and approved_plan.spec.limits.defer_nudge_during_human_lease:
         return SupervisionTickResult(status="deferred_human_lease")
 
     if fault_coalescer is not None:
@@ -1439,7 +1628,6 @@ def process_supervision_tick(
         if is_outage:
             return SupervisionTickResult(status="coalesced_fleet_outage", fleet_notice_key=notice_key)
 
-    # Check THROTTLED window boundary BEFORE System-1 so triggered_trailing genuinely bypasses System-1!
     if lane_state.mode == "THROTTLED" and t0.monotonic_s >= lane_state.window_end_mono:
         if lane_state.trailing_queued:
             return dispatch_blind_with_post_verdict_freshness(
@@ -1457,6 +1645,7 @@ def process_supervision_tick(
 
     sys1_resp, early_res = _evaluate_system1_with_canary(
         ctx=ctx,
+        approved_plan=approved_plan,
         lane_state=lane_state,
         frozen_snapshot=frozen_snapshot,
         snapshot_provider=snapshot_provider,
@@ -1467,7 +1656,7 @@ def process_supervision_tick(
     if early_res is not None or sys1_resp is None:
         return early_res or SupervisionTickResult(status="canary_reeval_abstained")
 
-    if sys1_resp.choice == _require_system1(ctx.plan).abstain_default:
+    if sys1_resp.choice == _require_system1(approved_plan).abstain_default:
         return SupervisionTickResult(status="healthy_no_action")
 
     if lane_state.mode == "THROTTLED":
@@ -1498,19 +1687,23 @@ def run_scheduled_audit(
     sleep_detector: HostSleepDetector | None = None,
     repeated_canary_threshold: int = 2,
 ) -> SupervisionTickResult:
-    """Run scheduled active-lane unalerted audit sharing canary handling and reserved audit floor."""
+    """Run scheduled active-lane unalerted audit using strictly record.approved_plan."""
     if not stratum.startswith("scheduled_audit"):
         raise SupervisionError(f"scheduled audit stratum must start with 'scheduled_audit', got {stratum!r}")
     t0 = clock_provider()
+    approved_plan = ctx.authority_store.verify_active(
+        ctx.receipt, clock=t0, target=lane_state.target
+    ).approved_plan
     if sleep_detector is not None and sleep_detector.observe_and_in_grace(
-        t0, wake_grace_s=ctx.plan.spec.limits.wake_grace_after_host_sleep_s
+        t0, wake_grace_s=approved_plan.spec.limits.wake_grace_after_host_sleep_s
     ):
         return SupervisionTickResult(status="deferred_wake_grace")
     frozen_snapshot = snapshot_provider(lane_state.target)
-    if frozen_snapshot.trusted.human_input_lease_active and ctx.plan.spec.limits.defer_nudge_during_human_lease:
+    if frozen_snapshot.trusted.human_input_lease_active and approved_plan.spec.limits.defer_nudge_during_human_lease:
         return SupervisionTickResult(status="deferred_human_lease")
     sys1_resp, early_res = _evaluate_system1_with_canary(
         ctx=ctx,
+        approved_plan=approved_plan,
         lane_state=lane_state,
         frozen_snapshot=frozen_snapshot,
         snapshot_provider=snapshot_provider,
