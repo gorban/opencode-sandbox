@@ -3512,5 +3512,204 @@ class TestReciprocalRound8Fixes(CoordTestBase):
         self.assertIsInstance(wait_err[0], RevokedError)
 
 
+class TestReciprocalRound9Fixes(CoordTestBase):
+    """Red/green regressions for cleanup worker, minimal transport, and wait deadline on 8d1f8ab2."""
+
+    _open_pair = TestReciprocalRound6Fixes._open_pair
+    _reg_sb = staticmethod(TestReciprocalRound6Fixes._reg_sb)
+    _wait_until = staticmethod(TestReciprocalRound6Fixes._wait_until)
+
+    def test_r9_p1_1_cleanup_worker_atomic_retirement_single_owner_and_start_error_surfaced(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-cw", "inc_cw1")
+
+        # Part A: Enqueue a second stream while first worker is retiring -> MUST NOT strand!
+        allow_s1 = {"ok": False}
+        allow_s2 = {"ok": False}
+        s2_aborted = threading.Event()
+        orig_abort_stream = transport.abort_stream
+
+        def _custom_abort(stream_id: str, *, reason: str) -> bool:
+            if stream_id == "sid_r9_1":
+                return allow_s1["ok"]
+            if stream_id == "sid_r9_2":
+                if allow_s2["ok"]:
+                    s2_aborted.set()
+                    return True
+                return False
+            return orig_abort_stream(stream_id, reason=reason)
+
+        transport.abort_stream = _custom_abort  # type: ignore[method-assign]
+        injected_s2 = {"done": False}
+        orig_drain = hub._drain_pending_cleanups
+
+        def _drain_and_enqueue_s2() -> bool:
+            res = orig_drain()
+            if res and not injected_s2["done"]:
+                injected_s2["done"] = True
+                # Enqueue second stream AFTER worker observed empty queue, BEFORE worker retires!
+                hub._record_pending_cleanup_stream("sid_r9_2", "sb-cw", "inc_cw1", "handoff_persist_failed")
+                allow_s2["ok"] = True
+            return res
+
+        hub._drain_pending_cleanups = _drain_and_enqueue_s2  # type: ignore[method-assign]
+        hub._record_pending_cleanup_stream("sid_r9_1", "sb-cw", "inc_cw1", "handoff_persist_failed")
+        hub._ensure_cleanup_retry_worker()
+        allow_s1["ok"] = True
+        self.assertTrue(s2_aborted.wait(timeout=1.5))
+        self.assertTrue(self._wait_until(lambda: not hub._has_pending_cleanups()))
+        hub._drain_pending_cleanups = orig_drain  # type: ignore[method-assign]
+
+        # Part B: Concurrent _ensure_cleanup_retry_worker() starts ONLY ONE worker thread
+        start_entered = threading.Event()
+        release_start = threading.Event()
+        orig_start = threading.Thread.start
+        worker_starts = 0
+        start_lock = threading.Lock()
+
+        def _intercept_start(thr: threading.Thread) -> None:
+            nonlocal worker_starts
+            if getattr(thr, "_target", None) == hub._run_cleanup_retry_loop:
+                with start_lock:
+                    worker_starts += 1
+                    first = worker_starts == 1
+                if first:
+                    start_entered.set()
+                    release_start.wait(timeout=2.0)
+            orig_start(thr)
+
+        allow_s2["ok"] = False
+        hub._record_pending_cleanup_stream("sid_r9_2", "sb-cw", "inc_cw1", "handoff_persist_failed")
+        with mock.patch.object(threading.Thread, "start", _intercept_start):
+            t1 = threading.Thread(target=hub._ensure_cleanup_retry_worker, daemon=True)
+            t2 = threading.Thread(target=hub._ensure_cleanup_retry_worker, daemon=True)
+            t1.start()
+            self.assertTrue(start_entered.wait(timeout=1.0))
+            t2.start()
+            time.sleep(0.05)
+            release_start.set()
+            t1.join(timeout=1.5)
+            t2.join(timeout=1.5)
+        self.assertEqual(worker_starts, 1)
+        allow_s2["ok"] = True
+        self.assertTrue(self._wait_until(lambda: not hub._has_pending_cleanups()))
+        self.assertTrue(self._wait_until(lambda: hub._cleanup_state is None))
+
+        # Part C: Startup failure surfaces RuntimeError, marks degraded, and retains handle
+        allow_s2["ok"] = False
+        hub._record_pending_cleanup_stream("sid_r9_2", "sb-cw", "inc_cw1", "handoff_persist_failed")
+
+        def _fail_start(thr: threading.Thread) -> None:
+            if getattr(thr, "_target", None) == hub._run_cleanup_retry_loop:
+                raise RuntimeError("cleanup_worker_start_failed")
+            orig_start(thr)
+
+        with (
+            mock.patch.object(threading.Thread, "start", _fail_start),
+            self.assertRaises(RuntimeError),
+        ):
+            hub._ensure_cleanup_retry_worker()
+        self.assertTrue(hub.is_degraded)
+        self.assertIn("sid_r9_2", hub._pending_cleanup_streams)
+        allow_s2["ok"] = True
+
+    def test_r9_p1_2_failed_inbound_revoke_abort_retries_automatically_and_unblocks_close(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self._reg_sb(hub, _OP, "sb-ir", "inc_ir1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-ir")
+
+        started = threading.Event()
+        never_done = threading.Event()
+        self.addCleanup(never_done.set)
+        transport.queue_script(
+            "sb-ir", TurnScript(on_stream_started=started, block_event=never_done)
+        )
+        hub.send(_OP, target="sb-ir", body_text="Held inbound stream")
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(started.wait(timeout=1.0))
+
+        orig_abort = transport.abort_incarnation
+        fail_abort = {"on": True}
+
+        def _flaky_abort(sb_addr: str, inc_id: str, *, reason: str) -> bool:
+            if fail_abort["on"]:
+                raise RuntimeError("transient_inbound_abort_failure")
+            return orig_abort(sb_addr, inc_id, reason=reason)
+
+        transport.abort_incarnation = _flaky_abort  # type: ignore[method-assign]
+        hub.revoke(_OP, target="sb-ir", reason="inbound_revoke_with_transient_err")
+        self.assertNotIn(("sb-ir", "inc_ir1"), transport.revoked_incarnations)
+
+        # Clear transport fault -> cleanup retry worker (and close pre-join drain) aborts held stream!
+        fail_abort["on"] = False
+        self.assertTrue(
+            self._wait_until(lambda: ("sb-ir", "inc_ir1") in transport.revoked_incarnations)
+        )
+        hub.close(timeout_s=1.0)
+        self.assertFalse(hub._session_active_marker.exists())
+
+    def test_r9_p2_3_minimal_transport_without_abort_stream_recovers_and_closes_cleanly(
+        self,
+    ) -> None:
+        inner = FakeWorkerTransport()
+        proxy = _NoAbortStreamTransport(inner)
+        reg, _transport, hub = self._open_pair(transport=proxy)
+        self.addCleanup(reg.close)
+        self._reg_sb(hub, _OP, "sb-min", "inc_min1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-min")
+
+        started = threading.Event()
+        never_done = threading.Event()
+        self.addCleanup(never_done.set)
+        inner.queue_script(
+            "sb-min", TurnScript(on_stream_started=started, block_event=never_done)
+        )
+        hub.send(_OP, target="sb-min", body_text="Held turn on minimal transport")
+        self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        self.assertTrue(started.wait(timeout=1.0))
+
+        hub._mark_degraded("minimal_transport_degrade")
+        hub.confirm_recovery(_OP, reason="minimal_transport_recovered")
+        self.assertFalse(hub.is_degraded)
+        self.assertIn(("sb-min", "inc_min1"), inner.revoked_incarnations)
+        self.assertEqual(hub._pending_cleanup_streams, {})
+        hub.close(timeout_s=1.0)
+        self.assertFalse(hub._session_active_marker.exists())
+
+    def test_r9_p2_4_nonempty_wait_honors_deadline_under_sustained_generation_churn(
+        self,
+    ) -> None:
+        reg, _transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-wc", "inc_wc1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-wc")
+        hub.send(_OP, target="sb-wc", body_text="Produce nonempty batch for churn test")
+        self.assertEqual(hub.dispatch_once(async_stream=False), 1)
+
+        orig_list = reg.list_events_since
+
+        def _churning_list(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            events = orig_list(*args, **kwargs)
+            time.sleep(0.015)
+            hub._notify_waiters()
+            return events
+
+        reg.list_events_since = _churning_list  # type: ignore[method-assign]
+        t0 = time.monotonic()
+        res = hub.wait(_OP, targets=("sb-wc",), since_seq=0, timeout_s=0.06)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(res["timed_out"])
+        self.assertEqual(res["events"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1056,8 +1056,8 @@ class CoordHub:
             self._pending_cleanup_leases: list[BrokerLease] = []
             self._pending_cleanup_incarnations: dict[tuple[str, str], str] = {}
             self._pending_cleanup_streams: dict[str, tuple[str, str, str]] = {}
-            self._cleanup_stop_ev = threading.Event()
-            self._cleanup_thread: threading.Thread | None = None
+            self._cleanup_state: _RequestMonitorState | None = None
+            self._retired_cleanup_states: set[_RequestMonitorState] = set()
             self._settlement_thread: threading.Thread | None = None
             self._settlement_error: Exception | None = None
             self._watchdog_threads: set[threading.Thread] = set()
@@ -1270,19 +1270,29 @@ class CoordHub:
             with self._meta_lock:
                 self._pending_cleanup_incarnations.pop((sb_addr, inc_id), None)
 
+    def _settle_stream_without_abort_stream(
+        self, dst_addr: str, dst_inc: str, reason: str
+    ) -> bool:
+        if reason == _REASON_RECOVERY_RETIRED:
+            with self._meta_lock:
+                return (dst_addr, dst_inc) not in self._pending_cleanup_incarnations
+        if reason == _REASON_HANDOFF_PERSIST_FAILED:
+            try:
+                self._transport.abort_incarnation(dst_addr, dst_inc, reason=reason)
+                return True
+            except Exception:
+                return False
+        return False
+
     def _drain_pending_cleanup_streams(self) -> None:
         with self._meta_lock:
             items = tuple(self._pending_cleanup_streams.items())
+        has_abort_stream = callable(getattr(self._transport, "abort_stream", None))
         for sid, (dst_addr, dst_inc, reason) in items:
-            ok = self._try_abort_stream(sid, reason=reason)
-            if not ok and reason == _REASON_HANDOFF_PERSIST_FAILED and not callable(
-                getattr(self._transport, "abort_stream", None)
-            ):
-                try:
-                    self._transport.abort_incarnation(dst_addr, dst_inc, reason=reason)
-                    ok = True
-                except Exception:
-                    ok = False
+            if has_abort_stream:
+                ok = self._try_abort_stream(sid, reason=reason)
+            else:
+                ok = self._settle_stream_without_abort_stream(dst_addr, dst_inc, reason)
             if ok:
                 with self._meta_lock:
                     self._pending_cleanup_streams.pop(sid, None)
@@ -1290,13 +1300,16 @@ class CoordHub:
                         self._stream_authorities.pop(sid, None)
                         self._stream_abort_reasons.pop(sid, None)
 
+    def _has_pending_cleanups_locked(self) -> bool:
+        return bool(
+            self._pending_cleanup_leases
+            or self._pending_cleanup_incarnations
+            or self._pending_cleanup_streams
+        )
+
     def _has_pending_cleanups(self) -> bool:
         with self._meta_lock:
-            return bool(
-                self._pending_cleanup_leases
-                or self._pending_cleanup_incarnations
-                or self._pending_cleanup_streams
-            )
+            return self._has_pending_cleanups_locked()
 
     def _drain_pending_cleanups(self) -> bool:
         """Attempt settlement of every retained cleanup handle; return True only when empty."""
@@ -1306,41 +1319,92 @@ class CoordHub:
         return not self._has_pending_cleanups()
 
     def _ensure_cleanup_retry_worker(self) -> None:
-        """Ensure a hub-owned retry worker drains retained cleanup handles without a monitor."""
+        """Reserve and start one hub-owned retry worker; synchronize with atomic retirement."""
         with self._meta_lock:
-            if not self._accept_watchdog_spawns or self._shutdown_settled:
+            if (
+                not self._accept_watchdog_spawns
+                or self._shutdown_settled
+                or not self._has_pending_cleanups_locked()
+            ):
                 return
-            if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
-                return
-            self._cleanup_stop_ev.clear()
-            worker = threading.Thread(target=self._run_cleanup_retry_loop, daemon=True)
-            self._cleanup_thread = worker
+            existing = self._cleanup_state
+            if existing is None:
+                state = _RequestMonitorState(stop_ev=threading.Event())
+                worker = threading.Thread(
+                    target=self._run_cleanup_retry_loop, args=(state,), daemon=True
+                )
+                state.thread = worker
+                self._cleanup_state = state
+        if existing is not None:
+            existing.ready_ev.wait()
+            if existing.start_error is not None:
+                raise existing.start_error
+            return
         try:
             worker.start()
-        except Exception:
+        except Exception as exc:
             with self._meta_lock:
-                if self._cleanup_thread is worker:
-                    self._cleanup_thread = None
+                state.start_error = exc
+                if self._cleanup_state is state:
+                    self._cleanup_state = None
+                state.ready_ev.set()
+            self._mark_degraded("cleanup_retry_worker_start_failed")
+            raise
+        with self._meta_lock:
+            state.started = True
+            if not self._accept_watchdog_spawns or self._shutdown_settled:
+                state.stop_ev.set()
+            state.ready_ev.set()
 
-    def _run_cleanup_retry_loop(self) -> None:
+    def _try_retire_cleanup_worker(self, state: _RequestMonitorState) -> bool:
+        """Atomically retire _cleanup_state under _meta_lock only when queue is empty."""
+        with self._meta_lock:
+            if self._has_pending_cleanups_locked():
+                return False
+            if self._cleanup_state is state:
+                self._cleanup_state = None
+                self._retired_cleanup_states.add(state)
+            return True
+
+    def _run_cleanup_retry_loop(self, state: _RequestMonitorState) -> None:
         try:
-            while not self._cleanup_stop_ev.wait(self._watchdog_interval_s):
-                if self._drain_pending_cleanups():
+            while not state.stop_ev.wait(self._watchdog_interval_s):
+                self._drain_pending_cleanups()
+                if self._try_retire_cleanup_worker(state):
                     return
         finally:
             with self._meta_lock:
-                if self._cleanup_thread is threading.current_thread():
-                    self._cleanup_thread = None
+                if self._cleanup_state is state:
+                    self._cleanup_state = None
+                self._retired_cleanup_states.discard(state)
 
     def _stop_cleanup_retry_worker(self, deadline: float) -> bool:
         current = threading.current_thread()
         with self._meta_lock:
-            self._cleanup_stop_ev.set()
-            worker = self._cleanup_thread
-        if worker is not None and worker is not current:
-            worker.join(timeout=max(0.0, deadline - time.monotonic()))
-            return not worker.is_alive()
-        return True
+            states: list[_RequestMonitorState] = [*self._retired_cleanup_states]
+            if self._cleanup_state is not None:
+                states.append(self._cleanup_state)
+            for st in states:
+                st.stop_ev.set()
+        for st in states:
+            if st.thread is current:
+                continue
+            if not st.ready_ev.wait(timeout=max(0.0, deadline - time.monotonic())):
+                return False
+            if st.started and st.thread is not None:
+                st.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._meta_lock:
+            remaining = tuple(self._retired_cleanup_states) + (
+                (self._cleanup_state,) if self._cleanup_state is not None else ()
+            )
+            return not any(
+                st.thread is not current
+                and (
+                    not st.ready_ev.is_set()
+                    or (st.thread is not None and st.thread.is_alive())
+                )
+                for st in remaining
+            )
 
     def _fence_all_for_recovery_locked(
         self,
@@ -1421,7 +1485,8 @@ class CoordHub:
         finally:
             for fence in reversed(fences):
                 fence.release()
-        self._drain_pending_cleanups()
+        if not self._drain_pending_cleanups():
+            self._ensure_cleanup_retry_worker()
         self._notify_waiters()
         if read_err is not None:
             raise read_err
@@ -1634,6 +1699,7 @@ class CoordHub:
         fg_ok = self._wait_fg_ops(deadline)
         if not pump_ok or not fg_ok:
             raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
+        self._drain_pending_cleanups()
         streams_ok = self.dispatcher.join_streams(deadline)
         if not streams_ok:
             raise CoordPolicyError(_ERR_CLOSE_INCOMPLETE)
@@ -3698,12 +3764,17 @@ class CoordHub:
                 target_addrs, since_seq, eff_threads, req_incs, exclude_trust
             )
             if events:
-                if self._wait_commit_or_sleep(waiter, seen_gen, wait_timeout=None):
-                    continue
-                return {"events": events, "last_seq": events[-1]["seq"], "timed_out": False}
+                if not self._wait_commit_or_sleep(waiter, seen_gen, wait_timeout=None):
+                    return {"events": events, "last_seq": events[-1]["seq"], "timed_out": False}
+                if deadline - time.monotonic() <= 0:
+                    self._wait_snapshot_gen(waiter)
+                    self._require_operational(allow_operator_diagnostic=True, caller=caller)
+                    return {"events": [], "last_seq": since_seq, "timed_out": True}
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._wait_snapshot_gen(waiter)
+                self._require_operational(allow_operator_diagnostic=True, caller=caller)
                 return {"events": [], "last_seq": since_seq, "timed_out": True}
             self._wait_commit_or_sleep(waiter, seen_gen, wait_timeout=remaining)
 
@@ -3766,6 +3837,8 @@ class CoordHub:
         return [(target_addr, inc_id) for inc_id in sorted(inc_set)], outbound_sids, lease
 
     def _abort_detached_outbound_stream(self, sid: str, reason: str) -> bool:
+        if not callable(getattr(self._transport, "abort_stream", None)):
+            return False
         if self._try_abort_stream(sid, reason=reason):
             return True
         with self._meta_lock:
@@ -3784,12 +3857,14 @@ class CoordHub:
         reason: str,
     ) -> bool:
         aborted = False
+        needs_retry = False
         for sb_addr, inc_id in detached_incarnations:
             try:
                 if self._transport.abort_incarnation(sb_addr, inc_id, reason=reason):
                     aborted = True
             except Exception:
                 self._record_pending_cleanup_incarnation(sb_addr, inc_id, reason)
+                needs_retry = True
         for sid in outbound_sids:
             if self._abort_detached_outbound_stream(sid, reason):
                 aborted = True
@@ -3803,6 +3878,9 @@ class CoordHub:
                 lease.revoke()
             except Exception:
                 self._record_pending_cleanup_lease(lease)
+                needs_retry = True
+        if needs_retry:
+            self._ensure_cleanup_retry_worker()
         return aborted
 
     def _lookup_revoke_metadata(
