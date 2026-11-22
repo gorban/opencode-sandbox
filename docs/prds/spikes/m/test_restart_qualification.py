@@ -1535,6 +1535,7 @@ class TestRestartQualification(unittest.TestCase):
             self.assertTrue(orig_stream_id)
         finally:
             # Simulate abrupt host crash BEFORE stream finalization touches SQLite
+            reg1.abort_handed_off_outbox_row_if_open = lambda *a, **k: False  # type: ignore[method-assign]
             reg1.mark_outbox_aborted = lambda *a, **k: None  # type: ignore[method-assign]
             reg1.mark_outbox_completed = lambda *a, **k: None  # type: ignore[method-assign]
             never_done.set()
@@ -1644,17 +1645,49 @@ class TestRestartQualification(unittest.TestCase):
         owner.confirm_incarnation_terminal = _confirm_with_late_arrival  # type: ignore[method-assign]
         try:
             hub._drain_pending_cleanup_incarnations()
-            # Late stream MUST NOT have been discarded by the sweep that never confirmed it.
+            # Late stream MUST NOT have been discarded, and cached owner MUST remain retained.
             self.assertIn("str-late-after-confirm", hub._pending_cleanup_streams)
             self.assertIn(("sb-sw", "inc_sw1"), hub._pending_cleanup_incarnations)
+            self.assertIn(("sb-sw", "inc_sw1"), hub._external_owners)
             self.assertEqual(len(owner.confirm_calls), 1)
-            # Subsequent drain must physically confirm AGAIN before clearing the late obligation.
+            # Even during a subsequent DB binding-read outage, cached owner physically confirms late stream.
+            orig_get = reg.get_transport_binding
+
+            def _binding_outage(sb_addr: str, inc_id: str) -> dict[str, Any] | None:
+                raise sqlite3.OperationalError("binding_read_outage_after_late_arrival")
+
+            reg.get_transport_binding = _binding_outage  # type: ignore[method-assign]
+            try:
+                self.assertFalse(hub._drain_pending_cleanups())
+                self.assertGreaterEqual(len(owner.confirm_calls), 2)
+                self.assertIn(("sb-sw", "inc_sw1"), hub._external_owners)
+            finally:
+                reg.get_transport_binding = orig_get  # type: ignore[method-assign]
+            # Once DB recovers, sweep clears the last obligation AND evicts the cached owner.
             self.assertTrue(hub._drain_pending_cleanups())
             self.assertNotIn("str-late-after-confirm", hub._pending_cleanup_streams)
             self.assertNotIn(("sb-sw", "inc_sw1"), hub._pending_cleanup_incarnations)
-            self.assertGreaterEqual(len(owner.confirm_calls), 2)
+            self.assertNotIn(("sb-sw", "inc_sw1"), hub._external_owners)
         finally:
             owner.confirm_incarnation_terminal = orig_confirm  # type: ignore[method-assign]
+
+        # Register a same-address successor; if metadata lookup fails during revoke,
+        # address-level revoke MUST fail closed and never report success for a retired/ambiguous owner.
+        owner.register_owner("sb-sw", "inc_sw2", _OWNER_B)
+        self._reg_and_grant(hub, "sb-sw", "inc_sw2")
+        orig_get_sb = reg.get_sandbox
+
+        def _meta_outage(sb_addr: str) -> Any:
+            raise sqlite3.OperationalError("sandbox_meta_outage")
+
+        reg.get_sandbox = _meta_outage  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(CoordPolicyError):
+                hub.revoke(_OP, target="sb-sw", reason="meta_outage_revoke")
+            self.assertTrue(hub.is_degraded)
+        finally:
+            reg.get_sandbox = orig_get_sb  # type: ignore[method-assign]
+        hub.confirm_recovery(_OP, reason="after_meta_outage")
 
     def test_oc2_p1_2_cleanup_retry_stops_held_stream_with_cached_owner_during_db_outage(
         self,
@@ -1737,6 +1770,7 @@ class TestRestartQualification(unittest.TestCase):
             self.assertEqual(hub1.dispatch_once(async_stream=True), 1)
             self.assertTrue(started.wait(timeout=1.0))
         finally:
+            reg1.abort_handed_off_outbox_row_if_open = lambda *a, **k: False  # type: ignore[method-assign]
             reg1.mark_outbox_aborted = lambda *a, **k: None  # type: ignore[method-assign]
             reg1.mark_outbox_completed = lambda *a, **k: None  # type: ignore[method-assign]
             never_done.set()
@@ -1784,6 +1818,7 @@ class TestRestartQualification(unittest.TestCase):
             self.assertEqual(hub3.dispatch_once(async_stream=True), 1)
             self.assertTrue(started_b.wait(timeout=1.0))
         finally:
+            reg3.abort_handed_off_outbox_row_if_open = lambda *a, **k: False  # type: ignore[method-assign]
             reg3.mark_outbox_aborted = lambda *a, **k: None  # type: ignore[method-assign]
             reg3.mark_outbox_completed = lambda *a, **k: None  # type: ignore[method-assign]
             never_b.set()
@@ -1853,6 +1888,152 @@ class TestRestartQualification(unittest.TestCase):
         hub_min._cancel_if_still_pending(msg_id, reason="stale_minimal")
         self.assertEqual(cancel_fallback_calls, [])
         self.assertEqual(mem.outbox[msg_id]["status"], "dispatch_started")
+
+    def test_oc3_p1_2_stream_reader_start_failure_fences_and_cleans_up_handed_off_turn(
+        self,
+    ) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-st", "inc_st1"): _OWNER_A})
+        reg, hub = self._open_hub(owner)
+        self._reg_and_grant(hub, "sb-st", "inc_st1")
+        msg_id = hub.send(_OP, target="sb-st", body_text="Reader thread start fails")["msg_id"]
+
+        # Fail physical confirm once so cleanup obligation stays retained until explicit drain,
+        # and fail threading.Thread.start once for the async stream reader.
+        owner.fail_confirm_keys.add(("sb-st", "inc_st1"))
+        orig_start = threading.Thread.start
+        failed_once = {"done": False}
+
+        def _fail_first_thread_start(thread_self: threading.Thread) -> None:
+            if not failed_once["done"]:
+                failed_once["done"] = True
+                raise RuntimeError("cannot_start_reader_thread")
+            orig_start(thread_self)
+
+        threading.Thread.start = _fail_first_thread_start  # type: ignore[method-assign]
+        try:
+            self.assertEqual(hub.dispatch_once(async_stream=True), 1)
+        finally:
+            threading.Thread.start = orig_start  # type: ignore[method-assign]
+
+        self.assertTrue(hub.is_degraded)
+        self.assertIn(("sb-st", "inc_st1"), hub._fenced_targets)
+        self.assertIn(("sb-st", "inc_st1"), hub._pending_cleanup_incarnations)
+        self.assertEqual(len(hub.dispatcher._stream_threads), 0)
+        row_before = {r["msg_id"]: r for r in reg.list_outbox(statuses=_STATUS_ALL)}[msg_id]
+        self.assertEqual(row_before["status"], "handed_off")
+        self.assertEqual(row_before["attempts"], 1)
+
+        # Allow physical confirm before shutdown, close cleanly, reopen degraded, and recover without replay.
+        owner.fail_confirm_keys.discard(("sb-st", "inc_st1"))
+        hub.close()
+        reg.close()
+        self.assertTrue(
+            any(c[0] == "sb-st" and c[1] == "inc_st1" and c[2] == _OWNER_A for c in owner.confirm_calls)
+        )
+        reg2, hub2 = self._open_hub(owner)
+        self.addCleanup(reg2.close)
+        self.addCleanup(hub2.close)
+        self.assertTrue(hub2.is_degraded)
+        calls_before = len(owner.dispatch_calls)
+        hub2.confirm_recovery(_OP, reason="recover_stream_start_failure")
+        self.assertEqual(hub2.dispatch_once(async_stream=False), 0)
+        self.assertEqual(len(owner.dispatch_calls), calls_before)
+        row_after = {r["msg_id"]: r for r in reg2.list_outbox(statuses=_STATUS_ALL)}[msg_id]
+        self.assertEqual(row_after["status"], "aborted")
+        self.assertEqual(row_after["attempts"], 1)
+
+    def test_oc3_p2_1_failed_terminal_outbox_write_marks_degraded_and_recovers_on_reopen(
+        self,
+    ) -> None:
+        owner = ExternallyFencedFakeTransport({("sb-fw", "inc_fw1"): _OWNER_A})
+        reg, hub = self._open_hub(owner)
+        self._reg_and_grant(hub, "sb-fw", "inc_fw1")
+        msg_id = hub.send(_OP, target="sb-fw", body_text="Terminal write fails")["msg_id"]
+
+        orig_complete = reg.mark_outbox_completed
+
+        def _fail_complete(mid: str) -> None:
+            raise sqlite3.OperationalError("transient_terminal_write_failure")
+
+        reg.mark_outbox_completed = _fail_complete  # type: ignore[method-assign]
+        try:
+            self.assertEqual(hub.dispatch_once(async_stream=False), 1)
+        finally:
+            reg.mark_outbox_completed = orig_complete  # type: ignore[method-assign]
+
+        self.assertTrue(hub.is_degraded)
+        row_mid = {r["msg_id"]: r for r in reg.list_outbox(statuses=_STATUS_ALL)}[msg_id]
+        self.assertEqual(row_mid["status"], "handed_off")
+        hub.close()
+        reg.close()
+
+        # Reopen MUST detect the retained session seal, enter recovery, and settle the orphan.
+        reg2, hub2 = self._open_hub(owner)
+        self.addCleanup(reg2.close)
+        self.addCleanup(hub2.close)
+        self.assertTrue(hub2.is_degraded)
+        hub2.confirm_recovery(_OP, reason="settle_failed_terminal_write")
+        self.assertFalse(hub2.is_degraded)
+        row_after = {r["msg_id"]: r for r in reg2.list_outbox(statuses=_STATUS_ALL)}[msg_id]
+        self.assertEqual(row_after["status"], "aborted")
+        self.assertEqual(row_after["attempts"], 1)
+
+    def test_oc3_p2_2_recovery_fails_closed_when_minimal_store_cannot_settle_open_handoff(
+        self,
+    ) -> None:
+        from test_hub import InMemoryRegistryStore
+
+        # Case A: minimal store omitting both abort_handed_off_outbox_row_if_open and mark_outbox_aborted.
+        mem_a = InMemoryRegistryStore()
+        transport = FakeWorkerTransport()
+
+        class _NoAbortStore:
+            def __getattr__(self, name: str) -> Any:
+                if name in ("abort_handed_off_outbox_row_if_open", "mark_outbox_aborted"):
+                    raise AttributeError(name)
+                return getattr(mem_a, name)
+
+        dir_a = self.state_dir.parent / "min_rec_a"
+        dir_a.mkdir(mode=0o700, exist_ok=True)
+        hub_a = CoordHub(_NoAbortStore(), transport, dir_a, sandbox_root=self.sandbox_root)  # type: ignore[arg-type]
+        self.addCleanup(hub_a.close)
+        edge_a = self._reg_and_grant(hub_a, "sb-ma", "inc_ma1")
+        msg_a = hub_a.send(_OP, target="sb-ma", body_text="Open handoff no abort")["msg_id"]
+        mem_a.mark_outbox_dispatch_started(
+            msg_a, edge_id=edge_a, grant_generation=mem_a.edges[edge_a].grant_generation, dst_incarnation="inc_ma1"
+        )
+        mem_a.mark_outbox_handed_off(msg_a, stream_id="str-ma-1")
+        hub_a._mark_degraded("sim_crash_a")
+        with self.assertRaises(CoordPolicyError):
+            hub_a.confirm_recovery(_OP, reason="recover_no_abort")
+        self.assertTrue(hub_a.is_degraded)
+
+        # Case B: legacy store raising CoordValidationError without transitioning the row out of handed_off.
+        mem_b = InMemoryRegistryStore()
+
+        class _SpuriousRejectStore:
+            def __getattr__(self, name: str) -> Any:
+                if name == "abort_handed_off_outbox_row_if_open":
+                    raise AttributeError(name)
+                return getattr(mem_b, name)
+
+            def mark_outbox_aborted(self, mid: str, *, reason: str = "x") -> None:
+                raise CoordValidationError("spurious_reject_leaves_handed_off")
+
+        dir_b = self.state_dir.parent / "min_rec_b"
+        dir_b.mkdir(mode=0o700, exist_ok=True)
+        hub_b = CoordHub(_SpuriousRejectStore(), transport, dir_b, sandbox_root=self.sandbox_root)  # type: ignore[arg-type]
+        self.addCleanup(hub_b.close)
+        edge_b = self._reg_and_grant(hub_b, "sb-mb", "inc_mb1")
+        msg_b = hub_b.send(_OP, target="sb-mb", body_text="Open handoff spurious reject")["msg_id"]
+        mem_b.mark_outbox_dispatch_started(
+            msg_b, edge_id=edge_b, grant_generation=mem_b.edges[edge_b].grant_generation, dst_incarnation="inc_mb1"
+        )
+        mem_b.mark_outbox_handed_off(msg_b, stream_id="str-mb-1")
+        hub_b._mark_degraded("sim_crash_b")
+        with self.assertRaises(CoordPolicyError):
+            hub_b.confirm_recovery(_OP, reason="recover_spurious_reject")
+        self.assertTrue(hub_b.is_degraded)
 
 
 if __name__ == "__main__":
