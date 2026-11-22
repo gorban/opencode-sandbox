@@ -185,10 +185,13 @@ here for security and general review before implementation:
         `BlindCheckRunBudget`, or stateful `ReplayGrantBudget`).
    - Any failed check or exhausted budget yields **zero fake-adapter invocations** (even if
      `FleetCheckBudget` still has spare scheduling capacity).
-8. **Explicit injected clocks (`ClockSnapshot`) & fleet-level `HostSleepDetector`:**
-   - Every authority, budget, throttle, sleep, and replay method accepts explicit
-     `ClockSnapshot(monotonic_s: float, wall_s: float)` (no hidden `time.time()` calls; non-finite
-     values rejected).
+8. **Explicit injected clocks (`ClockSnapshot` / `clock_provider`) & fleet-level `HostSleepDetector`:**
+   - Single-step methods accept `ClockSnapshot(monotonic_s: float, wall_s: float)` and multi-step
+     procedures (`process_supervision_tick`, `dispatch_blind_with_post_verdict_freshness`,
+     `run_calibration_replay`) accept an injected `clock_provider: Callable[[], ClockSnapshot]`
+     queried at entry, before each subsequent model invocation, and immediately before any simulated
+     action (no hidden `time.time()` calls; non-finite values rejected). This ensures a lease or
+     grant that expires *during* a model call is caught before any subsequent call or action.
    - Shared fleet-level `HostSleepDetector` rejects backward `monotonic_s < last_monotonic_s`
      (`ValueError`) and applies a uniform `wake_grace_until_mono` across all lanes whenever
      `wall_dt - mono_dt > sleep_gap_threshold_s` (`30s`). During `wake_grace` or an active human
@@ -475,10 +478,10 @@ class SupervisionBrokerGate:
 def process_supervision_tick(
     lane_state: LaneSupervisionState,
     snapshot_provider: Callable[[TargetIncarnation], MetricSnapshot],
+    clock_provider: Callable[[], ClockSnapshot],
     *,
     receipt: AdmissionReceipt,
     plan: CompiledWorkflowPlan,
-    clock: ClockSnapshot,
     sleep_detector: HostSleepDetector,
     authority_store: RunAuthorityStore,
     broker_gate: SupervisionBrokerGate,
@@ -489,13 +492,14 @@ def process_supervision_tick(
     lease_registry: LaneLeaseRegistry,
     ledger: CalibrationLedger,
 ) -> SupervisionTickResult:
-    # 0. Verify run is still active before doing work (revoked/expired -> 0 adapter calls).
+    # 0. Sample fresh clock & verify run is still active (revoked/expired -> 0 adapter calls).
+    t0 = clock_provider()
     authority_store.verify_active(
-        receipt, clock=clock, expected_plan_digest=plan.workflow_plan_digest, target=lane_state.target
+        receipt, clock=t0, expected_plan_digest=plan.workflow_plan_digest, target=lane_state.target
     )
     # 1. Fleet-level HostSleepDetector (rejects backward monotonic_s; uniform wake_grace;
     #    preserves any pending trailing_queued).
-    if sleep_detector.observe_and_in_grace(clock, wake_grace_s=plan.spec.limits.wake_grace_s):
+    if sleep_detector.observe_and_in_grace(t0, wake_grace_s=plan.spec.limits.wake_grace_s):
         return SupervisionTickResult(status="deferred_wake_grace")
 
     # Capture frozen point-in-time snapshot S1 (or S_now at trailing boundary) BEFORE model call:
@@ -508,11 +512,12 @@ def process_supervision_tick(
     # 3. Correlated fleet-outage coalescing (Trap T8).
 
     # 4. Check THROTTLED window boundary BEFORE calling System-1 (trailing bypasses System-1):
-    if lane_state.mode == "THROTTLED" and clock.monotonic_s >= lane_state.window_end_mono:
+    if lane_state.mode == "THROTTLED" and t0.monotonic_s >= lane_state.window_end_mono:
         if lane_state.trailing_queued:
             return dispatch_blind_with_post_verdict_freshness(
                 frozen_snapshot=frozen_snapshot,
                 snapshot_provider=snapshot_provider,
+                clock_provider=clock_provider,
                 stratum="triggered_trailing",
                 sys1_verdict=None,
                 roll_window_after=True,
@@ -520,22 +525,22 @@ def process_supervision_tick(
             )
         lane_state.mode = "IDLE"
 
-    # 5. System-1 evaluation strictly through SupervisionBrokerGate:
+    # 5. System-1 evaluation strictly through SupervisionBrokerGate (fresh clock_provider() call):
     sys1_resp = broker_gate.invoke_decisions_live(
         receipt=receipt, plan=plan, target=lane_state.target, snapshot=frozen_snapshot,
         include_canary_question=plan.spec.system1.canary_injection_question,
         metrics_only_override=False, authority_store=authority_store,
-        decisions_budget=decisions_budget, clock=clock,
+        decisions_budget=decisions_budget, clock=clock_provider(),
     )
     if not is_valid_sys1_response(sys1_resp, plan.spec.system1.choices):
         ledger.record_abstention(stratum="triggered_leading")
         return SupervisionTickResult(status="sys1_abstained_fail_closed")
 
     # 6. Positive classifier_injection_suspected canary: NEVER default to healthy_progress.
-    #    Re-evaluate numeric-only strictly through broker_gate (pre-charged & re-validated);
-    #    repeated hits route through dispatch_blind_with_post_verdict_freshness (enforcing
-    #    FleetCheckBudget + BlindCheckRunBudget + SupervisionBrokerGate) tagged in dedicated
-    #    "canary_escalation" stratum.
+    #    Re-evaluate numeric-only strictly through broker_gate (fresh clock_provider() call,
+    #    pre-charged & re-validated); repeated hits route through
+    #    dispatch_blind_with_post_verdict_freshness (enforcing FleetCheckBudget +
+    #    BlindCheckRunBudget + SupervisionBrokerGate) tagged in dedicated "canary_escalation" stratum.
     ...
 
     # 7. Non-alert vs. alert throttler handling:
@@ -546,12 +551,15 @@ def process_supervision_tick(
         lane_state.suppressed_count += 1
         return SupervisionTickResult(status="throttled_trailing_queued")
 
-    lane_state.enter_throttled(window_end_mono=clock.monotonic_s + plan.spec.limits.throttle_period_s)
+    # Enter THROTTLED inside dispatch_blind_with_post_verdict_freshness ONLY if FleetCheckBudget
+    # admits (or cap_dropped)—never prematurely on cap_delayed!
     return dispatch_blind_with_post_verdict_freshness(
         frozen_snapshot=frozen_snapshot,
         snapshot_provider=snapshot_provider,
+        clock_provider=clock_provider,
         stratum="triggered_leading",
         sys1_verdict=sys1_resp.choice,
+        enter_throttled_on_admit_or_drop=True,
         ...,
     )
 
@@ -560,19 +568,24 @@ def dispatch_blind_with_post_verdict_freshness(
     *,
     frozen_snapshot: MetricSnapshot,
     snapshot_provider: Callable[[TargetIncarnation], MetricSnapshot],
+    clock_provider: Callable[[], ClockSnapshot],
     stratum: str,
     sys1_verdict: str | None,
     ...,
 ) -> SupervisionTickResult:
-    # 1. Pre-check live authority & per-run BlindCheckRunBudget BEFORE consuming fleet slot
-    #    or calling fake blind adapter (0 adapter calls on revoked run or exhausted blind budget!).
-    # 2. Acquire FleetCheckBudget slot (record cap_delayed / cap_dropped if capped).
-    # 3. Call broker_gate.invoke_blind_check_live(snapshot_for_model=frozen_snapshot, ...).
-    #    (During this call, host-verified progress or worker-only events may occur in real/test world.)
+    # 1. Sample fresh t_call = clock_provider(); pre-check live authority & per-run
+    #    BlindCheckRunBudget BEFORE consuming fleet slot or calling fake blind adapter
+    #    (0 adapter calls on revoked/expired run or exhausted blind budget!).
+    # 2. Acquire FleetCheckBudget slot (record cap_delayed / cap_dropped if capped;
+    #    enter/roll THROTTLED only on admit or cap_dropped, never on cap_delayed).
+    # 3. Call broker_gate.invoke_blind_check_live(snapshot_for_model=frozen_snapshot, clock=clock_provider(), ...).
+    #    (During this call, host-verified progress, worker-only events, or clock expiry may occur.)
     # 4. Validate closed 4-tool response (strictly 1 tool, closed args; else blind_abstain).
     # 5. Record TP/FP/TN/FN/class_mismatch in ledger against FROZEN frozen_snapshot!
-    # 6. Obtain FRESH host-trusted snapshot AFTER verdict & IMMEDIATELY before simulated action:
+    # 6. Obtain FRESH host-trusted snapshot AND fresh t_action = clock_provider() AFTER verdict
+    #    & IMMEDIATELY before simulated action:
     fresh_snapshot = snapshot_provider(lane_state.target)
+    t_action = clock_provider()
     # 7. Freshness guard (Trap T4 & T5):
     #    Compare fresh_snapshot.trusted.progress_fingerprint != frozen_snapshot.trusted.progress_fingerprint
     #    (commit_sha, tree_oid, diff_stat_hash, verified_test_exit_seq, workflow_state_seq ONLY —
@@ -581,8 +594,10 @@ def dispatch_blind_with_post_verdict_freshness(
     #    in ledger, and the live nudge is SUPPRESSED.
     #    If only worker-supplied turn_completed/stream_events arrived: ProgressFingerprint is unchanged,
     #    and the nudge decision proceeds unchanged.
-    # 8. Re-verify live authority (authority_store.verify_active), absence of human InputLease on
-    #    fresh_snapshot, lease_registry.assert_can_nudge, autonomy, nudge_budget, and dedupe_key.
+    # 8. Re-verify live authority at t_action (authority_store.verify_active(..., clock=t_action)),
+    #    absence of human InputLease on fresh_snapshot, lease_registry.assert_can_nudge(..., clock=t_action),
+    #    autonomy, nudge_budget (at t_action), and dedupe_key. If lease expired during the blind call:
+    #    reference verdict remains recorded in ledger and ZERO nudges are emitted!
     ...
 ```
 
@@ -601,18 +616,24 @@ def run_calibration_replay(
     caller_id: str,
     caller_role: Literal["operator", "orchestrator"],
     caller_subtree: frozenset[str],
-    clock: ClockSnapshot,
+    clock_provider: Callable[[], ClockSnapshot],
 ) -> ReplayScorecard:
-    # 1. Verify grant active/unrevoked/unexpired, principal, workflow_id, candidate_spec_digest,
-    #    candidate_rubric_digest, route, model, disclosure policy, non-empty unique sample_ids,
-    #    and len(sample_ids) <= grant.max_replay_samples.
-    # 2. Recheck current run & target-incarnation authority in authority_store (and caller_subtree)
-    #    for EVERY individual sample_id (and in query_calibration_examples for every aggregate input!).
-    # 3. Dispatch each replay call through broker_gate.invoke_decisions_replay(...), which checks
-    #    complete disclosure policy (strip on "none"; enforce source, max_bytes, route in
-    #    allowed_routes, "replay" in permitted_uses on opt-in), includes canary_question in the
-    #    checked canonical payload, runs dual-pass OverlapCanaryScanner, and reserves cumulative
-    #    (calls=1, cost_microusd) in stateful ReplayGrantBudget BEFORE adapter invocation.
+    # 1. Sample fresh t_start = clock_provider(); verify grant active/unrevoked/unexpired,
+    #    principal, workflow_id, candidate_spec_digest, candidate_rubric_digest, route, model,
+    #    disclosure policy, non-empty unique sample_ids, and len(sample_ids) <= grant.max_replay_samples.
+    # 2. For EVERY individual sample_id BEFORE invoking any fake adapter:
+    #    - Verify BOTH live (caller, grant.run_id, target_incarnation) authority in authority_store
+    #      (and caller_subtree) AND record.stratum in grant.authorized_sample_scope!
+    #      (An otherwise authorized record whose stratum is outside grant.authorized_sample_scope
+    #      fails closed with ZERO fake-adapter calls!)
+    #    - In query_calibration_examples, apply the same live (caller, run_id, target_incarnation)
+    #      check to every returned record and every aggregate input.
+    # 3. Dispatch each replay call through broker_gate.invoke_decisions_replay(..., clock=clock_provider()),
+    #    which rechecks grant & live authority at the fresh clock, checks complete disclosure policy
+    #    (strip on "none"; enforce source, max_bytes, route in allowed_routes, "replay" in permitted_uses
+    #    on opt-in), includes canary_question in the checked canonical payload, runs dual-pass
+    #    OverlapCanaryScanner, and reserves cumulative (calls=1, cost_microusd) in stateful
+    #    ReplayGrantBudget BEFORE adapter invocation.
     # 4. Return stratified before vs. after reference-verdict scorecard (including abstentions
     #    and cap-drop notes).
 ```
@@ -686,10 +707,14 @@ def run_calibration_replay(
    Period-1 boundary **bypasses System-1** (0 System-1 calls at boundary!) and dispatches one
    `triggered_trailing` blind check on `S_now`, Period-2 burst requeues for Period 3, quiet
    Period 3 returns to `IDLE`; verifies `healthy_progress` leaves `IDLE`/`THROTTLED` cleanly.
-3. **Post-verdict fresh-snapshot freshness guard & `turn_completed` immunity (Trap T4 & T5):**
+3. **Post-verdict fresh-snapshot freshness guard, mid-call lease expiry & `turn_completed` immunity (Trap T4 & T5):**
    - Scripted blind verifier advances host-verified `ProgressFingerprint` (`commit_sha`/`tree_oid`)
      **during** the blind call -> reference verdict (`TP`) stays recorded in the ledger against
      frozen `S1`, while the post-verdict fresh snapshot suppresses the live nudge.
+   - Scripted blind verifier advances the injected `clock_provider()` **past lease expiry during
+     the blind call** -> reference verdict (`TP`) remains recorded in the ledger against frozen `S1`,
+     while the post-verdict `authority_store.verify_active(..., clock=t_action)` check fails closed
+     and emits **zero nudges**.
    - Scripted blind verifier emits only worker-supplied `turn_completed`, `stream_events`, or
      `"Got it, continuing!"` during the blind call -> `last_transport_frame_at` advances,
      post-verdict `ProgressFingerprint` is unchanged, and the nudge decision proceeds unchanged.
@@ -728,6 +753,10 @@ def run_calibration_replay(
    - Empty/duplicate `sample_ids`, cross-run / revoked-run / out-of-scope `sample_ids`, missing
      `"replay"` in `permitted_uses`, or canary-leaking excerpts fail closed; aggregate queries
      recheck live `(caller, run_id, target_incarnation)` authority and exclude unauthorized records.
+   - **Grant-specific stratum scope test:** With two otherwise authorized samples on the same live
+     run/target from different strata (e.g., `"triggered_leading"` vs. `"scheduled_audit_uniform"`),
+     replaying under a grant whose `authorized_sample_scope` permits only `"triggered_leading"`
+     fails closed on the excluded stratum with **zero fake-adapter calls** for the excluded sample.
 
 ---
 
