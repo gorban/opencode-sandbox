@@ -2118,6 +2118,9 @@ class TestRestartQualification(unittest.TestCase):
         self.assertTrue(entered_p2.wait(timeout=1.0))
         hub.revoke(_OP, target="sb-ord", reason="revoke_before_async_reader")
         order.clear()
+        # Hold the immediate post-receipt abort unconfirmed so the stream enters _pending_cleanup_streams;
+        # the fenced async reader MUST STILL NOT enter stream_events(), while cleanup retries settle it.
+        owner.fail_confirm_keys.add(("sb-ord", "inc_ord1"))
         release_p2.set()
         t.join(timeout=2.0)
         self.assertFalse(t.is_alive())
@@ -2125,10 +2128,18 @@ class TestRestartQualification(unittest.TestCase):
         hub.dispatcher.join_streams(time.monotonic() + 2.0)
 
         self.assertIn("abort", order)
-        if "stream_events" in order:
-            self.assertLess(order.index("abort"), order.index("stream_events"))
+        self.assertNotIn("stream_events", order)
+        self.assertTrue(hub._has_pending_cleanups())
         row = {r["msg_id"]: r for r in reg.list_outbox(statuses=_STATUS_ALL)}[msg_id]
         self.assertEqual(row["status"], "aborted")
+
+        # Release physical confirmation and verify the background cleanup worker settles the obligation.
+        owner.fail_confirm_keys.discard(("sb-ord", "inc_ord1"))
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and hub._has_pending_cleanups():
+            time.sleep(0.02)
+        self.assertFalse(hub._has_pending_cleanups())
+        self.assertNotIn("stream_events", order)
 
     def test_oc4_p2_2_phase3_exception_schedules_cleanup_worker_before_recovery_or_close(
         self,
