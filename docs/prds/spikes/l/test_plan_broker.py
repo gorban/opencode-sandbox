@@ -856,6 +856,144 @@ class TestPlanBrokerSplitAndGates(unittest.TestCase):
         finally:
             srv.stop()
 
+    def test_gate2_r1_local_ephemeral_slots_forbidden_env_delta_and_local_cidrs(self) -> None:
+        # P1-3: pinned-artifact local-ephemeral MCP referencing an unbacked secret slot fails closed
+        self.store.operator_direct_upsert(
+            "bundle",
+            "team/unbacked-pinned",
+            _bundle_toml(
+                "team/unbacked-pinned",
+                '[mcp.sneaky]\ntype = "pinned-artifact"\nartifact_id = "builtin/mcp-demo"\n'
+                'credential_delivery = "local-ephemeral"\ntools = ["read_only"]\n'
+                '[mcp.sneaky.secret_env]\nSTAGING_KEY = "{file:/run/secrets/unbacked_staging_secret}"\n',
+            ),
+        )
+        with self.assertRaisesRegex(PolicyError, "not backed by any active local pod service"):
+            compile_plan(
+                self.store,
+                "builtin/api-workbench",
+                overrides=PlanOverrides(with_mods=("team/unbacked-pinned",)),
+            )
+
+        # Backed local-ephemeral slot (pg_password from active builtin/postgres) succeeds
+        self.store.operator_direct_upsert(
+            "bundle",
+            "team/backed-pinned",
+            _bundle_toml(
+                "team/backed-pinned",
+                '[mcp.pg_helper]\ntype = "pinned-artifact"\nartifact_id = "builtin/mcp-demo"\n'
+                'credential_delivery = "local-ephemeral"\ntools = ["read_only"]\n'
+                '[mcp.pg_helper.secret_env]\nLOCAL_PG_PW = "{file:/run/secrets/pg_password}"\n',
+            ),
+        )
+        ok_pinned = compile_plan(
+            self.store,
+            "builtin/api-workbench",
+            overrides=PlanOverrides(with_mods=("team/backed-pinned",)),
+        )
+        self.assertIn("pg_helper", ok_pinned.plan["role_contract"]["opencode_config"]["mcp"])
+
+        # P2-1: Proxy/CA/Kubeconfig/AWS env vars rejected by FORBIDDEN_ENV_EXACT
+        for bad_var in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "CURL_CA_BUNDLE",
+            "REQUESTS_CA_BUNDLE",
+            "KUBECONFIG",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_PROFILE",
+        ):
+            raw = _bundle_toml(
+                "team/bad-env",
+                f'[broker_services.sonar]\nkind = "http"\nupstream_url = "https://sonar.example.com"\n'
+                f'preset = "sonarqube"\nclient_env_var = "{bad_var}"\n',
+            )
+            with self.subTest(bad_var=bad_var), self.assertRaises(PolicyError):
+                validate_bundle_doc(parse_toml_strict(raw))
+
+        # P2-1: security_delta detects broker_client_env changes AND secret_ref removal/change
+        class _FakeCompiled:
+            def __init__(self, plan: dict[str, object]) -> None:
+                self.plan = plan
+
+        self.store.operator_direct_upsert(
+            "bundle",
+            "team/delta-p21",
+            _bundle_toml(
+                "team/delta-p21",
+                '[broker_services.sonar]\nkind = "http"\nupstream_url = "https://sonar.example.com"\n'
+                'preset = "sonarqube"\nread_only_secret_ref = "vault:sonar_ro"\n',
+            ),
+        )
+        base = compile_plan(
+            self.store,
+            "builtin/api-workbench",
+            overrides=PlanOverrides(with_mods=("team/delta-p21",)),
+        )
+        for label, mutator, expected in (
+            (
+                "secret_ref_removed",
+                lambda p: p["broker_routes"]["http:sonar"].pop("secret_ref", None),
+                "auth_requirement_changed",
+            ),
+            (
+                "broker_client_env_changed",
+                lambda p: p["broker_client_env"].__setitem__("SONAR_HOST_URL", "http://127.0.0.1:18080/http/evil"),
+                "remote_endpoint_added",
+            ),
+        ):
+            mut_plan = json.loads(json.dumps(base.plan))
+            mutator(mut_plan)
+            delta = compute_closed_security_delta(
+                {"builtin/api-workbench": base},
+                {"builtin/api-workbench": _FakeCompiled(mut_plan)},  # type: ignore[dict-item]
+            )
+            with self.subTest(case=label):
+                self.assertIn(expected, delta["triggers"])
+
+        # P3-4: [local] MCP declaring allowed_cidrs can bind private IP via env_bindings & write grant
+        priv_cidr = _cidr(10, 55, 0, 0, 16)
+        priv_ip = _ip(10, 55, 1, 9)
+        outside_ip = _ip(10, 99, 1, 9)
+        self.store.operator_direct_upsert(
+            "bundle",
+            "team/local-cidr-mcp",
+            _bundle_toml(
+                "team/local-cidr-mcp",
+                f'[mcp.corp_api]\ntype = "remote"\nurl = "http://127.0.0.1:8080/mcp"\n'
+                f'allowed_cidrs = ["{priv_cidr}"]\nread_only_tools = ["q"]\nwrite_tools = ["w"]\n'
+                f'[mcp.corp_api.local]\nbinding_key = "CORP_ENDPOINT"\nservice = "builtin/api-demo"\n'
+                f'url = "http://127.0.0.1:8080/mcp"\n'
+                f'[mcp.corp_api.remote.read_only_headers]\nAuthorization = "Bearer {{file:/run/secrets/corp_ro}}"\n'
+                f'[mcp.corp_api.remote.write_headers]\nAuthorization = "Bearer {{file:/run/secrets/corp_rw}}"\n',
+            ),
+        )
+        ok_priv = compile_plan(
+            self.store,
+            "builtin/api-workbench",
+            overrides=PlanOverrides(
+                with_mods=("team/local-cidr-mcp",),
+                env_bindings={"CORP_ENDPOINT": f"https://{priv_ip}:8443/mcp"},
+                remote_write_grants={"corp_api": f"https://{priv_ip}:8443/mcp"},
+            ),
+        )
+        self.assertEqual(
+            ok_priv.plan["broker_routes"]["mcp:corp_api"]["upstream"],
+            f"https://{priv_ip}:8443/mcp",
+        )
+        with self.assertRaises(PolicyError):
+            compile_plan(
+                self.store,
+                "builtin/api-workbench",
+                overrides=PlanOverrides(
+                    with_mods=("team/local-cidr-mcp",),
+                    env_bindings={"CORP_ENDPOINT": f"https://{outside_ip}:8443/mcp"},
+                ),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

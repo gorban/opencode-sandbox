@@ -6,6 +6,7 @@ import base64
 from dataclasses import dataclass, field
 import hashlib
 import hmac
+import json
 import os
 from pathlib import Path
 import shlex
@@ -1091,6 +1092,57 @@ class TestHostPostgresBroker(unittest.TestCase):
             srv_ok.stop()
             mock.stop()
 
+    def test_gate2_r1_pg_uds_untrusted_dir_and_ipv6_loopback(self) -> None:
+        # P1-2: PG UDS refuses group-writable ancestor (without chmodding), symlink, and sandbox_root
+        base = Path(self._tmpdir.name)
+        os.chmod(base, 0o700)
+        sandbox = base / "sandbox_pg"
+        sandbox.mkdir(mode=0o700)
+        bad_dir = base / "pg_untrusted"
+        bad_dir.mkdir(mode=0o700)
+        os.chmod(bad_dir, 0o770)
+        sym_dir = base / "pg_sym"
+        sym_dir.symlink_to(base)
+        route = self._make_route(5432)
+        vault = self._make_vault()
+        lease = BrokerLease("job_pg_uds_trust")
+        for target in (bad_dir / "sub" / "pg.sock", sym_dir / "pg.sock", sandbox / "pg.sock"):
+            srv = HostPostgresBrokerServer(
+                route,
+                vault,
+                lease,
+                uds_path=target,
+                sandbox_root=sandbox,
+                resolver=_loopback_resolver,
+                allow_test_loopback=True,
+                ssl_context=self._client_ssl,
+            )
+            with self.assertRaises(BrokerPolicyError):
+                srv.start()
+        self.assertEqual(stat.S_IMODE(os.lstat(bad_dir).st_mode), 0o770)
+        self.assertFalse((bad_dir / "sub").exists())
+
+        # P3-1: PG TCP listener supports IPv6 loopback ::1
+        if socket.has_ipv6:
+            srv6 = HostPostgresBrokerServer(
+                route,
+                vault,
+                lease,
+                host="::1",
+                port=0,
+                resolver=_loopback_resolver,
+                allow_test_loopback=True,
+                ssl_context=self._client_ssl,
+            )
+            try:
+                srv6.start()
+            except OSError:
+                return
+            try:
+                self.assertGreater(srv6.bound_port, 0)
+            finally:
+                srv6.stop()
+
 
 class TestHostSshBroker(unittest.TestCase):
     def setUp(self) -> None:
@@ -1141,8 +1193,10 @@ class TestHostSshBroker(unittest.TestCase):
 
         self.assertEqual(len(calls), 4)
         expected_ip = _ip(93, 184, 216, 34)
+        self.assertTrue(os.path.isabs(calls[0][0][0]))
+        self.assertTrue(calls[0][0][0].endswith("/ssh"))
         expected_prefix = [
-            "ssh",
+            calls[0][0][0],
             "-F", "/dev/null",
             "-n",
             "-T",
@@ -1152,7 +1206,6 @@ class TestHostSshBroker(unittest.TestCase):
             "-o", "StrictHostKeyChecking=yes",
             "-o", "GlobalKnownHostsFile=/dev/null",
             "-o", f"UserKnownHostsFile={self._kh.resolve()}",
-            "-o", "IdentitiesOnly=yes",
             "-o", "ControlMaster=no",
             "-o", "ControlPath=none",
             "-o", "ControlPersist=no",
@@ -1171,6 +1224,7 @@ class TestHostSshBroker(unittest.TestCase):
             self.assertFalse(shell)
             self.assertEqual(timeout, 15.0)
             self.assertEqual(argv[:-1], expected_prefix)
+            self.assertNotIn("IdentitiesOnly=yes", argv)
 
         self.assertEqual(calls[0][0][-1], "journalctl --no-pager -n 50 -u caddy@prod.service")
         self.assertEqual(calls[1][0][-1], "systemctl status --no-pager -- postgresql.service")
@@ -1453,6 +1507,89 @@ class TestHostSshBroker(unittest.TestCase):
             )
             with self.subTest(leak=leaked_bytes[:12]), self.assertRaises(CanaryLeakError):
                 leak_broker.run_preset(target, "df")
+
+    def test_gate2_r1_ssh_identity_file_env_and_overflow_tail_canary(self) -> None:
+        # P2-3: Pinned identity_file emits IdentitiesOnly=yes + IdentityFile and binds digest
+        pub_key = self._root / "ops_ed25519.pub"
+        pub_key.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey ops@test\n", encoding="utf-8")
+        os.chmod(pub_key, 0o600)
+
+        captured: list[list[str]] = []
+        broker = HostSshBroker(
+            runner=lambda argv, **_k: (captured.append(argv), SshRawOutput(0, b"ok", b""))[1],
+            resolver=self._public_resolver,
+            sandbox_root=self._sandbox,
+        )
+        pinned = self._make_target(identity_file=pub_key)
+        broker.run_preset(pinned, "df")
+        self.assertIn("IdentitiesOnly=yes", captured[-1])
+        self.assertIn(f"IdentityFile={pub_key.resolve()}", captured[-1])
+
+        d_no_id = compute_ssh_command_digest(
+            "ops_ro", "ops.example.com", 2222, ["df", "-h"], known_hosts_path=self._kh.resolve()
+        )
+        d_with_id = compute_ssh_command_digest(
+            "ops_ro",
+            "ops.example.com",
+            2222,
+            ["df", "-h"],
+            known_hosts_path=self._kh.resolve(),
+            identity_file=pub_key.resolve(),
+        )
+        self.assertNotEqual(d_no_id, d_with_id)
+
+        # Untrusted identity_file (group-readable or inside sandbox) fails closed
+        bad_pub = self._root / "bad_id.pub"
+        bad_pub.write_text("ssh-ed25519 AAAATest\n", encoding="utf-8")
+        os.chmod(bad_pub, 0o640)
+        with self.assertRaises(BrokerPolicyError):
+            broker.run_preset(self._make_target(identity_file=bad_pub), "df")
+
+        # P2-3: Minimal sanitized env strips arbitrary host env vars & SSH_ASKPASS while keeping SSH_AUTH_SOCK
+        old_probe = os.environ.get("OC_HOST_SECRET_PROBE")
+        old_askpass = os.environ.get("SSH_ASKPASS")
+        old_sock = os.environ.get("SSH_AUTH_SOCK")
+        os.environ["OC_HOST_SECRET_PROBE"] = "DO_NOT_LEAK_ME"
+        os.environ["SSH_ASKPASS"] = "/bin/false"
+        os.environ["SSH_AUTH_SOCK"] = "/run/user/1000/keeper-agent.sock"
+        try:
+            env_res = _run_streaming_subprocess(
+                [sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"],
+                timeout=5.0,
+                max_output_bytes=8192,
+                canary_secrets=(),
+            )
+            child_env = json.loads(env_res.stdout.decode("utf-8"))
+            self.assertNotIn("OC_HOST_SECRET_PROBE", child_env)
+            self.assertNotIn("SSH_ASKPASS", child_env)
+            self.assertEqual(child_env.get("SSH_ASKPASS_REQUIRE"), "never")
+            self.assertEqual(child_env.get("SSH_AUTH_SOCK"), "/run/user/1000/keeper-agent.sock")
+        finally:
+            for k, v in (
+                ("OC_HOST_SECRET_PROBE", old_probe),
+                ("SSH_ASKPASS", old_askpass),
+                ("SSH_AUTH_SOCK", old_sock),
+            ):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        # P2-3: Overflow on stdout still finishes/scans buffered short canary tail in stderr
+        secret = "SSH_OVERFLOW_TAIL_CANARY_882211"
+        script = (
+            "import sys, time; "
+            f"sys.stderr.buffer.write({secret.encode('utf-8')!r}); sys.stderr.buffer.flush(); "
+            "time.sleep(0.05); "
+            "sys.stdout.buffer.write(b'A' * 65536); sys.stdout.buffer.flush()"
+        )
+        with self.assertRaises(CanaryLeakError):
+            _run_streaming_subprocess(
+                [sys.executable, "-c", script],
+                timeout=5.0,
+                max_output_bytes=64,
+                canary_secrets=(secret,),
+            )
 
 
 if __name__ == "__main__":

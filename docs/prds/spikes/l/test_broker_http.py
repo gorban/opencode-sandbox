@@ -1512,6 +1512,267 @@ class TestBrokerHttpIntegration(unittest.TestCase):
         self.assertEqual(st_head, 500)
         self.assertEqual(body_head, b"")
 
+    def test_gate2_r1_p1_header_allowlist_aws_action_and_uds_trust(self) -> None:
+        # P1-1: Strict inbound request header allowlist strips impersonation & secondary auth headers
+        st_k8s, _h, _b = _raw_http_exchange(
+            self.addr,
+            _build_req(
+                "GET",
+                "/http/k8s/version",
+                headers={
+                    **self._auth_hdr(),
+                    "Accept": "application/json",
+                    "Impersonate-User": "system:admin",
+                    "Impersonate-Group": "system:masters",
+                    "Impersonate-Extra-Role": "cluster-admin",
+                    "X-Remote-User": "root",
+                    "X-Api-Key": "attacker-key",
+                    "X-Goog-Api-Key": "attacker-goog",
+                    "X-Amz-Copy-Source": "/secret-bucket/key",
+                    "X-Custom-Spoof": "1",
+                },
+            ),
+        )
+        self.assertEqual(st_k8s, 200)
+        up_hdrs = {k.lower(): v for k, v in self.upstream.recorded[-1].headers.items()}
+        self.assertEqual(up_hdrs.get("accept"), "application/json")
+        for forbidden in (
+            "impersonate-user",
+            "impersonate-group",
+            "impersonate-extra-role",
+            "x-remote-user",
+            "x-api-key",
+            "x-goog-api-key",
+            "x-amz-copy-source",
+            "x-custom-spoof",
+        ):
+            self.assertNotIn(forbidden, up_hdrs)
+
+        # P1-1: extra_allowed_request_headers rejects auth/impersonation/x-amz-* headers
+        for bad_hdr in ("Impersonate-User", "X-Remote-User", "X-Api-Key", "X-Amz-Copy-Source", "Authorization"):
+            bad_route = HttpBrokerRoute(
+                route_id="http:bad_hdr",
+                route_prefix="/http/bad_hdr",
+                upstream_url=f"https://upstream.test:{self.up_port}",
+                secret_ref="vault:k8s_token",
+                wire_policy=WirePolicy(allow_rules=(AllowRule(("GET",), ("/ok",)),)),
+                extra_allowed_request_headers=frozenset({bad_hdr}),
+            )
+            with self.subTest(bad_hdr=bad_hdr), self.assertRaises(BrokerPolicyError):
+                validate_route_table([bad_route], self.vault)
+
+        # P1-1 + P1-4: AWS SigV4 strips unsigned X-Amz-Copy-Source, signs X-Amz-Target,
+        # rejects ';' / invalid Action syntax, and enforces segment-bounded REST globs
+        job_ak, job_sk = derive_job_aws_credentials(self.lease.ocjob_token)
+        aws_wild = build_aws_ro_route(
+            "sts",
+            f"https://upstream.test:{self.up_port}",
+            "vault:aws_ak",
+            "vault:aws_sk",
+            allowed_aws_actions=["sts:Get*", "sts:GET:/public/*"],
+        )
+        b_aws = HostHttpBrokerServer(
+            [aws_wild],
+            self.vault,
+            self.lease,
+            ssl_context=self._tls_ctx,
+            resolver=_make_resolver("127.0.0.1"),
+            allow_test_loopback=True,
+        )
+        addr_aws = b_aws.start()
+        try:
+            for bad_q in ("Action=GetCallerIdentity;Action=AssumeRole", "Action=Get%00AssumeRole"):
+                sig_bad = sign_aws_sigv4(
+                    method="GET",
+                    raw_path="/aws/sts",
+                    raw_query=bad_q,
+                    host_header="127.0.0.1",
+                    body=b"",
+                    access_key=job_ak,
+                    secret_key=job_sk,
+                    region="us-east-1",
+                    service="sts",
+                )
+                st_bad, _h, _b = _raw_http_exchange(
+                    addr_aws, _build_req("GET", f"/aws/sts?{bad_q}", headers=sig_bad)
+                )
+                self.assertEqual(st_bad, 403)
+
+            # Segment-bounded REST glob: /public/a allowed, /public/a/b denied
+            for path, want in (("/aws/sts/public/a", 200), ("/aws/sts/public/a/b", 403)):
+                sig_rest = sign_aws_sigv4(
+                    method="GET",
+                    raw_path=path,
+                    raw_query="",
+                    host_header="127.0.0.1",
+                    body=b"",
+                    access_key=job_ak,
+                    secret_key=job_sk,
+                    region="us-east-1",
+                    service="sts",
+                )
+                st_r, _h, _b = _raw_http_exchange(
+                    addr_aws,
+                    _build_req(
+                        "GET",
+                        path,
+                        headers={**sig_rest, "X-Amz-Copy-Source": "/evil/secret"},
+                    ),
+                )
+                self.assertEqual(st_r, want)
+                if want == 200:
+                    up_aws_h = {k.lower(): v for k, v in self.upstream.recorded[-1].headers.items()}
+                    self.assertNotIn("x-amz-copy-source", up_aws_h)
+
+            # X-Amz-Target must be included in upstream SignedHeaders
+            body_tgt = b"{}"
+            sig_tgt = sign_aws_sigv4(
+                method="POST",
+                raw_path="/aws/sts",
+                raw_query="",
+                host_header="127.0.0.1",
+                body=body_tgt,
+                access_key=job_ak,
+                secret_key=job_sk,
+                region="us-east-1",
+                service="sts",
+            )
+            st_tgt, _h, _b = _raw_http_exchange(
+                addr_aws,
+                _build_req(
+                    "POST",
+                    "/aws/sts",
+                    headers={
+                        **sig_tgt,
+                        "Content-Type": "application/x-amz-json-1.1",
+                        "X-Amz-Target": "AWSSecurityTokenService.GetCallerIdentity",
+                    },
+                    body=body_tgt,
+                ),
+            )
+            self.assertEqual(st_tgt, 200)
+            up_tgt_h = {k.lower(): v for k, v in self.upstream.recorded[-1].headers.items()}
+            self.assertIn("x-amz-target", up_tgt_h.get("authorization", ""))
+        finally:
+            b_aws.stop()
+
+        # P1-2: HTTP broker UDS rejects group-writable ancestor, symlink parent, and sandbox_root
+        sandbox = Path(self._tmpdir_obj.name) / "sandbox_http"
+        sandbox.mkdir(mode=0o700)
+        bad_dir = Path(self._tmpdir_obj.name) / "http_untrusted"
+        bad_dir.mkdir(mode=0o700)
+        os.chmod(bad_dir, 0o770)
+        k8s_only = [build_k8s_ro_route("k8s", f"https://upstream.test:{self.up_port}", "vault:k8s_token")]
+        for uds_target in (bad_dir / "sub" / "h.sock", sandbox / "h.sock"):
+            srv_bad = HostHttpBrokerServer(
+                k8s_only,
+                self.vault,
+                self.lease,
+                socket_path=uds_target,
+                sandbox_root=sandbox,
+                ssl_context=self._tls_ctx,
+                resolver=_make_resolver("127.0.0.1"),
+                allow_test_loopback=True,
+            )
+            with self.assertRaises(BrokerPolicyError):
+                srv_bad.start()
+        self.assertEqual(stat.S_IMODE(os.lstat(bad_dir).st_mode), 0o770)
+        self.assertFalse((bad_dir / "sub").exists())
+
+    def test_gate2_r1_p2_unified_presets_and_p3_ipv6_utf8_502(self) -> None:
+        # P2-2: Unified oc_schema.py presets cover nested paths and deny sub-paths / prefix collisions
+        cases = (
+            ("GET", "/http/k8s/api/v1/namespaces/default/secrets/db-creds", 403),
+            ("GET", "/http/k8s/api/v1/namespaces/default/pods/app/exec/sub", 403),
+            ("GET", "/http/k8s/api/v1/namespaces/default/pods-evil", 403),
+            ("GET", "/http/concourse/api/v1/builds/42", 200),
+            ("GET", "/http/concourse/api/v1/teams/main/pipelines/app", 200),
+            ("GET", "/http/concourse/api/v1/teams/main/builds/9/events", 200),
+            ("GET", "/http/concourse/api/v1/teams/main/containers/c1/hijack/sub", 403),
+            ("GET", "/http/github/repos/org/repo/pulls/1/files", 200),
+        )
+        for method, path, want in cases:
+            st, _h, _b = _raw_http_exchange(
+                self.addr, _build_req(method, path, headers=self._auth_hdr())
+            )
+            with self.subTest(path=path):
+                self.assertEqual(st, want)
+
+        # P3-3: Non-ASCII basic-token secret encodes as UTF-8 cleanly
+        utf8_vault = HostVaultMemory({"vault:utf8_tok": "CANARY_UTF8_TOKEN_éçñ_12345"})
+        utf8_route = build_sonarqube_ro_route(
+            "sonar", f"https://upstream.test:{self.up_port}", "vault:utf8_tok"
+        )
+        b_utf8 = HostHttpBrokerServer(
+            [utf8_route],
+            utf8_vault,
+            self.lease,
+            ssl_context=self._tls_ctx,
+            resolver=_make_resolver("127.0.0.1"),
+            allow_test_loopback=True,
+        )
+        addr_u = b_utf8.start()
+        try:
+            b64_job = base64.b64encode(f"{self.lease.ocjob_token}:".encode("utf-8")).decode("ascii")
+            st_u, _h, _b = _raw_http_exchange(
+                addr_u,
+                _build_req(
+                    "GET",
+                    "/http/sonar/api/issues/search",
+                    headers={"Authorization": f"Basic {b64_job}"},
+                ),
+            )
+            self.assertEqual(st_u, 200)
+            want_up = "Basic " + base64.b64encode("CANARY_UTF8_TOKEN_éçñ_12345:".encode("utf-8")).decode("ascii")
+            self.assertEqual(self.upstream.recorded[-1].headers.get("authorization"), want_up)
+        finally:
+            b_utf8.stop()
+
+        # P3-3: Unexpected internal exception inside handler returns clean 502 JSON
+        def _boom_resolver(*_a: object, **_k: object) -> list[Any]:
+            raise RuntimeError("boom_internal")
+
+        b_err = HostHttpBrokerServer(
+            [build_k8s_ro_route("k8s", f"https://upstream.test:{self.up_port}", "vault:k8s_token")],
+            self.vault,
+            self.lease,
+            ssl_context=self._tls_ctx,
+            resolver=_boom_resolver,
+            allow_test_loopback=True,
+        )
+        addr_e = b_err.start()
+        try:
+            st_e, _h, body_e = _raw_http_exchange(
+                addr_e, _build_req("GET", "/http/k8s/version", headers=self._auth_hdr())
+            )
+            self.assertEqual(st_e, 502)
+            self.assertIn(b"broker_internal_error", body_e)
+            self.assertNotIn(b"boom_internal", body_e)
+        finally:
+            b_err.stop()
+
+        # P3-1: IPv6 loopback ::1 binding works on HTTP broker
+        if socket.has_ipv6:
+            b6 = HostHttpBrokerServer(
+                [build_k8s_ro_route("k8s", f"https://upstream.test:{self.up_port}", "vault:k8s_token")],
+                self.vault,
+                self.lease,
+                host="::1",
+                port=0,
+                ssl_context=self._tls_ctx,
+                resolver=_make_resolver("127.0.0.1"),
+                allow_test_loopback=True,
+            )
+            try:
+                addr6 = b6.start()
+            except OSError:
+                return
+            try:
+                self.assertEqual(addr6[0], "::1")
+                self.assertGreater(addr6[1], 0)
+            finally:
+                b6.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 import socket
+import stat
 import sys
+import tempfile
 import time
 import unittest
 from urllib.parse import quote
@@ -25,6 +28,9 @@ from oc_broker_common import (  # noqa: E402
     HostVaultMemory,
     OverlapCanaryScanner,
     PgUpstreamCancelTarget,
+    bind_loopback_tcp,
+    bind_trusted_uds,
+    cleanup_uds_socket,
     resolve_and_validate_ip,
     validate_allowed_cidrs,
 )
@@ -206,6 +212,73 @@ class TestBrokerCommon(unittest.TestCase):
             lease.stop_watchdog()
             s_a.close()
             s_b.close()
+
+    def test_gate2_r1_bind_trusted_uds_ipv6_loopback_and_revoke_no_close(self) -> None:
+        # P3-2: BrokerLease.revoke shuts down registered sockets without closing owning FDs
+        lease = BrokerLease("job_revoke_fd")
+        s1, s2 = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            lease.register_stream(s1)
+            lease.revoke()
+            self.assertNotEqual(s1.fileno(), -1)
+            s2.settimeout(0.5)
+            self.assertEqual(s2.recv(16), b"")
+        finally:
+            s1.close()
+            s2.close()
+
+        # P1-2: bind_trusted_uds rejects untrusted parent perms, symlinks, sandbox paths, non-sockets
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            os.chmod(root, 0o700)
+            sandbox = root / "sandbox"
+            sandbox.mkdir(mode=0o700)
+
+            grp_dir = root / "group_writable"
+            grp_dir.mkdir(mode=0o700)
+            os.chmod(grp_dir, 0o770)
+            with self.assertRaises(BrokerPolicyError):
+                bind_trusted_uds(grp_dir / "nested" / "b.sock", sandbox_root=sandbox)
+            # Must NOT silently chmod untrusted pre-existing dirs or create nested dirs
+            self.assertEqual(stat.S_IMODE(os.lstat(grp_dir).st_mode), 0o770)
+            self.assertFalse((grp_dir / "nested").exists())
+
+            link_parent = root / "sym_parent"
+            link_parent.symlink_to(root)
+            with self.assertRaises(BrokerPolicyError):
+                bind_trusted_uds(link_parent / "b.sock", sandbox_root=sandbox)
+
+            with self.assertRaises(BrokerPolicyError):
+                bind_trusted_uds(sandbox / "inside.sock", sandbox_root=sandbox)
+
+            reg_file = root / "not_a_socket"
+            reg_file.write_text("keep", encoding="utf-8")
+            with self.assertRaises(BrokerPolicyError):
+                bind_trusted_uds(reg_file, sandbox_root=sandbox)
+            self.assertTrue(reg_file.exists())
+
+            sock, bound = bind_trusted_uds(root / "ok_sub" / "broker.sock", sandbox_root=sandbox)
+            try:
+                self.assertEqual(stat.S_IMODE(os.lstat(bound.parent).st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(os.lstat(bound).st_mode), 0o600)
+            finally:
+                sock.close()
+                cleanup_uds_socket(bound)
+            self.assertFalse(bound.exists())
+
+        # P3-1: bind_loopback_tcp supports IPv6 ::1 and rejects non-loopback
+        with self.assertRaises(BrokerPolicyError):
+            bind_loopback_tcp("2001:db8::1", 0)
+        if socket.has_ipv6:
+            try:
+                s6, port6 = bind_loopback_tcp("::1", 0)
+            except OSError:
+                return
+            try:
+                self.assertGreater(port6, 0)
+                self.assertEqual(s6.family, socket.AF_INET6)
+            finally:
+                s6.close()
 
 
 if __name__ == "__main__":

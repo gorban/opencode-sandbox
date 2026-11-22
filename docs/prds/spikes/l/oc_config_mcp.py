@@ -438,10 +438,12 @@ class _BaseUdsRpcServer:
         self._cleanup_extra()
 
     def _accept_loop(self) -> None:
-        assert self._sock is not None
+        sock = self._sock
+        if sock is None:
+            return
         while not self._stop.is_set():
             try:
-                conn, _ = self._sock.accept()
+                conn, _ = sock.accept()
             except TimeoutError:
                 continue
             except OSError:

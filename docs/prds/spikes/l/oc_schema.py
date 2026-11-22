@@ -146,6 +146,16 @@ FORBIDDEN_ENV_EXACT = frozenset(
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
         "NODE_EXTRA_CA_CERTS",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "CURL_CA_BUNDLE",
+        "REQUESTS_CA_BUNDLE",
+        "KUBECONFIG",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_PROFILE",
     }
 )
 FORBIDDEN_ENV_PREFIXES = (
@@ -1222,6 +1232,7 @@ def default_concourse_wire_policy() -> dict[str, Any]:
                     "/api/v1/builds/*/events",
                     "/api/v1/teams/*/builds",
                     "/api/v1/teams/*/builds/*",
+                    "/api/v1/teams/*/builds/*/events",
                 ],
                 "body_policy": "none",
             }

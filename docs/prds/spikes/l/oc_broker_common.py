@@ -14,9 +14,12 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 import hmac
 import ipaddress
+import os
+from pathlib import Path
 import secrets
 import socket
 import ssl
+import stat
 import threading
 from typing import Any
 from urllib.parse import quote, quote_plus
@@ -326,11 +329,136 @@ def generate_ocjob_token() -> str:
     return f"ocjob_{secrets.token_hex(32)}"
 
 
-def _safe_shutdown_close(sock: socket.socket) -> None:
+_UMASK_LOCK = threading.Lock()
+
+
+def _unlink_uds_socket_only(sock_path: Path) -> None:
+    try:
+        st = os.lstat(sock_path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(st.st_mode):
+        raise BrokerPolicyError(f"Refusing to unlink non-socket path: {sock_path}")
+    sock_path.unlink()
+
+
+def cleanup_uds_socket(sock_path: Path | None) -> None:
+    if sock_path is None:
+        return
+    try:
+        _unlink_uds_socket_only(sock_path)
+    except (OSError, BrokerPolicyError):
+        pass
+
+
+def _assert_existing_ancestor_chain_trusted(target_dir: Path, *, sandbox_root: Path | None) -> None:
+    """Verify every existing ancestor of target_dir is owned by current user/root and not world-writable."""
+    uid = os.geteuid()
+    cur = target_dir
+    while not cur.exists():
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    while True:
+        ast = os.lstat(cur)
+        if not stat.S_ISDIR(ast.st_mode) or stat.S_ISLNK(ast.st_mode):
+            raise BrokerPolicyError(f"Expected non-symlink ancestor directory: {cur}")
+        if ast.st_uid not in (uid, 0):
+            raise BrokerPolicyError(f"Untrusted ancestor owner for {target_dir}: {cur}")
+        if (ast.st_mode & 0o022) and not (ast.st_uid == 0 and (ast.st_mode & stat.S_ISVTX)):
+            raise BrokerPolicyError(f"Writable ancestor directory for {target_dir}: {cur}")
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    _ = sandbox_root
+
+
+def bind_trusted_uds(
+    raw_socket_path: Path,
+    *,
+    sandbox_root: Path | None = None,
+    backlog: int = 32,
+) -> tuple[socket.socket, Path]:
+    """Verify trust boundaries before creating/binding a 0o600 UDS under a shared umask lock."""
+    from oc_schema import (
+        PolicyError,
+        assert_trusted_dir,
+        check_not_host_production_dir,
+        check_not_in_sandbox,
+    )
+
+    sock_p = Path(raw_socket_path)
+    if sock_p.name in ("", ".", ".."):
+        raise BrokerPolicyError(f"Invalid UDS socket path: {sock_p}")
+    if sock_p.is_symlink() or sock_p.parent.is_symlink():
+        raise BrokerPolicyError(f"Symlink UDS path or parent rejected: {sock_p}")
+    try:
+        phys_parent = check_not_in_sandbox(sock_p.parent, sandbox_root)
+        check_not_in_sandbox(sock_p, sandbox_root)
+        check_not_host_production_dir(sock_p.parent)
+        if phys_parent.is_symlink():
+            raise BrokerPolicyError(f"Symlink UDS parent rejected: {phys_parent}")
+        if phys_parent.exists():
+            # Verify existing directory BEFORE ever modifying permissions.
+            trusted_parent = assert_trusted_dir(phys_parent, sandbox_root=sandbox_root)
+        else:
+            _assert_existing_ancestor_chain_trusted(phys_parent, sandbox_root=sandbox_root)
+            phys_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(phys_parent, 0o700)
+            trusted_parent = assert_trusted_dir(phys_parent, sandbox_root=sandbox_root)
+    except PolicyError as exc:
+        raise BrokerPolicyError(str(exc)) from exc
+
+    phys_sock = trusted_parent / sock_p.name
+    _unlink_uds_socket_only(phys_sock)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        with _UMASK_LOCK:
+            old_umask = os.umask(0o177)
+            try:
+                srv.bind(str(phys_sock))
+            finally:
+                os.umask(old_umask)
+        os.chmod(phys_sock, 0o600)
+        srv.listen(backlog)
+        srv.settimeout(0.2)
+        return srv, phys_sock
+    except Exception:
+        srv.close()
+        raise
+
+
+def bind_loopback_tcp(host: str, port: int, *, backlog: int = 32) -> tuple[socket.socket, int]:
+    """Bind a loopback-only TCP listener supporting both IPv4 (127.0.0.1) and IPv6 (::1)."""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise BrokerPolicyError(f"TCP listener host must be a loopback IP: {host!r}") from exc
+    if not addr.is_loopback:
+        raise BrokerPolicyError(f"TCP listener host must be loopback: {host!r}")
+    family = socket.AF_INET6 if isinstance(addr, ipaddress.IPv6Address) else socket.AF_INET
+    srv = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((str(addr), port))
+        srv.listen(backlog)
+        srv.settimeout(0.2)
+        bound_port = int(srv.getsockname()[1])
+        return srv, bound_port
+    except Exception:
+        srv.close()
+        raise
+
+
+def _safe_shutdown(sock: socket.socket) -> None:
     try:
         sock.shutdown(socket.SHUT_RDWR)
     except OSError:
         pass
+
+
+def _safe_shutdown_close(sock: socket.socket) -> None:
+    _safe_shutdown(sock)
     try:
         sock.close()
     except OSError:
@@ -462,7 +590,7 @@ class BrokerLease:
             except Exception:
                 pass
         for sock in streams:
-            _safe_shutdown_close(sock)
+            _safe_shutdown(sock)
 
     def start_watchdog(self, *, poll_interval: float = 0.05) -> None:
         if self._watch_thread is not None and self._watch_thread.is_alive():

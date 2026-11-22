@@ -737,6 +737,40 @@ def _build_remote_mcp_broker_route(
     }
 
 
+def _match_remote_write_grant(
+    mname: str, resolved_url: str, remote_write_grants: dict[str, str]
+) -> bool:
+    if mname not in remote_write_grants:
+        return False
+    granted_url = remote_write_grants[mname]
+    if granted_url != resolved_url:
+        raise PolicyError(
+            f"Remote write grant for MCP {mname!r} targets {granted_url!r}, "
+            f"which does not match bound remote endpoint {resolved_url!r}"
+        )
+    return True
+
+
+def _resolve_remote_cred_delivery(
+    mname: str,
+    mcfg: dict[str, Any],
+    *,
+    tier: str,
+    allow_raw_remote_mounts: frozenset[str],
+    active_raw_remote_mounts: set[str],
+) -> tuple[str, str]:
+    raw_delivery = mcfg.get("credential_delivery")
+    cred_delivery = "host-brokered" if raw_delivery is None else raw_delivery
+    if cred_delivery == "local-ephemeral":
+        raise PolicyError(
+            f"Remote MCP {mname!r} cannot use credential_delivery='local-ephemeral' when bound remotely"
+        )
+    route_id = f"mcp:{mname}"
+    if cred_delivery == "raw-container-mount":
+        _require_raw_mount_breakglass(route_id, tier, allow_raw_remote_mounts, active_raw_remote_mounts)
+    return route_id, cred_delivery
+
+
 def _compile_remote_mcp_entry(
     mname: str,
     mcfg: dict[str, Any],
@@ -753,21 +787,15 @@ def _compile_remote_mcp_entry(
     broker_routes: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
     resolved_url = mcfg["url"]
+    if resolved_url is None:
+        raise PlanError(f"Remote MCP {mname!r} missing resolved_url")
     ro_tools = mcfg.get("read_only_tools")
     wr_tools = mcfg.get("write_tools", [])
     if ro_tools is None:
         raise PolicyError(
             f"Remote MCP server {mname!r} must explicitly declare read_only_tools (failing closed)"
         )
-    grant_matched = False
-    if mname in remote_write_grants:
-        granted_url = remote_write_grants[mname]
-        if granted_url != resolved_url:
-            raise PolicyError(
-                f"Remote write grant for MCP {mname!r} targets {granted_url!r}, "
-                f"which does not match bound remote endpoint {resolved_url!r}"
-            )
-        grant_matched = True
+    grant_matched = _match_remote_write_grant(mname, resolved_url, remote_write_grants)
 
     candidate_tools = list(ro_tools) + (list(wr_tools) if grant_matched else [])
     tools = _filter_tools_by_persona(mname, candidate_tools, allow_set, deny_set)
@@ -778,24 +806,17 @@ def _compile_remote_mcp_entry(
         mname, mcfg, write_active=write_active
     )
     if write_active:
-        if resolved_url is None:
-            raise PlanError(f"Remote MCP {mname!r} missing resolved_url")
         effective_remote_write_grants[mname] = resolved_url
     if allow_set is not None and candidate_tools and not tools:
         return None
 
-    raw_delivery = mcfg.get("credential_delivery")
-    cred_delivery = "host-brokered" if raw_delivery is None else raw_delivery
-    if cred_delivery == "local-ephemeral":
-        raise PolicyError(
-            f"Remote MCP {mname!r} cannot use credential_delivery='local-ephemeral' when bound remotely"
-        )
-    route_id = f"mcp:{mname}"
-    if cred_delivery == "raw-container-mount":
-        _require_raw_mount_breakglass(route_id, tier, allow_raw_remote_mounts, active_raw_remote_mounts)
-
-    if resolved_url is None:
-        raise PlanError(f"Remote MCP {mname!r} missing resolved_url")
+    route_id, cred_delivery = _resolve_remote_cred_delivery(
+        mname,
+        mcfg,
+        tier=tier,
+        allow_raw_remote_mounts=allow_raw_remote_mounts,
+        active_raw_remote_mounts=active_raw_remote_mounts,
+    )
     broker_routes[route_id] = _build_remote_mcp_broker_route(
         mname,
         mcfg,
@@ -838,6 +859,7 @@ def _compile_local_mcp_entry(
     tier: str,
     allow_raw_remote_mounts: frozenset[str],
     active_raw_remote_mounts: set[str],
+    active_local_secret_slots: frozenset[str],
 ) -> dict[str, Any] | None:
     if mname in remote_write_grants:
         raise PolicyError(
@@ -858,6 +880,16 @@ def _compile_local_mcp_entry(
     lcfg = mcfg.get("local") if mcfg["type"] != "pinned-artifact" else None
     use_local = lcfg is not None and (lcfg["headers"] or lcfg["secret_env"])
     src = lcfg if use_local else mcfg
+    eff_headers = dict(src["headers"])
+    eff_secret_env = dict(src["secret_env"])
+    if cred_delivery == "local-ephemeral":
+        referenced_slots = extract_secret_slots(eff_headers, eff_secret_env)
+        unbacked = sorted(referenced_slots - active_local_secret_slots)
+        if unbacked:
+            raise PolicyError(
+                f"Local MCP {mname!r} with credential_delivery='local-ephemeral' references secret slot(s) "
+                f"not backed by any active local pod service: {', '.join(unbacked)}"
+            )
     return {
         "type": mcfg["type"],
         "access_mode": "local",
@@ -865,8 +897,8 @@ def _compile_local_mcp_entry(
         "url": mcfg["url"],
         "artifact_id": mcfg["artifact_id"],
         "args": mcfg["args"],
-        "headers": dict(src["headers"]),
-        "secret_env": dict(src["secret_env"]),
+        "headers": eff_headers,
+        "secret_env": eff_secret_env,
         "allowed_tools": tools,
     }
 
@@ -916,6 +948,9 @@ def _compile_role_contract(
     )
     deny_set = set(primary_persona["denied_mcp_tools"]) if primary_persona else set()
 
+    active_local_secret_slots = frozenset(
+        slot["slot"] for rs in resolved_services for slot in rs["doc"].get("secret_slots", [])
+    )
     filtered_mcp: dict[str, dict[str, Any]] = {}
     effective_remote_write_grants: dict[str, str] = {}
     for mname, mcfg in sorted(mcp_servers.items()):
@@ -944,6 +979,7 @@ def _compile_role_contract(
                 tier=tier,
                 allow_raw_remote_mounts=allow_raw_remote_mounts,
                 active_raw_remote_mounts=active_raw_remote_mounts,
+                active_local_secret_slots=active_local_secret_slots,
             )
         )
         if compiled_entry is not None:
@@ -1219,6 +1255,8 @@ def _bind_or_activate_local(
     ov: PlanOverrides,
     active_roots: list[dict[str, Any]],
     remote_bindings: dict[str, str],
+    *,
+    allowed_cidrs: tuple[str, ...] = (),
 ) -> None:
     ext = ov.env_bindings.get(bkey, "")
     if ext:
@@ -1226,6 +1264,7 @@ def _bind_or_activate_local(
             ext,
             allow_http=ov.allow_http_remote,
             allowed_hosts=ov.allowed_remote_hosts,
+            allowed_cidrs=allowed_cidrs,
         )
     else:
         active_roots.append(target_req)
@@ -1264,11 +1303,17 @@ def _collect_roots_and_bindings(
                     ov,
                     active_roots,
                     remote_bindings,
+                    allowed_cidrs=tuple(mcfg.get("allowed_cidrs", ())),
                 )
     return active_roots, remote_bindings
 
 
-def _canonicalize_write_grants(ov: PlanOverrides) -> dict[str, str]:
+def _canonicalize_write_grants(ov: PlanOverrides, bundles: list[dict[str, Any]]) -> dict[str, str]:
+    mcp_cidrs: dict[str, tuple[str, ...]] = {}
+    for b in bundles:
+        for mname, mcfg in b.get("mcp", {}).items():
+            if mcfg.get("allowed_cidrs"):
+                mcp_cidrs[mname] = tuple(mcfg["allowed_cidrs"])
     canonical_write_grants: dict[str, str] = {}
     for g_mcp, g_url in ov.remote_write_grants.items():
         if type(g_mcp) is not str or SIMPLE_NAME_RE.fullmatch(g_mcp) is None:
@@ -1277,6 +1322,7 @@ def _canonicalize_write_grants(ov: PlanOverrides) -> dict[str, str]:
             g_url,
             allow_http=ov.allow_http_remote,
             allowed_hosts=ov.allowed_remote_hosts,
+            allowed_cidrs=mcp_cidrs.get(g_mcp, ()),
         )
     return canonical_write_grants
 
@@ -1355,7 +1401,7 @@ def compile_plan(
 
     bundles, bundle_closure = _resolve_bundle_dag(store, st["bundles"], ov.with_mods, ov.without_mods)
     active_roots, remote_bindings = _collect_roots_and_bindings(bundles, ov)
-    canonical_write_grants = _canonicalize_write_grants(ov)
+    canonical_write_grants = _canonicalize_write_grants(ov, bundles)
 
     if active_roots and not bool(worker_caps.get("supports_pods", False)):
         raise PlanError(
@@ -1637,6 +1683,7 @@ def _broker_route_auth_changed(old_r: dict[str, Any], new_r: dict[str, Any]) -> 
         new_r.get("known_hosts_ref") != old_r.get("known_hosts_ref")
         or new_r.get("inbound_auth") != old_r.get("inbound_auth")
         or new_r.get("inbound_auth_header") != old_r.get("inbound_auth_header")
+        or new_r.get("secret_ref") != old_r.get("secret_ref")
         or new_r.get("upstream_headers") != old_r.get("upstream_headers")
         or new_r.get("upstream_secret_env") != old_r.get("upstream_secret_env")
     )
@@ -1705,6 +1752,16 @@ def _delta_broker_routes(
             _delta_broker_route_pair(st_id, rid, old_r, new_r, triggers, details)
 
 
+def _delta_broker_client_env(
+    st_id: str, old_p: dict[str, Any] | None, new_p: dict[str, Any], triggers: set[str], details: list[dict[str, Any]]
+) -> None:
+    old_env = old_p.get("broker_client_env", {}) if old_p else {}
+    for k, v in sorted(new_p.get("broker_client_env", {}).items()):
+        if old_env.get(k) != v:
+            triggers.add("remote_endpoint_added")
+            details.append({"trigger": "remote_endpoint_added", "sandbox_type": st_id, "client_env": k})
+
+
 def _delta_misc(
     st_id: str, old_p: dict[str, Any] | None, new_p: dict[str, Any], triggers: set[str], details: list[dict[str, Any]]
 ) -> None:
@@ -1726,6 +1783,7 @@ def _delta_misc(
     for rid in sorted(set(new_p.get("raw_remote_mounts", [])) - old_raw_mounts):
         triggers.add("raw_remote_secret_mounted")
         details.append({"trigger": "raw_remote_secret_mounted", "sandbox_type": st_id, "route": rid})
+    _delta_broker_client_env(st_id, old_p, new_p, triggers, details)
 
 
 def compute_closed_security_delta(

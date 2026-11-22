@@ -23,7 +23,6 @@ import secrets
 import selectors
 import socket
 import ssl
-import stat
 import struct
 import threading
 import time
@@ -40,12 +39,14 @@ from oc_broker_common import (
     MIN_SECRET_LEN,
     OverlapCanaryScanner,
     PgUpstreamCancelTarget,
+    bind_loopback_tcp,
+    bind_trusted_uds,
     build_strict_tls_context,
+    cleanup_uds_socket,
     connect_tcp_pinned_ip,
     resolve_and_validate_ip,
     validate_allowed_cidrs,
 )
-from oc_schema import PolicyError, assert_trusted_dir, check_not_in_sandbox
 
 PG_PROTOCOL_V3 = 196608
 PG_SSL_REQUEST = 80877103
@@ -706,16 +707,6 @@ def _close_quiet(sock: socket.socket) -> None:
         pass
 
 
-def _unlink_socket_only(path: Path) -> None:
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return
-    if not stat.S_ISSOCK(st.st_mode):
-        raise BrokerPolicyError(f"Refusing to unlink non-socket path: {path}")
-    path.unlink()
-
-
 class HostPostgresBrokerServer:
     """Bounded per-job message-framed Postgres v3 proxy listener (loopback TCP or 0o600 UDS)."""
 
@@ -790,46 +781,17 @@ class HostPostgresBrokerServer:
         self._accept_thread.start()
 
     def _bind_tcp(self) -> socket.socket:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self._host, self._port))
-            sock.listen(32)
-            sock.settimeout(0.2)
-            self._bound_port = int(sock.getsockname()[1])
-            return sock
-        except Exception:
-            _close_quiet(sock)
-            raise
+        sock, bound_port = bind_loopback_tcp(self._host, self._port, backlog=32)
+        self._bound_port = bound_port
+        return sock
 
     def _bind_uds(self, raw_uds_path: Path) -> socket.socket:
-        uds_path = Path(raw_uds_path)
-        try:
-            if uds_path.parent.is_symlink():
-                raise BrokerPolicyError(f"Symlink UDS parent rejected: {uds_path.parent}")
-            phys_parent = check_not_in_sandbox(uds_path.parent, self._sandbox_root)
-            check_not_in_sandbox(uds_path, self._sandbox_root)
-            phys_parent.mkdir(parents=True, exist_ok=True)
-            os.chmod(phys_parent, 0o700)
-            trusted_parent = assert_trusted_dir(phys_parent, sandbox_root=self._sandbox_root)
-        except PolicyError as exc:
-            raise BrokerPolicyError(str(exc)) from exc
-
-        sock_path = trusted_parent / uds_path.name
-        _unlink_socket_only(sock_path)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        old_umask = os.umask(0o177)
-        try:
-            sock.bind(str(sock_path))
-        except Exception:
-            _close_quiet(sock)
-            raise
-        finally:
-            os.umask(old_umask)
-        os.chmod(sock_path, 0o600)
-        sock.listen(32)
-        sock.settimeout(0.2)
-        self._bound_uds_path = sock_path
+        sock, bound_path = bind_trusted_uds(
+            raw_uds_path,
+            sandbox_root=self._sandbox_root,
+            backlog=32,
+        )
+        self._bound_uds_path = bound_path
         return sock
 
     def stop(self) -> None:
@@ -841,10 +803,7 @@ class HostPostgresBrokerServer:
             self._accept_thread.join(timeout=2.0)
             self._accept_thread = None
         if self._bound_uds_path is not None:
-            try:
-                _unlink_socket_only(self._bound_uds_path)
-            except (OSError, BrokerPolicyError):
-                pass
+            cleanup_uds_socket(self._bound_uds_path)
             self._bound_uds_path = None
 
     def __enter__(self) -> HostPostgresBrokerServer:

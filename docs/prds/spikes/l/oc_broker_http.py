@@ -30,7 +30,6 @@ from pathlib import Path
 import re
 import socket
 import ssl
-import stat
 import struct
 import threading
 import time
@@ -44,9 +43,18 @@ from oc_broker_common import (
     CanaryLeakError,
     HostVaultMemory,
     OverlapCanaryScanner,
+    bind_loopback_tcp,
+    bind_trusted_uds,
+    cleanup_uds_socket,
     connect_tls_pinned_ip,
     resolve_and_validate_ip,
     validate_allowed_cidrs,
+)
+from oc_schema import (
+    default_concourse_wire_policy,
+    default_github_wire_policy,
+    default_k8s_wire_policy,
+    default_sonarqube_wire_policy,
 )
 
 MAX_CONCURRENT_CONNS = 16
@@ -60,8 +68,6 @@ MAX_GQL_TOKENS = 8_192
 MAX_GQL_DEPTH = 64
 MAX_SIGV4_CLOCK_SKEW_SECONDS = 300
 MAX_CHUNK_LINE_BYTES = 1_024
-
-_UMASK_LOCK = threading.Lock()
 
 CLOSED_MCP_WIRE_METHODS = frozenset(
     {
@@ -96,7 +102,20 @@ HOP_BY_HOP_HEADERS = frozenset(
     }
 )
 
-IGNORED_INBOUND_HEADERS = frozenset(
+ALLOWED_UPSTREAM_REQUEST_HEADERS = frozenset(
+    {
+        "accept",
+        "content-type",
+        "user-agent",
+        "mcp-session-id",
+        "mcp-protocol-version",
+        "last-event-id",
+        "if-none-match",
+        "if-modified-since",
+    }
+)
+
+_FORBIDDEN_EXTRA_REQUEST_HEADERS = frozenset(
     {
         "host",
         "forwarded",
@@ -111,10 +130,15 @@ IGNORED_INBOUND_HEADERS = frozenset(
         "authorization",
         "proxy-authorization",
         "cookie",
+        "x-api-key",
+        "x-goog-api-key",
         "x-auth-token",
         "x-access-token",
     }
 )
+_FORBIDDEN_EXTRA_HEADER_PREFIXES = ("impersonate-", "x-remote-", "x-forwarded-", "x-amz-")
+
+_AWS_ACTION_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,127}$", re.ASCII)
 
 _AWS_PRESIGN_QUERY_KEYS = frozenset(
     {"x-amz-signature", "x-amz-credential", "x-amz-security-token"}
@@ -224,6 +248,7 @@ class HttpBrokerRoute:
     aws_secret_key_ref: str | None = None
     aws_session_token_ref: str | None = None
     pair_distinct_secret_ref: str | None = None
+    extra_allowed_request_headers: frozenset[str] = frozenset()
 
 
 @dataclass(slots=True)
@@ -252,8 +277,22 @@ class _ParsedUpstreamUrl:
 
 
 # ---------------------------------------------------------------------------
-# Preset Route-Policy Builders
+# Preset Route-Policy Builders (unified with oc_schema.py)
 # ---------------------------------------------------------------------------
+
+
+def _wire_policy_from_preset_dict(raw: dict[str, Any]) -> WirePolicy:
+    return WirePolicy(
+        denied_paths=tuple(raw.get("denied_paths", ())),
+        allow_rules=tuple(
+            AllowRule(
+                methods=tuple(rule["methods"]),
+                path_patterns=tuple(rule["path_patterns"]),
+                body_policy=rule.get("body_policy", "none"),
+            )
+            for rule in raw.get("allow_rules", ())
+        ),
+    )
 
 
 def build_concourse_ro_route(
@@ -265,30 +304,12 @@ def build_concourse_ro_route(
     pair_distinct_secret_ref: str | None = None,
 ) -> HttpBrokerRoute:
     """Default read-only Concourse CI (fly) route with /hijack denied and /events SSE."""
-    policy = WirePolicy(
-        denied_paths=("/api/v1/teams/*/containers/*/hijack*",),
-        allow_rules=(
-            AllowRule(
-                methods=("GET", "HEAD"),
-                path_patterns=(
-                    "/api/v1/info",
-                    "/api/v1/teams/*/pipelines*",
-                    "/api/v1/teams/*/pipelines/*/jobs*",
-                    "/api/v1/builds*",
-                    "/api/v1/builds/*/events",
-                    "/api/v1/teams/*/builds*",
-                    "/api/v1/teams/*/builds/*/events",
-                ),
-                body_policy="none",
-            ),
-        ),
-    )
     return HttpBrokerRoute(
         route_id=f"http:{name}",
         route_prefix=f"/http/{name}",
         upstream_url=upstream_url,
         secret_ref=secret_ref,
-        wire_policy=policy,
+        wire_policy=_wire_policy_from_preset_dict(default_concourse_wire_policy()),
         inbound_auth="bearer",
         upstream_auth_mode="bearer",
         allow_streaming=True,
@@ -306,42 +327,12 @@ def build_k8s_ro_route(
     pair_distinct_secret_ref: str | None = None,
 ) -> HttpBrokerRoute:
     """Default read-only Kubernetes (kubectl) route with secrets/exec/attach/proxy denied."""
-    policy = WirePolicy(
-        denied_paths=(
-            "/api/v1/secrets*",
-            "/api/v1/namespaces/*/secrets*",
-            "/api/v1/namespaces/*/pods/*/exec*",
-            "/api/v1/namespaces/*/pods/*/attach*",
-            "/api/v1/namespaces/*/pods/*/portforward*",
-            "/api/v1/namespaces/*/pods/*/proxy*",
-            "/api/v1/namespaces/*/services/*/proxy*",
-        ),
-        allow_rules=(
-            AllowRule(
-                methods=("GET", "HEAD"),
-                path_patterns=(
-                    "/version",
-                    "/api",
-                    "/apis",
-                    "/api/v1/namespaces/*/pods*",
-                    "/api/v1/namespaces/*/pods/*",
-                    "/api/v1/namespaces/*/pods/*/log",
-                    "/api/v1/namespaces/*/events*",
-                    "/api/v1/namespaces/*/services*",
-                    "/api/v1/namespaces/*/services/*",
-                    "/apis/apps/v1/namespaces/*/deployments*",
-                    "/apis/apps/v1/namespaces/*/deployments/*",
-                ),
-                body_policy="none",
-            ),
-        ),
-    )
     return HttpBrokerRoute(
         route_id=f"http:{name}",
         route_prefix=f"/http/{name}",
         upstream_url=upstream_url,
         secret_ref=secret_ref,
-        wire_policy=policy,
+        wire_policy=_wire_policy_from_preset_dict(default_k8s_wire_policy()),
         inbound_auth="bearer",
         upstream_auth_mode="bearer",
         allow_streaming=False,
@@ -359,26 +350,12 @@ def build_sonarqube_ro_route(
     pair_distinct_secret_ref: str | None = None,
 ) -> HttpBrokerRoute:
     """Default read-only SonarQube route using basic-token auth."""
-    policy = WirePolicy(
-        allow_rules=(
-            AllowRule(
-                methods=("GET", "HEAD"),
-                path_patterns=(
-                    "/api/qualitygates/*",
-                    "/api/issues/search",
-                    "/api/measures/component*",
-                    "/api/hotspots/search",
-                ),
-                body_policy="none",
-            ),
-        ),
-    )
     return HttpBrokerRoute(
         route_id=f"http:{name}",
         route_prefix=f"/http/{name}",
         upstream_url=upstream_url,
         secret_ref=secret_ref,
-        wire_policy=policy,
+        wire_policy=_wire_policy_from_preset_dict(default_sonarqube_wire_policy()),
         inbound_auth="basic-token",
         upstream_auth_mode="basic-token",
         allow_streaming=False,
@@ -396,34 +373,12 @@ def build_github_ro_route(
     pair_distinct_secret_ref: str | None = None,
 ) -> HttpBrokerRoute:
     """Default read-only GitHub route: GET REST + POST /graphql query-only AST."""
-    policy = WirePolicy(
-        allow_rules=(
-            AllowRule(
-                methods=("GET", "HEAD"),
-                path_patterns=(
-                    "/repos/*/*",
-                    "/repos/*/*/pulls*",
-                    "/repos/*/*/pulls/*",
-                    "/repos/*/*/issues*",
-                    "/repos/*/*/issues/*",
-                    "/repos/*/*/commits*",
-                    "/repos/*/*/commits/*",
-                ),
-                body_policy="none",
-            ),
-            AllowRule(
-                methods=("POST",),
-                path_patterns=("/graphql",),
-                body_policy="graphql-query-only",
-            ),
-        ),
-    )
     return HttpBrokerRoute(
         route_id=f"http:{name}",
         route_prefix=f"/http/{name}",
         upstream_url=upstream_url,
         secret_ref=secret_ref,
-        wire_policy=policy,
+        wire_policy=_wire_policy_from_preset_dict(default_github_wire_policy()),
         inbound_auth="bearer",
         upstream_auth_mode="bearer",
         allow_streaming=False,
@@ -527,6 +482,20 @@ def _parse_upstream_url(url: str) -> _ParsedUpstreamUrl:
     return _ParsedUpstreamUrl(host=parts.hostname.lower(), port=port, base_path=parts.path or "")
 
 
+def _validate_extra_allowed_headers(route: HttpBrokerRoute) -> None:
+    blocked = _FORBIDDEN_EXTRA_REQUEST_HEADERS | HOP_BY_HOP_HEADERS
+    if route.inbound_auth_header:
+        blocked = blocked | {route.inbound_auth_header.lower()}
+    if route.upstream_auth_header:
+        blocked = blocked | {route.upstream_auth_header.lower()}
+    for hdr in route.extra_allowed_request_headers:
+        if type(hdr) is not str or not _HTTP_TOKEN_RE.match(hdr):
+            raise BrokerPolicyError(f"Invalid extra_allowed_request_headers entry: {hdr!r}")
+        low = hdr.lower()
+        if low in blocked or any(low.startswith(pfx) for pfx in _FORBIDDEN_EXTRA_HEADER_PREFIXES):
+            raise BrokerPolicyError(f"Forbidden extra_allowed_request_headers entry: {hdr!r}")
+
+
 def _validate_route_auth_fields(route: HttpBrokerRoute) -> None:
     if route.inbound_auth not in VALID_INBOUND_AUTH:
         raise BrokerPolicyError(f"Unsupported inbound_auth: {route.inbound_auth!r}")
@@ -540,6 +509,7 @@ def _validate_route_auth_fields(route: HttpBrokerRoute) -> None:
     if route.upstream_auth_mode == "aws-sigv4":
         if not route.aws_access_key_ref or not route.aws_secret_key_ref:
             raise BrokerPolicyError(f"AWS SigV4 route {route.route_id!r} requires access/secret refs")
+    _validate_extra_allowed_headers(route)
 
 
 def _validate_route_policy_patterns(route: HttpBrokerRoute) -> None:
@@ -1644,7 +1614,13 @@ def _enforce_graphql_query_only(req: ParsedHttpRequest) -> bytes:
 def _extract_action_params(raw_encoded: str) -> list[str]:
     if not raw_encoded:
         return []
-    return [v for k, v in parse_qsl(raw_encoded, keep_blank_values=True) if k.lower() == "action"]
+    actions: list[str] = []
+    for k, v in parse_qsl(raw_encoded, keep_blank_values=True):
+        if k.lower() == "action":
+            if ";" in raw_encoded or ";" in v:
+                raise HttpErrorResponse(403, "aws_invalid_action_delimiter")
+            actions.append(v)
+    return actions
 
 
 def _extract_body_action_params(req: ParsedHttpRequest) -> list[str]:
@@ -1694,17 +1670,33 @@ def _resolve_aws_actions(
     if amz_pair is not None:
         return amz_pair[0], amz_pair
     if action_list:
-        if not action_list[0]:
+        raw_act = action_list[0]
+        if not raw_act:
             raise HttpErrorResponse(400, "empty_aws_action")
-        act = f"{route.aws_service}:{action_list[0]}"
+        if _AWS_ACTION_TOKEN_RE.fullmatch(raw_act) is None:
+            raise HttpErrorResponse(403, "aws_invalid_action_syntax")
+        act = f"{route.aws_service}:{raw_act}"
         return act, (act,)
     rest_act = f"{route.aws_service}:{req.method}:{rel_path}"
     return rest_act, (rest_act,)
 
 
+def _aws_single_pattern_matches(action: str, pattern: str) -> bool:
+    act_parts = action.split(":", 2)
+    pat_parts = pattern.split(":", 2)
+    if len(act_parts) == 3 and len(pat_parts) == 3:
+        return (
+            fnmatchcase(act_parts[0].lower(), pat_parts[0].lower())
+            and fnmatchcase(act_parts[1].lower(), pat_parts[1].lower())
+            and match_segment_glob(act_parts[2], pat_parts[2])
+        )
+    if len(act_parts) == 3 or len(pat_parts) == 3:
+        return False
+    return fnmatchcase(action.lower(), pattern.lower())
+
+
 def _aws_action_matches(action: str, patterns: frozenset[str]) -> bool:
-    low_action = action.lower()
-    return any(fnmatchcase(low_action, pat.lower()) for pat in patterns)
+    return any(_aws_single_pattern_matches(action, pat) for pat in patterns)
 
 
 def _enforce_aws_sigv4_policy(
@@ -1845,11 +1837,42 @@ def _build_upstream_auth_headers(
     if mode == "bearer":
         return [("Authorization", f"Bearer {secret_val}")], [secret_val]
     if mode == "basic-token":
-        tok = base64.b64encode(f"{secret_val}:".encode("ascii")).decode("ascii")
+        tok = base64.b64encode(f"{secret_val}:".encode("utf-8")).decode("ascii")
         return [("Authorization", f"Basic {tok}")], [secret_val, tok]
     if mode == "header":
         return [(route.upstream_auth_header, secret_val)], [secret_val]
     raise BrokerPolicyError(f"Unsupported upstream_auth_mode: {mode!r}")
+
+
+def _collect_allowlisted_upstream_headers(
+    req: ParsedHttpRequest, route: HttpBrokerRoute
+) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    is_aws = route.upstream_auth_mode == "aws-sigv4" or any(
+        r.body_policy == "aws-sigv4" for r in route.wire_policy.allow_rules
+    )
+    allowed = set(ALLOWED_UPSTREAM_REQUEST_HEADERS) | {
+        h.lower() for h in route.extra_allowed_request_headers
+    }
+    if is_aws:
+        allowed.add("x-amz-target")
+
+    strip_names = set(HOP_BY_HOP_HEADERS) | set(req.connection_tokens)
+    if route.upstream_auth_header:
+        strip_names.add(route.upstream_auth_header.lower())
+    if is_aws:
+        strip_names.update(_AWS_AUTH_HEADERS)
+
+    fwd_headers: list[tuple[str, str]] = []
+    sigv4_extra: dict[str, str] = {}
+    for lname, oname, val in req.headers:
+        if lname not in allowed or lname in strip_names:
+            continue
+        if is_aws and (lname == "content-type" or lname.startswith("x-amz-")):
+            if lname in sigv4_extra:
+                raise HttpErrorResponse(400, f"duplicate_signed_header:{lname}")
+            sigv4_extra[lname] = val
+        fwd_headers.append((oname, val))
+    return fwd_headers, sigv4_extra
 
 
 def _build_upstream_request_bytes(
@@ -1866,23 +1889,13 @@ def _build_upstream_request_bytes(
     target = f"{wire_path}?{raw_query}" if raw_query else wire_path
     host_header = upstream.host if upstream.port == 443 else f"{upstream.host}:{upstream.port}"
 
-    strip_names = HOP_BY_HOP_HEADERS | req.connection_tokens | IGNORED_INBOUND_HEADERS
-    if route.upstream_auth_header:
-        strip_names = strip_names | frozenset({route.upstream_auth_header.lower()})
-    if route.upstream_auth_mode == "aws-sigv4":
-        strip_names = strip_names | _AWS_AUTH_HEADERS
     fwd_headers: list[tuple[str, str]] = [
         ("Host", host_header),
         ("Accept-Encoding", "identity"),
         ("Connection", "close"),
     ]
-    sigv4_extra: dict[str, str] = {}
-    for lname, oname, val in req.headers:
-        if lname in strip_names or lname.startswith("x-forwarded-"):
-            continue
-        fwd_headers.append((oname, val))
-        if lname in ("content-type", "x-amz-target"):
-            sigv4_extra[lname] = val
+    client_allowed, sigv4_extra = _collect_allowlisted_upstream_headers(req, route)
+    fwd_headers.extend(client_allowed)
 
     if out_body or req.method in ("POST", "PUT", "PATCH"):
         fwd_headers.append(("Content-Length", str(len(out_body))))
@@ -2155,6 +2168,7 @@ class HostHttpBrokerServer:
         host: str = "127.0.0.1",
         port: int = 0,
         socket_path: Path | None = None,
+        sandbox_root: Path | None = None,
         expected_uid: int | None = None,
         max_concurrent_conns: int = MAX_CONCURRENT_CONNS,
         read_timeout: float = READ_TIMEOUT_SECONDS,
@@ -2171,6 +2185,8 @@ class HostHttpBrokerServer:
         self.lease = lease
         self.routes_by_prefix = validate_route_table(routes, vault)
         self._socket_path = Path(socket_path) if socket_path is not None else None
+        self._sandbox_root = sandbox_root
+        self._bound_uds_path: Path | None = None
         if self._socket_path is None:
             try:
                 if not ipaddress.ip_address(host).is_loopback:
@@ -2196,41 +2212,16 @@ class HostHttpBrokerServer:
         self._thread: threading.Thread | None = None
         self.bound_address: tuple[str, int] | Path | None = None
 
-    def _bind_uds(self, sock_path: Path) -> socket.socket:
-        parent = sock_path.parent
-        if parent.is_symlink():
-            raise BrokerPolicyError(f"Refusing symlink socket directory: {parent}")
-        parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(parent, 0o700)
-        try:
-            st = os.lstat(sock_path)
-        except FileNotFoundError:
-            st = None
-        if st is not None:
-            if not stat.S_ISSOCK(st.st_mode):
-                raise BrokerPolicyError(f"Refusing to unlink non-socket path: {sock_path}")
-            sock_path.unlink()
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        with _UMASK_LOCK:
-            old_umask = os.umask(0o177)
-            try:
-                srv.bind(str(sock_path))
-            finally:
-                os.umask(old_umask)
-        os.chmod(sock_path, 0o600)
-        return srv
-
     def start(self) -> tuple[str, int] | Path:
         if self._socket_path is not None:
-            srv = self._bind_uds(self._socket_path)
-            self.bound_address = self._socket_path
+            srv, phys_sock = bind_trusted_uds(
+                self._socket_path, sandbox_root=self._sandbox_root, backlog=32
+            )
+            self._bound_uds_path = phys_sock
+            self.bound_address = phys_sock
         else:
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind((self._host, self._port))
-            self.bound_address = srv.getsockname()[:2]
-        srv.listen(32)
-        srv.settimeout(0.2)
+            srv, bound_port = bind_loopback_tcp(self._host, self._port, backlog=32)
+            self.bound_address = (str(ipaddress.ip_address(self._host)), bound_port)
         self._sock = srv
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
@@ -2245,13 +2236,8 @@ class HostHttpBrokerServer:
                 pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        if self._socket_path is not None:
-            try:
-                st = os.lstat(self._socket_path)
-                if stat.S_ISSOCK(st.st_mode):
-                    self._socket_path.unlink()
-            except OSError:
-                pass
+        cleanup_uds_socket(self._bound_uds_path)
+        self._bound_uds_path = None
 
     def _accept_loop(self) -> None:
         srv = self._sock
@@ -2294,6 +2280,10 @@ class HostHttpBrokerServer:
                 )
             except OSError:
                 pass
+            except Exception:
+                _send_error_response(
+                    conn, HttpErrorResponse(502, "broker_internal_error"), self._write_timeout
+                )
         finally:
             self.lease.unregister_stream(conn)
             try:
