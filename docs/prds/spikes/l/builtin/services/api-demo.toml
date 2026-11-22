@@ -29,6 +29,12 @@ host_url_template = "http://{host}:{port}{path}"
 [env]
 APP_ENV = "sandbox"
 
+[[secret_slots]]
+slot = "api_local_token"
+target = "/run/secrets/api_local_token"
+mode = "0400"
+secret_ref = "derived:api-demo-local-token"
+
 [readiness_probe]
 kind = "http_local"
 port = 8080
