@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -30,10 +31,11 @@ import re
 import socket
 import ssl
 import stat
+import struct
 import threading
 import time
 from typing import Any
-from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 from oc_broker_common import (
     BrokerAuthError,
@@ -57,6 +59,9 @@ MAX_JSON_DEPTH = 32
 MAX_GQL_TOKENS = 8_192
 MAX_GQL_DEPTH = 64
 MAX_SIGV4_CLOCK_SKEW_SECONDS = 300
+MAX_CHUNK_LINE_BYTES = 1_024
+
+_UMASK_LOCK = threading.Lock()
 
 CLOSED_MCP_WIRE_METHODS = frozenset(
     {
@@ -98,9 +103,24 @@ IGNORED_INBOUND_HEADERS = frozenset(
         "x-original-url",
         "x-rewrite-url",
         "x-http-method-override",
+        "x-http-method",
+        "x-method-override",
         "accept-encoding",
         "content-length",
+        "expect",
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "x-auth-token",
+        "x-access-token",
     }
+)
+
+_AWS_PRESIGN_QUERY_KEYS = frozenset(
+    {"x-amz-signature", "x-amz-credential", "x-amz-security-token"}
+)
+_AWS_AUTH_HEADERS = frozenset(
+    {"x-amz-date", "x-amz-security-token", "x-amz-content-sha256"}
 )
 
 SAFE_RESPONSE_HEADERS = frozenset(
@@ -120,6 +140,12 @@ VALID_BODY_POLICIES = frozenset({"none", "mcp-jsonrpc", "graphql-query-only", "a
 
 _HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _HTTP_METHOD_RE = re.compile(r"^[A-Z]+$")
+_CHUNK_SIZE_RE = re.compile(rb"^[0-9A-Fa-f]{1,8}$")
+_GQL_NUM_RE = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+_GQL_NAME_RE = re.compile(r"[_A-Za-z][_0-9A-Za-z]*")
+_AMZ_TARGET_PART_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_GQL_SIMPLE_ESCAPES = frozenset('"\\/bfnrt')
 _FORBIDDEN_PCT_BYTES = frozenset({0x2E, 0x2F, 0x5C, 0x3B, 0x3F, 0x23, 0x25, 0x7F})
 
 _HTTP_REASONS: dict[int, str] = {
@@ -501,23 +527,43 @@ def _parse_upstream_url(url: str) -> _ParsedUpstreamUrl:
     return _ParsedUpstreamUrl(host=parts.hostname.lower(), port=port, base_path=parts.path or "")
 
 
+def _validate_route_auth_fields(route: HttpBrokerRoute) -> None:
+    if route.inbound_auth not in VALID_INBOUND_AUTH:
+        raise BrokerPolicyError(f"Unsupported inbound_auth: {route.inbound_auth!r}")
+    if route.inbound_auth == "header":
+        if not route.inbound_auth_header or not _HTTP_TOKEN_RE.match(route.inbound_auth_header):
+            raise BrokerPolicyError(f"Route {route.route_id!r} requires valid inbound_auth_header")
+    if route.upstream_auth_mode not in VALID_UPSTREAM_AUTH:
+        raise BrokerPolicyError(f"Unsupported upstream_auth_mode: {route.upstream_auth_mode!r}")
+    if route.upstream_auth_header and not _HTTP_TOKEN_RE.match(route.upstream_auth_header):
+        raise BrokerPolicyError(f"Invalid upstream_auth_header: {route.upstream_auth_header!r}")
+    if route.upstream_auth_mode == "aws-sigv4":
+        if not route.aws_access_key_ref or not route.aws_secret_key_ref:
+            raise BrokerPolicyError(f"AWS SigV4 route {route.route_id!r} requires access/secret refs")
+
+
+def _validate_route_policy_patterns(route: HttpBrokerRoute) -> None:
+    for pat in route.wire_policy.denied_paths:
+        if not pat.startswith("/"):
+            raise BrokerPolicyError(f"denied_paths pattern must start with '/': {pat!r}")
+    for rule in route.wire_policy.allow_rules:
+        if rule.body_policy not in VALID_BODY_POLICIES:
+            raise BrokerPolicyError(f"Unsupported body_policy: {rule.body_policy!r}")
+        for pat in rule.path_patterns:
+            if not pat.startswith("/"):
+                raise BrokerPolicyError(f"allow_rules pattern must start with '/': {pat!r}")
+
+
 def _validate_single_route(route: HttpBrokerRoute, vault: HostVaultMemory) -> None:
     if not route.route_prefix.startswith("/") or "//" in route.route_prefix:
         raise BrokerPolicyError(f"Invalid route_prefix: {route.route_prefix!r}")
     if route.route_prefix != "/" and route.route_prefix.endswith("/"):
         raise BrokerPolicyError(f"route_prefix must not end with '/': {route.route_prefix!r}")
-    if route.inbound_auth not in VALID_INBOUND_AUTH:
-        raise BrokerPolicyError(f"Unsupported inbound_auth: {route.inbound_auth!r}")
-    if route.inbound_auth == "header" and not route.inbound_auth_header:
-        raise BrokerPolicyError(f"Route {route.route_id!r} requires inbound_auth_header")
-    if route.upstream_auth_mode not in VALID_UPSTREAM_AUTH:
-        raise BrokerPolicyError(f"Unsupported upstream_auth_mode: {route.upstream_auth_mode!r}")
+    _validate_route_auth_fields(route)
     _parse_upstream_url(route.upstream_url)
     if route.allowed_cidrs:
         validate_allowed_cidrs(route.allowed_cidrs, context=f"route:{route.route_id}")
-    for rule in route.wire_policy.allow_rules:
-        if rule.body_policy not in VALID_BODY_POLICIES:
-            raise BrokerPolicyError(f"Unsupported body_policy: {rule.body_policy!r}")
+    _validate_route_policy_patterns(route)
     if route.pair_distinct_secret_ref is not None:
         vault.assert_distinct_refs(
             route.secret_ref,
@@ -614,10 +660,9 @@ def _validate_percent_escapes(raw_path: str) -> None:
         if idx + 2 >= len(raw_path):
             raise HttpErrorResponse(400, "malformed_percent_encoding")
         hex_part = raw_path[idx + 1 : idx + 3]
-        try:
-            val = int(hex_part, 16)
-        except ValueError as exc:
-            raise HttpErrorResponse(400, "malformed_percent_encoding") from exc
+        if hex_part[0] not in _HEX_DIGITS or hex_part[1] not in _HEX_DIGITS:
+            raise HttpErrorResponse(400, "malformed_percent_encoding")
+        val = int(hex_part, 16)
         if val <= 0x1F or val in _FORBIDDEN_PCT_BYTES:
             raise HttpErrorResponse(400, "forbidden_encoded_path_char")
         idx = raw_path.find("%", idx + 3)
@@ -630,8 +675,28 @@ def _validate_raw_query(raw_query: str) -> None:
             raise HttpErrorResponse(400, "invalid_query_char")
 
 
+def _canonicalize_path(raw_path: str) -> str:
+    if ";" in raw_path:
+        raise HttpErrorResponse(400, "semicolon_in_path_rejected")
+    _validate_percent_escapes(raw_path)
+    try:
+        decoded = unquote(raw_path, errors="strict")
+    except UnicodeDecodeError as exc:
+        raise HttpErrorResponse(400, "invalid_utf8_path") from exc
+    for ch in decoded:
+        code = ord(ch)
+        if code <= 0x20 or code == 0x7F or ch in ("#", "\\", ";", "%"):
+            raise HttpErrorResponse(400, "forbidden_decoded_path_char")
+    if "//" in decoded or (decoded != "/" and decoded.endswith("/")):
+        raise HttpErrorResponse(400, "empty_path_segment_rejected")
+    for seg in decoded.split("/")[1:]:
+        if seg in (".", ".."):
+            raise HttpErrorResponse(400, "dot_segment_rejected")
+    return decoded
+
+
 def split_and_canonicalize_target(raw_target: str) -> tuple[str, str]:
-    """Split target into (raw_path, raw_query) FIRST and reject unsafe encodings/segments."""
+    """Split target into (canonical_path, raw_query) FIRST and reject unsafe encodings/segments."""
     if not raw_target.startswith("/"):
         raise HttpErrorResponse(400, "target_must_be_origin_form")
     for ch in raw_target:
@@ -641,13 +706,8 @@ def split_and_canonicalize_target(raw_target: str) -> tuple[str, str]:
     raw_path, has_q, raw_query = raw_target.partition("?")
     if has_q:
         _validate_raw_query(raw_query)
-    _validate_percent_escapes(raw_path)
-    if "//" in raw_path:
-        raise HttpErrorResponse(400, "empty_path_segment_rejected")
-    for seg in raw_path.split("/")[1:]:
-        if seg in (".", ".."):
-            raise HttpErrorResponse(400, "dot_segment_rejected")
-    return raw_path, raw_query
+    canon_path = _canonicalize_path(raw_path)
+    return canon_path, raw_query
 
 
 def match_route_prefix(
@@ -657,12 +717,14 @@ def match_route_prefix(
     best: HttpBrokerRoute | None = None
     best_len = -1
     for prefix, route in routes_by_prefix.items():
-        if raw_path == prefix or raw_path.startswith(prefix + "/"):
-            if len(prefix) > best_len:
-                best = route
-                best_len = len(prefix)
+        matched = (prefix == "/" and raw_path.startswith("/")) or raw_path == prefix or raw_path.startswith(prefix + "/")
+        if matched and len(prefix) > best_len:
+            best = route
+            best_len = len(prefix)
     if best is None:
         return None, ""
+    if best.route_prefix == "/":
+        return best, raw_path
     rel_path = "/" if raw_path == best.route_prefix else raw_path[len(best.route_prefix) :]
     return best, rel_path
 
@@ -683,7 +745,7 @@ def match_segment_glob(path: str, pattern: str) -> bool:
         return False
     path_segs = path[1:].split("/")
     pat_segs = pattern[1:].split("/")
-    if len(path_segs) != len(pat_segs):
+    if "" in path_segs or len(path_segs) != len(pat_segs):
         return False
     return all(_segment_matches(s, p) for s, p in zip(path_segs, pat_segs))
 
@@ -736,6 +798,8 @@ def _read_header_block(
     while True:
         idx = buf.find(b"\r\n\r\n")
         if idx != -1:
+            if idx > max_headers:
+                raise HttpFramingError("headers_too_large")
             return bytes(buf[:idx]), bytes(buf[idx + 4 :])
         if len(buf) > max_headers:
             raise HttpFramingError("headers_too_large")
@@ -1042,13 +1106,46 @@ def _single_header(headers: list[tuple[str, str, str]], target_lower: str) -> st
     return vals[0] if len(vals) == 1 else None
 
 
+def _has_aws_presign_query_params(raw_query: str) -> bool:
+    if not raw_query:
+        return False
+    return any(k.lower() in _AWS_PRESIGN_QUERY_KEYS for k, _v in parse_qsl(raw_query, keep_blank_values=True))
+
+
+def _verify_sigv4_payload_hash(req: ParsedHttpRequest) -> str | None:
+    payload_hash = hashlib.sha256(req.body).hexdigest()
+    hdr_hashes = _header_values(req.headers, "x-amz-content-sha256")
+    if len(hdr_hashes) > 1:
+        return None
+    if len(hdr_hashes) == 1 and not hmac.compare_digest(hdr_hashes[0].lower(), payload_hash):
+        return None
+    return payload_hash
+
+
+def _collect_signed_headers(
+    req: ParsedHttpRequest, signed_headers: list[str]
+) -> dict[str, str] | None:
+    if "host" not in signed_headers or "x-amz-date" not in signed_headers:
+        return None
+    headers_map: dict[str, str] = {}
+    for h in signed_headers:
+        val = _single_header(req.headers, h)
+        if val is None:
+            return None
+        headers_map[h] = val
+    return headers_map
+
+
 def _verify_inbound_sigv4(
     req: ParsedHttpRequest,
+    route: HttpBrokerRoute,
     raw_path: str,
     raw_query: str,
     ocjob_token: str,
     now_ts: float,
 ) -> bool:
+    if _has_aws_presign_query_params(raw_query):
+        return False
     auth_val = _single_header(req.headers, "authorization")
     amz_date = _single_header(req.headers, "x-amz-date")
     if not auth_val or not amz_date:
@@ -1060,19 +1157,13 @@ def _verify_inbound_sigv4(
     job_ak, job_sk = derive_job_aws_credentials(ocjob_token)
     if not hmac.compare_digest(cred[0], job_ak):
         return False
+    if cred[2] != route.aws_region or cred[3] != route.aws_service:
+        return False
     if not _check_sigv4_clock_skew(amz_date, cred[1], now_ts):
         return False
-    if "host" not in signed_headers or "x-amz-date" not in signed_headers:
-        return False
-    headers_map: dict[str, str] = {}
-    for h in signed_headers:
-        val = _single_header(req.headers, h)
-        if val is None:
-            return False
-        headers_map[h] = val
-    payload_hash = hashlib.sha256(req.body).hexdigest()
-    hdr_hash = _single_header(req.headers, "x-amz-content-sha256")
-    if hdr_hash is not None and not hmac.compare_digest(hdr_hash.lower(), payload_hash):
+    headers_map = _collect_signed_headers(req, signed_headers)
+    payload_hash = _verify_sigv4_payload_hash(req)
+    if headers_map is None or payload_hash is None:
         return False
     expected_sig = _compute_sigv4_signature(
         method=req.method,
@@ -1082,8 +1173,8 @@ def _verify_inbound_sigv4(
         signed_headers=signed_headers,
         payload_hash=payload_hash,
         amz_date=amz_date,
-        region=cred[2],
-        service=cred[3],
+        region=route.aws_region,
+        service=route.aws_service,
         secret_key=job_sk,
     )
     return hmac.compare_digest(provided_sig.lower(), expected_sig.lower())
@@ -1134,7 +1225,7 @@ def verify_and_strip_inbound_auth(
         strip = _verify_header_auth(req, route, lease)
     elif mode == "aws-sigv4-job-key":
         ts = time.time() if now_ts is None else now_ts
-        if _verify_inbound_sigv4(req, raw_path, raw_query, lease.ocjob_token, ts):
+        if _verify_inbound_sigv4(req, route, raw_path, raw_query, lease.ocjob_token, ts):
             strip = frozenset(
                 {"authorization", "x-amz-date", "x-amz-security-token", "x-amz-content-sha256"}
             )
@@ -1174,6 +1265,20 @@ def _lex_gql_block_string(src: str, pos: int) -> tuple[_GqlToken, int]:
     raise GraphQLParseError("Unterminated GraphQL block string")
 
 
+def _lex_gql_escape(src: str, pos: int) -> tuple[str, int]:
+    n = len(src)
+    if pos + 1 >= n:
+        raise GraphQLParseError("Unterminated escape in GraphQL string")
+    esc = src[pos + 1]
+    if esc in _GQL_SIMPLE_ESCAPES:
+        return esc, pos + 2
+    if esc == "u":
+        if pos + 5 >= n or any(c not in _HEX_DIGITS for c in src[pos + 2 : pos + 6]):
+            raise GraphQLParseError("Invalid unicode escape in GraphQL string")
+        return chr(int(src[pos + 2 : pos + 6], 16)), pos + 6
+    raise GraphQLParseError(f"Invalid escape char in GraphQL string: {esc!r}")
+
+
 def _lex_gql_string(src: str, pos: int) -> tuple[_GqlToken, int]:
     i = pos + 1
     n = len(src)
@@ -1183,10 +1288,8 @@ def _lex_gql_string(src: str, pos: int) -> tuple[_GqlToken, int]:
         if ch in ("\n", "\r"):
             raise GraphQLParseError("Unescaped newline in GraphQL string")
         if ch == "\\":
-            if i + 1 >= n:
-                raise GraphQLParseError("Unterminated escape in GraphQL string")
-            out.append(src[i + 1])
-            i += 2
+            decoded, i = _lex_gql_escape(src, i)
+            out.append(decoded)
             continue
         if ch == '"':
             return _GqlToken("STRING", "".join(out)), i + 1
@@ -1196,12 +1299,19 @@ def _lex_gql_string(src: str, pos: int) -> tuple[_GqlToken, int]:
 
 
 def _lex_gql_number(src: str, pos: int) -> tuple[_GqlToken, int]:
-    m = re.match(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", src[pos:])
+    m = _GQL_NUM_RE.match(src, pos)
     if m is None:
         raise GraphQLParseError("Invalid GraphQL number")
     raw = m.group(0)
     kind = "FLOAT" if ("." in raw or "e" in raw or "E" in raw) else "INT"
-    return _GqlToken(kind, raw), pos + len(raw)
+    return _GqlToken(kind, raw), m.end()
+
+
+def _skip_gql_comment(src: str, pos: int) -> int:
+    n = len(src)
+    while pos < n and src[pos] not in ("\n", "\r"):
+        pos += 1
+    return pos
 
 
 def _skip_gql_trivia(src: str, pos: int) -> int:
@@ -1211,8 +1321,7 @@ def _skip_gql_trivia(src: str, pos: int) -> int:
         if ch in (" ", "\t", "\r", "\n", ",", "\ufeff"):
             pos += 1
         elif ch == "#":
-            nl = src.find("\n", pos)
-            pos = n if nl == -1 else nl + 1
+            pos = _skip_gql_comment(src, pos + 1)
         else:
             break
     return pos
@@ -1228,16 +1337,25 @@ def _lex_gql_one(src: str, pos: int) -> tuple[_GqlToken, int]:
         return _lex_gql_block_string(src, pos)
     if ch == '"':
         return _lex_gql_string(src, pos)
-    if ch == "-" or ch.isdigit():
+    if ch == "-" or ("0" <= ch <= "9"):
         return _lex_gql_number(src, pos)
-    if ch == "_" or ch.isalpha():
-        m = re.match(r"[_A-Za-z][_0-9A-Za-z]*", src[pos:])
-        assert m is not None
-        return _GqlToken("NAME", m.group(0)), pos + len(m.group(0))
+    if ch == "_" or ("a" <= ch <= "z") or ("A" <= ch <= "Z"):
+        m = _GQL_NAME_RE.match(src, pos)
+        if m is None:
+            raise GraphQLParseError(f"Invalid GraphQL name at {pos}")
+        return _GqlToken("NAME", m.group(0)), m.end()
     raise GraphQLParseError(f"Unexpected GraphQL character: {ch!r}")
 
 
+def _validate_gql_control_chars(src: str) -> None:
+    for ch in src:
+        code = ord(ch)
+        if code == 0x7F or (code < 0x20 and ch not in ("\t", "\n", "\r")):
+            raise GraphQLParseError("Illegal control character in GraphQL source")
+
+
 def tokenize_graphql(src: str) -> list[_GqlToken]:
+    _validate_gql_control_chars(src)
     tokens: list[_GqlToken] = []
     pos = 0
     n = len(src)
@@ -1466,17 +1584,21 @@ def all_graphql_operations_are_query(query: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _media_type(headers: list[tuple[str, str, str]]) -> str:
-    ct = _single_header(headers, "content-type")
-    if not ct:
+def _media_type_strict(
+    headers: list[tuple[str, str, str]], *, dup_status: int = 400, dup_code: str = "duplicate_content_type"
+) -> str:
+    vals = _header_values(headers, "content-type")
+    if len(vals) > 1:
+        raise HttpErrorResponse(dup_status, dup_code)
+    if not vals:
         return ""
-    return ct.split(";", 1)[0].strip().lower()
+    return vals[0].split(";", 1)[0].strip().lower()
 
 
 def _enforce_mcp_jsonrpc(req: ParsedHttpRequest, policy: WirePolicy) -> tuple[bytes, str]:
     if req.method != "POST":
         raise HttpErrorResponse(403, "mcp_requires_post")
-    if _media_type(req.headers) != "application/json":
+    if _media_type_strict(req.headers) != "application/json":
         raise HttpErrorResponse(415, "mcp_requires_json_content_type")
     try:
         obj = parse_strict_json_object(req.body)
@@ -1499,7 +1621,7 @@ def _enforce_mcp_jsonrpc(req: ParsedHttpRequest, policy: WirePolicy) -> tuple[by
 def _enforce_graphql_query_only(req: ParsedHttpRequest) -> bytes:
     if req.method != "POST":
         raise HttpErrorResponse(403, "graphql_requires_post")
-    if _media_type(req.headers) != "application/json":
+    if _media_type_strict(req.headers) != "application/json":
         raise HttpErrorResponse(415, "graphql_requires_json_content_type")
     try:
         obj = parse_strict_json_object(req.body)
@@ -1521,22 +1643,41 @@ def _enforce_graphql_query_only(req: ParsedHttpRequest) -> bytes:
 def _extract_action_params(raw_encoded: str) -> list[str]:
     if not raw_encoded:
         return []
-    return [v for k, v in parse_qsl(raw_encoded, keep_blank_values=True) if k == "Action"]
+    return [v for k, v in parse_qsl(raw_encoded, keep_blank_values=True) if k.lower() == "action"]
 
 
 def _extract_body_action_params(req: ParsedHttpRequest) -> list[str]:
-    if _media_type(req.headers) != "application/x-www-form-urlencoded" or not req.body:
+    media = _media_type_strict(req.headers)
+    if not req.body:
         return []
-    try:
-        body_text = req.body.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise HttpErrorResponse(400, "invalid_form_encoding") from exc
-    return _extract_action_params(body_text)
+    if media == "application/x-www-form-urlencoded":
+        try:
+            body_text = req.body.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise HttpErrorResponse(400, "invalid_form_encoding") from exc
+        return _extract_action_params(body_text)
+    if b"action=" in req.body.lower():
+        raise HttpErrorResponse(403, "aws_ambiguous_action_denied")
+    return []
 
 
-def _resolve_aws_action(
+def _parse_amz_target(req: ParsedHttpRequest, route: HttpBrokerRoute) -> tuple[str, str] | None:
+    targets = _header_values(req.headers, "x-amz-target")
+    if len(targets) > 1:
+        raise HttpErrorResponse(400, "duplicate_amz_target")
+    if not targets:
+        return None
+    raw_target = targets[0]
+    parts = raw_target.split(".")
+    if len(parts) != 2 or not _AMZ_TARGET_PART_RE.match(parts[0]) or not _AMZ_TARGET_PART_RE.match(parts[1]):
+        raise HttpErrorResponse(400, "invalid_amz_target")
+    svc_prefix, op = parts[0], parts[1]
+    return f"{route.aws_service}:{op}", f"{svc_prefix}:{op}"
+
+
+def _resolve_aws_actions(
     req: ParsedHttpRequest, route: HttpBrokerRoute, rel_path: str, raw_query: str
-) -> str:
+) -> tuple[str, tuple[str, ...]]:
     query_actions = _extract_action_params(raw_query)
     body_actions = _extract_body_action_params(req)
     if len(query_actions) > 1 or len(body_actions) > 1:
@@ -1544,19 +1685,19 @@ def _resolve_aws_action(
     if query_actions and body_actions:
         raise HttpErrorResponse(403, "aws_ambiguous_action_denied")
 
-    amz_target = _single_header(req.headers, "x-amz-target")
+    amz_pair = _parse_amz_target(req, route)
     action_list = query_actions or body_actions
-    if amz_target and action_list:
+    if amz_pair is not None and action_list:
         raise HttpErrorResponse(403, "aws_ambiguous_action_denied")
-    if amz_target:
-        if "." not in amz_target:
-            raise HttpErrorResponse(400, "invalid_amz_target")
-        return f"{route.aws_service}:{amz_target.split('.', 1)[1]}"
+    if amz_pair is not None:
+        return amz_pair[0], amz_pair
     if action_list:
         if not action_list[0]:
             raise HttpErrorResponse(400, "empty_aws_action")
-        return f"{route.aws_service}:{action_list[0]}"
-    return f"{route.aws_service}:{req.method}:{rel_path}"
+        act = f"{route.aws_service}:{action_list[0]}"
+        return act, (act,)
+    rest_act = f"{route.aws_service}:{req.method}:{rel_path}"
+    return rest_act, (rest_act,)
 
 
 def _aws_action_matches(action: str, patterns: frozenset[str]) -> bool:
@@ -1567,10 +1708,11 @@ def _aws_action_matches(action: str, patterns: frozenset[str]) -> bool:
 def _enforce_aws_sigv4_policy(
     req: ParsedHttpRequest, route: HttpBrokerRoute, rel_path: str, raw_query: str
 ) -> bytes:
-    action = _resolve_aws_action(req, route, rel_path, raw_query)
-    if _aws_action_matches(action, route.wire_policy.denied_aws_actions):
-        raise HttpErrorResponse(403, "aws_action_denied")
-    if not _aws_action_matches(action, route.wire_policy.allowed_aws_actions):
+    primary_action, deny_candidates = _resolve_aws_actions(req, route, rel_path, raw_query)
+    for cand in deny_candidates:
+        if _aws_action_matches(cand, route.wire_policy.denied_aws_actions):
+            raise HttpErrorResponse(403, "aws_action_denied")
+    if not _aws_action_matches(primary_action, route.wire_policy.allowed_aws_actions):
         raise HttpErrorResponse(403, "aws_action_not_allowed")
     return req.body
 
@@ -1649,7 +1791,7 @@ def filter_mcp_tools_list_response(
             text = body.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
             raise HttpErrorResponse(502, "invalid_mcp_sse_utf8") from exc
-        norm = text.replace("\r\n", "\n")
+        norm = text.replace("\r\n", "\n").replace("\r", "\n")
         blocks = [b for b in norm.split("\n\n") if b.strip()]
         if not blocks:
             raise HttpErrorResponse(502, "empty_mcp_sse_response")
@@ -1702,7 +1844,7 @@ def _build_upstream_auth_headers(
         return [("Authorization", f"Bearer {secret_val}")], [secret_val]
     if mode == "basic-token":
         tok = base64.b64encode(f"{secret_val}:".encode("ascii")).decode("ascii")
-        return [("Authorization", f"Basic {tok}")], [secret_val]
+        return [("Authorization", f"Basic {tok}")], [secret_val, tok]
     if mode == "header":
         return [(route.upstream_auth_header, secret_val)], [secret_val]
     raise BrokerPolicyError(f"Unsupported upstream_auth_mode: {mode!r}")
@@ -1722,6 +1864,10 @@ def _build_upstream_request_bytes(
     host_header = upstream.host if upstream.port == 443 else f"{upstream.host}:{upstream.port}"
 
     strip_names = HOP_BY_HOP_HEADERS | req.connection_tokens | IGNORED_INBOUND_HEADERS
+    if route.upstream_auth_header:
+        strip_names = strip_names | frozenset({route.upstream_auth_header.lower()})
+    if route.upstream_auth_mode == "aws-sigv4":
+        strip_names = strip_names | _AWS_AUTH_HEADERS
     fwd_headers: list[tuple[str, str]] = [
         ("Host", host_header),
         ("Accept-Encoding", "identity"),
@@ -1765,8 +1911,15 @@ def _parse_upstream_response_head(
     except UnicodeDecodeError as exc:
         raise HttpErrorResponse(502, "upstream_invalid_headers") from exc
     lines = text.split("\r\n")
+    if any("\n" in ln or "\r" in ln for ln in lines):
+        raise HttpErrorResponse(502, "upstream_invalid_headers")
     parts = lines[0].split(" ", 2)
-    if len(parts) < 2 or not parts[0].startswith("HTTP/1.") or not parts[1].isdigit():
+    if (
+        len(parts) < 2
+        or parts[0] not in ("HTTP/1.0", "HTTP/1.1")
+        or len(parts[1]) != 3
+        or not (parts[1].isascii() and parts[1].isdigit())
+    ):
         raise HttpErrorResponse(502, "upstream_invalid_status_line")
     status = int(parts[1])
     reason = parts[2] if len(parts) == 3 else _HTTP_REASONS.get(status, "OK")
@@ -1805,17 +1958,37 @@ def _read_chunk_size_line(
     sock: socket.socket, buf: bytearray, deadline: float, read_timeout: float
 ) -> int:
     while b"\r\n" not in buf:
+        if len(buf) > MAX_CHUNK_LINE_BYTES:
+            raise HttpErrorResponse(502, "upstream_chunk_line_too_large")
         chunk = _recv_with_deadline(sock, 8192, deadline, read_timeout)
         if not chunk:
             raise HttpErrorResponse(502, "upstream_truncated_chunked")
         buf.extend(chunk)
     line_end = buf.find(b"\r\n")
+    if line_end > MAX_CHUNK_LINE_BYTES:
+        raise HttpErrorResponse(502, "upstream_chunk_line_too_large")
     size_token = bytes(buf[:line_end]).split(b";", 1)[0].strip()
     del buf[: line_end + 2]
-    try:
-        return int(size_token, 16)
-    except ValueError as exc:
-        raise HttpErrorResponse(502, "upstream_invalid_chunk_size") from exc
+    if not _CHUNK_SIZE_RE.fullmatch(size_token):
+        raise HttpErrorResponse(502, "upstream_invalid_chunk_size")
+    return int(size_token, 16)
+
+
+def _consume_chunk_trailers(
+    sock: socket.socket, buf: bytearray, deadline: float, read_timeout: float
+) -> None:
+    while True:
+        while b"\r\n" not in buf:
+            if len(buf) > MAX_CHUNK_LINE_BYTES:
+                raise HttpErrorResponse(502, "upstream_chunk_trailer_too_large")
+            chunk = _recv_with_deadline(sock, 4096, deadline, read_timeout)
+            if not chunk:
+                raise HttpErrorResponse(502, "upstream_truncated_chunked")
+            buf.extend(chunk)
+        line_end = buf.find(b"\r\n")
+        del buf[: line_end + 2]
+        if line_end == 0:
+            return
 
 
 def _read_chunked_body_bounded(
@@ -1830,12 +2003,28 @@ def _read_chunked_body_bounded(
     while True:
         size = _read_chunk_size_line(sock, buf, deadline, read_timeout)
         if size == 0:
+            _consume_chunk_trailers(sock, buf, deadline, read_timeout)
             return bytes(out)
         if len(out) + size > max_body:
             raise HttpErrorResponse(502, "upstream_body_too_large")
         _fill_until(sock, buf, size + 2, deadline, read_timeout, "upstream_truncated_chunked")
+        if buf[size : size + 2] != b"\r\n":
+            raise HttpErrorResponse(502, "upstream_invalid_chunk_terminator")
         out.extend(buf[:size])
         del buf[: size + 2]
+
+
+def _is_upstream_chunked(head: ParsedUpstreamHead) -> bool:
+    te_vals = _header_values(head.headers, "transfer-encoding")
+    cl_vals = _header_values(head.headers, "content-length")
+    if not te_vals:
+        return False
+    if cl_vals:
+        raise HttpErrorResponse(502, "upstream_cl_te_rejected")
+    tokens = [p.strip().lower() for v in te_vals for p in v.split(",") if p.strip()]
+    if tokens != ["chunked"]:
+        raise HttpErrorResponse(502, "upstream_unsupported_te")
+    return True
 
 
 def _read_cl_body_bounded(
@@ -1882,8 +2071,7 @@ def _read_upstream_body_bounded(
 ) -> bytes:
     if req_method == "HEAD" or head.status in (204, 304):
         return b""
-    te_vals = _header_values(head.headers, "transfer-encoding")
-    if any("chunked" in v.lower() for v in te_vals):
+    if _is_upstream_chunked(head):
         return _read_chunked_body_bounded(sock, head.rest, max_body, deadline, read_timeout)
     cl_vals = _header_values(head.headers, "content-length")
     if len(cl_vals) > 1:
@@ -1894,7 +2082,7 @@ def _read_upstream_body_bounded(
 
 
 def _filter_safe_response_headers(
-    headers: list[tuple[str, str, str]], conn_tokens: frozenset[str]
+    headers: list[tuple[str, str, str]], conn_tokens: frozenset[str], secrets_list: Sequence[str]
 ) -> list[tuple[str, str]]:
     drop = HOP_BY_HOP_HEADERS | conn_tokens
     out: list[tuple[str, str]] = []
@@ -1902,8 +2090,16 @@ def _filter_safe_response_headers(
         if lname in drop or lname == "content-length":
             continue
         if lname in SAFE_RESPONSE_HEADERS:
+            OverlapCanaryScanner(secrets_list).scan_bytes(val.encode("utf-8", errors="replace"))
             out.append((oname, val))
     return out
+
+
+def _get_peer_uid(conn: socket.socket) -> int:
+    so_peercred = getattr(socket, "SO_PEERCRED", 17)
+    raw = conn.getsockopt(socket.SOL_SOCKET, so_peercred, struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", raw)
+    return uid
 
 
 def _format_http_response(
@@ -1927,8 +2123,14 @@ def _send_error_response(conn: socket.socket, err: HttpErrorResponse, write_time
         body,
     )
     try:
+        conn.setblocking(False)
+        try:
+            conn.recv(4096)
+        except OSError:
+            pass
         conn.settimeout(write_timeout)
         conn.sendall(raw)
+        conn.shutdown(socket.SHUT_WR)
     except OSError:
         pass
 
@@ -1950,6 +2152,7 @@ class HostHttpBrokerServer:
         host: str = "127.0.0.1",
         port: int = 0,
         socket_path: Path | None = None,
+        expected_uid: int | None = None,
         max_concurrent_conns: int = MAX_CONCURRENT_CONNS,
         read_timeout: float = READ_TIMEOUT_SECONDS,
         write_timeout: float = WRITE_TIMEOUT_SECONDS,
@@ -1964,9 +2167,16 @@ class HostHttpBrokerServer:
         self.vault = vault
         self.lease = lease
         self.routes_by_prefix = validate_route_table(routes, vault)
+        self._socket_path = Path(socket_path) if socket_path is not None else None
+        if self._socket_path is None:
+            try:
+                if not ipaddress.ip_address(host).is_loopback:
+                    raise BrokerPolicyError("HTTP broker TCP listener must bind to loopback only")
+            except ValueError as exc:
+                raise BrokerPolicyError("HTTP broker TCP host must be a loopback IP address") from exc
         self._host = host
         self._port = port
-        self._socket_path = Path(socket_path) if socket_path is not None else None
+        self._expected_uid = os.geteuid() if expected_uid is None else expected_uid
         self._conn_sem = threading.BoundedSemaphore(max_concurrent_conns)
         self._read_timeout = read_timeout
         self._write_timeout = write_timeout
@@ -1998,11 +2208,12 @@ class HostHttpBrokerServer:
                 raise BrokerPolicyError(f"Refusing to unlink non-socket path: {sock_path}")
             sock_path.unlink()
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        old_umask = os.umask(0o177)
-        try:
-            srv.bind(str(sock_path))
-        finally:
-            os.umask(old_umask)
+        with _UMASK_LOCK:
+            old_umask = os.umask(0o177)
+            try:
+                srv.bind(str(sock_path))
+            finally:
+                os.umask(old_umask)
         os.chmod(sock_path, 0o600)
         return srv
 
@@ -2056,6 +2267,8 @@ class HostHttpBrokerServer:
 
     def _handle_conn(self, conn: socket.socket) -> None:
         try:
+            if self._socket_path is not None and _get_peer_uid(conn) != self._expected_uid:
+                return
             try:
                 self._process_request(conn)
             except HttpFramingError as exc:
@@ -2066,8 +2279,10 @@ class HostHttpBrokerServer:
                 _send_error_response(
                     conn, HttpErrorResponse(403, "lease_revoked_or_expired"), self._write_timeout
                 )
-            except BrokerPolicyError as exc:
-                _send_error_response(conn, HttpErrorResponse(502, str(exc)), self._write_timeout)
+            except BrokerPolicyError:
+                _send_error_response(
+                    conn, HttpErrorResponse(502, "broker_policy_blocked"), self._write_timeout
+                )
             except CanaryLeakError:
                 _send_error_response(
                     conn, HttpErrorResponse(502, "upstream_canary_blocked"), self._write_timeout
@@ -2082,6 +2297,9 @@ class HostHttpBrokerServer:
                 self._conn_sem.release()
 
     def _process_request(self, conn: socket.socket) -> None:
+        if not self.lease.is_active():
+            raise HttpErrorResponse(403, "lease_revoked_or_expired")
+        self.lease.register_stream(conn)
         req = parse_strict_http11_request(
             conn,
             max_headers=self._max_headers,
@@ -2149,9 +2367,8 @@ class HostHttpBrokerServer:
         except Exception as exc:
             raise HttpErrorResponse(502, "upstream_connect_failed") from exc
 
-        self.lease.register_stream(client_sock)
-        self.lease.register_stream(up_sock)
         try:
+            self.lease.register_stream(up_sock)
             up_sock.settimeout(self._write_timeout)
             up_sock.sendall(raw_req)
             deadline = time.monotonic() + self._total_timeout
@@ -2172,21 +2389,24 @@ class HostHttpBrokerServer:
         self,
         head: ParsedUpstreamHead,
         route: HttpBrokerRoute,
-        rule: AllowRule,
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, bool, bool]:
         if head.status == 101 or _header_values(head.headers, "upgrade") or "upgrade" in head.connection_tokens:
             raise HttpErrorResponse(502, "upstream_upgrade_blocked")
+        if head.status < 200 or head.status > 599:
+            raise HttpErrorResponse(502, "upstream_invalid_status")
         if 300 <= head.status <= 399:
             raise HttpErrorResponse(502, "upstream_redirect_blocked")
-        media = _media_type(head.headers)
+        media = _media_type_strict(
+            head.headers, dup_status=502, dup_code="upstream_duplicate_content_type"
+        )
         is_sse = media == "text/event-stream"
         if is_sse and not route.allow_streaming:
             raise HttpErrorResponse(502, "streaming_not_allowed")
         ce_vals = _header_values(head.headers, "content-encoding")
         if any(v.strip().lower() not in ("", "identity") for v in ce_vals):
-            if rule.body_policy != "none" or is_sse:
-                raise HttpErrorResponse(502, "upstream_compressed_response")
-        return media, is_sse
+            raise HttpErrorResponse(502, "upstream_compressed_response")
+        is_chunked = _is_upstream_chunked(head)
+        return media, is_sse, is_chunked
 
     def _handle_upstream_response(
         self,
@@ -2200,10 +2420,15 @@ class HostHttpBrokerServer:
         secrets_list: list[str],
         deadline: float,
     ) -> None:
-        media, is_sse = self._validate_upstream_head(head, route, rule)
+        media, is_sse, is_chunked = self._validate_upstream_head(head, route)
         if 400 <= head.status <= 599:
-            scrubbed = canonical_json_bytes({"error": "upstream_error", "status": head.status})
-            raw = _format_http_response(head.status, [("Content-Type", "application/json")], scrubbed)
+            scrubbed = b"" if req.method == "HEAD" else canonical_json_bytes({"error": "upstream_error", "status": head.status})
+            raw = _format_http_response(
+                head.status,
+                [("Content-Type", "application/json")],
+                scrubbed,
+                include_cl=(req.method != "HEAD"),
+            )
             client_sock.settimeout(self._write_timeout)
             client_sock.sendall(raw)
             return
@@ -2214,20 +2439,20 @@ class HostHttpBrokerServer:
             )
             scanned = OverlapCanaryScanner(secrets_list).scan_bytes(raw_body)
             filtered = filter_mcp_tools_list_response(media, scanned, route.wire_policy.allowed_tools)
-            safe_hdrs = _filter_safe_response_headers(head.headers, head.connection_tokens)
+            safe_hdrs = _filter_safe_response_headers(head.headers, head.connection_tokens, secrets_list)
             client_sock.settimeout(self._write_timeout)
             client_sock.sendall(_format_http_response(head.status, safe_hdrs, filtered))
             return
 
         if is_sse:
-            self._stream_sse_response(client_sock, up_sock, head, secrets_list)
+            self._stream_sse_response(client_sock, up_sock, head, secrets_list, is_chunked=is_chunked)
             return
 
         raw_body = _read_upstream_body_bounded(
             up_sock, head, req.method, self._max_body, deadline, self._read_timeout
         )
         scanned = OverlapCanaryScanner(secrets_list).scan_bytes(raw_body)
-        safe_hdrs = _filter_safe_response_headers(head.headers, head.connection_tokens)
+        safe_hdrs = _filter_safe_response_headers(head.headers, head.connection_tokens, secrets_list)
         client_sock.settimeout(self._write_timeout)
         client_sock.sendall(
             _format_http_response(head.status, safe_hdrs, scanned, include_cl=(req.method != "HEAD"))
@@ -2239,19 +2464,98 @@ class HostHttpBrokerServer:
         up_sock: socket.socket,
         head: ParsedUpstreamHead,
         secrets_list: list[str],
+        *,
+        is_chunked: bool = False,
     ) -> None:
-        safe_hdrs = _filter_safe_response_headers(head.headers, head.connection_tokens)
+        safe_hdrs = _filter_safe_response_headers(head.headers, head.connection_tokens, secrets_list)
         scanner = OverlapCanaryScanner(secrets_list)
         client_sock.settimeout(self._write_timeout)
         client_sock.sendall(_format_http_response(head.status, safe_hdrs, b"", include_cl=False))
         up_sock.settimeout(self._read_timeout)
         try:
-            self._relay_sse_chunks(client_sock, up_sock, head.rest, scanner)
-        except CanaryLeakError:
+            if is_chunked:
+                self._relay_chunked_sse_chunks(client_sock, up_sock, head.rest, scanner)
+            else:
+                self._relay_sse_chunks(client_sock, up_sock, head.rest, scanner)
+        except (CanaryLeakError, HttpErrorResponse):
             try:
                 client_sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+
+    def _recv_sse_more(self, up_sock: socket.socket, buf: bytearray) -> bool:
+        while self.lease.is_active():
+            try:
+                chunk = up_sock.recv(4096)
+            except TimeoutError:
+                continue
+            except OSError:
+                return False
+            if not chunk:
+                return False
+            buf.extend(chunk)
+            return True
+        return False
+
+    def _read_sse_chunk_size(self, up_sock: socket.socket, buf: bytearray) -> int | None:
+        while b"\r\n" not in buf:
+            if len(buf) > MAX_CHUNK_LINE_BYTES:
+                raise HttpErrorResponse(502, "upstream_chunk_line_too_large")
+            if not self._recv_sse_more(up_sock, buf):
+                return None
+        line_end = buf.find(b"\r\n")
+        if line_end > MAX_CHUNK_LINE_BYTES:
+            raise HttpErrorResponse(502, "upstream_chunk_line_too_large")
+        token = bytes(buf[:line_end]).split(b";", 1)[0].strip()
+        del buf[: line_end + 2]
+        if not _CHUNK_SIZE_RE.fullmatch(token):
+            raise HttpErrorResponse(502, "upstream_invalid_chunk_size")
+        return int(token, 16)
+
+    def _relay_one_sse_chunk(
+        self,
+        client_sock: socket.socket,
+        up_sock: socket.socket,
+        buf: bytearray,
+        size: int,
+        scanner: OverlapCanaryScanner,
+    ) -> None:
+        rem = size
+        while rem > 0:
+            if not buf and not self._recv_sse_more(up_sock, buf):
+                raise HttpErrorResponse(502, "upstream_truncated_chunked")
+            take = min(rem, len(buf))
+            emit = scanner.feed(bytes(buf[:take]))
+            del buf[:take]
+            rem -= take
+            if emit:
+                client_sock.sendall(emit)
+
+    def _consume_sse_chunk_crlf(self, up_sock: socket.socket, buf: bytearray) -> None:
+        while len(buf) < 2:
+            if not self._recv_sse_more(up_sock, buf):
+                raise HttpErrorResponse(502, "upstream_truncated_chunked")
+        if buf[:2] != b"\r\n":
+            raise HttpErrorResponse(502, "upstream_invalid_chunk_terminator")
+        del buf[:2]
+
+    def _relay_chunked_sse_chunks(
+        self,
+        client_sock: socket.socket,
+        up_sock: socket.socket,
+        initial: bytes,
+        scanner: OverlapCanaryScanner,
+    ) -> None:
+        buf = bytearray(initial)
+        while self.lease.is_active():
+            size = self._read_sse_chunk_size(up_sock, buf)
+            if size is None or size == 0:
+                tail = scanner.finish()
+                if tail:
+                    client_sock.sendall(tail)
+                return
+            self._relay_one_sse_chunk(client_sock, up_sock, buf, size, scanner)
+            self._consume_sse_chunk_crlf(up_sock, buf)
 
     def _relay_sse_chunks(
         self,

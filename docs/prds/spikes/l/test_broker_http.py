@@ -45,7 +45,9 @@ from oc_broker_http import (  # noqa: E402
     build_remote_mcp_route,
     build_sonarqube_ro_route,
     derive_job_aws_credentials,
+    filter_mcp_tools_list_response,
     join_upstream_path,
+    match_route_prefix,
     match_segment_glob,
     sign_aws_sigv4,
     validate_route_table,
@@ -357,6 +359,60 @@ class TestBrokerHttpUnit(unittest.TestCase):
 
         deep = "{" * 70 + "a" + "}" * 70
         self.assertFalse(all_graphql_operations_are_query(deep))
+
+        # Regression HTTP-P1-1, HTTP-P2-1, P3: bare \r comment, control chars, non-ASCII, escapes
+        self.assertFalse(
+            all_graphql_operations_are_query(
+                "query A { viewer { login } }\n# comment\rmutation B { deleteRepo }"
+            )
+        )
+        self.assertFalse(all_graphql_operations_are_query("query { café }"))
+        self.assertFalse(all_graphql_operations_are_query("query { a\x07 }"))
+        self.assertFalse(all_graphql_operations_are_query('query { a(x: "\\q") }'))
+        self.assertTrue(all_graphql_operations_are_query('query { a(x: "\\u0041") }'))
+
+    def test_root_prefix_trailing_slash_and_route_validation_regressions(self) -> None:
+        self.assertFalse(match_segment_glob("/api/v1/secrets/", "/api/v1/*/*"))
+        vault = HostVaultMemory({"k:s": "SECRET_VAL_1234567890"})
+        root_route = HttpBrokerRoute(
+            route_id="http:root",
+            route_prefix="/",
+            upstream_url="https://upstream.test",
+            secret_ref="k:s",
+            wire_policy=WirePolicy(allow_rules=(AllowRule(methods=("GET",), path_patterns=("/version",)),)),
+        )
+        table = validate_route_table([root_route], vault)
+        matched, rel = match_route_prefix("/version", table)
+        self.assertEqual(matched, root_route)
+        self.assertEqual(rel, "/version")
+
+        # Invalid denied_paths pattern and missing AWS refs rejected
+        bad_pat = HttpBrokerRoute(
+            route_id="http:bad",
+            route_prefix="/http/bad",
+            upstream_url="https://upstream.test",
+            secret_ref="k:s",
+            wire_policy=WirePolicy(denied_paths=("relative/path",)),
+        )
+        with self.assertRaises(BrokerPolicyError):
+            validate_route_table([bad_pat], vault)
+
+        bad_aws = HttpBrokerRoute(
+            route_id="aws:bad",
+            route_prefix="/aws/bad",
+            upstream_url="https://upstream.test",
+            secret_ref="k:s",
+            wire_policy=WirePolicy(),
+            upstream_auth_mode="aws-sigv4",
+        )
+        with self.assertRaises(BrokerPolicyError):
+            validate_route_table([bad_aws], vault)
+
+        # Bare \r SSE normalization for tools/list
+        sse_cr = b'event: message\rdata: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"ok"},{"name":"no"}]}}\r\r'
+        filtered = filter_mcp_tools_list_response("text/event-stream", sse_cr, frozenset({"ok"}))
+        self.assertIn(b"ok", filtered)
+        self.assertNotIn(b"no", filtered)
 
 
 class TestBrokerHttpIntegration(unittest.TestCase):
@@ -1077,6 +1133,357 @@ class TestBrokerHttpIntegration(unittest.TestCase):
         )
         self.assertEqual(st_rev, 403)
         self.assertIn(b"lease_revoked_or_expired", body_rev)
+
+    def test_regression_path_percent_decode_semicolon_trailing_slash_and_header_stripping(self) -> None:
+        # HTTP-P1-2: %73ecrets decoded before denied_paths, literal ';', trailing '/'
+        wild_route = HttpBrokerRoute(
+            route_id="http:wild",
+            route_prefix="/http/wild",
+            upstream_url=f"https://upstream.test:{self.up_port}",
+            secret_ref="vault:k8s_ro",
+            wire_policy=WirePolicy(
+                denied_paths=("/api/v1/secrets*",),
+                allow_rules=(AllowRule(methods=("GET",), path_patterns=("/api/v1/*",)),),
+            ),
+        )
+        b2 = HostHttpBrokerServer(
+            [wild_route],
+            self.vault,
+            self.lease,
+            ssl_context=self._tls_ctx,
+            resolver=_make_resolver("127.0.0.1"),
+            allow_test_loopback=True,
+        )
+        addr2 = b2.start()
+        try:
+            st_pct, _h, _b = _raw_http_exchange(
+                addr2, _build_req("GET", "/http/wild/api/v1/%73ecrets", headers=self._auth_hdr())
+            )
+            self.assertEqual(st_pct, 403)
+            for bad_p in ("/http/wild/api/v1/pods;x", "/http/wild/api/v1/secrets/"):
+                st_b, _h, _b = _raw_http_exchange(
+                    addr2, _build_req("GET", bad_p, headers=self._auth_hdr())
+                )
+                self.assertEqual(st_b, 400)
+        finally:
+            b2.stop()
+
+        # HTTP-P1-6: unconditional stripping of auth/credential/override/Expect headers
+        st_c, _h, _b = _raw_http_exchange(
+            self.addr,
+            _build_req(
+                "GET",
+                "/http/custom/ping",
+                headers={
+                    "X-Job-Key": self.lease.ocjob_token,
+                    "Authorization": "Bearer spoofed",
+                    "Cookie": "sid=spoof",
+                    "Proxy-Authorization": "Basic spoof",
+                    "X-Auth-Token": "spoof",
+                    "X-Access-Token": "spoof",
+                    "X-API-Key": "spoofed_upstream_key",
+                    "X-HTTP-Method": "DELETE",
+                    "X-Method-Override": "DELETE",
+                    "Expect": "100-continue",
+                },
+            ),
+        )
+        self.assertEqual(st_c, 200)
+        up_h = self.upstream.recorded[-1].headers
+        for forbidden in (
+            "authorization",
+            "cookie",
+            "proxy-authorization",
+            "x-auth-token",
+            "x-access-token",
+            "x-http-method",
+            "x-method-override",
+            "expect",
+        ):
+            self.assertNotIn(forbidden, up_h)
+        self.assertEqual(up_h.get("x-api-key"), "CANARY_CUSTOM_HDR_SECRET_9999")
+
+    def test_regression_aws_policy_and_sigv4_hardening(self) -> None:
+        job_ak, job_sk = derive_job_aws_credentials(self.lease.ocjob_token)
+        # HTTP-P1-3: duplicate Content-Type, non-form Action= body, lowercase action=, X-Amz-Target prefix
+        dup_ct_raw = (
+            b"POST /aws/sts?Action=GetCallerIdentity HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/x-www-form-urlencoded\r\n"
+            b"Content-Type: application/x-www-form-urlencoded\r\n"
+        )
+        body = b"Action=AssumeRole"
+        sig = sign_aws_sigv4(
+            method="POST",
+            raw_path="/aws/sts",
+            raw_query="Action=GetCallerIdentity",
+            host_header="127.0.0.1",
+            body=body,
+            access_key=job_ak,
+            secret_key=job_sk,
+            region="us-east-1",
+            service="sts",
+        )
+        dup_ct_raw += "".join(f"{k}: {v}\r\n" for k, v in sig.items()).encode("ascii")
+        dup_ct_raw += f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+        st_dup_ct, _h, _b = _raw_http_exchange(self.addr, dup_ct_raw)
+        self.assertEqual(st_dup_ct, 400)
+
+        # Non-form Content-Type with Action=AssumeRole body alongside ?Action=GetCallerIdentity -> 403
+        st_nf, _h, _b = _raw_http_exchange(
+            self.addr,
+            _build_req(
+                "POST",
+                "/aws/sts?Action=GetCallerIdentity",
+                headers={"Content-Type": "text/plain", **sig},
+                body=body,
+            ),
+        )
+        self.assertEqual(st_nf, 403)
+
+        # Case-insensitive action= smuggling -> 403
+        q_case = "Action=GetCallerIdentity&action=AssumeRole"
+        sig_case = sign_aws_sigv4(
+            method="GET",
+            raw_path="/aws/sts",
+            raw_query=q_case,
+            host_header="127.0.0.1",
+            body=b"",
+            access_key=job_ak,
+            secret_key=job_sk,
+            region="us-east-1",
+            service="sts",
+        )
+        st_case, _h, _b = _raw_http_exchange(
+            self.addr, _build_req("GET", f"/aws/sts?{q_case}", headers=sig_case)
+        )
+        self.assertEqual(st_case, 403)
+
+        # X-Amz-Target secretsmanager.GetSecretValue denied even if sts:Get* allowed
+        aws_wild = build_aws_ro_route(
+            "sts",
+            f"https://upstream.test:{self.up_port}",
+            "vault:aws_ak",
+            "vault:aws_sk",
+            allowed_aws_actions=["sts:Get*"],
+        )
+        b_aws = HostHttpBrokerServer(
+            [aws_wild],
+            self.vault,
+            self.lease,
+            ssl_context=self._tls_ctx,
+            resolver=_make_resolver("127.0.0.1"),
+            allow_test_loopback=True,
+        )
+        addr_aws = b_aws.start()
+        try:
+            sig_tgt = sign_aws_sigv4(
+                method="POST",
+                raw_path="/aws/sts",
+                raw_query="",
+                host_header="127.0.0.1",
+                body=b"{}",
+                access_key=job_ak,
+                secret_key=job_sk,
+                region="us-east-1",
+                service="sts",
+                extra_headers={"x-amz-target": "secretsmanager.GetSecretValue"},
+            )
+            st_tgt, _h, _b = _raw_http_exchange(
+                addr_aws,
+                _build_req(
+                    "POST",
+                    "/aws/sts",
+                    headers={"X-Amz-Target": "secretsmanager.GetSecretValue", **sig_tgt},
+                    body=b"{}",
+                ),
+            )
+            self.assertEqual(st_tgt, 403)
+        finally:
+            b_aws.stop()
+
+        # HTTP-P2-6: wrong region in SigV4 credential and presign query params -> 401
+        sig_bad_reg = sign_aws_sigv4(
+            method="GET",
+            raw_path="/aws/sts",
+            raw_query="Action=GetCallerIdentity",
+            host_header="127.0.0.1",
+            body=b"",
+            access_key=job_ak,
+            secret_key=job_sk,
+            region="eu-west-1",
+            service="sts",
+        )
+        st_reg, _h, _b = _raw_http_exchange(
+            self.addr, _build_req("GET", "/aws/sts?Action=GetCallerIdentity", headers=sig_bad_reg)
+        )
+        self.assertEqual(st_reg, 401)
+
+        sig_presign = sign_aws_sigv4(
+            method="GET",
+            raw_path="/aws/sts",
+            raw_query="Action=GetCallerIdentity&X-Amz-Signature=deadbeef",
+            host_header="127.0.0.1",
+            body=b"",
+            access_key=job_ak,
+            secret_key=job_sk,
+            region="us-east-1",
+            service="sts",
+        )
+        st_pre, _h, _b = _raw_http_exchange(
+            self.addr,
+            _build_req(
+                "GET",
+                "/aws/sts?Action=GetCallerIdentity&X-Amz-Signature=deadbeef",
+                headers=sig_presign,
+            ),
+        )
+        self.assertEqual(st_pre, 401)
+
+    def test_regression_upstream_chunked_1xx_dup_ct_and_chunked_sse_canary(self) -> None:
+        # HTTP-P1-4 & HTTP-P1-5: negative chunk size, bad terminator, CL+TE, gzip CE, 100 Continue, dup CT
+        bad_upstream_payloads = [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-2\r\nab\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nabXX0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 2\r\n\r\nok",
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Type: text/event-stream\r\nContent-Length: 2\r\n\r\nok",
+        ]
+        for raw_up in bad_upstream_payloads:
+            def _make_handler(data: bytes) -> Any:
+                return lambda _req, conn: conn.sendall(data)
+
+            self.upstream.handler = _make_handler(raw_up)
+            st, _h, _b = _raw_http_exchange(
+                self.addr, _build_req("GET", "/http/k8s/version", headers=self._auth_hdr())
+            )
+            self.assertEqual(st, 502)
+
+        # HTTP-P1-4(d): Chunked SSE splitting canary across chunk boundaries caught by scanner!
+        def _chunked_sse_canary(_req: RecordedRequest, conn: ssl.SSLSocket) -> None:
+            secret = b"CANARY_CONCOURSE_TOKEN_ABCDE"
+            p1 = b"data: " + secret[:10]
+            p2 = secret[10:] + b"\n\n"
+            wire = (
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                + f"{len(p1):x}\r\n".encode("ascii")
+                + p1
+                + b"\r\n"
+                + f"{len(p2):x}\r\n".encode("ascii")
+                + p2
+                + b"\r\n0\r\n\r\n"
+            )
+            conn.sendall(wire)
+
+        self.upstream.handler = _chunked_sse_canary
+        st_cs, _h, body_cs = _raw_http_exchange(
+            self.addr,
+            _build_req("GET", "/http/concourse/api/v1/builds/5/events", headers=self._auth_hdr()),
+        )
+        self.assertEqual(st_cs, 200)
+        self.assertNotIn(b"CANARY_CONCOURSE_TOKEN_ABCDE", body_cs)
+
+    def test_regression_opaque_policy_err_basic_canary_header_canary_and_uds_peercred(self) -> None:
+        # HTTP-P2-2: BrokerPolicyError does not leak upstream.host
+        ssrf_b = HostHttpBrokerServer(
+            [build_k8s_ro_route("k8s", f"https://upstream.test:{self.up_port}", "vault:k8s_ro")],
+            self.vault,
+            self.lease,
+            ssl_context=self._tls_ctx,
+            resolver=_make_resolver(_ip(169, 254, 169, 254)),
+            allow_test_loopback=False,
+        )
+        ssrf_addr = ssrf_b.start()
+        try:
+            st, _h, body = _raw_http_exchange(
+                ssrf_addr, _build_req("GET", "/http/k8s/version", headers=self._auth_hdr())
+            )
+            self.assertEqual(st, 502)
+            self.assertEqual(json.loads(body), {"error": "broker_policy_blocked"})
+            self.assertNotIn(b"upstream.test", body)
+        finally:
+            ssrf_b.stop()
+
+        # HTTP-P2-3: non-loopback TCP host rejected
+        with self.assertRaises(BrokerPolicyError):
+            HostHttpBrokerServer(
+                self.routes, self.vault, self.lease, host=_ip(0, 0, 0, 0)
+            )
+
+        # HTTP-P2-3: UDS SO_PEERCRED mismatch closes connection
+        uds_path = Path(self._tmpdir_obj.name) / "uds_uid_test" / "broker.sock"
+        uds_b = HostHttpBrokerServer(
+            [build_k8s_ro_route("k8s", f"https://upstream.test:{self.up_port}", "vault:k8s_ro")],
+            self.vault,
+            self.lease,
+            socket_path=uds_path,
+            expected_uid=os.geteuid() + 1,
+            ssl_context=self._tls_ctx,
+            resolver=_make_resolver("127.0.0.1"),
+            allow_test_loopback=True,
+        )
+        uds_b.start()
+        cli = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            cli.settimeout(2.0)
+            cli.connect(str(uds_path))
+            cli.sendall(_build_req("GET", "/http/k8s/version", headers=self._auth_hdr()))
+            try:
+                got = cli.recv(1024)
+            except ConnectionResetError:
+                got = b""
+            self.assertEqual(got, b"")
+        finally:
+            cli.close()
+            uds_b.stop()
+
+        # HTTP-P2-5: basic-token base64 canary (25-char secret, len % 3 != 0) & header canary
+        b64_sonar = base64.b64encode(b"CANARY_SONAR_TOKEN_FGHIJ:").decode("ascii")
+        b64_job = base64.b64encode(f"{self.lease.ocjob_token}:".encode("ascii")).decode("ascii")
+
+        def _leak_b64(_req: RecordedRequest, conn: ssl.SSLSocket) -> None:
+            payload = f"leaked={b64_sonar}".encode("ascii")
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                + f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                + payload
+            )
+
+        self.upstream.handler = _leak_b64
+        st_b64, _h, _b = _raw_http_exchange(
+            self.addr,
+            _build_req("GET", "/http/sonar/api/issues/search", headers={"Authorization": f"Basic {b64_job}"}),
+        )
+        self.assertEqual(st_b64, 502)
+
+        def _leak_hdr(_req: RecordedRequest, conn: ssl.SSLSocket) -> None:
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"X-Request-Id: CANARY_K8S_SECRET_TOKEN_67890\r\n"
+                b"Content-Length: 2\r\nConnection: close\r\n\r\n{}"
+            )
+
+        self.upstream.handler = _leak_hdr
+        st_hdr, _h, _b = _raw_http_exchange(
+            self.addr, _build_req("GET", "/http/k8s/version", headers=self._auth_hdr())
+        )
+        self.assertEqual(st_hdr, 502)
+
+        # P3: HEAD on 500 upstream error returns empty body
+        def _err500(_req: RecordedRequest, conn: ssl.SSLSocket) -> None:
+            conn.sendall(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfail"
+            )
+
+        self.upstream.handler = _err500
+        st_head, _h, body_head = _raw_http_exchange(
+            self.addr, _build_req("HEAD", "/http/k8s/version", headers=self._auth_hdr())
+        )
+        self.assertEqual(st_head, 500)
+        self.assertEqual(body_head, b"")
 
 
 if __name__ == "__main__":
