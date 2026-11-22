@@ -33,7 +33,7 @@ ln -s project "$t/sandbox/construct/link"
 if run detect construct/link/nested 2>/dev/null; then echo 'FAIL: symlink accepted' >&2; exit 1; else pass=$((pass+1)); fi
 if run detect wt/construct/project/feature 2>/dev/null; then echo 'FAIL: nested worktree accepted' >&2; exit 1; else pass=$((pass+1)); fi
 if run init wt/bad construct/project -option 2>/dev/null; then echo 'FAIL: option branch accepted' >&2; exit 1; else pass=$((pass+1)); fi
-# Exercise the actual destination-selection block with a fake safe_run and scratch HOME.
+# Exercise the actual destination-selection block using throwaway repositories.
 python3 - "$SCRIPT" "$t/selection.sh" <<'PYCODE'
 import pathlib, sys
 s = pathlib.Path(sys.argv[1]).read_text()
@@ -56,6 +56,7 @@ mkdir -p "$t/state"
   done
   acquire_guard() { :; }; release_worktree_lock() { :; }
   safe_run() { run detect "${@: -1}"; }
+  tree_run() { run "$@"; }
   init_sandbox_tree() { run init "$@"; }
   source "$t/selection.sh"
   [[ $CWD = wt/construct/project/second ]]
