@@ -46,57 +46,81 @@ sockets, and source repository outside the container's mounts. Run with `--pull=
 fixed executable and arguments, and container logging disabled. Use no real provider binary,
 provider credentials, credential stores, host agent sockets, or provider network calls.
 
+Use one generation per lease for this first probe. This lets the fixture close stdout on
+completion and makes unexpected output after its terminal frame observable. A successful request
+settles the lease, releases its slot and retires its resources. Future multi-turn reuse has a
+separate protocol and cancellation design.
+
+The broker accepts strict UTF-8 JSON with no duplicate keys, non-finite numbers, unpaired
+surrogates, or nesting deeper than eight levels. Cap the request body at 16 KiB, each text field
+at 4 KiB, and the message array at eight entries. Bound fixture lines and event count as well as
+total output. Fixture stdout uses newline-delimited JSON in the order `ready`, one to sixteen
+`text` frames, one `done`, then EOF with a clean exit. Each frame has an exact schema. Any extra
+bytes, duplicate terminal frame, out-of-order event, nonzero exit, or missing EOF fail the request.
+
 ## Pseudocode walkthrough
 
 ```text
 open_lease(image_id, deadline):
     validate a full local Python image ID and require rootless Podman
-    generate independent client token, fake provider credential, and fixture identity
-    start one networkless fixture with its own writable tmpfs and attached pipes
+    generate independent tokens and a run-specific owner label
+    create the networkless fixture. Capture its complete immutable container ID
+    record ID in a private cidfile at creation and verify the ID and owner label
+    start and attach only by that ID
     send fake provider credential down the private pipe for fixture initialization
     wait for a bounded ready event, then bind the owner-only job socket
-    on failure stop and reap everything created for this lease
+    on failure use the same receipt-based cleanup as retirement
 
 admit(http_request, listener_lease):
     put byte and time limits on HTTP headers and body, one request per connection
     require exact supported method and path, one Content-Length for POST, and one token
-    reject transfer encoding, duplicate auth or lengths, and noncanonical routes
+    reject transfer encoding, duplicate headers, obs-fold, control characters, and noncanonical routes
+    reject trailing or pipelined bytes already received before dispatch
     match the token to the listener lease using a constant-time comparison
     allow only typed text request fields and the fixed synthetic model
     reject tools and unsupported fields. Forward no caller headers or identity selectors
     check lease expiry, revocation, request budget, and one-in-flight limit under the lease lock
-    reserve generation before dispatch. Return the fixed catalogue for GET
+    transition READY to DISPATCHED before dispatch. GET returns the catalogue without reserving
     dispatch the validated text request only to that lease's private pipe
 
 stream(active_request):
-    read bounded, deadline-aware fixture frames and parse only known event types
+    enforce bounded, deadline-aware fixture event grammar, EOF, and clean exit
     build fresh text SSE frames. Never forward raw stdout, stderr, or upstream errors
-    bound output and write time and recheck lease state before delivering events
-    finish only on an explicit upstream completion event
-    on bad data, timeout, or early exit end the stream without a successful terminal event
-    if dispatch already occurred, do not retry or reuse uncertain backend state
+    bound output and write time. Cancel if the peer disconnects or sends more bytes
+    after validated completion, attempt DISPATCHED to SUCCEEDED and enqueue the terminal event
+      in the same serialized operation used for revocation, without waiting on socket I/O
+    release the in-flight slot on success and reclaim the lease resources
+    on any post-dispatch error, retire. Never retry a dispatched request
 
 retire(lease):
-    mark inactive and invalidate token before releasing admission lock
+    serialize READY or DISPATCHED to RETIRING and invalidate the token before cleanup
+    preserve an already committed SUCCEEDED outcome
     close client stream and backend pipes to wake a stalled read
-    stop and reap only this test-owned container, then remove its socket and scratch state
+    inspect the complete container ID and owner label before stopping or removing by ID
+    confirm the ID no longer exists, then remove socket and scratch state and settle RETIRED
+    if identity or cleanup is uncertain, fail the run and retain the private recovery receipt
     on client disconnect during generation retire the lease as well
     repeat retirement safely from timeout, exception, and harness shutdown
     require a new lease and fresh runtime for recovery. Old tokens and state stay retired
 ```
 
-Socket handling uses short per-operation deadlines plus a monotonic overall deadline, so a silent
-or slow peer cannot defeat lease expiry. Expiry and explicit revocation use the same retirement
-path and do not wait for upstream output. The test owns explicit random container identities
-and verifies ownership before cleanup. No global prune or removal by image tag. Start with no
-more than two simultaneous leases and a bounded test deadline.
+On a single broker event loop, terminal enqueue with the success transition and revocation
+marking run without an `await`. If expiry or revocation wins, no success terminal is enqueued.
+Bytes enqueued by an earlier success can arrive later. A downstream write failure after success
+was committed still triggers cleanup and cannot cause replay. Socket handling uses short
+per-operation and monotonic overall deadlines. A peer that pipelines after dispatch can abort the
+one generation, and the broker never admits a second request on that connection. Keep at most two
+simultaneous leases and bound the test duration. Cleanup uses full IDs from private receipts and
+never targets names or tags. A partial create without a confirmed ID fails with the owner label
+and available receipt retained for investigation.
 
 ## Verification and limits
 
 - [ ] Show model discovery and a streamed text response through the real Podman fixture.
-      Require one terminal event for success. Reject a hostile request with the other lease's
-      token, forged selectors, mismatched routes/models, malformed HTTP, and tool inputs.
-      Check two concurrent jobs against the correct fixture identity and output.
+      Require one terminal event for success. Reject hostile requests with the other lease's
+      token, forged selectors, mismatched routes/models, tool inputs, duplicate keys, non-finite
+      numbers, obs-fold, control characters, and pipelining. Check concurrent job identity and
+      output. Use bad fixture modes for wrong order, duplicate terminal, trailing data, and EOF.
 - [ ] Verify inspect settings and probe filesystem/network canaries inside the fixture. Verify
       that synthetic credentials and private state are absent from job responses, command-line
       arguments, container configuration, and routine diagnostics. Malformed fixture output is
@@ -104,10 +128,11 @@ more than two simultaneous leases and a bounded test deadline.
       still encode its own readable state in a valid text response. This test verifies the
       designed channels and does not claim arbitrary secret detection in model output.
 - [ ] Test stalled upstream output, early failure, disconnect, explicit revocation and expiry.
-      Assert old-token denial, no successful terminal event after cancellation, bounded teardown,
-      independent sibling lease operation, and absence of test-owned containers and socket
-      directories on completion or error. Exercise separate teardown triggers with synthetic data.
-- [ ] Record exact evidence and remaining open work. A passing probe establishes offline text
-      lease behavior and the provider container boundary only. Actual Meridian and OpenCode V2,
-      managed-job transport, tool continuations, authentication, provider egress policy, and
-      licensing of a distributed runtime all require separate evidence.
+      Use test barriers to run both orderings of terminal commit and revocation. Assert no
+      success after revocation wins, old-token denial, bounded teardown, sibling independence,
+      and absence of test-owned containers and sockets after completion or error. Test partial
+      startup and ensure a replacement using the same name cannot be removed by cleanup.
+- [ ] Record exact evidence and remaining open work. A passing probe establishes host broker
+      lease behavior and synthetic fixture container isolation. The credentialed provider
+      boundary, actual Meridian and OpenCode V2, managed-job transport, tool continuations,
+      authentication, provider egress policy, and distributed runtime licensing stay open.
