@@ -83,6 +83,7 @@ _KEY_PARAMS = "params"
 _KEY_TARGET = "target"
 _KEY_BLOB_SHA256 = "blob_sha256"
 _KEY_SIZE_BYTES = "size_bytes"
+_ERR_RATE_LIMITED = "rate_limited"
 
 ALLOWED_HEADERS: frozenset[str] = frozenset({"content-length", "content-type"})
 ALLOWED_RPC_KEYS: frozenset[str] = frozenset(
@@ -602,6 +603,10 @@ class CoordUdsRpcServer:
         self._token_table: dict[str, tuple[str, PrincipalCtx]] | None = (
             _build_token_table(token_principals) if token_principals is not None else None
         )
+        self._has_operator_principal = bool(
+            self._token_table is not None
+            and any(p.role is CoordRole.OPERATOR for _, p in self._token_table.values())
+        )
         uid_rate_max = (
             min(rate_limit_max * max(1, len(self._token_table)), rate_limit_max * 16)
             if self._token_table is not None
@@ -609,6 +614,7 @@ class CoordUdsRpcServer:
         )
         self.rate_limiter = SlidingWindowRateLimiter(uid_rate_max, rate_limit_window)
         self.principal_rate_limiter = SlidingWindowRateLimiter(rate_limit_max, rate_limit_window)
+        self._lifecycle = threading.Lock()
         self._workers = ListenerWorkers()
         self._listener: socket.socket | None = None
         self._bound: BoundUds | None = None
@@ -622,34 +628,43 @@ class CoordUdsRpcServer:
         self.stop()
 
     def start(self) -> Path:
-        if self._listener is not None:
-            raise BrokerError("CoordUdsRpcServer is already running")
-        srv, bound = bind_trusted_uds(
-            self._raw_socket_path,
-            sandbox_root=self._sandbox_root,
-            backlog=max(16, self._max_concurrent_conns * 2),
-        )
-        self._listener = srv
-        self._bound = bound
-        self.socket_path = bound.path
-        started = self._workers.start(
-            self._workers.serve,
-            srv,
-            self._handle_conn,
-            self._max_concurrent_conns,
-        )
-        if not started:
-            self.stop()
-            raise BrokerError("Failed to start CoordUdsRpcServer listener thread")
-        return bound.path
+        with self._lifecycle:
+            if self._listener is not None or self._bound is not None:
+                raise BrokerError("CoordUdsRpcServer is already running or awaiting stop cleanup")
+            srv, bound = bind_trusted_uds(
+                self._raw_socket_path,
+                sandbox_root=self._sandbox_root,
+                backlog=max(16, self._max_concurrent_conns * 2),
+            )
+            self._listener = srv
+            self._bound = bound
+            try:
+                started = self._workers.start(
+                    self._workers.serve,
+                    srv,
+                    self._handle_conn,
+                    self._max_concurrent_conns,
+                )
+                if not started:
+                    raise BrokerError("Failed to start CoordUdsRpcServer listener thread")
+            except Exception:
+                self._stop_locked()
+                raise
+            self.socket_path = bound.path
+            return bound.path
 
     def stop(self) -> None:
-        listener = self._listener
-        bound = self._bound
-        self._listener = None
+        with self._lifecycle:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        if self._listener is None and self._bound is None:
+            return
+        self._workers.stop(self._listener, self._bound)
         self._bound = None
-        if listener is not None or bound is not None:
-            self._workers.stop(listener, bound)
+        self._workers = ListenerWorkers()
+        self._listener = None
+        self.socket_path = None
 
     def _lookup_token_principal(self, auth_token: Any) -> PrincipalCtx | None:
         if type(auth_token) is not str or not auth_token or self._token_table is None:
@@ -761,6 +776,32 @@ class CoordUdsRpcServer:
         except Exception:
             return _rpc_error(req_id, ERR_CODE_INTERNAL, "internal_error")
 
+    def _read_and_validate_conn(
+        self, conn: socket.socket, peer_uid: int, *, uid_allowed: bool
+    ) -> tuple[Any, PrincipalCtx, str, dict[str, Any]] | dict[str, Any]:
+        read_timeout = self._read_timeout if uid_allowed else min(self._read_timeout, 1.0)
+        total_timeout = min(TOTAL_REQUEST_TIMEOUT_SECONDS, read_timeout * 3.0)
+        try:
+            raw_frame = read_content_length_frame(
+                conn,
+                max_bytes=MAX_FRAME_BYTES,
+                read_timeout=read_timeout,
+                total_timeout=total_timeout,
+            )
+            req = parse_strict_json(raw_frame, max_depth=MAX_JSON_DEPTH, max_bytes=MAX_FRAME_BYTES)
+        except (FramingError, StrictJsonError) as exc:
+            if not uid_allowed:
+                return _rpc_error(None, ERR_CODE_RATE_LIMIT, _ERR_RATE_LIMITED)
+            return _rpc_error(None, ERR_CODE_PARSE, str(exc))
+        validated = self._validate_envelope(req, peer_uid)
+        if isinstance(validated, dict):
+            if not uid_allowed:
+                return _rpc_error(None, ERR_CODE_RATE_LIMIT, _ERR_RATE_LIMITED)
+            return validated
+        if not uid_allowed and validated[1].role is not CoordRole.OPERATOR:
+            return _rpc_error(validated[0], ERR_CODE_RATE_LIMIT, _ERR_RATE_LIMITED)
+        return validated
+
     def _handle_conn(self, conn: socket.socket) -> None:
         try:
             peer_uid = self._peer_uid_getter(conn)
@@ -768,22 +809,11 @@ class CoordUdsRpcServer:
             return
         if peer_uid != self._expected_uid:
             return
-        if not self.rate_limiter.allow(peer_uid):
-            self._send(conn, _rpc_error(None, ERR_CODE_RATE_LIMIT, "rate_limited"))
+        uid_allowed = self.rate_limiter.allow(peer_uid)
+        if not uid_allowed and not self._has_operator_principal:
+            self._send(conn, _rpc_error(None, ERR_CODE_RATE_LIMIT, _ERR_RATE_LIMITED))
             return
-        total_timeout = min(TOTAL_REQUEST_TIMEOUT_SECONDS, self._read_timeout * 3.0)
-        try:
-            raw_frame = read_content_length_frame(
-                conn,
-                max_bytes=MAX_FRAME_BYTES,
-                read_timeout=self._read_timeout,
-                total_timeout=total_timeout,
-            )
-            req = parse_strict_json(raw_frame, max_depth=MAX_JSON_DEPTH, max_bytes=MAX_FRAME_BYTES)
-        except (FramingError, StrictJsonError) as exc:
-            self._send(conn, _rpc_error(None, ERR_CODE_PARSE, str(exc)))
-            return
-        validated = self._validate_envelope(req, peer_uid)
+        validated = self._read_and_validate_conn(conn, peer_uid, uid_allowed=uid_allowed)
         if isinstance(validated, dict):
             self._send(conn, validated)
             return

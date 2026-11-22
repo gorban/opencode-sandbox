@@ -100,6 +100,8 @@ _STATUS_PENDING = "pending"
 _STAGING_DIR_NAME = ".staging"
 _SPOOL_DIR_NAME = "inbox-spool"
 _DEGRADED_MARKER_NAME = ".coord_degraded"
+_SESSION_ACTIVE_MARKER_NAME = ".coord_session_active"
+_EPHEMERAL_LEASE_PREFIX = "ephemeral-lease:"
 _ORCH_ACTOR_PREFIX = "orchestrator:"
 _PATCH_SUFFIX = ".patch"
 
@@ -116,6 +118,8 @@ _THREAD_MAIN = "main"
 _KIND_PROMPT = "prompt"
 _MEDIA_PATCH = "text/x-patch"
 _LABEL_INCARNATION = "incarnation_id"
+_LABEL_CTRL_REQ_ID = "controller_request_id"
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _OUTCOME_OK = "ok"
 
 _DEFAULT_MAX_EDGE_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -211,8 +215,22 @@ class RegistryStore(Protocol):
 
     def cancel_outbox_row(self, msg_id: str, *, reason: str) -> None: ...
 
+    def save_sandbox_budget(
+        self, sandbox_addr: str, incarnation_id: str, budget: SubtreeBudget
+    ) -> None: ...
+
+    def get_sandbox_budget(
+        self, sandbox_addr: str, incarnation_id: str
+    ) -> SubtreeBudget | None: ...
+
+    def list_committed_artifact_manifests(self) -> list[dict[str, Any]]: ...
+
     def record_stream_event(
-        self, event: StreamEvent, *, tui_enter_token: str | None = None
+        self,
+        event: StreamEvent,
+        *,
+        tui_enter_token: str | None = None,
+        dispatch_msg_id: str | None = None,
     ) -> dict[str, Any]: ...
 
     def list_events_since(
@@ -322,6 +340,48 @@ def _assert_existing_ancestors_safe(phys: Path) -> None:
         cur = cur.parent
 
 
+def _fsync_dir(path: Path) -> None:
+    """Fsync a trusted directory fd (no symlinks) to make directory entry updates durable."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _O_NOFOLLOW
+    dir_fd = os.open(path, flags)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _write_marker_durable(path: Path, parent_dir: Path, payload: bytes) -> None:
+    """Atomically write a 0o600 non-symlink marker file and fsync both file and parent dir."""
+    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC | _O_NOFOLLOW
+    with _UMASK_LOCK:
+        old_umask = os.umask(0o177)
+        try:
+            fd = os.open(path, flags, 0o600)
+        finally:
+            os.umask(old_umask)
+    try:
+        view = memoryview(payload)
+        written = 0
+        while written < len(payload):
+            written += os.write(fd, view[written:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_dir(parent_dir)
+
+
+def _unlink_marker_durable(path: Path, parent_dir: Path) -> None:
+    """Unlink a non-symlink marker file if present and fsync the parent directory."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise CoordPolicyError(f"Refusing to remove non-regular marker: {path}")
+    os.unlink(path)
+    _fsync_dir(parent_dir)
+
+
 def _ensure_trusted_dir(path: Path, *, sandbox_root: Path | None) -> Path:
     """Validate trust boundaries and ensure a 0o700 non-symlink directory exists."""
     raw = Path(path)
@@ -339,7 +399,7 @@ def _ensure_trusted_dir(path: Path, *, sandbox_root: Path | None) -> Path:
                     phys.mkdir(parents=True, exist_ok=True, mode=0o700)
                 finally:
                     os.umask(old_umask)
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _O_NOFOLLOW
         dir_fd = os.open(phys, flags)
         try:
             st = os.fstat(dir_fd)
@@ -558,6 +618,7 @@ class ArtifactSpool:
             dst_path = dst_dir / f"{digest}{_PATCH_SUFFIX}"
             os.chmod(src_path, 0o400)
             os.replace(src_path, dst_path)
+        _fsync_dir(dst_dir)
         self._remove_dir_quietly(reservation.staging_dir)
 
         with self._lock:
@@ -636,6 +697,26 @@ class ArtifactSpool:
             self._edge_reserved_count.clear()
             self._edge_reserved_bytes.clear()
         return reclaimed
+
+    def has_verified_blob(self, incarnation_id: str, ref: ArtifactRef) -> bool:
+        """Return True iff the published spool file exists, passes metadata checks, and matches SHA-256."""
+        try:
+            self.read_artifact(incarnation_id, ref)
+            return True
+        except (CoordPolicyError, CoordValidationError):
+            return False
+
+    def restore_edge_charges(
+        self, edge_counts: Mapping[str, int], edge_bytes: Mapping[str, int]
+    ) -> None:
+        """Restore per-edge published artifact counts and byte charges from reconciled manifests."""
+        with self._lock:
+            self._edge_published_count = {
+                edge_id: cnt for edge_id, cnt in edge_counts.items() if cnt > 0
+            }
+            self._edge_published_bytes = {
+                edge_id: byt for edge_id, byt in edge_bytes.items() if byt > 0
+            }
 
     def read_artifact(self, incarnation_id: str, ref: ArtifactRef) -> bytes:
         clean_inc = validate_opaque_token(incarnation_id, _LABEL_INCARNATION)
@@ -801,18 +882,19 @@ class CoordHub:
         self.spool = ArtifactSpool(state_dir, sandbox_root=sandbox_root)
         self._state_dir = self.spool._state_dir
         self._degraded_marker = self._state_dir / _DEGRADED_MARKER_NAME
+        self._session_active_marker = self._state_dir / _SESSION_ACTIVE_MARKER_NAME
         self.wait_graph = WaitForGraph()
         self.dispatcher = OutboxDispatcher(self, poll_interval_s=watchdog_interval_s)
 
         self._meta_lock = threading.Lock()
         self._register_lock = threading.Lock()
-        self._degraded = self._load_degraded_marker()
+        self._degraded = self._init_recovery_seal()
         self._grant_fences: dict[str, threading.RLock] = {}
         self._fenced_generations: set[tuple[str, int]] = set()
         self._fenced_targets: set[tuple[str, str]] = set()
         self._fenced_addrs: set[str] = set()
         self._known_incarnations: dict[str, set[str]] = {}
-        self._budgets: dict[str, SubtreeBudget] = {}
+        self._budgets: dict[tuple[str, str], SubtreeBudget] = {}
         self._leases: dict[str, BrokerLease] = {}
         self._lease_callbacks: dict[str, Callable[[], None]] = {}
         self._rate_windows: dict[str, deque[float]] = {}
@@ -820,34 +902,138 @@ class CoordHub:
 
         self._wait_cond = threading.Condition()
         self._waiters: set[_WaiterState] = set()
+        self._reconcile_artifacts_on_startup()
 
-    def _load_degraded_marker(self) -> bool:
+    @staticmethod
+    def _marker_present_or_error(path: Path) -> bool:
         try:
-            os.lstat(self._degraded_marker)
+            os.lstat(path)
             return True
         except FileNotFoundError:
             return False
         except OSError:
             return True
 
+    def _init_recovery_seal(self) -> bool:
+        if self._marker_present_or_error(self._degraded_marker) or self._marker_present_or_error(
+            self._session_active_marker
+        ):
+            return True
+        try:
+            _write_marker_durable(
+                self._session_active_marker,
+                self._state_dir,
+                f"{time.time():.6f}:pid={os.getpid()}\n".encode("utf-8"),
+            )
+        except OSError:
+            return True
+        return False
+
     def _mark_degraded(self, detail: str) -> None:
         with self._meta_lock:
             self._degraded = True
-        flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
         try:
-            with _UMASK_LOCK:
-                old_umask = os.umask(0o177)
-                try:
-                    fd = os.open(self._degraded_marker, flags, 0o600)
-                finally:
-                    os.umask(old_umask)
-            try:
-                os.write(fd, f"{time.time():.6f}:{detail}\n".encode("utf-8", errors="replace"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            _write_marker_durable(
+                self._degraded_marker,
+                self._state_dir,
+                f"{time.time():.6f}:{detail}\n".encode("utf-8", errors="replace"),
+            )
         except OSError:
             pass
+
+    @staticmethod
+    def _parse_manifest_refs(raw_refs: Any) -> list[ArtifactRef] | None:
+        if not isinstance(raw_refs, list) or not raw_refs:
+            return None
+        parsed: list[ArtifactRef] = []
+        for item in raw_refs:
+            if not isinstance(item, Mapping):
+                return None
+            try:
+                parsed.append(
+                    ArtifactRef(
+                        blob_sha256=item["blob_sha256"],
+                        size_bytes=item["size_bytes"],
+                        media_type=item.get("media_type", _MEDIA_PATCH),
+                    )
+                )
+            except (KeyError, TypeError, ValueError, CoordValidationError):
+                return None
+        return parsed
+
+    def _reconcile_artifacts_on_startup(self) -> None:
+        list_manifests = getattr(self._registry, "list_committed_artifact_manifests", None)
+        if not callable(list_manifests):
+            return
+        try:
+            manifests = list_manifests()
+        except Exception:
+            self._mark_degraded("artifact_reconciliation_failed")
+            return
+        edge_counts: dict[str, int] = {}
+        edge_bytes: dict[str, int] = {}
+        for item in manifests:
+            self._reconcile_single_manifest(item, edge_counts, edge_bytes)
+        self.spool.restore_edge_charges(edge_counts, edge_bytes)
+
+    def _reconcile_single_manifest(
+        self,
+        item: Mapping[str, Any],
+        edge_counts: dict[str, int],
+        edge_bytes: dict[str, int],
+    ) -> None:
+        msg_id = str(item.get("msg_id", ""))
+        edge_id = str(item.get("edge_id", ""))
+        dst_inc = str(item.get("dst_incarnation", ""))
+        status = item.get("outbox_status")
+        refs = self._parse_manifest_refs(item.get("artifact_refs"))
+        blobs_ok = refs is not None and all(
+            self.spool.has_verified_blob(dst_inc, ref) for ref in refs
+        )
+        if not blobs_ok:
+            if status == _STATUS_PENDING and msg_id:
+                try:
+                    self._registry.cancel_outbox_row(
+                        msg_id, reason="artifact_unreconciled_after_crash"
+                    )
+                    self._registry.append_audit(
+                        "hub",
+                        "reconcile_artifact_cancelled",
+                        msg_id,
+                        "cancelled",
+                        {"edge_id": edge_id},
+                    )
+                except Exception:
+                    self._mark_degraded("artifact_reconciliation_cancel_failed")
+            return
+        if refs is not None and edge_id:
+            edge_counts[edge_id] = edge_counts.get(edge_id, 0) + len(refs)
+            edge_bytes[edge_id] = edge_bytes.get(edge_id, 0) + sum(r.size_bytes for r in refs)
+
+    def confirm_recovery(
+        self, caller: PrincipalCtx, *, reason: str = "operator_verified_recovery"
+    ) -> None:
+        """Operator-only explicit recovery clearing degraded/unclean-shutdown seals."""
+        if caller.role is not CoordRole.OPERATOR:
+            raise CoordAuthError("operator_required:confirm_recovery")
+        clean_reason = validate_reason_text(reason, "reason")
+        with self._register_lock:
+            _unlink_marker_durable(self._degraded_marker, self._state_dir)
+            _write_marker_durable(
+                self._session_active_marker,
+                self._state_dir,
+                f"{time.time():.6f}:pid={os.getpid()}:recovered\n".encode("utf-8"),
+            )
+            with self._meta_lock:
+                self._degraded = False
+            self._reconcile_artifacts_on_startup()
+            self._registry.append_audit(
+                caller.canonical_sender,
+                "confirm_recovery",
+                "hub",
+                _OUTCOME_OK,
+                {"reason": clean_reason},
+            )
 
     @property
     def is_degraded(self) -> bool:
@@ -864,11 +1050,18 @@ class CoordHub:
             callbacks = dict(self._lease_callbacks)
             self._leases.clear()
             self._lease_callbacks.clear()
+            degraded = self._degraded
         for addr, lease in leases:
             cb = callbacks.get(addr)
             if cb is not None:
                 lease.remove_revoke_callback(cb)
             lease.stop_watchdog()
+        if not degraded:
+            try:
+                _unlink_marker_durable(self._session_active_marker, self._state_dir)
+            except (OSError, CoordPolicyError):
+                with self._meta_lock:
+                    self._degraded = True
 
     def _get_grant_fence(self, edge_id: str) -> threading.RLock:
         with self._meta_lock:
@@ -889,6 +1082,8 @@ class CoordHub:
             raise CoordAuthError(f"{_ERR_ADMIN_ONLY}:{action}")
 
     def _check_controller_request_active(self, request_id: str) -> bool:
+        if request_id.startswith(_EPHEMERAL_LEASE_PREFIX):
+            return False
         if self._controller is None or self._controller_actor is None:
             return False
         try:
@@ -906,6 +1101,8 @@ class CoordHub:
             if not lease.is_active():
                 return False
             if controller_request_id is not None:
+                if controller_request_id == self._ephemeral_authority_id(lease):
+                    return True
                 lease_req = getattr(lease, "_controller_request_id", None)
                 if lease_req != controller_request_id:
                     return self._check_controller_request_active(controller_request_id)
@@ -918,6 +1115,15 @@ class CoordHub:
         if req_id is not None:
             return self._check_controller_request_active(req_id)
         return True
+
+    @staticmethod
+    def _ephemeral_authority_id(lease: BrokerLease) -> str:
+        raw_id = f"{_EPHEMERAL_LEASE_PREFIX}{lease.job_id}"
+        try:
+            return validate_opaque_token(raw_id, _LABEL_CTRL_REQ_ID)
+        except CoordValidationError:
+            digest = hashlib.sha256(str(lease.job_id).encode("utf-8", errors="replace")).hexdigest()[:32]
+            return f"{_EPHEMERAL_LEASE_PREFIX}{digest}"
 
     def _verify_caller_live(self, caller: PrincipalCtx) -> None:
         if caller.sandbox_addr is None:
@@ -963,17 +1169,39 @@ class CoordHub:
             if old_cb is not None:
                 old_lease.remove_revoke_callback(old_cb)
             try:
-                old_lease.stop_watchdog()
+                old_lease.revoke()
+            except Exception:
+                pass
+            try:
+                if getattr(old_lease, "_watch_thread", None) is not threading.current_thread():
+                    old_lease.stop_watchdog()
             except Exception:
                 pass
 
-    def _on_lease_revoked(self, sandbox_addr: str) -> None:
-        """Dispatch revocation on a daemon thread so BrokerLease never re-enters grant fences."""
+    def _on_lease_revoked(
+        self,
+        sandbox_addr: str,
+        expected_incarnation_id: str,
+        expected_lease: BrokerLease,
+    ) -> None:
+        """Dispatch incarnation-bound revocation on a daemon thread without re-entering fences."""
 
         def _run() -> None:
             watchdog_caller = PrincipalCtx(role=CoordRole.OPERATOR, actor_id="lease-watchdog")
             try:
-                self.revoke(watchdog_caller, target=sandbox_addr, reason="controller_lease_revoked")
+                with self._register_lock:
+                    with self._meta_lock:
+                        current_lease = self._leases.get(sandbox_addr)
+                    if current_lease is not expected_lease:
+                        return
+                    sb = self._registry.get_sandbox(sandbox_addr)
+                    if sb is None or sb.incarnation_id != expected_incarnation_id:
+                        return
+                    self._revoke_unlocked(
+                        watchdog_caller,
+                        target=sandbox_addr,
+                        reason="controller_lease_revoked",
+                    )
             except Exception:
                 pass
 
@@ -987,21 +1215,17 @@ class CoordHub:
         parent = self._registry.get_sandbox(parent_addr)
         if parent is None or parent.status == _STATUS_REVOKED:
             raise CoordPolicyError(f"Parent sandbox unavailable: {parent_addr!r}")
+        budget_key = (parent_addr, parent.incarnation_id)
         with self._meta_lock:
-            parent_budget = self._budgets.get(parent_addr)
+            parent_budget = self._budgets.get(budget_key)
         if parent_budget is None:
-            rem_depth = max(0, self._root_budget.max_depth_remaining - parent.depth)
-            parent_budget = SubtreeBudget(
-                max_depth_remaining=rem_depth,
-                max_children=self._root_budget.max_children,
-                max_total_sandboxes=self._root_budget.max_total_sandboxes,
-                allowed_workers=self._root_budget.allowed_workers,
-                allowed_sandbox_types=self._root_budget.allowed_sandbox_types,
-                allowed_models=self._root_budget.allowed_models,
-                allowed_variants=self._root_budget.allowed_variants,
-                allowed_broker_routes=self._root_budget.allowed_broker_routes,
-                max_security_profile=self._root_budget.max_security_profile,
-            )
+            get_budget = getattr(self._registry, "get_sandbox_budget", None)
+            if callable(get_budget):
+                parent_budget = get_budget(parent_addr, parent.incarnation_id)
+            if parent_budget is None:
+                raise CoordPolicyError("parent_budget_not_established")
+            with self._meta_lock:
+                self._budgets[budget_key] = parent_budget
         if parent_budget.max_depth_remaining <= 0:
             raise CoordPolicyError("Subtree max_depth_remaining exhausted")
         children = [sb for sb in active_sandboxes if sb.parent_addr == parent_addr]
@@ -1093,14 +1317,49 @@ class CoordHub:
         if callable(invalidate):
             invalidate(addr, new_incarnation, reason="incarnation_rotated")
 
-    def _check_register_lease(self, lease: BrokerLease | None) -> None:
-        if lease is None:
-            return
+    def _bind_lease_controller(self, lease: BrokerLease) -> str | None:
         if not lease.is_active():
             raise RevokedError("lease_already_revoked")
+        lease_controller = getattr(lease, "_controller", None)
+        if (
+            self._controller is not None
+            and lease_controller is not None
+            and lease_controller is not self._controller
+        ):
+            raise CoordPolicyError("lease_controller_mismatch")
+        if self._controller is None and lease_controller is not None:
+            self._controller = lease_controller
         lease_actor = getattr(lease, "_controller_actor", None)
         if self._controller_actor is None and lease_actor is not None:
             self._controller_actor = lease_actor
+        raw_lease_req = getattr(lease, "_controller_request_id", None)
+        if raw_lease_req is None:
+            return None
+        return validate_opaque_token(raw_lease_req, _LABEL_CTRL_REQ_ID)
+
+    def _resolve_register_authority(
+        self, lease: BrokerLease | None, controller_request_id: str | None
+    ) -> str | None:
+        clean_req = (
+            validate_opaque_token(controller_request_id, _LABEL_CTRL_REQ_ID)
+            if controller_request_id is not None
+            else None
+        )
+        if clean_req is not None and clean_req.startswith(_EPHEMERAL_LEASE_PREFIX):
+            raise CoordValidationError("ephemeral_lease_prefix_reserved")
+        if lease is None:
+            if clean_req is not None and not self._check_controller_request_active(clean_req):
+                raise RevokedError("controller_request_not_active")
+            return clean_req
+        lease_req = self._bind_lease_controller(lease)
+        if clean_req is not None and lease_req is not None and clean_req != lease_req:
+            raise CoordPolicyError("lease_controller_request_id_mismatch")
+        effective_req = clean_req if clean_req is not None else lease_req
+        if effective_req is None:
+            return self._ephemeral_authority_id(lease)
+        if not self._check_controller_request_active(effective_req):
+            raise RevokedError("controller_request_not_active")
+        return effective_req
 
     def register_sandbox(
         self,
@@ -1125,7 +1384,7 @@ class CoordHub:
         clean_inc = validate_opaque_token(incarnation_id, _LABEL_INCARNATION)
         clean_brief = validate_task_brief(task_brief)
         clean_parent = parse_local_target(parent_addr).canonical if parent_addr is not None else None
-        self._check_register_lease(lease)
+        effective_req_id = self._resolve_register_authority(lease, controller_request_id)
 
         with self._register_lock:
             existing = self._registry.get_sandbox(addr.canonical)
@@ -1152,18 +1411,21 @@ class CoordHub:
                 sandbox_type=sandbox_type,
                 task_brief=clean_brief,
                 status=_STATUS_RUNNING,
-                controller_request_id=controller_request_id,
+                controller_request_id=effective_req_id,
                 parent_addr=clean_parent,
                 depth=depth,
                 created_at=now,
                 updated_at=now,
             )
             persisted = self._registry.register_sandbox(record)
+            save_budget = getattr(self._registry, "save_sandbox_budget", None)
+            if callable(save_budget):
+                save_budget(addr.canonical, clean_inc, effective_budget)
             self._registry.ensure_thread(addr.canonical, clean_inc, _THREAD_MAIN, title=clean_brief[:64])
             self._record_registered_meta(addr.canonical, clean_inc, effective_budget, lease)
 
         if lease is not None:
-            self._attach_lease_watchdog(addr.canonical, lease)
+            self._attach_lease_watchdog(addr.canonical, clean_inc, lease)
 
         self._registry.append_audit(
             caller.canonical_sender,
@@ -1184,15 +1446,19 @@ class CoordHub:
         with self._meta_lock:
             self._fenced_addrs.discard(addr)
             self._known_incarnations.setdefault(addr, set()).add(incarnation_id)
-            self._budgets[addr] = budget
+            self._budgets[(addr, incarnation_id)] = budget
             if lease is not None:
                 self._leases[addr] = lease
 
-    def _attach_lease_watchdog(self, sandbox_addr: str, lease: BrokerLease) -> None:
+    def _attach_lease_watchdog(
+        self, sandbox_addr: str, incarnation_id: str, lease: BrokerLease
+    ) -> None:
         def _cb() -> None:
-            self._on_lease_revoked(sandbox_addr)
+            self._on_lease_revoked(sandbox_addr, incarnation_id, lease)
 
         with self._meta_lock:
+            if self._leases.get(sandbox_addr) is not lease:
+                return
             self._lease_callbacks[sandbox_addr] = _cb
         lease.add_revoke_callback(_cb)
         lease.start_watchdog(poll_interval=self._watchdog_interval_s)
@@ -1773,7 +2039,7 @@ class CoordHub:
                 {"stream_id": stream_id},
             )
             return False, None
-        self._registry.record_stream_event(valid_ev)
+        self._registry.record_stream_event(valid_ev, dispatch_msg_id=env.msg_id)
         self._notify_waiters()
         if valid_ev.event_type == "turn_completed":
             return True, None
@@ -1799,7 +2065,7 @@ class CoordHub:
                         text=abort_reason,
                         created_at=time.time(),
                     )
-                    self._registry.record_stream_event(cap_ev)
+                    self._registry.record_stream_event(cap_ev, dispatch_msg_id=env.msg_id)
                     self._notify_waiters()
                     break
                 total_seen += 1
@@ -1847,6 +2113,17 @@ class CoordHub:
         with self._wait_cond:
             self._wait_cond.notify_all()
 
+    def _edge_is_live_for_read(self, edge: RoutingEdge, target_addr: str) -> bool:
+        with self._meta_lock:
+            gen_fenced = (edge.edge_id, edge.grant_generation) in self._fenced_generations
+        if gen_fenced or self._registry.is_grant_tombstoned(edge.edge_id, edge.grant_generation):
+            return False
+        try:
+            self._require_dst_sandbox_live(target_addr, edge.lease_request_id)
+        except RevokedError:
+            return False
+        return True
+
     def _authorize_target_read(
         self, caller: PrincipalCtx, target_addr: str
     ) -> frozenset[str] | None:
@@ -1862,17 +2139,19 @@ class CoordHub:
         edges = self._registry.list_edges(
             src_actor=caller.canonical_sender, dst_addr=target_addr, active_only=True
         )
-        matching = [
+        candidates = [
             e
             for e in edges
-            if (e.src_incarnation is None or e.src_incarnation == caller.incarnation_id)
-            and not self._registry.is_grant_tombstoned(e.edge_id, e.grant_generation)
+            if e.src_incarnation is None or e.src_incarnation == caller.incarnation_id
         ]
-        if not matching:
+        if not candidates:
             raise CoordAuthError(_ERR_NO_ACTIVE_EDGE)
         allowed: set[str] = set()
-        for edge in matching:
-            allowed.update(edge.allowed_threads)
+        for edge in candidates:
+            if self._edge_is_live_for_read(edge, target_addr):
+                allowed.update(edge.allowed_threads)
+        if not allowed:
+            raise RevokedError(_ERR_EDGE_REVOKED)
         return frozenset(allowed)
 
     def status(self, caller: PrincipalCtx, *, target: str | None = None) -> dict[str, Any]:
@@ -1998,6 +2277,8 @@ class CoordHub:
             target_fenced = (addr, sb.incarnation_id) in self._fenced_targets
         if target_fenced:
             raise RevokedError(_ERR_EDGE_REVOKED)
+        if not self._check_lease_active(addr, controller_request_id=sb.controller_request_id):
+            raise RevokedError(_ERR_SANDBOX_REVOKED)
 
     def _assert_targets_not_revoked(
         self, caller_actor: str, target_addrs: Sequence[str]
@@ -2130,6 +2411,10 @@ class CoordHub:
                 pass
         if lease is not None:
             try:
+                lease.revoke()
+            except Exception:
+                pass
+            try:
                 if getattr(lease, "_watch_thread", None) is not threading.current_thread():
                     lease.stop_watchdog()
             except Exception:
@@ -2152,6 +2437,16 @@ class CoordHub:
             return None, [], True
 
     def revoke(
+        self,
+        caller: PrincipalCtx,
+        *,
+        target: str,
+        reason: str = "operator_revoked",
+    ) -> RevocationStatus:
+        with self._register_lock:
+            return self._revoke_unlocked(caller, target=target, reason=reason)
+
+    def _revoke_unlocked(
         self,
         caller: PrincipalCtx,
         *,

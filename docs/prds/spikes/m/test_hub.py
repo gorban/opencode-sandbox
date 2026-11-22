@@ -116,6 +116,7 @@ class InMemoryRegistryStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.sandboxes: dict[str, SandboxRecord] = {}
+        self.budgets: dict[tuple[str, str], SubtreeBudget] = {}
         self.threads: dict[tuple[str, str, str], ThreadRecord] = {}
         self.edges: dict[str, RoutingEdge] = {}
         self.tombstones: set[tuple[str, int]] = set()
@@ -451,8 +452,53 @@ class InMemoryRegistryStore:
             row["status"] = _STATUS_CANCELLED
             row["detail"] = reason
 
+    def save_sandbox_budget(
+        self, sandbox_addr: str, incarnation_id: str, budget: SubtreeBudget
+    ) -> None:
+        with self._lock:
+            self.budgets[(sandbox_addr, incarnation_id)] = budget
+
+    def get_sandbox_budget(
+        self, sandbox_addr: str, incarnation_id: str
+    ) -> SubtreeBudget | None:
+        with self._lock:
+            return self.budgets.get((sandbox_addr, incarnation_id))
+
+    def list_committed_artifact_manifests(self) -> list[dict[str, Any]]:
+        with self._lock:
+            out: list[dict[str, Any]] = []
+            for msg_id, env in self.envelopes.items():
+                if not env.artifact_refs:
+                    continue
+                ob = self.outbox.get(msg_id)
+                status = ob["status"] if ob is not None else None
+                if status == _STATUS_CANCELLED:
+                    continue
+                out.append(
+                    {
+                        "msg_id": msg_id,
+                        "edge_id": env.edge_id,
+                        "dst_addr": env.dst_addr,
+                        "dst_incarnation": env.dst_incarnation,
+                        "outbox_status": status,
+                        "artifact_refs": [
+                            {
+                                "blob_sha256": r.blob_sha256,
+                                "size_bytes": r.size_bytes,
+                                "media_type": r.media_type,
+                            }
+                            for r in env.artifact_refs
+                        ],
+                    }
+                )
+            return out
+
     def record_stream_event(
-        self, event: StreamEvent, *, tui_enter_token: str | None = None
+        self,
+        event: StreamEvent,
+        *,
+        tui_enter_token: str | None = None,
+        dispatch_msg_id: str | None = None,
     ) -> dict[str, Any]:
         _ = tui_enter_token
         with self._lock:
@@ -465,6 +511,7 @@ class InMemoryRegistryStore:
                 "incarnation_id": event.incarnation_id,
                 "thread_id": event.thread_id,
                 "message_id": event.message_id,
+                "dispatch_msg_id": dispatch_msg_id,
                 "text": event.text,
                 "file_path": event.file_path,
                 "detail": dict(event.detail),
@@ -844,6 +891,7 @@ class TestCoordHub(unittest.TestCase):
             PrincipalCtx(CoordRole.JOB, "job-a", sandbox_addr=_TARGET_ALPHA, incarnation_id=None)
 
     def test_subtree_budget_attenuation_global_cap_and_brief_validation(self) -> None:
+        self.hub.close()
         tiny_budget = SubtreeBudget(max_depth_remaining=1, max_children=1, max_total_sandboxes=2)
         hub = CoordHub(self.registry, self.transport, self.state_dir, root_budget=tiny_budget)
         self.addCleanup(hub.close)
@@ -956,10 +1004,13 @@ class TestCoordHub(unittest.TestCase):
         # 1. Queue turn, revoke BEFORE handoff, recreate hub with SAME incarnation -> ZERO deliveries.
         self.hub.send(self.operator, target=_TARGET_ALPHA, body_text="must not deliver")
         self.hub.revoke(self.operator, target=_TARGET_ALPHA, reason="pre_handoff_revoke")
+        self.hub.close()
         restarted_hub = CoordHub(self.registry, self.transport, self.state_dir)
         self.addCleanup(restarted_hub.close)
+        self.assertFalse(restarted_hub.is_degraded)
         self.assertEqual(restarted_hub.dispatch_once(), 0)
         self.assertEqual(len(self.transport.dispatched_turns(_TARGET_ALPHA)), 0)
+        self.hub = restarted_hub
 
         # 2. Handoff winning race: handoff succeeds before revoke -> active stream aborted, no duplicate.
         self.hub.grant_edge(
@@ -1245,6 +1296,7 @@ class TestCoordHub(unittest.TestCase):
         small_spool.abort_reservation(resv)
 
     def test_out_of_band_controller_revoke_and_no_fence_deadlock(self) -> None:
+        self.hub.close()
         controller, ctrl_op, req_id, lease = _build_controller_and_lease()
         hub = CoordHub(
             self.registry,

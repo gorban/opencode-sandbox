@@ -62,6 +62,7 @@ from oc_coord_contract import (  # noqa: E402
     RoutingEdge,
     SandboxRecord,
     StreamEvent,
+    SubtreeBudget,
     ThreadRecord,
     TrustClass,
     canonicalize_body_text,
@@ -306,6 +307,14 @@ _SCHEMA_SQL: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS sandbox_budgets (
+        sandbox_addr TEXT PRIMARY KEY,
+        incarnation_id TEXT NOT NULL,
+        budget_json TEXT NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS stream_events (
         seq INTEGER PRIMARY KEY,
         event_type TEXT NOT NULL,
@@ -314,6 +323,7 @@ _SCHEMA_SQL: tuple[str, ...] = (
         thread_id TEXT NOT NULL,
         seq_hint INTEGER NOT NULL DEFAULT 0,
         message_id TEXT,
+        dispatch_msg_id TEXT,
         text TEXT NOT NULL DEFAULT '',
         file_path TEXT,
         detail_json TEXT NOT NULL DEFAULT '{}',
@@ -628,6 +638,7 @@ def _row_to_stream_event_dict(row: Mapping[str, Any]) -> dict[str, Any]:
         "thread_id": row["thread_id"],
         "seq_hint": int(row["seq_hint"]),
         "message_id": row["message_id"],
+        "dispatch_msg_id": row.get("dispatch_msg_id"),
         "text": row["text"],
         "file_path": row["file_path"],
         "detail": json.loads(row["detail_json"]),
@@ -773,6 +784,12 @@ class CoordRegistry:
                     try:
                         for stmt in _SCHEMA_SQL:
                             conn.execute(stmt)
+                        st_cols = {
+                            r["name"]
+                            for r in conn.execute("PRAGMA table_info(stream_events)").fetchall()
+                        }
+                        if "dispatch_msg_id" not in st_cols:
+                            conn.execute("ALTER TABLE stream_events ADD COLUMN dispatch_msg_id TEXT")
                         conn.execute("COMMIT")
                     except BaseException:
                         conn.execute("ROLLBACK")
@@ -2092,12 +2109,88 @@ class CoordRegistry:
         if event.file_path is not None:
             validate_sandbox_rel_path(event.file_path)
 
+    def save_sandbox_budget(
+        self, sandbox_addr: str, incarnation_id: str, budget: SubtreeBudget
+    ) -> None:
+        clean_addr = parse_local_target(sandbox_addr).canonical
+        validate_opaque_token(incarnation_id, "incarnation_id")
+        payload = {
+            "max_depth_remaining": budget.max_depth_remaining,
+            "max_children": budget.max_children,
+            "max_total_sandboxes": budget.max_total_sandboxes,
+            "allowed_workers": sorted(budget.allowed_workers),
+            "allowed_sandbox_types": sorted(budget.allowed_sandbox_types),
+            "allowed_models": (
+                None if budget.allowed_models is None else sorted(budget.allowed_models)
+            ),
+            "allowed_variants": (
+                None if budget.allowed_variants is None else sorted(budget.allowed_variants)
+            ),
+            "allowed_broker_routes": sorted(budget.allowed_broker_routes),
+            "max_security_profile": budget.max_security_profile,
+        }
+        now = time.time()
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO sandbox_budgets (sandbox_addr, incarnation_id, budget_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(sandbox_addr) DO UPDATE SET
+                    incarnation_id = excluded.incarnation_id,
+                    budget_json = excluded.budget_json,
+                    updated_at = excluded.updated_at
+                """,
+                (clean_addr, incarnation_id, canonical_json(payload), now),
+            )
+
+    def get_sandbox_budget(
+        self, sandbox_addr: str, incarnation_id: str
+    ) -> SubtreeBudget | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT budget_json FROM sandbox_budgets
+                WHERE sandbox_addr = ? AND incarnation_id = ?
+                """,
+                (sandbox_addr, incarnation_id),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            raw = json.loads(row["budget_json"])
+            return SubtreeBudget(
+                max_depth_remaining=int(raw["max_depth_remaining"]),
+                max_children=int(raw["max_children"]),
+                max_total_sandboxes=int(raw["max_total_sandboxes"]),
+                allowed_workers=frozenset(raw["allowed_workers"]),
+                allowed_sandbox_types=frozenset(raw["allowed_sandbox_types"]),
+                allowed_models=(
+                    None if raw["allowed_models"] is None else frozenset(raw["allowed_models"])
+                ),
+                allowed_variants=(
+                    None if raw["allowed_variants"] is None else frozenset(raw["allowed_variants"])
+                ),
+                allowed_broker_routes=frozenset(raw["allowed_broker_routes"]),
+                max_security_profile=str(raw["max_security_profile"]),
+            )
+        except (KeyError, TypeError, ValueError, CoordValidationError):
+            return None
+
     def record_stream_event(
-        self, event: StreamEvent, *, tui_enter_token: str | None = None
+        self,
+        event: StreamEvent,
+        *,
+        tui_enter_token: str | None = None,
+        dispatch_msg_id: str | None = None,
     ) -> dict[str, Any]:
         self._validate_stream_event_fields(event)
         clean_detail, detail_json = _sanitize_stream_detail(event.detail)
         safe_message_id = _sanitize_stream_message_id(event.message_id)
+        safe_dispatch_id = (
+            validate_opaque_token(dispatch_msg_id, "dispatch_msg_id")
+            if dispatch_msg_id is not None
+            else None
+        )
         now = _safe_timestamp(event.created_at)
         with self._tx() as conn:
             badge: ProvenanceBadge | None = None
@@ -2109,8 +2202,9 @@ class CoordRegistry:
                 """
                 INSERT INTO stream_events (
                     seq, event_type, sandbox_addr, incarnation_id, thread_id,
-                    seq_hint, message_id, text, file_path, detail_json, badge, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    seq_hint, message_id, dispatch_msg_id, text, file_path,
+                    detail_json, badge, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     seq,
@@ -2120,6 +2214,7 @@ class CoordRegistry:
                     event.thread_id,
                     event.seq_hint,
                     safe_message_id,
+                    safe_dispatch_id,
                     event.text,
                     event.file_path,
                     detail_json,
@@ -2152,6 +2247,7 @@ class CoordRegistry:
                 "thread_id": event.thread_id,
                 "seq_hint": event.seq_hint,
                 "message_id": safe_message_id,
+                "dispatch_msg_id": safe_dispatch_id,
                 "text": event.text,
                 "file_path": event.file_path,
                 "detail": clean_detail,
@@ -2201,12 +2297,51 @@ class CoordRegistry:
             return [], []
         excluded = sorted(exclude_trust_classes)
         ph = ",".join("?" for _ in excluded)
-        clauses = [f"(e.trust_class IS NULL OR e.trust_class NOT IN ({ph}))"]
-        params: list[Any] = list(excluded)
+        clauses = [
+            "s.dispatch_msg_id IS NOT NULL",
+            "ed.msg_id IS NOT NULL",
+            f"ed.trust_class NOT IN ({ph})",
+            f"(em.trust_class IS NULL OR em.trust_class NOT IN ({ph}))",
+        ]
+        params: list[Any] = list(excluded) + list(excluded)
         if TrustClass.OPERATOR_DIRECTIVE.value in exclude_trust_classes:
             clauses.append("(s.badge IS NULL OR s.badge != ?)")
             params.append(ProvenanceBadge.OPERATOR.value)
         return clauses, params
+
+    def list_committed_artifact_manifests(self) -> list[dict[str, Any]]:
+        """Return all non-cancelled envelopes carrying artifact_refs for startup reconciliation."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT e.msg_id, e.edge_id, e.dst_addr, e.dst_incarnation,
+                       e.artifact_refs_json, o.status AS outbox_status
+                FROM event_log e
+                LEFT JOIN outbox o ON o.msg_id = e.msg_id
+                WHERE e.artifact_refs_json != '[]'
+                  AND (o.status IS NULL OR o.status != ?)
+                ORDER BY e.seq ASC
+                """,
+                (_STATUS_CANCELLED,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                refs = json.loads(row["artifact_refs_json"] or "[]")
+            except ValueError:
+                refs = []
+            if refs:
+                out.append(
+                    {
+                        "msg_id": row["msg_id"],
+                        "edge_id": row["edge_id"],
+                        "dst_addr": row["dst_addr"],
+                        "dst_incarnation": row["dst_incarnation"],
+                        "outbox_status": row["outbox_status"],
+                        "artifact_refs": refs,
+                    }
+                )
+        return out
 
     def has_committed_artifact(
         self, sandbox_addr: str, incarnation_id: str, blob_sha256: str
@@ -2289,7 +2424,8 @@ class CoordRegistry:
             st_rows = self._conn.execute(
                 f"""
                 SELECT s.* FROM stream_events s
-                LEFT JOIN event_log e ON e.msg_id = s.message_id
+                LEFT JOIN event_log ed ON ed.msg_id = s.dispatch_msg_id
+                LEFT JOIN event_log em ON em.msg_id = s.message_id
                 WHERE {' AND '.join(st_clauses)}
                 ORDER BY s.seq ASC LIMIT ?
                 """,

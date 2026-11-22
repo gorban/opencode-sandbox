@@ -22,7 +22,7 @@ from test_prd_m_coord_e2e import (  # noqa: E402
     _E2eFixtureAdapter,
     _create_controller_lease,
 )
-from oc_broker_common import BrokerLease  # noqa: E402
+from oc_broker_common import BrokerError, BrokerLease  # noqa: E402
 from oc_controller import (  # noqa: E402
     Capability,
     Controller,
@@ -1158,6 +1158,464 @@ class TestGate2Round2Regressions(CoordTestBase):
         hub.revoke(orch_ctx, target="child-1", reason="stop-child-1")
         with self.assertRaises(RevokedError):
             hub.grant_edge(orch_ctx, src_actor="child-1", dst_addr="child-2")
+
+
+class TestReciprocalReviewRegressions(CoordTestBase):
+    """Regressions for every finding from the PR #50 reciprocal security review."""
+
+    def _open_pair(
+        self,
+        *,
+        controller: Controller | None = None,
+        controller_actor: Principal | None = None,
+        root_budget: SubtreeBudget | None = None,
+    ) -> tuple[CoordRegistry, FakeWorkerTransport, CoordHub]:
+        reg = CoordRegistry(self.state_dir, sandbox_root=self.sandbox_root)
+        transport = FakeWorkerTransport()
+        hub = CoordHub(
+            reg,
+            transport,
+            self.state_dir,
+            controller=controller,
+            controller_actor=controller_actor,
+            root_budget=root_budget,
+            sandbox_root=self.sandbox_root,
+            watchdog_interval_s=0.02,
+        )
+        return reg, transport, hub
+
+    @staticmethod
+    def _reg_sb(
+        hub: CoordHub,
+        caller: PrincipalCtx,
+        name: str,
+        inc: str,
+        **kwargs: Any,
+    ) -> Any:
+        return hub.register_sandbox(
+            caller,
+            name=name,
+            incarnation_id=inc,
+            project_id="p1",
+            project_name="P1",
+            branch="main",
+            task_brief=f"Task {name}",
+            **kwargs,
+        )
+
+    def test_rec_p1_1_narrowed_parent_budget_persists_and_missing_budget_fails_closed(
+        self,
+    ) -> None:
+        root_b = SubtreeBudget(allowed_sandbox_types=frozenset({"default", "reviewer"}))
+        narrow = SubtreeBudget(
+            max_depth_remaining=1,
+            max_children=1,
+            max_total_sandboxes=4,
+            allowed_sandbox_types=frozenset({"reviewer"}),
+        )
+        reg1, transport, hub1 = self._open_pair(root_budget=root_b)
+        try:
+            self._reg_sb(hub1, _OP, "sub-orch", "inc_so1", child_budget=narrow)
+        finally:
+            hub1.close()
+            reg1.close()
+
+        orch_ctx = PrincipalCtx(
+            CoordRole.ORCHESTRATOR, "sub-orch", sandbox_addr="sub-orch", incarnation_id="inc_so1"
+        )
+        reg2, _t2, hub2 = self._open_pair(root_budget=root_b)
+        try:
+            # Must NOT fall back to root_budget (which permits "default" and max_children=8)
+            with self.assertRaises(CoordPolicyError):
+                self._reg_sb(hub2, orch_ctx, "c-default", "inc_c0", parent_addr="sub-orch")
+            self._reg_sb(
+                hub2,
+                orch_ctx,
+                "c-rev1",
+                "inc_c1",
+                sandbox_type="reviewer",
+                parent_addr="sub-orch",
+            )
+            with self.assertRaises(CoordPolicyError):
+                self._reg_sb(
+                    hub2,
+                    orch_ctx,
+                    "c-rev2",
+                    "inc_c2",
+                    sandbox_type="reviewer",
+                    parent_addr="sub-orch",
+                )
+            # Delete persisted budget row to simulate missing budget -> fail closed
+            with reg2._tx() as conn:
+                conn.execute("DELETE FROM sandbox_budgets WHERE sandbox_addr = ?", ("sub-orch",))
+        finally:
+            hub2.close()
+            reg2.close()
+
+        reg3, _t3, hub3 = self._open_pair(root_budget=root_b)
+        try:
+            with self.assertRaises(CoordPolicyError):
+                self._reg_sb(
+                    hub3,
+                    orch_ctx,
+                    "c-after-del",
+                    "inc_c3",
+                    sandbox_type="reviewer",
+                    parent_addr="sub-orch",
+                )
+        finally:
+            hub3.close()
+            reg3.close()
+        _ = transport
+
+    def test_rec_p1_2_peer_wait_uses_host_dispatch_attribution_for_unmatched_events(
+        self,
+    ) -> None:
+        reg, transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "peer-a", "inc_a1")
+        self._reg_sb(hub, _OP, "target-b", "inc_b1")
+        hub.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="target-b")
+        hub.grant_edge(_OP, src_actor="peer-a", dst_addr="target-b")
+        peer_a = PrincipalCtx(
+            CoordRole.JOB, "peer-a", sandbox_addr="peer-a", incarnation_id="inc_a1"
+        )
+
+        # Malicious worker emits null and spoofed message_id during an OPERATOR turn
+        transport.queue_script(
+            "target-b",
+            TurnScript(
+                hostile_raw_events=(
+                    StreamEvent("text_delta", "target-b", "inc_b1", _THREAD_MAIN, message_id=None, text="OP_SECRET_NULL"),
+                    StreamEvent(
+                        "text_delta",
+                        "target-b",
+                        "inc_b1",
+                        _THREAD_MAIN,
+                        message_id="msg_unmatched_spoof",
+                        text="OP_SECRET_UNMATCHED",
+                    ),
+                )
+            ),
+        )
+        hub.send(_OP, target="target-b", body_text="Secret operator directive")
+        hub.dispatch_once()
+
+        peer_wait_op = hub.wait(peer_a, targets=["target-b"], since_seq=0, timeout_s=0.05)
+        leaked_texts = [ev.get("text", "") for ev in peer_wait_op["events"]]
+        self.assertNotIn("OP_SECRET_NULL", leaked_texts)
+        self.assertNotIn("OP_SECRET_UNMATCHED", leaked_texts)
+
+        # Peer-dispatched turn with worker message_id=None IS visible via host dispatch_msg_id
+        transport.queue_script(
+            "target-b",
+            TurnScript(
+                hostile_raw_events=(
+                    StreamEvent("text_delta", "target-b", "inc_b1", _THREAD_MAIN, message_id=None, text="PEER_OK_NULL"),
+                )
+            ),
+        )
+        hub.send(peer_a, target="target-b", body_text="Peer prompt")
+        hub.dispatch_once()
+
+        peer_wait_ok = hub.wait(peer_a, targets=["target-b"], since_seq=0, timeout_s=0.05)
+        visible_texts = [ev.get("text", "") for ev in peer_wait_ok["events"]]
+        self.assertIn("PEER_OK_NULL", visible_texts)
+
+    def test_rec_p1_3_read_and_wait_reauthorization_enforce_live_edge_and_controller_grants(
+        self,
+    ) -> None:
+        controller, ctrl_op, lease_sb, req_sb, req_edge = _make_dual_request_controller()
+        reg, _transport, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "peer-a", "inc_a1")
+        self._reg_sb(
+            hub,
+            _OP,
+            "target-b",
+            "inc_b1",
+            lease=lease_sb,
+            controller_request_id=req_sb,
+        )
+        hub.grant_edge(_OP, src_actor="peer-a", dst_addr="target-b", lease_request_id=req_edge)
+        peer_a = PrincipalCtx(
+            CoordRole.JOB, "peer-a", sandbox_addr="peer-a", incarnation_id="inc_a1"
+        )
+        self.assertIn("sandbox", hub.status(peer_a, target="target-b"))
+
+        # Revoke ONLY the edge's controller grant -> peer status() and wait() must fail closed
+        controller.revoke(ctrl_op, req_edge)
+        with self.assertRaises(RevokedError):
+            hub.status(peer_a, target="target-b")
+        with self.assertRaises(RevokedError):
+            hub.wait(peer_a, targets=["target-b"], since_seq=0, timeout_s=0.05)
+
+        # Revoke the target sandbox's controller grant -> operator wait() must also fail closed
+        controller.revoke(ctrl_op, req_sb)
+        with self.assertRaises(RevokedError):
+            hub.wait(_OP, targets=["target-b"], since_seq=0, timeout_s=0.05)
+
+    def test_rec_p1_4_direct_hub_revoke_terminates_lease_and_stale_watchdog_skips_replacement(
+        self,
+    ) -> None:
+        controller, ctrl_op, lease1, req1 = _make_controller_lease("sb-lease", "inc_1")
+        reg, _transport, hub = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-lease", "inc_1", lease=lease1, controller_request_id=req1)
+        self.assertTrue(lease1.is_active())
+
+        hub.revoke(_OP, target="sb-lease", reason="direct_hub_kill")
+        self.assertFalse(lease1.is_active())
+
+        # Register replacement with fresh lease; stale callback for old incarnation must not revoke it
+        lease_old = BrokerLease("job_old_inc")
+        lease_new = BrokerLease("job_new_inc")
+        self._reg_sb(hub, _OP, "sb-rot", "inc_old", lease=lease_old)
+        self._reg_sb(hub, _OP, "sb-rot", "inc_new", lease=lease_new)
+        self.assertFalse(lease_old.is_active())
+        self.assertTrue(lease_new.is_active())
+
+        hub._on_lease_revoked("sb-rot", "inc_old", lease_old)
+        time.sleep(0.05)
+        st = hub.status(_OP, target="sb-rot")
+        self.assertEqual(st["sandbox"]["status"], "running")
+        self.assertEqual(st["sandbox"]["incarnation_id"], "inc_new")
+        self.assertTrue(lease_new.is_active())
+
+    def test_rec_p1_5_lease_authority_derived_verified_and_ephemeral_fails_closed_after_restart(
+        self,
+    ) -> None:
+        controller, ctrl_op, lease_ctrl, req_ctrl = _make_controller_lease("sb-ctrl", "inc_c1")
+        lease_eph = BrokerLease("job_ephemeral_only")
+        reg1, _t1, hub1 = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        try:
+            # Mismatched controller_request_id vs lease._controller_request_id rejected
+            with self.assertRaises(CoordPolicyError):
+                self._reg_sb(
+                    hub1,
+                    _OP,
+                    "sb-bad",
+                    "inc_bad",
+                    lease=lease_ctrl,
+                    controller_request_id="req_different_id",
+                )
+            # Omit controller_request_id -> derived automatically from lease
+            rec_ctrl = self._reg_sb(hub1, _OP, "sb-ctrl", "inc_c1", lease=lease_ctrl)
+            self.assertEqual(rec_ctrl.controller_request_id, req_ctrl)
+            hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-ctrl")
+
+            # Ephemeral lease works before restart
+            rec_eph = self._reg_sb(hub1, _OP, "sb-eph", "inc_e1", lease=lease_eph)
+            self.assertIsNotNone(rec_eph.controller_request_id)
+            hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-eph")
+            hub1.send(_OP, target="sb-eph", body_text="Before restart ok")
+        finally:
+            hub1.close()
+            reg1.close()
+
+        controller.revoke(ctrl_op, req_ctrl)
+
+        reg2, _t2, hub2 = self._open_pair(controller=controller, controller_actor=ctrl_op)
+        try:
+            # Derived controller authority detects out-of-band revoke after restart
+            with self.assertRaises(RevokedError):
+                hub2.send(_OP, target="sb-ctrl", body_text="Must deny after controller revoke")
+            # Ephemeral lease has no recoverable controller authority -> fails closed after restart
+            with self.assertRaises(RevokedError):
+                hub2.send(_OP, target="sb-eph", body_text="Must deny ephemeral after restart")
+        finally:
+            hub2.close()
+            reg2.close()
+
+    def test_rec_p1_6_unclean_shutdown_fails_closed_until_operator_recovery(self) -> None:
+        reg1, _t1, hub1 = self._open_pair()
+        self._reg_sb(hub1, _OP, "sb-crash", "inc_1")
+        # Simulate crash / double-persistence failure: do NOT call hub1.close()!
+        reg1.close()
+
+        reg2, _t2, hub2 = self._open_pair()
+        try:
+            self.assertTrue(hub2.is_degraded)
+            with self.assertRaises(CoordPolicyError):
+                self._reg_sb(hub2, _OP, "sb-after-crash", "inc_2")
+            orch_caller = PrincipalCtx(CoordRole.ORCHESTRATOR, "orch-1")
+            with self.assertRaises(CoordAuthError):
+                hub2.confirm_recovery(orch_caller, reason="unauthorized")
+            hub2.confirm_recovery(_OP, reason="operator_verified")
+            self.assertFalse(hub2.is_degraded)
+        finally:
+            hub2.close()
+            reg2.close()
+
+        # After clean close(), next boot is healthy (not degraded)
+        reg3, _t3, hub3 = self._open_pair()
+        try:
+            self.assertFalse(hub3.is_degraded)
+        finally:
+            hub3.close()
+            reg3.close()
+
+    def test_rec_p2_7_startup_reconciles_missing_artifact_and_restores_edge_charges(self) -> None:
+        reg1, transport1, hub1 = self._open_pair()
+        blob_ok = b"diff --git a/a.py b/a.py\n+ok\n"
+        blob_lost = b"diff --git a/b.py b/b.py\n+lost\n"
+        try:
+            self._reg_sb(hub1, _OP, "sb-art", "inc_art1")
+            edge = hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-art")
+            hub1.send(_OP, target="sb-art", body_text="Good artifact", artifact_blobs=[blob_ok])
+            hub1.dispatch_once()
+            res_lost = hub1.send(
+                _OP, target="sb-art", body_text="Lost artifact", artifact_blobs=[blob_lost]
+            )
+            lost_msg_id = res_lost["msg_id"]
+            lost_env = reg1.get_envelope(lost_msg_id)
+            self.assertIsNotNone(lost_env)
+            lost_digest = lost_env.artifact_refs[0].blob_sha256
+            # Simulate crash leaving committed outbox row without published spool file
+            os.unlink(hub1.spool.spool_root / "inc_art1" / f"{lost_digest}.patch")
+        finally:
+            hub1.close()
+            reg1.close()
+        _ = transport1
+
+        reg2, transport2, hub2 = self._open_pair()
+        try:
+            # Missing-blob pending row must be cancelled during startup reconciliation before dispatch
+            self.assertEqual(hub2.dispatch_once(), 0)
+            self.assertEqual(transport2.dispatched_turns("sb-art"), [])
+            cancelled = reg2.list_outbox(statuses=("cancelled",))
+            self.assertTrue(any(r["msg_id"] == lost_msg_id for r in cancelled))
+            # Per-edge charges for the verified published blob must be restored on restart
+            self.assertEqual(hub2.spool._edge_published_count.get(edge.edge_id), 1)
+            self.assertEqual(hub2.spool._edge_published_bytes.get(edge.edge_id), len(blob_ok))
+        finally:
+            hub2.close()
+            reg2.close()
+
+    def test_rec_p2_8_operator_rpc_succeeds_after_job_saturates_uid_rate_limiter(self) -> None:
+        reg, _transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        self._reg_sb(hub, _OP, "sb-sat", "inc_sat1")
+        job_a = PrincipalCtx(
+            CoordRole.JOB, "job-sat", sandbox_addr="sb-sat", incarnation_id="inc_sat1"
+        )
+        sock_path = self.sock_dir / "sat.sock"
+        rpc = CoordUdsRpcServer(
+            hub,
+            sock_path,
+            sandbox_root=self.sandbox_root,
+            token_principals={"tok_job": job_a, "tok_op": _OP},
+            rate_limit_max=2,
+            rate_limit_window=60.0,
+        )
+        rpc.start()
+        self.addCleanup(rpc.stop)
+
+        # Job floods 6 requests (exceeding uid_rate_max = 4)
+        job_resps = [
+            uds_rpc_call(sock_path, "coord.status", {"target": "sb-sat"}, auth_token="tok_job")
+            for _ in range(6)
+        ]
+        self.assertIn("result", job_resps[0])
+        self.assertEqual(job_resps[5]["error"]["message"], "rate_limited")
+
+        # Operator MUST still get its full reserved allowance (2 calls), then be bounded on 3rd
+        op1 = uds_rpc_call(sock_path, "coord.status", {"target": "sb-sat"}, auth_token="tok_op")
+        op2 = uds_rpc_call(sock_path, "coord.status", {"target": "sb-sat"}, auth_token="tok_op")
+        op3 = uds_rpc_call(sock_path, "coord.status", {"target": "sb-sat"}, auth_token="tok_op")
+        self.assertIn("result", op1)
+        self.assertIn("result", op2)
+        self.assertEqual(op3["error"]["message"], "principal_rate_limited")
+
+    def test_rec_p2_9_rpc_server_retains_listener_ownership_through_incomplete_stop(self) -> None:
+        reg, _transport, hub = self._open_pair()
+        self.addCleanup(reg.close)
+        self.addCleanup(hub.close)
+        sock_path = self.sock_dir / "retry_stop.sock"
+        rpc = CoordUdsRpcServer(hub, sock_path, sandbox_root=self.sandbox_root)
+        rpc.start()
+
+        real_stop = rpc._workers.stop
+        attempts = {"count": 0}
+
+        def _flaky_stop(listener: Any, bound: Any = None) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise BrokerError("Broker stop incomplete; workers are still running")
+            real_stop(listener, bound)
+
+        rpc._workers.stop = _flaky_stop  # type: ignore[method-assign]
+        with self.assertRaises(BrokerError):
+            rpc.stop()
+        # Ownership retained after failed stop; restart refused until stop succeeds
+        self.assertIsNotNone(rpc._listener)
+        self.assertIsNotNone(rpc._bound)
+        with self.assertRaises(BrokerError):
+            rpc.start()
+
+        # Retry stop succeeds and cleans up socket
+        rpc.stop()
+        self.assertIsNone(rpc._listener)
+        self.assertIsNone(rpc._bound)
+        self.assertFalse(sock_path.exists())
+
+    def test_rec_ui_auth_ws_ticket_pins_minting_origin_across_multi_origin_config(self) -> None:
+        host_b = "localhost:47110"
+        origin_b = f"http://{host_b}"
+        mgr = UiAuthManager(allowed_hosts=[_HOST, host_b], allowed_origins=[_ORIGIN, origin_b])
+        code = mgr.mint_bootstrap_code(actor_id="op1")
+        _rec, csrf, set_cookie = mgr.exchange_bootstrap_code(
+            code, host_header=_HOST, origin_header=_ORIGIN
+        )
+        session_id = set_cookie.split("=", 1)[1].split(";", 1)[0]
+
+        ticket_cross = mgr.mint_ws_ticket(
+            session_id,
+            host_header=_HOST,
+            origin_header=_ORIGIN,
+            csrf_token=csrf,
+            target_addr="sb-1",
+            incarnation_id="inc_1",
+            surface_kind="events",
+            mode="observe",
+        )
+        with self.assertRaises(UiAuthDeniedError):
+            mgr.consume_ws_ticket(
+                ticket_cross,
+                host_header=host_b,
+                origin_header=origin_b,
+                expected_target_addr="sb-1",
+                expected_incarnation_id="inc_1",
+                expected_surface_kind="events",
+                expected_mode="observe",
+                expected_session_id=session_id,
+            )
+
+        ticket_same = mgr.mint_ws_ticket(
+            session_id,
+            host_header=_HOST,
+            origin_header=_ORIGIN,
+            csrf_token=csrf,
+            target_addr="sb-1",
+            incarnation_id="inc_1",
+            surface_kind="events",
+            mode="observe",
+        )
+        scope = mgr.consume_ws_ticket(
+            ticket_same,
+            host_header=_HOST,
+            origin_header=_ORIGIN,
+            expected_target_addr="sb-1",
+            expected_incarnation_id="inc_1",
+            expected_surface_kind="events",
+            expected_mode="observe",
+            expected_session_id=session_id,
+        )
+        self.assertEqual(scope.minting_origin, _ORIGIN)
 
 
 if __name__ == "__main__":

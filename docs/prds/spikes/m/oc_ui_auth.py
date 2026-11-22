@@ -106,6 +106,7 @@ class WsTicketScope:
     incarnation_id: str
     surface_kind: str
     mode: str
+    minting_origin: str
     created_at: float
     expires_at: float
 
@@ -308,11 +309,12 @@ class UiAuthManager:
             raise UiAuthDeniedError(_ERR_INVALID_HOST)
         return host_header
 
-    def _require_valid_origin(self, origin_header: object, *, host_header: str) -> None:
+    def _require_valid_origin(self, origin_header: object, *, host_header: str) -> str:
         if type(origin_header) is not str or origin_header not in self._allowed_origins:
             raise UiAuthDeniedError(_ERR_INVALID_ORIGIN)
         if urlsplit(origin_header).netloc != host_header:
             raise UiAuthDeniedError(_ERR_INVALID_ORIGIN)
+        return origin_header
 
     def _purge_expired_locked(self, now: float) -> None:
         expired_codes = [k for k, v in self._pending_codes.items() if now >= v.expires_at]
@@ -514,7 +516,7 @@ class UiAuthManager:
     ) -> str:
         """Mint a single-use 256-bit WS ticket pinned to session + target + incarnation + surface + mode."""
         valid_host = self._require_valid_host(host_header)
-        self._require_valid_origin(origin_header, host_header=valid_host)
+        valid_origin = self._require_valid_origin(origin_header, host_header=valid_host)
         if type(csrf_token) is not str or not csrf_token:
             raise UiAuthDeniedError(_ERR_MISSING_CSRF)
         canon_target, clean_inc, clean_surface, clean_mode = _validate_ws_scope(
@@ -546,6 +548,7 @@ class UiAuthManager:
                 incarnation_id=clean_inc,
                 surface_kind=clean_surface,
                 mode=clean_mode,
+                minting_origin=valid_origin,
                 created_at=now,
                 expires_at=now + effective_ttl,
             )
@@ -562,12 +565,14 @@ class UiAuthManager:
         clean_inc: str,
         clean_surface: str,
         clean_mode: str,
+        valid_origin: str,
     ) -> None:
         matched = (
             hmac.compare_digest(scope.target_addr, canon_target)
             and hmac.compare_digest(scope.incarnation_id, clean_inc)
             and hmac.compare_digest(scope.surface_kind, clean_surface)
             and hmac.compare_digest(scope.mode, clean_mode)
+            and hmac.compare_digest(scope.minting_origin, valid_origin)
         )
         if not matched:
             raise UiAuthDeniedError("WebSocket ticket scope mismatch")
@@ -592,7 +597,7 @@ class UiAuthManager:
     ) -> WsTicketScope:
         """Atomically consume a single-use WS ticket after verifying Host, Origin, TTL, session, and scope pins."""
         valid_host = self._require_valid_host(host_header)
-        self._require_valid_origin(origin_header, host_header=valid_host)
+        valid_origin = self._require_valid_origin(origin_header, host_header=valid_host)
         canon_target, clean_inc, clean_surface, clean_mode = _validate_ws_scope(
             expected_target_addr, expected_incarnation_id, expected_surface_kind, expected_mode
         )
@@ -622,5 +627,6 @@ class UiAuthManager:
                 clean_inc=clean_inc,
                 clean_surface=clean_surface,
                 clean_mode=clean_mode,
+                valid_origin=valid_origin,
             )
             return scope
