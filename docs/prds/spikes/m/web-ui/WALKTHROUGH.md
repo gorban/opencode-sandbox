@@ -12,19 +12,25 @@ production launcher and Tauri are outside this slice.
 
 ## Static build and host boundary
 
-- Use Svelte 5 and SvelteKit 2 with `adapter-static`, fallback `200.html`, root-layout
+- Use Svelte 5 and SvelteKit 3 with `adapter-static`, fallback `200.html`, root-layout
   `ssr = false`, `inlineStyleThreshold = 0`, and `paths.relative = false` for
-  root-relative `/_app/` URLs. Ship just static assets. Link to the
+  root-relative `/_app/` URLs. Configure the adapter and paths in the SvelteKit Vite
+  plugin and use the `#lib` import alias. Ship just static assets. Link to the
   explicit UI paths `/dashboard/projects`, `/dashboard/sandboxes` and `/dashboard/threads`.
   The host redirects `/` to Projects. Keep selection in memory and choose the first available
   authorized item on direct navigation. Put only the generic view in history state and URLs.
   [Static adapter](https://svelte.dev/docs/kit/adapter-static) · [SPA fallback](https://svelte.dev/docs/kit/single-page-apps)
 - Proposed exact pins are Node 24.18.0 (lane-local mise), npm 11.16.0, Svelte 5.59.1,
-  SvelteKit 2.70.4, adapter-static 3.0.11, vite-plugin-svelte 7.3.1, Vite 8.3.8,
+  SvelteKit 3.4.0, adapter-static 4.0.1, vite-plugin-svelte 7.3.1, Vite 8.3.8,
   TypeScript 6.0.3 and svelte-check 4.7.8. Use Playwright 1.65.1 with its pinned Chromium
   and Lighthouse 13.6.0 for qualification. Commit the npm lockfile, use `npm ci`,
   and review the resolved dependency tree and applicable advisories at Gate 2. Build tools have no runtime role. Generated output, browser installations and
-  measurement reports stay out of Git.
+  measurement reports stay out of Git. SvelteKit 3.4.0 includes fixes for the two
+  remote-function advisories affecting 2.70.4. The build stays a client-only static SPA
+  with no Kit runtime server, remote functions, server endpoints, or form actions.
+  [SvelteKit 3 migration](https://svelte.dev/docs/kit/migrating-to-sveltekit-3) ·
+  [Form data advisory](https://github.com/advisories/GHSA-3r8g-jcqq-3p5j) ·
+  [Batch query advisory](https://github.com/advisories/GHSA-6cf5-gc4q-fm3x)
 - Decode the single generated HTML fallback as strict UTF-8. Require exactly one
   executable inline bootstrap and reject inline styles, event handlers,
   `<meta http-equiv>`, `<base>`, CR and NUL.
