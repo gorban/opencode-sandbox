@@ -2265,7 +2265,9 @@ class DurableWorkflowSupervisor:
         step_rec = self._enter_worker_under_gate(token, clock_provider)
 
         try:
-            work_result = self._tracker.run_admitted(token, worker_fn=worker_fn)
+            work_result = self._tracker.run_admitted(
+                token, worker_fn=worker_fn, journal_id=self._journal.journal_id
+            )
         except SimulatedSupervisorCrash:
             raise
         except Exception as exc:

@@ -4066,5 +4066,177 @@ class TestAdversarialRegressionsRound6(_RestartFixtureBase):
         verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
 
 
+class TestAdversarialRegressionsRound7(_RestartFixtureBase):
+    """Regressions for Round 6 review: run_admitted bound lineage & pristine first-binding."""
+
+    def test_run_admitted_requires_exact_bound_journal_id_before_consuming_attempt(
+        self,
+    ) -> None:
+        owner_jid = "jnl_owner_run_admitted_01"
+        foreign_jid = "jnl_foreign_run_admitted_02"
+        tracker = SyntheticEffectTracker()
+        tracker.attach_epoch(1, journal_id=owner_jid)
+        tok = StepLeaseToken(
+            run_id="run_ra_1",
+            step_id="se1",
+            attempt_no=1,
+            lease_epoch=1,
+            idempotency_key="idem_ra_1",
+        )
+        tracker.admit_attempt(tok, journal_id=owner_jid)
+
+        worker_calls = 0
+
+        def _worker(_t: StepLeaseToken) -> WorkerStepResult:
+            nonlocal worker_calls
+            worker_calls += 1
+            return WorkerStepResult("completed", _DIGEST_A)
+
+        # Omitted journal_id MUST fail closed before consuming attempt or calling worker.
+        with self.assertRaises(StaleEpochError):
+            tracker.run_admitted(tok, worker_fn=_worker)
+        self.assertEqual(worker_calls, 0)
+
+        # Foreign journal_id MUST fail closed before consuming attempt or calling worker.
+        with self.assertRaises(StaleEpochError):
+            tracker.run_admitted(tok, worker_fn=_worker, journal_id=foreign_jid)
+        self.assertEqual(worker_calls, 0)
+
+        # Exact owner journal_id succeeds ONCE and consumes the admitted attempt.
+        res = tracker.run_admitted(tok, worker_fn=_worker, journal_id=owner_jid)
+        self.assertEqual(res.outcome, "completed")
+        self.assertEqual(res.output_digest, _DIGEST_A)
+        self.assertEqual(worker_calls, 1)
+        self.assertEqual(tracker.count("run_ra_1", "se1"), 1)
+
+        with self.assertRaises(InvalidStepTransitionError):
+            tracker.run_admitted(tok, worker_fn=_worker, journal_id=owner_jid)
+        self.assertEqual(worker_calls, 1)
+
+    def test_used_standalone_tracker_cannot_be_adopted_by_journal_binding(
+        self,
+    ) -> None:
+        # 1. Pre-populate a standalone tracker with identical coordinates to a future journal step.
+        run_id = "run_adopt_1"
+        idem_1 = "idem_adopt_shared_1"
+        shared_tok = StepLeaseToken(
+            run_id=run_id,
+            step_id="se1",
+            attempt_no=1,
+            lease_epoch=1,
+            idempotency_key=idem_1,
+        )
+        standalone_applied = SyntheticEffectTracker()
+        standalone_applied.admit_attempt(shared_tok)
+        standalone_applied.run_admitted(
+            shared_tok,
+            worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+        )
+        standalone_rcpt = standalone_applied.issue_receipt(
+            token=shared_tok, current_epoch=1
+        )
+        self.assertEqual(standalone_rcpt.tracker_outcome, "effect_applied")
+
+        # 2. Inject that already-used standalone tracker into a journal supervisor.
+        sup, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=standalone_applied,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            self.assertIsNone(standalone_applied.bound_journal_id)
+            sup.journal.create_run(
+                self._make_run_request(
+                    run_id, (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+            leased = sup.journal.lease_step(
+                run_id=run_id,
+                step_id="se1",
+                clock=self.clock.advance(),
+                idempotency_key=idem_1,
+            )
+            self.assertEqual(leased, shared_tok)
+            sup.journal.fail_step(
+                FailStepRequest(
+                    token=leased,
+                    reason="worker_crash_uncertain",
+                    retryable=False,
+                    uncertain=True,
+                    clock=self.clock.advance(),
+                )
+            )
+            # Journal receipt MUST stay still_pending (never adopting standalone effect_applied).
+            journal_rcpt = sup.issue_tracker_receipt(token=leased, force_fence=True)
+            self.assertEqual(journal_rcpt.tracker_outcome, "still_pending")
+            self.assertFalse(journal_rcpt.attempt_fenced)
+            self.assertIsNone(journal_rcpt.output_digest)
+
+            # Reconciling COMPLETED using the standalone receipt MUST fail closed.
+            with self.assertRaises(ReconciliationEvidenceError):
+                sup.reconcile_step(
+                    ReconcileStepRequest(
+                        run_id=run_id,
+                        step_id="se1",
+                        expected_attempt_no=1,
+                        expected_epoch=1,
+                        reconciliation_key="rec_adopt_1",
+                        resolution=ReconcileResolution.COMPLETED,
+                        output_digest=_DIGEST_A,
+                        evidence_digest=standalone_rcpt.receipt_digest,
+                        reason="attempt_adopt_standalone_applied",
+                        clock=self.clock.advance(),
+                    ),
+                    tracker_receipt=standalone_rcpt,
+                )
+            # Standalone history remains intact for standalone queries.
+            standalone_after = standalone_applied.issue_receipt(
+                token=shared_tok, current_epoch=1
+            )
+            self.assertEqual(standalone_after.tracker_outcome, "effect_applied")
+        finally:
+            sup.close_clean(clock=self.clock.advance())
+
+        # 3. Also verify a standalone tracker with only epoch-1 attachment cannot certify no_effect.
+        dir_noeff = self.root / "adopt_no_effect"
+        dir_noeff.mkdir(mode=0o700)
+        standalone_obs = SyntheticEffectTracker()
+        standalone_obs.attach_epoch(1)
+        sup2, _ = DurableWorkflowSupervisor.start_or_recover(
+            dir_noeff,
+            clock=self.clock.advance(),
+            tracker=standalone_obs,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            self.assertIsNone(standalone_obs.bound_journal_id)
+            sup2.journal.create_run(
+                self._make_run_request(
+                    "run_adopt_2", (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+            tok2 = sup2.journal.lease_step(
+                run_id="run_adopt_2", step_id="se1", clock=self.clock.advance()
+            )
+            sup2.journal.fail_step(
+                FailStepRequest(
+                    token=tok2,
+                    reason="uncertain_no_adopt",
+                    retryable=False,
+                    uncertain=True,
+                    clock=self.clock.advance(),
+                )
+            )
+            rcpt2 = sup2.issue_tracker_receipt(token=tok2, force_fence=True)
+            self.assertEqual(rcpt2.tracker_outcome, "still_pending")
+            self.assertFalse(rcpt2.attempt_fenced)
+        finally:
+            sup2.close_clean(clock=self.clock.advance())
+
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+        verify_journal_replay_readonly(dir_noeff, sandbox_root=self.sandbox_root)
+
+
 if __name__ == "__main__":
     unittest.main()

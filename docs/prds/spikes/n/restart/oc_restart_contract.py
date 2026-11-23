@@ -1956,6 +1956,7 @@ class SyntheticEffectTracker:
         self._lock = threading.Lock()
         self._history_start_epoch = start_ep
         self._attached = False
+        self._standalone_used = False
         self._bound_journal_id: str | None = None
         self._observed_epochs: set[int] = set()
         self._fenced_before_epoch = start_ep
@@ -1994,6 +1995,29 @@ class SyntheticEffectTracker:
             return None
         return _wrap_clean_str(journal_id, KEY_JOURNAL_ID, max_bytes=128)
 
+    def _is_pristine_locked(self) -> bool:
+        return (
+            not self._standalone_used
+            and not self._attached
+            and not self._attempts
+            and not self._fenced_attempts
+            and not self._observed_epochs
+            and not self._exec_counts
+        )
+
+    def _accept_attach_locked(self, clean_jid: str | None) -> bool:
+        if clean_jid is None:
+            if self._bound_journal_id is not None:
+                return False
+            self._standalone_used = True
+            return True
+        if self._bound_journal_id is None:
+            if not self._is_pristine_locked():
+                return False
+            self._bound_journal_id = clean_jid
+            return True
+        return clean_jid == self._bound_journal_id
+
     def _journal_matches_locked(self, journal_id: str | None) -> bool:
         if self._bound_journal_id is None:
             return journal_id is None
@@ -2005,12 +2029,7 @@ class SyntheticEffectTracker:
         ep = validate_int64(supervisor_epoch, "supervisor_epoch", min_val=1)
         clean_jid = self._clean_journal_id(journal_id)
         with self._lock:
-            if clean_jid is not None:
-                if self._bound_journal_id is None:
-                    self._bound_journal_id = clean_jid
-                elif clean_jid != self._bound_journal_id:
-                    return
-            elif self._bound_journal_id is not None:
+            if not self._accept_attach_locked(clean_jid):
                 return
             self._fenced_before_epoch = max(self._fenced_before_epoch, ep)
             if not self._attached:
@@ -2025,6 +2044,8 @@ class SyntheticEffectTracker:
         with self._lock:
             if not self._journal_matches_locked(clean_jid):
                 return
+            if clean_jid is None:
+                self._standalone_used = True
             self._fenced_before_epoch = max(self._fenced_before_epoch, min_active_epoch)
 
     def fence_attempt(
@@ -2034,6 +2055,8 @@ class SyntheticEffectTracker:
         with self._lock:
             if not self._journal_matches_locked(clean_jid):
                 return
+            if clean_jid is None:
+                self._standalone_used = True
             self._fenced_attempts.add(self._key_for(token))
 
     def admit_attempt(
@@ -2044,6 +2067,8 @@ class SyntheticEffectTracker:
         with self._lock:
             if not self._journal_matches_locked(clean_jid):
                 raise StaleEpochError(ERR_STALE_EPOCH)
+            if clean_jid is None:
+                self._standalone_used = True
             if (
                 token.lease_epoch < self._fenced_before_epoch
                 or key in self._fenced_attempts
@@ -2059,9 +2084,15 @@ class SyntheticEffectTracker:
         token: StepLeaseToken,
         *,
         worker_fn: Callable[[StepLeaseToken], WorkerStepResult],
+        journal_id: str | None = None,
     ) -> WorkerStepResult:
         key = self._key_for(token)
+        clean_jid = self._clean_journal_id(journal_id)
         with self._lock:
+            if not self._journal_matches_locked(clean_jid):
+                raise StaleEpochError(ERR_STALE_EPOCH)
+            if clean_jid is None:
+                self._standalone_used = True
             rec = self._attempts.get(key)
             if rec is None or rec.status != "admitted":
                 raise InvalidStepTransitionError("attempt_not_admitted")
@@ -2113,6 +2144,8 @@ class SyntheticEffectTracker:
                 outcome: TrackerOutcome = OUTCOME_STILL_PENDING
                 out_digest: str | None = None
             else:
+                if clean_jid is None:
+                    self._standalone_used = True
                 if force_fence:
                     self._fenced_attempts.add(key)
                 fenced = (
