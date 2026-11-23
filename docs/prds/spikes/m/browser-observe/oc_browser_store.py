@@ -107,6 +107,7 @@ _ERR_MAX_ROTATIONS = "max_incarnation_rotations_exceeded"
 _ERR_INVALID_CLOCK = "invalid_monotonic_clock"
 _ERR_BUDGET_ENVELOPE = "response_budget_too_small_for_envelope"
 _ERR_BUDGET_ITEM = "response_budget_too_small_for_item"
+_ERR_WALL_CHANGED_AT_RELEASE = "wall_state_changed_during_release"
 _ERR_NON_MONOTONIC_NAV = "non_monotonic_nav_generation"
 _ERR_COMMITTED_FUTURE = "committed_at_in_future"
 _ERR_COMMITTED_NON_MONO = "committed_at_non_monotonic"
@@ -1393,42 +1394,61 @@ class BrowserProvenanceStore:
             and cur_fresh.stale_reason == tile.stale_reason
         )
 
-    def _enforce_wall_release_fence(
+    def _all_wall_tiles_valid_locked(
+        self, page: BrowserWallPage, *, include_disconnected: bool, now_release: float
+    ) -> bool:
+        return all(
+            self._wall_tile_matches_locked(
+                tile,
+                include_disconnected=include_disconnected,
+                now_release=now_release,
+            )
+            for tile in page.tiles
+        )
+
+    def _run_wall_pack_and_release_fence(
         self,
-        page: BrowserWallPage,
+        op_caller: PrincipalCtx,
         *,
         include_disconnected: bool,
         after_key: tuple[str, str] | None,
         scope_hash: str,
         limit: int,
-        max_response_bytes: int,
+        budget: int,
         session_echo: ReadSessionEcho | None,
     ) -> BrowserWallPage:
         with self._lock:
-            now_release = self._read_monotonic_clock()
-            all_valid = all(
-                self._wall_tile_matches_locked(
-                    tile,
-                    include_disconnected=include_disconnected,
-                    now_release=now_release,
-                )
-                for tile in page.tiles
+            candidates, observed_at = self._collect_wall_candidates_locked(
+                include_disconnected=include_disconnected, after_key=after_key
             )
-            if all_valid:
-                return page
-            candidates_now, _ = self._collect_wall_candidates_locked(
-                include_disconnected=include_disconnected,
-                after_key=after_key,
-                now=now_release,
-            )
-            return _pack_wall_page(
-                candidates_now,
+        for attempt in range(2):
+            page = _pack_wall_page(
+                candidates,
                 scope_hash=scope_hash,
                 limit=limit,
-                max_response_bytes=max_response_bytes,
-                observed_at=now_release,
+                max_response_bytes=budget,
+                observed_at=observed_at,
                 read_session=session_echo,
             )
+            if self._on_after_pack_before_release is not None:
+                self._on_after_pack_before_release()
+            self._check_authority_and_session(op_caller, session_echo)
+            with self._lock:
+                now_release = self._read_monotonic_clock()
+                if self._all_wall_tiles_valid_locked(
+                    page,
+                    include_disconnected=include_disconnected,
+                    now_release=now_release,
+                ):
+                    return page
+                if attempt == 1:
+                    raise CoordPolicyError(_ERR_WALL_CHANGED_AT_RELEASE)
+                candidates, observed_at = self._collect_wall_candidates_locked(
+                    include_disconnected=include_disconnected,
+                    after_key=after_key,
+                    now=now_release,
+                )
+        raise CoordPolicyError(_ERR_WALL_CHANGED_AT_RELEASE)
 
     def list_browser_wall(
         self,
@@ -1452,30 +1472,13 @@ class BrowserProvenanceStore:
         after_key = decode_wall_cursor(after_cursor, expected_scope_hash=scope_hash)
         session_echo = self._validate_session_args(read_session_id, session_generation)
         self._check_authority_and_session(op_caller, session_echo)
-
-        with self._lock:
-            candidates, observed_at = self._collect_wall_candidates_locked(
-                include_disconnected=include_disconnected, after_key=after_key
-            )
-
-        page = _pack_wall_page(
-            candidates,
-            scope_hash=scope_hash,
-            limit=clean_limit,
-            max_response_bytes=budget,
-            observed_at=observed_at,
-            read_session=session_echo,
-        )
-        if self._on_after_pack_before_release is not None:
-            self._on_after_pack_before_release()
-        self._check_authority_and_session(op_caller, session_echo)
-        return self._enforce_wall_release_fence(
-            page,
+        return self._run_wall_pack_and_release_fence(
+            op_caller,
             include_disconnected=include_disconnected,
             after_key=after_key,
             scope_hash=scope_hash,
             limit=clean_limit,
-            max_response_bytes=budget,
+            budget=budget,
             session_echo=session_echo,
         )
 

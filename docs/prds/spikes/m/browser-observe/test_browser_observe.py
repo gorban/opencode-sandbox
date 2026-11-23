@@ -855,6 +855,103 @@ class TestClockTtlAndPostPackBarriers(unittest.TestCase):
         self.assertTrue(page_ttl.tiles[0].frame_stale)
         self.assertEqual(page_ttl.tiles[0].stale_reason, STALE_TTL_EXPIRED)
 
+    def _make_second_pack_store(
+        self,
+        clock: _FakeClock,
+        *,
+        session_active: dict[str, bool],
+        pack_calls: dict[str, int],
+        on_second_pack: object,
+    ) -> BrowserProvenanceStore:
+        def _hook() -> None:
+            pack_calls["n"] += 1
+            if pack_calls["n"] == 1:
+                store.register_sandbox(
+                    _SB_FEAT_A, incarnation_id=_INC_1, browser_enabled=False
+                )
+            elif pack_calls["n"] == 2 and callable(on_second_pack):
+                on_second_pack()
+
+        store = BrowserProvenanceStore(
+            clock=clock,
+            max_frame_age_ms=5_000,
+            session_validator=lambda c, sid, gen: session_active["ok"],
+            on_after_pack_before_release=_hook,
+        )
+        png = _make_png(24, 24)
+        for sb in (_SB_FEAT_A, "feat-b"):
+            store.register_sandbox(sb, incarnation_id=_INC_1)
+            store.record_navigation(
+                sb, incarnation_id=_INC_1, surface_id=_SURF_MAIN,
+                capture_generation=1, nav_generation=1,
+                raw_url=f"https://{sb}.oc-sandbox.internal/app",
+                tls_verified=True, tls_state_evidence=TLS_EVIDENCE_SANDBOX_CA,
+                committed_at=100.0,
+            )
+            store.ingest_frame(
+                sb, incarnation_id=_INC_1, surface_id=_SURF_MAIN,
+                capture_generation=1, nav_generation=1, frame_seq=1,
+                media_type=_MEDIA_PNG, frame_bytes=png, captured_at=100.0,
+            )
+        return store
+
+    def test_list_browser_wall_second_pack_release_fence_and_revocation(self) -> None:
+        op = _operator()
+
+        # (1) Retire operator session during the SECOND pack -> RevokedError (zero data).
+        clock_1 = _FakeClock(100.0)
+        sess_1 = {"ok": True}
+        calls_1 = {"n": 0}
+        store_1 = self._make_second_pack_store(
+            clock_1,
+            session_active=sess_1,
+            pack_calls=calls_1,
+            on_second_pack=lambda: sess_1.__setitem__("ok", False),
+        )
+        with self.assertRaises(RevokedError):
+            store_1.list_browser_wall(
+                op, limit=2, read_session_id=_SESS_ID, session_generation=1
+            )
+        self.assertEqual(calls_1["n"], 2)
+
+        # (2) Advance clock past TTL during the SECOND pack -> CoordPolicyError fail-closed.
+        clock_2 = _FakeClock(104.999)
+        sess_2 = {"ok": True}
+        calls_2 = {"n": 0}
+        store_2 = self._make_second_pack_store(
+            clock_2,
+            session_active=sess_2,
+            pack_calls=calls_2,
+            on_second_pack=lambda: setattr(clock_2, "now", 105.0005),
+        )
+        with self.assertRaises(CoordPolicyError) as ctx_ttl:
+            store_2.list_browser_wall(
+                op, limit=2, read_session_id=_SESS_ID, session_generation=1
+            )
+        self.assertEqual(str(ctx_ttl.exception), "wall_state_changed_during_release")
+        self.assertEqual(calls_2["n"], 2)
+
+        # (3) Disable remaining tile during the SECOND pack -> CoordPolicyError fail-closed.
+        clock_3 = _FakeClock(100.0)
+        sess_3 = {"ok": True}
+        calls_3 = {"n": 0}
+        holder: list[BrowserProvenanceStore] = []
+        store_3 = self._make_second_pack_store(
+            clock_3,
+            session_active=sess_3,
+            pack_calls=calls_3,
+            on_second_pack=lambda: holder[0].register_sandbox(
+                "feat-b", incarnation_id=_INC_1, browser_enabled=False
+            ),
+        )
+        holder.append(store_3)
+        with self.assertRaises(CoordPolicyError) as ctx_dis:
+            store_3.list_browser_wall(
+                op, limit=2, read_session_id=_SESS_ID, session_generation=1
+            )
+        self.assertEqual(str(ctx_dis.exception), "wall_state_changed_during_release")
+        self.assertEqual(calls_3["n"], 2)
+
     def test_get_surface_snapshot_rejects_already_revoked_and_exhausted_incarnations(
         self,
     ) -> None:
