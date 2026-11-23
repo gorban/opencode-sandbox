@@ -1001,7 +1001,21 @@ class DurableWorkflowSupervisor:
             self._journal.verify_active_lease(token)
             # Sample clock AFTER blocking journal read so expiry during lock wait is caught!
             t_entry = clock_provider()
-            self._verify_live_run_authority(run_id, t_entry)
+            try:
+                self._verify_live_run_authority(run_id, t_entry)
+            except AuthorityError:
+                # Worker NEVER entered: definitively settle exact token in the same supervisor
+                # instead of stranding the journal row as 'leased'!
+                self._journal.fail_step(
+                    FailStepRequest(
+                        token=token,
+                        reason="authority_revoked_pre_entry",
+                        retryable=False,
+                        uncertain=False,
+                        clock=t_entry,
+                    )
+                )
+                raise
             self._tracker.admit_attempt(token)
 
         # 3. WORKER EXECUTION (outside _lifecycle_gate & outside SQLite write transaction):
@@ -1022,10 +1036,13 @@ class DurableWorkflowSupervisor:
 
         # 4. PHASE 2 (EXACT-TOKEN TERMINAL SETTLEMENT):
         #    The attempt ALREADY won _lifecycle_gate and executed under its fenced StepLeaseToken.
-        #    Settle its exact-token outcome in SQLite without stranding it as 'leased' even if
-        #    authority retired mid-execution (while forbidding retryable requeue on retired authority).
-        t_done = clock_provider()
+        #    - Completed outcomes settle atomically with the exact token without stranding as 'leased'.
+        #    - Retryable pure failures order authority verification AND durable requeue commit
+        #      together under self._lifecycle_gate (sampling a fresh clock AFTER acquiring the
+        #      guard!) so retirement winning the gate ALWAYS produces a terminal failure instead
+        #      of requeuing to 'pending'.
         if work_result.outcome == "completed":
+            t_done = clock_provider()
             ack = self._journal.complete_step(
                 CompleteStepRequest(
                     token=token,
@@ -1035,14 +1052,27 @@ class DurableWorkflowSupervisor:
             )
             return StepExecutionOutcome(token=token, ack=ack)
 
-        retryable = work_result.outcome == "failed_retryable"
-        if retryable and not self._is_live_run_authority_active(run_id, t_done):
-            retryable = False  # never requeue a revoked/expired run
+        if work_result.outcome == "failed_retryable":
+            with self._lifecycle_gate:
+                t_retry = clock_provider()
+                retryable = self._is_live_run_authority_active(run_id, t_retry)
+                ack = self._journal.fail_step(
+                    FailStepRequest(
+                        token=token,
+                        reason=work_result.reason,
+                        retryable=retryable,
+                        uncertain=False,
+                        clock=t_retry,
+                    )
+                )
+            return StepExecutionOutcome(token=token, ack=ack)
+
+        t_done = clock_provider()
         ack = self._journal.fail_step(
             FailStepRequest(
                 token=token,
                 reason=work_result.reason,
-                retryable=retryable,
+                retryable=False,
                 uncertain=(work_result.outcome == "failed_uncertain"),
                 clock=t_done,
             )
@@ -1139,23 +1169,34 @@ Engineering & maintainability constraints:
     step count after the transaction (with default `max_replay_events = MAX_REPLAY_EVENTS =
     50_000`; configurable `<= MAX_REPLAY_EVENTS` for boundary tests):
     1. **Ordinary workflow writes** (`create_run`, `lease_step`, `complete_step`, `fail_step`,
-       `cancel_run`, `reconcile_step(requeue_pending)`) reserve headroom for crash startup,
-       per-lease recovery fencing, one terminal reconciliation for EVERY leased or uncertain
-       obligation, and clean shutdown:
-       `reserved = 1 (supervisor_started) + L (recovery fences) + (L + U) (terminal reconciliations) + 1 (supervisor_stopped)`.
+       `cancel_run`, `reconcile_step(requeue_pending)`) reserve headroom for clean shutdown when
+       no obligations remain, OR for `clean close + next supervisor_started + L recovery fences +
+       (L + U) terminal reconciliations + final supervisor_stopped` whenever obligations exist
+       (`L + U > 0`):
+       - If `L + U == 0`: `reserved = 1 (supervisor_stopped)`.
+       - If `L + U > 0`: `reserved = 1 (close_clean) + 1 (next supervisor_started) + L (recovery fences) + (L + U) (terminal reconciliations) + 1 (final supervisor_stopped) = 3 + 2 * L + U`.
        Admit iff `last_event_seq + k + reserved <= max_replay_events`.
+       *(This strictly dominates BOTH crash recovery `2 + 2*L + U` AND clean-close-then-reopen
+       recovery `3 + 2*L + U`!)*
     2. **Terminal reconciliation** (`reconcile_step` with `resolution in {completed,
        failed_terminal, cancelled}`) discharges 1 existing uncertain obligation (`U_after = U_before - 1`):
-       admit iff `last_event_seq + 1 + L + U_after + 1 (supervisor_stopped) <= max_replay_events`
-       (guaranteed to fit using the headroom already reserved when the step was leased!).
+       - If `L + U_after == 0`: admit iff `last_event_seq + 1 + 1 (supervisor_stopped) <= max_replay_events`.
+       - If `L + U_after > 0`: admit iff `last_event_seq + 1 + (L + U_after) + 1 (supervisor_stopped) <= max_replay_events`
+         (always guaranteed to fit using the headroom already reserved when the step was leased!).
     3. **Writable boot (`open_and_recover`)** computes `prior_leased = len(leased_prior_steps)` and
        `resulting_uncertain = existing_uncertain + count(side_effecting in prior_leased)`, and
        admits iff `last_event_seq + 1 + prior_leased + resulting_uncertain + 1 <= max_replay_events`
        (otherwise rolls back cleanly with `RestartPolicyError("max_replay_events_exceeded")`,
        leaving the prior head untouched and readable via `verify_journal_replay_readonly()`).
-    4. **Clean shutdown (`close_clean`)** admits iff `last_event_seq + 1 <= max_replay_events`.
+    4. **Clean shutdown (`close_clean`)** preserves the next recovery + settlement + final-close
+       reserve whenever outstanding obligations (`L + U > 0`) exist:
+       - If `L + U == 0`: admit iff `last_event_seq + 1 <= max_replay_events`.
+       - If `L + U > 0`: admit iff `last_event_seq + 1 + (1 + L + (L + U) + 1) <= max_replay_events`
+         (otherwise refuses with `RestartPolicyError("max_replay_events_exceeded")` leaving a
+         recoverable dirty head).
   - Refusal rolls back cleanly with zero writes, guaranteeing every admitted lease can ALWAYS
-    complete `lease -> crash -> recovery -> terminal reconciliation -> close` within
+    complete BOTH `lease -> crash -> recovery -> terminal reconciliation -> close` AND
+    `lease -> clean close -> reopen -> recovery -> terminal reconciliation -> close` within
     `max_replay_events`!
 - All parameter-heavy operations use small frozen request dataclasses (`CreateRunRequest`,
   `CompleteStepRequest`, `FailStepRequest`, `ReconcileStepRequest`) keeping every function at
@@ -1244,26 +1285,33 @@ directories:
      (c) a **valid `AdmissionReceipt` paired with a changed dependency, altered `max_attempts`, or
      duplicated step** in `proposed_steps` ALL fail closed with `RestartPolicyError` and **ZERO
      journal writes** (`last_event_seq` and `head_hash` unchanged).
-   - **Both `_lifecycle_gate` orderings at worker entry:**
+   - **Both `_lifecycle_gate` orderings at worker entry & retry boundary:**
      1. *Retirement / cancellation wins first:* pauses via `on_after_lease_before_entry` after
         `lease_step()` commits, calls `revoke_run_authority()` (and in a sibling test
-        `cancel_run()`), then resumes -> asserts **0 worker entries** and **0 synthetic effects**.
+        `cancel_run()`), then resumes -> asserts **0 worker entries**, **0 synthetic effects**,
+        **settled terminal journal row (`failed_terminal` / `cancelled`, zero stranded `leased`
+        row!)**, and exact read-only replay parity in the same supervisor.
      2. *Worker entry wins first (mid-step revocation):* worker wins `_lifecycle_gate` and begins
         executing, authority is revoked during worker execution -> same supervisor commits
         exact-token `complete_step` (1 owned worker entry, step transitions to `completed` with
         matching `output_digest`, **0 stranded `leased` steps**) and refuses all subsequent
         `lease_step` dispatches on the revoked run with `AuthorityError`!
+     3. *Pure retry boundary vs. authority retirement:* pure step returns `failed_retryable` while
+        authority retires before `_lifecycle_gate` is acquired -> asserts the step settles cleanly
+        to `failed_terminal` (never requeuing to `pending`) with full replay parity.
    - Verifies cross-restart `AdmissionReceipt` reconstruction from durable `workflow_runs` and
      **revoked-run `reconcile_step` policy** (`requeue_pending` refused with `AuthorityError`,
      while terminal settlement `completed` / `cancelled` succeeds).
    - Rejects mutating `effect_kind` with `side_effecting=False`, cyclic `depends_on` DAGs,
      duplicate `step_id`, NUL/control/BiDi strings, `bool`-as-`int`, `NaN`/`Inf`, negative
      `monotonic_s`/`wall_s`, `ClockSnapshot` / `grant_generation` signed-64-bit overflow, and
-     **full-lifecycle `MAX_RUNS` / `max_replay_events` headroom** (driving a small-cap fixture
-     through `lease (last admissible batch) -> refusal of next write leaving head intact -> crash
-     -> open_and_recover() -> terminal reconcile_step() -> close_clean()`, then confirming an
-     exhausted writable reopen fails closed with `RestartPolicyError("max_replay_events_exceeded")`
-     leaving the prior head unchanged while `verify_journal_replay_readonly()` succeeds!).
+     **full-lifecycle `MAX_RUNS` / `max_replay_events` headroom** (driving small-cap fixtures
+     through BOTH (a) `lease (last admissible batch) -> refusal of next write leaving head intact
+     -> crash -> open_and_recover() -> terminal reconcile_step() -> close_clean()` AND (b) `lease
+     (last admissible batch) -> close_clean() -> open_and_recover() -> terminal reconcile_step()
+     -> close_clean()`, then confirming an exhausted writable reopen fails closed with
+     `RestartPolicyError("max_replay_events_exceeded")` leaving the prior head unchanged while
+     `verify_journal_replay_readonly()` succeeds!).
 2. **Crash BEFORE worker invocation (`AFTER_LEASE_COMMIT_BEFORE_WORKER`) & trusted-tracker `no_effect` evidence:**
    - **Pure/idempotent step (`side_effecting=False`):** Commits `leased` + reserves
      `idempotency_key` under epoch `1`, crashes before worker runs (`executions == 0`), restarts
