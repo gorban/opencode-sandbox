@@ -139,7 +139,7 @@ _HEADER_QUOTED_RE = re.compile(
     r"(?i)(?<![a-z\d_.-])"
     r"((?:proxy[_-]?)?authorization|set[_-]?cookie|cookie|auth[_-]?header|x[_-]?api[_-]?key)"
     r"([\"']?\s*[:=]\s*)"
-    r"(?:\"(?:\\.|[^\"\\])*(?:\"|\\?$)|'(?:\\.|[^'\\])*(?:'|\\?$))"
+    r"(?:\"(?:\\[\s\S]|[^\"\\])*(?:\"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$))"
 )
 _HEADER_LINE_RE = re.compile(
     r"(?i)(?<![a-z\d_.-])"
@@ -172,7 +172,7 @@ _KV_SECRET_RE = re.compile(
     r"|credential|awakeable[_-]?token[_-]?hash|private[_-]?key"
     r"|client[_-]?secret|secret[_-]?key|secret|token)"
     r"([\"']?\s*[:=]\s*)"
-    r"(?:\"(?:\\.|[^\"\\])*(?:\"|\\?$)|'(?:\\.|[^'\\])*(?:'|\\?$)|[^\s\"',;}{]+)"
+    r"(?:\"(?:\\[\s\S]|[^\"\\])*(?:\"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|[^\s\"',;}{]+)"
 )
 
 

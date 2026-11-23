@@ -434,6 +434,8 @@ def verify_regular_private_file_nofollow(
         )
     except ValueError as exc:
         raise CoordPolicyError(f"{label}{_SFX_UNREADABLE}") from exc
+    except OSError as exc:
+        raise CoordPolicyError(ERR_INBOX_UNREADABLE) from exc
 
 
 def verify_state_dir_and_db_readonly(

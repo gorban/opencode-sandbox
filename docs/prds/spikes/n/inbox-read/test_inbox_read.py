@@ -1782,8 +1782,7 @@ class TestExternalReviewRegressions(InboxReadTestBase):
         bad_dir = _make_private_dir(self.root, "sidecar_rev_state")
         bad_db = _init_inbox_db(bad_dir)
         wal_path = Path(f"{bad_db}-wal")
-        wal_path.write_bytes(b"")
-        os.chmod(wal_path, 0o600 | 0o044)
+        wal_path.symlink_to(bad_db)
         bad_svc = ReadOnlyInboxService(
             bad_dir,
             sandbox_root=self.sandbox_root,
@@ -1834,6 +1833,73 @@ class TestExternalReviewRegressions(InboxReadTestBase):
         with self.assertRaises(CoordValidationError) as ctx:
             self.svc.list_inbox_items(_OP, statuses=[oversize_status])
         self.assertEqual(str(ctx.exception), _ERR_UNSUPPORTED_STATUS)
+
+    def test_multiline_quoted_backslash_newline_secret_redacted_in_serialized_response(self) -> None:
+        hdr_summary = 'Header:\nAuthorization: "CANARY_HDR_L1\\\nCANARY_HDR_L2"\nDone'
+        kv_summary = 'Config:\napi_key="CANARY_KV_L1\\\nCANARY_KV_L2"\nDone'
+        _insert_item(
+            self.db_path,
+            {_COL_REVIEW_ID: "rev_ml_hdr", _COL_SUMMARY_TEXT: hdr_summary},
+            artifact_id="art-ml-hdr",
+        )
+        _insert_item(
+            self.db_path,
+            {_COL_REVIEW_ID: "rev_ml_kv", _COL_SUMMARY_TEXT: kv_summary},
+            artifact_id="art-ml-kv",
+        )
+        for rev_id, canaries in (
+            ("rev_ml_hdr", ("CANARY_HDR_L1", "CANARY_HDR_L2")),
+            ("rev_ml_kv", ("CANARY_KV_L1", "CANARY_KV_L2")),
+        ):
+            detail = self.svc.get_inbox_item(_OP, review_id=rev_id)
+            serialized = serialize_inbox_json(detail)
+            self.assertTrue(detail.item.redaction_applied)
+            for canary in canaries:
+                self.assertNotIn(canary, serialized)
+
+    def test_file_checker_oserror_fstat_and_close_translated_and_fenced(self) -> None:
+        import errno  # noqa: PLC0415
+        from unittest import mock  # noqa: PLC0415
+
+        real_close = os.close
+
+        def _fstat_boom(_fd: int) -> os.stat_result:
+            raise OSError(errno.EIO, "fstat_io_error")
+
+        def _close_boom(fd: int) -> None:
+            real_close(fd)
+            raise OSError(errno.EIO, "close_io_error")
+
+        for patch_target, side_effect in (
+            ("os.fstat", _fstat_boom),
+            ("os.close", _close_boom),
+        ):
+            with (
+                mock.patch(patch_target, side_effect=side_effect),
+                self.assertRaises(CoordPolicyError) as ctx_active,
+            ):
+                self.svc.get_inbox_summary(_OP)
+            self.assertEqual(str(ctx_active.exception), ERR_INBOX_UNREADABLE)
+
+            calls = 0
+
+            def _retire_mid_call(_sid: str, _gen: int) -> bool:
+                nonlocal calls
+                calls += 1
+                return calls == 1
+
+            fenced_svc = ReadOnlyInboxService(
+                self.state_dir,
+                sandbox_root=self.sandbox_root,
+                session_validator=_retire_mid_call,
+            )
+            with (
+                mock.patch(patch_target, side_effect=side_effect),
+                self.assertRaises(RevokedError),
+            ):
+                fenced_svc.get_inbox_summary(
+                    _OP, read_session_id=_SESS_ID, session_generation=1
+                )
 
 
 if __name__ == "__main__":
