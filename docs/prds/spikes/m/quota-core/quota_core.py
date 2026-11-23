@@ -155,8 +155,8 @@ class QuotaCore:
 
     def _grant_matches(self, route: str, model: str) -> bool:
         return (
-            type(route) is str
-            and type(model) is str
+            valid_identifier(route)
+            and valid_identifier(model)
             and (route, model) == (self._grant.route, self._grant.model)
         )
 

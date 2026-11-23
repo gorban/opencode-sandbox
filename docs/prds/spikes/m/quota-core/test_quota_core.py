@@ -212,6 +212,19 @@ class QuotaCoreTest(unittest.TestCase):
                 self.assertEqual(core.accounting().admitted_ids, 0)
         self.assertTrue(self.reserve())
 
+    def test_reserve_rejects_malformed_configured_route_or_model(self):
+        for field in ("route", "model"):
+            with self.subTest(field=field):
+                malformed = replace(GRANT, **{field: getattr(GRANT, field) + " "})
+                core = QuotaCore(lambda: self.now, malformed)
+                self.assertFalse(core.reserve("request", malformed.route, malformed.model))
+                self.assertFalse(core.mark_may_have_sent("request"))
+                self.assertEqual(core.accounting().admitted_ids, 0)
+                self.assertIsNone(core.accounting().active)
+
+        self.reserve_and_mark()
+        self.assertTrue(self.core.settle(self.settlement()))
+
     def test_invalid_budget_does_not_consume_a_slot(self):
         for invalid in (None, True, -1, 10.0):
             with self.subTest(invalid=invalid):
