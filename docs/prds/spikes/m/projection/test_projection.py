@@ -1827,6 +1827,17 @@ class TestGate2AdversarialRegressions(ProjectionBaseTest):
 
         svc = self._new_service()
         page = svc.get_thread_events(_OP_CALLER, target="actor-a", thread_id=_DEFAULT_THREAD)
+        env = [e for e in page.events if e.source == SOURCE_EVENT_LOG][0]
+        self.assertEqual(env.raw_badge, ProvenanceBadge.OPERATOR.value)
+        self.assertEqual(
+            env.effective_badge, ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED.value
+        )
+        self.assertEqual(env.authority_rank, 0)
+        self.assertIsNone(env.verified_actor)
+        self.assertTrue(env.untrusted_content)
+        self.assertTrue(env.provenance_anomaly)
+        self.assertTrue(env.malformed_metadata)
+
         st = [e for e in page.events if e.source == SOURCE_STREAM_EVENT][0]
         self.assertEqual(
             st.effective_badge, ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED.value
@@ -2176,19 +2187,87 @@ class TestGate2AdversarialRegressions(ProjectionBaseTest):
         self.assertEqual(len(mb.entries), 1)
         self.assertIsNone(mb.entries[0].src_sandbox_status)
 
-        # Relative state_dir traversing a user symlink ancestor must be rejected!
+        # Relative state_dir traversing a user symlink followed by '..' must fail BEFORE SQLite opens!
         sym_rel = self.root / "sym_rel"
-        os.symlink(self.root, sym_rel)
+        os.symlink(self.state_dir, sym_rel)
         orig_cwd = os.getcwd()
         try:
             os.chdir(self.root)
             rel_svc = ReadOnlyProjectionService(
-                Path("sym_rel/state"), sandbox_root=self.sandbox_root
+                Path("sym_rel/../state"), sandbox_root=self.sandbox_root
             )
-            with self.assertRaisesRegex(CoordPolicyError, "symlink_ancestor_rejected"):
-                rel_svc.get_workspace_tree(_OP_CALLER)
+            with mock.patch(_PATCH_DB_CONNECT) as mock_connect:
+                with self.assertRaisesRegex(CoordPolicyError, "symlink_ancestor_rejected"):
+                    rel_svc.get_workspace_tree(_OP_CALLER)
+                mock_connect.assert_not_called()
         finally:
             os.chdir(orig_cwd)
+
+    def test_reg_rejected_hostile_message_id_cannot_verify_stream_badge(self) -> None:
+        hostile_mid = "msg\x1b[31m"
+        reg = self._new_registry()
+        _register_sample_sandbox(reg, name="mid-a")
+        body = "matching directive"
+        reg.close()
+
+        raw = _open_raw_rw(self.state_dir)
+        try:
+            sha = sha256_canonical_body(body)
+            raw.execute(
+                """
+                INSERT INTO event_log
+                (seq, msg_id, src_role, src_actor, src_incarnation, dst_addr, dst_thread_id,
+                 dst_incarnation, trust_class, msg_kind, body_text, body_sha256, edge_id,
+                 edge_turn_seq, in_reply_to, artifact_refs_json, created_at)
+                VALUES (950, ?, 'operator', 'operator:op-main', NULL, 'mid-a', 'main', ?,
+                        'OPERATOR_DIRECTIVE', 'prompt', ?, ?, 'edge-mid', 1, NULL, '[]', 1.0)
+                """,
+                (hostile_mid, _DEFAULT_INC, body, sha),
+            )
+            raw.execute(
+                """
+                INSERT INTO dispatch_receipts
+                (sandbox_addr, incarnation_id, session_id, message_id, body_sha256,
+                 badge, src_actor, trust_class, consumed_at)
+                VALUES ('mid-a', ?, 'main', ?, ?, 'Operator',
+                        'operator:op-main', 'OPERATOR_DIRECTIVE', 2.0)
+                """,
+                (_DEFAULT_INC, hostile_mid, sha),
+            )
+            raw.execute(
+                """
+                INSERT INTO stream_events
+                (seq, event_type, sandbox_addr, incarnation_id, thread_id, seq_hint,
+                 message_id, dispatch_msg_id, text, file_path, detail_json, badge, created_at)
+                VALUES (951, 'user_message', 'mid-a', ?, 'main', 1, ?, ?, ?, NULL, '{}', 'Operator', 3.0)
+                """,
+                (_DEFAULT_INC, hostile_mid, hostile_mid, body),
+            )
+        finally:
+            raw.close()
+
+        # Query stream row directly (event_log seq=950 has invalid primary msg_id, so cursor past 950)
+        scope = oc_projection.compute_scope_hash(
+            "events", target="mid-a", thread_id=_DEFAULT_THREAD, incarnation_id=_DEFAULT_INC
+        )
+        after_env = encode_cursor(
+            {"op": "events", "fh": scope, "seq": 950, "rank": 1, "inc": _DEFAULT_INC}
+        )
+        svc = self._new_service()
+        page = svc.get_thread_events(
+            _OP_CALLER, target="mid-a", thread_id=_DEFAULT_THREAD, after_cursor=after_env
+        )
+        self.assertEqual(len(page.events), 1)
+        st = page.events[0]
+        self.assertIsNone(st.message_id)
+        self.assertEqual(
+            st.effective_badge, ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED.value
+        )
+        self.assertEqual(st.authority_rank, 0)
+        self.assertIsNone(st.verified_actor)
+        self.assertTrue(st.untrusted_content)
+        self.assertTrue(st.provenance_anomaly)
+        self.assertEqual(st.anomaly_reason, "unbacked_host_badge")
 
 
 if __name__ == "__main__":

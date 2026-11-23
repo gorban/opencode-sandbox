@@ -608,14 +608,15 @@ def _verify_host_stream_provenance(
     execute_fn: Callable[[sqlite3.Connection, str, tuple[Any, ...], float], sqlite3.Cursor],
     check_deadline_fn: Callable[[float], int],
     raw_badge: str,
+    message_id: str | None,
     sandbox_addr: str,
     incarnation_id: str,
     thread_id: str,
     deadline: float,
 ) -> tuple[str, str | None, int, bool, bool, str | None]:
-    msg_id = row["message_id"]
-    if not isinstance(msg_id, str) or not msg_id:
+    if not _is_valid_actor_str(message_id):
         return _downgrade(ANOMALY_UNBACKED)
+    assert message_id is not None
 
     ev, receipts = _fetch_envelope_and_receipt(
         conn,
@@ -623,7 +624,7 @@ def _verify_host_stream_provenance(
         sandbox_addr=sandbox_addr,
         incarnation_id=incarnation_id,
         thread_id=thread_id,
-        msg_id=msg_id,
+        msg_id=message_id,
         deadline=deadline,
     )
     if ev is None or len(receipts) == 0:
@@ -649,7 +650,7 @@ def _verify_host_stream_provenance(
         sandbox_addr=sandbox_addr,
         incarnation_id=incarnation_id,
         thread_id=thread_id,
-        message_id=msg_id,
+        message_id=message_id,
         expected_sha256=rcpt_sha,
         deadline=deadline,
     )
@@ -673,6 +674,7 @@ def evaluate_stream_provenance(
     execute_fn: Callable[[sqlite3.Connection, str, tuple[Any, ...], float], sqlite3.Cursor],
     check_deadline_fn: Callable[[float], int],
     event_type: str,
+    message_id: str | None,
     sandbox_addr: str,
     incarnation_id: str,
     thread_id: str,
@@ -697,6 +699,7 @@ def evaluate_stream_provenance(
             execute_fn=execute_fn,
             check_deadline_fn=check_deadline_fn,
             raw_badge=raw_badge,
+            message_id=message_id,
             sandbox_addr=sandbox_addr,
             incarnation_id=incarnation_id,
             thread_id=thread_id,

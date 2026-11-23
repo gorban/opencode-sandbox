@@ -18,7 +18,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
-from typing import Any
+from typing import Any, cast
 
 _PROJECTION_DIR = Path(__file__).resolve().parent
 _SPIKE_M_DIR = _PROJECTION_DIR.parent
@@ -36,6 +36,7 @@ from oc_coord_contract import (  # noqa: E402
     CoordRole,
     CoordValidationError,
     PrincipalCtx,
+    ProvenanceBadge,
     RevokedError,
     TrustClass,
     validate_opaque_token,
@@ -1211,12 +1212,24 @@ def _project_event_log_row(
     )
     tc_val, bad_tc_chars = sanitize_optional_ref(row["trust_class"])
     tc_valid = tc_val in _TRUST_AUTHORITY_RANK
-    eff_badge = (
+    stored_badge = (
         _TRUST_CLASS_TO_BADGE[TrustClass(tc_val)].value if tc_valid and tc_val else None
     )
     actor_verified = src_actor if (tc_valid and src_actor is not None) else None
-    auth_rank = _TRUST_AUTHORITY_RANK.get(tc_val or "", 0) if actor_verified else 0
-    untrusted = (not actor_verified) or (tc_val not in _TRUSTED_TRUST_CLASSES)
+    if actor_verified is not None:
+        eff_badge: str | None = stored_badge
+        auth_rank = _TRUST_AUTHORITY_RANK.get(tc_val or "", 0)
+        untrusted = tc_val not in _TRUSTED_TRUST_CLASSES
+        prov_anomaly = False
+        anomaly_reason: str | None = None
+    else:
+        eff_badge = ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED.value
+        auth_rank = 0
+        untrusted = True
+        prov_anomaly = True
+        anomaly_reason = (
+            "invalid_envelope_actor" if tc_valid else "invalid_or_missing_badge"
+        )
     malformed = any(
         (
             bad_utf8,
@@ -1250,12 +1263,12 @@ def _project_event_log_row(
         verified_actor=actor_verified,
         trust_class=tc_val if tc_valid else None,
         msg_kind=msg_kind,
-        raw_badge=eff_badge,
+        raw_badge=stored_badge,
         effective_badge=eff_badge,
         authority_rank=auth_rank,
         untrusted_content=untrusted,
-        provenance_anomaly=False,
-        anomaly_reason=None,
+        provenance_anomaly=prov_anomaly,
+        anomaly_reason=anomaly_reason,
         text=decoded,
         text_truncated=suffix_uninspected,
         text_suffix_uninspected=suffix_uninspected,
@@ -1308,6 +1321,7 @@ def _project_stream_row(
             execute_fn=execute_bounded,
             check_deadline_fn=check_deadline_ms,
             event_type=ev_type,
+            message_id=msg_id,
             sandbox_addr=sandbox_addr,
             incarnation_id=incarnation_id,
             thread_id=thread_id,
@@ -1711,10 +1725,13 @@ class ReadOnlyProjectionService:
         )
         cur_health = health
         if shrunk is None and cur_health.unconfirmed_bindings:
-            cur_health = replace(
-                cur_health,
-                unconfirmed_bindings=_EMPTY_BINDINGS,
-                unconfirmed_bindings_truncated=True,
+            cur_health = cast(
+                WorkspaceHealth,
+                replace(
+                    cur_health,
+                    unconfirmed_bindings=_EMPTY_BINDINGS,
+                    unconfirmed_bindings_truncated=True,
+                ),
             )
             shrunk = _shrink_first_sandbox_threads(
                 node,
@@ -1923,12 +1940,15 @@ class ReadOnlyProjectionService:
         if fitted_health is not None:
             return _make(_EMPTY_EDGES, zero_edges_trunc, fitted_health, node)
 
-        min_health = replace(
-            raw_health,
-            unconfirmed_bindings=_EMPTY_BINDINGS,
-            unconfirmed_bindings_truncated=(
-                raw_health.unconfirmed_bindings_truncated
-                or bool(raw_health.unconfirmed_bindings)
+        min_health = cast(
+            WorkspaceHealth,
+            replace(
+                raw_health,
+                unconfirmed_bindings=_EMPTY_BINDINGS,
+                unconfirmed_bindings_truncated=(
+                    raw_health.unconfirmed_bindings_truncated
+                    or bool(raw_health.unconfirmed_bindings)
+                ),
             ),
         )
         best_th = _binary_search_prefix(
@@ -1937,10 +1957,15 @@ class ReadOnlyProjectionService:
                 _EMPTY_EDGES,
                 zero_edges_trunc,
                 min_health,
-                replace(
-                    node,
-                    threads=node.threads[:mid_t],
-                    threads_truncated=(node.threads_truncated or mid_t < len(node.threads)),
+                cast(
+                    ProjectedSandboxNode,
+                    replace(
+                        node,
+                        threads=node.threads[:mid_t],
+                        threads_truncated=(
+                            node.threads_truncated or mid_t < len(node.threads)
+                        ),
+                    ),
                 ),
             ),
             ctx.max_bytes,

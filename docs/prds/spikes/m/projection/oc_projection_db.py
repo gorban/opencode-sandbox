@@ -112,17 +112,20 @@ def _safe_close(conn: sqlite3.Connection | None) -> None:
 
 
 def _assert_raw_no_user_symlink_ancestors(raw: Path) -> None:
-    cur = Path(os.path.abspath(str(raw)))
-    while True:
+    anchored = raw if raw.is_absolute() else (Path.cwd() / raw)
+    parts = anchored.parts
+    if not parts:
+        return
+    acc = Path(parts[0])
+    for idx, part in enumerate(parts):
+        if idx > 0:
+            acc = acc / part
         try:
-            st = os.lstat(cur)
+            st = os.lstat(acc)
             if stat.S_ISLNK(st.st_mode) and st.st_uid != 0:
-                raise CoordPolicyError(f"state_dir_symlink_ancestor_rejected: {cur}")
+                raise CoordPolicyError(f"state_dir_symlink_ancestor_rejected: {acc}")
         except FileNotFoundError:
             pass
-        if cur.parent == cur:
-            break
-        cur = cur.parent
 
 
 def verify_regular_private_file_nofollow(
