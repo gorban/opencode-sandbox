@@ -253,17 +253,19 @@ markers explicitly alongside a 3-state `health_status`: `"healthy" | "degraded" 
      - Otherwise -> `health_status = "unknown"`, `degraded = False` (reporting
        `session_active_marker_present` explicitly without overstating `"healthy"` when a crashed
        or restarted hub's in-memory state is unknown!).
-3. **Orphaned & unconfirmed `external_transport_bindings` (`LEFT JOIN`, SQL storage-class & byte-gated columns, inside SQLite snapshot):**
+3. **Orphaned & unconfirmed `external_transport_bindings` (`LEFT JOIN`, SQL storage-class, flag-domain, & byte-gated columns, inside SQLite snapshot):**
    ```sql
    SELECT
        CASE WHEN typeof(b.sandbox_addr) = 'text' AND LENGTH(CAST(b.sandbox_addr AS BLOB)) <= 256
             THEN b.sandbox_addr ELSE NULL END AS sandbox_addr,
        CASE WHEN typeof(b.incarnation_id) = 'text' AND LENGTH(CAST(b.incarnation_id AS BLOB)) <= 256
             THEN b.incarnation_id ELSE NULL END AS incarnation_id,
-       CASE WHEN typeof(b.abort_requested) = 'integer' THEN b.abort_requested ELSE NULL END AS abort_requested,
-       (typeof(b.abort_requested) != 'integer') AS abort_requested_malformed,
-       CASE WHEN typeof(b.terminal_confirmed) = 'integer' THEN b.terminal_confirmed ELSE NULL END AS terminal_confirmed,
-       (typeof(b.terminal_confirmed) != 'integer') AS terminal_confirmed_malformed,
+       CASE WHEN typeof(b.abort_requested) = 'integer' AND b.abort_requested IN (0, 1)
+            THEN b.abort_requested ELSE NULL END AS abort_requested,
+       (typeof(b.abort_requested) != 'integer' OR b.abort_requested NOT IN (0, 1)) AS abort_requested_malformed,
+       CASE WHEN typeof(b.terminal_confirmed) = 'integer' AND b.terminal_confirmed IN (0, 1)
+            THEN b.terminal_confirmed ELSE NULL END AS terminal_confirmed,
+       (typeof(b.terminal_confirmed) != 'integer' OR b.terminal_confirmed NOT IN (0, 1)) AS terminal_confirmed_malformed,
        SUBSTR(CAST(b.reason AS BLOB), 1, 1024) AS reason_blob,
        LENGTH(CAST(b.reason AS BLOB)) AS reason_bytes,
        (typeof(b.reason) != 'text') AS reason_non_text,
@@ -276,18 +278,27 @@ markers explicitly alongside a 3-state `health_status`: `"healthy" | "degraded" 
        (s.sandbox_addr IS NULL) AS sandbox_missing
    FROM external_transport_bindings b
    LEFT JOIN sandboxes s ON s.sandbox_addr = b.sandbox_addr
-   WHERE (typeof(b.terminal_confirmed) != 'integer' OR b.terminal_confirmed = 0)
-     AND (typeof(b.terminal_confirmed) != 'integer'
-          OR typeof(b.abort_requested) != 'integer'
-          OR b.abort_requested != 0
-          OR s.sandbox_addr IS NULL
-          OR s.status = 'revoked'
-          OR s.incarnation_id != b.incarnation_id)
+   WHERE (typeof(b.terminal_confirmed) != 'integer' OR b.terminal_confirmed NOT IN (0, 1))
+      OR (typeof(b.abort_requested) != 'integer' OR b.abort_requested NOT IN (0, 1))
+      OR (b.terminal_confirmed = 0
+          AND (b.abort_requested = 1
+               OR s.sandbox_addr IS NULL
+               OR s.status = 'revoked'
+               OR s.incarnation_id IS NOT b.incarnation_id))
    ORDER BY b.sandbox_addr ASC, b.incarnation_id ASC
    LIMIT ?
    ```
    - Using `LEFT JOIN` ensures orphaned bindings whose `sandboxes` row is missing are **never**
      dropped (matching `oc_hub.py:1336-1338`).
+   - A **valid boolean flag** is defined strictly as SQLite storage class `integer` in `{0, 1}`
+     (`typeof(col) = 'integer' AND col IN (0, 1)`).
+   - **Independent malformed-flag qualification:** If EITHER `b.terminal_confirmed` OR
+     `b.abort_requested` is invalid (non-integer or outside `{0, 1}`, e.g., `terminal_confirmed = 2`
+     or `terminal_confirmed = 1` paired with a BLOB/out-of-domain `abort_requested`), that branch
+     **independently** qualifies the row BEFORE the valid-row unresolved-binding predicate runs
+     (so a malformed flag can never be masked by `terminal_confirmed = 1` or silently skipped by an
+     out-of-domain integer). Valid confirmed rows (`terminal_confirmed = 1` with `abort_requested`
+     in `{0, 1}`) stay excluded from both the summary and the count.
    - Every selected column — including nominally numeric flags and timestamps (`b.abort_requested`,
      `b.terminal_confirmed`, `b.updated_at`) in SQLite's non-`STRICT` tables — is storage-class
      and byte-gated inside SQL:
@@ -296,15 +307,14 @@ markers explicitly alongside a 3-state `health_status`: `"healthy" | "degraded" 
        truncating an oversized identifier into an apparent match, and still counting it in
        `unconfirmed_bindings_count`).
      - If `b.abort_requested`, `b.terminal_confirmed`, or `b.updated_at` has an unexpected SQLite
-       storage class (e.g., an oversized BLOB stored in `updated_at`), SQL returns `NULL` plus the
-       corresponding `*_malformed = 1` flag so zero oversized bytes cross into Python; the entry
-       clamps cleanly (`abort_requested = False` if null, `updated_at = 0.0` if null/non-finite)
-       and sets `malformed_metadata = True`.
-     - Rows with non-integer `b.terminal_confirmed` or `b.abort_requested` also qualify fail-closed
-       as unconfirmed bindings (`health_status = "degraded"`).
-   - Also execute `SELECT COUNT(*) ...` with the exact same `WHERE` clause so
-     `unconfirmed_bindings_count` is exact even when the summary list is capped at
-     `MAX_UNCONFIRMED_BINDINGS_SUMMARY = 50`.
+       storage class or out-of-domain flag value (e.g., an oversized BLOB stored in `updated_at` or
+       `abort_requested`, or `terminal_confirmed = 2`), SQL returns `NULL` plus the corresponding
+       `*_malformed = 1` flag so zero oversized bytes cross into Python; the entry clamps cleanly
+       (`abort_requested = False` if null, `updated_at = 0.0` if null/non-finite) and sets
+       `malformed_metadata = True`.
+   - Execute `SELECT COUNT(*) ...` with the **exact same `FROM ... LEFT JOIN ... WHERE` clause**
+     so `unconfirmed_bindings_count` and the bounded summary list (`MAX_UNCONFIRMED_BINDINGS_SUMMARY = 50`)
+     always match on valid and malformed rows alike.
    - Raw `owner_id` and `token_sha256` are **never** exposed in any projection response.
 
 ---
@@ -513,12 +523,15 @@ All 4 APIs serialize strictly via `json.dumps(obj.to_dict(), ensure_ascii=False,
        `oc_registry.py` tables are non-`STRICT`, SQLite allows an arbitrary multi-MB BLOB or TEXT
        value in any declared `INTEGER` or `REAL` column. Every projected numeric column is
        therefore storage-class gated **inside SQL** before crossing into Python:
-       - Integer flags, counters, and non-rowid sequence columns (`seq_counter.last_seq`,
+       - Boolean integer flags (`routing_edges.active`,
+         `external_transport_bindings.abort_requested`, `terminal_confirmed`): valid strictly when
+         `typeof(col) = 'integer' AND col IN (0, 1)`; select
+         `CASE WHEN typeof(col) = 'integer' AND col IN (0, 1) THEN col ELSE NULL END AS col, (typeof(col) != 'integer' OR col NOT IN (0, 1)) AS col_malformed`.
+       - Integer counters and non-rowid sequence columns (`seq_counter.last_seq`,
          `sandboxes.depth`, `threads.last_seq`, `routing_edges.max_rounds`, `turns_used`,
-         `rate_limit_rpm`, `active`, `grant_generation`, `grant_tombstones.grant_generation`,
+         `rate_limit_rpm`, `grant_generation`, `grant_tombstones.grant_generation`,
          `event_log.edge_turn_seq`, `outbox.seq`, `outbox.grant_generation`, `outbox.priority`,
-         `outbox.body_bytes`, `outbox.attempts`, `stream_events.seq_hint`,
-         `external_transport_bindings.abort_requested`, `terminal_confirmed`):
+         `outbox.body_bytes`, `outbox.attempts`, `stream_events.seq_hint`):
          `CASE WHEN typeof(col) = 'integer' THEN col ELSE NULL END AS col, (typeof(col) != 'integer') AS col_malformed`.
        - Floating-point timestamps (`created_at`, `updated_at`, `revoked_at`, `consumed_at`):
          `CASE WHEN typeof(col) IN ('integer', 'real') THEN col ELSE NULL END AS col, (typeof(col) NOT IN ('integer', 'real')) AS col_malformed`
@@ -937,10 +950,19 @@ under both default `$HOME` and `TMPDIR=/tmp` using private owner-only synthetic 
      (`"marker_unreadable"`) without blocking.
    - Orphaned `external_transport_bindings` row (missing `sandboxes` row) is included via `LEFT JOIN`
      and `owner_id` is never leaked in responses.
-   - Oversized BLOB (e.g., 2 MiB) stored in `external_transport_bindings.updated_at` (and non-integer
-     `abort_requested` / `terminal_confirmed`) on an otherwise qualifying row is blocked by SQL
-     storage-class gating without transferring the BLOB to Python, emitting bounded
-     `malformed_metadata = True` (`updated_at = 0.0`).
+   - Oversized BLOB (e.g., 2 MiB) stored in `external_transport_bindings.updated_at` on an
+     otherwise qualifying row is blocked by SQL storage-class gating without transferring the BLOB
+     to Python, emitting bounded `malformed_metadata = True` (`updated_at = 0.0`).
+   - Binding-flag domain fixtures (asserting exact parity between `unconfirmed_bindings_count` and
+     the bounded `unconfirmed_bindings` summary):
+     1. Confirmed row (`terminal_confirmed = 1`) with a malformed `abort_requested` flag (e.g.,
+        oversized BLOB or out-of-domain integer) independently qualifies -> `health_status = "degraded"`,
+        included in both summary and count, `malformed_metadata = True`, zero BLOB transfer.
+     2. Row with an out-of-domain `terminal_confirmed` flag (e.g., `terminal_confirmed = 2`)
+        independently qualifies -> `health_status = "degraded"`, included in both summary and count,
+        `malformed_metadata = True`.
+     3. Valid confirmed row (`terminal_confirmed = 1`, `abort_requested IN (0, 1)`) stays excluded
+        from both the summary and `unconfirmed_bindings_count`, preserving healthy/non-degraded status.
 4. **Hard response-byte bounds, SQL cell caps, cursors, deadline, & connection close:**
    - 1 KiB `max_response_bytes` page with escape-heavy (`"\\"\n\u0000`) and multibyte UTF-8 text
      stays strictly `<= 1024` UTF-8 bytes (`allow_nan=False`), truncating cleanly at UTF-8 boundary.
