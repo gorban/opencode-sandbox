@@ -2439,7 +2439,7 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
         entered = threading.Event()
         release = threading.Event()
         t1_res: list[WorkerStepResult] = []
-        t1_err: list[BaseException] = []
+        t1_err: list[Exception] = []
 
         def _worker(_t: StepLeaseToken) -> WorkerStepResult:
             entered.set()
@@ -2449,7 +2449,7 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
         def _run_t1() -> None:
             try:
                 t1_res.append(tracker.run_admitted(tok, worker_fn=_worker))
-            except BaseException as exc:  # pragma: no cover
+            except Exception as exc:  # pragma: no cover
                 t1_err.append(exc)
 
         th = threading.Thread(target=_run_t1)
