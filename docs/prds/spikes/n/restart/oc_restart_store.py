@@ -45,6 +45,7 @@ from oc_restart_contract import (  # noqa: E402
     KEY_DIRTY_RECOVERY,
     KEY_EVIDENCE_DIGEST,
     KEY_IDEM_KEY,
+    KEY_JOURNAL_ID,
     KEY_LEASE_EPOCH,
     KEY_OUTPUT_DIGEST,
     KEY_PRIOR_EPOCH,
@@ -628,7 +629,11 @@ class WorkflowRestartJournal:
             event_type=EventType.SUPERVISOR_STARTED,
             run_id=None,
             step_id=None,
-            payload={KEY_DIRTY_RECOVERY: dirty_recovery, KEY_PRIOR_EPOCH: prior_epoch},
+            payload={
+                KEY_DIRTY_RECOVERY: dirty_recovery,
+                KEY_JOURNAL_ID: journal_id,
+                KEY_PRIOR_EPOCH: prior_epoch,
+            },
             created_at_us=created_at_us,
             deadline=deadline,
         )

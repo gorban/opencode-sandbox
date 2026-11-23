@@ -104,6 +104,7 @@ _DIGEST_C = "c" * 64
 _DIGEST_E = "e" * 64
 _DIGEST_1 = "1" * 64
 _DIGEST_2 = "2" * 64
+_TEST_JOURNAL_ID = "jnl_00000000000000000000000000000000"
 
 _OBSERVE_ONLY_TOML = """
 schema_version = 1
@@ -793,9 +794,7 @@ class TestLifecycleGateAndMidStepAuthority(_RestartFixtureBase):
             sandbox_root=self.sandbox_root,
         )
         try:
-            no_eff = tracker2.issue_receipt(
-                token=captured[0], current_epoch=sup3.journal.current_epoch
-            )
+            no_eff = sup3.issue_tracker_receipt(captured[0])
             seq_before = sup3.journal.get_meta().last_event_seq
             requeue_req = ReconcileStepRequest(
                 run_id=rec2.run_id,
@@ -920,7 +919,7 @@ class TestCrashRecoveryFencingAndIdempotency(_RestartFixtureBase):
             self.assertEqual(sup3.journal.list_eligible_steps("run_pre"), ())
 
             # Negative tracker receipt checks ALL fail closed leaving step UNCERTAIN:
-            no_eff = tracker.issue_receipt(token=se_tokens[0], current_epoch=3)
+            no_eff = sup3.issue_tracker_receipt(se_tokens[0])
             base_req = ReconcileStepRequest(
                 run_id="run_pre",
                 step_id="se_step",
@@ -1076,7 +1075,7 @@ class TestCrashRecoveryFencingAndIdempotency(_RestartFixtureBase):
             self.assertEqual(sup2.journal.get_meta(), meta_before)
 
             # Attempting requeue_pending when tracker knows effect_applied fails closed!
-            applied_rcpt = tracker.issue_receipt(token=stale, current_epoch=2)
+            applied_rcpt = sup2.issue_tracker_receipt(stale)
             self.assertEqual(applied_rcpt.tracker_outcome, "effect_applied")
             bad_requeue = ReconcileStepRequest(
                 run_id="run_se",
@@ -1366,9 +1365,7 @@ class TestCrashRecoveryFencingAndIdempotency(_RestartFixtureBase):
                 captured_tokens=unc_tokens,
             )
             self.assertEqual(out_u.ack.status, StepStatus.UNCERTAIN_NEEDS_RECONCILE.value)
-            unc_rcpt = tracker.issue_receipt(
-                token=unc_tokens[0], current_epoch=1, force_fence=True
-            )
+            unc_rcpt = sup.issue_tracker_receipt(unc_tokens[0], force_fence=True)
             self.assertEqual(unc_rcpt.tracker_outcome, "still_pending")
             bad_req_unc = ReconcileStepRequest(
                 run_id="run_worker_unc",
@@ -1731,7 +1728,11 @@ class TestCapacityHeadroomAndTamperDefense(_RestartFixtureBase):
             epoch=1,
             event_type=EventType.SUPERVISOR_STARTED,
             prev_hash=EVENT_GENESIS_HASH,
-            payload={"dirty_recovery": False, "prior_epoch": 0},
+            payload={
+                "dirty_recovery": False,
+                "journal_id": _TEST_JOURNAL_ID,
+                "prior_epoch": 0,
+            },
         )
         e2_stop = self._make_chained_event(
             seq=2,
@@ -1767,7 +1768,11 @@ class TestCapacityHeadroomAndTamperDefense(_RestartFixtureBase):
             epoch=3,
             event_type=EventType.SUPERVISOR_STARTED,
             prev_hash=e2_stop.entry_hash,
-            payload={"dirty_recovery": False, "prior_epoch": 1},
+            payload={
+                "dirty_recovery": False,
+                "journal_id": _TEST_JOURNAL_ID,
+                "prior_epoch": 1,
+            },
         )
         with self.assertRaises(ReplayMismatchError):
             reduce_event_log([e1, e2_stop, e3_skip])
@@ -1809,7 +1814,11 @@ class TestCapacityHeadroomAndTamperDefense(_RestartFixtureBase):
             epoch=2,
             event_type=EventType.SUPERVISOR_STARTED,
             prev_hash=e3_lease.entry_hash,
-            payload={"dirty_recovery": True, "prior_epoch": 1},
+            payload={
+                "dirty_recovery": True,
+                "journal_id": _TEST_JOURNAL_ID,
+                "prior_epoch": 1,
+            },
         )
         e5_bad_stop = self._make_chained_event(
             seq=5,
@@ -2277,7 +2286,7 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
             )
 
             # Requeue on recovered plan-bound run DENIED without authority_store!
-            no_eff = tracker.issue_receipt(token=captured[0], current_epoch=2)
+            no_eff = sup2.issue_tracker_receipt(captured[0])
             req_requeue = ReconcileStepRequest(
                 run_id=rec_act.run_id,
                 step_id="apply_patch",
@@ -2368,7 +2377,7 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
             sandbox_root=self.sandbox_root,
         )
         try:
-            no_eff = tracker.issue_receipt(token=captured[0], current_epoch=2)
+            no_eff = sup2.issue_tracker_receipt(captured[0])
             seq_before = sup2.journal.get_meta().last_event_seq
             stale_snap = self.clock.now()
             req = ReconcileStepRequest(
@@ -2510,7 +2519,7 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
             sandbox_root=self.sandbox_root,
         )
         try:
-            rcpt = tracker2.issue_receipt(token=captured[0], current_epoch=2)
+            rcpt = sup2.issue_tracker_receipt(captured[0])
             self.assertEqual(rcpt.tracker_outcome, "still_pending")
             req_requeue = ReconcileStepRequest(
                 run_id="run_hist",
@@ -2549,7 +2558,7 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
         try:
             self.assertEqual(rep3.supervisor_epoch, 3)
             self.assertEqual(tracker3.history_start_epoch, 3)
-            rcpt3 = tracker3.issue_receipt(token=captured[0], current_epoch=3)
+            rcpt3 = sup3.issue_tracker_receipt(captured[0])
             self.assertEqual(rcpt3.tracker_outcome, "still_pending")
         finally:
             sup3.close_clean(clock=self.clock.advance())
@@ -2589,7 +2598,7 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
         )
         try:
             meta_before = sup2.journal.get_meta()
-            applied_rcpt = tracker.issue_receipt(token=captured[0], current_epoch=2)
+            applied_rcpt = sup2.issue_tracker_receipt(captured[0])
             req = ReconcileStepRequest(
                 run_id="run_comp_req",
                 step_id="se1",
@@ -2730,7 +2739,11 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
             safe_rollback_and_close(ro_conn)
 
     def test_reduce_event_log_enforces_monotonic_deadline(self) -> None:
-        p1 = {"dirty_recovery": False, "prior_epoch": 0}
+        p1 = {
+            "dirty_recovery": False,
+            "journal_id": _TEST_JOURNAL_ID,
+            "prior_epoch": 0,
+        }
         h1 = compute_event_hash(
             seq=1,
             supervisor_epoch=1,
@@ -2918,8 +2931,17 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
     ) -> None:
         # 1. Bool-for-int confusion (prior_epoch: False == 0) & extra key on genesis started.
         bad_genesis_payloads: tuple[dict[str, Any], ...] = (
-            {"dirty_recovery": False, "prior_epoch": False},
-            {"dirty_recovery": False, "prior_epoch": 0, "extra": 1},
+            {
+                "dirty_recovery": False,
+                "journal_id": _TEST_JOURNAL_ID,
+                "prior_epoch": False,
+            },
+            {
+                "dirty_recovery": False,
+                "journal_id": _TEST_JOURNAL_ID,
+                "prior_epoch": 0,
+                "extra": 1,
+            },
         )
         for bad_p in bad_genesis_payloads:
             ev = self._build_event(
@@ -2937,7 +2959,11 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
             epoch=1,
             event_type=EventType.SUPERVISOR_STARTED,
             prev_hash=EVENT_GENESIS_HASH,
-            payload={"dirty_recovery": False, "prior_epoch": 0},
+            payload={
+                "dirty_recovery": False,
+                "journal_id": _TEST_JOURNAL_ID,
+                "prior_epoch": 0,
+            },
         )
         good_step = StepSpec("s1", "s1", "read_metrics", False).to_payload_dict()
 
@@ -3151,7 +3177,7 @@ class TestAdversarialRegressionsRound3(_RestartFixtureBase):
         try:
             self.assertEqual(rep3.supervisor_epoch, 3)
             self.assertEqual(tracker_a.observed_epochs, frozenset({1, 3}))
-            rcpt = tracker_a.issue_receipt(token=captured[0], current_epoch=3)
+            rcpt = sup3.issue_tracker_receipt(captured[0])
             self.assertEqual(rcpt.tracker_outcome, "still_pending")
             req_requeue = ReconcileStepRequest(
                 run_id="run_gap",
@@ -3184,9 +3210,7 @@ class TestAdversarialRegressionsRound3(_RestartFixtureBase):
         try:
             self.assertEqual(tracker_direct.observed_epochs, frozenset({4}))
             self.assertEqual(
-                tracker_direct.issue_receipt(
-                    token=captured[0], current_epoch=4
-                ).tracker_outcome,
+                sup4.issue_tracker_receipt(captured[0]).tracker_outcome,
                 "still_pending",
             )
         finally:
@@ -3415,7 +3439,11 @@ class TestAdversarialRegressionsRound3(_RestartFixtureBase):
             epoch=1,
             event_type=EventType.SUPERVISOR_STARTED,
             prev_hash=EVENT_GENESIS_HASH,
-            payload={"dirty_recovery": False, "prior_epoch": 0},
+            payload={
+                "dirty_recovery": False,
+                "journal_id": _TEST_JOURNAL_ID,
+                "prior_epoch": 0,
+            },
         )
         e2 = TestAdversarialRegressionsRound2._build_event(
             seq=2,
@@ -3908,6 +3936,133 @@ class TestAdversarialRegressionsRound5(_RestartFixtureBase):
             self.assertEqual(tracker_1.count("run_fresh", "se1"), 0)
         finally:
             sup2_rec.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+
+class TestAdversarialRegressionsRound6(_RestartFixtureBase):
+    def test_tampered_meta_journal_id_rejected_before_tracker_attachment(self) -> None:
+        tracker1 = SyntheticEffectTracker()
+        sup1, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker1,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            sup1.journal.create_run(
+                self._make_run_request(
+                    "run_jid_tamper", (StepSpec("s1", "s1", "read_metrics", False),)
+                )
+            )
+        finally:
+            sup1.close_clean(clock=self.clock.advance())
+
+        # Tamper ONLY supervisor_meta.journal_id to another valid jnl_... ID!
+        self._tamper_db(
+            "UPDATE supervisor_meta SET journal_id = ?",
+            ("jnl_tampered0000000000000000000000",),
+        )
+
+        # 1. Read-only verification fails closed with ReplayMismatchError.
+        with self.assertRaises(ReplayMismatchError):
+            verify_journal_replay_readonly(
+                self.state_dir, sandbox_root=self.sandbox_root
+            )
+
+        # 2. Direct writable recovery fails closed with ReplayMismatchError.
+        t_rec1 = self.clock.advance()
+        with self.assertRaises(ReplayMismatchError):
+            WorkflowRestartJournal.open_and_recover(
+                self.state_dir, clock=t_rec1, sandbox_root=self.sandbox_root
+            )
+
+        # 3. Supervisor recovery fails BEFORE attaching tracker (tracker stays unbound!).
+        fresh_tracker = SyntheticEffectTracker()
+        t_rec2 = self.clock.advance()
+        with self.assertRaises(ReplayMismatchError):
+            DurableWorkflowSupervisor.start_or_recover(
+                self.state_dir,
+                clock=t_rec2,
+                tracker=fresh_tracker,
+                sandbox_root=self.sandbox_root,
+            )
+        self.assertIsNone(fresh_tracker.bound_journal_id)
+        self.assertEqual(fresh_tracker.observed_epochs, frozenset())
+
+    def test_bound_tracker_refuses_omitted_journal_id_without_mutating_owner(
+        self,
+    ) -> None:
+        tracker = SyntheticEffectTracker()
+        sup, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            sandbox_root=self.sandbox_root,
+        )
+        jid = sup.journal.journal_id
+        captured: list[StepLeaseToken] = []
+        try:
+            steps = (
+                StepSpec("se1", "se1", "stage_patch", True),
+                StepSpec("se2", "se2", "stage_patch", True),
+            )
+            sup.journal.create_run(self._make_run_request("run_omit_jid", steps))
+            sup.run_step_once(
+                "run_omit_jid",
+                "se1",
+                worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                clock_provider=self.clock.advance,
+                captured_tokens=captured,
+            )
+            tok = captured[0]
+            step_rec = sup.journal.get_step("run_omit_jid", "se1")
+            owner_rcpt = sup.issue_tracker_receipt(tok)
+            self.assertEqual(owner_rcpt.tracker_outcome, "effect_applied")
+
+            # Omitting journal_id=None on a bound tracker MUST refuse / no-op without
+            # reading stored attempts or mutating owner fence/observed_epochs!
+            tracker.attach_epoch(99)
+            tracker.fence_epoch(99)
+            tracker.fence_attempt(tok)
+            self.assertEqual(tracker.observed_epochs, frozenset({1}))
+
+            extra_tok = StepLeaseToken("run_omit_jid", "se2", 1, 1, "idem_omit_jid")
+            with self.assertRaises(StaleEpochError):
+                tracker.admit_attempt(extra_tok)
+
+            rcpt_none = tracker.issue_receipt(
+                token=tok, current_epoch=99, force_fence=True
+            )
+            self.assertEqual(rcpt_none.tracker_outcome, "still_pending")
+            self.assertFalse(rcpt_none.attempt_fenced)
+            self.assertIsNone(rcpt_none.output_digest)
+
+            with self.assertRaises(ReconciliationEvidenceError):
+                tracker.verify_receipt_for_step(
+                    owner_rcpt,
+                    step=step_rec,
+                    current_epoch=1,
+                    expected_outcome="effect_applied",
+                    expected_evidence_digest=owner_rcpt.receipt_digest,
+                    expected_output_digest=_DIGEST_A,
+                )
+
+            # Owner state is completely untouched: can still read owner receipt AND
+            # execute epoch-1 se2 cleanly!
+            owner_rcpt_after = tracker.issue_receipt(
+                token=tok, current_epoch=1, journal_id=jid
+            )
+            self.assertEqual(owner_rcpt_after.tracker_outcome, "effect_applied")
+            self.assertEqual(owner_rcpt_after.output_digest, _DIGEST_A)
+            out2 = sup.run_step_once(
+                "run_omit_jid",
+                "se2",
+                worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_B),
+                clock_provider=self.clock.advance,
+            )
+            self.assertEqual(out2.ack.status, StepStatus.COMPLETED.value)
+        finally:
+            sup.close_clean(clock=self.clock.advance())
         verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
 
 

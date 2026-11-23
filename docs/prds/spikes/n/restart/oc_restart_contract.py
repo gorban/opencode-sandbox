@@ -1032,6 +1032,7 @@ class ReplayedSnapshot:
     steps: Mapping[tuple[str, str], WorkflowStepRecord]
     idempotency_records: Mapping[tuple[str, str], StepIdempotencyRecord]
     reconciliation_records: Mapping[tuple[str, str], StepReconciliationRecord]
+    journal_id: str = ""
 
 
 # --- Pure DAG-aware run status derivation ---
@@ -1160,6 +1161,7 @@ def derive_steps_from_plan(plan: CompiledWorkflowPlan) -> tuple[StepSpec, ...]:
 
 @dataclass
 class _MutableReplayState:
+    journal_id: str = ""
     epoch: int = 0
     last_seq: int = 0
     head_hash: str = EVENT_GENESIS_HASH
@@ -1201,7 +1203,7 @@ def _refresh_run_status(
     state.runs[run_id] = replace(run, status=new_status, updated_at_us=updated_at_us)
 
 
-_STARTED_PAYLOAD_KEYS = frozenset({KEY_DIRTY_RECOVERY, KEY_PRIOR_EPOCH})
+_STARTED_PAYLOAD_KEYS = frozenset({KEY_DIRTY_RECOVERY, KEY_JOURNAL_ID, KEY_PRIOR_EPOCH})
 _RUN_CREATED_PAYLOAD_KEYS = frozenset(
     {
         KEY_GRANT_GENERATION,
@@ -1279,11 +1281,13 @@ def _apply_supervisor_started(state: _MutableReplayState, event: JournalEvent) -
     _require_payload_keys(payload, _STARTED_PAYLOAD_KEYS, "started_payload_keys_invalid")
     dirty_val = validate_bool(payload[KEY_DIRTY_RECOVERY], KEY_DIRTY_RECOVERY)
     prior_ep = validate_int64(payload[KEY_PRIOR_EPOCH], KEY_PRIOR_EPOCH, min_val=0)
+    jid = validate_opaque_id(payload[KEY_JOURNAL_ID], KEY_JOURNAL_ID)
     if event.seq == 1:
         _require_replay(
             event.supervisor_epoch == 1 and not dirty_val and prior_ep == 0,
             "invalid_genesis_started_event",
         )
+        state.journal_id = jid
     else:
         _require_replay(
             len(state.pending_recovery_queue) == 0, ERR_UNFENCED_LEASE
@@ -1291,7 +1295,8 @@ def _apply_supervisor_started(state: _MutableReplayState, event: JournalEvent) -
         _require_replay(
             event.supervisor_epoch == state.epoch + 1
             and prior_ep == state.epoch
-            and dirty_val is (state.dirty_shutdown == 1),
+            and dirty_val is (state.dirty_shutdown == 1)
+            and jid == state.journal_id,
             "invalid_supervisor_started_transition",
         )
     state.dirty_shutdown = 1
@@ -1883,6 +1888,7 @@ def reduce_event_log(
         steps=dict(state.steps),
         idempotency_records=dict(state.idempotency_records),
         reconciliation_records=dict(state.reconciliation_records),
+        journal_id=state.journal_id,
     )
 
 
@@ -1914,6 +1920,7 @@ def verify_materialized_parity(
         replayed.meta_updated_at_us,
     )
     _require_replay(meta_tuple == replayed_meta, ERR_MATERIALIZED_MISMATCH)
+    _require_replay(meta.journal_id == replayed.journal_id, "meta_journal_id_mismatch")
     _check_replay_deadline(deadline)
     _require_replay(actual_runs == replayed.runs, ERR_MATERIALIZED_MISMATCH)
     _check_replay_deadline(deadline)
@@ -1988,11 +1995,9 @@ class SyntheticEffectTracker:
         return _wrap_clean_str(journal_id, KEY_JOURNAL_ID, max_bytes=128)
 
     def _journal_matches_locked(self, journal_id: str | None) -> bool:
-        if journal_id is None:
-            return True
-        if self._bound_journal_id is None and not self._attached:
-            return True
-        return self._bound_journal_id == journal_id
+        if self._bound_journal_id is None:
+            return journal_id is None
+        return journal_id is not None and journal_id == self._bound_journal_id
 
     def attach_epoch(
         self, supervisor_epoch: int, *, journal_id: str | None = None
