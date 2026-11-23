@@ -60,6 +60,16 @@ SUITES = (
     discover('CI supervisor contract', 'test_ci_supervisor.py'),
     discover('CI toolchain contract', 'test_ci_toolchain.py'),
     discover('Sonar publisher contract', 'test_sonar_publisher.py'),
+    discover('OpenAI operator consent', 'test_openai_cli.py'),
+    discover('OpenAI launcher dispatch', 'test_openai_cli_launcher.py'),
+    discover('OpenAI workstation connection', 'test_openai_connection.py'),
+    discover('OpenAI managed retirement', 'test_openai_connection_job.py'),
+    discover('OpenAI provider transport', 'test_openai_connection_transport.py'),
+    discover('OpenAI inference exposure', 'test_openai_exposure.py'),
+    discover('OpenAI acceptance integration', 'test_openai_live.py'),
+    discover('OpenAI registry integration', 'test_openai_profile_backend.py'),
+    discover('OpenAI saved registrations', 'test_openai_profiles.py'),
+    discover('OpenAI managed worker', 'test_openai_worker.py'),
 )
 
 SHELL_FILES = (
@@ -78,6 +88,25 @@ PYTHON_FILES = (
     'oc-setup-lock.py',
     'oc_bridge_merge.py',
     'oc_controller.py',
+    'oc-openai-accept.py',
+    'oc_openai/__init__.py',
+    'oc_openai/cli.py',
+    'oc_openai/connection.py',
+    'oc_openai/connection_job.py',
+    'oc_openai/connection_state.py',
+    'oc_openai/exposure.py',
+    'oc_openai/live.py',
+    'oc_openai/managed/__init__.py',
+    'oc_openai/managed/broker.py',
+    'oc_openai/managed/client.py',
+    'oc_openai/managed/protocol.py',
+    'oc_openai/managed/relay.py',
+    'oc_openai/managed/relay_receipt.py',
+    'oc_openai/managed/runtime.py',
+    'oc_openai/profile_backend.py',
+    'oc_openai/profiles.py',
+    'oc_openai/responses.py',
+    'oc_openai/worker.py',
     'tests/bridge_merge_core.py',
     'tests/host_state_leaves.py',
     'tests/parallel-isolated-test.py',
@@ -88,6 +117,16 @@ PYTHON_FILES = (
     'tests/test_ci_supervisor.py',
     'tests/test_ci_toolchain.py',
     'tests/test_controller_core.py',
+    'tests/test_openai_cli.py',
+    'tests/test_openai_cli_launcher.py',
+    'tests/test_openai_connection.py',
+    'tests/test_openai_connection_job.py',
+    'tests/test_openai_connection_transport.py',
+    'tests/test_openai_exposure.py',
+    'tests/test_openai_live.py',
+    'tests/test_openai_profile_backend.py',
+    'tests/test_openai_profiles.py',
+    'tests/test_openai_worker.py',
     'tests/test_sonar_publisher.py',
     'tests/worktree_review_regressions.py',
     'tests/worktree_state_regressions.py',
@@ -224,7 +263,8 @@ def tests(supervisor):
 def validate_scope():
     # Keep additions to the active source directories visible without scanning archived probes.
     declared = set(SHELL_FILES + PYTHON_FILES)
-    for directory, prefix in ((ROOT, ''), (ROOT / 'tests', '**/'), (ROOT / 'tools/ci', '**/')):
+    scopes = ((ROOT, ''), (ROOT / 'tests', '**/'), (ROOT / 'tools/ci', '**/'), (ROOT / 'oc_openai', '**/'))
+    for directory, prefix in scopes:
         for pattern in ('*.sh', '*.py'):
             for path in sorted(directory.glob(prefix + pattern)):
                 name = path.relative_to(ROOT).as_posix()

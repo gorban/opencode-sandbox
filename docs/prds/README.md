@@ -18,6 +18,9 @@ reservation explicitly in this index.
 - [*] Managed worker credential isolation, sign-in enforcement, and shared-home migration
   ([I3a](prd_i3a.md)) — **Worker credential isolation**. Provider onboarding and live acceptance
   stay with **Outside-in integrations**.
+- [*] [I4a local OpenAI acceptance](prd_i4a.md) — **Codex**, within the Outside-in and
+  worker isolation reservations. Qualify the workstation orchestrator first, then the managed
+  worker through `oc-sandbox`. The Chromium and Postgres app proof follows provider acceptance.
 
 - [*] PRD M first PoC — local worker addressing, orchestration, and thread projection
   ([M first PoC split](prd_m.md#first-poc-split)) — **PRD M coordination**.

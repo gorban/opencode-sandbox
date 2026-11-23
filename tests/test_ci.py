@@ -79,6 +79,16 @@ class PortableTests(unittest.TestCase):
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_ci_supervisor.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_ci_toolchain.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_sonar_publisher.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_cli.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_cli_launcher.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_connection.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_connection_job.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_connection_transport.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_exposure.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_live.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_profile_backend.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_profiles.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_worker.py'),
         ]
         seen = []
         roots = set()
@@ -236,7 +246,7 @@ class QualityTests(unittest.TestCase):
             archive.mkdir(parents=True)
             (archive / 'probe.py').touch()
             ci.validate_scope()
-            for name in ('new.sh', 'tests/fixtures/new.py', 'tools/ci/new.py'):
+            for name in ('new.sh', 'tests/fixtures/new.py', 'tools/ci/new.py', 'oc_openai/new.py'):
                 with self.subTest(name=name):
                     path = ci.ROOT / name
                     path.parent.mkdir(parents=True, exist_ok=True)

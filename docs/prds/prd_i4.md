@@ -2,6 +2,8 @@
 
 Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential broker](prd_i3.md)
 
+First local acceptance: [I4a OpenAI workstation connection and worker proof](prd_i4a.md).
+
 ## Gateway
 
 - [ ] Keep the agent runtime, worktree and tools on the worker when the provider supports that

@@ -1,7 +1,8 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash -p
 # oc-sandbox — idempotent setup + launch + teardown for sandboxed OpenCode instances
 # (one rootless Podman pod per instance: OpenCode agent + Chromium on your Wayland desktop,
 # optional Postgres and docker-in-docker sidecar).
+# Use the system Bash and skip startup hooks before checking the launcher and helper paths.
 set -euo pipefail
 
 CALLER_PWD=$PWD
@@ -9,9 +10,9 @@ CALLER_PHYSICAL=$(pwd -P)
 SB="$HOME/opencode-sandbox"            # mounted at /sandbox in every agent
 # This script runs on the HOST (and asks for admin rights), so it must never live inside the directory
 # that is mounted into the agent containers, or an agent could rewrite it.
-SCRIPT_REAL=$(readlink -f "$0"); SCRIPT_DIR=${SCRIPT_REAL%/*}
+SCRIPT_REAL=$(/usr/bin/readlink -f -- "$0"); SCRIPT_DIR=${SCRIPT_REAL%/*}
 case $SCRIPT_REAL in
-  "$(readlink -f "$SB")"/*)
+  "$(/usr/bin/readlink -f -- "$SB")"/*)
     echo "Refusing to run: $SCRIPT_REAL is inside the sandbox directory $SB," >&2
     echo "which the agent can write to. Keep the checkout elsewhere (e.g. ~/code/opencode-sandbox)" >&2
     echo "and symlink it into ~/.local/bin. See README.md." >&2
@@ -44,6 +45,7 @@ usage() {
   cat <<EOF
 Usage: ${0##*/} [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
+       ${0##*/} openai {connect LABEL|select LABEL|status|disconnect|accept}
 
   (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
               OpenCode. Safe to run repeatedly; only missing/changed pieces are touched.
@@ -94,9 +96,10 @@ die() { echo "${0##*/}: $*" >&2; exit 2; }
 # and fails if ANY step (including each symlink target on the way) is inside $SB. Only components
 # outside $SB, which the agent cannot change, remain; the walked physical path is used from then on.
 # The locations must not contain $SB either (-d -a deletes $STATE). Done before anything is touched.
-sb_real=$(realpath -m -- "$SB")
+sb_real=$(/usr/bin/realpath -m -- "$SB")
+openai_sb_real=
 in_sb() {
-  [[ $1/ == "$sb_real"/* ]]
+  [[ $1/ == "$sb_real"/* || ( -n ${openai_sb_real:-} && $1/ == "$openai_sb_real"/* ) ]]
 }
 trusted_path() {  # absolute path -> its physical path on stdout; 1 if the walk enters $SB
   local cur="" comp next t n=0 todo=() tc=()
@@ -109,7 +112,7 @@ trusted_path() {  # absolute path -> its physical path on stdout; 1 if the walk 
     in_sb "$next" && return 1
     if [[ -L $next ]]; then
       (( ++n <= 40 )) || return 1
-      IFS= read -r -d '' t < <(readlink -z -- "$next") || return 1
+      IFS= read -r -d '' t < <(/usr/bin/readlink -z -- "$next") || return 1
       [[ $t != *$'\n'* && $t != *$'\r'* ]] || return 1
       tc=(); IFS=/ read -ra tc <<<"$t"
       [[ $t == /* ]] && cur=""
@@ -124,6 +127,61 @@ trusted_file() { # resolve repository helpers without following a path into the 
   [[ -f $r ]] || return 1
   printf '%s\n' "$r"
 }
+
+if [[ ${1:-} == openai ]]; then
+  case $#:${2:-} in
+    2:status|2:disconnect|2:accept) ;;
+    3:connect|3:select)
+      LC_ALL=C
+      [[ $3 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] ||
+        die "OpenAI labels must be 1 to 32 ASCII letters, numbers, underscores or hyphens, starting with a letter or number"
+      ;;
+    *) die "usage: oc-sandbox openai {connect LABEL|select LABEL|status|disconnect|accept}" ;;
+  esac
+  # Check the system account's sandbox too, independently of caller HOME.
+  account_entry=$(/usr/bin/getent passwd "$EUID") || die "cannot verify the OpenAI workstation account"
+  IFS=: read -r _ _ account_uid _ _ account_home _ <<<"$account_entry"
+  [[ $account_uid == "$EUID" && $account_home == /* ]] || die "invalid OpenAI workstation account"
+  openai_sb_real=$(/usr/bin/realpath -m -- "$account_home/opencode-sandbox") ||
+    die "cannot verify the OpenAI workstation sandbox path"
+  launcher=$0
+  [[ $launcher == /* ]] || launcher=$CALLER_PHYSICAL/$launcher
+  [[ $(trusted_path "$launcher") == "$SCRIPT_REAL" && -f $SCRIPT_REAL ]] ||
+    die "refusing an unsafe OpenAI launcher path"
+  helper=$SCRIPT_DIR/oc-openai-accept.py
+  [[ $(trusted_file "$helper") == "$helper" && ! -L $helper ]] ||
+    die "refusing an unsafe OpenAI helper path"
+  for source_file in "$SCRIPT_REAL" "$helper"; do
+    read -r owner mode links < <(/usr/bin/stat -c '%u %a %h' -- "$source_file") ||
+      die "cannot verify OpenAI source ownership"
+    (( (owner == EUID || owner == 0) && !(8#$mode & 022) && links == 1 )) ||
+      die "refusing unprotected OpenAI source"
+  done
+  source_parent=$SCRIPT_DIR
+  source_parents=()
+  while :; do
+    source_parents+=("$source_parent")
+    [[ $source_parent != / ]] || break
+    source_parent=${source_parent%/*}
+    source_parent=${source_parent:-/}
+  done
+  # A private, user-owned ancestor already excludes other users from its subtree.
+  private_source=0
+  for (( index=${#source_parents[@]}-1; index>=0; index-- )); do
+    source_parent=${source_parents[index]}
+    read -r owner mode < <(/usr/bin/stat -c '%u %a' -- "$source_parent") ||
+      die "cannot verify OpenAI source directory"
+    if [[ $source_parent != /tmp ]] || (( (owner != 0 && owner != 65534) || !(8#$mode & 01000) )); then
+      (( (owner == EUID || owner == 0) && (private_source || !(8#$mode & 022)) )) ||
+        die "refusing unprotected OpenAI source directory"
+    fi
+    if (( owner == EUID && !(8#$mode & 077) )); then private_source=1; fi
+  done
+  cd -- "$SCRIPT_DIR"
+  shift
+  exec /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/python3 -IB "$helper" "$@"
+fi
+
 trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
   local r
   r=$(trusted_path "$2") || die "refusing to use $2: the path leads into the sandbox directory $SB, which the agent controls (check XDG_DATA_HOME / XDG_CONFIG_HOME and symlinks)"
