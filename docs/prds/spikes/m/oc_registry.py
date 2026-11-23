@@ -110,6 +110,9 @@ _SQL_SELECT_SANDBOX_INC_STATUS = (
 _SQL_UPDATE_OUTBOX_STATUS_DETAIL = (
     "UPDATE outbox SET status = ?, detail = ?, updated_at = ? WHERE msg_id = ? AND status = ?"
 )
+_SQL_DELETE_UNCONSUMED_DISPATCH_RECEIPT = (
+    "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?"
+)
 
 
 def _dict_row_factory(cursor: sqlite3.Cursor, row: tuple[Any, ...]) -> dict[str, Any]:
@@ -172,6 +175,12 @@ _UNTRUSTED_DETAIL_KEYS: frozenset[str] = frozenset(
 
 _ERR_INVALID_IN_REPLY_TO = "invalid_in_reply_to"
 _ERR_INVALID_OUTBOX_TRANSITION = "invalid_outbox_transition"
+_ERR_TRANSPORT_ABORT_UNCONFIRMED = "transport_abort_unconfirmed"
+_LABEL_TRANSPORT_OWNER = "transport_owner_id"
+_LABEL_INCARNATION = "incarnation_id"
+_SQL_SELECT_BINDING = (
+    "SELECT * FROM external_transport_bindings WHERE sandbox_addr = ? AND incarnation_id = ?"
+)
 
 _SCHEMA_SQL: tuple[str, ...] = (
     """
@@ -342,6 +351,19 @@ _SCHEMA_SQL: tuple[str, ...] = (
         created_at REAL NOT NULL,
         prev_hash TEXT NOT NULL,
         entry_hash TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS external_transport_bindings (
+        sandbox_addr TEXT NOT NULL,
+        incarnation_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        abort_requested INTEGER NOT NULL DEFAULT 0,
+        terminal_confirmed INTEGER NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (sandbox_addr, incarnation_id)
     )
     """,
 )
@@ -670,6 +692,19 @@ def _row_to_event_log_dict(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _row_to_transport_binding(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "sandbox_addr": row["sandbox_addr"],
+        "incarnation_id": row["incarnation_id"],
+        "owner_id": row["owner_id"],
+        "abort_requested": bool(row["abort_requested"]),
+        "terminal_confirmed": bool(row["terminal_confirmed"]),
+        "reason": row["reason"],
+        "created_at": float(row["created_at"]),
+        "updated_at": float(row["updated_at"]),
+    }
+
+
 def _validate_sandbox_record(record: SandboxRecord) -> str:
     parse_local_target(record.sandbox_addr)
     brief = validate_task_brief(record.task_brief)
@@ -915,13 +950,64 @@ class CoordRegistry:
     # Sandbox & Thread Operations
     # ------------------------------------------------------------------
 
-    def register_sandbox(self, record: SandboxRecord) -> SandboxRecord:
+    def _check_and_record_binding_conn(
+        self,
+        conn: sqlite3.Connection,
+        sandbox_addr: str,
+        incarnation_id: str,
+        external_owner_id: str | None,
+        now: float,
+    ) -> None:
+        unconfirmed = conn.execute(
+            """
+            SELECT incarnation_id, owner_id, abort_requested
+            FROM external_transport_bindings
+            WHERE sandbox_addr = ? AND terminal_confirmed = 0
+            """,
+            (sandbox_addr,),
+        ).fetchall()
+        for row in unconfirmed:
+            same_inc = row["incarnation_id"] == incarnation_id
+            same_owner = external_owner_id is not None and row["owner_id"] == external_owner_id
+            if not same_inc or not same_owner or int(row["abort_requested"]) != 0:
+                raise CoordPolicyError(_ERR_TRANSPORT_ABORT_UNCONFIRMED)
+        existing = conn.execute(
+            _SQL_SELECT_BINDING, (sandbox_addr, incarnation_id)
+        ).fetchone()
+        if existing is not None:
+            if int(existing["terminal_confirmed"]) != 0:
+                raise RevokedError("cannot_reregister_revoked_incarnation")
+            if external_owner_id is None:
+                raise CoordPolicyError(_ERR_TRANSPORT_ABORT_UNCONFIRMED)
+            clean_owner = validate_opaque_token(external_owner_id, _LABEL_TRANSPORT_OWNER)
+            if existing["owner_id"] != clean_owner:
+                raise CoordPolicyError(_ERR_TRANSPORT_ABORT_UNCONFIRMED)
+            return
+        if external_owner_id is None:
+            return
+        clean_owner = validate_opaque_token(external_owner_id, _LABEL_TRANSPORT_OWNER)
+        conn.execute(
+            """
+            INSERT INTO external_transport_bindings (
+                sandbox_addr, incarnation_id, owner_id,
+                abort_requested, terminal_confirmed, reason, created_at, updated_at
+            ) VALUES (?, ?, ?, 0, 0, '', ?, ?)
+            """,
+            (sandbox_addr, incarnation_id, clean_owner, now, now),
+        )
+
+    def register_sandbox(
+        self, record: SandboxRecord, *, external_owner_id: str | None = None
+    ) -> SandboxRecord:
         brief = _validate_sandbox_record(record)
         now = time.time()
         created_at = record.created_at if record.created_at > 0 else now
         updated_at = record.updated_at if record.updated_at > 0 else now
         stored = replace(record, task_brief=brief, created_at=created_at, updated_at=updated_at)
         with self._tx() as conn:
+            self._check_and_record_binding_conn(
+                conn, stored.sandbox_addr, stored.incarnation_id, external_owner_id, updated_at
+            )
             conn.execute(
                 """
                 INSERT INTO sandboxes (
@@ -1755,6 +1841,146 @@ class CoordRegistry:
             )
             return revoked_ids
 
+    def record_transport_binding(
+        self, sandbox_addr: str, incarnation_id: str, owner_id: str
+    ) -> dict[str, Any]:
+        clean_addr = parse_local_target(sandbox_addr).canonical
+        clean_inc = validate_opaque_token(incarnation_id, _LABEL_INCARNATION)
+        clean_owner = validate_opaque_token(owner_id, _LABEL_TRANSPORT_OWNER)
+        now = time.time()
+        with self._tx() as conn:
+            self._check_and_record_binding_conn(conn, clean_addr, clean_inc, clean_owner, now)
+            row = conn.execute(_SQL_SELECT_BINDING, (clean_addr, clean_inc)).fetchone()
+            return _row_to_transport_binding(row)
+
+    def get_transport_binding(
+        self, sandbox_addr: str, incarnation_id: str
+    ) -> dict[str, Any] | None:
+        clean_addr = parse_local_target(sandbox_addr).canonical
+        clean_inc = validate_opaque_token(incarnation_id, _LABEL_INCARNATION)
+        with self._lock:
+            row = self._conn.execute(_SQL_SELECT_BINDING, (clean_addr, clean_inc)).fetchone()
+            return _row_to_transport_binding(row) if row is not None else None
+
+    def list_unconfirmed_transport_bindings(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM external_transport_bindings
+                WHERE terminal_confirmed = 0
+                ORDER BY created_at ASC, sandbox_addr ASC, incarnation_id ASC
+                """
+            ).fetchall()
+            return [_row_to_transport_binding(r) for r in rows]
+
+    def has_unconfirmed_transport_binding(self, sandbox_addr: str) -> bool:
+        clean_addr = parse_local_target(sandbox_addr).canonical
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM external_transport_bindings
+                WHERE sandbox_addr = ? AND terminal_confirmed = 0 LIMIT 1
+                """,
+                (clean_addr,),
+            ).fetchone()
+            return row is not None
+
+    def mark_transport_abort_requested(
+        self, sandbox_addr: str, incarnation_id: str, *, reason: str
+    ) -> bool:
+        clean_addr = parse_local_target(sandbox_addr).canonical
+        clean_inc = validate_opaque_token(incarnation_id, _LABEL_INCARNATION)
+        clean_reason = validate_reason_text(reason, "reason")
+        now = time.time()
+        with self._tx() as conn:
+            cur = conn.execute(
+                """
+                UPDATE external_transport_bindings
+                SET abort_requested = 1, reason = ?, updated_at = ?
+                WHERE sandbox_addr = ? AND incarnation_id = ? AND terminal_confirmed = 0
+                """,
+                (clean_reason, now, clean_addr, clean_inc),
+            )
+            return cur.rowcount == 1
+
+    def _retire_binding_logical_state_conn(
+        self,
+        conn: sqlite3.Connection,
+        clean_addr: str,
+        clean_inc: str,
+        clean_reason: str,
+        now: float,
+    ) -> list[str]:
+        sb = conn.execute(_SQL_SELECT_SANDBOX_INC_STATUS, (clean_addr,)).fetchone()
+        if sb is not None and sb["incarnation_id"] == clean_inc:
+            self._revoke_whole_sandbox_conn(conn, clean_addr, clean_reason, now)
+            where, params = self._build_revoke_where(clean_addr, None, None)
+            rows = conn.execute(
+                f"SELECT edge_id, grant_generation FROM routing_edges WHERE {where} ORDER BY edge_id ASC",
+                params,
+            ).fetchall()
+            return self._revoke_matching_edges_conn(conn, rows, clean_reason, now)
+        stale_rows = conn.execute(
+            """
+            SELECT o.msg_id FROM outbox o
+            JOIN event_log e ON e.msg_id = o.msg_id
+            WHERE o.status = ? AND e.dst_addr = ? AND o.dst_incarnation = ?
+            """,
+            (_STATUS_PENDING, clean_addr, clean_inc),
+        ).fetchall()
+        self._cancel_pending_outbox_msgs(
+            conn, [r["msg_id"] for r in stale_rows], clean_reason, now
+        )
+        return []
+
+    def commit_external_revoke(
+        self,
+        *,
+        target_addr: str,
+        incarnation_id: str,
+        owner_id: str,
+        actor: str,
+        reason: str,
+    ) -> list[str]:
+        """Atomically commit logical retirement, terminal_confirmed=1, and revoke audit."""
+        clean_addr = parse_local_target(target_addr).canonical
+        clean_inc = validate_opaque_token(incarnation_id, _LABEL_INCARNATION)
+        clean_owner = validate_opaque_token(owner_id, _LABEL_TRANSPORT_OWNER)
+        clean_actor = check_no_control_or_bidi(actor, "actor")
+        clean_reason = validate_reason_text(reason, "reason")
+        now = time.time()
+        with self._tx() as conn:
+            binding = conn.execute(_SQL_SELECT_BINDING, (clean_addr, clean_inc)).fetchone()
+            if binding is None or binding["owner_id"] != clean_owner:
+                raise CoordPolicyError("transport_owner_mismatch")
+            if int(binding["terminal_confirmed"]) != 0:
+                return []
+            revoked_ids = self._retire_binding_logical_state_conn(
+                conn, clean_addr, clean_inc, clean_reason, now
+            )
+            conn.execute(
+                """
+                UPDATE external_transport_bindings
+                SET abort_requested = 1, terminal_confirmed = 1, reason = ?, updated_at = ?
+                WHERE sandbox_addr = ? AND incarnation_id = ? AND owner_id = ?
+                """,
+                (clean_reason, now, clean_addr, clean_inc, clean_owner),
+            )
+            self._append_audit_conn(
+                conn,
+                clean_actor,
+                "revoke",
+                clean_addr,
+                "ok",
+                {
+                    "incarnation_id": clean_inc,
+                    "owner_id": clean_owner,
+                    "reason": clean_reason,
+                    "revoked_edges": len(revoked_ids),
+                },
+            )
+            return revoked_ids
+
     def is_grant_tombstoned(self, edge_id: str, grant_generation: int) -> bool:
         with self._lock:
             return self._is_tombstoned_conn(self._conn, edge_id, grant_generation)
@@ -1941,10 +2167,35 @@ class CoordRegistry:
             )
             if cur.rowcount != 1:
                 raise CoordValidationError(_ERR_INVALID_OUTBOX_TRANSITION)
-            conn.execute(
-                "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?",
-                (msg_id,),
+            conn.execute(_SQL_DELETE_UNCONSUMED_DISPATCH_RECEIPT, (msg_id,))
+
+    def abort_handed_off_outbox_row_if_open(self, msg_id: str, *, reason: str) -> bool:
+        """Conditionally abort a handed_off row; return False if already finalized."""
+        clean_reason = validate_reason_text(reason, "reason")
+        now = time.time()
+        with self._tx() as conn:
+            cur = conn.execute(
+                _SQL_UPDATE_OUTBOX_STATUS_DETAIL,
+                (_STATUS_ABORTED, clean_reason, now, msg_id, _STATUS_HANDED_OFF),
             )
+            if cur.rowcount != 1:
+                return False
+            conn.execute(_SQL_DELETE_UNCONSUMED_DISPATCH_RECEIPT, (msg_id,))
+            return True
+
+    def cancel_pending_outbox_row(self, msg_id: str, *, reason: str) -> bool:
+        """Conditionally cancel a row ONLY if still pending; return False if already claimed."""
+        clean_reason = validate_reason_text(reason, "reason")
+        now = time.time()
+        with self._tx() as conn:
+            cur = conn.execute(
+                _SQL_UPDATE_OUTBOX_STATUS_DETAIL,
+                (_STATUS_CANCELLED, clean_reason, now, msg_id, _STATUS_PENDING),
+            )
+            if cur.rowcount != 1:
+                return False
+            conn.execute(_SQL_DELETE_UNCONSUMED_DISPATCH_RECEIPT, (msg_id,))
+            return True
 
     def cancel_outbox_row(self, msg_id: str, *, reason: str) -> None:
         clean_reason = validate_reason_text(reason, "reason")
@@ -1959,10 +2210,7 @@ class CoordRegistry:
             )
             if cur.rowcount != 1:
                 raise CoordValidationError(_ERR_INVALID_OUTBOX_TRANSITION)
-            conn.execute(
-                "DELETE FROM dispatch_receipts WHERE consumed_at IS NULL AND message_id = ?",
-                (msg_id,),
-            )
+            conn.execute(_SQL_DELETE_UNCONSUMED_DISPATCH_RECEIPT, (msg_id,))
 
     # ------------------------------------------------------------------
     # Provenance Receipts, TUI Enter Tokens, & Hostile Stream Events

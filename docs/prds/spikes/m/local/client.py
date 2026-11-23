@@ -102,9 +102,9 @@ class Wire:
         self.deadline = deadline
         self.buffer = bytearray()
 
-    def receive(self) -> None:
+    def receive(self, limit: int = 16_384) -> None:
         self.sock.settimeout(remaining(self.deadline))
-        data = self.sock.recv(16_384)
+        data = self.sock.recv(limit)
         if not data:
             raise ProbeError("unexpected EOF")
         self.buffer.extend(data)
@@ -115,7 +115,7 @@ class Wire:
 
     def take(self, count: int) -> bytes:
         while len(self.buffer) < count:
-            self.receive()
+            self.receive(min(16_384, count - len(self.buffer)))
         data = bytes(self.buffer[:count])
         del self.buffer[:count]
         return data
@@ -427,7 +427,7 @@ class OpenCode:
         with self._response(raw, deadline, "text/event-stream") as response:
             yield Subscription(response)
 
-    def _prompt(self, pins: TurnPins, text: str) -> bytes:
+    def encode_prompt(self, pins: TurnPins, text: str) -> bytes:
         pinned = (pins.sandbox_addr, pins.incarnation_id, pins.grant_generation, pins.thread_id)
         if (self._thread_id is None or type(pins.grant_generation) is not int
                 or pinned != (*self._job_pins, self._thread_id)):
@@ -439,11 +439,23 @@ class OpenCode:
         })
 
     def prompt(self, pins: TurnPins, text: str, deadline: float) -> None:
-        with self._response(self._prompt(pins, text), deadline, JSON_MEDIA_TYPE) as response:
-            data = response.json().get("data")
+        with self._response(self.encode_prompt(pins, text), deadline, JSON_MEDIA_TYPE) as response:
+            self._check_prompt_reply(response, pins)
+
+    def prompt_exchange(self, encoded: bytes, deadline: float, *, pause: bool = False):
+        """Open the prepared frame without reading the eventual HTTP reply."""
+        return self._exchange(encoded, deadline, pause=pause)
+
+    def read_prompt_reply(self, wire: Wire, pins: TurnPins, deadline: float) -> None:
+        wire.deadline = deadline
+        self._check_prompt_reply(Response(wire, status=200, media=JSON_MEDIA_TYPE), pins)
+
+    @staticmethod
+    def _check_prompt_reply(response: Response, pins: TurnPins) -> None:
+        data = response.json().get("data")
         if (not isinstance(data, dict) or data.get("id") != pins.msg_id
                 or data.get("sessionID") != pins.thread_id or data.get("type") != "user"):
             raise ProbeError("worker did not echo the pinned input")
 
     def pause_prompt(self, pins: TurnPins, text: str, deadline: float):
-        return self._exchange(self._prompt(pins, text), deadline, pause=True)
+        return self._exchange(self.encode_prompt(pins, text), deadline, pause=True)

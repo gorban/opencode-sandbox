@@ -2895,6 +2895,11 @@ class TestReciprocalRound6Fixes(CoordTestBase):
                     lambda: any(r["msg_id"] == msg_ho for r in reg_b.list_outbox(statuses=("aborted",)))
                 )
             )
+            self.assertTrue(
+                self._wait_until(
+                    lambda: len(abort_calls) >= 2 and not hub_b._has_pending_cleanups()
+                )
+            )
             self.assertGreaterEqual(len(abort_calls), 2)
             self.assertNotIn(("sb-ho", "inc_ho1"), transport_b.revoked_incarnations)
         finally:
@@ -3896,18 +3901,30 @@ class TestReciprocalRound11Fixes(CoordTestBase):
             self._reg_sb(hub1, _OP, "sb-psrc", "inc_ps1")
             self._reg_sb(hub1, _OP, "sb-pdst", "inc_pd1")
             self._reg_sb(hub1, _OP, "sb-elig", "inc_el1")
+            self._reg_sb(hub1, _OP, "sb-elig0", "inc_el0")
             hub1.grant_edge(_OP, src_actor="sb-psrc", src_incarnation="inc_ps1", dst_addr="sb-pdst")
             hub1.grant_edge(_OP, src_actor=_OP.canonical_sender, dst_addr="sb-elig")
+            hub1.grant_edge(_OP, src_actor="sb-elig0", src_incarnation="inc_el0", dst_addr="sb-elig0")
             p_ctx = PrincipalCtx(
                 CoordRole.JOB, "jp11", sandbox_addr="sb-psrc", incarnation_id="inc_ps1"
             )
-            # Peer row has earlier seq than eligible row (same priority)
+            self_ctx = PrincipalCtx(
+                CoordRole.JOB, "js11", sandbox_addr="sb-elig0", incarnation_id="inc_el0"
+            )
+            # Peer row (priority=0) sits ahead of equal-priority eligible self-send (priority=0) in seq order
             msg_peer = hub1.send(p_ctx, target="sb-pdst", body_text="Unsupported peer row")[
+                "msg_id"
+            ]
+            msg_elig0 = hub1.send(self_ctx, target="sb-elig0", body_text="Eligible prio-0 row")[
                 "msg_id"
             ]
             msg_elig = hub1.send(_OP, target="sb-elig", body_text="Eligible operator row")[
                 "msg_id"
             ]
+            by_id = {r["msg_id"]: r for r in reg1.list_outbox(statuses=("pending",))}
+            self.assertEqual(by_id[msg_peer]["priority"], 0)
+            self.assertEqual(by_id[msg_elig0]["priority"], 0)
+            self.assertLess(by_id[msg_peer]["seq"], by_id[msg_elig0]["seq"])
         finally:
             hub1.close()
             reg1.close()
@@ -3923,12 +3940,14 @@ class TestReciprocalRound11Fixes(CoordTestBase):
         with self.assertRaises(CoordPolicyError):
             hub2.send(p_ctx, target="sb-pdst", body_text="Rejected upfront")
 
-        # Already-pending unsupported peer row sends nothing, yet eligible row STILL dispatches!
-        self.assertEqual(hub2.dispatch_once(async_stream=False), 1)
+        # Already-pending unsupported peer row sends nothing, yet both eligible rows STILL dispatch!
+        self.assertEqual(hub2.dispatch_once(async_stream=False), 2)
         self.assertEqual(inner.dispatched_turns("sb-pdst"), [])
+        self.assertEqual([t.msg_id for t in inner.dispatched_turns("sb-elig0")], [msg_elig0])
         self.assertEqual([t.msg_id for t in inner.dispatched_turns("sb-elig")], [msg_elig])
         self.assertIn(msg_peer, {r["msg_id"] for r in reg2.list_outbox(statuses=("pending",))})
-        self.assertIn(msg_elig, {r["msg_id"] for r in reg2.list_outbox(statuses=("completed",))})
+        completed = {r["msg_id"] for r in reg2.list_outbox(statuses=("completed",))}
+        self.assertTrue({msg_elig, msg_elig0}.issubset(completed))
 
     def test_r11_p2_2_recovery_terminal_abort_settles_failed_receipt_stream_on_purging_transport(
         self,

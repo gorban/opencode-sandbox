@@ -67,5 +67,41 @@ the pinned image. [OpenCode HTTP API reference](https://opencode.ai/docs/api)
 
 The handoff receipt uses the coordination contract's outcome names. The
 standalone host driver waits for the relay receipt outside a coordination hub.
-Durable outbox restart and production integration remain in their respective
-workstreams. See the [walkthrough](WALKTHROUGH.md).
+
+## Joint CoordHub proof
+
+Use a trusted checkout that contains both the local adapter and the shared
+restart qualification implementation. In the same `devbox` session, with the
+image IDs from the standalone command, run:
+
+```sh
+OC_POC_PODMAN_HOST=distrobox PYTHONDONTWRITEBYTECODE=1 python3 docs/prds/spikes/m/local/joint_probe.py \
+  --opencode-image "$opencode_image" --relay-image "$relay_image"
+```
+
+Add `--attended` in a terminal to pause after the first turn's scratch-file
+proof. The driver exercises the real hub and SQLite outbox with three
+disposable OpenCode jobs:
+
+1. Complete an operator turn and verify its streamed text and exact file bytes.
+   Hold the next response, queue another turn, and revoke through the hub.
+   Check that the original SSE reader is still open when the adapter begins
+   terminal cleanup, then verify its closure and HTTP 403 for the stale
+   bearer. Reopen the hub with the same worker and relay IDs still running.
+   The queued row stays cancelled with zero attempts, adapter invocations,
+   worker events, and new provider admissions.
+2. Use a separate fresh job to verify relay receipt `P` before revoke and
+   read the exact terminal grant and durable owner binding while the turn is
+   still paused. Release the pause to receive `Z` and verify zero provider
+   admissions.
+3. Complete an authorized turn on a fresh incarnation at the original address.
+   Verify durable outbox states, grant tombstones, receipts, worker provenance,
+   and the audit chain through the shared evidence verifier.
+
+The synthetic uncertain-handoff restart case is in the shared qualification
+suite. The joint driver verifies cleanup after each job and retains the private
+coordination state under `~/.ocm-joint-*` on failure. The containers' private
+run directories still use the shared `/tmp/ocm-*`. If an individual job fails,
+the driver prints its run directory. See the
+[local adapter walkthrough](ADAPTER_WALKTHROUGH.md) and the
+[shared restart walkthrough](../RESTART_WALKTHROUGH.md).
