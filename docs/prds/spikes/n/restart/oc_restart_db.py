@@ -51,6 +51,7 @@ from oc_restart_contract import (  # noqa: E402
     KEY_FAILURE_REASON,
     KEY_GRANT_GENERATION,
     KEY_IDEM_KEY,
+    KEY_JOURNAL_ID,
     KEY_LAST_EVENT_SEQ,
     KEY_LEASE_EPOCH,
     KEY_MAX_ATTEMPTS,
@@ -137,6 +138,7 @@ _SCHEMA_SQL: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS supervisor_meta (
         id INTEGER PRIMARY KEY CHECK (id = 1),
+        journal_id TEXT NOT NULL,
         current_epoch INTEGER NOT NULL CHECK (current_epoch >= 1),
         last_event_seq INTEGER NOT NULL CHECK (last_event_seq >= 0),
         head_hash TEXT NOT NULL,
@@ -669,6 +671,7 @@ _CORE_TABLE_COLS: dict[str, frozenset[str]] = {
     _TBL_META: frozenset(
         {
             "id",
+            KEY_JOURNAL_ID,
             KEY_CURRENT_EPOCH,
             KEY_LAST_EVENT_SEQ,
             "head_hash",
@@ -946,6 +949,7 @@ _SQL_META_ID = _sql_gated(
 
 _SQL_SELECT_META = (
     f"SELECT {_SQL_META_ID}, "
+    f"{_sql_text(KEY_JOURNAL_ID, 96)}, "
     f"{_sql_int(KEY_CURRENT_EPOCH)}, "
     f"{_sql_int(KEY_LAST_EVENT_SEQ)}, "
     f"{_sql_sha256('head_hash')}, "
@@ -1240,6 +1244,7 @@ def read_meta_strict(
             updated_at_us=validate_int64(
                 row[KEY_UPDATED_AT_US], KEY_UPDATED_AT_US, min_val=0
             ),
+            journal_id=validate_opaque_id(row[KEY_JOURNAL_ID], KEY_JOURNAL_ID),
         )
     except (RestartValidationError, ValueError) as exc:
         raise _as_integrity_error(exc) from exc

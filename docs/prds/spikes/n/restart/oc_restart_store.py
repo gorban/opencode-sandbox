@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+import secrets
 import sqlite3
 import sys
 import threading
@@ -473,6 +474,7 @@ class WorkflowRestartJournal:
         *,
         state_dir: Path,
         db_path: Path,
+        journal_id: str,
         lock_fd: int,
         conn: sqlite3.Connection,
         current_epoch: int,
@@ -480,6 +482,7 @@ class WorkflowRestartJournal:
     ) -> None:
         self._state_dir = state_dir
         self._db_path = db_path
+        self._journal_id = journal_id
         self._lock_fd: int | None = lock_fd
         self._conn: sqlite3.Connection | None = conn
         self._current_epoch = current_epoch
@@ -497,7 +500,7 @@ class WorkflowRestartJournal:
 
     @property
     def journal_id(self) -> str:
-        return str(self._db_path.resolve())
+        return self._journal_id
 
     @property
     def state_dir(self) -> Path:
@@ -527,7 +530,7 @@ class WorkflowRestartJournal:
             verify_all_db_files(db_path, required_main=False)
             conn = open_sqlite_bounded(db_path, readonly=False, deadline=deadline)
             with scoped_op_deadline(conn, deadline):
-                report = cls._recover_inside_tx(
+                report, journal_id = cls._recover_inside_tx(
                     conn,
                     created_at_us=created_at_us,
                     max_replay_events=cap,
@@ -539,6 +542,7 @@ class WorkflowRestartJournal:
             journal = cls(
                 state_dir=trusted_dir,
                 db_path=db_path,
+                journal_id=journal_id,
                 lock_fd=lock_fd,
                 conn=conn,
                 current_epoch=report.supervisor_epoch,
@@ -558,7 +562,7 @@ class WorkflowRestartJournal:
         max_replay_events: int,
         crash_point: CrashPoint,
         deadline: float,
-    ) -> RecoveryReport:
+    ) -> tuple[RecoveryReport, str]:
         execute_bounded(conn, _SQL_BEGIN_IMMEDIATE, (), deadline)
         verify_no_unexpected_schema_objects(
             conn, require_core_tables=False, deadline=deadline
@@ -567,6 +571,7 @@ class WorkflowRestartJournal:
         meta = read_meta_strict(conn, allow_missing=True, deadline=deadline)
         if meta is None:
             assert_all_other_tables_empty(conn, deadline)
+            journal_id = f"jnl_{secrets.token_hex(16)}"
             new_epoch = 1
             prior_epoch = 0
             dirty_recovery = False
@@ -577,15 +582,16 @@ class WorkflowRestartJournal:
             execute_bounded(
                 conn,
                 "INSERT INTO supervisor_meta "
-                "(id, current_epoch, last_event_seq, head_hash, dirty_shutdown, updated_at_us) "
-                "VALUES (1, 1, 0, ?, 1, ?)",
-                (EVENT_GENESIS_HASH, created_at_us),
+                "(id, journal_id, current_epoch, last_event_seq, head_hash, dirty_shutdown, updated_at_us) "
+                "VALUES (1, ?, 1, 0, ?, 1, ?)",
+                (journal_id, EVENT_GENESIS_HASH, created_at_us),
                 deadline,
             )
         else:
             prior = _verify_and_replay_in_tx(
                 conn, meta, max_replay_events=max_replay_events, deadline=deadline
             )
+            journal_id = meta.journal_id
             new_epoch = meta.current_epoch + 1
             prior_epoch = meta.current_epoch
             dirty_recovery = meta.dirty_shutdown == 1
@@ -654,15 +660,18 @@ class WorkflowRestartJournal:
             execute_bounded(conn, "ROLLBACK", (), deadline)
             raise SimulatedSupervisorCrash("DURING_RECOVERY_BEFORE_COMMIT")
         execute_bounded(conn, "COMMIT", (), deadline)
-        return RecoveryReport(
-            supervisor_epoch=new_epoch,
-            prior_epoch=prior_epoch,
-            dirty_recovery=dirty_recovery,
-            last_event_seq=seq,
-            head_hash=head_hash,
-            fenced_requeued=tuple(buckets["requeued"]),
-            fenced_uncertain=tuple(buckets["uncertain"]),
-            fenced_failed=tuple(buckets["failed"]),
+        return (
+            RecoveryReport(
+                supervisor_epoch=new_epoch,
+                prior_epoch=prior_epoch,
+                dirty_recovery=dirty_recovery,
+                last_event_seq=seq,
+                head_hash=head_hash,
+                fenced_requeued=tuple(buckets["requeued"]),
+                fenced_uncertain=tuple(buckets["uncertain"]),
+                fenced_failed=tuple(buckets["failed"]),
+            ),
+            journal_id,
         )
 
     @contextmanager
@@ -2086,12 +2095,25 @@ class DurableWorkflowSupervisor:
 
     def simulate_crash(self) -> None:
         with self._lifecycle_gate:
-            self._tracker.fence_epoch(self._journal.current_epoch + 1)
+            self._tracker.fence_epoch(
+                self._journal.current_epoch + 1,
+                journal_id=self._journal.journal_id,
+            )
             self._journal.simulate_crash()
 
     def close_clean(self, *, clock: ClockSnapshot) -> int:
         with self._lifecycle_gate:
             return self._journal.close_clean(clock=clock)
+
+    def issue_tracker_receipt(
+        self, token: StepLeaseToken, *, force_fence: bool = False
+    ) -> EffectTrackerReceipt:
+        return self._tracker.issue_receipt(
+            token=token,
+            current_epoch=self._journal.current_epoch,
+            force_fence=force_fence,
+            journal_id=self._journal.journal_id,
+        )
 
     def reconcile_step(
         self,
@@ -2122,7 +2144,7 @@ class DurableWorkflowSupervisor:
     def _settle_pre_entry_refusal(
         self, token: StepLeaseToken, *, reason: str, clock: ClockSnapshot
     ) -> None:
-        self._tracker.fence_attempt(token)
+        self._tracker.fence_attempt(token, journal_id=self._journal.journal_id)
         self._journal.fail_step(
             FailStepRequest(
                 token=token,

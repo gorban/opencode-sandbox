@@ -1597,7 +1597,9 @@ class TestCapacityHeadroomAndTamperDefense(_RestartFixtureBase):
 
         # 2. last_event_seq == 0 on existing DB rejected.
         self._tamper_db(
-            "INSERT INTO supervisor_meta VALUES (1, 1, 0, ?, 0, 1)", (EVENT_GENESIS_HASH,)
+            "INSERT INTO supervisor_meta VALUES "
+            "(1, 'jnl_tamper000000000000000000000000', 1, 0, ?, 0, 1)",
+            (EVENT_GENESIS_HASH,),
         )
         with self.assertRaises(JournalIntegrityError):
             verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
@@ -3657,7 +3659,11 @@ class TestAdversarialRegressionsRound4(_RestartFixtureBase):
         )
         try:
             self.assertEqual(rep_b2.supervisor_epoch, 2)
-            rcpt_foreign = tracker_a.issue_receipt(token=captured_b[0], current_epoch=2)
+            rcpt_foreign = tracker_a.issue_receipt(
+                token=captured_b[0],
+                current_epoch=2,
+                journal_id=sup_b2.journal.journal_id,
+            )
             self.assertEqual(rcpt_foreign.tracker_outcome, "still_pending")
             req_requeue = ReconcileStepRequest(
                 run_id="run_b",
@@ -3687,6 +3693,222 @@ class TestAdversarialRegressionsRound4(_RestartFixtureBase):
 
         verify_journal_replay_readonly(dir_a, sandbox_root=self.sandbox_root)
         verify_journal_replay_readonly(dir_b, sandbox_root=self.sandbox_root)
+
+
+class TestAdversarialRegressionsRound5(_RestartFixtureBase):
+    def test_foreign_journal_refused_before_stored_attempt_or_epoch_mutation(
+        self,
+    ) -> None:
+        dir_a = self.root / "lineage_a"
+        dir_b = self.root / "lineage_b"
+        for d in (dir_a, dir_b):
+            d.mkdir(mode=0o700)
+            os.chmod(d, 0o700)
+
+        # Journal A (owner): executes shared_run/se1 with exact idem key -> effect_applied.
+        tracker_a = SyntheticEffectTracker()
+        sup_a, _ = DurableWorkflowSupervisor.start_or_recover(
+            dir_a,
+            clock=self.clock.now(),
+            tracker=tracker_a,
+            sandbox_root=self.sandbox_root,
+        )
+        jid_a = sup_a.journal.journal_id
+        captured_a: list[StepLeaseToken] = []
+        try:
+            steps = (
+                StepSpec("se1", "se1", "stage_patch", True),
+                StepSpec("se2", "se2", "stage_patch", True),
+            )
+            sup_a.journal.create_run(self._make_run_request("shared_run", steps))
+            sup_a.run_step_once(
+                "shared_run",
+                "se1",
+                idempotency_key="shared_idem_1",
+                worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                clock_provider=self.clock.advance,
+                captured_tokens=captured_a,
+            )
+
+            # Journal B (foreign): identical coordinates (run_id, step_id, attempt, epoch, idem)!
+            tracker_b = SyntheticEffectTracker()
+            sup_b1, _ = DurableWorkflowSupervisor.start_or_recover(
+                dir_b,
+                clock=self.clock.advance(),
+                tracker=tracker_b,
+                sandbox_root=self.sandbox_root,
+            )
+            jid_b = sup_b1.journal.journal_id
+            self.assertNotEqual(jid_a, jid_b)
+            captured_b: list[StepLeaseToken] = []
+            try:
+                sup_b1.journal.create_run(self._make_run_request("shared_run", steps))
+                with self.assertRaises(SimulatedSupervisorCrash):
+                    sup_b1.run_step_once(
+                        "shared_run",
+                        "se1",
+                        idempotency_key="shared_idem_1",
+                        worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_B),
+                        clock_provider=self.clock.advance,
+                        crash_point=CrashPoint.AFTER_LEASE_COMMIT_BEFORE_WORKER,
+                        captured_tokens=captured_b,
+                    )
+            finally:
+                sup_b1.simulate_crash()
+
+            self.assertEqual(captured_a[0], captured_b[0])
+
+            # Foreign calls MUST NOT read owner's stored effect_applied OR advance owner epoch!
+            tracker_a.attach_epoch(99, journal_id=jid_b)
+            rcpt_foreign = tracker_a.issue_receipt(
+                token=captured_b[0],
+                current_epoch=99,
+                force_fence=True,
+                journal_id=jid_b,
+            )
+            self.assertEqual(rcpt_foreign.tracker_outcome, "still_pending")
+            self.assertIsNone(rcpt_foreign.output_digest)
+            tracker_a.fence_epoch(99, journal_id=jid_b)
+
+            # Reopen Journal B injecting tracker_a: reconciling COMPLETED using A's stored
+            # receipt MUST fail closed with ReconciliationEvidenceError!
+            owner_applied = tracker_a.issue_receipt(
+                token=captured_a[0], current_epoch=1, journal_id=jid_a
+            )
+            self.assertEqual(owner_applied.tracker_outcome, "effect_applied")
+            sup_b2, _ = DurableWorkflowSupervisor.start_or_recover(
+                dir_b,
+                clock=self.clock.advance(),
+                tracker=tracker_a,
+                sandbox_root=self.sandbox_root,
+            )
+            try:
+                bad_comp = ReconcileStepRequest(
+                    run_id="shared_run",
+                    step_id="se1",
+                    expected_attempt_no=1,
+                    expected_epoch=2,
+                    reconciliation_key="recon_steal_owner_receipt",
+                    resolution=ReconcileResolution.COMPLETED,
+                    output_digest=_DIGEST_A,
+                    evidence_digest=owner_applied.receipt_digest,
+                    reason="try_steal_owner_effect_applied",
+                    clock=self.clock.advance(),
+                )
+                with self.assertRaises(ReconciliationEvidenceError):
+                    sup_b2.reconcile_step(bad_comp, tracker_receipt=owner_applied)
+            finally:
+                sup_b2.close_clean(clock=self.clock.advance())
+
+            # Owner Journal A is completely unharmed: can still execute epoch-1 se2!
+            out_a2 = sup_a.run_step_once(
+                "shared_run",
+                "se2",
+                worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_B),
+                clock_provider=self.clock.advance,
+            )
+            self.assertEqual(out_a2.ack.status, StepStatus.COMPLETED.value)
+        finally:
+            sup_a.close_clean(clock=self.clock.advance())
+
+        verify_journal_replay_readonly(dir_a, sandbox_root=self.sandbox_root)
+        verify_journal_replay_readonly(dir_b, sandbox_root=self.sandbox_root)
+
+    def test_recreated_db_at_same_path_has_fresh_journal_id_and_refuses_old_tracker(
+        self,
+    ) -> None:
+        # 1. Create Journal 1 at self.state_dir with tracker_1 -> binds to jid_1, epoch 1.
+        tracker_1 = SyntheticEffectTracker()
+        sup1, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker_1,
+            sandbox_root=self.sandbox_root,
+        )
+        jid_1 = sup1.journal.journal_id
+        try:
+            sup1.journal.create_run(
+                self._make_run_request(
+                    "run_orig", (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+        finally:
+            sup1.close_clean(clock=self.clock.advance())
+
+        # 2. Delete Journal 1's DB & sidecar files and create a brand-new Journal 2 at
+        #    the EXACT SAME self.state_dir path!
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            p = Path(f"{self.state_dir / DB_FILENAME}{suffix}")
+            if p.exists():
+                p.unlink()
+
+        tracker_2 = SyntheticEffectTracker()
+        sup2, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.advance(),
+            tracker=tracker_2,
+            sandbox_root=self.sandbox_root,
+        )
+        jid_2 = sup2.journal.journal_id
+        self.assertNotEqual(jid_1, jid_2)
+        captured_2: list[StepLeaseToken] = []
+        try:
+            sup2.journal.create_run(
+                self._make_run_request(
+                    "run_fresh", (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+            with self.assertRaises(SimulatedSupervisorCrash):
+                sup2.run_step_once(
+                    "run_fresh",
+                    "se1",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                    clock_provider=self.clock.advance,
+                    crash_point=CrashPoint.AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT,
+                    captured_tokens=captured_2,
+                )
+            self.assertEqual(tracker_2.count("run_fresh", "se1"), 1)
+        finally:
+            sup2.simulate_crash()
+
+        # 3. Recover Journal 2 (same path, epoch 2) with old tracker_1 -> MUST refuse!
+        sup2_rec, rep2 = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.advance(),
+            tracker=tracker_1,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            self.assertEqual(rep2.supervisor_epoch, 2)
+            self.assertEqual(sup2_rec.journal.journal_id, jid_2)
+            rcpt = sup2_rec.issue_tracker_receipt(captured_2[0])
+            self.assertEqual(rcpt.tracker_outcome, "still_pending")
+            req_requeue = ReconcileStepRequest(
+                run_id="run_fresh",
+                step_id="se1",
+                expected_attempt_no=1,
+                expected_epoch=2,
+                reconciliation_key="recon_recreated_same_path",
+                resolution=ReconcileResolution.REQUEUE_PENDING,
+                output_digest=None,
+                evidence_digest=rcpt.receipt_digest,
+                reason="try_requeue_old_tracker_same_path",
+                clock=self.clock.advance(),
+            )
+            with self.assertRaises(ReconciliationEvidenceError):
+                sup2_rec.reconcile_step(
+                    req_requeue,
+                    tracker_receipt=rcpt,
+                    clock_provider=self.clock.advance,
+                )
+            self.assertEqual(
+                sup2_rec.journal.get_step("run_fresh", "se1").status,
+                StepStatus.UNCERTAIN_NEEDS_RECONCILE,
+            )
+            self.assertEqual(tracker_1.count("run_fresh", "se1"), 0)
+        finally:
+            sup2_rec.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
 
 
 if __name__ == "__main__":
