@@ -2245,6 +2245,7 @@ class DurableWorkflowSupervisor:
         captured_tokens: list[StepLeaseToken] | None = None,
         on_after_lease_before_entry: Callable[[StepLeaseToken], None] | None = None,
     ) -> StepExecutionOutcome:
+        self._tracker.assert_bound_to_journal(self._journal.journal_id)
         t_lease = clock_provider()
         self._verify_live_run_authority(run_id, t_lease)
 

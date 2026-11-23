@@ -579,7 +579,9 @@ class TestLifecycleGateAndMidStepAuthority(_RestartFixtureBase):
                     clock_provider=self.clock.advance,
                     on_after_lease_before_entry=_revoke_before_entry,
                 )
-            self.assertEqual(tracker.count(receipt.run_id, "scan"), 0)
+            self.assertEqual(
+                tracker.count(receipt.run_id, "scan", journal_id=sup.journal.journal_id), 0
+            )
             step = sup.journal.get_step(receipt.run_id, "scan")
             self.assertEqual(step.status, StepStatus.FAILED_TERMINAL)
             self.assertEqual(step.failure_reason, ERR_AUTH_REVOKED_PRE_ENTRY)
@@ -608,7 +610,9 @@ class TestLifecycleGateAndMidStepAuthority(_RestartFixtureBase):
                     clock_provider=self.clock.advance,
                     on_after_lease_before_entry=_cancel_pure,
                 )
-            self.assertEqual(tracker.count(receipt.run_id, "scan"), 0)
+            self.assertEqual(
+                tracker.count(receipt.run_id, "scan", journal_id=sup.journal.journal_id), 0
+            )
             self.assertEqual(sup.journal.get_step(receipt.run_id, "scan").status, StepStatus.CANCELLED)
             self.assertEqual(sup.journal.get_run(receipt.run_id).status, RunStatus.CANCELLED)
         finally:
@@ -654,7 +658,12 @@ class TestLifecycleGateAndMidStepAuthority(_RestartFixtureBase):
                     clock_provider=self.clock.advance,
                     on_after_lease_before_entry=_cancel_se,
                 )
-            self.assertEqual(tracker2.count(rec2.run_id, "apply_patch"), 0)
+            self.assertEqual(
+                tracker2.count(
+                    rec2.run_id, "apply_patch", journal_id=sup2.journal.journal_id
+                ),
+                0,
+            )
             se_step = sup2.journal.get_step(rec2.run_id, "apply_patch")
             self.assertEqual(se_step.status, StepStatus.UNCERTAIN_NEEDS_RECONCILE)
             self.assertEqual(
@@ -692,7 +701,9 @@ class TestLifecycleGateAndMidStepAuthority(_RestartFixtureBase):
                 worker_fn=_worker_revoke_mid_exec,
                 clock_provider=self.clock.advance,
             )
-            self.assertEqual(tracker.count(receipt.run_id, "scan"), 1)
+            self.assertEqual(
+                tracker.count(receipt.run_id, "scan", journal_id=sup.journal.journal_id), 1
+            )
             self.assertEqual(outcome.ack.status, StepStatus.COMPLETED.value)
             step = sup.journal.get_step(receipt.run_id, "scan")
             self.assertEqual(step.status, StepStatus.COMPLETED)
@@ -709,7 +720,12 @@ class TestLifecycleGateAndMidStepAuthority(_RestartFixtureBase):
                     worker_fn=_worker_next,
                     clock_provider=self.clock.advance,
                 )
-            self.assertEqual(tracker.count(receipt.run_id, "apply_patch"), 0)
+            self.assertEqual(
+                tracker.count(
+                    receipt.run_id, "apply_patch", journal_id=sup.journal.journal_id
+                ),
+                0,
+            )
         finally:
             sup.close_clean(clock=self.clock.advance())
         verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
@@ -879,7 +895,9 @@ class TestCrashRecoveryFencingAndIdempotency(_RestartFixtureBase):
                 crash_point=CrashPoint.AFTER_LEASE_COMMIT_BEFORE_WORKER,
                 captured_tokens=pure_tokens,
             )
-        self.assertEqual(tracker.count("run_pre", "pure_step"), 0)
+        self.assertEqual(
+            tracker.count("run_pre", "pure_step", journal_id=sup1.journal.journal_id), 0
+        )
 
         # Restart into epoch 2 -> pure_step auto-requeued, executes once, completes!
         sup2, rep2 = DurableWorkflowSupervisor.start_or_recover(
@@ -895,7 +913,9 @@ class TestCrashRecoveryFencingAndIdempotency(_RestartFixtureBase):
         )
         self.assertEqual(out_pure.token.attempt_no, 2)
         self.assertEqual(out_pure.token.lease_epoch, 2)
-        self.assertEqual(tracker.count("run_pre", "pure_step"), 1)
+        self.assertEqual(
+            tracker.count("run_pre", "pure_step", journal_id=sup2.journal.journal_id), 1
+        )
 
         # Crash before worker on side-effecting step!
         se_tokens: list[StepLeaseToken] = []
@@ -908,7 +928,9 @@ class TestCrashRecoveryFencingAndIdempotency(_RestartFixtureBase):
                 crash_point=CrashPoint.AFTER_LEASE_COMMIT_BEFORE_WORKER,
                 captured_tokens=se_tokens,
             )
-        self.assertEqual(tracker.count("run_pre", "se_step"), 0)
+        self.assertEqual(
+            tracker.count("run_pre", "se_step", journal_id=sup2.journal.journal_id), 0
+        )
 
         sup3, rep3 = DurableWorkflowSupervisor.start_or_recover(
             self.state_dir, clock=self.clock.advance(), tracker=tracker, sandbox_root=self.sandbox_root
@@ -1011,7 +1033,9 @@ class TestCrashRecoveryFencingAndIdempotency(_RestartFixtureBase):
                 clock_provider=self.clock.advance,
             )
             self.assertEqual(out_se.token.attempt_no, 2)
-            self.assertEqual(tracker.count("run_pre", "se_step"), 1)
+            self.assertEqual(
+                tracker.count("run_pre", "se_step", journal_id=sup3.journal.journal_id), 1
+            )
             self.assertEqual(sup3.journal.get_run("run_pre").status, RunStatus.COMPLETED)
         finally:
             sup3.close_clean(clock=self.clock.advance())
@@ -1046,7 +1070,9 @@ class TestCrashRecoveryFencingAndIdempotency(_RestartFixtureBase):
                 crash_point=CrashPoint.AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT,
                 captured_tokens=stale_tokens,
             )
-        self.assertEqual(tracker.count("run_se", "se_exec"), 1)
+        self.assertEqual(
+            tracker.count("run_se", "se_exec", journal_id=sup1.journal.journal_id), 1
+        )
 
         sup2, rep2 = DurableWorkflowSupervisor.start_or_recover(
             self.state_dir, clock=self.clock.advance(), tracker=tracker, sandbox_root=self.sandbox_root
@@ -1140,7 +1166,9 @@ class TestCrashRecoveryFencingAndIdempotency(_RestartFixtureBase):
                 worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_B),
                 clock_provider=self.clock.advance,
             )
-            self.assertEqual(tracker.count("run_se", "se_exec"), 1)
+            self.assertEqual(
+            tracker.count("run_se", "se_exec", journal_id=sup1.journal.journal_id), 1
+        )
             self.assertEqual(sup2.journal.get_run("run_se").status, RunStatus.COMPLETED)
         finally:
             sup2.close_clean(clock=self.clock.advance())
@@ -2279,7 +2307,12 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
                     worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
                     clock_provider=self.clock.advance,
                 )
-            self.assertEqual(tracker.count(rec_obs.run_id, "collect"), 0)
+            self.assertEqual(
+                tracker.count(
+                    rec_obs.run_id, "collect", journal_id=sup2.journal.journal_id
+                ),
+                0,
+            )
             self.assertEqual(
                 sup2.journal.get_step(rec_obs.run_id, "collect").status,
                 StepStatus.PENDING,
@@ -2305,7 +2338,12 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
                     tracker_receipt=no_eff,
                     clock_provider=self.clock.advance,
                 )
-            self.assertEqual(tracker.count(rec_act.run_id, "apply_patch"), 0)
+            self.assertEqual(
+                tracker.count(
+                    rec_act.run_id, "apply_patch", journal_id=sup2.journal.journal_id
+                ),
+                0,
+            )
 
             # Terminal settlement still succeeds without authority_store.
             settled = sup2.reconcile_step(
@@ -2506,7 +2544,9 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
                     crash_point=CrashPoint.AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT,
                     captured_tokens=captured,
                 )
-            self.assertEqual(tracker1.count("run_hist", "se1"), 1)
+            self.assertEqual(
+                tracker1.count("run_hist", "se1", journal_id=sup1.journal.journal_id), 1
+            )
         finally:
             sup1.simulate_crash()
 
@@ -2539,7 +2579,9 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
                     tracker_receipt=rcpt,
                     clock_provider=self.clock.advance,
                 )
-            self.assertEqual(tracker2.count("run_hist", "se1"), 0)
+            self.assertEqual(
+                tracker2.count("run_hist", "se1", journal_id=sup2.journal.journal_id), 0
+            )
             self.assertEqual(
                 sup2.journal.get_step("run_hist", "se1").status,
                 StepStatus.UNCERTAIN_NEEDS_RECONCILE,
@@ -3163,7 +3205,9 @@ class TestAdversarialRegressionsRound3(_RestartFixtureBase):
                     crash_point=CrashPoint.AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT,
                     captured_tokens=captured,
                 )
-            self.assertEqual(tracker_b.count("run_gap", "se1"), 1)
+            self.assertEqual(
+                tracker_b.count("run_gap", "se1", journal_id=sup2.journal.journal_id), 1
+            )
         finally:
             sup2.simulate_crash()
 
@@ -3197,7 +3241,9 @@ class TestAdversarialRegressionsRound3(_RestartFixtureBase):
                     tracker_receipt=rcpt,
                     clock_provider=self.clock.advance,
                 )
-            self.assertEqual(tracker_a.count("run_gap", "se1"), 0)
+            self.assertEqual(
+                tracker_a.count("run_gap", "se1", journal_id=sup3.journal.journal_id), 0
+            )
         finally:
             sup3.close_clean(clock=self.clock.advance())
 
@@ -3341,7 +3387,10 @@ class TestAdversarialRegressionsRound3(_RestartFixtureBase):
                     on_after_lease_before_entry=_pause_before_entry,
                 )
             self.assertIn("run_paused_before_worker_entry", str(ctx.exception))
-            self.assertEqual(tracker.count("run_pause_pre", "step_b"), 0)
+            self.assertEqual(
+                tracker.count("run_pause_pre", "step_b", journal_id=sup.journal.journal_id),
+                0,
+            )
             step_b_rec = sup.journal.get_step("run_pause_pre", "step_b")
             self.assertEqual(step_b_rec.status, StepStatus.FAILED_TERMINAL)
             self.assertEqual(step_b_rec.failure_reason, "run_paused_before_worker_entry")
@@ -3428,7 +3477,9 @@ class TestAdversarialRegressionsRound3(_RestartFixtureBase):
                 )
             self.assertTrue(admitted)
             self.assertEqual(out.ack.status, StepStatus.COMPLETED.value)
-            self.assertEqual(tracker.count("run_no_get", "se1"), 1)
+            self.assertEqual(
+                tracker.count("run_no_get", "se1", journal_id=sup.journal.journal_id), 1
+            )
         finally:
             sup.close_clean(clock=self.clock.advance())
         verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
@@ -3555,7 +3606,9 @@ class TestAdversarialRegressionsRound4(_RestartFixtureBase):
             self.assertEqual(a_errors, [])
             self.assertEqual(a_settled_before_admit, [False])
             self.assertEqual(out_b.ack.status, StepStatus.COMPLETED.value)
-            self.assertEqual(tracker.count("run_ser_1", "step_b"), 1)
+            self.assertEqual(
+                tracker.count("run_ser_1", "step_b", journal_id=sup.journal.journal_id), 1
+            )
             self.assertEqual(
                 sup.journal.get_step("run_ser_1", "step_a").status,
                 StepStatus.UNCERTAIN_NEEDS_RECONCILE,
@@ -3615,7 +3668,9 @@ class TestAdversarialRegressionsRound4(_RestartFixtureBase):
                 )
             self.assertEqual(a2_errors, [])
             self.assertIn("run_paused_before_worker_entry", str(ctx.exception))
-            self.assertEqual(tracker.count("run_ser_2", "step_b"), 0)
+            self.assertEqual(
+                tracker.count("run_ser_2", "step_b", journal_id=sup.journal.journal_id), 0
+            )
             self.assertEqual(
                 sup.journal.get_step("run_ser_2", "step_b").status,
                 StepStatus.FAILED_TERMINAL,
@@ -3674,7 +3729,9 @@ class TestAdversarialRegressionsRound4(_RestartFixtureBase):
                     crash_point=CrashPoint.AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT,
                     captured_tokens=captured_b,
                 )
-            self.assertEqual(tracker_b.count("run_b", "se1"), 1)
+            self.assertEqual(
+                tracker_b.count("run_b", "se1", journal_id=sup_b1.journal.journal_id), 1
+            )
         finally:
             sup_b1.simulate_crash()
 
@@ -3715,7 +3772,9 @@ class TestAdversarialRegressionsRound4(_RestartFixtureBase):
                 sup_b2.journal.get_step("run_b", "se1").status,
                 StepStatus.UNCERTAIN_NEEDS_RECONCILE,
             )
-            self.assertEqual(tracker_a.count("run_b", "se1"), 0)
+            self.assertEqual(
+                tracker_a.count("run_b", "se1", journal_id=tracker_a.bound_journal_id), 0
+            )
         finally:
             sup_b2.close_clean(clock=self.clock.advance())
 
@@ -3895,7 +3954,9 @@ class TestAdversarialRegressionsRound5(_RestartFixtureBase):
                     crash_point=CrashPoint.AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT,
                     captured_tokens=captured_2,
                 )
-            self.assertEqual(tracker_2.count("run_fresh", "se1"), 1)
+            self.assertEqual(
+                tracker_2.count("run_fresh", "se1", journal_id=jid_2), 1
+            )
         finally:
             sup2.simulate_crash()
 
@@ -3933,7 +3994,9 @@ class TestAdversarialRegressionsRound5(_RestartFixtureBase):
                 sup2_rec.journal.get_step("run_fresh", "se1").status,
                 StepStatus.UNCERTAIN_NEEDS_RECONCILE,
             )
-            self.assertEqual(tracker_1.count("run_fresh", "se1"), 0)
+            self.assertEqual(
+                tracker_1.count("run_fresh", "se1", journal_id=jid_1), 0
+            )
         finally:
             sup2_rec.close_clean(clock=self.clock.advance())
         verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
@@ -4107,7 +4170,7 @@ class TestAdversarialRegressionsRound7(_RestartFixtureBase):
         self.assertEqual(res.outcome, "completed")
         self.assertEqual(res.output_digest, _DIGEST_A)
         self.assertEqual(worker_calls, 1)
-        self.assertEqual(tracker.count("run_ra_1", "se1"), 1)
+        self.assertEqual(tracker.count("run_ra_1", "se1", journal_id=owner_jid), 1)
 
         with self.assertRaises(InvalidStepTransitionError):
             tracker.run_admitted(tok, worker_fn=_worker, journal_id=owner_jid)
@@ -4237,6 +4300,146 @@ class TestAdversarialRegressionsRound7(_RestartFixtureBase):
 
         verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
         verify_journal_replay_readonly(dir_noeff, sandbox_root=self.sandbox_root)
+
+
+class TestAdversarialRegressionsRound8(_RestartFixtureBase):
+    def test_refused_tracker_binding_rejects_run_step_once_before_leasing(
+        self,
+    ) -> None:
+        # Case A: Already-used standalone tracker refuses binding -> run_step_once
+        # MUST fail closed with StaleEpochError BEFORE lease_step (0 journal writes!).
+        used_standalone = SyntheticEffectTracker()
+        used_standalone.attach_epoch(1)
+        sup_standalone, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=used_standalone,
+            sandbox_root=self.sandbox_root,
+        )
+        worker_calls = 0
+
+        def _worker(_tok: StepLeaseToken) -> WorkerStepResult:
+            nonlocal worker_calls
+            worker_calls += 1
+            return WorkerStepResult("completed", _DIGEST_A)
+
+        try:
+            self.assertIsNone(used_standalone.bound_journal_id)
+            sup_standalone.journal.create_run(
+                self._make_run_request(
+                    "run_refused_1", (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+            seq_before_1 = sup_standalone.journal.get_meta().last_event_seq
+            with self.assertRaises(StaleEpochError):
+                sup_standalone.run_step_once(
+                    "run_refused_1",
+                    "se1",
+                    worker_fn=_worker,
+                    clock_provider=self.clock.advance,
+                )
+            self.assertEqual(worker_calls, 0)
+            step1 = sup_standalone.journal.get_step("run_refused_1", "se1")
+            self.assertEqual(step1.status, StepStatus.PENDING)
+            self.assertEqual(step1.attempt_no, 0)
+            self.assertEqual(
+                sup_standalone.journal.get_meta().last_event_seq, seq_before_1
+            )
+        finally:
+            sup_standalone.close_clean(clock=self.clock.advance())
+
+        # Case B: Foreign-journal tracker refuses binding -> run_step_once MUST fail
+        # closed with StaleEpochError BEFORE lease_step (0 journal writes!).
+        dir_owner = self.root / "owner_prelease"
+        dir_foreign = self.root / "foreign_prelease"
+        for d in (dir_owner, dir_foreign):
+            d.mkdir(mode=0o700)
+            os.chmod(d, 0o700)
+
+        owner_tracker = SyntheticEffectTracker()
+        sup_owner, _ = DurableWorkflowSupervisor.start_or_recover(
+            dir_owner,
+            clock=self.clock.advance(),
+            tracker=owner_tracker,
+            sandbox_root=self.sandbox_root,
+        )
+        sup_owner.close_clean(clock=self.clock.advance())
+
+        sup_foreign, _ = DurableWorkflowSupervisor.start_or_recover(
+            dir_foreign,
+            clock=self.clock.advance(),
+            tracker=owner_tracker,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            sup_foreign.journal.create_run(
+                self._make_run_request(
+                    "run_refused_2", (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+            seq_before_2 = sup_foreign.journal.get_meta().last_event_seq
+            with self.assertRaises(StaleEpochError):
+                sup_foreign.run_step_once(
+                    "run_refused_2",
+                    "se1",
+                    worker_fn=_worker,
+                    clock_provider=self.clock.advance,
+                )
+            self.assertEqual(worker_calls, 0)
+            step2 = sup_foreign.journal.get_step("run_refused_2", "se1")
+            self.assertEqual(step2.status, StepStatus.PENDING)
+            self.assertEqual(step2.attempt_no, 0)
+            self.assertEqual(
+                sup_foreign.journal.get_meta().last_event_seq, seq_before_2
+            )
+        finally:
+            sup_foreign.close_clean(clock=self.clock.advance())
+
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+        verify_journal_replay_readonly(dir_owner, sandbox_root=self.sandbox_root)
+        verify_journal_replay_readonly(dir_foreign, sandbox_root=self.sandbox_root)
+
+    def test_count_enforces_exact_bound_journal_id(self) -> None:
+        tracker = SyntheticEffectTracker()
+        sup, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            sandbox_root=self.sandbox_root,
+        )
+        owner_jid = sup.journal.journal_id
+        foreign_jid = "jnl_ffffffffffffffffffffffffffffffff"
+        try:
+            sup.journal.create_run(
+                self._make_run_request(
+                    "run_cnt", (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+            sup.run_step_once(
+                "run_cnt",
+                "se1",
+                worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                clock_provider=self.clock.advance,
+            )
+            # Owner journal_id succeeds cleanly.
+            self.assertEqual(
+                tracker.count("run_cnt", "se1", journal_id=owner_jid), 1
+            )
+            # Foreign journal_id MUST raise StaleEpochError.
+            with self.assertRaises(StaleEpochError):
+                tracker.count("run_cnt", "se1", journal_id=foreign_jid)
+            # Omitted journal_id=None on bound tracker MUST raise StaleEpochError.
+            with self.assertRaises(StaleEpochError):
+                tracker.count("run_cnt", "se1")
+        finally:
+            sup.close_clean(clock=self.clock.advance())
+
+        # Standalone unbound tracker rejects non-None journal_id and allows None.
+        standalone = SyntheticEffectTracker()
+        self.assertEqual(standalone.count("run_cnt", "se1"), 0)
+        with self.assertRaises(StaleEpochError):
+            standalone.count("run_cnt", "se1", journal_id=owner_jid)
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
 
 
 if __name__ == "__main__":

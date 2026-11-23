@@ -2023,6 +2023,12 @@ class SyntheticEffectTracker:
             return journal_id is None
         return journal_id is not None and journal_id == self._bound_journal_id
 
+    def assert_bound_to_journal(self, journal_id: str) -> None:
+        clean_jid = self._clean_journal_id(journal_id)
+        with self._lock:
+            if not self._journal_matches_locked(clean_jid):
+                raise StaleEpochError(ERR_STALE_EPOCH)
+
     def attach_epoch(
         self, supervisor_epoch: int, *, journal_id: str | None = None
     ) -> None:
@@ -2112,8 +2118,15 @@ class SyntheticEffectTracker:
                 self._attempts[key] = _AttemptRecord(status="failed_no_effect")
         return result
 
-    def count(self, run_id: str, step_id: str) -> int:
+    def count(
+        self, run_id: str, step_id: str, *, journal_id: str | None = None
+    ) -> int:
+        clean_jid = self._clean_journal_id(journal_id)
         with self._lock:
+            if not self._journal_matches_locked(clean_jid):
+                raise StaleEpochError(ERR_STALE_EPOCH)
+            if clean_jid is None:
+                self._standalone_used = True
             return self._exec_counts.get((run_id, step_id), 0)
 
     @staticmethod
