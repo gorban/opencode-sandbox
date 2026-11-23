@@ -1,6 +1,6 @@
 # PRD M3.4 Read-Only Browser Frame & Navigation Provenance Pairing Walkthrough (`docs/prds/spikes/m/browser-observe/`)
 
-Parent: [prd_m3.md](../../prd_m3.md) · related: [prd_d.md](../../prd_d.md), [prd_e.md](../../prd_e.md),
+Parent: [prd_m3.md](../../../prd_m3.md) · related: [prd_d.md](../../../prd_d.md), [prd_e.md](../../../prd_e.md),
 [PROJECTION_WALKTHROUGH.md](../projection/PROJECTION_WALKTHROUGH.md) · builds read-only on
 [oc_address.py](../oc_address.py) and [oc_coord_contract.py](../oc_coord_contract.py)
 
@@ -24,9 +24,10 @@ All documentation, implementation, and tests for this slice live exclusively und
 - `oc_browser_contract.py` — frozen dataclasses with `__post_init__` invariant enforcement, schema
   version constants, hard bounds, closed enums, strict `allow_nan=False` JSON serializer, and
   collision-free canonical base64url JSON cursor codec.
-- `oc_browser_validate.py` — backtracking-free URL/origin redactor & trust/TLS classifier, strict
-  PNG/JPEG magic-byte & header dimension validator, and linear-time ANSI/ECMA-48/C0/C1/bidi/NUL/
-  surrogate single-line page-title scrubber.
+- `oc_browser_validate.py` — backtracking-free browser-canonical ASCII URL/origin redactor &
+  trust/TLS classifier, PNG/JPEG binary header & dimension inspector (provenance pairing only;
+  full bounded bitstream decoding before display remains a downstream display gate), and linear-time
+  ANSI/ECMA-48/C0/C1/bidi/NUL/surrogate single-line page-title scrubber.
 - `oc_browser_observe.py` — thread-safe in-memory provenance pairing store and operator-only
   `BrowserObserveService` (`register_sandbox`, `set_sandbox_status`, `record_navigation`,
   `ingest_frame`, `get_surface_snapshot`, `list_browser_wall`) with pre/post authority & session
@@ -67,11 +68,11 @@ Chromium Sidecar (isolated-sidecars, --network=none, CA public cert only)
   │  (host-only 0o600 CDP UDS — simulated here via trusted host ingestion calls)
   ▼
 BrowserObserveService (Trusted Host Provenance Pairing Boundary — THIS SLICE)
-  ├── Validates, scrubs, redacts, and classifies host-observed navigations
-  ├── Strictly inspects binary PNG/JPEG magic bytes + header dimensions + computes SHA-256
-  ├── Enforces exact (sandbox_addr, incarnation_id, surface_id, nav_generation) pairing
-  ├── Drops/quarantines stale, future, superseded-incarnation, and non-monotonic frames
-  ├── Evaluates frame freshness strictly against an injected monotonic clock
+  ├── Validates, scrubs, redacts, and classifies browser-canonical ASCII navigations
+  ├── Performs PNG/JPEG header inspection (magic bytes, IHDR/SOF dims, SHA-256; not full decode)
+  ├── Enforces exact (sandbox_addr, incarnation_id, surface_id, capture_generation, nav_generation) pairing
+  ├── Retires capture_generation on disconnect/disable and drops/quarantines stale/future/replayed frames
+  ├── Evaluates frame freshness strictly against an injected monotonic clock + post-pack release fence
   └── Serves operator-only, session-fenced, byte-bounded JSON snapshots (untrusted_content=True)
 ```
 
@@ -82,14 +83,17 @@ BrowserObserveService (Trusted Host Provenance Pairing Boundary — THIS SLICE)
    agent-controlled app inside the sandbox that can paint fake approval modals, spoofed URL bars,
    or prompt-injection text. `PairedBrowserFrame`, `BrowserSurfaceSnapshot`, and `BrowserWallTile`
    enforce `untrusted_content is True` structurally in `__post_init__`.
-2. **Zero cross-navigation frame pairing (anti-frame-after-navigation spoofing):** A frame carrying
-   `nav_generation != current_nav.nav_generation` can NEVER be paired with the current navigation's
-   `origin` or `tls_state`. Committing a new `nav_generation` atomically clears any previously paired
-   frame and its cached bytes until a matching post-commit frame arrives.
+2. **Zero cross-navigation or cross-capture-generation frame pairing (anti-spoofing):** A frame
+   carrying a mismatched `capture_generation` or `nav_generation != current_nav.nav_generation` can
+   NEVER be paired with a newer navigation or resumed capture session. Committing a new
+   `nav_generation` atomically clears `paired_frame` and `paired_frame_bytes`; disconnecting or
+   disabling a sandbox atomically retires `capture_generation` (incrementing it) and clears
+   `current_nav`, `paired_frame`, and `paired_frame_bytes` across all surfaces so delayed pre-stop
+   frames can never be admitted after resume.
 3. **Structural pairing invariant:** `PairedBrowserFrame.__post_init__` enforces exact equality of
-   `(sandbox_addr, incarnation_id, surface_id, nav_generation)` between its `nav: BrowserNavState`
-   and `frame: BrowserFrameMeta` components, plus `untrusted_content is True`. A mismatched pairing
-   is unrepresentable.
+   `SurfaceKey(sandbox_addr, incarnation_id, surface_id, capture_generation)` and `nav_generation`
+   between its `nav: BrowserNavState` and `frame: BrowserFrameMeta` components, plus
+   `untrusted_content is True`. A mismatched pairing is unrepresentable.
 4. **Zero URL secret leakage:** Userinfo (`user:pass@`), query strings (`?token=SECRET`), and
    fragments (`#jwt=XYZ`) are stripped before storage or projection and are **never** interpolated
    into error messages, snapshots, or PiP wall tiles.
@@ -154,7 +158,6 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 MAX_RAW_URL_BYTES = 8_192
 MAX_DISPLAY_URL_BYTES = 2_048
 MAX_PATH_BYTES = 256
-_NON_ASCII_DOTS = frozenset({"\u3002", "\uff0e", "\uff61"})
 _NUMERIC_OR_HEX_LABEL_RE = re.compile(r"^(?:0x[0-9a-f]+|[0-9]+)$", re.ASCII)
 
 function parse_and_classify_url(
@@ -203,20 +206,20 @@ function parse_and_classify_url(
     #      and refuse trust elevation (origin_trust forced to "external_untrusted").
     hostport, userinfo_redacted = strip_userinfo(authority, reject_userinfo=reject_userinfo)
 
-    # 7. Parse host and optional port strictly:
-    #    - Record raw_host_is_ascii BEFORE any normalization!
-    #    - Bracketed IPv6 "[...]": must be strictly ASCII, validate via ipaddress.IPv6Address
-    #      (reject zone IDs '%', reject malformed literals); normalize to compressed form;
-    #      loopback iff == IPv6Address("::1") (IPv4-mapped [::ffff:127.0.0.1] is NOT loopback).
-    #    - Non-IPv6 host pre-IDNA hardening (defeats IDNA 2003 silent folding):
-    #      * Reject non-ASCII dot-equivalents (\u3002, \uff0e, \uff61).
-    #      * Reject Unicode categories Cf, Cc, Cs, Zl, Zp (invisible format/ZWSP/soft-hyphen).
-    #      * Reject any non-ASCII char whose NFKC normalization is ASCII (blocks fullwidth
-    #        ASCII like "\uff46\uff45\uff41\uff54" or compatibility chars folding into
-    #        "localhost" / "<NAME>.oc-sandbox.internal").
-    #      * Reject '%' and leading/trailing/empty dot labels.
-    #      * Convert IDN to ASCII punycode via host.encode("idna").decode("ascii"), catching
-    #        UnicodeError -> CoordValidationError("url_host_invalid"), then lowercase.
+    # 7. Parse host and optional port strictly (preserving browser-observed ASCII origin spelling;
+    #    NEVER calling Python's stdlib host.encode("idna") which implements IDNA 2003 and can
+    #    diverge from Chromium's UTS #46 canonicalization, e.g. "straße.example"!):
+    #    - Strict browser-canonical ASCII host contract:
+    #      * Require host.isascii() — reject ANY non-ASCII hostname (including "straße.example",
+    #        "bücher.example", fullwidth ASCII, ideographic dots \u3002/\uff0e/\uff61, and
+    #        invisible Cf chars) with CoordValidationError("url_host_non_canonical"). Already-
+    #        punycoded ASCII labels emitted by Chromium (e.g. "xn--strae-oqa.example",
+    #        "xn--bcher-kva.example") are preserved verbatim after ASCII lowercasing!
+    #    - Bracketed IPv6 "[...]": validate via ipaddress.IPv6Address (reject zone IDs '%',
+    #      reject malformed literals); normalize to compressed form; loopback iff == IPv6Address("::1")
+    #      (IPv4-mapped [::ffff:127.0.0.1] is NOT loopback).
+    #    - Non-IPv6 ASCII host:
+    #      * Reject '%' and leading/trailing/empty dot labels; lowercase ASCII host.
     #    - Canonical IPv4 vs. ambiguous numeric/hex/octal/short IPv4 rejection:
     #      * Accept IPv4 ONLY if ascii_host == str(ipaddress.IPv4Address(ascii_host)).
     #      * Otherwise reject ANY host whose last label matches _NUMERIC_OR_HEX_LABEL_RE
@@ -226,7 +229,7 @@ function parse_and_classify_url(
     #    - Port (optional): require 1 <= len(port_str) <= 5, port_str.isascii() and
     #      port_str.isdigit(), port_str[0] != "0", 1 <= int(port_str) <= 65535.
     #      Omit default port (80 for http, 443 for https); preserve non-default port (:8443).
-    ascii_host, host_kind, raw_host_is_ascii, port = parse_strict_host_port(hostport, scheme=scheme)
+    ascii_host, host_kind, port = parse_strict_host_port(hostport, scheme=scheme)
 
     # 8. Sanitize & bound path_redacted (defaults to "/", starts with "/", <= MAX_PATH_BYTES UTF-8)
     path_redacted, path_truncated = truncate_utf8_clean(raw_path or "/", MAX_PATH_BYTES)
@@ -239,7 +242,6 @@ function parse_and_classify_url(
     tls_state, effective_tls_verified, origin_trust = classify_origin_and_tls(
         scheme=scheme,
         ascii_host=ascii_host,
-        raw_host_is_ascii=raw_host_is_ascii,
         sandbox_instance_name=sandbox_instance_name,
         tls_verified=tls_verified,
         tls_state_evidence=tls_state_evidence,
@@ -252,11 +254,12 @@ function parse_and_classify_url(
 
 `tls_state` and `effective_tls_verified` are always resolved **first** (strictly requiring explicit
 same-document CA evidence and downgrading every mismatched CA/host pairing to `"unknown"` / `False`),
-and the `userinfo_redacted` trust cap is applied **second**. Privileged origins
-(`"sandbox_internal_https"` and `"loopback_http"`) additionally require `raw_host_is_ascii == True`.
+and the `userinfo_redacted` trust cap is applied **second**. Because all admitted hostnames must
+arrive in browser-canonical ASCII form (`url_host_non_canonical` rejects any non-ASCII host without
+re-encoding), `ascii_host` preserves Chromium's exact UTS #46 / punycode spelling.
 
 Define:
-- `is_own_sandbox_internal = raw_host_is_ascii and (ascii_host == f"{NAME}.oc-sandbox.internal")`
+- `is_own_sandbox_internal = (ascii_host == f"{NAME}.oc-sandbox.internal")`
 - `is_internal_namespace = (ascii_host == "oc-sandbox.internal") or ascii_host.endswith(".oc-sandbox.internal")`
 
 | Condition | `tls_state` | `effective_tls_verified` | `origin_trust` | `untrusted_content` |
@@ -271,7 +274,7 @@ Define:
 | `scheme == "https"` AND `tls_state_evidence == "sandbox_internal_ca"` AND `not is_own_sandbox_internal` (sibling sandbox, subdomain, bare `oc-sandbox.internal`, `localhost`, IP, or external host!) | `"unknown"` | `False` | `"external_untrusted"` | `True` |
 | `scheme == "https"` AND `tls_state_evidence == "external_ca"` AND `is_internal_namespace` (bare, own, sibling, or subdomain `*.oc-sandbox.internal`!) | `"unknown"` | `False` | `"external_untrusted"` | `True` |
 | `scheme == "https"` AND `tls_state_evidence == "external_ca"` AND `not is_internal_namespace` | `"verified_external_tls"` | `True` | `"external_untrusted"` | `True` |
-| `scheme == "http"` AND `raw_host_is_ascii` AND `ascii_host in {"127.0.0.1", "::1", "localhost"}` AND `not userinfo_redacted` | `"http_unencrypted"` | `False` | `"loopback_http"` | `True` |
+| `scheme == "http"` AND `ascii_host in {"127.0.0.1", "::1", "localhost"}` AND `not userinfo_redacted` | `"http_unencrypted"` | `False` | `"loopback_http"` | `True` |
 | `scheme == "http"` AND (`userinfo_redacted` OR non-loopback host, incl. `http://<NAME>.oc-sandbox.internal` or `http://sub.localhost`) | `"http_unencrypted"` | `False` | `"external_untrusted"` | `True` |
 
 *Port & CA alignment with `prd_d.md`, `prd_e.md`, and `prd_m3.md`:*
@@ -283,10 +286,17 @@ Define:
 - Profile E excludes IP SANs and `localhost` from the sandbox CA, so `https://127.0.0.1` and
   `https://localhost` never earn `"sandbox_internal_https"` or `"loopback_http"`.
 
-### 3.2 Strict Binary Image Magic-Byte & Header Dimension Validator (PNG & JPEG Only)
+### 3.2 PNG & JPEG Binary Header Inspection & Dimension Guard (Provenance Pairing Scope)
 
 Strictly matches `prd_m3.md:271-273, 454` (CDP `Page.startScreencast` formats — PNG and JPEG only;
-WebP, SVG, GIF, and all other media types are unconditionally rejected):
+WebP, SVG, GIF, and all other media types are unconditionally rejected).
+
+**Scope clarification:** `_validate_png_header` and `_validate_jpeg_header` perform **binary header
+inspection and provenance pairing** (verifying magic bytes, IHDR/SOF dimensions, pixel ceiling, and
+computing the authoritative SHA-256 digest over the supplied bytes). They do **not** perform full
+image decompression/decoding; **full bounded bitstream decoding before display remains a separate
+downstream display gate** (e.g., confined `<canvas>` `createImageBitmap` / display decoder per
+`prd_m3.md:271-280`).
 
 ```python
 ALLOWED_FRAME_MEDIA_TYPES = frozenset({"image/png", "image/jpeg"})
@@ -300,7 +310,7 @@ MAX_FRAME_PIXELS = 4096 * 2160      # 8,847,360 pixels (~33.75 MiB RGBA decode c
 MAX_JPEG_SEGMENTS = 256             # linear marker-scan DoS guard
 ```
 
-Validation rules (exact fail-closed order):
+Header-inspection rules (exact fail-closed order):
 
 1. **Type & size gate:** Require `type(frame_bytes) is bytes` (rejects mutable `bytearray`,
    `memoryview`, `str`) and `MIN_FRAME_BYTES <= len(frame_bytes) <= MAX_FRAME_BYTES`.
@@ -312,7 +322,7 @@ Validation rules (exact fail-closed order):
    - JPEG: `b"\xff\xd8\xff"`
    If detected format is unknown or differs from declared `media_type`, raise
    `CoordValidationError("frame_media_type_mismatch")`.
-4. **Format-specific header & dimension parsing:**
+4. **Format-specific header & dimension inspection:**
    - **PNG (`_validate_png_header`):**
      - Require `len >= 33`, first chunk length == `13` (`b"\x00\x00\x00\x0d"`), type == `b"IHDR"`.
      - Verify IHDR CRC-32 (`zlib.crc32(raw[12:29]) & 0xFFFFFFFF == struct.unpack(">I", raw[29:33])[0]`).
@@ -325,15 +335,20 @@ Validation rules (exact fail-closed order):
      - Walk markers linearly from `pos = 2`, bounded by `MAX_JPEG_SEGMENTS = 256` iterations.
      - At every marker boundary, require `pos < len(raw)` AND **`raw[pos] == 0xFF`** (else
        `CoordValidationError("frame_jpeg_malformed")`).
-     - Skip fill `0xFF` bytes; read `marker = raw[pos]; pos += 1`.
+     - Skip fill `0xFF` bytes (`while pos < len(raw) and raw[pos] == 0xFF: pos += 1`), then
+       **explicitly check `if pos >= len(raw): raise CoordValidationError("frame_jpeg_malformed")`**
+       before reading `marker = raw[pos]; pos += 1` (so trailing `0xFF` bytes never raise
+       `IndexError`).
      - **Explicitly reject** `marker == 0x00` (byte-stuffing outside entropy data), `marker == 0xD8`
        (nested SOI), and `0xD0 <= marker <= 0xD7` (RSTn restart markers before SOF/SOS) with
        `CoordValidationError("frame_jpeg_malformed")`.
      - Handle standalone `marker == 0x01` (TEM); abort with
        `CoordValidationError("frame_jpeg_missing_sof")` if `EOI` (`0xD9`) or `SOS` (`0xDA`) is hit
        before any SOF marker.
-     - For all length-bearing segments (including `APP1` EXIF, `COM`, `DQT`, `DHT`, `SOF*`), read
-       2-byte big-endian `seg_len`; require `seg_len >= 2` and `pos + seg_len <= len(raw)`.
+     - For all length-bearing segments (including `APP1` EXIF, `COM`, `DQT`, `DHT`, `SOF*`),
+       **explicitly check `if pos + 2 > len(raw): raise CoordValidationError("frame_jpeg_malformed")`**
+       before unpacking 2-byte big-endian `seg_len` (so truncated markers never raise `struct.error`);
+       require `seg_len >= 2` and `pos + seg_len <= len(raw)`.
      - On SOF markers (`0xC0..0xC3`, `0xC5..0xC7`, `0xC9..0xCB`, `0xCD..0xCF`):
        - Require **`seg_len >= 11`**, sample precision `raw[pos + 2] in (8, 12, 16)`,
          `height, width = struct.unpack(">HH", raw[pos + 3 : pos + 7])`,
@@ -347,7 +362,7 @@ Validation rules (exact fail-closed order):
    and `width * height <= MAX_FRAME_PIXELS` (`8_847_360`), else raise
    `CoordValidationError("frame_dimensions_out_of_bounds")`.
 6. **Authoritative digest:** Compute `frame_sha256 = hashlib.sha256(frame_bytes).hexdigest()` over
-   the exact validated bytes.
+   the exact supplied bytes.
 
 ### 3.3 Deterministic Single-Line Page Title Scrubber
 
@@ -386,22 +401,45 @@ Untrusted `document.title` values pass through a linear-time `O(n)` state machin
 
 ## 4. Authoritative Navigation <-> Frame Provenance Pairing Model (`oc_browser_observe.py`)
 
-### 4.1 Surface State & Monotonic Counters
+### 4.1 Surface State, Capture Generation, & Monotonic Counters
 
 `VALID_SANDBOX_STATUSES = frozenset({"starting", "running", "stopped", "revoked", "degraded"})`
 (matching `oc_coord_contract.SANDBOX_LIFECYCLE_STATES`; only `"running"` admits navigations/frames).
 
-Every browser surface is uniquely keyed by `(sandbox_addr, incarnation_id, surface_id)` under its
-parent sandbox record and tracks:
+Every sandbox browser record tracks a strictly monotonic **`capture_generation: int`**
+(`1 <= capture_generation <= MAX_SQLITE_INT64`, starting at `1` on initial registration or fresh
+incarnation rotation):
 
-- `current_nav: BrowserNavState` — latest host-observed committed navigation
-  (`1 <= nav_generation <= MAX_SQLITE_INT64`, strictly increasing on every `record_navigation`).
-- `last_frame_seq: int` — strictly monotonic frame sequence watermark across the surface's lifetime
-  (starts at `0`; every accepted frame requires `last_frame_seq < frame_seq <= MAX_SQLITE_INT64`).
-- `last_frame_captured_at: float | None` — monotonic timestamp watermark (prevents time rollback).
-- `paired_frame: PairedBrowserFrame | None` — present **iff** a validated frame has been admitted
-  for the **exact** `current_nav.nav_generation` while the sandbox remained `"running"`.
-- `paired_frame_bytes: bytes | None` — raw validated bytes of `paired_frame` (`<= 512 KiB`), always
+- Whenever an active capture session (`status == "running" and browser_enabled is True`) leaves
+  `"running"` (disconnect/stop/degraded/starting/revoked) OR toggles `browser_enabled` to `False`,
+  the service **atomically retires the current capture generation**:
+  1. Increments `sb.capture_generation += 1` (raising `CoordPolicyError("max_capture_generations_exceeded")`
+     at `MAX_SQLITE_INT64`), and
+  2. Clears **`surf.current_nav = None`, `surf.paired_frame = None`, and
+     `surf.paired_frame_bytes = None`** across all surfaces of `sb`!
+- Both `record_navigation` and `ingest_frame` require an explicit `capture_generation` matching
+  `sb.capture_generation` (else fail closed with `CoordPolicyError("stale_capture_generation")`),
+  closing the delayed pre-stop frame race across disconnect/disable/resume cycles.
+
+Every browser surface is uniquely keyed by
+`SurfaceKey(sandbox_addr, incarnation_id, surface_id, capture_generation)` under its parent sandbox
+record and tracks:
+
+- `current_nav: BrowserNavState | None` — latest host-observed committed navigation for the active
+  `capture_generation` (cleared to `None` whenever `capture_generation` is retired).
+- `last_nav_generation: int` — strictly monotonic navigation watermark across the surface's
+  incarnation lifetime (starts at `0`; every `record_navigation` requires
+  `last_nav_generation < nav_generation <= MAX_SQLITE_INT64`, even across `capture_generation`
+  bumps).
+- `last_frame_seq: int` — strictly monotonic frame sequence watermark across the surface's
+  incarnation lifetime (starts at `0`; every accepted frame requires
+  `last_frame_seq < frame_seq <= MAX_SQLITE_INT64`).
+- `last_nav_committed_at: float | None` and `last_frame_captured_at: float | None` — monotonic
+  timestamp watermarks (preventing time rollback even after `current_nav` is cleared on disconnect).
+- `paired_frame: PairedBrowserFrame | None` — present **iff** a header-inspected frame has been
+  admitted for the **exact** `(capture_generation, current_nav.nav_generation)` while the sandbox
+  remained `"running"` and enabled.
+- `paired_frame_bytes: bytes | None` — raw supplied bytes of `paired_frame` (`<= 512 KiB`), always
   cleared **together with `paired_frame = None`** on navigation commit, incarnation rotation,
   `browser_enabled = False`, or transition to any non-`"running"` status.
 - `dropped_frame_counts: dict[str, int]` and `quarantine_recent: deque[QuarantinedFrameEvent]`
@@ -410,10 +448,17 @@ parent sandbox record and tracks:
 ### 4.2 Lifecycle & Ingestion Pseudocode
 
 ```python
-function clear_surface_frames(sb):
+function clear_surface_state(sb):
     for surf in sb.surfaces.values():
+        surf.current_nav = None
         surf.paired_frame = None
         surf.paired_frame_bytes = None
+
+function retire_capture_generation(sb):
+    if sb.capture_generation >= MAX_SQLITE_INT64:
+        raise CoordPolicyError("max_capture_generations_exceeded")
+    sb.capture_generation += 1
+    clear_surface_state(sb)
 
 function register_sandbox(sandbox_addr, *, incarnation_id, browser_enabled=True, status="running"):
     target = parse_sandbox_target(sandbox_addr)                # wraps AddressError; rejects @PEER
@@ -428,24 +473,29 @@ function register_sandbox(sandbox_addr, *, incarnation_id, browser_enabled=True,
                     if status != "revoked" or browser_enabled != existing.browser_enabled:
                         raise RevokedError("incarnation_revoked")
                     return
+                was_active = (existing.status == "running" and existing.browser_enabled)
+                is_active = (status == "running" and browser_enabled)
+                if was_active and not is_active:
+                    retire_capture_generation(existing)        # checked before mutating status/enabled!
+                elif not is_active:
+                    clear_surface_state(existing)
                 existing.browser_enabled = browser_enabled
                 existing.status = status
-                if status != "running" or not browser_enabled:
-                    clear_surface_frames(existing)             # clears BOTH paired_frame & bytes!
                 return
             if inc in existing.superseded_incarnations:
                 raise IncarnationMismatchError("superseded_incarnation")
             if len(existing.superseded_incarnations) >= MAX_ROTATIONS_PER_SANDBOX:
                 raise CoordPolicyError("max_incarnation_rotations_exceeded")
-            # Incarnation rotation: retire old incarnation & purge all old surfaces/frames!
+            # Incarnation rotation: retire old incarnation, reset capture_generation=1 & purge all surfaces!
             existing.superseded_incarnations.add(existing.current_incarnation_id)
             existing.current_incarnation_id = inc
+            existing.capture_generation = 1
             existing.browser_enabled = browser_enabled
             existing.status = status
             existing.surfaces.clear()
             return
         require len(sandboxes) < MAX_TRACKED_SANDBOXES else CoordPolicyError("max_sandboxes_exceeded")
-        sandboxes[target.canonical] = SandboxBrowserRecord(...)
+        sandboxes[target.canonical] = SandboxBrowserRecord(capture_generation=1, ...)
 
 function set_sandbox_status(sandbox_addr, *, incarnation_id, status):
     target = parse_sandbox_target(sandbox_addr)
@@ -461,21 +511,26 @@ function set_sandbox_status(sandbox_addr, *, incarnation_id, status):
             if status != "revoked":
                 raise RevokedError("incarnation_revoked")      # revoked is terminal per incarnation!
             return
+        was_active = (sb.status == "running" and sb.browser_enabled)
+        is_active = (status == "running" and sb.browser_enabled)
+        if was_active and not is_active:
+            retire_capture_generation(sb)                      # checked before mutating status!
+        elif not is_active:
+            clear_surface_state(sb)
         sb.status = status
-        if status != "running":
-            clear_surface_frames(sb)                           # clears BOTH paired_frame & bytes!
 
 function record_navigation(
-    sandbox_addr, *, incarnation_id, surface_id, nav_generation,
+    sandbox_addr, *, incarnation_id, surface_id, capture_generation, nav_generation,
     raw_url, tls_verified, tls_state_evidence=None, page_title="", committed_at=None,
 ) -> BrowserNavState:
     target = parse_sandbox_target(sandbox_addr)
     inc = validate_token_strict(incarnation_id, "incarnation_id")
     sid = validate_token_strict(surface_id, "surface_id")
-    validate_positive_int(nav_generation, "nav_generation")    # 1 <= x <= MAX_SQLITE_INT64
+    validate_positive_int(capture_generation, "capture_generation")  # 1 <= x <= MAX_SQLITE_INT64
+    validate_positive_int(nav_generation, "nav_generation")          # 1 <= x <= MAX_SQLITE_INT64
     require type(tls_verified) is bool
     explicit_ts = None if committed_at is None else validate_finite_nonneg_float(committed_at, "committed_at")
-    # Validate & redact URL + scrub page title BEFORE mutating state (atomic fail-closed)
+    # Validate & redact browser-canonical ASCII URL + scrub page title BEFORE mutating state
     parsed = parse_and_classify_url(
         raw_url, sandbox_instance_name=target.name,
         tls_verified=tls_verified, tls_state_evidence=tls_state_evidence,
@@ -492,41 +547,45 @@ function record_navigation(
             raise IncarnationMismatchError("superseded_incarnation")
         if sb.status != "running":
             raise CoordPolicyError("sandbox_not_running")
+        if capture_generation != sb.capture_generation:
+            raise CoordPolicyError("stale_capture_generation")
         surf = sb.surfaces.get(sid)
         if surf is not None:
-            if nav_generation <= surf.current_nav.nav_generation:
+            if nav_generation <= surf.last_nav_generation:
                 raise CoordValidationError("non_monotonic_nav_generation")
-            min_ts = surf.current_nav.committed_at
-            if surf.last_frame_captured_at is not None and surf.last_frame_captured_at > min_ts:
-                min_ts = surf.last_frame_captured_at
-            if ts < min_ts:
+            min_ts = max_non_none(surf.last_nav_committed_at, surf.last_frame_captured_at)
+            if min_ts is not None and ts < min_ts:
                 raise CoordValidationError("committed_at_non_monotonic")
         else:
             require len(sb.surfaces) < MAX_SURFACES_PER_SANDBOX else CoordPolicyError("max_surfaces_exceeded")
             surf = SurfaceRecord(surface_id=sid)
             sb.surfaces[sid] = surf
 
-        nav = BrowserNavState(...)
+        skey = SurfaceKey(target.canonical, inc, sid, capture_generation)
+        nav = BrowserNavState(surface_key=skey, nav_generation=nav_generation, ...)
         surf.current_nav = nav
+        surf.last_nav_generation = nav_generation
+        surf.last_nav_committed_at = ts
         # CRITICAL ANTI-SPOOFING FENCE: immediately clear previous nav_generation's paired frame!
         surf.paired_frame = None
         surf.paired_frame_bytes = None
         return nav
 
 function ingest_frame(
-    sandbox_addr, *, incarnation_id, surface_id, nav_generation,
+    sandbox_addr, *, incarnation_id, surface_id, capture_generation, nav_generation,
     frame_seq, media_type, frame_bytes, captured_at=None,
 ) -> FrameAdmissionResult:
     # Step 1: Validate caller argument types & bounds (CoordValidationError on bad types)
     target = parse_sandbox_target(sandbox_addr)
     inc = validate_token_strict(incarnation_id, "incarnation_id")
     sid = validate_token_strict(surface_id, "surface_id")
-    validate_positive_int(nav_generation, "nav_generation")    # 1 <= x <= MAX_SQLITE_INT64
-    validate_positive_int(frame_seq, "frame_seq")              # 1 <= x <= MAX_SQLITE_INT64
+    validate_positive_int(capture_generation, "capture_generation")  # 1 <= x <= MAX_SQLITE_INT64
+    validate_positive_int(nav_generation, "nav_generation")          # 1 <= x <= MAX_SQLITE_INT64
+    validate_positive_int(frame_seq, "frame_seq")                    # 1 <= x <= MAX_SQLITE_INT64
     explicit_ts = None if captured_at is None else validate_finite_nonneg_float(captured_at, "captured_at")
 
-    # Step 2: Strict binary payload inspection (PNG/JPEG only, size 16..512 KiB, magic bytes,
-    #         header dimensions, pixel cap, SHA-256). Always rejects malformed/spoofed images!
+    # Step 2: PNG/JPEG binary header inspection (size 16..512 KiB, magic bytes, IHDR/SOF dims,
+    #         pixel cap, SHA-256). Always rejects malformed/spoofed headers before lock!
     header = validate_frame_bytes(media_type, frame_bytes)
 
     with lock:
@@ -545,7 +604,14 @@ function ingest_frame(
         if sb.status != "running":
             return FrameAdmissionResult(accepted=False, stale_reason="sandbox_not_running")
 
-        # Step 5: Surface & nav_generation fence
+        # Step 5: Capture-generation fence (blocks delayed pre-stop/pre-disable frames after resume!)
+        if capture_generation != sb.capture_generation:
+            surf_existing = sb.surfaces.get(sid)
+            if surf_existing is not None:
+                record_quarantine(surf_existing, frame_seq, nav_generation, "stale_capture_generation", now)
+            raise CoordPolicyError("stale_capture_generation")
+
+        # Step 6: Surface & nav_generation fence
         surf = sb.surfaces.get(sid)
         if surf is None or surf.current_nav is None:
             return FrameAdmissionResult(accepted=False, stale_reason="unknown_nav_generation")
@@ -557,22 +623,22 @@ function ingest_frame(
             record_quarantine(surf, frame_seq, nav_generation, "unknown_nav_generation", now)
             return FrameAdmissionResult(accepted=False, stale_reason="unknown_nav_generation")
 
-        # Step 6: Monotonic frame_seq fence (prevents replay / out-of-order frames)
+        # Step 7: Monotonic frame_seq fence (prevents replay / out-of-order frames)
         if frame_seq <= surf.last_frame_seq:
             record_quarantine(surf, frame_seq, nav_generation, "non_monotonic_frame_seq", now)
             return FrameAdmissionResult(accepted=False, stale_reason="non_monotonic_frame_seq")
 
-        # Step 7: Pre-commit & non-monotonic timestamp fence
+        # Step 8: Pre-commit & non-monotonic timestamp fence
         if ts < surf.current_nav.committed_at:
             record_quarantine(surf, frame_seq, nav_generation, "stale_nav_generation", now)
             return FrameAdmissionResult(accepted=False, stale_reason="stale_nav_generation")
         if surf.last_frame_captured_at is not None and ts < surf.last_frame_captured_at:
             raise CoordValidationError("frame_captured_at_non_monotonic")
 
-        # Step 8: Atomic pairing!
+        # Step 9: Atomic pairing!
+        skey = SurfaceKey(target.canonical, inc, sid, capture_generation)
         meta = BrowserFrameMeta(
-            sandbox_addr=target.canonical, incarnation_id=inc, surface_id=sid,
-            nav_generation=nav_generation, frame_seq=frame_seq,
+            surface_key=skey, nav_generation=nav_generation, frame_seq=frame_seq,
             media_type=header.media_type, width=header.width, height=header.height,
             size_bytes=header.size_bytes, frame_sha256=header.frame_sha256, captured_at=ts,
         )
@@ -584,28 +650,93 @@ function ingest_frame(
         return FrameAdmissionResult(accepted=True, stale_reason=None, frame_meta=meta, paired_frame=paired)
 ```
 
-### 4.3 Frame Freshness & Stale-Reason Evaluation on Read
+### 4.3 Frame Freshness, Stale-Reason Evaluation, & Post-Pack Pixel Release Fence
 
 At read time (`get_surface_snapshot` / `list_browser_wall`), freshness is evaluated under `with lock:`
 against `now = read_monotonic_clock()` and configured `max_frame_age_ms`
 (`100 <= max_frame_age_ms <= 300_000`, default `10_000` ms):
 
 1. If `sandbox.status != "running"` -> `frame_stale = True`, `stale_reason = "sandbox_disconnected"`.
-2. Else if `surf.paired_frame is None or surf.paired_frame_bytes is None` -> `frame_stale = True`,
+2. Else if `surf.current_nav is None` (e.g., resumed after capture-generation retirement, awaiting
+   fresh navigation for the new `capture_generation`) -> `frame_stale = True`,
+   `stale_reason = "awaiting_navigation_for_capture_generation"`.
+3. Else if `surf.paired_frame is None or surf.paired_frame_bytes is None` -> `frame_stale = True`,
    `stale_reason = "awaiting_frame_for_navigation"` (makes `b64encode(None)` structurally impossible!).
-3. Else if `now < surf.paired_frame.frame.captured_at` (clock regression!) -> `frame_stale = True`,
+4. Else if `now < surf.paired_frame.frame.captured_at` (clock regression!) -> `frame_stale = True`,
    `stale_reason = "clock_regression"`, `frame_age_ms = None`.
-4. Else compute `age_ms = int((now - surf.paired_frame.frame.captured_at) * 1000)`:
+5. Else compute `age_ms = int((now - surf.paired_frame.frame.captured_at) * 1000)`:
    - If `age_ms > max_frame_age_ms` -> `frame_stale = True`, `stale_reason = "frame_ttl_expired"`,
      `frame_age_ms = age_ms`.
    - Else -> `frame_stale = False`, `stale_reason = None`, `frame_age_ms = age_ms`.
 
 When `frame_stale = True`:
-- All read-only diagnostic metadata (`current_nav`, `paired_frame` metadata if one exists for the
-  current nav, `frame_age_ms`, `frame_stale = True`, `stale_reason`) remains readable so the
-  operator can inspect the last observed state without spoofing freshness.
+- All read-only diagnostic metadata (`current_nav` if present for the active capture generation,
+  `paired_frame` metadata if one existed for the current nav, `frame_age_ms`, `frame_stale = True`,
+  `stale_reason`) remains readable so the operator can inspect the last observed state without
+  spoofing freshness.
 - `frame_b64` is **always suppressed (`None`)** with `frame_b64_omitted_reason = stale_reason` so a
-  consumer can never accidentally render expired or disconnected pixels as live.
+  consumer can never accidentally render expired, pre-disconnect, or superseded pixels as live.
+
+#### Mandatory Post-Pack Pixel Release Fence (Defeats TOCTOU Between Capture and Return)
+
+Because base64 encoding and JSON byte-budget packing run **outside `self._lock`**, a concurrent
+navigation commit, capture-generation retirement, incarnation rotation, revocation, or TTL expiry
+can occur *while packing*. Therefore `get_surface_snapshot` enforces a strict **post-pack release
+fence** immediately before returning:
+
+```python
+# After packing snapshot outside self._lock (and invoking optional test seam on_after_pack_before_release):
+# First re-verify operator session & live authority so revoked callers fail closed with zero target-state oracle!
+check_authority_and_session_post(caller, read_session_id, session_generation)
+with lock:
+    now_release = read_monotonic_clock()
+    sb = sandboxes.get(target.canonical)
+    if sb is None:
+        raise CoordPolicyError("sandbox_not_found")
+    if sb.current_incarnation_id != captured_incarnation_id:
+        raise IncarnationMismatchError("superseded_incarnation")
+    if sb.status == "revoked":
+        raise RevokedError("incarnation_revoked")
+    if not sb.browser_enabled:
+        raise CoordPolicyError("browser_service_not_enabled")
+
+    if packed_snapshot.frame_b64 is not None:
+        surf = sb.surfaces.get(sid)
+        release_failure = check_pixel_release_invariant(
+            sb, surf, now_release,
+            captured_capture_generation=captured_capture_generation,
+            captured_nav_generation=captured_nav_generation,
+            captured_frame_seq=captured_frame_seq,
+            captured_frame_sha256=captured_frame_sha256,
+            max_frame_age_ms=self._max_frame_age_ms,
+        )
+        # Verifies ALL of:
+        #   - sb.status == "running" and sb.capture_generation == captured_capture_generation
+        #   - surf is not None and surf.current_nav is not None
+        #     and surf.current_nav.nav_generation == captured_nav_generation
+        #   - surf.paired_frame is not None and surf.paired_frame_bytes is not None
+        #   - surf.paired_frame.frame.frame_seq == captured_frame_seq
+        #     and surf.paired_frame.frame.frame_sha256 == captured_frame_sha256
+        #   - now_release >= surf.paired_frame.frame.captured_at
+        #     and int((now_release - surf.paired_frame.frame.captured_at) * 1000) <= max_frame_age_ms
+        if release_failure is not None:
+            # FAIL CLOSED: suppress pixels & rebuild zero-pixel stale snapshot from current locked state!
+            packed_snapshot = rebuild_zero_pixel_stale_snapshot_locked(
+                sb, surf, now_release, omission_reason=release_failure, max_response_bytes=max_response_bytes
+            )
+
+return packed_snapshot
+```
+
+- On incarnation rotation or revocation during packing: raises `IncarnationMismatchError` or
+  `RevokedError` (zero data returned).
+- On mid-pack navigation commit, capture-generation bump, frame superseding, disconnect, clock
+  regression, or TTL expiry: **suppresses pixels unconditionally** (`frame_b64 = None`,
+  `frame_b64_omitted_reason = release_failure`) and re-packs a zero-pixel stale metadata snapshot
+  from the current locked state (matching `max_response_bytes`), followed by the final post-read
+  `session_validator` & `live_authority_checker` gate.
+- `list_browser_wall` never carries pixels (`frame_b64` is never emitted on wall tiles) and enforces
+  the post-pack `session_validator` and `live_authority_checker` gate before returning.
 
 ---
 
@@ -675,24 +806,26 @@ and **strictly guarantee `len(serialized_utf8) <= max_response_bytes`**:
 
 - **Deduplicated JSON wire layout (exact byte arithmetic verified):**
   - Inside `BrowserSurfaceSnapshot.to_dict()` and `BrowserWallTile.to_dict()`:
-    - `sandbox_addr`, `incarnation_id`, and `surface_id` appear **once** at the snapshot/tile top
-      level (not repeated inside nested `nav` and `frame` objects).
-    - `BrowserSurfaceSnapshot.to_dict()` emits `"nav"` once and `"frame"` (from
-      `paired_frame.frame`) without duplicating `"nav"` inside `"frame"`.
+    - `sandbox_addr`, `incarnation_id`, `surface_id`, and `capture_generation` appear **once** at
+      the snapshot/tile top level (not repeated inside nested `nav` and `frame` objects).
+    - `BrowserSurfaceSnapshot.to_dict()` emits `"nav"` once (or `null` when awaiting a new
+      navigation after capture-generation retirement) and `"frame"` (from `paired_frame.frame`)
+      without duplicating `"nav"` inside `"frame"`.
     - `NavClassification` serializes its 6 redaction/truncation flags as a compact sorted
       `"redacted_flags": [...]` list of active tokens (closed set: `"userinfo"`, `"query"`,
       `"fragment"`, `"path_truncated"`, `"title_scrubbed"`, `"title_truncated"` — `20` bytes when
       clean instead of `148` bytes of `false` booleans!), while exposing all 6 booleans directly as
       Python properties on `NavClassification` and `BrowserNavState`.
   - **Verified byte sizes (`MIN_RESPONSE_BYTES = 1024`):**
-    - Typical `BrowserSurfaceSnapshot` (with paired frame, `frame_b64=None`, `read_session`,
-      `dropped_frame_counts`) is **~810 UTF-8 bytes** (fits cleanly inside `1024` bytes with > 210 B
-      headroom for title/path).
-    - Typical 1-tile `BrowserWallPage` (with `next_cursor` ~115 B and `read_session` ~70 B) is
-      **~860 UTF-8 bytes** (fits cleanly inside `1024` bytes with > 160 B headroom).
+    - Typical `BrowserSurfaceSnapshot` (with paired frame, `capture_generation`, `frame_b64=None`,
+      `read_session`, `dropped_frame_counts`) is **~833 UTF-8 bytes** (fits cleanly inside `1024`
+      bytes with > 190 B headroom for title/path).
+    - Typical 1-tile `BrowserWallPage` (with `capture_generation`, `next_cursor` ~115 B, and
+      `read_session` ~70 B) is **~883 UTF-8 bytes** (fits cleanly inside `1024` bytes with > 140 B
+      headroom).
     - Pathological max-length inputs (253 B DNS hostname + 96 B `incarnation_id` + 96 B `surface_id`
-      + 307 B `next_cursor` + 96 B `read_session_id`) have a worst-case minimal snapshot of ~1,580 B
-      and minimal 1-tile wall page of ~1,560 B; under a 1 KiB caller cap those fail closed cleanly
+      + 307 B `next_cursor` + 96 B `read_session_id`) have a worst-case minimal snapshot of ~1,610 B
+      and minimal 1-tile wall page of ~1,590 B; under a 1 KiB caller cap those fail closed cleanly
       with `CoordValidationError("response_budget_too_small_for_envelope")` or
       `CoordValidationError("response_budget_too_small_for_item")` rather than ever exceeding
       `max_response_bytes`.
@@ -728,6 +861,12 @@ and **strictly guarantee `len(serialized_utf8) <= max_response_bytes`**:
      so `snapshot.nav == snapshot.paired_frame.nav` stays 100% synchronized! If even the minimal
      envelope exceeds `max_response_bytes`, raises
      `CoordValidationError("response_budget_too_small_for_envelope")`.
+   - **Mandatory post-pack release fence (§4.3):** Immediately after packing and **before returning**,
+     re-acquires `self._lock` to re-verify incarnation, `capture_generation`, `browser_enabled`,
+     `status == "running"`, `nav_generation`, `(frame_seq, frame_sha256)`, and TTL freshness
+     against `now_release` (failing closed to a zero-pixel stale snapshot or raising
+     `IncarnationMismatchError`/`RevokedError`), followed by the final post-read `session_validator`
+     & `live_authority_checker` gate.
 
 2. **`list_browser_wall`:**
    ```python
@@ -743,7 +882,8 @@ and **strictly guarantee `len(serialized_utf8) <= max_response_bytes`**:
        session_generation: int | None = None,
    ) -> BrowserWallPage
    ```
-   - Never includes raw frame bytes or `frame_b64` (metadata-only PiP tiles).
+   - Never includes raw frame bytes or `frame_b64` (metadata-only PiP tiles; post-pack
+     `session_validator` & `live_authority_checker` still run before returning).
    - Iterates browser-enabled sandboxes' active-incarnation surfaces in deterministic total order
      `(sandbox_addr ASC, surface_id ASC)` strictly greater than `(cursor.addr, cursor.sid)`.
    - Excludes non-`"running"` sandboxes unless `include_disconnected=True`.
@@ -778,16 +918,17 @@ dataclass constructor including `self`, zero duplicated `>= 10`-char string lite
    - Composed frozen dataclasses (each `<= 11` fields so `__init__` stays `<= 12` params incl.
      `self`, every dataclass validating its invariants in `__post_init__`):
      - `ReadSessionEcho(read_session_id, session_generation)`
+     - `SurfaceKey(sandbox_addr, incarnation_id, surface_id, capture_generation)` — 4 fields; validates canonical target, opaque tokens, and `1 <= capture_generation <= MAX_SQLITE_INT64`.
      - `NavClassification(origin_trust, tls_state, userinfo_redacted, query_redacted, fragment_redacted, path_truncated, title_scrubbed, title_truncated)`
-     - `BrowserNavState(sandbox_addr, incarnation_id, surface_id, nav_generation, origin, path_redacted, scheme, tls_verified, page_title_clean, committed_at, classification)` — validates all fields + `len(display_url.encode("utf-8")) <= MAX_DISPLAY_URL_BYTES` in `__post_init__`; exposes `display_url` and classification properties, full `to_dict()`, and deduplicated `to_compact_dict()`.
-     - `BrowserFrameMeta(sandbox_addr, incarnation_id, surface_id, nav_generation, frame_seq, media_type, width, height, size_bytes, frame_sha256, captured_at)` — validates all fields/ranges/SHA-256 hex in `__post_init__`; exposes full `to_dict()` and deduplicated `to_compact_dict()`.
-     - `PairedBrowserFrame(nav, frame, untrusted_content=True)` — structurally verifies identity/generation parity and `untrusted_content is True`.
+     - `BrowserNavState(surface_key, nav_generation, origin, path_redacted, scheme, tls_verified, page_title_clean, committed_at, classification)` — 9 fields (`<= 10` params incl. `self`); validates all fields + `len(display_url.encode("utf-8")) <= MAX_DISPLAY_URL_BYTES` in `__post_init__`; exposes `sandbox_addr`, `incarnation_id`, `surface_id`, `capture_generation`, `display_url`, and classification properties, full `to_dict()`, and deduplicated `to_compact_dict()`.
+     - `BrowserFrameMeta(surface_key, nav_generation, frame_seq, media_type, width, height, size_bytes, frame_sha256, captured_at)` — 9 fields (`<= 10` params incl. `self`); validates all fields/ranges/SHA-256 hex in `__post_init__`; exposes `sandbox_addr`, `incarnation_id`, `surface_id`, `capture_generation` properties, full `to_dict()`, and deduplicated `to_compact_dict()`.
+     - `PairedBrowserFrame(nav, frame, untrusted_content=True)` — structurally verifies `nav.surface_key == frame.surface_key`, `nav.nav_generation == frame.nav_generation`, and `untrusted_content is True`.
      - `FrameAdmissionResult(accepted, stale_reason=None, frame_meta=None, paired_frame=None)`
-     - `SandboxViewMeta(worker_ref, instance_name, sandbox_status)`
+     - `SandboxViewMeta(worker_ref, instance_name, sandbox_status, capture_generation)`
      - `FrameFreshness(frame_stale, stale_reason, frame_age_ms)`
      - `BrowserSurfaceAudit(dropped_frame_counts, observed_at, read_session)` — wraps `dropped_frame_counts` in `types.MappingProxyType(dict(...))` in `__post_init__`.
-     - `BrowserWallTile(sandbox_meta, nav, frame_meta, freshness, untrusted_content=True)` — 5 fields (`<= 6` params incl. `self`); exposes convenience properties and deduplicated `to_dict()`.
-     - `BrowserSurfaceSnapshot(schema_version, sandbox_meta, nav, paired_frame, freshness, frame_b64, frame_b64_omitted_reason, audit, untrusted_content=True)` — 9 fields (`<= 10` params incl. `self`); exposes convenience properties and deduplicated `to_dict()`.
+     - `BrowserWallTile(sandbox_meta, surface_key, nav, frame_meta, freshness, untrusted_content=True)` — 6 fields (`<= 7` params incl. `self`); `nav` may be `None` when awaiting navigation after capture-generation retirement; exposes convenience properties and deduplicated `to_dict()`.
+     - `BrowserSurfaceSnapshot(schema_version, sandbox_meta, surface_key, nav, paired_frame, freshness, frame_b64, frame_b64_omitted_reason, audit, untrusted_content=True)` — 10 fields (`<= 11` params incl. `self`); `nav` may be `None` after capture-generation retirement; exposes convenience properties and deduplicated `to_dict()`.
      - `BrowserWallPage(schema_version, tiles, has_more, next_cursor, observed_at, read_session)`
    - Strict JSON serializer (`serialize_json_bytes`, `serialize_json_str` with `allow_nan=False`).
    - Hardened canonical base64url JSON cursor codec (`compute_wall_scope_hash`, `encode_wall_cursor`,
@@ -795,20 +936,22 @@ dataclass constructor including `self`, zero duplicated `>= 10`-char string lite
 2. **`oc_browser_validate.py`:**
    - `parse_and_classify_url(...)` with small linear helpers (`_split_http_https_scheme`,
      `_parse_strict_host_port`, `_parse_ipv6_host`, `_parse_dns_or_ipv4_host`, `_parse_port`,
-     `_classify_origin_and_tls`).
+     `_classify_origin_and_tls`) enforcing browser-canonical ASCII hosts (zero `encode("idna")`).
    - `validate_frame_bytes(media_type, frame_bytes)` dispatching strictly to `_validate_png_header`
-     and `_validate_jpeg_header`, plus `_check_dimensions`.
+     and `_validate_jpeg_header` (header inspection & SHA-256 provenance only; full bitstream
+     decoding remains a downstream display gate), plus `_check_dimensions`.
    - `scrub_page_title(raw_title)` using `_strip_terminal_escapes` (7-bit CSI/OSC/DCS/ECMA-48 `nF`,
      nested-ESC restart, 8-bit C1 & `\x9c` ST) and `_filter_and_cap_single_line` (`ch.isspace()`
      normalization + control/bidi/NUL/surrogate removal).
 3. **`oc_browser_observe.py`:**
-   - `BrowserObserveService(clock=time.monotonic, max_frame_age_ms=DEFAULT_MAX_FRAME_AGE_MS, session_validator=None, live_authority_checker=None)`.
+   - `BrowserObserveService(clock=time.monotonic, max_frame_age_ms=DEFAULT_MAX_FRAME_AGE_MS, session_validator=None, live_authority_checker=None, on_after_pack_before_release=None)`.
    - Ingestion/lifecycle: `register_sandbox`, `set_sandbox_status`, `record_navigation`, `ingest_frame`.
    - Operator-only reads: `get_surface_snapshot`, `list_browser_wall`.
-   - Byte-budget packers & atomic binary-search shrinkers: `_pack_surface_snapshot`,
-     `_pack_browser_wall_page`.
+   - Byte-budget packers, atomic binary-search shrinkers, & post-pack release fence:
+     `_pack_surface_snapshot`, `_enforce_pixel_release_fence`, `_pack_browser_wall_page`.
 4. **`test_browser_observe.py`:**
-   - Offline qualification test suite with deterministic PNG/JPEG binary builders and fake clock.
+   - Offline qualification test suite with deterministic PNG/JPEG binary builders, fake clock, and
+     post-pack barrier hooks.
 
 ---
 
@@ -829,30 +972,34 @@ dataclass constructor including `self`, zero duplicated `>= 10`-char string lite
 | Unknown sandbox target | `CoordPolicyError("sandbox_not_found")` |
 | Sandbox registered with `browser_enabled=False` | `CoordPolicyError("browser_service_not_enabled")` (omitted from wall) |
 | Unknown `surface_id` on `get_surface_snapshot` | `CoordPolicyError("surface_not_found")` |
-| `MAX_TRACKED_SANDBOXES`, `MAX_SURFACES_PER_SANDBOX`, or `MAX_ROTATIONS_PER_SANDBOX` exceeded | `CoordPolicyError("max_sandboxes_exceeded" \| "max_surfaces_exceeded" \| "max_incarnation_rotations_exceeded")` |
+| `MAX_TRACKED_SANDBOXES`, `MAX_SURFACES_PER_SANDBOX`, `MAX_ROTATIONS_PER_SANDBOX`, or `MAX_SQLITE_INT64` `capture_generation` exceeded | `CoordPolicyError("max_sandboxes_exceeded" \| "max_surfaces_exceeded" \| "max_incarnation_rotations_exceeded" \| "max_capture_generations_exceeded")` |
 | Transitioning out of `"revoked"` on the same `incarnation_id` (`register_sandbox` or `set_sandbox_status`) | `RevokedError("incarnation_revoked")` (must rotate to fresh `incarnation_id`) |
 | `record_navigation`, `set_sandbox_status`, or `get_surface_snapshot` with superseded `incarnation_id` | `IncarnationMismatchError("superseded_incarnation")` |
+| `record_navigation` or `ingest_frame` with mismatched/stale `capture_generation` | `CoordPolicyError("stale_capture_generation")` (drop counter incremented; zero pixels admitted) |
 | `ingest_frame` with superseded `incarnation_id` | `FrameAdmissionResult(accepted=False, stale_reason="superseded_incarnation")` (zero bytes stored) |
 | `ingest_frame` with `nav_generation < current_nav_generation` or `captured_at < committed_at` | `FrameAdmissionResult(accepted=False, stale_reason="stale_nav_generation")` (quarantined; never paired!) |
 | `ingest_frame` with `nav_generation > current_nav_generation` or no committed nav | `FrameAdmissionResult(accepted=False, stale_reason="unknown_nav_generation")` (quarantined) |
 | `ingest_frame` with `frame_seq <= last_frame_seq` | `FrameAdmissionResult(accepted=False, stale_reason="non_monotonic_frame_seq")` (quarantined) |
-| `nav_generation` or `frame_seq` out of `1..MAX_SQLITE_INT64` or `bool` | `CoordValidationError` |
+| `capture_generation`, `nav_generation`, or `frame_seq` out of `1..MAX_SQLITE_INT64` or `bool` | `CoordValidationError` |
 | `committed_at` earlier than prior `committed_at` / `last_frame_captured_at` | `CoordValidationError("committed_at_non_monotonic")` |
 | `captured_at` earlier than prior `last_frame_captured_at` | `CoordValidationError("frame_captured_at_non_monotonic")` |
 | Future `committed_at > now` or `captured_at > now` | `CoordValidationError("..._in_future")` |
 | Frame age exceeds `max_frame_age_ms` on injected monotonic clock | `frame_stale = True`, `stale_reason = "frame_ttl_expired"`, `frame_b64 = None` (diagnostic metadata preserved) |
-| New navigation committed (or transient disconnect/resume) before next frame arrives | `paired_frame = None`, `paired_frame_bytes = None`, `frame_stale = True`, `stale_reason = "awaiting_frame_for_navigation"` |
-| Sandbox `"starting"`, `"stopped"`, `"revoked"`, or `"degraded"` | `frame_stale = True`, `stale_reason = "sandbox_disconnected"`, paired frame & raw bytes purged |
+| New navigation committed before next frame arrives | `paired_frame = None`, `paired_frame_bytes = None`, `frame_stale = True`, `stale_reason = "awaiting_frame_for_navigation"` |
+| Disconnect/disable retires `capture_generation`, then resumes before a new `capture_generation` navigation commits | `current_nav = None`, `paired_frame = None`, `paired_frame_bytes = None`, `frame_stale = True`, `stale_reason = "awaiting_navigation_for_capture_generation"`, `frame_b64 = None` |
+| Mid-pack navigation commit, capture-generation bump, frame superseding, disconnect, clock regression, or TTL expiry before release | Post-pack release fence suppresses `frame_b64 = None` and returns zero-pixel stale snapshot (or raises `IncarnationMismatchError`/`RevokedError` on incarnation/revocation change) |
+| Sandbox `"starting"`, `"stopped"`, `"revoked"`, or `"degraded"` | `frame_stale = True`, `stale_reason = "sandbox_disconnected"`, `capture_generation` retired, `current_nav` & paired frame/bytes purged |
 | Monotonic clock returns `NaN`/`Inf`/`bool`/negative | `CoordPolicyError("invalid_monotonic_clock")` |
 | Monotonic clock steps backwards below `captured_at` | `frame_stale = True`, `stale_reason = "clock_regression"`, `frame_b64 = None` |
 | `NaN`, `+Inf`, `-Inf`, or `bool` in numeric args | `CoordValidationError` (and `serialize_json_bytes` uses `allow_nan=False`) |
 | Forbidden URL scheme (`javascript:`, `data:`, `file:`, `chrome:`, `chrome-extension:`, `about:srcdoc`, `blob:`, `devtools:`, `ftp:`, etc.) | `CoordValidationError("url_scheme_rejected")` (raw URL never echoed) |
-| Control, C1, DEL, NUL, surrogate, bidi, whitespace, `\`, non-ASCII dot, `Cf`/NFKC-folding host char, invalid port (leading `0` / `>5` digits), or ambiguous hex/octal/short IPv4 | `CoordValidationError` (raw URL never echoed) |
+| Any non-ASCII host (e.g., `straße.example`, `bücher.example`, fullwidth ASCII, ideographic dot, `Cf` invisible char) | `CoordValidationError("url_host_non_canonical")` (raw URL never echoed; browser-canonical ASCII `xn--...` required) |
+| Control, C1, DEL, NUL, surrogate, bidi, whitespace, `\`, invalid port (leading `0` / `>5` digits), or ambiguous hex/octal/short IPv4 | `CoordValidationError` (raw URL never echoed) |
 | Missing `tls_state_evidence` (`None`) on HTTPS, or mismatched CA/host pairing | `tls_state = "unknown"`, `effective_tls_verified = False`, `origin_trust = "external_untrusted"` |
 | Contradictory `tls_verified` vs. `tls_state_evidence` or HTTP with `tls_verified=True`/evidence | `CoordValidationError("invalid_tls_evidence" \| "http_cannot_be_tls_verified")` |
 | URL with `user:pass@host/path?token=SECRET#frag` | Userinfo, query, and fragment stripped & discarded; `userinfo_redacted=True`, `query_redacted=True`, `fragment_redacted=True`; `origin_trust` forced to `"external_untrusted"` (or rejected outright if `reject_userinfo=True`) |
 | Disallowed MIME (`image/webp`, `image/svg+xml`, `image/gif`), bad magic, or MIME vs. magic mismatch | `CoordValidationError("frame_media_type_unsupported")` / `CoordValidationError("frame_media_type_mismatch")` |
-| Frame size `< 16` B or `> 512 KiB`, zero/oversized dimensions, pixel cap exceeded, invalid PNG IHDR CRC/color-depth, or malformed JPEG marker/SOF length (`seg_len != 8 + 3 * nf`) | `CoordValidationError` |
+| Frame size `< 16` B or `> 512 KiB`, zero/oversized dimensions, pixel cap exceeded, invalid PNG IHDR CRC/color-depth, or malformed/truncated JPEG marker (`pos >= len` / `pos + 2 > len`) / SOF length (`seg_len != 8 + 3 * nf`) | `CoordValidationError` |
 | ANSI CSI/OSC/DCS/ECMA-48 `nF`/8-bit C1/`\x9c` ST, NUL, bidi, surrogates, Unicode line separators (`U+2028`/`U+2029`) in page title | Stripped/normalized cleanly to single-line UTF-8 `<= 256` bytes (`title_scrubbed=True`) |
 | Malformed, padded, nested-recursion, `NaN`-containing, oversized, non-canonical, or scope-mismatched wall cursor | `CoordValidationError("cursor_malformed")` / `CoordValidationError("cursor_scope_mismatch")` |
 | `max_response_bytes` exceeded by `frame_b64` | `frame_b64 = None`, `frame_b64_omitted_reason = "response_budget_exceeded"`, serialized JSON `<= max_response_bytes` |
@@ -862,27 +1009,30 @@ dataclass constructor including `self`, zero duplicated `>= 10`-char string lite
 
 ## 8. Open Choices Resolved in This Walkthrough (For Gate 1 Review)
 
-1. **Strict PNG/JPEG-only frame allowlist (no WebP):** `ALLOWED_FRAME_MEDIA_TYPES = {"image/png", "image/jpeg"}`
-   matches `prd_m3.md:271-273, 454` (CDP `Page.startScreencast`) 1:1 and removes the `VP8X`
-   chunk-parsing attack surface completely. `image/webp` is explicitly rejected.
-2. **Explicit `tls_state_evidence` required for HTTPS trust elevation:** Missing evidence
+1. **Strict PNG/JPEG header inspection (no WebP, full decode downstream):**
+   `ALLOWED_FRAME_MEDIA_TYPES = {"image/png", "image/jpeg"}` matches `prd_m3.md:271-273, 454` 1:1
+   and removes the WebP `VP8X` surface completely. `_validate_png_header` and `_validate_jpeg_header`
+   perform binary header inspection and SHA-256 provenance pairing; full bounded bitstream decoding
+   before display remains a separate downstream display gate.
+2. **Browser-canonical ASCII host contract (no IDNA 2003 re-encoding):** Dropping Python's stdlib
+   `host.encode("idna")` eliminates IDNA-2003-vs-UTS-#46 divergence (such as `straße.example`).
+   Non-ASCII hostnames are rejected with `CoordValidationError("url_host_non_canonical")` while
+   already-punycoded ASCII labels from Chromium (`xn--...`) are preserved verbatim.
+3. **Explicit `tls_state_evidence` required for HTTPS trust elevation:** Missing evidence
    (`tls_state_evidence=None`) on HTTPS never fabricates `"sandbox_internal_ca"` or
    `"verified_external_tls"`; it always classifies as `tls_state="unknown"`,
    `effective_tls_verified=False`, `origin_trust="external_untrusted"`, and every mismatched CA/host
    pairing is downgraded identically before applying the `userinfo_redacted` cap.
-3. **Userinfo (`user:pass@`) redaction + trust-elevation refusal:** `parse_and_classify_url` strips
-   userinfo via the last `@` by default (`userinfo_redacted=True`, credentials discarded and never
-   echoed in errors, `origin_trust` forced to `"external_untrusted"`), while supporting
-   `reject_userinfo=True` for strict admission callers.
-4. **Expired-frame pixel suppression & non-running frame purge:** Expired frames retain read-only
-   diagnostic metadata (`BrowserFrameMeta`, `frame_age_ms`, `frame_stale=True`,
-   `stale_reason="frame_ttl_expired"`) while suppressing `frame_b64=None`. Transitioning to any
-   non-`"running"` status clears both `paired_frame` and `paired_frame_bytes` atomically, and
-   `"revoked"` is strictly terminal per `incarnation_id`.
+4. **Capture-generation retirement + post-pack pixel release fence:** Leaving `"running"` or
+   disabling a sandbox retires `capture_generation` (bumping it and clearing `current_nav`,
+   `paired_frame`, and `paired_frame_bytes`), and every pixel-bearing `get_surface_snapshot`
+   re-checks surface identity, `capture_generation`, `nav_generation`, `(frame_seq, frame_sha256)`,
+   and TTL freshness under lock *after* packing before releasing any pixels.
 5. **Compact deduplicated JSON wire representation:** Snapshots and wall tiles emit identity keys
-   once at the top level and serialize redaction flags as a compact `"redacted_flags"` list so
-   typical paired snapshots (~810 B) and 1-tile wall pages with cursor (~860 B) fit comfortably
-   inside `MIN_RESPONSE_BYTES = 1024`, while pathological max-length records fail closed cleanly.
+   (`sandbox_addr`, `incarnation_id`, `surface_id`, `capture_generation`) once at the top level and
+   serialize redaction flags as a compact `"redacted_flags"` list so typical paired snapshots
+   (~833 B) and 1-tile wall pages with cursor (~883 B) fit comfortably inside
+   `MIN_RESPONSE_BYTES = 1024`, while pathological max-length records fail closed cleanly.
 
 ---
 
@@ -921,28 +1071,49 @@ with zero Podman, zero live Chromium, zero network calls, and zero writes to hos
    - Terminal `"revoked"` fixture: `set_sandbox_status(..., "revoked")` purges paired frames;
      attempting `set_sandbox_status(..., "running")` or `register_sandbox(..., inc_same, status="running")`
      raises `RevokedError("incarnation_revoked")`; rotating to fresh `inc_3` succeeds.
-   - Transient disconnect/resume fixture: `set_sandbox_status(..., "stopped")` -> `"running"` clears
-     both `paired_frame` and `paired_frame_bytes`; subsequent `get_surface_snapshot(..., include_frame_b64=True)`
-     returns `paired_frame = None, frame_stale = True, stale_reason = "awaiting_frame_for_navigation", frame_b64 = None`
-     (never crashes in `b64encode`).
+   - **Capture-generation retirement on disconnect/disable & delayed-frame race fixture:**
+     - Sandbox running at `capture_generation = 1`: commit nav (`nav_generation = 1`) and ingest
+       frame (`frame_seq = 1`).
+     - Disconnect (`set_sandbox_status(..., "stopped")`) or disable (`register_sandbox(..., browser_enabled=False)`),
+       then resume (`status = "running"`, `browser_enabled = True`) — bumping `capture_generation = 2`
+       and clearing `current_nav`, `paired_frame`, and `paired_frame_bytes`.
+     - Deliver a held old frame from `capture_generation = 1` (and a stale nav from
+       `capture_generation = 1`) -> rejected with `CoordPolicyError("stale_capture_generation")`.
+     - Verify `get_surface_snapshot(..., include_frame_b64=True)` returns **zero pixels**
+       (`nav = None`, `paired_frame = None`, `frame_b64 = None`,
+       `stale_reason = "awaiting_navigation_for_capture_generation"`) until a new navigation and
+       frame bound to `capture_generation = 2` arrive!
    - Status `"starting"` and `"degraded"` treated as non-running (`sandbox_disconnected`).
-   - Structural invariant check: direct instantiation of `PairedBrowserFrame` with mismatched keys
-     or `untrusted_content=False`, or direct `BrowserNavState`/`BrowserFrameMeta` with invalid
-     fields, raises `CoordValidationError`; mutating `snapshot.audit.dropped_frame_counts` raises
+   - Structural invariant check: direct instantiation of `PairedBrowserFrame` with mismatched
+     `SurfaceKey` (including mismatched `capture_generation`) or `nav_generation` or
+     `untrusted_content=False`, or direct `BrowserNavState`/`BrowserFrameMeta` with invalid fields,
+     raises `CoordValidationError`; mutating `snapshot.audit.dropped_frame_counts` raises
      `TypeError` (`MappingProxyType`).
-3. **Fake monotonic clock TTL expiry & clock-anomaly defense:**
+3. **Fake monotonic clock TTL expiry, post-pack release barrier, & clock-anomaly defense:**
    - Admit frame at `t = 100.0` with `max_frame_age_ms = 5000`; at `t = 104.999` -> `frame_stale = False`,
      `include_frame_b64 = True` returns exact base64 bytes matching `frame_sha256`.
    - Advance fake clock to `t = 105.001` -> `frame_stale = True`,
      `stale_reason = "frame_ttl_expired"`, `frame_age_ms = 5001`, diagnostic `BrowserFrameMeta`
      preserved, `frame_b64 = None`, `frame_b64_omitted_reason = "frame_ttl_expired"`.
+   - **Post-pack pixel release barrier fixtures (`on_after_pack_before_release`):**
+     - *(a) Mid-pack navigation commit:* Begin `get_surface_snapshot(..., include_frame_b64=True)` on
+       `nav_generation = 1`; inside `on_after_pack_before_release`, commit `nav_generation = 2` ->
+       verify post-pack release fence suppresses pixels (`frame_b64 = None`, zero `nav_generation = 1`
+       pixels released!).
+     - *(b) Mid-pack TTL expiry:* Begin `get_surface_snapshot(..., include_frame_b64=True)` at
+       `t = 104.999`; inside `on_after_pack_before_release`, advance fake clock to `t = 105.001` ->
+       verify post-pack release fence suppresses pixels (`frame_b64 = None`,
+       `stale_reason = "frame_ttl_expired"`, zero expired pixels released!).
+     - *(c) Mid-pack incarnation rotation / revocation:* Inside `on_after_pack_before_release`,
+       rotate incarnation or mark `"revoked"` -> raises `IncarnationMismatchError` / `RevokedError`
+       with zero data returned!
    - Future `captured_at > now` or `committed_at > now`, or non-monotonic `committed_at` /
      `captured_at` rejected with `CoordValidationError`.
    - Backwards clock step (`t = 99.0 < captured_at`) -> `frame_stale = True`,
      `stale_reason = "clock_regression"`, `frame_b64 = None`.
    - Broken clock returning `NaN`, `+Inf`, `-1.0`, or `True` fails closed with
      `CoordPolicyError("invalid_monotonic_clock")`.
-4. **URL redaction, scheme/IDNA/IPv4/port hardening, & exact TLS/CA classification:**
+4. **URL redaction, browser-canonical ASCII host contract, IPv4/port hardening, & exact TLS/CA classification:**
    - `https://user:pass@feat-a.oc-sandbox.internal/callback?token=SECRET&a=1#jwt=FRAG` with
      `tls_verified=True, tls_state_evidence="sandbox_internal_ca"` ->
      `origin == "https://feat-a.oc-sandbox.internal"`, `path_redacted == "/callback"`,
@@ -956,16 +1127,24 @@ with zero Podman, zero live Chromium, zero network calls, and zero writes to hos
      `chrome://settings`, `chrome-extension://abc/bg.html`, `about:srcdoc`, `about:blank`,
      `blob:https://example.com/1`, `devtools://devtools`, `ftp://example.com`, `//example.com`)
      all raise `CoordValidationError`.
-   - IDNA/NFKC/IPv4/port bypasses rejected: fullwidth `\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54`
-     and fullwidth `\uff46\uff45\uff41\uff54-a.oc-sandbox.internal`, ideographic dot `\u3002`/`\uff0e`,
-     invisible `Cf` ZWSP `\u200b` / soft hyphen `\u00ad`, backslash `https://evil.com\@feat-a.oc-sandbox.internal`,
-     hex/octal/short/integer IPv4 (`http://2130706433/`, `http://0x7f000001/`, `http://0177.0.0.1/`,
-     `http://127.1/`, `http://0x7f.0.0.1/`), IPv4-mapped IPv6 (`http://[::ffff:127.0.0.1]/`),
-     IPv6 zone IDs (`http://[::1%25lo]/`), leading-zero/oversize ports (`:0443`, `:00000080`, `:99999`).
+   - **IDNA-2003 vs. UTS-#46 / browser-canonical ASCII origin fixtures:**
+     - Non-ASCII hosts (`https://straße.example/`, `https://bücher.example/`, fullwidth
+       `\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54`, fullwidth
+       `\uff46\uff45\uff41\uff54-a.oc-sandbox.internal`, ideographic dots `\u3002`/`\uff0e`,
+       invisible `Cf` ZWSP `\u200b` / soft hyphen `\u00ad`) are ALL rejected with
+       `CoordValidationError("url_host_non_canonical")` (zero `encode("idna")` re-encoding!).
+     - Browser-canonical ASCII punycode (`https://xn--strae-oqa.example/p`,
+       `https://xn--bcher-kva.example/p`) is accepted verbatim without re-encoding (`origin`
+       preserved identically; with `external_ca` -> `tls_state="verified_external_tls"`,
+       `origin_trust="external_untrusted"`).
+   - Backslash `https://evil.com\@feat-a.oc-sandbox.internal`, hex/octal/short/integer IPv4
+     (`http://2130706433/`, `http://0x7f000001/`, `http://0177.0.0.1/`, `http://127.1/`,
+     `http://0x7f.0.0.1/`), IPv4-mapped IPv6 (`http://[::ffff:127.0.0.1]/`), IPv6 zone IDs
+     (`http://[::1%25lo]/`), and leading-zero/oversize ports (`:0443`, `:00000080`, `:99999`) are
+     rejected with `CoordValidationError`.
    - Explicit `:443` omitted (`https://feat-a.oc-sandbox.internal:443/` -> `origin == "https://feat-a.oc-sandbox.internal"`),
      non-default `:8443` preserved (`origin == "https://feat-a.oc-sandbox.internal:8443"`, still
-     `"sandbox_internal_https"` with `sandbox_internal_ca`), IDN (`https://bücher.example/p` ->
-     `https://xn--bcher-kva.example`).
+     `"sandbox_internal_https"` with `sandbox_internal_ca`).
    - Complete TLS/CA matrix verified:
      - HTTPS with `tls_state_evidence=None` (even `tls_verified=True`!) -> `tls_state="unknown"`,
        `tls_verified=False`, `origin_trust="external_untrusted"`.
@@ -981,20 +1160,24 @@ with zero Podman, zero live Chromium, zero network calls, and zero writes to hos
      - Contradictory `(tls_verified=True, "tls_error")`, `(tls_verified=False, "sandbox_internal_ca")`,
        or `(http, tls_verified=True)` / `(http, tls_state_evidence=...)` -> `CoordValidationError`.
      - `http://127.0.0.1:3000/`, `http://[::1]:8080/`, `http://localhost:5173/` -> `"loopback_http"`.
-5. **Binary image magic-byte, MIME mismatch, JPEG EXIF-SOF, & decompression-bomb validation:**
+5. **PNG/JPEG binary header inspection, MIME mismatch, JPEG EXIF-SOF, truncated markers, & decompression-bomb guard:**
    - Valid PNG (all legal `(color_type, bit_depth)` forms) and valid JPEG (SOF0/SOF2 with preceding
      `APP0`/`COM` AND an **`APP1` EXIF segment containing a fake embedded `FF C0` SOF** whose inner
-     dimensions differ from the real main SOF!) pass with exact main-image `(width, height)` and
-     authoritative `frame_sha256`.
+     dimensions differ from the real main SOF!) pass header inspection with exact main-image
+     `(width, height)` and authoritative `frame_sha256`.
    - Disallowed MIME (`image/webp` even with valid RIFF/WEBP bytes, `image/svg+xml`, `image/gif`) ->
      `CoordValidationError("frame_media_type_unsupported")`.
    - MIME vs. magic mismatch (PNG declared `image/jpeg`, JPEG declared `image/png`, SVG declared
      `image/png`) -> `CoordValidationError("frame_media_type_mismatch")`.
    - Decompression-bomb dimensions (`width=0`, `height=0`, `65535 x 65535`, `4096 x 4096` exceeding
      `MAX_FRAME_PIXELS`) -> `CoordValidationError("frame_dimensions_out_of_bounds")`.
+   - **Truncated JPEG marker fixtures:** (a) JPEG ending with trailing `0xFF` fill bytes after
+     `SOI` (`pos >= len(raw)`), (b) JPEG truncated right after marker byte with `< 2` bytes left
+     for `seg_len` (`pos + 2 > len(raw)`), and (c) JPEG truncated mid-SOF header — all raise
+     `CoordValidationError("frame_jpeg_malformed")` (never `IndexError` or `struct.error`).
    - Corrupt PNG IHDR CRC, illegal PNG `(color_type, bit_depth)` pair (e.g. `color_type=3, bit_depth=16`),
      oversized payload (`512 KiB + 1`), undersized payload (`< 16` B), non-`bytes` payload, JPEG
-     missing `0xFF` alignment, `0x00`/`0xD8`/`0xD0` markers before SOF, truncated/mismatched SOF
+     missing `0xFF` alignment, `0x00`/`0xD8`/`0xD0` markers before SOF, mismatched SOF
      `seg_len != 8 + 3 * nf`, and `> MAX_JPEG_SEGMENTS` -> `CoordValidationError`.
 6. **Page-title scrubbing (ANSI / ECMA-48 `nF` / nested ESC / C1 / Unicode line breaks / bidi / NUL):**
    - Title with 7-bit CSI (`\x1b[31mRed\x1b[0m`), OSC (`\x1b]52;c;AAAA\x07`), 8-bit ST (`\x1b]0;spoof\x9c`),
