@@ -1133,9 +1133,17 @@ class BrowserProvenanceStore:
         self, addr: str, sid: str, explicit_inc: str | None
     ) -> _CapturedSurfaceState:
         now = self._read_monotonic_clock()
-        sb = self._require_enabled_sandbox_locked(addr)
+        sb = self._sandboxes.get(addr)
+        if sb is None:
+            raise CoordPolicyError(_ERR_SANDBOX_NOT_FOUND)
         if explicit_inc is not None and explicit_inc != sb.current_incarnation_id:
             raise IncarnationMismatchError(STALE_SUPERSEDED_INCARNATION)
+        if sb.status == _STATUS_REVOKED:
+            raise RevokedError(_ERR_INCARNATION_REVOKED)
+        if sb.capture_generation_exhausted:
+            raise RevokedError(_ERR_CAP_GEN_EXHAUSTED)
+        if not sb.browser_enabled:
+            raise CoordPolicyError(_ERR_BROWSER_DISABLED)
         surf = sb.surfaces.get(sid)
         if surf is None:
             raise CoordPolicyError(_ERR_SURFACE_NOT_FOUND)
@@ -1170,15 +1178,9 @@ class BrowserProvenanceStore:
             raise CoordPolicyError(_ERR_SANDBOX_NOT_FOUND)
         if sb.current_incarnation_id != captured.surface_key.incarnation_id:
             raise IncarnationMismatchError(STALE_SUPERSEDED_INCARNATION)
-        if (
-            captured.sandbox_meta.sandbox_status != _STATUS_REVOKED
-            and sb.status == _STATUS_REVOKED
-        ):
+        if sb.status == _STATUS_REVOKED:
             raise RevokedError(_ERR_INCARNATION_REVOKED)
-        if (
-            not captured.capture_generation_exhausted
-            and sb.capture_generation_exhausted
-        ):
+        if sb.capture_generation_exhausted:
             raise RevokedError(_ERR_CAP_GEN_EXHAUSTED)
         if not sb.browser_enabled:
             raise CoordPolicyError(_ERR_BROWSER_DISABLED)
@@ -1321,8 +1323,9 @@ class BrowserProvenanceStore:
         *,
         include_disconnected: bool,
         after_key: tuple[str, str] | None,
+        now: float | None = None,
     ) -> tuple[list[BrowserWallTile], float]:
-        now = self._read_monotonic_clock()
+        cur_now = self._read_monotonic_clock() if now is None else now
         tiles: list[BrowserWallTile] = []
         for addr in sorted(self._sandboxes.keys()):
             sb = self._sandboxes[addr]
@@ -1332,10 +1335,100 @@ class BrowserProvenanceStore:
                 continue
             tiles.extend(
                 self._collect_sandbox_wall_tiles_locked(
-                    sb, now=now, after_key=after_key
+                    sb, now=cur_now, after_key=after_key
                 )
             )
-        return tiles, now
+        return tiles, cur_now
+
+    def _wall_tile_frame_matches(
+        self, tile: BrowserWallTile, surf: _SurfaceRecord
+    ) -> bool:
+        cur_frame = None if surf.paired_frame is None else surf.paired_frame.frame
+        if tile.frame_meta is None:
+            return cur_frame is None
+        return (
+            cur_frame is not None
+            and cur_frame.frame_seq == tile.frame_meta.frame_seq
+            and cur_frame.frame_sha256 == tile.frame_meta.frame_sha256
+        )
+
+    def _wall_sandbox_matches_tile_locked(
+        self, tile: BrowserWallTile, *, include_disconnected: bool
+    ) -> _SandboxBrowserRecord | None:
+        sb = self._sandboxes.get(tile.sandbox_addr)
+        if sb is None or not sb.browser_enabled:
+            return None
+        if not include_disconnected and sb.status != _STATUS_RUNNING:
+            return None
+        if (
+            sb.current_incarnation_id != tile.incarnation_id
+            or sb.capture_generation != tile.capture_generation
+            or sb.status != tile.sandbox_meta.sandbox_status
+        ):
+            return None
+        return sb
+
+    def _wall_tile_matches_locked(
+        self,
+        tile: BrowserWallTile,
+        *,
+        include_disconnected: bool,
+        now_release: float,
+    ) -> bool:
+        sb = self._wall_sandbox_matches_tile_locked(
+            tile, include_disconnected=include_disconnected
+        )
+        if sb is None:
+            return False
+        surf = sb.surfaces.get(tile.surface_id)
+        if surf is None:
+            return False
+        cur_nav_gen = None if surf.current_nav is None else surf.current_nav.nav_generation
+        tile_nav_gen = None if tile.nav is None else tile.nav.nav_generation
+        if cur_nav_gen != tile_nav_gen or not self._wall_tile_frame_matches(tile, surf):
+            return False
+        cur_fresh = _evaluate_freshness(sb, surf, now_release, self._max_frame_age_ms)
+        return (
+            cur_fresh.frame_stale == tile.frame_stale
+            and cur_fresh.stale_reason == tile.stale_reason
+        )
+
+    def _enforce_wall_release_fence(
+        self,
+        page: BrowserWallPage,
+        *,
+        include_disconnected: bool,
+        after_key: tuple[str, str] | None,
+        scope_hash: str,
+        limit: int,
+        max_response_bytes: int,
+        session_echo: ReadSessionEcho | None,
+    ) -> BrowserWallPage:
+        with self._lock:
+            now_release = self._read_monotonic_clock()
+            all_valid = all(
+                self._wall_tile_matches_locked(
+                    tile,
+                    include_disconnected=include_disconnected,
+                    now_release=now_release,
+                )
+                for tile in page.tiles
+            )
+            if all_valid:
+                return page
+            candidates_now, _ = self._collect_wall_candidates_locked(
+                include_disconnected=include_disconnected,
+                after_key=after_key,
+                now=now_release,
+            )
+            return _pack_wall_page(
+                candidates_now,
+                scope_hash=scope_hash,
+                limit=limit,
+                max_response_bytes=max_response_bytes,
+                observed_at=now_release,
+                read_session=session_echo,
+            )
 
     def list_browser_wall(
         self,
@@ -1376,7 +1469,15 @@ class BrowserProvenanceStore:
         if self._on_after_pack_before_release is not None:
             self._on_after_pack_before_release()
         self._check_authority_and_session(op_caller, session_echo)
-        return page
+        return self._enforce_wall_release_fence(
+            page,
+            include_disconnected=include_disconnected,
+            after_key=after_key,
+            scope_hash=scope_hash,
+            limit=clean_limit,
+            max_response_bytes=budget,
+            session_echo=session_echo,
+        )
 
 
 BrowserObserveService = BrowserProvenanceStore

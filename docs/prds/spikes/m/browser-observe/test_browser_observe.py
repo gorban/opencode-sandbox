@@ -794,6 +794,91 @@ class TestClockTtlAndPostPackBarriers(unittest.TestCase):
                 op, target=_SB_FEAT_A, surface_id=_SURF_MAIN
             )
 
+    def test_list_browser_wall_post_pack_fence_omits_disabled_and_updates_stale(
+        self,
+    ) -> None:
+        clock = _FakeClock(100.0)
+        hook_fn: list[object] = [None]
+        store = BrowserProvenanceStore(
+            clock=clock,
+            max_frame_age_ms=5_000,
+            on_after_pack_before_release=lambda: hook_fn[0]() if callable(hook_fn[0]) else None,
+        )
+        png_a = _make_png(24, 24)
+        png_b = _make_png(32, 32)
+        op = _operator()
+
+        for sb, title, data in (
+            (_SB_FEAT_A, "SecretRetiredTile", png_a),
+            ("feat-b", "ActiveTileB", png_b),
+            ("feat-c", "ActiveTileC", png_b),
+        ):
+            store.register_sandbox(sb, incarnation_id=_INC_1)
+            store.record_navigation(
+                sb, incarnation_id=_INC_1, surface_id=_SURF_MAIN,
+                capture_generation=1, nav_generation=1,
+                raw_url=f"https://{sb}.oc-sandbox.internal/app",
+                tls_verified=True, tls_state_evidence=TLS_EVIDENCE_SANDBOX_CA,
+                page_title=title,
+            )
+            store.ingest_frame(
+                sb, incarnation_id=_INC_1, surface_id=_SURF_MAIN,
+                capture_generation=1, nav_generation=1, frame_seq=1,
+                media_type=_MEDIA_PNG, frame_bytes=data,
+            )
+
+        # (a) Disabling feat-a mid-pack omits its tile/nav metadata and recomputes pagination!
+        hook_fn[0] = lambda: store.register_sandbox(
+            _SB_FEAT_A, incarnation_id=_INC_1, browser_enabled=False
+        )
+        page_a = store.list_browser_wall(op, limit=2)
+        raw_a = page_a.to_json_bytes().decode("utf-8")
+        self.assertNotIn("SecretRetiredTile", raw_a)
+        self.assertEqual([t.sandbox_addr for t in page_a.tiles], ["feat-b", "feat-c"])
+        self.assertFalse(page_a.has_more)
+        self.assertIsNone(page_a.next_cursor)
+
+        # (b) Mid-pack disable on limit=1 recomputes cursor cleanly for remaining tile.
+        hook_fn[0] = lambda: store.register_sandbox(
+            "feat-b", incarnation_id=_INC_1, browser_enabled=False
+        )
+        page_b = store.list_browser_wall(op, limit=1)
+        self.assertEqual([t.sandbox_addr for t in page_b.tiles], ["feat-c"])
+        self.assertFalse(page_b.has_more)
+        self.assertIsNone(page_b.next_cursor)
+
+        # (c) Mid-pack TTL expiry updates remaining tile freshness to stale.
+        clock.now = 104.999
+        hook_fn[0] = lambda: setattr(clock, "now", 105.0005)
+        page_ttl = store.list_browser_wall(op, limit=2)
+        self.assertEqual(len(page_ttl.tiles), 1)
+        self.assertTrue(page_ttl.tiles[0].frame_stale)
+        self.assertEqual(page_ttl.tiles[0].stale_reason, STALE_TTL_EXPIRED)
+
+    def test_get_surface_snapshot_rejects_already_revoked_and_exhausted_incarnations(
+        self,
+    ) -> None:
+        clock = _FakeClock(100.0)
+        store, _ = _make_store_with_paired_frame(clock)
+        op = _operator()
+
+        # (a) Single-surface read begun AFTER revocation raises RevokedError.
+        store.set_sandbox_status(_SB_FEAT_A, incarnation_id=_INC_1, status="revoked")
+        with self.assertRaises(RevokedError):
+            store.get_surface_snapshot(op, target=_SB_FEAT_A, surface_id=_SURF_MAIN)
+
+        # (b) Single-surface read begun AFTER capture_generation exhaustion raises RevokedError.
+        store.register_sandbox("feat-b", incarnation_id=_INC_1)
+        store.record_navigation(
+            "feat-b", incarnation_id=_INC_1, surface_id=_SURF_MAIN,
+            capture_generation=1, nav_generation=1,
+            raw_url=_URL_EXTERNAL_PHISH, tls_verified=False,
+        )
+        store._sandboxes["feat-b"].capture_generation = MAX_SQLITE_INT64  # noqa: SLF001
+        store.set_sandbox_status("feat-b", incarnation_id=_INC_1, status="stopped")
+        with self.assertRaises(RevokedError):
+            store.get_surface_snapshot(op, target="feat-b", surface_id=_SURF_MAIN)
+
 
 class TestUrlRedactionAndTlsClassification(unittest.TestCase):
     """Section 9.4: URL redaction, browser-canonical ASCII host, bare 0x, & TLS/CA matrix."""

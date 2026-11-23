@@ -146,9 +146,9 @@ VALID_STALE_REASONS: frozenset[str] = frozenset(
 
 CURSOR_PREFIX = "v1."
 OP_BROWSER_WALL = "browser_wall"
-_CURSOR_B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$", re.ASCII)
-_SCOPE_HASH_RE = re.compile(r"^[0-9a-f]{16}$", re.ASCII)
-_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
+_CURSOR_B64URL_RE = re.compile(r"^[\w-]+$", re.ASCII)
+_SCOPE_HASH_RE = re.compile(r"^[\da-f]{16}$", re.ASCII)
+_SHA256_HEX_RE = re.compile(r"^[\da-f]{64}$", re.ASCII)
 _CURSOR_KEYS: frozenset[str] = frozenset({"op", "fh", "addr", "sid"})
 
 ERR_CURSOR_MALFORMED = "cursor_malformed"

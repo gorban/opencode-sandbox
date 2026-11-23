@@ -55,7 +55,7 @@ SANDBOX_INTERNAL_SUFFIX = ".oc-sandbox.internal"
 LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
 
 _NUMERIC_OR_HEX_LABEL_RE = re.compile(r"^(?:0x[\da-f]*|\d+)$", re.ASCII)
-_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.ASCII)
+_DNS_LABEL_RE = re.compile(r"^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$", re.ASCII)
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _JPEG_MAGIC = b"\xff\xd8\xff"
