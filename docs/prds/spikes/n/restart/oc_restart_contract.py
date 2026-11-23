@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import sys
 import threading
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 _RESTART_DIR = Path(__file__).resolve().parent
 _SPIKE_N_DIR = _RESTART_DIR.parent
@@ -648,7 +648,7 @@ def _build_dag_adjacency(
         if spec.step_id in by_id:
             raise RestartValidationError(f"duplicate step_id: {spec.step_id}")
         by_id[spec.step_id] = spec
-    in_degree = {sid: 0 for sid in by_id}
+    in_degree = dict.fromkeys(by_id, 0)
     children: dict[str, list[str]] = {sid: [] for sid in by_id}
     for spec in steps:
         for dep in spec.depends_on:
@@ -1355,12 +1355,15 @@ def _apply_step_completed(state: _MutableReplayState, event: JournalEvent) -> No
         and p.get(KEY_IDEM_KEY) == step.idempotency_key,
         "complete_token_mismatch",
     )
-    updated = replace(
-        step,
-        status=StepStatus.COMPLETED,
-        output_digest=out_digest,
-        failure_reason=None,
-        updated_at_us=event.created_at_us,
+    updated = cast(
+        WorkflowStepRecord,
+        replace(
+            step,
+            status=StepStatus.COMPLETED,
+            output_digest=out_digest,
+            failure_reason=None,
+            updated_at_us=event.created_at_us,
+        ),
     )
     state.steps[(step.run_id, step.step_id)] = updated
     _update_idem_for_step(
@@ -1392,12 +1395,15 @@ def _apply_step_failed_terminal(state: _MutableReplayState, event: JournalEvent)
         _require_replay(
             step.lease_epoch == event.supervisor_epoch, "fail_epoch_mismatch"
         )
-    updated = replace(
-        step,
-        status=StepStatus.FAILED_TERMINAL,
-        output_digest=None,
-        failure_reason=reason,
-        updated_at_us=event.created_at_us,
+    updated = cast(
+        WorkflowStepRecord,
+        replace(
+            step,
+            status=StepStatus.FAILED_TERMINAL,
+            output_digest=None,
+            failure_reason=reason,
+            updated_at_us=event.created_at_us,
+        ),
     )
     state.steps[(step.run_id, step.step_id)] = updated
     _update_idem_for_step(
@@ -1458,12 +1464,15 @@ def _apply_step_marked_uncertain(state: _MutableReplayState, event: JournalEvent
         _require_replay(step.lease_epoch < event.supervisor_epoch, "uncertain_epoch_invalid")
     else:
         _require_replay(step.lease_epoch == event.supervisor_epoch, "uncertain_epoch_invalid")
-    updated = replace(
-        step,
-        status=StepStatus.UNCERTAIN_NEEDS_RECONCILE,
-        output_digest=None,
-        failure_reason=reason,
-        updated_at_us=event.created_at_us,
+    updated = cast(
+        WorkflowStepRecord,
+        replace(
+            step,
+            status=StepStatus.UNCERTAIN_NEEDS_RECONCILE,
+            output_digest=None,
+            failure_reason=reason,
+            updated_at_us=event.created_at_us,
+        ),
     )
     state.steps[(step.run_id, step.step_id)] = updated
     _update_idem_for_step(
@@ -1591,12 +1600,15 @@ def _cancel_step_in_replay(
         if step.side_effecting
         else IdempotencyOutcome.CANCELLED
     )
-    updated = replace(
-        step,
-        status=new_st,
-        output_digest=None,
-        failure_reason=reason,
-        updated_at_us=created_at_us,
+    updated = cast(
+        WorkflowStepRecord,
+        replace(
+            step,
+            status=new_st,
+            output_digest=None,
+            failure_reason=reason,
+            updated_at_us=created_at_us,
+        ),
     )
     state.steps[(step.run_id, step.step_id)] = updated
     _update_idem_for_step(
