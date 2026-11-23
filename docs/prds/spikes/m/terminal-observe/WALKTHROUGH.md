@@ -295,13 +295,15 @@ class SanitizerStats:
   so 1 KiB response budgets retain ample room for escape-heavy frame text without losing any
   non-zero anomaly telemetry; Python dataclasses retain full typed 12-field `SanitizerStats`).
 - **O(1) Cross-Frame Active SGR State & Self-Contained Frame Invariant (`SAFE_SGR` mode):**
-  - `TerminalOutputSanitizer` maintains a fixed-size 7-slot O(1) active SGR state (`intensity`
-    `{None, 1, 2}`, `italic`, `underline`, `inverse`, `strike`, `fg` [16-color or `38;5;N`], `bg`
-    [16-color or `48;5;N`]), exposed via `active_sgr_seq: str` (canonical `"\x1b[<codes>m"` <= 32
-    bytes, strictly `<= MAX_SAFE_SGR_PARAM_BYTES`; `""` in `PLAIN` mode or when all attributes are
-    default). Every accepted `SAFE_SGR` sequence updates the 7-slot state (`ESC[m` / `ESC[0m`
-    clears all slots to `""`; partial resets `22`/`23`/`24`/`27`/`29`/`39`/`49` clear only their
-    corresponding slot).
+  - `TerminalOutputSanitizer` maintains a fixed-size 8-slot O(1) active SGR state (`bold: bool` [SGR
+    `1`], `faint: bool` [SGR `2`], `italic: bool` [`3`], `underline: bool` [`4`], `inverse: bool`
+    [`7`], `strike: bool` [`9`], `fg` [16-color or `38;5;N`], `bg` [16-color or `48;5;N`]), exposed
+    via `active_sgr_seq: str` (canonical `"\x1b[<codes>m"` <= 34 bytes, strictly
+    `<= MAX_SAFE_SGR_PARAM_BYTES`; `""` in `PLAIN` mode or when all attributes are default). `bold`
+    and `faint` are tracked as **independent booleans** so both `1` and `2` are preserved across a
+    frame boundary when both are active; every accepted `SAFE_SGR` sequence updates the 8-slot state
+    (`ESC[m` / `ESC[0m` clears all slots to `""`; SGR `22` clears **both** `bold` and `faint`;
+    partial resets `23`/`24`/`27`/`29`/`39`/`49` clear only their corresponding slot).
   - **Self-contained replay frame invariant:** Every stored and paged `SAFE_SGR` replay frame
     strictly **starts and ends in default terminal style** while preserving cross-frame styling:
     1. Before feeding `raw_bytes` into `stream.sanitizer.feed(raw_bytes)`, capture
@@ -324,7 +326,7 @@ class SanitizerStats:
     1. If the cut point falls inside an emitted `\x1b[...m` sequence (after `\x1b` before its
        terminating `'m'`), backs the cut point up to right before that `\x1b` so a truncated frame
        NEVER emits a dangling partial escape sequence.
-    2. Evaluates `_sgr_is_open(prefix)` using the exact 7-slot SGR state machine over `prefix`
+    2. Evaluates `_sgr_is_open(prefix)` using the exact 8-slot SGR state machine over `prefix`
        (handling cumulative SGRs, partial resets, full resets `ESC[0m`/`ESC[m`, and prepended
        cross-frame `prefix_sgr`). Whenever `_sgr_is_open(prefix)` is `True`, reserves `4` UTF-8
        bytes for `"\x1b[0m"` within `max_bytes` (re-cutting the prefix at a UTF-8 + SGR boundary
@@ -605,12 +607,12 @@ class TerminalOutputSanitizer:
         self._str_utf8_min = 0x80
         self._str_utf8_max = 0xBF
         self._str_utf8_is_c2 = False
-        self._sgr_state = _SgrState()  # O(1) 7-slot active SGR tracker (SAFE_SGR mode only)
+        self._sgr_state = _SgrState()  # O(1) 8-slot active SGR tracker (independent bold/faint; SAFE_SGR mode only)
         self._stats = _MutableStats()
 
     @property
     def active_sgr_seq(self) -> str:
-        """Canonical active SGR sequence (<= 32 B) or '' when in default style / PLAIN mode."""
+        """Canonical active SGR sequence (<= 34 B) or '' when in default style / PLAIN mode."""
         return "" if self._mode is not SanitizerMode.SAFE_SGR else self._sgr_state.to_sgr_seq()
 
     def feed(self, chunk: bytes) -> str:
@@ -1075,9 +1077,12 @@ external dependencies, zero Podman, zero network, and zero host state writes:
      (both 1-candidate page without phantom cursor reservation and multi-candidate page with
      `next_cursor`) stays strictly `<= 1024` UTF-8 bytes, truncates cleanly at UTF-8 boundary, and
      paginates deterministically across `limit=1` pages with zero skips or duplicates.
-   - **Cross-frame `SAFE_SGR` self-containment & truncation:** Style opened in frame A
-     (`b"\x1b[31mhello"` -> stored frame A ends with `"\x1b[0m"`), continued in frame B
+   - **Cross-frame `SAFE_SGR` self-containment, bold+faint fidelity, & truncation:** Style opened in
+     frame A (`b"\x1b[31mhello"` -> stored frame A ends with `"\x1b[0m"`), continued in frame B
      (`b"world\x1b[0m"` -> stored frame B prepends `"\x1b[31m"` and ends with `"\x1b[0m"`), PLUS
+     a dedicated frame-boundary test with **both SGR `1` (bold) and SGR `2` (faint) active**
+     (`b"\x1b[1;2mhello"` in frame A -> frame B `b"world\x1b[22mplain"` prepends `"\x1b[1;2m"` and
+     clears both on SGR `22` so frame C `b"after"` starts with zero active SGR), PLUS
      truncating frame B's closing `"\x1b[0m"` BOTH at `MAX_FRAME_TEXT_BYTES` (`b"A" * 20000 + b"\x1b[0m"`)
      AND across a `max_response_bytes = 1024` page boundary (accounting for 6-byte JSON `\u001b`
      expansion) — verifying every emitted frame starts and ends in default style (`_sgr_is_open == False`),
