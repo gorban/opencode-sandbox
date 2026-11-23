@@ -471,22 +471,42 @@ class TerminalOutputSanitizer:
         else:
             out.append(ch)
 
+    def _promote_esc_to_csi(self) -> None:
+        had_padding = self._seq_bytes > 1
+        self._state = _State.CSI
+        self._from_c1 = False
+        self._csi_buf.clear()
+        self._csi_has_intermediate = False
+        self._csi_valid = (
+            (not had_padding)
+            and (not self._seq_overlong)
+            and (self._mode is SanitizerMode.SAFE_SGR)
+        )
+        self._charge_seq_bytes(1)
+
+    def _promote_esc_to_string(self, state: _State) -> None:
+        self._state = state
+        self._from_c1 = False
+        self._esc_seen = False
+        self._clear_str_utf8_state()
+        self._charge_seq_bytes(1)
+
     def _handle_esc(self, byte: int, out: list[str]) -> None:
         if byte == 0x5B:
-            self._enter_csi(from_c1=False, initial_bytes=2)
+            self._promote_esc_to_csi()
             return
         if byte == 0x5D:
-            self._enter_string_state(_State.OSC, from_c1=False, initial_bytes=2)
+            self._promote_esc_to_string(_State.OSC)
             return
         if byte in _STRING_SEQ_ESC_FINALS:
-            self._enter_string_state(_State.STRING_SEQ, from_c1=False, initial_bytes=2)
+            self._promote_esc_to_string(_State.STRING_SEQ)
             return
         if 0x20 <= byte <= 0x2F:
             self._state = _State.ESC_INTERMEDIATE
-            self._seq_bytes = 2
+            self._charge_seq_bytes(1)
             return
         if 0x30 <= byte <= 0x7E:
-            self._seq_bytes += 1
+            self._charge_seq_bytes(1)
             self._increment_active_drop_counter()
             self._reset_seq_state()
             self._state = _State.GROUND
@@ -500,6 +520,10 @@ class TerminalOutputSanitizer:
             self._stats.dropped_c0_c1_count += 1
             self._reset_seq_state()
             self._state = _State.GROUND
+            return
+        if byte < 0x20 or byte == 0x7F:
+            self._charge_seq_bytes(1)
+            self._stats.dropped_c0_c1_count += 1
             return
         self._increment_active_drop_counter()
         self._reset_seq_state()
@@ -840,4 +864,6 @@ def sanitize_text_str(
     """Sanitize a Python string (neutralizing lone surrogates via surrogatepass + RFC 3629)."""
     if not isinstance(text, str):
         raise CoordValidationError("text must be str")
+    if len(text) > MAX_FEED_CHUNK_BYTES:
+        raise CoordValidationError("text exceeds MAX_FEED_CHUNK_BYTES")
     return sanitize_bytes(text.encode(_K_UTF8, errors="surrogatepass"), mode=mode)

@@ -152,14 +152,15 @@ sequence with its own `seq_bytes`.
 | `GROUND` | Invalid UTF-8 (`0xA0..0xBF`, `0xC0`, `0xC1`, `0xF5..0xFF`) | Emit `"\ufffd"` | `GROUND` | `invalid_utf8_count += 1` |
 | `UTF8_PENDING` | Valid continuation byte in `[_utf8_min_next, _utf8_max_next]` | Append to `utf8_buf`, **immediately reset `_utf8_min_next=0x80, _utf8_max_next=0xBF`** for bytes 3/4; if complete, decode scalar `cp` -> dispatch `cp` (below) | `UTF8_PENDING` or `GROUND` (or C1 state) | *(per decoded `cp`)* |
 | `UTF8_PENDING` | Invalid / unexpected byte (incl. `0x1B`, C0, new lead, bad continuation) | Emit `"\ufffd"`, clear `utf8_buf`, reset `_utf8_min_next=0x80, _utf8_max_next=0xBF`, **re-dispatch current byte in `GROUND`** | *(per re-dispatch)* | `invalid_utf8_count += 1` |
-| `ESC` | `0x5B` (`[`) | `csi_valid = (mode is SAFE_SGR)`, `from_c1=False`, `seq_bytes=2` | `CSI` | *(none yet)* |
-| `ESC` | `0x5D` (`]`) | `from_c1=False`, `seq_bytes=2`, `esc_seen=False`, `str_utf8_rem=0`, `str_utf8_is_c2=False` | `OSC` | *(none yet)* |
-| `ESC` | `0x50` (`P`), `0x58` (`X`), `0x5E` (`^`), `0x5F` (`_`) | `from_c1=False`, `seq_bytes=2`, `esc_seen=False`, `str_utf8_rem=0`, `str_utf8_is_c2=False` | `STRING_SEQ` | *(none yet)* |
-| `ESC` | `0x20..0x2F` (intermediate) | `seq_bytes=2` | `ESC_INTERMEDIATE` | *(none yet)* |
-| `ESC` | `0x30..0x7E` (Fe/Fp/Fs final, e.g. `ESC c` RIS) | `seq_bytes += 1`; drop sequence | `GROUND` | `dropped_esc_count += 1` |
-| `ESC` | `0x1B` (nested `ESC`) | Drop previous `ESC`, restart `ESC(seq_bytes=1)` | `ESC` | `dropped_esc_count += 1` |
-| `ESC` | `0x18` (`CAN`) / `0x1A` (`SUB`) | Abort & drop `ESC` | `GROUND` | `dropped_esc_count += 1`, `dropped_c0_c1_count += 1` |
-| `ESC` | Any other byte (C0, DEL, `>= 0x80`) | Drop `ESC`, **re-dispatch current byte in `GROUND`** | *(per re-dispatch)* | `dropped_esc_count += 1` |
+| `ESC` | `0x5B` (`[`) | Promote to `CSI` preserving `seq_bytes`/`seq_overlong`/`seq_counted`, charge `+1` + overlong check; `csi_valid = (mode is SAFE_SGR and seq_bytes == 2 and not seq_overlong)` (poisons CSI if C0/DEL padding preceded `[`), `from_c1=False` | `CSI` | If overlong (once): `overlong_seq_dropped_count += 1`, `dropped_csi_count += 1` |
+| `ESC` | `0x5D` (`]`) | Promote to `OSC` preserving `seq_bytes`/`seq_overlong`/`seq_counted`, charge `+1` + overlong check; `from_c1=False`, `esc_seen=False`, `str_utf8_rem=0`, `str_utf8_is_c2=False` | `OSC` | If overlong (once): `overlong_seq_dropped_count += 1`, `dropped_osc_count += 1` |
+| `ESC` | `0x50` (`P`), `0x58` (`X`), `0x5E` (`^`), `0x5F` (`_`) | Promote to `STRING_SEQ` preserving `seq_bytes`/`seq_overlong`/`seq_counted`, charge `+1` + overlong check; `from_c1=False`, `esc_seen=False`, `str_utf8_rem=0`, `str_utf8_is_c2=False` | `STRING_SEQ` | If overlong (once): `overlong_seq_dropped_count += 1`, `dropped_string_seq_count += 1` |
+| `ESC` | `0x20..0x2F` (intermediate) | Promote to `ESC_INTERMEDIATE` preserving `seq_bytes`/`seq_overlong`/`seq_counted`, charge `+1` + overlong check | `ESC_INTERMEDIATE` | If overlong (once): `overlong_seq_dropped_count += 1`, `dropped_esc_count += 1` |
+| `ESC` | `0x30..0x7E` (Fe/Fp/Fs final, e.g. `ESC c` RIS) | Charge `+1` + overlong check; drop sequence | `GROUND` | `dropped_esc_count += 1` (if not already counted) |
+| `ESC` | `0x1B` (nested `ESC`) | Drop previous `ESC`, restart `ESC(seq_bytes=1)` | `ESC` | `dropped_esc_count += 1` (if not already counted) |
+| `ESC` | `0x18` (`CAN`) / `0x1A` (`SUB`) | Abort & drop `ESC` | `GROUND` | `dropped_esc_count += 1` (if not counted), `dropped_c0_c1_count += 1` |
+| `ESC` | Other C0 (`0x00..0x1F`) or `0x7F` (`DEL`) (ignored VT padding) | Charge `seq_bytes += 1` + overlong check; **stay in `ESC`** so padded `ESC \x00 ]` / `ESC \x7f P` still enters `OSC`/`STRING_SEQ` instead of leaking control-string payload | `ESC` | `dropped_c0_c1_count += 1` (+ overlong once if `> MAX_ESC_SEQ_BYTES`) |
+| `ESC` | `>= 0x80` (C1 or high byte) | Drop `ESC`, **re-dispatch current byte in `GROUND`** | *(per re-dispatch)* | `dropped_esc_count += 1` (if not already counted) |
 | `ESC_INTERMEDIATE` | `0x20..0x2F` | Increment `seq_bytes` + overlong check `> MAX_ESC_SEQ_BYTES` | `ESC_INTERMEDIATE` | If overlong (once): `overlong_seq_dropped_count += 1`, `dropped_esc_count += 1` |
 | `ESC_INTERMEDIATE` | `0x30..0x7E` (final) | Increment `seq_bytes` + overlong check; drop sequence | `GROUND` | `dropped_esc_count += 1` (if not already counted) |
 | `ESC_INTERMEDIATE` | `0x1B` | Drop sequence, restart `ESC(seq_bytes=1)` | `ESC` | `dropped_esc_count += 1` (if not counted) |

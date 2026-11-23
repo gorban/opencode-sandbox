@@ -54,8 +54,8 @@ from oc_terminal_contract import (  # noqa: E402
     TerminalReplayFrame,
     TerminalReplayPage,
     compute_replay_scope_hash,
-    decode_replay_cursor,
     encode_replay_cursor,
+    parse_replay_cursor_fields,
     parse_terminal_target,
     serialize_terminal_bytes,
     validate_finite_timestamp,
@@ -63,6 +63,7 @@ from oc_terminal_contract import (  # noqa: E402
     validate_strict_int_range,
     validate_terminal_id,
     validate_terminal_token,
+    verify_replay_cursor_scope,
 )
 from oc_terminal_sanitizer import (  # noqa: E402
     SGR_RESET,
@@ -665,7 +666,7 @@ class TerminalReplayStore:
         tid: str,
         req_inc: str | None,
         req_ep: int | None,
-        after_cursor: str | None,
+        parsed_cursor: tuple[str, str, str, int, int] | None,
     ) -> tuple[_StreamSnapshot, str, bool]:
         sb = self._sandboxes.get(addr)
         if sb is None:
@@ -686,8 +687,8 @@ class TerminalReplayStore:
             incarnation_id=applied_inc,
             stream_epoch=applied_ep,
         )
-        after_seq = decode_replay_cursor(
-            after_cursor,
+        after_seq = verify_replay_cursor_scope(
+            parsed_cursor,
             expected_scope_hash=scope_hash,
             expected_incarnation_id=applied_inc,
             expected_stream_epoch=applied_ep,
@@ -773,6 +774,7 @@ class TerminalReplayStore:
             MIN_RESPONSE_BYTES,
             MAX_RESPONSE_BYTES,
         )
+        parsed_cursor = parse_replay_cursor_fields(after_cursor)
         session_echo = self._validate_session_echo(read_session_id, session_generation)
         self._run_authority_fences(operator, session_echo)
 
@@ -782,7 +784,7 @@ class TerminalReplayStore:
                 tid=tid,
                 req_inc=req_inc,
                 req_ep=req_ep,
-                after_cursor=after_cursor,
+                parsed_cursor=parsed_cursor,
             )
 
         if self._on_after_snapshot_before_release is not None:

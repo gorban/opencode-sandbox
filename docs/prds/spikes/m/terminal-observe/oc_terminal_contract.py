@@ -139,6 +139,8 @@ def validate_finite_timestamp(value: object, label: str = _K_CAPTURED_AT) -> flo
 
 def validate_terminal_token(value: object, label: str) -> str:
     """Validate an opaque identifier token, wrapping AddressError as CoordValidationError."""
+    if not isinstance(value, str) or len(value) > 96:
+        raise CoordValidationError(f"Invalid {label}")
     try:
         return validate_opaque_token(value, label)
     except AddressError as exc:
@@ -147,6 +149,8 @@ def validate_terminal_token(value: object, label: str) -> str:
 
 def parse_terminal_target(raw: object) -> TargetAddr:
     """Parse canonical local or remote sandbox target address (rejecting @PEER)."""
+    if not isinstance(raw, str) or len(raw) > 128:
+        raise CoordValidationError("Invalid target address")
     try:
         addr = parse_canonical_addr(raw)
     except AddressError as exc:
@@ -257,8 +261,8 @@ class TerminalReplayFrame:
         validate_strict_int_range(self.stream_epoch, _K_STREAM_EPOCH, 1, MAX_INT64)
         validate_strict_int_range(self.frame_seq, "frame_seq", 1, MAX_INT64)
         validate_finite_timestamp(self.captured_at, _K_CAPTURED_AT)
-        if not isinstance(self.text, str):
-            raise CoordValidationError("frame text must be str")
+        if not isinstance(self.text, str) or len(self.text) > MAX_FRAME_TEXT_BYTES:
+            raise CoordValidationError("frame text must be bounded str")
         validate_strict_int_range(self.text_bytes, _K_TEXT_BYTES, 0, MAX_FRAME_TEXT_BYTES)
         if type(self.text_truncated) is not bool:
             raise CoordValidationError("text_truncated must be bool")
@@ -431,8 +435,7 @@ def _reject_json_constant(token: str) -> Any:
 def _decode_raw_cursor_dict(raw: object) -> dict[str, Any]:
     if not isinstance(raw, str):
         raise CoordValidationError(ERR_CURSOR_MALFORMED)
-    raw_bytes = raw.encode(_K_UTF8, errors="surrogatepass")
-    if len(raw_bytes) > MAX_CURSOR_BYTES or not raw.startswith(CURSOR_PREFIX):
+    if len(raw) > MAX_CURSOR_BYTES or not raw.startswith(CURSOR_PREFIX):
         raise CoordValidationError(ERR_CURSOR_MALFORMED)
     b64_part = raw[len(CURSOR_PREFIX) :]
     if not b64_part or _CURSOR_B64URL_RE.fullmatch(b64_part) is None:
@@ -480,18 +483,27 @@ def _validate_cursor_fields(parsed: Mapping[str, Any]) -> tuple[str, str, str, i
     return op, fh, inc, ep, seq
 
 
-def decode_replay_cursor(
+def parse_replay_cursor_fields(
     raw: object,
+) -> tuple[str, str, str, int, int] | None:
+    """Validate cursor length, canonical base64url JSON, and field types without locking."""
+    if raw is None:
+        return None
+    parsed = _decode_raw_cursor_dict(raw)
+    return _validate_cursor_fields(parsed)
+
+
+def verify_replay_cursor_scope(
+    fields: tuple[str, str, str, int, int] | None,
     *,
     expected_scope_hash: str,
     expected_incarnation_id: str,
     expected_stream_epoch: int,
 ) -> int | None:
-    """Decode and scope-verify a terminal replay cursor, returning after_seq or None."""
-    if raw is None:
+    """Verify pre-parsed cursor fields against exact stream scope and return after_seq."""
+    if fields is None:
         return None
-    parsed = _decode_raw_cursor_dict(raw)
-    op, fh, inc, ep, seq = _validate_cursor_fields(parsed)
+    op, fh, inc, ep, seq = fields
     if (
         op != OP_TERMINAL_REPLAY
         or fh != expected_scope_hash
@@ -500,3 +512,20 @@ def decode_replay_cursor(
     ):
         raise CoordValidationError(ERR_CURSOR_SCOPE_MISMATCH)
     return seq
+
+
+def decode_replay_cursor(
+    raw: object,
+    *,
+    expected_scope_hash: str,
+    expected_incarnation_id: str,
+    expected_stream_epoch: int,
+) -> int | None:
+    """Decode and scope-verify a terminal replay cursor, returning after_seq or None."""
+    fields = parse_replay_cursor_fields(raw)
+    return verify_replay_cursor_scope(
+        fields,
+        expected_scope_hash=expected_scope_hash,
+        expected_incarnation_id=expected_incarnation_id,
+        expected_stream_epoch=expected_stream_epoch,
+    )

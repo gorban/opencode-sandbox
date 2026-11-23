@@ -38,6 +38,7 @@ from oc_terminal_contract import (  # noqa: E402
     ERR_CURSOR_SCOPE_MISMATCH,
     MAX_CURSOR_BYTES,
     MAX_ESC_SEQ_BYTES,
+    MAX_FEED_CHUNK_BYTES,
     MAX_FRAME_TEXT_BYTES,
     MAX_INT64,
     MAX_RETIRED_INCARNATIONS,
@@ -125,6 +126,13 @@ def _feed_chunked(
         parts.append(san.feed(data[idx : idx + chunk_size]))
     parts.append(san.flush())
     return "".join(parts), san.stats
+
+
+class _NoEncodeStr(str):
+    """Test double verifying O(1) length/syntax checks run before UTF-8 encoding."""
+
+    def encode(self, encoding: str = _UTF8, errors: str = "strict") -> bytes:
+        raise AssertionError("encode() must not be called on oversized or invalid input")
 
 
 def _b64url_cursor(raw_json: bytes) -> str:
@@ -1488,6 +1496,81 @@ class TestResponseByteCapsCrossFrameSgrAndCursors(unittest.TestCase):
         with self.assertRaises(CoordPolicyError) as nf_ctx:
             store.read_replay_frames(_OPERATOR, target="missing-sb", terminal_id=_TUI)
         self.assertIn(ERR_STREAM_NOT_FOUND, str(nf_ctx.exception))
+
+    def test_esc_ignored_nul_del_padding_no_control_string_leak(self) -> None:
+        # P2-1 regression: NUL/DEL padding inside ESC must not drop ESC and leak OSC/DCS bodies
+        before_after = "beforeafter"
+        cases = (
+            (b"before\x1b\x00]0;HIDDEN\x07after", before_after, 1, 0),
+            (b"before\x1b\x7fPSECRET\x1b\\after", before_after, 0, 1),
+            (b"before\x1b\x00\x7f_KITTY_PAYLOAD\x1b\\after", before_after, 0, 1),
+        )
+        for raw, expected, exp_osc, exp_str in cases:
+            for mode in (SanitizerMode.PLAIN, SanitizerMode.SAFE_SGR):
+                out_full, st_full = sanitize_bytes(raw, mode=mode)
+                out_split, st_split = _feed_chunked(raw, 1, mode=mode)
+                self.assertEqual(out_full, expected)
+                self.assertEqual(out_split, expected)
+                self.assertEqual(st_full, st_split)
+                self.assertEqual(st_full.dropped_osc_count, exp_osc)
+                self.assertEqual(st_full.dropped_string_seq_count, exp_str)
+
+        # Padded ESC \x00 [ 31 m in SAFE_SGR must consume CSI AND poison SAFE_SGR
+        csi_out, csi_stats = _feed_chunked(
+            b"before\x1b\x00[31mSAFE_TEXT", 1, mode=SanitizerMode.SAFE_SGR
+        )
+        self.assertEqual(csi_out, "beforeSAFE_TEXT")
+        self.assertEqual(csi_stats.allowed_sgr_count, 0)
+        self.assertEqual(csi_stats.dropped_csi_count, 1)
+
+        # Overlong NUL padding before OSC must not double-count or leak OSC body
+        flood = b"before\x1b" + (b"\x00" * 5000) + b"]0;HIDDEN\x07after"
+        f_out, f_stats = sanitize_bytes(flood)
+        self.assertEqual(f_out, before_after)
+        self.assertEqual(f_stats.overlong_seq_dropped_count, 1)
+        self.assertEqual(f_stats.dropped_esc_count + f_stats.dropped_osc_count, 1)
+
+        # Explicit CAN (0x18) and SUB (0x1A) still abort pending ESC cleanly
+        for abort_byte in (b"\x18", b"\x1a"):
+            ab_out, ab_stats = _feed_chunked(b"\x1b" + abort_byte + b"ok", 1)
+            self.assertEqual(ab_out, "ok")
+            self.assertEqual(ab_stats.dropped_esc_count, 1)
+            self.assertEqual(ab_stats.dropped_c0_c1_count, 1)
+
+    def test_oversized_cursor_and_text_rejected_before_utf8_encode(self) -> None:
+        # P2-2 regression: character length checked BEFORE .encode() allocation
+        scope = compute_replay_scope_hash(
+            target=_TARGET_LOCAL,
+            terminal_id=_TUI,
+            incarnation_id=_INC_1,
+            stream_epoch=1,
+        )
+        oversize_ascii_cursor = _NoEncodeStr(f"{CURSOR_PREFIX}" + ("A" * (MAX_CURSOR_BYTES + 1)))
+        non_ascii_cursor = _NoEncodeStr(f"{CURSOR_PREFIX}" + ("\U0001f525" * 300))
+        for bad_cursor in (oversize_ascii_cursor, non_ascii_cursor):
+            with self.assertRaises(CoordValidationError) as c_ctx:
+                decode_replay_cursor(
+                    bad_cursor,
+                    expected_scope_hash=scope,
+                    expected_incarnation_id=_INC_1,
+                    expected_stream_epoch=1,
+                )
+            self.assertIn(ERR_CURSOR_MALFORMED, str(c_ctx.exception))
+
+        # Malformed/oversized cursor is rejected BEFORE lock acquisition / target lookup
+        store = TerminalReplayStore()
+        with self.assertRaises(CoordValidationError) as pre_ctx:
+            store.read_replay_frames(
+                _OPERATOR,
+                target="missing-sb",
+                terminal_id=_TUI,
+                after_cursor=oversize_ascii_cursor,
+            )
+        self.assertIn(ERR_CURSOR_MALFORMED, str(pre_ctx.exception))
+
+        oversize_text = _NoEncodeStr("a" * (MAX_FEED_CHUNK_BYTES + 1))
+        with self.assertRaises(CoordValidationError):
+            sanitize_text_str(oversize_text)
 
 
 if __name__ == "__main__":
