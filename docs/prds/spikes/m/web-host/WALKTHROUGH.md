@@ -21,7 +21,16 @@ their own slices.
    query strings, fragments, encoded aliases and traversal. Refuse
    forwarding or upgrade headers, duplicate headers, Transfer-Encoding,
    and malformed Content-Length. Reject duplicate cookie values for the
-   fixture session. Use a single request per connection.
+   fixture session. Use a single request per connection. At socket acceptance,
+   set one two-second deadline from the real monotonic clock. Carry that
+   deadline into the worker and complete all request parsing, including
+   any body read, within it. Before each socket receive, set its timeout to
+   the time remaining against that same deadline. A trickle of bytes cannot
+   renew it. Check the deadline again before dispatch, then close on timeout
+   without admission or projection work. Bound the number of active workers.
+   On shutdown, retire authority and stop accepting connections. Interrupt
+   outstanding reads with socket shutdown so handlers can close their own
+   sockets and join without waiting for the peer.
 3. Mint one operator bootstrap code through the trusted launcher or private
    harness control using [UiAuthManager](../oc_ui_auth.py). The operator
    enters it into the unauthenticated UI shell. Exchange the code at
@@ -35,7 +44,8 @@ their own slices.
    For exchange, configure the manager with `max_sessions=2`. It consumes
    the code and creates the candidate session before the host revokes the
    previous session by hash. On successful manager exchange, swap in the
-   candidate with a freshly minted noncredential `read_session_id` and a
+   candidate with a freshly minted noncredential `read_session_id` of
+   exactly 32 characters from `[A-Za-z0-9_-]` and a
    monotonically increasing generation. Failed manager exchanges preserve
    the existing session. The client may still have an unconfirmed result
    after a successful host exchange.
@@ -100,8 +110,8 @@ no query parameters. Suggested response structure for joint qualification:
 }
 ```
 
-Use sibling-unique synthetic ASCII IDs up to 64 bytes and positive safe
-integer generations. Cap the fixture at eight projects, 16 sandboxes in
+Use sibling-unique synthetic IDs of 1–64 characters from
+`[A-Za-z0-9_-]` and positive safe integer generations. Cap the fixture at eight projects, 16 sandboxes in
 total, 32 threads in total, eight entries per thread list, 120 Unicode
 scalars per label, 256 UTF-8 bytes per text field, and 32 KiB serialized.
 Enforce the full byte cap before release. Use fixed fixture labels for status
@@ -203,6 +213,12 @@ workers and local state.
   tie and an auth TTL that floors to zero. Test replacement while the old
   session occupies a slot and check that a rejected exchange preserves it.
   Cover body limits, wrong media type, and duplicate Content-Length.
+  Keep TCP peers connected with incomplete headers and an incomplete
+  exchange body, and send bytes slowly enough to exceed the fixed request
+  deadline. Assert incomplete requests close within the deadline, never
+  reach the projection reader, and cannot change the current session.
+  Separately start shutdown with incomplete requests outstanding and assert
+  it interrupts reads and joins all workers within a bounded wait.
 - Hold one request before read and another immediately before its first
   guarded socket send. Retire by logout, expiry, or authority revocation and
   release each barrier. Assert zero reads in the first case and zero private
@@ -223,8 +239,11 @@ workers and local state.
   invalid UTF-8. Exercise nofollow ancestor and leaf handling, hard links,
   and reserved static paths.
 - Joint smoke runs the packaged static build with real Chromium and the
-  same loopback fixture. Deep-link from a fresh profile, exchange, render
-  private synthetic rows, and assert CSP allows the generated bootstrap
+  same loopback fixture. Deep-link from a fresh profile, exchange, reload
+  to recover the session, and render private synthetic rows. Exercise the
+  actual UI decoders against host responses for exchange, session recovery,
+  and workspace so opaque token alphabets and lengths agree at the wire.
+  Assert CSP allows the generated bootstrap
   while blocking a connection to a second disposable loopback origin.
   Check unchanged bytes, correct MIME, no-store, inert text, cookie
   attributes, absence of private state in offline assets and browser
