@@ -291,33 +291,37 @@ def open_readonly_inbox_snapshot(db_path: Path, *, deadline: float) -> Iterator[
             apply_remaining_busy_timeout(conn, deadline)
             conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
             conn.execute("BEGIN DEFERRED")
-            # 1. Anchor the WAL read snapshot against sqlite_master FIRST, rejecting ANY trigger
-            #    or view BEFORE querying inbox_seq_counter or any user table!
+            # 1. Anchor the WAL read snapshot against sqlite_master FIRST using a constant projection
+            #    (SELECT 1 — never transferring unbounded schema identifiers into Python), rejecting
+            #    ANY trigger or view BEFORE querying inbox_seq_counter or any user table!
             unsafe_obj = execute_bounded(
                 conn,
-                "SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view') LIMIT 1",
+                "SELECT 1 FROM sqlite_master WHERE type IN ('trigger', 'view') LIMIT 1",
                 (),
                 deadline,
             ).fetchone()
             if unsafe_obj is not None:
                 raise CoordPolicyError("inbox_db_unreadable")
-            # 2. Verify all 4 required objects exist as ordinary tables ('table') in sqlite_master.
+            # 2. Verify all 4 required objects exist as ORDINARY tables (type = 'table', explicitly
+            #    rejecting 'virtual', 'shadow', and 'view'!) via pragma_table_list BEFORE reading
+            #    inbox_seq_counter!
             req_tables = execute_bounded(
                 conn,
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "SELECT name, type FROM pragma_table_list "
+                "WHERE schema = 'main' "
                 "AND name IN ('inbox_seq_counter', 'review_items', 'workflow_runs', 'review_artifacts')",
                 (),
                 deadline,
             ).fetchall()
-            if {r["name"] for r in req_tables} != {
+            if {r["name"] for r in req_tables if r["type"] == "table"} != {
                 "inbox_seq_counter",
                 "review_items",
                 "workflow_runs",
                 "review_artifacts",
-            }:
+            } or len(req_tables) != 4:
                 raise CoordPolicyError("inbox_db_unreadable")
-            # 3. ONLY after sqlite_master verification, validate inbox_seq_counter inside the exact
-            #    same anchored WAL snapshot transaction!
+            # 3. ONLY after pragma_table_list ordinary-table verification, validate
+            #    inbox_seq_counter inside the exact same anchored WAL snapshot transaction!
             execute_bounded(
                 conn,
                 "SELECT CASE WHEN typeof(last_seq) = 'integer' THEN last_seq ELSE NULL END "
@@ -1272,13 +1276,15 @@ synthetic SQLite fixtures (zero Podman, zero network, zero writes to production 
      (completes immediately without hanging), hardlinked (`os.link`) DB/sidecar, and `0o644`
      unsafe-mode DB/sidecar all fail closed without repairing modes (`stat` mode remains `0o644`).
    - Read-only `0o500` dir without `-shm` maps cleanly to `CoordPolicyError("inbox_db_unreadable")`.
-   - Hostile SQLite `VIEW` and `TRIGGER` injected into `inbox.sqlite` — **including replacing
-     `inbox_seq_counter` itself with a `VIEW` (`CREATE VIEW inbox_seq_counter AS ...`)** — fail
-     closed via `sqlite_master` BEFORE any view body or user table is evaluated, raising
-     `CoordPolicyError("inbox_db_unreadable")` with clean connection close; missing or non-table
-     required objects (`inbox_seq_counter`, `review_items`, `workflow_runs`, `review_artifacts`)
-     likewise fail closed; verify `PRAGMA trusted_schema = OFF` and `PRAGMA cell_size_check = ON`
-     are active on opened snapshots.
+   - Hostile SQLite `VIEW`, `TRIGGER`, and `VIRTUAL TABLE` (e.g., `CREATE VIRTUAL TABLE
+     review_items USING fts5(...)` or `CREATE VIRTUAL TABLE inbox_seq_counter USING fts5(...)`)
+     injected into `inbox.sqlite` — **including replacing `inbox_seq_counter` itself with a `VIEW`
+     or `VIRTUAL TABLE`** — fail closed via `SELECT 1 FROM sqlite_master ...` and
+     `pragma_table_list` (`type = 'table'` ordinary-table check, rejecting `'virtual'`/`'shadow'`/
+     `'view'`) BEFORE any view/virtual-table body or projection read is evaluated, raising
+     `CoordPolicyError("inbox_db_unreadable")` with clean connection close (while valid ordinary
+     tables pass cleanly); missing required objects likewise fail closed; verify
+     `PRAGMA trusted_schema = OFF` and `PRAGMA cell_size_check = ON` are active on opened snapshots.
 3. **Deterministic cryptographic review pins, `orchestrator_advisory` vs `lane_paused == 1`, artifacts, & IDs:**
    - Valid pending `host_workflow_engine` item (`lane_paused = 1`) with nullable `expires_at = None`,
      `target_addr = None`, `target_incarnation_id = None` passes verification cleanly
