@@ -496,6 +496,10 @@ class WorkflowRestartJournal:
         return self._db_path
 
     @property
+    def journal_id(self) -> str:
+        return str(self._db_path.resolve())
+
+    @property
     def state_dir(self) -> Path:
         return self._state_dir
 
@@ -1479,6 +1483,7 @@ class WorkflowRestartJournal:
             current_epoch=self._current_epoch,
             expected_outcome=OUTCOME_NO_EFFECT,
             expected_evidence_digest=request.evidence_digest,
+            journal_id=self.journal_id,
         )
         return self._resolve_requeue_clock_and_authority(
             request,
@@ -1507,6 +1512,7 @@ class WorkflowRestartJournal:
                 expected_outcome=OUTCOME_EFFECT_APPLIED,
                 expected_evidence_digest=request.evidence_digest,
                 expected_output_digest=request.output_digest,
+                journal_id=self.journal_id,
             )
 
     def _resolve_reconcile_timestamp(
@@ -1946,7 +1952,9 @@ class DurableWorkflowSupervisor:
         self._tracker = tracker
         self._authority_store = authority_store
         self._lifecycle_gate = threading.RLock()
-        self._tracker.attach_epoch(self._journal.current_epoch)
+        self._tracker.attach_epoch(
+            self._journal.current_epoch, journal_id=self._journal.journal_id
+        )
 
     @property
     def journal(self) -> WorkflowRestartJournal:
@@ -2145,7 +2153,7 @@ class DurableWorkflowSupervisor:
                     token, reason=ERR_AUTH_REVOKED_PRE_ENTRY, clock=t_entry
                 )
                 raise
-            self._tracker.admit_attempt(token)
+            self._tracker.admit_attempt(token, journal_id=self._journal.journal_id)
             return step
 
     def _settle_worker_result(
@@ -2172,13 +2180,27 @@ class DurableWorkflowSupervisor:
                 )
             return StepExecutionOutcome(token=token, ack=ack)
 
+        if work_result.outcome == WORKER_FAILED_UNCERTAIN:
+            with self._lifecycle_gate:
+                t_done = clock_provider()
+                ack = self._journal.fail_step(
+                    FailStepRequest(
+                        token=token,
+                        reason=work_result.reason,
+                        retryable=False,
+                        uncertain=True,
+                        clock=t_done,
+                    )
+                )
+            return StepExecutionOutcome(token=token, ack=ack)
+
         t_done = clock_provider()
         ack = self._journal.fail_step(
             FailStepRequest(
                 token=token,
                 reason=work_result.reason,
                 retryable=False,
-                uncertain=(work_result.outcome == WORKER_FAILED_UNCERTAIN),
+                uncertain=False,
                 clock=t_done,
             )
         )

@@ -3376,9 +3376,9 @@ class TestAdversarialRegressionsRound3(_RestartFixtureBase):
             orig_admit = tracker.admit_attempt
             orig_get_step = sup.journal.get_step
 
-            def _tracked_admit(tok: StepLeaseToken) -> None:
+            def _tracked_admit(tok: StepLeaseToken, **kwargs: Any) -> None:
                 nonlocal admitted
-                orig_admit(tok)
+                orig_admit(tok, **kwargs)
                 admitted = True
 
             def _forbid_get_step_after_admit(
@@ -3450,6 +3450,243 @@ class TestAdversarialRegressionsRound3(_RestartFixtureBase):
                 deadline=10.0,
             )
         self.assertIn(ERR_OP_DEADLINE, str(ctx.exception))
+
+
+class TestAdversarialRegressionsRound4(_RestartFixtureBase):
+    def test_uncertain_pause_and_worker_admission_serialized_under_lifecycle_gate(
+        self,
+    ) -> None:
+        tracker = SyntheticEffectTracker()
+        sup, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            # Ordering 1: step_b wins _lifecycle_gate; sibling step_a tries to commit
+            # WORKER_FAILED_UNCERTAIN in the gap AFTER verify_lease_for_entry and
+            # BEFORE tracker.admit_attempt -> MUST block until step_b finishes admission!
+            steps1 = (
+                StepSpec("step_a", "step_a", "stage_patch", True),
+                StepSpec("step_b", "step_b", "stage_patch", True),
+                StepSpec("step_c", "step_c", "stage_patch", True),
+            )
+            sup.journal.create_run(self._make_run_request("run_ser_1", steps1))
+            a_entered = threading.Event()
+            release_a = threading.Event()
+            a_settled = threading.Event()
+            a_errors: list[Exception] = []
+
+            def _worker_a(_tok: StepLeaseToken) -> WorkerStepResult:
+                a_entered.set()
+                release_a.wait(timeout=5.0)
+                return WorkerStepResult("failed_uncertain", reason="sibling_drop")
+
+            def _run_a() -> None:
+                try:
+                    sup.run_step_once(
+                        "run_ser_1",
+                        "step_a",
+                        worker_fn=_worker_a,
+                        clock_provider=self.clock.advance,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    a_errors.append(exc)
+                finally:
+                    a_settled.set()
+
+            th_a = threading.Thread(target=_run_a)
+            th_a.start()
+            self.assertTrue(a_entered.wait(timeout=5.0))
+
+            orig_verify = sup.journal.verify_lease_for_entry
+            a_settled_before_admit: list[bool] = []
+
+            def _verify_with_pause_race(
+                tok: StepLeaseToken, *, max_op_ms: int = 2_000
+            ) -> Any:
+                res = orig_verify(tok, max_op_ms=max_op_ms)
+                if tok.run_id == "run_ser_1" and tok.step_id == "step_b":
+                    release_a.set()
+                    a_settled_before_admit.append(a_settled.wait(timeout=0.15))
+                return res
+
+            with mock.patch.object(
+                sup.journal, "verify_lease_for_entry", side_effect=_verify_with_pause_race
+            ):
+                out_b = sup.run_step_once(
+                    "run_ser_1",
+                    "step_b",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_B),
+                    clock_provider=self.clock.advance,
+                )
+            th_a.join(timeout=5.0)
+            self.assertEqual(a_errors, [])
+            self.assertEqual(a_settled_before_admit, [False])
+            self.assertEqual(out_b.ack.status, StepStatus.COMPLETED.value)
+            self.assertEqual(tracker.count("run_ser_1", "step_b"), 1)
+            self.assertEqual(
+                sup.journal.get_step("run_ser_1", "step_a").status,
+                StepStatus.UNCERTAIN_NEEDS_RECONCILE,
+            )
+            self.assertEqual(
+                sup.journal.get_run("run_ser_1").status,
+                RunStatus.PAUSED_NEEDS_RECONCILE,
+            )
+            t_c = self.clock.advance()
+            with self.assertRaises(InvalidStepTransitionError):
+                sup.journal.lease_step(
+                    run_id="run_ser_1", step_id="step_c", clock=t_c
+                )
+
+            # Ordering 2: step_a commits WORKER_FAILED_UNCERTAIN BEFORE step_b enters
+            # _enter_worker_under_gate -> step_b settles FAILED_TERMINAL with 0 worker calls!
+            steps2 = (
+                StepSpec("step_a", "step_a", "stage_patch", True),
+                StepSpec("step_b", "step_b", "stage_patch", True),
+            )
+            sup.journal.create_run(self._make_run_request("run_ser_2", steps2))
+            a2_entered = threading.Event()
+            release_a2 = threading.Event()
+            a2_errors: list[Exception] = []
+
+            def _worker_a2(_tok: StepLeaseToken) -> WorkerStepResult:
+                a2_entered.set()
+                release_a2.wait(timeout=5.0)
+                return WorkerStepResult("failed_uncertain", reason="sibling_drop_2")
+
+            def _run_a2() -> None:
+                try:
+                    sup.run_step_once(
+                        "run_ser_2",
+                        "step_a",
+                        worker_fn=_worker_a2,
+                        clock_provider=self.clock.advance,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    a2_errors.append(exc)
+
+            th_a2 = threading.Thread(target=_run_a2)
+            th_a2.start()
+            self.assertTrue(a2_entered.wait(timeout=5.0))
+
+            def _let_pause_win(_tok: StepLeaseToken) -> None:
+                release_a2.set()
+                th_a2.join(timeout=5.0)
+
+            with self.assertRaises(InvalidStepTransitionError) as ctx:
+                sup.run_step_once(
+                    "run_ser_2",
+                    "step_b",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_B),
+                    clock_provider=self.clock.advance,
+                    on_after_lease_before_entry=_let_pause_win,
+                )
+            self.assertEqual(a2_errors, [])
+            self.assertIn("run_paused_before_worker_entry", str(ctx.exception))
+            self.assertEqual(tracker.count("run_ser_2", "step_b"), 0)
+            self.assertEqual(
+                sup.journal.get_step("run_ser_2", "step_b").status,
+                StepStatus.FAILED_TERMINAL,
+            )
+        finally:
+            sup.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_tracker_sticky_journal_lineage_refuses_foreign_journal_requeue(
+        self,
+    ) -> None:
+        dir_a = self.root / "journal_a"
+        dir_b = self.root / "journal_b"
+        for d in (dir_a, dir_b):
+            d.mkdir(mode=0o700)
+            os.chmod(d, 0o700)
+
+        # Journal A: tracker_a observes epoch 1 and binds stickily to Journal A.
+        tracker_a = SyntheticEffectTracker()
+        sup_a, _ = DurableWorkflowSupervisor.start_or_recover(
+            dir_a,
+            clock=self.clock.now(),
+            tracker=tracker_a,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            sup_a.journal.create_run(
+                self._make_run_request(
+                    "run_a", (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+        finally:
+            sup_a.close_clean(clock=self.clock.advance())
+
+        # Journal B: tracker_b executes epoch-1 side-effecting step and crashes before commit!
+        tracker_b = SyntheticEffectTracker()
+        sup_b1, _ = DurableWorkflowSupervisor.start_or_recover(
+            dir_b,
+            clock=self.clock.advance(),
+            tracker=tracker_b,
+            sandbox_root=self.sandbox_root,
+        )
+        captured_b: list[StepLeaseToken] = []
+        try:
+            sup_b1.journal.create_run(
+                self._make_run_request(
+                    "run_b", (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+            with self.assertRaises(SimulatedSupervisorCrash):
+                sup_b1.run_step_once(
+                    "run_b",
+                    "se1",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                    clock_provider=self.clock.advance,
+                    crash_point=CrashPoint.AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT,
+                    captured_tokens=captured_b,
+                )
+            self.assertEqual(tracker_b.count("run_b", "se1"), 1)
+        finally:
+            sup_b1.simulate_crash()
+
+        # Recover Journal B at epoch 2 injecting foreign tracker_a (which observed epoch 1 for A)!
+        sup_b2, rep_b2 = DurableWorkflowSupervisor.start_or_recover(
+            dir_b,
+            clock=self.clock.advance(),
+            tracker=tracker_a,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            self.assertEqual(rep_b2.supervisor_epoch, 2)
+            rcpt_foreign = tracker_a.issue_receipt(token=captured_b[0], current_epoch=2)
+            self.assertEqual(rcpt_foreign.tracker_outcome, "still_pending")
+            req_requeue = ReconcileStepRequest(
+                run_id="run_b",
+                step_id="se1",
+                expected_attempt_no=1,
+                expected_epoch=2,
+                reconciliation_key="recon_foreign_tracker",
+                resolution=ReconcileResolution.REQUEUE_PENDING,
+                output_digest=None,
+                evidence_digest=rcpt_foreign.receipt_digest,
+                reason="try_requeue_with_foreign_tracker",
+                clock=self.clock.advance(),
+            )
+            with self.assertRaises(ReconciliationEvidenceError):
+                sup_b2.reconcile_step(
+                    req_requeue,
+                    tracker_receipt=rcpt_foreign,
+                    clock_provider=self.clock.advance,
+                )
+            self.assertEqual(
+                sup_b2.journal.get_step("run_b", "se1").status,
+                StepStatus.UNCERTAIN_NEEDS_RECONCILE,
+            )
+            self.assertEqual(tracker_a.count("run_b", "se1"), 0)
+        finally:
+            sup_b2.close_clean(clock=self.clock.advance())
+
+        verify_journal_replay_readonly(dir_a, sandbox_root=self.sandbox_root)
+        verify_journal_replay_readonly(dir_b, sandbox_root=self.sandbox_root)
 
 
 if __name__ == "__main__":

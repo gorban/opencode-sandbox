@@ -1947,6 +1947,8 @@ class SyntheticEffectTracker:
         self._lock = threading.Lock()
         self._history_start_epoch = start_ep
         self._attached = False
+        self._bound_journal_id: str | None = None
+        self._active_journal_id: str | None = None
         self._observed_epochs: set[int] = set()
         self._fenced_before_epoch = start_ep
         self._fenced_attempts: set[_AttemptKey] = set()
@@ -1963,6 +1965,11 @@ class SyntheticEffectTracker:
         with self._lock:
             return frozenset(self._observed_epochs)
 
+    @property
+    def bound_journal_id(self) -> str | None:
+        with self._lock:
+            return self._bound_journal_id
+
     @staticmethod
     def _key_for(token: StepLeaseToken) -> _AttemptKey:
         return (
@@ -1973,14 +1980,41 @@ class SyntheticEffectTracker:
             token.idempotency_key,
         )
 
-    def attach_epoch(self, supervisor_epoch: int) -> None:
+    @staticmethod
+    def _clean_journal_id(journal_id: str | None) -> str | None:
+        if journal_id is None:
+            return None
+        return _wrap_clean_str(journal_id, "journal_id", max_bytes=1024)
+
+    def _journal_matches_locked(self, journal_id: str | None) -> bool:
+        effective_jid = (
+            journal_id if journal_id is not None else self._active_journal_id
+        )
+        if effective_jid is None:
+            return True
+        if self._bound_journal_id is None and not self._attached:
+            return True
+        return self._bound_journal_id == effective_jid
+
+    def attach_epoch(
+        self, supervisor_epoch: int, *, journal_id: str | None = None
+    ) -> None:
         ep = validate_int64(supervisor_epoch, "supervisor_epoch", min_val=1)
+        clean_jid = self._clean_journal_id(journal_id)
         with self._lock:
+            self._fenced_before_epoch = max(self._fenced_before_epoch, ep)
+            if clean_jid is not None:
+                if self._bound_journal_id is None:
+                    self._bound_journal_id = clean_jid
+                self._active_journal_id = clean_jid
+                if clean_jid != self._bound_journal_id:
+                    return
+            elif self._bound_journal_id is not None:
+                return
             if not self._attached:
                 self._attached = True
                 self._history_start_epoch = max(self._history_start_epoch, ep)
             self._observed_epochs.add(ep)
-            self._fenced_before_epoch = max(self._fenced_before_epoch, ep)
 
     def fence_epoch(self, min_active_epoch: int) -> None:
         with self._lock:
@@ -1990,12 +2024,16 @@ class SyntheticEffectTracker:
         with self._lock:
             self._fenced_attempts.add(self._key_for(token))
 
-    def admit_attempt(self, token: StepLeaseToken) -> None:
+    def admit_attempt(
+        self, token: StepLeaseToken, *, journal_id: str | None = None
+    ) -> None:
         key = self._key_for(token)
+        clean_jid = self._clean_journal_id(journal_id)
         with self._lock:
             if (
                 token.lease_epoch < self._fenced_before_epoch
                 or key in self._fenced_attempts
+                or not self._journal_matches_locked(clean_jid)
                 or (self._attached and token.lease_epoch not in self._observed_epochs)
             ):
                 raise StaleEpochError(ERR_STALE_EPOCH)
@@ -2052,8 +2090,10 @@ class SyntheticEffectTracker:
         token: StepLeaseToken,
         current_epoch: int,
         force_fence: bool = False,
+        journal_id: str | None = None,
     ) -> EffectTrackerReceipt:
         key = self._key_for(token)
+        clean_jid = self._clean_journal_id(journal_id)
         with self._lock:
             if force_fence:
                 self._fenced_attempts.add(key)
@@ -2062,11 +2102,12 @@ class SyntheticEffectTracker:
                 or token.lease_epoch < current_epoch
                 or key in self._fenced_attempts
             )
-            has_history = (
-                token.lease_epoch in self._observed_epochs
-                if self._attached
-                else token.lease_epoch == self._history_start_epoch
-            )
+            if not self._journal_matches_locked(clean_jid):
+                has_history = False
+            elif self._attached:
+                has_history = token.lease_epoch in self._observed_epochs
+            else:
+                has_history = token.lease_epoch == self._history_start_epoch
             outcome, out_digest = self._resolve_receipt_outcome(
                 self._attempts.get(key), fenced=fenced, has_history=has_history
             )
@@ -2134,6 +2175,7 @@ class SyntheticEffectTracker:
         expected_outcome: TrackerOutcome,
         expected_evidence_digest: str,
         expected_output_digest: str | None = None,
+        journal_id: str | None = None,
     ) -> None:
         if receipt is None or step.idempotency_key is None:
             raise ReconciliationEvidenceError("missing_tracker_receipt")
@@ -2147,6 +2189,7 @@ class SyntheticEffectTracker:
                 idempotency_key=step.idempotency_key,
             ),
             current_epoch=current_epoch,
+            journal_id=journal_id,
         )
         if not hmac.compare_digest(live.receipt_digest, receipt.receipt_digest):
             raise ReconciliationEvidenceError("tracker_receipt_state_mismatch")
