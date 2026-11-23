@@ -112,7 +112,7 @@ def _safe_close(conn: sqlite3.Connection | None) -> None:
 
 
 def _assert_raw_no_user_symlink_ancestors(raw: Path) -> None:
-    cur = raw
+    cur = Path(os.path.abspath(str(raw)))
     while True:
         try:
             st = os.lstat(cur)
@@ -317,6 +317,11 @@ def read_seq_counter(conn: sqlite3.Connection, deadline: float) -> int:
         (),
         deadline,
     ).fetchone()
-    if row is None or bool(row["last_seq_malformed"]) or type(row["last_seq"]) is not int:
+    if (
+        row is None
+        or bool(row["last_seq_malformed"])
+        or type(row["last_seq"]) is not int
+        or row["last_seq"] < 0
+    ):
         raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
     return row["last_seq"]

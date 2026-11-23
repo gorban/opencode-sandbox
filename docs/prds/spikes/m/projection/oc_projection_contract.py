@@ -50,6 +50,7 @@ MIN_READ_MS = 50
 MAX_READ_MS = 10_000
 MAX_MARKER_BYTES = 256
 MAX_AMBIGUITY_CANDIDATES = 16
+MAX_SQLITE_INT64 = (1 << 63) - 1
 
 CURSOR_PREFIX = "v1."
 _CURSOR_B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$", re.ASCII)
@@ -729,9 +730,9 @@ def _decode_raw_cursor_dict(raw: object) -> dict[str, Any]:
     try:
         decoded_bytes = base64.urlsafe_b64decode(b64_part + ("=" * pad_len))
         parsed = json.loads(
-            decoded_bytes.decode("utf-8"), parse_constant=_reject_json_constant
+            decoded_bytes.decode(_K_UTF8), parse_constant=_reject_json_constant
         )
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, RecursionError) as exc:
         raise CoordValidationError(ERR_CURSOR_MALFORMED) from exc
     if not isinstance(parsed, dict):
         raise CoordValidationError(ERR_CURSOR_MALFORMED)
@@ -758,7 +759,7 @@ def _validate_cursor_header(
 
 
 def _is_strict_nonneg_int(val: Any) -> bool:
-    return type(val) is int and val >= 0
+    return type(val) is int and 0 <= val <= MAX_SQLITE_INT64
 
 
 def decode_tree_cursor(

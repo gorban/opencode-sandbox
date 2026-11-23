@@ -85,6 +85,8 @@ _ERR_BODY_HASH = "receipt_body_hash_mismatch"
 _SQL_LAST_SEQ = "SELECT last_seq FROM seq_counter WHERE id = 1"
 _MSG_OVERSIZE = "msg-oversize"
 _SB_FLAG_MAL_ABORT = "flag-mal-abort"
+_ERR_CURSOR_MALFORMED = "cursor_malformed"
+_PATCH_DB_CONNECT = "oc_projection_db.sqlite3.connect"
 
 
 def _make_private_tempdir() -> Path:
@@ -357,11 +359,11 @@ class TestFilesystemAdmissionAndLiveWal(ProjectionBaseTest):
         reg = self._new_registry()
         reg.close()
         db_path = self.state_dir / _DB_NAME
-        os.chmod(db_path, 0o644)
+        os.chmod(db_path, 0o640)
         svc = self._new_service()
         with self.assertRaisesRegex(CoordPolicyError, "registry_unsafe_mode"):
             svc.get_workspace_tree(_OP_CALLER)
-        self.assertEqual(stat.S_IMODE(os.lstat(db_path).st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(os.lstat(db_path).st_mode), 0o640)
 
     def test_symlink_hardlink_and_fifo_db_and_sidecars_fail_immediately(self) -> None:
         reg = self._new_registry()
@@ -427,9 +429,11 @@ class TestFilesystemAdmissionAndLiveWal(ProjectionBaseTest):
         before_seq = _read_raw_seq(self.state_dir)
 
         db_path = self.state_dir / _DB_NAME
-        with open_readonly_snapshot(db_path, deadline=time.monotonic() + 2.0) as conn:
-            with self.assertRaises(sqlite3.OperationalError):
-                conn.execute("UPDATE seq_counter SET last_seq = 999999 WHERE id = 1")
+        with (
+            open_readonly_snapshot(db_path, deadline=time.monotonic() + 2.0) as conn,
+            self.assertRaises(sqlite3.OperationalError),
+        ):
+            conn.execute("UPDATE seq_counter SET last_seq = 999999 WHERE id = 1")
 
         svc = self._new_service()
         tree = svc.get_workspace_tree(_OP_CALLER)
@@ -643,7 +647,7 @@ class TestHealthMarkersAndBindingDomains(ProjectionBaseTest):
 
         sess_marker = self.state_dir / ".coord_session_active"
         sess_marker.write_text("active", encoding="utf-8")
-        os.chmod(sess_marker, 0o644)
+        os.chmod(sess_marker, 0o640)
         try:
             tree = svc.get_workspace_tree(_OP_CALLER)
             self.assertEqual(tree.health.health_status, HEALTH_DEGRADED)
@@ -994,14 +998,14 @@ class TestBoundsCursorsDeadlinesAndConcurrency(ProjectionBaseTest):
 
         # Non-canonical base64 padding -> cursor_malformed
         bad_padded = f"{p1.next_cursor}=="
-        with self.assertRaisesRegex(CoordValidationError, "cursor_malformed"):
+        with self.assertRaisesRegex(CoordValidationError, _ERR_CURSOR_MALFORMED):
             svc.get_workspace_tree(_OP_CALLER, after_cursor=bad_padded)
 
         # NaN inside cursor JSON -> cursor_malformed
         nan_b64 = base64.urlsafe_b64encode(b'{"fh":"0123456789abcdef","op":"tree","x":NaN}').decode(
             "ascii"
         ).rstrip("=")
-        with self.assertRaisesRegex(CoordValidationError, "cursor_malformed"):
+        with self.assertRaisesRegex(CoordValidationError, _ERR_CURSOR_MALFORMED):
             svc.get_workspace_tree(_OP_CALLER, after_cursor=f"v1.{nan_b64}")
 
         # Unknown field -> cursor_malformed
@@ -1049,7 +1053,7 @@ class TestBoundsCursorsDeadlinesAndConcurrency(ProjectionBaseTest):
         holder.start()
         held.wait(timeout=1.0)
         try:
-            with mock.patch("oc_projection_db.sqlite3.connect") as mock_connect:
+            with mock.patch(_PATCH_DB_CONNECT) as mock_connect:
                 with self.assertRaisesRegex(CoordPolicyError, _ERR_DEADLINE):
                     svc.get_workspace_tree(_OP_CALLER, max_read_ms=50)
                 mock_connect.assert_not_called()
@@ -1058,12 +1062,13 @@ class TestBoundsCursorsDeadlinesAndConcurrency(ProjectionBaseTest):
             holder.join(timeout=2.0)
 
         # 3. URI construction failure (surrogate-escaped path) NEVER strands _UMASK_LOCK!
-        surrogate_path = Path(os.fsdecode(b"/tmp/bad\xffpath/registry.sqlite"))
+        surrogate_raw = os.fsencode(str(self.root / "bad")) + b"\xffpath/" + _DB_NAME.encode("ascii")
+        surrogate_path = Path(os.fsdecode(surrogate_raw))
         dl_surrogate = time.monotonic() + 2.0
 
         def _open_surrogate() -> None:
             with open_readonly_snapshot(surrogate_path, deadline=dl_surrogate):
-                pass
+                self.fail("expected surrogate path URI failure")
 
         with self.assertRaisesRegex(CoordPolicyError, _ERR_UNREADABLE):
             _open_surrogate()
@@ -1129,11 +1134,13 @@ class TestBoundsCursorsDeadlinesAndConcurrency(ProjectionBaseTest):
 
         def _open_broken() -> None:
             with open_readonly_snapshot(broken_db, deadline=dl_broken):
-                pass
+                self.fail("expected missing seq_counter anchor failure")
 
-        with mock.patch("oc_projection_db.sqlite3.connect", side_effect=_spy_connect):
-            with self.assertRaisesRegex(CoordPolicyError, _ERR_UNREADABLE):
-                _open_broken()
+        with (
+            mock.patch(_PATCH_DB_CONNECT, side_effect=_spy_connect),
+            self.assertRaisesRegex(CoordPolicyError, _ERR_UNREADABLE),
+        ):
+            _open_broken()
         self.assertEqual(len(opened), 1)
         with self.assertRaises(sqlite3.ProgrammingError):
             opened[0].execute("SELECT 1")
@@ -1786,6 +1793,402 @@ class TestEndToEndHubIntegration(ProjectionBaseTest):
                 read_session_id="s" * 90,
                 session_generation=1,
             )
+
+
+class TestGate2AdversarialRegressions(ProjectionBaseTest):
+    """Fail-on-89cd1b7 / pass-on-new regressions for all Gate 2 review findings."""
+
+    def test_reg_invalid_oversized_src_actor_cannot_verify_operator_badge(self) -> None:
+        reg = self._new_registry()
+        _register_sample_sandbox(reg, name="actor-a")
+        _insert_verified_operator_message(
+            reg,
+            sandbox_addr="actor-a",
+            incarnation_id=_DEFAULT_INC,
+            thread_id=_DEFAULT_THREAD,
+            msg_id="msg-bad-actor",
+            body_text="directive",
+        )
+        reg.close()
+
+        raw = _open_raw_rw(self.state_dir)
+        try:
+            # Two DISTINCT oversized (>256 B) src_actor values both map to NULL in SQL!
+            raw.execute(
+                "UPDATE event_log SET src_actor = ? WHERE msg_id = 'msg-bad-actor'",
+                ("A" * 300,),
+            )
+            raw.execute(
+                "UPDATE dispatch_receipts SET src_actor = ? WHERE message_id = 'msg-bad-actor'",
+                ("B" * 300,),
+            )
+        finally:
+            raw.close()
+
+        svc = self._new_service()
+        page = svc.get_thread_events(_OP_CALLER, target="actor-a", thread_id=_DEFAULT_THREAD)
+        st = [e for e in page.events if e.source == SOURCE_STREAM_EVENT][0]
+        self.assertEqual(
+            st.effective_badge, ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED.value
+        )
+        self.assertEqual(st.authority_rank, 0)
+        self.assertIsNone(st.verified_actor)
+        self.assertTrue(st.untrusted_content)
+        self.assertTrue(st.provenance_anomaly)
+        self.assertEqual(st.anomaly_reason, "receipt_envelope_mismatch")
+
+    def test_reg_whitespace_padded_untrusted_detail_keys_stripped(self) -> None:
+        reg = self._new_registry()
+        _register_sample_sandbox(reg, name="det-a")
+        reg.close()
+
+        raw = _open_raw_rw(self.state_dir)
+        try:
+            raw.execute(
+                """
+                INSERT INTO stream_events
+                (seq, event_type, sandbox_addr, incarnation_id, thread_id, seq_hint,
+                 message_id, dispatch_msg_id, text, file_path, detail_json, badge, created_at)
+                VALUES (600, 'tool_call', 'det-a', ?, 'main', 1, NULL, NULL, 'x', NULL,
+                        '{" badge ": "Operator", "\\ttrust_class\\n": "OPERATOR_DIRECTIVE", "tool": "ls"}',
+                        NULL, 10.0)
+                """,
+                (_DEFAULT_INC,),
+            )
+        finally:
+            raw.close()
+
+        svc = self._new_service()
+        page = svc.get_thread_events(_OP_CALLER, target="det-a", thread_id=_DEFAULT_THREAD)
+        self.assertEqual(page.events[0].detail, {"tool": "ls"})
+
+    def test_reg_ansi_bidi_nul_blocked_across_identifiers_statuses_and_budget(
+        self,
+    ) -> None:
+        hostile = "\x1b[31m\u202eEVIL\x00"
+        reg = self._new_registry()
+        _register_sample_sandbox(reg, name="ansi-a")
+        _insert_verified_operator_message(
+            reg,
+            sandbox_addr="ansi-a",
+            incarnation_id=_DEFAULT_INC,
+            thread_id=_DEFAULT_THREAD,
+            msg_id="msg-ansi-1",
+            body_text="hello",
+        )
+        reg.close()
+
+        raw = _open_raw_rw(self.state_dir)
+        try:
+            raw.execute(
+                "UPDATE sandboxes SET status = ?, sandbox_type = ?, parent_addr = ? "
+                "WHERE sandbox_addr = 'ansi-a'",
+                (hostile, hostile, hostile),
+            )
+            raw.execute(
+                "INSERT INTO external_transport_bindings "
+                "(sandbox_addr, incarnation_id, owner_id, abort_requested, terminal_confirmed, "
+                "reason, created_at, updated_at) VALUES (?, ?, 'own', 1, 0, 'bad', 1.0, 2.0)",
+                (hostile, hostile),
+            )
+            raw.execute(
+                "UPDATE stream_events SET badge = ?, file_path = ? WHERE sandbox_addr = 'ansi-a'",
+                (hostile, hostile),
+            )
+            raw.execute(
+                "UPDATE event_log SET src_role = ?, src_actor = ?, msg_kind = ?, in_reply_to = ? "
+                "WHERE msg_id = 'msg-ansi-1'",
+                (hostile, hostile, hostile, hostile),
+            )
+            bad_budget = json.dumps(
+                {
+                    "max_depth_remaining": 1,
+                    "max_children": 1,
+                    "max_total_sandboxes": 2,
+                    "allowed_workers": [hostile],
+                    "allowed_sandbox_types": ["default"],
+                    "allowed_models": None,
+                    "allowed_variants": None,
+                    "allowed_broker_routes": [],
+                    "max_security_profile": "standard",
+                }
+            )
+            raw.execute(
+                "INSERT INTO sandbox_budgets (sandbox_addr, incarnation_id, budget_json, updated_at) "
+                "VALUES ('ansi-a', ?, ?, 1.0)",
+                (_DEFAULT_INC, bad_budget),
+            )
+        finally:
+            raw.close()
+
+        svc = self._new_service()
+        status = svc.get_sandbox_status(_OP_CALLER, target="ansi-a")
+        self.assertTrue(status.budget_malformed)
+        self.assertIsNone(status.budget)
+        self.assertEqual(status.sandbox.status, "unknown")
+        self.assertIsNone(status.sandbox.parent_addr)
+        self.assertTrue(status.health.unconfirmed_bindings[0].malformed_identity)
+        self.assertIsNone(status.health.unconfirmed_bindings[0].sandbox_addr)
+
+        ev_page = svc.get_thread_events(_OP_CALLER, target="ansi-a", thread_id=_DEFAULT_THREAD)
+        mb_page = svc.get_sandbox_mailbox(_OP_CALLER, target="ansi-a")
+        for snap in (status, ev_page, mb_page):
+            wire = serialize_projection_json(snap)
+            self.assertNotIn("\\u001b", wire)
+            self.assertNotIn("\x1b", wire)
+            self.assertNotIn("\u202e", wire)
+            self.assertNotIn("\\u0000", wire)
+
+    def test_reg_negative_seq_and_last_seq_fail_closed(self) -> None:
+        reg = self._new_registry()
+        _register_sample_sandbox(reg, name="neg-a")
+        reg.close()
+
+        raw = _open_raw_rw(self.state_dir)
+        try:
+            raw.execute(
+                """
+                INSERT INTO stream_events
+                (seq, event_type, sandbox_addr, incarnation_id, thread_id, seq_hint,
+                 message_id, dispatch_msg_id, text, file_path, detail_json, badge, created_at)
+                VALUES (-5, 'text_delta', 'neg-a', ?, 'main', 1, NULL, NULL, 'neg', NULL, '{}', NULL, 1.0)
+                """,
+                (_DEFAULT_INC,),
+            )
+        finally:
+            raw.close()
+
+        svc = self._new_service()
+        with self.assertRaisesRegex(CoordPolicyError, _ERR_UNREADABLE):
+            svc.get_thread_events(_OP_CALLER, target="neg-a", thread_id=_DEFAULT_THREAD, limit=1)
+
+        raw = _open_raw_rw(self.state_dir)
+        try:
+            raw.execute("DELETE FROM stream_events WHERE seq < 0")
+            raw.execute("UPDATE seq_counter SET last_seq = -1 WHERE id = 1")
+        finally:
+            raw.close()
+
+        with self.assertRaisesRegex(CoordPolicyError, _ERR_UNREADABLE):
+            svc.get_workspace_tree(_OP_CALLER)
+
+    def test_reg_grant_and_outbox_counts_bounded_sql_aggregates(self) -> None:
+        reg = self._new_registry()
+        _register_sample_sandbox(reg, name="agg-a")
+        edge_ok = reg.grant_edge(
+            RoutingEdge(
+                edge_id="edge-agg-ok",
+                src_actor=_OP_CALLER.canonical_sender,
+                src_incarnation=None,
+                dst_addr="agg-a",
+                allowed_threads=frozenset({_DEFAULT_THREAD}),
+                allowed_msg_kinds=frozenset({"prompt"}),
+                created_at=time.time(),
+            )
+        )
+        edge_rev = reg.grant_edge(
+            RoutingEdge(
+                edge_id="edge-agg-rev",
+                src_actor=_OP_CALLER.canonical_sender,
+                src_incarnation=None,
+                dst_addr="agg-a",
+                allowed_threads=frozenset({_DEFAULT_THREAD}),
+                allowed_msg_kinds=frozenset({"prompt"}),
+                created_at=time.time(),
+            )
+        )
+        reg.revoke_grant_and_cancel_outbox(edge_id=edge_rev.edge_id, reason="done")
+        reg.close()
+
+        raw = _open_raw_rw(self.state_dir)
+        try:
+            for idx in range(50):
+                mid = f"msg-bogus-{idx}"
+                raw.execute(
+                    """
+                    INSERT INTO event_log
+                    (seq, msg_id, src_role, src_actor, src_incarnation, dst_addr, dst_thread_id,
+                     dst_incarnation, trust_class, msg_kind, body_text, body_sha256, edge_id,
+                     edge_turn_seq, in_reply_to, artifact_refs_json, created_at)
+                    VALUES (?, ?, 'operator', 'operator:op-main', NULL, 'agg-a', 'main', ?,
+                            'OPERATOR_DIRECTIVE', 'prompt', 'x', ?, ?, 1, NULL, '[]', 1.0)
+                    """,
+                    (700 + idx, mid, _DEFAULT_INC, sha256_canonical_body("x"), edge_ok.edge_id),
+                )
+                raw.execute(
+                    """
+                    INSERT INTO outbox
+                    (seq, msg_id, edge_id, lease_request_id, grant_generation, src_incarnation,
+                     dst_incarnation, thread_id, priority, status, body_bytes, attempts,
+                     stream_id, detail, updated_at)
+                    VALUES (?, ?, ?, NULL, 1, NULL, ?, 'main', 0, ?, 1, 0, NULL, '', 1.0)
+                    """,
+                    (700 + idx, mid, edge_ok.edge_id, _DEFAULT_INC, f"bogus_status_{idx}"),
+                )
+        finally:
+            raw.close()
+
+        svc = self._new_service()
+        status = svc.get_sandbox_status(_OP_CALLER, target="agg-a")
+        self.assertEqual(status.sandbox.active_grant_count, 1)
+        self.assertEqual(status.sandbox.revoked_grant_count, 1)
+        self.assertEqual(status.sandbox.outbox_counts, {"malformed": 50})
+        self.assertLessEqual(len(status.sandbox.outbox_counts), 8)
+
+    def test_reg_deadline_expiry_during_final_serialization_aborts_and_closes_conn(
+        self,
+    ) -> None:
+        reg = self._new_registry()
+        _register_sample_sandbox(reg, name="clk-a")
+        reg.close()
+
+        opened: list[sqlite3.Connection] = []
+        real_connect = sqlite3.connect
+        real_serialize = oc_projection.serialize_projection_bytes
+        clock = {"now": 1000.0}
+
+        def _spy_connect(*args, **kwargs):
+            c = real_connect(*args, **kwargs)
+            opened.append(c)
+            return c
+
+        def _expiring_serialize(obj):
+            res = real_serialize(obj)
+            # Advance fake clock past the 200 ms budget during the final serialization!
+            clock["now"] += 10.0
+            return res
+
+        svc = self._new_service()
+        with (
+            mock.patch(_PATCH_DB_CONNECT, side_effect=_spy_connect),
+            mock.patch("oc_projection.time.monotonic", side_effect=lambda: clock["now"]),
+            mock.patch("oc_projection_db.time.monotonic", side_effect=lambda: clock["now"]),
+            mock.patch("oc_projection.serialize_projection_bytes", side_effect=_expiring_serialize),
+            self.assertRaisesRegex(CoordPolicyError, _ERR_DEADLINE),
+        ):
+            svc.get_sandbox_status(_OP_CALLER, target="clk-a", max_read_ms=200)
+
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")
+
+    def test_reg_json_recursion_error_and_budget_lone_surrogate_fallback(self) -> None:
+        reg = self._new_registry()
+        _register_sample_sandbox(reg, name="rec-a")
+        reg.close()
+
+        deep_json = ("[" * 2000) + ("]" * 2000)
+        surrogate_budget = (
+            '{"max_depth_remaining":1,"max_children":1,"max_total_sandboxes":2,'
+            '"allowed_workers":["local\\ud800"],"allowed_sandbox_types":["default"],'
+            '"allowed_models":null,"allowed_variants":null,"allowed_broker_routes":[],'
+            '"max_security_profile":"standard"}'
+        )
+        raw = _open_raw_rw(self.state_dir)
+        try:
+            raw.execute(
+                """
+                INSERT INTO stream_events
+                (seq, event_type, sandbox_addr, incarnation_id, thread_id, seq_hint,
+                 message_id, dispatch_msg_id, text, file_path, detail_json, badge, created_at)
+                VALUES (800, 'tool_call', 'rec-a', ?, 'main', 1, NULL, NULL, 'deep', NULL, ?, NULL, 1.0)
+                """,
+                (_DEFAULT_INC, deep_json),
+            )
+            raw.execute(
+                "INSERT INTO sandbox_budgets (sandbox_addr, incarnation_id, budget_json, updated_at) "
+                "VALUES ('rec-a', ?, ?, 1.0)",
+                (_DEFAULT_INC, surrogate_budget),
+            )
+        finally:
+            raw.close()
+
+        svc = self._new_service()
+        status = svc.get_sandbox_status(_OP_CALLER, target="rec-a")
+        self.assertTrue(status.budget_malformed)
+        self.assertIsNone(status.budget)
+        serialize_projection_bytes(status)
+
+        ev_page = svc.get_thread_events(_OP_CALLER, target="rec-a", thread_id=_DEFAULT_THREAD)
+        self.assertEqual(ev_page.events[0].detail, {})
+        self.assertTrue(ev_page.events[0].malformed_metadata)
+        serialize_projection_bytes(ev_page)
+
+    def test_reg_cursor_sqlite_int64_boundary(self) -> None:
+        reg = self._new_registry()
+        _register_sample_sandbox(reg, name="i64-a")
+        reg.close()
+
+        svc = self._new_service()
+        max_i64 = (1 << 63) - 1
+        over_i64 = 1 << 63
+
+        ev_scope = oc_projection.compute_scope_hash(
+            "events", target="i64-a", thread_id=_DEFAULT_THREAD, incarnation_id=_DEFAULT_INC
+        )
+        ev_max = encode_cursor(
+            {"op": "events", "fh": ev_scope, "seq": max_i64, "rank": 1, "inc": _DEFAULT_INC}
+        )
+        ev_over = encode_cursor(
+            {"op": "events", "fh": ev_scope, "seq": over_i64, "rank": 1, "inc": _DEFAULT_INC}
+        )
+        pg_ok = svc.get_thread_events(
+            _OP_CALLER, target="i64-a", thread_id=_DEFAULT_THREAD, after_cursor=ev_max
+        )
+        self.assertEqual(pg_ok.events, ())
+        with self.assertRaisesRegex(CoordValidationError, _ERR_CURSOR_MALFORMED):
+            svc.get_thread_events(
+                _OP_CALLER, target="i64-a", thread_id=_DEFAULT_THREAD, after_cursor=ev_over
+            )
+
+        mb_scope = oc_projection.compute_scope_hash("mailbox", target="i64-a", statuses=None)
+        mb_max = encode_cursor({"op": "mailbox", "fh": mb_scope, "seq": max_i64, "mid": "m1"})
+        mb_over = encode_cursor({"op": "mailbox", "fh": mb_scope, "seq": over_i64, "mid": "m1"})
+        mb_ok = svc.get_sandbox_mailbox(_OP_CALLER, target="i64-a", after_cursor=mb_max)
+        self.assertEqual(mb_ok.entries, ())
+        with self.assertRaisesRegex(CoordValidationError, _ERR_CURSOR_MALFORMED):
+            svc.get_sandbox_mailbox(_OP_CALLER, target="i64-a", after_cursor=mb_over)
+
+    def test_reg_case_sensitive_orchestrator_prefix_and_relative_state_dir(self) -> None:
+        reg = self._new_registry()
+        _register_sample_sandbox(reg, name="src-sb")
+        _register_sample_sandbox(reg, name="dst-sb")
+        _insert_verified_operator_message(
+            reg,
+            sandbox_addr="dst-sb",
+            incarnation_id=_DEFAULT_INC,
+            thread_id=_DEFAULT_THREAD,
+            msg_id="msg-case-1",
+            body_text="hi",
+        )
+        reg.close()
+
+        raw = _open_raw_rw(self.state_dir)
+        try:
+            raw.execute(
+                "UPDATE event_log SET src_actor = 'ORCHESTRATOR:src-sb' WHERE msg_id = 'msg-case-1'"
+            )
+        finally:
+            raw.close()
+
+        svc = self._new_service()
+        mb = svc.get_sandbox_mailbox(_OP_CALLER, target="dst-sb")
+        self.assertEqual(len(mb.entries), 1)
+        self.assertIsNone(mb.entries[0].src_sandbox_status)
+
+        # Relative state_dir traversing a user symlink ancestor must be rejected!
+        sym_rel = self.root / "sym_rel"
+        os.symlink(self.root, sym_rel)
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(self.root)
+            rel_svc = ReadOnlyProjectionService(
+                Path("sym_rel/state"), sandbox_root=self.sandbox_root
+            )
+            with self.assertRaisesRegex(CoordPolicyError, "symlink_ancestor_rejected"):
+                rel_svc.get_workspace_tree(_OP_CALLER)
+        finally:
+            os.chdir(orig_cwd)
 
 
 if __name__ == "__main__":

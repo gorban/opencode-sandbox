@@ -11,7 +11,7 @@ Public entry points:
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 import hashlib
 from pathlib import Path
@@ -29,6 +29,8 @@ for _import_dir in (str(_PROJECTION_DIR), str(_SPIKE_M_DIR), str(_SPIKE_L_DIR)):
 
 from oc_address import AddressError, parse_local_target, validate_thread_id  # noqa: E402
 from oc_coord_contract import (  # noqa: E402
+    SANDBOX_LIFECYCLE_STATES,
+    STREAM_EVENT_TYPES,
     CoordAuthError,
     CoordPolicyError,
     CoordRole,
@@ -104,9 +106,12 @@ from oc_projection_decode import (  # noqa: E402
     parse_budget_json,
     parse_detail_json,
     parse_string_list_json,
+    require_clean_primary_id,
     safe_bool_flag,
     safe_finite_float,
     safe_int,
+    sanitize_enum_str,
+    sanitize_optional_ref,
     scrub_single_line_str,
 )
 from oc_registry import _TRUST_CLASS_TO_BADGE, _VALID_OUTBOX_STATUSES  # noqa: E402
@@ -128,9 +133,16 @@ _KEY_MARKER_UNREADABLE = "marker_unreadable"
 _KEY_LIVE_STATUS_AVAILABLE = "live_status_available"
 _PARAM_MAX_RESPONSE_BYTES = "max_response_bytes"
 _PARAM_MAX_READ_MS = "max_read_ms"
+
 _ERR_SANDBOX_NOT_FOUND = "sandbox_not_found"
 _ERR_BUDGET_ENVELOPE = "response_budget_too_small_for_envelope"
 _ERR_BUDGET_ITEM = "response_budget_too_small_for_item"
+
+_EMPTY_EDGES: tuple[ProjectedRoutingEdge, ...] = ()
+_EMPTY_BINDINGS: tuple[UnconfirmedBindingSummary, ...] = ()
+_EMPTY_PROJECTS: tuple[ProjectedProjectGroup, ...] = ()
+_EMPTY_EVENTS: tuple[ProjectedThreadEvent, ...] = ()
+_EMPTY_ENTRIES: tuple[ProjectedMailboxEntry, ...] = ()
 
 _TRUSTED_TRUST_CLASSES = frozenset(
     {TrustClass.OPERATOR_DIRECTIVE.value, TrustClass.PARENT_TASK.value}
@@ -141,6 +153,8 @@ _TRUST_AUTHORITY_RANK = {
     TrustClass.UNTRUSTED_PEER_DATA.value: 1,
     TrustClass.SYSTEM_ALERT.value: 0,
 }
+
+_CLOSED_OUTBOX_SQL_LIST = ",".join(f"'{s}'" for s in sorted(_VALID_OUTBOX_STATUSES))
 
 _BINDING_SELECT_COLUMNS = """
     CASE WHEN typeof(b.sandbox_addr) = 'text' AND LENGTH(CAST(b.sandbox_addr AS BLOB)) <= 256
@@ -225,8 +239,63 @@ _SQL_SANDBOX_COLUMNS = """
 """
 
 
+@dataclass(frozen=True, slots=True)
+class _EventsPackCtx:
+    snapshot_seq: int
+    health: WorkspaceHealthSummary
+    sandbox_addr: str
+    target_inc: str
+    is_current: bool
+    stale_reason: str | None
+    thread_id: str
+    thread_exists: bool
+    page_limit: int
+    scope_hash: str
+    max_bytes: int
+    session_echo: ReadSessionEcho | None
+    deadline: float
+
+
+@dataclass(frozen=True, slots=True)
+class _TreePackCtx:
+    snapshot_seq: int
+    sb_limit: int
+    include_historical: bool
+    max_threads: int
+    scope_hash: str
+    max_bytes: int
+    session_echo: ReadSessionEcho | None
+    deadline: float
+
+
+@dataclass(frozen=True, slots=True)
+class _MailboxPackCtx:
+    snapshot_seq: int
+    health: WorkspaceHealthSummary
+    sandbox_addr: str
+    current_inc: str
+    page_limit: int
+    scope_hash: str
+    max_bytes: int
+    session_echo: ReadSessionEcho | None
+    deadline: float
+
+
+@dataclass(frozen=True, slots=True)
+class _StatusPackCtx:
+    snapshot_seq: int
+    binding: UnconfirmedBindingSummary | None
+    budget: ProjectedSubtreeBudget | None
+    budget_malformed: bool
+    max_bytes: int
+    session_echo: ReadSessionEcho | None
+    deadline: float
+
+
 def _validate_int_range(value: object, label: str, lo: int, hi: int) -> int:
-    if type(value) is not int or not (lo <= value <= hi):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CoordValidationError(f"{label} must be an int in {lo}..{hi}")
+    if value < lo or value > hi:
         raise CoordValidationError(f"{label} must be an int in {lo}..{hi}")
     return value
 
@@ -275,7 +344,9 @@ def _validate_session_args(
         clean_id = validate_opaque_token(read_session_id, "read_session_id")
     except AddressError as exc:
         raise CoordValidationError(str(exc)) from exc
-    if type(session_generation) is not int or session_generation < 1:
+    if isinstance(session_generation, bool) or not isinstance(session_generation, int):
+        raise CoordValidationError("session_generation must be an int >= 1")
+    if session_generation < 1:
         raise CoordValidationError("session_generation must be an int >= 1")
     if not has_validator:
         raise CoordPolicyError("read_session_validator_unconfigured")
@@ -307,8 +378,10 @@ def _enforce_authority_fences(
 
 
 def _row_to_binding_summary(row: Mapping[str, Any]) -> UnconfirmedBindingSummary:
-    sb_addr = row[_COL_SANDBOX_ADDR]
-    inc_id = row[_COL_INCARNATION_ID]
+    sb_addr, bad_sb = sanitize_optional_ref(row[_COL_SANDBOX_ADDR])
+    inc_id, bad_inc = sanitize_optional_ref(row[_COL_INCARNATION_ID])
+    sb_status, bad_st = sanitize_optional_ref(row["sandbox_status"])
+    cur_inc, bad_cinc = sanitize_optional_ref(row["current_incarnation"])
     abort_req, bad_abort = safe_bool_flag(
         row[_COL_ABORT_REQUESTED], row["abort_requested_malformed"]
     )
@@ -321,6 +394,10 @@ def _row_to_binding_summary(row: Mapping[str, Any]) -> UnconfirmedBindingSummary
     updated_at, bad_upd = safe_finite_float(
         row[_COL_UPDATED_AT], row[_COL_UPDATED_AT_MALFORMED]
     )
+    malformed_id = (sb_addr is None) or (inc_id is None) or bad_sb or bad_inc
+    malformed_meta = (
+        bad_abort or bad_term or bad_reason or bad_upd or bad_st or bad_cinc
+    )
     return UnconfirmedBindingSummary(
         sandbox_addr=sb_addr,
         incarnation_id=inc_id,
@@ -329,11 +406,11 @@ def _row_to_binding_summary(row: Mapping[str, Any]) -> UnconfirmedBindingSummary
         reason=reason,
         reason_truncated=reason_trunc,
         updated_at=updated_at,
-        sandbox_status=row["sandbox_status"],
-        current_incarnation=row["current_incarnation"],
+        sandbox_status=sb_status,
+        current_incarnation=cur_inc,
         sandbox_missing=bool(row["sandbox_missing"]),
-        malformed_identity=(sb_addr is None) or (inc_id is None),
-        malformed_metadata=(bad_abort or bad_term or bad_reason or bad_upd),
+        malformed_identity=malformed_id,
+        malformed_metadata=malformed_meta,
     )
 
 
@@ -482,46 +559,48 @@ def _select_threads_for_sandbox(
         LIMIT ?
     """
     rows = execute_bounded(conn, sql, params, deadline).fetchall()
-    items: list[ProjectedThreadSummary] = []
-    for row in rows[:max_threads]:
-        if row["thread_id"] is None or row[_COL_INCARNATION_ID] is None:
-            raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
-        title, title_trunc, bad_title = decode_single_line_cell(
-            row["title_blob"], row["title_bytes"], row["title_non_text"]
-        )
-        last_seq, bad_seq = safe_int(row["last_seq"], row["last_seq_malformed"])
-        updated_at, bad_upd = safe_finite_float(
-            row[_COL_UPDATED_AT], row[_COL_UPDATED_AT_MALFORMED]
-        )
-        items.append(
-            ProjectedThreadSummary(
-                thread_id=row["thread_id"],
-                incarnation_id=row[_COL_INCARNATION_ID],
-                is_current_incarnation=(row[_COL_INCARNATION_ID] == current_inc),
-                title=title,
-                title_truncated=title_trunc,
-                status=row["status"] if row["status"] is not None else "unknown",
-                last_seq=last_seq,
-                updated_at=updated_at,
-                malformed_metadata=(
-                    bad_title or bad_seq or bad_upd or (row["status"] is None)
-                ),
-            )
-        )
-    return tuple(items), len(rows) > max_threads, historical_count
+    items = tuple(_row_to_thread_summary(r, current_inc) for r in rows[:max_threads])
+    return items, len(rows) > max_threads, historical_count
+
+
+def _row_to_thread_summary(
+    row: Mapping[str, Any], current_inc: str
+) -> ProjectedThreadSummary:
+    th_id = require_clean_primary_id(row["thread_id"])
+    inc_id = require_clean_primary_id(row[_COL_INCARNATION_ID])
+    title, title_trunc, bad_title = decode_single_line_cell(
+        row["title_blob"], row["title_bytes"], row["title_non_text"]
+    )
+    last_seq, bad_seq = safe_int(row["last_seq"], row["last_seq_malformed"])
+    updated_at, bad_upd = safe_finite_float(
+        row[_COL_UPDATED_AT], row[_COL_UPDATED_AT_MALFORMED]
+    )
+    status_val, bad_status = sanitize_enum_str(row["status"])
+    return ProjectedThreadSummary(
+        thread_id=th_id,
+        incarnation_id=inc_id,
+        is_current_incarnation=(inc_id == current_inc),
+        title=title,
+        title_truncated=title_trunc,
+        status=status_val,
+        last_seq=last_seq,
+        updated_at=updated_at,
+        malformed_metadata=(bad_title or bad_seq or bad_upd or bad_status),
+    )
 
 
 def _select_grant_counts(
     conn: sqlite3.Connection, sandbox_addr: str, deadline: float
 ) -> tuple[int, int]:
     orch_actor = f"{_ORCH_PREFIX}{sandbox_addr}"
-    rows = execute_bounded(
+    row = execute_bounded(
         conn,
         """
         SELECT
-            CASE WHEN typeof(r.active) = 'integer' AND r.active IN (0, 1)
-                 THEN r.active ELSE NULL END AS active,
-            (t.edge_id IS NOT NULL) AS tombstoned
+            COALESCE(SUM(CASE WHEN typeof(r.active) = 'integer' AND r.active = 1
+                                   AND t.edge_id IS NULL THEN 1 ELSE 0 END), 0) AS active_cnt,
+            COALESCE(SUM(CASE WHEN typeof(r.active) = 'integer' AND r.active = 1
+                                   AND t.edge_id IS NULL THEN 0 ELSE 1 END), 0) AS revoked_cnt
         FROM routing_edges r
         LEFT JOIN grant_tombstones t
           ON t.edge_id = r.edge_id AND t.grant_generation = r.grant_generation
@@ -529,9 +608,10 @@ def _select_grant_counts(
         """,
         (sandbox_addr, sandbox_addr, orch_actor),
         deadline,
-    ).fetchall()
-    active_cnt = sum(1 for r in rows if r["active"] == 1 and not bool(r["tombstoned"]))
-    return active_cnt, len(rows) - active_cnt
+    ).fetchone()
+    if row is None:
+        return 0, 0
+    return int(row["active_cnt"]), int(row["revoked_cnt"])
 
 
 def _select_outbox_counts(
@@ -539,9 +619,9 @@ def _select_outbox_counts(
 ) -> dict[str, int]:
     rows = execute_bounded(
         conn,
-        """
+        f"""
         SELECT
-            CASE WHEN typeof(o.status) = 'text' AND LENGTH(CAST(o.status AS BLOB)) <= 64
+            CASE WHEN typeof(o.status) = 'text' AND o.status IN ({_CLOSED_OUTBOX_SQL_LIST})
                  THEN o.status ELSE 'malformed' END AS status,
             COUNT(*) AS cnt
         FROM outbox o
@@ -577,6 +657,37 @@ def _select_binding_state_and_summary(
     return "active", summary
 
 
+def _extract_sandbox_primary_ids(row: Mapping[str, Any]) -> tuple[str, str, str, str, str]:
+    addr = require_clean_primary_id(row[_COL_SANDBOX_ADDR])
+    inc = require_clean_primary_id(row[_COL_INCARNATION_ID])
+    worker_ref = require_clean_primary_id(row["worker_ref"])
+    inst_name = require_clean_primary_id(row["instance_name"])
+    job_id = require_clean_primary_id(row["job_id"])
+    try:
+        if parse_local_target(addr).canonical != addr:
+            raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
+        validate_opaque_token(inc, _COL_INCARNATION_ID)
+    except (AddressError, CoordValidationError) as exc:
+        raise CoordPolicyError(ERR_REGISTRY_UNREADABLE) from exc
+    return addr, inc, worker_ref, inst_name, job_id
+
+
+def _decode_sandbox_project_id(
+    row: Mapping[str, Any], addr: str
+) -> tuple[str, str | None, bool, bool, tuple[str, str]]:
+    proj_raw = row["project_id_raw"]
+    proj_bytes = row["project_id_bytes"] if type(row["project_id_bytes"]) is int else 0
+    if proj_raw is not None:
+        proj_sha = hashlib.sha256(proj_raw.encode("utf-8")).hexdigest()
+        proj_display, proj_trunc = scrub_single_line_str(proj_raw)
+        return proj_display, proj_sha, proj_trunc, False, ("exact", proj_raw)
+    proj_display, proj_trunc_cell, _ = decode_single_line_cell(
+        row["project_id_preview_blob"], proj_bytes, row["project_id_non_text"]
+    )
+    proj_trunc = proj_trunc_cell or (proj_bytes > MAX_METADATA_TEXT_BYTES)
+    return proj_display, None, proj_trunc, True, ("oversize", addr)
+
+
 def _build_sandbox_node(
     conn: sqlite3.Connection,
     row: Mapping[str, Any],
@@ -586,36 +697,10 @@ def _build_sandbox_node(
     deadline: float,
 ) -> tuple[ProjectedSandboxNode, tuple[str, str], UnconfirmedBindingSummary | None]:
     check_deadline_ms(deadline)
-    if any(
-        row[k] is None
-        for k in (_COL_SANDBOX_ADDR, "worker_ref", "instance_name", _COL_INCARNATION_ID, "job_id")
-    ):
-        raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
-    addr = row[_COL_SANDBOX_ADDR]
-    inc = row[_COL_INCARNATION_ID]
-    try:
-        if parse_local_target(addr).canonical != addr:
-            raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
-        validate_opaque_token(inc, _COL_INCARNATION_ID)
-    except (AddressError, CoordValidationError) as exc:
-        raise CoordPolicyError(ERR_REGISTRY_UNREADABLE) from exc
-
-    proj_raw = row["project_id_raw"]
-    proj_bytes = row["project_id_bytes"] if type(row["project_id_bytes"]) is int else 0
-    if proj_raw is not None:
-        proj_sha: str | None = hashlib.sha256(proj_raw.encode("utf-8")).hexdigest()
-        proj_display, proj_trunc = scrub_single_line_str(proj_raw)
-        proj_malformed = False
-        group_key = ("exact", proj_raw)
-    else:
-        proj_sha = None
-        proj_display, proj_trunc_cell, _ = decode_single_line_cell(
-            row["project_id_preview_blob"], proj_bytes, row["project_id_non_text"]
-        )
-        proj_trunc = proj_trunc_cell or (proj_bytes > MAX_METADATA_TEXT_BYTES)
-        proj_malformed = True
-        group_key = ("oversize", addr)
-
+    addr, inc, worker_ref, inst_name, job_id = _extract_sandbox_primary_ids(row)
+    proj_display, proj_sha, proj_trunc, proj_malformed, group_key = (
+        _decode_sandbox_project_id(row, addr)
+    )
     proj_name, proj_name_trunc, bad_pname = decode_single_line_cell(
         row["project_name_blob"], row["project_name_bytes"], row["project_name_non_text"]
     )
@@ -624,6 +709,11 @@ def _build_sandbox_node(
     )
     brief, brief_trunc, bad_brief = decode_single_line_cell(
         row["task_brief_blob"], row["task_brief_bytes"], row["task_brief_non_text"]
+    )
+    sb_type, bad_type = sanitize_enum_str(row[_COL_SANDBOX_TYPE])
+    status_val, bad_status = sanitize_enum_str(row["status"], SANDBOX_LIFECYCLE_STATES)
+    parent_addr, bad_parent = sanitize_optional_ref(
+        row["parent_addr"], row["parent_addr_malformed"]
     )
     depth, bad_depth = safe_int(row["depth"], row["depth_malformed"])
     created_at, bad_created = safe_finite_float(
@@ -645,24 +735,26 @@ def _build_sandbox_node(
     binding_state, binding_summary = _select_binding_state_and_summary(
         conn, addr, inc, deadline
     )
-    malformed = (
-        proj_malformed
-        or bad_pname
-        or bad_branch
-        or bad_brief
-        or bad_depth
-        or bad_created
-        or bad_updated
-        or bool(row["parent_addr_malformed"])
-        or (row[_COL_SANDBOX_TYPE] is None)
-        or (row["status"] is None)
+    malformed = any(
+        (
+            proj_malformed,
+            bad_pname,
+            bad_branch,
+            bad_brief,
+            bad_type,
+            bad_status,
+            bad_parent,
+            bad_depth,
+            bad_created,
+            bad_updated,
+        )
     )
     node = ProjectedSandboxNode(
         sandbox_addr=addr,
-        worker_ref=row["worker_ref"],
-        instance_name=row["instance_name"],
+        worker_ref=worker_ref,
+        instance_name=inst_name,
         incarnation_id=inc,
-        job_id=row["job_id"],
+        job_id=job_id,
         project_id=proj_display,
         project_id_sha256=proj_sha,
         project_id_truncated=proj_trunc,
@@ -670,11 +762,11 @@ def _build_sandbox_node(
         project_name_truncated=proj_name_trunc,
         branch=branch,
         branch_truncated=branch_trunc,
-        sandbox_type=row[_COL_SANDBOX_TYPE] if row[_COL_SANDBOX_TYPE] is not None else "unknown",
+        sandbox_type=sb_type,
         task_brief=brief,
         task_brief_truncated=brief_trunc,
-        status=row["status"] if row["status"] is not None else "unknown",
-        parent_addr=row["parent_addr"],
+        status=status_val,
+        parent_addr=parent_addr,
         depth=depth,
         created_at=created_at,
         updated_at=updated_at,
@@ -714,12 +806,16 @@ def _group_sandboxes_by_project(
 
 
 def _binary_search_prefix(
-    count: int, make_candidate: Callable[[int], Any], max_response_bytes: int
+    count: int,
+    make_candidate: Callable[[int], Any],
+    max_response_bytes: int,
+    deadline: float,
 ) -> Any | None:
     lo = 0
     hi = count
     best: Any | None = None
     while lo <= hi:
+        check_deadline_ms(deadline)
         mid = (lo + hi) // 2
         candidate = make_candidate(mid)
         if len(serialize_projection_bytes(candidate)) <= max_response_bytes:
@@ -727,6 +823,7 @@ def _binary_search_prefix(
             lo = mid + 1
         else:
             hi = mid - 1
+    check_deadline_ms(deadline)
     return best
 
 
@@ -734,14 +831,18 @@ def _fit_health_in_budget(
     health: WorkspaceHealth,
     make_snapshot: Callable[[WorkspaceHealth], Any],
     max_response_bytes: int,
+    deadline: float,
 ) -> WorkspaceHealth | None:
+    check_deadline_ms(deadline)
     if len(serialize_projection_bytes(make_snapshot(health))) <= max_response_bytes:
+        check_deadline_ms(deadline)
         return health
     total = len(health.unconfirmed_bindings)
     lo = 0
     hi = total
     best: WorkspaceHealth | None = None
     while lo <= hi:
+        check_deadline_ms(deadline)
         mid = (lo + hi) // 2
         candidate = replace(
             health,
@@ -755,6 +856,7 @@ def _fit_health_in_budget(
             lo = mid + 1
         else:
             hi = mid - 1
+    check_deadline_ms(deadline)
     return best
 
 
@@ -763,11 +865,13 @@ def _shrink_first_sandbox_threads(
     group_key: tuple[str, str],
     make_snapshot: Callable[[tuple[ProjectedProjectGroup, ...]], Any],
     max_response_bytes: int,
+    deadline: float,
 ) -> ProjectedSandboxNode | None:
     lo = 0
     hi = len(node.threads)
     best: ProjectedSandboxNode | None = None
     while lo <= hi:
+        check_deadline_ms(deadline)
         mid = (lo + hi) // 2
         trimmed = replace(
             node,
@@ -780,6 +884,7 @@ def _shrink_first_sandbox_threads(
             lo = mid + 1
         else:
             hi = mid - 1
+    check_deadline_ms(deadline)
     return best
 
 
@@ -789,12 +894,14 @@ def _shrink_text_item_to_fit(
     trunc_field: str,
     make_page: Callable[[Any], Any],
     max_response_bytes: int,
+    deadline: float,
 ) -> Any | None:
     full_text: str = getattr(item, text_field)
     lo = 0
     hi = len(full_text)
     best: Any | None = None
     while lo <= hi:
+        check_deadline_ms(deadline)
         mid = (lo + hi) // 2
         candidate = replace(
             item,
@@ -808,6 +915,7 @@ def _shrink_text_item_to_fit(
             lo = mid + 1
         else:
             hi = mid - 1
+    check_deadline_ms(deadline)
     return best
 
 
@@ -870,8 +978,12 @@ def _select_edges_for_sandbox(
 
 
 def _row_to_routing_edge(row: Mapping[str, Any]) -> ProjectedRoutingEdge:
-    if row["edge_id"] is None or row["src_actor"] is None or row["dst_addr"] is None:
-        raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
+    edge_id = require_clean_primary_id(row["edge_id"])
+    src_actor = require_clean_primary_id(row["src_actor"])
+    dst_addr = require_clean_primary_id(row["dst_addr"])
+    src_inc, bad_sinc = sanitize_optional_ref(
+        row["src_incarnation"], row["src_inc_malformed"]
+    )
     threads, bad_threads = parse_string_list_json(
         row["allowed_threads_blob"], row["allowed_threads_bytes"]
     )
@@ -900,23 +1012,25 @@ def _row_to_routing_edge(row: Mapping[str, Any]) -> ProjectedRoutingEdge:
             row["tomb_revoked_at"], row["tomb_revoked_malformed"]
         )
         bad_tomb = bad_tr or bad_ta
-    malformed = (
-        bad_threads
-        or bad_kinds
-        or bad_mr
-        or bad_tu
-        or bad_rpm
-        or bad_act
-        or bad_gen
-        or bad_cr
-        or bad_tomb
-        or bool(row["src_inc_malformed"])
+    malformed = any(
+        (
+            bad_threads,
+            bad_kinds,
+            bad_mr,
+            bad_tu,
+            bad_rpm,
+            bad_act,
+            bad_gen,
+            bad_cr,
+            bad_tomb,
+            bad_sinc,
+        )
     )
     return ProjectedRoutingEdge(
-        edge_id=row["edge_id"],
-        src_actor=row["src_actor"],
-        src_incarnation=row["src_incarnation"],
-        dst_addr=row["dst_addr"],
+        edge_id=edge_id,
+        src_actor=src_actor,
+        src_incarnation=src_inc,
+        dst_addr=dst_addr,
         allowed_threads=threads,
         allowed_msg_kinds=kinds,
         max_rounds=max_rounds,
@@ -1064,12 +1178,26 @@ def _select_thread_stream_rows(
     return execute_bounded(conn, sql, params, deadline).fetchall()
 
 
+def _require_nonneg_seq(val: Any) -> int:
+    if type(val) is not int or val < 0:
+        raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
+    return val
+
+
 def _project_event_log_row(
     row: Mapping[str, Any], *, sandbox_addr: str, incarnation_id: str, thread_id: str
 ) -> ProjectedThreadEvent:
-    if row["msg_id"] is None or type(row["seq"]) is not int:
-        raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
-    orig_bytes = row[_COL_ORIGINAL_TEXT_BYTES] if type(row[_COL_ORIGINAL_TEXT_BYTES]) is int else 0
+    seq = _require_nonneg_seq(row["seq"])
+    msg_id = require_clean_primary_id(row["msg_id"])
+    src_role, bad_role = sanitize_optional_ref(row["src_role"])
+    src_actor, bad_actor = sanitize_optional_ref(row["src_actor"])
+    msg_kind, bad_kind = sanitize_optional_ref(row["msg_kind"])
+    edge_id, bad_edge = sanitize_optional_ref(row["edge_id"])
+    in_reply_to, bad_reply = sanitize_optional_ref(
+        row["in_reply_to"], row["in_reply_to_malformed"]
+    )
+    raw_orig = row[_COL_ORIGINAL_TEXT_BYTES]
+    orig_bytes = raw_orig if type(raw_orig) is int and raw_orig >= 0 else 0
     decoded, inspected_len, bad_utf8 = decode_bounded_blob(row["text_blob"], orig_bytes)
     suffix_uninspected = orig_bytes > inspected_len
     artifacts, bad_arts = parse_artifact_refs_json(
@@ -1081,41 +1209,51 @@ def _project_event_log_row(
     created_at, bad_cr = safe_finite_float(
         row[_COL_CREATED_AT], row[_COL_CREATED_AT_MALFORMED]
     )
-    tc_val = row["trust_class"]
+    tc_val, bad_tc_chars = sanitize_optional_ref(row["trust_class"])
+    tc_valid = tc_val in _TRUST_AUTHORITY_RANK
     eff_badge = (
-        _TRUST_CLASS_TO_BADGE[TrustClass(tc_val)].value
-        if tc_val in _TRUST_AUTHORITY_RANK
-        else None
+        _TRUST_CLASS_TO_BADGE[TrustClass(tc_val)].value if tc_valid and tc_val else None
     )
-    malformed = (
-        bad_utf8
-        or bool(row["text_non_text"])
-        or bad_arts
-        or bad_ets
-        or bad_cr
-        or bool(row["in_reply_to_malformed"])
-        or (tc_val not in _TRUST_AUTHORITY_RANK)
+    actor_verified = src_actor if (tc_valid and src_actor is not None) else None
+    auth_rank = _TRUST_AUTHORITY_RANK.get(tc_val or "", 0) if actor_verified else 0
+    untrusted = (not actor_verified) or (tc_val not in _TRUSTED_TRUST_CLASSES)
+    malformed = any(
+        (
+            bad_utf8,
+            bool(row["text_non_text"]),
+            bad_arts,
+            bad_ets,
+            bad_cr,
+            bad_role,
+            bad_actor,
+            bad_kind,
+            bad_edge,
+            bad_reply,
+            bad_tc_chars,
+            not tc_valid,
+            src_actor is None,
+        )
     )
     return ProjectedThreadEvent(
         source=SOURCE_EVENT_LOG,
         source_rank=0,
-        seq=row["seq"],
+        seq=seq,
         event_type="envelope",
         sandbox_addr=sandbox_addr,
         incarnation_id=incarnation_id,
         thread_id=thread_id,
-        msg_id=row["msg_id"],
-        message_id=row["msg_id"],
+        msg_id=msg_id,
+        message_id=msg_id,
         dispatch_msg_id=None,
-        src_role=row["src_role"],
-        src_actor=row["src_actor"],
-        verified_actor=row["src_actor"] if tc_val in _TRUST_AUTHORITY_RANK else None,
-        trust_class=tc_val,
-        msg_kind=row["msg_kind"],
+        src_role=src_role,
+        src_actor=src_actor,
+        verified_actor=actor_verified,
+        trust_class=tc_val if tc_valid else None,
+        msg_kind=msg_kind,
         raw_badge=eff_badge,
         effective_badge=eff_badge,
-        authority_rank=_TRUST_AUTHORITY_RANK.get(tc_val, 0),
-        untrusted_content=(tc_val not in _TRUSTED_TRUST_CLASSES),
+        authority_rank=auth_rank,
+        untrusted_content=untrusted,
         provenance_anomaly=False,
         anomaly_reason=None,
         text=decoded,
@@ -1124,8 +1262,8 @@ def _project_event_log_row(
         original_text_bytes=orig_bytes,
         has_control_or_bidi=(bad_utf8 or has_multiline_control_or_bidi(decoded)),
         file_path=None,
-        in_reply_to=row["in_reply_to"],
-        edge_id=row["edge_id"],
+        in_reply_to=in_reply_to,
+        edge_id=edge_id,
         edge_turn_seq=edge_turn_seq,
         seq_hint=None,
         artifact_refs=artifacts,
@@ -1144,10 +1282,12 @@ def _project_stream_row(
     thread_id: str,
     deadline: float,
 ) -> ProjectedThreadEvent:
-    if type(row["seq"]) is not int or row["event_type"] is None:
+    seq = _require_nonneg_seq(row["seq"])
+    ev_type, bad_ev_type = sanitize_enum_str(row["event_type"], STREAM_EVENT_TYPES)
+    if bad_ev_type:
         raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
-    ev_type = row["event_type"]
-    orig_bytes = row[_COL_ORIGINAL_TEXT_BYTES] if type(row[_COL_ORIGINAL_TEXT_BYTES]) is int else 0
+    raw_orig = row[_COL_ORIGINAL_TEXT_BYTES]
+    orig_bytes = raw_orig if type(raw_orig) is int and raw_orig >= 0 else 0
     decoded, inspected_len, bad_utf8 = decode_bounded_blob(row["text_blob"], orig_bytes)
     suffix_uninspected = orig_bytes > inspected_len
     detail, bad_detail = parse_detail_json(row["detail_blob"], row["detail_bytes"])
@@ -1155,6 +1295,12 @@ def _project_stream_row(
     created_at, bad_cr = safe_finite_float(
         row[_COL_CREATED_AT], row[_COL_CREATED_AT_MALFORMED]
     )
+    msg_id, bad_mid = sanitize_optional_ref(row["message_id"], row["message_id_malformed"])
+    disp_id, bad_disp = sanitize_optional_ref(
+        row["dispatch_msg_id"], row["dispatch_msg_id_malformed"]
+    )
+    file_path, bad_fp = sanitize_optional_ref(row["file_path"], row["file_path_malformed"])
+    clean_raw_badge, bad_badge = sanitize_optional_ref(row["badge"], row["badge_malformed"])
     eff_badge, verified_actor, auth_rank, untrusted, anomaly, anomaly_reason = (
         evaluate_stream_provenance(
             conn,
@@ -1168,34 +1314,36 @@ def _project_stream_row(
             deadline=deadline,
         )
     )
-    malformed = (
-        bad_utf8
-        or bool(row["text_non_text"])
-        or bad_detail
-        or bad_hint
-        or bad_cr
-        or bool(row["message_id_malformed"])
-        or bool(row["dispatch_msg_id_malformed"])
-        or bool(row["file_path_malformed"])
-        or bool(row["badge_malformed"])
+    malformed = any(
+        (
+            bad_utf8,
+            bool(row["text_non_text"]),
+            bad_detail,
+            bad_hint,
+            bad_cr,
+            bad_mid,
+            bad_disp,
+            bad_fp,
+            bad_badge,
+        )
     )
     return ProjectedThreadEvent(
         source=SOURCE_STREAM_EVENT,
         source_rank=1,
-        seq=row["seq"],
+        seq=seq,
         event_type=ev_type,
         sandbox_addr=sandbox_addr,
         incarnation_id=incarnation_id,
         thread_id=thread_id,
         msg_id=None,
-        message_id=row["message_id"],
-        dispatch_msg_id=row["dispatch_msg_id"],
+        message_id=msg_id,
+        dispatch_msg_id=disp_id,
         src_role=None,
         src_actor=None,
         verified_actor=verified_actor,
         trust_class=None,
         msg_kind=None,
-        raw_badge=row["badge"],
+        raw_badge=clean_raw_badge,
         effective_badge=eff_badge,
         authority_rank=auth_rank,
         untrusted_content=untrusted,
@@ -1206,7 +1354,7 @@ def _project_stream_row(
         text_suffix_uninspected=suffix_uninspected,
         original_text_bytes=orig_bytes,
         has_control_or_bidi=(bad_utf8 or has_multiline_control_or_bidi(decoded)),
-        file_path=row["file_path"],
+        file_path=file_path,
         in_reply_to=None,
         edge_id=None,
         edge_turn_seq=None,
@@ -1224,9 +1372,8 @@ def _merge_sorted_events(
     tagged: list[tuple[int, int, dict[str, Any]]] = []
     for rank, bucket in ((0, ev_rows), (1, st_rows)):
         for row in bucket:
-            if type(row["seq"]) is not int:
-                raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
-            tagged.append((row["seq"], rank, row))
+            seq = _require_nonneg_seq(row["seq"])
+            tagged.append((seq, rank, row))
     tagged.sort(key=lambda item: (item[0], item[1]))
     return tagged
 
@@ -1310,7 +1457,7 @@ def _select_mailbox_rows(
           ON t_cur.edge_id = o.edge_id AND r.edge_id IS NOT NULL AND t_cur.grant_generation = r.grant_generation
         LEFT JOIN sandboxes src_sb
           ON src_sb.sandbox_addr = CASE
-              WHEN typeof(e.src_actor) = 'text' AND e.src_actor LIKE 'orchestrator:%'
+              WHEN typeof(e.src_actor) = 'text' AND SUBSTR(e.src_actor, 1, 13) = 'orchestrator:'
                    THEN SUBSTR(e.src_actor, 14)
               ELSE e.src_actor END
         WHERE {where_sql}
@@ -1321,21 +1468,33 @@ def _select_mailbox_rows(
     return execute_bounded(conn, sql, tuple(params), deadline).fetchall()
 
 
-def _row_to_mailbox_entry(row: Mapping[str, Any]) -> ProjectedMailboxEntry:
-    if (
-        bool(row["seq_malformed"])
-        or type(row["seq"]) is not int
-        or row["seq"] < 0
-        or row["msg_id"] is None
-        or row["edge_id"] is None
-        or row["dst_incarnation"] is None
-        or row["thread_id"] is None
-    ):
+def _extract_mailbox_primary_keys(row: Mapping[str, Any]) -> tuple[int, str, str, str, str]:
+    if bool(row["seq_malformed"]):
         raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
+    seq = _require_nonneg_seq(row["seq"])
+    msg_id = require_clean_primary_id(row["msg_id"])
+    edge_id = require_clean_primary_id(row["edge_id"])
+    dst_inc = require_clean_primary_id(row["dst_incarnation"])
+    thread_id = require_clean_primary_id(row["thread_id"])
     try:
-        validate_opaque_token(row["msg_id"], "msg_id")
+        validate_opaque_token(msg_id, "msg_id")
     except (AddressError, CoordValidationError) as exc:
         raise CoordPolicyError(ERR_REGISTRY_UNREADABLE) from exc
+    return seq, msg_id, edge_id, dst_inc, thread_id
+
+
+def _row_to_mailbox_entry(row: Mapping[str, Any]) -> ProjectedMailboxEntry:
+    seq, msg_id, edge_id, dst_inc, thread_id = _extract_mailbox_primary_keys(row)
+    src_actor, bad_sa = sanitize_optional_ref(row["src_actor"])
+    src_role, bad_sr = sanitize_optional_ref(row["src_role"])
+    src_inc, bad_si = sanitize_optional_ref(row["src_incarnation"], row["src_inc_malformed"])
+    src_sb_status, bad_sbs = sanitize_optional_ref(row["src_sandbox_status"])
+    src_cur_inc, bad_sci = sanitize_optional_ref(row["src_current_incarnation"])
+    trust_class, bad_tc = sanitize_optional_ref(row["trust_class"])
+    msg_kind, bad_mk = sanitize_optional_ref(row["msg_kind"])
+    stream_id, bad_sid = sanitize_optional_ref(row["stream_id"], row["stream_id_malformed"])
+    status_val, bad_status = sanitize_enum_str(row["status"], _VALID_OUTBOX_STATUSES)
+
     grant_gen, bad_gen = safe_int(
         row["grant_generation"], row["grant_gen_malformed"], default=1
     )
@@ -1348,40 +1507,46 @@ def _row_to_mailbox_entry(row: Mapping[str, Any]) -> ProjectedMailboxEntry:
     updated_at, bad_upd = safe_finite_float(
         row[_COL_UPDATED_AT], row[_COL_UPDATED_AT_MALFORMED]
     )
-    grant_active: bool | None = (
-        None if row["grant_active"] is None else (row["grant_active"] == 1)
-    )
-    malformed = (
-        bad_gen
-        or bad_pri
-        or bad_bb
-        or bad_att
-        or bad_det
-        or bad_upd
-        or bool(row["src_inc_malformed"])
-        or bool(row["stream_id_malformed"])
-        or bool(row["grant_active_malformed"])
-        or (row["status"] is None)
+    grant_active = None if row["grant_active"] is None else (row["grant_active"] == 1)
+    malformed = any(
+        (
+            bad_gen,
+            bad_pri,
+            bad_bb,
+            bad_att,
+            bad_det,
+            bad_upd,
+            bad_sa,
+            bad_sr,
+            bad_si,
+            bad_sbs,
+            bad_sci,
+            bad_tc,
+            bad_mk,
+            bad_sid,
+            bad_status,
+            bool(row["grant_active_malformed"]),
+        )
     )
     return ProjectedMailboxEntry(
-        seq=row["seq"],
-        msg_id=row["msg_id"],
-        edge_id=row["edge_id"],
+        seq=seq,
+        msg_id=msg_id,
+        edge_id=edge_id,
         grant_generation=grant_gen,
-        src_actor=row["src_actor"],
-        src_role=row["src_role"],
-        src_incarnation=row["src_incarnation"],
-        src_sandbox_status=row["src_sandbox_status"],
-        src_current_incarnation=row["src_current_incarnation"],
-        dst_incarnation=row["dst_incarnation"],
-        thread_id=row["thread_id"],
-        trust_class=row["trust_class"],
-        msg_kind=row["msg_kind"],
+        src_actor=src_actor,
+        src_role=src_role,
+        src_incarnation=src_inc,
+        src_sandbox_status=src_sb_status,
+        src_current_incarnation=src_cur_inc,
+        dst_incarnation=dst_inc,
+        thread_id=thread_id,
+        trust_class=trust_class,
+        msg_kind=msg_kind,
         priority=priority,
-        status=row["status"] if row["status"] is not None else "unknown",
+        status=status_val,
         body_bytes=body_bytes,
         attempts=attempts,
-        stream_id=row["stream_id"],
+        stream_id=stream_id,
         detail=detail,
         detail_truncated=detail_trunc,
         grant_active=grant_active,
@@ -1389,6 +1554,15 @@ def _row_to_mailbox_entry(row: Mapping[str, Any]) -> ProjectedMailboxEntry:
         updated_at=updated_at,
         malformed_metadata=malformed,
     )
+
+
+def _validate_sandbox_incarnation(sb_row: Mapping[str, Any]) -> str:
+    inc = require_clean_primary_id(sb_row[_COL_INCARNATION_ID])
+    try:
+        validate_opaque_token(inc, _COL_INCARNATION_ID)
+    except (AddressError, CoordValidationError) as exc:
+        raise CoordPolicyError(ERR_REGISTRY_UNREADABLE) from exc
+    return inc
 
 
 class ReadOnlyProjectionService:
@@ -1475,7 +1649,9 @@ class ReadOnlyProjectionService:
             MIN_RESPONSE_BYTES,
             MAX_RESPONSE_BYTES,
         )
-        read_ms = _validate_int_range(max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS)
+        read_ms = _validate_int_range(
+            max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS
+        )
         scope_hash = compute_scope_hash(
             OP_TREE,
             include_revoked=inc_rev,
@@ -1497,11 +1673,8 @@ class ReadOnlyProjectionService:
                 limit=sb_limit + 1,
                 deadline=deadline,
             )
-            snapshot = self._pack_workspace_tree(
-                conn,
+            ctx = _TreePackCtx(
                 snapshot_seq=snapshot_seq,
-                raw_health=raw_health,
-                sb_rows=sb_rows,
                 sb_limit=sb_limit,
                 include_historical=inc_hist,
                 max_threads=th_limit,
@@ -1510,24 +1683,61 @@ class ReadOnlyProjectionService:
                 session_echo=session_echo,
                 deadline=deadline,
             )
+            snapshot = self._pack_workspace_tree(conn, raw_health, sb_rows, ctx)
+            check_deadline_ms(deadline)
 
         self._postflight(principal, session_echo)
         return snapshot
 
+    def _fit_first_tree_sandbox(
+        self,
+        node: ProjectedSandboxNode,
+        group_key: tuple[str, str],
+        health: WorkspaceHealth,
+        make_tree: Callable[
+            [WorkspaceHealth, tuple[ProjectedProjectGroup, ...], bool, str | None],
+            WorkspaceTreeSnapshot,
+        ],
+        more_after: bool,
+        cursor_after: str | None,
+        ctx: _TreePackCtx,
+    ) -> WorkspaceTreeSnapshot:
+        shrunk = _shrink_first_sandbox_threads(
+            node,
+            group_key,
+            partial(make_tree, health, more=more_after, cursor=cursor_after),
+            ctx.max_bytes,
+            ctx.deadline,
+        )
+        cur_health = health
+        if shrunk is None and cur_health.unconfirmed_bindings:
+            cur_health = replace(
+                cur_health,
+                unconfirmed_bindings=_EMPTY_BINDINGS,
+                unconfirmed_bindings_truncated=True,
+            )
+            shrunk = _shrink_first_sandbox_threads(
+                node,
+                group_key,
+                partial(make_tree, cur_health, more=more_after, cursor=cursor_after),
+                ctx.max_bytes,
+                ctx.deadline,
+            )
+        if shrunk is None:
+            raise CoordValidationError(_ERR_BUDGET_ITEM)
+        return make_tree(
+            cur_health,
+            _group_sandboxes_by_project([(shrunk, group_key)]),
+            more_after,
+            cursor_after,
+        )
+
     def _pack_workspace_tree(
         self,
         conn: sqlite3.Connection,
-        *,
-        snapshot_seq: int,
         raw_health: WorkspaceHealth,
         sb_rows: list[dict[str, Any]],
-        sb_limit: int,
-        include_historical: bool,
-        max_threads: int,
-        scope_hash: str,
-        max_bytes: int,
-        session_echo: ReadSessionEcho | None,
-        deadline: float,
+        ctx: _TreePackCtx,
     ) -> WorkspaceTreeSnapshot:
         def _make_tree(
             cur_health: WorkspaceHealth,
@@ -1537,36 +1747,39 @@ class ReadOnlyProjectionService:
         ) -> WorkspaceTreeSnapshot:
             return WorkspaceTreeSnapshot(
                 schema_version=PROJECTION_SCHEMA_VERSION,
-                snapshot_seq=snapshot_seq,
+                snapshot_seq=ctx.snapshot_seq,
                 health=cur_health,
                 projects=groups,
                 has_more=more,
                 next_cursor=cursor,
-                read_session=session_echo,
+                read_session=ctx.session_echo,
             )
 
         health = _fit_health_in_budget(
-            raw_health, lambda h: _make_tree(h, (), False, None), max_bytes
+            raw_health,
+            lambda h: _make_tree(h, _EMPTY_PROJECTS, False, None),
+            ctx.max_bytes,
+            ctx.deadline,
         )
         if health is None:
             raise CoordValidationError(_ERR_BUDGET_ENVELOPE)
 
         total_rows = len(sb_rows)
         admitted: list[tuple[ProjectedSandboxNode, tuple[str, str]]] = []
-        last_page = _make_tree(health, (), False, None)
+        last_page = _make_tree(health, _EMPTY_PROJECTS, False, None)
 
-        for idx, row in enumerate(sb_rows[:sb_limit]):
-            check_deadline_ms(deadline)
+        for idx, row in enumerate(sb_rows[: ctx.sb_limit]):
+            check_deadline_ms(ctx.deadline)
             node, group_key, _ = _build_sandbox_node(
                 conn,
                 row,
-                include_historical=include_historical,
-                max_threads=max_threads,
-                deadline=deadline,
+                include_historical=ctx.include_historical,
+                max_threads=ctx.max_threads,
+                deadline=ctx.deadline,
             )
             more_after = (idx + 1) < total_rows
             cursor_after = (
-                encode_tree_cursor(scope_hash=scope_hash, sandbox_addr=node.sandbox_addr)
+                encode_tree_cursor(scope_hash=ctx.scope_hash, sandbox_addr=node.sandbox_addr)
                 if more_after
                 else None
             )
@@ -1576,48 +1789,22 @@ class ReadOnlyProjectionService:
                 more_after,
                 cursor_after,
             )
-            if len(serialize_projection_bytes(candidate)) <= max_bytes:
+            if len(serialize_projection_bytes(candidate)) <= ctx.max_bytes:
                 admitted.append((node, group_key))
                 last_page = candidate
                 continue
 
             if not admitted:
-                shrunk = _shrink_first_sandbox_threads(
-                    node,
-                    group_key,
-                    partial(_make_tree, health, more=more_after, cursor=cursor_after),
-                    max_bytes,
+                return self._fit_first_tree_sandbox(
+                    node, group_key, health, _make_tree, more_after, cursor_after, ctx
                 )
-                if shrunk is None and health.unconfirmed_bindings:
-                    health = replace(
-                        health,
-                        unconfirmed_bindings=(),
-                        unconfirmed_bindings_truncated=True,
-                    )
-                    shrunk = _shrink_first_sandbox_threads(
-                        node,
-                        group_key,
-                        partial(_make_tree, health, more=more_after, cursor=cursor_after),
-                        max_bytes,
-                    )
-                if shrunk is None:
-                    raise CoordValidationError(_ERR_BUDGET_ITEM)
-                admitted.append((shrunk, group_key))
-                last_page = _make_tree(
-                    health,
-                    _group_sandboxes_by_project([(shrunk, group_key)]),
-                    more_after,
-                    cursor_after,
-                )
-                if total_rows > 1:
-                    break
-                return last_page
 
-            prev_node = admitted[-1][0]
             stop_cursor = encode_tree_cursor(
-                scope_hash=scope_hash, sandbox_addr=prev_node.sandbox_addr
+                scope_hash=ctx.scope_hash, sandbox_addr=admitted[-1][0].sandbox_addr
             )
-            return replace(last_page, has_more=True, next_cursor=stop_cursor)
+            return _make_tree(
+                last_page.health, last_page.projects, True, stop_cursor
+            )
 
         return last_page
 
@@ -1643,7 +1830,9 @@ class ReadOnlyProjectionService:
             MIN_RESPONSE_BYTES,
             MAX_RESPONSE_BYTES,
         )
-        read_ms = _validate_int_range(max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS)
+        read_ms = _validate_int_range(
+            max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS
+        )
         principal, session_echo, db_path, marker = self._preflight(
             caller, read_session_id, session_generation
         )
@@ -1666,35 +1855,28 @@ class ReadOnlyProjectionService:
             budget, budget_malformed = _select_budget_safe(
                 conn, addr, node.incarnation_id, deadline
             )
-            snapshot = self._pack_sandbox_status(
+            ctx = _StatusPackCtx(
                 snapshot_seq=snapshot_seq,
-                raw_health=raw_health,
-                node=node,
-                edges=edges,
-                edges_trunc=edges_trunc,
                 binding=binding,
                 budget=budget,
                 budget_malformed=budget_malformed,
                 max_bytes=max_bytes,
                 session_echo=session_echo,
+                deadline=deadline,
             )
+            snapshot = self._pack_sandbox_status(raw_health, node, edges, edges_trunc, ctx)
+            check_deadline_ms(deadline)
 
         self._postflight(principal, session_echo)
         return snapshot
 
     def _pack_sandbox_status(
         self,
-        *,
-        snapshot_seq: int,
         raw_health: WorkspaceHealth,
         node: ProjectedSandboxNode,
         edges: tuple[ProjectedRoutingEdge, ...],
         edges_trunc: bool,
-        binding: UnconfirmedBindingSummary | None,
-        budget: ProjectedSubtreeBudget | None,
-        budget_malformed: bool,
-        max_bytes: int,
-        session_echo: ReadSessionEcho | None,
+        ctx: _StatusPackCtx,
     ) -> SandboxStatusSnapshot:
         def _make(
             cur_edges: tuple[ProjectedRoutingEdge, ...],
@@ -1704,19 +1886,20 @@ class ReadOnlyProjectionService:
         ) -> SandboxStatusSnapshot:
             return SandboxStatusSnapshot(
                 schema_version=PROJECTION_SCHEMA_VERSION,
-                snapshot_seq=snapshot_seq,
+                snapshot_seq=ctx.snapshot_seq,
                 health=cur_health,
                 sandbox=cur_node,
                 edges=cur_edges,
                 edges_truncated=cur_edges_trunc,
-                binding=binding,
-                budget=budget,
-                budget_malformed=budget_malformed,
-                read_session=session_echo,
+                binding=ctx.binding,
+                budget=ctx.budget,
+                budget_malformed=ctx.budget_malformed,
+                read_session=ctx.session_echo,
             )
 
+        check_deadline_ms(ctx.deadline)
         full = _make(edges, edges_trunc, raw_health, node)
-        if len(serialize_projection_bytes(full)) <= max_bytes:
+        if len(serialize_projection_bytes(full)) <= ctx.max_bytes:
             return full
 
         best_edges = _binary_search_prefix(
@@ -1724,21 +1907,25 @@ class ReadOnlyProjectionService:
             lambda mid: _make(
                 edges[:mid], edges_trunc or (mid < len(edges)), raw_health, node
             ),
-            max_bytes,
+            ctx.max_bytes,
+            ctx.deadline,
         )
         if best_edges is not None:
             return best_edges
 
         zero_edges_trunc = edges_trunc or bool(edges)
         fitted_health = _fit_health_in_budget(
-            raw_health, lambda h: _make((), zero_edges_trunc, h, node), max_bytes
+            raw_health,
+            lambda h: _make(_EMPTY_EDGES, zero_edges_trunc, h, node),
+            ctx.max_bytes,
+            ctx.deadline,
         )
         if fitted_health is not None:
-            return _make((), zero_edges_trunc, fitted_health, node)
+            return _make(_EMPTY_EDGES, zero_edges_trunc, fitted_health, node)
 
         min_health = replace(
             raw_health,
-            unconfirmed_bindings=(),
+            unconfirmed_bindings=_EMPTY_BINDINGS,
             unconfirmed_bindings_truncated=(
                 raw_health.unconfirmed_bindings_truncated
                 or bool(raw_health.unconfirmed_bindings)
@@ -1747,7 +1934,7 @@ class ReadOnlyProjectionService:
         best_th = _binary_search_prefix(
             len(node.threads),
             lambda mid_t: _make(
-                (),
+                _EMPTY_EDGES,
                 zero_edges_trunc,
                 min_health,
                 replace(
@@ -1756,7 +1943,8 @@ class ReadOnlyProjectionService:
                     threads_truncated=(node.threads_truncated or mid_t < len(node.threads)),
                 ),
             ),
-            max_bytes,
+            ctx.max_bytes,
+            ctx.deadline,
         )
         if best_th is None:
             raise CoordValidationError(_ERR_BUDGET_ENVELOPE)
@@ -1795,7 +1983,9 @@ class ReadOnlyProjectionService:
             MIN_RESPONSE_BYTES,
             MAX_RESPONSE_BYTES,
         )
-        read_ms = _validate_int_range(max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS)
+        read_ms = _validate_int_range(
+            max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS
+        )
         principal, session_echo, db_path, marker = self._preflight(
             caller, read_session_id, session_generation
         )
@@ -1807,16 +1997,9 @@ class ReadOnlyProjectionService:
             sb_row = _select_single_sandbox(conn, addr, deadline)
             if sb_row is None:
                 raise CoordPolicyError(_ERR_SANDBOX_NOT_FOUND)
-            if sb_row[_COL_INCARNATION_ID] is None:
-                raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
-            current_inc = sb_row[_COL_INCARNATION_ID]
-            try:
-                validate_opaque_token(current_inc, _COL_INCARNATION_ID)
-            except (AddressError, CoordValidationError) as exc:
-                raise CoordPolicyError(ERR_REGISTRY_UNREADABLE) from exc
+            current_inc = _validate_sandbox_incarnation(sb_row)
             target_inc = explicit_inc if explicit_inc is not None else current_inc
             is_current = target_inc == current_inc
-            stale_reason = None if is_current else "superseded_incarnation"
 
             scope_hash = compute_scope_hash(
                 OP_EVENTS,
@@ -1853,45 +2036,53 @@ class ReadOnlyProjectionService:
                 limit=page_limit + 1,
                 deadline=deadline,
             )
-            page = self._pack_thread_events(
-                conn,
+            ctx = _EventsPackCtx(
                 snapshot_seq=snapshot_seq,
                 health=health_summary,
                 sandbox_addr=addr,
                 target_inc=target_inc,
                 is_current=is_current,
-                stale_reason=stale_reason,
+                stale_reason=None if is_current else "superseded_incarnation",
                 thread_id=clean_thread,
                 thread_exists=(th_row is not None),
-                merged=_merge_sorted_events(ev_rows, st_rows),
                 page_limit=page_limit,
                 scope_hash=scope_hash,
                 max_bytes=max_bytes,
                 session_echo=session_echo,
                 deadline=deadline,
             )
+            page = self._pack_thread_events(
+                conn, _merge_sorted_events(ev_rows, st_rows), ctx
+            )
+            check_deadline_ms(deadline)
 
         self._postflight(principal, session_echo)
         return page
 
+    def _project_merged_event(
+        self, conn: sqlite3.Connection, rank: int, row: Mapping[str, Any], ctx: _EventsPackCtx
+    ) -> ProjectedThreadEvent:
+        if rank == 0:
+            return _project_event_log_row(
+                row,
+                sandbox_addr=ctx.sandbox_addr,
+                incarnation_id=ctx.target_inc,
+                thread_id=ctx.thread_id,
+            )
+        return _project_stream_row(
+            conn,
+            row,
+            sandbox_addr=ctx.sandbox_addr,
+            incarnation_id=ctx.target_inc,
+            thread_id=ctx.thread_id,
+            deadline=ctx.deadline,
+        )
+
     def _pack_thread_events(
         self,
         conn: sqlite3.Connection,
-        *,
-        snapshot_seq: int,
-        health: WorkspaceHealthSummary,
-        sandbox_addr: str,
-        target_inc: str,
-        is_current: bool,
-        stale_reason: str | None,
-        thread_id: str,
-        thread_exists: bool,
         merged: list[tuple[int, int, dict[str, Any]]],
-        page_limit: int,
-        scope_hash: str,
-        max_bytes: int,
-        session_echo: ReadSessionEcho | None,
-        deadline: float,
+        ctx: _EventsPackCtx,
     ) -> ThreadEventsPage:
         def _make_page(
             events: tuple[ProjectedThreadEvent, ...],
@@ -1900,18 +2091,18 @@ class ReadOnlyProjectionService:
         ) -> ThreadEventsPage:
             return ThreadEventsPage(
                 schema_version=PROJECTION_SCHEMA_VERSION,
-                snapshot_seq=snapshot_seq,
-                health=health,
-                sandbox_addr=sandbox_addr,
-                applied_incarnation_id=target_inc,
-                is_current_incarnation=is_current,
-                stale_reason=stale_reason,
-                thread_id=thread_id,
-                thread_exists=thread_exists,
+                snapshot_seq=ctx.snapshot_seq,
+                health=ctx.health,
+                sandbox_addr=ctx.sandbox_addr,
+                applied_incarnation_id=ctx.target_inc,
+                is_current_incarnation=ctx.is_current,
+                stale_reason=ctx.stale_reason,
+                thread_id=ctx.thread_id,
+                thread_exists=ctx.thread_exists,
                 events=events,
                 has_more=has_more,
                 next_cursor=next_cursor,
-                read_session=session_echo,
+                read_session=ctx.session_echo,
             )
 
         def _make_single(
@@ -1919,46 +2110,30 @@ class ReadOnlyProjectionService:
         ) -> ThreadEventsPage:
             return _make_page((item,), more, cursor)
 
-        empty = _make_page((), False, None)
-        if len(serialize_projection_bytes(empty)) > max_bytes:
+        empty = _make_page(_EMPTY_EVENTS, False, None)
+        if len(serialize_projection_bytes(empty)) > ctx.max_bytes:
             raise CoordValidationError(_ERR_BUDGET_ENVELOPE)
 
         total = len(merged)
         admitted: list[ProjectedThreadEvent] = []
         last_page = empty
 
-        for idx, (_seq, rank, row) in enumerate(merged[:page_limit]):
-            check_deadline_ms(deadline)
-            projected = (
-                _project_event_log_row(
-                    row,
-                    sandbox_addr=sandbox_addr,
-                    incarnation_id=target_inc,
-                    thread_id=thread_id,
-                )
-                if rank == 0
-                else _project_stream_row(
-                    conn,
-                    row,
-                    sandbox_addr=sandbox_addr,
-                    incarnation_id=target_inc,
-                    thread_id=thread_id,
-                    deadline=deadline,
-                )
-            )
+        for idx, (_seq, rank, row) in enumerate(merged[: ctx.page_limit]):
+            check_deadline_ms(ctx.deadline)
+            projected = self._project_merged_event(conn, rank, row, ctx)
             more_after = (idx + 1) < total
             cursor_after = (
                 encode_events_cursor(
-                    scope_hash=scope_hash,
+                    scope_hash=ctx.scope_hash,
                     seq=projected.seq,
                     rank=projected.source_rank,
-                    incarnation_id=target_inc,
+                    incarnation_id=ctx.target_inc,
                 )
                 if more_after
                 else None
             )
-            candidate = _make_page(tuple([*admitted, projected]), more_after, cursor_after)
-            if len(serialize_projection_bytes(candidate)) <= max_bytes:
+            candidate = _make_page((*admitted, projected), more_after, cursor_after)
+            if len(serialize_projection_bytes(candidate)) <= ctx.max_bytes:
                 admitted.append(projected)
                 last_page = candidate
                 continue
@@ -1969,24 +2144,21 @@ class ReadOnlyProjectionService:
                     "text",
                     "text_truncated",
                     partial(_make_single, more_after, cursor_after),
-                    max_bytes,
+                    ctx.max_bytes,
+                    ctx.deadline,
                 )
                 if shrunk is None:
                     raise CoordValidationError(_ERR_BUDGET_ITEM)
-                admitted.append(shrunk)
-                last_page = _make_page((shrunk,), more_after, cursor_after)
-                if total > 1:
-                    break
-                return last_page
+                return _make_page((shrunk,), more_after, cursor_after)
 
             prev = admitted[-1]
             stop_cursor = encode_events_cursor(
-                scope_hash=scope_hash,
+                scope_hash=ctx.scope_hash,
                 seq=prev.seq,
                 rank=prev.source_rank,
-                incarnation_id=target_inc,
+                incarnation_id=ctx.target_inc,
             )
-            return replace(last_page, has_more=True, next_cursor=stop_cursor)
+            return _make_page(last_page.events, True, stop_cursor)
 
         return last_page
 
@@ -2017,7 +2189,9 @@ class ReadOnlyProjectionService:
             MIN_RESPONSE_BYTES,
             MAX_RESPONSE_BYTES,
         )
-        read_ms = _validate_int_range(max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS)
+        read_ms = _validate_int_range(
+            max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS
+        )
         scope_hash = compute_scope_hash(
             OP_MAILBOX, target=addr, statuses=clean_statuses
         )
@@ -2035,8 +2209,7 @@ class ReadOnlyProjectionService:
             sb_row = _select_single_sandbox(conn, addr, deadline)
             if sb_row is None:
                 raise CoordPolicyError(_ERR_SANDBOX_NOT_FOUND)
-            if sb_row[_COL_INCARNATION_ID] is None:
-                raise CoordPolicyError(ERR_REGISTRY_UNREADABLE)
+            current_inc = _validate_sandbox_incarnation(sb_row)
             rows = _select_mailbox_rows(
                 conn,
                 sandbox_addr=addr,
@@ -2045,35 +2218,25 @@ class ReadOnlyProjectionService:
                 limit=page_limit + 1,
                 deadline=deadline,
             )
-            page = self._pack_mailbox_page(
+            ctx = _MailboxPackCtx(
                 snapshot_seq=snapshot_seq,
                 health=health_summary,
                 sandbox_addr=addr,
-                current_inc=sb_row[_COL_INCARNATION_ID],
-                rows=rows,
+                current_inc=current_inc,
                 page_limit=page_limit,
                 scope_hash=scope_hash,
                 max_bytes=max_bytes,
                 session_echo=session_echo,
                 deadline=deadline,
             )
+            page = self._pack_mailbox_page(rows, ctx)
+            check_deadline_ms(deadline)
 
         self._postflight(principal, session_echo)
         return page
 
     def _pack_mailbox_page(
-        self,
-        *,
-        snapshot_seq: int,
-        health: WorkspaceHealthSummary,
-        sandbox_addr: str,
-        current_inc: str,
-        rows: list[dict[str, Any]],
-        page_limit: int,
-        scope_hash: str,
-        max_bytes: int,
-        session_echo: ReadSessionEcho | None,
-        deadline: float,
+        self, rows: list[dict[str, Any]], ctx: _MailboxPackCtx
     ) -> MailboxPage:
         def _make_page(
             entries: tuple[ProjectedMailboxEntry, ...],
@@ -2082,14 +2245,14 @@ class ReadOnlyProjectionService:
         ) -> MailboxPage:
             return MailboxPage(
                 schema_version=PROJECTION_SCHEMA_VERSION,
-                snapshot_seq=snapshot_seq,
-                health=health,
-                sandbox_addr=sandbox_addr,
-                current_incarnation_id=current_inc,
+                snapshot_seq=ctx.snapshot_seq,
+                health=ctx.health,
+                sandbox_addr=ctx.sandbox_addr,
+                current_incarnation_id=ctx.current_inc,
                 entries=entries,
                 has_more=has_more,
                 next_cursor=next_cursor,
-                read_session=session_echo,
+                read_session=ctx.session_echo,
             )
 
         def _make_single(
@@ -2097,27 +2260,27 @@ class ReadOnlyProjectionService:
         ) -> MailboxPage:
             return _make_page((item,), more, cursor)
 
-        empty = _make_page((), False, None)
-        if len(serialize_projection_bytes(empty)) > max_bytes:
+        empty = _make_page(_EMPTY_ENTRIES, False, None)
+        if len(serialize_projection_bytes(empty)) > ctx.max_bytes:
             raise CoordValidationError(_ERR_BUDGET_ENVELOPE)
 
         total = len(rows)
         admitted: list[ProjectedMailboxEntry] = []
         last_page = empty
 
-        for idx, row in enumerate(rows[:page_limit]):
-            check_deadline_ms(deadline)
+        for idx, row in enumerate(rows[: ctx.page_limit]):
+            check_deadline_ms(ctx.deadline)
             entry = _row_to_mailbox_entry(row)
             more_after = (idx + 1) < total
             cursor_after = (
                 encode_mailbox_cursor(
-                    scope_hash=scope_hash, seq=entry.seq, msg_id=entry.msg_id
+                    scope_hash=ctx.scope_hash, seq=entry.seq, msg_id=entry.msg_id
                 )
                 if more_after
                 else None
             )
-            candidate = _make_page(tuple([*admitted, entry]), more_after, cursor_after)
-            if len(serialize_projection_bytes(candidate)) <= max_bytes:
+            candidate = _make_page((*admitted, entry), more_after, cursor_after)
+            if len(serialize_projection_bytes(candidate)) <= ctx.max_bytes:
                 admitted.append(entry)
                 last_page = candidate
                 continue
@@ -2128,20 +2291,17 @@ class ReadOnlyProjectionService:
                     "detail",
                     "detail_truncated",
                     partial(_make_single, more_after, cursor_after),
-                    max_bytes,
+                    ctx.max_bytes,
+                    ctx.deadline,
                 )
                 if shrunk is None:
                     raise CoordValidationError(_ERR_BUDGET_ITEM)
-                admitted.append(shrunk)
-                last_page = _make_page((shrunk,), more_after, cursor_after)
-                if total > 1:
-                    break
-                return last_page
+                return _make_page((shrunk,), more_after, cursor_after)
 
             prev = admitted[-1]
             stop_cursor = encode_mailbox_cursor(
-                scope_hash=scope_hash, seq=prev.seq, msg_id=prev.msg_id
+                scope_hash=ctx.scope_hash, seq=prev.seq, msg_id=prev.msg_id
             )
-            return replace(last_page, has_more=True, next_cursor=stop_cursor)
+            return _make_page(last_page.entries, True, stop_cursor)
 
         return last_page

@@ -22,9 +22,14 @@ for _import_dir in (str(_PROJECTION_DIR), str(_SPIKE_M_DIR), str(_SPIKE_L_DIR)):
     if _import_dir not in sys.path:
         sys.path.insert(0, _import_dir)
 
-from oc_address import AddressError, _BIDI_CODEPOINTS  # noqa: E402
+from oc_address import (  # noqa: E402
+    _BIDI_CODEPOINTS,
+    check_no_control_or_bidi,
+    has_forbidden_control_or_bidi,
+)
 from oc_coord_contract import (  # noqa: E402
     ArtifactRef,
+    CoordPolicyError,
     CoordValidationError,
     ProvenanceBadge,
     SubtreeBudget,
@@ -232,7 +237,7 @@ def _parse_json_cell(raw_blob: Any, raw_bytes: Any) -> tuple[Any, bool]:
         parsed = json.loads(
             bytes(raw_blob).decode("utf-8"), parse_constant=_reject_json_constant
         )
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, RecursionError):
         return None, True
     if not _check_json_depth(parsed):
         return None, True
@@ -266,6 +271,38 @@ def _sanitize_json_list(items: list[Any], depth: int) -> tuple[list[Any], bool]:
     return out, malformed or (len(items) > 64)
 
 
+def require_clean_primary_id(value: Any) -> str:
+    """Require a non-empty TEXT identifier free of control, surrogate, and bidi chars."""
+    if not isinstance(value, str) or not value or has_forbidden_control_or_bidi(value):
+        raise CoordPolicyError("registry_unreadable")
+    return value
+
+
+def sanitize_optional_ref(
+    value: Any, malformed_flag: Any = False
+) -> tuple[str | None, bool]:
+    """Validate an optional identifier/reference, mapping hostile chars to None + malformed."""
+    if value is None:
+        return None, bool(malformed_flag)
+    if not isinstance(value, str) or not value or has_forbidden_control_or_bidi(value):
+        return None, True
+    return value, bool(malformed_flag)
+
+
+def sanitize_enum_str(
+    value: Any,
+    allowed: frozenset[str] | None = None,
+    *,
+    fallback: str = "unknown",
+) -> tuple[str, bool]:
+    """Validate a status/enum token, clamping hostile or out-of-domain values cleanly."""
+    if not isinstance(value, str) or not value or has_forbidden_control_or_bidi(value):
+        return fallback, True
+    if allowed is not None and value not in allowed:
+        return fallback, True
+    return value, False
+
+
 def _sanitize_json_dict(
     mapping: Mapping[Any, Any], depth: int
 ) -> tuple[dict[str, Any], bool]:
@@ -277,6 +314,7 @@ def _sanitize_json_dict(
             malformed = True
             continue
         clean_key, _ = scrub_single_line_str(key, max_bytes=64)
+        clean_key = clean_key.strip()
         if not clean_key or clean_key.lower() in _UNTRUSTED_DETAIL_KEYS_LOWER:
             continue
         if count >= 64:
@@ -338,23 +376,30 @@ def parse_artifact_refs_json(
                     media_type=validated.media_type,
                 )
             )
-        except (AddressError, CoordValidationError, TypeError, ValueError):
+        except (CoordValidationError, TypeError, ValueError):
             malformed = True
     return tuple(refs), malformed or (len(parsed) > 32)
 
 
-def _parse_optional_str_frozenset(raw: Any) -> frozenset[str] | None:
+def _validate_budget_str(value: Any, label: str) -> str:
+    clean = check_no_control_or_bidi(value, label)
+    if not clean or len(clean.encode("utf-8")) > MAX_METADATA_TEXT_BYTES:
+        raise ValueError(f"Invalid budget {label}")
+    return clean
+
+
+def _parse_optional_str_frozenset(raw: Any, label: str) -> frozenset[str] | None:
     if raw is None:
         return None
-    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
-        raise ValueError("Expected list of strings or None")
-    return frozenset(raw)
+    if not isinstance(raw, list) or len(raw) > 64:
+        raise ValueError("Expected bounded list of strings or None")
+    return frozenset(_validate_budget_str(x, label) for x in raw)
 
 
-def _parse_required_str_frozenset(raw: Any) -> frozenset[str]:
-    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
-        raise ValueError("Expected list of strings")
-    return frozenset(raw)
+def _parse_required_str_frozenset(raw: Any, label: str) -> frozenset[str]:
+    if not isinstance(raw, list) or len(raw) > 64:
+        raise ValueError("Expected bounded list of strings")
+    return frozenset(_validate_budget_str(x, label) for x in raw)
 
 
 def parse_budget_json(
@@ -368,18 +413,24 @@ def parse_budget_json(
             max_depth_remaining=parsed["max_depth_remaining"],
             max_children=parsed["max_children"],
             max_total_sandboxes=parsed["max_total_sandboxes"],
-            allowed_workers=_parse_required_str_frozenset(parsed["allowed_workers"]),
-            allowed_sandbox_types=_parse_required_str_frozenset(
-                parsed["allowed_sandbox_types"]
+            allowed_workers=_parse_required_str_frozenset(
+                parsed["allowed_workers"], "allowed_workers"
             ),
-            allowed_models=_parse_optional_str_frozenset(parsed.get("allowed_models")),
+            allowed_sandbox_types=_parse_required_str_frozenset(
+                parsed["allowed_sandbox_types"], "allowed_sandbox_types"
+            ),
+            allowed_models=_parse_optional_str_frozenset(
+                parsed.get("allowed_models"), "allowed_models"
+            ),
             allowed_variants=_parse_optional_str_frozenset(
-                parsed.get("allowed_variants")
+                parsed.get("allowed_variants"), "allowed_variants"
             ),
             allowed_broker_routes=_parse_required_str_frozenset(
-                parsed["allowed_broker_routes"]
+                parsed["allowed_broker_routes"], "allowed_broker_routes"
             ),
-            max_security_profile=parsed["max_security_profile"],
+            max_security_profile=_validate_budget_str(
+                parsed["max_security_profile"], "max_security_profile"
+            ),
         )
     except (KeyError, TypeError, ValueError, CoordValidationError):
         return None, True
@@ -413,7 +464,7 @@ def hash_strict_text_blob(blob: Any) -> str | None:
     try:
         text = bytes(blob).decode("utf-8")
         return sha256_canonical_body(text, max_bytes=MAX_HASH_TEXT_BYTES)
-    except (UnicodeDecodeError, CoordValidationError, TypeError, ValueError):
+    except (CoordValidationError, TypeError, ValueError):
         return None
 
 
@@ -465,22 +516,42 @@ def _count_full_tuple_stream_matches(
     return matches, False
 
 
-def _verify_host_stream_provenance(
+def _is_valid_actor_str(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not has_forbidden_control_or_bidi(value)
+    )
+
+
+def _receipt_matches_envelope(
+    rcpt: Mapping[str, Any], ev: Mapping[str, Any]
+) -> bool:
+    rcpt_actor = rcpt[_COL_SRC_ACTOR]
+    ev_actor = ev[_COL_SRC_ACTOR]
+    rcpt_sha = rcpt[_COL_BODY_SHA256]
+    ev_sha = ev[_COL_BODY_SHA256]
+    if not (_is_valid_actor_str(rcpt_actor) and _is_valid_actor_str(ev_actor)):
+        return False
+    if not (isinstance(rcpt_sha, str) and bool(rcpt_sha) and isinstance(ev_sha, str)):
+        return False
+    return (
+        rcpt[_COL_TRUST_CLASS] == ev[_COL_TRUST_CLASS]
+        and rcpt_actor == ev_actor
+        and rcpt_sha == ev_sha
+    )
+
+
+def _fetch_envelope_and_receipt(
     conn: sqlite3.Connection,
-    row: Mapping[str, Any],
     *,
     execute_fn: Callable[[sqlite3.Connection, str, tuple[Any, ...], float], sqlite3.Cursor],
-    check_deadline_fn: Callable[[float], int],
-    raw_badge: str,
     sandbox_addr: str,
     incarnation_id: str,
     thread_id: str,
+    msg_id: str,
     deadline: float,
-) -> tuple[str, str | None, int, bool, bool, str | None]:
-    msg_id = row["message_id"]
-    if not isinstance(msg_id, str) or not msg_id:
-        return _downgrade(ANOMALY_UNBACKED)
-
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     ev = execute_fn(
         conn,
         """
@@ -498,8 +569,7 @@ def _verify_host_stream_provenance(
         deadline,
     ).fetchone()
     if ev is None:
-        return _downgrade(ANOMALY_UNBACKED)
-
+        return None, []
     receipts = execute_fn(
         conn,
         """
@@ -520,28 +590,54 @@ def _verify_host_stream_provenance(
         (sandbox_addr, incarnation_id, thread_id, msg_id),
         deadline,
     ).fetchall()
-    if len(receipts) == 0:
+    return ev, receipts
+
+
+def _receipt_badge_matches(rcpt: Mapping[str, Any], raw_badge: str) -> bool:
+    try:
+        rcpt_tc = TrustClass(rcpt[_COL_TRUST_CLASS])
+    except (ValueError, TypeError):
+        return False
+    return rcpt["badge"] == raw_badge and _TRUST_CLASS_TO_BADGE[rcpt_tc].value == raw_badge
+
+
+def _verify_host_stream_provenance(
+    conn: sqlite3.Connection,
+    row: Mapping[str, Any],
+    *,
+    execute_fn: Callable[[sqlite3.Connection, str, tuple[Any, ...], float], sqlite3.Cursor],
+    check_deadline_fn: Callable[[float], int],
+    raw_badge: str,
+    sandbox_addr: str,
+    incarnation_id: str,
+    thread_id: str,
+    deadline: float,
+) -> tuple[str, str | None, int, bool, bool, str | None]:
+    msg_id = row["message_id"]
+    if not isinstance(msg_id, str) or not msg_id:
+        return _downgrade(ANOMALY_UNBACKED)
+
+    ev, receipts = _fetch_envelope_and_receipt(
+        conn,
+        execute_fn=execute_fn,
+        sandbox_addr=sandbox_addr,
+        incarnation_id=incarnation_id,
+        thread_id=thread_id,
+        msg_id=msg_id,
+        deadline=deadline,
+    )
+    if ev is None or len(receipts) == 0:
         return _downgrade(ANOMALY_UNBACKED)
     if len(receipts) != 1:
         return _downgrade(ANOMALY_AMBIGUOUS_RECEIPT)
 
     rcpt = receipts[0]
-    try:
-        rcpt_tc = TrustClass(rcpt[_COL_TRUST_CLASS])
-    except (ValueError, TypeError):
+    if not _receipt_badge_matches(rcpt, raw_badge):
         return _downgrade(ANOMALY_TRUST_MISMATCH)
-    if rcpt["badge"] != raw_badge or _TRUST_CLASS_TO_BADGE[rcpt_tc].value != raw_badge:
-        return _downgrade(ANOMALY_TRUST_MISMATCH)
-
-    rcpt_sha = rcpt[_COL_BODY_SHA256]
-    if (
-        rcpt[_COL_TRUST_CLASS] != ev[_COL_TRUST_CLASS]
-        or rcpt[_COL_SRC_ACTOR] != ev[_COL_SRC_ACTOR]
-        or rcpt_sha != ev[_COL_BODY_SHA256]
-        or rcpt_sha is None
-    ):
+    if not _receipt_matches_envelope(rcpt, ev):
         return _downgrade(ANOMALY_ENVELOPE_MISMATCH)
 
+    rcpt_sha = rcpt[_COL_BODY_SHA256]
     row_digest = hash_strict_text_blob(row["text_for_hash_blob"])
     if row_digest is None or row_digest != rcpt_sha:
         return _downgrade(ANOMALY_BODY_HASH_MISMATCH)
