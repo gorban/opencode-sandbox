@@ -11,7 +11,7 @@ on `origin/main` (`9b608f43`). Every workflow run currently fetches all external
 | Dependency / Artifact | Where Pulled Today | Approx. Size | Current Pain |
 |---|---|---:|---|
 | `mise-v2026.10.21-linux-x64.tar.xz` | `tools/ci/toolchain.py` (every `oc-sandbox PR / quality` run) | `<= 64 MiB` cap (`175 MB` extracted) | Repeated download + extraction every PR push |
-| `shellcheck-v0.9.0.linux.x86_64.tar.xz` | `mise install --locked` in `quality` | `~2 MiB` | Triggers unauthenticated GitHub API `403` attestation failure on **`~16%`** of runs ([prd_o1](prd_o1.md)) |
+| `shellcheck-v0.9.0.linux.x86_64.tar.xz` | `mise install --locked` in `quality` | `~2 MiB` | Recurring unauthenticated GitHub API `403` attestation failure (`6/6` inspected recent failures out of `21/131` historical `oc-sandbox PR` failures; [prd_o1](prd_o1.md)) |
 | `coverage-7.11.0-py3-none-any.whl` | `tools/ci/core_coverage.py` (every `oc-sandbox baselines` run) | `< 1 MiB` | Repeated PyPI network call + fresh `venv` creation |
 | Upcoming: Web UI `npm` tarballs (`docs/prds/spikes/m/web-ui/package-lock.json`) | Tier 0B Web UI job ([prd_o2](prd_o2.md)) | `~60–120 MiB` (`npm` cache) | Uncached `npm ci` adds `~25–60 s` per PR push |
 | Upcoming: Additional pinned linters/tools (`actionlint`, `ruff`, `shfmt`, `syft`, `grype`) | [prd_k](prd_k.md) toolchain expansion | `~50–150 MiB` | Compounds download time & rate-limit exposure if uncached |
@@ -27,11 +27,15 @@ on `origin/main` (`9b608f43`). Every workflow run currently fetches all external
   14 hours** observed during PRs #57–#64), a warm cache stays continuously hot well inside the
   7-day TTL and converts repeated network pulls into local Azure-blob restores (`~1–3 s`) with zero
   upstream rate-limit hits.
-- **Branch-scoping isolation:** GitHub Actions scopes caches by branch ref:
+- **Branch-scoping isolation and shared quota:** GitHub Actions scopes caches by ref:
   - A workflow on `main` writes to `main`'s scope.
-  - A PR branch can **read** from its own branch, its base branch, and the default branch (`main`),
-    and can write **only** to its own branch scope (never overwriting `main` or sibling PRs).
-  - Fork PRs can read `main`'s cache but cannot write to the base repository's cache.
+  - A PR workflow (same-repo or fork, running on its `refs/pull/<n>/merge` ref) can **read** from
+    its own ref, its base branch, and the default branch (`main`), and can write **only** to its
+    own PR merge-ref scope — never replacing `main`'s or sibling PRs' entries.
+  - Because all branch and PR merge-ref entries still share the single **`10 GB` repository LRU
+    quota**, workflows must never treat ref scoping as eviction immunity: every cache hit must
+    undergo independent cryptographic verification, and every workflow must remain functionally
+    correct on a cold run after cache eviction.
 
 ## Content-hashed cache key design
 
@@ -71,10 +75,12 @@ GitHub Actions caches are **untrusted acceleration storage**, never a security b
    - If the exact dependency list changes (even by one package or version), the key misses cleanly,
      fetches the exact new pinned artifact set, verifies its checksums, and populates the new key.
    - This eliminates cross-version stale-cache pollution and prevents loose-prefix cache poisoning.
-2. **Mandatory fail-closed SHA-256 verification on every cache hit:**
-   - Every consumer script (`tools/ci/toolchain.py`, `tools/ci/core_coverage.py`, `npm ci`) verifies
-     the restored artifact's SHA-256/SRI digest (plus `O_NOFOLLOW`, regular-file, and size-cap
-     checks) against the repository's tracked lockfile before executing a single instruction.
+2. **Mandatory fail-closed cryptographic verification on every cache hit:**
+   - Every consumer script (`tools/ci/toolchain.py`, `tools/ci/core_coverage.py`, `npm ci` +
+     lockfile admission validator) verifies the restored artifact's prescribed strong digest
+     (**SHA-256** for toolchains/archives/Python wheels/OCI payloads; **SHA-384 / SHA-512 SRI** +
+     registry-origin admission for npm tarballs), plus `O_NOFOLLOW`, regular-file, and size-cap
+     checks against the repository's tracked lockfile before executing a single instruction.
    - On any digest mismatch, symlink, non-regular file, or oversized cache entry on a cache hit:
      **fail closed by default** (especially on `main` and in regression tests) with a clear
      tamper/corruption error rather than silently falling back to network and masking cache
@@ -87,12 +93,14 @@ GitHub Actions caches are **untrusted acceleration storage**, never a security b
      SHAs, never floating `@v4` tags), running under `permissions: { contents: read }`.
 5. **Quota budget & anti-eviction discipline (`<= 3 GB` target of `10 GB` limit):**
    - Keep `ci-toolchain + py-wheels + web-ui-npm` under `~350 MiB` total per active manifest version
-     so hot Tier 0 caches are never evicted by large Tier 1 container caches.
+     so hot Tier 0 caches stay small within the shared `10 GB` repository quota.
    - Enforce a hard size budget on optional Tier 1 OCI caches (`<= 1.5 GiB` total). Note that
-     deleting PR caches via GitHub API on `pull_request: [closed]` requires
+     deleting PR-ref caches via GitHub API on `pull_request: [closed]` requires
      `permissions: { actions: write }`, which must **never** be granted to any workflow checking
-     out PR code (requiring a separate zero-checkout cleanup workflow) — reinforcing Option O3-A's
-     read-only PR restore model where PRs create no persistent caches to clean up.
+     out PR code (requiring a separate zero-checkout cleanup workflow). Under Option O3-A, normal
+     PRs perform no routine cache saves (reducing quota churn without needing `actions: write`),
+     while any modified PR workflow that writes merge-ref entries still cannot overwrite `main`
+     entries and every workflow stays correct on a cold run after LRU eviction.
 
 ## Cache scoping and seeding options
 
@@ -149,7 +157,9 @@ GitHub Actions caches are **untrusted acceleration storage**, never a security b
   Option O3-B (read+write per PR branch), or Option O3-C (digest-pinned GHCR CI toolchain image).
 - [ ] `(decision needed)` Confirm the canonical manifest-hashed key format
   (`oc-cache-v1-<os>-<arch>-<scope>-<manifest-sha256>`) with exact-key-only restore (no
-  `restore-keys` fallback) and mandatory post-restore SHA-256 verification.
+  `restore-keys` fallback) and mandatory post-restore per-payload cryptographic verification
+  (`SHA-256` for toolchains/archives/wheels/OCI payloads; `SHA-384`/`SHA-512` SRI + registry-origin
+  admission for npm tarballs).
 - [ ] `(decision needed)` Decide whether to design a separate Gate 1 spec for optional Tier 1 OCI
   layer caching (requiring an exact payload format, an independent expected output digest, a
   same-key different-payload rejection test, and a hard `<= 1.5 GiB` cap) after the Tier 1 Podman

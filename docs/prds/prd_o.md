@@ -57,10 +57,12 @@ SonarQube Cloud), but an empirical audit of **257 historical workflow runs**
      multiply runner time and external rate-limit risk.
    - PRD O3 specifies **zero-trust, content-hashed caching**: cache keys hashed strictly from the
      exact pinned dependency list and checksums being pulled, exact-key restore (`restore-keys`
-     omitted for executable artifacts), mandatory SHA-256 verification on every cache hit before
-     execution, `main`-seeded warm caches with read-only PR restore (reducing routine PR cache
-     churn while relying on ref-scoping, per-hit SHA-256 verification, and cold-run correctness
-     after eviction), and **zero caching** in any secret-bearing Tier 2 job.
+     omitted for executable artifacts), mandatory per-payload cryptographic digest verification on
+     every cache hit before execution (**SHA-256** for toolchains/archives/Python wheels/OCI
+     payloads; **SHA-384 / SHA-512 SRI** + registry-origin admission for npm tarballs),
+     `main`-seeded warm caches with read-only PR restore (reducing routine PR cache churn while
+     relying on ref-scoping, per-hit cryptographic verification, and cold-run correctness after
+     eviction), and **zero caching** in any secret-bearing Tier 2 job.
 4. **Strict scope boundary:**
    - PRD O builds on [prd_k](prd_k.md) (contributor checks, SonarQube Cloud qualification, SBOM/Grype,
      and SSH remote acceptance) without modifying `prd_k` reservations or duplicating `prd_i3`/`prd_i4`
@@ -76,7 +78,7 @@ flowchart TB
         T0S["Tier 0A-baselines: Separate Scanners\n(Coverage · CodeQL[sec-events:w] · DepReview · Sonar)"]
     end
 
-    subgraph CACHE["Verified Content-Hashed GHA Cache (Acceleration Only · SHA-256 Re-Verified on Hit)"]
+    subgraph CACHE["Verified Content-Hashed GHA Cache (Acceleration Only · Digest Re-Verified on Hit)"]
         C1["Toolchain Manifest Hash\n(mise + shellcheck + future linters)"]
         C2["Python Wheelhouse Hash\n(coverage + pinned dev wheels)"]
         C3["Web UI Lockfile Hash\n(lockfile admission + npm cache)"]
@@ -108,13 +110,18 @@ Every implementation PR derived from PRD O must satisfy all six invariants and p
 [implementation review gates](README.md#implementation-review-gates):
 
 1. **Zero secrets on untrusted triggers:** `pull_request` workflows (Tier 0) and any fork-reachable
-   job must carry zero repository/environment API secrets, minimal `permissions` (`contents: read`
-   or `{}`), and `persist-credentials: false` on every `actions/checkout`. Never use
-   `pull_request_target` to execute PR head code.
+   job must carry zero repository/environment API secrets and `persist-credentials: false` on every
+   `actions/checkout`. Every job executing contributor code is restricted to minimal `permissions`
+   (`contents: read` or `{}`); the sole narrow exception on `pull_request` is the existing isolated
+   `CodeQL baseline` job in `.github/workflows/ci-baselines.yml` (`build-mode: none`, zero
+   contributor code execution), which holds `security-events: write` solely to upload SARIF results.
+   Never use `pull_request_target` to execute PR head code.
 2. **Cache is untrusted acceleration, never a trust root:** Every cached executable, archive, or
-   package restored from GitHub Actions cache must pass cryptographic SHA-256 verification against
-   tracked lockfiles/manifests in the checked-out revision **before** execution. Omit loose
-   `restore-keys` prefixes for executable toolchains and wheels.
+   package restored from GitHub Actions cache must pass the prescribed strong cryptographic digest
+   verification for its payload against tracked lockfiles/manifests in the checked-out revision
+   **before** execution — **SHA-256** for toolchains, archives, Python wheels, and any future OCI
+   payload, and **SHA-384 / SHA-512 SRI** (plus registry-origin admission) for npm tarballs. Omit
+   loose `restore-keys` prefixes for executable toolchains, wheels, and npm caches.
 3. **No cache in secret-bearing jobs:** Tier 2 live inference jobs must never read from or write to
    GitHub Actions cache, preventing cache-poisoning escalation into secret-bearing runners.
 4. **Strict separation of CI API keys from personal subscriptions:** Tier 2 basic inference tests
@@ -164,11 +171,12 @@ each slice passes Gate 1 walkthrough review:
 ## Child PRDs
 
 - [prd_o1.md](prd_o1.md): Empirical CI duration trends (`257` runs), critical-path step timings,
-  root cause of the `16%` `mise` 403 failure rate, and latency-reduction options.
+  analysis of the recurring `mise` 403 failure mode (`6/6` inspected recent failures out of
+  `21/131` historical `oc-sandbox PR` failures), and latency-reduction options.
 - [prd_o2.md](prd_o2.md): Complete test-scope audit, 4-tier CI trust matrix, spike/UI/Podman
   integration options, and secret-gated basic inference smoke architecture.
 - [prd_o3.md](prd_o3.md): GitHub Actions cache economics (`10 GB` / `7`-day TTL), canonical
-  manifest-hashed keying by exact dependency list, zero-trust SHA-256 verification on cache hits,
-  and seeding/eviction design.
+  manifest-hashed keying by exact dependency list, zero-trust per-payload cryptographic
+  verification (`SHA-256` / `SHA-384`–`SHA-512` SRI) on cache hits, and seeding/eviction design.
 
 - [ ] **Human review**: checked only when the user says so
