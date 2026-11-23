@@ -571,7 +571,7 @@ For `read_replay_frames(..., max_response_bytes=...)`:
        non-decreasing** probe `prefix + "\x1b[0m"` (accounting for JSON's 6-byte `\u001b`
        expansion — 9 JSON bytes for `"\x1b[0m"`!) inside the full serialized page!
      - Once the maximum fitting `k` is found, evaluate `_sgr_is_open(prefix)` (using the exact
-       7-slot SGR state tracker across `prefix`, including any cross-frame prepended `active_sgr_seq`
+       8-slot SGR state tracker across `prefix`, including any cross-frame prepended `active_sgr_seq`
        from Section 3.4): emit `prefix + "\x1b[0m"` iff `mode is SAFE_SGR and _sgr_is_open(prefix)`,
        else `prefix` (guaranteed `<=` tested JSON byte length `<= max_response_bytes` and guaranteed
        to start and end in default style!), setting `text_truncated = True` and updating `text_bytes`.
@@ -937,7 +937,7 @@ def read_replay_frames(
    with zero `\r` in sanitized output — consistent with `oc_coord_contract.canonicalize_body_text`.
 3. **Closed `SAFE_SGR` allowlist & cross-frame self-contained SGR closure:** Excludes `SGR 8`
    (conceal), blink (`5`/`6`), and 24-bit RGB (`38;2`/`48;2`/`58;2`), while allowing basic
-   attributes, 16-color, and 8-bit indexed `38;5;N`/`48;5;N` (`0 <= N <= 255`). An O(1) 7-slot
+   attributes, 16-color, and 8-bit indexed `38;5;N`/`48;5;N` (`0 <= N <= 255`). An O(1) 8-slot
    `active_sgr_seq` tracker prepends active styles onto continuation frames and closes open styles
    with `"\x1b[0m"` on every non-empty frame (and on truncation at BOTH `MAX_FRAME_TEXT_BYTES` and
    `max_response_bytes`, accounting for JSON's 6-byte `\u001b` expansion), guaranteeing every stored
