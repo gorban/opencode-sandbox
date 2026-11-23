@@ -291,7 +291,33 @@ def open_readonly_inbox_snapshot(db_path: Path, *, deadline: float) -> Iterator[
             apply_remaining_busy_timeout(conn, deadline)
             conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
             conn.execute("BEGIN DEFERRED")
-            # Immediately anchor the WAL read snapshot on inbox_seq_counter!
+            # 1. Anchor the WAL read snapshot against sqlite_master FIRST, rejecting ANY trigger
+            #    or view BEFORE querying inbox_seq_counter or any user table!
+            unsafe_obj = execute_bounded(
+                conn,
+                "SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view') LIMIT 1",
+                (),
+                deadline,
+            ).fetchone()
+            if unsafe_obj is not None:
+                raise CoordPolicyError("inbox_db_unreadable")
+            # 2. Verify all 4 required objects exist as ordinary tables ('table') in sqlite_master.
+            req_tables = execute_bounded(
+                conn,
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('inbox_seq_counter', 'review_items', 'workflow_runs', 'review_artifacts')",
+                (),
+                deadline,
+            ).fetchall()
+            if {r["name"] for r in req_tables} != {
+                "inbox_seq_counter",
+                "review_items",
+                "workflow_runs",
+                "review_artifacts",
+            }:
+                raise CoordPolicyError("inbox_db_unreadable")
+            # 3. ONLY after sqlite_master verification, validate inbox_seq_counter inside the exact
+            #    same anchored WAL snapshot transaction!
             execute_bounded(
                 conn,
                 "SELECT CASE WHEN typeof(last_seq) = 'integer' THEN last_seq ELSE NULL END "
@@ -299,15 +325,6 @@ def open_readonly_inbox_snapshot(db_path: Path, *, deadline: float) -> Iterator[
                 (),
                 deadline,
             ).fetchone()
-            # Reject hostile SQLite triggers or views before executing any projection SQL!
-            unsafe_obj = execute_bounded(
-                conn,
-                "SELECT COUNT(*) AS cnt FROM sqlite_master WHERE type IN ('trigger', 'view')",
-                (),
-                deadline,
-            ).fetchone()
-            if unsafe_obj is None or int(unsafe_obj["cnt"]) != 0:
-                raise CoordPolicyError("inbox_db_unreadable")
         except sqlite3.OperationalError as exc:
             safe_close(conn)
             raise map_sqlite_operational_error(exc, deadline) from exc
@@ -337,10 +354,13 @@ def open_readonly_inbox_snapshot(db_path: Path, *, deadline: float) -> Iterator[
             conn.close()
 ```
 
-- **Hardened SQLite connection pragmas & schema check:** `PRAGMA trusted_schema = OFF` blocks
-  schema-embedded unsafe SQL functions, `PRAGMA cell_size_check = ON` catches corrupt B-tree page
-  cells early, and rejecting any `trigger` or `view` in `sqlite_master` prevents hostile DB views
-  from shadowing `review_items`, `workflow_runs`, `review_artifacts`, or `inbox_seq_counter`.
+- **Hardened SQLite connection pragmas & `sqlite_master`-first snapshot anchor:**
+  `PRAGMA trusted_schema = OFF` blocks schema-embedded unsafe SQL functions,
+  `PRAGMA cell_size_check = ON` catches corrupt B-tree page cells early, and anchoring the
+  `BEGIN DEFERRED` snapshot on `sqlite_master` FIRST (rejecting any `trigger` or `view` and
+  confirming `inbox_seq_counter`, `review_items`, `workflow_runs`, and `review_artifacts` are all
+  ordinary `type = 'table'` objects BEFORE reading `inbox_seq_counter`) guarantees a hostile view
+  named `inbox_seq_counter` is rejected without its view body ever being evaluated.
 - **Explicit Live-WAL semantics:** `mode=ro` + `PRAGMA query_only = ON` guarantees strict logical
   immutability (zero DB creation, zero SQL writes, zero `inbox_seq_counter` or `audit_log`
   mutations). When reading a live WAL database in a writable `0o700` directory, SQLite may map or
@@ -467,7 +487,10 @@ def compute_review_pin_sha256(
 
 On every item read (`list_inbox_items` and `get_inbox_item`), primary-key `review_id` is admitted
 first (SQL `typeof(review_id) = 'text' AND LENGTH(CAST(review_id AS BLOB)) <= 96` +
-`validate_opaque_token`, mapping any failure to `CoordPolicyError("inbox_db_unreadable")`). The
+`validate_opaque_token` + `not contains_credential_pattern(review_id)`, mapping any failure to fixed
+`CoordPolicyError("inbox_db_unreadable")` with zero echo of the raw identifier). Required
+identifiers `run_id`, `step_id`, and `artifact_id` likewise fail closed with fixed
+`CoordPolicyError("inbox_db_unreadable")` if they match `contains_credential_pattern`. The
 projection then runs a strict 7-step ordered verification pipeline inside the same SQLite snapshot:
 
 | Precedence | Check | Failure `anomaly_reason` (Closed Enum) | Resulting Flags |
@@ -506,23 +529,34 @@ into Python:
 
 - **Primary key (`review_id`):**
   `CASE WHEN typeof(r.review_id) = 'text' AND LENGTH(CAST(r.review_id AS BLOB)) <= 96 THEN r.review_id ELSE NULL END`.
-  At row admission, Python requires `review_id is not None` and passes `validate_opaque_token(review_id, "review_id")`,
-  mapping any `(CoordValidationError, AddressError)` to `CoordPolicyError("inbox_db_unreadable")`.
-- **Opaque tokens, addresses, workflow IDs, & hex digests:**
+  At row admission, Python requires `review_id is not None`, passes
+  `validate_opaque_token(review_id, "review_id")`, AND runs `contains_credential_pattern(review_id)`
+  (blocking credential-shaped tokens such as `"sk-ant-synthetic-secret1234"` that syntactically
+  satisfy `_ID_TOKEN_RE`), mapping any failure to fixed `CoordPolicyError("inbox_db_unreadable")`
+  with **zero echo of the raw identifier** (never serialized or placed in `next_cursor`).
+- **Opaque tokens, addresses, workflow IDs, & hex digests (all checked via
+  `contains_credential_pattern` before serialization or cursor encoding):**
   - `run_id`, `step_id`, `artifact_id`: `typeof = 'text' AND LENGTH(CAST(col AS BLOB)) <= 96`,
-    validated via `validate_opaque_token` (matching `_ID_TOKEN_RE` max 96 chars).
+    validated via `validate_opaque_token` (matching `_ID_TOKEN_RE` max 96 chars). Any required
+    identifier (`run_id`, `step_id`, `artifact_id`) matching `contains_credential_pattern` fails
+    closed with fixed `CoordPolicyError("inbox_db_unreadable")` (zero echo, never serialized).
   - `target_incarnation_id` (nullable): exempts `IS NULL` (`col IS NULL -> NULL, malformed = 0`);
     non-`NULL` gated to `typeof = 'text' AND LENGTH(CAST(col AS BLOB)) <= 96` and validated via
-    `validate_opaque_token`, clamping invalid values to `None` + `malformed_metadata = True`.
+    `validate_opaque_token`; invalid values clamp to `None` + `malformed_metadata = True`, and
+    values matching `contains_credential_pattern` clamp to `None` + `malformed_metadata = True` +
+    `redaction_applied = True` (never emitted).
   - `target_addr` (nullable): exempts `IS NULL`; non-`NULL` gated to
     `typeof = 'text' AND LENGTH(CAST(col AS BLOB)) <= 256` and validated via
     `parse_canonical_addr(raw)` (supporting `"NAME"`, `"REMOTE / NAME"`, and `"@PEER"`, requiring
-    exact canonical equality `parsed.canonical == raw`), clamping invalid values to `None` +
-    `malformed_metadata = True`.
+    exact canonical equality `parsed.canonical == raw`); invalid values clamp to `None` +
+    `malformed_metadata = True`, and values matching `contains_credential_pattern` clamp to `None`
+    + `malformed_metadata = True` + `redaction_applied = True`.
   - `workflow_runs.workflow_id` (from `LEFT JOIN`): exempts `w.run_id IS NULL`; when run row exists,
     gated to `typeof = 'text' AND LENGTH(CAST(col AS BLOB)) <= 128` and validated via
-    `parse_namespaced_id(raw, "workflow_id")` (allowing `"builtin/<slug>"` / `"user/<slug>"`),
-    clamping invalid values to `None` + `malformed_metadata = True`.
+    `parse_namespaced_id(raw, "workflow_id")` (allowing `"builtin/<slug>"` / `"user/<slug>"`);
+    invalid values clamp to `None` + `malformed_metadata = True`, and values matching
+    `contains_credential_pattern` clamp to `None` + `malformed_metadata = True` +
+    `redaction_applied = True`.
   - `artifact_sha256`, `policy_digest`, `review_pin_sha256`, `blob_sha256`:
     `typeof = 'text' AND LENGTH(CAST(col AS BLOB)) = 64` + `_SHA256_HEX_RE`.
   - `media_type`: `typeof = 'text' AND LENGTH(CAST(col AS BLOB)) <= 128` + `_MEDIA_TYPE_RE`.
@@ -618,8 +652,10 @@ of arbitrary unlabeled prose secrets):
 2. **Stage 2 — Sensitive Key Stripping & Enumerated Credential-Pattern Redaction (`redaction_applied`):**
    - **SQL layer:** Sensitive columns (`env_vars`, `auth_header`, `token`, `password`, `private_key`,
      `awakeable_token_hash`, etc.) are never included in any `SELECT` column list.
-   - **Enumerated credential-pattern redactor (`redact_sensitive_text`, applied to `summary_text`,
-     `title`, `label`, surviving `metadata` string values, AND surviving `metadata` keys):**
+   - **Enumerated credential-pattern redactor (`redact_sensitive_text` & `contains_credential_pattern`,
+     applied to `summary_text`, `title`, `label`, surviving `metadata` string values, surviving
+     `metadata` keys, AND all projected identifiers `review_id`, `run_id`, `step_id`, `artifact_id`,
+     `target_incarnation_id`, `workflow_id`, `target_addr` before serialization or cursor encoding):**
      Replaces matches with `"[REDACTED]"` (or preserves key/scheme prefix as shown) and reports
      `redacted = True`:
      1. Bounded PEM private key blocks (including prefix-truncated blocks terminating at `$`):
@@ -645,7 +681,7 @@ of arbitrary unlabeled prose secrets):
         `eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}(?:\.(?:[A-Za-z0-9_-]{8,}|[A-Za-z0-9_-]*$)|$)`
         -> `"[REDACTED]"`
      6. Inline / env-var-prefixed / JSON-serialized / EOF-truncated-quote KV secret assignments:
-        `(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{0,48}(?:password|passwd|pwd|api[_-]?key|access[_-]?token|auth[_-]?token|auth[_-]?header|authorization|cookie|set[_-]?cookie|credential|awakeable[_-]?token[_-]?hash|private[_-]?key|client[_-]?secret|secret[_-]?key|secret|token))(["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s"',;}{]+)`
+        `(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{0,48}(?:password|passwd|pwd|api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|auth[_-]?header|authorization|cookie|set[_-]?cookie|credential|awakeable[_-]?token[_-]?hash|private[_-]?key|client[_-]?secret|secret[_-]?key|secret|token))(["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s"',;}{]+)`
         -> `\1\2[REDACTED]`
    - **Recursive untruncated normalized `metadata_json` key denylist + key pattern redaction +
      deterministic collision handling (runs at ALL nesting depths BEFORE key truncation):**
@@ -799,13 +835,20 @@ cursor = "v1." + base64url_nopad(json.dumps(payload, separators=(",", ":"), sort
     raises `CoordValidationError("cursor_scope_mismatch")`.
   - Validates `type(ss) is int and 0 <= ss <= MAX_SQLITE_INT64`,
     `type(pr) is int and 0 <= pr <= MAX_PRIORITY_RANK`,
-    `type(seq) is int and 0 <= seq <= MAX_SQLITE_INT64`, and wrapped
-    `validate_opaque_token(rid, "review_id")`.
-- **Cross-page snapshot fencing:** Inside `open_readonly_inbox_snapshot`, immediately after reading
-  `snapshot_seq = read_inbox_seq_counter(conn, deadline)`, if `parsed_cursor is not None` and
-  `snapshot_seq != parsed_cursor.snapshot_seq`, fail closed with
-  `CoordValidationError("cursor_snapshot_changed")` so callers restart cleanly from page 1 rather
-  than observing silent skips or duplicates after a concurrent priority/status update!
+    `type(seq) is int and 0 <= seq <= MAX_SQLITE_INT64`, wrapped
+    `validate_opaque_token(rid, "review_id")`, and `not contains_credential_pattern(rid)` (rejecting
+    credential-shaped cursor IDs as `CoordValidationError("cursor_malformed")` with zero echo).
+- **Cross-page snapshot fencing & writer-side `inbox_seq_counter` contract:**
+  - **Explicit fixture/daemon writer invariant:** Every projection-visible mutation (inserts,
+    updates, or deletes on `review_items`, `workflow_runs`, or `review_artifacts`) MUST advance
+    `inbox_seq_counter.last_seq` inside the **same** SQLite write transaction so `snapshot_seq`
+    detects every cross-page change (and rolled-back transactions leave `last_seq` unchanged).
+  - Inside `open_readonly_inbox_snapshot`, immediately after reading
+    `snapshot_seq = read_inbox_seq_counter(conn, deadline)`, if `parsed_cursor is not None` and
+    `snapshot_seq != parsed_cursor.snapshot_seq`, fail closed with
+    `CoordValidationError("cursor_snapshot_changed")` so callers restart cleanly from page 1 rather
+    than observing silent skips or duplicates after a concurrent priority, status, run, or artifact
+    update!
 
 ### 6.3 Exact SQL & Walkthrough of the Three Read APIs
 
@@ -923,10 +966,10 @@ SELECT
     workflow_run_present, workflow_id, workflow_id_malformed,
     run_policy_digest, run_policy_digest_malformed
 FROM ranked
--- optional cursor predicate:
+-- optional cursor predicate (matches ORDER BY total order without skipping BLOB PKs!):
 -- WHERE (effective_priority < ?)
 --    OR (effective_priority = ? AND effective_seq > ?)
---    OR (effective_priority = ? AND effective_seq = ? AND typeof(_ord_rid) = 'text' AND _ord_rid > ?)
+--    OR (effective_priority = ? AND effective_seq = ? AND _ord_rid > ?)
 ORDER BY effective_priority DESC, effective_seq ASC, _ord_rid ASC
 LIMIT ?
 ```
@@ -1124,10 +1167,14 @@ def get_inbox_summary(
   else `CoordValidationError("response_budget_too_small_for_envelope")`) +
   `check_deadline_ms(deadline)`, close SQLite snapshot, run post-read authority/session fences, and
   return `InboxSummarySnapshot`.
-- **Explicit aggregate boundary honesty:** `get_inbox_summary` sets
-  `pin_verification_scope = "item_read_only"` because full SHA-256 pin recomputation and
-  cross-table artifact/run corroboration execute per-item in `list_inbox_items` and
-  `get_inbox_item` without transferring unbounded rows into Python.
+- **Explicit aggregate boundary honesty:** `get_inbox_summary` executes strictly bounded SQL
+  aggregates over `review_items` (`<= 11` rows transferred). Accordingly, `paused_lanes_count`
+  reports `host_workflow_engine` pause flags (`typeof(source_kind) = 'text' AND source_kind =
+  'host_workflow_engine' AND typeof(lane_paused) = 'integer' AND lane_paused = 1`),
+  `malformed_rows_count` reports row-level structural, format, and `source_kind`/`lane_paused`
+  contradiction anomalies on `review_items`, and `pin_verification_scope = "item_read_only"`
+  explicitly reserves cross-table cryptographic `review_pin_sha256`, `workflow_runs`, and
+  `review_artifacts` verification verdicts for item reads (`list_inbox_items` and `get_inbox_item`).
 
 ---
 
@@ -1145,16 +1192,18 @@ def get_inbox_summary(
 | `live_authority_checker` returns non-`True` or raises (pre or post read) | `RevokedError("read_authority_revoked")` (zero data returned) |
 | Relative/raw symlink ancestor (`sym_rel/../state`), `PermissionError`/`ENOTDIR`/NUL-byte path, symlinked `state_dir`, sandbox path, host production dir, non-`0o700` dir, missing `inbox.sqlite`, symlink/FIFO/hardlink/wrong-UID/unsafe-mode (`0o644`) on DB or `-wal`/`-shm`/`-journal` | `CoordPolicyError` (fail closed immediately; zero blocking, zero `chmod`, zero file creation, zero unmapped `OSError`/`PolicyError`/`ValueError`) |
 | Surrogate-escaped POSIX `db_path` failing URI `quote()` | `CoordPolicyError("inbox_db_unreadable")` before acquiring `_UMASK_LOCK` |
-| Corrupt DB, missing tables, present SQLite `trigger`/`view` in `sqlite_master`, malformed `inbox_seq_counter.last_seq`, or read-only `0o500` dir without `-shm` | `CoordPolicyError("inbox_db_unreadable")` |
-| Corrupted primary key `review_items.review_id` (non-TEXT, `> 96` B, invalid opaque token, control/bidi/NUL) | `CoordPolicyError("inbox_db_unreadable")` |
+| Corrupt DB, missing or non-table required objects (`inbox_seq_counter`, `review_items`, `workflow_runs`, `review_artifacts`), present SQLite `trigger`/`view` in `sqlite_master`, malformed `inbox_seq_counter.last_seq`, or read-only `0o500` dir without `-shm` | `CoordPolicyError("inbox_db_unreadable")` (rejected via `sqlite_master` BEFORE evaluating any view or user table) |
+| Corrupted primary key `review_items.review_id` (non-TEXT, `> 96` B, invalid opaque token, control/bidi/NUL) OR credential-shaped required identifier (`review_id`, `run_id`, `step_id`, `artifact_id`) | Fixed `CoordPolicyError("inbox_db_unreadable")` (zero echo of raw value; never serialized or placed in `next_cursor`) |
+| Credential-shaped optional/nullable identifier (`target_addr`, `target_incarnation_id`, `workflow_id`) | Clamped to `None` + `malformed_metadata = True`, `redaction_applied = True`, `pin_verified = False`, `pin_anomaly = True`, `review_ready = False` (raw value never emitted) |
 | Lock wait, `_UMASK_LOCK` wait, SQL VM progress, packing loop, or post-serialization exceeds `max_read_ms` | `CoordPolicyError("read_deadline_exceeded")` (connection closed; zero `connect()` if expired before lock) |
 | SQLite `"locked"` / `"busy"` before deadline | `CoordPolicyError("inbox_db_busy")` |
 | Non-existent `review_id` on `get_inbox_item` | `CoordPolicyError("review_item_not_found")` |
-| Malformed, oversized, padded, non-canonical, `NaN`, `1e400` overflow, deeply nested (`RecursionError`), or out-of-range (`< 0`, `> MAX_SQLITE_INT64`, `bool`) cursor | `CoordValidationError("cursor_malformed")` |
+| Malformed, oversized, padded, non-canonical, `NaN`, `1e400` overflow, deeply nested (`RecursionError`), credential-shaped `rid`, or out-of-range (`< 0`, `> MAX_SQLITE_INT64`, `bool`) cursor | `CoordValidationError("cursor_malformed")` |
 | Cursor reused across different `op`, `statuses`, or `run_id` | `CoordValidationError("cursor_scope_mismatch")` |
 | Cursor `snapshot_seq` (`"ss"`) != current WAL `inbox_seq_counter.last_seq` | `CoordValidationError("cursor_snapshot_changed")` (caller restarts from page 1) |
 | `max_response_bytes` out of `2048..256 KiB` or too small for envelope / minimal first item | `CoordValidationError("response_budget_too_small_for_envelope" / "response_budget_too_small_for_item")` |
-| Tampered `review_pin_sha256`, missing/mismatched `workflow_runs.policy_digest`, missing/ambiguous/mismatched primary `review_artifacts`, tampered `is_primary`, contradictory `source_kind != 'host_workflow_engine'` + `lane_paused = 1`, or any item-level `malformed_metadata` | `pin_verified = False`, `pin_anomaly = True`, closed-enum `anomaly_reason`, `review_ready = False` (and excluded from `paused_lanes_count` + counted in `malformed_rows_count` on `get_inbox_summary`) |
+| Item reads (`list_inbox_items`, `get_inbox_item`): tampered `review_pin_sha256`, missing/mismatched `workflow_runs.policy_digest`, missing/ambiguous/mismatched primary `review_artifacts`, tampered `is_primary`, contradictory `source_kind != 'host_workflow_engine'` + `lane_paused = 1`, or any item-level `malformed_metadata` | `pin_verified = False`, `pin_anomaly = True`, closed-enum `anomaly_reason`, `review_ready = False` (cross-table cryptographic pin and `review_artifacts` verdicts are evaluated on item reads) |
+| Summary aggregate (`get_inbox_summary`): `review_items` structural/format anomalies or contradictory `source_kind != 'host_workflow_engine'` + `lane_paused = 1` | `paused_lanes_count` counts reported `host_workflow_engine` pause flags (`typeof(source_kind)='text' AND source_kind='host_workflow_engine' AND typeof(lane_paused)='integer' AND lane_paused=1`) only; `malformed_rows_count` counts row-level structural/format/contradiction anomalies on `review_items` (`pin_verification_scope = "item_read_only"`) |
 | Malformed secondary (`is_primary = 0`) artifact in `get_inbox_item` | Clean per-artifact degradation (`a.malformed_metadata = True`) + `snapshot.artifacts_malformed = True` |
 | Oversized BLOB (e.g., 2 MiB) in numeric timestamp, boolean flag, `priority_rank`, `checkpoint_seq`, `metadata_json`, or `summary_text` | Blocked inside SQL `typeof()` / `LENGTH(CAST(... AS BLOB))` / `SUBSTR(CAST(... AS BLOB), 1, cap)`; bounded diagnostic fallback + `malformed_metadata = True` |
 | `NaN` / `Inf` / `-Inf` SQLite `REAL`, JSON `NaN`/`Infinity` literal, JSON numeric overflow (`1e400`), or deeply nested `metadata_json` (`RecursionError`) | Safe clamped fallback (`0.0` / `None` / `{}`) + `malformed_metadata = True`; `json.dumps(..., allow_nan=False)` succeeds |
@@ -1223,9 +1272,13 @@ synthetic SQLite fixtures (zero Podman, zero network, zero writes to production 
      (completes immediately without hanging), hardlinked (`os.link`) DB/sidecar, and `0o644`
      unsafe-mode DB/sidecar all fail closed without repairing modes (`stat` mode remains `0o644`).
    - Read-only `0o500` dir without `-shm` maps cleanly to `CoordPolicyError("inbox_db_unreadable")`.
-   - Hostile SQLite `VIEW` and `TRIGGER` injected into `inbox.sqlite` both fail closed with
-     `CoordPolicyError("inbox_db_unreadable")` (with clean connection close); verify
-     `PRAGMA trusted_schema = OFF` and `PRAGMA cell_size_check = ON` are active on opened snapshots.
+   - Hostile SQLite `VIEW` and `TRIGGER` injected into `inbox.sqlite` — **including replacing
+     `inbox_seq_counter` itself with a `VIEW` (`CREATE VIEW inbox_seq_counter AS ...`)** — fail
+     closed via `sqlite_master` BEFORE any view body or user table is evaluated, raising
+     `CoordPolicyError("inbox_db_unreadable")` with clean connection close; missing or non-table
+     required objects (`inbox_seq_counter`, `review_items`, `workflow_runs`, `review_artifacts`)
+     likewise fail closed; verify `PRAGMA trusted_schema = OFF` and `PRAGMA cell_size_check = ON`
+     are active on opened snapshots.
 3. **Deterministic cryptographic review pins, `orchestrator_advisory` vs `lane_paused == 1`, artifacts, & IDs:**
    - Valid pending `host_workflow_engine` item (`lane_paused = 1`) with nullable `expires_at = None`,
      `target_addr = None`, `target_incarnation_id = None` passes verification cleanly
@@ -1286,16 +1339,25 @@ synthetic SQLite fixtures (zero Podman, zero network, zero writes to production 
      prefix boundary decode cleanly without leaking `\x1b`/`\x9b` and set
      `text_suffix_uninspected = True`.
    - Verify env-var-prefixed secrets (`DB_PASSWORD=val`, `POSTGRES_PASSWORD="val"`,
-     `MY_API_KEY=val`, `GITHUB_TOKEN=val`), JSON-serialized secrets (`{"password": "supersecret"}`),
-     quoted secret truncated before closing `"` at the `16 KiB` BLOB boundary, JWT truncated in its
-     3rd segment at the `16 KiB` BLOB boundary, URL basic-auth (`https://alice:s3cr3t@host/p`),
-     multi-token `Authorization: CustomScheme xyz`, `Cookie: sid=abc; k=v`, `Set-Cookie: a=b`,
-     `credential=foo`, `awakeable_token_hash=deadbeef`, PEM private keys, bearer/API-key tokens,
-     extra sensitive DB columns (`env_vars`, `auth_header`, `token`, `password`, `private_key`,
-     `awakeable_token_hash`), recursive/hyphenated/camelCase/`> 256` B-padded sensitive keys in
-     `metadata_json`, **AND a synthetic canary token placed inside a `metadata_json` key**
-     (`{"sk-ant-canary12345678": "ok"}`, `{"Bearer eyJ...": "ok"}`) have zero occurrence in the
-     final serialized JSON response and set `redaction_applied = True` and `untrusted_content = True`.
+     `MY_API_KEY=val`, `AWS_ACCESS_KEY=val`, `GITHUB_TOKEN=val`), JSON-serialized secrets
+     (`{"password": "supersecret"}`), quoted secret truncated before closing `"` at the `16 KiB`
+     BLOB boundary, JWT truncated in its 3rd segment at the `16 KiB` BLOB boundary, URL basic-auth
+     (`https://alice:s3cr3t@host/p`), multi-token `Authorization: CustomScheme xyz`,
+     `Cookie: sid=abc; k=v`, `Set-Cookie: a=b`, `credential=foo`, `awakeable_token_hash=deadbeef`,
+     PEM private keys, bearer/API-key tokens, extra sensitive DB columns (`env_vars`, `auth_header`,
+     `token`, `password`, `private_key`, `awakeable_token_hash`), recursive/hyphenated/camelCase/
+     `> 256` B-padded sensitive keys in `metadata_json`, **AND a synthetic canary token placed
+     inside a `metadata_json` key** (`{"sk-ant-canary12345678": "ok"}`, `{"Bearer eyJ...": "ok"}`)
+     have zero occurrence in the final serialized JSON response and set `redaction_applied = True`
+     and `untrusted_content = True`.
+   - **Credential-shaped identifier defense:** Inject a synthetic credential-shaped primary key
+     `review_id` (e.g., `"sk-ant-synthetic-12345678"`, which matches `_ID_TOKEN_RE`) and assert
+     fixed `CoordPolicyError("inbox_db_unreadable")` with **zero echo** of the identifier value in
+     the exception message (and never serialized or placed in `next_cursor`); likewise verify
+     credential-shaped required `run_id`/`step_id`/`artifact_id` fail closed with fixed
+     `CoordPolicyError("inbox_db_unreadable")` (zero echo), and credential-shaped nullable
+     `target_incarnation_id` clamps to `None` with `malformed_metadata = True`,
+     `redaction_applied = True`, `pin_verified = False`, `review_ready = False`.
    - Verify two distinct `metadata_json` keys colliding after 64-byte truncation keep the first key
      in sorted order deterministically and set `malformed_metadata = True`.
 6. **2 KiB (`2048` B) UTF-8 JSON byte budget, `next_cursor` accounting, metadata-drop retry, & snapshot-bound int64 cursors:**
@@ -1311,13 +1373,23 @@ synthetic SQLite fixtures (zero Podman, zero network, zero writes to production 
    - Full `limit = 1` pagination across `checkpoint_seq = 0`, `checkpoint_seq = MAX_SQLITE_INT64`,
      equal-priority ties, `:` in `review_id`, `statuses` + `run_id` filters, and malformed
      `checkpoint_seq` rows yields zero skips and zero duplicates.
-   - **Two-page snapshot-change fixture:** mutate a row's `priority_rank` and advance
-     `inbox_seq_counter.last_seq` between page 1 and page 2; passing page 1's `next_cursor` fails
-     closed with `CoordValidationError("cursor_snapshot_changed")` with zero projection mutations.
+   - **Tie-group BLOB-PK continuation fixture (`limit = 1`):** Inside the same tie-group
+     (`priority_rank = 0, checkpoint_seq = MAX_SQLITE_INT64`), place valid TEXT row 1 immediately
+     followed by a corrupted BLOB primary-key row 2: Page 1 returns row 1 (`has_more = True`), and
+     Page 2 with `next_cursor` reaches row 2 and fails closed with
+     `CoordPolicyError("inbox_db_unreadable")` (proving continuation never silently skips BLOB PKs!).
+   - **Two-page snapshot-change & rollback fixture:** (a) commit a projection-visible mutation
+     (testing both a `review_items.priority_rank` update AND a joined `workflow_runs` /
+     `review_artifacts` update) that advances `inbox_seq_counter.last_seq` inside the same write
+     transaction -> passing page 1's `next_cursor` fails closed with
+     `CoordValidationError("cursor_snapshot_changed")` with zero projection mutations; and (b) run
+     a rolled-back write transaction -> `last_seq` remains unchanged and page 1's `next_cursor`
+     continues to succeed on page 2!
    - Forged cursors (`seq = MAX_SQLITE_INT64 + 1`, `ss = MAX_SQLITE_INT64 + 1`, `seq = -1`,
-     `seq = True`, `pr = 101`, `1e400`, padding, non-canonical JSON, `NaN`, deep nesting, `> 512` B)
-     raise `CoordValidationError("cursor_malformed")`; cross-filter (`statuses`/`run_id`) or
-     cross-op cursor reuse raises `CoordValidationError("cursor_scope_mismatch")`.
+     `seq = True`, `pr = 101`, `1e400`, credential-shaped `rid`, padding, non-canonical JSON, `NaN`,
+     deep nesting, `> 512` B) raise `CoordValidationError("cursor_malformed")`; cross-filter
+     (`statuses`/`run_id`) or cross-op cursor reuse raises
+     `CoordValidationError("cursor_scope_mismatch")`.
 7. **Deadline contention, URI-before-`_UMASK_LOCK`, connection close, & zero mutation authority:**
    - Held write lock with `max_read_ms = 50` aborts promptly with `CoordPolicyError("read_deadline_exceeded")`.
    - Held `_UMASK_LOCK` past `max_read_ms = 50` raises `CoordPolicyError("read_deadline_exceeded")`
