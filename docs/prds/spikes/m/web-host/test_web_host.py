@@ -594,7 +594,7 @@ class HostTests(unittest.TestCase):
             self.assertNotIn(b"csrf_token", body)
             self.assertNotIn(b"Fixture project", body)
             with server.guard:
-                self.assertTrue(server.active is None, "expired fixture session remained active")
+                self.assertIs(server.active, None, "expired fixture session remained active")
                 self.assertFalse(server.auth.revoke_session_by_hash(session.session_hash))
 
     def test_malformed_framing_and_media_preserve_previous_session(self):
