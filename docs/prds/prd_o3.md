@@ -111,10 +111,12 @@ GitHub Actions caches are **untrusted acceleration storage**, never a security b
   **strictly gated on**
   `(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && steps.restore.outputs.cache-hit != 'true'`,
   with `actions/checkout` pinned to `ref: ${{ github.sha }}` (zero custom ref inputs) and saving
-  only from a clean staging directory populated solely by SHA-256-verified downloads.
+  only from a clean staging directory populated solely by downloads verified according to the
+  per-payload rules in [Content-hashed cache key design](#content-hashed-cache-key-design).
 - **`pull_request` (same-repo and forks):** Runs **`actions/cache/restore` ONLY** (read-only against
-  `main`'s warm cache), verifies SHA-256 on hit, and performs a verified cold fetch if the PR
-  modifies a dependency manifest.
+  `main`'s warm cache), verifies every hit according to the per-payload rules in
+  [Content-hashed cache key design](#content-hashed-cache-key-design), and performs a verified cold
+  fetch if the PR modifies a dependency manifest.
 - **Pros:**
   - Near-100% cache hit rate across rapid multi-PR bursts (like PRs #57–#64, which all shared the
     exact same `mise.lock` and `coverage` wheel!).
