@@ -25,6 +25,10 @@ RELAY_ID = "d" * 64
 
 
 class PlanTests(TestCase):
+    def test_catalog_lists_the_same_services_when_archives_are_requested(self):
+        catalog = FixtureCatalog()
+        self.assertEqual(catalog.list_ids("service", include_archived=True), [CDP_SERVICE, PG_SERVICE])
+
     def test_compiler_omits_only_the_requested_service(self):
         full = compile_fixture(without_chromium=False)
         partial = compile_fixture(without_chromium=True)

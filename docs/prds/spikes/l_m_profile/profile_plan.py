@@ -66,7 +66,7 @@ class FixtureCatalog(PlanStoreView):
     def get(self, kind: str, obj_id: str, *, include_archived: bool = False) -> dict:
         return self.documents[kind, obj_id]
 
-    def list_ids(self, kind: str) -> list[str]:
+    def list_ids(self, kind: str, *, include_archived: bool = False) -> list[str]:
         return sorted(obj_id for doc_kind, obj_id in self.documents if doc_kind == kind)
 
     def get_revision(self, kind: str, obj_id: str) -> int:
