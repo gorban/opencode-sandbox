@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+import time
 from typing import Any, Literal, cast
 
 _RESTART_DIR = Path(__file__).resolve().parent
@@ -73,18 +74,21 @@ WORKER_FAILED_UNCERTAIN = "failed_uncertain"
 PURE_IDEMPOTENT_EFFECTS: frozenset[str] = frozenset(
     {EFFECT_READ_METRICS, "update_health_projection"}
 )
-assert PURE_IDEMPOTENT_EFFECTS.issubset(OBSERVE_ONLY_ALLOWED_EFFECTS)
+if not PURE_IDEMPOTENT_EFFECTS.issubset(OBSERVE_ONLY_ALLOWED_EFFECTS):
+    raise RuntimeError("PURE_IDEMPOTENT_EFFECTS must be a subset of OBSERVE_ONLY_ALLOWED_EFFECTS")
 
-_STATE_SHAPE_PRIMARY_EFFECT: Mapping[str, str] = {
-    "observe": EFFECT_READ_METRICS,
-    "deterministic": "launch_sandbox",
-    "ship_lane": EFFECT_SPAWN_LANE,
-    "scout_lane": EFFECT_SPAWN_LANE,
-    "parallel_lanes": EFFECT_SPAWN_LANE,
-    "wait_signal": EFFECT_READ_METRICS,
-    "human_gate_async": "pause_lane_gate",
-    "human_gate_blocking": "blocking_gate",
+_LANE_SHAPE_EFFECTS: frozenset[str] = frozenset({EFFECT_SPAWN_LANE, "acquire_lane_lease"})
+
+_STATE_SHAPE_IMPLIED_EFFECTS: Mapping[str, frozenset[str]] = {
+    "ship_lane": _LANE_SHAPE_EFFECTS,
+    "scout_lane": _LANE_SHAPE_EFFECTS,
+    "parallel_lanes": _LANE_SHAPE_EFFECTS,
+    "deterministic": frozenset({"launch_sandbox"}),
+    "human_gate_async": frozenset({"pause_lane_gate"}),
+    "human_gate_blocking": frozenset({"blocking_gate"}),
 }
+
+_REPLAY_DEADLINE_STRIDE = 64
 
 CORE_TABLE_NAMES: frozenset[str] = frozenset(
     {
@@ -113,6 +117,9 @@ ERR_CANNOT_REQUEUE = "cannot_requeue_cancelled_or_exhausted_step"
 ERR_SE_NO_AUTO_RETRY = "side_effecting_step_cannot_auto_retry"
 ERR_AUTH_REVOKED_PRE_ENTRY = "authority_revoked_pre_entry"
 ERR_AUTH_RETIRED_MID_STEP = "authority_retired_mid_step"
+ERR_AUTH_STORE_REQUIRED = "authority_store_required"
+ERR_CLOCK_PROVIDER_REQUIRED = "clock_provider_required_for_requeue"
+ERR_DUP_MATERIALIZED_KEY = "duplicate_materialized_key"
 ERR_MAX_ATTEMPTS_RECOVERY = "max_attempts_exceeded_on_recovery"
 ERR_RECOVERY_UNCERTAIN = "prior_epoch_side_effect_uncertain"
 ERR_RECOVERY_REQUEUE = "prior_epoch_pure_step_requeued"
@@ -158,6 +165,7 @@ KEY_REASON = "reason"
 KEY_RECON_EPOCH = "reconciled_epoch"
 KEY_RECON_KEY = "reconciliation_key"
 KEY_RECORDED_SEQ = "recorded_seq"
+KEY_REQUIRES_AUTHORITY = "requires_authority"
 KEY_RESOLUTION = "resolution"
 KEY_SIDE_EFFECTING = "side_effecting"
 KEY_SPEC_DIGEST = "spec_digest"
@@ -716,6 +724,7 @@ class CreateRunRequest:
     grant_generation: int
     steps: tuple[StepSpec, ...]
     clock: ClockSnapshot
+    requires_authority: bool = False
 
     def __post_init__(self) -> None:
         validate_opaque_id(self.run_id, "run_id")
@@ -725,6 +734,7 @@ class CreateRunRequest:
         validate_int64(self.grant_generation, KEY_GRANT_GENERATION, min_val=1)
         validate_step_dag(self.steps)
         clock_to_wall_us(self.clock)
+        validate_bool(self.requires_authority, KEY_REQUIRES_AUTHORITY)
 
 
 @dataclass(frozen=True)
@@ -918,6 +928,7 @@ class WorkflowRunRecord:
     spec_digest: str
     workflow_plan_digest: str
     grant_generation: int
+    requires_authority: bool
     status: RunStatus
     cancel_requested: bool
     created_epoch: int
@@ -1075,32 +1086,47 @@ def compute_run_status(
 
 
 def _pick_state_effect(state: Any, reachable: frozenset[str]) -> str:
-    if state.effects:
-        chosen = state.effects[0]
-    elif state.factory_id is not None:
-        chosen = "invoke_factory"
+    if len(state.effects) > 1:
+        raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
+    if state.shape not in ("observe", "wait_signal") and state.shape not in _STATE_SHAPE_IMPLIED_EFFECTS:
+        raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
+    combined: set[str] = set(state.effects)
+    combined.update(_STATE_SHAPE_IMPLIED_EFFECTS.get(state.shape, ()))
+    if state.factory_id is not None:
+        combined.add("invoke_factory")
+    if not combined:
+        chosen = EFFECT_READ_METRICS
+    elif len(combined) == 1:
+        chosen = next(iter(combined))
     else:
-        chosen = _STATE_SHAPE_PRIMARY_EFFECT.get(state.shape, EFFECT_READ_METRICS)
+        raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
     if chosen not in reachable:
         raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
     return chosen
 
 
-def derive_steps_from_plan(plan: CompiledWorkflowPlan) -> tuple[StepSpec, ...]:
-    """Derive the canonical acyclic StepSpec DAG strictly from an admitted CompiledWorkflowPlan."""
-    spec = plan.spec
-    if not spec.states:
-        raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
-    reachable = compute_reachable_effects(spec)
-    state_names = [st.name for st in spec.states]
+def _build_plan_deps_map(spec: Any, state_names: Sequence[str]) -> dict[str, list[str]]:
     state_set = set(state_names)
     deps_map: dict[str, list[str]] = {name: [] for name in state_names}
     for tr in spec.transitions:
+        if tr.predicate is not None or tr.effects:
+            raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
         if tr.src not in state_set or tr.dst not in state_set or tr.src == tr.dst:
             raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
         if tr.src in deps_map[tr.dst]:
             raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
         deps_map[tr.dst].append(tr.src)
+    return deps_map
+
+
+def derive_steps_from_plan(plan: CompiledWorkflowPlan) -> tuple[StepSpec, ...]:
+    """Derive the canonical acyclic StepSpec DAG strictly from an admitted CompiledWorkflowPlan."""
+    spec = plan.spec
+    if not spec.states or spec.timers or spec.signal_handlers:
+        raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
+    reachable = compute_reachable_effects(spec)
+    state_names = [st.name for st in spec.states]
+    deps_map = _build_plan_deps_map(spec, state_names)
     derived: list[StepSpec] = []
     for st in spec.states:
         effect = _pick_state_effect(st, reachable)
@@ -1133,6 +1159,7 @@ class _MutableReplayState:
     meta_updated_at_us: int = 0
     runs: dict[str, WorkflowRunRecord] = field(default_factory=dict)
     steps: dict[tuple[str, str], WorkflowStepRecord] = field(default_factory=dict)
+    steps_by_run: dict[str, list[str]] = field(default_factory=dict)
     idempotency_records: dict[tuple[str, str], StepIdempotencyRecord] = field(
         default_factory=dict
     )
@@ -1151,7 +1178,8 @@ def _run_steps_map(
     state: _MutableReplayState, run_id: str
 ) -> dict[str, WorkflowStepRecord]:
     return {
-        sid: rec for (rid, sid), rec in state.steps.items() if rid == run_id
+        sid: state.steps[(run_id, sid)]
+        for sid in state.steps_by_run.get(run_id, ())
     }
 
 
@@ -1165,6 +1193,54 @@ def _refresh_run_status(
     state.runs[run_id] = replace(run, status=new_status, updated_at_us=updated_at_us)
 
 
+_STARTED_PAYLOAD_KEYS = frozenset({KEY_DIRTY_RECOVERY, KEY_PRIOR_EPOCH})
+_RUN_CREATED_PAYLOAD_KEYS = frozenset(
+    {
+        KEY_GRANT_GENERATION,
+        KEY_REQUIRES_AUTHORITY,
+        KEY_SPEC_DIGEST,
+        "steps",
+        KEY_WORKFLOW_ID,
+        KEY_WORKFLOW_PLAN_DIGEST,
+    }
+)
+_STEP_PAYLOAD_KEYS = frozenset(
+    {
+        "step_id",
+        KEY_STATE_NAME,
+        KEY_EFFECT_KIND,
+        KEY_SIDE_EFFECTING,
+        KEY_DEPENDS_ON,
+        KEY_MAX_ATTEMPTS,
+    }
+)
+_STEP_LEASED_PAYLOAD_KEYS = frozenset(
+    {KEY_ATTEMPT_NO, KEY_IDEM_KEY, KEY_LEASE_EPOCH, KEY_SIDE_EFFECTING}
+)
+_STEP_COMPLETED_PAYLOAD_KEYS = frozenset(
+    {KEY_ATTEMPT_NO, KEY_IDEM_KEY, KEY_LEASE_EPOCH, KEY_OUTPUT_DIGEST}
+)
+_STEP_FAIL_PAYLOAD_KEYS = frozenset({KEY_ATTEMPT_NO, KEY_REASON, KEY_VIA_RECOVERY})
+_STEP_RECONCILED_PAYLOAD_KEYS = frozenset(
+    {
+        KEY_ATTEMPT_NO,
+        KEY_EVIDENCE_DIGEST,
+        KEY_OUTPUT_DIGEST,
+        KEY_REASON,
+        KEY_RECON_KEY,
+        KEY_RESOLUTION,
+    }
+)
+_RUN_CANCELLED_PAYLOAD_KEYS = frozenset({KEY_REASON})
+
+
+def _require_payload_keys(
+    payload: Mapping[str, Any], expected: frozenset[str], msg: str
+) -> None:
+    if not isinstance(payload, Mapping) or set(payload.keys()) != expected:
+        raise ReplayMismatchError(msg)
+
+
 def _update_idem_for_step(
     state: _MutableReplayState,
     step: WorkflowStepRecord,
@@ -1174,11 +1250,12 @@ def _update_idem_for_step(
     failure_reason: str | None,
     recorded_seq: int,
 ) -> None:
-    _require_replay(step.idempotency_key is not None, "missing_step_idem_key")
-    key = (step.run_id, str(step.idempotency_key))
+    if step.idempotency_key is None:
+        raise ReplayMismatchError("missing_step_idem_key")
+    key = (step.run_id, step.idempotency_key)
     existing = state.idempotency_records.get(key)
-    _require_replay(existing is not None, "missing_idempotency_record")
-    assert existing is not None
+    if existing is None:
+        raise ReplayMismatchError("missing_idempotency_record")
     state.idempotency_records[key] = replace(
         existing,
         outcome_status=outcome,
@@ -1191,10 +1268,12 @@ def _update_idem_for_step(
 def _apply_supervisor_started(state: _MutableReplayState, event: JournalEvent) -> None:
     _require_replay(event.run_id is None and event.step_id is None, "started_scope_invalid")
     payload = event.payload
+    _require_payload_keys(payload, _STARTED_PAYLOAD_KEYS, "started_payload_keys_invalid")
+    dirty_val = validate_bool(payload[KEY_DIRTY_RECOVERY], KEY_DIRTY_RECOVERY)
+    prior_ep = validate_int64(payload[KEY_PRIOR_EPOCH], KEY_PRIOR_EPOCH, min_val=0)
     if event.seq == 1:
         _require_replay(
-            event.supervisor_epoch == 1
-            and payload == {KEY_DIRTY_RECOVERY: False, KEY_PRIOR_EPOCH: 0},
+            event.supervisor_epoch == 1 and not dirty_val and prior_ep == 0,
             "invalid_genesis_started_event",
         )
     else:
@@ -1203,9 +1282,8 @@ def _apply_supervisor_started(state: _MutableReplayState, event: JournalEvent) -
         )
         _require_replay(
             event.supervisor_epoch == state.epoch + 1
-            and payload.get(KEY_PRIOR_EPOCH) == state.epoch
-            and payload.get(KEY_DIRTY_RECOVERY) is (state.dirty_shutdown == 1)
-            and set(payload.keys()) == {KEY_DIRTY_RECOVERY, KEY_PRIOR_EPOCH},
+            and prior_ep == state.epoch
+            and dirty_val is (state.dirty_shutdown == 1),
             "invalid_supervisor_started_transition",
         )
     state.dirty_shutdown = 1
@@ -1220,8 +1298,25 @@ def _apply_supervisor_started(state: _MutableReplayState, event: JournalEvent) -
 
 def _apply_supervisor_stopped(state: _MutableReplayState, event: JournalEvent) -> None:
     _require_replay(event.run_id is None and event.step_id is None, "stopped_scope_invalid")
-    _require_replay(event.payload == {}, "stopped_payload_invalid")
+    _require_payload_keys(event.payload, frozenset(), "stopped_payload_invalid")
     state.dirty_shutdown = 0
+
+
+def _decode_run_created_step(item: Any) -> StepSpec:
+    if not isinstance(item, dict):
+        raise ReplayMismatchError("run_created_step_not_dict")
+    _require_payload_keys(item, _STEP_PAYLOAD_KEYS, "run_created_step_keys_invalid")
+    raw_deps = item[KEY_DEPENDS_ON]
+    if not isinstance(raw_deps, list):
+        raise ReplayMismatchError("run_created_depends_not_list")
+    return StepSpec(
+        step_id=item["step_id"],
+        state_name=item[KEY_STATE_NAME],
+        effect_kind=item[KEY_EFFECT_KIND],
+        side_effecting=item[KEY_SIDE_EFFECTING],
+        depends_on=tuple(raw_deps),
+        max_attempts=item[KEY_MAX_ATTEMPTS],
+    )
 
 
 def _apply_run_created(state: _MutableReplayState, event: JournalEvent) -> None:
@@ -1230,29 +1325,23 @@ def _apply_run_created(state: _MutableReplayState, event: JournalEvent) -> None:
     _require_replay(run_id not in state.runs, "duplicate_run_id")
     _require_replay(len(state.runs) < MAX_RUNS, ERR_MAX_RUNS)
     p = event.payload
-    raw_steps = p.get("steps")
+    _require_payload_keys(p, _RUN_CREATED_PAYLOAD_KEYS, "run_created_payload_keys_invalid")
+    raw_steps = p["steps"]
     _require_replay(isinstance(raw_steps, list), "run_created_steps_invalid")
-    specs = tuple(
-        StepSpec(
-            step_id=item["step_id"],
-            state_name=item[KEY_STATE_NAME],
-            effect_kind=item[KEY_EFFECT_KIND],
-            side_effecting=item[KEY_SIDE_EFFECTING],
-            depends_on=tuple(item[KEY_DEPENDS_ON]),
-            max_attempts=item[KEY_MAX_ATTEMPTS],
-        )
-        for item in raw_steps
-    )
+    specs = tuple(_decode_run_created_step(item) for item in raw_steps)
     validate_step_dag(specs)
     state.runs[run_id] = WorkflowRunRecord(
         run_id=run_id,
-        workflow_id=validate_opaque_id(p.get(KEY_WORKFLOW_ID), KEY_WORKFLOW_ID),
-        spec_digest=validate_sha256_hex(p.get(KEY_SPEC_DIGEST), KEY_SPEC_DIGEST),
+        workflow_id=validate_opaque_id(p[KEY_WORKFLOW_ID], KEY_WORKFLOW_ID),
+        spec_digest=validate_sha256_hex(p[KEY_SPEC_DIGEST], KEY_SPEC_DIGEST),
         workflow_plan_digest=validate_sha256_hex(
-            p.get(KEY_WORKFLOW_PLAN_DIGEST), KEY_WORKFLOW_PLAN_DIGEST
+            p[KEY_WORKFLOW_PLAN_DIGEST], KEY_WORKFLOW_PLAN_DIGEST
         ),
         grant_generation=validate_int64(
-            p.get(KEY_GRANT_GENERATION), KEY_GRANT_GENERATION, min_val=1
+            p[KEY_GRANT_GENERATION], KEY_GRANT_GENERATION, min_val=1
+        ),
+        requires_authority=validate_bool(
+            p[KEY_REQUIRES_AUTHORITY], KEY_REQUIRES_AUTHORITY
         ),
         status=RunStatus.RUNNING,
         cancel_requested=False,
@@ -1260,6 +1349,7 @@ def _apply_run_created(state: _MutableReplayState, event: JournalEvent) -> None:
         created_at_us=event.created_at_us,
         updated_at_us=event.created_at_us,
     )
+    state.steps_by_run[run_id] = [spec.step_id for spec in specs]
     for order, spec in enumerate(specs):
         defn = StepDefinition(
             step_id=spec.step_id,
@@ -1289,8 +1379,8 @@ def _get_step_for_event(
     _require_replay(event.run_id is not None and event.step_id is not None, "step_event_scope")
     key = (str(event.run_id), str(event.step_id))
     step = state.steps.get(key)
-    _require_replay(step is not None, "unknown_step_in_event")
-    assert step is not None
+    if step is None:
+        raise ReplayMismatchError("unknown_step_in_event")
     return step
 
 
@@ -1308,14 +1398,16 @@ def _apply_step_leased(state: _MutableReplayState, event: JournalEvent) -> None:
             "lease_dependency_unmet",
         )
     p = event.payload
-    attempt_no = validate_int64(p.get(KEY_ATTEMPT_NO), KEY_ATTEMPT_NO, min_val=1)
-    lease_epoch = validate_int64(p.get(KEY_LEASE_EPOCH), KEY_LEASE_EPOCH, min_val=1)
-    idem_key = validate_opaque_id(p.get(KEY_IDEM_KEY), KEY_IDEM_KEY)
+    _require_payload_keys(p, _STEP_LEASED_PAYLOAD_KEYS, "step_leased_payload_keys_invalid")
+    attempt_no = validate_int64(p[KEY_ATTEMPT_NO], KEY_ATTEMPT_NO, min_val=1)
+    lease_epoch = validate_int64(p[KEY_LEASE_EPOCH], KEY_LEASE_EPOCH, min_val=1)
+    idem_key = validate_opaque_id(p[KEY_IDEM_KEY], KEY_IDEM_KEY)
+    side_eff = validate_bool(p[KEY_SIDE_EFFECTING], KEY_SIDE_EFFECTING)
     _require_replay(
         attempt_no == step.attempt_no + 1
         and attempt_no <= step.max_attempts
         and lease_epoch == event.supervisor_epoch
-        and p.get(KEY_SIDE_EFFECTING) is step.side_effecting,
+        and side_eff is step.side_effecting,
         "invalid_step_leased_payload",
     )
     idem_pk = (step.run_id, idem_key)
@@ -1344,15 +1436,31 @@ def _apply_step_leased(state: _MutableReplayState, event: JournalEvent) -> None:
     _refresh_run_status(state, step.run_id, event.created_at_us)
 
 
+def _require_settleable_run(state: _MutableReplayState, run_id: str) -> None:
+    run = state.runs[run_id]
+    _require_replay(
+        run.status in (RunStatus.RUNNING, RunStatus.PAUSED_NEEDS_RECONCILE)
+        and not run.cancel_requested,
+        "settle_on_non_active_run",
+    )
+
+
 def _apply_step_completed(state: _MutableReplayState, event: JournalEvent) -> None:
     step = _get_step_for_event(state, event)
+    _require_settleable_run(state, step.run_id)
     _require_replay(step.status is StepStatus.LEASED, "complete_on_non_leased_step")
     p = event.payload
-    out_digest = validate_sha256_hex(p.get(KEY_OUTPUT_DIGEST), KEY_OUTPUT_DIGEST)
+    _require_payload_keys(
+        p, _STEP_COMPLETED_PAYLOAD_KEYS, "step_completed_payload_keys_invalid"
+    )
+    attempt_no = validate_int64(p[KEY_ATTEMPT_NO], KEY_ATTEMPT_NO, min_val=1)
+    lease_epoch = validate_int64(p[KEY_LEASE_EPOCH], KEY_LEASE_EPOCH, min_val=1)
+    idem_key = validate_opaque_id(p[KEY_IDEM_KEY], KEY_IDEM_KEY)
+    out_digest = validate_sha256_hex(p[KEY_OUTPUT_DIGEST], KEY_OUTPUT_DIGEST)
     _require_replay(
-        p.get(KEY_ATTEMPT_NO) == step.attempt_no
-        and p.get(KEY_LEASE_EPOCH) == step.lease_epoch == event.supervisor_epoch
-        and p.get(KEY_IDEM_KEY) == step.idempotency_key,
+        attempt_no == step.attempt_no
+        and lease_epoch == step.lease_epoch == event.supervisor_epoch
+        and idem_key == step.idempotency_key,
         "complete_token_mismatch",
     )
     updated = cast(
@@ -1377,13 +1485,19 @@ def _apply_step_completed(state: _MutableReplayState, event: JournalEvent) -> No
     _refresh_run_status(state, step.run_id, event.created_at_us)
 
 
+def _parse_step_fail_payload(payload: Mapping[str, Any]) -> tuple[int, str, bool]:
+    _require_payload_keys(payload, _STEP_FAIL_PAYLOAD_KEYS, "step_fail_payload_keys_invalid")
+    attempt_no = validate_int64(payload[KEY_ATTEMPT_NO], KEY_ATTEMPT_NO, min_val=1)
+    reason = validate_reason(payload[KEY_REASON], KEY_REASON)
+    via_recovery = validate_bool(payload[KEY_VIA_RECOVERY], KEY_VIA_RECOVERY)
+    return attempt_no, reason, via_recovery
+
+
 def _apply_step_failed_terminal(state: _MutableReplayState, event: JournalEvent) -> None:
     step = _get_step_for_event(state, event)
     _require_replay(step.status is StepStatus.LEASED, "fail_on_non_leased_step")
-    p = event.payload
-    reason = validate_reason(p.get(KEY_REASON), KEY_REASON)
-    via_recovery = validate_bool(p.get(KEY_VIA_RECOVERY), KEY_VIA_RECOVERY)
-    _require_replay(p.get(KEY_ATTEMPT_NO) == step.attempt_no, "fail_attempt_mismatch")
+    attempt_no, reason, via_recovery = _parse_step_fail_payload(event.payload)
+    _require_replay(attempt_no == step.attempt_no, "fail_attempt_mismatch")
     if via_recovery:
         _require_replay(
             step.lease_epoch < event.supervisor_epoch
@@ -1392,6 +1506,7 @@ def _apply_step_failed_terminal(state: _MutableReplayState, event: JournalEvent)
             "invalid_recovery_fail_terminal",
         )
     else:
+        _require_settleable_run(state, step.run_id)
         _require_replay(
             step.lease_epoch == event.supervisor_epoch, "fail_epoch_mismatch"
         )
@@ -1424,10 +1539,8 @@ def _apply_step_requeued(state: _MutableReplayState, event: JournalEvent) -> Non
         not step.side_effecting and step.attempt_no < step.max_attempts,
         "invalid_requeue_step",
     )
-    p = event.payload
-    reason = validate_reason(p.get(KEY_REASON), KEY_REASON)
-    via_recovery = validate_bool(p.get(KEY_VIA_RECOVERY), KEY_VIA_RECOVERY)
-    _require_replay(p.get(KEY_ATTEMPT_NO) == step.attempt_no, "requeue_attempt_mismatch")
+    attempt_no, reason, via_recovery = _parse_step_fail_payload(event.payload)
+    _require_replay(attempt_no == step.attempt_no, "requeue_attempt_mismatch")
     if via_recovery:
         _require_replay(step.lease_epoch < event.supervisor_epoch, "requeue_epoch_invalid")
     else:
@@ -1456,13 +1569,12 @@ def _apply_step_marked_uncertain(state: _MutableReplayState, event: JournalEvent
         step.status is StepStatus.LEASED and step.side_effecting,
         "uncertain_requires_leased_side_effecting",
     )
-    p = event.payload
-    reason = validate_reason(p.get(KEY_REASON), KEY_REASON)
-    via_recovery = validate_bool(p.get(KEY_VIA_RECOVERY), KEY_VIA_RECOVERY)
-    _require_replay(p.get(KEY_ATTEMPT_NO) == step.attempt_no, "uncertain_attempt_mismatch")
+    attempt_no, reason, via_recovery = _parse_step_fail_payload(event.payload)
+    _require_replay(attempt_no == step.attempt_no, "uncertain_attempt_mismatch")
     if via_recovery:
         _require_replay(step.lease_epoch < event.supervisor_epoch, "uncertain_epoch_invalid")
     else:
+        _require_settleable_run(state, step.run_id)
         _require_replay(step.lease_epoch == event.supervisor_epoch, "uncertain_epoch_invalid")
     updated = cast(
         WorkflowStepRecord,
@@ -1516,26 +1628,30 @@ def _apply_step_reconciled(state: _MutableReplayState, event: JournalEvent) -> N
         "reconcile_requires_uncertain",
     )
     p = event.payload
-    recon_key = validate_opaque_id(p.get(KEY_RECON_KEY), KEY_RECON_KEY)
-    res_raw = p.get(KEY_RESOLUTION)
+    _require_payload_keys(
+        p, _STEP_RECONCILED_PAYLOAD_KEYS, "step_reconciled_payload_keys_invalid"
+    )
+    recon_key = validate_opaque_id(p[KEY_RECON_KEY], KEY_RECON_KEY)
+    res_raw = p[KEY_RESOLUTION]
     _require_replay(isinstance(res_raw, str), "invalid_resolution")
     try:
         resolution = ReconcileResolution(str(res_raw))
     except ValueError as exc:
         raise ReplayMismatchError("invalid_resolution") from exc
-    _require_replay(p.get(KEY_ATTEMPT_NO) == step.attempt_no, "reconcile_attempt_mismatch")
+    attempt_no = validate_int64(p[KEY_ATTEMPT_NO], KEY_ATTEMPT_NO, min_val=1)
+    _require_replay(attempt_no == step.attempt_no, "reconcile_attempt_mismatch")
     if resolution is ReconcileResolution.REQUEUE_PENDING:
         _require_replay(
             not run.cancel_requested and step.attempt_no < step.max_attempts,
             ERR_CANNOT_REQUEUE,
         )
-    out_digest = p.get(KEY_OUTPUT_DIGEST)
+    out_digest = p[KEY_OUTPUT_DIGEST]
     if resolution is ReconcileResolution.COMPLETED:
         out_digest = validate_sha256_hex(out_digest, KEY_OUTPUT_DIGEST)
     else:
         _require_replay(out_digest is None, "reconcile_unexpected_output_digest")
-    ev_digest = validate_sha256_hex(p.get(KEY_EVIDENCE_DIGEST), KEY_EVIDENCE_DIGEST)
-    reason = validate_reason(p.get(KEY_REASON), KEY_REASON)
+    ev_digest = validate_sha256_hex(p[KEY_EVIDENCE_DIGEST], KEY_EVIDENCE_DIGEST)
+    reason = validate_reason(p[KEY_REASON], KEY_REASON)
     recon_pk = (step.run_id, recon_key)
     _require_replay(recon_pk not in state.reconciliation_records, ERR_RECON_CONFLICT)
 
@@ -1625,14 +1741,16 @@ def _apply_run_cancelled(state: _MutableReplayState, event: JournalEvent) -> Non
     _require_replay(event.run_id is not None and event.step_id is None, "cancel_scope")
     run_id = str(event.run_id)
     run = state.runs.get(run_id)
-    _require_replay(
-        run is not None
-        and run.status not in TERMINAL_RUN_STATUSES
-        and not run.cancel_requested,
-        "cancel_invalid_run_state",
+    if (
+        run is None
+        or run.status in TERMINAL_RUN_STATUSES
+        or run.cancel_requested
+    ):
+        raise ReplayMismatchError("cancel_invalid_run_state")
+    _require_payload_keys(
+        event.payload, _RUN_CANCELLED_PAYLOAD_KEYS, "cancel_payload_keys_invalid"
     )
-    assert run is not None
-    reason = validate_reason(event.payload.get(KEY_REASON), KEY_REASON)
+    reason = validate_reason(event.payload[KEY_REASON], KEY_REASON)
     run_steps = sorted(
         _run_steps_map(state, run_id).values(), key=lambda s: (s.step_order, s.step_id)
     )
@@ -1696,15 +1814,30 @@ def apply_event_strict(state: _MutableReplayState, event: JournalEvent) -> None:
         )
         _check_recovery_drainage(state, event)
     handler = _EVENT_HANDLERS.get(event.event_type)
-    _require_replay(handler is not None, "unknown_event_type")
-    assert handler is not None
-    handler(state, event)
+    if handler is None:
+        raise ReplayMismatchError("unknown_event_type")
+    try:
+        handler(state, event)
+    except RestartValidationError as exc:
+        raise ReplayMismatchError(str(exc)) from exc
 
 
-def reduce_event_log(events: Sequence[JournalEvent]) -> ReplayedSnapshot:
+def _check_replay_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RestartStorageError(ERR_OP_DEADLINE)
+
+
+def reduce_event_log(
+    events: Sequence[JournalEvent],
+    *,
+    deadline: float | None = None,
+) -> ReplayedSnapshot:
     """Pure deterministic replay from seq 0 verifying unbroken SHA-256 chain & lifecycle."""
+    _check_replay_deadline(deadline)
     state = _MutableReplayState()
-    for event in events:
+    for idx, event in enumerate(events):
+        if idx % _REPLAY_DEADLINE_STRIDE == 0:
+            _check_replay_deadline(deadline)
         _require_replay(event.seq == state.last_seq + 1, "event_seq_gap_or_order")
         if not hmac.compare_digest(event.prev_hash, state.head_hash):
             raise JournalIntegrityError(ERR_HASH_CHAIN_BROKEN)
@@ -1725,6 +1858,7 @@ def reduce_event_log(events: Sequence[JournalEvent]) -> ReplayedSnapshot:
         state.last_seq = event.seq
         state.head_hash = event.entry_hash
         state.meta_updated_at_us = event.created_at_us
+    _check_replay_deadline(deadline)
     _require_replay(len(state.pending_recovery_queue) == 0, "incomplete_epoch_recovery")
     return ReplayedSnapshot(
         supervisor_epoch=state.epoch,
@@ -1747,8 +1881,10 @@ def verify_materialized_parity(
     actual_steps: Mapping[tuple[str, str], WorkflowStepRecord],
     actual_idems: Mapping[tuple[str, str], StepIdempotencyRecord],
     actual_recons: Mapping[tuple[str, str], StepReconciliationRecord],
+    deadline: float | None = None,
 ) -> None:
     """Unconditionally compare supervisor_meta and all 4 materialized tables against replay."""
+    _check_replay_deadline(deadline)
     _require_replay(meta.last_event_seq >= 1, ERR_INVALID_META_SEQ)
     meta_tuple = (
         meta.current_epoch,
@@ -1765,11 +1901,15 @@ def verify_materialized_parity(
         replayed.meta_updated_at_us,
     )
     _require_replay(meta_tuple == replayed_meta, ERR_MATERIALIZED_MISMATCH)
+    _check_replay_deadline(deadline)
     _require_replay(actual_runs == replayed.runs, ERR_MATERIALIZED_MISMATCH)
+    _check_replay_deadline(deadline)
     _require_replay(actual_steps == replayed.steps, ERR_MATERIALIZED_MISMATCH)
+    _check_replay_deadline(deadline)
     _require_replay(
         actual_idems == replayed.idempotency_records, ERR_MATERIALIZED_MISMATCH
     )
+    _check_replay_deadline(deadline)
     _require_replay(
         actual_recons == replayed.reconciliation_records, ERR_MATERIALIZED_MISMATCH
     )
@@ -1790,12 +1930,20 @@ class _AttemptRecord:
 class SyntheticEffectTracker:
     """External side-effect ledger surviving crashes, enforcing attempt admission & receipts."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, history_start_epoch: int = 1) -> None:
+        start_ep = validate_int64(history_start_epoch, "history_start_epoch", min_val=1)
         self._lock = threading.Lock()
-        self._fenced_before_epoch = 1
+        self._history_start_epoch = start_ep
+        self._attached = False
+        self._fenced_before_epoch = start_ep
         self._fenced_attempts: set[_AttemptKey] = set()
         self._attempts: dict[_AttemptKey, _AttemptRecord] = {}
         self._exec_counts: dict[tuple[str, str], int] = {}
+
+    @property
+    def history_start_epoch(self) -> int:
+        with self._lock:
+            return self._history_start_epoch
 
     @staticmethod
     def _key_for(token: StepLeaseToken) -> _AttemptKey:
@@ -1806,6 +1954,14 @@ class SyntheticEffectTracker:
             token.lease_epoch,
             token.idempotency_key,
         )
+
+    def attach_epoch(self, supervisor_epoch: int) -> None:
+        ep = validate_int64(supervisor_epoch, "supervisor_epoch", min_val=1)
+        with self._lock:
+            if not self._attached:
+                self._attached = True
+                self._history_start_epoch = max(self._history_start_epoch, ep)
+            self._fenced_before_epoch = max(self._fenced_before_epoch, ep)
 
     def fence_epoch(self, min_active_epoch: int) -> None:
         with self._lock:
@@ -1835,6 +1991,7 @@ class SyntheticEffectTracker:
             rec = self._attempts.get(key)
             if rec is None or rec.status != "admitted":
                 raise InvalidStepTransitionError("attempt_not_admitted")
+            self._attempts[key] = _AttemptRecord(status="running")
             self._exec_counts[(token.run_id, token.step_id)] = (
                 self._exec_counts.get((token.run_id, token.step_id), 0) + 1
             )
@@ -1856,11 +2013,13 @@ class SyntheticEffectTracker:
 
     @staticmethod
     def _resolve_receipt_outcome(
-        rec: _AttemptRecord | None, *, fenced: bool
+        rec: _AttemptRecord | None, *, fenced: bool, has_history: bool
     ) -> tuple[TrackerOutcome, str | None]:
         if rec is not None and rec.status == OUTCOME_EFFECT_APPLIED:
             return OUTCOME_EFFECT_APPLIED, rec.output_digest
-        if rec is not None and rec.status in ("admitted", OUTCOME_STILL_PENDING):
+        if rec is not None and rec.status in ("admitted", "running", OUTCOME_STILL_PENDING):
+            return OUTCOME_STILL_PENDING, None
+        if rec is None and not has_history:
             return OUTCOME_STILL_PENDING, None
         return (OUTCOME_NO_EFFECT if fenced else OUTCOME_STILL_PENDING), None
 
@@ -1880,8 +2039,9 @@ class SyntheticEffectTracker:
                 or token.lease_epoch < current_epoch
                 or key in self._fenced_attempts
             )
+            has_history = token.lease_epoch >= self._history_start_epoch
             outcome, out_digest = self._resolve_receipt_outcome(
-                self._attempts.get(key), fenced=fenced
+                self._attempts.get(key), fenced=fenced, has_history=has_history
             )
         digest = compute_tracker_receipt_digest(
             run_id=token.run_id,

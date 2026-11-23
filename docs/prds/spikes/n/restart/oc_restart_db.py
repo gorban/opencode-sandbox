@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import errno
 import fcntl
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import sys
 import time
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import quote
 
 _RESTART_DIR = Path(__file__).resolve().parent
@@ -26,6 +27,7 @@ from oc_broker_common import _UMASK_LOCK  # noqa: E402
 from oc_restart_contract import (  # noqa: E402
     ALLOWED_EFFECTS,
     CORE_TABLE_NAMES,
+    ERR_DUP_MATERIALIZED_KEY,
     ERR_EXTRA_ROWS,
     ERR_INVALID_META_SEQ,
     ERR_JOURNAL_CORRUPT,
@@ -56,6 +58,8 @@ from oc_restart_contract import (  # noqa: E402
     KEY_RECON_EPOCH,
     KEY_RECON_KEY,
     KEY_RECORDED_SEQ,
+    KEY_REQUIRES_AUTHORITY,
+    KEY_RESOLUTION,
     KEY_SIDE_EFFECTING,
     KEY_SPEC_DIGEST,
     KEY_STATE_NAME,
@@ -68,6 +72,7 @@ from oc_restart_contract import (  # noqa: E402
     MAX_ID_BYTES,
     MAX_REASON_BYTES,
     MAX_STEP_ATTEMPTS,
+    PURE_IDEMPOTENT_EFFECTS,
     EventType,
     IdempotencyOutcome,
     JournalEvent,
@@ -102,13 +107,26 @@ DB_FILENAME = "workflow_restart.sqlite"
 DB_ALL_FILES: tuple[str, ...] = ("", "-wal", "-shm", "-journal")
 LOCK_FILENAME = ".workflow_restart.lock"
 
+_COL_DIRTY_SHUTDOWN = "dirty_shutdown"
+_COL_OUTCOME_STATUS = "outcome_status"
+_COL_EVENT_TYPE = "event_type"
+
+_TBL_META = "supervisor_meta"
+_TBL_RUNS = "workflow_runs"
+_TBL_STEPS = "workflow_steps"
+_TBL_IDEM = "step_idempotency_keys"
+_TBL_RECON = "step_reconciliations"
+_TBL_EVENTS = "workflow_event_log"
+
 _NON_META_TABLES: tuple[str, ...] = (
-    "workflow_runs",
-    "workflow_steps",
-    "step_idempotency_keys",
-    "step_reconciliations",
-    "workflow_event_log",
+    _TBL_RUNS,
+    _TBL_STEPS,
+    _TBL_IDEM,
+    _TBL_RECON,
+    _TBL_EVENTS,
 )
+
+_AUTOINDEX_NAME_RE = re.compile(r"^sqlite_autoindex_[a-zA-Z\d_]+_\d+$", re.ASCII)
 
 _DEADLINE_CHECK_STRIDE = 128
 
@@ -130,6 +148,7 @@ _SCHEMA_SQL: tuple[str, ...] = (
         spec_digest TEXT NOT NULL,
         workflow_plan_digest TEXT NOT NULL,
         grant_generation INTEGER NOT NULL CHECK (grant_generation >= 1),
+        requires_authority INTEGER NOT NULL DEFAULT 0 CHECK (requires_authority IN (0, 1)),
         status TEXT NOT NULL,
         cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0, 1)),
         created_epoch INTEGER NOT NULL CHECK (created_epoch >= 1),
@@ -583,31 +602,209 @@ _SQL_INSPECT_SCHEMA = (
     "CASE WHEN typeof(name) = 'text' AND LENGTH(CAST(name AS BLOB)) <= 128 THEN name ELSE NULL END AS name, "
     "CASE WHEN typeof(tbl_name) = 'text' AND LENGTH(CAST(tbl_name AS BLOB)) <= 128 THEN tbl_name ELSE NULL END AS tbl_name, "
     "CASE WHEN typeof(rootpage) = 'integer' THEN rootpage ELSE NULL END AS rootpage, "
+    "(sql IS NULL) AS sql_is_null, "
     "(typeof(type) != 'text' OR typeof(name) != 'text' OR typeof(tbl_name) != 'text' "
     "OR typeof(rootpage) != 'integer') AS meta_malformed "
     "FROM main.sqlite_schema LIMIT ?"
 )
 
 
+def _check_schema_table_row(
+    name: Any, rootpage: Any, found_core: set[str]
+) -> None:
+    if isinstance(name, str) and name.startswith("sqlite_"):
+        return
+    if name not in CORE_TABLE_NAMES or type(rootpage) is not int or rootpage <= 0:
+        raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+    found_core.add(name)
+
+
+def _check_schema_index_row(row: dict[str, Any], name: Any, tbl_name: Any) -> None:
+    valid_autoindex = (
+        tbl_name in CORE_TABLE_NAMES
+        and isinstance(name, str)
+        and _AUTOINDEX_NAME_RE.fullmatch(name) is not None
+        and row.get("sql_is_null") == 1
+    )
+    if not valid_autoindex:
+        raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+
+
 def _check_schema_row(row: dict[str, Any], found_core: set[str]) -> None:
     if row.get("meta_malformed") != 0:
         raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
     obj_type = row.get("type")
-    name = row.get("name")
-    tbl_name = row.get("tbl_name")
-    rootpage = row.get("rootpage")
     if obj_type == "table":
-        if isinstance(name, str) and name.startswith("sqlite_"):
-            return
-        if name not in CORE_TABLE_NAMES or type(rootpage) is not int or rootpage <= 0:
-            raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
-        found_core.add(name)
+        _check_schema_table_row(row.get("name"), row.get("rootpage"), found_core)
         return
     if obj_type == "index":
-        if tbl_name not in CORE_TABLE_NAMES:
-            raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+        _check_schema_index_row(row, row.get("name"), row.get("tbl_name"))
         return
     raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+
+
+_CORE_TABLE_PKS: dict[str, tuple[str, ...]] = {
+    _TBL_META: ("id",),
+    _TBL_RUNS: ("run_id",),
+    _TBL_STEPS: ("run_id", "step_id"),
+    _TBL_IDEM: ("run_id", KEY_IDEM_KEY),
+    _TBL_RECON: ("run_id", KEY_RECON_KEY),
+    _TBL_EVENTS: ("seq",),
+}
+
+_CORE_TABLE_COLS: dict[str, frozenset[str]] = {
+    _TBL_META: frozenset(
+        {
+            "id",
+            KEY_CURRENT_EPOCH,
+            KEY_LAST_EVENT_SEQ,
+            "head_hash",
+            _COL_DIRTY_SHUTDOWN,
+            KEY_UPDATED_AT_US,
+        }
+    ),
+    _TBL_RUNS: frozenset(
+        {
+            "run_id",
+            KEY_WORKFLOW_ID,
+            KEY_SPEC_DIGEST,
+            KEY_WORKFLOW_PLAN_DIGEST,
+            KEY_GRANT_GENERATION,
+            KEY_REQUIRES_AUTHORITY,
+            "status",
+            KEY_CANCEL_REQUESTED,
+            KEY_CREATED_EPOCH,
+            KEY_CREATED_AT_US,
+            KEY_UPDATED_AT_US,
+        }
+    ),
+    _TBL_STEPS: frozenset(
+        {
+            "run_id",
+            "step_id",
+            KEY_STEP_ORDER,
+            KEY_STATE_NAME,
+            KEY_EFFECT_KIND,
+            KEY_SIDE_EFFECTING,
+            "depends_on_json",
+            KEY_MAX_ATTEMPTS,
+            "status",
+            KEY_ATTEMPT_NO,
+            KEY_LEASE_EPOCH,
+            KEY_IDEM_KEY,
+            KEY_OUTPUT_DIGEST,
+            KEY_FAILURE_REASON,
+            KEY_UPDATED_AT_US,
+        }
+    ),
+    _TBL_IDEM: frozenset(
+        {
+            "run_id",
+            KEY_IDEM_KEY,
+            "step_id",
+            KEY_ATTEMPT_NO,
+            KEY_LEASE_EPOCH,
+            _COL_OUTCOME_STATUS,
+            KEY_OUTPUT_DIGEST,
+            KEY_FAILURE_REASON,
+            KEY_RECORDED_SEQ,
+        }
+    ),
+    _TBL_RECON: frozenset(
+        {
+            "run_id",
+            KEY_RECON_KEY,
+            "step_id",
+            KEY_ATTEMPT_NO,
+            KEY_RECON_EPOCH,
+            KEY_RESOLUTION,
+            KEY_OUTPUT_DIGEST,
+            KEY_EVIDENCE_DIGEST,
+            "reason",
+            KEY_RECORDED_SEQ,
+        }
+    ),
+    _TBL_EVENTS: frozenset(
+        {
+            "seq",
+            KEY_SUPERVISOR_EPOCH,
+            _COL_EVENT_TYPE,
+            "run_id",
+            "step_id",
+            "payload_json",
+            KEY_CREATED_AT_US,
+            "prev_hash",
+            KEY_ENTRY_HASH,
+        }
+    ),
+}
+
+_CORE_TABLE_REQUIRED_UNIQUES: dict[str, frozenset[tuple[str, ...]]] = {
+    _TBL_IDEM: frozenset({("run_id", "step_id", KEY_ATTEMPT_NO)}),
+}
+
+
+def _verify_core_table_columns_and_pk(
+    conn: sqlite3.Connection, table_name: str, deadline: float
+) -> None:
+    cols = execute_bounded(
+        conn, f"PRAGMA main.table_info('{table_name}')", (), deadline
+    ).fetchall()
+    col_names: set[str] = set()
+    pk_pairs: list[tuple[int, str]] = []
+    for col in cols:
+        col_name = col.get("name")
+        if not isinstance(col_name, str):
+            raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+        col_names.add(col_name)
+        pk_ord = col.get("pk")
+        if type(pk_ord) is int and pk_ord > 0:
+            pk_pairs.append((pk_ord, col_name))
+    pk_pairs.sort(key=lambda pair: pair[0])
+    if col_names != _CORE_TABLE_COLS[table_name]:
+        raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+    if tuple(name for _, name in pk_pairs) != _CORE_TABLE_PKS[table_name]:
+        raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+
+
+def _read_unique_index_cols(
+    conn: sqlite3.Connection, idx_name: str, deadline: float
+) -> tuple[str, ...]:
+    if _AUTOINDEX_NAME_RE.fullmatch(idx_name) is None:
+        raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+    info_rows = execute_bounded(
+        conn, f"PRAGMA main.index_info('{idx_name}')", (), deadline
+    ).fetchall()
+    pairs: list[tuple[int, str]] = []
+    for item in info_rows:
+        seqno = item.get("seqno")
+        cname = item.get("name")
+        if type(seqno) is not int or not isinstance(cname, str):
+            raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+        pairs.append((seqno, cname))
+    pairs.sort(key=lambda pair: pair[0])
+    return tuple(cname for _, cname in pairs)
+
+
+def _verify_core_table_uniques(
+    conn: sqlite3.Connection, table_name: str, deadline: float
+) -> None:
+    required = _CORE_TABLE_REQUIRED_UNIQUES.get(table_name)
+    if not required:
+        return
+    idx_rows = execute_bounded(
+        conn, f"PRAGMA main.index_list('{table_name}')", (), deadline
+    ).fetchall()
+    found: set[tuple[str, ...]] = set()
+    for idx in idx_rows:
+        if idx.get("unique") != 1 or idx.get("partial") != 0:
+            continue
+        idx_name = idx.get("name")
+        if not isinstance(idx_name, str):
+            raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+        found.add(_read_unique_index_cols(conn, idx_name, deadline))
+    if not required.issubset(found):
+        raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
 
 
 def _verify_core_table_pragma(
@@ -625,6 +822,8 @@ def _verify_core_table_pragma(
         or info.get("type") != "table"
     ):
         raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+    _verify_core_table_columns_and_pk(conn, table_name, deadline)
+    _verify_core_table_uniques(conn, table_name, deadline)
 
 
 def verify_no_unexpected_schema_objects(
@@ -736,7 +935,7 @@ _SQL_SELECT_META = (
     f"{_sql_int(KEY_CURRENT_EPOCH)}, "
     f"{_sql_int(KEY_LAST_EVENT_SEQ)}, "
     f"{_sql_sha256('head_hash')}, "
-    f"{_sql_bool('dirty_shutdown')}, "
+    f"{_sql_bool(_COL_DIRTY_SHUTDOWN)}, "
     f"{_sql_int(KEY_UPDATED_AT_US)} "
     "FROM supervisor_meta LIMIT 2"
 )
@@ -747,6 +946,7 @@ _SQL_SELECT_RUNS_COLS = (
     f"{_sql_sha256(KEY_SPEC_DIGEST)}, "
     f"{_sql_sha256(KEY_WORKFLOW_PLAN_DIGEST)}, "
     f"{_sql_int(KEY_GRANT_GENERATION)}, "
+    f"{_sql_bool(KEY_REQUIRES_AUTHORITY)}, "
     f"{_sql_text('status', 64)}, "
     f"{_sql_bool(KEY_CANCEL_REQUESTED)}, "
     f"{_sql_int(KEY_CREATED_EPOCH)}, "
@@ -778,7 +978,7 @@ _SQL_SELECT_IDEM_COLS = (
     f"{_sql_text('step_id', 64)}, "
     f"{_sql_int(KEY_ATTEMPT_NO)}, "
     f"{_sql_int(KEY_LEASE_EPOCH)}, "
-    f"{_sql_text('outcome_status', 64)}, "
+    f"{_sql_text(_COL_OUTCOME_STATUS, 64)}, "
     f"{_sql_sha256(KEY_OUTPUT_DIGEST, nullable=True)}, "
     f"{_sql_text(KEY_FAILURE_REASON, MAX_REASON_BYTES, nullable=True)}, "
     f"{_sql_int(KEY_RECORDED_SEQ)}"
@@ -800,7 +1000,7 @@ _SQL_SELECT_RECON_COLS = (
 _SQL_SELECT_EVENTS_COLS = (
     f"{_sql_int('seq')}, "
     f"{_sql_int(KEY_SUPERVISOR_EPOCH)}, "
-    f"{_sql_text('event_type', 64)}, "
+    f"{_sql_text(_COL_EVENT_TYPE, 64)}, "
     f"{_sql_text('run_id', MAX_ID_BYTES, nullable=True)}, "
     f"{_sql_text('step_id', 64, nullable=True)}, "
     f"{_sql_json_blob('payload_json', 'payload_blob')}, "
@@ -833,6 +1033,7 @@ def _decode_run_row(row: dict[str, Any]) -> WorkflowRunRecord:
             grant_generation=validate_int64(
                 row[KEY_GRANT_GENERATION], KEY_GRANT_GENERATION, min_val=1
             ),
+            requires_authority=bool(row[KEY_REQUIRES_AUTHORITY]),
             status=RunStatus(row["status"]),
             cancel_requested=bool(row[KEY_CANCEL_REQUESTED]),
             created_epoch=validate_int64(
@@ -857,6 +1058,9 @@ def _decode_step_row(row: dict[str, Any]) -> WorkflowStepRecord:
         effect = row[KEY_EFFECT_KIND]
         if effect not in ALLOWED_EFFECTS:
             raise JournalIntegrityError(ERR_MALFORMED_STORAGE)
+        side_effecting = bool(row[KEY_SIDE_EFFECTING])
+        if effect not in PURE_IDEMPOTENT_EFFECTS and not side_effecting:
+            raise JournalIntegrityError(ERR_MALFORMED_STORAGE)
         max_att = validate_int64(row[KEY_MAX_ATTEMPTS], KEY_MAX_ATTEMPTS, min_val=1)
         if max_att > MAX_STEP_ATTEMPTS:
             raise JournalIntegrityError(ERR_MALFORMED_STORAGE)
@@ -865,7 +1069,7 @@ def _decode_step_row(row: dict[str, Any]) -> WorkflowStepRecord:
             step_order=validate_int64(row[KEY_STEP_ORDER], KEY_STEP_ORDER, min_val=0),
             state_name=validate_step_id(row[KEY_STATE_NAME], KEY_STATE_NAME),
             effect_kind=effect,
-            side_effecting=bool(row[KEY_SIDE_EFFECTING]),
+            side_effecting=side_effecting,
             depends_on=deps,
             max_attempts=max_att,
         )
@@ -1046,108 +1250,122 @@ def stream_event_log_strict(
     return events
 
 
-def read_runs_strict(
-    conn: sqlite3.Connection, *, max_rows: int, deadline: float
-) -> dict[str, WorkflowRunRecord]:
-    cur = execute_bounded(
-        conn,
-        f"SELECT {_SQL_SELECT_RUNS_COLS} FROM workflow_runs LIMIT ?",
-        (max_rows + 1,),
-        deadline,
-    )
-    out: dict[str, WorkflowRunRecord] = {}
+_K = TypeVar("_K")
+_V = TypeVar("_V")
+
+
+def _read_table_strict(
+    conn: sqlite3.Connection,
+    sql: str,
+    *,
+    max_rows: int,
+    deadline: float,
+    decoder: Callable[[dict[str, Any]], _V],
+    key_fn: Callable[[_V], _K],
+) -> dict[_K, _V]:
+    cur = execute_bounded(conn, sql, (max_rows + 1,), deadline)
+    out: dict[_K, _V] = {}
     for idx, row in enumerate(cur):
         if idx % _DEADLINE_CHECK_STRIDE == 0:
             check_deadline_ms(deadline)
-        if len(out) >= max_rows:
+        if idx >= max_rows:
             raise ReplayMismatchError(ERR_EXTRA_ROWS)
-        rec = _decode_run_row(row)
-        out[rec.run_id] = rec
+        rec = decoder(row)
+        pk = key_fn(rec)
+        if pk in out:
+            raise ReplayMismatchError(ERR_DUP_MATERIALIZED_KEY)
+        out[pk] = rec
     return out
+
+
+def _fetch_single_row_strict(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: tuple[Any, ...],
+    deadline: float,
+    decoder: Callable[[dict[str, Any]], _V],
+) -> _V | None:
+    rows = execute_bounded(conn, sql, params, deadline).fetchall()
+    if len(rows) > 1:
+        raise JournalIntegrityError(ERR_DUP_MATERIALIZED_KEY)
+    return None if not rows else decoder(rows[0])
+
+
+def read_runs_strict(
+    conn: sqlite3.Connection, *, max_rows: int, deadline: float
+) -> dict[str, WorkflowRunRecord]:
+    return _read_table_strict(
+        conn,
+        f"SELECT {_SQL_SELECT_RUNS_COLS} FROM workflow_runs LIMIT ?",
+        max_rows=max_rows,
+        deadline=deadline,
+        decoder=_decode_run_row,
+        key_fn=lambda rec: rec.run_id,
+    )
 
 
 def read_steps_strict(
     conn: sqlite3.Connection, *, max_rows: int, deadline: float
 ) -> dict[tuple[str, str], WorkflowStepRecord]:
-    cur = execute_bounded(
+    return _read_table_strict(
         conn,
         f"SELECT {_SQL_SELECT_STEPS_COLS} FROM workflow_steps LIMIT ?",
-        (max_rows + 1,),
-        deadline,
+        max_rows=max_rows,
+        deadline=deadline,
+        decoder=_decode_step_row,
+        key_fn=lambda rec: (rec.run_id, rec.step_id),
     )
-    out: dict[tuple[str, str], WorkflowStepRecord] = {}
-    for idx, row in enumerate(cur):
-        if idx % _DEADLINE_CHECK_STRIDE == 0:
-            check_deadline_ms(deadline)
-        if len(out) >= max_rows:
-            raise ReplayMismatchError(ERR_EXTRA_ROWS)
-        rec = _decode_step_row(row)
-        out[(rec.run_id, rec.step_id)] = rec
-    return out
 
 
 def read_idempotency_strict(
     conn: sqlite3.Connection, *, max_rows: int, deadline: float
 ) -> dict[tuple[str, str], StepIdempotencyRecord]:
-    cur = execute_bounded(
+    return _read_table_strict(
         conn,
         f"SELECT {_SQL_SELECT_IDEM_COLS} FROM step_idempotency_keys LIMIT ?",
-        (max_rows + 1,),
-        deadline,
+        max_rows=max_rows,
+        deadline=deadline,
+        decoder=_decode_idem_row,
+        key_fn=lambda rec: (rec.run_id, rec.idempotency_key),
     )
-    out: dict[tuple[str, str], StepIdempotencyRecord] = {}
-    for idx, row in enumerate(cur):
-        if idx % _DEADLINE_CHECK_STRIDE == 0:
-            check_deadline_ms(deadline)
-        if len(out) >= max_rows:
-            raise ReplayMismatchError(ERR_EXTRA_ROWS)
-        rec = _decode_idem_row(row)
-        out[(rec.run_id, rec.idempotency_key)] = rec
-    return out
 
 
 def read_reconciliations_strict(
     conn: sqlite3.Connection, *, max_rows: int, deadline: float
 ) -> dict[tuple[str, str], StepReconciliationRecord]:
-    cur = execute_bounded(
+    return _read_table_strict(
         conn,
         f"SELECT {_SQL_SELECT_RECON_COLS} FROM step_reconciliations LIMIT ?",
-        (max_rows + 1,),
-        deadline,
+        max_rows=max_rows,
+        deadline=deadline,
+        decoder=_decode_recon_row,
+        key_fn=lambda rec: (rec.run_id, rec.reconciliation_key),
     )
-    out: dict[tuple[str, str], StepReconciliationRecord] = {}
-    for idx, row in enumerate(cur):
-        if idx % _DEADLINE_CHECK_STRIDE == 0:
-            check_deadline_ms(deadline)
-        if len(out) >= max_rows:
-            raise ReplayMismatchError(ERR_EXTRA_ROWS)
-        rec = _decode_recon_row(row)
-        out[(rec.run_id, rec.reconciliation_key)] = rec
-    return out
 
 
 def read_run_by_id_strict(
     conn: sqlite3.Connection, run_id: str, deadline: float
 ) -> WorkflowRunRecord | None:
-    row = execute_bounded(
+    return _fetch_single_row_strict(
         conn,
-        f"SELECT {_SQL_SELECT_RUNS_COLS} FROM workflow_runs WHERE run_id = ?",
+        f"SELECT {_SQL_SELECT_RUNS_COLS} FROM workflow_runs WHERE run_id = ? LIMIT 2",
         (run_id,),
         deadline,
-    ).fetchone()
-    return None if row is None else _decode_run_row(row)
+        _decode_run_row,
+    )
 
 
 def read_step_by_pk_strict(
     conn: sqlite3.Connection, run_id: str, step_id: str, deadline: float
 ) -> WorkflowStepRecord | None:
-    row = execute_bounded(
+    return _fetch_single_row_strict(
         conn,
-        f"SELECT {_SQL_SELECT_STEPS_COLS} FROM workflow_steps WHERE run_id = ? AND step_id = ?",
+        f"SELECT {_SQL_SELECT_STEPS_COLS} FROM workflow_steps "
+        "WHERE run_id = ? AND step_id = ? LIMIT 2",
         (run_id, step_id),
         deadline,
-    ).fetchone()
-    return None if row is None else _decode_step_row(row)
+        _decode_step_row,
+    )
 
 
 def read_run_steps_strict(
@@ -1160,33 +1378,39 @@ def read_run_steps_strict(
         (run_id,),
         deadline,
     ).fetchall()
-    return {rec.step_id: rec for rec in (_decode_step_row(r) for r in rows)}
+    out: dict[str, WorkflowStepRecord] = {}
+    for row in rows:
+        rec = _decode_step_row(row)
+        if rec.step_id in out:
+            raise JournalIntegrityError(ERR_DUP_MATERIALIZED_KEY)
+        out[rec.step_id] = rec
+    return out
 
 
 def read_idem_by_pk_strict(
     conn: sqlite3.Connection, run_id: str, idempotency_key: str, deadline: float
 ) -> StepIdempotencyRecord | None:
-    row = execute_bounded(
+    return _fetch_single_row_strict(
         conn,
         f"SELECT {_SQL_SELECT_IDEM_COLS} FROM step_idempotency_keys "
-        "WHERE run_id = ? AND idempotency_key = ?",
+        "WHERE run_id = ? AND idempotency_key = ? LIMIT 2",
         (run_id, idempotency_key),
         deadline,
-    ).fetchone()
-    return None if row is None else _decode_idem_row(row)
+        _decode_idem_row,
+    )
 
 
 def read_recon_by_pk_strict(
     conn: sqlite3.Connection, run_id: str, reconciliation_key: str, deadline: float
 ) -> StepReconciliationRecord | None:
-    row = execute_bounded(
+    return _fetch_single_row_strict(
         conn,
         f"SELECT {_SQL_SELECT_RECON_COLS} FROM step_reconciliations "
-        "WHERE run_id = ? AND reconciliation_key = ?",
+        "WHERE run_id = ? AND reconciliation_key = ? LIMIT 2",
         (run_id, reconciliation_key),
         deadline,
-    ).fetchone()
-    return None if row is None else _decode_recon_row(row)
+        _decode_recon_row,
+    )
 
 
 def count_obligations_strict(conn: sqlite3.Connection, deadline: float) -> tuple[int, int]:

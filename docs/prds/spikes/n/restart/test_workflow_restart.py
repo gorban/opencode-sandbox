@@ -60,6 +60,7 @@ from oc_restart_contract import (  # noqa: E402
     StepLeaseToken,
     StepSpec,
     StepStatus,
+    SupervisorMetaRecord,
     SyntheticEffectTracker,
     WorkerStepResult,
     compute_event_hash,
@@ -67,11 +68,15 @@ from oc_restart_contract import (  # noqa: E402
     compute_tracker_receipt_digest,
     derive_steps_from_plan,
     reduce_event_log,
+    verify_materialized_parity,
 )
 from oc_restart_db import (  # noqa: E402
     DB_FILENAME,
     LOCK_FILENAME,
     open_sqlite_bounded,
+    read_step_by_pk_strict,
+    read_steps_strict,
+    safe_rollback_and_close,
 )
 from oc_restart_store import (  # noqa: E402
     DurableWorkflowSupervisor,
@@ -183,7 +188,7 @@ effects = ["read_metrics"]
 [[states]]
 name = "apply_patch"
 shape = "deterministic"
-effects = ["stage_patch"]
+effects = ["launch_sandbox"]
 
 [[states]]
 name = "verify"
@@ -1624,7 +1629,7 @@ class TestCapacityHeadroomAndTamperDefense(_RestartFixtureBase):
             ("UPDATE workflow_steps SET updated_at_us = 1 WHERE run_id = 'run_t'", ()),
             (
                 "INSERT INTO workflow_runs VALUES "
-                "('extra_r', 'user/x', ?, ?, 1, 'running', 0, 1, 1, 1)",
+                "('extra_r', 'user/x', ?, ?, 1, 0, 'running', 0, 1, 1, 1)",
                 (_DIGEST_1, _DIGEST_2),
             ),
             (
@@ -1740,6 +1745,7 @@ class TestCapacityHeadroomAndTamperDefense(_RestartFixtureBase):
             run_id="r1",
             payload={
                 "grant_generation": 1,
+                "requires_authority": False,
                 "spec_digest": _DIGEST_1,
                 "steps": [
                     StepSpec("s1", "s1", "read_metrics", False).to_payload_dict()
@@ -1771,6 +1777,7 @@ class TestCapacityHeadroomAndTamperDefense(_RestartFixtureBase):
             run_id="r1",
             payload={
                 "grant_generation": 1,
+                "requires_authority": False,
                 "spec_digest": _DIGEST_1,
                 "steps": [
                     StepSpec("s1", "s1", "stage_patch", True).to_payload_dict()
@@ -2170,6 +2177,894 @@ class TestFilesystemLockConcurrencyAndChildProcessCrashes(_RestartFixtureBase):
         finally:
             j_post.close_clean(clock=self.clock.advance())
         verify_journal_replay_readonly(dir_post, sandbox_root=self.sandbox_root)
+
+
+_CONDITIONAL_TRANSITION_TOML = _OBSERVE_ONLY_TOML.replace(
+    'dst = "project"\n',
+    'dst = "project"\npredicate = "metric.stall_seconds > 10"\n',
+)
+
+_TRANSITION_EFFECT_TOML = _OBSERVE_ONLY_TOML.replace(
+    'dst = "project"\n',
+    'dst = "project"\neffects = ["read_metrics"]\n',
+)
+
+_MIXED_EFFECT_STATE_TOML = _ACTIVE_STATECHART_TOML.replace(
+    'effects = ["launch_sandbox"]',
+    'effects = ["read_metrics", "launch_sandbox"]',
+)
+
+_PURE_ON_MUTATING_SHAPE_TOML = _ACTIVE_STATECHART_TOML.replace(
+    'effects = ["launch_sandbox"]',
+    'effects = ["read_metrics"]',
+)
+
+
+class TestAdversarialRegressionsRound2(_RestartFixtureBase):
+    def test_recovered_plan_run_denies_dispatch_and_requeue_without_authority_store(
+        self,
+    ) -> None:
+        auth = RunAuthorityStore()
+        plan_act, rec_act = self._compile_and_admit(
+            _ACTIVE_STATECHART_TOML, authority_store=auth, ttl_s=120.0
+        )
+        plan_obs, rec_obs = self._compile_and_admit(
+            _OBSERVE_ONLY_TOML, authority_store=auth, ttl_s=120.0
+        )
+        tracker = SyntheticEffectTracker()
+        sup1, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            authority_store=auth,
+            sandbox_root=self.sandbox_root,
+        )
+        captured: list[StepLeaseToken] = []
+        try:
+            sup1.create_run_from_plan(
+                plan=plan_act, receipt=rec_act, clock=self.clock.advance()
+            )
+            sup1.create_run_from_plan(
+                plan=plan_obs, receipt=rec_obs, clock=self.clock.advance()
+            )
+            sup1.run_step_once(
+                rec_act.run_id,
+                "scan",
+                worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                clock_provider=self.clock.advance,
+            )
+            with self.assertRaises(SimulatedSupervisorCrash):
+                sup1.run_step_once(
+                    rec_act.run_id,
+                    "apply_patch",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_B),
+                    clock_provider=self.clock.advance,
+                    crash_point=CrashPoint.AFTER_LEASE_COMMIT_BEFORE_WORKER,
+                    captured_tokens=captured,
+                )
+        finally:
+            sup1.simulate_crash()
+
+        sup2, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.advance(),
+            tracker=tracker,
+            authority_store=None,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            # Read-only inspection works without authority_store.
+            run_act = sup2.journal.get_run(rec_act.run_id)
+            self.assertTrue(run_act.requires_authority)
+            self.assertEqual(run_act.status, RunStatus.PAUSED_NEEDS_RECONCILE)
+
+            # New dispatch on recovered plan-bound run DENIED without authority_store!
+            with self.assertRaises(AuthorityError):
+                sup2.run_step_once(
+                    rec_obs.run_id,
+                    "collect",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                    clock_provider=self.clock.advance,
+                )
+            self.assertEqual(tracker.count(rec_obs.run_id, "collect"), 0)
+            self.assertEqual(
+                sup2.journal.get_step(rec_obs.run_id, "collect").status,
+                StepStatus.PENDING,
+            )
+
+            # Requeue on recovered plan-bound run DENIED without authority_store!
+            no_eff = tracker.issue_receipt(token=captured[0], current_epoch=2)
+            req_requeue = ReconcileStepRequest(
+                run_id=rec_act.run_id,
+                step_id="apply_patch",
+                expected_attempt_no=1,
+                expected_epoch=2,
+                reconciliation_key="recon_no_auth_requeue",
+                resolution=ReconcileResolution.REQUEUE_PENDING,
+                output_digest=None,
+                evidence_digest=no_eff.receipt_digest,
+                reason="try_requeue_no_auth_store",
+                clock=self.clock.advance(),
+            )
+            with self.assertRaises(AuthorityError):
+                sup2.reconcile_step(
+                    req_requeue,
+                    tracker_receipt=no_eff,
+                    clock_provider=self.clock.advance,
+                )
+            self.assertEqual(tracker.count(rec_act.run_id, "apply_patch"), 0)
+
+            # Terminal settlement still succeeds without authority_store.
+            settled = sup2.reconcile_step(
+                ReconcileStepRequest(
+                    run_id=rec_act.run_id,
+                    step_id="apply_patch",
+                    expected_attempt_no=1,
+                    expected_epoch=2,
+                    reconciliation_key="recon_no_auth_cancel",
+                    resolution=ReconcileResolution.CANCELLED,
+                    output_digest=None,
+                    evidence_digest=no_eff.receipt_digest,
+                    reason="settle_without_auth_store",
+                    clock=self.clock.advance(),
+                ),
+                tracker_receipt=no_eff,
+            )
+            self.assertFalse(settled.duplicate)
+            self.assertEqual(
+                sup2.journal.get_run(rec_act.run_id).status, RunStatus.CANCELLED
+            )
+        finally:
+            sup2.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_requeue_pending_omitted_clock_provider_rejected_for_authority_bound_run(
+        self,
+    ) -> None:
+        auth = RunAuthorityStore()
+        plan, rec = self._compile_and_admit(
+            _ACTIVE_STATECHART_TOML, authority_store=auth, ttl_s=20.0
+        )
+        tracker = SyntheticEffectTracker()
+        sup1, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            authority_store=auth,
+            sandbox_root=self.sandbox_root,
+        )
+        captured: list[StepLeaseToken] = []
+        try:
+            sup1.create_run_from_plan(
+                plan=plan, receipt=rec, clock=self.clock.advance(1.0)
+            )
+            sup1.run_step_once(
+                rec.run_id,
+                "scan",
+                worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                clock_provider=self.clock.advance,
+            )
+            with self.assertRaises(SimulatedSupervisorCrash):
+                sup1.run_step_once(
+                    rec.run_id,
+                    "apply_patch",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_B),
+                    clock_provider=self.clock.advance,
+                    crash_point=CrashPoint.AFTER_LEASE_COMMIT_BEFORE_WORKER,
+                    captured_tokens=captured,
+                )
+        finally:
+            sup1.simulate_crash()
+
+        sup2, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.advance(1.0),
+            tracker=tracker,
+            authority_store=auth,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            no_eff = tracker.issue_receipt(token=captured[0], current_epoch=2)
+            seq_before = sup2.journal.get_meta().last_event_seq
+            stale_snap = self.clock.now()
+            req = ReconcileStepRequest(
+                run_id=rec.run_id,
+                step_id="apply_patch",
+                expected_attempt_no=1,
+                expected_epoch=2,
+                reconciliation_key="recon_omit_clock_provider",
+                resolution=ReconcileResolution.REQUEUE_PENDING,
+                output_digest=None,
+                evidence_digest=no_eff.receipt_digest,
+                reason="omitted_clock_provider",
+                clock=stale_snap,
+            )
+            with self.assertRaises(RestartValidationError):
+                sup2.reconcile_step(req, tracker_receipt=no_eff)
+            self.assertEqual(sup2.journal.get_meta().last_event_seq, seq_before)
+            self.assertEqual(
+                sup2.journal.get_step(rec.run_id, "apply_patch").status,
+                StepStatus.UNCERTAIN_NEEDS_RECONCILE,
+            )
+
+            def _expire_in_tx() -> ClockSnapshot:
+                return self.clock.advance(50.0)
+
+            with self.assertRaises(AuthorityError):
+                sup2.reconcile_step(
+                    req, tracker_receipt=no_eff, clock_provider=_expire_in_tx
+                )
+            self.assertEqual(sup2.journal.get_meta().last_event_seq, seq_before)
+        finally:
+            sup2.close_clean(clock=self.clock.advance(1.0))
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_derive_steps_rejects_conditional_transition_and_mixed_state_effects(
+        self,
+    ) -> None:
+        auth = RunAuthorityStore()
+        tracker = SyntheticEffectTracker()
+        sup, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            authority_store=auth,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            bad_tomls = (
+                _CONDITIONAL_TRANSITION_TOML,
+                _TRANSITION_EFFECT_TOML,
+                _MIXED_EFFECT_STATE_TOML,
+                _PURE_ON_MUTATING_SHAPE_TOML,
+            )
+            for toml_text in bad_tomls:
+                plan, rec = self._compile_and_admit(
+                    toml_text, authority_store=auth, ttl_s=120.0
+                )
+                seq_before = sup.journal.get_meta().last_event_seq
+                t_now = self.clock.advance()
+                with self.assertRaises(RestartPolicyError) as ctx:
+                    sup.create_run_from_plan(plan=plan, receipt=rec, clock=t_now)
+                self.assertIn(ERR_PLAN_GRAPH_UNSUPPORTED, str(ctx.exception))
+                self.assertEqual(sup.journal.get_meta().last_event_seq, seq_before)
+        finally:
+            sup.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_tracker_run_admitted_concurrent_double_entry_rejected(self) -> None:
+        tracker = SyntheticEffectTracker()
+        tok = StepLeaseToken("run_conc", "se1", 1, 1, "idem_conc_1")
+        tracker.admit_attempt(tok)
+        entered = threading.Event()
+        release = threading.Event()
+        t1_res: list[WorkerStepResult] = []
+        t1_err: list[BaseException] = []
+
+        def _worker(_t: StepLeaseToken) -> WorkerStepResult:
+            entered.set()
+            release.wait(timeout=5.0)
+            return WorkerStepResult("completed", _DIGEST_A)
+
+        def _run_t1() -> None:
+            try:
+                t1_res.append(tracker.run_admitted(tok, worker_fn=_worker))
+            except BaseException as exc:  # pragma: no cover
+                t1_err.append(exc)
+
+        th = threading.Thread(target=_run_t1)
+        th.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5.0))
+            # While Thread 1 is inside worker_fn, a 2nd run_admitted MUST fail!
+            with self.assertRaises(InvalidStepTransitionError):
+                tracker.run_admitted(tok, worker_fn=_worker)
+            # And a receipt issued while running MUST report still_pending!
+            mid_rcpt = tracker.issue_receipt(
+                token=tok, current_epoch=1, force_fence=True
+            )
+            self.assertEqual(mid_rcpt.tracker_outcome, "still_pending")
+        finally:
+            release.set()
+            th.join(timeout=5.0)
+
+        self.assertEqual(t1_err, [])
+        self.assertEqual(len(t1_res), 1)
+        self.assertEqual(tracker.count("run_conc", "se1"), 1)
+
+    def test_fresh_tracker_missing_prior_history_refuses_requeue_pending(self) -> None:
+        tracker1 = SyntheticEffectTracker()
+        sup1, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker1,
+            sandbox_root=self.sandbox_root,
+        )
+        captured: list[StepLeaseToken] = []
+        try:
+            steps = (StepSpec("se1", "se1", "stage_patch", True),)
+            sup1.journal.create_run(self._make_run_request("run_hist", steps))
+            with self.assertRaises(SimulatedSupervisorCrash):
+                sup1.run_step_once(
+                    "run_hist",
+                    "se1",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                    clock_provider=self.clock.advance,
+                    crash_point=CrashPoint.AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT,
+                    captured_tokens=captured,
+                )
+            self.assertEqual(tracker1.count("run_hist", "se1"), 1)
+        finally:
+            sup1.simulate_crash()
+
+        # Reopen with a brand-new tracker that has no history before epoch 2!
+        tracker2 = SyntheticEffectTracker(history_start_epoch=2)
+        sup2, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.advance(),
+            tracker=tracker2,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            rcpt = tracker2.issue_receipt(token=captured[0], current_epoch=2)
+            self.assertEqual(rcpt.tracker_outcome, "still_pending")
+            req_requeue = ReconcileStepRequest(
+                run_id="run_hist",
+                step_id="se1",
+                expected_attempt_no=1,
+                expected_epoch=2,
+                reconciliation_key="recon_missing_hist",
+                resolution=ReconcileResolution.REQUEUE_PENDING,
+                output_digest=None,
+                evidence_digest=rcpt.receipt_digest,
+                reason="try_requeue_with_fresh_tracker",
+                clock=self.clock.advance(),
+            )
+            with self.assertRaises(ReconciliationEvidenceError):
+                sup2.reconcile_step(
+                    req_requeue,
+                    tracker_receipt=rcpt,
+                    clock_provider=self.clock.advance,
+                )
+            self.assertEqual(tracker2.count("run_hist", "se1"), 0)
+            self.assertEqual(
+                sup2.journal.get_step("run_hist", "se1").status,
+                StepStatus.UNCERTAIN_NEEDS_RECONCILE,
+            )
+        finally:
+            sup2.close_clean(clock=self.clock.advance())
+
+        # Even if a caller omits history_start_epoch on recovery, attach_epoch advances it!
+        tracker3 = SyntheticEffectTracker()
+        sup3, rep3 = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.advance(),
+            tracker=tracker3,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            self.assertEqual(rep3.supervisor_epoch, 3)
+            self.assertEqual(tracker3.history_start_epoch, 3)
+            rcpt3 = tracker3.issue_receipt(token=captured[0], current_epoch=3)
+            self.assertEqual(rcpt3.tracker_outcome, "still_pending")
+        finally:
+            sup3.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_supervisor_reconcile_completed_requires_verified_tracker_receipt(
+        self,
+    ) -> None:
+        tracker = SyntheticEffectTracker()
+        sup1, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            sandbox_root=self.sandbox_root,
+        )
+        captured: list[StepLeaseToken] = []
+        try:
+            steps = (StepSpec("se1", "se1", "stage_patch", True),)
+            sup1.journal.create_run(self._make_run_request("run_comp_req", steps))
+            with self.assertRaises(SimulatedSupervisorCrash):
+                sup1.run_step_once(
+                    "run_comp_req",
+                    "se1",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                    clock_provider=self.clock.advance,
+                    crash_point=CrashPoint.AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT,
+                    captured_tokens=captured,
+                )
+        finally:
+            sup1.simulate_crash()
+
+        sup2, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.advance(),
+            tracker=tracker,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            meta_before = sup2.journal.get_meta()
+            applied_rcpt = tracker.issue_receipt(token=captured[0], current_epoch=2)
+            req = ReconcileStepRequest(
+                run_id="run_comp_req",
+                step_id="se1",
+                expected_attempt_no=1,
+                expected_epoch=2,
+                reconciliation_key="recon_comp_missing_rcpt",
+                resolution=ReconcileResolution.COMPLETED,
+                output_digest=_DIGEST_A,
+                evidence_digest=applied_rcpt.receipt_digest,
+                reason="claim_completed_without_receipt",
+                clock=self.clock.advance(),
+            )
+            with self.assertRaises(ReconciliationEvidenceError):
+                sup2.reconcile_step(req, tracker_receipt=None)
+            meta_after = sup2.journal.get_meta()
+            self.assertEqual(meta_after.last_event_seq, meta_before.last_event_seq)
+            self.assertEqual(meta_after.head_hash, meta_before.head_hash)
+            self.assertEqual(
+                sup2.journal.get_step("run_comp_req", "se1").status,
+                StepStatus.UNCERTAIN_NEEDS_RECONCILE,
+            )
+
+            # With verified receipt, COMPLETED succeeds cleanly!
+            ok = sup2.reconcile_step(req, tracker_receipt=applied_rcpt)
+            self.assertFalse(ok.duplicate)
+            self.assertEqual(
+                sup2.journal.get_run("run_comp_req").status, RunStatus.COMPLETED
+            )
+        finally:
+            sup2.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_uncertain_sibling_does_not_strand_leased_sibling_settlement(self) -> None:
+        journal, _ = WorkflowRestartJournal.open_and_recover(
+            self.state_dir, clock=self.clock.now(), sandbox_root=self.sandbox_root
+        )
+        try:
+            steps = (
+                StepSpec("step_a", "step_a", "stage_patch", True),
+                StepSpec("step_b", "step_b", "read_metrics", False),
+                StepSpec("step_c", "step_c", "read_metrics", False),
+            )
+            journal.create_run(self._make_run_request("run_sib", steps))
+            tok_a = journal.lease_step(
+                run_id="run_sib", step_id="step_a", clock=self.clock.advance()
+            )
+            tok_b = journal.lease_step(
+                run_id="run_sib", step_id="step_b", clock=self.clock.advance()
+            )
+            journal.fail_step(
+                FailStepRequest(tok_a, "net_drop", False, True, self.clock.advance())
+            )
+            self.assertEqual(
+                journal.get_run("run_sib").status, RunStatus.PAUSED_NEEDS_RECONCILE
+            )
+
+            # New admission remains blocked while paused_needs_reconcile.
+            t_blocked = self.clock.advance()
+            with self.assertRaises(InvalidStepTransitionError):
+                journal.lease_step(
+                    run_id="run_sib", step_id="step_c", clock=t_blocked
+                )
+
+            # Already-leased sibling settles cleanly with its exact owned token!
+            ack_b = journal.complete_step(
+                CompleteStepRequest(tok_b, _DIGEST_B, self.clock.advance())
+            )
+            self.assertEqual(ack_b.status, StepStatus.COMPLETED.value)
+            self.assertEqual(
+                journal.get_step("run_sib", "step_b").status, StepStatus.COMPLETED
+            )
+            self.assertEqual(
+                journal.get_run("run_sib").status, RunStatus.PAUSED_NEEDS_RECONCILE
+            )
+
+            # Reconcile step_a -> run returns to RUNNING for step_c!
+            journal.reconcile_step(
+                ReconcileStepRequest(
+                    run_id="run_sib",
+                    step_id="step_a",
+                    expected_attempt_no=1,
+                    expected_epoch=1,
+                    reconciliation_key="recon_sib_a",
+                    resolution=ReconcileResolution.COMPLETED,
+                    output_digest=_DIGEST_A,
+                    evidence_digest=_DIGEST_E,
+                    reason="sib_a_confirmed",
+                    clock=self.clock.advance(),
+                )
+            )
+            self.assertEqual(journal.get_run("run_sib").status, RunStatus.RUNNING)
+        finally:
+            journal.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_tampered_missing_pk_and_duplicate_materialized_rows_rejected(self) -> None:
+        j, _ = WorkflowRestartJournal.open_and_recover(
+            self.state_dir, clock=self.clock.now(), sandbox_root=self.sandbox_root
+        )
+        try:
+            j.create_run(
+                self._make_run_request(
+                    "run_pk_dup", (StepSpec("s1", "s1", "read_metrics", False),)
+                )
+            )
+        finally:
+            j.close_clean(clock=self.clock.advance())
+        db_path = self.state_dir / DB_FILENAME
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute(
+                "CREATE TABLE workflow_steps_dup AS SELECT * FROM workflow_steps"
+            )
+            conn.execute("DROP TABLE workflow_steps")
+            conn.execute("ALTER TABLE workflow_steps_dup RENAME TO workflow_steps")
+            conn.execute(
+                "INSERT INTO workflow_steps SELECT * FROM workflow_steps LIMIT 1"
+            )
+        finally:
+            conn.close()
+
+        # 1. Read-only replay fails closed on missing PRIMARY KEY via PRAGMA table_info.
+        with self.assertRaises(JournalIntegrityError):
+            verify_journal_replay_readonly(
+                self.state_dir, sandbox_root=self.sandbox_root
+            )
+
+        # 2. Direct parity reader also rejects duplicate keys even with generous max_rows!
+        ro_conn = open_sqlite_bounded(
+            db_path, readonly=True, deadline=time.monotonic() + 2.0
+        )
+        try:
+            dl = time.monotonic() + 2.0
+            with self.assertRaises(JournalIntegrityError):
+                read_steps_strict(ro_conn, max_rows=10, deadline=dl)
+        finally:
+            safe_rollback_and_close(ro_conn)
+
+    def test_reduce_event_log_enforces_monotonic_deadline(self) -> None:
+        p1 = {"dirty_recovery": False, "prior_epoch": 0}
+        h1 = compute_event_hash(
+            seq=1,
+            supervisor_epoch=1,
+            event_type=EventType.SUPERVISOR_STARTED.value,
+            run_id=None,
+            step_id=None,
+            payload=p1,
+            created_at_us=1_000,
+            prev_hash=EVENT_GENESIS_HASH,
+        )
+        e1 = JournalEvent(
+            seq=1,
+            supervisor_epoch=1,
+            event_type=EventType.SUPERVISOR_STARTED,
+            run_id=None,
+            step_id=None,
+            payload=p1,
+            created_at_us=1_000,
+            prev_hash=EVENT_GENESIS_HASH,
+            entry_hash=h1,
+        )
+        h2 = compute_event_hash(
+            seq=2,
+            supervisor_epoch=1,
+            event_type=EventType.SUPERVISOR_STOPPED.value,
+            run_id=None,
+            step_id=None,
+            payload={},
+            created_at_us=2_000,
+            prev_hash=h1,
+        )
+        e2 = JournalEvent(
+            seq=2,
+            supervisor_epoch=1,
+            event_type=EventType.SUPERVISOR_STOPPED,
+            run_id=None,
+            step_id=None,
+            payload={},
+            created_at_us=2_000,
+            prev_hash=h1,
+            entry_hash=h2,
+        )
+        expired = time.monotonic() - 1.0
+        with self.assertRaises(RestartStorageError) as ctx:
+            reduce_event_log([e1, e2], deadline=expired)
+        self.assertIn(ERR_OP_DEADLINE, str(ctx.exception))
+
+        snap = reduce_event_log([e1, e2])
+        meta = SupervisorMetaRecord(
+            current_epoch=snap.supervisor_epoch,
+            last_event_seq=snap.last_event_seq,
+            head_hash=snap.head_hash,
+            dirty_shutdown=snap.dirty_shutdown,
+            updated_at_us=snap.meta_updated_at_us,
+        )
+        with self.assertRaises(RestartStorageError) as ctx2:
+            verify_materialized_parity(
+                meta=meta,
+                replayed=snap,
+                actual_runs=snap.runs,
+                actual_steps=snap.steps,
+                actual_idems=snap.idempotency_records,
+                actual_recons=snap.reconciliation_records,
+                deadline=expired,
+            )
+        self.assertIn(ERR_OP_DEADLINE, str(ctx2.exception))
+
+    def test_tampered_indexes_dropped_unique_and_mutating_non_side_effecting_rejected(
+        self,
+    ) -> None:
+        tamper_sqls = (
+            "CREATE INDEX evil_bomb ON workflow_event_log(zeroblob(1000000))",
+            "CREATE UNIQUE INDEX evil_lockout ON workflow_event_log(1) WHERE seq > 10",
+            (
+                "PRAGMA foreign_keys = OFF; "
+                "CREATE TABLE idem_no_uniq ("
+                "run_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, "
+                "step_id TEXT NOT NULL, attempt_no INTEGER NOT NULL, "
+                "lease_epoch INTEGER NOT NULL, outcome_status TEXT NOT NULL, "
+                "output_digest TEXT, failure_reason TEXT, recorded_seq INTEGER NOT NULL, "
+                "PRIMARY KEY (run_id, idempotency_key)); "
+                "INSERT INTO idem_no_uniq SELECT * FROM step_idempotency_keys; "
+                "DROP TABLE step_idempotency_keys; "
+                "ALTER TABLE idem_no_uniq RENAME TO step_idempotency_keys;"
+            ),
+        )
+        for idx, sql in enumerate(tamper_sqls):
+            sub_dir = self.root / f"idx_tamper_{idx}"
+            sub_dir.mkdir(mode=0o700)
+            os.chmod(sub_dir, 0o700)
+            j, _ = WorkflowRestartJournal.open_and_recover(
+                sub_dir, clock=self.clock.advance(), sandbox_root=self.sandbox_root
+            )
+            j.close_clean(clock=self.clock.advance())
+            conn = sqlite3.connect(str(sub_dir / DB_FILENAME), isolation_level=None)
+            try:
+                conn.executescript(sql)
+            finally:
+                conn.close()
+            with self.assertRaises(JournalIntegrityError):
+                verify_journal_replay_readonly(sub_dir, sandbox_root=self.sandbox_root)
+
+        # Single-row lookup rejects duplicate PKs AND _decode_step_row rejects mutating side_effecting=0!
+        dup_dir = self.root / "single_row_and_se_tamper"
+        dup_dir.mkdir(mode=0o700)
+        os.chmod(dup_dir, 0o700)
+        j2, _ = WorkflowRestartJournal.open_and_recover(
+            dup_dir, clock=self.clock.advance(), sandbox_root=self.sandbox_root
+        )
+        try:
+            j2.create_run(
+                self._make_run_request(
+                    "run_se_chk", (StepSpec("s1", "s1", "stage_patch", True),)
+                )
+            )
+        finally:
+            j2.close_clean(clock=self.clock.advance())
+        db_path = dup_dir / DB_FILENAME
+        conn2 = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn2.execute("UPDATE workflow_steps SET side_effecting = 0 WHERE step_id = 's1'")
+        finally:
+            conn2.close()
+        ro1 = open_sqlite_bounded(db_path, readonly=True, deadline=time.monotonic() + 2.0)
+        try:
+            dl = time.monotonic() + 2.0
+            with self.assertRaises(JournalIntegrityError):
+                read_step_by_pk_strict(ro1, "run_se_chk", "s1", dl)
+        finally:
+            safe_rollback_and_close(ro1)
+
+        conn3 = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn3.execute("PRAGMA foreign_keys = OFF")
+            conn3.execute("UPDATE workflow_steps SET side_effecting = 1 WHERE step_id = 's1'")
+            conn3.execute("CREATE TABLE ws_dup AS SELECT * FROM workflow_steps")
+            conn3.execute("DROP TABLE workflow_steps")
+            conn3.execute("ALTER TABLE ws_dup RENAME TO workflow_steps")
+            conn3.execute("INSERT INTO workflow_steps SELECT * FROM workflow_steps LIMIT 1")
+        finally:
+            conn3.close()
+        ro2 = open_sqlite_bounded(db_path, readonly=True, deadline=time.monotonic() + 2.0)
+        try:
+            dl = time.monotonic() + 2.0
+            with self.assertRaises(JournalIntegrityError):
+                read_step_by_pk_strict(ro2, "run_se_chk", "s1", dl)
+        finally:
+            safe_rollback_and_close(ro2)
+
+    @staticmethod
+    def _build_event(
+        *,
+        seq: int,
+        epoch: int,
+        event_type: EventType,
+        prev_hash: str,
+        payload: dict[str, Any],
+        run_id: str | None = None,
+        step_id: str | None = None,
+    ) -> JournalEvent:
+        ehash = compute_event_hash(
+            seq=seq,
+            supervisor_epoch=epoch,
+            event_type=event_type.value,
+            run_id=run_id,
+            step_id=step_id,
+            payload=payload,
+            created_at_us=seq * 1_000,
+            prev_hash=prev_hash,
+        )
+        return JournalEvent(
+            seq=seq,
+            supervisor_epoch=epoch,
+            event_type=event_type,
+            run_id=run_id,
+            step_id=step_id,
+            payload=payload,
+            created_at_us=seq * 1_000,
+            prev_hash=prev_hash,
+            entry_hash=ehash,
+        )
+
+    def test_replay_strict_payload_keys_bool_int_confusion_and_malformed_steps_rejected(
+        self,
+    ) -> None:
+        # 1. Bool-for-int confusion (prior_epoch: False == 0) & extra key on genesis started.
+        bad_genesis_payloads: tuple[dict[str, Any], ...] = (
+            {"dirty_recovery": False, "prior_epoch": False},
+            {"dirty_recovery": False, "prior_epoch": 0, "extra": 1},
+        )
+        for bad_p in bad_genesis_payloads:
+            ev = self._build_event(
+                seq=1,
+                epoch=1,
+                event_type=EventType.SUPERVISOR_STARTED,
+                prev_hash=EVENT_GENESIS_HASH,
+                payload=bad_p,
+            )
+            with self.assertRaises(ReplayMismatchError):
+                reduce_event_log([ev])
+
+        e1 = self._build_event(
+            seq=1,
+            epoch=1,
+            event_type=EventType.SUPERVISOR_STARTED,
+            prev_hash=EVENT_GENESIS_HASH,
+            payload={"dirty_recovery": False, "prior_epoch": 0},
+        )
+        good_step = StepSpec("s1", "s1", "read_metrics", False).to_payload_dict()
+
+        # 2. Malformed RUN_CREATED payloads (non-dict step, missing key, bad depends_on, extra key).
+        bad_run_payloads: tuple[dict[str, Any], ...] = (
+            {
+                "grant_generation": 1,
+                "requires_authority": False,
+                "spec_digest": _DIGEST_1,
+                "steps": ["not_a_dict"],
+                "workflow_id": "user/w",
+                "workflow_plan_digest": _DIGEST_2,
+            },
+            {
+                "grant_generation": 1,
+                "requires_authority": False,
+                "spec_digest": _DIGEST_1,
+                "steps": [{"step_id": "s1"}],
+                "workflow_id": "user/w",
+                "workflow_plan_digest": _DIGEST_2,
+            },
+            {
+                "grant_generation": 1,
+                "requires_authority": False,
+                "spec_digest": _DIGEST_1,
+                "steps": [{**good_step, "depends_on": "not_a_list"}],
+                "workflow_id": "user/w",
+                "workflow_plan_digest": _DIGEST_2,
+            },
+            {
+                "grant_generation": 1,
+                "requires_authority": False,
+                "spec_digest": _DIGEST_1,
+                "steps": [good_step],
+                "workflow_id": "user/w",
+                "workflow_plan_digest": _DIGEST_2,
+                "unexpected": 99,
+            },
+        )
+        for bad_rp in bad_run_payloads:
+            e2 = self._build_event(
+                seq=2,
+                epoch=1,
+                event_type=EventType.RUN_CREATED,
+                prev_hash=e1.entry_hash,
+                run_id="r1",
+                payload=bad_rp,
+            )
+            with self.assertRaises(ReplayMismatchError):
+                reduce_event_log([e1, e2])
+
+        # 3. Bool-for-int confusion (attempt_no: True == 1) & extra key on STEP_COMPLETED.
+        e2_ok = self._build_event(
+            seq=2,
+            epoch=1,
+            event_type=EventType.RUN_CREATED,
+            prev_hash=e1.entry_hash,
+            run_id="r1",
+            payload={
+                "grant_generation": 1,
+                "requires_authority": False,
+                "spec_digest": _DIGEST_1,
+                "steps": [good_step],
+                "workflow_id": "user/w",
+                "workflow_plan_digest": _DIGEST_2,
+            },
+        )
+        e3_lease = self._build_event(
+            seq=3,
+            epoch=1,
+            event_type=EventType.STEP_LEASED,
+            prev_hash=e2_ok.entry_hash,
+            run_id="r1",
+            step_id="s1",
+            payload={
+                "attempt_no": 1,
+                "idempotency_key": "k_bool_test",
+                "lease_epoch": 1,
+                "side_effecting": False,
+            },
+        )
+        bad_comp_payloads: tuple[dict[str, Any], ...] = (
+            {
+                "attempt_no": True,
+                "idempotency_key": "k_bool_test",
+                "lease_epoch": 1,
+                "output_digest": _DIGEST_A,
+            },
+            {
+                "attempt_no": 1,
+                "idempotency_key": "k_bool_test",
+                "lease_epoch": True,
+                "output_digest": _DIGEST_A,
+            },
+            {
+                "attempt_no": 1,
+                "idempotency_key": "k_bool_test",
+                "lease_epoch": 1,
+                "output_digest": _DIGEST_A,
+                "extra_field": 1,
+            },
+        )
+        for bad_cp in bad_comp_payloads:
+            e4 = self._build_event(
+                seq=4,
+                epoch=1,
+                event_type=EventType.STEP_COMPLETED,
+                prev_hash=e3_lease.entry_hash,
+                run_id="r1",
+                step_id="s1",
+                payload=bad_cp,
+            )
+            with self.assertRaises(ReplayMismatchError):
+                reduce_event_log([e1, e2_ok, e3_lease, e4])
+
+    def test_supervisor_reconcile_step_invalid_request_type_raises_validation_error(
+        self,
+    ) -> None:
+        tracker = SyntheticEffectTracker()
+        sup, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            bad_req: Any = "not_a_reconcile_request"
+            with self.assertRaises(RestartValidationError):
+                sup.reconcile_step(bad_req)
+        finally:
+            sup.close_clean(clock=self.clock.advance())
 
 
 if __name__ == "__main__":

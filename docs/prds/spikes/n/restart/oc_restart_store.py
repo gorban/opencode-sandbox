@@ -23,7 +23,9 @@ from oc_restart_contract import (  # noqa: E402
     DEFAULT_MAX_OP_MS,
     ERR_AUTH_RETIRED_MID_STEP,
     ERR_AUTH_REVOKED_PRE_ENTRY,
+    ERR_AUTH_STORE_REQUIRED,
     ERR_CANNOT_REQUEUE,
+    ERR_CLOCK_PROVIDER_REQUIRED,
     ERR_IDEM_CONFLICT,
     ERR_MAX_ATTEMPTS_RECOVERY,
     ERR_MAX_EVENTS,
@@ -45,6 +47,7 @@ from oc_restart_contract import (  # noqa: E402
     KEY_PRIOR_EPOCH,
     KEY_REASON,
     KEY_RECON_KEY,
+    KEY_REQUIRES_AUTHORITY,
     KEY_RESOLUTION,
     KEY_SIDE_EFFECTING,
     KEY_VIA_RECOVERY,
@@ -151,6 +154,9 @@ _ERR_TOKEN_TYPE = "token must be StepLeaseToken"
 _ERR_JOURNAL_CLOSED = "journal_closed"
 _ERR_RUN_NOT_RUNNING = "run_not_running"
 _ERR_UNKNOWN_RUN = "unknown_run"
+_ERR_MISSING_META = "supervisor_meta_missing"
+_ERR_MISSING_IDEM = "missing_step_idempotency_key"
+_ERR_EXPECTED_RECON_REQ = "expected ReconcileStepRequest"
 
 _SQL_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE"
 _SQL_UPDATE_STEP_STATUS = (
@@ -246,7 +252,7 @@ def _verify_and_replay_in_tx(
     )
     if len(events) != meta.last_event_seq:
         raise ReplayMismatchError("event_count_meta_mismatch")
-    replayed = reduce_event_log(events)
+    replayed = reduce_event_log(events, deadline=deadline)
     actual_runs = read_runs_strict(conn, max_rows=len(replayed.runs), deadline=deadline)
     actual_steps = read_steps_strict(
         conn, max_rows=len(replayed.steps), deadline=deadline
@@ -264,6 +270,7 @@ def _verify_and_replay_in_tx(
         actual_steps=actual_steps,
         actual_idems=actual_idems,
         actual_recons=actual_recons,
+        deadline=deadline,
     )
     return replayed
 
@@ -367,7 +374,8 @@ def verify_journal_replay_readonly(
                 conn, require_core_tables=True, deadline=deadline
             )
             meta = read_meta_strict(conn, allow_missing=False, deadline=deadline)
-            assert meta is not None
+            if meta is None:
+                raise JournalIntegrityError(_ERR_MISSING_META)
             return _verify_and_replay_in_tx(
                 conn, meta, max_replay_events=cap, deadline=deadline
             )
@@ -389,7 +397,8 @@ def _fence_one_prior_leased_step(
     deadline: float,
 ) -> tuple[str, str]:
     """Fence one prior-epoch leased step and return (new_head_hash, bucket)."""
-    assert step.idempotency_key is not None
+    if step.idempotency_key is None:
+        raise JournalIntegrityError(_ERR_MISSING_IDEM)
     if step.side_effecting:
         ev_type = EventType.STEP_MARKED_UNCERTAIN
         new_st = StepStatus.UNCERTAIN_NEEDS_RECONCILE
@@ -438,7 +447,8 @@ def _fence_one_prior_leased_step(
         deadline=deadline,
     )
     run = read_run_by_id_strict(conn, step.run_id, deadline)
-    assert run is not None
+    if run is None:
+        raise JournalIntegrityError(_ERR_UNKNOWN_RUN)
     _recompute_and_update_run_status(
         conn,
         step.run_id,
@@ -683,7 +693,8 @@ class WorkflowRestartJournal:
         self, conn: sqlite3.Connection, deadline: float
     ) -> SupervisorMetaRecord:
         meta = read_meta_strict(conn, allow_missing=False, deadline=deadline)
-        assert meta is not None
+        if meta is None:
+            raise JournalIntegrityError(_ERR_MISSING_META)
         if meta.current_epoch != self._current_epoch:
             raise StaleEpochError(ERR_STALE_EPOCH)
         return meta
@@ -727,7 +738,8 @@ class WorkflowRestartJournal:
     def get_meta(self, *, max_op_ms: int = DEFAULT_MAX_OP_MS) -> SupervisorMetaRecord:
         with self._locked_conn(max_op_ms) as (conn, deadline):
             meta = read_meta_strict(conn, allow_missing=False, deadline=deadline)
-            assert meta is not None
+            if meta is None:
+                raise JournalIntegrityError(_ERR_MISSING_META)
             return meta
 
     def get_run(
@@ -795,14 +807,15 @@ class WorkflowRestartJournal:
                 conn,
                 "INSERT INTO workflow_runs "
                 "(run_id, workflow_id, spec_digest, workflow_plan_digest, grant_generation, "
-                "status, cancel_requested, created_epoch, created_at_us, updated_at_us) "
-                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                "requires_authority, status, cancel_requested, created_epoch, created_at_us, updated_at_us) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                 (
                     request.run_id,
                     request.workflow_id,
                     request.spec_digest,
                     request.workflow_plan_digest,
                     request.grant_generation,
+                    1 if request.requires_authority else 0,
                     RunStatus.RUNNING.value,
                     self._current_epoch,
                     created_at_us,
@@ -840,6 +853,7 @@ class WorkflowRestartJournal:
                 step_id=None,
                 payload={
                     "grant_generation": request.grant_generation,
+                    KEY_REQUIRES_AUTHORITY: request.requires_authority,
                     "spec_digest": request.spec_digest,
                     "steps": [s.to_payload_dict() for s in request.steps],
                     "workflow_id": request.workflow_id,
@@ -850,7 +864,8 @@ class WorkflowRestartJournal:
                 deadline=deadline,
             )
             run = read_run_by_id_strict(conn, request.run_id, deadline)
-            assert run is not None
+            if run is None:
+                raise JournalIntegrityError(_ERR_UNKNOWN_RUN)
             return run
 
     def lease_step(
@@ -965,14 +980,24 @@ class WorkflowRestartJournal:
             )
 
     def _verify_active_lease_in_conn(
-        self, conn: sqlite3.Connection, token: StepLeaseToken, deadline: float
+        self,
+        conn: sqlite3.Connection,
+        token: StepLeaseToken,
+        deadline: float,
+        *,
+        allow_paused_for_settlement: bool = False,
     ) -> tuple[WorkflowRunRecord, WorkflowStepRecord]:
         if token.lease_epoch != self._current_epoch:
             raise StaleEpochError(ERR_STALE_EPOCH)
         run = read_run_by_id_strict(conn, token.run_id, deadline)
         if run is None:
             raise InvalidStepTransitionError(_ERR_UNKNOWN_RUN)
-        if run.status is not RunStatus.RUNNING or run.cancel_requested:
+        allowed_statuses = (
+            (RunStatus.RUNNING, RunStatus.PAUSED_NEEDS_RECONCILE)
+            if allow_paused_for_settlement
+            else (RunStatus.RUNNING,)
+        )
+        if run.status not in allowed_statuses or run.cancel_requested:
             raise InvalidStepTransitionError(_ERR_RUN_NOT_RUNNING)
         step = read_step_by_pk_strict(conn, token.run_id, token.step_id, deadline)
         if step is None:
@@ -1063,7 +1088,9 @@ class WorkflowRestartJournal:
             if idem.outcome_status is not IdempotencyOutcome.LEASED:
                 raise IdempotencyConflictError(ERR_IDEM_CONFLICT)
 
-            run, _ = self._verify_active_lease_in_conn(conn, token, deadline)
+            run, _ = self._verify_active_lease_in_conn(
+                conn, token, deadline, allow_paused_for_settlement=True
+            )
             leased_cnt, unc_cnt = count_obligations_strict(conn, deadline)
             _assert_ordinary_capacity(
                 meta.last_event_seq,
@@ -1284,7 +1311,12 @@ class WorkflowRestartJournal:
             if idem.outcome_status is not IdempotencyOutcome.LEASED:
                 raise IdempotencyConflictError(ERR_IDEM_CONFLICT)
 
-            run, step = self._verify_active_lease_in_conn(conn, token, deadline)
+            run, step = self._verify_active_lease_in_conn(
+                conn,
+                token,
+                deadline,
+                allow_paused_for_settlement=(not request.retryable),
+            )
             return self._apply_fail_transition(
                 conn,
                 meta,
@@ -1368,7 +1400,31 @@ class WorkflowRestartJournal:
             seq=existing.recorded_seq,
         )
 
-    def _validate_reconcile_evidence(
+    @staticmethod
+    def _resolve_requeue_clock_and_authority(
+        request: ReconcileStepRequest,
+        *,
+        run: WorkflowRunRecord,
+        authority_gate: Callable[[WorkflowRunRecord, ClockSnapshot], None] | None,
+        clock_provider: Callable[[], ClockSnapshot] | None,
+        require_live_clock: bool,
+    ) -> int:
+        auth_bound = run.requires_authority or require_live_clock
+        if auth_bound and authority_gate is None:
+            raise AuthorityError(ERR_AUTH_STORE_REQUIRED)
+        if auth_bound and clock_provider is None:
+            if not require_live_clock and authority_gate is not None:
+                authority_gate(run, request.clock)
+            raise RestartValidationError(ERR_CLOCK_PROVIDER_REQUIRED)
+        effective_clock = (
+            clock_provider() if clock_provider is not None else request.clock
+        )
+        now_us = clock_to_wall_us(effective_clock)
+        if authority_gate is not None:
+            authority_gate(run, effective_clock)
+        return now_us
+
+    def _validate_requeue_evidence(
         self,
         request: ReconcileStepRequest,
         *,
@@ -1378,31 +1434,39 @@ class WorkflowRestartJournal:
         tracker_receipt: EffectTrackerReceipt | None,
         authority_gate: Callable[[WorkflowRunRecord, ClockSnapshot], None] | None,
         clock_provider: Callable[[], ClockSnapshot] | None,
+        require_live_clock: bool,
     ) -> int:
-        if request.resolution is ReconcileResolution.REQUEUE_PENDING:
-            if run.cancel_requested or step.attempt_no >= step.max_attempts:
-                raise InvalidStepTransitionError(ERR_CANNOT_REQUEUE)
-            if tracker is None:
-                raise ReconciliationEvidenceError("missing_tracker_verifier")
-            tracker.verify_receipt_for_step(
-                tracker_receipt,
-                step=step,
-                current_epoch=self._current_epoch,
-                expected_outcome=OUTCOME_NO_EFFECT,
-                expected_evidence_digest=request.evidence_digest,
-            )
-            effective_clock = (
-                clock_provider() if clock_provider is not None else request.clock
-            )
-            now_us = clock_to_wall_us(effective_clock)
-            if authority_gate is not None:
-                authority_gate(run, effective_clock)
-            return now_us
-        if (
-            request.resolution is ReconcileResolution.COMPLETED
-            and tracker is not None
-            and tracker_receipt is not None
-        ):
+        if run.cancel_requested or step.attempt_no >= step.max_attempts:
+            raise InvalidStepTransitionError(ERR_CANNOT_REQUEUE)
+        if tracker is None:
+            raise ReconciliationEvidenceError("missing_tracker_verifier")
+        tracker.verify_receipt_for_step(
+            tracker_receipt,
+            step=step,
+            current_epoch=self._current_epoch,
+            expected_outcome=OUTCOME_NO_EFFECT,
+            expected_evidence_digest=request.evidence_digest,
+        )
+        return self._resolve_requeue_clock_and_authority(
+            request,
+            run=run,
+            authority_gate=authority_gate,
+            clock_provider=clock_provider,
+            require_live_clock=require_live_clock,
+        )
+
+    def _validate_completed_evidence(
+        self,
+        request: ReconcileStepRequest,
+        *,
+        step: WorkflowStepRecord,
+        tracker: SyntheticEffectTracker | None,
+        tracker_receipt: EffectTrackerReceipt | None,
+        require_completed_receipt: bool,
+    ) -> None:
+        if require_completed_receipt and (tracker is None or tracker_receipt is None):
+            raise ReconciliationEvidenceError("missing_tracker_receipt")
+        if tracker is not None and tracker_receipt is not None:
             tracker.verify_receipt_for_step(
                 tracker_receipt,
                 step=step,
@@ -1411,7 +1475,65 @@ class WorkflowRestartJournal:
                 expected_evidence_digest=request.evidence_digest,
                 expected_output_digest=request.output_digest,
             )
+
+    def _resolve_reconcile_timestamp(
+        self,
+        request: ReconcileStepRequest,
+        *,
+        run: WorkflowRunRecord,
+        step: WorkflowStepRecord,
+        tracker: SyntheticEffectTracker | None,
+        tracker_receipt: EffectTrackerReceipt | None,
+        authority_gate: Callable[[WorkflowRunRecord, ClockSnapshot], None] | None,
+        clock_provider: Callable[[], ClockSnapshot] | None,
+        require_live_clock: bool,
+        require_completed_receipt: bool,
+    ) -> int:
+        if request.resolution is ReconcileResolution.REQUEUE_PENDING:
+            return self._validate_requeue_evidence(
+                request,
+                run=run,
+                step=step,
+                tracker=tracker,
+                tracker_receipt=tracker_receipt,
+                authority_gate=authority_gate,
+                clock_provider=clock_provider,
+                require_live_clock=require_live_clock,
+            )
+        if request.resolution is ReconcileResolution.COMPLETED:
+            self._validate_completed_evidence(
+                request,
+                step=step,
+                tracker=tracker,
+                tracker_receipt=tracker_receipt,
+                require_completed_receipt=require_completed_receipt,
+            )
         return clock_to_wall_us(request.clock)
+
+    def _assert_reconcile_capacity(
+        self,
+        conn: sqlite3.Connection,
+        last_seq: int,
+        resolution: ReconcileResolution,
+        deadline: float,
+    ) -> None:
+        leased_cnt, unc_cnt = count_obligations_strict(conn, deadline)
+        unc_after = max(0, unc_cnt - 1)
+        if resolution in TERMINAL_RECONCILE_RESOLUTIONS:
+            _assert_terminal_reconcile_capacity(
+                last_seq,
+                leased_after=leased_cnt,
+                uncertain_after=unc_after,
+                max_replay_events=self._max_replay_events,
+            )
+            return
+        _assert_ordinary_capacity(
+            last_seq,
+            events_to_append=1,
+            leased_after=leased_cnt,
+            uncertain_after=unc_after,
+            max_replay_events=self._max_replay_events,
+        )
 
     def reconcile_step(
         self,
@@ -1421,10 +1543,12 @@ class WorkflowRestartJournal:
         tracker_receipt: EffectTrackerReceipt | None = None,
         authority_gate: Callable[[WorkflowRunRecord, ClockSnapshot], None] | None = None,
         clock_provider: Callable[[], ClockSnapshot] | None = None,
+        require_live_clock: bool = False,
+        require_completed_receipt: bool = False,
         max_op_ms: int = DEFAULT_MAX_OP_MS,
     ) -> ReconciliationReceipt:
         if not isinstance(request, ReconcileStepRequest):
-            raise RestartValidationError("expected ReconcileStepRequest")
+            raise RestartValidationError(_ERR_EXPECTED_RECON_REQ)
         if request.expected_epoch != self._current_epoch:
             raise StaleEpochError(ERR_STALE_EPOCH)
         with self._write_tx(max_op_ms) as (conn, deadline):
@@ -1444,7 +1568,7 @@ class WorkflowRestartJournal:
             if step.attempt_no != request.expected_attempt_no or step.idempotency_key is None:
                 raise StaleEpochError(ERR_STALE_EPOCH)
 
-            now_us = self._validate_reconcile_evidence(
+            now_us = self._resolve_reconcile_timestamp(
                 request,
                 run=run,
                 step=step,
@@ -1452,24 +1576,12 @@ class WorkflowRestartJournal:
                 tracker_receipt=tracker_receipt,
                 authority_gate=authority_gate,
                 clock_provider=clock_provider,
+                require_live_clock=require_live_clock,
+                require_completed_receipt=require_completed_receipt,
             )
-            leased_cnt, unc_cnt = count_obligations_strict(conn, deadline)
-            unc_after = max(0, unc_cnt - 1)
-            if request.resolution in TERMINAL_RECONCILE_RESOLUTIONS:
-                _assert_terminal_reconcile_capacity(
-                    meta.last_event_seq,
-                    leased_after=leased_cnt,
-                    uncertain_after=unc_after,
-                    max_replay_events=self._max_replay_events,
-                )
-            else:
-                _assert_ordinary_capacity(
-                    meta.last_event_seq,
-                    events_to_append=1,
-                    leased_after=leased_cnt,
-                    uncertain_after=unc_after,
-                    max_replay_events=self._max_replay_events,
-                )
+            self._assert_reconcile_capacity(
+                conn, meta.last_event_seq, request.resolution, deadline
+            )
             return self._commit_reconcile_rows(
                 conn, meta, run=run, step=step, request=request, now_us=now_us, deadline=deadline
             )
@@ -1485,7 +1597,8 @@ class WorkflowRestartJournal:
         now_us: int,
         deadline: float,
     ) -> ReconciliationReceipt:
-        assert step.idempotency_key is not None
+        if step.idempotency_key is None:
+            raise JournalIntegrityError(_ERR_MISSING_IDEM)
         status_map = {
             ReconcileResolution.COMPLETED: (
                 StepStatus.COMPLETED,
@@ -1621,7 +1734,8 @@ class WorkflowRestartJournal:
             return
         if step.status is not StepStatus.LEASED:
             return
-        assert step.idempotency_key is not None
+        if step.idempotency_key is None:
+            raise JournalIntegrityError(_ERR_MISSING_IDEM)
         new_st = (
             StepStatus.UNCERTAIN_NEEDS_RECONCILE
             if step.side_effecting
@@ -1829,7 +1943,7 @@ class DurableWorkflowSupervisor:
             max_replay_events=max_replay_events,
             crash_point=crash_point,
         )
-        tracker.fence_epoch(report.supervisor_epoch)
+        tracker.attach_epoch(report.supervisor_epoch)
         return (
             cls(journal, tracker=tracker, authority_store=authority_store),
             report,
@@ -1847,6 +1961,8 @@ class DurableWorkflowSupervisor:
         self, run: WorkflowRunRecord, clock: ClockSnapshot
     ) -> None:
         if self._authority_store is None:
+            if run.requires_authority:
+                raise AuthorityError(ERR_AUTH_STORE_REQUIRED)
             return
         receipt = self._reconstruct_receipt(run)
         self._authority_store.verify_active(
@@ -1854,8 +1970,6 @@ class DurableWorkflowSupervisor:
         )
 
     def _verify_live_run_authority(self, run_id: str, clock: ClockSnapshot) -> None:
-        if self._authority_store is None:
-            return
         run = self._journal.get_run(run_id)
         self._verify_live_run_record_authority(run, clock)
 
@@ -1877,40 +1991,46 @@ class DurableWorkflowSupervisor:
         proposed_steps: Sequence[StepSpec] | None = None,
     ) -> WorkflowRunRecord:
         """Create run strictly from auth_record.approved_plan's canonical derived DAG."""
-        if self._authority_store is None:
-            raise RestartPolicyError("authority_store_required_for_plan_run")
-        auth_record = self._authority_store.verify_active(
-            receipt, clock=clock, expected_plan_digest=plan.workflow_plan_digest
-        )
-        approved = auth_record.approved_plan
-        recomp_spec, recomp_skill, recomp_plan = recompute_plan_digests(approved)
-        recomp_effects = compute_reachable_effects(approved.spec)
-        digests_ok = (
-            (recomp_spec, recomp_skill, recomp_plan)
-            == (approved.spec_digest, approved.skill_sha256, approved.workflow_plan_digest)
-            and approved.workflow_plan_digest
-            == auth_record.workflow_plan_digest
-            == receipt.workflow_plan_digest
-            == plan.workflow_plan_digest
-            and approved.spec.id == receipt.workflow_id
-            and recomp_effects == approved.reachable_effects
-        )
-        if not digests_ok:
-            raise AdmissionDeniedError("PLAN_INTEGRITY_MISMATCH")
-        canonical_steps = derive_steps_from_plan(approved)
-        if proposed_steps is not None and tuple(proposed_steps) != canonical_steps:
-            raise RestartPolicyError(ERR_PROPOSED_STEPS_MISMATCH)
-        return self._journal.create_run(
-            CreateRunRequest(
-                run_id=receipt.run_id,
-                workflow_id=approved.spec.id,
-                spec_digest=approved.spec_digest,
-                workflow_plan_digest=approved.workflow_plan_digest,
-                grant_generation=receipt.grant_generation,
-                steps=canonical_steps,
-                clock=clock,
+        with self._lifecycle_gate:
+            if self._authority_store is None:
+                raise RestartPolicyError("authority_store_required_for_plan_run")
+            auth_record = self._authority_store.verify_active(
+                receipt, clock=clock, expected_plan_digest=plan.workflow_plan_digest
             )
-        )
+            approved = auth_record.approved_plan
+            recomp_spec, recomp_skill, recomp_plan = recompute_plan_digests(approved)
+            recomp_effects = compute_reachable_effects(approved.spec)
+            digests_ok = (
+                (recomp_spec, recomp_skill, recomp_plan)
+                == (
+                    approved.spec_digest,
+                    approved.skill_sha256,
+                    approved.workflow_plan_digest,
+                )
+                and approved.workflow_plan_digest
+                == auth_record.workflow_plan_digest
+                == receipt.workflow_plan_digest
+                == plan.workflow_plan_digest
+                and approved.spec.id == receipt.workflow_id
+                and recomp_effects == approved.reachable_effects
+            )
+            if not digests_ok:
+                raise AdmissionDeniedError("PLAN_INTEGRITY_MISMATCH")
+            canonical_steps = derive_steps_from_plan(approved)
+            if proposed_steps is not None and tuple(proposed_steps) != canonical_steps:
+                raise RestartPolicyError(ERR_PROPOSED_STEPS_MISMATCH)
+            return self._journal.create_run(
+                CreateRunRequest(
+                    run_id=receipt.run_id,
+                    workflow_id=approved.spec.id,
+                    spec_digest=approved.spec_digest,
+                    workflow_plan_digest=approved.workflow_plan_digest,
+                    grant_generation=receipt.grant_generation,
+                    steps=canonical_steps,
+                    clock=clock,
+                    requires_authority=True,
+                )
+            )
 
     def revoke_run_authority(self, run_id: str) -> None:
         with self._lifecycle_gate:
@@ -1939,24 +2059,23 @@ class DurableWorkflowSupervisor:
         tracker_receipt: EffectTrackerReceipt | None = None,
         clock_provider: Callable[[], ClockSnapshot] | None = None,
     ) -> ReconciliationReceipt:
+        if not isinstance(request, ReconcileStepRequest):
+            raise RestartValidationError(_ERR_EXPECTED_RECON_REQ)
         if request.resolution is ReconcileResolution.REQUEUE_PENDING:
             with self._lifecycle_gate:
-                gate_fn = (
-                    self._verify_live_run_record_authority
-                    if self._authority_store is not None
-                    else None
-                )
                 return self._journal.reconcile_step(
                     request,
                     tracker=self._tracker,
                     tracker_receipt=tracker_receipt,
-                    authority_gate=gate_fn,
+                    authority_gate=self._verify_live_run_record_authority,
                     clock_provider=clock_provider,
+                    require_live_clock=(self._authority_store is not None),
                 )
         return self._journal.reconcile_step(
             request,
             tracker=self._tracker,
             tracker_receipt=tracker_receipt,
+            require_completed_receipt=True,
         )
 
     def _enter_worker_under_gate(
