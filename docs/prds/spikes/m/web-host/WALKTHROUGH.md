@@ -26,24 +26,38 @@ their own slices.
    increasing `session_generation`. A successful exchange replaces any
    active fixture session. An unsuccessful exchange leaves it alone.
 3. Exchange and `GET /api/auth/session` return
-   `{read_session_id,session_generation,csrf_token,expires_in_ms}`. The raw
-   session ID is carried only in the manager's host-only
-   `HttpOnly; SameSite=Strict; Path=/` cookie. Accept one session cookie value and reject ambiguous duplicates. Keep the
-   CSRF token in the active host record and browser memory so a same-origin reload can recover
-   it. Verify the `X-OC-CSRF` header through the manager on
-   `POST /api/auth/logout`. On success retire the generation and expire the
-   cookie with a `204` response. A validated expiry or revocation discards the
-   record. Compute the remaining lesser of idle and absolute TTL from the
-   same monotonic clock. In this short read-only fixture auth/session
+   `{read_session_id,session_generation,csrf_token,expires_in_ms}`. Only a
+   successful exchange sends `Set-Cookie`. The manager issues a host-only
+   `HttpOnly; SameSite=Strict; Path=/` cookie. Accept one session cookie value
+   and reject ambiguous duplicates. Keep the CSRF token in host and browser
+   memory so a same-origin reload can recover it. Compute `expires_in_ms`
+   from the remaining lesser of idle and absolute TTL at the final auth
+   release check immediately before the first successful socket send. If
+   that first send would block, discard the unsent frame and recompute on
+   retry. Once any bytes are sent, preserve the frame. The client anchors its
+   deadline to the monotonic time captured before making the request. Auth
    inspection and workspace reads do not extend the deadline.
-4. Missing or retired sessions return `401`, policy denials `403`, and
-   unknown routes `404`, and unsupported methods `405`, with fixed bodies
-   and no private data. Keep codes,
-   cookies, CSRF, internal session hashes, and fixture rows out of request
-   logs, URLs, and browser storage. Suppress raw access and error logging.
-   Use a fresh trusted browser profile constrained to the fixture origin for
-   qualification. Cookies are host-scoped, so an ephemeral port alone does
-   not isolate them from other services on `127.0.0.1`.
+4. Verify `X-OC-CSRF` through the manager on `POST /api/auth/logout`.
+   Retire the generation and return `204` without `Set-Cookie`. The old
+   cookie has no authority. The next confirmed exchange overwrites it.
+   Expiry or authority revocation also retires the record.
+5. Use one auth controller in a fresh single-tab qualification profile. It
+   serializes exchange and logout through full response confirmation and
+   leaves these requests running while the page is intact. Only a complete,
+   validated outcome lets the controller start the next operation. An
+   interrupted or unconfirmed operation blocks further auth in the profile.
+   The trusted harness resets by discarding the profile, stopping that
+   fixture server, and starting a fresh server and profile. An exchange
+   response can change the cookie before its body is confirmed. This
+   qualification therefore applies to one controlled tab and controller,
+   with reload exercised only between confirmed operations.
+6. Use fixed bodies for auth failures, policy denials, unknown routes, and
+   unsupported methods (`401`, `403`, `404`, `405` respectively). Keep
+   codes, cookies, CSRF, internal session hashes, and fixture rows out of
+   request logs, URLs, and browser storage. Suppress raw access and error
+   logging. Constrain the trusted browser profile to the fixture origin.
+   Cookies are host-scoped. Qualify the fixture in a profile isolated from
+   other services on `127.0.0.1`.
 
 ## Read contract and release fence
 
@@ -83,20 +97,31 @@ admit(cookie, request):
 prepare():
   pass only the captured context to the bounded fake reader
   reader checks that authority and session are still active before reading
-  build and validate the complete JSON body off the wire
+  validate the full JSON body and preframe status, headers and body
+  retain a bounded private frame and an unsent-byte offset in the handler
 
-commit():
-  under the same host lock as logout, replacement and revocation,
-    verify the captured context, operator authority and expiry again
-  commit either the prepared private response or a fixed denial
+release(frame, context):
+  use a short monotonic deadline for the whole response
+  at each send attempt, take the same guard as retirement and check
+    deadline, captured generation, active cookie, operator authority and expiry
+    if retired before any bytes are sent, select a fixed denial
+    if retired after any bytes are sent, close without sending the suffix
+    otherwise call the socket directly with a bounded MSG_DONTWAIT send
+  advance the offset only by the number of bytes accepted by that call
+  release the guard before waiting for writability or retrying
+  close on deadline or transport failure
 ```
 
-The commit is the HTTP release decision. A retirement that wins this decision
-returns only the denial. The client still fences delivery already committed to
-the socket. It retires its generation and clears state on logout or expiry,
-cancels in-flight work, and discards completions from retired generations
-after a fresh login. A queued in-memory UI invalidation exercises that rule
-alongside the integrated HTTP held-reply case.
+The guarded socket call is the release boundary. Every successful send
+releases exactly the bytes accepted by the socket. All unsent bytes stay
+handler-owned and must pass the guard again. Use explicit Content-Length and
+close the connection after this single response. Bypass buffered HTTP
+writers for the private frame. Retirement remains available while a peer
+stalls because the guard covers only the authorization check and the
+nonblocking syscall. Socket-accepted bytes may reach the browser after
+retirement. The client clears state and cancels outstanding reads on logout
+or expiry, then rejects late completions after a fresh login. A queued
+in-memory UI invalidation exercises that rule alongside the HTTP held reply.
 
 ## Static assets and CSP
 
@@ -112,10 +137,14 @@ under API, event, and asset namespaces return fixed errors.
 At startup privately read `build/csp-manifest.json` from the trusted UI
 build and exclude it from HTTP. Require
 `{version:1,html_sha256:<hex>,inline_script_sha256:<base64>}`. Verify the
-whole HTML digest and the exact bytes inside its single executable inline
-bootstrap. Refuse to start on a missing manifest, mismatch, or unexpected
-executable inline block. Serve the verified HTML bytes and put the exact
-`'sha256-<base64>'` value in the enforcing header on every HTML response.
+whole HTML digest over the original artifact bytes, then decode strictly as
+UTF-8 and admit exactly one executable inline bootstrap. Reject CR, NUL and
+invalid UTF-8. Hash the raw UTF-8 byte span inside the bootstrap tags, including
+all LF whitespace. Use the same byte contract in the UI manifest builder, host
+verifier and shared fixture. Refuse startup on a missing manifest, a mismatch
+or extra executable inline content. Serve the verified bytes as
+`text/html; charset=utf-8` and insert the exact `'sha256-<base64>'` value in
+the enforcing header on every HTML response.
 
 ```text
 default-src 'none'; script-src 'self' 'sha256-<base64>'; style-src 'self';
@@ -137,13 +166,25 @@ workers and local state.
   CSRF, unknown API and asset paths, and denied role/authority. Assert the
   reader count stays zero on admission denials and fixed denials contain no
   fixture text. Exercise expired idle and absolute lifetime independently.
-- Hold one request before read and one after body preparation but before
-  release. Retire by logout, expiry, or authority revocation and release
-  each barrier. Assert no read in the first case and no private response in
-  the second. Open a fresh operator generation during the hold and assert
-  the old response cannot supply new-session data. Assert the fresh read
-  succeeds with a new pair.
-- Joint smoke runs the packaged static build with a local browser and the
+- Hold one request before read and another immediately before its first
+  guarded socket send. Retire by logout, expiry, or authority revocation and
+  release each barrier. Assert zero reads in the first case and zero private
+  bytes in the second. Use a stalled peer and an intentionally partial send
+  to prove retirement completes during backpressure, and assert that no
+  unsent private suffix reaches the socket after retirement. Open a fresh
+  generation while the old request is held and verify the fresh read.
+- Delay the auth response across the first socket-send barrier and check
+  that the issued TTL reflects current host time and that the browser's
+  pre-request anchor is conservative. Confirm exchange overwrites a revoked
+  cookie and logout emits no `Set-Cookie`. Interrupt an exchange after its
+  cookie header can arrive and verify that the controller blocks further auth
+  until the harness resets the server and profile. Check the same recovery
+  path when logout completion is unconfirmed.
+- Share a bootstrap byte fixture with the UI lane. Accept LF and multibyte
+  UTF-8 with matching digests. Refuse changed HTML and script hashes,
+  additional inline executable content, CR, NUL, and invalid UTF-8, including
+  when the supplied hashes otherwise match.
+- Joint smoke runs the packaged static build with real Chromium and the
   same loopback fixture. Deep-link from a fresh profile, exchange, render
   private synthetic rows, and assert CSP allows the generated bootstrap
   while blocking a connection to a second disposable loopback origin.
