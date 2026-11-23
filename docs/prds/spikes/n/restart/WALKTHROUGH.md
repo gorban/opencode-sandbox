@@ -889,51 +889,78 @@ class WorkflowRestartJournal:
             raise
 ```
 
-### 5.2 Admitted-Plan Step Derivation, Atomic Worker-Entry Fence, & Two-Phase Dispatch (`oc_restart_harness.py`)
+### 5.2 Canonical Admitted-Plan Graph, Single `_lifecycle_gate`, & Exact-Token Settlement (`oc_restart_harness.py`)
 
 - **Run creation from admitted `authority_record.approved_plan` (`create_run_from_plan`):**
   1. Verifies live authority FIRST: `auth_record = authority_store.verify_active(receipt,
      clock=clock, expected_plan_digest=plan.workflow_plan_digest)`.
-  2. Uses **`approved = auth_record.approved_plan`** as the single authoritative source (never
-     trusting unverified caller fields): calls `recompute_plan_digests(approved)` and
-     `recomputed_effects = compute_reachable_effects(approved.spec)`, verifying:
+  2. Uses **`approved = auth_record.approved_plan`** as the single authoritative source: calls
+     `recompute_plan_digests(approved)` and `recomputed_effects =
+     compute_reachable_effects(approved.spec)`, verifying:
      - `recomputed_spec == approved.spec.spec_digest`,
      - `recomputed_skill == approved.skill_sha256`,
      - `recomputed_plan == approved.workflow_plan_digest == auth_record.workflow_plan_digest == receipt.workflow_plan_digest == plan.workflow_plan_digest`,
      - `approved.spec.id == receipt.workflow_id`,
      - `recomputed_effects == approved.reachable_effects`.
-  3. **Derives or validates the entire executable step graph from `approved`:**
-     - `derive_steps_from_plan(approved)` derives `StepSpec`s directly from `approved.spec.states`
-       and `approved.spec.transitions` (binding each state's exact `effect_kind`, `side_effecting`,
-       and acyclic DAG `depends_on`).
-     - When explicit `steps` are supplied, validates EVERY `StepSpec` against `approved.spec`
-       **before writing any journal row**: every `step.state_name` must exist in
-       `approved.spec.states`, `step.effect_kind` must be explicitly permitted on that exact state
-       AND in `recomputed_effects`, and `step.side_effecting` must match the fail-closed rule. Any
-       changed/unauthorized effect or undeclared state fails closed with `RestartPolicyError` and
-       **ZERO journal writes**!
-  4. Enforces `MAX_RUNS` (`current_run_count < MAX_RUNS`) and whole-transaction event headroom
-     (`assert_event_capacity`) inside `BEGIN IMMEDIATE`, then persists
+  3. **Executes ONLY the canonical derived graph (`derive_steps_from_plan(approved)`):**
+     - `canonical_steps = derive_steps_from_plan(approved)` constructs the canonical acyclic DAG
+       deterministically from `approved.spec.states` and `approved.spec.transitions` (binding each
+       step's exact `step_id`, `state_name`, `effect_kind`, `side_effecting`, `depends_on`, and
+       `max_attempts`). Any plan transition semantics the acyclic fixture cannot represent (cycles,
+       loops, missing/unmapped states, or unsupported multi-edge ambiguity) fails closed with
+       `RestartPolicyError("plan_graph_unsupported")`.
+     - If an optional caller-provided `proposed_steps` sequence is passed for verification,
+       `create_run_from_plan()` requires **exact structural equality**
+       `tuple(proposed_steps) == tuple(canonical_steps)` (forbidding altered dependencies,
+       repeated effects under a second step ID, changed `effect_kind`, or altered retry limits) —
+       any mismatch raises `RestartPolicyError("proposed_steps_mismatch")` with **ZERO journal
+       writes**!
+  4. Enforces `MAX_RUNS` (`current_run_count < MAX_RUNS`) and whole-transaction recovery +
+     terminal-settlement headroom (`assert_event_capacity`) inside `BEGIN IMMEDIATE`, then persists
      `(run_id, workflow_id, spec_digest, workflow_plan_digest, grant_generation)` durably in
      `workflow_runs` and in the `run_created` event.
-- **Cross-restart live authority & atomic worker-entry fencing:**
-  - Across restarts, every plan-bound execution requires live `RunAuthorityStore` authority,
-    reconstructing `AdmissionReceipt(run_id=run.run_id, grant_generation=run.grant_generation,
+- **Single ordering guard (`self._lifecycle_gate = threading.RLock()`) & exact-token settlement:**
+  - Across restarts, every plan-bound execution reconstructs
+    `AdmissionReceipt(run_id=run.run_id, grant_generation=run.grant_generation,
     workflow_plan_digest=run.workflow_plan_digest, workflow_id=run.workflow_id)` from the
     replay-verified `workflow_runs` row.
-  - **Atomic worker-entry gate (`SyntheticEffectTracker.execute_fenced`):** To close the TOCTOU
-    window between `lease_step()` commit and `worker.execute(token)` (where authority revocation,
-    expiry, `cancel_run`, or epoch rotation could occur after leasing), worker execution enters
-    through `tracker.execute_fenced(token, pre_entry_gate=...)` which—atomically under
-    `tracker._lock` **before** running the worker body or recording any effect—verifies:
-    1. `token.lease_epoch >= tracker.fenced_epoch` and `(run_id, step_id, attempt_no, lease_epoch, idempotency_key)` is not fenced,
-    2. `journal.verify_active_lease(token)` (live `current_epoch`, `status == 'leased'`, `run.status == 'running'`, `not run.cancel_requested`),
-    3. live `RunAuthorityStore` authority at a fresh `clock_provider()` call!
-    If ANY check fails at worker entry, the worker body is **never invoked** and **zero synthetic
-    effects** are recorded!
+  - `DurableWorkflowSupervisor` owns **ONE shared ordering guard
+    `self._lifecycle_gate = threading.RLock()`** that serializes:
+    - **(a) Lifecycle retirement / fencing:** `cancel_run(...)`, `revoke_run_authority(run_id)`
+      (wrapping `authority_store.revoke_run(run_id)`), and `simulate_crash()` /
+      `tracker.fence_epoch(...)`, AND
+    - **(b) The irreversible worker-entry decision inside `run_step_once()`:** acquire
+      `self._lifecycle_gate` -> `journal.verify_active_lease(token)` -> sample
+      `t_entry = clock_provider()` **AFTER** the blocking journal read ->
+      `_verify_live_run_authority(run_id, t_entry)` -> `tracker.admit_attempt(token)` (atomically
+      marking the single owned attempt admitted/in-flight in `SyntheticEffectTracker`), then
+      release `self._lifecycle_gate` **before** running `worker.execute(token)`.
+  - **Both orderings are crisp and race-free:**
+    - If retirement, cancellation, or epoch fencing wins `_lifecycle_gate` first -> worker entry
+      fails closed with **0 worker entries and 0 synthetic effects**.
+    - If worker entry wins `_lifecycle_gate` first -> **exactly 1 owned attempt** executes. If
+      authority is revoked or expires *during* worker execution, Phase 2 settles that
+      already-admitted, already-executed fenced `StepLeaseToken` via `complete_step()` (preserving
+      its `output_digest` and `EffectTrackerReceipt`, never leaving the step stranded in `leased`!)
+      or `fail_step()` (mapping `failed_retryable` under retired authority to `failed_terminal` so
+      a revoked run can never requeue), while all subsequent `lease_step()` and
+      `reconcile_step(resolution="requeue_pending")` calls fail closed with `AuthorityError`!
 
 ```python
 class DurableWorkflowSupervisor:
+    def revoke_run_authority(self, run_id: str) -> None:
+        with self._lifecycle_gate:
+            self._authority_store.revoke_run(run_id)
+
+    def cancel_run(self, run_id: str, *, reason: str, clock: ClockSnapshot) -> RunStatus:
+        with self._lifecycle_gate:
+            return self._journal.cancel_run(run_id, reason=reason, clock=clock)
+
+    def simulate_crash(self) -> None:
+        with self._lifecycle_gate:
+            self._tracker.fence_epoch(self._journal.current_epoch + 1)
+            self._journal.simulate_crash()
+
     def run_step_once(
         self,
         run_id: str,
@@ -946,12 +973,12 @@ class DurableWorkflowSupervisor:
         captured_tokens: list[StepLeaseToken] | None = None,
         on_after_lease_before_entry: Callable[[StepLeaseToken], None] | None = None,
     ) -> StepExecutionOutcome:
-        # 0. Reconstruct AdmissionReceipt from durable workflow_runs row & verify live authority.
+        # 0. Verify live authority before leasing (new dispatch strictly requires live authority).
         t_lease = clock_provider()
         self._verify_live_run_authority(run_id, t_lease)
 
         # 1. PHASE 1 (DURABLE FIRST-WRITE): Commit status='leased' AND reserve idempotency_key
-        #    in step_idempotency_keys BEFORE invoking worker!
+        #    in step_idempotency_keys BEFORE worker entry!
         token = self._journal.lease_step(
             run_id=run_id,
             step_id=step_id,
@@ -965,35 +992,25 @@ class DurableWorkflowSupervisor:
             self.simulate_crash()
             raise SimulatedSupervisorCrash("AFTER_LEASE_COMMIT_BEFORE_WORKER")
 
-        # Optional deterministic pause hook (for testing revocation / cancel_run between lease & entry):
+        # Optional deterministic pause hook (for testing both _lifecycle_gate orderings):
         if on_after_lease_before_entry is not None:
             on_after_lease_before_entry(token)
 
-        # 2. FENCED WORKER ENTRY (atomic lease + non-cancelled + live-authority gate inside tracker):
-        def _entry_gate() -> None:
-            t_entry = clock_provider()
+        # 2. IRREVERSIBLE WORKER-ENTRY DECISION under single shared _lifecycle_gate:
+        with self._lifecycle_gate:
             self._journal.verify_active_lease(token)
+            # Sample clock AFTER blocking journal read so expiry during lock wait is caught!
+            t_entry = clock_provider()
             self._verify_live_run_authority(run_id, t_entry)
+            self._tracker.admit_attempt(token)
 
+        # 3. WORKER EXECUTION (outside _lifecycle_gate & outside SQLite write transaction):
         step_rec = self._journal.get_step(run_id, step_id)
         try:
-            work_result = self._tracker.execute_fenced(
-                token,
-                pre_entry_gate=_entry_gate,
-                worker_fn=worker.execute,
-            )
-        except (
-            SimulatedSupervisorCrash,
-            AuthorityError,
-            StaleEpochError,
-            InvalidStepTransitionError,
-            RestartStorageError,
-            JournalIntegrityError,
-            RestartPolicyError,
-        ):
+            work_result = self._tracker.run_admitted(token, worker_fn=worker.execute)
+        except SimulatedSupervisorCrash:
             raise
         except Exception as exc:
-            # Unexpected exception thrown by worker_fn itself (not kernel/gate errors above):
             work_result = WorkerStepResult(
                 outcome="failed_uncertain" if step_rec.side_effecting else "failed_terminal",
                 reason=f"worker_exception:{type(exc).__name__}",
@@ -1003,10 +1020,12 @@ class DurableWorkflowSupervisor:
             self.simulate_crash()
             raise SimulatedSupervisorCrash("AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT")
 
-        # 3. PHASE 2 (FENCED COMMIT): Route completed vs worker-failure outcomes through journal.
+        # 4. PHASE 2 (EXACT-TOKEN TERMINAL SETTLEMENT):
+        #    The attempt ALREADY won _lifecycle_gate and executed under its fenced StepLeaseToken.
+        #    Settle its exact-token outcome in SQLite without stranding it as 'leased' even if
+        #    authority retired mid-execution (while forbidding retryable requeue on retired authority).
         t_done = clock_provider()
         if work_result.outcome == "completed":
-            self._verify_live_run_authority(run_id, t_done)
             ack = self._journal.complete_step(
                 CompleteStepRequest(
                     token=token,
@@ -1016,11 +1035,14 @@ class DurableWorkflowSupervisor:
             )
             return StepExecutionOutcome(token=token, ack=ack)
 
+        retryable = work_result.outcome == "failed_retryable"
+        if retryable and not self._is_live_run_authority_active(run_id, t_done):
+            retryable = False  # never requeue a revoked/expired run
         ack = self._journal.fail_step(
             FailStepRequest(
                 token=token,
                 reason=work_result.reason,
-                retryable=(work_result.outcome == "failed_retryable"),
+                retryable=retryable,
                 uncertain=(work_result.outcome == "failed_uncertain"),
                 clock=t_done,
             )
@@ -1111,21 +1133,30 @@ MAX_OP_MS = 10_000
 ```
 
 Engineering & maintainability constraints:
-- **Whole-transaction capacity & recovery-headroom guards (`assert_event_capacity`):**
+- **Whole-transaction capacity, recovery, & terminal-settlement headroom (`assert_event_capacity`):**
   - `create_run` rejects creating run `MAX_RUNS + 1` (`RestartPolicyError("max_runs_exceeded")`).
-  - Every user/workflow write transaction (`create_run`, `lease_step`, `complete_step`,
-    `fail_step`, `reconcile_step`, `cancel_run`) computes the **resulting** active leased-step count
-    `L` after the transaction and reserves mandatory headroom for a subsequent crash recovery +
-    clean shutdown:
-    `reserved_headroom = 1 (supervisor_started) + L (per-lease recovery fence) + 1 (supervisor_stopped)`.
-    A write appending `k` events is admitted **only** if
-    `last_event_seq + k + reserved_headroom <= max_replay_events` (default `MAX_REPLAY_EVENTS =
-    50_000`; configurable `<= MAX_REPLAY_EVENTS` for boundary tests). Refusal rolls back cleanly
-    with zero writes. Likewise, `open_and_recover()` verifies
-    `last_event_seq + 1 + len(prior_leased) <= max_replay_events` and `close_clean()` verifies
-    `last_event_seq + 1 <= max_replay_events` before appending, failing closed with
-    `RestartPolicyError("max_replay_events_exceeded")` so the journal can **never** write event
-    `max_replay_events + 1` or brick a subsequent verifier!
+  - Let `L` = resulting active `leased` step count and `U` = resulting `uncertain_needs_reconcile`
+    step count after the transaction (with default `max_replay_events = MAX_REPLAY_EVENTS =
+    50_000`; configurable `<= MAX_REPLAY_EVENTS` for boundary tests):
+    1. **Ordinary workflow writes** (`create_run`, `lease_step`, `complete_step`, `fail_step`,
+       `cancel_run`, `reconcile_step(requeue_pending)`) reserve headroom for crash startup,
+       per-lease recovery fencing, one terminal reconciliation for EVERY leased or uncertain
+       obligation, and clean shutdown:
+       `reserved = 1 (supervisor_started) + L (recovery fences) + (L + U) (terminal reconciliations) + 1 (supervisor_stopped)`.
+       Admit iff `last_event_seq + k + reserved <= max_replay_events`.
+    2. **Terminal reconciliation** (`reconcile_step` with `resolution in {completed,
+       failed_terminal, cancelled}`) discharges 1 existing uncertain obligation (`U_after = U_before - 1`):
+       admit iff `last_event_seq + 1 + L + U_after + 1 (supervisor_stopped) <= max_replay_events`
+       (guaranteed to fit using the headroom already reserved when the step was leased!).
+    3. **Writable boot (`open_and_recover`)** computes `prior_leased = len(leased_prior_steps)` and
+       `resulting_uncertain = existing_uncertain + count(side_effecting in prior_leased)`, and
+       admits iff `last_event_seq + 1 + prior_leased + resulting_uncertain + 1 <= max_replay_events`
+       (otherwise rolls back cleanly with `RestartPolicyError("max_replay_events_exceeded")`,
+       leaving the prior head untouched and readable via `verify_journal_replay_readonly()`).
+    4. **Clean shutdown (`close_clean`)** admits iff `last_event_seq + 1 <= max_replay_events`.
+  - Refusal rolls back cleanly with zero writes, guaranteeing every admitted lease can ALWAYS
+    complete `lease -> crash -> recovery -> terminal reconciliation -> close` within
+    `max_replay_events`!
 - All parameter-heavy operations use small frozen request dataclasses (`CreateRunRequest`,
   `CompleteStepRequest`, `FailStepRequest`, `ReconcileStepRequest`) keeping every function at
   `<= 8` parameters (`<= 12` cap).
@@ -1152,10 +1183,11 @@ Engineering & maintainability constraints:
 | `fail_step(retryable=True)` on pure step at `attempt_no >= max_attempts` | Transitions to `failed_terminal` (`outcome_status = 'failed_terminal'`) | Atomic commit |
 | `cancel_run` followed by `reconcile_step(resolution="requeue_pending")` | `InvalidStepTransitionError("cannot_requeue_cancelled_or_exhausted_step")` | **Zero** DB writes |
 | `reconcile_step(resolution="requeue_pending")` missing/mismatched/unfenced/`still_pending`/`effect_applied` `EffectTrackerReceipt` | `ReconciliationEvidenceError` (step remains `uncertain_needs_reconcile`) | **Zero** DB writes |
-| Authority retired or `cancel_run` invoked between `lease_step()` commit and worker entry | Atomic `SyntheticEffectTracker.execute_fenced` gate fails closed (`AuthorityError` / `InvalidStepTransitionError`); **zero worker entries & zero synthetic effects** | **Zero** side effects |
+| Authority retired or `cancel_run` wins `_lifecycle_gate` before worker entry | `_lifecycle_gate` fails closed (`AuthorityError` / `InvalidStepTransitionError`); **0 worker entries & 0 synthetic effects** | **Zero** side effects |
+| Worker entry wins `_lifecycle_gate`, then authority retires mid-execution | Exact-token terminal settlement commits `complete_step` / `fail_step` (never `retryable` requeue; **0 stranded `leased` steps**); all subsequent `lease_step` dispatches fail with `AuthorityError` | Atomic terminal commit |
 | `reconcile_step(resolution="requeue_pending")` on revoked/expired `RunAuthorityStore` run | `AuthorityError` (terminal settlement `completed`/`failed_terminal`/`cancelled` remains permitted) | **Zero** DB writes |
-| `create_run_from_plan` with `StepSpec.effect_kind` outside `auth_record.approved_plan` reachable effects or undeclared `state_name` | `RestartPolicyError` | **Zero** journal writes |
-| `create_run` exceeding `MAX_RUNS` or write exceeding `MAX_REPLAY_EVENTS - reserved_headroom` | `RestartPolicyError("max_runs_exceeded" / "max_replay_events_exceeded")` (prior head remains recoverable!) | Clean rollback |
+| `create_run_from_plan` with altered `proposed_steps` (dependency, duplicated step, effect, or `max_attempts`) or unsupported cyclic plan graph | `RestartPolicyError("proposed_steps_mismatch" / "plan_graph_unsupported")` | **Zero** journal writes |
+| `create_run` exceeding `MAX_RUNS` or write/reopen exceeding `max_replay_events` headroom (`1 + L + (L + U) + 1`) | `RestartPolicyError("max_runs_exceeded" / "max_replay_events_exceeded")` (prior head intact & read-only verifiable!) | Clean rollback |
 | Upstream DAG step enters `FAILED_TERMINAL` or `CANCELLED` while downstream dependents remain `PENDING` | DAG-aware `compute_run_status()` transitions run to `FAILED` / `CANCELLED` once zero runnable steps remain (no `RUNNING` deadlock) | Atomic commit |
 | Post-`supervisor_stopped` event, skipped/duplicate epoch start, unfenced prior-epoch lease, or tampered `updated_at_us` | `ReplayMismatchError` | Boot/replay fails closed |
 | `reconcile_step` with `expected_epoch != current_epoch` | `StaleEpochError` | **Zero** DB writes |
@@ -1166,7 +1198,7 @@ Engineering & maintainability constraints:
 | Tampered `entry_hash` / `prev_hash`, invalid hex (`"z"*64`), negative/zero/gapped `seq`, non-monotonic epoch, or extra materialized rows | `JournalIntegrityError` / `ReplayMismatchError` | Boot/replay fails closed |
 | SQLite non-`STRICT` tamper (`BLOB`/`TEXT` in `id`, `current_epoch`, `seq`, `supervisor_epoch`, `attempt_no`, `reconciled_epoch`, `outcome_status`, `side_effecting`, `cancel_requested`) or unexpected trigger/view | `JournalIntegrityError("malformed_storage_class" / "unexpected_schema_object")` | Boot/replay fails closed |
 | `ClockSnapshot` overflow (`> MAX_INT64` us), negative `monotonic_s`/`wall_s`, `NaN`/`Inf`, or `grant_generation` overflow | `RestartValidationError` | Rejected pre-write |
-| Revoked/expired `RunAuthorityStore` record (including mid-step) or tampered `CompiledWorkflowPlan` digest | `AuthorityError` / `AdmissionDeniedError` | Rejected pre-commit |
+| Revoked/expired `RunAuthorityStore` record at run creation, `lease_step`, or pre-entry `_lifecycle_gate`, or tampered `CompiledWorkflowPlan` digest | `AuthorityError` / `AdmissionDeniedError` | Rejected pre-write / zero effects |
 | Second live supervisor while lock held | `RestartStorageError("supervisor_lock_held")` | Refused immediately |
 | Symlink `state_dir`, user symlink ancestor via `..`, production/sandbox dir, unsafe mode (`0o755`/`0o644` DB/sidecar/lock), hardlink, or FIFO | `RestartStorageError` (non-blocking, zero mode repair) | Refused immediately |
 | Held SQLite write lock or `_UMASK_LOCK` past `max_op_ms` | `RestartStorageError("op_deadline_exceeded")` (progress handler unconditionally cleared in `finally:`) | Fails closed promptly |
@@ -1203,28 +1235,35 @@ python3 -B -m unittest discover -s docs/prds/spikes/n/restart -p 'test_*.py'
 under both default `$HOME` and `TMPDIR=/tmp` using disposable owner-only (`0o700`) temporary
 directories:
 
-1. **Admitted-plan derivation, atomic worker-entry fencing, mid-step revocation, & strict bounds:**
+1. **Canonical admitted-plan derivation, `_lifecycle_gate` orderings, mid-step settlement, & headroom bounds:**
    - Compiles a real `workflow@1` TOML plan via read-only `compile_workflow_plan()`, verifies
      `recompute_plan_digests()` + `compute_reachable_effects()` against
-     `auth_record.approved_plan`, and derives/validates steps via `create_run_from_plan()`.
-     Verifies a **tampered `CompiledWorkflowPlan` digest** AND a **valid `AdmissionReceipt` paired
-     with an unauthorized effect (`launch_sandbox` against an `observe_only` plan) or undeclared
-     `state_name`** are rejected with **zero journal writes** (`last_event_seq` and `workflow_runs`
-     unchanged).
-   - **Atomic worker-entry fence:** Pauses via `on_after_lease_before_entry` after `lease_step()`
-     commits, retires `RunAuthorityStore` authority (and in a sibling test calls `cancel_run()`),
-     then resumes worker dispatch -> asserts **zero worker entries** and **zero synthetic effects**.
-   - Verifies cross-restart `AdmissionReceipt` reconstruction from durable `workflow_runs`,
-     **mid-step `RunAuthorityStore` revocation** (revoked between worker execution and
-     `complete_step` -> fails closed with `AuthorityError`), and **revoked-run `reconcile_step`
-     policy** (`requeue_pending` refused with `AuthorityError`, while terminal settlement
-     `completed` / `cancelled` succeeds).
+     `auth_record.approved_plan`, and executes ONLY `derive_steps_from_plan(approved)`.
+     Verifies: (a) a **tampered `CompiledWorkflowPlan` digest**, (b) a **valid `AdmissionReceipt`
+     paired with an unauthorized effect (`launch_sandbox` against an `observe_only` plan)**, and
+     (c) a **valid `AdmissionReceipt` paired with a changed dependency, altered `max_attempts`, or
+     duplicated step** in `proposed_steps` ALL fail closed with `RestartPolicyError` and **ZERO
+     journal writes** (`last_event_seq` and `head_hash` unchanged).
+   - **Both `_lifecycle_gate` orderings at worker entry:**
+     1. *Retirement / cancellation wins first:* pauses via `on_after_lease_before_entry` after
+        `lease_step()` commits, calls `revoke_run_authority()` (and in a sibling test
+        `cancel_run()`), then resumes -> asserts **0 worker entries** and **0 synthetic effects**.
+     2. *Worker entry wins first (mid-step revocation):* worker wins `_lifecycle_gate` and begins
+        executing, authority is revoked during worker execution -> same supervisor commits
+        exact-token `complete_step` (1 owned worker entry, step transitions to `completed` with
+        matching `output_digest`, **0 stranded `leased` steps**) and refuses all subsequent
+        `lease_step` dispatches on the revoked run with `AuthorityError`!
+   - Verifies cross-restart `AdmissionReceipt` reconstruction from durable `workflow_runs` and
+     **revoked-run `reconcile_step` policy** (`requeue_pending` refused with `AuthorityError`,
+     while terminal settlement `completed` / `cancelled` succeeds).
    - Rejects mutating `effect_kind` with `side_effecting=False`, cyclic `depends_on` DAGs,
      duplicate `step_id`, NUL/control/BiDi strings, `bool`-as-`int`, `NaN`/`Inf`, negative
      `monotonic_s`/`wall_s`, `ClockSnapshot` / `grant_generation` signed-64-bit overflow, and
-     **whole-transaction `MAX_RUNS` / `MAX_REPLAY_EVENTS` headroom** (driving to the exact last
-     admissible batch at a test-configured cap, verifying refusal leaves prior head intact, AND
-     verifying crash -> recovery -> `close_clean()` all succeed within reserved headroom!).
+     **full-lifecycle `MAX_RUNS` / `max_replay_events` headroom** (driving a small-cap fixture
+     through `lease (last admissible batch) -> refusal of next write leaving head intact -> crash
+     -> open_and_recover() -> terminal reconcile_step() -> close_clean()`, then confirming an
+     exhausted writable reopen fails closed with `RestartPolicyError("max_replay_events_exceeded")`
+     leaving the prior head unchanged while `verify_journal_replay_readonly()` succeeds!).
 2. **Crash BEFORE worker invocation (`AFTER_LEASE_COMMIT_BEFORE_WORKER`) & trusted-tracker `no_effect` evidence:**
    - **Pure/idempotent step (`side_effecting=False`):** Commits `leased` + reserves
      `idempotency_key` under epoch `1`, crashes before worker runs (`executions == 0`), restarts
