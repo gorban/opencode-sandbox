@@ -18,6 +18,9 @@ reservation explicitly in this index.
 
 - [*] PRD M first PoC — local worker addressing, orchestration, and thread projection
   ([M first PoC split](prd_m.md#first-poc-split)) — **PRD M coordination**.
+- [*] Local compiled-profile proof ([L](prd_l.md#local-compiled-profile-proof)) — **Codex**.
+- [*] Read-only thread projection ([M3](prd_m3.md#concrete-gaps-and-checkboxes)) —
+  **PRD M coordination**.
 - [*] PRD N planning & initial workflow/supervision slices (**N0–N2** only; **N3** three-tier
   Human Inbox UI & declarative `oc-ui@1` surfaces remain open `[ ]`) — `workflow@1` schema/kernel,
   host-authoritative metrics, and zero-authority System-1 + blind verification supervision
@@ -63,7 +66,7 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 | [prd_j](prd_j.md) | Host configuration and bridge merge tool preferences | proposed; TOML and editor design deferred |
 | [prd_k](prd_k.md) | Contributor checks and repository layout | local CI and documentation PoCs human-approved; hosted qualification and final review open |
 | [prd_l](prd_l.md) | Composable sandbox config, host providers, comm adapters, and orchestrator config MCP | offline spike PoC slice human-approved; external secret isolation ([prd_l1](prd_l1.md)), production port, and final review open |
-| [prd_m](prd_m.md) | Model telemetry (5h/7d quotas & reasoning variants), cross-model orchestration, and unified Tauri/web control plane | proposed; Gate 1 external security review cleared; open decisions & human review pending |
+| [prd_m](prd_m.md) | Model telemetry, cross-model orchestration, and a shared SvelteKit control plane | local hub and worker proof merged; [loopback UI first](prd_m3a.md), then [Tauri desktop](prd_m3b.md); final review open |
 | [prd_n](prd_n.md) | First-class long-running workflows (`workflow@1`), host metrics, zero-authority System-1 + blind-check supervision, non-blocking Human Inbox, and declarative `oc-ui@1` dashboard surfaces | proposed; Rank #1 direction selected; initial Gate 1 external security & PR-style review cleared (`e155caf2`); reciprocal review, open decisions & human review pending |
 
 The imported findings are evidence, not production implementation:

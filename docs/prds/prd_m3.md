@@ -6,12 +6,16 @@ Parent: [prd_m](prd_m.md) · related: [per-instance DNS](prd_d.md), [local HTTPS
 [host credential brokering](prd_l1.md), [model telemetry](prd_m1.md),
 [cross-model orchestration](prd_m2.md)
 
+Delivery order: **[M3a — Loopback dashboard](prd_m3a.md)**, then
+**[M3b — Tauri desktop dashboard](prd_m3b.md)**. Both use the same SvelteKit static SPA
+and typed control-plane contract.
+
 ## Problem statement
 
 Running parallel local and remote sandboxes currently scatters operator attention across multiple
 Chrome profiles/windows and ad-hoc host terminals, and launches Chromium even for sandboxes that
 only run backend code or security reviews. We want a single, lightweight **native desktop app +
-hardened loopback web UI** (Tauri v2 + shared React/Vite frontend) that:
+hardened loopback web UI** with a shared SvelteKit frontend that:
 
 1. Replaces flat project lists with a clear three-level hierarchy:
    **`Project -> Sandbox (local or REMOTE, -i NAME) -> Chat / Thread`** (plus a pinned **Root
@@ -94,16 +98,17 @@ Sidebar Tree (3-Level Hierarchy)
       authority).
     - Otherwise render **`[Sandbox-Local / Unverified]`** (warning badge, zero authority).
 
-### 3. Shared React/Vite frontend, Tauri v2 UDS bridge, and loopback web auth
+### 3. Shared SvelteKit frontend, loopback web auth, and Tauri v2 UDS bridge
 
-- **One SPA, Two Strictly Authenticated Shells (Zero CORS Holes, Zero Tokens in URLs):**
-  1. **Tauri v2 Native Desktop App (Recommended Daily Driver):** ~30–60 MB idle RAM, zero browser
+- **One static SPA, two authenticated shells:** Reach initial acceptance in M3a first. M3b
+  then packages the same client with a typed native transport.
+  - **Tauri v2 Native Desktop App (M3b):** zero browser
      extensions. A minimal Rust backend opens `oc_daemon`'s host-only `0o600` UDS directly
      (`SO_PEERCRED` UID verified) to proxy API/SSE/PTY/Browser streams to the WebView without
      opening any cross-origin HTTP/CORS hole on loopback. The Tauri v2 capabilities JSON grants
      **zero** `fs`, `shell`, `http`, or `clipboard` plugin permissions (only native window focus,
      notifications, and the typed `oc_daemon` UDS IPC bridge).
-  2. **Hardened Loopback Web Mode ([prd_i1](prd_i1.md)):** Binds `127.0.0.1` only. Launch CLI
+  - **Hardened Loopback Web Mode (M3a, [prd_i1](prd_i1.md)):** Binds `127.0.0.1` only. Launch CLI
      prints/passes a **single-use, 60-second bootstrap code** (never putting a reusable
      `operator_ui_token` in URL query strings, browser history, or CLI `argv`), exchanged via
      `POST /api/auth/exchange` for an `HttpOnly; SameSite=Strict` session cookie (with idle +
@@ -111,10 +116,15 @@ Sidebar Tree (3-Level Hierarchy)
      mutation validates exact `Origin` + CSRF token; every WebSocket upgrade requires a
      **single-use, CSRF-minted WS ticket** bound to `(session_id, target_addr, surface_kind)`.
 - **Explicit CSP & Trusted Host Chrome Separation ([prd_i1](prd_i1.md), [prd_i3](prd_i3.md)):**
-  - **Trusted Host Chrome CSP:** Emit the **exact bound ephemeral port** at runtime:
+  - **Loopback dashboard CSP ([M3a](prd_m3a.md)):** The daemon sends the enforcing header on
+    each HTML response. Emit the **exact bound ephemeral port** at runtime when WebSockets
+    are enabled:
     `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;
     connect-src 'self' ws://127.0.0.1:<bound_port>; frame-src 'self'; frame-ancestors 'none';
-    base-uri 'none'; form-action 'self'`.
+    base-uri 'none'; form-action 'self'`. If the production build has an inline bootstrap,
+    add its exact build hash to `script-src`.
+  - **Desktop dashboard CSP ([M3b](prd_m3b.md)):** Load only bundled assets and enable only
+    the platform's required local IPC endpoints. Omit the loopback WebSocket destination.
   - **Null-Origin Sandboxed Iframes (PTY & Browser Canvas):** Because `<iframe sandbox="allow-scripts">`
     assigns an opaque `null` origin where `'self'` does not match, pin iframe scripts via an
     explicit CSP SHA-256 hash or exact static origin URL (`script-src 'sha256-...'` /
@@ -558,7 +568,7 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
       auto-importing host-trusted `$STATE/worktrees/<NAME>` via `O_NOFOLLOW` (zero host `git` in
       `~/opencode-sandbox`), with full 5-tuple write-ahead provenance receipts and bootstrap-code +
       cookie + CSRF + single-use WS-ticket auth.
-- [ ] **Gap M3.2 — Shared React/Vite frontend + Tauri v2 UDS native shell (`ui/`):** implement
+- [ ] **Gap M3.2 — [M3a loopback frontend](prd_m3a.md), then [M3b Tauri shell](prd_m3b.md):** implement
       3-level sidebar tree (with conditional `Browser` item & optional fleet PiP Browser Wall),
       pinned `-o` orchestrator view, inert Markdown thread renderer, Trusted Chrome Approval Inbox
       & 5h/7d quota bar, unambiguous target picker (`NAME`, `REMOTE / NAME`, `@PEER`), `safe_run`

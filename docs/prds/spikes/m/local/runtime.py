@@ -411,6 +411,7 @@ class Job:
                 "--user=0:0", "--cap-drop=all", "--security-opt=no-new-privileges",
                 "--read-only", "--read-only-tmpfs=false", "--image-volume=ignore",
                 "--log-driver=none", "--restart=no", "--pids-limit=192", "--ipc=private",
+                "--pid=private",
                 "--memory", memory, "--memory-swap", memory, "--cgroupns=private",
                 "--workdir", workdir]
         for destination, (source, writable) in mounts.items():
@@ -482,6 +483,10 @@ class Job:
                 for field in NETWORK_LEAK_FIELDS
             )
             or host.get("Privileged")
+            or host.get("IpcMode") != "private"
+            or host.get("PidMode") != "private"
+            or host.get("PidsLimit") != 192
+            or config.get("User") != "0:0"
             or not host.get("ReadonlyRootfs")
             or host.get("Devices")
             or host.get("CapAdd")
