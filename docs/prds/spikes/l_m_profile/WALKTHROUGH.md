@@ -22,9 +22,12 @@ its job-scoped arbiter require separate verification.
 2. Compile each variant through `compile_plan`; show the plan digest and service names. Lower
    only the supported shape: local Podman, interactive tier, pod-shared topology, exact fixture base
    and service images, zero remote bindings/broker routes/raw mounts, no user environment
-   overrides, one approved factory per selected service, and only expected pod-local endpoints
-   on 5432/9222. Verify the immutable digest. Reject unsupported shapes before any Podman create.
-   Lower only fixed fixture commands. Do not interpret plan exec commands, secret references,
+   overrides, and only expected pod-local endpoints on 5432/9222. Bind the exact service ID,
+   image and endpoint to the fixture-local recipe: `builtin/postgres` requires
+   `factory_id=postgres_scram_service`, and `builtin/chromium-managed` requires
+   `factory_id=None`. Verify the immutable digest. Reject unsupported shapes and any
+   unexpected mapping before any Podman create. Lower only fixed fixture commands.
+   Do not interpret plan exec commands, secret references,
    persistent volume requests, or user environment as executable configuration. The test
    substitutes tmpfs and synthetic credentials for fixture-declared durable service state.
 3. Prepare the existing PRD M `Job` and fake model `Broker` in private devbox scratch and start
@@ -34,9 +37,12 @@ its job-scoped arbiter require separate verification.
    distinct SELinux MCS labels. Retain the original relay's separate role and bind mounts.
    This models shared pod-local networking while retaining individual SELinux categories.
    The proof will use no Podman pod object or host port mapping.
-4. Verify each exact container identity, image, name, label and effective namespace before
-   accepting readiness. Inspect port bindings, image volume suppression, capabilities, mounts,
-   memory/PID limits and SELinux labels. Use read-only roots with bounded tmpfs for data,
+4. After each create and before its start, inspect the exact ID, image, name, run/role labels,
+   namespace configuration, mounts, port bindings, UID, dropped capabilities, security
+   options, memory/PID limits and its SELinux categories. Require distinct categories across
+   the worker, relay and sidecars. A mismatch leaves that entrypoint unstarted. After start,
+   inspect the effective namespace, process label and limits before probing readiness.
+   Use read-only roots with bounded tmpfs for data,
    bounded host calls, no default Podman mounts or environment passthrough, no host sockets
    in the sidecars, and no desktop session or browser profile. Run both as unprivileged
    container UIDs with dropped caps and `no-new-privileges`. Postgres uses loopback,
@@ -47,13 +53,14 @@ its job-scoped arbiter require separate verification.
 
 ## Observe and clean up
 
-1. Compare the worker, relay and service network namespace IDs with the host ID; verify only
-   loopback is present. Test CDP from the existing relay container with a bounded, local
-   `/json/version` request and verify the intended Chromium response shape. Test Postgres with
-   a TCP `SELECT 1` and a rejected authentication attempt from its own container inside that
-   same namespace. Use the verified namespace membership as evidence that the OpenCode worker
-   has the same network reachability. In the Postgres-only run, require port 9222 to refuse a
-   connection and require the Chromium sidecar to be absent from the run inventory.
+1. Compare the worker, relay and service network namespace IDs with the host ID. Verify only
+   loopback is present. Execute fixed probes for both endpoints in the exact OpenCode worker
+   container with bounded reads and deadlines. On 9222 require the expected Chromium
+   `/json/version` response. On 5432 require PostgreSQL's SCRAM challenge to a fixed startup
+   message. Separately require a TCP `SELECT 1` and rejected credentials from within the
+   Postgres container. Keep the real fixture password out of the worker and relay. In the
+   Postgres-only run, require an explicit connection refusal on 9222 from the worker and
+   require the Chromium sidecar to be absent from the run inventory.
 2. Reuse the existing OpenCode proof for a synthetic response, exact scratch-file write and
    job grant revocation. Verify no stale grant can admit a new model call.
 3. Record names and an unguessable run label before create, then an immutable ID receipt before
@@ -66,7 +73,8 @@ its job-scoped arbiter require separate verification.
 ## Verification
 
 - Run offline tests for image and unsupported-plan denial, exact optional bundle omission,
-  fixed command lowering, and cleanup for a partial startup or uncertain create.
+  recipe mapping, zero start calls on a pre-start mismatch, and cleanup for a partial
+  startup or uncertain create.
 - Run both variants in devbox using cached, pinned images, rootless Podman and SELinux
   enforcing. Record the plan digest, selected services, port and namespace evidence,
   application proof and cleanup summary without logging credentials.
