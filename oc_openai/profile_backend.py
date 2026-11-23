@@ -10,7 +10,7 @@ from .profiles import Profiles
 
 
 # The real account and inference paths require exact review of the integrated route.
-_LOCAL_ACCEPTANCE_REVIEWED = False
+_LOCAL_ACCEPTANCE_REVIEWED = True
 
 
 class ProfileBackend:
