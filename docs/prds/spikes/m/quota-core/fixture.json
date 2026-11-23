@@ -1,0 +1,13 @@
+{
+  "observed_at": 1000,
+  "windows": {
+    "5h_rolling": {"remaining_bps": 7400, "resets_at": 19000},
+    "7d_weekly": {"remaining_bps": 2500, "resets_at": 605800}
+  },
+  "grant": {
+    "route": "fixture-metered",
+    "model": "fixture-model",
+    "budget": 10,
+    "hard_bound": 6
+  }
+}
