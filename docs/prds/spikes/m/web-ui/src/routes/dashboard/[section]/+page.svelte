@@ -14,16 +14,21 @@
     phase: 'checking', snapshot: null, message: 'Checking session',
     authBusy: false, authBlocked: false, canLogout: false
   });
-  let selection = $state.raw<{ project?: string; sandbox?: string; thread?: string }>({});
-  let selectedProject = $derived(
-    view.snapshot?.projects.find(({ id }) => id === selection.project) ?? view.snapshot?.projects[0]
-  );
-  let selectedSandbox = $derived(
-    selectedProject?.sandboxes.find(({ id }) => id === selection.sandbox) ?? selectedProject?.sandboxes[0]
-  );
-  let selectedThread = $derived(
-    selectedSandbox?.threads.find(({ id }) => id === selection.thread) ?? selectedSandbox?.threads[0]
-  );
+  type Selection = { project?: string; sandbox?: string; thread?: string };
+  let selection = $state.raw<Selection>({});
+  let {
+    project: selectedProject, sandbox: selectedSandbox, thread: selectedThread
+  } = $derived(resolveSelection(view.snapshot?.projects ?? [], selection));
+
+  function resolveSelection(projects: Project[], previous: Selection) {
+    const keptProject = projects.find(({ id }) => id === previous.project);
+    const project = keptProject ?? projects[0];
+    const keptSandbox = keptProject?.sandboxes.find(({ id }) => id === previous.sandbox);
+    const sandbox = keptSandbox ?? project?.sandboxes[0];
+    const thread = keptSandbox?.threads.find(({ id }) => id === previous.thread) ?? sandbox?.threads[0];
+    return { project, sandbox, thread };
+  }
+
   let heading = $state<HTMLHeadingElement>();
   let code = $state('');
   const workspace = new Workspace(browserTransport(), (next) => {
@@ -37,10 +42,7 @@
     view = next;
     if (next.phase === 'checking' || next.phase === 'signed-out') selection = {};
     if (next.snapshot) {
-      const projects = next.snapshot.projects;
-      const project = projects.find(({ id }) => id === selection.project) ?? projects[0];
-      const sandbox = project?.sandboxes.find(({ id }) => id === selection.sandbox) ?? project?.sandboxes[0];
-      const thread = sandbox?.threads.find(({ id }) => id === selection.thread) ?? sandbox?.threads[0];
+      const { project, sandbox, thread } = resolveSelection(next.snapshot.projects, selection);
       selection = { project: project?.id, sandbox: sandbox?.id, thread: thread?.id };
     }
   });

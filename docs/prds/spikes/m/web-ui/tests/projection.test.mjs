@@ -14,11 +14,23 @@ test('manifest matches fixture bytes and rejects unsupported HTML', async () => 
     html.replace('café', 'caf\u0000'),
     html.replace('café', 'caf\r'),
     html.replace('</script>', '</script><script>2</script>'),
+    html.replace('document.documentElement', '<!-- document.documentElement'),
+    html.replace(/<script>[^]*<\/script>/u, '<script></script>'),
+    html.replace('<title>', '<title>duplicate</title><title>'),
+    html.replace('<title>', '<title data-extra="value">'),
+    html.replace('</head>', '<link href="/_app/immutable/bad.css" rel="modulepreload"></head>'),
+    html.replace('</head>', '<link href="https://example.invalid/style.css" rel="stylesheet"></head>'),
     html.replace('<div id="app">', '<div id="app" style="color:red">'),
     html.replace('<div id="app">', '<div id="app" onclick="f()">'),
     html.replace('<head>', '<head><meta http-equiv="refresh">'),
     html.replace('<head>', '<head><base href="/">')
   ]) assert.throws(() => manifest(Buffer.from(changed)));
+  const linked = html.replace('</head>', [
+    '<link href="/_app/immutable/entry/start.abc.js" rel="modulepreload">',
+    '<link href="/_app/immutable/assets/navigation.def.css" rel="stylesheet">',
+    '</head>'
+  ].join(''));
+  assert.equal(manifest(Buffer.from(linked)).inline_script_sha256, expected.inline_script_sha256);
   const invalidUtf8 = Buffer.from(bytes);
   invalidUtf8[html.indexOf('café')] = 0xff;
   assert.throws(() => manifest(invalidUtf8));

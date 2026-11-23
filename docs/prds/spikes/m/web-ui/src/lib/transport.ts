@@ -1,4 +1,4 @@
-import { boundedJson, decodeSnapshot, MAX_SNAPSHOT_BYTES, record, sessionIdentity } from './projection.ts';
+import { boundedJson, cancelResponseBody, decodeSnapshot, MAX_SNAPSHOT_BYTES, record, sessionIdentity } from './projection.ts';
 import type { Session, Snapshot } from './projection.ts';
 
 const MAX_AUTH_BYTES = 4 * 1024;
@@ -41,7 +41,7 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
 
 function requireSuccess(response: Response, status: number): void {
   if (response.status === status) return;
-  void response.body?.cancel().catch(() => {});
+  cancelResponseBody(response);
   if ([401, 403].includes(response.status)) throw new Denied();
   throw new Error('Request did not complete');
 }
@@ -60,7 +60,7 @@ export function browserTransport(): Transport {
         body: JSON.stringify({ code })
       });
       if (response.status === 401) {
-        await response.body?.cancel();
+        cancelResponseBody(response);
         throw new InvalidCode();
       }
       requireSuccess(response, 200);

@@ -93,6 +93,8 @@ test('production fallback boots in Chromium under enforcing CSP and supports key
   await code.fill(fixtureCode);
   await code.press('Enter');
   await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
+  await expect(page.locator('head title')).toHaveCount(1);
+  await expect(page).toHaveTitle('Projects · Workspace dashboard');
 
   const project = page.getByRole('button', { name: /Fixture Workshop/ });
   await project.focus();
@@ -113,6 +115,8 @@ test('production fallback boots in Chromium under enforcing CSP and supports key
   await page.getByRole('button', { name: 'Review thread' }).press('Enter');
   await expect(page.getByText('No messages.')).toBeVisible();
   await expect(announcer).toHaveText('Threads · Workspace dashboard');
+  await expect(page.locator('head title')).toHaveCount(1);
+  await expect(page).toHaveTitle('Threads · Workspace dashboard');
   await expect(announcer).toHaveAttribute('aria-live', 'assertive');
   await expect(announcer).toHaveAttribute('aria-atomic', 'true');
   await expect(announcer).toHaveCSS('position', 'absolute');
@@ -205,3 +209,38 @@ test('ready rows clear after a wall-clock jump without hiding the page', async (
   await expect(page.getByRole('status')).toHaveText('Session expired', { timeout: 3000 });
   await expect(page.getByText('Synthetic worker report')).toHaveCount(0);
 });
+
+for (const removedParent of ['sandbox', 'project']) {
+  test(`refresh resets descendants when the selected ${removedParent} disappears`, async ({ page }) => {
+    let replaceParent = false;
+    const workspace = (generation) => {
+      const data = snapshot(generation);
+      if (!replaceParent) return data;
+      const oldProject = data.projects[0];
+      const oldSandbox = oldProject.sandboxes[0];
+      const reusedThread = { ...oldSandbox.threads[1], label: 'Reused thread ID' };
+      const firstThread = { ...oldSandbox.threads[0], id: 'new-thread', label: 'First replacement thread' };
+      if (removedParent === 'sandbox') {
+        oldSandbox.id = 'new-sandbox';
+        oldSandbox.threads = [firstThread, reusedThread];
+      } else {
+        oldProject.id = 'new-project';
+        oldProject.sandboxes = [
+          { ...oldSandbox, id: 'new-sandbox', threads: [firstThread] },
+          { ...oldSandbox, label: 'Reused sandbox ID', threads: [reusedThread] }
+        ];
+      }
+      return data;
+    };
+    await mockPrivateApi(page, { authorized: true, workspace });
+    await page.goto(origin + '/dashboard/threads');
+    await page.getByRole('button', { name: 'Review thread' }).click();
+    await expect(page.locator('article h2')).toHaveText('Review thread');
+    await page.getByRole('button', { name: 'Refresh' }).click();
+    await expect(page.locator('article h2')).toHaveText('Review thread');
+
+    replaceParent = true;
+    await page.getByRole('button', { name: 'Refresh' }).click();
+    await expect(page.locator('article h2')).toHaveText('First replacement thread');
+  });
+}

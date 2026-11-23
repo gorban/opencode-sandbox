@@ -3,14 +3,26 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // The pinned adapter emits this fixed shell. Requalify if its structure changes.
-const shell = /^<!doctype html>\s*<html lang="en">\s*<head>\s*<meta charset="utf-8">\s*<meta name="viewport" content="width=device-width, initial-scale=1">\s*(?:<link href="\/_app\/immutable\/[A-Za-z0-9_./-]+(?:\.js" rel="modulepreload"|\.css" rel="stylesheet")>\s*)*<\/head>\s*<body>\s*<div id="app">\s*<script>([\s\S]+)<\/script>\s*<\/div>\s*<\/body>\s*<\/html>\s*$/u;
+const headStart = /^<!doctype html>\s*<html lang="en">\s*<head>/u;
+const shellEnd = /<\/head>\s*<body>\s*<div id="app">\s*<script>(.+)<\/script>\s*<\/div>\s*<\/body>\s*<\/html>\s*$/su;
+const assetLink = /^<link href="\/_app\/immutable\/[A-Za-z0-9_./-]+(?:\.js" rel="modulepreload"|\.css" rel="stylesheet")>$/u;
+
+function validHead(head) {
+  const [charset, viewport, title, ...links] = head.trim().split(/(?<=>)\s*(?=<)/u);
+  return charset === '<meta charset="utf-8">' &&
+    viewport === '<meta name="viewport" content="width=device-width, initial-scale=1">' &&
+    title === '<title>Workspace dashboard</title>' &&
+    links.every((link) => assetLink.test(link));
+}
 
 export function manifest(bytes) {
   const html = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   if (/[\r\0]/.test(html)) throw new Error('Unsupported fallback line endings or NUL');
-  const match = shell.exec(html);
-  const body = match?.[1];
-  if (!body || /<\/?script\b|<!--/i.test(body)) throw new Error('Unsupported fallback shell');
+  const head = headStart.exec(html);
+  const end = shellEnd.exec(html);
+  if (!head || !end || !validHead(html.slice(head[0].length, end.index)) ||
+      /<\/?script\b|<!--/i.test(end[1])) throw new Error('Unsupported fallback shell');
+  const body = end[1];
 
   // Strict UTF-8 and LF-only input make its decoded span round-trip byte-for-byte.
   const start = Buffer.byteLength(html.slice(0, html.indexOf('<script>') + '<script>'.length));

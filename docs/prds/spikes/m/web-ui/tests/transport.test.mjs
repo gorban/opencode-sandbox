@@ -61,3 +61,39 @@ test('browser transport scopes and bounds every auth and workspace request', asy
   });
   await assert.rejects(transport.session(signal));
 });
+
+test('early response rejection cancels open bodies without waiting for cancellation', async (t) => {
+  let response;
+  let cancellations = 0;
+  t.mock.method(globalThis, 'fetch', async () => response);
+  const transport = browserTransport();
+  const { signal } = new AbortController();
+  const openBody = () => new ReadableStream({
+    cancel() {
+      ++cancellations;
+      return new Promise(() => {});
+    }
+  });
+  const verify = async (operation, errorType) => {
+    const before = cancellations;
+    let timeout;
+    try {
+      await assert.rejects(Promise.race([
+        operation(),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Cancellation stalled')), 500); })
+      ]), errorType);
+      assert.equal(cancellations, before + 1);
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+
+  response = new Response(openBody(), { headers: { 'Content-Type': 'text/plain' } });
+  await verify(() => transport.load(signal), /Invalid workspace response/);
+  response = new Response(openBody(), { status: 403 });
+  await verify(() => transport.session(signal), Denied);
+  response = new Response(openBody(), { status: 401 });
+  await verify(() => transport.exchange('synthetic'), InvalidCode);
+  response = new Response(openBody(), { status: 200 });
+  await verify(() => transport.logout(session().csrf_token), /Request did not complete/);
+});

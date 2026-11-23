@@ -53,7 +53,7 @@ function label(value: unknown): string {
 
 function body(value: unknown): string {
   return display(value, (text) => encoder.encode(text).length <= 256)
-    .replace(/\r\n/g, '\n')
+    .replaceAll('\r\n', '\n')
     .replace(unsafeDisplay, '\uFFFD');
 }
 
@@ -119,10 +119,18 @@ export function decodeSnapshot(value: unknown): Snapshot {
   return { ...sessionIdentity(source), version: VERSION, projects };
 }
 
+export function cancelResponseBody(response: Response): void {
+  const body = response.body;
+  if (body && !body.locked && !response.bodyUsed) void body.cancel().catch(() => {});
+}
+
 export async function boundedJson(response: Response, maximum: number): Promise<unknown> {
   const mediaType = response.headers.get('content-type') ?? '';
   if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(mediaType) ||
-      !response.body) return malformed();
+      !response.body) {
+    cancelResponseBody(response);
+    return malformed();
+  }
   const reader = response.body.getReader();
   const bytes = new Uint8Array(maximum);
   let size = 0;

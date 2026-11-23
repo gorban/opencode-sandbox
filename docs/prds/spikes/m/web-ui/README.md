@@ -40,3 +40,10 @@ and report the browser version, requested throttling, transferred bytes and requ
 count. In the Lighthouse user timings, read `first-populated-sandbox-list` as the
 navigation-to-list measurement. Keep the report and the scratch profile outside the
 repository and shut down the host and browser after qualification.
+
+One local run used Lighthouse 13.6.0 and Chrome for Testing 159.0.8154.6 with
+an authenticated synthetic loopback fixture, storage reset disabled, and DevTools
+mobile throttling (150 ms RTT, 1,638 kbps configured throughput, 4× CPU slowdown).
+The first populated sandbox list appeared at 4.27 seconds. Lighthouse recorded 17
+requests, 126,402 transferred bytes, a performance score of 0.79, and an accessibility
+score of 1.00. This was a single fixture run.
