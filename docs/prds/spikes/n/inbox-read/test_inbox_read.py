@@ -65,6 +65,7 @@ from oc_inbox_contract import (  # noqa: E402
     MIN_RESPONSE_BYTES,
     OP_INBOX_LIST,
     PIN_VERIFICATION_SCOPE_ITEM_ONLY,
+    REDACTED_MARKER,
     SOURCE_HOST_WORKFLOW_ENGINE,
     SOURCE_ORCHESTRATOR_ADVISORY,
     STATUS_EXPIRED,
@@ -175,7 +176,9 @@ _CANARY_INC_ID = "".join(("ocpeer_", "syntheticInc", "Secret1"))
 _SQL_INSERT_ART = "INSERT INTO review_artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
 _SQL_INSERT_RUN = "INSERT INTO workflow_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
 _ERR_ITEM_NOT_FOUND = "review_item_not_found"
+_ERR_UNSUPPORTED_STATUS = "unsupported_inbox_status_filter"
 _SQL_BUMP_SEQ = "UPDATE inbox_seq_counter SET last_seq = last_seq + 1 WHERE id = 1"
+_SQL_CLEAR_SEQ = "DELETE FROM inbox_seq_counter"
 _REV_REMOTE = "rev-remote"
 _REV_BADPIN = "rev-badpin"
 _REV_BADPOL = "rev-badpol"
@@ -660,7 +663,7 @@ class TestFilesystemAndSchemaAdmission(InboxReadTestBase):
         # Missing integer id=1 row in inbox_seq_counter fails closed
         nc_dir = _make_private_dir(self.root, "no_counter_state")
         nc_db = _init_inbox_db(nc_dir)
-        _exec_write(nc_db, "DELETE FROM inbox_seq_counter")
+        _exec_write(nc_db, _SQL_CLEAR_SEQ)
         nc_svc = ReadOnlyInboxService(nc_dir, sandbox_root=self.sandbox_root)
         with self.assertRaises(CoordPolicyError) as ctx_nc:
             nc_svc.get_inbox_summary(_OP)
@@ -1421,6 +1424,13 @@ class _NoEncodeStr(str):
         raise AssertionError("encode_must_not_be_called")
 
 
+class _NoHashStr(str):
+    """Test string failing immediately if __hash__() is invoked."""
+
+    def __hash__(self) -> int:
+        raise AssertionError("hash_must_not_be_called")
+
+
 class TestExternalReviewRegressions(InboxReadTestBase):
     """Adversarial regressions verified red on c48ee250 and green on patched code."""
 
@@ -1703,8 +1713,127 @@ class TestExternalReviewRegressions(InboxReadTestBase):
         bad_sec = "".join(("sk-ant-", "badStat", "123456"))
         with self.assertRaises(CoordValidationError) as ctx_bad:
             self.svc.list_inbox_items(_OP, statuses=[bad_sec])
-        self.assertEqual(str(ctx_bad.exception), "unsupported_inbox_status_filter")
+        self.assertEqual(str(ctx_bad.exception), _ERR_UNSUPPORTED_STATUS)
         self.assertNotIn(bad_sec, str(ctx_bad.exception))
+
+    def test_truncated_backslash_quoted_secret_and_raw_cookie_with_brace(self) -> None:
+        w1 = "".join(("Multi", "Word", "One"))
+        w2 = "".join(("Multi", "Word", "Two"))
+        w3 = "".join(("Short", "Slash", "One"))
+        w4 = "".join(("Short", "Slash", "Two"))
+        c_tail = "".join(("COOKIE_", "BRACE_", "TAIL99"))
+        c_json = "".join(("JSON_", "COOKIE_", "SEC88"))
+        x_tail = "".join(("XAPI_", "BRACE_", "TAIL77"))
+        rev_trunc = "rev-bs-trunc"
+        rev_raw = "rev-bs-raw"
+        pwd_prefix = "".join(("pass", 'word="'))
+
+        tail_quote = f" {pwd_prefix}{w1} {w2}\\"
+        pad_len = MAX_ITEM_TEXT_BYTES - len(tail_quote)
+        _insert_item(
+            self.db_path,
+            {
+                _COL_REVIEW_ID: rev_trunc,
+                _COL_SUMMARY_TEXT: ("p" * pad_len) + tail_quote + "extra_cut",
+            },
+            artifact_id="art-bs-trunc",
+        )
+        _insert_item(
+            self.db_path,
+            {
+                _COL_REVIEW_ID: rev_raw,
+                _COL_SUMMARY_TEXT: "\n".join(
+                    (
+                        f"Cookie: sid=abc}}{c_tail}",
+                        f'Cookie: prefs={{"k":"v"}}; sid={c_json}',
+                        f"X-Api-Key: k}}{x_tail}",
+                        f"{pwd_prefix}{w3} {w4}\\",
+                    )
+                ),
+            },
+            artifact_id="art-bs-raw",
+        )
+        page = self.svc.list_inbox_items(_OP)
+        serialized = serialize_inbox_json(page)
+        for secret in (w1, w2, w3, w4, c_tail, c_json, x_tail):
+            self.assertNotIn(secret, serialized)
+        by_id = {it.review_id: it for it in page.items}
+        self.assertEqual(by_id[rev_trunc].summary_text, REDACTED_MARKER)
+        self.assertTrue(by_id[rev_trunc].redaction_applied)
+        self.assertTrue(by_id[rev_raw].redaction_applied)
+
+    def test_mid_fs_admission_revocation_precedes_missing_db_and_bad_sidecar(self) -> None:
+        calls = 0
+
+        def _retire_after_precheck(_c: PrincipalCtx, _sid: str, _gen: int) -> bool:
+            nonlocal calls
+            calls += 1
+            return calls % 2 == 1
+
+        empty_dir = _make_private_dir(self.root, "empty_rev_state")
+        miss_svc = ReadOnlyInboxService(
+            empty_dir,
+            sandbox_root=self.sandbox_root,
+            session_validator=_retire_after_precheck,
+        )
+        with self.assertRaises(RevokedError):
+            miss_svc.list_inbox_items(_OP, read_session_id=_SESS_ID, session_generation=1)
+
+        bad_dir = _make_private_dir(self.root, "sidecar_rev_state")
+        bad_db = _init_inbox_db(bad_dir)
+        wal_path = Path(f"{bad_db}-wal")
+        wal_path.write_bytes(b"")
+        os.chmod(wal_path, 0o600 | 0o044)
+        bad_svc = ReadOnlyInboxService(
+            bad_dir,
+            sandbox_root=self.sandbox_root,
+            session_validator=_retire_after_precheck,
+        )
+        with self.assertRaises(RevokedError):
+            bad_svc.get_inbox_summary(_OP, read_session_id=_SESS_ID, session_generation=1)
+
+    def test_oversized_schema_ddl_columns_and_objects_rejected_before_seq_read(self) -> None:
+        import oc_inbox_db  # noqa: PLC0415
+
+        self.assertIn("sql_is_null", oc_inbox_db._SQL_LIST_INDEXES)
+        self.assertNotIn(", sql ", oc_inbox_db._SQL_LIST_INDEXES)
+
+        big_def_dir = _make_private_dir(self.root, "big_ddl_state")
+        huge_default = "D" * (200 * 1024)
+        big_schema = _SCHEMA_SQL.replace(
+            "title                 TEXT NOT NULL,",
+            f"title                 TEXT NOT NULL DEFAULT '{huge_default}',",
+        )
+        big_db = _init_inbox_db(big_def_dir, schema_sql=big_schema)
+        _exec_write(big_db, _SQL_CLEAR_SEQ)
+        big_svc = ReadOnlyInboxService(big_def_dir, sandbox_root=self.sandbox_root)
+        with self.assertRaises(CoordPolicyError) as ctx_ddl:
+            big_svc.list_inbox_items(_OP)
+        self.assertEqual(str(ctx_ddl.exception), ERR_INBOX_UNREADABLE)
+
+        col_dir = _make_private_dir(self.root, "many_col_state")
+        col_db = _init_inbox_db(col_dir)
+        for idx in range(70):
+            _exec_write(col_db, f"ALTER TABLE review_items ADD COLUMN extra_c{idx} INTEGER")
+        col_svc = ReadOnlyInboxService(col_dir, sandbox_root=self.sandbox_root)
+        with self.assertRaises(CoordPolicyError) as ctx_col:
+            col_svc.list_inbox_items(_OP)
+        self.assertEqual(str(ctx_col.exception), ERR_INBOX_UNREADABLE)
+
+        obj_dir = _make_private_dir(self.root, "many_obj_state")
+        obj_db = _init_inbox_db(obj_dir)
+        for idx in range(35):
+            _exec_write(obj_db, f"CREATE TABLE extra_t{idx} (id INTEGER PRIMARY KEY)")
+        obj_svc = ReadOnlyInboxService(obj_dir, sandbox_root=self.sandbox_root)
+        with self.assertRaises(CoordPolicyError) as ctx_obj:
+            obj_svc.list_inbox_items(_OP)
+        self.assertEqual(str(ctx_obj.exception), ERR_INBOX_UNREADABLE)
+
+    def test_oversized_status_filter_short_circuits_before_hash(self) -> None:
+        oversize_status = _NoHashStr("x" * 1000)
+        with self.assertRaises(CoordValidationError) as ctx:
+            self.svc.list_inbox_items(_OP, statuses=[oversize_status])
+        self.assertEqual(str(ctx.exception), _ERR_UNSUPPORTED_STATUS)
 
 
 if __name__ == "__main__":

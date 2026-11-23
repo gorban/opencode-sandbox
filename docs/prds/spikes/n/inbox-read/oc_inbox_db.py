@@ -82,6 +82,12 @@ _CLOSED_STATUS_SQL = ", ".join(f"'{s}'" for s in sorted(VALID_STATUSES))
 _CLOSED_SEVERITY_SQL = ", ".join(f"'{s}'" for s in sorted(VALID_SEVERITIES))
 _CLOSED_SOURCE_SQL = ", ".join(f"'{s}'" for s in sorted(VALID_SOURCE_KINDS))
 
+MAX_SCHEMA_OBJECTS = 32
+MAX_SCHEMA_COLUMNS = 64
+MAX_INDEX_COLS = 16
+MAX_SCHEMA_NAME_BYTES = 128
+MAX_SCHEMA_SQL_BYTES = 16 * 1024
+
 _TBL_SEQ = "inbox_seq_counter"
 _TBL_ITEMS = "review_items"
 _TBL_RUNS = "workflow_runs"
@@ -97,10 +103,17 @@ _SQL_SCHEMA_SAFETY_PRECHECK = (
     "SELECT 1 FROM main.sqlite_schema "
     "WHERE type IN ('trigger', 'view') "
     "OR (type = 'table' AND (typeof(rootpage) != 'integer' OR rootpage <= 0)) "
+    f"OR (name IS NOT NULL AND LENGTH(CAST(name AS BLOB)) > {MAX_SCHEMA_NAME_BYTES}) "
+    f"OR (tbl_name IS NOT NULL AND LENGTH(CAST(tbl_name AS BLOB)) > {MAX_SCHEMA_NAME_BYTES}) "
+    f"OR (sql IS NOT NULL AND LENGTH(CAST(sql AS BLOB)) > {MAX_SCHEMA_SQL_BYTES}) "
     "LIMIT 1"
 )
+_SQL_SCHEMA_OBJECT_COUNT = (
+    f"SELECT COUNT(*) AS cnt FROM (SELECT 1 FROM main.sqlite_schema LIMIT {MAX_SCHEMA_OBJECTS + 1})"
+)
 _SQL_LIST_INDEXES = (
-    "SELECT name, tbl_name, sql FROM main.sqlite_schema WHERE type = 'index'"
+    "SELECT name, tbl_name, (sql IS NULL) AS sql_is_null "
+    f"FROM main.sqlite_schema WHERE type = 'index' LIMIT {MAX_SCHEMA_OBJECTS + 1}"
 )
 _PRAGMA_TABLE_LIST_CHECKS: tuple[tuple[str, str], ...] = (
     (_TBL_SEQ, "PRAGMA main.table_list('inbox_seq_counter')"),
@@ -460,12 +473,23 @@ def verify_state_dir_and_db_readonly(
     return trusted_dir, db_path
 
 
+def _fetch_bounded_pragma_rows(
+    conn: sqlite3.Connection, sql: str, max_rows: int, deadline: float
+) -> list[dict[str, Any]]:
+    cur = execute_bounded(conn, sql, (), deadline)
+    rows = cur.fetchmany(max_rows + 1)
+    cur.close()
+    if len(rows) > max_rows:
+        raise CoordPolicyError(ERR_INBOX_UNREADABLE)
+    return rows
+
+
 def _index_columns_strict(
     conn: sqlite3.Connection, idx_name: str, deadline: float
 ) -> tuple[str, ...] | None:
-    rows = execute_bounded(
-        conn, f"PRAGMA main.index_info('{idx_name}')", (), deadline
-    ).fetchall()
+    rows = _fetch_bounded_pragma_rows(
+        conn, f"PRAGMA main.index_info('{idx_name}')", MAX_INDEX_COLS, deadline
+    )
     if not rows:
         return None
     cols: list[tuple[int, str]] = []
@@ -511,7 +535,9 @@ def _verify_table_pk_and_unique(
     allowed_pks: tuple[tuple[str, ...], ...],
     deadline: float,
 ) -> dict[str, dict[str, Any]]:
-    info_rows = execute_bounded(conn, info_sql, (), deadline).fetchall()
+    info_rows = _fetch_bounded_pragma_rows(
+        conn, info_sql, MAX_SCHEMA_COLUMNS, deadline
+    )
     pk_entries = sorted(
         (
             (cast(int, col["pk"]), str(col["name"]), str(col.get("type", "")))
@@ -526,9 +552,9 @@ def _verify_table_pk_and_unique(
     if pk_cols not in allowed_pks:
         raise CoordPolicyError(ERR_INBOX_UNREADABLE)
 
-    idx_rows = execute_bounded(
-        conn, _PRAGMA_INDEX_LIST_SQL[table_name], (), deadline
-    ).fetchall()
+    idx_rows = _fetch_bounded_pragma_rows(
+        conn, _PRAGMA_INDEX_LIST_SQL[table_name], MAX_SCHEMA_OBJECTS, deadline
+    )
     idx_by_name = {
         str(row["name"]): row for row in idx_rows if isinstance(row.get("name"), str)
     }
@@ -546,15 +572,17 @@ def _verify_indexes_allowlisted(
     table_indexes: dict[str, dict[str, dict[str, Any]]],
     deadline: float,
 ) -> None:
-    schema_indexes = execute_bounded(conn, _SQL_LIST_INDEXES, (), deadline).fetchall()
+    schema_indexes = _fetch_bounded_pragma_rows(
+        conn, _SQL_LIST_INDEXES, MAX_SCHEMA_OBJECTS, deadline
+    )
     for row in schema_indexes:
         name = row.get("name")
         tbl_name = row.get("tbl_name")
-        sql = row.get("sql")
+        sql_is_null = bool(row.get("sql_is_null"))
         if not isinstance(name, str) or not isinstance(tbl_name, str):
             raise CoordPolicyError(ERR_INBOX_UNREADABLE)
         if (
-            sql is None
+            sql_is_null
             and tbl_name in _CORE_TABLES
             and _AUTOINDEX_NAME_RE.fullmatch(name) is not None
         ):
@@ -574,14 +602,23 @@ def _verify_indexes_allowlisted(
 def _verify_schema_and_anchor_snapshot(
     conn: sqlite3.Connection, deadline: float
 ) -> None:
-    """Anchor snapshot on main.sqlite_schema, verify tables/PKs/indexes, then read counter."""
+    """Anchor snapshot on main.sqlite_schema, verify bounded tables/PKs/indexes, then read counter."""
     unsafe_obj = execute_bounded(
         conn, _SQL_SCHEMA_SAFETY_PRECHECK, (), deadline
     ).fetchone()
     if unsafe_obj is not None:
         raise CoordPolicyError(ERR_INBOX_UNREADABLE)
+    obj_count_row = execute_bounded(
+        conn, _SQL_SCHEMA_OBJECT_COUNT, (), deadline
+    ).fetchone()
+    if (
+        obj_count_row is None
+        or type(obj_count_row.get("cnt")) is not int
+        or cast(int, obj_count_row["cnt"]) > MAX_SCHEMA_OBJECTS
+    ):
+        raise CoordPolicyError(ERR_INBOX_UNREADABLE)
     for table_name, pragma_sql in _PRAGMA_TABLE_LIST_CHECKS:
-        rows = execute_bounded(conn, pragma_sql, (), deadline).fetchall()
+        rows = _fetch_bounded_pragma_rows(conn, pragma_sql, 1, deadline)
         if (
             len(rows) != 1
             or rows[0].get("schema") != "main"

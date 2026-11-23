@@ -86,6 +86,7 @@ from oc_inbox_contract import (  # noqa: E402
     MIN_RESPONSE_BYTES,
     OP_INBOX_LIST,
     PIN_VERIFICATION_SCOPE_ITEM_ONLY,
+    REDACTED_MARKER,
     SOURCE_HOST_WORKFLOW_ENGINE,
     SQL_MAX_CELL_BYTES,
     STATUS_PENDING,
@@ -169,6 +170,7 @@ _COL_WORKFLOW_ID = "workflow_id"
 _COL_WORKFLOW_RUN_PRESENT = "workflow_run_present"
 _COL_JOINED_RUN_ID = "joined_run_id"
 _COL_CHECKPOINT_SEQ = "checkpoint_seq"
+_MAX_STATUS_LEN = max(len(status) for status in VALID_STATUSES)
 _T = TypeVar("_T")
 
 # Stage-1 linear-time stack FSM states for ECMA-48 / VT100 escape stripping.
@@ -239,7 +241,6 @@ class _AdmittedReadCtx:
     max_bytes: int
     deadline: float
     session_echo: ReadSessionEcho | None
-    db_path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,13 +260,10 @@ class _PinEvalInputs:
 
 
 def _withhold_truncated_tail(text: str, sql_truncated: bool) -> tuple[str, bool]:
-    """Drop the trailing incomplete non-whitespace token in O(tail_len) time."""
-    if not sql_truncated or not text or text[-1].isspace():
+    """Fail closed when SQL cut the cell: withhold the entire truncated field."""
+    if not sql_truncated:
         return text, False
-    idx = len(text)
-    while idx > 0 and not text[idx - 1].isspace():
-        idx -= 1
-    return text[:idx], True
+    return REDACTED_MARKER, True
 
 
 def _is_ignored_escape_pad(code: int) -> bool:
@@ -705,7 +703,11 @@ def _validate_status_filter(
     for idx, item in enumerate(statuses):
         if idx >= MAX_STATUS_FILTER_ITEMS:
             raise CoordValidationError("status_filter_too_many_entries")
-        if not isinstance(item, str) or item not in VALID_STATUSES:
+        if (
+            not isinstance(item, str)
+            or len(item) > _MAX_STATUS_LEN
+            or item not in VALID_STATUSES
+        ):
             raise CoordValidationError("unsupported_inbox_status_filter")
         cleaned.add(item)
     if not cleaned:
@@ -1590,15 +1592,11 @@ class ReadOnlyInboxService:
         _enforce_authority_fences(
             op, session_echo, self._session_validator, self._live_authority_checker
         )
-        _trusted_dir, db_path = verify_state_dir_and_db_readonly(
-            self._state_dir, self._sandbox_root
-        )
         return _AdmittedReadCtx(
             caller=op,
             max_bytes=max_bytes,
             deadline=time.monotonic() + (read_ms / 1000.0),
             session_echo=session_echo,
-            db_path=db_path,
         )
 
     def _run_fenced_snapshot(
@@ -1606,12 +1604,15 @@ class ReadOnlyInboxService:
         ctx: _AdmittedReadCtx,
         body: Callable[[sqlite3.Connection, int], _T],
     ) -> _T:
-        """Execute snapshot read, close DB, recheck authority, then release result or error."""
+        """Run FS admission + snapshot read, close DB, recheck authority, then release."""
         result: _T | None = None
         deferred_exc: Exception | None = None
         try:
+            _trusted_dir, db_path = verify_state_dir_and_db_readonly(
+                self._state_dir, self._sandbox_root
+            )
             with open_readonly_inbox_snapshot(
-                ctx.db_path, deadline=ctx.deadline
+                db_path, deadline=ctx.deadline
             ) as conn:
                 snapshot_seq = read_inbox_seq_counter(conn, ctx.deadline)
                 result = body(conn, snapshot_seq)
