@@ -8,7 +8,7 @@ production directories:
 from __future__ import annotations
 
 import base64
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import hashlib
 import itertools
 import json
@@ -1859,7 +1859,6 @@ class TestExternalReviewRegressions(InboxReadTestBase):
 
     def test_file_checker_oserror_fstat_and_close_translated_and_fenced(self) -> None:
         import errno  # noqa: PLC0415
-        from unittest import mock  # noqa: PLC0415
 
         real_close = os.close
         hook_hits = 0
@@ -1875,6 +1874,16 @@ class TestExternalReviewRegressions(InboxReadTestBase):
             real_close(fd)
             raise OSError(errno.EIO, "close_io_error")
 
+        def _make_retirer(
+            results: list[bool],
+        ) -> Callable[[PrincipalCtx, str, int], bool]:
+            def _retire_mid_call(_c: PrincipalCtx, _sid: str, _gen: int) -> bool:
+                admitted = not results
+                results.append(admitted)
+                return admitted
+
+            return _retire_mid_call
+
         for patch_target, side_effect in (
             ("os.fstat", _fstat_boom),
             ("os.close", _close_boom),
@@ -1889,16 +1898,10 @@ class TestExternalReviewRegressions(InboxReadTestBase):
             self.assertEqual(str(ctx_active.exception), ERR_INBOX_UNREADABLE)
 
             validator_results: list[bool] = []
-
-            def _retire_mid_call(_c: PrincipalCtx, _sid: str, _gen: int) -> bool:
-                admitted = len(validator_results) == 0
-                validator_results.append(admitted)
-                return admitted
-
             fenced_svc = ReadOnlyInboxService(
                 self.state_dir,
                 sandbox_root=self.sandbox_root,
-                session_validator=_retire_mid_call,
+                session_validator=_make_retirer(validator_results),
             )
             hook_hits = 0
             with (
