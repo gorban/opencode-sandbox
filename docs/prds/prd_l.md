@@ -611,6 +611,19 @@ function operator_reconcile_uncertain_proposal(proposal_id):
         return settled
 ```
 
+## Local compiled-profile proof
+
+- [ ] Compile one checked-in local profile with the PRD L compiler and lower its selected
+      services into a disposable Podman job using the [local PRD M proof](spikes/m/local/README.md).
+      Verify that the worker reaches Postgres and managed Chromium over pod-local endpoints,
+      that an omitted service stays absent, and that no ports are published. Use pinned local
+      images, synthetic credentials and an isolated scratch workspace. Verify cleanup on
+      completion and startup failure.
+
+The Codex lane owns `docs/prds/spikes/l_m_profile/` and the walkthrough for this slice.
+The compiler, hub, provider and runtime contracts remain shared. Review any required shared
+change with its owner before implementation. Production profile launch remains separately gated.
+
 ## PoC Scope (Spike Branch `spike-outside-in-poc`)
 
 Per [AGENTS.md](../../AGENTS.md#branches), the spike PoC lives strictly under

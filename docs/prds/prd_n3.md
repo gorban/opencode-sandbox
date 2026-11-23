@@ -116,12 +116,12 @@ Workspace Header (Trusted Host Chrome)
 Instead of loading untrusted HTML/JS or per-card MCP App `ui://` iframes inside the operator chrome
 (null-origin iframes stay strictly reserved for PTY and Browser Canvas per [prd_m3](prd_m3.md)),
 `oc-ui@1` uses a constrained **A2UI-style declarative JSON projection** mapped onto a fixed
-host-owned React component catalog:
+host-owned Svelte component catalog:
 
 - **SQLite table (`dashboard_surfaces`):**
   `(workflow_run_id, surface_id, owner_kind, title, priority, spec_json, state_json, updated_at)`
   where `owner_kind IN ('workflow_default', 'orchestrator_overlay')` and `state_json <= 32 KiB`.
-- **Closed React component allowlist:**
+- **Closed Svelte component allowlist:**
   `status_card | metric_kpi | kv_table | lane_health_matrix | timeline_log | checklist_progress | sparkline_series | action_chips`
 - **Strict `action_chips` split (prevents overlay clickjacking):**
   - On `owner_kind = "orchestrator_overlay"` surfaces: **strictly read-only navigation chips**
@@ -177,9 +177,9 @@ host-owned `0o700`/`0o600` source, 0 base tokens until invoked). The skill teach
 - [ ] Expose `workflow_*`, `metrics_*`, `fleet_bearings_snapshot`, `inbox_*`, `dashboard_*`, and
       `calibration_*` MCP tools on `-o`'s private UDS RPC server (`oc_coord_rpc.py` /
       `oc_config_mcp.py`).
-- [ ] Build Trusted Host Chrome UI views in Tauri v2 / loopback Web UI ([prd_m3](prd_m3.md)):
+- [ ] Build Trusted Host Chrome views for [M3a loopback](prd_m3a.md), then [M3b Tauri](prd_m3b.md):
       `Tier B Human Inbox` drawer (strictly separate from `Tier A Approval Inbox`), `Tier C Health
-      Ribbon`, `Workflows` panel, and closed `oc-ui@1` React component catalog with provenance pills.
+      Ribbon`, `Workflows` panel, and closed `oc-ui@1` Svelte component catalog with provenance pills.
 - [ ] Author `builtin/prd-delivery-pipeline.toml` + `SKILL.md` demonstrating parallel implementor /
       adversarial-reviewer lanes with non-blocking PRD human-review gates.
 - [ ] **(decision needed)** Should `-o` be allowed to register `[Orchestrator Overlay]` dashboard

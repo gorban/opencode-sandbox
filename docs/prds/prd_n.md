@@ -55,7 +55,7 @@ prerequisites in [prd_i](prd_i.md), [prd_l](prd_l.md), and [prd_m](prd_m.md).)*
 4. **Declarative dashboard surfaces (`oc-ui@1`) and workflow skills** ([prd_n3](prd_n3.md)):
    workflows ship baked-in `[Deterministic Workflow]` health cards (zero LLM tokens, immutable by
    `-o`) plus a compiled `:ro` `orchestrator_skill` (`SKILL.md`) teaching `-o` how to maintain
-   bounded `[Orchestrator Overlay]` panels over a fixed host React component catalog—zero untrusted
+   bounded `[Orchestrator Overlay]` panels over a fixed host Svelte component catalog—zero untrusted
    JS/HTML inside Trusted Host Chrome.
 
 ```mermaid
@@ -119,7 +119,7 @@ invariants ([AGENTS.md](../../AGENTS.md), [prd_i1](prd_i1.md), [prd_l](prd_l.md)
 
 | Rank | Option Set | Core Architecture | Key Strengths | Key Weaknesses / Limits | Security Fit | Est. Effort |
 |---|---|---|---|---|---|---|
-| **#1 (Selected Direction)** | **Native `workflow@1` Statechart + Orthogonal 4-Tier Supervisor + Clean-Room `firstmate` Patterns** | Named declarative `workflow@1` TOML compiled to immutable `workflow_plan_digest`; SQLite event-sourced statechart + durable awakeables in `oc_daemon`; orthogonal supervisory reconciler (`Tier-0` deterministic host telemetry -> zero-authority `Tier-1` `/decisions/*` -> coalesced throttler -> blind `Tier-2` real-model health check -> `Tier-B` Human Inbox); declarative `oc-ui@1` surfaces over fixed host React catalog; clean-room port of `kunchenguid/firstmate` patterns. | Single ACID DB with `oc_hub`/`oc_controller` (`<1s` cascade revoke); zero untrusted host code or UI JS; zero-authority System-1 defeats classifier injection; full `TP/FP/TN/FN` calibration loop; identical local & `REMOTE / NAME` SSH operation; zero upstream rebase debt. | Closed predicate/action DSL means complex custom workflows delegate reasoning to `-o` via `workflow_signal` or host-only `factory_id`; expands `oc_daemon` responsibilities (mitigated by non-blocking I/O & never holding `routing_fence` across network calls). | **Best** (100% aligned with `prd_i1`, `prd_l1`, `prd_m1`–`m3`) | **~3–4 weeks** (phased on PRD M) |
+| **#1 (Selected Direction)** | **Native `workflow@1` Statechart + Orthogonal 4-Tier Supervisor + Clean-Room `firstmate` Patterns** | Named declarative `workflow@1` TOML compiled to immutable `workflow_plan_digest`; SQLite event-sourced statechart + durable awakeables in `oc_daemon`; orthogonal supervisory reconciler (`Tier-0` deterministic host telemetry -> zero-authority `Tier-1` `/decisions/*` -> coalesced throttler -> blind `Tier-2` real-model health check -> `Tier-B` Human Inbox); declarative `oc-ui@1` surfaces over fixed host Svelte catalog; clean-room port of `kunchenguid/firstmate` patterns. | Single ACID DB with `oc_hub`/`oc_controller` (`<1s` cascade revoke); zero untrusted host code or UI JS; zero-authority System-1 defeats classifier injection; full `TP/FP/TN/FN` calibration loop; identical local & `REMOTE / NAME` SSH operation; zero upstream rebase debt. | Closed predicate/action DSL means complex custom workflows delegate reasoning to `-o` via `workflow_signal` or host-only `factory_id`; expands `oc_daemon` responsibilities (mitigated by non-blocking I/O & never holding `routing_fence` across network calls). | **Best** (100% aligned with `prd_i1`, `prd_l1`, `prd_m1`–`m3`) | **~3–4 weeks** (phased on PRD M) |
 | **#2** | **Embedded Durable Engine (DBOS-SQLite / Restate) + Native UI/Inbox** | Imperative Python/TS workflow functions with durable `@step` / `awakeable` primitives bridged to `oc_hub` and `oc_controller`. | Full general-purpose programming expressiveness; mature durable timer/retry primitives. | Imperative configs risk arbitrary host code execution; Restate introduces dual-store split-brain with `$STATE/registry.sqlite`; mid-run code edits hit replay-determinism hazards on 12h+ workflows; awkward for continuous fleet health supervision. | **Medium–Weak** | **~3.5–4.5 weeks** |
 | **#3 (Rejected)** | **Sandboxed `firstmate` Sidecar Inside Root Orchestrator `-o`** | Run stripped `kunchenguid/firstmate` inside `-o` driving `oc_hub` via an MCP backend shim, while `oc_daemon` owns UI, Inbox, metrics, and Decisions API. | Keeps `firstmate` off host UID; reuses its `AGENTS.md` prompt playbook. | Violates `prd_i1` shell-less OS confinement of `-o` (forces enabling Bash + writable state inside `-o`, widening prompt-injection blast radius); ~80% of `firstmate` becomes dead weight; dual-state sync bugs. | **Weak** (breaks `-o` confinement) | **~3.5–5 weeks** |
 | **#4 (Rejected)** | **`firstmate` as Outer Control Plane + `bin/backends/oc-sandbox.sh` Plugin** | Keep `kunchenguid/firstmate` (~150 host-UID Bash scripts, MIT) as outer control plane calling `oc-sandbox` via a new session backend. | Fast CLI prototype if zero-trust boundaries did not exist. | **Inverted trust model:** walks untrusted worktrees on host (`crew_worktree_written_since`, violating `AGENTS.md`), trusts worker-writable `status.log`, clashes with `prd_i2a` remote SSH workers (`secondmate`), bypasses `oc_controller` `plan_digest`/`SubtreeBudget`/`QuotaLedger`, still lacks `workflow@1`/metrics/Decisions/Tauri UI, high rebase tax. | **Broken** | **~5–7 weeks** + rebase tax |
@@ -216,7 +216,7 @@ desktop surfaces explicitly depend on completing the open upstream slices:
 - Joint local OpenCode transport + `oc_hub` restart qualification ([prd_m](prd_m.md#first-poc-split))
 - Live provider routes & full `5h`/`7d` `QuotaLedger` telemetry ([prd_m1](prd_m1.md), [prd_i4](prd_i4.md))
 - SSH remote worker onboarding (`REMOTE / NAME`, [prd_i2](prd_i2.md))
-- Unified Tauri v2 / loopback Web Trusted Host Chrome ([prd_m3](prd_m3.md))
+- Trusted Host Chrome ([M3a loopback first](prd_m3a.md), [M3b Tauri desktop](prd_m3b.md))
 
 - [*] **N0 — PRD N Gate 1 design & security review** (`prd_n.md`, `prd_n1.md`, `prd_n2.md`,
       `prd_n3.md`): resolve `(decision needed)` items with the user, clear Gate 1 external security
@@ -237,7 +237,7 @@ desktop surfaces explicitly depend on completing the open upstream slices:
 - [ ] **N3 — Three-tier Human Inbox, declarative `oc-ui@1` Trusted Chrome surfaces & `-o` MCP
       tools** ([prd_n3](prd_n3.md)): `human_inbox_items` (`note`/`reply`/`receipts`/`ready`/
       `status`/`ask`/`hold`/`snooze`/auto-resolve + TOCTOU pinning), `dashboard_surfaces` closed
-      React component catalog (`[Deterministic Workflow]` vs. `[Orchestrator Overlay]`), `-o` MCP
+      Svelte component catalog (`[Deterministic Workflow]` vs. `[Orchestrator Overlay]`), `-o` MCP
       surface (`workflow_*`, `metrics_*`, `fleet_bearings_snapshot`, `inbox_*`, `dashboard_*`,
       `calibration_*`), `builtin/prd-delivery-pipeline`, and end-to-end adversarial suite.
       *(Est. 5–7 days.)*

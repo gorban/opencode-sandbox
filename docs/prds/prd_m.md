@@ -25,7 +25,7 @@ a cohesive, zero-trust multi-model control plane covering three tightly linked a
    parallel Codex implementors each paired with an adversarial Claude reviewer), and host-enrolled
    external top-level peer streams, all addressed unambiguously as `"NAME"` (local),
    `"REMOTE / NAME"` (remote), or `"@PEER"` (external harness).
-3. **Unified native + web control plane (Tauri v2 + hardened loopback web UI)**
+3. **Shared SvelteKit control plane (hardened loopback web first, then Tauri v2)**
    ([prd_m3](prd_m3.md)) replacing per-sandbox Chrome windows and terminals with a single
    `Project -> Sandbox -> Thread` workspace where both the human operator and the root orchestrator
    message the same targets, alongside confined embedded terminal emulation (`opencode-tui` and
@@ -84,7 +84,7 @@ zero-trust invariants (`prd_i`, `prd_i3`, `prd_i4`, `prd_l`, `prd_l1`):
 
 | Rank | Lens / Approach | Core Strengths | Key Weaknesses / Limits | Role in Selected Synthesis |
 |---|---|---|---|---|
-| **#1 (Selected Combination)** | **First-Principles Protocol & Threat Model** anchored on **Existing `oc-sandbox` Stack**, **Mirroring T3Code Patterns** | Preserves every `prd_i`/`prd_l1` boundary (zero secrets in sandboxes, host-owned `oc_controller` approvals, no host `git` or host writes in `~/opencode-sandbox`); clean 3-subplane model/reasoning/quota split with provider-tool egress allowlisting and atomic budget reservations; bijective RFC-1123 addressing (`"NAME"`, `"REMOTE / NAME"`, `"@PEER"`); unforgeable host write-ahead provenance; lightweight Tauri v2 + web UI. | Requires building our own React/Tauri frontend views and `oc_daemon` SQLite event/mailbox projection (~3.5–5 weeks across phased slices). | **Adopted baseline** across `prd_m1`, `prd_m2`, and `prd_m3`. |
+| **#1 (Selected Combination)** | **First-Principles Protocol & Threat Model** anchored on **Existing `oc-sandbox` Stack**, **Mirroring T3Code Patterns** | Preserves every `prd_i`/`prd_l1` boundary (zero secrets in sandboxes, host-owned `oc_controller` approvals, no host `git` or host writes in `~/opencode-sandbox`); clean 3-subplane model/reasoning/quota split with provider-tool egress allowlisting and atomic budget reservations; bijective RFC-1123 addressing (`"NAME"`, `"REMOTE / NAME"`, `"@PEER"`); unforgeable host write-ahead provenance; SvelteKit loopback UI followed by Tauri v2. | Requires building our own SvelteKit frontend views and Tauri packaging and `oc_daemon` SQLite event/mailbox projection (~3.5–5 weeks across phased slices). | **Adopted baseline** across `prd_m1`, `prd_m2`, and `prd_m3`. |
 | **#2** | **Pure Incremental Patch on Existing `oc-sandbox` + tmux CLI** | Fastest path to M1/M2 (~1.5–2 weeks); zero frontend toolchain. | Does not eliminate Chrome/terminal window sprawl or deliver unified desktop/web agent threads + embedded terminal emulation. | Incorporated directly into M1/M2 (`oc_broker_http`, `oc_plan`, `oc_config_mcp`, host-trusted `$STATE/worktrees` auto-discovery) while adding M3 UI/PTY cleanly on top. |
 | **#3 (Rejected for Direct Adoption)** | **Fork or Embed `pingdotgg/t3code` (MIT)** | Polished out-of-the-box React thread/diff UI, `packages/contracts`, SQLite Command/Event/Projection + Outbox, `CheckpointReactor`, mid-thread provider handoff. | **Inverted trust model:** Node + `node-pty` + Electron server runs directly on host UID/worktrees with local CLI credentials; retrofitting rootless Podman `pasta`, `safe_run` git isolation, `prd_l1` host-only brokers, SSH workers, and autonomous multi-sandbox lanes costs more (~5–8 weeks + rebase debt) than mirroring its best patterns cleanly. | **Mirror patterns only** (shared contracts, SQLite Command/Event/Projection + Outbox, mid-thread handoff, containerized `safe_run` turn checkpoints); do **not** fork/embed T3Code. |
 
@@ -145,6 +145,10 @@ first SSH onboarding, and maintainer acceptance. Those integrations, full quota 
 desktop and browser surfaces, and human review remain open. Review each lane's implementation
 walkthrough and final diff under the [implementation review gates](README.md#implementation-review-gates).
 
+The next local proofs are the [compiled profile](prd_l.md#local-compiled-profile-proof) and the
+read-only M3.1 thread projection. They can run in parallel using synthetic fixtures and the
+merged M command/event contract. M3a frontend implementation follows the projection.
+
 ## Scope and phased milestones
 
 - [ ] **M1 — Model selection, reasoning variants, and dual-window (`5h` + `7d`) quota telemetry**
@@ -166,9 +170,10 @@ walkthrough and final diff under the [implementation review gates](README.md#imp
 - [ ] **M3 — Unified Tauri v2 + hardened web control plane, confined PTY, and opt-in embedded
       browser views** ([prd_m3](prd_m3.md)): build `oc_daemon.py` (`$STATE/registry.sqlite`
       Command/Event/Projection + Outbox, auto-importing host-trusted `$STATE/worktrees/<NAME>` via
-      `O_NOFOLLOW`), React + Vite SPA served via Tauri v2 minimal Rust UDS bridge and hardened
-      loopback web mode (bootstrap-code exchange + `HttpOnly` cookie + CSRF + single-use WS
-      tickets), full-key write-ahead provenance receipts, Trusted Chrome Approval Inbox + 5h/7d
+      `O_NOFOLLOW`), a SvelteKit static SPA served first through hardened
+      [loopback web mode](prd_m3a.md) (bootstrap-code exchange + `HttpOnly` cookie + CSRF +
+      single-use WS tickets), followed by [Tauri v2](prd_m3b.md) with a minimal Rust UDS
+      bridge, full-key write-ahead provenance receipts, Trusted Chrome Approval Inbox + 5h/7d
       quota bar, zero-network null-origin `xterm.js` iframe behind an allowlist host VT/UTF-8
       scrubber + non-blocking PTY relay, opt-in per-sandbox `Browser` view + fleet PiP Browser Wall
       (backed by `builtin/chromium-managed`, [prd_d](prd_d.md)/[prd_e](prd_e.md) internal HTTPS,
@@ -176,13 +181,14 @@ walkthrough and final diff under the [implementation review gates](README.md#imp
       and Pattern 4 in `orchestrator_skills/oc-sandbox-authoring/SKILL.md`.
       *(Estimated: 10–15 days including M3 browser views & arbiter.)*
 
+## Control-plane decision
+
+- [x] Use SvelteKit with the static adapter and a client-rendered SPA. Qualify the
+      [loopback dashboard](prd_m3a.md) before packaging the shared frontend for
+      [Tauri v2](prd_m3b.md). Reuse the documented T3Code architectural patterns.
+
 ## Open decisions
 
-- [ ] (decision needed) **Control-plane UI strategy** — **Mirror T3Code architectural patterns on
-      `oc_daemon` + Tauri v2 + React/Vite (recommended)**: keeps BSD-2-Clause core, preserves
-      rootless Podman + zero-secret host boundaries, ~30–60 MB idle Tauri shell, 8–12 days for M3;
-      *vs.* **Fork/embed `pingdotgg/t3code`**: instant thread/diff UI, but Electron (~150–300 MB+
-      RAM), Node/`node-pty` host-UID trust inversion, and 5–8 weeks of retrofit + rebase debt.
 - [ ] (decision needed) **Embedded PTY renderer** — **Sandboxed-iframe `xterm.js` behind allowlist
       host VT/UTF-8 scrubber (recommended first)**: mature, OSC 52 off by default, standard GC, no
       `wasm-unsafe-eval` CSP relaxation on Linux WebKitGTK (included in M3); *vs.*
