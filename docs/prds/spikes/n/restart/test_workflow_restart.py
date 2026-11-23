@@ -4174,20 +4174,21 @@ class TestAdversarialRegressionsRound7(_RestartFixtureBase):
             self.assertIsNone(journal_rcpt.output_digest)
 
             # Reconciling COMPLETED using the standalone receipt MUST fail closed.
+            bad_reconcile_req = ReconcileStepRequest(
+                run_id=run_id,
+                step_id="se1",
+                expected_attempt_no=1,
+                expected_epoch=1,
+                reconciliation_key="rec_adopt_1",
+                resolution=ReconcileResolution.COMPLETED,
+                output_digest=_DIGEST_A,
+                evidence_digest=standalone_rcpt.receipt_digest,
+                reason="attempt_adopt_standalone_applied",
+                clock=self.clock.advance(),
+            )
             with self.assertRaises(ReconciliationEvidenceError):
                 sup.reconcile_step(
-                    ReconcileStepRequest(
-                        run_id=run_id,
-                        step_id="se1",
-                        expected_attempt_no=1,
-                        expected_epoch=1,
-                        reconciliation_key="rec_adopt_1",
-                        resolution=ReconcileResolution.COMPLETED,
-                        output_digest=_DIGEST_A,
-                        evidence_digest=standalone_rcpt.receipt_digest,
-                        reason="attempt_adopt_standalone_applied",
-                        clock=self.clock.advance(),
-                    ),
+                    bad_reconcile_req,
                     tracker_receipt=standalone_rcpt,
                 )
             # Standalone history remains intact for standalone queries.
