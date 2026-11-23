@@ -23,13 +23,14 @@ Inventory at `origin/main` (`9b608f431eedf7e55137c6dfe1abead9ffd2cba8`):
 Expanding test scope must **never** weaken the fork-PR security boundary established in
 [prd_k](prd_k.md). PRD O separates all checks into four explicit trust tiers:
 
-| Tier | Scope | Triggers | External Secrets | GHA Cache Policy ([prd_o3](prd_o3.md)) | Required to Merge PR? |
+| Tier | Scope | Triggers & Permissions | External API Secrets | GHA Cache Policy ([prd_o3](prd_o3.md)) | Required-Check / Promotion Status |
 |---|---|---|---|---|---|
-| **Tier 0A** | Core portable suites (15), `quality`, coverage, CodeQL, DepReview, SonarQube Cloud | `pull_request` (incl. forks) + `push` to `main` | **None** | Verified read-only restore on PR; seeded on `main` | **Yes** (`oc-sandbox / required`) |
-| **Tier 0B** | Offline Python spike suites (30 files) + Web UI (`check`, `build`, `node --test`, optional headless Playwright) | `pull_request` (incl. forks) + `push` to `main` | **None** | Verified read-only restore on PR; seeded on `main` | **Yes** (once qualified; separate job or under `required`) |
-| **Tier 1** | Real rootless Podman `tests/security.sh` (`246` checks), Containerfile build smoke, bounded Postgres sidecar smoke | `push` to `main`, nightly `schedule`, `workflow_dispatch` (optional PR opt-in after spike) | **None** | Optional bounded container-layer cache (verified digest-keyed, `main`-seeded) | Advisory initially; promote only after hosted stability proof |
-| **Tier 2** | Basic live LLM provider inference smoke (tiny deterministic wire-contract probe) | **`main`-only** nightly `schedule` + manual `workflow_dispatch` via protected Environment `ci-inference-smoke` | **Dedicated low-budget CI API keys ONLY** | **Strictly NONE** (no cache read or write) | **No** (never blocks PR merges on upstream provider outages) |
-| **Tier 3** | Full `tests/parallel.sh` (Chrome/SELinux/Wayland), local host subscription acceptance (`prd_i3`/`prd_i4`) | Local maintainer workstation (`AGENTS.md`) | Local host credentials only | N/A | Maintainer local gate |
+| **Tier 0A-gate** (`oc-sandbox PR`) | Core portable suites (15) + `quality`, aggregated by `oc-sandbox / required` | `pull_request` (incl. forks) + proposed `push` to `main` (O1-D); `contents: read` (`{}` on aggregator) | **None** | Verified read-only restore on PR; seeded on `main` | **Required gate** (`oc-sandbox / required` aggregates `tests` and `quality` only; promotion tracked in [prd_k](prd_k.md)) |
+| **Tier 0A-baselines** (`oc-sandbox baselines` + SonarQube Cloud App) | `Python coverage baseline`, `Dependency Review baseline`, `CodeQL baseline (python, actions)`, and automatic SonarQube Cloud GitHub App | `pull_request` (separate workflow/App); `contents: read` on coverage/DepReview, **`security-events: write` strictly isolated to the CodeQL job** | **None** | Verified read-only restore on PR (`py-wheels`); seeded on `main` | **Separate from `oc-sandbox / required`**; default-branch qualification & promotion owned by [prd_k](prd_k.md) |
+| **Tier 0B** | Offline Python spike suites (30 files) + Web UI (`check`, `build`, `node --test`, optional headless Playwright) | `pull_request` (incl. forks) + `push` to `main`; `contents: read` only | **None** | Verified read-only restore on PR; seeded on `main` | Unconditional `spike-python` promotable to `oc-sandbox / required` after qualification; `spike-web-ui` advisory if path-filtered or promotable if unconditional |
+| **Tier 1** | Real rootless Podman `tests/security.sh` (`22` skipped checks; `19` non-SELinux on Ubuntu), Containerfile build smoke, bounded Postgres sidecar smoke | `push` to `main`, nightly `schedule`, `workflow_dispatch`; `contents: read` only | **None** | Optional bounded container cache only after independent output-digest verification ([prd_o3](prd_o3.md)) | Advisory initially; promote only after hosted stability proof |
+| **Tier 2** | Basic live LLM provider inference smoke (tiny deterministic wire-contract probe) | **`main`-only** nightly `schedule` + manual `workflow_dispatch` via protected Environment `ci-inference-smoke`; `contents: read` only | **Dedicated low-budget CI API keys ONLY** | **Strictly NONE** (no cache read or write) | **Never required** (never blocks PR merges on upstream provider outages) |
+| **Tier 3** | Full `tests/parallel.sh` (Chrome/SELinux/Wayland), SELinux MCS xattr checks, local host subscription acceptance (`prd_i3`/`prd_i4`) | Local maintainer workstation (`AGENTS.md`) | Local host credentials only | N/A | Maintainer local gate |
 
 ## Tier 0B: Offline spike suites and SvelteKit Web UI
 
@@ -42,9 +43,11 @@ Operational notes discovered during PRs #57–#64:
 - SQLite-backed spike suites (`m/projection`, `n/restart`, `n/inbox-read`) require a private,
   user-owned canonical `TMPDIR` (matching `tools/ci/run.py`'s `suite_scratch` behavior) so SQLite
   temporary files never resolve through world-writable or `nobody`-owned `/tmp` mounts.
-- Web UI installs in CI must run `npm ci --ignore-scripts --offline` (against the lockfile-hashed
-  cache from [prd_o3](prd_o3.md)) or `--ignore-scripts` on cache miss so untrusted postinstall
-  lifecycle scripts cannot execute during dependency installation.
+- Web UI installs in CI must first run a lockfile admission validator on **both cold and warm
+  paths** (verifying every installable dependency in `package-lock.json` comes from the allowed
+  registry origin and carries a strong SRI `integrity` digest — see [prd_o3](prd_o3.md)), and then
+  run `npm ci --ignore-scripts --offline` on cache hit (or `npm ci --ignore-scripts --prefer-offline`
+  on cold miss) so untrusted postinstall lifecycle scripts cannot execute.
 
 ### Options for Tier 0B
 
@@ -121,8 +124,9 @@ before committing to hosted Tier 1 gating:
   If feasible, enable Tier 1 on `push` to `main`, nightly `schedule`, and `workflow_dispatch`
   (advisory first, zero external API secrets). Keep SELinux MCS enforcement and full
   `tests/parallel.sh` (Chromium/SELinux/Wayland) in Tier 3 local host gates.
-  - **Pros:** Closes the largest real-runtime gap (246 real Podman security assertions) without
-    operating self-hosted runner infrastructure or exposing secrets to PRs.
+  - **Pros:** Closes the non-SELinux real-Podman gap (`19` of the `22` skipped real-Podman checks
+    on Ubuntu, out of `246` total `tests/security.sh` assertions) without operating self-hosted
+    runner infrastructure or exposing secrets to PRs.
   - **Cons:** GitHub-hosted Ubuntu runners lack Fedora SELinux enforcement and host Wayland, so
     SELinux/Wayland regressions still require Tier 3 local checks; container image pulls add
     `~30–90 s` unless paired with bounded caching ([prd_o3](prd_o3.md)).
@@ -212,16 +216,23 @@ tests.
   - **Effort:** ~1 day (once live provider adapter code lands on `main`).
 - **Option O2-H:** Keep GitHub Actions 100% free of API secrets; run live inference smoke only via
   a local maintainer CLI command (`tools/ci/inference_smoke.py --local`).
+  - **Mandatory credentialed-code boundary for Option O2-H:** The credentialed probe script and
+    **every module it imports** must execute strictly from a **separately verified, reviewed
+    revision** (e.g., clean `main` checkout) in a clean Python environment (`python3 -I`, isolated
+    `PYTHONPATH` excluding any unreviewed candidate checkout). Candidate adapter changes under
+    review are exercised strictly against **synthetic credentials and synthetic upstreams** until
+    they reach that trusted reviewed revision.
   - **Pros:** Zero secrets stored in GitHub; zero cloud secret-rotation burden.
-  - **Cons:** Live wire drift is discovered only when the maintainer remembers to run the local
-    command.
+  - **Cons:** Live wire drift is discovered only when the maintainer runs the trusted-revision
+    local smoke command.
   - **Effort:** ~0.5 day.
 - **Rejected — PR-triggered secret smoke (formerly Option O2-I, disqualified by Non-Negotiable
   Invariants #1 & #4):** Running live inference smoke on maintainer-labeled PRs via Environment
   approval would require weakening `ci-inference-smoke`'s `main`-only deployment branch policy to
   allow PR branches and introduces label/push-to-approval TOCTOU secret-exfiltration risk via
-  modified test code. It is explicitly disallowed; pre-merge live checks run locally (`O2-H`) and
-  post-merge automated checks run only on `main` (`O2-G`).
+  modified test code. It is explicitly disallowed; candidate PRs run strictly with synthetic
+  upstreams, while live provider checks run only from reviewed `main` code (automated under
+  `O2-G`, or locally from a verified clean `main` revision under `O2-H`).
 
 ## Checkboxes
 

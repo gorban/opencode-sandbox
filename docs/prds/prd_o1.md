@@ -40,11 +40,13 @@ All measurements below were collected from `gorban/opencode-sandbox` GitHub Acti
 | `Launcher and setup lifecycle` (`tests/setup-lifecycle.py`) | `~8.6 s` | **14%** | 41 lifecycle subprocess tests |
 | Remaining 12 suites combined | `~5.7 s` | **9%** | Each `< 1.0 s` (`Controller core` `0.008 s`, `Bridge merge core` `0.006 s`, etc.) |
 
-## Root cause of the 16% `oc-sandbox PR` failure rate
+## Recurring failure mode: `mise` 403 rate limits in `oc-sandbox PR`
 
-Inspection of failed runs in the last 100 runs (`45127421466`, `45123845457`, `45120842525`,
-`45120672925`, `45120478991`, `45114120123`) confirms **6 out of 6 (`100%`)** failed on the exact
-same infrastructure error inside `quality`:
+Of `131` historical `oc-sandbox PR` runs, `21` failed (`16.0%` overall; `8/50` in the last 100
+runs). Inspection of `6` recent failed runs (`45127421466`, `45123845457`, `45120842525`,
+`45120672925`, `45120478991`, `45114120123`) shows **6 out of 6 inspected failures** hit the exact
+same infrastructure error inside `quality` (establishing a recurring infrastructure failure mode;
+post-change runs will measure the actual reduction in overall failure rate):
 
 ```text
 mise ✗ github:koalaman/shellcheck@0.9.0 · failed: GitHub artifact attestations verification error:
@@ -99,19 +101,28 @@ Why this happens:
   `tools/ci/mise.lock` is verified offline (or extract/verify the pinned archive offline inside
   `toolchain.py`, keeping lockfile parity checks), and verify zero outbound `api.github.com`
   requests occur on cache hit.
-  - **Pros:** Cuts the `16%` flaky failure rate to **~0%**, cuts `quality` step time from `7–10 s`
-    to `~2–3 s`, preserves strict SHA-256 integrity (`MISE_ARCHIVE_SHA`, `MISE_BINARY_SHA`,
-    `SHELLCHECK_CHECKSUM`), and never exposes `GITHUB_TOKEN` to `mise` or untrusted PR checkouts.
+  - **Pros:** Eliminates the recurring `mise` 403 infrastructure failure mode, cuts `quality` step
+    time from `7–10 s` to `~2–3 s`, preserves strict SHA-256 integrity (`MISE_ARCHIVE_SHA`,
+    `MISE_BINARY_SHA`, `SHELLCHECK_CHECKSUM`), and never exposes `GITHUB_TOKEN` to `mise` or
+    untrusted PR checkouts.
   - **Cons:** Requires updating `tools/ci/toolchain.py` and its unit tests (`tests/test_ci_toolchain.py`)
     to accept a read-only verified cache directory without trusting cached bytes before hashing.
   - **Effort:** ~0.5 day.
-- **Option B2:** Pass `GITHUB_TOKEN` to `mise install --locked` with no caching.
-  - **Pros:** Raises API rate limit from `60/hr/IP` to `1,000/hr/repo`; minimal code change.
-  - **Cons:** Regresses `tests/test_ci_toolchain.py`'s explicit token-stripping invariant by
-    exposing a repo-scoped `GITHUB_TOKEN` to PR-checked-out `toolchain.py`/`mise` execution; still
-    downloads `mise` (`<= 64 MiB`) + `shellcheck` on every PR run; does not scale as additional
-    tools (`ruff`, `actionlint`, `shfmt`) are added under [prd_k](prd_k.md).
-  - **Effort:** ~2 hours.
+- **Option B3 (Alternative for future attestation-bearing tools):** Run any authenticated GitHub
+  API attestation fetch strictly inside a **trusted `main`-only seeder job** (using read-only
+  `GITHUB_TOKEN` on reviewed `main` code only) and save only the verified archive bytes into
+  `main`'s cache scope; PR consumer jobs continue keeping `GITHUB_TOKEN`/`GH_TOKEN` completely
+  stripped and verify every cached byte offline against `mise.lock` SHA-256 checksums.
+  - **Pros:** Preserves strict PR token isolation (`tests/test_ci_toolchain.py`) even if a future
+    pinned tool supports GitHub Artifact Attestations.
+  - **Cons:** Adds seeder/consumer split complexity unnecessary for `shellcheck@0.9.0` (which
+    predates attestations).
+  - **Effort:** ~0.5–1 day.
+- **Rejected — Pass `GITHUB_TOKEN` to `mise` on PR jobs (formerly Option B2):** Passing
+  `GITHUB_TOKEN` into `mise` launched by PR-controlled code breaks `tests/test_ci_toolchain.py`'s
+  explicit token-isolation invariant, exposes a repo-scoped token to untrusted PR checkouts, still
+  downloads `mise` (`<= 64 MiB` cap) + `shellcheck` every run, and does not scale to additional
+  linters under [prd_k](prd_k.md). Disallowed for PR jobs.
 
 ### Option O1-C: Intra-job parallelism inside `tools/ci/run.py tests`
 
@@ -164,10 +175,11 @@ isolation** — never `ThreadPoolExecutor` inside one supervised process.
 - [x] Measured historical CI build/test duration trends and failure breakdown across 257 runs
   (`2026-11-21..2026-11-23`, `origin/main` `9b608f43`).
 - [ ] `(decision needed)` Select Option O1-A1 vs O1-A2 (decouple `quality` + add PR `concurrency`).
-- [ ] `(decision needed)` Select Option O1-B1 vs O1-B2 (`mise` 403 rate-limit elimination).
-- [ ] `(decision needed)` Select Option O1-C1, O1-C2, or O1-C3 (`tools/ci/run.py` parallelism /
-  `security.sh` sharding).
+- [ ] `(decision needed)` Select Option O1-B1 vs O1-B3 (`mise` 403 rate-limit elimination without
+  exposing `GITHUB_TOKEN` on PR jobs).
+- [ ] `(decision needed)` Select Option O1-C1, O1-C2, or O1-C3 (`tools/ci/run.py` process-isolated
+  parallelism / `security.sh` sharding).
 - [ ] `(decision needed)` Decide whether to adopt Option O1-D (`push` to `main` +
   `$GITHUB_STEP_SUMMARY` suite timings).
-- [ ] Implement selected O1 optimizations after Gate 1 walkthrough review and record before/after
-  hosted p50/p90 durations and 0% `mise` 403 rate across >=20 consecutive runs.
+- [ ] Implement selected O1 optimizations after Gate 1 walkthrough review and measure before/after
+  hosted p50/p90 durations, overall failure rate, and `mise` 403 count across >=20 consecutive runs.

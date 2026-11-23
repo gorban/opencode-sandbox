@@ -47,8 +47,8 @@ oc-cache-v1-<runner.os>-<arch>-<scope>-<sha256-of-exact-dependency-manifest>
 |---|---|---|---|---:|
 | `ci-toolchain` | `hashFiles('tools/ci/mise.toml', 'tools/ci/mise.lock', 'tools/ci/toolchain.py')` *(note: `toolchain.py` imports `SHELLCHECK_VERSION` from `run.py`, while `mise.toml`/`mise.lock` also pin `0.9.0`, so omitting `run.py` busts on version bumps without busting on unrelated `run.py` edits)* | Downloaded verified archives (`mise` tarball + locked tool tarballs) in read-only cache dir | Pre-validate exact filenames (`O_NOFOLLOW`, regular file, size cap), re-verify `MISE_ARCHIVE_SHA`, `MISE_BINARY_SHA`, and every `mise.lock` `sha256:` before extracting or executing | `~70–180 MiB` |
 | `py-wheels` | `py<minor>` + `hashFiles('tools/ci/wheels.lock.txt')` *(new tracked canonical sorted `pkg==ver --hash=sha256:...` lockfile replacing/mirroring `WHEEL`/`WHEEL_HASH` in `tools/ci/core_coverage.py`; include Python minor/ABI tag before adding any C-extension wheel)* | Raw `.whl` files only (never pre-built `venv`s with absolute paths) | Pre-validate exact allowlisted filenames with `O_NOFOLLOW`, regular-file, size-cap, and SHA-256 checks (`bounded_regular`), copy only verified wheels into private `0o700` scratch, then run `pip install --isolated --no-index --find-links <private-verified-dir> --no-deps --require-hashes --only-binary=:all:` | `~5–40 MiB` |
-| `web-ui-npm` | `node24.18.0-` + `hashFiles('docs/prds/spikes/m/web-ui/package-lock.json')` *(at `9b608f43`, all 223 locked packages carry SRI `integrity` digests and the only `hasInstallScript` package is optional macOS `fsevents`)* | Isolated npm tarball cache (`--cache <private-dir>`, **never** `~/.npm` alongside `.npmrc` and **never** mutable `node_modules`) | With `NPM_CONFIG_USERCONFIG=/dev/null` and `NPM_CONFIG_GLOBALCONFIG=/dev/null`, run `npm ci --ignore-scripts --cache <private-dir> --offline` on `cache-hit == 'true'` (or `--prefer-offline` on cold miss), verifying every package SRI digest against `package-lock.json` | `~60–120 MiB` |
-| `tier1-oci` *(optional, Tier 1 only)* | Canonical manifest hash of pinned base image digest + Containerfile + explicit sorted package list (`tools/ci/container-deps.manifest`) | OCI image/layer tarballs or Buildx cache | Verify exact raw archive/blob `sha256:` digest **before** `podman load` parses any untrusted tar stream (never relying on post-load `podman image inspect`) | `<= 1.5 GiB` |
+| `web-ui-npm` | `node24.18.0-` + `hashFiles('docs/prds/spikes/m/web-ui/package-lock.json')` *(at `9b608f43`, all 223 locked packages carry SRI `integrity` digests and the only `hasInstallScript` package is optional macOS `fsevents`)* | Isolated npm tarball cache (`--cache <private-dir>`, **never** `~/.npm` alongside `.npmrc` and **never** mutable `node_modules`) | **Lockfile admission validator on BOTH cold and warm paths** (fail closed before install if any installable package lacks a strong `sha512`/`sha384` SRI `integrity` digest or uses a non-allowlisted `resolved` source outside `https://registry.npmjs.org/`), then with `NPM_CONFIG_USERCONFIG=/dev/null` and `NPM_CONFIG_GLOBALCONFIG=/dev/null`, run `npm ci --ignore-scripts --cache <private-dir> --offline` on `cache-hit == 'true'` (or `--prefer-offline` on cold miss) | `~60–120 MiB` |
+| `tier1-oci` *(deferred optional scope, Tier 1 only — does NOT block `ci-toolchain`, `py-wheels`, or `web-ui-npm`)* | **Input hash alone is insufficient to authenticate cached output.** Must specify exact serialized payload format and bind an independent expected output digest (from a reviewed pin or an independently authenticated `main` build record) before enabling | Deferred until Gate 1 payload/digest spec is approved (OCI archive or verified Buildx store) | Verify raw cached payload against the independent expected output digest **before** `podman load` / import (including a mandatory same-key, different-payload rejection test); never rely on input-key matching alone or post-load `podman image inspect` | `<= 1.5 GiB` |
 
 ### Why caching raw verified archives/wheels beats caching extracted trees
 
@@ -110,9 +110,14 @@ GitHub Actions caches are **untrusted acceleration storage**, never a security b
 - **Pros:**
   - Near-100% cache hit rate across rapid multi-PR bursts (like PRs #57–#64, which all shared the
     exact same `mise.lock` and `coverage` wheel!).
-  - **Zero PR cache-eviction / LRU-flooding risk** (10 concurrent PRs cannot churn the `10 GB` quota
-    with 10 duplicate copies of the same cache!).
-  - Cleanest security posture: only reviewed code merged to `main` writes persistent caches.
+  - **Routine-churn optimization (not a security boundary against modified PR workflows):** Avoiding
+    routine saves on normal `pull_request` runs prevents benign concurrent PRs from duplicating
+    caches across branch scopes. Note that a PR can still edit its own workflow file to save
+    entries scoped to its merge ref; GitHub's ref-scoping prevents those entries from replacing
+    `main`'s caches, though all refs still share the repository's `10 GB` LRU quota. Therefore,
+    security relies on **independent cryptographic verification on every cache hit**, and
+    reliability requires **every workflow to remain functionally correct on a cold run after cache
+    eviction**.
 - **Cons:** A PR that *modifies* `mise.lock` or `package-lock.json` fetches cold on each push to
   that PR until merged to `main` (rare, and acceptable for dependency-bump PRs).
 - **Effort:** ~0.5–1 day (paired with [prd_o1](prd_o1.md) Option O1-B1).
@@ -145,8 +150,12 @@ GitHub Actions caches are **untrusted acceleration storage**, never a security b
 - [ ] `(decision needed)` Confirm the canonical manifest-hashed key format
   (`oc-cache-v1-<os>-<arch>-<scope>-<manifest-sha256>`) with exact-key-only restore (no
   `restore-keys` fallback) and mandatory post-restore SHA-256 verification.
-- [ ] `(decision needed)` Decide whether to include optional Tier 1 OCI layer caching (with hard
-  `<= 1.5 GiB` cap) after the Tier 1 Podman feasibility spike ([prd_o2](prd_o2.md)).
+- [ ] `(decision needed)` Decide whether to design a separate Gate 1 spec for optional Tier 1 OCI
+  layer caching (requiring an exact payload format, an independent expected output digest, a
+  same-key different-payload rejection test, and a hard `<= 1.5 GiB` cap) after the Tier 1 Podman
+  feasibility spike ([prd_o2](prd_o2.md)); `ci-toolchain`, `py-wheels`, and `web-ui-npm` proceed
+  independently.
 - [ ] Implement selected caching slice after Gate 1 walkthrough review, verifying (1) exact hit on
-  unchanged manifest, (2) clean miss + rebuild when a single package/version changes, (3) fail-closed
-  rejection on a corrupted cached archive, and (4) `0%` `mise` 403 rate across burst runs.
+  unchanged manifest, (2) clean miss + cold rebuild when a single package/version changes or after
+  cache eviction, (3) fail-closed rejection on a corrupted cached archive or non-allowlisted /
+  missing-integrity `package-lock.json` entry, and (4) `0` `mise` 403 failures across burst runs.

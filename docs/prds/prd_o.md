@@ -25,10 +25,11 @@ SonarQube Cloud), but an empirical audit of **257 historical workflow runs**
    - `oc-sandbox PR` has a steady **~99 s** median wall clock (`min 91 s`, `p90 137 s`, `max 286 s`),
      dominated by serial execution of `tests` (`p50 72 s`, of which `tests/security.sh` stubs take
      `~35.8 s` / `58%`) **followed by** `quality` (`needs: tests`, `p50 14 s`).
-   - `oc-sandbox PR` suffered a **16.0% failure rate** (`21/131` runs overall; `8/50` in the last
-     100 runs), and **100% of inspected recent failures (`6/6`)** were unauthenticated GitHub API
+   - `oc-sandbox PR` had a **16.0% historical failure rate** (`21/131` runs overall; `8/50` in the
+     last 100 runs), and **6/6 inspected recent failures** were unauthenticated GitHub API
      `403 Forbidden` rate-limit errors inside `tools/ci/toolchain.py` when `mise` verified
-     `github:koalaman/shellcheck@0.9.0` artifact attestations from shared runner IPs.
+     `github:koalaman/shellcheck@0.9.0` artifact attestations from shared runner IPs — establishing
+     a recurring infrastructure failure mode.
    - `oc-sandbox baselines` grew **+29% in 48 hours** (median `56 s -> 62 s -> 72 s`) as
      `CodeQL baseline (python)` scaled (`p50 70 s`, `max 89 s`) with newly merged spike modules.
 2. **Test-scope gaps across spikes, UI, real containers, and basic inference ([prd_o2](prd_o2.md)):**
@@ -57,8 +58,9 @@ SonarQube Cloud), but an empirical audit of **257 historical workflow runs**
    - PRD O3 specifies **zero-trust, content-hashed caching**: cache keys hashed strictly from the
      exact pinned dependency list and checksums being pulled, exact-key restore (`restore-keys`
      omitted for executable artifacts), mandatory SHA-256 verification on every cache hit before
-     execution, `main`-seeded warm caches with read-only PR restore (eliminating LRU flooding and
-     cross-PR poisoning), and **zero caching** in any secret-bearing Tier 2 job.
+     execution, `main`-seeded warm caches with read-only PR restore (reducing routine PR cache
+     churn while relying on ref-scoping, per-hit SHA-256 verification, and cold-run correctness
+     after eviction), and **zero caching** in any secret-bearing Tier 2 job.
 4. **Strict scope boundary:**
    - PRD O builds on [prd_k](prd_k.md) (contributor checks, SonarQube Cloud qualification, SBOM/Grype,
      and SSH remote acceptance) without modifying `prd_k` reservations or duplicating `prd_i3`/`prd_i4`
@@ -66,22 +68,22 @@ SonarQube Cloud), but an empirical audit of **257 historical workflow runs**
 
 ```mermaid
 flowchart TB
-    subgraph T0["Tier 0 · Untrusted PR Gate (pull_request · Zero Secrets)"]
+    subgraph T0["Tier 0 · Untrusted PR Workflows (pull_request · Zero External API Secrets)"]
         direction LR
-        T0A["Core Portable Suites\n(15 suites · parallelized)"]
-        T0Q["Quality & Lint\n(decoupled from tests)"]
-        T0B["Offline Spikes & Web UI\n(30 Py suites + SvelteKit)"]
-        T0S["Baselines & Scanners\n(Coverage · CodeQL · DepReview · Sonar)"]
+        T0A["Tier 0A-gate: Core Portable Suites\n(15 suites · process-isolated)"]
+        T0Q["Tier 0A-gate: Quality & Lint\n(decoupled from tests)"]
+        T0B["Tier 0B: Offline Spikes & Web UI\n(30 Py suites + SvelteKit)"]
+        T0S["Tier 0A-baselines: Separate Scanners\n(Coverage · CodeQL[sec-events:w] · DepReview · Sonar)"]
     end
 
     subgraph CACHE["Verified Content-Hashed GHA Cache (Acceleration Only · SHA-256 Re-Verified on Hit)"]
         C1["Toolchain Manifest Hash\n(mise + shellcheck + future linters)"]
         C2["Python Wheelhouse Hash\n(coverage + pinned dev wheels)"]
-        C3["Web UI Lockfile Hash\n(npm tarball cache · --ignore-scripts)"]
+        C3["Web UI Lockfile Hash\n(lockfile admission + npm cache)"]
     end
 
     subgraph T1["Tier 1 · Real Container Integration (main / schedule / dispatch · Zero API Secrets)"]
-        T1P["Rootless Podman Security\n(246 real checks · ubuntu-24.04 probe)"]
+        T1P["Rootless Podman Security\n(22 skipped real-Podman checks / 246 total)"]
         T1G["Sidecar & Containerfile Smoke\n(Postgres + image build probe)"]
     end
 
