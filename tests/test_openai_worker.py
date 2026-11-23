@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
-from oc_openai import worker
+from oc_openai import responses, worker
 from oc_openai.managed import protocol
 from oc_openai.managed.broker import Broker
 from oc_openai.managed.relay import Lease, PROOF_PREFIX, grant_record, read_exact, take_fence
@@ -26,9 +26,18 @@ from oc_openai.managed.runtime import (
 )
 
 
-def fixture_events(body, *, deadline, cancelled):
+
+_REPLAY_ITEMS = (
+    {"type": "reasoning", "id": "rs_before_assistant", "summary": [],
+     "encrypted_content": "host_reasoning_ciphertext_before_assistant"},
+    {"type": "reasoning", "id": "rs_before_write", "status": "completed", "summary": [],
+     "encrypted_content": "host_reasoning_ciphertext_before_write"},
+)
+
+def fixture_events(body, *, deadline, cancelled, reasoning=False):
     assert time.monotonic() < deadline and not cancelled.is_set()
     assert body["store"] is False and body["stream"] is True
+    assert "include" not in body
     assert body["instructions"] == protocol.INSTRUCTIONS
     tool, prompt, *history = body["input"]
     assert tool["type"] == "additional_tools" and len(tool["tools"]) == 1
@@ -37,9 +46,14 @@ def fixture_events(body, *, deadline, cancelled):
     assert prompt == {"type": "message", "role": "user", "content": protocol.PROMPT}
     initial = not history
     if not initial:
-        assert [item["type"] for item in history] == ["message", "function_call", "function_call_output"]
-        assert history[2] == {"type": "function_call_output", "call_id": "call_example",
-                              "output": protocol.TOOL_RESULT}
+        expected_types = ["message", "function_call", "function_call_output"]
+        if reasoning:
+            expected_types = ["reasoning", "message", "reasoning", "function_call", "function_call_output"]
+            assert history[0] == _REPLAY_ITEMS[0] and history[2] == _REPLAY_ITEMS[1]
+            assert history[1]["phase"] == "commentary"
+        assert [item["type"] for item in history] == expected_types
+        assert history[-1] == {"type": "function_call_output", "call_id": "call_example",
+                               "output": protocol.TOOL_RESULT}
     sequence = "1" if initial else "2"
     response = {"id": "resp_example" + sequence, "model": body["model"]}
     yield {"type": "response.created", "response": response}
@@ -51,6 +65,16 @@ def fixture_events(body, *, deadline, cancelled):
                       "status": "completed", "arguments": json.dumps({
                           "path": protocol.PROOF_PATH, "content": protocol.PROOF_BYTES.decode("ascii"),
                       })})
+    if reasoning and initial:
+        items[0]["phase"] = "commentary"
+        items = [_REPLAY_ITEMS[0].copy(), items[0], _REPLAY_ITEMS[1].copy(), items[1]]
+        for index in (0, 2):
+            item = items[index]
+            yield {"type": "response.output_item.added", "output_index": index,
+                   "item": {**item, "encrypted_content": "unfinished_ciphertext"}}
+            yield {"type": "response.reasoning_text.delta", "output_index": index, "item_id": item["id"],
+                   "delta": "discard this synthetic reasoning text"}
+            yield {"type": "response.output_item.done", "output_index": index, "item": item.copy()}
     yield {"type": "response.completed", "response": {
         **response, "status": "completed", "output": items,
         "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
@@ -136,14 +160,7 @@ class WorkerBrokerTests(unittest.TestCase):
 
         def upstream(body, **kwargs):
             calls.append(deepcopy(body))
-            for event in fixture_events(body, **kwargs):
-                if event["type"] == "response.completed":
-                    reason = {"type": "reasoning", "id": "rs_example", "summary": [],
-                              "encrypted_content": "host reasoning marker"}
-                    event["response"]["output"].insert(0, reason)
-                    yield {"type": "response.output_item.done", "item": reason}
-                    yield {"type": "response.reasoning_text.delta", "delta": "host reasoning marker"}
-                yield event
+            yield from fixture_events(body, **kwargs, reasoning=True)
 
         with offline_broker(upstream, phases) as (root, job, broker):
             altered = native_payload()
@@ -164,7 +181,8 @@ class WorkerBrokerTests(unittest.TestCase):
 
             with exchange(job, native_payload()) as peer:
                 data = response(peer, generation=job.generation)
-            self.assertNotIn(b"host reasoning marker", data)
+            self.assertNotIn(b"host_reasoning_ciphertext", data)
+            self.assertNotIn(b"discard this synthetic reasoning text", data)
             terminal = next(item["response"] for item in (
                 json.loads(frame[6:]) for frame in data.partition(b"\r\n\r\n")[2].splitlines() if frame
             ) if item["type"] == "response.completed")
@@ -178,7 +196,8 @@ class WorkerBrokerTests(unittest.TestCase):
                 self.assertTrue(response(peer).startswith(b"HTTP/1.1 403"))
             with exchange(job, native) as peer:
                 data = response(peer, generation=job.generation)
-            self.assertNotIn(b"host reasoning marker", data)
+            self.assertNotIn(b"host_reasoning_ciphertext", data)
+            self.assertNotIn(b"discard this synthetic reasoning text", data)
             self.assertTrue(broker.complete("call_example"))
             with exchange(job, native) as peer:
                 self.assertTrue(response(peer).startswith(b"HTTP/1.1 403"))
@@ -220,6 +239,83 @@ class WorkerBrokerTests(unittest.TestCase):
             self.assertTrue(broker.done.wait(1))
             with exchange(job, native_payload()) as peer:
                 self.assertTrue(response(peer).startswith(b"HTTP/1.1 403"))
+            self.assertEqual(phases, ["initial"])
+
+    def test_terminal_reasoning_can_supply_the_only_completed_ciphertext(self):
+        cases = ("only terminal", "done omits ciphertext", "done nulls ciphertext")
+        for case in cases:
+            with self.subTest(case=case):
+                def upstream(body, **kwargs):
+                    for event in fixture_events(body, **kwargs, reasoning=True):
+                        kind = event["type"]
+                        if case == "only terminal" and kind != "response.created" and kind != "response.completed":
+                            continue
+                        if kind == "response.output_item.done":
+                            if case == "done omits ciphertext":
+                                event["item"].pop("encrypted_content")
+                            elif case == "done nulls ciphertext":
+                                event["item"]["encrypted_content"] = None
+                        yield event
+
+                with offline_broker(upstream, []) as (_, job, _):
+                    with exchange(job, native_payload()) as peer:
+                        data = response(peer, generation=job.generation)
+                    self.assertTrue(data.startswith(b"HTTP/1.1 200"))
+                    self.assertNotIn(b"host_reasoning_ciphertext", data)
+                    self.assertNotIn(b"discard this synthetic reasoning text", data)
+
+    def test_unresumable_reasoning_blocks_tool_projection_and_continuation(self):
+        def fault_events(fault):
+            def upstream(body, **kwargs):
+                for event in fixture_events(body, **kwargs, reasoning=True):
+                    kind = event["type"]
+                    if kind == "response.output_item.done" and event["output_index"] == 0:
+                        if fault == "ciphertext mismatch":
+                            event["item"]["encrypted_content"] = "different_ciphertext"
+                        if fault == "reasoning ID mismatch":
+                            event["item"]["id"] = "rs_different"
+                        if fault == "incomplete done status":
+                            event["item"]["status"] = "incomplete"
+                    if kind == "response.completed":
+                        output = event["response"]["output"]
+                        if fault == "missing encrypted content":
+                            output[0].pop("encrypted_content")
+                        elif fault == "missing terminal reasoning":
+                            output.pop(0)
+                        elif fault == "unsupported phase":
+                            output[1]["phase"] = "invalid phase"
+                    yield event
+            return upstream
+
+        for fault in ("missing encrypted content", "missing terminal reasoning", "ciphertext mismatch",
+                      "reasoning ID mismatch", "incomplete done status", "unsupported phase"):
+            with self.subTest(fault=fault):
+                phases = []
+                with offline_broker(fault_events(fault), phases) as (root, job, broker):
+                    with exchange(job, native_payload()) as peer:
+                        self.assertEqual(peer.recv(1), b"")
+                    self.assertTrue(broker.done.wait(2))
+                    self.assertFalse((root / "proof.txt").exists())
+                    with exchange(job, native_payload()) as peer:
+                        self.assertTrue(response(peer).startswith(b"HTTP/1.1 403"))
+                    self.assertEqual(phases, ["initial"])
+
+    def test_encoded_continuation_cap_applies_before_tool_delivery(self):
+        phases = []
+        body = protocol.body_for("fixture-model")
+        upstream = lambda body, **kwargs: fixture_events(body, **kwargs, reasoning=True)
+        sample = list(upstream(body, deadline=time.monotonic() + 2, cancelled=threading.Event()))
+        continuation = protocol.body_for("fixture-model", sample[-1]["response"]["output"])
+        encoded_size = len(responses.encode_responses_body(continuation))
+        self.assertLess(len(responses.encode_responses_body(body)), encoded_size - 1)
+        with patch.object(responses, "MAX_JSON", encoded_size):
+            self.assertEqual(len(responses.encode_responses_body(continuation)), encoded_size)
+        with (patch.object(responses, "MAX_JSON", encoded_size - 1),
+              offline_broker(upstream, phases) as (root, job, broker)):
+            with exchange(job, native_payload()) as peer:
+                self.assertEqual(peer.recv(1), b"")
+            self.assertTrue(broker.done.wait(2))
+            self.assertFalse((root / "proof.txt").exists())
             self.assertEqual(phases, ["initial"])
 
     def test_unknown_upstream_item_blocks_tool_projection(self):
@@ -447,7 +543,7 @@ class WorkerPodmanTests(unittest.TestCase):
 
         def upstream(body, **kwargs):
             seen.append(body)
-            return fixture_events(body, **kwargs)
+            return fixture_events(body, **kwargs, reasoning=True)
 
         native_turn = worker._native_turn
 

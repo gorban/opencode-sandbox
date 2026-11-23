@@ -1,8 +1,10 @@
 """Fixed worker intent and bounded projection of upstream Responses events."""
 
+from dataclasses import dataclass, field
 import json
 import re
 
+from ..responses import encode_responses_body
 from .relay_receipt import MAX_BODY, MAX_RESPONSE
 from .runtime import PUBLIC_RESPONSES_VALUE
 
@@ -19,12 +21,19 @@ INSTRUCTIONS = (
 )
 _MAX_EVENTS = 2048
 _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+_CALL_ID = re.compile(r"call_[A-Za-z0-9_-]{1,123}\Z")
 _HEADERS = set(b"host connection content-type content-length accept accept-encoding authorization "
                b"user-agent x-stainless-lang x-stainless-package-version x-stainless-os "
                b"x-stainless-arch x-stainless-runtime x-stainless-runtime-version "
                b"x-stainless-retry-count x-stainless-timeout b3 traceparent "
                b"x-opencode-client x-opencode-project x-opencode-session x-opencode-session-id "
                b"x-session-affinity x-session-id".split())
+
+
+@dataclass(frozen=True)
+class CompletedReply:
+    native: dict
+    continuation: dict | None = field(default=None, repr=False)
 
 
 class Refused(ValueError):
@@ -153,9 +162,9 @@ def body_for(model, output=None):
     input_items = [{"type": "additional_tools", "role": "developer", "tools": [tool]},
                    {"type": "message", "role": "user", "content": PROMPT}]
     if output is not None:
-        message, call = output
-        input_items.extend((message.copy(), call.copy(),
-                            {"type": "function_call_output", "call_id": call["call_id"], "output": TOOL_RESULT}))
+        call = next(item for item in output if item["type"] == "function_call")
+        input_items.extend(output)
+        input_items.append({"type": "function_call_output", "call_id": call["call_id"], "output": TOOL_RESULT})
     return {"model": model, "store": False, "stream": True, "instructions": INSTRUCTIONS, "input": input_items}
 
 
@@ -173,30 +182,109 @@ def _usage(raw):
     return usage
 
 
-def _terminal(response, model, initial):
+def _reasoning_item(item):
+    require({"type", "id", "summary", "encrypted_content"} <= item.keys()
+            <= {"type", "id", "summary", "encrypted_content", "status", "content"})
+    require(item["type"] == "reasoning" and item["summary"] == [] and item.get("content", []) == []
+            and item.get("status", "completed") == "completed")
+    require(_identifier(item["id"]).startswith("rs_"))
+    _encrypted(item["encrypted_content"])
+    return item.copy()
+
+
+def _encrypted(value):
+    # Ciphertext is not interpreted. The stream's byte limit and the exact
+    # connector encoding cap bound what we retain and replay.
+    require(type(value) is str and bool(value) and value.isascii()
+            and all("!" <= char <= "~" for char in value))
+    return value
+
+
+def _reasoning_position(index, identifier, seen):
+    require(type(index) is int and 0 <= index < 8 and _identifier(identifier).startswith("rs_"))
+    previous = seen.setdefault(index, identifier)
+    require(previous == identifier)
+
+
+def _reasoning_frame(kind, event, seen, completed):
+    if kind in ("response.output_item.done", "response.output_item.added"):
+        item = event["item"]
+        if item["type"] != "reasoning":
+            return
+        index = event.get("output_index")
+        _reasoning_position(index, item.get("id"), seen)
+        if kind == "response.output_item.done":
+            require(index not in completed and item.get("status", "completed") == "completed")
+            encrypted = item.get("encrypted_content")
+            completed[index] = None if encrypted is None else _encrypted(encrypted)
+    elif kind.startswith("response.reasoning"):
+        _reasoning_position(event.get("output_index"), event.get("item_id"), seen)
+
+
+def _assistant_replay(message):
+    require(message.keys() <= {"id", "type", "role", "status", "content", "phase"})
+    require(message.get("phase") in (None, "commentary", "final_answer"))
+    content = message.get("content")
+    require(type(content) is list and all(
+        part.keys() <= {"type", "text", "annotations", "logprobs"}
+        and part.get("annotations", []) == [] and part.get("logprobs", []) == []
+        for part in content
+    ))
+    return message.copy()
+
+
+def _terminal(response, model, initial, seen_reasoning, completed_reasoning):
     require(type(response) is dict and response.get("model") == model and response.get("status") == "completed")
     expected = INITIAL_TEXT if initial else FINAL_TEXT
     items = response.get("output")
     require(type(items) is list and 0 < len(items) <= 8 and all(type(item) is dict for item in items))
-    # Reasoning is inert data. It stays outside both worker projection and the
-    # host-built follow-up. The per-event and aggregate byte bounds apply first.
-    items = [item for item in items if item.get("type") != "reasoning"]
-    require(len(items) == (2 if initial else 1))
-    message = items[0]
+    visible = [item for item in items if item.get("type") != "reasoning"]
+    require(len(visible) == (2 if initial else 1))
+    message = visible[0]
     require(message.get("type") == "message" and message.get("role") == "assistant"
             and message.get("status") == "completed" and _content(message, "output_text") == expected)
     output = [{"type": "message", "role": "assistant", "status": "completed", "id": _identifier(message.get("id")),
                "content": [{"type": "output_text", "text": expected, "annotations": []}]}]
+    continuation = None
     if initial:
-        call = items[1]
-        require(call.get("type") == "function_call" and call.get("name") == "write"
-                and call.get("status") == "completed" and type(call.get("arguments")) is str)
+        call = visible[1]
+        require(call.keys() == {"type", "name", "status", "arguments", "id", "call_id"}
+                and call.get("type") == "function_call"
+                and call.get("name") == "write" and call.get("status") == "completed"
+                and type(call.get("arguments")) is str)
         require(len(call["arguments"]) <= 1024 and decode(call["arguments"]) == _arguments())
+        call_id = _identifier(call.get("call_id"))
+        require(_CALL_ID.fullmatch(call_id))
         output.append({"type": "function_call", "name": "write", "status": "completed",
-                       "id": _identifier(call.get("id")), "call_id": _identifier(call.get("call_id")),
+                       "id": _identifier(call.get("id")), "call_id": call_id,
                        "arguments": json.dumps(_arguments(), separators=(",", ":"))})
-    return {"object": "response", "id": _identifier(response.get("id")), "model": model, "status": "completed",
-            "output": output, "usage": _usage(response.get("usage"))}
+
+        history = []
+        seen_ids = set()
+        terminal_positions = set()
+        for index, item in enumerate(items):
+            item_id = _identifier(item.get("id"))
+            require(item_id not in seen_ids)
+            seen_ids.add(item_id)
+            if item is message:
+                history.append(_assistant_replay(message))
+            elif item is call:
+                history.append(call.copy())
+            else:
+                terminal_positions.add(index)
+                require(seen_reasoning.get(index, item_id) == item_id)
+                replay_item = _reasoning_item(item)
+                completed = completed_reasoning.get(index)
+                require(completed is None or completed == replay_item["encrypted_content"])
+                history.append(replay_item)
+        require(seen_reasoning.keys() <= terminal_positions)
+        continuation = body_for(model, history)
+        # Check the entire future request using the exact connector encoding
+        # before exposing even one executable frame to OpenCode.
+        encode_responses_body(continuation)
+    native = {"object": "response", "id": _identifier(response.get("id")), "model": model, "status": "completed",
+              "output": output, "usage": _usage(response.get("usage"))}
+    return CompletedReply(native, continuation)
 
 
 def validate(events, model, initial, cancelled):
@@ -210,6 +298,8 @@ def validate(events, model, initial, cancelled):
                "response.reasoning_text.delta", "response.reasoning_text.done"}
     terminal = None
     response_id = None
+    seen_reasoning = {}
+    completed_reasoning = {}
     total_bytes = 0
     for count, event in enumerate(events, 1):
         require(not cancelled.is_set() and count <= _MAX_EVENTS and type(event) is dict and terminal is None)
@@ -224,13 +314,16 @@ def validate(events, model, initial, cancelled):
             require(kind == "response.created" and type(event.get("response")) is dict)
             response_id = _identifier(event["response"].get("id"))
         elif kind == "response.completed":
-            terminal = _terminal(event.get("response"), model, initial)
-            require(terminal["id"] == response_id)
+            response = event.get("response")
+            require(type(response) is dict and response.get("id") == response_id)
+            terminal = _terminal(response, model, initial, seen_reasoning, completed_reasoning)
         else:
             require(kind != "response.created")
             if kind in ("response.output_item.added", "response.output_item.done"):
                 item = event.get("item")
                 require(type(item) is dict and item.get("type") in ("message", "function_call", "reasoning"))
+            if initial:
+                _reasoning_frame(kind, event, seen_reasoning, completed_reasoning)
     require(terminal is not None and not cancelled.is_set())
     return terminal
 

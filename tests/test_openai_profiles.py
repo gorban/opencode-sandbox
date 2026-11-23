@@ -92,7 +92,7 @@ class ProfilesTests(unittest.TestCase):
     def test_abandoned_first_attempt_keeps_opaque_directory_for_local_recovery(self):
         candidate = self.profiles.begin("personal")
         self.profiles.abandon(candidate)
-        self.assertEqual(self.profiles.snapshot(), RegistryView((), None))
+        self.assertEqual(self.profiles.snapshot(), RegistryView((), None, (candidate.profile,)))
         retry = self.profiles.begin("personal")
         self.assertEqual(retry.profile.directory, candidate.profile.directory)
         self.assertEqual(retry.profile.host_id, candidate.profile.host_id)
@@ -127,11 +127,42 @@ class ProfilesTests(unittest.TestCase):
 
     def test_disconnect_invalidates_pending_first_connection(self):
         pending = self.profiles.begin("personal")
-        self.assertIsNone(self.profiles.begin_disconnect(lambda profile: None))
+        retired = []
+        self.assertIsNone(self.profiles.begin_disconnect(retired.append))
+        self.assertEqual(retired, [pending.profile])
+        with self.assertRaisesRegex(ProfileError, "^profile_stale$"):
+            with self.profiles.authorize(pending):
+                self.fail("disconnected installation accepted a stale exchange")
         with self.assertRaisesRegex(ProfileError, "^profile_stale$"):
             with self.profiles.publish(pending, "issued-one"):
                 self.fail("disconnected installation accepted stale connect")
+        self.assertEqual(self.profiles.snapshot().saved, ())
+
+    def test_reclaim_requires_exact_pending_candidate_and_local_proof(self):
+        first = self.profiles.begin("empty")
+        candidate = self.profiles.begin("empty")
+        self.profiles.abandon(first, reclaim=lambda _: self.fail("stale attempt reached local check"))
+        candidate.profile.directory.mkdir(parents=True)
+        sentinel = candidate.profile.directory / "synthetic-sentinel"
+        sentinel.write_text("fixture")
+        self.profiles.abandon(candidate, reclaim=lambda _: True)
         self.assertEqual(self.profiles.snapshot(), RegistryView((), None))
+        self.assertEqual(sentinel.read_text(), "fixture")
+        self.assertNotEqual(self.profiles.begin("empty").profile.directory, candidate.profile.directory)
+        uncertain = self.profiles.begin("ambiguous")
+        self.profiles.abandon(uncertain, reclaim=lambda _: False)
+        self.assertEqual(self.profiles.begin("ambiguous").profile.directory, uncertain.profile.directory)
+
+    def test_at_capacity_reclamation_does_not_touch_newer_pending_attempt(self):
+        previous = self.profiles.begin("attempt")
+        self.profiles.abandon(previous)
+        current = self.profiles.begin("attempt")
+        for index in range(15):
+            self.profiles.begin(f"reserved-{index}")
+        with self.assertRaisesRegex(ProfileError, "^profile_limit$"):
+            self.profiles.begin("next", reclaim=lambda _: self.fail("pending attempt passed to reclaim check"))
+        with self.profiles.authorize(current):
+            pass
 
     def test_failed_local_gates_preserve_previous_selection(self):
         personal = self.save("personal", "issued-one")

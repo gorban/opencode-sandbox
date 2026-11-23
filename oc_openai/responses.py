@@ -31,6 +31,17 @@ IO_TIMEOUT = 10
 CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,16}(?:;[^\r\n]*)?\r\n\Z")
 
 
+def encode_responses_body(body):
+    """Prepare the exact bounded request bytes sent by the Responses connector."""
+    try:
+        encoded = json.dumps(body, allow_nan=False, ensure_ascii=True).encode("ascii")
+    except (TypeError, ValueError, RecursionError):
+        raise ConnectionError("invalid_responses_body") from None
+    if len(encoded) > MAX_JSON:
+        raise ConnectionError("provider_request_too_large")
+    return encoded
+
+
 class Cancellation:
     def __init__(self, deadline, stopped=None):
         self.event = threading.Event()
@@ -338,10 +349,7 @@ class OpenAITransport:
 
     @contextlib.contextmanager
     def responses(self, body, bearer, cancellation, dispatch):
-        try:
-            encoded = json.dumps(body, allow_nan=False, ensure_ascii=True).encode("ascii")
-        except (TypeError, ValueError, RecursionError):
-            raise ConnectionError("invalid_responses_body") from None
+        encoded = encode_responses_body(body)
         with self._request(API_HOST, RESPONSES, method="POST", body=encoded,
                            content_type="application/json", bearer=bearer,
                            cancellation=cancellation, dispatch=dispatch) as response:

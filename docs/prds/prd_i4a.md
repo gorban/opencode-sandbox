@@ -77,9 +77,14 @@ into any worker. [Sign-in guide](https://developers.openai.com/siwc/token-sharin
   URN per workstation installation. Each label maps to an opaque private
   directory with the registration's own issued client, verified subject
   and generation. Reject duplicate issued clients across labels. Keep
-  pending sign-in separate until identity and scope are verified. Check
-  the exact pending attempt and selection generation before publishing.
-  A failed or stale attempt preserves the active selection.
+  pending sign-in separate until identity and scope are verified. Fence the
+  exact attempt and selection epoch before the first exchange write and
+  again before publishing. A failed or stale attempt preserves the active
+  selection. One nonblocking sign-in lifetime lock covers reservation
+  through cleanup. Reclaim an abandoned label at capacity only when
+  durable state shows no issuance or possible exchange.
+  Keep unresolved upstream revocation visible for the affected label,
+  including an unselected or unpublished registration.
 - Serialize selection publication against foreground inference and the
   managed worker. Check for a still-unsettled usage record or worker
   lease before switching labels. Later approval checks include the
@@ -112,7 +117,8 @@ into any worker. [Sign-in guide](https://developers.openai.com/siwc/token-sharin
   first upstream byte can be sent. Crash, unknown send and missing valid
   usage retain the reservation across restart and connection retirement,
   so they cannot create another send or fresh headroom. Validate
-  `response.completed` and usage before accepting success. Record an
+  one matching `response.created` and `response.completed` identity and
+  authenticated terminal usage before accepting success. Record an
   authoritative usage overage and suspend future inference. A failed,
   truncated, over-limit, or unknown send does not earn a replacement request. Closing local I/O is not proof that OpenAI stopped work.
 
@@ -146,7 +152,12 @@ into any worker. [Sign-in guide](https://developers.openai.com/siwc/token-sharin
   intended workspace. The bytes prove the observed effect and the
   pinned client's native tool events provide separate execution evidence.
   Construct the continuation using the prior approved request, accepted
-  call and a fixed host-produced tool result. The sandbox can consume its
+  call and a fixed host-produced tool result. If OpenAI supplies reasoning
+  items, keep their bounded encrypted continuation data and order on the
+  workstation. Before tool delivery, verify that the complete approved
+  continuation fits the request limit. Return the data only to the
+  same OpenAI route for that continuation. [Stateless reasoning
+  replay](https://developers.openai.com/api/docs/guides/reasoning#preserve-reasoning-without-stored-responses) The sandbox can consume its
   own admitted allowance, but cannot request arbitrary inference. If
   this exact connected-app placement changes, review the new route
   before enabling it.
@@ -155,8 +166,10 @@ into any worker. [Sign-in guide](https://developers.openai.com/siwc/token-sharin
   and lifetime inodes before activation. On account disconnect, preserve
   the retirement intent before taking the relay's delivery lock and
   publishing the terminal marker. Keep the same-grant marker check under
-  every nonblocking worker write. Use independently matched boot identity
-  to distinguish a reboot from missing live state. Close relay sockets on
+  every nonblocking worker write. For reboot recovery, require a fresh
+  corroborated physical-workstation and boot observation bound to the
+  exact persisted lease. Otherwise use the pinned fence or retain the
+  unfinished retirement. Close relay sockets on
   revoke, failure or owner loss. Bind continuation to one admitted phase and verify
   exact cleanup of all owned containers. Retain a private ownership
   receipt only if cleanup is inconclusive. User data, local service

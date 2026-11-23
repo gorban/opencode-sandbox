@@ -3,6 +3,7 @@
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 import fcntl
+import hashlib
 import os
 import re
 import secrets
@@ -10,15 +11,40 @@ import stat
 
 from .connection_state import ConnectionError, _lock
 from .managed.relay import grant_record
+from .managed.runtime import JobRuntimeError, check_devbox, host_output
 
 
 _TEMP = "/tmp"
 _LEAF = re.compile(r"oc-i4a-[a-z0-9_]{8}")
 _INCARNATION = re.compile(r"inc_[0-9a-f]{32}")
 _BOOT_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+_MACHINE_ID = re.compile(rb"[0-9a-f]{32}")
+_MACHINE_HASH = re.compile(r"[0-9a-f]{64}")
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
 _RETRY = "managed_retirement_incomplete"
+
+
+@dataclass(frozen=True)
+class PhysicalHost:
+    machine: str
+    boot: str
+
+    @classmethod
+    def observe(cls):
+        """Use the qualified physical Podman host bridge, outside all state locks."""
+        try:
+            check_devbox()
+            boot = _boot()
+            raw = host_output("cat", "/etc/machine-id", "/proc/sys/kernel/random/boot_id")
+            machine, physical_boot = raw.splitlines()
+            if (_MACHINE_ID.fullmatch(machine) is None or machine == b"0" * 32
+                    or physical_boot != boot.encode("ascii") or _boot() != boot):
+                return None
+            pin = hashlib.sha256(b"oc-sandbox:physical-podman-host:v1\x00" + machine).hexdigest()
+            return cls(pin, boot)
+        except (OSError, ValueError, JobRuntimeError, ConnectionError):
+            return None
 
 
 @dataclass(frozen=True)
@@ -33,6 +59,7 @@ class WorkerLease:
     lifetime_dev: int
     lifetime_ino: int
     boot: str
+    machine: str | None = None
 
     @classmethod
     def parse(cls, value):
@@ -40,6 +67,7 @@ class WorkerLease:
             lease = cls(**value)
             if (not _LEAF.fullmatch(lease.root) or not _INCARNATION.fullmatch(lease.incarnation)
                     or not _BOOT_ID.fullmatch(lease.boot) or not _positive(lease.generation) or lease.generation >= 2**63
+                    or (lease.machine is not None and not _MACHINE_HASH.fullmatch(lease.machine))
                     or not all(_positive(n) for n in (
                         lease.grant_dev, lease.grant_ino, lease.lock_dev, lease.lock_ino,
                         lease.lifetime_dev, lease.lifetime_ino,
@@ -50,22 +78,25 @@ class WorkerLease:
             raise ConnectionError(_RETRY) from None
 
     @classmethod
-    def capture(cls, job):
+    def capture(cls, job, host):
         root = job.root.name
-        if job.root.parent.as_posix() != _TEMP or not _LEAF.fullmatch(root):
+        if type(host) is not PhysicalHost or job.root.parent.as_posix() != _TEMP or not _LEAF.fullmatch(root):
             raise ConnectionError(_RETRY)
         with _grant(root) as (grant, lock, lifetime):
             lease = cls(root, job.incarnation, job.generation, *_identity(grant),
-                        *_identity(lock), *_identity(lifetime), _boot())
+                        *_identity(lock), *_identity(lifetime), host.boot, host.machine)
         return cls.parse(lease.record())
 
     def record(self):
         return asdict(self)
 
-    def terminal(self):
+    def terminal(self, host):
         """Publish terminal under the same inode fence used for each relay send."""
         try:
-            if _boot() != self.boot:
+            if (type(host) is not PhysicalHost or self.machine is None
+                    or host.machine != self.machine or not _BOOT_ID.fullmatch(host.boot)):
+                raise ConnectionError(_RETRY)
+            if host.boot != self.boot:
                 return
             with _grant(self.root) as (grant, lock, lifetime):
                 self._verify(grant, lock, lifetime)
@@ -99,6 +130,12 @@ class WorkerLease:
             self.grant_dev, self.grant_ino, self.lock_dev, self.lock_ino, self.lifetime_dev, self.lifetime_ino,
         ):
             raise ConnectionError(_RETRY)
+
+
+@dataclass(frozen=True)
+class LeaseHostProof:
+    lease: WorkerLease
+    host: PhysicalHost
 
 
 def _identity(fd):

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from .connection_job import WorkerLease
+from .connection_job import LeaseHostProof, PhysicalHost, WorkerLease
 from .connection_state import ConnectionError, Store
 from .responses import AUTH_HOST, API_HOST, DISCOVERY, JWKS, MODELS, TOKEN
 from .responses import Cancellation, OpenAITransport, response_error
@@ -249,12 +249,14 @@ def _parse_tokens(value, now):
 
 
 class Connection:
-    def __init__(self, state_dir: Path, *, transport=None, verifier=None, browser=None, clock=None):
+    def __init__(self, state_dir: Path, *, transport=None, verifier=None, browser=None, clock=None,
+                 host_probe=None):
         self._store = Store(Path(state_dir))
         self._transport = transport if transport is not None else OpenAITransport()
         self._verifier = verifier if verifier is not None else IDTokenVerifier()
         self._browser = browser if browser is not None else _open_host_browser
         self._clock = clock if clock is not None else time.time
+        self._host_probe = host_probe if host_probe is not None else PhysicalHost.observe
         self._running = {}
         self._running_lock = threading.Lock()
 
@@ -274,6 +276,28 @@ class Connection:
         if record.get("scope_missing"):
             return "chatgpt_plan_scope_missing"
         return "disconnected"
+
+    @staticmethod
+    def _uncertain(record):
+        return (record.get("revocation_unconfirmed") is True
+                or record.get("pending", {}).get("may_have_sent") is True
+                or record.get("refresh_pending", {}).get("may_have_sent") is True)
+
+    def revocation_unconfirmed(self):
+        """Report durable possible issuance or rotation independent of selection."""
+        with self._store.locked() as directory:
+            return self._uncertain(self._store.read(directory))
+
+    def reclaimable_registration(self, *, abandoned_attempt=False):
+        """Check label eligibility. Abandonment requires the exclusive Connect lifetime lock."""
+        with self._store.locked() as directory:
+            record = self._store.read(directory)
+            if "pending" in record and abandoned_attempt is not True:
+                return False
+            return not self._uncertain(record) and not {
+                "client", "pending_client", "tokens", "refresh_pending",
+                "worker_lease", "worker_retiring", "retiring",
+            }.intersection(record) and record.get("registration_observed") is not True
 
     def binding(self):
         with self._store.locked() as directory:
@@ -311,7 +335,7 @@ class Connection:
 
     @contextlib.contextmanager
     def worker_lease(self, binding, job):
-        lease = WorkerLease.capture(job)
+        lease = WorkerLease.capture(job, self._host_probe())
         with self._store.locked() as directory:
             record = self._store.read(directory)
             if not _active(record, binding) or "worker_lease" in record:
@@ -371,7 +395,8 @@ class Connection:
             for operation in self._running.get(generation, ()):
                 operation.cancel()
 
-    def _dispatch(self, check, cancellation, before_send=None, *, journal=None):
+    def _dispatch(self, check, cancellation, before_send=None, *, journal=None,
+                  authorization=contextlib.nullcontext):
         used = False
 
         def dispatch(write):
@@ -384,7 +409,7 @@ class Connection:
                     raise ConnectionError("openai_dispatch_already_attempted")
                 used = True
                 before_send()
-            with self._store.locked() as directory:
+            with authorization(), self._store.locked() as directory:
                 record = self._store.read(directory)
                 check(record)
                 cancellation.check()
@@ -398,19 +423,22 @@ class Connection:
                 return write()
         return dispatch
 
-    def connect(self, *, installation_host=None, publication=None):
+    def connect(self, *, installation_host=None, publication=None, authorization=None):
+        """Sign in within a short registry authorization guard at each local effect."""
         self.require_prerequisites()
+        authorize = authorization or contextlib.nullcontext
         generation = _random()
         state, nonce, pkce = _random(), _random(), _random()
         expires = self._clock() + CONNECT_SECONDS
         exchange_rejected = False
+        registration_observed = False
 
         def is_pending(record):
             if (record.get("generation") != generation
                     or self._clock() >= record.get("pending", {}).get("expires", 0)):
                 raise ConnectionError("connection_retired")
 
-        with self._store.locked(create=True) as directory:
+        with authorize(), self._store.locked(create=True) as directory:
             record = self._store.read(directory)
             if record.get("tokens"):
                 raise ConnectionError("openai_already_connected")
@@ -455,8 +483,11 @@ class Connection:
                         while server.result is None:
                             cancellation.check()
                             server.handle_request()
-                    kind, code, returned_client = server.result
-                with self._store.locked() as directory:
+                        kind, code, returned_client = server.result
+                        registration_observed = (client is None and kind == "ok" and
+                                                 isinstance(returned_client, str) and
+                                                 CLIENT.fullmatch(returned_client) is not None)
+                with authorize(), self._store.locked() as directory:
                     record = self._store.read(directory)
                     is_pending(record)
                     if record["pending"].get("consumed"):
@@ -469,6 +500,7 @@ class Connection:
                             raise ConnectionError("invalid_openai_callback")
                         client = returned_client
                         record["pending_client"] = client
+                        record["registration_observed"] = True
                     elif returned_client is not None and returned_client != client:
                         raise ConnectionError("invalid_openai_callback")
                     self._store.write(directory, record)
@@ -477,7 +509,8 @@ class Connection:
                                 "resource": RESOURCE})
                 status, value = self._transport.json(
                     AUTH_HOST, TOKEN, body=params, cancellation=cancellation,
-                    dispatch=self._dispatch(is_pending, cancellation, journal="pending"))
+                    dispatch=self._dispatch(is_pending, cancellation, journal="pending",
+                                            authorization=authorize))
                 if status != 200:
                     exchange_rejected = status == 400 and value.get("error") == "invalid_grant"
                     raise ConnectionError("openai_exchange_failed")
@@ -494,7 +527,7 @@ class Connection:
                 scope = value.get("scope")
                 scope_missing = not isinstance(scope, str) or DIRECT_SCOPE not in scope.split()
                 tokens = None if scope_missing else _parse_tokens(value, self._clock())
-                publish = publication(client) if publication is not None and not scope_missing else contextlib.nullcontext()
+                publish = publication(client) if publication is not None and not scope_missing else authorize()
                 with publish:
                     with self._store.locked() as directory:
                         record = self._store.read(directory)
@@ -515,12 +548,21 @@ class Connection:
         finally:
             with self._store.locked() as directory:
                 record = self._store.read(directory)
+                changed = False
                 if record.get("generation") == generation:
                     pending = record.pop("pending", None)
                     if pending:
                         if pending.get("may_have_sent") and not exchange_rejected:
                             record["revocation_unconfirmed"] = True
-                        self._store.write(directory, record)
+                        changed = True
+                if (registration_observed and record.get("profile") == profile
+                        and record.get("host_id") == host_id and record.get("registration_observed") is not True):
+                    # Retain the observation after retirement without binding
+                    # the old client or changing another generation's attempt.
+                    record["registration_observed"] = True
+                    changed = True
+                if changed:
+                    self._store.write(directory, record)
 
     def _refresh(self, binding, *, deadline=None, cancelled=None):
         wait_until = time.monotonic() + REFRESH_SECONDS + 1
@@ -675,9 +717,20 @@ class Connection:
                 yield guarded()
 
     def disconnect(self):
-        return self.finish_disconnect(self.begin_disconnect())
+        return self.finish_disconnect(self.begin_disconnect(
+            physical_host=self.physical_host_for_retirement()))
 
-    def begin_disconnect(self):
+    def physical_host_for_retirement(self):
+        """Collect host evidence for one exact lease without holding the store lock."""
+        with self._store.locked() as directory:
+            record = self._store.read(directory)
+            lease = WorkerLease.parse(record["worker_lease"]) if "worker_lease" in record else None
+        if lease is None:
+            return None
+        host = self._host_probe()
+        return LeaseHostProof(lease, host) if type(host) is PhysicalHost else None
+
+    def begin_disconnect(self, *, physical_host=None):
         """Order local token and worker retirement before any provider I/O."""
         generation = _random()
         with self._store.locked() as directory:
@@ -689,7 +742,10 @@ class Connection:
             if "worker_lease" in record:
                 record["worker_retiring"] = True
                 self._store.write(directory, record)
-                WorkerLease.parse(record["worker_lease"]).terminal()
+                lease = WorkerLease.parse(record["worker_lease"])
+                host = (physical_host.host if type(physical_host) is LeaseHostProof
+                        and physical_host.lease == lease else None)
+                lease.terminal(host)
                 record.pop("worker_lease")
             record.pop("worker_retiring", None)
             previous = record.get("generation")

@@ -18,11 +18,15 @@ feature is merged.
 ## Inference and exposure
 
 `connect LABEL` enrolls a local registration after the privacy notice.
-Use `status` to see its label and `select LABEL` to switch registrations.
+Use `status` to see the active label, saved registrations, and any
+unconfirmed OpenAI revocation from a current or interrupted connection.
+Use `select LABEL` to switch registrations.
 `accept` requires fresh consent for the fixed GPT proposal and again
 for a disposable OpenCode worker to write one known file. No project
-files are used. The proof reports success only after the two worker
-phases and exact cleanup are verified.
+files are used. The continuation returns the approved outcome and any
+encrypted reasoning from OpenAI to that same endpoint. The replay stays
+in workstation memory. The proof reports success after verifying both
+worker phases and cleanup.
 
 Review the app's ChatGPT usage and credit settings before approving.
 The proposal reserves up to 922,000 input and 128,000 output tokens.

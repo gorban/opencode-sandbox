@@ -37,6 +37,7 @@ class Broker:
         self._clients = {}
         self._phase = "pending"
         self._initial = None
+        self._continuation = None
         self._cancel = None
         self._listener = None
         self._thread = None
@@ -96,7 +97,11 @@ class Broker:
             protocol.request(raw, WORKER_MODEL, output)
             if phase == "continuation":
                 self.job.assert_file(protocol.PROOF_BYTES)
-            body = protocol.body_for(self.job.model, output)
+                body = self._continuation
+                protocol.require(body is not None)
+                self._continuation = None
+            else:
+                body = protocol.body_for(self.job.model)
             self._phase = phase + "_dispatch"
             cancel = self._cancel = threading.Event()
             try:
@@ -152,7 +157,10 @@ class Broker:
             protocol.require(self.job.lease.active() and not self._stopped.is_set()
                              and self._phase == phase + "_receipt")
             if phase == "initial":
-                self._initial = tuple(terminal["output"])
+                # The generation-bound receipt confirms handoff of this
+                # validated terminal response. Only its replay can be used.
+                self._initial = tuple(terminal.native["output"])
+                self._continuation = terminal.continuation
                 self._phase = "continuation"
             else:
                 self._phase = "complete"
@@ -174,7 +182,7 @@ class Broker:
             raw = read_exact(peer, size, deadline)
             phase, body, cancel = self._reserve(raw)
             terminal = self._response(peer, phase, body, cancel)
-            frames = b"".join(protocol.project({**terminal, "model": WORKER_MODEL}))
+            frames = b"".join(protocol.project({**terminal.native, "model": WORKER_MODEL}))
             response = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n"
                         + f"Content-Length: {len(frames)}\r\n\r\n".encode("ascii") + frames)
             with self.job.lease.fence(), self._state:
@@ -194,6 +202,7 @@ class Broker:
             if phase is not None and not confirmed:
                 with self._state:
                     self._phase = "failed"
+                    self._continuation = None
                     self._cancel.set()
                     self.done.set()
                     self._state.notify_all()
@@ -209,6 +218,7 @@ class Broker:
     def close(self):
         self._stopped.set()
         with self._state:
+            self._continuation = None
             if self._cancel is not None:
                 self._cancel.set()
             self._state.notify_all()

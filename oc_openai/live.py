@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import pwd
+import re
 import time
 
 from .cli import (
@@ -21,6 +22,7 @@ from .cli import (
 )
 from .connection import Binding, ConnectionError
 from .exposure import ExposureError, Phase, Slot, binding_digest
+from .responses import MAX_EVENTS
 
 
 _CONNECTION_REASONS = {
@@ -34,6 +36,7 @@ _CONNECTION_REASONS = {
     "openai_reconnect_required": Reason.CONNECTION_CHANGED,
 }
 _PROVIDER_TERMINALS = {"response.completed", "response.failed", "response.incomplete", "error"}
+_RESPONSE_ID = re.compile(r"resp_[A-Za-z0-9_-]{1,123}")
 
 
 def _proposal_body():
@@ -43,6 +46,13 @@ def _proposal_body():
         "store": False,
         "stream": True,
     }
+
+
+def _response_id(response):
+    identity = response.get("id") if type(response) is dict else None
+    if type(identity) is not str or not _RESPONSE_ID.fullmatch(identity):
+        raise RouteUnavailable(Reason.PROOF_FAILED)
+    return identity
 
 
 def _usage(response):
@@ -164,23 +174,40 @@ class WorkstationBackend:
 
     def events(self, binding, slot, body, before_send, *, deadline=None, cancelled=None) -> Iterator[dict]:
         _running(deadline, cancelled)
+        created_id = None
         terminal = None
+        staged = []
         options = {"deadline": deadline, "cancelled": cancelled} if deadline is not None else {}
         with self.connection_state.responses(binding, body, before_send, **options) as events:
-            for event in events:
+            for count, event in enumerate(events, 1):
                 _running(deadline, cancelled)
-                if terminal is not None or type(event) is not dict or type(event.get("type")) is not str:
+                if (count > MAX_EVENTS or terminal is not None or type(event) is not dict
+                        or type(event.get("type")) is not str):
                     raise RouteUnavailable(Reason.PROOF_FAILED)
                 kind = event["type"]
+                if created_id is None:
+                    if kind != "response.created":
+                        raise RouteUnavailable(Reason.PROOF_FAILED)
+                    created_id = _response_id(event.get("response"))
+                elif kind == "response.created":
+                    raise RouteUnavailable(Reason.PROOF_FAILED)
                 if kind == "response.completed":
+                    if _response_id(event.get("response")) != created_id:
+                        raise RouteUnavailable(Reason.PROOF_FAILED)
                     terminal = event
                 elif kind in _PROVIDER_TERMINALS:
                     raise RouteUnavailable(Reason.PROOF_FAILED)
                 else:
-                    yield event
+                    # The transport already caps each frame and aggregate bytes.
+                    # Keep tool semantics downstream of accounting so even an
+                    # unacceptable tool result can have authoritative usage.
+                    staged.append(event)
             if terminal is None:
                 raise RouteUnavailable(Reason.PROOF_FAILED)
             self.ledger.settle(slot, *_usage(terminal.get("response")))
+            for event in staged:
+                _running(deadline, cancelled)
+                yield event
             _running(deadline, cancelled)
             yield terminal
 

@@ -113,6 +113,8 @@ class FixtureTransport:
         self.next_tokens = {**self.tokens, "access_token": "next-access",
                             "refresh_token": "next-refresh"}
         self.token_block = None
+        self.before_token_dispatch = None
+        self.record_token_dispatch = None
         self.token_started = threading.Event()
         self.revoke_block = None
         self.revoke_started = threading.Event()
@@ -128,8 +130,17 @@ class FixtureTransport:
     def json(self, host, path, *, cancellation, dispatch, body=None, bearer=None,
              revocation=False):
         form = parse_qs(body.decode()) if body else None
-        dispatch(lambda: self.calls.append((host, path, form, bearer)))
-        if (host, path) == (AUTH_HOST, TOKEN):
+        token = (host, path) == (AUTH_HOST, TOKEN)
+        if token and self.before_token_dispatch is not None:
+            self.before_token_dispatch()
+
+        def written():
+            if token and self.record_token_dispatch is not None:
+                self.record_token_dispatch()
+            self.calls.append((host, path, form, bearer))
+
+        dispatch(written)
+        if token:
             self.token_started.set()
             if self.interrupt_token:
                 raise KeyboardInterrupt
@@ -211,9 +222,9 @@ class ConnectionTests(unittest.TestCase):
         self.addCleanup(worker.join, 4)
         return worker, result
 
-    def auth(self):
+    def auth(self, **options):
         try:
-            return self.connection.connect()
+            return self.connection.connect(**options)
         finally:
             if not self.browser.hold:
                 self.assertTrue(self.browser.finished.wait(2))
@@ -314,6 +325,147 @@ class ConnectionTests(unittest.TestCase):
         worker.join(3)
         self.assertEqual(result[0].code, "connection_retired")
         self.assertEqual(self.transport.calls, [])
+
+    def registry_authorization(self):
+        lock = threading.Lock()
+        state = {"valid": True}
+
+        @contextlib.contextmanager
+        def guard():
+            with lock:
+                if not state["valid"]:
+                    raise ConnectionError("profile_stale")
+                yield
+
+        def invalidate():
+            with lock:
+                state["valid"] = False
+
+        return guard, invalidate, lock
+
+    def test_candidate_invalidated_before_start_has_no_store_or_browser_effects(self):
+        guard, invalidate, _ = self.registry_authorization()
+        invalidate()
+        self.assert_code("profile_stale", lambda: self.connection.connect(authorization=guard))
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.browser.ready.is_set())
+        self.assertTrue(self.connection.reclaimable_registration())
+
+    def test_candidate_invalidated_during_browser_wait_cannot_journal_callback(self):
+        guard, invalidate, _ = self.registry_authorization()
+        self.browser.hold = True
+        worker, result = self.start(lambda: self.auth(authorization=guard))
+        self.assertTrue(self.browser.ready.wait(2))
+        self.assertFalse(self.connection.reclaimable_registration())
+        invalidate()
+        self.browser.send()
+        worker.join(3)
+        self.assertEqual(result[0].code, "profile_stale")
+        self.assertEqual(self.transport.calls, [])
+        snapshot = json.loads((self.state / "state.json").read_bytes())
+        self.assertNotIn("pending_client", snapshot)
+        self.assertTrue(snapshot["registration_observed"])
+        self.assertFalse(self.connection.reclaimable_registration())
+        self.assertFalse(self.connection.revocation_unconfirmed())
+
+    def test_candidate_invalidated_after_callback_before_write_has_no_exchange(self):
+        guard, invalidate, _ = self.registry_authorization()
+        self.transport.before_token_dispatch = invalidate
+        self.assert_code("profile_stale", lambda: self.auth(authorization=guard))
+        self.assertEqual(self.transport.calls, [])
+        self.assertFalse(self.connection.revocation_unconfirmed())
+        self.assertFalse(self.connection.reclaimable_registration())  # The issued client ID was observed.
+
+    def test_retirement_between_valid_callback_and_journal_preserves_issuance_only(self):
+        retired = self.make_connection()
+        newer_browser = FixtureBrowser()
+        newer_browser.hold = True
+        newer = Connection(self.state, transport=self.transport, verifier=self.verifier,
+                           browser=newer_browser, clock=lambda: self.now)
+        newer_attempt = []
+        authorizations = 0
+
+        @contextlib.contextmanager
+        def guard():
+            nonlocal authorizations
+            authorizations += 1
+            if authorizations == 2:
+                self.assertTrue(retired.disconnect())
+                newer_attempt.extend(self.start(newer.connect))
+                self.assertTrue(newer_browser.ready.wait(2))
+            yield
+
+        try:
+            self.assert_code("connection_retired", lambda: self.auth(authorization=guard))
+            snapshot = json.loads((self.state / "state.json").read_bytes())
+            self.assertTrue(snapshot["registration_observed"])
+            self.assertIn("pending", snapshot)
+            self.assertNotIn("consumed", snapshot["pending"])
+            self.assertNotIn("pending_client", snapshot)
+            self.assertNotIn("client", snapshot)
+            self.assertNotIn("tokens", snapshot)
+            self.assertEqual(self.transport.calls, [])
+        finally:
+            if newer_attempt:
+                self.assertTrue(newer.disconnect())
+                worker, result = newer_attempt
+                worker.join(3)
+                self.assertEqual(result[0].code, "connection_retired")
+        self.assertFalse(retired.reclaimable_registration())
+        self.assertFalse(retired.revocation_unconfirmed())
+
+    def test_candidate_invalidated_after_write_preserves_uncertainty(self):
+        guard, invalidate, lock = self.registry_authorization()
+        self.transport.token_block = threading.Event()
+
+        def written():
+            self.assertTrue(lock.locked())
+            # The atomic snapshot already carries uncertainty at the write boundary.
+            snapshot = json.loads((self.state / "state.json").read_bytes())
+            self.assertIs(snapshot["pending"]["may_have_sent"], True)
+
+        self.transport.record_token_dispatch = written
+        worker, result = self.start(lambda: self.auth(authorization=guard))
+        self.assertTrue(self.transport.token_started.wait(2))
+        invalidate()
+        self.transport.token_block.set()
+        worker.join(3)
+        self.assertEqual(result[0].code, "profile_stale")
+        self.assertEqual([call[1] for call in self.transport.calls].count(TOKEN), 1)
+        restarted = self.make_connection()
+        self.assertTrue(restarted.revocation_unconfirmed())
+        self.assertFalse(restarted.reclaimable_registration())
+        self.assertIsNone(restarted.saved_registration())
+
+    def test_untyped_uncertainty_never_classifies_registration_as_reclaimable(self):
+        self.auth()
+        with self.connection._store.locked() as directory:
+            snapshot = self.connection._store.read(directory)
+            snapshot["revocation_unconfirmed"] = "false"
+            self.connection._store.write(directory, snapshot)
+        for read in (self.connection.revocation_unconfirmed, self.connection.reclaimable_registration):
+            self.assert_code("invalid_connection_state", read)
+
+    def test_abandoned_attempt_reclaims_only_unissued_and_unambiguous_registration(self):
+        store = self.connection._store
+        pending = {"expires": self.now + 180}
+        with store.locked(create=True) as directory:
+            store.write(directory, {"pending": pending})
+        self.assertFalse(self.connection.reclaimable_registration())
+        self.assertTrue(self.connection.reclaimable_registration(abandoned_attempt=True))
+
+        for observed in (
+            {"pending": {**pending, "may_have_sent": True}},
+            {"pending_client": CLIENT},
+            {"registration_observed": True},
+            {"revocation_unconfirmed": True},
+            {"retiring": self.now + 35},
+            {"worker_retiring": True},
+        ):
+            with self.subTest(observed=observed):
+                with store.locked() as directory:
+                    store.write(directory, {"pending": pending, **observed})
+                self.assertFalse(self.connection.reclaimable_registration(abandoned_attempt=True))
 
     def test_parallel_refresh_uses_new_token_once_and_does_not_hold_state_lock(self):
         binding = self.auth()

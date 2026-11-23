@@ -48,6 +48,8 @@ class ConnectionBinding:
 class SavedProfile:
     label: str
     connected: bool
+    revocation_unconfirmed: bool = False
+    published: bool = True
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,7 @@ class Reason(Enum):
     BROWSER_REQUIRED = "browser_required"
     PROOF_FAILED = "proof_failed"
     PROFILE_BUSY = "profile_busy"
+    PROFILE_CONNECT_BUSY = "profile_connect_busy"
     PROFILE_NOT_FOUND = "profile_not_found"
     PROFILE_CONFLICT = "profile_conflict"
     MANAGED_RETIREMENT = "managed_retirement"
@@ -102,6 +105,7 @@ _UNAVAILABLE_MESSAGES = {
         "The managed OpenCode proof did not complete. Inspect the disposable worker cleanup evidence before trying again."
     ),
     Reason.PROFILE_BUSY: "A foreground ChatGPT request or worker proof is active. Wait for it to finish.",
+    Reason.PROFILE_CONNECT_BUSY: "A ChatGPT sign-in attempt is already active.",
     Reason.PROFILE_NOT_FOUND: "That saved ChatGPT registration is unavailable.",
     Reason.PROFILE_CONFLICT: "OpenAI returned a registration that conflicts with the saved labels.",
     Reason.MANAGED_RETIREMENT: "The selected registration still has a pending disconnection or worker retirement.",
@@ -109,6 +113,7 @@ _UNAVAILABLE_MESSAGES = {
 
 _PROFILE_REASONS = {
     "profile_busy": Reason.PROFILE_BUSY,
+    "profile_connect_busy": Reason.PROFILE_CONNECT_BUSY,
     "profile_stale": Reason.CONNECTION_CHANGED,
     "profile_unknown": Reason.PROFILE_NOT_FOUND,
     "profile_client_conflict": Reason.PROFILE_CONFLICT,
@@ -301,6 +306,8 @@ def _accept(terminal: Terminal, backend: Backend) -> int:
         f"Active registration: {binding.label}. GPT proposed the disposable local OpenCode proof. "
         "It writes one fixed scratch file. "
         f"The task and its fixed result use up to two separate OpenAI requests using {MODEL}. "
+        "The continuation returns the fixed file outcome and any OpenAI-provided encrypted "
+        "reasoning to the same endpoint. The encrypted reasoning stays outside the worker. "
         "This approval reserves up to 1,844,000 input and 256,000 output tokens in total. "
         "Review the app's OpenAI-managed usage and credit settings before approving. "
         "OpenAI may use your ChatGPT plan or account credits. There is no verified hard spending cap. "
@@ -326,7 +333,8 @@ def _local_status(backend: Backend) -> ConnectionStatus:
     for entry in status.saved:
         if (
             type(entry) is not SavedProfile or not valid_label(entry.label)
-            or type(entry.connected) is not bool or entry.label in labels
+            or type(entry.connected) is not bool or type(entry.revocation_unconfirmed) is not bool
+            or type(entry.published) is not bool or entry.label in labels
         ):
             raise RouteUnavailable
         labels.add(entry.label)
@@ -342,7 +350,10 @@ def _show_status(terminal: Terminal, status: ConnectionStatus) -> None:
     for entry in status.saved:
         active = ", active" if entry.label == status.active else ""
         connection = "connected" if entry.connected else "disconnected"
-        terminal.write(f"{entry.label} ({connection}{active})")
+        if not entry.published:
+            connection = "sign-in incomplete"
+        revocation = ", remote revocation unconfirmed" if entry.revocation_unconfirmed else ""
+        terminal.write(f"{entry.label} ({connection}{active}{revocation})")
     if status.active is None:
         terminal.write("No saved registration is active.")
 

@@ -119,6 +119,7 @@ class OpenAICommandTests(unittest.TestCase):
         self.assertIn("1,844,000 input and 256,000 output", output)
         self.assertEqual(output.count("There is no verified hard spending cap."), 2)
         self.assertEqual(output.count("API-key fallback is disabled."), 2)
+        self.assertIn("OpenAI-provided encrypted", output)
 
     def test_declines_at_each_stage(self):
         for approvals, effects in [((False,), []), ((True, False), ["inference"])]:
@@ -229,6 +230,20 @@ class OpenAICommandTests(unittest.TestCase):
         terminal = FakeTerminal()
         self.assertEqual(self.call(terminal, "status"), 1)
         self.assertNotIn(CANARY, "\n".join(terminal.output))
+
+    def test_status_marks_revocation_uncertainty_per_label_including_unpublished(self):
+        self.backend.local_status = ConnectionStatus((
+            SavedProfile("personal", True),
+            SavedProfile("work", False, True),
+            SavedProfile("pending", False, True, False),
+        ), "personal")
+        terminal = FakeTerminal()
+        self.assertEqual(self.call(terminal, "status"), 0)
+        self.assertEqual(terminal.output, [
+            "personal (connected, active)",
+            "work (disconnected, remote revocation unconfirmed)",
+            "pending (sign-in incomplete, remote revocation unconfirmed)",
+        ])
 
     def test_placement_failure_precedes_both_prompts_and_all_effects(self):
         self.backend.preflight_error = RouteUnavailable(Reason.PLACEMENT)

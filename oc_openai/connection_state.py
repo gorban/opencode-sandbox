@@ -45,13 +45,16 @@ def _timestamp(value):
 
 
 def _valid_record(value):
-    if not isinstance(value, dict) or value.get("version") != 1:
+    if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 1:
         return False
     for key in ("generation", "profile", "host_id", "client", "pending_client", "subject"):
         if key in value and (not isinstance(value[key], str) or not value[key]):
             return False
     for key in ("retiring", "refresh_retry_after"):
         if key in value and not _timestamp(value[key]):
+            return False
+    for key in ("revocation_unconfirmed", "scope_missing", "registration_observed"):
+        if key in value and type(value[key]) is not bool:
             return False
     pending = value.get("pending", {})
     if not isinstance(pending, dict) or ("pending" in value and not _timestamp(pending.get("expires"))):
@@ -60,6 +63,11 @@ def _valid_record(value):
     if not isinstance(refresh, dict) or ("refresh_pending" in value and (
         not _timestamp(refresh.get("until")) or not isinstance(refresh.get("ticket"), str)
     )):
+        return False
+    for transaction in (pending, refresh):
+        if "may_have_sent" in transaction and type(transaction["may_have_sent"]) is not bool:
+            return False
+    if "consumed" in pending and type(pending["consumed"]) is not bool:
         return False
     if "worker_retiring" in value and value["worker_retiring"] is not True:
         return False

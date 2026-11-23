@@ -1,5 +1,7 @@
 """Select one workstation registration for the fixed attended acceptance."""
 
+from pathlib import Path
+
 from .cli import ConnectionStatus, Reason, RouteUnavailable, SavedProfile
 from .connection import Connection, ConnectionError
 from .exposure import ExposureError, ExposureLedger
@@ -13,6 +15,7 @@ _LOCAL_ACCEPTANCE_REVIEWED = False
 
 class ProfileBackend:
     def __init__(self, state, *, connection=Connection, worker=None, reviewed=_LOCAL_ACCEPTANCE_REVIEWED):
+        self._state = Path(state)
         self.profiles = Profiles(state)
         self.ledger = ExposureLedger(state)
         self._connection = connection
@@ -47,12 +50,18 @@ class ProfileBackend:
     def status(self):
         view = self.profiles.snapshot()
         try:
-            saved = tuple(SavedProfile(profile.label, not profile.retiring and
-                                       self._connection(profile.directory).status() == "connected")
-                          for profile in view.saved)
+            saved = []
+            for profile in (*view.saved, *view.unpublished):
+                connection = self._connection(profile.directory)
+                uncertain = connection.revocation_unconfirmed()
+                published = profile.client_id is not None
+                if published or uncertain or not connection.reclaimable_registration():
+                    connected = published and not profile.retiring and connection.status() == "connected"
+                    saved.append(SavedProfile(profile.label, connected, uncertain, published))
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
-        return ConnectionStatus(saved, view.active.label if view.active is not None else None)
+        return ConnectionStatus(tuple(sorted(saved, key=lambda profile: profile.label)),
+                                view.active.label if view.active is not None else None)
 
     def _require_idle(self, previous, target):
         if previous is None or previous.directory == target.directory:
@@ -78,7 +87,18 @@ class ProfileBackend:
     def connect(self, label):
         if not self._reviewed:
             raise RouteUnavailable(Reason.QUALIFICATION)
-        candidate = self.profiles.begin(label)
+        try:
+            self._connection(self._state / "registrations").require_prerequisites()
+        except ConnectionError as error:
+            raise _mapped_connection_error(error) from None
+        with self.profiles.connect_candidate(
+            label, reclaim=lambda profile: self._connection(profile.directory).reclaimable_registration(
+                abandoned_attempt=True,
+            ),
+        ) as candidate:
+            self._connect_candidate(candidate)
+
+    def _connect_candidate(self, candidate):
         connection = self._connection(candidate.profile.directory)
         try:
             def publish(client_id):
@@ -86,29 +106,53 @@ class ProfileBackend:
 
             saved = connection.saved_registration()
             if saved is None:
-                connection.connect(installation_host=candidate.profile.host_id, publication=publish)
+                connection.connect(
+                    installation_host=candidate.profile.host_id, publication=publish,
+                    authorization=lambda: self.profiles.authorize(candidate),
+                )
             else:
                 client_id, binding = saved
                 with publish(client_id):
                     connection.require_active(binding)
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
-        finally:
-            self.profiles.abandon(candidate)
 
     def disconnect(self):
-        connection = retirement = None
+        observed = self.profiles.selected()
+        physical_host = None
+        if observed is not None:
+            try:
+                physical_host = self._connection(observed.directory).physical_host_for_retirement()
+            except (ConnectionError, OSError):
+                pass
+
+        retirements = []
+        errors = []
 
         def retire(profile):
-            nonlocal connection, retirement
             connection = self._connection(profile.directory)
-            retirement = connection.begin_disconnect()
+            placement = physical_host if observed is not None and profile.directory == observed.directory else None
+            try:
+                if profile.client_id is not None and not profile.selected and connection.status() == "connected":
+                    return False
+                retirement = connection.begin_disconnect(physical_host=placement)
+            except ConnectionError as error:
+                raise _mapped_connection_error(error) from None
+            retirements.append((connection, retirement))
 
+        confirmed = True
         try:
             self.profiles.begin_disconnect(retire)
-            return connection.finish_disconnect(retirement) if connection is not None else True
-        except ConnectionError as error:
-            raise _mapped_connection_error(error) from None
+        finally:
+            for connection, retirement in retirements:
+                try:
+                    if not connection.finish_disconnect(retirement):
+                        confirmed = False
+                except ConnectionError as error:
+                    errors.append(error)
+        if errors:
+            raise _mapped_connection_error(errors[0]) from None
+        return confirmed
 
     def require_acceptance(self):
         if not self._reviewed:

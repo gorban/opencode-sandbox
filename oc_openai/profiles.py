@@ -38,6 +38,7 @@ class Profile:
     epoch: str
     client_id: str | None = field(repr=False)
     retiring: bool = False
+    selected: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class Candidate:
 class RegistryView:
     saved: tuple[Profile, ...]
     active: Profile | None
+    unpublished: tuple[Profile, ...] = ()
 
 
 def _matches(value, pattern):
@@ -121,7 +123,7 @@ class Profiles:
         entry = state["registrations"][label]
         return Profile(
             label, self._root / "registrations" / entry["key"], state["host_id"], state["epoch"],
-            entry["client_id"], entry["retiring"],
+            entry["client_id"], entry["retiring"], state["active"] == label,
         )
 
     def snapshot(self) -> RegistryView:
@@ -132,8 +134,12 @@ class Profiles:
                 self._profile(state, label) for label, entry in sorted(state["registrations"].items())
                 if entry["client_id"] is not None
             )
+            unpublished = tuple(
+                self._profile(state, label) for label, entry in sorted(state["registrations"].items())
+                if entry["client_id"] is None
+            )
             active = state["active"]
-            return RegistryView(saved, self._profile(state, active) if active is not None else None)
+            return RegistryView(saved, self._profile(state, active) if active is not None else None, unpublished)
 
     def list(self) -> tuple[Profile, ...]:
         return self.snapshot().saved
@@ -141,7 +147,10 @@ class Profiles:
     def selected(self) -> Profile | None:
         return self.snapshot().active
 
-    def begin(self, label: str) -> Candidate:
+    def begin(self, label: str, *, reclaim=None) -> Candidate:
+        return self._begin(label, reclaim, abandoned_pending=False)
+
+    def _begin(self, label: str, reclaim, *, abandoned_pending: bool) -> Candidate:
         if not valid_label(label):
             raise ProfileError("profile_invalid_label")
         with self._state(create=True) as (directory, state):
@@ -156,27 +165,76 @@ class Profiles:
             entries = state["registrations"]
             if label not in entries:
                 if len(entries) >= _MAX_REGISTRATIONS:
-                    raise ProfileError("profile_limit")
+                    self._make_room(state, reclaim, abandoned_pending=abandoned_pending)
                 entries[label] = {"key": secrets.token_hex(16), "client_id": None, "pending": None, "retiring": False}
             pending = secrets.token_urlsafe(32)
             entries[label]["pending"] = pending
             self._write(directory, state)
             return Candidate(self._profile(state, label), pending)
 
-    def abandon(self, candidate: Candidate) -> None:
-        with self._state() as (directory, state):
-            entry = state.get("registrations", {}).get(candidate.profile.label)
-            if entry is not None and entry["pending"] == candidate.pending_generation:
-                entry["pending"] = None
-                self._write(directory, state)
+    def _make_room(self, state, reclaim, *, abandoned_pending: bool):
+        if reclaim is not None:
+            entries = state["registrations"]
+            for label, entry in entries.items():
+                if (
+                    entry["client_id"] is None and (abandoned_pending or entry["pending"] is None)
+                    and reclaim(self._profile(state, label)) is True
+                ):
+                    # Reuse only the registry slot. The opaque directory remains untouched.
+                    del entries[label]
+                    return
+        raise ProfileError("profile_limit")
 
     @contextmanager
+    def connect_candidate(self, label: str, *, reclaim=None):
+        """Own the sign-in attempt through exact cleanup, independently of inference and retirement."""
+        with self._exclusive("connect.lock", "profile_connect_busy"):
+            candidate = self._begin(label, reclaim, abandoned_pending=True)
+            try:
+                yield candidate
+            finally:
+                self.abandon(candidate, reclaim=reclaim)
+
+    def abandon(self, candidate: Candidate, *, reclaim=None) -> None:
+        with self._state() as (directory, state):
+            label = candidate.profile.label
+            entries = state.get("registrations", {})
+            entry = entries.get(label)
+            if (
+                entry is not None and entry["pending"] == candidate.pending_generation
+                and self._profile(state, label).directory == candidate.profile.directory
+            ):
+                if entry["client_id"] is None and reclaim is not None and reclaim(self._profile(state, label)) is True:
+                    del entries[label]
+                else:
+                    entry["pending"] = None
+                self._write(directory, state)
+
+    def _candidate_entry(self, state, candidate):
+        label = candidate.profile.label
+        entry = state.get("registrations", {}).get(label)
+        if (entry is None or self._profile(state, label) != candidate.profile
+                or entry["pending"] != candidate.pending_generation):
+            raise ProfileError("profile_stale")
+        return entry
+
+    @contextmanager
+    def authorize(self, candidate: Candidate):
+        """Hold the exact selection and attempt fence for one short local action."""
+        with self._state() as (_, state):
+            self._candidate_entry(state, candidate)
+            yield
+
     def foreground(self):
+        return self._exclusive("foreground.lock", "profile_busy")
+
+    @contextmanager
+    def _exclusive(self, name, busy):
         try:
             directory = _directory(self._store.path, create=True)
             try:
                 mutex = os.open(
-                    "foreground.lock", os.O_RDWR | os.O_NONBLOCK | os.O_CREAT | CREATE_FLAGS,
+                    name, os.O_RDWR | os.O_NONBLOCK | os.O_CREAT | CREATE_FLAGS,
                     0o600, dir_fd=directory,
                 )
             finally:
@@ -188,7 +246,7 @@ class Profiles:
                 _regular(mutex)
                 fcntl.flock(mutex, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise ProfileError("profile_busy") from None
+                raise ProfileError(busy) from None
             except (OSError, ConnectionError):
                 raise ProfileError("profile_storage_unavailable") from None
             yield
@@ -201,11 +259,8 @@ class Profiles:
             raise ProfileError("profile_client_conflict")
         label = candidate.profile.label
         with self.foreground(), self._state() as (directory, state):
-            entries = state.get("registrations", {})
-            entry = entries.get(label)
-            if (entry is None or self._profile(state, label) != candidate.profile
-                    or entry["pending"] != candidate.pending_generation):
-                raise ProfileError("profile_stale")
+            entry = self._candidate_entry(state, candidate)
+            entries = state["registrations"]
             if (
                 entry["client_id"] not in (None, client_id)
                 or any(other["client_id"] == client_id for name, other in entries.items() if name != label)
@@ -239,9 +294,16 @@ class Profiles:
             if not state:
                 return None
             label = state.get("active")
-            if label is not None:
-                before_retirement(self._profile(state, label))
-                state["registrations"][label]["retiring"] = True
+            entries = state["registrations"]
+            targets = [label] if label is not None else []
+            targets.extend(
+                name for name, entry in sorted(entries.items())
+                if name != label and (entry["pending"] is not None or entry["client_id"] is None)
+            )
+            for name in targets:
+                fenced = before_retirement(self._profile(state, name))
+                if fenced is not False and entries[name]["client_id"] is not None:
+                    entries[name]["retiring"] = True
             state["epoch"] = secrets.token_urlsafe(32)
             self._write(directory, state)
             return self._profile(state, label) if label is not None else None

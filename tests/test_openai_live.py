@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 from copy import deepcopy
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ import unittest
 from oc_openai import cli, live
 from oc_openai.connection import Binding, ConnectionError
 from oc_openai.exposure import ExposureLedger
-from oc_openai.managed.protocol import body_for
+from oc_openai.managed.protocol import body_for, validate
 from oc_openai.worker import WorkerEvidence, run_worker
 from test_openai_worker import fixture_events
 
@@ -45,6 +46,7 @@ class FakeConnection:
         self.catalog = (MODEL,)
         self.calls = []
         self.proposal = list(proposal_events())
+        self.worker_events = fixture_events
 
     def require_prerequisites(self):
         pass
@@ -75,7 +77,7 @@ class FakeConnection:
         if "instructions" not in body:
             yield iter(self.proposal)
         else:
-            yield fixture_events(body, deadline=deadline, cancelled=cancelled)
+            yield self.worker_events(body, deadline=deadline, cancelled=cancelled)
 
 
 class Terminal:
@@ -172,6 +174,57 @@ class LiveBackendTests(unittest.TestCase):
         self.assertEqual(self.accept(Terminal(True), self.backend()), 1)
         self.assertEqual(len(self.connection.calls), 1)
 
+    def test_unbound_terminal_usage_keeps_a_hold_across_reopen(self):
+        created, completed = list(proposal_events())
+        response = completed["response"]
+        cases = {
+            "missing created": [completed],
+            "duplicate created": [created, created, completed],
+            "duplicate terminal": [created, completed, completed],
+            "missing created ID": [{"type": "response.created", "response": {}}, completed],
+            "missing terminal ID": [created, {**completed, "response": {
+                key: value for key, value in response.items() if key != "id"
+            }}],
+            "wrong terminal ID": [created, {**completed, "response": {**response, "id": "resp_other"}}],
+            "wrong terminal model": [created, {**completed, "response": {**response, "model": "other"}}],
+            "wrong terminal status": [created, {**completed, "response": {**response, "status": "incomplete"}}],
+        }
+        for name, events in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as scratch:
+                self.state = Path(scratch)
+                self.connection = FakeConnection(self.state)
+                self.ledger = ExposureLedger(self.state)
+                self.connection.proposal = events
+                self.assertEqual(self.accept(Terminal(True), self.backend()), 1)
+                records = json.loads((self.state / "exposure.json").read_text())
+                self.assertEqual(len(records), 1)
+                self.assertIsNone(records[0]["actual"])
+                self.connection.proposal = list(proposal_events())
+                self.ledger = ExposureLedger(self.state)
+                self.assertEqual(self.accept(Terminal(True), self.backend()), 1)
+                self.assertEqual(len(self.connection.calls), 1)
+
+    def test_authoritative_worker_overage_precedes_tool_semantics(self):
+        def overage_events(body, **bounds):
+            for event in fixture_events(body, **bounds):
+                if event["type"] == "response.completed":
+                    yield {"type": "response.output_item.added", "item": {"type": "unapproved_tool"}}
+                    event["response"]["usage"] = {
+                        "input_tokens": 3, "output_tokens": 128001, "total_tokens": 128004,
+                    }
+                yield event
+
+        def validate_initial(events, *, model, before_dispatch, lease_guard):
+            cancelled = threading.Event()
+            before_dispatch("initial")
+            return validate(events(body_for(model), deadline=time.monotonic() + 5, cancelled=cancelled),
+                            model, True, cancelled)
+
+        self.connection.worker_events = overage_events
+        self.assertEqual(self.accept(Terminal(True, True), self.backend(worker=validate_initial)), 1)
+        records = json.loads((self.state / "exposure.json").read_text())
+        self.assertEqual([record["actual"] for record in records], [[3, 7], [3, 128001]])
+
     def test_marker_mismatch_stops_without_printing_provider_output(self):
         private = "do not project this unapproved string"
         self.connection.proposal = list(proposal_events(private))
@@ -187,9 +240,12 @@ class LiveBackendTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("OC_OPENAI_WORKER_REAL") == "1", "requires pinned Podman/devbox host")
     def test_full_cli_with_pinned_native_opencode_and_fake_upstream(self):
+        self.connection.worker_events = partial(fixture_events, reasoning=True)
         terminal = Terminal(True, True)
         self.assertEqual(self.accept(terminal, self.backend(worker=run_worker)), 0, terminal.output)
         self.assertEqual(len(self.connection.calls), 3)
+        self.assertNotIn("host_reasoning_ciphertext", "\n".join(terminal.output))
+        self.assertNotIn("host_reasoning_ciphertext", (self.state / "exposure.json").read_text())
 
 
 if __name__ == "__main__":
