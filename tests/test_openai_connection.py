@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from oc_openai.connection import (AUTHORIZE, Binding, Connection, ConnectionError,
@@ -51,6 +52,8 @@ class FixtureBrowser:
         self.redirect = None
         self.mode = None
         self.referrer = None
+        self.callback_status = 200
+        self.callback_body = None
 
     def __call__(self, target):
         class Meta(HTMLParser):
@@ -95,8 +98,8 @@ class FixtureBrowser:
                         response.read()
                 client.request("GET", address.path + "?" + urlencode(query))
                 response = client.getresponse()
-                response.read()
-                if response.status != 200:
+                self.callback_body = response.read()
+                if response.status != self.callback_status:
                     raise AssertionError(f"unexpected callback status {response.status}")
         except BaseException as error:
             self.assertions = error
@@ -375,6 +378,21 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(self.transport.calls, [])
         self.assertFalse(self.connection.revocation_unconfirmed())
         self.assertFalse(self.connection.reclaimable_registration())  # The issued client ID was observed.
+
+    def test_callback_acknowledgement_fails_closed_when_observation_cannot_commit(self):
+        self.browser.callback_status = 503
+        original = self.connection._store.write
+
+        def fail_observation(directory, record):
+            if record.get("registration_observed") is True:
+                raise ConnectionError("connection_storage_unavailable")
+            original(directory, record)
+
+        with patch.object(self.connection._store, "write", side_effect=fail_observation):
+            self.assert_code("connection_storage_unavailable", self.auth)
+        self.assertEqual(self.browser.callback_body,
+                         b"Callback unavailable. Return to the oc-sandbox terminal.")
+        self.assertEqual(self.transport.calls, [])
 
     def test_retirement_between_valid_callback_and_journal_preserves_issuance_only(self):
         retired = self.make_connection()

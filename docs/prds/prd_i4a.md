@@ -79,7 +79,8 @@ into any worker. [Sign-in guide](https://developers.openai.com/siwc/token-sharin
   and generation. Reject duplicate issued clients across labels. Keep
   pending sign-in separate until identity and scope are verified. Fence the
   exact attempt and selection epoch before the first exchange write and
-  again before publishing. A failed or stale attempt preserves the active
+  again before publishing. Persist observation of a valid issued client
+  before acknowledging the callback. A failed or stale attempt preserves the active
   selection. One nonblocking sign-in lifetime lock covers reservation
   through cleanup. Reclaim an abandoned label at capacity only when
   durable state shows no issuance or possible exchange.
@@ -117,8 +118,8 @@ into any worker. [Sign-in guide](https://developers.openai.com/siwc/token-sharin
   first upstream byte can be sent. Crash, unknown send and missing valid
   usage retain the reservation across restart and connection retirement,
   so they cannot create another send or fresh headroom. Validate
-  one matching `response.created` and `response.completed` identity and
-  authenticated terminal usage before accepting success. Record an
+  one matching `response.created` and `response.completed` identity,
+  consistent model, and authenticated terminal usage before accepting success. Record an
   authoritative usage overage and suspend future inference. A failed,
   truncated, over-limit, or unknown send does not earn a replacement request. Closing local I/O is not proof that OpenAI stopped work.
 

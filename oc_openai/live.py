@@ -188,7 +188,10 @@ class WorkstationBackend:
                 if created_id is None:
                     if kind != "response.created":
                         raise RouteUnavailable(Reason.PROOF_FAILED)
-                    created_id = _response_id(event.get("response"))
+                    created = event.get("response")
+                    created_id = _response_id(created)
+                    if created.get("model", MODEL) != MODEL:
+                        raise RouteUnavailable(Reason.PROOF_FAILED)
                 elif kind == "response.created":
                     raise RouteUnavailable(Reason.PROOF_FAILED)
                 if kind == "response.completed":

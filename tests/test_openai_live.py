@@ -138,6 +138,7 @@ class LiveBackendTests(unittest.TestCase):
             self.assertFalse(expected.exists())
 
     def test_full_cli_reserves_exact_sequence_and_validates_evidence(self):
+        self.connection.proposal[0]["response"].pop("model")
         terminal = Terminal(True, True)
         self.assertEqual(self.accept(terminal, self.backend()), 0, terminal.output)
         self.assertEqual(len(self.connection.calls), 3)
@@ -186,6 +187,7 @@ class LiveBackendTests(unittest.TestCase):
                 key: value for key, value in response.items() if key != "id"
             }}],
             "wrong terminal ID": [created, {**completed, "response": {**response, "id": "resp_other"}}],
+            "wrong created model": [{**created, "response": {**created["response"], "model": "other"}}, completed],
             "wrong terminal model": [created, {**completed, "response": {**response, "model": "other"}}],
             "wrong terminal status": [created, {**completed, "response": {**response, "status": "incomplete"}}],
         }

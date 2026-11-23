@@ -1,6 +1,7 @@
 """Exercise registry and connection publication through the workstation facade."""
 
 from contextlib import contextmanager
+import json
 from pathlib import Path
 import os
 import pwd
@@ -273,6 +274,60 @@ with profiles.connect_candidate("crashed") as candidate:
                     self.assertEqual(backend.active_label(), "new")
                     self.assertEqual(backend.profiles.snapshot().unpublished, ())
                 self.assertTrue(crashed.directory.exists())
+
+    def test_acknowledged_callback_survives_crash_before_exchange_and_preserves_slot(self):
+        backend = self.backend()
+        for index in range(15):
+            saved = backend.profiles.begin(f"saved-{index}")
+            with backend.profiles.publish(saved, f"oaiapp_fixture_{index}"):
+                pass
+        tests = Path(__file__).resolve().parent
+        result = subprocess.run([sys.executable, "-B", "-c", """
+import contextlib
+import os
+from pathlib import Path
+import sys
+from oc_openai.connection import Connection
+from oc_openai.profiles import Profiles
+from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+
+profiles = Profiles(Path(sys.argv[1]))
+browser = FixtureBrowser()
+transport = FixtureTransport()
+with profiles.connect_candidate("crashed") as candidate:
+    connection = Connection(candidate.profile.directory, transport=transport,
+                            verifier=FixtureVerifier(), browser=browser)
+    admissions = 0
+
+    @contextlib.contextmanager
+    def authorize():
+        global admissions
+        admissions += 1
+        if admissions == 2:
+            if not browser.finished.wait(2) or browser.assertions is not None or transport.calls:
+                raise RuntimeError("Expected callback acknowledgement before provider request")
+            print("HTTP 200 received; no provider request", flush=True)
+            os._exit(73)
+        with profiles.authorize(candidate):
+            yield
+
+    connection.connect(installation_host=candidate.profile.host_id, authorization=authorize)
+""", str(self.state)], cwd=tests.parent, env={**os.environ, "PYTHONPATH": str(tests)},
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertEqual(result.stdout.strip(), "HTTP 200 received; no provider request")
+        (crashed,) = backend.profiles.snapshot().unpublished
+        self.assertEqual(crashed.label, "crashed")
+        record = json.loads((crashed.directory / "state.json").read_bytes())
+        self.assertEqual(set(record), {"version", "generation", "host_id", "profile",
+                                       "pending", "registration_observed"})
+        self.assertIs(record["registration_observed"], True)
+        self.assertEqual(set(record["pending"]), {"expires"})
+        self.assertFalse(self.connection(crashed.directory).revocation_unconfirmed())
+        with self.assertRaisesRegex(ProfileError, "^profile_limit$"):
+            backend.connect("new")
+        self.assertEqual(backend.profiles.snapshot().unpublished, (crashed,))
+        self.assertFalse(any(transport.calls for transport in self.transports.values()))
 
     def test_cross_process_disconnect_orders_pending_first_exchange(self):
         for send_first in (False, True):

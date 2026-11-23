@@ -187,11 +187,23 @@ class _Callback(http.server.BaseHTTPRequestHandler):
                 result = ("ok", code, client)
             if server.result is not None:
                 raise ValueError
+            if result[0] == "ok" and server.observe_registration is not None:
+                if not isinstance(client, str) or CLIENT.fullmatch(client) is None:
+                    raise ValueError
+                server.observe_registration()
             server.result = result
         except (UnicodeError, ValueError):
             result = None
-        content = (b"Return to the oc-sandbox terminal." if result else b"Invalid callback.")
-        self.send_response(200 if result else 400)
+        except ConnectionError as error:
+            server.failure = error
+            result = None
+        if server.failure is not None:
+            status, content = 503, b"Callback unavailable. Return to the oc-sandbox terminal."
+        elif result is not None:
+            status, content = 200, b"Return to the oc-sandbox terminal."
+        else:
+            status, content = 400, b"Invalid callback."
+        self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
@@ -431,7 +443,6 @@ class Connection:
         state, nonce, pkce = _random(), _random(), _random()
         expires = self._clock() + CONNECT_SECONDS
         exchange_rejected = False
-        registration_observed = False
 
         def is_pending(record):
             if (record.get("generation") != generation
@@ -460,6 +471,17 @@ class Connection:
             self._store.write(directory, record)
         self._cancel(previous)
 
+        def observe_registration():
+            with self._store.locked() as directory:
+                record = self._store.read(directory)
+                if record.get("profile") != profile or record.get("host_id") != host_id:
+                    raise ConnectionError("connection_retired")
+                # Retain issuance evidence across retirement without granting
+                # a stale callback any client, code or token authority.
+                if record.get("registration_observed") is not True:
+                    record["registration_observed"] = True
+                    self._store.write(directory, record)
+
         try:
             with self._operation(generation, is_pending, timeout=CONNECT_SECONDS) as cancellation:
                 dispatch = self._dispatch(is_pending, cancellation)
@@ -468,6 +490,8 @@ class Connection:
                     server.timeout = POLL_SECONDS
                     server.state = state
                     server.result = None
+                    server.failure = None
+                    server.observe_registration = observe_registration if client is None else None
                     redirect = f"http://127.0.0.1:{server.server_port}{CALLBACK}"
                     fields = {"client_id": client or INITIAL_CLIENT, "ext_agent_host_id": host_id,
                               "response_type": "code", "redirect_uri": redirect, "scope": SCOPES,
@@ -480,13 +504,12 @@ class Connection:
                     cancellation.check()
                     with self._store.browser_redirect(AUTHORIZE + "?" + urlencode(fields)) as target:
                         self._browser(target)
-                        while server.result is None:
+                        while server.result is None and server.failure is None:
                             cancellation.check()
                             server.handle_request()
+                        if server.failure is not None:
+                            raise server.failure
                         kind, code, returned_client = server.result
-                        registration_observed = (client is None and kind == "ok" and
-                                                 isinstance(returned_client, str) and
-                                                 CLIENT.fullmatch(returned_client) is not None)
                 with authorize(), self._store.locked() as directory:
                     record = self._store.read(directory)
                     is_pending(record)
@@ -500,7 +523,6 @@ class Connection:
                             raise ConnectionError("invalid_openai_callback")
                         client = returned_client
                         record["pending_client"] = client
-                        record["registration_observed"] = True
                     elif returned_client is not None and returned_client != client:
                         raise ConnectionError("invalid_openai_callback")
                     self._store.write(directory, record)
@@ -548,21 +570,12 @@ class Connection:
         finally:
             with self._store.locked() as directory:
                 record = self._store.read(directory)
-                changed = False
                 if record.get("generation") == generation:
                     pending = record.pop("pending", None)
                     if pending:
                         if pending.get("may_have_sent") and not exchange_rejected:
                             record["revocation_unconfirmed"] = True
-                        changed = True
-                if (registration_observed and record.get("profile") == profile
-                        and record.get("host_id") == host_id and record.get("registration_observed") is not True):
-                    # Retain the observation after retirement without binding
-                    # the old client or changing another generation's attempt.
-                    record["registration_observed"] = True
-                    changed = True
-                if changed:
-                    self._store.write(directory, record)
+                        self._store.write(directory, record)
 
     def _refresh(self, binding, *, deadline=None, cancelled=None):
         wait_until = time.monotonic() + REFRESH_SECONDS + 1
