@@ -1862,11 +1862,16 @@ class TestExternalReviewRegressions(InboxReadTestBase):
         from unittest import mock  # noqa: PLC0415
 
         real_close = os.close
+        hook_hits = 0
 
         def _fstat_boom(_fd: int) -> os.stat_result:
+            nonlocal hook_hits
+            hook_hits += 1
             raise OSError(errno.EIO, "fstat_io_error")
 
         def _close_boom(fd: int) -> None:
+            nonlocal hook_hits
+            hook_hits += 1
             real_close(fd)
             raise OSError(errno.EIO, "close_io_error")
 
@@ -1874,25 +1879,28 @@ class TestExternalReviewRegressions(InboxReadTestBase):
             ("os.fstat", _fstat_boom),
             ("os.close", _close_boom),
         ):
+            hook_hits = 0
             with (
                 mock.patch(patch_target, side_effect=side_effect),
                 self.assertRaises(CoordPolicyError) as ctx_active,
             ):
                 self.svc.get_inbox_summary(_OP)
+            self.assertGreaterEqual(hook_hits, 1)
             self.assertEqual(str(ctx_active.exception), ERR_INBOX_UNREADABLE)
 
-            calls = 0
+            validator_results: list[bool] = []
 
-            def _retire_mid_call(_sid: str, _gen: int) -> bool:
-                nonlocal calls
-                calls += 1
-                return calls == 1
+            def _retire_mid_call(_c: PrincipalCtx, _sid: str, _gen: int) -> bool:
+                admitted = len(validator_results) == 0
+                validator_results.append(admitted)
+                return admitted
 
             fenced_svc = ReadOnlyInboxService(
                 self.state_dir,
                 sandbox_root=self.sandbox_root,
                 session_validator=_retire_mid_call,
             )
+            hook_hits = 0
             with (
                 mock.patch(patch_target, side_effect=side_effect),
                 self.assertRaises(RevokedError),
@@ -1900,6 +1908,8 @@ class TestExternalReviewRegressions(InboxReadTestBase):
                 fenced_svc.get_inbox_summary(
                     _OP, read_session_id=_SESS_ID, session_generation=1
                 )
+            self.assertGreaterEqual(hook_hits, 1)
+            self.assertEqual(validator_results, [True, False])
 
 
 if __name__ == "__main__":
