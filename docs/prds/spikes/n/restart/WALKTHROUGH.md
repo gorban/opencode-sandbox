@@ -769,14 +769,17 @@ Exact rules across all 5 step/run operations:
    - Otherwise require `step.status == 'uncertain_needs_reconcile'` and
      `step.attempt_no == expected_attempt_no`; forbid `resolution == 'requeue_pending'` if
      `run.cancel_requested` or `step.attempt_no >= step.max_attempts`
-     (`InvalidStepTransitionError`); when `RunAuthorityStore` is bound to the supervisor,
-     **`resolution == 'requeue_pending'` MUST also pass live authority verification**
-     (`_verify_live_run_authority`, raising `AuthorityError` on a revoked/expired run so a revoked
-     run can never be reopened into `RUNNING`), whereas **terminal settlement resolutions**
-     (`completed`, `failed_terminal`, `cancelled`) remain permitted so operators can settle
-     already-executed uncertain external side effects without dispatching new work. Atomically
-     update `workflow_steps`, update the attempt's `step_idempotency_keys` row in place, insert
-     `step_reconciliations`, recompute `workflow_runs.status`, and append `step_reconciled`.
+     (`InvalidStepTransitionError`). When `RunAuthorityStore` is bound to the supervisor,
+     **`resolution == 'requeue_pending'` MUST acquire `self._lifecycle_gate` -> journal
+     `_conn_lock` -> `BEGIN IMMEDIATE` in that fixed order, and THEN sample a fresh clock and run
+     `_verify_live_run_authority(run_id, clock)` inside the write transaction before deciding and
+     committing the requeue** (so neither concurrent revocation nor expiry during the journal lock
+     wait can ever durably record a requeue to `pending`, raising `AuthorityError` with zero DB
+     writes!), whereas **terminal settlement resolutions** (`completed`, `failed_terminal`,
+     `cancelled`) remain permitted so operators can settle already-executed uncertain external side
+     effects without dispatching new work. Atomically update `workflow_steps`, update the attempt's
+     `step_idempotency_keys` row in place, insert `step_reconciliations`, recompute
+     `workflow_runs.status`, and append `step_reconciled`.
 
 ### 4.3 Exact `step_idempotency_keys` Column Transition Table (DB & Replay Locked)
 
@@ -1053,17 +1056,17 @@ class DurableWorkflowSupervisor:
             return StepExecutionOutcome(token=token, ack=ack)
 
         if work_result.outcome == "failed_retryable":
+            # Consistent lock order for BOTH requeue paths (fail_step retryable & reconcile requeue):
+            # self._lifecycle_gate -> journal._conn_lock -> BEGIN IMMEDIATE -> sample fresh clock ->
+            # verify live authority -> decide retryable vs failed_terminal -> COMMIT!
             with self._lifecycle_gate:
-                t_retry = clock_provider()
-                retryable = self._is_live_run_authority_active(run_id, t_retry)
-                ack = self._journal.fail_step(
-                    FailStepRequest(
-                        token=token,
-                        reason=work_result.reason,
-                        retryable=retryable,
-                        uncertain=False,
-                        clock=t_retry,
-                    )
+                ack = self._journal.fail_step_with_authority_gate(
+                    token=token,
+                    reason=work_result.reason,
+                    clock_provider=clock_provider,
+                    is_authority_active=lambda t_now: self._is_live_run_authority_active(
+                        run_id, t_now
+                    ),
                 )
             return StepExecutionOutcome(token=token, ack=ack)
 
@@ -1192,12 +1195,17 @@ Engineering & maintainability constraints:
        reserve whenever outstanding obligations (`L + U > 0`) exist:
        - If `L + U == 0`: admit iff `last_event_seq + 1 <= max_replay_events`.
        - If `L + U > 0`: admit iff `last_event_seq + 1 + (1 + L + (L + U) + 1) <= max_replay_events`
-         (otherwise refuses with `RestartPolicyError("max_replay_events_exceeded")` leaving a
-         recoverable dirty head).
+         (otherwise refuses with `RestartPolicyError("max_replay_events_exceeded")` — preserving
+         the current open writer so it can still settle its obligations and close within the
+         remaining slots, while leaving the on-disk head intact and verifiable via
+         `verify_journal_replay_readonly()`; note that a *separate* writable restart needs an
+         additional `supervisor_started` slot beyond same-supervisor settlement).
   - Refusal rolls back cleanly with zero writes, guaranteeing every admitted lease can ALWAYS
     complete BOTH `lease -> crash -> recovery -> terminal reconciliation -> close` AND
     `lease -> clean close -> reopen -> recovery -> terminal reconciliation -> close` within
-    `max_replay_events`!
+    `max_replay_events`, and when a recovered supervisor finishes with `U` uncertain steps and
+    exactly `U + 1` remaining slots, refusing premature `close_clean()` preserves those slots for
+    same-supervisor terminal reconciliation + close while keeping the head read-only verifiable!
 - All parameter-heavy operations use small frozen request dataclasses (`CreateRunRequest`,
   `CompleteStepRequest`, `FailStepRequest`, `ReconcileStepRequest`) keeping every function at
   `<= 8` parameters (`<= 12` cap).
@@ -1285,20 +1293,32 @@ directories:
      (c) a **valid `AdmissionReceipt` paired with a changed dependency, altered `max_attempts`, or
      duplicated step** in `proposed_steps` ALL fail closed with `RestartPolicyError` and **ZERO
      journal writes** (`last_event_seq` and `head_hash` unchanged).
-   - **Both `_lifecycle_gate` orderings at worker entry & retry boundary:**
+   - **Both `_lifecycle_gate` orderings at worker entry & requeue boundaries:**
      1. *Retirement / cancellation wins first:* pauses via `on_after_lease_before_entry` after
-        `lease_step()` commits, calls `revoke_run_authority()` (and in a sibling test
-        `cancel_run()`), then resumes -> asserts **0 worker entries**, **0 synthetic effects**,
-        **settled terminal journal row (`failed_terminal` / `cancelled`, zero stranded `leased`
-        row!)**, and exact read-only replay parity in the same supervisor.
+        `lease_step()` commits and resumes after winning `_lifecycle_gate`:
+        - Authority revocation (`revoke_run_authority()`): asserts **0 worker entries**, **0
+          synthetic effects**, settled `failed_terminal` journal row (`authority_revoked_pre_entry`,
+          zero stranded `leased` row), and exact read-only replay parity in the same supervisor.
+        - Cancellation (`cancel_run()`) on a **pure step**: `verify_active_lease()` rejects,
+          asserting **0 worker entries**, direct `cancelled` terminal row, and replay parity.
+        - Cancellation (`cancel_run()`) on a **side-effecting step**: `verify_active_lease()`
+          rejects, asserting **0 worker entries**, preserved `uncertain_needs_reconcile` row, and
+          subsequent exact-token terminal reconciliation (`resolution="cancelled"`) settling cleanly
+          with replay parity.
      2. *Worker entry wins first (mid-step revocation):* worker wins `_lifecycle_gate` and begins
         executing, authority is revoked during worker execution -> same supervisor commits
         exact-token `complete_step` (1 owned worker entry, step transitions to `completed` with
         matching `output_digest`, **0 stranded `leased` steps**) and refuses all subsequent
         `lease_step` dispatches on the revoked run with `AuthorityError`!
-     3. *Pure retry boundary vs. authority retirement:* pure step returns `failed_retryable` while
-        authority retires before `_lifecycle_gate` is acquired -> asserts the step settles cleanly
-        to `failed_terminal` (never requeuing to `pending`) with full replay parity.
+     3. *Both requeue paths vs. lock-wait expiry / retirement:*
+        - Pure step returns `failed_retryable` while authority expires **during the journal lock
+          wait** (after `_lifecycle_gate` is acquired, before `BEGIN IMMEDIATE` samples the fresh
+          clock) -> asserts the step settles cleanly to `failed_terminal` (never requeuing to
+          `pending`) with full replay parity.
+        - Side-effecting `uncertain_needs_reconcile` step calls
+          `reconcile_step(resolution="requeue_pending")` when authority retires before or during
+          the journal lock wait -> asserts `AuthorityError` with zero DB writes (never recording a
+          requeue to `pending`).
    - Verifies cross-restart `AdmissionReceipt` reconstruction from durable `workflow_runs` and
      **revoked-run `reconcile_step` policy** (`requeue_pending` refused with `AuthorityError`,
      while terminal settlement `completed` / `cancelled` succeeds).
@@ -1306,12 +1326,14 @@ directories:
      duplicate `step_id`, NUL/control/BiDi strings, `bool`-as-`int`, `NaN`/`Inf`, negative
      `monotonic_s`/`wall_s`, `ClockSnapshot` / `grant_generation` signed-64-bit overflow, and
      **full-lifecycle `MAX_RUNS` / `max_replay_events` headroom** (driving small-cap fixtures
-     through BOTH (a) `lease (last admissible batch) -> refusal of next write leaving head intact
-     -> crash -> open_and_recover() -> terminal reconcile_step() -> close_clean()` AND (b) `lease
-     (last admissible batch) -> close_clean() -> open_and_recover() -> terminal reconcile_step()
-     -> close_clean()`, then confirming an exhausted writable reopen fails closed with
-     `RestartPolicyError("max_replay_events_exceeded")` leaving the prior head unchanged while
-     `verify_journal_replay_readonly()` succeeds!).
+     through (a) `lease (last admissible batch) -> refusal of next write leaving head intact ->
+     crash -> open_and_recover() -> terminal reconcile_step() -> close_clean()`, (b) `lease (last
+     admissible batch) -> close_clean() -> open_and_recover() -> terminal reconcile_step() ->
+     close_clean()`, AND (c) exact-cap recovery finishing with 1 uncertain step and 2 remaining
+     slots where premature `close_clean()` refuses while preserving the current open writer for
+     same-supervisor `reconcile_step()` + `close_clean()` and leaving the head read-only
+     verifiable, followed by confirming an exhausted writable reopen fails closed leaving the prior
+     head unchanged while `verify_journal_replay_readonly()` succeeds!).
 2. **Crash BEFORE worker invocation (`AFTER_LEASE_COMMIT_BEFORE_WORKER`) & trusted-tracker `no_effect` evidence:**
    - **Pure/idempotent step (`side_effecting=False`):** Commits `leased` + reserves
      `idempotency_key` under epoch `1`, crashes before worker runs (`executions == 0`), restarts
