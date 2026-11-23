@@ -610,8 +610,8 @@ class TestFilesystemAndSchemaAdmission(InboxReadTestBase):
         ) as conn:
             ts = conn.execute("PRAGMA trusted_schema").fetchone()
             csc = conn.execute("PRAGMA cell_size_check").fetchone()
-            self.assertEqual(list(ts.values())[0], 0)
-            self.assertEqual(list(csc.values())[0], 1)
+            self.assertEqual(next(iter(ts.values())), 0)
+            self.assertEqual(next(iter(csc.values())), 1)
 
         v_dir = _make_private_dir(self.root, "view_state")
         v_db = _init_inbox_db(v_dir)
@@ -1369,11 +1369,13 @@ class TestBudgetsCursorsAndDeadlines(InboxReadTestBase):
         self.assertTrue(_UMASK_LOCK.acquire(timeout=0.1))
         _UMASK_LOCK.release()
 
-        with open_readonly_inbox_snapshot(
-            self.db_path, deadline=time.monotonic() + 5.0
-        ) as ro_conn:
-            with self.assertRaises(sqlite3.OperationalError):
-                ro_conn.execute("DELETE FROM review_items")
+        with (
+            open_readonly_inbox_snapshot(
+                self.db_path, deadline=time.monotonic() + 5.0
+            ) as ro_conn,
+            self.assertRaises(sqlite3.OperationalError),
+        ):
+            ro_conn.execute("DELETE FROM review_items")
         with self.assertRaises(sqlite3.ProgrammingError):
             ro_conn.execute("SELECT 1")
 

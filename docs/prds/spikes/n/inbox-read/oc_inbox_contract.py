@@ -134,7 +134,7 @@ _URL_BASIC_AUTH_RE = re.compile(
     r"(?i)((?:https?|postgres(?:ql)?|redis|ftp|sftp)://)[^\s/@:]+:[^\s/@]+@"
 )
 _BEARER_BASIC_RE = re.compile(
-    r"(?i)\b(?:authorization\s*[:=]\s*)?(?:bearer|basic)\s+[A-Za-z\d._~+/=-]{4,}"
+    r"(?i)\b(?:authorization\s*[:=]\s*)?(?:bearer|basic)\s+[a-z\d._~+/=-]{4,}"
 )
 _HEADER_QUOTED_RE = re.compile(
     r"(?i)(?<![A-Za-z\d_.-])"

@@ -646,7 +646,7 @@ def select_item_artifacts(
 def select_status_aggregate_counts(
     conn: sqlite3.Connection, deadline: float
 ) -> dict[str, int]:
-    counts: dict[str, int] = {status: 0 for status in sorted(VALID_STATUSES)}
+    counts: dict[str, int] = dict.fromkeys(sorted(VALID_STATUSES), 0)
     counts[BUCKET_MALFORMED] = 0
     rows = execute_bounded(conn, _SQL_STATUS_AGG, (), deadline).fetchall()
     for row in rows:
@@ -661,9 +661,9 @@ def select_status_aggregate_counts(
 def select_severity_aggregate_counts(
     conn: sqlite3.Connection, deadline: float
 ) -> tuple[dict[str, int], dict[str, int]]:
-    total: dict[str, int] = {sev: 0 for sev in sorted(VALID_SEVERITIES)}
+    total: dict[str, int] = dict.fromkeys(sorted(VALID_SEVERITIES), 0)
     total[BUCKET_MALFORMED] = 0
-    pending: dict[str, int] = {sev: 0 for sev in sorted(VALID_SEVERITIES)}
+    pending: dict[str, int] = dict.fromkeys(sorted(VALID_SEVERITIES), 0)
     pending[BUCKET_MALFORMED] = 0
     rows = execute_bounded(conn, _SQL_SEVERITY_AGG, (), deadline).fetchall()
     for row in rows:
