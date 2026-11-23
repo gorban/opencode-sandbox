@@ -23,15 +23,17 @@ import re
 import sqlite3
 import sys
 import time
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 _INBOX_DIR = Path(__file__).resolve().parent
 _SPIKE_N_DIR = _INBOX_DIR.parent
 _SPIKE_M_DIR = _SPIKE_N_DIR.parent / "m"
+_SPIKE_M_PROJ_DIR = _SPIKE_M_DIR / "projection"
 _SPIKE_L_DIR = _SPIKE_N_DIR.parent / "l"
 for _import_dir in (
     str(_INBOX_DIR),
     str(_SPIKE_N_DIR),
+    str(_SPIKE_M_PROJ_DIR),
     str(_SPIKE_M_DIR),
     str(_SPIKE_L_DIR),
 ):
@@ -79,6 +81,7 @@ from oc_inbox_contract import (  # noqa: E402
     MAX_READ_MS,
     MAX_RESPONSE_BYTES,
     MAX_SQLITE_INT64,
+    MAX_STATUS_FILTER_ITEMS,
     MIN_READ_MS,
     MIN_RESPONSE_BYTES,
     OP_INBOX_LIST,
@@ -107,6 +110,7 @@ from oc_inbox_contract import (  # noqa: E402
     is_json_tree_valid,
     is_valid_sha256_hex,
     redact_sensitive_text,
+    reject_json_constant,
     serialize_inbox_bytes,
     validate_clean_opaque_token,
 )
@@ -124,6 +128,7 @@ from oc_inbox_db import (  # noqa: E402
     select_structural_summary_totals,
     verify_state_dir_and_db_readonly,
 )
+from oc_projection_decode import decode_bounded_blob  # noqa: E402
 from oc_workflow_schema import (  # noqa: E402
     WorkflowSchemaError,
     parse_namespaced_id,
@@ -162,25 +167,29 @@ _COL_STATUS_MALFORMED = "status_malformed"
 _COL_TARGET_INC_ID = "target_incarnation_id"
 _COL_WORKFLOW_ID = "workflow_id"
 _COL_WORKFLOW_RUN_PRESENT = "workflow_run_present"
+_COL_JOINED_RUN_ID = "joined_run_id"
 _COL_CHECKPOINT_SEQ = "checkpoint_seq"
+_T = TypeVar("_T")
 
-# Stage-1 escape & 8-bit C1 sequence strippers (strict precedence order).
-_ESCAPE_RES: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]"),
-    re.compile(r"\x9b[0-?]*[ -/]*[@-~]"),
-    re.compile(r"\x1b\][^\x07\x9c\x1b]*(?:\x07|\x9c|\x1b\\)?"),
-    re.compile(r"\x9d[^\x07\x9c\x1b]*(?:\x07|\x9c|\x1b\\)?"),
-    re.compile(r"\x1b[P^_X][^\x9c\x1b]*(?:\x9c|\x1b\\)?"),
-    re.compile(r"[\x90\x98\x9e\x9f][^\x9c\x1b]*(?:\x9c|\x1b\\)?"),
-    re.compile(r"\x1b[ -/]+[0-~]"),
-    re.compile(r"\x1b[0-~]"),
-    re.compile(
-        r"(?:(?:\x1b(?:\[[0-?]*[ -/]*|\][^\x07\x9c\x1b]*|[P^_X][^\x9c\x1b]*|[ -/]+)?)"
-        r"|(?:\x9b[0-?]*[ -/]*))$"
-    ),
-)
+# Stage-1 linear-time stack FSM states for ECMA-48 / VT100 escape stripping.
+_ST_ESC = 1
+_ST_ESC_INT = 2
+_ST_CSI = 3
+_ST_OSC = 4
+_ST_STR = 5
+_ST_OSC_ESC = 6
+_ST_STR_ESC = 7
+_C1_INTRODUCERS: dict[int, int] = {
+    0x1B: _ST_ESC,
+    0x9B: _ST_CSI,
+    0x9D: _ST_OSC,
+    0x90: _ST_STR,
+    0x98: _ST_STR,
+    0x9E: _ST_STR,
+    0x9F: _ST_STR,
+}
 
-_KEY_NORM_RE = re.compile(r"[\s_-]+")
+_KEY_NORM_RE = re.compile(r"[^a-z\d]+")
 _SENSITIVE_KEY_TOKENS: tuple[str, ...] = (
     "envvars",
     "authheader",
@@ -225,6 +234,15 @@ class _DetailPackCtx:
 
 
 @dataclass(frozen=True, slots=True)
+class _AdmittedReadCtx:
+    caller: PrincipalCtx
+    max_bytes: int
+    deadline: float
+    session_echo: ReadSessionEcho | None
+    db_path: Path
+
+
+@dataclass(frozen=True, slots=True)
 class _PinEvalInputs:
     review_id: str
     run_id: str | None
@@ -240,59 +258,108 @@ class _PinEvalInputs:
 # --- Low-level BLOB decoding, Stage-1 scrubbing, and metadata_json sanitization ---
 
 
-def _reject_json_constant(token: str) -> Any:
-    raise ValueError(f"Forbidden JSON constant: {token}")
-
-
-def _trim_incomplete_utf8_tail(data: bytes) -> bytes:
-    """Drop a single trailing incomplete UTF-8 sequence split by a byte prefix slice."""
-    n = len(data)
-    if n == 0:
-        return data
-    cont_count = 0
-    idx = n - 1
-    while idx >= 0 and cont_count < 3 and (data[idx] & 0xC0) == 0x80:
-        cont_count += 1
+def _withhold_truncated_tail(text: str, sql_truncated: bool) -> tuple[str, bool]:
+    """Drop the trailing incomplete non-whitespace token in O(tail_len) time."""
+    if not sql_truncated or not text or text[-1].isspace():
+        return text, False
+    idx = len(text)
+    while idx > 0 and not text[idx - 1].isspace():
         idx -= 1
-    if idx < 0:
-        return data
-    lead = data[idx]
-    if 0xC2 <= lead <= 0xDF:
-        expected = 2
-    elif 0xE0 <= lead <= 0xEF:
-        expected = 3
-    elif 0xF0 <= lead <= 0xF4:
-        expected = 4
-    else:
-        return data
-    return data[:idx] if (n - idx) < expected else data
+    return text[:idx], True
 
 
-def _decode_bounded_blob(
-    raw_blob: Any, original_bytes: int
-) -> tuple[str, int, bool]:
-    """Decode bounded SQL BLOB prefix at UTF-8 boundary, preserving embedded NUL."""
-    if raw_blob is None:
-        return "", 0, True
-    if not isinstance(raw_blob, (bytes, bytearray)):
-        raw_blob = str(raw_blob).encode(_UTF8, errors="replace")
-    raw = bytes(raw_blob)
-    trimmed = _trim_incomplete_utf8_tail(raw) if original_bytes > len(raw) else raw
-    try:
-        return trimmed.decode(_UTF8), len(trimmed), False
-    except UnicodeDecodeError:
-        return trimmed.decode(_UTF8, errors="replace"), len(trimmed), True
+def _is_ignored_escape_pad(code: int) -> bool:
+    return (code < 0x20 and code not in (0x18, 0x1A, 0x1B)) or code == 0x7F
+
+
+def _step_esc_dispatch(stack: list[int], code: int) -> bool:
+    if _is_ignored_escape_pad(code):
+        return True
+    if code in (0x18, 0x1A):
+        stack.pop()
+        return True
+    intro = _C1_INTRODUCERS.get(code)
+    if intro is not None:
+        stack.append(intro)
+        return True
+    if code == 0x5B:
+        stack[-1] = _ST_CSI
+        return True
+    if code == 0x5D:
+        stack[-1] = _ST_OSC
+        return True
+    if code in (0x50, 0x58, 0x5E, 0x5F):
+        stack[-1] = _ST_STR
+        return True
+    if 0x20 <= code <= 0x2F:
+        stack[-1] = _ST_ESC_INT
+        return True
+    stack.pop()
+    return 0x30 <= code <= 0x7E
+
+
+def _step_csi_or_interm(stack: list[int], state: int, code: int) -> bool:
+    if _is_ignored_escape_pad(code):
+        return True
+    if code in (0x18, 0x1A):
+        stack.pop()
+        return True
+    intro = _C1_INTRODUCERS.get(code)
+    if intro is not None:
+        stack.append(intro)
+        return True
+    cont_hi = 0x2F if state == _ST_ESC_INT else 0x3F
+    final_lo = 0x30 if state == _ST_ESC_INT else 0x40
+    if 0x20 <= code <= cont_hi:
+        return True
+    stack.pop()
+    return final_lo <= code <= 0x7E
+
+
+def _step_string_escape(stack: list[int], state: int, code: int) -> bool:
+    if state in (_ST_OSC_ESC, _ST_STR_ESC):
+        if _is_ignored_escape_pad(code) or code == 0x1B:
+            return True
+        if code in (0x5C, 0x18, 0x1A):
+            stack.pop()
+            return True
+        stack[-1] = _ST_ESC
+        return False
+    if code in (0x9C, 0x18, 0x1A) or (state == _ST_OSC and code == 0x07):
+        stack.pop()
+        return True
+    if code == 0x1B:
+        stack[-1] = _ST_OSC_ESC if state == _ST_OSC else _ST_STR_ESC
+    return True
+
+
+def _advance_escape_stack(stack: list[int], code: int) -> bool:
+    state = stack[-1]
+    if state == _ST_ESC:
+        return _step_esc_dispatch(stack, code)
+    if state in (_ST_ESC_INT, _ST_CSI):
+        return _step_csi_or_interm(stack, state, code)
+    return _step_string_escape(stack, state, code)
 
 
 def _strip_escape_sequences(text: str) -> tuple[str, bool]:
-    current = text
+    """Linear-time stack FSM stripping 7-bit/8-bit, nested, padded, and split escapes."""
+    out: list[str] = []
+    stack: list[int] = []
     found = False
-    for pattern in _ESCAPE_RES:
-        updated, count = pattern.subn("", current)
-        if count > 0:
-            current = updated
-            found = True
-    return current, found
+    for ch in text:
+        code = ord(ch)
+        while stack:
+            if _advance_escape_stack(stack, code):
+                break
+        else:
+            intro = _C1_INTRODUCERS.get(code)
+            if intro is not None:
+                found = True
+                stack.append(intro)
+            else:
+                out.append(ch)
+    return "".join(out), found
 
 
 def _is_forbidden_codepoint(code: int, *, allow_multiline: bool) -> bool:
@@ -357,13 +424,15 @@ def _decode_single_line_redacted(
         if type(raw_bytes) is int and cast(int, raw_bytes) >= 0
         else 0
     )
-    decoded, inspected_len, bad_utf8 = _decode_bounded_blob(raw_blob, orig_bytes)
+    decoded, inspected_len, bad_utf8 = decode_bounded_blob(raw_blob, orig_bytes)
+    sql_truncated = orig_bytes > inspected_len
     scrubbed = _scrub_single_line_unbounded(decoded)
     redacted_text, was_redacted = redact_sensitive_text(scrubbed)
-    clean, cut_in_py = _truncate_utf8_str(redacted_text, max_bytes)
-    truncated = cut_in_py or (orig_bytes > inspected_len)
+    safe_text, tail_withheld = _withhold_truncated_tail(redacted_text, sql_truncated)
+    clean, cut_in_py = _truncate_utf8_str(safe_text, max_bytes)
+    truncated = cut_in_py or sql_truncated
     malformed = bool(non_text) or bad_utf8
-    return clean, truncated, was_redacted, malformed
+    return clean, truncated, (was_redacted or tail_withheld), malformed
 
 
 def _is_sensitive_key(full_key: str) -> bool:
@@ -455,7 +524,7 @@ def _parse_metadata_json(
         return {}, False, True
     try:
         parsed = json.loads(
-            bytes(raw_blob).decode(_UTF8), parse_constant=_reject_json_constant
+            bytes(raw_blob).decode(_UTF8), parse_constant=reject_json_constant
         )
     except (ValueError, RecursionError):
         return {}, False, True
@@ -633,21 +702,23 @@ def _validate_status_filter(
     ):
         raise CoordValidationError("statuses must be an iterable of status strings")
     cleaned: set[str] = set()
-    for item in statuses:
+    for idx, item in enumerate(statuses):
+        if idx >= MAX_STATUS_FILTER_ITEMS:
+            raise CoordValidationError("status_filter_too_many_entries")
         if not isinstance(item, str) or item not in VALID_STATUSES:
-            raise CoordValidationError(f"Unsupported inbox status filter: {item!r}")
+            raise CoordValidationError("unsupported_inbox_status_filter")
         cleaned.add(item)
     if not cleaned:
         raise CoordValidationError("statuses filter must not be empty")
     return tuple(sorted(cleaned))
 
 
-def _authorize_operator_caller(caller: object) -> PrincipalCtx:
+def _require_operator_principal(caller: object) -> PrincipalCtx:
     if not isinstance(caller, PrincipalCtx):
         raise CoordValidationError("caller must be PrincipalCtx")
     if caller.role is not CoordRole.OPERATOR:
         raise CoordAuthError("operator_role_required")
-    if caller.sandbox_addr is not None or caller.incarnation_id is not None:
+    if (caller.sandbox_addr, caller.incarnation_id) != (None, None):
         raise CoordAuthError("operator_principal_must_not_bind_sandbox")
     return caller
 
@@ -655,19 +726,18 @@ def _authorize_operator_caller(caller: object) -> PrincipalCtx:
 def _validate_session_args(
     read_session_id: object, session_generation: object, *, has_validator: bool
 ) -> ReadSessionEcho | None:
-    if (read_session_id is None) != (session_generation is None):
-        raise CoordValidationError("read_session_pair_required")
-    if read_session_id is None:
+    if read_session_id is None and session_generation is None:
         if has_validator:
             raise CoordAuthError("read_session_required")
         return None
+    if read_session_id is None or session_generation is None:
+        raise CoordValidationError("read_session_pair_required")
     clean_id = validate_clean_opaque_token(read_session_id, "read_session_id")
-    err_gen = "session_generation must be an int in 1..MAX_SQLITE_INT64"
-    if type(session_generation) is not int:
-        raise CoordValidationError(err_gen)
-    gen_val = cast(int, session_generation)
-    if gen_val < 1 or gen_val > MAX_SQLITE_INT64:
-        raise CoordValidationError(err_gen)
+    if contains_credential_pattern(clean_id):
+        raise CoordValidationError("invalid_read_session_id")
+    gen_val = _validate_int_range(
+        session_generation, "session_generation", 1, MAX_SQLITE_INT64
+    )
     if not has_validator:
         raise CoordPolicyError("read_session_validator_unconfigured")
     return ReadSessionEcho(read_session_id=clean_id, session_generation=gen_val)
@@ -727,6 +797,7 @@ def _is_primary_artifact_core_valid(
         and is_valid_sha256_hex(blob_sha)
         and isinstance(media_type, str)
         and _MEDIA_TYPE_RE.fullmatch(media_type) is not None
+        and not contains_credential_pattern(media_type)
         and hmac.compare_digest(blob_sha, expected_sha256)
     )
 
@@ -755,7 +826,7 @@ def _verify_primary_artifact_row(
 
 def _recompute_pin_if_complete(
     pin_in: _PinEvalInputs,
-) -> tuple[str, str, str, str] | None:
+) -> tuple[str, str, str, str, str] | None:
     if (
         pin_in.format_invalid
         or pin_in.run_id is None
@@ -774,13 +845,19 @@ def _recompute_pin_if_complete(
         artifact_sha256=pin_in.artifact_sha256,
         policy_digest=pin_in.policy_digest,
     )
-    return recomputed, pin_in.stored_pin, pin_in.policy_digest, pin_in.artifact_sha256
+    return (
+        recomputed,
+        pin_in.stored_pin,
+        pin_in.run_id,
+        pin_in.policy_digest,
+        pin_in.artifact_sha256,
+    )
 
 
 def _check_run_policy_corroboration(
-    row: Mapping[str, Any], policy_digest: str
+    row: Mapping[str, Any], run_id: str, policy_digest: str
 ) -> tuple[str | None, bool]:
-    if not bool(row[_COL_WORKFLOW_RUN_PRESENT]):
+    if not bool(row[_COL_WORKFLOW_RUN_PRESENT]) or row[_COL_JOINED_RUN_ID] != run_id:
         return ANOMALY_RUN_MISSING, False
     run_pol = row["run_policy_digest"]
     bad_run_pol = bool(row["run_policy_digest_malformed"])
@@ -807,14 +884,16 @@ def _evaluate_review_pin(
     pin_tuple = _recompute_pin_if_complete(pin_in)
     if pin_tuple is None:
         return _failed_pin(pin_in, None, ANOMALY_MALFORMED_PIN_INPUT), True
-    recomputed, stored_pin, policy_digest, artifact_sha256 = pin_tuple
+    recomputed, stored_pin, run_id, policy_digest, artifact_sha256 = pin_tuple
 
     # Step 3: constant-time stored pin equality.
     if not hmac.compare_digest(stored_pin, recomputed):
         return _failed_pin(pin_in, recomputed, ANOMALY_PIN_MISMATCH), item_malformed
 
     # Steps 4-5: workflow_runs presence & policy_digest equality.
-    run_anomaly, bad_run_pol = _check_run_policy_corroboration(row, policy_digest)
+    run_anomaly, bad_run_pol = _check_run_policy_corroboration(
+        row, run_id, policy_digest
+    )
     if run_anomaly is not None:
         return (
             _failed_pin(pin_in, recomputed, run_anomaly),
@@ -920,23 +999,24 @@ def _build_presentation(
         if type(raw_orig) is int and cast(int, raw_orig) >= 0
         else 0
     )
-    decoded_sum, inspected_len, bad_utf8 = _decode_bounded_blob(
+    decoded_sum, inspected_len, bad_utf8 = decode_bounded_blob(
         row["summary_blob"], orig_bytes
     )
+    suffix_uninspected = orig_bytes > inspected_len
     scrubbed_sum, has_ctrl = _scrub_multiline_text(decoded_sum)
     redacted_sum, sum_red = redact_sensitive_text(scrubbed_sum)
-    suffix_uninspected = orig_bytes > inspected_len
+    safe_sum, tail_withheld = _withhold_truncated_tail(redacted_sum, suffix_uninspected)
     bad_summary = bool(row["summary_non_text"]) or bad_utf8
     pres = InboxItemPresentation(
         title=title,
         title_truncated=title_trunc,
-        summary_text=redacted_sum,
+        summary_text=safe_sum,
         text_truncated=suffix_uninspected,
         text_suffix_uninspected=suffix_uninspected,
         original_text_bytes=orig_bytes,
         has_control_or_bidi=(has_ctrl or bad_utf8),
         untrusted_content=True,
-        redaction_applied=(title_red or sum_red or extra_redacted),
+        redaction_applied=(title_red or sum_red or tail_withheld or extra_redacted),
     )
     return pres, (bad_title or bad_summary)
 
@@ -1006,6 +1086,9 @@ def _build_verified_inbox_item(
     """Return (InboxItem, effective_priority, effective_seq)."""
     check_deadline_ms(deadline)
     review_id = _admit_primary_review_id(row[_COL_REVIEW_ID])
+    match_count = row["workflow_run_match_count"]
+    if type(match_count) is not int or cast(int, match_count) > 1:
+        raise CoordPolicyError(ERR_INBOX_UNREADABLE)
     pin_in = _extract_pin_inputs(row, review_id)
     item_rev, bad_rev = _safe_int(
         row["item_revision"], row["item_revision_malformed"], default=0
@@ -1018,9 +1101,14 @@ def _build_verified_inbox_item(
         row["target_incarnation_id_malformed"],
         _COL_TARGET_INC_ID,
     )
+    run_present = (
+        bool(row[_COL_WORKFLOW_RUN_PRESENT])
+        and pin_in.run_id is not None
+        and row[_COL_JOINED_RUN_ID] == pin_in.run_id
+    )
     wf_id, red_wf, bad_wf = _validate_workflow_id(
         row[_COL_WORKFLOW_ID],
-        bool(row[_COL_WORKFLOW_RUN_PRESENT]),
+        run_present,
         row["workflow_id_malformed"],
     )
     metadata, red_meta, bad_meta = _parse_metadata_json(
@@ -1086,6 +1174,18 @@ def _extract_artifact_id(row: Mapping[str, Any]) -> tuple[str | None, bool]:
     return (cand, False) if cand == raw_aid else (None, True)
 
 
+def _extract_media_type(row: Mapping[str, Any]) -> tuple[str, bool, bool]:
+    raw_mt = row[_COL_MEDIA_TYPE]
+    mt_has_cred = isinstance(raw_mt, str) and contains_credential_pattern(raw_mt)
+    bad_mt = (
+        bool(row[_COL_MEDIA_TYPE_MALFORMED])
+        or not isinstance(raw_mt, str)
+        or _MEDIA_TYPE_RE.fullmatch(raw_mt) is None
+        or mt_has_cred
+    )
+    return (_FALLBACK_MEDIA_TYPE if bad_mt else raw_mt), mt_has_cred, bad_mt
+
+
 def _row_to_artifact_ref(row: Mapping[str, Any]) -> InboxArtifactRef:
     clean_aid, bad_aid = _extract_artifact_id(row)
     raw_sha = row[_COL_BLOB_SHA256]
@@ -1095,13 +1195,7 @@ def _row_to_artifact_ref(row: Mapping[str, Any]) -> InboxArtifactRef:
     size_bytes, bad_size = _safe_int(
         row["size_bytes"], row[_COL_SIZE_BYTES_MALFORMED], default=0
     )
-    raw_mt = row[_COL_MEDIA_TYPE]
-    bad_mt = (
-        bool(row[_COL_MEDIA_TYPE_MALFORMED])
-        or not isinstance(raw_mt, str)
-        or _MEDIA_TYPE_RE.fullmatch(raw_mt) is None
-    )
-    clean_mt = _FALLBACK_MEDIA_TYPE if bad_mt else raw_mt
+    clean_mt, red_mt, bad_mt = _extract_media_type(row)
 
     label, lbl_trunc, lbl_red, bad_lbl = _decode_single_line_redacted(
         row[_COL_LABEL_BLOB], row[_COL_LABEL_BYTES], row[_COL_LABEL_NON_TEXT]
@@ -1122,7 +1216,7 @@ def _row_to_artifact_ref(row: Mapping[str, Any]) -> InboxArtifactRef:
         label_truncated=lbl_trunc,
         is_primary=is_primary,
         created_at=created_at,
-        redaction_applied=lbl_red,
+        redaction_applied=(lbl_red or red_mt),
         malformed_metadata=malformed,
     )
 
@@ -1237,6 +1331,7 @@ def _pack_bounded_inbox_page(
         return page
 
     admitted: tuple[InboxItem, ...] = ()
+    seen_review_ids: set[str] = set()
     last_cursor: str | None = None
     max_items = min(ctx.page_limit, len(rows))
     for idx in range(max_items):
@@ -1244,6 +1339,9 @@ def _pack_bounded_inbox_page(
         item, eff_pr, eff_seq = _build_verified_inbox_item(
             conn, rows[idx], deadline=ctx.deadline
         )
+        if item.review_id in seen_review_ids:
+            raise CoordPolicyError(ERR_INBOX_UNREADABLE)
+        seen_review_ids.add(item.review_id)
         remaining_exists = (idx + 1) < len(rows)
         item_cursor = encode_inbox_list_cursor(
             scope_hash=ctx.scope_hash,
@@ -1466,6 +1564,70 @@ class ReadOnlyInboxService:
         self._session_validator = session_validator
         self._live_authority_checker = live_authority_checker
 
+    def _admit_read_call(
+        self,
+        op: PrincipalCtx,
+        *,
+        max_response_bytes: int,
+        max_read_ms: int,
+        read_session_id: str | None,
+        session_generation: int | None,
+    ) -> _AdmittedReadCtx:
+        max_bytes = _validate_int_range(
+            max_response_bytes,
+            _PARAM_MAX_RESPONSE_BYTES,
+            MIN_RESPONSE_BYTES,
+            MAX_RESPONSE_BYTES,
+        )
+        read_ms = _validate_int_range(
+            max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS
+        )
+        session_echo = _validate_session_args(
+            read_session_id,
+            session_generation,
+            has_validator=(self._session_validator is not None),
+        )
+        _enforce_authority_fences(
+            op, session_echo, self._session_validator, self._live_authority_checker
+        )
+        _trusted_dir, db_path = verify_state_dir_and_db_readonly(
+            self._state_dir, self._sandbox_root
+        )
+        return _AdmittedReadCtx(
+            caller=op,
+            max_bytes=max_bytes,
+            deadline=time.monotonic() + (read_ms / 1000.0),
+            session_echo=session_echo,
+            db_path=db_path,
+        )
+
+    def _run_fenced_snapshot(
+        self,
+        ctx: _AdmittedReadCtx,
+        body: Callable[[sqlite3.Connection, int], _T],
+    ) -> _T:
+        """Execute snapshot read, close DB, recheck authority, then release result or error."""
+        result: _T | None = None
+        deferred_exc: Exception | None = None
+        try:
+            with open_readonly_inbox_snapshot(
+                ctx.db_path, deadline=ctx.deadline
+            ) as conn:
+                snapshot_seq = read_inbox_seq_counter(conn, ctx.deadline)
+                result = body(conn, snapshot_seq)
+        except (CoordValidationError, CoordPolicyError) as exc:
+            deferred_exc = exc
+
+        _enforce_authority_fences(
+            ctx.caller,
+            ctx.session_echo,
+            self._session_validator,
+            self._live_authority_checker,
+        )
+        if deferred_exc is not None:
+            raise deferred_exc
+        return cast(_T, result)
+
     def list_inbox_items(
         self,
         caller: object,
@@ -1480,42 +1642,27 @@ class ReadOnlyInboxService:
         session_generation: int | None = None,
     ) -> InboxPage:
         """Return a bounded, verified, redacted page of Tier-B inbox items."""
-        op = _authorize_operator_caller(caller)
+        op = _require_operator_principal(caller)
         clean_statuses = _validate_status_filter(statuses)
         clean_run_id = (
             validate_clean_opaque_token(run_id, "run_id") if run_id is not None else None
         )
         page_limit = _validate_int_range(limit, "limit", 1, MAX_PAGE_LIMIT)
-        max_bytes = _validate_int_range(
-            max_response_bytes,
-            _PARAM_MAX_RESPONSE_BYTES,
-            MIN_RESPONSE_BYTES,
-            MAX_RESPONSE_BYTES,
-        )
-        read_ms = _validate_int_range(
-            max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS
-        )
-        session_echo = _validate_session_args(
-            read_session_id,
-            session_generation,
-            has_validator=(self._session_validator is not None),
-        )
         scope_hash = compute_scope_hash(
             OP_INBOX_LIST, statuses=clean_statuses, run_id=clean_run_id
         )
         parsed_cursor = decode_inbox_list_cursor(
             after_cursor, expected_scope_hash=scope_hash
         )
-        _enforce_authority_fences(
-            op, session_echo, self._session_validator, self._live_authority_checker
-        )
-        _trusted_dir, db_path = verify_state_dir_and_db_readonly(
-            self._state_dir, self._sandbox_root
+        ctx = self._admit_read_call(
+            op,
+            max_response_bytes=max_response_bytes,
+            max_read_ms=max_read_ms,
+            read_session_id=read_session_id,
+            session_generation=session_generation,
         )
 
-        deadline = time.monotonic() + (read_ms / 1000.0)
-        with open_readonly_inbox_snapshot(db_path, deadline=deadline) as conn:
-            snapshot_seq = read_inbox_seq_counter(conn, deadline)
+        def _query(conn: sqlite3.Connection, snapshot_seq: int) -> InboxPage:
             if parsed_cursor is not None and snapshot_seq != parsed_cursor.snapshot_seq:
                 raise CoordValidationError(ERR_CURSOR_SNAPSHOT_CHANGED)
             rows = select_review_items_page(
@@ -1524,22 +1671,19 @@ class ReadOnlyInboxService:
                 run_id=clean_run_id,
                 cursor=parsed_cursor,
                 limit=page_limit + 1,
-                deadline=deadline,
+                deadline=ctx.deadline,
             )
             pack_ctx = _ListPackCtx(
                 snapshot_seq=snapshot_seq,
                 page_limit=page_limit,
                 scope_hash=scope_hash,
-                max_bytes=max_bytes,
-                session_echo=session_echo,
-                deadline=deadline,
+                max_bytes=ctx.max_bytes,
+                session_echo=ctx.session_echo,
+                deadline=ctx.deadline,
             )
-            page = _pack_bounded_inbox_page(conn, rows, pack_ctx)
+            return _pack_bounded_inbox_page(conn, rows, pack_ctx)
 
-        _enforce_authority_fences(
-            op, session_echo, self._session_validator, self._live_authority_checker
-        )
-        return page
+        return self._run_fenced_snapshot(ctx, _query)
 
     def get_inbox_item(
         self,
@@ -1552,43 +1696,30 @@ class ReadOnlyInboxService:
         session_generation: int | None = None,
     ) -> InboxItemDetailSnapshot:
         """Return a bounded detailed single-item snapshot with verified pin and artifacts."""
-        op = _authorize_operator_caller(caller)
+        op = _require_operator_principal(caller)
         clean_review_id = validate_clean_opaque_token(review_id, _COL_REVIEW_ID)
-        max_bytes = _validate_int_range(
-            max_response_bytes,
-            _PARAM_MAX_RESPONSE_BYTES,
-            MIN_RESPONSE_BYTES,
-            MAX_RESPONSE_BYTES,
-        )
-        read_ms = _validate_int_range(
-            max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS
-        )
-        session_echo = _validate_session_args(
-            read_session_id,
-            session_generation,
-            has_validator=(self._session_validator is not None),
-        )
-        _enforce_authority_fences(
-            op, session_echo, self._session_validator, self._live_authority_checker
-        )
-        _trusted_dir, db_path = verify_state_dir_and_db_readonly(
-            self._state_dir, self._sandbox_root
+        ctx = self._admit_read_call(
+            op,
+            max_response_bytes=max_response_bytes,
+            max_read_ms=max_read_ms,
+            read_session_id=read_session_id,
+            session_generation=session_generation,
         )
 
-        deadline = time.monotonic() + (read_ms / 1000.0)
-        with open_readonly_inbox_snapshot(db_path, deadline=deadline) as conn:
-            snapshot_seq = read_inbox_seq_counter(conn, deadline)
-            row = select_single_review_item(conn, clean_review_id, deadline)
+        def _query(
+            conn: sqlite3.Connection, snapshot_seq: int
+        ) -> InboxItemDetailSnapshot:
+            row = select_single_review_item(conn, clean_review_id, ctx.deadline)
             if row is None:
                 raise CoordPolicyError("review_item_not_found")
             item, _eff_pr, _eff_seq = _build_verified_inbox_item(
-                conn, row, deadline=deadline
+                conn, row, deadline=ctx.deadline
             )
             raw_arts = select_item_artifacts(
                 conn,
                 clean_review_id,
                 limit=MAX_ARTIFACTS_PER_ITEM + 1,
-                deadline=deadline,
+                deadline=ctx.deadline,
             )
             artifacts_truncated = len(raw_arts) > MAX_ARTIFACTS_PER_ITEM
             artifacts = tuple(
@@ -1597,11 +1728,11 @@ class ReadOnlyInboxService:
             artifacts_malformed = any(art.malformed_metadata for art in artifacts)
             detail_ctx = _DetailPackCtx(
                 snapshot_seq=snapshot_seq,
-                max_bytes=max_bytes,
-                session_echo=session_echo,
-                deadline=deadline,
+                max_bytes=ctx.max_bytes,
+                session_echo=ctx.session_echo,
+                deadline=ctx.deadline,
             )
-            snapshot = _fit_inbox_item_detail(
+            return _fit_inbox_item_detail(
                 item,
                 artifacts,
                 artifacts_truncated=artifacts_truncated,
@@ -1609,10 +1740,7 @@ class ReadOnlyInboxService:
                 ctx=detail_ctx,
             )
 
-        _enforce_authority_fences(
-            op, session_echo, self._session_validator, self._live_authority_checker
-        )
-        return snapshot
+        return self._run_fenced_snapshot(ctx, _query)
 
     def get_inbox_summary(
         self,
@@ -1624,36 +1752,21 @@ class ReadOnlyInboxService:
         session_generation: int | None = None,
     ) -> InboxSummarySnapshot:
         """Return bounded O(1)-row SQL aggregate counts by status, severity, and health."""
-        op = _authorize_operator_caller(caller)
-        max_bytes = _validate_int_range(
-            max_response_bytes,
-            _PARAM_MAX_RESPONSE_BYTES,
-            MIN_RESPONSE_BYTES,
-            MAX_RESPONSE_BYTES,
-        )
-        read_ms = _validate_int_range(
-            max_read_ms, _PARAM_MAX_READ_MS, MIN_READ_MS, MAX_READ_MS
-        )
-        session_echo = _validate_session_args(
-            read_session_id,
-            session_generation,
-            has_validator=(self._session_validator is not None),
-        )
-        _enforce_authority_fences(
-            op, session_echo, self._session_validator, self._live_authority_checker
-        )
-        _trusted_dir, db_path = verify_state_dir_and_db_readonly(
-            self._state_dir, self._sandbox_root
+        op = _require_operator_principal(caller)
+        ctx = self._admit_read_call(
+            op,
+            max_response_bytes=max_response_bytes,
+            max_read_ms=max_read_ms,
+            read_session_id=read_session_id,
+            session_generation=session_generation,
         )
 
-        deadline = time.monotonic() + (read_ms / 1000.0)
-        with open_readonly_inbox_snapshot(db_path, deadline=deadline) as conn:
-            snapshot_seq = read_inbox_seq_counter(conn, deadline)
-            status_counts = select_status_aggregate_counts(conn, deadline)
+        def _query(conn: sqlite3.Connection, snapshot_seq: int) -> InboxSummarySnapshot:
+            status_counts = select_status_aggregate_counts(conn, ctx.deadline)
             sev_counts, pending_by_sev = select_severity_aggregate_counts(
-                conn, deadline
+                conn, ctx.deadline
             )
-            totals = select_structural_summary_totals(conn, deadline)
+            totals = select_structural_summary_totals(conn, ctx.deadline)
             snapshot = InboxSummarySnapshot(
                 schema_version=INBOX_SCHEMA_VERSION,
                 snapshot_seq=snapshot_seq,
@@ -1665,14 +1778,12 @@ class ReadOnlyInboxService:
                 requires_human_review_count=totals["requires_human_review_count"],
                 malformed_rows_count=totals["malformed_rows_count"],
                 pin_verification_scope=PIN_VERIFICATION_SCOPE_ITEM_ONLY,
-                read_session=session_echo,
+                read_session=ctx.session_echo,
             )
-            _assert_serialized_within_budget(snapshot, max_bytes, deadline)
+            _assert_serialized_within_budget(snapshot, ctx.max_bytes, ctx.deadline)
+            return snapshot
 
-        _enforce_authority_fences(
-            op, session_echo, self._session_validator, self._live_authority_checker
-        )
-        return snapshot
+        return self._run_fenced_snapshot(ctx, _query)
 
 
 HumanInboxReadProjection = ReadOnlyInboxService

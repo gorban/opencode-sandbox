@@ -9,7 +9,7 @@ docs/prds/spikes/{m,n}. Every dataclass constructor stays <= 12 parameters
 from __future__ import annotations
 
 import base64
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
@@ -52,6 +52,8 @@ MAX_METADATA_LIST_ITEMS = 32
 SQL_MAX_CELL_BYTES = 65_536
 MAX_JSON_DEPTH = 8
 MAX_CURSOR_BYTES = 512
+MAX_OPAQUE_TOKEN_CHARS = 96
+MAX_STATUS_FILTER_ITEMS = 16
 MAX_PRIORITY_RANK = 100
 DEFAULT_MAX_READ_MS = 2000
 MIN_READ_MS = 50
@@ -131,21 +133,21 @@ _PEM_BLOCK_RE = re.compile(
     r"(?:-----END [A-Z\d ]{0,32}PRIVATE KEY-----|$)"
 )
 _URL_BASIC_AUTH_RE = re.compile(
-    r"(?i)((?:https?|postgres(?:ql)?|redis|ftp|sftp)://)[^\s/@:]+:[^\s/@]+@"
-)
-_BEARER_BASIC_RE = re.compile(
-    r"(?i)\b(?:authorization\s*[:=]\s*)?(?:bearer|basic)\s+[a-z\d._~+/=-]{4,}"
+    r"(?i)((?:https?|postgres(?:ql)?|redis|ftp|sftp)://)[^\s/@:]+:[^\s/@]*(@|$)"
 )
 _HEADER_QUOTED_RE = re.compile(
-    r"(?i)(?<![A-Za-z\d_.-])"
+    r"(?i)(?<![a-z\d_.-])"
     r"((?:proxy[_-]?)?authorization|set[_-]?cookie|cookie|auth[_-]?header)"
-    r"([\"']\s*[:=]\s*)"
+    r"([\"']?\s*[:=]\s*)"
     r"(?:\"(?:\\.|[^\"\\])*(?:\"|$)|'(?:\\.|[^'\\])*(?:'|$))"
 )
 _HEADER_LINE_RE = re.compile(
-    r"(?i)(?<![A-Za-z\d_.-])"
+    r"(?i)(?<![a-z\d_.-])"
     r"((?:proxy[_-]?)?authorization|set[_-]?cookie|cookie|auth[_-]?header)"
     r"(\s*[:=]\s*)[^\r\n}{]+"
+)
+_BEARER_BASIC_RE = re.compile(
+    r"(?i)\b(?:bearer|basic)\s+[^\s\"',;}{]{4,}"
 )
 _TOKEN_PREFIX_AND_JWT_RE = re.compile(
     r"(?:"
@@ -173,12 +175,20 @@ _KV_SECRET_RE = re.compile(
     r"(?:\"(?:\\.|[^\"\\])*(?:\"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s\"',;}{]+)"
 )
 
-_REDACT_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+
+def _replace_url_basic_auth(match: re.Match[str]) -> str:
+    suffix = "@" if match.group(2) == "@" else ""
+    return f"{match.group(1)}{REDACTED_MARKER}{suffix}"
+
+
+_REDACT_RULES: tuple[
+    tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...
+] = (
     (_PEM_BLOCK_RE, REDACTED_MARKER),
-    (_URL_BASIC_AUTH_RE, rf"\1{REDACTED_MARKER}@"),
-    (_BEARER_BASIC_RE, REDACTED_MARKER),
+    (_URL_BASIC_AUTH_RE, _replace_url_basic_auth),
     (_HEADER_QUOTED_RE, rf"\1\2{REDACTED_MARKER}"),
     (_HEADER_LINE_RE, rf"\1\2{REDACTED_MARKER}"),
+    (_BEARER_BASIC_RE, REDACTED_MARKER),
     (_TOKEN_PREFIX_AND_JWT_RE, REDACTED_MARKER),
     (_KV_SECRET_RE, rf"\1\2{REDACTED_MARKER}"),
 )
@@ -213,11 +223,18 @@ def contains_credential_pattern(text: str) -> bool:
 
 
 def validate_clean_opaque_token(value: object, label: str) -> str:
-    """Validate an opaque token, mapping AddressError cleanly to CoordValidationError."""
+    """Validate an opaque token in O(1)-bounded time, mapping AddressError cleanly."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_OPAQUE_TOKEN_CHARS
+        or not value.isascii()
+    ):
+        raise CoordValidationError(f"invalid_{label}")
     try:
         return validate_opaque_token(value, label)
-    except AddressError as exc:
-        raise CoordValidationError(str(exc)) from exc
+    except (AddressError, CoordValidationError) as exc:
+        raise CoordValidationError(f"invalid_{label}") from exc
 
 
 def is_valid_sha256_hex(value: object) -> bool:
@@ -250,7 +267,7 @@ def is_json_tree_valid(value: Any, *, max_depth: int = MAX_JSON_DEPTH, depth: in
     return True
 
 
-def _reject_json_constant(token: str) -> Any:
+def reject_json_constant(token: str) -> Any:
     raise ValueError(f"Forbidden JSON constant: {token}")
 
 
@@ -712,22 +729,30 @@ def encode_inbox_list_cursor(
     )
 
 
-def _decode_raw_cursor_dict(raw: object) -> dict[str, Any]:
+def _extract_b64_cursor_part(raw: object) -> str:
     if not isinstance(raw, str):
         raise CoordValidationError(ERR_CURSOR_MALFORMED)
-    raw_bytes = raw.encode(_UTF8, errors="surrogatepass")
-    if len(raw_bytes) > MAX_CURSOR_BYTES or not raw.startswith(CURSOR_PREFIX):
+    if (
+        len(raw) > MAX_CURSOR_BYTES
+        or not raw.isascii()
+        or not raw.startswith(CURSOR_PREFIX)
+    ):
         raise CoordValidationError(ERR_CURSOR_MALFORMED)
     b64_part = raw[len(CURSOR_PREFIX) :]
     if not b64_part or _CURSOR_B64URL_RE.fullmatch(b64_part) is None:
         raise CoordValidationError(ERR_CURSOR_MALFORMED)
+    return b64_part
+
+
+def _decode_raw_cursor_dict(raw: object) -> dict[str, Any]:
+    b64_part = _extract_b64_cursor_part(raw)
     pad_len = (-len(b64_part)) % 4
     if pad_len == 3:
         raise CoordValidationError(ERR_CURSOR_MALFORMED)
     try:
         decoded_bytes = base64.urlsafe_b64decode(b64_part + ("=" * pad_len))
         parsed = json.loads(
-            decoded_bytes.decode(_UTF8), parse_constant=_reject_json_constant
+            decoded_bytes.decode(_UTF8), parse_constant=reject_json_constant
         )
     except (ValueError, RecursionError) as exc:
         raise CoordValidationError(ERR_CURSOR_MALFORMED) from exc

@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -172,6 +173,8 @@ _CANARY_ART_ID = "".join(("ocjob_", "syntheticArt", "Secret1"))
 _CANARY_INC_ID = "".join(("ocpeer_", "syntheticInc", "Secret1"))
 
 _SQL_INSERT_ART = "INSERT INTO review_artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+_SQL_INSERT_RUN = "INSERT INTO workflow_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+_ERR_ITEM_NOT_FOUND = "review_item_not_found"
 _SQL_BUMP_SEQ = "UPDATE inbox_seq_counter SET last_seq = last_seq + 1 WHERE id = 1"
 _REV_REMOTE = "rev-remote"
 _REV_BADPIN = "rev-badpin"
@@ -238,18 +241,20 @@ def _make_private_dir(parent: Path, name: str) -> Path:
     return path
 
 
-def _init_inbox_db(state_dir: Path, *, initial_seq: int = 1) -> Path:
+def _init_inbox_db(
+    state_dir: Path, *, initial_seq: int = 1, schema_sql: str = _SCHEMA_SQL
+) -> Path:
     db_path = state_dir / DB_FILENAME
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA journal_mode = WAL")
-        conn.executescript(_SCHEMA_SQL)
+        conn.executescript(schema_sql)
         conn.execute(
             "INSERT INTO inbox_seq_counter (id, last_seq) VALUES (1, ?)",
             (initial_seq,),
         )
         conn.execute(
-            "INSERT INTO workflow_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            _SQL_INSERT_RUN,
             (
                 _RUN_ID,
                 _WORKFLOW_ID,
@@ -709,7 +714,7 @@ class TestPinsArtifactsAndExclusivity(InboxReadTestBase):
         self.assertEqual([it.review_id for it in filtered.items], ["rev-peer"])
         with self.assertRaises(CoordPolicyError) as ctx_nf:
             self.svc.get_inbox_item(_OP, review_id="rev-does-not-exist")
-        self.assertIn("review_item_not_found", str(ctx_nf.exception))
+        self.assertIn(_ERR_ITEM_NOT_FOUND, str(ctx_nf.exception))
 
     def test_orchestrator_advisory_with_lane_paused_contradiction_all_3_apis(self) -> None:
         _insert_item(
@@ -1390,6 +1395,7 @@ class TestBudgetsCursorsAndDeadlines(InboxReadTestBase):
         with (
             mock.patch("oc_inbox_projection.time.monotonic", side_effect=_advancing_monotonic),
             mock.patch("oc_inbox_db.time.monotonic", side_effect=_advancing_monotonic),
+            mock.patch("oc_projection_db.time.monotonic", side_effect=_advancing_monotonic),
             self.assertRaises(CoordPolicyError) as ctx_pack,
         ):
             self.svc.get_inbox_summary(_OP, max_read_ms=50)
@@ -1406,6 +1412,299 @@ class TestBudgetsCursorsAndDeadlines(InboxReadTestBase):
         self.svc.get_inbox_item(_OP, review_id=_REV_ID)
         self.svc.get_inbox_summary(_OP)
         self.assertEqual(_snapshot_db_digest(self.db_path), before_digest)
+
+
+class _NoEncodeStr(str):
+    """Test string failing immediately if .encode() is invoked."""
+
+    def encode(self, *_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("encode_must_not_be_called")
+
+
+class TestExternalReviewRegressions(InboxReadTestBase):
+    """Adversarial regressions verified red on c48ee250 and green on patched code."""
+
+    def test_collate_nocase_cross_identity_and_schema_pk_index_guards(self) -> None:
+        rev_pk_def = "review_id             TEXT PRIMARY KEY"
+        nc_dir = _make_private_dir(self.root, "nocase_state")
+        nc_schema = (
+            _SCHEMA_SQL.replace(
+                "run_id        TEXT PRIMARY KEY",
+                "run_id        TEXT PRIMARY KEY COLLATE NOCASE",
+            )
+            .replace(rev_pk_def, f"{rev_pk_def} COLLATE NOCASE")
+            .replace(
+                "review_id   TEXT NOT NULL",
+                "review_id   TEXT NOT NULL COLLATE NOCASE",
+            )
+        )
+        nc_db = _init_inbox_db(nc_dir, schema_sql=nc_schema)
+        _exec_write(
+            nc_db,
+            _SQL_INSERT_RUN,
+            ("run-a", _WORKFLOW_ID, _SPEC_DIGEST, _POLICY_DIGEST, "running", "orchestrator", 1700000000.0, 1700000001.0),
+        )
+        pin = compute_review_pin_sha256(
+            run_id="Run-A",
+            step_id=_STEP_ID,
+            review_id="Rev-1",
+            checkpoint_seq=10,
+            artifact_sha256=_ART_SHA,
+            policy_digest=_POLICY_DIGEST,
+        )
+        _insert_item(
+            nc_db,
+            {_COL_REVIEW_ID: "Rev-1", "run_id": "Run-A"},
+            override_pin=pin,
+            with_primary_artifact=False,
+        )
+        _exec_write(
+            nc_db,
+            _SQL_INSERT_ART,
+            ("art-lower", "rev-1", _ART_SHA, 128, _MEDIA_PATCH, "Lower", 1, 1700000000.0),
+        )
+
+        nc_svc = ReadOnlyInboxService(nc_dir, sandbox_root=self.sandbox_root)
+        with self.assertRaises(CoordPolicyError) as ctx_miss:
+            nc_svc.get_inbox_item(_OP, review_id="rev-1")
+        self.assertIn(_ERR_ITEM_NOT_FOUND, str(ctx_miss.exception))
+        self.assertEqual(nc_svc.list_inbox_items(_OP, run_id="run-a").items, ())
+
+        detail = nc_svc.get_inbox_item(_OP, review_id="Rev-1")
+        self.assertFalse(detail.item.pin_verified)
+        self.assertFalse(detail.item.review_ready)
+        self.assertEqual(detail.item.anomaly_reason, ANOMALY_RUN_MISSING)
+        self.assertIsNone(detail.item.identity.workflow_id)
+        self.assertEqual(detail.artifact_refs, ())
+
+        nopk_dir = _make_private_dir(self.root, "nopk_state")
+        nopk_schema = _SCHEMA_SQL.replace(
+            rev_pk_def,
+            "review_id             TEXT NOT NULL",
+        )
+        _init_inbox_db(nopk_dir, schema_sql=nopk_schema)
+        nopk_svc = ReadOnlyInboxService(nopk_dir, sandbox_root=self.sandbox_root)
+        with self.assertRaises(CoordPolicyError) as ctx_nopk:
+            nopk_svc.list_inbox_items(_OP)
+        self.assertEqual(str(ctx_nopk.exception), ERR_INBOX_UNREADABLE)
+
+        idx_dir = _make_private_dir(self.root, "extra_idx_state")
+        idx_db = _init_inbox_db(idx_dir)
+        _exec_write(idx_db, "CREATE INDEX idx_evil_expr ON review_items(lower(review_id))")
+        idx_svc = ReadOnlyInboxService(idx_dir, sandbox_root=self.sandbox_root)
+        with self.assertRaises(CoordPolicyError) as ctx_idx:
+            idx_svc.list_inbox_items(_OP)
+        self.assertEqual(str(ctx_idx.exception), ERR_INBOX_UNREADABLE)
+
+    def test_sql_truncation_withholds_split_credential_prefix(self) -> None:
+        url_tok = "".join(("TopSec", "Url", "998877"))
+        sk_tok = "".join(("9988", "7766", "5544"))
+        url_cred = "".join(("https://", "alice:", url_tok, "@example.com/db"))
+        sk_cred = "".join(("sk-ant-", sk_tok))
+        ansi_pad = "\x1b[31m" * 202
+        rev_cut_url = "rev-cut-url"
+        rev_cut_sk = "rev-cut-sk"
+
+        _insert_item(
+            self.db_path,
+            {
+                _COL_REVIEW_ID: rev_cut_url,
+                "title": "t " + ansi_pad + " " + url_cred,
+                _COL_SUMMARY_TEXT: "s " + ("a" * (MAX_ITEM_TEXT_BYTES - 21)) + " " + url_cred,
+            },
+            artifact_id="art-cut-url",
+        )
+        _insert_item(
+            self.db_path,
+            {
+                _COL_REVIEW_ID: rev_cut_sk,
+                "title": "t " + ("b" * 245) + " " + sk_cred,
+                _COL_SUMMARY_TEXT: "s " + ("b" * (MAX_ITEM_TEXT_BYTES - 12)) + " " + sk_cred,
+            },
+            artifact_id="art-cut-sk",
+        )
+        _exec_write(
+            self.db_path,
+            "UPDATE review_artifacts SET label = ? WHERE artifact_id = 'art-cut-url'",
+            ("l " + ansi_pad + " " + sk_cred,),
+        )
+        _exec_write(
+            self.db_path,
+            "UPDATE review_artifacts SET label = ? WHERE artifact_id = 'art-cut-sk'",
+            ("l " + ("c" * 245) + " " + url_cred,),
+        )
+
+        page_json = serialize_inbox_json(self.svc.list_inbox_items(_OP))
+        d1_json = serialize_inbox_json(self.svc.get_inbox_item(_OP, review_id=rev_cut_url))
+        d2_json = serialize_inbox_json(self.svc.get_inbox_item(_OP, review_id=rev_cut_sk))
+        combined = page_json + d1_json + d2_json
+        for leaked in ("alice:", url_tok[:4], "sk-ant-", sk_tok[:2]):
+            self.assertNotIn(leaked, combined)
+
+    def test_stage2_header_redaction_ordering_and_quoted_braces(self) -> None:
+        s1 = "".join(("SUPER_", "SEC_", "COLON1"))
+        s2 = "".join(("SUPER_", "SEC_", "DOLLAR2"))
+        s3 = "".join(("PROXY_", "SEC_", "DOLLAR3"))
+        s4 = "".join(("extra_", "secret_", "tail4"))
+        s5 = "".join(("EXTRA_", "BASIC_", "SEC5"))
+        s6 = "".join(("SECRET_", "AFTER_", "BRACE6"))
+        s7 = "".join(("SECRET_", "COOKIE_", "BRACE7"))
+        payload = "\n".join(
+            (
+                f"Authorization: Bearer abc123:{s1}",
+                f"Authorization: Bearer fooo${s2}",
+                f"Proxy-Authorization: Bearer fooo${s3}",
+                f"Authorization: Bearer tok1234 {s4}",
+                f"Authorization: Basic dXNlcjpwYXNz {s5}",
+                f'Authorization: "part1}}{s6}"',
+                f'Cookie: "sid=abc}}{s7}"',
+            )
+        )
+        _insert_item(
+            self.db_path,
+            {_COL_REVIEW_ID: "rev-hdr-ord", _COL_SUMMARY_TEXT: payload},
+            artifact_id="art-hdr-ord",
+        )
+        page = self.svc.list_inbox_items(_OP)
+        serialized = serialize_inbox_json(page)
+        for secret in (s1, s2, s3, s4, s5, s6, s7):
+            self.assertNotIn(secret, serialized)
+        self.assertTrue(page.items[0].redaction_applied)
+
+    def test_stage1_nested_spliced_padded_escapes_and_dot_metadata_keys(self) -> None:
+        cases = (
+            ("rev-fsm-1", "A\x1b[\x1b]0;x\x0731mB"),
+            ("rev-fsm-2", "A\x9b\x1b]0;x\x0731mB"),
+            ("rev-fsm-3", "A\x1b\x1b]0;x\x07]0;PWNED\x07B"),
+            ("rev-fsm-4", "A\x1b\x1bPfoo\x1b\\]0;HIDDEN_OSC\x07B"),
+            ("rev-fsm-5", "A\x1b\x00]0;HIDDEN_NUL\x07B"),
+            ("rev-fsm-6", "A\x1b\x7fPHIDDEN_DCS\x1b\\B"),
+        )
+        dot_meta = json.dumps(
+            {
+                "api.key": "dot1",
+                "private.key": "dot2",
+                "env.vars": "dot3",
+                "auth/header": "dot4",
+                "safe_ok": "kept",
+            }
+        )
+        for rid, text in cases:
+            _insert_item(
+                self.db_path,
+                {
+                    _COL_REVIEW_ID: rid,
+                    _COL_SUMMARY_TEXT: text,
+                    _COL_METADATA_JSON: dot_meta,
+                },
+                artifact_id=f"art-{rid}",
+            )
+        page = self.svc.list_inbox_items(_OP)
+        serialized = serialize_inbox_json(page)
+        for item in page.items:
+            self.assertEqual(item.summary_text, "AB")
+            self.assertTrue(item.has_control_or_bidi)
+            self.assertTrue(item.redaction_applied)
+            self.assertEqual(dict(item.metadata), {"safe_ok": "kept"})
+        for leaked in ("31m", "PWNED", "HIDDEN_OSC", "HIDDEN_NUL", "HIDDEN_DCS", "dot1", "dot2", "dot3", "dot4"):
+            self.assertNotIn(leaked, serialized)
+
+    def test_credential_shaped_media_type_and_read_session_id_blocked(self) -> None:
+        cred_tok = "".join(("sk-ant-", "mediaSec", "123456"))
+        _insert_item(
+            self.db_path,
+            {_COL_REVIEW_ID: "rev-mt-p"},
+            with_primary_artifact=False,
+        )
+        _exec_write(
+            self.db_path,
+            _SQL_INSERT_ART,
+            ("art-mt-p", "rev-mt-p", _ART_SHA, 64, f"application/vnd.{cred_tok}", "Prim", 1, 1700000000.0),
+        )
+        _exec_write(
+            self.db_path,
+            _SQL_INSERT_ART,
+            ("art-mt-s", "rev-mt-p", _ART_SHA_ALT, 64, f"text/{cred_tok}", "Sec", 0, 1700000000.0),
+        )
+        detail = self.svc.get_inbox_item(_OP, review_id="rev-mt-p")
+        self.assertFalse(detail.item.pin_verified)
+        self.assertFalse(detail.item.review_ready)
+        self.assertEqual(detail.item.anomaly_reason, ANOMALY_ARTIFACT_MISMATCH)
+        self.assertTrue(detail.item.malformed_metadata)
+        self.assertTrue(detail.artifacts_malformed)
+        for art in detail.artifact_refs:
+            self.assertEqual(art.media_type, "application/octet-stream")
+            self.assertTrue(art.redaction_applied)
+            self.assertTrue(art.malformed_metadata)
+        self.assertNotIn(cred_tok, serialize_inbox_json(detail))
+
+        cred_sess = "".join(("sk-ant-", "sessTok", "123456"))
+        sess_svc = ReadOnlyInboxService(
+            self.state_dir,
+            sandbox_root=self.sandbox_root,
+            session_validator=lambda _c, _sid, _gen: True,
+        )
+        for call in (
+            lambda: sess_svc.list_inbox_items(_OP, read_session_id=cred_sess, session_generation=1),
+            lambda: sess_svc.get_inbox_item(_OP, review_id="rev-mt-p", read_session_id=cred_sess, session_generation=1),
+            lambda: sess_svc.get_inbox_summary(_OP, read_session_id=cred_sess, session_generation=1),
+        ):
+            with self.assertRaises(CoordValidationError) as ctx_s:
+                call()
+            self.assertEqual(str(ctx_s.exception), "invalid_read_session_id")
+            self.assertNotIn(cred_sess, str(ctx_s.exception))
+
+    def test_mid_read_revocation_precedes_storage_errors(self) -> None:
+        _insert_item(self.db_path, {_COL_REVIEW_ID: "rev-keep-1"}, artifact_id="art-k1")
+        _insert_item(self.db_path, {_COL_REVIEW_ID: "rev-keep-2"}, artifact_id="art-k2")
+        page1 = self.svc.list_inbox_items(_OP, limit=1)
+        stale_cursor = page1.next_cursor
+        self.assertIsNotNone(stale_cursor)
+        _exec_write(self.db_path, _SQL_BUMP_SEQ)
+
+        calls = 0
+
+        def _retire_on_second(_c: PrincipalCtx, _sid: str, _gen: int) -> bool:
+            nonlocal calls
+            calls += 1
+            return calls % 2 == 1
+
+        rev_svc = ReadOnlyInboxService(
+            self.state_dir,
+            sandbox_root=self.sandbox_root,
+            session_validator=_retire_on_second,
+        )
+        with self.assertRaises(RevokedError):
+            rev_svc.get_inbox_item(
+                _OP, review_id="rev-missing-999", read_session_id=_SESS_ID, session_generation=1
+            )
+        with self.assertRaises(RevokedError):
+            rev_svc.list_inbox_items(
+                _OP, after_cursor=stale_cursor, read_session_id=_SESS_ID, session_generation=1
+            )
+
+    def test_o1_cursor_no_encode_and_bounded_statuses_and_token_precheck(self) -> None:
+        oversize_cur = _NoEncodeStr("v1." + ("A" * 600))
+        with self.assertRaises(CoordValidationError) as ctx_cur:
+            self.svc.list_inbox_items(_OP, after_cursor=oversize_cur)
+        self.assertIn(ERR_CURSOR_MALFORMED, str(ctx_cur.exception))
+
+        oversize_tok = _NoEncodeStr("a" * 200)
+        with self.assertRaises(CoordValidationError):
+            self.svc.get_inbox_item(_OP, review_id=oversize_tok)
+        with self.assertRaises(CoordValidationError):
+            self.svc.list_inbox_items(_OP, run_id=oversize_tok)
+
+        for many in (itertools.repeat(STATUS_PENDING), [STATUS_PENDING] * 1000):
+            with self.assertRaises(CoordValidationError) as ctx_many:
+                self.svc.list_inbox_items(_OP, statuses=many)
+            self.assertEqual(str(ctx_many.exception), "status_filter_too_many_entries")
+
+        bad_sec = "".join(("sk-ant-", "badStat", "123456"))
+        with self.assertRaises(CoordValidationError) as ctx_bad:
+            self.svc.list_inbox_items(_OP, statuses=[bad_sec])
+        self.assertEqual(str(ctx_bad.exception), "unsupported_inbox_status_filter")
+        self.assertNotIn(bad_sec, str(ctx_bad.exception))
 
 
 if __name__ == "__main__":
