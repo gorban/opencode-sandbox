@@ -126,12 +126,17 @@ assembly:
 ```python
 @contextlib.contextmanager
 function open_readonly_snapshot(db_path, *, deadline: float) -> Iterator[sqlite3.Connection]:
+    # Build and validate the SQLite URI BEFORE acquiring _UMASK_LOCK so a surrogate-escaped
+    # POSIX path (UnicodeEncodeError) or URI-construction failure can never strand the lock.
+    try:
+        uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
+    except UnicodeEncodeError as exc:
+        raise CoordPolicyError("registry_unreadable") from exc
     remaining_s = check_deadline_s(deadline)  # raises CoordPolicyError("read_deadline_exceeded") if <= 0
     if not _UMASK_LOCK.acquire(timeout=remaining_s):
         raise CoordPolicyError("read_deadline_exceeded")
-    uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
-    conn = None
     try:
+        conn = None
         # Recompute remaining budget AFTER acquiring _UMASK_LOCK; expiry prevents connect()!
         remaining_ms = check_deadline_ms(deadline)
         old_umask = os.umask(0o077)
@@ -150,7 +155,10 @@ function open_readonly_snapshot(db_path, *, deadline: float) -> Iterator[sqlite3
             install_progress_deadline(conn, deadline)      # aborts VM when time.monotonic() >= deadline
             conn.execute("BEGIN DEFERRED")
             # Immediately anchor the WAL read snapshot on seq_counter inside this transaction!
-            conn.execute("SELECT last_seq FROM seq_counter WHERE id = 1").fetchone()
+            conn.execute(
+                "SELECT CASE WHEN typeof(last_seq) = 'integer' THEN last_seq ELSE NULL END AS last_seq "
+                "FROM seq_counter WHERE id = 1"
+            ).fetchone()
         except sqlite3.OperationalError as exc:
             if conn is not None:
                 safe_close(conn)
@@ -245,18 +253,22 @@ markers explicitly alongside a 3-state `health_status`: `"healthy" | "degraded" 
      - Otherwise -> `health_status = "unknown"`, `degraded = False` (reporting
        `session_active_marker_present` explicitly without overstating `"healthy"` when a crashed
        or restarted hub's in-memory state is unknown!).
-3. **Orphaned & unconfirmed `external_transport_bindings` (`LEFT JOIN`, SQL-gated columns, inside SQLite snapshot):**
+3. **Orphaned & unconfirmed `external_transport_bindings` (`LEFT JOIN`, SQL storage-class & byte-gated columns, inside SQLite snapshot):**
    ```sql
    SELECT
        CASE WHEN typeof(b.sandbox_addr) = 'text' AND LENGTH(CAST(b.sandbox_addr AS BLOB)) <= 256
             THEN b.sandbox_addr ELSE NULL END AS sandbox_addr,
        CASE WHEN typeof(b.incarnation_id) = 'text' AND LENGTH(CAST(b.incarnation_id AS BLOB)) <= 256
             THEN b.incarnation_id ELSE NULL END AS incarnation_id,
-       b.abort_requested,
-       b.terminal_confirmed,
+       CASE WHEN typeof(b.abort_requested) = 'integer' THEN b.abort_requested ELSE NULL END AS abort_requested,
+       (typeof(b.abort_requested) != 'integer') AS abort_requested_malformed,
+       CASE WHEN typeof(b.terminal_confirmed) = 'integer' THEN b.terminal_confirmed ELSE NULL END AS terminal_confirmed,
+       (typeof(b.terminal_confirmed) != 'integer') AS terminal_confirmed_malformed,
        SUBSTR(CAST(b.reason AS BLOB), 1, 1024) AS reason_blob,
        LENGTH(CAST(b.reason AS BLOB)) AS reason_bytes,
-       b.updated_at,
+       (typeof(b.reason) != 'text') AS reason_non_text,
+       CASE WHEN typeof(b.updated_at) IN ('integer', 'real') THEN b.updated_at ELSE NULL END AS updated_at,
+       (typeof(b.updated_at) NOT IN ('integer', 'real')) AS updated_at_malformed,
        CASE WHEN typeof(s.status) = 'text' AND LENGTH(CAST(s.status AS BLOB)) <= 64
             THEN s.status ELSE NULL END AS sandbox_status,
        CASE WHEN typeof(s.incarnation_id) = 'text' AND LENGTH(CAST(s.incarnation_id AS BLOB)) <= 256
@@ -264,8 +276,10 @@ markers explicitly alongside a 3-state `health_status`: `"healthy" | "degraded" 
        (s.sandbox_addr IS NULL) AS sandbox_missing
    FROM external_transport_bindings b
    LEFT JOIN sandboxes s ON s.sandbox_addr = b.sandbox_addr
-   WHERE b.terminal_confirmed = 0
-     AND (b.abort_requested != 0
+   WHERE (typeof(b.terminal_confirmed) != 'integer' OR b.terminal_confirmed = 0)
+     AND (typeof(b.terminal_confirmed) != 'integer'
+          OR typeof(b.abort_requested) != 'integer'
+          OR b.abort_requested != 0
           OR s.sandbox_addr IS NULL
           OR s.status = 'revoked'
           OR s.incarnation_id != b.incarnation_id)
@@ -274,11 +288,20 @@ markers explicitly alongside a 3-state `health_status`: `"healthy" | "degraded" 
    ```
    - Using `LEFT JOIN` ensures orphaned bindings whose `sandboxes` row is missing are **never**
      dropped (matching `oc_hub.py:1336-1338`).
-   - Every identity and status column is type- and byte-gated in SQL (`typeof(col) = 'text'` and
-     bounded `LENGTH(CAST(col AS BLOB))`) without truncating an oversized identifier into an
-     apparent match: if `sandbox_addr` or `incarnation_id` is malformed/oversized (`NULL`), the
-     entry is emitted with `sandbox_addr = None` / `incarnation_id = None` and
-     `malformed_identity = True` (and still counted in `unconfirmed_bindings_count`).
+   - Every selected column — including nominally numeric flags and timestamps (`b.abort_requested`,
+     `b.terminal_confirmed`, `b.updated_at`) in SQLite's non-`STRICT` tables — is storage-class
+     and byte-gated inside SQL:
+     - If `b.sandbox_addr` or `b.incarnation_id` is non-`TEXT` or `> 256` bytes (`NULL`), the entry
+       emits `sandbox_addr = None` / `incarnation_id = None` and `malformed_identity = True` (never
+       truncating an oversized identifier into an apparent match, and still counting it in
+       `unconfirmed_bindings_count`).
+     - If `b.abort_requested`, `b.terminal_confirmed`, or `b.updated_at` has an unexpected SQLite
+       storage class (e.g., an oversized BLOB stored in `updated_at`), SQL returns `NULL` plus the
+       corresponding `*_malformed = 1` flag so zero oversized bytes cross into Python; the entry
+       clamps cleanly (`abort_requested = False` if null, `updated_at = 0.0` if null/non-finite)
+       and sets `malformed_metadata = True`.
+     - Rows with non-integer `b.terminal_confirmed` or `b.abort_requested` also qualify fail-closed
+       as unconfirmed bindings (`health_status = "degraded"`).
    - Also execute `SELECT COUNT(*) ...` with the exact same `WHERE` clause so
      `unconfirmed_bindings_count` is exact even when the summary list is capped at
      `MAX_UNCONFIRMED_BINDINGS_SUMMARY = 50`.
@@ -403,15 +426,21 @@ cursor = "v1." + base64url_nopad(json.dumps(payload, separators=(",", ":"), sort
      - Cursor payload: `{"op": "tree", "fh": "<16-hex>", "addr": "<sandbox_addr>"}` — always
        `< 160` bytes regardless of how long `project_id` is!
      - **SQL-bounded `project_id` fetch (`MAX_PROJECT_ID_HASH_BYTES = 4096`):** Fetch
-       `LENGTH(CAST(project_id AS BLOB)) AS project_id_bytes` and
-       `CASE WHEN LENGTH(CAST(project_id AS BLOB)) <= 4096 THEN project_id ELSE SUBSTR(CAST(project_id AS TEXT), 1, 256) END AS project_id_raw`.
-       - When `project_id_bytes <= 4096` (covers every normal and 2 KiB long `project_id`): group
-         by exact `project_id_raw`, emit exact `project_id_sha256`, and truncate displayed
-         `project_id` to `MAX_METADATA_TEXT_BYTES` (`project_id_truncated = True` if shortened).
-       - When `project_id_bytes > 4096`: SQL never materializes the multi-MB cell into Python;
-         mark `malformed_metadata = True`, `project_id_truncated = True`, `project_id_sha256 = None`,
-         and isolate that sandbox in its own group keyed by `("oversize", sandbox_addr)` so
-         oversized `project_id`s can never merge with another project!
+       `LENGTH(CAST(project_id AS BLOB)) AS project_id_bytes`,
+       `(typeof(project_id) != 'text') AS project_id_non_text`,
+       `CASE WHEN typeof(project_id) = 'text' AND LENGTH(CAST(project_id AS BLOB)) <= 4096 THEN project_id ELSE NULL END AS project_id_raw`,
+       and `SUBSTR(CAST(project_id AS BLOB), 1, 1024) AS project_id_preview_blob`.
+       - When `project_id_raw is not None` (`typeof = 'text'` and `<= 4096` bytes, covering every
+         normal and 2 KiB long `project_id`): group by exact `project_id_raw`, emit exact
+         `project_id_sha256`, and truncate displayed `project_id` to `MAX_METADATA_TEXT_BYTES`
+         (`project_id_truncated = True` if shortened).
+       - When `project_id_raw is None` (`project_id_bytes > 4096` or non-`TEXT`): SQL never
+         materializes a multi-MB cell into Python; decode the bounded display prefix safely from
+         `project_id_preview_blob`, mark `malformed_metadata = True`,
+         `project_id_truncated = (project_id_bytes > MAX_METADATA_TEXT_BYTES)`,
+         `project_id_sha256 = None`, and isolate that sandbox in its own group keyed by
+         `("oversize", sandbox_addr)` so oversized or non-text `project_id`s can never merge with
+         another project!
   2. **`get_thread_events`:** Total order `(seq ASC, source_rank ASC)` where `source_rank = 0` for
      `event_log` and `1` for `stream_events` (`seq` is unique per table via `INTEGER PRIMARY KEY`).
      - Cursor payload: `{"op": "events", "fh": "<16-hex>", "seq": int, "rank": 0|1, "inc": "<incarnation_id>"}`.
@@ -480,20 +509,44 @@ All 4 APIs serialize strictly via `json.dumps(obj.to_dict(), ensure_ascii=False,
        primary row identifiers fail closed (`CoordPolicyError("registry_unreadable")`), while
        malformed secondary/diagnostic refs (e.g., binding summary IDs, `in_reply_to`, `file_path`,
        `stream_id`) emit `None` + `malformed_identity = True` / `malformed_metadata = True`.
+     - **Nominally numeric columns (flags, counters, sequence numbers, timestamps):** Because
+       `oc_registry.py` tables are non-`STRICT`, SQLite allows an arbitrary multi-MB BLOB or TEXT
+       value in any declared `INTEGER` or `REAL` column. Every projected numeric column is
+       therefore storage-class gated **inside SQL** before crossing into Python:
+       - Integer flags, counters, and non-rowid sequence columns (`seq_counter.last_seq`,
+         `sandboxes.depth`, `threads.last_seq`, `routing_edges.max_rounds`, `turns_used`,
+         `rate_limit_rpm`, `active`, `grant_generation`, `grant_tombstones.grant_generation`,
+         `event_log.edge_turn_seq`, `outbox.seq`, `outbox.grant_generation`, `outbox.priority`,
+         `outbox.body_bytes`, `outbox.attempts`, `stream_events.seq_hint`,
+         `external_transport_bindings.abort_requested`, `terminal_confirmed`):
+         `CASE WHEN typeof(col) = 'integer' THEN col ELSE NULL END AS col, (typeof(col) != 'integer') AS col_malformed`.
+       - Floating-point timestamps (`created_at`, `updated_at`, `revoked_at`, `consumed_at`):
+         `CASE WHEN typeof(col) IN ('integer', 'real') THEN col ELSE NULL END AS col, (typeof(col) NOT IN ('integer', 'real')) AS col_malformed`
+         (and `WHERE typeof(consumed_at) IN ('integer', 'real')` on `dispatch_receipts` lookup).
+       - Malformed required anchor/key integers (`seq_counter.last_seq`, `outbox.seq`) fail closed
+         with `CoordPolicyError("registry_unreadable")`; malformed non-anchor flags, counters, and
+         timestamps (or non-finite `NaN`/`Inf` reals) fall back safely (`0` / `False` / `0.0`) and
+         set `malformed_metadata = True` without transferring any oversized BLOB/TEXT value to
+         Python.
      - **JSON columns (`detail_json`, `artifact_refs_json`, `allowed_threads_json`,
        `allowed_msg_kinds_json`, `budget_json`):**
        `CASE WHEN typeof(col) = 'text' AND LENGTH(CAST(col AS BLOB)) <= 65536 THEN CAST(col AS BLOB) ELSE NULL END AS col_blob, LENGTH(CAST(col AS BLOB)) AS col_bytes`.
-       Cells `> SQL_MAX_CELL_BYTES (65,536)` are never returned to Python and immediately produce
-       `malformed_metadata = True` with safe empty fallback (`{}` / `()`).
+       Cells `> SQL_MAX_CELL_BYTES (65,536)` or non-`TEXT` are never returned to Python and
+       immediately produce `malformed_metadata = True` with safe empty fallback (`{}` / `()`).
      - **Single-line display metadata (`project_name`, `branch`, `task_brief`, `title`, `detail`,
        `reason`):** Fetch bounded **BLOB** prefix `SUBSTR(CAST(col AS BLOB), 1, 1024)` +
-       `LENGTH(CAST(col AS BLOB)) AS col_bytes`, decode safely at UTF-8 boundary (preserving
-       embedded `\x00` for detection!), scrub control/bidi chars, and cap to
+       `LENGTH(CAST(col AS BLOB)) AS col_bytes` + `(typeof(col) != 'text') AS col_non_text`, decode
+       safely at UTF-8 boundary (preserving embedded `\x00` for detection!), scrub control/bidi
+       chars, set `malformed_metadata = True` if non-`TEXT` or invalid UTF-8, and cap to
        `MAX_METADATA_TEXT_BYTES`.
-     - **Event `body_text` / `text` (BLOB prefix + explicit `text_suffix_uninspected`):**
+     - **Event `body_text` / `text` (BLOB prefix + strict `TEXT` hash gate + explicit `text_suffix_uninspected`):**
        - Fetch `SUBSTR(CAST(col AS BLOB), 1, 16384) AS text_blob` +
-         `LENGTH(CAST(col AS BLOB)) AS original_text_bytes` (plus, on candidate host-badged
-         `stream_events` `user_message` rows, `CASE WHEN LENGTH(CAST(text AS BLOB)) <= 69632 THEN CAST(text AS BLOB) ELSE NULL END AS text_for_hash_blob`).
+         `LENGTH(CAST(col AS BLOB)) AS original_text_bytes` +
+         `(typeof(col) != 'text') AS text_non_text` (plus, on candidate host-badged
+         `stream_events` `user_message` rows,
+         `CASE WHEN typeof(text) = 'text' AND LENGTH(CAST(text AS BLOB)) <= 69632 THEN CAST(text AS BLOB) ELSE NULL END AS text_for_hash_blob`
+         — requiring original SQLite storage class `TEXT` BEFORE converting to BLOB so a raw BLOB
+         cell containing matching UTF-8 bytes can NEVER pass receipt verification!).
        - In Python, trim at most 3 trailing incomplete UTF-8 continuation bytes **only** when
          `original_text_bytes > len(text_blob)` (so a valid multibyte char split by the BLOB slice
          is cleanly backed up to a UTF-8 char boundary), then decode with `utf-8`
@@ -725,33 +778,37 @@ Inside the same read-only SQLite snapshot, every `stream_events` row is re-verif
        Require `isinstance(row["message_id"], str) and bool(row["message_id"])`.
      - **Exact 5-tuple receipt + envelope match (unique consumed receipt on 4-tuple):** Require BOTH:
        - `event_log` row matching exact `(msg_id = row.message_id, dst_addr = row.sandbox_addr, dst_incarnation = row.incarnation_id, dst_thread_id = row.thread_id)`, AND
-       - `dispatch_receipts` rows for `(sandbox_addr, incarnation_id, session_id = row.thread_id, message_id = row.message_id)` with `consumed_at IS NOT NULL` (`LIMIT 2`) having **`len(receipts) == 1`** (so tampered multi-receipt rows never depend on arbitrary `fetchone()` order -> `len != 1` downgrades with `"ambiguous_receipt_match"`).
+       - `dispatch_receipts` rows for `(sandbox_addr, incarnation_id, session_id = row.thread_id, message_id = row.message_id)` with `typeof(consumed_at) IN ('integer', 'real')` (`LIMIT 2`) having **`len(receipts) == 1`** (so tampered multi-receipt rows or non-numeric `consumed_at` payloads never depend on arbitrary `fetchone()` order -> `len != 1` downgrades with `"ambiguous_receipt_match"`).
      - Verify ALL of:
        1. `receipt.badge == raw_badge` AND `_TRUST_CLASS_TO_BADGE[TrustClass(receipt.trust_class)].value == raw_badge`,
        2. `receipt.trust_class == event_log.trust_class` AND `receipt.src_actor == event_log.src_actor` AND `receipt.body_sha256 == event_log.body_sha256`,
-       3. `text_for_hash_blob is not None` (SQL verified `LENGTH(CAST(text AS BLOB)) <= 69632`,
-          decoded strictly as UTF-8) AND `sha256_canonical_body(text_for_hash) == receipt.body_sha256`,
-          catching `(UnicodeDecodeError, CoordValidationError, TypeError, ValueError)` so NUL,
-          invalid UTF-8, surrogate, or non-string tampered cells NEVER crash reads and cleanly
-          downgrade with `anomaly_reason = "receipt_body_hash_mismatch"`.
+       3. `text_for_hash_blob is not None` (SQL verified **`typeof(text) = 'text'`** AND
+          `LENGTH(CAST(text AS BLOB)) <= 69632` before casting to BLOB, decoded strictly as UTF-8)
+          AND `sha256_canonical_body(text_for_hash) == receipt.body_sha256`, catching
+          `(UnicodeDecodeError, CoordValidationError, TypeError, ValueError)` so raw SQLite BLOBs,
+          NUL, invalid UTF-8, surrogate, or non-string tampered cells NEVER pass receipt hashing or
+          crash reads and cleanly downgrade with `anomaly_reason = "receipt_body_hash_mismatch"`.
      - **Badge-independent full-tuple ambiguity check (across the entire thread & page boundaries):**
        Because `dispatch_receipts` proves the host message's origin but does NOT store
        `stream_events.seq`, moving the stored badge between two stream rows that share the exact
        `(sandbox_addr, incarnation_id, thread_id, message_id, body_sha256)` tuple would otherwise
        leave one claimant with a valid consumed receipt. Therefore, fetch candidate `user_message`
        rows on `(sandbox_addr, incarnation_id, thread_id, message_id)` **regardless of their stored
-       `badge`**:
+       `badge`**, requiring `typeof(text) = 'text'` before returning hash input:
        ```sql
        SELECT seq,
-              CASE WHEN LENGTH(CAST(text AS BLOB)) <= 69632 THEN CAST(text AS BLOB) ELSE NULL END AS text_blob
+              CASE WHEN typeof(text) = 'text' AND LENGTH(CAST(text AS BLOB)) <= 69632
+                   THEN CAST(text AS BLOB) ELSE NULL END AS text_blob
        FROM stream_events
        WHERE sandbox_addr = ? AND incarnation_id = ? AND thread_id = ?
          AND event_type = 'user_message' AND message_id = ?
        ORDER BY seq ASC
        LIMIT 17
        ```
-       - Count how many candidate rows have `sha256_canonical_body(decoded_text) == receipt.body_sha256`
-         (checking deadline during iteration).
+       - Count how many candidate rows have `text_blob is not None` (i.e., original SQLite `TEXT`
+         storage class within 69,632 bytes) AND `sha256_canonical_body(decoded_text) == receipt.body_sha256`
+         (checking deadline during iteration). A raw SQLite `BLOB` row containing identical UTF-8
+         bytes yields `text_blob = NULL` and is therefore never eligible for verified attribution.
        - If `len(candidates) > 16` (flood cap exceeded) OR `full_tuple_match_count != 1` (e.g., two
          rows match the full 5-tuple regardless of which row currently carries `badge='Operator'`):
          **downgrade stream-row attribution** to `SANDBOX_LOCAL_UNVERIFIED` (`authority_rank = 0`,
@@ -880,6 +937,10 @@ under both default `$HOME` and `TMPDIR=/tmp` using private owner-only synthetic 
      (`"marker_unreadable"`) without blocking.
    - Orphaned `external_transport_bindings` row (missing `sandboxes` row) is included via `LEFT JOIN`
      and `owner_id` is never leaked in responses.
+   - Oversized BLOB (e.g., 2 MiB) stored in `external_transport_bindings.updated_at` (and non-integer
+     `abort_requested` / `terminal_confirmed`) on an otherwise qualifying row is blocked by SQL
+     storage-class gating without transferring the BLOB to Python, emitting bounded
+     `malformed_metadata = True` (`updated_at = 0.0`).
 4. **Hard response-byte bounds, SQL cell caps, cursors, deadline, & connection close:**
    - 1 KiB `max_response_bytes` page with escape-heavy (`"\\"\n\u0000`) and multibyte UTF-8 text
      stays strictly `<= 1024` UTF-8 bytes (`allow_nan=False`), truncating cleanly at UTF-8 boundary.
@@ -898,7 +959,9 @@ under both default `$HOME` and `TMPDIR=/tmp` using private owner-only synthetic 
    - Lock-contention fixture with minimum `max_read_ms=50` against a held write lock aborts
      promptly with `CoordPolicyError("read_deadline_exceeded")` (well under 500 ms), alongside
      a fixture holding `_UMASK_LOCK` past `max_read_ms=50` asserting `CoordPolicyError("read_deadline_exceeded")`
-     with **zero calls to `sqlite3.connect`**, and the large-query deadline fixture.
+     with **zero calls to `sqlite3.connect`**, a fixture forcing URI construction to fail (e.g.,
+     surrogate-escaped path / failing `quote`) verifying another thread can immediately acquire
+     `_UMASK_LOCK`, and the large-query deadline fixture.
    - `open_readonly_snapshot` closes the SQLite connection immediately on normal return, anchor
      `SELECT` failure (e.g. corrupt DB / missing `seq_counter`), and query timeout (verified via
      closed-connection check / zero leaked descriptors).
@@ -911,6 +974,11 @@ under both default `$HOME` and `TMPDIR=/tmp` using private owner-only synthetic 
    - Embedded NUL (`"a\x00b"`) in event text is detected via BLOB prefix (`has_control_or_bidi=True`),
      and a control/bidi character located beyond the preview byte cap yields
      `has_control_or_bidi=False, text_suffix_uninspected=True, text_truncated=True`.
+   - Identical UTF-8 receipted body bytes stored once as SQLite `TEXT` and once as SQLite `BLOB`:
+     only the `TEXT` stream row is eligible for verified attribution, the `BLOB` stream row
+     downgrades to `SANDBOX_LOCAL_UNVERIFIED` (`"receipt_body_hash_mismatch"`,
+     `malformed_metadata = True`), and the `event_log` host envelope (`source_rank = 0`) retains
+     its verified attribution in both cases.
    - Swapping badges between two `stream_events` rows that match the exact full 5-tuple
      `(sandbox_addr, incarnation_id, thread_id, message_id, body_sha256)` (regardless of stored
      badge, including across page boundaries) downgrades **both** stream rows to
