@@ -13,7 +13,8 @@ production launcher and Tauri are outside this slice.
 ## Static build and host boundary
 
 - Use Svelte 5 and SvelteKit 2 with `adapter-static`, fallback `200.html`, root-layout
-  `ssr = false`, and `inlineStyleThreshold = 0`. Ship just static assets. Link to the
+  `ssr = false`, `inlineStyleThreshold = 0`, and `paths.relative = false` for
+  root-relative `/_app/` URLs. Ship just static assets. Link to the
   explicit UI paths `/dashboard/projects`, `/dashboard/sandboxes` and `/dashboard/threads`.
   The host redirects `/` to Projects. Keep selection in memory and choose the first available
   authorized item on direct navigation. Put only the generic view in history state and URLs.
@@ -25,7 +26,8 @@ production launcher and Tauri are outside this slice.
   and review the resolved dependency tree and applicable advisories at Gate 2. Build tools have no runtime role. Generated output, browser installations and
   measurement reports stay out of Git.
 - Decode the single generated HTML fallback as strict UTF-8. Require exactly one
-  executable inline bootstrap and reject inline styles, event handlers, CR and NUL.
+  executable inline bootstrap and reject inline styles, event handlers,
+  `<meta http-equiv>`, `<base>`, CR and NUL.
   Use LF line endings and hash the raw UTF-8 byte span of the bootstrap body, excluding
   its tags. Emit `build/csp-manifest.json` with `version: 1`, `html_sha256` as hex
   over the complete HTML, and `inline_script_sha256` as base64 over the byte span.
@@ -41,9 +43,11 @@ production launcher and Tauri are outside this slice.
 The shared endpoint `GET /api/v1/workspace` returns one bounded, authorized snapshot.
 This lane owns the browser transport. Set `X-OC-UI: 1` on private reads and expose
 current session identity, expiry and logout to the view. Call `POST /api/auth/exchange`,
-`GET /api/auth/session` and `POST /api/auth/logout` on the same origin. The browser
+`GET /api/auth/session` and `POST /api/auth/logout` on the same origin. Use the read marker on `GET /api/auth/session` as well as the workspace read. The browser
 handles the HttpOnly cookie. The adapter holds CSRF in memory and supplies
-`X-OC-CSRF` for logout. Bootstrap input stays in memory until exchange and is then cleared.
+`X-OC-CSRF` for logout. Bootstrap input uses a password field with autocomplete off, no name or native form,
+and JS-only submission, with `form-action 'none'` on the host. Clear the field on
+submission or hide.
 The fixture implements the same interface with synthetic promises and an in-process
 expiry or refresh signal. Visible event rows are part of the snapshot.
 
@@ -69,13 +73,15 @@ subscribe(signal, callback) -> unsubscribe    # in-process refresh or session-en
 ```
 
 The read session ID is an opaque correlation alias with no authority, and the generation is
-a safe positive integer. IDs are unique per sibling list, opaque ASCII tokens up to 64
-characters. The shared caps are 32 KiB per JSON response, 8 projects, 16 sandboxes and
+a safe positive integer. IDs use only `[A-Za-z0-9_-]`, up to 64 characters and unique
+per sibling list. The read-session alias uses the same alphabet and exactly 32 characters.
+DTO decoders require exact, closed sets of own keys and reject extra keys. The shared caps are 32 KiB per JSON response, 8 projects, 16 sandboxes and
 32 threads in total, 8 rows per kind per thread, 120 Unicode scalar values per label
 and 256 UTF-8 bytes per text field. The host enforces caps. The UI bounds reading before
-UTF-8 and JSON decoding and checks shape, size, status and identity before storing it. Treat every display string as
-inert text. Preserve line breaks in bodies, wrap long words, isolate text direction, and
-replace other control and bidi-format characters in displayed strings. Provenance labels
+UTF-8 and JSON decoding and checks shape, size, status and identity before storing it. Use Svelte text interpolation for all display strings. Replace C0, DEL, C1 and bidi
+control characters in labels, including newlines and tabs. In bodies, normalize CRLF to
+LF, preserve LF and tab, and replace other control and bidi characters. Wrap long words
+and isolate text direction. Provenance labels
 are host-derived display data. The viewer derives no authority from body text or labels.
 
 ## View flow
@@ -94,7 +100,7 @@ mount or renewed session:
   subscribe with captured generation and load one no-store snapshot
   after each await or queued callback, require captured generation to still be current
   apply the same expiry checks before publishing and retire on expiry
-  clear private rows synchronously on hide and before any restore-time revalidation
+  use Svelte flushSync to clear private rows on hide and before restore-time revalidation
   revalidate with the host and require a current session before publishing again
   on load completion, require the latest request and matching response identity
   select authorized item by in-memory ID, or first listed item, and render
@@ -107,22 +113,25 @@ choose project, sandbox, or thread:
 refresh:
   cancel superseded load, start one request in current generation
   replace snapshot atomically, clear invalid selections and reselect within the new hierarchy
-  on error clear displayed snapshot and offer retry; on auth failure retire the generation
+  on error clear displayed snapshot and offer retry
+  on 401 or 403 retire the generation and clear adapter and view state
 
 logout, expiry, authenticated identity change, pagehide, or component teardown:
   invalidate the generation before any await
   abort reads, unsubscribe, cancel timers and clear DOM, snapshot, selections and errors
   on logout request host revocation through the serialized auth controller
-  flush the DOM clear synchronously on pagehide before any page cache snapshot
+  use Svelte flushSync on pagehide before any page cache snapshot
   on page restore revalidate the host session before rendering private rows
 ```
 
 Use native buttons for selections, links for generic views, headings and lists for content,
 visible focus and status text, and a polite announcement for load, empty and session changes.
 Keep the interface functional at narrow widths and with the keyboard. The bundle and HTML
-contain public shell assets only. Workspace reads use same-origin credentials,
-`redirect: 'error'` and `cache: 'no-store'`. The host sends `Cache-Control: no-store`
-for private responses.
+contain public shell assets only. All auth and workspace fetches use same-origin
+credentials, `redirect: 'error'` and `cache: 'no-store'`. Require JSON Content-Type on
+successful responses with a body, and enforce a 4 KiB cap for auth and a 32 KiB cap for
+workspace while streaming, before UTF-8 or JSON decoding. Logout expects an exact 204.
+The host sends `Cache-Control: no-store` for private responses.
 Keep snapshots and authorization-adapter state in memory. Avoid persistent storage,
 service workers, route prefetch and diagnostic output containing payloads or auth data.
 
@@ -147,10 +156,11 @@ service workers, route prefetch and diagnostic output containing payloads or aut
    delayed or backwards wall-clock readings cannot leave private rows visible. Hold logout and verify the next exchange stays blocked until the full
    response. After confirmed logout, exchange again and reload the exact authenticated
    deep link. Verify an unconfirmed mutation leaves further exchange blocked. Inspect
-   storage, URLs, and the initial HTML for private fixture data.
+   storage, URLs, and the initial HTML for private fixture data. After retirement, use
+   Back and Forward and verify private rows stay cleared.
 4. Run Lighthouse against a cold loopback navigation with the synthetic session cookie
-   established in the same isolated Chromium session. Retain that cookie across the
-   audit and record browser, throttling, bytes and initial requests. Measure navigation to
+   established in the same isolated Chromium session. Set Lighthouse
+   `disableStorageReset` to retain that cookie across the audit and record browser, throttling, bytes and initial requests. Measure navigation to
    the first populated sandbox list with an app mark and confirm keyboard navigation in
    Playwright. Keep the report local and record concise measurements and limitations.
 
