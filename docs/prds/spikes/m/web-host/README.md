@@ -1,11 +1,13 @@
 # Running the M3a host fixture
 
 From the repository root, give the host the trusted SvelteKit build directory
-prepared by the [UI fixture](../web-ui/WALKTHROUGH.md).
+prepared by the [UI fixture](../web-ui/WALKTHROUGH.md). Pass its canonical
+path so the strict directory checks also work on hosts where `/home` is a
+symlink.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 docs/prds/spikes/m/web-host/oc_web_host.py \
-  --build /absolute/path/to/build
+  --build "$(realpath -- /absolute/path/to/build)"
 ```
 
 For an automated browser launch, start the host with private stdin and

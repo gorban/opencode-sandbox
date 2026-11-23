@@ -370,6 +370,7 @@ class HostTests(unittest.TestCase):
         for label, text, expected in (
             ("界" * 100, "x", 200),
             ("界" * 120, "é" * 128, 200),
+            ("😀" * 120, "x", 200),
             ("a" * 121, "x", 503),
             ("ok", "é" * 129, 503),
             ("ok", "a" * 257, 503),
@@ -555,6 +556,46 @@ class HostTests(unittest.TestCase):
             self.assertEqual(status, 401)
             self.assertNotIn("set-cookie", headers)
             self.assertNotIn(b"csrf_token", body)
+            self.assertEqual(do_read(server, cookie)[0], 401)
+
+    def test_held_exchange_retires_rounded_to_zero_session(self):
+        self._check_held_rounded_to_zero_release(EXCHANGE)
+
+    def test_held_workspace_retires_rounded_to_zero_session(self):
+        self._check_held_rounded_to_zero_release(WORKSPACE)
+
+    def _check_held_rounded_to_zero_release(self, route):
+        hold = Hold()
+
+        def before_send(path, offset):
+            if path == route and offset == 0:
+                hold()
+
+        with running(self.build, clock=self.clock, idle=10, absolute=20,
+                     before_send=before_send) as server, ThreadPoolExecutor(2) as pool:
+            if route == EXCHANGE:
+                pending = pool.submit(do_exchange, server)
+            else:
+                cookie, _ = do_login(server)
+                pending = pool.submit(do_read, server, cookie)
+
+            try:
+                self.assertTrue(hold.arrived.wait(1))
+                with server.guard:
+                    session = server.active
+                    self.assertIsNotNone(session)
+                    self.clock.advance(9.9995)
+            finally:
+                hold.open.set()
+
+            status, headers, body = pending.result(3)
+            self.assertEqual(status, 401)
+            self.assertNotIn("set-cookie", headers)
+            self.assertNotIn(b"csrf_token", body)
+            self.assertNotIn(b"Fixture project", body)
+            with server.guard:
+                self.assertTrue(server.active is None, "expired fixture session remained active")
+                self.assertFalse(server.auth.revoke_session_by_hash(session.session_hash))
 
     def test_malformed_framing_and_media_preserve_previous_session(self):
         with running(self.build) as server:

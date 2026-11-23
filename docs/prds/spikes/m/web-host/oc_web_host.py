@@ -302,18 +302,25 @@ class FixtureServer(socketserver.ThreadingTCPServer):
             self.authority = False
             self._retire()
 
-    def _session_denial(self, session):
+    def _session_status(self, session):
+        """Check authority and sample the shared millisecond TTL under the guard."""
         if not self._authorized() or (session is not None and self.principal != session.principal):
-            return 403
-        if self.active is not None and self.clock() >= self.active.deadline:
+            return 403, 0
+        active = self.active
+        if active is None:
+            return 401, 0
+        remaining_ms = int((active.deadline - self.clock()) * 1000)
+        if remaining_ms <= 0:
             self._retire()
-        if session is None or self.active is not session:
-            return 401
-        return None
+            return 401, 0
+        if active is not session:
+            return 401, 0
+        return None, remaining_ms
 
     def _admit(self, headers):
         session = self.active
-        if denial := self._session_denial(session):
+        denial, _ = self._session_status(session)
+        if denial is not None:
             raise RequestError(denial)
         raw = _cookie(headers)
         record = self.auth.validate_session(raw, host_header=self.host, touch=False)
@@ -360,11 +367,10 @@ class FixtureServer(socketserver.ThreadingTCPServer):
                 raise RequestError(403) from None
             self._retire()
 
-    def _session_frame(self, session, cookie):
-        expires = int((session.deadline - self.clock()) * 1000)
-        if expires <= 0:
-            return None
-        body = _json_bytes({**session.coords(), "csrf_token": session.csrf, "expires_in_ms": expires})
+    def _session_frame(self, session, cookie, remaining_ms):
+        body = _json_bytes({
+            **session.coords(), "csrf_token": session.csrf, "expires_in_ms": remaining_ms,
+        })
         if len(body) > AUTH_LIMIT:
             return None
         extra = (("Set-Cookie", cookie),) if cookie else ()
@@ -531,7 +537,8 @@ class _Handler(socketserver.BaseRequestHandler):
             server.before_read()
         try:
             with server.guard:
-                if denial := server._session_denial(session):
+                denial, _ = server._session_status(session)
+                if denial is not None:
                     raise RequestError(denial)
                 context = ReadContext(session.principal, session.read_alias, session.generation)
                 # The reader is trusted, bounded in-memory fixture code. It
@@ -565,9 +572,9 @@ class _Handler(socketserver.BaseRequestHandler):
     def _send_once(self, frame, session, cookie, offset, deadline):
         server = self.server
         with server.guard:
+            denial, remaining_ms = server._session_status(session) if session else (None, 0)
             if time.monotonic() >= deadline:
                 return frame, session, 0
-            denial = server._session_denial(session) if session is not None else None
             if denial is not None:
                 if offset:
                     return frame, session, 0
@@ -575,8 +582,9 @@ class _Handler(socketserver.BaseRequestHandler):
 
             retry_frame = frame
             if frame is None:
-                frame = server._session_frame(session, cookie)
+                frame = server._session_frame(session, cookie, remaining_ms)
                 if frame is None:
+                    server._retire()
                     frame = retry_frame = _denial(401)
                     session = None
 
