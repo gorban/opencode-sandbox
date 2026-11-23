@@ -247,7 +247,7 @@ def validate_finite_nonneg_float(value: object, label: str) -> float:
         raise CoordValidationError(err) from exc
     if not math.isfinite(fval) or fval < 0.0:
         raise CoordValidationError(err)
-    return 0.0 if fval == 0.0 else fval
+    return fval + 0.0
 
 
 def parse_sandbox_target(raw: object) -> TargetAddr:
@@ -828,13 +828,12 @@ class BrowserWallTile:
             raise CoordValidationError("invalid_freshness")
         if self.nav is not None and self.nav.surface_key != self.surface_key:
             raise CoordValidationError(ERR_PAIRING_MISMATCH)
-        if self.frame_meta is not None:
-            if (
-                self.nav is None
-                or self.frame_meta.surface_key != self.surface_key
-                or self.frame_meta.nav_generation != self.nav.nav_generation
-            ):
-                raise CoordValidationError(ERR_PAIRING_MISMATCH)
+        if self.frame_meta is not None and (
+            self.nav is None
+            or self.frame_meta.surface_key != self.surface_key
+            or self.frame_meta.nav_generation != self.nav.nav_generation
+        ):
+            raise CoordValidationError(ERR_PAIRING_MISMATCH)
 
     @property
     def sandbox_addr(self) -> str:

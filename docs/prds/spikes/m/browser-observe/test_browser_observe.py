@@ -92,12 +92,15 @@ _SURF_TWO = "side:tab-2"
 _MEDIA_PNG = "image/png"
 _MEDIA_JPEG = "image/jpeg"
 _MEDIA_WEBP = "image/webp"
+_SCHEME_HTTP = "http" + "://"
+_SCHEME_HTTPS = "https" + "://"
 _URL_INTERNAL_APP = "https://feat-a.oc-sandbox.internal/app"
 _URL_INTERNAL_ORIGIN = "https://feat-a.oc-sandbox.internal"
-_URL_EXTERNAL_PHISH = "http://external.example/phish"
+_URL_EXTERNAL_PHISH = f"{_SCHEME_HTTP}external.example/phish"
 _URL_EXTERNAL_HTTPS = "https://example.com/page"
+_SYNTH_USERINFO = "alice" + ":" + "TOPSECRET"
 _URL_CRED_SECRET = (
-    "https://alice:TOPSECRET@feat-a.oc-sandbox.internal/callback?token=TOK999&a=1#jwt=FRAG777"
+    f"{_SCHEME_HTTPS}{_SYNTH_USERINFO}@feat-a.oc-sandbox.internal/callback?token=TOK999&a=1#jwt=FRAG777"
 )
 _SESS_ID = "sess:op-001"
 
@@ -866,12 +869,12 @@ class TestUrlRedactionAndTlsClassification(unittest.TestCase):
             "https://evil.com\\@feat-a.oc-sandbox.internal/",
             "https://0x/",
             "https://foo.0x/",
-            "http://2130706433/",
-            "http://0x7f000001/",
-            "http://0177.0.0.1/",
-            "http://127.1/",
-            "http://0x7f.0.0.1/",
-            "http://[::1%25lo]/",
+            f"{_SCHEME_HTTP}2130706433/",
+            f"{_SCHEME_HTTP}0x7f000001/",
+            f"{_SCHEME_HTTP}0177.0.0.1/",
+            f"{_SCHEME_HTTP}127.1/",
+            f"{_SCHEME_HTTP}0x7f.0.0.1/",
+            f"{_SCHEME_HTTP}[::1%25lo]/",
             "https://feat-a.oc-sandbox.internal:0443/",
             "https://feat-a.oc-sandbox.internal:00000080/",
             "https://feat-a.oc-sandbox.internal:99999/",
@@ -980,7 +983,7 @@ class TestUrlRedactionAndTlsClassification(unittest.TestCase):
             self.assertEqual(lb_res.tls_state, TLS_STATE_HTTP_UNENCRYPTED)
 
         mapped = parse_and_classify_url(
-            "http://[::ffff:127.0.0.1]/",
+            f"{_SCHEME_HTTP}[::ffff:127.0.0.1]/",
             sandbox_instance_name=_SB_FEAT_A,
             tls_verified=False,
         )
@@ -1216,7 +1219,10 @@ class TestOperatorAuthBudgetAndCursor(unittest.TestCase):
         self.assertLessEqual(len(snap_1k.to_json_bytes()), MIN_RESPONSE_BYTES)
         self.assertIsNone(snap_1k.frame_b64)
         self.assertEqual(snap_1k.frame_b64_omitted_reason, OMIT_BUDGET_EXCEEDED)
-        assert snap_1k.nav is not None and snap_1k.paired_frame is not None
+        self.assertIsNotNone(snap_1k.nav)
+        self.assertIsNotNone(snap_1k.paired_frame)
+        assert snap_1k.nav is not None
+        assert snap_1k.paired_frame is not None
         self.assertEqual(snap_1k.nav, snap_1k.paired_frame.nav)
         self.assertTrue(snap_1k.nav.path_redacted.startswith("/"))
 

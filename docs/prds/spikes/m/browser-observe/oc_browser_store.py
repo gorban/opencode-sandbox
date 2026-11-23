@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 import math
 import threading
 import time
-from typing import Any
+from typing import Any, cast
 
 from oc_coord_contract import (
     CoordAuthError,
@@ -263,9 +263,12 @@ def _authorize_operator_caller(caller: object) -> PrincipalCtx:
 
 
 def _validate_int_range(value: object, min_v: int, max_v: int) -> int:
-    if type(value) is not int or not (min_v <= value <= max_v):
+    if type(value) is not int:
         raise CoordValidationError(_ERR_INVALID_BOUNDS)
-    return value
+    ival = cast(int, value)
+    if not (min_v <= ival <= max_v):
+        raise CoordValidationError(_ERR_INVALID_BOUNDS)
+    return ival
 
 
 def _max_optional_float(a: float | None, b: float | None) -> float | None:
@@ -755,7 +758,7 @@ class BrowserProvenanceStore:
             raise CoordPolicyError(_ERR_INVALID_CLOCK) from exc
         if not math.isfinite(fval) or fval < 0.0:
             raise CoordPolicyError(_ERR_INVALID_CLOCK)
-        return 0.0 if fval == 0.0 else fval
+        return fval + 0.0
 
     def _validate_session_args(
         self, read_session_id: object, session_generation: object
