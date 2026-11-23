@@ -1,6 +1,6 @@
 # PRD M3.3 Confined Read-Only Terminal Output Sanitizer & Replay Walkthrough (`docs/prds/spikes/m/terminal-observe/`)
 
-Parent: [prd_m3.md](../../prd_m3.md) · related: [prd_i2.md](../../prd_i2.md) ·
+Parent: [prd_m3.md](../../../prd_m3.md) · related: [prd_i2.md](../../../prd_i2.md) ·
 [PROJECTION_WALKTHROUGH.md](../projection/PROJECTION_WALKTHROUGH.md) · builds read-only on
 [oc_address.py](../oc_address.py) and [oc_coord_contract.py](../oc_coord_contract.py)
 
@@ -182,7 +182,7 @@ sequence with its own `seq_bytes`.
 | `OSC` / `STRING_SEQ` | `0x9C` (raw 8-bit ST when `str_utf8_rem == 0`) | Increment `seq_bytes += 1` + overlong check; complete & drop sequence | `GROUND` | `dropped_osc_count` or `dropped_string_seq_count` += 1 (if not counted) |
 | `OSC` / `STRING_SEQ` | `0x18` (`CAN`) / `0x1A` (`SUB`) | Increment `seq_bytes += 1` + overlong check; abort & drop sequence | `GROUND` | `dropped_osc_count`/`dropped_string_seq_count` += 1 (if not counted), `dropped_c0_c1_count += 1` |
 | `OSC` / `STRING_SEQ` | `0x1B` | Set `esc_seen = True` (`seq_bytes` deferred until `\` or `flush()` so a nested `ESC` aborting into a new sequence doesn't miscount) | `OSC` / `STRING_SEQ` | *(resolved on next byte or `flush()`)* |
-| `OSC` / `STRING_SEQ` | Valid UTF-8 lead `0xC2..0xF4` | If `b == 0xC2`: defer `seq_bytes` charge until byte 2 (matching `0x1B` above so a byte-4097 UTF-8 C1 introducer doesn't miscount), else increment `seq_bytes += 1` + overlong check; set `(str_utf8_rem, str_utf8_min, str_utf8_max)` from the RFC 3629 lead table and `str_utf8_is_c2 = (b == 0xC2)` | `OSC` / `STRING_SEQ` | If overlong (once): `overlong_seq_dropped_count += 1` + seq drop counter |
+| `OSC` / `STRING_SEQ` | Valid UTF-8 lead `0xC2..0xF4` | If `b == 0xC2`: defer `seq_bytes` charge until byte 2 or `flush()` (matching `0x1B` above so a byte-4097 UTF-8 C1 introducer doesn't miscount), else increment `seq_bytes += 1` + overlong check; set `(str_utf8_rem, str_utf8_min, str_utf8_max)` from the RFC 3629 lead table and `str_utf8_is_c2 = (b == 0xC2)` | `OSC` / `STRING_SEQ` | If overlong (once): `overlong_seq_dropped_count += 1` + seq drop counter |
 | `OSC` / `STRING_SEQ` | Any other byte | Discard in O(1) memory; increment `seq_bytes += 1` + overlong check | `OSC` / `STRING_SEQ` | If overlong (once): `overlong_seq_dropped_count += 1` + seq drop counter |
 
 #### Decoded UTF-8 Scalar Dispatch (on completing `UTF8_PENDING`)
@@ -217,7 +217,7 @@ When `flush()` is called (stream close or fixture completion):
 - If `pending_cr`: emit `"\n"`, increment `neutralized_bare_cr_count += 1` and `dropped_c0_c1_count += 1`, clear `pending_cr`.
 - If `state == UTF8_PENDING`: emit `"\ufffd"`, increment `invalid_utf8_count += 1`, clear `utf8_buf`, reset `_utf8_min_next=0x80, _utf8_max_next=0xBF`, reset to `GROUND`.
 - If `state in (ESC, ESC_INTERMEDIATE, CSI, OSC, STRING_SEQ)`:
-  - If `state in (OSC, STRING_SEQ)` and `esc_seen`: increment `seq_bytes += 1` and run the overlong check (accounting for the trailing `0x1B` byte).
+  - If `state in (OSC, STRING_SEQ)` and `(esc_seen or str_utf8_is_c2)`: increment `seq_bytes += 1` and run the overlong check once (accounting for the deferred trailing `0x1B` or `0xC2` byte before resetting both flags; note `esc_seen` and `str_utf8_is_c2` are mutually exclusive).
   - Increment the matching drop counter (`dropped_esc_count`, `dropped_csi_count`, `dropped_osc_count`, or `dropped_string_seq_count`) if `not seq_counted`, clear all sequence state (including `esc_seen`, `str_utf8_rem`, `str_utf8_min`, `str_utf8_max`, `str_utf8_is_c2`), reset to `GROUND`.
 - `flush()` is idempotent on an already-ground sanitizer (calling `flush()` twice produces `""` with zero double-counting).
 
@@ -294,6 +294,29 @@ class SanitizerStats:
   (used inside `TerminalReplayPage.to_dict()` for both `stream_stats` and per-frame `frame_stats`
   so 1 KiB response budgets retain ample room for escape-heavy frame text without losing any
   non-zero anomaly telemetry; Python dataclasses retain full typed 12-field `SanitizerStats`).
+- **O(1) Cross-Frame Active SGR State & Self-Contained Frame Invariant (`SAFE_SGR` mode):**
+  - `TerminalOutputSanitizer` maintains a fixed-size 7-slot O(1) active SGR state (`intensity`
+    `{None, 1, 2}`, `italic`, `underline`, `inverse`, `strike`, `fg` [16-color or `38;5;N`], `bg`
+    [16-color or `48;5;N`]), exposed via `active_sgr_seq: str` (canonical `"\x1b[<codes>m"` <= 32
+    bytes, strictly `<= MAX_SAFE_SGR_PARAM_BYTES`; `""` in `PLAIN` mode or when all attributes are
+    default). Every accepted `SAFE_SGR` sequence updates the 7-slot state (`ESC[m` / `ESC[0m`
+    clears all slots to `""`; partial resets `22`/`23`/`24`/`27`/`29`/`39`/`49` clear only their
+    corresponding slot).
+  - **Self-contained replay frame invariant:** Every stored and paged `SAFE_SGR` replay frame
+    strictly **starts and ends in default terminal style** while preserving cross-frame styling:
+    1. Before feeding `raw_bytes` into `stream.sanitizer.feed(raw_bytes)`, capture
+       `prefix_sgr = stream.sanitizer.active_sgr_seq`.
+    2. After `clean_chunk = stream.sanitizer.feed(raw_bytes)`, if `clean_chunk != ""`:
+       - If `prefix_sgr != ""` and `not clean_chunk.startswith(("\x1b[0m", "\x1b[m"))`, prepend
+         `prefix_sgr` so styles opened in an earlier frame carry seamlessly into this frame.
+       - If `stream.sanitizer.active_sgr_seq != ""` (style still open at end of chunk), append
+         `"\x1b[0m"` so the frame ends in default style.
+    3. If `clean_chunk == ""` (e.g., chunk contained only dropped OSC/CSI), emit `""` without
+       spurious SGR wrappers while preserving `stream.sanitizer.active_sgr_seq` for the next
+       non-empty frame.
+    4. Every stored `SAFE_SGR` frame is therefore 100% self-contained whether viewed standalone,
+       evicted past earlier frames, truncated at `MAX_FRAME_TEXT_BYTES`, or split across a
+       `max_response_bytes` page boundary!
 - **SGR-boundary-safe & reset-closed UTF-8 truncation (`truncate_sanitized_text_utf8(text, max_bytes, mode)`):**
   - If `len(text.encode("utf-8")) <= max_bytes`, returns `(text, utf8_len, False)` untouched.
   - Truncates `text` to `<= max_bytes` UTF-8 bytes without splitting any multibyte Unicode character.
@@ -301,13 +324,13 @@ class SanitizerStats:
     1. If the cut point falls inside an emitted `\x1b[...m` sequence (after `\x1b` before its
        terminating `'m'`), backs the cut point up to right before that `\x1b` so a truncated frame
        NEVER emits a dangling partial escape sequence.
-    2. If the kept prefix contains `"\x1b["` and does NOT already end with `"\x1b[0m"` or
-       `"\x1b[m"` (meaning truncation stripped a closing SGR reset), reserves `4` UTF-8 bytes for
-       `"\x1b[0m"` within `max_bytes` (re-cutting the prefix at a UTF-8 + SGR boundary within
-       `max_bytes - 4` if needed) and appends `"\x1b[0m"` whenever the shortened prefix still
-       contains `"\x1b["` and does not end with a reset. (When shrinking inside
-       `max_response_bytes` JSON serialization, Section 5.4 accounts for JSON's 6-byte `\u001b`
-       expansion — `9` UTF-8 JSON bytes for `"\x1b[0m"`!)
+    2. Evaluates `_sgr_is_open(prefix)` using the exact 7-slot SGR state machine over `prefix`
+       (handling cumulative SGRs, partial resets, full resets `ESC[0m`/`ESC[m`, and prepended
+       cross-frame `prefix_sgr`). Whenever `_sgr_is_open(prefix)` is `True`, reserves `4` UTF-8
+       bytes for `"\x1b[0m"` within `max_bytes` (re-cutting the prefix at a UTF-8 + SGR boundary
+       within `max_bytes - 4` if needed) and appends `"\x1b[0m"` whenever `_sgr_is_open` remains
+       `True`. (When shrinking inside `max_response_bytes` JSON serialization, Section 5.4 accounts
+       for JSON's 6-byte `\u001b` expansion — `9` UTF-8 JSON bytes for `"\x1b[0m"`!)
 - **String helper (`sanitize_text_str`):** For fixtures passing Python `str` values (including lone
   surrogates `"\ud800"`..`"\udfff"`), encodes via `utf-8` (`surrogatepass`) through a fresh
   `TerminalOutputSanitizer` + `flush()`, ensuring lone surrogates are rejected by the RFC 3629
@@ -545,12 +568,11 @@ For `read_replay_frames(..., max_response_bytes=...)`:
        and when `mode is SanitizerMode.SAFE_SGR and "\x1b[" in prefix`, test the **monotonically
        non-decreasing** probe `prefix + "\x1b[0m"` (accounting for JSON's 6-byte `\u001b`
        expansion — 9 JSON bytes for `"\x1b[0m"`!) inside the full serialized page!
-     - Once the maximum fitting `k` is found, emit `prefix + "\x1b[0m"` iff `mode is SAFE_SGR` and
-       `"\x1b[" in prefix` and `not prefix.endswith(("\x1b[0m", "\x1b[m"))`, else `prefix`
-       (guaranteed `<=` tested JSON byte length `<= max_response_bytes`), setting
-       `text_truncated = True` and updating `text_bytes`.
-     - If even `text = ""` on the first frame cannot fit, raise
-       `CoordValidationError("response_budget_too_small_for_item")`.
+     - Once the maximum fitting `k` is found, evaluate `_sgr_is_open(prefix)` (using the exact
+       7-slot SGR state tracker across `prefix`, including any cross-frame prepended `active_sgr_seq`
+       from Section 3.4): emit `prefix + "\x1b[0m"` iff `mode is SAFE_SGR and _sgr_is_open(prefix)`,
+       else `prefix` (guaranteed `<=` tested JSON byte length `<= max_response_bytes` and guaranteed
+       to start and end in default style!), setting `text_truncated = True` and updating `text_bytes`.
    - **Subsequent frames:** Stop before exceeding `max_response_bytes`, set `has_more = True`, and
      emit `next_cursor` for the last admitted frame's `frame_seq`.
 
@@ -583,7 +605,13 @@ class TerminalOutputSanitizer:
         self._str_utf8_min = 0x80
         self._str_utf8_max = 0xBF
         self._str_utf8_is_c2 = False
+        self._sgr_state = _SgrState()  # O(1) 7-slot active SGR tracker (SAFE_SGR mode only)
         self._stats = _MutableStats()
+
+    @property
+    def active_sgr_seq(self) -> str:
+        """Canonical active SGR sequence (<= 32 B) or '' when in default style / PLAIN mode."""
+        return "" if self._mode is not SanitizerMode.SAFE_SGR else self._sgr_state.to_sgr_seq()
 
     def feed(self, chunk: bytes) -> str:
         if not isinstance(chunk, bytes):
@@ -613,7 +641,9 @@ class TerminalOutputSanitizer:
             out.append("\ufffd")
             self._stats.invalid_utf8_count += 1
         elif self._state is not _State.GROUND:
-            if self._state in (_State.OSC, _State.STRING_SEQ) and self._esc_seen:
+            if self._state in (_State.OSC, _State.STRING_SEQ) and (
+                self._esc_seen or self._str_utf8_is_c2
+            ):
                 self._charge_seq_byte_and_check_overlong()
             self._finalize_dropped_active_seq()
             self._reset_seq_state()
@@ -705,13 +735,16 @@ def close_stream(
             raise CoordPolicyError("non_monotonic_frame_seq")
 
         before = stream.sanitizer.stats
+        prefix_sgr = stream.sanitizer.active_sgr_seq
         flushed = stream.sanitizer.flush()
         after = stream.sanitizer.stats
+        sgr_open_end = bool(stream.sanitizer.active_sgr_seq)
         stream.closed = True
         if flush_seq is None:
             return None
+        wrapped = wrap_self_contained_sgr_frame(flushed, prefix_sgr, sgr_open_end, mode=stream.mode)
         return _store_sanitized_frame(
-            stream, addr, inc, tid, ep, flush_seq, flush_ts, flushed, raw_input_bytes=0, frame_stats=diff_stats(before, after)
+            stream, addr, inc, tid, ep, flush_seq, flush_ts, wrapped, raw_input_bytes=0, frame_stats=diff_stats(before, after)
         )
 
 
@@ -754,10 +787,15 @@ def append_chunk(
             raise CoordPolicyError("non_monotonic_frame_seq")
 
         before = stream.sanitizer.stats
+        prefix_sgr = stream.sanitizer.active_sgr_seq
         clean_full = stream.sanitizer.feed(raw_bytes)
         after = stream.sanitizer.stats
+        sgr_open_end = bool(stream.sanitizer.active_sgr_seq)
+        # In SAFE_SGR mode, wrap non-empty frames with prefix_sgr + closing ESC[0m so every
+        # stored frame starts and ends in default style across frame and page boundaries.
+        wrapped = wrap_self_contained_sgr_frame(clean_full, prefix_sgr, sgr_open_end, mode=stream.mode)
         return _store_sanitized_frame(
-            stream, addr, inc, tid, ep, seq, ts, clean_full, raw_input_bytes=len(raw_bytes), frame_stats=diff_stats(before, after)
+            stream, addr, inc, tid, ep, seq, ts, wrapped, raw_input_bytes=len(raw_bytes), frame_stats=diff_stats(before, after)
         )
         # _store_sanitized_frame truncates via truncate_sanitized_text_utf8 (preserving SGR reset),
         # appends to stream.ring, and evicts oldest frames while updating evicted_frame_count
@@ -801,6 +839,7 @@ def read_replay_frames(
 
         applied_inc = sb.active_incarnation_id
         applied_ep = stream.stream_epoch
+        captured_closed = stream.closed
         scope_hash = compute_replay_scope_hash(
             target=addr, terminal_id=tid, incarnation_id=applied_inc, stream_epoch=applied_ep
         )
@@ -814,6 +853,8 @@ def read_replay_frames(
         evicted_before = (stream.last_evicted_seq > 0) if after_seq is None else (stream.last_evicted_seq > after_seq)
         snapshot = snapshot_stream_candidates(stream, after_seq, evicted_before=evicted_before)
 
+    if self._on_after_snapshot_before_release is not None:
+        self._on_after_snapshot_before_release()
     page = build_bounded_replay_page(
         snapshot=snapshot,
         scope_hash=scope_hash,
@@ -821,7 +862,23 @@ def read_replay_frames(
         max_response_bytes=budget,
         read_session=session_echo,
     )
+    # Post-pack fencing: verify operator session/authority FIRST (zero target-state oracle on
+    # revoked callers), then re-acquire self._lock to verify stream identity did not rotate or
+    # close while packing (returning zero frames on any race!).
     check_post_fences(caller, read_session_id, session_generation)
+    with self._lock:
+        sb = self._sandboxes.get(addr)
+        if sb is None:
+            raise CoordPolicyError("terminal_stream_not_found")
+        if sb.active_incarnation_id != applied_inc:
+            raise IncarnationMismatchError("stale_incarnation_id")
+        stream = sb.streams.get(tid)
+        if stream is None:
+            raise CoordPolicyError("terminal_stream_not_found")
+        if stream.stream_epoch != applied_ep:
+            raise CoordPolicyError("stale_stream_epoch")
+        if not captured_closed and stream.closed:
+            raise RevokedError("terminal_stream_closed")
     return page
 ```
 
@@ -848,11 +905,11 @@ def read_replay_frames(
 | Rotating incarnation when `len(retired_incarnations) >= MAX_RETIRED_INCARNATIONS` (`1024`) | `CoordPolicyError("max_retired_incarnations_exceeded")` (never evicts retired IDs; atomic) |
 | Append/close/rotate/read on unregistered sandbox or unregistered terminal of current incarnation | `CoordPolicyError("terminal_stream_not_registered")` / `CoordPolicyError("terminal_stream_not_found")` |
 | Registering a previously retired `incarnation_id` for a sandbox | `IncarnationMismatchError("retired_incarnation_reused")` |
-| Append, close, rotate, or read with stale/mismatched `incarnation_id` (checked BEFORE `tid in sb.streams`!) | `IncarnationMismatchError("stale_incarnation_id")` (atomic: zero state mutated) |
+| Append, close, rotate, or read with stale/mismatched `incarnation_id` (checked BEFORE `tid in sb.streams`!) OR incarnation rotated mid-read during page packing | `IncarnationMismatchError("stale_incarnation_id")` (atomic; zero frames returned on mid-read race) |
 | Append or close with `stream_epoch < active_stream_epoch` / `> active_stream_epoch` | `CoordPolicyError("stale_stream_epoch")` / `CoordPolicyError("unregistered_stream_epoch")` |
-| Read with explicit `stream_epoch != active_stream_epoch`, or `rotate_stream_epoch` / re-register with `new_epoch <= active_stream_epoch` | `CoordPolicyError("stale_stream_epoch")` |
+| Read with explicit `stream_epoch != active_stream_epoch`, epoch rotated mid-read during page packing, or `rotate_stream_epoch` / re-register with `new_epoch <= active_stream_epoch` | `CoordPolicyError("stale_stream_epoch")` (zero frames returned on mid-read race) |
 | Append or `close_stream(flush_frame_seq=...)` with `seq <= last_frame_seq` | `CoordPolicyError("non_monotonic_frame_seq")` (atomic: zero flush/sanitizer/ring mutation) |
-| Append to or double-close on an already-closed stream | `RevokedError("terminal_stream_closed")` (operators may still read retained frames with `stream_closed=True`; `rotate_stream_epoch` with strictly higher epoch opens a new epoch) |
+| Append to or double-close on an already-closed stream, OR open stream closed mid-read during page packing | `RevokedError("terminal_stream_closed")` (operators may still open new reads on already-closed streams with `stream_closed=True`; `rotate_stream_epoch` with strictly higher epoch opens a new epoch) |
 | Malformed, oversized, `pad_len == 3`, non-canonical, `NaN`/deeply-nested, `bool`/out-of-range `ep`/`seq`, bad `inc`/`fh`, or scope/incarnation/epoch-mismatched cursor | `CoordValidationError("cursor_malformed")` / `CoordValidationError("cursor_scope_mismatch")` |
 | `max_response_bytes` too small for empty envelope or minimal empty-text first frame | `CoordValidationError("response_budget_too_small_for_envelope")` / `CoordValidationError("response_budget_too_small_for_item")` |
 | Unterminated `> MAX_ESC_SEQ_BYTES` OSC/DCS/APC/PM/SOS/CSI/ESC_INTERMEDIATE (including final/terminator and C0-in-CSI/ESC_INTERMEDIATE bytes) | O(1)-memory drain until terminator/`flush()`; immediate `overlong_seq_dropped_count += 1` + seq drop counter; zero tail bytes leaked |
@@ -876,12 +933,13 @@ def read_replay_frames(
    chunk-split `\r` + `\n`) to `\n` and neutralizing bare `\r` to `\n` (with diagnostic counters)
    defeats single-line overwrite spoofing while preserving both pieces of text on separate lines
    with zero `\r` in sanitized output — consistent with `oc_coord_contract.canonicalize_body_text`.
-3. **Closed `SAFE_SGR` allowlist & reset-closed truncation:** Excludes `SGR 8` (conceal), blink
-   (`5`/`6`), and 24-bit RGB (`38;2`/`48;2`/`58;2`), while allowing basic attributes, 16-color, and
-   8-bit indexed `38;5;N`/`48;5;N` (`0 <= N <= 255`). When truncating a `SAFE_SGR` frame (either at
-   `MAX_FRAME_TEXT_BYTES` or during `max_response_bytes` JSON binary search), always backs up
-   before partial SGRs and appends `"\x1b[0m"` within the byte budget (accounting for JSON's 6-byte
-   `\u001b` expansion) whenever an open SGR style would otherwise lose its reset.
+3. **Closed `SAFE_SGR` allowlist & cross-frame self-contained SGR closure:** Excludes `SGR 8`
+   (conceal), blink (`5`/`6`), and 24-bit RGB (`38;2`/`48;2`/`58;2`), while allowing basic
+   attributes, 16-color, and 8-bit indexed `38;5;N`/`48;5;N` (`0 <= N <= 255`). An O(1) 7-slot
+   `active_sgr_seq` tracker prepends active styles onto continuation frames and closes open styles
+   with `"\x1b[0m"` on every non-empty frame (and on truncation at BOTH `MAX_FRAME_TEXT_BYTES` and
+   `max_response_bytes`, accounting for JSON's 6-byte `\u001b` expansion), guaranteeing every stored
+   and paged `SAFE_SGR` frame starts and ends in default style.
 4. **Target scope, closed `terminal_id` set, & fail-closed capacity bounds:** Accepts both `"local"`
    (`"NAME"`) and `"remote"` (`"REMOTE / NAME"`) canonical sandbox addresses (rejecting `"@PEER"`),
    with closed `VALID_TERMINAL_IDS = {"opencode-tui", "shell"}` matching `prd_m3.md`, uniform
@@ -967,7 +1025,10 @@ external dependencies, zero Podman, zero network, and zero host state writes:
      `"AFTER"` without double-counting.
    - Exact boundary tests at `MAX_ESC_SEQ_BYTES` (4096 bytes including final/terminator `BEL`,
      `ESC \`, `0xC2 0x9C`, or CSI `m` -> not overlong; 4097 bytes triggered by the final/terminator
-     byte -> `overlong_seq_dropped_count == 1`).
+     byte -> `overlong_seq_dropped_count == 1`), PLUS EOF boundary test for a 4096-byte OSC/DCS
+     ending in a lone `0xC2` (or lone `0x1B`) at byte 4097 followed by `flush()` (triggers
+     `overlong_seq_dropped_count == 1` and `dropped_osc_count == 1`) and a second idempotent
+     `flush()` call verifying counters do NOT double-increment.
 4. **Provenance binding, incarnation/epoch/sequence fencing, capacity caps, `close_stream`, & ring eviction:**
    - Reject stale `incarnation_id`, reused retired `incarnation_id`, stale/unregistered
      `stream_epoch`, duplicate/decreasing `frame_seq`, closed-stream append, double-close,
@@ -1000,15 +1061,27 @@ external dependencies, zero Podman, zero network, and zero host state writes:
      (`CoordValidationError`), pre-read retired session (`RevokedError`), and mid-read revoked
      session or `live_authority_checker` (`RevokedError`, zero frames returned); session args
      without a validator raise `CoordPolicyError`; valid reads echo `ReadSessionEcho`.
-6. **Hard UTF-8 JSON byte caps, SGR-reset-closed truncation, cursors, & `allow_nan=False`:**
+   - **Mid-read stream-identity race barrier (`on_after_snapshot_before_release`):** Pause a read
+     after releasing the snapshot lock while keeping the operator session and live authority valid:
+     (a) rotate the sandbox's `incarnation_id` -> held read fails closed with
+     `IncarnationMismatchError("stale_incarnation_id")` returning zero frames;
+     (b) rotate `stream_epoch` -> held read fails closed with `CoordPolicyError("stale_stream_epoch")`
+     returning zero frames;
+     (c) close the open stream -> held read fails closed with `RevokedError("terminal_stream_closed")`
+     returning zero frames (while a *new* read opened on an already-closed stream succeeds with
+     `stream_closed=True`!).
+6. **Hard UTF-8 JSON byte caps, cross-frame SGR-reset-closed truncation, cursors, & `allow_nan=False`:**
    - 1 KiB `max_response_bytes` page containing escape-heavy text (`\"\\\"\n`) and multibyte UTF-8
      (both 1-candidate page without phantom cursor reservation and multi-candidate page with
      `next_cursor`) stays strictly `<= 1024` UTF-8 bytes, truncates cleanly at UTF-8 boundary, and
      paginates deterministically across `limit=1` pages with zero skips or duplicates.
-   - `SAFE_SGR` truncation at BOTH `MAX_FRAME_TEXT_BYTES` and `max_response_bytes = 1024` (with
-     `"\x1b[31m" + "A" * 5000 + "\x1b[0m"`) never splits mid-SGR, appends closing `"\x1b[0m"`
-     (accounting for 6-byte JSON `\u001b` expansion), and stays strictly `<= max_bytes` /
-     `<= max_response_bytes`.
+   - **Cross-frame `SAFE_SGR` self-containment & truncation:** Style opened in frame A
+     (`b"\x1b[31mhello"` -> stored frame A ends with `"\x1b[0m"`), continued in frame B
+     (`b"world\x1b[0m"` -> stored frame B prepends `"\x1b[31m"` and ends with `"\x1b[0m"`), PLUS
+     truncating frame B's closing `"\x1b[0m"` BOTH at `MAX_FRAME_TEXT_BYTES` (`b"A" * 20000 + b"\x1b[0m"`)
+     AND across a `max_response_bytes = 1024` page boundary (accounting for 6-byte JSON `\u001b`
+     expansion) — verifying every emitted frame starts and ends in default style (`_sgr_is_open == False`),
+     never splits mid-SGR, and stays strictly `<= max_bytes` / `<= max_response_bytes`.
    - Too-small envelope/item budget raises explicit `CoordValidationError`.
    - Cursor tampering (`pad_len == 3`, non-canonical base64 padding, extra whitespace, unknown key,
      embedded `NaN`, deeply nested JSON `RecursionError`, `bool`/`0`/negative/`> MAX_INT64` `ep` or
