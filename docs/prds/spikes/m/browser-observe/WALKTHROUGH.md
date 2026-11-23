@@ -158,7 +158,7 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 MAX_RAW_URL_BYTES = 8_192
 MAX_DISPLAY_URL_BYTES = 2_048
 MAX_PATH_BYTES = 256
-_NUMERIC_OR_HEX_LABEL_RE = re.compile(r"^(?:0x[0-9a-f]+|[0-9]+)$", re.ASCII)
+_NUMERIC_OR_HEX_LABEL_RE = re.compile(r"^(?:0x[0-9a-f]*|[0-9]+)$", re.ASCII)
 
 function parse_and_classify_url(
     raw_url,
@@ -223,8 +223,9 @@ function parse_and_classify_url(
     #    - Canonical IPv4 vs. ambiguous numeric/hex/octal/short IPv4 rejection:
     #      * Accept IPv4 ONLY if ascii_host == str(ipaddress.IPv4Address(ascii_host)).
     #      * Otherwise reject ANY host whose last label matches _NUMERIC_OR_HEX_LABEL_RE
-    #        (^(?:0x[0-9a-f]+|[0-9]+)$) OR whose labels all match it (blocks 2130706433,
-    #        0x7f000001, 0177.0.0.1, 127.1, 0x7f.0.0.1, 127.0.0.01!).
+    #        (^(?:0x[0-9a-f]*|[0-9]+)$) OR whose labels all match it with
+    #        CoordValidationError("url_host_invalid") (blocks bare "0x" / "foo.0x",
+    #        2130706433, 0x7f000001, 0177.0.0.1, 127.1, 0x7f.0.0.1, 127.0.0.01!).
     #      * Validate RFC-1123 DNS labels (1..63 ASCII alnum/hyphen, total <= 253).
     #    - Port (optional): require 1 <= len(port_str) <= 5, port_str.isascii() and
     #      port_str.isdigit(), port_str[0] != "0", 1 <= int(port_str) <= 65535.
@@ -408,17 +409,24 @@ Untrusted `document.title` values pass through a linear-time `O(n)` state machin
 
 Every sandbox browser record tracks a strictly monotonic **`capture_generation: int`**
 (`1 <= capture_generation <= MAX_SQLITE_INT64`, starting at `1` on initial registration or fresh
-incarnation rotation):
+incarnation rotation) plus a terminal exhaustion flag **`capture_generation_exhausted: bool = False`**:
 
 - Whenever an active capture session (`status == "running" and browser_enabled is True`) leaves
   `"running"` (disconnect/stop/degraded/starting/revoked) OR toggles `browser_enabled` to `False`,
-  the service **atomically retires the current capture generation**:
-  1. Increments `sb.capture_generation += 1` (raising `CoordPolicyError("max_capture_generations_exceeded")`
-     at `MAX_SQLITE_INT64`), and
-  2. Clears **`surf.current_nav = None`, `surf.paired_frame = None`, and
-     `surf.paired_frame_bytes = None`** across all surfaces of `sb`!
-- Both `record_navigation` and `ingest_frame` require an explicit `capture_generation` matching
-  `sb.capture_generation` (else fail closed with `CoordPolicyError("stale_capture_generation")`),
+  the service **atomically retires the current capture generation without EVER blocking revocation
+  or disable**:
+  1. Clears **`surf.current_nav = None`, `surf.paired_frame = None`, and
+     `surf.paired_frame_bytes = None`** across all surfaces of `sb` and commits the status/disabled
+     transition unconditionally under `self._lock`;
+  2. If `sb.capture_generation >= MAX_SQLITE_INT64`: sets `sb.capture_generation_exhausted = True`
+     (terminal for that `incarnation_id`: subsequent non-active/revoke/disable transitions still
+     succeed and purge state, while any resume/re-enable/`record_navigation`/`ingest_frame` under
+     that `incarnation_id` fails closed with `RevokedError("capture_generation_exhausted")`,
+     requiring a fresh `incarnation_id` to resume);
+  3. Otherwise increments `sb.capture_generation += 1`.
+- Both `record_navigation` and `ingest_frame` reject exhausted incarnations with
+  `RevokedError("capture_generation_exhausted")` and require an explicit `capture_generation`
+  matching `sb.capture_generation` (else fail closed with `CoordPolicyError("stale_capture_generation")`),
   closing the delayed pre-stop frame race across disconnect/disable/resume cycles.
 
 Every browser surface is uniquely keyed by
@@ -455,10 +463,12 @@ function clear_surface_state(sb):
         surf.paired_frame_bytes = None
 
 function retire_capture_generation(sb):
-    if sb.capture_generation >= MAX_SQLITE_INT64:
-        raise CoordPolicyError("max_capture_generations_exceeded")
-    sb.capture_generation += 1
+    # NEVER raises — revocation, stop, and disable MUST always succeed and purge frames!
     clear_surface_state(sb)
+    if sb.capture_generation >= MAX_SQLITE_INT64:
+        sb.capture_generation_exhausted = True
+    else:
+        sb.capture_generation += 1
 
 function register_sandbox(sandbox_addr, *, incarnation_id, browser_enabled=True, status="running"):
     target = parse_sandbox_target(sandbox_addr)                # wraps AddressError; rejects @PEER
@@ -475,12 +485,14 @@ function register_sandbox(sandbox_addr, *, incarnation_id, browser_enabled=True,
                     return
                 was_active = (existing.status == "running" and existing.browser_enabled)
                 is_active = (status == "running" and browser_enabled)
-                if was_active and not is_active:
-                    retire_capture_generation(existing)        # checked before mutating status/enabled!
-                elif not is_active:
-                    clear_surface_state(existing)
+                if existing.capture_generation_exhausted and is_active:
+                    raise RevokedError("capture_generation_exhausted")
                 existing.browser_enabled = browser_enabled
                 existing.status = status
+                if was_active and not is_active:
+                    retire_capture_generation(existing)        # always succeeds; marks exhausted at MAX_SQLITE_INT64
+                elif not is_active:
+                    clear_surface_state(existing)
                 return
             if inc in existing.superseded_incarnations:
                 raise IncarnationMismatchError("superseded_incarnation")
@@ -490,12 +502,15 @@ function register_sandbox(sandbox_addr, *, incarnation_id, browser_enabled=True,
             existing.superseded_incarnations.add(existing.current_incarnation_id)
             existing.current_incarnation_id = inc
             existing.capture_generation = 1
+            existing.capture_generation_exhausted = False
             existing.browser_enabled = browser_enabled
             existing.status = status
             existing.surfaces.clear()
             return
         require len(sandboxes) < MAX_TRACKED_SANDBOXES else CoordPolicyError("max_sandboxes_exceeded")
-        sandboxes[target.canonical] = SandboxBrowserRecord(capture_generation=1, ...)
+        sandboxes[target.canonical] = SandboxBrowserRecord(
+            capture_generation=1, capture_generation_exhausted=False, ...
+        )
 
 function set_sandbox_status(sandbox_addr, *, incarnation_id, status):
     target = parse_sandbox_target(sandbox_addr)
@@ -511,13 +526,15 @@ function set_sandbox_status(sandbox_addr, *, incarnation_id, status):
             if status != "revoked":
                 raise RevokedError("incarnation_revoked")      # revoked is terminal per incarnation!
             return
+        if sb.capture_generation_exhausted and status == "running":
+            raise RevokedError("capture_generation_exhausted") # terminal exhaustion; revoke/stop still allowed!
         was_active = (sb.status == "running" and sb.browser_enabled)
         is_active = (status == "running" and sb.browser_enabled)
+        sb.status = status
         if was_active and not is_active:
-            retire_capture_generation(sb)                      # checked before mutating status!
+            retire_capture_generation(sb)                      # always succeeds; never blocks revoke/stop!
         elif not is_active:
             clear_surface_state(sb)
-        sb.status = status
 
 function record_navigation(
     sandbox_addr, *, incarnation_id, surface_id, capture_generation, nav_generation,
@@ -545,6 +562,8 @@ function record_navigation(
         sb = require_enabled_sandbox(target.canonical)
         if inc != sb.current_incarnation_id:
             raise IncarnationMismatchError("superseded_incarnation")
+        if sb.capture_generation_exhausted:
+            raise RevokedError("capture_generation_exhausted")
         if sb.status != "running":
             raise CoordPolicyError("sandbox_not_running")
         if capture_generation != sb.capture_generation:
@@ -600,7 +619,9 @@ function ingest_frame(
             sb.superseded_frame_drops += 1
             return FrameAdmissionResult(accepted=False, stale_reason="superseded_incarnation")
 
-        # Step 4: Sandbox lifecycle fence
+        # Step 4: Sandbox lifecycle & capture-generation exhaustion fence
+        if sb.capture_generation_exhausted:
+            raise RevokedError("capture_generation_exhausted")
         if sb.status != "running":
             return FrameAdmissionResult(accepted=False, stale_reason="sandbox_not_running")
 
@@ -650,7 +671,7 @@ function ingest_frame(
         return FrameAdmissionResult(accepted=True, stale_reason=None, frame_meta=meta, paired_frame=paired)
 ```
 
-### 4.3 Frame Freshness, Stale-Reason Evaluation, & Post-Pack Pixel Release Fence
+### 4.3 Frame Freshness, Stale-Reason Evaluation, & Post-Pack Snapshot Release Fence
 
 At read time (`get_surface_snapshot` / `list_browser_wall`), freshness is evaluated under `with lock:`
 against `now = read_monotonic_clock()` and configured `max_frame_age_ms`
@@ -662,12 +683,17 @@ against `now = read_monotonic_clock()` and configured `max_frame_age_ms`
    `stale_reason = "awaiting_navigation_for_capture_generation"`.
 3. Else if `surf.paired_frame is None or surf.paired_frame_bytes is None` -> `frame_stale = True`,
    `stale_reason = "awaiting_frame_for_navigation"` (makes `b64encode(None)` structurally impossible!).
-4. Else if `now < surf.paired_frame.frame.captured_at` (clock regression!) -> `frame_stale = True`,
-   `stale_reason = "clock_regression"`, `frame_age_ms = None`.
-5. Else compute `age_ms = int((now - surf.paired_frame.frame.captured_at) * 1000)`:
-   - If `age_ms > max_frame_age_ms` -> `frame_stale = True`, `stale_reason = "frame_ttl_expired"`,
-     `frame_age_ms = age_ms`.
-   - Else -> `frame_stale = False`, `stale_reason = None`, `frame_age_ms = age_ms`.
+4. Else compute exact unrounded `elapsed_s = now - surf.paired_frame.frame.captured_at`:
+   - If `elapsed_s < 0.0` (clock regression!) -> `frame_stale = True`,
+     `stale_reason = "clock_regression"`, `frame_age_ms = None`.
+   - Compare **before integer rounding** (`elapsed_ms = elapsed_s * 1000.0`):
+     - If `elapsed_ms > float(max_frame_age_ms)` (so even `5000.5 ms > 5000 ms` expires!) ->
+       `frame_stale = True`, `stale_reason = "frame_ttl_expired"`,
+       `frame_age_ms = math.ceil(elapsed_ms)`.
+     - Else (`elapsed_s >= 0.0 and elapsed_ms <= float(max_frame_age_ms)`) ->
+       `frame_stale = False`, `stale_reason = None`,
+       `frame_age_ms = math.floor(elapsed_ms)` (computed **only after** the exact unrounded TTL
+       comparison passes!).
 
 When `frame_stale = True`:
 - All read-only diagnostic metadata (`current_nav` if present for the active capture generation,
@@ -677,12 +703,14 @@ When `frame_stale = True`:
 - `frame_b64` is **always suppressed (`None`)** with `frame_b64_omitted_reason = stale_reason` so a
   consumer can never accidentally render expired, pre-disconnect, or superseded pixels as live.
 
-#### Mandatory Post-Pack Pixel Release Fence (Defeats TOCTOU Between Capture and Return)
+#### Mandatory Post-Pack Snapshot Release Fence (Defeats TOCTOU on Every Fresh Response)
 
 Because base64 encoding and JSON byte-budget packing run **outside `self._lock`**, a concurrent
 navigation commit, capture-generation retirement, incarnation rotation, revocation, or TTL expiry
-can occur *while packing*. Therefore `get_surface_snapshot` enforces a strict **post-pack release
-fence** immediately before returning:
+can occur *while packing* — affecting pixel-bearing (`frame_b64 is not None`), metadata-only
+(`include_frame_b64 = False`), and budget-omitted (`frame_b64_omitted_reason = "response_budget_exceeded"`)
+responses alike. Therefore `get_surface_snapshot` enforces a strict **post-pack release fence**
+immediately before returning:
 
 ```python
 # After packing snapshot outside self._lock (and invoking optional test seam on_after_pack_before_release):
@@ -697,12 +725,16 @@ with lock:
         raise IncarnationMismatchError("superseded_incarnation")
     if sb.status == "revoked":
         raise RevokedError("incarnation_revoked")
+    if sb.capture_generation_exhausted:
+        raise RevokedError("capture_generation_exhausted")
     if not sb.browser_enabled:
         raise CoordPolicyError("browser_service_not_enabled")
 
-    if packed_snapshot.frame_b64 is not None:
+    # Fence EVERY response that claims a current, non-stale frame (pixel-bearing, metadata-only,
+    # AND budget-omitted responses alike)!
+    if not packed_snapshot.frame_stale:
         surf = sb.surfaces.get(sid)
-        release_failure = check_pixel_release_invariant(
+        release_failure = check_snapshot_release_invariant(
             sb, surf, now_release,
             captured_capture_generation=captured_capture_generation,
             captured_nav_generation=captured_nav_generation,
@@ -710,15 +742,15 @@ with lock:
             captured_frame_sha256=captured_frame_sha256,
             max_frame_age_ms=self._max_frame_age_ms,
         )
-        # Verifies ALL of:
+        # Verifies ALL of (using exact unrounded elapsed_s before rounding!):
         #   - sb.status == "running" and sb.capture_generation == captured_capture_generation
         #   - surf is not None and surf.current_nav is not None
         #     and surf.current_nav.nav_generation == captured_nav_generation
         #   - surf.paired_frame is not None and surf.paired_frame_bytes is not None
         #   - surf.paired_frame.frame.frame_seq == captured_frame_seq
         #     and surf.paired_frame.frame.frame_sha256 == captured_frame_sha256
-        #   - now_release >= surf.paired_frame.frame.captured_at
-        #     and int((now_release - surf.paired_frame.frame.captured_at) * 1000) <= max_frame_age_ms
+        #   - elapsed_s = now_release - surf.paired_frame.frame.captured_at
+        #     satisfies elapsed_s >= 0.0 and (elapsed_s * 1000.0) <= float(max_frame_age_ms)
         if release_failure is not None:
             # FAIL CLOSED: suppress pixels & rebuild zero-pixel stale snapshot from current locked state!
             packed_snapshot = rebuild_zero_pixel_stale_snapshot_locked(
@@ -728,13 +760,16 @@ with lock:
 return packed_snapshot
 ```
 
-- On incarnation rotation or revocation during packing: raises `IncarnationMismatchError` or
-  `RevokedError` (zero data returned).
+- Revoked/expired operator sessions or live authority are rejected **first** right after packing
+  (`check_authority_and_session_post`), returning zero data and leaking zero target-state oracle.
+- On incarnation rotation, revocation, or `capture_generation_exhausted` during packing: raises
+  `IncarnationMismatchError` or `RevokedError` (zero data returned).
 - On mid-pack navigation commit, capture-generation bump, frame superseding, disconnect, clock
-  regression, or TTL expiry: **suppresses pixels unconditionally** (`frame_b64 = None`,
-  `frame_b64_omitted_reason = release_failure`) and re-packs a zero-pixel stale metadata snapshot
-  from the current locked state (matching `max_response_bytes`), followed by the final post-read
-  `session_validator` & `live_authority_checker` gate.
+  regression, or TTL expiry (even fractionally past TTL, e.g., `5000.5 ms > 5000 ms`): degrades
+  **every** previously-fresh response (pixel-bearing, metadata-only `include_frame_b64=False`, and
+  budget-omitted) to a fresh zero-pixel stale metadata snapshot (`frame_stale = True`,
+  `frame_b64 = None`, `frame_b64_omitted_reason = release_failure`) rebuilt from the current locked
+  state within `max_response_bytes`.
 - `list_browser_wall` never carries pixels (`frame_b64` is never emitted on wall tiles) and enforces
   the post-pack `session_validator` and `live_authority_checker` gate before returning.
 
@@ -862,11 +897,13 @@ and **strictly guarantee `len(serialized_utf8) <= max_response_bytes`**:
      envelope exceeds `max_response_bytes`, raises
      `CoordValidationError("response_budget_too_small_for_envelope")`.
    - **Mandatory post-pack release fence (§4.3):** Immediately after packing and **before returning**,
-     re-acquires `self._lock` to re-verify incarnation, `capture_generation`, `browser_enabled`,
-     `status == "running"`, `nav_generation`, `(frame_seq, frame_sha256)`, and TTL freshness
-     against `now_release` (failing closed to a zero-pixel stale snapshot or raising
-     `IncarnationMismatchError`/`RevokedError`), followed by the final post-read `session_validator`
-     & `live_authority_checker` gate.
+     runs post-read `session_validator` & `live_authority_checker` (`RevokedError` with zero oracle
+     if revoked), then re-acquires `self._lock` to re-verify incarnation, revocation/exhaustion,
+     `browser_enabled`, and — for **every** non-stale response (`not packed_snapshot.frame_stale`,
+     covering pixel-bearing, metadata-only `include_frame_b64=False`, AND budget-omitted responses) —
+     `status == "running"`, `capture_generation`, `nav_generation`, `(frame_seq, frame_sha256)`,
+     and exact unrounded TTL freshness against `now_release`, degrading fail-closed to a zero-pixel
+     stale snapshot or raising `IncarnationMismatchError`/`RevokedError`.
 
 2. **`list_browser_wall`:**
    ```python
@@ -948,7 +985,7 @@ dataclass constructor including `self`, zero duplicated `>= 10`-char string lite
    - Ingestion/lifecycle: `register_sandbox`, `set_sandbox_status`, `record_navigation`, `ingest_frame`.
    - Operator-only reads: `get_surface_snapshot`, `list_browser_wall`.
    - Byte-budget packers, atomic binary-search shrinkers, & post-pack release fence:
-     `_pack_surface_snapshot`, `_enforce_pixel_release_fence`, `_pack_browser_wall_page`.
+     `_pack_surface_snapshot`, `_enforce_snapshot_release_fence`, `_pack_browser_wall_page`.
 4. **`test_browser_observe.py`:**
    - Offline qualification test suite with deterministic PNG/JPEG binary builders, fake clock, and
      post-pack barrier hooks.
@@ -972,7 +1009,8 @@ dataclass constructor including `self`, zero duplicated `>= 10`-char string lite
 | Unknown sandbox target | `CoordPolicyError("sandbox_not_found")` |
 | Sandbox registered with `browser_enabled=False` | `CoordPolicyError("browser_service_not_enabled")` (omitted from wall) |
 | Unknown `surface_id` on `get_surface_snapshot` | `CoordPolicyError("surface_not_found")` |
-| `MAX_TRACKED_SANDBOXES`, `MAX_SURFACES_PER_SANDBOX`, `MAX_ROTATIONS_PER_SANDBOX`, or `MAX_SQLITE_INT64` `capture_generation` exceeded | `CoordPolicyError("max_sandboxes_exceeded" \| "max_surfaces_exceeded" \| "max_incarnation_rotations_exceeded" \| "max_capture_generations_exceeded")` |
+| `MAX_TRACKED_SANDBOXES`, `MAX_SURFACES_PER_SANDBOX`, or `MAX_ROTATIONS_PER_SANDBOX` exceeded | `CoordPolicyError("max_sandboxes_exceeded" \| "max_surfaces_exceeded" \| "max_incarnation_rotations_exceeded")` |
+| Retiring `capture_generation == MAX_SQLITE_INT64` on revoke/stop/disable | Revoke/stop/disable **succeeds** and purges all surfaces/frames; sets `capture_generation_exhausted = True` (terminal for that incarnation — subsequent resume/`record_navigation`/`ingest_frame` raises `RevokedError("capture_generation_exhausted")` until a fresh `incarnation_id` registers) |
 | Transitioning out of `"revoked"` on the same `incarnation_id` (`register_sandbox` or `set_sandbox_status`) | `RevokedError("incarnation_revoked")` (must rotate to fresh `incarnation_id`) |
 | `record_navigation`, `set_sandbox_status`, or `get_surface_snapshot` with superseded `incarnation_id` | `IncarnationMismatchError("superseded_incarnation")` |
 | `record_navigation` or `ingest_frame` with mismatched/stale `capture_generation` | `CoordPolicyError("stale_capture_generation")` (drop counter incremented; zero pixels admitted) |
@@ -987,7 +1025,7 @@ dataclass constructor including `self`, zero duplicated `>= 10`-char string lite
 | Frame age exceeds `max_frame_age_ms` on injected monotonic clock | `frame_stale = True`, `stale_reason = "frame_ttl_expired"`, `frame_b64 = None` (diagnostic metadata preserved) |
 | New navigation committed before next frame arrives | `paired_frame = None`, `paired_frame_bytes = None`, `frame_stale = True`, `stale_reason = "awaiting_frame_for_navigation"` |
 | Disconnect/disable retires `capture_generation`, then resumes before a new `capture_generation` navigation commits | `current_nav = None`, `paired_frame = None`, `paired_frame_bytes = None`, `frame_stale = True`, `stale_reason = "awaiting_navigation_for_capture_generation"`, `frame_b64 = None` |
-| Mid-pack navigation commit, capture-generation bump, frame superseding, disconnect, clock regression, or TTL expiry before release | Post-pack release fence suppresses `frame_b64 = None` and returns zero-pixel stale snapshot (or raises `IncarnationMismatchError`/`RevokedError` on incarnation/revocation change) |
+| Mid-pack navigation commit, capture-generation bump, frame superseding, disconnect, clock regression, or TTL expiry before release (on pixel-bearing, metadata-only, OR budget-omitted responses) | Post-pack release fence degrades every previously-fresh response to a zero-pixel stale snapshot (`frame_stale = True`, `frame_b64 = None`) rebuilt from locked state (or raises `IncarnationMismatchError`/`RevokedError` on incarnation/revocation/exhaustion change) |
 | Sandbox `"starting"`, `"stopped"`, `"revoked"`, or `"degraded"` | `frame_stale = True`, `stale_reason = "sandbox_disconnected"`, `capture_generation` retired, `current_nav` & paired frame/bytes purged |
 | Monotonic clock returns `NaN`/`Inf`/`bool`/negative | `CoordPolicyError("invalid_monotonic_clock")` |
 | Monotonic clock steps backwards below `captured_at` | `frame_stale = True`, `stale_reason = "clock_regression"`, `frame_b64 = None` |
@@ -1023,11 +1061,13 @@ dataclass constructor including `self`, zero duplicated `>= 10`-char string lite
    `"verified_external_tls"`; it always classifies as `tls_state="unknown"`,
    `effective_tls_verified=False`, `origin_trust="external_untrusted"`, and every mismatched CA/host
    pairing is downgraded identically before applying the `userinfo_redacted` cap.
-4. **Capture-generation retirement + post-pack pixel release fence:** Leaving `"running"` or
-   disabling a sandbox retires `capture_generation` (bumping it and clearing `current_nav`,
-   `paired_frame`, and `paired_frame_bytes`), and every pixel-bearing `get_surface_snapshot`
-   re-checks surface identity, `capture_generation`, `nav_generation`, `(frame_seq, frame_sha256)`,
-   and TTL freshness under lock *after* packing before releasing any pixels.
+4. **Capture-generation retirement + post-pack snapshot release fence:** Leaving `"running"` or
+   disabling a sandbox always succeeds, clears `current_nav`/`paired_frame`/`paired_frame_bytes`,
+   and retires `capture_generation` (marking `capture_generation_exhausted = True` at
+   `MAX_SQLITE_INT64` without ever blocking revocation or disable). Every non-stale
+   `get_surface_snapshot` response (pixel-bearing, metadata-only, AND budget-omitted) re-checks
+   surface identity, `capture_generation`, `nav_generation`, `(frame_seq, frame_sha256)`, and exact
+   unrounded TTL freshness under lock *after* packing before returning.
 5. **Compact deduplicated JSON wire representation:** Snapshots and wall tiles emit identity keys
    (`sandbox_addr`, `incarnation_id`, `surface_id`, `capture_generation`) once at the top level and
    serialize redaction flags as a compact `"redacted_flags"` list so typical paired snapshots
@@ -1083,6 +1123,15 @@ with zero Podman, zero live Chromium, zero network calls, and zero writes to hos
        (`nav = None`, `paired_frame = None`, `frame_b64 = None`,
        `stale_reason = "awaiting_navigation_for_capture_generation"`) until a new navigation and
        frame bound to `capture_generation = 2` arrive!
+   - **`capture_generation == MAX_SQLITE_INT64` terminal exhaustion fixture:**
+     - Seed an active sandbox at `capture_generation = MAX_SQLITE_INT64` with a paired frame.
+     - Verify `set_sandbox_status(..., "revoked")` and `register_sandbox(..., browser_enabled=False)`
+       **succeed cleanly** and immediately purge `current_nav`/`paired_frame`/`paired_frame_bytes`
+       (never blocked by generation overflow!).
+     - Verify subsequent resume (`status = "running"`), re-enable, `record_navigation`, and
+       `ingest_frame` under the same `incarnation_id` fail closed with
+       `RevokedError("capture_generation_exhausted")`, while rotating to a fresh `incarnation_id`
+       resets `capture_generation = 1` and `capture_generation_exhausted = False` and succeeds cleanly.
    - Status `"starting"` and `"degraded"` treated as non-running (`sandbox_disconnected`).
    - Structural invariant check: direct instantiation of `PairedBrowserFrame` with mismatched
      `SurfaceKey` (including mismatched `capture_generation`) or `nav_generation` or
@@ -1092,21 +1141,26 @@ with zero Podman, zero live Chromium, zero network calls, and zero writes to hos
 3. **Fake monotonic clock TTL expiry, post-pack release barrier, & clock-anomaly defense:**
    - Admit frame at `t = 100.0` with `max_frame_age_ms = 5000`; at `t = 104.999` -> `frame_stale = False`,
      `include_frame_b64 = True` returns exact base64 bytes matching `frame_sha256`.
-   - Advance fake clock to `t = 105.001` -> `frame_stale = True`,
-     `stale_reason = "frame_ttl_expired"`, `frame_age_ms = 5001`, diagnostic `BrowserFrameMeta`
-     preserved, `frame_b64 = None`, `frame_b64_omitted_reason = "frame_ttl_expired"`.
-   - **Post-pack pixel release barrier fixtures (`on_after_pack_before_release`):**
-     - *(a) Mid-pack navigation commit:* Begin `get_surface_snapshot(..., include_frame_b64=True)` on
-       `nav_generation = 1`; inside `on_after_pack_before_release`, commit `nav_generation = 2` ->
-       verify post-pack release fence suppresses pixels (`frame_b64 = None`, zero `nav_generation = 1`
-       pixels released!).
-     - *(b) Mid-pack TTL expiry:* Begin `get_surface_snapshot(..., include_frame_b64=True)` at
-       `t = 104.999`; inside `on_after_pack_before_release`, advance fake clock to `t = 105.001` ->
-       verify post-pack release fence suppresses pixels (`frame_b64 = None`,
-       `stale_reason = "frame_ttl_expired"`, zero expired pixels released!).
-     - *(c) Mid-pack incarnation rotation / revocation:* Inside `on_after_pack_before_release`,
-       rotate incarnation or mark `"revoked"` -> raises `IncarnationMismatchError` / `RevokedError`
-       with zero data returned!
+   - **Fractional-ms-over-TTL fixture:** Advance fake clock to `t = 105.0005` (`5000.5 ms > 5000 ms`,
+     catching any `int(5000.5) == 5000` rounding bug!) and `t = 105.001` -> both return
+     `frame_stale = True`, `stale_reason = "frame_ttl_expired"`, `frame_age_ms = 5001`, diagnostic
+     `BrowserFrameMeta` preserved, `frame_b64 = None`, `frame_b64_omitted_reason = "frame_ttl_expired"`.
+   - **Post-pack snapshot release barrier fixtures (`on_after_pack_before_release`):**
+     - *(a) Pixel-bearing (`include_frame_b64=True`) mid-pack navigation commit & TTL expiry:*
+       Inside `on_after_pack_before_release`, commit `nav_generation = 2` (or advance clock to
+       `105.0005`) -> verify post-pack release fence degrades to zero-pixel stale snapshot
+       (`frame_stale = True`, `frame_b64 = None`, zero stale pixels released!).
+     - *(b) Metadata-only (`include_frame_b64=False`) mid-pack navigation commit & TTL expiry:*
+       Inside `on_after_pack_before_release`, commit `nav_generation = 2` (or advance clock past
+       TTL) -> verify post-pack release fence degrades the metadata-only response to `frame_stale = True`
+       rebuilt from locked state (never claiming a superseded/expired frame is current!).
+     - *(c) Budget-omitted pixel response (`include_frame_b64=True, max_response_bytes=1024`)
+       mid-pack navigation commit & TTL expiry:* Inside `on_after_pack_before_release`, commit
+       `nav_generation = 2` (or advance clock past TTL) -> verify post-pack release fence degrades
+       to `frame_stale = True` rebuilt from locked state!
+     - *(d) Mid-pack incarnation rotation / revocation / exhaustion:* Inside
+       `on_after_pack_before_release`, rotate incarnation or mark `"revoked"` -> raises
+       `IncarnationMismatchError` / `RevokedError` with zero data returned!
    - Future `captured_at > now` or `committed_at > now`, or non-monotonic `committed_at` /
      `captured_at` rejected with `CoordValidationError`.
    - Backwards clock step (`t = 99.0 < captured_at`) -> `frame_stale = True`,
@@ -1137,11 +1191,11 @@ with zero Podman, zero live Chromium, zero network calls, and zero writes to hos
        `https://xn--bcher-kva.example/p`) is accepted verbatim without re-encoding (`origin`
        preserved identically; with `external_ca` -> `tls_state="verified_external_tls"`,
        `origin_trust="external_untrusted"`).
-   - Backslash `https://evil.com\@feat-a.oc-sandbox.internal`, hex/octal/short/integer IPv4
-     (`http://2130706433/`, `http://0x7f000001/`, `http://0177.0.0.1/`, `http://127.1/`,
-     `http://0x7f.0.0.1/`), IPv4-mapped IPv6 (`http://[::ffff:127.0.0.1]/`), IPv6 zone IDs
-     (`http://[::1%25lo]/`), and leading-zero/oversize ports (`:0443`, `:00000080`, `:99999`) are
-     rejected with `CoordValidationError`.
+   - Backslash `https://evil.com\@feat-a.oc-sandbox.internal`, bare `0x` labels (`https://0x/`,
+     `https://foo.0x/`), hex/octal/short/integer IPv4 (`http://2130706433/`, `http://0x7f000001/`,
+     `http://0177.0.0.1/`, `http://127.1/`, `http://0x7f.0.0.1/`), IPv4-mapped IPv6
+     (`http://[::ffff:127.0.0.1]/`), IPv6 zone IDs (`http://[::1%25lo]/`), and leading-zero/oversize
+     ports (`:0443`, `:00000080`, `:99999`) are rejected with `CoordValidationError`.
    - Explicit `:443` omitted (`https://feat-a.oc-sandbox.internal:443/` -> `origin == "https://feat-a.oc-sandbox.internal"`),
      non-default `:8443` preserved (`origin == "https://feat-a.oc-sandbox.internal:8443"`, still
      `"sandbox_internal_https"` with `sandbox_internal_ca`).
