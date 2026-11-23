@@ -35,6 +35,8 @@ from oc_restart_contract import (  # noqa: E402
     ERR_RECON_CONFLICT,
     ERR_RECOVERY_REQUEUE,
     ERR_RECOVERY_UNCERTAIN,
+    ERR_RUN_PAUSED_MID_STEP,
+    ERR_RUN_PAUSED_PRE_ENTRY,
     ERR_SE_NO_AUTO_RETRY,
     ERR_STALE_EPOCH,
     EVENT_GENESIS_HASH,
@@ -162,15 +164,15 @@ _SQL_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE"
 _SQL_UPDATE_STEP_STATUS = (
     "UPDATE workflow_steps "
     "SET status = ?, output_digest = ?, failure_reason = ?, updated_at_us = ? "
-    "WHERE run_id = ? AND step_id = ?"
+    "WHERE run_id COLLATE BINARY = ? AND step_id COLLATE BINARY = ?"
 )
 _SQL_UPDATE_IDEM_OUTCOME = (
     "UPDATE step_idempotency_keys "
     "SET outcome_status = ?, output_digest = ?, failure_reason = ?, recorded_seq = ? "
-    "WHERE run_id = ? AND idempotency_key = ?"
+    "WHERE run_id COLLATE BINARY = ? AND idempotency_key COLLATE BINARY = ?"
 )
 _SQL_UPDATE_RUN_STATUS = (
-    "UPDATE workflow_runs SET status = ?, updated_at_us = ? WHERE run_id = ?"
+    "UPDATE workflow_runs SET status = ?, updated_at_us = ? WHERE run_id COLLATE BINARY = ?"
 )
 _SQL_UPDATE_META = (
     "UPDATE supervisor_meta "
@@ -272,6 +274,7 @@ def _verify_and_replay_in_tx(
         actual_recons=actual_recons,
         deadline=deadline,
     )
+    check_deadline_ms(deadline)
     return replayed
 
 
@@ -919,7 +922,7 @@ class WorkflowRestartJournal:
                 "UPDATE workflow_steps "
                 "SET status = ?, attempt_no = ?, lease_epoch = ?, idempotency_key = ?, "
                 "output_digest = NULL, failure_reason = NULL, updated_at_us = ? "
-                "WHERE run_id = ? AND step_id = ?",
+                "WHERE run_id COLLATE BINARY = ? AND step_id COLLATE BINARY = ?",
                 (
                     StepStatus.LEASED.value,
                     next_attempt,
@@ -1011,6 +1014,27 @@ class WorkflowRestartJournal:
         ):
             raise StaleEpochError(ERR_STALE_EPOCH)
         return run, step
+
+    def verify_lease_for_entry(
+        self, token: StepLeaseToken, *, max_op_ms: int = DEFAULT_MAX_OP_MS
+    ) -> tuple[HeartbeatAck, WorkflowRunRecord, WorkflowStepRecord]:
+        if not isinstance(token, StepLeaseToken):
+            raise RestartValidationError(_ERR_TOKEN_TYPE)
+        if token.lease_epoch != self._current_epoch:
+            raise StaleEpochError(ERR_STALE_EPOCH)
+        with self._locked_conn(max_op_ms) as (conn, deadline):
+            self._require_meta_active(conn, deadline)
+            run, step = self._verify_active_lease_in_conn(
+                conn, token, deadline, allow_paused_for_settlement=True
+            )
+            ack = HeartbeatAck(
+                run_id=token.run_id,
+                step_id=token.step_id,
+                attempt_no=token.attempt_no,
+                lease_epoch=token.lease_epoch,
+                supervisor_epoch=self._current_epoch,
+            )
+            return ack, run, step
 
     def verify_active_lease_with_run(
         self, token: StepLeaseToken, *, max_op_ms: int = DEFAULT_MAX_OP_MS
@@ -1347,17 +1371,26 @@ class WorkflowRestartJournal:
             raise StaleEpochError(ERR_STALE_EPOCH)
         with self._write_tx(max_op_ms) as (conn, deadline):
             meta = self._require_meta_active(conn, deadline)
-            run, step = self._verify_active_lease_in_conn(conn, token, deadline)
+            run, step = self._verify_active_lease_in_conn(
+                conn, token, deadline, allow_paused_for_settlement=True
+            )
             if step.side_effecting:
                 raise InvalidStepTransitionError(ERR_SE_NO_AUTO_RETRY)
             t_now = clock_provider()
             now_us = clock_to_wall_us(t_now)
-            auth_ok = bool(is_authority_active(run, t_now))
-            effective_reason = (
-                clean_reason
-                if auth_ok
-                else _bound_reason(f"{ERR_AUTH_RETIRED_MID_STEP}: {clean_reason}")
-            )
+            if run.status is RunStatus.PAUSED_NEEDS_RECONCILE:
+                retryable = False
+                effective_reason = _bound_reason(
+                    f"{ERR_RUN_PAUSED_MID_STEP}: {clean_reason}"
+                )
+            else:
+                auth_ok = bool(is_authority_active(run, t_now))
+                retryable = auth_ok
+                effective_reason = (
+                    clean_reason
+                    if auth_ok
+                    else _bound_reason(f"{ERR_AUTH_RETIRED_MID_STEP}: {clean_reason}")
+                )
             return self._apply_fail_transition(
                 conn,
                 meta,
@@ -1365,7 +1398,7 @@ class WorkflowRestartJournal:
                 step=step,
                 token=token,
                 reason=effective_reason,
-                retryable=auth_ok,
+                retryable=retryable,
                 uncertain=False,
                 now_us=now_us,
                 deadline=deadline,
@@ -1800,7 +1833,7 @@ class WorkflowRestartJournal:
                 )
             execute_bounded(
                 conn,
-                "UPDATE workflow_runs SET cancel_requested = 1 WHERE run_id = ?",
+                "UPDATE workflow_runs SET cancel_requested = 1 WHERE run_id COLLATE BINARY = ?",
                 (clean_run,),
                 deadline,
             )
@@ -1913,6 +1946,7 @@ class DurableWorkflowSupervisor:
         self._tracker = tracker
         self._authority_store = authority_store
         self._lifecycle_gate = threading.RLock()
+        self._tracker.attach_epoch(self._journal.current_epoch)
 
     @property
     def journal(self) -> WorkflowRestartJournal:
@@ -1943,7 +1977,6 @@ class DurableWorkflowSupervisor:
             max_replay_events=max_replay_events,
             crash_point=crash_point,
         )
-        tracker.attach_epoch(report.supervisor_epoch)
         return (
             cls(journal, tracker=tracker, authority_store=authority_store),
             report,
@@ -2078,29 +2111,42 @@ class DurableWorkflowSupervisor:
             require_completed_receipt=True,
         )
 
+    def _settle_pre_entry_refusal(
+        self, token: StepLeaseToken, *, reason: str, clock: ClockSnapshot
+    ) -> None:
+        self._tracker.fence_attempt(token)
+        self._journal.fail_step(
+            FailStepRequest(
+                token=token,
+                reason=reason,
+                retryable=False,
+                uncertain=False,
+                clock=clock,
+            )
+        )
+
     def _enter_worker_under_gate(
         self,
         token: StepLeaseToken,
         clock_provider: Callable[[], ClockSnapshot],
-    ) -> None:
+    ) -> WorkflowStepRecord:
         with self._lifecycle_gate:
-            _, run = self._journal.verify_active_lease_with_run(token)
+            _, run, step = self._journal.verify_lease_for_entry(token)
             t_entry = clock_provider()
+            if run.status is RunStatus.PAUSED_NEEDS_RECONCILE:
+                self._settle_pre_entry_refusal(
+                    token, reason=ERR_RUN_PAUSED_PRE_ENTRY, clock=t_entry
+                )
+                raise InvalidStepTransitionError(ERR_RUN_PAUSED_PRE_ENTRY)
             try:
                 self._verify_live_run_record_authority(run, t_entry)
             except AuthorityError:
-                self._tracker.fence_attempt(token)
-                self._journal.fail_step(
-                    FailStepRequest(
-                        token=token,
-                        reason=ERR_AUTH_REVOKED_PRE_ENTRY,
-                        retryable=False,
-                        uncertain=False,
-                        clock=t_entry,
-                    )
+                self._settle_pre_entry_refusal(
+                    token, reason=ERR_AUTH_REVOKED_PRE_ENTRY, clock=t_entry
                 )
                 raise
             self._tracker.admit_attempt(token)
+            return step
 
     def _settle_worker_result(
         self,
@@ -2167,9 +2213,8 @@ class DurableWorkflowSupervisor:
         if on_after_lease_before_entry is not None:
             on_after_lease_before_entry(token)
 
-        self._enter_worker_under_gate(token, clock_provider)
+        step_rec = self._enter_worker_under_gate(token, clock_provider)
 
-        step_rec = self._journal.get_step(run_id, step_id)
         try:
             work_result = self._tracker.run_admitted(token, worker_fn=worker_fn)
         except SimulatedSupervisorCrash:

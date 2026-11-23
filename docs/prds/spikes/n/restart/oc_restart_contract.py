@@ -117,6 +117,8 @@ ERR_CANNOT_REQUEUE = "cannot_requeue_cancelled_or_exhausted_step"
 ERR_SE_NO_AUTO_RETRY = "side_effecting_step_cannot_auto_retry"
 ERR_AUTH_REVOKED_PRE_ENTRY = "authority_revoked_pre_entry"
 ERR_AUTH_RETIRED_MID_STEP = "authority_retired_mid_step"
+ERR_RUN_PAUSED_PRE_ENTRY = "run_paused_before_worker_entry"
+ERR_RUN_PAUSED_MID_STEP = "run_paused_mid_step"
 ERR_AUTH_STORE_REQUIRED = "authority_store_required"
 ERR_CLOCK_PROVIDER_REQUIRED = "clock_provider_required_for_requeue"
 ERR_DUP_MATERIALIZED_KEY = "duplicate_materialized_key"
@@ -1086,9 +1088,13 @@ def compute_run_status(
 
 
 def _pick_state_effect(state: Any, reachable: frozenset[str]) -> str:
-    if len(state.effects) > 1:
+    if (
+        len(state.effects) > 1
+        or state.shape == "wait_signal"
+        or "wait_signal" in state.effects
+    ):
         raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
-    if state.shape not in ("observe", "wait_signal") and state.shape not in _STATE_SHAPE_IMPLIED_EFFECTS:
+    if state.shape != "observe" and state.shape not in _STATE_SHAPE_IMPLIED_EFFECTS:
         raise RestartPolicyError(ERR_PLAN_GRAPH_UNSUPPORTED)
     combined: set[str] = set(state.effects)
     combined.update(_STATE_SHAPE_IMPLIED_EFFECTS.get(state.shape, ()))
@@ -1544,6 +1550,11 @@ def _apply_step_requeued(state: _MutableReplayState, event: JournalEvent) -> Non
     if via_recovery:
         _require_replay(step.lease_epoch < event.supervisor_epoch, "requeue_epoch_invalid")
     else:
+        run = state.runs[step.run_id]
+        _require_replay(
+            run.status is RunStatus.RUNNING and not run.cancel_requested,
+            "requeue_on_non_running_run",
+        )
         _require_replay(step.lease_epoch == event.supervisor_epoch, "requeue_epoch_invalid")
     _update_idem_for_step(
         state,
@@ -1913,6 +1924,7 @@ def verify_materialized_parity(
     _require_replay(
         actual_recons == replayed.reconciliation_records, ERR_MATERIALIZED_MISMATCH
     )
+    _check_replay_deadline(deadline)
 
 
 # --- External SyntheticEffectTracker (survives simulated supervisor crashes) ---
@@ -1935,6 +1947,7 @@ class SyntheticEffectTracker:
         self._lock = threading.Lock()
         self._history_start_epoch = start_ep
         self._attached = False
+        self._observed_epochs: set[int] = set()
         self._fenced_before_epoch = start_ep
         self._fenced_attempts: set[_AttemptKey] = set()
         self._attempts: dict[_AttemptKey, _AttemptRecord] = {}
@@ -1944,6 +1957,11 @@ class SyntheticEffectTracker:
     def history_start_epoch(self) -> int:
         with self._lock:
             return self._history_start_epoch
+
+    @property
+    def observed_epochs(self) -> frozenset[int]:
+        with self._lock:
+            return frozenset(self._observed_epochs)
 
     @staticmethod
     def _key_for(token: StepLeaseToken) -> _AttemptKey:
@@ -1961,6 +1979,7 @@ class SyntheticEffectTracker:
             if not self._attached:
                 self._attached = True
                 self._history_start_epoch = max(self._history_start_epoch, ep)
+            self._observed_epochs.add(ep)
             self._fenced_before_epoch = max(self._fenced_before_epoch, ep)
 
     def fence_epoch(self, min_active_epoch: int) -> None:
@@ -1974,7 +1993,11 @@ class SyntheticEffectTracker:
     def admit_attempt(self, token: StepLeaseToken) -> None:
         key = self._key_for(token)
         with self._lock:
-            if token.lease_epoch < self._fenced_before_epoch or key in self._fenced_attempts:
+            if (
+                token.lease_epoch < self._fenced_before_epoch
+                or key in self._fenced_attempts
+                or (self._attached and token.lease_epoch not in self._observed_epochs)
+            ):
                 raise StaleEpochError(ERR_STALE_EPOCH)
             if key in self._attempts:
                 raise IdempotencyConflictError(ERR_IDEM_CONFLICT)
@@ -2039,7 +2062,11 @@ class SyntheticEffectTracker:
                 or token.lease_epoch < current_epoch
                 or key in self._fenced_attempts
             )
-            has_history = token.lease_epoch >= self._history_start_epoch
+            has_history = (
+                token.lease_epoch in self._observed_epochs
+                if self._attached
+                else token.lease_epoch == self._history_start_epoch
+            )
             outcome, out_digest = self._resolve_receipt_outcome(
                 self._attempts.get(key), fenced=fenced, has_history=has_history
             )

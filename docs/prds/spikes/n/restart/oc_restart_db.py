@@ -127,6 +127,9 @@ _NON_META_TABLES: tuple[str, ...] = (
 )
 
 _AUTOINDEX_NAME_RE = re.compile(r"^sqlite_autoindex_[a-zA-Z\d_]+_\d+$", re.ASCII)
+_COLLATE_CLAUSE_RE = re.compile(r"\bcollate\b", re.IGNORECASE)
+_SQL_BIN_EQ = "COLLATE BINARY = ?"
+_SQL_BIN_EQ_LIMIT_2 = "COLLATE BINARY = ? LIMIT 2"
 
 _DEADLINE_CHECK_STRIDE = 128
 
@@ -603,18 +606,28 @@ _SQL_INSPECT_SCHEMA = (
     "CASE WHEN typeof(tbl_name) = 'text' AND LENGTH(CAST(tbl_name AS BLOB)) <= 128 THEN tbl_name ELSE NULL END AS tbl_name, "
     "CASE WHEN typeof(rootpage) = 'integer' THEN rootpage ELSE NULL END AS rootpage, "
     "(sql IS NULL) AS sql_is_null, "
+    "CASE WHEN typeof(sql) = 'text' AND LENGTH(CAST(sql AS BLOB)) <= 8192 THEN sql ELSE NULL END AS sql_text, "
+    "(type = 'table' AND name NOT LIKE 'sqlite_%' "
+    "AND (typeof(sql) != 'text' OR LENGTH(CAST(sql AS BLOB)) > 8192)) AS sql_malformed, "
     "(typeof(type) != 'text' OR typeof(name) != 'text' OR typeof(tbl_name) != 'text' "
     "OR typeof(rootpage) != 'integer') AS meta_malformed "
     "FROM main.sqlite_schema LIMIT ?"
 )
 
 
-def _check_schema_table_row(
-    name: Any, rootpage: Any, found_core: set[str]
-) -> None:
+def _check_schema_table_row(row: dict[str, Any], found_core: set[str]) -> None:
+    name = row.get("name")
+    rootpage = row.get("rootpage")
     if isinstance(name, str) and name.startswith("sqlite_"):
         return
     if name not in CORE_TABLE_NAMES or type(rootpage) is not int or rootpage <= 0:
+        raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
+    sql_text = row.get("sql_text")
+    if (
+        row.get("sql_malformed") != 0
+        or not isinstance(sql_text, str)
+        or _COLLATE_CLAUSE_RE.search(sql_text) is not None
+    ):
         raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
     found_core.add(name)
 
@@ -635,7 +648,7 @@ def _check_schema_row(row: dict[str, Any], found_core: set[str]) -> None:
         raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
     obj_type = row.get("type")
     if obj_type == "table":
-        _check_schema_table_row(row.get("name"), row.get("rootpage"), found_core)
+        _check_schema_table_row(row, found_core)
         return
     if obj_type == "index":
         _check_schema_index_row(row, row.get("name"), row.get("tbl_name"))
@@ -739,8 +752,11 @@ _CORE_TABLE_COLS: dict[str, frozenset[str]] = {
     ),
 }
 
-_CORE_TABLE_REQUIRED_UNIQUES: dict[str, frozenset[tuple[str, ...]]] = {
-    _TBL_IDEM: frozenset({("run_id", "step_id", KEY_ATTEMPT_NO)}),
+_CORE_TABLE_REQUIRED_INDEXES: dict[str, frozenset[tuple[str, ...]]] = {
+    _TBL_RUNS: frozenset({("run_id",)}),
+    _TBL_STEPS: frozenset({("run_id", "step_id")}),
+    _TBL_IDEM: frozenset({("run_id", KEY_IDEM_KEY), ("run_id", "step_id", KEY_ATTEMPT_NO)}),
+    _TBL_RECON: frozenset({("run_id", KEY_RECON_KEY)}),
 }
 
 
@@ -767,42 +783,40 @@ def _verify_core_table_columns_and_pk(
         raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
 
 
-def _read_unique_index_cols(
+def _read_binary_index_cols(
     conn: sqlite3.Connection, idx_name: str, deadline: float
 ) -> tuple[str, ...]:
     if _AUTOINDEX_NAME_RE.fullmatch(idx_name) is None:
         raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
     info_rows = execute_bounded(
-        conn, f"PRAGMA main.index_info('{idx_name}')", (), deadline
+        conn, f"PRAGMA main.index_xinfo('{idx_name}')", (), deadline
     ).fetchall()
     pairs: list[tuple[int, str]] = []
     for item in info_rows:
+        if item.get("key") != 1:
+            continue
         seqno = item.get("seqno")
         cname = item.get("name")
-        if type(seqno) is not int or not isinstance(cname, str):
+        if type(seqno) is not int or not isinstance(cname, str) or item.get("coll") != "BINARY":
             raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
         pairs.append((seqno, cname))
     pairs.sort(key=lambda pair: pair[0])
     return tuple(cname for _, cname in pairs)
 
 
-def _verify_core_table_uniques(
+def _verify_core_table_indexes(
     conn: sqlite3.Connection, table_name: str, deadline: float
 ) -> None:
-    required = _CORE_TABLE_REQUIRED_UNIQUES.get(table_name)
-    if not required:
-        return
     idx_rows = execute_bounded(
         conn, f"PRAGMA main.index_list('{table_name}')", (), deadline
     ).fetchall()
     found: set[tuple[str, ...]] = set()
     for idx in idx_rows:
-        if idx.get("unique") != 1 or idx.get("partial") != 0:
-            continue
         idx_name = idx.get("name")
-        if not isinstance(idx_name, str):
+        if idx.get("unique") != 1 or idx.get("partial") != 0 or not isinstance(idx_name, str):
             raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
-        found.add(_read_unique_index_cols(conn, idx_name, deadline))
+        found.add(_read_binary_index_cols(conn, idx_name, deadline))
+    required = _CORE_TABLE_REQUIRED_INDEXES.get(table_name, frozenset())
     if not required.issubset(found):
         raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
 
@@ -823,7 +837,7 @@ def _verify_core_table_pragma(
     ):
         raise JournalIntegrityError(ERR_UNEXPECTED_SCHEMA)
     _verify_core_table_columns_and_pk(conn, table_name, deadline)
-    _verify_core_table_uniques(conn, table_name, deadline)
+    _verify_core_table_indexes(conn, table_name, deadline)
 
 
 def verify_no_unexpected_schema_objects(
@@ -1346,26 +1360,33 @@ def read_reconciliations_strict(
 def read_run_by_id_strict(
     conn: sqlite3.Connection, run_id: str, deadline: float
 ) -> WorkflowRunRecord | None:
-    return _fetch_single_row_strict(
+    rec = _fetch_single_row_strict(
         conn,
-        f"SELECT {_SQL_SELECT_RUNS_COLS} FROM workflow_runs WHERE run_id = ? LIMIT 2",
+        f"SELECT {_SQL_SELECT_RUNS_COLS} FROM workflow_runs "
+        f"WHERE run_id {_SQL_BIN_EQ_LIMIT_2}",
         (run_id,),
         deadline,
         _decode_run_row,
     )
+    if rec is not None and rec.run_id != run_id:
+        raise JournalIntegrityError(ERR_MALFORMED_STORAGE)
+    return rec
 
 
 def read_step_by_pk_strict(
     conn: sqlite3.Connection, run_id: str, step_id: str, deadline: float
 ) -> WorkflowStepRecord | None:
-    return _fetch_single_row_strict(
+    rec = _fetch_single_row_strict(
         conn,
         f"SELECT {_SQL_SELECT_STEPS_COLS} FROM workflow_steps "
-        "WHERE run_id = ? AND step_id = ? LIMIT 2",
+        f"WHERE run_id {_SQL_BIN_EQ} AND step_id {_SQL_BIN_EQ_LIMIT_2}",
         (run_id, step_id),
         deadline,
         _decode_step_row,
     )
+    if rec is not None and (rec.run_id, rec.step_id) != (run_id, step_id):
+        raise JournalIntegrityError(ERR_MALFORMED_STORAGE)
+    return rec
 
 
 def read_run_steps_strict(
@@ -1374,13 +1395,15 @@ def read_run_steps_strict(
     rows = execute_bounded(
         conn,
         f"SELECT {_SQL_SELECT_STEPS_COLS} FROM workflow_steps "
-        "WHERE run_id = ? ORDER BY step_order ASC, step_id ASC",
+        f"WHERE run_id {_SQL_BIN_EQ} ORDER BY step_order ASC, step_id ASC",
         (run_id,),
         deadline,
     ).fetchall()
     out: dict[str, WorkflowStepRecord] = {}
     for row in rows:
         rec = _decode_step_row(row)
+        if rec.run_id != run_id:
+            raise JournalIntegrityError(ERR_MALFORMED_STORAGE)
         if rec.step_id in out:
             raise JournalIntegrityError(ERR_DUP_MATERIALIZED_KEY)
         out[rec.step_id] = rec
@@ -1390,27 +1413,36 @@ def read_run_steps_strict(
 def read_idem_by_pk_strict(
     conn: sqlite3.Connection, run_id: str, idempotency_key: str, deadline: float
 ) -> StepIdempotencyRecord | None:
-    return _fetch_single_row_strict(
+    rec = _fetch_single_row_strict(
         conn,
         f"SELECT {_SQL_SELECT_IDEM_COLS} FROM step_idempotency_keys "
-        "WHERE run_id = ? AND idempotency_key = ? LIMIT 2",
+        f"WHERE run_id {_SQL_BIN_EQ} AND idempotency_key {_SQL_BIN_EQ_LIMIT_2}",
         (run_id, idempotency_key),
         deadline,
         _decode_idem_row,
     )
+    if rec is not None and (rec.run_id, rec.idempotency_key) != (run_id, idempotency_key):
+        raise JournalIntegrityError(ERR_MALFORMED_STORAGE)
+    return rec
 
 
 def read_recon_by_pk_strict(
     conn: sqlite3.Connection, run_id: str, reconciliation_key: str, deadline: float
 ) -> StepReconciliationRecord | None:
-    return _fetch_single_row_strict(
+    rec = _fetch_single_row_strict(
         conn,
         f"SELECT {_SQL_SELECT_RECON_COLS} FROM step_reconciliations "
-        "WHERE run_id = ? AND reconciliation_key = ? LIMIT 2",
+        f"WHERE run_id {_SQL_BIN_EQ} AND reconciliation_key {_SQL_BIN_EQ_LIMIT_2}",
         (run_id, reconciliation_key),
         deadline,
         _decode_recon_row,
     )
+    if rec is not None and (rec.run_id, rec.reconciliation_key) != (
+        run_id,
+        reconciliation_key,
+    ):
+        raise JournalIntegrityError(ERR_MALFORMED_STORAGE)
+    return rec
 
 
 def count_obligations_strict(conn: sqlite3.Connection, deadline: float) -> tuple[int, int]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator, Mapping
 import hashlib
 import json
 import os
@@ -74,6 +75,7 @@ from oc_restart_db import (  # noqa: E402
     DB_FILENAME,
     LOCK_FILENAME,
     open_sqlite_bounded,
+    read_run_by_id_strict,
     read_step_by_pk_strict,
     read_steps_strict,
     safe_rollback_and_close,
@@ -3065,6 +3067,389 @@ class TestAdversarialRegressionsRound2(_RestartFixtureBase):
                 sup.reconcile_step(bad_req)
         finally:
             sup.close_clean(clock=self.clock.advance())
+
+
+_WAIT_SIGNAL_TOML = _OBSERVE_ONLY_TOML.replace(
+    'name = "project"\nshape = "observe"\neffects = ["update_health_projection"]',
+    'name = "await_sig"\nshape = "wait_signal"\neffects = []',
+).replace('dst = "project"', 'dst = "await_sig"')
+
+
+class _ClockAdvancingMapping(Mapping[Any, Any]):
+    """Mapping proxy that advances a fake monotonic clock when compared for equality."""
+
+    def __init__(self, inner: Mapping[Any, Any], on_eq: Callable[[], None]) -> None:
+        self._inner = dict(inner)
+        self._on_eq = on_eq
+
+    def __getitem__(self, key: Any) -> Any:
+        return self._inner[key]
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._inner)
+
+    def __len__(self) -> int:
+        return len(self._inner)
+
+    def __eq__(self, other: object) -> bool:
+        self._on_eq()
+        return self._inner == other
+
+
+class TestAdversarialRegressionsRound3(_RestartFixtureBase):
+    def test_discontinuous_tracker_epoch_history_refuses_requeue_pending(self) -> None:
+        # Epoch 1: tracker_a observes epoch 1 and closes cleanly.
+        tracker_a = SyntheticEffectTracker()
+        sup1, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker_a,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            sup1.journal.create_run(
+                self._make_run_request(
+                    "run_gap", (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+            self.assertEqual(tracker_a.observed_epochs, frozenset({1}))
+        finally:
+            sup1.close_clean(clock=self.clock.advance())
+
+        # Epoch 2: tracker_b handles epoch 2, executes side effect, crashes before commit!
+        tracker_b = SyntheticEffectTracker()
+        sup2, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.advance(),
+            tracker=tracker_b,
+            sandbox_root=self.sandbox_root,
+        )
+        captured: list[StepLeaseToken] = []
+        try:
+            with self.assertRaises(SimulatedSupervisorCrash):
+                sup2.run_step_once(
+                    "run_gap",
+                    "se1",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                    clock_provider=self.clock.advance,
+                    crash_point=CrashPoint.AFTER_WORKER_EXEC_BEFORE_COMPLETE_COMMIT,
+                    captured_tokens=captured,
+                )
+            self.assertEqual(tracker_b.count("run_gap", "se1"), 1)
+        finally:
+            sup2.simulate_crash()
+
+        # Epoch 3: tracker_a re-attaches at epoch 3 (observed {1, 3}, NEVER observed 2!).
+        sup3, rep3 = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.advance(),
+            tracker=tracker_a,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            self.assertEqual(rep3.supervisor_epoch, 3)
+            self.assertEqual(tracker_a.observed_epochs, frozenset({1, 3}))
+            rcpt = tracker_a.issue_receipt(token=captured[0], current_epoch=3)
+            self.assertEqual(rcpt.tracker_outcome, "still_pending")
+            req_requeue = ReconcileStepRequest(
+                run_id="run_gap",
+                step_id="se1",
+                expected_attempt_no=1,
+                expected_epoch=3,
+                reconciliation_key="recon_gap_requeue",
+                resolution=ReconcileResolution.REQUEUE_PENDING,
+                output_digest=None,
+                evidence_digest=rcpt.receipt_digest,
+                reason="try_requeue_across_epoch_gap",
+                clock=self.clock.advance(),
+            )
+            with self.assertRaises(ReconciliationEvidenceError):
+                sup3.reconcile_step(
+                    req_requeue,
+                    tracker_receipt=rcpt,
+                    clock_provider=self.clock.advance,
+                )
+            self.assertEqual(tracker_a.count("run_gap", "se1"), 0)
+        finally:
+            sup3.close_clean(clock=self.clock.advance())
+
+        # Direct supervisor construction also records observed_epochs in __init__.
+        j4, _ = WorkflowRestartJournal.open_and_recover(
+            self.state_dir, clock=self.clock.advance(), sandbox_root=self.sandbox_root
+        )
+        tracker_direct = SyntheticEffectTracker()
+        sup4 = DurableWorkflowSupervisor(j4, tracker=tracker_direct)
+        try:
+            self.assertEqual(tracker_direct.observed_epochs, frozenset({4}))
+            self.assertEqual(
+                tracker_direct.issue_receipt(
+                    token=captured[0], current_epoch=4
+                ).tracker_outcome,
+                "still_pending",
+            )
+        finally:
+            sup4.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_derive_steps_rejects_wait_signal_state_before_journal_write(self) -> None:
+        auth = RunAuthorityStore()
+        plan, rec = self._compile_and_admit(
+            _WAIT_SIGNAL_TOML, authority_store=auth, ttl_s=120.0
+        )
+        tracker = SyntheticEffectTracker()
+        sup, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            authority_store=auth,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            seq_before = sup.journal.get_meta().last_event_seq
+            t_now = self.clock.advance()
+            with self.assertRaises(RestartPolicyError) as ctx:
+                sup.create_run_from_plan(plan=plan, receipt=rec, clock=t_now)
+            self.assertIn(ERR_PLAN_GRAPH_UNSUPPORTED, str(ctx.exception))
+            self.assertEqual(sup.journal.get_meta().last_event_seq, seq_before)
+        finally:
+            sup.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_nocase_collation_tamper_rejected_at_admission_and_binary_lookup_enforced(
+        self,
+    ) -> None:
+        j, _ = WorkflowRestartJournal.open_and_recover(
+            self.state_dir, clock=self.clock.now(), sandbox_root=self.sandbox_root
+        )
+        try:
+            j.create_run(
+                self._make_run_request(
+                    "RunMixedCase", (StepSpec("s1", "s1", "read_metrics", False),)
+                )
+            )
+        finally:
+            seq_before = j.close_clean(clock=self.clock.advance())
+
+        db_path = self.state_dir / DB_FILENAME
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn.executescript(
+                "PRAGMA foreign_keys = OFF; "
+                "CREATE TABLE wr_nocase ("
+                "run_id TEXT PRIMARY KEY COLLATE NOCASE, "
+                "workflow_id TEXT NOT NULL, spec_digest TEXT NOT NULL, "
+                "workflow_plan_digest TEXT NOT NULL, "
+                "grant_generation INTEGER NOT NULL, "
+                "requires_authority INTEGER NOT NULL DEFAULT 0, "
+                "status TEXT NOT NULL, cancel_requested INTEGER NOT NULL DEFAULT 0, "
+                "created_epoch INTEGER NOT NULL, created_at_us INTEGER NOT NULL, "
+                "updated_at_us INTEGER NOT NULL); "
+                "INSERT INTO wr_nocase SELECT * FROM workflow_runs; "
+                "DROP TABLE workflow_runs; "
+                "ALTER TABLE wr_nocase RENAME TO workflow_runs;"
+            )
+        finally:
+            conn.close()
+
+        # 1. Read-only replay & recovery BOTH reject COLLATE NOCASE with JournalIntegrityError!
+        with self.assertRaises(JournalIntegrityError):
+            verify_journal_replay_readonly(
+                self.state_dir, sandbox_root=self.sandbox_root
+            )
+        t_rec = self.clock.advance()
+        with self.assertRaises(JournalIntegrityError):
+            WorkflowRestartJournal.open_and_recover(
+                self.state_dir, clock=t_rec, sandbox_root=self.sandbox_root
+            )
+
+        # 2. Event log remained untouched AND direct COLLATE BINARY lookup rejects wrong case!
+        ro = open_sqlite_bounded(
+            db_path, readonly=True, deadline=time.monotonic() + 2.0
+        )
+        try:
+            dl = time.monotonic() + 2.0
+            ev_count = ro.execute("SELECT COUNT(*) AS c FROM workflow_event_log").fetchone()["c"]
+            self.assertEqual(ev_count, seq_before)
+            self.assertIsNone(read_run_by_id_strict(ro, "runmixedcase", dl))
+            exact = read_run_by_id_strict(ro, "RunMixedCase", dl)
+            self.assertIsNotNone(exact)
+            assert exact is not None
+            self.assertEqual(exact.run_id, "RunMixedCase")
+        finally:
+            safe_rollback_and_close(ro)
+
+    def test_paused_sibling_settles_pre_entry_and_pure_retryable_without_stranding(
+        self,
+    ) -> None:
+        tracker = SyntheticEffectTracker()
+        sup, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            # (a) Sibling becomes uncertain between step_b lease and pre-entry gate.
+            steps_a = (
+                StepSpec("step_a", "step_a", "stage_patch", True),
+                StepSpec("step_b", "step_b", "stage_patch", True),
+            )
+            sup.journal.create_run(self._make_run_request("run_pause_pre", steps_a))
+            tok_a1 = sup.journal.lease_step(
+                run_id="run_pause_pre", step_id="step_a", clock=self.clock.advance()
+            )
+
+            def _pause_before_entry(_tok: StepLeaseToken) -> None:
+                sup.journal.fail_step(
+                    FailStepRequest(
+                        tok_a1, "sibling_uncertain", False, True, self.clock.advance()
+                    )
+                )
+
+            with self.assertRaises(InvalidStepTransitionError) as ctx:
+                sup.run_step_once(
+                    "run_pause_pre",
+                    "step_b",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_B),
+                    clock_provider=self.clock.advance,
+                    on_after_lease_before_entry=_pause_before_entry,
+                )
+            self.assertIn("run_paused_before_worker_entry", str(ctx.exception))
+            self.assertEqual(tracker.count("run_pause_pre", "step_b"), 0)
+            step_b_rec = sup.journal.get_step("run_pause_pre", "step_b")
+            self.assertEqual(step_b_rec.status, StepStatus.FAILED_TERMINAL)
+            self.assertEqual(step_b_rec.failure_reason, "run_paused_before_worker_entry")
+
+            # (b) Pure worker returns retryable failure after sibling transitioned run to paused.
+            steps_b = (
+                StepSpec("step_a", "step_a", "stage_patch", True),
+                StepSpec("step_pure", "step_pure", "read_metrics", False),
+            )
+            sup.journal.create_run(self._make_run_request("run_pause_mid", steps_b))
+            tok_a2 = sup.journal.lease_step(
+                run_id="run_pause_mid", step_id="step_a", clock=self.clock.advance()
+            )
+
+            def _pure_worker_mid_pause(_tok: StepLeaseToken) -> WorkerStepResult:
+                sup.journal.fail_step(
+                    FailStepRequest(
+                        tok_a2, "sibling_mid_uncertain", False, True, self.clock.advance()
+                    )
+                )
+                return WorkerStepResult("failed_retryable", reason="transient_net")
+
+            outcome = sup.run_step_once(
+                "run_pause_mid",
+                "step_pure",
+                worker_fn=_pure_worker_mid_pause,
+                clock_provider=self.clock.advance,
+            )
+            self.assertEqual(outcome.ack.status, StepStatus.FAILED_TERMINAL.value)
+            pure_rec = sup.journal.get_step("run_pause_mid", "step_pure")
+            self.assertEqual(pure_rec.status, StepStatus.FAILED_TERMINAL)
+            self.assertIn("run_paused_mid_step", str(pure_rec.failure_reason))
+            self.assertEqual(
+                sup.journal.get_run("run_pause_mid").status,
+                RunStatus.PAUSED_NEEDS_RECONCILE,
+            )
+        finally:
+            sup.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_no_intervening_get_step_between_admit_attempt_and_worker_entry(
+        self,
+    ) -> None:
+        tracker = SyntheticEffectTracker()
+        sup, _ = DurableWorkflowSupervisor.start_or_recover(
+            self.state_dir,
+            clock=self.clock.now(),
+            tracker=tracker,
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            sup.journal.create_run(
+                self._make_run_request(
+                    "run_no_get", (StepSpec("se1", "se1", "stage_patch", True),)
+                )
+            )
+            admitted = False
+            orig_admit = tracker.admit_attempt
+            orig_get_step = sup.journal.get_step
+
+            def _tracked_admit(tok: StepLeaseToken) -> None:
+                nonlocal admitted
+                orig_admit(tok)
+                admitted = True
+
+            def _forbid_get_step_after_admit(
+                run_id: str, step_id: str, *, max_op_ms: int = 2_000
+            ) -> Any:
+                if admitted:
+                    raise RuntimeError("intervening_get_step_forbidden")
+                return orig_get_step(run_id, step_id, max_op_ms=max_op_ms)
+
+            with (
+                mock.patch.object(tracker, "admit_attempt", side_effect=_tracked_admit),
+                mock.patch.object(
+                    sup.journal, "get_step", side_effect=_forbid_get_step_after_admit
+                ),
+            ):
+                out = sup.run_step_once(
+                    "run_no_get",
+                    "se1",
+                    worker_fn=lambda _t: WorkerStepResult("completed", _DIGEST_A),
+                    clock_provider=self.clock.advance,
+                )
+            self.assertTrue(admitted)
+            self.assertEqual(out.ack.status, StepStatus.COMPLETED.value)
+            self.assertEqual(tracker.count("run_no_get", "se1"), 1)
+        finally:
+            sup.close_clean(clock=self.clock.advance())
+        verify_journal_replay_readonly(self.state_dir, sandbox_root=self.sandbox_root)
+
+    def test_final_deadline_check_after_reconciliation_parity_comparison(self) -> None:
+        e1 = TestAdversarialRegressionsRound2._build_event(
+            seq=1,
+            epoch=1,
+            event_type=EventType.SUPERVISOR_STARTED,
+            prev_hash=EVENT_GENESIS_HASH,
+            payload={"dirty_recovery": False, "prior_epoch": 0},
+        )
+        e2 = TestAdversarialRegressionsRound2._build_event(
+            seq=2,
+            epoch=1,
+            event_type=EventType.SUPERVISOR_STOPPED,
+            prev_hash=e1.entry_hash,
+            payload={},
+        )
+        snap = reduce_event_log([e1, e2])
+        meta = SupervisorMetaRecord(
+            current_epoch=snap.supervisor_epoch,
+            last_event_seq=snap.last_event_seq,
+            head_hash=snap.head_hash,
+            dirty_shutdown=snap.dirty_shutdown,
+            updated_at_us=snap.meta_updated_at_us,
+        )
+        fake_now = [5.0]
+
+        def _cross_deadline() -> None:
+            fake_now[0] = 15.0
+
+        slow_recons = _ClockAdvancingMapping(snap.reconciliation_records, _cross_deadline)
+        with (
+            mock.patch("oc_restart_contract.time.monotonic", side_effect=lambda: fake_now[0]),
+            self.assertRaises(RestartStorageError) as ctx,
+        ):
+            verify_materialized_parity(
+                meta=meta,
+                replayed=snap,
+                actual_runs=snap.runs,
+                actual_steps=snap.steps,
+                actual_idems=snap.idempotency_records,
+                actual_recons=slow_recons,
+                deadline=10.0,
+            )
+        self.assertIn(ERR_OP_DEADLINE, str(ctx.exception))
 
 
 if __name__ == "__main__":
