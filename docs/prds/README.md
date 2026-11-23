@@ -71,6 +71,7 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 | [prd_l](prd_l.md) | Composable sandbox config, host providers, comm adapters, and orchestrator config MCP | offline spike PoC slice human-approved; external secret isolation ([prd_l1](prd_l1.md)), production port, and final review open |
 | [prd_m](prd_m.md) | Model telemetry, cross-model orchestration, and a shared SvelteKit control plane | local hub and worker proof merged; [loopback UI first](prd_m3a.md), then [Tauri desktop](prd_m3b.md); final review open |
 | [prd_n](prd_n.md) | First-class long-running workflows (`workflow@1`), host metrics, zero-authority System-1 + blind-check supervision, non-blocking Human Inbox, and declarative `oc-ui@1` dashboard surfaces | proposed; Rank #1 direction selected; initial Gate 1 external security & PR-style review cleared (`e155caf2`); reciprocal review, open decisions & human review pending |
+| [prd_o](prd_o.md) | CI build & test duration trends, test-scope expansion (spikes, integration, secret-gated live inference smoke), and deterministic content-hashed GitHub Actions caching | proposed; empirical CI baseline measured (`9b608f43`); open decisions & human review pending |
 
 The imported findings are evidence, not production implementation:
 
