@@ -8,6 +8,7 @@ zero host filesystem writes).
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 import hashlib
 import json
 import math
@@ -861,7 +862,7 @@ class TestClockTtlAndPostPackBarriers(unittest.TestCase):
         *,
         session_active: dict[str, bool],
         pack_calls: dict[str, int],
-        on_second_pack: object,
+        on_second_pack: Callable[[], None],
     ) -> BrowserProvenanceStore:
         def _hook() -> None:
             pack_calls["n"] += 1
@@ -869,7 +870,7 @@ class TestClockTtlAndPostPackBarriers(unittest.TestCase):
                 store.register_sandbox(
                     _SB_FEAT_A, incarnation_id=_INC_1, browser_enabled=False
                 )
-            elif pack_calls["n"] == 2 and callable(on_second_pack):
+            elif pack_calls["n"] == 2:
                 on_second_pack()
 
         store = BrowserProvenanceStore(
