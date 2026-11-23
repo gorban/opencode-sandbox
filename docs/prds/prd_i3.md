@@ -3,6 +3,8 @@
 Parent: [prd_i](prd_i.md) · related: [dashboard](prd_i1.md), [worker fleet](prd_i2.md),
 [LLM gateway](prd_i4.md)
 
+Child: [I3a managed worker credential isolation](prd_i3a.md).
+
 ## Credential access
 
 - [ ] Keep provider, CI and infrastructure credentials in trusted host storage. Workers

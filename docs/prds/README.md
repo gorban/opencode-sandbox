@@ -15,6 +15,9 @@ reservation explicitly in this index.
   ([I2](prd_i2.md#workers-and-connectivity)) — **Outside-in integrations**.
 - [*] Maintainer setup and end-to-end acceptance for these integrations
   ([I](prd_i.md#recommended-first-slice), [I2](prd_i2.md), [I4](prd_i4.md)) — **Outside-in integrations**.
+- [*] Managed worker credential isolation, sign-in enforcement, and shared-home migration
+  ([I3a](prd_i3a.md)) — **Worker credential isolation**. Provider onboarding and live acceptance
+  stay with **Outside-in integrations**.
 
 - [*] PRD M first PoC — local worker addressing, orchestration, and thread projection
   ([M first PoC split](prd_m.md#first-poc-split)) — **PRD M coordination**.
