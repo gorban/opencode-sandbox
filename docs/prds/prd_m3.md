@@ -116,10 +116,15 @@ Sidebar Tree (3-Level Hierarchy)
      mutation validates exact `Origin` + CSRF token; every WebSocket upgrade requires a
      **single-use, CSRF-minted WS ticket** bound to `(session_id, target_addr, surface_kind)`.
 - **Explicit CSP & Trusted Host Chrome Separation ([prd_i1](prd_i1.md), [prd_i3](prd_i3.md)):**
-  - **Trusted Host Chrome CSP:** Emit the **exact bound ephemeral port** at runtime:
+  - **Loopback dashboard CSP ([M3a](prd_m3a.md)):** The daemon sends the enforcing header on
+    each HTML response. Emit the **exact bound ephemeral port** at runtime when WebSockets
+    are enabled:
     `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;
     connect-src 'self' ws://127.0.0.1:<bound_port>; frame-src 'self'; frame-ancestors 'none';
-    base-uri 'none'; form-action 'self'`.
+    base-uri 'none'; form-action 'self'`. If the production build has an inline bootstrap,
+    add its exact build hash to `script-src`.
+  - **Desktop dashboard CSP ([M3b](prd_m3b.md)):** Load only bundled assets and enable only
+    the platform's required local IPC endpoints. Omit the loopback WebSocket destination.
   - **Null-Origin Sandboxed Iframes (PTY & Browser Canvas):** Because `<iframe sandbox="allow-scripts">`
     assigns an opaque `null` origin where `'self'` does not match, pin iframe scripts via an
     explicit CSP SHA-256 hash or exact static origin URL (`script-src 'sha256-...'` /
