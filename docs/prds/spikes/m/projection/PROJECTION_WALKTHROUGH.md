@@ -6,9 +6,9 @@ Parent: [prd_m3.md](../../prd_m3.md) · [prd_m3a.md](../../prd_m3a.md) · [prd_m
 
 ## 1. Scope, Boundaries, and Non-Goals
 
-This Gate 1 walkthrough specifies the **read-only M3.1 projection slice** for the unified
-`Project -> Sandbox -> Thread` control plane, producing strictly typed, bounded, inert JSON-safe
-snapshots from `$STATE/registry.sqlite` and `$STATE` health markers without mutating any state.
+This Gate 1 walkthrough specifies the **standalone, operator-only read-only M3.1 projection slice**
+for the unified `Project -> Sandbox -> Thread` control plane, producing strictly typed, bounded,
+inert JSON-safe snapshots from `$STATE/registry.sqlite` and `$STATE` health markers.
 
 ### Owned File Boundary (Strictly Disjoint)
 
@@ -16,22 +16,30 @@ All code and tests for this slice live exclusively under `docs/prds/spikes/m/pro
 
 - `PROJECTION_WALKTHROUGH.md` — this Gate 1 design walkthrough.
 - `oc_projection_contract.py` — frozen dataclasses, schema version constants, bounds constants,
-  validated cursor grammar, and strict JSON-safe serializer (`to_dict()`).
-- `oc_projection.py` — `ReadOnlyProjectionService` (engine-enforced read-only SQLite snapshot
-  reader, `O_NOFOLLOW` state/marker validation, caller authorization, provenance verification, and
-  bounded pagination).
+  canonical base64url JSON cursor codec, and strict `allow_nan=False` JSON serializer.
+- `oc_projection.py` — `ReadOnlyProjectionService` (operator-only standalone read-only SQLite
+  snapshot reader, non-blocking `O_NOFOLLOW` state/DB/sidecar/marker/lock validation, pre/post
+  authority & session-generation fencing, per-event provenance verification, and hard-bounded
+  response pagination).
 - `test_projection.py` — deterministic offline qualification suite built on synthetic
   `CoordRegistry` + `CoordHub` fixtures (zero Podman, zero network, zero live credentials, zero
   writes to host production directories).
 
 **Zero edits to shared files:** This slice reuses `oc_coord_contract.py`, `oc_registry.py`,
-`oc_hub.py`, and `docs/prds/spikes/m/local/*` as currently merged on `main` (`e176712` / shared
-plan `f1dcc79`). No shared contract change is required. If any shared helper becomes necessary
-later, it will be proposed and cleared at Gate 1 before modifying any file outside
+`oc_hub.py`, and `docs/prds/spikes/m/local/*` as merged on `main` (`e176712` / shared plan
+`f1dcc79`). No shared contract change is required. If any shared helper becomes necessary later,
+it will be proposed and cleared at Gate 1 before modifying any file outside
 `docs/prds/spikes/m/projection/`.
 
 ### Explicit Non-Goals (Deferred to Later Slices / Other Owners)
 
+- **Non-operator (`JOB` / `ORCHESTRATOR` / `EXTERNAL_PEER`) scoped reads:** Standalone SQLite
+  cannot establish live in-memory `CoordHub` leases, target fences, grant-generation fences, or
+  historical subtree ownership across reused addresses. Standalone `ReadOnlyProjectionService` is
+  therefore **strictly `CoordRole.OPERATOR`-only** (`sandbox_addr is None, incarnation_id is None`).
+  Any future sandbox-scoped or orchestrator-scoped read API requires a separate hub-owned Gate 1
+  walkthrough that enforces live `CoordHub` lease, target-incarnation, and grant-generation
+  authority at both admission and release.
 - No SvelteKit frontend, HTTP/WebSocket daemon routes, or Tauri v2 bridge (`prd_m3a.md`, `prd_m3b.md`).
 - No mutations, message sending, grant creation/revocation, or `InputLease` writes.
 - No embedded PTY streaming, browser CDP screencasts, or containerized `safe_run` turn diffs.
@@ -41,163 +49,360 @@ later, it will be proposed and cleared at Gate 1 before modifying any file outsi
 
 ---
 
-## 2. Trust Boundaries & Engine-Enforced Read-Only Access
+## 2. Trust Boundaries, Filesystem Admission, & Live-WAL Semantics
 
-### 2.1 Filesystem & SQLite Read-Only Confinement
+### 2.1 Verification-Only State Directory, Database, & Sidecar Admission
 
-`ReadOnlyProjectionService` treats `$STATE` path hygiene identically to `oc_registry.py` and
-`oc_hub.py`, and enforces read-only access at both the OS and SQLite engine layers:
+`ReadOnlyProjectionService` enforces verification-only filesystem checks **at least as strict as
+`oc_registry.py`** — it **never creates directories or files, and never repairs modes via `chmod`
+or `fchmod`**:
 
 ```python
-function open_readonly_snapshot(state_dir, sandbox_root):
-    # 1. Path trust validation (never follow symlinks; never resolve inside sandbox_root)
-    trusted_dir = assert_trusted_dir(state_dir, sandbox_root=sandbox_root)
-    assert_not_in_sandbox(trusted_dir, sandbox_root)
-    assert_existing_ancestors_safe(trusted_dir)
+_DB_ALL_FILES = ("", "-wal", "-shm", "-journal")
 
+function verify_regular_private_file_nofollow(path, *, required: bool, label: str) -> None:
+    # Always open non-blocking + no-follow so a pre-placed FIFO cannot hang before fstat()!
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if required:
+            raise CoordPolicyError(f"{label}_missing")
+        return
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise CoordPolicyError(f"{label}_symlink_rejected") from exc
+        raise CoordPolicyError(f"{label}_unreadable") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise CoordPolicyError(f"{label}_not_regular")
+        if st.st_nlink != 1:
+            raise CoordPolicyError(f"{label}_hardlink_rejected")
+        if st.st_uid != os.geteuid():
+            raise CoordPolicyError(f"{label}_wrong_owner")
+        if (st.st_mode & 0o077) != 0:
+            raise CoordPolicyError(f"{label}_unsafe_mode")
+    finally:
+        os.close(fd)
+
+function verify_state_dir_and_db_readonly(state_dir, sandbox_root) -> tuple[Path, Path]:
+    raw = Path(state_dir)
+    if raw.is_symlink():
+        raise CoordPolicyError("state_dir_symlink_rejected")
+    assert_raw_no_user_symlink_ancestors(raw)          # mirrors oc_hub.py:375-388
+    phys = check_not_in_sandbox(raw, sandbox_root)
+    check_not_host_production_dir(raw)                 # mirrors oc_registry.py:398
+    check_not_host_production_dir(phys)
+    if phys.is_symlink() or not phys.exists():
+        raise CoordPolicyError("state_dir_missing_or_symlink")
+    trusted_dir = assert_trusted_dir(phys, sandbox_root=sandbox_root)  # requires 0o700, euid owner, no symlinks
     db_path = trusted_dir / "registry.sqlite"
-    # 2. Verify registry.sqlite itself via O_RDONLY | O_NOFOLLOW + fstat
-    #    - Missing -> CoordPolicyError("registry_missing") (NEVER auto-create!)
-    #    - Symlink (ELOOP), non-regular file, wrong UID (not euid/0), or group/world writable (mode & 0o022)
-    #      -> CoordPolicyError("registry_untrusted")
-    verify_regular_file_nofollow(db_path, require_owner=True, reject_group_world_writable=True)
+    for idx, suffix in enumerate(_DB_ALL_FILES):
+        verify_regular_private_file_nofollow(
+            Path(f"{db_path}{suffix}"),
+            required=(idx == 0),
+            label="registry" if idx == 0 else f"registry_sidecar_{suffix.lstrip('-')}",
+        )
+    return trusted_dir, db_path
+```
 
-    # 3. Open dedicated SQLite connection strictly read-only (URI mode=ro, no creation)
-    #    Note: immutable=0 so live WAL snapshots from concurrent CoordHub writers are visible!
-    conn = sqlite3.connect(
-        f"file:{quote(str(db_path))}?mode=ro",
-        uri=True,
-        isolation_level=None,   # explicit transaction control
-        timeout=2.0,
-        check_same_thread=False,
-    )
-    conn.row_factory = dict_row_factory
-    conn.execute("PRAGMA query_only = ON")
-    conn.execute("PRAGMA temp_store = MEMORY")
-    conn.execute("PRAGMA busy_timeout = 2000")
+- **Strict parity with `oc_registry.py`:** Rejects raw symlinks, user-symlink ancestors,
+  production host directories, missing state directories, non-`0o700` state directories, missing
+  `registry.sqlite`, symlinks, FIFOs/sockets/devices, hardlinks (`st_nlink != 1`), non-effective-UID
+  owners (`st_uid != os.geteuid()` — never accepts UID `0` unless running as UID `0`), any
+  group/other permission bits (`(st_mode & 0o077) != 0`, rejecting `0o644`/`0o640` without
+  repairing them), and verifies all 4 database files (`registry.sqlite`, `-wal`, `-shm`,
+  `-journal`).
+
+### 2.2 Live-WAL SQLite Opening & Explicit Immutability Guarantee
+
+```python
+function open_readonly_snapshot(db_path, *, max_read_ms: int) -> sqlite3.Connection:
+    # Wrap connect + initial WAL anchor read under _UMASK_LOCK + umask(0o077) so any
+    # SQLite WAL shared-memory coordination sidecar created in a writable $STATE inherits 0o600.
+    uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
+    with _UMASK_LOCK:
+        old_umask = os.umask(0o077)
+        try:
+            conn = sqlite3.connect(
+                uri,
+                uri=True,
+                isolation_level=None,
+                timeout=2.0,
+                check_same_thread=False,
+            )
+            conn.row_factory = dict_row_factory
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA temp_store = MEMORY")
+            conn.execute("PRAGMA busy_timeout = 2000")
+            install_progress_deadline(conn, max_read_ms)  # raises sqlite3.OperationalError("interrupted") on deadline
+            conn.execute("BEGIN DEFERRED")
+            # Immediately anchor the WAL read snapshot on seq_counter inside this transaction!
+            conn.execute("SELECT last_seq FROM seq_counter WHERE id = 1").fetchone()
+        except sqlite3.OperationalError as exc:
+            raise map_sqlite_operational_error(exc) from exc
+        finally:
+            os.umask(old_umask)
     return conn
 ```
 
-- **Why `mode=ro` + `PRAGMA query_only = ON` + `immutable=0`?**
-  - SQLite refuses to create missing files (`mode=ro`) and refuses any `INSERT`/`UPDATE`/`DELETE`/DDL
-    (`PRAGMA query_only = ON`).
-  - Leaving `immutable=0` allows SQLite WAL mode to serve consistent concurrent snapshots while
-    `CoordHub` writes on its own connection without racing or corrupting reads.
-  - Because `registry.sqlite` is opened in WAL mode by `CoordRegistry`, if `-wal`/`-shm` exist
-    alongside `registry.sqlite`, `verify_optional_sidecar_nofollow()` verifies any present
-    `registry.sqlite-wal` and `registry.sqlite-shm` files are also regular, non-symlink,
-    owner-trusted, non-group/world-writable files before opening SQLite.
-- **Single-Snapshot Transaction Discipline:** Every public read API executes inside a single
-  `BEGIN DEFERRED` transaction (immediately executing a first `SELECT` on `seq_counter` to anchor
-  the WAL read snapshot!) and unconditionally executes `ROLLBACK` in `finally:` before closing
-  (or releasing) the connection. Readers therefore:
-  1. Never see torn cross-table state (e.g., a rotated `sandboxes.incarnation_id` mixed with old
-     `routing_edges` or `outbox` rows from a different commit).
-  2. Never hold long-lived read marks that block WAL checkpointing.
+- **Explicit Live-WAL Guarantee (No Overclaimed Zero-Sidecar Filesystem Immutability):**
+  - `mode=ro` + `PRAGMA query_only = ON` guarantees **strict logical immutability**: SQLite
+    refuses to create a missing `registry.sqlite` and rejects every SQL write (`INSERT`, `UPDATE`,
+    `DELETE`, DDL, `VACUUM`, `PRAGMA` mutations). All logical tables, `seq_counter`, and the
+    hash-chained `audit_log` remain completely unchanged by projection reads.
+  - Because `immutable=0` is used to read live WAL snapshots from a concurrent `CoordHub` writer,
+    SQLite may create or update WAL shared-memory coordination sidecars (`registry.sqlite-shm`,
+    `registry.sqlite-wal`) in a writable `0o700` `$STATE` directory (confined to `0o600` via
+    `_UMASK_LOCK` + `umask(0o077)`). If `$STATE` is read-only (`0o500`) without a pre-existing
+    `-shm` file, SQLite raises `OperationalError`, which is mapped fail-closed to
+    `CoordPolicyError("registry_unreadable")`.
+  - Post-`O_NOFOLLOW` URI opening relies on `$STATE`'s verified owner-only `0o700` confinement.
+  - If strict zero-sidecar filesystem immutability is ever required (e.g., against an immutable
+    archive), that belongs to a separate host-produced sealed snapshot copy opened with
+    `immutable=1`.
+- **Single-Snapshot & Clean Release Discipline:** Every public read API runs inside the single
+  `BEGIN DEFERRED` transaction anchored at open time and unconditionally executes `ROLLBACK` +
+  `conn.close()` in `finally:` so readers never see torn cross-table state and never hold long
+  WAL read marks.
+- **Query Work Deadline:** `conn.set_progress_handler(deadline_cb, 1000)` enforces a bounded
+  wall-clock budget (`DEFAULT_MAX_READ_MS = 2000`, configurable within `50..10_000` ms); exceeding
+  the deadline aborts SQLite execution and raises `CoordPolicyError("read_deadline_exceeded")`.
 
-### 2.2 State-Dir Health Marker Reads (`O_NOFOLLOW`)
+### 2.3 State-Dir Health Markers, `.coord_hub.lock` Liveness Probe, & Orphaned Bindings
 
-Inside each snapshot operation (immediately before opening the `BEGIN DEFERRED` read transaction,
-and re-checked inside if an optional live fence oracle is provided):
+Inside each read operation, health is derived from three sources:
 
-- Read `.coord_degraded` and `.coord_session_active` via `O_RDONLY | O_NOFOLLOW`, verifying regular
-  file, owner UID, and bounded read (`<= 256` bytes), mirroring `oc_hub.py._read_marker_text_nofollow()`.
-- **Fail-closed on marker error:** If either marker is a symlink (`ELOOP`), non-regular file,
-  wrong owner, group/world-writable, or unreadable (`OSError`), do **not** treat the hub as healthy:
-  force `health.degraded = True` and append `"marker_unreadable"` to `degraded_reasons`.
-- **Unconfirmed external bindings check (from the same SQLite snapshot):** Query
-  `external_transport_bindings WHERE terminal_confirmed = 0` joined with `sandboxes`:
-  - Count bindings where `abort_requested != 0`, OR where the corresponding sandbox is `revoked`,
-    OR where the binding's `incarnation_id` differs from the current `sandboxes.incarnation_id`
-    (superseded unconfirmed external owner).
-  - Expose `unconfirmed_bindings_count` and (for `OPERATOR` only) bounded summary entries
-    (omitting raw host secrets; exposing sanitized `sandbox_addr`, `incarnation_id`,
-    `abort_requested`, `terminal_confirmed`, sanitized `reason`, `updated_at`).
-  - If `unconfirmed_bindings_count > 0`, set `health.has_unconfirmed_bindings = True`.
-  - **Fail-closed operational gate:** When `health.degraded` is `True` OR
-    `health.has_unconfirmed_bindings` is `True`, non-`OPERATOR` callers are refused with
-    `CoordPolicyError("hub_degraded")`, while `OPERATOR` retains read-only diagnostic visibility
-    with explicit health warnings!
-
-### 2.3 Session-Generation Fence Readiness (`prd_m3a.md` / `prd_m3b.md`)
-
-To support the M3a/M3b session-generation retirement invariant specified in `f1dcc79`:
-
-- `ReadOnlyProjectionService` accepts an optional host-side `session_validator` callback:
-  `validate_read_session(caller: PrincipalCtx, read_session_id: str, session_generation: int) -> bool`
-  (and optional `live_fence_checker(sandbox_addr: str, incarnation_id: str) -> bool` when wired
-  into an in-process `CoordHub`).
-- When `read_session_id` / `session_generation` are supplied on a read call:
-  1. Validate both before reading SQLite (`session_validator` must return `True`; falsy or raising
-     raises `RevokedError("read_session_retired")`).
-  2. Re-validate **after** reading SQLite and **before** returning the snapshot object (fencing
-     late replies that raced a logout, expiry, or session rotation during the query!).
-  3. Echo validated `(read_session_id, session_generation)` on the returned snapshot envelope so
-     M3a/M3b clients can also discard any response whose generation no longer matches the active
-     UI session.
-- If a caller supplies `read_session_id` or `session_generation` when **no** `session_validator`
-  is configured, fail closed with `CoordPolicyError("read_session_validator_unconfigured")` rather
-  than echoing unverified session metadata.
-
----
-
-## 3. Caller Read Authority Matrix (`PrincipalCtx`)
-
-Every read API requires a host-authenticated `PrincipalCtx` (never constructed from untrusted
-payloads) and performs role + liveness authorization **inside the same SQLite read snapshot**:
-
-| `CoordRole` | `get_workspace_tree` | `get_sandbox_status` | `get_thread_events` | `get_sandbox_mailbox` |
-|---|---|---|---|---|
-| `OPERATOR` (`sandbox_addr is None`, `incarnation_id is None`) | Full fleet (active + revoked; optional historical incarnations); full health diagnostics | Any sandbox (active or revoked); full binding status & grants | Any sandbox/thread (current or historical incarnation with explicit stale flag) | Any sandbox outbox + stale grant/incarnation flags |
-| `ORCHESTRATOR` (root `sandbox_addr is None`) | Full fleet when operational (no raw host marker reasons / `owner_id`) | Any sandbox when operational (no raw `owner_id`) | Any sandbox/thread (current or historical within operational gate) | Any sandbox outbox when operational |
-| `ORCHESTRATOR` (sandbox-bound `sandbox_addr != None`) | Strictly own live subtree (`parent_addr` closure rooted at `caller.sandbox_addr`) | Strictly own live subtree | Strictly own live subtree; excludes `OPERATOR_DIRECTIVE` outside self | Strictly own live subtree |
-| `JOB` (`sandbox_addr` + `incarnation_id` required) | Own current live sandbox + peer sandboxes with an **active, non-tombstoned** `routing_edge` from `caller.sandbox_addr` (matching `src_incarnation` if pinned) | Own live sandbox only (active edges to/from self; zero other-sandbox internals) | Own current incarnation threads + peer current incarnation threads explicitly in `allowed_threads` of an active non-tombstoned edge; **strictly excludes `OPERATOR_DIRECTIVE`** on peer reads; **refuses historical incarnations** | **DENIED (`CoordAuthError`)** |
-| `EXTERNAL_PEER` | **DENIED (`CoordAuthError`)** | **DENIED (`CoordAuthError`)** | **DENIED (`CoordAuthError`)** | **DENIED (`CoordAuthError`)** |
-
-### Strict Caller Liveness Rules (Inside Snapshot)
-
-1. `OPERATOR` must have `sandbox_addr is None` and `incarnation_id is None`; otherwise reject with
-   `CoordAuthError("operator_principal_must_not_bind_sandbox")`.
-2. Any principal with `sandbox_addr is not None` (`JOB` or sandbox-bound `ORCHESTRATOR`):
-   - `sandboxes` row for `caller.sandbox_addr` must exist and have `status != "revoked"`.
-   - `sandboxes.incarnation_id` must equal `caller.incarnation_id` (else `IncarnationMismatchError`).
-   - `external_transport_bindings` for `(caller.sandbox_addr, caller.incarnation_id)` must NOT have
-     `abort_requested != 0` or `terminal_confirmed != 0` (else `RevokedError`).
-   - If `live_fence_checker` is attached and returns fenced for `(caller.sandbox_addr,
-     caller.incarnation_id)` -> `RevokedError`.
-3. Active edge validation for `JOB` peer reads:
-   - Edge must have `active == 1`, `src_actor == caller.sandbox_addr`,
-     `(src_incarnation IS NULL OR src_incarnation == caller.incarnation_id)`, AND **no** matching
-     row in `grant_tombstones` for `(edge_id, grant_generation)`!
-   - Destination sandbox must exist and have `status != "revoked"` (revoked peers are never
-     readable by `JOB` callers; `OPERATOR` can still inspect revoked sandboxes!).
-   - Corrupt/non-list `allowed_threads_json` on an edge fails closed (grants zero threads).
+1. **Non-blocking `O_NOFOLLOW` marker reads (`.coord_degraded`, `.coord_session_active`):**
+   - Both files are read via `os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)`, verifying
+     `S_ISREG`, `st_nlink == 1`, `st_uid == os.geteuid()`, `(st_mode & 0o077) == 0`, reading at most
+     `256` bytes.
+   - Any open/stat failure other than `FileNotFoundError` (including FIFO, symlink `ELOOP`,
+     hardlink, wrong owner, unsafe mode `0o644`) sets `degraded = True` and adds
+     `"marker_unreadable"` to `degraded_reasons`.
+   - If `.coord_degraded` exists and is readable: `degraded = True` and add sanitized reason
+     (or `"degraded_marker_present"`).
+2. **`.coord_session_active` liveness vs. stale crash marker (`.coord_hub.lock` probe):**
+   - If `.coord_session_active` is absent: `hub_session_active = False`.
+   - If `.coord_session_active` is present and valid: `hub_session_active = True`, and probe
+     `.coord_hub.lock` strictly read-only via `os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW |
+     os.O_NONBLOCK)` with the exact same `S_ISREG` / `st_nlink == 1` / `st_uid == euid` /
+     `(st_mode & 0o077) == 0` checks, then call `fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)`:
+     - Raises `BlockingIOError` -> a live `CoordHub` holds the exclusive lock -> healthy live
+       session (not degraded by `.coord_session_active` alone).
+     - Lock acquired (immediately `fcntl.flock(fd, fcntl.LOCK_UN)` and close) -> no live hub holds
+       the lock, so `.coord_session_active` is a **stale crash marker** -> `degraded = True` and
+       add `"stale_session_active_marker"` to `degraded_reasons`.
+     - `.coord_hub.lock` missing or fails trust checks -> `degraded = True` and add
+       `"stale_session_active_marker"` / `"marker_unreadable"`.
+3. **Optional live in-process degraded hook (`live_degraded_checker`):**
+   - Because a restarted `CoordHub` sets in-memory `self._degraded = True` upon observing
+     `.coord_session_active` without necessarily writing `.coord_degraded` (`oc_hub.py:1140-1144`),
+     `ReadOnlyProjectionService` accepts an optional `live_degraded_checker: Callable[[], bool]`.
+     When configured, if it returns `True` (or anything non-`False` / raises), force
+     `degraded = True` and add `"live_hub_degraded"`!
+4. **Orphaned & unconfirmed `external_transport_bindings` (`LEFT JOIN`, inside SQLite snapshot):**
+   ```sql
+   SELECT b.sandbox_addr, b.incarnation_id, b.abort_requested, b.terminal_confirmed,
+          b.reason, b.updated_at, s.status AS sandbox_status, s.incarnation_id AS current_incarnation
+   FROM external_transport_bindings b
+   LEFT JOIN sandboxes s ON s.sandbox_addr = b.sandbox_addr
+   WHERE b.terminal_confirmed = 0
+     AND (b.abort_requested != 0
+          OR s.sandbox_addr IS NULL
+          OR s.status = 'revoked'
+          OR s.incarnation_id != b.incarnation_id)
+   ORDER BY b.sandbox_addr ASC, b.incarnation_id ASC
+   LIMIT ?
+   ```
+   - Using `LEFT JOIN` ensures orphaned bindings whose `sandboxes` row is missing are **never**
+     dropped (matching `oc_hub.py:1336-1338`).
+   - Also execute `SELECT COUNT(*) ...` with the exact same `WHERE` clause so
+     `unconfirmed_bindings_count` is exact even when the summary list is capped at
+     `MAX_UNCONFIRMED_BINDINGS_SUMMARY = 50`.
+   - Raw `owner_id` and `token_sha256` are **never** exposed in any projection response.
 
 ---
 
-## 4. Pseudocode Walkthrough of Read-Only Operations
+## 3. Caller Read Authority & Session-Generation Fencing
 
-### 4.1 Core Bounds Constants (`oc_projection_contract.py`)
+### 3.1 Strict Operator-Only Admission
+
+Every public read method checks `caller` **before touching the filesystem or SQLite**:
+
+```python
+function authorize_operator_caller(caller) -> PrincipalCtx:
+    if not isinstance(caller, PrincipalCtx):
+        raise CoordValidationError("caller must be PrincipalCtx")
+    if caller.role is not CoordRole.OPERATOR:
+        raise CoordAuthError("operator_role_required")
+    if caller.sandbox_addr is not None or caller.incarnation_id is not None:
+        raise CoordAuthError("operator_principal_must_not_bind_sandbox")
+    return caller
+```
+
+- `CoordRole.JOB`, `CoordRole.ORCHESTRATOR` (both root and sandbox-bound), and
+  `CoordRole.EXTERNAL_PEER` are unconditionally denied (`CoordAuthError("operator_role_required")`)
+  before any DB open or sandbox lookup, eliminating any sandbox-existence oracle, stale-grant race,
+  or address-reuse history leak in the standalone reader.
+
+### 3.2 Mandatory Pre-Read and Post-Read Session & Live-Authority Fencing
+
+`ReadOnlyProjectionService` supports two optional host-side authority callbacks:
+
+- `session_validator: Callable[[PrincipalCtx, str, int], bool] | None = None`
+- `live_authority_checker: Callable[[PrincipalCtx], bool] | None = None`
+
+Exact fail-closed rules:
+
+1. **Session argument pairing & mandatory enforcement:**
+   - Passing only one of `(read_session_id, session_generation)` raises
+     `CoordValidationError("read_session_pair_required")`.
+   - When `read_session_id` and `session_generation` are supplied:
+     - Validate `read_session_id` via `validate_opaque_token(read_session_id, "read_session_id")`.
+     - Validate `type(session_generation) is int and session_generation >= 1` (rejects `bool`,
+       `<= 0`, floats).
+     - If `session_validator is None`: raise `CoordPolicyError("read_session_validator_unconfigured")`.
+   - When `session_validator is not None`:
+     - Omitting `(read_session_id, session_generation)` raises
+       `CoordAuthError("read_session_required")` (no silent bypass!).
+     - Call `session_validator(caller, read_session_id, session_generation)` **both before** opening
+       SQLite **and after** completing the snapshot **before returning** the response.
+     - Require strict `result is True` (not truthy objects); any non-`True` return or raised
+       exception raises `RevokedError("read_session_retired")` and returns zero data!
+2. **Live authority check (`live_authority_checker`):**
+   - When configured, call `live_authority_checker(caller)` **both before** opening SQLite **and
+     after** completing the snapshot **before returning**. Require strict `result is True`; any
+     non-`True` return or raised exception raises `RevokedError("read_authority_revoked")` (fencing
+     a paused read if the host daemon shuts down or operator authority is revoked while a UI
+     session token is still valid!).
+3. **Echo validated session coordinates:** When a read session is validated, echo
+   `(read_session_id, session_generation)` on the returned snapshot envelope so M3a/M3b UI clients
+   can discard late responses belonging to a retired session generation.
+
+---
+
+## 4. Collision-Free, Context-Bound Cursors & Hard Response-Byte Caps
+
+### 4.1 Hard Bounds (`oc_projection_contract.py`)
 
 ```python
 PROJECTION_SCHEMA_VERSION = "oc.m3.readonly_projection@1"
-MAX_PROJECTS_PER_PAGE = 50
-MAX_SANDBOXES_PER_PAGE = 100
+MAX_SANDBOXES_PER_PAGE = 50
+MAX_PROJECTS_PER_PAGE = 50             # bounded by MAX_SANDBOXES_PER_PAGE (<= 1 project per sandbox)
 MAX_THREADS_PER_SANDBOX = 50
 MAX_EDGES_PER_SANDBOX = 100
 MAX_PAGE_LIMIT = 200
 DEFAULT_PAGE_LIMIT = 50
-MAX_RESPONSE_BYTES = 256 * 1024        # 256 KiB serialized JSON payload cap per page
-MAX_ITEM_TEXT_BYTES = 16 * 1024        # 16 KiB per-item text cap (UTF-8 safe truncation)
-MAX_METADATA_TEXT_BYTES = 256          # Titles, reasons, sanitized detail fields
-MAX_CURSOR_BYTES = 256
-MAX_UNCONFIRMED_BINDINGS_SUMMARY = 100
+MIN_RESPONSE_BYTES = 1024
+MAX_RESPONSE_BYTES = 256 * 1024        # 256 KiB hard ceiling on complete UTF-8 JSON serialization
+MAX_ITEM_TEXT_BYTES = 16 * 1024        # 16 KiB per-item text cap before further budget shrinking
+MAX_METADATA_TEXT_BYTES = 256
+SQL_MAX_CELL_BYTES = 65_536            # Max JSON/metadata cell bytes decoded; larger cells -> malformed_metadata
+MAX_JSON_DEPTH = 8
+MAX_CURSOR_BYTES = 512
+MAX_UNCONFIRMED_BINDINGS_SUMMARY = 50
+DEFAULT_MAX_READ_MS = 2000
+MAX_READ_MS = 10_000
 ```
 
-All `limit`, `max_*`, and `max_response_bytes` arguments reject `bool`, non-`int`, `< 1`, or
-values exceeding their hard upper bound with `CoordValidationError`.
+All `limit`, `max_*`, `max_response_bytes`, and `max_read_ms` inputs reject `bool`, non-`int`,
+out-of-range values with `CoordValidationError`.
 
-### 4.2 Operation 1: `get_workspace_tree`
+### 4.2 Collision-Free Canonical Cursor Codec
+
+Because `_ID_TOKEN_RE` permits `:` in `incarnation_id` and `msg_id`, and `project_id` accepts
+arbitrary non-control Unicode strings of unbounded length, **`:`-delimited cursors are NOT used**.
+
+Every cursor uses canonical base64url-encoded JSON:
+
+```text
+cursor = "v1." + base64url_nopad(json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=True).encode("utf-8"))
+```
+
+- **Strict validation on decode:**
+  - Must be `str`, `len(cursor.encode("utf-8")) <= MAX_CURSOR_BYTES`, ASCII-only, starting with `"v1."`.
+  - Decode base64url (strict alphabet, no padding), parse JSON object, verify exact expected keys
+    and value types, and verify **canonical re-encoding equals the exact input string** (rejecting
+    malleable base64 padding, extra whitespace, or unknown fields) -> else `CoordValidationError`.
+- **Operation & filter scope binding (`"op"` + `"fh"`):**
+  - Every cursor embeds `"op"` (`"tree" | "events" | "mailbox"`) and `"fh"` (16-hex-char SHA-256
+    prefix of the canonicalized query parameters: operation, target, thread_id, incarnation_id,
+    `include_revoked`, `include_historical_incarnations`, `statuses`).
+  - Reusing a cursor under a different operation, target, thread, incarnation, or filter raises
+    `CoordValidationError("cursor_scope_mismatch")`.
+- **Exact keyset shapes (every key strictly bounded so a valid row NEVER emits an unparseable cursor!):**
+  1. **`get_workspace_tree`:** Paginates sandboxes deterministically by **`sandbox_addr ASC`**
+     (`PRIMARY KEY`, strictly `<= 63` ASCII chars via `parse_local_target`), grouping each page's
+     sandboxes by `project_id` (sorted by `(project_id ASC, sandbox_addr ASC)` within the page,
+     with clients merging multi-page projects by `project_id`).
+     - Cursor payload: `{"op": "tree", "fh": "<16-hex>", "addr": "<sandbox_addr>"}` — always
+       `< 160` bytes regardless of how long `project_id` is!
+     - `project_id` itself is projected verbatim when `<= MAX_METADATA_TEXT_BYTES` or truncated
+       with `project_id_truncated = True` + exact `project_id_sha256` so even a 10 KiB valid
+       `project_id` never breaks cursor encoding or blows the response budget!
+  2. **`get_thread_events`:** Total order `(seq ASC, source_rank ASC)` where `source_rank = 0` for
+     `event_log` and `1` for `stream_events` (`seq` is unique per table via `INTEGER PRIMARY KEY`).
+     - Cursor payload: `{"op": "events", "fh": "<16-hex>", "seq": int, "rank": 0|1, "inc": "<incarnation_id>"}`.
+     - **Exact SQL boundary (zero skipped same-`seq` stream rows):**
+       - When `cursor.rank == 0`: `event_log` queries `seq > cursor.seq`; `stream_events` queries
+         **`seq >= cursor.seq`**!
+       - When `cursor.rank == 1`: BOTH `event_log` and `stream_events` query `seq > cursor.seq`.
+  3. **`get_sandbox_mailbox`:** Total order `(o.seq ASC, o.msg_id ASC)`.
+     - Cursor payload: `{"op": "mailbox", "fh": "<16-hex>", "seq": int, "mid": "<msg_id>"}`.
+     - SQL boundary: `(o.seq > ?) OR (o.seq = ? AND o.msg_id > ?)`.
+- **Concurrent-change cursor semantics:** Each page runs inside its own single-transaction
+  `BEGIN DEFERRED` read snapshot (`snapshot_seq`). Within a page, all counts, bindings, edges,
+  and rows are strictly consistent. Across pages, concurrent writers produce a forward-moving
+  keyset view (`snapshot_seq` may advance; callers wanting a fresh point-in-time resync when
+  `snapshot_seq` or `applied_incarnation_id` rotates restart from `cursor=None`).
+
+### 4.3 Hard End-to-End Serialized Response-Byte Enforcement (All 4 APIs)
+
+All 4 APIs serialize strictly via `json.dumps(obj.to_dict(), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")` and **guarantee `len(serialized_utf8) <= max_response_bytes`** (including all JSON escaping such as `\"`, `\\`, `\n`, `\u0000` and full envelope overhead!):
+
+1. **Paginated responses (`get_thread_events`, `get_sandbox_mailbox`, `get_workspace_tree`):**
+   - `get_thread_events` and `get_sandbox_mailbox` carry a compact `WorkspaceHealthSummary`
+     (`degraded`, `hub_session_active`, `has_unconfirmed_bindings`, `unconfirmed_bindings_count` —
+     fixed compact footprint) so a 50-item unconfirmed binding list never crowds out 1 KiB pages.
+   - `get_workspace_tree` and `get_sandbox_status` carry `WorkspaceHealth` with bounded
+     `unconfirmed_bindings` (shrunk / truncated with `unconfirmed_bindings_truncated = True` if
+     needed to fit `max_response_bytes`).
+   - Measure the exact serialized envelope size with empty item list + worst-case `next_cursor`
+     length first; if the empty envelope alone exceeds `max_response_bytes`, raise
+     `CoordValidationError("response_budget_too_small_for_envelope")`.
+   - Add projected items one by one, checking the **actual serialized JSON UTF-8 byte length** of
+     the assembled response (or incremental exact serialized item bytes + separator + updated
+     `next_cursor`):
+     - **First-item rule (`get_thread_events`, `get_sandbox_mailbox`):** If the first item alone
+       exceeds the remaining byte budget (e.g., 1 KiB budget with escape-heavy text), shrink its
+       `text` / `detail` via binary search on character length (UTF-8 & JSON-escape exact!) so the
+       **complete serialized response** fits `<= max_response_bytes` with `text_truncated = True`.
+       If even an empty-text first item cannot fit, raise
+       `CoordValidationError("response_budget_too_small_for_item")` rather than violating the cap!
+     - **First-item rule (`get_workspace_tree`):** If the first sandbox with its threads exceeds
+       remaining budget, reduce its inline `threads[]` (setting `threads_truncated = True`, down to
+       `0` threads if needed); if even a zero-thread sandbox cannot fit, raise
+       `CoordValidationError("response_budget_too_small_for_item")`.
+     - **Subsequent items:** Stop before exceeding `max_response_bytes`, set `has_more = True`,
+       and emit `next_cursor` for the last admitted item.
+2. **Non-paginated status (`get_sandbox_status`):**
+   - Enforces `max_response_bytes` (default `MAX_RESPONSE_BYTES`), progressively capping `edges[]`
+     (`edges_truncated = True`) and `health.unconfirmed_bindings[]`
+     (`unconfirmed_bindings_truncated = True`) if needed, and raising
+     `CoordValidationError("response_budget_too_small_for_envelope")` if even the minimal status
+     envelope cannot fit.
+3. **Bounded SQL byte fetches before decoding:**
+   - Queries check `LENGTH(CAST(col AS BLOB))` or inspect raw UTF-8 byte length before calling
+     `json.loads()` on `detail_json`, `artifact_refs_json`, `allowed_threads_json`,
+     `allowed_msg_kinds_json`, and `budget_json` — any cell exceeding `SQL_MAX_CELL_BYTES` is
+     never decoded into Python objects and sets `malformed_metadata = True`.
+
+---
+
+## 5. Pseudocode Walkthrough of the Four Operator Read APIs
+
+### 5.1 `get_workspace_tree`
 
 ```python
 function get_workspace_tree(
@@ -205,85 +410,79 @@ function get_workspace_tree(
     *,
     include_revoked=True,
     include_historical_incarnations=False,
-    after_sandbox_cursor=None,
-    sandbox_limit=100,
-    max_threads_per_sandbox=50,
+    after_cursor=None,
+    sandbox_limit=MAX_SANDBOXES_PER_PAGE,
+    max_threads_per_sandbox=MAX_THREADS_PER_SANDBOX,
+    max_response_bytes=MAX_RESPONSE_BYTES,
+    max_read_ms=DEFAULT_MAX_READ_MS,
     read_session_id=None,
     session_generation=None,
 ) -> WorkspaceTreeSnapshot:
-    validate_bounds(sandbox_limit <= MAX_SANDBOXES_PER_PAGE, max_threads_per_sandbox <= MAX_THREADS_PER_SANDBOX)
-    cursor_tuple = parse_sandbox_cursor(after_sandbox_cursor)  # "v1:<project_id>:<sandbox_addr>"
-    check_session_pre(caller, read_session_id, session_generation)
-    health_markers = read_state_dir_markers_nofollow(state_dir)
+    authorize_operator_caller(caller)
+    validate_bounds(sandbox_limit, max_threads_per_sandbox, max_response_bytes, max_read_ms)
+    scope_hash = compute_scope_hash("tree", include_revoked=include_revoked, include_historical=include_historical_incarnations)
+    parsed_cursor = decode_tree_cursor(after_cursor, expected_scope_hash=scope_hash)
+    check_authority_and_session_pre(caller, read_session_id, session_generation)
+    trusted_dir, db_path = verify_state_dir_and_db_readonly(state_dir, sandbox_root)
+    marker_health = read_state_dir_health_nofollow(trusted_dir, live_degraded_checker)
 
-    with readonly_snapshot_tx() as conn:
+    with open_readonly_snapshot(db_path, max_read_ms=max_read_ms) as conn:
         snapshot_seq = read_seq_counter(conn)
-        unconfirmed = query_unconfirmed_bindings(conn)
-        health = build_workspace_health(health_markers, unconfirmed, is_operator=(caller.role == OPERATOR))
-        enforce_caller_authority_and_health(conn, caller, health, require_admin=False)
+        health = build_full_workspace_health(conn, marker_health)
+        # Fetch sandbox_limit + 1 ordered by sandbox_addr ASC after parsed_cursor.addr
+        # (filtering status != 'revoked' when include_revoked is False)
+        sb_rows = select_sandboxes_page(conn, include_revoked=include_revoked, after_addr=parsed_cursor, limit=sandbox_limit + 1)
+        # For ONLY those fetched sandboxes (<= 51 rows, zero full-table scans):
+        #   - Fetch bounded threads (current incarnation only unless include_historical_incarnations=True)
+        #   - Compute historical_thread_count per sandbox
+        #   - Compute active vs revoked/tombstoned grant counts (checking both dst_addr and src_actor/orchestrator:<addr>)
+        #   - Compute outbox status counts grouped by status
+        #   - Compute external_transport_bindings state ("none"|"active"|"abort_requested"|"terminal_confirmed")
+        #   - Enforce max_response_bytes, group admitted sandboxes into sorted ProjectSummary[]
+        snapshot = build_bounded_workspace_tree(snapshot_seq, health, sb_rows, ...)
 
-        if include_historical_incarnations and caller.role not in (OPERATOR, ORCHESTRATOR):
-            raise CoordAuthError("historical_incarnations_admin_only")
-
-        # Determine exact visible sandbox set & allowed threads per sandbox
-        visible_addrs, allowed_threads_map = resolve_visible_sandboxes(conn, caller, include_revoked)
-
-        # Fetch bounded sandboxes ordered deterministically by (project_id ASC, sandbox_addr ASC)
-        # applying cursor_tuple > (last_project_id, last_sandbox_addr), fetching sandbox_limit + 1
-        sb_rows = select_visible_sandboxes(conn, visible_addrs, cursor_tuple, limit=sandbox_limit + 1)
-        has_more = len(sb_rows) > sandbox_limit
-        page_sbs = sb_rows[:sandbox_limit]
-
-        # For page_sbs ONLY (bounded, zero full-table scans):
-        #   - Fetch threads (current incarnation by default; historical only if requested by admin)
-        #   - Fetch historical_thread_count per sandbox
-        #   - Fetch active vs revoked/tombstoned grant counts
-        #   - Fetch outbox status counts (OPERATOR/ORCHESTRATOR only; empty dict for JOB)
-        #   - Fetch external_transport_bindings state ("none"|"active"|"abort_requested"|"terminal_confirmed")
-        #   - Group page_sbs into deterministic ProjectSummary -> SandboxSummary -> ThreadSummary tree
-        #   - Sanitize display metadata (project_name, branch, task_brief, title) for control/bidi chars
-        snapshot = assemble_workspace_tree(snapshot_seq, health, page_sbs, has_more, ...)
-
-    check_session_post(caller, read_session_id, session_generation)
+    check_authority_and_session_post(caller, read_session_id, session_generation)
     return snapshot
 ```
 
-### 4.3 Operation 2: `get_sandbox_status`
+### 5.2 `get_sandbox_status`
 
 ```python
 function get_sandbox_status(
     caller,
     *,
     target,
+    max_response_bytes=MAX_RESPONSE_BYTES,
+    max_read_ms=DEFAULT_MAX_READ_MS,
     read_session_id=None,
     session_generation=None,
 ) -> SandboxStatusSnapshot:
+    authorize_operator_caller(caller)
     addr = parse_local_target(target).canonical
-    check_session_pre(caller, read_session_id, session_generation)
-    health_markers = read_state_dir_markers_nofollow(state_dir)
+    validate_bounds(max_response_bytes=max_response_bytes, max_read_ms=max_read_ms)
+    check_authority_and_session_pre(caller, read_session_id, session_generation)
+    trusted_dir, db_path = verify_state_dir_and_db_readonly(state_dir, sandbox_root)
+    marker_health = read_state_dir_health_nofollow(trusted_dir, live_degraded_checker)
 
-    with readonly_snapshot_tx() as conn:
+    with open_readonly_snapshot(db_path, max_read_ms=max_read_ms) as conn:
         snapshot_seq = read_seq_counter(conn)
-        unconfirmed = query_unconfirmed_bindings(conn)
-        health = build_workspace_health(health_markers, unconfirmed, is_operator=(caller.role == OPERATOR))
-        enforce_caller_authority_and_health(conn, caller, health, require_admin=False)
-        enforce_sandbox_status_access(conn, caller, addr)  # JOB: self only; ORCHESTRATOR: subtree
-
+        health = build_full_workspace_health(conn, marker_health)
         sb = select_sandbox(conn, addr)
         if sb is None:
             raise CoordPolicyError("sandbox_not_found")
+        # Edges matching dst_addr = addr OR src_actor = addr OR src_actor = 'orchestrator:' || addr
         edges = select_edges_for_sandbox(conn, addr, limit=MAX_EDGES_PER_SANDBOX + 1)
         tombstones = select_tombstones_for_edges(conn, edges)
-        outbox_counts = select_outbox_counts(conn, addr) if caller.role in (OPERATOR, ORCHESTRATOR) else {}
-        binding_summary = select_binding_summary(conn, addr, sb.incarnation_id, include_reason=(caller.role == OPERATOR))
-        budget = select_sandbox_budget_safe(conn, addr, sb.incarnation_id)
-        snapshot = assemble_sandbox_status(snapshot_seq, health, sb, edges, tombstones, outbox_counts, binding_summary, budget)
+        outbox_counts = select_outbox_counts(conn, addr)
+        binding_summary = select_binding_summary(conn, addr, sb["incarnation_id"])  # omits owner_id
+        budget, budget_malformed = select_sandbox_budget_safe(conn, addr, sb["incarnation_id"])
+        snapshot = build_bounded_sandbox_status(snapshot_seq, health, sb, edges, tombstones, outbox_counts, binding_summary, budget, ...)
 
-    check_session_post(caller, read_session_id, session_generation)
+    check_authority_and_session_post(caller, read_session_id, session_generation)
     return snapshot
 ```
 
-### 4.4 Operation 3: `get_thread_events` (Bounded, Provenance-Verified Pagination)
+### 5.3 `get_thread_events`
 
 ```python
 function get_thread_events(
@@ -295,59 +494,46 @@ function get_thread_events(
     after_cursor=None,
     limit=DEFAULT_PAGE_LIMIT,
     max_response_bytes=MAX_RESPONSE_BYTES,
+    max_read_ms=DEFAULT_MAX_READ_MS,
     read_session_id=None,
     session_generation=None,
 ) -> ThreadEventsPage:
+    authorize_operator_caller(caller)
     addr = parse_local_target(target).canonical
     clean_thread = validate_thread_id(thread_id)
-    validate_bounds(1 <= limit <= MAX_PAGE_LIMIT, 1024 <= max_response_bytes <= MAX_RESPONSE_BYTES)
-    parsed_cursor = parse_event_cursor(after_cursor)  # "v1:<seq>:<source_rank>:<incarnation_id>"
-    check_session_pre(caller, read_session_id, session_generation)
-    health_markers = read_state_dir_markers_nofollow(state_dir)
+    explicit_inc = validate_opaque_token(incarnation_id, "incarnation_id") if incarnation_id is not None else None
+    validate_bounds(limit=limit, max_response_bytes=max_response_bytes, max_read_ms=max_read_ms)
+    check_authority_and_session_pre(caller, read_session_id, session_generation)
+    trusted_dir, db_path = verify_state_dir_and_db_readonly(state_dir, sandbox_root)
+    marker_health = read_state_dir_health_nofollow(trusted_dir, live_degraded_checker)
 
-    with readonly_snapshot_tx() as conn:
+    with open_readonly_snapshot(db_path, max_read_ms=max_read_ms) as conn:
         snapshot_seq = read_seq_counter(conn)
-        unconfirmed = query_unconfirmed_bindings(conn)
-        health = build_workspace_health(health_markers, unconfirmed, is_operator=(caller.role == OPERATOR))
-        enforce_caller_authority_and_health(conn, caller, health, require_admin=False)
-
+        health_summary = build_compact_workspace_health(conn, marker_health)
         sb = select_sandbox(conn, addr)
         if sb is None:
             raise CoordPolicyError("sandbox_not_found")
+        target_inc = explicit_inc if explicit_inc is not None else sb["incarnation_id"]
+        is_current_inc = (target_inc == sb["incarnation_id"])
+        stale_reason = None if is_current_inc else "superseded_incarnation"
+        scope_hash = compute_scope_hash("events", target=addr, thread_id=clean_thread, incarnation_id=target_inc)
+        parsed_cursor = decode_events_cursor(after_cursor, expected_scope_hash=scope_hash, expected_inc=target_inc)
 
-        # Resolve target incarnation & enforce stale/historical access rules
-        target_inc = validate_opaque_token(incarnation_id, "incarnation_id") if incarnation_id is not None else sb.incarnation_id
-        is_current_inc = (target_inc == sb.incarnation_id)
-        if parsed_cursor is not None and parsed_cursor.incarnation_id != target_inc:
-            raise CoordValidationError("cursor_incarnation_mismatch")
+        thread_exists = check_thread_row_exists(conn, addr, target_inc, clean_thread)
+        # Cursor-aware fetch (limit + 1 from each table; when cursor.rank == 0, stream_events uses seq >= cursor.seq!)
+        ev_rows = select_thread_event_log_rows(conn, addr, target_inc, clean_thread, parsed_cursor, limit=limit + 1)
+        st_rows = select_thread_stream_rows(conn, addr, target_inc, clean_thread, parsed_cursor, limit=limit + 1)
+        merged = merge_sorted_by_seq_and_rank(ev_rows, st_rows)
 
-        # Authorize thread read & determine whether OPERATOR_DIRECTIVE must be excluded
-        exclude_operator_directives = authorize_thread_read(
-            conn, caller, sb, clean_thread, target_inc=target_inc, is_current_inc=is_current_inc
-        )
+        # Provenance-verify every stream_events row (Section 6) and pack strictly within limit & max_response_bytes!
+        # Authorized query on a non-existent thread_id of an existing sandbox returns empty page (thread_exists=False).
+        page = build_bounded_events_page(conn, sb, target_inc, is_current_inc, stale_reason, thread_exists, merged, ...)
 
-        # Query event_log (source_rank=0) and stream_events (source_rank=1) strictly scoped to
-        # (addr, target_inc, clean_thread) and (seq, source_rank) > (cursor_seq, cursor_rank).
-        # Fetch limit + 1 from each table so merged sort guarantees exact pagination without gaps!
-        ev_rows = select_thread_event_log_rows(conn, addr, target_inc, clean_thread, parsed_cursor, exclude_operator_directives, limit=limit + 1)
-        st_rows = select_thread_stream_rows(conn, addr, target_inc, clean_thread, parsed_cursor, exclude_operator_directives, limit=limit + 1)
-
-        # Merge by (seq ASC, source_rank ASC, row_key ASC)
-        merged = merge_sorted(ev_rows, st_rows)
-
-        # Project items sequentially under BOTH row count cap (limit) AND byte cap (max_response_bytes):
-        #   - Every stream_events row is provenance-verified inside this snapshot (Section 5)
-        #   - Individual item text is safely UTF-8 truncated to <= MAX_ITEM_TEXT_BYTES with
-        #     text_truncated + original_text_bytes + has_control_or_bidi
-        #   - Always admit at least 1 bounded item if merged is non-empty; stop before exceeding
-        #     max_response_bytes for subsequent items, setting has_more=True and exact next_cursor
-        page = build_bounded_event_page(merged, limit=limit, max_response_bytes=max_response_bytes, ...)
-
-    check_session_post(caller, read_session_id, session_generation)
+    check_authority_and_session_post(caller, read_session_id, session_generation)
     return page
 ```
 
-### 4.5 Operation 4: `get_sandbox_mailbox`
+### 5.4 `get_sandbox_mailbox`
 
 ```python
 function get_sandbox_mailbox(
@@ -358,205 +544,232 @@ function get_sandbox_mailbox(
     after_cursor=None,
     limit=DEFAULT_PAGE_LIMIT,
     max_response_bytes=MAX_RESPONSE_BYTES,
+    max_read_ms=DEFAULT_MAX_READ_MS,
     read_session_id=None,
     session_generation=None,
 ) -> MailboxPage:
-    # Strictly admin-only (OPERATOR or subtree ORCHESTRATOR); JOB & EXTERNAL_PEER denied!
-    if caller.role not in (CoordRole.OPERATOR, CoordRole.ORCHESTRATOR):
-        raise CoordAuthError("mailbox_projection_admin_only")
+    authorize_operator_caller(caller)
     addr = parse_local_target(target).canonical
     clean_statuses = validate_outbox_statuses(statuses)
-    parsed_cursor = parse_mailbox_cursor(after_cursor)  # "v1:<seq>:<msg_id>"
-    validate_bounds(1 <= limit <= MAX_PAGE_LIMIT, 1024 <= max_response_bytes <= MAX_RESPONSE_BYTES)
-    check_session_pre(caller, read_session_id, session_generation)
-    health_markers = read_state_dir_markers_nofollow(state_dir)
+    validate_bounds(limit=limit, max_response_bytes=max_response_bytes, max_read_ms=max_read_ms)
+    scope_hash = compute_scope_hash("mailbox", target=addr, statuses=clean_statuses)
+    parsed_cursor = decode_mailbox_cursor(after_cursor, expected_scope_hash=scope_hash)
+    check_authority_and_session_pre(caller, read_session_id, session_generation)
+    trusted_dir, db_path = verify_state_dir_and_db_readonly(state_dir, sandbox_root)
+    marker_health = read_state_dir_health_nofollow(trusted_dir, live_degraded_checker)
 
-    with readonly_snapshot_tx() as conn:
+    with open_readonly_snapshot(db_path, max_read_ms=max_read_ms) as conn:
         snapshot_seq = read_seq_counter(conn)
-        unconfirmed = query_unconfirmed_bindings(conn)
-        health = build_workspace_health(health_markers, unconfirmed, is_operator=(caller.role == OPERATOR))
-        enforce_caller_authority_and_health(conn, caller, health, require_admin=True)
-        enforce_subtree_if_sandbox_orchestrator(conn, caller, addr)
-
+        health_summary = build_compact_workspace_health(conn, marker_health)
         sb = select_sandbox(conn, addr)
         if sb is None:
             raise CoordPolicyError("sandbox_not_found")
+        # Join outbox + event_log + routing_edges + grant_tombstones (checking BOTH (o.edge_id, o.grant_generation)
+        # and (o.edge_id, e.grant_generation)) + source sandbox status/incarnation!
+        rows = select_mailbox_rows(conn, addr, clean_statuses, parsed_cursor, limit=limit + 1)
+        page = build_bounded_mailbox_page(sb, rows, limit=limit, max_response_bytes=max_response_bytes, ...)
 
-        # Join outbox + event_log + routing_edges + grant_tombstones for dst_addr = addr,
-        # ordered by (o.seq ASC, o.msg_id ASC), computing:
-        #   - is_stale_incarnation = (o.dst_incarnation != sb.incarnation_id)
-        #   - is_stale_grant = (edge missing OR edge.active == 0 OR tombstone exists OR edge.grant_generation != o.grant_generation)
-        #   - sanitized detail (control/bidi scrubbed, <= MAX_METADATA_TEXT_BYTES)
-        #   - exclude OPERATOR_DIRECTIVE rows if sandbox-bound ORCHESTRATOR reads another sandbox
-        rows = select_mailbox_rows(conn, addr, clean_statuses, parsed_cursor, exclude_op_dir, limit=limit + 1)
-        page = build_bounded_mailbox_page(rows, sb, limit=limit, max_response_bytes=max_response_bytes, ...)
-
-    check_session_post(caller, read_session_id, session_generation)
+    check_authority_and_session_post(caller, read_session_id, session_generation)
     return page
 ```
 
 ---
 
-## 5. Provenance Re-Verification & Inert Content Boundary
+## 6. Strict Per-Event Provenance Re-Verification & Inert Content Boundary
 
-The projection layer **never trusts raw `stream_events.badge` strings** stored in SQLite (defending
-against database corruption, legacy bugs, or hostile writes). Inside the same read snapshot, every
-projected `stream_events` row runs through `_verify_and_project_provenance(conn, row)`:
+Inside the same read-only SQLite snapshot, every `stream_events` row is re-verified against
+`event_log`, `dispatch_receipts`, and `tui_enter_tokens` — never trusting raw `stream_events.badge`:
 
 1. **Non-`user_message` events** (`text_delta`, `reasoning_delta`, `tool_call`, `file_edit`,
    `turn_completed`, `turn_error`, `revoked`):
-   - `effective_badge` MUST be `None`, `authority_rank = 0`.
-   - If `row["badge"] is not None`: set `provenance_anomaly = True`, `anomaly_reason = "non_user_event_has_badge"`,
-     and force `effective_badge = None`.
+   - `effective_badge = None`, `authority_rank = 0`, `untrusted_content = True`.
+   - If `row["badge"] is not None`: set `provenance_anomaly = True`,
+     `anomaly_reason = "non_user_event_has_badge"`, and force `effective_badge = None`.
 2. **`user_message` events:**
-   - Parse `raw_badge = row["badge"]`. If missing or not a valid `ProvenanceBadge` member:
-     downgrade to `ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED`, `authority_rank = 0`,
+   - If `row["badge"]` is missing or not a valid `ProvenanceBadge` value: downgrade to
+     `ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED`, `authority_rank = 0`, `untrusted_content = True`,
      `provenance_anomaly = True`, `anomaly_reason = "invalid_or_missing_badge"`.
-   - If `raw_badge` is `SANDBOX_LOCAL_UNVERIFIED` or `TUI_INPUT`:
-     - Keep `effective_badge = raw_badge`, `authority_rank = 0` (zero directive/approval authority).
-     - Note: for `TUI_INPUT`, check that a consumed `tui_enter_tokens` row exists for
-       `(sandbox_addr, incarnation_id)` with `surface_kind = "opencode-tui"` and
-       `consumed_at IS NOT NULL`; if none exists, downgrade to `SANDBOX_LOCAL_UNVERIFIED` with
-       `provenance_anomaly = True`, `anomaly_reason = "unbacked_tui_badge"`.
-   - If `raw_badge` claims a **verified host-originated badge** (`OPERATOR`, `ORCHESTRATOR`, or `PEER`):
-     - Require a matching `event_log` row (by `message_id` or `dispatch_msg_id`) on the **exact**
-       `(sandbox_addr, incarnation_id, thread_id)` AND a matching **consumed** `dispatch_receipts`
-       row (`consumed_at IS NOT NULL`) for `(sandbox_addr, incarnation_id, session_id=thread_id,
-       message_id)` whose:
-       1. `receipt.trust_class` maps via `_TRUST_CLASS_TO_BADGE` to the exact `raw_badge` (and
-          matches `event_log.trust_class`), AND
-       2. `receipt.body_sha256 == sha256_canonical_body(row["text"])` (catches post-write body
-          tampering!).
-     - If ANY check fails: **fail closed** by downgrading `effective_badge` to
-       `ProvenanceBadge.SANDBOX_LOCAL_UNVERIFIED`, `authority_rank = 0`,
-       `provenance_anomaly = True`, and recording a closed-enum `anomaly_reason`
-       (`"unbacked_host_badge"`, `"trust_class_mismatch"`, or `"receipt_body_hash_mismatch"`).
-     - If all checks pass: preserve `effective_badge`, set `verified_actor = receipt.src_actor`,
-       and set `authority_rank` (`3` for `OPERATOR`, `2` for `ORCHESTRATOR`, `1` for `PEER`).
-3. **Inert display & hostile Unicode guarantees:**
-   - Every projected event includes `render_policy = "inert_text"` and `untrusted_content` (`True`
-     for all worker stream events except verified host-originated `OPERATOR`/`ORCHESTRATOR` user
-     messages, and `True` for `UNTRUSTED_PEER_DATA` envelopes).
-   - Display metadata (`project_name`, `branch`, `task_brief`, `title`, `detail`, `reason`) is
-     scrubbed of forbidden control and Unicode bidi override characters and capped to
+   - **`SANDBOX_LOCAL_UNVERIFIED`:** keep as `SANDBOX_LOCAL_UNVERIFIED`, `authority_rank = 0`,
+     `untrusted_content = True`.
+   - **`TUI_INPUT` (fail-closed against revocation-stamped and ambiguous tokens):**
+     - `authority_rank = 0`, `untrusted_content = True` ALWAYS.
+     - Query inside the snapshot:
+       - `valid_token_count`: `SELECT COUNT(*) FROM tui_enter_tokens WHERE sandbox_addr = ? AND incarnation_id = ? AND surface_kind = 'opencode-tui' AND consumed_at IS NOT NULL AND consumed_at <= expires_at`.
+       - `tui_candidate_count`: `SELECT COUNT(*) FROM stream_events WHERE sandbox_addr = ? AND incarnation_id = ? AND event_type = 'user_message' AND badge = 'TUI Input · In-Sandbox'`.
+     - Because `oc_registry.py` stamps `consumed_at = now` on unconsumed tokens during sandbox
+       revocation (`_revoke_whole_sandbox_conn`) and incarnation rotation
+       (`invalidate_prior_incarnation`), AND `tui_enter_tokens` does not store `stream_events.seq`:
+       - If `sandbox.status == 'revoked'` OR `not is_current_inc` OR `valid_token_count == 0`:
+         downgrade to `SANDBOX_LOCAL_UNVERIFIED` (`provenance_anomaly = True`,
+         `anomaly_reason = "unbacked_tui_badge"`).
+       - If `tui_candidate_count > valid_token_count` (e.g., 1 consumed token and 2 candidate
+         events — even across page boundaries!): the current schema cannot prove which event
+         consumed the token -> downgrade **all** ambiguous candidates to `SANDBOX_LOCAL_UNVERIFIED`
+         (`provenance_anomaly = True`, `anomaly_reason = "ambiguous_tui_token"`).
+       - Only when the sandbox is live (`is_current_inc` and `status != 'revoked'`),
+         `valid_token_count >= 1`, and `tui_candidate_count <= valid_token_count`: preserve
+         `effective_badge = TUI_INPUT` with `authority_rank = 0`, `untrusted_content = True`, and
+         explicit `attribution_scope = "incarnation_level_unpinned"`.
+   - **Verified host-originated badges (`OPERATOR`, `ORCHESTRATOR`, `PEER`):**
+     - **Strict `message_id` requirement (`dispatch_msg_id` NEVER substitutes!):** Require
+       `isinstance(row["message_id"], str) and bool(row["message_id"])`.
+     - **Cross-page ambiguity check (full thread in SQLite):** Query
+       `SELECT COUNT(*) FROM stream_events WHERE sandbox_addr = ? AND incarnation_id = ? AND thread_id = ? AND event_type = 'user_message' AND message_id = ?`.
+       If `candidate_count != 1` (duplicate rows sharing the same `message_id`, whether on the same
+       page or across different pages!), the current schema cannot prove which row consumed the
+       single-use receipt -> **downgrade ALL matching rows** to `SANDBOX_LOCAL_UNVERIFIED`
+       (`authority_rank = 0`, `verified_actor = None`, `untrusted_content = True`,
+       `provenance_anomaly = True`, `anomaly_reason = "ambiguous_receipt_match"`).
+     - **Exact 5-tuple receipt + envelope match:** Require BOTH:
+       - `event_log` row matching exact `(msg_id = row.message_id, dst_addr = row.sandbox_addr, dst_incarnation = row.incarnation_id, dst_thread_id = row.thread_id)`, AND
+       - `dispatch_receipts` row matching exact `(sandbox_addr, incarnation_id, session_id = row.thread_id, message_id = row.message_id)` with `consumed_at IS NOT NULL`.
+     - Verify ALL of:
+       1. `receipt.badge == raw_badge` AND `_TRUST_CLASS_TO_BADGE[TrustClass(receipt.trust_class)].value == raw_badge`,
+       2. `receipt.trust_class == event_log.trust_class` AND `receipt.src_actor == event_log.src_actor` AND `receipt.body_sha256 == event_log.body_sha256`,
+       3. `sha256_canonical_body(row["text"]) == receipt.body_sha256`, wrapping `sha256_canonical_body` in `try ... except (CoordValidationError, TypeError, ValueError):` so oversize (`> 69,632` B), NUL, surrogate, or non-string tampered cells NEVER crash reads and cleanly downgrade with `anomaly_reason = "receipt_body_hash_mismatch"`.
+     - On any failure -> downgrade to `SANDBOX_LOCAL_UNVERIFIED`, `authority_rank = 0`,
+       `verified_actor = None`, `untrusted_content = True`, `provenance_anomaly = True`, closed-enum
+       `anomaly_reason` (`"unbacked_host_badge"`, `"trust_class_mismatch"`,
+       `"receipt_envelope_mismatch"`, or `"receipt_body_hash_mismatch"`).
+     - On full verification -> preserve `effective_badge`, set `verified_actor = receipt.src_actor`,
+       `authority_rank` (`3` for `OPERATOR`, `2` for `ORCHESTRATOR`, `1` for `PEER`), and
+       `untrusted_content = (effective_badge not in (OPERATOR, ORCHESTRATOR))`.
+3. **Inert Content, Multiline Unicode, `ArtifactRef`, & Strict JSON Safety:**
+   - **`untrusted_content` exact rule:** Default `True` for all projected events EXCEPT `event_log`
+     rows with `trust_class in (OPERATOR_DIRECTIVE, PARENT_TASK)` and provenance-verified
+     `stream_events` `user_message` rows with `effective_badge in (OPERATOR, ORCHESTRATOR)`
+     (explicitly `True` for `SYSTEM_ALERT`, `UNTRUSTED_PEER_DATA`, `TUI_INPUT`,
+     `SANDBOX_LOCAL_UNVERIFIED`, and all non-`user_message` stream events).
+   - **Multiline event text (`has_control_or_bidi`):** Permits normal `\n`, `\t`, and `\r\n` pairs
+     (zero false positives on multiline messages/code blocks!), while flagging bare `\r`, NUL,
+     other C0 (`0x00..0x1F` minus `\n`/`\t`), DEL (`0x7F`), C1 (`0x80..0x9F`), lone surrogates, and
+     Unicode bidi override characters.
+   - **Single-line metadata (`project_name`, `branch`, `task_brief`, `title`, `detail`, `reason`):**
+     Scrubs ALL control/bidi characters (collapsing `\r`/`\n`/`\t` to spaces) and caps to
      `MAX_METADATA_TEXT_BYTES`.
-   - Event `text` / `body_text` is UTF-8 byte-capped to `MAX_ITEM_TEXT_BYTES` without splitting
-     multibyte codepoints, sets `text_truncated` + `original_text_bytes`, and sets
-     `has_control_or_bidi = has_forbidden_control_or_bidi(raw_text)` so downstream SvelteKit UIs
-     can render strictly as inert text with a visible warning chip.
-   - `artifact_refs_json` is parsed safely and projects ONLY `(name, kind, blob_sha256, size_bytes)`
-     — never host spool paths.
+   - **`artifact_refs_json` schema alignment:** Projects strictly `(blob_sha256, size_bytes,
+     media_type)` matching `ArtifactRef` (`oc_coord_contract.py:299-313`), skipping invalid entries
+     and setting `malformed_metadata = True` on corrupt or oversize (`> SQL_MAX_CELL_BYTES`) JSON.
+   - **Defensive JSON & numeric safety (`allow_nan=False`):**
+     - Non-finite SQLite `REAL` values (`NaN`/`Inf`) clamp to `0.0` with `malformed_metadata = True`.
+     - Bounded/depth-capped (`<= SQL_MAX_CELL_BYTES`, depth `<= MAX_JSON_DEPTH`) decoding for
+       `detail_json`, `allowed_threads_json`, `allowed_msg_kinds_json`, and `budget_json`, stripping
+       `_UNTRUSTED_DETAIL_KEYS`, scrubbing control/bidi strings, and falling back to `{}` / `()` +
+       `malformed_metadata = True` on corrupt or non-TEXT SQLite cells.
 
 ---
 
-## 6. Failure & Recovery Matrix
+## 7. Failure & Recovery Matrix (Pinned Exception Mapping)
 
-| Failure / Edge Condition | Behavior (Fail-Closed) |
+| Failure / Edge Condition | Exact Exception / Result |
 |---|---|
-| Missing `registry.sqlite` | Raise `CoordPolicyError("registry_missing")` (never create file). |
-| Symlinked / untrusted / group- or world-writable `state_dir`, DB, or `-wal`/`-shm` | Raise `CoordPolicyError` before opening SQLite. |
-| Corrupt SQLite DB or missing schema table | Raise `CoordPolicyError("registry_unreadable")`. |
-| SQLite lock contention beyond `busy_timeout` | Raise `CoordPolicyError("registry_busy")`. |
-| Any SQL write attempted on projection connection | Engine error (`PRAGMA query_only = ON` + `mode=ro`). |
-| Symlinked / non-regular / unreadable `.coord_degraded` or `.coord_session_active` | Set `health.degraded = True` (`"marker_unreadable"`); refuse non-operators with `CoordPolicyError("hub_degraded")`; surface degraded banner to `OPERATOR`. |
-| Unconfirmed `external_transport_bindings` (`abort_requested=1` or revoked/superseded with `terminal_confirmed=0`) | Surface `has_unconfirmed_bindings = True` + count to `OPERATOR`; refuse non-operators with `CoordPolicyError("hub_degraded")`. |
-| Caller sandbox revoked, rotated, or abort-requested | Raise `RevokedError` or `IncarnationMismatchError` before returning any rows. |
-| Caller `EXTERNAL_PEER` on any endpoint | Raise `CoordAuthError` immediately. |
-| Caller `JOB` on `get_sandbox_mailbox` or ungranted peer or historical incarnation | Raise `CoordAuthError` / `RevokedError` / `IncarnationMismatchError`. |
-| `read_session` retired before or during query | Raise `RevokedError("read_session_retired")` before returning snapshot. |
-| Malformed `allowed_threads_json` in DB | Treat edge as granting zero threads (fail closed). |
-| Malformed `detail_json` or `budget_json` in DB | Mark `malformed_metadata = True` with safe empty dict fallback so operator diagnostics remain usable. |
-| Tampered / unbacked `stream_events.badge` or altered `text` hash | Downgrade `effective_badge` to `SANDBOX_LOCAL_UNVERIFIED`, `authority_rank = 0`, `provenance_anomaly = True`, set `has_provenance_anomalies = True` on page. |
-| Oversize single event (> `MAX_ITEM_TEXT_BYTES`) or page (> `MAX_RESPONSE_BYTES`) | Truncate single item cleanly at UTF-8 boundary (`text_truncated = True`); stop page cleanly with `has_more = True` and exact `next_cursor` (always making forward progress). |
-| Malformed / oversized / incarnation-mismatched cursor | Raise `CoordValidationError`. |
+| `caller` is not `PrincipalCtx` | `CoordValidationError("caller must be PrincipalCtx")` |
+| `caller.role != CoordRole.OPERATOR` (e.g. `JOB`, `ORCHESTRATOR`, `EXTERNAL_PEER`) | `CoordAuthError("operator_role_required")` |
+| `OPERATOR` with non-`None` `sandbox_addr` or `incarnation_id` | `CoordAuthError("operator_principal_must_not_bind_sandbox")` |
+| `session_validator` configured, but `(read_session_id, session_generation)` omitted | `CoordAuthError("read_session_required")` |
+| Only one of `(read_session_id, session_generation)` supplied, or invalid type/value | `CoordValidationError` |
+| Session arguments supplied with no `session_validator` configured | `CoordPolicyError("read_session_validator_unconfigured")` |
+| `session_validator` returns non-`True` or raises (pre-read or post-read) | `RevokedError("read_session_retired")` |
+| `live_authority_checker` returns non-`True` or raises (pre-read or post-read) | `RevokedError("read_authority_revoked")` |
+| Missing/symlinked/untrusted/production `state_dir`, missing `registry.sqlite`, symlink/FIFO/hardlink/wrong-UID/unsafe-mode on DB or `-wal`/`-shm`/`-journal` | `CoordPolicyError` |
+| Corrupt SQLite DB, missing table, or read-only dir without WAL `-shm` | `CoordPolicyError("registry_unreadable")` |
+| SQLite lock timeout (`BUSY`) / read progress deadline exceeded | `CoordPolicyError("registry_busy")` / `CoordPolicyError("read_deadline_exceeded")` |
+| Symlink/FIFO/hardlink/wrong-UID/unsafe-mode/unreadable `.coord_degraded`, `.coord_session_active`, or `.coord_hub.lock` | `health.degraded = True` (`"marker_unreadable"`) — operator still gets diagnostics |
+| Present `.coord_session_active` with unlocked/missing `.coord_hub.lock` | `health.degraded = True` (`"stale_session_active_marker"`) |
+| Non-existent `target` sandbox on `get_sandbox_status` / `get_thread_events` / `get_sandbox_mailbox` | `CoordPolicyError("sandbox_not_found")` |
+| Authorized `get_thread_events` on non-existent `thread_id` of an existing sandbox | Empty `ThreadEventsPage` (`events=()`, `has_more=False`, `thread_exists=False`) |
+| Malformed, oversized, non-canonical, or scope/incarnation-mismatched cursor | `CoordValidationError` |
+| `max_response_bytes` too small for envelope or minimal first item | `CoordValidationError("response_budget_too_small_...")` |
+| Tampered/unbacked/ambiguous provenance badge, `body_sha256` mismatch, or oversize tampered `text` | Downgrade `effective_badge` to `SANDBOX_LOCAL_UNVERIFIED` (or `None` on non-user), `authority_rank = 0`, `provenance_anomaly = True` |
+| Corrupt/oversize JSON metadata cell or `NaN`/`Inf` SQLite `REAL` | Safe fallback (`{}` / `()` / `0.0`) + `malformed_metadata = True` |
 
 ---
 
-## 7. Open Choices Resolved in This Walkthrough (For Gate 1 Review)
+## 8. Open Choices Resolved in This Walkthrough (For Gate 1 Review)
 
-1. **Dedicated `mode=ro` + `PRAGMA query_only = ON` connection per snapshot vs. sharing `CoordRegistry._conn`:**
-   - **Chosen:** Dedicated `mode=ro` + `PRAGMA query_only = ON` connection verified via `O_NOFOLLOW` +
-     explicit `BEGIN DEFERRED` / `ROLLBACK` per read.
-   - **Rationale:** Guarantees engine-enforced immutability, zero cross-table tearing under
-     concurrent WAL writes, and zero edits to `oc_registry.py`.
-2. **Tampered/unbacked provenance badge handling on read:**
-   - **Chosen:** Fail-closed downgrade to `SANDBOX_LOCAL_UNVERIFIED` (`authority_rank = 0`) with
-     explicit `provenance_anomaly = True` and closed-enum `anomaly_reason` rather than raising an
-     exception that blocks the whole thread page.
-   - **Rationale:** Prevents both badge spoofing and denial-of-service against operator incident
-     inspection.
-3. **Least-privilege role scoping on mailbox & host health internals:**
-   - **Chosen:** `get_sandbox_mailbox` is restricted to `OPERATOR` and subtree `ORCHESTRATOR`
-     (`JOB` and `EXTERNAL_PEER` denied); raw `owner_id`, `token_sha256`, and host-side marker
-     reason strings are omitted from non-`OPERATOR` responses (and raw secrets / host paths are
-     never returned even to `OPERATOR`).
-4. **Historical incarnation reads:**
-   - **Chosen:** Default all tree/thread reads to the current `sandboxes.incarnation_id`, surfacing
-     `historical_thread_count` and permitting explicit `incarnation_id=<old>` lookup only for
-     `OPERATOR` and subtree `ORCHESTRATOR` with explicit `is_current_incarnation = False` and
-     `stale_reason = "superseded_incarnation"`.
-5. **Session-generation fencing hook on M3.1 read calls:**
-   - **Chosen:** Optional `session_validator` checked both before and after the SQLite read
-     transaction (fail-closed if session arguments are passed without a validator), echoing the
-     validated generation in the snapshot envelope for M3a/M3b late-response fencing.
+1. **Standalone reader role scope:** Strictly `CoordRole.OPERATOR`-only (`sandbox_addr is None,
+   incarnation_id is None`). Sandbox-scoped (`JOB`) and subtree-scoped (`ORCHESTRATOR`) reads are
+   explicitly deferred to a future hub-owned walkthrough with live lease/fence/grant-generation
+   authority, eliminating SQLite-only authority gaps and address-reuse history leaks without
+   modifying shared files.
+2. **Dedicated live-WAL `mode=ro` + `PRAGMA query_only = ON` connection per snapshot:** Protects
+   all logical database state under single-transaction `BEGIN DEFERRED` / `ROLLBACK` snapshots and
+   explicitly documents WAL `-shm`/`-wal` coordination sidecar behavior (confined via `umask(0o077)`).
+3. **Strict per-event provenance downgrade on read:** Downgrades unbacked, tampered, cross-page
+   ambiguous host-receipt matches, and un-attributable/revocation-tainted `TUI_INPUT` badges to
+   `SANDBOX_LOCAL_UNVERIFIED` (`authority_rank = 0`, `provenance_anomaly = True`) without crashing
+   operator forensic views.
+4. **Collision-free base64url canonical JSON cursors keyed on `sandbox_addr` for tree paging:**
+   Guarantees every valid `project_id` (including `:` or multi-KiB IDs) round-trips within
+   `MAX_CURSOR_BYTES`, binds every cursor to `(op, scope_hash)`, and handles `(seq, rank)`
+   boundaries without skipping same-`seq` stream rows.
+5. **Hard end-to-end serialized UTF-8 JSON byte enforcement across all 4 APIs:** Accounts for JSON
+   escaping and full envelope overhead (with compact `WorkspaceHealthSummary` on event/mailbox
+   pages, dynamic binary-search first-item text shrinking, or explicit `CoordValidationError` if
+   even a minimal item cannot fit).
 
 ---
 
-## 8. Offline Qualification & Verification Plan (`test_projection.py`)
+## 9. Offline Qualification & Verification Plan (`test_projection.py`)
 
 All tests run offline via `python3 -B -m unittest discover -s docs/prds/spikes/m/projection -p 'test_*.py'`
-under both default `$HOME` and `TMPDIR=/tmp` using synthetic `CoordRegistry` + `CoordHub` fixtures:
+under both default `$HOME` and `TMPDIR=/tmp` using private owner-only synthetic fixtures:
 
-1. **Read-only & filesystem confinement:**
-   - Missing DB refuses without creating `registry.sqlite`.
-   - Symlinked `state_dir`, symlinked `registry.sqlite`, symlinked `-wal`, and group/world-writable
-     DB files are refused (`CoordPolicyError`).
+1. **Filesystem admission, sidecars, FIFO/hardlink safety, & live-WAL semantics:**
+   - Missing `registry.sqlite` raises `CoordPolicyError("registry_missing")` without creating it.
+   - Symlinked `state_dir`, production host dir, symlinked DB, hardlinked DB (`os.link`),
+     `0o644` DB, symlinked/hardlinked `-wal`/`-shm`/`-journal`, and FIFO at DB/sidecar/marker
+     (`os.mkfifo`) all fail closed immediately without blocking or repairing modes.
    - Direct write attempt on opened projection connection fails with `sqlite3.OperationalError`.
-   - State dir inside `sandbox_root` is refused.
-2. **Consistent snapshot & bounded pagination:**
-   - Multi-project, multi-sandbox, multi-thread `get_workspace_tree` produces deterministic order,
-     exact `snapshot_seq`, accurate active/revoked grant counts, outbox counts, and cursor paging.
-   - `get_thread_events` paginates seamlessly across merged `event_log` + `stream_events` with
-     `limit=1`, `limit=2`, and tight `max_response_bytes` caps, guaranteeing zero duplicates, zero
-     skips, and exact forward progress even when a single event exceeds `MAX_ITEM_TEXT_BYTES`.
-   - Multibyte UTF-8 text truncation never splits characters; `text_truncated`, `original_text_bytes`,
-     and `has_control_or_bidi` are exact.
-   - Concurrent WAL writer mutating `sandboxes` + `routing_edges` + `outbox` while a read snapshot
-     is held inside `BEGIN DEFERRED` never produces torn cross-table state.
-   - Malformed, negative, oversized, or incarnation-mismatched cursors raise `CoordValidationError`.
-3. **Stale, degraded, revoked, and unconfirmed state surfacing:**
-   - Revoked sandboxes, tombstoned grants, superseded incarnations, `uncertain`/`aborted`/`cancelled`/
-     `handed_off` outbox rows, and unconfirmed `external_transport_bindings` are surfaced accurately
-     to `OPERATOR` with explicit stale/revoked flags.
-   - Degraded marker (`.coord_degraded`), unreadable/symlinked marker, or unconfirmed external
-     binding blocks non-`OPERATOR` callers (`CoordPolicyError("hub_degraded")`) while preserving
-     `OPERATOR` diagnostic access.
-   - Explicit historical incarnation lookup succeeds for `OPERATOR` with
-     `is_current_incarnation=False, stale_reason="superseded_incarnation"`, and is refused for `JOB`.
-4. **Provenance verification & hostile input defense:**
-   - Legitimate `[Operator]`, `[Orchestrator -o]`, `[Peer]`, `[TUI Input · In-Sandbox]`, and
-     `[Sandbox-Local / Unverified]` stream events project with exact expected badges & authority ranks.
-   - Tampered SQLite rows — forged `[Operator]` on unlinked `user_message`, `[Operator]` badge on a
-     `UNTRUSTED_PEER_DATA` envelope, post-write altered `stream_events.text` breaking receipt
-     `body_sha256`, unbacked `TUI_INPUT` without consumed token, and non-null badge on `text_delta` —
-     all fail closed (downgraded to `SANDBOX_LOCAL_UNVERIFIED` or `None`, `authority_rank=0`,
-     `provenance_anomaly=True`).
-   - Hostile control/bidi characters in `project_name`, `branch`, `title`, and `detail` are scrubbed;
-     artifact projections omit host spool paths.
-5. **Caller authorization & session-generation fence matrix:**
-   - `EXTERNAL_PEER` rejected on all 4 operations.
-   - `JOB` denied on `get_sandbox_mailbox`, denied on ungranted peer, denied on tombstoned edge,
-     denied on non-allowed thread, excluded from `OPERATOR_DIRECTIVE` events on peer reads, denied
-     when self is revoked or incarnation-rotated.
-   - Sandbox-bound `ORCHESTRATOR` restricted strictly to its own `parent_addr` subtree; denied
-     outside subtree.
-   - `read_session` retired *before* read OR *during* the snapshot (between pre-check and
-     post-check) raises `RevokedError("read_session_retired")` and returns zero data; session params
-     without a configured validator fail closed.
-   - Corrupt `allowed_threads_json` fails closed (zero threads granted); corrupt `detail_json` sets
-     `malformed_metadata=True` without crashing operator diagnostics.
-6. **End-to-end synthetic hub integration:**
-   - Run a real `CoordHub` + `ExternallyFencedFakeTransport` lifecycle (register, grant, send,
-     stream, revoke, restart, register fresh same-address successor) and verify `ReadOnlyProjectionService`
-     projects exact tree, status, mailbox, provenance, and historical vs current incarnation views
-     with zero mutations to SQLite (`PRAGMA data_version` / audit chain intact).
+   - Logical immutability verified across reads (unchanged rows, `seq_counter`, and hash-chained
+     `audit_log`); read-only `0o500` dir without `-shm` maps cleanly to `CoordPolicyError("registry_unreadable")`.
+2. **Operator-only admission & pre/post authority + session-generation fencing:**
+   - `JOB`, root `ORCHESTRATOR`, sandbox-bound `ORCHESTRATOR`, `EXTERNAL_PEER`, `OPERATOR` with
+     bound `sandbox_addr`, and non-`PrincipalCtx` all fail closed before touching SQLite.
+   - Configured `session_validator` rejects omitted session args (`CoordAuthError`), partial pairs
+     (`CoordValidationError`), retired session *before* read, and a paused read whose session OR
+     `live_authority_checker` is revoked *during* the snapshot (`RevokedError`), returning zero data.
+   - Session args without a configured validator raise `CoordPolicyError`.
+3. **Health markers, `.coord_hub.lock` probe, & orphaned bindings:**
+   - Live `CoordHub` holding `.coord_hub.lock` + `.coord_session_active` reports
+     `hub_session_active=True, degraded=False`.
+   - Stale `.coord_session_active` with unlocked/missing `.coord_hub.lock` reports `degraded=True`
+     (`"stale_session_active_marker"`).
+   - FIFO/symlink/unsafe-mode health markers report `degraded=True` (`"marker_unreadable"`) without
+     blocking.
+   - `live_degraded_checker` returning `True` surfaces `"live_hub_degraded"`.
+   - Orphaned `external_transport_bindings` row (missing `sandboxes` row) is included via `LEFT JOIN`
+     and `owner_id` is never leaked in responses.
+4. **Hard response-byte bounds, cursors, & snapshot consistency:**
+   - 1 KiB `max_response_bytes` page with escape-heavy (`"\\"\n\u0000`) and multibyte UTF-8 text
+     stays strictly `<= 1024` UTF-8 bytes (`allow_nan=False`), truncating cleanly at UTF-8 boundary.
+   - Extremely tiny budget that cannot fit the envelope or empty first item raises explicit
+     `CoordValidationError`.
+   - Long valid `project_id` (e.g. 2 KiB containing `:`), `:` in `incarnation_id`/`msg_id`, and
+     same-`seq` `event_log` + `stream_events` rows paginate across `limit=1` pages with zero skips
+     or duplicates.
+   - Reusing a cursor on a different operation, target, thread, incarnation, or filter raises
+     `CoordValidationError("cursor_scope_mismatch")`.
+   - Large synthetic fixture respects `max_read_ms` progress-handler deadline (`CoordPolicyError("read_deadline_exceeded")`).
+   - Concurrent WAL writer mutating `sandboxes` + `routing_edges` + `outbox` during a held read
+     snapshot never causes torn cross-table state.
+5. **Per-event provenance verification & hostile/corrupt DB defense:**
+   - Verified `[Operator]`, `[Orchestrator -o]`, `[Peer]`, live-incarnation 1-to-1 `[TUI Input]`,
+     and `[Sandbox-Local / Unverified]` rows project accurately; multiline `\n`/`\t` event text
+     does NOT false-positive `has_control_or_bidi`, while bare `\r`/NUL/bidi override DOES flag it.
+   - Duplicate host-message matches **across page boundaries** both downgrade to
+     `SANDBOX_LOCAL_UNVERIFIED` (`"ambiguous_receipt_match"`).
+   - `user_message` with `message_id=None` + valid `dispatch_msg_id` downgrades (`"unbacked_host_badge"`).
+   - Oversize (`> 69,632` B) or NUL tampered `stream_events.text` on a host-badged row downgrades
+     cleanly (`"receipt_body_hash_mismatch"`) without raising `CoordValidationError`.
+   - One consumed `tui_enter_tokens` row with two `TUI_INPUT` candidate events downgrades BOTH
+     (`"ambiguous_tui_token"`); revocation/rotation-stamped `tui_enter_tokens` downgrades
+     (`"unbacked_tui_badge"`).
+   - Non-user event with non-null badge clears badge (`"non_user_event_has_badge"`).
+   - `ArtifactRef` projects `(blob_sha256, size_bytes, media_type)` only; corrupt `artifact_refs_json`,
+     `detail_json`, `budget_json`, oversize cells (`> SQL_MAX_CELL_BYTES`), and `NaN`/`Inf` SQLite
+     `REAL` values degrade cleanly (`malformed_metadata=True`, strict `json.dumps(..., allow_nan=False)` succeeds).
+6. **End-to-end synthetic `CoordHub` + `ExternallyFencedFakeTransport` integration:**
+   - Full lifecycle (register, grant, send, stream, revoke, restart, fresh same-address successor,
+     explicit historical incarnation query, non-existent `thread_id` returning empty page with
+     `thread_exists=False`) verified end-to-end with logical DB/audit chain completely intact.
