@@ -1,0 +1,4 @@
+schema_version = 1
+kind = "bundle@1"
+id = "poc/headless-browser"
+requires_services = ["builtin/chromium-managed"]

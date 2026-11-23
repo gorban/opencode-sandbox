@@ -1,0 +1,9 @@
+schema_version = 1
+kind = "sandbox-type@1"
+id = "poc/local-profile"
+description = "Interactive shared-loopback fixture with no published ports."
+tier = "interactive"
+topology = "pod-shared"
+default_worker = "builtin/local-workstation"
+bundles = ["builtin/postgres-app", "poc/headless-browser"]
+base_image = "ghcr.io/anomalyco/opencode@sha256:8cb14899e31ea4fd34c1093cfa15278fac46b3c10c9ad4ec2f2d56ff4484ba6b"
