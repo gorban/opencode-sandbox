@@ -686,14 +686,22 @@ against `now = read_monotonic_clock()` and configured `max_frame_age_ms`
 4. Else compute exact unrounded `elapsed_s = now - surf.paired_frame.frame.captured_at`:
    - If `elapsed_s < 0.0` (clock regression!) -> `frame_stale = True`,
      `stale_reason = "clock_regression"`, `frame_age_ms = None`.
-   - Compare **before integer rounding** (`elapsed_ms = elapsed_s * 1000.0`):
-     - If `elapsed_ms > float(max_frame_age_ms)` (so even `5000.5 ms > 5000 ms` expires!) ->
-       `frame_stale = True`, `stale_reason = "frame_ttl_expired"`,
-       `frame_age_ms = math.ceil(elapsed_ms)`.
-     - Else (`elapsed_s >= 0.0 and elapsed_ms <= float(max_frame_age_ms)`) ->
-       `frame_stale = False`, `stale_reason = None`,
-       `frame_age_ms = math.floor(elapsed_ms)` (computed **only after** the exact unrounded TTL
-       comparison passes!).
+   - Compare **before integer rounding** against exact `ttl_s = max_frame_age_ms / 1000.0` (never
+     multiplying an arbitrarily large finite clock sample by `1000.0` before checking overflow!):
+     - Let `expired = (not math.isfinite(elapsed_s)) or (elapsed_s > ttl_s)` (so even `5000.5 ms`
+       and `5001 ms > 5000 ms` both expire regardless of float rounding, and huge finite clock
+       samples like `1e308` safely evaluate `expired = True` without overflow!).
+     - Compute display age via bounded conversion `_bounded_display_age_ms(elapsed_s, max_frame_age_ms=max_frame_age_ms, expired=expired)`:
+       - If `not math.isfinite(elapsed_s)` or `elapsed_s >= (MAX_SQLITE_INT64 / 1000.0)` ->
+         return `MAX_SQLITE_INT64` (never calling `math.ceil(inf)`!).
+       - Else `ms = int(elapsed_s * 1000.0)` (clamped `0..MAX_SQLITE_INT64`); if `expired` and
+         `ms <= max_frame_age_ms`, return `min(MAX_SQLITE_INT64, max_frame_age_ms + 1)` (so any
+         expired frame displays `>= max_frame_age_ms + 1` while fresh frames display
+         `0..max_frame_age_ms`!).
+     - If `expired` -> `frame_stale = True`, `stale_reason = "frame_ttl_expired"`,
+       `frame_age_ms = _bounded_display_age_ms(...)`.
+     - Else -> `frame_stale = False`, `stale_reason = None`,
+       `frame_age_ms = _bounded_display_age_ms(...)`.
 
 When `frame_stale = True`:
 - All read-only diagnostic metadata (`current_nav` if present for the active capture generation,
@@ -703,14 +711,15 @@ When `frame_stale = True`:
 - `frame_b64` is **always suppressed (`None`)** with `frame_b64_omitted_reason = stale_reason` so a
   consumer can never accidentally render expired, pre-disconnect, or superseded pixels as live.
 
-#### Mandatory Post-Pack Snapshot Release Fence (Defeats TOCTOU on Every Fresh Response)
+#### Mandatory Post-Pack Snapshot Release Fence (Defeats TOCTOU on Fresh AND Stale Responses Carrying Metadata)
 
 Because base64 encoding and JSON byte-budget packing run **outside `self._lock`**, a concurrent
-navigation commit, capture-generation retirement, incarnation rotation, revocation, or TTL expiry
-can occur *while packing* — affecting pixel-bearing (`frame_b64 is not None`), metadata-only
-(`include_frame_b64 = False`), and budget-omitted (`frame_b64_omitted_reason = "response_budget_exceeded"`)
-responses alike. Therefore `get_surface_snapshot` enforces a strict **post-pack release fence**
-immediately before returning:
+navigation commit, capture-generation retirement (e.g., disable -> re-enable during packing),
+incarnation rotation, revocation, or TTL expiry can occur *while packing* — affecting pixel-bearing
+(`frame_b64 is not None`), metadata-only (`include_frame_b64 = False`), budget-omitted
+(`frame_b64_omitted_reason = "response_budget_exceeded"`), AND already-stale responses carrying
+captured `nav` or `paired_frame` metadata alike. Therefore `get_surface_snapshot` enforces a strict
+**post-pack release fence** immediately before returning:
 
 ```python
 # After packing snapshot outside self._lock (and invoking optional test seam on_after_pack_before_release):
@@ -730,29 +739,39 @@ with lock:
     if not sb.browser_enabled:
         raise CoordPolicyError("browser_service_not_enabled")
 
-    # Fence EVERY response that claims a current, non-stale frame (pixel-bearing, metadata-only,
-    # AND budget-omitted responses alike)!
-    if not packed_snapshot.frame_stale:
+    # Fence EVERY response that claims a current frame OR carries navigation / paired-frame metadata
+    # (pixel-bearing, metadata-only, budget-omitted, AND already-stale metadata responses alike)!
+    if (
+        not packed_snapshot.frame_stale
+        or packed_snapshot.nav is not None
+        or packed_snapshot.paired_frame is not None
+    ):
         surf = sb.surfaces.get(sid)
         release_failure = check_snapshot_release_invariant(
             sb, surf, now_release,
+            require_fresh=(not packed_snapshot.frame_stale),
             captured_capture_generation=captured_capture_generation,
             captured_nav_generation=captured_nav_generation,
             captured_frame_seq=captured_frame_seq,
             captured_frame_sha256=captured_frame_sha256,
             max_frame_age_ms=self._max_frame_age_ms,
         )
-        # Verifies ALL of (using exact unrounded elapsed_s before rounding!):
-        #   - sb.status == "running" and sb.capture_generation == captured_capture_generation
-        #   - surf is not None and surf.current_nav is not None
-        #     and surf.current_nav.nav_generation == captured_nav_generation
-        #   - surf.paired_frame is not None and surf.paired_frame_bytes is not None
-        #   - surf.paired_frame.frame.frame_seq == captured_frame_seq
-        #     and surf.paired_frame.frame.frame_sha256 == captured_frame_sha256
+        # Always verifies capture & navigation/frame identity against locked state:
+        #   - sb.capture_generation == captured_capture_generation
+        #   - if captured_nav_generation is not None:
+        #       surf is not None and surf.current_nav is not None
+        #       and surf.current_nav.nav_generation == captured_nav_generation
+        #   - if captured_frame_seq is not None:
+        #       surf.paired_frame is not None
+        #       and surf.paired_frame.frame.frame_seq == captured_frame_seq
+        #       and surf.paired_frame.frame.frame_sha256 == captured_frame_sha256
+        # And when require_fresh is True, additionally verifies:
+        #   - sb.status == "running" and surf.paired_frame_bytes is not None
         #   - elapsed_s = now_release - surf.paired_frame.frame.captured_at
-        #     satisfies elapsed_s >= 0.0 and (elapsed_s * 1000.0) <= float(max_frame_age_ms)
+        #     satisfies math.isfinite(elapsed_s) and 0.0 <= elapsed_s <= (max_frame_age_ms / 1000.0)
         if release_failure is not None:
-            # FAIL CLOSED: suppress pixels & rebuild zero-pixel stale snapshot from current locked state!
+            # FAIL CLOSED: suppress pixels & rebuild zero-pixel stale snapshot from current locked state
+            # (clearing retired nav/title/origin/frame metadata when capture_generation changed)!
             packed_snapshot = rebuild_zero_pixel_stale_snapshot_locked(
                 sb, surf, now_release, omission_reason=release_failure, max_response_bytes=max_response_bytes
             )
@@ -1141,10 +1160,13 @@ with zero Podman, zero live Chromium, zero network calls, and zero writes to hos
 3. **Fake monotonic clock TTL expiry, post-pack release barrier, & clock-anomaly defense:**
    - Admit frame at `t = 100.0` with `max_frame_age_ms = 5000`; at `t = 104.999` -> `frame_stale = False`,
      `include_frame_b64 = True` returns exact base64 bytes matching `frame_sha256`.
-   - **Fractional-ms-over-TTL fixture:** Advance fake clock to `t = 105.0005` (`5000.5 ms > 5000 ms`,
-     catching any `int(5000.5) == 5000` rounding bug!) and `t = 105.001` -> both return
-     `frame_stale = True`, `stale_reason = "frame_ttl_expired"`, `frame_age_ms = 5001`, diagnostic
-     `BrowserFrameMeta` preserved, `frame_b64 = None`, `frame_b64_omitted_reason = "frame_ttl_expired"`.
+   - **Fractional-ms-over-TTL & bounded display-age fixtures:** Advance fake clock to
+     `t = 105.0005` (`5000.5 ms > 5000 ms`) and `t = 105.001` -> both suppress pixels
+     (`frame_stale = True`, `stale_reason = "frame_ttl_expired"`, `frame_b64 = None`,
+     `frame_b64_omitted_reason = "frame_ttl_expired"`) and display bounded `frame_age_ms >= 5001`
+     (`_bounded_display_age_ms` tested separately from the unrounded expiry check, including an
+     extreme finite clock sample `t = 1e308` saturating cleanly to `frame_age_ms = MAX_SQLITE_INT64`
+     without `OverflowError`!).
    - **Post-pack snapshot release barrier fixtures (`on_after_pack_before_release`):**
      - *(a) Pixel-bearing (`include_frame_b64=True`) mid-pack navigation commit & TTL expiry:*
        Inside `on_after_pack_before_release`, commit `nav_generation = 2` (or advance clock to
@@ -1158,7 +1180,14 @@ with zero Podman, zero live Chromium, zero network calls, and zero writes to hos
        mid-pack navigation commit & TTL expiry:* Inside `on_after_pack_before_release`, commit
        `nav_generation = 2` (or advance clock past TTL) -> verify post-pack release fence degrades
        to `frame_stale = True` rebuilt from locked state!
-     - *(d) Mid-pack incarnation rotation / revocation / exhaustion:* Inside
+     - *(d) Already-stale expired snapshot + mid-pack disable & re-enable (`capture_generation`
+       retirement):* Start with an already-expired frame carrying prior `nav`/title/origin and
+       `paired_frame` metadata; inside `on_after_pack_before_release`, disable and re-enable
+       browser capture (bumping `capture_generation` under the same incarnation) -> verify the
+       release fence detects the retired `capture_generation`, rebuilds from locked state, and
+       returns `nav = None`, `paired_frame = None`, `frame_b64 = None` (zero retired metadata
+       disclosed!).
+     - *(e) Mid-pack incarnation rotation / revocation / exhaustion:* Inside
        `on_after_pack_before_release`, rotate incarnation or mark `"revoked"` -> raises
        `IncarnationMismatchError` / `RevokedError` with zero data returned!
    - Future `captured_at > now` or `committed_at > now`, or non-monotonic `committed_at` /
