@@ -35,7 +35,7 @@ All measurements below were collected from `gorban/opencode-sandbox` GitHub Acti
 
 | Suite (`tools/ci/run.py`) | Observed Time | Share of `tests` Step | Notes |
 |---|---:|---:|---|
-| `Security stubs` (`tests/security.sh`, `OC_TEST_NO_PODMAN=1`) | `~35.8 s` | **58%** | Spawns ~132 bash/stubbed `oc-sandbox` invocations serially |
+| `Security stubs` (`tests/security.sh`, `OC_TEST_NO_PODMAN=1`) | `~35.8 s` | **58%** | Spawns `224` stubbed `oc-sandbox` checks serially (`22` real-Podman checks skipped) |
 | `CI supervisor contract` (`tests/test_ci_supervisor.py`) | `~11.9 s` | **19%** | Process-group timeout/signal-drain waits |
 | `Launcher and setup lifecycle` (`tests/setup-lifecycle.py`) | `~8.6 s` | **14%** | 41 lifecycle subprocess tests |
 | Remaining 12 suites combined | `~5.7 s` | **9%** | Each `< 1.0 s` (`Controller core` `0.008 s`, `Bridge merge core` `0.006 s`, etc.) |
@@ -54,9 +54,12 @@ API error: GitHub API returned 403 Forbidden: API rate limit exceeded for <runne
 Why this happens:
 
 1. `tools/ci/toolchain.py` creates a fresh `/tmp/oc-ci-*` scratch directory on every run,
-   re-downloads `mise-v2026.10.21-linux-x64.tar.xz` (`~64 MiB` archive / `175 MB` binary), and runs
-   `mise install --locked` for `github:koalaman/shellcheck@0.9.0`.
-2. `mise` contacts `api.github.com` unauthenticated to verify GitHub artifact attestations. Because
+   re-downloads `mise-v2026.10.21-linux-x64.tar.xz` (`<= 64 MiB` `ARCHIVE_LIMIT` cap / `175 MB`
+   extracted binary), and runs `mise install --locked` for `github:koalaman/shellcheck@0.9.0`.
+2. `mise` (under `MISE_PARANOID=1` with `url_api` in `tools/ci/mise.lock`) contacts
+   `api.github.com` unauthenticated to probe for GitHub artifact attestations, even though
+   `koalaman/shellcheck@0.9.0` (Dec 2022) predates GitHub Artifact Attestations and is already
+   pinned by exact SHA-256 in `tools/ci/mise.lock` and `tools/ci/toolchain.py`. Because
    GitHub-hosted `ubuntu-24.04` runners share NAT egress IPs, unauthenticated calls (`60 req/hr/IP`)
    frequently collide with other jobs and return `403 Forbidden`.
 3. Even when `quality` succeeds, chaining `needs: tests` adds a second full runner allocation,
@@ -69,15 +72,19 @@ Why this happens:
 ### Option O1-A: Parallelize `quality` with `tests` and add PR `concurrency` cancellation
 
 - **Option A1 (Recommended):** Remove `needs: tests` from `quality` in `.github/workflows/pr.yml`
-  (keeping `oc-sandbox / required` gated on `needs: [tests, quality]`) and add
-  `concurrency: { group: ci-pr-${{ github.event.pull_request.number }}, cancel-in-progress: true }`.
+  (keeping `oc-sandbox / required` gated on `needs: [tests, quality]`) and add PR-scoped
+  `concurrency` that never collides on or cancels non-PR runs:
+  `group: ci-pr-${{ github.event.pull_request.number || github.run_id }}` with
+  `cancel-in-progress: ${{ github.event_name == 'pull_request' }}`.
   - **Pros:** Immediate **~16–22 s** wall-clock drop (`99 s -> ~78 s`) with zero security regression
-    (both jobs still check `GITHUB_SHA` independently and both are required by
-    `oc-sandbox / required`); eliminates wasted duplicate runs during rapid push bursts.
+    (both jobs still verify `GITHUB_SHA` independently and both are required by
+    `oc-sandbox / required`); eliminates wasted duplicate PR runs during rapid push bursts without
+    cancelling `push` to `main` verification or `main` cache-seeding saves.
   - **Cons:** `quality` still runs even when `tests` fails (~`14 s` of runner time on red PRs, which
     is also useful feedback to contributors).
   - **Effort:** ~1 hour (plus Gate 1/2 review).
-- **Option A2:** Keep `quality` serialized after `tests`; add only `concurrency`.
+- **Option A2:** Keep `quality` serialized after `tests`; add only the non-colliding PR
+  `concurrency` rule above.
   - **Pros:** Saves `quality` runner minutes on failing-test PRs.
   - **Cons:** Preserves the `16–22 s` serial wall-clock penalty on every green PR.
   - **Effort:** ~30 minutes.
@@ -86,54 +93,67 @@ Why this happens:
 
 - **Option B1 (Recommended — pair with [prd_o3](prd_o3.md)):** Cache the verified `mise` archive +
   pinned `shellcheck` archive (keyed by exact manifest/lockfile/checksum hash, SHA-256 re-verified on
-  every hit before extraction/execution) AND disable `mise`'s network attestation lookup when the
-  exact pinned SHA-256 checksum in `tools/ci/mise.lock` is verified offline (or install directly from
-  the checksum-verified cached archive inside `toolchain.py`, keeping `mise` lockfile parity checks).
-  On a genuine cold cache miss, optionally pass read-only `GITHUB_TOKEN` (scoped solely to
-  `contents: read`, stripped before running user/repo tests!) only if attestation lookup is retained.
+  every hit before extraction/execution) AND keep `GITHUB_TOKEN`/`GH_TOKEN` **completely stripped**
+  from `mise`'s environment (preserving `tests/test_ci_toolchain.py`'s token-isolation invariant).
+  Disable `mise`'s network attestation lookup when the exact pinned SHA-256 checksum in
+  `tools/ci/mise.lock` is verified offline (or extract/verify the pinned archive offline inside
+  `toolchain.py`, keeping lockfile parity checks), and verify zero outbound `api.github.com`
+  requests occur on cache hit.
   - **Pros:** Cuts the `16%` flaky failure rate to **~0%**, cuts `quality` step time from `7–10 s`
-    to `~2–3 s`, and preserves strict SHA-256 integrity (`MISE_ARCHIVE_SHA`, `MISE_BINARY_SHA`,
-    `SHELLCHECK_CHECKSUM`).
+    to `~2–3 s`, preserves strict SHA-256 integrity (`MISE_ARCHIVE_SHA`, `MISE_BINARY_SHA`,
+    `SHELLCHECK_CHECKSUM`), and never exposes `GITHUB_TOKEN` to `mise` or untrusted PR checkouts.
   - **Cons:** Requires updating `tools/ci/toolchain.py` and its unit tests (`tests/test_ci_toolchain.py`)
     to accept a read-only verified cache directory without trusting cached bytes before hashing.
   - **Effort:** ~0.5 day.
 - **Option B2:** Pass `GITHUB_TOKEN` to `mise install --locked` with no caching.
   - **Pros:** Raises API rate limit from `60/hr/IP` to `1,000/hr/repo`; minimal code change.
-  - **Cons:** Still downloads `~64 MiB` `mise` + `shellcheck` on every PR run, exposes `GITHUB_TOKEN`
-    inside the `mise` process environment, and does not scale as additional tools (`ruff`, `actionlint`,
-    `shfmt`) are added under [prd_k](prd_k.md).
+  - **Cons:** Regresses `tests/test_ci_toolchain.py`'s explicit token-stripping invariant by
+    exposing a repo-scoped `GITHUB_TOKEN` to PR-checked-out `toolchain.py`/`mise` execution; still
+    downloads `mise` (`<= 64 MiB`) + `shellcheck` on every PR run; does not scale as additional
+    tools (`ruff`, `actionlint`, `shfmt`) are added under [prd_k](prd_k.md).
   - **Effort:** ~2 hours.
 
 ### Option O1-C: Intra-job parallelism inside `tools/ci/run.py tests`
 
-- **Option C1 (Recommended):** Run independent `SUITES` concurrently inside the single `tests`
-  runner using `concurrent.futures.ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 2))`
-  (each suite already gets its own isolated `/tmp/oc-ci-*` scratch directory and `HOME`/`TMPDIR`!),
-  preserving deterministic ordered log output and supervisor child-drain invariants.
+Because `tools/ci/supervisor.py` intentionally fails closed on multi-threaded processes
+(`PR_SET_CHILD_SUBREAPER`, Linux per-thread `/proc/thread-self/children`, process-global
+`os.waitid(os.P_ALL, 0, ...)`, and per-suite `supervisor.drained` gating `shutil.rmtree` against
+live-child symlink races in `suite_scratch`), suite parallelism **must use process-per-worker
+isolation** — never `ThreadPoolExecutor` inside one supervised process.
+
+- **Option C1 (Recommended):** Use a single-threaded coordinator in `tools/ci/run.py tests` that
+  spawns up to `min(4, os.cpu_count() or 2)` single-threaded worker subprocesses (e.g.,
+  `tools/ci/run.py --suite <id>`). Each worker independently acquires its own
+  `PR_SET_CHILD_SUBREAPER`, isolates its own `/tmp/oc-ci-*` scratch directory, traps and drains
+  100% of its own suite's descendants, proves per-suite `drained` before deleting its scratch, and
+  returns buffered logs to the coordinator for deterministic ordered printing.
   - **Pros:** Immediately overlaps `CI supervisor contract` (`11.9 s`), `Launcher and setup lifecycle`
     (`8.6 s`), and the 12 fast suites (`5.7 s`) underneath `Security stubs` (`35.8 s`), cutting
-    `tests` from **`62 s -> ~37–40 s`** without extra GitHub runner startup overhead!
-  - **Cons:** Must adapt `tools/ci/supervisor.py` to track multiple concurrent process groups cleanly
-    and verify child drain on timeout/SIGINT; `tests/security.sh` (`35.8 s`) remains the single
-    longest critical-path suite unless sharded.
+    `tests` from **`62 s -> ~37–40 s`** without extra GitHub runner startup overhead while keeping
+    `tools/ci/supervisor.py`'s single-threaded subreaper and child-drain guarantees intact.
+  - **Cons:** Adds a small `--suite` worker dispatch mode and coordinator-level timeout/SIGINT
+    forwarding to `tools/ci/run.py`; `tests/security.sh` (`35.8 s`) remains the single longest
+    critical-path suite unless sharded.
   - **Effort:** ~0.5–1 day.
 - **Option C2:** Option C1 **plus** sharding `tests/security.sh` stubbed test groups into 2–3
-  disjoint shards.
+  disjoint process-isolated shards.
   - **Pros:** Cuts `tests` step from **`62 s -> ~18–22 s`**, bringing end-to-end `oc-sandbox PR`
     wall clock under `~40 s` even after adding offline spike tests!
   - **Cons:** Slightly larger diff to `tests/security.sh` (must preserve exact pass/fail total
     reporting and `bash tests/security.sh` single-command local ergonomics).
   - **Effort:** ~1–1.5 days.
 - **Option C3:** Keep `tools/ci/run.py tests` strictly serial.
-  - **Pros:** Zero changes to `supervisor.py` or `security.sh`.
+  - **Pros:** Zero changes to `run.py` or `security.sh`.
   - **Cons:** Adding 30 spike suites + Web UI tests serially would push `oc-sandbox PR` past `2–3 min`.
   - **Effort:** 0 days.
 
 ### Option O1-D: CI duration trend observability
 
-- **Option D1 (Recommended):** Run `oc-sandbox PR` on `push` to `main` (in addition to
-  `pull_request`) and append a concise per-suite timing summary table to `$GITHUB_STEP_SUMMARY`
-  (zero secrets, zero external services, queryable via `gh api` for longitudinal trend checks).
+- **Option D1 (Recommended):** Run `oc-sandbox PR` on `push` to `main` (verifying the `main` commit
+  `GITHUB_SHA`, alongside synthetic merge-SHA checks on `pull_request`, with non-cancelling `main`
+  concurrency from Option A1) and append a concise per-suite timing summary table to
+  `$GITHUB_STEP_SUMMARY` (zero secrets, zero external services, queryable via `gh api` for
+  longitudinal trend checks).
   - **Pros:** Gives immediate visibility into which suite regressed latency without adding a third-party
     metrics service, and confirms `main` post-merge health continuously.
   - **Cons:** Adds one ~`40–75 s` run per merge to `main`.

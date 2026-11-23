@@ -10,7 +10,7 @@ on `origin/main` (`9b608f43`). Every workflow run currently fetches all external
 
 | Dependency / Artifact | Where Pulled Today | Approx. Size | Current Pain |
 |---|---|---:|---|
-| `mise-v2026.10.21-linux-x64.tar.xz` | `tools/ci/toolchain.py` (every `oc-sandbox PR / quality` run) | `~64 MiB` archive (`175 MB` extracted) | Repeated download + extraction every PR push |
+| `mise-v2026.10.21-linux-x64.tar.xz` | `tools/ci/toolchain.py` (every `oc-sandbox PR / quality` run) | `<= 64 MiB` cap (`175 MB` extracted) | Repeated download + extraction every PR push |
 | `shellcheck-v0.9.0.linux.x86_64.tar.xz` | `mise install --locked` in `quality` | `~2 MiB` | Triggers unauthenticated GitHub API `403` attestation failure on **`~16%`** of runs ([prd_o1](prd_o1.md)) |
 | `coverage-7.11.0-py3-none-any.whl` | `tools/ci/core_coverage.py` (every `oc-sandbox baselines` run) | `< 1 MiB` | Repeated PyPI network call + fresh `venv` creation |
 | Upcoming: Web UI `npm` tarballs (`docs/prds/spikes/m/web-ui/package-lock.json`) | Tier 0B Web UI job ([prd_o2](prd_o2.md)) | `~60–120 MiB` (`npm` cache) | Uncached `npm ci` adds `~25–60 s` per PR push |
@@ -45,10 +45,10 @@ oc-cache-v1-<runner.os>-<arch>-<scope>-<sha256-of-exact-dependency-manifest>
 
 | Scope | Manifest / Exact Dependency List Hashed | Cached Payload | Post-Restore Verification Before Use | Est. Size |
 |---|---|---|---|---:|
-| `ci-toolchain` | `hashFiles('tools/ci/mise.toml', 'tools/ci/mise.lock', 'tools/ci/toolchain.py')` | Downloaded verified archives (`mise` tarball + locked tool tarballs) in read-only cache dir | Re-verify `MISE_ARCHIVE_SHA`, `MISE_BINARY_SHA`, and every `mise.lock` `sha256:` before extracting or executing | `~70–180 MiB` |
-| `py-wheels` | `hashFiles('tools/ci/wheels.lock.txt')` (canonical sorted `pkg==ver --hash=sha256:...` list, starting with `coverage==7.11.0`) | Raw `.whl` files only (never pre-built `venv`s with absolute paths) | `pip install --isolated --no-index --find-links <cache> --no-deps --require-hashes --only-binary=:all:` | `~5–40 MiB` |
-| `web-ui-npm` | `hashFiles('docs/prds/spikes/m/web-ui/package-lock.json')` | Content-addressed `~/.npm` tarball cache (`_cacache`), **not** mutable `node_modules` | `npm ci --offline --prefer-offline --ignore-scripts` verifies every package SRI integrity digest against `package-lock.json` | `~60–120 MiB` |
-| `tier1-oci` *(optional, Tier 1 only)* | Canonical manifest hash of pinned base image digest + Containerfile + explicit sorted package list (`tools/ci/container-deps.manifest`) | OCI image/layer tarballs or Buildx cache | Verify exact image/blob `sha256:` digest before `podman load` / run | `<= 1.5 GiB` |
+| `ci-toolchain` | `hashFiles('tools/ci/mise.toml', 'tools/ci/mise.lock', 'tools/ci/toolchain.py')` *(note: `toolchain.py` imports `SHELLCHECK_VERSION` from `run.py`, while `mise.toml`/`mise.lock` also pin `0.9.0`, so omitting `run.py` busts on version bumps without busting on unrelated `run.py` edits)* | Downloaded verified archives (`mise` tarball + locked tool tarballs) in read-only cache dir | Pre-validate exact filenames (`O_NOFOLLOW`, regular file, size cap), re-verify `MISE_ARCHIVE_SHA`, `MISE_BINARY_SHA`, and every `mise.lock` `sha256:` before extracting or executing | `~70–180 MiB` |
+| `py-wheels` | `py<minor>` + `hashFiles('tools/ci/wheels.lock.txt')` *(new tracked canonical sorted `pkg==ver --hash=sha256:...` lockfile replacing/mirroring `WHEEL`/`WHEEL_HASH` in `tools/ci/core_coverage.py`; include Python minor/ABI tag before adding any C-extension wheel)* | Raw `.whl` files only (never pre-built `venv`s with absolute paths) | Pre-validate exact allowlisted filenames with `O_NOFOLLOW`, regular-file, size-cap, and SHA-256 checks (`bounded_regular`), copy only verified wheels into private `0o700` scratch, then run `pip install --isolated --no-index --find-links <private-verified-dir> --no-deps --require-hashes --only-binary=:all:` | `~5–40 MiB` |
+| `web-ui-npm` | `node24.18.0-` + `hashFiles('docs/prds/spikes/m/web-ui/package-lock.json')` *(at `9b608f43`, all 223 locked packages carry SRI `integrity` digests and the only `hasInstallScript` package is optional macOS `fsevents`)* | Isolated npm tarball cache (`--cache <private-dir>`, **never** `~/.npm` alongside `.npmrc` and **never** mutable `node_modules`) | With `NPM_CONFIG_USERCONFIG=/dev/null` and `NPM_CONFIG_GLOBALCONFIG=/dev/null`, run `npm ci --ignore-scripts --cache <private-dir> --offline` on `cache-hit == 'true'` (or `--prefer-offline` on cold miss), verifying every package SRI digest against `package-lock.json` | `~60–120 MiB` |
+| `tier1-oci` *(optional, Tier 1 only)* | Canonical manifest hash of pinned base image digest + Containerfile + explicit sorted package list (`tools/ci/container-deps.manifest`) | OCI image/layer tarballs or Buildx cache | Verify exact raw archive/blob `sha256:` digest **before** `podman load` parses any untrusted tar stream (never relying on post-load `podman image inspect`) | `<= 1.5 GiB` |
 
 ### Why caching raw verified archives/wheels beats caching extracted trees
 
@@ -56,8 +56,8 @@ oc-cache-v1-<runner.os>-<arch>-<scope>-<sha256-of-exact-dependency-manifest>
    takes milliseconds and detects single-bit tampering, whereas verifying thousands of extracted
    files in `node_modules/` or a Python `venv/` is slow and fragile.
 2. **Smaller cache footprint & faster transfer:** Compressed tarballs and wheels are 2–4x smaller
-   than extracted binaries (`mise` binary is `175 MB` extracted vs `~64 MiB` compressed), keeping
-   cache restores fast (`1–2 s`) and total storage far below the `10 GB` quota.
+   than extracted binaries (`mise` binary is `175 MB` extracted vs `<= 64 MiB` `ARCHIVE_LIMIT`
+   compressed), keeping cache restores fast (`1–2 s`) and total storage far below the `10 GB` quota.
 3. **Zero path-relocation bugs:** Extracted Python `venv` shebangs embed `/tmp/oc-ci-XXXXXX`
    scratch paths that break across runs; cached raw `.whl` files install cleanly into any fresh
    private scratch `venv` in `~1 s` with `--no-index --require-hashes`.
@@ -73,11 +73,12 @@ GitHub Actions caches are **untrusted acceleration storage**, never a security b
    - This eliminates cross-version stale-cache pollution and prevents loose-prefix cache poisoning.
 2. **Mandatory fail-closed SHA-256 verification on every cache hit:**
    - Every consumer script (`tools/ci/toolchain.py`, `tools/ci/core_coverage.py`, `npm ci`) verifies
-     the restored artifact's SHA-256/SRI digest against the repository's tracked lockfile before
-     executing a single instruction.
-   - On any digest mismatch, symlink, non-regular file, or oversized cache entry: **reject the
-     cached file**, log a clear tamper/corruption warning, and fail closed (or perform a clean
-     verified network fetch if configured, never silently executing unverified bytes).
+     the restored artifact's SHA-256/SRI digest (plus `O_NOFOLLOW`, regular-file, and size-cap
+     checks) against the repository's tracked lockfile before executing a single instruction.
+   - On any digest mismatch, symlink, non-regular file, or oversized cache entry on a cache hit:
+     **fail closed by default** (especially on `main` and in regression tests) with a clear
+     tamper/corruption error rather than silently falling back to network and masking cache
+     poisoning or corruption.
 3. **Zero cache in Tier 2 (secret-bearing) workflows:**
    - Tier 2 live inference jobs ([prd_o2](prd_o2.md)) must never call `actions/cache`,
      `actions/cache/restore`, or `actions/cache/save`.
@@ -87,18 +88,24 @@ GitHub Actions caches are **untrusted acceleration storage**, never a security b
 5. **Quota budget & anti-eviction discipline (`<= 3 GB` target of `10 GB` limit):**
    - Keep `ci-toolchain + py-wheels + web-ui-npm` under `~350 MiB` total per active manifest version
      so hot Tier 0 caches are never evicted by large Tier 1 container caches.
-   - Enforce a hard size budget on optional Tier 1 OCI caches (`<= 1.5 GiB` total) and expire stale
-     PR branch caches automatically when PRs close (optional `pull_request: [closed]` cache cleanup
-     or rely on read-only PR restore below).
+   - Enforce a hard size budget on optional Tier 1 OCI caches (`<= 1.5 GiB` total). Note that
+     deleting PR caches via GitHub API on `pull_request: [closed]` requires
+     `permissions: { actions: write }`, which must **never** be granted to any workflow checking
+     out PR code (requiring a separate zero-checkout cleanup workflow) — reinforcing Option O3-A's
+     read-only PR restore model where PRs create no persistent caches to clean up.
 
 ## Cache scoping and seeding options
 
 ### Option O3-A (Recommended): `main`-seeded warm cache + read-only verified restore on PRs
 
-- **`push` to `main` (and `workflow_dispatch`):** Runs `actions/cache/restore` -> verifies or fetches
-  pinned artifacts -> runs `actions/cache/save` on miss (seeding `main`'s cache scope).
+- **`push` to `main` (and `workflow_dispatch` on `main` only):** Runs `actions/cache/restore` ->
+  verifies or fetches pinned artifacts into a clean staging directory -> runs `actions/cache/save`
+  **strictly gated on**
+  `(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && steps.restore.outputs.cache-hit != 'true'`,
+  with `actions/checkout` pinned to `ref: ${{ github.sha }}` (zero custom ref inputs) and saving
+  only from a clean staging directory populated solely by SHA-256-verified downloads.
 - **`pull_request` (same-repo and forks):** Runs **`actions/cache/restore` ONLY** (read-only against
-  `main`'s warm cache), verifies SHA-256 on hit, and falls back to verified cold fetch if the PR
+  `main`'s warm cache), verifies SHA-256 on hit, and performs a verified cold fetch if the PR
   modifies a dependency manifest.
 - **Pros:**
   - Near-100% cache hit rate across rapid multi-PR bursts (like PRs #57–#64, which all shared the

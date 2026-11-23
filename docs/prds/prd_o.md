@@ -36,9 +36,10 @@ SonarQube Cloud), but an empirical audit of **257 historical workflow runs**
      under `docs/prds/spikes/` (`l/`, `l_m_profile/`, `m/`, `n/`) and the SvelteKit/TypeScript UI
      project (`docs/prds/spikes/m/web-ui/`, pinned `package-lock.json`, `vite build`, `svelte-check`,
      3 `node --test` suites, 1 Playwright spec) do **not** run in GitHub Actions at all.
-   - Real Podman security tests (`tests/security.sh` without `OC_TEST_NO_PODMAN=1`: `246` checks vs
-     `132` stubbed), real Postgres/sidecar parallel tests (`tests/parallel.sh`), and live basic LLM
-     inference wire-contract checks are currently absent from hosted CI.
+   - Real Podman security tests (`tests/security.sh` without `OC_TEST_NO_PODMAN=1`: `246` total
+     checks, of which `224` already run stubbed and `22` real-Podman checks are skipped), real
+     Postgres/sidecar parallel tests (`tests/parallel.sh`), and live basic LLM inference
+     wire-contract checks are currently absent from hosted CI.
    - Answering whether GitHub Actions secrets are required: **no** for all Tier 0 PR gates and
      Tier 1 container integration tests, and **yes — strictly isolated to a dedicated Tier 2
      protected GitHub Environment (`ci-inference-smoke`) on `main` / `schedule` / `workflow_dispatch`
@@ -48,10 +49,11 @@ SonarQube Cloud), but an empirical audit of **257 historical workflow runs**
 3. **Zero GitHub Actions caching today ([prd_o3](prd_o3.md)):**
    - The repository currently holds **`0` cache entries (`0` bytes)** out of GitHub's `10 GB`
      repository cache quota (`7`-day idle TTL).
-   - Every PR run re-downloads `mise-v2026.10.21-linux-x64.tar.xz` (`~64 MiB`),
-     `shellcheck-v0.9.0.linux.x86_64.tar.xz`, and `coverage-7.11.0-py3-none-any.whl` from PyPI.
-     Once Node/SvelteKit (`npm`), additional Python wheels, and container builds join CI, uncached
-     repeated runs during multi-PR bursts will multiply runner time and external rate-limit risk.
+   - Every PR run re-downloads `mise-v2026.10.21-linux-x64.tar.xz` (`<= 64 MiB` cap / `175 MB`
+     extracted binary), `shellcheck-v0.9.0.linux.x86_64.tar.xz`, and
+     `coverage-7.11.0-py3-none-any.whl` from PyPI. Once Node/SvelteKit (`npm`), additional Python
+     wheels, and container builds join CI, uncached repeated runs during multi-PR bursts will
+     multiply runner time and external rate-limit risk.
    - PRD O3 specifies **zero-trust, content-hashed caching**: cache keys hashed strictly from the
      exact pinned dependency list and checksums being pulled, exact-key restore (`restore-keys`
      omitted for executable artifacts), mandatory SHA-256 verification on every cache hit before
@@ -117,13 +119,16 @@ Every implementation PR derived from PRD O must satisfy all six invariants and p
    use dedicated, least-privilege, hard-capped CI API keys stored only in a protected GitHub
    Environment (`ci-inference-smoke`, restricted to `main` + optional required reviewer). Personal
    OAuth/subscription credentials (`prd_i3`/`prd_i4`) are never placed in GitHub Actions.
-5. **No prompt injection or secret leakage in Tier 2:** Inference smoke tests send only static,
-   hardcoded synthetic probes (never PR titles, commit messages, diffs, or issue text), enforce
-   strict token/request/timeout caps, and redact/drop raw response headers and error bodies before
-   logging.
-6. **Pinned workflow actions and exact merge-SHA checks:** Every third-party GitHub Action is pinned
-   to a full 40-hex commit SHA; `oc-sandbox PR` continues checking the exact synthetic merge SHA
-   (`GITHUB_SHA`) and keeps SonarQube Cloud green on both PRs and `main`.
+5. **No prompt injection, redirect exfiltration, or secret leakage in Tier 2:** Inference smoke
+   tests send only static, hardcoded synthetic probes to hardcoded HTTPS provider endpoints (with
+   `3xx` redirects refused, proxy/`*_BASE_URL` overrides scrubbed, step-scoped secrets, header-only
+   Gemini keys, and no free-form `workflow_dispatch` inputs or custom checkout refs), enforce
+   strict token/request/timeout caps, forbid uploading raw HTTP artifacts, and drop/redact raw
+   response headers and raw error bodies before logging.
+6. **Pinned workflow actions and exact SHA checks:** Every third-party GitHub Action is pinned to a
+   full 40-hex commit SHA; `oc-sandbox PR` continues verifying the exact `GITHUB_SHA` (synthetic
+   merge SHA on `pull_request`, or the `main` commit SHA when run on `push` to `main`) and keeps
+   SonarQube Cloud green on both PRs and `main`.
 
 ## Phased rollout and open decisions
 
@@ -131,8 +136,9 @@ Implementation starts only after the maintainer resolves the `(decision needed)`
 each slice passes Gate 1 walkthrough review:
 
 - **Phase O-A (Fast reliability & latency wins — 0.5–1 day):**
-  - [ ] `(decision needed)` Approve decoupling `quality` from `needs: tests`, adding
-    `concurrency: cancel-in-progress: true` to `oc-sandbox PR`, and intra-job suite parallelism in
+  - [ ] `(decision needed)` Approve decoupling `quality` from `needs: tests`, adding PR-only
+    `concurrency` cancellation (`cancel-in-progress: ${{ github.event_name == 'pull_request' }}`
+    with non-colliding group keys for `main`), and process-per-worker suite parallelism in
     `tools/ci/run.py` ([prd_o1](prd_o1.md#latency-reduction-and-reliability-options)).
   - [ ] `(decision needed)` Choose the `mise` 403 rate-limit remediation + verified toolchain
     caching strategy ([prd_o1](prd_o1.md#option-o1-b-eliminate-mise-403-rate-limit-failures),

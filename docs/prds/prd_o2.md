@@ -10,7 +10,7 @@ Inventory at `origin/main` (`9b608f431eedf7e55137c6dfe1abead9ffd2cba8`):
 
 | Test Group | Location on `origin/main` | Runs in Hosted CI Today? | Current Gap |
 |---|---|---|---|
-| Core portable unit & stubbed security suites (15 suites) | `tests/` via `tools/ci/run.py tests` | **Yes** (`oc-sandbox PR`) | Runs only on `pull_request` (not `push` to `main`); `tests/security.sh` runs stubbed (`132` checks, `OC_TEST_NO_PODMAN=1`) |
+| Core portable unit & stubbed security suites (15 suites) | `tests/` via `tools/ci/run.py tests` | **Yes** (`oc-sandbox PR`) | Runs only on `pull_request` (not `push` to `main`); `tests/security.sh` runs `224` stubbed checks (`OC_TEST_NO_PODMAN=1`) and skips `22` real-Podman checks |
 | Core Python coverage (2 modules: `oc_bridge_merge.py`, `oc_controller.py`) | `tools/ci/core_coverage.py` | **Yes** (`oc-sandbox baselines`) | Does not cover newer modules (`oc-bridge.py`, `oc-opencode-*.py`, or promoted spike kernels) |
 | Offline Python spike test suites (**30 test files** across 13 dirs) | `docs/prds/spikes/{l,l_m_profile,m,n}/**/test_*.py` | **No** | Zero regression guard in hosted CI after merge; cross-spike edits can silently break merged proofs (`l/`, `m/`, `n/restart/`, `n/inbox-read/`, etc.) |
 | SvelteKit / TypeScript Web UI (`oc-sandbox-m3a-dashboard`) | `docs/prds/spikes/m/web-ui/` (`package-lock.json`, `npm run check`, `npm run build`, `npm test` — 3 unit files + 1 Playwright spec) | **No** | Zero TypeScript/Svelte typecheck, build, CSP check, or UI unit test coverage in hosted CI |
@@ -48,26 +48,40 @@ Operational notes discovered during PRs #57–#64:
 
 ### Options for Tier 0B
 
-- **Option O2-A (Recommended):** Add two dedicated zero-secret jobs to `.github/workflows/pr.yml`
-  (or a companion `spikes-ci.yml` workflow) with path-aware triggers on `pull_request` AND full
-  unconditional runs on `push` to `main` (and whenever `tools/ci/**` or shared spike contracts
-  change):
-  1. `spike-python`: runs all 30 offline Python spike test files in parallel workers under private
-     `HOME`/`TMPDIR` scratch (`~10–15 s` wall clock with 4 workers).
-  2. `spike-web-ui`: runs `npm ci --ignore-scripts`, `npm run check`, `npm run build`, and
-     `npm test` (`node --test tests/*.test.mjs`) on `docs/prds/spikes/m/web-ui/` (`~15–25 s` warm
-     cache), keeping `npm run test:browser` (Playwright Chromium) opt-in / Tier 1 to avoid
-     multi-hundred-MB browser download churn on every docs PR.
+Required-check constraint (from [prd_k](prd_k.md) and `.github/workflows/pr.yml`): a companion
+workflow using `on.pull_request.paths` creates **no** check run when paths are untouched (leaving
+a GitHub ruleset required check permanently pending), and skipping a job inside `pr.yml` either
+fails `oc-sandbox / required` (`[[ "$RESULT" == success ]]`) or re-introduces a skipped-job bypass
+if the PR checkout itself can edit path filters. Therefore, any check promoted to a **required**
+merge gate must run **unconditionally** (or be gated by a trusted target-branch classifier per
+[prd_k](prd_k.md)).
+
+- **Option O2-A (Recommended):** Add two dedicated zero-secret jobs running in parallel with
+  `tests` and `quality`:
+  1. `spike-python` (**unconditional on every `pull_request` and `push` to `main`**, promotable to
+     `oc-sandbox / required`): runs an explicit tracked manifest of the 30 offline Python spike test
+     files in process-isolated parallel workers under private `HOME`/`TMPDIR` scratch (`~10–15 s`
+     wall clock with 4 workers — completely overlapped underneath `tests`, adding **`0 s`** to
+     critical-path wall clock and eliminating path-filter bypass risk!).
+  2. `spike-web-ui`: runs `npm ci --ignore-scripts` (with `--offline` on cache hit, else
+     `--prefer-offline`), `npm run check`, `npm run build`, and `npm test`
+     (`node --test tests/*.test.mjs`) on `docs/prds/spikes/m/web-ui/` (`~15–25 s` warm cache). Start
+     unconditional (still overlapped underneath `tests` once warm-cached) if required, or keep
+     path-filtered as **advisory-only** until a trusted classifier exists; keep
+     `npm run test:browser` (Playwright Chromium) opt-in / Tier 1 to avoid multi-hundred-MB browser
+     download churn on every docs PR.
   - **Pros:** Protects all 30 merged spike test suites and the SvelteKit dashboard from silent
-    regressions with zero secrets and minimal wall-clock cost when parallelized and cached.
-  - **Cons:** Spike directories are explicitly prototypes (`AGENTS.md`), so CI must distinguish
-    promoted/active spike suites from archived throwaway probes via an explicit manifest list (just
-    like `SUITES` in `tools/ci/run.py`) rather than blind recursive globbing.
+    regressions with zero secrets, zero path-filter bypass risk on required checks, and ~`0 s`
+    critical-path latency increase when overlapped with `tests`.
+  - **Cons:** Spike directories are explicitly prototypes (`AGENTS.md`), so CI must maintain an
+    explicit manifest list (just like `SUITES` in `tools/ci/run.py`) rather than blind recursive
+    globbing, and remove entries as spikes are retired or promoted.
   - **Effort:** ~1 day (with Gate 1/2 review).
-- **Option O2-B:** Run all 30 spike Python suites + Web UI unconditionally on every PR (no path
-  filtering).
-  - **Pros:** Simplest workflow logic; zero risk of missing a cross-cutting dependency.
-  - **Cons:** Adds Node/npm setup overhead even to pure shell or docs-only PRs.
+- **Option O2-B:** Run both `spike-python` and `spike-web-ui` unconditionally on every PR inside
+  `oc-sandbox / required` from day one (no advisory phase).
+  - **Pros:** Simplest workflow logic; uniform required-check semantics across Python and Web UI.
+  - **Cons:** Adds Node/npm setup overhead even to pure shell or docs-only PRs (though overlapped
+    with `tests` when warm-cached).
   - **Effort:** ~0.5–1 day.
 - **Option O2-C:** Keep spike suites out of hosted CI until each spike is promoted to production
   code under `src/` or `tests/`.
@@ -78,24 +92,35 @@ Operational notes discovered during PRs #57–#64:
 
 ## Tier 1: Real container integration tests
 
-`tests/security.sh` runs **246 real Podman tests** locally vs **132 stubbed tests** in portable CI.
-`tests/parallel.sh` and `tests/postgres-host-real.py` exercise live pods, Postgres, Chromium, and
-nested container flows.
+`tests/security.sh` runs **246 total checks** locally: **`224` stubbed checks** already run in
+portable CI under `OC_TEST_NO_PODMAN=1`, while **`22` real-Podman checks** (`14` in lines
+`1129–1235` + `8` `FROM scratch` checks in lines `1254–1296`) are skipped. `tests/parallel.sh` and
+`tests/postgres-host-real.py` additionally exercise live pods, Postgres, Chromium, and nested
+container flows.
 
-Important `ubuntu-24.04` hosted-runner constraint: Ubuntu 24.04 enables
-`kernel.apparmor_restrict_unprivileged_userns=1` by default, which can restrict rootless Podman
-user-namespace creation unless the runner image provides an explicit AppArmor profile for `podman` /
-`newuidmap` (or `podman` runs with verified runner support). Therefore, **a throwaway feasibility
-spike is required before committing to hosted Tier 1 gating**.
+Three concrete `ubuntu-24.04` hosted-runner constraints require a **throwaway feasibility spike**
+before committing to hosted Tier 1 gating:
+1. Ubuntu 24.04 enables `kernel.apparmor_restrict_unprivileged_userns=1` by default, which can
+   restrict rootless Podman user-namespace creation unless the runner image provides an AppArmor
+   profile for `podman`/`newuidmap` (or verified runner support).
+2. `tests/security.sh:1131` silently skips the entire 14-check block unless `TEST_AGENT_IMG`
+   (`oc-agent` or `OC_TEST_AGENT_IMAGE`) is prebuilt/supplied on the runner (otherwise only the 8
+   `FROM scratch` checks at lines `1254–1296` execute).
+3. `tests/security.sh:1175–1178` and `1228–1234` unconditionally assert SELinux MCS xattrs
+   (`os.getxattr(..., "security.selinux")` and `stat -c %C`), which will **fail on Ubuntu 24.04**
+   (no SELinux). On non-SELinux runners, those 3 SELinux MCS assertions must be explicitly scoped
+   out (reporting a clear skip) while staying strictly fail-closed on SELinux hosts.
 
 ### Options for Tier 1
 
 - **Option O2-D (Recommended):** Run a bounded `ubuntu-24.04` hosted-runner feasibility spike
-  (`workflow_dispatch` only, zero secrets) testing whether preinstalled/apt `podman` can execute
-  `bash tests/security.sh` (real Podman mode) and a minimal Postgres container smoke test cleanly
-  within `<= 5 min`. If feasible, enable Tier 1 on `push` to `main`, nightly `schedule`, and
-  `workflow_dispatch` (advisory first, zero external API secrets). Keep full `tests/parallel.sh`
-  (Chromium/SELinux/Wayland) in Tier 3 local host gates.
+  (`workflow_dispatch` only, zero secrets) testing whether preinstalled/apt `podman` can build or
+  supply `TEST_AGENT_IMG`, execute the non-SELinux subset of the 22 real-Podman checks in
+  `bash tests/security.sh` (explicitly scoping the 3 SELinux MCS xattr assertions only on
+  non-SELinux hosts), and run a minimal Postgres container smoke test cleanly within `<= 5 min`.
+  If feasible, enable Tier 1 on `push` to `main`, nightly `schedule`, and `workflow_dispatch`
+  (advisory first, zero external API secrets). Keep SELinux MCS enforcement and full
+  `tests/parallel.sh` (Chromium/SELinux/Wayland) in Tier 3 local host gates.
   - **Pros:** Closes the largest real-runtime gap (246 real Podman security assertions) without
     operating self-hosted runner infrastructure or exposing secrets to PRs.
   - **Cons:** GitHub-hosted Ubuntu runners lack Fedora SELinux enforcement and host Wayland, so
@@ -137,25 +162,38 @@ tests.
 
 ### Security architecture for Tier 2 (if enabled)
 
-1. **Protected GitHub Environment (`ci-inference-smoke`):**
+1. **Protected GitHub Environment (`ci-inference-smoke`) & `workflow_dispatch` lockdown:**
    - Deployment branch policy restricted strictly to `main` (never PR branches, never tags from
-     untrusted actors).
-   - Optional required maintainer reviewer approval for `workflow_dispatch`.
+     untrusted actors), reinforced in-workflow with `if: github.ref == 'refs/heads/main'` and
+     `actions/checkout` pinned to `ref: ${{ github.sha }}` (zero custom checkout ref inputs).
+   - Forbid free-form `workflow_dispatch` inputs (at most a fixed-enum `choice` selecting a
+     provider subset); optional required maintainer reviewer approval for manual dispatch.
    - Workflow triggers restricted strictly to `schedule` (e.g., once nightly) and `workflow_dispatch`
      — **NEVER** `pull_request` or `pull_request_target`.
-2. **Zero cache & minimal permissions:**
+   - Enforce `timeout-minutes: 5` and serialized `concurrency` (`cancel-in-progress: false`) so
+     overlapping dispatches cannot multiply spend.
+2. **Zero cache, minimal permissions, & step-scoped secrets:**
    - `permissions: { contents: read }` only; `persist-credentials: false`.
    - **Zero** `actions/cache` read or write (no cache-to-secret pivot surface).
-3. **Deterministic, injection-proof, budget-capped probe:**
-   - One hardcoded static prompt per configured provider (e.g., `"Reply with the single token PONG"`),
-     with `max_tokens <= 32`, `temperature = 0`, `timeout <= 20 s`, `retries = 0`, and at most `2`
-     requests per provider per run (normal completion + expected error-code / invalid-model handling).
+   - Inject each provider API key strictly into its own isolated step (or matrix leg), never at
+     workflow-level or job-level `env:`.
+3. **Hardcoded HTTPS endpoints, redirect refusal, & deterministic probe:**
+   - Pin provider HTTPS endpoints in code and refuse all `3xx` HTTP redirects (matching
+     `tools/ci/sonar_http.py`), preventing `Authorization` / `x-api-key` redirection to another
+     host; scrub `*_BASE_URL`, `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` environment variables.
+   - Pass Gemini API keys strictly via the `x-goog-api-key` header (never `?key=` query strings
+     that leak into URLs or tracebacks).
+   - Send one hardcoded static prompt per configured provider (e.g.,
+     `"Reply with the single token PONG"`), with `max_tokens <= 32`, `temperature = 0`,
+     `timeout <= 20 s`, `retries = 0`, and at most `2` requests per provider per run (normal
+     completion + expected error-code / invalid-model handling).
    - Never interpolate repository contents, commit messages, PR titles, or workflow inputs into the
      prompt or headers.
+4. **Log hygiene, no raw HTTP artifacts, & non-blocking merge posture:**
    - Skip a provider cleanly with an explicit warning if its secret is unset, fail loudly on auth
-     (`401`/`403`) or wire-schema mismatch when set, and mask/strip all auth headers and raw tokens
-     from logs.
-4. **Non-blocking merge posture:**
+     (`401`/`403`) or wire-schema mismatch when set, **forbid `actions/upload-artifact`** of raw
+     HTTP dumps or responses, and drop/redact **both** raw response headers and raw error bodies
+     before logging (emit parsed structured JSON error codes/types only).
    - Tier 2 is **never** added to `oc-sandbox / required` so upstream provider outages or billing
      glitches never block code merges.
 
@@ -163,8 +201,9 @@ tests.
 
 - **Option O2-G (Recommended):** Implement Tier 2 as an isolated `ci-inference-smoke.yml` workflow
   bound to protected GitHub Environment `ci-inference-smoke` (`main`-only `schedule` +
-  `workflow_dispatch`, zero cache, hardcoded `PONG` probe, hard `<= 32`-token cap, dedicated
-  low-budget API keys). Keep all PR checks 100% synthetic/zero-secret.
+  `workflow_dispatch`, zero cache, step-scoped dedicated low-budget API keys, hardcoded HTTPS
+  endpoints with `3xx` refusal, static `PONG` probe, hard `<= 32`-token cap). Keep all PR checks
+  100% synthetic/zero-secret.
   - **Pros:** Catches real provider SDK/wire/auth regressions nightly with negligible cost
     (`< \$1/month`), zero fork/PR secret exposure, and zero impact on PR velocity.
   - **Cons:** Requires maintainer to provision and rotate low-budget API keys per provider in the
@@ -177,25 +216,24 @@ tests.
   - **Cons:** Live wire drift is discovered only when the maintainer remembers to run the local
     command.
   - **Effort:** ~0.5 day.
-- **Option O2-I:** Run live inference smoke on maintainer-labeled same-repo PRs via Environment
-  approval.
-  - **Pros:** Pre-merge live verification on provider-adapter PRs.
-  - **Cons:** Higher operational risk (approver must verify exact commit SHA before every approval
-    to prevent exfiltration via modified test code); unnecessary when `workflow_dispatch` on `main`
-    (or local runs pre-merge) achieves the same coverage safely.
-  - **Effort:** ~1.5 days.
+- **Rejected — PR-triggered secret smoke (formerly Option O2-I, disqualified by Non-Negotiable
+  Invariants #1 & #4):** Running live inference smoke on maintainer-labeled PRs via Environment
+  approval would require weakening `ci-inference-smoke`'s `main`-only deployment branch policy to
+  allow PR branches and introduces label/push-to-approval TOCTOU secret-exfiltration risk via
+  modified test code. It is explicitly disallowed; pre-merge live checks run locally (`O2-H`) and
+  post-merge automated checks run only on `main` (`O2-G`).
 
 ## Checkboxes
 
 - [x] Audited existing CI test inventory (`15` portable suites) against full `origin/main` test
-  inventory (`30` offline Python spike test files, `docs/prds/spikes/m/web-ui/`, real Podman/parallel
-  suites, and live inference gap).
+  inventory (`30` offline Python spike test files, `docs/prds/spikes/m/web-ui/`, `22` skipped real
+  Podman checks + `tests/parallel.sh`, and live inference gap).
 - [ ] `(decision needed)` Select Option O2-A, O2-B, or O2-C for Tier 0B (offline spike Python
   suites + SvelteKit Web UI in CI).
 - [ ] `(decision needed)` Select Option O2-D, O2-E, or O2-F for Tier 1 (real Podman / container
   integration in hosted CI vs local-only).
-- [ ] `(decision needed)` Select Option O2-G, O2-H, or O2-I for Tier 2 (secret-gated basic live
-  inference smoke tests in protected GitHub Environment `ci-inference-smoke` vs local-only).
+- [ ] `(decision needed)` Select Option O2-G or O2-H for Tier 2 (protected-Environment `main`-only
+  live inference smoke vs local-only; PR-triggered secrets remain disallowed).
 - [ ] `(decision needed)` Decide whether `tools/ci/core_coverage.py` should expand beyond
   `oc_bridge_merge.py` and `oc_controller.py` as additional Python modules stabilize.
 - [ ] Run Gate 1 walkthrough review before implementing each selected tier.
