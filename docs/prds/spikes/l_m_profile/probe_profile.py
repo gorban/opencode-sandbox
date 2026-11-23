@@ -17,7 +17,9 @@ sys.path.insert(0, str(SPIKES / "m" / "local"))
 from broker import Broker
 from probe import close_resources, image_id, interrupt, prove, report
 from profile_checks import verify_services
-from profile_plan import CDP_SERVICE, PG_SERVICE, RECIPES, RELAY_REF, WORKER_REF, ProfileError, compile_fixture, verify_image
+from profile_plan import (
+    CDP_SERVICE, PG_SERVICE, RELAY_REF, SERVICE_IMAGES, WORKER_REF, ProfileError, compile_fixture, verify_image,
+)
 from profile_services import Sidecars, recipe
 from runtime import Job, JobRuntimeError, inspected
 
@@ -31,7 +33,7 @@ def _images(args, services: tuple[str, ...]) -> dict[str, str]:
     verify_image(args.opencode_image, WORKER_REF, inspected)
     verify_image(args.relay_image, RELAY_REF, inspected)
     for service, image in images.items():
-        verify_image(image, RECIPES[service][0], inspected)
+        verify_image(image, SERVICE_IMAGES[service], inspected)
     return images
 
 
@@ -74,7 +76,7 @@ def run(args) -> int:
         sidecars = Sidecars(job)
         for service in selection.services:
             sidecars.start(recipe(service, images[service], job.root))
-        verify_services(job, sidecars)
+        verify_services(job, sidecars, selection)
         report("Verified worker-local services and zero port publication.")
         prove(job, broker, False)
     except KeyboardInterrupt:
@@ -98,12 +100,16 @@ def run(args) -> int:
     return 0
 
 
+def _local_image_id(value: str) -> str:
+    return image_id(value).removeprefix("sha256:")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--without-chromium", action="store_true")
     for role in ("opencode", "relay", "postgres", "chromium"):
-        parser.add_argument(f"--{role}-image", type=image_id)
+        parser.add_argument(f"--{role}-image", type=_local_image_id)
     args = parser.parse_args(argv)
     if not args.plan_only and not (args.opencode_image and args.relay_image and args.postgres_image):
         parser.error("Full local OpenCode, relay, and Postgres image IDs are required for a live proof")

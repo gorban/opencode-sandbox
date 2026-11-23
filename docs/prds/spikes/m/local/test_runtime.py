@@ -106,9 +106,10 @@ class RuntimeTests(unittest.TestCase):
             "HostConfig": {
                 "NetworkMode": mode, "ReadonlyRootfs": True, "SecurityOpt": ["no-new-privileges"],
                 "Memory": MEMORY_LIMITS["relay"], "MemorySwap": MEMORY_LIMITS["relay"], "CgroupMode": "private",
+                "IpcMode": "private", "PidMode": "private", "PidsLimit": 192,
             },
             "NetworkSettings": {"Networks": {"none": {}}},
-            "Config": {},
+            "Config": {"User": "0:0"},
             "ProcessLabel": label,
             "MountLabel": "system_u:object_r:container_file_t:s0:c100,c200",
         }
@@ -119,6 +120,63 @@ class RuntimeTests(unittest.TestCase):
             self.assertRaisesRegex(JobError, "distinct SELinux MCS categories"),
         ):
             self.job._verify_isolation("relay", mode, details)
+
+    def test_host_pid_inspection_never_starts_that_role(self):
+        for bad_role in ("worker", "relay"):
+            with self.subTest(role=bad_role):
+                self._assert_host_pid_refused(bad_role)
+
+    def _assert_host_pid_refused(self, bad_role):
+        root = Path(self.scratch.name) / bad_role
+        root.mkdir(mode=0o700)
+        job = self.make_job(root)
+        job.prepare()
+        emitted = []
+        role_ids = {"worker": WORKER, "relay": RELAY}
+
+        def run(*args):
+            emitted.append(args)
+            if args[0] == "create":
+                role = "relay" if RELAY in args else "worker"
+                return CompletedProcess(args, 0, stdout=role_ids[role].encode("ascii"))
+            return CompletedProcess(args, 0, stdout=b"opencode v2.3.0\n")
+
+        def verify(role, mode, _mounts, _tmpfs, _env):
+            if role != bad_role:
+                return
+            details = {
+                "Image": role_ids[role],
+                "HostConfig": {
+                    "NetworkMode": mode, "ReadonlyRootfs": True, "SecurityOpt": ["no-new-privileges"],
+                    "IpcMode": "private", "PidMode": "host", "PidsLimit": 192, "CgroupMode": "private",
+                    "Memory": MEMORY_LIMITS[role], "MemorySwap": MEMORY_LIMITS[role],
+                },
+                "NetworkSettings": {"Networks": {"none": {}}}, "Config": {"User": "0:0"},
+                "ProcessLabel": "system_u:system_r:container_t:s0:c100,c200",
+                "MountLabel": "system_u:object_r:container_file_t:s0:c100,c200",
+            }
+            job._verify_isolation(role, mode, details)
+
+        try:
+            with (
+                socket.socket(socket.AF_UNIX) as provider,
+                patch("runtime.podman", side_effect=run),
+                patch.object(job, "_check_images"),
+                patch.object(job, "_verify_running_label"),
+                patch.object(job, "_verify_memory"),
+                patch.object(job, "_verify_distinct_mcs"),
+                patch.object(job, "_verify_container", side_effect=verify),
+            ):
+                provider.bind(str(job.provider_socket))
+                with self.assertRaisesRegex(JobError, "isolation settings"):
+                    job.start()
+        finally:
+            job.attempted_create = False
+            job.close()
+        creates = [args for args in emitted if args[0] == "create"]
+        self.assertEqual(len(creates), 1 if bad_role == "worker" else 2)
+        self.assertTrue(all("--pid=private" in args for args in creates))
+        self.assertNotIn(("start", role_ids[bad_role]), emitted)
 
     def test_failed_fence_open_invalidates_lifetime_even_if_state_and_relay_remain(self):
         def stop():

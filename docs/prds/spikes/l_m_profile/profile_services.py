@@ -3,27 +3,38 @@
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import secrets
 
 from profile_plan import CDP_SERVICE, PG_SERVICE, ProfileError
 from runtime import (
-    IMAGE_ID, NETNS_PATH, PROCESS_LABEL, Job, JobRuntimeError, atomic_write, host_output, inspected, parse_env, podman,
+    IMAGE_ID, NETWORK_LEAK_FIELDS, PROCESS_LABEL, Job, JobRuntimeError, atomic_write, host_output, inspected,
+    parse_env, podman,
 )
 
 
 LABEL = "io.oc-sandbox.profile-poc"
 ROLE = f"{LABEL}.role"
 PASSWORD = "/run/profile-pg-password"
+PASSWORD_FILE = "postgres-password"
 PG_DATA = "/pgscratch/data"
+SIDECAR_STATE = "/scratch"
+SERVICE_ROLE = {PG_SERVICE: "postgres", CDP_SERVICE: "chromium"}
+NAMESPACES = ("net", "pid", "ipc", "mnt")
+# The qualified rootless Podman host expands --cap-drop=all to its default set.
+PODMAN_DEFAULT_CAPS = frozenset({
+    "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FSETID", "CAP_KILL", "CAP_NET_BIND_SERVICE",
+    "CAP_SETFCAP", "CAP_SETGID", "CAP_SETPCAP", "CAP_SETUID", "CAP_SYS_CHROOT",
+})
 PG_INIT = (
     f"initdb -D {PG_DATA} --username=postgres --auth-local=peer --auth-host=scram-sha-256 "
     "--pwfile=/run/profile-pg-password --no-sync --no-instructions >/dev/null; "
-    f"exec postgres -D {PG_DATA} -c listen_addresses=127.0.0.1 -c unix_socket_directories=/tmp "
+    f"exec postgres -D {PG_DATA} -c listen_addresses=127.0.0.1 -c unix_socket_directories={SIDECAR_STATE} "
     "-c password_encryption=scram-sha-256"
 )
 CDP_COMMAND = (
     "--headless", "--no-sandbox", "--disable-gpu", "--disable-background-networking",
-    "--no-first-run", "--user-data-dir=/tmp/chromium", "--remote-debugging-address=127.0.0.1",
+    "--no-first-run", f"--user-data-dir={SIDECAR_STATE}/chromium", "--remote-debugging-address=127.0.0.1",
     "--remote-debugging-port=9222", "about:blank",
 )
 
@@ -46,16 +57,16 @@ class Recipe:
 
 def recipe(service: str, image: str, root: Path) -> Recipe:
     if service == PG_SERVICE:
-        password = root / "postgres-password"
+        password = root / PASSWORD_FILE
         atomic_write(password, (secrets.token_hex(24) + "\n").encode("ascii"))
         # The private directory is host-owner-only. The single-file :Z bind
         # permits the isolated database UID to read its synthetic password.
         password.chmod(0o444)
-        return Recipe("postgres", 999, image, 1024**3, "/bin/sh", ("-ec", PG_INIT),
-                      {"/pgscratch": private_tmpfs("192m"), "/tmp": private_tmpfs("16m")}, password)
+        return Recipe(SERVICE_ROLE[service], 999, image, 1024**3, "/bin/sh", ("-ec", PG_INIT),
+                      {"/pgscratch": private_tmpfs("192m"), SIDECAR_STATE: private_tmpfs("16m")}, password)
     if service == CDP_SERVICE:
-        return Recipe("chromium", 65534, image, 2 * 1024**3, "/usr/bin/chromium-browser",
-                      CDP_COMMAND, {"/tmp": private_tmpfs("128m")})
+        return Recipe(SERVICE_ROLE[service], 65534, image, 2 * 1024**3, "/usr/bin/chromium-browser",
+                      CDP_COMMAND, {SIDECAR_STATE: private_tmpfs("128m")})
     raise ProfileError("Unknown fixture sidecar")
 
 
@@ -73,6 +84,13 @@ def _check_ports(details: dict) -> None:
     net = details["NetworkSettings"]
     if host.get("PortBindings") or host.get("PublishAllPorts") or any((net.get("Ports") or {}).values()):
         raise ProfileError("A fixture sidecar has a published port")
+    networks = net.get("Networks") or {}
+    if (
+        set(networks) != {"none"}
+        or any(net.get(field) for field in NETWORK_LEAK_FIELDS)
+        or any((networks["none"] or {}).get(field) for field in NETWORK_LEAK_FIELDS)
+    ):
+        raise ProfileError("A fixture sidecar has unexpected network settings")
 
 
 def _check_mounts(details: dict, spec: Recipe) -> None:
@@ -112,35 +130,65 @@ def _verify_pre_start(details: dict, spec: Recipe, worker: str) -> None:
     config = details["Config"]
     _check_ports(details)
     _check_mounts(details, spec)
+    _check_sandbox_settings(details)
+    _check_cgroup(host, spec.memory)
     if (
         details.get("Image", "").removeprefix("sha256:") != spec.image
         or config.get("User") != f"{spec.uid}:{spec.uid}"
         or details.get("Path") != spec.entrypoint or tuple(details.get("Args") or ()) != spec.command
         or host.get("NetworkMode") != f"container:{worker}"
-        or host.get("IpcMode") != "private" or host.get("PidMode") not in ("", "private")
-        or host.get("Privileged") or host.get("Devices") or host.get("CapAdd") or details.get("EffectiveCaps")
-        or host.get("SecurityOpt") != ["no-new-privileges"] or not host.get("ReadonlyRootfs")
-        or host.get("Memory") != spec.memory or host.get("MemorySwap") != spec.memory
-        or host.get("CgroupMode") != "private" or host.get("PidsLimit") != 256
+        or host.get("IpcMode") != "private" or host.get("PidMode") != "private"
         or details["State"]["Running"]
     ):
         raise ProfileError("Fixture sidecar pre-start isolation did not match")
 
 
-def _verify_effective(container_id: str, details: dict, spec: Recipe, worker: str) -> None:
+def _check_sandbox_settings(details: dict) -> None:
+    host = details["HostConfig"]
+    drops = {cap.upper() for cap in host.get("CapDrop") or ()}
+    if (
+        host.get("Privileged") or host.get("Devices") or host.get("CapAdd") or details.get("EffectiveCaps")
+        or drops not in ({"ALL"}, PODMAN_DEFAULT_CAPS)
+        or host.get("SecurityOpt") != ["no-new-privileges"] or not host.get("ReadonlyRootfs")
+    ):
+        raise ProfileError("Fixture sidecar sandbox settings did not match")
+
+
+def _check_cgroup(host: dict, memory: int) -> None:
+    if (
+        host.get("Memory") != memory or host.get("MemorySwap") != memory
+        or host.get("CgroupMode") != "private" or host.get("PidsLimit") != 256
+    ):
+        raise ProfileError("Fixture sidecar resource limits did not match")
+
+
+def _namespace_ids(container_id: str | None = None) -> dict[str, bytes]:
+    paths = tuple(f"/proc/self/ns/{name}" for name in NAMESPACES)
+    if container_id is None:
+        output = host_output("readlink", *paths)
+    else:
+        command = 'for path do readlink "$path"; done'
+        output = podman("exec", container_id, "/bin/sh", "-ec", command, "--", *paths).stdout
+    identities = output.splitlines()
+    if len(identities) != len(NAMESPACES):
+        raise ProfileError("Fixture process returned an incomplete namespace identity")
+    result = dict(zip(NAMESPACES, identities, strict=True))
+    for name, value in result.items():
+        if not re.fullmatch(rb"%s:\[\d+\]" % name.encode("ascii"), value):
+            raise ProfileError("Fixture process returned an invalid namespace identity")
+    return result
+
+
+def _verify_effective(container_id: str, details: dict, spec: Recipe) -> None:
     label = podman("exec", container_id, "cat", "/proc/self/attr/current").stdout.removesuffix(b"\0")
     if not details["State"]["Running"] or label != details["ProcessLabel"].encode("ascii"):
         raise ProfileError("Fixture sidecar is not running in the expected SELinux context")
     uid = podman("exec", container_id, "id", "-u").stdout.strip()
     if uid != str(spec.uid).encode("ascii"):
         raise ProfileError("Fixture sidecar does not run as the intended user")
-    ns = podman("exec", container_id, "readlink", NETNS_PATH).stdout
-    if ns != podman("exec", worker, "readlink", NETNS_PATH).stdout:
-        raise ProfileError("Fixture sidecar did not join the worker network")
-    for namespace in ("pid", "ipc", "mnt"):
-        path = f"/proc/self/ns/{namespace}"
-        if podman("exec", container_id, "readlink", path).stdout == podman("exec", worker, "readlink", path).stdout:
-            raise ProfileError("Fixture sidecar shares a non-network worker namespace")
+    status = podman("exec", container_id, "cat", "/proc/self/status").stdout.splitlines()
+    if b"CapEff:\t0000000000000000" not in status or b"NoNewPrivs:\t1" not in status:
+        raise ProfileError("Fixture sidecar effective capability settings did not match")
     paths = ("memory.max", "memory.swap.max", "pids.max")
     limits = podman("exec", container_id, "cat", *(f"/sys/fs/cgroup/{name}" for name in paths)).stdout.splitlines()
     if limits != [str(spec.memory).encode("ascii"), b"0", b"256"]:
@@ -160,7 +208,8 @@ def _arguments(spec: Recipe, worker: str, name: str, run: str) -> list[str]:
         "--cap-drop=all", "--security-opt=no-new-privileges", "--read-only",
         "--read-only-tmpfs=false", "--image-volume=ignore", "--http-proxy=false", "--env-host=false",
         "--restart=no", "--log-driver=none", "--memory", memory, "--memory-swap", memory,
-        "--pids-limit=256", "--cgroupns=private", "--env=HOME=/tmp", "--env=container=podman",
+        "--pids-limit=256", "--cgroupns=private", f"--env=HOME={SIDECAR_STATE}",
+        f"--env=TMPDIR={SIDECAR_STATE}", "--env=container=podman",
         "--entrypoint", spec.entrypoint,
     ]
     if spec.bind is not None:
@@ -182,6 +231,18 @@ class Sidecars:
         self.pending: set[str] = set()
         self.recorded: dict[str, str] = {}
         self.categories = {_mcs(job._identity(role, cid)) for role, cid in job.ids.items()}
+        worker = _namespace_ids(job.ids["worker"])
+        self.network_namespace = worker["net"]
+        self.namespaces = [_namespace_ids(), worker, _namespace_ids(job.ids["relay"])]
+
+    def _verify_namespaces(self, cid: str) -> None:
+        current = _namespace_ids(cid)
+        if current["net"] != self.network_namespace:
+            raise ProfileError("Fixture sidecar did not join the worker network")
+        for name in ("pid", "ipc", "mnt"):
+            if any(other[name] == current[name] for other in self.namespaces):
+                raise ProfileError("Fixture sidecar shares a non-network namespace")
+        self.namespaces.append(current)
 
     def _remember(self) -> None:
         record = {"label": f"{LABEL}={self.run}", "names": self.names, "ids": self.ids, "pending": sorted(self.pending)}
@@ -192,7 +253,7 @@ class Sidecars:
         details = inspected("container", "inspect", cid)
         labels = (details.get("Config") or {}).get("Labels") or {}
         if (
-            (details.get("Id"), details.get("Name"), labels.get(LABEL), labels.get(ROLE))
+            (details.get("Id"), (details.get("Name") or "").removeprefix("/"), labels.get(LABEL), labels.get(ROLE))
             != (cid, self.names[role], self.run, role)
         ):
             raise ProfileError("Fixture sidecar identity did not match its receipt")
@@ -205,7 +266,7 @@ class Sidecars:
         self.pending.add(role)
         self._remember()
         cid = podman(*_arguments(spec, worker, name, self.run)).stdout.decode("ascii").strip()
-        if not IMAGE_ID.fullmatch(cid) or cid in self.ids.values():
+        if not IMAGE_ID.fullmatch(cid) or cid in self.ids.values() or cid in self.job.ids.values():
             raise ProfileError("Invalid sidecar create receipt")
         self.ids[role] = cid
         self.pending.remove(role)
@@ -213,7 +274,7 @@ class Sidecars:
         details = self._identity(role, cid)
         _verify_pre_start(details, spec, worker)
         image_env = (inspected("image", "inspect", spec.image).get("Config") or {}).get("Env") or []
-        expected_env = {**parse_env(image_env), "HOME": "/tmp", "container": "podman"}
+        expected_env = {**parse_env(image_env), "HOME": SIDECAR_STATE, "TMPDIR": SIDECAR_STATE, "container": "podman"}
         if parse_env(details["Config"]["Env"]) != expected_env:
             raise ProfileError("Fixture sidecar environment did not match pinned image and fixed settings")
         categories = _mcs(details)
@@ -221,7 +282,8 @@ class Sidecars:
             raise ProfileError("Fixture sidecars require separate SELinux categories")
         self.categories.add(categories)
         podman("start", cid)
-        _verify_effective(cid, self._identity(role, cid), spec, worker)
+        _verify_effective(cid, self._identity(role, cid), spec)
+        self._verify_namespaces(cid)
 
     def inventory(self) -> set[str]:
         result = podman("ps", "--all", "--quiet", "--no-trunc", "--filter", f"label={LABEL}={self.run}")
@@ -230,7 +292,30 @@ class Sidecars:
             raise ProfileError("Invalid sidecar inventory")
         return ids
 
+    def _recover_unrecorded_ids(self) -> None:
+        for cid in self.inventory():
+            try:
+                details = inspected("container", "inspect", cid)
+                labels = (details.get("Config") or {}).get("Labels") or {}
+                role = labels.get(ROLE)
+                if (
+                    role in self.names and role not in self.recorded
+                    and self.ids.get(role, cid) == cid and cid not in self.job.ids.values()
+                ):
+                    self._identity(role, cid)
+                    self.ids[role] = cid
+                    self._remember()
+            except (OSError, ProfileError, JobRuntimeError):
+                # Refuse this candidate without skipping other exact receipts.
+                continue
+
     def close(self) -> None:
+        if self.pending or self.ids != self.recorded:
+            try:
+                self._recover_unrecorded_ids()
+            except (ProfileError, JobRuntimeError):
+                # Verified receipts for other roles can still be used below.
+                pass
         for role, cid in reversed(tuple(self.recorded.items())):
             try:
                 self._identity(role, cid)
@@ -239,9 +324,9 @@ class Sidecars:
                 # A fresh absence check determines the outcome.
                 pass
         known = set(self.ids.values())
-        if (
-            self.pending
-            or self.inventory()
-            or any(podman("container", "exists", cid, check=False).returncode != 1 for cid in known)
-        ):
+        remaining = self.inventory()
+        present = [cid for cid in known if podman("container", "exists", cid, check=False).returncode != 1]
+        if not remaining and not present and SERVICE_ROLE[PG_SERVICE] not in self.pending:
+            (self.job.root / PASSWORD_FILE).unlink(missing_ok=True)
+        if self.pending or remaining or present:
             raise ProfileError("Fixture sidecar cleanup unconfirmed; receipt retained")

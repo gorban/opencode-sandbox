@@ -4,8 +4,8 @@ import json
 import struct
 import time
 
-from profile_plan import ProfileError
-from profile_services import PASSWORD, Sidecars
+from profile_plan import CDP_SERVICE, PG_SERVICE, ProfileError, Selection
+from profile_services import PASSWORD, SERVICE_ROLE, Sidecars
 from runtime import Job, NETNS_LINK, NETNS_PATH, host_output, podman
 
 
@@ -14,12 +14,15 @@ PG_STARTUP = struct.pack("!II", 8 + len(PG_PARAMS), 196608) + PG_PARAMS
 PG_METHOD = b"SCRAM-SHA-256\0\0"
 PG_CHALLENGE = b"R" + struct.pack("!II", 8 + len(PG_METHOD), 10) + PG_METHOD
 HTTP_REQUEST = b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:9222\r\nConnection: close\r\n\r\n"
+SHELL = "/bin/sh"
+MAX_LISTENER_TABLE = 32768
+LOOPBACK_ADDRESSES = {b"0100007F", b"00000000000000000000000001000000"}
 
 
 def _exchange(worker: str, port: int, request: bytes, byte_limit: int) -> bytes:
     encoded = "".join(f"\\0{octet:03o}" for octet in request)
     return podman(
-        "exec", worker, "/bin/sh", "-ec",
+        "exec", worker, SHELL, "-ec",
         '{ printf "%b" "$1"; sleep 1; } | busybox nc -nw 2 127.0.0.1 "$2" | head -c "$3"',
         "--", encoded, str(port), str(byte_limit), timeout=4,
     ).stdout
@@ -40,7 +43,7 @@ def _chrome_response(response: bytes) -> bool:
         return False
     try:
         record = json.loads(body)
-    except (UnicodeError, ValueError):
+    except ValueError:
         return False
     return (
         isinstance(record, dict)
@@ -60,7 +63,7 @@ def _verify_database(worker: str, postgres: str) -> None:
         "-XwAtq", "-c", "SELECT 1",
     )
     success = podman(
-        "exec", postgres, "/bin/sh", "-ec",
+        "exec", postgres, SHELL, "-ec",
         'PGPASSWORD=$(cat "$1"); export PGPASSWORD; shift; exec "$@"',
         "--", PASSWORD, *args, timeout=4,
     )
@@ -79,7 +82,7 @@ def _verify_chromium(worker: str, present: bool) -> None:
         )
         return
     refusal = podman(
-        "exec", worker, "/bin/sh", "-ec",
+        "exec", worker, SHELL, "-ec",
         'busybox wget -T 2 -O /dev/null http://127.0.0.1:9222/json/version',
         check=False, timeout=4,
     )
@@ -88,7 +91,13 @@ def _verify_chromium(worker: str, present: bool) -> None:
 
 
 def _verify_listeners(worker: str, with_chromium: bool) -> None:
-    sockets = podman("exec", worker, "cat", "/proc/net/tcp", "/proc/net/tcp6").stdout.splitlines()
+    tables = [
+        podman("exec", worker, "busybox", "head", "-c", str(MAX_LISTENER_TABLE + 1), path, timeout=4).stdout
+        for path in ("/proc/net/tcp", "/proc/net/tcp6")
+    ]
+    if any(len(table) > MAX_LISTENER_TABLE for table in tables):
+        raise ProfileError("Profile listener evidence exceeds the byte limit")
+    sockets = b"\n".join(tables).splitlines()
     ports = {b"1538", b"2406"}
     listeners = set()
     for line in sockets:
@@ -96,6 +105,8 @@ def _verify_listeners(worker: str, with_chromium: bool) -> None:
         if len(fields) < 4 or fields[3] != b"0A":
             continue
         address, _, port = fields[1].partition(b":")
+        if address not in LOOPBACK_ADDRESSES:
+            raise ProfileError("Fixture has a non-loopback TCP listener")
         if port in ports:
             listeners.add((address, port))
     expected = {(b"0100007F", b"1538")}
@@ -105,7 +116,10 @@ def _verify_listeners(worker: str, with_chromium: bool) -> None:
         raise ProfileError("Profile listener addresses did not match the selected loopback endpoints")
 
 
-def verify_services(job: Job, sidecars: Sidecars) -> None:
+def verify_services(job: Job, sidecars: Sidecars, selection: Selection) -> None:
+    expected = {SERVICE_ROLE[service] for service in selection.services}
+    if sidecars.ids.keys() != expected or sidecars.ids != sidecars.recorded or sidecars.pending:
+        raise ProfileError("Sidecar launch receipts did not match the compiled selection")
     worker = job.ids["worker"]
     netns = podman("exec", worker, "readlink", NETNS_PATH).stdout.strip()
     hostnet = host_output("readlink", NETNS_PATH).strip()
@@ -115,7 +129,7 @@ def verify_services(job: Job, sidecars: Sidecars) -> None:
         raise ProfileError("Fixture network is not a private loopback-only namespace")
     if sidecars.inventory() != set(sidecars.ids.values()):
         raise ProfileError("Unexpected profile sidecar inventory")
-    with_chromium = "chromium" in sidecars.ids
-    _verify_database(worker, sidecars.ids["postgres"])
+    with_chromium = CDP_SERVICE in selection.services
+    _verify_database(worker, sidecars.ids[SERVICE_ROLE[PG_SERVICE]])
     _verify_chromium(worker, with_chromium)
     _verify_listeners(worker, with_chromium)
