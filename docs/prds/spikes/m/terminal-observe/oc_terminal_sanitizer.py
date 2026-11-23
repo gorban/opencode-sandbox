@@ -505,30 +505,7 @@ class TerminalOutputSanitizer:
             self._state = _State.ESC_INTERMEDIATE
             self._charge_seq_bytes(1)
             return
-        if 0x30 <= byte <= 0x7E:
-            self._charge_seq_bytes(1)
-            self._increment_active_drop_counter()
-            self._reset_seq_state()
-            self._state = _State.GROUND
-            return
-        if byte == 0x1B:
-            self._increment_active_drop_counter()
-            self._enter_esc()
-            return
-        if byte in (0x18, 0x1A):
-            self._increment_active_drop_counter()
-            self._stats.dropped_c0_c1_count += 1
-            self._reset_seq_state()
-            self._state = _State.GROUND
-            return
-        if byte < 0x20 or byte == 0x7F:
-            self._charge_seq_bytes(1)
-            self._stats.dropped_c0_c1_count += 1
-            return
-        self._increment_active_drop_counter()
-        self._reset_seq_state()
-        self._state = _State.GROUND
-        self._handle_ground_byte(byte, out)
+        self._handle_esc_intermediate(byte, out)
 
     def _handle_esc_intermediate(self, byte: int, out: list[str]) -> None:
         if 0x20 <= byte <= 0x2F:
