@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 import re
+from typing import cast
 
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -245,14 +246,15 @@ def lower(
         raise InvalidInput
     if lease.route != route:
         raise Denied
-    if type(request) is not dict or len(request) != 2:
+    if type(request) is not dict:
         raise InvalidInput
-    if any(type(key) is not str for key in request):
+    body: dict = cast(dict, request)
+    if len(body) != 2 or any(type(key) is not str for key in body):
         raise InvalidInput
-    if request.keys() != {"model", "x_oc_effort"}:
+    if body.keys() != {"model", "x_oc_effort"}:
         raise InvalidInput
-    model = request["model"]
-    variant = request["x_oc_effort"]
+    model = body["model"]
+    variant = body["x_oc_effort"]
     _require_identifiers(lease.job, lease.route, lease.model, model, variant, host_agent)
     if model != lease.model:
         raise Denied

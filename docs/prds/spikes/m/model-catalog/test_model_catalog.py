@@ -133,8 +133,9 @@ class ModelCatalogTest(unittest.TestCase):
             with self.subTest(catalog=catalog):
                 with self.assertRaises(InvalidInput):
                     project(catalog, LEASE, JOB, PROFILE)
+                body = request("low")
                 with self.assertRaises(InvalidInput):
-                    lower(catalog, LEASE, JOB, PRIMARY, ROUTE, request("low"))
+                    lower(catalog, LEASE, JOB, PRIMARY, ROUTE, body)
 
     def test_invalid_limits_are_rejected_at_catalog_construction(self):
         for limits in (
@@ -180,8 +181,9 @@ class ModelCatalogTest(unittest.TestCase):
         profile = (replace(PROFILE[0], agent="unknown"),)
         with self.assertRaises(InvalidInput):
             project(None, LEASE, JOB, profile)
+        body = request("low")
         with self.assertRaises(Denied):
-            lower(None, LEASE, JOB, "unknown", ROUTE, request("low"))
+            lower(None, LEASE, JOB, "unknown", ROUTE, body)
 
     def test_malformed_record_and_profile_container_are_invalid(self):
         lookalike = SimpleNamespace(agent=PRIMARY, model=MODEL, variant="low")
@@ -201,8 +203,9 @@ class ModelCatalogTest(unittest.TestCase):
             with self.subTest(catalog=catalog, lease=lease):
                 with self.assertRaises(InvalidInput):
                     project(catalog, lease, JOB, PROFILE)
+                body = request("low")
                 with self.assertRaises(InvalidInput):
-                    lower(catalog, lease, JOB, PRIMARY, ROUTE, request("low"))
+                    lower(catalog, lease, JOB, PRIMARY, ROUTE, body)
 
     def test_malformed_grant_records_and_containers_are_invalid(self):
         for grants in (
@@ -217,8 +220,9 @@ class ModelCatalogTest(unittest.TestCase):
             with self.subTest(grants=grants):
                 with self.assertRaises(InvalidInput):
                     project(CATALOG, lease, JOB, PROFILE[:1])
+                body = request("low")
                 with self.assertRaises(InvalidInput):
-                    lower(CATALOG, lease, JOB, PRIMARY, ROUTE, request("low"))
+                    lower(CATALOG, lease, JOB, PRIMARY, ROUTE, body)
 
     def test_grant_members_require_exact_identifier_strings(self):
         class StringSubclass(str):
@@ -230,8 +234,9 @@ class ModelCatalogTest(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(InvalidInput):
                     project(CATALOG, lease, JOB, PROFILE[:1])
+                body = request("low")
                 with self.assertRaises(InvalidInput):
-                    lower(CATALOG, lease, JOB, PRIMARY, ROUTE, request("low"))
+                    lower(CATALOG, lease, JOB, PRIMARY, ROUTE, body)
 
     def test_request_requires_a_plain_dict_with_plain_string_keys(self):
         class DictSubclass(dict):
@@ -253,12 +258,15 @@ class ModelCatalogTest(unittest.TestCase):
                     replace(CATALOG, model=value)
                 with self.assertRaises(InvalidInput):
                     replace(CATALOG, variants=((value, CATALOG.variants[0][1]),))
+                lease = replace(LEASE, job=value)
                 with self.assertRaises(InvalidInput):
-                    project(CATALOG, replace(LEASE, job=value), value, PROFILE)
+                    project(CATALOG, lease, value, PROFILE)
+                profile = (replace(PROFILE[0], agent=value),)
                 with self.assertRaises(InvalidInput):
-                    project(CATALOG, LEASE, JOB, (replace(PROFILE[0], agent=value),))
+                    project(CATALOG, LEASE, JOB, profile)
+                body = request("low")
                 with self.assertRaises(InvalidInput):
-                    lower(CATALOG, LEASE, JOB, value, ROUTE, request("low"))
+                    lower(CATALOG, LEASE, JOB, value, ROUTE, body)
                 with self.assertRaises(InvalidInput):
                     lower(
                         CATALOG, LEASE, JOB, PRIMARY, ROUTE, {"model": value, "x_oc_effort": "low"}
@@ -275,25 +283,31 @@ class ModelCatalogTest(unittest.TestCase):
                 with self.subTest(agent=agent, variants=variants):
                     with self.assertRaises(InvalidInput):
                         project(CATALOG, lease, JOB, PROFILE[:1])
+                    body = request("low")
                     with self.assertRaises(InvalidInput):
-                        lower(CATALOG, lease, JOB, PRIMARY, ROUTE, request("low"))
+                        lower(CATALOG, lease, JOB, PRIMARY, ROUTE, body)
 
     def test_unleased_model_and_unknown_agent_are_denied(self):
         with self.assertRaises(Denied):
             lower(CATALOG, LEASE, JOB, PRIMARY, ROUTE, {"model": "other", "x_oc_effort": "low"})
+        profile = (replace(PROFILE[0], model="other"),)
         with self.assertRaises(Denied):
-            project(CATALOG, LEASE, JOB, (replace(PROFILE[0], model="other"),))
+            project(CATALOG, LEASE, JOB, profile)
+        body = request("low")
         with self.assertRaises(Denied):
-            lower(CATALOG, LEASE, JOB, "unknown", ROUTE, request("low"))
+            lower(CATALOG, LEASE, JOB, "unknown", ROUTE, body)
+        profile = (replace(PROFILE[0], agent="unknown"),)
         with self.assertRaises(Denied):
-            project(CATALOG, LEASE, JOB, (replace(PROFILE[0], agent="unknown"),))
+            project(CATALOG, LEASE, JOB, profile)
 
     def test_model_variant_union_confers_no_agent_grant(self):
         self.assertEqual(project(CATALOG, LEASE, JOB, PROFILE).variants, ("high", "low"))
+        body = request("high")
         with self.assertRaises(Denied):
-            lower(CATALOG, LEASE, JOB, PRIMARY, ROUTE, request("high"))
+            lower(CATALOG, LEASE, JOB, PRIMARY, ROUTE, body)
+        profile = (replace(PROFILE[0], variant="high"),)
         with self.assertRaises(Denied):
-            project(CATALOG, LEASE, JOB, (replace(PROFILE[0], variant="high"),))
+            project(CATALOG, LEASE, JOB, profile)
 
     def test_request_requires_exact_model_and_effort_strings(self):
         for body in (
@@ -325,8 +339,9 @@ class ModelCatalogTest(unittest.TestCase):
         lease = replace(LEASE, grants=LEASE.grants + (AgentGrant(PRIMARY, frozenset({"high"})),))
         with self.assertRaises(InvalidInput):
             project(CATALOG, lease, JOB, PROFILE)
+        body = request("high")
         with self.assertRaises(InvalidInput):
-            lower(CATALOG, lease, JOB, PRIMARY, ROUTE, request("high"))
+            lower(CATALOG, lease, JOB, PRIMARY, ROUTE, body)
 
     def test_extra_request_fields_are_rejected_with_or_without_a_symbol(self):
         fields = {
@@ -352,10 +367,11 @@ class ModelCatalogTest(unittest.TestCase):
         projection = project(CATALOG, LEASE, JOB, PROFILE)
         inactive = replace(LEASE, active=False)
         effort = projection.agents[0].variant
+        body = request(effort)
         with self.assertRaises(Denied):
-            lower(CATALOG, inactive, JOB, PRIMARY, ROUTE, request(effort))
+            lower(CATALOG, inactive, JOB, PRIMARY, ROUTE, body)
         self.assertEqual(
-            lower(CATALOG, LEASE, JOB, PRIMARY, ROUTE, request(effort)).reasoning.effort,
+            lower(CATALOG, LEASE, JOB, PRIMARY, ROUTE, body).reasoning.effort,
             "low",
         )
 
