@@ -31,6 +31,7 @@ TARGET = re.compile(rb"/[A-Za-z0-9_./-]*\Z")
 HEADER = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 CODE = re.compile(r"[A-Za-z0-9_-]{43}\Z", re.ASCII)
 ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
+SURROGATE = re.compile(r"[\ud800-\udfff]")
 BAD_VALUE = re.compile(rb"[\x00-\x08\x0a-\x1f\x7f]")
 READ_LIMIT = 16 * 1024
 BODY_LIMIT = 256
@@ -82,45 +83,59 @@ def _read_request(conn: socket.socket, deadline: float):
                 raise RequestError(400)
             _recv(conn, data, min(4096, READ_LIMIT - len(data)), deadline)
         head, body = data.split(b"\r\n\r\n", 1)
-        lines = head.split(b"\r\n")
-        request_line = lines[0].split(b" ")
-        if len(request_line) != 3 or request_line[2] != b"HTTP/1.1":
-            raise RequestError(400)
-        method, target, _ = request_line
-        if not HEADER.fullmatch(method):
-            raise RequestError(400)
-        if not target.startswith(b"/") or target.startswith(b"//"):
-            raise RequestError(403)
-        headers = {}
-        for line in lines[1:]:
-            name, sep, value = line.partition(b":")
-            if not sep or not HEADER.fullmatch(name) or BAD_VALUE.search(value):
-                raise RequestError(400)
-            key = name.decode("ascii").lower()
-            if key == "content-length" and key in headers:
-                raise RequestError(400)
-            if (key in headers or key in ("forwarded", "transfer-encoding", "expect")
-                    or key.startswith("x-forwarded-")):
-                raise RequestError(403)
-            headers[key] = value.strip(b" \t").decode("latin-1")
-        length = headers.get("content-length", "0")
-        if not re.fullmatch(r"[0-9]+", length, re.ASCII):
-            raise RequestError(400)
-        significant = length.lstrip("0") or "0"
-        if len(significant) > 3 or int(significant) > BODY_LIMIT:
-            raise RequestError(413)
-        size = int(significant)
+        request_line, *header_lines = head.split(b"\r\n")
+        method, target = _parse_request_line(request_line)
+        headers = _parse_headers(header_lines)
+        size = _body_size(headers)
         if len(body) > size:
             raise RequestError(400)
         while len(body) < size:
             _recv(conn, body, size - len(body), deadline)
         if time.monotonic() >= deadline:
             raise TimeoutError
-        return method.decode("ascii"), target, headers, bytes(body)
+        return method, target, headers, bytes(body)
     finally:
         # A Python timeout socket would perform its own potentially blocking
         # readiness wait before send(), even with MSG_DONTWAIT.
         conn.settimeout(None)
+
+
+def _parse_request_line(line):
+    fields = line.split(b" ")
+    if len(fields) != 3 or fields[2] != b"HTTP/1.1":
+        raise RequestError(400)
+    method, target, _ = fields
+    if not HEADER.fullmatch(method):
+        raise RequestError(400)
+    if not target.startswith(b"/") or target.startswith(b"//"):
+        raise RequestError(403)
+    return method.decode("ascii"), target
+
+
+def _parse_headers(lines):
+    headers = {}
+    for line in lines:
+        name, sep, value = line.partition(b":")
+        if not sep or not HEADER.fullmatch(name) or BAD_VALUE.search(value):
+            raise RequestError(400)
+        key = name.decode("ascii").lower()
+        if key == "content-length" and key in headers:
+            raise RequestError(400)
+        if (key in headers or key in ("forwarded", "transfer-encoding", "expect")
+                or key.startswith("x-forwarded-")):
+            raise RequestError(403)
+        headers[key] = value.strip(b" \t").decode("latin-1")
+    return headers
+
+
+def _body_size(headers):
+    length = headers.get("content-length", "0")
+    if not re.fullmatch(r"\d+", length, re.ASCII):
+        raise RequestError(400)
+    significant = length.lstrip("0") or "0"
+    if len(significant) > 3 or int(significant) > BODY_LIMIT:
+        raise RequestError(413)
+    return int(significant)
 
 
 def _recv(conn, data, size, deadline):
@@ -213,8 +228,9 @@ class FixtureServer(socketserver.ThreadingTCPServer):
         self.active = None
         self.generation = 0
         super().__init__(("127.0.0.1", 0), _Handler)
-        self.host = f"127.0.0.1:{self.server_address[1]}"
-        self.origin = f"http://{self.host}"
+        port = self.server_address[1]
+        self.host = f"127.0.0.1:{port}"
+        self.origin = f"http://127.0.0.1:{port}"
         self.auth = UiAuthManager((self.host,), (self.origin,), idle_ttl_s=idle,
                                   absolute_ttl_s=absolute, max_sessions=2, clock=clock)
 
@@ -310,7 +326,7 @@ class FixtureServer(socketserver.ThreadingTCPServer):
             raise RequestError(415)
         try:
             payload = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object)
-        except (ValueError, UnicodeError, RecursionError):
+        except (ValueError, RecursionError):
             raise RequestError(400) from None
         if type(payload) is not dict or set(payload) != {"code"} or type(payload["code"]) is not str:
             raise RequestError(400)
@@ -363,9 +379,14 @@ def _unique_object(items):
 
 
 def _text(value, *, label=False):
-    if (type(value) is not str or (label and len(value) > 120)
-            or len(value.encode("utf-8")) > 256):
-        raise ValueError("Projection text limit exceeded")
+    if type(value) is not str:
+        raise ValueError("Invalid projection text")
+    if label:
+        if len(value) > 120 or SURROGATE.search(value):
+            raise ValueError("Invalid projection label")
+        return
+    if len(value) > 256 or len(value.encode("utf-8")) > 256:
+        raise ValueError("Projection text byte limit exceeded")
 
 
 def _nodes(items, fields, limit):
@@ -440,7 +461,7 @@ class _Handler(socketserver.BaseRequestHandler):
         except (FixtureDenied, UiAuthDeniedError):
             self._send(_denial(401), "")
 
-    def _route(self, method, raw_target, headers, body):
+    def _admitted_route(self, raw_target, headers):
         server = self.server
         origin = headers.get("origin")
         if headers.get("host") != server.host or (origin is not None and origin != server.origin):
@@ -455,16 +476,27 @@ class _Handler(socketserver.BaseRequestHandler):
         if (route not in METHODS and route not in DASHBOARDS
                 and route not in server.build.assets and route != "/"):
             raise RequestError(404)
+        return route
+
+    def _route(self, method, raw_target, headers, body):
+        route = self._admitted_route(raw_target, headers)
         allowed_method = METHODS.get(route, "GET")
         if method != allowed_method:
             self._send(_denial(405, (("Allow", allowed_method),)), route)
             return
-        if (route in (EXCHANGE, LOGOUT) and origin != server.origin
+        if (route in (EXCHANGE, LOGOUT) and headers.get("origin") != self.server.origin
                 or route in (SESSION, WORKSPACE) and headers.get("x-oc-ui") != "1"):
             raise RequestError(403)
         if route != EXCHANGE and body:
             raise RequestError(400)
 
+        if route in METHODS:
+            self._serve_api(route, headers, body)
+        else:
+            self._serve_static(route)
+
+    def _serve_api(self, route, headers, body):
+        server = self.server
         if route == EXCHANGE:
             session, cookie = server._exchange(headers, body)
             self._send(None, route, session, cookie=cookie)
@@ -478,7 +510,10 @@ class _Handler(socketserver.BaseRequestHandler):
                 self._workspace(route, session)
             else:
                 self._send(None, route, session)
-        elif route == "/":
+
+    def _serve_static(self, route):
+        server = self.server
+        if route == "/":
             self._send(_frame(303, extra=(("Location", "/dashboard/projects"),)), route)
         elif route in DASHBOARDS:
             frame = _frame(
@@ -503,7 +538,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 # returns stable data and may not block or perform I/O.
                 projects = server.reader(context)
             body = _workspace_bytes(session, projects)
-        except (ValueError, UnicodeError, TypeError):
+        except (ValueError, TypeError):
             self._send(_denial(503), route)
             return
         self._send(_frame(200, body, JSON_TYPE), route, session)
@@ -515,40 +550,45 @@ class _Handler(socketserver.BaseRequestHandler):
         while True:
             if server.before_send:
                 server.before_send(route, offset)
-            regenerate_ttl = frame is None
-            with server.guard:
-                if time.monotonic() >= deadline:
-                    return
-                denial = server._session_denial(session) if session is not None else None
-                if denial is not None:
-                    if offset:
-                        return
-                    frame = _denial(denial)
-                    session = None
-                elif regenerate_ttl:
-                    frame = server._session_frame(session, cookie)
-                    if frame is None:
-                        frame = _denial(401)
-                        session = None
-                try:
-                    view = memoryview(frame)[offset:offset + SEND_CHUNK]
-                    sent = self.request.send(view, socket.MSG_DONTWAIT)
-                except BlockingIOError:
-                    sent = None
-                except OSError:
-                    return
+            frame, session, sent = self._send_once(frame, session, cookie, offset, deadline)
             if sent is None:
-                if regenerate_ttl and session is not None:
-                    frame = None
                 if server.on_backpressure:
                     server.on_backpressure(route, offset)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or not _wait_writable(self.request, remaining):
                     return
-            elif not sent or offset + sent == len(frame):
+                continue
+            if not sent or offset + sent == len(frame):
                 return
-            else:
-                offset += sent
+            offset += sent
+
+    def _send_once(self, frame, session, cookie, offset, deadline):
+        server = self.server
+        with server.guard:
+            if time.monotonic() >= deadline:
+                return frame, session, 0
+            denial = server._session_denial(session) if session is not None else None
+            if denial is not None:
+                if offset:
+                    return frame, session, 0
+                frame, session = _denial(denial), None
+
+            retry_frame = frame
+            if frame is None:
+                frame = server._session_frame(session, cookie)
+                if frame is None:
+                    frame = retry_frame = _denial(401)
+                    session = None
+
+            try:
+                view = memoryview(frame)[offset:offset + SEND_CHUNK]
+                sent = self.request.send(view, socket.MSG_DONTWAIT)
+            except BlockingIOError:
+                # A private auth frame has no TTL until there is a successful send.
+                return retry_frame, session, None
+            except OSError:
+                return frame, session, 0
+            return frame, session, sent
 
 
 def _wait_writable(conn, remaining):

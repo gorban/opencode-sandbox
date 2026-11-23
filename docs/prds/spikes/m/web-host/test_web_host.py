@@ -366,45 +366,78 @@ class HostTests(unittest.TestCase):
             self.assertEqual(status, 503)
             self.assertNotIn(b"hidden", body)
 
+    def test_projection_label_scalar_and_text_byte_limits(self):
+        for label, text, expected in (
+            ("界" * 100, "x", 200),
+            ("界" * 120, "é" * 128, 200),
+            ("a" * 121, "x", 503),
+            ("ok", "é" * 129, 503),
+            ("ok", "a" * 257, 503),
+            ("\ud800", "x", 503),
+            ("ok", "\udfff", 503),
+        ):
+            with self.subTest(label_length=len(label), text_length=len(text), expected=expected):
+                projection = deepcopy(PROJECTION)
+                projection[0]["label"] = label
+                thread = projection[0]["sandboxes"][0]["threads"][0]
+                thread["mailbox"][0]["text"] = text
+                self._check_projection_text(projection, label, text, expected)
+
+    def _check_projection_text(self, projection, label, text, expected):
+        with running(self.build, reader=lambda _: projection) as server:
+            cookie, _ = do_login(server)
+            status, _, body = do_read(server, cookie)
+            self.assertEqual(status, expected)
+            if status == 200:
+                project = json.loads(body)["projects"][0]
+                self.assertEqual(project["label"], label)
+                thread = project["sandboxes"][0]["threads"][0]
+                self.assertEqual(thread["mailbox"][0]["text"], text)
+
     def test_retirement_before_read_or_first_release_denies(self):
         for retirement in ("logout", "expiry", "revoke", "replace"):
             for point in ("read", "release"):
                 with self.subTest(retirement=retirement, point=point):
-                    clock = Clock()
-                    hold = Hold()
-                    reads = []
+                    self._check_retirement_barrier(retirement, point)
 
-                    def reader(principal):
-                        reads.append(principal)
-                        return PROJECTION
+    def _check_retirement_barrier(self, retirement, point):
+        clock = Clock()
+        hold = Hold()
+        reads = []
 
-                    def before_send(route, offset):
-                        if route == WORKSPACE and offset == 0:
-                            hold()
+        def reader(context):
+            reads.append(context)
+            return PROJECTION
 
-                    params = ({"before_read": hold} if point == "read"
-                              else {"before_send": before_send})
-                    with running(self.build, clock=clock, idle=10, absolute=20,
-                                 reader=reader, **params) as server, ThreadPoolExecutor(2) as pool:
-                        cookie, auth = do_login(server)
-                        pending = pool.submit(do_read, server, cookie)
-                        try:
-                            self.assertTrue(hold.arrived.wait(1))
-                            if retirement == "logout":
-                                self.assertEqual(do_logout(server, cookie, auth["csrf_token"])[0], 204)
-                            elif retirement == "expiry":
-                                clock.advance(10)
-                            elif retirement == "revoke":
-                                server.revoke_authority()
-                            else:
-                                fresh = do_login(server)
-                                self.assertGreater(fresh[1]["session_generation"], auth["session_generation"])
-                        finally:
-                            hold.open.set()
-                        status, _, body = pending.result(3)
-                        self.assertEqual(status, 403 if retirement == "revoke" else 401)
-                        self.assertNotIn(b"Fixture project", body)
-                        self.assertEqual(len(reads), 0 if point == "read" else 1)
+        def before_send(route, offset):
+            if route == WORKSPACE and offset == 0:
+                hold()
+
+        params = {"before_read": hold} if point == "read" else {"before_send": before_send}
+        with running(self.build, clock=clock, idle=10, absolute=20,
+                     reader=reader, **params) as server, ThreadPoolExecutor(2) as pool:
+            cookie, auth = do_login(server)
+            pending = pool.submit(do_read, server, cookie)
+            try:
+                self.assertTrue(hold.arrived.wait(1))
+                self._retire_fixture_session(retirement, server, clock, cookie, auth)
+            finally:
+                hold.open.set()
+            status, _, body = pending.result(3)
+            self.assertEqual(status, 403 if retirement == "revoke" else 401)
+            self.assertNotIn(b"Fixture project", body)
+            self.assertEqual(len(reads), 0 if point == "read" else 1)
+
+    def _retire_fixture_session(self, retirement, server, clock, cookie, auth):
+        if retirement == "logout":
+            self.assertEqual(do_logout(server, cookie, auth["csrf_token"])[0], 204)
+        elif retirement == "expiry":
+            clock.advance(10)
+        elif retirement == "revoke":
+            server.revoke_authority()
+        else:
+            _, fresh = do_login(server)
+            self.assertGreater(fresh["session_generation"], auth["session_generation"])
 
     def test_logout_completes_while_partial_private_send_is_backpressured(self):
         projection = deepcopy(PROJECTION)
@@ -494,9 +527,9 @@ class HostTests(unittest.TestCase):
                 clock = Clock()
                 hold = Hold()
 
-                def before_send(path, offset):
-                    if path == route and offset == 0:
-                        hold()
+                def before_send(path, offset, target=route, release=hold):
+                    if path == target and offset == 0:
+                        release()
 
                 with running(self.build, clock=clock, idle=10, absolute=20,
                              before_send=before_send) as server, ThreadPoolExecutor(2) as pool:

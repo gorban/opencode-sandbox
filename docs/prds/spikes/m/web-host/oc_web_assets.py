@@ -140,23 +140,27 @@ def _walk(fd: int, prefix: str, files: dict[str, bytes], budget: list[int], dept
                 finally:
                     os.close(child)
                 continue
-            if not entry.is_file(follow_symlinks=False):
-                raise AssetError("Build entry is not a regular file")
-            if path not in (MANIFEST, FALLBACK) and Path(name).suffix not in FILE_TYPES:
-                raise AssetError("Unsupported build file type")
-            file_fd = os.open(
-                name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=fd,
-            )
-            with os.fdopen(file_fd, "rb") as source:
-                info = os.fstat(source.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                    raise AssetError("Build entry must be a regular single-link file")
-                data = source.read(ASSET_LIMIT + 1)
+            data = _read_asset(fd, entry, path)
             budget[1] += len(data)
             if len(data) > ASSET_LIMIT or budget[1] > BUILD_LIMIT:
                 raise AssetError("Build file size limit exceeded")
             files[path] = data
+
+
+def _read_asset(fd, entry, path):
+    if not entry.is_file(follow_symlinks=False):
+        raise AssetError("Build entry is not a regular file")
+    if path not in (MANIFEST, FALLBACK) and Path(entry.name).suffix not in FILE_TYPES:
+        raise AssetError("Unsupported build file type")
+    file_fd = os.open(
+        entry.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=fd,
+    )
+    with os.fdopen(file_fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise AssetError("Build entry must be a regular single-link file")
+        return source.read(ASSET_LIMIT + 1)
 
 
 def _unique_object(items):
