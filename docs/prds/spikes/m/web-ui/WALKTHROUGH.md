@@ -24,13 +24,13 @@ production launcher and Tauri are outside this slice.
   and Lighthouse 13.6.0 for qualification. Commit the npm lockfile, use `npm ci`,
   and review the resolved dependency tree and applicable advisories at Gate 2. Build tools have no runtime role. Generated output, browser installations and
   measurement reports stay out of Git.
-- Use the exact SHA-256 of the generated inline bootstrap. After building, parse the
-  single HTML fallback, require one executable inline script with no inline style or
-  handlers. Emit `build/csp-manifest.json` with `version: 1`, `html_sha256` as hex
-  over the complete HTML, and `inline_script_sha256` as base64 over the browser-parsed
-  script text encoded as UTF-8. The host verifies the manifest against its trusted build
-  artifact, keeps the manifest private, and serves those exact HTML bytes with the
-  authoritative header. A changed byte sequence, unsupported bootstrap structure or a
+- Decode the single generated HTML fallback as strict UTF-8. Require exactly one
+  executable inline bootstrap and reject inline styles, event handlers, CR and NUL.
+  Use LF line endings and hash the raw UTF-8 byte span of the bootstrap body, excluding
+  its tags. Emit `build/csp-manifest.json` with `version: 1`, `html_sha256` as hex
+  over the complete HTML, and `inline_script_sha256` as base64 over the byte span.
+  The host verifies both digests under the same rules, keeps the manifest private, and
+  serves the exact HTML bytes with the authoritative CSP header. A changed byte sequence, unsupported bootstrap structure or a
   production deep link that fails under CSP blocks qualification. Review a same-origin
   external bootstrap separately if the hash approach proves incompatible. The read-only
   transport needs only same-origin fetch in `connect-src`.
@@ -46,6 +46,15 @@ handles the HttpOnly cookie. The adapter holds CSRF in memory and supplies
 `X-OC-CSRF` for logout. Bootstrap input stays in memory until exchange and is then cleared.
 The fixture implements the same interface with synthetic promises and an in-process
 expiry or refresh signal. Visible event rows are part of the snapshot.
+
+Qualify in one fresh, single-tab browser profile with one auth controller. Serialize
+exchange and logout through the complete response, including validation of its status
+and body. Keep a dispatched mutation in flight for the life of the intact page and
+disable further auth mutations until it settles. On logout, clear the view immediately.
+The host revokes the session and sends no `Set-Cookie` for logout. After confirmed logout,
+the next confirmed exchange overwrites the inert stale cookie. If a mutation's outcome
+is unconfirmed, keep the view signed out and require a fresh trusted browser profile
+and a host reset before another exchange.
 
 ```text
 Session = { read_session_id, session_generation }
@@ -72,12 +81,21 @@ are host-derived display data. The viewer derives no authority from body text or
 ## View flow
 
 ```text
+exchange or session check:
+  record monotonic and wall-clock start times immediately before dispatch
+  validate identity and finite positive remaining TTL from the complete response
+  deadline = monotonic start + reported remaining TTL
+  expire on deadline, on wall elapsed >= remaining TTL, or on backwards wall reading
+  discard stale or expired completions before installing any session state
+
 mount or renewed session:
   retire old generation and clear selection
   record fresh client generation and host read-session identity
   subscribe with captured generation and load one no-store snapshot
   after each await or queued callback, require captured generation to still be current
-  check the adapter expiry deadline before publishing and on visibility restore
+  apply the same expiry checks before publishing and retire on expiry
+  clear private rows synchronously on hide and before any restore-time revalidation
+  revalidate with the host and require a current session before publishing again
   on load completion, require the latest request and matching response identity
   select authorized item by in-memory ID, or first listed item, and render
   show empty, loading, or a generic retryable failure as appropriate
@@ -94,7 +112,7 @@ refresh:
 logout, expiry, authenticated identity change, pagehide, or component teardown:
   invalidate the generation before any await
   abort reads, unsubscribe, cancel timers and clear DOM, snapshot, selections and errors
-  on logout request host revocation; a failed request leaves the local view signed out
+  on logout request host revocation through the serialized auth controller
   flush the DOM clear synchronously on pagehide before any page cache snapshot
   on page restore revalidate the host session before rendering private rows
 ```
@@ -111,9 +129,11 @@ service workers, route prefetch and diagnostic output containing payloads or aut
 ## Qualification
 
 1. Check types, a clean locked production build, and absence of fixture payloads in built
-   assets. Load each deep link with synthetic data through the actual host and enforcing
-   CSP. Verify the build bootstrap runs and the host's negative CSP checks reject unapproved
-   connections. Review WebSocket qualification with any later streaming surface.
+   assets. Use one shared HTML fixture and expected hash pair to check both manifest
+   generation and host verification, including rejected invalid UTF-8, CR, NUL, changed
+   HTML and multiple bootstraps. Load each deep link in pinned Chromium through the
+   actual host with the generated CSP. Verify the bootstrap runs and the host's CSP
+   checks reject unapproved connections. Review WebSocket qualification with streaming.
 2. Drive keyboard selection through the full hierarchy, including fresh deep links, empty
    snapshots and offline status. Verify mailbox, provenance and event text is literal,
    long rows wrap, and fixture body text produces no interactive elements or requests.
@@ -122,7 +142,11 @@ service workers, route prefetch and diagnostic output containing payloads or aut
    authenticate a fresh generation, then deliver the old response and callback. Check the
    view, transport call count and state after delivery. Use the injected transport to
    simulate work that escaped cancellation, then exercise a held HTTP reply through the
-   loopback host. Repeat with a mismatched response identity and page restore. Inspect
+   loopback host. Hold exchange and session-check replies past their request-anchored
+   deadlines, including suspend and restore with a paused monotonic clock. Check that
+   delayed or backwards wall-clock readings cannot leave private rows visible. Hold logout and verify the next exchange stays blocked until the full
+   response. After confirmed logout, exchange again and reload the exact authenticated
+   deep link. Verify an unconfirmed mutation leaves further exchange blocked. Inspect
    storage, URLs, and the initial HTML for private fixture data.
 4. Run Lighthouse against a cold loopback navigation with the synthetic session cookie
    established in the same isolated Chromium session. Retain that cookie across the
