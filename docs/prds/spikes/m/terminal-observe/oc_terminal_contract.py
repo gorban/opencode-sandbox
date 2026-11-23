@@ -17,7 +17,7 @@ import math
 from pathlib import Path
 import re
 import sys
-from typing import Any
+from typing import Any, cast
 
 _TERMINAL_DIR = Path(__file__).resolve().parent
 _SPIKE_M_DIR = _TERMINAL_DIR.parent
@@ -116,9 +116,12 @@ def validate_strict_int_range(
     value: object, label: str, min_val: int, max_val: int
 ) -> int:
     """Require a strict non-bool int within [min_val, max_val]."""
-    if type(value) is not int or not (min_val <= value <= max_val):
+    if type(value) is not int:
         raise CoordValidationError(f"{label} must be an int in {min_val}..{max_val}")
-    return value
+    ival = cast(int, value)
+    if not (min_val <= ival <= max_val):
+        raise CoordValidationError(f"{label} must be an int in {min_val}..{max_val}")
+    return ival
 
 
 def validate_finite_timestamp(value: object, label: str = _K_CAPTURED_AT) -> float:
@@ -126,12 +129,12 @@ def validate_finite_timestamp(value: object, label: str = _K_CAPTURED_AT) -> flo
     if type(value) not in (int, float):
         raise CoordValidationError(f"{label} must be a finite non-negative number")
     try:
-        ts = float(value)
+        ts = float(cast(int | float, value))
     except OverflowError as exc:
         raise CoordValidationError(f"{label} must be finite and >= 0.0") from exc
     if not math.isfinite(ts) or ts < 0.0:
         raise CoordValidationError(f"{label} must be finite and >= 0.0")
-    return 0.0 if ts == 0.0 else ts
+    return ts + 0.0
 
 
 def validate_terminal_token(value: object, label: str) -> str:
