@@ -42,6 +42,16 @@ production launcher and Tauri are outside this slice.
   production deep link that fails under CSP blocks qualification. Review a same-origin
   external bootstrap separately if the hash approach proves incompatible. The read-only
   transport needs only same-origin fetch in `connect-src`.
+  Kit 3.4.0 applies inline CSS to its generated accessible route announcer. A build-only
+  Vite pre-transform targets `@sveltejs/kit/src/runtime/components/root.svelte` and
+  verifies its original SHA-256
+  `26acca1c521c771906deea7475985544445cccb6ee0d2a150a68ed6fc6d5fad9`.
+  Require exactly one inline declaration on the generated announcer. Move the existing
+  declaration bytes into the component's scoped CSS without modifying dependencies
+  on disk. The build fails on drift or a missing transformation. Keep the announcer's
+  ARIA behavior and the host's
+  `style-src 'self'`. Check the initial page and keyboard route transition for CSP
+  violations in Chromium.
   [M3 CSP](../../../prd_m3.md#3-shared-sveltekit-frontend-loopback-web-auth-and-tauri-v2-uds-bridge)
 
 ## Projection and transport
