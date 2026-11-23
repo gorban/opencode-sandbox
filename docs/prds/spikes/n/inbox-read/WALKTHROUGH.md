@@ -291,37 +291,41 @@ def open_readonly_inbox_snapshot(db_path: Path, *, deadline: float) -> Iterator[
             apply_remaining_busy_timeout(conn, deadline)
             conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
             conn.execute("BEGIN DEFERRED")
-            # 1. Anchor the WAL read snapshot against sqlite_master FIRST using a constant projection
-            #    (SELECT 1 — never transferring unbounded schema identifiers into Python), rejecting
-            #    ANY trigger or view BEFORE querying inbox_seq_counter or any user table!
+            # 1. Anchor the WAL read snapshot against main.sqlite_schema FIRST using a constant
+            #    projection (SELECT 1 — never transferring unbounded schema identifiers into Python),
+            #    rejecting ANY trigger, view, OR virtual/rootpage=0 table BEFORE any pragma
+            #    introspection or user-table query (so virtual tables are never initialized)!
             unsafe_obj = execute_bounded(
                 conn,
-                "SELECT 1 FROM sqlite_master WHERE type IN ('trigger', 'view') LIMIT 1",
+                "SELECT 1 FROM main.sqlite_schema "
+                "WHERE type IN ('trigger', 'view') "
+                "   OR (type = 'table' AND (typeof(rootpage) != 'integer' OR rootpage <= 0)) "
+                "LIMIT 1",
                 (),
                 deadline,
             ).fetchone()
             if unsafe_obj is not None:
                 raise CoordPolicyError("inbox_db_unreadable")
-            # 2. Verify all 4 required objects exist as ORDINARY tables (type = 'table', explicitly
-            #    rejecting 'virtual', 'shadow', and 'view'!) via pragma_table_list BEFORE reading
-            #    inbox_seq_counter!
-            req_tables = execute_bounded(
-                conn,
-                "SELECT name, type FROM pragma_table_list "
-                "WHERE schema = 'main' "
-                "AND name IN ('inbox_seq_counter', 'review_items', 'workflow_runs', 'review_artifacts')",
-                (),
-                deadline,
-            ).fetchall()
-            if {r["name"] for r in req_tables if r["type"] == "table"} != {
-                "inbox_seq_counter",
-                "review_items",
-                "workflow_runs",
-                "review_artifacts",
-            } or len(req_tables) != 4:
-                raise CoordPolicyError("inbox_db_unreadable")
-            # 3. ONLY after pragma_table_list ordinary-table verification, validate
-            #    inbox_seq_counter inside the exact same anchored WAL snapshot transaction!
+            # 2. Verify each of the 4 required tables via direct PRAGMA main.table_list('<literal>')
+            #    (immune to database-defined tables named pragma_table_list!), requiring exactly one
+            #    row with schema == 'main', name == literal, and type == 'table' (rejecting 'virtual',
+            #    'shadow', and 'view') BEFORE reading inbox_seq_counter!
+            for pragma_sql, expected_name in (
+                ("PRAGMA main.table_list('inbox_seq_counter')", "inbox_seq_counter"),
+                ("PRAGMA main.table_list('review_items')", "review_items"),
+                ("PRAGMA main.table_list('workflow_runs')", "workflow_runs"),
+                ("PRAGMA main.table_list('review_artifacts')", "review_artifacts"),
+            ):
+                rows = execute_bounded(conn, pragma_sql, (), deadline).fetchall()
+                if (
+                    len(rows) != 1
+                    or rows[0]["schema"] != "main"
+                    or rows[0]["name"] != expected_name
+                    or rows[0]["type"] != "table"
+                ):
+                    raise CoordPolicyError("inbox_db_unreadable")
+            # 3. ONLY after main.sqlite_schema + direct PRAGMA main.table_list verification,
+            #    validate inbox_seq_counter inside the exact same anchored WAL snapshot transaction!
             execute_bounded(
                 conn,
                 "SELECT CASE WHEN typeof(last_seq) = 'integer' THEN last_seq ELSE NULL END "
@@ -1279,12 +1283,15 @@ synthetic SQLite fixtures (zero Podman, zero network, zero writes to production 
    - Hostile SQLite `VIEW`, `TRIGGER`, and `VIRTUAL TABLE` (e.g., `CREATE VIRTUAL TABLE
      review_items USING fts5(...)` or `CREATE VIRTUAL TABLE inbox_seq_counter USING fts5(...)`)
      injected into `inbox.sqlite` — **including replacing `inbox_seq_counter` itself with a `VIEW`
-     or `VIRTUAL TABLE`** — fail closed via `SELECT 1 FROM sqlite_master ...` and
-     `pragma_table_list` (`type = 'table'` ordinary-table check, rejecting `'virtual'`/`'shadow'`/
-     `'view'`) BEFORE any view/virtual-table body or projection read is evaluated, raising
-     `CoordPolicyError("inbox_db_unreadable")` with clean connection close (while valid ordinary
-     tables pass cleanly); missing required objects likewise fail closed; verify
-     `PRAGMA trusted_schema = OFF` and `PRAGMA cell_size_check = ON` are active on opened snapshots.
+     or `VIRTUAL TABLE`** — fail closed at the constant-only `SELECT 1 FROM main.sqlite_schema`
+     precheck (`type IN ('trigger', 'view') OR (type = 'table' AND (typeof(rootpage) != 'integer'
+     OR rootpage <= 0))`) BEFORE any `PRAGMA main.table_list` introspection, virtual-table
+     initialization, or counter/projection read, raising `CoordPolicyError("inbox_db_unreadable")`
+     with clean connection close. Also verifies: (a) a harmless database-defined table named
+     `CREATE TABLE pragma_table_list (...)` does NOT break or spoof direct
+     `PRAGMA main.table_list('<literal>')` ordinary-table verification, (b) valid ordinary tables
+     pass cleanly, (c) missing required tables fail closed, and (d) `PRAGMA trusted_schema = OFF`
+     and `PRAGMA cell_size_check = ON` are active on opened snapshots.
 3. **Deterministic cryptographic review pins, `orchestrator_advisory` vs `lane_paused == 1`, artifacts, & IDs:**
    - Valid pending `host_workflow_engine` item (`lane_paused = 1`) with nullable `expires_at = None`,
      `target_addr = None`, `target_incarnation_id = None` passes verification cleanly
