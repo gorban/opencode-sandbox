@@ -126,10 +126,14 @@ assembly:
 ```python
 @contextlib.contextmanager
 function open_readonly_snapshot(db_path, *, deadline: float) -> Iterator[sqlite3.Connection]:
-    remaining_ms = check_deadline_ms(deadline)  # raises CoordPolicyError("read_deadline_exceeded") if <= 0
+    remaining_s = check_deadline_s(deadline)  # raises CoordPolicyError("read_deadline_exceeded") if <= 0
+    if not _UMASK_LOCK.acquire(timeout=remaining_s):
+        raise CoordPolicyError("read_deadline_exceeded")
     uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
     conn = None
-    with _UMASK_LOCK:
+    try:
+        # Recompute remaining budget AFTER acquiring _UMASK_LOCK; expiry prevents connect()!
+        remaining_ms = check_deadline_ms(deadline)
         old_umask = os.umask(0o077)
         try:
             conn = sqlite3.connect(
@@ -161,6 +165,8 @@ function open_readonly_snapshot(db_path, *, deadline: float) -> Iterator[sqlite3
             raise
         finally:
             os.umask(old_umask)
+    finally:
+        _UMASK_LOCK.release()
 
     try:
         yield conn
@@ -193,12 +199,13 @@ function open_readonly_snapshot(db_path, *, deadline: float) -> Iterator[sqlite3
     archive), that belongs to a separate host-produced sealed snapshot copy opened with
     `immutable=1`.
 - **Single Monotonic Deadline & Error Mapping:**
-  - `deadline = time.monotonic() + (max_read_ms / 1000.0)` (`50 <= max_read_ms <= 10_000`, default
-    `2000`) governs the entire read operation: before every SQL query, `apply_remaining_busy_timeout()`
-    updates `PRAGMA busy_timeout = max(1, remaining_ms)` so a 50 ms caller budget never waits
-    2,000 ms on a locked database; `conn.set_progress_handler(deadline_cb, 1000)` interrupts
-    long SQLite VM executions; and `check_deadline_ms(deadline)` runs between queries and during
-    Python result assembly.
+  - **Deadline scope:** `deadline = time.monotonic() + (max_read_ms / 1000.0)` (`50 <= max_read_ms <= 10_000`,
+    default `2000`) is started immediately after synchronous caller/argument/pre-session/filesystem
+    preflight and governs the entire database/projection phase: `_UMASK_LOCK.acquire(timeout=remaining_s)`
+    (recomputing `remaining_ms` after lock acquisition so expiry prevents calling `sqlite3.connect()`),
+    dynamic `PRAGMA busy_timeout = max(1, remaining_ms)` updated before every SQL query,
+    `conn.set_progress_handler(deadline_cb, 1000)` during SQLite VM execution, and
+    `check_deadline_ms(deadline)` between queries and during Python result assembly.
   - Error mapping: `sqlite3.OperationalError` with `"interrupted"` or `time.monotonic() >= deadline`
     -> `CoordPolicyError("read_deadline_exceeded")`; `"locked"`/`"busy"` before deadline ->
     `CoordPolicyError("registry_busy")`; other `sqlite3.OperationalError` or corrupt
@@ -238,12 +245,23 @@ markers explicitly alongside a 3-state `health_status`: `"healthy" | "degraded" 
      - Otherwise -> `health_status = "unknown"`, `degraded = False` (reporting
        `session_active_marker_present` explicitly without overstating `"healthy"` when a crashed
        or restarted hub's in-memory state is unknown!).
-3. **Orphaned & unconfirmed `external_transport_bindings` (`LEFT JOIN`, inside SQLite snapshot):**
+3. **Orphaned & unconfirmed `external_transport_bindings` (`LEFT JOIN`, SQL-gated columns, inside SQLite snapshot):**
    ```sql
-   SELECT b.sandbox_addr, b.incarnation_id, b.abort_requested, b.terminal_confirmed,
-          SUBSTR(CAST(b.reason AS TEXT), 1, 1024) AS reason_preview,
-          LENGTH(CAST(b.reason AS BLOB)) AS reason_bytes,
-          b.updated_at, s.status AS sandbox_status, s.incarnation_id AS current_incarnation
+   SELECT
+       CASE WHEN typeof(b.sandbox_addr) = 'text' AND LENGTH(CAST(b.sandbox_addr AS BLOB)) <= 256
+            THEN b.sandbox_addr ELSE NULL END AS sandbox_addr,
+       CASE WHEN typeof(b.incarnation_id) = 'text' AND LENGTH(CAST(b.incarnation_id AS BLOB)) <= 256
+            THEN b.incarnation_id ELSE NULL END AS incarnation_id,
+       b.abort_requested,
+       b.terminal_confirmed,
+       SUBSTR(CAST(b.reason AS BLOB), 1, 1024) AS reason_blob,
+       LENGTH(CAST(b.reason AS BLOB)) AS reason_bytes,
+       b.updated_at,
+       CASE WHEN typeof(s.status) = 'text' AND LENGTH(CAST(s.status AS BLOB)) <= 64
+            THEN s.status ELSE NULL END AS sandbox_status,
+       CASE WHEN typeof(s.incarnation_id) = 'text' AND LENGTH(CAST(s.incarnation_id AS BLOB)) <= 256
+            THEN s.incarnation_id ELSE NULL END AS current_incarnation,
+       (s.sandbox_addr IS NULL) AS sandbox_missing
    FROM external_transport_bindings b
    LEFT JOIN sandboxes s ON s.sandbox_addr = b.sandbox_addr
    WHERE b.terminal_confirmed = 0
@@ -256,6 +274,11 @@ markers explicitly alongside a 3-state `health_status`: `"healthy" | "degraded" 
    ```
    - Using `LEFT JOIN` ensures orphaned bindings whose `sandboxes` row is missing are **never**
      dropped (matching `oc_hub.py:1336-1338`).
+   - Every identity and status column is type- and byte-gated in SQL (`typeof(col) = 'text'` and
+     bounded `LENGTH(CAST(col AS BLOB))`) without truncating an oversized identifier into an
+     apparent match: if `sandbox_addr` or `incarnation_id` is malformed/oversized (`NULL`), the
+     entry is emitted with `sandbox_addr = None` / `incarnation_id = None` and
+     `malformed_identity = True` (and still counted in `unconfirmed_bindings_count`).
    - Also execute `SELECT COUNT(*) ...` with the exact same `WHERE` clause so
      `unconfirmed_bindings_count` is exact even when the summary list is capped at
      `MAX_UNCONFIRMED_BINDINGS_SUMMARY = 50`.
@@ -441,32 +464,47 @@ All 4 APIs serialize strictly via `json.dumps(obj.to_dict(), ensure_ascii=False,
      (`unconfirmed_bindings_truncated = True`) if needed, and raising
      `CoordValidationError("response_budget_too_small_for_envelope")` if even the minimal status
      envelope cannot fit.
-3. **SQL-level byte-length gates on EVERY variable-width column BEFORE materializing into Python:**
-   - Every variable-width SQLite column is byte-gated **inside SQL** using
-     `LENGTH(CAST(col AS BLOB))` before returning values to Python (preventing multi-MB allocation
-     from tampered or oversized cells!):
+3. **SQL-level type & BLOB byte-length gates on EVERY column BEFORE materializing into Python:**
+   - Every variable-width and identifier SQLite column is gated **inside SQL** using
+     `typeof(col)` and `LENGTH(CAST(col AS BLOB))` / `SUBSTR(CAST(col AS BLOB), 1, cap)` before
+     returning values to Python (preventing multi-MB allocation AND avoiding SQLite's NUL-truncation
+     behavior in `SUBSTR(CAST(col AS TEXT), ...)`!):
+     - **Identity & closed-enum/status columns** (`sandbox_addr`, `incarnation_id`, `worker_ref`,
+       `instance_name`, `job_id`, `branch`, `sandbox_type`, `status`, `parent_addr`, `thread_id`,
+       `edge_id`, `src_actor`, `src_incarnation`, `dst_addr`, `dst_incarnation`, `msg_id`,
+       `message_id`, `dispatch_msg_id`, `stream_id`, `event_type`, `badge`, `trust_class`,
+       `msg_kind`, `src_role`, `body_sha256`, `in_reply_to`, `file_path`):
+       `CASE WHEN typeof(col) = 'text' AND LENGTH(CAST(col AS BLOB)) <= cap THEN col ELSE NULL END`
+       (`cap = 64` for short closed-enum/status columns, `256` for opaque identifiers/tokens).
+       Oversized/malformed identifiers are **never truncated into apparent matches**: malformed
+       primary row identifiers fail closed (`CoordPolicyError("registry_unreadable")`), while
+       malformed secondary/diagnostic refs (e.g., binding summary IDs, `in_reply_to`, `file_path`,
+       `stream_id`) emit `None` + `malformed_identity = True` / `malformed_metadata = True`.
      - **JSON columns (`detail_json`, `artifact_refs_json`, `allowed_threads_json`,
        `allowed_msg_kinds_json`, `budget_json`):**
-       `CASE WHEN LENGTH(CAST(col AS BLOB)) <= 65536 THEN col ELSE NULL END AS col, LENGTH(CAST(col AS BLOB)) AS col_bytes`.
+       `CASE WHEN typeof(col) = 'text' AND LENGTH(CAST(col AS BLOB)) <= 65536 THEN CAST(col AS BLOB) ELSE NULL END AS col_blob, LENGTH(CAST(col AS BLOB)) AS col_bytes`.
        Cells `> SQL_MAX_CELL_BYTES (65,536)` are never returned to Python and immediately produce
        `malformed_metadata = True` with safe empty fallback (`{}` / `()`).
      - **Single-line display metadata (`project_name`, `branch`, `task_brief`, `title`, `detail`,
-       `reason`):** Fetch `SUBSTR(CAST(col AS TEXT), 1, 1024)` + `LENGTH(CAST(col AS BLOB)) AS col_bytes`
-       (never allocating more than ~4 KiB per metadata cell in Python) before control/bidi
-       scrubbing and `MAX_METADATA_TEXT_BYTES` UTF-8 truncation.
-     - **Event `body_text` / `text`:**
-       - For `event_log.body_text` and non-host-badged `stream_events.text`: fetch
-         `SUBSTR(CAST(col AS TEXT), 1, 16384) AS text_preview` +
-         `LENGTH(CAST(col AS BLOB)) AS original_text_bytes` (so Python never allocates beyond
-         `MAX_ITEM_TEXT_BYTES` characters!).
-       - For `stream_events.text` on candidate host-badged `user_message` rows
-         (`badge IN ('Operator', 'Orchestrator -o', 'Peer')`): fetch
-         `CASE WHEN LENGTH(CAST(text AS BLOB)) <= 69632 THEN text ELSE NULL END AS text_for_hash`,
-         `SUBSTR(CAST(text AS TEXT), 1, 16384) AS text_preview`, and
-         `LENGTH(CAST(text AS BLOB)) AS original_text_bytes`. Any cell `> 69,632` bytes
-         (`MAX_FRAMED_BODY_BYTES`) cannot match a valid `dispatch_receipts` hash, so SQL returns
-         `text_for_hash = NULL` and provenance downgrades immediately with
-         `"receipt_body_hash_mismatch"` without allocating megabytes!
+       `reason`):** Fetch bounded **BLOB** prefix `SUBSTR(CAST(col AS BLOB), 1, 1024)` +
+       `LENGTH(CAST(col AS BLOB)) AS col_bytes`, decode safely at UTF-8 boundary (preserving
+       embedded `\x00` for detection!), scrub control/bidi chars, and cap to
+       `MAX_METADATA_TEXT_BYTES`.
+     - **Event `body_text` / `text` (BLOB prefix + explicit `text_suffix_uninspected`):**
+       - Fetch `SUBSTR(CAST(col AS BLOB), 1, 16384) AS text_blob` +
+         `LENGTH(CAST(col AS BLOB)) AS original_text_bytes` (plus, on candidate host-badged
+         `stream_events` `user_message` rows, `CASE WHEN LENGTH(CAST(text AS BLOB)) <= 69632 THEN CAST(text AS BLOB) ELSE NULL END AS text_for_hash_blob`).
+       - In Python, trim at most 3 trailing incomplete UTF-8 continuation bytes **only** when
+         `original_text_bytes > len(text_blob)` (so a valid multibyte char split by the BLOB slice
+         is cleanly backed up to a UTF-8 char boundary), then decode with `utf-8`
+         (`errors="replace"` on invalid UTF-8 sets `malformed_metadata = True` and
+         `has_control_or_bidi = True`).
+       - Because the prefix is fetched as a **BLOB**, embedded `b"\x00"` (NUL) is preserved verbatim
+         and detected (`has_control_or_bidi = True`).
+       - Emit explicit **`text_suffix_uninspected = (original_text_bytes > len(inspected_utf8_bytes))`**
+         alongside `text_truncated` and `has_control_or_bidi` so consumers distinguish a clean
+         fully-inspected message (`text_suffix_uninspected = False`) from an inspected prefix
+         whose suffix beyond the byte cap was not inspected (`text_suffix_uninspected = True`).
 
 ---
 
@@ -676,36 +714,54 @@ Inside the same read-only SQLite snapshot, every `stream_events` row is re-verif
        `untrusted_content = True`, `provenance_anomaly = True`,
        `anomaly_reason = "tui_unverifiable_without_event_link"`. Per-event verified `TUI_INPUT`
        attribution is deferred to a later coordinated writer/schema slice.
-   - **Verified host-originated badges (`OPERATOR`, `ORCHESTRATOR`, `PEER`):**
-     - **Strict `message_id` requirement (`dispatch_msg_id` NEVER substitutes!):** Require
-       `isinstance(row["message_id"], str) and bool(row["message_id"])`.
-     - **Cross-page host-badge ambiguity check (full thread in SQLite, immune to worker SSE replay):**
-       Query strictly rows claiming a verified host badge:
-       ```sql
-       SELECT COUNT(*) FROM stream_events
-       WHERE sandbox_addr = ? AND incarnation_id = ? AND thread_id = ?
-         AND event_type = 'user_message' AND message_id = ?
-         AND badge IN ('Operator', 'Orchestrator -o', 'Peer')
-       ```
-       Filtering by `badge IN ('Operator', 'Orchestrator -o', 'Peer')` guarantees that a
-       compromised worker replaying a known `message_id` over SSE (which `oc_registry.py` stores
-       as `badge = 'Sandbox-Local / Unverified'`) **cannot** retroactively strip provenance from
-       the genuine `[Operator]` row, while DB tampering duplicating a host-badged row
-       (`candidate_count != 1`, same page or across page boundaries) downgrades **all** claiming
-       rows to `SANDBOX_LOCAL_UNVERIFIED` (`authority_rank = 0`, `verified_actor = None`,
-       `untrusted_content = True`, `provenance_anomaly = True`,
-       `anomaly_reason = "ambiguous_receipt_match"`).
+   - **Verified host-originated badges (`OPERATOR`, `ORCHESTRATOR`, `PEER`) — badge-independent full-tuple matching:**
+     - **Authoritative envelope separation:** Host-originated `event_log` rows (`source_rank = 0`)
+       are written exclusively by the trusted host (`CoordHub.send()`) and **always** preserve
+       their authoritative host attribution (`src_role`, `src_actor`, `trust_class`,
+       `authority_rank = 3` for `OPERATOR_DIRECTIVE`, `2` for `PARENT_TASK`, `1` for
+       `UNTRUSTED_PEER_DATA`). Worker SSE replays or stream-row tampering can never erase
+       `event_log` envelope provenance.
+     - **Strict `message_id` requirement on `stream_events` (`dispatch_msg_id` NEVER substitutes!):**
+       Require `isinstance(row["message_id"], str) and bool(row["message_id"])`.
      - **Exact 5-tuple receipt + envelope match (unique consumed receipt on 4-tuple):** Require BOTH:
        - `event_log` row matching exact `(msg_id = row.message_id, dst_addr = row.sandbox_addr, dst_incarnation = row.incarnation_id, dst_thread_id = row.thread_id)`, AND
        - `dispatch_receipts` rows for `(sandbox_addr, incarnation_id, session_id = row.thread_id, message_id = row.message_id)` with `consumed_at IS NOT NULL` (`LIMIT 2`) having **`len(receipts) == 1`** (so tampered multi-receipt rows never depend on arbitrary `fetchone()` order -> `len != 1` downgrades with `"ambiguous_receipt_match"`).
      - Verify ALL of:
        1. `receipt.badge == raw_badge` AND `_TRUST_CLASS_TO_BADGE[TrustClass(receipt.trust_class)].value == raw_badge`,
        2. `receipt.trust_class == event_log.trust_class` AND `receipt.src_actor == event_log.src_actor` AND `receipt.body_sha256 == event_log.body_sha256`,
-       3. `text_for_hash is not None` (SQL verified `LENGTH(CAST(text AS BLOB)) <= 69632`) AND
-          `sha256_canonical_body(text_for_hash) == receipt.body_sha256`, wrapping
-          `sha256_canonical_body` in `try ... except (CoordValidationError, TypeError, ValueError):`
-          so NUL, surrogate, or non-string tampered cells NEVER crash reads and cleanly downgrade
-          with `anomaly_reason = "receipt_body_hash_mismatch"`.
+       3. `text_for_hash_blob is not None` (SQL verified `LENGTH(CAST(text AS BLOB)) <= 69632`,
+          decoded strictly as UTF-8) AND `sha256_canonical_body(text_for_hash) == receipt.body_sha256`,
+          catching `(UnicodeDecodeError, CoordValidationError, TypeError, ValueError)` so NUL,
+          invalid UTF-8, surrogate, or non-string tampered cells NEVER crash reads and cleanly
+          downgrade with `anomaly_reason = "receipt_body_hash_mismatch"`.
+     - **Badge-independent full-tuple ambiguity check (across the entire thread & page boundaries):**
+       Because `dispatch_receipts` proves the host message's origin but does NOT store
+       `stream_events.seq`, moving the stored badge between two stream rows that share the exact
+       `(sandbox_addr, incarnation_id, thread_id, message_id, body_sha256)` tuple would otherwise
+       leave one claimant with a valid consumed receipt. Therefore, fetch candidate `user_message`
+       rows on `(sandbox_addr, incarnation_id, thread_id, message_id)` **regardless of their stored
+       `badge`**:
+       ```sql
+       SELECT seq,
+              CASE WHEN LENGTH(CAST(text AS BLOB)) <= 69632 THEN CAST(text AS BLOB) ELSE NULL END AS text_blob
+       FROM stream_events
+       WHERE sandbox_addr = ? AND incarnation_id = ? AND thread_id = ?
+         AND event_type = 'user_message' AND message_id = ?
+       ORDER BY seq ASC
+       LIMIT 17
+       ```
+       - Count how many candidate rows have `sha256_canonical_body(decoded_text) == receipt.body_sha256`
+         (checking deadline during iteration).
+       - If `len(candidates) > 16` (flood cap exceeded) OR `full_tuple_match_count != 1` (e.g., two
+         rows match the full 5-tuple regardless of which row currently carries `badge='Operator'`):
+         **downgrade stream-row attribution** to `SANDBOX_LOCAL_UNVERIFIED` (`authority_rank = 0`,
+         `verified_actor = None`, `untrusted_content = True`, `provenance_anomaly = True`,
+         `anomaly_reason = "ambiguous_receipt_match"`), while the `event_log` envelope row
+         (`source_rank = 0`) still preserves verified host attribution!
+       - Conversely, if a compromised worker replays `message_id` with a *different* spoofed body
+         (whose hash != `receipt.body_sha256`), `full_tuple_match_count` remains `1` on the
+         genuine row, so the genuine row keeps `[Operator]` and the spoofed row remains
+         `SANDBOX_LOCAL_UNVERIFIED`.
      - On any failure -> downgrade to `SANDBOX_LOCAL_UNVERIFIED`, `authority_rank = 0`,
        `verified_actor = None`, `untrusted_content = True`, `provenance_anomaly = True`, closed-enum
        `anomaly_reason` (`"unbacked_host_badge"`, `"trust_class_mismatch"`,
@@ -833,13 +889,16 @@ under both default `$HOME` and `TMPDIR=/tmp` using private owner-only synthetic 
      a 256-byte prefix (kept in separate groups!), oversized >4 KiB `project_id` (isolated without
      materializing megabytes), `:` in `incarnation_id`/`msg_id`, and same-`seq` `event_log` +
      `stream_events` rows paginate across `limit=1` pages with zero skips or duplicates.
-   - Oversized SQLite cells (e.g., 2 MiB `detail_json`, `text`, `project_id`) are SQL-gated before
-     Python materialization (asserting both bounded bytes fetched and final serialized size).
+   - Oversized SQLite cells (e.g., 2 MiB `detail_json`, `text`, `project_id`, and oversized
+     `external_transport_bindings.sandbox_addr`/`incarnation_id`) are SQL-gated via BLOB/type
+     checks before Python materialization (asserting bounded bytes returned by SQLite,
+     `malformed_identity = True` without ID truncation, and final serialized size `<= max_response_bytes`).
    - Reusing a cursor on a different operation, target, thread, incarnation, or filter raises
      `CoordValidationError("cursor_scope_mismatch")`.
    - Lock-contention fixture with minimum `max_read_ms=50` against a held write lock aborts
      promptly with `CoordPolicyError("read_deadline_exceeded")` (well under 500 ms), alongside
-     the large-query deadline fixture.
+     a fixture holding `_UMASK_LOCK` past `max_read_ms=50` asserting `CoordPolicyError("read_deadline_exceeded")`
+     with **zero calls to `sqlite3.connect`**, and the large-query deadline fixture.
    - `open_readonly_snapshot` closes the SQLite connection immediately on normal return, anchor
      `SELECT` failure (e.g. corrupt DB / missing `seq_counter`), and query timeout (verified via
      closed-connection check / zero leaked descriptors).
@@ -848,13 +907,19 @@ under both default `$HOME` and `TMPDIR=/tmp` using private owner-only synthetic 
 5. **Per-event provenance verification & hostile/corrupt DB defense:**
    - Verified `[Operator]`, `[Orchestrator -o]`, `[Peer]`, and `[Sandbox-Local / Unverified]` rows
      project accurately; multiline `\n`/`\t` event text does NOT false-positive
-     `has_control_or_bidi`, while bare `\r`/NUL/bidi override DOES flag it.
-   - Genuine `[Operator]` row followed by a compromised worker's rejected SSE replay
-     (`badge='Sandbox-Local / Unverified'` on the same `message_id`) **preserves `[Operator]`** on
-     the genuine row while keeping the replay `SANDBOX_LOCAL_UNVERIFIED`.
-   - Two tampered `badge='Operator'` rows on the same `message_id` **across page boundaries** (or
-     two conflicting consumed `dispatch_receipts` on the same 4-tuple) BOTH downgrade to
-     `SANDBOX_LOCAL_UNVERIFIED` (`"ambiguous_receipt_match"`).
+     `has_control_or_bidi` (`text_suffix_uninspected=False`).
+   - Embedded NUL (`"a\x00b"`) in event text is detected via BLOB prefix (`has_control_or_bidi=True`),
+     and a control/bidi character located beyond the preview byte cap yields
+     `has_control_or_bidi=False, text_suffix_uninspected=True, text_truncated=True`.
+   - Swapping badges between two `stream_events` rows that match the exact full 5-tuple
+     `(sandbox_addr, incarnation_id, thread_id, message_id, body_sha256)` (regardless of stored
+     badge, including across page boundaries) downgrades **both** stream rows to
+     `SANDBOX_LOCAL_UNVERIFIED` (`"ambiguous_receipt_match"`, zero per-event authority) while the
+     `event_log` envelope row (`source_rank=0`) still preserves verified `[Operator]` attribution;
+     whereas a spoofed-body replay (`body_sha256 != receipt.body_sha256`) preserves `[Operator]`
+     on the single full-tuple-matching genuine row.
+   - Conflicting consumed `dispatch_receipts` on the same 4-tuple downgrade with
+     `"ambiguous_receipt_match"`.
    - `user_message` with `message_id=None` + valid `dispatch_msg_id` downgrades (`"unbacked_host_badge"`).
    - Oversize (`> 69,632` B) or NUL tampered `stream_events.text` on a host-badged row downgrades
      cleanly (`"receipt_body_hash_mismatch"`) without raising `CoordValidationError` or allocating
