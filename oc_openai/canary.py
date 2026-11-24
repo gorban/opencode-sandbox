@@ -2,13 +2,15 @@
 
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from hashlib import sha256
 import hmac
 import os
 from pathlib import Path
-import pwd
 import re
 import secrets
+import signal
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -37,7 +39,13 @@ from .canary_protocol import (
     validate_responses_request,
     verify_opencode_json_stdout,
 )
-from .canary_runtime import DetachedOwnerSession, OwnerLost, RuntimeFailure
+from .canary_runtime import (
+    DetachedOwnerSession,
+    OwnerLost,
+    RuntimeFailure,
+    check_private_directory,
+    scratch_parent,
+)
 from .cli import MODEL, Reason, RouteUnavailable, StreamTerminal, Terminal, report_failure
 from .connection import ConnectionError
 from .exposure import _INPUT_LIMIT, _OUTPUT_LIMIT, binding_digest
@@ -47,6 +55,8 @@ from .responses import StreamLimits
 
 
 _MODEL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z", re.ASCII)
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+REVIEWED_MODELS = {MODEL: (_INPUT_LIMIT, _OUTPUT_LIMIT)}
 CANARY_STREAM_LIMITS = StreamLimits(
     max_json=1024 * 1024,
     max_stream=4 * 1024 * 1024,
@@ -60,33 +70,92 @@ CANARY_STREAM_LIMITS = StreamLimits(
 class CanaryArgs:
     model: str | None
     synthetic_check: bool
+    reviewed_source: str | None = None
+
+
+def _parse_canary_flag(argv: list[str], idx: int, current: str | None, pattern: re.Pattern) -> tuple[str, int]:
+    if current is not None or idx + 1 >= len(argv):
+        raise ValueError("unsupported canary arguments")
+    value = argv[idx + 1]
+    if not pattern.fullmatch(value):
+        raise ValueError("invalid canary argument value")
+    return value, idx + 2
 
 
 def parse_canary_argv(argv: list[str]) -> CanaryArgs:
-    """Strictly parse `canary [--model SLUG] [--synthetic-check]`."""
+    """Strictly parse `canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]`."""
     model = None
     synthetic = False
+    reviewed_source = None
     idx = 0
     while idx < len(argv):
         arg = argv[idx]
         if arg == "--synthetic-check" and not synthetic:
-            synthetic = True
-            idx += 1
-        elif arg == "--model" and model is None and idx + 1 < len(argv):
-            slug = argv[idx + 1]
-            if not _MODEL_SLUG_RE.fullmatch(slug):
-                raise ValueError("invalid model slug")
-            model = slug
-            idx += 2
+            synthetic, idx = True, idx + 1
+        elif arg == "--model":
+            model, idx = _parse_canary_flag(argv, idx, model, _MODEL_SLUG_RE)
+        elif arg == "--reviewed-source":
+            reviewed_source, idx = _parse_canary_flag(argv, idx, reviewed_source, _SHA256_RE)
         else:
             raise ValueError("unsupported canary arguments")
-    return CanaryArgs(model=model, synthetic_check=synthetic)
+    return CanaryArgs(model=model, synthetic_check=synthetic, reviewed_source=reviewed_source)
+
+
+def _trusted_source_file(path: Path) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid())
+                or info.st_nlink != 1 or info.st_mode & 0o022):
+            raise RuntimeFailure("untrusted canary source file")
+        data = stream.read(1_048_577)
+    if len(data) > 1_048_576:
+        raise RuntimeFailure("canary source file exceeds size cap")
+    return data
+
+
+def _collect_source_files(root: Path) -> list[Path]:
+    files = [Path("oc-sandbox"), Path("oc-openai.py")]
+    for rel_dir in (Path("oc_openai"), Path("oc_openai/managed")):
+        directory = root / rel_dir
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+            raise RuntimeFailure("untrusted canary source directory")
+        for entry in sorted(directory.iterdir()):
+            if entry.suffix == ".py":
+                files.append(entry.relative_to(root))
+    return sorted(files)
+
+
+def canary_source_digest(root: Path | None = None) -> str:
+    """Compute a deterministic SHA-256 provenance digest over the canary source tree."""
+    base = Path(__file__).resolve().parents[1] if root is None else Path(root)
+    hasher = sha256()
+    for rel in _collect_source_files(base):
+        data = _trusted_source_file(base / rel)
+        hasher.update(rel.as_posix().encode("ascii") + b"\0" + sha256(data).digest())
+    return hasher.hexdigest()
 
 
 def _send_all_bounded(sock: socket.socket, data: bytes, *, timeout: float = IDLE_SECONDS) -> int:
     sock.settimeout(timeout)
     sock.sendall(data)
     return len(data)
+
+
+def _send_nonblocking_exact(sock: socket.socket, data: bytes) -> int:
+    """Single non-blocking send for use while holding global profile/store locks."""
+    sock.setblocking(False)
+    try:
+        sent = sock.send(data)
+    except OSError:
+        raise OwnerLost("nonblocking client delivery failed") from None
+    finally:
+        with suppress(OSError):
+            sock.settimeout(IDLE_SECONDS)
+    if sent != len(data):
+        raise OwnerLost("incomplete nonblocking client delivery")
+    return sent
 
 
 def _recv_exact_proof(conn: socket.socket, expected: bytes) -> bool:
@@ -135,6 +204,8 @@ class CanaryBroker:
         self.after_reserve = after_reserve
         self._stop = threading.Event()
         self._admit_lock = threading.Lock()
+        self._peer_lock = threading.Lock()
+        self._active_peers: set[socket.socket] = set()
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self.models_requests = 0
@@ -144,6 +215,16 @@ class CanaryBroker:
         self.ledger_outcome: str | None = None
         self.delivered_bytes = 0
         self.error: str | None = None
+
+    @contextmanager
+    def _track_peer(self, sock: socket.socket):
+        with self._peer_lock:
+            self._active_peers.add(sock)
+        try:
+            yield
+        finally:
+            with self._peer_lock:
+                self._active_peers.discard(sock)
 
     def start(self) -> None:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -160,6 +241,11 @@ class CanaryBroker:
         if self._server is not None:
             with suppress(OSError):
                 self._server.close()
+        with self._peer_lock:
+            peers = tuple(self._active_peers)
+        for peer in peers:
+            with suppress(OSError):
+                peer.shutdown(socket.SHUT_RDWR)
         if self._thread is not None:
             self._thread.join(timeout=5)
         with suppress(OSError):
@@ -176,8 +262,11 @@ class CanaryBroker:
                 continue
             except OSError:
                 return
-            with control:
-                self._handle_control(control)
+            try:
+                with control, self._track_peer(control):
+                    self._handle_control(control)
+            except Exception as exc:
+                self.error = str(exc)
 
     def _handle_control(self, control: socket.socket) -> None:
         try:
@@ -186,8 +275,18 @@ class CanaryBroker:
             client = receive_client(control, port=self.port)
         except (OSError, Refused):
             return
-        with client:
+        with client, self._track_peer(client):
             self._handle_client(client)
+
+    def _send_if_alive(self, client: socket.socket, payload: bytes) -> None:
+        if self._stop.is_set():
+            return
+        try:
+            self.check_alive()
+        except (OwnerLost, RouteUnavailable, ConnectionError):
+            return
+        with suppress(OSError):
+            _send_all_bounded(client, payload)
 
     def _handle_client(self, client: socket.socket) -> None:
         deadline = time.monotonic() + TOTAL_SECONDS
@@ -196,8 +295,7 @@ class CanaryBroker:
                 client, deadline, port=self.port, expected_token=self.worker_token,
             )
         except (OSError, Refused):
-            with suppress(OSError):
-                _send_all_bounded(client, REFUSAL_RESPONSE)
+            self._send_if_alive(client, REFUSAL_RESPONSE)
             return
         if req.kind == "models":
             self._serve_models(client)
@@ -207,49 +305,56 @@ class CanaryBroker:
     def _serve_models(self, client: socket.socket) -> None:
         with self._admit_lock:
             if self.models_requests >= MAX_MODELS_REQUESTS:
-                with suppress(OSError):
-                    _send_all_bounded(client, REFUSAL_RESPONSE)
+                self._send_if_alive(client, REFUSAL_RESPONSE)
                 return
             self.models_requests += 1
-        with suppress(OSError):
-            _send_all_bounded(client, models_http_response(self.bound_model))
+        self._send_if_alive(client, models_http_response(self.bound_model))
 
-    def _reserve_before_write(self) -> None:
+    def _check_dispatch_authority(self, deadline: float) -> None:
+        if self._stop.is_set():
+            raise OwnerLost("canary cancelled")
+        if time.monotonic() >= deadline:
+            raise OwnerLost("canary turn deadline expired")
         self.check_alive()
+
+    def _reserve_before_write(self, deadline: float) -> None:
+        self._check_dispatch_authority(deadline)
         self.ledger.reserve(
             self.run_id, self.binding_hash, self.bound_model, self.history_digest,
+            deadline=deadline, check_alive=lambda: self._check_dispatch_authority(deadline),
         )
         self.ledger_outcome = "unsettled"
         if self.after_reserve is not None:
             self.after_reserve()
+        # Re-verify TTY, owner liveness, cancellation, and deadline after blocking reservation.
+        self._check_dispatch_authority(deadline)
 
     def _serve_responses(self, client: socket.socket, body: bytes, deadline: float) -> None:
         try:
             canonical = validate_responses_request(body, bound_model=self.bound_model)
         except Refused:
-            with suppress(OSError):
-                _send_all_bounded(client, REFUSAL_RESPONSE)
+            self._send_if_alive(client, REFUSAL_RESPONSE)
             return
         with self._admit_lock:
             if self.inference_admitted:
-                with suppress(OSError):
-                    _send_all_bounded(client, REFUSAL_RESPONSE)
+                self._send_if_alive(client, REFUSAL_RESPONSE)
                 return
             self.inference_admitted = True
         self._dispatch_single_turn(client, canonical, deadline)
 
     def _dispatch_single_turn(self, client: socket.socket, canonical: dict, deadline: float) -> None:
         try:
-            self.check_alive()
+            self._check_dispatch_authority(deadline)
             self.upstream_calls += 1
             with self.upstream_stream(
                 canonical,
-                before_write=self._reserve_before_write,
+                before_write=lambda: self._reserve_before_write(deadline),
                 deadline=deadline,
                 cancelled=self._stop,
             ) as events:
                 outcome = consume_upstream_stream(
-                    events, bound_model=self.bound_model, check_alive=self.check_alive,
+                    events, bound_model=self.bound_model,
+                    check_alive=lambda: self._check_dispatch_authority(deadline),
                 )
             self.stream_outcome = outcome
             settled = self.ledger.settle(
@@ -263,43 +368,49 @@ class CanaryBroker:
                 payload = ok_sse_http_response(
                     self.bound_model, outcome.input_tokens, outcome.output_tokens,
                 )
-                self._deliver_fenced(client, payload)
+                self._deliver_fenced(client, payload, deadline)
         except (CanaryLedgerError, CanaryUnsettledError, ConnectionError, OwnerLost, RouteUnavailable, OSError) as exc:
             self.error = str(exc)
 
-    def _deliver_fenced(self, client: socket.socket, payload: bytes) -> None:
+    def _deliver_fenced(self, client: socket.socket, payload: bytes, deadline: float) -> None:
         def write_action():
-            self.check_alive()
-            return _send_all_bounded(client, payload)
+            self._check_dispatch_authority(deadline)
+            return _send_nonblocking_exact(client, payload)
 
         self.delivered_bytes = self.fenced_client_write(write_action)
 
 
-def _format_disclosure(label: str, model: str, history: HistorySnapshot) -> str:
+def _format_disclosure(label: str, model: str, history: HistorySnapshot, source_digest: str) -> str:
+    max_in, max_out = REVIEWED_MODELS[model]
     prior_desc = (
         f"{len(history.present_files)} prior I4a record file(s) "
-        f"({history.record_count} entries, {history.unsettled_count} unsettled, "
-        f"prior exposure {history.reserved_input:,} input / {history.reserved_output:,} output tokens)"
+        f"({history.record_count} entries, {history.unsettled_count} unsettled; "
+        f"verified settled usage {history.settled_input:,} in / {history.settled_output:,} out; "
+        f"open unsettled reservations {history.unsettled_input:,} in / {history.unsettled_output:,} out; "
+        f"cumulative prior ceilings {history.reserved_input:,} in / {history.reserved_output:,} out)"
         if history.present_files
         else "no prior I4a hold files"
     )
-    total_in = history.reserved_input + _INPUT_LIMIT
-    total_out = history.reserved_output + _OUTPUT_LIMIT
+    total_in = history.reserved_input + max_in
+    total_out = history.reserved_output + max_out
     return (
         f"Active registration: {label}. Bound model: {model}. "
+        f"Canary source SHA-256: {source_digest}. "
         f"Prior workstation state (read-only, untouched): {prior_desc}. "
         f"This single-use zero-tool canary authorizes at most 1 request to OpenAI ('Reply with exactly: ok'). "
         f"OpenCode local limit.output=64 does not cap upstream because ChatGPT /v1/responses omits max_output_tokens; "
-        f"published ceilings add up to {_INPUT_LIMIT:,} input and {_OUTPUT_LIMIT:,} output tokens "
-        f"(combined exposure up to {total_in:,} input and {total_out:,} output tokens). "
+        f"published ceilings add up to {max_in:,} input and {max_out:,} output tokens "
+        f"(combined reserved ceiling up to {total_in:,} input and {total_out:,} output tokens). "
         "OpenAI may use your ChatGPT plan or account credits with no verified hard spending cap. "
         "API-key fallback and all tools are disabled. Ctrl-C stops and cleans up."
     )
 
 
 def _resolve_model(conn, binding, requested: str | None) -> str:
-    models = conn.models(binding)
     target = requested or MODEL
+    if target not in REVIEWED_MODELS:
+        raise RouteUnavailable(Reason.MODEL_UNAVAILABLE)
+    models = conn.models(binding)
     if target not in models:
         raise RouteUnavailable(Reason.MODEL_UNAVAILABLE)
     return target
@@ -315,6 +426,41 @@ def _check_tty_and_owner(terminal: Terminal, owner: DetachedOwnerSession) -> Non
     if not terminal.attended():
         raise OwnerLost("foreground terminal lost")
     owner.check_alive()
+
+
+def _verify_and_record_completion(
+    terminal: Terminal,
+    ledger: CanaryLedger,
+    broker: CanaryBroker,
+    run_id: str,
+    *,
+    root: Path,
+    rc: int,
+    stdout_bytes: bytes,
+    cleanup_verified: bool,
+    cleanup_error: str,
+    owner_rc: int,
+) -> int:
+    clean_ok = cleanup_verified and owner_rc == 0 and not root.exists()
+    if not clean_ok:
+        terminal.error(
+            f"ChatGPT canary cleanup was not verified ({cleanup_error or f'owner_rc={owner_rc}'}); "
+            f"preserving ledger state ({broker.ledger_outcome or 'none'}) without retry."
+        )
+        return 1
+    if (broker.ledger_outcome == "ok_settled" and broker.delivered_bytes > 0
+            and rc == 0 and verify_opencode_json_stdout(stdout_bytes)):
+        ledger.mark_delivered(run_id)
+        terminal.write(
+            f"ChatGPT canary succeeded: exact 'ok' delivered, verified cleanup, and settled "
+            f"({broker.stream_outcome.input_tokens} in / {broker.stream_outcome.output_tokens} out)."
+        )
+        return 0
+    terminal.error(
+        f"ChatGPT canary did not verify clean 'ok' delivery "
+        f"(ledger={broker.ledger_outcome or 'none'}, opencode_rc={rc})."
+    )
+    return 1
 
 
 def _execute_canary_session(
@@ -335,6 +481,7 @@ def _execute_canary_session(
     b_hash = binding_digest(binding.profile, binding.generation, epoch)
     owner = owner_factory(model, worker_token)
     broker = None
+    root: Path | None = None
     try:
         root, proof = owner.prepare()
 
@@ -368,32 +515,26 @@ def _execute_canary_session(
         )
         broker.start()
         owner.start_containers()
-        rc, stdout_bytes, _stderr_bytes = owner.wait_opencode()
-        if (broker.ledger_outcome == "ok_settled" and broker.delivered_bytes > 0
-                and rc == 0 and verify_opencode_json_stdout(stdout_bytes)):
-            ledger.mark_delivered(run_id)
-            terminal.write(
-                f"ChatGPT canary succeeded: exact 'ok' delivered and settled "
-                f"({broker.stream_outcome.input_tokens} in / {broker.stream_outcome.output_tokens} out)."
-            )
-            return 0
-        terminal.error(
-            f"ChatGPT canary did not verify clean 'ok' delivery "
-            f"(ledger={broker.ledger_outcome or 'none'}, opencode_rc={rc})."
-        )
-        return 1
+        rc, stdout_bytes, _stderr_bytes, cleanup_verified, cleanup_error = owner.wait_opencode()
     finally:
         if broker is not None:
             broker.close()
-        owner.close()
+        owner_rc = owner.close()
+    return _verify_and_record_completion(
+        terminal, ledger, broker, run_id,
+        root=root, rc=rc, stdout_bytes=stdout_bytes,
+        cleanup_verified=cleanup_verified, cleanup_error=cleanup_error, owner_rc=owner_rc,
+    )
 
 
 def run_canary(
     terminal: Terminal,
     *,
     requested_model: str | None = None,
+    reviewed_source: str | None = None,
     backend_factory=None,
     owner_factory=DetachedOwnerSession,
+    source_root: Path | None = None,
 ) -> int:
     """Run the attended single-turn zero-tool ChatGPT canary."""
     if not terminal.attended():
@@ -401,13 +542,17 @@ def run_canary(
         return 2
     factory = backend_factory or make_backend
     try:
+        source_digest = canary_source_digest(source_root)
+        if reviewed_source is not None and not hmac.compare_digest(source_digest, reviewed_source):
+            terminal.error("ChatGPT canary source digest does not match --reviewed-source.")
+            return 1
         backend = factory()
         ledger = CanaryLedger(backend._state)
         with ledger.exclusive_run():
             history = ledger.preflight()
             label, epoch, conn, binding = backend.active_connection()
             model = _resolve_model(conn, binding, requested_model)
-            terminal.write(_format_disclosure(label, model, history))
+            terminal.write(_format_disclosure(label, model, history, source_digest))
             if not terminal.confirm("Authorize this single zero-tool OpenCode canary request?"):
                 terminal.error("Cancelled.")
                 return 1
@@ -424,12 +569,43 @@ def run_canary(
         return 1
 
 
+def _synthetic_upstream_events(body: dict):
+    resp_id = "resp_synth_1"
+    return (
+        {"type": "response.created", "response": {"id": resp_id, "model": body["model"], "status": "in_progress"}},
+        {"type": "response.metadata", "response_id": resp_id, "sequence_number": 1,
+         "metadata": {"openai_chatgpt_moderation_metadata": {"prompt": {"outputs": [{"is_blocked": False}]}}}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"id": "rs_1", "type": "reasoning", "status": "completed", "summary": []}},
+        {"type": "response.output_text.delta", "output_index": 1, "content_index": 0, "delta": "ok"},
+        {"type": "response.output_text.done", "output_index": 1, "content_index": 0, "text": "ok"},
+        {"type": "response.completed", "response": {
+            "id": resp_id, "model": body["model"], "status": "completed",
+            "output": [
+                {"id": "rs_1", "type": "reasoning", "status": "completed", "summary": []},
+                {"id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+                 "content": [{"type": "output_text", "text": "ok"}]},
+            ],
+            "usage": {"input_tokens": 12, "output_tokens": 1, "total_tokens": 13},
+        }},
+    )
+
+
 def run_synthetic_check(terminal: Terminal, *, requested_model: str | None = None) -> int:
     """Run the shipping canary placement against an in-process synthetic upstream (0 live calls)."""
     model = requested_model or MODEL
-    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    with tempfile.TemporaryDirectory(prefix="oc-canary-synth-", dir=home) as scratch:
+    if model not in REVIEWED_MODELS:
+        terminal.error(f"Synthetic ChatGPT canary refused: model '{model}' is not reviewed.")
+        return 1
+    parent = scratch_parent()
+    try:
+        check_private_directory(parent)
+    except RuntimeFailure as error:
+        terminal.error(f"Synthetic ChatGPT canary check failed: {error}")
+        return 1
+    with tempfile.TemporaryDirectory(prefix="oc-canary-synth-", dir=parent) as scratch:
         state_dir = Path(scratch)
+        os.chmod(state_dir, 0o700)
         ledger = CanaryLedger(state_dir)
         history = ledger.preflight()
         run_id = secrets.token_hex(16)
@@ -437,31 +613,16 @@ def run_synthetic_check(terminal: Terminal, *, requested_model: str | None = Non
         b_hash = binding_digest("a" * 43, "b" * 43, "c" * 43)
         owner = DetachedOwnerSession(model, worker_token)
         broker = None
+        root: Path | None = None
         try:
             root, proof = owner.prepare()
 
             @contextmanager
             def fake_upstream(body, *, before_write, deadline, cancelled):
                 before_write()
-                resp_id = "resp_synth_1"
-                yield (
-                    {"type": "response.created", "response": {"id": resp_id, "model": body["model"], "status": "in_progress"}},
-                    {"type": "response.metadata", "response_id": resp_id, "sequence_number": 1,
-                     "metadata": {"openai_chatgpt_moderation_metadata": {"prompt": {"outputs": [{"is_blocked": False}]}}}},
-                    {"type": "response.output_item.added", "output_index": 0,
-                     "item": {"id": "rs_1", "type": "reasoning", "status": "completed", "summary": []}},
-                    {"type": "response.output_text.delta", "output_index": 1, "content_index": 0, "delta": "ok"},
-                    {"type": "response.output_text.done", "output_index": 1, "content_index": 0, "text": "ok"},
-                    {"type": "response.completed", "response": {
-                        "id": resp_id, "model": body["model"], "status": "completed",
-                        "output": [
-                            {"id": "rs_1", "type": "reasoning", "status": "completed", "summary": []},
-                            {"id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
-                             "content": [{"type": "output_text", "text": "ok"}]},
-                        ],
-                        "usage": {"input_tokens": 12, "output_tokens": 1, "total_tokens": 13},
-                    }},
-                )
+                if cancelled.is_set() or time.monotonic() >= deadline:
+                    raise OwnerLost("synthetic canary cancelled")
+                yield _synthetic_upstream_events(body)
 
             broker = CanaryBroker(
                 root / "relay" / "provider.sock",
@@ -478,24 +639,47 @@ def run_synthetic_check(terminal: Terminal, *, requested_model: str | None = Non
             )
             broker.start()
             owner.start_containers()
-            rc, stdout_bytes, _stderr_bytes = owner.wait_opencode()
-            if (broker.upstream_calls == 1 and broker.ledger_outcome == "ok_settled"
-                    and broker.delivered_bytes > 0 and rc == 0 and verify_opencode_json_stdout(stdout_bytes)):
-                ledger.mark_delivered(run_id)
-                terminal.write(f"Synthetic ChatGPT canary check passed for model {model} (1 synthetic POST, exact 'ok').")
-                return 0
-            terminal.error(
-                f"Synthetic ChatGPT canary check failed "
-                f"(posts={broker.upstream_calls}, ledger={broker.ledger_outcome}, rc={rc})."
-            )
-            return 1
+            rc, stdout_bytes, _stderr_bytes, cleanup_verified, cleanup_error = owner.wait_opencode()
         except (CanaryLedgerError, OwnerLost, RuntimeFailure, OSError) as error:
             terminal.error(f"Synthetic ChatGPT canary check failed: {error}")
             return 1
         finally:
             if broker is not None:
                 broker.close()
-            owner.close()
+            owner_rc = owner.close()
+        clean_ok = cleanup_verified and owner_rc == 0 and root is not None and not root.exists()
+        if (clean_ok and broker.upstream_calls == 1 and broker.ledger_outcome == "ok_settled"
+                and broker.delivered_bytes > 0 and rc == 0 and verify_opencode_json_stdout(stdout_bytes)):
+            ledger.mark_delivered(run_id)
+            terminal.write(
+                f"Synthetic ChatGPT canary check passed for model {model} "
+                "(1 synthetic POST, exact 'ok', cleanup verified)."
+            )
+            return 0
+        terminal.error(
+            f"Synthetic ChatGPT canary check failed "
+            f"(posts={broker.upstream_calls}, ledger={broker.ledger_outcome}, rc={rc}, "
+            f"cleanup={cleanup_verified}:{cleanup_error})."
+        )
+        return 1
+
+
+@contextmanager
+def _interrupt_signals():
+    def _raise_interrupt(_signum, _frame):
+        raise KeyboardInterrupt
+
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        with suppress(OSError, ValueError):
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, _raise_interrupt)
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            with suppress(OSError, ValueError):
+                signal.signal(sig, handler)
 
 
 def main(argv: list[str], *, terminal: Terminal | None = None) -> int:
@@ -503,8 +687,15 @@ def main(argv: list[str], *, terminal: Terminal | None = None) -> int:
     try:
         parsed = parse_canary_argv(argv)
     except ValueError:
-        term.error("usage: oc-sandbox openai canary [--model SLUG] [--synthetic-check]")
+        term.error("usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]")
         return 2
-    if parsed.synthetic_check:
-        return run_synthetic_check(term, requested_model=parsed.model)
-    return run_canary(term, requested_model=parsed.model)
+    try:
+        with _interrupt_signals():
+            if parsed.synthetic_check:
+                return run_synthetic_check(term, requested_model=parsed.model)
+            return run_canary(
+                term, requested_model=parsed.model, reviewed_source=parsed.reviewed_source,
+            )
+    except KeyboardInterrupt:
+        term.error("Interrupted.")
+        return 130

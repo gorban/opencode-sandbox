@@ -6,7 +6,7 @@ is structurally incapable of making any provider request.
 """
 
 import base64
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 import errno
 import json
 import os
@@ -16,11 +16,11 @@ import re
 import secrets
 import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 
@@ -31,6 +31,7 @@ CONTAINER_SHELL = "/bin/sh"
 LABEL = "io.oc-sandbox.openai-canary"
 PORT = 8401
 PROMPT = "Reply with exactly: ok"
+EXPECTED_OPENCODE_VERSION = b"opencode v2.3.0"
 OUTPUT_LIMIT = 256 * 1024
 FULL_ID = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 MODEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z", re.ASCII)
@@ -53,10 +54,20 @@ class OwnerLost(RuntimeError):
     """Peer process died before the canary settled."""
 
 
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    with suppress(OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    with suppress(OSError):
+        proc.kill()
+    with suppress(OSError, subprocess.TimeoutExpired):
+        proc.wait(timeout=5)
+
+
 def _bounded_capture(command, *, env, timeout, limit=OUTPUT_LIMIT, lifeline=None):
     with subprocess.Popen(
         command, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
     ) as proc:
         deadline = time.monotonic() + timeout
         out_buf = bytearray()
@@ -65,19 +76,21 @@ def _bounded_capture(command, *, env, timeout, limit=OUTPUT_LIMIT, lifeline=None
         for fd in pipes:
             os.set_blocking(fd, False)
         try:
-            _drain_pipes(proc, pipes, deadline, limit, lifeline)
+            _drain_pipes(pipes, deadline, limit, lifeline)
         except BaseException:
-            proc.kill()
-            proc.wait()
+            _kill_process_group(proc)
             raise
         rc = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
         return subprocess.CompletedProcess(command, rc, bytes(out_buf), bytes(err_buf))
 
 
-def _drain_pipes(proc, pipes, deadline, limit, lifeline):
+def _drain_pipes(pipes, deadline, limit, lifeline):
     poller = select.poll()
     for fd in pipes:
         poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    life_fd = lifeline.fd if lifeline is not None else None
+    if life_fd is not None:
+        poller.register(life_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
     total = 0
     while pipes:
         if lifeline is not None:
@@ -87,6 +100,9 @@ def _drain_pipes(proc, pipes, deadline, limit, lifeline):
             raise RuntimeFailure("host command timed out")
         events = poller.poll(min(100, int(remaining * 1000) + 1))
         for fd, _mask in events:
+            if fd == life_fd:
+                lifeline.check()
+                continue
             stream, buf = pipes[fd]
             total = _read_pipe_fd(fd, stream, buf, pipes, poller, total, limit)
 
@@ -282,56 +298,26 @@ def seed_scratch(root: Path, model: str, worker_token: str) -> tuple[Path, Path,
 
 
 class PipeLifeline:
-    """Synchronous poll-backed peer liveness monitor."""
+    """Synchronous single-threaded poll-backed peer liveness monitor."""
 
     def __init__(self, read_fd: int):
-        self._fd = read_fd
-        self._lost = threading.Event()
-        self._lock = threading.Lock()
-        self._on_loss = None
-
-    def start_watcher(self) -> None:
-        threading.Thread(target=self._watch, daemon=True).start()
-
-    def _watch(self) -> None:
-        poller = select.poll()
-        poller.register(self._fd, select.POLLHUP | select.POLLERR)
-        while not self._lost.is_set():
-            events = poller.poll(200)
-            if events:
-                break
-        self._lost.set()
-        with self._lock:
-            callback = self._on_loss
-        if callback is not None:
-            with suppress(Exception):
-                callback()
+        self.fd = read_fd
+        self._closed = False
 
     def active(self) -> bool:
-        if self._lost.is_set():
+        if self._closed:
             return False
         poller = select.poll()
-        poller.register(self._fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        poller.register(self.fd, select.POLLIN | select.POLLHUP | select.POLLERR)
         ready = poller.poll(0)
         if any(mask & (select.POLLHUP | select.POLLERR) for _, mask in ready):
-            self._lost.set()
+            self._closed = True
             return False
         return True
 
     def check(self) -> None:
         if not self.active():
             raise OwnerLost("peer lifeline closed")
-
-    @contextmanager
-    def on_loss(self, callback):
-        with self._lock:
-            self.check()
-            self._on_loss = callback
-        try:
-            yield
-        finally:
-            with self._lock:
-                self._on_loss = None
 
 
 def _verify_host_config(data: dict, *, image: str, network: str, env: dict, tmpfs: tuple[str, ...]) -> None:
@@ -368,7 +354,7 @@ def _verify_single_mount(data: dict, *, source: Path, target: str) -> None:
 
 
 class CanaryPlacement:
-    """Create, verify, run, and unconditionally tear down the two disposable canary containers."""
+    """Create, verify, run, and verify teardown of the two disposable canary containers."""
 
     def __init__(self, lifeline: PipeLifeline):
         self.lifeline = lifeline
@@ -434,6 +420,9 @@ class CanaryPlacement:
             h_ns = host("readlink", ns_path, lifeline=self.lifeline).stdout.strip()
             if (w_ns == r_ns) != (kind == "net") or h_ns in (w_ns, r_ns):
                 raise RuntimeFailure(f"unexpected {kind} namespace placement")
+        version = podman("exec", worker, "/usr/local/bin/opencode", "--version", lifeline=self.lifeline).stdout.strip()
+        if version != EXPECTED_OPENCODE_VERSION:
+            raise RuntimeFailure("unexpected OpenCode version in pinned image")
         home = pwd.getpwuid(os.getuid()).pw_dir
         podman(
             "exec", worker, CONTAINER_SHELL, "-ec",
@@ -449,7 +438,7 @@ class CanaryPlacement:
         return podman(
             "exec", "-w", "/workspace", worker,
             "/usr/local/bin/opencode", "run", "--format", "json",
-            "--model", f"local/{model}", PROMPT,
+            "--agent", "canary", "--model", f"local/{model}", PROMPT,
             timeout=timeout, check=False, lifeline=self.lifeline,
         )
 
@@ -473,7 +462,7 @@ class CanaryPlacement:
             with suppress(RuntimeFailure, KeyError, OSError, TypeError, ValueError):
                 self._identity(cid, role)
                 podman("rm", "--force", "--time", "1", "--ignore", cid, check=False)
-        leftover = podman("ps", "--all", "--filter", selector, "--quiet", check=False).stdout.strip()
+        leftover = podman("ps", "--all", "--filter", selector, "--quiet", check=True).stdout.strip()
         if leftover:
             raise RuntimeFailure("canary cleanup left a container")
 
@@ -498,6 +487,44 @@ def _write_owner_line(fd: int, payload: dict) -> None:
         sent += os.write(fd, view[sent:])
 
 
+def _teardown_owner(placement: CanaryPlacement, root: Path | None) -> tuple[bool, str]:
+    errors = []
+    try:
+        placement.close()
+    except (RuntimeFailure, OSError) as exc:
+        errors.append(str(exc))
+    if root is not None:
+        try:
+            if root.exists():
+                shutil.rmtree(root)
+            if root.exists():
+                errors.append("scratch directory still exists after cleanup")
+        except OSError as exc:
+            errors.append(f"scratch removal failed: {exc}")
+    return (not errors), "; ".join(errors)
+
+
+def _run_owner_containers(placement: CanaryPlacement, worker_dir: Path, relay_dir: Path, model: str):
+    w_id = placement.create_and_start(
+        "worker", OPEN_CODE, "none", worker_dir, "/etc/opencode",
+        {
+            "HOME": "/job-home",
+            "TMPDIR": "/job-tmp",
+            "XDG_CONFIG_HOME": "/job-home/config",
+            "OPENCODE_CONFIG_PROJECT_DISABLE": "true",
+        },
+        ("/job-home", "/job-tmp", "/workspace"),
+        CONTAINER_SHELL, "-c", "exec sleep 90",
+    )
+    placement.create_and_start(
+        "relay", RELAY, f"container:{w_id}", relay_dir, "/fixture",
+        {}, (), RELAY_PYTHON, "-IB", "/fixture/relay.py",
+    )
+    placement.verify_pair()
+    _write_owner_line(1, {"started": True})
+    return placement.run_opencode(model)
+
+
 def _owner_main() -> int:
     if not stat.S_ISFIFO(os.fstat(0).st_mode) or not stat.S_ISFIFO(os.fstat(1).st_mode):
         return 2
@@ -507,47 +534,40 @@ def _owner_main() -> int:
     token = spec.get("token")
     if type(model) is not str or not MODEL_RE.fullmatch(model) or type(token) is not str or not TOKEN_RE.fullmatch(token):
         return 2
-    preflight_host()
-    root = Path(tempfile.mkdtemp(prefix="oc-canary-", dir=scratch_parent()))
-    os.chmod(root, 0o700)
     lifeline = PipeLifeline(0)
     placement = CanaryPlacement(lifeline)
+    root: Path | None = None
+    result = None
+    run_error: str | None = None
     try:
+        preflight_host()
+        root = Path(tempfile.mkdtemp(prefix="oc-canary-", dir=scratch_parent()))
+        os.chmod(root, 0o700)
         worker_dir, relay_dir, proof = seed_scratch(root, model, token)
         _write_owner_line(1, {"root": str(root), "proof": proof.hex()})
         start_msg = json.loads(_read_owner_line(0).decode("ascii"))
         if start_msg.get("start") is not True:
             return 2
-        lifeline.start_watcher()
-        with lifeline.on_loss(placement.close):
-            w_id = placement.create_and_start(
-                "worker", OPEN_CODE, "none", worker_dir, "/etc/opencode",
-                {"HOME": "/home/sandbox", "OPENCODE_CONFIG_PROJECT_DISABLE": "true"},
-                ("/home/sandbox", "/workspace", "/tmp"),
-                CONTAINER_SHELL, "-c", "sleep 90",
-            )
-            placement.create_and_start(
-                "relay", RELAY, f"container:{w_id}", relay_dir, "/fixture",
-                {}, (), RELAY_PYTHON, "-IB", "/fixture/relay.py",
-            )
-            placement.verify_pair()
-            _write_owner_line(1, {"started": True})
-            res = placement.run_opencode(model)
-            _write_owner_line(1, {
-                "done": True,
-                "rc": res.returncode,
-                "stdout_b64": base64.b64encode(res.stdout).decode("ascii"),
-                "stderr_b64": base64.b64encode(res.stderr).decode("ascii"),
-            })
-        return 0
+        result = _run_owner_containers(placement, worker_dir, relay_dir, model)
     except (OwnerLost, RuntimeFailure, OSError, ValueError) as error:
+        run_error = str(error)
+    cleanup_ok, cleanup_err = _teardown_owner(placement, root)
+    if run_error is not None:
         with suppress(OSError):
-            _write_owner_line(1, {"error": str(error)})
+            _write_owner_line(1, {"error": run_error, "cleanup_verified": cleanup_ok, "cleanup_error": cleanup_err})
         return 1
-    finally:
-        with suppress(RuntimeFailure, OSError):
-            placement.close()
-        shutil.rmtree(root, ignore_errors=True)
+    with suppress(OSError):
+        _write_owner_line(1, {
+            "done": True,
+            "rc": result.returncode,
+            "stdout_b64": base64.b64encode(result.stdout).decode("ascii"),
+            "stderr_b64": base64.b64encode(result.stderr).decode("ascii"),
+            "cleanup_verified": cleanup_ok,
+            "cleanup_error": cleanup_err,
+        })
+    if cleanup_ok:
+        return 0
+    return 1
 
 
 class DetachedOwnerSession:
@@ -624,7 +644,7 @@ class DetachedOwnerSession:
         if msg.get("started") is not True:
             raise OwnerLost("owner failed to start containers")
 
-    def wait_opencode(self, timeout: float = 70.0) -> tuple[int, bytes, bytes]:
+    def wait_opencode(self, timeout: float = 85.0) -> tuple[int, bytes, bytes, bool, str]:
         msg = self._read_msg(timeout=timeout)
         if "error" in msg:
             raise RuntimeFailure(msg["error"])
@@ -634,11 +654,13 @@ class DetachedOwnerSession:
             int(msg["rc"]),
             base64.b64decode(msg["stdout_b64"]),
             base64.b64decode(msg["stderr_b64"]),
+            bool(msg.get("cleanup_verified")),
+            str(msg.get("cleanup_error") or ""),
         )
 
-    def close(self) -> None:
+    def close(self) -> int:
         if self.proc is None:
-            return
+            return 0
         with suppress(OSError):
             if self.proc.stdin is not None:
                 self.proc.stdin.close()
@@ -646,11 +668,12 @@ class DetachedOwnerSession:
             if self.proc.stdout is not None:
                 self.proc.stdout.close()
         try:
-            self.proc.wait(timeout=20)
+            rc = self.proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
             self.proc.kill()
-            self.proc.wait(timeout=5)
+            rc = self.proc.wait(timeout=5)
         self.proc = None
+        return rc
 
 
 if __name__ == "__main__":

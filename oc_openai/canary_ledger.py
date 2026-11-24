@@ -10,20 +10,29 @@ import os
 from pathlib import Path
 import re
 import secrets
-import stat
+import time
 
+from .connection_state import ConnectionError as StateError, _directory
 from .exposure import (
+    Phase,
+    Slot,
     _DIAGNOSTIC,
+    _DIGEST,
     _INPUT_LIMIT,
     _LEDGER,
     _LOCK,
     _MAX_BYTES,
     _OUTPUT_LIMIT,
     _RECOVERY_NAMES,
+    _RECOVERY_PROOF,
+    _RUN,
     _STREAM_DIAGNOSTIC,
     _is_usage,
     _private_file,
     _unique,
+    _use,
+    _valid_slot,
+    _validate,
 )
 
 
@@ -39,6 +48,11 @@ _OUTCOME_REFUSED = "refused_settled"
 _OUTCOME_OVERAGE = "overage_settled"
 _SETTLED_OUTCOMES = frozenset({_OUTCOME_OK, _OUTCOME_REFUSED, _OUTCOME_OVERAGE})
 _ERR_STORAGE = "canary_storage_unavailable"
+_ERR_CORRUPT = "canary_history_corrupt"
+_DIAG_KEYS = frozenset({"original_run", "binding", "run", "phase", "max_input", "max_output", "actual"})
+_STREAM_DIAG_KEYS = _DIAG_KEYS | {"previous_diagnostic_run"}
+_RECOVERY_KEYS = frozenset({"version", "prior", "source", "phases"})
+_EMPTY_HISTORY_DIGEST = sha256(b"").hexdigest()
 
 
 class CanaryLedgerError(RuntimeError):
@@ -51,25 +65,27 @@ class HistorySnapshot:
     present_files: tuple[str, ...]
     record_count: int
     unsettled_count: int
+    settled_input: int
+    settled_output: int
+    unsettled_input: int
+    unsettled_output: int
     reserved_input: int
     reserved_output: int
 
 
-def _open_state_dir(root: Path) -> int:
+def _bad_constant(_value):
+    raise ValueError("non-finite JSON constant")
+
+
+def _open_state_dir(root: Path, *, create: bool) -> int | None:
     try:
-        os.makedirs(root, mode=0o700, exist_ok=True)
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        dir_fd = os.open(root, flags)
-    except OSError:
+        return _directory(Path(root), create=create)
+    except FileNotFoundError:
+        if not create:
+            return None
         raise CanaryLedgerError(_ERR_STORAGE) from None
-    try:
-        info = os.fstat(dir_fd)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
-            raise CanaryLedgerError(_ERR_STORAGE)
-        return dir_fd
-    except BaseException:
-        os.close(dir_fd)
-        raise
+    except (OSError, StateError):
+        raise CanaryLedgerError(_ERR_STORAGE) from None
 
 
 def _read_private_bytes(dir_fd: int, name: str) -> bytes | None:
@@ -99,78 +115,113 @@ def _read_private_bytes(dir_fd: int, name: str) -> bytes | None:
         os.close(fd)
 
 
-def _decode_json_bytes(raw: bytes):
+def _decode_json_bytes(raw: bytes, *, err_code: str = _ERR_CORRUPT):
     try:
-        return json.loads(raw.decode("utf-8"), object_pairs_hook=_unique)
-    except (UnicodeDecodeError, ValueError):
-        raise CanaryLedgerError("canary_history_corrupt") from None
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_unique, parse_constant=_bad_constant)
+    except ValueError:
+        raise CanaryLedgerError(err_code) from None
 
 
-def _tally_entry(entry: dict) -> tuple[int, int, int, int]:
-    if type(entry) is not dict:
-        raise CanaryLedgerError("canary_history_corrupt")
-    max_in = entry.get("max_input", _INPUT_LIMIT)
-    max_out = entry.get("max_output", _OUTPUT_LIMIT)
-    if not _is_usage(max_in) or not _is_usage(max_out):
-        raise CanaryLedgerError("canary_history_corrupt")
-    actual = entry.get("actual")
-    if actual is None:
-        return 1, 1, max_in, max_out
-    if type(actual) is list and len(actual) == 2 and all(_is_usage(v) for v in actual):
-        return 1, 0, actual[0], actual[1]
-    raise CanaryLedgerError("canary_history_corrupt")
+def _validate_diagnostic_entry(name: str, payload) -> list[dict]:
+    expected_keys = _STREAM_DIAG_KEYS if name == _STREAM_DIAGNOSTIC else _DIAG_KEYS
+    if type(payload) is not dict or set(payload) != expected_keys:
+        raise CanaryLedgerError(_ERR_CORRUPT)
+    try:
+        phase = Phase(payload["phase"])
+    except ValueError:
+        raise CanaryLedgerError(_ERR_CORRUPT) from None
+    slot = Slot(payload["run"], payload["binding"], phase)
+    valid_orig = type(payload["original_run"]) is str and bool(_RUN.fullmatch(payload["original_run"]))
+    valid_prev = (
+        name != _STREAM_DIAGNOSTIC
+        or (type(payload["previous_diagnostic_run"]) is str
+            and bool(_RUN.fullmatch(payload["previous_diagnostic_run"])))
+    )
+    if (not _valid_slot(slot) or not valid_orig or not valid_prev
+            or type(payload["max_input"]) is not int or payload["max_input"] != _INPUT_LIMIT
+            or type(payload["max_output"]) is not int or payload["max_output"] != _OUTPUT_LIMIT
+            or not _use(payload)):
+        raise CanaryLedgerError(_ERR_CORRUPT)
+    return [payload]
 
 
-def _tally_i4a_payload(name: str, payload) -> tuple[int, int, int, int]:
+def _validate_recovery_payload(name: str, payload) -> list[dict]:
+    if (type(payload) is not dict or set(payload) != _RECOVERY_KEYS
+            or type(payload["version"]) is not int or payload["version"] != 1
+            or type(payload["prior"]) is not list
+            or any(type(p) is not str or not (_RUN.fullmatch(p) or _DIGEST.fullmatch(p)) for p in payload["prior"])
+            or type(payload["source"]) is not str or not _DIGEST.fullmatch(payload["source"])):
+        raise CanaryLedgerError(_ERR_CORRUPT)
+    first = Phase.ORCHESTRATOR if name == _RECOVERY_PROOF else Phase.INITIAL
+    try:
+        return _validate(payload["phases"], first=first)
+    except ValueError:
+        raise CanaryLedgerError(_ERR_CORRUPT) from None
+
+
+def _validate_i4a_entries(name: str, payload) -> list[dict]:
     if name == _LEDGER:
-        if type(payload) is not list:
-            raise CanaryLedgerError("canary_history_corrupt")
-        entries = payload
-    elif name in (_DIAGNOSTIC, _STREAM_DIAGNOSTIC):
-        entries = [payload]
-    else:
-        if type(payload) is not dict or type(payload.get("phases")) is not list:
-            raise CanaryLedgerError("canary_history_corrupt")
-        entries = payload["phases"]
-    records = unsettled = res_in = res_out = 0
+        try:
+            return _validate(payload)
+        except ValueError:
+            raise CanaryLedgerError(_ERR_CORRUPT) from None
+    if name in (_DIAGNOSTIC, _STREAM_DIAGNOSTIC):
+        return _validate_diagnostic_entry(name, payload)
+    return _validate_recovery_payload(name, payload)
+
+
+def _tally_entries(entries: list[dict]) -> tuple[int, int, int, int, int, int, int, int]:
+    records = unsettled = s_in = s_out = u_in = u_out = r_in = r_out = 0
     for entry in entries:
-        r, u, i_tok, o_tok = _tally_entry(entry)
-        records += r
-        unsettled += u
-        res_in += i_tok
-        res_out += o_tok
-    return records, unsettled, res_in, res_out
+        records += 1
+        max_in, max_out = entry["max_input"], entry["max_output"]
+        r_in += max_in
+        r_out += max_out
+        actual = entry["actual"]
+        if actual is None:
+            unsettled += 1
+            u_in += max_in
+            u_out += max_out
+        else:
+            s_in += actual[0]
+            s_out += actual[1]
+    return records, unsettled, s_in, s_out, u_in, u_out, r_in, r_out
 
 
 def _inspect_history_fd(dir_fd: int) -> HistorySnapshot:
     hasher = sha256()
     present = []
-    records = unsettled = res_in = res_out = 0
+    totals = [0, 0, 0, 0, 0, 0, 0, 0]
     for name in I4A_HOLD_FILES:
         raw = _read_private_bytes(dir_fd, name)
         if raw is None:
             continue
         payload = _decode_json_bytes(raw)
-        r, u, i_tok, o_tok = _tally_i4a_payload(name, payload)
+        entries = _validate_i4a_entries(name, payload)
+        counts = _tally_entries(entries)
         present.append(name)
-        records += r
-        unsettled += u
-        res_in += i_tok
-        res_out += o_tok
+        for idx, value in enumerate(counts):
+            totals[idx] += value
         hasher.update(name.encode("ascii") + b"\0" + str(len(raw)).encode("ascii") + b"\0" + raw + b"\0")
     return HistorySnapshot(
         digest=hasher.hexdigest(),
         present_files=tuple(present),
-        record_count=records,
-        unsettled_count=unsettled,
-        reserved_input=res_in,
-        reserved_output=res_out,
+        record_count=totals[0],
+        unsettled_count=totals[1],
+        settled_input=totals[2],
+        settled_output=totals[3],
+        unsettled_input=totals[4],
+        unsettled_output=totals[5],
+        reserved_input=totals[6],
+        reserved_output=totals[7],
     )
 
 
 def inspect_i4a_history(root: Path) -> HistorySnapshot:
-    """Strictly read-only inspection of all 9 I4a hold files in shared state."""
-    dir_fd = _open_state_dir(Path(root))
+    """Strictly read-only inspection of all 9 I4a hold files without creating directories."""
+    dir_fd = _open_state_dir(Path(root), create=False)
+    if dir_fd is None:
+        return HistorySnapshot(_EMPTY_HISTORY_DIGEST, (), 0, 0, 0, 0, 0, 0, 0, 0)
     try:
         return _inspect_history_fd(dir_fd)
     finally:
@@ -182,6 +233,8 @@ def _valid_canary_record(record) -> bool:
         return False
     required = {"run_id", "binding", "model", "history_digest", "max_input", "max_output", "actual", "outcome"}
     if not required <= set(record) <= (required | {"delivered"}):
+        return False
+    if "delivered" in record and type(record["delivered"]) is not bool:
         return False
     if (type(record["run_id"]) is not str or not _RUN_RE.fullmatch(record["run_id"])
             or type(record["binding"]) is not str or not _DIGEST_RE.fullmatch(record["binding"])
@@ -235,15 +288,41 @@ def _atomic_write_json(dir_fd: int, name: str, payload: dict) -> None:
 
 
 def _refuse_existing_canary(raw: bytes) -> None:
-    try:
-        record = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique)
-    except (UnicodeDecodeError, ValueError):
-        raise CanaryLedgerError(_ERR_STORAGE) from None
+    record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
     if not _valid_canary_record(record):
         raise CanaryLedgerError(_ERR_STORAGE)
     if record["outcome"] == _OUTCOME_UNSETTLED:
         raise CanaryLedgerError("canary_unsettled_hold")
     raise CanaryLedgerError("canary_already_spent")
+
+
+def _try_flock_nb(lock_fd: int) -> bool:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as error:
+        if error.errno in (errno.EAGAIN, errno.EACCES):
+            return False
+        raise CanaryLedgerError(_ERR_STORAGE) from None
+
+
+def _acquire_flock(lock_fd: int, *, blocking: bool, deadline: float | None, check_alive) -> None:
+    if not blocking:
+        if not _try_flock_nb(lock_fd):
+            raise CanaryLedgerError("canary_busy")
+        return
+    while True:
+        if check_alive is not None:
+            check_alive()
+        if _try_flock_nb(lock_fd):
+            return
+        pause = 0.05
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CanaryLedgerError("canary_lock_timeout")
+            pause = min(pause, remaining)
+        time.sleep(pause)
 
 
 class CanaryLedger:
@@ -255,8 +334,9 @@ class CanaryLedger:
         self.max_output = max_output
 
     @contextmanager
-    def _locked(self, *, lock_name: str = _LOCK, blocking: bool = True):
-        dir_fd = _open_state_dir(self.root)
+    def _locked(self, *, lock_name: str = _LOCK, blocking: bool = True,
+                deadline: float | None = None, check_alive=None):
+        dir_fd = _open_state_dir(self.root, create=True)
         lock_fd = None
         try:
             flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -264,13 +344,7 @@ class CanaryLedger:
             info = os.fstat(lock_fd)
             if not _private_file(info):
                 raise CanaryLedgerError(_ERR_STORAGE)
-            mode = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                fcntl.flock(lock_fd, mode)
-            except OSError as error:
-                if error.errno in (errno.EAGAIN, errno.EACCES):
-                    raise CanaryLedgerError("canary_busy") from None
-                raise CanaryLedgerError(_ERR_STORAGE) from None
+            _acquire_flock(lock_fd, blocking=blocking, deadline=deadline, check_alive=check_alive)
             yield dir_fd
         except OSError:
             raise CanaryLedgerError(_ERR_STORAGE) from None
@@ -293,14 +367,15 @@ class CanaryLedger:
                 _refuse_existing_canary(existing)
             return _inspect_history_fd(dir_fd)
 
-    def reserve(self, run_id: str, binding: str, model: str, history_digest: str) -> None:
+    def reserve(self, run_id: str, binding: str, model: str, history_digest: str, *,
+                deadline: float | None = None, check_alive=None) -> None:
         """Durably reserve the single canary slot before any upstream write."""
         if (type(run_id) is not str or not _RUN_RE.fullmatch(run_id)
                 or type(binding) is not str or not _DIGEST_RE.fullmatch(binding)
                 or type(model) is not str or not _MODEL_RE.fullmatch(model)
                 or type(history_digest) is not str or not _DIGEST_RE.fullmatch(history_digest)):
             raise CanaryLedgerError("canary_invalid_reservation")
-        with self._locked(blocking=True) as dir_fd:
+        with self._locked(blocking=True, deadline=deadline, check_alive=check_alive) as dir_fd:
             existing = _read_private_bytes(dir_fd, CANARY_FILE)
             if existing is not None:
                 _refuse_existing_canary(existing)
@@ -324,7 +399,7 @@ class CanaryLedger:
         raw = _read_private_bytes(dir_fd, CANARY_FILE)
         if raw is None:
             raise CanaryLedgerError("canary_missing_reservation")
-        record = _decode_json_bytes(raw)
+        record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
         if not _valid_canary_record(record) or record["run_id"] != run_id:
             raise CanaryLedgerError("canary_unmatched_settlement")
         if record["outcome"] != _OUTCOME_UNSETTLED:
@@ -350,12 +425,12 @@ class CanaryLedger:
             return outcome
 
     def mark_delivered(self, run_id: str) -> None:
-        """Record milestone delivery only after OpenCode exits 0 with one visible ok."""
+        """Record milestone delivery only after OpenCode exits 0 with one visible ok and verified cleanup."""
         with self._locked(blocking=True) as dir_fd:
             raw = _read_private_bytes(dir_fd, CANARY_FILE)
             if raw is None:
                 raise CanaryLedgerError("canary_missing_reservation")
-            record = _decode_json_bytes(raw)
+            record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
             if not _valid_canary_record(record) or record["run_id"] != run_id or record["outcome"] != _OUTCOME_OK:
                 raise CanaryLedgerError("canary_unmatched_settlement")
             record["delivered"] = True

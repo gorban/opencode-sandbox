@@ -23,7 +23,7 @@ MAX_EVENTS = 1024
 MAX_MODELS_REQUESTS = 4
 PROOF_SIZE = 32
 SYSTEM_DATE = re.compile(r"^Today's date: [A-Z][a-z]{2} [A-Z][a-z]{2} \d{2} \d{4}$", re.MULTILINE | re.ASCII)
-SYSTEM_DIGEST = "1b244cf99a8a63075252c2de34262ba6a396e15f67ef4be980111e7d1a4e64e4"
+SYSTEM_DIGEST = "9dbfd7bee7bd57cc1776a0867584dd69d65157bed267c6cec826ebec27878c3d"
 _RESPONSE_ID_RE = re.compile(r"resp_[A-Za-z0-9_-]{1,123}\Z", re.ASCII)
 _CACHE_KEY_RE = re.compile(r"ses_[A-Za-z0-9]{26}\Z", re.ASCII)
 _HEADER_VAL_RE = re.compile(rb"[ -~]+\Z")
@@ -80,6 +80,12 @@ def _scan_dict_children(current: dict, depth: int, stack: list) -> None:
             stack.append((value, depth + 1))
 
 
+def _scan_list_children(current: list, depth: int, stack: list) -> None:
+    for item in current:
+        if type(item) in (dict, list):
+            stack.append((item, depth + 1))
+
+
 def _scan_global_safety(obj) -> None:
     stack = [(obj, 0)]
     nodes = 0
@@ -91,9 +97,7 @@ def _scan_global_safety(obj) -> None:
         if type(current) is dict:
             _scan_dict_children(current, depth, stack)
         elif type(current) is list:
-            for item in current:
-                if type(item) in (dict, list):
-                    stack.append((item, depth + 1))
+            _scan_list_children(current, depth, stack)
 
 
 def _validate_moderation_entries(entries) -> None:
@@ -292,7 +296,11 @@ def _valid_instructions(instructions) -> bool:
     if type(instructions) is not str:
         return False
     normalized, count = SYSTEM_DATE.subn("Today's date: [date]", instructions)
-    return count == 1 and hashlib.sha256(normalized.encode("utf-8")).hexdigest() == SYSTEM_DIGEST
+    try:
+        encoded = normalized.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return count == 1 and hashlib.sha256(encoded).hexdigest() == SYSTEM_DIGEST
 
 
 def _validate_optional_fields(data: dict) -> None:
@@ -310,7 +318,7 @@ def validate_responses_request(body: bytes, *, bound_model: str) -> dict:
     """Strictly validate the inbound OpenCode Responses request and return the canonical upstream body."""
     try:
         data = json.loads(body.decode("utf-8"), object_pairs_hook=_unique, parse_constant=_bad_constant)
-    except (UnicodeDecodeError, ValueError):
+    except (ValueError, RecursionError):
         raise Refused("invalid_json") from None
     if type(data) is not dict or not _REQUIRED_REQ_KEYS <= set(data) <= _ALLOWED_REQ_KEYS:
         raise Refused("unexpected_keys")
@@ -345,6 +353,17 @@ def _is_empty_reasoning_item(item: dict) -> bool:
     return summary is None or summary == []
 
 
+def _is_clean_output_text_part(part) -> bool:
+    return (
+        type(part) is dict
+        and part.get("type") == "output_text"
+        and set(part) <= {"type", "text", "annotations", "logprobs"}
+        and type(part.get("text", "")) is str
+        and part.get("annotations") in (None, [])
+        and part.get("logprobs") in (None, [])
+    )
+
+
 def _is_clean_assistant_message(item: dict) -> bool:
     if (item.get("type") != "message" or item.get("role") != "assistant"
             or not set(item) <= _MESSAGE_ITEM_KEYS):
@@ -352,12 +371,7 @@ def _is_clean_assistant_message(item: dict) -> bool:
     content = item.get("content", [])
     if type(content) is not list:
         return False
-    return all(
-        type(part) is dict and part.get("type") == "output_text"
-        and set(part) <= {"type", "text", "annotations", "logprobs"}
-        and type(part.get("text", "")) is str
-        for part in content
-    )
+    return all(_is_clean_output_text_part(part) for part in content)
 
 
 def _extract_exact_ok(response: dict, deltas: list[str]) -> bool:
@@ -409,6 +423,18 @@ class _CanaryStreamState:
             self.suppressed = True
             self.suppress_reason = reason
 
+    def _check_response_output(self, response) -> None:
+        if type(response) is not dict or "output" not in response:
+            return
+        items = response["output"]
+        if type(items) is not list:
+            self._suppress("invalid_output")
+            return
+        for item in items:
+            if type(item) is not dict or not (_is_empty_reasoning_item(item) or _is_clean_assistant_message(item)):
+                self._suppress("disallowed_item")
+                return
+
     def _check_created(self, event: dict) -> None:
         response = event.get("response")
         rid = response.get("id") if type(response) is dict else None
@@ -417,6 +443,7 @@ class _CanaryStreamState:
                 or response.get("model", self.bound_model) != self.bound_model):
             raise CanaryUnsettledError("provider_identity")
         self.created_id = rid
+        self._check_response_output(response)
 
     def _check_item(self, event: dict) -> None:
         item = event.get("item")
@@ -428,9 +455,7 @@ class _CanaryStreamState:
         self._suppress("disallowed_item")
 
     def _check_part(self, event: dict) -> None:
-        part = event.get("part")
-        if (type(part) is not dict or part.get("type") != "output_text"
-                or not set(part) <= {"type", "text", "annotations", "logprobs"}):
+        if not _is_clean_output_text_part(event.get("part")):
             self._suppress("disallowed_part")
 
     def _check_text(self, kind: str, event: dict) -> None:
@@ -439,7 +464,12 @@ class _CanaryStreamState:
             if type(delta) is not str:
                 self._suppress("invalid_delta")
                 return
-            self.delta_bytes += len(delta.encode("utf-8"))
+            try:
+                encoded_len = len(delta.encode("utf-8"))
+            except UnicodeEncodeError:
+                self._suppress("invalid_delta")
+                return
+            self.delta_bytes += encoded_len
             if self.delta_bytes > PROJECTED_LIMIT:
                 self._suppress("projected_limit")
                 return
@@ -460,6 +490,10 @@ class _CanaryStreamState:
         kind = event["type"]
         if kind in _TERMINAL_FAILURES:
             raise CanaryUnsettledError("provider_terminal")
+        try:
+            _scan_global_safety(event)
+        except _SafetyRejected:
+            self._suppress("safety_signal")
         if kind == _EV_CREATED:
             self._check_created(event)
             return
@@ -471,15 +505,11 @@ class _CanaryStreamState:
         if kind == _EV_METADATA:
             self._check_metadata(event)
             return
-        try:
-            _scan_global_safety(event)
-        except _SafetyRejected:
-            self._suppress("safety_signal")
-            return
         self._accept_body_event(kind, event)
 
     def _accept_body_event(self, kind: str, event: dict) -> None:
         if kind == _EV_IN_PROGRESS:
+            self._check_response_output(event.get("response"))
             return
         if kind in (_EV_ITEM_ADDED, _EV_ITEM_DONE):
             self._check_item(event)
@@ -596,42 +626,47 @@ def ok_sse_http_response(bound_model: str, input_tokens: int, output_tokens: int
 
 def _parse_stdout_event(raw: str) -> dict | None:
     try:
-        event = json.loads(raw, object_pairs_hook=_unique)
-    except (Refused, ValueError):
+        event = json.loads(raw, object_pairs_hook=_unique, parse_constant=_bad_constant)
+    except (ValueError, RecursionError):
         return None
     return event if type(event) is dict else None
 
 
-def _classify_stdout_event(event: dict, texts: list[str]) -> tuple[bool, bool]:
-    kind = event.get("type")
-    if kind in ("error", "tool_use"):
-        return False, False
-    part = event.get("part")
-    if kind == "text":
-        if type(part) is not dict or type(part.get("text")) is not str:
-            return False, False
-        texts.append(part["text"])
-        return True, False
-    finished = kind == "step_finish" and type(part) is dict and part.get("reason") == "stop"
-    return True, finished
+def _valid_stdout_ids(event: dict, part: dict, seen_ids: list[str | None]) -> bool:
+    sid = event.get("sessionID")
+    mid = part.get("messageID")
+    if type(sid) is not str or not sid or type(mid) is not str or not mid:
+        return False
+    if part.get("sessionID") is not None and part.get("sessionID") != sid:
+        return False
+    if seen_ids[0] is None:
+        seen_ids[0] = sid
+        seen_ids[1] = mid
+        return True
+    return seen_ids[0] == sid and seen_ids[1] == mid
 
 
 def verify_opencode_json_stdout(stdout_bytes: bytes) -> bool:
-    """Verify pinned OpenCode exited with zero errors/tools and exactly one visible 'ok'."""
+    """Strict 3-event allowlist verifier: exact [step_start, text('ok'), step_finish('stop')]."""
     try:
-        lines = stdout_bytes.decode("utf-8").splitlines()
+        lines = [line for line in stdout_bytes.decode("utf-8").splitlines() if line.strip()]
     except UnicodeDecodeError:
         return False
-    texts: list[str] = []
-    finished = False
-    for raw in lines:
-        if not raw.strip():
-            continue
-        event = _parse_stdout_event(raw)
-        if event is None:
+    if len(lines) != 3:
+        return False
+    events = [_parse_stdout_event(line) for line in lines]
+    if any(event is None for event in events):
+        return False
+    seen_ids: list[str | None] = [None, None]
+    expected_types = ("step_start", "text", "step_finish")
+    for event, want in zip(events, expected_types):
+        part = event.get("part")
+        if event.get("type") != want or type(part) is not dict or not _valid_stdout_ids(event, part, seen_ids):
             return False
-        ok, is_finish = _classify_stdout_event(event, texts)
-        if not ok:
-            return False
-        finished = finished or is_finish
-    return finished and texts == [EXPECTED_REPLY]
+    return (
+        events[0]["part"].get("type") == "step-start"
+        and events[1]["part"].get("type") == "text"
+        and events[1]["part"].get("text") == EXPECTED_REPLY
+        and events[2]["part"].get("type") == "step-finish"
+        and events[2]["part"].get("reason") == "stop"
+    )

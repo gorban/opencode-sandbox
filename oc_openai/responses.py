@@ -571,7 +571,21 @@ class _SseParser:
         return None
 
 
-def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None, limits=None):
+def _verify_tls_close(response, limits):
+    sock = getattr(response, "_oc_sock", None)
+    if not isinstance(sock, ssl.SSLSocket):
+        raise ConnectionError("provider_network_error")
+    sock.settimeout(min(5.0, limits.io_timeout))
+    try:
+        trailing = sock.recv(1)
+    except OSError:
+        raise ConnectionError("provider_network_error") from None
+    if trailing:
+        raise ConnectionError("provider_stream_after_terminal")
+
+
+def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None, limits=None,
+            require_done=False, require_tls_close=False):
     active = _active_limits(limits)
     prefix = _resolve_stream_prefix(
         response, cancellation, evidence, inspect_media=inspect_media, observe_media=observe_media,
@@ -591,6 +605,10 @@ def _events(response, cancellation, evidence, *, inspect_media=False, observe_me
         raise ConnectionError("provider_stream_incomplete")
     if parser.completed is not None and parser.event_name is not None:
         raise ConnectionError("provider_stream_after_terminal")
+    if require_done and not evidence.done_seen:
+        raise ConnectionError("provider_stream_incomplete")
+    if require_tls_close:
+        _verify_tls_close(response, active)
     cancellation.check()
     if parser.completed is not None:
         yield parser.completed
@@ -651,6 +669,7 @@ class OpenAITransport:
                     sock.sendall(packet[sent:])
                 cancellation.check()
                 with contextlib.closing(_StrictResponse(sock, method=method, max_line=active.max_line)) as response:
+                    response._oc_sock = sock
                     response.begin()
                     _validate_http(response)
                     yield response
@@ -677,7 +696,7 @@ class OpenAITransport:
 
     @contextlib.contextmanager
     def responses(self, body, bearer, cancellation, dispatch, *, inspect_media=False, observe_media=None,
-                  limits=None):
+                  limits=None, require_done=False, require_tls_close=False):
         active = _active_limits(limits)
         encoded = encode_responses_body(body, max_json=active.max_json)
         evidence = None
@@ -697,6 +716,7 @@ class OpenAITransport:
                 yield _events(
                     response, cancellation, evidence, inspect_media=inspect_media,
                     observe_media=observe_media, limits=active,
+                    require_done=require_done, require_tls_close=require_tls_close,
                 )
         except ConnectionError as error:
             if evidence is not None and error.code in _STREAM_CODES:

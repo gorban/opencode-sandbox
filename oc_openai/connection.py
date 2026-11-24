@@ -1003,7 +1003,13 @@ class Connection:
                 lambda record: self._require_dispatchable(record, binding, access),
                 cancellation, authorization=authorization, before_write=before_write,
             )
-            options = {"inspect_media": True, "limits": limits} if inspect_media else {"limits": limits}
+            options = {
+                "limits": limits,
+                "require_done": True,
+                "require_tls_close": True,
+            }
+            if inspect_media:
+                options["inspect_media"] = True
             if observe_media is not None:
                 options["observe_media"] = observe_media
             with self._transport.responses(body, access, cancellation, dispatch, **options) as events:

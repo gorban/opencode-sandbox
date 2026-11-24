@@ -175,20 +175,34 @@ verify_openai_helper() {
 if [[ ${1:-} == openai ]]; then
   case $#:${2:-} in
     2:status|2:verify|2:disconnect|2:canary) ;;
-    3:canary)
-      [[ $3 == --synthetic-check ]] ||
-        die "usage: oc-sandbox openai canary [--model SLUG] [--synthetic-check]"
-      ;;
-    4:canary)
+    3:canary|4:canary|5:canary|6:canary|7:canary)
       LC_ALL=C
-      [[ $3 == --model && $4 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
-        die "usage: oc-sandbox openai canary [--model SLUG] [--synthetic-check]"
-      ;;
-    5:canary)
-      LC_ALL=C
-      { [[ $3 == --model && $4 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && $5 == --synthetic-check ]] ||
-        [[ $3 == --synthetic-check && $4 == --model && $5 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; } ||
-        die "usage: oc-sandbox openai canary [--model SLUG] [--synthetic-check]"
+      canary_args=("${@:3}")
+      c_idx=0 c_model=0 c_src=0 c_synth=0
+      while (( c_idx < ${#canary_args[@]} )); do
+        case ${canary_args[c_idx]} in
+          --synthetic-check)
+            (( !c_synth )) || die "usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]"
+            c_synth=1
+            (( c_idx += 1 ))
+            ;;
+          --model)
+            (( !c_model && c_idx + 1 < ${#canary_args[@]} )) &&
+              [[ ${canary_args[c_idx + 1]} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
+              die "usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]"
+            c_model=1
+            (( c_idx += 2 ))
+            ;;
+          --reviewed-source)
+            (( !c_src && c_idx + 1 < ${#canary_args[@]} )) &&
+              [[ ${canary_args[c_idx + 1]} =~ ^[0-9a-f]{64}$ ]] ||
+              die "usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]"
+            c_src=1
+            (( c_idx += 2 ))
+            ;;
+          *) die "usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]" ;;
+        esac
+      done
       ;;
     3:connect|3:select|4:connect)
       [[ $# != 4 || $4 == --no-browser ]] ||
@@ -197,13 +211,20 @@ if [[ ${1:-} == openai ]]; then
       [[ $3 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] ||
         die "OpenAI labels must be 1 to 32 ASCII letters, numbers, underscores or hyphens, starting with a letter or number"
       ;;
-    *) die "usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect|canary [--model SLUG] [--synthetic-check]}" ;;
+    *) die "usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect|canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]}" ;;
   esac
   helper=$SCRIPT_DIR/oc-openai.py
   verify_openai_helper "$helper"
+  openai_home=$HOME
+  if [[ ${2:-} == canary ]]; then
+    canary_entry=$(/usr/bin/getent passwd "$EUID") || die "could not resolve workstation home directory via getent"
+    IFS=: read -r _ _ canary_uid _ _ openai_home _ <<<"$canary_entry"
+    [[ $canary_uid == "$EUID" && -n $openai_home && $openai_home == /* ]] ||
+      die "could not resolve workstation home directory via getent"
+  fi
   cd -- "$SCRIPT_DIR"
   shift
-  exec /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/python3 -IB "$helper" "$@"
+  exec /usr/bin/env -i HOME="$openai_home" PATH=/usr/bin:/bin /usr/bin/python3 -IB "$helper" "$@"
 fi
 
 trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
