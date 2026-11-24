@@ -32,7 +32,8 @@ _RECOVERY_NAMES = (
 )
 _CANARY = "canary.json"
 _CANARY_RECOVERY = "canary-recovery.json"
-_CANARY_NAMES = (_CANARY, _CANARY_RECOVERY)
+_CANARY_E2E = "canary-e2e.json"
+_CANARY_NAMES = (_CANARY, _CANARY_RECOVERY, _CANARY_E2E)
 _LOCK = "exposure.lock"
 _RUN = re.compile(r"[0-9a-f]{32}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")

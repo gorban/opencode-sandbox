@@ -365,6 +365,11 @@ class SessionBroker:
                 continue
             offset += self._send_slice_fenced(peer, view[offset:])
 
+    @contextmanager
+    def _first_write_fence(self):
+        with self._lease.fence(), self._exposure_fence():
+            yield
+
     def _stream_responses_turn(self, peer: socket.socket, parsed, cancel: threading.Event,
                                state: dict) -> tuple[str, tuple[int, int, int] | None]:
         turn_deadline = min(time.monotonic() + TURN_TIMEOUT_SECONDS, self._lease.deadline_ns / 1e9)
@@ -382,7 +387,7 @@ class SessionBroker:
         with self._connection.interactive_responses(
             self._binding, parsed.body, before_write,
             authorization=self._authorization,
-            write_fence=self._exposure_fence,
+            write_fence=self._first_write_fence,
             limits=INTERACTIVE_STREAM_LIMITS, deadline=turn_deadline,
             cancelled=cancel, inspect_media=True, observe_media=lambda _kind: None,
         ) as upstream_events:

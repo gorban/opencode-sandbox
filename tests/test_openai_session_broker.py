@@ -1335,6 +1335,128 @@ class SessionBrokerTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertEqual(getattr(errors[0], "code", None), "session_revoked")
 
+    def test_reciprocal_r3_first_write_holds_lease_fence_revocation_wins_and_canary_e2e_blocks(self):
+        import pwd
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.exposure import binding_digest
+        from oc_openai.profile_backend import ProfileBackend
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+
+        def _forbid_host_browser(url):
+            raise AssertionError(f"unit test attempted to open host browser: {url}")
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        self.enterContext(patch("oc_openai.connection._open_host_browser", side_effect=_forbid_host_browser))
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+        shared_verifier = FixtureVerifier()
+        shared_transport = FixtureTransport()
+        writes = []
+        lease_lock_held = []
+
+        @contextlib.contextmanager
+        def checking_responses(body, access, cancellation, dispatch, **kwargs):
+            def write():
+                writes.append("write")
+                fd = os.open(self.lease.directory / "lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        lease_lock_held.append(False)
+                    except BlockingIOError:
+                        lease_lock_held.append(True)
+                finally:
+                    os.close(fd)
+                return "sent"
+
+            dispatch(write)
+            yield iter([
+                {"type": "response.created", "response": {"id": "resp_lf", "status": "in_progress"}},
+                {"type": "response.completed", "response": {"id": "resp_lf", "status": "completed", "output": []}},
+            ])
+
+        shared_transport.responses = checking_responses
+        backend = ProfileBackend(
+            scratch / "lease_fence_profiles",
+            connection=lambda d: Connection(
+                d, transport=shared_transport, verifier=shared_verifier,
+                browser=FixtureBrowser(), host_probe=lambda: host,
+            ),
+        )
+        backend.connect("personal")
+        label, epoch, conn, binding = backend.active_connection()
+        sock_lf = self.root / "provider_lf.sock"
+        broker = SessionBroker(
+            socket_path=sock_lf, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=conn, binding=binding, models=("gpt-6.2-sol",),
+            profile_label=label, usage_dir=backend._state,
+            policy=SessionPolicy(
+                exposure_dir=backend._state,
+                authorization=lambda: backend.selected_fence(label, epoch),
+                is_selected=lambda: backend.active_selection() == (label, epoch),
+            ),
+        )
+        broker.start()
+        self.addCleanup(broker.close)
+        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
+                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        req = (
+            f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+            f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode("ascii") + body
+
+        # 1. Active turn MUST hold the job grant lock across the first provider write.
+        raw_ok = _send_via_relay(sock_lf, self.lease, self.proof, req)
+        self.assertIn(b"response.completed", raw_ok)
+        self.assertEqual(lease_lock_held, [True])
+        self.assertEqual(len(writes), 1)
+
+        # 2. Unsettled canary-e2e.json MUST block first dispatch with 0 upstream writes.
+        e2e_path = backend._state / "canary-e2e.json"
+        e2e_path.write_text(json.dumps({
+            "run_id": "a" * 32, "binding": binding_digest("a" * 43, "b" * 43), "model": "gpt-6.2-sol",
+            "history_digest": "0" * 64, "max_input": 922_000, "max_output": 128_000,
+            "actual": None, "outcome": "unsettled", "delivered": False,
+        }), encoding="ascii")
+        e2e_path.chmod(0o600)
+        raw_e2e = _send_via_relay(sock_lf, self.lease, self.proof, req)
+        self.assertIn(b"403 Forbidden", raw_e2e)
+        self.assertEqual(len(writes), 1)
+        e2e_path.unlink()
+
+        # 3. Revocation winning the lease fence before first write records 0 additional upstream writes.
+        rev_win_root = self.root / "rev_win_root"
+        rev_win_root.mkdir(mode=0o700)
+        lease2, life_fd2 = _make_lease(rev_win_root)
+        self.addCleanup(lambda: os.close(life_fd2))
+        sock_rw = self.root / "provider_rw.sock"
+        broker_rw = SessionBroker(
+            socket_path=sock_rw, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=lease2, connection=conn, binding=binding, models=("gpt-6.2-sol",),
+            profile_label=label, usage_dir=backend._state,
+            policy=SessionPolicy(
+                exposure_dir=backend._state,
+                authorization=lambda: backend.selected_fence(label, epoch),
+                is_selected=lambda: backend.active_selection() == (label, epoch),
+            ),
+        )
+        broker_rw.start()
+        self.addCleanup(broker_rw.close)
+
+        results = []
+        with lease2.fence():
+            t = threading.Thread(target=lambda: results.append(_send_via_relay(sock_rw, lease2, self.proof, req)))
+            t.start()
+            time.sleep(0.1)
+            terminal = relay_mod.grant_record("inc_" + "a" * 32, 1, False)
+            (lease2.directory / "state").write_bytes(terminal)
+            (lease2.directory / "state").chmod(0o600)
+        t.join(5)
+        self.assertEqual(len(writes), 1, "revocation won the lease fence yet provider write still executed")
+        self.assertEqual(len(results), 1)
+        self.assertNotIn(b"response.completed", results[0])
+
 
 if __name__ == "__main__":
     unittest.main()
