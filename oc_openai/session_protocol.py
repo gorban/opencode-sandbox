@@ -907,18 +907,7 @@ class SessionStreamProjector:
         self._attach_content_fields(event, payload)
         return sse_frame(kind, payload), False
 
-    def _project_function_arg_event(self, kind: str, event: dict, payload: dict) -> tuple[bytes, bool]:
-        if not self._allowed_tools:
-            raise StreamAborted("unauthorized_tool_call")
-        idx = _valid_index(event.get("output_index"))
-        if idx in self._non_tool_indices:
-            raise StreamAborted("tool_call_mismatch")
-        payload["output_index"] = idx
-        key = "delta" if kind.endswith(_DELTA_SUFFIX) else "arguments"
-        value = event.get(key)
-        if type(value) is not str:
-            raise StreamAborted("invalid_function_call")
-        payload[key] = value
+    def _attach_arg_identity(self, event: dict, payload: dict) -> tuple[str | None, str | None, str | None]:
         call_id = event.get("call_id")
         if call_id is not None:
             if not _valid_id(call_id):
@@ -934,6 +923,21 @@ class SessionStreamProjector:
         mapped = self._mapped_event_item_id(event)
         if mapped is not None:
             payload["item_id"] = mapped
+        return call_id, mapped, name
+
+    def _project_function_arg_event(self, kind: str, event: dict, payload: dict) -> tuple[bytes, bool]:
+        if not self._allowed_tools:
+            raise StreamAborted("unauthorized_tool_call")
+        idx = _valid_index(event.get("output_index"))
+        if idx in self._non_tool_indices:
+            raise StreamAborted("tool_call_mismatch")
+        payload["output_index"] = idx
+        key = "delta" if kind.endswith(_DELTA_SUFFIX) else "arguments"
+        value = event.get(key)
+        if type(value) is not str:
+            raise StreamAborted("invalid_function_call")
+        payload[key] = value
+        call_id, mapped, name = self._attach_arg_identity(event, payload)
         if kind.endswith(_DELTA_SUFFIX):
             self._buffered_arg_deltas.setdefault(idx, []).append((call_id, mapped, name, value))
         else:

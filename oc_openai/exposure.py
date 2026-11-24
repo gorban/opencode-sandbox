@@ -426,36 +426,50 @@ class ExposureLedger:
         return _validate_recovery_record(name, parsed)
 
     @staticmethod
-    def _validate_hold_links(loaded_files: dict[str, tuple[bytes, object]]) -> None:
-        if "canary-recovery.json" in loaded_files:
-            canary = loaded_files.get("canary.json")
-            if canary is None:
-                raise ExposureError(_ERR_INVALID_RECORD)
-            canary_raw, canary_parsed = canary
-            _rec_raw, rec_parsed = loaded_files["canary-recovery.json"]
-            if (canary_parsed["outcome"] != "unsettled"
-                    or rec_parsed["prior_canary_run_id"] != canary_parsed["run_id"]
-                    or not hmac.compare_digest(rec_parsed["prior_canary_digest"], sha256(canary_raw).hexdigest())):
-                raise ExposureError(_ERR_INVALID_RECORD)
+    def _validate_canary_recovery_link(loaded_files: dict[str, tuple[bytes, object]]) -> None:
+        if "canary-recovery.json" not in loaded_files:
+            return
+        canary = loaded_files.get("canary.json")
+        if canary is None:
+            raise ExposureError(_ERR_INVALID_RECORD)
+        canary_raw, canary_parsed = canary
+        _rec_raw, rec_parsed = loaded_files["canary-recovery.json"]
+        if (canary_parsed["outcome"] != "unsettled"
+                or rec_parsed["prior_canary_run_id"] != canary_parsed["run_id"]
+                or rec_parsed["binding"] != canary_parsed["binding"]
+                or rec_parsed["model"] != canary_parsed["model"]
+                or rec_parsed["history_digest"] != canary_parsed["history_digest"]
+                or not hmac.compare_digest(rec_parsed["prior_canary_digest"], sha256(canary_raw).hexdigest())):
+            raise ExposureError(_ERR_INVALID_RECORD)
+
+    @staticmethod
+    def _validate_diagnostic_links(loaded_files: dict[str, tuple[bytes, object]]) -> None:
+        exp = loaded_files.get(_LEDGER)
         if _DIAGNOSTIC in loaded_files:
-            exp = loaded_files.get(_LEDGER)
             if exp is None or not exp[1]:
                 raise ExposureError(_ERR_INVALID_RECORD)
-            first_run = exp[1][0]["run"]
+            first_entry = exp[1][0]
             diag = loaded_files[_DIAGNOSTIC][1]
-            if diag["original_run"] != first_run or diag["run"] == first_run:
+            if (diag["original_run"] != first_entry["run"] or diag["run"] == first_entry["run"]
+                    or diag["binding"] != first_entry["binding"]):
                 raise ExposureError(_ERR_INVALID_RECORD)
         if _STREAM_DIAGNOSTIC in loaded_files:
-            exp = loaded_files.get(_LEDGER)
             diag = loaded_files.get(_DIAGNOSTIC)
             if exp is None or not exp[1] or diag is None:
                 raise ExposureError(_ERR_INVALID_RECORD)
-            first_run = exp[1][0]["run"]
+            first_entry = exp[1][0]
             prev_run = diag[1]["run"]
             stream = loaded_files[_STREAM_DIAGNOSTIC][1]
-            if (stream["original_run"] != first_run or stream["previous_diagnostic_run"] != prev_run
-                    or stream["run"] in (first_run, prev_run)):
+            if (stream["original_run"] != first_entry["run"]
+                    or stream["previous_diagnostic_run"] != prev_run
+                    or stream["binding"] != first_entry["binding"]
+                    or stream["run"] in (first_entry["run"], prev_run)):
                 raise ExposureError(_ERR_INVALID_RECORD)
+
+    @classmethod
+    def _validate_hold_links(cls, loaded_files: dict[str, tuple[bytes, object]]) -> None:
+        cls._validate_canary_recovery_link(loaded_files)
+        cls._validate_diagnostic_links(loaded_files)
 
     def _inspect_locked(self, directory) -> ExposureHold:
         names = (_LEDGER, _DIAGNOSTIC, _STREAM_DIAGNOSTIC, *_RECOVERY_NAMES, *_CANARY_NAMES)

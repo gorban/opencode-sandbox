@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -321,12 +322,11 @@ class SessionBroker:
         if self._is_selected is not None and not self._is_selected():
             raise StreamAborted("session_revoked")
 
-    def _send_fenced(self, peer: socket.socket, payload: bytes) -> None:
-        if not payload:
-            return
+    def _send_slice_fenced(self, peer: socket.socket, chunk: memoryview) -> int:
         authorize = self._authorization or nullcontext
         active_fence = getattr(self._connection, "active_fence", None)
         conn_fence = (lambda: active_fence(self._binding)) if active_fence is not None else nullcontext
+        prev_timeout = peer.gettimeout()
         try:
             with authorize(), conn_fence(), self._lease.fence():
                 if self._stopped.is_set() or self._revoked.is_set() or not self._lease.active():
@@ -335,9 +335,35 @@ class SessionBroker:
                     raise StreamAborted("session_revoked")
                 if active_fence is None:
                     self._connection.require_active(self._binding)
-                peer.sendall(payload)
+                peer.setblocking(False)
+                try:
+                    sent = peer.send(chunk)
+                except BlockingIOError:
+                    return 0
+                finally:
+                    peer.settimeout(prev_timeout)
+                if sent <= 0:
+                    raise OSError("peer closed during fenced send")
+                return sent
         except (ConnectionError, ProfileError, RouteUnavailable):
             raise StreamAborted("session_revoked") from None
+
+    def _send_fenced(self, peer: socket.socket, payload: bytes) -> None:
+        if not payload:
+            return
+        view = memoryview(payload)
+        offset = 0
+        deadline = time.monotonic() + 5.0
+        while offset < len(view):
+            if self._stopped.is_set() or self._revoked.is_set() or not self._lease.active():
+                raise StreamAborted("session_revoked")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("fenced peer write timed out")
+            _, writable, _ = select.select([], [peer], [], min(0.1, remaining))
+            if not writable:
+                continue
+            offset += self._send_slice_fenced(peer, view[offset:])
 
     def _stream_responses_turn(self, peer: socket.socket, parsed, cancel: threading.Event,
                                state: dict) -> tuple[str, tuple[int, int, int] | None]:

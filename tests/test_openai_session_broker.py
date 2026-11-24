@@ -1272,6 +1272,68 @@ class SessionBrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(ExposureError, "invalid_exposure_record"):
             ExposureLedger(diag_dir).inspect_hold()
 
+    def test_reciprocal_r2_stalled_peer_never_holds_locks_during_fenced_send(self):
+        auth_lock = threading.Lock()
+        auth_acquires = []
+
+        @contextlib.contextmanager
+        def tracked_auth():
+            auth_lock.acquire()
+            try:
+                yield
+            finally:
+                auth_lock.release()
+
+        broker = SessionBroker(
+            socket_path=self.sock_path, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=_FakeConn(lambda _b: iter(())), binding=object(),
+            models=("gpt-6.2-sol",), profile_label="personal", usage_dir=self.usage_dir,
+            policy=SessionPolicy(exposure_dir=self.usage_dir, authorization=tracked_auth),
+        )
+
+        # Create a stalled Unix socket pair whose peer stops reading so a large payload fills the kernel buffer.
+        writer, reader = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(writer.close)
+        self.addCleanup(reader.close)
+        with contextlib.suppress(OSError):
+            writer.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            reader.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        writer.settimeout(5)
+
+        errors = []
+        started = threading.Event()
+
+        def run_send():
+            started.set()
+            try:
+                broker._send_fenced(writer, b"x" * (1024 * 1024))
+            except Exception as exc:
+                errors.append(exc)
+
+        t = threading.Thread(target=run_send, daemon=True)
+        t.start()
+        self.assertTrue(started.wait(1))
+        time.sleep(0.05)
+
+        # Concurrent auth + lease lock acquisition (simulating disconnect / revocation) MUST NOT stall!
+        t0 = time.monotonic()
+        acquired = auth_lock.acquire(timeout=0.5)
+        elapsed = time.monotonic() - t0
+        if acquired:
+            auth_lock.release()
+            auth_acquires.append(elapsed)
+        self.assertTrue(acquired, "stalled peer held authorization lock across blocking socket send")
+        self.assertLess(elapsed, 0.5)
+
+        # Mid-write revocation must abort _send_fenced promptly instead of waiting 5 seconds.
+        t_rev = time.monotonic()
+        broker._revoked.set()
+        t.join(1.5)
+        self.assertFalse(t.is_alive(), "_send_fenced did not abort promptly on mid-write revocation")
+        self.assertLess(time.monotonic() - t_rev, 1.0)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(getattr(errors[0], "code", None), "session_revoked")
+
 
 if __name__ == "__main__":
     unittest.main()
