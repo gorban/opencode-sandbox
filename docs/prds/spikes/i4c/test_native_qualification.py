@@ -6,7 +6,7 @@ import runpy
 import subprocess
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 
 ROOT = Path(__file__).parent
@@ -24,10 +24,23 @@ class QualificationTest(unittest.TestCase):
                 stop("fixture.service", require_success=True)
 
     def test_unresolved_start_receipt_requires_retention(self):
-        process = Mock()
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.poll.return_value = None
         process.wait.side_effect = subprocess.TimeoutExpired([], 5)
-        with self.assertRaises(HOST["RetirementUnknown"]):
-            HOST["wait_for_launch_receipt"](process)
+        verify = HOST["verify_interruption"]
+        stop = Mock()
+        with TemporaryDirectory() as directory, patch.dict(verify.__globals__, stop=stop), patch(
+            "subprocess.Popen", return_value=process,
+        ):
+            work = Path(directory)
+            (work / "cancel-ready").touch()
+            with self.assertRaises(HOST["RetirementUnknown"]):
+                verify("fixture.service", [], work)
+        stop.assert_called_once_with("fixture.service", require_success=True)
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_args_list, [call(timeout=5), call(timeout=2)])
+        process.__exit__.assert_not_called()
 
     def test_only_exact_native_authentication_error_confirms_signed_out(self):
         check = NATIVE["require_authentication"]

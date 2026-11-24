@@ -1,10 +1,12 @@
 """Exercise Antigravity's offline native dependencies in a rootless host namespace."""
 
 import argparse
+from contextlib import suppress
 import hashlib
 import os
 from pathlib import Path
 import pwd
+import runpy
 import secrets
 import shutil
 import signal
@@ -13,6 +15,7 @@ import stat
 import subprocess
 import sys
 from tempfile import mkdtemp
+from threading import Thread
 import time
 
 
@@ -26,6 +29,7 @@ HOST = "/usr/bin/host-spawn"
 SYSTEMCTL = "/usr/bin/systemctl"
 NATIVE = "/run/oc-native"
 SCRATCH = "/run/oc-proof"
+FORBIDDEN = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
 
 class QualificationError(RuntimeError):
@@ -86,7 +90,8 @@ def seed(root, agy, keyring):
     stage(agy, programs / "agy")
     for name in PINS.keys() - {"agy"}:
         stage(keyring / name, programs / name)
-    shutil.copyfile(Path(__file__).with_name("native-fixture.py"), programs / "native-fixture.py")
+    for name in ("native-fixture.py", "native-egress.py"):
+        shutil.copyfile(Path(__file__).with_name(name), programs / name)
     uid, gid = os.getuid(), os.getgid()
     (config / "passwd").write_text(f"root:x:0:0:root:/root:/bin/false\nfixture:x:{uid}:{gid}:fixture:{SCRATCH}:/bin/false\n")
     (config / "group").write_text(f"root:x:0:\nfixture:x:{gid}:\n")
@@ -95,7 +100,12 @@ def seed(root, agy, keyring):
     return programs, config, work, outside
 
 
-def command(unit, programs, config, work, outside, port, interruption):
+def command(unit, programs, config, work, outside, port, interruption, *, egress=None):
+    mounts = [] if egress is None else ["--ro-bind", str(egress), "/run/oc-egress"]
+    if egress is None:
+        script = [f"{NATIVE}/native-fixture.py", str(outside), str(port), "cancel" if interruption else "complete"]
+    else:
+        script = [f"{NATIVE}/native-egress.py"]
     return ["/usr/bin/systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect",
             f"--unit={unit}", "--property=KillMode=control-group", "--property=RuntimeMaxSec=25s",
             "--property=TimeoutStopSec=3s", "--property=NoNewPrivileges=yes", "--expand-environment=no", "--",
@@ -104,8 +114,7 @@ def command(unit, programs, config, work, outside, port, interruption):
             "--setenv", "LANG", "C.UTF-8", "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
             "--symlink", "usr/lib64", "/lib64", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
             "--ro-bind", str(config), "/etc", "--ro-bind", str(programs), NATIVE, "--bind", str(work), SCRATCH,
-            "--chdir", SCRATCH, "--", "/usr/bin/python3", "-IBS", f"{NATIVE}/native-fixture.py", str(outside),
-            str(port), "cancel" if interruption else "complete"]
+            *mounts, "--chdir", SCRATCH, "--", "/usr/bin/python3", "-IBS", *script]
 
 
 def stop(unit, *, require_success=False):
@@ -121,46 +130,94 @@ def stop(unit, *, require_success=False):
         raise QualificationError("the live service stop was not confirmed")
 
 
-def verify_completion(unit, launch, work):
+def run_to_completion(unit, launch):
     try:
         verify = host(launch, timeout=33)
     except (KeyboardInterrupt, OSError, subprocess.SubprocessError) as error:
         raise RetirementUnknown("the launch receipt was interrupted") from error
     finally:
         stop(unit)
+    return verify
+
+
+def verify_completion(unit, launch, work):
+    verify = run_to_completion(unit, launch)
     if verify.stdout.strip() != b"ACP_SIGNED_OUT" or verify.returncode or any(work.iterdir()):
         raise QualificationError("native fixture did not confirm its expected result and cleanup")
 
 
 def verify_interruption(unit, launch, work):
-    with subprocess.Popen([HOST, "--no-pty", *launch], cwd="/", env=workstation_env(os.getuid()),
-                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as service:
-        deadline = time.monotonic() + 12
-        observed = False
+    try:
+        service = subprocess.Popen([HOST, "--no-pty", *launch], cwd="/", env=workstation_env(os.getuid()),
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (KeyboardInterrupt, OSError, subprocess.SubprocessError) as error:
+        stop(unit)
+        raise RetirementUnknown("the host launch did not return a process receipt") from error
+    deadline = time.monotonic() + 12
+    observed = False
+    try:
+        while service.poll() is None and time.monotonic() < deadline:
+            if (work / "cancel-ready").is_file():
+                observed = True
+                break
+            time.sleep(.05)
+        else:
+            raise QualificationError("could not observe the live private keyring before cancellation")
+    except KeyboardInterrupt as error:
+        if not observed:
+            raise RetirementUnknown("the launch receipt was interrupted") from error
+        raise
+    finally:
         try:
-            while service.poll() is None and time.monotonic() < deadline:
-                if (work / "cancel-ready").is_file():
-                    observed = True
-                    break
-                time.sleep(.05)
-            else:
-                raise QualificationError("could not observe the live private keyring before cancellation")
-        except KeyboardInterrupt as error:
-            if not observed:
-                raise RetirementUnknown("the launch receipt was interrupted") from error
-            raise
+            stop(unit, require_success=observed)
         finally:
-            try:
-                stop(unit, require_success=observed)
-            finally:
-                wait_for_launch_receipt(service)
+            wait_for_launch_receipt(service)
 
 
 def wait_for_launch_receipt(service):
     try:
         service.wait(timeout=5)
     except (KeyboardInterrupt, OSError, subprocess.SubprocessError) as error:
+        with suppress(KeyboardInterrupt, OSError):
+            service.kill()
+        with suppress(KeyboardInterrupt, OSError, subprocess.SubprocessError):
+            service.wait(timeout=2)
         raise RetirementUnknown("the host launch receipt did not resolve") from error
+
+
+def observe_once(listener, policy, receipts):
+    try:
+        peer, _ = listener.accept()
+        with peer:
+            host_name = policy(peer)
+            peer.sendall(FORBIDDEN)
+            receipts.append(host_name)
+    except (OSError, ValueError):
+        return
+
+
+def prove_native_connect(root, programs, config):
+    policy = runpy.run_path(str(Path(__file__).with_name("egress-policy.py")))
+    server, home = root / "egress", root / "egress-home"
+    server.mkdir(mode=0o700)
+    home.mkdir(mode=0o700)
+    address = server / "observe.sock"
+    receipts = []
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(str(address))
+        address.chmod(0o600)
+        listener.listen(1)
+        listener.settimeout(16)
+        observer = Thread(target=observe_once, args=(listener, policy["read_connect"], receipts), daemon=True)
+        observer.start()
+        unit = f"oc-agy-egress-{secrets.token_hex(8)}.service"
+        launch = command(unit, programs, config, home, None, None, False, egress=server)
+        verify = run_to_completion(unit, launch)
+        observer.join(1)
+        if observer.is_alive() or verify.returncode or verify.stdout.strip() != b"NATIVE_CONNECT_DENIED":
+            raise QualificationError("native CONNECT fixture did not finish")
+        if receipts != [policy["TOKEN_HOST"]]:
+            raise QualificationError("workstation policy receipt did not match the measured OAuth host")
 
 
 def run(root, agy, keyring):
@@ -177,6 +234,7 @@ def run(root, agy, keyring):
             unit = f"oc-agy-offline-{secrets.token_hex(8)}.service"
             launch = command(unit, programs, config, work, outside, listener.getsockname()[1], interruption)
             verify(unit, launch, work)
+    prove_native_connect(root, programs, config)
 
 
 def interrupt(_number, _frame):
@@ -210,6 +268,7 @@ def main():
         if directory is not None and not retain:
             shutil.rmtree(directory)
     print("Rootless isolation, synthetic keyring restart, signed-out ACP and cancellation passed.")
+    print("Native CONNECT matched the isolated workstation policy. Forwarding was denied.")
     return 0
 
 

@@ -22,9 +22,10 @@ workstation file and socket. Enrollment and the brokered native route still need
 
 The [offline rootless qualification](spikes/i4c/) reproduced keyring restart,
 explicit signed-out ACP v1, workstation file and socket denial, and cancellation
-on the pinned `agy` 1.5.15 build. A separate private-loopback observation with a
-synthetic code recorded a native `CONNECT oauth2.googleapis.com:443` and denied
-it before any upstream exchange. Hosted egress and sign-in remain open.
+on the pinned `agy` 1.5.15 build. The same probe also sent a native
+`CONNECT oauth2.googleapis.com:443` from private loopback to the workstation
+policy over a dedicated Unix socket. The fixture denied forwarding before any
+upstream exchange. Forwarding qualification and sign-in remain open.
 
 - [ ] Qualify the pinned `agy` binary, rootless private provider home and keyring, bounded ACP
   channel, and separately scoped enrollment and execution egress. Verify the provider cannot

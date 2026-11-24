@@ -21,6 +21,13 @@ then calls only ACP `initialize` and `session/new` and expects an explicit
 authentication-required reply. A second run interrupts the live private
 keyring and verifies that its exact systemd unit retired.
 
+The final phase runs the pinned native terminal-login client on a synthetic
+PTY. Its fake code produces a CONNECT request from private loopback through
+the dedicated workstation Unix socket. The fixture checks the exact
+`oauth2.googleapis.com:443` request and returns a denial without forwarding it.
+The policy tests also reject unexpected hosts, malformed framing and non-public
+DNS answers. Run them with `python3 -IB -m unittest discover -s docs/prds/spikes/i4c`.
+
 The proof creates no workstation Secret Service item or real provider session.
 When host retirement is uncertain, its output identifies the retained
 synthetic scratch directory. The next qualification covers native client
