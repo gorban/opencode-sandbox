@@ -54,6 +54,33 @@ routing, exposure or revocation goes through both reviews before use by another 
    revocation, wrong incarnation and provider failure. Prove the model cannot use host tools or
    read the workstation login. Keep that provider text-only until this gate clears.
 
+## Opt-in live e2e pytest milestones
+
+Keep temporary canary and smoke harnesses out of the public `oc-sandbox` CLI. Automate each
+provider's live `"Reply with exactly: ok"` check as an opt-in pytest under `tests/e2e/live/`
+(skipped by default in CI unless its explicit opt-in flag is supplied), running in an isolated
+verified interpreter that leaves historical exposure receipts untouched, enforces source-trust and
+graceful `SIGINT` teardown, and asserts exact `ok` delivery plus verified container/scratch cleanup.
+
+- [ ] **OpenAI zero-tool canary e2e** (`tests/e2e/live/test_openai_canary_e2e.py`,
+  `--run-openai-canary-live`) — opt-in zero-tool OpenCode 2.3.0 turn against the active OpenAI
+  subscription (`Reply with exactly: ok`). Candidate verified live on PR #71 (`be81a605`); pending
+  serialized merge after PR #69 and final human review.
+- [ ] **OpenAI interactive shell e2e** (`tests/e2e/live/test_openai_shell_e2e.py`,
+  `--run-openai-shell-live`) — opt-in automated test driving the normal `oc-sandbox` interactive
+  OpenAI OpenCode launch path, sending `Reply with exactly: ok`, and verifying exact `ok` delivery,
+  zero broker errors, and clean teardown.
+- [ ] **Claude live e2e** (`tests/e2e/live/test_claude_shell_e2e.py`, `--run-claude-shell-live`) —
+  opt-in automated test replacing ad-hoc `/var/tmp/...` probe commands once the exact host-isolated
+  Claude launch topology clears qualification and security review (remains open while PR #72's
+  project launcher is synthetic).
+- [ ] **Combined multi-provider default + `--mini` e2e** — once both OpenAI and Claude qualify on
+  `main` under [I4d](prd_i4d.md#default-multi-provider-launch-and---mini-ui-mode), opt-in e2e
+  verification that a default `oc-sandbox` launch (no `--provider` flag, and optional `--mini`)
+  exposes models from all enabled qualified providers together and completes
+  `Reply with exactly: ok` on each explicitly selected provider with strict per-instance credential
+  and billing isolation.
+
 - [ ] For each candidate, publish the exact branch/commit, provider and placement, the scope
   proven, and an attended test step when ready. Keep model use opt-in and human review open
   until the maintainer explicitly records it.

@@ -42,10 +42,12 @@ source may set each field and which routes and placements are allowed. Only trus
 TOML can create an instance or change `enabled`, `auth_mode`, `credential_ref`, its billing
 policy or `provider_defaults.<kind>`. A dedicated operator setup action can persist those
 changes after approval.
-CLI or environment settings may override `cli_path` for an existing instance. `--provider`
-selects an already enabled instance. Provider declarations, instance profiles and agent requests
-cannot use precedence to elevate authority. Use only trusted startup inputs for a persistent
-supervisor.
+CLI or environment settings may override `cli_path` for an existing instance. A default
+`oc-sandbox` launch catalogs all enabled, qualified provider instances for the selected placement;
+an optional `--provider` restricts one launch to a single already enabled instance. `--mini`
+selects OpenCode Mini as an opt-in UI mode (defaulting to full OpenCode when omitted). Provider
+declarations, instance profiles and agent requests cannot use precedence to elevate authority.
+Use only trusted startup inputs for a persistent supervisor.
 
 ## Named instances and credentials
 
@@ -125,6 +127,33 @@ trusted working directory. Standalone invocations may use trusted environment ov
 A persistent supervisor takes them only from its operator-owned startup environment or
 configuration, never from a client request.
 
+## Default multi-provider launch and `--mini` UI mode
+
+A normal `oc-sandbox` launch (without `--provider`) loads **all enabled, qualified provider
+instances** declared in trusted operator TOML for the selected placement, projecting each admitted
+instance under its stable provider label into OpenCode's read-only configuration behind isolated
+host brokers and relays. The operator can select and switch between models from multiple configured
+providers (for example, both OpenAI and Claude once each adapter and placement is qualified) in the
+same OpenCode session without passing `--provider`.
+
+- **Strict per-instance isolation:** Cataloging multiple enabled instances never pools accounts,
+  merges quotas, shares tokens across relays, or enables automatic fallback between providers or
+  paid API keys. Every dispatch, retry, and continuation stays bound to the explicitly chosen
+  provider instance, auth mode, credential generation, billing policy, selection epoch, and
+  exposure checks.
+- **Placement qualification gate:** Unqualified or disabled instances stay excluded from the
+  generated OpenCode catalog (and report a typed readiness reason on explicit selection). A live
+  combined OpenAI + Claude launch remains gated until the exact Claude host-isolated launch
+  topology clears qualification and review.
+- **Optional narrowing:** `--provider KIND[/INSTANCE]` remains an optional explicit restriction for
+  a single launch when the operator wants to limit a session to one enabled instance. It takes
+  precedence over a profile's provider list for that launch and leaves persisted configuration and
+  selections unchanged.
+- **Opt-in OpenCode Mini (`--mini`):** `oc-sandbox` accepts `--mini` to launch OpenCode Mini
+  instead of full OpenCode, defaulting to full OpenCode when omitted. Both full and `--mini`
+  launches enforce the identical host broker, read-only config, SELinux/container isolation,
+  exposure hold, and worker credential isolation invariants.
+
 ## Connection and first-use flow
 
 The proposed CLI shape is `oc-sandbox <openai|claude|google> <connect|status|verify|select|disconnect>`.
@@ -135,12 +164,12 @@ routing for the selected instance first and preserves unrelated native sessions.
 adapter qualifies. Claude can guide the operator through native sign-in and verification while
 its separate worker subscription route remains unqualified.
 
-Use a single `--provider KIND[/INSTANCE]` on launch commands for an explicit route choice, subject
-to workstation policy. It takes precedence over a profile's provider request for that launch and
-leaves persisted selection unchanged. Refuse incompatible models or placements
-with a typed reason. Use one typed workstation operation for CLI and orchestrator connection.
-The trusted launcher preflights the orchestrator's own model without an LLM. In an interactive
-session it can show the reason, offer the attended action and repeat preflight after sign-in.
+On a default launch, the trusted launcher preflights every enabled, qualified provider instance for
+the selected placement without an LLM, excluding disabled or unqualified routes rather than failing
+silently into paid fallback. When `--provider KIND[/INSTANCE]` is passed explicitly, refuse
+incompatible models or placements with a typed reason. Use one typed workstation operation for CLI
+and orchestrator connection. In an interactive session it can show the reason, offer the attended
+action and repeat preflight after sign-in.
 For a running orchestrator selecting a worker model, the restricted interface returns a typed
 readiness result and may request that the workstation offer the connection action. It carries
 provider and local label, without native commands, executable paths or credentials. The
@@ -191,5 +220,14 @@ registration binding and exposure holds.
   epoch must cause refusal and zero inference.
 - [ ] Reuse the CLI workstation action in the orchestrator. Keep browser/terminal interaction and
   provider state out of model transcripts, worker config and the orchestrator's generic tools.
+- [ ] Verify default multi-provider launch catalogs all enabled, qualified provider instances for
+  the selected placement (with no `--provider` flag), excludes disabled or unqualified instances,
+  preserves per-instance billing/credential/revocation isolation with zero cross-provider fallback,
+  and still honors optional `--provider KIND[/INSTANCE]` narrowing for a single launch.
+- [ ] Verify `--mini` launches OpenCode Mini while default (no `--mini`) launches full OpenCode,
+  with identical read-only config, broker isolation, exposure hold, and credential-separation
+  invariants in both modes.
+- [ ] Link and qualify the per-provider and combined opt-in live e2e pytest milestones in
+  [I4f](prd_i4f.md#opt-in-live-e2e-pytest-milestones).
 - [ ] Review every live adapter and placement independently under [I3a](prd_i3a.md),
   [I4](prd_i4.md), and the [implementation review gates](README.md#implementation-review-gates).
