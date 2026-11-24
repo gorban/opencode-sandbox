@@ -47,6 +47,15 @@ class EgressPolicyTest(unittest.TestCase):
             with self.subTest(address=forbidden), self.assertRaises(Refused):
                 POLICY["resolve_token_endpoint"](resolve=lambda *_a, **_k: rows(public, forbidden))
 
+    def test_token_and_userinfo_each_require_the_current_destination(self):
+        userinfo = REQUEST.replace(AUTHORITY, b"www.googleapis.com:443") + b"\r\n"
+        self.assertEqual(POLICY["enrollment_authority"](userinfo, hostname=POLICY["USERINFO_HOST"]),
+                         POLICY["USERINFO_HOST"])
+        with self.assertRaises(Refused):
+            POLICY["enrollment_authority"](userinfo)
+        with self.assertRaises(Refused):
+            POLICY["enrollment_authority"](REQUEST + b"\r\n", hostname=POLICY["USERINFO_HOST"])
+
 
 if __name__ == "__main__":
     unittest.main()

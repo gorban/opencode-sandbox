@@ -67,6 +67,17 @@ class TLSAdmissionTest(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             self.read(b"", timeout=.01)
 
+    def test_userinfo_tls_cannot_be_used_for_token_phase(self):
+        name = "www.googleapis.com"
+        hello = client_hello(name)
+        receiver, writer = socket.socketpair()
+        with receiver, writer:
+            writer.sendall(hello)
+            self.assertEqual(TLS["read_client_hello"](receiver, deadline=time.monotonic() + 1,
+                                                     hostname=name.encode()), hello)
+        with self.assertRaises(TLS["Refused"]):
+            self.read(hello)
+
     def test_rejected_hello_never_reaches_fake_peer(self):
         receiver, writer = socket.socketpair()
         listener = Mock()

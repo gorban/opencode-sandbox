@@ -73,10 +73,12 @@ def observe(master, native, received):
         raise RuntimeError("expected offline native OAuth exchange was not observed")
 
 
-def run_login(port, observed, *, tunnel=False):
+def run_login(port, observed, *, tunnel=False, private_env=None):
     proxy = f"http://127.0.0.1:{port}"
     env = {"HOME": ROOT, "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "TERM": "dumb",
            **{key: proxy for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")}}
+    if private_env is not None:
+        env.update(private_env)
     if tunnel:
         env["SSL_CERT_FILE"] = "/run/oc-native/synthetic-ca.pem"
         env["NODE_EXTRA_CA_CERTS"] = env["SSL_CERT_FILE"]

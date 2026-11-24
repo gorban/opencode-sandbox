@@ -90,7 +90,7 @@ def seed(root, agy, keyring):
     stage(agy, programs / "agy")
     for name in PINS.keys() - {"agy"}:
         stage(keyring / name, programs / name)
-    for name in ("native-fixture.py", "native-egress.py", "tls-admission.py"):
+    for name in ("native-fixture.py", "native-egress.py", "native-enrollment.py", "tls-admission.py"):
         shutil.copyfile(Path(__file__).with_name(name), programs / name)
     uid, gid = os.getuid(), os.getgid()
     (config / "passwd").write_text(f"root:x:0:0:root:/root:/bin/false\nfixture:x:{uid}:{gid}:fixture:{SCRATCH}:/bin/false\n")
@@ -100,9 +100,11 @@ def seed(root, agy, keyring):
     return programs, config, work, outside
 
 
-def command(unit, programs, config, work, outside, port, interruption, *, egress=None, fake_tls=False):
+def command(unit, programs, config, work, outside, port, interruption, *, egress=None, fake_tls=False, enroll=False):
     mounts = [] if egress is None else ["--ro-bind", str(egress), "/run/oc-egress"]
-    if egress is None:
+    if enroll:
+        script = [f"{NATIVE}/native-enrollment.py"]
+    elif egress is None:
         script = [f"{NATIVE}/native-fixture.py", str(outside), str(port), "cancel" if interruption else "complete"]
     else:
         script = [f"{NATIVE}/native-egress.py"]
@@ -245,6 +247,23 @@ def prove_native_tls(root, programs, config):
         raise QualificationError(f"native client certificate test did not confirm {failed_case}")
 
 
+def prove_native_enrollment(root, programs, config):
+    fixture = runpy.run_path(str(Path(__file__).with_name("enrollment-fixture.py")))
+
+    def launch(profile, egress, *, cancel):
+        unit = f"oc-agy-fake-enroll-{secrets.token_hex(8)}.service"
+        command_line = command(unit, programs, config, profile, None, None, False, egress=egress, enroll=True)
+        if cancel:
+            verify_interruption(unit, command_line, profile)
+            return None
+        return run_to_completion(unit, command_line)
+
+    state = fixture["qualify"](root, programs, launch=launch, run_host=host)
+    if state not in ("ready", "pending"):
+        raise QualificationError(state)
+    return state
+
+
 def run(root, agy, keyring):
     programs, config, work, outside = seed(root, agy, keyring)
     remote_net = host(["/usr/bin/readlink", "/proc/self/ns/net"])
@@ -261,6 +280,7 @@ def run(root, agy, keyring):
             verify(unit, launch, work)
     prove_native_connect(root, programs, config)
     prove_native_tls(root, programs, config)
+    return prove_native_enrollment(root, programs, config)
 
 
 def interrupt(_number, _frame):
@@ -277,7 +297,7 @@ def main():
     retain = False
     try:
         directory = Path(mkdtemp(prefix="oc-agy-native-", dir=private_shared_runtime()))
-        run(directory, args.agy, args.keyring_bundle)
+        enrollment_state = run(directory, args.agy, args.keyring_bundle)
     except RetirementUnknown as error:
         retain = True
         print(f"Antigravity qualification: {error}. Retained synthetic scratch {directory}", file=sys.stderr)
@@ -296,6 +316,7 @@ def main():
     print("Rootless isolation, synthetic keyring restart, signed-out ACP and cancellation passed.")
     print("Native CONNECT matched the isolated workstation policy. Forwarding was denied.")
     print("Pinned agy sent a synthetic token POST, rejected both invalid certificates and retired an open tunnel.")
+    print(f"Both fake enrollment peers matched. Cancellation preserved pending. Fresh ACP state: {enrollment_state}.")
     return 0
 
 

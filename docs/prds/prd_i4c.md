@@ -32,6 +32,14 @@ rejected the wrong hostname and untrusted certificate, and closed an open
 tunnel on cancellation. Real destination-limited forwarding, persistent
 enrollment and sign-in remain open.
 
+The synthetic enrollment also confirmed native `POST /token` on
+`oauth2.googleapis.com` followed by `GET /oauth2/v2/userinfo` on
+`www.googleapis.com`. A fresh namespace reopened the private keyring and made
+an ACP session after both fake exchanges. Cancellation after synthetic token
+issuance kept the registration pending and left the second fake peer unused.
+Attended approval must describe access to both HTTPS destinations. An opaque
+TLS tunnel cannot restrict the HTTP path on either one.
+
 - [ ] Qualify the pinned `agy` binary, rootless private provider home and keyring, bounded ACP
   channel, and separately scoped enrollment and execution egress. Verify the provider cannot
   access ordinary workstation credentials. Verify that the worker and relay get only the approved

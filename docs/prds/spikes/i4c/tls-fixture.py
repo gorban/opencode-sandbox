@@ -56,7 +56,7 @@ class CancellationEvidence:
             return "cancelled_open_peer" if self.stop_at is not None and self.stop_at < when else "premature_peer_close"
 
 
-def create_certificates(directory, run_host):
+def create_certificates(directory, run_host, *, userinfo=False):
     def openssl(*args):
         command = ["/usr/bin/env", "--chdir", os.fspath(directory), "/usr/bin/openssl", *args]
         if run_host(command, timeout=5).returncode:
@@ -66,7 +66,10 @@ def create_certificates(directory, run_host):
             "-noenc", "-days", "1", "-subj", "/CN=Synthetic Antigravity Test CA",
             "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign",
             "-keyout", "ca.key", "-out", "ca.pem")
-    for label, host in (("match", HOST), ("wrong-name", "other.fixture.invalid")):
+    slots = [("match", HOST), ("wrong-name", "other.fixture.invalid")]
+    if userinfo:
+        slots.append(("userinfo", POLICY["USERINFO_HOST"]))
+    for label, host in slots:
         openssl("req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-noenc",
                 "-subj", f"/CN={host}", "-addext", f"subjectAltName=DNS:{host}",
                 "-keyout", f"{label}.key", "-out", f"{label}.csr")
@@ -110,12 +113,12 @@ def fake_oauth(peer, cancellation):
     return "synthetic_token_post"
 
 
-def record_outcome(sock, context, evidence, cancellation):
+def record_outcome(sock, context, evidence, respond):
     with sock:
         sock.settimeout(5)
         try:
             with context.wrap_socket(sock, server_side=True) as peer:
-                evidence.append(fake_oauth(peer, cancellation))
+                evidence.append(respond(peer))
         except ssl.SSLError as error:
             if error.reason in {"SSLV3_ALERT_BAD_CERTIFICATE", "TLSV1_ALERT_UNKNOWN_CA",
                                 "SSLV3_ALERT_CERTIFICATE_UNKNOWN"}:
@@ -124,19 +127,22 @@ def record_outcome(sock, context, evidence, cancellation):
             return
 
 
-def serve_once(listener, context, evidence, cancellation=None):
+def serve_once(listener, context, evidence, cancellation=None, *, hostname=HOST, respond=None):
     try:
         client, _ = listener.accept()
         with client:
             if cancellation is not None:
                 cancellation.bridge = client
             deadline = time.monotonic() + 7
-            POLICY["read_connect"](client)
+            POLICY["read_connect"](client, hostname=hostname)
             client.sendall(TLS["ESTABLISHED"])
-            validated_hello = TLS["read_client_hello"](client, deadline=deadline)
+            validated_hello = TLS["read_client_hello"](client, deadline=deadline, hostname=hostname.encode("ascii"))
             broker, fake = socket.socketpair()
             with broker, fake:
-                server = Thread(target=record_outcome, args=(fake, context, evidence, cancellation), daemon=True)
+                if respond is None:
+                    def respond(peer):
+                        return fake_oauth(peer, cancellation)
+                server = Thread(target=record_outcome, args=(fake, context, evidence, respond), daemon=True)
                 server.start()
                 try:
                     broker.sendall(validated_hello)

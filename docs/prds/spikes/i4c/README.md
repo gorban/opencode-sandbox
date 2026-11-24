@@ -37,6 +37,16 @@ the namespace. One more run cancels the live native service after the fake
 peer receives the synthetic POST and verifies that the open tunnel closes.
 The fixture opens no upstream network connection.
 
+The final phase stages a pending enrollment record outside the provider
+namespace. Pinned `agy` exchanges the synthetic code at the first fake peer,
+then presents the fixture-issued bearer to the second fake peer for userinfo.
+A fresh provider process reopens the same isolated keyring and profile with
+the enrollment socket unavailable. Only successful ACP initialization and
+session creation can publish readiness for that pending generation.
+An interrupted run issues the fake token, admits no userinfo request and
+keeps the generation pending until it is explicitly abandoned. Late
+publication then fails.
+
 The proof creates no workstation Secret Service item or real provider session.
 When host retirement is uncertain, its output identifies the retained
 synthetic scratch directory. The next qualification covers native client

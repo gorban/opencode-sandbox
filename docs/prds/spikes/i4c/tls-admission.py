@@ -36,14 +36,14 @@ class Wire:
         return not self.data
 
 
-def one_host(data):
+def one_host(data, required):
     encoded = Wire(data)
     hosts = Wire(encoded.vector(2))
-    if not encoded.done() or hosts.number(1) != 0 or hosts.vector(2) != NAME or not hosts.done():
+    if not encoded.done() or hosts.number(1) != 0 or hosts.vector(2) != required or not hosts.done():
         raise Refused()
 
 
-def require_server_name(hello):
+def require_server_name(hello, *, hostname=NAME):
     payload = Wire(hello)
     payload.take(34)
     payload.vector(1)  # Session ID
@@ -60,7 +60,7 @@ def require_server_name(hello):
             raise Refused()
         seen.add(kind)
         if kind == 0:
-            one_host(value)
+            one_host(value, hostname)
     if 0 not in seen:
         raise Refused()
 
@@ -83,7 +83,7 @@ def read_exact(peer, count, deadline):
     return data
 
 
-def read_client_hello(peer, *, deadline):
+def read_client_hello(peer, *, deadline, hostname=NAME):
     wire = bytearray()
     handshake = bytearray()
     for _ in range(8):
@@ -103,7 +103,7 @@ def read_client_hello(peer, *, deadline):
         if handshake[0] != 1 or expected > HELLO_LIMIT or len(handshake) > expected:
             raise Refused()
         if len(handshake) == expected:
-            require_server_name(handshake[4:])
+            require_server_name(handshake[4:], hostname=hostname)
             return bytes(wire)
     raise Refused()
 

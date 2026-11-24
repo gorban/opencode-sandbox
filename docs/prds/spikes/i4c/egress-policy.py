@@ -7,9 +7,9 @@ import time
 
 
 TOKEN_HOST = "oauth2.googleapis.com"
+USERINFO_HOST = "www.googleapis.com"
+ENROLLMENT_HOSTS = frozenset((TOKEN_HOST, USERINFO_HOST))
 PORT = 443
-AUTHORITY = b"oauth2.googleapis.com:443"
-REQUEST = b"CONNECT " + AUTHORITY + b" HTTP/1.1"
 DELIMITER = b"\r\n\r\n"
 HEADER_LIMIT = 8192
 
@@ -18,11 +18,14 @@ class Refused(ValueError):
     """The tunnel request is outside the measured enrollment phase."""
 
 
-def enrollment_authority(header):
+def enrollment_authority(header, *, hostname=TOKEN_HOST):
+    if hostname not in ENROLLMENT_HOSTS:
+        raise Refused()
+    authority = f"{hostname}:{PORT}".encode("ascii")
     if len(header) > HEADER_LIMIT or not header.endswith(DELIMITER):
         raise Refused()
     request, *lines = header[:-len(DELIMITER)].split(b"\r\n")
-    if request != REQUEST:
+    if request != b"CONNECT " + authority + b" HTTP/1.1":
         raise Refused()
     fields = {}
     for line in lines:
@@ -33,12 +36,12 @@ def enrollment_authority(header):
         if not re.fullmatch(rb"[ -~]{1,512}", value) or value != value.strip():
             raise Refused()
         fields[name] = value
-    if fields.get(b"host") != AUTHORITY:
+    if fields.get(b"host") != authority:
         raise Refused()
-    return TOKEN_HOST
+    return hostname
 
 
-def read_connect(client, *, timeout=2):
+def read_connect(client, *, timeout=2, hostname=TOKEN_HOST):
     deadline = time.monotonic() + timeout
     data = bytearray()
     while DELIMITER not in data:
@@ -50,7 +53,7 @@ def read_connect(client, *, timeout=2):
         if not chunk:
             raise Refused()
         data.extend(chunk)
-    return enrollment_authority(bytes(data))
+    return enrollment_authority(bytes(data), hostname=hostname)
 
 
 def public_address(family, address):

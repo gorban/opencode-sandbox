@@ -149,7 +149,7 @@ def require_authentication(reply):
         raise ValueError("expected signed-out ACP result")
 
 
-def signed_out(workspace, env):
+def new_session(workspace, env):
     argv = [str(NATIVE / "agy"), "acp", "--sandbox", "--disable-telemetry", "--include-default-customizations=false",
             "--log-file", str(workspace.parent / "native.log")]
     with running(argv, env, acp=True, cwd=workspace) as proc:
@@ -159,7 +159,11 @@ def signed_out(workspace, env):
             raise ValueError("wrong ACP protocol")
         if any(workspace.iterdir()):
             raise ValueError("ACP workspace changed before session creation")
-        require_authentication(exchange(proc, 2, "session/new", {"cwd": str(workspace), "mcpServers": []}))
+        return exchange(proc, 2, "session/new", {"cwd": str(workspace), "mcpServers": []})
+
+
+def signed_out(workspace, env):
+    require_authentication(new_session(workspace, env))
 
 
 def interrupted(_signum, _frame):
