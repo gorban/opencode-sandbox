@@ -1,5 +1,6 @@
 """Opt-in live zero-tool OpenCode + OpenAI subscription canary e2e test."""
 
+from contextlib import suppress
 from hashlib import sha256
 import hmac
 import os
@@ -119,6 +120,35 @@ def _wait_for_driver(command: list[str], *, root: Path, env: dict[str, str]) -> 
     return status
 
 
+def _run_pinned_snapshot(files: dict[Path, bytes], driver_rel: Path, *, home: Path,
+                         extra_args: list[str], source_sha256: str, env: dict[str, str]) -> int:
+    with tempfile.TemporaryDirectory(prefix="oc-reviewed-canary-", dir=home) as scratch:
+        snapshot = Path(scratch)
+        snapshot.chmod(0o700)
+        dirs: list[Path] = []
+        try:
+            for rel, data in files.items():
+                destination = snapshot / rel
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+                destination.chmod(0o400)
+            dirs = sorted((entry for entry in snapshot.rglob("*") if entry.is_dir()), reverse=True)
+            for directory in dirs:
+                directory.chmod(0o500)
+            snapshot.chmod(0o500)
+            command = [
+                "/usr/bin/python3", "-IB", str(snapshot / driver_rel),
+                *extra_args, "--source-sha256", source_sha256,
+            ]
+            return _wait_for_driver(command, root=snapshot, env=env)
+        finally:
+            with suppress(OSError):
+                snapshot.chmod(0o700)
+            for directory in reversed(dirs):
+                with suppress(OSError):
+                    directory.chmod(0o700)
+
+
 def _run_checked_driver(root: Path, *, model: str | None, source_sha256: str | None = None) -> int | None:
     try:
         home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
@@ -138,29 +168,21 @@ def _run_checked_driver(root: Path, *, model: str | None, source_sha256: str | N
             return None
     except (OSError, ValueError):
         return None
-    with tempfile.TemporaryDirectory(prefix="oc-reviewed-canary-") as scratch:
-        snapshot = Path(scratch)
-        for rel, data in files.items():
-            destination = snapshot / rel
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(data)
-            destination.chmod(0o400)
-        for directory in sorted((entry for entry in snapshot.rglob("*") if entry.is_dir()), reverse=True):
-            directory.chmod(0o500)
-        snap_driver = snapshot / driver.relative_to(root)
-        command = ["/usr/bin/python3", "-IB", str(snap_driver), *extra_args, "--source-sha256", source_sha256]
-        return _wait_for_driver(command, root=snapshot, env=env)
+    return _run_pinned_snapshot(
+        files, driver.relative_to(root), home=home, extra_args=extra_args,
+        source_sha256=source_sha256, env=env,
+    )
 
 
-def _validated_source_pin(request, args) -> str | None:
+def _validated_source_pin(request, args) -> tuple[bool, str | None]:
     source_sha256 = request.config.getoption(SOURCE_PIN_FLAG, default=None)
     if source_sha256 is None:
-        return None
+        return True, None
     direct_count = sum(arg == SOURCE_PIN_FLAG or arg.startswith(f"{SOURCE_PIN_FLAG}=") for arg in args)
     if (type(source_sha256) is not str or not _SHA256_RE.fullmatch(source_sha256)
             or direct_count != 1 or source_sha256 not in " ".join(args)):
-        raise ValueError("invalid source pin")
-    return source_sha256
+        return False, None
+    return True, source_sha256
 
 
 def test_live_openai_opencode_canary(request):
@@ -175,9 +197,8 @@ def test_live_openai_opencode_canary(request):
     if model is not None and (type(model) is not str or not _MODEL_RE.fullmatch(model)):
         pytest.fail("Invalid --openai-canary-model value.", pytrace=False)
 
-    try:
-        source_sha256 = _validated_source_pin(request, args)
-    except ValueError:
+    pin_ok, source_sha256 = _validated_source_pin(request, args)
+    if not pin_ok:
         pytest.fail("Invalid --openai-canary-source-sha256 value.", pytrace=False)
 
     root = Path(__file__).resolve(strict=True).parents[3]

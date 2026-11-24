@@ -39,16 +39,22 @@ def _parse_args(argv: list[str]) -> tuple[str | None, str | None]:
     return model, source_sha256
 
 
-def _collect_package_files(root: Path, relative: Path, *, mode_mask: int, files: list[Path]) -> None:
-    directory = root / relative
+def _check_dir_node(directory: Path, *, mode_mask: int) -> None:
     info = directory.lstat()
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid())
             or info.st_mode & mode_mask):
-        raise ValueError("untrusted canary package directory")
+        raise ValueError("untrusted canary source directory")
+
+
+def _collect_package_files(root: Path, relative: Path, *, mode_mask: int, files: list[Path]) -> None:
+    directory = root / relative
+    _check_dir_node(directory, mode_mask=mode_mask)
     for entry in sorted(directory.iterdir()):
         rel = entry.relative_to(root)
         if entry.is_dir() and not entry.is_symlink():
             if entry.name == "__pycache__":
+                if mode_mask & 0o200:
+                    raise ValueError("unexpected bytecode cache in verified canary package")
                 continue
             _collect_package_files(root, rel, mode_mask=mode_mask, files=files)
         elif entry.suffix == ".py":
@@ -73,6 +79,12 @@ def _read_trusted_file(path: Path, *, mode_mask: int) -> bytes:
 def snapshot_digest(root: Path, *, require_readonly: bool = False) -> tuple[str, bytes]:
     """Verify and hash all first-party canary sources before executing any bootstrap code."""
     mode_mask = 0o222 if require_readonly else 0o022
+    if require_readonly:
+        _check_dir_node(root, mode_mask=mode_mask)
+        cur = root
+        for part in DRIVER.parent.parts:
+            cur = cur / part
+            _check_dir_node(cur, mode_mask=mode_mask)
     files: list[Path] = [DRIVER, Path("oc-openai.py")]
     _collect_package_files(root, Path("oc_openai"), mode_mask=mode_mask, files=files)
     providers = root / "oc_providers"

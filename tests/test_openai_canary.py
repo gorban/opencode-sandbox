@@ -2061,6 +2061,183 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1)
             self.assertFalse(marker.exists(), "driver executed bootstrap despite source digest mismatch")
 
+    def test_reciprocal_r2_source_pin_blocks_pycache_and_writable_root_and_accepts_readonly_match(self):
+        import py_compile
+        import shutil
+
+        repo = Path(__file__).resolve().parents[1]
+        e2e_spec = importlib.util.spec_from_file_location(
+            "test_openai_canary_e2e_p1", repo / "tests/e2e/live/test_openai_canary_e2e.py",
+        )
+        e2e_mod = importlib.util.module_from_spec(e2e_spec)
+        e2e_spec.loader.exec_module(e2e_mod)
+        drv_spec = importlib.util.spec_from_file_location(
+            "openai_canary_driver_p1", repo / "tests/e2e/live/openai_canary_driver.py",
+        )
+        drv_mod = importlib.util.module_from_spec(drv_spec)
+        drv_spec.loader.exec_module(drv_mod)
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        with tempfile.TemporaryDirectory(prefix="oc-e2e-pyc-", dir=home) as tmp:
+            fake_root = Path(tmp) / "repo"
+            drv_dir = fake_root / "tests/e2e/live"
+            pkg_dir = fake_root / "oc_openai"
+            drv_dir.mkdir(parents=True, mode=0o700)
+            pkg_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(fake_root, 0o700)
+            pwn_marker = Path(tmp) / "pyc_pwned"
+            ok_marker = Path(tmp) / "matched_ok"
+
+            driver_copy = drv_dir / "openai_canary_driver.py"
+            driver_copy.write_bytes((repo / "tests/e2e/live/openai_canary_driver.py").read_bytes())
+            os.chmod(driver_copy, 0o600)
+            bootstrap = fake_root / "oc-openai.py"
+            bootstrap.write_text(
+                "import importlib.util, sys\n"
+                "from pathlib import Path\n"
+                f"Path({str(ok_marker)!r}).write_text('ok')\n"
+                "def load_cli():\n"
+                "    spec = importlib.util.spec_from_file_location('oc_openai', Path(__file__).parent / 'oc_openai/__init__.py', submodule_search_locations=[str(Path(__file__).parent / 'oc_openai')])\n"
+                "    mod = importlib.util.module_from_spec(spec); sys.modules['oc_openai'] = mod; spec.loader.exec_module(mod)\n"
+                "    import oc_openai.cli\n"
+                "    raise ImportError('stop_after_cli')\n",
+                encoding="ascii",
+            )
+            os.chmod(bootstrap, 0o600)
+            (pkg_dir / "__init__.py").write_text("", encoding="ascii")
+            os.chmod(pkg_dir / "__init__.py", 0o600)
+
+            evil_src = f"from pathlib import Path\nPath({str(pwn_marker)!r}).write_text('PWN')\n"
+            benign_src = "#" * (len(evil_src) - 1) + "\n"
+            cli_py = pkg_dir / "cli.py"
+            cli_py.write_text(evil_src, encoding="ascii")
+            os.chmod(cli_py, 0o600)
+            pyc_path = Path(py_compile.compile(str(cli_py), optimize=0))
+            cli_py.write_text(benign_src, encoding="ascii")
+            st = pyc_path.stat()
+            os.utime(cli_py, (st.st_atime, st.st_mtime))
+
+            benign_pin, _ = drv_mod.snapshot_digest(fake_root, require_readonly=False)
+
+            # 1. Writable root MUST be rejected under --source-sha256 even when pin matches.
+            res_writable = subprocess.run(
+                ["/usr/bin/python3", "-IB", str(driver_copy), "--run-openai-canary-live", "--source-sha256", benign_pin],
+                cwd=fake_root, env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(res_writable.returncode, 1)
+            self.assertFalse(pwn_marker.exists())
+            self.assertFalse(ok_marker.exists())
+
+            # 2. Read-only tree with __pycache__/*.pyc MUST be rejected before exec/import so .pyc never runs.
+            all_dirs = [fake_root, *sorted((d for d in fake_root.rglob("*") if d.is_dir()), reverse=True)]
+            all_files = [f for f in fake_root.rglob("*") if f.is_file()]
+            try:
+                for f in all_files:
+                    os.chmod(f, 0o400)
+                for d in reversed(all_dirs):
+                    os.chmod(d, 0o500)
+                res_pyc = subprocess.run(
+                    ["/usr/bin/python3", "-IB", str(driver_copy), "--run-openai-canary-live", "--source-sha256", benign_pin],
+                    cwd=fake_root, env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(res_pyc.returncode, 1)
+                self.assertFalse(pwn_marker.exists(), "__pycache__ bytecode executed under --source-sha256")
+                self.assertFalse(ok_marker.exists())
+            finally:
+                for d in all_dirs:
+                    os.chmod(d, 0o700)
+                for f in all_files:
+                    os.chmod(f, 0o600)
+
+            # 3. Clean matching pin through _run_checked_driver builds a read-only private snapshot and runs cleanly.
+            shutil.rmtree(pkg_dir / "__pycache__")
+            bootstrap.write_text(
+                f"from pathlib import Path\nPath({str(ok_marker)!r}).write_text('MATCHED_OK')\n"
+                "def load_cli(): raise ImportError('stop_clean')\n",
+                encoding="ascii",
+            )
+            matching_pin, _ = drv_mod.snapshot_digest(fake_root, require_readonly=False)
+            rc = e2e_mod._run_checked_driver(fake_root, model=None, source_sha256=matching_pin)
+            self.assertEqual(rc, 1)  # stopped cleanly at stub load_cli ImportError AFTER digest verification
+            self.assertEqual(ok_marker.read_text(encoding="ascii"), "MATCHED_OK")
+
+    def test_reciprocal_r2_cross_ledger_holds_between_canary_recovery_and_e2e(self):
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        with tempfile.TemporaryDirectory(prefix="oc-cross-hold-", dir=home) as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(mode=0o700)
+            b_hash = binding_digest("a" * 43, "b" * 43)
+            hist_digest = inspect_i4a_history(state_dir).digest
+            e2e_ledger = canary_ledger.E2ECanaryLedger(state_dir)
+            base_ledger = CanaryLedger(state_dir)
+
+            base_canary = {
+                "run_id": "1" * 32, "binding": b_hash, "model": MODEL, "history_digest": hist_digest,
+                "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT,
+                "actual": None, "outcome": "unsettled", "delivered": False,
+            }
+            c_path = state_dir / CANARY_FILE
+            r_path = state_dir / CANARY_RECOVERY_FILE
+            e_path = state_dir / canary_ledger.CANARY_E2E_FILE
+
+            # 1. Unrecovered unsettled canary.json MUST block E2ECanaryLedger.
+            c_raw = (json.dumps(base_canary, sort_keys=True) + "\n").encode("ascii")
+            c_path.write_bytes(c_raw)
+            c_path.chmod(0o600)
+            with self.assertRaisesRegex(CanaryLedgerError, "canary_unsettled_hold"):
+                e2e_ledger.preflight()
+
+            # 2. Overage canary.json MUST block E2ECanaryLedger.
+            c_path.write_text(json.dumps({
+                **base_canary, "actual": [_INPUT_LIMIT + 1, 1], "outcome": "overage_settled",
+            }), encoding="ascii")
+            with self.assertRaisesRegex(CanaryLedgerError, "canary_overage_hold"):
+                e2e_ledger.preflight()
+
+            # 3. Unlinked canary-recovery.json (missing canary.json) and unsettled recovery both fail closed.
+            c_path.unlink()
+            c_digest = hashlib.sha256(c_raw).hexdigest()
+            rec_record = {
+                "run_id": "2" * 32, "binding": b_hash, "model": MODEL, "history_digest": hist_digest,
+                "prior_canary_run_id": "1" * 32, "prior_canary_digest": c_digest,
+                "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT,
+                "actual": [10, 4], "outcome": "ok_settled", "delivered": True,
+            }
+            r_path.write_text(json.dumps(rec_record), encoding="ascii")
+            r_path.chmod(0o600)
+            with self.assertRaisesRegex(CanaryLedgerError, "canary_storage_unavailable"):
+                e2e_ledger.preflight()
+
+            c_path.write_bytes(c_raw)
+            c_path.chmod(0o600)
+            r_path.write_text(json.dumps({
+                **rec_record, "actual": None, "outcome": "unsettled", "delivered": False,
+            }), encoding="ascii")
+            with self.assertRaisesRegex(CanaryLedgerError, "canary_unsettled_hold"):
+                e2e_ledger.preflight()
+
+            # 4. Resolved pair (unsettled canary.json + valid linked ok_settled recovery) is accepted by E2ECanaryLedger.
+            r_path.write_text(json.dumps(rec_record), encoding="ascii")
+            self.assertEqual(e2e_ledger.preflight().digest, hist_digest)
+
+            # 5. Unsettled, overage, or corrupt canary-e2e.json MUST block CanaryLedger preflight and preflight_recovery.
+            r_path.unlink()
+            for payload, expected_err in (
+                ({**base_canary, "run_id": "3" * 32}, "canary_unsettled_hold"),
+                ({**base_canary, "run_id": "3" * 32, "actual": [_INPUT_LIMIT + 1, 1],
+                  "outcome": "overage_settled"}, "canary_overage_hold"),
+                ({"corrupt": True}, "canary_storage_unavailable"),
+            ):
+                e_path.write_text(json.dumps(payload), encoding="ascii")
+                e_path.chmod(0o600)
+                with self.subTest(expected_err=expected_err):
+                    with self.assertRaisesRegex(CanaryLedgerError, expected_err):
+                        base_ledger.preflight_recovery(b_hash, MODEL, expected_prior=("1" * 32, c_digest))
+            c_path.unlink()
+            e_path.write_text(json.dumps({**base_canary, "run_id": "3" * 32}), encoding="ascii")
+            with self.assertRaisesRegex(CanaryLedgerError, "canary_unsettled_hold"):
+                base_ledger.preflight()
+
 
 if __name__ == "__main__":
     unittest.main()
