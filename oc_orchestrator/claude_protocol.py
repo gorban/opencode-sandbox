@@ -72,7 +72,6 @@ def validate_sdk(message, session, position):
     else:
         require(kind == "user" and position == 1)
         content = message.get("message", {}).get("content")
-        require(type(content) is list and all(type(part) is dict and part.get("type") == "text" for part in content))
-        require(sum(part.get("text") == PROMPT for part in content) == 1)
+        require(content == [{"type": "text", "text": PROMPT}])
     if kind == "control_request":
         require(type(message.get("request_id")) is str and len(message["request_id"]) <= 96)

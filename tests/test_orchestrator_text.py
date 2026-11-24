@@ -1,6 +1,7 @@
 """Portable checks for the isolated orchestrator entry and its recording fake."""
 
 from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -8,12 +9,14 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
-from tempfile import TemporaryDirectory
-from threading import Event
+from tempfile import TemporaryDirectory, TemporaryFile
+from threading import Event, Thread
 import unittest
 from unittest.mock import patch
 
 from oc_orchestrator.capture import CaptureError, capture
+from oc_orchestrator.claude import Broker, NativeFrames, native_process
+from oc_orchestrator.claude_fixture import extra_descriptors
 from oc_orchestrator.claude_protocol import PREFIX, SETTINGS, ProtocolError, select_native, validate_sdk
 from oc_orchestrator.owner import Lifeline
 from oc_orchestrator.protocol import OPTIONS, PROMPT, RecordingFake, accept_text
@@ -95,6 +98,53 @@ class OrchestratorTest(unittest.TestCase):
                                      (request("get_context_usage"), 1)):
             with self.subTest(unexpected=unexpected), self.assertRaises(ProtocolError):
                 validate_sdk(unexpected, None, position)
+
+    def test_claude_synthetic_rejects_any_extra_prompt_block(self):
+        session = "00000000-0000-4000-8000-000000000001"
+        fixed = {"type": "text", "text": "Reply with exactly: ok"}
+        for parts in ([fixed], [fixed, {"type": "text", "text": "Unexpected instructions"}]):
+            message = {"type": "user", "message": {"content": parts}}
+            if len(parts) == 1:
+                validate_sdk(message, session, 1)
+            else:
+                with self.assertRaises(ProtocolError):
+                    validate_sdk(message, session, 1)
+
+    def test_claude_probe_detects_an_inherited_descriptor_above_15(self):
+        with TemporaryFile() as marker:
+            marker.write(b"synthetic private marker")
+            descriptor = fcntl.fcntl(marker.fileno(), fcntl.F_DUPFD, 40)
+            try:
+                self.assertIn(descriptor, set(extra_descriptors()))
+            finally:
+                os.close(descriptor)
+
+    def test_owner_loss_retires_a_stalled_native_process_and_socket(self):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as pipe, os.fdopen(write_fd, "wb") as owner:
+            lifeline = Lifeline(pipe.fileno())
+            broker = Broker(None, "", lifeline)
+            first, second = socket.socketpair()
+            with native_process(["/usr/bin/sleep", "60"]) as process, first as client, second as peer:
+                cancelled = Event()
+
+                def read_native():
+                    try:
+                        NativeFrames(process.stdout).next_line()
+                    except ProtocolError:
+                        cancelled.set()
+
+                reader = Thread(target=read_native)
+                with (broker.own(broker.children, process), broker.own(broker.clients, client),
+                      lifeline.revoke_on_loss(broker.retire)):
+                    reader.start()
+                    owner.close()
+                    self.assertTrue(cancelled.wait(1))
+                    self.assertIsNotNone(process.wait(timeout=1))
+                    peer.settimeout(1)
+                    self.assertEqual(peer.recv(1), b"")
+                reader.join(timeout=1)
+                self.assertFalse(reader.is_alive())
 
     def test_launcher_has_a_side_effect_free_help_and_refuses_normal_options(self):
         with TemporaryDirectory() as home:

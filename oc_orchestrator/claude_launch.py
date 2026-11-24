@@ -18,7 +18,7 @@ PROMPT = "Reply with exactly: ok"
 def endpoint(server, path):
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline and server.poll() is None:
-        match = re.search(r"(?m)^server listening on (http://127\.0\.0\.1:[1-9][0-9]{0,4})$", path.read_text())
+        match = re.search(r"(?am)^server listening on (http://127\.0\.0\.1:[1-9]\d{0,4})$", path.read_text())
         if match:
             return match[1]
         time.sleep(.05)

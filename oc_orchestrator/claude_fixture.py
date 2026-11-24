@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -IB
 """Synthetic native process and OpenCode executable-path shim for local qualification."""
 
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -9,9 +10,11 @@ import sys
 from threading import Thread
 import uuid
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-from claude_protocol import LIMIT, REPLY, decode, encode
+if __package__:
+    from .claude_protocol import LIMIT, REPLY, decode, encode
+else:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from claude_protocol import LIMIT, REPLY, decode, encode
 
 
 SOCKET = "/broker/native.sock"
@@ -28,10 +31,25 @@ def feed(client):
         return
 
 
+def extra_descriptors():
+    entries = list(Path("/proc/self/fd").iterdir())
+    for entry in entries:
+        number = int(entry.name)
+        if number < 3:
+            continue
+        try:
+            os.fstat(number)
+        except OSError as error:
+            if error.errno != errno.EBADF:
+                raise
+        else:
+            yield number
+
+
 def shim():
     assert not CREDENTIAL.exists()
     assert not Path("/proc/1/root/private/native-profile").exists()
-    assert all(not Path(f"/proc/self/fd/{fd}").exists() for fd in range(3, 16))
+    assert not list(extra_descriptors())
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(12)
         client.connect(SOCKET)

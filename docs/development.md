@@ -34,6 +34,11 @@ profile. Missing tools in the required portable suite fail the check.
 
 ### Local OpenCode text proof
 
+The Claude fixture runs with `./oc-sandbox orchestrate --synthetic-check --provider claude`.
+It uses rootless Bubblewrap and the stock OpenCode 2.3.0 Linux x64 glibc executable
+in `~/.cache/oc-sandbox/fixtures/opencode-2.3.0`. The launcher verifies its SHA-256
+before executing the private copy. The expected output is `Claude fixture response`.
+
 From the Linux devbox, run `./oc-sandbox orchestrate --synthetic-check` with the pinned OpenCode
 and relay images already in the host's rootless Podman store. The command prints `ok` after one
 text-only turn through a disposable worker and a loopback fake provider. It verifies cleanup

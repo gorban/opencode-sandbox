@@ -51,7 +51,7 @@ usage() {
 Usage: ${0##*/} [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
        ${0##*/} orchestrate [--synthetic-check]
-       ${0##*/} orchestrate --synthetic-check --provider claude --opencode PATH
+       ${0##*/} orchestrate --synthetic-check --provider claude
 
   (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
               OpenCode. Safe to run repeatedly; only missing/changed pieces are touched.

@@ -38,13 +38,18 @@ def kill_group(process):
         os.killpg(process.pid, signal.SIGKILL)
 
 
-def capture(command, *, env, timeout, limit, lifeline=None):
+def capture(command, *, env, timeout, limit, lifeline=None, on_revoke=None):
     deadline = time.monotonic() + timeout
     with subprocess.Popen(command, env=env, cwd="/", stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
         try:
-            revoke = nullcontext() if lifeline is None else lifeline.revoke_on_loss(lambda: kill_group(process))
-            with revoke:
+            def revoke():
+                kill_group(process)
+                if on_revoke is not None:
+                    on_revoke()
+
+            ownership = nullcontext() if lifeline is None else lifeline.revoke_on_loss(revoke)
+            with ownership:
                 output = drain(process, deadline, limit)
                 result = process.wait(timeout=max(0, deadline - time.monotonic()))
         except BaseException:
