@@ -164,8 +164,9 @@ def _cleanup(job, broker):
         raise terminal_error
 
 
-def _execute_worker_turn(job, stack, responses, before_dispatch, *, lease_guard, allow_progress, allow_metadata):
-    broker = None
+def _execute_worker_turn(
+    job, stack, responses, before_dispatch, broker_ref, *, lease_guard, allow_progress, allow_metadata,
+):
     try:
         job.prepare()
         if lease_guard is not None:
@@ -174,6 +175,7 @@ def _execute_worker_turn(job, stack, responses, before_dispatch, *, lease_guard,
         broker = Broker(
             job, responses, before_dispatch, allow_progress=allow_progress, allow_metadata=allow_metadata,
         )
+        broker_ref[0] = broker
         broker.start()
         job.start()
         job.activate(broker)
@@ -181,11 +183,10 @@ def _execute_worker_turn(job, stack, responses, before_dispatch, *, lease_guard,
         if not broker.done.wait(timeout=2) or not broker.complete(call_id):
             raise WorkerError("Managed tool continuation receipt is missing")
         job.assert_file(protocol.PROOF_BYTES)
-        return broker
     except (JobRuntimeError, ProbeError, WorkerError, OSError, ValueError):
-        if broker is None:
+        if broker_ref[0] is None:
             raise WorkerProofError(None, protocol.Fault.PLACEMENT) from None
-        failure = broker.failure() or (None, protocol.Fault.NATIVE)
+        failure = broker_ref[0].failure() or (None, protocol.Fault.NATIVE)
         raise WorkerProofError(*failure) from None
 
 
@@ -208,21 +209,21 @@ def run_worker(responses, *, model, before_dispatch, worker_image=WORKER_IMAGE, 
         raise WorkerError("Invalid managed worker invocation")
     root = Path(tempfile.mkdtemp(prefix="oc-i4a-", dir=SHARED_TMP))
     job = Job(root, worker_image, relay_image, model, "inc_" + secrets.token_hex(16))
-    broker = None
+    broker_ref = [None]
     verified = False
     clean = False
     try:
         with ExitStack() as stack:
             try:
-                broker = _execute_worker_turn(
-                    job, stack, responses, before_dispatch,
+                _execute_worker_turn(
+                    job, stack, responses, before_dispatch, broker_ref,
                     lease_guard=lease_guard, allow_progress=allow_progress, allow_metadata=allow_metadata,
                 )
                 verified = True
             finally:
                 try:
                     try:
-                        _cleanup(job, broker)
+                        _cleanup(job, broker_ref[0])
                     finally:
                         # Drain the guard after attempting terminal/resource
                         # cleanup. Its retained registration may need the

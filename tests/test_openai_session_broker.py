@@ -583,6 +583,18 @@ class SessionBrokerTests(unittest.TestCase):
             s_a.close()
             s_b.close()
 
+    def test_numeric_regexes_reject_non_ascii_digits(self):
+        from oc_openai import session_broker
+
+        self.assertIsNone(session_broker._MEM_RE.fullmatch("4\u0662m"))
+        self.assertIsNone(session_broker._LEVEL_RE.fullmatch("s0:c\u0661,c2"))
+        self.assertIsNone(session_broker._PORT_KEY_RE.fullmatch("\uff18\uff10/tcp"))
+        self.assertIsNone(session_broker._PORT_LABEL_RE.fullmatch("\uff18\uff10:\uff18\uff10"))
+        self.assertIsNotNone(session_broker._MEM_RE.fullmatch("42m"))
+        self.assertIsNotNone(session_broker._LEVEL_RE.fullmatch("s0:c1,c2"))
+        self.assertIsNotNone(session_broker._PORT_KEY_RE.fullmatch("80/tcp"))
+        self.assertIsNotNone(session_broker._PORT_LABEL_RE.fullmatch("80:80"))
+
 
 if __name__ == "__main__":
     unittest.main()

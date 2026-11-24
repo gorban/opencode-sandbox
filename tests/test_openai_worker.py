@@ -572,6 +572,42 @@ class WorkerCleanupTests(unittest.TestCase):
             self.assertNotIn(str(surrounding), str(caught.exception))
             self.assertEqual(other.read_text(), "outside this run")
 
+    def test_started_broker_is_closed_when_job_start_fails_or_interrupted(self):
+        for exc_cls in (worker.JobRuntimeError, KeyboardInterrupt):
+            with self.subTest(exc_cls=exc_cls.__name__), tempfile.TemporaryDirectory() as temp:
+                events = []
+
+                class _FakeBroker:
+                    def __init__(self, *_args, **_kwargs):
+                        pass
+
+                    def start(self):
+                        events.append("start")
+
+                    def close(self):
+                        events.append("close")
+
+                    def failure(self):
+                        return None
+
+                def failing_job(root, *_):
+                    def start():
+                        raise exc_cls("synthetic post-broker failure")
+
+                    return SimpleNamespace(
+                        root=root, grant=root / "grant", lease=None,
+                        prepare=lambda: None, assert_file=lambda _: None,
+                        start=start, revoke=lambda: None, close=lambda: events.append("job_close"),
+                    )
+
+                expected = worker.WorkerProofError if exc_cls is worker.JobRuntimeError else KeyboardInterrupt
+                with (patch.object(worker, "SHARED_TMP", Path(temp)),
+                      patch.object(worker, "Job", side_effect=failing_job),
+                      patch.object(worker, "Broker", _FakeBroker),
+                      self.assertRaises(expected)):
+                    worker.run_worker(fixture_events, model="fixture-model", before_dispatch=lambda _: None)
+                self.assertEqual(events, ["start", "close", "job_close"])
+
 
 class RelayLifetimeTests(unittest.TestCase):
     def test_pending_then_active_sockets_close_when_the_owner_is_lost(self):
