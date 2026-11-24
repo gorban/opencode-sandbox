@@ -71,10 +71,11 @@ def _wait_for_driver(command: list[str], *, root: Path, env: dict[str, str]) -> 
     return status
 
 
-def _run_checked_driver(root: Path, home: Path, *, model: str | None) -> int | None:
+def _run_checked_driver(root: Path, *, model: str | None) -> int | None:
     try:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
         driver = _trusted_driver(root, home)
-    except (OSError, ValueError):
+    except (KeyError, OSError, ValueError):
         return None
     command = ["/usr/bin/python3", "-IB", str(driver)]
     if model is not None:
@@ -97,11 +98,7 @@ def test_live_openai_opencode_canary(request):
         pytest.fail("Invalid --openai-canary-model value.", pytrace=False)
 
     root = Path(__file__).resolve(strict=True).parents[3]
-    try:
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
-    except (KeyError, OSError):
-        pytest.fail("The reviewed workstation canary source is unavailable.", pytrace=False)
-    status = _run_checked_driver(root, home, model=model)
+    status = _run_checked_driver(root, model=model)
     if status is None:
         pytest.fail("The reviewed workstation canary source is unavailable.", pytrace=False)
     if status == 130:
