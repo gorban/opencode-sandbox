@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 import os
 from pathlib import Path
+import select
 import stat
 import subprocess
 import sys
@@ -15,6 +16,7 @@ class OwnerLost(RuntimeError):
 
 class Lifeline:
     def __init__(self, pipe):
+        self.pipe = pipe
         self.lost = threading.Event()
         self.lock = threading.Lock()
         self.revoke = None
@@ -31,8 +33,16 @@ class Lifeline:
                 self.revoke()
 
     def check(self):
-        if self.lost.is_set():
+        if not self.active():
             raise OwnerLost("launcher exited before the proof settled")
+
+    def active(self):
+        if self.lost.is_set():
+            return False
+        # Observe EOF even when the watcher has not been scheduled yet.
+        ready = select.poll()
+        ready.register(self.pipe, select.POLLIN | select.POLLHUP | select.POLLERR)
+        return not ready.poll(0)
 
     @contextmanager
     def revoke_on_loss(self, revoke):

@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 import hashlib
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -13,7 +14,8 @@ import unittest
 from unittest.mock import patch
 
 from oc_orchestrator.capture import CaptureError, capture
-from oc_orchestrator.protocol import OPTIONS, PROMPT, RecordingFake
+from oc_orchestrator.owner import Lifeline
+from oc_orchestrator.protocol import OPTIONS, PROMPT, RecordingFake, accept_text
 from oc_orchestrator.relay import handoff
 from oc_orchestrator.runtime import Failure, Placement, container_categories, verify_result
 
@@ -162,6 +164,40 @@ class OrchestratorTest(unittest.TestCase):
                         self.assertEqual(broker.settlement, "recorded_offline")
                     finally:
                         release.set()
+
+    def test_owner_eof_fences_even_while_watcher_is_delayed(self):
+        for expected in (0, 1):
+            with self.subTest(expected_sends=expected), TemporaryDirectory() as root:
+                self.check_owner_eof(Path(root) / "proof.sock", expected)
+
+    def check_owner_eof(self, address, expected):
+        paused, release = Event(), Event()
+
+        def hold():
+            paused.set()
+            release.wait(3)
+
+        def validate(body):
+            accept_text(body)
+            if not expected:
+                hold()
+
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as read_end, os.fdopen(write_fd, "wb") as write_end:
+            with patch("oc_orchestrator.owner.threading.Thread.start"):
+                lifeline = Lifeline(read_end.fileno())
+            with (patch("oc_orchestrator.protocol.accept_text", side_effect=validate),
+                  route(address, authorized=lifeline.active, before_delivery=hold if expected else None) as (listener, broker),
+                  connect(address, listener, payload()) as client):
+                try:
+                    self.assertTrue(paused.wait(2))
+                    write_end.close()
+                    release.set()
+                    self.assertEqual(response(client), b"")
+                    self.assertEqual(broker.receipt()[0], expected)
+                    self.assertFalse(lifeline.lost.is_set())
+                finally:
+                    release.set()
 
     def test_native_result_belongs_to_one_successful_turn(self):
         events = [{"type": kind, "sessionID": "session", "part": {

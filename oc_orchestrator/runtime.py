@@ -288,7 +288,7 @@ def wait_relay(relay):
     raise Failure("the private relay did not listen")
 
 
-def fixture_request(relay, body):
+def fixture_request(relay, body, *, count_bytes=False):
     program = """import socket, sys
 port = int(sys.argv[1])
 body = sys.argv[2].encode()
@@ -297,10 +297,20 @@ head = (f'POST /v1/chat/completions HTTP/1.1\\r\\nHost: 127.0.0.1:{port}\\r\\n'
         f'Content-Length: {len(body)}\\r\\nConnection: close\\r\\n\\r\\n').encode()
 with socket.create_connection(('127.0.0.1', port), timeout=3) as client:
     client.sendall(head + body)
-    with client.makefile('rb') as stream:
-        print(stream.readline(128).decode().strip())
+    if sys.argv[3] == 'count':
+        size = 0
+        try:
+            while size < 128 and (block := client.recv(128 - size)):
+                size += len(block)
+        except ConnectionResetError:
+            pass
+        print(size)
+    else:
+        with client.makefile('rb') as stream:
+            print(stream.readline(128).decode().rstrip('\\r\\n'))
 """
-    return podman("exec", relay, "/usr/local/bin/python3", "-IB", "-c", program, str(PORT), body.decode()).stdout
+    mode = "count" if count_bytes else "status"
+    return podman("exec", relay, "/usr/local/bin/python3", "-IB", "-c", program, str(PORT), body.decode(), mode).stdout
 
 
 def verify_one_admission(broker, relay):
@@ -324,7 +334,8 @@ def placed_broker(mode, lifeline, *, before_delivery=None):
         lifeline.check()
         preflight(root)
         worker_files, relay_files, proof = seeds(root)
-        with (RecordingFake(relay_files / "provider.sock", proof, before_delivery=before_delivery) as broker,
+        with (RecordingFake(relay_files / "provider.sock", proof, authorized=lifeline.active,
+                            before_delivery=before_delivery) as broker,
               lifeline.revoke_on_loss(broker.revoke)):
             worker = placement.create("open-code", OPEN_CODE, "none", worker_files / "opencode.json",
                                       "/etc/opencode/opencode.json", {"HOME": "/job-home", "TMPDIR": "/job-tmp",

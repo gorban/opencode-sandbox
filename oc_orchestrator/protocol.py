@@ -164,9 +164,10 @@ def reply_bytes(events):
 class RecordingFake:
     """Per-launch capability, one accepted request and no routable upstream."""
 
-    def __init__(self, address, proof, *, port=PORT, before_delivery=None, events=FIXTURE_EVENTS):
+    def __init__(self, address, proof, *, port=PORT, authorized=lambda: True, before_delivery=None, events=FIXTURE_EVENTS):
         self.proof = proof
         self.port = port
+        self.authorized = authorized
         self.before_delivery = before_delivery
         self.events = events
         self.lock = threading.Lock()
@@ -225,7 +226,7 @@ class RecordingFake:
 
     def track(self, connection):
         with self.lock:
-            if not self.active:
+            if not self.active or not self.authorized():
                 raise Refused()
             self.connection = connection
 
@@ -241,7 +242,7 @@ class RecordingFake:
     def admit(self, body):
         accept_text(body)
         with self.lock:
-            if not self.active or self.admissions:
+            if not self.active or self.admissions or not self.authorized():
                 raise Refused()
             self.admissions += 1
             self.settlement = "recorded_offline"
@@ -263,7 +264,7 @@ class RecordingFake:
 
     def write(self, client, response):
         with self.lock:
-            if self.active:
+            if self.active and self.authorized():
                 client.setblocking(False)
                 if client.send(response) != len(response):
                     raise Refused()

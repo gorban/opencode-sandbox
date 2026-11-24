@@ -39,7 +39,8 @@ and relay images already in the host's rootless Podman store. The command prints
 text-only turn through a disposable worker and a loopback fake provider. It verifies cleanup
 and rejection of a second request before reporting success. Run
 `python3 -B tests/orchestrator-owner-loss.py` from that devbox to check cleanup after launcher loss
-and to verify that revocation before the broker writes leaves the client with zero response bytes.
+during startup and after both containers start, and to verify zero response bytes if the owner pipe
+closes before the broker writes.
 These checks use no provider credentials. Subscription routes require separate qualification.
 
 ### Real host gates
