@@ -54,13 +54,17 @@ testing the fix.
   stubbed. `tests/postgres-host-real.py` uses isolated, test-owned Podman resources and locally available
   Postgres 17 and Python Alpine images to check SCRAM, existing volumes and host authentication; run it
   only when no other test is using the shared Podman host.
-- `python3 tests/parallel-isolated.py --run` runs `tests/parallel.sh` against the real host (two Chromium windows open for a few
-  minutes): two instances with worktrees, agents launched in parallel, the same echo server on the same
-  port in both, host access through `-P`, per-instance Postgres, docker-in-docker, `-l`, port changes and
-  instance removal. It uses a fresh private Podman store and sandbox home, with synthetic credentials.
-  The existing host SELinux policy and Wayland session are required; user systemd changes are stubbed.
-  Direct execution of `tests/parallel.sh` is refused. Without `--run`, the runner only audits its sources.
-  An interrupted distrobox run retains both private directories if remote processes cannot be verified stopped.
+- `python3 tests/parallel-isolated.py --run` runs the full real-host acceptance suite with headless
+  Chromium. It verifies two concurrent agents and worktrees, per-instance DevTools navigation,
+  loopback port mapping and isolation, Postgres, docker-in-docker, and instance removal. The suite
+  uses the installed SELinux policy, a private Podman store and sandbox home, and synthetic
+  credentials. It stubs user systemd and runs without the desktop display or physical security keys.
+- `python3 tests/parallel-isolated.py --run --wayland` opens one visible Chromium window to verify
+  the desktop Wayland connection and the named DevTools tab. Use this hand-run smoke test when
+  changing desktop integration. The runner cleans up its private browser and store.
+
+Direct execution of `tests/parallel.sh` is refused. Without `--run`, the runner only audits its sources.
+An interrupted distrobox run retains both private directories if remote processes cannot be verified stopped.
 
 ## GitHub pull-request checks
 

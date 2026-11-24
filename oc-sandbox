@@ -1146,11 +1146,18 @@ OPENCODE_VERSION=${OC_OPENCODE_VERSION:-}
 if [[ -n $OPENCODE_VERSION && $OPENCODE_VERSION != keep && ! $OPENCODE_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]]; then
   die "OC_OPENCODE_VERSION must be keep or a version such as 2.3.0"
 fi
+CHROMIUM_MODE=${OC_CHROMIUM_MODE-wayland}
+case $CHROMIUM_MODE in
+  wayland|headless) ;;
+  *) die "OC_CHROMIUM_MODE must be wayland or headless" ;;
+esac
 
 # ---- preflight ----------------------------------------------------------------
 pm --version >/dev/null 2>&1 || { echo "podman not found" >&2; exit 1; }
-WL="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-wayland-0}"
-[[ -S $WL ]] || { echo "No Wayland socket at $WL (run from a KDE Wayland session)" >&2; exit 1; }
+if [[ $CHROMIUM_MODE == wayland ]]; then
+  WL="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-wayland-0}"
+  [[ -S $WL ]] || { echo "No Wayland socket at $WL (run from a KDE Wayland session)" >&2; exit 1; }
+fi
 "${H[@]}" test -x "$BC_BIN"   || echo "warning: $BC_BIN not found; 'bcompare' bridge will do nothing" >&2
 "${H[@]}" test -x "$CODE_BIN" || echo "warning: $CODE_BIN not found; 'code' bridge will do nothing" >&2
 
@@ -1882,9 +1889,23 @@ fi
 want_id=$(pm image inspect --format '{{.Id}}' "$CHROME_IMG")
 have_id=$(pm container inspect --format '{{.Image}}' "$CHROME" 2>/dev/null || true)
 have_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.cfg"}}' "$CHROME" 2>/dev/null || true)
-# Security keys: pass ONLY FIDO hidraw nodes (see detect_keys); -K disables.
+# Security keys: pass only FIDO hidraw nodes to desktop Chromium when enabled.
+display_args=()
+browser_mode=(--headless)
+starturl=()
 keys=""
-if (( NOKEY )); then echo "Security keys: disabled (-K)"; else keys=$(detect_keys); fi
+if [[ $CHROMIUM_MODE == wayland ]]; then
+  display_args=(-v "$WL":/run/xdg/wayland-1 -e XDG_RUNTIME_DIR=/run/xdg -e WAYLAND_DISPLAY=wayland-1)
+  browser_mode=(--ozone-platform=wayland)
+  # Use the instance name as the desktop window's initial title.
+  [[ -z $INST ]] || starturl=("data:text/html,%3Ctitle%3Eoc%20$INST%3C/title%3E%3Ch1%3Eoc-sandbox%20instance%20$INST%3C/h1%3E")
+  if (( NOKEY )); then
+    echo "Security keys: disabled (-K)"
+  else
+    keys=$(detect_keys)
+    [[ -n $keys ]] || echo "Security key: none detected (plug one in and rerun to use it)"
+  fi
+fi
 fido_nodes=$(fido_device_nodes <<<"$keys")
 devargs=()
 while IFS= read -r n; do [[ -z $n ]] || devargs+=(--device "$n"); done <<<"$fido_nodes"
@@ -1892,12 +1913,8 @@ while IFS= read -r n; do [[ -z $n ]] || devargs+=(--device "$n"); done <<<"$fido
 while IFS='|' read -r node name id; do
   [[ -n $node ]] && echo "Security key: $name [$id] -> $node"
 done <<<"$keys"
-(( NOKEY )) || [[ -n $keys ]] || echo "Security key: none detected (plug one in and rerun to use it)"
-# A named instance opens a first tab titled with its name, so its window is easy to tell apart.
-starturl=()
-[[ -n $INST ]] && starturl=("data:text/html,%3Ctitle%3Eoc%20$INST%3C/title%3E%3Ch1%3Eoc-sandbox%20instance%20$INST%3C/h1%3E")
 # recreate the container only if its run command, policy, or security-key set changed
-cfg=$( { sed -n '/^# >>>chromium-run/,/^# <<<chromium-run/p' "$SCRIPT_REAL"; echo "$fido_nodes"; cat "$POLDIR/oc_chromium.cil"; } | sha256sum | cut -c1-16)
+cfg=$( { sed -n '/^# >>>chromium-run/,/^# <<<chromium-run/p' "$SCRIPT_REAL"; printf '%s\n' "$CHROMIUM_MODE" "$fido_nodes"; cat "$POLDIR/oc_chromium.cil"; } | sha256sum | cut -c1-16)
 if [[ -n $have_id && ( $have_id != "$want_id" || $have_cfg != "$cfg" ) ]]; then
   log "Chromium image/config changed; recreating container"
   pm rm -f "$CHROME" >/dev/null
@@ -1917,11 +1934,9 @@ if [[ -z $have_id ]]; then
     --security-opt label=type:oc_chromium.process \
     --pids-limit=1024 --memory="$CHROME_MEM" --shm-size=1g \
     -v "$CHROMEVOL":/profile:Z \
-    "${devargs[@]}" \
-    -v "$WL":/run/xdg/wayland-1 \
-    -e XDG_RUNTIME_DIR=/run/xdg -e WAYLAND_DISPLAY=wayland-1 \
+    "${devargs[@]}" "${display_args[@]}" \
     "$CHROME_IMG" \
-    chromium-browser --ozone-platform=wayland --no-sandbox --disable-gpu \
+    chromium-browser "${browser_mode[@]}" --no-sandbox --disable-gpu \
       --no-first-run --no-default-browser-check --class="oc-$ILABEL" \
       --user-data-dir=/profile --remote-debugging-port=9222 "${starturl[@]}" >/dev/null
 # <<<chromium-run
