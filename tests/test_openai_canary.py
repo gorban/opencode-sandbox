@@ -320,7 +320,8 @@ class CanaryLedgerTests(unittest.TestCase):
             self.ledger.preflight_recovery("9" * 64, MODEL, expected_prior=pinned)
 
         rec_snap = self.ledger.preflight_recovery(self.binding, MODEL, expected_prior=pinned)
-        self.assertEqual((rec_snap.prior_run_id, rec_snap.prior_digest), pinned)
+        self.assertEqual(rec_snap.prior_run_id, prior_run)
+        self.assertEqual(rec_snap.prior_digest, prior_digest)
 
         # Tampering canary.json between preflight and reserve fails closed without creating canary-recovery.json.
         tampered = prior_bytes.replace(b'"unsettled"', b'"ok_settled"')
