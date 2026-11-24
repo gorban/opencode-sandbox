@@ -20,8 +20,8 @@ ORCHESTRATOR_INPUT = (
     "Reply with exactly OC_SANDBOX_WORKER_PROOF and no other text."
 )
 _LABEL_COMMANDS = ("connect", "select")
-_LOCAL_COMMANDS = ("status", "disconnect")
-USAGE = "Usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|disconnect}"
+_LOCAL_COMMANDS = ("status", "verify", "disconnect")
+USAGE = "Usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}"
 BrowserHandoff = Callable[[str, Callable[[], bool]], None]
 # The Linux device identity also matches the PTY master, so exclude that side explicitly.
 _TIOCGDEV = 0x80045432
@@ -400,6 +400,16 @@ def run(
             return 0
         if command == "status":
             _show_status(terminal, _local_status(backend))
+            return 0
+        if command == "verify":
+            result = backend.verify()
+            if (not valid_label(result.label)
+                    or not isinstance(result.models, tuple) or not result.models
+                    or any(not isinstance(slug, str) or not slug or not slug.isascii() for slug in result.models)):
+                raise RouteUnavailable(Reason.PROVIDER_DATA)
+            models = ", ".join(result.models[:8])
+            extra = f" (+{len(result.models) - 8} more)" if len(result.models) > 8 else ""
+            terminal.write(f"Verified ChatGPT registration {result.label} ({result.readiness.value}): {models}{extra}")
             return 0
         if backend.disconnect() is True:
             terminal.write("ChatGPT is disconnected on this workstation.")

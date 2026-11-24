@@ -29,21 +29,29 @@ def verify_package(directory: Path) -> None:
             trusted_node(entry)
 
 
-def load_cli():
-    if not sys.flags.isolated or not sys.flags.dont_write_bytecode:
-        raise ValueError("isolated Python is required")
-    package_dir = Path(__file__).parent / "oc_openai"
+def _load_package(name: str):
+    package_dir = Path(__file__).parent / name
     verify_package(package_dir)
     package = importlib.util.spec_from_file_location(
-        "oc_openai",
+        name,
         package_dir / "__init__.py",
         submodule_search_locations=[str(package_dir)],
     )
     if package is None or package.loader is None:
-        raise ValueError("OpenAI command package is unavailable")
+        raise ValueError(f"{name} package is unavailable")
     module = importlib.util.module_from_spec(package)
     sys.modules[package.name] = module
     package.loader.exec_module(module)
+    return module
+
+
+def load_cli():
+    if not sys.flags.isolated or not sys.flags.dont_write_bytecode:
+        raise ValueError("isolated Python is required")
+    providers_dir = Path(__file__).parent / "oc_providers"
+    if providers_dir.exists() or providers_dir.is_symlink():
+        _load_package("oc_providers")
+    _load_package("oc_openai")
     from oc_openai import cli
 
     return cli

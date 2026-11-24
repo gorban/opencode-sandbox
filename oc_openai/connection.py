@@ -19,11 +19,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from .connection_job import LeaseHostProof, PhysicalHost, WorkerLease
-from .connection_state import ConnectionError, Store
+from .connection_job import LeaseHostProof, LeaseSetHostProof, PhysicalHost, WorkerLease
+from .connection_state import ConnectionError, MAX_WORKER_LEASES, Store
 from .profiles import ProfileError
-from .responses import AUTH_HOST, API_HOST, DISCOVERY, JWKS, MODELS, TOKEN
-from .responses import Cancellation, OpenAITransport, response_error
+from .responses import AUTH_HOST, API_HOST, DISCOVERY, INTERACTIVE_STREAM_LIMITS, JWKS, MODELS, TOKEN
+from .responses import Cancellation, OpenAITransport, StreamLimits, response_error
 
 RESOURCE = "https://api.openai.com/v1"
 ISSUER = "https://auth.openai.com"
@@ -373,7 +373,7 @@ class Connection:
                 return False
             return not self._uncertain(record) and not {
                 "client", "pending_client", "tokens", "refresh_pending",
-                "worker_lease", "worker_retiring", "retiring",
+                "worker_lease", "worker_leases", "worker_retiring", "retiring",
             }.intersection(record) and record.get("registration_observed") is not True
 
     def binding(self):
@@ -404,18 +404,25 @@ class Connection:
         if tokens["expiry"] <= self._clock() or tokens["access"] != access:
             raise ConnectionError("openai_access_token_changed")
 
-    def require_switchable(self):
+    def has_active_leases(self):
         with self._store.locked() as directory:
             record = self._store.read(directory)
-            if record.get("worker_lease") is not None or record.get("worker_retiring") is True:
-                raise ConnectionError("managed_retirement_incomplete")
+            return bool(
+                record.get("worker_lease") is not None
+                or record.get("worker_leases")
+                or record.get("worker_retiring") is True
+            )
+
+    def require_switchable(self):
+        if self.has_active_leases():
+            raise ConnectionError("managed_retirement_incomplete")
 
     @contextlib.contextmanager
     def worker_lease(self, binding, job):
         lease = WorkerLease.capture(job, self._host_probe())
         with self._store.locked() as directory:
             record = self._store.read(directory)
-            if not _active(record, binding) or "worker_lease" in record:
+            if not _active(record, binding) or "worker_lease" in record or record.get("worker_leases"):
                 raise ConnectionError("managed_retirement_incomplete")
             record["worker_lease"] = lease.record()
             self._store.write(directory, record)
@@ -427,6 +434,36 @@ class Connection:
                 if record.get("worker_lease") == lease.record():
                     lease.confirm_terminal()
                     record.pop("worker_lease")
+                    self._store.write(directory, record)
+
+    @contextlib.contextmanager
+    def session_lease(self, binding, job):
+        """Register one concurrent interactive session lease (bounded to MAX_WORKER_LEASES)."""
+        lease = WorkerLease.capture(job, self._host_probe())
+        lease_record = lease.record()
+        with self._store.locked() as directory:
+            record = self._store.read(directory)
+            leases = dict(record.get("worker_leases") or {})
+            if (not _active(record, binding) or "worker_lease" in record
+                    or lease.root in leases or len(leases) >= MAX_WORKER_LEASES):
+                raise ConnectionError("managed_retirement_incomplete")
+            leases[lease.root] = lease_record
+            record["worker_leases"] = leases
+            self._store.write(directory, record)
+        try:
+            yield lease
+        finally:
+            with self._store.locked() as directory:
+                record = self._store.read(directory)
+                leases = record.get("worker_leases")
+                if isinstance(leases, dict) and leases.get(lease.root) == lease_record:
+                    lease.confirm_terminal()
+                    leases = dict(leases)
+                    leases.pop(lease.root, None)
+                    if leases:
+                        record["worker_leases"] = leases
+                    else:
+                        record.pop("worker_leases", None)
                     self._store.write(directory, record)
 
     @contextlib.contextmanager
@@ -834,19 +871,81 @@ class Connection:
                         yield event
                 yield guarded()
 
+    @contextlib.contextmanager
+    def interactive_responses(self, binding, body, before_send=None, *, limits=INTERACTIVE_STREAM_LIMITS,
+                              deadline=None, cancelled=None, inspect_media=True, observe_media=None):
+        """Stream one bounded interactive Responses turn with pre-send token-rotation retry."""
+        if (not isinstance(body, dict) or body.get("store") is not False
+                or body.get("stream") is not True or not isinstance(body.get("input"), list)
+                or not _value(body.get("model"), max_length=128)
+                or not isinstance(limits, StreamLimits)):
+            raise ConnectionError("invalid_responses_body")
+        if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+            raise ConnectionError("invalid_openai_deadline")
+
+        for attempt in range(2):
+            access = self._refresh(binding, deadline=deadline, cancelled=cancelled)
+            sent_hook_fired = False
+
+            def track_before_send():
+                nonlocal sent_hook_fired
+                sent_hook_fired = True
+                if before_send is not None:
+                    before_send()
+
+            try:
+                op_timeout = (
+                    max(REQUEST_SECONDS, limits.io_timeout)
+                    if deadline is None
+                    else max(REQUEST_SECONDS, deadline - time.monotonic())
+                )
+                with self._operation(binding.generation, self._current(binding),
+                                     timeout=op_timeout,
+                                     deadline=deadline, cancelled=cancelled) as cancellation:
+                    if body["model"] not in self._models(binding, access, cancellation):
+                        raise ConnectionError("openai_model_unavailable")
+                    dispatch = self._dispatch(
+                        lambda record: self._require_dispatchable(record, binding, access),
+                        cancellation, track_before_send,
+                    )
+                    options = {"inspect_media": True, "limits": limits} if inspect_media else {"limits": limits}
+                    if observe_media is not None:
+                        options["observe_media"] = observe_media
+                    with self._transport.responses(body, access, cancellation, dispatch, **options) as events:
+                        def guarded():
+                            for event in events:
+                                cancellation.check()
+                                self.require_active(binding)
+                                yield event
+                        yield guarded()
+                        return
+            except ConnectionError as error:
+                if error.code == "openai_access_token_changed" and not sent_hook_fired and attempt == 0:
+                    continue
+                raise
+
     def disconnect(self):
         return self.finish_disconnect(self.begin_disconnect(
             physical_host=self.physical_host_for_retirement()))
 
     def physical_host_for_retirement(self):
-        """Collect host evidence for one exact lease without holding the store lock."""
+        """Collect host evidence for active leases without holding the store lock."""
         with self._store.locked() as directory:
             record = self._store.read(directory)
-            lease = WorkerLease.parse(record["worker_lease"]) if "worker_lease" in record else None
-        if lease is None:
+            single = WorkerLease.parse(record["worker_lease"]) if "worker_lease" in record else None
+            multi = tuple(
+                WorkerLease.parse(item)
+                for _, item in sorted((record.get("worker_leases") or {}).items())
+            )
+        if single is None and not multi:
             return None
         host = self._host_probe()
-        return LeaseHostProof(lease, host) if type(host) is PhysicalHost else None
+        if type(host) is not PhysicalHost:
+            return None
+        if single is not None and not multi:
+            return LeaseHostProof(single, host)
+        all_leases = ((single,) if single is not None else ()) + multi
+        return LeaseSetHostProof(all_leases, host)
 
     def begin_disconnect(self, *, physical_host=None):
         """Order local token and worker retirement before any provider I/O."""
@@ -857,14 +956,37 @@ class Connection:
                 return None
             if record.get("retiring", 0) > self._clock():
                 raise ConnectionError("openai_disconnect_in_progress")
-            if "worker_lease" in record:
+            has_single = "worker_lease" in record
+            has_multi = bool(record.get("worker_leases"))
+            if has_single or has_multi:
                 record["worker_retiring"] = True
                 self._store.write(directory, record)
-                lease = WorkerLease.parse(record["worker_lease"])
-                host = (physical_host.host if type(physical_host) is LeaseHostProof
-                        and physical_host.lease == lease else None)
-                lease.terminal(host)
-                record.pop("worker_lease")
+                if has_single:
+                    lease = WorkerLease.parse(record["worker_lease"])
+                    host = None
+                    if type(physical_host) is LeaseHostProof and physical_host.lease == lease:
+                        host = physical_host.host
+                    elif type(physical_host) is LeaseSetHostProof and lease in physical_host.leases:
+                        host = physical_host.host
+                    lease.terminal(host)
+                    record.pop("worker_lease")
+                    self._store.write(directory, record)
+                if has_multi:
+                    remaining = dict(record.get("worker_leases") or {})
+                    for key in sorted(list(remaining)):
+                        lease = WorkerLease.parse(remaining[key])
+                        host = None
+                        if type(physical_host) is LeaseHostProof and physical_host.lease == lease:
+                            host = physical_host.host
+                        elif type(physical_host) is LeaseSetHostProof and lease in physical_host.leases:
+                            host = physical_host.host
+                        lease.terminal(host)
+                        remaining.pop(key, None)
+                        if remaining:
+                            record["worker_leases"] = dict(remaining)
+                        else:
+                            record.pop("worker_leases", None)
+                        self._store.write(directory, record)
             record.pop("worker_retiring", None)
             previous = record.get("generation")
             client = record.get("client")

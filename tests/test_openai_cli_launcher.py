@@ -24,8 +24,11 @@ class OpenAILauncherTests(unittest.TestCase):
         self.bootstrap = self.checkout / "oc-openai.py"
         self.package = self.checkout / "oc_openai"
         self.package.mkdir()
+        (self.checkout / "oc_providers").mkdir()
         for name in (
-            "oc-sandbox", "oc-openai.py", "oc_openai/__init__.py", "oc_openai/cli.py",
+            "oc-sandbox", "oc-openai.py",
+            "oc_providers/__init__.py", "oc_providers/contracts.py",
+            "oc_openai/__init__.py", "oc_openai/cli.py",
             "oc_openai/profiles.py", "oc_openai/connection_state.py", "oc_openai/exposure.py",
         ):
             shutil.copy2(SOURCE / name, self.checkout / name)

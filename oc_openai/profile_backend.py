@@ -85,6 +85,54 @@ class ProfileBackend:
     def select(self, label):
         self.profiles.select(label, self._select_ready)
 
+    def verify(self):
+        if not self._reviewed:
+            raise RouteUnavailable(Reason.QUALIFICATION)
+        with self.profiles.foreground():
+            return self._require_selected().verify()
+
+    def active_connection(self):
+        """Return (label, Connection, Binding) for the active registration."""
+        if not self._reviewed:
+            raise RouteUnavailable(Reason.QUALIFICATION)
+        profile = self.profiles.selected()
+        if profile is None or profile.retiring:
+            raise RouteUnavailable(Reason.CONNECTION_CHANGED)
+        conn = self._connection(profile.directory)
+        try:
+            binding = conn.binding()
+        except ConnectionError as error:
+            raise _mapped_connection_error(error) from None
+        return profile.label, conn, binding
+
+    @contextmanager
+    def session_lease(self, label, binding, job):
+        """Acquire a concurrent session lease atomically under foreground selection lock."""
+        if not self._reviewed:
+            raise RouteUnavailable(Reason.QUALIFICATION)
+        with self.profiles.foreground():
+            profile = self.profiles.selected()
+            if profile is None or profile.retiring or profile.label != label:
+                raise RouteUnavailable(Reason.CONNECTION_CHANGED)
+            conn = self._connection(profile.directory)
+            lease_cm = conn.session_lease(binding, job)
+            try:
+                lease = lease_cm.__enter__()
+            except ConnectionError as error:
+                raise _mapped_connection_error(error) from None
+        exc = (None, None, None)
+        try:
+            yield lease
+        except BaseException:
+            exc = __import__("sys").exc_info()
+            raise
+        finally:
+            try:
+                lease_cm.__exit__(*exc)
+            except ConnectionError as error:
+                if exc[0] is None:
+                    raise _mapped_connection_error(error) from None
+
     def connect(self, label, *, handoff=None):
         if not self._reviewed:
             raise RouteUnavailable(Reason.QUALIFICATION)
@@ -134,7 +182,8 @@ class ProfileBackend:
             connection = self._connection(profile.directory)
             placement = physical_host if observed is not None and profile.directory == observed.directory else None
             try:
-                if profile.client_id is not None and not profile.selected and connection.status() == "connected":
+                if (profile.client_id is not None and not profile.selected
+                        and connection.status() == "connected" and not connection.has_active_leases()):
                     return False
                 retirement = connection.begin_disconnect(physical_host=placement)
             except ConnectionError as error:

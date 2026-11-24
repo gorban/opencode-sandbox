@@ -72,6 +72,10 @@ SUITES = (
     discover('OpenAI registry integration', 'test_openai_profile_backend.py'),
     discover('OpenAI saved registrations', 'test_openai_profiles.py'),
     discover('OpenAI managed worker', 'test_openai_worker.py'),
+    discover('Shared provider contracts', 'test_provider_contracts.py'),
+    discover('OpenAI interactive session leases', 'test_openai_session_leases.py'),
+    discover('OpenAI interactive session protocol', 'test_openai_session_protocol.py'),
+    discover('OpenAI interactive session broker', 'test_openai_session_broker.py'),
 )
 
 SHELL_FILES = (
@@ -91,6 +95,9 @@ PYTHON_FILES = (
     'oc_bridge_merge.py',
     'oc_controller.py',
     'oc-openai.py',
+    'oc-openai-session.py',
+    'oc_providers/__init__.py',
+    'oc_providers/contracts.py',
     'oc_openai/__init__.py',
     'oc_openai/acceptance.py',
     'oc_openai/cli.py',
@@ -110,6 +117,9 @@ PYTHON_FILES = (
     'oc_openai/profiles.py',
     'oc_openai/recovery.py',
     'oc_openai/responses.py',
+    'oc_openai/session_broker.py',
+    'oc_openai/session_protocol.py',
+    'oc_openai/session_relay.py',
     'oc_openai/worker.py',
     'tests/bridge_merge_core.py',
     'tests/e2e/live/conftest.py',
@@ -135,7 +145,11 @@ PYTHON_FILES = (
     'tests/test_openai_profiles.py',
     'tests/test_openai_proof_harness.py',
     'tests/test_openai_recovery.py',
+    'tests/test_openai_session_broker.py',
+    'tests/test_openai_session_leases.py',
+    'tests/test_openai_session_protocol.py',
     'tests/test_openai_worker.py',
+    'tests/test_provider_contracts.py',
     'tests/test_sonar_publisher.py',
     'tests/worktree_review_regressions.py',
     'tests/worktree_state_regressions.py',
@@ -272,7 +286,8 @@ def tests(supervisor):
 def validate_scope():
     # Keep additions to the active source directories visible without scanning archived probes.
     declared = set(SHELL_FILES + PYTHON_FILES)
-    scopes = ((ROOT, ''), (ROOT / 'tests', '**/'), (ROOT / 'tools/ci', '**/'), (ROOT / 'oc_openai', '**/'))
+    scopes = ((ROOT, ''), (ROOT / 'tests', '**/'), (ROOT / 'tools/ci', '**/'),
+              (ROOT / 'oc_openai', '**/'), (ROOT / 'oc_providers', '**/'))
     for directory, prefix in scopes:
         for pattern in ('*.sh', '*.py'):
             for path in sorted(directory.glob(prefix + pattern)):

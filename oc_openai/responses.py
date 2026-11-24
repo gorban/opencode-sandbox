@@ -29,7 +29,7 @@ MAX_STREAM = 2 * 1024 * 1024
 MAX_LINE = 256 * 1024
 MAX_EVENTS = 2048
 IO_TIMEOUT = 10
-CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,16}(?:;[^\r\n]*)?\r\n\Z")
+CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,16}[ \t]*(?:;[^\r\n]*)?\r\n\Z")
 _SSE_END = re.compile(rb"\r\n|[\r\n]")
 _STREAM_CODES = frozenset({
     "provider_stream_content_type", "provider_stream_incomplete", "provider_stream_limit",
@@ -97,13 +97,46 @@ class StreamFailure(ConnectionError):
         )
 
 
-def encode_responses_body(body):
+@dataclass(frozen=True)
+class StreamLimits:
+    """Explicit per-call byte, line, event, and socket timeout ceilings."""
+
+    max_json: int
+    max_stream: int
+    max_line: int
+    max_events: int
+    io_timeout: int
+
+    def __post_init__(self):
+        if any(type(value) is not int or value <= 0 for value in (
+            self.max_json, self.max_stream, self.max_line, self.max_events, self.io_timeout,
+        )):
+            raise ValueError("StreamLimits values must be positive integers")
+
+
+INTERACTIVE_STREAM_LIMITS = StreamLimits(
+    max_json=4 * 1024 * 1024,
+    max_stream=8 * 1024 * 1024,
+    max_line=1024 * 1024,
+    max_events=16_384,
+    io_timeout=30,
+)
+
+
+def _active_limits(limits):
+    if limits is not None:
+        return limits
+    return StreamLimits(MAX_JSON, MAX_STREAM, MAX_LINE, MAX_EVENTS, IO_TIMEOUT)
+
+
+def encode_responses_body(body, *, max_json=None):
     """Prepare the exact bounded request bytes sent by the Responses connector."""
+    limit = MAX_JSON if max_json is None else max_json
     try:
         encoded = json.dumps(body, allow_nan=False, ensure_ascii=True).encode("ascii")
     except (TypeError, ValueError, RecursionError):
         raise ConnectionError("invalid_responses_body") from None
-    if len(encoded) > MAX_JSON:
+    if len(encoded) > limit:
         raise ConnectionError("provider_request_too_large")
     return encoded
 
@@ -194,7 +227,7 @@ def _connect(host, cancellation):
 
 
 def _validate_http(response):
-    encodings = response.headers.get_all("Content-Encoding", [])
+    encodings = [item.strip().lower() for item in response.headers.get_all("Content-Encoding", [])]
     lengths = response.headers.get_all("Content-Length", [])
     transfers = response.headers.get_all("Transfer-Encoding", [])
     if (response.status < 200 or 300 <= response.status < 400
@@ -206,11 +239,12 @@ def _validate_http(response):
         raise ConnectionError("invalid_provider_http")
 
 
-def _read_json(response):
-    if response.length is not None and response.length > MAX_JSON:
+def _read_json(response, *, max_json=None):
+    limit = MAX_JSON if max_json is None else max_json
+    if response.length is not None and response.length > limit:
         raise ConnectionError("provider_response_too_large")
-    data = response.read(MAX_JSON + 1)
-    if len(data) > MAX_JSON:
+    data = response.read(limit + 1)
+    if len(data) > limit:
         raise ConnectionError("provider_response_too_large")
     if response.length not in (None, 0):
         raise ConnectionError("invalid_provider_http")
@@ -238,6 +272,10 @@ class _HeaderReader:
 
 
 class _StrictResponse(http.client.HTTPResponse):
+    def __init__(self, sock, *, max_line=None, **kwargs):
+        super().__init__(sock, **kwargs)
+        self._max_line = MAX_LINE if max_line is None else max_line
+
     def begin(self):
         raw = self.fp
         headers = _HeaderReader(raw)
@@ -253,18 +291,18 @@ class _StrictResponse(http.client.HTTPResponse):
         if not remaining:
             if remaining == 0 and self._safe_read(2) != b"\r\n":
                 raise http.client.HTTPException("invalid chunk delimiter")
-            size = self.fp.readline(MAX_LINE + 1)
-            if len(size) > MAX_LINE or not CHUNK_SIZE.fullmatch(size):
+            size = self.fp.readline(self._max_line + 1)
+            if len(size) > self._max_line or not CHUNK_SIZE.fullmatch(size):
                 raise http.client.HTTPException("invalid chunk size")
-            remaining = int(size.rstrip(b"\r\n").split(b";", 1)[0], 16)
+            remaining = int(size.rstrip(b"\r\n").split(b";", 1)[0].strip(), 16)
             if remaining == 0:
                 for _ in range(100):
-                    line = self.fp.readline(MAX_LINE + 1)
+                    line = self.fp.readline(self._max_line + 1)
                     if line == b"\r\n":
                         self._close_conn()
                         remaining = None
                         break
-                    if len(line) > MAX_LINE or not line.endswith(b"\r\n") or b":" not in line:
+                    if len(line) > self._max_line or not line.endswith(b"\r\n") or b":" not in line:
                         raise http.client.HTTPException("incomplete chunk trailer")
                 else:
                     raise http.client.HTTPException("too many chunk trailers")
@@ -272,18 +310,19 @@ class _StrictResponse(http.client.HTTPResponse):
         return remaining
 
 
-def _stream_lines(response, cancellation, evidence, prefix=b""):
+def _stream_lines(response, cancellation, evidence, prefix=b"", *, limits=None):
     """Split SSE lines while charging the original bytes against both limits."""
+    active = _active_limits(limits)
     pending = bytearray()
     received = 0
     trailing_cr = False
     while True:
         cancellation.check()
-        block = prefix or response.read1(min(16_384, MAX_STREAM - received + 1))
+        block = prefix or response.read1(min(16_384, active.max_stream - received + 1))
         prefix = b""
         received += len(block)
         evidence.raw_bytes = received
-        if received > MAX_STREAM:
+        if received > active.max_stream:
             raise ConnectionError("provider_stream_limit")
         if not block and response.length not in (None, 0):
             raise ConnectionError("provider_stream_incomplete")
@@ -292,7 +331,7 @@ def _stream_lines(response, cancellation, evidence, prefix=b""):
             if block.startswith(b"\n"):
                 pending.append(10)
                 start = 1
-            if len(pending) > MAX_LINE:
+            if len(pending) > active.max_line:
                 raise ConnectionError("provider_stream_limit")
             yield bytes(pending[:-(start + 1)])
             pending.clear()
@@ -300,7 +339,7 @@ def _stream_lines(response, cancellation, evidence, prefix=b""):
         for end in _SSE_END.finditer(block, start):
             pending.extend(block[start:end.end()])
             start = end.end()
-            if len(pending) > MAX_LINE:
+            if len(pending) > active.max_line:
                 raise ConnectionError("provider_stream_limit")
             # A trailing CR may be the first byte of a CRLF split across reads.
             if start == len(block) and end.group() == b"\r":
@@ -309,7 +348,7 @@ def _stream_lines(response, cancellation, evidence, prefix=b""):
             yield bytes(pending[:-(end.end() - end.start())])
             pending.clear()
         pending.extend(block[start:])
-        if len(pending) > MAX_LINE:
+        if len(pending) > active.max_line:
             raise ConnectionError("provider_stream_limit")
         if not block:
             if pending:
@@ -376,7 +415,8 @@ def _inspect_prefix(response, cancellation, evidence):
         return prefix
 
 
-def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None):
+def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None, limits=None):
+    active = _active_limits(limits)
     prefix = b""
     if inspect_media or observe_media is not None:
         evidence.media_fields, evidence.media = _media_shape(response.headers)
@@ -403,7 +443,7 @@ def _events(response, cancellation, evidence, *, inspect_media=False, observe_me
     done = False
     completed = None
     first = True
-    for line in _stream_lines(response, cancellation, evidence, prefix):
+    for line in _stream_lines(response, cancellation, evidence, prefix, limits=active):
         cancellation.check()
         evidence.lines += 1
         if first:
@@ -431,7 +471,7 @@ def _events(response, cancellation, evidence, *, inspect_media=False, observe_me
             evidence.line = "separator"
             events += 1
             evidence.events = events
-            if events > MAX_EVENTS:
+            if events > active.max_events:
                 raise ConnectionError("provider_stream_limit")
             payload = b"\n".join(data)
             if payload == b"[DONE]":
@@ -474,7 +514,11 @@ def _events(response, cancellation, evidence, *, inspect_media=False, observe_me
             event_name = None
         else:
             evidence.line = "comment" if line.startswith(b":") else "field"
-            if prefix and evidence.line == "field":
+            standard_field = (
+                line == b"id" or line.startswith(b"id:")
+                or line == b"retry" or line.startswith(b"retry:")
+            )
+            if prefix and evidence.line == "field" and not standard_field:
                 raise ConnectionError("provider_stream_event_type")
     if data:
         raise ConnectionError("provider_stream_incomplete")
@@ -498,13 +542,14 @@ class OpenAITransport:
 
     @contextlib.contextmanager
     def _request(self, host, path, *, method, body, content_type, bearer,
-                 cancellation, dispatch, revocation=False):
+                 cancellation, dispatch, revocation=False, limits=None):
+        active = _active_limits(limits)
         if not self._allowed(host, method, path, revocation):
             raise ConnectionError("invalid_provider_destination")
         if bearer is not None and (host != API_HOST or not bearer.isascii()
                                    or any(ord(char) <= 32 or ord(char) >= 127 for char in bearer)):
             raise ConnectionError("invalid_provider_credential")
-        if len(body) > MAX_JSON:
+        if len(body) > active.max_json:
             raise ConnectionError("provider_request_too_large")
         fields = [f"{method} {path} HTTP/1.1", f"Host: {host}", "Connection: close",
                   "Accept-Encoding: identity", f"Content-Length: {len(body)}"]
@@ -529,7 +574,7 @@ class OpenAITransport:
                     except OSError:
                         raise ConnectionError("provider_send_uncertain") from None
                     finally:
-                        sock.settimeout(IO_TIMEOUT)
+                        sock.settimeout(active.io_timeout)
 
                 sent = dispatch(first_write)
                 cancellation.check()
@@ -538,7 +583,7 @@ class OpenAITransport:
                 if sent < len(packet):
                     sock.sendall(packet[sent:])
                 cancellation.check()
-                with contextlib.closing(_StrictResponse(sock, method=method)) as response:
+                with contextlib.closing(_StrictResponse(sock, method=method, max_line=active.max_line)) as response:
                     response.begin()
                     _validate_http(response)
                     yield response
@@ -564,13 +609,15 @@ class OpenAITransport:
             return response.status, _read_json(response)
 
     @contextlib.contextmanager
-    def responses(self, body, bearer, cancellation, dispatch, *, inspect_media=False, observe_media=None):
-        encoded = encode_responses_body(body)
+    def responses(self, body, bearer, cancellation, dispatch, *, inspect_media=False, observe_media=None,
+                  limits=None):
+        active = _active_limits(limits)
+        encoded = encode_responses_body(body, max_json=active.max_json)
         evidence = None
         try:
             with self._request(API_HOST, RESPONSES, method="POST", body=encoded,
                                content_type="application/json", bearer=bearer,
-                               cancellation=cancellation, dispatch=dispatch) as response:
+                               cancellation=cancellation, dispatch=dispatch, limits=active) as response:
                 if response.status != 200:
                     try:
                         error_body = _read_json(response)
@@ -581,7 +628,8 @@ class OpenAITransport:
                     raise ConnectionError(response_error(response.status, error_body))
                 evidence = _StreamEvidence()
                 yield _events(
-                    response, cancellation, evidence, inspect_media=inspect_media, observe_media=observe_media,
+                    response, cancellation, evidence, inspect_media=inspect_media,
+                    observe_media=observe_media, limits=active,
                 )
         except ConnectionError as error:
             if evidence is not None and error.code in _STREAM_CODES:

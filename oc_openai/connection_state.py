@@ -22,6 +22,7 @@ class ConnectionError(RuntimeError):
 
 CREATE_FLAGS = os.O_CLOEXEC | os.O_NOFOLLOW
 MAX_STATE = 128 * 1024
+MAX_WORKER_LEASES = 16
 LOCK_SECONDS = 0.6
 
 
@@ -73,6 +74,11 @@ def _valid_record(value):
         return False
     if "worker_lease" in value and type(value["worker_lease"]) is not dict:
         return False
+    if "worker_leases" in value:
+        leases = value["worker_leases"]
+        if (type(leases) is not dict or len(leases) > MAX_WORKER_LEASES
+                or any(type(key) is not str or not key or type(item) is not dict for key, item in leases.items())):
+            return False
     if "tokens" in value:
         tokens = value["tokens"]
         if (not isinstance(tokens, dict) or not {"generation", "profile", "client"} <= value.keys()

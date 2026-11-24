@@ -242,6 +242,24 @@ class WorkstationBackend:
             raise _mapped_connection_error(error) from None
         return ConnectionBinding(selected.profile, selected.generation, MODEL, self._label, self._selection_epoch)
 
+    def verify(self):
+        """Explicit, inference-free workstation probe checking active registration and model catalog."""
+        from oc_providers.contracts import ReadinessState, VerifyResult
+
+        try:
+            binding = self.connection_state.binding()
+            models = self.connection_state.models(binding)
+        except ConnectionError as error:
+            raise _mapped_connection_error(error) from None
+        if not models:
+            raise RouteUnavailable(Reason.MODEL_UNAVAILABLE)
+        return VerifyResult(
+            provider="openai",
+            label=self._label,
+            readiness=ReadinessState.READY,
+            models=tuple(models),
+        )
+
     def require_acceptance(self, proposal, *, recovery=None):
         if recovery is not None and type(recovery) is not RecoveryMode:
             raise RouteUnavailable(Reason.DIAGNOSTIC_UNAVAILABLE)
