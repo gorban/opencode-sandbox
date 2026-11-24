@@ -102,7 +102,10 @@ def parse_canary_argv(argv: list[str]) -> CanaryArgs:
 
 
 def _trusted_source_file(path: Path) -> bytes:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        raise RuntimeFailure("untrusted canary source file") from None
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid())
@@ -114,16 +117,24 @@ def _trusted_source_file(path: Path) -> bytes:
     return data
 
 
+def _collect_dir_files(base: Path, directory: Path, out: list[Path]) -> None:
+    try:
+        info = directory.lstat()
+    except OSError:
+        raise RuntimeFailure("untrusted canary source directory") from None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+        raise RuntimeFailure("untrusted canary source directory")
+    for entry in sorted(directory.iterdir()):
+        if not entry.is_symlink() and entry.is_dir():
+            _collect_dir_files(base, entry, out)
+        else:
+            out.append(entry.relative_to(base))
+
+
 def _collect_source_files(root: Path) -> list[Path]:
     files = [Path("oc-sandbox"), Path("oc-openai.py")]
-    for rel_dir in (Path("oc_openai"), Path("oc_openai/managed")):
-        directory = root / rel_dir
-        info = directory.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
-            raise RuntimeFailure("untrusted canary source directory")
-        for entry in sorted(directory.iterdir()):
-            if entry.suffix == ".py":
-                files.append(entry.relative_to(root))
+    for pkg in ("oc_openai", "oc_providers"):
+        _collect_dir_files(root, root / pkg, files)
     return sorted(files)
 
 
@@ -219,6 +230,8 @@ class CanaryBroker:
     @contextmanager
     def _track_peer(self, sock: socket.socket):
         with self._peer_lock:
+            if self._stop.is_set():
+                raise OwnerLost("canary cancelled")
             self._active_peers.add(sock)
         try:
             yield
@@ -228,10 +241,15 @@ class CanaryBroker:
 
     def start(self) -> None:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(self.sock_path))
-        os.chmod(self.sock_path, 0o600)
-        server.listen(4)
-        server.settimeout(0.25)
+        try:
+            server.bind(str(self.sock_path))
+            os.chmod(self.sock_path, 0o600)
+            server.listen(4)
+            server.settimeout(0.25)
+        except BaseException:
+            with suppress(OSError):
+                server.close()
+            raise
         self._server = server
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()

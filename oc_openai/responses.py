@@ -274,9 +274,27 @@ class _HeaderReader:
 
 
 class _StrictResponse(http.client.HTTPResponse):
-    def __init__(self, sock, *, max_line=None, **kwargs):
+    def __init__(self, sock, *, max_line=None, keep_fp=False, **kwargs):
         super().__init__(sock, **kwargs)
         self._max_line = MAX_LINE if max_line is None else max_line
+        self._keep_fp = keep_fp
+        self._oc_sock = sock
+        self._oc_fp = None
+
+    def _close_conn(self):
+        if self._keep_fp and self.fp is not None:
+            self._oc_fp = self.fp
+            self.fp = None
+            return
+        super()._close_conn()
+
+    def close(self):
+        kept, self._oc_fp = self._oc_fp, None
+        try:
+            if kept is not None:
+                kept.close()
+        finally:
+            super().close()
 
     def begin(self):
         raw = self.fp
@@ -573,11 +591,12 @@ class _SseParser:
 
 def _verify_tls_close(response, limits):
     sock = getattr(response, "_oc_sock", None)
-    if not isinstance(sock, ssl.SSLSocket):
+    reader = getattr(response, "_oc_fp", None) or getattr(response, "fp", None)
+    if not isinstance(sock, ssl.SSLSocket) or reader is None:
         raise ConnectionError("provider_network_error")
     sock.settimeout(min(5.0, limits.io_timeout))
     try:
-        trailing = sock.recv(1)
+        trailing = reader.read(1)
     except OSError:
         raise ConnectionError("provider_network_error") from None
     if trailing:
@@ -587,6 +606,8 @@ def _verify_tls_close(response, limits):
 def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None, limits=None,
             require_done=False, require_tls_close=False):
     active = _active_limits(limits)
+    if require_tls_close and not response.chunked and response.length is None:
+        raise ConnectionError("provider_stream_incomplete")
     prefix = _resolve_stream_prefix(
         response, cancellation, evidence, inspect_media=inspect_media, observe_media=observe_media,
     )
@@ -627,7 +648,7 @@ class OpenAITransport:
 
     @contextlib.contextmanager
     def _request(self, host, path, *, method, body, content_type, bearer,
-                 cancellation, dispatch, revocation=False, limits=None):
+                 cancellation, dispatch, revocation=False, limits=None, keep_fp=False):
         active = _active_limits(limits)
         if not self._allowed(host, method, path, revocation):
             raise ConnectionError("invalid_provider_destination")
@@ -668,8 +689,9 @@ class OpenAITransport:
                 if sent < len(packet):
                     sock.sendall(packet[sent:])
                 cancellation.check()
-                with contextlib.closing(_StrictResponse(sock, method=method, max_line=active.max_line)) as response:
-                    response._oc_sock = sock
+                with contextlib.closing(
+                    _StrictResponse(sock, method=method, max_line=active.max_line, keep_fp=keep_fp),
+                ) as response:
                     response.begin()
                     _validate_http(response)
                     yield response
@@ -703,7 +725,8 @@ class OpenAITransport:
         try:
             with self._request(API_HOST, RESPONSES, method="POST", body=encoded,
                                content_type="application/json", bearer=bearer,
-                               cancellation=cancellation, dispatch=dispatch, limits=active) as response:
+                               cancellation=cancellation, dispatch=dispatch, limits=active,
+                               keep_fp=require_tls_close) as response:
                 if response.status != 200:
                     try:
                         error_body = _read_json(response)

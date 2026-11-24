@@ -63,25 +63,43 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5)
 
 
+def _wait_bounded(proc: subprocess.Popen, deadline: float, lifeline) -> int:
+    while True:
+        if lifeline is not None:
+            lifeline.check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeFailure("host command timed out")
+        try:
+            return proc.wait(timeout=min(0.1, remaining))
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def _bounded_capture(command, *, env, timeout, limit=OUTPUT_LIMIT, lifeline=None):
-    with subprocess.Popen(
+    proc = subprocess.Popen(
         command, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True,
-    ) as proc:
-        deadline = time.monotonic() + timeout
-        out_buf = bytearray()
-        err_buf = bytearray()
-        pipes = {proc.stdout.fileno(): (proc.stdout, out_buf), proc.stderr.fileno(): (proc.stderr, err_buf)}
-        for fd in pipes:
-            os.set_blocking(fd, False)
-        try:
-            _drain_pipes(pipes, deadline, limit, lifeline)
-        except BaseException:
-            _kill_process_group(proc)
-            raise
-        rc = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    )
+    deadline = time.monotonic() + timeout
+    out_buf = bytearray()
+    err_buf = bytearray()
+    pipes = {proc.stdout.fileno(): (proc.stdout, out_buf), proc.stderr.fileno(): (proc.stderr, err_buf)}
+    for fd in pipes:
+        os.set_blocking(fd, False)
+    try:
+        _drain_pipes(pipes, deadline, limit, lifeline)
+        rc = _wait_bounded(proc, deadline, lifeline)
         return subprocess.CompletedProcess(command, rc, bytes(out_buf), bytes(err_buf))
+    except BaseException:
+        _kill_process_group(proc)
+        raise
+    finally:
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                with suppress(OSError):
+                    stream.close()
 
 
 def _drain_pipes(pipes, deadline, limit, lifeline):
@@ -310,7 +328,7 @@ class PipeLifeline:
         poller = select.poll()
         poller.register(self.fd, select.POLLIN | select.POLLHUP | select.POLLERR)
         ready = poller.poll(0)
-        if any(mask & (select.POLLHUP | select.POLLERR) for _, mask in ready):
+        if ready:
             self._closed = True
             return False
         return True

@@ -237,6 +237,29 @@ class CanaryLedgerTests(unittest.TestCase):
         exp.write_bytes(before["exposure.json"])
         os.chmod(exp, 0o600)
 
+        # Present recovery receipt with empty phases[] is impossible and must fail closed before consent.
+        rec_path = self.state / "recovery-proof.json"
+        empty_rec = {
+            "version": 1, "prior": ["1" * 32], "source": "7" * 64, "phases": [],
+        }
+        rec_path.write_bytes((json.dumps(empty_rec) + "\n").encode("utf-8"))
+        os.chmod(rec_path, 0o600)
+        with self.assertRaisesRegex(CanaryLedgerError, "canary_history_corrupt"):
+            self.ledger.preflight()
+        rec_path.write_bytes(before["recovery-proof.json"])
+        os.chmod(rec_path, 0o600)
+
+        # Planted FIFO at an I4a filename must be rejected nonblocking without hanging preflight.
+        exp.unlink()
+        os.mkfifo(exp, 0o600)
+        try:
+            with self.assertRaisesRegex(CanaryLedgerError, "canary_storage_unavailable"):
+                self.ledger.preflight()
+        finally:
+            exp.unlink()
+        exp.write_bytes(before["exposure.json"])
+        os.chmod(exp, 0o600)
+
         # Non-bool delivered field in canary.json rejected.
         self.assertFalse(canary_ledger._valid_canary_record({
             "run_id": "1" * 32, "binding": "2" * 64, "model": "gpt-6.2-sol", "history_digest": "3" * 64,
@@ -275,10 +298,11 @@ class CanaryLedgerTests(unittest.TestCase):
         lock_fd = os.open(self.state / "exposure.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_deadline = time.monotonic() + 0.08
             with self.assertRaisesRegex(CanaryLedgerError, "canary_lock_timeout"):
                 self.ledger.reserve(
                     "1" * 32, self.binding, "gpt-6.2-sol", snap2.digest,
-                    deadline=time.monotonic() + 0.08,
+                    deadline=lock_deadline,
                 )
             self.assertFalse((self.state / CANARY_FILE).exists())
         finally:
@@ -435,9 +459,34 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
             "type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "\ud800",
         },))
 
+        completed_blocked_mod = _ok_events()
+        completed_blocked_mod[-1]["response"] = {
+            **completed_blocked_mod[-1]["response"],
+            "metadata": {
+                "openai_chatgpt_moderation_metadata": {
+                    "prompt": {"outputs": [{"is_blocked": True}]},
+                },
+            },
+        }
+
+        completed_ambiguous_mod = _ok_events()
+        completed_ambiguous_mod[-1]["response"] = {
+            **completed_ambiguous_mod[-1]["response"],
+            "metadata": {"unknown_safety_flag": "review"},
+        }
+
+        completed_review_rec = _ok_events()
+        completed_review_rec[-1]["response"] = {
+            **completed_review_rec[-1]["response"],
+            "metadata": {"openai_verification_recommendation": [{"action": "review"}]},
+        }
+
         refused_cases = (
             ("created_safety", created_safety),
             ("completed_outer_safety", completed_outer_safety),
+            ("completed_blocked_mod", completed_blocked_mod),
+            ("completed_ambiguous_mod", completed_ambiguous_mod),
+            ("completed_review_rec", completed_review_rec),
             ("in_progress_tool", in_progress_tool),
             ("annotated_completed", annotated_completed),
             ("surrogate_delta", surrogate_delta),
@@ -942,6 +991,17 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
              b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
              + f"{len(sse_done):x}\r\n".encode("ascii") + sse_done + b"\r\n0\r\n",
              True, False),
+            ("cl_same_record_trailing_bytes",
+             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+             + f"Content-Length: {len(sse_done)}\r\n\r\n".encode("ascii") + sse_done + b"SMUGGLED",
+             True, False),
+            ("chunked_same_record_trailing_bytes",
+             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+             + chunk_done + b"SMUGGLED",
+             True, False),
+            ("close_delimited_no_framing",
+             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" + sse_done,
+             True, False),
         )
         for name, wire, clean_tls, should_settle in cases:
             with self.subTest(name=name), socket.socket() as listener:
@@ -1057,13 +1117,16 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
                     raise self.result
                 return self.result
 
+        blocking_sock = _ShortSock(BlockingIOError())
         with self.assertRaises(OwnerLost):
-            canary._send_nonblocking_exact(_ShortSock(BlockingIOError()), b"hello")
+            canary._send_nonblocking_exact(blocking_sock, b"hello")
+        short_sock = _ShortSock(2)
         with self.assertRaises(OwnerLost):
-            canary._send_nonblocking_exact(_ShortSock(2), b"hello")
+            canary._send_nonblocking_exact(short_sock, b"hello")
         self.assertEqual(canary._send_nonblocking_exact(_ShortSock(5), b"hello"), 5)
 
-        # CanaryBroker.close() shuts down active peer sockets so close() does not hang on stalled peers.
+        # CanaryBroker.close() shuts down active peer sockets so close() does not hang on stalled peers,
+        # and _track_peer refuses late sockets once stop is set.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ledger = CanaryLedger(root / "state")
@@ -1092,8 +1155,93 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
                 elapsed = time.monotonic() - started
                 self.assertLess(elapsed, 2.0)
                 self.assertFalse(broker._thread.is_alive())
+                peer_cm = broker._track_peer(stalled)
+                with self.assertRaises(OwnerLost):
+                    _enter_cm(peer_cm)
             finally:
                 stalled.close()
+
+    def test_lifeline_poll_states_bounded_capture_preimport_provenance_and_hostile_home(self):
+        # PipeLifeline.active() treats POLLIN (unexpected byte) and POLLNVAL (closed fd) as dead.
+        r1, w1 = os.pipe()
+        try:
+            life1 = PipeLifeline(r1)
+            self.assertTrue(life1.active())
+            os.write(w1, b"x")
+            self.assertFalse(life1.active())
+        finally:
+            os.close(r1)
+            os.close(w1)
+
+        r2, w2 = os.pipe()
+        life2 = PipeLifeline(r2)
+        os.close(r2)
+        os.close(w2)
+        self.assertFalse(life2.active())
+
+        # _bounded_capture kills and reaps a child that closes both pipes and stays alive.
+        hang_cmd = [
+            sys.executable, "-c",
+            "import os, time; os.close(1); os.close(2); time.sleep(30)",
+        ]
+        started = time.monotonic()
+        with self.assertRaises(RuntimeFailure):
+            canary_runtime._bounded_capture(hang_cmd, env={"PATH": "/usr/bin:/bin"}, timeout=0.25)
+        self.assertLess(time.monotonic() - started, 3.0)
+
+        # oc-openai.py verifies --reviewed-source (including oc_providers/) BEFORE importing packages.
+        repo = Path(__file__).resolve().parents[1]
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with tempfile.TemporaryDirectory(prefix="oc-canary-prov-", dir=home) as tmp:
+            copy_root = Path(tmp) / "checkout"
+            copy_root.mkdir(mode=0o700)
+            for rel in ("oc-sandbox", "oc-openai.py"):
+                dst = copy_root / rel
+                dst.write_bytes((repo / rel).read_bytes())
+                os.chmod(dst, 0o700 if rel == "oc-sandbox" else 0o600)
+            for pkg in ("oc_openai", "oc_providers"):
+                for src in sorted((repo / pkg).rglob("*")):
+                    rel = src.relative_to(repo)
+                    dst = copy_root / rel
+                    if src.is_dir():
+                        dst.mkdir(mode=0o700, exist_ok=True)
+                    else:
+                        dst.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                        dst.write_bytes(src.read_bytes())
+                        os.chmod(dst, 0o600)
+            orig_digest = canary.canary_source_digest(copy_root)
+            sentinel = Path(tmp) / "imported_sentinel"
+            contracts = copy_root / "oc_providers" / "contracts.py"
+            contracts.write_text(
+                f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('RAN')\n"
+                + contracts.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            os.chmod(contracts, 0o600)
+            self.assertNotEqual(canary.canary_source_digest(copy_root), orig_digest)
+            res = subprocess.run(
+                [sys.executable, "-IB", str(copy_root / "oc-openai.py"),
+                 "canary", "--reviewed-source", orig_digest],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("does not match --reviewed-source", res.stderr)
+            self.assertFalse(sentinel.exists(), "oc_providers executed before --reviewed-source check!")
+
+            # oc-sandbox resolves canary HOME via getent passwd BEFORE SB="$HOME/opencode-sandbox".
+            launcher_text = (repo / "oc-sandbox").read_text(encoding="utf-8")
+            self.assertLess(launcher_text.index("/usr/bin/getent passwd"), launcher_text.index('SB="$HOME/opencode-sandbox"'))
+            stub_helper = copy_root / "oc-openai.py"
+            stub_helper.write_text("import os; print(os.environ['HOME'])\n", encoding="utf-8")
+            os.chmod(stub_helper, 0o600)
+            env = {k: v for k, v in os.environ.items() if k != "HOME"}
+            env["HOME"] = "/nonexistent/hostile-home-override"
+            res_home = subprocess.run(
+                ["bash", str(copy_root / "oc-sandbox"), "openai", "canary", "--synthetic-check"],
+                env=env, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(res_home.returncode, 0, res_home.stderr)
+            self.assertEqual(res_home.stdout.strip(), str(home))
 
 
 if __name__ == "__main__":

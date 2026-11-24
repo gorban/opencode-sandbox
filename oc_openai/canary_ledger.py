@@ -90,7 +90,7 @@ def _open_state_dir(root: Path, *, create: bool) -> int | None:
 
 def _read_private_bytes(dir_fd: int, name: str) -> bytes | None:
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
     except FileNotFoundError:
         return None
     except OSError:
@@ -154,9 +154,12 @@ def _validate_recovery_payload(name: str, payload) -> list[dict]:
         raise CanaryLedgerError(_ERR_CORRUPT)
     first = Phase.ORCHESTRATOR if name == _RECOVERY_PROOF else Phase.INITIAL
     try:
-        return _validate(payload["phases"], first=first)
+        entries = _validate(payload["phases"], first=first)
     except ValueError:
         raise CanaryLedgerError(_ERR_CORRUPT) from None
+    if not entries:
+        raise CanaryLedgerError(_ERR_CORRUPT)
+    return entries
 
 
 def _validate_i4a_entries(name: str, payload) -> list[dict]:

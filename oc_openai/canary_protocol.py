@@ -63,6 +63,16 @@ class _SafetyRejected(RuntimeError):
     """Internal marker when safety or metadata inspection requires delivery suppression."""
 
 
+def _check_moderation_or_metadata(low: str, value) -> None:
+    if low == "openai_chatgpt_moderation_metadata":
+        _validate_moderation_root(value)
+        return
+    if "moderation" in low:
+        raise _SafetyRejected("metadata_moderation")
+    if low == "metadata" and value not in (None, {}):
+        _validate_metadata_dict(value)
+
+
 def _check_safety_entry(key, value) -> None:
     if type(key) is not str:
         return
@@ -71,6 +81,12 @@ def _check_safety_entry(key, value) -> None:
         raise _SafetyRejected("metadata_guardian")
     if (low == "safety_buffering" and value is not False) or (low == "type" and value == "safety_buffering"):
         raise _SafetyRejected("safety_buffering")
+    if (low in ("is_blocked", "blocked", "flagged") and value is not False
+            or (low == "openai_verification_recommendation" and value != [])
+            or (low == "refusal" and value not in (None, "", False))
+            or (low in ("incomplete_details", "error") and value is not None)):
+        raise _SafetyRejected("safety_signal")
+    _check_moderation_or_metadata(low, value)
 
 
 def _scan_dict_children(current: dict, depth: int, stack: list) -> None:
@@ -121,19 +137,7 @@ def _validate_moderation_slot(slot) -> None:
             _validate_moderation_entries(slot[list_key])
 
 
-def _validate_metadata_event(event: dict, active_upstream_id: str | None) -> None:
-    if (event.keys() != {"type", "response_id", "sequence_number", "metadata"}
-            or active_upstream_id is None or event["response_id"] != active_upstream_id
-            or type(event["sequence_number"]) is not int
-            or not 0 <= event["sequence_number"] <= 2**31
-            or type(event["metadata"]) is not dict):
-        raise _SafetyRejected("metadata_envelope")
-    metadata = event["metadata"]
-    if not set(metadata) <= {"openai_verification_recommendation", "openai_chatgpt_moderation_metadata"}:
-        raise _SafetyRejected("metadata_fields")
-    if metadata.get("openai_verification_recommendation", []) != []:
-        raise _SafetyRejected("metadata_review")
-    moderation = metadata.get("openai_chatgpt_moderation_metadata", {})
+def _validate_moderation_root(moderation) -> None:
     if type(moderation) is not dict or not set(moderation) <= _MODERATION_ROOT_KEYS:
         raise _SafetyRejected("metadata_moderation")
     if moderation.get("presentation") not in (None, "inline"):
@@ -144,6 +148,25 @@ def _validate_metadata_event(event: dict, active_upstream_id: str | None) -> Non
     _validate_moderation_slot(moderation.get("prompt"))
     if moderation.get("response") not in (None, {}):
         raise _SafetyRejected("metadata_moderation")
+
+
+def _validate_metadata_dict(metadata) -> None:
+    if type(metadata) is not dict:
+        raise _SafetyRejected("metadata_envelope")
+    if not set(metadata) <= {"openai_verification_recommendation", "openai_chatgpt_moderation_metadata"}:
+        raise _SafetyRejected("metadata_fields")
+    if metadata.get("openai_verification_recommendation", []) != []:
+        raise _SafetyRejected("metadata_review")
+    _validate_moderation_root(metadata.get("openai_chatgpt_moderation_metadata", {}))
+
+
+def _validate_metadata_event(event: dict, active_upstream_id: str | None) -> None:
+    if (event.keys() != {"type", "response_id", "sequence_number", "metadata"}
+            or active_upstream_id is None or event["response_id"] != active_upstream_id
+            or type(event["sequence_number"]) is not int
+            or not 0 <= event["sequence_number"] <= 2**31):
+        raise _SafetyRejected("metadata_envelope")
+    _validate_metadata_dict(event["metadata"])
 
 
 class Refused(ValueError):
