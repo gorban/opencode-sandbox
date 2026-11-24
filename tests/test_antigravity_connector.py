@@ -1,6 +1,7 @@
 """Bound the resolver and race one TLS-only diagnostic against retirement."""
 
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import sys
 from tempfile import TemporaryDirectory
 from threading import Event
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -24,6 +26,16 @@ def wire(*addresses):
 
 
 class ResolverTest(unittest.TestCase):
+    def test_lookup_is_absolute(self):
+        host = dns.HOSTS[0]
+        answer = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", 443))
+        output = BytesIO()
+        with patch.object(dns.socket, "getaddrinfo", return_value=[answer]) as lookup:
+            with patch.object(dns.sys, "stdout", SimpleNamespace(buffer=output)):
+                self.assertEqual(dns.resolver_child(host), 0)
+        lookup.assert_called_once_with(host + ".", 443, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+        self.assertEqual(dns.validate_answers(output.getvalue()), ((socket.AF_INET, ("8.8.8.8", 443)),))
+
     def test_all_answers_are_validated_before_selection(self):
         valid = (socket.AF_INET, ["8.8.8.8", 443])
         valid6 = (socket.AF_INET6, ["2001:4860:4860::8888", 443, 0, 0])
@@ -88,6 +100,22 @@ class DiagnosticTest(unittest.TestCase):
             with self.assertRaises(connector.ConnectorError):
                 connector.certificate_handshake(self.attempt, self.context)
             self.assertEqual(peer.recv(1), b"")
+
+    def test_tls_setup_ignores_inherited_key_logging(self):
+        roots = next((candidate for candidate in ("/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                                                  ssl.get_default_verify_paths().cafile)
+                      if candidate and Path(candidate).is_file()), None)
+        if roots is None:
+            self.skipTest("test machine has no default CA bundle")
+        with TemporaryDirectory() as scratch:
+            key_log = Path(scratch) / "must-not-exist"
+            with patch.dict(os.environ, {"SSLKEYLOGFILE": str(key_log)}):
+                with patch.object(connector, "WORKSTATION_ROOTS", roots):
+                    with patch.object(connector.DiagnosticAttempt, "connect", side_effect=connector.ConnectorError):
+                        deadline = time.monotonic() + 1
+                        with self.assertRaises(connector.ConnectorError):
+                            connector.qualify_tls(dns.HOSTS[0], owner_fd=self.owner, deadline=deadline)
+            self.assertFalse(key_log.exists())
 
     def test_revoke_during_handshake_closes_peer(self):
         self.attempt.connect(resolver=self.resolve_locally)

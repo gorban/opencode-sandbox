@@ -16,7 +16,7 @@ from oc_antigravity_dns import HOSTS, remaining, resolve
 CHUNK = 8192
 MAX_HANDSHAKE_BYTES = 262144
 CONNECT_PENDING = {0, errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK}
-WORKSTATION_ROOTS = "/etc/pki/tls/certs/ca-bundle.crt"
+WORKSTATION_ROOTS = "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
 DIAGNOSTIC_LIFETIME = 8.0
 
 
@@ -169,8 +169,11 @@ def qualify_tls(hostname, *, owner_fd, deadline):
     cutoff = min(deadline, time.monotonic() + DIAGNOSTIC_LIFETIME)
     attempt = DiagnosticAttempt(hostname, owner_fd=owner_fd, deadline=cutoff)
     try:
-        context = ssl.create_default_context(cafile=WORKSTATION_ROOTS)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = True
         context.hostname_checks_common_name = False
+        context.load_verify_locations(cafile=WORKSTATION_ROOTS)
         attempt.connect()
         return certificate_handshake(attempt, context)
     finally:

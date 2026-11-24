@@ -130,7 +130,7 @@ def resolver_child(host):
     if host not in HOSTS:
         return 2
     try:
-        rows = socket.getaddrinfo(host, PORT, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+        rows = socket.getaddrinfo(host + ".", PORT, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
         if len(rows) > MAX_ANSWERS:
             return 1
         records = [(family, kind, protocol, address) for family, kind, protocol, _, address in rows]
