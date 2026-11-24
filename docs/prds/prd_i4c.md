@@ -20,6 +20,12 @@ and returned the signed-out ACP verdict using `agy` 1.5.15. A separate rootless 
 test completed a synthetic text turn while both containers lacked access to a synthetic private
 workstation file and socket. Enrollment and the brokered native route still need qualification.
 
+The [offline rootless qualification](spikes/i4c/) reproduced keyring restart,
+explicit signed-out ACP v1, workstation file and socket denial, and cancellation
+on the pinned `agy` 1.5.15 build. A separate private-loopback observation with a
+synthetic code recorded a native `CONNECT oauth2.googleapis.com:443` and denied
+it before any upstream exchange. Hosted egress and sign-in remain open.
+
 - [ ] Qualify the pinned `agy` binary, rootless private provider home and keyring, bounded ACP
   channel, and separately scoped enrollment and execution egress. Verify the provider cannot
   access ordinary workstation credentials. Verify that the worker and relay get only the approved
