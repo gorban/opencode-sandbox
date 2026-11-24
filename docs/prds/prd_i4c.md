@@ -68,8 +68,9 @@ test cancels after token issuance but before userinfo forwarding and verifies
 no second-peer bytes, exact service retirement and the same pending generation.
 The journal exercises ordered non-reusable reservations, cancellation across
 reopen, stale-generation rejection, and distinct retirement and readiness
-publication. Wiring the terminal, journal and credential holder together
-remains open.
+publication. A canceled cold check cannot publish. An abandoned registration
+can record verified retirement while remaining abandoned. Wiring the
+terminal, journal and credential holder together remains open.
 
 A fresh process must select exactly one existing unlock item for that
 registration in the trusted collection. Missing, locked or duplicate items

@@ -31,9 +31,10 @@ class EnrollmentJournalTest(unittest.TestCase):
         reopened.reserve(self.identity, userinfo)
         reopened.retired(self.identity, userinfo)
         with self.assertRaises(EnrollmentUnavailable):
-            reopened.mark_ready_after_cold_check(self.identity)
+            reopened.begin_cold_check(self.identity)
         reopened.record_attempt_retirement(self.identity)
-        reopened.mark_ready_after_cold_check(self.identity)
+        check = reopened.begin_cold_check(self.identity)
+        reopened.mark_ready_after_cold_check(self.identity, check)
         self.assertEqual(self.journal.status().state, "ready")
 
     def test_cancel_keeps_same_pending_generation_and_fences_old_attempt(self):
@@ -49,11 +50,11 @@ class EnrollmentJournalTest(unittest.TestCase):
         with self.assertRaises(EnrollmentUnavailable):
             self.journal.begin("a" * 64)
         with self.assertRaises(EnrollmentUnavailable):
-            self.journal.mark_ready_after_cold_check(self.identity)
+            self.journal.begin_cold_check(self.identity)
         reopened.record_attempt_retirement(self.identity)
         reopened.abandon(self.identity)
         with self.assertRaises(EnrollmentUnavailable):
-            self.journal.mark_ready_after_cold_check(self.identity)
+            self.journal.begin_cold_check(self.identity)
         self.assertEqual(self.journal.status().state, "abandoned")
 
     def test_stale_generation_cannot_change_any_state(self):
@@ -62,7 +63,7 @@ class EnrollmentJournalTest(unittest.TestCase):
         with self.assertRaises(EnrollmentUnavailable):
             self.journal.revoke(wrong)
         with self.assertRaises(EnrollmentUnavailable):
-            self.journal.mark_ready_after_cold_check(wrong)
+            self.journal.begin_cold_check(wrong)
         self.assertEqual(self.journal.status(), before)
 
     def test_concurrent_claims_spend_one_slot(self):
@@ -82,6 +83,27 @@ class EnrollmentJournalTest(unittest.TestCase):
         os.mkfifo(record, 0o600)
         with self.assertRaises(EnrollmentUnavailable):
             self.journal.status()
+
+    def test_cancel_during_cold_check_blocks_late_readiness(self):
+        self.journal.revoke(self.identity)
+        self.journal.record_attempt_retirement(self.identity)
+        check = self.journal.begin_cold_check(self.identity)
+        EnrollmentJournal(self.path).revoke(self.identity)
+        with self.assertRaises(EnrollmentUnavailable):
+            self.journal.mark_ready_after_cold_check(self.identity, check)
+        self.assertEqual(self.journal.status().state, "pending")
+
+    def test_abandoned_attempt_can_record_retirement_without_reopening(self):
+        self.journal.reserve(self.identity, HOSTS[0])
+        self.journal.abandon(self.identity)
+        reopened = EnrollmentJournal(self.path)
+        reopened.record_attempt_retirement(self.identity)
+        current = reopened.status()
+        self.assertTrue(current.attempt_retired)
+        self.assertIsNone(current.active_slot)
+        self.assertEqual(current.state, "abandoned")
+        with self.assertRaises(EnrollmentUnavailable):
+            reopened.reserve(self.identity, HOSTS[0])
 
 
 if __name__ == "__main__":

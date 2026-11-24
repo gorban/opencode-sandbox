@@ -32,6 +32,7 @@ class Enrollment:
     state: str = "pending"
     revoked: bool = False
     attempt_retired: bool = False
+    cold_check: str | None = None
     closed_slots: int = 0
     active_slot: str | None = None
 
@@ -71,6 +72,10 @@ def decode(raw):
         raise EnrollmentUnavailable("invalid enrollment retirement record")
     if enrolled.state == "ready" and not enrolled.attempt_retired:
         raise EnrollmentUnavailable("published enrollment lacks retirement evidence")
+    if enrolled.cold_check is not None:
+        require_identifier(enrolled.cold_check, 32)
+        if not enrolled.attempt_retired or enrolled.state != "pending":
+            raise EnrollmentUnavailable("invalid cold readiness check")
     return enrolled
 
 
@@ -144,45 +149,55 @@ class EnrollmentJournal:
             return enrolled.identity
 
     @contextmanager
-    def _pending(self, identity):
+    def _exact(self, identity, *, allow_abandoned=False):
         with self._locked() as directory:
             current = fetch(directory)
-            if current is None or current.identity != identity or current.state != "pending":
-                raise EnrollmentUnavailable("the exact pending enrollment changed")
+            permitted = ("pending", "abandoned") if allow_abandoned else ("pending",)
+            if current is None or current.identity != identity or current.state not in permitted:
+                raise EnrollmentUnavailable("the exact enrollment changed")
             yield directory, current
 
     def reserve(self, identity, target):
-        with self._pending(identity) as (directory, current):
+        with self._exact(identity) as (directory, current):
             index = current.closed_slots
             if current.revoked or current.active_slot is not None or index == len(HOSTS) or target != HOSTS[index]:
                 raise EnrollmentUnavailable("the enrollment tunnel slot is unavailable")
             durable_store(directory, replace(current, active_slot=target))
 
     def retired(self, identity, target):
-        with self._pending(identity) as (directory, current):
+        with self._exact(identity) as (directory, current):
             if current.revoked or current.active_slot is None or current.active_slot != target:
                 raise EnrollmentUnavailable("the enrollment tunnel did not retire in order")
             durable_store(directory, replace(current, closed_slots=current.closed_slots + 1, active_slot=None))
 
     def revoke(self, identity):
-        with self._pending(identity) as (directory, current):
-            if not current.revoked:
-                durable_store(directory, replace(current, revoked=True))
+        with self._exact(identity) as (directory, current):
+            if not current.revoked or current.cold_check is not None:
+                durable_store(directory, replace(current, revoked=True, cold_check=None))
 
     def record_attempt_retirement(self, identity):
         """Record the supervisor's verification that the broker and unit retired."""
-        with self._pending(identity) as (directory, current):
+        with self._exact(identity, allow_abandoned=True) as (directory, current):
             if not current.revoked and current.closed_slots != len(HOSTS):
                 raise EnrollmentUnavailable("the enrollment attempt is still active")
             if not current.attempt_retired:
                 durable_store(directory, replace(current, revoked=True, attempt_retired=True, active_slot=None))
 
-    def mark_ready_after_cold_check(self, identity):
-        with self._pending(identity) as (directory, current):
-            if not current.attempt_retired:
-                raise EnrollmentUnavailable("retire enrollment egress before publishing readiness")
-            durable_store(directory, replace(current, state="ready", revoked=True))
+    def begin_cold_check(self, identity):
+        with self._exact(identity) as (directory, current):
+            if not current.attempt_retired or current.cold_check is not None:
+                raise EnrollmentUnavailable("the cold readiness check is unavailable")
+            check = secrets.token_hex(16)
+            durable_store(directory, replace(current, cold_check=check))
+            return check
+
+    def mark_ready_after_cold_check(self, identity, check):
+        require_identifier(check, 32)
+        with self._exact(identity) as (directory, current):
+            if not current.attempt_retired or current.cold_check != check:
+                raise EnrollmentUnavailable("the exact cold readiness check changed")
+            durable_store(directory, replace(current, state="ready", revoked=True, cold_check=None))
 
     def abandon(self, identity):
-        with self._pending(identity) as (directory, current):
-            durable_store(directory, replace(current, state="abandoned", revoked=True))
+        with self._exact(identity) as (directory, current):
+            durable_store(directory, replace(current, state="abandoned", revoked=True, cold_check=None))
