@@ -19,6 +19,8 @@ from .protocol import MODEL, PORT, PROMPT, RecordingFake, bad_constant, unique
 
 OPEN_CODE = "edc96b3f8ef46d2309577c259167813fc943edd6e344db08848e48ec3ed4f278"
 RELAY = "2893cf9f584f34cfa2d0b8dd6ba9e63dfacd1e1105a304bb4f72317b00f89029"
+RELAY_PYTHON = "/usr/local/bin/python3"
+CONTAINER_SHELL = "/bin/sh"
 LABEL = "io.oc-sandbox.orchestrator-proof"
 FULL_ID = re.compile(r"[0-9a-f]{64}")
 PROCESS_LABEL = re.compile(r"[^:]+:[^:]+:container_t:s0:(c\d+),(c\d+)")
@@ -68,29 +70,36 @@ def inspect(kind, identity):
     return result[0]
 
 
-def preflight(root):
+def scratch_parent():
+    return Path("/run/user") / str(os.getuid())
+
+
+def check_private_directory(directory):
+    uid = os.getuid()
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700:
+        raise Failure("unsafe private scratch directory")
+    expected = f"{info.st_dev}:{info.st_ino}:{uid}:{info.st_mode:x}".encode()
+    if host("stat", "-c", "%d:%i:%u:%f", "--", str(directory)).stdout.strip() != expected:
+        raise Failure("host and devbox do not share the private scratch path")
+
+
+def preflight():
     uid = os.getuid()
     bridge = Path("/usr/bin/host-spawn").lstat()
-    info = root.lstat()
-    top = root.parent.lstat()
-    if (not uid or root.parent != Path("/tmp") or not stat.S_ISDIR(top.st_mode) or not top.st_mode & stat.S_ISVTX
-            or not stat.S_ISREG(bridge.st_mode) or bridge.st_uid != 0 or bridge.st_mode & 0o022
-            or not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700):
-        raise Failure("unsafe host bridge or scratch path")
+    if not uid or not stat.S_ISREG(bridge.st_mode) or bridge.st_uid != 0 or bridge.st_mode & 0o022:
+        raise Failure("unsafe host bridge")
     if (host("id", "-ru").stdout.strip() != str(uid).encode()
             or host("cat", "/sys/fs/selinux/enforce").stdout.strip() != b"1"
             or host("cat", "/proc/sys/crypto/fips_enabled").stdout.strip() != b"0"
             or podman("info", "--format", "{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}} {{.Host.CgroupsVersion}}").stdout.strip()
             != b"true true v2"):
         raise Failure("requires the qualified rootless SELinux host")
-    for directory, entry, owner in ((root, info, uid), (root.parent, top, 0)):
-        expected = f"{entry.st_dev}:{entry.st_ino}:{owner}:{entry.st_mode:x}".encode()
-        if host("stat", "-c", "%d:%i:%u:%f", "--", str(directory)).stdout.strip() != expected:
-            raise Failure("host and devbox do not share the private scratch path")
+    check_private_directory(scratch_parent())
 
 
 def environment(entries):
-    fields = dict(item.split("=", 1) for item in entries)
+    fields = {key: value for key, value in (item.split("=", 1) for item in entries)}
     if len(fields) != len(entries):
         raise Failure("duplicate image environment key")
     return fields
@@ -192,15 +201,15 @@ class Placement:
         for kind in ("net", "pid", "ipc", "cgroup"):
             path = "/proc/self/ns/" + kind
             worker_ns = podman("exec", worker, "/usr/bin/readlink", path).stdout.strip()
-            relay_ns = podman("exec", relay, "/usr/local/bin/python3", "-IB", "-c",
+            relay_ns = podman("exec", relay, RELAY_PYTHON, "-IB", "-c",
                               "import os, sys; print(os.readlink(sys.argv[1]))", path).stdout.strip()
             if ((worker_ns == relay_ns) != (kind == "net")
                     or host("readlink", path).stdout.strip() in (worker_ns, relay_ns)):
                 raise Failure(f"unexpected {kind} namespace placement")
-        podman("exec", worker, "/bin/sh", "-ec",
+        podman("exec", worker, CONTAINER_SHELL, "-ec",
                'test ! -e /fixture && test ! -e /sandbox && test ! -e /run/host && test ! -e /run/user'
                ' && test ! -e /var/run/docker.sock && test ! -e "$1"', "fixture", pwd.getpwuid(os.getuid()).pw_dir)
-        podman("exec", relay, "/bin/sh", "-ec", 'test -S /fixture/provider.sock && test -r /fixture/proof')
+        podman("exec", relay, CONTAINER_SHELL, "-ec", 'test -S /fixture/provider.sock && test -r /fixture/proof')
 
     def close(self):
         if not self.attempted:
@@ -252,7 +261,7 @@ def run_open_code(worker):
         raise Failure("unexpected OpenCode version")
     project = config()
     project["providers"]["local"]["settings"]["baseURL"] = "http://127.0.0.1:9/v1"
-    podman("exec", worker, "/bin/sh", "-ec", 'mkdir -p /job-home/config/opencode'
+    podman("exec", worker, CONTAINER_SHELL, "-ec", 'mkdir -p /job-home/config/opencode'
            ' && printf %s "$1" > /workspace/opencode.json'
            ' && printf %s "$1" > /job-home/config/opencode/opencode.json',
            "fixture", json.dumps(project))
@@ -280,7 +289,7 @@ def verify_result(wire):
 def wait_relay(relay):
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        rows = podman("exec", relay, "/usr/local/bin/python3", "-IB", "-c",
+        rows = podman("exec", relay, RELAY_PYTHON, "-IB", "-c",
                       "print(open('/proc/net/tcp').read(), end='')").stdout.splitlines()[1:]
         if any(row.split()[1] == f"0100007F:{PORT:04X}".encode() and row.split()[3] == b"0A" for row in rows):
             return
@@ -310,7 +319,7 @@ with socket.create_connection(('127.0.0.1', port), timeout=3) as client:
             print(stream.readline(128).decode().rstrip('\\r\\n'))
 """
     mode = "count" if count_bytes else "status"
-    return podman("exec", relay, "/usr/local/bin/python3", "-IB", "-c", program, str(PORT), body.decode(), mode).stdout
+    return podman("exec", relay, RELAY_PYTHON, "-IB", "-c", program, str(PORT), body.decode(), mode).stdout
 
 
 def verify_one_admission(broker, relay):
@@ -324,15 +333,15 @@ def verify_one_admission(broker, relay):
 
 
 @contextmanager
-def placed_broker(mode, lifeline, *, before_delivery=None):
-    if mode != "distrobox":
-        raise Failure("the offline check currently requires the qualified devbox placement")
+def placed_broker(lifeline, *, before_delivery=None):
     os.umask(0o077)
-    root = Path(tempfile.mkdtemp(prefix=f"oc-orch-{os.getpid()}-", dir="/tmp"))
+    preflight()
+    lifeline.check()
+    root = Path(tempfile.mkdtemp(prefix=f"oc-orch-{os.getpid()}-", dir=scratch_parent()))
     placement = Placement(root, lifeline)
     try:
         lifeline.check()
-        preflight(root)
+        check_private_directory(root)
         worker_files, relay_files, proof = seeds(root)
         with (RecordingFake(relay_files / "provider.sock", proof, authorized=lifeline.active,
                             before_delivery=before_delivery) as broker,
@@ -340,9 +349,9 @@ def placed_broker(mode, lifeline, *, before_delivery=None):
             worker = placement.create("open-code", OPEN_CODE, "none", worker_files / "opencode.json",
                                       "/etc/opencode/opencode.json", {"HOME": "/job-home", "TMPDIR": "/job-tmp",
                                       "XDG_CONFIG_HOME": "/job-home/config", "OPENCODE_CONFIG_PROJECT_DISABLE": "true"},
-                                      ("/job-home", "/job-tmp", "/workspace"), "/bin/sh", "-c", "exec sleep 90")
+                                      ("/job-home", "/job-tmp", "/workspace"), CONTAINER_SHELL, "-c", "exec sleep 90")
             relay = placement.create("relay", RELAY, f"container:{worker}", relay_files, "/fixture", {}, (),
-                                     "/usr/local/bin/python3", "-IB", "/fixture/relay.py")
+                                     RELAY_PYTHON, "-IB", "/fixture/relay.py")
             placement.verify_pair(worker, relay)
             wait_relay(relay)
             lifeline.check()
@@ -354,8 +363,8 @@ def placed_broker(mode, lifeline, *, before_delivery=None):
             shutil.rmtree(root)
 
 
-def run_proof(mode, lifeline):
-    with placed_broker(mode, lifeline) as (worker, relay, broker):
+def run_proof(lifeline):
+    with placed_broker(lifeline) as (worker, relay, broker):
         run_open_code(worker)
         lifeline.check()
         verify_one_admission(broker, relay)

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from oc_orchestrator.owner import Lifeline
-from oc_orchestrator.runtime import Failure, LABEL, fixture_request, inspect, placed_broker, podman, run_open_code
+from oc_orchestrator.runtime import Failure, LABEL, fixture_request, inspect, placed_broker, podman, run_open_code, scratch_parent
 
 
 def launch_label(root, count):
@@ -37,7 +37,7 @@ def wait_for_launch(launcher, count):
     deadline = time.monotonic() + 30
     while launcher.poll() is None and time.monotonic() < deadline:
         for pid in children.read_text().split():
-            for root in Path("/tmp").glob(f"oc-orch-{pid}-*"):
+            for root in scratch_parent().glob(f"oc-orch-{pid}-*"):
                 label = launch_label(root, count)
                 if label:
                     return root, label
@@ -73,7 +73,7 @@ def check_owner_loss(count):
 
 def check_before_delivery():
     lifeline = SimpleNamespace(check=lambda: None, active=lambda: True, revoke_on_loss=lambda _: nullcontext())
-    with placed_broker("distrobox", lifeline) as (worker, _, initial):
+    with placed_broker(lifeline) as (worker, _, initial):
         run_open_code(worker)
         body = initial.receipt()[3]
         if not body:
@@ -82,7 +82,7 @@ def check_before_delivery():
     read_fd, write_fd = os.pipe()
     with os.fdopen(read_fd, "rb") as read_end, os.fdopen(write_fd, "wb") as write_end:
         lifeline = Lifeline(read_end.fileno())
-        with placed_broker("distrobox", lifeline, before_delivery=write_end.close) as (_, relay, broker):
+        with placed_broker(lifeline, before_delivery=write_end.close) as (_, relay, broker):
             reply = fixture_request(relay, body, count_bytes=True)
             if reply != b"0\n" or broker.receipt() != (1, 0, "recorded_offline", body):
                 raise Failure("owner EOF did not fence the response after one admission")

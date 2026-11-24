@@ -30,7 +30,7 @@ HEADERS = frozenset({
     b"x-session-id",
 })
 OPTIONS = {"model": MODEL, "stream": True, "stream_options": {"include_usage": True}, "max_completion_tokens": 2048}
-SYSTEM_DATE = re.compile(r"^Today's date: [A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{2} [0-9]{4}$", re.MULTILINE)
+SYSTEM_DATE = re.compile(r"^Today's date: [A-Z][a-z]{2} [A-Z][a-z]{2} \d{2} \d{4}$", re.MULTILINE | re.ASCII)
 SYSTEM_DIGEST = "7dbcff5fc8be1a8df35451a145f885302a0762341cb08e2c2bac7206192ad118"
 REFUSAL = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
@@ -87,7 +87,7 @@ def request_body(connection, deadline, port):
             or fields.get(b"content-type", b"").lower() not in {b"application/json", b"application/json; charset=utf-8"}):
         raise Refused()
     length = fields.get(b"content-length", b"")
-    if not re.fullmatch(rb"[1-9][0-9]{0,4}", length) or not len(data) <= int(length) <= REQUEST_LIMIT:
+    if not re.fullmatch(rb"[1-9]\d{0,4}", length) or not len(data) <= int(length) <= REQUEST_LIMIT:
         raise Refused()
     return bytes(data) + fixed_bytes(connection, int(length) - len(data), deadline)
 

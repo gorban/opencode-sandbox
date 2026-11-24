@@ -56,8 +56,8 @@ class Lifeline:
                 self.revoke = None
 
 
-def supervise(script: Path, placement):
-    command = [sys.executable, "-IB", str(script), "_owner", placement]
+def supervise(script: Path):
+    command = [sys.executable, "-IB", str(script), "_owner"]
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True) as owner:
         try:
             if owner.stdout.read(1) == b"R":

@@ -112,7 +112,7 @@ class OrchestratorTest(unittest.TestCase):
                     with connect(address, listener, body, proof) as client:
                         self.assertIn(b"403 Forbidden", response(client))
                 with connect(address, listener, payload(), b"q" * 32) as client:
-                    self.assertEqual(b"", response(client))
+                    self.assertEqual(response(client), b"")
                 self.assertEqual(broker.admissions, 0)
                 with connect(address, listener, payload()) as client:
                     self.assertIn(b'"content": "ok"', response(client))

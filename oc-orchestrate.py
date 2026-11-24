@@ -37,18 +37,21 @@ def interrupt(_number, _frame):
 
 
 def main():
-    if sys.argv[1:2] == ["_owner"] and len(sys.argv) == 3:
-        return run_owner(sys.argv[2])
+    if sys.argv[1:] == ["_owner"]:
+        return run_owner()
     parser = argparse.ArgumentParser(prog="oc-sandbox orchestrate", allow_abbrev=False)
     parser.add_argument("--synthetic-check", action="store_true", help="run a disposable offline OpenCode check")
     args = parser.parse_args(sys.argv[2:])
     if not args.synthetic_check:
         print("orchestrate: live_route_unqualified", file=sys.stderr)
         return 2
+    if sys.argv[1:2] != ["distrobox"]:
+        print("orchestrate: the offline check currently requires the qualified devbox placement", file=sys.stderr)
+        return 1
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGHUP, interrupt)
     try:
-        code = supervise(SOURCE, sys.argv[1] if len(sys.argv) > 1 else "local")
+        code = supervise(SOURCE)
     except KeyboardInterrupt:
         print("orchestrate: interrupted", file=sys.stderr)
         return 130
@@ -60,9 +63,9 @@ def main():
     return code
 
 
-def run_owner(mode):
+def run_owner():
     try:
-        run_proof(mode, accept_launch())
+        run_proof(accept_launch())
     except (Failure, OwnerLost) as error:
         print(f"orchestrate: {error}", file=sys.stderr)
         return 1
