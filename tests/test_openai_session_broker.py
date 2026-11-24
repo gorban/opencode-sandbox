@@ -1269,8 +1269,9 @@ class SessionBrokerTests(unittest.TestCase):
             "phase": "orchestrator", "max_input": 922_000, "max_output": 128_000, "actual": [5, 5],
         }), encoding="ascii")
         diag_path.chmod(0o600)
+        diag_ledger = ExposureLedger(diag_dir)
         with self.assertRaisesRegex(ExposureError, "invalid_exposure_record"):
-            ExposureLedger(diag_dir).inspect_hold()
+            diag_ledger.inspect_hold()
 
     def test_reciprocal_r2_stalled_peer_never_holds_locks_during_fenced_send(self):
         auth_lock = threading.Lock()

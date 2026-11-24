@@ -30,7 +30,9 @@ _RECOVERY_NAMES = (
     _RECOVERY_PROOF, _RECOVERY_WORKER, _RECOVERY_WORKER_PROGRESS,
     _RECOVERY_TRACE, _RECOVERY_METADATA, _RECOVERY_MODERATION,
 )
-_CANARY_NAMES = ("canary.json", "canary-recovery.json")
+_CANARY = "canary.json"
+_CANARY_RECOVERY = "canary-recovery.json"
+_CANARY_NAMES = (_CANARY, _CANARY_RECOVERY)
 _LOCK = "exposure.lock"
 _RUN = re.compile(r"[0-9a-f]{32}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -216,7 +218,7 @@ def _validate_settled_canary(record: dict) -> tuple[bool, int]:
 def _validate_canary_record(name: str, record) -> tuple[bool, int]:
     if type(record) is not dict:
         raise ExposureError(_ERR_INVALID_RECORD)
-    _validate_canary_fields(record, recovery=(name == "canary-recovery.json"))
+    _validate_canary_fields(record, recovery=(name == _CANARY_RECOVERY))
     if record["outcome"] == "unsettled":
         if record["actual"] is not None or record.get("delivered", False) is not False:
             raise ExposureError(_ERR_INVALID_RECORD)
@@ -427,13 +429,13 @@ class ExposureLedger:
 
     @staticmethod
     def _validate_canary_recovery_link(loaded_files: dict[str, tuple[bytes, object]]) -> None:
-        if "canary-recovery.json" not in loaded_files:
+        if _CANARY_RECOVERY not in loaded_files:
             return
-        canary = loaded_files.get("canary.json")
+        canary = loaded_files.get(_CANARY)
         if canary is None:
             raise ExposureError(_ERR_INVALID_RECORD)
         canary_raw, canary_parsed = canary
-        _rec_raw, rec_parsed = loaded_files["canary-recovery.json"]
+        _rec_raw, rec_parsed = loaded_files[_CANARY_RECOVERY]
         if (canary_parsed["outcome"] != "unsettled"
                 or rec_parsed["prior_canary_run_id"] != canary_parsed["run_id"]
                 or rec_parsed["binding"] != canary_parsed["binding"]

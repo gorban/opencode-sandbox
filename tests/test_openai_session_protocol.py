@@ -502,10 +502,10 @@ class SessionProtocolTests(unittest.TestCase):
             frozenset({"read"}),
         )
         for bad_choice in ({"type": "function", "name": "bash"}, "required"):
+            bad_req = _http_req("POST", "/v1/responses", {**base, "tool_choice": bad_choice})
             with self.subTest(bad_choice=bad_choice), self.assertRaises(RequestRefused) as err_req:
                 parse_worker_request(
-                    _http_req("POST", "/v1/responses", {**base, "tool_choice": bad_choice}),
-                    expected_token="tok-secret", allowed_models=self.models, vault=self.vault,
+                    bad_req, expected_token="tok-secret", allowed_models=self.models, vault=self.vault,
                 )
             self.assertEqual(err_req.exception.status, 400)
 
