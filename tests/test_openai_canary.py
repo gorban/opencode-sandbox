@@ -481,12 +481,36 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
             "metadata": {"openai_verification_recommendation": [{"action": "review"}]},
         }
 
+        mod_classifier_obj = _ok_events(extra=({
+            "type": "response.metadata", "response_id": "resp_ok_1", "sequence_number": 1,
+            "metadata": {
+                "openai_chatgpt_moderation_metadata": {
+                    "prompt": {"outputs": [{"is_blocked": False, "classifier": {"requires_review": True}}]},
+                },
+            },
+        },))
+
+        mod_nonscalar_score = _ok_events(extra=({
+            "type": "response.metadata", "response_id": "resp_ok_1", "sequence_number": 1,
+            "metadata": {
+                "openai_chatgpt_moderation_metadata": {
+                    "prompt": {"outputs": [{"is_blocked": False, "score": {"level": "high"}}]},
+                },
+            },
+        },))
+
+        completed_requires_review = _ok_events()
+        completed_requires_review[-1] = {**completed_requires_review[-1], "requires_review": True}
+
         refused_cases = (
             ("created_safety", created_safety),
             ("completed_outer_safety", completed_outer_safety),
             ("completed_blocked_mod", completed_blocked_mod),
             ("completed_ambiguous_mod", completed_ambiguous_mod),
             ("completed_review_rec", completed_review_rec),
+            ("mod_classifier_obj", mod_classifier_obj),
+            ("mod_nonscalar_score", mod_nonscalar_score),
+            ("completed_requires_review", completed_requires_review),
             ("in_progress_tool", in_progress_tool),
             ("annotated_completed", annotated_completed),
             ("surrogate_delta", surrogate_delta),
@@ -731,43 +755,60 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
         self.assertIn("not yet qualified", res.stderr)
 
     def test_broker_refused_turn_settles_usage_and_delivers_zero_bytes(self):
-        token = secrets.token_hex(32)
-        proof = secrets.token_bytes(32)
-        sock_path = self.scratch / "refused.sock"
-        snap = self.ledger.preflight()
-
-        @contextmanager
-        def tool_upstream(body, *, before_write, deadline, cancelled):
-            before_write()
-            yield _ok_events(extra=({
+        cases = (
+            ("tool_item", {
                 "type": "response.output_item.added", "output_index": 0,
                 "item": {"id": "fc_1", "type": "function_call", "name": "bash", "arguments": "{}"},
-            },))
-
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-
-        broker = canary.CanaryBroker(
-            sock_path, proof=proof, worker_token=token, bound_model="gpt-6.2-sol",
-            ledger=self.ledger, run_id="3" * 32, binding_hash=self.binding,
-            history_digest=snap.digest, upstream_stream=tool_upstream,
-            fenced_client_write=lambda fn: fn(), check_alive=lambda: None, port=port,
+            }),
+            ("moderation_requires_review", {
+                "type": "response.metadata", "response_id": "resp_ok_1", "sequence_number": 1,
+                "metadata": {
+                    "openai_chatgpt_moderation_metadata": {
+                        "prompt": {"outputs": [{"is_blocked": False, "classifier": {"requires_review": True}}]},
+                    },
+                },
+            }),
         )
-        broker.start()
-        try:
-            resp = _send_via_uds(
-                sock_path, proof, _http_post("/v1/responses", token, _valid_inbound_payload(), port=port), port=port,
-            )
-            self.assertEqual(resp, b"")
-            self.assertEqual(broker.delivered_bytes, 0)
-            self.assertEqual(broker.ledger_outcome, "refused_settled")
-            rec = json.loads((self.state / CANARY_FILE).read_text())
-            self.assertEqual(rec["outcome"], "refused_settled")
-            self.assertEqual(rec["actual"], [11, 2])
-            self.assertIs(rec["delivered"], False)
-        finally:
-            broker.close()
+        for case_name, extra_event in cases:
+            with self.subTest(case=case_name):
+                state_dir = self.scratch / f"refused-{case_name}"
+                state_dir.mkdir(mode=0o700)
+                ledger = CanaryLedger(state_dir)
+                token = secrets.token_hex(32)
+                proof = secrets.token_bytes(32)
+                sock_path = self.scratch / f"refused-{case_name}.sock"
+                snap = ledger.preflight()
+
+                @contextmanager
+                def refused_upstream(body, *, before_write, deadline, cancelled, ev=extra_event):
+                    before_write()
+                    yield _ok_events(extra=(ev,))
+
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    port = probe.getsockname()[1]
+
+                broker = canary.CanaryBroker(
+                    sock_path, proof=proof, worker_token=token, bound_model="gpt-6.2-sol",
+                    ledger=ledger, run_id="3" * 32, binding_hash=self.binding,
+                    history_digest=snap.digest, upstream_stream=refused_upstream,
+                    fenced_client_write=lambda fn: fn(), check_alive=lambda: None, port=port,
+                )
+                broker.start()
+                try:
+                    resp = _send_via_uds(
+                        sock_path, proof, _http_post("/v1/responses", token, _valid_inbound_payload(), port=port),
+                        port=port,
+                    )
+                    self.assertEqual(resp, b"")
+                    self.assertEqual(broker.delivered_bytes, 0)
+                    self.assertEqual(broker.ledger_outcome, "refused_settled")
+                    rec = json.loads((state_dir / CANARY_FILE).read_text())
+                    self.assertEqual(rec["outcome"], "refused_settled")
+                    self.assertEqual(rec["actual"], [11, 2])
+                    self.assertIs(rec["delivered"], False)
+                finally:
+                    broker.close()
 
 
 class CanaryRealPodmanTests(unittest.TestCase):
@@ -1242,6 +1283,24 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
             )
             self.assertEqual(res_home.returncode, 0, res_home.stderr)
             self.assertEqual(res_home.stdout.strip(), str(home))
+
+        # Early close() on a keep_fp=True _StrictResponse before body exhaustion closes its BufferedReader.
+        from oc_openai.responses import _StrictResponse
+
+        s1, s2 = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s2.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+            resp = _StrictResponse(s1, method="POST", keep_fp=True)
+            raw_fp = resp.fp
+            resp.begin()
+            resp.close()
+            self.assertTrue(resp.closed)
+            self.assertIsNone(resp.fp)
+            self.assertIsNone(resp._oc_fp)
+            self.assertTrue(raw_fp.closed)
+        finally:
+            s1.close()
+            s2.close()
 
 
 if __name__ == "__main__":

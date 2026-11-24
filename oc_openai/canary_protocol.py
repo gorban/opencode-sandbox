@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import socket
@@ -81,7 +82,8 @@ def _check_safety_entry(key, value) -> None:
         raise _SafetyRejected("metadata_guardian")
     if (low == "safety_buffering" and value is not False) or (low == "type" and value == "safety_buffering"):
         raise _SafetyRejected("safety_buffering")
-    if (low in ("is_blocked", "blocked", "flagged") and value is not False
+    if (low in ("is_blocked", "blocked", "flagged", "requires_review", "needs_review", "review_required")
+            and value is not False
             or (low == "openai_verification_recommendation" and value != [])
             or (low == "refusal" and value not in (None, "", False))
             or (low in ("incomplete_details", "error") and value is not None)):
@@ -116,13 +118,24 @@ def _scan_global_safety(obj) -> None:
             _scan_list_children(current, depth, stack)
 
 
+def _validate_moderation_entry(entry) -> None:
+    if (type(entry) is not dict or not set(entry) <= _MODERATION_ENTRY_KEYS
+            or entry.get("is_blocked") is not False):
+        raise _SafetyRejected("metadata_moderation")
+    for text_key in ("category", "classifier", "label"):
+        val = entry.get(text_key)
+        if val is not None and (type(val) is not str or len(val) > 256):
+            raise _SafetyRejected("metadata_moderation")
+    score = entry.get("score")
+    if score is not None and (type(score) not in (int, float) or not math.isfinite(score)):
+        raise _SafetyRejected("metadata_moderation")
+
+
 def _validate_moderation_entries(entries) -> None:
     if type(entries) is not list or len(entries) > 32:
         raise _SafetyRejected("metadata_moderation")
     for entry in entries:
-        if (type(entry) is not dict or not set(entry) <= _MODERATION_ENTRY_KEYS
-                or entry.get("is_blocked") is not False):
-            raise _SafetyRejected("metadata_moderation")
+        _validate_moderation_entry(entry)
 
 
 def _validate_moderation_slot(slot) -> None:

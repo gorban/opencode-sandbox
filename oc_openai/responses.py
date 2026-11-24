@@ -289,6 +289,7 @@ class _StrictResponse(http.client.HTTPResponse):
         super()._close_conn()
 
     def close(self):
+        self._keep_fp = False
         kept, self._oc_fp = self._oc_fp, None
         try:
             if kept is not None:
