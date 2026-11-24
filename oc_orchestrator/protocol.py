@@ -1,8 +1,11 @@
 """One authenticated, text-only turn against an in-process recording fake."""
 
+from array import array
 from contextlib import suppress
+import hashlib
 import hmac
 import json
+import os
 import re
 import socket
 import threading
@@ -26,10 +29,10 @@ HEADERS = frozenset({
     b"x-opencode-project", b"x-opencode-session", b"x-opencode-session-id", b"x-session-affinity",
     b"x-session-id",
 })
-BODY_FIELDS = frozenset({
-    "messages", "model", "stream", "tools", "tool_choice", "stream_options",
-    "max_completion_tokens", "max_tokens", "parallel_tool_calls", "temperature", "top_p",
-})
+OPTIONS = {"model": MODEL, "stream": True, "stream_options": {"include_usage": True}, "max_completion_tokens": 2048}
+SYSTEM_DATE = re.compile(r"^Today's date: [A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{2} [0-9]{4}$", re.MULTILINE)
+SYSTEM_DIGEST = "7dbcff5fc8be1a8df35451a145f885302a0762341cb08e2c2bac7206192ad118"
+REFUSAL = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
 
 class Refused(ValueError):
@@ -61,7 +64,7 @@ def fixed_bytes(connection, length, deadline):
     return bytes(data)
 
 
-def request_body(connection, deadline):
+def request_body(connection, deadline, port):
     delimiter = b"\r\n\r\n"
     head = bytearray()
     while delimiter not in head:
@@ -79,7 +82,8 @@ def request_body(connection, deadline):
         if not separator or name not in HEADERS or name in fields or not re.fullmatch(rb"[ -~]+", value):
             raise Refused()
         fields[name] = value
-    if (fields.get(b"host") != f"127.0.0.1:{PORT}".encode()
+    if (fields.get(b"host") != f"127.0.0.1:{port}".encode()
+            or fields.get(b"authorization") != b"Bearer offline-fixture"
             or fields.get(b"content-type", b"").lower() not in {b"application/json", b"application/json; charset=utf-8"}):
         raise Refused()
     length = fields.get(b"content-length", b"")
@@ -88,37 +92,52 @@ def request_body(connection, deadline):
     return bytes(data) + fixed_bytes(connection, int(length) - len(data), deadline)
 
 
-def text(content):
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list) or any(
-        not isinstance(item, dict) or set(item) != {"type", "text"} or item["type"] != "text"
-        or not isinstance(item["text"], str) for item in content
-    ):
-        raise Refused()
-    return "".join(item["text"] for item in content)
+def bad_constant(_value):
+    raise Refused()
 
 
 def accept_text(body):
-    data = json.loads(body, object_pairs_hook=unique)
-    if (not isinstance(data, dict) or data.keys() - BODY_FIELDS or data.get("model") != MODEL
-            or data.get("stream") is not True or data.get("tools", []) != []
-            or data.get("tool_choice") not in (None, "none", "auto")):
+    data = json.loads(body.decode("utf-8"), object_pairs_hook=unique, parse_constant=bad_constant)
+    if not isinstance(data, dict):
         raise Refused()
-    messages = data.get("messages")
-    if not isinstance(messages, list) or not 1 <= len(messages) <= 8:
+    messages = data.pop("messages", None)
+    if (json.dumps(data, sort_keys=True) != json.dumps(OPTIONS, sort_keys=True)
+            or not isinstance(messages, list) or len(messages) != 2
+            or messages[1] != {"role": "user", "content": PROMPT}):
         raise Refused()
-    user = []
-    for message in messages:
-        if not isinstance(message, dict) or set(message) != {"role", "content"}:
+    system = messages[0]
+    if (not isinstance(system, dict) or system.keys() != {"role", "content"} or system["role"] != "system"
+            or not isinstance(system["content"], str)):
+        raise Refused()
+    normalized, count = SYSTEM_DATE.subn("Today's date: [date]", system["content"])
+    if count != 1 or hashlib.sha256(normalized.encode()).hexdigest() != SYSTEM_DIGEST:
+        raise Refused()
+
+
+def receive_client(control, port):
+    fds = array("i")
+    marker, messages, flags, _ = control.recvmsg(1, socket.CMSG_SPACE(fds.itemsize * 2), socket.MSG_CMSG_CLOEXEC)
+    try:
+        for level, kind, data in messages:
+            if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
+                fds.frombytes(data[:len(data) - len(data) % fds.itemsize])
+        if marker != b"F" or flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC) or len(messages) != 1 or len(fds) != 1:
             raise Refused()
-        value = text(message["content"])
-        if message["role"] == "user":
-            user.append(value)
-        elif message["role"] != "system":
+        client = socket.socket(fileno=fds[0])
+        fds.pop()
+    finally:
+        for fd in fds:
+            os.close(fd)
+    try:
+        if (client.getsockopt(socket.SOL_SOCKET, socket.SO_DOMAIN) != socket.AF_INET
+                or client.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
+                or client.getsockopt(socket.SOL_SOCKET, socket.SO_PROTOCOL) != socket.IPPROTO_TCP
+                or client.getsockname() != ("127.0.0.1", port) or client.getpeername()[0] != "127.0.0.1"):
             raise Refused()
-    if user != [PROMPT]:
-        raise Refused()
+        return client
+    except BaseException:
+        client.close()
+        raise
 
 
 def reply_bytes(events):
@@ -145,19 +164,22 @@ def reply_bytes(events):
 class RecordingFake:
     """Per-launch capability, one accepted request and no routable upstream."""
 
-    def __init__(self, address, proof, *, after_send=None, events=FIXTURE_EVENTS):
+    def __init__(self, address, proof, *, port=PORT, before_delivery=None, events=FIXTURE_EVENTS):
         self.proof = proof
-        self.after_send = after_send
+        self.port = port
+        self.before_delivery = before_delivery
         self.events = events
         self.lock = threading.Lock()
         self.active = True
         self.admissions = 0
         self.refusals = 0
         self.settlement = "unsent"
+        self.recorded_body = None
         self.connection = None
         self.listener = socket.socket(socket.AF_UNIX)
         try:
             self.listener.bind(str(address))
+            os.chmod(address, 0o600)
             self.listener.listen(2)
             self.listener.settimeout(0.2)
         except BaseException:
@@ -192,37 +214,60 @@ class RecordingFake:
             except OSError:
                 return
             with connection:
-                with self.lock:
-                    if not self.active:
-                        return
-                    self.connection = connection
                 try:
-                    self.turn(connection)
+                    self.accept(connection)
                 except (OSError, ValueError, RecursionError):
                     with self.lock:
                         self.refusals += 1
-                    with suppress(OSError):
-                        connection.settimeout(0.2)
-                        connection.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 finally:
                     with self.lock:
                         self.connection = None
 
-    def turn(self, connection):
+    def track(self, connection):
+        with self.lock:
+            if not self.active:
+                raise Refused()
+            self.connection = connection
+
+    def accept(self, control):
+        self.track(control)
         deadline = time.monotonic() + TOTAL
-        if not hmac.compare_digest(fixed_bytes(connection, PROOF_SIZE, deadline), self.proof):
+        if not hmac.compare_digest(fixed_bytes(control, PROOF_SIZE, deadline), self.proof):
             raise Refused()
-        accept_text(request_body(connection, deadline))
+        with receive_client(control, self.port) as client:
+            self.track(client)
+            self.deliver(client, deadline)
+
+    def admit(self, body):
+        accept_text(body)
         with self.lock:
             if not self.active or self.admissions:
                 raise Refused()
             self.admissions += 1
             self.settlement = "recorded_offline"
-        if self.after_send is not None:
-            self.after_send()
+            self.recorded_body = body
+
+    def deliver(self, client, deadline):
+        try:
+            self.admit(request_body(client, deadline, self.port))
+            response = reply_bytes(self.events)
+        except (OSError, ValueError, RecursionError):
+            with self.lock:
+                self.refusals += 1
+            with suppress(OSError, Refused):
+                self.write(client, REFUSAL)
+            return
+        if self.before_delivery is not None:
+            self.before_delivery()
+        self.write(client, response)
+
+    def write(self, client, response):
         with self.lock:
             if self.active:
-                connection.setblocking(False)
-                response = reply_bytes(self.events)
-                if connection.send(response) != len(response):
+                client.setblocking(False)
+                if client.send(response) != len(response):
                     raise Refused()
+
+    def receipt(self):
+        with self.lock:
+            return self.admissions, self.refusals, self.settlement, self.recorded_body

@@ -2,12 +2,33 @@
 """Enter the restricted orchestrator before normal sandbox setup."""
 
 import argparse
+import os
 import signal
+import stat
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+SOURCE = Path(__file__).resolve()
 
+
+def check_sources():
+    package = SOURCE.parent / "oc_orchestrator"
+    for path in (SOURCE.parent, package, SOURCE, *(package / name for name in (
+            "__init__.py", "capture.py", "owner.py", "protocol.py", "relay.py", "runtime.py"))):
+        info = path.lstat()
+        kind = stat.S_ISDIR if path in (SOURCE.parent, package) else stat.S_ISREG
+        if not kind(info.st_mode) or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+            raise ValueError("unsafe offline launcher source")
+
+
+try:
+    check_sources()
+except (OSError, ValueError):
+    raise SystemExit("orchestrate: unavailable trusted launcher sources") from None
+
+sys.path.insert(0, str(SOURCE.parent))
+
+from oc_orchestrator.owner import OwnerLost, accept_launch, supervise
 from oc_orchestrator.runtime import Failure, run_proof
 
 
@@ -16,6 +37,8 @@ def interrupt(_number, _frame):
 
 
 def main():
+    if sys.argv[1:2] == ["_owner"] and len(sys.argv) == 3:
+        return run_owner(sys.argv[2])
     parser = argparse.ArgumentParser(prog="oc-sandbox orchestrate", allow_abbrev=False)
     parser.add_argument("--synthetic-check", action="store_true", help="run a disposable offline OpenCode check")
     args = parser.parse_args(sys.argv[2:])
@@ -25,17 +48,27 @@ def main():
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGHUP, interrupt)
     try:
-        run_proof(sys.argv[1])
-    except Failure as error:
-        print(f"orchestrate: {error}", file=sys.stderr)
-        return 1
+        code = supervise(SOURCE, sys.argv[1] if len(sys.argv) > 1 else "local")
     except KeyboardInterrupt:
         print("orchestrate: interrupted", file=sys.stderr)
         return 130
     except (OSError, ValueError):
         print("orchestrate: local proof failed", file=sys.stderr)
         return 1
-    print("ok")
+    if code == 0:
+        print("ok")
+    return code
+
+
+def run_owner(mode):
+    try:
+        run_proof(mode, accept_launch())
+    except (Failure, OwnerLost) as error:
+        print(f"orchestrate: {error}", file=sys.stderr)
+        return 1
+    except (KeyError, OSError, RecursionError, TypeError, ValueError):
+        print("orchestrate: local proof failed", file=sys.stderr)
+        return 1
     return 0
 
 

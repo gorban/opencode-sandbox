@@ -37,8 +37,10 @@ profile. Missing tools in the required portable suite fail the check.
 From the Linux devbox, run `./oc-sandbox orchestrate --synthetic-check` with the pinned OpenCode
 and relay images already in the host's rootless Podman store. The command prints `ok` after one
 text-only turn through a disposable worker and a loopback fake provider. It verifies cleanup
-before reporting success. This check uses no provider credentials. Subscription routes require
-separate qualification before they can be launched.
+and rejection of a second request before reporting success. Run
+`python3 -B tests/orchestrator-owner-loss.py` from that devbox to check cleanup after launcher loss
+and to verify that revocation before the broker writes leaves the client with zero response bytes.
+These checks use no provider credentials. Subscription routes require separate qualification.
 
 ### Real host gates
 

@@ -1,5 +1,6 @@
 """Start and verify the two disposable containers for the offline text proof."""
 
+from contextlib import contextmanager, suppress
 import json
 import os
 from pathlib import Path
@@ -12,14 +13,16 @@ import subprocess
 import tempfile
 import time
 
-from .protocol import MODEL, PORT, PROMPT, RecordingFake
+from .capture import CaptureError, capture
+from .protocol import MODEL, PORT, PROMPT, RecordingFake, bad_constant, unique
 
 
 OPEN_CODE = "edc96b3f8ef46d2309577c259167813fc943edd6e344db08848e48ec3ed4f278"
 RELAY = "2893cf9f584f34cfa2d0b8dd6ba9e63dfacd1e1105a304bb4f72317b00f89029"
 LABEL = "io.oc-sandbox.orchestrator-proof"
 FULL_ID = re.compile(r"[0-9a-f]{64}")
-SECURITY_LABEL = re.compile(r"[^:]+:[^:]+:container_t:(s0:c\d+,c\d+)")
+PROCESS_LABEL = re.compile(r"[^:]+:[^:]+:container_t:s0:(c\d+),(c\d+)")
+MOUNT_LABEL = re.compile(r"[^:]+:[^:]+:container_file_t:s0:(c\d+),(c\d+)")
 TMPFS = "rw,nosuid,nodev,noexec,mode=0700"
 ALLOWED_IMAGE_ENV = {
     OPEN_CODE: {"PATH", "BUN_RUNTIME_TRANSPILER_CACHE_PATH"},
@@ -42,10 +45,9 @@ def host(program, *args, timeout=12, check=True):
                f"{timeout}s", f"/usr/bin/{program}", *args]
     env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/host{bus}"
     try:
-        result = subprocess.run(command, env=env, cwd="/", stdin=subprocess.DEVNULL,
-                                capture_output=True, timeout=timeout + 4, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        raise Failure(f"host {program} unavailable or timed out") from None
+        result = capture(command, env=env, timeout=timeout + 4, limit=256 * 1024)
+    except (OSError, subprocess.TimeoutExpired, CaptureError):
+        raise Failure(f"host {program} did not complete within its time and output bounds") from None
     if result.returncode and check:
         raise Failure(f"host {program} {args[0]} did not complete ({result.returncode})")
     return result
@@ -114,20 +116,22 @@ def config():
 class Placement:
     """Verify the pinned container settings and remove only this launch's resources."""
 
-    def __init__(self, root):
+    def __init__(self, root, lifeline):
         self.root = root
+        self.lifeline = lifeline
         self.label = secrets.token_hex(16)
         self.names = {role: f"oc-orch-{self.label}-{role}" for role in ("open-code", "relay")}
         self.ids = {}
         self.attempted = False
 
     def create(self, role, image, network, source, target, env, tmpfs, executable, *args):
+        self.lifeline.check()
         image_data = inspect("image", image)
         inherited = environment(image_data["Config"].get("Env") or [])
         if image_data["Id"].removeprefix("sha256:") != image or inherited.keys() - ALLOWED_IMAGE_ENV[image]:
             raise Failure("unexpected pinned image identity or environment")
         memory = "1g" if image == OPEN_CODE else "128m"
-        command = ["create", "--pull=never", "--network", network, "--name", self.names[role],
+        command = ["create", "--rm", "--pull=never", "--network", network, "--name", self.names[role],
                    "--label", f"{LABEL}={self.label}", "--http-proxy=false", "--user=0:0", "--cap-drop=all",
                    "--security-opt=no-new-privileges", "--read-only", "--read-only-tmpfs=false",
                    "--image-volume=ignore", "--log-driver=none", "--restart=no", "--pids-limit=192",
@@ -145,7 +149,9 @@ class Placement:
         self.ids[role] = identifier
         data = self.identity(identifier, role)
         self.verify(data, image, network, source, target, inherited | env | {"container": "podman"}, tmpfs)
+        self.lifeline.check()
         podman("start", identifier)
+        self.lifeline.check()
         return identifier
 
     def identity(self, identifier, role):
@@ -162,7 +168,7 @@ class Placement:
         settings = data["Config"]
         memory = 1024**3 if image == OPEN_CODE else 128 * 1024**2
         isolation = {"IpcMode": "private", "PidMode": "private", "CgroupMode": "private",
-                     "NetworkMode": network, "ReadonlyRootfs": True, "PidsLimit": 192,
+                     "NetworkMode": network, "ReadonlyRootfs": True, "AutoRemove": True, "PidsLimit": 192,
                      "Memory": memory, "MemorySwap": memory}
         if (any(host_config.get(key) != value for key, value in isolation.items())
                 or any(host_config.get(key) for key in ("PortBindings", "PublishAllPorts", "Privileged", "CapAdd", "Devices"))
@@ -180,9 +186,9 @@ class Placement:
             raise Failure("unexpected container mount")
 
     def verify_pair(self, worker, relay):
-        labels = [self.identity(cid, role)["ProcessLabel"] for role, cid in self.ids.items()]
-        if not all(SECURITY_LABEL.fullmatch(label or "") for label in labels) or len(set(labels)) != 2:
-            raise Failure("OpenCode and relay SELinux labels are not distinct")
+        labels = [container_categories(self.identity(cid, role)) for role, cid in self.ids.items()]
+        if len(set(labels)) != 2:
+            raise Failure("OpenCode and relay SELinux categories are not distinct")
         for kind in ("net", "pid", "ipc", "cgroup"):
             path = "/proc/self/ns/" + kind
             worker_ns = podman("exec", worker, "/usr/bin/readlink", path).stdout.strip()
@@ -200,20 +206,33 @@ class Placement:
         if not self.attempted:
             return
         selector = f"label={LABEL}={self.label}"
-        items = podman("ps", "--all", "--no-trunc", "--filter", selector, "--format", "{{.ID}} {{.Names}}").stdout.splitlines()
-        owned = {}
-        for row in items:
-            identity, name = row.decode("ascii").split()
-            role = next((key for key, expected in self.names.items() if expected == name), None)
-            if role is None or role in owned or not FULL_ID.fullmatch(identity) or self.ids.get(role, identity) != identity:
-                raise Failure("cleanup could not identify all owned containers")
-            self.identity(identity, role)
-            owned[role] = identity
+        owned = self.ids.copy()
+        with suppress(Failure):
+            items = podman("ps", "--all", "--no-trunc", "--filter", selector,
+                           "--format", "{{.ID}} {{.Names}}").stdout.splitlines()
+            roles = {name.encode(): role for role, name in self.names.items()}
+            for row in items:
+                identity, _, name = row.partition(b" ")
+                if name in roles and re.fullmatch(rb"[0-9a-f]{64}", identity):
+                    owned.setdefault(roles[name], identity.decode("ascii"))
         for role in ("relay", "open-code"):
-            if role in owned:
-                podman("rm", "--force", "--time", "1", "--ignore", owned[role])
+            with suppress(Failure, KeyError, OSError, TypeError, ValueError):
+                identity = owned[role]
+                self.identity(identity, role)
+                podman("rm", "--force", "--time", "1", "--ignore", identity)
         if podman("ps", "--all", "--filter", selector, "--quiet").stdout.strip():
             raise Failure("cleanup left a container")
+
+
+def container_categories(data):
+    process = PROCESS_LABEL.fullmatch(data.get("ProcessLabel") or "")
+    mount = MOUNT_LABEL.fullmatch(data.get("MountLabel") or "")
+    if process is None or mount is None:
+        raise Failure("invalid container SELinux labels")
+    categories = frozenset(process.groups())
+    if len(categories) != 2 or categories != frozenset(mount.groups()):
+        raise Failure("container process and mount SELinux labels do not agree")
+    return categories
 
 
 def seeds(root):
@@ -233,18 +252,29 @@ def run_open_code(worker):
         raise Failure("unexpected OpenCode version")
     project = config()
     project["providers"]["local"]["settings"]["baseURL"] = "http://127.0.0.1:9/v1"
-    podman("exec", worker, "/bin/sh", "-ec", 'printf %s "$1" > /workspace/opencode.json',
+    podman("exec", worker, "/bin/sh", "-ec", 'mkdir -p /job-home/config/opencode'
+           ' && printf %s "$1" > /workspace/opencode.json'
+           ' && printf %s "$1" > /job-home/config/opencode/opencode.json',
            "fixture", json.dumps(project))
     wire = podman("exec", "--workdir", "/workspace", worker, "opencode", "run", "--format", "json", "--agent", "offline",
                   "--model", f"local/{MODEL}", PROMPT, timeout=65).stdout
-    if len(wire) > 256 * 1024:
-        raise Failure("OpenCode event output exceeded its bound")
-    events = [json.loads(line) for line in wire.splitlines() if line.strip()]
-    if not events or any(event.get("type") not in {"step_start", "text", "step_finish"} for event in events):
-        raise Failure("OpenCode emitted an unexpected event")
-    result = "".join(event["part"]["text"] for event in events if event["type"] == "text")
-    if result != "ok" or events[-1].get("type") != "step_finish":
-        raise Failure("OpenCode did not complete the exact text proof")
+    verify_result(wire)
+
+
+def verify_result(wire):
+    events = [json.loads(line, object_pairs_hook=unique, parse_constant=bad_constant)
+              for line in wire.splitlines() if line.strip()]
+    if len(events) != 3 or any(not isinstance(event, dict) or not isinstance(event.get("part"), dict) for event in events):
+        raise Failure("OpenCode emitted an unexpected event sequence")
+    start, text, finish = (event["part"] for event in events)
+    session, message = start.get("sessionID"), start.get("messageID")
+    if (not isinstance(session, str) or not session or not isinstance(message, str) or not message
+            or [event.get("type") for event in events] != ["step_start", "text", "step_finish"]
+            or [part.get("type") for part in (start, text, finish)] != ["step-start", "text", "step-finish"]
+            or any(event.get("sessionID") != session or event["part"].get("sessionID") != session
+                   or event["part"].get("messageID") != message for event in events)
+            or text.get("text") != "ok" or finish.get("reason") != "stop"):
+        raise Failure("OpenCode did not complete one successful text turn")
 
 
 def wait_relay(relay):
@@ -258,16 +288,44 @@ def wait_relay(relay):
     raise Failure("the private relay did not listen")
 
 
-def run_proof(mode):
+def fixture_request(relay, body):
+    program = """import socket, sys
+port = int(sys.argv[1])
+body = sys.argv[2].encode()
+head = (f'POST /v1/chat/completions HTTP/1.1\\r\\nHost: 127.0.0.1:{port}\\r\\n'
+        'Authorization: Bearer offline-fixture\\r\\nContent-Type: application/json\\r\\n'
+        f'Content-Length: {len(body)}\\r\\nConnection: close\\r\\n\\r\\n').encode()
+with socket.create_connection(('127.0.0.1', port), timeout=3) as client:
+    client.sendall(head + body)
+    with client.makefile('rb') as stream:
+        print(stream.readline(128).decode().strip())
+"""
+    return podman("exec", relay, "/usr/local/bin/python3", "-IB", "-c", program, str(PORT), body.decode()).stdout
+
+
+def verify_one_admission(broker, relay):
+    sends, refusals, settlement, body = broker.receipt()
+    if (sends, refusals, settlement) != (1, 0, "recorded_offline") or not body:
+        raise Failure("the recording fake did not observe exactly one text-only send")
+    # Replay the measured fixture to prove the completed turn spent the one admission.
+    reply = fixture_request(relay, body)
+    if reply != b"HTTP/1.1 403 Forbidden\n" or broker.receipt() != (1, 1, "recorded_offline", body):
+        raise Failure("the relay did not refuse the auxiliary request")
+
+
+@contextmanager
+def placed_broker(mode, lifeline, *, before_delivery=None):
     if mode != "distrobox":
         raise Failure("the offline check currently requires the qualified devbox placement")
     os.umask(0o077)
-    root = Path(tempfile.mkdtemp(prefix="oc-orch-", dir="/tmp"))
-    placement = Placement(root)
+    root = Path(tempfile.mkdtemp(prefix=f"oc-orch-{os.getpid()}-", dir="/tmp"))
+    placement = Placement(root, lifeline)
     try:
+        lifeline.check()
         preflight(root)
         worker_files, relay_files, proof = seeds(root)
-        with RecordingFake(relay_files / "provider.sock", proof) as broker:
+        with (RecordingFake(relay_files / "provider.sock", proof, before_delivery=before_delivery) as broker,
+              lifeline.revoke_on_loss(broker.revoke)):
             worker = placement.create("open-code", OPEN_CODE, "none", worker_files / "opencode.json",
                                       "/etc/opencode/opencode.json", {"HOME": "/job-home", "TMPDIR": "/job-tmp",
                                       "XDG_CONFIG_HOME": "/job-home/config", "OPENCODE_CONFIG_PROJECT_DISABLE": "true"},
@@ -276,9 +334,17 @@ def run_proof(mode):
                                      "/usr/local/bin/python3", "-IB", "/fixture/relay.py")
             placement.verify_pair(worker, relay)
             wait_relay(relay)
-            run_open_code(worker)
-            if broker.admissions != 1 or broker.refusals or broker.settlement != "recorded_offline":
-                raise Failure("the recording fake did not observe exactly one text-only send")
+            lifeline.check()
+            yield worker, relay, broker
     finally:
-        placement.close()
-        shutil.rmtree(root)
+        try:
+            placement.close()
+        finally:
+            shutil.rmtree(root)
+
+
+def run_proof(mode, lifeline):
+    with placed_broker(mode, lifeline) as (worker, relay, broker):
+        run_open_code(worker)
+        lifeline.check()
+        verify_one_admission(broker, relay)
