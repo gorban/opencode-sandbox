@@ -1561,7 +1561,7 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 e2e_mod._trusted_driver(fake_root, home)
             with self.assertRaises(ValueError):
-                drv_mod._read_trusted_bootstrap(fake_root / "oc-openai.py")
+                drv_mod._read_trusted_file(fake_root / "oc-openai.py", mode_mask=0o022)
 
         # _wait_for_driver forwards SIGINT and waits for child cleanup instead of SIGKILL.
         with tempfile.TemporaryDirectory(prefix="oc-e2e-sig-", dir="/tmp") as sig_tmp:
@@ -1832,6 +1832,234 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
                 with suppress(OSError):
                     listener.close()
                 t.join(3)
+
+    def test_reciprocal_r2_driver_requires_explicit_live_flag(self):
+        repo = Path(__file__).resolve().parents[1]
+        driver = repo / "tests/e2e/live/openai_canary_driver.py"
+        with tempfile.TemporaryDirectory(prefix="oc-drv-args-", dir="/tmp") as tmp:
+            env = {"HOME": tmp, "PATH": "/usr/bin:/bin"}
+            for argv in ([], ["--model", MODEL], ["--source-sha256", "a" * 64]):
+                with self.subTest(argv=argv):
+                    res = subprocess.run(
+                        ["/usr/bin/python3", "-IB", str(driver), *argv],
+                        cwd=repo, env=env, capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(res.returncode, 2)
+                    self.assertEqual(res.stdout, "")
+                    self.assertEqual(res.stderr, "")
+
+    def test_reciprocal_r2_live_e2e_durable_shared_accounting_and_unsettled_hold(self):
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        with tempfile.TemporaryDirectory(prefix="oc-e2e-acct-", dir=home) as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(mode=0o700)
+            b_hash = binding_digest("a" * 43, "b" * 43)
+            hist_exp = state_dir / "exposure.json"
+            hist_exp.write_text(json.dumps([{
+                "run": "1" * 32, "binding": b_hash, "phase": "orchestrator",
+                "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": None,
+            }]), encoding="ascii")
+            hist_exp.chmod(0o600)
+            hist_canary = state_dir / CANARY_FILE
+            hist_canary.write_text(json.dumps({
+                "run_id": "2" * 32, "binding": b_hash, "model": MODEL,
+                "history_digest": inspect_i4a_history(state_dir).digest,
+                "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT,
+                "actual": [10, 5], "outcome": "ok_settled", "delivered": True,
+            }), encoding="ascii")
+            hist_canary.chmod(0o600)
+            orig_exp_bytes = hist_exp.read_bytes()
+            orig_canary_bytes = hist_canary.read_bytes()
+
+            upstream_calls = [0]
+            interrupt_after_reserve = [True]
+
+            class _FakeBinding:
+                profile = "a" * 43
+                generation = "b" * 43
+
+            class _FakeConn:
+                def models(self, _binding):
+                    return (MODEL,)
+
+                @contextmanager
+                def canary_responses(self, _binding, _body, *, before_write=None, **_kwargs):
+                    upstream_calls[0] += 1
+                    if before_write is not None:
+                        before_write()
+                    if interrupt_after_reserve[0]:
+                        raise ConnectionError("simulated_interrupt_after_dispatch")
+                    yield iter(_ok_events())
+
+            class _FakeBackend:
+                _state = state_dir
+
+                def active_connection(self):
+                    return "personal", "c" * 43, _FakeConn(), _FakeBinding()
+
+                @contextmanager
+                def selected_fence(self, _label, _epoch):
+                    yield
+
+                def canary_fenced_write(self, _label, _epoch, _conn, _binding, fn):
+                    return fn()
+
+            with socket.socket() as probe_sock:
+                probe_sock.bind(("127.0.0.1", 0))
+                free_port = probe_sock.getsockname()[1]
+
+            class _FakeOwner:
+                def __init__(self, model, worker_token):
+                    self.model = model
+                    self.worker_token = worker_token
+                    self.root = Path(tmp) / f"owner-{secrets.token_hex(4)}"
+                    self.proof = secrets.token_bytes(canary_protocol.PROOF_SIZE)
+
+                def prepare(self):
+                    (self.root / "relay").mkdir(parents=True, mode=0o700)
+                    return self.root, self.proof
+
+                def check_alive(self):
+                    return None
+
+                def start_containers(self):
+                    self.sock = self.root / "relay" / canary._RELAY_SOCK
+
+                def wait_opencode(self):
+                    req = _http_post(
+                        "/v1/responses", self.worker_token, _valid_inbound_payload(self.model), port=free_port,
+                    )
+                    try:
+                        resp = _send_via_uds(self.sock, self.proof, req, port=free_port)
+                    except OSError:
+                        resp = b""
+                    if b"200 OK" not in resp:
+                        return 1, b"", b"", True, None
+                    ok_ndjson = b"".join(
+                        (json.dumps(ev) + "\n").encode("ascii")
+                        for ev in (
+                            {"type": "step_start", "sessionID": "ses_1",
+                             "part": {"type": "step-start", "sessionID": "ses_1", "messageID": "msg_1"}},
+                            {"type": "text", "sessionID": "ses_1",
+                             "part": {"type": "text", "sessionID": "ses_1", "messageID": "msg_1", "text": EXPECTED_REPLY}},
+                            {"type": "step_finish", "sessionID": "ses_1",
+                             "part": {"type": "step-finish", "sessionID": "ses_1", "messageID": "msg_1", "reason": "stop"}},
+                        )
+                    )
+                    return 0, ok_ndjson, b"", True, None
+
+                def close(self):
+                    import shutil
+                    shutil.rmtree(self.root, ignore_errors=True)
+                    return 0
+
+            norm_inst = canary_protocol.SYSTEM_DATE.sub("Today's date: [date]", _MEASURED_INSTRUCTIONS_HEADER)
+            inst_hash = hashlib.sha256(norm_inst.encode("utf-8")).hexdigest()
+            orig_cfg = canary.CanaryBrokerConfig
+
+            def _cfg_with_port(*args, **kwargs):
+                kwargs.setdefault("port", free_port)
+                return orig_cfg(*args, **kwargs)
+
+            with (patch.object(canary, "PORT", free_port),
+                  patch.object(canary_protocol, "SYSTEM_DIGEST", inst_hash),
+                  patch.object(canary, "CanaryBrokerConfig", side_effect=_cfg_with_port)):
+                # 1. Interrupted run after dispatch leaves durable unsettled canary-e2e.json while historical files stay intact.
+                res1 = canary.run_live_canary_e2e(
+                    requested_model=MODEL, backend_factory=_FakeBackend, owner_factory=_FakeOwner,
+                )
+                self.assertFalse(res1.ok)
+                self.assertEqual(upstream_calls[0], 1)
+                self.assertEqual(hist_exp.read_bytes(), orig_exp_bytes)
+                self.assertEqual(hist_canary.read_bytes(), orig_canary_bytes)
+                e2e_file = state_dir / canary_ledger.CANARY_E2E_FILE
+                self.assertTrue(e2e_file.exists())
+                self.assertEqual(json.loads(e2e_file.read_text(encoding="ascii"))["outcome"], "unsettled")
+
+                # 2. Subsequent invocation MUST fail closed on the durable unsettled hold with 0 upstream calls.
+                with self.assertRaisesRegex(CanaryLedgerError, "canary_unsettled_hold"):
+                    canary.run_live_canary_e2e(
+                        requested_model=MODEL, backend_factory=_FakeBackend, owner_factory=_FakeOwner,
+                    )
+                self.assertEqual(upstream_calls[0], 1)
+
+                # 3. Clean settled run permits an explicit repeatable live run while serializing via canary.lock.
+                e2e_file.unlink()
+                interrupt_after_reserve[0] = False
+                with canary_ledger.E2ECanaryLedger(state_dir).exclusive_run():
+                    with self.assertRaisesRegex(CanaryLedgerError, "canary_busy"):
+                        canary.run_live_canary_e2e(
+                            requested_model=MODEL, backend_factory=_FakeBackend, owner_factory=_FakeOwner,
+                        )
+                res2 = canary.run_live_canary_e2e(
+                    requested_model=MODEL, backend_factory=_FakeBackend, owner_factory=_FakeOwner,
+                )
+                self.assertTrue(res2.ok)
+                self.assertEqual(res2.ledger_outcome, "ok_settled")
+                self.assertTrue(json.loads(e2e_file.read_text(encoding="ascii"))["delivered"])
+                res3 = canary.run_live_canary_e2e(
+                    requested_model=MODEL, backend_factory=_FakeBackend, owner_factory=_FakeOwner,
+                )
+                self.assertTrue(res3.ok)
+                self.assertEqual(hist_exp.read_bytes(), orig_exp_bytes)
+                self.assertEqual(hist_canary.read_bytes(), orig_canary_bytes)
+
+    def test_reciprocal_r2_source_digest_pin_rejects_owner_edit_before_exec(self):
+        repo = Path(__file__).resolve().parents[1]
+        e2e_spec = importlib.util.spec_from_file_location(
+            "test_openai_canary_e2e_r2", repo / "tests/e2e/live/test_openai_canary_e2e.py",
+        )
+        e2e_mod = importlib.util.module_from_spec(e2e_spec)
+        e2e_spec.loader.exec_module(e2e_mod)
+        drv_spec = importlib.util.spec_from_file_location(
+            "openai_canary_driver_r2", repo / "tests/e2e/live/openai_canary_driver.py",
+        )
+        drv_mod = importlib.util.module_from_spec(drv_spec)
+        drv_spec.loader.exec_module(drv_mod)
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        with tempfile.TemporaryDirectory(prefix="oc-e2e-pin-", dir=home) as tmp:
+            fake_root = Path(tmp) / "repo"
+            drv_dir = fake_root / "tests/e2e/live"
+            pkg_dir = fake_root / "oc_openai"
+            drv_dir.mkdir(parents=True, mode=0o700)
+            pkg_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(fake_root, 0o700)
+            marker = Path(tmp) / "bootstrap_ran"
+            (drv_dir / "openai_canary_driver.py").write_bytes(
+                (repo / "tests/e2e/live/openai_canary_driver.py").read_bytes(),
+            )
+            os.chmod(drv_dir / "openai_canary_driver.py", 0o600)
+            bootstrap = fake_root / "oc-openai.py"
+            bootstrap.write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n"
+                "def load_cli(): raise ImportError('stop')\n",
+                encoding="ascii",
+            )
+            os.chmod(bootstrap, 0o600)
+            (pkg_dir / "__init__.py").write_text("# clean\n", encoding="ascii")
+            os.chmod(pkg_dir / "__init__.py", 0o600)
+
+            pinned_digest, _raw = drv_mod.snapshot_digest(fake_root)
+            captured_digest, _files = e2e_mod._capture_sources(fake_root, drv_dir / "openai_canary_driver.py")
+            self.assertEqual(pinned_digest, captured_digest)
+
+            # Owner edits a first-party module by 1 byte -> launcher AND driver MUST refuse before exec().
+            (pkg_dir / "__init__.py").write_text("# owner-edited\n", encoding="ascii")
+            self.assertIsNone(e2e_mod._run_checked_driver(fake_root, model=None, source_sha256=pinned_digest))
+            self.assertFalse(marker.exists())
+
+            # Direct driver invocation with mismatched pin MUST also refuse before executing bootstrap.
+            res = subprocess.run(
+                [
+                    "/usr/bin/python3", "-IB", str(drv_dir / "openai_canary_driver.py"),
+                    "--run-openai-canary-live", "--source-sha256", pinned_digest,
+                ],
+                cwd=fake_root, env={"HOME": tmp, "PATH": "/usr/bin:/bin"},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(res.returncode, 1)
+            self.assertFalse(marker.exists(), "driver executed bootstrap despite source digest mismatch")
 
 
 if __name__ == "__main__":

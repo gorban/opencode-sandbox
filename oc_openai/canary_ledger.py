@@ -38,6 +38,7 @@ from .exposure import (
 
 CANARY_FILE = "canary.json"
 CANARY_RECOVERY_FILE = "canary-recovery.json"
+CANARY_E2E_FILE = "canary-e2e.json"
 CANARY_LOCK = "canary.lock"
 I4A_HOLD_FILES = (_LEDGER, _DIAGNOSTIC, _STREAM_DIAGNOSTIC, *_RECOVERY_NAMES)
 _RUN_RE = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
@@ -401,15 +402,16 @@ class CanaryLedger:
         dir_fd = _open_state_dir(self.root, create=True)
         lock_fd = None
         try:
-            flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
-            lock_fd = os.open(lock_name, flags, 0o600, dir_fd=dir_fd)
-            info = os.fstat(lock_fd)
-            if not _private_file(info):
-                raise CanaryLedgerError(_ERR_STORAGE)
-            _acquire_flock(lock_fd, blocking=blocking, deadline=deadline, check_alive=check_alive)
+            try:
+                flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+                lock_fd = os.open(lock_name, flags, 0o600, dir_fd=dir_fd)
+                info = os.fstat(lock_fd)
+                if not _private_file(info):
+                    raise CanaryLedgerError(_ERR_STORAGE)
+                _acquire_flock(lock_fd, blocking=blocking, deadline=deadline, check_alive=check_alive)
+            except OSError:
+                raise CanaryLedgerError(_ERR_STORAGE) from None
             yield dir_fd
-        except OSError:
-            raise CanaryLedgerError(_ERR_STORAGE) from None
         finally:
             if lock_fd is not None:
                 os.close(lock_fd)
@@ -589,3 +591,112 @@ class CanaryLedger:
                 raise CanaryLedgerError("canary_unmatched_settlement")
             record["delivered"] = True
             _atomic_write_json(dir_fd, target, record)
+
+
+class E2ECanaryLedger(CanaryLedger):
+    """Durable repeatable live-e2e ledger sharing exposure.lock without mutating historical receipts.
+
+    Historical I4a files, canary.json, and canary-recovery.json are read-only. Each live e2e
+    invocation serializes via canary.lock and exposure.lock and writes its own durable record in
+    canary-e2e.json. Any unsettled or overage canary-e2e.json durably blocks subsequent runs; a
+    cleanly settled in-bounds record permits explicit re-runs.
+    """
+
+    @staticmethod
+    def _validate_readonly_history(dir_fd: int) -> HistorySnapshot:
+        history = _inspect_history_fd(dir_fd)
+        for name, is_rec in ((CANARY_FILE, False), (CANARY_RECOVERY_FILE, True)):
+            raw = _read_private_bytes(dir_fd, name)
+            if raw is None:
+                continue
+            record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
+            if not _valid_canary_record(record, recovery=is_rec):
+                raise CanaryLedgerError(_ERR_STORAGE)
+        return history
+
+    @staticmethod
+    def _check_existing_e2e(dir_fd: int, *, run_id: str | None = None) -> None:
+        raw = _read_private_bytes(dir_fd, CANARY_E2E_FILE)
+        if raw is None:
+            return
+        record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
+        if not _valid_canary_record(record, recovery=False):
+            raise CanaryLedgerError(_ERR_STORAGE)
+        if record["outcome"] == _OUTCOME_UNSETTLED:
+            raise CanaryLedgerError("canary_unsettled_hold")
+        if record["outcome"] == _OUTCOME_OVERAGE:
+            raise CanaryLedgerError("canary_overage_hold")
+        actual = record["actual"]
+        if actual[0] > record["max_input"] or actual[1] > record["max_output"]:
+            raise CanaryLedgerError("canary_overage_hold")
+        if run_id is not None and record["run_id"] == run_id:
+            raise CanaryLedgerError("canary_invalid_reservation")
+
+    def preflight(self) -> HistorySnapshot:
+        with self._locked(blocking=False) as dir_fd:
+            self._check_existing_e2e(dir_fd)
+            return self._validate_readonly_history(dir_fd)
+
+    def reserve(self, run_id: str, binding: str, model: str, history_digest: str, *,
+                deadline: float | None = None, check_alive=None) -> None:
+        if (type(run_id) is not str or not _RUN_RE.fullmatch(run_id)
+                or type(binding) is not str or not _DIGEST_RE.fullmatch(binding)
+                or type(model) is not str or not _MODEL_RE.fullmatch(model)
+                or type(history_digest) is not str or not _DIGEST_RE.fullmatch(history_digest)):
+            raise CanaryLedgerError("canary_invalid_reservation")
+        with self._locked(blocking=True, deadline=deadline, check_alive=check_alive) as dir_fd:
+            self._check_existing_e2e(dir_fd, run_id=run_id)
+            current = self._validate_readonly_history(dir_fd)
+            if current.digest != history_digest:
+                raise CanaryLedgerError("canary_history_changed")
+            record = {
+                "run_id": run_id,
+                "binding": binding,
+                "model": model,
+                "history_digest": history_digest,
+                "max_input": self.max_input,
+                "max_output": self.max_output,
+                "actual": None,
+                "outcome": _OUTCOME_UNSETTLED,
+                "delivered": False,
+            }
+            _atomic_write_json(dir_fd, CANARY_E2E_FILE, record)
+
+    def settle(self, run_id: str, *, allow_delivery: bool, input_tokens: int, output_tokens: int,
+               recovery: bool = False) -> str:
+        if recovery or not _is_usage(input_tokens) or not _is_usage(output_tokens):
+            raise CanaryLedgerError("canary_invalid_usage")
+        with self._locked(blocking=True) as dir_fd:
+            raw = _read_private_bytes(dir_fd, CANARY_E2E_FILE)
+            if raw is None:
+                raise CanaryLedgerError("canary_missing_reservation")
+            record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
+            if not _valid_canary_record(record, recovery=False) or record["run_id"] != run_id:
+                raise CanaryLedgerError("canary_unmatched_settlement")
+            if record["outcome"] != _OUTCOME_UNSETTLED:
+                raise CanaryLedgerError("canary_already_settled")
+            over = input_tokens > record["max_input"] or output_tokens > record["max_output"]
+            if over:
+                outcome = _OUTCOME_OVERAGE
+            elif allow_delivery:
+                outcome = _OUTCOME_OK
+            else:
+                outcome = _OUTCOME_REFUSED
+            record["actual"] = [input_tokens, output_tokens]
+            record["outcome"] = outcome
+            _atomic_write_json(dir_fd, CANARY_E2E_FILE, record)
+            return outcome
+
+    def mark_delivered(self, run_id: str, *, recovery: bool = False) -> None:
+        if recovery:
+            raise CanaryLedgerError("canary_unmatched_settlement")
+        with self._locked(blocking=True) as dir_fd:
+            raw = _read_private_bytes(dir_fd, CANARY_E2E_FILE)
+            if raw is None:
+                raise CanaryLedgerError("canary_missing_reservation")
+            record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
+            if (not _valid_canary_record(record, recovery=False)
+                    or record["run_id"] != run_id or record["outcome"] != _OUTCOME_OK):
+                raise CanaryLedgerError("canary_unmatched_settlement")
+            record["delivered"] = True
+            _atomic_write_json(dir_fd, CANARY_E2E_FILE, record)

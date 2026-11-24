@@ -19,6 +19,7 @@ import time
 from .canary_ledger import (
     CanaryLedger,
     CanaryLedgerError,
+    E2ECanaryLedger,
     HistorySnapshot,
     RecoverySnapshot,
 )
@@ -889,18 +890,21 @@ def run_live_canary_e2e(
     requested_model: str | None = None,
     backend_factory=None,
     owner_factory=DetachedOwnerSession,
+    ledger_dir: Path | None = None,
 ) -> CanaryLiveResult:
-    """Run the zero-tool OpenCode + OpenAI live e2e canary using an isolated scratch ledger."""
+    """Run the zero-tool OpenCode + OpenAI live e2e canary under durable shared accounting.
+
+    Uses E2ECanaryLedger in the shared OpenAI state directory (canary-e2e.json under canary.lock
+    and exposure.lock) so historical I4a/canary receipts stay read-only while concurrent runs are
+    serialized and any interrupted/uncertain or overage run durably blocks future invocations.
+    """
     factory = backend_factory or make_backend
     backend = factory()
     label, epoch, conn, binding = backend.active_connection()
     model = _resolve_model(conn, binding, requested_model)
-    parent = scratch_parent()
-    check_private_directory(parent)
-    with tempfile.TemporaryDirectory(prefix="oc-canary-e2e-", dir=parent) as scratch:
-        state_dir = Path(scratch)
-        os.chmod(state_dir, 0o700)
-        ledger = CanaryLedger(state_dir)
+    state_dir = Path(ledger_dir) if ledger_dir is not None else Path(backend._state)
+    ledger = E2ECanaryLedger(state_dir)
+    with ledger.exclusive_run():
         history = ledger.preflight()
         run_id = secrets.token_hex(16)
         worker_token = secrets.token_hex(32)
