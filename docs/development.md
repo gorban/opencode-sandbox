@@ -32,6 +32,14 @@ The portable run reports real Podman security, real Postgres, and SELinux/Waylan
 skipped because it has no configured isolated fixtures. Remote acceptance is unavailable in this
 profile. Missing tools in the required portable suite fail the check.
 
+### Local OpenCode text proof
+
+From the Linux devbox, run `./oc-sandbox orchestrate --synthetic-check` with the pinned OpenCode
+and relay images already in the host's rootless Podman store. The command prints `ok` after one
+text-only turn through a disposable worker and a loopback fake provider. It verifies cleanup
+before reporting success. This check uses no provider credentials. Subscription routes require
+separate qualification before they can be launched.
+
 ### Real host gates
 
 [AGENTS.md](../AGENTS.md#gates-before-a-commit-and-before-asking-for-review) requires changed-shell
