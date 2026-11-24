@@ -178,7 +178,9 @@ def _recovery(terminal, backend, source):
             worker = Approval(proposal.run_id, binding, Stage.WORKER)
             if not _matches_current(terminal, backend, worker):
                 return 1
-            return 0 if _finish_worker(terminal, proof, worker) else 1
+            if not _finish_worker(terminal, proof, worker):
+                return 1
+            return 0
         except StreamRouteUnavailable as error:
             terminal.error(error.failure.describe())
             return report_failure(terminal, error, operation="Recovery proof")

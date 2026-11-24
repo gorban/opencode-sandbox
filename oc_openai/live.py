@@ -180,8 +180,8 @@ def _proposal_reserve(ledger, slot, diagnostic):
     return lambda: ledger.reserve_diagnostic(diagnostic)
 
 
-def _verify_worker_evidence(evidence, dispatch, ManagedEvidence):
-    if (type(evidence) is not ManagedEvidence or any(value is not True for value in (
+def _verify_worker_evidence(evidence, dispatch, evidence_type):
+    if (type(evidence) is not evidence_type or any(value is not True for value in (
         evidence.initial_receipt, evidence.continuation_receipt, evidence.native_tool,
     )) or dispatch.pending is not None or dispatch.delivered is not Phase.CONTINUATION):
         raise RouteUnavailable(Reason.PROOF_FAILED)
@@ -416,7 +416,7 @@ class WorkstationBackend:
             raise _mapped_exposure_error(error) from None
         raise RouteUnavailable(Reason.PROOF_FAILED)
 
-    def _run_worker_proof(self, approval, binding, worker_fn, dispatch):
+    def _run_worker_proof(self, binding, worker_fn, dispatch):
         options = {"allow_progress": True} if self._allow_progress else {}
         if self._allow_metadata:
             options["allow_metadata"] = True
@@ -441,7 +441,7 @@ class WorkstationBackend:
             binding = self._require_approval(approval, Stage.WORKER)
             self.ledger.require_next(_slot(approval, Phase.INITIAL))
             dispatch = _WorkerDispatch(self, approval, binding)
-            evidence = self._run_worker_proof(approval, binding, self._worker or run_worker, dispatch)
+            evidence = self._run_worker_proof(binding, self._worker or run_worker, dispatch)
             return _verify_worker_evidence(evidence, dispatch, ManagedEvidence)
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
