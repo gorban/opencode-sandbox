@@ -46,7 +46,13 @@ numeric address for each pinned destination. It verifies the TLS certificate
 and hostname without accessing a registration or sending HTTP. The local
 fixture covers resolver timeout and overflow, revocation before ClientHello,
 cancellation during the handshake, and a successful TLS exchange with zero
-application bytes. A monitored run against the actual destinations remains
-open pending exact-code review.
+application bytes.
+
+- [x] Qualify the two enrollment destinations with a credential-free
+  workstation diagnostic. The reviewed `30a9456` implementation negotiated
+  TLS 1.3 with certificate and hostname verification at
+  `oauth2.googleapis.com:443` and `www.googleapis.com:443`. It sent zero HTTP
+  requests and no application bytes. Attended enrollment, refresh and
+  inference remain open.
 
 [Antigravity ACP authentication](https://antigravity.google/docs/ide/extensions/acp/#authentication)
