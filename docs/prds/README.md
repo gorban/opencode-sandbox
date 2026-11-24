@@ -11,10 +11,15 @@ reservation explicitly in this index.
 
 - [*] Real subscription connections and sign-in lifecycle
   ([I4](prd_i4.md), [I3](prd_i3.md)) — **Outside-in integrations**.
-  - [*] Claude Code and Antigravity initial workstation sign-in qualification
-    ([I4b](prd_i4b.md), [I4c](prd_i4c.md)) — **Codex**.
-  - [*] Shared provider settings and first-use connection design ([I4d](prd_i4d.md)) —
-    **Codex**, coordinated with **AGY** on the ChatGPT launch and connection interface.
+  - [*] OpenAI sign-in and the ChatGPT orchestrator and sandbox path ([I4](prd_i4.md#gateway)) —
+    **AGY**.
+  - [ ] Claude subscription route and native sign-in qualification ([I4b](prd_i4b.md)) — **Codex**.
+  - [ ] Antigravity subscription route and native sign-in qualification ([I4c](prd_i4c.md)) — **Codex**.
+  - [ ] Shared provider settings, model selection and staged live acceptance
+    ([I4d](prd_i4d.md), [I4f](prd_i4f.md)) — **Codex**, coordinated with **AGY** on shared
+    launcher and relay changes.
+  - [*] Amazon Bedrock planning and qualification ([I4e](prd_i4e.md)) — **AGY**. Plan when
+    ChatGPT review leaves capacity. Live Bedrock follows ChatGPT text in both placements.
 - [*] SSH remote host onboarding and first remote sandbox run
   ([I2](prd_i2.md#workers-and-connectivity)) — **Outside-in integrations**.
 - [*] Maintainer setup and end-to-end acceptance for these integrations
