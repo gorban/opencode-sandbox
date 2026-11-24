@@ -1852,8 +1852,13 @@ if pod_exists; then
   fi
 fi
 if [[ -n $recreate ]]; then
-  if [[ $(cstate "$AGENT") == running || $(cstate "$RELAY") == running ]]; then
-    echo "Cannot recreate pod '$POD' ($recreate): OpenCode or provider relay is running in instance '$ILABEL'." >&2
+  if [[ $(cstate "$AGENT") == running ]]; then
+    echo "Cannot recreate pod '$POD' ($recreate): OpenCode is running in instance '$ILABEL'." >&2
+    echo "Exit it first, then rerun this command." >&2
+    exit 1
+  fi
+  if [[ $(cstate "$RELAY") == running ]]; then
+    echo "Cannot recreate pod '$POD' ($recreate): Provider relay is running in instance '$ILABEL'." >&2
     echo "Exit it first, then rerun this command." >&2
     exit 1
   fi
