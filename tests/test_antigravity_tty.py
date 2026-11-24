@@ -8,6 +8,7 @@ import selectors
 import subprocess
 import sys
 import time
+import traceback
 import unittest
 from urllib.parse import urlencode
 
@@ -15,14 +16,18 @@ import oc_antigravity_tty as handoff
 
 
 def good_link():
-    fields = {"access_type": "offline", "client_id": "123456789-example.apps.googleusercontent.com",
+    google = "https://www.googleapis.com/auth/"
+    scopes = " ".join((*(google + name for name in ("cloud-platform", "userinfo.email", "userinfo.profile",
+                                                   "cclog", "experimentsandconfigs", "aicode")), "openid"))
+    fields = {"access_type": "offline",
+              "client_id": "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
               "code_challenge": "a" * 43, "code_challenge_method": "S256", "prompt": "consent",
-              "redirect_uri": handoff.CALLBACK, "response_type": "code", "scope": "openid profile",
+              "redirect_uri": handoff.CALLBACK, "response_type": "code", "scope": scopes,
               "state": "x" * 28}
     return "https://accounts.google.com/o/oauth2/auth?" + urlencode(fields)
 
 
-CHILD = """
+CHILD = r"""
 import fcntl
 import os
 import signal
@@ -37,22 +42,37 @@ signal.signal(signal.SIGHUP, signal.SIG_IGN)
 fcntl.ioctl(fd, termios.TIOCSCTTY, 0)
 try:
     with handoff.foreground_terminal() as terminal:
-        code = handoff.request_code(terminal, sys.argv[2], time.monotonic() + 5)
-        if code == b'4/synthetic-terminal-code' and termios.tcgetattr(terminal)[3] & termios.ECHO:
-            print('FORWARD_AND_RESTORE', flush=True)
+        mode = sys.argv[3]
+        if mode == 'approve':
+            print('READY_TO_QUEUE', flush=True)
+            sys.stdin.buffer.read(1)
+            approved = handoff.approve(terminal, 'fixture', 'a' * 64, time.monotonic() + 4)
+            print('APPROVED' if approved else 'DECLINED', flush=True)
+        elif mode == 'partial':
+            try:
+                handoff.request_code(terminal, sys.argv[2], time.monotonic() + .75)
+            except handoff.TerminalUnavailable:
+                echo = bool(termios.tcgetattr(terminal)[3] & termios.ECHO)
+                os.write(terminal, b'Next reader ready\n')
+                fresh = handoff.read_line(terminal, 128, time.monotonic() + 3)
+                print('FRESH_AND_RESTORED' if echo and fresh == b'fresh' else 'STALE_INPUT', flush=True)
+        else:
+            code = handoff.request_code(terminal, sys.argv[2], time.monotonic() + 5)
+            if code == b'4/synthetic-terminal-code' and termios.tcgetattr(terminal)[3] & termios.ECHO:
+                print('FORWARD_AND_RESTORE', flush=True)
 except (handoff.TerminalUnavailable, OSError):
     print('CANCELLED_WITHOUT_CODE', flush=True)
 """
 
 
 @contextmanager
-def operator_test_terminal():
+def operator_test_terminal(mode="code"):
     master, slave = pty.openpty()
     terminal = os.fdopen(master, "rb", buffering=0)
     process = None
     try:
-        process = subprocess.Popen([sys.executable, "-B", "-c", CHILD, str(slave), good_link()],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        process = subprocess.Popen([sys.executable, "-B", "-c", CHILD, str(slave), good_link(), mode],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True, pass_fds=(slave,))
         yield terminal, process
     finally:
@@ -94,6 +114,52 @@ class HandoffTest(unittest.TestCase):
         for link in invalid:
             with self.subTest(link=link), self.assertRaises(handoff.TerminalUnavailable):
                 handoff.authorization_link(link)
+
+    def test_native_link_requires_the_pinned_client_scopes_and_prompt(self):
+        original = good_link()
+        variants = (original.replace("1071006060591-", "123456789-"),
+                    original.replace("openid&", "openid+email&"), original.replace("prompt=consent", "prompt=none"))
+        for link in variants:
+            with self.subTest(link=link), self.assertRaises(handoff.TerminalUnavailable):
+                handoff.authorization_link(link)
+
+    def test_malformed_query_does_not_include_native_text_in_traceback(self):
+        private = "fixture-url-query-private-marker"
+        invalid = good_link().replace("prompt=consent", private)
+        try:
+            handoff.authorization_link(invalid)
+        except handoff.TerminalUnavailable as error:
+            self.assertNotIn(private, "".join(traceback.format_exception(error)))
+        else:
+            self.fail("malformed query accepted")
+
+    def test_queued_yes_cannot_approve_a_later_scope(self):
+        with operator_test_terminal("approve") as (master, process):
+            with selectors.DefaultSelector() as output:
+                output.register(process.stdout, selectors.EVENT_READ)
+                self.assertTrue(output.select(2))
+                self.assertEqual(process.stdout.readline(), b"READY_TO_QUEUE\n")
+            os.write(master.fileno(), b"yes\n")
+            process.stdin.write(b"x")
+            process.stdin.flush()
+            displayed = terminal_output(master.fileno(), stop=b"Continue with Google sign-in? [y/N]")
+            self.assertIn(b"Allow one temporary HTTPS tunnel", displayed)
+            os.write(master.fileno(), b"n\n")
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertEqual((process.returncode, stdout, stderr), (0, b"DECLINED\n", b""))
+
+    def test_timeout_flushes_partial_code_before_restoring_echo(self):
+        with operator_test_terminal("partial") as (master, process):
+            shown = terminal_output(master.fileno(), stop=b"Paste the authorization code and press Enter")
+            self.assertIn(good_link().encode("ascii"), shown)
+            private = b"4/fixture-incomplete-code"
+            os.write(master.fileno(), private)
+            after = terminal_output(master.fileno(), stop=b"Next reader ready")
+            self.assertNotIn(private, after)
+            self.assertIn(b"Next reader ready", after)
+            os.write(master.fileno(), b"fresh\n")
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertEqual((process.returncode, stdout, stderr), (0, b"FRESH_AND_RESTORED\n", b""))
 
     def test_code_is_not_echoed_and_terminal_modes_are_restored(self):
         with operator_test_terminal() as (master, process):

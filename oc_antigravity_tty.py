@@ -12,6 +12,11 @@ from urllib.parse import parse_qsl, urlsplit
 
 AUTHORITY = "accounts.google.com"
 CALLBACK = "https://antigravity.google/oauth-callback"
+CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+SCOPES = frozenset(("openid", "https://www.googleapis.com/auth/cloud-platform",
+                    "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile",
+                    "https://www.googleapis.com/auth/cclog", "https://www.googleapis.com/auth/experimentsandconfigs",
+                    "https://www.googleapis.com/auth/aicode"))
 PARAMETERS = frozenset(("access_type", "client_id", "code_challenge", "code_challenge_method", "prompt",
                         "redirect_uri", "response_type", "scope", "state"))
 DESTINATIONS = ("oauth2.googleapis.com:443", "www.googleapis.com:443")
@@ -30,15 +35,17 @@ def authorization_link(candidate):
     try:
         link = urlsplit(candidate)
         entries = parse_qsl(link.query, strict_parsing=True, max_num_fields=len(PARAMETERS), keep_blank_values=True)
-    except ValueError as error:
-        raise TerminalUnavailable("invalid native authorization link") from error
+    except ValueError:
+        raise TerminalUnavailable("invalid native authorization link") from None
     fields = dict(entries)
     if (link.scheme != "https" or link.netloc != AUTHORITY or link.path != "/o/oauth2/auth" or link.fragment
             or len(entries) != len(fields) or fields.keys() != PARAMETERS
             or fields["redirect_uri"] != CALLBACK or fields["response_type"] != "code"
             or fields["code_challenge_method"] != "S256" or fields["access_type"] != "offline"):
         raise TerminalUnavailable("unexpected native authorization link")
-    if (not re.fullmatch(r"[0-9]+-[a-zA-Z0-9]+\.apps\.googleusercontent\.com", fields["client_id"])
+    scopes = fields["scope"].split(" ")
+    if (fields["client_id"] != CLIENT_ID or fields["prompt"] != "consent"
+            or len(scopes) != len(SCOPES) or set(scopes) != SCOPES
             or not re.fullmatch(r"[a-zA-Z0-9_-]{43}", fields["code_challenge"])
             or not re.fullmatch(r"[a-zA-Z0-9_-]{16,128}", fields["state"])
             or any(not value or any(not 32 <= ord(char) < 127 for char in value) for value in fields.values())):
@@ -110,8 +117,10 @@ def approve(terminal, label, build_digest, deadline):
     write_operator(terminal, f"Antigravity registration {label}\n"
                    f"Native build SHA-256 {build_digest}\n"
                    f"Allow one temporary HTTPS tunnel to {first}, then one to {second}?\n"
-                   "Each tunnel permits any encrypted path at its destination.\n"
-                   "Continue with Google sign-in? [y/N] ", deadline)
+                   "Each tunnel permits any encrypted path at its destination.\n", deadline)
+    require_foreground(terminal)
+    termios.tcflush(terminal, termios.TCIFLUSH)
+    write_operator(terminal, "Continue with Google sign-in? [y/N] ", deadline)
     return read_line(terminal, 8, deadline).lower() in (b"y", b"yes")
 
 
@@ -128,7 +137,7 @@ def hidden_input(terminal):
         old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
         try:
             try:
-                termios.tcsetattr(terminal, termios.TCSANOW, previous)
+                termios.tcsetattr(terminal, termios.TCSAFLUSH, previous)
             except termios.error as error:
                 raise TerminalUnavailable("the operator terminal detached during sign-in") from error
         finally:

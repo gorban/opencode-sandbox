@@ -57,13 +57,19 @@ and keyring.
 Pinned `agy` 1.5.15 emitted the measured Google authorization URL and
 Antigravity callback in an offline launcher. The foreground component accepted
 that link shape. A synthetic controlling terminal verified hidden input, echo
-restoration and cancellation when the terminal detached before paste.
+restoration, fresh confirmation after the scope is shown, and removal of
+unsubmitted code when the prompt times out. A detached terminal cancels the
+handoff. The link guard checks the pinned public client ID, scopes and prompt.
 
 The supervisor records a pending generation before creating the unlock item
 or opening egress. The attempt has independent revocation, and cancellation
 can close its sockets while the registration remains pending. The offline
 test cancels after token issuance but before userinfo forwarding and verifies
 no second-peer bytes, exact service retirement and the same pending generation.
+The journal exercises ordered non-reusable reservations, cancellation across
+reopen, stale-generation rejection, and distinct retirement and readiness
+publication. Wiring the terminal, journal and credential holder together
+remains open.
 
 A fresh process must select exactly one existing unlock item for that
 registration in the trusted collection. Missing, locked or duplicate items
