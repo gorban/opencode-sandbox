@@ -977,7 +977,7 @@ def main(argv: list[str], *, terminal: Terminal | None = None) -> int:
         parsed = parse_canary_argv(argv)
     except ValueError:
         term.error(
-            "usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] "
+            "usage: canary [--model SLUG] [--reviewed-source SHA256] "
             "[--synthetic-check | --recover-unsettled]"
         )
         return 2

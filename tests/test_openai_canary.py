@@ -313,7 +313,9 @@ class CanaryLedgerTests(unittest.TestCase):
         prior_digest = hashlib.sha256(prior_bytes).hexdigest()
         pinned = (prior_run, prior_digest)
 
-        # Wrong pinned predecessor digest/run_id or wrong binding is rejected before consent.
+        # Wrong or omitted pinned predecessor digest/run_id or wrong binding is rejected before consent.
+        with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_ineligible"):
+            self.ledger.preflight_recovery(self.binding, MODEL)
         with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_ineligible"):
             self.ledger.preflight_recovery(self.binding, MODEL, expected_prior=(prior_run, "0" * 64))
         with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_ineligible"):
@@ -1525,6 +1527,74 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
         )
         self.assertEqual(res_cli.returncode, 2)
         self.assertNotIn("canary", res_cli.stderr)
+
+        # P1 #1 (PR #71): e2e canary test validates driver/bootstrap trust and waits gracefully on SIGINT.
+        e2e_spec = importlib.util.spec_from_file_location(
+            "test_openai_canary_e2e_mod", repo / "tests/e2e/live/test_openai_canary_e2e.py",
+        )
+        e2e_mod = importlib.util.module_from_spec(e2e_spec)
+        e2e_spec.loader.exec_module(e2e_mod)
+        drv_spec = importlib.util.spec_from_file_location(
+            "openai_canary_driver_mod", repo / "tests/e2e/live/openai_canary_driver.py",
+        )
+        drv_mod = importlib.util.module_from_spec(drv_spec)
+        drv_spec.loader.exec_module(drv_mod)
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        with tempfile.TemporaryDirectory(prefix="oc-e2e-trust-", dir=home) as tmp:
+            fake_root = Path(tmp) / "repo"
+            drv_dir = fake_root / "tests/e2e/live"
+            drv_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(fake_root, 0o700)
+            target_file = Path(tmp) / "real.py"
+            target_file.write_text("# ok\n", encoding="ascii")
+            os.chmod(target_file, 0o600)
+            (fake_root / "oc-openai.py").write_text("# ok\n", encoding="ascii")
+            os.chmod(fake_root / "oc-openai.py", 0o600)
+            os.symlink(target_file, drv_dir / "openai_canary_driver.py")
+            with self.assertRaises(ValueError):
+                e2e_mod._trusted_driver(fake_root, home)
+            os.unlink(drv_dir / "openai_canary_driver.py")
+            (drv_dir / "openai_canary_driver.py").write_text("# ok\n", encoding="ascii")
+            os.chmod(drv_dir / "openai_canary_driver.py", 0o600)
+            os.chmod(fake_root / "oc-openai.py", 0o666)
+            with self.assertRaises(ValueError):
+                e2e_mod._trusted_driver(fake_root, home)
+            with self.assertRaises(ValueError):
+                drv_mod._read_trusted_bootstrap(fake_root / "oc-openai.py")
+
+        # _wait_for_driver forwards SIGINT and waits for child cleanup instead of SIGKILL.
+        with tempfile.TemporaryDirectory(prefix="oc-e2e-sig-", dir="/tmp") as sig_tmp:
+            marker = Path(sig_tmp) / "cleaned"
+            ready = Path(sig_tmp) / "ready"
+            child_code = (
+                "import pathlib, signal, time\n"
+                f"def h(_s,_f): pathlib.Path({str(marker)!r}).write_text('ok'); raise SystemExit(130)\n"
+                "signal.signal(signal.SIGINT, h)\n"
+                f"pathlib.Path({str(ready)!r}).write_text('1')\n"
+                "time.sleep(10)\n"
+            )
+            def send_sig():
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                os.kill(os.getpid(), signal.SIGINT)
+            t = threading.Thread(target=send_sig, daemon=True)
+            t.start()
+            with self.assertRaises(KeyboardInterrupt):
+                e2e_mod._wait_for_driver(
+                    [sys.executable, "-c", child_code],
+                    root=Path(sig_tmp),
+                    env={"PATH": "/usr/bin:/bin"},
+                )
+            t.join(timeout=2)
+            self.assertTrue(marker.exists(), "_wait_for_driver killed child before SIGINT cleanup finished")
+
+        # P2 #1 (PR #71): canary_ledger has no hardcoded workstation pin; canary.main drops stale CLI name.
+        self.assertFalse(hasattr(canary_ledger, "REVIEWED_PRIOR_RUN_ID"))
+        bad_term = Terminal(True)
+        self.assertEqual(canary.main(["--bogus"], terminal=bad_term), 2)
+        self.assertNotIn("oc-sandbox openai canary", "\n".join(bad_term.output))
 
         # Live-observed moderation wire schema: response.moderation=None and omnimod unblocked flags pass,
         # while any flagged category or non-empty tool moderation slot suppresses cleanly.

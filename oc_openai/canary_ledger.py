@@ -39,8 +39,6 @@ from .exposure import (
 CANARY_FILE = "canary.json"
 CANARY_RECOVERY_FILE = "canary-recovery.json"
 CANARY_LOCK = "canary.lock"
-REVIEWED_PRIOR_RUN_ID = "abf81307ab4706d897783b3a35434193"
-REVIEWED_PRIOR_CANARY_DIGEST = "15bee27e10125d6c33f5b60bff940e7a1495ac3fb6e362b386abe23e923e2d58"
 I4A_HOLD_FILES = (_LEDGER, _DIAGNOSTIC, _STREAM_DIAGNOSTIC, *_RECOVERY_NAMES)
 _RUN_RE = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
@@ -445,7 +443,9 @@ class CanaryLedger:
         if (type(binding) is not str or not _DIGEST_RE.fullmatch(binding)
                 or type(model) is not str or not _MODEL_RE.fullmatch(model)):
             raise CanaryLedgerError("canary_recovery_ineligible")
-        pinned = expected_prior or (REVIEWED_PRIOR_RUN_ID, REVIEWED_PRIOR_CANARY_DIGEST)
+        if expected_prior is None:
+            raise CanaryLedgerError("canary_recovery_ineligible")
+        pinned = expected_prior
         with self._locked(blocking=False) as dir_fd:
             existing_rec = _read_private_bytes(dir_fd, CANARY_RECOVERY_FILE)
             if existing_rec is not None:
@@ -508,7 +508,9 @@ class CanaryLedger:
         check_alive=None,
     ) -> None:
         """Durably reserve the single one-shot recovery slot without touching canary.json."""
-        pinned = expected_prior or (REVIEWED_PRIOR_RUN_ID, REVIEWED_PRIOR_CANARY_DIGEST)
+        if expected_prior is None:
+            raise CanaryLedgerError("canary_recovery_ineligible")
+        pinned = expected_prior
         if (type(run_id) is not str or not _RUN_RE.fullmatch(run_id)
                 or type(binding) is not str or not _DIGEST_RE.fullmatch(binding)
                 or type(model) is not str or not _MODEL_RE.fullmatch(model)
