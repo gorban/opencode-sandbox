@@ -193,31 +193,38 @@ if [[ ${1:-} == openai ]]; then
     3:canary|4:canary|5:canary|6:canary|7:canary)
       LC_ALL=C
       canary_args=("${@:3}")
-      c_idx=0 c_model=0 c_src=0 c_synth=0
+      c_idx=0 c_model=0 c_src=0 c_synth=0 c_rec=0
+      canary_usage="usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check | --recover-unsettled]"
       while (( c_idx < ${#canary_args[@]} )); do
         case ${canary_args[c_idx]} in
           --synthetic-check)
-            (( !c_synth )) || die "usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]"
+            (( !c_synth && !c_rec )) || die "$canary_usage"
             c_synth=1
+            (( c_idx += 1 ))
+            ;;
+          --recover-unsettled)
+            (( !c_rec && !c_synth )) || die "$canary_usage"
+            c_rec=1
             (( c_idx += 1 ))
             ;;
           --model)
             (( !c_model && c_idx + 1 < ${#canary_args[@]} )) &&
               [[ ${canary_args[c_idx + 1]} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
-              die "usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]"
+              die "$canary_usage"
             c_model=1
             (( c_idx += 2 ))
             ;;
           --reviewed-source)
             (( !c_src && c_idx + 1 < ${#canary_args[@]} )) &&
               [[ ${canary_args[c_idx + 1]} =~ ^[0-9a-f]{64}$ ]] ||
-              die "usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]"
+              die "$canary_usage"
             c_src=1
             (( c_idx += 2 ))
             ;;
-          *) die "usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]" ;;
+          *) die "$canary_usage" ;;
         esac
       done
+      (( !c_rec || c_src )) || die "$canary_usage"
       ;;
     3:connect|3:select|4:connect)
       [[ $# != 4 || $4 == --no-browser ]] ||
@@ -226,7 +233,7 @@ if [[ ${1:-} == openai ]]; then
       [[ $3 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] ||
         die "OpenAI labels must be 1 to 32 ASCII letters, numbers, underscores or hyphens, starting with a letter or number"
       ;;
-    *) die "usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect|canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]}" ;;
+    *) die "usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect|canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check | --recover-unsettled]}" ;;
   esac
   helper=$SCRIPT_DIR/oc-openai.py
   verify_openai_helper "$helper"

@@ -37,7 +37,10 @@ from .exposure import (
 
 
 CANARY_FILE = "canary.json"
+CANARY_RECOVERY_FILE = "canary-recovery.json"
 CANARY_LOCK = "canary.lock"
+REVIEWED_PRIOR_RUN_ID = "abf81307ab4706d897783b3a35434193"
+REVIEWED_PRIOR_CANARY_DIGEST = "15bee27e10125d6c33f5b60bff940e7a1495ac3fb6e362b386abe23e923e2d58"
 I4A_HOLD_FILES = (_LEDGER, _DIAGNOSTIC, _STREAM_DIAGNOSTIC, *_RECOVERY_NAMES)
 _RUN_RE = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
@@ -71,6 +74,15 @@ class HistorySnapshot:
     unsettled_output: int
     reserved_input: int
     reserved_output: int
+
+
+@dataclass(frozen=True)
+class RecoverySnapshot:
+    history: HistorySnapshot
+    prior_run_id: str
+    prior_digest: str
+    prior_max_input: int
+    prior_max_output: int
 
 
 def _bad_constant(_value):
@@ -231,13 +243,26 @@ def inspect_i4a_history(root: Path) -> HistorySnapshot:
         os.close(dir_fd)
 
 
-def _valid_canary_record(record) -> bool:
+def _valid_recovery_links(record: dict) -> bool:
+    prior_run = record.get("prior_canary_run_id")
+    prior_digest = record.get("prior_canary_digest")
+    return (
+        type(prior_run) is str and bool(_RUN_RE.fullmatch(prior_run))
+        and prior_run != record["run_id"]
+        and type(prior_digest) is str and bool(_DIGEST_RE.fullmatch(prior_digest))
+    )
+
+
+def _valid_canary_record(record, *, recovery: bool = False) -> bool:
     if type(record) is not dict:
         return False
     required = {"run_id", "binding", "model", "history_digest", "max_input", "max_output", "actual", "outcome"}
+    if recovery:
+        required |= {"prior_canary_run_id", "prior_canary_digest"}
     if not required <= set(record) <= (required | {"delivered"}):
         return False
-    if "delivered" in record and type(record["delivered"]) is not bool:
+    delivered = record.get("delivered", False)
+    if type(delivered) is not bool:
         return False
     if (type(record["run_id"]) is not str or not _RUN_RE.fullmatch(record["run_id"])
             or type(record["binding"]) is not str or not _DIGEST_RE.fullmatch(record["binding"])
@@ -245,12 +270,15 @@ def _valid_canary_record(record) -> bool:
             or type(record["history_digest"]) is not str or not _DIGEST_RE.fullmatch(record["history_digest"])
             or not _is_usage(record["max_input"]) or not _is_usage(record["max_output"])):
         return False
+    if recovery and not _valid_recovery_links(record):
+        return False
     outcome = record["outcome"]
     actual = record["actual"]
     if outcome == _OUTCOME_UNSETTLED:
-        return actual is None
+        return actual is None and delivered is False
     return (
         outcome in _SETTLED_OUTCOMES
+        and (not delivered or outcome == _OUTCOME_OK)
         and type(actual) is list and len(actual) == 2
         and all(_is_usage(v) for v in actual)
     )
@@ -290,13 +318,46 @@ def _atomic_write_json(dir_fd: int, name: str, payload: dict) -> None:
         raise CanaryLedgerError(_ERR_STORAGE) from None
 
 
-def _refuse_existing_canary(raw: bytes) -> None:
+def _refuse_existing_canary(raw: bytes, *, recovery: bool = False) -> None:
     record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
-    if not _valid_canary_record(record):
+    if not _valid_canary_record(record, recovery=recovery):
         raise CanaryLedgerError(_ERR_STORAGE)
+    if recovery:
+        raise CanaryLedgerError("canary_recovery_already_used")
     if record["outcome"] == _OUTCOME_UNSETTLED:
         raise CanaryLedgerError("canary_unsettled_hold")
     raise CanaryLedgerError("canary_already_spent")
+
+
+def _load_eligible_prior_canary(
+    dir_fd: int,
+    *,
+    binding: str,
+    model: str,
+    history_digest: str,
+    max_input: int,
+    max_output: int,
+    expected_prior: tuple[str, str],
+) -> tuple[dict, str]:
+    raw = _read_private_bytes(dir_fd, CANARY_FILE)
+    if raw is None:
+        raise CanaryLedgerError("canary_recovery_no_prior")
+    prior_digest = sha256(raw).hexdigest()
+    record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
+    expected_run_id, expected_digest = expected_prior
+    if (not _valid_canary_record(record)
+            or record["outcome"] != _OUTCOME_UNSETTLED
+            or record["actual"] is not None
+            or record.get("delivered") is not False
+            or record["run_id"] != expected_run_id
+            or prior_digest != expected_digest
+            or record["binding"] != binding
+            or record["model"] != model
+            or record["max_input"] != max_input
+            or record["max_output"] != max_output
+            or record["history_digest"] != history_digest):
+        raise CanaryLedgerError("canary_recovery_ineligible")
+    return record, prior_digest
 
 
 def _try_flock_nb(lock_fd: int) -> bool:
@@ -363,12 +424,44 @@ class CanaryLedger:
             yield
 
     def preflight(self) -> HistorySnapshot:
-        """Verify no prior canary slot exists and snapshot all 9 I4a hold files."""
+        """Verify no prior canary or recovery slot exists and snapshot all 9 I4a hold files."""
         with self._locked(blocking=False) as dir_fd:
             existing = _read_private_bytes(dir_fd, CANARY_FILE)
             if existing is not None:
                 _refuse_existing_canary(existing)
+            existing_rec = _read_private_bytes(dir_fd, CANARY_RECOVERY_FILE)
+            if existing_rec is not None:
+                _refuse_existing_canary(existing_rec, recovery=True)
             return _inspect_history_fd(dir_fd)
+
+    def preflight_recovery(
+        self,
+        binding: str,
+        model: str,
+        *,
+        expected_prior: tuple[str, str] | None = None,
+    ) -> RecoverySnapshot:
+        """Verify exact reviewed unsettled canary.json predecessor and absent canary-recovery.json."""
+        if (type(binding) is not str or not _DIGEST_RE.fullmatch(binding)
+                or type(model) is not str or not _MODEL_RE.fullmatch(model)):
+            raise CanaryLedgerError("canary_recovery_ineligible")
+        pinned = expected_prior or (REVIEWED_PRIOR_RUN_ID, REVIEWED_PRIOR_CANARY_DIGEST)
+        with self._locked(blocking=False) as dir_fd:
+            existing_rec = _read_private_bytes(dir_fd, CANARY_RECOVERY_FILE)
+            if existing_rec is not None:
+                _refuse_existing_canary(existing_rec, recovery=True)
+            history = _inspect_history_fd(dir_fd)
+            prior, prior_digest = _load_eligible_prior_canary(
+                dir_fd, binding=binding, model=model, history_digest=history.digest,
+                max_input=self.max_input, max_output=self.max_output, expected_prior=pinned,
+            )
+            return RecoverySnapshot(
+                history=history,
+                prior_run_id=prior["run_id"],
+                prior_digest=prior_digest,
+                prior_max_input=prior["max_input"],
+                prior_max_output=prior["max_output"],
+            )
 
     def reserve(self, run_id: str, binding: str, model: str, history_digest: str, *,
                 deadline: float | None = None, check_alive=None) -> None:
@@ -382,6 +475,9 @@ class CanaryLedger:
             existing = _read_private_bytes(dir_fd, CANARY_FILE)
             if existing is not None:
                 _refuse_existing_canary(existing)
+            existing_rec = _read_private_bytes(dir_fd, CANARY_RECOVERY_FILE)
+            if existing_rec is not None:
+                _refuse_existing_canary(existing_rec, recovery=True)
             current = _inspect_history_fd(dir_fd)
             if current.digest != history_digest:
                 raise CanaryLedgerError("canary_history_changed")
@@ -398,23 +494,74 @@ class CanaryLedger:
             }
             _atomic_write_json(dir_fd, CANARY_FILE, record)
 
-    def _load_matching_unsettled(self, dir_fd: int, run_id: str) -> dict:
-        raw = _read_private_bytes(dir_fd, CANARY_FILE)
+    def reserve_recovery(
+        self,
+        run_id: str,
+        binding: str,
+        model: str,
+        history_digest: str,
+        *,
+        prior_run_id: str,
+        prior_digest: str,
+        expected_prior: tuple[str, str] | None = None,
+        deadline: float | None = None,
+        check_alive=None,
+    ) -> None:
+        """Durably reserve the single one-shot recovery slot without touching canary.json."""
+        pinned = expected_prior or (REVIEWED_PRIOR_RUN_ID, REVIEWED_PRIOR_CANARY_DIGEST)
+        if (type(run_id) is not str or not _RUN_RE.fullmatch(run_id)
+                or type(binding) is not str or not _DIGEST_RE.fullmatch(binding)
+                or type(model) is not str or not _MODEL_RE.fullmatch(model)
+                or type(history_digest) is not str or not _DIGEST_RE.fullmatch(history_digest)
+                or (prior_run_id, prior_digest) != pinned
+                or run_id == prior_run_id):
+            raise CanaryLedgerError("canary_invalid_reservation")
+        with self._locked(blocking=True, deadline=deadline, check_alive=check_alive) as dir_fd:
+            existing_rec = _read_private_bytes(dir_fd, CANARY_RECOVERY_FILE)
+            if existing_rec is not None:
+                _refuse_existing_canary(existing_rec, recovery=True)
+            current = _inspect_history_fd(dir_fd)
+            if current.digest != history_digest:
+                raise CanaryLedgerError("canary_history_changed")
+            _load_eligible_prior_canary(
+                dir_fd, binding=binding, model=model, history_digest=history_digest,
+                max_input=self.max_input, max_output=self.max_output, expected_prior=pinned,
+            )
+            record = {
+                "run_id": run_id,
+                "binding": binding,
+                "model": model,
+                "history_digest": history_digest,
+                "prior_canary_run_id": prior_run_id,
+                "prior_canary_digest": prior_digest,
+                "max_input": self.max_input,
+                "max_output": self.max_output,
+                "actual": None,
+                "outcome": _OUTCOME_UNSETTLED,
+                "delivered": False,
+            }
+            _atomic_write_json(dir_fd, CANARY_RECOVERY_FILE, record)
+
+    def _load_matching_unsettled(self, dir_fd: int, run_id: str, *, recovery: bool = False) -> dict:
+        target = CANARY_RECOVERY_FILE if recovery else CANARY_FILE
+        raw = _read_private_bytes(dir_fd, target)
         if raw is None:
             raise CanaryLedgerError("canary_missing_reservation")
         record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
-        if not _valid_canary_record(record) or record["run_id"] != run_id:
+        if not _valid_canary_record(record, recovery=recovery) or record["run_id"] != run_id:
             raise CanaryLedgerError("canary_unmatched_settlement")
         if record["outcome"] != _OUTCOME_UNSETTLED:
             raise CanaryLedgerError("canary_already_settled")
         return record
 
-    def settle(self, run_id: str, *, allow_delivery: bool, input_tokens: int, output_tokens: int) -> str:
+    def settle(self, run_id: str, *, allow_delivery: bool, input_tokens: int, output_tokens: int,
+               recovery: bool = False) -> str:
         """Durably settle verified usage independently of delivery permission."""
         if not _is_usage(input_tokens) or not _is_usage(output_tokens):
             raise CanaryLedgerError("canary_invalid_usage")
+        target = CANARY_RECOVERY_FILE if recovery else CANARY_FILE
         with self._locked(blocking=True) as dir_fd:
-            record = self._load_matching_unsettled(dir_fd, run_id)
+            record = self._load_matching_unsettled(dir_fd, run_id, recovery=recovery)
             over = input_tokens > record["max_input"] or output_tokens > record["max_output"]
             if over:
                 outcome = _OUTCOME_OVERAGE
@@ -424,17 +571,19 @@ class CanaryLedger:
                 outcome = _OUTCOME_REFUSED
             record["actual"] = [input_tokens, output_tokens]
             record["outcome"] = outcome
-            _atomic_write_json(dir_fd, CANARY_FILE, record)
+            _atomic_write_json(dir_fd, target, record)
             return outcome
 
-    def mark_delivered(self, run_id: str) -> None:
+    def mark_delivered(self, run_id: str, *, recovery: bool = False) -> None:
         """Record milestone delivery only after OpenCode exits 0 with one visible ok and verified cleanup."""
+        target = CANARY_RECOVERY_FILE if recovery else CANARY_FILE
         with self._locked(blocking=True) as dir_fd:
-            raw = _read_private_bytes(dir_fd, CANARY_FILE)
+            raw = _read_private_bytes(dir_fd, target)
             if raw is None:
                 raise CanaryLedgerError("canary_missing_reservation")
             record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
-            if not _valid_canary_record(record) or record["run_id"] != run_id or record["outcome"] != _OUTCOME_OK:
+            if (not _valid_canary_record(record, recovery=recovery)
+                    or record["run_id"] != run_id or record["outcome"] != _OUTCOME_OK):
                 raise CanaryLedgerError("canary_unmatched_settlement")
             record["delivered"] = True
-            _atomic_write_json(dir_fd, CANARY_FILE, record)
+            _atomic_write_json(dir_fd, target, record)

@@ -20,6 +20,7 @@ from .canary_ledger import (
     CanaryLedger,
     CanaryLedgerError,
     HistorySnapshot,
+    RecoverySnapshot,
 )
 from .canary_protocol import (
     IDLE_SECONDS,
@@ -51,11 +52,21 @@ from .connection import ConnectionError
 from .exposure import _INPUT_LIMIT, _OUTPUT_LIMIT, binding_digest
 from .live import make_backend
 from .profile_backend import ProfileBackend
-from .responses import StreamLimits
+from .responses import StreamFailure, StreamLimits
 
 
 _MODEL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z", re.ASCII)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_CLOSED_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
+_CLOSED_MEDIA = frozenset({"sse", "missing", "plain", "octet-stream", "other", "ambiguous"})
+_CLOSED_SUPPRESS_REASONS = frozenset({
+    "ok", "non_exact_output", "non_exact_text", "invalid_delta", "projected_limit",
+    "invalid_output", "disallowed_item", "invalid_item", "disallowed_part",
+    "invalid_queued", "unexpected_event", "safety_signal", "safety_buffering",
+    "safety_scan_limit", "metadata_guardian", "metadata_envelope", "metadata_fields",
+    "metadata_review", "metadata_moderation", "metadata_moderation_shape",
+    "metadata_moderation_root_keys", "metadata_moderation_blocked",
+})
 REVIEWED_MODELS = {MODEL: (_INPUT_LIMIT, _OUTPUT_LIMIT)}
 CANARY_STREAM_LIMITS = StreamLimits(
     max_json=1024 * 1024,
@@ -66,11 +77,32 @@ CANARY_STREAM_LIMITS = StreamLimits(
 )
 
 
+def _closed_diagnostic(exc: Exception) -> str:
+    """Return a strictly content-free closed diagnostic string for an exception."""
+    if isinstance(exc, StreamFailure):
+        return exc.describe()
+    if isinstance(exc, ConnectionError):
+        code = exc.code if type(exc.code) is str and _CLOSED_CODE_RE.fullmatch(exc.code) else "provider_error"
+        return f"code={code}"
+    if isinstance(exc, RouteUnavailable):
+        return f"code={exc.reason.value}"
+    if isinstance(exc, (CanaryUnsettledError, CanaryLedgerError)):
+        raw = exc.args[0] if exc.args and type(exc.args[0]) is str else ""
+        code = raw if _CLOSED_CODE_RE.fullmatch(raw) else "canary_error"
+        return f"code={code}"
+    if isinstance(exc, OwnerLost):
+        return "code=owner_lost"
+    if isinstance(exc, RuntimeFailure):
+        return "code=runtime_failure"
+    return "code=io_error"
+
+
 @dataclass(frozen=True)
 class CanaryArgs:
     model: str | None
     synthetic_check: bool
     reviewed_source: str | None = None
+    recover_unsettled: bool = False
 
 
 def _parse_canary_flag(argv: list[str], idx: int, current: str | None, pattern: re.Pattern) -> tuple[str, int]:
@@ -82,23 +114,43 @@ def _parse_canary_flag(argv: list[str], idx: int, current: str | None, pattern: 
     return value, idx + 2
 
 
+def _set_unique_flag(current: bool, conflict: bool) -> bool:
+    if current or conflict:
+        raise ValueError("unsupported canary arguments")
+    return True
+
+
+def _consume_canary_arg(argv: list[str], idx: int, state: dict) -> int:
+    arg = argv[idx]
+    if arg == "--synthetic-check":
+        state["synthetic"] = _set_unique_flag(state["synthetic"], state["recover"])
+        return idx + 1
+    if arg == "--recover-unsettled":
+        state["recover"] = _set_unique_flag(state["recover"], state["synthetic"])
+        return idx + 1
+    if arg == "--model":
+        state["model"], next_idx = _parse_canary_flag(argv, idx, state["model"], _MODEL_SLUG_RE)
+        return next_idx
+    if arg == "--reviewed-source":
+        state["reviewed_source"], next_idx = _parse_canary_flag(argv, idx, state["reviewed_source"], _SHA256_RE)
+        return next_idx
+    raise ValueError("unsupported canary arguments")
+
+
 def parse_canary_argv(argv: list[str]) -> CanaryArgs:
-    """Strictly parse `canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]`."""
-    model = None
-    synthetic = False
-    reviewed_source = None
+    """Strictly parse `canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check | --recover-unsettled]`."""
+    state: dict = {"model": None, "synthetic": False, "recover": False, "reviewed_source": None}
     idx = 0
     while idx < len(argv):
-        arg = argv[idx]
-        if arg == "--synthetic-check" and not synthetic:
-            synthetic, idx = True, idx + 1
-        elif arg == "--model":
-            model, idx = _parse_canary_flag(argv, idx, model, _MODEL_SLUG_RE)
-        elif arg == "--reviewed-source":
-            reviewed_source, idx = _parse_canary_flag(argv, idx, reviewed_source, _SHA256_RE)
-        else:
-            raise ValueError("unsupported canary arguments")
-    return CanaryArgs(model=model, synthetic_check=synthetic, reviewed_source=reviewed_source)
+        idx = _consume_canary_arg(argv, idx, state)
+    if state["recover"] and state["reviewed_source"] is None:
+        raise ValueError("--recover-unsettled requires --reviewed-source")
+    return CanaryArgs(
+        model=state["model"],
+        synthetic_check=state["synthetic"],
+        reviewed_source=state["reviewed_source"],
+        recover_unsettled=state["recover"],
+    )
 
 
 def _trusted_source_file(path: Path) -> bytes:
@@ -199,6 +251,8 @@ class CanaryBroker:
         check_alive,
         port: int = PORT,
         after_reserve=None,
+        recovery_prior: tuple[str, str] | None = None,
+        expected_prior: tuple[str, str] | None = None,
     ):
         self.sock_path = sock_path
         self.proof = proof
@@ -213,6 +267,8 @@ class CanaryBroker:
         self.check_alive = check_alive
         self.port = port
         self.after_reserve = after_reserve
+        self.recovery_prior = recovery_prior
+        self.expected_prior = expected_prior
         self._stop = threading.Event()
         self._admit_lock = threading.Lock()
         self._peer_lock = threading.Lock()
@@ -225,7 +281,13 @@ class CanaryBroker:
         self.stream_outcome: StreamOutcome | None = None
         self.ledger_outcome: str | None = None
         self.delivered_bytes = 0
+        self.media_fallback: str | None = None
+        self.diagnostic: str = ""
         self.error: str | None = None
+
+    def observe_media(self, category: str) -> None:
+        if type(category) is str and category in _CLOSED_MEDIA:
+            self.media_fallback = category
 
     @contextmanager
     def _track_peer(self, sock: socket.socket):
@@ -337,10 +399,19 @@ class CanaryBroker:
 
     def _reserve_before_write(self, deadline: float) -> None:
         self._check_dispatch_authority(deadline)
-        self.ledger.reserve(
-            self.run_id, self.binding_hash, self.bound_model, self.history_digest,
-            deadline=deadline, check_alive=lambda: self._check_dispatch_authority(deadline),
-        )
+        alive_cb = lambda: self._check_dispatch_authority(deadline)
+        if self.recovery_prior is not None:
+            prior_run_id, prior_digest = self.recovery_prior
+            self.ledger.reserve_recovery(
+                self.run_id, self.binding_hash, self.bound_model, self.history_digest,
+                prior_run_id=prior_run_id, prior_digest=prior_digest,
+                expected_prior=self.expected_prior, deadline=deadline, check_alive=alive_cb,
+            )
+        else:
+            self.ledger.reserve(
+                self.run_id, self.binding_hash, self.bound_model, self.history_digest,
+                deadline=deadline, check_alive=alive_cb,
+            )
         self.ledger_outcome = "unsettled"
         if self.after_reserve is not None:
             self.after_reserve()
@@ -361,6 +432,7 @@ class CanaryBroker:
         self._dispatch_single_turn(client, canonical, deadline)
 
     def _dispatch_single_turn(self, client: socket.socket, canonical: dict, deadline: float) -> None:
+        recovery = self.recovery_prior is not None
         try:
             self._check_dispatch_authority(deadline)
             self.upstream_calls += 1
@@ -380,6 +452,7 @@ class CanaryBroker:
                 allow_delivery=outcome.allow_delivery,
                 input_tokens=outcome.input_tokens,
                 output_tokens=outcome.output_tokens,
+                recovery=recovery,
             )
             self.ledger_outcome = settled
             if settled == "ok_settled":
@@ -388,7 +461,8 @@ class CanaryBroker:
                 )
                 self._deliver_fenced(client, payload, deadline)
         except (CanaryLedgerError, CanaryUnsettledError, ConnectionError, OwnerLost, RouteUnavailable, OSError) as exc:
-            self.error = str(exc)
+            self.diagnostic = _closed_diagnostic(exc)
+            self.error = self.diagnostic
 
     def _deliver_fenced(self, client: socket.socket, payload: bytes, deadline: float) -> None:
         def write_action():
@@ -398,7 +472,14 @@ class CanaryBroker:
         self.delivered_bytes = self.fenced_client_write(write_action)
 
 
-def _format_disclosure(label: str, model: str, history: HistorySnapshot, source_digest: str) -> str:
+def _format_disclosure(
+    label: str,
+    model: str,
+    history: HistorySnapshot,
+    source_digest: str,
+    *,
+    recovery: RecoverySnapshot | None = None,
+) -> str:
     max_in, max_out = REVIEWED_MODELS[model]
     prior_desc = (
         f"{len(history.present_files)} prior I4a record file(s) "
@@ -409,12 +490,23 @@ def _format_disclosure(label: str, model: str, history: HistorySnapshot, source_
         if history.present_files
         else "no prior I4a hold files"
     )
-    total_in = history.reserved_input + max_in
-    total_out = history.reserved_output + max_out
+    prior_canary_in = recovery.prior_max_input if recovery is not None else 0
+    prior_canary_out = recovery.prior_max_output if recovery is not None else 0
+    total_in = history.reserved_input + prior_canary_in + max_in
+    total_out = history.reserved_output + prior_canary_out + max_out
+    recovery_note = (
+        f"Prior unsettled canary.json (read-only, untouched): run_id={recovery.prior_run_id}, "
+        f"open unsettled ceiling {prior_canary_in:,} in / {prior_canary_out:,} out. "
+        "This one-shot recovery reserves canary-recovery.json without modifying canary.json; "
+        "strict moderation checks remain active and may settle actual usage as refused_settled with 0 client bytes. "
+        if recovery is not None
+        else ""
+    )
     return (
         f"Active registration: {label}. Bound model: {model}. "
         f"Canary source SHA-256: {source_digest}. "
         f"Prior workstation state (read-only, untouched): {prior_desc}. "
+        f"{recovery_note}"
         f"This single-use zero-tool canary authorizes at most 1 request to OpenAI ('Reply with exactly: ok'). "
         f"OpenCode local limit.output=64 does not cap upstream because ChatGPT /v1/responses omits max_output_tokens; "
         f"published ceilings add up to {max_in:,} input and {max_out:,} output tokens "
@@ -422,6 +514,19 @@ def _format_disclosure(label: str, model: str, history: HistorySnapshot, source_
         "OpenAI may use your ChatGPT plan or account credits with no verified hard spending cap. "
         "API-key fallback and all tools are disabled. Ctrl-C stops and cleans up."
     )
+
+
+def _format_failure_details(broker: CanaryBroker) -> str:
+    parts = []
+    if broker.media_fallback in _CLOSED_MEDIA:
+        parts.append(f"media_fallback={broker.media_fallback}")
+    if broker.stream_outcome is not None and not broker.stream_outcome.allow_delivery:
+        raw_reason = broker.stream_outcome.reason
+        reason = raw_reason if raw_reason in _CLOSED_SUPPRESS_REASONS else "suppressed"
+        parts.append(f"reason={reason}")
+    elif broker.diagnostic:
+        parts.append(broker.diagnostic)
+    return ("; " + ", ".join(parts)) if parts else ""
 
 
 def _resolve_model(conn, binding, requested: str | None) -> str:
@@ -458,6 +563,7 @@ def _verify_and_record_completion(
     cleanup_verified: bool,
     cleanup_error: str,
     owner_rc: int,
+    recovery: bool = False,
 ) -> int:
     clean_ok = cleanup_verified and owner_rc == 0 and not root.exists()
     if not clean_ok:
@@ -468,15 +574,16 @@ def _verify_and_record_completion(
         return 1
     if (broker.ledger_outcome == "ok_settled" and broker.delivered_bytes > 0
             and rc == 0 and verify_opencode_json_stdout(stdout_bytes)):
-        ledger.mark_delivered(run_id)
+        ledger.mark_delivered(run_id, recovery=recovery)
         terminal.write(
             f"ChatGPT canary succeeded: exact 'ok' delivered, verified cleanup, and settled "
             f"({broker.stream_outcome.input_tokens} in / {broker.stream_outcome.output_tokens} out)."
         )
         return 0
+    details = _format_failure_details(broker)
     terminal.error(
         f"ChatGPT canary did not verify clean 'ok' delivery "
-        f"(ledger={broker.ledger_outcome or 'none'}, opencode_rc={rc})."
+        f"(ledger={broker.ledger_outcome or 'none'}, opencode_rc={rc}{details})."
     )
     return 1
 
@@ -493,6 +600,8 @@ def _execute_canary_session(
     model: str,
     history: HistorySnapshot,
     owner_factory=DetachedOwnerSession,
+    recovery_prior: tuple[str, str] | None = None,
+    expected_prior: tuple[str, str] | None = None,
 ) -> int:
     run_id = secrets.token_hex(16)
     worker_token = secrets.token_hex(32)
@@ -515,6 +624,8 @@ def _execute_canary_session(
                 limits=CANARY_STREAM_LIMITS,
                 deadline=deadline,
                 cancelled=cancelled,
+                inspect_media=True,
+                observe_media=broker.observe_media,
             ) as events:
                 yield events
 
@@ -530,6 +641,8 @@ def _execute_canary_session(
             upstream_stream=upstream_stream,
             fenced_client_write=lambda fn: backend.canary_fenced_write(label, epoch, conn, binding, fn),
             check_alive=check_alive,
+            recovery_prior=recovery_prior,
+            expected_prior=expected_prior,
         )
         broker.start()
         owner.start_containers()
@@ -542,7 +655,25 @@ def _execute_canary_session(
         terminal, ledger, broker, run_id,
         root=root, rc=rc, stdout_bytes=stdout_bytes,
         cleanup_verified=cleanup_verified, cleanup_error=cleanup_error, owner_rc=owner_rc,
+        recovery=(recovery_prior is not None),
     )
+
+
+def _preflight_and_resolve(backend: ProfileBackend, ledger: CanaryLedger, requested_model: str | None, *,
+                           recover_unsettled: bool, expected_prior: tuple[str, str] | None):
+    if not recover_unsettled:
+        history = ledger.preflight()
+        label, epoch, conn, binding = backend.active_connection()
+        model = _resolve_model(conn, binding, requested_model)
+        return label, epoch, conn, binding, model, history, None
+    target = requested_model or MODEL
+    if target not in REVIEWED_MODELS:
+        raise RouteUnavailable(Reason.MODEL_UNAVAILABLE)
+    label, epoch, conn, binding = backend.active_connection()
+    b_hash = binding_digest(binding.profile, binding.generation, epoch)
+    rec = ledger.preflight_recovery(b_hash, target, expected_prior=expected_prior)
+    model = _resolve_model(conn, binding, target)
+    return label, epoch, conn, binding, model, rec.history, rec
 
 
 def run_canary(
@@ -550,13 +681,18 @@ def run_canary(
     *,
     requested_model: str | None = None,
     reviewed_source: str | None = None,
+    recover_unsettled: bool = False,
+    expected_prior: tuple[str, str] | None = None,
     backend_factory=None,
     owner_factory=DetachedOwnerSession,
     source_root: Path | None = None,
 ) -> int:
-    """Run the attended single-turn zero-tool ChatGPT canary."""
+    """Run the attended single-turn zero-tool ChatGPT canary (or one-shot unsettled recovery)."""
     if not terminal.attended():
         terminal.error("ChatGPT canary requires an attended foreground workstation terminal.")
+        return 2
+    if recover_unsettled and reviewed_source is None:
+        terminal.error("ChatGPT canary recovery requires --reviewed-source SHA256.")
         return 2
     factory = backend_factory or make_backend
     try:
@@ -567,11 +703,17 @@ def run_canary(
         backend = factory()
         ledger = CanaryLedger(backend._state)
         with ledger.exclusive_run():
-            history = ledger.preflight()
-            label, epoch, conn, binding = backend.active_connection()
-            model = _resolve_model(conn, binding, requested_model)
-            terminal.write(_format_disclosure(label, model, history, source_digest))
-            if not terminal.confirm("Authorize this single zero-tool OpenCode canary request?"):
+            label, epoch, conn, binding, model, history, rec_snap = _preflight_and_resolve(
+                backend, ledger, requested_model,
+                recover_unsettled=recover_unsettled, expected_prior=expected_prior,
+            )
+            terminal.write(_format_disclosure(label, model, history, source_digest, recovery=rec_snap))
+            prompt = (
+                "Authorize this single one-shot recovery zero-tool OpenCode canary request?"
+                if rec_snap is not None
+                else "Authorize this single zero-tool OpenCode canary request?"
+            )
+            if not terminal.confirm(prompt):
                 terminal.error("Cancelled.")
                 return 1
             _verify_live_identity(backend, label, epoch, binding)
@@ -579,11 +721,13 @@ def run_canary(
                 terminal=terminal, backend=backend, ledger=ledger,
                 label=label, epoch=epoch, conn=conn, binding=binding,
                 model=model, history=history, owner_factory=owner_factory,
+                recovery_prior=(rec_snap.prior_run_id, rec_snap.prior_digest) if rec_snap is not None else None,
+                expected_prior=expected_prior,
             )
     except RouteUnavailable as error:
         return report_failure(terminal, error, operation="ChatGPT canary")
     except (CanaryLedgerError, ConnectionError, OwnerLost, RuntimeFailure) as error:
-        terminal.error(f"ChatGPT canary refused: {error}")
+        terminal.error(f"ChatGPT canary refused: {_closed_diagnostic(error)}")
         return 1
 
 
@@ -705,14 +849,20 @@ def main(argv: list[str], *, terminal: Terminal | None = None) -> int:
     try:
         parsed = parse_canary_argv(argv)
     except ValueError:
-        term.error("usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]")
+        term.error(
+            "usage: oc-sandbox openai canary [--model SLUG] [--reviewed-source SHA256] "
+            "[--synthetic-check | --recover-unsettled]"
+        )
         return 2
     try:
         with _interrupt_signals():
             if parsed.synthetic_check:
                 return run_synthetic_check(term, requested_model=parsed.model)
             return run_canary(
-                term, requested_model=parsed.model, reviewed_source=parsed.reviewed_source,
+                term,
+                requested_model=parsed.model,
+                reviewed_source=parsed.reviewed_source,
+                recover_unsettled=parsed.recover_unsettled,
             )
     except KeyboardInterrupt:
         term.error("Interrupted.")

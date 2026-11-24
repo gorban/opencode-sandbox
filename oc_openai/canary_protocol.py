@@ -38,9 +38,10 @@ _REQUIRED_REQ_KEYS = frozenset({"model", "input", "stream", "instructions"})
 _ALLOWED_REQ_KEYS = _REQUIRED_REQ_KEYS | frozenset({
     "store", "max_output_tokens", "prompt_cache_key", "include", "tools", "tool_choice",
 })
-_EMPTY_REASONING_KEYS = frozenset({"id", "type", "status", "summary"})
+_EMPTY_REASONING_KEYS = frozenset({"id", "type", "status", "summary", "content", "encrypted_content"})
 _MESSAGE_ITEM_KEYS = frozenset({"id", "type", "role", "status", "content", "phase"})
 _EV_CREATED = "response.created"
+_EV_QUEUED = "response.queued"
 _EV_IN_PROGRESS = "response.in_progress"
 _EV_METADATA = "response.metadata"
 _EV_ITEM_ADDED = "response.output_item.added"
@@ -50,6 +51,7 @@ _EV_PART_DONE = "response.content_part.done"
 _EV_TEXT_DELTA = "response.output_text.delta"
 _EV_TEXT_DONE = "response.output_text.done"
 _EV_COMPLETED = "response.completed"
+_HEARTBEAT_EVENTS = frozenset({"ping", "keepalive"})
 _TERMINAL_FAILURES = frozenset({"response.failed", "response.incomplete", "error"})
 _MODERATION_ROOT_KEYS = frozenset({"presentation", "prompt", "response", "schema_version"})
 _MODERATION_SLOT_KEYS = frozenset({"outputs", "results", "is_blocked"})
@@ -118,21 +120,22 @@ def _scan_global_safety(obj) -> None:
 
 
 def _validate_moderation_entry(entry) -> None:
-    if (type(entry) is not dict or not set(entry) <= _MODERATION_ENTRY_KEYS
-            or entry.get("is_blocked") is not False):
-        raise _SafetyRejected("metadata_moderation")
+    if type(entry) is not dict or not set(entry) <= _MODERATION_ENTRY_KEYS:
+        raise _SafetyRejected("metadata_moderation_shape")
+    if entry.get("is_blocked") is not False:
+        raise _SafetyRejected("metadata_moderation_blocked")
     for text_key in ("category", "classifier", "label"):
         val = entry.get(text_key)
         if val is not None and (type(val) is not str or len(val) > 256):
-            raise _SafetyRejected("metadata_moderation")
+            raise _SafetyRejected("metadata_moderation_shape")
     score = entry.get("score")
     if score is not None and (type(score) not in (int, float) or not 0 <= score <= 1):
-        raise _SafetyRejected("metadata_moderation")
+        raise _SafetyRejected("metadata_moderation_shape")
 
 
 def _validate_moderation_entries(entries) -> None:
     if type(entries) is not list or len(entries) > 32:
-        raise _SafetyRejected("metadata_moderation")
+        raise _SafetyRejected("metadata_moderation_shape")
     for entry in entries:
         _validate_moderation_entry(entry)
 
@@ -141,25 +144,27 @@ def _validate_moderation_slot(slot) -> None:
     if slot is None or slot == {}:
         return
     if type(slot) is not dict or not set(slot) <= _MODERATION_SLOT_KEYS:
-        raise _SafetyRejected("metadata_moderation")
+        raise _SafetyRejected("metadata_moderation_shape")
     if "is_blocked" in slot and slot["is_blocked"] is not False:
-        raise _SafetyRejected("metadata_moderation")
+        raise _SafetyRejected("metadata_moderation_blocked")
     for list_key in ("outputs", "results"):
         if slot.get(list_key) is not None:
             _validate_moderation_entries(slot[list_key])
 
 
 def _validate_moderation_root(moderation) -> None:
-    if type(moderation) is not dict or not set(moderation) <= _MODERATION_ROOT_KEYS:
-        raise _SafetyRejected("metadata_moderation")
+    if type(moderation) is not dict:
+        raise _SafetyRejected("metadata_moderation_shape")
+    if not set(moderation) <= _MODERATION_ROOT_KEYS:
+        raise _SafetyRejected("metadata_moderation_root_keys")
     if moderation.get("presentation") not in (None, "inline"):
-        raise _SafetyRejected("metadata_moderation")
+        raise _SafetyRejected("metadata_moderation_shape")
     schema_version = moderation.get("schema_version")
     if schema_version is not None and (type(schema_version) is not int or schema_version != 1):
-        raise _SafetyRejected("metadata_moderation")
+        raise _SafetyRejected("metadata_moderation_shape")
     _validate_moderation_slot(moderation.get("prompt"))
     if moderation.get("response") not in (None, {}):
-        raise _SafetyRejected("metadata_moderation")
+        raise _SafetyRejected("metadata_moderation_blocked")
 
 
 def _validate_metadata_dict(metadata) -> None:
@@ -384,8 +389,12 @@ def _is_empty_reasoning_item(item: dict) -> bool:
         return False
     if not set(item) <= _EMPTY_REASONING_KEYS:
         return False
-    summary = item.get("summary")
-    return summary is None or summary == []
+    return (
+        item.get("status") in (None, "in_progress", "completed")
+        and item.get("summary") in (None, [])
+        and item.get("content") in (None, [])
+        and item.get("encrypted_content") is None
+    )
 
 
 def _is_clean_output_text_part(part) -> bool:
@@ -401,6 +410,7 @@ def _is_clean_output_text_part(part) -> bool:
 
 def _is_clean_assistant_message(item: dict) -> bool:
     if (item.get("type") != "message" or item.get("role") != "assistant"
+            or item.get("status") not in (None, "in_progress", "completed")
             or not set(item) <= _MESSAGE_ITEM_KEYS):
         return False
     content = item.get("content", [])
@@ -516,8 +526,18 @@ class _CanaryStreamState:
     def _check_metadata(self, event: dict) -> None:
         try:
             _validate_metadata_event(event, self.created_id)
-        except _SafetyRejected:
-            self._suppress("moderation_or_ambiguous_metadata")
+        except _SafetyRejected as rej:
+            self._suppress(rej.args[0] if rej.args else "metadata_moderation_shape")
+
+    def _check_queued(self, event: dict) -> None:
+        queued = event.get("response")
+        if (type(queued) is not dict or queued.get("id") != self.created_id
+                or queued.get("model", self.bound_model) != self.bound_model
+                or queued.get("status") != "queued"
+                or queued.get("output", []) != []
+                or queued.get("error") is not None
+                or queued.get("incomplete_details") is not None):
+            self._suppress("invalid_queued")
 
     def accept(self, event: dict) -> None:
         if type(event) is not dict or type(event.get("type")) is not str or self.completed is not None:
@@ -527,8 +547,8 @@ class _CanaryStreamState:
             raise CanaryUnsettledError("provider_terminal")
         try:
             _scan_global_safety(event)
-        except _SafetyRejected:
-            self._suppress("safety_signal")
+        except _SafetyRejected as rej:
+            self._suppress(rej.args[0] if rej.args else "safety_signal")
         if kind == _EV_CREATED:
             self._check_created(event)
             return
@@ -543,6 +563,11 @@ class _CanaryStreamState:
         self._accept_body_event(kind, event)
 
     def _accept_body_event(self, kind: str, event: dict) -> None:
+        if kind == _EV_QUEUED:
+            self._check_queued(event)
+            return
+        if kind in _HEARTBEAT_EVENTS and event.keys() == {"type"}:
+            return
         if kind == _EV_IN_PROGRESS:
             self._check_response_output(event.get("response"))
             return
@@ -574,8 +599,8 @@ def consume_upstream_stream(events, *, bound_model: str, check_alive) -> StreamO
     )
     try:
         _scan_global_safety(state.completed)
-    except _SafetyRejected:
-        state._suppress("safety_signal")
+    except _SafetyRejected as rej:
+        state._suppress(rej.args[0] if rej.args else "safety_signal")
     exact_ok = not state.suppressed and _extract_exact_ok(state.completed, state.deltas)
     reason = "ok" if exact_ok else (state.suppress_reason or "non_exact_output")
     return StreamOutcome(

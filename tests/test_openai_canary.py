@@ -25,6 +25,7 @@ from unittest.mock import patch
 from oc_openai import canary, canary_ledger, canary_protocol, canary_runtime
 from oc_openai.canary_ledger import (
     CANARY_FILE,
+    CANARY_RECOVERY_FILE,
     I4A_HOLD_FILES,
     CanaryLedger,
     CanaryLedgerError,
@@ -260,11 +261,21 @@ class CanaryLedgerTests(unittest.TestCase):
         exp.write_bytes(before["exposure.json"])
         os.chmod(exp, 0o600)
 
-        # Non-bool delivered field in canary.json rejected.
+        # Non-bool delivered field or delivered=True on non-ok_settled rejected.
         self.assertFalse(canary_ledger._valid_canary_record({
             "run_id": "1" * 32, "binding": "2" * 64, "model": "gpt-6.2-sol", "history_digest": "3" * 64,
             "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [1, 1],
             "outcome": "ok_settled", "delivered": "yes",
+        }))
+        self.assertFalse(canary_ledger._valid_canary_record({
+            "run_id": "1" * 32, "binding": "2" * 64, "model": "gpt-6.2-sol", "history_digest": "3" * 64,
+            "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": None,
+            "outcome": "unsettled", "delivered": True,
+        }))
+        self.assertFalse(canary_ledger._valid_canary_record({
+            "run_id": "1" * 32, "binding": "2" * 64, "model": "gpt-6.2-sol", "history_digest": "3" * 64,
+            "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [1, 1],
+            "outcome": "refused_settled", "delivered": True,
         }))
 
         # Unsafe mode fails visibly.
@@ -277,6 +288,77 @@ class CanaryLedgerTests(unittest.TestCase):
         # Corrupt JSON fails visibly.
         target.write_bytes(b"{broken")
         with self.assertRaisesRegex(CanaryLedgerError, "canary_history_corrupt"):
+            self.ledger.preflight()
+
+    def test_one_shot_recovery_pinning_immutability_and_mutual_exclusion(self):
+        # CLI grammar requires --reviewed-source with --recover-unsettled and forbids --synthetic-check.
+        rec_args = canary.parse_canary_argv(["--recover-unsettled", "--reviewed-source", "a" * 64])
+        self.assertTrue(rec_args.recover_unsettled)
+        self.assertEqual(rec_args.reviewed_source, "a" * 64)
+        for bad_argv in (
+            ["--recover-unsettled"],
+            ["--recover-unsettled", "--reviewed-source", "a" * 64, "--synthetic-check"],
+            ["--recover-unsettled", "--recover-unsettled", "--reviewed-source", "a" * 64],
+        ):
+            with self.assertRaises(ValueError):
+                canary.parse_canary_argv(bad_argv)
+
+        # Seed unsettled canary.json predecessor and pin its exact run_id + byte digest.
+        snap = self.ledger.preflight()
+        prior_run = "a" * 32
+        self.ledger.reserve(prior_run, self.binding, "gpt-6.2-sol", snap.digest)
+        prior_path = self.state / CANARY_FILE
+        prior_bytes = prior_path.read_bytes()
+        prior_stat = prior_path.stat()
+        prior_digest = hashlib.sha256(prior_bytes).hexdigest()
+        pinned = (prior_run, prior_digest)
+
+        # Wrong pinned predecessor digest/run_id or wrong binding is rejected before consent.
+        with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_ineligible"):
+            self.ledger.preflight_recovery(self.binding, "gpt-6.2-sol", expected_prior=(prior_run, "0" * 64))
+        with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_ineligible"):
+            self.ledger.preflight_recovery("9" * 64, "gpt-6.2-sol", expected_prior=pinned)
+
+        rec_snap = self.ledger.preflight_recovery(self.binding, "gpt-6.2-sol", expected_prior=pinned)
+        self.assertEqual((rec_snap.prior_run_id, rec_snap.prior_digest), pinned)
+
+        # Tampering canary.json between preflight and reserve fails closed without creating canary-recovery.json.
+        tampered = prior_bytes.replace(b'"unsettled"', b'"ok_settled"')
+        prior_path.write_bytes(tampered)
+        os.chmod(prior_path, 0o600)
+        with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_ineligible"):
+            self.ledger.reserve_recovery(
+                "b" * 32, self.binding, "gpt-6.2-sol", rec_snap.history.digest,
+                prior_run_id=prior_run, prior_digest=prior_digest, expected_prior=pinned,
+            )
+        self.assertFalse((self.state / CANARY_RECOVERY_FILE).exists())
+        prior_path.write_bytes(prior_bytes)
+        os.chmod(prior_path, 0o600)
+        prior_stat = prior_path.stat()
+
+        # Reserve, settle, and mark delivered on canary-recovery.json while canary.json stays byte/inode identical.
+        self.ledger.reserve_recovery(
+            "b" * 32, self.binding, "gpt-6.2-sol", rec_snap.history.digest,
+            prior_run_id=prior_run, prior_digest=prior_digest, expected_prior=pinned,
+        )
+        self.assertEqual(prior_path.read_bytes(), prior_bytes)
+        self.assertEqual((prior_path.stat().st_dev, prior_path.stat().st_ino), (prior_stat.st_dev, prior_stat.st_ino))
+        # Settlement of canary-recovery.json succeeds cleanly and never mutates canary.json.
+        outcome = self.ledger.settle("b" * 32, allow_delivery=True, input_tokens=15, output_tokens=2, recovery=True)
+        self.assertEqual(outcome, "ok_settled")
+        self.ledger.mark_delivered("b" * 32, recovery=True)
+        rec_data = json.loads((self.state / CANARY_RECOVERY_FILE).read_text())
+        self.assertEqual(rec_data["prior_canary_run_id"], prior_run)
+        self.assertEqual(rec_data["prior_canary_digest"], prior_digest)
+        self.assertIs(rec_data["delivered"], True)
+        self.assertEqual(prior_path.read_bytes(), prior_bytes)
+        self.assertEqual((prior_path.stat().st_dev, prior_path.stat().st_ino), (prior_stat.st_dev, prior_stat.st_ino))
+
+        # Repeat recovery is permanently blocked; removing canary.json still blocks ordinary canary via recovery file.
+        with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_already_used"):
+            self.ledger.preflight_recovery(self.binding, "gpt-6.2-sol", expected_prior=pinned)
+        prior_path.unlink()
+        with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_already_used"):
             self.ledger.preflight()
 
     def test_single_use_across_settled_unsettled_history_change_and_lock_bounds(self):
@@ -831,6 +913,93 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
                     self.assertIs(rec["delivered"], False)
                 finally:
                     broker.close()
+
+    def test_queued_ping_keepalive_empty_reasoning_and_content_free_diagnostics(self):
+        # Valid response.queued, type-only ping/keepalive, and empty reasoning with null content/encrypted_content.
+        extra_ok = (
+            {"type": "response.queued", "response": {
+                "id": "resp_ok_1", "model": "gpt-6.2-sol", "status": "queued",
+                "output": [], "error": None, "incomplete_details": None,
+            }},
+            {"type": "ping"},
+            {"type": "keepalive"},
+            {"type": "response.output_item.added", "output_index": 0, "item": {
+                "id": "rs_1", "type": "reasoning", "status": "completed",
+                "summary": [], "content": None, "encrypted_content": None,
+            }},
+        )
+        ok_out = consume_upstream_stream(_ok_events(extra=extra_ok), bound_model="gpt-6.2-sol", check_alive=lambda: None)
+        self.assertTrue(ok_out.allow_delivery)
+        self.assertEqual((ok_out.input_tokens, ok_out.output_tokens), (11, 2))
+
+        # Queued before created raises provider_identity; bad queued/ping/reasoning status suppress delivery.
+        queued_first = [{"type": "response.queued", "response": {"id": "resp_ok_1", "status": "queued"}}, *_ok_events()]
+        with self.assertRaises(CanaryUnsettledError):
+            consume_upstream_stream(queued_first, bound_model="gpt-6.2-sol", check_alive=lambda: None)
+
+        sentinel = "SECRET_CANARY_SENTINEL_999"
+        suppressed_cases = (
+            ("bad_queued_id", {"type": "response.queued", "response": {
+                "id": "resp_other", "status": "queued", "output": [], "error": None, "incomplete_details": None,
+            }}, "invalid_queued"),
+            ("ping_extra_field", {"type": "ping", "note": sentinel}, "unexpected_event"),
+            ("failed_reasoning", {"type": "response.output_item.added", "output_index": 0, "item": {
+                "id": "rs_1", "type": "reasoning", "status": "failed", "summary": [],
+            }}, "disallowed_item"),
+            ("extra_mod_root", {"type": "response.metadata", "response_id": "resp_ok_1", "sequence_number": 1,
+             "metadata": {"openai_chatgpt_moderation_metadata": {sentinel: "private"}}}, "metadata_moderation_root_keys"),
+        )
+        for label, extra_ev, expected_reason in suppressed_cases:
+            with self.subTest(case=label):
+                out = consume_upstream_stream(_ok_events(extra=(extra_ev,)), bound_model="gpt-6.2-sol",
+                                              check_alive=lambda: None)
+                self.assertFalse(out.allow_delivery)
+                self.assertEqual(out.reason, expected_reason)
+
+        # Verify content-free diagnostics never leak private sentinels on either refused_settled or StreamFailure.
+        from oc_openai.responses import _StreamEvidence
+
+        class _FakeBroker:
+            def __init__(self, outcome, ledger_outcome, diagnostic="", media_fallback=None):
+                self.stream_outcome = outcome
+                self.ledger_outcome = ledger_outcome
+                self.delivered_bytes = 0
+                self.diagnostic = diagnostic
+                self.media_fallback = media_fallback
+
+        refused_out = consume_upstream_stream(
+            _ok_events(extra=({"type": "response.metadata", "response_id": "resp_ok_1", "sequence_number": 1,
+                               "metadata": {"openai_chatgpt_moderation_metadata": {sentinel: "private"}}},)),
+            bound_model="gpt-6.2-sol", check_alive=lambda: None,
+        )
+        term_ref = Terminal(True)
+        canary._verify_and_record_completion(
+            term_ref, self.ledger, _FakeBroker(refused_out, "refused_settled", media_fallback="missing"), "9" * 32,
+            root=self.scratch / "gone", rc=1, stdout_bytes=b"",
+            cleanup_verified=True, cleanup_error="", owner_rc=0,
+        )
+        joined_ref = "\n".join(term_ref.output)
+        self.assertIn("reason=metadata_moderation_root_keys", joined_ref)
+        self.assertIn("media_fallback=missing", joined_ref)
+        self.assertNotIn(sentinel, joined_ref)
+
+        ev = _StreamEvidence(
+            media="plain", media_fields="one", prefix_shape="other", prefix_bytes=12,
+            http_body_verified=False, tls_close="not_reached",
+        )
+        sf_diag = canary._closed_diagnostic(StreamFailure("provider_stream_content_type", ev))
+        term_sf = Terminal(True)
+        canary._verify_and_record_completion(
+            term_sf, self.ledger, _FakeBroker(None, "unsettled", diagnostic=sf_diag), "9" * 32,
+            root=self.scratch / "gone", rc=1, stdout_bytes=b"",
+            cleanup_verified=True, cleanup_error="", owner_rc=0,
+        )
+        joined_sf = "\n".join(term_sf.output)
+        self.assertIn("provider_stream_content_type", joined_sf)
+        self.assertIn("http_body_verified=0 tls_close=not_reached", joined_sf)
+        self.assertNotIn(sentinel, joined_sf)
+        # Raw OSError text must never escape _closed_diagnostic.
+        self.assertEqual(canary._closed_diagnostic(OSError(sentinel)), "code=io_error")
 
 
 class CanaryRealPodmanTests(unittest.TestCase):
@@ -1401,6 +1570,163 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
         finally:
             s1.close()
             s2.close()
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "cryptography prerequisite unavailable")
+    def test_real_tls_missing_media_only_and_tls_close_timeout_diagnostics(self):
+        """Missing-header-only SSE compatibility + explicit http_body_verified/tls_close diagnostics over real TLS."""
+        client_ctx, server_ctx = self._build_local_tls_contexts()
+        created_evt, completed_evt = _ok_events()[0], _ok_events()[-1]
+        c_line = f"data: {json.dumps(created_evt)}\n\n".encode("ascii")
+        ok_line = f"data: {json.dumps(completed_evt)}\n\n".encode("ascii")
+        small_no_done = c_line + ok_line
+        self.assertLessEqual(len(small_no_done), 512)
+        small_with_done = small_no_done + b"data: [DONE]\n\n"
+        large_pad = b": " + (b"x" * 600) + b"\n\n"
+        large_no_done = c_line + large_pad + ok_line
+        large_with_done = large_no_done + b"data: [DONE]\n\n"
+        sentinel = "SECRET_CANARY_SENTINEL_999"
+
+        def _missing_cl(body: bytes, trailing: bytes = b"") -> bytes:
+            return b"HTTP/1.1 200 OK\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body + trailing
+
+        def _missing_chunked(body: bytes) -> bytes:
+            return (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                + f"{len(body):x}\r\n".encode("ascii") + body + b"\r\n0\r\n\r\n"
+            )
+
+        # 1. Absent Content-Type succeeds for small (<=512B) and multi-chunk (>512B), with and without [DONE].
+        for name, wire in (
+            ("missing_small_no_done", _missing_cl(small_no_done)),
+            ("missing_small_with_done", _missing_cl(small_with_done)),
+            ("missing_large_no_done", _missing_chunked(large_no_done)),
+            ("missing_large_with_done", _missing_chunked(large_with_done)),
+        ):
+            with self.subTest(name=name), self._local_tls_server(server_ctx, wire, clean_tls=True) as addrs:
+                seen_media = []
+                with (patch("oc_openai.responses._address_list", return_value=addrs),
+                      patch("oc_openai.responses.ssl.create_default_context", return_value=client_ctx)):
+                    with OpenAITransport().responses(
+                        canary_protocol.canonical_upstream_body("gpt-6.2-sol"),
+                        "synthetic-access", Cancellation(time.monotonic() + 3), lambda w: w(),
+                        limits=canary.CANARY_STREAM_LIMITS,
+                        require_done=False, require_tls_close=True, strict_terminal=True,
+                        inspect_media=True, observe_media=seen_media.append, allow_missing_media=True,
+                    ) as events:
+                        out = consume_upstream_stream(events, bound_model="gpt-6.2-sol", check_alive=lambda: None)
+                self.assertTrue(out.allow_delivery)
+                self.assertEqual(seen_media, ["missing"])
+
+        # 2. Explicit text/plain, application/octet-stream, duplicate CT, JSON/HTML, and trailing bytes fail closed.
+        reject_cases = (
+            ("explicit_text_plain",
+             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; tag=" + sentinel.encode("ascii") + b"\r\n"
+             + f"Content-Length: {len(small_no_done)}\r\n\r\n".encode("ascii") + small_no_done,
+             True, "provider_stream_content_type", False, "not_reached"),
+            ("explicit_octet_stream",
+             b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+             + f"Content-Length: {len(small_no_done)}\r\n\r\n".encode("ascii") + small_no_done,
+             True, "provider_stream_content_type", False, "not_reached"),
+            ("duplicate_content_type",
+             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Type: text/event-stream\r\n"
+             + f"Content-Length: {len(small_no_done)}\r\n\r\n".encode("ascii") + small_no_done,
+             True, "provider_stream_content_type", False, "not_reached"),
+            ("missing_ct_json_body",
+             _missing_cl(f'{{"secret":"{sentinel}"}}'.encode("ascii")),
+             True, "provider_stream_content_type", False, "not_reached"),
+            ("missing_ct_html_body",
+             _missing_cl(f"<html>{sentinel}</html>".encode("ascii")),
+             True, "provider_stream_content_type", False, "not_reached"),
+            ("missing_ct_trailing_bytes",
+             _missing_cl(small_no_done, b"SMUGGLED"),
+             True, "provider_stream_after_terminal", True, "trailing_bytes"),
+            ("missing_ct_abrupt_eof",
+             _missing_cl(small_no_done),
+             False, "provider_network_error", True, "abrupt_eof"),
+        )
+        for name, wire, clean_tls, exp_code, exp_http, exp_tls in reject_cases:
+            with self.subTest(name=name), self._local_tls_server(server_ctx, wire, clean_tls=clean_tls) as addrs:
+                with (patch("oc_openai.responses._address_list", return_value=addrs),
+                      patch("oc_openai.responses.ssl.create_default_context", return_value=client_ctx)):
+                    cm = OpenAITransport().responses(
+                        canary_protocol.canonical_upstream_body("gpt-6.2-sol"),
+                        "synthetic-access", Cancellation(time.monotonic() + 3), lambda w: w(),
+                        limits=canary.CANARY_STREAM_LIMITS,
+                        require_done=False, require_tls_close=True, strict_terminal=True,
+                        inspect_media=True, observe_media=lambda _m: None, allow_missing_media=True,
+                    )
+
+                    def _run_case():
+                        with cm as events:
+                            consume_upstream_stream(events, bound_model="gpt-6.2-sol", check_alive=lambda: None)
+
+                    with self.assertRaises(StreamFailure) as ctx:
+                        _run_case()
+                self.assertEqual(ctx.exception.code, exp_code)
+                self.assertEqual(ctx.exception.evidence.http_body_verified, exp_http)
+                self.assertEqual(ctx.exception.evidence.tls_close, exp_tls)
+                self.assertNotIn(sentinel, ctx.exception.describe())
+
+        # 3. Option B keep-alive TLS close timeout produces distinct provider_tls_close_timeout + http_body_verified=1.
+        release = threading.Event()
+        wire_ka = (
+            b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n"
+            + f"Content-Length: {len(small_no_done)}\r\n\r\n".encode("ascii") + small_no_done
+        )
+        with socket.socket() as listener:
+            listener.settimeout(3)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            addrs = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", listener.getsockname())]
+
+            def serve_ka():
+                try:
+                    raw, _ = listener.accept()
+                except OSError:
+                    return
+                with raw:
+                    raw.settimeout(3)
+                    with server_ctx.wrap_socket(raw, server_side=True) as peer:
+                        with peer.makefile("rb") as incoming:
+                            incoming.readline()
+                            size = 0
+                            while (ln := incoming.readline()) not in (b"", b"\r\n"):
+                                if ln.lower().startswith(b"content-length:"):
+                                    size = int(ln.split(b":", 1)[1].strip())
+                            incoming.read(size)
+                        peer.sendall(wire_ka)
+                        release.wait(2.5)
+
+            t = threading.Thread(target=serve_ka, daemon=True)
+            t.start()
+            try:
+                fast_limits = canary.StreamLimits(1024 * 1024, 4 * 1024 * 1024, 512 * 1024, 1024, 1)
+                with (patch("oc_openai.responses._address_list", return_value=addrs),
+                      patch("oc_openai.responses.ssl.create_default_context", return_value=client_ctx)):
+                    cm = OpenAITransport().responses(
+                        canary_protocol.canonical_upstream_body("gpt-6.2-sol"),
+                        "synthetic-access", Cancellation(time.monotonic() + 5), lambda w: w(),
+                        limits=fast_limits,
+                        require_done=False, require_tls_close=True, strict_terminal=True,
+                        inspect_media=True, observe_media=lambda _m: None, allow_missing_media=True,
+                    )
+
+                    def _run_ka():
+                        with cm as events:
+                            consume_upstream_stream(events, bound_model="gpt-6.2-sol", check_alive=lambda: None)
+
+                    with self.assertRaises(StreamFailure) as ctx:
+                        _run_ka()
+                self.assertEqual(ctx.exception.code, "provider_tls_close_timeout")
+                self.assertTrue(ctx.exception.evidence.http_body_verified)
+                self.assertEqual(ctx.exception.evidence.tls_close, "timeout")
+                self.assertTrue(ctx.exception.evidence.completed_seen)
+                self.assertIn("http_body_verified=1 tls_close=timeout", ctx.exception.describe())
+            finally:
+                release.set()
+                with suppress(OSError):
+                    listener.close()
+                t.join(3)
 
 
 if __name__ == "__main__":

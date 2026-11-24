@@ -34,7 +34,7 @@ _SSE_END = re.compile(rb"\r\n|[\r\n]")
 _STREAM_CODES = frozenset({
     "provider_stream_content_type", "provider_stream_incomplete", "provider_stream_limit",
     "provider_stream_json", "provider_stream_event_type", "provider_stream_named_done",
-    "provider_stream_after_terminal", "provider_network_error",
+    "provider_stream_after_terminal", "provider_network_error", "provider_tls_close_timeout",
 })
 _EVENT_COMPLETED = "response.completed"
 _EVENT_NAMES = frozenset({
@@ -75,6 +75,8 @@ class _StreamEvidence:
     media_fields: str | None = None
     prefix_shape: str = "not-read"
     prefix_bytes: int = 0
+    http_body_verified: bool = False
+    tls_close: str = "not_checked"
 
 
 class StreamFailure(ConnectionError):
@@ -90,11 +92,15 @@ class StreamFailure(ConnectionError):
             f" media_fields={facts.media_fields} prefix={facts.prefix_shape} prefix_bytes={facts.prefix_bytes}"
             if facts.media_fields is not None else ""
         )
+        transport = (
+            f" http_body_verified={int(facts.http_body_verified)} tls_close={facts.tls_close}"
+            if facts.tls_close != "not_checked" else ""
+        )
         return (
             f"Stream structure ({self.code}) media={facts.media} raw_bytes={facts.raw_bytes} "
             f"lines={facts.lines} events={facts.events} last_line={facts.line} "
             f"sse={facts.sse} json_type={facts.json_type} "
-            f"completed_seen={int(facts.completed_seen)} done_seen={int(facts.done_seen)}{inspected}"
+            f"completed_seen={int(facts.completed_seen)} done_seen={int(facts.done_seen)}{inspected}{transport}"
         )
 
 
@@ -450,27 +456,45 @@ def _inspect_prefix(response, cancellation, evidence):
     return None
 
 
-def _resolve_stream_prefix(response, cancellation, evidence, *, inspect_media, observe_media):
-    prefix = b""
-    if inspect_media or observe_media is not None:
+def _fallback_media_allowed(evidence, *, allow_missing_media, observe_media):
+    if evidence.prefix_shape != "sse-like":
+        return False
+    if allow_missing_media:
+        return evidence.media_fields == "none" and evidence.media == "missing"
+    return observe_media is not None and evidence.media in {"missing", "plain", "octet-stream"}
+
+
+def _fallback_prefix(response, cancellation, evidence, *, inspect_media, observe_media, allow_missing_media):
+    if not (inspect_media or allow_missing_media):
+        evidence.media = _MEDIA_TYPES.get(response.headers.get_content_type(), "other")
+        return b""
+    inspected = _inspect_prefix(response, cancellation, evidence)
+    if _fallback_media_allowed(evidence, allow_missing_media=allow_missing_media, observe_media=observe_media):
+        return inspected
+    return b""
+
+
+def _resolve_stream_prefix(response, cancellation, evidence, *, inspect_media, observe_media,
+                           allow_missing_media=False):
+    strict_shape = inspect_media or observe_media is not None or allow_missing_media
+    if strict_shape:
         evidence.media_fields, evidence.media = _media_shape(response.headers)
-    content_type = response.headers.get_content_type()
     expected_media = (
-        evidence.media == "sse" if observe_media is not None else content_type == "text/event-stream"
+        evidence.media == "sse" if (observe_media is not None or allow_missing_media)
+        else response.headers.get_content_type() == "text/event-stream"
     )
-    if not expected_media:
-        if inspect_media:
-            inspected = _inspect_prefix(response, cancellation, evidence)
-            if (observe_media is not None and evidence.media in {"missing", "plain", "octet-stream"}
-                    and evidence.prefix_shape == "sse-like"):
-                prefix = inspected
-        else:
-            evidence.media = _MEDIA_TYPES.get(content_type, "other")
-        if not prefix:
-            raise ConnectionError("provider_stream_content_type")
+    if expected_media:
+        if not strict_shape:
+            evidence.media = "sse"
+        return b""
+    prefix = _fallback_prefix(
+        response, cancellation, evidence,
+        inspect_media=inspect_media, observe_media=observe_media, allow_missing_media=allow_missing_media,
+    )
+    if not prefix:
+        raise ConnectionError("provider_stream_content_type")
+    if observe_media is not None:
         observe_media(evidence.media)
-    if not inspect_media and observe_media is None:
-        evidence.media = "sse"
     return prefix
 
 
@@ -597,18 +621,28 @@ class _SseParser:
         return None
 
 
-def _verify_tls_close(response, limits):
+def _verify_tls_close(response, limits, evidence):
     sock = getattr(response, "_oc_sock", None)
     reader = getattr(response, "_oc_fp", None) or getattr(response, "fp", None)
     if not isinstance(sock, ssl.SSLSocket) or reader is None:
+        evidence.tls_close = "error"
         raise ConnectionError("provider_network_error")
     sock.settimeout(min(5.0, limits.io_timeout))
     try:
         trailing = reader.read(1)
+    except TimeoutError:
+        evidence.tls_close = "timeout"
+        raise ConnectionError("provider_tls_close_timeout") from None
+    except ssl.SSLEOFError:
+        evidence.tls_close = "abrupt_eof"
+        raise ConnectionError("provider_network_error") from None
     except OSError:
+        evidence.tls_close = "error"
         raise ConnectionError("provider_network_error") from None
     if trailing:
+        evidence.tls_close = "trailing_bytes"
         raise ConnectionError("provider_stream_after_terminal")
+    evidence.tls_close = "clean"
 
 
 def _finalize_stream(response, parser, evidence, active, *, require_done, require_tls_close, strict_terminal):
@@ -619,16 +653,19 @@ def _finalize_stream(response, parser, evidence, active, *, require_done, requir
     if require_done and not evidence.done_seen:
         raise ConnectionError("provider_stream_incomplete")
     if require_tls_close:
-        _verify_tls_close(response, active)
+        _verify_tls_close(response, active, evidence)
 
 
 def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None, limits=None,
-            require_done=False, require_tls_close=False, strict_terminal=False):
+            require_done=False, require_tls_close=False, strict_terminal=False, allow_missing_media=False):
     active = _active_limits(limits)
-    if require_tls_close and not response.chunked and response.length is None:
-        raise ConnectionError("provider_stream_incomplete")
+    if require_tls_close:
+        evidence.tls_close = "not_reached"
+        if not response.chunked and response.length is None:
+            raise ConnectionError("provider_stream_incomplete")
     prefix = _resolve_stream_prefix(
         response, cancellation, evidence, inspect_media=inspect_media, observe_media=observe_media,
+        allow_missing_media=allow_missing_media,
     )
     parser = _SseParser(evidence, active, prefix, cancellation, strict_terminal=strict_terminal)
     first = True
@@ -641,6 +678,7 @@ def _events(response, cancellation, evidence, *, inspect_media=False, observe_me
         frame = parser.feed(line)
         if frame is not None:
             yield frame
+    evidence.http_body_verified = True
     _finalize_stream(
         response, parser, evidence, active,
         require_done=require_done, require_tls_close=require_tls_close, strict_terminal=strict_terminal,
@@ -733,7 +771,8 @@ class OpenAITransport:
 
     @contextlib.contextmanager
     def responses(self, body, bearer, cancellation, dispatch, *, inspect_media=False, observe_media=None,
-                  limits=None, require_done=False, require_tls_close=False, strict_terminal=False):
+                  limits=None, require_done=False, require_tls_close=False, strict_terminal=False,
+                  allow_missing_media=False):
         active = _active_limits(limits)
         encoded = encode_responses_body(body, max_json=active.max_json)
         evidence = None
@@ -755,7 +794,7 @@ class OpenAITransport:
                     response, cancellation, evidence, inspect_media=inspect_media,
                     observe_media=observe_media, limits=active,
                     require_done=require_done, require_tls_close=require_tls_close,
-                    strict_terminal=strict_terminal,
+                    strict_terminal=strict_terminal, allow_missing_media=allow_missing_media,
                 )
         except ConnectionError as error:
             if evidence is not None and error.code in _STREAM_CODES:

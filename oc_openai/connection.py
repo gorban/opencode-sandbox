@@ -1008,6 +1008,7 @@ class Connection:
                 "require_done": False,
                 "require_tls_close": True,
                 "strict_terminal": True,
+                "allow_missing_media": True,
             }
             if inspect_media:
                 options["inspect_media"] = True

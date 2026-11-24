@@ -80,15 +80,22 @@ def _extract_reviewed_source(argv: list[str]) -> str | None:
     if not argv or argv[0] != "canary":
         return None
     found = None
+    recover = False
+    synth = False
     idx = 1
     while idx < len(argv):
-        if argv[idx] == "--reviewed-source":
+        arg = argv[idx]
+        if arg == "--reviewed-source":
             if found is not None or idx + 1 >= len(argv) or not _SHA256_RE.fullmatch(argv[idx + 1]):
                 raise ValueError("invalid --reviewed-source")
             found = argv[idx + 1]
             idx += 2
-        else:
-            idx += 1
+            continue
+        recover = recover or (arg == "--recover-unsettled")
+        synth = synth or (arg == "--synthetic-check")
+        idx += 1
+    if recover and (found is None or synth):
+        raise ValueError("invalid --recover-unsettled arguments")
     return found
 
 

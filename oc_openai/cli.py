@@ -21,7 +21,10 @@ ORCHESTRATOR_INPUT = (
 )
 _LABEL_COMMANDS = ("connect", "select")
 _LOCAL_COMMANDS = ("status", "verify", "disconnect")
-USAGE = "Usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect|canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check]}"
+USAGE = (
+    "Usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect|"
+    "canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check | --recover-unsettled]}"
+)
 BrowserHandoff = Callable[[str, Callable[[], bool]], None]
 # The Linux device identity also matches the PTY master, so exclude that side explicitly.
 _TIOCGDEV = 0x80045432
