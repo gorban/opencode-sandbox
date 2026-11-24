@@ -58,28 +58,36 @@ routing, exposure or revocation goes through both reviews before use by another 
 
 Keep temporary canary and smoke harnesses out of the public `oc-sandbox` CLI. Automate each
 provider's live `"Reply with exactly: ok"` check as an opt-in pytest under `tests/e2e/live/`
-(skipped by default in CI unless its explicit opt-in flag is supplied), running in an isolated
-verified interpreter that leaves historical exposure receipts untouched, enforces source-trust and
-graceful `SIGINT` teardown, and asserts exact `ok` delivery plus verified container/scratch cleanup.
+(skipped by default in CI unless its explicit opt-in flag is passed directly in pytest's CLI
+invocation arguments — never via `PYTEST_ADDOPTS` or ambient environment variables). Every live e2e
+harness runs in an isolated verified interpreter and disposable sandbox pod/workspace, leaves
+historical exposure receipts in `~/.config/oc-sandbox/` byte-for-byte untouched without bypassing
+corrupt-receipt/untrusted-store fail-closed checks or broker credential isolation, enforces
+source-trust and graceful `SIGINT` teardown, and asserts exact `ok` delivery, `0` unintended tool
+calls, and verified container/scratch cleanup.
 
 - [ ] **OpenAI zero-tool canary e2e** (`tests/e2e/live/test_openai_canary_e2e.py`,
   `--run-openai-canary-live`) — opt-in zero-tool OpenCode 2.3.0 turn against the active OpenAI
-  subscription (`Reply with exactly: ok`). Candidate verified live on PR #71 (`be81a605`); pending
-  serialized merge after PR #69 and final human review.
+  subscription (`Reply with exactly: ok`). Candidate verified live on PR #71; pending Gate 2
+  re-review, serialized merge after PR #69, and final human review.
 - [ ] **OpenAI interactive shell e2e** (`tests/e2e/live/test_openai_shell_e2e.py`,
   `--run-openai-shell-live`) — opt-in automated test driving the normal `oc-sandbox` interactive
-  OpenAI OpenCode launch path, sending `Reply with exactly: ok`, and verifying exact `ok` delivery,
-  zero broker errors, and clean teardown.
+  OpenAI OpenCode launch path in a disposable sandbox pod/workspace, sending
+  `Reply with exactly: ok`, and verifying exact `ok` delivery, `0` unintended tool calls, zero
+  broker errors, intact fail-closed receipt/store checks, and clean teardown.
 - [ ] **Claude live e2e** (`tests/e2e/live/test_claude_shell_e2e.py`, `--run-claude-shell-live`) —
   opt-in automated test replacing ad-hoc `/var/tmp/...` probe commands once the exact host-isolated
   Claude launch topology clears qualification and security review (remains open while PR #72's
-  project launcher is synthetic).
+  project launcher is synthetic), verifying exact `ok` delivery, `0` unintended tool calls, intact
+  fail-closed checks, and clean teardown.
 - [ ] **Combined multi-provider default + `--mini` e2e** — once both OpenAI and Claude qualify on
   `main` under [I4d](prd_i4d.md#default-multi-provider-launch-and---mini-ui-mode), opt-in e2e
   verification that a default `oc-sandbox` launch (no `--provider` flag, and optional `--mini`)
-  exposes models from all enabled qualified providers together and completes
-  `Reply with exactly: ok` on each explicitly selected provider with strict per-instance credential
-  and billing isolation.
+  exposes models from all enabled qualified providers together, completes
+  `Reply with exactly: ok` with `0` unintended tool calls on each explicitly selected provider, and
+  asserts negative isolation: selecting provider A produces `0` upstream requests on provider B's
+  broker/instance (and vice versa), zero cross-instance credential/token/vault visibility, and
+  verified teardown of all relays, containers, and scratch directories.
 
 - [ ] For each candidate, publish the exact branch/commit, provider and placement, the scope
   proven, and an attended test step when ready. Keep model use opt-in and human review open

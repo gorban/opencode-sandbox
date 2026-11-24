@@ -44,8 +44,10 @@ policy or `provider_defaults.<kind>`. A dedicated operator setup action can pers
 changes after approval.
 CLI or environment settings may override `cli_path` for an existing instance. A default
 `oc-sandbox` launch catalogs all enabled, qualified provider instances for the selected placement;
-an optional `--provider` restricts one launch to a single already enabled instance. `--mini`
-selects OpenCode Mini as an opt-in UI mode (defaulting to full OpenCode when omitted). Provider
+an optional `--provider` restricts one launch to a single already enabled instance. `--mini` is a
+trusted operator CLI/config UI-mode switch only (never settable from workspace files, sandbox
+environment, or agent requests; composable with optional `--provider`) that selects OpenCode Mini
+(defaulting to full OpenCode when omitted). Provider
 declarations, instance profiles and agent requests cannot use precedence to elevate authority.
 Use only trusted startup inputs for a persistent supervisor.
 
@@ -136,23 +138,56 @@ host brokers and relays. The operator can select and switch between models from 
 providers (for example, both OpenAI and Claude once each adapter and placement is qualified) in the
 same OpenCode session without passing `--provider`.
 
-- **Strict per-instance isolation:** Cataloging multiple enabled instances never pools accounts,
-  merges quotas, shares tokens across relays, or enables automatic fallback between providers or
-  paid API keys. Every dispatch, retry, and continuation stays bound to the explicitly chosen
-  provider instance, auth mode, credential generation, billing policy, selection epoch, and
-  exposure checks.
-- **Placement qualification gate:** Unqualified or disabled instances stay excluded from the
-  generated OpenCode catalog (and report a typed readiness reason on explicit selection). A live
-  combined OpenAI + Claude launch remains gated until the exact Claude host-isolated launch
-  topology clears qualification and review.
-- **Optional narrowing:** `--provider KIND[/INSTANCE]` remains an optional explicit restriction for
-  a single launch when the operator wants to limit a session to one enabled instance. It takes
-  precedence over a profile's provider list for that launch and leaves persisted configuration and
-  selections unchanged.
-- **Opt-in OpenCode Mini (`--mini`):** `oc-sandbox` accepts `--mini` to launch OpenCode Mini
-  instead of full OpenCode, defaulting to full OpenCode when omitted. Both full and `--mini`
-  launches enforce the identical host broker, read-only config, SELinux/container isolation,
-  exposure hold, and worker credential isolation invariants.
+- **Attended multi-instance disclosure and paid-route protection:** Before starting any relay on a
+  default launch, the attended foreground confirmation must enumerate every admitted instance (its
+  label, kind, authentication mode, billing policy, and any active exposure hold). Initial active
+  model selection is governed strictly by explicit persisted selection or explicit operator default
+  (never by catalog ordering or silent fallthrough from a disconnected subscription onto a paid
+  `api_key` instance), and paid `api_key` routes still require visible billing disclosure and
+  opt-in per [I4](prd_i4.md).
+- **Concrete per-instance isolation boundary:** Cataloging multiple enabled instances never pools
+  accounts, merges quotas, shares tokens across relays, or enables automatic fallback between
+  providers or paid API keys. Each admitted instance receives its own collision-free scoped
+  OpenCode provider ID, distinct local worker bearer token, distinct broker/relay grant and
+  endpoint/SELinux MCS compartment, distinct reasoning vault, and independent lease and
+  selection-epoch binding — preventing a sandboxed agent or subagent from replaying instance A's
+  token against instance B's broker or splicing continuations or reasoning state across instances.
+  Every dispatch, retry, and continuation stays bound to the explicitly chosen provider instance,
+  auth mode, credential generation, billing policy, selection epoch, and exposure checks.
+- **Fail-closed partial preflight, exposure holds, empty catalogs, and mid-session revocation:**
+  - *Benign exclusion vs. integrity failure:* Benign states (disabled by policy, unqualified for the
+    selected placement, or cleanly disconnected) may be excluded from a default launch with a
+    visible typed operator summary and zero relay started. Trust or integrity failures (corrupt or
+    untrusted credential store, corrupt or tampered exposure receipt, invalid TOML, or tampered
+    executable override) **must fail closed** and abort launch — never silently drop the affected
+    instance.
+  - *Active exposure hold:* A valid active exposure hold on an enabled instance requires explicit
+    per-instance foreground acknowledgment (leaving historical receipt bytes untouched) or excludes
+    that instance with zero relay started — never silently bypassed.
+  - *Zero admitted ready instances:* Fail closed with typed readiness guidance (or offer attended
+    interactive sign-in) — never launch OpenCode with an empty or ambiguous provider catalog and
+    never fall back to ambient API-key environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+    etc.) or `~/.local/share/opencode/auth.json`.
+  - *Mid-session revocation and mutation:* Revoking, disconnecting, rotating credentials, or mutating
+    the exposure hold of one instance in an active multi-provider session immediately retires that
+    instance's lease, broker, and relay (returning `401` with zero further upstream writes) while
+    other admitted instances remain isolated; `select` is refused while any instance lease is active.
+- **Placement qualification gate:** A live combined OpenAI + Claude launch remains gated until the
+  exact Claude host-isolated launch topology clears qualification and review.
+- **Optional narrowing (`--provider KIND[/INSTANCE]`):** Passing `--provider KIND[/INSTANCE]`
+  restricts one launch to a single already enabled instance, takes precedence over the default
+  multi-provider catalog for that launch, and leaves persisted configuration and selections
+  unchanged. Passing `--provider` for a disabled, unqualified, disconnected, or unacknowledged-held
+  instance **fails closed** with a typed reason (zero launch, zero fallback to other enabled
+  instances). A bare `--provider KIND` (without `/INSTANCE`) resolves only via persisted selection
+  or explicit default — never falling through from a disconnected selection to the TOML default.
+- **Opt-in OpenCode Mini (`--mini`):** `oc-sandbox` accepts `--mini` (composable with optional
+  `--provider`) to launch OpenCode Mini instead of full OpenCode, defaulting to full OpenCode when
+  omitted. OpenCode Mini requires pinned version/digest provenance with zero runtime auto-update or
+  download and the exact same hardening environment (`OPENCODE_DISABLE_AUTOUPDATE=true`,
+  `OPENCODE_CONFIG_PROJECT_DISABLE=true`, `OPENCODE_DISABLE_MODELS_FETCH=true`,
+  `OPENCODE_DISABLE_FREE_MODELS=true`), host broker, read-only config, SELinux/container isolation,
+  exposure hold, and worker credential isolation invariants as full OpenCode.
 
 ## Connection and first-use flow
 
@@ -165,11 +200,14 @@ adapter qualifies. Claude can guide the operator through native sign-in and veri
 its separate worker subscription route remains unqualified.
 
 On a default launch, the trusted launcher preflights every enabled, qualified provider instance for
-the selected placement without an LLM, excluding disabled or unqualified routes rather than failing
-silently into paid fallback. When `--provider KIND[/INSTANCE]` is passed explicitly, refuse
-incompatible models or placements with a typed reason. Use one typed workstation operation for CLI
-and orchestrator connection. In an interactive session it can show the reason, offer the attended
-action and repeat preflight after sign-in.
+the selected placement without an LLM: benign unavailable states (disabled, unqualified, cleanly
+disconnected, or an unacknowledged valid exposure hold when the operator declines that instance)
+are excluded with a typed summary and zero relay started, whereas any trust/integrity failure or
+zero admitted ready instances aborts launch fail-closed with zero ambient or paid fallback. When
+`--provider KIND[/INSTANCE]` is passed explicitly, any disabled, unqualified, disconnected,
+unacknowledged-held, or incompatible model/placement fails closed with a typed reason and zero
+fallback. Use one typed workstation operation for CLI and orchestrator connection. In an interactive
+session it can show the reason, offer the attended action and repeat preflight after sign-in.
 For a running orchestrator selecting a worker model, the restricted interface returns a typed
 readiness result and may request that the workstation offer the connection action. It carries
 provider and local label, without native commands, executable paths or credentials. The
@@ -221,11 +259,16 @@ registration binding and exposure holds.
 - [ ] Reuse the CLI workstation action in the orchestrator. Keep browser/terminal interaction and
   provider state out of model transcripts, worker config and the orchestrator's generic tools.
 - [ ] Verify default multi-provider launch catalogs all enabled, qualified provider instances for
-  the selected placement (with no `--provider` flag), excludes disabled or unqualified instances,
-  preserves per-instance billing/credential/revocation isolation with zero cross-provider fallback,
-  and still honors optional `--provider KIND[/INSTANCE]` narrowing for a single launch.
-- [ ] Verify `--mini` launches OpenCode Mini while default (no `--mini`) launches full OpenCode,
-  with identical read-only config, broker isolation, exposure hold, and credential-separation
+  the selected placement (with no `--provider` flag), enumerates every admitted instance and
+  billing/hold state in foreground confirmation, enforces distinct per-instance provider IDs,
+  worker tokens, grants, MCS compartments, reasoning vaults, and leases with zero cross-provider or
+  ambient fallback, excludes benign unavailable instances while failing closed on integrity
+  failures or zero admitted instances, isolates mid-session single-instance revocation, and honors
+  fail-closed `--provider KIND[/INSTANCE]` narrowing for a single launch.
+- [ ] (decision needed) Confirm OpenCode Mini packaging and pinned provenance mechanism (pinned
+  flag/subcommand on pinned OpenCode, separate pinned binary, or pinned image), then verify
+  `--mini` launches OpenCode Mini while default (no `--mini`) launches full OpenCode with identical
+  hardening env flags, read-only config, broker isolation, exposure hold, and credential-separation
   invariants in both modes.
 - [ ] Link and qualify the per-provider and combined opt-in live e2e pytest milestones in
   [I4f](prd_i4f.md#opt-in-live-e2e-pytest-milestones).
