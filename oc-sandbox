@@ -47,7 +47,7 @@ usage() {
   cat <<EOF
 Usage: ${0##*/} [--provider openai] [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
-       ${0##*/} openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}
+       ${0##*/} openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect|canary [--model SLUG] [--synthetic-check]}
 
   (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
               OpenCode. Safe to run repeatedly; only missing/changed pieces are touched.
@@ -174,7 +174,22 @@ verify_openai_helper() {
 
 if [[ ${1:-} == openai ]]; then
   case $#:${2:-} in
-    2:status|2:verify|2:disconnect) ;;
+    2:status|2:verify|2:disconnect|2:canary) ;;
+    3:canary)
+      [[ $3 == --synthetic-check ]] ||
+        die "usage: oc-sandbox openai canary [--model SLUG] [--synthetic-check]"
+      ;;
+    4:canary)
+      LC_ALL=C
+      [[ $3 == --model && $4 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
+        die "usage: oc-sandbox openai canary [--model SLUG] [--synthetic-check]"
+      ;;
+    5:canary)
+      LC_ALL=C
+      { [[ $3 == --model && $4 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && $5 == --synthetic-check ]] ||
+        [[ $3 == --synthetic-check && $4 == --model && $5 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; } ||
+        die "usage: oc-sandbox openai canary [--model SLUG] [--synthetic-check]"
+      ;;
     3:connect|3:select|4:connect)
       [[ $# != 4 || $4 == --no-browser ]] ||
         die "usage: oc-sandbox openai connect LABEL [--no-browser]"
@@ -182,7 +197,7 @@ if [[ ${1:-} == openai ]]; then
       [[ $3 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] ||
         die "OpenAI labels must be 1 to 32 ASCII letters, numbers, underscores or hyphens, starting with a letter or number"
       ;;
-    *) die "usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}" ;;
+    *) die "usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect|canary [--model SLUG] [--synthetic-check]}" ;;
   esac
   helper=$SCRIPT_DIR/oc-openai.py
   verify_openai_helper "$helper"
@@ -311,9 +326,8 @@ while (( $# )); do
 done
 if [[ -n $PROVIDER ]]; then
   case $PROVIDER in
-    openai) ;;
-    claude|google) die "--provider $PROVIDER is not yet qualified for sandbox launch" ;;
-    *) die "unsupported provider '$PROVIDER' (supported: openai)" ;;
+    openai|claude|google) die "--provider $PROVIDER is not yet qualified for sandbox launch" ;;
+    *) die "unsupported provider '$PROVIDER'" ;;
   esac
 fi
 set -- ${GETOPTS_ARGS[@]+"${GETOPTS_ARGS[@]}"}
@@ -1980,37 +1994,6 @@ if (( NOLAUNCH )); then
 fi
 
 # ---- launch OpenCode ------------------------------------------------------------------
-if [[ $PROVIDER == openai ]]; then
-  if [[ $(cstate "$AGENT") == running || $(cstate "$RELAY") == running ]]; then
-    release_lifecycle_lock
-    die "OpenCode or provider relay is already running in instance '$ILABEL'; exit it first"
-  fi
-  ensure_volume "$OPENAI_HOMEVOL" "$ILABEL"
-  agent_pg=0
-  if agent_pg_passfile; then agent_pg=1; fi
-  dind_container_arg=""
-  dind_run_arg=""
-  if [[ $(cstate "$DINDC") != none ]]; then dind_container_arg=$DINDC dind_run_arg=$DINDRUN; fi
-  pg_secret_arg=""
-  pg_container_arg=""
-  if (( agent_pg )); then pg_secret_arg=$PGPASSSECRET pg_container_arg=$PGC; fi
-  relay_image_id=$(pm image inspect --format '{{.Id}}' "$RELAY_IMG") || die "missing relay image '$RELAY_IMG'"
-  agent_image_id=$(pm image inspect --format '{{.Id}}' "$AGENT_IMG") || die "missing agent image '$AGENT_IMG'"
-  session_helper=$SCRIPT_DIR/oc-openai-session.py
-  verify_openai_helper "$session_helper"
-  session_spec=$(/usr/bin/python3 -I -c '
-import json, sys
-keys = ("instance", "pod", "agent", "relay", "relay_image", "agent_image", "agent_mem",
-        "level", "sandbox", "cwd", "home_vol", "chromium", "postgres", "pg_secret", "dind", "dind_run")
-print(json.dumps(dict(zip(keys, sys.argv[1:]))))
-' "$ILABEL" "$POD" "$AGENT" "$RELAY" "$relay_image_id" "$agent_image_id" "$AGENT_MEM" \
-  "$LEVEL" "$SB" "$CWD" "$OPENAI_HOMEVOL" "$CHROME" "$pg_container_arg" "$pg_secret_arg" "$dind_container_arg" "$dind_run_arg")
-  release_lifecycle_lock
-  cd -- "$SCRIPT_DIR"
-  log "Launching ChatGPT-backed OpenCode (instance '$ILABEL') in /sandbox/$CWD"
-  exec /usr/bin/env -i HOME="$HOME" TERM="${TERM:-xterm-256color}" PATH=/usr/bin:/bin \
-    /usr/bin/python3 -IB "$session_helper" 3<<<"$session_spec"
-fi
 if [[ $(cstate "$RELAY") == running ]]; then
   release_lifecycle_lock
   die "Provider relay is running in instance '$ILABEL'; exit the active provider session first"

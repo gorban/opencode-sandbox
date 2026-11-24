@@ -295,13 +295,19 @@ class Profiles:
 
     def with_selected(self, label: str, epoch: str, callback):
         """Run callback under the registry mutex only while (label, epoch) is active and non-retiring."""
+        with self.selected_fence(label, epoch) as profile:
+            return callback(profile)
+
+    @contextmanager
+    def selected_fence(self, label: str, epoch: str):
+        """Hold the registry mutex while (label, epoch) remains active and non-retiring."""
         with self._state() as (_directory, state):
             if not state or state.get("active") != label or state.get("epoch") != epoch:
                 raise ProfileError("profile_stale")
             entry = state["registrations"].get(label)
             if entry is None or entry["client_id"] is None or entry["retiring"]:
                 raise ProfileError("profile_retiring")
-            return callback(self._profile(state, label))
+            yield self._profile(state, label)
 
     def begin_disconnect(self, before_retirement, *, inactive_filter=None) -> Profile | None:
         with self._state() as (directory, state):

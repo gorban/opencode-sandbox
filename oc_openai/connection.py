@@ -987,6 +987,75 @@ class Connection:
                     continue
                 raise
 
+    @contextlib.contextmanager
+    def _canary_attempt(self, binding, body, access, limits, deadline, cancelled,
+                        authorization, before_write, inspect_media, observe_media):
+        op_timeout = (
+            max(REQUEST_SECONDS, limits.io_timeout)
+            if deadline is None
+            else max(REQUEST_SECONDS, deadline - time.monotonic())
+        )
+        with self._operation(binding.generation, self._current(binding),
+                             timeout=op_timeout, deadline=deadline, cancelled=cancelled) as cancellation:
+            if body["model"] not in self._models(binding, access, cancellation):
+                raise ConnectionError("openai_model_unavailable")
+            dispatch = self._dispatch(
+                lambda record: self._require_dispatchable(record, binding, access),
+                cancellation, authorization=authorization, before_write=before_write,
+            )
+            options = {"inspect_media": True, "limits": limits} if inspect_media else {"limits": limits}
+            if observe_media is not None:
+                options["observe_media"] = observe_media
+            with self._transport.responses(body, access, cancellation, dispatch, **options) as events:
+                def guarded():
+                    for event in events:
+                        cancellation.check()
+                        self.require_active(binding)
+                        yield event
+                yield guarded()
+
+    @contextlib.contextmanager
+    def canary_responses(self, binding, body, *, authorization, before_write,
+                         limits=INTERACTIVE_STREAM_LIMITS, deadline=None, cancelled=None,
+                         inspect_media=True, observe_media=None):
+        """Stream one fenced single-turn canary with zero retries once reserved."""
+        if (not isinstance(body, dict) or body.get("store") is not False
+                or body.get("stream") is not True or not isinstance(body.get("input"), list)
+                or not _value(body.get("model"), max_length=128)
+                or set(body) != {"model", "input", "store", "stream"}
+                or not isinstance(limits, StreamLimits)):
+            raise ConnectionError("invalid_responses_body")
+        if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+            raise ConnectionError("invalid_openai_deadline")
+        reserved = False
+
+        def tracked_before_write():
+            nonlocal reserved
+            reserved = True
+            before_write()
+
+        for attempt in range(2):
+            access = self._refresh(binding, deadline=deadline, cancelled=cancelled)
+            try:
+                with self._canary_attempt(
+                    binding, body, access, limits, deadline, cancelled,
+                    authorization, tracked_before_write, inspect_media, observe_media,
+                ) as guarded:
+                    yield guarded
+                    return
+            except ConnectionError as error:
+                if error.code == "openai_access_token_changed" and not reserved and attempt == 0:
+                    continue
+                raise
+
+    def fenced_write(self, binding, authorization, action):
+        """Run a bounded client write while holding authorization() -> store.lock."""
+        with authorization(), self._store.locked() as directory:
+            record = self._store.read(directory)
+            if not _active(record, binding):
+                raise ConnectionError("connection_retired")
+            return action()
+
     def disconnect(self):
         return self.finish_disconnect(self.begin_disconnect(
             physical_host=self.physical_host_for_retirement()))
