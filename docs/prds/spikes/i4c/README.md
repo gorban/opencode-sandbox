@@ -58,6 +58,10 @@ revocation, with closure afterwards. A separate case verifies the token
 tunnel retires before userinfo can be admitted. Idle endpoints close at the
 attempt deadline even when the client sends nothing else. Native sign-in logs
 stay in the namespace's temporary filesystem.
+The pinned native client uses the same offline tunnel broker with fake DNS
+and Unix-only recording peers. The workstation checks that its connected
+peer belongs to the exact transient service cgroup. A separate process test
+retires the owner during resolution and confirms the late result cannot dial.
 
 The proof creates no workstation Secret Service item or real provider session.
 When host retirement is uncertain, its output identifies the retained

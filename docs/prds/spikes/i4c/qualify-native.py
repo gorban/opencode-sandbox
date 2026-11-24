@@ -255,8 +255,9 @@ def prove_native_tls(root, programs, config):
 def prove_native_enrollment(root, programs, config):
     fixture = runpy.run_path(str(Path(__file__).with_name("enrollment-fixture.py")))
 
-    def launch(profile, egress, *, attempt=None, expired=False):
-        unit = f"oc-agy-fake-enroll-{secrets.token_hex(8)}.service"
+    def launch(profile, egress, *, attempt=None, expired=False, unit=None):
+        if unit is None:
+            unit = f"oc-agy-fake-enroll-{secrets.token_hex(8)}.service"
         command_line = command(unit, programs, config, profile, None, None, False, egress=egress, enroll=True,
                                expired=expired)
         if attempt is not None:

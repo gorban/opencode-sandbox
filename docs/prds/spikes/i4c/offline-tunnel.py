@@ -3,8 +3,11 @@
 from contextlib import suppress
 from dataclasses import dataclass
 import errno
+import os
 from pathlib import Path
 import runpy
+import select
+import selectors
 import socket
 import struct
 from threading import Lock, Timer
@@ -28,6 +31,7 @@ class PendingTunnel:
     generation: str
     host: str
     client: socket.socket
+    pidfd: int
     hello_remaining: bytes = b""
     dial_started: bool = False
     remote: socket.socket | None = None
@@ -45,10 +49,13 @@ def retire_socket(peer):
 class OfflineAttempt:
     """Fence all observable fake-peer writes and one Unix dial per slot."""
 
-    def __init__(self, generation, *, deadline, expected_pid, expected_uid):
+    def __init__(self, generation, *, deadline, expected_uid, expected_pid=None, verify_owner=None):
+        if (expected_pid is None) == (verify_owner is None):
+            raise ValueError("expected exactly one source of owner evidence")
         self.generation = generation
         self.deadline = deadline
         self.expected_peer = (expected_pid, expected_uid)
+        self.verify_owner = verify_owner
         self._lock = Lock()
         self._phase = 0
         self._active = None
@@ -65,21 +72,34 @@ class OfflineAttempt:
     def _require(self, tunnel):
         if not self._available() or tunnel is not self._active or tunnel.generation != self.generation:
             raise AttemptClosed("the enrollment attempt is closed")
+        if select.select((tunnel.pidfd,), (), (), 0)[0]:
+            self._revoke()
+            raise AttemptClosed("the enrollment owner retired")
 
     def admit(self, client, *, host):
         if client.family != socket.AF_UNIX:
             raise AttemptClosed("expected a private Unix peer")
         peer = client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
         pid, uid, _gid = struct.unpack("3i", peer)
+        expected_pid, expected_uid = self.expected_peer
+        verified = pid > 0 and uid == expected_uid
+        if verified:
+            verified = pid == expected_pid if self.verify_owner is None else self.verify_owner(pid)
         with self._lock:
             if (not self._available() or self._active is not None or self._phase >= len(PHASES)
-                    or host != PHASES[self._phase] or (pid, uid) != self.expected_peer):
+                    or host != PHASES[self._phase] or not verified):
                 raise AttemptClosed("the peer or enrollment slot is unavailable")
-            self._active = PendingTunnel(self.generation, host, client)
+            pidfd = os.pidfd_open(pid)
+            if select.select((pidfd,), (), (), 0)[0]:
+                os.close(pidfd)
+                raise AttemptClosed("the enrollment owner retired")
+            self._active = PendingTunnel(self.generation, host, client, pidfd)
             return self._active
 
-    def hello(self, tunnel):
+    def hello(self, tunnel, *, authorize=None):
         POLICY["read_connect"](tunnel.client, hostname=tunnel.host, timeout=min(TLS["remaining"](self.deadline), 2))
+        if authorize is not None and not authorize():
+            raise AttemptClosed("enrollment phase was refused")
         with self._lock:
             self._require(tunnel)
             # Short control response on a nonblocking socket, before entering TLS.
@@ -139,12 +159,53 @@ class OfflineAttempt:
             tunnel.transferred += sent
             return sent
 
+    def end_write(self, tunnel, *, to_peer):
+        with self._lock:
+            self._require(tunnel)
+            receiver = tunnel.remote if to_peer else tunnel.client
+            receiver.shutdown(socket.SHUT_WR)
+
+    def pump(self, tunnel, hello):
+        remaining = memoryview(hello)
+        while remaining:
+            sent = self.write(tunnel, remaining[:CHUNK_SIZE])
+            if not sent:
+                raise AttemptClosed("the synthetic peer stopped receiving")
+            remaining = remaining[sent:]
+        with selectors.DefaultSelector() as ready:
+            ready.register(tunnel.client, selectors.EVENT_READ, True)
+            ready.register(tunnel.remote, selectors.EVENT_READ, False)
+            while ready.get_map():
+                with self._lock:
+                    self._require(tunnel)
+                for event, _ in ready.select(min(TLS["remaining"](self.deadline), .25)):
+                    incoming, to_peer = event.fileobj, event.data
+                    data = incoming.recv(CHUNK_SIZE)
+                    if not data:
+                        ready.unregister(incoming)
+                        self.end_write(tunnel, to_peer=to_peer)
+                        continue
+                    self._write_chunk(tunnel, data, to_peer=to_peer)
+
+    def _write_chunk(self, tunnel, data, *, to_peer):
+        remaining = memoryview(data)
+        while remaining:
+            sent = self.write(tunnel, remaining, to_peer=to_peer)
+            if not sent:
+                raise AttemptClosed("the synthetic peer stopped receiving")
+            remaining = remaining[sent:]
+
     def _retire(self):
         if self._active is not None:
-            retire_socket(self._active.client)
-            if self._active.remote is not None:
-                retire_socket(self._active.remote)
-            self._active = None
+            tunnel, self._active = self._active, None
+            try:
+                retire_socket(tunnel.client)
+            finally:
+                try:
+                    if tunnel.remote is not None:
+                        retire_socket(tunnel.remote)
+                finally:
+                    os.close(tunnel.pidfd)
 
     def finish(self, tunnel):
         with self._lock:

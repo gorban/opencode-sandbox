@@ -3,6 +3,7 @@
 from pathlib import Path
 import json
 import runpy
+import secrets
 import socket
 import ssl
 from threading import Event, Thread
@@ -11,13 +12,15 @@ from threading import Event, Thread
 HERE = Path(__file__).parent
 FIXTURE = runpy.run_path(str(HERE / "tls-fixture.py"))
 STATE = runpy.run_path(str(HERE / "enrollment-journal.py"))
+GUARD = runpy.run_path(str(HERE / "lease-fixture.py"))
 ACCESS = "synthetic-enrollment-fixture-access"
 USERINFO = FIXTURE["POLICY"]["USERINFO_HOST"]
 
 
 class Attempt:
-    def __init__(self, *, pause):
+    def __init__(self, *, pause, lease=None):
         self.pause = pause
+        self.lease = lease
         self.userinfo_arrival = Event()
         self.resume = Event()
         self.revoked = Event()
@@ -29,6 +32,8 @@ class Attempt:
         self.resume.set()
         if not self.refused.wait(2):
             raise STATE["EnrollmentError"]("the revoked attempt did not refuse userinfo")
+        if self.lease is not None:
+            self.lease.revoke()
 
     def admit_userinfo(self):
         self.userinfo_arrival.set()
@@ -78,31 +83,41 @@ def userinfo(peer):
     return "synthetic_userinfo_completed"
 
 
-def serve(listener, certs, evidence, journal, generation, attempt):
+def serve(listener, certs, evidence, journal, generation, attempt, fake_dir=None):
     def pending():
         return journal.current() == {"generation": generation, "state": "pending"}
+
+    def forward(hostname, context, respond, authorize):
+        if fake_dir is None:
+            FIXTURE["serve_once"](listener, context, evidence, hostname=hostname, respond=respond,
+                                  authorize=authorize)
+            return
+        endpoint = "token.sock" if hostname == FIXTURE["HOST"] else "userinfo.sock"
+        GUARD["exchange"](listener, fake_dir / endpoint, attempt.lease, hostname=hostname, context=context,
+                          evidence=evidence, respond=respond, authorize=authorize)
 
     if not pending():
         return
     token = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     token.load_cert_chain(certs / "match.pem", certs / "match.key")
-    FIXTURE["serve_once"](listener, token, evidence, respond=tokenize)
+    forward(FIXTURE["HOST"], token, tokenize, pending)
     if evidence != ["synthetic_token_issued"]:
         return
     profile = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     profile.load_cert_chain(certs / "userinfo.pem", certs / "userinfo.key")
-    FIXTURE["serve_once"](listener, profile, evidence, hostname=USERINFO, respond=userinfo,
-                          authorize=lambda: attempt.admit_userinfo() and pending())
+    forward(USERINFO, profile, userinfo, lambda: attempt.admit_userinfo() and pending())
 
 
-def qualification_case(root, certificates, *, launch, cancel=False, expired=False):
+def qualification_case(root, certificates, *, launch, run_host, cancel=False, expired=False):
     root.mkdir(mode=0o700)
-    profile, state, broker = (root / name for name in ("profile", "state", "broker"))
-    for directory in (profile, state, broker):
+    profile, state, broker, fake = (root / name for name in ("profile", "state", "broker", "fake"))
+    for directory in (profile, state, broker, fake):
         directory.mkdir(mode=0o700)
     journal = STATE["Journal"](state)
     generation = journal.begin()
-    attempt = Attempt(pause=cancel)
+    unit = f"oc-agy-fake-enroll-{secrets.token_hex(8)}.service"
+    lease = GUARD["create"](generation, unit, run_host)
+    attempt = Attempt(pause=cancel, lease=lease)
     evidence = []
     with socket.socket(socket.AF_UNIX) as listener:
         address = broker / "observe.sock"
@@ -110,10 +125,13 @@ def qualification_case(root, certificates, *, launch, cancel=False, expired=Fals
         address.chmod(0o600)
         listener.listen(1)
         listener.settimeout(8)
-        forwarder = Thread(target=serve, args=(listener, certificates, evidence, journal, generation, attempt),
+        forwarder = Thread(target=serve, args=(listener, certificates, evidence, journal, generation, attempt, fake),
                            daemon=True)
         forwarder.start()
-        result = launch(profile, broker, attempt=attempt if cancel else None)
+        try:
+            result = launch(profile, broker, attempt=attempt if cancel else None, unit=unit)
+        finally:
+            lease.revoke()
         forwarder.join(2)
         if forwarder.is_alive():
             return "fake enrollment peer did not retire"
@@ -154,10 +172,10 @@ def qualify(directory, programs, *, launch, run_host):
     certificates.mkdir(mode=0o700)
     FIXTURE["create_certificates"](certificates, run_host, userinfo=True)
     (programs / "synthetic-ca.pem").write_bytes((certificates / "ca.pem").read_bytes())
-    cancelled = qualification_case(directory / "interrupted", certificates, launch=launch, cancel=True)
+    cancelled = qualification_case(directory / "interrupted", certificates, launch=launch, run_host=run_host, cancel=True)
     if cancelled != "interrupted":
         return cancelled
-    expired = qualification_case(directory / "expired", certificates, launch=launch, expired=True)
+    expired = qualification_case(directory / "expired", certificates, launch=launch, run_host=run_host, expired=True)
     if expired != "expired":
         return expired
-    return qualification_case(directory / "enrolled", certificates, launch=launch)
+    return qualification_case(directory / "enrolled", certificates, launch=launch, run_host=run_host)

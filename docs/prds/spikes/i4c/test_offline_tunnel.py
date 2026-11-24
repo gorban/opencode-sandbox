@@ -6,6 +6,8 @@ from pathlib import Path
 import runpy
 import socket
 import ssl
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from threading import Event
 import time
@@ -106,6 +108,50 @@ class TunnelTest(unittest.TestCase):
             with self.assertRaises((OSError, MODULE["TLS"]["Refused"])):
                 result.result(2)
             self.assertEqual(caller.recv(1), b"")
+
+    def test_owner_loss_during_dns_prevents_a_late_dial(self):
+        owner_path = str(Path(self.scratch) / "owner.sock")
+        code = (
+            "import socket, sys; "
+            "client = socket.socket(socket.AF_UNIX); client.connect(sys.argv[1]); "
+            "client.sendall(bytes.fromhex(sys.argv[2])); "
+            "client.makefile('rb').read(int(sys.argv[3])); "
+            "client.sendall(bytes.fromhex(sys.argv[4])); sys.stdin.buffer.read(1)"
+        )
+        authority = f"{TOKEN}:443".encode()
+        header = b"CONNECT " + authority + b" HTTP/1.1\r\nHost: " + authority + b"\r\n\r\n"
+        hello = hello_for(TOKEN)
+        argv = [sys.executable, "-IB", "-c", code, owner_path, header.hex(),
+                str(len(MODULE["TLS"]["ESTABLISHED"])), hello.hex()]
+        with socket.socket(socket.AF_UNIX) as owner_listener:
+            owner_listener.bind(owner_path)
+            owner_listener.listen(1)
+            owner_listener.settimeout(2)
+            with subprocess.Popen(argv, stdin=subprocess.PIPE) as owner:
+                try:
+                    self.attempt.revoke()
+                    self.attempt = Attempt("fixture-owner", deadline=time.monotonic() + 5,
+                                           expected_pid=owner.pid, expected_uid=os.getuid())
+                    self.addCleanup(self.attempt.revoke)
+                    client, _ = owner_listener.accept()
+                    with client:
+                        tunnel = self.attempt.admit(client, host=TOKEN)
+                        self.assertEqual(self.attempt.hello(tunnel), hello)
+
+                        def resolver(*args, **kwargs):
+                            owner.terminate()
+                            owner.wait(2)
+                            return synthetic_dns(*args, **kwargs)
+
+                        with self.assertRaises(Closed):
+                            self.dial(tunnel, resolver)
+                finally:
+                    if owner.poll() is None:
+                        owner.kill()
+                        owner.wait(2)
+        self.observer.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            self.observer.accept()
 
     def test_cancel_after_dial_prevents_first_forward(self):
         tunnel, caller, hello = self.provision()
