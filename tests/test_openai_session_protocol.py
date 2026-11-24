@@ -410,6 +410,45 @@ class SessionProtocolTests(unittest.TestCase):
             p_ref.finalize()
         self.assertEqual(err_ref.exception.code, "tool_call_with_refusal")
 
+        # P2 #1: unknown metadata keys inside response.completed/created abort fail-closed.
+        p_meta = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t7", vault=self.vault)
+        p_meta.feed({"type": "response.created", "response": {"id": "resp_up_t7", "status": "in_progress"}})
+        with self.assertRaises(StreamAborted) as err_meta:
+            p_meta.feed({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_up_t7", "status": "completed",
+                    "metadata": {"policy_action": "block", "unknown_safety_flag": True},
+                    "output": [{"type": "function_call", "call_id": "call_m", "name": "bash",
+                                "arguments": "{}", "status": "completed"}],
+                },
+            })
+        self.assertEqual(err_meta.exception.code, "metadata_fields")
+
+        # P2 #2: mismatched item_id between output_item.added and function_call_arguments.delta
+        # aborts finalize() even when response.completed.output[idx] omits "id".
+        p_id = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t8", vault=self.vault)
+        p_id.feed({"type": "response.created", "response": {"id": "resp_up_t8", "status": "in_progress"}})
+        p_id.feed({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "fc_1", "type": "function_call", "call_id": "call_id1", "name": "read", "arguments": ""},
+        })
+        p_id.feed({
+            "type": "response.function_call_arguments.delta", "output_index": 0,
+            "item_id": "fc_WRONG", "delta": "{}",
+        })
+        p_id.feed({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_up_t8", "status": "completed",
+                "output": [{"type": "function_call", "call_id": "call_id1", "name": "read",
+                            "arguments": "{}", "status": "completed"}],
+            },
+        })
+        with self.assertRaises(StreamAborted) as err_id:
+            p_id.finalize()
+        self.assertEqual(err_id.exception.code, "tool_call_mismatch")
+
 
 if __name__ == "__main__":
     unittest.main()

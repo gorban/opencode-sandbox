@@ -34,7 +34,16 @@ _CANARY_NAMES = ("canary.json", "canary-recovery.json")
 _LOCK = "exposure.lock"
 _RUN = re.compile(r"[0-9a-f]{32}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+_MODEL_SLUG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z", re.ASCII)
 _LOCAL_ID = re.compile(r"[A-Za-z0-9_-]{43}")
+_DIAG_KEYS = frozenset({"original_run", "binding", "run", "phase", "max_input", "max_output", "actual"})
+_STREAM_DIAG_KEYS = _DIAG_KEYS | {"previous_diagnostic_run"}
+_RECOVERY_KEYS = frozenset({"version", "prior", "source", "phases"})
+_CANARY_REQ_KEYS = frozenset({
+    "run_id", "binding", "model", "history_digest", "max_input", "max_output", "actual", "outcome",
+})
+_CANARY_RECOVERY_EXTRA = frozenset({"prior_canary_run_id", "prior_canary_digest"})
+_ERR_INVALID_RECORD = "invalid_exposure_record"
 
 
 class ExposureError(RuntimeError):
@@ -111,6 +120,108 @@ def _unique(pairs):
     if len(obj) != len(pairs):
         raise ValueError
     return obj
+
+
+def _bad_constant(_value):
+    raise ValueError("non-finite JSON constant")
+
+
+def _validate_diagnostic_record(name: str, payload) -> tuple[bool, int]:
+    expected_keys = _STREAM_DIAG_KEYS if name == _STREAM_DIAGNOSTIC else _DIAG_KEYS
+    if type(payload) is not dict or set(payload) != expected_keys:
+        raise ExposureError(_ERR_INVALID_RECORD)
+    try:
+        phase = Phase(payload["phase"])
+    except ValueError:
+        raise ExposureError(_ERR_INVALID_RECORD) from None
+    slot = Slot(payload["run"], payload["binding"], phase)
+    valid_orig = type(payload["original_run"]) is str and bool(_RUN.fullmatch(payload["original_run"]))
+    valid_prev = (
+        name != _STREAM_DIAGNOSTIC
+        or (type(payload["previous_diagnostic_run"]) is str
+            and bool(_RUN.fullmatch(payload["previous_diagnostic_run"])))
+    )
+    if (not _valid_slot(slot) or not valid_orig or not valid_prev
+            or type(payload["max_input"]) is not int or payload["max_input"] != _INPUT_LIMIT
+            or type(payload["max_output"]) is not int or payload["max_output"] != _OUTPUT_LIMIT
+            or not _use(payload)):
+        raise ExposureError(_ERR_INVALID_RECORD)
+    return True, int(payload["actual"] is None)
+
+
+def _validate_recovery_record(name: str, payload) -> tuple[bool, int]:
+    if (type(payload) is not dict or set(payload) != _RECOVERY_KEYS
+            or type(payload["version"]) is not int or payload["version"] != 1
+            or type(payload["prior"]) is not list
+            or any(type(p) is not str or not (_RUN.fullmatch(p) or _DIGEST.fullmatch(p)) for p in payload["prior"])
+            or type(payload["source"]) is not str or not _DIGEST.fullmatch(payload["source"])):
+        raise ExposureError(_ERR_INVALID_RECORD)
+    first = Phase.ORCHESTRATOR if name == _RECOVERY_PROOF else Phase.INITIAL
+    try:
+        entries = _validate(payload["phases"], first=first)
+    except ValueError:
+        raise ExposureError(_ERR_INVALID_RECORD) from None
+    if not entries:
+        raise ExposureError(_ERR_INVALID_RECORD)
+    unsettled = sum(1 for entry in entries if entry["actual"] is None)
+    return True, unsettled
+
+
+def _valid_canary_links(record: dict) -> bool:
+    prior_run = record.get("prior_canary_run_id")
+    prior_digest = record.get("prior_canary_digest")
+    return (
+        type(prior_run) is str and bool(_RUN.fullmatch(prior_run))
+        and prior_run != record["run_id"]
+        and type(prior_digest) is str and bool(_DIGEST.fullmatch(prior_digest))
+    )
+
+
+def _valid_canary_strings(record: dict) -> bool:
+    return (
+        type(record["run_id"]) is str and bool(_RUN.fullmatch(record["run_id"]))
+        and type(record["binding"]) is str and bool(_DIGEST.fullmatch(record["binding"]))
+        and type(record["model"]) is str and bool(_MODEL_SLUG.fullmatch(record["model"]))
+        and type(record["history_digest"]) is str and bool(_DIGEST.fullmatch(record["history_digest"]))
+    )
+
+
+def _validate_canary_fields(record: dict, *, recovery: bool) -> None:
+    required = _CANARY_REQ_KEYS | (_CANARY_RECOVERY_EXTRA if recovery else frozenset())
+    if not required <= set(record) <= (required | {"delivered"}):
+        raise ExposureError(_ERR_INVALID_RECORD)
+    delivered = record.get("delivered", False)
+    if (type(delivered) is not bool or not _valid_canary_strings(record)
+            or record["max_input"] != _INPUT_LIMIT or record["max_output"] != _OUTPUT_LIMIT
+            or not _is_usage(record["max_input"]) or not _is_usage(record["max_output"])):
+        raise ExposureError(_ERR_INVALID_RECORD)
+    if recovery and not _valid_canary_links(record):
+        raise ExposureError(_ERR_INVALID_RECORD)
+
+
+def _validate_settled_canary(record: dict) -> tuple[bool, int]:
+    outcome = record["outcome"]
+    actual = record["actual"]
+    delivered = record.get("delivered", False)
+    if (outcome not in ("ok_settled", "refused_settled", "overage_settled")
+            or (delivered and outcome != "ok_settled")
+            or type(actual) is not list or len(actual) != 2 or not all(_is_usage(v) for v in actual)):
+        raise ExposureError(_ERR_INVALID_RECORD)
+    is_over = actual[0] > record["max_input"] or actual[1] > record["max_output"]
+    if (outcome == "overage_settled") != is_over:
+        raise ExposureError(_ERR_INVALID_RECORD)
+    return is_over, 0
+
+
+def _validate_canary_record(name: str, record) -> tuple[bool, int]:
+    if type(record) is not dict:
+        raise ExposureError(_ERR_INVALID_RECORD)
+    _validate_canary_fields(record, recovery=(name == "canary-recovery.json"))
+    if record["outcome"] == "unsettled":
+        if record["actual"] is not None or record.get("delivered", False) is not False:
+            raise ExposureError(_ERR_INVALID_RECORD)
+        return True, 1
+    return _validate_settled_canary(record)
 
 
 def _is_usage(value):
@@ -289,11 +400,11 @@ class ExposureLedger:
                 raise ExposureError("untrusted_exposure_store")
             raw = stream.read(_MAX_BYTES + 1)
         if len(raw) > _MAX_BYTES:
-            raise ExposureError("invalid_exposure_record")
+            raise ExposureError(_ERR_INVALID_RECORD)
         try:
-            parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique)
+            parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique, parse_constant=_bad_constant)
         except (TypeError, ValueError, RecursionError):
-            raise ExposureError("invalid_exposure_record") from None
+            raise ExposureError(_ERR_INVALID_RECORD) from None
         return raw, parsed
 
     def _validate_hold_entry(self, name: str, parsed) -> tuple[bool, int]:
@@ -301,7 +412,7 @@ class ExposureLedger:
             try:
                 records = _validate(parsed)
             except (TypeError, ValueError):
-                raise ExposureError("invalid_exposure_record") from None
+                raise ExposureError(_ERR_INVALID_RECORD) from None
             if not records:
                 return False, 0
             actual = records[-1]["actual"]
@@ -309,14 +420,10 @@ class ExposureLedger:
                 return True, 1
             return _overage(actual), 0
         if name in _CANARY_NAMES:
-            if type(parsed) is not dict or parsed.get("outcome") not in ("unsettled", "ok_settled", "refused_settled"):
-                raise ExposureError("invalid_exposure_record")
-            is_unsettled = parsed["outcome"] == "unsettled"
-            return is_unsettled, int(is_unsettled)
-        if type(parsed) is not dict:
-            raise ExposureError("invalid_exposure_record")
-        unsettled = 1 if parsed.get("actual") is None and "actual" in parsed else 0
-        return True, unsettled
+            return _validate_canary_record(name, parsed)
+        if name in (_DIAGNOSTIC, _STREAM_DIAGNOSTIC):
+            return _validate_diagnostic_record(name, parsed)
+        return _validate_recovery_record(name, parsed)
 
     def _inspect_locked(self, directory) -> ExposureHold:
         names = (_LEDGER, _DIAGNOSTIC, _STREAM_DIAGNOSTIC, *_RECOVERY_NAMES, *_CANARY_NAMES)

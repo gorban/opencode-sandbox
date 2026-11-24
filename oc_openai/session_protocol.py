@@ -466,6 +466,8 @@ def _check_moderation_or_metadata(low: str, value) -> None:
         return
     if "moderation" in low:
         raise StreamAborted("metadata_moderation")
+    if low == "metadata" and value not in (None, {}):
+        _validate_metadata_dict(value)
 
 
 def _check_safety_entry(key, value) -> None:
@@ -603,6 +605,16 @@ def _validate_moderation_root(moderation) -> None:
         raise StreamAborted("metadata_moderation")
 
 
+def _validate_metadata_dict(metadata) -> None:
+    if type(metadata) is not dict:
+        raise StreamAborted("metadata_envelope")
+    if not set(metadata) <= {"openai_verification_recommendation", "openai_chatgpt_moderation_metadata"}:
+        raise StreamAborted("metadata_fields")
+    if metadata.get("openai_verification_recommendation", []) != []:
+        raise StreamAborted("metadata_review")
+    _validate_moderation_root(metadata.get("openai_chatgpt_moderation_metadata", {}))
+
+
 def _validate_metadata_event(event: dict, active_upstream_id: str | None) -> None:
     if (event.keys() != {"type", "response_id", "sequence_number", "metadata"}
             or active_upstream_id is None or event["response_id"] != active_upstream_id
@@ -610,12 +622,7 @@ def _validate_metadata_event(event: dict, active_upstream_id: str | None) -> Non
             or not 0 <= event["sequence_number"] <= 2**31
             or type(event["metadata"]) is not dict):
         raise StreamAborted("metadata_envelope")
-    metadata = event["metadata"]
-    if not set(metadata) <= {"openai_verification_recommendation", "openai_chatgpt_moderation_metadata"}:
-        raise StreamAborted("metadata_fields")
-    if metadata.get("openai_verification_recommendation", []) != []:
-        raise StreamAborted("metadata_review")
-    _validate_moderation_root(metadata.get("openai_chatgpt_moderation_metadata", {}))
+    _validate_metadata_dict(event["metadata"])
 
 
 def encode_chunk(payload: bytes) -> bytes:
@@ -1116,6 +1123,23 @@ class SessionStreamProjector:
         self._verify_arg_deltas()
         self._verify_arg_done()
 
+    def _collect_tool_ids(self, idx: int, completed: dict) -> set[str]:
+        candidates = [
+            item.get("id")
+            for item in (completed, self._buffered_tool_added.get(idx), self._buffered_tool_done.get(idx))
+            if item is not None
+        ]
+        candidates.extend(item_id for _c, item_id, _d in self._buffered_arg_deltas.get(idx, ()))
+        done_arg = self._buffered_arg_done.get(idx)
+        if done_arg is not None:
+            candidates.append(done_arg[1])
+        return {val for val in candidates if val is not None}
+
+    def _verify_tool_id_consistency(self) -> None:
+        for idx, completed in self._completed_tool_calls.items():
+            if len(self._collect_tool_ids(idx, completed)) > 1:
+                raise StreamAborted("tool_call_mismatch")
+
     def _verify_buffered_tools(self) -> None:
         if self._saw_refusal and self._completed_tool_calls:
             raise StreamAborted("tool_call_with_refusal")
@@ -1123,6 +1147,7 @@ class SessionStreamProjector:
             raise StreamAborted("tool_call_mismatch")
         self._verify_tool_items()
         self._verify_tool_args()
+        self._verify_tool_id_consistency()
 
     def finalize(self) -> list[bytes]:
         if not self._completed_seen:

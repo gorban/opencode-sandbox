@@ -664,18 +664,75 @@ class SessionBrokerTests(unittest.TestCase):
         self.assertIn(b"response.completed", resp2)
         self.assertEqual(len(upstream_calls), 1)
 
-        # Adding a new receipt invalidates the pinned snapshot digest -> 0 further upstream calls.
+        # Adding a valid new diagnostic receipt invalidates the pinned snapshot digest -> 0 further upstream calls.
         diag = self.usage_dir / "diagnostic.json"
-        diag.write_text('{"run":"' + "2" * 32 + '","actual":null}', encoding="ascii")
+        diag_payload = {
+            "original_run": "1" * 32,
+            "binding": b_hash,
+            "run": "2" * 32,
+            "phase": "orchestrator",
+            "max_input": 922_000,
+            "max_output": 128_000,
+            "actual": None,
+        }
+        diag.write_text(json.dumps(diag_payload), encoding="ascii")
         diag.chmod(0o600)
         resp3 = _send_via_relay(sock2, self.lease, self.proof, req)
         self.assertIn(b"403 Forbidden", resp3)
         self.assertEqual(len(upstream_calls), 1)
 
-        # Corrupt receipt is NEVER acknowledgeable.
+        # Corrupt JSON, NaN constants, and schema-tampered receipts are NEVER acknowledgeable or unblocked.
         diag.write_text("{corrupt", encoding="ascii")
         with self.assertRaises(ExposureError):
             ledger.inspect_hold()
+        diag.write_text(json.dumps({"corrupt": 123, "tampered": True}), encoding="ascii")
+        with self.assertRaises(ExposureError):
+            ledger.inspect_hold()
+        diag.write_text('{"original_run": NaN}', encoding="ascii")
+        with self.assertRaises(ExposureError):
+            ledger.inspect_hold()
+        diag.unlink()
+
+        # Tampered or overage canary.json MUST fail closed (never silently unblocked); valid overage blocks.
+        canary_dir = self.root / "canary_hold_check"
+        canary_dir.mkdir(mode=0o700)
+        c_ledger = ExposureLedger(canary_dir)
+        c_path = canary_dir / "canary.json"
+        for bad_canary in (
+            {"outcome": "ok_settled", "tampered": True},
+            {"run_id": "a" * 32, "binding": b_hash, "model": "gpt-6.2-sol", "history_digest": "0" * 64,
+             "max_input": 922_000, "max_output": 128_000, "actual": None, "outcome": "ok_settled", "delivered": True},
+            {"run_id": "a" * 32, "binding": b_hash, "model": "gpt-6.2-sol", "history_digest": "0" * 64,
+             "max_input": 922_000, "max_output": 128_000, "actual": [999_999, 1], "outcome": "ok_settled", "delivered": True},
+        ):
+            c_path.write_text(json.dumps(bad_canary), encoding="ascii")
+            c_path.chmod(0o600)
+            with self.assertRaises(ExposureError):
+                c_ledger.inspect_hold()
+        valid_overage = {
+            "run_id": "a" * 32, "binding": b_hash, "model": "gpt-6.2-sol", "history_digest": "0" * 64,
+            "max_input": 922_000, "max_output": 128_000, "actual": [922_001, 1],
+            "outcome": "overage_settled", "delivered": False,
+        }
+        c_path.write_text(json.dumps(valid_overage), encoding="ascii")
+        c_path.chmod(0o600)
+        self.assertTrue(c_ledger.inspect_hold().blocked)
+        c_path.unlink()
+
+        # Valid unsettled recovery-proof.json accurately reports unsettled_count=1 and rejects corrupt recovery.
+        rec_path = canary_dir / "recovery-proof.json"
+        rec_path.write_text(json.dumps({
+            "version": 1, "prior": ["1" * 32], "source": "a" * 64,
+            "phases": [{"run": "3" * 32, "binding": b_hash, "phase": "orchestrator",
+                        "max_input": 922_000, "max_output": 128_000, "actual": None}],
+        }), encoding="ascii")
+        rec_path.chmod(0o600)
+        rec_hold = c_ledger.inspect_hold()
+        self.assertTrue(rec_hold.blocked)
+        self.assertEqual(rec_hold.unsettled_count, 1)
+        rec_path.write_text(json.dumps({"corrupt": 123}), encoding="ascii")
+        with self.assertRaises(ExposureError):
+            c_ledger.inspect_hold()
 
     def test_reciprocal_p2_container_ownership_and_exception_cleanup_propagation(self):
         from unittest.mock import patch
