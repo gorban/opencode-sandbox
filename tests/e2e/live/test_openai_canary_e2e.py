@@ -150,24 +150,20 @@ def _run_pinned_snapshot(files: dict[Path, bytes], driver_rel: Path, *, home: Pa
 
 
 def _run_checked_driver(root: Path, *, model: str | None, source_sha256: str | None = None) -> int | None:
+    if type(source_sha256) is not str or not _SHA256_RE.fullmatch(source_sha256):
+        return None
     try:
         home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
         driver = _trusted_driver(root, home)
+        digest, files = _capture_sources(root, driver)
+        if not hmac.compare_digest(digest, source_sha256):
+            return None
     except (KeyError, OSError, ValueError):
         return None
     env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
     extra_args: list[str] = [LIVE_FLAG]
     if model is not None:
         extra_args.extend(["--model", model])
-    if source_sha256 is None:
-        command = ["/usr/bin/python3", "-IB", str(driver), *extra_args]
-        return _wait_for_driver(command, root=root, env=env)
-    try:
-        digest, files = _capture_sources(root, driver)
-        if not hmac.compare_digest(digest, source_sha256):
-            return None
-    except (OSError, ValueError):
-        return None
     return _run_pinned_snapshot(
         files, driver.relative_to(root), home=home, extra_args=extra_args,
         source_sha256=source_sha256, env=env,
@@ -177,7 +173,7 @@ def _run_checked_driver(root: Path, *, model: str | None, source_sha256: str | N
 def _validated_source_pin(request, args) -> tuple[bool, str | None]:
     source_sha256 = request.config.getoption(SOURCE_PIN_FLAG, default=None)
     if source_sha256 is None:
-        return True, None
+        return False, None
     direct_count = sum(arg == SOURCE_PIN_FLAG or arg.startswith(f"{SOURCE_PIN_FLAG}=") for arg in args)
     if (type(source_sha256) is not str or not _SHA256_RE.fullmatch(source_sha256)
             or direct_count != 1 or source_sha256 not in " ".join(args)):
@@ -198,8 +194,8 @@ def test_live_openai_opencode_canary(request):
         pytest.fail("Invalid --openai-canary-model value.", pytrace=False)
 
     pin_ok, source_sha256 = _validated_source_pin(request, args)
-    if not pin_ok:
-        pytest.fail("Invalid --openai-canary-source-sha256 value.", pytrace=False)
+    if not pin_ok or source_sha256 is None:
+        pytest.fail("Explicit --openai-canary-source-sha256=<64-hex> pin is required.", pytrace=False)
 
     root = Path(__file__).resolve(strict=True).parents[3]
     status = _run_checked_driver(root, model=model, source_sha256=source_sha256)

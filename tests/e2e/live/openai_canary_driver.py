@@ -18,7 +18,7 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _MAX_SOURCE_BYTES = 1_048_576
 
 
-def _parse_args(argv: list[str]) -> tuple[str | None, str | None]:
+def _parse_args(argv: list[str]) -> tuple[str | None, str]:
     if not argv or argv[0] != LIVE_FLAG:
         raise ValueError("explicit --run-openai-canary-live flag required")
     model: str | None = None
@@ -36,6 +36,8 @@ def _parse_args(argv: list[str]) -> tuple[str | None, str | None]:
         else:
             raise ValueError("unsupported driver arguments")
         idx += 2
+    if source_sha256 is None:
+        raise ValueError("explicit --source-sha256 pin required")
     return model, source_sha256
 
 
@@ -112,8 +114,8 @@ def main() -> int:
     root = Path(__file__).resolve().parents[3]
     bootstrap = root / "oc-openai.py"
     try:
-        actual_digest, raw = snapshot_digest(root, require_readonly=(expected_sha256 is not None))
-        if expected_sha256 is not None and not hmac.compare_digest(actual_digest, expected_sha256):
+        actual_digest, raw = snapshot_digest(root, require_readonly=True)
+        if not hmac.compare_digest(actual_digest, expected_sha256):
             raise ValueError("canary source digest does not match expected pin")
         namespace = {"__file__": str(bootstrap), "__name__": "openai_bootstrap"}
         exec(compile(raw, str(bootstrap), "exec"), namespace)

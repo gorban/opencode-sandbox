@@ -15,4 +15,4 @@ def pytest_addoption(parser):
     parser.addoption("--openai-canary-model", default=None,
                      help="Optional reviewed model slug for --run-openai-canary-live.")
     parser.addoption("--openai-canary-source-sha256", metavar="REVIEWED_SHA256", default=None,
-                     help="Optional exact SHA-256 source-tree pin for --run-openai-canary-live.")
+                     help="Required exact 64-hex SHA-256 source-tree pin for --run-openai-canary-live.")

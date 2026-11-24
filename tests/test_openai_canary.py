@@ -2238,6 +2238,105 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
             with self.assertRaisesRegex(CanaryLedgerError, "canary_unsettled_hold"):
                 base_ledger.preflight()
 
+    def test_reciprocal_r3_source_pin_mandatory_and_inflated_receipt_ceilings_rejected(self):
+        repo = Path(__file__).resolve().parents[1]
+        driver = repo / "tests/e2e/live/openai_canary_driver.py"
+        e2e_spec = importlib.util.spec_from_file_location(
+            "test_openai_canary_e2e_r3", repo / "tests/e2e/live/test_openai_canary_e2e.py",
+        )
+        e2e_mod = importlib.util.module_from_spec(e2e_spec)
+        e2e_spec.loader.exec_module(e2e_mod)
+
+        # 1. Omitting --source-sha256 at the driver exits 2 before touching oc-openai.py or backend.
+        with tempfile.TemporaryDirectory(prefix="oc-drv-nopin-", dir="/tmp") as tmp:
+            env = {"HOME": tmp, "PATH": "/usr/bin:/bin"}
+            for argv in (["--run-openai-canary-live"], ["--run-openai-canary-live", "--model", MODEL]):
+                with self.subTest(argv=argv):
+                    res = subprocess.run(
+                        ["/usr/bin/python3", "-IB", str(driver), *argv],
+                        cwd=repo, env=env, capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(res.returncode, 2)
+                    self.assertEqual(res.stdout, "")
+                    self.assertEqual(res.stderr, "")
+
+        # 2. Omitting source_sha256 at _run_checked_driver returns None before starting the driver.
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        with tempfile.TemporaryDirectory(prefix="oc-nopin-root-", dir=home) as nopin_tmp:
+            nopin_root = Path(nopin_tmp) / "repo"
+            nopin_drv = nopin_root / "tests/e2e/live"
+            nopin_drv.mkdir(parents=True, mode=0o700)
+            os.chmod(nopin_root, 0o700)
+            nopin_marker = Path(nopin_tmp) / "driver_started"
+            (nopin_drv / "openai_canary_driver.py").write_text(
+                f"from pathlib import Path\nPath({str(nopin_marker)!r}).write_text('ran')\n",
+                encoding="ascii",
+            )
+            os.chmod(nopin_drv / "openai_canary_driver.py", 0o600)
+            (nopin_root / "oc-openai.py").write_text("# stub\n", encoding="ascii")
+            os.chmod(nopin_root / "oc-openai.py", 0o600)
+            self.assertIsNone(e2e_mod._run_checked_driver(nopin_root, model=None, source_sha256=None))
+            self.assertFalse(nopin_marker.exists(), "_run_checked_driver launched driver without a source pin")
+
+        # 3. Inflated stored ceiling + over-policy actual usage fails closed across E2E, primary, and recovery.
+        with tempfile.TemporaryDirectory(prefix="oc-ceil-", dir=home) as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(mode=0o700)
+            b_hash = binding_digest("a" * 43, "b" * 43)
+            hist_digest = inspect_i4a_history(state_dir).digest
+            e2e_ledger = canary_ledger.E2ECanaryLedger(state_dir)
+            base_ledger = CanaryLedger(state_dir)
+
+            inflated_out = {
+                "run_id": "1" * 32, "binding": b_hash, "model": MODEL, "history_digest": hist_digest,
+                "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT + 1,
+                "actual": [10, _OUTPUT_LIMIT + 1], "outcome": "ok_settled", "delivered": True,
+            }
+            inflated_in = {
+                "run_id": "2" * 32, "binding": b_hash, "model": MODEL, "history_digest": hist_digest,
+                "max_input": _INPUT_LIMIT + 1, "max_output": _OUTPUT_LIMIT,
+                "actual": [_INPUT_LIMIT + 1, 5], "outcome": "ok_settled", "delivered": True,
+            }
+
+            e_path = state_dir / canary_ledger.CANARY_E2E_FILE
+            for bad in (inflated_out, inflated_in):
+                e_path.write_text(json.dumps(bad), encoding="ascii")
+                e_path.chmod(0o600)
+                with self.assertRaisesRegex(CanaryLedgerError, "canary_storage_unavailable"):
+                    e2e_ledger.preflight()
+                with self.assertRaisesRegex(CanaryLedgerError, "canary_storage_unavailable"):
+                    base_ledger.preflight()
+            e_path.unlink()
+
+            c_path = state_dir / CANARY_FILE
+            c_path.write_text(json.dumps(inflated_out), encoding="ascii")
+            c_path.chmod(0o600)
+            with self.assertRaisesRegex(CanaryLedgerError, "canary_storage_unavailable"):
+                e2e_ledger.preflight()
+            with self.assertRaisesRegex(CanaryLedgerError, "canary_storage_unavailable"):
+                base_ledger.preflight()
+
+            # Valid unsettled primary + recovery with inflated ceiling MUST fail closed.
+            valid_unsettled = {
+                "run_id": "3" * 32, "binding": b_hash, "model": MODEL, "history_digest": hist_digest,
+                "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT,
+                "actual": None, "outcome": "unsettled", "delivered": False,
+            }
+            c_raw = (json.dumps(valid_unsettled, sort_keys=True) + "\n").encode("ascii")
+            c_digest = hashlib.sha256(c_raw).hexdigest()
+            c_path.write_bytes(c_raw)
+            r_path = state_dir / CANARY_RECOVERY_FILE
+            r_path.write_text(json.dumps({
+                **inflated_out, "run_id": "4" * 32,
+                "prior_canary_run_id": "3" * 32,
+                "prior_canary_digest": c_digest,
+            }), encoding="ascii")
+            r_path.chmod(0o600)
+            with self.assertRaisesRegex(CanaryLedgerError, "canary_storage_unavailable"):
+                e2e_ledger.preflight()
+            with self.assertRaisesRegex(CanaryLedgerError, "canary_storage_unavailable"):
+                base_ledger.preflight_recovery(b_hash, MODEL, expected_prior=("3" * 32, c_digest))
+
 
 if __name__ == "__main__":
     unittest.main()

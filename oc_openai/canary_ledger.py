@@ -261,7 +261,26 @@ def _valid_recovery_links(record: dict) -> bool:
     )
 
 
-def _valid_canary_record(record, *, recovery: bool = False) -> bool:
+def _valid_canary_settled(record: dict, *, delivered: bool, max_input: int, max_output: int) -> bool:
+    outcome = record["outcome"]
+    actual = record["actual"]
+    if outcome == _OUTCOME_UNSETTLED:
+        return actual is None and delivered is False
+    if (outcome not in _SETTLED_OUTCOMES
+            or (delivered and outcome != _OUTCOME_OK)
+            or type(actual) is not list or len(actual) != 2
+            or not all(_is_usage(v) for v in actual)):
+        return False
+    return (outcome == _OUTCOME_OVERAGE) == (actual[0] > max_input or actual[1] > max_output)
+
+
+def _valid_canary_record(
+    record,
+    *,
+    recovery: bool = False,
+    max_input: int = _INPUT_LIMIT,
+    max_output: int = _OUTPUT_LIMIT,
+) -> bool:
     if type(record) is not dict:
         return False
     required = {"run_id", "binding", "model", "history_digest", "max_input", "max_output", "actual", "outcome"}
@@ -276,20 +295,12 @@ def _valid_canary_record(record, *, recovery: bool = False) -> bool:
             or type(record["binding"]) is not str or not _DIGEST_RE.fullmatch(record["binding"])
             or type(record["model"]) is not str or not _MODEL_RE.fullmatch(record["model"])
             or type(record["history_digest"]) is not str or not _DIGEST_RE.fullmatch(record["history_digest"])
-            or not _is_usage(record["max_input"]) or not _is_usage(record["max_output"])):
+            or not _is_usage(record["max_input"]) or not _is_usage(record["max_output"])
+            or record["max_input"] != max_input or record["max_output"] != max_output):
         return False
     if recovery and not _valid_recovery_links(record):
         return False
-    outcome = record["outcome"]
-    actual = record["actual"]
-    if outcome == _OUTCOME_UNSETTLED:
-        return actual is None and delivered is False
-    return (
-        outcome in _SETTLED_OUTCOMES
-        and (not delivered or outcome == _OUTCOME_OK)
-        and type(actual) is list and len(actual) == 2
-        and all(_is_usage(v) for v in actual)
-    )
+    return _valid_canary_settled(record, delivered=delivered, max_input=max_input, max_output=max_output)
 
 
 def _atomic_write_json(dir_fd: int, name: str, payload: dict) -> None:
@@ -326,9 +337,11 @@ def _atomic_write_json(dir_fd: int, name: str, payload: dict) -> None:
         raise CanaryLedgerError(_ERR_STORAGE) from None
 
 
-def _refuse_existing_canary(raw: bytes, *, recovery: bool = False) -> None:
+def _refuse_existing_canary(
+    raw: bytes, *, recovery: bool = False, max_input: int = _INPUT_LIMIT, max_output: int = _OUTPUT_LIMIT,
+) -> None:
     record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
-    if not _valid_canary_record(record, recovery=recovery):
+    if not _valid_canary_record(record, recovery=recovery, max_input=max_input, max_output=max_output):
         raise CanaryLedgerError(_ERR_STORAGE)
     if recovery:
         raise CanaryLedgerError("canary_recovery_already_used")
@@ -337,41 +350,53 @@ def _refuse_existing_canary(raw: bytes, *, recovery: bool = False) -> None:
     raise CanaryLedgerError("canary_already_spent")
 
 
-def _require_settled_in_bounds(record: dict) -> None:
+def _require_settled_in_bounds(
+    record: dict, *, max_input: int = _INPUT_LIMIT, max_output: int = _OUTPUT_LIMIT,
+) -> None:
+    if record["max_input"] != max_input or record["max_output"] != max_output:
+        raise CanaryLedgerError(_ERR_STORAGE)
     if record["outcome"] == _OUTCOME_UNSETTLED:
         raise CanaryLedgerError(_ERR_UNSETTLED_HOLD)
     if record["outcome"] == _OUTCOME_OVERAGE:
         raise CanaryLedgerError(_ERR_OVERAGE_HOLD)
     actual = record["actual"]
-    if actual[0] > record["max_input"] or actual[1] > record["max_output"]:
+    if actual[0] > max_input or actual[1] > max_output:
         raise CanaryLedgerError(_ERR_OVERAGE_HOLD)
 
 
-def _check_e2e_record(dir_fd: int, *, run_id: str | None = None) -> None:
+def _check_e2e_record(
+    dir_fd: int, *, run_id: str | None = None, max_input: int = _INPUT_LIMIT, max_output: int = _OUTPUT_LIMIT,
+) -> None:
     raw = _read_private_bytes(dir_fd, CANARY_E2E_FILE)
     if raw is None:
         return
     record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
-    if not _valid_canary_record(record, recovery=False):
+    if not _valid_canary_record(record, recovery=False, max_input=max_input, max_output=max_output):
         raise CanaryLedgerError(_ERR_STORAGE)
-    _require_settled_in_bounds(record)
+    _require_settled_in_bounds(record, max_input=max_input, max_output=max_output)
     if run_id is not None and record["run_id"] == run_id:
         raise CanaryLedgerError(_ERR_INVALID_RES)
 
 
-def _load_optional_canary(dir_fd: int, name: str, *, recovery: bool) -> tuple[bytes, dict] | None:
+def _load_optional_canary(
+    dir_fd: int, name: str, *, recovery: bool, max_input: int = _INPUT_LIMIT, max_output: int = _OUTPUT_LIMIT,
+) -> tuple[bytes, dict] | None:
     raw = _read_private_bytes(dir_fd, name)
     if raw is None:
         return None
     record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
-    if not _valid_canary_record(record, recovery=recovery):
+    if not _valid_canary_record(record, recovery=recovery, max_input=max_input, max_output=max_output):
         raise CanaryLedgerError(_ERR_STORAGE)
     return raw, record
 
 
-def _check_readonly_canary_files(dir_fd: int) -> None:
-    primary = _load_optional_canary(dir_fd, CANARY_FILE, recovery=False)
-    recovery = _load_optional_canary(dir_fd, CANARY_RECOVERY_FILE, recovery=True)
+def _check_readonly_canary_files(
+    dir_fd: int, *, max_input: int = _INPUT_LIMIT, max_output: int = _OUTPUT_LIMIT,
+) -> None:
+    primary = _load_optional_canary(dir_fd, CANARY_FILE, recovery=False, max_input=max_input, max_output=max_output)
+    recovery = _load_optional_canary(
+        dir_fd, CANARY_RECOVERY_FILE, recovery=True, max_input=max_input, max_output=max_output,
+    )
     if recovery is not None:
         if primary is None:
             raise CanaryLedgerError(_ERR_STORAGE)
@@ -384,10 +409,10 @@ def _check_readonly_canary_files(dir_fd: int) -> None:
                 or rec["history_digest"] != canary["history_digest"]
                 or not hmac.compare_digest(rec["prior_canary_digest"], sha256(canary_raw).hexdigest())):
             raise CanaryLedgerError(_ERR_STORAGE)
-        _require_settled_in_bounds(rec)
+        _require_settled_in_bounds(rec, max_input=max_input, max_output=max_output)
         return
     if primary is not None:
-        _require_settled_in_bounds(primary[1])
+        _require_settled_in_bounds(primary[1], max_input=max_input, max_output=max_output)
 
 
 def _load_eligible_prior_canary(
@@ -406,7 +431,7 @@ def _load_eligible_prior_canary(
     prior_digest = sha256(raw).hexdigest()
     record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
     expected_run_id, expected_digest = expected_prior
-    if (not _valid_canary_record(record)
+    if (not _valid_canary_record(record, max_input=max_input, max_output=max_output)
             or record["outcome"] != _OUTCOME_UNSETTLED
             or record["actual"] is not None
             or record.get("delivered") is not False
@@ -488,13 +513,13 @@ class CanaryLedger:
     def preflight(self) -> HistorySnapshot:
         """Verify no prior canary or recovery slot exists and snapshot all 9 I4a hold files."""
         with self._locked(blocking=False) as dir_fd:
-            _check_e2e_record(dir_fd)
+            _check_e2e_record(dir_fd, max_input=self.max_input, max_output=self.max_output)
             existing = _read_private_bytes(dir_fd, CANARY_FILE)
             if existing is not None:
-                _refuse_existing_canary(existing)
+                _refuse_existing_canary(existing, max_input=self.max_input, max_output=self.max_output)
             existing_rec = _read_private_bytes(dir_fd, CANARY_RECOVERY_FILE)
             if existing_rec is not None:
-                _refuse_existing_canary(existing_rec, recovery=True)
+                _refuse_existing_canary(existing_rec, recovery=True, max_input=self.max_input, max_output=self.max_output)
             return _inspect_history_fd(dir_fd)
 
     def preflight_recovery(
@@ -512,10 +537,10 @@ class CanaryLedger:
             raise CanaryLedgerError("canary_recovery_ineligible")
         pinned = expected_prior
         with self._locked(blocking=False) as dir_fd:
-            _check_e2e_record(dir_fd)
+            _check_e2e_record(dir_fd, max_input=self.max_input, max_output=self.max_output)
             existing_rec = _read_private_bytes(dir_fd, CANARY_RECOVERY_FILE)
             if existing_rec is not None:
-                _refuse_existing_canary(existing_rec, recovery=True)
+                _refuse_existing_canary(existing_rec, recovery=True, max_input=self.max_input, max_output=self.max_output)
             history = _inspect_history_fd(dir_fd)
             prior, prior_digest = _load_eligible_prior_canary(
                 dir_fd, binding=binding, model=model, history_digest=history.digest,
@@ -538,13 +563,13 @@ class CanaryLedger:
                 or type(history_digest) is not str or not _DIGEST_RE.fullmatch(history_digest)):
             raise CanaryLedgerError(_ERR_INVALID_RES)
         with self._locked(blocking=True, deadline=deadline, check_alive=check_alive) as dir_fd:
-            _check_e2e_record(dir_fd, run_id=run_id)
+            _check_e2e_record(dir_fd, run_id=run_id, max_input=self.max_input, max_output=self.max_output)
             existing = _read_private_bytes(dir_fd, CANARY_FILE)
             if existing is not None:
-                _refuse_existing_canary(existing)
+                _refuse_existing_canary(existing, max_input=self.max_input, max_output=self.max_output)
             existing_rec = _read_private_bytes(dir_fd, CANARY_RECOVERY_FILE)
             if existing_rec is not None:
-                _refuse_existing_canary(existing_rec, recovery=True)
+                _refuse_existing_canary(existing_rec, recovery=True, max_input=self.max_input, max_output=self.max_output)
             current = _inspect_history_fd(dir_fd)
             if current.digest != history_digest:
                 raise CanaryLedgerError(_ERR_HISTORY_CHANGED)
@@ -586,10 +611,10 @@ class CanaryLedger:
                 or run_id == prior_run_id):
             raise CanaryLedgerError(_ERR_INVALID_RES)
         with self._locked(blocking=True, deadline=deadline, check_alive=check_alive) as dir_fd:
-            _check_e2e_record(dir_fd, run_id=run_id)
+            _check_e2e_record(dir_fd, run_id=run_id, max_input=self.max_input, max_output=self.max_output)
             existing_rec = _read_private_bytes(dir_fd, CANARY_RECOVERY_FILE)
             if existing_rec is not None:
-                _refuse_existing_canary(existing_rec, recovery=True)
+                _refuse_existing_canary(existing_rec, recovery=True, max_input=self.max_input, max_output=self.max_output)
             current = _inspect_history_fd(dir_fd)
             if current.digest != history_digest:
                 raise CanaryLedgerError(_ERR_HISTORY_CHANGED)
@@ -618,7 +643,8 @@ class CanaryLedger:
         if raw is None:
             raise CanaryLedgerError(_ERR_MISSING)
         record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
-        if not _valid_canary_record(record, recovery=recovery) or record["run_id"] != run_id:
+        if (not _valid_canary_record(record, recovery=recovery, max_input=self.max_input, max_output=self.max_output)
+                or record["run_id"] != run_id):
             raise CanaryLedgerError(_ERR_UNMATCHED)
         if record["outcome"] != _OUTCOME_UNSETTLED:
             raise CanaryLedgerError(_ERR_ALREADY_SETTLED)
@@ -632,7 +658,7 @@ class CanaryLedger:
         target = CANARY_RECOVERY_FILE if recovery else CANARY_FILE
         with self._locked(blocking=True) as dir_fd:
             record = self._load_matching_unsettled(dir_fd, run_id, recovery=recovery)
-            over = input_tokens > record["max_input"] or output_tokens > record["max_output"]
+            over = input_tokens > self.max_input or output_tokens > self.max_output
             if over:
                 outcome = _OUTCOME_OVERAGE
             elif allow_delivery:
@@ -652,7 +678,7 @@ class CanaryLedger:
             if raw is None:
                 raise CanaryLedgerError(_ERR_MISSING)
             record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
-            if (not _valid_canary_record(record, recovery=recovery)
+            if (not _valid_canary_record(record, recovery=recovery, max_input=self.max_input, max_output=self.max_output)
                     or record["run_id"] != run_id or record["outcome"] != _OUTCOME_OK):
                 raise CanaryLedgerError(_ERR_UNMATCHED)
             record["delivered"] = True
@@ -668,15 +694,14 @@ class E2ECanaryLedger(CanaryLedger):
     cleanly settled in-bounds records (or a valid linked settled recovery) permit explicit re-runs.
     """
 
-    @staticmethod
-    def _validate_readonly_history(dir_fd: int) -> HistorySnapshot:
+    def _validate_readonly_history(self, dir_fd: int) -> HistorySnapshot:
         history = _inspect_history_fd(dir_fd)
-        _check_readonly_canary_files(dir_fd)
+        _check_readonly_canary_files(dir_fd, max_input=self.max_input, max_output=self.max_output)
         return history
 
     def preflight(self) -> HistorySnapshot:
         with self._locked(blocking=False) as dir_fd:
-            _check_e2e_record(dir_fd)
+            _check_e2e_record(dir_fd, max_input=self.max_input, max_output=self.max_output)
             return self._validate_readonly_history(dir_fd)
 
     def reserve(self, run_id: str, binding: str, model: str, history_digest: str, *,
@@ -687,7 +712,7 @@ class E2ECanaryLedger(CanaryLedger):
                 or type(history_digest) is not str or not _DIGEST_RE.fullmatch(history_digest)):
             raise CanaryLedgerError(_ERR_INVALID_RES)
         with self._locked(blocking=True, deadline=deadline, check_alive=check_alive) as dir_fd:
-            _check_e2e_record(dir_fd, run_id=run_id)
+            _check_e2e_record(dir_fd, run_id=run_id, max_input=self.max_input, max_output=self.max_output)
             current = self._validate_readonly_history(dir_fd)
             if current.digest != history_digest:
                 raise CanaryLedgerError(_ERR_HISTORY_CHANGED)
@@ -713,11 +738,12 @@ class E2ECanaryLedger(CanaryLedger):
             if raw is None:
                 raise CanaryLedgerError(_ERR_MISSING)
             record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
-            if not _valid_canary_record(record, recovery=False) or record["run_id"] != run_id:
+            if (not _valid_canary_record(record, recovery=False, max_input=self.max_input, max_output=self.max_output)
+                    or record["run_id"] != run_id):
                 raise CanaryLedgerError(_ERR_UNMATCHED)
             if record["outcome"] != _OUTCOME_UNSETTLED:
                 raise CanaryLedgerError(_ERR_ALREADY_SETTLED)
-            over = input_tokens > record["max_input"] or output_tokens > record["max_output"]
+            over = input_tokens > self.max_input or output_tokens > self.max_output
             if over:
                 outcome = _OUTCOME_OVERAGE
             elif allow_delivery:
@@ -737,7 +763,7 @@ class E2ECanaryLedger(CanaryLedger):
             if raw is None:
                 raise CanaryLedgerError(_ERR_MISSING)
             record = _decode_json_bytes(raw, err_code=_ERR_STORAGE)
-            if (not _valid_canary_record(record, recovery=False)
+            if (not _valid_canary_record(record, recovery=False, max_input=self.max_input, max_output=self.max_output)
                     or record["run_id"] != run_id or record["outcome"] != _OUTCOME_OK):
                 raise CanaryLedgerError(_ERR_UNMATCHED)
             record["delivered"] = True
