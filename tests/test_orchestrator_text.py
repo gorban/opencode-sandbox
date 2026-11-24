@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from oc_orchestrator.capture import CaptureError, capture
+from oc_orchestrator.claude_protocol import PREFIX, SETTINGS, ProtocolError, select_native, validate_sdk
 from oc_orchestrator.owner import Lifeline
 from oc_orchestrator.protocol import OPTIONS, PROMPT, RecordingFake, accept_text
 from oc_orchestrator.relay import handoff
@@ -73,6 +74,28 @@ def response(client):
 
 
 class OrchestratorTest(unittest.TestCase):
+    def test_claude_synthetic_admits_only_the_known_sdk_launch_modes(self):
+        discovery = [*PREFIX, "--no-session-persistence", *SETTINGS]
+        turn = [*PREFIX, "--model=haiku", "--include-partial-messages",
+                "--session-id=00000000-0000-4000-8000-000000000001", *SETTINGS]
+        self.assertIsNone(select_native(discovery))
+        self.assertEqual(select_native(turn), "00000000-0000-4000-8000-000000000001")
+        for unexpected in ([*turn, "--tools=Read"], [*turn, "--model=opus"], [*discovery, "--mcp-config=test"]):
+            with self.subTest(unexpected=unexpected), self.assertRaises(ProtocolError):
+                select_native(unexpected)
+
+    def test_claude_synthetic_rejects_mcp_and_changed_model_before_forwarding(self):
+        def request(subtype, **fields):
+            return {"type": "control_request", "request_id": "fixture", "request": {"subtype": subtype, **fields}}
+
+        validate_sdk(request("initialize"), None, 0)
+        validate_sdk(request("set_model", model="haiku"), None, 1)
+        for unexpected, position in ((request("initialize", sdkMcpServers=["unapproved"]), 0),
+                                     (request("set_model", model="opus"), 1),
+                                     (request("get_context_usage"), 1)):
+            with self.subTest(unexpected=unexpected), self.assertRaises(ProtocolError):
+                validate_sdk(unexpected, None, position)
+
     def test_launcher_has_a_side_effect_free_help_and_refuses_normal_options(self):
         with TemporaryDirectory() as home:
             for flags, exit_code in ((["--help"], 0), ([], 2), (["--synthetic-check", "-d"], 2),

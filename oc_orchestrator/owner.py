@@ -56,14 +56,15 @@ class Lifeline:
                 self.revoke = None
 
 
-def supervise(script: Path):
-    command = [sys.executable, "-IB", str(script), "_owner"]
+def supervise(script: Path, *owner_args, output=False):
+    command = [sys.executable, "-IB", str(script), "_owner", *owner_args]
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True) as owner:
         try:
             if owner.stdout.read(1) == b"R":
                 owner.stdin.write(b"S")
                 owner.stdin.flush()
-            return owner.wait()
+            code = owner.wait()
+            return (code, owner.stdout.read(1024)) if output else code
         except KeyboardInterrupt:
             owner.stdin.close()
             owner.wait()
