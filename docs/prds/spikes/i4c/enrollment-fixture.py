@@ -95,7 +95,7 @@ def serve(listener, certs, evidence, journal, generation, attempt):
                           authorize=lambda: attempt.admit_userinfo() and pending())
 
 
-def qualification_case(root, certificates, *, launch, cancel):
+def qualification_case(root, certificates, *, launch, cancel=False, expired=False):
     root.mkdir(mode=0o700)
     profile, state, broker = (root / name for name in ("profile", "state", "broker"))
     for directory in (profile, state, broker):
@@ -131,9 +131,14 @@ def qualification_case(root, certificates, *, launch, cancel):
         return "native synthetic enrollment did not complete both peer exchanges"
     if evidence != ["synthetic_token_issued", "synthetic_userinfo_completed"]:
         return "native enrollment sequence or authorization did not match"
-    fresh = launch(profile, None)
+    fresh = launch(profile, None, expired=expired)
     if fresh.returncode:
         return "could not reopen the synthetic private profile"
+    if expired:
+        if (fresh.stdout.strip() != b"NATIVE_EXPIRED_REFRESH_DENIED"
+                or journal.current() != {"generation": generation, "state": "pending"}):
+            return "expired token denial did not preserve pending"
+        return "expired"
     if fresh.stdout.strip() == b"NATIVE_RESTART_ACP_READY":
         journal.transition(generation, "ready")
         return "ready"
@@ -152,4 +157,7 @@ def qualify(directory, programs, *, launch, run_host):
     cancelled = qualification_case(directory / "interrupted", certificates, launch=launch, cancel=True)
     if cancelled != "interrupted":
         return cancelled
-    return qualification_case(directory / "enrolled", certificates, launch=launch, cancel=False)
+    expired = qualification_case(directory / "expired", certificates, launch=launch, expired=True)
+    if expired != "expired":
+        return expired
+    return qualification_case(directory / "enrolled", certificates, launch=launch)

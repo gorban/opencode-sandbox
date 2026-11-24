@@ -78,8 +78,10 @@ def public_address(family, address):
     return str(ip), PORT, 0, 0
 
 
-def resolve_token_endpoint(*, resolve=socket.getaddrinfo):
-    records = resolve(TOKEN_HOST, PORT, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+def resolve_token_endpoint(*, resolve=socket.getaddrinfo, hostname=TOKEN_HOST):
+    if hostname not in ENROLLMENT_HOSTS:
+        raise Refused()
+    records = resolve(hostname, PORT, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
     if not 1 <= len(records) <= 32:
         raise Refused()
     endpoints = []

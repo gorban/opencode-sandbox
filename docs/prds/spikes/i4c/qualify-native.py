@@ -90,7 +90,7 @@ def seed(root, agy, keyring):
     stage(agy, programs / "agy")
     for name in PINS.keys() - {"agy"}:
         stage(keyring / name, programs / name)
-    for name in ("native-fixture.py", "native-egress.py", "native-enrollment.py", "tls-admission.py"):
+    for name in ("native-fixture.py", "native-egress.py", "native-enrollment.py", "native-expiry.py", "tls-admission.py"):
         shutil.copyfile(Path(__file__).with_name(name), programs / name)
     uid, gid = os.getuid(), os.getgid()
     (config / "passwd").write_text(f"root:x:0:0:root:/root:/bin/false\nfixture:x:{uid}:{gid}:fixture:{SCRATCH}:/bin/false\n")
@@ -100,10 +100,13 @@ def seed(root, agy, keyring):
     return programs, config, work, outside
 
 
-def command(unit, programs, config, work, outside, port, interruption, *, egress=None, fake_tls=False, enroll=False):
+def command(unit, programs, config, work, outside, port, interruption, *, egress=None, fake_tls=False, enroll=False,
+            expired=False):
     mounts = [] if egress is None else ["--ro-bind", str(egress), "/run/oc-egress"]
     if enroll:
         script = [f"{NATIVE}/native-enrollment.py"]
+        if expired:
+            script.append("expired")
     elif egress is None:
         script = [f"{NATIVE}/native-fixture.py", str(outside), str(port), "cancel" if interruption else "complete"]
     else:
@@ -252,9 +255,10 @@ def prove_native_tls(root, programs, config):
 def prove_native_enrollment(root, programs, config):
     fixture = runpy.run_path(str(Path(__file__).with_name("enrollment-fixture.py")))
 
-    def launch(profile, egress, *, attempt=None):
+    def launch(profile, egress, *, attempt=None, expired=False):
         unit = f"oc-agy-fake-enroll-{secrets.token_hex(8)}.service"
-        command_line = command(unit, programs, config, profile, None, None, False, egress=egress, enroll=True)
+        command_line = command(unit, programs, config, profile, None, None, False, egress=egress, enroll=True,
+                               expired=expired)
         if attempt is not None:
             try:
                 verify_interruption(unit, command_line, profile, is_ready=attempt.userinfo_arrival.is_set,
@@ -326,6 +330,7 @@ def main():
     print("Native CONNECT matched the isolated workstation policy. Forwarding was denied.")
     print("Pinned agy sent a synthetic token POST, rejected both invalid certificates and retired an open tunnel.")
     print(f"Both fake enrollment peers matched. Cancellation preserved pending. Fresh ACP state: {enrollment_state}.")
+    print("An expired synthetic profile tried the token host. Denial left ACP unavailable and enrollment pending.")
     return 0
 
 

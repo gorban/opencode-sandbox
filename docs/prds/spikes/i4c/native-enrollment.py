@@ -3,6 +3,8 @@
 from pathlib import Path
 import runpy
 import socket
+import subprocess
+import sys
 from threading import Event, Thread
 
 
@@ -51,7 +53,7 @@ def sign_in():
     print("NATIVE_SYNTHETIC_ENROLLMENT")
 
 
-def check_restart():
+def check_restart(*, expired=False):
     home = WORK / "home"
     with NATIVE["keyring"](WORK / "restart-bus", private_environment(home), PASSWORD) as private:
         marker = NATIVE["call"](["/usr/bin/secret-tool", "lookup", *NATIVE["ATTRIBUTES"]], private)
@@ -59,6 +61,11 @@ def check_restart():
             raise ValueError("synthetic keyring item was not reopened")
         workspace = WORK / "empty"
         workspace.mkdir(mode=0o700)
+        if expired:
+            test = runpy.run_path(str(DIR / "native-expiry.py"))
+            test["check_expired"](NATIVE["call"], NATIVE["new_session"], workspace, private)
+            print("NATIVE_EXPIRED_REFRESH_DENIED")
+            return
         reply = NATIVE["new_session"](workspace, private)
     result = reply.get("result")
     if isinstance(result, dict) and isinstance(result.get("sessionId"), str) and result["sessionId"]:
@@ -72,6 +79,6 @@ if __name__ == "__main__":
         if Path("/run/oc-egress/observe.sock").is_socket():
             sign_in()
         else:
-            check_restart()
-    except (OSError, ValueError, RuntimeError):
+            check_restart(expired=sys.argv[1:] == ["expired"])
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError):
         raise SystemExit("NATIVE_SYNTHETIC_ENROLLMENT_FAILED") from None

@@ -46,6 +46,16 @@ session creation can publish readiness for that pending generation.
 An interrupted run issues the fake token, admits no userinfo request and
 keeps the generation pending until it is explicitly abandoned. Late
 publication then fails.
+An expired-profile run uses a separate synthetic registration. It confirms a
+refresh attempt at the token host through a deny-only loopback listener and
+keeps the registration pending.
+
+The offline tunnel tests own the provisional client socket through admission,
+validate its ClientHello, and use only a Unix-domain fake peer for dialing.
+They cancel during ClientHello, during fake DNS, after dial, and after a
+successful write. The recording peer sees only bytes accepted before
+revocation, with closure afterwards. A separate case verifies the token
+tunnel retires before userinfo can be admitted.
 
 The proof creates no workstation Secret Service item or real provider session.
 When host retirement is uncertain, its output identifies the retained

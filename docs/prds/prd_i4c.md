@@ -39,6 +39,9 @@ an ACP session after both fake exchanges. Cancellation after synthetic token
 issuance kept the registration pending and left the second fake peer unused.
 Attended approval must describe access to both HTTPS destinations. An opaque
 TLS tunnel cannot restrict the HTTP path on either one.
+An offline restart with an expired synthetic keyring item attempted the token
+destination, where the fixture denied it. ACP stayed unavailable and the
+registration stayed pending. Token refresh needs its own scoped route.
 
 - [ ] Qualify the pinned `agy` binary, rootless private provider home and keyring, bounded ACP
   channel, and separately scoped enrollment and execution egress. Verify the provider cannot
