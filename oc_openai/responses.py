@@ -504,11 +504,12 @@ def _decode_sse_frame(payload, event_name, evidence):
 
 
 class _SseParser:
-    def __init__(self, evidence, active, prefix, cancellation):
+    def __init__(self, evidence, active, prefix, cancellation, *, strict_terminal=False):
         self.evidence = evidence
         self.active = active
         self.prefix = prefix
         self.cancellation = cancellation
+        self.strict_terminal = strict_terminal
         self.data = []
         self.event_name = None
         self.events = 0
@@ -528,6 +529,8 @@ class _SseParser:
             self.evidence.done_seen = True
             if name is not None and (self.completed is None or name not in {b"done", b"message"}):
                 raise ConnectionError("provider_stream_named_done")
+            if self.strict_terminal and self.completed is None:
+                raise ConnectionError("provider_stream_incomplete")
             self.done = True
             return None
         frame, kind = _decode_sse_frame(payload, name, self.evidence)
@@ -543,6 +546,8 @@ class _SseParser:
 
     def _handle_other_line(self, line):
         self.evidence.line = "comment" if line.startswith(b":") else "field"
+        if self.strict_terminal and self.completed is not None and not line.startswith(b":"):
+            raise ConnectionError("provider_stream_after_terminal")
         standard_field = (
             line == b"id" or line.startswith(b"id:")
             or line == b"retry" or line.startswith(b"retry:")
@@ -556,6 +561,8 @@ class _SseParser:
             raise ConnectionError("provider_stream_event_type")
         self.event_name = line[6:].removeprefix(b" ")
         self.evidence.sse = _SSE_NAMES.get(self.event_name, "other")
+        if self.strict_terminal and self.completed is not None and self.event_name not in {b"done", b"message"}:
+            raise ConnectionError("provider_stream_after_terminal")
 
     def _feed_data_line(self, line):
         self.evidence.line = "data"
@@ -604,15 +611,26 @@ def _verify_tls_close(response, limits):
         raise ConnectionError("provider_stream_after_terminal")
 
 
+def _finalize_stream(response, parser, evidence, active, *, require_done, require_tls_close, strict_terminal):
+    if parser.data or (strict_terminal and parser.completed is None):
+        raise ConnectionError("provider_stream_incomplete")
+    if parser.completed is not None and parser.event_name is not None:
+        raise ConnectionError("provider_stream_after_terminal")
+    if require_done and not evidence.done_seen:
+        raise ConnectionError("provider_stream_incomplete")
+    if require_tls_close:
+        _verify_tls_close(response, active)
+
+
 def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None, limits=None,
-            require_done=False, require_tls_close=False):
+            require_done=False, require_tls_close=False, strict_terminal=False):
     active = _active_limits(limits)
     if require_tls_close and not response.chunked and response.length is None:
         raise ConnectionError("provider_stream_incomplete")
     prefix = _resolve_stream_prefix(
         response, cancellation, evidence, inspect_media=inspect_media, observe_media=observe_media,
     )
-    parser = _SseParser(evidence, active, prefix, cancellation)
+    parser = _SseParser(evidence, active, prefix, cancellation, strict_terminal=strict_terminal)
     first = True
     for line in _stream_lines(response, cancellation, evidence, prefix, limits=active):
         cancellation.check()
@@ -623,14 +641,10 @@ def _events(response, cancellation, evidence, *, inspect_media=False, observe_me
         frame = parser.feed(line)
         if frame is not None:
             yield frame
-    if parser.data:
-        raise ConnectionError("provider_stream_incomplete")
-    if parser.completed is not None and parser.event_name is not None:
-        raise ConnectionError("provider_stream_after_terminal")
-    if require_done and not evidence.done_seen:
-        raise ConnectionError("provider_stream_incomplete")
-    if require_tls_close:
-        _verify_tls_close(response, active)
+    _finalize_stream(
+        response, parser, evidence, active,
+        require_done=require_done, require_tls_close=require_tls_close, strict_terminal=strict_terminal,
+    )
     cancellation.check()
     if parser.completed is not None:
         yield parser.completed
@@ -719,7 +733,7 @@ class OpenAITransport:
 
     @contextlib.contextmanager
     def responses(self, body, bearer, cancellation, dispatch, *, inspect_media=False, observe_media=None,
-                  limits=None, require_done=False, require_tls_close=False):
+                  limits=None, require_done=False, require_tls_close=False, strict_terminal=False):
         active = _active_limits(limits)
         encoded = encode_responses_body(body, max_json=active.max_json)
         evidence = None
@@ -741,6 +755,7 @@ class OpenAITransport:
                     response, cancellation, evidence, inspect_media=inspect_media,
                     observe_media=observe_media, limits=active,
                     require_done=require_done, require_tls_close=require_tls_close,
+                    strict_terminal=strict_terminal,
                 )
         except ConnectionError as error:
             if evidence is not None and error.code in _STREAM_CODES:

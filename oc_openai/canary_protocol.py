@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import json
-import math
 import os
 import re
 import socket
@@ -85,7 +84,7 @@ def _check_safety_entry(key, value) -> None:
     if (low in ("is_blocked", "blocked", "flagged", "requires_review", "needs_review", "review_required")
             and value is not False
             or (low == "openai_verification_recommendation" and value != [])
-            or (low == "refusal" and value not in (None, "", False))
+            or (low == "refusal" and not (value is None or value == "" or value is False))
             or (low in ("incomplete_details", "error") and value is not None)):
         raise _SafetyRejected("safety_signal")
     _check_moderation_or_metadata(low, value)
@@ -127,7 +126,7 @@ def _validate_moderation_entry(entry) -> None:
         if val is not None and (type(val) is not str or len(val) > 256):
             raise _SafetyRejected("metadata_moderation")
     score = entry.get("score")
-    if score is not None and (type(score) not in (int, float) or not math.isfinite(score)):
+    if score is not None and (type(score) not in (int, float) or not 0 <= score <= 1):
         raise _SafetyRejected("metadata_moderation")
 
 

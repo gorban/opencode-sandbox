@@ -499,8 +499,20 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
             },
         },))
 
+        mod_huge_int_score = _ok_events(extra=({
+            "type": "response.metadata", "response_id": "resp_ok_1", "sequence_number": 1,
+            "metadata": {
+                "openai_chatgpt_moderation_metadata": {
+                    "prompt": {"outputs": [{"is_blocked": False, "score": 10**310}]},
+                },
+            },
+        },))
+
         completed_requires_review = _ok_events()
         completed_requires_review[-1] = {**completed_requires_review[-1], "requires_review": True}
+
+        completed_refusal_zero = _ok_events()
+        completed_refusal_zero[-1]["response"] = {**completed_refusal_zero[-1]["response"], "refusal": 0}
 
         refused_cases = (
             ("created_safety", created_safety),
@@ -510,7 +522,9 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
             ("completed_review_rec", completed_review_rec),
             ("mod_classifier_obj", mod_classifier_obj),
             ("mod_nonscalar_score", mod_nonscalar_score),
+            ("mod_huge_int_score", mod_huge_int_score),
             ("completed_requires_review", completed_requires_review),
+            ("completed_refusal_zero", completed_refusal_zero),
             ("in_progress_tool", in_progress_tool),
             ("annotated_completed", annotated_completed),
             ("surrogate_delta", surrogate_delta),
@@ -768,6 +782,14 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
                     },
                 },
             }),
+            ("moderation_huge_int_score", {
+                "type": "response.metadata", "response_id": "resp_ok_1", "sequence_number": 1,
+                "metadata": {
+                    "openai_chatgpt_moderation_metadata": {
+                        "prompt": {"outputs": [{"is_blocked": False, "score": 10**310}]},
+                    },
+                },
+            }),
         )
         for case_name, extra_event in cases:
             with self.subTest(case=case_name):
@@ -997,109 +1019,187 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
             server_ctx.load_cert_chain(cert_p, key_p)
         return client_ctx, server_ctx
 
+    @contextmanager
+    def _local_tls_server(self, server_ctx, wire: bytes, *, clean_tls: bool):
+        with socket.socket() as listener:
+            listener.settimeout(3)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            addrs = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", listener.getsockname())]
+
+            def serve():
+                try:
+                    raw, _ = listener.accept()
+                except OSError:
+                    return
+                with raw:
+                    raw.settimeout(3)
+                    with server_ctx.wrap_socket(raw, server_side=True) as peer:
+                        with peer.makefile("rb") as incoming:
+                            incoming.readline()
+                            size = 0
+                            while (ln := incoming.readline()) not in (b"", b"\r\n"):
+                                if ln.lower().startswith(b"content-length:"):
+                                    size = int(ln.split(b":", 1)[1].strip())
+                            incoming.read(size)
+                        peer.sendall(wire)
+                        if clean_tls:
+                            with suppress(OSError, ssl.SSLError):
+                                peer.unwrap()
+                        else:
+                            with suppress(OSError):
+                                peer.close()
+
+            t = threading.Thread(target=serve, daemon=True)
+            t.start()
+            try:
+                yield addrs
+            finally:
+                with suppress(OSError):
+                    listener.shutdown(socket.SHUT_RDWR)
+                with suppress(OSError):
+                    listener.close()
+                t.join(3)
+
     @unittest.skipUnless(importlib.util.find_spec("cryptography"), "cryptography prerequisite unavailable")
-    def test_real_tls_terminal_framing_requires_done_and_clean_close_notify(self):
-        """Enforce Rev 3 terminal contract over real local TLS: HTTP framing + [DONE] + TLS close_notify."""
+    def test_real_tls_terminal_framing_optional_done_strict_suffix_and_close_notify(self):
+        """Enforce amended canary terminal contract over real local TLS: optional [DONE], strict suffix, TLS close."""
         client_ctx, server_ctx = self._build_local_tls_contexts()
         created_evt, completed_evt = _ok_events()[0], _ok_events()[-1]
-        sse_done = (
-            f"data: {json.dumps(created_evt)}\n\n"
-            f"data: {json.dumps(completed_evt)}\n\n"
-            "data: [DONE]\n\n"
-        ).encode("ascii")
-        sse_no_done = (
-            f"data: {json.dumps(created_evt)}\n\n"
-            f"data: {json.dumps(completed_evt)}\n\n"
-        ).encode("ascii")
-        chunk_done = f"{len(sse_done):x}\r\n".encode("ascii") + sse_done + b"\r\n0\r\n\r\n"
+        c_line = f"data: {json.dumps(created_evt)}\n\n".encode("ascii")
+        ok_line = f"data: {json.dumps(completed_evt)}\n\n".encode("ascii")
+        sse_done = c_line + ok_line + b"data: [DONE]\n\n"
+        sse_no_done = c_line + ok_line
+
+        def _cl(body: bytes, trailing: bytes = b"") -> bytes:
+            return (
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body + trailing
+            )
+
+        def _chunked(body: bytes, suffix: bytes = b"\r\n0\r\n\r\n") -> bytes:
+            return (
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+                + f"{len(body):x}\r\n".encode("ascii") + body + suffix
+            )
+
         cases = (
-            ("cl_done_clean_tls",
-             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-             + f"Content-Length: {len(sse_done)}\r\n\r\n".encode("ascii") + sse_done,
-             True, True),
-            ("chunked_done_clean_tls",
-             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n" + chunk_done,
-             True, True),
-            ("missing_done_clean_tls",
-             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-             + f"Content-Length: {len(sse_no_done)}\r\n\r\n".encode("ascii") + sse_no_done,
-             True, False),
-            ("cl_done_abrupt_tls_eof",
-             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-             + f"Content-Length: {len(sse_done)}\r\n\r\n".encode("ascii") + sse_done,
-             False, False),
-            ("truncated_chunked",
-             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
-             + f"{len(sse_done):x}\r\n".encode("ascii") + sse_done + b"\r\n0\r\n",
-             True, False),
-            ("cl_same_record_trailing_bytes",
-             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-             + f"Content-Length: {len(sse_done)}\r\n\r\n".encode("ascii") + sse_done + b"SMUGGLED",
-             True, False),
-            ("chunked_same_record_trailing_bytes",
-             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
-             + chunk_done + b"SMUGGLED",
-             True, False),
-            ("close_delimited_no_framing",
-             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" + sse_done,
+            # 4 clean local-TLS cases (CL & chunked, with & without [DONE]) + comments without [DONE].
+            ("cl_with_done_clean_tls", _cl(sse_done), True, True),
+            ("cl_without_done_clean_tls", _cl(sse_no_done), True, True),
+            ("chunked_with_done_clean_tls", _chunked(sse_done), True, True),
+            ("chunked_without_done_clean_tls", _chunked(sse_no_done), True, True),
+            ("cl_without_done_comments_clean_tls", _cl(sse_no_done + b": keepalive\n\n"), True, True),
+            # Invalid suffix and framing cases on both marker-absent and marker-present paths.
+            ("early_done_unnamed", _cl(c_line + b"data: [DONE]\n\n" + ok_line), True, False),
+            ("early_done_named", _cl(c_line + b"event: done\ndata: [DONE]\n\n" + ok_line), True, False),
+            ("done_only_no_completed", _cl(c_line + b"data: [DONE]\n\n"), True, False),
+            ("duplicate_done", _cl(sse_done + b"data: [DONE]\n\n"), True, False),
+            ("second_completed_no_done", _cl(sse_no_done + ok_line), True, False),
+            ("trailing_id_field_no_done", _cl(sse_no_done + b"id: 99\n\n"), True, False),
+            ("trailing_retry_field_no_done", _cl(sse_no_done + b"retry: 1000\n\n"), True, False),
+            ("trailing_unknown_field_no_done", _cl(sse_no_done + b"foo: bar\n\n"), True, False),
+            ("trailing_event_no_done", _cl(sse_no_done + b"event: response.in_progress\n\n"), True, False),
+            ("partial_frame_eof_no_done", _cl(sse_no_done + b'data: {"type":"response.output_text.delta"}'), True, False),
+            ("cl_no_done_abrupt_tls_eof", _cl(sse_no_done), False, False),
+            ("cl_no_done_same_record_trailing_bytes", _cl(sse_no_done, b"SMUGGLED"), True, False),
+            ("chunked_no_done_truncated", _chunked(sse_no_done, b"\r\n0\r\n"), True, False),
+            ("cl_done_abrupt_tls_eof", _cl(sse_done), False, False),
+            ("cl_done_same_record_trailing_bytes", _cl(sse_done, b"SMUGGLED"), True, False),
+            ("chunked_done_same_record_trailing_bytes", _chunked(sse_done, b"\r\n0\r\n\r\nSMUGGLED"), True, False),
+            ("close_delimited_no_framing", b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" + sse_no_done,
              True, False),
         )
         for name, wire, clean_tls, should_settle in cases:
-            with self.subTest(name=name), socket.socket() as listener:
-                listener.settimeout(3)
-                listener.bind(("127.0.0.1", 0))
-                listener.listen(1)
-                addrs = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", listener.getsockname())]
-
-                def serve(lst=listener, w=wire, clean=clean_tls):
-                    raw, _ = lst.accept()
-                    with raw:
-                        raw.settimeout(3)
-                        with server_ctx.wrap_socket(raw, server_side=True) as peer:
-                            with peer.makefile("rb") as incoming:
-                                incoming.readline()
-                                size = 0
-                                while (ln := incoming.readline()) not in (b"", b"\r\n"):
-                                    if ln.lower().startswith(b"content-length:"):
-                                        size = int(ln.split(b":", 1)[1].strip())
-                                incoming.read(size)
-                            peer.sendall(w)
-                            if clean:
-                                with suppress(OSError, ssl.SSLError):
-                                    peer.unwrap()
-                            else:
-                                with suppress(OSError):
-                                    peer.close()
-
-                t = threading.Thread(target=serve, daemon=True)
-                t.start()
-                try:
-                    with (patch("oc_openai.responses._address_list", return_value=addrs),
-                          patch("oc_openai.responses.ssl.create_default_context", return_value=client_ctx)):
-                        cm = OpenAITransport().responses(
-                            canary_protocol.canonical_upstream_body("gpt-6.2-sol"),
-                            "synthetic-access", Cancellation(time.monotonic() + 3), lambda w: w(),
-                            limits=canary.CANARY_STREAM_LIMITS,
-                            require_done=True, require_tls_close=True,
-                        )
-                        if should_settle:
+            with self.subTest(name=name), self._local_tls_server(server_ctx, wire, clean_tls=clean_tls) as addrs:
+                with (patch("oc_openai.responses._address_list", return_value=addrs),
+                      patch("oc_openai.responses.ssl.create_default_context", return_value=client_ctx)):
+                    cm = OpenAITransport().responses(
+                        canary_protocol.canonical_upstream_body("gpt-6.2-sol"),
+                        "synthetic-access", Cancellation(time.monotonic() + 3), lambda w: w(),
+                        limits=canary.CANARY_STREAM_LIMITS,
+                        require_done=False, require_tls_close=True, strict_terminal=True,
+                    )
+                    if should_settle:
+                        with cm as events:
+                            out = consume_upstream_stream(
+                                events, bound_model="gpt-6.2-sol", check_alive=lambda: None,
+                            )
+                        self.assertTrue(out.allow_delivery)
+                        self.assertEqual((out.input_tokens, out.output_tokens), (11, 2))
+                    else:
+                        def _consume():
                             with cm as events:
-                                out = consume_upstream_stream(
+                                consume_upstream_stream(
                                     events, bound_model="gpt-6.2-sol", check_alive=lambda: None,
                                 )
-                            self.assertTrue(out.allow_delivery)
-                            self.assertEqual((out.input_tokens, out.output_tokens), (11, 2))
-                        else:
-                            def _consume():
-                                with cm as events:
-                                    consume_upstream_stream(
-                                        events, bound_model="gpt-6.2-sol", check_alive=lambda: None,
-                                    )
 
-                            with self.assertRaises(StreamFailure):
-                                _consume()
-                finally:
-                    t.join(3)
+                        with self.assertRaises(StreamFailure):
+                            _consume()
+
+        # Suppressed-but-settled turn without [DONE] over real local TLS: settles refused_settled, 0 client bytes.
+        mod_evt = {
+            "type": "response.metadata", "response_id": "resp_ok_1", "sequence_number": 1,
+            "metadata": {
+                "openai_chatgpt_moderation_metadata": {
+                    "prompt": {"outputs": [{"is_blocked": False, "classifier": {"requires_review": True}}]},
+                },
+            },
+        }
+        suppressed_wire = _chunked(c_line + f"data: {json.dumps(mod_evt)}\n\n".encode("ascii") + ok_line)
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with (tempfile.TemporaryDirectory(prefix="oc-canary-tls-supp-", dir=home) as tmp,
+              self._local_tls_server(server_ctx, suppressed_wire, clean_tls=True) as addrs,
+              patch("oc_openai.responses._address_list", return_value=addrs),
+              patch("oc_openai.responses.ssl.create_default_context", return_value=client_ctx)):
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            ledger = CanaryLedger(state_dir)
+            snap = ledger.preflight()
+            token = secrets.token_hex(32)
+            proof = secrets.token_bytes(32)
+
+            @contextmanager
+            def tls_upstream(body, *, before_write, deadline, cancelled):
+                def dispatch(first_write):
+                    before_write()
+                    return first_write()
+
+                with OpenAITransport().responses(
+                    body, "synthetic-access", Cancellation(deadline, cancelled), dispatch,
+                    limits=canary.CANARY_STREAM_LIMITS,
+                    require_done=False, require_tls_close=True, strict_terminal=True,
+                ) as events:
+                    yield events
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+
+            broker = canary.CanaryBroker(
+                root / "supp.sock", proof=proof, worker_token=token, bound_model="gpt-6.2-sol",
+                ledger=ledger, run_id="5" * 32, binding_hash=binding_digest("a" * 43, "b" * 43, "c" * 43),
+                history_digest=snap.digest, upstream_stream=tls_upstream,
+                fenced_client_write=lambda fn: fn(), check_alive=lambda: None, port=port,
+            )
+            broker.start()
+            try:
+                norm_instr = _MEASURED_INSTRUCTIONS_HEADER.replace("Mon Nov 23 2026", "[date]")
+                with patch.object(canary_protocol, "SYSTEM_DIGEST", hashlib.sha256(norm_instr.encode("utf-8")).hexdigest()):
+                    resp = _send_via_uds(
+                        root / "supp.sock", proof,
+                        _http_post("/v1/responses", token, _valid_inbound_payload(), port=port), port=port,
+                    )
+                self.assertEqual(resp, b"")
+                self.assertEqual(broker.delivered_bytes, 0)
+                self.assertEqual(broker.ledger_outcome, "refused_settled")
+                rec = json.loads((state_dir / CANARY_FILE).read_text())
+                self.assertEqual(rec["outcome"], "refused_settled")
+                self.assertEqual(rec["actual"], [11, 2])
+                self.assertIs(rec["delivered"], False)
+            finally:
+                broker.close()
 
     def test_mcs_categories_strict_stdout_allowlist_and_scm_rights_rejections(self):
         # MCS category pair comparison matches container_t vs container_file_t.

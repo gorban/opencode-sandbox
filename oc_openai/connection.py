@@ -1005,8 +1005,9 @@ class Connection:
             )
             options = {
                 "limits": limits,
-                "require_done": True,
+                "require_done": False,
                 "require_tls_close": True,
+                "strict_terminal": True,
             }
             if inspect_media:
                 options["inspect_media"] = True
