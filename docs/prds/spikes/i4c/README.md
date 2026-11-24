@@ -62,6 +62,9 @@ The pinned native client uses the same offline tunnel broker with fake DNS
 and Unix-only recording peers. The workstation checks that its connected
 peer belongs to the exact transient service cgroup. A separate process test
 retires the owner during resolution and confirms the late result cannot dial.
+On Fedora, the broker holds the pidfd obtained directly from the Unix socket
+through cgroup verification, admission, and retirement. The test suite also
+checks retirement during admission and a descriptor beyond `select()` limits.
 
 The proof creates no workstation Secret Service item or real provider session.
 When host retirement is uncertain, its output identifies the retained

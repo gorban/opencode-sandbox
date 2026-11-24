@@ -1,6 +1,8 @@
 """Check that revocation fences concrete Unix dials and every forwarded chunk."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+import fcntl
 import os
 from pathlib import Path
 import runpy
@@ -12,6 +14,7 @@ from tempfile import TemporaryDirectory
 from threading import Event
 import time
 import unittest
+from unittest.mock import patch
 
 
 MODULE = runpy.run_path(str(Path(__file__).with_name("offline-tunnel.py")))
@@ -152,6 +155,59 @@ class TunnelTest(unittest.TestCase):
         self.observer.setblocking(False)
         with self.assertRaises(BlockingIOError):
             self.observer.accept()
+
+    def test_owner_exit_while_validation_holds_the_socket_pidfd_refuses_admission(self):
+        owner_path = str(Path(self.scratch) / "admission-owner.sock")
+        argv = [sys.executable, "-IB", "-c", (
+            "import socket, sys; "
+            "s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); sys.stdin.buffer.read(1)"
+        ), owner_path]
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(owner_path)
+            listener.listen(1)
+            listener.settimeout(2)
+            with subprocess.Popen(argv, stdin=subprocess.PIPE) as owner:
+                try:
+                    def owner_exits(pid, *held_fd):
+                        self.assertEqual(pid, owner.pid)
+                        self.assertTrue(held_fd and MODULE["owner_alive"](held_fd[0]))
+                        owner.terminate()
+                        owner.wait(2)
+                        return True
+
+                    attempt = Attempt("fixture-admission", deadline=time.monotonic() + 3,
+                                      expected_uid=os.getuid(), verify_owner=owner_exits)
+                    self.addCleanup(attempt.revoke)
+                    client, _ = listener.accept()
+                    with client, self.assertRaises(Closed):
+                        attempt.admit(client, host=TOKEN)
+                finally:
+                    if owner.poll() is None:
+                        owner.kill()
+                        owner.wait(2)
+        self.observer.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            self.observer.accept()
+
+    def test_high_numbered_pidfd_is_admitted_and_closed_on_retirement(self):
+        original = os.pidfd_open(os.getpid())
+        try:
+            high = fcntl.fcntl(original, fcntl.F_DUPFD_CLOEXEC, 1024)
+        finally:
+            os.close(original)
+        client, caller = socket.socketpair()
+        globals_ = Attempt.admit.__globals__
+        try:
+            with client, caller, patch.dict(globals_, {"peer_pidfd": lambda _client: high}):
+                with patch.object(os, "pidfd_open", return_value=high):
+                    tunnel = self.attempt.admit(client, host=TOKEN)
+                    self.assertEqual(tunnel.pidfd, high)
+                self.attempt.revoke()
+                with self.assertRaises(OSError):
+                    os.fstat(high)
+        finally:
+            with suppress(OSError):
+                os.close(high)
 
     def test_cancel_after_dial_prevents_first_forward(self):
         tunnel, caller, hello = self.provision()

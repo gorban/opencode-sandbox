@@ -4,8 +4,8 @@ from contextlib import suppress
 import os
 from pathlib import Path
 import runpy
-import select
 import socket
+import subprocess
 from threading import Thread
 import time
 
@@ -15,27 +15,25 @@ TUNNEL = runpy.run_path(str(HERE / "offline-tunnel.py"))
 TLS = runpy.run_path(str(HERE / "tls-fixture.py"))
 
 
-def owner_in_unit(pid, unit, run_host):
-    try:
-        pidfd = os.pidfd_open(pid)
-    except OSError:
+def owner_in_unit(pid, pidfd, unit, run_host):
+    if not TUNNEL["owner_alive"](pidfd):
         return False
     try:
         group = run_host(["/usr/bin/systemctl", "--user", "show", "--property=ControlGroup", "--value", unit],
                          timeout=2)
         member = run_host(["/usr/bin/cat", f"/proc/{pid}/cgroup"], timeout=2)
-        exact = group.stdout.strip()
-        if (group.returncode or member.returncode or not exact.startswith(b"/") or
-                not exact.endswith(b"/" + unit.encode("ascii"))):
-            return False
-        return b"0::" + exact in member.stdout.splitlines() and not select.select((pidfd,), (), (), 0)[0]
-    finally:
-        os.close(pidfd)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    exact = group.stdout.strip()
+    if (group.returncode or member.returncode or not exact.startswith(b"/") or
+            not exact.endswith(b"/" + unit.encode("ascii"))):
+        return False
+    return b"0::" + exact in member.stdout.splitlines() and TUNNEL["owner_alive"](pidfd)
 
 
 def create(generation, unit, run_host):
     return TUNNEL["OfflineAttempt"](generation, deadline=time.monotonic() + 22, expected_uid=os.getuid(),
-                                    verify_owner=lambda pid: owner_in_unit(pid, unit, run_host))
+                                    verify_owner=lambda pid, fd: owner_in_unit(pid, fd, unit, run_host))
 
 
 def fake_dns(_hostname, port, **_kwargs):

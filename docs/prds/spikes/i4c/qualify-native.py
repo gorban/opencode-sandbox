@@ -283,6 +283,9 @@ def run(root, agy, keyring):
     remote_net = host(["/usr/bin/readlink", "/proc/self/ns/net"])
     if remote_net.returncode or remote_net.stdout.strip() != os.readlink("/proc/self/ns/net").encode():
         raise QualificationError("devbox and workstation do not share the test listener namespace")
+    remote_pid = host(["/usr/bin/readlink", "/proc/self/ns/pid"])
+    if remote_pid.returncode or remote_pid.stdout.strip() != os.readlink("/proc/self/ns/pid").encode():
+        raise QualificationError("devbox and workstation do not share the peer identity namespace")
     with socket.socket() as listener, socket.socket(socket.AF_UNIX) as private_socket:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)

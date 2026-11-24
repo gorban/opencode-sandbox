@@ -20,6 +20,8 @@ TLS = runpy.run_path(str(HERE / "tls-admission.py"))
 PHASES = (POLICY["TOKEN_HOST"], POLICY["USERINFO_HOST"])
 CONNECT_PENDING = (0, errno.EINPROGRESS, errno.EAGAIN, errno.EALREADY)
 CHUNK_SIZE = 8192
+# Linux asm-generic/socket.h, also on Fedora's x86-64 kernel when Python omits it.
+SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", 77)
 
 
 class AttemptClosed(RuntimeError):
@@ -44,6 +46,16 @@ def retire_socket(peer):
     with suppress(OSError):
         peer.shutdown(socket.SHUT_RDWR)
     peer.close()
+
+
+def peer_pidfd(client):
+    return struct.unpack("i", client.getsockopt(socket.SOL_SOCKET, SO_PEERPIDFD, struct.calcsize("i")))[0]
+
+
+def owner_alive(pidfd):
+    poll = select.poll()
+    poll.register(pidfd, select.POLLIN)
+    return not poll.poll(0)
 
 
 class OfflineAttempt:
@@ -72,7 +84,7 @@ class OfflineAttempt:
     def _require(self, tunnel):
         if not self._available() or tunnel is not self._active or tunnel.generation != self.generation:
             raise AttemptClosed("the enrollment attempt is closed")
-        if select.select((tunnel.pidfd,), (), (), 0)[0]:
+        if not owner_alive(tunnel.pidfd):
             self._revoke()
             raise AttemptClosed("the enrollment owner retired")
 
@@ -82,19 +94,24 @@ class OfflineAttempt:
         peer = client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
         pid, uid, _gid = struct.unpack("3i", peer)
         expected_pid, expected_uid = self.expected_peer
-        verified = pid > 0 and uid == expected_uid
-        if verified:
-            verified = pid == expected_pid if self.verify_owner is None else self.verify_owner(pid)
-        with self._lock:
-            if (not self._available() or self._active is not None or self._phase >= len(PHASES)
-                    or host != PHASES[self._phase] or not verified):
-                raise AttemptClosed("the peer or enrollment slot is unavailable")
-            pidfd = os.pidfd_open(pid)
-            if select.select((pidfd,), (), (), 0)[0]:
+        if pid <= 0 or uid != expected_uid:
+            raise AttemptClosed("the peer or enrollment slot is unavailable")
+        pidfd = peer_pidfd(client)
+        try:
+            os.set_inheritable(pidfd, False)
+            verified = pid == expected_pid if self.verify_owner is None else self.verify_owner(pid, pidfd)
+            with self._lock:
+                if (not self._available() or self._active is not None or self._phase >= len(PHASES)
+                        or host != PHASES[self._phase] or not verified):
+                    raise AttemptClosed("the peer or enrollment slot is unavailable")
+                if not owner_alive(pidfd):
+                    raise AttemptClosed("the enrollment owner retired")
+                self._active = PendingTunnel(self.generation, host, client, pidfd)
+                pidfd = None
+                return self._active
+        finally:
+            if pidfd is not None:
                 os.close(pidfd)
-                raise AttemptClosed("the enrollment owner retired")
-            self._active = PendingTunnel(self.generation, host, client, pidfd)
-            return self._active
 
     def hello(self, tunnel, *, authorize=None):
         POLICY["read_connect"](tunnel.client, hostname=tunnel.host, timeout=min(TLS["remaining"](self.deadline), 2))
