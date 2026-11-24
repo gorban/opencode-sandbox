@@ -25,7 +25,12 @@ explicit signed-out ACP v1, workstation file and socket denial, and cancellation
 on the pinned `agy` 1.5.15 build. The same probe also sent a native
 `CONNECT oauth2.googleapis.com:443` from private loopback to the workstation
 policy over a dedicated Unix socket. The fixture denied forwarding before any
-upstream exchange. Forwarding qualification and sign-in remain open.
+upstream exchange. A separate synthetic TLS phase admitted only the exact
+visible ClientHello server name and forwarded to a local fake peer. The pinned
+client sent a synthetic token POST with a trusted, matching certificate,
+rejected the wrong hostname and untrusted certificate, and closed an open
+tunnel on cancellation. Real destination-limited forwarding, persistent
+enrollment and sign-in remain open.
 
 - [ ] Qualify the pinned `agy` binary, rootless private provider home and keyring, bounded ACP
   channel, and separately scoped enrollment and execution egress. Verify the provider cannot

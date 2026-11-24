@@ -90,7 +90,7 @@ def seed(root, agy, keyring):
     stage(agy, programs / "agy")
     for name in PINS.keys() - {"agy"}:
         stage(keyring / name, programs / name)
-    for name in ("native-fixture.py", "native-egress.py"):
+    for name in ("native-fixture.py", "native-egress.py", "tls-admission.py"):
         shutil.copyfile(Path(__file__).with_name(name), programs / name)
     uid, gid = os.getuid(), os.getgid()
     (config / "passwd").write_text(f"root:x:0:0:root:/root:/bin/false\nfixture:x:{uid}:{gid}:fixture:{SCRATCH}:/bin/false\n")
@@ -100,12 +100,14 @@ def seed(root, agy, keyring):
     return programs, config, work, outside
 
 
-def command(unit, programs, config, work, outside, port, interruption, *, egress=None):
+def command(unit, programs, config, work, outside, port, interruption, *, egress=None, fake_tls=False):
     mounts = [] if egress is None else ["--ro-bind", str(egress), "/run/oc-egress"]
     if egress is None:
         script = [f"{NATIVE}/native-fixture.py", str(outside), str(port), "cancel" if interruption else "complete"]
     else:
         script = [f"{NATIVE}/native-egress.py"]
+        if fake_tls:
+            script.append("synthetic-tls")
     return ["/usr/bin/systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect",
             f"--unit={unit}", "--property=KillMode=control-group", "--property=RuntimeMaxSec=25s",
             "--property=TimeoutStopSec=3s", "--property=NoNewPrivileges=yes", "--expand-environment=no", "--",
@@ -162,7 +164,7 @@ def verify_interruption(unit, launch, work):
                 break
             time.sleep(.05)
         else:
-            raise QualificationError("could not observe the live private keyring before cancellation")
+            raise QualificationError("could not observe the qualification service ready for cancellation")
     except KeyboardInterrupt as error:
         if not observed:
             raise RetirementUnknown("the launch receipt was interrupted") from error
@@ -220,6 +222,22 @@ def prove_native_connect(root, programs, config):
             raise QualificationError("workstation policy receipt did not match the measured OAuth host")
 
 
+def prove_native_tls(root, programs, config):
+    fixture = runpy.run_path(str(Path(__file__).with_name("tls-fixture.py")))
+
+    def launch(profile, egress, *, cancel):
+        unit = f"oc-agy-fake-tls-{secrets.token_hex(8)}.service"
+        command_line = command(unit, programs, config, profile, None, None, False, egress=egress, fake_tls=True)
+        if cancel:
+            verify_interruption(unit, command_line, profile)
+            return None
+        return run_to_completion(unit, command_line)
+
+    failed_case = fixture["qualify"](root, programs, launch=launch, run_host=host)
+    if failed_case:
+        raise QualificationError(f"native client certificate test did not confirm {failed_case}")
+
+
 def run(root, agy, keyring):
     programs, config, work, outside = seed(root, agy, keyring)
     remote_net = host(["/usr/bin/readlink", "/proc/self/ns/net"])
@@ -235,6 +253,7 @@ def run(root, agy, keyring):
             launch = command(unit, programs, config, work, outside, listener.getsockname()[1], interruption)
             verify(unit, launch, work)
     prove_native_connect(root, programs, config)
+    prove_native_tls(root, programs, config)
 
 
 def interrupt(_number, _frame):
@@ -269,6 +288,7 @@ def main():
             shutil.rmtree(directory)
     print("Rootless isolation, synthetic keyring restart, signed-out ACP and cancellation passed.")
     print("Native CONNECT matched the isolated workstation policy. Forwarding was denied.")
+    print("Pinned agy sent a synthetic token POST, rejected both invalid certificates and retired an open tunnel.")
     return 0
 
 
