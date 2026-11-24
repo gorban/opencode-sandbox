@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance test for parallel instances, port mapping, per-instance Postgres, docker-in-docker and
-# worktrees, against the REAL host (Podman, Wayland, SELinux): two Chromium windows open for a while.
+# worktrees, against the real host (Podman, SELinux and headless Chromium).
 # Creates instances ptest1/ptest2 and $SB/.oc-ptest-repo, and removes them again (also on failure).
 # Run through tests/parallel-isolated.py; direct execution is refused.
 set -uo pipefail
@@ -37,6 +37,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [[ ${OC_CHROMIUM_MODE:-} == wayland ]]; then
+  echo "Wayland smoke: one visible Chromium window"
+  "$OCS" -n -K -i ptest1 > "$T/wayland.log" 2>&1 || {
+    tail -n 80 "$T/wayland.log"; exit 1;
+  }
+  for _ in $(seq 1 15); do
+    if host_podman exec oc-ptest1-chromium curl -sf --max-time 2 http://127.0.0.1:9222/json/list \
+        | grep -F '"title": "oc ptest1"' >/dev/null; then
+      echo "Wayland Chromium and its named DevTools tab verified."
+      exit 0
+    fi
+    sleep 1
+  done
+  echo "Wayland Chromium's expected DevTools tab did not appear" >&2
+  exit 1
+fi
+[[ ${OC_CHROMIUM_MODE:-} == headless ]] || { echo "Missing isolated Chromium mode" >&2; exit 2; }
+
 echo "prepare: test repository inside the sandbox (with a hook that must NOT run)"
 OC_PTEST_INBOX_IMAGE=docker.io/alpine/git:latest inbox 'test -d /sandbox' || { echo "bootstrap container or sandbox mount failed" >&2; exit 1; }
 OC_PTEST_INBOX_IMAGE=docker.io/alpine/git:latest inbox 'd=$(mktemp -d "${TMPDIR:-/tmp}/oc-git-check.XXXXXX") || exit 1; trap '\''rm -rf "$d"'\'' EXIT; mkdir "$d/repo" || exit 1; git -C "$d/repo" init -q || exit 1; git -C "$d/repo" -c user.name=Test -c user.email=test@example.invalid -c core.hooksPath=/dev/null commit --allow-empty -qm init || exit 1; git -C "$d/repo" -c core.hooksPath=/dev/null worktree add -q --relative-paths -b oc-test "$d/wt" || exit 1; IFS= read -r link < "$d/wt/.git" || exit 1; case "$link" in "gitdir: ../repo/.git/worktrees/"*) ;; *) exit 1;; esac' || { echo "could not verify bootstrap Git relative-worktree support" >&2; exit 1; }
@@ -55,8 +73,8 @@ EOF
   printf "#!/bin/sh\ntouch /sandbox/.oc-ptest-repo/HOOK-RAN\n" > .git/hooks/post-checkout; chmod +x .git/hooks/post-checkout' || { echo "repository preparation failed" >&2; exit 1; }
 
 echo "setup: two instances (each: own pod, Chromium, Postgres; ptest1 also docker-in-docker)"
-"$OCS" -n -i ptest1 -P 18181:3000 -p -D -W .oc-ptest-repo > "$T/ptest1.log" 2>&1 & setup1=$!
-"$OCS" -n -i ptest2 -P 18182:3000,18192:80 -p -W .oc-ptest-repo:other > "$T/ptest2.log" 2>&1 & setup2=$!
+"$OCS" -n -K -i ptest1 -P 18181:3000 -p -D -W .oc-ptest-repo > "$T/ptest1.log" 2>&1 & setup1=$!
+"$OCS" -n -K -i ptest2 -P 18182:3000,18192:80 -p -W .oc-ptest-repo:other > "$T/ptest2.log" 2>&1 & setup2=$!
 wait "$setup1"; r1=$?; wait "$setup2"; r2=$?
 check "shared agent image built once" [ "$(grep -hcF '==> Building oc-agent' "$T/ptest1.log" "$T/ptest2.log" | awk '{n+=$1} END{print n+0}')" -eq 1 ]
 check "shared Chromium image built once" [ "$(grep -hcF '==> Building oc-chromium' "$T/ptest1.log" "$T/ptest2.log" | awk '{n+=$1} END{print n+0}')" -eq 1 ]
@@ -75,7 +93,7 @@ check "repository hooks did not run"     inbox '[ ! -e .oc-ptest-repo/HOOK-RAN ]
 
 echo "real agents, launched in parallel (pseudo-terminals)"
 for i in ptest1 ptest2; do
-  ( exec script -qec "$OCS -i $i" /dev/null >$T/$i.agent.log 2>&1 ) & sleep 1
+  ( exec script -qec "$OCS -K -i $i" /dev/null >$T/$i.agent.log 2>&1 ) & sleep 1
 done
 for _ in $(seq 1 60); do
   [[ $(host_podman container inspect -f '{{.State.Status}}' oc-ptest1-agent 2>/dev/null) == running &&
@@ -103,7 +121,20 @@ check "host :18182 -> ptest2"            [ "$("${H[@]}" curl -s -m 3 127.0.0.1:1
 check "host cannot reach pod port 3000 directly" ! "${H[@]}" curl -s -m 2 127.0.0.1:3000
 lan=$("${H[@]}" sh -c "ip -4 -o route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p'")
 check "mapped port not on the LAN ($lan)" ! "${H[@]}" curl -s -m 2 "$lan:18181"
+headless_configuration() {
+  host_podman container inspect "$1" | python3 -c '
+import json, sys
+browser, = json.load(sys.stdin)
+env = {item.split("=", 1)[0] for item in browser["Config"]["Env"]}
+mounts = {item["Destination"] for item in browser["Mounts"]}
+valid = ("--headless" in browser["Config"]["Cmd"] and mounts == {"/profile"}
+         and not browser["HostConfig"].get("Devices")
+         and not env & {"DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"})
+raise SystemExit(0 if valid else 1)
+'
+}
 for i in ptest1 ptest2; do
+  check "$i Chromium has no display or hardware device exposure" headless_configuration "oc-$i-chromium"
   host_podman exec "oc-$i-chromium" curl -s -X PUT "http://127.0.0.1:9222/json/new?http://127.0.0.1:3000/" >/dev/null
 done; sleep 3
 check "ptest1 Chromium loads its own app" sh -c "${H[*]} podman exec oc-ptest1-chromium curl -s 127.0.0.1:9222/json/list | grep -q '\"title\": \"instance ptest1\"'"
@@ -134,12 +165,15 @@ check "ptest2 has no docker"             ! agent_shell ptest2 'docker version'
 echo "management"
 "$OCS" -l > $T/ptest.list 2>&1
 check "-l lists both with ports"         sh -c "grep -q '^ptest1 .*18181->3000' $T/ptest.list && grep -q '^ptest2 .*18182->3000,18192->80' $T/ptest.list"
-"$OCS" -n -i ptest1 -P 18183:3000 > $T/ptest.refuse 2>&1; rc=$?
+"$OCS" -n -K -i ptest1 -P 18183:3000 > $T/ptest.refuse 2>&1; rc=$?
 check "port change refused while agent runs" sh -c "[ $rc -ne 0 ] && grep -q 'OpenCode is running' $T/ptest.refuse"
-"$OCS" -n -i ptest2 > $T/ptest.rerun 2>&1; rc=$?
+chrome_before=$(host_podman container inspect --format '{{.Id}}' oc-ptest2-chromium)
+"$OCS" -n -K -i ptest2 > $T/ptest.rerun 2>&1; rc=$?
 check "rerun without -P keeps the mapping" sh -c "[ $rc -eq 0 ] && ${H[*]} curl -s -m 3 127.0.0.1:18182 | grep -q ptest2"
+check "rerun keeps the headless Chromium container" bash -c '[[ -n $1 && $1 == "$2" ]]' fixture \
+  "$chrome_before" "$(host_podman container inspect --format '{{.Id}}' oc-ptest2-chromium)"
 host_podman stop -t 2 oc-ptest1-agent >/dev/null 2>&1
-"$OCS" -n -i ptest1 -P 18183:3000 > $T/ptest.change 2>&1; rc=$?
+"$OCS" -n -K -i ptest1 -P 18183:3000 > $T/ptest.change 2>&1; rc=$?
 check "port change after agent exits"    [ $rc -eq 0 ]
 check "...keeps Postgres data"           [ "$(postgres_query ptest1 "select to_regclass('only_in_ptest1') is not null")" = t ]
 check "...keeps docker-in-docker"        [ "$(host_podman container inspect -f '{{.State.Status}}' oc-ptest1-dind 2>/dev/null)" = running ]

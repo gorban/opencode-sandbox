@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from unittest.mock import patch
 
 MODULE = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).with_name('parallel-isolated.py')).resolve()
 REPO = Path(__file__).resolve().parent.parent
@@ -31,7 +32,7 @@ def empty_mount_host(args, **kwargs):
     return subprocess.CompletedProcess(args,0,out,b'')
 
 
-def environment(distro):
+def environment(distro, desktop=False):
     m = load()
     m.fresh_ports = lambda: ['41001', '41002', '41003', '41004']
     with tempfile.TemporaryDirectory() as td:
@@ -47,7 +48,10 @@ def environment(distro):
             os.environ['CONTAINER_ID'] = 'test'
         else:
             os.environ.pop('CONTAINER_ID', None)
-        env = m.prepare(base, runtime_base, 'policy\n', base/'unused-socket', 'wayland-0')
+        wayland = base/'unused-socket' if desktop else None
+        with patch.dict(os.environ, {'DISPLAY': ':99', 'WAYLAND_DISPLAY': 'desktop-fixture',
+                                     'DBUS_SESSION_BUS_ADDRESS': 'fixture', 'OC_CHROMIUM_MODE': 'wayland'}):
+            env = m.prepare(base, runtime_base, 'policy\n', wayland)
         sandbox = base/'home/opencode-sandbox'
         assert sandbox.is_dir() and not sandbox.is_symlink()
         assert sandbox.stat().st_mode & 0o777 == 0o755
@@ -66,8 +70,45 @@ def environment(distro):
         assert got['XDG_RUNTIME_DIR'] == str(runtime_base/'xdg')
         assert got['TMPDIR'] == str(runtime_base/'tmp')
         assert 'runroot="'+str(runtime_base/'runroot')+'"' in (base/'storage.conf').read_text()
-        assert (runtime_base/'xdg/wayland-0').is_symlink()
+        assert 'DISPLAY' not in env and 'DBUS_SESSION_BUS_ADDRESS' not in env
+        if desktop:
+            assert env['OC_CHROMIUM_MODE'] == 'wayland' and env['WAYLAND_DISPLAY'] == wayland.name
+            assert (runtime_base/'xdg'/wayland.name).readlink() == wayland
+            verify_desktop_smoke(base, backend, env)
+        else:
+            assert env['OC_CHROMIUM_MODE'] == 'headless' and 'WAYLAND_DISPLAY' not in env
+            assert not list((runtime_base/'xdg').iterdir())
         print(('distrobox' if distro else 'native') + ' backend environment isolated')
+
+
+def verify_desktop_smoke(base, backend, env):
+    source = base/'source'
+    (source/'oc-sandbox').write_text('#!/bin/sh\ntest "$*" = "-n -K -i ptest1"\n')
+    backend.write_text('''#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in --*=*) shift;; *) break;; esac
+done
+test "$*" = 'exec oc-ptest1-chromium curl -sf --max-time 2 http://127.0.0.1:9222/json/list' || exit 1
+printf '%s\\n' '[{"title": "oc ptest1"}]'
+''')
+    result = subprocess.run(['/usr/bin/bash', str(source/'tests/parallel.sh')], env=env,
+                            text=True, capture_output=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    assert 'Wayland Chromium and its named DevTools tab verified.' in result.stdout
+
+
+def headless_preflight():
+    m = load()
+    m.run_host = empty_mount_host
+    with tempfile.TemporaryDirectory() as td:
+        with patch.dict(os.environ, {'XDG_RUNTIME_DIR': td, 'WAYLAND_DISPLAY': '/untrusted/socket'}):
+            assert m.host_preflight(False) == (Path(td), None)
+            try:
+                m.host_preflight(True)
+            except RuntimeError as error:
+                assert 'WAYLAND_DISPLAY' in str(error)
+            else:
+                raise AssertionError('unsafe explicit Wayland socket accepted')
 
 
 def child_mode(marker, result):
@@ -108,7 +149,7 @@ def interrupted(sig, distro):
         env=os.environ.copy()
         if distro: env['CONTAINER_ID']='test'
         else: env.pop('CONTAINER_ID',None)
-        proc = subprocess.Popen([sys.executable, __file__, str(MODULE), '--child', str(marker), str(result)],env=env)
+        proc = subprocess.Popen([sys.executable, '-B', __file__, str(MODULE), '--child', str(marker), str(result)],env=env)
         pid = None; worker_fd = None; parent_fd = None
         try:
             for _ in range(100):
@@ -361,13 +402,13 @@ esac
         print('bootstrap Git capability checked in a cleaned temporary repository')
 
 
-def interruption_cleanup(distro):
+def interruption_cleanup(distro, *, smoke_timeout=False):
     m = load()
     with tempfile.TemporaryDirectory() as td:
         base=Path(td)/'private'; base.mkdir(); calls=[]
         runtime_base=Path(td)/'runtime-private'; runtime_base.mkdir()
         m.preflight=lambda: 'policy'
-        m.host_preflight=lambda: (Path(td)/'unused','wayland-0')
+        m.host_preflight=lambda desktop: (Path(td), Path(td)/'unused' if desktop else None)
         def prepare_fixture(*args):
             (base/'store').mkdir(mode=0o700)
             return {}
@@ -379,18 +420,27 @@ def interruption_cleanup(distro):
             info=Path(args[-1]).stat()
             return subprocess.CompletedProcess(args,0,('%s:%s:%s' % (info.st_dev,info.st_ino,info.st_uid)).encode(),b'')
         m.run_host=host_fixture
-        m.supervised_suite=lambda *a,**kw: (143,True,True)
+        real_supervise = m.supervised_suite
+
+        def timeout_fixture(_command, _env, *, timeout):
+            assert timeout == 480
+            child = [sys.executable, '-IB', '-c', 'import time; time.sleep(30)']
+            return real_supervise(child, os.environ.copy(), timeout=.05, grace=1)
+
+        m.supervised_suite = timeout_fixture if smoke_timeout else lambda *a, **kw: (143, True, True)
         m.cleanup=lambda *a: calls.append('cleanup')
         m.subprocess.run=lambda *a,**kw: subprocess.CompletedProcess([],0,str(base/'store')+'|'+str(runtime_base/'runroot')+'|vfs','')
         old_argv=sys.argv; old_container=os.environ.get('CONTAINER_ID')
         try:
-            sys.argv=['runner','--run']
+            sys.argv = ['runner', '--run', '--wayland'] if smoke_timeout else ['runner', '--run']
             if distro: os.environ['CONTAINER_ID']='test'
             else: os.environ.pop('CONTAINER_ID',None)
             rc=m.main()
             assert calls == ([] if distro else ['cleanup'])
-            assert rc == 143
-            print(('distrobox retains store' if distro else 'native cleans store')+' after interruption')
+            assert rc == (124 if smoke_timeout else 143)
+            assert base.is_dir() and runtime_base.is_dir()
+            reason = 'Wayland timeout' if smoke_timeout else 'interruption'
+            print(('distrobox retains store' if distro else 'native cleans store') + f' after {reason}')
         finally:
             sys.argv=old_argv
             m.tempfile.mkdtemp=old_mkdtemp; m.subprocess.run=old_run
@@ -403,6 +453,8 @@ if '--child' in sys.argv:
 case = sys.argv[2] if len(sys.argv) > 2 else 'all'
 if case in ('all', 'native'): environment(False)
 if case in ('all', 'distrobox'): environment(True)
+if case in ('all', 'desktop'): environment(False, desktop=True)
+if case in ('all', 'headless_preflight'): headless_preflight()
 if case in ('all', 'sigint'):
     for route in (False, True): interrupted(signal.SIGINT, route)
 if case in ('all', 'sigterm'):
@@ -416,3 +468,5 @@ if case in ('all', 'namespace_mount'): namespace_mount_guard()
 if case in ('all', 'bootstrap'): bootstrap_git()
 if case in ('all', 'retention'):
     for route in (False, True): interruption_cleanup(route)
+if case in ('all', 'wayland_timeout'):
+    for route in (False, True): interruption_cleanup(route, smoke_timeout=True)
