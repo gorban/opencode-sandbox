@@ -310,7 +310,6 @@ class CanaryLedgerTests(unittest.TestCase):
         self.ledger.reserve(prior_run, self.binding, MODEL, snap.digest)
         prior_path = self.state / CANARY_FILE
         prior_bytes = prior_path.read_bytes()
-        prior_stat = prior_path.stat()
         prior_digest = hashlib.sha256(prior_bytes).hexdigest()
         pinned = (prior_run, prior_digest)
 

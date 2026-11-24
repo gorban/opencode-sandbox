@@ -98,6 +98,7 @@ def _closed_diagnostic(exc: Exception) -> str:
 
 
 _UNSUPPORTED_ARGS = "unsupported canary arguments"
+_RELAY_SOCK = "provider.sock"
 
 
 @dataclass(frozen=True)
@@ -654,7 +655,7 @@ def _execute_canary_session(
                 yield events
 
         broker = CanaryBroker(
-            root / "relay" / "provider.sock",
+            root / "relay" / _RELAY_SOCK,
             CanaryBrokerConfig(
                 proof=proof,
                 worker_token=worker_token,
@@ -813,7 +814,7 @@ def run_synthetic_check(terminal: Terminal, *, requested_model: str | None = Non
                 yield _synthetic_upstream_events(body)
 
             broker = CanaryBroker(
-                root / "relay" / "provider.sock",
+                root / "relay" / _RELAY_SOCK,
                 CanaryBrokerConfig(
                     proof=proof,
                     worker_token=worker_token,
@@ -925,7 +926,7 @@ def run_live_canary_e2e(
                     yield events
 
             broker = CanaryBroker(
-                root / "relay" / "provider.sock",
+                root / "relay" / _RELAY_SOCK,
                 CanaryBrokerConfig(
                     proof=proof,
                     worker_token=worker_token,
