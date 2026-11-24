@@ -39,4 +39,38 @@ workstation file and socket. Enrollment and the brokered native route still need
 - [ ] Record sign-in and reuse evidence. Review the exact route, host tool boundary, provider
   scope and first live prompt separately before enabling Antigravity in a managed worker.
 
+### Attended enrollment walkthrough
+
+The offline command will use the pinned client, a disposable outer keyring
+and two local TLS peers. Its approval binds one attempt to the registration,
+the client build and the ordered destinations `oauth2.googleapis.com:443`
+and `www.googleapis.com:443`. Each destination gets one tunnel. The operator
+can approve any HTTPS path on those destinations during enrollment. Methods
+and paths are encrypted.
+
+The foreground terminal displays a validated native Google link and accepts
+a code with echo disabled. Browser launch, recording and agent output are
+absent from this path. Loss of the terminal before submission cancels the
+attempt. Native sign-in uses an empty workspace and only the isolated profile
+and keyring.
+
+Pinned `agy` 1.5.15 emitted the measured Google authorization URL and
+Antigravity callback in an offline launcher. The foreground component accepted
+that link shape. A synthetic controlling terminal verified hidden input, echo
+restoration and cancellation when the terminal detached before paste.
+
+The supervisor records a pending generation before creating the unlock item
+or opening egress. The attempt has independent revocation, and cancellation
+can close its sockets while the registration remains pending. The offline
+test cancels after token issuance but before userinfo forwarding and verifies
+no second-peer bytes, exact service retirement and the same pending generation.
+
+A fresh process must select exactly one existing unlock item for that
+registration in the trusted collection. Missing, locked or duplicate items
+leave it pending. The unlock pipe closes before the client starts.
+Readiness requires only ACP `initialize` and `session/new` with enrollment
+egress gone, then a generation check before publication. An expired item
+that cannot refresh stays pending. A fresh attended retry requires an
+explicit signed-out result.
+
 [Antigravity ACP authentication](https://antigravity.google/docs/ide/extensions/acp/#authentication)

@@ -47,6 +47,7 @@ def script(name, path, *interpreter, unittest=False, stub_security=False):
 SUITES = (
     discover('Controller core', 'test_controller_core.py'),
     discover('Bridge merge core', 'bridge_merge_core.py'),
+    discover('Antigravity foreground handoff', 'test_antigravity_tty.py'),
     script('Launcher and setup lifecycle', 'tests/setup-lifecycle.py', 'python3', '-B', unittest=True),
     script('Host state leaves', 'tests/host_state_leaves.py', 'python3', '-B'),
     script('Worktree shell', 'tests/worktrees.sh', 'bash'),
@@ -76,6 +77,7 @@ PYTHON_FILES = (
     'oc-opencode-supervisor.py',
     'oc-opencode-update.py',
     'oc-setup-lock.py',
+    'oc_antigravity_tty.py',
     'oc_bridge_merge.py',
     'oc_controller.py',
     'tests/bridge_merge_core.py',
@@ -84,6 +86,7 @@ PYTHON_FILES = (
     'tests/parallel-isolated.py',
     'tests/postgres-host-real.py',
     'tests/setup-lifecycle.py',
+    'tests/test_antigravity_tty.py',
     'tests/test_ci.py',
     'tests/test_ci_supervisor.py',
     'tests/test_ci_toolchain.py',
