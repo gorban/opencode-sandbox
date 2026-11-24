@@ -328,19 +328,25 @@ class OpenAICommandTests(unittest.TestCase):
             stderr = os.fdopen(os.dup(2), "w", buffering=1)
             try:
                 terminal = StreamTerminal(stdin, stdout, stderr)
-                assert terminal.attended()
+                if not terminal.attended():
+                    raise RuntimeError("expected controlling terminal to be attended")
                 with os.fdopen(master) as master_side:
-                    assert not StreamTerminal(master_side, stdout, stderr).attended()
-                    assert not StreamTerminal(stdin, master_side, stderr).attended()
+                    if StreamTerminal(master_side, stdout, stderr).attended():
+                        raise RuntimeError("master stdin must not be attended")
+                    if StreamTerminal(stdin, master_side, stderr).attended():
+                        raise RuntimeError("master stdout must not be attended")
                 with os.fdopen(other_slave) as other:
-                    assert not StreamTerminal(stdin, other, stderr).attended()
-                    assert not StreamTerminal(other, other, stderr).attended()
+                    if StreamTerminal(stdin, other, stderr).attended():
+                        raise RuntimeError("foreign tty stdout must not be attended")
+                    if StreamTerminal(other, other, stderr).attended():
+                        raise RuntimeError("foreign tty must not be attended")
                 for detach in (os.setsid, lambda: os.setpgid(0, 0)):
                     subchild = os.fork()
                     if subchild == 0:
                         detach()
                         os._exit(1 if terminal.attended() else 0)
-                    assert os.waitpid(subchild, 0)[1] == 0
+                    if os.waitpid(subchild, 0)[1] != 0:
+                        raise RuntimeError("detached child reported attended")
                 first = terminal.confirm("First?")
                 second = terminal.confirm("Second?")
                 terminal.write(f"Approvals: {first} {second}")

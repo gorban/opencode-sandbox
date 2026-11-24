@@ -110,6 +110,14 @@ def _run_driver(root, home, *, recovery=None, recovery_source=None):
         )
 
 
+def _run_checked_driver(case, recovery, source):
+    try:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
+        return _run_driver(case.parents[3], home, recovery=recovery, recovery_source=source)
+    except (KeyError, OSError, ValueError):
+        return None
+
+
 def test_attended_openai_route(request):
     import pytest
 
@@ -130,10 +138,8 @@ def test_attended_openai_route(request):
     case = Path(__file__).resolve(strict=True)
     if [Path(arg).resolve() for arg in request.config.args] != [case]:
         pytest.fail("Select this one test file for an attended live run.", pytrace=False)
-    try:
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
-        result = _run_driver(case.parents[3], home, recovery=next(iter(recovery), None), recovery_source=source)
-    except (KeyError, OSError, ValueError):
+    result = _run_checked_driver(case, next(iter(recovery), None), source)
+    if result is None:
         pytest.fail("The reviewed workstation proof source is unavailable.", pytrace=False)
     if result == 130:
         raise KeyboardInterrupt

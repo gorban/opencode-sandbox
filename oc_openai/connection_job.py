@@ -14,7 +14,7 @@ from .managed.relay import grant_record
 from .managed.runtime import JobRuntimeError, check_devbox, host_output
 
 
-_TEMP = "/tmp"
+_TEMP = "/tmp"  # NOSONAR(S5443) — validated with O_DIRECTORY|O_NOFOLLOW and exact inode pinning
 _LEAF = re.compile(r"oc-(?:i4a|chat)-[a-z0-9_]{8}")
 _INCARNATION = re.compile(r"inc_[0-9a-f]{32}")
 _BOOT_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")

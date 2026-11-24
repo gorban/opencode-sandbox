@@ -116,35 +116,39 @@ def _use(record):
     return actual is None or (type(actual) is list and len(actual) == 2 and all(map(_is_usage, actual)))
 
 
+def _validate_record(record, seen, previous, *, first):
+    if type(record) is not dict or set(record) != {
+        "run", "binding", "phase", "max_input", "max_output", "actual",
+    }:
+        raise ValueError
+    phase = Phase(record["phase"])
+    slot = Slot(record["run"], record["binding"], phase)
+    if (not _valid_slot(slot) or type(record["max_input"]) is not int
+            or type(record["max_output"]) is not int or record["max_input"] != _INPUT_LIMIT
+            or record["max_output"] != _OUTPUT_LIMIT or not _use(record)):
+        raise ValueError
+    if previous is not None and (previous["actual"] is None or _overage(previous["actual"])):
+        raise ValueError
+    if phase is Phase.ORCHESTRATOR:
+        if first is not Phase.ORCHESTRATOR or slot.run_id in seen:
+            raise ValueError
+        seen.add(slot.run_id)
+    elif previous is None:
+        if phase is not first:
+            raise ValueError
+    elif (previous["run"], previous["binding"], previous["phase"]) != (
+        slot.run_id, slot.binding, _PRECEDING[phase].value,
+    ):
+        raise ValueError
+
+
 def _validate(records, *, first=Phase.ORCHESTRATOR):
     if type(records) is not list or len(records) > _MAX_SLOTS:
         raise ValueError
     seen = set()
     previous = None
     for record in records:
-        if type(record) is not dict or set(record) != {
-            "run", "binding", "phase", "max_input", "max_output", "actual",
-        }:
-            raise ValueError
-        phase = Phase(record["phase"])
-        slot = Slot(record["run"], record["binding"], phase)
-        if (not _valid_slot(slot) or type(record["max_input"]) is not int
-                or type(record["max_output"]) is not int or record["max_input"] != _INPUT_LIMIT
-                or record["max_output"] != _OUTPUT_LIMIT or not _use(record)):
-            raise ValueError
-        if previous is not None and (previous["actual"] is None or _overage(previous["actual"])):
-            raise ValueError
-        if phase is Phase.ORCHESTRATOR:
-            if first is not Phase.ORCHESTRATOR or slot.run_id in seen:
-                raise ValueError
-            seen.add(slot.run_id)
-        elif previous is None:
-            if phase is not first:
-                raise ValueError
-        elif (
-            previous["run"], previous["binding"], previous["phase"]
-        ) != (slot.run_id, slot.binding, _PRECEDING[phase].value):
-            raise ValueError
+        _validate_record(record, seen, previous, first=first)
         previous = record
     return records
 

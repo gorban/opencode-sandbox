@@ -45,9 +45,10 @@ def _timestamp(value):
     return type(value) in (int, float) and 0 < value < math.inf
 
 
-def _valid_record(value):
-    if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 1:
-        return False
+_STATE_FILE = "state.json"
+
+
+def _valid_scalar_fields(value):
     for key in ("generation", "profile", "host_id", "client", "pending_client", "subject"):
         if key in value and (not isinstance(value[key], str) or not value[key]):
             return False
@@ -57,6 +58,10 @@ def _valid_record(value):
     for key in ("revocation_unconfirmed", "scope_missing", "registration_observed"):
         if key in value and type(value[key]) is not bool:
             return False
+    return True
+
+
+def _valid_transactions(value):
     pending = value.get("pending", {})
     if not isinstance(pending, dict) or ("pending" in value and not _timestamp(pending.get("expires"))):
         return False
@@ -68,8 +73,10 @@ def _valid_record(value):
     for transaction in (pending, refresh):
         if "may_have_sent" in transaction and type(transaction["may_have_sent"]) is not bool:
             return False
-    if "consumed" in pending and type(pending["consumed"]) is not bool:
-        return False
+    return "consumed" not in pending or type(pending["consumed"]) is bool
+
+
+def _valid_leases_and_tokens(value):
     if "worker_retiring" in value and value["worker_retiring"] is not True:
         return False
     if "worker_lease" in value and type(value["worker_lease"]) is not dict:
@@ -79,14 +86,34 @@ def _valid_record(value):
         if (type(leases) is not dict or len(leases) > MAX_WORKER_LEASES
                 or any(type(key) is not str or not key or type(item) is not dict for key, item in leases.items())):
             return False
-    if "tokens" in value:
-        tokens = value["tokens"]
-        if (not isinstance(tokens, dict) or not {"generation", "profile", "client"} <= value.keys()
-                or not isinstance(tokens.get("access"), str) or not isinstance(tokens.get("refresh"), str)
-                or not _timestamp(tokens.get("expiry"))
-                or (tokens.get("earliest") is not None and not _timestamp(tokens["earliest"]))):
-            return False
-    return True
+    if "tokens" not in value:
+        return True
+    tokens = value["tokens"]
+    return (
+        isinstance(tokens, dict) and {"generation", "profile", "client"} <= value.keys()
+        and isinstance(tokens.get("access"), str) and isinstance(tokens.get("refresh"), str)
+        and _timestamp(tokens.get("expiry"))
+        and (tokens.get("earliest") is None or _timestamp(tokens["earliest"]))
+    )
+
+
+def _valid_record(value):
+    if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 1:
+        return False
+    return _valid_scalar_fields(value) and _valid_transactions(value) and _valid_leases_and_tokens(value)
+
+
+def _open_dir_component(fd, part, flags, *, create):
+    try:
+        return os.open(part, flags, dir_fd=fd)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os.mkdir(part, 0o700, dir_fd=fd)
+        except FileExistsError:
+            pass
+        return os.open(part, flags, dir_fd=fd)
 
 
 def _directory(path: Path, *, create=False):
@@ -98,16 +125,7 @@ def _directory(path: Path, *, create=False):
     try:
         for index, part in enumerate(path.parts[1:], 1):
             private = index == len(path.parts) - 1
-            try:
-                child = os.open(part, flags, dir_fd=fd)
-            except FileNotFoundError:
-                if not create:
-                    raise
-                try:
-                    os.mkdir(part, 0o700, dir_fd=fd)
-                except FileExistsError:
-                    pass
-                child = os.open(part, flags, dir_fd=fd)
+            child = _open_dir_component(fd, part, flags, create=create)
             os.close(fd)
             fd = child
             info = os.fstat(fd)
@@ -190,7 +208,7 @@ class Store:
             except FileNotFoundError:
                 # An absent lock is an empty state only if no snapshot exists.
                 try:
-                    os.stat("state.json", dir_fd=directory, follow_symlinks=False)
+                    os.stat(_STATE_FILE, dir_fd=directory, follow_symlinks=False)
                 except FileNotFoundError:
                     yield None
                     return
@@ -210,7 +228,7 @@ class Store:
         if directory is None:
             return {}
         try:
-            fd = os.open("state.json", os.O_RDONLY | os.O_NONBLOCK | CREATE_FLAGS,
+            fd = os.open(_STATE_FILE, os.O_RDONLY | os.O_NONBLOCK | CREATE_FLAGS,
                          dir_fd=directory)
         except FileNotFoundError:
             return {}
@@ -239,7 +257,7 @@ class Store:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, "state.json", src_dir_fd=directory, dst_dir_fd=directory)
+            os.replace(temporary, _STATE_FILE, src_dir_fd=directory, dst_dir_fd=directory)
             os.fsync(directory)
         finally:
             with contextlib.suppress(FileNotFoundError):

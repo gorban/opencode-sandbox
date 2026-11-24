@@ -25,7 +25,8 @@ RECEIPT = struct.Struct("!16sQI")
 _END = b"\r\n\r\n"
 _HEADER_NAME = re.compile(rb"[!#$%&'*+.^_\x60|~0-9A-Za-z-]+\Z")
 _REQUEST_LINE = re.compile(rb"[A-Z]+ [!-~]+ HTTP/1\.1\Z")
-_LENGTH = re.compile(rb"(?:0|[1-9][0-9]{0,5})\Z")
+_LENGTH = re.compile(rb"(?:0|[1-9]\d{0,5})\Z")
+_INVALID_FRAMING = "invalid HTTP request framing"
 
 
 class ReceiptError(ValueError):
@@ -86,22 +87,22 @@ def _write(peer, data, lease, deadline, *, worker=None, deliver=None):
 def _content_length(header):
     request, *lines = header.split(b"\r\n")
     if not _REQUEST_LINE.fullmatch(request):
-        raise ReceiptError("invalid HTTP request framing")
+        raise ReceiptError(_INVALID_FRAMING)
     length = None
     for line in lines:
         name, separator, value = line.partition(b":")
         if not separator or not _HEADER_NAME.fullmatch(name) or not re.fullmatch(rb"[ -~]*", value):
-            raise ReceiptError("invalid HTTP request framing")
+            raise ReceiptError(_INVALID_FRAMING)
         name = name.lower()
         if name == b"transfer-encoding":
-            raise ReceiptError("invalid HTTP request framing")
+            raise ReceiptError(_INVALID_FRAMING)
         if name == b"content-length":
             value = value.strip(b" ")
             if length is not None or not _LENGTH.fullmatch(value):
-                raise ReceiptError("invalid HTTP request framing")
+                raise ReceiptError(_INVALID_FRAMING)
             length = int(value)
     if length is None or length > MAX_BODY:
-        raise ReceiptError("invalid HTTP request framing")
+        raise ReceiptError(_INVALID_FRAMING)
     return length
 
 
@@ -128,7 +129,7 @@ def forward(worker, broker, lease, proof, deadline):
     """
     if type(proof) is not bytes or len(proof) != relay.PROOF_SIZE:
         raise ReceiptError("invalid relay proof length")
-    active = re.fullmatch(rb"[^ \r\n]+ ([1-9][0-9]{0,19}) active\n", lease.active_record)
+    active = re.fullmatch(rb"[^ \r\n]+ ([1-9]\d{0,19}) active\n", lease.active_record)
     if active is None or not 0 < (generation := int(active[1])) < 2**64:
         raise ReceiptError("invalid relay grant generation")
     # Apply the exchange deadline inside the existing fenced worker send too.

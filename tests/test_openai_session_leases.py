@@ -49,7 +49,16 @@ class _FakeJob:
 
 
 class SessionLeaseTests(unittest.TestCase):
+    @staticmethod
+    def _enter(cm):
+        with cm:
+            pass
+
     def setUp(self):
+        def _forbid_host_browser(url):
+            raise AssertionError(f"unit test attempted to open host browser: {url}")
+
+        self.enterContext(patch("oc_openai.connection._open_host_browser", side_effect=_forbid_host_browser))
         home = Path(pwd.getpwuid(os.getuid()).pw_dir)
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
         self.host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
@@ -78,9 +87,9 @@ class SessionLeaseTests(unittest.TestCase):
                 self.connection.require_switchable()
             self.assertEqual(err.exception.code, "managed_retirement_incomplete")
 
+            mix_cm = self.connection.worker_lease(self.binding, self._make_job("oc-i4a-"))
             with self.assertRaises(ConnectionError) as mix:
-                with self.connection.worker_lease(self.binding, self._make_job("oc-i4a-")):
-                    pass
+                self._enter(mix_cm)
             self.assertEqual(mix.exception.code, "managed_retirement_incomplete")
 
             self.assertTrue(self.connection.disconnect())
@@ -258,9 +267,9 @@ class SessionLeaseTests(unittest.TestCase):
 
         # Stale selection epoch must be rejected by session_lease.
         job = self._make_job()
+        stale_cm = pb.session_lease(label, "stale-epoch", binding, job)
         with self.assertRaises(RouteUnavailable) as err:
-            with pb.session_lease(label, "stale-epoch", binding, job):
-                self.fail("session_lease accepted stale selection_epoch")
+            self._enter(stale_cm)
         self.assertEqual(err.exception.reason, Reason.CONNECTION_CHANGED)
 
         # Retiring profile must not report an active_selection for session authority.
@@ -327,9 +336,12 @@ class SessionLeaseTests(unittest.TestCase):
         label, epoch, conn, binding = pb.active_connection()
         job = self._make_job()
         # Leave grant marker non-terminal while lifetime FD is held so confirm_terminal fails.
-        with self.assertRaises(RouteUnavailable) as err:
+        def crash_inside_lease():
             with pb.session_lease(label, epoch, binding, job):
                 raise RuntimeError("simulated session crash")
+
+        with self.assertRaises(RouteUnavailable) as err:
+            crash_inside_lease()
         self.assertEqual(err.exception.reason, Reason.MANAGED_RETIREMENT)
         self.assertTrue(conn.has_active_leases())
 

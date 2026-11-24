@@ -188,6 +188,30 @@ def deliver(lease: Lease, worker: socket.socket, data: bytes) -> int:
         return worker.send(data)
 
 
+def _control_step(worker: socket.socket, client: socket.socket, lease: Lease,
+                  pending: memoryview, total: int, peer_poll) -> tuple[memoryview, int, bool]:
+    reading, writing, _ = select.select(
+        [] if pending else [worker], [client] if pending else [], [], GRANT_POLL,
+    )
+    if any(flags & PEER_CLOSED for _, flags in peer_poll.poll(0)):
+        return pending, total, False
+    if reading:
+        data = worker.recv(CHUNK)
+        total += len(data)
+        if not data or total > WIRE_LIMIT:
+            return pending, total, False
+        pending = memoryview(data)
+    if writing:
+        try:
+            count = deliver(lease, client, pending)
+        except BlockingIOError:
+            return pending, total, True
+        if not count:
+            return pending, total, False
+        pending = pending[count:]
+    return pending, total, True
+
+
 def control_reply(worker: socket.socket, client: socket.socket, lease: Lease) -> None:
     """Forward one bounded native HTTP response and discard it on revocation."""
     deadline = time.monotonic() + STREAM_TIMEOUT
@@ -197,25 +221,9 @@ def control_reply(worker: socket.socket, client: socket.socket, lease: Lease) ->
     peer_poll = select.poll()
     peer_poll.register(client, select.POLLRDHUP)
     while lease.active() and time.monotonic() < deadline:
-        reading, writing, _ = select.select(
-            [] if pending else [worker], [client] if pending else [], [], GRANT_POLL,
-        )
-        if any(flags & PEER_CLOSED for _, flags in peer_poll.poll(0)):
+        pending, total, keep_going = _control_step(worker, client, lease, pending, total, peer_poll)
+        if not keep_going:
             return
-        if reading:
-            data = worker.recv(CHUNK)
-            total += len(data)
-            if not data or total > WIRE_LIMIT:
-                return
-            pending = memoryview(data)
-        if writing:
-            try:
-                count = deliver(lease, client, pending)
-            except BlockingIOError:
-                continue
-            if not count:
-                return
-            pending = pending[count:]
 
 
 def control(client: socket.socket, lease: Lease) -> None:
@@ -250,6 +258,22 @@ def provider(worker: socket.socket, lease: Lease, proof: bytes) -> None:
         broker.connect(PROVIDER_SOCKET)
         from relay_receipt import forward
         forward(worker, broker, lease, proof, time.monotonic() + STREAM_TIMEOUT)
+
+
+def _accept_relay_peer(listener, handler, slots, lease: Lease, peers: set, peers_lock: threading.Lock, handle) -> None:
+    client, _ = listener.accept()
+    if not lease.active() or not slots.acquire(blocking=False):
+        client.close()
+        return
+    with peers_lock:
+        peers.add(client)
+    try:
+        threading.Thread(target=handle, args=(client, handler, slots), daemon=True).start()
+    except RuntimeError:
+        slots.release()
+        with peers_lock:
+            peers.discard(client)
+        client.close()
 
 
 def serve(lease: Lease, proof: bytes) -> None:
@@ -298,19 +322,7 @@ def serve(lease: Lease, proof: bytes) -> None:
                     for key, _ in selector.select(GRANT_POLL):
                         listener = key.fileobj
                         handler, slots = listeners[listener]
-                        client, _ = listener.accept()
-                        if not lease.active() or not slots.acquire(blocking=False):
-                            client.close()
-                            continue
-                        with peers_lock:
-                            peers.add(client)
-                        try:
-                            threading.Thread(target=handle, args=(client, handler, slots), daemon=True).start()
-                        except RuntimeError:
-                            slots.release()
-                            with peers_lock:
-                                peers.discard(client)
-                            client.close()
+                        _accept_relay_peer(listener, handler, slots, lease, peers, peers_lock, handle)
         finally:
             with peers_lock:
                 for client in peers:

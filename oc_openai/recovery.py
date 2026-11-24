@@ -22,34 +22,50 @@ _REVIEWED_TRACE = "dccaa92e285656a74f5293224bd64c7b3604b3330d98b8aa71151de54adf4
 _REVIEWED_METADATA = "999b1a0a04b9e50477ab2df9f3100b1249bde1dc706cb49b23d4481839b11409"
 
 
+def _recovery_phases(*, trace_only, worker_only):
+    if trace_only:
+        return (Phase.INITIAL,)
+    if worker_only:
+        return _PHASES[1:]
+    return _PHASES
+
+
+def _recovery_name(*, moderation_trace, after_trace, trace_only, after_retry, worker_only):
+    if moderation_trace:
+        return _RECOVERY_MODERATION
+    if after_trace:
+        return _RECOVERY_METADATA
+    if trace_only:
+        return _RECOVERY_TRACE
+    if after_retry:
+        return _RECOVERY_WORKER_PROGRESS
+    return _RECOVERY_WORKER if worker_only else _RECOVERY_PROOF
+
+
 class RecoveryLedger:
     """Process-local permit backed by a one-shot durable phase record."""
 
     def __init__(self, ledger, first, source, *, worker_only=False, after_retry=False,
                  trace_only=False, after_trace=False, moderation_trace=False):
         trace_only = trace_only or moderation_trace
-        phases = (Phase.INITIAL,) if trace_only else _PHASES[1:] if worker_only else _PHASES
+        phases = _recovery_phases(trace_only=trace_only, worker_only=worker_only)
+        invalid_flags = (
+            (after_retry and not worker_only)
+            or ((trace_only or after_trace) and not after_retry)
+            or (trace_only and after_trace and not moderation_trace)
+            or (moderation_trace and not after_trace)
+        )
         if (not _valid_slot(first) or first.phase is not phases[0]
-                or after_retry and not worker_only
-                or (trace_only or after_trace) and not after_retry
-                or trace_only and after_trace and not moderation_trace
-                or moderation_trace and not after_trace
-                or type(source) is not str or not _DIGEST.fullmatch(source)):
+                or invalid_flags or type(source) is not str or not _DIGEST.fullmatch(source)):
             raise ExposureError("diagnostic_unavailable")
         self._ledger = ledger
         self._first = first
         self._source = source
         self._phases = phases
-        if moderation_trace:
-            self._name = _RECOVERY_MODERATION
-        elif after_trace:
-            self._name = _RECOVERY_METADATA
-        elif trace_only:
-            self._name = _RECOVERY_TRACE
-        elif after_retry:
-            self._name = _RECOVERY_WORKER_PROGRESS
-        else:
-            self._name = _RECOVERY_WORKER if worker_only else _RECOVERY_PROOF
+        self._name = _recovery_name(
+            moderation_trace=moderation_trace, after_trace=after_trace,
+            trace_only=trace_only, after_retry=after_retry, worker_only=worker_only,
+        )
         self._worker_only = worker_only
         self._after_retry = after_retry
         self._trace_only = trace_only

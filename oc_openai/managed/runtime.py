@@ -71,6 +71,7 @@ finally:
 """
 MANAGED_LIFETIME_NS = 180 * 10**9
 JOB_DATA = b"ordinary readable disposable job data\n"
+_GRANT_MOUNT = "/grant"
 class JobRuntimeError(RuntimeError):
     """A concise diagnostic containing only trusted labels, roles, and identifiers."""
 
@@ -401,7 +402,7 @@ class Job:
         self.lease = Lease(self.grant, active, time.monotonic_ns() + MANAGED_LIFETIME_NS)
         self._grant_files = {
             name: self.root.joinpath(name.removeprefix("/")).lstat()
-            for name in ("/grant", "/grant/lock", "/grant/lifetime")
+            for name in (_GRANT_MOUNT, "/grant/lock", "/grant/lifetime")
         }
         for filename in (RELAY_FILE, RECEIPT_RELAY_FILE):
             destination = self.root / "source" / filename
@@ -613,7 +614,7 @@ class Job:
         relay_mounts = {
             "/source": (self.root / "source", False),
             "/provider": (self.provider_socket.parent, False),
-            "/grant": (self.grant, False),
+            _GRANT_MOUNT: (self.grant, False),
             "/control": (self.control_socket.parent, True),
         }
         relay_mounts["/proof"] = (self.root / "proof", False)
@@ -652,7 +653,7 @@ class Job:
             time.sleep(0.1)
         raise JobRuntimeError("Isolated OpenCode listener did not become ready")
 
-    def _verify_managed_placement(self) -> None:
+    def _verify_namespaces(self) -> None:
         for namespace in ("mnt", "pid", "ipc", "time"):
             path = f"/proc/self/ns/{namespace}"
             local = os.readlink(path).encode("ascii")
@@ -660,23 +661,19 @@ class Job:
             values = {podman("exec", self.ids[role], "readlink", path).stdout.strip() for role in ROLES}
             valid = re.compile(fr"{namespace}:\[\d+\]".encode("ascii"))
             isolated = len(values) == len(ROLES) and not values & {local, host}
-            if not all(valid.fullmatch(value) for value in values | {host, local}) or not (
-                values == {host} and local == host if namespace == "time" else isolated
-            ):
+            ok = (values == {host} and local == host) if namespace == "time" else isolated
+            if not all(valid.fullmatch(value) for value in values | {host, local}) or not ok:
                 raise JobRuntimeError(f"Unexpected managed {namespace} namespace")
-        relay_id = self.ids["relay"]
-        interfaces = podman("exec", relay_id, "python3", "-c",
-                            "import socket; assert socket.if_nameindex() == [(1, 'lo')]")
-        if interfaces.stdout:
-            raise JobRuntimeError("Unexpected managed network fixture output")
-        label = self._identity("relay", relay_id)["MountLabel"].encode("ascii")
+
+    def _verify_relay_files(self, relay_id: str, label: bytes) -> None:
         for path, expected in self._relay_files.items():
             source = self.root / path.removeprefix("/")
             entry = source.lstat()
             identity = (entry.st_dev, entry.st_ino, entry.st_mode)
+            expected_kind = stat.S_ISREG(entry.st_mode) if path == "/proof/relay" else stat.S_ISSOCK(entry.st_mode)
             if (identity != (expected.st_dev, expected.st_ino, expected.st_mode)
                     or entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) != 0o600
-                    or (not stat.S_ISREG(entry.st_mode) if path == "/proof/relay" else not stat.S_ISSOCK(entry.st_mode))):
+                    or not expected_kind):
                 raise JobRuntimeError("Unexpected relay-only path identity")
             visible = podman("exec", relay_id, "stat", "-c", "%d:%i:%u:%a", path).stdout.strip()
             if visible != f"{entry.st_dev}:{entry.st_ino}:0:600".encode("ascii"):
@@ -685,10 +682,11 @@ class Job:
             if effective.removesuffix(b"\0") != label:
                 raise JobRuntimeError("Unexpected relay-only path label")
 
+    def _verify_grant_files(self, relay_id: str) -> None:
         for path, expected in self._grant_files.items():
             source = self.root / path.removeprefix("/")
             entry = source.lstat()
-            directory = path == "/grant"
+            directory = path == _GRANT_MOUNT
             mode = 0o700 if directory else 0o600
             kind = stat.S_ISDIR if directory else stat.S_ISREG
             if ((entry.st_dev, entry.st_ino) != (expected.st_dev, expected.st_ino)
@@ -698,6 +696,17 @@ class Job:
             visible = podman("exec", relay_id, "stat", "-c", "%d:%i:%u:%a", path).stdout.strip()
             if visible != f"{entry.st_dev}:{entry.st_ino}:0:{mode:o}".encode("ascii"):
                 raise JobRuntimeError("Unexpected effective relay grant path identity")
+
+    def _verify_managed_placement(self) -> None:
+        self._verify_namespaces()
+        relay_id = self.ids["relay"]
+        interfaces = podman("exec", relay_id, "python3", "-c",
+                            "import socket; assert socket.if_nameindex() == [(1, 'lo')]")
+        if interfaces.stdout:
+            raise JobRuntimeError("Unexpected managed network fixture output")
+        label = self._identity("relay", relay_id)["MountLabel"].encode("ascii")
+        self._verify_relay_files(relay_id, label)
+        self._verify_grant_files(relay_id)
 
     def activate(self, broker) -> None:
         if (not self._ready or self.terminal

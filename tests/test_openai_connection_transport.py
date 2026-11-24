@@ -77,6 +77,14 @@ class WireTests(unittest.TestCase):
             lambda write: write(),
         )
 
+    def _first_event(self):
+        with self.streams() as events:
+            return next(events)
+
+    def _all_events(self):
+        with self.streams() as events:
+            return list(events)
+
     def test_http_rejections_are_not_reported_as_stream_or_plan_limit_failures(self):
         from oc_openai.acceptance import run_attended
         from oc_openai.exposure import ExposureLedger
@@ -223,9 +231,8 @@ class WireTests(unittest.TestCase):
                             with self.streams() as events:
                                 self.assertEqual(list(events), [{"type": "response.completed"}])
                         else:
-                            with self.assertRaises(ConnectionError) as error, self.streams() as events:
-                                next(events)
-                                self.fail("completion escaped without a TLS close_notify")
+                            with self.assertRaises(ConnectionError) as error:
+                                self._first_event()
                             self.assertEqual(error.exception.code, "provider_network_error")
                 finally:
                     thread.join(3)
@@ -271,9 +278,7 @@ class WireTests(unittest.TestCase):
         )
         for wire in cases:
             with self.subTest(wire=wire), self.response(wire), self.assertRaises(ConnectionError):
-                with self.streams() as events:
-                    next(events)
-                    self.fail("completion escaped before valid framing")
+                self._first_event()
         with self.response(chunk_header + size + completed + b"\r\n0\r\n\r\n"), self.streams() as events:
             self.assertEqual(list(events), [{"type": "response.completed"}])
 
@@ -488,12 +493,10 @@ class WireTests(unittest.TestCase):
                 self.assertIs(json.loads(request[2])["stream"], True)
 
         wire = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\n\r\ndata")
-        with (self.response(wire), patch.object(_StrictResponse, "read1") as read,
-              self.assertRaises(StreamFailure), self.streams() as events):
-            try:
-                self.assertEqual(list(events), [])
-            finally:
-                read.assert_not_called()
+        with self.response(wire), patch.object(_StrictResponse, "read1") as read:
+            with self.assertRaises(StreamFailure):
+                self._all_events()
+            read.assert_not_called()
 
     def test_stalled_media_probe_keeps_header_evidence_at_expiry(self):
         from oc_openai.connection import Connection
@@ -735,9 +738,10 @@ class WireTests(unittest.TestCase):
         transport = OpenAITransport()
         with patch("oc_openai.responses._connect") as connect:
             for host, path in (("fixture.invalid", TOKEN), (AUTH_HOST, TOKEN)):
+                cancel = Cancellation(time.monotonic() + 2)
                 with self.subTest(host=host), self.assertRaises(ConnectionError):
                     transport.json(host, path, bearer="secret", body=b"grant_type=refresh_token",
-                                   cancellation=Cancellation(time.monotonic() + 2),
+                                   cancellation=cancel,
                                    dispatch=lambda write: write())
             connect.assert_not_called()
 

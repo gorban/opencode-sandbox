@@ -69,7 +69,7 @@ def main() -> int:
         from oc_openai.connection_state import decode_json
         from oc_openai.session_broker import run_interactive_session
         launch_spec = decode_json(raw)
-    except (ImportError, OSError, UnicodeError, ValueError):
+    except (ImportError, OSError, ValueError):
         print("oc-sandbox --provider openai: trusted workstation supervisor unavailable.", file=sys.stderr)
         return 1
     return run_interactive_session(launch_spec, StreamTerminal(sys.stdin, sys.stdout, sys.stderr))

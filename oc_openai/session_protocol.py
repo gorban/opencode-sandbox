@@ -50,17 +50,22 @@ _ALLOWED_REASONING_KEYS = frozenset({"type", "id", "summary", "content", "encryp
 _ALLOWED_TEXT_PART_TYPES = frozenset({"input_text", "output_text", "refusal"})
 _ALLOWED_ROLES = frozenset({"user", "assistant", "developer", "system"})
 
+_EVENT_CREATED = "response.created"
+_EVENT_TEXT_DONE = "response.output_text.done"
+_EVENT_COMPLETED = "response.completed"
+_DELTA_SUFFIX = ".delta"
+
 _ALLOWED_STREAM_EVENTS = frozenset({
-    "response.created", "response.in_progress", "response.queued",
+    _EVENT_CREATED, "response.in_progress", "response.queued",
     "response.output_item.added", "response.output_item.done",
     "response.content_part.added", "response.content_part.done",
-    "response.output_text.delta", "response.output_text.done",
+    "response.output_text.delta", _EVENT_TEXT_DONE,
     "response.refusal.delta", "response.refusal.done",
     "response.function_call_arguments.delta", "response.function_call_arguments.done",
     "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
     "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
     "response.reasoning_text.delta", "response.reasoning_text.done",
-    "response.completed",
+    _EVENT_COMPLETED,
 })
 _UNSUPPORTED_EVENT_PREFIXES = (
     "response.audio.", "response.code_interpreter_", "response.compaction.",
@@ -746,7 +751,12 @@ class SessionStreamProjector:
             payload["item_id"] = mapped
 
     def _project_text_event(self, kind: str, event: dict, payload: dict) -> tuple[bytes, bool]:
-        field = "delta" if kind.endswith(".delta") else ("text" if kind == "response.output_text.done" else "refusal")
+        if kind.endswith(_DELTA_SUFFIX):
+            field = "delta"
+        elif kind == _EVENT_TEXT_DONE:
+            field = "text"
+        else:
+            field = "refusal"
         if type(event.get(field)) is not str:
             raise StreamAborted("invalid_delta")
         payload[field] = event[field]
@@ -754,7 +764,7 @@ class SessionStreamProjector:
         return sse_frame(kind, payload), False
 
     def _project_function_arg_event(self, kind: str, event: dict, payload: dict) -> tuple[bytes, bool]:
-        key = "delta" if kind.endswith(".delta") else "arguments"
+        key = "delta" if kind.endswith(_DELTA_SUFFIX) else "arguments"
         if type(event.get(key)) is not str:
             raise StreamAborted("invalid_function_call")
         payload[key] = event[key]
@@ -778,7 +788,7 @@ class SessionStreamProjector:
                 raise StreamAborted("invalid_reasoning_item")
             payload["part"] = {"type": "summary_text", "text": part["text"]}
             return sse_frame(kind, payload), False
-        field = "delta" if kind.endswith(".delta") else "text"
+        field = "delta" if kind.endswith(_DELTA_SUFFIX) else "text"
         if type(event.get(field)) is not str:
             raise StreamAborted("invalid_reasoning_item")
         payload[field] = event[field]
@@ -794,7 +804,7 @@ class SessionStreamProjector:
         if "output_index" in event:
             payload["output_index"] = _valid_index(event["output_index"])
         if kind in ("response.output_text.delta", "response.refusal.delta",
-                    "response.output_text.done", "response.refusal.done"):
+                    _EVENT_TEXT_DONE, "response.refusal.done"):
             return self._project_text_event(kind, event, payload)
         if kind in ("response.content_part.added", "response.content_part.done"):
             payload["part"] = self._project_content_part(event.get("part"))
@@ -812,7 +822,7 @@ class SessionStreamProjector:
             raise StreamAborted("invalid_response_id")
         self.upstream_response_id = response["id"]
         projected_resp = self._project_response_envelope(response, allow_vault=False)
-        return [sse_frame("response.created", {"type": "response.created", "response": projected_resp})]
+        return [sse_frame(_EVENT_CREATED, {"type": _EVENT_CREATED, "response": projected_resp})]
 
     def _feed_progress(self, kind: str, event: dict) -> list[bytes]:
         response = event.get("response")
@@ -843,7 +853,7 @@ class SessionStreamProjector:
             if all(type(c) is int and 0 <= c <= 2**31 for c in counts) and counts[0] + counts[1] == counts[2]:
                 self.usage = counts
         projected_resp = self._project_response_envelope(response, allow_vault=True)
-        self._buffered_frames.append(sse_frame("response.completed", {"type": "response.completed", "response": projected_resp}))
+        self._buffered_frames.append(sse_frame(_EVENT_COMPLETED, {"type": _EVENT_COMPLETED, "response": projected_resp}))
         self._completed_seen = True
         return []
 
@@ -866,7 +876,7 @@ class SessionStreamProjector:
             return self._feed_output_item(kind, event, allow_vault=False)
         if kind == "response.output_item.done":
             return self._feed_output_item(kind, event, allow_vault=True)
-        if kind == "response.completed":
+        if kind == _EVENT_COMPLETED:
             return self._feed_completed(event)
         return None
 
@@ -884,10 +894,10 @@ class SessionStreamProjector:
         if kind.startswith(_UNSUPPORTED_EVENT_PREFIXES) or kind not in _ALLOWED_STREAM_EVENTS:
             raise StreamAborted("unsupported_event")
         if self.upstream_response_id is None:
-            if kind != "response.created":
+            if kind != _EVENT_CREATED:
                 raise StreamAborted("missing_response_created")
             return self._feed_created(event)
-        if kind == "response.created":
+        if kind == _EVENT_CREATED:
             raise StreamAborted("duplicate_response_created")
         handled = self._feed_lifecycle(kind, event)
         if handled is not None:

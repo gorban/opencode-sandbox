@@ -61,11 +61,13 @@ USAGE_LOG_LIMIT = 512 * 1024
 USAGE_LOG_NAME = "session_usage.jsonl"
 _INSTANCE_NAME = re.compile(r"(?:default|[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)\Z")
 _LEVEL_RE = re.compile(r"s0:c(\d+),c(\d+)\Z")
-_MEM_RE = re.compile(r"[1-9][0-9]{0,5}[kmgKMG]?\Z")
+_MEM_RE = re.compile(r"[1-9]\d{0,5}[kmgKMG]?\Z")
 _REL_SEG_RE = re.compile(r"[A-Za-z0-9._@+-]+\Z")
 _TERM_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}\Z")
-_PORT_KEY_RE = re.compile(r"([0-9]+)/tcp\Z")
-_PORT_LABEL_RE = re.compile(r"[0-9]+:[0-9]+\Z")
+_PORT_KEY_RE = re.compile(r"(\d+)/tcp\Z")
+_PORT_LABEL_RE = re.compile(r"\d+:\d+\Z")
+_RELAY_MODULE = "relay.py"
+_SESSION_RELAY_MODULE = "session_relay.py"
 _RESERVED_INSTANCES = frozenset({
     "agent", "chromium", "chrome", "postgres", "pg", "dind", "home",
     "openai-relay", "openai-home",
@@ -216,9 +218,9 @@ class SessionBroker:
 
     def _cancel_active_turns(self) -> None:
         with self._lock:
-            for event in list(self._cancels):
+            for event in self._cancels:
                 event.set()
-            for peer in list(self._clients):
+            for peer in self._clients:
                 with suppress(OSError):
                     peer.shutdown(socket.SHUT_RDWR)
 
@@ -349,7 +351,7 @@ class SessionBroker:
             outcome = error.code
             status, code, msg = _ERROR_MAP.get(error.code, (502, "provider_error", "OpenAI request failed."))
             self._send_peer_error(peer, state["headers_sent"], status, code, msg)
-        except (OSError, TimeoutError, EOFError):
+        except (OSError, EOFError):
             outcome = "transport_error"
         finally:
             if model is not None:
@@ -459,10 +461,10 @@ class _SessionJob:
         atomic_write(self.proof_file, self.relay_proof)
         self.proof_file.chmod(0o600)
         pkg_dir = Path(__file__).resolve().parent
-        shutil.copyfile(pkg_dir / "managed" / "relay.py", self.source_dir / "relay.py")
-        shutil.copyfile(pkg_dir / "session_relay.py", self.source_dir / "session_relay.py")
-        (self.source_dir / "relay.py").chmod(0o444)
-        (self.source_dir / "session_relay.py").chmod(0o444)
+        shutil.copyfile(pkg_dir / "managed" / _RELAY_MODULE, self.source_dir / _RELAY_MODULE)
+        shutil.copyfile(pkg_dir / _SESSION_RELAY_MODULE, self.source_dir / _SESSION_RELAY_MODULE)
+        (self.source_dir / _RELAY_MODULE).chmod(0o444)
+        (self.source_dir / _SESSION_RELAY_MODULE).chmod(0o444)
         cfg_bytes = (json.dumps(config_payload, indent=2, ensure_ascii=True) + "\n").encode("ascii")
         atomic_write(self.opencode_config, cfg_bytes)
         self.opencode_config.chmod(0o444)
@@ -487,7 +489,7 @@ class _SessionJob:
             with self.lease.fence():
                 atomic_write(self.grant / "state", terminal)
                 (self.grant / "state").chmod(0o600)
-        except (OSError, TimeoutError) as exc:
+        except OSError as exc:
             error = exc
         finally:
             if self._lifetime_fd is not None:
@@ -962,7 +964,7 @@ def run_interactive_session(spec: dict, terminal: StreamTerminal) -> int:
 
     try:
         instance_lock_fd = _open_instance_lock(backend._state, spec["instance"])
-    except (BlockingIOError, OSError, RuntimeError):
+    except (OSError, RuntimeError):
         terminal.error(f"Instance '{spec['instance']}' already has an active provider session launch.")
         return 1
 

@@ -58,6 +58,25 @@ def _matches(value, pattern):
     return type(value) is str and pattern.fullmatch(value) is not None
 
 
+def _validate_entry(label, entry, directories, clients):
+    if (
+        not valid_label(label) or type(entry) is not dict
+        or set(entry) != {"key", "client_id", "pending", "retiring"}
+        or not _matches(entry["key"], _DIRECTORY_ID) or entry["key"] in directories
+        or (entry["pending"] is not None and not _matches(entry["pending"], _LOCAL_ID))
+        or type(entry["retiring"]) is not bool
+    ):
+        raise ProfileError("profile_storage_unavailable")
+    directories.add(entry["key"])
+    client_id = entry["client_id"]
+    if client_id is not None:
+        if not _matches(client_id, _CLIENT_ID) or client_id in clients:
+            raise ProfileError("profile_storage_unavailable")
+        clients.add(client_id)
+    elif entry["retiring"]:
+        raise ProfileError("profile_storage_unavailable")
+
+
 def _validate(state):
     if (
         set(state) != {"version", "host_id", "epoch", "active", "registrations"}
@@ -71,22 +90,7 @@ def _validate(state):
     directories = set()
     clients = set()
     for label, entry in state["registrations"].items():
-        if (
-            not valid_label(label) or type(entry) is not dict
-            or set(entry) != {"key", "client_id", "pending", "retiring"}
-            or not _matches(entry["key"], _DIRECTORY_ID) or entry["key"] in directories
-            or (entry["pending"] is not None and not _matches(entry["pending"], _LOCAL_ID))
-            or type(entry["retiring"]) is not bool
-        ):
-            raise ProfileError("profile_storage_unavailable")
-        directories.add(entry["key"])
-        client_id = entry["client_id"]
-        if client_id is not None:
-            if not _matches(client_id, _CLIENT_ID) or client_id in clients:
-                raise ProfileError("profile_storage_unavailable")
-            clients.add(client_id)
-        elif entry["retiring"]:
-            raise ProfileError("profile_storage_unavailable")
+        _validate_entry(label, entry, directories, clients)
     active = state["active"]
     if active is not None and (
         not valid_label(active) or not state["registrations"].get(active, {}).get("client_id")
@@ -309,9 +313,8 @@ class Profiles:
             for name, entry in sorted(entries.items()):
                 if name == label:
                     continue
-                if entry["pending"] is not None or entry["client_id"] is None:
-                    targets.append(name)
-                elif inactive_filter is not None and inactive_filter(self._profile(state, name)):
+                if (entry["pending"] is not None or entry["client_id"] is None
+                        or (inactive_filter is not None and inactive_filter(self._profile(state, name)))):
                     targets.append(name)
             for name in targets:
                 fenced = before_retirement(self._profile(state, name))

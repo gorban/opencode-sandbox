@@ -360,16 +360,48 @@ def _run_verify(terminal: Terminal, backend: Backend) -> int:
     return 0
 
 
+def _run_connect(terminal: Terminal, backend: Backend, label: str, *, manual: bool) -> int:
+    active = backend.active_label()
+    if active is not None and not valid_label(active):
+        raise RouteUnavailable(Reason.CONNECTION_CHANGED)
+    terminal.write(
+        f"Active registration: {active}." if active is not None else "No registration is currently active."
+    )
+    terminal.write(
+        f"Continue with ChatGPT for registration {label}. OpenAI receives the app's OAuth "
+        "request and this installation's identifier. This workstation stores the verified "
+        "account identity and provider tokens. Disconnect retires local tokens and attempts "
+        "revocation with OpenAI. It retains registration labels and IDs, the verified "
+        "account binding, and installation-wide numeric usage accounting. The live proof "
+        "sends fixed prompts to OpenAI only after separate authorization."
+    )
+    terminal.write(
+        "If browser sign-in is needed, copy the sign-in link shown after approval into a browser "
+        "on this workstation that can reach 127.0.0.1. Keep this terminal open."
+    )
+    if not terminal.confirm(f"Continue with ChatGPT for {label}?"):
+        terminal.error("Cancelled.")
+        return 1
+    backend.connect(
+        label, handoff=lambda uri, launch: _present_sign_in(terminal, uri, launch, manual=manual),
+    )
+    terminal.write(f"Connected ChatGPT registration {label} on this workstation.")
+    return 0
+
+
+def _valid_argv(argv: Sequence[str], command: str, *, labelled: bool, manual: bool) -> bool:
+    if labelled:
+        return (len(argv) == 2 or manual) and valid_label(argv[1])
+    return len(argv) == 1 and command in _LOCAL_COMMANDS
+
+
 def run(
     argv: Sequence[str], *, terminal: Terminal, backend_factory: Callable[[], Backend] = _production_backend,
 ) -> int:
     command = argv[0] if argv else ""
     labelled = command in _LABEL_COMMANDS
     manual = command == "connect" and len(argv) == 3 and argv[2] == "--no-browser"
-    if (
-        (labelled and ((len(argv) != 2 and not manual) or not valid_label(argv[1])))
-        or (not labelled and (len(argv) != 1 or command not in _LOCAL_COMMANDS))
-    ):
+    if not _valid_argv(argv, command, labelled=labelled, manual=manual):
         terminal.error(USAGE)
         return 2
     if command == "connect" and not terminal.attended():
@@ -378,33 +410,7 @@ def run(
     try:
         backend = backend_factory()
         if command == "connect":
-            label = argv[1]
-            active = backend.active_label()
-            if active is not None and not valid_label(active):
-                raise RouteUnavailable(Reason.CONNECTION_CHANGED)
-            terminal.write(
-                f"Active registration: {active}." if active is not None else "No registration is currently active."
-            )
-            terminal.write(
-                f"Continue with ChatGPT for registration {label}. OpenAI receives the app's OAuth "
-                "request and this installation's identifier. This workstation stores the verified "
-                "account identity and provider tokens. Disconnect retires local tokens and attempts "
-                "revocation with OpenAI. It retains registration labels and IDs, the verified "
-                "account binding, and installation-wide numeric usage accounting. The live proof "
-                "sends fixed prompts to OpenAI only after separate authorization."
-            )
-            terminal.write(
-                "If browser sign-in is needed, copy the sign-in link shown after approval into a browser "
-                "on this workstation that can reach 127.0.0.1. Keep this terminal open."
-            )
-            if not terminal.confirm(f"Continue with ChatGPT for {label}?"):
-                terminal.error("Cancelled.")
-                return 1
-            backend.connect(
-                label, handoff=lambda uri, launch: _present_sign_in(terminal, uri, launch, manual=manual),
-            )
-            terminal.write(f"Connected ChatGPT registration {label} on this workstation.")
-            return 0
+            return _run_connect(terminal, backend, argv[1], manual=manual)
         if command == "select":
             label = argv[1]
             backend.select(label)

@@ -157,6 +157,7 @@ class _CallbackServer(http.server.HTTPServer):
 
 class _Callback(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
+        # Suppress default stderr HTTP access logs to keep OAuth callback parameters private.
         pass
 
     def send_error(self, code, message=None, explain=None):
@@ -168,7 +169,7 @@ class _Callback(http.server.BaseHTTPRequestHandler):
         if (start is None or self.path != start.path
                 or self.requestline != f"GET {start.path} {self.request_version}"
                 or self.headers.get_all("Host") != [expected_host]
-                or self.headers.get_all("Origin") not in (None, [f"http://{expected_host}"])
+                or self.headers.get_all("Origin") not in (None, [f"http://{expected_host}"])  # NOSONAR(S5332)
                 or self.headers.get_all("Sec-Fetch-Site") not in (None, ["none"], ["same-origin"])
                 or self.headers.get_all("Content-Length") not in (None, ["0"])
                 or self.headers.get_all("Transfer-Encoding") is not None):
@@ -192,6 +193,29 @@ class _Callback(http.server.BaseHTTPRequestHandler):
         if self.server.failure is not None:
             self.send_error(410)
 
+    def _parse_callback_result(self, server, expected_host):
+        path = urlsplit(self.path)
+        fields = parse_qs(path.query, strict_parsing=True, keep_blank_values=True,
+                          errors="strict", max_num_fields=12)
+        if (self.headers.get_all("Host") != [expected_host] or path.scheme
+                or path.netloc or path.fragment or path.path != CALLBACK
+                or len(path.query) > 8192 or any(len(values) != 1 for values in fields.values())):
+            raise ValueError
+        state = fields.get("state", [""])[0]
+        if (not state.isascii() or not hmac.compare_digest(state, server.state)
+                or ("iss" in fields and fields["iss"][0] != ISSUER)
+                or ("code" in fields) == ("error" in fields)):
+            raise ValueError
+        if "error" in fields:
+            if not _value(fields["error"][0], max_length=128):
+                raise ValueError
+            return ("denied", None, None)
+        code = fields["code"][0]
+        client = fields.get("client_id", [None])[0]
+        if not _value(code, max_length=4096):
+            raise ValueError
+        return ("ok", code, client)
+
     def do_GET(self):
         server = self.server
         expected_host = f"127.0.0.1:{server.server_port}"
@@ -200,38 +224,15 @@ class _Callback(http.server.BaseHTTPRequestHandler):
             return
         result = None
         try:
-            path = urlsplit(self.path)
-            fields = parse_qs(path.query, strict_parsing=True, keep_blank_values=True,
-                              errors="strict", max_num_fields=12)
-            if (self.headers.get_all("Host") != [expected_host] or path.scheme
-                    or path.netloc or path.fragment or path.path != CALLBACK
-                    or len(path.query) > 8192 or any(len(values) != 1 for values in fields.values())):
-                raise ValueError
-            state = fields.get("state", [""])[0]
-            if not state.isascii() or not hmac.compare_digest(state, server.state):
-                raise ValueError
-            if "iss" in fields and fields["iss"][0] != ISSUER:
-                raise ValueError
-            if ("code" in fields) == ("error" in fields):
-                raise ValueError
-            if "error" in fields:
-                if not _value(fields["error"][0], max_length=128):
-                    raise ValueError
-                result = ("denied", None, None)
-            else:
-                code = fields["code"][0]
-                client = fields.get("client_id", [None])[0]
-                if not _value(code, max_length=4096):
-                    raise ValueError
-                result = ("ok", code, client)
+            result = self._parse_callback_result(server, expected_host)
             if server.result is not None:
                 raise ValueError
             if result[0] == "ok" and server.observe_registration is not None:
-                if not isinstance(client, str) or CLIENT.fullmatch(client) is None:
+                if not isinstance(result[2], str) or CLIENT.fullmatch(result[2]) is None:
                     raise ValueError
                 server.observe_registration()
             server.result = result
-        except (UnicodeError, ValueError):
+        except ValueError:
             result = None
         except ConnectionError as error:
             server.failure = error
@@ -549,22 +550,7 @@ class Connection:
             return False
         return True
 
-    def connect(self, *, installation_host=None, publication=None, authorization=None, handoff=None):
-        """Sign in within a short registry authorization guard at each local effect."""
-        self.require_prerequisites()
-        if handoff is not None:
-            _check_browser_placement()
-        authorize = authorization or contextlib.nullcontext
-        generation = _random()
-        state, nonce, pkce = _random(), _random(), _random()
-        expires = self._clock() + CONNECT_SECONDS
-        exchange_rejected = False
-
-        def is_pending(record):
-            if (record.get("generation") != generation
-                    or self._clock() >= record.get("pending", {}).get("expires", 0)):
-                raise ConnectionError("connection_retired")
-
+    def _begin_connect_state(self, authorize, generation, expires, installation_host):
         with authorize(), self._store.locked(create=True) as directory:
             record = self._store.read(directory)
             if record.get("tokens"):
@@ -586,82 +572,162 @@ class Connection:
             record.update(generation=generation, pending={"expires": expires})
             self._store.write(directory, record)
         self._cancel(previous)
+        return host_id, profile, client, subject, ask_again
 
-        def observe_registration():
-            with self._store.locked() as directory:
-                record = self._store.read(directory)
-                if record.get("profile") != profile or record.get("host_id") != host_id:
-                    raise ConnectionError("connection_retired")
-                # Retain issuance evidence across retirement without granting
-                # a stale callback any client, code or token authority.
-                if record.get("registration_observed") is not True:
-                    record["registration_observed"] = True
-                    self._store.write(directory, record)
+    def _run_callback_exchange(self, *, cancellation, state, nonce, pkce, host_id, client,
+                               ask_again, handoff, authorize, is_pending, observe_registration):
+        with _CallbackServer(("127.0.0.1", 0), _Callback) as server:
+            server.cancellation = cancellation
+            server.timeout = POLL_SECONDS
+            server.state = state
+            server.result = None
+            server.failure = None
+            server.observe_registration = observe_registration if client is None else None
+            redirect = f"http://127.0.0.1:{server.server_port}{CALLBACK}"
+            fields = {"client_id": client or INITIAL_CLIENT, "ext_agent_host_id": host_id,
+                      "response_type": "code", "redirect_uri": redirect, "scope": SCOPES,
+                      "resource": RESOURCE, "state": state, "nonce": nonce,
+                      "code_challenge_method": "S256", "code_challenge": _pkce(pkce)}
+            if client is None:
+                fields["agent_name_hint"] = "oc-sandbox"
+            elif ask_again:
+                fields["prompt"] = "consent"
+            cancellation.check()
+            destination = AUTHORIZE + "?" + urlencode(fields)
+            with contextlib.ExitStack() as resources:
+                self._handoff_browser(
+                    server, resources, destination, handoff, authorize, is_pending, cancellation,
+                )
+                while server.result is None and server.failure is None:
+                    cancellation.check()
+                    server.handle_request()
+                if server.failure is not None:
+                    raise server.failure
+                return redirect, server.result
 
+    def _handoff_browser(self, server, resources, destination, handoff, authorize, is_pending, cancellation):
+        if handoff is None:
+            target = resources.enter_context(self._store.browser_redirect(destination))
+            self._browser(target)
+            return
+
+        @contextlib.contextmanager
+        def authorize_start():
+            with authorize(), self._store.locked() as directory:
+                is_pending(self._store.read(directory))
+                cancellation.check()
+                yield
+
+        def launch():
+            cancellation.check()
+            target = resources.enter_context(self._store.browser_redirect(destination))
+            return self._try_browser(target, cancellation)
+
+        path = BROWSER_START + _random()
+        server.browser_start = _BrowserStart(path, _browser_redirect_response(destination), authorize_start)
+        handoff(f"http://127.0.0.1:{server.server_port}{path}", launch)
+
+    def _consume_callback(self, authorize, is_pending, kind, returned_client, client):
+        with authorize(), self._store.locked() as directory:
+            record = self._store.read(directory)
+            is_pending(record)
+            if record["pending"].get("consumed"):
+                raise ConnectionError("invalid_openai_callback")
+            record["pending"]["consumed"] = True
+            if kind != "ok":
+                raise ConnectionError("openai_consent_declined")
+            if client is None:
+                if not isinstance(returned_client, str) or not CLIENT.fullmatch(returned_client):
+                    raise ConnectionError("invalid_openai_callback")
+                client = returned_client
+                record["pending_client"] = client
+            elif returned_client is not None and returned_client != client:
+                raise ConnectionError("invalid_openai_callback")
+            self._store.write(directory, record)
+        return client
+
+    def _commit_connect(self, *, client, verified, profile, scope_missing, tokens, value,
+                        publication, authorize, is_pending, cancellation):
+        publish = publication(client) if publication is not None and not scope_missing else authorize()
+        with publish, self._store.locked() as directory:
+            record = self._store.read(directory)
+            is_pending(record)
+            cancellation.check()
+            record.update(client=client, subject=verified, profile=profile, scope_missing=scope_missing)
+            record.pop("pending", None)
+            record.pop("pending_client", None)
+            if tokens is not None:
+                record["tokens"] = tokens
+            elif _value(value.get("refresh_token")):
+                record["revocation_unconfirmed"] = True
+            self._store.write(directory, record)
+
+    def _finalize_connect_pending(self, generation, exchange_rejected):
+        with self._store.locked() as directory:
+            record = self._store.read(directory)
+            if record.get("generation") != generation:
+                return
+            pending = record.pop("pending", None)
+            if pending:
+                if pending.get("may_have_sent") and not exchange_rejected:
+                    record["revocation_unconfirmed"] = True
+                self._store.write(directory, record)
+
+    def _observe_registration(self, profile, host_id):
+        with self._store.locked() as directory:
+            record = self._store.read(directory)
+            if record.get("profile") != profile or record.get("host_id") != host_id:
+                raise ConnectionError("connection_retired")
+            # Retain issuance evidence across retirement without granting
+            # a stale callback any client, code or token authority.
+            if record.get("registration_observed") is not True:
+                record["registration_observed"] = True
+                self._store.write(directory, record)
+
+    def _verify_connect_tokens(self, value, *, client, nonce, subject, cancellation, dispatch):
+        id_token = value.get("id_token")
+        if not _value(id_token):
+            raise ConnectionError("invalid_openai_identity")
+        status, keys = self._transport.json(AUTH_HOST, JWKS, cancellation=cancellation, dispatch=dispatch)
+        if status != 200:
+            raise ConnectionError("openai_keys_unavailable")
+        verified = self._verifier.verify(id_token, keys, client, nonce)
+        if not _value(verified, max_length=256) or (subject is not None and verified != subject):
+            raise ConnectionError("openai_account_mismatch")
+        scope = value.get("scope")
+        scope_missing = not isinstance(scope, str) or DIRECT_SCOPE not in scope.split()
+        tokens = None if scope_missing else _parse_tokens(value, self._clock())
+        return verified, scope_missing, tokens
+
+    def connect(self, *, installation_host=None, publication=None, authorization=None, handoff=None):
+        """Sign in within a short registry authorization guard at each local effect."""
+        self.require_prerequisites()
+        if handoff is not None:
+            _check_browser_placement()
+        authorize = authorization or contextlib.nullcontext
+        generation = _random()
+        state, nonce, pkce = _random(), _random(), _random()
+        expires = self._clock() + CONNECT_SECONDS
+        exchange_rejected = False
+
+        def is_pending(record):
+            if (record.get("generation") != generation
+                    or self._clock() >= record.get("pending", {}).get("expires", 0)):
+                raise ConnectionError("connection_retired")
+
+        host_id, profile, client, subject, ask_again = self._begin_connect_state(
+            authorize, generation, expires, installation_host,
+        )
         try:
             with self._operation(generation, is_pending, timeout=CONNECT_SECONDS) as cancellation:
                 dispatch = self._dispatch(is_pending, cancellation)
-                with _CallbackServer(("127.0.0.1", 0), _Callback) as server:
-                    server.cancellation = cancellation
-                    server.timeout = POLL_SECONDS
-                    server.state = state
-                    server.result = None
-                    server.failure = None
-                    server.observe_registration = observe_registration if client is None else None
-                    redirect = f"http://127.0.0.1:{server.server_port}{CALLBACK}"
-                    fields = {"client_id": client or INITIAL_CLIENT, "ext_agent_host_id": host_id,
-                              "response_type": "code", "redirect_uri": redirect, "scope": SCOPES,
-                              "resource": RESOURCE, "state": state, "nonce": nonce,
-                              "code_challenge_method": "S256", "code_challenge": _pkce(pkce)}
-                    if client is None:
-                        fields["agent_name_hint"] = "oc-sandbox"
-                    elif ask_again:
-                        fields["prompt"] = "consent"
-                    cancellation.check()
-                    destination = AUTHORIZE + "?" + urlencode(fields)
-                    with contextlib.ExitStack() as resources:
-                        if handoff is None:
-                            target = resources.enter_context(self._store.browser_redirect(destination))
-                            self._browser(target)
-                        else:
-                            @contextlib.contextmanager
-                            def authorize_start():
-                                with authorize(), self._store.locked() as directory:
-                                    is_pending(self._store.read(directory))
-                                    cancellation.check()
-                                    yield
-
-                            def launch():
-                                cancellation.check()
-                                target = resources.enter_context(self._store.browser_redirect(destination))
-                                return self._try_browser(target, cancellation)
-
-                            path = BROWSER_START + _random()
-                            server.browser_start = _BrowserStart(path, _browser_redirect_response(destination),
-                                                                 authorize_start)
-                            handoff(f"http://127.0.0.1:{server.server_port}{path}", launch)
-                        while server.result is None and server.failure is None:
-                            cancellation.check()
-                            server.handle_request()
-                        if server.failure is not None:
-                            raise server.failure
-                        kind, code, returned_client = server.result
-                with authorize(), self._store.locked() as directory:
-                    record = self._store.read(directory)
-                    is_pending(record)
-                    if record["pending"].get("consumed"):
-                        raise ConnectionError("invalid_openai_callback")
-                    record["pending"]["consumed"] = True
-                    if kind != "ok":
-                        raise ConnectionError("openai_consent_declined")
-                    if client is None:
-                        if not isinstance(returned_client, str) or not CLIENT.fullmatch(returned_client):
-                            raise ConnectionError("invalid_openai_callback")
-                        client = returned_client
-                        record["pending_client"] = client
-                    elif returned_client is not None and returned_client != client:
-                        raise ConnectionError("invalid_openai_callback")
-                    self._store.write(directory, record)
+                redirect, (kind, code, returned_client) = self._run_callback_exchange(
+                    cancellation=cancellation, state=state, nonce=nonce, pkce=pkce,
+                    host_id=host_id, client=client, ask_again=ask_again, handoff=handoff,
+                    authorize=authorize, is_pending=is_pending,
+                    observe_registration=lambda: self._observe_registration(profile, host_id),
+                )
+                client = self._consume_callback(authorize, is_pending, kind, returned_client, client)
                 params = _form({"grant_type": "authorization_code", "client_id": client,
                                 "code": code, "code_verifier": pkce, "redirect_uri": redirect,
                                 "resource": RESOURCE})
@@ -672,53 +738,22 @@ class Connection:
                 if status != 200:
                     exchange_rejected = status == 400 and value.get("error") == "invalid_grant"
                     raise ConnectionError("openai_exchange_failed")
-                id_token = value.get("id_token")
-                if not _value(id_token):
-                    raise ConnectionError("invalid_openai_identity")
-                status, keys = self._transport.json(AUTH_HOST, JWKS,
-                                                    cancellation=cancellation, dispatch=dispatch)
-                if status != 200:
-                    raise ConnectionError("openai_keys_unavailable")
-                verified = self._verifier.verify(id_token, keys, client, nonce)
-                if not _value(verified, max_length=256) or (subject is not None and verified != subject):
-                    raise ConnectionError("openai_account_mismatch")
-                scope = value.get("scope")
-                scope_missing = not isinstance(scope, str) or DIRECT_SCOPE not in scope.split()
-                tokens = None if scope_missing else _parse_tokens(value, self._clock())
-                publish = publication(client) if publication is not None and not scope_missing else authorize()
-                with publish:
-                    with self._store.locked() as directory:
-                        record = self._store.read(directory)
-                        is_pending(record)
-                        cancellation.check()
-                        record.update(client=client, subject=verified, profile=profile,
-                                      scope_missing=scope_missing)
-                        record.pop("pending", None)
-                        record.pop("pending_client", None)
-                        if tokens is not None:
-                            record["tokens"] = tokens
-                        elif _value(value.get("refresh_token")):
-                            record["revocation_unconfirmed"] = True
-                        self._store.write(directory, record)
+                verified, scope_missing, tokens = self._verify_connect_tokens(
+                    value, client=client, nonce=nonce, subject=subject,
+                    cancellation=cancellation, dispatch=dispatch,
+                )
+                self._commit_connect(
+                    client=client, verified=verified, profile=profile, scope_missing=scope_missing,
+                    tokens=tokens, value=value, publication=publication, authorize=authorize,
+                    is_pending=is_pending, cancellation=cancellation,
+                )
                 if scope_missing:
                     raise ConnectionError("chatgpt_plan_scope_missing")
                 return Binding(generation, profile)
         finally:
-            with self._store.locked() as directory:
-                record = self._store.read(directory)
-                if record.get("generation") == generation:
-                    pending = record.pop("pending", None)
-                    if pending:
-                        if pending.get("may_have_sent") and not exchange_rejected:
-                            record["revocation_unconfirmed"] = True
-                        self._store.write(directory, record)
+            self._finalize_connect_pending(generation, exchange_rejected)
 
-    def _refresh(self, binding, *, deadline=None, cancelled=None):
-        wait_until = time.monotonic() + REFRESH_SECONDS + 1
-        if deadline is not None:
-            wait_until = min(wait_until, deadline)
-        waiting = Cancellation(wait_until, cancelled)
-        ticket = _random()
+    def _claim_refresh_slot(self, binding, waiting, ticket, wait_until, cancelled):
         while True:
             waiting.check()
             with self._store.locked() as directory:
@@ -728,34 +763,69 @@ class Connection:
                     raise ConnectionError("connection_retired")
                 now = self._clock()
                 tokens = record["tokens"]
-                pending = record.get("refresh_pending", {})
-                if pending and pending["until"] <= now:
-                    record.pop("refresh_pending")
-                    if pending.get("may_have_sent"):
-                        record.pop("tokens")
-                        record["revocation_unconfirmed"] = True
-                    self._store.write(directory, record)
-                    if pending.get("may_have_sent"):
-                        raise ConnectionError("openai_reconnect_required")
-                    pending = {}
+                pending = self._expire_stale_refresh(directory, record, now)
                 if not pending:
-                    expiry = tokens["expiry"]
-                    earliest = tokens.get("earliest")
-                    if expiry > now + 30 or (earliest is not None and now < earliest < expiry):
-                        return tokens["access"]
-                    if record.get("refresh_retry_after", 0) > now:
-                        if expiry > now:
-                            return tokens["access"]
-                        raise ConnectionError("openai_refresh_deferred")
-                    client = record["client"]
-                    record["refresh_pending"] = {"ticket": ticket, "until": now + REFRESH_SECONDS}
-                    self._store.write(directory, record)
-                    break
+                    return self._decide_refresh_action(directory, record, tokens, ticket, now)
             pause = min(POLL_SECONDS, max(0, wait_until - time.monotonic()))
             if cancelled is None:
                 time.sleep(pause)
             else:
                 cancelled.wait(pause)
+
+    def _expire_stale_refresh(self, directory, record, now):
+        pending = record.get("refresh_pending", {})
+        if not pending or pending["until"] > now:
+            return pending
+        record.pop("refresh_pending")
+        if pending.get("may_have_sent"):
+            record.pop("tokens")
+            record["revocation_unconfirmed"] = True
+        self._store.write(directory, record)
+        if pending.get("may_have_sent"):
+            raise ConnectionError("openai_reconnect_required")
+        return {}
+
+    def _decide_refresh_action(self, directory, record, tokens, ticket, now):
+        expiry = tokens["expiry"]
+        earliest = tokens.get("earliest")
+        if expiry > now + 30 or (earliest is not None and now < earliest < expiry):
+            return tokens["access"], None, None
+        if record.get("refresh_retry_after", 0) > now:
+            if expiry > now:
+                return tokens["access"], None, None
+            raise ConnectionError("openai_refresh_deferred")
+        client = record["client"]
+        record["refresh_pending"] = {"ticket": ticket, "until": now + REFRESH_SECONDS}
+        self._store.write(directory, record)
+        return None, client, tokens
+
+    def _finalize_refresh_slot(self, binding, ticket, outcome, scope_missing):
+        with self._store.locked() as directory:
+            record = self._store.read(directory)
+            if (record.get("generation") != binding.generation
+                    or record.get("refresh_pending", {}).get("ticket") != ticket):
+                return
+            pending = record.pop("refresh_pending")
+            unknown = pending.get("may_have_sent") and outcome is None
+            if unknown or outcome == "invalid":
+                record.pop("tokens", None)
+                if scope_missing:
+                    record["scope_missing"] = True
+                if unknown:
+                    record["revocation_unconfirmed"] = True
+            elif outcome == "retry":
+                record["refresh_retry_after"] = self._clock() + 30
+            self._store.write(directory, record)
+
+    def _refresh(self, binding, *, deadline=None, cancelled=None):
+        wait_until = time.monotonic() + REFRESH_SECONDS + 1
+        if deadline is not None:
+            wait_until = min(wait_until, deadline)
+        waiting = Cancellation(wait_until, cancelled)
+        ticket = _random()
+        cached, client, tokens = self._claim_refresh_slot(binding, waiting, ticket, wait_until, cancelled)
+        if cached is not None:
+            return cached
 
         def is_current(record):
             if (not _active(record, binding)
@@ -765,7 +835,6 @@ class Connection:
 
         outcome = None
         scope_missing = False
-
         try:
             with self._operation(binding.generation, is_current,
                                  deadline=deadline, cancelled=cancelled) as cancellation:
@@ -798,21 +867,7 @@ class Connection:
             scope_missing = error.code == "chatgpt_plan_scope_missing"
             raise
         finally:
-            with self._store.locked() as directory:
-                record = self._store.read(directory)
-                if (record.get("generation") == binding.generation
-                        and record.get("refresh_pending", {}).get("ticket") == ticket):
-                    pending = record.pop("refresh_pending")
-                    unknown = pending.get("may_have_sent") and outcome is None
-                    if unknown or outcome == "invalid":
-                        record.pop("tokens", None)
-                        if scope_missing:
-                            record["scope_missing"] = True
-                        if unknown:
-                            record["revocation_unconfirmed"] = True
-                    elif outcome == "retry":
-                        record["refresh_retry_after"] = self._clock() + 30
-                    self._store.write(directory, record)
+            self._finalize_refresh_slot(binding, ticket, outcome, scope_missing)
 
     def _models(self, binding, access, cancellation):
         status, value = self._transport.json(
@@ -977,7 +1032,7 @@ class Connection:
             self._store.write(directory, record)
         if has_multi:
             remaining = dict(record.get("worker_leases") or {})
-            for key in sorted(list(remaining)):
+            for key in sorted(remaining):
                 lease = WorkerLease.parse(remaining[key])
                 lease.terminal(self._host_for_lease(physical_host, lease))
                 remaining.pop(key, None)

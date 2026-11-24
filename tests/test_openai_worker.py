@@ -35,12 +35,15 @@ _REPLAY_ITEMS = (
 )
 
 def fixture_events(body, *, deadline, cancelled, reasoning=False, tool_only=False, done_only=False):
-    assert time.monotonic() < deadline and not cancelled.is_set()
-    assert body["store"] is False and body["stream"] is True
+    assert time.monotonic() < deadline
+    assert not cancelled.is_set()
+    assert body["store"] is False
+    assert body["stream"] is True
     assert "include" not in body
     assert body["instructions"] == protocol.INSTRUCTIONS
     tool, prompt, *history = body["input"]
-    assert tool["type"] == "additional_tools" and len(tool["tools"]) == 1
+    assert tool["type"] == "additional_tools"
+    assert len(tool["tools"]) == 1
     assert tool["tools"][0]["name"] == "write"
     assert set(tool["tools"][0]["parameters"]["properties"]) == {"path", "content"}
     assert prompt == {"type": "message", "role": "user", "content": protocol.PROMPT}
@@ -49,7 +52,8 @@ def fixture_events(body, *, deadline, cancelled, reasoning=False, tool_only=Fals
         expected_types = ["message", "function_call", "function_call_output"]
         if reasoning:
             expected_types = ["reasoning", "message", "reasoning", "function_call", "function_call_output"]
-            assert history[0] == _REPLAY_ITEMS[0] and history[1 if tool_only else 2] == _REPLAY_ITEMS[1]
+            assert history[0] == _REPLAY_ITEMS[0]
+            assert history[1 if tool_only else 2] == _REPLAY_ITEMS[1]
             if not tool_only:
                 assert history[1]["phase"] == "commentary"
         if tool_only:
@@ -513,11 +517,14 @@ class NativeToolEvidenceTests(unittest.TestCase):
             (started, called, {**success, "data": {**success["data"], "status": "failed"}}),
             (started, called, {**success, "type": "session.tool.failed"}),
         )
+        def run_sequence(items):
+            evidence = worker._NativeWrite()
+            for item in items:
+                evidence.accept(item, observer)
+
         for sequence in cases:
             with self.subTest(sequence=[item["type"] for item in sequence]), self.assertRaises(worker.WorkerError):
-                evidence = worker._NativeWrite()
-                for item in sequence:
-                    evidence.accept(item, observer)
+                run_sequence(sequence)
 
     def test_generated_config_denies_every_integration_connection(self):
         connect = [policy for policy in worker_config()["policies"] if policy["action"] == "integration.connect"]

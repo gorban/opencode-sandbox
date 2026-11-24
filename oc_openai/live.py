@@ -147,6 +147,47 @@ def _mapped_exposure_error(error):
     return RouteUnavailable(reasons.get(str(error), Reason.EXPOSURE_UNAVAILABLE))
 
 
+_EVENT_COMPLETED = "response.completed"
+
+
+def _event_failure(kind, event):
+    details = event.get("response") if kind == "response.failed" else event
+    if isinstance(details, dict) and response_error(0, details) == "chatgpt_usage_limit":
+        raise RouteUnavailable(Reason.PROVIDER_LIMIT)
+    raise RouteUnavailable(Reason.PROVIDER_TERMINAL)
+
+
+def _check_created_id(created_id, kind, event):
+    if created_id is None:
+        if kind != "response.created":
+            raise RouteUnavailable(Reason.PROVIDER_IDENTITY)
+        created = event.get("response")
+        new_id = _response_id(created)
+        if created.get("model", MODEL) != MODEL:
+            raise RouteUnavailable(Reason.PROVIDER_IDENTITY)
+        return new_id
+    if kind == "response.created":
+        raise RouteUnavailable(Reason.PROVIDER_IDENTITY)
+    return created_id
+
+
+def _proposal_reserve(ledger, slot, diagnostic):
+    if diagnostic is None:
+        ledger.require_next(slot)
+        return lambda: ledger.reserve(slot)
+    if type(diagnostic) is not Diagnostic or ledger.prepare_diagnostic(slot, stream=diagnostic.stream) != diagnostic:
+        raise ExposureError("diagnostic_unavailable")
+    return lambda: ledger.reserve_diagnostic(diagnostic)
+
+
+def _verify_worker_evidence(evidence, dispatch, ManagedEvidence):
+    if (type(evidence) is not ManagedEvidence or any(value is not True for value in (
+        evidence.initial_receipt, evidence.continuation_receipt, evidence.native_tool,
+    )) or dispatch.pending is not None or dispatch.delivered is not Phase.CONTINUATION):
+        raise RouteUnavailable(Reason.PROOF_FAILED)
+    return WorkerEvidence(evidence.native_terminal, evidence.exact_file, True, evidence.cleanup_verified)
+
+
 def _running(deadline, cancelled):
     if ((cancelled is not None and cancelled.is_set())
             or (deadline is not None and time.monotonic() >= deadline)):
@@ -184,7 +225,7 @@ class _WorkerDispatch:
             for event in self.backend.events(
                 self.binding, slot, body, before_send, deadline=deadline, cancelled=cancelled,
             ):
-                if event["type"] == "response.completed":
+                if event["type"] == _EVENT_COMPLETED:
                     self.delivered = slot.phase
                 yield event
         except StreamFailure as failure:
@@ -301,12 +342,7 @@ class WorkstationBackend:
         self.connection_state.require_active(binding)
         return binding
 
-    def events(self, binding, slot, body, before_send, *,
-               deadline=None, cancelled=None, diagnostic=None) -> Iterator[dict]:
-        _running(deadline, cancelled)
-        created_id = None
-        terminal = None
-        staged = []
+    def _event_options(self, slot, *, deadline, cancelled, diagnostic):
         options = {"deadline": deadline, "cancelled": cancelled} if deadline is not None else {}
         if diagnostic is not None and diagnostic.stream:
             options["inspect_media"] = True
@@ -316,38 +352,41 @@ class WorkstationBackend:
                 observe_media=lambda category: self.media_fallbacks.setdefault(slot.phase, category),
                 before_write=self.ledger.require_dispatch,
             )
-        with self.connection_state.responses(binding, body, before_send, **options) as events:
-            for count, event in enumerate(events, 1):
-                _running(deadline, cancelled)
-                if (count > MAX_EVENTS or terminal is not None or type(event) is not dict
-                        or type(event.get("type")) is not str):
-                    raise RouteUnavailable(Reason.PROVIDER_STREAM)
-                kind = event["type"]
-                if kind in _PROVIDER_FAILURES:
-                    details = event.get("response") if kind == "response.failed" else event
-                    if isinstance(details, dict) and response_error(0, details) == "chatgpt_usage_limit":
-                        raise RouteUnavailable(Reason.PROVIDER_LIMIT)
-                    raise RouteUnavailable(Reason.PROVIDER_TERMINAL)
-                if created_id is None:
-                    if kind != "response.created":
-                        raise RouteUnavailable(Reason.PROVIDER_IDENTITY)
-                    created = event.get("response")
-                    created_id = _response_id(created)
-                    if created.get("model", MODEL) != MODEL:
-                        raise RouteUnavailable(Reason.PROVIDER_IDENTITY)
-                elif kind == "response.created":
+        return options
+
+    @staticmethod
+    def _collect_events(events, deadline, cancelled):
+        created_id = None
+        terminal = None
+        staged = []
+        for count, event in enumerate(events, 1):
+            _running(deadline, cancelled)
+            if (count > MAX_EVENTS or terminal is not None or type(event) is not dict
+                    or type(event.get("type")) is not str):
+                raise RouteUnavailable(Reason.PROVIDER_STREAM)
+            kind = event["type"]
+            if kind in _PROVIDER_FAILURES:
+                _event_failure(kind, event)
+            created_id = _check_created_id(created_id, kind, event)
+            if kind == _EVENT_COMPLETED:
+                if _response_id(event.get("response")) != created_id:
                     raise RouteUnavailable(Reason.PROVIDER_IDENTITY)
-                if kind == "response.completed":
-                    if _response_id(event.get("response")) != created_id:
-                        raise RouteUnavailable(Reason.PROVIDER_IDENTITY)
-                    terminal = event
-                else:
-                    # The transport already caps each frame and aggregate bytes.
-                    # Keep tool semantics downstream of accounting so even an
-                    # unacceptable tool result can have authoritative usage.
-                    staged.append(event)
-            if terminal is None:
-                raise RouteUnavailable(Reason.PROVIDER_MISSING_COMPLETION)
+                terminal = event
+            else:
+                # The transport already caps each frame and aggregate bytes.
+                # Keep tool semantics downstream of accounting so even an
+                # unacceptable tool result can have authoritative usage.
+                staged.append(event)
+        if terminal is None:
+            raise RouteUnavailable(Reason.PROVIDER_MISSING_COMPLETION)
+        return staged, terminal
+
+    def events(self, binding, slot, body, before_send, *,
+               deadline=None, cancelled=None, diagnostic=None) -> Iterator[dict]:
+        _running(deadline, cancelled)
+        options = self._event_options(slot, deadline=deadline, cancelled=cancelled, diagnostic=diagnostic)
+        with self.connection_state.responses(binding, body, before_send, **options) as events:
+            staged, terminal = self._collect_events(events, deadline, cancelled)
             usage = _usage(terminal.get("response"))
             if diagnostic is None:
                 self.ledger.settle(slot, *usage)
@@ -365,24 +404,28 @@ class WorkstationBackend:
         try:
             binding = self._require_approval(approval, Stage.ORCHESTRATOR)
             slot = _slot(approval, Phase.ORCHESTRATOR)
-            if diagnostic is None:
-                self.ledger.require_next(slot)
-                reserve = lambda: self.ledger.reserve(slot)
-            else:
-                if (type(diagnostic) is not Diagnostic
-                        or self.ledger.prepare_diagnostic(slot, stream=diagnostic.stream) != diagnostic):
-                    raise ExposureError("diagnostic_unavailable")
-                reserve = lambda: self.ledger.reserve_diagnostic(diagnostic)
+            reserve = _proposal_reserve(self.ledger, slot, diagnostic)
             for event in self.events(binding, slot, _proposal_body(), reserve, diagnostic=diagnostic):
-                if event["type"] == "response.completed":
+                if event["type"] == _EVENT_COMPLETED:
                     return _proposal_marker(event["response"])
         except ConnectionError as error:
-            if type(error) is StreamFailure and (self._recovery or diagnostic is not None and diagnostic.stream):
+            if type(error) is StreamFailure and (self._recovery or (diagnostic is not None and diagnostic.stream)):
                 raise StreamRouteUnavailable(error) from None
             raise _mapped_connection_error(error) from None
         except ExposureError as error:
             raise _mapped_exposure_error(error) from None
         raise RouteUnavailable(Reason.PROOF_FAILED)
+
+    def _run_worker_proof(self, approval, binding, worker_fn, dispatch):
+        options = {"allow_progress": True} if self._allow_progress else {}
+        if self._allow_metadata:
+            options["allow_metadata"] = True
+        evidence = worker_fn(
+            dispatch.events, model=MODEL, before_dispatch=dispatch.reserve,
+            lease_guard=lambda job: self.connection_state.worker_lease(binding, job), **options,
+        )
+        self.connection_state.require_active(binding)
+        return evidence
 
     def prove(self, approval):
         if self._trace_only:
@@ -398,18 +441,8 @@ class WorkstationBackend:
             binding = self._require_approval(approval, Stage.WORKER)
             self.ledger.require_next(_slot(approval, Phase.INITIAL))
             dispatch = _WorkerDispatch(self, approval, binding)
-            worker = self._worker or run_worker
-            options = {"allow_progress": True} if self._allow_progress else {}
-            if self._allow_metadata:
-                options["allow_metadata"] = True
-            evidence = worker(dispatch.events, model=MODEL, before_dispatch=dispatch.reserve,
-                              lease_guard=lambda job: self.connection_state.worker_lease(binding, job), **options)
-            self.connection_state.require_active(binding)
-            if type(evidence) is not ManagedEvidence or any(value is not True for value in (
-                evidence.initial_receipt, evidence.continuation_receipt, evidence.native_tool,
-            )) or dispatch.pending is not None or dispatch.delivered is not Phase.CONTINUATION:
-                raise RouteUnavailable(Reason.PROOF_FAILED)
-            return WorkerEvidence(evidence.native_terminal, evidence.exact_file, True, evidence.cleanup_verified)
+            evidence = self._run_worker_proof(approval, binding, self._worker or run_worker, dispatch)
+            return _verify_worker_evidence(evidence, dispatch, ManagedEvidence)
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
         except ExposureError as error:

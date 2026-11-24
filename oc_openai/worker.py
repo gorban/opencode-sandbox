@@ -70,17 +70,14 @@ class _NativeWrite:
         self.called = False
         self.succeeded = False
 
-    def accept(self, event, observer):
-        kind, data = event.get("type"), event.get("data")
-        if (type(kind) is not str or not kind.startswith("session.tool.")
-                or not observer.delivered or not isinstance(data, dict)
-                or data.get("sessionID") != observer.pins.thread_id):
-            return
+    def _validate_identity(self, data, observer):
         assistant_id, call_id = data.get("assistantMessageID"), data.get("id")
         if (type(assistant_id) is not str or assistant_id not in observer.assistants
                 or type(call_id) is not str or not re.fullmatch(r"call_[A-Za-z0-9_-]{1,123}", call_id)):
             raise WorkerError("OpenCode reported unbound tool evidence")
-        identity = (assistant_id, call_id)
+        return (assistant_id, call_id)
+
+    def _apply_step(self, kind, data, identity):
         if kind == "session.tool.input.started":
             if self.identity is not None or data.get("name") != "write":
                 raise WorkerError("OpenCode reported an unexpected tool start")
@@ -90,9 +87,8 @@ class _NativeWrite:
                 or data.get("status") in ("failed", "error", "cancelled", "incomplete")):
             raise WorkerError("OpenCode reported an unexpected tool identity or failure")
         if kind == "session.tool.called":
-            if (self.called or data.get("executed") is not False
-                    or data.get("input") != {"path": protocol.PROOF_PATH,
-                                            "content": protocol.PROOF_BYTES.decode("ascii")}):
+            expected = {"path": protocol.PROOF_PATH, "content": protocol.PROOF_BYTES.decode("ascii")}
+            if self.called or data.get("executed") is not False or data.get("input") != expected:
                 raise WorkerError("OpenCode reported an unexpected tool call")
             self.called = True
         elif kind == "session.tool.success":
@@ -100,6 +96,26 @@ class _NativeWrite:
                     or data.get("status", "completed") != "completed"):
                 raise WorkerError("OpenCode reported an unexpected tool result")
             self.succeeded = True
+
+    def accept(self, event, observer):
+        kind, data = event.get("type"), event.get("data")
+        if (type(kind) is not str or not kind.startswith("session.tool.")
+                or not observer.delivered or not isinstance(data, dict)
+                or data.get("sessionID") != observer.pins.thread_id):
+            return
+        self._apply_step(kind, data, self._validate_identity(data, observer))
+
+
+def _append_turn_text(text: str, early_text: str, final_text: str, *, called: bool) -> tuple[str, str]:
+    if not called:
+        early_text += text
+        if not protocol.INITIAL_TEXT.startswith(early_text):
+            raise WorkerError("OpenCode text did not match the approved workflow")
+    else:
+        final_text += text
+        if not protocol.FINAL_TEXT.startswith(final_text):
+            raise WorkerError("OpenCode text did not match the approved workflow")
+    return early_text, final_text
 
 
 def _native_turn(job):
@@ -117,23 +133,17 @@ def _native_turn(job):
         for native in events:
             event = observer.accept(native)
             tool.accept(native, observer)
-            if event is not None:
-                if event.kind == "text_delta":
-                    if not tool.called:
-                        early_text += event.text
-                        matches = protocol.INITIAL_TEXT.startswith(early_text)
-                    else:
-                        final_text += event.text
-                        matches = protocol.FINAL_TEXT.startswith(final_text)
-                    if not matches:
-                        raise WorkerError("OpenCode text did not match the approved workflow")
-                elif event.kind == "turn_error":
-                    raise WorkerError("OpenCode reported that the managed turn failed")
-                elif event.kind == "turn_completed":
-                    if (early_text in ("", protocol.INITIAL_TEXT) and final_text == protocol.FINAL_TEXT
-                            and tool.succeeded):
-                        return tool.identity[1]
-                    raise WorkerError("OpenCode terminal lacks native text or tool evidence")
+            if event is None:
+                continue
+            if event.kind == "text_delta":
+                early_text, final_text = _append_turn_text(event.text, early_text, final_text, called=tool.called)
+            elif event.kind == "turn_error":
+                raise WorkerError("OpenCode reported that the managed turn failed")
+            elif event.kind == "turn_completed":
+                if (early_text in ("", protocol.INITIAL_TEXT) and final_text == protocol.FINAL_TEXT
+                        and tool.succeeded):
+                    return tool.identity[1]
+                raise WorkerError("OpenCode terminal lacks native text or tool evidence")
     raise WorkerError("OpenCode event subscription ended before the terminal")
 
 
@@ -152,6 +162,31 @@ def _cleanup(job, broker):
         job.close()
     if terminal_error is not None:
         raise terminal_error
+
+
+def _execute_worker_turn(job, stack, responses, before_dispatch, *, lease_guard, allow_progress, allow_metadata):
+    broker = None
+    try:
+        job.prepare()
+        if lease_guard is not None:
+            stack.enter_context(lease_guard(job))
+        job.assert_file(None)
+        broker = Broker(
+            job, responses, before_dispatch, allow_progress=allow_progress, allow_metadata=allow_metadata,
+        )
+        broker.start()
+        job.start()
+        job.activate(broker)
+        call_id = _native_turn(job)
+        if not broker.done.wait(timeout=2) or not broker.complete(call_id):
+            raise WorkerError("Managed tool continuation receipt is missing")
+        job.assert_file(protocol.PROOF_BYTES)
+        return broker
+    except (JobRuntimeError, ProbeError, WorkerError, OSError, ValueError):
+        if broker is None:
+            raise WorkerProofError(None, protocol.Fault.PLACEMENT) from None
+        failure = broker.failure() or (None, protocol.Fault.NATIVE)
+        raise WorkerProofError(*failure) from None
 
 
 def run_worker(responses, *, model, before_dispatch, worker_image=WORKER_IMAGE, relay_image=RELAY_IMAGE,
@@ -179,26 +214,11 @@ def run_worker(responses, *, model, before_dispatch, worker_image=WORKER_IMAGE, 
     try:
         with ExitStack() as stack:
             try:
-                job.prepare()
-                if lease_guard is not None:
-                    stack.enter_context(lease_guard(job))
-                job.assert_file(None)
-                broker = Broker(
-                    job, responses, before_dispatch, allow_progress=allow_progress, allow_metadata=allow_metadata,
+                broker = _execute_worker_turn(
+                    job, stack, responses, before_dispatch,
+                    lease_guard=lease_guard, allow_progress=allow_progress, allow_metadata=allow_metadata,
                 )
-                broker.start()
-                job.start()
-                job.activate(broker)
-                call_id = _native_turn(job)
-                if not broker.done.wait(timeout=2) or not broker.complete(call_id):
-                    raise WorkerError("Managed tool continuation receipt is missing")
-                job.assert_file(protocol.PROOF_BYTES)
                 verified = True
-            except (JobRuntimeError, ProbeError, WorkerError, OSError, ValueError):
-                if broker is None:
-                    raise WorkerProofError(None, protocol.Fault.PLACEMENT) from None
-                failure = broker.failure() or (None, protocol.Fault.NATIVE)
-                raise WorkerProofError(*failure) from None
             finally:
                 try:
                     try:

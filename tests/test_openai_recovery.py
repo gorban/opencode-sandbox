@@ -201,53 +201,58 @@ class RecoveryProofTests(unittest.TestCase):
             with self.assertRaisesRegex(ExposureError, "diagnostic_unavailable"):
                 proof.require_dispatch()
             proof.settle(proposal, 3, 7)
+            initial_slot = self.slot("4", Phase.INITIAL)
             with self.assertRaisesRegex(ExposureError, "diagnostic_unavailable"):
-                proof.reserve(self.slot("4", Phase.INITIAL))
+                proof.reserve(initial_slot)
         self.assertEqual(json.loads(self.receipt.read_text())["phases"][-1]["actual"], [3, 7])
 
     def test_nonexact_predecessor_conflict_and_replay_fail_closed(self):
         proposal = self.slot("4")
+        other_proposal = self.slot("5")
         first = RecoveryLedger(self.ledger, proposal, SOURCE)
-        competing = RecoveryLedger(self.ledger, self.slot("5"), SOURCE)
+        competing = RecoveryLedger(self.ledger, other_proposal, SOURCE)
         identical = RecoveryLedger(self.ledger, proposal, SOURCE)
         for permit in (first, competing, identical):
             permit.approve(time.monotonic(), lambda: True)
         for phase in (Phase.INITIAL, Phase.CONTINUATION):
+            wrong_phase = replace(proposal, phase=phase)
             with self.assertRaises(ExposureError):
-                first.reserve(replace(proposal, phase=phase))
+                first.reserve(wrong_phase)
         first.reserve(proposal)
         with self.assertRaises(ExposureError):
             identical.settle(proposal, 1, 1)
         with self.assertRaises(ExposureError):
-            competing.reserve(self.slot("5"))
+            competing.reserve(other_proposal)
         with self.assertRaises(ExposureError):
             first.reserve(proposal)
+        initial_phase = replace(proposal, phase=Phase.INITIAL)
         with self.assertRaisesRegex(ExposureError, "unsettled_exposure"):
-            first.reserve(replace(proposal, phase=Phase.INITIAL))
+            first.reserve(initial_phase)
         with self.assertRaises(ExposureError):
             self.ledger.settle_diagnostic(self.stream, 1, 1)
         with self.assertRaisesRegex(ExposureError, "exposure_bound_exceeded"):
             first.settle(proposal, 1, 128_001)
         with self.assertRaisesRegex(ExposureError, "exposure_bound_exceeded"):
-            first.reserve(replace(proposal, phase=Phase.INITIAL))
+            first.reserve(initial_phase)
         first.close()
         with self.assertRaisesRegex(ExposureError, "diagnostic_already_reserved"):
-            RecoveryLedger(self.ledger, self.slot("5"), SOURCE)
+            RecoveryLedger(self.ledger, other_proposal, SOURCE)
 
     def test_mutation_of_history_or_corrupt_recovery_state_fails_closed(self):
-        proof = RecoveryLedger(self.ledger, self.slot("4"), SOURCE)
+        proposal = self.slot("4")
+        proof = RecoveryLedger(self.ledger, proposal, SOURCE)
         proof.approve(time.monotonic(), lambda: True)
         self.receipt.write_text("false")
         self.receipt.chmod(0o600)
         with self.assertRaises(ExposureError):
-            proof.reserve(self.slot("4"))
+            proof.reserve(proposal)
         self.assertEqual(self.receipt.read_text(), "false")
         self.receipt.unlink()
         old_stream = self.state / PRIOR_NAMES[-1]
         previous = json.loads(old_stream.read_text())
         old_stream.write_text(json.dumps({**previous, "run": "7" * 32}))
         with self.assertRaises(ExposureError):
-            proof.reserve(self.slot("4"))
+            proof.reserve(proposal)
         self.assertFalse(self.receipt.exists())
 
     def test_expiry_or_foreground_loss_after_reservation_denies_first_byte(self):
@@ -351,8 +356,9 @@ class RecoveryProofTests(unittest.TestCase):
         target.write_text("corrupt")
         with self.assertRaises(ExposureError):
             self.ledger.require_quiescent()
+        retry_slot = self.slot("9", Phase.INITIAL)
         with self.assertRaisesRegex(ExposureError, "diagnostic_already_reserved"):
-            RecoveryLedger(self.ledger, self.slot("9", Phase.INITIAL), SOURCE, worker_only=True)
+            RecoveryLedger(self.ledger, retry_slot, SOURCE, worker_only=True)
         with self.assertRaises(cli.RouteUnavailable):
             backend.recovery_proof(approval, SOURCE, worker_only=True, after_retry=True)
 
@@ -514,8 +520,11 @@ class RecoveryProofTests(unittest.TestCase):
 
         def cleanup_uncertain(events, *, model, before_dispatch, lease_guard):
             before_dispatch("initial")
+            body = body_for(model)
+            deadline = time.monotonic() + 2
+            cancelled = threading.Event()
             with self.assertRaises(StreamFailure):
-                list(events(body_for(model), deadline=time.monotonic() + 2, cancelled=threading.Event()))
+                list(events(body, deadline=deadline, cancelled=cancelled))
             raise WorkerCleanupError("oc-i4a-01234567")
 
         backend, approval = self.prepare_worker_retry(worker=cleanup_uncertain)

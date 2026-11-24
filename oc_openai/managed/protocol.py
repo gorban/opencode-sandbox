@@ -259,11 +259,26 @@ def _reasoning_position(index, identifier, seen):
     require(previous == identifier)
 
 
+_EV_CREATED = "response.created"
+_EV_ITEM_ADDED = "response.output_item.added"
+_EV_ITEM_DONE = "response.output_item.done"
+_EV_COMPLETED = "response.completed"
+_ALLOWED_EVENTS = frozenset({
+    _EV_CREATED, "response.in_progress", _EV_ITEM_ADDED, _EV_ITEM_DONE,
+    "response.content_part.added", "response.content_part.done",
+    "response.output_text.delta", "response.output_text.done",
+    "response.function_call_arguments.delta", "response.function_call_arguments.done",
+    _EV_COMPLETED, "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+    "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+    "response.reasoning_text.delta", "response.reasoning_text.done",
+})
+
+
 def _reasoning_frame(kind, event, seen, completed):
-    if kind in ("response.output_item.done", "response.output_item.added"):
+    if kind in (_EV_ITEM_DONE, _EV_ITEM_ADDED):
         item = event["item"]
         index = event.get("output_index")
-        if kind == "response.output_item.done":
+        if kind == _EV_ITEM_DONE:
             require(type(index) is int and 0 <= index < 8 and index not in completed)
             ciphertext = _reasoning_item(item) if item["type"] == "reasoning" else None
             completed[index] = (item["type"], _identifier(item.get("id")), ciphertext)
@@ -392,55 +407,81 @@ def _validate_metadata(event, response_id):
         require(metadata.get("openai_chatgpt_moderation_metadata", {}) in ({}, {"presentation": "inline"}))
 
 
+def _check_event_envelope(event, count, total_bytes, terminal, cancelled, *, allow_metadata):
+    with checking(Fault.EVENT_SEQUENCE):
+        require(not cancelled.is_set() and type(event) is dict and terminal is None)
+    with checking(Fault.EVENT_COUNT):
+        require(count <= _MAX_EVENTS)
+    try:
+        total_bytes += len(json.dumps(event, ensure_ascii=True, allow_nan=False))
+    except (ValueError, TypeError, RecursionError):
+        raise Refused("Invalid upstream event", fault=Fault.EVENT_BYTES) from None
+    with checking(Fault.EVENT_BYTES):
+        require(total_bytes <= MAX_RESPONSE)
+    kind = event.get("type")
+    with checking(Fault.EVENT_LABEL):
+        require(type(kind) is str and len(kind) <= 96 and _EVENT_LABEL.fullmatch(kind))
+    if allow_metadata:
+        with checking(Fault.SAFETY_BUFFERING):
+            require(event.get("safety_buffering", False) is False)
+            metadata = event.get("metadata")
+            require(type(metadata) is not dict or metadata.get("type") != "safety_buffering")
+    return kind, total_bytes
+
+
+def _validate_intermediate(kind, event, response_id, initial, seen_reasoning, completed_reasoning, *, allow_progress):
+    with checking(Fault.EVENT_SEQUENCE):
+        require(kind != _EV_CREATED)
+    if kind == "response.output_text.annotation.added":
+        raise Refused("Unsupported text annotation", fault=Fault.ANNOTATION)
+    if kind.startswith(_UNSUPPORTED_EVENTS) or kind in ("response.failed", "response.incomplete", "error"):
+        raise Refused("Unsupported upstream event", fault=Fault.EVENT_UNSUPPORTED)
+    with checking(Fault.EVENT_UNKNOWN):
+        require(kind in _ALLOWED_EVENTS)
+    if kind in (_EV_ITEM_ADDED, _EV_ITEM_DONE):
+        with checking(Fault.EVENT_ITEM):
+            item = event.get("item")
+            index = event.get("output_index")
+            require(type(item) is dict and item.get("type") in ("message", "function_call", "reasoning"))
+            if allow_progress:
+                require(type(index) is int and 0 <= index < 8)
+    if initial:
+        with checking(Fault.REASONING):
+            require(event.get("response_id", response_id) == response_id)
+            _reasoning_frame(kind, event, seen_reasoning, completed_reasoning)
+
+
+def _validate_queued(event, response_id):
+    with checking(Fault.EVENT_SEQUENCE):
+        queued = event.get("response")
+        require(type(queued) is dict and queued.get("id") == response_id and queued.get("status") == "queued"
+                and queued.get("output", []) == [] and queued.get("error") is None
+                and queued.get("incomplete_details") is None)
+
+
 def validate(events, model, initial, cancelled, *, allow_progress=False, allow_metadata=False):
     """Buffer the proof through terminal validation before exposing executable items."""
-    allowed = {"response.created", "response.in_progress", "response.output_item.added",
-               "response.output_item.done", "response.content_part.added", "response.content_part.done",
-               "response.output_text.delta", "response.output_text.done", "response.function_call_arguments.delta",
-               "response.function_call_arguments.done", "response.completed",
-               "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
-               "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
-               "response.reasoning_text.delta", "response.reasoning_text.done"}
     terminal = None
     response_id = None
     seen_reasoning = {}
     completed_reasoning = {}
     total_bytes = 0
     for count, event in enumerate(events, 1):
-        with checking(Fault.EVENT_SEQUENCE):
-            require(not cancelled.is_set() and type(event) is dict and terminal is None)
-        with checking(Fault.EVENT_COUNT):
-            require(count <= _MAX_EVENTS)
-        try:
-            total_bytes += len(json.dumps(event, ensure_ascii=True, allow_nan=False))
-        except (ValueError, TypeError, RecursionError):
-            raise Refused("Invalid upstream event", fault=Fault.EVENT_BYTES) from None
-        with checking(Fault.EVENT_BYTES):
-            require(total_bytes <= MAX_RESPONSE)
-        kind = event.get("type")
-        with checking(Fault.EVENT_LABEL):
-            require(type(kind) is str and len(kind) <= 96 and _EVENT_LABEL.fullmatch(kind))
-        if allow_metadata:
-            with checking(Fault.SAFETY_BUFFERING):
-                require(event.get("safety_buffering", False) is False)
-                metadata = event.get("metadata")
-                require(type(metadata) is not dict or metadata.get("type") != "safety_buffering")
+        kind, total_bytes = _check_event_envelope(
+            event, count, total_bytes, terminal, cancelled, allow_metadata=allow_metadata,
+        )
         if count == 1:
             with checking(Fault.EVENT_SEQUENCE):
-                require(kind == "response.created" and type(event.get("response")) is dict)
+                require(kind == _EV_CREATED and type(event.get("response")) is dict)
                 response_id = _identifier(event["response"].get("id"))
         elif allow_progress and kind == "response.queued":
-            with checking(Fault.EVENT_SEQUENCE):
-                queued = event.get("response")
-                require(type(queued) is dict and queued.get("id") == response_id and queued.get("status") == "queued"
-                        and queued.get("output", []) == [] and queued.get("error") is None
-                        and queued.get("incomplete_details") is None)
+            _validate_queued(event, response_id)
         elif allow_progress and kind in ("ping", "keepalive"):
             with checking(Fault.EVENT_LABEL):
                 require(event.keys() == {"type"})
         elif allow_metadata and kind == "response.metadata":
             _validate_metadata(event, response_id)
-        elif kind == "response.completed":
+        elif kind == _EV_COMPLETED:
             response = event.get("response")
             with checking(Fault.EVENT_SEQUENCE):
                 require(type(response) is dict and response.get("id") == response_id)
@@ -448,25 +489,9 @@ def validate(events, model, initial, cancelled, *, allow_progress=False, allow_m
                 response, model, initial, seen_reasoning, completed_reasoning, strict_annotations=allow_progress,
             )
         else:
-            with checking(Fault.EVENT_SEQUENCE):
-                require(kind != "response.created")
-            if kind == "response.output_text.annotation.added":
-                raise Refused("Unsupported text annotation", fault=Fault.ANNOTATION)
-            if kind.startswith(_UNSUPPORTED_EVENTS) or kind in ("response.failed", "response.incomplete", "error"):
-                raise Refused("Unsupported upstream event", fault=Fault.EVENT_UNSUPPORTED)
-            with checking(Fault.EVENT_UNKNOWN):
-                require(kind in allowed)
-            if kind in ("response.output_item.added", "response.output_item.done"):
-                with checking(Fault.EVENT_ITEM):
-                    item = event.get("item")
-                    index = event.get("output_index")
-                    require(type(item) is dict and item.get("type") in ("message", "function_call", "reasoning"))
-                    if allow_progress:
-                        require(type(index) is int and 0 <= index < 8)
-            if initial:
-                with checking(Fault.REASONING):
-                    require(event.get("response_id", response_id) == response_id)
-                    _reasoning_frame(kind, event, seen_reasoning, completed_reasoning)
+            _validate_intermediate(
+                kind, event, response_id, initial, seen_reasoning, completed_reasoning, allow_progress=allow_progress,
+            )
     with checking(Fault.EVENT_SEQUENCE):
         require(terminal is not None and not cancelled.is_set())
     return terminal
@@ -477,21 +502,21 @@ def project(terminal):
     def sse(kind, **values):
         return b"data: " + json.dumps({"type": kind, **values}, separators=(",", ":")).encode("ascii") + b"\n\n"
 
-    yield sse("response.created", response={**terminal, "status": "in_progress", "output": [], "usage": None})
+    yield sse(_EV_CREATED, response={**terminal, "status": "in_progress", "output": [], "usage": None})
     for index, item in enumerate(terminal["output"]):
         if item["type"] == "message":
-            yield sse("response.output_item.added", output_index=index,
+            yield sse(_EV_ITEM_ADDED, output_index=index,
                       item={**item, "status": "in_progress", "content": []})
             text = item["content"][0]["text"]
             for delta in (text[:len(text) // 2], text[len(text) // 2:]):
                 yield sse("response.output_text.delta", output_index=index, item_id=item["id"], content_index=0,
                           delta=delta)
         else:
-            yield sse("response.output_item.added", output_index=index,
+            yield sse(_EV_ITEM_ADDED, output_index=index,
                       item={**item, "status": "in_progress", "arguments": ""})
             yield sse("response.function_call_arguments.delta", output_index=index, item_id=item["id"],
                       delta=item["arguments"])
             yield sse("response.function_call_arguments.done", output_index=index, item_id=item["id"],
                       arguments=item["arguments"])
-        yield sse("response.output_item.done", output_index=index, item=item)
-    yield sse("response.completed", response=terminal)
+        yield sse(_EV_ITEM_DONE, output_index=index, item=item)
+    yield sse(_EV_COMPLETED, response=terminal)

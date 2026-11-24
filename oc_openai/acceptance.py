@@ -49,6 +49,41 @@ def _approve(
     return _matches_current(terminal, backend, approval)
 
 
+def _prepare_proposal(terminal: Terminal, backend: Backend, binding, proposal, recovery: RecoveryMode | None):
+    if recovery is not None:
+        ticket = backend.require_acceptance(proposal, recovery=recovery)
+        stream = recovery is RecoveryMode.STREAM
+        if type(ticket) is not Diagnostic or ticket.stream != stream:
+            raise RouteUnavailable(Reason.DIAGNOSTIC_UNAVAILABLE)
+        if stream:
+            prior = "The original workstation request and first diagnostic both remain unknown."
+            bounds = "2,766,000 input and 384,000 output tokens"
+            question = "Send the one workstation stream diagnostic request?"
+        else:
+            prior = "The original workstation request remains unknown."
+            bounds = "1,844,000 input and 256,000 output tokens"
+            question = "Send the one workstation diagnostic request?"
+        terminal.write(
+            f"Active registration: {binding.label}. {prior} "
+            f"This diagnostic sends one fixed text prompt to OpenAI using {MODEL}. Its reservation "
+            "adds up to 922,000 input and 128,000 output tokens. Counting every earlier reservation "
+            f"in full, the total reserved exposure is {bounds}. "
+            f"{_USAGE_REVIEW} OpenAI determines actual usage and may use your ChatGPT "
+            "plan or account credits. There is no verified hard spending cap. This diagnostic ends without a worker."
+        )
+        return ticket, question
+    backend.require_acceptance(proposal)
+    terminal.write(
+        f"Active registration: {binding.label}. ChatGPT plan acceptance will send one fixed text "
+        f"prompt to OpenAI using {MODEL}. "
+        "The prompt only asks for a marker for the disposable proof. This approval reserves up "
+        f"to 922,000 input and 128,000 output tokens. {_USAGE_REVIEW} "
+        "OpenAI may use your ChatGPT plan or account credits. "
+        "There is no verified hard spending cap. API-key fallback is disabled."
+    )
+    return None, "Send one GPT request to propose the proof?"
+
+
 def _prove(terminal: Terminal, backend: Backend, *, recovery: RecoveryMode | None) -> int:
     binding = backend.connection()
     if not _valid_binding(binding):
@@ -61,39 +96,7 @@ def _prove(terminal: Terminal, backend: Backend, *, recovery: RecoveryMode | Non
         RecoveryMode.STREAM: "Workstation stream diagnostic",
     }.get(recovery, "Workstation proposal")
     try:
-        if recovery is not None:
-            ticket = backend.require_acceptance(proposal, recovery=recovery)
-            stream = recovery is RecoveryMode.STREAM
-            if type(ticket) is not Diagnostic or ticket.stream != stream:
-                raise RouteUnavailable(Reason.DIAGNOSTIC_UNAVAILABLE)
-            if stream:
-                prior = "The original workstation request and first diagnostic both remain unknown."
-                bounds = "2,766,000 input and 384,000 output tokens"
-                question = "Send the one workstation stream diagnostic request?"
-            else:
-                prior = "The original workstation request remains unknown."
-                bounds = "1,844,000 input and 256,000 output tokens"
-                question = "Send the one workstation diagnostic request?"
-            terminal.write(
-                f"Active registration: {binding.label}. {prior} "
-                f"This diagnostic sends one fixed text prompt to OpenAI using {MODEL}. Its reservation "
-                "adds up to 922,000 input and 128,000 output tokens. Counting every earlier reservation "
-                f"in full, the total reserved exposure is {bounds}. "
-                f"{_USAGE_REVIEW} OpenAI determines actual usage and may use your ChatGPT "
-                "plan or account credits. There is no verified hard spending cap. This diagnostic ends without a worker."
-            )
-        else:
-            ticket = None
-            backend.require_acceptance(proposal)
-            terminal.write(
-                f"Active registration: {binding.label}. ChatGPT plan acceptance will send one fixed text "
-                f"prompt to OpenAI using {MODEL}. "
-                "The prompt only asks for a marker for the disposable proof. This approval reserves up "
-                f"to 922,000 input and 128,000 output tokens. {_USAGE_REVIEW} "
-                "OpenAI may use your ChatGPT plan or account credits. "
-                "There is no verified hard spending cap. API-key fallback is disabled."
-            )
-            question = "Send one GPT request to propose the proof?"
+        ticket, question = _prepare_proposal(terminal, backend, binding, proposal, recovery)
         if not _approve(terminal, backend, proposal, question):
             return 1
         response = backend.propose(proposal, diagnostic=ticket) if ticket is not None else backend.propose(proposal)
@@ -126,18 +129,18 @@ def _prove(terminal: Terminal, backend: Backend, *, recovery: RecoveryMode | Non
     )
     if not _approve(terminal, backend, worker, "Start one local worker and authorize up to two requests?"):
         return 1
-    return _finish_worker(terminal, backend, worker)
+    return 0 if _finish_worker(terminal, backend, worker) else 1
 
 
-def _finish_worker(terminal, backend, worker):
+def _finish_worker(terminal, backend, worker) -> bool:
     evidence = backend.prove(worker)
     if type(evidence) is not WorkerEvidence or not all(value is True for value in (
         evidence.native_terminal, evidence.exact_scratch, evidence.exact_receipt, evidence.owned_cleanup,
     )):
         terminal.error("Could not verify the local OpenCode proof and cleanup.")
-        return 1
+        return False
     terminal.write("OpenCode completed the scratch-file proof. Verified tool delivery and worker cleanup.")
-    return 0
+    return True
 
 
 def _recovery(terminal, backend, source):
@@ -175,7 +178,7 @@ def _recovery(terminal, backend, source):
             worker = Approval(proposal.run_id, binding, Stage.WORKER)
             if not _matches_current(terminal, backend, worker):
                 return 1
-            return _finish_worker(terminal, proof, worker)
+            return 0 if _finish_worker(terminal, proof, worker) else 1
         except StreamRouteUnavailable as error:
             terminal.error(error.failure.describe())
             return report_failure(terminal, error, operation="Recovery proof")

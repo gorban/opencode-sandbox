@@ -36,8 +36,9 @@ _STREAM_CODES = frozenset({
     "provider_stream_json", "provider_stream_event_type", "provider_stream_named_done",
     "provider_stream_after_terminal", "provider_network_error",
 })
+_EVENT_COMPLETED = "response.completed"
 _EVENT_NAMES = frozenset({
-    "response.created", "response.in_progress", "response.completed", "response.failed",
+    "response.created", "response.in_progress", _EVENT_COMPLETED, "response.failed",
     "response.incomplete", "response.done", "response.output_text.delta", "response.output_text.done",
     "response.output_item.added", "response.output_item.done", "message", "done", "ping", "keepalive", "error",
 })
@@ -204,6 +205,7 @@ def _address_list(host, cancellation):
 
 def _connect(host, cancellation):
     context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     for family, kind, protocol, _, address in _address_list(host, cancellation):
         cancellation.check()
         try:
@@ -286,6 +288,16 @@ class _StrictResponse(http.client.HTTPResponse):
             if self.fp is headers:
                 self.fp = raw
 
+    def _consume_chunk_trailers(self):
+        for _ in range(100):
+            line = self.fp.readline(self._max_line + 1)
+            if line == b"\r\n":
+                self._close_conn()
+                return None
+            if len(line) > self._max_line or not line.endswith(b"\r\n") or b":" not in line:
+                raise http.client.HTTPException("incomplete chunk trailer")
+        raise http.client.HTTPException("too many chunk trailers")
+
     def _get_chunk_left(self):
         remaining = self.chunk_left
         if not remaining:
@@ -296,18 +308,38 @@ class _StrictResponse(http.client.HTTPResponse):
                 raise http.client.HTTPException("invalid chunk size")
             remaining = int(size.rstrip(b"\r\n").split(b";", 1)[0].strip(), 16)
             if remaining == 0:
-                for _ in range(100):
-                    line = self.fp.readline(self._max_line + 1)
-                    if line == b"\r\n":
-                        self._close_conn()
-                        remaining = None
-                        break
-                    if len(line) > self._max_line or not line.endswith(b"\r\n") or b":" not in line:
-                        raise http.client.HTTPException("incomplete chunk trailer")
-                else:
-                    raise http.client.HTTPException("too many chunk trailers")
+                remaining = self._consume_chunk_trailers()
             self.chunk_left = remaining
         return remaining
+
+
+def _split_sse_block(block, pending, trailing_cr, max_line):
+    lines = []
+    start = 0
+    if trailing_cr:
+        if block.startswith(b"\n"):
+            pending.append(10)
+            start = 1
+        if len(pending) > max_line:
+            raise ConnectionError("provider_stream_limit")
+        lines.append(bytes(pending[:-(start + 1)]))
+        pending.clear()
+        trailing_cr = False
+    for end in _SSE_END.finditer(block, start):
+        pending.extend(block[start:end.end()])
+        start = end.end()
+        if len(pending) > max_line:
+            raise ConnectionError("provider_stream_limit")
+        # A trailing CR may be the first byte of a CRLF split across reads.
+        if start == len(block) and end.group() == b"\r":
+            trailing_cr = True
+            break
+        lines.append(bytes(pending[:-(end.end() - end.start())]))
+        pending.clear()
+    pending.extend(block[start:])
+    if len(pending) > max_line:
+        raise ConnectionError("provider_stream_limit")
+    return lines, trailing_cr
 
 
 def _stream_lines(response, cancellation, evidence, prefix=b"", *, limits=None):
@@ -326,30 +358,8 @@ def _stream_lines(response, cancellation, evidence, prefix=b"", *, limits=None):
             raise ConnectionError("provider_stream_limit")
         if not block and response.length not in (None, 0):
             raise ConnectionError("provider_stream_incomplete")
-        start = 0
-        if trailing_cr:
-            if block.startswith(b"\n"):
-                pending.append(10)
-                start = 1
-            if len(pending) > active.max_line:
-                raise ConnectionError("provider_stream_limit")
-            yield bytes(pending[:-(start + 1)])
-            pending.clear()
-            trailing_cr = False
-        for end in _SSE_END.finditer(block, start):
-            pending.extend(block[start:end.end()])
-            start = end.end()
-            if len(pending) > active.max_line:
-                raise ConnectionError("provider_stream_limit")
-            # A trailing CR may be the first byte of a CRLF split across reads.
-            if start == len(block) and end.group() == b"\r":
-                trailing_cr = True
-                break
-            yield bytes(pending[:-(end.end() - end.start())])
-            pending.clear()
-        pending.extend(block[start:])
-        if len(pending) > active.max_line:
-            raise ConnectionError("provider_stream_limit")
+        lines, trailing_cr = _split_sse_block(block, pending, trailing_cr, active.max_line)
+        yield from lines
         if not block:
             if pending:
                 raise ConnectionError("provider_stream_incomplete")
@@ -383,6 +393,19 @@ def _media_shape(headers):
     return "one", _MEDIA_TYPES.get(media_type, "other")
 
 
+def _classify_prefix(prefix):
+    text = prefix.removeprefix(b"\xef\xbb\xbf").lstrip(b" \r\n\t")
+    if text.startswith(_SSE_PREFIXES):
+        return "sse-like"
+    if text.startswith((b"{", b"[")):
+        return "json-like"
+    if text.startswith(b"<"):
+        return "markup-like"
+    if not text or b"\xef\xbb\xbf".startswith(text) or any(tag.startswith(text) for tag in _SSE_PREFIXES):
+        return None
+    return "other"
+
+
 def _inspect_prefix(response, cancellation, evidence):
     evidence.prefix_shape = "inconclusive"
     prefix = b""
@@ -391,32 +414,24 @@ def _inspect_prefix(response, cancellation, evidence):
             block = response.read1(_PREFIX_LIMIT - len(prefix))
         except (OSError, http.client.HTTPException):
             cancellation.check(allow_timeout=True)
-            return
+            return None
         evidence.raw_bytes += len(block)
         evidence.prefix_bytes += len(block)
         if not cancellation.check(allow_timeout=True):
-            return
+            return None
         if not block:
             if not prefix and response.isclosed() and response.length in (None, 0):
                 evidence.prefix_shape = "empty"
-            return
+            return None
         prefix += block
-        text = prefix.removeprefix(b"\xef\xbb\xbf").lstrip(b" \r\n\t")
-        if text.startswith(_SSE_PREFIXES):
-            evidence.prefix_shape = "sse-like"
-        elif text.startswith((b"{", b"[")):
-            evidence.prefix_shape = "json-like"
-        elif text.startswith(b"<"):
-            evidence.prefix_shape = "markup-like"
-        elif not text or b"\xef\xbb\xbf".startswith(text) or any(tag.startswith(text) for tag in _SSE_PREFIXES):
-            continue
-        else:
-            evidence.prefix_shape = "other"
-        return prefix
+        shape = _classify_prefix(prefix)
+        if shape is not None:
+            evidence.prefix_shape = shape
+            return prefix
+    return None
 
 
-def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None, limits=None):
-    active = _active_limits(limits)
+def _resolve_stream_prefix(response, cancellation, evidence, *, inspect_media, observe_media):
     prefix = b""
     if inspect_media or observe_media is not None:
         evidence.media_fields, evidence.media = _media_shape(response.headers)
@@ -437,11 +452,131 @@ def _events(response, cancellation, evidence, *, inspect_media=False, observe_me
         observe_media(evidence.media)
     if not inspect_media and observe_media is None:
         evidence.media = "sse"
-    data = []
-    event_name = None
-    events = 0
-    done = False
-    completed = None
+    return prefix
+
+
+def _check_done_line(line, evidence):
+    if line.startswith(b":"):
+        evidence.line = "comment"
+    elif line:
+        evidence.line = "suffix"
+    else:
+        evidence.line = "separator"
+    if line and not line.startswith(b":"):
+        raise ConnectionError("provider_stream_after_terminal")
+
+
+def _decode_sse_frame(payload, event_name, evidence):
+    try:
+        frame = decode_json(payload)
+    except (ValueError, RecursionError):
+        raise ConnectionError("provider_stream_json") from None
+    if not isinstance(frame, dict) or not isinstance(frame.get("type"), str):
+        raise ConnectionError("provider_stream_event_type")
+    kind = frame["type"]
+    evidence.json_type = kind if kind in _EVENT_NAMES else "other"
+    evidence.completed_seen |= kind == _EVENT_COMPLETED
+    try:
+        if event_name not in (None, b"", b"message") and kind.encode("utf-8") != event_name:
+            raise ConnectionError("provider_stream_event_type")
+    except UnicodeEncodeError:
+        raise ConnectionError("provider_stream_event_type") from None
+    return frame, kind
+
+
+class _SseParser:
+    def __init__(self, evidence, active, prefix, cancellation):
+        self.evidence = evidence
+        self.active = active
+        self.prefix = prefix
+        self.cancellation = cancellation
+        self.data = []
+        self.event_name = None
+        self.events = 0
+        self.done = False
+        self.completed = None
+
+    def _flush_data(self):
+        self.evidence.line = "separator"
+        self.events += 1
+        self.evidence.events = self.events
+        if self.events > self.active.max_events:
+            raise ConnectionError("provider_stream_limit")
+        payload = b"\n".join(self.data)
+        self.data.clear()
+        name, self.event_name = self.event_name, None
+        if payload == b"[DONE]":
+            self.evidence.done_seen = True
+            if name is not None and (self.completed is None or name not in {b"done", b"message"}):
+                raise ConnectionError("provider_stream_named_done")
+            self.done = True
+            return None
+        frame, kind = _decode_sse_frame(payload, name, self.evidence)
+        self.cancellation.check()
+        if self.completed is not None:
+            raise ConnectionError("provider_stream_after_terminal")
+        if kind == _EVENT_COMPLETED:
+            # A caller may stop consuming as soon as success is delivered.
+            # Verify the remaining HTTP framing before exposing completion.
+            self.completed = frame
+            return None
+        return frame
+
+    def _handle_other_line(self, line):
+        self.evidence.line = "comment" if line.startswith(b":") else "field"
+        standard_field = (
+            line == b"id" or line.startswith(b"id:")
+            or line == b"retry" or line.startswith(b"retry:")
+        )
+        if self.prefix and self.evidence.line == "field" and not standard_field:
+            raise ConnectionError("provider_stream_event_type")
+
+    def _feed_event_line(self, line):
+        self.evidence.line = "event"
+        if self.event_name is not None:
+            raise ConnectionError("provider_stream_event_type")
+        self.event_name = line[6:].removeprefix(b" ")
+        self.evidence.sse = _SSE_NAMES.get(self.event_name, "other")
+
+    def _feed_data_line(self, line):
+        self.evidence.line = "data"
+        if not self.data:
+            self.evidence.sse = _SSE_NAMES.get(self.event_name, "other")
+            self.evidence.json_type = "none"
+        field = line[5:]
+        self.data.append(field[1:] if field.startswith(b" ") else field)
+
+    def _feed_separator(self):
+        if self.data:
+            return self._flush_data()
+        self.evidence.line = "separator"
+        if self.completed is not None and self.event_name is not None:
+            raise ConnectionError("provider_stream_after_terminal")
+        self.event_name = None
+        return None
+
+    def feed(self, line):
+        if self.done:
+            _check_done_line(line, self.evidence)
+            return None
+        if line == b"event" or line.startswith(b"event:"):
+            self._feed_event_line(line)
+            return None
+        if line == b"data" or line.startswith(b"data:"):
+            self._feed_data_line(line)
+            return None
+        if not line:
+            return self._feed_separator()
+        self._handle_other_line(line)
+        return None
+
+
+def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None, limits=None):
+    active = _active_limits(limits)
+    prefix = _resolve_stream_prefix(
+        response, cancellation, evidence, inspect_media=inspect_media, observe_media=observe_media,
+    )
+    parser = _SseParser(evidence, active, prefix, cancellation)
     first = True
     for line in _stream_lines(response, cancellation, evidence, prefix, limits=active):
         cancellation.check()
@@ -449,84 +584,16 @@ def _events(response, cancellation, evidence, *, inspect_media=False, observe_me
         if first:
             line = line.removeprefix(b"\xef\xbb\xbf")
             first = False
-        if done:
-            evidence.line = "comment" if line.startswith(b":") else "suffix" if line else "separator"
-            if line and not line.startswith(b":"):
-                raise ConnectionError("provider_stream_after_terminal")
-            continue
-        if line == b"event" or line.startswith(b"event:"):
-            evidence.line = "event"
-            if event_name is not None:
-                raise ConnectionError("provider_stream_event_type")
-            event_name = line[6:].removeprefix(b" ")
-            evidence.sse = _SSE_NAMES.get(event_name, "other")
-        elif line == b"data" or line.startswith(b"data:"):
-            evidence.line = "data"
-            if not data:
-                evidence.sse = _SSE_NAMES.get(event_name, "other")
-                evidence.json_type = "none"
-            field = line[5:]
-            data.append(field[1:] if field.startswith(b" ") else field)
-        elif not line and data:
-            evidence.line = "separator"
-            events += 1
-            evidence.events = events
-            if events > active.max_events:
-                raise ConnectionError("provider_stream_limit")
-            payload = b"\n".join(data)
-            if payload == b"[DONE]":
-                evidence.done_seen = True
-                if event_name is not None and (completed is None or event_name not in {b"done", b"message"}):
-                    raise ConnectionError("provider_stream_named_done")
-                data.clear()
-                event_name = None
-                done = True
-                continue
-            try:
-                frame = decode_json(payload)
-            except (ValueError, RecursionError):
-                raise ConnectionError("provider_stream_json") from None
-            if not isinstance(frame, dict) or not isinstance(frame.get("type"), str):
-                raise ConnectionError("provider_stream_event_type")
-            kind = frame["type"]
-            evidence.json_type = kind if kind in _EVENT_NAMES else "other"
-            evidence.completed_seen |= kind == "response.completed"
-            try:
-                if event_name not in (None, b"", b"message") and kind.encode("utf-8") != event_name:
-                    raise ConnectionError("provider_stream_event_type")
-            except UnicodeEncodeError:
-                raise ConnectionError("provider_stream_event_type") from None
-            data.clear()
-            event_name = None
-            cancellation.check()
-            if completed is not None:
-                raise ConnectionError("provider_stream_after_terminal")
-            if kind == "response.completed":
-                # A caller may stop consuming as soon as success is delivered.
-                # Verify the remaining HTTP framing before exposing completion.
-                completed = frame
-            else:
-                yield frame
-        elif not line:
-            evidence.line = "separator"
-            if completed is not None and event_name is not None:
-                raise ConnectionError("provider_stream_after_terminal")
-            event_name = None
-        else:
-            evidence.line = "comment" if line.startswith(b":") else "field"
-            standard_field = (
-                line == b"id" or line.startswith(b"id:")
-                or line == b"retry" or line.startswith(b"retry:")
-            )
-            if prefix and evidence.line == "field" and not standard_field:
-                raise ConnectionError("provider_stream_event_type")
-    if data:
+        frame = parser.feed(line)
+        if frame is not None:
+            yield frame
+    if parser.data:
         raise ConnectionError("provider_stream_incomplete")
-    if completed is not None and event_name is not None:
+    if parser.completed is not None and parser.event_name is not None:
         raise ConnectionError("provider_stream_after_terminal")
     cancellation.check()
-    if completed is not None:
-        yield completed
+    if parser.completed is not None:
+        yield parser.completed
 
 
 class OpenAITransport:

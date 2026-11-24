@@ -30,7 +30,7 @@ REQUEST_LENGTH = struct.Struct("!I")
 _END = b"\r\n\r\n"
 _REQUEST_LINE = re.compile(rb"(?:GET|POST) [!-~]+ HTTP/1\.1\Z")
 _HEADER_NAME = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
-_LENGTH = re.compile(rb"(?:0|[1-9][0-9]{0,7})\Z")
+_LENGTH = re.compile(rb"(?:0|[1-9]\d{0,7})\Z")
 
 
 class RelayError(ValueError):
@@ -214,7 +214,7 @@ def serve(lease: relay.Lease, proof: bytes) -> None:
             with client:
                 try:
                     _handle_client(client, lease, proof)
-                except (EOFError, OSError, RelayError, ValueError):
+                except (EOFError, OSError, ValueError):
                     pass
                 finally:
                     with peers_lock:
@@ -234,7 +234,7 @@ def serve(lease: relay.Lease, proof: bytes) -> None:
                         _spawn_peer(listener, lease, slots, peers, peers_lock, handle)
         finally:
             with peers_lock:
-                for client in list(peers):
+                for client in peers:
                     with contextlib.suppress(OSError):
                         client.shutdown(socket.SHUT_RDWR)
 

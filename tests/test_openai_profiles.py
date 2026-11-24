@@ -43,15 +43,20 @@ class ProfilesTests(unittest.TestCase):
         for name in ("state.lock", "state.json", "foreground.lock"):
             self.assertEqual((self.root / "profiles" / name).stat().st_mode & 0o777, 0o600)
 
+    @staticmethod
+    def _enter(cm):
+        with cm:
+            pass
+
     def test_duplicate_client_and_changed_returning_client_preserve_selection(self):
         personal = self.save("personal", "issued-one")
         for label in ("other", "personal"):
             with self.subTest(label=label):
                 candidate = self.profiles.begin(label)
                 client = "issued-one" if label == "other" else "issued-two"
+                pub = self.profiles.publish(candidate, client)
                 with self.assertRaisesRegex(ProfileError, "^profile_client_conflict$"):
-                    with self.profiles.publish(candidate, client):
-                        self.fail("conflicting client reached local publication")
+                    self._enter(pub)
                 self.assertEqual(self.profiles.selected(), personal)
         candidate = self.profiles.begin("personal")
         self.assertEqual(candidate.profile.client_id, "issued-one")
@@ -66,9 +71,9 @@ class ProfilesTests(unittest.TestCase):
         self.profiles.select("personal", lambda *_: None)
         self.profiles.select("work", lambda *_: None)
         self.assertNotEqual(work.epoch, self.profiles.selected().epoch)
+        pub = self.profiles.publish(candidate, "issued-three")
         with self.assertRaisesRegex(ProfileError, "^profile_stale$"):
-            with self.profiles.publish(candidate, "issued-three"):
-                self.fail("stale epoch reached publication")
+            self._enter(pub)
         self.assertEqual(self.profiles.selected().label, "work")
 
     def test_only_current_pending_generation_can_publish_or_be_abandoned(self):
@@ -77,17 +82,17 @@ class ProfilesTests(unittest.TestCase):
         self.assertEqual(stale.profile, current.profile)
         self.assertNotEqual(stale.pending_generation, current.pending_generation)
         self.profiles.abandon(stale)
+        stale_pub = self.profiles.publish(stale, "issued-one")
         with self.assertRaisesRegex(ProfileError, "^profile_stale$"):
-            with self.profiles.publish(stale, "issued-one"):
-                self.fail("stale attempt reached publication")
+            self._enter(stale_pub)
         with self.profiles.publish(current, "issued-one"):
             pass
         self.assertEqual(self.profiles.selected().label, "personal")
         pending = self.profiles.begin("personal")
         self.profiles.abandon(pending)
+        pending_pub = self.profiles.publish(pending, "issued-one")
         with self.assertRaisesRegex(ProfileError, "^profile_stale$"):
-            with self.profiles.publish(pending, "issued-one"):
-                self.fail("abandoned attempt reached publication")
+            self._enter(pending_pub)
 
     def test_abandoned_first_attempt_keeps_opaque_directory_for_local_recovery(self):
         candidate = self.profiles.begin("personal")
@@ -108,17 +113,17 @@ class ProfilesTests(unittest.TestCase):
         with self.profiles.foreground():
             with self.assertRaisesRegex(ProfileError, "^profile_busy$"):
                 other.select("personal", lambda *_: self.fail("selection callback while busy"))
+            busy_pub = other.publish(pending, "issued-two")
             with self.assertRaisesRegex(ProfileError, "^profile_busy$"):
-                with other.publish(pending, "issued-two"):
-                    self.fail("publication while busy")
+                self._enter(busy_pub)
             retired = other.begin_disconnect(lambda profile: None)
             self.assertEqual(retired.label, personal.label)
             self.assertNotEqual(retired.epoch, personal.epoch)
             self.assertTrue(other.selected().retiring)
         self.assertTrue(other.begin_disconnect(lambda profile: None).retiring)
+        stale_pub = other.publish(pending, "issued-two")
         with self.assertRaisesRegex(ProfileError, "^profile_stale$"):
-            with other.publish(pending, "issued-two"):
-                self.fail("publication with a retired epoch")
+            self._enter(stale_pub)
         with self.assertRaisesRegex(ProfileError, "^profile_retiring$"):
             other.select("personal", lambda *_: self.fail("selected a retiring registration"))
         reconnected = self.save("personal", "issued-one")
@@ -130,12 +135,12 @@ class ProfilesTests(unittest.TestCase):
         retired = []
         self.assertIsNone(self.profiles.begin_disconnect(retired.append))
         self.assertEqual(retired, [pending.profile])
+        auth_cm = self.profiles.authorize(pending)
         with self.assertRaisesRegex(ProfileError, "^profile_stale$"):
-            with self.profiles.authorize(pending):
-                self.fail("disconnected installation accepted a stale exchange")
+            self._enter(auth_cm)
+        pub_cm = self.profiles.publish(pending, "issued-one")
         with self.assertRaisesRegex(ProfileError, "^profile_stale$"):
-            with self.profiles.publish(pending, "issued-one"):
-                self.fail("disconnected installation accepted stale connect")
+            self._enter(pub_cm)
         self.assertEqual(self.profiles.snapshot().saved, ())
 
     def test_reclaim_requires_exact_pending_candidate_and_local_proof(self):
@@ -177,12 +182,16 @@ class ProfilesTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "local precondition fixture"):
             self.profiles.select("work", refuse)
         candidate = self.profiles.begin("work")
+        refused_pub = self.profiles.publish(candidate, "issued-two", refuse)
         with self.assertRaisesRegex(RuntimeError, "local precondition fixture"):
-            with self.profiles.publish(candidate, "issued-two", refuse):
-                self.fail("publication body reached despite local precondition")
-        with self.assertRaisesRegex(RuntimeError, "local write fixture"):
+            self._enter(refused_pub)
+
+        def fail_write():
             with self.profiles.publish(candidate, "issued-two"):
                 raise RuntimeError("local write fixture")
+
+        with self.assertRaisesRegex(RuntimeError, "local write fixture"):
+            fail_write()
         self.assertEqual(self.profiles.selected(), previous)
 
     def test_rejects_untrusted_storage_and_bounds_registration_inventory(self):
@@ -196,9 +205,9 @@ class ProfilesTests(unittest.TestCase):
         lock = self.root / "profiles" / "foreground.lock"
         state = self.root / "profiles" / "state.json"
         lock.symlink_to(state)
+        fg_cm = self.profiles.foreground()
         with self.assertRaisesRegex(ProfileError, "^profile_storage_unavailable$"):
-            with self.profiles.foreground():
-                self.fail("followed an untrusted lock path")
+            self._enter(fg_cm)
         state.chmod(0o644)
         with self.assertRaisesRegex(ProfileError, "^profile_storage_unavailable$"):
             self.profiles.snapshot()

@@ -28,8 +28,9 @@ class ExposureLedgerTests(unittest.TestCase):
             self.ledger.reserve(initial)
         self.ledger.reserve(proposal)
         self.ledger.settle(proposal, 100, 21)
+        wrong_binding = self.slot(Phase.INITIAL, binding=binding_digest("r" * 43, "h" * 43))
         with self.assertRaisesRegex(ExposureError, "unapproved_or_replayed_phase"):
-            self.ledger.reserve(self.slot(Phase.INITIAL, binding=binding_digest("r" * 43, "h" * 43)))
+            self.ledger.reserve(wrong_binding)
         with self.assertRaisesRegex(ExposureError, "unapproved_or_replayed_phase"):
             self.ledger.reserve(proposal)
         self.ledger.reserve(initial)
@@ -72,24 +73,28 @@ os._exit(91)
             with self.subTest(bad_count=bad_count):
                 with self.assertRaisesRegex(ExposureError, "invalid_terminal_usage"):
                     self.ledger.settle(proposal, 1, bad_count)
+        other_run = self.slot(run="f" * 32)
         with self.assertRaisesRegex(ExposureError, "unsettled_exposure"):
-            self.ledger.reserve(self.slot(run="f" * 32))
+            self.ledger.reserve(other_run)
 
     def test_overage_is_recorded_and_suspends_all_further_inference(self):
         proposal = self.slot()
         self.ledger.reserve(proposal)
         with self.assertRaisesRegex(ExposureError, "exposure_bound_exceeded"):
             self.ledger.settle(proposal, 1, 128_001)
+        reopened = ExposureLedger(self.root)
+        other_run = self.slot(run="f" * 32)
         with self.assertRaisesRegex(ExposureError, "exposure_bound_exceeded"):
-            ExposureLedger(self.root).reserve(self.slot(run="f" * 32))
+            reopened.reserve(other_run)
         self.assertEqual(json.loads((self.root / "exposure.json").read_text())[-1]["actual"], [1, 128_001])
 
     def test_unsafe_file_never_opened_for_writing(self):
         original = self.root / "keep"
         original.write_bytes(b"protected")
         (self.root / "exposure.json").symlink_to(original)
+        proposal = self.slot()
         with self.assertRaises(ExposureError):
-            self.ledger.reserve(self.slot())
+            self.ledger.reserve(proposal)
         self.assertEqual(original.read_bytes(), b"protected")
 
     def _reserve_then_exit_before_write(self, request, *, stream=False):
@@ -173,7 +178,8 @@ os._exit(91)
         before = original.read_bytes(), first.read_bytes()
         request = self.slot(run="c" * 32)
         self._reserve_then_exit_before_write(request, stream=True)
-        self.assertEqual((original.read_bytes(), first.read_bytes()), before)
+        after = (original.read_bytes(), first.read_bytes())
+        self.assertEqual(after, before)
         receipt = json.loads((self.root / "diagnostic-stream.json").read_text())
         self.assertEqual((receipt["original_run"], receipt["previous_diagnostic_run"], receipt["run"]),
                          (self.run, old.request.run_id, request.run_id))

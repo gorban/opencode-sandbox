@@ -124,9 +124,10 @@ class SessionProtocolTests(unittest.TestCase):
                 {"role": "user", "content": "next"},
             ],
         }
+        req_pre = _http_req("POST", "/v1/responses", replay_body)
         with self.assertRaises(RequestRefused) as pre_err:
             parse_worker_request(
-                _http_req("POST", "/v1/responses", replay_body),
+                req_pre,
                 expected_token="tok-secret", allowed_models=self.models, vault=self.vault,
             )
         self.assertEqual(pre_err.exception.status, 400)
@@ -152,9 +153,10 @@ class SessionProtocolTests(unittest.TestCase):
             ({"type": "reasoning", "id": local_id, "summary": [], "encrypted_content": handle}, "gpt-6.2-mini"),
             ({"type": "reasoning", "id": local_id, "summary": [], "encrypted_content": "raw_cipher"}, "gpt-6.2-sol"),
         ):
+            bad_req = _http_req("POST", "/v1/responses", {"model": bad_model, "stream": True, "store": False, "input": [bad_item]})
             with self.assertRaises(RequestRefused) as err:
                 parse_worker_request(
-                    _http_req("POST", "/v1/responses", {"model": bad_model, "stream": True, "store": False, "input": [bad_item]}),
+                    bad_req,
                     expected_token="tok-secret", allowed_models=self.models, vault=self.vault,
                 )
             self.assertEqual(err.exception.status, 400)

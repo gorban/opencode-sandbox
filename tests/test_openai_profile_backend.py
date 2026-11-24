@@ -37,6 +37,10 @@ class ProofTransport(FixtureTransport):
 
 class ProfileBackendTests(unittest.TestCase):
     def setUp(self):
+        def _forbid_host_browser(url):
+            raise AssertionError(f"unit test attempted to open host browser: {url}")
+
+        self.enterContext(patch("oc_openai.connection._open_host_browser", side_effect=_forbid_host_browser))
         home = Path(pwd.getpwuid(os.getuid()).pw_dir)
         self.state = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="oc-i4a-profile-", dir=home)))
         self.transports = {}
