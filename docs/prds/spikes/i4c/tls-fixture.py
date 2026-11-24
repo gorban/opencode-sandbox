@@ -127,7 +127,7 @@ def record_outcome(sock, context, evidence, respond):
             return
 
 
-def serve_once(listener, context, evidence, cancellation=None, *, hostname=HOST, respond=None):
+def serve_once(listener, context, evidence, cancellation=None, *, hostname=HOST, respond=None, authorize=None):
     try:
         client, _ = listener.accept()
         with client:
@@ -135,6 +135,8 @@ def serve_once(listener, context, evidence, cancellation=None, *, hostname=HOST,
                 cancellation.bridge = client
             deadline = time.monotonic() + 7
             POLICY["read_connect"](client, hostname=hostname)
+            if authorize is not None and not authorize():
+                return
             client.sendall(TLS["ESTABLISHED"])
             validated_hello = TLS["read_client_hello"](client, deadline=deadline, hostname=hostname.encode("ascii"))
             broker, fake = socket.socketpair()

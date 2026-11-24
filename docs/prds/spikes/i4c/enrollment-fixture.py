@@ -5,7 +5,7 @@ import json
 import runpy
 import socket
 import ssl
-from threading import Thread
+from threading import Event, Thread
 
 
 HERE = Path(__file__).parent
@@ -13,6 +13,32 @@ FIXTURE = runpy.run_path(str(HERE / "tls-fixture.py"))
 STATE = runpy.run_path(str(HERE / "enrollment-journal.py"))
 ACCESS = "synthetic-enrollment-fixture-access"
 USERINFO = FIXTURE["POLICY"]["USERINFO_HOST"]
+
+
+class Attempt:
+    def __init__(self, *, pause):
+        self.pause = pause
+        self.userinfo_arrival = Event()
+        self.resume = Event()
+        self.revoked = Event()
+        self.refused = Event()
+        self.retirement_checked = Event()
+
+    def cancel(self):
+        self.revoked.set()
+        self.resume.set()
+        if not self.refused.wait(2):
+            raise STATE["EnrollmentError"]("the revoked attempt did not refuse userinfo")
+
+    def admit_userinfo(self):
+        self.userinfo_arrival.set()
+        if self.pause and not self.resume.wait(5):
+            return False
+        if not self.revoked.is_set():
+            return True
+        self.refused.set()
+        self.retirement_checked.wait(4)
+        return False
 
 
 def json_reply(peer, value):
@@ -52,20 +78,21 @@ def userinfo(peer):
     return "synthetic_userinfo_completed"
 
 
-def serve(listener, certs, evidence, journal, generation, marker):
-    if journal.current() != {"generation": generation, "state": "pending"}:
+def serve(listener, certs, evidence, journal, generation, attempt):
+    def pending():
+        return journal.current() == {"generation": generation, "state": "pending"}
+
+    if not pending():
         return
     token = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     token.load_cert_chain(certs / "match.pem", certs / "match.key")
     FIXTURE["serve_once"](listener, token, evidence, respond=tokenize)
     if evidence != ["synthetic_token_issued"]:
         return
-    if marker is not None:
-        marker.touch(exist_ok=False)
-        return
     profile = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     profile.load_cert_chain(certs / "userinfo.pem", certs / "userinfo.key")
-    FIXTURE["serve_once"](listener, profile, evidence, hostname=USERINFO, respond=userinfo)
+    FIXTURE["serve_once"](listener, profile, evidence, hostname=USERINFO, respond=userinfo,
+                          authorize=lambda: attempt.admit_userinfo() and pending())
 
 
 def qualification_case(root, certificates, *, launch, cancel):
@@ -75,7 +102,7 @@ def qualification_case(root, certificates, *, launch, cancel):
         directory.mkdir(mode=0o700)
     journal = STATE["Journal"](state)
     generation = journal.begin()
-    marker = profile / "cancel-ready" if cancel else None
+    attempt = Attempt(pause=cancel)
     evidence = []
     with socket.socket(socket.AF_UNIX) as listener:
         address = broker / "observe.sock"
@@ -83,15 +110,16 @@ def qualification_case(root, certificates, *, launch, cancel):
         address.chmod(0o600)
         listener.listen(1)
         listener.settimeout(8)
-        forwarder = Thread(target=serve, args=(listener, certificates, evidence, journal, generation, marker),
+        forwarder = Thread(target=serve, args=(listener, certificates, evidence, journal, generation, attempt),
                            daemon=True)
         forwarder.start()
-        result = launch(profile, broker, cancel=cancel)
+        result = launch(profile, broker, attempt=attempt if cancel else None)
         forwarder.join(2)
         if forwarder.is_alive():
             return "fake enrollment peer did not retire"
     if cancel:
-        if evidence != ["synthetic_token_issued"] or journal.current() != {"generation": generation, "state": "pending"}:
+        if (not attempt.refused.is_set() or evidence != ["synthetic_token_issued"]
+                or journal.current() != {"generation": generation, "state": "pending"}):
             return "interrupted enrollment did not preserve pending"
         journal.transition(generation, "abandoned")
         try:
@@ -103,7 +131,7 @@ def qualification_case(root, certificates, *, launch, cancel):
         return "native synthetic enrollment did not complete both peer exchanges"
     if evidence != ["synthetic_token_issued", "synthetic_userinfo_completed"]:
         return "native enrollment sequence or authorization did not match"
-    fresh = launch(profile, None, cancel=False)
+    fresh = launch(profile, None)
     if fresh.returncode:
         return "could not reopen the synthetic private profile"
     if fresh.stdout.strip() == b"NATIVE_RESTART_ACP_READY":

@@ -150,7 +150,7 @@ def verify_completion(unit, launch, work):
         raise QualificationError("native fixture did not confirm its expected result and cleanup")
 
 
-def verify_interruption(unit, launch, work, *, before_stop=None):
+def verify_interruption(unit, launch, work, *, before_stop=None, is_ready=None):
     try:
         service = subprocess.Popen([HOST, "--no-pty", *launch], cwd="/", env=workstation_env(os.getuid()),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -159,9 +159,11 @@ def verify_interruption(unit, launch, work, *, before_stop=None):
         raise RetirementUnknown("the host launch did not return a process receipt") from error
     deadline = time.monotonic() + 12
     observed = False
+    if is_ready is None:
+        is_ready = (work / "cancel-ready").is_file
     try:
         while service.poll() is None and time.monotonic() < deadline:
-            if (work / "cancel-ready").is_file():
+            if is_ready():
                 observed = True
                 break
             time.sleep(.05)
@@ -250,15 +252,22 @@ def prove_native_tls(root, programs, config):
 def prove_native_enrollment(root, programs, config):
     fixture = runpy.run_path(str(Path(__file__).with_name("enrollment-fixture.py")))
 
-    def launch(profile, egress, *, cancel):
+    def launch(profile, egress, *, attempt=None):
         unit = f"oc-agy-fake-enroll-{secrets.token_hex(8)}.service"
         command_line = command(unit, programs, config, profile, None, None, False, egress=egress, enroll=True)
-        if cancel:
-            verify_interruption(unit, command_line, profile)
+        if attempt is not None:
+            try:
+                verify_interruption(unit, command_line, profile, is_ready=attempt.userinfo_arrival.is_set,
+                                    before_stop=attempt.cancel)
+            finally:
+                attempt.retirement_checked.set()
             return None
         return run_to_completion(unit, command_line)
 
-    state = fixture["qualify"](root, programs, launch=launch, run_host=host)
+    try:
+        state = fixture["qualify"](root, programs, launch=launch, run_host=host)
+    except fixture["STATE"]["EnrollmentError"] as error:
+        raise QualificationError(str(error)) from error
     if state not in ("ready", "pending"):
         raise QualificationError(state)
     return state
