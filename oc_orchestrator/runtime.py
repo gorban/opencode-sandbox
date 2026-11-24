@@ -99,9 +99,12 @@ def preflight():
 
 
 def environment(entries):
-    fields = {key: value for key, value in (item.split("=", 1) for item in entries)}
-    if len(fields) != len(entries):
-        raise Failure("duplicate image environment key")
+    fields = {}
+    for item in entries:
+        key, value = item.split("=", 1)
+        if key in fields:
+            raise Failure("duplicate image environment key")
+        fields[key] = value
     return fields
 
 
