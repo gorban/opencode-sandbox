@@ -927,8 +927,10 @@ class Connection:
                 yield guarded()
 
     @contextlib.contextmanager
-    def _interactive_attempt(self, binding, body, access, limits, deadline, cancelled,
-                             track_before_send, inspect_media, observe_media):
+    def _interactive_attempt(self, binding, body, access, cfg: dict):
+        limits = cfg["limits"]
+        deadline = cfg["deadline"]
+        cancelled = cfg["cancelled"]
         op_timeout = (
             max(REQUEST_SECONDS, limits.io_timeout)
             if deadline is None
@@ -940,11 +942,21 @@ class Connection:
                 raise ConnectionError("openai_model_unavailable")
             dispatch = self._dispatch(
                 lambda record: self._require_dispatchable(record, binding, access),
-                cancellation, track_before_send,
+                cancellation,
+                authorization=cfg["authorization"],
+                before_write=cfg["before_write"],
             )
-            options = {"inspect_media": True, "limits": limits} if inspect_media else {"limits": limits}
-            if observe_media is not None:
-                options["observe_media"] = observe_media
+            options = {
+                "limits": limits,
+                "require_done": False,
+                "require_tls_close": True,
+                "strict_terminal": True,
+                "allow_missing_media": True,
+            }
+            if cfg["inspect_media"]:
+                options["inspect_media"] = True
+            if cfg["observe_media"] is not None:
+                options["observe_media"] = cfg["observe_media"]
             with self._transport.responses(body, access, cancellation, dispatch, **options) as events:
                 def guarded():
                     for event in events:
@@ -954,9 +966,10 @@ class Connection:
                 yield guarded()
 
     @contextlib.contextmanager
-    def interactive_responses(self, binding, body, before_send=None, *, limits=INTERACTIVE_STREAM_LIMITS,
-                              deadline=None, cancelled=None, inspect_media=True, observe_media=None):
-        """Stream one bounded interactive Responses turn with pre-send token-rotation retry."""
+    def interactive_responses(self, binding, body, before_send=None, *, authorization=None,
+                              limits=INTERACTIVE_STREAM_LIMITS, deadline=None, cancelled=None,
+                              inspect_media=True, observe_media=None):
+        """Stream one bounded interactive Responses turn with fenced first-write verification."""
         if (not isinstance(body, dict) or body.get("store") is not False
                 or body.get("stream") is not True or not isinstance(body.get("input"), list)
                 or not _value(body.get("model"), max_length=128)
@@ -964,28 +977,43 @@ class Connection:
             raise ConnectionError("invalid_responses_body")
         if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
             raise ConnectionError("invalid_openai_deadline")
+        authorize = authorization or contextlib.nullcontext
 
         for attempt in range(2):
             access = self._refresh(binding, deadline=deadline, cancelled=cancelled)
             sent_hook_fired = False
 
-            def track_before_send():
+            def track_before_write():
                 nonlocal sent_hook_fired
                 sent_hook_fired = True
                 if before_send is not None:
                     before_send()
 
+            cfg = {
+                "limits": limits,
+                "deadline": deadline,
+                "cancelled": cancelled,
+                "authorization": authorize,
+                "before_write": track_before_write,
+                "inspect_media": inspect_media,
+                "observe_media": observe_media,
+            }
             try:
-                with self._interactive_attempt(
-                    binding, body, access, limits, deadline, cancelled,
-                    track_before_send, inspect_media, observe_media,
-                ) as guarded:
+                with self._interactive_attempt(binding, body, access, cfg) as guarded:
                     yield guarded
                     return
             except ConnectionError as error:
                 if error.code == "openai_access_token_changed" and not sent_hook_fired and attempt == 0:
                     continue
                 raise
+
+    def fenced_write(self, binding, authorization, action):
+        """Run a bounded client write while holding authorization() -> store.lock."""
+        with authorization(), self._store.locked() as directory:
+            record = self._store.read(directory)
+            if not _active(record, binding):
+                raise ConnectionError("connection_retired")
+            return action()
 
     def disconnect(self):
         return self.finish_disconnect(self.begin_disconnect(

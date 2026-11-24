@@ -1,6 +1,7 @@
 """Host-side interactive ChatGPT Responses broker and foreground pod supervisor."""
 
 from contextlib import ExitStack, suppress
+from dataclasses import dataclass
 import fcntl
 import hmac
 import json
@@ -21,6 +22,7 @@ import time
 
 from .cli import Reason, RouteUnavailable, StreamTerminal, report_failure
 from .connection import ConnectionError
+from .exposure import ExposureError, ExposureLedger
 from .live import make_backend
 from .managed import relay as relay_mod
 from .managed.runtime import (
@@ -91,6 +93,12 @@ _ERROR_MAP = {
     "connection_retired": (401, "session_revoked", "ChatGPT session has been disconnected or revoked."),
     "openai_operation_timed_out": (504, "timeout", "Upstream response timed out."),
     "openai_operation_cancelled": (503, "cancelled", "Request was cancelled."),
+    "exposure_hold_active": (403, "exposure_hold", "ChatGPT interactive dispatch is blocked by an exposure hold."),
+    "exposure_hold_changed": (403, "exposure_hold", "ChatGPT exposure hold changed; interactive dispatch blocked."),
+    "invalid_exposure_record": (403, "exposure_hold", "ChatGPT exposure record is invalid; interactive dispatch blocked."),
+    "untrusted_exposure_store": (403, "exposure_hold", "ChatGPT exposure store failed trust checks."),
+    "exposure_store_unavailable": (403, "exposure_hold", "ChatGPT exposure store is unavailable."),
+    "provider_tls_close_timeout": (502, "provider_error", "OpenAI stream did not close cleanly."),
 }
 
 
@@ -141,6 +149,17 @@ def _read_exact(sock: socket.socket, size: int, deadline: float) -> bytes:
     return bytes(buf)
 
 
+@dataclass(frozen=True)
+class SessionPolicy:
+    """Optional exposure hold, selection fence, and revocation callbacks for SessionBroker."""
+
+    exposure_dir: Path | None = None
+    acknowledged_exposure_digest: str | None = None
+    authorization: object = None
+    is_selected: object = None
+    on_revoke: object = None
+
+
 class SessionBroker:
     """Host-side UDS broker mediating multi-turn OpenCode Responses requests."""
 
@@ -156,9 +175,9 @@ class SessionBroker:
         models: tuple[str, ...],
         profile_label: str,
         usage_dir: Path | None = None,
-        is_selected=None,
-        on_revoke=None,
+        policy: SessionPolicy | None = None,
     ):
+        active_policy = policy or SessionPolicy()
         self.socket_path = Path(socket_path)
         self._proof = relay_proof
         self._worker_token = worker_token
@@ -169,8 +188,12 @@ class SessionBroker:
         self._allowed_models = frozenset(models)
         self._profile_label = profile_label
         self._usage_dir = Path(usage_dir) if usage_dir is not None else None
-        self._is_selected = is_selected
-        self._on_revoke = on_revoke
+        resolved_exposure = active_policy.exposure_dir if active_policy.exposure_dir is not None else usage_dir
+        self._exposure_dir = Path(resolved_exposure) if resolved_exposure is not None else None
+        self._acknowledged_exposure_digest = active_policy.acknowledged_exposure_digest
+        self._authorization = active_policy.authorization
+        self._is_selected = active_policy.is_selected
+        self._on_revoke = active_policy.on_revoke
         self._vault = ReasoningVault()
         self._vault_lock = threading.Lock()
         self._turn_counter = 0
@@ -186,13 +209,18 @@ class SessionBroker:
 
     def start(self) -> None:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(self.socket_path))
+            self.socket_path.chmod(0o600)
+            info = self.socket_path.lstat()
+            self._socket_id = (info.st_dev, info.st_ino)
+            listener.listen(MAX_CLIENTS)
+            listener.settimeout(relay_mod.GRANT_POLL)
+        except BaseException:
+            with suppress(OSError):
+                listener.close()
+            raise
         self._listener = listener
-        listener.bind(str(self.socket_path))
-        self.socket_path.chmod(0o600)
-        info = self.socket_path.lstat()
-        self._socket_id = (info.st_dev, info.st_ino)
-        listener.listen(MAX_CLIENTS)
-        listener.settimeout(relay_mod.GRANT_POLL)
         self._accept_thread = threading.Thread(target=self._accept_loop, name="oc-chat-broker", daemon=True)
         self._watch_thread = threading.Thread(target=self._watch_revocation, name="oc-chat-watch", daemon=True)
         self._accept_thread.start()
@@ -273,6 +301,23 @@ class SessionBroker:
             return None
         return _read_exact(peer, size, deadline)
 
+    def _check_exposure_allowed(self) -> None:
+        if self._exposure_dir is None:
+            raise ConnectionError("exposure_store_unavailable")
+        try:
+            ExposureLedger(self._exposure_dir).require_dispatch_allowed(
+                acknowledged_digest=self._acknowledged_exposure_digest,
+            )
+        except ExposureError as exc:
+            code = exc.args[0] if exc.args and type(exc.args[0]) is str else "exposure_hold_active"
+            raise ConnectionError(code) from None
+
+    def _require_turn_active(self) -> None:
+        if self._stopped.is_set() or self._revoked.is_set() or not self._lease.active():
+            raise StreamAborted("session_revoked")
+        if self._is_selected is not None and not self._is_selected():
+            raise StreamAborted("session_revoked")
+
     def _stream_responses_turn(self, peer: socket.socket, parsed, cancel: threading.Event,
                                state: dict) -> tuple[str, tuple[int, int, int] | None]:
         turn_deadline = min(time.monotonic() + TURN_TIMEOUT_SECONDS, self._lease.deadline_ns / 1e9)
@@ -280,14 +325,16 @@ class SessionBroker:
             model=parsed.model, local_response_id=self._next_response_id(), vault=self._vault,
         )
 
-        def before_send():
+        def before_write():
             if self._stopped.is_set() or self._revoked.is_set() or not self._lease.active():
                 raise ConnectionError("connection_retired")
-            if self._is_selected is not None and not self._is_selected():
+            if self._authorization is None and self._is_selected is not None and not self._is_selected():
                 raise ConnectionError("connection_retired")
+            self._check_exposure_allowed()
 
         with self._connection.interactive_responses(
-            self._binding, parsed.body, before_send,
+            self._binding, parsed.body, before_write,
+            authorization=self._authorization,
             limits=INTERACTIVE_STREAM_LIMITS, deadline=turn_deadline,
             cancelled=cancel, inspect_media=True, observe_media=lambda _kind: None,
         ) as upstream_events:
@@ -295,14 +342,15 @@ class SessionBroker:
             peer.sendall(sse_response_headers())
             state["headers_sent"] = True
             for event in upstream_events:
-                if self._stopped.is_set() or self._revoked.is_set() or not self._lease.active():
-                    raise StreamAborted("session_revoked")
+                self._require_turn_active()
                 with self._vault_lock:
                     frames = projector.feed(event)
                 for frame in frames:
                     peer.sendall(encode_chunk(frame))
+            self._require_turn_active()
             with self._vault_lock:
                 tail = projector.finalize()
+            self._require_turn_active()
             for frame in tail:
                 peer.sendall(encode_chunk(frame))
             peer.sendall(b"0\r\n\r\n")
@@ -347,6 +395,9 @@ class SessionBroker:
             outcome = error.code
             # If headers were already sent, intentionally omit terminating chunk 0\r\n\r\n.
             self._send_peer_error(peer, state["headers_sent"], 502, error.code, "Upstream response failed safety checks.")
+        except RouteUnavailable:
+            outcome = "connection_retired"
+            self._send_peer_error(peer, state["headers_sent"], 401, "session_revoked", "ChatGPT session is no longer active.")
         except (ConnectionError, StreamFailure) as error:
             outcome = error.code
             status, code, msg = _ERROR_MAP.get(error.code, (502, "provider_error", "OpenAI request failed."))
@@ -500,8 +551,12 @@ class _SessionJob:
             raise error
 
 
-def _mcs_pair(label: str) -> set[int] | None:
-    match = PROCESS_LABEL.fullmatch(label or "")
+_SIBLING_PROCESS_LABEL = re.compile(r"[^:]+:[^:]+:[A-Za-z0-9_.-]+:s0:c(\d+),c(\d+)\Z", re.ASCII)
+
+
+def _mcs_pair(label: str, *, allow_custom_type: bool = False) -> set[int] | None:
+    pattern = _SIBLING_PROCESS_LABEL if allow_custom_type else PROCESS_LABEL
+    match = pattern.fullmatch(label or "")
     if not match:
         return None
     pair = set(map(int, match.groups()))
@@ -572,7 +627,7 @@ def _verify_relay_mounts(details: dict, job: _SessionJob) -> None:
         target = expected.get(binding.get("Destination"))
         opts = set(binding.get("Options") or ())
         if (target is None or binding.get("Type") != "bind" or binding.get("Source") != str(target)
-                or binding.get("RW") is not False or binding.get("Mode") != "Z"
+                or binding.get("RW") is not False or binding.get("Mode") not in ("Z", "")
                 or binding.get("Propagation") != "rprivate"
                 or not {"nosuid", "nodev", "noexec"} <= opts):
             raise RuntimeError("Relay bind mount failed verification")
@@ -611,7 +666,7 @@ def _inspect_sibling_mcs(name: str) -> set[int] | None:
         raise RuntimeError(f"Malformed inspect data for sibling container {name}") from None
     if type(parsed) is not list or len(parsed) != 1 or type(parsed[0]) is not dict:
         raise RuntimeError(f"Malformed inspect data for sibling container {name}")
-    other_mcs = _mcs_pair(parsed[0].get("ProcessLabel") or "")
+    other_mcs = _mcs_pair(parsed[0].get("ProcessLabel") or "", allow_custom_type=True)
     if not other_mcs:
         raise RuntimeError(f"Missing SELinux label for sibling container {name}")
     return other_mcs
@@ -746,13 +801,60 @@ def _validate_spec(spec: dict) -> dict:
     return spec
 
 
-def _ensure_containers_idle(agent_name: str, relay_name: str) -> None:
-    for cname in (agent_name, relay_name):
-        st = podman("container", "inspect", "--format", "{{.State.Status}}", cname, check=False)
-        if st.returncode == 0 and st.stdout.strip() == b"running":
-            raise RuntimeError(f"Container {cname} is already running")
-        if st.returncode == 0:
-            podman("rm", "-f", cname, check=False)
+def _remove_stopped_owned_container(container_id: str) -> None:
+    res = podman("rm", container_id, check=False, timeout=8)
+    if res.returncode != 0:
+        raise RuntimeError(f"Could not remove stopped container ({container_id[:12]})")
+    exists = podman("container", "exists", container_id, check=False, timeout=4)
+    if exists.returncode != 1:
+        raise RuntimeError(f"Could not confirm stopped container removal ({container_id[:12]})")
+
+
+def _inspect_existing_container(cname: str) -> dict | None:
+    probe = podman("container", "inspect", cname, check=False)
+    if probe.returncode != 0:
+        exists = podman("container", "exists", cname, check=False)
+        if exists.returncode == 1:
+            return None
+        raise RuntimeError(f"Could not inspect existing container {cname}")
+    try:
+        parsed = json.loads(probe.stdout)
+    except ValueError:
+        raise RuntimeError(f"Malformed inspect data for container {cname}") from None
+    if type(parsed) is not list or len(parsed) != 1 or type(parsed[0]) is not dict:
+        raise RuntimeError(f"Malformed inspect data for container {cname}")
+    return parsed[0]
+
+
+def _verify_stopped_container_owner(details: dict, cname: str, instance: str, expected_role: str | None) -> str:
+    cid = details.get("Id") or ""
+    state = details.get("State") or {}
+    labels = (details.get("Config") or {}).get("Labels") or {}
+    if type(state) is not dict or type(labels) is not dict:
+        raise RuntimeError(f"Malformed inspect metadata for container {cname}")
+    if state.get("Running") is True or state.get("Status") in ("running", "paused", "restarting", "stopping"):
+        raise RuntimeError(f"Container {cname} is already running")
+    role = labels.get("oc.role")
+    role_ok = (role == expected_role) if expected_role is not None else (role in (None, ""))
+    if (type(cid) is not str or not IMAGE_ID.fullmatch(cid)
+            or labels.get("oc.sandbox") != "1"
+            or labels.get("oc.instance") != instance
+            or not role_ok):
+        raise RuntimeError(f"Refusing to remove unowned stopped container {cname}")
+    return cid
+
+
+def _ensure_single_container_idle(cname: str, instance: str, expected_role: str | None) -> None:
+    details = _inspect_existing_container(cname)
+    if details is None:
+        return
+    cid = _verify_stopped_container_owner(details, cname, instance, expected_role)
+    _remove_stopped_owned_container(cid)
+
+
+def _ensure_containers_idle(agent_name: str, relay_name: str, instance: str) -> None:
+    _ensure_single_container_idle(agent_name, instance, None)
+    _ensure_single_container_idle(relay_name, instance, "openai-relay")
 
 
 def _build_relay_args(spec: dict, job: _SessionJob) -> list[str]:
@@ -868,20 +970,20 @@ def _teardown_session(job: _SessionJob, broker: SessionBroker | None,
     return cleanup_error
 
 
-def _run_session_body(spec: dict, backend, label: str, selection_epoch: str,
-                      conn, binding, models: tuple[str, ...], job: _SessionJob,
-                      stop_event: threading.Event, terminal: StreamTerminal) -> tuple[int, bool]:
+def _run_session_body(spec: dict, backend, identity: tuple, models: tuple[str, ...],
+                      job: _SessionJob, stop_event: threading.Event,
+                      terminal: StreamTerminal, cleanup_state: dict) -> int:
+    label, selection_epoch, conn, binding, acknowledged_digest = identity
     worker_token = secrets.token_urlsafe(32)
     relay_id: str | None = None
     agent_id: str | None = None
     broker: SessionBroker | None = None
     rc = 1
-    clean = False
-    pod_id = _verify_pod(spec)
-    job.prepare(generate_opencode_config(worker_token=worker_token, models=models))
     with ExitStack() as stack:
-        stack.enter_context(backend.session_lease(label, selection_epoch, binding, job))
         try:
+            pod_id = _verify_pod(spec)
+            job.prepare(generate_opencode_config(worker_token=worker_token, models=models))
+            stack.enter_context(backend.session_lease(label, selection_epoch, binding, job))
             broker = SessionBroker(
                 socket_path=job.provider_socket,
                 relay_proof=job.relay_proof,
@@ -892,11 +994,16 @@ def _run_session_body(spec: dict, backend, label: str, selection_epoch: str,
                 models=models,
                 profile_label=label,
                 usage_dir=backend._state,
-                is_selected=lambda: backend.active_selection() == (label, selection_epoch),
-                on_revoke=stop_event.set,
+                policy=SessionPolicy(
+                    exposure_dir=backend._state,
+                    acknowledged_exposure_digest=acknowledged_digest,
+                    authorization=lambda: backend.selected_fence(label, selection_epoch),
+                    is_selected=lambda: backend.active_selection() == (label, selection_epoch),
+                    on_revoke=stop_event.set,
+                ),
             )
             broker.start()
-            _ensure_containers_idle(spec["agent"], spec["relay"])
+            _ensure_containers_idle(spec["agent"], spec["relay"], spec["instance"])
 
             relay_id = podman(*_build_relay_args(spec, job)).stdout.decode("ascii").strip()
             if not IMAGE_ID.fullmatch(relay_id):
@@ -922,11 +1029,23 @@ def _run_session_body(spec: dict, backend, label: str, selection_epoch: str,
         finally:
             cleanup_error = _teardown_session(job, broker, (agent_id, relay_id), stack)
             if cleanup_error is None:
-                clean = True
+                cleanup_state["clean"] = True
             else:
                 terminal.error(f"Provider session cleanup needs verification. Retained directory {job.root}")
                 rc = 1
-    return rc, clean
+    return rc
+
+
+def _resolve_interactive_exposure(backend, terminal: StreamTerminal) -> str | None:
+    hold = ExposureLedger(backend._state).inspect_hold()
+    if not hold.blocked:
+        return None
+    terminal.write(
+        f"Prior exposure hold present ({hold.file_count} receipt file(s), "
+        f"{hold.unsettled_count} unsettled, snapshot {hold.digest[:12]}). "
+        "Existing receipt files will remain untouched."
+    )
+    return hold.digest
 
 
 def run_interactive_session(spec: dict, terminal: StreamTerminal) -> int:
@@ -948,6 +1067,7 @@ def run_interactive_session(spec: dict, terminal: StreamTerminal) -> int:
         models = conn.models(binding)
         if not models:
             raise RouteUnavailable(Reason.MODEL_UNAVAILABLE)
+        acknowledged_digest = _resolve_interactive_exposure(backend, terminal)
     except Exception as error:
         return report_failure(terminal, error, operation="ChatGPT session")
 
@@ -958,7 +1078,12 @@ def run_interactive_session(spec: dict, terminal: StreamTerminal) -> int:
         "isolated relay. One approval covers multiple interactive turns and subagents in this session "
         "with no verified spending ceiling. Disconnect with `oc-sandbox openai disconnect` or exit OpenCode."
     )
-    if not terminal.confirm(f"Start interactive ChatGPT OpenCode session for instance '{spec['instance']}'?"):
+    prompt = (
+        f"Acknowledge prior exposure snapshot and start interactive ChatGPT OpenCode session for instance '{spec['instance']}'?"
+        if acknowledged_digest is not None
+        else f"Start interactive ChatGPT OpenCode session for instance '{spec['instance']}'?"
+    )
+    if not terminal.confirm(prompt):
         terminal.error("Cancelled.")
         return 1
 
@@ -974,11 +1099,10 @@ def run_interactive_session(spec: dict, terminal: StreamTerminal) -> int:
     prev_term = signal.signal(signal.SIGTERM, lambda _s, _f: stop_event.set())
     prev_hup = signal.signal(signal.SIGHUP, lambda _s, _f: stop_event.set())
     rc = 1
-    clean = False
+    cleanup_state = {"clean": False}
     try:
-        rc, clean = _run_session_body(
-            spec, backend, label, selection_epoch, conn, binding, models, job, stop_event, terminal,
-        )
+        identity = (label, selection_epoch, conn, binding, acknowledged_digest)
+        rc = _run_session_body(spec, backend, identity, models, job, stop_event, terminal, cleanup_state)
     except KeyboardInterrupt:
         rc = 130
     except Exception as error:
@@ -988,7 +1112,7 @@ def run_interactive_session(spec: dict, terminal: StreamTerminal) -> int:
         signal.signal(signal.SIGHUP, prev_hup)
         with suppress(OSError):
             os.close(instance_lock_fd)
-        if clean:
+        if cleanup_state["clean"]:
             with suppress(OSError):
                 shutil.rmtree(root)
     return rc

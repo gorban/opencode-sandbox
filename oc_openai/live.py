@@ -36,6 +36,7 @@ _CONNECTION_REASONS = {
     "openai_model_unavailable": Reason.MODEL_UNAVAILABLE,
     "openai_reconnect_required": Reason.CONNECTION_CHANGED,
     "provider_network_error": Reason.PROVIDER_TRANSPORT,
+    "provider_tls_close_timeout": Reason.PROVIDER_TRANSPORT,
     "provider_send_uncertain": Reason.PROVIDER_TRANSPORT,
     "openai_operation_timed_out": Reason.PROVIDER_TRANSPORT,
     "invalid_provider_http": Reason.PROVIDER_TRANSPORT,

@@ -34,7 +34,7 @@ _SSE_END = re.compile(rb"\r\n|[\r\n]")
 _STREAM_CODES = frozenset({
     "provider_stream_content_type", "provider_stream_incomplete", "provider_stream_limit",
     "provider_stream_json", "provider_stream_event_type", "provider_stream_named_done",
-    "provider_stream_after_terminal", "provider_network_error",
+    "provider_stream_after_terminal", "provider_network_error", "provider_tls_close_timeout",
 })
 _EVENT_COMPLETED = "response.completed"
 _EVENT_NAMES = frozenset({
@@ -75,6 +75,8 @@ class _StreamEvidence:
     media_fields: str | None = None
     prefix_shape: str = "not-read"
     prefix_bytes: int = 0
+    http_body_verified: bool = False
+    tls_close: str = "not_checked"
 
 
 class StreamFailure(ConnectionError):
@@ -90,11 +92,15 @@ class StreamFailure(ConnectionError):
             f" media_fields={facts.media_fields} prefix={facts.prefix_shape} prefix_bytes={facts.prefix_bytes}"
             if facts.media_fields is not None else ""
         )
+        transport = (
+            f" http_body_verified={int(facts.http_body_verified)} tls_close={facts.tls_close}"
+            if facts.tls_close != "not_checked" else ""
+        )
         return (
             f"Stream structure ({self.code}) media={facts.media} raw_bytes={facts.raw_bytes} "
             f"lines={facts.lines} events={facts.events} last_line={facts.line} "
             f"sse={facts.sse} json_type={facts.json_type} "
-            f"completed_seen={int(facts.completed_seen)} done_seen={int(facts.done_seen)}{inspected}"
+            f"completed_seen={int(facts.completed_seen)} done_seen={int(facts.done_seen)}{inspected}{transport}"
         )
 
 
@@ -274,9 +280,28 @@ class _HeaderReader:
 
 
 class _StrictResponse(http.client.HTTPResponse):
-    def __init__(self, sock, *, max_line=None, **kwargs):
+    def __init__(self, sock, *, max_line=None, keep_fp=False, **kwargs):
         super().__init__(sock, **kwargs)
         self._max_line = MAX_LINE if max_line is None else max_line
+        self._keep_fp = keep_fp
+        self._oc_sock = sock
+        self._oc_fp = None
+
+    def _close_conn(self):
+        if self._keep_fp and self.fp is not None:
+            self._oc_fp = self.fp
+            self.fp = None
+            return
+        super()._close_conn()
+
+    def close(self):
+        self._keep_fp = False
+        kept, self._oc_fp = self._oc_fp, None
+        try:
+            if kept is not None:
+                kept.close()
+        finally:
+            super().close()
 
     def begin(self):
         raw = self.fp
@@ -431,27 +456,45 @@ def _inspect_prefix(response, cancellation, evidence):
     return None
 
 
-def _resolve_stream_prefix(response, cancellation, evidence, *, inspect_media, observe_media):
-    prefix = b""
-    if inspect_media or observe_media is not None:
+def _fallback_media_allowed(evidence, *, allow_missing_media, observe_media):
+    if evidence.prefix_shape != "sse-like":
+        return False
+    if allow_missing_media:
+        return evidence.media_fields == "none" and evidence.media == "missing"
+    return observe_media is not None and evidence.media in {"missing", "plain", "octet-stream"}
+
+
+def _fallback_prefix(response, cancellation, evidence, *, inspect_media, observe_media, allow_missing_media):
+    if not (inspect_media or allow_missing_media):
+        evidence.media = _MEDIA_TYPES.get(response.headers.get_content_type(), "other")
+        return b""
+    inspected = _inspect_prefix(response, cancellation, evidence)
+    if _fallback_media_allowed(evidence, allow_missing_media=allow_missing_media, observe_media=observe_media):
+        return inspected
+    return b""
+
+
+def _resolve_stream_prefix(response, cancellation, evidence, *, inspect_media, observe_media,
+                           allow_missing_media=False):
+    strict_shape = inspect_media or observe_media is not None or allow_missing_media
+    if strict_shape:
         evidence.media_fields, evidence.media = _media_shape(response.headers)
-    content_type = response.headers.get_content_type()
     expected_media = (
-        evidence.media == "sse" if observe_media is not None else content_type == "text/event-stream"
+        evidence.media == "sse" if (observe_media is not None or allow_missing_media)
+        else response.headers.get_content_type() == "text/event-stream"
     )
-    if not expected_media:
-        if inspect_media:
-            inspected = _inspect_prefix(response, cancellation, evidence)
-            if (observe_media is not None and evidence.media in {"missing", "plain", "octet-stream"}
-                    and evidence.prefix_shape == "sse-like"):
-                prefix = inspected
-        else:
-            evidence.media = _MEDIA_TYPES.get(content_type, "other")
-        if not prefix:
-            raise ConnectionError("provider_stream_content_type")
+    if expected_media:
+        if not strict_shape:
+            evidence.media = "sse"
+        return b""
+    prefix = _fallback_prefix(
+        response, cancellation, evidence,
+        inspect_media=inspect_media, observe_media=observe_media, allow_missing_media=allow_missing_media,
+    )
+    if not prefix:
+        raise ConnectionError("provider_stream_content_type")
+    if observe_media is not None:
         observe_media(evidence.media)
-    if not inspect_media and observe_media is None:
-        evidence.media = "sse"
     return prefix
 
 
@@ -485,11 +528,12 @@ def _decode_sse_frame(payload, event_name, evidence):
 
 
 class _SseParser:
-    def __init__(self, evidence, active, prefix, cancellation):
+    def __init__(self, evidence, active, prefix, cancellation, *, strict_terminal=False):
         self.evidence = evidence
         self.active = active
         self.prefix = prefix
         self.cancellation = cancellation
+        self.strict_terminal = strict_terminal
         self.data = []
         self.event_name = None
         self.events = 0
@@ -509,6 +553,8 @@ class _SseParser:
             self.evidence.done_seen = True
             if name is not None and (self.completed is None or name not in {b"done", b"message"}):
                 raise ConnectionError("provider_stream_named_done")
+            if self.strict_terminal and self.completed is None:
+                raise ConnectionError("provider_stream_incomplete")
             self.done = True
             return None
         frame, kind = _decode_sse_frame(payload, name, self.evidence)
@@ -524,6 +570,8 @@ class _SseParser:
 
     def _handle_other_line(self, line):
         self.evidence.line = "comment" if line.startswith(b":") else "field"
+        if self.strict_terminal and self.completed is not None and not line.startswith(b":"):
+            raise ConnectionError("provider_stream_after_terminal")
         standard_field = (
             line == b"id" or line.startswith(b"id:")
             or line == b"retry" or line.startswith(b"retry:")
@@ -537,6 +585,8 @@ class _SseParser:
             raise ConnectionError("provider_stream_event_type")
         self.event_name = line[6:].removeprefix(b" ")
         self.evidence.sse = _SSE_NAMES.get(self.event_name, "other")
+        if self.strict_terminal and self.completed is not None and self.event_name not in {b"done", b"message"}:
+            raise ConnectionError("provider_stream_after_terminal")
 
     def _feed_data_line(self, line):
         self.evidence.line = "data"
@@ -571,12 +621,53 @@ class _SseParser:
         return None
 
 
-def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None, limits=None):
+def _verify_tls_close(response, limits, evidence):
+    sock = getattr(response, "_oc_sock", None)
+    reader = getattr(response, "_oc_fp", None) or getattr(response, "fp", None)
+    if not isinstance(sock, ssl.SSLSocket) or reader is None:
+        evidence.tls_close = "error"
+        raise ConnectionError("provider_network_error")
+    sock.settimeout(min(5.0, limits.io_timeout))
+    try:
+        trailing = reader.read(1)
+    except TimeoutError:
+        evidence.tls_close = "timeout"
+        raise ConnectionError("provider_tls_close_timeout") from None
+    except ssl.SSLEOFError:
+        evidence.tls_close = "abrupt_eof"
+        raise ConnectionError("provider_network_error") from None
+    except OSError:
+        evidence.tls_close = "error"
+        raise ConnectionError("provider_network_error") from None
+    if trailing:
+        evidence.tls_close = "trailing_bytes"
+        raise ConnectionError("provider_stream_after_terminal")
+    evidence.tls_close = "clean"
+
+
+def _finalize_stream(response, parser, evidence, active, *, require_done, require_tls_close, strict_terminal):
+    if parser.data or (strict_terminal and parser.completed is None):
+        raise ConnectionError("provider_stream_incomplete")
+    if parser.completed is not None and parser.event_name is not None:
+        raise ConnectionError("provider_stream_after_terminal")
+    if require_done and not evidence.done_seen:
+        raise ConnectionError("provider_stream_incomplete")
+    if require_tls_close:
+        _verify_tls_close(response, active, evidence)
+
+
+def _events(response, cancellation, evidence, *, inspect_media=False, observe_media=None, limits=None,
+            require_done=False, require_tls_close=False, strict_terminal=False, allow_missing_media=False):
     active = _active_limits(limits)
+    if require_tls_close:
+        evidence.tls_close = "not_reached"
+        if not response.chunked and response.length is None:
+            raise ConnectionError("provider_stream_incomplete")
     prefix = _resolve_stream_prefix(
         response, cancellation, evidence, inspect_media=inspect_media, observe_media=observe_media,
+        allow_missing_media=allow_missing_media,
     )
-    parser = _SseParser(evidence, active, prefix, cancellation)
+    parser = _SseParser(evidence, active, prefix, cancellation, strict_terminal=strict_terminal)
     first = True
     for line in _stream_lines(response, cancellation, evidence, prefix, limits=active):
         cancellation.check()
@@ -587,10 +678,11 @@ def _events(response, cancellation, evidence, *, inspect_media=False, observe_me
         frame = parser.feed(line)
         if frame is not None:
             yield frame
-    if parser.data:
-        raise ConnectionError("provider_stream_incomplete")
-    if parser.completed is not None and parser.event_name is not None:
-        raise ConnectionError("provider_stream_after_terminal")
+    evidence.http_body_verified = True
+    _finalize_stream(
+        response, parser, evidence, active,
+        require_done=require_done, require_tls_close=require_tls_close, strict_terminal=strict_terminal,
+    )
     cancellation.check()
     if parser.completed is not None:
         yield parser.completed
@@ -609,7 +701,7 @@ class OpenAITransport:
 
     @contextlib.contextmanager
     def _request(self, host, path, *, method, body, content_type, bearer,
-                 cancellation, dispatch, revocation=False, limits=None):
+                 cancellation, dispatch, revocation=False, limits=None, keep_fp=False):
         active = _active_limits(limits)
         if not self._allowed(host, method, path, revocation):
             raise ConnectionError("invalid_provider_destination")
@@ -650,7 +742,9 @@ class OpenAITransport:
                 if sent < len(packet):
                     sock.sendall(packet[sent:])
                 cancellation.check()
-                with contextlib.closing(_StrictResponse(sock, method=method, max_line=active.max_line)) as response:
+                with contextlib.closing(
+                    _StrictResponse(sock, method=method, max_line=active.max_line, keep_fp=keep_fp),
+                ) as response:
                     response.begin()
                     _validate_http(response)
                     yield response
@@ -677,14 +771,16 @@ class OpenAITransport:
 
     @contextlib.contextmanager
     def responses(self, body, bearer, cancellation, dispatch, *, inspect_media=False, observe_media=None,
-                  limits=None):
+                  limits=None, require_done=False, require_tls_close=False, strict_terminal=False,
+                  allow_missing_media=False):
         active = _active_limits(limits)
         encoded = encode_responses_body(body, max_json=active.max_json)
         evidence = None
         try:
             with self._request(API_HOST, RESPONSES, method="POST", body=encoded,
                                content_type="application/json", bearer=bearer,
-                               cancellation=cancellation, dispatch=dispatch, limits=active) as response:
+                               cancellation=cancellation, dispatch=dispatch, limits=active,
+                               keep_fp=require_tls_close) as response:
                 if response.status != 200:
                     try:
                         error_body = _read_json(response)
@@ -697,6 +793,8 @@ class OpenAITransport:
                 yield _events(
                     response, cancellation, evidence, inspect_media=inspect_media,
                     observe_media=observe_media, limits=active,
+                    require_done=require_done, require_tls_close=require_tls_close,
+                    strict_terminal=strict_terminal, allow_missing_media=allow_missing_media,
                 )
         except ConnectionError as error:
             if evidence is not None and error.code in _STREAM_CODES:

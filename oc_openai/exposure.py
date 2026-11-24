@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 import fcntl
 from hashlib import sha256
+import hmac
 import json
 import os
 import re
@@ -29,6 +30,7 @@ _RECOVERY_NAMES = (
     _RECOVERY_PROOF, _RECOVERY_WORKER, _RECOVERY_WORKER_PROGRESS,
     _RECOVERY_TRACE, _RECOVERY_METADATA, _RECOVERY_MODERATION,
 )
+_CANARY_NAMES = ("canary.json", "canary-recovery.json")
 _LOCK = "exposure.lock"
 _RUN = re.compile(r"[0-9a-f]{32}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -69,6 +71,14 @@ class Slot:
     run_id: str
     binding: str
     phase: Phase
+
+
+@dataclass(frozen=True)
+class ExposureHold:
+    blocked: bool
+    file_count: int
+    unsettled_count: int
+    digest: str
 
 
 @dataclass(frozen=True)
@@ -266,6 +276,84 @@ class ExposureLedger:
             return _validate(updated, first=first)
         except ValueError:
             raise ExposureError("unapproved_or_replayed_phase") from None
+
+    def _read_verified_hold_file(self, directory, name: str) -> tuple[bytes, object] | None:
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise ExposureError("untrusted_exposure_store") from None
+        with os.fdopen(fd, "rb") as stream:
+            if not _private_file(os.fstat(fd)):
+                raise ExposureError("untrusted_exposure_store")
+            raw = stream.read(_MAX_BYTES + 1)
+        if len(raw) > _MAX_BYTES:
+            raise ExposureError("invalid_exposure_record")
+        try:
+            parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique)
+        except (TypeError, ValueError, RecursionError):
+            raise ExposureError("invalid_exposure_record") from None
+        return raw, parsed
+
+    def _validate_hold_entry(self, name: str, parsed) -> tuple[bool, int]:
+        if name == _LEDGER:
+            try:
+                records = _validate(parsed)
+            except (TypeError, ValueError):
+                raise ExposureError("invalid_exposure_record") from None
+            if not records:
+                return False, 0
+            actual = records[-1]["actual"]
+            if actual is None:
+                return True, 1
+            return _overage(actual), 0
+        if name in _CANARY_NAMES:
+            if type(parsed) is not dict or parsed.get("outcome") not in ("unsettled", "ok_settled", "refused_settled"):
+                raise ExposureError("invalid_exposure_record")
+            is_unsettled = parsed["outcome"] == "unsettled"
+            return is_unsettled, int(is_unsettled)
+        if type(parsed) is not dict:
+            raise ExposureError("invalid_exposure_record")
+        unsettled = 1 if parsed.get("actual") is None and "actual" in parsed else 0
+        return True, unsettled
+
+    def _inspect_locked(self, directory) -> ExposureHold:
+        names = (_LEDGER, _DIAGNOSTIC, _STREAM_DIAGNOSTIC, *_RECOVERY_NAMES, *_CANARY_NAMES)
+        hasher = sha256()
+        present = 0
+        unsettled = 0
+        blocked = False
+        for name in names:
+            loaded = self._read_verified_hold_file(directory, name)
+            if loaded is None:
+                hasher.update(name.encode("ascii") + b"\0missing\0")
+                continue
+            raw, parsed = loaded
+            file_blocked, file_unsettled = self._validate_hold_entry(name, parsed)
+            present += 1
+            unsettled += file_unsettled
+            blocked = blocked or file_blocked
+            hasher.update(name.encode("ascii") + b"\0" + sha256(raw).digest())
+        if not blocked:
+            return ExposureHold(blocked=False, file_count=0, unsettled_count=0, digest="")
+        return ExposureHold(blocked=True, file_count=present, unsettled_count=unsettled, digest=hasher.hexdigest())
+
+    def inspect_hold(self) -> ExposureHold:
+        """Read-only inspection of whether an I4a/canary exposure hold blocks ordinary sends."""
+        with self._locked() as directory:
+            return self._inspect_locked(directory)
+
+    def require_dispatch_allowed(self, *, acknowledged_digest: str | None = None) -> None:
+        """Atomically enforce the shared exposure hold under non-blocking exposure.lock."""
+        with self._locked() as directory:
+            hold = self._inspect_locked(directory)
+            if not hold.blocked:
+                return
+            if acknowledged_digest is None or type(acknowledged_digest) is not str:
+                raise ExposureError("exposure_hold_active")
+            if not hmac.compare_digest(hold.digest, acknowledged_digest):
+                raise ExposureError("exposure_hold_changed")
 
     def require_quiescent(self):
         """Keep a pending possible send from becoming a different account's run."""

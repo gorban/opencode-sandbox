@@ -72,8 +72,8 @@ class ProfileBackend:
         return ConnectionStatus(tuple(sorted(saved, key=lambda profile: profile.label)),
                                 view.active.label if view.active is not None else None)
 
-    def _require_idle(self, previous, target):
-        if previous is None or previous.directory == target.directory:
+    def _require_idle(self, previous, target, *, allow_same=True):
+        if previous is None or (allow_same and previous.directory == target.directory):
             return
         try:
             self._connection(previous.directory).require_switchable()
@@ -84,7 +84,7 @@ class ProfileBackend:
             raise _mapped_exposure_error(error) from None
 
     def _select_ready(self, previous, target):
-        self._require_idle(previous, target)
+        self._require_idle(previous, target, allow_same=False)
         try:
             self._connection(target.directory).binding()
         except ConnectionError as error:
@@ -112,6 +112,25 @@ class ProfileBackend:
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
         return profile.label, profile.epoch, conn, binding
+
+    def selected_fence(self, label, selection_epoch):
+        """Return a context manager holding profiles/state.lock while (label, selection_epoch) is active."""
+        @contextmanager
+        def _fence():
+            try:
+                with self.profiles.selected_fence(label, selection_epoch):
+                    yield
+            except ProfileError:
+                raise RouteUnavailable(Reason.CONNECTION_CHANGED) from None
+
+        return _fence()
+
+    def canary_fenced_write(self, label, selection_epoch, conn, binding, action):
+        """Execute a final client write under profiles.lock -> store.lock."""
+        try:
+            return conn.fenced_write(binding, lambda: self.selected_fence(label, selection_epoch), action)
+        except ConnectionError as error:
+            raise _mapped_connection_error(error) from None
 
     @contextmanager
     def session_lease(self, label, selection_epoch, binding, job):

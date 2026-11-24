@@ -72,9 +72,15 @@ _UNSUPPORTED_EVENT_PREFIXES = (
     "response.file_search_", "response.shell_", "response.web_search_",
     "response.image_generation_", "response.mcp_", "response.custom_tool_",
 )
-_MODERATION_ROOT_KEYS = frozenset({"presentation", "prompt", "response", "schema_version"})
-_MODERATION_SLOT_KEYS = frozenset({"outputs", "results", "is_blocked"})
-_MODERATION_ENTRY_KEYS = frozenset({"is_blocked", "category", "classifier", "label", "score"})
+_MODERATION_ROOT_KEYS = frozenset({
+    "presentation", "prompt", "response", "generation", "tool_call", "tool_response", "schema_version",
+})
+_MODERATION_SLOT_KEYS = frozenset({"outputs", "results", "is_blocked", "protection_type"})
+_MODERATION_ENTRY_KEYS = frozenset({
+    "is_blocked", "category", "classifier", "label", "score", "results", "category_flags", "category_scores",
+})
+_MODERATION_CLASSIFIER_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z", re.ASCII)
+MAX_BUFFERED_TOOL_BYTES = 2 * 1024 * 1024
 
 
 class RequestRefused(ValueError):
@@ -451,16 +457,32 @@ def parse_worker_request(raw: bytes, *, expected_token: str, allowed_models: fro
     return ParsedRequest(route="responses", body=sanitized, model=model)
 
 
+def _check_moderation_or_metadata(low: str, value) -> None:
+    if low == "openai_chatgpt_moderation_metadata":
+        _validate_moderation_root(value)
+        return
+    if low == "moderation" and value is None:
+        return
+    if "moderation" in low:
+        raise StreamAborted("metadata_moderation")
+
+
 def _check_safety_entry(key, value) -> None:
     if type(key) is not str:
         return
     low = key.lower()
     if "guardian" in low:
         raise StreamAborted("metadata_guardian")
-    if low == "safety_buffering" and value is not False:
+    if (low == "safety_buffering" and value is not False) or (low == "type" and value == "safety_buffering"):
         raise StreamAborted("safety_buffering")
-    if low == "type" and value == "safety_buffering":
-        raise StreamAborted("safety_buffering")
+    if (low in ("is_blocked", "blocked", "flagged", "requires_review", "needs_review", "review_required")
+            and value is not False):
+        raise StreamAborted("safety_signal")
+    if low == "openai_verification_recommendation" and value != []:
+        raise StreamAborted("metadata_review")
+    if low in ("incomplete_details", "error") and value is not None:
+        raise StreamAborted("safety_signal")
+    _check_moderation_or_metadata(low, value)
 
 
 def _scan_dict_children(current: dict, depth: int, stack: list) -> None:
@@ -471,7 +493,7 @@ def _scan_dict_children(current: dict, depth: int, stack: list) -> None:
 
 
 def _scan_global_safety(obj) -> None:
-    """Recursively fail closed on any guardian or safety_buffering signal."""
+    """Recursively fail closed on any guardian, moderation, or safety_buffering signal."""
     stack = [(obj, 0)]
     nodes = 0
     while stack:
@@ -487,25 +509,97 @@ def _scan_global_safety(obj) -> None:
                     stack.append((item, depth + 1))
 
 
-def _validate_moderation_entries(entries) -> None:
+def _validate_category_flags(flags) -> None:
+    if type(flags) is not dict or len(flags) > 128:
+        raise StreamAborted("metadata_moderation")
+    for name, flagged in flags.items():
+        if type(name) is not str or not 1 <= len(name) <= 64 or flagged is not False:
+            raise StreamAborted("metadata_moderation")
+
+
+def _validate_category_scores(scores) -> None:
+    if type(scores) is not dict or len(scores) > 128:
+        raise StreamAborted("metadata_moderation")
+    for name, score in scores.items():
+        if (type(name) is not str or not 1 <= len(name) <= 64
+                or type(score) not in (int, float) or not 0 <= score <= 1):
+            raise StreamAborted("metadata_moderation")
+
+
+def _validate_moderation_entry_scalars(entry: dict) -> None:
+    for text_key in ("category", "classifier", "label"):
+        val = entry.get(text_key)
+        if val is not None and (type(val) is not str or len(val) > 256):
+            raise StreamAborted("metadata_moderation")
+    score = entry.get("score")
+    if score is not None and (type(score) not in (int, float) or not 0 <= score <= 1):
+        raise StreamAborted("metadata_moderation")
+
+
+def _validate_moderation_entry(entry, *, require_explicit_unblocked: bool = True, depth: int = 0) -> None:
+    if depth > 2 or type(entry) is not dict or not set(entry) <= _MODERATION_ENTRY_KEYS:
+        raise StreamAborted("metadata_moderation")
+    unblocked = entry.get("is_blocked")
+    if (require_explicit_unblocked and unblocked is not False) or (
+            not require_explicit_unblocked and "is_blocked" in entry and unblocked is not False):
+        raise StreamAborted("metadata_moderation")
+    _validate_moderation_entry_scalars(entry)
+    if entry.get("category_flags") is not None:
+        _validate_category_flags(entry["category_flags"])
+    if entry.get("category_scores") is not None:
+        _validate_category_scores(entry["category_scores"])
+    if entry.get("results") is not None:
+        _validate_moderation_entries(entry["results"], require_explicit_unblocked=False, depth=depth + 1)
+
+
+def _validate_moderation_entries(entries, *, require_explicit_unblocked: bool = True, depth: int = 0) -> None:
     if type(entries) is not list or len(entries) > 32:
         raise StreamAborted("metadata_moderation")
     for entry in entries:
-        if (type(entry) is not dict or not set(entry) <= _MODERATION_ENTRY_KEYS
-                or entry.get("is_blocked") is not False):
-            raise StreamAborted("metadata_moderation")
+        _validate_moderation_entry(entry, require_explicit_unblocked=require_explicit_unblocked, depth=depth)
+
+
+def _validate_moderation_bucket(bucket) -> None:
+    if bucket is None or bucket == {}:
+        return
+    if type(bucket) is not dict or not set(bucket) <= _MODERATION_SLOT_KEYS:
+        raise StreamAborted("metadata_moderation")
+    if "is_blocked" in bucket and bucket["is_blocked"] is not False:
+        raise StreamAborted("metadata_moderation")
+    ptype = bucket.get("protection_type")
+    if ptype is not None and (type(ptype) is not str or not 1 <= len(ptype) <= 64):
+        raise StreamAborted("metadata_moderation")
+    for list_key in ("outputs", "results"):
+        if bucket.get(list_key) is not None:
+            _validate_moderation_entries(bucket[list_key])
 
 
 def _validate_moderation_slot(slot) -> None:
     if slot is None or slot == {}:
         return
-    if type(slot) is not dict or not set(slot) <= _MODERATION_SLOT_KEYS:
+    if type(slot) is not dict or len(slot) > 16:
         raise StreamAborted("metadata_moderation")
-    if "is_blocked" in slot and slot["is_blocked"] is not False:
+    if set(slot) <= _MODERATION_SLOT_KEYS:
+        _validate_moderation_bucket(slot)
+        return
+    for name, bucket in slot.items():
+        if type(name) is not str or not _MODERATION_CLASSIFIER_RE.fullmatch(name):
+            raise StreamAborted("metadata_moderation")
+        _validate_moderation_bucket(bucket)
+
+
+def _validate_moderation_root(moderation) -> None:
+    if type(moderation) is not dict or not set(moderation) <= _MODERATION_ROOT_KEYS:
         raise StreamAborted("metadata_moderation")
-    for list_key in ("outputs", "results"):
-        if slot.get(list_key) is not None:
-            _validate_moderation_entries(slot[list_key])
+    if moderation.get("presentation") not in (None, "inline"):
+        raise StreamAborted("metadata_moderation")
+    schema_version = moderation.get("schema_version")
+    if schema_version is not None and (type(schema_version) is not int or schema_version != 1):
+        raise StreamAborted("metadata_moderation")
+    for slot_key in ("prompt", "generation", "tool_call", "tool_response"):
+        _validate_moderation_slot(moderation.get(slot_key))
+    if moderation.get("response") not in (None, {}):
+        raise StreamAborted("metadata_moderation")
 
 
 def _validate_metadata_event(event: dict, active_upstream_id: str | None) -> None:
@@ -520,17 +614,7 @@ def _validate_metadata_event(event: dict, active_upstream_id: str | None) -> Non
         raise StreamAborted("metadata_fields")
     if metadata.get("openai_verification_recommendation", []) != []:
         raise StreamAborted("metadata_review")
-    moderation = metadata.get("openai_chatgpt_moderation_metadata", {})
-    if type(moderation) is not dict or not set(moderation) <= _MODERATION_ROOT_KEYS:
-        raise StreamAborted("metadata_moderation")
-    if moderation.get("presentation") not in (None, "inline"):
-        raise StreamAborted("metadata_moderation")
-    schema_version = moderation.get("schema_version")
-    if schema_version is not None and (type(schema_version) is not int or schema_version != 1):
-        raise StreamAborted("metadata_moderation")
-    _validate_moderation_slot(moderation.get("prompt"))
-    if moderation.get("response") not in (None, {}):
-        raise StreamAborted("metadata_moderation")
+    _validate_moderation_root(metadata.get("openai_chatgpt_moderation_metadata", {}))
 
 
 def encode_chunk(payload: bytes) -> bytes:
@@ -551,6 +635,8 @@ def _valid_index(value, limit: int = 64) -> int:
 
 
 def _valid_summary(summary) -> list[dict]:
+    if summary is None:
+        return []
     if type(summary) is not list or len(summary) > MAX_CONTENT_PARTS:
         raise StreamAborted("invalid_reasoning_item")
     out = []
@@ -576,7 +662,21 @@ class SessionStreamProjector:
         self._reasoning_ids: dict[str, str] = {}
         self._staged_vault: dict[str, tuple[str, str, str]] = {}
         self._buffered_frames: list[bytes] = []
+        self._buffered_bytes = 0
+        self._buffered_tool_added: dict[int, dict] = {}
+        self._buffered_tool_done: dict[int, dict] = {}
+        self._buffered_arg_deltas: dict[int, list[tuple[str | None, str | None, str]]] = {}
+        self._buffered_arg_done: dict[int, tuple[str | None, str | None, str | None, str]] = {}
+        self._completed_tool_calls: dict[int, dict] = {}
+        self._non_tool_indices: set[int] = set()
+        self._saw_refusal = False
         self._completed_seen = False
+
+    def _buffer_frame(self, frame: bytes) -> None:
+        self._buffered_bytes += len(frame)
+        if self._buffered_bytes > MAX_BUFFERED_TOOL_BYTES:
+            raise StreamAborted("buffered_tool_limit")
+        self._buffered_frames.append(frame)
 
     def _local_item_id(self, upstream_id: str, prefix: str) -> str:
         if not _valid_id(upstream_id):
@@ -627,6 +727,7 @@ class SessionStreamProjector:
             refusal = part.get("refusal", "")
             if type(refusal) is not str:
                 raise StreamAborted("invalid_content_part")
+            self._saw_refusal = True
             return {"type": "refusal", "refusal": refusal}
         raise StreamAborted("unsupported_content_part")
 
@@ -651,11 +752,18 @@ class SessionStreamProjector:
             out["phase"] = item["phase"]
         return out
 
-    def _project_call_item(self, item: dict) -> dict:
-        status = item.get("status", "in_progress")
+    def _project_call_item(self, item: dict, *, terminal: bool = False) -> dict:
+        raw_status = item.get("status")
+        if terminal:
+            if raw_status not in (None, "completed"):
+                raise StreamAborted("invalid_function_call")
+            status = "completed"
+        else:
+            status = "in_progress" if raw_status is None else raw_status
+            if status not in ("in_progress", "completed", "incomplete"):
+                raise StreamAborted("invalid_function_call")
         arguments = item.get("arguments", "")
         if (not _valid_id(item.get("call_id")) or not _valid_id(item.get("name"))
-                or status not in ("in_progress", "completed", "incomplete")
                 or type(arguments) is not str):
             raise StreamAborted("invalid_function_call")
         out = {
@@ -689,19 +797,22 @@ class SessionStreamProjector:
             out["encrypted_content"] = self._staged_vault[upstream_id][1]
         return out
 
-    def _project_item(self, item, *, allow_vault: bool) -> dict:
+    def _project_item(self, item, *, allow_vault: bool, allow_tools: bool = True, terminal: bool = False) -> dict:
         if type(item) is not dict:
             raise StreamAborted("invalid_item")
         kind = item.get("type")
         if kind == "message":
             return self._project_message_item(item)
         if kind == "function_call":
-            return self._project_call_item(item)
+            if not allow_tools:
+                raise StreamAborted("premature_tool_call")
+            return self._project_call_item(item, terminal=terminal)
         if kind == "reasoning":
             return self._project_reasoning_item(item, allow_vault=allow_vault)
         raise StreamAborted("unsupported_item_type")
 
-    def _project_response_envelope(self, response: dict, *, allow_vault: bool) -> dict:
+    def _project_response_envelope(self, response: dict, *, allow_vault: bool,
+                                   allow_tools: bool = False, terminal: bool = False) -> dict:
         if type(response) is not dict:
             raise StreamAborted("invalid_response_envelope")
         status = response.get("status", "in_progress")
@@ -710,7 +821,10 @@ class SessionStreamProjector:
         raw_output = response.get("output", [])
         if type(raw_output) is not list or len(raw_output) > 64:
             raise StreamAborted("invalid_response_envelope")
-        output = [self._project_item(item, allow_vault=allow_vault) for item in raw_output]
+        output = [
+            self._project_item(item, allow_vault=allow_vault, allow_tools=allow_tools, terminal=terminal)
+            for item in raw_output
+        ]
         projected: dict = {
             "id": self.local_response_id,
             "object": "response",
@@ -751,6 +865,8 @@ class SessionStreamProjector:
             payload["item_id"] = mapped
 
     def _project_text_event(self, kind: str, event: dict, payload: dict) -> tuple[bytes, bool]:
+        if kind.startswith("response.refusal."):
+            self._saw_refusal = True
         if kind.endswith(_DELTA_SUFFIX):
             field = "delta"
         elif kind == _EVENT_TEXT_DONE:
@@ -764,17 +880,34 @@ class SessionStreamProjector:
         return sse_frame(kind, payload), False
 
     def _project_function_arg_event(self, kind: str, event: dict, payload: dict) -> tuple[bytes, bool]:
+        idx = _valid_index(event.get("output_index"))
+        if idx in self._non_tool_indices:
+            raise StreamAborted("tool_call_mismatch")
+        payload["output_index"] = idx
         key = "delta" if kind.endswith(_DELTA_SUFFIX) else "arguments"
-        if type(event.get(key)) is not str:
+        value = event.get(key)
+        if type(value) is not str:
             raise StreamAborted("invalid_function_call")
-        payload[key] = event[key]
-        if event.get("call_id") is not None:
-            if not _valid_id(event["call_id"]):
+        payload[key] = value
+        call_id = event.get("call_id")
+        if call_id is not None:
+            if not _valid_id(call_id):
                 raise StreamAborted("invalid_function_call")
-            payload["call_id"] = event["call_id"]
+            payload["call_id"] = call_id
+        name = event.get("name")
+        if name is not None:
+            if not _valid_id(name):
+                raise StreamAborted("invalid_function_call")
+            payload["name"] = name
         mapped = self._mapped_event_item_id(event)
         if mapped is not None:
             payload["item_id"] = mapped
+        if kind.endswith(_DELTA_SUFFIX):
+            self._buffered_arg_deltas.setdefault(idx, []).append((call_id, mapped, value))
+        else:
+            if idx in self._buffered_arg_done:
+                raise StreamAborted("tool_call_mismatch")
+            self._buffered_arg_done[idx] = (call_id, mapped, name, value)
         # Buffer all tool-call argument frames until metadata + completed + EOF verify.
         return sse_frame(kind, payload), True
 
@@ -821,25 +954,38 @@ class SessionStreamProjector:
         if type(response) is not dict or not _valid_id(response.get("id")):
             raise StreamAborted("invalid_response_id")
         self.upstream_response_id = response["id"]
-        projected_resp = self._project_response_envelope(response, allow_vault=False)
+        projected_resp = self._project_response_envelope(response, allow_vault=False, allow_tools=False)
         return [sse_frame(_EVENT_CREATED, {"type": _EVENT_CREATED, "response": projected_resp})]
 
     def _feed_progress(self, kind: str, event: dict) -> list[bytes]:
         response = event.get("response")
         if type(response) is not dict or response.get("id") != self.upstream_response_id:
             raise StreamAborted("response_id_mismatch")
-        projected_resp = self._project_response_envelope(response, allow_vault=False)
+        projected_resp = self._project_response_envelope(response, allow_vault=False, allow_tools=False)
         return [sse_frame(kind, {"type": kind, "response": projected_resp})]
 
     def _feed_output_item(self, kind: str, event: dict, *, allow_vault: bool) -> list[bytes]:
         if "response_id" in event and event["response_id"] != self.upstream_response_id:
             raise StreamAborted("response_id_mismatch")
-        idx = _valid_index(event.get("output_index", 0))
-        item = self._project_item(event.get("item"), allow_vault=allow_vault)
+        raw_item = event.get("item")
+        raw_idx = event.get("output_index")
+        is_tool = type(raw_item) is dict and raw_item.get("type") == "function_call"
+        idx = _valid_index(raw_idx if is_tool else (0 if raw_idx is None else raw_idx))
+        item = self._project_item(raw_item, allow_vault=allow_vault, allow_tools=True)
         frame = sse_frame(kind, {"type": kind, "output_index": idx, "item": item})
         if item["type"] == "function_call":
-            self._buffered_frames.append(frame)
+            if idx in self._non_tool_indices:
+                raise StreamAborted("tool_call_mismatch")
+            bucket = self._buffered_tool_added if kind == "response.output_item.added" else self._buffered_tool_done
+            if idx in bucket:
+                raise StreamAborted("tool_call_mismatch")
+            bucket[idx] = item
+            self._buffer_frame(frame)
             return []
+        if (idx in self._buffered_tool_added or idx in self._buffered_tool_done
+                or idx in self._buffered_arg_deltas or idx in self._buffered_arg_done):
+            raise StreamAborted("tool_call_mismatch")
+        self._non_tool_indices.add(idx)
         return [frame]
 
     def _feed_completed(self, event: dict) -> list[bytes]:
@@ -852,8 +998,11 @@ class SessionStreamProjector:
             counts = tuple(usage.get(k) for k in ("input_tokens", "output_tokens", "total_tokens"))
             if all(type(c) is int and 0 <= c <= 2**31 for c in counts) and counts[0] + counts[1] == counts[2]:
                 self.usage = counts
-        projected_resp = self._project_response_envelope(response, allow_vault=True)
-        self._buffered_frames.append(sse_frame(_EVENT_COMPLETED, {"type": _EVENT_COMPLETED, "response": projected_resp}))
+        projected_resp = self._project_response_envelope(response, allow_vault=True, allow_tools=True, terminal=True)
+        self._completed_tool_calls = {
+            idx: item for idx, item in enumerate(projected_resp["output"]) if item["type"] == "function_call"
+        }
+        self._buffer_frame(sse_frame(_EVENT_COMPLETED, {"type": _EVENT_COMPLETED, "response": projected_resp}))
         self._completed_seen = True
         return []
 
@@ -905,18 +1054,83 @@ class SessionStreamProjector:
 
         frame, should_buffer = self._project_stream_event(kind, event)
         if should_buffer:
-            self._buffered_frames.append(frame)
+            self._buffer_frame(frame)
             return []
         return [frame]
+
+    @staticmethod
+    def _check_tool_identity(completed: dict, item: dict) -> None:
+        if item["call_id"] != completed["call_id"] or item["name"] != completed["name"]:
+            raise StreamAborted("tool_call_mismatch")
+        if "id" in item and "id" in completed and item["id"] != completed["id"]:
+            raise StreamAborted("tool_call_mismatch")
+
+    def _verify_tool_items(self) -> None:
+        for idx, added in self._buffered_tool_added.items():
+            completed = self._completed_tool_calls.get(idx)
+            if completed is None:
+                raise StreamAborted("tool_call_mismatch")
+            self._check_tool_identity(completed, added)
+            if added["arguments"] and not completed["arguments"].startswith(added["arguments"]):
+                raise StreamAborted("tool_call_mismatch")
+        for idx, done in self._buffered_tool_done.items():
+            completed = self._completed_tool_calls.get(idx)
+            if completed is None:
+                raise StreamAborted("tool_call_mismatch")
+            self._check_tool_identity(completed, done)
+            if done["arguments"] != completed["arguments"]:
+                raise StreamAborted("tool_call_mismatch")
+
+    @staticmethod
+    def _check_arg_ids(completed: dict, call_id: str | None, item_id: str | None) -> None:
+        if call_id is not None and call_id != completed["call_id"]:
+            raise StreamAborted("tool_call_mismatch")
+        if item_id is not None and completed.get("id") is not None and item_id != completed["id"]:
+            raise StreamAborted("tool_call_mismatch")
+
+    def _verify_arg_deltas(self) -> None:
+        for idx, entries in self._buffered_arg_deltas.items():
+            completed = self._completed_tool_calls.get(idx)
+            if completed is None:
+                raise StreamAborted("tool_call_mismatch")
+            parts = []
+            for call_id, item_id, delta in entries:
+                self._check_arg_ids(completed, call_id, item_id)
+                parts.append(delta)
+            if "".join(parts) != completed["arguments"]:
+                raise StreamAborted("tool_call_mismatch")
+
+    def _verify_arg_done(self) -> None:
+        for idx, (call_id, item_id, name, args) in self._buffered_arg_done.items():
+            completed = self._completed_tool_calls.get(idx)
+            if completed is None:
+                raise StreamAborted("tool_call_mismatch")
+            self._check_arg_ids(completed, call_id, item_id)
+            if (name is not None and name != completed["name"]) or args != completed["arguments"]:
+                raise StreamAborted("tool_call_mismatch")
+
+    def _verify_tool_args(self) -> None:
+        self._verify_arg_deltas()
+        self._verify_arg_done()
+
+    def _verify_buffered_tools(self) -> None:
+        if self._saw_refusal and self._completed_tool_calls:
+            raise StreamAborted("tool_call_with_refusal")
+        if any(idx in self._non_tool_indices for idx in self._completed_tool_calls):
+            raise StreamAborted("tool_call_mismatch")
+        self._verify_tool_items()
+        self._verify_tool_args()
 
     def finalize(self) -> list[bytes]:
         if not self._completed_seen:
             raise StreamAborted("missing_completed")
+        self._verify_buffered_tools()
         for upstream_id, (local_id, handle, ciphertext) in self._staged_vault.items():
             self.vault.commit(local_id, upstream_id, handle, ciphertext, self.model)
         self._staged_vault.clear()
         frames = list(self._buffered_frames)
         self._buffered_frames.clear()
+        self._buffered_bytes = 0
         return frames
 
 

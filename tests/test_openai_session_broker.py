@@ -20,6 +20,7 @@ from oc_openai.connection import ConnectionError
 from oc_openai.managed import relay as relay_mod
 from oc_openai.session_broker import (
     SessionBroker,
+    SessionPolicy,
     USAGE_LOG_NAME,
     generate_opencode_config,
 )
@@ -38,8 +39,12 @@ class _FakeConn:
             raise ConnectionError("connection_retired")
 
     @contextlib.contextmanager
-    def interactive_responses(self, binding, body, before_send=None, **kwargs):
+    def interactive_responses(self, binding, body, before_send=None, *, authorization=None, **kwargs):
         self.require_active(binding)
+        auth_ctx = authorization() if authorization is not None else contextlib.nullcontext()
+        with auth_ctx:
+            if before_send is not None:
+                before_send()
         yield self._events_fn(body)
 
 
@@ -107,8 +112,14 @@ class SessionBrokerTests(unittest.TestCase):
             yield {"type": "response.output_item.done", "output_index": 0,
                    "item": {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"}}
             yield {"type": "response.completed",
-                   "response": {"id": "resp_up_1", "status": "completed", "output": [],
-                                "usage": {"input_tokens": 11, "output_tokens": 4, "total_tokens": 15}}}
+                   "response": {
+                       "id": "resp_up_1", "status": "completed",
+                       "output": [
+                           {"type": "function_call", "call_id": "call_1", "name": "read",
+                            "arguments": "{}", "status": "completed"},
+                       ],
+                       "usage": {"input_tokens": 11, "output_tokens": 4, "total_tokens": 15},
+                   }}
 
         conn = _FakeConn(make_events)
         broker = SessionBroker(
@@ -182,7 +193,7 @@ class SessionBrokerTests(unittest.TestCase):
         broker = SessionBroker(
             socket_path=self.sock_path, relay_proof=self.proof, worker_token=self.worker_token,
             lease=self.lease, connection=conn, binding=object(), models=("gpt-6.2-sol",),
-            profile_label="personal", on_revoke=revoked.set,
+            profile_label="personal", policy=SessionPolicy(on_revoke=revoked.set),
         )
         broker.start()
         self.addCleanup(broker.close)
@@ -249,7 +260,7 @@ class SessionBrokerTests(unittest.TestCase):
         broker = SessionBroker(
             socket_path=self.sock_path, relay_proof=self.proof, worker_token=self.worker_token,
             lease=self.lease, connection=_FakeConn(make_events), binding=object(), models=("gpt-6.2-sol",),
-            profile_label="personal", usage_dir=missing_dir,
+            profile_label="personal", usage_dir=missing_dir, policy=SessionPolicy(exposure_dir=self.usage_dir),
         )
         broker.start()
         self.addCleanup(broker.close)
@@ -374,6 +385,7 @@ class SessionBrokerTests(unittest.TestCase):
             def __init__(self, state_dir: Path):
                 self._state = state_dir
                 self._state.mkdir(parents=True, exist_ok=True)
+                self._state.chmod(0o700)
                 self.selected = ("work", "epoch-1")
 
             def active_connection(self):
@@ -387,6 +399,11 @@ class SessionBrokerTests(unittest.TestCase):
 
             def active_selection(self):
                 return self.selected
+
+            @contextlib.contextmanager
+            def selected_fence(self, label, epoch):
+                assert (label, epoch) == ("work", "epoch-1")
+                yield
 
             @contextlib.contextmanager
             def session_lease(self, label, epoch, binding, job):
@@ -445,7 +462,7 @@ class SessionBrokerTests(unittest.TestCase):
             if args[0] == "create" and spec["agent"] in args:
                 agent_create_args.extend(args)
                 return subprocess.CompletedProcess(args, 0, (agent_id + "\n").encode(), b"")
-            if args[:2] == ("container", "inspect") and "--format" in args:
+            if args[:2] == ("container", "inspect") and args[2] in (spec["agent"], spec["relay"]):
                 return subprocess.CompletedProcess(args, 1, b"", b"")
             if args[:2] == ("container", "inspect"):
                 inspected_siblings.append(args[2])
@@ -594,6 +611,384 @@ class SessionBrokerTests(unittest.TestCase):
         self.assertIsNotNone(session_broker._LEVEL_RE.fullmatch("s0:c1,c2"))
         self.assertIsNotNone(session_broker._PORT_KEY_RE.fullmatch("80/tcp"))
         self.assertIsNotNone(session_broker._PORT_LABEL_RE.fullmatch("80:80"))
+
+    def test_reciprocal_p1_exposure_hold_blocks_with_zero_upstream_writes_and_rejects_corrupt(self):
+        from oc_openai.exposure import ExposureError, ExposureLedger, Phase, Slot, binding_digest
+
+        ledger = ExposureLedger(self.usage_dir)
+        b_hash = binding_digest("a" * 43, "b" * 43, "c" * 43)
+        ledger.reserve(Slot("1" * 32, b_hash, Phase.ORCHESTRATOR))
+
+        upstream_calls = []
+
+        def make_events(body):
+            upstream_calls.append(body)
+            yield {"type": "response.created", "response": {"id": "resp_blocked", "status": "in_progress"}}
+            yield {"type": "response.completed", "response": {"id": "resp_blocked", "status": "completed", "output": []}}
+
+        # Unacknowledged blocking receipt MUST refuse with 403 and 0 upstream calls.
+        broker = SessionBroker(
+            socket_path=self.sock_path, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=_FakeConn(make_events), binding=object(), models=("gpt-6.2-sol",),
+            profile_label="personal", usage_dir=self.usage_dir, policy=SessionPolicy(exposure_dir=self.usage_dir),
+        )
+        broker.start()
+        self.addCleanup(broker.close)
+
+        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
+                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        req = (
+            f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+            f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode("ascii") + body
+        resp = _send_via_relay(self.sock_path, self.lease, self.proof, req)
+        self.assertIn(b"403 Forbidden", resp)
+        self.assertIn(b"exposure_hold", resp)
+        self.assertEqual(upstream_calls, [])
+
+        # Exact foreground-acknowledged snapshot allows dispatch, but any new receipt immediately blocks again.
+        hold = ledger.inspect_hold()
+        self.assertTrue(hold.blocked)
+        broker.close()
+        sock2 = self.root / "provider2.sock"
+        broker2 = SessionBroker(
+            socket_path=sock2, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=_FakeConn(make_events), binding=object(), models=("gpt-6.2-sol",),
+            profile_label="personal", usage_dir=self.usage_dir,
+            policy=SessionPolicy(exposure_dir=self.usage_dir, acknowledged_exposure_digest=hold.digest),
+        )
+        broker2.start()
+        self.addCleanup(broker2.close)
+        resp2 = _send_via_relay(sock2, self.lease, self.proof, req)
+        self.assertIn(b"response.completed", resp2)
+        self.assertEqual(len(upstream_calls), 1)
+
+        # Adding a new receipt invalidates the pinned snapshot digest -> 0 further upstream calls.
+        diag = self.usage_dir / "diagnostic.json"
+        diag.write_text('{"run":"' + "2" * 32 + '","actual":null}', encoding="ascii")
+        diag.chmod(0o600)
+        resp3 = _send_via_relay(sock2, self.lease, self.proof, req)
+        self.assertIn(b"403 Forbidden", resp3)
+        self.assertEqual(len(upstream_calls), 1)
+
+        # Corrupt receipt is NEVER acknowledgeable.
+        diag.write_text("{corrupt", encoding="ascii")
+        with self.assertRaises(ExposureError):
+            ledger.inspect_hold()
+
+    def test_reciprocal_p2_container_ownership_and_exception_cleanup_propagation(self):
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.cli import StreamTerminal
+
+        # Foreign stopped container (missing oc.sandbox=1 / matching oc.instance) MUST be refused without rm.
+        rm_calls = []
+
+        def fake_podman_foreign(*args, check=True, timeout=12):
+            if args[:2] == ("container", "inspect"):
+                return subprocess.CompletedProcess(
+                    args, 0,
+                    json.dumps([{"Id": "a" * 64, "State": {"Running": False, "Status": "exited"},
+                                 "Config": {"Labels": {"oc.sandbox": "1", "oc.instance": "other"}}}]).encode(),
+                    b"",
+                )
+            if args[0] == "rm":
+                rm_calls.append(args)
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        with patch.object(session_broker, "podman", side_effect=fake_podman_foreign):
+            with self.assertRaisesRegex(RuntimeError, "unowned stopped container"):
+                session_broker._ensure_containers_idle("oc-work-agent", "oc-work-openai-relay", "work")
+        self.assertEqual(rm_calls, [])
+
+        # Owned stopped container is removed strictly by exact 64-hex ID without --force.
+        owned_id = "b" * 64
+
+        def fake_podman_owned(*args, check=True, timeout=12):
+            if args[:2] == ("container", "inspect") and args[2] == "oc-work-agent":
+                return subprocess.CompletedProcess(
+                    args, 0,
+                    json.dumps([{"Id": owned_id, "State": {"Running": False, "Status": "exited"},
+                                 "Config": {"Labels": {"oc.sandbox": "1", "oc.instance": "work"}}}]).encode(),
+                    b"",
+                )
+            if args[:2] == ("container", "inspect"):
+                return subprocess.CompletedProcess(args, 1, b"", b"")
+            if args[:2] == ("container", "exists"):
+                return subprocess.CompletedProcess(args, 1, b"", b"")
+            if args[0] == "rm":
+                rm_calls.append(args)
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        with patch.object(session_broker, "podman", side_effect=fake_podman_owned):
+            session_broker._ensure_containers_idle("oc-work-agent", "oc-work-openai-relay", "work")
+        self.assertEqual(rm_calls, [("rm", owned_id)])
+
+        # Verified teardown on KeyboardInterrupt still removes owned private scratch dir.
+        spec = self._valid_spec(instance="work")
+        created_roots = []
+
+        class _InterruptBackend:
+            def __init__(self, state_dir: Path):
+                self._state = state_dir
+                self._state.mkdir(parents=True, exist_ok=True)
+                self._state.chmod(0o700)
+
+            def active_connection(self):
+                class _Conn:
+                    def models(self, _binding):
+                        return ("gpt-6.2-sol",)
+                return "work", "epoch-1", _Conn(), object()
+
+            def active_selection(self):
+                return ("work", "epoch-1")
+
+            @contextlib.contextmanager
+            def selected_fence(self, _label, _epoch):
+                yield
+
+            @contextlib.contextmanager
+            def session_lease(self, _label, _epoch, _binding, job):
+                created_roots.append(job.root)
+                yield job.lease
+
+        class _Term(StreamTerminal):
+            def __init__(self):
+                self.errors = []
+
+            def attended(self):
+                return True
+
+            def write(self, _text):
+                return None
+
+            def error(self, text):
+                self.errors.append(text)
+
+            def confirm(self, _prompt):
+                return True
+
+        def fake_verify_pod(_spec):
+            raise KeyboardInterrupt
+
+        with (patch.object(session_broker, "check_devbox"),
+              patch.object(session_broker, "check_host"),
+              patch.object(session_broker, "make_backend", return_value=_InterruptBackend(self.root / "int_state")),
+              patch.object(session_broker, "SHARED_TMP", str(self.root)),
+              patch.object(session_broker, "_verify_pod", side_effect=fake_verify_pod)):
+            before_dirs = set(self.root.glob("oc-chat-*"))
+            rc = session_broker.run_interactive_session(spec, _Term())
+            after_dirs = set(self.root.glob("oc-chat-*"))
+        self.assertEqual(rc, 130)
+        self.assertEqual(after_dirs, before_dirs)
+
+    def test_reciprocal_p1_selection_fence_same_label_and_write_critical_section(self):
+        import pwd
+        from unittest.mock import patch
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.profile_backend import ProfileBackend
+        from oc_openai.cli import RouteUnavailable
+        from oc_openai.session_broker import _SessionJob
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+
+        def _forbid_host_browser(url):
+            raise AssertionError(f"unit test attempted to open host browser: {url}")
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        self.enterContext(patch("oc_openai.connection._open_host_browser", side_effect=_forbid_host_browser))
+
+        # 1. Connection.interactive_responses runs authorization -> store.lock -> before_send -> write atomically.
+        order = []
+        state_dir = scratch / "fence_conn"
+        verifier = FixtureVerifier()
+        transport = FixtureTransport()
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+
+        @contextlib.contextmanager
+        def ordered_responses(body, access, cancellation, dispatch, **kwargs):
+            def write():
+                order.append("write")
+                return "ok"
+            dispatch(write)
+            yield iter([
+                {"type": "response.created", "response": {"id": "resp_f1", "status": "in_progress"}},
+                {"type": "response.completed", "response": {"id": "resp_f1", "status": "completed", "output": []}},
+            ])
+
+        transport.responses = ordered_responses
+        conn = Connection(
+            state_dir, transport=transport, verifier=verifier,
+            browser=FixtureBrowser(), host_probe=lambda: host,
+        )
+        binding = conn.connect()
+
+        @contextlib.contextmanager
+        def auth_ctx():
+            order.append("auth_enter")
+            try:
+                yield
+            finally:
+                order.append("auth_exit")
+
+        def check_inside_lock():
+            order.append("before_write")
+
+        body = {"model": "gpt-6.2-sol", "stream": True, "store": False,
+                "input": [{"role": "user", "content": "hi"}]}
+        with conn.interactive_responses(binding, body, check_inside_lock, authorization=auth_ctx) as events:
+            list(events)
+        self.assertEqual(order, ["auth_enter", "before_write", "write", "auth_exit"])
+
+        # 2. Same-label select() is refused while an interactive session lease is active.
+        prof_dir = scratch / "fence_profiles"
+        shared_verifier = FixtureVerifier()
+        shared_transport = FixtureTransport()
+        backend = ProfileBackend(
+            prof_dir,
+            connection=lambda d: Connection(
+                d, transport=shared_transport, verifier=shared_verifier,
+                browser=FixtureBrowser(), host_probe=lambda: host,
+            ),
+        )
+        backend.connect("personal")
+        label, epoch, _pconn, pbinding = backend.active_connection()
+        job_dir = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+        self.addCleanup(lambda: job_dir.exists() and shutil.rmtree(job_dir, ignore_errors=True))
+        job = _SessionJob(job_dir, "inc_" + "1" * 32)
+        job.prepare({"model": "local/gpt-6.2-sol"})
+        self.addCleanup(job.revoke)
+        with backend.session_lease(label, epoch, pbinding, job):
+            with self.assertRaises(RouteUnavailable):
+                backend.select("personal")
+            job.revoke()
+
+        # 3. Mid-stream revocation before finalize() withholds buffered function_call frames.
+        selected = [True]
+
+        def revoke_after_completed(_body):
+            yield {"type": "response.created", "response": {"id": "resp_rev", "status": "in_progress"}}
+            yield {"type": "response.output_item.done", "output_index": 0,
+                   "item": {"type": "function_call", "call_id": "call_rev", "name": "bash", "arguments": "{}"}}
+            yield {"type": "response.completed", "response": {
+                "id": "resp_rev", "status": "completed",
+                "output": [{"type": "function_call", "call_id": "call_rev", "name": "bash",
+                            "arguments": "{}", "status": "completed"}],
+            }}
+            selected[0] = False
+
+        sock_rev = self.root / "provider_rev.sock"
+        broker_rev = SessionBroker(
+            socket_path=sock_rev, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=_FakeConn(revoke_after_completed), binding=object(),
+            models=("gpt-6.2-sol",), profile_label="personal", usage_dir=self.usage_dir,
+            policy=SessionPolicy(exposure_dir=self.usage_dir, is_selected=lambda: selected[0]),
+        )
+        broker_rev.start()
+        self.addCleanup(broker_rev.close)
+        req_body = json.dumps(body).encode()
+        req = (
+            f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+            f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(req_body)}\r\n\r\n"
+        ).encode("ascii") + req_body
+        raw_rev = _send_via_relay(sock_rev, self.lease, self.proof, req)
+        self.assertNotIn(b"call_rev", raw_rev)
+        self.assertFalse(raw_rev.endswith(b"0\r\n\r\n"))
+
+    def test_live_e2e_regressions_real_selected_fence_poststart_mounts_and_chromium_selinux(self):
+        import pwd
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.profile_backend import ProfileBackend
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+
+        # 1. Post-start Podman clears Mounts[].Mode from "Z" to ""; accept "" and "Z", still reject "z".
+        job_root = self.root / "mnt_job"
+        job_root.mkdir(mode=0o700)
+        mnt_job = session_broker._SessionJob(job_root, "inc_" + "2" * 32)
+        mnt_job.prepare({"model": "local/gpt-6.2-sol"})
+        self.addCleanup(mnt_job.revoke)
+        mounts = [
+            {"Destination": dst, "Type": "bind", "Source": str(src), "RW": False,
+             "Mode": "", "Propagation": "rprivate", "Options": ["nosuid", "nodev", "noexec", "rbind"]}
+            for dst, src in (
+                ("/source", mnt_job.source_dir),
+                ("/provider", mnt_job.provider_socket.parent),
+                ("/grant", mnt_job.grant),
+                ("/proof", mnt_job.proof_file.parent),
+            )
+        ]
+        session_broker._verify_relay_mounts({"Mounts": mounts}, mnt_job)
+        mounts[0]["Mode"] = "z"
+        with self.assertRaises(RuntimeError):
+            session_broker._verify_relay_mounts({"Mounts": mounts}, mnt_job)
+
+        # 2. Sibling oc-chromium custom SELinux type (oc_chromium.process) extracts MCS pair cleanly.
+        self.assertEqual(
+            session_broker._mcs_pair("system_u:system_r:oc_chromium.process:s0:c99,c993", allow_custom_type=True),
+            {99, 993},
+        )
+        self.assertIsNone(session_broker._mcs_pair("system_u:system_r:oc_chromium.process:s0:c99,c993"))
+
+        # 3. Real ProfileBackend.selected_fence + active_selection in SessionBroker never self-deadlocks flock.
+        def _forbid_host_browser(url):
+            raise AssertionError(f"unit test attempted to open host browser: {url}")
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        self.enterContext(patch("oc_openai.connection._open_host_browser", side_effect=_forbid_host_browser))
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+        shared_verifier = FixtureVerifier()
+        shared_transport = FixtureTransport()
+
+        @contextlib.contextmanager
+        def ok_responses(body, access, cancellation, dispatch, **kwargs):
+            dispatch(lambda: "sent")
+            yield iter([
+                {"type": "response.created", "response": {"id": "resp_real_fence", "status": "in_progress"}},
+                {"type": "response.output_text.delta", "delta": "ok"},
+                {"type": "response.completed", "response": {
+                    "id": "resp_real_fence", "status": "completed", "output": [],
+                    "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                }},
+            ])
+
+        shared_transport.responses = ok_responses
+        backend = ProfileBackend(
+            scratch / "real_fence_profiles",
+            connection=lambda d: Connection(
+                d, transport=shared_transport, verifier=shared_verifier,
+                browser=FixtureBrowser(), host_probe=lambda: host,
+            ),
+        )
+        backend.connect("personal")
+        label, epoch, conn, binding = backend.active_connection()
+        sock_real = self.root / "provider_real_fence.sock"
+        broker_real = SessionBroker(
+            socket_path=sock_real, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=conn, binding=binding, models=("gpt-6.2-sol",),
+            profile_label=label, usage_dir=backend._state,
+            policy=SessionPolicy(
+                exposure_dir=backend._state,
+                authorization=lambda: backend.selected_fence(label, epoch),
+                is_selected=lambda: backend.active_selection() == (label, epoch),
+            ),
+        )
+        broker_real.start()
+        self.addCleanup(broker_real.close)
+        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
+                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        req = (
+            f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+            f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode("ascii") + body
+        raw = _send_via_relay(sock_real, self.lease, self.proof, req)
+        self.assertIn(b"200 OK", raw)
+        self.assertIn(b"response.completed", raw)
 
 
 if __name__ == "__main__":

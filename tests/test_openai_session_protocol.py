@@ -169,11 +169,12 @@ class SessionProtocolTests(unittest.TestCase):
             "type": "response.metadata", "response_id": "resp_up_2", "sequence_number": 1,
             "metadata": {"openai_chatgpt_moderation_metadata": {"prompt": {"outputs": [{"is_blocked": False}]}}},
         }), [])
-        # Text deltas stream live; function_call completion frames are buffered.
+        # Text deltas stream live; function_call completion frames are buffered and correlated.
         text_out = projector.feed({"type": "response.output_text.delta", "delta": "hi"})
         self.assertEqual(len(text_out), 1)
         self.assertEqual(projector.feed({
-            "type": "response.function_call_arguments.done", "call_id": "call_1", "arguments": "{}",
+            "type": "response.function_call_arguments.done", "output_index": 0,
+            "call_id": "call_1", "arguments": "{}",
         }), [])
         self.assertEqual(projector.feed({
             "type": "response.output_item.done", "output_index": 0,
@@ -181,8 +182,14 @@ class SessionProtocolTests(unittest.TestCase):
         }), [])
         self.assertEqual(projector.feed({
             "type": "response.completed",
-            "response": {"id": "resp_up_2", "status": "completed", "output": [],
-                         "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}},
+            "response": {
+                "id": "resp_up_2", "status": "completed",
+                "output": [
+                    {"type": "function_call", "call_id": "call_1", "name": "read",
+                     "arguments": "{}", "status": "completed"},
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+            },
         }), [])
         tail = projector.finalize()
         self.assertEqual(len(tail), 3)
@@ -275,6 +282,133 @@ class SessionProtocolTests(unittest.TestCase):
         )
         self.assertEqual(parsed.route, "responses")
         self.assertEqual(parsed.model, "gpt-6.2-sol")
+
+    def test_reciprocal_p1_tool_release_correlation_and_live_omnimod_moderation(self):
+        # P1 #2a: created / in_progress / queued envelopes must never project nested function_calls.
+        for kind, status in (
+            ("response.created", "in_progress"),
+            ("response.in_progress", "in_progress"),
+            ("response.queued", "queued"),
+        ):
+            p = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t1", vault=self.vault)
+            if kind != "response.created":
+                p.feed({"type": "response.created", "response": {"id": "resp_up_t1", "status": "in_progress"}})
+            with self.subTest(kind=kind), self.assertRaises(StreamAborted) as err:
+                p.feed({
+                    "type": kind,
+                    "response": {
+                        "id": "resp_up_t1", "status": status,
+                        "output": [{"type": "function_call", "call_id": "call_early", "name": "bash", "arguments": "{}"}],
+                    },
+                })
+            self.assertEqual(err.exception.code, "premature_tool_call")
+
+        # P1 #2b: buffered tool item missing from completed.output or with mismatched arguments aborts finalize().
+        p_orphan = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t2", vault=self.vault)
+        p_orphan.feed({"type": "response.created", "response": {"id": "resp_up_t2", "status": "in_progress"}})
+        p_orphan.feed({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_x", "name": "bash", "arguments": '{"a":1}'},
+        })
+        p_orphan.feed({"type": "response.completed", "response": {"id": "resp_up_t2", "status": "completed", "output": []}})
+        with self.assertRaises(StreamAborted) as err_o:
+            p_orphan.finalize()
+        self.assertEqual(err_o.exception.code, "tool_call_mismatch")
+
+        p_mismatch = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t3", vault=self.vault)
+        p_mismatch.feed({"type": "response.created", "response": {"id": "resp_up_t3", "status": "in_progress"}})
+        p_mismatch.feed({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "fc_up_1", "type": "function_call", "call_id": "call_m", "name": "read", "arguments": ""},
+        })
+        p_mismatch.feed({
+            "type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "fc_up_1", "delta": '{"x":1}',
+        })
+        p_mismatch.feed({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_up_t3", "status": "completed",
+                "output": [{"id": "fc_up_1", "type": "function_call", "call_id": "call_m",
+                            "name": "read", "arguments": '{"x":2}', "status": "completed"}],
+            },
+        })
+        with self.assertRaises(StreamAborted) as err_m:
+            p_mismatch.finalize()
+        self.assertEqual(err_m.exception.code, "tool_call_mismatch")
+
+        # P1 #2c: valid live-style tool stream (item_id without call_id on deltas) + omnimod moderation passes.
+        p_ok = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t4", vault=self.vault)
+        p_ok.feed({
+            "type": "response.created", "safety_buffering": False, "sequence_number": 0,
+            "response": {"id": "resp_up_t4", "status": "in_progress", "moderation": None},
+        })
+        self.assertEqual(p_ok.feed({
+            "type": "response.metadata", "response_id": "resp_up_t4", "sequence_number": 1,
+            "metadata": {"openai_chatgpt_moderation_metadata": {
+                "prompt": {"omnimod": {
+                    "protection_type": "default",
+                    "outputs": [{"is_blocked": False, "results": [{"category_flags": {"A1": False, "REFUSED": False}}]}],
+                }},
+                "generation": {}, "tool_call": {}, "tool_response": {},
+            }},
+        }), [])
+        self.assertEqual(p_ok.feed({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "fc_up_2", "type": "function_call", "call_id": "call_ok", "name": "read", "arguments": ""},
+        }), [])
+        self.assertEqual(p_ok.feed({
+            "type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "fc_up_2", "delta": '{"p":',
+        }), [])
+        self.assertEqual(p_ok.feed({
+            "type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "fc_up_2", "delta": '"a"}',
+        }), [])
+        self.assertEqual(p_ok.feed({
+            "type": "response.function_call_arguments.done", "output_index": 0, "item_id": "fc_up_2", "arguments": '{"p":"a"}',
+        }), [])
+        self.assertEqual(p_ok.feed({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "fc_up_2", "type": "function_call", "call_id": "call_ok",
+                     "name": "read", "arguments": '{"p":"a"}', "status": "completed"},
+        }), [])
+        p_ok.feed({
+            "type": "response.completed", "safety_buffering": False,
+            "response": {
+                "id": "resp_up_t4", "status": "completed", "moderation": None,
+                "output": [{"id": "fc_up_2", "type": "function_call", "call_id": "call_ok",
+                            "name": "read", "arguments": '{"p":"a"}', "status": "completed"}],
+            },
+        })
+        self.assertEqual(len(p_ok.finalize()), 6)
+
+        # Any True category_flag in omnimod or non-None response.moderation aborts fail-closed.
+        p_flag = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t5", vault=self.vault)
+        p_flag.feed({"type": "response.created", "response": {"id": "resp_up_t5", "status": "in_progress"}})
+        with self.assertRaises(StreamAborted):
+            p_flag.feed({
+                "type": "response.metadata", "response_id": "resp_up_t5", "sequence_number": 1,
+                "metadata": {"openai_chatgpt_moderation_metadata": {
+                    "prompt": {"omnimod": {
+                        "protection_type": "default",
+                        "outputs": [{"is_blocked": False, "results": [{"category_flags": {"REFUSED": True}}]}],
+                    }},
+                }},
+            })
+
+        # Assistant refusal cannot coexist with a function_call on the same turn.
+        p_ref = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t6", vault=self.vault)
+        p_ref.feed({"type": "response.created", "response": {"id": "resp_up_t6", "status": "in_progress"}})
+        p_ref.feed({"type": "response.refusal.delta", "delta": "cannot do that"})
+        p_ref.feed({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_up_t6", "status": "completed",
+                "output": [{"type": "function_call", "call_id": "call_r", "name": "bash",
+                            "arguments": "{}", "status": "completed"}],
+            },
+        })
+        with self.assertRaises(StreamAborted) as err_ref:
+            p_ref.finalize()
+        self.assertEqual(err_ref.exception.code, "tool_call_with_refusal")
 
 
 if __name__ == "__main__":
