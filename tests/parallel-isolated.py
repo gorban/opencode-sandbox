@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Isolated real-host parallel acceptance runner. --audit is read-only; --run uses Podman.
+"""Isolated real-host parallel acceptance runner. Without --run, audit sources only.
 
 A private rootless Podman store is mandatory. Never point it at an existing store.
-The run uses real network, container, SELinux and Wayland facilities; only systemctl
-is stubbed. Failed or uncertain cleanup retains the private directory for inspection.
+The default real run uses headless Chromium. --run --wayland runs the opt-in
+desktop smoke. Failed or uncertain cleanup retains the private directory for inspection.
 """
 import argparse
 import ctypes
@@ -63,7 +63,7 @@ def preflight():
     return pol
 
 
-def host_preflight():
+def host_preflight(desktop):
     code = ('import ctypes; l=ctypes.CDLL("libselinux.so.1"); '
             'l.security_check_context.argtypes=[ctypes.c_char_p]; '
             'raise SystemExit(not (l.is_selinux_enabled()==1 and '
@@ -72,14 +72,19 @@ def host_preflight():
         run_host(['/usr/bin/python3', '-c', code], capture=True)
     except (subprocess.SubprocessError, OSError):
         die('SELinux is disabled or the oc_chromium.process context is unavailable; install/verify policy first')
-    runtime = os.environ.get('XDG_RUNTIME_DIR', '')
+    runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
+    if not runtime.is_absolute():
+        die('XDG_RUNTIME_DIR must be an absolute path')
+    root_receipt(runtime)
+    if not desktop:
+        return runtime, None
     display = os.environ.get('WAYLAND_DISPLAY', 'wayland-0')
-    if not runtime or '/' in display or not display:
-        die('a simple WAYLAND_DISPLAY and XDG_RUNTIME_DIR are required')
-    path = Path(runtime) / display
+    if '/' in display or not display:
+        die('a simple WAYLAND_DISPLAY is required')
+    path = runtime / display
     if not path.is_socket():
         die('real Wayland socket unavailable')
-    return path, display
+    return runtime, path
 
 
 def shell_file(path, text):
@@ -110,7 +115,7 @@ def check_receipt(path, receipt):
         die('private root identity changed')
 
 
-def prepare(base, runtime_base, pol, wayland, display):
+def prepare(base, runtime_base, pol, wayland):
     for dirname in ('bin', 'home', 'home/opencode-sandbox', 'store', 'source', 'source/tests'):
         (base / dirname).mkdir(mode=0o700)
     for dirname in ('xdg', 'runroot', 'tmp'):
@@ -131,7 +136,8 @@ def prepare(base, runtime_base, pol, wayland, display):
     for original, replacement in zip(('18181', '18182', '18192', '18183'), fresh_ports()):
         suite = suite.replace(original, replacement)
     (source / 'tests/parallel.sh').write_text(suite)
-    (runtime_base / 'xdg' / display).symlink_to(wayland)
+    if wayland is not None:
+        (runtime_base / 'xdg' / wayland.name).symlink_to(wayland)
     # The default shared-memory lock name is per UID, not per graphroot.  A fresh
     # store with file locks keeps lock state under this run's private directory.
     (base / 'containers.conf').write_text('[engine]\nlock_type="file"\ncgroup_manager="cgroupfs"\n')
@@ -169,10 +175,13 @@ def prepare(base, runtime_base, pol, wayland, display):
     shell_file(base / 'bin/systemctl', 'exit 0')
     for cmd in ('sudo', 'pkexec', 'semodule'):
         shell_file(base / ('bin/' + cmd), 'echo "privileged command refused" >&2; exit 1')
-    env = {k: os.environ[k] for k in ('CONTAINER_ID', 'DBUS_SESSION_BUS_ADDRESS', 'LANG', 'TERM') if k in os.environ}
+    env = {k: os.environ[k] for k in ('CONTAINER_ID', 'LANG', 'TERM') if k in os.environ}
     env.update(HOME=home, XDG_RUNTIME_DIR=runtime, XDG_DATA_HOME=home + '/.local/share',
-               XDG_CONFIG_HOME=home + '/.config', TMPDIR=str(runtime_base / 'tmp'), WAYLAND_DISPLAY=display,
+               XDG_CONFIG_HOME=home + '/.config', TMPDIR=str(runtime_base / 'tmp'),
                PATH=str(base / 'bin') + ':/usr/local/bin:/usr/bin:/bin', OC_PTEST_ISOLATED='1')
+    env['OC_CHROMIUM_MODE'] = 'headless' if wayland is None else 'wayland'
+    if wayland is not None:
+        env['WAYLAND_DISPLAY'] = wayland.name
     return env
 
 
@@ -383,12 +392,15 @@ def supervised_suite(command, env, *, grace=3):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--run', action='store_true', help='run real isolated Podman acceptance test')
+    parser.add_argument('--run', action='store_true', help='run real isolated headless Podman acceptance')
+    parser.add_argument('--wayland', action='store_true', help='use --run to run only the visible Wayland smoke')
     args = parser.parse_args()
+    if args.wayland and not args.run:
+        parser.error('--wayland requires --run')
     pol = preflight()
     if not args.run:
         return 0
-    wayland, display = host_preflight()
+    runtime_parent, wayland = host_preflight(args.wayland)
     # The distrobox /tmp is not necessarily visible to the host bridge.
     base = Path(tempfile.mkdtemp(prefix='.oc-parallel-private-', dir=Path.home()))
     os.chmod(base, 0o700)
@@ -399,12 +411,10 @@ def main():
     safe = False
     try:
         base_receipt = root_receipt(base)
-        runtime_parent = wayland.parent
-        root_receipt(runtime_parent)
         runtime_base = Path(tempfile.mkdtemp(prefix='oc-parallel-private-', dir=runtime_parent))
         os.chmod(runtime_base, 0o700)
         runtime_receipt = root_receipt(runtime_base)
-        env = prepare(base, runtime_base, pol, wayland, display)
+        env = prepare(base, runtime_base, pol, wayland)
         store_receipt = root_receipt(base/'store')
         for path, receipt in ((base, base_receipt), (runtime_base, runtime_receipt), (base/'store', store_receipt)):
             host_id = run_host(['/usr/bin/stat', '-Lc', '%d:%i:%u', str(path)], capture=True).stdout.decode().strip()

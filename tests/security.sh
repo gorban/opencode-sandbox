@@ -976,7 +976,7 @@ python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.
 LSOCK=$!
 for _ in $(seq 1 100); do [[ -S $T/lifecycle/runtime/wayland-0 ]] && break; sleep .02; done
 life_run() {
-  env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$LHOME" PATH="$T/stub:$PATH" \
+  env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u OC_CHROMIUM_MODE HOME="$LHOME" PATH="$T/stub:$PATH" \
     XDG_RUNTIME_DIR="$T/lifecycle/runtime" WAYLAND_DISPLAY=wayland-0 OC_OPENCODE_VERSION=keep \
     STUB_SETUP=1 "$@"
 }
@@ -989,6 +989,26 @@ check "agent image built once across concurrent setups" test "$(grep -c '^oc-age
 check "chromium image built once across concurrent setups" test "$(grep -c '^oc-chromium$' "$T/lifecycle/builds")" = 1
 check "keep skips update containers" ! grep -q 'oc-opencode-update' "$T/stub.log"
 check "waiting setup names the holder" grep -qE 'Waiting for setup \(pid=[0-9]+ instance=(first|second)\)' "$T/lifecycle/first.out" "$T/lifecycle/second.out"
+for mode in '' invalid; do
+  : > "$T/stub.log"
+  life_run env OC_CHROMIUM_MODE="$mode" "$SCRIPT" -n -i invalid-mode > "$T/lifecycle/chrome-mode.out" 2>&1
+  rc=$?
+  check "invalid Chromium mode ($mode) is refused before Podman" sh -c \
+    "[ '$rc' -eq 2 ] && grep -q 'OC_CHROMIUM_MODE must be' '$T/lifecycle/chrome-mode.out' && [ ! -s '$T/stub.log' ]"
+done
+life_run env WAYLAND_DISPLAY=unused-socket "$SCRIPT" -n -i wayland-default > "$T/lifecycle/default.out" 2>&1
+rc=$?
+check "default Chromium still requires a Wayland socket" sh -c \
+  "[ '$rc' -ne 0 ] && grep -q 'No Wayland socket' '$T/lifecycle/default.out'"
+life_run env OC_CHROMIUM_MODE=headless WAYLAND_DISPLAY=unused-socket timeout 30 "$SCRIPT" -n -i headless \
+  > "$T/lifecycle/headless.out" 2>&1
+rc=$?
+check "headless setup succeeds without a Wayland socket or -K" test "$rc" -eq 0
+browser_args=$(grep '^podman run -d --name oc-headless-chromium ' "$T/stub.log")
+check "headless Chromium uses no display or physical keys" sh -c '
+    case $1 in (*--headless*) ;; (*) exit 1;; esac
+    case $1 in (*WAYLAND_DISPLAY*|*/run/xdg*|*--device*|*/run/udev*) exit 1;; esac
+' fixture "$browser_args"
 setup_inode=$(stat -c '%d:%i' "$LSTATE/setup.lock" 2>/dev/null || true)
 life_inode=$(stat -c '%d:%i' "$LSTATE/lifecycle.lock" 2>/dev/null || true)
 life_run env STUB_HOLD_POD=1 timeout 30 "$SCRIPT" -n -i third -K > "$T/lifecycle/third.out" 2>&1 </dev/null & P3=$!

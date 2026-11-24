@@ -71,7 +71,9 @@ oc-sandbox -l                               # what is running
   volumes `oc-NAME-chrome`, `oc-NAME-pg`, `oc-NAME-dind`, `oc-NAME-dind-run`, secret
   `oc-NAME-pg-password`. Both instances above run the app on port 3000 and Postgres on 5432 without
   conflict; each Chromium sees only its own pod. A named instance's Chromium opens a first tab titled
-  `oc NAME` so you can tell the windows apart.
+  `oc NAME` in desktop mode so you can tell the windows apart. Set `OC_CHROMIUM_MODE=headless` on the
+  launcher when you want Chromium and DevTools without a window or physical security keys. The
+  default is `wayland`. Switching modes restarts Chromium with the instance's existing profile.
 - **Shared:** images, the `oc-home` volume (OpenCode login, sessions, the self-updated binary), the
   bridge, and the Postgres settings (`~/.config/oc-sandbox/postgres.NAME.env` overrides
   `postgres.env` for one instance). All agents mount all of `~/opencode-sandbox` (worktrees need the

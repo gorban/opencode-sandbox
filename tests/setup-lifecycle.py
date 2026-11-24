@@ -411,6 +411,57 @@ sys.exit(125)
         self.assertEqual(list(self.db.iterdir()),[])
 
 
+class ChromiumModeTests(unittest.TestCase):
+    def test_same_mode_reuses_browser_and_switch_only_replaces_browser(self):
+        source = (ROOT/'oc-sandbox').read_text()
+        browser = source[source.index('# ---- Chromium -'):source.index('log "Waiting for Chromium DevTools')]
+        fixture = r'''
+set -euo pipefail
+CHROME=chrome CHROME_IMG=chrome-image CHROME_MEM=1g CHROMEVOL=retained-profile
+POD=retained-pod POLDIR=$PWD SCRIPT_REAL=$1 WL=$PWD/test-wayland INST=test ILABEL=test NOKEY=0
+log() { :; }
+cstate() { printf 'running\n'; }
+detect_keys() { printf '/dev/hidraw-fixture|test-key|test-id\n'; printf 'detect\n' >> trace; }
+fido_device_nodes() { cut -d'|' -f1; }
+pm() {
+  case "$1 $2" in
+    'image inspect') printf 'image\n' ;;
+    'container inspect')
+      test -s receipt || return 1
+      if [[ $4 == '{{.Image}}' ]]; then printf 'image\n'; else cat receipt; fi ;;
+    'run --rm') : ;;  # profile lock cleanup
+    'rm -f') printf 'remove %s\n' "$3" >> trace; : > receipt ;;
+    'run -d')
+      printf 'launch %s\n' "$*" >> trace
+      printf '%s\n' "$8" | sed 's/^oc.cfg=//' > receipt ;;
+    *) return 97 ;;
+  esac
+}
+for CHROMIUM_MODE in headless headless wayland wayland headless headless; do
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root/'oc_chromium.cil').write_text('fixture policy')
+            result = subprocess.run(['/usr/bin/bash', '-c', fixture + browser + '\ndone',
+                                     'fixture', str(ROOT/'oc-sandbox')], cwd=root,
+                                    env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            trace = (root/'trace').read_text().splitlines()
+        self.assertEqual(trace.count('detect'), 2)
+        lifecycle = [row for row in trace if row != 'detect']
+        self.assertEqual([row.split()[0] for row in lifecycle], ['launch', 'remove', 'launch', 'remove', 'launch'])
+        self.assertEqual(lifecycle[1::2], ['remove chrome', 'remove chrome'])
+        for row in lifecycle[0::2]:
+            self.assertIn('--pod retained-pod', row)
+            self.assertIn('-v retained-profile:/profile:Z', row)
+        self.assertIn('--ozone-platform=wayland', lifecycle[2])
+        self.assertIn('--device /dev/hidraw-fixture', lifecycle[2])
+        for row in lifecycle[0::4]:
+            self.assertIn('--headless', row)
+            for forbidden in ('WAYLAND_DISPLAY', '--device', '/run/udev'):
+                self.assertNotIn(forbidden, row)
+
+
 class LaunchHandoffTests(unittest.TestCase):
     def test_name_replacement_after_release_does_not_start_replacement(self):
         source=(ROOT/'oc-sandbox').read_text()

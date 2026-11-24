@@ -21,7 +21,8 @@ before relying on the isolation.
 ## Requirements
 
 - Linux with rootless Podman and pasta networking (the default since Podman 5), a systemd user
-  session, SELinux and a Wayland socket at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`.
+  session and SELinux. Desktop Chromium also needs a Wayland socket at
+  `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`. See [headless Chromium](docs/operations.md#parallel-instances).
 - Host `udica` with templates under `/usr/share/udica/templates`, and `pkexec` or `sudo` to install
   the Chromium SELinux module on first setup.
 - Python 3.11 or later on the host for the bridge. Optional editors and their paths are listed in the
