@@ -348,6 +348,18 @@ def report_failure(terminal: Terminal, error: BaseException, *, operation: str =
     return 1
 
 
+def _run_verify(terminal: Terminal, backend: Backend) -> int:
+    result = backend.verify()
+    if (not valid_label(result.label)
+            or not isinstance(result.models, tuple) or not result.models
+            or any(not isinstance(slug, str) or not slug or not slug.isascii() for slug in result.models)):
+        raise RouteUnavailable(Reason.PROVIDER_DATA)
+    models = ", ".join(result.models[:8])
+    extra = f" (+{len(result.models) - 8} more)" if len(result.models) > 8 else ""
+    terminal.write(f"Verified ChatGPT registration {result.label} ({result.readiness.value}): {models}{extra}")
+    return 0
+
+
 def run(
     argv: Sequence[str], *, terminal: Terminal, backend_factory: Callable[[], Backend] = _production_backend,
 ) -> int:
@@ -402,15 +414,7 @@ def run(
             _show_status(terminal, _local_status(backend))
             return 0
         if command == "verify":
-            result = backend.verify()
-            if (not valid_label(result.label)
-                    or not isinstance(result.models, tuple) or not result.models
-                    or any(not isinstance(slug, str) or not slug or not slug.isascii() for slug in result.models)):
-                raise RouteUnavailable(Reason.PROVIDER_DATA)
-            models = ", ".join(result.models[:8])
-            extra = f" (+{len(result.models) - 8} more)" if len(result.models) > 8 else ""
-            terminal.write(f"Verified ChatGPT registration {result.label} ({result.readiness.value}): {models}{extra}")
-            return 0
+            return _run_verify(terminal, backend)
         if backend.disconnect() is True:
             terminal.write("ChatGPT is disconnected on this workstation.")
             return 0
