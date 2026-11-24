@@ -41,8 +41,8 @@ def check_isolation(outside, port):
 
 
 @contextmanager
-def running(command, env, *, payload=None, acp=False):
-    with subprocess.Popen(command, env=env, cwd=WORK, bufsize=0,
+def running(command, env, *, payload=None, acp=False, cwd=WORK):
+    with subprocess.Popen(command, env=env, cwd=cwd, bufsize=0,
                           stdin=subprocess.PIPE if payload or acp else subprocess.DEVNULL,
                           stdout=subprocess.PIPE if acp else subprocess.DEVNULL, stderr=subprocess.DEVNULL) as proc:
         try:
@@ -140,20 +140,26 @@ def exchange(proc, request_id, method, params):
     return reply
 
 
+def require_authentication(reply):
+    error = reply.get("error")
+    if not isinstance(error, dict) or type(error.get("code")) is not int or error["code"] != -32000:
+        raise ValueError("expected signed-out ACP result")
+    message = error.get("message")
+    if not isinstance(message, str) or message.strip(" \r\n\t").lower() != "authentication required":
+        raise ValueError("expected signed-out ACP result")
+
+
 def signed_out(workspace, env):
     argv = [str(NATIVE / "agy"), "acp", "--sandbox", "--disable-telemetry", "--include-default-customizations=false",
-            "--log-file", str(workspace / "native.log")]
-    with running(argv, env, acp=True) as proc:
+            "--log-file", str(workspace.parent / "native.log")]
+    with running(argv, env, acp=True, cwd=workspace) as proc:
         hello = exchange(proc, 1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}})
         result = hello.get("result")
         if not isinstance(result, dict) or type(result.get("protocolVersion")) is not int or result["protocolVersion"] != 1:
             raise ValueError("wrong ACP protocol")
-        reply = exchange(proc, 2, "session/new", {"cwd": str(workspace), "mcpServers": []})
-        error = reply.get("error")
-        if not isinstance(error, dict) or error.get("code") != -32000 or not isinstance(error.get("message"), str):
-            raise ValueError("expected signed-out ACP result")
-        if "authentication required" not in error["message"].lower():
-            raise ValueError("expected signed-out ACP result")
+        if any(workspace.iterdir()):
+            raise ValueError("ACP workspace changed before session creation")
+        require_authentication(exchange(proc, 2, "session/new", {"cwd": str(workspace), "mcpServers": []}))
 
 
 def interrupted(_signum, _frame):

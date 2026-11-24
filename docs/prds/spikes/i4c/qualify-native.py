@@ -108,15 +108,17 @@ def command(unit, programs, config, work, outside, port, interruption):
             str(port), "cancel" if interruption else "complete"]
 
 
-def stop(unit):
+def stop(unit, *, require_success=False):
     try:
-        host([SYSTEMCTL, "--user", "stop", unit])
+        requested = host([SYSTEMCTL, "--user", "stop", unit])
         status = host([SYSTEMCTL, "--user", "show", "--property=ActiveState,ControlGroup", unit])
     except (KeyboardInterrupt, OSError, subprocess.SubprocessError) as error:
         raise RetirementUnknown("could not verify qualification service retirement") from error
     fields = dict(line.split(b"=", 1) for line in status.stdout.splitlines() if b"=" in line)
     if status.returncode or fields.get(b"ControlGroup") != b"" or fields.get(b"ActiveState") not in (b"inactive", b"failed"):
         raise RetirementUnknown("the exact qualification service did not retire")
+    if require_success and requested.returncode:
+        raise QualificationError("the live service stop was not confirmed")
 
 
 def verify_completion(unit, launch, work):
@@ -148,8 +150,17 @@ def verify_interruption(unit, launch, work):
                 raise RetirementUnknown("the launch receipt was interrupted") from error
             raise
         finally:
-            stop(unit)
-            service.wait(timeout=5)
+            try:
+                stop(unit, require_success=observed)
+            finally:
+                wait_for_launch_receipt(service)
+
+
+def wait_for_launch_receipt(service):
+    try:
+        service.wait(timeout=5)
+    except (KeyboardInterrupt, OSError, subprocess.SubprocessError) as error:
+        raise RetirementUnknown("the host launch receipt did not resolve") from error
 
 
 def run(root, agy, keyring):
