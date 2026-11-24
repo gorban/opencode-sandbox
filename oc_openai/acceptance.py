@@ -170,17 +170,15 @@ def _recovery(terminal, backend, source):
         if not _matches_current(terminal, backend, proposal):
             return 1
         proof.ledger.approve(confirmed_at, terminal.attended)
+        ok = False
         try:
             if proof.propose(proposal) != PROPOSAL_MARKER:
                 terminal.error("Workstation recovery: GPT did not return the required proof proposal.")
                 return 1
             terminal.write("Verified the recovery marker and usage. Starting the disposable OpenCode proof.")
             worker = Approval(proposal.run_id, binding, Stage.WORKER)
-            if not _matches_current(terminal, backend, worker):
-                return 1
-            if not _finish_worker(terminal, proof, worker):
-                return 1
-            return 0
+            if _matches_current(terminal, backend, worker) and _finish_worker(terminal, proof, worker):
+                ok = True
         except StreamRouteUnavailable as error:
             terminal.error(error.failure.describe())
             return report_failure(terminal, error, operation="Recovery proof")
@@ -190,6 +188,9 @@ def _recovery(terminal, backend, source):
         finally:
             for phase, category in tuple(proof.media_fallbacks.items()):
                 terminal.write(f"OpenAI response media compatibility used for {phase.value}: {category}.")
+        if ok:
+            return 0
+        return 1
 
 
 def run_attended(
