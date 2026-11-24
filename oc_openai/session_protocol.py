@@ -107,6 +107,7 @@ class ParsedRequest:
     route: str
     body: dict | None = None
     model: str | None = None
+    allowed_tools: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -410,6 +411,20 @@ def _apply_optional_structures(data: dict, sanitized: dict) -> None:
             sanitized["text"] = text_cfg
 
 
+def _resolve_allowed_tools(sanitized: dict) -> frozenset[str]:
+    declared = frozenset(tool["name"] for tool in sanitized.get("tools", ()))
+    choice = sanitized.get("tool_choice")
+    if choice == "required":
+        _require_req(bool(declared))
+        return declared
+    if type(choice) is dict:
+        _require_req(choice["name"] in declared)
+        return frozenset({choice["name"]})
+    if choice == "none":
+        return frozenset()
+    return declared
+
+
 def parse_worker_request(raw: bytes, *, expected_token: str, allowed_models: frozenset[str],
                          vault: ReasoningVault) -> ParsedRequest:
     """Validate HTTP/1.1 framing, auth, CSRF headers, and sanitize the Responses payload."""
@@ -455,7 +470,8 @@ def parse_worker_request(raw: bytes, *, expected_token: str, allowed_models: fro
     }
     _apply_optional_scalars(data, sanitized)
     _apply_optional_structures(data, sanitized)
-    return ParsedRequest(route="responses", body=sanitized, model=model)
+    allowed_tools = _resolve_allowed_tools(sanitized)
+    return ParsedRequest(route="responses", body=sanitized, model=model, allowed_tools=allowed_tools)
 
 
 def _check_moderation_or_metadata(low: str, value) -> None:
@@ -658,10 +674,12 @@ def _valid_summary(summary) -> list[dict]:
 class SessionStreamProjector:
     """Project upstream Responses SSE safely with host-only IDs/vault and buffered tool calls."""
 
-    def __init__(self, *, model: str, local_response_id: str, vault: ReasoningVault):
+    def __init__(self, *, model: str, local_response_id: str, vault: ReasoningVault,
+                 allowed_tools: frozenset[str] = frozenset()):
         self.model = model
         self.local_response_id = local_response_id
         self.vault = vault
+        self._allowed_tools = frozenset(allowed_tools)
         self.upstream_response_id: str | None = None
         self.events_seen = 0
         self.metadata_checked = 0
@@ -673,7 +691,7 @@ class SessionStreamProjector:
         self._buffered_bytes = 0
         self._buffered_tool_added: dict[int, dict] = {}
         self._buffered_tool_done: dict[int, dict] = {}
-        self._buffered_arg_deltas: dict[int, list[tuple[str | None, str | None, str]]] = {}
+        self._buffered_arg_deltas: dict[int, list[tuple[str | None, str | None, str | None, str]]] = {}
         self._buffered_arg_done: dict[int, tuple[str | None, str | None, str | None, str]] = {}
         self._completed_tool_calls: dict[int, dict] = {}
         self._non_tool_indices: set[int] = set()
@@ -774,6 +792,8 @@ class SessionStreamProjector:
         if (not _valid_id(item.get("call_id")) or not _valid_id(item.get("name"))
                 or type(arguments) is not str):
             raise StreamAborted("invalid_function_call")
+        if item["name"] not in self._allowed_tools:
+            raise StreamAborted("unauthorized_tool_call")
         out = {
             "type": "function_call",
             "call_id": item["call_id"],
@@ -888,6 +908,8 @@ class SessionStreamProjector:
         return sse_frame(kind, payload), False
 
     def _project_function_arg_event(self, kind: str, event: dict, payload: dict) -> tuple[bytes, bool]:
+        if not self._allowed_tools:
+            raise StreamAborted("unauthorized_tool_call")
         idx = _valid_index(event.get("output_index"))
         if idx in self._non_tool_indices:
             raise StreamAborted("tool_call_mismatch")
@@ -906,12 +928,14 @@ class SessionStreamProjector:
         if name is not None:
             if not _valid_id(name):
                 raise StreamAborted("invalid_function_call")
+            if name not in self._allowed_tools:
+                raise StreamAborted("unauthorized_tool_call")
             payload["name"] = name
         mapped = self._mapped_event_item_id(event)
         if mapped is not None:
             payload["item_id"] = mapped
         if kind.endswith(_DELTA_SUFFIX):
-            self._buffered_arg_deltas.setdefault(idx, []).append((call_id, mapped, value))
+            self._buffered_arg_deltas.setdefault(idx, []).append((call_id, mapped, name, value))
         else:
             if idx in self._buffered_arg_done:
                 raise StreamAborted("tool_call_mismatch")
@@ -1104,8 +1128,10 @@ class SessionStreamProjector:
             if completed is None:
                 raise StreamAborted("tool_call_mismatch")
             parts = []
-            for call_id, item_id, delta in entries:
+            for call_id, item_id, name, delta in entries:
                 self._check_arg_ids(completed, call_id, item_id)
+                if name is not None and name != completed["name"]:
+                    raise StreamAborted("tool_call_mismatch")
                 parts.append(delta)
             if "".join(parts) != completed["arguments"]:
                 raise StreamAborted("tool_call_mismatch")
@@ -1129,7 +1155,7 @@ class SessionStreamProjector:
             for item in (completed, self._buffered_tool_added.get(idx), self._buffered_tool_done.get(idx))
             if item is not None
         ]
-        candidates.extend(item_id for _c, item_id, _d in self._buffered_arg_deltas.get(idx, ()))
+        candidates.extend(item_id for _c, item_id, _n, _d in self._buffered_arg_deltas.get(idx, ()))
         done_arg = self._buffered_arg_done.get(idx)
         if done_arg is not None:
             candidates.append(done_arg[1])

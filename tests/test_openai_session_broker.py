@@ -39,10 +39,12 @@ class _FakeConn:
             raise ConnectionError("connection_retired")
 
     @contextlib.contextmanager
-    def interactive_responses(self, binding, body, before_send=None, *, authorization=None, **kwargs):
+    def interactive_responses(self, binding, body, before_send=None, *, authorization=None,
+                              write_fence=None, **kwargs):
         self.require_active(binding)
         auth_ctx = authorization() if authorization is not None else contextlib.nullcontext()
-        with auth_ctx:
+        fence_ctx = write_fence() if write_fence is not None else contextlib.nullcontext()
+        with auth_ctx, fence_ctx:
             if before_send is not None:
                 before_send()
         yield self._events_fn(body)
@@ -138,8 +140,11 @@ class SessionBrokerTests(unittest.TestCase):
         self.assertIn(b"200 OK", models_raw)
         self.assertIn(b'"id":"gpt-6.2-sol"', models_raw)
 
-        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
-                           "input": [{"role": "user", "content": "SUPER_SECRET_PROMPT"}]}).encode()
+        body = json.dumps({
+            "model": "gpt-6.2-sol", "stream": True, "store": False,
+            "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}],
+            "input": [{"role": "user", "content": "SUPER_SECRET_PROMPT"}],
+        }).encode()
         resp_req = (
             f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
             f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
@@ -174,8 +179,11 @@ class SessionBrokerTests(unittest.TestCase):
         broker.start()
         self.addCleanup(broker.close)
 
-        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
-                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        body = json.dumps({
+            "model": "gpt-6.2-sol", "stream": True, "store": False,
+            "tools": [{"type": "function", "name": "bash", "parameters": {"type": "object"}}],
+            "input": [{"role": "user", "content": "hi"}],
+        }).encode()
         req = (
             f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
             f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
@@ -265,8 +273,11 @@ class SessionBrokerTests(unittest.TestCase):
         broker.start()
         self.addCleanup(broker.close)
 
-        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
-                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        body = json.dumps({
+            "model": "gpt-6.2-sol", "stream": True, "store": False,
+            "tools": [{"type": "function", "name": "bash", "parameters": {"type": "object"}}],
+            "input": [{"role": "user", "content": "hi"}],
+        }).encode()
         req = (
             f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
             f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
@@ -635,8 +646,11 @@ class SessionBrokerTests(unittest.TestCase):
         broker.start()
         self.addCleanup(broker.close)
 
-        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
-                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        body = json.dumps({
+            "model": "gpt-6.2-sol", "stream": True, "store": False,
+            "tools": [{"type": "function", "name": "bash", "parameters": {"type": "object"}}],
+            "input": [{"role": "user", "content": "hi"}],
+        }).encode()
         req = (
             f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
             f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
@@ -944,7 +958,10 @@ class SessionBrokerTests(unittest.TestCase):
         )
         broker_rev.start()
         self.addCleanup(broker_rev.close)
-        req_body = json.dumps(body).encode()
+        req_body = json.dumps({
+            **body,
+            "tools": [{"type": "function", "name": "bash", "parameters": {"type": "object"}}],
+        }).encode()
         req = (
             f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
             f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
@@ -1036,8 +1053,11 @@ class SessionBrokerTests(unittest.TestCase):
         )
         broker_real.start()
         self.addCleanup(broker_real.close)
-        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
-                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        body = json.dumps({
+            "model": "gpt-6.2-sol", "stream": True, "store": False,
+            "tools": [{"type": "function", "name": "bash", "parameters": {"type": "object"}}],
+            "input": [{"role": "user", "content": "hi"}],
+        }).encode()
         req = (
             f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
             f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
@@ -1046,6 +1066,211 @@ class SessionBrokerTests(unittest.TestCase):
         raw = _send_via_relay(sock_real, self.lease, self.proof, req)
         self.assertIn(b"200 OK", raw)
         self.assertIn(b"response.completed", raw)
+
+    def test_reciprocal_r2_exposure_lock_spans_first_write_and_blocks_concurrent_reservation(self):
+        import pwd
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.exposure import ExposureError, ExposureLedger, Phase, Slot, binding_digest
+        from oc_openai.profile_backend import ProfileBackend
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+
+        def _forbid_host_browser(url):
+            raise AssertionError(f"unit test attempted to open host browser: {url}")
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        self.enterContext(patch("oc_openai.connection._open_host_browser", side_effect=_forbid_host_browser))
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+        shared_verifier = FixtureVerifier()
+        shared_transport = FixtureTransport()
+        lock_contested = []
+        state_holder = []
+
+        @contextlib.contextmanager
+        def checking_responses(body, access, cancellation, dispatch, **kwargs):
+            def write():
+                ledger = ExposureLedger(state_holder[0])
+                slot = Slot("a" * 32, binding_digest("a" * 43, "b" * 43), Phase.ORCHESTRATOR)
+                try:
+                    ledger.reserve(slot)
+                    lock_contested.append("UNLOCKED_RACE")
+                except ExposureError as exc:
+                    lock_contested.append(exc.args[0])
+                return "sent"
+
+            dispatch(write)
+            yield iter([
+                {"type": "response.created", "response": {"id": "resp_lock", "status": "in_progress"}},
+                {"type": "response.completed", "response": {"id": "resp_lock", "status": "completed", "output": []}},
+            ])
+
+        shared_transport.responses = checking_responses
+        backend = ProfileBackend(
+            scratch / "exp_fence_profiles",
+            connection=lambda d: Connection(
+                d, transport=shared_transport, verifier=shared_verifier,
+                browser=FixtureBrowser(), host_probe=lambda: host,
+            ),
+        )
+        backend.connect("personal")
+        state_holder.append(backend._state)
+        label, epoch, conn, binding = backend.active_connection()
+        sock_exp = self.root / "provider_exp_fence.sock"
+        broker = SessionBroker(
+            socket_path=sock_exp, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=conn, binding=binding, models=("gpt-6.2-sol",),
+            profile_label=label, usage_dir=backend._state,
+            policy=SessionPolicy(
+                exposure_dir=backend._state,
+                authorization=lambda: backend.selected_fence(label, epoch),
+                is_selected=lambda: backend.active_selection() == (label, epoch),
+            ),
+        )
+        broker.start()
+        self.addCleanup(broker.close)
+        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
+                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        req = (
+            f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+            f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode("ascii") + body
+        raw = _send_via_relay(sock_exp, self.lease, self.proof, req)
+        self.assertIn(b"response.completed", raw)
+        # During write(), exposure.lock MUST have been held so concurrent reserve() failed closed.
+        self.assertEqual(lock_contested, ["exposure_store_unavailable"])
+        # Once write() finishes, exposure.lock is released cleanly.
+        ExposureLedger(backend._state).reserve(Slot("b" * 32, binding_digest("a" * 43, "b" * 43), Phase.ORCHESTRATOR))
+
+    def test_reciprocal_r2_mid_batch_revocation_withholds_remaining_terminal_tool_frames(self):
+        selected = [True]
+
+        def two_tool_events(_body):
+            yield {"type": "response.created", "response": {"id": "resp_mb", "status": "in_progress"}}
+            yield {"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "fc_mb_1", "type": "function_call", "call_id": "call_first",
+                            "name": "read", "arguments": ""}}
+            yield {"type": "response.output_item.done", "output_index": 0,
+                   "item": {"id": "fc_mb_1", "type": "function_call", "call_id": "call_first",
+                            "name": "read", "arguments": '{"p":"a"}', "status": "completed"}}
+            yield {"type": "response.output_item.done", "output_index": 1,
+                   "item": {"id": "fc_mb_2", "type": "function_call", "call_id": "call_SECOND_WITHHELD",
+                            "name": "edit", "arguments": '{"p":"b"}', "status": "completed"}}
+            yield {"type": "response.completed", "response": {
+                "id": "resp_mb", "status": "completed",
+                "output": [
+                    {"id": "fc_mb_1", "type": "function_call", "call_id": "call_first",
+                     "name": "read", "arguments": '{"p":"a"}', "status": "completed"},
+                    {"id": "fc_mb_2", "type": "function_call", "call_id": "call_SECOND_WITHHELD",
+                     "name": "edit", "arguments": '{"p":"b"}', "status": "completed"},
+                ],
+            }}
+
+        from oc_openai import session_broker
+        orig_encode = session_broker.encode_chunk
+
+        def revoke_after_first_tool_frame(payload):
+            chunk = orig_encode(payload)
+            if b"call_first" in payload:
+                selected[0] = False
+            return chunk
+
+        sock_mb = self.root / "provider_midbatch.sock"
+        broker = SessionBroker(
+            socket_path=sock_mb, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=_FakeConn(two_tool_events), binding=object(),
+            models=("gpt-6.2-sol",), profile_label="personal", usage_dir=self.usage_dir,
+            policy=SessionPolicy(exposure_dir=self.usage_dir, is_selected=lambda: selected[0]),
+        )
+        broker.start()
+        self.addCleanup(broker.close)
+
+        body = json.dumps({
+            "model": "gpt-6.2-sol", "stream": True, "store": False,
+            "tools": [
+                {"type": "function", "name": "read", "parameters": {"type": "object"}},
+                {"type": "function", "name": "edit", "parameters": {"type": "object"}},
+            ],
+            "input": [{"role": "user", "content": "hi"}],
+        }).encode()
+        req = (
+            f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+            f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode("ascii") + body
+        with patch.object(session_broker, "encode_chunk", side_effect=revoke_after_first_tool_frame):
+            raw = _send_via_relay(sock_mb, self.lease, self.proof, req)
+        self.assertNotIn(b"call_SECOND_WITHHELD", raw)
+        self.assertNotIn(b"response.completed", raw)
+        self.assertFalse(raw.endswith(b"0\r\n\r\n"))
+
+    def test_reciprocal_r2_recovery_receipt_requires_matching_predecessor(self):
+        from hashlib import sha256
+        from oc_openai.exposure import ExposureError, ExposureLedger, binding_digest
+
+        b_hash = binding_digest("a" * 43, "b" * 43)
+        rec_dir = self.root / "pred_check"
+        rec_dir.mkdir(mode=0o700)
+        ledger = ExposureLedger(rec_dir)
+
+        canary_payload = {
+            "run_id": "a" * 32, "binding": b_hash, "model": "gpt-6.2-sol", "history_digest": "0" * 64,
+            "max_input": 922_000, "max_output": 128_000, "actual": None,
+            "outcome": "unsettled", "delivered": False,
+        }
+        canary_raw = json.dumps(canary_payload, sort_keys=True).encode("ascii")
+        canary_digest = sha256(canary_raw).hexdigest()
+        recovery_payload = {
+            "run_id": "b" * 32, "binding": b_hash, "model": "gpt-6.2-sol", "history_digest": "0" * 64,
+            "max_input": 922_000, "max_output": 128_000, "actual": [10, 5],
+            "outcome": "ok_settled", "delivered": True,
+            "prior_canary_run_id": "a" * 32, "prior_canary_digest": canary_digest,
+        }
+
+        rec_path = rec_dir / "canary-recovery.json"
+        rec_path.write_text(json.dumps(recovery_payload), encoding="ascii")
+        rec_path.chmod(0o600)
+
+        # 1. Missing canary.json predecessor MUST fail closed (never pass inspection).
+        with self.assertRaisesRegex(ExposureError, "invalid_exposure_record"):
+            ledger.inspect_hold()
+
+        # 2. Mismatched predecessor digest or run_id MUST fail closed.
+        canary_path = rec_dir / "canary.json"
+        canary_path.write_bytes(json.dumps({**canary_payload, "run_id": "c" * 32}).encode("ascii"))
+        canary_path.chmod(0o600)
+        with self.assertRaisesRegex(ExposureError, "invalid_exposure_record"):
+            ledger.inspect_hold()
+
+        # 3. Already-settled canary.json with matching digest still mismatches unsettled precondition.
+        settled_canary = {**canary_payload, "actual": [5, 2], "outcome": "ok_settled", "delivered": True}
+        settled_raw = json.dumps(settled_canary, sort_keys=True).encode("ascii")
+        canary_path.write_bytes(settled_raw)
+        rec_path.write_text(
+            json.dumps({**recovery_payload, "prior_canary_digest": sha256(settled_raw).hexdigest()}),
+            encoding="ascii",
+        )
+        with self.assertRaisesRegex(ExposureError, "invalid_exposure_record"):
+            ledger.inspect_hold()
+
+        # 4. Exact matching unsettled canary.json predecessor passes inspection and reports blocked=True.
+        canary_path.write_bytes(canary_raw)
+        rec_path.write_text(json.dumps(recovery_payload), encoding="ascii")
+        hold = ledger.inspect_hold()
+        self.assertTrue(hold.blocked)
+        self.assertEqual((hold.file_count, hold.unsettled_count), (2, 1))
+
+        # 5. Orphan diagnostic.json without exposure.json also fails closed.
+        diag_dir = self.root / "orphan_diag"
+        diag_dir.mkdir(mode=0o700)
+        diag_path = diag_dir / "diagnostic.json"
+        diag_path.write_text(json.dumps({
+            "original_run": "1" * 32, "binding": b_hash, "run": "2" * 32,
+            "phase": "orchestrator", "max_input": 922_000, "max_output": 128_000, "actual": [5, 5],
+        }), encoding="ascii")
+        diag_path.chmod(0o600)
+        with self.assertRaisesRegex(ExposureError, "invalid_exposure_record"):
+            ExposureLedger(diag_dir).inspect_hold()
 
 
 if __name__ == "__main__":

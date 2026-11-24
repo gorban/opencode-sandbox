@@ -511,7 +511,8 @@ class Connection:
                 operation.cancel()
 
     def _dispatch(self, check, cancellation, before_send=None, *, journal=None,
-                  authorization=contextlib.nullcontext, before_write=None):
+                  authorization=contextlib.nullcontext, before_write=None,
+                  write_fence=contextlib.nullcontext):
         used = False
 
         def dispatch(write):
@@ -535,9 +536,10 @@ class Connection:
                     transaction["may_have_sent"] = True
                     self._store.write(directory, record)
                     cancellation.check()
-                if before_write is not None:
-                    before_write()
-                return write()
+                with write_fence():
+                    if before_write is not None:
+                        before_write()
+                    return write()
         return dispatch
 
     def _try_browser(self, target, cancellation):
@@ -890,6 +892,13 @@ class Connection:
                 raise ConnectionError("connection_retired")
         return check
 
+    @contextlib.contextmanager
+    def active_fence(self, binding):
+        """Hold the connection store lock while binding remains active and non-retiring."""
+        with self._store.locked() as directory:
+            self._current(binding)(self._store.read(directory))
+            yield
+
     def models(self, binding):
         access = self._refresh(binding)
         with self._operation(binding.generation, self._current(binding)) as cancellation:
@@ -945,6 +954,7 @@ class Connection:
                 cancellation,
                 authorization=cfg["authorization"],
                 before_write=cfg["before_write"],
+                write_fence=cfg["write_fence"],
             )
             options = {
                 "limits": limits,
@@ -977,11 +987,12 @@ class Connection:
 
     @contextlib.contextmanager
     def interactive_responses(self, binding, body, before_send=None, *, authorization=None,
-                              limits=INTERACTIVE_STREAM_LIMITS, deadline=None, cancelled=None,
-                              inspect_media=True, observe_media=None):
+                              write_fence=None, limits=INTERACTIVE_STREAM_LIMITS, deadline=None,
+                              cancelled=None, inspect_media=True, observe_media=None):
         """Stream one bounded interactive Responses turn with fenced first-write verification."""
         self._validate_interactive_request(body, limits, deadline)
         authorize = authorization or contextlib.nullcontext
+        fence = write_fence or contextlib.nullcontext
 
         for attempt in range(2):
             access = self._refresh(binding, deadline=deadline, cancelled=cancelled)
@@ -999,6 +1010,7 @@ class Connection:
                 "cancelled": cancelled,
                 "authorization": authorize,
                 "before_write": track_before_write,
+                "write_fence": fence,
                 "inspect_media": inspect_media,
                 "observe_media": observe_media,
             }

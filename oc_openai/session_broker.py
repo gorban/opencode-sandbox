@@ -1,6 +1,6 @@
 """Host-side interactive ChatGPT Responses broker and foreground pod supervisor."""
 
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 import fcntl
 import hmac
@@ -24,6 +24,7 @@ from .cli import Reason, RouteUnavailable, StreamTerminal, report_failure
 from .connection import ConnectionError
 from .exposure import ExposureError, ExposureLedger
 from .live import make_backend
+from .profiles import ProfileError
 from .managed import relay as relay_mod
 from .managed.runtime import (
     HOST_SPAWN,
@@ -301,13 +302,15 @@ class SessionBroker:
             return None
         return _read_exact(peer, size, deadline)
 
-    def _check_exposure_allowed(self) -> None:
+    @contextmanager
+    def _exposure_fence(self):
         if self._exposure_dir is None:
             raise ConnectionError("exposure_store_unavailable")
         try:
-            ExposureLedger(self._exposure_dir).require_dispatch_allowed(
+            with ExposureLedger(self._exposure_dir).dispatch_fence(
                 acknowledged_digest=self._acknowledged_exposure_digest,
-            )
+            ):
+                yield
         except ExposureError as exc:
             code = exc.args[0] if exc.args and type(exc.args[0]) is str else "exposure_hold_active"
             raise ConnectionError(code) from None
@@ -318,11 +321,30 @@ class SessionBroker:
         if self._is_selected is not None and not self._is_selected():
             raise StreamAborted("session_revoked")
 
+    def _send_fenced(self, peer: socket.socket, payload: bytes) -> None:
+        if not payload:
+            return
+        authorize = self._authorization or nullcontext
+        active_fence = getattr(self._connection, "active_fence", None)
+        conn_fence = (lambda: active_fence(self._binding)) if active_fence is not None else nullcontext
+        try:
+            with authorize(), conn_fence(), self._lease.fence():
+                if self._stopped.is_set() or self._revoked.is_set() or not self._lease.active():
+                    raise StreamAborted("session_revoked")
+                if self._authorization is None and self._is_selected is not None and not self._is_selected():
+                    raise StreamAborted("session_revoked")
+                if active_fence is None:
+                    self._connection.require_active(self._binding)
+                peer.sendall(payload)
+        except (ConnectionError, ProfileError, RouteUnavailable):
+            raise StreamAborted("session_revoked") from None
+
     def _stream_responses_turn(self, peer: socket.socket, parsed, cancel: threading.Event,
                                state: dict) -> tuple[str, tuple[int, int, int] | None]:
         turn_deadline = min(time.monotonic() + TURN_TIMEOUT_SECONDS, self._lease.deadline_ns / 1e9)
         projector = SessionStreamProjector(
             model=parsed.model, local_response_id=self._next_response_id(), vault=self._vault,
+            allowed_tools=parsed.allowed_tools,
         )
 
         def before_write():
@@ -330,30 +352,29 @@ class SessionBroker:
                 raise ConnectionError("connection_retired")
             if self._authorization is None and self._is_selected is not None and not self._is_selected():
                 raise ConnectionError("connection_retired")
-            self._check_exposure_allowed()
 
         with self._connection.interactive_responses(
             self._binding, parsed.body, before_write,
             authorization=self._authorization,
+            write_fence=self._exposure_fence,
             limits=INTERACTIVE_STREAM_LIMITS, deadline=turn_deadline,
             cancelled=cancel, inspect_media=True, observe_media=lambda _kind: None,
         ) as upstream_events:
-            peer.settimeout(30)
-            peer.sendall(sse_response_headers())
+            peer.settimeout(5)
+            self._send_fenced(peer, sse_response_headers())
             state["headers_sent"] = True
             for event in upstream_events:
                 self._require_turn_active()
                 with self._vault_lock:
                     frames = projector.feed(event)
                 for frame in frames:
-                    peer.sendall(encode_chunk(frame))
+                    self._send_fenced(peer, encode_chunk(frame))
             self._require_turn_active()
             with self._vault_lock:
                 tail = projector.finalize()
-            self._require_turn_active()
             for frame in tail:
-                peer.sendall(encode_chunk(frame))
-            peer.sendall(b"0\r\n\r\n")
+                self._send_fenced(peer, encode_chunk(frame))
+            self._send_fenced(peer, b"0\r\n\r\n")
             return "completed", projector.usage
 
     def _send_peer_error(self, peer: socket.socket, headers_sent: bool, status: int, code: str, message: str) -> None:

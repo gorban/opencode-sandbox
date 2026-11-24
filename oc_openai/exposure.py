@@ -425,23 +425,58 @@ class ExposureLedger:
             return _validate_diagnostic_record(name, parsed)
         return _validate_recovery_record(name, parsed)
 
+    @staticmethod
+    def _validate_hold_links(loaded_files: dict[str, tuple[bytes, object]]) -> None:
+        if "canary-recovery.json" in loaded_files:
+            canary = loaded_files.get("canary.json")
+            if canary is None:
+                raise ExposureError(_ERR_INVALID_RECORD)
+            canary_raw, canary_parsed = canary
+            _rec_raw, rec_parsed = loaded_files["canary-recovery.json"]
+            if (canary_parsed["outcome"] != "unsettled"
+                    or rec_parsed["prior_canary_run_id"] != canary_parsed["run_id"]
+                    or not hmac.compare_digest(rec_parsed["prior_canary_digest"], sha256(canary_raw).hexdigest())):
+                raise ExposureError(_ERR_INVALID_RECORD)
+        if _DIAGNOSTIC in loaded_files:
+            exp = loaded_files.get(_LEDGER)
+            if exp is None or not exp[1]:
+                raise ExposureError(_ERR_INVALID_RECORD)
+            first_run = exp[1][0]["run"]
+            diag = loaded_files[_DIAGNOSTIC][1]
+            if diag["original_run"] != first_run or diag["run"] == first_run:
+                raise ExposureError(_ERR_INVALID_RECORD)
+        if _STREAM_DIAGNOSTIC in loaded_files:
+            exp = loaded_files.get(_LEDGER)
+            diag = loaded_files.get(_DIAGNOSTIC)
+            if exp is None or not exp[1] or diag is None:
+                raise ExposureError(_ERR_INVALID_RECORD)
+            first_run = exp[1][0]["run"]
+            prev_run = diag[1]["run"]
+            stream = loaded_files[_STREAM_DIAGNOSTIC][1]
+            if (stream["original_run"] != first_run or stream["previous_diagnostic_run"] != prev_run
+                    or stream["run"] in (first_run, prev_run)):
+                raise ExposureError(_ERR_INVALID_RECORD)
+
     def _inspect_locked(self, directory) -> ExposureHold:
         names = (_LEDGER, _DIAGNOSTIC, _STREAM_DIAGNOSTIC, *_RECOVERY_NAMES, *_CANARY_NAMES)
         hasher = sha256()
         present = 0
         unsettled = 0
         blocked = False
+        loaded_files: dict[str, tuple[bytes, object]] = {}
         for name in names:
             loaded = self._read_verified_hold_file(directory, name)
             if loaded is None:
                 hasher.update(name.encode("ascii") + b"\0missing\0")
                 continue
             raw, parsed = loaded
+            loaded_files[name] = (raw, parsed)
             file_blocked, file_unsettled = self._validate_hold_entry(name, parsed)
             present += 1
             unsettled += file_unsettled
             blocked = blocked or file_blocked
             hasher.update(name.encode("ascii") + b"\0" + sha256(raw).digest())
+        self._validate_hold_links(loaded_files)
         if not blocked:
             return ExposureHold(blocked=False, file_count=0, unsettled_count=0, digest="")
         return ExposureHold(blocked=True, file_count=present, unsettled_count=unsettled, digest=hasher.hexdigest())
@@ -451,16 +486,22 @@ class ExposureLedger:
         with self._locked() as directory:
             return self._inspect_locked(directory)
 
-    def require_dispatch_allowed(self, *, acknowledged_digest: str | None = None) -> None:
-        """Atomically enforce the shared exposure hold under non-blocking exposure.lock."""
+    @contextmanager
+    def dispatch_fence(self, *, acknowledged_digest: str | None = None):
+        """Hold non-blocking exposure.lock across hold validation and the bounded first write."""
         with self._locked() as directory:
             hold = self._inspect_locked(directory)
-            if not hold.blocked:
-                return
-            if acknowledged_digest is None or type(acknowledged_digest) is not str:
-                raise ExposureError("exposure_hold_active")
-            if not hmac.compare_digest(hold.digest, acknowledged_digest):
-                raise ExposureError("exposure_hold_changed")
+            if hold.blocked:
+                if acknowledged_digest is None or type(acknowledged_digest) is not str:
+                    raise ExposureError("exposure_hold_active")
+                if not hmac.compare_digest(hold.digest, acknowledged_digest):
+                    raise ExposureError("exposure_hold_changed")
+            yield hold
+
+    def require_dispatch_allowed(self, *, acknowledged_digest: str | None = None) -> None:
+        """Atomically enforce the shared exposure hold under non-blocking exposure.lock."""
+        with self.dispatch_fence(acknowledged_digest=acknowledged_digest):
+            return None
 
     def require_quiescent(self):
         """Keep a pending possible send from becoming a different account's run."""

@@ -162,7 +162,10 @@ class SessionProtocolTests(unittest.TestCase):
             self.assertEqual(err.exception.status, 400)
 
     def test_buffers_function_call_completion_until_finalize_and_enforces_strict_metadata_allowlist(self):
-        projector = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_2", vault=self.vault)
+        projector = SessionStreamProjector(
+            model="gpt-6.2-sol", local_response_id="resp_local_2", vault=self.vault,
+            allowed_tools=frozenset({"read"}),
+        )
         projector.feed({"type": "response.created", "response": {"id": "resp_up_2", "status": "in_progress"}})
         # Benign unblocked prompt metadata is dropped host-only.
         self.assertEqual(projector.feed({
@@ -226,7 +229,10 @@ class SessionProtocolTests(unittest.TestCase):
         self.assertEqual(err.exception.status, 400)
 
         # Strict event projection strips unknown fields/annotations and buffers ALL function_call frames.
-        p = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_4", vault=self.vault)
+        p = SessionStreamProjector(
+            model="gpt-6.2-sol", local_response_id="resp_local_4", vault=self.vault,
+            allowed_tools=frozenset({"bash"}),
+        )
         p.feed({"type": "response.created", "response": {"id": "resp_up_4", "status": "in_progress"}})
         done_text = p.feed({
             "type": "response.output_text.done", "text": "clean",
@@ -304,7 +310,10 @@ class SessionProtocolTests(unittest.TestCase):
             self.assertEqual(err.exception.code, "premature_tool_call")
 
         # P1 #2b: buffered tool item missing from completed.output or with mismatched arguments aborts finalize().
-        p_orphan = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t2", vault=self.vault)
+        p_orphan = SessionStreamProjector(
+            model="gpt-6.2-sol", local_response_id="resp_local_t2", vault=self.vault,
+            allowed_tools=frozenset({"bash"}),
+        )
         p_orphan.feed({"type": "response.created", "response": {"id": "resp_up_t2", "status": "in_progress"}})
         p_orphan.feed({
             "type": "response.output_item.done", "output_index": 0,
@@ -315,7 +324,10 @@ class SessionProtocolTests(unittest.TestCase):
             p_orphan.finalize()
         self.assertEqual(err_o.exception.code, "tool_call_mismatch")
 
-        p_mismatch = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t3", vault=self.vault)
+        p_mismatch = SessionStreamProjector(
+            model="gpt-6.2-sol", local_response_id="resp_local_t3", vault=self.vault,
+            allowed_tools=frozenset({"read"}),
+        )
         p_mismatch.feed({"type": "response.created", "response": {"id": "resp_up_t3", "status": "in_progress"}})
         p_mismatch.feed({
             "type": "response.output_item.added", "output_index": 0,
@@ -337,7 +349,10 @@ class SessionProtocolTests(unittest.TestCase):
         self.assertEqual(err_m.exception.code, "tool_call_mismatch")
 
         # P1 #2c: valid live-style tool stream (item_id without call_id on deltas) + omnimod moderation passes.
-        p_ok = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t4", vault=self.vault)
+        p_ok = SessionStreamProjector(
+            model="gpt-6.2-sol", local_response_id="resp_local_t4", vault=self.vault,
+            allowed_tools=frozenset({"read"}),
+        )
         p_ok.feed({
             "type": "response.created", "safety_buffering": False, "sequence_number": 0,
             "response": {"id": "resp_up_t4", "status": "in_progress", "moderation": None},
@@ -395,7 +410,10 @@ class SessionProtocolTests(unittest.TestCase):
             })
 
         # Assistant refusal cannot coexist with a function_call on the same turn.
-        p_ref = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t6", vault=self.vault)
+        p_ref = SessionStreamProjector(
+            model="gpt-6.2-sol", local_response_id="resp_local_t6", vault=self.vault,
+            allowed_tools=frozenset({"bash"}),
+        )
         p_ref.feed({"type": "response.created", "response": {"id": "resp_up_t6", "status": "in_progress"}})
         p_ref.feed({"type": "response.refusal.delta", "delta": "cannot do that"})
         p_ref.feed({
@@ -411,7 +429,10 @@ class SessionProtocolTests(unittest.TestCase):
         self.assertEqual(err_ref.exception.code, "tool_call_with_refusal")
 
         # P2 #1: unknown metadata keys inside response.completed/created abort fail-closed.
-        p_meta = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t7", vault=self.vault)
+        p_meta = SessionStreamProjector(
+            model="gpt-6.2-sol", local_response_id="resp_local_t7", vault=self.vault,
+            allowed_tools=frozenset({"bash"}),
+        )
         p_meta.feed({"type": "response.created", "response": {"id": "resp_up_t7", "status": "in_progress"}})
         with self.assertRaises(StreamAborted) as err_meta:
             p_meta.feed({
@@ -427,7 +448,10 @@ class SessionProtocolTests(unittest.TestCase):
 
         # P2 #2: mismatched item_id between output_item.added and function_call_arguments.delta
         # aborts finalize() even when response.completed.output[idx] omits "id".
-        p_id = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_t8", vault=self.vault)
+        p_id = SessionStreamProjector(
+            model="gpt-6.2-sol", local_response_id="resp_local_t8", vault=self.vault,
+            allowed_tools=frozenset({"read"}),
+        )
         p_id.feed({"type": "response.created", "response": {"id": "resp_up_t8", "status": "in_progress"}})
         p_id.feed({
             "type": "response.output_item.added", "output_index": 0,
@@ -448,6 +472,95 @@ class SessionProtocolTests(unittest.TestCase):
         with self.assertRaises(StreamAborted) as err_id:
             p_id.finalize()
         self.assertEqual(err_id.exception.code, "tool_call_mismatch")
+
+    def test_reciprocal_r2_tool_policy_and_delta_name_enforcement(self):
+        base = {"model": "gpt-6.2-sol", "stream": True, "store": False,
+                "input": [{"role": "user", "content": "hi"}]}
+        read_tool = {"type": "function", "name": "read", "parameters": {"type": "object"}}
+        edit_tool = {"type": "function", "name": "edit", "parameters": {"type": "object"}}
+
+        # Request policy resolution: no tools, tool_choice=none, specific tool, and invalid choice.
+        self.assertEqual(
+            parse_worker_request(_http_req("POST", "/v1/responses", base),
+                                 expected_token="tok-secret", allowed_models=self.models, vault=self.vault).allowed_tools,
+            frozenset(),
+        )
+        self.assertEqual(
+            parse_worker_request(
+                _http_req("POST", "/v1/responses", {**base, "tools": [read_tool, edit_tool], "tool_choice": "none"}),
+                expected_token="tok-secret", allowed_models=self.models, vault=self.vault,
+            ).allowed_tools,
+            frozenset(),
+        )
+        self.assertEqual(
+            parse_worker_request(
+                _http_req("POST", "/v1/responses", {
+                    **base, "tools": [read_tool, edit_tool], "tool_choice": {"type": "function", "name": "read"},
+                }),
+                expected_token="tok-secret", allowed_models=self.models, vault=self.vault,
+            ).allowed_tools,
+            frozenset({"read"}),
+        )
+        for bad_choice in ({"type": "function", "name": "bash"}, "required"):
+            with self.subTest(bad_choice=bad_choice), self.assertRaises(RequestRefused) as err_req:
+                parse_worker_request(
+                    _http_req("POST", "/v1/responses", {**base, "tool_choice": bad_choice}),
+                    expected_token="tok-secret", allowed_models=self.models, vault=self.vault,
+                )
+            self.assertEqual(err_req.exception.status, 400)
+
+        # Projector rejects any tool call when allowed_tools is empty (e.g. no tools or tool_choice=none).
+        p_none = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_nt", vault=self.vault)
+        p_none.feed({"type": "response.created", "response": {"id": "resp_nt", "status": "in_progress"}})
+        with self.assertRaises(StreamAborted) as err_nt:
+            p_none.feed({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+            })
+        self.assertEqual(err_nt.exception.code, "unauthorized_tool_call")
+
+        # Projector rejects undeclared tool names even when other tools are allowed.
+        p_only_read = SessionStreamProjector(
+            model="gpt-6.2-sol", local_response_id="resp_local_or", vault=self.vault,
+            allowed_tools=frozenset({"read"}),
+        )
+        p_only_read.feed({"type": "response.created", "response": {"id": "resp_or", "status": "in_progress"}})
+        with self.assertRaises(StreamAborted) as err_or:
+            p_only_read.feed({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_or", "status": "completed",
+                    "output": [{"type": "function_call", "call_id": "call_e", "name": "edit",
+                                "arguments": "{}", "status": "completed"}],
+                },
+            })
+        self.assertEqual(err_or.exception.code, "unauthorized_tool_call")
+
+        # Conflicting name on function_call_arguments.delta aborts finalize() before releasing any tool frames.
+        p_delta = SessionStreamProjector(
+            model="gpt-6.2-sol", local_response_id="resp_local_dn", vault=self.vault,
+            allowed_tools=frozenset({"read", "edit"}),
+        )
+        p_delta.feed({"type": "response.created", "response": {"id": "resp_dn", "status": "in_progress"}})
+        p_delta.feed({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "fc_dn", "type": "function_call", "call_id": "call_dn", "name": "read", "arguments": ""},
+        })
+        p_delta.feed({
+            "type": "response.function_call_arguments.delta", "output_index": 0,
+            "item_id": "fc_dn", "call_id": "call_dn", "name": "edit", "delta": "{}",
+        })
+        p_delta.feed({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_dn", "status": "completed",
+                "output": [{"id": "fc_dn", "type": "function_call", "call_id": "call_dn",
+                            "name": "read", "arguments": "{}", "status": "completed"}],
+            },
+        })
+        with self.assertRaises(StreamAborted) as err_dn:
+            p_delta.finalize()
+        self.assertEqual(err_dn.exception.code, "tool_call_mismatch")
 
 
 if __name__ == "__main__":
