@@ -5,9 +5,10 @@ import os
 from pathlib import Path
 import runpy
 import secrets
+import select
 import socket
 import ssl
-from threading import Thread
+from threading import Lock, Thread
 import time
 
 
@@ -16,6 +17,43 @@ POLICY = runpy.run_path(str(HERE / "egress-policy.py"))
 TLS = runpy.run_path(str(HERE / "tls-admission.py"))
 HOST = "oauth2.googleapis.com"
 REPLY = b'{"error":"invalid_grant"}'
+
+
+class PrematureClose(RuntimeError):
+    """The trusted supervisor could not establish that the tunnel was open at stop."""
+
+
+class CancellationEvidence:
+    def __init__(self, marker):
+        self.marker = marker
+        self.lock = Lock()
+        self.bridge = None
+        self.peer = None
+        self.stop_at = None
+        self.closed_at = None
+
+    def ready(self, peer):
+        with self.lock:
+            self.peer = peer
+            self.marker.touch(exist_ok=False)
+
+    def stop_requested(self):
+        with self.lock:
+            if self.closed_at is not None or self.peer is None or self.bridge is None:
+                raise PrematureClose()
+            try:
+                readable, _, _ = select.select((self.bridge, self.peer), (), (), 0)
+                if readable:
+                    raise PrematureClose()
+            except (OSError, ValueError) as error:
+                raise PrematureClose() from error
+            self.stop_at = time.monotonic_ns()
+
+    def record_eof(self):
+        when = time.monotonic_ns()
+        with self.lock:
+            self.closed_at = when
+            return "cancelled_open_peer" if self.stop_at is not None and self.stop_at < when else "premature_peer_close"
 
 
 def create_certificates(directory, run_host):
@@ -61,23 +99,23 @@ def received_token_post(peer):
                 and b"oc-sandbox-synthetic-invalid-code" in stream.read(size))
 
 
-def fake_oauth(peer, cancel_ready):
+def fake_oauth(peer, cancellation):
     if not received_token_post(peer):
         return "unexpected_request"
-    if cancel_ready is not None:
-        cancel_ready.touch(exist_ok=False)
-        return "cancelled_open_peer" if not peer.recv(1) else "unexpected_request"
+    if cancellation is not None:
+        cancellation.ready(peer)
+        return cancellation.record_eof() if not peer.recv(1) else "unexpected_request"
     peer.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: "
                  + str(len(REPLY)).encode("ascii") + b"\r\nConnection: close\r\n\r\n" + REPLY)
     return "synthetic_token_post"
 
 
-def record_outcome(sock, context, evidence, cancel_ready):
+def record_outcome(sock, context, evidence, cancellation):
     with sock:
         sock.settimeout(5)
         try:
             with context.wrap_socket(sock, server_side=True) as peer:
-                evidence.append(fake_oauth(peer, cancel_ready))
+                evidence.append(fake_oauth(peer, cancellation))
         except ssl.SSLError as error:
             if error.reason in {"SSLV3_ALERT_BAD_CERTIFICATE", "TLSV1_ALERT_UNKNOWN_CA",
                                 "SSLV3_ALERT_CERTIFICATE_UNKNOWN"}:
@@ -86,17 +124,19 @@ def record_outcome(sock, context, evidence, cancel_ready):
             return
 
 
-def serve_once(listener, context, evidence, cancel_ready=None):
+def serve_once(listener, context, evidence, cancellation=None):
     try:
         client, _ = listener.accept()
         with client:
+            if cancellation is not None:
+                cancellation.bridge = client
             deadline = time.monotonic() + 7
             POLICY["read_connect"](client)
             client.sendall(TLS["ESTABLISHED"])
             validated_hello = TLS["read_client_hello"](client, deadline=deadline)
             broker, fake = socket.socketpair()
             with broker, fake:
-                server = Thread(target=record_outcome, args=(fake, context, evidence, cancel_ready), daemon=True)
+                server = Thread(target=record_outcome, args=(fake, context, evidence, cancellation), daemon=True)
                 server.start()
                 try:
                     broker.sendall(validated_hello)
@@ -122,7 +162,7 @@ def qualify(directory, programs, *, launch, run_host):
         socket_directory.mkdir(mode=0o700)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certificates / f"{certificate}.pem", certificates / f"{certificate}.key")
-        cancel_ready = profile / "cancel-ready" if label == "cancel-open" else None
+        cancellation = CancellationEvidence(profile / "cancel-ready") if label == "cancel-open" else None
         evidence = []
         with socket.socket(socket.AF_UNIX) as listener:
             address = socket_directory / "observe.sock"
@@ -130,9 +170,9 @@ def qualify(directory, programs, *, launch, run_host):
             address.chmod(0o600)
             listener.listen(1)
             listener.settimeout(6)
-            broker = Thread(target=serve_once, args=(listener, context, evidence, cancel_ready), daemon=True)
+            broker = Thread(target=serve_once, args=(listener, context, evidence, cancellation), daemon=True)
             broker.start()
-            verify = launch(profile, socket_directory, cancel=cancel_ready is not None)
+            verify = launch(profile, socket_directory, cancellation=cancellation)
             broker.join(7)
             if verify is not None and (verify.returncode or verify.stdout.strip() != b"NATIVE_FAKE_TLS_FINISHED"):
                 return label

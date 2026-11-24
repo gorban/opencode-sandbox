@@ -148,7 +148,7 @@ def verify_completion(unit, launch, work):
         raise QualificationError("native fixture did not confirm its expected result and cleanup")
 
 
-def verify_interruption(unit, launch, work):
+def verify_interruption(unit, launch, work, *, before_stop=None):
     try:
         service = subprocess.Popen([HOST, "--no-pty", *launch], cwd="/", env=workstation_env(os.getuid()),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -171,7 +171,11 @@ def verify_interruption(unit, launch, work):
         raise
     finally:
         try:
-            stop(unit, require_success=observed)
+            try:
+                if observed and before_stop is not None:
+                    before_stop()
+            finally:
+                stop(unit, require_success=observed)
         finally:
             wait_for_launch_receipt(service)
 
@@ -225,11 +229,14 @@ def prove_native_connect(root, programs, config):
 def prove_native_tls(root, programs, config):
     fixture = runpy.run_path(str(Path(__file__).with_name("tls-fixture.py")))
 
-    def launch(profile, egress, *, cancel):
+    def launch(profile, egress, *, cancellation):
         unit = f"oc-agy-fake-tls-{secrets.token_hex(8)}.service"
         command_line = command(unit, programs, config, profile, None, None, False, egress=egress, fake_tls=True)
-        if cancel:
-            verify_interruption(unit, command_line, profile)
+        if cancellation is not None:
+            try:
+                verify_interruption(unit, command_line, profile, before_stop=cancellation.stop_requested)
+            except fixture["PrematureClose"] as error:
+                raise QualificationError("fake TLS tunnel closed before cancellation was requested") from error
             return None
         return run_to_completion(unit, command_line)
 
