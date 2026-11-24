@@ -135,6 +135,8 @@ PYTHON_FILES = (
     'tests/test_ci_toolchain.py',
     'tests/test_controller_core.py',
     'tests/test_openai_canary.py',
+    'tests/e2e/live/openai_canary_driver.py',
+    'tests/e2e/live/test_openai_canary_e2e.py',
     'tests/test_openai_cli.py',
     'tests/test_openai_cli_launcher.py',
     'tests/test_openai_connection.py',

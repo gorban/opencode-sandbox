@@ -42,6 +42,7 @@ from oc_openai.canary_protocol import (
     verify_opencode_json_stdout,
 )
 from oc_openai.canary_runtime import CanaryPlacement, OwnerLost, PipeLifeline, RuntimeFailure, container_categories
+from oc_openai.cli import MODEL
 from oc_openai.connection import Connection
 from oc_openai.exposure import _INPUT_LIMIT, _OUTPUT_LIMIT, binding_digest
 from oc_openai.profile_backend import ProfileBackend
@@ -306,7 +307,7 @@ class CanaryLedgerTests(unittest.TestCase):
         # Seed unsettled canary.json predecessor and pin its exact run_id + byte digest.
         snap = self.ledger.preflight()
         prior_run = "a" * 32
-        self.ledger.reserve(prior_run, self.binding, "gpt-6.2-sol", snap.digest)
+        self.ledger.reserve(prior_run, self.binding, MODEL, snap.digest)
         prior_path = self.state / CANARY_FILE
         prior_bytes = prior_path.read_bytes()
         prior_stat = prior_path.stat()
@@ -315,11 +316,11 @@ class CanaryLedgerTests(unittest.TestCase):
 
         # Wrong pinned predecessor digest/run_id or wrong binding is rejected before consent.
         with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_ineligible"):
-            self.ledger.preflight_recovery(self.binding, "gpt-6.2-sol", expected_prior=(prior_run, "0" * 64))
+            self.ledger.preflight_recovery(self.binding, MODEL, expected_prior=(prior_run, "0" * 64))
         with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_ineligible"):
-            self.ledger.preflight_recovery("9" * 64, "gpt-6.2-sol", expected_prior=pinned)
+            self.ledger.preflight_recovery("9" * 64, MODEL, expected_prior=pinned)
 
-        rec_snap = self.ledger.preflight_recovery(self.binding, "gpt-6.2-sol", expected_prior=pinned)
+        rec_snap = self.ledger.preflight_recovery(self.binding, MODEL, expected_prior=pinned)
         self.assertEqual((rec_snap.prior_run_id, rec_snap.prior_digest), pinned)
 
         # Tampering canary.json between preflight and reserve fails closed without creating canary-recovery.json.
@@ -328,7 +329,7 @@ class CanaryLedgerTests(unittest.TestCase):
         os.chmod(prior_path, 0o600)
         with self.assertRaisesRegex(CanaryLedgerError, "canary_recovery_ineligible"):
             self.ledger.reserve_recovery(
-                "b" * 32, self.binding, "gpt-6.2-sol", rec_snap.history.digest,
+                "b" * 32, self.binding, MODEL, rec_snap.history.digest,
                 prior_run_id=prior_run, prior_digest=prior_digest, expected_prior=pinned,
             )
         self.assertFalse((self.state / CANARY_RECOVERY_FILE).exists())
@@ -338,7 +339,7 @@ class CanaryLedgerTests(unittest.TestCase):
 
         # Reserve, settle, and mark delivered on canary-recovery.json while canary.json stays byte/inode identical.
         self.ledger.reserve_recovery(
-            "b" * 32, self.binding, "gpt-6.2-sol", rec_snap.history.digest,
+            "b" * 32, self.binding, MODEL, rec_snap.history.digest,
             prior_run_id=prior_run, prior_digest=prior_digest, expected_prior=pinned,
         )
         self.assertEqual(prior_path.read_bytes(), prior_bytes)
@@ -647,10 +648,12 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
             port = probe.getsockname()[1]
 
         broker = canary.CanaryBroker(
-            sock_path, proof=proof, worker_token=token, bound_model="gpt-6.2-sol",
-            ledger=self.ledger, run_id="1" * 32, binding_hash=self.binding,
-            history_digest=snap.digest, upstream_stream=fake_upstream,
-            fenced_client_write=lambda fn: fn(), check_alive=lambda: None, port=port,
+            sock_path, canary.CanaryBrokerConfig(
+                proof=proof, worker_token=token, bound_model=MODEL,
+                ledger=self.ledger, run_id="1" * 32, binding_hash=self.binding,
+                history_digest=snap.digest, upstream_stream=fake_upstream,
+                fenced_client_write=lambda fn: fn(), check_alive=lambda: None, port=port,
+            ),
         )
         broker.start()
         try:
@@ -730,11 +733,13 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
             port = probe.getsockname()[1]
 
         broker = canary.CanaryBroker(
-            sock_path, proof=proof, worker_token=token, bound_model="gpt-6.2-sol",
-            ledger=self.ledger, run_id="2" * 32, binding_hash=self.binding,
-            history_digest=snap.digest, upstream_stream=upstream_after_reserve,
-            fenced_client_write=lambda fn: fn(), check_alive=check_alive,
-            port=port, after_reserve=drop_tty_after_reserve,
+            sock_path, canary.CanaryBrokerConfig(
+                proof=proof, worker_token=token, bound_model=MODEL,
+                ledger=self.ledger, run_id="2" * 32, binding_hash=self.binding,
+                history_digest=snap.digest, upstream_stream=upstream_after_reserve,
+                fenced_client_write=lambda fn: fn(), check_alive=check_alive,
+                port=port, after_reserve=drop_tty_after_reserve,
+            ),
         )
         broker.start()
         try:
@@ -893,10 +898,12 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
                     port = probe.getsockname()[1]
 
                 broker = canary.CanaryBroker(
-                    sock_path, proof=proof, worker_token=token, bound_model="gpt-6.2-sol",
-                    ledger=ledger, run_id="3" * 32, binding_hash=self.binding,
-                    history_digest=snap.digest, upstream_stream=refused_upstream,
-                    fenced_client_write=lambda fn: fn(), check_alive=lambda: None, port=port,
+                    sock_path, canary.CanaryBrokerConfig(
+                        proof=proof, worker_token=token, bound_model=MODEL,
+                        ledger=ledger, run_id="3" * 32, binding_hash=self.binding,
+                        history_digest=snap.digest, upstream_stream=refused_upstream,
+                        fenced_client_write=lambda fn: fn(), check_alive=lambda: None, port=port,
+                    ),
                 )
                 broker.start()
                 try:
@@ -1094,16 +1101,18 @@ class CanaryRealPodmanTests(unittest.TestCase):
 
                 broker = canary.CanaryBroker(
                     relay_dir / "provider.sock",
-                    proof=proof,
-                    worker_token=worker_token,
-                    bound_model="gpt-6.2-sol",
-                    ledger=ledger,
-                    run_id=secrets.token_hex(16),
-                    binding_hash=binding_digest("a" * 43, "b" * 43, "c" * 43),
-                    history_digest=history.digest,
-                    upstream_stream=fake_upstream,
-                    fenced_client_write=lambda fn: fn(),
-                    check_alive=lambda: None,
+                    canary.CanaryBrokerConfig(
+                        proof=proof,
+                        worker_token=worker_token,
+                        bound_model=MODEL,
+                        ledger=ledger,
+                        run_id=secrets.token_hex(16),
+                        binding_hash=binding_digest("a" * 43, "b" * 43, "c" * 43),
+                        history_digest=history.digest,
+                        upstream_stream=fake_upstream,
+                        fenced_client_write=lambda fn: fn(),
+                        check_alive=lambda: None,
+                    ),
                 )
                 broker.start()
                 w_id = placement.create_and_start(
@@ -1347,10 +1356,12 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
                 port = probe.getsockname()[1]
 
             broker = canary.CanaryBroker(
-                root / "supp.sock", proof=proof, worker_token=token, bound_model="gpt-6.2-sol",
-                ledger=ledger, run_id="5" * 32, binding_hash=binding_digest("a" * 43, "b" * 43, "c" * 43),
-                history_digest=snap.digest, upstream_stream=tls_upstream,
-                fenced_client_write=lambda fn: fn(), check_alive=lambda: None, port=port,
+                root / "supp.sock", canary.CanaryBrokerConfig(
+                    proof=proof, worker_token=token, bound_model=MODEL,
+                    ledger=ledger, run_id="5" * 32, binding_hash=binding_digest("a" * 43, "b" * 43, "c" * 43),
+                    history_digest=snap.digest, upstream_stream=tls_upstream,
+                    fenced_client_write=lambda fn: fn(), check_alive=lambda: None, port=port,
+                ),
             )
             broker.start()
             try:
@@ -1442,16 +1453,18 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
             ledger = CanaryLedger(root / "state")
             broker = canary.CanaryBroker(
                 root / "provider.sock",
-                proof=b"p" * 32,
-                worker_token="t" * 64,
-                bound_model="gpt-6.2-sol",
-                ledger=ledger,
-                run_id="r" * 32,
-                binding_hash=binding_digest("a" * 43, "b" * 43, "c" * 43),
-                history_digest="0" * 64,
-                upstream_stream=lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("no upstream")),
-                fenced_client_write=lambda fn: fn(),
-                check_alive=lambda: None,
+                canary.CanaryBrokerConfig(
+                    proof=b"p" * 32,
+                    worker_token="t" * 64,
+                    bound_model=MODEL,
+                    ledger=ledger,
+                    run_id="r" * 32,
+                    binding_hash=binding_digest("a" * 43, "b" * 43, "c" * 43),
+                    history_digest="0" * 64,
+                    upstream_stream=lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("no upstream")),
+                    fenced_client_write=lambda fn: fn(),
+                    check_alive=lambda: None,
+                ),
             )
             broker.start()
             stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1499,59 +1512,81 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
             canary_runtime._bounded_capture(hang_cmd, env={"PATH": "/usr/bin:/bin"}, timeout=0.25)
         self.assertLess(time.monotonic() - started, 3.0)
 
-        # oc-openai.py verifies --reviewed-source (including oc_providers/) BEFORE importing packages.
+        # Public CLI no longer exposes `oc-sandbox openai canary`; it belongs in tests/e2e/live/.
         repo = Path(__file__).resolve().parents[1]
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-        with tempfile.TemporaryDirectory(prefix="oc-canary-prov-", dir=home) as tmp:
-            copy_root = Path(tmp) / "checkout"
-            copy_root.mkdir(mode=0o700)
-            for rel in ("oc-sandbox", "oc-openai.py"):
-                dst = copy_root / rel
-                dst.write_bytes((repo / rel).read_bytes())
-                os.chmod(dst, 0o700 if rel == "oc-sandbox" else 0o600)
-            for pkg in ("oc_openai", "oc_providers"):
-                for src in sorted((repo / pkg).rglob("*")):
-                    rel = src.relative_to(repo)
-                    dst = copy_root / rel
-                    if src.is_dir():
-                        dst.mkdir(mode=0o700, exist_ok=True)
-                    else:
-                        dst.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-                        dst.write_bytes(src.read_bytes())
-                        os.chmod(dst, 0o600)
-            orig_digest = canary.canary_source_digest(copy_root)
-            sentinel = Path(tmp) / "imported_sentinel"
-            contracts = copy_root / "oc_providers" / "contracts.py"
-            contracts.write_text(
-                f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('RAN')\n"
-                + contracts.read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
-            os.chmod(contracts, 0o600)
-            self.assertNotEqual(canary.canary_source_digest(copy_root), orig_digest)
-            res = subprocess.run(
-                [sys.executable, "-IB", str(copy_root / "oc-openai.py"),
-                 "canary", "--reviewed-source", orig_digest],
-                capture_output=True, text=True, timeout=10,
-            )
-            self.assertEqual(res.returncode, 1)
-            self.assertIn("does not match --reviewed-source", res.stderr)
-            self.assertFalse(sentinel.exists(), "oc_providers executed before --reviewed-source check!")
+        from oc_openai import cli as openai_cli
 
-            # oc-sandbox resolves canary HOME via getent passwd BEFORE SB="$HOME/opencode-sandbox".
-            launcher_text = (repo / "oc-sandbox").read_text(encoding="utf-8")
-            self.assertLess(launcher_text.index("/usr/bin/getent passwd"), launcher_text.index('SB="$HOME/opencode-sandbox"'))
-            stub_helper = copy_root / "oc-openai.py"
-            stub_helper.write_text("import os; print(os.environ['HOME'])\n", encoding="utf-8")
-            os.chmod(stub_helper, 0o600)
-            env = {k: v for k, v in os.environ.items() if k != "HOME"}
-            env["HOME"] = "/nonexistent/hostile-home-override"
-            res_home = subprocess.run(
-                ["bash", str(copy_root / "oc-sandbox"), "openai", "canary", "--synthetic-check"],
-                env=env, capture_output=True, text=True, timeout=10,
-            )
-            self.assertEqual(res_home.returncode, 0, res_home.stderr)
-            self.assertEqual(res_home.stdout.strip(), str(home))
+        cli_term = Terminal(True)
+        self.assertEqual(openai_cli.run(["canary"], terminal=cli_term), 2)
+        self.assertNotIn("canary", openai_cli.USAGE)
+        res_cli = subprocess.run(
+            ["bash", str(repo / "oc-sandbox"), "openai", "canary", "--synthetic-check"],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(res_cli.returncode, 2)
+        self.assertNotIn("canary", res_cli.stderr)
+
+        # Live-observed moderation wire schema: response.moderation=None and omnimod unblocked flags pass,
+        # while any flagged category or non-empty tool moderation slot suppresses cleanly.
+        live_events = _ok_events()
+        rid = live_events[0]["response"]["id"]
+        live_events[0] = {
+            "type": "response.created", "safety_buffering": False, "sequence_number": 0,
+            "response": {"id": rid, "model": MODEL, "status": "in_progress", "moderation": None},
+        }
+        live_events.insert(1, {
+            "type": "response.metadata", "response_id": rid, "sequence_number": 1,
+            "metadata": {"openai_chatgpt_moderation_metadata": {
+                "prompt": {"omnimod": {
+                    "protection_type": "default",
+                    "outputs": [{"is_blocked": False, "results": [{"category_flags": {"A1": False, "REFUSED": False}}]}],
+                }},
+                "generation": {}, "tool_call": {}, "tool_response": {},
+            }},
+        })
+        live_events[-1]["response"]["moderation"] = None
+        ok_out = canary_protocol.consume_upstream_stream(live_events, bound_model=MODEL, check_alive=lambda: None)
+        self.assertTrue(ok_out.allow_delivery)
+        self.assertEqual(ok_out.reason, "ok")
+
+        flagged_events = [dict(ev) for ev in live_events]
+        flagged_events[1] = {
+            "type": "response.metadata", "response_id": rid, "sequence_number": 1,
+            "metadata": {"openai_chatgpt_moderation_metadata": {
+                "prompt": {"omnimod": {
+                    "protection_type": "default",
+                    "outputs": [{"is_blocked": False, "results": [{"category_flags": {"A1": False, "REFUSED": True}}]}],
+                }},
+                "generation": {}, "tool_call": {}, "tool_response": {},
+            }},
+        }
+        flagged_out = canary_protocol.consume_upstream_stream(
+            flagged_events, bound_model=MODEL, check_alive=lambda: None,
+        )
+        self.assertFalse(flagged_out.allow_delivery)
+        self.assertEqual(flagged_out.reason, "metadata_moderation_blocked")
+
+        non_null_mod = _ok_events()
+        non_null_mod[0]["response"]["moderation"] = {"flagged": True}
+        self.assertFalse(
+            canary_protocol.consume_upstream_stream(
+                non_null_mod, bound_model=MODEL, check_alive=lambda: None,
+            ).allow_delivery,
+        )
+
+        tool_mod_events = [dict(ev) for ev in live_events]
+        tool_mod_events[1] = {
+            "type": "response.metadata", "response_id": rid, "sequence_number": 1,
+            "metadata": {"openai_chatgpt_moderation_metadata": {
+                "prompt": {}, "generation": {}, "tool_call": {"omnimod": {"outputs": []}}, "tool_response": {},
+            }},
+        }
+        self.assertEqual(
+            canary_protocol.consume_upstream_stream(
+                tool_mod_events, bound_model=MODEL, check_alive=lambda: None,
+            ).reason,
+            "metadata_moderation_blocked",
+        )
 
         # Early close() on a keep_fp=True _StrictResponse before body exhaustion closes its BufferedReader.
         from oc_openai.responses import _StrictResponse

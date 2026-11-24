@@ -97,6 +97,9 @@ def _closed_diagnostic(exc: Exception) -> str:
     return "code=io_error"
 
 
+_UNSUPPORTED_ARGS = "unsupported canary arguments"
+
+
 @dataclass(frozen=True)
 class CanaryArgs:
     model: str | None
@@ -107,7 +110,7 @@ class CanaryArgs:
 
 def _parse_canary_flag(argv: list[str], idx: int, current: str | None, pattern: re.Pattern) -> tuple[str, int]:
     if current is not None or idx + 1 >= len(argv):
-        raise ValueError("unsupported canary arguments")
+        raise ValueError(_UNSUPPORTED_ARGS)
     value = argv[idx + 1]
     if not pattern.fullmatch(value):
         raise ValueError("invalid canary argument value")
@@ -116,7 +119,7 @@ def _parse_canary_flag(argv: list[str], idx: int, current: str | None, pattern: 
 
 def _set_unique_flag(current: bool, conflict: bool) -> bool:
     if current or conflict:
-        raise ValueError("unsupported canary arguments")
+        raise ValueError(_UNSUPPORTED_ARGS)
     return True
 
 
@@ -134,7 +137,7 @@ def _consume_canary_arg(argv: list[str], idx: int, state: dict) -> int:
     if arg == "--reviewed-source":
         state["reviewed_source"], next_idx = _parse_canary_flag(argv, idx, state["reviewed_source"], _SHA256_RE)
         return next_idx
-    raise ValueError("unsupported canary arguments")
+    raise ValueError(_UNSUPPORTED_ARGS)
 
 
 def parse_canary_argv(argv: list[str]) -> CanaryArgs:
@@ -232,43 +235,64 @@ def _recv_exact_proof(conn: socket.socket, expected: bytes) -> bool:
     return hmac.compare_digest(bytes(buf), expected)
 
 
+@dataclass(frozen=True)
+class CanaryBrokerConfig:
+    """Configuration and callbacks for one zero-tool canary broker run."""
+
+    proof: bytes
+    worker_token: str
+    bound_model: str
+    ledger: CanaryLedger
+    run_id: str
+    binding_hash: str
+    history_digest: str
+    upstream_stream: object
+    fenced_client_write: object
+    check_alive: object
+    port: int = PORT
+    after_reserve: object = None
+    recovery_prior: tuple[str, str] | None = None
+    expected_prior: tuple[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class CanaryLiveResult:
+    """Strictly content-free result from an isolated live e2e canary run."""
+
+    ok: bool
+    label: str
+    model: str
+    upstream_calls: int
+    ledger_outcome: str | None
+    delivered_bytes: int
+    media_fallback: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    opencode_rc: int
+    stdout_verified: bool
+    cleanup_verified: bool
+    details: str
+
+
 class CanaryBroker:
     """Foreground UDS broker enforcing 0 tools and at most 1 upstream Responses send."""
 
-    def __init__(
-        self,
-        sock_path: Path,
-        *,
-        proof: bytes,
-        worker_token: str,
-        bound_model: str,
-        ledger: CanaryLedger,
-        run_id: str,
-        binding_hash: str,
-        history_digest: str,
-        upstream_stream,
-        fenced_client_write,
-        check_alive,
-        port: int = PORT,
-        after_reserve=None,
-        recovery_prior: tuple[str, str] | None = None,
-        expected_prior: tuple[str, str] | None = None,
-    ):
+    def __init__(self, sock_path: Path, config: CanaryBrokerConfig):
         self.sock_path = sock_path
-        self.proof = proof
-        self.worker_token = worker_token
-        self.bound_model = bound_model
-        self.ledger = ledger
-        self.run_id = run_id
-        self.binding_hash = binding_hash
-        self.history_digest = history_digest
-        self.upstream_stream = upstream_stream
-        self.fenced_client_write = fenced_client_write
-        self.check_alive = check_alive
-        self.port = port
-        self.after_reserve = after_reserve
-        self.recovery_prior = recovery_prior
-        self.expected_prior = expected_prior
+        self.proof = config.proof
+        self.worker_token = config.worker_token
+        self.bound_model = config.bound_model
+        self.ledger = config.ledger
+        self.run_id = config.run_id
+        self.binding_hash = config.binding_hash
+        self.history_digest = config.history_digest
+        self.upstream_stream = config.upstream_stream
+        self.fenced_client_write = config.fenced_client_write
+        self.check_alive = config.check_alive
+        self.port = config.port
+        self.after_reserve = config.after_reserve
+        self.recovery_prior = config.recovery_prior
+        self.expected_prior = config.expected_prior
         self._stop = threading.Event()
         self._admit_lock = threading.Lock()
         self._peer_lock = threading.Lock()
@@ -631,18 +655,20 @@ def _execute_canary_session(
 
         broker = CanaryBroker(
             root / "relay" / "provider.sock",
-            proof=proof,
-            worker_token=worker_token,
-            bound_model=model,
-            ledger=ledger,
-            run_id=run_id,
-            binding_hash=b_hash,
-            history_digest=history.digest,
-            upstream_stream=upstream_stream,
-            fenced_client_write=lambda fn: backend.canary_fenced_write(label, epoch, conn, binding, fn),
-            check_alive=check_alive,
-            recovery_prior=recovery_prior,
-            expected_prior=expected_prior,
+            CanaryBrokerConfig(
+                proof=proof,
+                worker_token=worker_token,
+                bound_model=model,
+                ledger=ledger,
+                run_id=run_id,
+                binding_hash=b_hash,
+                history_digest=history.digest,
+                upstream_stream=upstream_stream,
+                fenced_client_write=lambda fn: backend.canary_fenced_write(label, epoch, conn, binding, fn),
+                check_alive=check_alive,
+                recovery_prior=recovery_prior,
+                expected_prior=expected_prior,
+            ),
         )
         broker.start()
         owner.start_containers()
@@ -788,16 +814,18 @@ def run_synthetic_check(terminal: Terminal, *, requested_model: str | None = Non
 
             broker = CanaryBroker(
                 root / "relay" / "provider.sock",
-                proof=proof,
-                worker_token=worker_token,
-                bound_model=model,
-                ledger=ledger,
-                run_id=run_id,
-                binding_hash=b_hash,
-                history_digest=history.digest,
-                upstream_stream=fake_upstream,
-                fenced_client_write=lambda fn: fn(),
-                check_alive=owner.check_alive,
+                CanaryBrokerConfig(
+                    proof=proof,
+                    worker_token=worker_token,
+                    bound_model=model,
+                    ledger=ledger,
+                    run_id=run_id,
+                    binding_hash=b_hash,
+                    history_digest=history.digest,
+                    upstream_stream=fake_upstream,
+                    fenced_client_write=lambda fn: fn(),
+                    check_alive=owner.check_alive,
+                ),
             )
             broker.start()
             owner.start_containers()
@@ -824,6 +852,104 @@ def run_synthetic_check(terminal: Terminal, *, requested_model: str | None = Non
             f"cleanup={cleanup_verified}:{cleanup_error})."
         )
         return 1
+
+
+def _build_live_result(
+    label: str, model: str, broker: CanaryBroker,
+    wait_result: tuple[int, bytes, bool, int], root: Path | None,
+) -> CanaryLiveResult:
+    rc, stdout_bytes, cleanup_verified, owner_rc = wait_result
+    stdout_ok = verify_opencode_json_stdout(stdout_bytes)
+    clean_ok = cleanup_verified and owner_rc == 0 and root is not None and not root.exists()
+    out = broker.stream_outcome
+    ok = (
+        clean_ok and broker.upstream_calls == 1 and broker.ledger_outcome == "ok_settled"
+        and broker.delivered_bytes > 0 and rc == 0 and stdout_ok
+    )
+    return CanaryLiveResult(
+        ok=ok,
+        label=label,
+        model=model,
+        upstream_calls=broker.upstream_calls,
+        ledger_outcome=broker.ledger_outcome,
+        delivered_bytes=broker.delivered_bytes,
+        media_fallback=broker.media_fallback,
+        input_tokens=out.input_tokens if out is not None else None,
+        output_tokens=out.output_tokens if out is not None else None,
+        opencode_rc=rc,
+        stdout_verified=stdout_ok,
+        cleanup_verified=clean_ok,
+        details=_format_failure_details(broker),
+    )
+
+
+def run_live_canary_e2e(
+    *,
+    requested_model: str | None = None,
+    backend_factory=None,
+    owner_factory=DetachedOwnerSession,
+) -> CanaryLiveResult:
+    """Run the zero-tool OpenCode + OpenAI live e2e canary using an isolated scratch ledger."""
+    factory = backend_factory or make_backend
+    backend = factory()
+    label, epoch, conn, binding = backend.active_connection()
+    model = _resolve_model(conn, binding, requested_model)
+    parent = scratch_parent()
+    check_private_directory(parent)
+    with tempfile.TemporaryDirectory(prefix="oc-canary-e2e-", dir=parent) as scratch:
+        state_dir = Path(scratch)
+        os.chmod(state_dir, 0o700)
+        ledger = CanaryLedger(state_dir)
+        history = ledger.preflight()
+        run_id = secrets.token_hex(16)
+        worker_token = secrets.token_hex(32)
+        b_hash = binding_digest(binding.profile, binding.generation, epoch)
+        owner = owner_factory(model, worker_token)
+        broker = None
+        root: Path | None = None
+        try:
+            root, proof = owner.prepare()
+
+            @contextmanager
+            def upstream_stream(body, *, before_write, deadline, cancelled):
+                with conn.canary_responses(
+                    binding, body,
+                    authorization=lambda: backend.selected_fence(label, epoch),
+                    before_write=before_write,
+                    limits=CANARY_STREAM_LIMITS,
+                    deadline=deadline,
+                    cancelled=cancelled,
+                    inspect_media=True,
+                    observe_media=broker.observe_media,
+                ) as events:
+                    yield events
+
+            broker = CanaryBroker(
+                root / "relay" / "provider.sock",
+                CanaryBrokerConfig(
+                    proof=proof,
+                    worker_token=worker_token,
+                    bound_model=model,
+                    ledger=ledger,
+                    run_id=run_id,
+                    binding_hash=b_hash,
+                    history_digest=history.digest,
+                    upstream_stream=upstream_stream,
+                    fenced_client_write=lambda fn: backend.canary_fenced_write(label, epoch, conn, binding, fn),
+                    check_alive=owner.check_alive,
+                ),
+            )
+            broker.start()
+            owner.start_containers()
+            rc, stdout_bytes, _stderr_bytes, cleanup_verified, _cleanup_error = owner.wait_opencode()
+        finally:
+            if broker is not None:
+                broker.close()
+            owner_rc = owner.close()
+        result = _build_live_result(label, model, broker, (rc, stdout_bytes, cleanup_verified, owner_rc), root)
+        if result.ok:
+            ledger.mark_delivered(run_id)
+        return result
 
 
 @contextmanager

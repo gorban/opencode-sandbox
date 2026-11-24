@@ -21,10 +21,7 @@ ORCHESTRATOR_INPUT = (
 )
 _LABEL_COMMANDS = ("connect", "select")
 _LOCAL_COMMANDS = ("status", "verify", "disconnect")
-USAGE = (
-    "Usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect|"
-    "canary [--model SLUG] [--reviewed-source SHA256] [--synthetic-check | --recover-unsettled]}"
-)
+USAGE = "Usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}"
 BrowserHandoff = Callable[[str, Callable[[], bool]], None]
 # The Linux device identity also matches the PTY master, so exclude that side explicitly.
 _TIOCGDEV = 0x80045432
@@ -402,9 +399,6 @@ def run(
     argv: Sequence[str], *, terminal: Terminal, backend_factory: Callable[[], Backend] = _production_backend,
 ) -> int:
     command = argv[0] if argv else ""
-    if command == "canary":
-        from .canary import main as canary_main
-        return canary_main(list(argv[1:]), terminal=terminal)
     labelled = command in _LABEL_COMMANDS
     manual = command == "connect" and len(argv) == 3 and argv[2] == "--no-browser"
     if not _valid_argv(argv, command, labelled=labelled, manual=manual):

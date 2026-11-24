@@ -53,9 +53,14 @@ _EV_TEXT_DONE = "response.output_text.done"
 _EV_COMPLETED = "response.completed"
 _HEARTBEAT_EVENTS = frozenset({"ping", "keepalive"})
 _TERMINAL_FAILURES = frozenset({"response.failed", "response.incomplete", "error"})
-_MODERATION_ROOT_KEYS = frozenset({"presentation", "prompt", "response", "schema_version"})
-_MODERATION_SLOT_KEYS = frozenset({"outputs", "results", "is_blocked"})
-_MODERATION_ENTRY_KEYS = frozenset({"is_blocked", "category", "classifier", "label", "score"})
+_MODERATION_ROOT_KEYS = frozenset({
+    "presentation", "prompt", "response", "generation", "tool_call", "tool_response", "schema_version",
+})
+_MODERATION_SLOT_KEYS = frozenset({"outputs", "results", "is_blocked", "protection_type"})
+_MODERATION_ENTRY_KEYS = frozenset({
+    "is_blocked", "category", "classifier", "label", "score", "results", "category_flags", "category_scores",
+})
+_MODERATION_CLASSIFIER_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z", re.ASCII)
 _MAX_SCAN_DEPTH = 32
 _MAX_SCAN_NODES = 4096
 REFUSAL_RESPONSE = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -68,6 +73,8 @@ class _SafetyRejected(RuntimeError):
 def _check_moderation_or_metadata(low: str, value) -> None:
     if low == "openai_chatgpt_moderation_metadata":
         _validate_moderation_root(value)
+        return
+    if low == "moderation" and value is None:
         return
     if "moderation" in low:
         raise _SafetyRejected("metadata_moderation")
@@ -119,11 +126,27 @@ def _scan_global_safety(obj) -> None:
             _scan_list_children(current, depth, stack)
 
 
-def _validate_moderation_entry(entry) -> None:
-    if type(entry) is not dict or not set(entry) <= _MODERATION_ENTRY_KEYS:
+def _validate_category_flags(flags) -> None:
+    if type(flags) is not dict or len(flags) > 128:
         raise _SafetyRejected("metadata_moderation_shape")
-    if entry.get("is_blocked") is not False:
-        raise _SafetyRejected("metadata_moderation_blocked")
+    for name, flagged in flags.items():
+        if type(name) is not str or not 1 <= len(name) <= 64:
+            raise _SafetyRejected("metadata_moderation_shape")
+        if flagged is not False:
+            raise _SafetyRejected("metadata_moderation_blocked")
+
+
+def _validate_category_scores(scores) -> None:
+    if type(scores) is not dict or len(scores) > 128:
+        raise _SafetyRejected("metadata_moderation_shape")
+    for name, score in scores.items():
+        if type(name) is not str or not 1 <= len(name) <= 64:
+            raise _SafetyRejected("metadata_moderation_shape")
+        if type(score) not in (int, float) or not 0 <= score <= 1:
+            raise _SafetyRejected("metadata_moderation_shape")
+
+
+def _validate_moderation_entry_scalars(entry: dict) -> None:
     for text_key in ("category", "classifier", "label"):
         val = entry.get(text_key)
         if val is not None and (type(val) is not str or len(val) > 256):
@@ -133,23 +156,56 @@ def _validate_moderation_entry(entry) -> None:
         raise _SafetyRejected("metadata_moderation_shape")
 
 
-def _validate_moderation_entries(entries) -> None:
+def _validate_moderation_entry(entry, *, require_explicit_unblocked: bool = True, depth: int = 0) -> None:
+    if depth > 2 or type(entry) is not dict or not set(entry) <= _MODERATION_ENTRY_KEYS:
+        raise _SafetyRejected("metadata_moderation_shape")
+    unblocked = entry.get("is_blocked")
+    if (require_explicit_unblocked and unblocked is not False) or (
+            not require_explicit_unblocked and "is_blocked" in entry and unblocked is not False):
+        raise _SafetyRejected("metadata_moderation_blocked")
+    _validate_moderation_entry_scalars(entry)
+    if entry.get("category_flags") is not None:
+        _validate_category_flags(entry["category_flags"])
+    if entry.get("category_scores") is not None:
+        _validate_category_scores(entry["category_scores"])
+    if entry.get("results") is not None:
+        _validate_moderation_entries(entry["results"], require_explicit_unblocked=False, depth=depth + 1)
+
+
+def _validate_moderation_entries(entries, *, require_explicit_unblocked: bool = True, depth: int = 0) -> None:
     if type(entries) is not list or len(entries) > 32:
         raise _SafetyRejected("metadata_moderation_shape")
     for entry in entries:
-        _validate_moderation_entry(entry)
+        _validate_moderation_entry(entry, require_explicit_unblocked=require_explicit_unblocked, depth=depth)
+
+
+def _validate_moderation_bucket(bucket) -> None:
+    if bucket is None or bucket == {}:
+        return
+    if type(bucket) is not dict or not set(bucket) <= _MODERATION_SLOT_KEYS:
+        raise _SafetyRejected("metadata_moderation_shape")
+    if "is_blocked" in bucket and bucket["is_blocked"] is not False:
+        raise _SafetyRejected("metadata_moderation_blocked")
+    ptype = bucket.get("protection_type")
+    if ptype is not None and (type(ptype) is not str or not 1 <= len(ptype) <= 64):
+        raise _SafetyRejected("metadata_moderation_shape")
+    for list_key in ("outputs", "results"):
+        if bucket.get(list_key) is not None:
+            _validate_moderation_entries(bucket[list_key])
 
 
 def _validate_moderation_slot(slot) -> None:
     if slot is None or slot == {}:
         return
-    if type(slot) is not dict or not set(slot) <= _MODERATION_SLOT_KEYS:
+    if type(slot) is not dict or len(slot) > 16:
         raise _SafetyRejected("metadata_moderation_shape")
-    if "is_blocked" in slot and slot["is_blocked"] is not False:
-        raise _SafetyRejected("metadata_moderation_blocked")
-    for list_key in ("outputs", "results"):
-        if slot.get(list_key) is not None:
-            _validate_moderation_entries(slot[list_key])
+    if set(slot) <= _MODERATION_SLOT_KEYS:
+        _validate_moderation_bucket(slot)
+        return
+    for name, bucket in slot.items():
+        if type(name) is not str or not _MODERATION_CLASSIFIER_RE.fullmatch(name):
+            raise _SafetyRejected("metadata_moderation_shape")
+        _validate_moderation_bucket(bucket)
 
 
 def _validate_moderation_root(moderation) -> None:
@@ -163,8 +219,10 @@ def _validate_moderation_root(moderation) -> None:
     if schema_version is not None and (type(schema_version) is not int or schema_version != 1):
         raise _SafetyRejected("metadata_moderation_shape")
     _validate_moderation_slot(moderation.get("prompt"))
-    if moderation.get("response") not in (None, {}):
-        raise _SafetyRejected("metadata_moderation_blocked")
+    _validate_moderation_slot(moderation.get("generation"))
+    for forbidden_slot in ("response", "tool_call", "tool_response"):
+        if moderation.get(forbidden_slot) not in (None, {}):
+            raise _SafetyRejected("metadata_moderation_blocked")
 
 
 def _validate_metadata_dict(metadata) -> None:
