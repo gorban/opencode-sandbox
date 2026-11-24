@@ -24,6 +24,15 @@ class WorkerError(RuntimeError):
     """A bounded local worker failure."""
 
 
+class WorkerProofError(WorkerError):
+    def __init__(self, phase, fault):
+        if phase not in (None, "initial", "continuation") or type(fault) is not protocol.Fault:
+            raise ValueError("Invalid worker failure category")
+        super().__init__("Managed worker proof did not complete")
+        self.phase = phase
+        self.fault = fault
+
+
 class WorkerCleanupError(WorkerError):
     """Exact, retained private receipt for one uncertain worker cleanup."""
 
@@ -121,7 +130,7 @@ def _native_turn(job):
                 elif event.kind == "turn_error":
                     raise WorkerError("OpenCode reported that the managed turn failed")
                 elif event.kind == "turn_completed":
-                    if (early_text == protocol.INITIAL_TEXT and final_text == protocol.FINAL_TEXT
+                    if (early_text in ("", protocol.INITIAL_TEXT) and final_text == protocol.FINAL_TEXT
                             and tool.succeeded):
                         return tool.identity[1]
                     raise WorkerError("OpenCode terminal lacks native text or tool evidence")
@@ -146,7 +155,7 @@ def _cleanup(job, broker):
 
 
 def run_worker(responses, *, model, before_dispatch, worker_image=WORKER_IMAGE, relay_image=RELAY_IMAGE,
-               lease_guard=None):
+               lease_guard=None, allow_progress=False, allow_metadata=False):
     """Run one approved turn and return evidence only after exact cleanup.
 
     The trusted before_dispatch(phase) callback durably consumes that phase's
@@ -174,7 +183,9 @@ def run_worker(responses, *, model, before_dispatch, worker_image=WORKER_IMAGE, 
                 if lease_guard is not None:
                     stack.enter_context(lease_guard(job))
                 job.assert_file(None)
-                broker = Broker(job, responses, before_dispatch)
+                broker = Broker(
+                    job, responses, before_dispatch, allow_progress=allow_progress, allow_metadata=allow_metadata,
+                )
                 broker.start()
                 job.start()
                 job.activate(broker)
@@ -183,10 +194,11 @@ def run_worker(responses, *, model, before_dispatch, worker_image=WORKER_IMAGE, 
                     raise WorkerError("Managed tool continuation receipt is missing")
                 job.assert_file(protocol.PROOF_BYTES)
                 verified = True
-            except (JobRuntimeError, ProbeError) as error:
-                raise WorkerError(str(error)) from None
-            except (OSError, ValueError):
-                raise WorkerError("Managed worker exchange did not complete") from None
+            except (JobRuntimeError, ProbeError, WorkerError, OSError, ValueError):
+                if broker is None:
+                    raise WorkerProofError(None, protocol.Fault.PLACEMENT) from None
+                failure = broker.failure() or (None, protocol.Fault.NATIVE)
+                raise WorkerProofError(*failure) from None
             finally:
                 try:
                     try:

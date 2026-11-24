@@ -10,11 +10,15 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
+from oc_openai.acceptance import run_attended
 from oc_openai import cli, live
 from oc_openai.connection import Binding, ConnectionError
-from oc_openai.exposure import ExposureLedger
+from oc_openai.exposure import ExposureLedger, Phase, RecoveryMode, Slot, binding_digest
 from oc_openai.managed.protocol import body_for, validate
+from oc_openai.profiles import ProfileError
+from oc_openai.responses import response_error
 from oc_openai.worker import WorkerEvidence, run_worker
 from test_openai_worker import fixture_events
 
@@ -46,7 +50,9 @@ class FakeConnection:
         self.catalog = (MODEL,)
         self.calls = []
         self.proposal = list(proposal_events())
+        self.proposal_error = None
         self.worker_events = fixture_events
+        self.recovery_receipt = "recovery-proof.json"
 
     def require_prerequisites(self):
         pass
@@ -66,15 +72,22 @@ class FakeConnection:
         yield
 
     @contextmanager
-    def responses(self, binding, body, before_send, *, deadline=None, cancelled=None):
+    def responses(self, binding, body, before_send, *, deadline=None, cancelled=None, inspect_media=False,
+                  observe_media=None, before_write=None):
         self.require_active(binding)
         if body["model"] not in self.catalog:
             raise ConnectionError("openai_model_unavailable")
         before_send()
-        records = json.loads((self.state / "exposure.json").read_text())
+        if before_write is not None:
+            before_write()
+            records = json.loads((self.state / self.recovery_receipt).read_text())["phases"]
+        else:
+            records = json.loads((self.state / "exposure.json").read_text())
         assert records[-1]["actual"] is None
         self.calls.append(deepcopy(body))
         if "instructions" not in body:
+            if self.proposal_error is not None:
+                raise self.proposal_error
             yield iter(self.proposal)
         else:
             yield self.worker_events(body, deadline=deadline, cancelled=cancelled)
@@ -123,7 +136,205 @@ class LiveBackendTests(unittest.TestCase):
                                        worker=worker, placement_qualified=placement)
 
     def accept(self, terminal, backend):
-        return cli.run(("accept",), terminal=terminal, backend_factory=lambda: backend)
+        return run_attended(terminal, backend_factory=lambda: backend)
+
+    def test_unsettled_reservation_refuses_before_approval_prompt(self):
+        self.ledger.reserve(Slot(
+            "1" * 32, binding_digest(REGISTRATION, GENERATION, SELECTION_EPOCH), Phase.ORCHESTRATOR,
+        ))
+        ledger = self.state / "exposure.json"
+        before = ledger.read_bytes()
+        terminal = Terminal()
+
+        self.assertEqual(self.accept(terminal, self.backend()), 1)
+        self.assertEqual(self.connection.calls, [])
+        self.assertEqual(ledger.read_bytes(), before)
+        self.assertEqual(len(terminal.output), 1)
+        self.assertIn("Workstation proposal: A prior request is unsettled", terminal.output[0])
+
+    def _hold_proposal(self):
+        self.ledger.reserve(Slot(
+            "1" * 32, binding_digest(REGISTRATION, GENERATION, SELECTION_EPOCH), Phase.ORCHESTRATOR,
+        ))
+        return (self.state / "exposure.json").read_bytes()
+
+    def test_diagnostic_never_spawns_worker_or_opens_a_second_attempt(self):
+        for name, events, result, usage in (
+            ("complete", list(proposal_events()), 0, [3, 7]),
+            ("wrong marker", list(proposal_events("private model output")), 1, [3, 7]),
+            ("missing completion", [next(proposal_events())], 1, None),
+            ("overage", list(proposal_events(tokens=(3, 128_001))), 1, [3, 128_001]),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as scratch:
+                self.state = Path(scratch)
+                self.connection = FakeConnection(self.state)
+                self.ledger = ExposureLedger(self.state)
+                before = self._hold_proposal()
+                self.connection.proposal = events
+                terminal = Terminal(True)
+                backend = self.backend(worker=lambda *args, **kwargs: self.fail("worker ran during diagnostic"))
+
+                self.assertEqual(run_attended(terminal, backend_factory=lambda: backend, recovery=RecoveryMode.FIRST),
+                                 result)
+                self.assertEqual(self.connection.calls, [live._proposal_body()])
+                self.assertIn("total reserved exposure is 1,844,000 input and 256,000 output",
+                              terminal.output[0])
+                self.assertIn("Review the app's OpenAI-managed usage and credit settings before approving.",
+                              terminal.output[0])
+                self.assertEqual(terminal.output[1], "Send the one workstation diagnostic request?")
+                self.assertNotIn("private model output", "\n".join(terminal.output))
+                self.assertEqual((self.state / "exposure.json").read_bytes(), before)
+                receipt = json.loads((self.state / "diagnostic.json").read_text())
+                self.assertEqual(receipt["original_run"], "1" * 32)
+                self.assertNotEqual(receipt["run"], receipt["original_run"])
+                self.assertEqual(receipt["actual"], usage)
+
+                self.ledger = ExposureLedger(self.state)
+                for recovery in (None, RecoveryMode.FIRST):
+                    stopped = Terminal()
+                    self.assertEqual(run_attended(stopped, backend_factory=self.backend, recovery=recovery), 1)
+                    self.assertEqual(len(stopped.output), 1)
+                    self.assertIn("diagnostic receipt already exists", stopped.output[0])
+                self.assertEqual(len(self.connection.calls), 1)
+
+    def test_diagnostic_decline_interrupt_and_changed_selection_spend_no_ticket(self):
+        original = self._hold_proposal()
+        backend = self.backend()
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        def rotate():
+            self.connection.selected = Binding(generation=NEXT_GENERATION, profile=REGISTRATION)
+            return True
+
+        for answer, result in ((False, 1), (interrupt, 130), (rotate, 1)):
+            with self.subTest(answer=answer):
+                terminal = Terminal(answer)
+                self.assertEqual(run_attended(terminal, backend_factory=lambda: backend, recovery=RecoveryMode.FIRST),
+                                 result)
+                self.assertFalse((self.state / "diagnostic.json").exists())
+                self.assertEqual((self.state / "exposure.json").read_bytes(), original)
+                self.assertEqual(self.connection.calls, [])
+
+    def test_stream_diagnostic_counts_both_prior_reservations_and_cannot_repeat(self):
+        for complete in (False, True):
+            with self.subTest(complete=complete), tempfile.TemporaryDirectory() as scratch:
+                self.state = Path(scratch)
+                self.connection = FakeConnection(self.state)
+                self.ledger = ExposureLedger(self.state)
+                self._hold_proposal()
+                prior = self.ledger.prepare_diagnostic(Slot(
+                    "2" * 32, binding_digest(REGISTRATION, GENERATION, SELECTION_EPOCH), Phase.ORCHESTRATOR,
+                ))
+                self.ledger.reserve_diagnostic(prior)
+                paths = [self.state / name for name in ("exposure.json", "diagnostic.json")]
+                before = [path.read_bytes() for path in paths]
+                if not complete:
+                    self.connection.proposal_error = ConnectionError("provider_stream_json")
+                backend = self.backend(worker=lambda *args, **kwargs: self.fail("stream diagnostic spawned a worker"))
+                declined = Terminal(False)
+                self.assertEqual(run_attended(declined, backend_factory=lambda: backend, recovery=RecoveryMode.STREAM), 1)
+                self.assertFalse((self.state / "diagnostic-stream.json").exists())
+                self.assertEqual(self.connection.calls, [])
+
+                terminal = Terminal(True)
+                self.assertEqual(run_attended(terminal, backend_factory=lambda: backend, recovery=RecoveryMode.STREAM),
+                                 0 if complete else 1)
+                self.assertIn("first diagnostic both remain unknown", terminal.output[0])
+                self.assertIn("2,766,000 input and 384,000 output tokens", terminal.output[0])
+                self.assertIn("Review the app's OpenAI-managed usage and credit settings", terminal.output[0])
+                self.assertEqual(terminal.output[1], "Send the one workstation stream diagnostic request?")
+                if not complete:
+                    self.assertIn("An OpenAI stream event contained invalid JSON.", terminal.output[-1])
+                self.assertEqual([path.read_bytes() for path in paths], before)
+                receipt = json.loads((self.state / "diagnostic-stream.json").read_text())
+                self.assertEqual(receipt["previous_diagnostic_run"], prior.request.run_id)
+                self.assertEqual(receipt["actual"], [3, 7] if complete else None)
+
+                self.ledger = ExposureLedger(self.state)
+                for recovery in (None, RecoveryMode.FIRST, RecoveryMode.STREAM):
+                    refused = Terminal()
+                    self.assertEqual(run_attended(refused, backend_factory=self.backend, recovery=recovery), 1)
+                    self.assertEqual(len(refused.output), 1)
+                    self.assertIn("diagnostic receipt already exists", refused.output[0])
+                self.assertEqual(self.connection.calls, [live._proposal_body()])
+
+    def test_invalid_recovery_mode_is_rejected_before_backend(self):
+        self._hold_proposal()
+        for mode in (False, True, "stream"):
+            with self.subTest(mode=mode):
+                terminal = Terminal()
+                self.assertEqual(run_attended(
+                    terminal, backend_factory=lambda: self.fail("backend was constructed"), recovery=mode,
+                ), 2)
+                self.assertEqual(terminal.output, ["The OpenAI proof recovery mode is invalid."])
+        self.assertEqual(self.connection.calls, [])
+        self.assertFalse((self.state / "diagnostic.json").exists())
+
+    def test_settled_full_ledger_reports_capacity_and_refuses_before_prompt(self):
+        slot = Slot("1" * 32, binding_digest(REGISTRATION, GENERATION, SELECTION_EPOCH), Phase.ORCHESTRATOR)
+        self.ledger.reserve(slot)
+        self.ledger.settle(slot, 1, 1)
+        ledger = self.state / "exposure.json"
+        row = json.loads(ledger.read_text())[0]
+        ledger.write_text(json.dumps([{**row, "run": f"{index:032x}"} for index in range(256)]))
+        before = ledger.read_bytes()
+        terminal = Terminal()
+
+        self.assertEqual(self.accept(terminal, self.backend()), 1)
+        self.assertEqual(self.connection.calls, [])
+        self.assertEqual(ledger.read_bytes(), before)
+        self.assertEqual(terminal.output, [
+            "Workstation proposal: The inference ledger is at capacity. Further inference is suspended.",
+        ])
+
+    def test_proposal_lock_refusal_keeps_the_stage_label(self):
+        terminal = Terminal(True)
+        backend = self.backend()
+        with patch.object(backend, "propose", side_effect=ProfileError("profile_busy")):
+            self.assertEqual(self.accept(terminal, backend), 1)
+        self.assertTrue(terminal.output[-1].startswith("Workstation proposal: A foreground ChatGPT"))
+        self.assertEqual(self.connection.calls, [])
+
+    def test_proposal_failure_has_a_fixed_stage_and_safe_cause(self):
+        canary = "must-not-appear-in-terminal"
+        rejected = response_error(403, {"error": {"code": canary, "message": canary}, "id": canary})
+        created, completed = proposal_events()
+        for category, error, events, detail in [
+            ("connection", ConnectionError("provider_network_error"), [], "closed unexpectedly"),
+            ("http", ConnectionError(rejected), [], "OpenAI rejected the request"),
+            ("malformed stream", ConnectionError("invalid_provider_stream"), [], "invalid or oversized"),
+            ("unknown exception", RuntimeError(canary), [], "plan command could not complete"),
+            ("failed response", None, [created, {"type": "response.failed", "response": {
+                "error": {"code": canary, "message": canary}, "id": canary,
+            }}], "failed or incomplete"),
+            ("usage limit", None, [created, {"type": "response.failed", "response": {"error": {
+                "code": "subscription_sharing_usage_limit_exceeded", "message": canary,
+            }}}], "plan usage limit"),
+            ("wrong identity", None, [created, {**completed, "response": {
+                **completed["response"], "id": canary,
+            }}], "identity or model did not match"),
+            ("no usage", None, [created, {**completed, "response": {
+                **completed["response"], "usage": {"stray": canary},
+            }}], "did not contain valid terminal usage"),
+            ("clean EOF", None, [created], "ended without a completed response"),
+        ]:
+            with self.subTest(category=category), tempfile.TemporaryDirectory() as scratch:
+                self.state = Path(scratch)
+                self.connection = FakeConnection(self.state)
+                self.ledger = ExposureLedger(self.state)
+                self.connection.proposal_error = error
+                self.connection.proposal = events
+                terminal = Terminal(True)
+
+                self.assertEqual(self.accept(terminal, self.backend()), 1)
+                self.assertTrue(terminal.output[-1].startswith("Workstation proposal: "))
+                self.assertIn(detail, terminal.output[-1])
+                self.assertNotIn(canary, "\n".join(terminal.output))
+                self.assertEqual(len(self.connection.calls), 1)
+                rows = json.loads((self.state / "exposure.json").read_text())
+                self.assertEqual([(row["phase"], row["actual"]) for row in rows], [("orchestrator", None)])
 
     def test_workstation_state_must_stay_outside_the_canonical_sandbox(self):
         with tempfile.TemporaryDirectory() as case:
@@ -137,7 +348,7 @@ class LiveBackendTests(unittest.TestCase):
                 live._state_directory(home, home)
             self.assertFalse(expected.exists())
 
-    def test_full_cli_reserves_exact_sequence_and_validates_evidence(self):
+    def test_attended_proof_reserves_exact_sequence_and_validates_evidence(self):
         self.connection.proposal[0]["response"].pop("model")
         terminal = Terminal(True, True)
         self.assertEqual(self.accept(terminal, self.backend()), 0, terminal.output)
@@ -233,6 +444,7 @@ class LiveBackendTests(unittest.TestCase):
         terminal = Terminal(True)
         self.assertEqual(self.accept(terminal, self.backend()), 1)
         self.assertNotIn(private, "\n".join(terminal.output))
+        self.assertEqual(terminal.output[-1], "Workstation proposal: GPT did not return the required proof proposal.")
         self.assertEqual(len(self.connection.calls), 1)
 
     def test_offered_worker_evidence_requires_two_accounted_provider_completions(self):
@@ -241,7 +453,7 @@ class LiveBackendTests(unittest.TestCase):
         self.assertEqual(len(self.connection.calls), 1)
 
     @unittest.skipUnless(os.environ.get("OC_OPENAI_WORKER_REAL") == "1", "requires pinned Podman/devbox host")
-    def test_full_cli_with_pinned_native_opencode_and_fake_upstream(self):
+    def test_attended_proof_with_pinned_native_opencode_and_fake_upstream(self):
         self.connection.worker_events = partial(fixture_events, reasoning=True)
         terminal = Terminal(True, True)
         self.assertEqual(self.accept(terminal, self.backend(worker=run_worker)), 0, terminal.output)

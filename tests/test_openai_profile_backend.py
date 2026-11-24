@@ -14,6 +14,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from oc_openai.acceptance import run_attended
 from oc_openai import cli
 from oc_openai.connection import Connection, ConnectionError
 from oc_openai.profile_backend import ProfileBackend
@@ -391,12 +392,12 @@ print(backend.disconnect())
                     self.assertFalse(any(profile.revocation_unconfirmed for profile in backend.status().saved))
 
     @unittest.skipUnless(os.environ.get("OC_OPENAI_WORKER_REAL") == "1", "requires pinned Podman/devbox host")
-    def test_pinned_opencode_via_attended_cli_and_real_broker_with_fake_openai(self):
+    def test_pinned_opencode_via_attended_proof_and_real_broker_with_fake_openai(self):
         self.transport_type = ProofTransport
         backend = self.backend()
         backend.connect("personal")
         terminal = Terminal(True, True)
-        self.assertEqual(cli.run(("accept",), terminal=terminal, backend_factory=lambda: backend), 0, terminal.output)
+        self.assertEqual(run_attended(terminal, backend_factory=lambda: backend), 0, terminal.output)
         selected = backend.profiles.selected()
         self.connection(selected.directory).require_switchable()
         proof_requests = [call for call in self.transports[selected.directory].calls if call[0] == "synthetic"]

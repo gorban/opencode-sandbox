@@ -1,4 +1,4 @@
-"""Foreground operator approvals for one OpenAI worker proof."""
+"""Workstation commands for OpenAI connections."""
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -7,10 +7,10 @@ from errno import ENOTTY
 from fcntl import ioctl
 import os
 import re
-import secrets
 import termios
 from typing import Protocol, TextIO
 
+from .exposure import Diagnostic, RecoveryMode
 from .profiles import ProfileError, valid_label
 
 MODEL = "gpt-6.2-sol"
@@ -20,9 +20,9 @@ ORCHESTRATOR_INPUT = (
     "Reply with exactly OC_SANDBOX_WORKER_PROOF and no other text."
 )
 _LABEL_COMMANDS = ("connect", "select")
-_LOCAL_COMMANDS = ("status", "disconnect", "accept")
-USAGE = "Usage: oc-sandbox openai {connect LABEL|select LABEL|status|disconnect|accept}"
-_LOCAL_ID = re.compile(r"[A-Za-z0-9_-]{43}")
+_LOCAL_COMMANDS = ("status", "disconnect")
+USAGE = "Usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|disconnect}"
+BrowserHandoff = Callable[[str, Callable[[], bool]], None]
 # The Linux device identity also matches the PTY master, so exclude that side explicitly.
 _TIOCGDEV = 0x80045432
 _TIOCGPTN = 0x80045430
@@ -81,8 +81,29 @@ class Reason(Enum):
     ROUTE_SCOPE = "route_scope"
     CONNECTION_CHANGED = "connection_changed"
     EXPOSURE = "exposure"
+    EXPOSURE_FULL = "exposure_full"
+    EXPOSURE_UNAVAILABLE = "exposure_unavailable"
+    DIAGNOSTIC_SPENT = "diagnostic_spent"
+    DIAGNOSTIC_UNAVAILABLE = "diagnostic_unavailable"
     BROWSER_REQUIRED = "browser_required"
+    FOREGROUND_REQUIRED = "foreground_required"
     PROOF_FAILED = "proof_failed"
+    PROVIDER_TRANSPORT = "provider_transport"
+    PROVIDER_REJECTED = "provider_rejected"
+    PROVIDER_LIMIT = "provider_limit"
+    PROVIDER_DATA = "provider_data"
+    PROVIDER_STREAM = "provider_stream"
+    PROVIDER_STREAM_CONTENT_TYPE = "provider_stream_content_type"
+    PROVIDER_STREAM_INCOMPLETE = "provider_stream_incomplete"
+    PROVIDER_STREAM_LIMIT = "provider_stream_limit"
+    PROVIDER_STREAM_JSON = "provider_stream_json"
+    PROVIDER_STREAM_EVENT_TYPE = "provider_stream_event_type"
+    PROVIDER_STREAM_NAMED_DONE = "provider_stream_named_done"
+    PROVIDER_STREAM_AFTER_TERMINAL = "provider_stream_after_terminal"
+    PROVIDER_TERMINAL = "provider_terminal"
+    PROVIDER_IDENTITY = "provider_identity"
+    PROVIDER_USAGE = "provider_usage"
+    PROVIDER_MISSING_COMPLETION = "provider_missing_completion"
     PROFILE_BUSY = "profile_busy"
     PROFILE_CONNECT_BUSY = "profile_connect_busy"
     PROFILE_NOT_FOUND = "profile_not_found"
@@ -100,10 +121,29 @@ _UNAVAILABLE_MESSAGES = {
     Reason.EXPOSURE: (
         "A prior request is unsettled or exceeded its approved token bound. Further inference is suspended."
     ),
+    Reason.EXPOSURE_FULL: "The inference ledger is at capacity. Further inference is suspended.",
+    Reason.EXPOSURE_UNAVAILABLE: "The inference ledger could not authorize this request.",
+    Reason.DIAGNOSTIC_SPENT: "A diagnostic receipt already exists. Further inference is suspended.",
+    Reason.DIAGNOSTIC_UNAVAILABLE: "The current connection and ledger do not qualify for this diagnostic.",
     Reason.BROWSER_REQUIRED: "Sign in requires the trusted workstation browser in the supported devbox session.",
-    Reason.PROOF_FAILED: (
-        "The managed OpenCode proof did not complete. Inspect the disposable worker cleanup evidence before trying again."
-    ),
+    Reason.FOREGROUND_REQUIRED: "Sign-in links require an attended workstation terminal in the foreground.",
+    Reason.PROOF_FAILED: "The proof did not complete.",
+    Reason.PROVIDER_TRANSPORT: "The connection to OpenAI failed or closed unexpectedly.",
+    Reason.PROVIDER_REJECTED: "OpenAI rejected the request.",
+    Reason.PROVIDER_LIMIT: "OpenAI reported a ChatGPT plan usage limit.",
+    Reason.PROVIDER_DATA: "OpenAI returned invalid or oversized response data.",
+    Reason.PROVIDER_STREAM: "OpenAI returned an invalid or oversized event stream.",
+    Reason.PROVIDER_STREAM_CONTENT_TYPE: "The OpenAI response had an unexpected event-stream content type.",
+    Reason.PROVIDER_STREAM_INCOMPLETE: "The OpenAI stream ended before a line, event, or HTTP body was complete.",
+    Reason.PROVIDER_STREAM_LIMIT: "The OpenAI stream exceeded its byte, line, or event limit.",
+    Reason.PROVIDER_STREAM_JSON: "An OpenAI stream event contained invalid JSON.",
+    Reason.PROVIDER_STREAM_EVENT_TYPE: "An OpenAI stream event had a missing, repeated, or conflicting event type.",
+    Reason.PROVIDER_STREAM_NAMED_DONE: "The OpenAI stream sent a named [DONE] terminator.",
+    Reason.PROVIDER_STREAM_AFTER_TERMINAL: "The OpenAI stream sent additional data after a terminal event.",
+    Reason.PROVIDER_TERMINAL: "OpenAI reported a failed or incomplete response.",
+    Reason.PROVIDER_IDENTITY: "The response identity or model did not match the request.",
+    Reason.PROVIDER_USAGE: "The response did not contain valid terminal usage.",
+    Reason.PROVIDER_MISSING_COMPLETION: "The stream ended without a completed response.",
     Reason.PROFILE_BUSY: "A foreground ChatGPT request or worker proof is active. Wait for it to finish.",
     Reason.PROFILE_CONNECT_BUSY: "A ChatGPT sign-in attempt is already active.",
     Reason.PROFILE_NOT_FOUND: "That saved ChatGPT registration is unavailable.",
@@ -142,7 +182,7 @@ class Backend(Protocol):
         """Read the current local selection without network calls or mutation."""
         ...
 
-    def connect(self, label: str) -> None: ...
+    def connect(self, label: str, *, handoff: BrowserHandoff | None = None) -> None: ...
 
     def active_label(self) -> str | None: ...
 
@@ -152,7 +192,7 @@ class Backend(Protocol):
 
     def select(self, label: str) -> None: ...
 
-    def require_acceptance(self) -> None:
+    def require_acceptance(self, proposal: Approval, *, recovery: RecoveryMode | None = None) -> Diagnostic | None:
         """Check read-only local acceptance prerequisites without opening the provider route."""
         ...
 
@@ -160,7 +200,7 @@ class Backend(Protocol):
         """Fence local use and report whether upstream revocation was confirmed."""
         ...
 
-    def propose(self, approval: Approval) -> str:
+    def propose(self, approval: Approval, *, diagnostic: Diagnostic | None = None) -> str:
         """Send one authorized inference and return only a validated terminal response."""
         ...
 
@@ -219,7 +259,7 @@ class StreamTerminal:
         try:
             fd = self.reader.fileno()
             termios.tcflush(fd, termios.TCIFLUSH)
-            self.write(f"{message} Type yes to approve.")
+            self.write(f"{message} [y/N]")
             # TextIO may read ahead into the next approval. Read this line directly.
             answer = b""
             while len(answer) < 4:
@@ -228,7 +268,8 @@ class StreamTerminal:
                     return False
                 answer += char
                 if char == b"\n":
-                    return answer == b"yes\n" and self.attended()
+                    return answer.lower() in (b"y\n", b"yes\n") and self.attended()
+            termios.tcflush(fd, termios.TCIFLUSH)
         except (OSError, termios.error, ValueError):
             return False
         return False
@@ -242,87 +283,6 @@ def _production_backend() -> Backend:
             raise RouteUnavailable from None
         raise
     return make_backend()
-
-
-def _valid_binding(binding: ConnectionBinding | None) -> bool:
-    return (
-        type(binding) is ConnectionBinding
-        and type(binding.registration_id) is str
-        and _LOCAL_ID.fullmatch(binding.registration_id) is not None
-        and type(binding.generation) is str
-        and _LOCAL_ID.fullmatch(binding.generation) is not None
-        and binding.model == MODEL
-        and valid_label(binding.label)
-        and type(binding.selection_epoch) is str
-        and _LOCAL_ID.fullmatch(binding.selection_epoch) is not None
-    )
-
-
-def _matches_current(terminal: Terminal, backend: Backend, approval: Approval) -> bool:
-    current = backend.connection()
-    if not _valid_binding(current) or current != approval.connection:
-        terminal.error(_UNAVAILABLE_MESSAGES[Reason.CONNECTION_CHANGED])
-        return False
-    return True
-
-
-def _approve(
-    terminal: Terminal, backend: Backend, approval: Approval, disclosure: str,
-) -> bool:
-    if not terminal.confirm(disclosure):
-        terminal.error("Cancelled.")
-        return False
-    return _matches_current(terminal, backend, approval)
-
-
-def _accept(terminal: Terminal, backend: Backend) -> int:
-    binding = backend.connection()
-    if not _valid_binding(binding):
-        terminal.error("A connected ChatGPT account with the approved model is required.")
-        return 1
-
-    backend.require_acceptance()
-    run_id = secrets.token_hex(16)
-    proposal = Approval(run_id, binding, Stage.ORCHESTRATOR)
-    terminal.write(
-        f"Active registration: {binding.label}. ChatGPT plan acceptance will send one fixed text "
-        f"prompt to OpenAI using {MODEL}. "
-        "The prompt only asks for a marker for the disposable proof. This approval reserves up "
-        "to 922,000 input and 128,000 output tokens. Review the app's OpenAI-managed usage and "
-        "credit settings before approving. OpenAI may use your ChatGPT plan or account credits. "
-        "There is no verified hard spending cap. API-key fallback is disabled."
-    )
-    if not _approve(terminal, backend, proposal, "Send one GPT request to propose the proof?"):
-        return 1
-    response = backend.propose(proposal)
-    if type(response) is not str or response != PROPOSAL_MARKER:
-        terminal.error("GPT did not return the required proof proposal.")
-        return 1
-
-    worker = Approval(run_id, binding, Stage.WORKER)
-    if not _matches_current(terminal, backend, worker):
-        return 1
-    terminal.write(
-        f"Active registration: {binding.label}. GPT proposed the disposable local OpenCode proof. "
-        "It writes one fixed scratch file. "
-        f"The task and its fixed result use up to two separate OpenAI requests using {MODEL}. "
-        "The continuation returns the fixed file outcome and any OpenAI-provided encrypted "
-        "reasoning to the same endpoint. The encrypted reasoning stays outside the worker. "
-        "This approval reserves up to 1,844,000 input and 256,000 output tokens in total. "
-        "Review the app's OpenAI-managed usage and credit settings before approving. "
-        "OpenAI may use your ChatGPT plan or account credits. There is no verified hard spending cap. "
-        "API-key fallback is disabled."
-    )
-    if not _approve(terminal, backend, worker, "Start one local worker and authorize up to two requests?"):
-        return 1
-    evidence = backend.prove(worker)
-    if type(evidence) is not WorkerEvidence or not all(value is True for value in (
-        evidence.native_terminal, evidence.exact_scratch, evidence.exact_receipt, evidence.owned_cleanup,
-    )):
-        terminal.error("Could not verify the local OpenCode proof and cleanup.")
-        return 1
-    terminal.write("OpenCode completed the scratch-file proof. Verified tool delivery and worker cleanup.")
-    return 0
 
 
 def _local_status(backend: Backend) -> ConnectionStatus:
@@ -358,18 +318,49 @@ def _show_status(terminal: Terminal, status: ConnectionStatus) -> None:
         terminal.write("No saved registration is active.")
 
 
+def _present_sign_in(terminal: Terminal, uri: str, launch: Callable[[], bool], *, manual: bool) -> None:
+    if not terminal.attended():
+        raise RouteUnavailable(Reason.FOREGROUND_REQUIRED)
+    terminal.write(f"Sign-in link for this workstation\n{uri}")
+    if manual:
+        return
+    if not terminal.attended():
+        raise RouteUnavailable(Reason.FOREGROUND_REQUIRED)
+    if not launch():
+        terminal.write("Could not start the default browser. Copy the sign-in link above into another browser.")
+
+
+def report_failure(terminal: Terminal, error: BaseException, *, operation: str = "") -> int:
+    prefix = f"{operation}: " if operation else ""
+    if isinstance(error, KeyboardInterrupt):
+        terminal.error("Interrupted.")
+        return 130
+    if isinstance(error, ManagedCleanup):
+        terminal.error("Managed worker cleanup needs verification.")
+        if error.receipt_leaf is not None:
+            terminal.error(f"Private receipt directory /tmp/{error.receipt_leaf}")
+    elif isinstance(error, RouteUnavailable):
+        terminal.error(prefix + _UNAVAILABLE_MESSAGES[error.reason])
+    elif isinstance(error, ProfileError):
+        terminal.error(prefix + _UNAVAILABLE_MESSAGES[_PROFILE_REASONS.get(error.code, Reason.QUALIFICATION)])
+    else:
+        terminal.error(prefix + "The ChatGPT plan command could not complete.")
+    return 1
+
+
 def run(
     argv: Sequence[str], *, terminal: Terminal, backend_factory: Callable[[], Backend] = _production_backend,
 ) -> int:
     command = argv[0] if argv else ""
     labelled = command in _LABEL_COMMANDS
+    manual = command == "connect" and len(argv) == 3 and argv[2] == "--no-browser"
     if (
-        (labelled and (len(argv) != 2 or not valid_label(argv[1])))
+        (labelled and ((len(argv) != 2 and not manual) or not valid_label(argv[1])))
         or (not labelled and (len(argv) != 1 or command not in _LOCAL_COMMANDS))
     ):
         terminal.error(USAGE)
         return 2
-    if command in ("connect", "accept") and not terminal.attended():
+    if command == "connect" and not terminal.attended():
         terminal.error("An attended workstation terminal in the foreground is required.")
         return 2
     try:
@@ -387,13 +378,19 @@ def run(
                 "request and this installation's identifier. This workstation stores the verified "
                 "account identity and provider tokens. Disconnect retires local tokens and attempts "
                 "revocation with OpenAI. It retains registration labels and IDs, the verified "
-                "account binding, and installation-wide numeric usage accounting. Acceptance "
+                "account binding, and installation-wide numeric usage accounting. The live proof "
                 "sends fixed prompts to OpenAI only after separate authorization."
             )
-            if not terminal.confirm(f"Continue with ChatGPT for {label} in the workstation browser?"):
+            terminal.write(
+                "If browser sign-in is needed, copy the sign-in link shown after approval into a browser "
+                "on this workstation that can reach 127.0.0.1. Keep this terminal open."
+            )
+            if not terminal.confirm(f"Continue with ChatGPT for {label}?"):
                 terminal.error("Cancelled.")
                 return 1
-            backend.connect(label)
+            backend.connect(
+                label, handoff=lambda uri, launch: _present_sign_in(terminal, uri, launch, manual=manual),
+            )
             terminal.write(f"Connected ChatGPT registration {label} on this workstation.")
             return 0
         if command == "select":
@@ -404,27 +401,10 @@ def run(
         if command == "status":
             _show_status(terminal, _local_status(backend))
             return 0
-        if command == "disconnect":
-            if backend.disconnect() is True:
-                terminal.write("ChatGPT is disconnected on this workstation.")
-                return 0
-            terminal.error("ChatGPT is disconnected locally. Remote revocation could not be confirmed.")
-            return 1
-        return _accept(terminal, backend)
-    except KeyboardInterrupt:
-        terminal.error("Interrupted.")
-        return 130
-    except ManagedCleanup as error:
-        terminal.error("Managed worker cleanup needs verification.")
-        if error.receipt_leaf is not None:
-            terminal.error(f"Private receipt directory /tmp/{error.receipt_leaf}")
+        if backend.disconnect() is True:
+            terminal.write("ChatGPT is disconnected on this workstation.")
+            return 0
+        terminal.error("ChatGPT is disconnected locally. Remote revocation could not be confirmed.")
         return 1
-    except RouteUnavailable as error:
-        terminal.error(_UNAVAILABLE_MESSAGES[error.reason])
-        return 1
-    except ProfileError as error:
-        terminal.error(_UNAVAILABLE_MESSAGES[_PROFILE_REASONS.get(error.code, Reason.QUALIFICATION)])
-        return 1
-    except Exception:
-        terminal.error("The ChatGPT plan command could not complete.")
-        return 1
+    except (Exception, KeyboardInterrupt) as error:
+        return report_failure(terminal, error)

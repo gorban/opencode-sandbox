@@ -1,10 +1,12 @@
 """Fixed worker intent and bounded projection of upstream Responses events."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import Enum
 import json
 import re
 
-from ..responses import encode_responses_body
+from ..responses import ConnectionError, encode_responses_body
 from .relay_receipt import MAX_BODY, MAX_RESPONSE
 from .runtime import PUBLIC_RESPONSES_VALUE
 
@@ -22,6 +24,12 @@ INSTRUCTIONS = (
 _MAX_EVENTS = 2048
 _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _CALL_ID = re.compile(r"call_[A-Za-z0-9_-]{1,123}\Z")
+_EVENT_LABEL = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){0,4}\Z")
+_UNSUPPORTED_EVENTS = (
+    "response.audio.", "response.code_interpreter_", "response.compaction.",
+    "response.file_search_", "response.shell_", "response.web_search_", "response.image_generation_",
+    "response.mcp_", "response.custom_tool_", "response.refusal.",
+)
 _HEADERS = set(b"host connection content-type content-length accept accept-encoding authorization "
                b"user-agent x-stainless-lang x-stainless-package-version x-stainless-os "
                b"x-stainless-arch x-stainless-runtime x-stainless-runtime-version "
@@ -38,6 +46,46 @@ class CompletedReply:
 
 class Refused(ValueError):
     """A safe status for a closed worker exchange."""
+
+    def __init__(self, message, *, fault=None):
+        super().__init__(message)
+        self.fault = fault
+
+
+class Fault(str, Enum):
+    EVENT = "upstream event validation"
+    EVENT_SEQUENCE = "upstream event ordering or response identity"
+    EVENT_COUNT = "upstream event count limit"
+    EVENT_BYTES = "upstream worker JSON size limit"
+    EVENT_LABEL = "malformed upstream event label"
+    EVENT_UNKNOWN = "unknown upstream event"
+    EVENT_UNSUPPORTED = "unsupported upstream event family"
+    EVENT_ITEM = "upstream output-item shape"
+    ANNOTATION = "unsupported upstream text annotation"
+    METADATA_ENVELOPE = "upstream metadata envelope validation"
+    METADATA_FIELDS = "unsupported upstream metadata fields"
+    METADATA_REVIEW = "upstream metadata requires separate verification or review"
+    METADATA_MODERATION = "unsupported upstream moderation metadata"
+    SAFETY_BUFFERING = "upstream safety buffering"
+    MESSAGE = "assistant message validation"
+    TOOL = "approved write-call validation"
+    REASONING = "stateless reasoning validation"
+    REPLAY = "continuation request bounds"
+    PROJECTION = "native response projection"
+    DELIVERY = "native response delivery receipt"
+    NATIVE = "native tool turn or terminal evidence"
+    CONTINUATION = "native continuation admission"
+    PLACEMENT = "worker placement or lifecycle"
+
+
+@contextmanager
+def checking(fault):
+    try:
+        yield
+    except Refused as error:
+        if error.fault is not None:
+            raise
+        raise Refused("Worker exchange refused", fault=fault) from None
 
 
 def require(condition):
@@ -122,19 +170,24 @@ def _native_tools(tools):
 def _native_input(items, output):
     require(type(items) is list and 1 <= len(items) <= 64 and all(type(item) is dict for item in items))
     if output is not None:
-        require(len(items) > 3)
-        message, call, result = items[-3:]
-        expected_message, expected_call = output
-        require(message.get("type") == "message" and message.get("role") == "assistant")
-        require(_content(message, "output_text") == INITIAL_TEXT)
-        require(message.get("id", expected_message["id"]) == expected_message["id"])
+        replay_count = len(output) + 1
+        require(len(output) in (1, 2) and len(items) > replay_count)
+        call, result = items[-2:]
+        expected_call = output[-1]
+        if len(output) == 2:
+            message = items[-3]
+            expected_message = output[0]
+            require(message.get("type") == "message" and message.get("role") == "assistant")
+            require(_content(message, "output_text") == INITIAL_TEXT)
+            require(message.get("id", expected_message["id"]) == expected_message["id"])
         require(call.get("type") == "function_call" and call.get("call_id") == expected_call["call_id"]
+                and call.get("id", expected_call["id"]) == expected_call["id"]
                 and call.get("name") == "write" and type(call.get("arguments")) is str)
         require(decode(call["arguments"]) == _arguments())
         require(result.keys() == {"type", "call_id", "output"} and result["type"] == "function_call_output"
                 and result["call_id"] == expected_call["call_id"])
         require(type(result["output"]) in (str, list))
-        items = items[:-3]
+        items = items[:-replay_count]
     require(items[-1].get("role") == "user" and _content(items[-1], "input_text") == PROMPT)
     require(all(item.get("type", "message") == "message" and item.get("role") == "developer"
                 and type(item.get("content")) in (str, list) for item in items[:-1]))
@@ -183,13 +236,13 @@ def _usage(raw):
 
 
 def _reasoning_item(item):
-    require({"type", "id", "summary", "encrypted_content"} <= item.keys()
+    require({"type", "id", "summary"} <= item.keys()
             <= {"type", "id", "summary", "encrypted_content", "status", "content"})
-    require(item["type"] == "reasoning" and item["summary"] == [] and item.get("content", []) == []
-            and item.get("status", "completed") == "completed")
+    require(item["type"] == "reasoning" and item["summary"] == [] and item.get("content") in (None, [])
+            and item.get("status") in (None, "completed"))
     require(_identifier(item["id"]).startswith("rs_"))
-    _encrypted(item["encrypted_content"])
-    return item.copy()
+    ciphertext = item.get("encrypted_content")
+    return None if ciphertext is None else _encrypted(ciphertext)
 
 
 def _encrypted(value):
@@ -209,14 +262,14 @@ def _reasoning_position(index, identifier, seen):
 def _reasoning_frame(kind, event, seen, completed):
     if kind in ("response.output_item.done", "response.output_item.added"):
         item = event["item"]
+        index = event.get("output_index")
+        if kind == "response.output_item.done":
+            require(type(index) is int and 0 <= index < 8 and index not in completed)
+            ciphertext = _reasoning_item(item) if item["type"] == "reasoning" else None
+            completed[index] = (item["type"], _identifier(item.get("id")), ciphertext)
         if item["type"] != "reasoning":
             return
-        index = event.get("output_index")
         _reasoning_position(index, item.get("id"), seen)
-        if kind == "response.output_item.done":
-            require(index not in completed and item.get("status", "completed") == "completed")
-            encrypted = item.get("encrypted_content")
-            completed[index] = None if encrypted is None else _encrypted(encrypted)
     elif kind.startswith("response.reasoning"):
         _reasoning_position(event.get("output_index"), event.get("item_id"), seen)
 
@@ -233,61 +286,113 @@ def _assistant_replay(message):
     return message.copy()
 
 
-def _terminal(response, model, initial, seen_reasoning, completed_reasoning):
+def _completed_message(message, expected, *, strict_annotations):
+    content = message.get("content")
+    if strict_annotations and type(content) is list:
+        with checking(Fault.ANNOTATION):
+            require(all(type(part) is dict and part.get("annotations", []) == [] for part in content))
+    require(message.get("type") == "message" and message.get("role") == "assistant"
+            and message.get("status") == "completed"
+            and _content(message, "output_text").strip(" \t\r\n") == expected)
+    return {"type": "message", "role": "assistant", "status": "completed", "id": _identifier(message.get("id")),
+            "content": [{"type": "output_text", "text": expected, "annotations": []}]}
+
+
+def _completed_call(call):
+    fields = {"type", "name", "arguments", "id", "call_id"}
+    require(fields <= call.keys() <= fields | {"status", "async", "caller", "namespace"}
+            and call["type"] == "function_call" and call["name"] == "write"
+            and call.get("status") in (None, "completed")
+            and (call.get("async") is None or call["async"] is False)
+            and call.get("caller") in (None, {"type": "direct"}) and call.get("namespace") is None
+            and type(call["arguments"]) is str)
+    require(len(call["arguments"]) <= 1024 and decode(call["arguments"]) == _arguments())
+    call_id = _identifier(call["call_id"])
+    require(_CALL_ID.fullmatch(call_id))
+    return {"type": "function_call", "name": "write", "status": "completed",
+            "id": _identifier(call["id"]), "call_id": call_id,
+            "arguments": json.dumps(_arguments(), separators=(",", ":"))}
+
+
+def _continuation_items(items, message, call, seen_reasoning, completed_reasoning):
+    history = []
+    seen_ids = set()
+    terminal_positions = set()
+    for index, item in enumerate(items):
+        item_id = _identifier(item.get("id"))
+        require(item_id not in seen_ids)
+        seen_ids.add(item_id)
+        completed = completed_reasoning.get(index)
+        require(completed is None or completed[:2] == (item.get("type"), item_id))
+        if item is message:
+            with checking(Fault.MESSAGE):
+                history.append(_assistant_replay(message))
+        elif item is call:
+            history.append(call.copy())
+        else:
+            with checking(Fault.REASONING):
+                terminal_positions.add(index)
+                require(seen_reasoning.get(index, item_id) == item_id)
+                terminal_ciphertext = _reasoning_item(item)
+                completed_ciphertext = completed[2] if completed is not None else None
+                require(terminal_ciphertext is None or completed_ciphertext is None
+                        or terminal_ciphertext == completed_ciphertext)
+                ciphertext = terminal_ciphertext or completed_ciphertext
+                require(ciphertext is not None)
+                history.append({**item, "encrypted_content": ciphertext})
+    require(seen_reasoning.keys() <= terminal_positions)
+    require(all(index < len(items) for index in completed_reasoning))
+    return history
+
+
+def _terminal(response, model, initial, seen_reasoning, completed_reasoning, *, strict_annotations):
     require(type(response) is dict and response.get("model") == model and response.get("status") == "completed")
     expected = INITIAL_TEXT if initial else FINAL_TEXT
     items = response.get("output")
     require(type(items) is list and 0 < len(items) <= 8 and all(type(item) is dict for item in items))
     visible = [item for item in items if item.get("type") != "reasoning"]
-    require(len(visible) == (2 if initial else 1))
-    message = visible[0]
-    require(message.get("type") == "message" and message.get("role") == "assistant"
-            and message.get("status") == "completed" and _content(message, "output_text") == expected)
-    output = [{"type": "message", "role": "assistant", "status": "completed", "id": _identifier(message.get("id")),
-               "content": [{"type": "output_text", "text": expected, "annotations": []}]}]
+    with checking(Fault.TOOL if initial else Fault.MESSAGE):
+        require(len(visible) in ((1, 2) if initial else (1,)))
+    message = None if initial and len(visible) == 1 else visible[0]
+    with checking(Fault.MESSAGE):
+        output = [] if message is None else [
+            _completed_message(message, expected, strict_annotations=strict_annotations)
+        ]
     continuation = None
     if initial:
-        call = visible[1]
-        require(call.keys() == {"type", "name", "status", "arguments", "id", "call_id"}
-                and call.get("type") == "function_call"
-                and call.get("name") == "write" and call.get("status") == "completed"
-                and type(call.get("arguments")) is str)
-        require(len(call["arguments"]) <= 1024 and decode(call["arguments"]) == _arguments())
-        call_id = _identifier(call.get("call_id"))
-        require(_CALL_ID.fullmatch(call_id))
-        output.append({"type": "function_call", "name": "write", "status": "completed",
-                       "id": _identifier(call.get("id")), "call_id": call_id,
-                       "arguments": json.dumps(_arguments(), separators=(",", ":"))})
-
-        history = []
-        seen_ids = set()
-        terminal_positions = set()
-        for index, item in enumerate(items):
-            item_id = _identifier(item.get("id"))
-            require(item_id not in seen_ids)
-            seen_ids.add(item_id)
-            if item is message:
-                history.append(_assistant_replay(message))
-            elif item is call:
-                history.append(call.copy())
-            else:
-                terminal_positions.add(index)
-                require(seen_reasoning.get(index, item_id) == item_id)
-                replay_item = _reasoning_item(item)
-                completed = completed_reasoning.get(index)
-                require(completed is None or completed == replay_item["encrypted_content"])
-                history.append(replay_item)
-        require(seen_reasoning.keys() <= terminal_positions)
+        call = visible[-1]
+        with checking(Fault.TOOL):
+            output.append(_completed_call(call))
+        with checking(Fault.REASONING):
+            history = _continuation_items(items, message, call, seen_reasoning, completed_reasoning)
         continuation = body_for(model, history)
         # Check the entire future request using the exact connector encoding
         # before exposing even one executable frame to OpenCode.
-        encode_responses_body(continuation)
+        try:
+            encode_responses_body(continuation)
+        except ConnectionError:
+            raise Refused("Worker continuation exceeds its request bounds", fault=Fault.REPLAY) from None
     native = {"object": "response", "id": _identifier(response.get("id")), "model": model, "status": "completed",
               "output": output, "usage": _usage(response.get("usage"))}
     return CompletedReply(native, continuation)
 
 
-def validate(events, model, initial, cancelled):
+def _validate_metadata(event, response_id):
+    with checking(Fault.METADATA_ENVELOPE):
+        require(event.keys() == {"type", "response_id", "sequence_number", "metadata"}
+                and event["response_id"] == response_id
+                and type(event["sequence_number"]) is int and 0 <= event["sequence_number"] <= 2**31
+                and type(event["metadata"]) is dict)
+    metadata = event["metadata"]
+    with checking(Fault.METADATA_REVIEW):
+        require("guardian" not in metadata and metadata.get("openai_verification_recommendation", []) == [])
+    with checking(Fault.METADATA_FIELDS):
+        require(metadata.keys() <= {"openai_verification_recommendation", "openai_chatgpt_moderation_metadata"})
+    with checking(Fault.METADATA_MODERATION):
+        require(metadata.get("openai_chatgpt_moderation_metadata", {}) in ({}, {"presentation": "inline"}))
+
+
+def validate(events, model, initial, cancelled, *, allow_progress=False, allow_metadata=False):
     """Buffer the proof through terminal validation before exposing executable items."""
     allowed = {"response.created", "response.in_progress", "response.output_item.added",
                "response.output_item.done", "response.content_part.added", "response.content_part.done",
@@ -302,29 +407,68 @@ def validate(events, model, initial, cancelled):
     completed_reasoning = {}
     total_bytes = 0
     for count, event in enumerate(events, 1):
-        require(not cancelled.is_set() and count <= _MAX_EVENTS and type(event) is dict and terminal is None)
+        with checking(Fault.EVENT_SEQUENCE):
+            require(not cancelled.is_set() and type(event) is dict and terminal is None)
+        with checking(Fault.EVENT_COUNT):
+            require(count <= _MAX_EVENTS)
         try:
             total_bytes += len(json.dumps(event, ensure_ascii=True, allow_nan=False))
         except (ValueError, TypeError, RecursionError):
-            raise Refused("Invalid upstream event") from None
-        require(total_bytes <= MAX_RESPONSE)
+            raise Refused("Invalid upstream event", fault=Fault.EVENT_BYTES) from None
+        with checking(Fault.EVENT_BYTES):
+            require(total_bytes <= MAX_RESPONSE)
         kind = event.get("type")
-        require(type(kind) is str and kind in allowed)
+        with checking(Fault.EVENT_LABEL):
+            require(type(kind) is str and len(kind) <= 96 and _EVENT_LABEL.fullmatch(kind))
+        if allow_metadata:
+            with checking(Fault.SAFETY_BUFFERING):
+                require(event.get("safety_buffering", False) is False)
+                metadata = event.get("metadata")
+                require(type(metadata) is not dict or metadata.get("type") != "safety_buffering")
         if count == 1:
-            require(kind == "response.created" and type(event.get("response")) is dict)
-            response_id = _identifier(event["response"].get("id"))
+            with checking(Fault.EVENT_SEQUENCE):
+                require(kind == "response.created" and type(event.get("response")) is dict)
+                response_id = _identifier(event["response"].get("id"))
+        elif allow_progress and kind == "response.queued":
+            with checking(Fault.EVENT_SEQUENCE):
+                queued = event.get("response")
+                require(type(queued) is dict and queued.get("id") == response_id and queued.get("status") == "queued"
+                        and queued.get("output", []) == [] and queued.get("error") is None
+                        and queued.get("incomplete_details") is None)
+        elif allow_progress and kind in ("ping", "keepalive"):
+            with checking(Fault.EVENT_LABEL):
+                require(event.keys() == {"type"})
+        elif allow_metadata and kind == "response.metadata":
+            _validate_metadata(event, response_id)
         elif kind == "response.completed":
             response = event.get("response")
-            require(type(response) is dict and response.get("id") == response_id)
-            terminal = _terminal(response, model, initial, seen_reasoning, completed_reasoning)
+            with checking(Fault.EVENT_SEQUENCE):
+                require(type(response) is dict and response.get("id") == response_id)
+            terminal = _terminal(
+                response, model, initial, seen_reasoning, completed_reasoning, strict_annotations=allow_progress,
+            )
         else:
-            require(kind != "response.created")
+            with checking(Fault.EVENT_SEQUENCE):
+                require(kind != "response.created")
+            if kind == "response.output_text.annotation.added":
+                raise Refused("Unsupported text annotation", fault=Fault.ANNOTATION)
+            if kind.startswith(_UNSUPPORTED_EVENTS) or kind in ("response.failed", "response.incomplete", "error"):
+                raise Refused("Unsupported upstream event", fault=Fault.EVENT_UNSUPPORTED)
+            with checking(Fault.EVENT_UNKNOWN):
+                require(kind in allowed)
             if kind in ("response.output_item.added", "response.output_item.done"):
-                item = event.get("item")
-                require(type(item) is dict and item.get("type") in ("message", "function_call", "reasoning"))
+                with checking(Fault.EVENT_ITEM):
+                    item = event.get("item")
+                    index = event.get("output_index")
+                    require(type(item) is dict and item.get("type") in ("message", "function_call", "reasoning"))
+                    if allow_progress:
+                        require(type(index) is int and 0 <= index < 8)
             if initial:
-                _reasoning_frame(kind, event, seen_reasoning, completed_reasoning)
-    require(terminal is not None and not cancelled.is_set())
+                with checking(Fault.REASONING):
+                    require(event.get("response_id", response_id) == response_id)
+                    _reasoning_frame(kind, event, seen_reasoning, completed_reasoning)
+    with checking(Fault.EVENT_SEQUENCE):
+        require(terminal is not None and not cancelled.is_set())
     return terminal
 
 

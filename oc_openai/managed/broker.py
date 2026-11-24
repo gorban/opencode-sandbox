@@ -27,10 +27,12 @@ def _shutdown(peer):
 
 
 class Broker:
-    def __init__(self, job, responses, before_dispatch):
+    def __init__(self, job, responses, before_dispatch, *, allow_progress=False, allow_metadata=False):
         self.job = job
         self._responses = responses
         self._before_dispatch = before_dispatch
+        self._allow_progress = allow_progress
+        self._allow_metadata = allow_metadata
         self._state = threading.Condition()
         self._stopped = threading.Event()
         self.done = threading.Event()
@@ -42,6 +44,16 @@ class Broker:
         self._listener = None
         self._thread = None
         self._socket_id = None
+        self._failure = None
+
+    def failure(self):
+        with self._state:
+            return self._failure
+
+    def _remember(self, phase, fault):
+        with self._state:
+            if self._failure is None:
+                self._failure = (phase, fault)
 
     def start(self):
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -94,13 +106,20 @@ class Broker:
             phase = self._phase
             protocol.require(lease.active() and phase in ("initial", "continuation") and not self._stopped.is_set())
             output = None if phase == "initial" else self._initial
-            protocol.request(raw, WORKER_MODEL, output)
             if phase == "continuation":
-                self.job.assert_file(protocol.PROOF_BYTES)
-                body = self._continuation
-                protocol.require(body is not None)
+                try:
+                    protocol.request(raw, WORKER_MODEL, output)
+                    self.job.assert_file(protocol.PROOF_BYTES)
+                    body = self._continuation
+                    protocol.require(body is not None)
+                except (OSError, ValueError, RuntimeError):
+                    self._remember(phase, protocol.Fault.CONTINUATION)
+                    raise
+                if self._failure == (phase, protocol.Fault.CONTINUATION):
+                    self._failure = None
                 self._continuation = None
             else:
+                protocol.request(raw, WORKER_MODEL, output)
                 body = protocol.body_for(self.job.model)
             self._phase = phase + "_dispatch"
             cancel = self._cancel = threading.Event()
@@ -134,7 +153,10 @@ class Broker:
             protocol.require(self.job.lease.active() and not cancel.is_set())
             events = iter(self._responses(body, deadline=deadline, cancelled=cancel))
             try:
-                terminal = protocol.validate(events, self.job.model, phase == "initial", cancel)
+                terminal = protocol.validate(
+                    events, self.job.model, phase == "initial", cancel, allow_progress=self._allow_progress,
+                    allow_metadata=self._allow_metadata,
+                )
             finally:
                 if hasattr(events, "close"):
                     events.close()
@@ -169,6 +191,7 @@ class Broker:
 
     def _handle(self, peer):
         phase = None
+        fault = protocol.Fault.EVENT
         confirmed = False
         proof = False
         request_id = secrets.token_bytes(16)
@@ -182,16 +205,21 @@ class Broker:
             raw = read_exact(peer, size, deadline)
             phase, body, cancel = self._reserve(raw)
             terminal = self._response(peer, phase, body, cancel)
+            fault = protocol.Fault.PROJECTION
             frames = b"".join(protocol.project({**terminal.native, "model": WORKER_MODEL}))
             response = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n"
                         + f"Content-Length: {len(frames)}\r\n\r\n".encode("ascii") + frames)
             with self.job.lease.fence(), self._state:
                 protocol.require(self.job.lease.active() and not self._stopped.is_set())
                 self._phase = phase + "_receipt"
+            fault = protocol.Fault.DELIVERY
             self._send(peer, request_id, response)
             self._confirm(peer, phase, terminal, request_id, len(response))
             confirmed = True
-        except Exception:
+        except Exception as error:
+            if phase is not None:
+                specific = error.fault if type(error) is protocol.Refused else None
+                self._remember(phase, specific if type(specific) is protocol.Fault else fault)
             if phase is None and proof:
                 with contextlib.suppress(OSError, EOFError):
                     self._send(peer, request_id, _DENIED)
@@ -213,7 +241,7 @@ class Broker:
 
     def complete(self, call_id):
         with self._state:
-            return self._phase == "complete" and self._initial[1]["call_id"] == call_id
+            return self._phase == "complete" and self._initial[-1]["call_id"] == call_id
 
     def close(self):
         self._stopped.set()

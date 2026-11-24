@@ -34,7 +34,7 @@ _REPLAY_ITEMS = (
      "encrypted_content": "host_reasoning_ciphertext_before_write"},
 )
 
-def fixture_events(body, *, deadline, cancelled, reasoning=False):
+def fixture_events(body, *, deadline, cancelled, reasoning=False, tool_only=False, done_only=False):
     assert time.monotonic() < deadline and not cancelled.is_set()
     assert body["store"] is False and body["stream"] is True
     assert "include" not in body
@@ -49,8 +49,11 @@ def fixture_events(body, *, deadline, cancelled, reasoning=False):
         expected_types = ["message", "function_call", "function_call_output"]
         if reasoning:
             expected_types = ["reasoning", "message", "reasoning", "function_call", "function_call_output"]
-            assert history[0] == _REPLAY_ITEMS[0] and history[2] == _REPLAY_ITEMS[1]
-            assert history[1]["phase"] == "commentary"
+            assert history[0] == _REPLAY_ITEMS[0] and history[1 if tool_only else 2] == _REPLAY_ITEMS[1]
+            if not tool_only:
+                assert history[1]["phase"] == "commentary"
+        if tool_only:
+            expected_types.remove("message")
         assert [item["type"] for item in history] == expected_types
         assert history[-1] == {"type": "function_call_output", "call_id": "call_example",
                                "output": protocol.TOOL_RESULT}
@@ -61,20 +64,29 @@ def fixture_events(body, *, deadline, cancelled, reasoning=False):
               "content": [{"type": "output_text",
                            "text": protocol.INITIAL_TEXT if initial else protocol.FINAL_TEXT}]}]
     if initial:
+        if tool_only:
+            items.clear()
         items.append({"id": "fc_example", "call_id": "call_example", "type": "function_call", "name": "write",
                       "status": "completed", "arguments": json.dumps({
                           "path": protocol.PROOF_PATH, "content": protocol.PROOF_BYTES.decode("ascii"),
                       })})
+        if tool_only:
+            items[-1].pop("status")
     if reasoning and initial:
-        items[0]["phase"] = "commentary"
-        items = [_REPLAY_ITEMS[0].copy(), items[0], _REPLAY_ITEMS[1].copy(), items[1]]
-        for index in (0, 2):
+        if tool_only:
+            items = [_REPLAY_ITEMS[0].copy(), _REPLAY_ITEMS[1].copy(), items[0]]
+        else:
+            items[0]["phase"] = "commentary"
+            items = [_REPLAY_ITEMS[0].copy(), items[0], _REPLAY_ITEMS[1].copy(), items[1]]
+        for index in (0, 1 if tool_only else 2):
             item = items[index]
             yield {"type": "response.output_item.added", "output_index": index,
                    "item": {**item, "encrypted_content": "unfinished_ciphertext"}}
             yield {"type": "response.reasoning_text.delta", "output_index": index, "item_id": item["id"],
                    "delta": "discard this synthetic reasoning text"}
             yield {"type": "response.output_item.done", "output_index": index, "item": item.copy()}
+            if done_only:
+                item.pop("encrypted_content")
     yield {"type": "response.completed", "response": {
         **response, "status": "completed", "output": items,
         "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
@@ -89,9 +101,9 @@ def native_payload(output=None):
                               "content": {"type": "string"}, "path": {"type": "string"},
                           }}}]}
     if output:
-        message, call = output
-        payload["input"].extend([message, call, {"type": "function_call_output", "call_id": call["call_id"],
-                                                 "output": "private job result marker"}])
+        call = output[-1]
+        payload["input"].extend([*output, {"type": "function_call_output", "call_id": call["call_id"],
+                                           "output": "private job result marker"}])
     return payload
 
 
@@ -194,6 +206,11 @@ class WorkerBrokerTests(unittest.TestCase):
             wrong_call["input"][-1]["call_id"] = "call_other"
             with exchange(job, wrong_call) as peer:
                 self.assertTrue(response(peer).startswith(b"HTTP/1.1 403"))
+            wrong_item = deepcopy(native)
+            wrong_item["input"][-2]["id"] = "fc_other"
+            with exchange(job, wrong_item) as peer:
+                self.assertTrue(response(peer).startswith(b"HTTP/1.1 403"))
+            self.assertEqual(phases, ["initial"])
             with exchange(job, native) as peer:
                 data = response(peer, generation=job.generation)
             self.assertNotIn(b"host_reasoning_ciphertext", data)
@@ -206,6 +223,25 @@ class WorkerBrokerTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         for body in calls:
             self.assertNotIn("marker", json.dumps(body))
+
+    def test_admitted_continuation_replaces_provisional_denial_with_delivery_failure(self):
+        phases = []
+        with offline_broker(fixture_events, phases) as (root, job, broker):
+            with exchange(job, native_payload()) as peer:
+                data = response(peer, generation=job.generation)
+            terminal = next(item["response"] for item in (
+                json.loads(frame[6:]) for frame in data.partition(b"\r\n\r\n")[2].splitlines() if frame
+            ) if item["type"] == "response.completed")
+            native = native_payload(terminal["output"])
+            with exchange(job, native) as peer:
+                self.assertTrue(response(peer).startswith(b"HTTP/1.1 403"))
+            self.assertEqual(broker.failure(), ("continuation", protocol.Fault.CONTINUATION))
+            (root / "proof.txt").write_bytes(protocol.PROOF_BYTES)
+            with patch.object(broker, "_send", side_effect=OSError), exchange(job, native) as peer:
+                self.assertEqual(peer.recv(1), b"")
+            self.assertTrue(broker.done.wait(1))
+            self.assertEqual(broker.failure(), ("continuation", protocol.Fault.DELIVERY))
+        self.assertEqual(phases, ["initial", "continuation"])
 
     def test_wrong_generation_receipt_closes_the_turn(self):
         phases = []
@@ -270,12 +306,19 @@ class WorkerBrokerTests(unittest.TestCase):
                 for event in fixture_events(body, **kwargs, reasoning=True):
                     kind = event["type"]
                     if kind == "response.output_item.done" and event["output_index"] == 0:
+                        if fault == "missing encrypted content":
+                            event["item"].pop("encrypted_content")
                         if fault == "ciphertext mismatch":
                             event["item"]["encrypted_content"] = "different_ciphertext"
                         if fault == "reasoning ID mismatch":
                             event["item"]["id"] = "rs_different"
                         if fault == "incomplete done status":
                             event["item"]["status"] = "incomplete"
+                        if fault == "conflicting completed occupant before reasoning":
+                            yield {**event, "item": {"type": "message", "id": "msg_conflict"}}
+                        if fault == "conflicting completed occupant after reasoning":
+                            yield event
+                            event = {**event, "item": {"type": "message", "id": "msg_conflict"}}
                     if kind == "response.completed":
                         output = event["response"]["output"]
                         if fault == "missing encrypted content":
@@ -288,17 +331,125 @@ class WorkerBrokerTests(unittest.TestCase):
             return upstream
 
         for fault in ("missing encrypted content", "missing terminal reasoning", "ciphertext mismatch",
-                      "reasoning ID mismatch", "incomplete done status", "unsupported phase"):
+                      "reasoning ID mismatch", "incomplete done status", "unsupported phase",
+                      "conflicting completed occupant before reasoning",
+                      "conflicting completed occupant after reasoning"):
             with self.subTest(fault=fault):
                 phases = []
                 with offline_broker(fault_events(fault), phases) as (root, job, broker):
                     with exchange(job, native_payload()) as peer:
                         self.assertEqual(peer.recv(1), b"")
                     self.assertTrue(broker.done.wait(2))
+                    self.assertIn(broker.failure()[1], (protocol.Fault.REASONING, protocol.Fault.MESSAGE))
                     self.assertFalse((root / "proof.txt").exists())
                     with exchange(job, native_payload()) as peer:
                         self.assertTrue(response(peer).startswith(b"HTTP/1.1 403"))
                     self.assertEqual(phases, ["initial"])
+
+    def test_tool_only_completed_shape_rejects_non_neutral_metadata(self):
+        for field, value in (("async", 0), ("caller", {"type": "program"}), ("status", "incomplete"),
+                             ("namespace", ""), ("id", None)):
+            with self.subTest(field=field):
+                cancelled = threading.Event()
+                events = list(fixture_events(
+                    protocol.body_for("fixture-model"), deadline=time.monotonic() + 2, cancelled=cancelled,
+                    tool_only=True,
+                ))
+                events[-1]["response"]["output"][0][field] = value
+                with self.assertRaises(protocol.Refused) as error:
+                    protocol.validate(events, "fixture-model", True, cancelled)
+                self.assertIs(error.exception.fault, protocol.Fault.TOOL)
+
+    def test_closed_progress_diagnostics_reject_bad_identity_payload_and_annotation(self):
+        faults = (
+            ({"type": "response.queued", "response": {"id": "resp_other", "status": "queued"}},
+             protocol.Fault.EVENT_SEQUENCE),
+            ({"type": "keepalive", "payload": "private"}, protocol.Fault.EVENT_LABEL),
+            ({"type": "response.output_text.annotation.added", "annotation": {"url": "private"}},
+             protocol.Fault.ANNOTATION),
+        )
+        for event, fault in faults:
+            with self.subTest(fault=fault):
+                cancel = threading.Event()
+                events = list(fixture_events(
+                    protocol.body_for("fixture-model"), deadline=time.monotonic() + 2, cancelled=cancel,
+                ))
+                events.insert(1, event)
+                with self.assertRaises(protocol.Refused) as error:
+                    protocol.validate(events, "fixture-model", True, cancel, allow_progress=True)
+                self.assertIs(error.exception.fault, fault)
+                self.assertNotIn("private", str(error.exception))
+        for initial in (True, False):
+            with self.subTest(initial=initial):
+                result = list(fixture_events(
+                    protocol.body_for("fixture-model"), deadline=time.monotonic() + 2, cancelled=threading.Event(),
+                ))
+                output = result[-1]["response"]["output"]
+                if not initial:
+                    output.pop()
+                    output[0]["content"][0]["text"] = protocol.FINAL_TEXT
+                output[0]["content"][0]["annotations"] = [{"url": "private"}]
+                if not initial:
+                    ordinary = protocol.validate(result, "fixture-model", False, threading.Event())
+                    self.assertNotIn("private", repr(ordinary.native))
+                with self.assertRaises(protocol.Refused) as error:
+                    protocol.validate(result, "fixture-model", initial, threading.Event(), allow_progress=True)
+                self.assertIs(error.exception.fault, protocol.Fault.ANNOTATION)
+
+    def test_followup_added_item_index_check_preserves_ordinary_admission(self):
+        events = list(fixture_events(
+            protocol.body_for("fixture-model"), deadline=time.monotonic() + 2, cancelled=threading.Event(),
+        ))
+        events.insert(1, {"type": "response.output_item.added", "item": {"type": "message"}})
+        self.assertTrue(protocol.validate(events, "fixture-model", True, threading.Event()).native)
+        with self.assertRaises(protocol.Refused) as error:
+            protocol.validate(events, "fixture-model", True, threading.Event(), allow_progress=True)
+        self.assertIs(error.exception.fault, protocol.Fault.EVENT_ITEM)
+
+    def test_metadata_requires_bound_neutral_envelope_and_approved_write(self):
+        expected = {"type": "response.metadata", "response_id": "resp_example1",
+                    "sequence_number": 1, "metadata": {}}
+        cases = (
+            ({"sequence_number": True}, protocol.Fault.METADATA_ENVELOPE),
+            ({"response_id": "resp_other"}, protocol.Fault.METADATA_ENVELOPE),
+            ({"metadata": []}, protocol.Fault.METADATA_ENVELOPE),
+            ({"error": None}, protocol.Fault.METADATA_ENVELOPE),
+            ({"metadata": {"private_effect": True}}, protocol.Fault.METADATA_FIELDS),
+            ({"metadata": {"type": "safety_buffering"}}, protocol.Fault.SAFETY_BUFFERING),
+            ({"metadata": {"guardian": {"requires_review": False}}}, protocol.Fault.METADATA_REVIEW),
+            ({"metadata": {"openai_verification_recommendation": ["verification"]}}, protocol.Fault.METADATA_REVIEW),
+            ({"metadata": {"openai_chatgpt_moderation_metadata": {"is_blocked": True}}},
+             protocol.Fault.METADATA_MODERATION),
+        )
+        for change, fault in cases:
+            with self.subTest(fault=fault):
+                cancelled = threading.Event()
+                events = list(fixture_events(
+                    protocol.body_for("fixture-model"), deadline=time.monotonic() + 2, cancelled=cancelled,
+                ))
+                events.insert(1, {**expected, **change})
+                with self.assertRaises(protocol.Refused) as error:
+                    protocol.validate(events, "fixture-model", True, cancelled,
+                                      allow_progress=True, allow_metadata=True)
+                self.assertIs(error.exception.fault, fault)
+        events[1] = expected
+        events[0]["safety_buffering"] = False
+        self.assertTrue(protocol.validate(events, "fixture-model", True, cancelled, allow_metadata=True).native)
+        events[-1]["response"]["output"].pop()
+        with self.assertRaises(protocol.Refused) as error:
+            protocol.validate(events, "fixture-model", True, cancelled, allow_metadata=True)
+        self.assertIs(error.exception.fault, protocol.Fault.TOOL)
+
+    def test_worker_json_limit_is_distinct_from_raw_stream_budget(self):
+        event = {"type": "response.in_progress", "fixture": "😀" * 32_000}
+        progress = [event] * 7
+        raw_size = sum(len(json.dumps(item, ensure_ascii=False).encode("utf-8")) + 8 for item in progress)
+        self.assertLess(raw_size, responses.MAX_STREAM)
+        self.assertGreater(sum(len(json.dumps(item)) for item in progress), protocol.MAX_RESPONSE)
+        created = {"type": "response.created", "response": {"id": "resp_fixture"}}
+        with self.assertRaises(protocol.Refused) as error:
+            protocol.validate([created, *progress], "fixture-model", True, threading.Event())
+        self.assertIs(error.exception.fault, protocol.Fault.EVENT_BYTES)
 
     def test_encoded_continuation_cap_applies_before_tool_delivery(self):
         phases = []

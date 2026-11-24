@@ -21,12 +21,12 @@ class OpenAILauncherTests(unittest.TestCase):
         for directory in (self.home, self.checkout, self.stubs):
             directory.mkdir()
         self.launcher = self.checkout / "oc-sandbox"
-        self.bootstrap = self.checkout / "oc-openai-accept.py"
+        self.bootstrap = self.checkout / "oc-openai.py"
         self.package = self.checkout / "oc_openai"
         self.package.mkdir()
         for name in (
-            "oc-sandbox", "oc-openai-accept.py", "oc_openai/__init__.py", "oc_openai/cli.py",
-            "oc_openai/profiles.py", "oc_openai/connection_state.py",
+            "oc-sandbox", "oc-openai.py", "oc_openai/__init__.py", "oc_openai/cli.py",
+            "oc_openai/profiles.py", "oc_openai/connection_state.py", "oc_openai/exposure.py",
         ):
             shutil.copy2(SOURCE / name, self.checkout / name)
         for command in ("podman", "systemctl", "distrobox-host-exec", "curl", "readlink", "realpath"):
@@ -53,11 +53,13 @@ class OpenAILauncherTests(unittest.TestCase):
         for args in [
             ("openai",), ("openai", "bogus"), ("openai", "accept", "-d"),
             ("openai", "connect"), ("openai", "select"), ("openai", "select", "work", "-d"),
+            ("openai", "accept", "--no-browser"), ("openai", "connect", "--no-browser", "work"),
+            ("openai", "connect", "work", "--no-browser", "--no-browser"),
         ]:
             with self.subTest(args=args):
                 result = self.launch(*args)
                 self.assertEqual(result.returncode, 2)
-                self.assertIn("oc-sandbox openai {connect LABEL|select LABEL|status|disconnect|accept}", result.stderr)
+                self.assertIn("usage: oc-sandbox openai", result.stderr)
 
         for label in ("", "--flag", "../outside", "üser", "line\nbreak", "a" * 33):
             with self.subTest(label=label):
@@ -66,6 +68,10 @@ class OpenAILauncherTests(unittest.TestCase):
                 self.assertIn("labels must be 1 to 32 ASCII", result.stderr)
 
         result = self.launch("openai", "accept")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage: oc-sandbox openai", result.stderr)
+        self.assertNotIn("accept", self.launch("-h").stdout)
+        result = self.launch("openai", "connect", "work", "--no-browser")
         self.assertEqual(result.returncode, 2)
         self.assertIn("attended workstation terminal", result.stderr)
 
@@ -86,7 +92,7 @@ class OpenAILauncherTests(unittest.TestCase):
             '#!/bin/sh\nprintf "path-bash\\n" > "$HOME/path-marker"\nexec /usr/bin/bash "$@"\n'
         )
         path_bash.chmod(0o700)
-        result = self.launch("openai", "accept")
+        result = self.launch("openai", "connect", "work")
         self.assertEqual(result.returncode, 2)
         self.assertIn("attended workstation terminal", result.stderr)
         result = self.launch("-h")

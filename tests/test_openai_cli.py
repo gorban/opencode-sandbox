@@ -11,6 +11,7 @@ import traceback
 import unittest
 from unittest.mock import patch
 
+from oc_openai.acceptance import run_attended
 from oc_openai.cli import (
     MODEL, PROPOSAL_MARKER, ConnectionBinding, ConnectionStatus, Reason, RouteUnavailable, SavedProfile,
     Stage, StreamTerminal, WorkerEvidence, run,
@@ -20,6 +21,7 @@ from oc_openai.cli import (
 BINDING = ConnectionBinding("a" * 43, "b" * 43, MODEL, "personal", "e" * 43)
 COMPLETE = WorkerEvidence(True, True, True, True)
 CANARY = "private-fixture-content"
+SIGN_IN_LINK = "http://127.0.0.1:12345/start/synthetic-browser-start"
 
 
 class FakeTerminal:
@@ -51,6 +53,8 @@ class FakeBackend:
         self.calls = []
         self.revoked = True
         self.preflight_error = None
+        self.browser_starts = 0
+        self.browser_available = True
         self.local_status = ConnectionStatus((SavedProfile("personal", True),), "personal")
 
     def connection(self):
@@ -66,8 +70,14 @@ class FakeBackend:
         self.calls.append(("proof", approval))
         return self.evidence
 
-    def connect(self, label):
+    def connect(self, label, *, handoff=None):
         self.calls.append(("connect", label))
+        if handoff is not None:
+            handoff(SIGN_IN_LINK, self.open_browser)
+
+    def open_browser(self):
+        self.browser_starts += 1
+        return self.browser_available
 
     def active_label(self):
         return self.status().active
@@ -78,7 +88,7 @@ class FakeBackend:
     def select(self, label):
         self.calls.append(("select", label))
 
-    def require_acceptance(self):
+    def require_acceptance(self, proposal):
         if self.preflight_error is not None:
             raise self.preflight_error
 
@@ -104,7 +114,7 @@ class OpenAICommandTests(unittest.TestCase):
             return True
 
         terminal = FakeTerminal(first, second)
-        self.assertEqual(self.call(terminal, "accept"), 0)
+        self.assertEqual(run_attended(terminal, backend_factory=lambda: self.backend), 0)
         self.assertEqual([kind for kind, _ in self.backend.calls], ["inference", "proof"])
         (_, request), (_, proof) = self.backend.calls
         self.assertEqual((request.stage, proof.stage), (Stage.ORCHESTRATOR, Stage.WORKER))
@@ -126,7 +136,7 @@ class OpenAICommandTests(unittest.TestCase):
             with self.subTest(approvals=approvals):
                 self.backend.calls.clear()
                 terminal = FakeTerminal(*approvals)
-                self.assertEqual(self.call(terminal, "accept"), 1)
+                self.assertEqual(run_attended(terminal, backend_factory=lambda: self.backend), 1)
                 self.assertEqual([kind for kind, _ in self.backend.calls], effects)
 
     def test_connection_change_during_each_approval_voids_it(self):
@@ -150,7 +160,7 @@ class OpenAICommandTests(unittest.TestCase):
 
                     approvals = (reconnect,) if target == 1 else (True, reconnect)
                     terminal = FakeTerminal(*approvals)
-                    self.assertEqual(self.call(terminal, "accept"), 1)
+                    self.assertEqual(run_attended(terminal, backend_factory=lambda: self.backend), 1)
                     self.assertEqual([kind for kind, _ in self.backend.calls], effects)
 
     def test_missing_terminal_or_invalid_arguments_never_construct_backend(self):
@@ -163,7 +173,7 @@ class OpenAICommandTests(unittest.TestCase):
             ("unsupported",),
         ]:
             with self.subTest(argv=argv):
-                terminal = FakeTerminal(attended=False)
+                terminal = FakeTerminal(attended=argv == ("accept",))
                 self.assertEqual(run(argv, terminal=terminal, backend_factory=forbidden_factory), 2)
 
     def test_rejects_wrong_response_and_redacts_route_failures(self):
@@ -178,7 +188,7 @@ class OpenAICommandTests(unittest.TestCase):
                 self.backend.calls.clear()
                 self.backend.response = response
                 terminal = FakeTerminal(True)
-                self.assertEqual(self.call(terminal, "accept"), result)
+                self.assertEqual(run_attended(terminal, backend_factory=lambda: self.backend), result)
                 self.assertEqual([kind for kind, _ in self.backend.calls], ["inference"])
                 self.assertEqual(len(terminal.prompts), 1)
                 self.assertNotIn(CANARY, "\n".join(terminal.output))
@@ -188,7 +198,7 @@ class OpenAICommandTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.backend.evidence = replace(COMPLETE, **{field: False})
                 terminal = FakeTerminal(True, True)
-                self.assertEqual(self.call(terminal, "accept"), 1)
+                self.assertEqual(run_attended(terminal, backend_factory=lambda: self.backend), 1)
                 self.assertNotIn("completed the scratch-file proof", "\n".join(terminal.output))
 
     def test_connect_status_disconnect_have_no_inference(self):
@@ -211,6 +221,40 @@ class OpenAICommandTests(unittest.TestCase):
             "only after separate authorization",
         ):
             self.assertIn(fact, disclosure)
+
+    def test_manual_link_instructions_precede_consent_and_only_manual_skips_browser(self):
+        terminal = FakeTerminal()
+
+        def approve():
+            self.assertIn("copy the sign-in link", "\n".join(terminal.output))
+            self.assertIn("Keep this terminal open", "\n".join(terminal.output))
+            self.assertNotIn(SIGN_IN_LINK, "\n".join(terminal.output))
+            self.assertFalse(self.backend.calls)
+            return True
+
+        terminal.approvals.append(approve)
+        self.assertEqual(self.call(terminal, "connect", "work", "--no-browser"), 0)
+        self.assertIn(SIGN_IN_LINK, "\n".join(terminal.output))
+        self.assertEqual(self.backend.browser_starts, 0)
+
+        self.backend.browser_available = False
+        terminal = FakeTerminal(True)
+        self.assertEqual(self.call(terminal, "connect", "work"), 0)
+        output = "\n".join(terminal.output)
+        self.assertLess(output.index(SIGN_IN_LINK), output.index("Could not start the default browser"))
+        self.assertEqual(self.backend.browser_starts, 1)
+
+    def test_lost_foreground_prevents_link_presentation_and_browser_start(self):
+        terminal = FakeTerminal()
+
+        def lose_foreground():
+            terminal.interactive = False
+            return True
+
+        terminal.approvals.append(lose_foreground)
+        self.assertEqual(self.call(terminal, "connect", "work"), 1)
+        self.assertNotIn(SIGN_IN_LINK, "\n".join(terminal.output))
+        self.assertEqual(self.backend.browser_starts, 0)
 
     def test_status_reports_local_connection_without_model_qualification(self):
         self.backend.binding = replace(BINDING, model="unqualified-model")
@@ -248,7 +292,7 @@ class OpenAICommandTests(unittest.TestCase):
     def test_placement_failure_precedes_both_prompts_and_all_effects(self):
         self.backend.preflight_error = RouteUnavailable(Reason.PLACEMENT)
         terminal = FakeTerminal()
-        self.assertEqual(self.call(terminal, "accept"), 1)
+        self.assertEqual(run_attended(terminal, backend_factory=lambda: self.backend), 1)
         self.assertEqual(terminal.prompts, [])
         self.assertEqual(self.backend.calls, [])
         self.assertIn("managed worker prerequisites", terminal.output[0])
@@ -256,11 +300,12 @@ class OpenAICommandTests(unittest.TestCase):
     def test_unavailable_diagnostics_are_projected_from_fixed_reasons(self):
         terminal = FakeTerminal(True)
         self.backend.response = RouteUnavailable(Reason.EXPOSURE)
-        self.assertEqual(self.call(terminal, "accept"), 1)
+        self.assertEqual(run_attended(terminal, backend_factory=lambda: self.backend), 1)
         self.assertIn("Further inference is suspended.", "\n".join(terminal.output))
 
     def test_terminal_rejects_eof_partial_approval_and_extra_input(self):
-        for source in (b"", b"yes", b"yes please\n", b"yes\n"):
+        cases = (b"", b"\n", b"n\n", b"no\n", b"yes", b"yes please\n", b"y\n", b"Y\n", b"YeS\n")
+        for source in cases:
             with self.subTest(source=source):
                 read_fd, write_fd = os.pipe()
                 os.write(write_fd, source)
@@ -268,7 +313,8 @@ class OpenAICommandTests(unittest.TestCase):
                 with os.fdopen(read_fd) as reader:
                     terminal = StreamTerminal(reader, io.StringIO(), io.StringIO())
                     with patch.object(terminal, "attended", return_value=True), patch("oc_openai.cli.termios.tcflush"):
-                        self.assertEqual(terminal.confirm("Approve?"), source == b"yes\n")
+                        self.assertEqual(terminal.confirm("Approve?"), source.lower() in (b"y\n", b"yes\n"))
+                        self.assertEqual(terminal.writer.getvalue(), "Approve? [y/N]\n")
 
     def test_controlling_foreground_tty_is_required_and_typeahead_cannot_approve_stage_two(self):
         other_master, other_slave = os.openpty()
@@ -298,6 +344,9 @@ class OpenAICommandTests(unittest.TestCase):
                 first = terminal.confirm("First?")
                 second = terminal.confirm("Second?")
                 terminal.write(f"Approvals: {first} {second}")
+                third = terminal.confirm("Overlong?")
+                queued = bool(select.select([stdin], [], [], 0)[0])
+                terminal.write(f"Overlong approval: {third}, queued input: {queued}")
                 result = 0
             except BaseException:
                 traceback.print_exc(file=stderr)
@@ -322,11 +371,14 @@ class OpenAICommandTests(unittest.TestCase):
 
         reaped = False
         try:
-            receive(b"First? Type yes to approve.")
-            os.write(master, b"yes\nyes\n")
-            receive(b"Second? Type yes to approve.")
-            os.write(master, b"no\n")
+            receive(b"First? [y/N]")
+            os.write(master, b"Y\nyes\n")
+            receive(b"Second? [y/N]")
+            os.write(master, b"\n")
             receive(b"Approvals: True False")
+            receive(b"Overlong? [y/N]")
+            os.write(master, b"yes and extra input\n")
+            receive(b"Overlong approval: False, queued input: False")
             _, status = os.waitpid(child, 0)
             reaped = True
             self.assertEqual(os.waitstatus_to_exitcode(status), 0)

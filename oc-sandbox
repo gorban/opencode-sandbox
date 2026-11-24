@@ -45,7 +45,7 @@ usage() {
   cat <<EOF
 Usage: ${0##*/} [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
-       ${0##*/} openai {connect LABEL|select LABEL|status|disconnect|accept}
+       ${0##*/} openai {connect LABEL [--no-browser]|select LABEL|status|disconnect}
 
   (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
               OpenCode. Safe to run repeatedly; only missing/changed pieces are touched.
@@ -130,13 +130,15 @@ trusted_file() { # resolve repository helpers without following a path into the 
 
 if [[ ${1:-} == openai ]]; then
   case $#:${2:-} in
-    2:status|2:disconnect|2:accept) ;;
-    3:connect|3:select)
+    2:status|2:disconnect) ;;
+    3:connect|3:select|4:connect)
+      [[ $# != 4 || $4 == --no-browser ]] ||
+        die "usage: oc-sandbox openai connect LABEL [--no-browser]"
       LC_ALL=C
       [[ $3 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] ||
         die "OpenAI labels must be 1 to 32 ASCII letters, numbers, underscores or hyphens, starting with a letter or number"
       ;;
-    *) die "usage: oc-sandbox openai {connect LABEL|select LABEL|status|disconnect|accept}" ;;
+    *) die "usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|disconnect}" ;;
   esac
   # Check the system account's sandbox too, independently of caller HOME.
   account_entry=$(/usr/bin/getent passwd "$EUID") || die "cannot verify the OpenAI workstation account"
@@ -148,7 +150,7 @@ if [[ ${1:-} == openai ]]; then
   [[ $launcher == /* ]] || launcher=$CALLER_PHYSICAL/$launcher
   [[ $(trusted_path "$launcher") == "$SCRIPT_REAL" && -f $SCRIPT_REAL ]] ||
     die "refusing an unsafe OpenAI launcher path"
-  helper=$SCRIPT_DIR/oc-openai-accept.py
+  helper=$SCRIPT_DIR/oc-openai.py
   [[ $(trusted_file "$helper") == "$helper" && ! -L $helper ]] ||
     die "refusing an unsafe OpenAI helper path"
   for source_file in "$SCRIPT_REAL" "$helper"; do

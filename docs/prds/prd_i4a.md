@@ -8,8 +8,37 @@ Parent: [I4 model gateway](prd_i4.md) · related: [I3a worker isolation](prd_i3a
 - [ ] Extend the accepted route to the Chromium and Postgres app workflow.
   Qualify its separate service placement and job-local credentials before
   admitting the broader developer tools and workspace.
+- [ ] Reclaim abandoned local registration directories. Failed sign-in can
+  free its registry slot while leaving the private state directory behind.
+  Review cleanup under the existing Connect lifetime and registry locks.
+  Remove only verified, unreferenced directories with no active attempt,
+  retained provider registration or possible token exchange, unsettled
+  revocation, or worker cleanup. Preserve uncertain state for recovery.
+  Test failed sign-in, cancellation, restart recovery, and a concurrent
+  connect or disconnect with synthetic credentials in a scratch store.
+- [ ] Define recovery for a possible upstream send without verified usage.
+  Preserve the original request reservation and its unresolved outcome.
+  The maintainer chose one attended workstation diagnostic with the full
+  outstanding reservation included in its disclosed exposure. The
+  original run cannot continue from the diagnostic.
+- [ ] Qualify delegated diagnostics from a protected controller. The
+  workstation helper owns consent and provider credentials. Expose only the
+  trigger for an already-approved request and its redacted result.
 
 ## Gate 1 walkthrough
+
+After foreground consent with `[y/N]`, display a single-use browser-start
+URL on the existing loopback listener. It redirects only to the host-built
+OpenAI authorization request while the exact attempt remains current.
+The optional default opener uses a private temporary page. `--no-browser`
+uses the loopback URL without creating that page. Both entry paths share
+the same callback and token exchange. Keep inference approvals separate
+and flush terminal typeahead before each prompt.
+
+The [Tauri dashboard](prd_m3b.md) can later trigger this typed workstation
+sign-in flow. Open provider authorization in the external browser and
+return connection status to the dashboard. The daemon owns the transaction
+and credential store. [OAuth for native apps](https://www.rfc-editor.org/rfc/rfc8252.html#section-8.12)
 
 Use the official open-source Sign in with ChatGPT dynamic registration and
 the public Responses API for a free local application operated by one user.
@@ -25,14 +54,18 @@ into any worker. [Sign-in guide](https://developers.openai.com/siwc/token-sharin
 ### CLI and control lane
 
 - Reserve the exact leading `oc-sandbox openai` subcommand with `connect`,
-  `status`, `disconnect`, `select`, and `accept`. Connect and select take one
+  `status`, `disconnect`, and `select`. Connect and select take one
   bounded local registration label. Reject extra flags and paths before
   any effects. Dispatch to trusted installed helper after source and
   sandbox path guards but before legacy setup. Keep all other launcher
   entry points unchanged. The first release qualifies the existing
   devbox/host-spawn placement only. A reviewer can call the worktree's
   actual launcher; do not replace the installed symlink as part of review.
-- `accept` is one foreground terminal sequence. Present data disclosure and
+- The [attended pytest case](../../tests/e2e/live/test_openai_proof.py) runs
+  one foreground terminal sequence in an isolated workstation process.
+  Require explicit live opt-in and verify the checkout and driver before
+  spawn. Reap the driver after its cleanup on terminal interruption.
+  Present data disclosure and
   usage, require direct operator consent, then send one fixed harmless GPT
   input from the workstation. It asks for one exact text marker proposing a
   disposable worker proof. The host recognizes that marker only after
@@ -177,6 +210,265 @@ into any worker. [Sign-in guide](https://developers.openai.com/siwc/token-sharin
   sidecars and remote placement have separate acceptance before use.
 
 ### Proof and review
+
+The maintainer reported a successful attended `connect personal --no-browser`
+with the one-time loopback link. Workstation inference and the managed
+OpenCode worker still require their own live acceptance.
+
+The first attended pytest run reached the workstation approval and recorded
+one possible upstream send. It stopped without verified terminal usage,
+before the worker approval. The installation ledger retains that reservation.
+
+The attended one-shot diagnostic reached response handling and failed event
+stream validation. Both the original reservation and the diagnostic receipt
+have unknown usage. The terminal message did not distinguish the specific
+parser check. The installation has spent its one-shot diagnostic and ordinary
+inference remains on hold.
+
+- [ ] Qualify the SSE framing updates against the live route. Synthetic
+  fixtures cover CR, LF and CRLF, one leading UTF-8 BOM, two explicit names
+  for a terminal `[DONE]` after completion, complete trailing comments,
+  and typed JSON with either generic SSE event name. Completion still needs
+  valid HTTP termination and verified usage. Independent offline comparison
+  also identified unqualified heartbeat frames and model aliases. The
+  retained live evidence does not identify any of these forms.
+
+#### One-shot diagnostic after an unsettled send
+
+The historical request used `store: false` and no provider request ID or
+verified usage was captured. Keep the original ledger bytes and unknown
+outcome. The recovery test is eligible only for an installation with exactly
+one unresolved workstation proposal and the same active connection
+generation and selection. This first mode has one recovery opportunity per
+installation.
+
+1. Require both explicit pytest switches, the reviewed local checkout and a
+   foreground workstation terminal. Check the exact original row and the
+   absence of any diagnostic receipt under the installation exposure lock.
+   Check the foreground request lock before offering approval.
+2. Present the possible exposure as the original full reservation plus one
+   additional reservation, for a combined 1,844,000 input and 256,000 output
+   tokens. The provider determines actual usage and credits. Obtain new
+   operator confirmation for one fixed workstation diagnostic.
+3. Recheck the selected connection and exact old and new slots before
+   dispatch. Under the exposure lock, durably write the new diagnostic
+   receipt before the first possible request byte. A failure after this
+   point consumes the one opportunity. Use the same fixed payload,
+   authenticated provider, and strict terminal usage checks.
+4. Settle only the diagnostic with its own verified usage. Keep any reported
+   overage. On restart, the receipt continues to block repeat diagnostics.
+   Ordinary inference stays suspended while the original outcome is unknown,
+   and the diagnostic has no worker phase. A malformed or orphaned receipt
+   keeps admission closed.
+
+#### Final SSE diagnostic
+
+After the offline framing changes, allow one final workstation-only request
+through the separate `--recover-stream-live` pytest mode. Check that the
+original and first diagnostic are distinct, remain unknown, and match
+the current selected registration. Show both unknown outcomes, all three
+reservations (2,766,000 input and 384,000 output tokens), and the usage and
+credit settings notice. One fresh foreground approval covers one fixed
+proposal. Seal the third receipt before the first possible request byte
+   and retain both earlier files byte-for-byte. Only this request's verified
+terminal usage can settle its receipt. Any third receipt keeps ordinary
+inference on hold. A successful workstation diagnostic has no worker phase.
+On a stream failure, offer one structural line with a fixed rejection code,
+bounded counters and allowlisted event names. The completion and sentinel
+flags describe observed wire structure. Verified usage still needs the
+full settlement checks. Response content stays out of the diagnostic.
+
+The attended stream diagnostic reached HTTP 200 and failed at the media-type
+check before reading response body bytes. The content-type bucket was
+`other`. All three linked reservations still have unknown usage. Use
+closed header and bounded body-prefix categories to diagnose a future
+approved request. An SSE-like prefix by itself cannot establish completion.
+
+#### Delegated diagnostics
+
+Codex can run the offline and real-Podman fixture tests from devbox. To
+delegate one live request, a foreground operator starts a short-lived trusted
+workstation helper. The consent binds the active registration and selection,
+the three existing receipts, one fixed request, the exact reviewed executable,
+and expiry. Show the aggregate reservation for all four possible requests,
+3,688,000 input and 512,000 output tokens, and the usage and credit settings
+notice. The helper rechecks that binding and writes the new receipt durably
+before the first possible POST byte. An unused permit expires when the
+helper exits. A used permit cannot be triggered again.
+
+The test controller receives only a trigger socket and a redacted result.
+A synthetic devbox prototype used Bubblewrap with only that socket mounted.
+It triggered once while protected synthetic state and approval files were
+inaccessible. The fixture refused minting, replay, expiration, revocation,
+and a changed binding. Qualify the real consent and credential owner,
+receipt durability and execution from the actual restricted controller
+before live use. The existing unrestricted devbox tool runner
+shares the workstation account; its access permissions do not provide
+independent operator authority.
+
+#### One approval for a full recovery proof
+
+- [ ] Qualify one dedicated recovery run after the three linked unknown
+  workstation receipts. Carry one foreground approval through the fixed
+  workstation proposal and, only after verified usage and the expected
+  marker, one disposable OpenCode worker with an initial turn and one tool
+  continuation. Reserve each possible send before it can reach OpenAI.
+  Retain the three earlier receipts and the hold on ordinary inference.
+
+The approval is for this foreground process, selected registration,
+generation and selection epoch, model, exact payloads, and five-minute
+dispatch window. Show the three historical reservations and up to three new
+ones (5,532,000 input and 768,000 output tokens in total), the usage and credit
+settings notice, and the absence of a verified currency ceiling. Reuse the
+approval for the worker phases in that process. Process exit, revocation, or
+a source revision change requires a new review of any further live attempt.
+
+```text
+preflight the exact linked unknown receipts and absent recovery receipt
+show the fixed sequence and combined exposure; ask once
+recheck selection and receipt bindings; open the five-minute window
+for proposal, worker initial, and worker continuation in that order:
+    check phase authorization, deadline, durable predecessor and lease
+    write the exact new phase reservation under the exposure lock before POST
+    settle that phase only with authenticated complete response and verified usage
+    stop on any uncertain send, overage, payload mismatch or lease loss
+verify native tool delivery, exact scratch bytes and container cleanup
+```
+
+Use a separate versioned receipt for the new phases. The first possible
+send consumes the run even if the helper dies. Each later phase must
+belong to the same run and follow verified, in-bound usage for the previous
+phase. Keep the original receipts byte-for-byte.
+
+The diagnostic evidence for the prior HTTP 200 stops at the media check.
+The recovery proof may use a bounded compatibility check for an absent
+media type or a single well-formed plain-text or octet-stream type.
+Replay inspected bytes into the strict SSE parser only on a positive SSE
+prefix. Require authenticated direct TLS, strict HTTP framing, matching
+response identity and model, completion, usage, and exact marker or tool
+evidence as before. Ambiguous headers and JSON, markup, and other bodies
+stay rejected. Publish only fixed categories and counters on failure.
+
+A loopback comparison with the OpenAI Python SDK used the same endpoint
+path and request JSON with a synthetic token. Both clients parsed standard
+SSE. The SDK accepted the same SSE fixture served as plain text, which the
+ordinary connector rejected. The recovery connector parsed it with closed
+media evidence. The SDK sent `Accept: application/json` and offered
+compression. The connector requests SSE and identity encoding. This
+comparison leaves the historical provider body and header unknown.
+
+Verify historical receipt tampering and replay, same-run phase sequence,
+terminal usage, deadlines, revocation, media compatibility and rejection,
+and one-prompt success and failure. Qualify the complete proof first with
+the synthetic provider and pinned Podman containers.
+
+The security and PR-style reviews cleared the walkthrough and the exact
+local proof source digest
+`4cbcf31fc1e5c740c2fe5e2ea27b4a1f71c542c0b4f63ac09477af8370570118`
+for one foreground run after verification. Devbox passed 169 OpenAI tests,
+including the pinned Podman worker and synthetic provider, and 246 host
+security checks. Portable CI and the pinned quality checks passed.
+Real subscription acceptance remains open until the live run succeeds.
+
+The attended run for that digest verified the workstation marker and
+settled both the workstation and worker-initial requests. In both phases
+the provider sent valid SSE without a Content-Type header. The worker
+reported a generic failure before a continuation was reserved. Devbox
+showed no owned proof containers or private proof directories afterward.
+Preserve the complete accounting record of this attempt.
+
+#### Worker-only follow-up
+
+- [ ] Qualify a fresh worker from the verified workstation evidence and
+  the settled initial request of the prior attempt. Admit one initial
+  request and, only after the approved file and delivery receipt verify,
+  one stateless tool continuation. Preserve all prior receipts.
+
+Use the same selected registration, generation, and selection epoch. Check
+the exact prior proof source digest and settled phases, the absence of a
+prior continuation, and the absence of a follow-up receipt. One fresh
+foreground approval binds the exact new snapshot and those two fixed
+requests for five minutes. The two new requests reserve up to 1,844,000
+input and 256,000 output tokens. Counting the five previous reservations
+in full, the total is 6,454,000 input and 896,000 output tokens. No verified
+currency ceiling is available. Retain the installation hold on ordinary
+inference. One possible send spends the follow-up opportunity.
+
+The maintainer delegated this diagnostic run to the local workstation
+operator for this chat. The one-off reviewed developer launcher pins its
+own execution, the package source, the selected binding, and the prior
+receipts. Its supervisor can retire the pinned worker if the operator
+process exits, and each send checks that supervisor's lifetime. The
+launcher digest identifies the code. The maintainer's message supplies
+the operator authority. The ordinary CLI and pytest consent path still
+require a foreground operator.
+
+Expose only fixed worker failure categories to the workstation operator,
+covering validation, projection, relay delivery, native tool evidence,
+and continuation admission. Preserve cleanup and retirement failure
+precedence. The first run did not retain provider payloads, so the exact
+worker validation failure is unknown. Synthetic tests reproduced two
+documented response variants the current validator rejects: a completed
+tool call without an assistant preamble and a completed response whose
+tool call omits the per-item status. The worker proof still requires the
+exact approved write, verified file bytes and receipt, and a final model
+message. An absent preamble yields no synthesized model text. Restrict
+accepted reasoning replay to authenticated, matched, completed, bounded
+ciphertext in provider order.
+
+The first delegated worker-only run verified the initial request usage
+within its bounds and reported an upstream event validation failure.
+There was no continuation reservation, and devbox verified cleanup.
+The next reviewed allowance pins that settled worker receipt as well as
+the four earlier files. It accepts a closed set of bounded queue and
+heartbeat events and separately reports event ordering, identity, label,
+type, annotation, output-item and size failures. Exactly two new requests
+are possible, with the same five-minute authority window. Across the
+three historical unknowns, three settled requests and two possible new
+requests, the full reservation ceilings total 7,376,000 input and
+1,024,000 output tokens.
+
+The delegated event-compatibility run settled its initial usage and
+reported an unknown event. It sent no continuation and removed its
+owned resources. The next diagnostic is scoped to the exact initial
+request and the event-type evidence needed to distinguish a new
+provider event from a worker-validation error. The diagnostic does
+not launch a worker or call a tool. It consumes one dedicated
+reservation after independently matching all six predecessor files and
+the active selection. No request or response content enters the
+diagnostic output.
+
+The standalone trace settled its one initial request. The private
+fingerprint matched `response.metadata` locally. Its top-level response
+ID matched the active response, and the sequence number was valid. The
+checks found absent nested response, output item, error and incomplete
+details. The [OpenAI Codex stream
+reader](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/sse/responses.rs)
+handles that event separately from output items. Its [event
+fixture](https://github.com/openai/codex/blob/main/codex-rs/core/tests/common/responses.rs)
+gives the expected envelope. Qualification requires a targeted
+metadata check that preserves moderation and review stops and keeps
+metadata out of the worker and the continuation.
+
+The delegated worker with the reviewed envelope handler settled its
+initial request and reached the moderation-content check. The broker
+reported unsupported moderation metadata. The continuation remained
+unreserved and devbox verified cleanup. The diagnostic establishes
+the field that needs qualification while leaving the exact payload
+shape and any affirmative policy signal unverified.
+
+The reviewed standalone moderation trace settled one initial request.
+The bounded summary found a prompt classification with one unblocked
+output, no captured affirmative block or review flag, and extra fields
+at the moderation root. The result does not establish an all-clear.
+The provider's published client treats the moderation object as a
+notification and has a separate action-bound Guardian check. The
+available contract gives no tool-release rule for the observed shape.
+Keep the worker hold and leave live acceptance open until that rule
+can be established. Devbox confirmed zero remaining proof containers
+and private run directories. The exact diagnostic package passed
+184 OpenAI tests, 246 host security checks, portable CI and pinned
+quality checks.
 
 Test CLI dispatch and rejection before legacy effects, exact scoped
 operator consent, wrong/replayed callbacks and ID tokens, credential

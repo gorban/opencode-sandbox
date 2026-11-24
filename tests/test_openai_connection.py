@@ -14,8 +14,9 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
-from oc_openai.connection import (AUTHORIZE, Binding, Connection, ConnectionError,
+from oc_openai.connection import (AUTHORIZE, CONNECT_SECONDS, Binding, Connection, ConnectionError,
                                   DIRECT_SCOPE, INITIAL_CLIENT, RESOURCE)
+from oc_openai.profiles import ProfileError
 from oc_openai.responses import API_HOST, AUTH_HOST, DISCOVERY, JWKS, MODELS, TOKEN
 
 
@@ -233,6 +234,156 @@ class ConnectionTests(unittest.TestCase):
                 self.assertTrue(self.browser.finished.wait(2))
                 if self.browser.assertions:
                     raise self.browser.assertions
+
+    def test_manual_handoff_uses_same_loopback_and_survives_unavailable_opener(self):
+        for opener in ("manual", "unavailable", "started"):
+            with self.subTest(opener=opener):
+                automatic = opener != "manual"
+                if automatic:
+                    self.assertTrue(self.connection.disconnect())
+                    self.browser.finished.clear()
+                launches = []
+                link, ready = [], threading.Event()
+
+                def open_browser(uri):
+                    launches.append(uri)
+                    if opener == "unavailable":
+                        raise ConnectionError("host_browser_unavailable")
+
+                def handoff(uri, launch):
+                    if automatic:
+                        self.assertEqual(launch(), opener == "started")
+                    link.append(urlsplit(uri))
+                    ready.set()
+
+                self.connection._browser = open_browser
+                with patch("oc_openai.connection._check_browser_placement"):
+                    worker, result = self.start(lambda: self.connection.connect(handoff=handoff))
+                    self.assertTrue(ready.wait(2), result)
+                    self.assertEqual(len(list(self.state.glob(".browser-*.html"))), int(automatic))
+                    start = link[0]
+                    self.assertEqual((start.scheme, start.hostname, start.query, start.fragment),
+                                     ("http", "127.0.0.1", "", ""))
+                    for method, path, headers in (
+                        ("GET", "/start/incorrect", {}),
+                        ("GET", "/" + start.path, {}),
+                        ("GET", start.path + "?extra=1", {}),
+                        ("GET", start.path, {"Host": "invalid.example"}),
+                        ("GET", start.path, {"Origin": "https://invalid.example"}),
+                        ("GET", start.path, {"Sec-Fetch-Site": "cross-site"}),
+                        ("POST", start.path, {}),
+                        ("HEAD", start.path, {}),
+                    ):
+                        status, response_headers, body = self.request_start(start, method, path, headers)
+                        self.assertIn(status, (404, 501))
+                        self.assertNotIn("Location", response_headers)
+                        self.assertNotIn(start.path.encode(), body)
+                    status, headers, body = self.request_start(start, headers={"Sec-Fetch-Site": "none"})
+                    self.assertEqual((status, body), (303, b""))
+                    self.assertEqual(headers["Cache-Control"], "no-store")
+                    self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+                    self.browser.last = urlsplit(headers["Location"])
+                    self.assertEqual(self.browser.last.geturl().split("?")[0], AUTHORIZE)
+                    self.assertNotIn("Location", self.request_start(start)[1])
+                    self.browser.send()
+                    worker.join(2)
+                    self.assertIsNone(self.browser.assertions)
+                    self.assertEqual(len(result), 1)
+                    self.assertIsInstance(result[0], Binding)
+                self.assertEqual(len(launches), int(automatic))
+                self.assertEqual(list(self.state.glob(".browser-*.html")), [])
+
+    def request_start(self, target, method="GET", path=None, headers=None):
+        with contextlib.closing(http.client.HTTPConnection(target.hostname, target.port, timeout=2)) as client:
+            client.request(method, path or target.path, headers=headers or {})
+            response = client.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+
+    def test_browser_start_rechecks_registry_authorization_before_redirect(self):
+        allowed, ready = threading.Event(), threading.Event()
+        allowed.set()
+        link = []
+
+        @contextlib.contextmanager
+        def authorize():
+            if not allowed.is_set():
+                raise ProfileError("profile_stale")
+            yield
+
+        def handoff(uri, _launch):
+            link.append(urlsplit(uri))
+            ready.set()
+
+        with patch("oc_openai.connection._check_browser_placement"):
+            worker, result = self.start(lambda: self.connection.connect(handoff=handoff, authorization=authorize))
+            self.assertTrue(ready.wait(2), result)
+            allowed.clear()
+            status, headers, _body = self.request_start(link[0])
+            self.assertEqual(status, 410)
+            self.assertNotIn("Location", headers)
+            worker.join(2)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], ProfileError)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_browser_start_cannot_redirect_after_expiry(self):
+        link, ready = [], threading.Event()
+
+        def handoff(uri, _launch):
+            link.append(urlsplit(uri))
+            ready.set()
+
+        with patch("oc_openai.connection._check_browser_placement"):
+            worker, result = self.start(lambda: self.connection.connect(handoff=handoff))
+            self.assertTrue(ready.wait(2), result)
+            self.now += CONNECT_SECONDS
+            try:
+                status, headers, _body = self.request_start(link[0])
+            except OSError:
+                pass  # The expiry watcher may already have shut down the listener.
+            else:
+                self.assertEqual(status, 410)
+                self.assertNotIn("Location", headers)
+            worker.join(2)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], ConnectionError)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_failed_handoff_cleans_document_before_browser_or_exchange(self):
+        uris = []
+
+        def refuse(uri, _launch):
+            uris.append(uri)
+            raise RuntimeError("fixture presentation failed")
+
+        with patch("oc_openai.connection._check_browser_placement"), self.assertRaisesRegex(
+            RuntimeError, "fixture presentation failed",
+        ):
+            self.connection.connect(handoff=refuse)
+        self.assertEqual(len(uris), 1)
+        self.assertEqual(list(self.state.glob(".browser-*.html")), [])
+        with self.assertRaises(OSError):
+            self.request_start(urlsplit(uris[0]))
+        self.assertFalse(self.browser.ready.is_set())
+        self.assertEqual(self.transport.calls, [])
+
+    def test_manual_and_automatic_handoff_reject_unqualified_workstation(self):
+        for automatic in (False, True):
+            with self.subTest(automatic=automatic):
+                presented = []
+
+                def handoff(uri, launch):
+                    presented.append(uri)
+                    if automatic:
+                        self.fail("unqualified automatic handoff could launch the browser")
+                    self.fail("unqualified manual handoff presented a link")
+
+                error = ConnectionError("host_browser_placement_unavailable")
+                with patch("oc_openai.connection._check_browser_placement", side_effect=error):
+                    self.assert_code(error.code, lambda: self.connection.connect(handoff=handoff))
+                self.assertEqual(presented, [])
+                self.assertEqual(self.transport.calls, [])
+                self.assertFalse(self.state.exists())
 
     def test_connect_catalog_and_responses(self):
         self.browser.invalid = True

@@ -1,11 +1,12 @@
 """Select one workstation registration for the fixed attended acceptance."""
 
+from contextlib import contextmanager
 from pathlib import Path
 
 from .cli import ConnectionStatus, Reason, RouteUnavailable, SavedProfile
 from .connection import Connection, ConnectionError
 from .exposure import ExposureError, ExposureLedger
-from .live import WorkstationBackend, _mapped_connection_error
+from .live import WorkstationBackend, _mapped_connection_error, _mapped_exposure_error
 from .profiles import Profiles
 
 
@@ -71,8 +72,8 @@ class ProfileBackend:
             self.ledger.require_quiescent()
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
-        except ExposureError:
-            raise RouteUnavailable(Reason.EXPOSURE) from None
+        except ExposureError as error:
+            raise _mapped_exposure_error(error) from None
 
     def _select_ready(self, previous, target):
         self._require_idle(previous, target)
@@ -84,7 +85,7 @@ class ProfileBackend:
     def select(self, label):
         self.profiles.select(label, self._select_ready)
 
-    def connect(self, label):
+    def connect(self, label, *, handoff=None):
         if not self._reviewed:
             raise RouteUnavailable(Reason.QUALIFICATION)
         try:
@@ -96,9 +97,9 @@ class ProfileBackend:
                 abandoned_attempt=True,
             ),
         ) as candidate:
-            self._connect_candidate(candidate)
+            self._connect_candidate(candidate, handoff)
 
-    def _connect_candidate(self, candidate):
+    def _connect_candidate(self, candidate, handoff):
         connection = self._connection(candidate.profile.directory)
         try:
             def publish(client_id):
@@ -108,7 +109,7 @@ class ProfileBackend:
             if saved is None:
                 connection.connect(
                     installation_host=candidate.profile.host_id, publication=publish,
-                    authorization=lambda: self.profiles.authorize(candidate),
+                    authorization=lambda: self.profiles.authorize(candidate), handoff=handoff,
                 )
             else:
                 client_id, binding = saved
@@ -154,15 +155,33 @@ class ProfileBackend:
             raise _mapped_connection_error(errors[0]) from None
         return confirmed
 
-    def require_acceptance(self):
+    def require_acceptance(self, proposal, *, recovery=None):
         if not self._reviewed:
             raise RouteUnavailable(Reason.QUALIFICATION)
-        self._require_selected().require_acceptance()
+        if recovery is not None:
+            with self.profiles.foreground():
+                return self._require_selected().require_acceptance(proposal, recovery=recovery)
+        return self._require_selected().require_acceptance(proposal)
 
-    def propose(self, approval):
+    def propose(self, approval, *, diagnostic=None):
         with self.profiles.foreground():
-            return self._require_selected().propose(approval)
+            return self._require_selected().propose(approval, diagnostic=diagnostic)
 
     def prove(self, approval):
         with self.profiles.foreground():
             return self._require_selected().prove(approval)
+
+    @contextmanager
+    def recovery_proof(self, approval, source, *, worker_only=False, after_retry=False,
+                       trace_only=False, after_trace=False, moderation_trace=False):
+        if not self._reviewed:
+            raise RouteUnavailable(Reason.QUALIFICATION)
+        with self.profiles.foreground():
+            proof = self._require_selected().recovery_proof(
+                approval, source, worker_only=worker_only, after_retry=after_retry,
+                trace_only=trace_only, after_trace=after_trace, moderation_trace=moderation_trace,
+            )
+            try:
+                yield proof
+            finally:
+                proof.ledger.close()

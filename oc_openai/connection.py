@@ -14,12 +14,14 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .connection_job import LeaseHostProof, PhysicalHost, WorkerLease
 from .connection_state import ConnectionError, Store
+from .profiles import ProfileError
 from .responses import AUTH_HOST, API_HOST, DISCOVERY, JWKS, MODELS, TOKEN
 from .responses import Cancellation, OpenAITransport, response_error
 
@@ -28,6 +30,7 @@ ISSUER = "https://auth.openai.com"
 AUTHORIZE = ISSUER + "/api/accounts/authorize"
 INITIAL_CLIENT = "dynamic_agent_client"
 CALLBACK = "/auth/callback"
+BROWSER_START = "/start/"
 DIRECT_SCOPE = "chatgpt.tokens.use.direct"
 SCOPES = f"openid profile email offline_access resource.invoke {DIRECT_SCOPE}"
 CONNECT_SECONDS = 180
@@ -156,9 +159,45 @@ class _Callback(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def send_error(self, code, message=None, explain=None):
+        # Parser errors can otherwise echo a request target containing a capability.
+        super().send_error(code)
+
+    def _start_browser(self, expected_host):
+        start = getattr(self.server, "browser_start", None)
+        if (start is None or self.path != start.path
+                or self.requestline != f"GET {start.path} {self.request_version}"
+                or self.headers.get_all("Host") != [expected_host]
+                or self.headers.get_all("Origin") not in (None, [f"http://{expected_host}"])
+                or self.headers.get_all("Sec-Fetch-Site") not in (None, ["none"], ["same-origin"])
+                or self.headers.get_all("Content-Length") not in (None, ["0"])
+                or self.headers.get_all("Transfer-Encoding") is not None):
+            self.send_error(404)
+            return
+
+        self.close_connection = True
+        timeout = self.connection.gettimeout()
+        self.connection.setblocking(False)
+        try:
+            with start.authorize():
+                self.server.browser_start = None
+                # A partial or failed write spends the capability. Never retry.
+                with contextlib.suppress(OSError):
+                    self.connection.send(start.response)
+        except (ConnectionError, ProfileError) as error:
+            self.server.browser_start = None
+            self.server.failure = error
+        finally:
+            self.connection.settimeout(timeout)
+        if self.server.failure is not None:
+            self.send_error(410)
+
     def do_GET(self):
         server = self.server
         expected_host = f"127.0.0.1:{server.server_port}"
+        if self.path.startswith(BROWSER_START):
+            self._start_browser(expected_host)
+            return
         result = None
         try:
             path = urlsplit(self.path)
@@ -212,7 +251,25 @@ class _Callback(http.server.BaseHTTPRequestHandler):
         self.wfile.write(content)
 
 
-def _open_host_browser(url):
+@dataclass(frozen=True)
+class _BrowserStart:
+    path: str = field(repr=False)
+    response: bytes = field(repr=False)
+    authorize: Callable[[], contextlib.AbstractContextManager] = field(repr=False)
+
+
+def _browser_redirect_response(destination):
+    return (
+        "HTTP/1.0 303 See Other\r\n"
+        f"Location: {destination}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Referrer-Policy: no-referrer\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii")
+
+
+def _check_browser_placement():
     uid = os.getuid()
     host_runtime = f"/run/user/{uid}"
     guest_runtime = "/run/host" + host_runtime
@@ -220,10 +277,18 @@ def _open_host_browser(url):
     try:
         directory = os.stat(guest_runtime, follow_symlinks=False)
         bus = os.stat(guest_bus, follow_symlinks=False)
-        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != uid
-                or directory.st_mode & 0o077 or not stat.S_ISSOCK(bus.st_mode)
-                or bus.st_uid != uid):
-            raise ConnectionError("host_browser_unavailable")
+    except OSError:
+        raise ConnectionError("host_browser_placement_unavailable") from None
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != uid
+            or directory.st_mode & 0o077 or not stat.S_ISSOCK(bus.st_mode)
+            or bus.st_uid != uid):
+        raise ConnectionError("host_browser_placement_unavailable")
+    return host_runtime, guest_runtime, guest_bus
+
+
+def _open_host_browser(url):
+    host_runtime, guest_runtime, guest_bus = _check_browser_placement()
+    try:
         subprocess.Popen(
             ["/usr/bin/host-spawn", "-cwd", "/", "-no-pty", "/usr/bin/env",
              f"DBUS_SESSION_BUS_ADDRESS=unix:path={host_runtime}/bus",
@@ -382,8 +447,8 @@ class Connection:
                     cancellation.check()
                     with self._store.locked() as directory:
                         check(self._store.read(directory))
-                except ConnectionError:
-                    cancellation.cancel()
+                except ConnectionError as error:
+                    cancellation.cancel(expired=error.code == "openai_operation_timed_out")
                     break
 
         watcher = threading.Thread(target=monitor, daemon=True)
@@ -408,7 +473,7 @@ class Connection:
                 operation.cancel()
 
     def _dispatch(self, check, cancellation, before_send=None, *, journal=None,
-                  authorization=contextlib.nullcontext):
+                  authorization=contextlib.nullcontext, before_write=None):
         used = False
 
         def dispatch(write):
@@ -432,12 +497,26 @@ class Connection:
                     transaction["may_have_sent"] = True
                     self._store.write(directory, record)
                     cancellation.check()
+                if before_write is not None:
+                    before_write()
                 return write()
         return dispatch
 
-    def connect(self, *, installation_host=None, publication=None, authorization=None):
+    def _try_browser(self, target, cancellation):
+        cancellation.check()
+        try:
+            self._browser(target)
+        except ConnectionError as error:
+            if error.code != "host_browser_unavailable":
+                raise
+            return False
+        return True
+
+    def connect(self, *, installation_host=None, publication=None, authorization=None, handoff=None):
         """Sign in within a short registry authorization guard at each local effect."""
         self.require_prerequisites()
+        if handoff is not None:
+            _check_browser_placement()
         authorize = authorization or contextlib.nullcontext
         generation = _random()
         state, nonce, pkce = _random(), _random(), _random()
@@ -502,8 +581,28 @@ class Connection:
                     elif ask_again:
                         fields["prompt"] = "consent"
                     cancellation.check()
-                    with self._store.browser_redirect(AUTHORIZE + "?" + urlencode(fields)) as target:
-                        self._browser(target)
+                    destination = AUTHORIZE + "?" + urlencode(fields)
+                    with contextlib.ExitStack() as resources:
+                        if handoff is None:
+                            target = resources.enter_context(self._store.browser_redirect(destination))
+                            self._browser(target)
+                        else:
+                            @contextlib.contextmanager
+                            def authorize_start():
+                                with authorize(), self._store.locked() as directory:
+                                    is_pending(self._store.read(directory))
+                                    cancellation.check()
+                                    yield
+
+                            def launch():
+                                cancellation.check()
+                                target = resources.enter_context(self._store.browser_redirect(destination))
+                                return self._try_browser(target, cancellation)
+
+                            path = BROWSER_START + _random()
+                            server.browser_start = _BrowserStart(path, _browser_redirect_response(destination),
+                                                                 authorize_start)
+                            handoff(f"http://127.0.0.1:{server.server_port}{path}", launch)
                         while server.result is None and server.failure is None:
                             cancellation.check()
                             server.handle_request()
@@ -705,7 +804,8 @@ class Connection:
             return self._models(binding, access, cancellation)
 
     @contextlib.contextmanager
-    def responses(self, binding, body, before_send, *, deadline=None, cancelled=None):
+    def responses(self, binding, body, before_send, *, deadline=None, cancelled=None, inspect_media=False,
+                  observe_media=None, before_write=None):
         if (not isinstance(body, dict) or body.get("store") is not False
                 or body.get("stream") is not True or not isinstance(body.get("input"), list)
                 or body.get("model") != "gpt-6.2-sol"
@@ -720,8 +820,13 @@ class Connection:
             if body["model"] not in self._models(binding, access, cancellation):
                 raise ConnectionError("openai_model_unavailable")
             dispatch = self._dispatch(
-                lambda record: self._require_dispatchable(record, binding, access), cancellation, before_send)
-            with self._transport.responses(body, access, cancellation, dispatch) as events:
+                lambda record: self._require_dispatchable(record, binding, access),
+                cancellation, before_send, before_write=before_write,
+            )
+            options = {"inspect_media": True} if inspect_media else {}
+            if observe_media is not None:
+                options["observe_media"] = observe_media
+            with self._transport.responses(body, access, cancellation, dispatch, **options) as events:
                 def guarded():
                     for event in events:
                         cancellation.check()
