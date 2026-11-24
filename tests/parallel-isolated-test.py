@@ -402,13 +402,13 @@ esac
         print('bootstrap Git capability checked in a cleaned temporary repository')
 
 
-def interruption_cleanup(distro):
+def interruption_cleanup(distro, *, smoke_timeout=False):
     m = load()
     with tempfile.TemporaryDirectory() as td:
         base=Path(td)/'private'; base.mkdir(); calls=[]
         runtime_base=Path(td)/'runtime-private'; runtime_base.mkdir()
         m.preflight=lambda: 'policy'
-        m.host_preflight=lambda _desktop: (Path(td), None)
+        m.host_preflight=lambda desktop: (Path(td), Path(td)/'unused' if desktop else None)
         def prepare_fixture(*args):
             (base/'store').mkdir(mode=0o700)
             return {}
@@ -420,18 +420,27 @@ def interruption_cleanup(distro):
             info=Path(args[-1]).stat()
             return subprocess.CompletedProcess(args,0,('%s:%s:%s' % (info.st_dev,info.st_ino,info.st_uid)).encode(),b'')
         m.run_host=host_fixture
-        m.supervised_suite=lambda *a,**kw: (143,True,True)
+        real_supervise = m.supervised_suite
+
+        def timeout_fixture(_command, _env, *, timeout):
+            assert timeout == 480
+            child = [sys.executable, '-IB', '-c', 'import time; time.sleep(30)']
+            return real_supervise(child, os.environ.copy(), timeout=.05, grace=1)
+
+        m.supervised_suite = timeout_fixture if smoke_timeout else lambda *a, **kw: (143, True, True)
         m.cleanup=lambda *a: calls.append('cleanup')
         m.subprocess.run=lambda *a,**kw: subprocess.CompletedProcess([],0,str(base/'store')+'|'+str(runtime_base/'runroot')+'|vfs','')
         old_argv=sys.argv; old_container=os.environ.get('CONTAINER_ID')
         try:
-            sys.argv=['runner','--run']
+            sys.argv = ['runner', '--run', '--wayland'] if smoke_timeout else ['runner', '--run']
             if distro: os.environ['CONTAINER_ID']='test'
             else: os.environ.pop('CONTAINER_ID',None)
             rc=m.main()
             assert calls == ([] if distro else ['cleanup'])
-            assert rc == 143
-            print(('distrobox retains store' if distro else 'native cleans store')+' after interruption')
+            assert rc == (124 if smoke_timeout else 143)
+            assert base.is_dir() and runtime_base.is_dir()
+            reason = 'Wayland timeout' if smoke_timeout else 'interruption'
+            print(('distrobox retains store' if distro else 'native cleans store') + f' after {reason}')
         finally:
             sys.argv=old_argv
             m.tempfile.mkdtemp=old_mkdtemp; m.subprocess.run=old_run
@@ -459,3 +468,5 @@ if case in ('all', 'namespace_mount'): namespace_mount_guard()
 if case in ('all', 'bootstrap'): bootstrap_git()
 if case in ('all', 'retention'):
     for route in (False, True): interruption_cleanup(route)
+if case in ('all', 'wayland_timeout'):
+    for route in (False, True): interruption_cleanup(route, smoke_timeout=True)

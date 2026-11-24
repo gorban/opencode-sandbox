@@ -39,7 +39,7 @@ trap cleanup EXIT
 
 if [[ ${OC_CHROMIUM_MODE:-} == wayland ]]; then
   echo "Wayland smoke: one visible Chromium window"
-  timeout --kill-after=10s 480s "$OCS" -n -K -i ptest1 > "$T/wayland.log" 2>&1 || {
+  "$OCS" -n -K -i ptest1 > "$T/wayland.log" 2>&1 || {
     tail -n 80 "$T/wayland.log"; exit 1;
   }
   for _ in $(seq 1 15); do

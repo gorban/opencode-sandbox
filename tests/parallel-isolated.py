@@ -331,7 +331,22 @@ def descendants():
         owned = expanded
 
 
-def supervised_suite(command, env, *, grace=3):
+def wait_for_suite(child, pending, timeout):
+    cutoff = time.monotonic() + timeout
+    while child.poll() is None and not pending:
+        if time.monotonic() >= cutoff:
+            return True
+        time.sleep(.05)
+    return False
+
+
+def suite_exit(status, pending, timed_out):
+    if pending:
+        return 128 + pending[0]
+    return 124 if timed_out else status
+
+
+def supervised_suite(command, env, *, grace=3, timeout=float('inf')):
     """Adopt, cancel and reap the suite tree; never clean a store with live children."""
     libc = ctypes.CDLL(None, use_errno=True)
     if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
@@ -344,10 +359,9 @@ def supervised_suite(command, env, *, grace=3):
     child = None
     try:
         child = subprocess.Popen(command, env=env, start_new_session=True)
-        while child.poll() is None and not pending:
-            time.sleep(.05)
+        timed_out = wait_for_suite(child, pending, timeout)
         status = child.poll()
-        interrupted = bool(pending)
+        interrupted = bool(pending) or timed_out
         cancelled = interrupted
         deadline = time.monotonic() + grace
         kill_deadline = deadline + grace
@@ -366,7 +380,7 @@ def supervised_suite(command, env, *, grace=3):
                 break
             now = time.monotonic()
             if now >= kill_deadline:
-                return (128 + pending[0] if pending else (status or 1)), False, interrupted
+                return suite_exit(status or 1, pending, timed_out), False, interrupted
             sig = signal.SIGKILL if now >= deadline else signal.SIGTERM
             cancelled = True
             for pid, start in owned.items():
@@ -384,7 +398,7 @@ def supervised_suite(command, env, *, grace=3):
                     pass
             time.sleep(.05)
         status = child.wait()
-        return (128 + pending[0] if pending else status), True, cancelled
+        return suite_exit(status, pending, timed_out), True, cancelled
     finally:
         for sig, handler in old.items():
             signal.signal(sig, handler)
@@ -427,7 +441,11 @@ def main():
         if info != str(base / 'store') + '|' + str(runtime_base / 'runroot') + '|vfs':
             die('Podman did not confirm the private store and vfs driver')
         print('Private acceptance directories:', base, runtime_base, flush=True)
-        result, safe, interrupted = supervised_suite(['/usr/bin/bash', str(base / 'source/tests/parallel.sh')], env)
+        command = ['/usr/bin/bash', str(base / 'source/tests/parallel.sh')]
+        options = {'timeout': 480} if args.wayland else {}
+        result, safe, interrupted = supervised_suite(command, env, **options)
+        if args.wayland and result == 124:
+            print('Wayland smoke timed out.', file=sys.stderr)
         # A killed forwarding bridge cannot prove a host-side command never started late.
         if interrupted and os.environ.get('CONTAINER_ID'):
             safe = False

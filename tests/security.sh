@@ -661,6 +661,9 @@ cat > "$T/stub/podman" <<EOF
 echo "\${0##*/} \$*" >> "$T/stub.log"
 # Optional lifecycle integration stub: every image/volume/pod operation stays in scratch.
 if [ -n "\${STUB_SETUP:-}" ]; then
+  if [ "\$1 \${2:-} \${3:-} \${4:-}" = 'run -d --name oc-headless-chromium' ]; then
+    printf '%s\\n' "\$*" > "$T/lifecycle/headless.args"
+  fi
   case "\$1 \${2:-}" in
     "pod ls") [ -s "$T/lifecycle/builds" ] || exit 0;;
     "image inspect")
@@ -1000,11 +1003,12 @@ life_run env WAYLAND_DISPLAY=unused-socket "$SCRIPT" -n -i wayland-default > "$T
 rc=$?
 check "default Chromium still requires a Wayland socket" sh -c \
   "[ '$rc' -ne 0 ] && grep -q 'No Wayland socket' '$T/lifecycle/default.out'"
+: > "$T/lifecycle/headless.args"
 life_run env OC_CHROMIUM_MODE=headless WAYLAND_DISPLAY=unused-socket timeout 30 "$SCRIPT" -n -i headless \
   > "$T/lifecycle/headless.out" 2>&1
 rc=$?
 check "headless setup succeeds without a Wayland socket or -K" test "$rc" -eq 0
-browser_args=$(grep '^podman run -d --name oc-headless-chromium ' "$T/stub.log")
+browser_args=$(cat "$T/lifecycle/headless.args")
 check "headless Chromium uses no display or physical keys" sh -c '
     case $1 in (*--headless*) ;; (*) exit 1;; esac
     case $1 in (*WAYLAND_DISPLAY*|*/run/xdg*|*--device*|*/run/udev*) exit 1;; esac
