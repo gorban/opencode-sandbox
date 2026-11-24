@@ -50,6 +50,8 @@ def sign_in():
             broker.join(1)
             if broker.is_alive() or not done.is_set():
                 raise ValueError("native synthetic enrollment did not complete both exchanges")
+    if any((home / ".gemini" / "antigravity-cli" / "log").glob("acp-login-*.log")):
+        raise ValueError("native login wrote a persistent log")
     print("NATIVE_SYNTHETIC_ENROLLMENT")
 
 

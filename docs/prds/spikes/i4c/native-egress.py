@@ -84,8 +84,10 @@ def run_login(port, observed, *, tunnel=False, private_env=None):
         env["NODE_EXTRA_CA_CERTS"] = env["SSL_CERT_FILE"]
     master, slave = pty.openpty()
     try:
+        command = ["/run/oc-native/agy", "acp", "--login", "--disable-telemetry",
+                   "--log-file", "/tmp/oc-offline-native-login.log"]
         with os.fdopen(slave, "rb") as endpoint, subprocess.Popen(
-                ["/run/oc-native/agy", "acp", "--login"], env=env, cwd=ROOT,
+                command, env=env, cwd=ROOT,
                 stdin=endpoint, stdout=endpoint, stderr=endpoint) as native:
             try:
                 observe(master, native, observed)

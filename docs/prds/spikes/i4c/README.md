@@ -55,7 +55,9 @@ validate its ClientHello, and use only a Unix-domain fake peer for dialing.
 They cancel during ClientHello, during fake DNS, after dial, and after a
 successful write. The recording peer sees only bytes accepted before
 revocation, with closure afterwards. A separate case verifies the token
-tunnel retires before userinfo can be admitted.
+tunnel retires before userinfo can be admitted. Idle endpoints close at the
+attempt deadline even when the client sends nothing else. Native sign-in logs
+stay in the namespace's temporary filesystem.
 
 The proof creates no workstation Secret Service item or real provider session.
 When host retirement is uncertain, its output identifies the retained

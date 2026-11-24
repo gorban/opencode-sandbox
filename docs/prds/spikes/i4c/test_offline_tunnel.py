@@ -155,6 +155,28 @@ class TunnelTest(unittest.TestCase):
         with self.assertRaises(Closed):
             self.dial(token)
 
+    def test_expiry_retires_both_idle_sockets_without_a_later_operation(self):
+        self.attempt.revoke()
+        self.attempt = Attempt("fixture-expiring", deadline=time.monotonic() + .45,
+                               expected_pid=os.getpid(), expected_uid=os.getuid())
+        self.addCleanup(self.attempt.revoke)
+        tunnel, caller, hello = self.provision()
+        self.dial(tunnel)
+        with self.observer.accept()[0] as fake:
+            fake.settimeout(1)
+            self.attempt.connected(tunnel)
+            self.assertEqual(self.attempt.write(tunnel, hello), len(hello))
+            with fake.makefile("rb") as stream:
+                self.assertEqual(stream.read(len(hello)), hello)
+                self.assertEqual(stream.read(1), b"")
+            self.assertEqual(caller.recv(1), b"")
+        with self.assertRaises(Closed):
+            self.attempt.finish(tunnel)
+        another, other_end = socket.socketpair()
+        with another, other_end:
+            with self.assertRaises(Closed):
+                self.attempt.admit(another, host=USERINFO)
+
 
 if __name__ == "__main__":
     unittest.main()

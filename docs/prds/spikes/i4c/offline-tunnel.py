@@ -7,7 +7,7 @@ from pathlib import Path
 import runpy
 import socket
 import struct
-from threading import Lock
+from threading import Lock, Timer
 import time
 
 
@@ -53,9 +53,14 @@ class OfflineAttempt:
         self._phase = 0
         self._active = None
         self._revoked = False
+        self._deadline_timer = Timer(max(0, deadline - time.monotonic()), self.revoke)
+        self._deadline_timer.daemon = True
+        self._deadline_timer.start()
 
     def _available(self):
-        return not self._revoked and time.monotonic() < self.deadline
+        if not self._revoked and time.monotonic() >= self.deadline:
+            self._revoke()
+        return not self._revoked
 
     def _require(self, tunnel):
         if not self._available() or tunnel is not self._active or tunnel.generation != self.generation:
@@ -145,11 +150,18 @@ class OfflineAttempt:
         with self._lock:
             self._require(tunnel)
             if not tunnel.forwarded or tunnel.hello_remaining:
-                self._revoked = True
+                self._revoke()
+                return
             self._phase += 1
             self._retire()
+            if self._phase == len(PHASES):
+                self._revoke()
+
+    def _revoke(self):
+        self._revoked = True
+        self._deadline_timer.cancel()
+        self._retire()
 
     def revoke(self):
         with self._lock:
-            self._revoked = True
-            self._retire()
+            self._revoke()
