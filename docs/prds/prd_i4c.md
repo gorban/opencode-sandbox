@@ -39,4 +39,14 @@ workstation file and socket. Enrollment and the brokered native route still need
 - [ ] Record sign-in and reuse evidence. Review the exact route, host tool boundary, provider
   scope and first live prompt separately before enabling Antigravity in a managed worker.
 
+### Credential-free TLS qualification
+
+The workstation diagnostic bounds DNS, validates every result and tries one
+numeric address for each pinned destination. It verifies the TLS certificate
+and hostname without accessing a registration or sending HTTP. The local
+fixture covers resolver timeout and overflow, revocation before ClientHello,
+cancellation during the handshake, and a successful TLS exchange with zero
+application bytes. A monitored run against the actual destinations remains
+open pending exact-code review.
+
 [Antigravity ACP authentication](https://antigravity.google/docs/ide/extensions/acp/#authentication)
