@@ -2,6 +2,10 @@
 
 Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential broker](prd_i3.md)
 
+Initial workstation sign-in qualification: [Claude Code](prd_i4b.md),
+[Google Antigravity](prd_i4c.md). See [provider configuration and first-use sign-in](prd_i4d.md)
+for the common CLI and orchestrator behavior. Later adapter: [Amazon Bedrock](prd_i4e.md).
+
 ## Gateway
 
 - [ ] Keep the agent runtime, worktree and tools on the worker when the provider supports that

@@ -11,6 +11,10 @@ reservation explicitly in this index.
 
 - [*] Real subscription connections and sign-in lifecycle
   ([I4](prd_i4.md), [I3](prd_i3.md)) — **Outside-in integrations**.
+  - [*] Claude Code and Antigravity initial workstation sign-in qualification
+    ([I4b](prd_i4b.md), [I4c](prd_i4c.md)) — **Codex**.
+  - [*] Shared provider settings and first-use connection design ([I4d](prd_i4d.md)) —
+    **Codex**, coordinated with **AGY** on the ChatGPT launch and connection interface.
 - [*] SSH remote host onboarding and first remote sandbox run
   ([I2](prd_i2.md#workers-and-connectivity)) — **Outside-in integrations**.
 - [*] Maintainer setup and end-to-end acceptance for these integrations
