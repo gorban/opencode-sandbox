@@ -6,7 +6,8 @@
 [local HTTPS](prd_e.md), [host tools](prd_f.md), [orchestrator](prd_i.md),
 [orchestrator UI and profiles](prd_i1.md), [SSH onboarding](prd_i2a.md),
 [credential broker](prd_i3.md), [host LLM broker](prd_i4a.md),
-[warm worker starts](prd_i5.md), [host config](prd_j.md)
+[warm worker starts](prd_i5.md), [host config](prd_j.md),
+[model provider settings and first-use connection](prd_i4d.md)
 
 ## Goal
 
@@ -25,6 +26,10 @@ granting generic host filesystem, shell, Podman, or SSH access.
 
 ## Coordination with active workstreams and open PRD choices
 
+- [ ] **Shared typed settings:** use the same declared setting paths for trusted TOML, environment,
+  CLI and settings-editor inputs. Review component-owned nested declarations and authorized default
+  overrides using [I4d](prd_i4d.md#one-configuration-model) as the first model-provider use case.
+  Keep provider authentication and secret acquisition with the workstation broker.
 - **Warm worker seeding (`codex/warm-worker-seeding` / [prd_i5](prd_i5.md)):** Tier-2 dependency
   seeding, OCI provenance verification, and cache-aware placement remain owned by `prd_i5`. This
   PRD consumes `prd_i5`'s digest-pinned image/seed layer contracts without duplicating or altering
