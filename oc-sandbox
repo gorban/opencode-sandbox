@@ -41,7 +41,7 @@ FWD_ENV=(ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY GOOG
 # Chromium DevTools (9222, full browser control), the pod-local provider relay (8401), and Postgres
 # (trust auth, any role) must never expose on host loopback.
 SENSITIVE_PORTS=(9222 8401)
-RESERVED_NAMES=" agent chromium chrome postgres pg dind home "
+RESERVED_NAMES=" agent chromium chrome postgres pg dind home openai-relay openai-home "
 
 usage() {
   cat <<EOF
@@ -834,8 +834,8 @@ if (( LIST )); then
     ports=$(pm pod inspect "$pod" --format '{{index .Labels "oc.ports"}}' 2>/dev/null || true)
     wd=$(pm container inspect --format '{{.Config.WorkingDir}}' "$AGENT" 2>/dev/null || true)
     side=""
-    for c in "$CHROME" "$PGC" "$DINDC"; do
-      s=$(cstate "$c"); [[ $s == none ]] || side+="${c##*-}:$s "
+    for c in "$CHROME" "$PGC" "$DINDC" "$RELAY"; do
+      s=$(cstate "$c"); [[ $s == none ]] || side+="${c#"$POD"-}:$s "
     done
     wt_info=""
     record_rc=0
@@ -1422,7 +1422,9 @@ relabel_shared || { echo "could not relabel $SB for the agents (see above)" >&2;
 # An offline reader hashes the current binary, the networked updater sees no
 # mounts, and an offline writer promotes only a complete candidate. The host-side
 # supervisor verifies each CID-receipted container is gone before the next phase.
-if [[ $OPENCODE_VERSION == keep ]]; then
+if [[ $PROVIDER == openai ]]; then
+  : # --provider openai uses an isolated home volume and baked-in OpenCode binary
+elif [[ $OPENCODE_VERSION == keep ]]; then
   echo "OpenCode: keeping the installed version (OC_OPENCODE_VERSION=keep)"
 else
   log "Checking OpenCode for updates"
@@ -1966,8 +1968,9 @@ if [[ $PROVIDER == openai ]]; then
   ensure_volume "$OPENAI_HOMEVOL" "$ILABEL"
   agent_pg=0
   if agent_pg_passfile; then agent_pg=1; fi
+  dind_container_arg=""
   dind_run_arg=""
-  if [[ $(cstate "$DINDC") != none ]]; then dind_run_arg=$DINDRUN; fi
+  if [[ $(cstate "$DINDC") != none ]]; then dind_container_arg=$DINDC dind_run_arg=$DINDRUN; fi
   pg_secret_arg=""
   pg_container_arg=""
   if (( agent_pg )); then pg_secret_arg=$PGPASSSECRET pg_container_arg=$PGC; fi
@@ -1978,10 +1981,10 @@ if [[ $PROVIDER == openai ]]; then
   session_spec=$(/usr/bin/python3 -I -c '
 import json, sys
 keys = ("instance", "pod", "agent", "relay", "relay_image", "agent_image", "agent_mem",
-        "level", "sandbox", "cwd", "home_vol", "chromium", "postgres", "pg_secret", "dind_run")
+        "level", "sandbox", "cwd", "home_vol", "chromium", "postgres", "pg_secret", "dind", "dind_run")
 print(json.dumps(dict(zip(keys, sys.argv[1:]))))
 ' "$ILABEL" "$POD" "$AGENT" "$RELAY" "$relay_image_id" "$agent_image_id" "$AGENT_MEM" \
-  "$LEVEL" "$SB" "$CWD" "$OPENAI_HOMEVOL" "$CHROME" "$pg_container_arg" "$pg_secret_arg" "$dind_run_arg")
+  "$LEVEL" "$SB" "$CWD" "$OPENAI_HOMEVOL" "$CHROME" "$pg_container_arg" "$pg_secret_arg" "$dind_container_arg" "$dind_run_arg")
   release_lifecycle_lock
   cd -- "$SCRIPT_DIR"
   log "Launching ChatGPT-backed OpenCode (instance '$ILABEL') in /sandbox/$CWD"

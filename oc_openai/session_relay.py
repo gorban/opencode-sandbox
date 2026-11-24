@@ -40,25 +40,37 @@ class RelayError(ValueError):
 _OTHER_CLOSED = select.POLLHUP | select.POLLERR | select.POLLNVAL
 
 
+def _check_poll_events(events, peer_fd: int, mask: int, other_fd: int | None,
+                       lease, deadline: float) -> bool:
+    for fd, flags in events:
+        if other_fd is not None and fd == other_fd and (flags & _OTHER_CLOSED):
+            raise RelayError("worker closed connection")
+    for fd, flags in events:
+        if fd == peer_fd and (flags & mask):
+            if time.monotonic() < deadline and lease.active():
+                return True
+            raise RelayError("relay lease expired or revoked")
+        if fd == peer_fd and (flags & relay.PEER_CLOSED):
+            return True
+    return False
+
+
 def _wait(peer, mask, lease, deadline, other=None):
     poll = select.poll()
     poll.register(peer, mask | select.POLLRDHUP)
+    other_fd = None
     if other is not None:
         # Watch only hard hangup/error on the client socket so standard HTTP/1.1
         # SHUT_WR half-close does not abort a streamed response.
+        other_fd = other.fileno()
         poll.register(other, _OTHER_CLOSED)
+    peer_fd = peer.fileno()
     while lease.active():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         events = poll.poll(max(1, int(1000 * min(remaining, relay.GRANT_POLL))))
-        if other is not None and any(fd == other.fileno() and (flags & _OTHER_CLOSED) for fd, flags in events):
-            raise RelayError("worker closed connection")
-        if any(fd == peer.fileno() and (flags & mask) for fd, flags in events):
-            if time.monotonic() < deadline and lease.active():
-                return
-            break
-        if any(fd == peer.fileno() and (flags & relay.PEER_CLOSED) for fd, flags in events):
+        if _check_poll_events(events, peer_fd, mask, other_fd, lease, deadline):
             return
     raise RelayError("relay lease expired or revoked")
 
@@ -85,23 +97,28 @@ def _send_all(peer, data, lease, deadline, *, other=None, deliver=None):
         view = view[sent:]
 
 
+def _parse_header_line(line: bytes, length: int | None) -> int | None:
+    name, sep, value = line.partition(b":")
+    if not sep or not _HEADER_NAME.fullmatch(name) or not re.fullmatch(rb"[ -~]*", value):
+        raise RelayError("invalid HTTP header")
+    low = name.lower()
+    if low == b"transfer-encoding":
+        raise RelayError("chunked requests unsupported")
+    if low == b"content-length":
+        val = value.strip(b" \t")
+        if length is not None or not _LENGTH.fullmatch(val):
+            raise RelayError("invalid Content-Length")
+        return int(val)
+    return length
+
+
 def _parse_content_length(header: bytes) -> int:
     request_line, *lines = header.split(b"\r\n")
     if not _REQUEST_LINE.fullmatch(request_line):
         raise RelayError("invalid HTTP request line")
     length = None
     for line in lines:
-        name, sep, value = line.partition(b":")
-        if not sep or not _HEADER_NAME.fullmatch(name) or not re.fullmatch(rb"[ -~]*", value):
-            raise RelayError("invalid HTTP header")
-        low = name.lower()
-        if low == b"transfer-encoding":
-            raise RelayError("chunked requests unsupported")
-        if low == b"content-length":
-            val = value.strip(b" \t")
-            if length is not None or not _LENGTH.fullmatch(val):
-                raise RelayError("invalid Content-Length")
-            length = int(val)
+        length = _parse_header_line(line, length)
     if length is None:
         if request_line.startswith(b"GET "):
             return 0
@@ -164,6 +181,23 @@ def _handle_client(worker: socket.socket, lease: relay.Lease, proof: bytes) -> N
         forward_stream(worker, broker, lease, proof, time.monotonic() + STREAM_TIMEOUT)
 
 
+def _spawn_peer(listener: socket.socket, lease: relay.Lease, slots: threading.BoundedSemaphore,
+                peers: set[socket.socket], peers_lock: threading.Lock, handle) -> None:
+    client, _ = listener.accept()
+    if not lease.active() or not slots.acquire(blocking=False):
+        client.close()
+        return
+    with peers_lock:
+        peers.add(client)
+    try:
+        threading.Thread(target=handle, args=(client,), daemon=True).start()
+    except RuntimeError:
+        slots.release()
+        with peers_lock:
+            peers.discard(client)
+        client.close()
+
+
 def serve(lease: relay.Lease, proof: bytes) -> None:
     os.umask(0o077)
     if lease.status() == "terminal":
@@ -197,19 +231,7 @@ def serve(lease: relay.Lease, proof: bytes) -> None:
                         break
                     was_active = status == "active"
                     for _, _ in selector.select(relay.GRANT_POLL):
-                        client, _ = listener.accept()
-                        if not lease.active() or not slots.acquire(blocking=False):
-                            client.close()
-                            continue
-                        with peers_lock:
-                            peers.add(client)
-                        try:
-                            threading.Thread(target=handle, args=(client,), daemon=True).start()
-                        except RuntimeError:
-                            slots.release()
-                            with peers_lock:
-                                peers.discard(client)
-                            client.close()
+                        _spawn_peer(listener, lease, slots, peers, peers_lock, handle)
         finally:
             with peers_lock:
                 for client in list(peers):

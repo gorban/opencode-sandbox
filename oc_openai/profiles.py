@@ -289,17 +289,30 @@ class Profiles:
             self._write(directory, state)
             return self._profile(state, label)
 
-    def begin_disconnect(self, before_retirement) -> Profile | None:
+    def with_selected(self, label: str, epoch: str, callback):
+        """Run callback under the registry mutex only while (label, epoch) is active and non-retiring."""
+        with self._state() as (_directory, state):
+            if not state or state.get("active") != label or state.get("epoch") != epoch:
+                raise ProfileError("profile_stale")
+            entry = state["registrations"].get(label)
+            if entry is None or entry["client_id"] is None or entry["retiring"]:
+                raise ProfileError("profile_retiring")
+            return callback(self._profile(state, label))
+
+    def begin_disconnect(self, before_retirement, *, inactive_filter=None) -> Profile | None:
         with self._state() as (directory, state):
             if not state:
                 return None
             label = state.get("active")
             entries = state["registrations"]
             targets = [label] if label is not None else []
-            targets.extend(
-                name for name, entry in sorted(entries.items())
-                if name != label and (entry["pending"] is not None or entry["client_id"] is None)
-            )
+            for name, entry in sorted(entries.items()):
+                if name == label:
+                    continue
+                if entry["pending"] is not None or entry["client_id"] is None:
+                    targets.append(name)
+                elif inactive_filter is not None and inactive_filter(self._profile(state, name)):
+                    targets.append(name)
             for name in targets:
                 fenced = before_retirement(self._profile(state, name))
                 if fenced is not False and entries[name]["client_id"] is not None:

@@ -6,7 +6,6 @@ stay attached to the operator's controlling foreground terminal.
 """
 
 import importlib.util
-import json
 import os
 from pathlib import Path
 import stat
@@ -57,15 +56,19 @@ def main() -> int:
         print("oc-sandbox --provider openai: isolated workstation invocation required.", file=sys.stderr)
         return 2
     try:
+        info = os.fstat(3)
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISFIFO(info.st_mode)):
+            raise ValueError("invalid launch specification descriptor")
         with os.fdopen(3, "rb") as pipe:
             raw = pipe.read(MAX_SPEC_BYTES + 1)
         if not raw or len(raw) > MAX_SPEC_BYTES:
             raise ValueError("invalid launch specification size")
-        launch_spec = json.loads(raw.decode("utf-8"))
         _load_package("oc_providers")
         _load_package("oc_openai")
         from oc_openai.cli import StreamTerminal
+        from oc_openai.connection_state import decode_json
         from oc_openai.session_broker import run_interactive_session
+        launch_spec = decode_json(raw)
     except (ImportError, OSError, UnicodeError, ValueError):
         print("oc-sandbox --provider openai: trusted workstation supervisor unavailable.", file=sys.stderr)
         return 1

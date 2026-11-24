@@ -223,7 +223,24 @@ class SessionLeaseTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertGreater(captured[0], 250)
 
-    def test_profile_backend_active_connection_requires_reviewed_and_disconnect_retires_leased(self):
+    def _make_profile_backend(self, root: Path):
+        from oc_openai.profile_backend import ProfileBackend
+
+        conns = {}
+
+        def factory(directory):
+            if directory not in conns:
+                browser = FixtureBrowser()
+                browser.client = f"oaiapp_{directory.name}"
+                conns[directory] = Connection(
+                    directory, transport=FixtureTransport(),
+                    verifier=FixtureVerifier(), browser=browser, host_probe=lambda: self.host,
+                )
+            return conns[directory]
+
+        return ProfileBackend(root, connection=factory, reviewed=True)
+
+    def test_profile_backend_active_connection_requires_reviewed_and_epoch_binding(self):
         from oc_openai.cli import Reason, RouteUnavailable
         from oc_openai.profile_backend import ProfileBackend
 
@@ -231,6 +248,90 @@ class SessionLeaseTests(unittest.TestCase):
         with self.assertRaises(RouteUnavailable) as err:
             unreviewed.active_connection()
         self.assertEqual(err.exception.reason, Reason.QUALIFICATION)
+
+        pb = self._make_profile_backend(self.scratch / "pb-epoch")
+        pb.connect("work")
+        label, epoch, _conn, binding = pb.active_connection()
+        self.assertEqual(label, "work")
+        self.assertEqual(pb.active_label(), "work")
+        self.assertEqual(pb.active_selection(), ("work", epoch))
+
+        # Stale selection epoch must be rejected by session_lease.
+        job = self._make_job()
+        with self.assertRaises(RouteUnavailable) as err:
+            with pb.session_lease(label, "stale-epoch", binding, job):
+                self.fail("session_lease accepted stale selection_epoch")
+        self.assertEqual(err.exception.reason, Reason.CONNECTION_CHANGED)
+
+        # Retiring profile must not report an active_selection for session authority.
+        pb.disconnect()
+        self.assertIsNone(pb.active_selection())
+
+    def test_profile_backend_disconnect_handles_concurrent_lease_and_unselected_leased_profile(self):
+        from oc_openai.managed.relay import grant_record
+
+        pb = self._make_profile_backend(self.scratch / "pb-race")
+        pb.connect("personal")
+        _p_label, _p_epoch, p_conn, p_binding = pb.active_connection()
+        pb.connect("clean")
+        pb.connect("work")
+        w_label, w_epoch, w_conn, w_binding = pb.active_connection()
+
+        # Simulate a lease on an unselected profile (`personal`) + a raced-in lease on `work`
+        # acquired right after the first unlocked physical_host_for_retirement() snapshot.
+        job_personal = self._make_job()
+        job_race = self._make_job()
+        raced_cm = None
+
+        # Put an active lease directly on unselected `personal`.
+        p_cm = p_conn.session_lease(p_binding, job_personal)
+        p_cm.__enter__()
+        self.assertTrue(p_conn.has_active_leases())
+
+        # Inject a concurrent session_lease on `work` immediately after the first snapshot.
+        orig_collect = pb._collect_retirement_hosts
+        injected = False
+
+        def race_collect():
+            nonlocal injected, raced_cm
+            hosts = orig_collect()
+            if not injected:
+                injected = True
+                raced_cm = pb.session_lease(w_label, w_epoch, w_binding, job_race)
+                raced_cm.__enter__()
+            return hosts
+
+        with patch.object(pb, "_collect_retirement_hosts", side_effect=race_collect):
+            self.assertTrue(pb.disconnect())
+
+        # Both `work` (raced-in lease) and unselected `personal` (active lease) must be cleanly retired
+        # without leaving worker_retiring wedged, while untouched `clean` stays connected.
+        self.assertEqual((job_race.grant / "state").read_bytes(), grant_record(job_race.incarnation, job_race.generation, False))
+        self.assertEqual((job_personal.grant / "state").read_bytes(), grant_record(job_personal.incarnation, job_personal.generation, False))
+        for conn in (w_conn, p_conn):
+            self.assertFalse(conn.has_active_leases())
+            with conn._store.locked() as d:
+                rec = conn._store.read(d)
+            self.assertNotIn("worker_retiring", rec)
+            self.assertNotIn("worker_leases", rec)
+        status = {p.label: p.connected for p in pb.status().saved}
+        self.assertTrue(status["clean"])
+        self.assertFalse(status["personal"])
+        self.assertFalse(status["work"])
+
+    def test_profile_backend_session_lease_does_not_swallow_confirm_terminal_error_on_body_exception(self):
+        from oc_openai.cli import Reason, RouteUnavailable
+
+        pb = self._make_profile_backend(self.scratch / "pb-swallow")
+        pb.connect("work")
+        label, epoch, conn, binding = pb.active_connection()
+        job = self._make_job()
+        # Leave grant marker non-terminal while lifetime FD is held so confirm_terminal fails.
+        with self.assertRaises(RouteUnavailable) as err:
+            with pb.session_lease(label, epoch, binding, job):
+                raise RuntimeError("simulated session crash")
+        self.assertEqual(err.exception.reason, Reason.MANAGED_RETIREMENT)
+        self.assertTrue(conn.has_active_leases())
 
 
 if __name__ == "__main__":

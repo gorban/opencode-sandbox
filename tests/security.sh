@@ -794,6 +794,8 @@ check "refuses malformed mapping"          argfail "is not PORT or HOSTPORT:PODP
 check "refuses out-of-range port"          argfail "ports are 1-65535" -P 18080:70000
 check "refuses bad instance name"          argfail "invalid instance name" -i Bad
 check "refuses reserved instance name"     argfail "invalid instance name" -i agent
+check "refuses openai-relay instance name" argfail "invalid instance name" -i openai-relay
+check "refuses openai-home instance name"  argfail "invalid instance name" -i openai-home
 check "refuses -C with .."                 argfail "plain relative path" -C ../x
 check "refuses absolute -C"                argfail "plain relative path" -C /etc
 check "refuses -W with .."                 argfail "plain relative path" -W a/../b

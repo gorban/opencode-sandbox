@@ -23,6 +23,7 @@ HANDLE_PREFIX = "oc_rs_"
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _EVENT_LABEL = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){0,4}\Z")
 _HEADER_NAME = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
+_JSON_CONTENT_TYPE = re.compile(rb"application/json(?:[ \t]*;[ \t]*charset=utf-8)?\Z")
 
 _ALLOWED_HEADERS = frozenset({
     b"host", b"authorization", b"content-type", b"content-length", b"accept",
@@ -180,6 +181,65 @@ def _sanitize_content(content) -> str | list:
     return cleaned
 
 
+def _sanitize_message_item(raw: dict) -> dict:
+    _require_req(set(raw) <= _ALLOWED_MESSAGE_KEYS)
+    role = raw.get("role")
+    _require_req(role in _ALLOWED_ROLES and "content" in raw)
+    item = {"type": "message", "role": role, "content": _sanitize_content(raw["content"])}
+    if "status" in raw:
+        _require_req(raw["status"] in ("in_progress", "completed", "incomplete"))
+        item["status"] = raw["status"]
+    if "phase" in raw and raw["phase"] is not None:
+        _require_req(raw["phase"] in ("commentary", "final_answer"))
+        item["phase"] = raw["phase"]
+    return item
+
+
+def _sanitize_call_item(raw: dict) -> dict:
+    _require_req(set(raw) <= _ALLOWED_CALL_KEYS)
+    _require_req(_valid_id(raw.get("call_id")) and _valid_id(raw.get("name"))
+                 and type(raw.get("arguments")) is str)
+    item = {
+        "type": "function_call",
+        "call_id": raw["call_id"],
+        "name": raw["name"],
+        "arguments": raw["arguments"],
+    }
+    if "status" in raw and raw["status"] is not None:
+        _require_req(raw["status"] in ("in_progress", "completed", "incomplete"))
+        item["status"] = raw["status"]
+    return item
+
+
+def _sanitize_call_output_item(raw: dict) -> dict:
+    _require_req(set(raw) <= _ALLOWED_CALL_OUTPUT_KEYS)
+    _require_req(_valid_id(raw.get("call_id")) and "output" in raw)
+    output = raw["output"]
+    if type(output) is not str:
+        output = _sanitize_content(output)
+    return {"type": "function_call_output", "call_id": raw["call_id"], "output": output}
+
+
+def _sanitize_reasoning_item(raw: dict, model: str, vault: ReasoningVault) -> dict:
+    _require_req(set(raw) <= _ALLOWED_REASONING_KEYS)
+    local_id = raw.get("id")
+    _require_req(_valid_id(local_id))
+    summary = raw.get("summary", [])
+    _require_req(type(summary) is list and len(summary) <= MAX_CONTENT_PARTS)
+    for part in summary:
+        _require_req(type(part) is dict and set(part) <= {"type", "text"}
+                     and part.get("type") == "summary_text" and type(part.get("text")) is str)
+    encrypted = raw.get("encrypted_content")
+    _require_req(encrypted is not None, 400, "invalid_reasoning_handle",
+                 "Reasoning replay requires an authenticated host handle.")
+    upstream_id, ciphertext = vault.resolve(encrypted, local_id, model)
+    item = {"type": "reasoning", "id": upstream_id, "summary": summary, "encrypted_content": ciphertext}
+    if "status" in raw and raw["status"] is not None:
+        _require_req(raw["status"] in ("completed",))
+        item["status"] = raw["status"]
+    return item
+
+
 def _sanitize_input(items, model: str, vault: ReasoningVault) -> list[dict]:
     _require_req(type(items) is list and 1 <= len(items) <= MAX_INPUT_ITEMS)
     cleaned = []
@@ -187,56 +247,13 @@ def _sanitize_input(items, model: str, vault: ReasoningVault) -> list[dict]:
         _require_req(type(raw) is dict)
         kind = raw.get("type", "message")
         if kind == "message":
-            _require_req(set(raw) <= _ALLOWED_MESSAGE_KEYS)
-            role = raw.get("role")
-            _require_req(role in _ALLOWED_ROLES and "content" in raw)
-            item = {"type": "message", "role": role, "content": _sanitize_content(raw["content"])}
-            if "status" in raw:
-                _require_req(raw["status"] in ("in_progress", "completed", "incomplete"))
-                item["status"] = raw["status"]
-            if "phase" in raw and raw["phase"] is not None:
-                _require_req(raw["phase"] in ("commentary", "final_answer"))
-                item["phase"] = raw["phase"]
-            cleaned.append(item)
+            cleaned.append(_sanitize_message_item(raw))
         elif kind == "function_call":
-            _require_req(set(raw) <= _ALLOWED_CALL_KEYS)
-            _require_req(_valid_id(raw.get("call_id")) and _valid_id(raw.get("name"))
-                         and type(raw.get("arguments")) is str)
-            item = {
-                "type": "function_call",
-                "call_id": raw["call_id"],
-                "name": raw["name"],
-                "arguments": raw["arguments"],
-            }
-            if "status" in raw and raw["status"] is not None:
-                _require_req(raw["status"] in ("in_progress", "completed", "incomplete"))
-                item["status"] = raw["status"]
-            cleaned.append(item)
+            cleaned.append(_sanitize_call_item(raw))
         elif kind == "function_call_output":
-            _require_req(set(raw) <= _ALLOWED_CALL_OUTPUT_KEYS)
-            _require_req(_valid_id(raw.get("call_id")) and "output" in raw)
-            output = raw["output"]
-            if type(output) is not str:
-                output = _sanitize_content(output)
-            cleaned.append({"type": "function_call_output", "call_id": raw["call_id"], "output": output})
+            cleaned.append(_sanitize_call_output_item(raw))
         elif kind == "reasoning":
-            _require_req(set(raw) <= _ALLOWED_REASONING_KEYS)
-            local_id = raw.get("id")
-            _require_req(_valid_id(local_id))
-            summary = raw.get("summary", [])
-            _require_req(type(summary) is list and len(summary) <= MAX_CONTENT_PARTS)
-            for part in summary:
-                _require_req(type(part) is dict and set(part) <= {"type", "text"}
-                             and part.get("type") == "summary_text" and type(part.get("text")) is str)
-            encrypted = raw.get("encrypted_content")
-            _require_req(encrypted is not None, 400, "invalid_reasoning_handle",
-                         "Reasoning replay requires an authenticated host handle.")
-            upstream_id, ciphertext = vault.resolve(encrypted, local_id, model)
-            item = {"type": "reasoning", "id": upstream_id, "summary": summary, "encrypted_content": ciphertext}
-            if "status" in raw and raw["status"] is not None:
-                _require_req(raw["status"] in ("completed",))
-                item["status"] = raw["status"]
-            cleaned.append(item)
+            cleaned.append(_sanitize_reasoning_item(raw, model, vault))
         else:
             raise RequestRefused(400, "unsupported_input_item", "Unsupported input item type.")
     return cleaned
@@ -282,33 +299,103 @@ def _sanitize_reasoning(value) -> dict:
     return cleaned
 
 
+def _sanitize_text_format(fmt) -> dict:
+    _require_req(type(fmt) is dict and fmt.get("type") in ("text", "json_object", "json_schema"))
+    if fmt["type"] in ("text", "json_object"):
+        _require_req(set(fmt) == {"type"})
+        return {"type": fmt["type"]}
+    _require_req({"type", "name", "schema"} <= set(fmt) <= {"type", "name", "schema", "description", "strict"})
+    _require_req(_valid_id(fmt["name"]) and type(fmt["schema"]) is dict)
+    entry = {"type": "json_schema", "name": fmt["name"], "schema": fmt["schema"]}
+    if fmt.get("description") is not None:
+        _require_req(type(fmt["description"]) is str)
+        entry["description"] = fmt["description"]
+    if fmt.get("strict") is not None:
+        _require_req(type(fmt["strict"]) is bool)
+        entry["strict"] = fmt["strict"]
+    return entry
+
+
 def _sanitize_text(value) -> dict:
     _require_req(type(value) is dict and set(value) <= {"format", "verbosity"})
     cleaned = {}
-    if "verbosity" in value and value["verbosity"] is not None:
+    if value.get("verbosity") is not None:
         _require_req(value["verbosity"] in ("low", "medium", "high"))
         cleaned["verbosity"] = value["verbosity"]
-    if "format" in value and value["format"] is not None:
-        fmt = value["format"]
-        _require_req(type(fmt) is dict and fmt.get("type") in ("text", "json_object", "json_schema"))
-        if fmt["type"] == "text":
-            _require_req(set(fmt) == {"type"})
-            cleaned["format"] = {"type": "text"}
-        elif fmt["type"] == "json_object":
-            _require_req(set(fmt) == {"type"})
-            cleaned["format"] = {"type": "json_object"}
-        else:
-            _require_req({"type", "name", "schema"} <= set(fmt) <= {"type", "name", "schema", "description", "strict"})
-            _require_req(_valid_id(fmt["name"]) and type(fmt["schema"]) is dict)
-            entry = {"type": "json_schema", "name": fmt["name"], "schema": fmt["schema"]}
-            if "description" in fmt and fmt["description"] is not None:
-                _require_req(type(fmt["description"]) is str)
-                entry["description"] = fmt["description"]
-            if "strict" in fmt and fmt["strict"] is not None:
-                _require_req(type(fmt["strict"]) is bool)
-                entry["strict"] = fmt["strict"]
-            cleaned["format"] = entry
+    if value.get("format") is not None:
+        cleaned["format"] = _sanitize_text_format(value["format"])
     return cleaned
+
+
+def _parse_headers(header_lines: list[bytes]) -> dict[bytes, bytes]:
+    headers: dict[bytes, bytes] = {}
+    for line in header_lines:
+        name, sep, value = line.partition(b":")
+        _require_req(bool(sep) and bool(_HEADER_NAME.fullmatch(name)))
+        low = name.lower()
+        if low in _FORBIDDEN_HEADERS or any(low.startswith(prefix) for prefix in _FORBIDDEN_HEADER_PREFIXES):
+            raise RequestRefused(403, "forbidden_header", "Browser or hop-by-hop header rejected.")
+        _require_req(low in _ALLOWED_HEADERS and low not in headers)
+        stripped = value.strip(b" \t")
+        _require_req(bool(re.fullmatch(rb"[ -~]*", stripped)))
+        headers[low] = stripped
+    return headers
+
+
+def _validate_request_headers(headers: dict[bytes, bytes], body_len: int, expected_token: str) -> None:
+    _require_req(headers.get(b"host") == b"127.0.0.1:8401", 403, "invalid_host", "Unexpected Host header.")
+    auth = headers.get(b"authorization", b"")
+    expected_auth = f"Bearer {expected_token}".encode("ascii")
+    if not hmac.compare_digest(auth, expected_auth):
+        raise RequestRefused(401, "unauthorized", "Missing or invalid worker token.")
+    content_length = headers.get(b"content-length")
+    if content_length is not None:
+        _require_req(len(content_length) <= 8 and content_length.isdigit() and int(content_length) == body_len)
+    else:
+        _require_req(body_len == 0)
+
+
+def _apply_optional_scalars(data: dict, sanitized: dict) -> None:
+    if data.get("instructions") is not None:
+        _require_req(type(data["instructions"]) is str)
+        sanitized["instructions"] = data["instructions"]
+    if data.get("parallel_tool_calls") is not None:
+        _require_req(type(data["parallel_tool_calls"]) is bool)
+        sanitized["parallel_tool_calls"] = data["parallel_tool_calls"]
+    if data.get("max_output_tokens") is not None:
+        # Validate caller input, then omit per SIWC direct-token route rules (prd_i4a.md).
+        _require_req(type(data["max_output_tokens"]) is int and data["max_output_tokens"] > 0)
+    if data.get("temperature") is not None:
+        _require_req(type(data["temperature"]) in (int, float) and 0 <= data["temperature"] <= 2)
+        sanitized["temperature"] = data["temperature"]
+    if data.get("top_p") is not None:
+        _require_req(type(data["top_p"]) in (int, float) and 0 < data["top_p"] <= 1)
+        sanitized["top_p"] = data["top_p"]
+    if data.get("truncation") is not None:
+        _require_req(data["truncation"] in ("auto", "disabled"))
+        sanitized["truncation"] = data["truncation"]
+    if data.get("prompt_cache_key") is not None:
+        _require_req(type(data["prompt_cache_key"]) is str and _ID_RE.fullmatch(data["prompt_cache_key"]))
+        sanitized["prompt_cache_key"] = data["prompt_cache_key"]
+
+
+def _apply_optional_structures(data: dict, sanitized: dict) -> None:
+    if data.get("tools") is not None:
+        sanitized["tools"] = _sanitize_tools(data["tools"])
+    if data.get("tool_choice") is not None:
+        sanitized["tool_choice"] = _sanitize_tool_choice(data["tool_choice"])
+    if data.get("include") is not None:
+        _require_req(data["include"] in ([], ["reasoning.encrypted_content"]))
+        if data["include"]:
+            sanitized["include"] = ["reasoning.encrypted_content"]
+    if data.get("reasoning") is not None:
+        reasoning = _sanitize_reasoning(data["reasoning"])
+        if reasoning:
+            sanitized["reasoning"] = reasoning
+    if data.get("text") is not None:
+        text_cfg = _sanitize_text(data["text"])
+        if text_cfg:
+            sanitized["text"] = text_cfg
 
 
 def parse_worker_request(raw: bytes, *, expected_token: str, allowed_models: frozenset[str],
@@ -321,40 +408,18 @@ def parse_worker_request(raw: bytes, *, expected_token: str, allowed_models: fro
     _require_req(len(parts) == 3 and parts[2] == b"HTTP/1.1")
     method, target = parts[0], parts[1]
 
-    headers: dict[bytes, bytes] = {}
-    for line in header_lines:
-        name, sep, value = line.partition(b":")
-        _require_req(bool(sep) and bool(_HEADER_NAME.fullmatch(name)))
-        low = name.lower()
-        if low in _FORBIDDEN_HEADERS or any(low.startswith(prefix) for prefix in _FORBIDDEN_HEADER_PREFIXES):
-            raise RequestRefused(403, "forbidden_header", "Browser or hop-by-hop header rejected.")
-        _require_req(low in _ALLOWED_HEADERS and low not in headers)
-        stripped = value.strip(b" \t")
-        _require_req(bool(re.fullmatch(rb"[ -~]*", stripped)))
-        headers[low] = stripped
-
-    _require_req(headers.get(b"host") == b"127.0.0.1:8401", 403, "invalid_host", "Unexpected Host header.")
-    auth = headers.get(b"authorization", b"")
-    expected_auth = f"Bearer {expected_token}".encode("ascii")
-    if not hmac.compare_digest(auth, expected_auth):
-        raise RequestRefused(401, "unauthorized", "Missing or invalid worker token.")
-
-    content_length = headers.get(b"content-length")
-    if content_length is not None:
-        _require_req(len(content_length) <= 8 and content_length.isdigit() and int(content_length) == len(body))
-    else:
-        _require_req(len(body) == 0)
+    headers = _parse_headers(header_lines)
+    _validate_request_headers(headers, len(body), expected_token)
 
     if method == b"GET" and target == b"/v1/models":
         _require_req(len(body) == 0)
         return ParsedRequest(route="models")
-
     if method != b"POST" or target != b"/v1/responses":
         raise RequestRefused(404, "not_found", "Unsupported endpoint.")
 
     _require_req(len(body) > 0)
     ct = headers.get(b"content-type", b"").lower()
-    _require_req(ct in (b"application/json", b"application/json; charset=utf-8"))
+    _require_req(bool(_JSON_CONTENT_TYPE.fullmatch(ct)))
 
     try:
         data = decode_json(body)
@@ -376,45 +441,28 @@ def parse_worker_request(raw: bytes, *, expected_token: str, allowed_models: fro
         "stream": True,
         "input": _sanitize_input(data["input"], model, vault),
     }
-    if "instructions" in data and data["instructions"] is not None:
-        _require_req(type(data["instructions"]) is str)
-        sanitized["instructions"] = data["instructions"]
-    if "tools" in data and data["tools"] is not None:
-        sanitized["tools"] = _sanitize_tools(data["tools"])
-    if "tool_choice" in data and data["tool_choice"] is not None:
-        sanitized["tool_choice"] = _sanitize_tool_choice(data["tool_choice"])
-    if "parallel_tool_calls" in data and data["parallel_tool_calls"] is not None:
-        _require_req(type(data["parallel_tool_calls"]) is bool)
-        sanitized["parallel_tool_calls"] = data["parallel_tool_calls"]
-    if "max_output_tokens" in data and data["max_output_tokens"] is not None:
-        # Validate caller input, then omit per SIWC direct-token route rules (prd_i4a.md).
-        _require_req(type(data["max_output_tokens"]) is int and data["max_output_tokens"] > 0)
-    if "include" in data and data["include"] is not None:
-        _require_req(data["include"] in ([], ["reasoning.encrypted_content"]))
-        if data["include"]:
-            sanitized["include"] = ["reasoning.encrypted_content"]
-    if "reasoning" in data and data["reasoning"] is not None:
-        reasoning = _sanitize_reasoning(data["reasoning"])
-        if reasoning:
-            sanitized["reasoning"] = reasoning
-    if "text" in data and data["text"] is not None:
-        text_cfg = _sanitize_text(data["text"])
-        if text_cfg:
-            sanitized["text"] = text_cfg
-    if "temperature" in data and data["temperature"] is not None:
-        _require_req(type(data["temperature"]) in (int, float) and 0 <= data["temperature"] <= 2)
-        sanitized["temperature"] = data["temperature"]
-    if "top_p" in data and data["top_p"] is not None:
-        _require_req(type(data["top_p"]) in (int, float) and 0 < data["top_p"] <= 1)
-        sanitized["top_p"] = data["top_p"]
-    if "truncation" in data and data["truncation"] is not None:
-        _require_req(data["truncation"] in ("auto", "disabled"))
-        sanitized["truncation"] = data["truncation"]
-    if "prompt_cache_key" in data and data["prompt_cache_key"] is not None:
-        _require_req(type(data["prompt_cache_key"]) is str and _ID_RE.fullmatch(data["prompt_cache_key"]))
-        sanitized["prompt_cache_key"] = data["prompt_cache_key"]
-
+    _apply_optional_scalars(data, sanitized)
+    _apply_optional_structures(data, sanitized)
     return ParsedRequest(route="responses", body=sanitized, model=model)
+
+
+def _check_safety_entry(key, value) -> None:
+    if type(key) is not str:
+        return
+    low = key.lower()
+    if "guardian" in low:
+        raise StreamAborted("metadata_guardian")
+    if low == "safety_buffering" and value is not False:
+        raise StreamAborted("safety_buffering")
+    if low == "type" and value == "safety_buffering":
+        raise StreamAborted("safety_buffering")
+
+
+def _scan_dict_children(current: dict, depth: int, stack: list) -> None:
+    for key, value in current.items():
+        _check_safety_entry(key, value)
+        if type(value) in (dict, list):
+            stack.append((value, depth + 1))
 
 
 def _scan_global_safety(obj) -> None:
@@ -427,21 +475,20 @@ def _scan_global_safety(obj) -> None:
         if depth > MAX_SCAN_DEPTH or nodes > MAX_SCAN_NODES:
             raise StreamAborted("safety_scan_limit")
         if type(current) is dict:
-            for key, value in current.items():
-                if type(key) is str:
-                    low = key.lower()
-                    if "guardian" in low:
-                        raise StreamAborted("metadata_guardian")
-                    if low == "safety_buffering" and value is not False:
-                        raise StreamAborted("safety_buffering")
-                    if low == "type" and value == "safety_buffering":
-                        raise StreamAborted("safety_buffering")
-                if type(value) in (dict, list):
-                    stack.append((value, depth + 1))
+            _scan_dict_children(current, depth, stack)
         elif type(current) is list:
             for item in current:
                 if type(item) in (dict, list):
                     stack.append((item, depth + 1))
+
+
+def _validate_moderation_entries(entries) -> None:
+    if type(entries) is not list or len(entries) > 32:
+        raise StreamAborted("metadata_moderation")
+    for entry in entries:
+        if (type(entry) is not dict or not set(entry) <= _MODERATION_ENTRY_KEYS
+                or entry.get("is_blocked") is not False):
+            raise StreamAborted("metadata_moderation")
 
 
 def _validate_moderation_slot(slot) -> None:
@@ -452,15 +499,8 @@ def _validate_moderation_slot(slot) -> None:
     if "is_blocked" in slot and slot["is_blocked"] is not False:
         raise StreamAborted("metadata_moderation")
     for list_key in ("outputs", "results"):
-        if list_key not in slot or slot[list_key] is None:
-            continue
-        entries = slot[list_key]
-        if type(entries) is not list or len(entries) > 32:
-            raise StreamAborted("metadata_moderation")
-        for entry in entries:
-            if (type(entry) is not dict or not set(entry) <= _MODERATION_ENTRY_KEYS
-                    or entry.get("is_blocked") is not False):
-                raise StreamAborted("metadata_moderation")
+        if slot.get(list_key) is not None:
+            _validate_moderation_entries(slot[list_key])
 
 
 def _validate_metadata_event(event: dict, active_upstream_id: str | None) -> None:
@@ -480,7 +520,8 @@ def _validate_metadata_event(event: dict, active_upstream_id: str | None) -> Non
         raise StreamAborted("metadata_moderation")
     if moderation.get("presentation") not in (None, "inline"):
         raise StreamAborted("metadata_moderation")
-    if moderation.get("schema_version") not in (None, 1):
+    schema_version = moderation.get("schema_version")
+    if schema_version is not None and (type(schema_version) is not int or schema_version != 1):
         raise StreamAborted("metadata_moderation")
     _validate_moderation_slot(moderation.get("prompt"))
     if moderation.get("response") not in (None, {}):
@@ -584,66 +625,75 @@ class SessionStreamProjector:
             return {"type": "refusal", "refusal": refusal}
         raise StreamAborted("unsupported_content_part")
 
+    def _project_message_item(self, item: dict) -> dict:
+        role = item.get("role", "assistant")
+        status = item.get("status", "in_progress")
+        content = item.get("content", [])
+        if (role != "assistant" or status not in ("in_progress", "completed", "incomplete")
+                or type(content) is not list or len(content) > MAX_CONTENT_PARTS):
+            raise StreamAborted("invalid_item")
+        out: dict = {
+            "type": "message",
+            "role": "assistant",
+            "status": status,
+            "content": [self._project_content_part(part) for part in content],
+        }
+        if item.get("id") is not None:
+            out["id"] = self._local_item_id(item["id"], "msg_local")
+        if item.get("phase") is not None:
+            if item["phase"] not in ("commentary", "final_answer"):
+                raise StreamAborted("invalid_item")
+            out["phase"] = item["phase"]
+        return out
+
+    def _project_call_item(self, item: dict) -> dict:
+        status = item.get("status", "in_progress")
+        arguments = item.get("arguments", "")
+        if (not _valid_id(item.get("call_id")) or not _valid_id(item.get("name"))
+                or status not in ("in_progress", "completed", "incomplete")
+                or type(arguments) is not str):
+            raise StreamAborted("invalid_function_call")
+        out = {
+            "type": "function_call",
+            "call_id": item["call_id"],
+            "name": item["name"],
+            "arguments": arguments,
+            "status": status,
+        }
+        if item.get("id") is not None:
+            out["id"] = self._local_item_id(item["id"], "fc_local")
+        return out
+
+    def _project_reasoning_item(self, item: dict, *, allow_vault: bool) -> dict:
+        upstream_id = item.get("id")
+        out = {
+            "type": "reasoning",
+            "id": self._local_reasoning_id(upstream_id),
+            "summary": _valid_summary(item.get("summary", [])),
+        }
+        status = item.get("status")
+        if status is not None:
+            if status not in ("in_progress", "completed"):
+                raise StreamAborted("invalid_reasoning_item")
+            out["status"] = status
+        ciphertext = item.get("encrypted_content")
+        if allow_vault and ciphertext is not None:
+            _, handle = self._stage_reasoning_ciphertext(upstream_id, ciphertext)
+            out["encrypted_content"] = handle
+        elif allow_vault and upstream_id in self._staged_vault:
+            out["encrypted_content"] = self._staged_vault[upstream_id][1]
+        return out
+
     def _project_item(self, item, *, allow_vault: bool) -> dict:
         if type(item) is not dict:
             raise StreamAborted("invalid_item")
         kind = item.get("type")
         if kind == "message":
-            role = item.get("role", "assistant")
-            status = item.get("status", "in_progress")
-            if role != "assistant" or status not in ("in_progress", "completed", "incomplete"):
-                raise StreamAborted("invalid_item")
-            content = item.get("content", [])
-            if type(content) is not list or len(content) > MAX_CONTENT_PARTS:
-                raise StreamAborted("invalid_item")
-            out: dict = {
-                "type": "message",
-                "role": "assistant",
-                "status": status,
-                "content": [self._project_content_part(part) for part in content],
-            }
-            if item.get("id") is not None:
-                out["id"] = self._local_item_id(item["id"], "msg_local")
-            if item.get("phase") is not None:
-                if item["phase"] not in ("commentary", "final_answer"):
-                    raise StreamAborted("invalid_item")
-                out["phase"] = item["phase"]
-            return out
+            return self._project_message_item(item)
         if kind == "function_call":
-            status = item.get("status", "in_progress")
-            if (not _valid_id(item.get("call_id")) or not _valid_id(item.get("name"))
-                    or status not in ("in_progress", "completed", "incomplete")):
-                raise StreamAborted("invalid_function_call")
-            arguments = item.get("arguments", "")
-            if type(arguments) is not str:
-                raise StreamAborted("invalid_function_call")
-            out = {
-                "type": "function_call",
-                "call_id": item["call_id"],
-                "name": item["name"],
-                "arguments": arguments,
-                "status": status,
-            }
-            if item.get("id") is not None:
-                out["id"] = self._local_item_id(item["id"], "fc_local")
-            return out
+            return self._project_call_item(item)
         if kind == "reasoning":
-            upstream_id = item.get("id")
-            local_id = self._local_reasoning_id(upstream_id)
-            summary = _valid_summary(item.get("summary", []))
-            out = {"type": "reasoning", "id": local_id, "summary": summary}
-            status = item.get("status")
-            if status is not None:
-                if status not in ("in_progress", "completed"):
-                    raise StreamAborted("invalid_reasoning_item")
-                out["status"] = status
-            ciphertext = item.get("encrypted_content")
-            if allow_vault and ciphertext is not None:
-                _, handle = self._stage_reasoning_ciphertext(upstream_id, ciphertext)
-                out["encrypted_content"] = handle
-            elif allow_vault and upstream_id in self._staged_vault:
-                out["encrypted_content"] = self._staged_vault[upstream_id][1]
-            return out
+            return self._project_reasoning_item(item, allow_vault=allow_vault)
         raise StreamAborted("unsupported_item_type")
 
     def _project_response_envelope(self, response: dict, *, allow_vault: bool) -> dict:
@@ -688,6 +738,54 @@ class SessionStreamProjector:
             return self._reasoning_ids[item_id]
         return self._item_ids.get(item_id, self._local_item_id(item_id, "item_local"))
 
+    def _attach_content_fields(self, event: dict, payload: dict) -> None:
+        if "content_index" in event:
+            payload["content_index"] = _valid_index(event["content_index"])
+        mapped = self._mapped_event_item_id(event)
+        if mapped is not None:
+            payload["item_id"] = mapped
+
+    def _project_text_event(self, kind: str, event: dict, payload: dict) -> tuple[bytes, bool]:
+        field = "delta" if kind.endswith(".delta") else ("text" if kind == "response.output_text.done" else "refusal")
+        if type(event.get(field)) is not str:
+            raise StreamAborted("invalid_delta")
+        payload[field] = event[field]
+        self._attach_content_fields(event, payload)
+        return sse_frame(kind, payload), False
+
+    def _project_function_arg_event(self, kind: str, event: dict, payload: dict) -> tuple[bytes, bool]:
+        key = "delta" if kind.endswith(".delta") else "arguments"
+        if type(event.get(key)) is not str:
+            raise StreamAborted("invalid_function_call")
+        payload[key] = event[key]
+        if event.get("call_id") is not None:
+            if not _valid_id(event["call_id"]):
+                raise StreamAborted("invalid_function_call")
+            payload["call_id"] = event["call_id"]
+        mapped = self._mapped_event_item_id(event)
+        if mapped is not None:
+            payload["item_id"] = mapped
+        # Buffer all tool-call argument frames until metadata + completed + EOF verify.
+        return sse_frame(kind, payload), True
+
+    def _project_reasoning_event(self, kind: str, event: dict, payload: dict) -> tuple[bytes, bool]:
+        payload["item_id"] = self._mapped_event_item_id(event, require_reasoning=True)
+        if "summary_index" in event:
+            payload["summary_index"] = _valid_index(event["summary_index"])
+        if kind in ("response.reasoning_summary_part.added", "response.reasoning_summary_part.done"):
+            part = event.get("part")
+            if type(part) is not dict or part.get("type") != "summary_text" or type(part.get("text")) is not str:
+                raise StreamAborted("invalid_reasoning_item")
+            payload["part"] = {"type": "summary_text", "text": part["text"]}
+            return sse_frame(kind, payload), False
+        field = "delta" if kind.endswith(".delta") else "text"
+        if type(event.get(field)) is not str:
+            raise StreamAborted("invalid_reasoning_item")
+        payload[field] = event[field]
+        if "content_index" in event:
+            payload["content_index"] = _valid_index(event["content_index"])
+        return sse_frame(kind, payload), False
+
     def _project_stream_event(self, kind: str, event: dict) -> tuple[bytes, bool]:
         """Strictly project one non-envelope streaming event; returns (frame, should_buffer)."""
         if "response_id" in event and event["response_id"] != self.upstream_response_id:
@@ -695,91 +793,61 @@ class SessionStreamProjector:
         payload: dict = {"type": kind}
         if "output_index" in event:
             payload["output_index"] = _valid_index(event["output_index"])
-        if kind in ("response.output_text.delta", "response.refusal.delta"):
-            if type(event.get("delta")) is not str:
-                raise StreamAborted("invalid_delta")
-            payload["delta"] = event["delta"]
-            if "content_index" in event:
-                payload["content_index"] = _valid_index(event["content_index"])
-            mapped = self._mapped_event_item_id(event)
-            if mapped is not None:
-                payload["item_id"] = mapped
-            return sse_frame(kind, payload), False
-        if kind == "response.output_text.done":
-            if type(event.get("text")) is not str:
-                raise StreamAborted("invalid_delta")
-            payload["text"] = event["text"]
-            if "content_index" in event:
-                payload["content_index"] = _valid_index(event["content_index"])
-            mapped = self._mapped_event_item_id(event)
-            if mapped is not None:
-                payload["item_id"] = mapped
-            return sse_frame(kind, payload), False
-        if kind == "response.refusal.done":
-            if type(event.get("refusal")) is not str:
-                raise StreamAborted("invalid_delta")
-            payload["refusal"] = event["refusal"]
-            if "content_index" in event:
-                payload["content_index"] = _valid_index(event["content_index"])
-            mapped = self._mapped_event_item_id(event)
-            if mapped is not None:
-                payload["item_id"] = mapped
-            return sse_frame(kind, payload), False
+        if kind in ("response.output_text.delta", "response.refusal.delta",
+                    "response.output_text.done", "response.refusal.done"):
+            return self._project_text_event(kind, event, payload)
         if kind in ("response.content_part.added", "response.content_part.done"):
             payload["part"] = self._project_content_part(event.get("part"))
-            if "content_index" in event:
-                payload["content_index"] = _valid_index(event["content_index"])
-            mapped = self._mapped_event_item_id(event)
-            if mapped is not None:
-                payload["item_id"] = mapped
+            self._attach_content_fields(event, payload)
             return sse_frame(kind, payload), False
         if kind in ("response.function_call_arguments.delta", "response.function_call_arguments.done"):
-            key = "delta" if kind.endswith(".delta") else "arguments"
-            if type(event.get(key)) is not str:
-                raise StreamAborted("invalid_function_call")
-            payload[key] = event[key]
-            if event.get("call_id") is not None:
-                if not _valid_id(event["call_id"]):
-                    raise StreamAborted("invalid_function_call")
-                payload["call_id"] = event["call_id"]
-            mapped = self._mapped_event_item_id(event)
-            if mapped is not None:
-                payload["item_id"] = mapped
-            # Buffer all tool-call argument frames until metadata + completed + EOF verify.
-            return sse_frame(kind, payload), True
-        if kind in ("response.reasoning_summary_part.added", "response.reasoning_summary_part.done"):
-            part = event.get("part")
-            if type(part) is not dict or part.get("type") != "summary_text" or type(part.get("text")) is not str:
-                raise StreamAborted("invalid_reasoning_item")
-            payload["item_id"] = self._mapped_event_item_id(event, require_reasoning=True)
-            payload["part"] = {"type": "summary_text", "text": part["text"]}
-            if "summary_index" in event:
-                payload["summary_index"] = _valid_index(event["summary_index"])
-            return sse_frame(kind, payload), False
-        if kind in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
-            if type(event.get("delta")) is not str:
-                raise StreamAborted("invalid_reasoning_item")
-            payload["item_id"] = self._mapped_event_item_id(event, require_reasoning=True)
-            payload["delta"] = event["delta"]
-            if "summary_index" in event:
-                payload["summary_index"] = _valid_index(event["summary_index"])
-            if "content_index" in event:
-                payload["content_index"] = _valid_index(event["content_index"])
-            return sse_frame(kind, payload), False
-        if kind in ("response.reasoning_summary_text.done", "response.reasoning_text.done"):
-            if type(event.get("text")) is not str:
-                raise StreamAborted("invalid_reasoning_item")
-            payload["item_id"] = self._mapped_event_item_id(event, require_reasoning=True)
-            payload["text"] = event["text"]
-            if "summary_index" in event:
-                payload["summary_index"] = _valid_index(event["summary_index"])
-            if "content_index" in event:
-                payload["content_index"] = _valid_index(event["content_index"])
-            return sse_frame(kind, payload), False
+            return self._project_function_arg_event(kind, event, payload)
+        if kind.startswith(("response.reasoning_summary_", "response.reasoning_text.")):
+            return self._project_reasoning_event(kind, event, payload)
         raise StreamAborted("unsupported_event")
 
-    def feed(self, event: dict) -> list[bytes]:
-        """Process one upstream event; return SSE frame bytes safe to emit immediately."""
+    def _feed_created(self, event: dict) -> list[bytes]:
+        response = event.get("response")
+        if type(response) is not dict or not _valid_id(response.get("id")):
+            raise StreamAborted("invalid_response_id")
+        self.upstream_response_id = response["id"]
+        projected_resp = self._project_response_envelope(response, allow_vault=False)
+        return [sse_frame("response.created", {"type": "response.created", "response": projected_resp})]
+
+    def _feed_progress(self, kind: str, event: dict) -> list[bytes]:
+        response = event.get("response")
+        if type(response) is not dict or response.get("id") != self.upstream_response_id:
+            raise StreamAborted("response_id_mismatch")
+        projected_resp = self._project_response_envelope(response, allow_vault=False)
+        return [sse_frame(kind, {"type": kind, "response": projected_resp})]
+
+    def _feed_output_item(self, kind: str, event: dict, *, allow_vault: bool) -> list[bytes]:
+        if "response_id" in event and event["response_id"] != self.upstream_response_id:
+            raise StreamAborted("response_id_mismatch")
+        idx = _valid_index(event.get("output_index", 0))
+        item = self._project_item(event.get("item"), allow_vault=allow_vault)
+        frame = sse_frame(kind, {"type": kind, "output_index": idx, "item": item})
+        if item["type"] == "function_call":
+            self._buffered_frames.append(frame)
+            return []
+        return [frame]
+
+    def _feed_completed(self, event: dict) -> list[bytes]:
+        response = event.get("response")
+        if (type(response) is not dict or response.get("id") != self.upstream_response_id
+                or response.get("status") != "completed"):
+            raise StreamAborted("invalid_completed")
+        usage = response.get("usage")
+        if type(usage) is dict:
+            counts = tuple(usage.get(k) for k in ("input_tokens", "output_tokens", "total_tokens"))
+            if all(type(c) is int and 0 <= c <= 2**31 for c in counts) and counts[0] + counts[1] == counts[2]:
+                self.usage = counts
+        projected_resp = self._project_response_envelope(response, allow_vault=True)
+        self._buffered_frames.append(sse_frame("response.completed", {"type": "response.completed", "response": projected_resp}))
+        self._completed_seen = True
+        return []
+
+    def _validate_event_kind(self, event) -> str:
         self.events_seen += 1
         if self.events_seen > MAX_INTERACTIVE_EVENTS or self._completed_seen:
             raise StreamAborted("stream_bounds")
@@ -789,7 +857,22 @@ class SessionStreamProjector:
         if type(kind) is not str or len(kind) > 96 or not _EVENT_LABEL.fullmatch(kind):
             raise StreamAborted("invalid_event_label")
         _scan_global_safety(event)
+        return kind
 
+    def _feed_lifecycle(self, kind: str, event: dict) -> list[bytes] | None:
+        if kind in ("response.in_progress", "response.queued"):
+            return self._feed_progress(kind, event)
+        if kind == "response.output_item.added":
+            return self._feed_output_item(kind, event, allow_vault=False)
+        if kind == "response.output_item.done":
+            return self._feed_output_item(kind, event, allow_vault=True)
+        if kind == "response.completed":
+            return self._feed_completed(event)
+        return None
+
+    def feed(self, event: dict) -> list[bytes]:
+        """Process one upstream event; return SSE frame bytes safe to emit immediately."""
+        kind = self._validate_event_kind(event)
         if kind in ("ping", "keepalive"):
             return []
         if kind == "response.metadata":
@@ -800,63 +883,15 @@ class SessionStreamProjector:
             raise StreamAborted(f"provider_{kind.replace('.', '_')}")
         if kind.startswith(_UNSUPPORTED_EVENT_PREFIXES) or kind not in _ALLOWED_STREAM_EVENTS:
             raise StreamAborted("unsupported_event")
-
         if self.upstream_response_id is None:
             if kind != "response.created":
                 raise StreamAborted("missing_response_created")
-            response = event.get("response")
-            if type(response) is not dict or not _valid_id(response.get("id")):
-                raise StreamAborted("invalid_response_id")
-            self.upstream_response_id = response["id"]
-            projected_resp = self._project_response_envelope(response, allow_vault=False)
-            return [sse_frame(kind, {"type": kind, "response": projected_resp})]
-
+            return self._feed_created(event)
         if kind == "response.created":
             raise StreamAborted("duplicate_response_created")
-
-        if kind in ("response.in_progress", "response.queued"):
-            response = event.get("response")
-            if type(response) is not dict or response.get("id") != self.upstream_response_id:
-                raise StreamAborted("response_id_mismatch")
-            projected_resp = self._project_response_envelope(response, allow_vault=False)
-            return [sse_frame(kind, {"type": kind, "response": projected_resp})]
-
-        if kind == "response.output_item.added":
-            if "response_id" in event and event["response_id"] != self.upstream_response_id:
-                raise StreamAborted("response_id_mismatch")
-            idx = _valid_index(event.get("output_index", 0))
-            item = self._project_item(event.get("item"), allow_vault=False)
-            frame = sse_frame(kind, {"type": kind, "output_index": idx, "item": item})
-            if item["type"] == "function_call":
-                self._buffered_frames.append(frame)
-                return []
-            return [frame]
-
-        if kind == "response.output_item.done":
-            if "response_id" in event and event["response_id"] != self.upstream_response_id:
-                raise StreamAborted("response_id_mismatch")
-            idx = _valid_index(event.get("output_index", 0))
-            item = self._project_item(event.get("item"), allow_vault=True)
-            frame = sse_frame(kind, {"type": kind, "output_index": idx, "item": item})
-            if item["type"] == "function_call":
-                self._buffered_frames.append(frame)
-                return []
-            return [frame]
-
-        if kind == "response.completed":
-            response = event.get("response")
-            if (type(response) is not dict or response.get("id") != self.upstream_response_id
-                    or response.get("status") != "completed"):
-                raise StreamAborted("invalid_completed")
-            usage = response.get("usage")
-            if type(usage) is dict:
-                counts = tuple(usage.get(k) for k in ("input_tokens", "output_tokens", "total_tokens"))
-                if all(type(c) is int and 0 <= c <= 2**31 for c in counts) and counts[0] + counts[1] == counts[2]:
-                    self.usage = counts
-            projected_resp = self._project_response_envelope(response, allow_vault=True)
-            self._buffered_frames.append(sse_frame(kind, {"type": kind, "response": projected_resp}))
-            self._completed_seen = True
-            return []
+        handled = self._feed_lifecycle(kind, event)
+        if handled is not None:
+            return handled
 
         frame, should_buffer = self._project_stream_event(kind, event)
         if should_buffer:

@@ -243,6 +243,37 @@ class SessionProtocolTests(unittest.TestCase):
         with self.assertRaises(StreamAborted):
             p.feed({"type": "response.output_text.delta", "response_id": "resp_wrong", "delta": "x"})
 
+    def test_schema_version_bool_rejected_and_compact_json_content_type_accepted(self):
+        # P2 #2a: Python bool True == 1 must be rejected for moderation schema_version.
+        p = SessionStreamProjector(model="gpt-6.2-sol", local_response_id="resp_local_5", vault=self.vault)
+        p.feed({"type": "response.created", "response": {"id": "resp_up_5", "status": "in_progress"}})
+        with self.assertRaises(StreamAborted) as err:
+            p.feed({
+                "type": "response.metadata",
+                "response_id": "resp_up_5",
+                "sequence_number": 1,
+                "metadata": {"openai_chatgpt_moderation_metadata": {"schema_version": True}},
+            })
+        self.assertEqual(err.exception.code, "metadata_moderation")
+
+        # P2 #2b: RFC 9110 application/json;charset=utf-8 (without space after semicolon) is valid.
+        body = json.dumps({
+            "model": "gpt-6.2-sol", "stream": True, "store": False,
+            "input": [{"role": "user", "content": "hi"}],
+        }).encode("utf-8")
+        raw = (
+            "POST /v1/responses HTTP/1.1\r\n"
+            "Host: 127.0.0.1:8401\r\n"
+            "Authorization: Bearer tok-secret\r\n"
+            "Content-Type: application/json;charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode("ascii") + body
+        parsed = parse_worker_request(
+            raw, expected_token="tok-secret", allowed_models=self.models, vault=self.vault,
+        )
+        self.assertEqual(parsed.route, "responses")
+        self.assertEqual(parsed.model, "gpt-6.2-sol")
+
 
 if __name__ == "__main__":
     unittest.main()

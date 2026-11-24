@@ -2,12 +2,13 @@
 
 from contextlib import contextmanager
 from pathlib import Path
+import sys
 
 from .cli import ConnectionStatus, Reason, RouteUnavailable, SavedProfile
 from .connection import Connection, ConnectionError
 from .exposure import ExposureError, ExposureLedger
 from .live import WorkstationBackend, _mapped_connection_error, _mapped_exposure_error
-from .profiles import Profiles
+from .profiles import ProfileError, Profiles
 
 
 # The real account and inference paths require exact review of the integrated route.
@@ -47,6 +48,13 @@ class ProfileBackend:
     def active_label(self):
         profile = self.profiles.selected()
         return profile.label if profile is not None else None
+
+    def active_selection(self):
+        """Return (label, selection_epoch) for the active non-retiring registration."""
+        profile = self.profiles.selected()
+        if profile is None or profile.retiring:
+            return None
+        return profile.label, profile.epoch
 
     def status(self):
         view = self.profiles.snapshot()
@@ -92,7 +100,7 @@ class ProfileBackend:
             return self._require_selected().verify()
 
     def active_connection(self):
-        """Return (label, Connection, Binding) for the active registration."""
+        """Return (label, selection_epoch, Connection, Binding) for the active registration."""
         if not self._reviewed:
             raise RouteUnavailable(Reason.QUALIFICATION)
         profile = self.profiles.selected()
@@ -103,35 +111,41 @@ class ProfileBackend:
             binding = conn.binding()
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
-        return profile.label, conn, binding
+        return profile.label, profile.epoch, conn, binding
 
     @contextmanager
-    def session_lease(self, label, binding, job):
-        """Acquire a concurrent session lease atomically under foreground selection lock."""
+    def session_lease(self, label, selection_epoch, binding, job):
+        """Acquire a concurrent session lease atomically under the profile registry mutex."""
         if not self._reviewed:
             raise RouteUnavailable(Reason.QUALIFICATION)
-        with self.profiles.foreground():
-            profile = self.profiles.selected()
-            if profile is None or profile.retiring or profile.label != label:
-                raise RouteUnavailable(Reason.CONNECTION_CHANGED)
+
+        def acquire(profile):
             conn = self._connection(profile.directory)
             lease_cm = conn.session_lease(binding, job)
             try:
-                lease = lease_cm.__enter__()
+                return lease_cm, lease_cm.__enter__()
             except ConnectionError as error:
                 raise _mapped_connection_error(error) from None
+
+        try:
+            lease_cm, lease = self.profiles.with_selected(label, selection_epoch, acquire)
+        except ProfileError:
+            raise RouteUnavailable(Reason.CONNECTION_CHANGED) from None
+
         exc = (None, None, None)
         try:
             yield lease
         except BaseException:
-            exc = __import__("sys").exc_info()
+            exc = sys.exc_info()
             raise
         finally:
             try:
                 lease_cm.__exit__(*exc)
             except ConnectionError as error:
+                mapped = _mapped_connection_error(error)
                 if exc[0] is None:
-                    raise _mapped_connection_error(error) from None
+                    raise mapped from None
+                raise mapped from exc[1]
 
     def connect(self, label, *, handoff=None):
         if not self._reviewed:
@@ -166,21 +180,32 @@ class ProfileBackend:
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
 
-    def disconnect(self):
-        observed = self.profiles.selected()
-        physical_host = None
-        if observed is not None:
+    def _collect_retirement_hosts(self):
+        hosts = {}
+        view = self.profiles.snapshot()
+        for profile in (*view.saved, *view.unpublished):
             try:
-                physical_host = self._connection(observed.directory).physical_host_for_retirement()
+                proof = self._connection(profile.directory).physical_host_for_retirement()
             except (ConnectionError, OSError):
-                pass
+                proof = None
+            if proof is not None:
+                hosts[profile.directory] = proof
+        return hosts
 
-        retirements = []
-        errors = []
+    def _begin_disconnect_pass(self, physical_hosts, retired_dirs, retirements):
+        def has_leases(profile):
+            if profile.directory in retired_dirs:
+                return True
+            try:
+                return self._connection(profile.directory).has_active_leases()
+            except ConnectionError as error:
+                raise _mapped_connection_error(error) from None
 
         def retire(profile):
+            if profile.directory in retired_dirs:
+                return None
             connection = self._connection(profile.directory)
-            placement = physical_host if observed is not None and profile.directory == observed.directory else None
+            placement = physical_hosts.get(profile.directory)
             try:
                 if (profile.client_id is not None and not profile.selected
                         and connection.status() == "connected" and not connection.has_active_leases()):
@@ -188,11 +213,26 @@ class ProfileBackend:
                 retirement = connection.begin_disconnect(physical_host=placement)
             except ConnectionError as error:
                 raise _mapped_connection_error(error) from None
+            retired_dirs.add(profile.directory)
             retirements.append((connection, retirement))
 
+        self.profiles.begin_disconnect(retire, inactive_filter=has_leases)
+
+    def disconnect(self):
+        retirements = []
+        retired_dirs = set()
+        errors = []
         confirmed = True
         try:
-            self.profiles.begin_disconnect(retire)
+            for attempt in range(2):
+                physical_hosts = self._collect_retirement_hosts()
+                try:
+                    self._begin_disconnect_pass(physical_hosts, retired_dirs, retirements)
+                    break
+                except RouteUnavailable as error:
+                    if error.reason is Reason.MANAGED_RETIREMENT and attempt == 0:
+                        continue
+                    raise
         finally:
             for connection, retirement in retirements:
                 try:
