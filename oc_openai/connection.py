@@ -965,11 +965,8 @@ class Connection:
                         yield event
                 yield guarded()
 
-    @contextlib.contextmanager
-    def interactive_responses(self, binding, body, before_send=None, *, authorization=None,
-                              limits=INTERACTIVE_STREAM_LIMITS, deadline=None, cancelled=None,
-                              inspect_media=True, observe_media=None):
-        """Stream one bounded interactive Responses turn with fenced first-write verification."""
+    @staticmethod
+    def _validate_interactive_request(body, limits, deadline) -> None:
         if (not isinstance(body, dict) or body.get("store") is not False
                 or body.get("stream") is not True or not isinstance(body.get("input"), list)
                 or not _value(body.get("model"), max_length=128)
@@ -977,6 +974,13 @@ class Connection:
             raise ConnectionError("invalid_responses_body")
         if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
             raise ConnectionError("invalid_openai_deadline")
+
+    @contextlib.contextmanager
+    def interactive_responses(self, binding, body, before_send=None, *, authorization=None,
+                              limits=INTERACTIVE_STREAM_LIMITS, deadline=None, cancelled=None,
+                              inspect_media=True, observe_media=None):
+        """Stream one bounded interactive Responses turn with fenced first-write verification."""
+        self._validate_interactive_request(body, limits, deadline)
         authorize = authorization or contextlib.nullcontext
 
         for attempt in range(2):

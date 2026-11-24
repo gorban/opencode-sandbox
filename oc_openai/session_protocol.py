@@ -51,13 +51,14 @@ _ALLOWED_TEXT_PART_TYPES = frozenset({"input_text", "output_text", "refusal"})
 _ALLOWED_ROLES = frozenset({"user", "assistant", "developer", "system"})
 
 _EVENT_CREATED = "response.created"
+_EVENT_ITEM_ADDED = "response.output_item.added"
 _EVENT_TEXT_DONE = "response.output_text.done"
 _EVENT_COMPLETED = "response.completed"
 _DELTA_SUFFIX = ".delta"
 
 _ALLOWED_STREAM_EVENTS = frozenset({
     _EVENT_CREATED, "response.in_progress", "response.queued",
-    "response.output_item.added", "response.output_item.done",
+    _EVENT_ITEM_ADDED, "response.output_item.done",
     "response.content_part.added", "response.content_part.done",
     "response.output_text.delta", _EVENT_TEXT_DONE,
     "response.refusal.delta", "response.refusal.done",
@@ -970,13 +971,15 @@ class SessionStreamProjector:
         raw_item = event.get("item")
         raw_idx = event.get("output_index")
         is_tool = type(raw_item) is dict and raw_item.get("type") == "function_call"
-        idx = _valid_index(raw_idx if is_tool else (0 if raw_idx is None else raw_idx))
+        if not is_tool and raw_idx is None:
+            raw_idx = 0
+        idx = _valid_index(raw_idx)
         item = self._project_item(raw_item, allow_vault=allow_vault, allow_tools=True)
         frame = sse_frame(kind, {"type": kind, "output_index": idx, "item": item})
         if item["type"] == "function_call":
             if idx in self._non_tool_indices:
                 raise StreamAborted("tool_call_mismatch")
-            bucket = self._buffered_tool_added if kind == "response.output_item.added" else self._buffered_tool_done
+            bucket = self._buffered_tool_added if kind == _EVENT_ITEM_ADDED else self._buffered_tool_done
             if idx in bucket:
                 raise StreamAborted("tool_call_mismatch")
             bucket[idx] = item
@@ -1021,7 +1024,7 @@ class SessionStreamProjector:
     def _feed_lifecycle(self, kind: str, event: dict) -> list[bytes] | None:
         if kind in ("response.in_progress", "response.queued"):
             return self._feed_progress(kind, event)
-        if kind == "response.output_item.added":
+        if kind == _EVENT_ITEM_ADDED:
             return self._feed_output_item(kind, event, allow_vault=False)
         if kind == "response.output_item.done":
             return self._feed_output_item(kind, event, allow_vault=True)
