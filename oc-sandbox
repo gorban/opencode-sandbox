@@ -1,17 +1,23 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash -p
 # oc-sandbox — idempotent setup + launch + teardown for sandboxed OpenCode instances
 # (one rootless Podman pod per instance: OpenCode agent + Chromium on your Wayland desktop,
 # optional Postgres and docker-in-docker sidecar).
 set -euo pipefail
 
+if [[ ${1:-} == orchestrate ]]; then
+  export PATH=/usr/bin:/bin
+  IFS=: read -r _ _ orchestrator_uid _ _ HOME _ < <(/usr/bin/getent passwd "$EUID") || exit 2
+  [[ $orchestrator_uid == "$EUID" && $HOME == /* ]] || exit 2
+  export HOME
+fi
 CALLER_PWD=$PWD
 CALLER_PHYSICAL=$(pwd -P)
 SB="$HOME/opencode-sandbox"            # mounted at /sandbox in every agent
 # This script runs on the HOST (and asks for admin rights), so it must never live inside the directory
 # that is mounted into the agent containers, or an agent could rewrite it.
-SCRIPT_REAL=$(readlink -f "$0"); SCRIPT_DIR=${SCRIPT_REAL%/*}
+SCRIPT_REAL=$(/usr/bin/readlink -f -- "$0"); SCRIPT_DIR=${SCRIPT_REAL%/*}
 case $SCRIPT_REAL in
-  "$(readlink -f "$SB")"/*)
+  "$(/usr/bin/readlink -f -- "$SB")"/*)
     echo "Refusing to run: $SCRIPT_REAL is inside the sandbox directory $SB," >&2
     echo "which the agent can write to. Keep the checkout elsewhere (e.g. ~/code/opencode-sandbox)" >&2
     echo "and symlink it into ~/.local/bin. See README.md." >&2
@@ -44,6 +50,7 @@ usage() {
   cat <<EOF
 Usage: ${0##*/} [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
+       ${0##*/} orchestrate [--synthetic-check]
 
   (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
               OpenCode. Safe to run repeatedly; only missing/changed pieces are touched.
@@ -94,7 +101,7 @@ die() { echo "${0##*/}: $*" >&2; exit 2; }
 # and fails if ANY step (including each symlink target on the way) is inside $SB. Only components
 # outside $SB, which the agent cannot change, remain; the walked physical path is used from then on.
 # The locations must not contain $SB either (-d -a deletes $STATE). Done before anything is touched.
-sb_real=$(realpath -m -- "$SB")
+sb_real=$(/usr/bin/realpath -m -- "$SB")
 in_sb() {
   [[ $1/ == "$sb_real"/* ]]
 }
@@ -109,7 +116,7 @@ trusted_path() {  # absolute path -> its physical path on stdout; 1 if the walk 
     in_sb "$next" && return 1
     if [[ -L $next ]]; then
       (( ++n <= 40 )) || return 1
-      IFS= read -r -d '' t < <(readlink -z -- "$next") || return 1
+      IFS= read -r -d '' t < <(/usr/bin/readlink -z -- "$next") || return 1
       [[ $t != *$'\n'* && $t != *$'\r'* ]] || return 1
       tc=(); IFS=/ read -ra tc <<<"$t"
       [[ $t == /* ]] && cur=""
@@ -124,6 +131,17 @@ trusted_file() { # resolve repository helpers without following a path into the 
   [[ -f $r ]] || return 1
   printf '%s\n' "$r"
 }
+if [[ ${1:-} == orchestrate ]]; then
+  shift
+  orchestrator_source=$0
+  if [[ $orchestrator_source != /* ]]; then orchestrator_source=$CALLER_PHYSICAL/$orchestrator_source; fi
+  [[ $(trusted_file "$orchestrator_source") == "$SCRIPT_REAL" ]] || die "untrusted orchestrator entry"
+  orchestrator_helper=$(trusted_file "$SCRIPT_DIR/oc-orchestrate.py") || die "unavailable orchestrator launcher"
+  orchestrator_host=local
+  if [[ -n ${CONTAINER_ID:-} ]]; then orchestrator_host=distrobox; fi
+  exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
+    /usr/bin/python3 -IB "$orchestrator_helper" "$orchestrator_host" "$@"
+fi
 trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
   local r
   r=$(trusted_path "$2") || die "refusing to use $2: the path leads into the sandbox directory $SB, which the agent controls (check XDG_DATA_HOME / XDG_CONFIG_HOME and symlinks)"
