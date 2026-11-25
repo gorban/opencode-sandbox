@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import select
 import shutil
 import socket
@@ -20,7 +21,10 @@ import time
 
 
 SHA256 = "2e0e4656521ca56e5ba16a00d48429958b8105b3fa6466710a4350e68759381f"
+MAX_FIXTURE_BYTES = 512 * 1024 * 1024
 PORT = 8401
+FIXTURE_KEY = "offline-fixture"
+FIXTURE_AUTH = f"Bearer {FIXTURE_KEY}"
 PROMPT = "Reply with exactly: ok"
 PICKER_TITLE = "Select model"
 GOOGLE_LABEL = "google/personal"
@@ -30,6 +34,8 @@ CONFIG = "/config"
 OUTPUT = "/output"
 WORKSPACE = "/workspace"
 CONFIG_ENV = "OPENCODE_CONFIG"
+# Nested Bubblewrap requires this staging path. The controller creates it in its new mount namespace.
+BWRAP_STAGING = "/tmp"  # NOSONAR(S5443) — private mode 0700, no host mount
 ENV = {
     "PATH": "/usr/bin:/bin",
     "LANG": "C.UTF-8",
@@ -40,27 +46,30 @@ ENV = {
     "OPENCODE_DISABLE_AUTOUPDATE": "true",
     "OPENCODE_DISABLE_CLAUDE_CODE": "true",
 }
+CLAUDE_PERSONAL = "claude--personal"
+CLAUDE_WORK = "claude--work"
+GOOGLE_PERSONAL = "google--personal"
 # Two kinds have the label "personal". Every kind has the same v2 upstream ID.
 # The v1 name includes the v2 ID and another account's display label as data.
-DEFAULT = ("claude--personal", "opal-v2")
-SELECT = ("google--personal", "opal-v2")
+DEFAULT = (CLAUDE_PERSONAL, "opal-v2")
+SELECT = (GOOGLE_PERSONAL, "opal-v2")
 CATALOG = {
-    "claude--personal": {
+    CLAUDE_PERSONAL: {
         "opal-v2": "Opal v2 - claude/personal [subscription]",
         "zircon": "Zircon - claude/personal [subscription]",
     },
-    "claude--work": {
+    CLAUDE_WORK: {
         "opal-v2": "Opal v2 - work [metered]",
         "opal-v1": "Opal v1 (opal-v2 work) - work [metered]",
     },
-    "google--personal": {
+    GOOGLE_PERSONAL: {
         "opal-v2": f"Opal v2 - {GOOGLE_LABEL} [subscription]",
     },
 }
 PROVIDER_NAMES = {
-    "claude--personal": "claude/personal",
-    "claude--work": "work",
-    "google--personal": GOOGLE_LABEL,
+    CLAUDE_PERSONAL: "claude/personal",
+    CLAUDE_WORK: "work",
+    GOOGLE_PERSONAL: GOOGLE_LABEL,
 }
 TARGET_LABEL = CATALOG[SELECT[0]][SELECT[1]]
 LABELS = [label for models in CATALOG.values() for label in models.values()]
@@ -84,9 +93,12 @@ def seed(source, target):
     fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as binary, target.open("xb") as copy:
         info = os.fstat(binary.fileno())
-        require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 512 * 1024 * 1024,
+        require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= MAX_FIXTURE_BYTES,
                 "OpenCode fixture must be a bounded regular file")
+        copied = 0
         while block := binary.read(1024 * 1024):
+            copied += len(block)
+            require(copied <= MAX_FIXTURE_BYTES, "OpenCode fixture exceeded its size bound")
             copy.write(block)
             digest.update(block)
     require(digest.hexdigest() == SHA256, "OpenCode fixture SHA-256 differs from repository pin")
@@ -96,7 +108,7 @@ def seed(source, target):
 def config(port, *, stale=False, collision_model=None):
     active = {scope: models.copy() for scope, models in CATALOG.items() if not stale or scope != SELECT[0]}
     if collision_model:
-        active["claude--work"][collision_model] = TARGET_LABEL
+        active[CLAUDE_WORK][collision_model] = TARGET_LABEL
     deny = [{"action": "*", "resource": "*", "effect": "deny"}]
     policies = [{"action": action, "resource": "*", "effect": "deny"}
                 for action in ("provider.use", "integration.connect", "mcp.use", "skill.use", "websearch.use")]
@@ -119,7 +131,7 @@ def config(port, *, stale=False, collision_model=None):
             scope: {
                 "name": PROVIDER_NAMES[scope],
                 "package": "@opencode/ai/providers/openai-compatible",
-                "settings": {"baseURL": f"http://127.0.0.1:{port}/{scope}/v1", "apiKey": "offline-fixture"},
+                "settings": {"baseURL": f"http://127.0.0.1:{port}/{scope}/v1", "apiKey": FIXTURE_KEY},
                 "models": {
                     model: {
                         "name": label,
@@ -190,7 +202,7 @@ class Fake(http.server.HTTPServer):
                 generation == self.generation
                 and event["method"] == "POST" and self.allow == (event["scope"], model)
                 and exact and not tools and payload.get("stream") is True
-                and authorization == "Bearer offline-fixture"
+                and authorization == FIXTURE_AUTH
             )
             if accepted:
                 self.allow = None
@@ -323,7 +335,10 @@ def request_log_matches(events):
 
 def stale_refusal(mode, screen):
     if mode == "full":
-        return "Model unavailable" in screen and f"{SAVED_ROUTE} is not available" in screen
+        return (
+            "Model unavailable" in screen
+            and re.search(rf"(?:^|[\s┃│]){re.escape(SAVED_ROUTE)} is not available", screen) is not None
+        )
     return any(line.strip() == f"Model unavailable: {SAVED_ROUTE}" for line in screen.splitlines())
 
 
@@ -508,8 +523,7 @@ def main():
         command = [
             "/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session",
             "--proc", "/proc", "--dev", "/dev",
-            # Nested bwrap hardcodes this staging location. It exists only in the controller namespace.
-            "--perms", "0700", "--dir", "/tmp",
+            "--perms", "0700", "--dir", BWRAP_STAGING,
             "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib64", "/lib64",
             "--ro-bind", str(root / "program"), PROGRAM, "--ro-bind", str(root / "config"), CONFIG,
             "--bind", str(root / "output"), OUTPUT, "--bind", str(root / "workspace"), WORKSPACE,

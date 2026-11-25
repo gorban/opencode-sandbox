@@ -3,13 +3,17 @@
 from contextlib import closing
 import http.client
 import json
+import os
+from pathlib import Path
 import socket
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 
 from probe import (
-    APPROVED_TARGET, EXPECTED_REQUEST, Fake, PROMPT, SAVED_ROUTE, SELECT, request_log_matches, serving, stale_refusal,
+    APPROVED_TARGET, CLAUDE_WORK, EXPECTED_REQUEST, FIXTURE_AUTH, GOOGLE_PERSONAL, Fake, PROMPT, SAVED_ROUTE,
+    SELECT, request_log_matches, seed, serving, stale_refusal,
 )
 
 
@@ -21,7 +25,7 @@ def valid_payload():
 
 def send_post(fake, payload):
     with closing(http.client.HTTPConnection("127.0.0.1", fake.server_port, timeout=3)) as client:
-        client.request("POST", APPROVED_TARGET, payload, {"Authorization": "Bearer offline-fixture"})
+        client.request("POST", APPROVED_TARGET, payload, {"Authorization": FIXTURE_AUTH})
         response = client.getresponse()
         response.read()
         return response.status
@@ -45,8 +49,32 @@ class EvidenceChecks(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertTrue(stale_refusal(mode, notice))
                 self.assertFalse(stale_refusal(mode, "Model unavailable"))
-                self.assertFalse(stale_refusal(mode, notice.replace("google--personal", "claude--work")))
+                self.assertFalse(stale_refusal(mode, notice.replace(GOOGLE_PERSONAL, CLAUDE_WORK)))
+                self.assertFalse(stale_refusal(mode, notice.replace(SAVED_ROUTE, "other-" + SAVED_ROUTE)))
                 self.assertFalse(stale_refusal(mode, notice.replace(SAVED_ROUTE, SAVED_ROUTE + "-preview")))
+        self.assertTrue(stale_refusal("full", f"Model unavailable\n┃  ┃{SAVED_ROUTE} is not available"))
+
+    def test_seed_rejects_fixture_that_grows_after_measurement(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            source = Path(scratch) / "source"
+            target = Path(scratch) / "target"
+            source.write_bytes(b"abc")
+            first_read = 1024 * 1024
+            measure = os.fstat
+
+            def measure_then_grow(fd):
+                info = measure(fd)
+                with source.open("ab") as writer:
+                    writer.write(b"d" * (first_read + 1))
+                return info
+
+            with (
+                patch("probe.MAX_FIXTURE_BYTES", first_read + 3),
+                patch("probe.os.fstat", side_effect=measure_then_grow),
+                self.assertRaisesRegex(RuntimeError, "exceeded its size bound"),
+            ):
+                seed(source, target)
+            self.assertEqual(target.stat().st_size, first_read)
 
     def test_final_verdict_includes_in_flight_handler(self):
         self.assertEqual({name for _, name in socket.if_nameindex()}, {"lo"},
@@ -69,7 +97,7 @@ class EvidenceChecks(unittest.TestCase):
 
         def send_extra():
             with closing(http.client.HTTPConnection("127.0.0.1", fake.server_port, timeout=3)) as client:
-                client.request("POST", "/claude--work/v1/chat/completions", "{}")
+                client.request("POST", f"/{CLAUDE_WORK}/v1/chat/completions", "{}")
                 response = client.getresponse()
                 statuses.append(response.status)
                 response.read()
@@ -109,7 +137,7 @@ class EvidenceChecks(unittest.TestCase):
             with closing(http.client.HTTPConnection("127.0.0.1", fake.server_port, timeout=3)) as client:
                 client.putrequest("POST", APPROVED_TARGET)
                 client.putheader("Content-Length", str(len(payload)))
-                client.putheader("Authorization", "Bearer offline-fixture")
+                client.putheader("Authorization", FIXTURE_AUTH)
                 client.endheaders()
                 self.assertTrue(arrived.wait(2))
                 fake.mark("approved", SELECT)
@@ -156,7 +184,7 @@ class EvidenceChecks(unittest.TestCase):
                         self.subTest(method=method, target=target),
                         closing(http.client.HTTPConnection("127.0.0.1", fake.server_port, timeout=3)) as client,
                     ):
-                        client.request(method, target, payload, {"Authorization": "Bearer offline-fixture"})
+                        client.request(method, target, payload, {"Authorization": FIXTURE_AUTH})
                         response = client.getresponse()
                         self.assertEqual(response.status, status)
                         body = response.read()

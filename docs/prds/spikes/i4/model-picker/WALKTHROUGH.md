@@ -30,8 +30,9 @@ Its mounts include the stock executable, read-only JSON configuration, read-only
 empty workspace, and its own scratch home and XDG directories. The tmux control
 socket and the fake's one-shot gate are outside the frontend's mounts. The
 launcher uses a separate mode-0700 temporary directory for each frontend.
-The controller creates a mode-0700 staging directory at the location required
-by nested Bubblewrap. The frontend receives its own `TMPDIR` and no host temporary directory.
+The controller creates the `/tmp` staging directory required by nested Bubblewrap
+with mode 0700 inside its own mount namespace. The directory has no host bind
+mount. The frontend has its own `TMPDIR` and no `/tmp` mount.
 The launcher uses these managed startup settings.
 
 - `OPENCODE_CONFIG_PROJECT_DISABLE=true`
