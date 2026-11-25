@@ -305,11 +305,13 @@ class _TerminalScreen:
         if mode == 3:
             return
         if mode == 0:
+            self._wrap_pending = False
             for c in range(self.col, self.cols):
                 self.grid[self.row][c] = " "
             for r in range(self.row + 1, self.rows):
                 self.grid[r] = [" "] * self.cols
         elif mode == 1:
+            self._wrap_pending = False
             for r in range(0, self.row):
                 self.grid[r] = [" "] * self.cols
             for c in range(0, min(self.col + 1, self.cols)):
@@ -319,11 +321,14 @@ class _TerminalScreen:
 
     def _erase_line(self, mode: int) -> None:
         if mode == 2:
+            self._wrap_pending = False
             self.grid[self.row] = [" "] * self.cols
         elif mode == 0:
+            self._wrap_pending = False
             for c in range(self.col, self.cols):
                 self.grid[self.row][c] = " "
         elif mode == 1:
+            self._wrap_pending = False
             for c in range(0, min(self.col + 1, self.cols)):
                 self.grid[self.row][c] = " "
         else:
@@ -363,14 +368,17 @@ class _TerminalScreen:
             self.row = max(0, min(self.rows - 1, n1 - 1))
 
     def _erase_chars(self, count: int) -> None:
+        self._wrap_pending = False
         for c in range(self.col, min(self.cols, self.col + count)):
             self.grid[self.row][c] = " "
 
     def _delete_chars(self, count: int) -> None:
+        self._wrap_pending = False
         tail = self.grid[self.row][self.col + count:]
         self.grid[self.row][self.col:] = tail + [" "] * (self.cols - self.col - len(tail))
 
     def _insert_chars(self, count: int) -> None:
+        self._wrap_pending = False
         step = min(count, self.cols - self.col)
         tail = self.grid[self.row][self.col:self.cols - step]
         self.grid[self.row][self.col:] = [" "] * step + tail
@@ -383,10 +391,12 @@ class _TerminalScreen:
         self.grid[top:bottom + 1] = (region[step:] + blanks) if up else (blanks + region[:-step])
 
     def _delete_lines(self, count: int) -> None:
+        self._wrap_pending = False
         if self._scroll_top <= self.row <= self._scroll_bottom:
             self._scroll_region(self.row, self._scroll_bottom, count, up=True)
 
     def _insert_lines(self, count: int) -> None:
+        self._wrap_pending = False
         if self._scroll_top <= self.row <= self._scroll_bottom:
             self._scroll_region(self.row, self._scroll_bottom, count, up=False)
 
@@ -627,7 +637,7 @@ class _TerminalScreen:
         self.grid[self.row][self.col] = " " if self._is_text_hidden() else mapped
         if self.col + 1 < self.cols:
             self.col += 1
-        elif self._autowrap:
+        else:
             self._wrap_pending = True
 
     def _put_char(self, ch: str) -> None:
@@ -647,8 +657,10 @@ class _TerminalScreen:
             self.col = max(0, self.col - 1)
             self._wrap_pending = False
         elif ch == "\t":
-            self.col = min(self.cols - 1, ((self.col // 8) + 1) * 8)
-            self._wrap_pending = False
+            new_col = min(self.cols - 1, ((self.col // 8) + 1) * 8)
+            if new_col != self.col:
+                self.col = new_col
+                self._wrap_pending = False
         elif ch >= " " and ch != "\x7f":
             self._put_printable(ch)
 

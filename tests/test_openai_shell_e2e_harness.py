@@ -4013,6 +4013,15 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 shell_driver.render_terminal_screen("\x1b[?7hABCD\x1b7\x1b[?7l\x1b8E", rows=4, cols=4).splitlines()[:2],
                 ["ABCE", ""],
             )
+            # Pending right-margin wrap is recorded even with DECAWM off and kept when HT does not move cursor.
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[?7lABCD\x1b[?7hE", rows=4, cols=4).splitlines()[:2],
+                ["ABCD", "E"],
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("ABCD\tE", rows=4, cols=4).splitlines()[:2],
+                ["ABCD", "E"],
+            )
             # Non-allowlisted XTWINOPS / geometry ops permanently invalidate certainty across CSI 2J and ?1049h.
             for resize_op in (
                 "\x1b[8;24;80t",
@@ -4049,6 +4058,21 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertEqual(
                 shell_driver.render_terminal_screen("ABCD\x0cZ", rows=4, cols=4).splitlines()[:3],
                 ["ABCD", "   Z", ""],
+            )
+            # Edit CSIs (P/@/X/K/0J/1J/L/M) clear pending wrap; scrollback-only 3J leaves pending wrap intact.
+            self.assertEqual(
+                shell_driver.render_terminal_screen("ABCD\x1b[1PZ", rows=4, cols=4).splitlines()[:2],
+                ["ABCZ", ""],
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("ABCD\x1b[3JZ", rows=4, cols=4).splitlines()[:2],
+                ["ABCD", "Z"],
+            )
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(f"\x1b[1;120H \x1b[2K{route_txt}", approval),
+            )
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(f"\x1b[1;120H \x1b[0J{route_txt}", approval),
             )
             self.assertEqual(shell_driver.render_terminal_screen("ab\x7fc").strip(), "abc")
             wide_old = "x" * (len(route_txt) + 5)
