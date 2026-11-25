@@ -146,16 +146,22 @@ def _atomic_fsync_write(path: Path, data: bytes) -> None:
         raise
 
 
-def _stat_owned_dir(path_str: str) -> tuple[int, int] | None:
+def _open_owned_dir_pin(path_str: str) -> tuple[int, int, int] | None:
     if not path_str:
         return None
     try:
-        info = os.lstat(path_str)
+        fd = os.open(path_str, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return None
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            os.close(fd)
+            return None
+        return fd, info.st_dev, info.st_ino
+    except OSError:
+        os.close(fd)
         return None
-    return info.st_dev, info.st_ino
 
 
 def _clear_dir_fd(dir_fd: int) -> None:
@@ -377,9 +383,23 @@ class _OwnershipJournal:
         self.worktree_owned = False
         self.worktree_dev_ino: tuple[int, int] | None = None
         self.slots: dict[str, dict[str, object]] = {}
+        self._pinned_slot_fds: dict[str, int] = {}
         self.owned_cids: set[str] = set()
         self.ownership_uncertain = False
         self.cleanup_errors: list[str] = []
+
+    def _close_pinned_slot_fd(self, slot_key: str) -> None:
+        fd = self._pinned_slot_fds.pop(slot_key, None)
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+
+    def _close_all_pinned_slot_fds(self) -> None:
+        for slot_key in list(self._pinned_slot_fds):
+            self._close_pinned_slot_fd(slot_key)
+
+    def __del__(self) -> None:
+        self._close_all_pinned_slot_fds()
 
     def _persist(self) -> None:
         if self.journal_path is None:
@@ -530,8 +550,13 @@ class _OwnershipJournal:
             prev_dev, prev_ino = prev.get("slot_root_dev"), prev.get("slot_root_ino")
             if type(prev_dev) is int and type(prev_ino) is int:
                 return prev_dev, prev_ino
-        ident = _stat_owned_dir(slot_root)
-        return ident if ident is not None else (None, None)
+        self._close_pinned_slot_fd(slot_key)
+        pinned = _open_owned_dir_pin(slot_root)
+        if pinned is None:
+            return None, None
+        fd, dev, ino = pinned
+        self._pinned_slot_fds[slot_key] = fd
+        return dev, ino
 
     def prepare_slot(self, slot_key: str, *, container_name: str, slot_root: str = "") -> None:
         """Persist intended slot BEFORE open_slot() acquires any profile lease in worker_leases."""
@@ -619,23 +644,26 @@ class _OwnershipJournal:
         return labels if isinstance(labels, dict) else {}
 
     def teardown(self) -> dict[str, object]:
-        self._reconcile_slots()
-        lock_target: Path | str | None = self._lock_helper_source or self._lock_helper
-        if lock_target is not None and self._state_dir is not None:
-            try:
-                with _LifecycleLock(lock_target, self._state_dir, self.instance):
-                    self._teardown_pod_volume_worktree()
-            except CleanupOwnerError:
-                self.ownership_uncertain = True
-                self.cleanup_errors.append("teardown_lifecycle_lock_failed")
-        else:
-            self._teardown_pod_volume_worktree()
-        self._persist()
-        return {
-            "cleanup_verified": (not self.cleanup_errors) and (not self.ownership_uncertain),
-            _KEY_UNCERTAIN: self.ownership_uncertain,
-            "errors": list(self.cleanup_errors),
-        }
+        try:
+            self._reconcile_slots()
+            lock_target: Path | str | None = self._lock_helper_source or self._lock_helper
+            if lock_target is not None and self._state_dir is not None:
+                try:
+                    with _LifecycleLock(lock_target, self._state_dir, self.instance):
+                        self._teardown_pod_volume_worktree()
+                except CleanupOwnerError:
+                    self.ownership_uncertain = True
+                    self.cleanup_errors.append("teardown_lifecycle_lock_failed")
+            else:
+                self._teardown_pod_volume_worktree()
+            self._persist()
+            return {
+                "cleanup_verified": (not self.cleanup_errors) and (not self.ownership_uncertain),
+                _KEY_UNCERTAIN: self.ownership_uncertain,
+                "errors": list(self.cleanup_errors),
+            }
+        finally:
+            self._close_all_pinned_slot_fds()
 
     def _confirm_absent(self, kind: str, target: str, error_code: str) -> bool:
         """Return True ONLY when podman `<kind> exists <target>` exits with explicit absence code 1."""
@@ -677,14 +705,19 @@ class _OwnershipJournal:
     def _remove_released_slot_root(self, slot_key: str, entry: dict[str, object]) -> None:
         slot_root = str(entry.get("slot_root") or "")
         if not slot_root:
+            self._close_pinned_slot_fd(slot_key)
             return
         want_dev = entry.get("slot_root_dev")
         want_ino = entry.get("slot_root_ino")
         if type(want_dev) is not int or type(want_ino) is not int:
+            self._close_pinned_slot_fd(slot_key)
             self.ownership_uncertain = True
             self.cleanup_errors.append(f"slot_root_identity_unknown:{slot_key}")
             return
-        outcome = _remove_pinned_dir(Path(slot_root), want_dev, want_ino)
+        try:
+            outcome = _remove_pinned_dir(Path(slot_root), want_dev, want_ino)
+        finally:
+            self._close_pinned_slot_fd(slot_key)
         if outcome == "replaced":
             self.ownership_uncertain = True
             self.cleanup_errors.append(f"slot_root_identity_mismatch:{slot_key}")
