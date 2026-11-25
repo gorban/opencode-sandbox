@@ -2879,6 +2879,84 @@ esac
         state_data = json.loads((personal_dir / "state.json").read_text(encoding="utf-8"))
         self.assertIn(retained_root.name, state_data.get("worker_leases", {}))
 
+    def test_gate4_r4_exists_timeout_after_failed_create_preserves_error_root_and_lease(self):
+        import gc
+        import io
+        import pwd
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.cli import StreamTerminal
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.managed.runtime import JobRuntimeError
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.catalog import ResolvedLaunchPlan
+        from oc_providers.contracts import ProviderInstanceSpec
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        backend = self._make_real_profile_backend(scratch / "exists_timeout_profiles")
+        backend.connect("personal")
+        view = backend.profiles.snapshot()
+        personal_dir = next(p.directory for p in view.saved if p.label == "personal")
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+
+        created_slot_roots: list[Path] = []
+        orig_mkdtemp = tempfile.mkdtemp
+
+        def tracking_mkdtemp(*args, **kwargs):
+            path = Path(orig_mkdtemp(*args, **kwargs))
+            created_slot_roots.append(path)
+            self.addCleanup(lambda p=path: shutil.rmtree(p, ignore_errors=True))
+            return str(path)
+
+        def failing_podman(*args, **_kwargs):
+            if args[0] == "create":
+                raise JobRuntimeError("create timed out")
+            if args[:2] == ("container", "exists"):
+                raise JobRuntimeError("exists probe timed out")
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        err_buf = io.StringIO()
+        cleanup_state = {"clean": False}
+        rb_root = self.root / "r4_root"
+        rb_root.mkdir(mode=0o700)
+
+        def _run_failed_create():
+            adapter = OpenAISessionAdapter(backend)
+            pref = adapter.preflight_instance(ProviderInstanceSpec("openai", "personal", True, "subscription"))
+            plan = ResolvedLaunchPlan(
+                admitted=(pref,), excluded=(), initial_provider_id="openai--personal",
+                initial_model="gpt-6.2-sol", ui_mode="full", ui_source="default",
+                acknowledged_digests={},
+            )
+            term = StreamTerminal(io.StringIO(), io.StringIO(), err_buf)
+            spec = self._valid_spec()
+            stop_ev = threading.Event()
+            with (
+                patch.object(session_broker.tempfile, "mkdtemp", side_effect=tracking_mkdtemp),
+                patch.object(session_broker, "_verify_pod_with_containers", return_value=("1" * 64, [])),
+                patch.object(session_broker, "_ensure_containers_idle"),
+                patch.object(session_broker, "podman", side_effect=failing_podman),
+            ):
+                with self.assertRaisesRegex(JobRuntimeError, "create timed out"):
+                    session_broker._run_multi_slot_session(
+                        spec, plan, {"openai": adapter}, rb_root, stop_ev, term, cleanup_state,
+                    )
+
+        _run_failed_create()
+        gc.collect()
+        gc.collect()
+
+        self.assertFalse(cleanup_state["clean"])
+        self.assertEqual(len(created_slot_roots), 1)
+        self.assertTrue(created_slot_roots[0].exists(), "unconfirmed slot_root must be retained for inspection")
+        self.assertIn("Provider session cleanup needs verification", err_buf.getvalue())
+        fresh_conn = Connection(personal_dir, host_probe=lambda: host)
+        self.assertTrue(
+            fresh_conn.has_active_leases(),
+            "durable lease must remain on disk when container exists probe times out after failed create",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

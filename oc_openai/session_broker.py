@@ -1418,6 +1418,10 @@ class _SessionSlotCoordinator:
                 slot.slot_cm.__exit__(None, None, None)
             except Exception as exc:
                 self._record_error(exc)
+        with self._lock:
+            still_unconfirmed = any(s.creating_relay or not s.exited for s in self._slots.values())
+        if still_unconfirmed:
+            self._record_error(RuntimeError("Slot relay state remained unconfirmed during teardown"))
 
     def teardown_all(self, agent_id: str | None) -> Exception | None:
         if agent_id is not None:
@@ -1464,6 +1468,13 @@ def _write_session_opencode_config(root: Path, config_payload: dict) -> Path:
     return cfg_path
 
 
+def _confirm_relay_absent(relay_name: str) -> bool:
+    try:
+        return podman("container", "exists", relay_name, check=False, timeout=4).returncode == 1
+    except Exception:
+        return False
+
+
 def _start_and_verify_slot_relay(
     spec: dict,
     pod_id: str,
@@ -1479,12 +1490,10 @@ def _start_and_verify_slot_relay(
     try:
         relay_id = podman(*handle.build_relay_args(spec)).stdout.decode("ascii").strip()
     except BaseException:
-        exists = podman("container", "exists", relay_name, check=False, timeout=4)
-        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=(exists.returncode == 1))
+        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=_confirm_relay_absent(relay_name))
         raise
     if not IMAGE_ID.fullmatch(relay_id):
-        exists = podman("container", "exists", relay_name, check=False, timeout=4)
-        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=(exists.returncode == 1))
+        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=_confirm_relay_absent(relay_name))
         raise RuntimeError("Podman did not return a complete relay container ID")
     if not coordinator.finish_relay_create(handle.slot_index, relay_id):
         raise ConnectionError("connection_retired")
