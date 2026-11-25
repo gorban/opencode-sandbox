@@ -20,7 +20,7 @@ from oc_orchestrator.capture import CaptureError, capture
 from oc_orchestrator.claude import Broker, NativeFrames, fixture_instances, native_process, run_proof as run_claude_proof
 from oc_orchestrator.claude_fixture import extra_descriptors, turn
 from oc_orchestrator.claude_protocol import (
-    PREFIX, SETTINGS, STOCK_MODEL, TURN_INITIALIZE, USER, ProtocolError, decode, encode,
+    LIMIT, PREFIX, SETTINGS, STOCK_MODEL, TURN_INITIALIZE, USER, ProtocolError, decode, encode,
     select_native, validate_sdk, validate_turn_output,
 )
 from oc_orchestrator.owner import Lifeline
@@ -248,6 +248,148 @@ class OrchestratorTest(unittest.TestCase):
             native.assert_called_once()
             self.assertEqual((broker.sends, native_writes), (1, [USER]))
 
+    def test_claude_stale_discovery_proof_cannot_be_rebound_after_a_b_a(self):
+        personal, team = "claude--personal", "claude--team"
+        instances = {slot: SimpleNamespace(models=("haiku",)) for slot in (personal, team)}
+        broker = Broker(None, SimpleNamespace(check=lambda: None), instances, {})
+        retired = broker.offer(personal, "haiku")
+        broker.offer(team, "haiku")
+        current = broker.offer(personal, "haiku")
+        broker.identify(current)
+        with self.assertRaises(ProtocolError):
+            broker.identify({**current, "proof": retired["proof"]})
+        self.assertEqual(broker.sends, 0)
+
+    def test_claude_discovery_errors_and_pending_requests_prevent_the_turn(self):
+        for case in ("completed", "queued", "active"):
+            with self.subTest(case=case), TemporaryDirectory(dir="/tmp") as directory:
+                root = Path(directory) / "scratch"
+                root.mkdir()
+                stages = []
+                brokers = []
+                request_sent, handler_started, release_handler = Event(), Event(), Event()
+                original_poll, original_serve = Broker.poll, Broker.serve
+
+                def poll(broker, listener, *phase):
+                    if case == "queued":
+                        (phase[0] if phase else request_sent).wait(timeout=3)
+                    return original_poll(broker, listener, *phase)
+
+                def serve(broker, client):
+                    if case != "active":
+                        return original_serve(broker, client)
+                    with client, broker.own(broker.clients, client):
+                        handler_started.set()
+                        release_handler.wait(timeout=1)
+
+                def run_frontend(root, stage, _lifeline, broker):
+                    stages.append(stage)
+                    brokers.append(broker)
+                    if stage == "turn":
+                        # Count the send old launchers permit after a failed discovery.
+                        broker.dispatch(broker.selection, lambda: None)
+                        return subprocess.CompletedProcess([], 1, stdout=b"")
+                    address = root / "socket" / stage / "native.sock"
+                    if not address.exists():
+                        address = root / "socket" / "native.sock"
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+                        peer.settimeout(3)
+                        peer.connect(str(address))
+                        peer.sendall(b"{}\n")
+                        peer.shutdown(socket.SHUT_WR)
+                        request_sent.set()
+                        if case == "completed":
+                            self.assertEqual(response(peer), b"")
+                        elif case == "active":
+                            self.assertTrue(handler_started.wait(timeout=3))
+                    return subprocess.CompletedProcess([], 0, stdout=STOCK_MODEL.encode() + b"\n")
+
+                lifeline = SimpleNamespace(check=lambda: None, active=lambda: True)
+                with (patch("oc_orchestrator.claude.mkdtemp", return_value=str(root)),
+                      patch("oc_orchestrator.claude.seed"),
+                      patch("oc_orchestrator.claude.run_frontend", side_effect=run_frontend),
+                      patch.object(Broker, "poll", new=poll),
+                      patch.object(Broker, "serve", new=serve)):
+                    with self.assertRaises(Failure):
+                        run_claude_proof(lifeline)
+                self.assertEqual(brokers[0].sends, 0)
+                self.assertEqual(stages, ["discovery"])
+                self.assertIsNone(brokers[0].selection)
+
+    def test_claude_fixture_permissions_under_user_private_group_umask(self):
+        with TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory) / "scratch"
+            root.mkdir()
+            stages = []
+
+            def inspect_stage(root, stage, _lifeline, _broker):
+                stages.append(stage)
+                for folder in ("state", f"state/{stage}", f"state/{stage}/tmp", "socket", f"socket/{stage}",
+                               "frontend", f"frontend/{stage}", "profiles", "provider-config", "workspace"):
+                    self.assertEqual(stat.S_IMODE((root / folder).stat().st_mode), 0o700)
+                for file in ("provider-config/providers.toml", f"socket/{stage}/native.sock",
+                             f"frontend/{stage}/route.json", "profiles/claude--personal"):
+                    self.assertEqual(stat.S_IMODE((root / file).stat().st_mode), 0o600)
+                if stage == "discovery":
+                    return subprocess.CompletedProcess([], 0, stdout=STOCK_MODEL.encode() + b"\n")
+                return subprocess.CompletedProcess([], 1, stdout=b"")
+
+            lifeline = SimpleNamespace(check=lambda: None, active=lambda: True)
+            old_umask = os.umask(0o002)
+            try:
+                with (patch("oc_orchestrator.claude.mkdtemp", return_value=str(root)),
+                      patch("oc_orchestrator.claude.seed"),
+                      patch("oc_orchestrator.claude.run_frontend", side_effect=inspect_stage)):
+                    with self.assertRaisesRegex(Failure, "could not verify the isolated OpenCode turn"):
+                        run_claude_proof(lifeline)
+                self.assertEqual(os.umask(0o002), 0o002)
+            finally:
+                os.umask(old_umask)
+            self.assertEqual(stages, ["discovery", "turn"])
+
+    def test_claude_fixture_config_rejection_reports_setup_failure(self):
+        unsupported = SimpleNamespace(kind="openai")
+        config = SimpleNamespace(launch=SimpleNamespace(default_provider=("claude", "personal")),
+                                 instances=(unsupported,))
+        with (TemporaryDirectory(dir="/tmp") as directory,
+              patch("oc_providers.config.load_provider_config", return_value=config)):
+            with self.assertRaisesRegex(Failure, "fixture provider configuration is unsupported"):
+                fixture_instances(Path(directory))
+
+    def test_claude_raw_wire_errors_are_typed_and_produce_no_output(self):
+        malformed = {
+            "invalid JSON": b'{"bad":}\n',
+            "invalid UTF-8": b'{"bad":"\xff"}\n',
+            "duplicate": b'{"bad":1,"bad":2}\n',
+            "NaN": b'{"bad":NaN}\n',
+            "Infinity": b'{"bad":Infinity}\n',
+            "over limit": b" " * LIMIT + b"\n",
+            "truncated": b"{",
+            "empty": b"",
+            "nested": b"[" * 10000 + b"]" * 10000 + b"\n",
+        }
+        broker = Broker(None, SimpleNamespace(check=lambda: None), {}, {})
+        for name, payload in malformed.items():
+            with self.subTest(name=name):
+                with self.assertRaises(ProtocolError):
+                    decode(payload)
+                client, peer = socket.socketpair()
+                with client, peer:
+                    peer.settimeout(3)
+                    peer.sendall(payload)
+                    peer.shutdown(socket.SHUT_WR)
+                    with self.assertRaises(ProtocolError):
+                        broker.serve(client)
+                    self.assertEqual(response(peer), b"")
+            self.assertEqual(broker.sends, 0)
+
+        for payload in (malformed["over limit"], malformed["truncated"], malformed["empty"]):
+            with TemporaryFile() as native:
+                native.write(payload)
+                native.seek(0)
+                with self.assertRaises(ProtocolError):
+                    NativeFrames(native).next_line()
+
     def test_claude_synthetic_requires_a_complete_native_tool_free_turn(self):
         session = "00000000-0000-4000-8000-000000000001"
         frames = list(turn(session))
@@ -375,9 +517,17 @@ class OrchestratorTest(unittest.TestCase):
                 hostile.chmod(0)
                 raise CaptureError("synthetic frontend failed")
 
+            original_chmod = os.chmod
+
+            def older_kernel_chmod(path, mode, **kwargs):
+                if kwargs.get("follow_symlinks") is False:
+                    raise NotImplementedError("fchmodat2 unavailable")
+                return original_chmod(path, mode, **kwargs)
+
             lifeline = SimpleNamespace(check=lambda: None, active=lambda: True)
             with (patch("oc_orchestrator.claude.mkdtemp", return_value=str(root)),
                   patch("oc_orchestrator.claude.seed"),
+                  patch("oc_orchestrator.claude.os.chmod", new=older_kernel_chmod),
                   patch("oc_orchestrator.claude.capture", side_effect=fail_after_frontend_write)):
                 with self.assertRaisesRegex(Failure, "within its bound"):
                     run_claude_proof(lifeline)
@@ -414,7 +564,7 @@ class OrchestratorTest(unittest.TestCase):
                 return subprocess.CompletedProcess([], 0, stdout=STOCK_MODEL.encode() + b"\n")
             route = json.loads((root / "frontend" / "turn" / "route.json").read_text())
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
-                peer.connect(str(root / "socket" / "native.sock"))
+                peer.connect(str(root / "socket" / stage / "native.sock"))
                 peer.sendall(encode({"route": route, "argv": args}))
                 self.assertTrue(started.wait(timeout=3))
             return subprocess.CompletedProcess([], 1, stdout=b"")

@@ -36,7 +36,10 @@ def pairs(entries):
 
 def decode(line):
     require(0 < len(line) <= LIMIT and line.endswith(b"\n"))
-    message = json.loads(line, object_pairs_hook=pairs, parse_constant=reject_constant)
+    try:
+        message = json.loads(line.decode("utf-8"), object_pairs_hook=pairs, parse_constant=reject_constant)
+    except (ValueError, RecursionError):
+        raise ProtocolError("malformed JSON fixture message") from None
     require(type(message) is dict)
     return message
 

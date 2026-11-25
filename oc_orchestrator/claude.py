@@ -45,6 +45,11 @@ def config():
     }
 
 
+def private_write(path, content):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(content)
+
 
 def fixture_instances(root):
     # The launcher checks its own package. Apply the same checks before importing the shared config reader.
@@ -60,31 +65,37 @@ def fixture_instances(root):
 
     directory = root / "provider-config"
     directory.mkdir(mode=0o700)
-    (directory / "providers.toml").write_text(
-        '[launch]\ndefault_provider = "claude/personal"\n'
-        '[providers.claude.personal]\nenabled = true\nauth_mode = "subscription"\n'
-        '[providers.claude.team]\nenabled = true\nauth_mode = "subscription"\n'
+    private_write(directory / "providers.toml",
+        b'[launch]\ndefault_provider = "claude/personal"\n'
+        b'[providers.claude.personal]\nenabled = true\nauth_mode = "subscription"\n'
+        b'[providers.claude.team]\nenabled = true\nauth_mode = "subscription"\n'
     )
     try:
         loaded = load_provider_config(config_dir=directory, sandbox_dir=root / "workspace")
     except ProviderIntegrityError:
         raise Failure("Claude fixture provider configuration could not be loaded") from None
     instances = {}
+    if loaded is None or loaded.launch.default_provider is None:
+        raise Failure("Claude fixture provider configuration has no default")
     for spec in loaded.instances:
-        require(spec.kind == "claude" and spec.enabled and spec.auth_mode == "subscription"
-                and spec.credential_ref is None and spec.cli_path is None)
+        if (spec.kind != "claude" or not spec.enabled or spec.auth_mode != "subscription"
+                or spec.credential_ref is not None or spec.cli_path is not None):
+            raise Failure("Claude fixture provider configuration is unsupported")
         instances[spec.scoped_id] = InstancePreflight(
             spec, ReadinessState.READY, models=("haiku",), route_policy="offline fixture",
         )
-    selected = next(item.spec.scoped_id for item in instances.values()
-                    if item.spec.qualified_name == "/".join(loaded.launch.default_provider))
+    selected = next((item.spec.scoped_id for item in instances.values()
+                     if item.spec.qualified_name == "/".join(loaded.launch.default_provider)), None)
+    if selected is None:
+        raise Failure("Claude fixture provider configuration has an unavailable default")
     return instances, selected
 
 
 def seed(root):
     program = root / "program"
     config_dir = program / "config" / "opencode"
-    config_dir.mkdir(parents=True)
+    for directory in (program, config_dir.parent, config_dir):
+        directory.mkdir(mode=0o700)
     (config_dir / "opencode.jsonc").write_text(json.dumps(config()))
     target = program / "opencode"
     binary = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cache/oc-sandbox/fixtures/opencode-2.3.0"
@@ -119,7 +130,7 @@ def open_code_command(root, stage):
     return [*namespace(root), "--bind", str(root / "state" / stage), "/state",
             "--ro-bind", str(root / "workspace"), "/workspace", "--chdir", "/workspace",
             "--ro-bind", str(root / "frontend" / stage), "/frontend",
-            "--ro-bind", str(root / "socket"), "/broker",
+            "--ro-bind", str(root / "socket" / stage), "/broker",
             "--setenv", "HOME", "/state", "--setenv", "XDG_CONFIG_HOME", "/opt/proof/config",
             "--setenv", "XDG_CACHE_HOME", "/state/cache", "--setenv", "XDG_DATA_HOME", "/state/data",
             "--setenv", "XDG_STATE_HOME", "/state/xdg-state", "--setenv", "TMPDIR", "/state/tmp",
@@ -183,7 +194,7 @@ class NativeFrames:
 class Broker:
     def __init__(self, root, lifeline, instances, profiles):
         self.root, self.lifeline, self.instances, self.profiles = root, lifeline, instances, profiles
-        self.discovery_proofs = {slot: secrets.token_hex(32) for slot in instances}
+        self.proposal_proof = None
         self.selection = None
         self.turn_proof = None
         self.epoch = 0
@@ -223,12 +234,13 @@ class Broker:
             require(not self.stop.is_set() and model in self.instances[slot].models)
             self.epoch += 1
             self.proposal = self.epoch, slot, model
-            return {"slot": slot, "model": model, "epoch": self.epoch, "proof": self.discovery_proofs[slot]}
+            self.proposal_proof = secrets.token_hex(32)
+            return {"slot": slot, "model": model, "epoch": self.epoch, "proof": self.proposal_proof}
 
     def identify(self, route, *, inference=False):
         require(type(route) is dict and set(route) == {"slot", "model", "epoch", "proof"})
         slot, model, epoch, proof = (route[key] for key in ("slot", "model", "epoch", "proof"))
-        require(type(slot) is str and slot in self.discovery_proofs)
+        require(type(slot) is str and slot in self.instances)
         require(type(proof) is str and len(proof) == 64 and proof.isascii())
         require(type(model) is str and model in self.instances[slot].models and type(epoch) is int)
         binding = epoch, slot, model
@@ -236,7 +248,7 @@ class Broker:
             self.lifeline.check()
             require(not self.stop.is_set())
             if binding == self.proposal and not inference:
-                expected = self.discovery_proofs[slot]
+                expected = self.proposal_proof
             else:
                 require(binding == self.selection and (not inference or self.sends == 0))
                 expected = self.turn_proof
@@ -246,16 +258,18 @@ class Broker:
     def activate(self, binding, observed_model):
         with self.lock:
             self.lifeline.check()
+            if self.errors or self.clients or self.children:
+                raise Failure("Claude fixture broker did not complete discovery cleanly")
             require(not self.stop.is_set() and self.proposal == binding and observed_model == STOCK_MODEL)
             self.turn_proof = secrets.token_hex(32)
             self.selection = binding
-            self.proposal = None
+            self.proposal = self.proposal_proof = None
             epoch, slot, model = binding
             return {"slot": slot, "model": model, "epoch": epoch, "proof": self.turn_proof}
 
     def cancel(self):
         with self.lock:
-            self.proposal = None
+            self.proposal = self.proposal_proof = None
 
     def dispatch(self, binding, write):
         with self.lock:
@@ -315,23 +329,44 @@ class Broker:
             self.receipt = binding
             client.sendall(b"".join(encode(reply) for reply in replies))
 
-    def poll(self, listener):
+    def record_error(self, error):
+        with self.lock:
+            self.errors.append(error)
+
+    def serve_job(self, client):
+        try:
+            self.serve(client)
+        except Exception as error:
+            self.record_error(error)
+
+    def poll(self, listener, finished):
         with ThreadPoolExecutor(max_workers=3) as pool:
             jobs = []
-            while not self.stop.is_set() and self.lifeline.active():
-                try:
-                    client, _address = listener.accept()
-                except TimeoutError:
-                    continue
-                if len(jobs) == 5:
-                    client.close()
-                    self.errors.append(ProtocolError("too many Claude SDK process requests"))
-                    break
-                jobs.append(pool.submit(self.serve, client))
-            for job in jobs:
-                failure = job.exception()
-                if failure is not None:
-                    self.errors.append(failure)
+            try:
+                while not (finished.is_set() or self.stop.is_set()) and self.lifeline.active():
+                    try:
+                        client, _address = listener.accept()
+                    except TimeoutError:
+                        continue
+                    if finished.is_set() or len(jobs) == 5:
+                        client.close()
+                        self.record_error(ProtocolError("unexpected queued Claude fixture request"))
+                        break
+                    jobs.append(pool.submit(self.serve_job, client))
+
+                if finished.is_set() and not self.stop.is_set():
+                    listener.setblocking(False)
+                    try:
+                        client, _address = listener.accept()
+                    except BlockingIOError:
+                        pass
+                    else:
+                        client.close()
+                        self.record_error(ProtocolError("unexpected queued Claude fixture request"))
+                    if any(not job.done() for job in jobs):
+                        self.record_error(ProtocolError("Claude fixture phase ended with active requests"))
+            except (OSError, RuntimeError) as error:
+                self.record_error(error)
 
 
 def remove_scratch(root):
@@ -341,9 +376,16 @@ def remove_scratch(root):
     while directories:
         directory = directories.pop()
         mode = directory.lstat().st_mode
-        require(stat.S_ISDIR(mode))
+        if not stat.S_ISDIR(mode):
+            raise Failure("Claude fixture scratch directory is invalid")
         if mode & stat.S_IRWXU != stat.S_IRWXU:
-            os.chmod(directory, mode | stat.S_IRWXU, follow_symlinks=False)
+            # An O_PATH descriptor pins the directory without requiring traversal permission.
+            # The proc link works on Linux kernels without fchmodat2.
+            fd = os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.chmod(f"/proc/self/fd/{fd}", stat.S_IMODE(os.fstat(fd).st_mode) | stat.S_IRWXU)
+            finally:
+                os.close(fd)
         with os.scandir(directory) as entries:
             directories.extend(Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False))
     shutil.rmtree(root)
@@ -354,55 +396,80 @@ def run_frontend(root, stage, lifeline, broker):
                    on_revoke=broker.retire)
 
 
+def run_stage(root, stage, lifeline, broker):
+    address = root / "socket" / stage / "native.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        # The parent directory is already private. Tighten the socket before listening.
+        listener.bind(str(address))
+        address.chmod(0o600)
+        listener.listen(3)
+        listener.settimeout(.15)
+        finished = Event()
+        thread = Thread(target=broker.poll, args=(listener, finished), daemon=True)
+        try:
+            try:
+                thread.start()
+            except (OSError, RuntimeError):
+                raise Failure("Claude fixture broker could not start") from None
+            return run_frontend(root, stage, lifeline, broker)
+        finally:
+            finished.set()
+            try:
+                if thread.ident is not None:
+                    thread.join(timeout=10)
+            except (OSError, RuntimeError):
+                raise RetirementUnverified("Claude fixture broker retirement could not be verified") from None
+            if thread.is_alive():
+                raise RetirementUnverified("Claude fixture broker is still running")
+            with broker.lock:
+                if (broker.children or broker.clients
+                        or any(isinstance(error, RetirementUnverified) for error in broker.errors)):
+                    raise RetirementUnverified("Claude fixture broker retirement could not be verified")
+
+
 def run_proof(lifeline):
     root = Path(mkdtemp(prefix="oc-claude-proof-", dir="/tmp"))
     removable = True
     try:
-        for name in ("workspace", "state/discovery/tmp", "state/turn/tmp", "socket", "profiles",
-                     "frontend/discovery", "frontend/turn"):
-            (root / name).mkdir(mode=0o700, parents=True)
-        (root / "workspace" / "job.txt").write_text("synthetic job data")
+        for name in ("workspace", "state", "state/discovery", "state/discovery/tmp", "state/turn", "state/turn/tmp",
+                     "socket", "socket/discovery", "socket/turn", "profiles", "frontend", "frontend/discovery",
+                     "frontend/turn"):
+            (root / name).mkdir(mode=0o700)
+        private_write(root / "workspace" / "job.txt", b"synthetic job data")
         seed(root)
         instances, selected = fixture_instances(root)
         profiles = {}
         for slot in instances:
             marker = secrets.token_bytes(48)
-            profile = root / "profiles" / slot
-            profile.touch(mode=0o600, exist_ok=False)
-            profile.write_bytes(marker)
+            private_write(root / "profiles" / slot, marker)
             profiles[slot] = hashlib.sha256(marker).hexdigest()
         broker = Broker(root, lifeline, instances, profiles)
-        route = broker.offer(selected, "haiku")
-        approved = broker.identify(route)
-        (root / "frontend" / "discovery" / "route.json").write_text(json.dumps(route))
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-            listener.bind(str(root / "socket" / "native.sock"))
-            listener.listen(3)
-            listener.settimeout(.15)
-            thread = Thread(target=broker.poll, args=(listener,))
+        try:
+            route = broker.offer(selected, "haiku")
+            approved = broker.identify(route)
+            private_write(root / "frontend" / "discovery" / "route.json", json.dumps(route).encode())
+            discovery = run_stage(root, "discovery", lifeline, broker)
+            with broker.lock:
+                closed_discovery = not broker.errors and not broker.sends
+            if discovery.returncode or discovery.stdout != STOCK_MODEL.encode() + b"\n" or not closed_discovery:
+                raise Failure("local Claude fixture could not verify closed discovery")
+            # A separate listener and proof are admitted only after discovery has closed cleanly.
+            turn_route = broker.activate(approved, STOCK_MODEL)
+            private_write(root / "frontend" / "turn" / "route.json", json.dumps(turn_route).encode())
+            result = run_stage(root, "turn", lifeline, broker)
+        except (CaptureError, subprocess.TimeoutExpired):
+            raise Failure("local Claude fixture did not complete within its bound") from None
+        except ProtocolError:
+            raise Failure("local Claude fixture could not bind the approved route") from None
+        except RetirementUnverified:
             removable = False
+            raise Failure(f"Claude fixture retirement could not be verified: {root}") from None
+        finally:
             try:
-                thread.start()
-                discovery = run_frontend(root, "discovery", lifeline, broker)
-                if discovery.returncode or discovery.stdout != STOCK_MODEL.encode() + b"\n" or broker.sends:
-                    raise Failure("local Claude fixture could not verify closed discovery")
-                # Mint the turn proof after discovery exits. Its mount is private to the turn placement.
-                turn_route = broker.activate(approved, STOCK_MODEL)
-                (root / "frontend" / "turn" / "route.json").write_text(json.dumps(turn_route))
-                result = run_frontend(root, "turn", lifeline, broker)
-            except (CaptureError, subprocess.TimeoutExpired):
-                raise Failure("local Claude fixture did not complete within its bound") from None
-            finally:
-                try:
-                    broker.retire()
-                    if thread.ident is not None:
-                        thread.join(timeout=10)
-                except (OSError, RuntimeError):
-                    raise Failure(f"Claude fixture retirement could not be verified: {root}") from None
-                if (thread.is_alive() or broker.children or broker.clients
-                        or any(isinstance(error, RetirementUnverified) for error in broker.errors)):
-                    raise Failure(f"Claude fixture retirement could not be verified: {root}")
-                removable = True
+                broker.retire()
+            except (OSError, RuntimeError):
+                removable = False
+                raise Failure(f"Claude fixture retirement could not be verified: {root}") from None
         lifeline.check()
         if result.returncode or broker.errors or broker.sends != 1 or broker.receipt != approved:
             raise Failure("local Claude fixture could not verify the isolated OpenCode turn")
@@ -411,8 +478,9 @@ def run_proof(lifeline):
         if removable:
             try:
                 remove_scratch(root)
-            except OSError:
+            except (OSError, NotImplementedError):
                 raise Failure(f"Claude fixture scratch could not be removed: {root}") from None
-    require(not root.exists())
+    if root.exists():
+        raise Failure(f"Claude fixture scratch could not be removed: {root}")
     lifeline.check()
     return reply
