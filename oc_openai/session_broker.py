@@ -1270,7 +1270,7 @@ class _SessionSlotCoordinator:
                 state.handle.mark_relay_created()
             return True
 
-    def finish_relay_create(self, slot_index: int, relay_id: str | None, *, confirmed_absent: bool = False) -> bool:
+    def finish_relay_create(self, slot_index: int, relay_id: str | None) -> bool:
         with self._lock:
             state = self._slots.get(slot_index)
             if state is None:
@@ -1282,10 +1282,10 @@ class _SessionSlotCoordinator:
                 if state.handle.mark_relay_created is not None:
                     state.handle.mark_relay_created()
                 return not state.retiring
-            if confirmed_absent and state.handle.confirm_relay_removed is not None:
-                state.handle.confirm_relay_removed()
-            elif not confirmed_absent and self._cleanup_error is None:
-                self._cleanup_error = RuntimeError("Could not confirm relay container absence after failed create")
+            if self._cleanup_error is None:
+                self._cleanup_error = RuntimeError(
+                    "Podman relay create did not complete with a verified container ID"
+                )
             return False
 
     def record_container(self, container_id: str, *, slot_index: int | None = None) -> bool:
@@ -1469,13 +1469,6 @@ def _write_session_opencode_config(root: Path, config_payload: dict) -> Path:
     return cfg_path
 
 
-def _confirm_relay_absent(relay_name: str) -> bool:
-    try:
-        return podman("container", "exists", relay_name, check=False, timeout=4).returncode == 1
-    except Exception:
-        return False
-
-
 def _start_and_verify_slot_relay(
     spec: dict,
     pod_id: str,
@@ -1487,21 +1480,20 @@ def _start_and_verify_slot_relay(
 ) -> str:
     if not coordinator.begin_relay_create(handle.slot_index):
         raise ConnectionError("connection_retired")
-    relay_name = f"{spec['pod']}-relay-{handle.slot_index}"
     try:
         res = podman(*handle.build_relay_args(spec), check=False)
     except BaseException:
         # Host create outcome is unknown (timeout / lost ack / interrupt): retain lease and grant dir.
-        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=False)
+        coordinator.finish_relay_create(handle.slot_index, None)
         raise
     if res.returncode != 0:
-        terminal_fail = res.returncode not in (124, 137)
-        confirmed = terminal_fail and _confirm_relay_absent(relay_name)
-        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=confirmed)
+        # Return code comes from the host-spawn wrapper and does not prove the host-side
+        # podman create finished; retain durable lease and grant dir without trusting name absence.
+        coordinator.finish_relay_create(handle.slot_index, None)
         raise JobRuntimeError(f"Podman create failed ({res.returncode})")
     relay_id = res.stdout.decode("ascii").strip()
     if not IMAGE_ID.fullmatch(relay_id):
-        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=False)
+        coordinator.finish_relay_create(handle.slot_index, None)
         raise RuntimeError("Podman did not return a complete relay container ID")
     if not coordinator.finish_relay_create(handle.slot_index, relay_id):
         raise ConnectionError("connection_retired")
