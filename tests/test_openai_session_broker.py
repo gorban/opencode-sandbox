@@ -2957,6 +2957,93 @@ esac
             "durable lease must remain on disk when container exists probe times out after failed create",
         )
 
+    def test_gate4_r5_lost_create_ack_retains_lease_and_grant_dir_even_if_exists_reports_absent(self):
+        import gc
+        import io
+        import pwd
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.cli import StreamTerminal
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.managed.runtime import JobRuntimeError
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.catalog import ResolvedLaunchPlan
+        from oc_providers.contracts import ProviderInstanceSpec
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        backend = self._make_real_profile_backend(scratch / "lost_ack_profiles")
+        backend.connect("personal")
+        view = backend.profiles.snapshot()
+        personal_dir = next(p.directory for p in view.saved if p.label == "personal")
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+
+        # Test both lost create ack (exception) and GNU timeout exit 124 even when `exists` returns 1 (absent).
+        for mode, expected_pat in (("lost_ack", "lost ack"), ("timeout_124", "Podman create failed \\(124\\)")):
+            with self.subTest(mode=mode):
+                created_slot_roots: list[Path] = []
+                orig_mkdtemp = tempfile.mkdtemp
+
+                def tracking_mkdtemp(*args, _roots=created_slot_roots, **kwargs):
+                    path = Path(orig_mkdtemp(*args, **kwargs))
+                    _roots.append(path)
+                    self.addCleanup(lambda p=path: shutil.rmtree(p, ignore_errors=True))
+                    return str(path)
+
+                def flaky_podman(*args, _mode=mode, **_kwargs):
+                    if args[0] == "create":
+                        if _mode == "lost_ack":
+                            raise JobRuntimeError("Podman create failed or timed out (lost ack)")
+                        return subprocess.CompletedProcess(args, 124, b"", b"")
+                    if args[:2] == ("container", "exists"):
+                        # Transiently reports absent (rc=1) before a late host create finishes!
+                        return subprocess.CompletedProcess(args, 1, b"", b"")
+                    return subprocess.CompletedProcess(args, 0, b"", b"")
+
+                err_buf = io.StringIO()
+                cleanup_state = {"clean": False}
+                rb_root = self.root / f"r5_root_{mode}"
+                rb_root.mkdir(mode=0o700)
+
+                def _run_uncertain_create():
+                    adapter = OpenAISessionAdapter(backend)
+                    pref = adapter.preflight_instance(ProviderInstanceSpec("openai", "personal", True, "subscription"))
+                    plan = ResolvedLaunchPlan(
+                        admitted=(pref,), excluded=(), initial_provider_id="openai--personal",
+                        initial_model="gpt-6.2-sol", ui_mode="full", ui_source="default",
+                        acknowledged_digests={},
+                    )
+                    term = StreamTerminal(io.StringIO(), io.StringIO(), err_buf)
+                    spec = self._valid_spec()
+                    stop_ev = threading.Event()
+                    with (
+                        patch.object(session_broker.tempfile, "mkdtemp", side_effect=tracking_mkdtemp),
+                        patch.object(session_broker, "_verify_pod_with_containers", return_value=("1" * 64, [])),
+                        patch.object(session_broker, "_ensure_containers_idle"),
+                        patch.object(session_broker, "podman", side_effect=flaky_podman),
+                    ):
+                        with self.assertRaisesRegex(JobRuntimeError, expected_pat):
+                            session_broker._run_multi_slot_session(
+                                spec, plan, {"openai": adapter}, rb_root, stop_ev, term, cleanup_state,
+                            )
+
+                _run_uncertain_create()
+                gc.collect()
+                gc.collect()
+
+                self.assertFalse(cleanup_state["clean"])
+                self.assertEqual(len(created_slot_roots), 1)
+                self.assertTrue((created_slot_roots[0] / "grant").is_dir(), "grant dir must be retained")
+                self.assertIn("Provider session cleanup needs verification", err_buf.getvalue())
+                fresh_conn = Connection(personal_dir, host_probe=lambda: host)
+                self.assertTrue(fresh_conn.has_active_leases(), "durable lease must be retained on uncertain create")
+                # Clear retained lease so second subtest starts cleanly.
+                state_path = personal_dir / "state.json"
+                data = json.loads(state_path.read_text(encoding="utf-8"))
+                data.pop("worker_leases", None)
+                state_path.write_text(json.dumps(data), encoding="utf-8")
+                state_path.chmod(0o600)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,7 @@ from .managed import relay as relay_mod
 from .managed.runtime import (
     HOST_SPAWN,
     IMAGE_ID,
+    JobRuntimeError,
     MOUNT_LABEL,
     PROCESS_LABEL,
     SHARED_TMP,
@@ -1488,12 +1489,19 @@ def _start_and_verify_slot_relay(
         raise ConnectionError("connection_retired")
     relay_name = f"{spec['pod']}-relay-{handle.slot_index}"
     try:
-        relay_id = podman(*handle.build_relay_args(spec)).stdout.decode("ascii").strip()
+        res = podman(*handle.build_relay_args(spec), check=False)
     except BaseException:
-        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=_confirm_relay_absent(relay_name))
+        # Host create outcome is unknown (timeout / lost ack / interrupt): retain lease and grant dir.
+        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=False)
         raise
+    if res.returncode != 0:
+        terminal_fail = res.returncode not in (124, 137)
+        confirmed = terminal_fail and _confirm_relay_absent(relay_name)
+        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=confirmed)
+        raise JobRuntimeError(f"Podman create failed ({res.returncode})")
+    relay_id = res.stdout.decode("ascii").strip()
     if not IMAGE_ID.fullmatch(relay_id):
-        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=_confirm_relay_absent(relay_name))
+        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=False)
         raise RuntimeError("Podman did not return a complete relay container ID")
     if not coordinator.finish_relay_create(handle.slot_index, relay_id):
         raise ConnectionError("connection_retired")
