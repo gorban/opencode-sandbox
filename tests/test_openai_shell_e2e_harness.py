@@ -3618,19 +3618,22 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             wt_dir.mkdir(mode=0o700)
             leaf = TEST_CWD.split("/", 1)[1]
 
-            def _make_wt_runner(swap_after_clear: bool = False):
+            def _make_wt_runner(swap_before_recheck: bool = False):
                 def _runner(args, timeout=20.0):
                     del timeout
                     c_idx = args.index("-c")
                     script = args[c_idx + 1].replace("'/sandbox/wt'", repr(str(wt_dir)))
-                    if swap_after_clear:
-                        # Inject a concurrent agent swap right after _clear_dir_fd completes.
+                    if swap_before_recheck:
+                        # Inject a concurrent agent swap right before final identity verification.
                         swap_hook = (
-                            "_clear_dir_fd(leaf_fd)\n"
+                            "if os.listdir(leaf_fd):\n"
+                            "            raise SystemExit(3)\n"
                             "        os.rename(leaf, leaf + '.moved', src_dir_fd=wt_fd, dst_dir_fd=wt_fd)\n"
                             "        os.mkdir(leaf, 0o700, dir_fd=wt_fd)\n"
                         )
-                        script = script.replace("_clear_dir_fd(leaf_fd)\n", swap_hook, 1)
+                        script = script.replace(
+                            "if os.listdir(leaf_fd):\n            raise SystemExit(3)\n", swap_hook, 1,
+                        )
                     leaf_arg, dev_s, ino_s = args[c_idx + 2], args[c_idx + 3], args[c_idx + 4]
                     return subprocess.run(
                         [sys.executable, "-IB", "-c", script, leaf_arg, dev_s, ino_s, str(wt_dir)],
@@ -3639,10 +3642,9 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                     )
                 return _runner
 
-            # 1a. Genuine owned worktree: contents emptied strictly via leaf_fd; directory preserved.
+            # 1a. Genuine owned empty worktree: verified intact and directory preserved (no rmdir in /sandbox/wt).
             wt_leaf = wt_dir / leaf
             wt_leaf.mkdir(mode=0o700)
-            (wt_leaf / "artifact.txt").write_text("temp\n", encoding="utf-8")
             wt_st = os.lstat(wt_leaf)
             jspec = JournalSpec(
                 run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
@@ -3657,9 +3659,8 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertTrue(wt_leaf.is_dir())
             self.assertEqual(list(wt_leaf.iterdir()), [])
 
-            # 1b. Empty replacement swapped at final removal MUST survive untouched and fail closed.
-            (wt_leaf / "artifact2.txt").write_text("temp2\n", encoding="utf-8")
-            j_swap = _OwnershipJournal(jspec, podman_runner=_make_wt_runner(swap_after_clear=True))
+            # 1b. Empty replacement swapped at final check MUST survive untouched and fail closed.
+            j_swap = _OwnershipJournal(jspec, podman_runner=_make_wt_runner(swap_before_recheck=True))
             j_swap.worktree_owned = True
             j_swap.worktree_dev_ino = (wt_st.st_dev, wt_st.st_ino)
             res_swap = j_swap.teardown()
@@ -3709,6 +3710,157 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             persisted = json.loads(lock_journal.read_text(encoding="utf-8"))
             self.assertTrue(persisted["ownership_uncertain"])
             self.assertIn("grant_lock_timeout:turn-0", persisted["cleanup_errors"])
+
+    def test_reciprocal_g2_r7_worktree_preserve_missing_clipped_prompt_and_fifo_lock(self) -> None:
+        import time
+
+        with tempfile.TemporaryDirectory(prefix="oc-g2-r7-") as td_raw:
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            wt_dir = td / "wt"
+            wt_dir.mkdir(mode=0o700)
+            leaf = TEST_CWD.split("/", 1)[1]
+
+            def _run_wt_script(args, timeout=20.0):
+                del timeout
+                c_idx = args.index("-c")
+                script = args[c_idx + 1].replace("'/sandbox/wt'", repr(str(wt_dir)))
+                leaf_arg, dev_s, ino_s = args[c_idx + 2], args[c_idx + 3], args[c_idx + 4]
+                return subprocess.run(
+                    [sys.executable, "-IB", "-c", script, leaf_arg, dev_s, ino_s, str(wt_dir)],
+                    capture_output=True,
+                    check=False,
+                )
+
+            jspec = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=td / "j_r7.json",
+            )
+
+            # 1a. Renamed/missing journaled worktree must NOT report false success; moved files remain intact.
+            wt_missing = wt_dir / leaf
+            wt_missing.mkdir(mode=0o700)
+            (wt_missing / "sample.txt").write_text("keep\n", encoding="utf-8")
+            wt_st = os.lstat(wt_missing)
+            moved_wt = wt_dir / f"{leaf}.renamed"
+            wt_missing.rename(moved_wt)
+            j_miss = _OwnershipJournal(jspec, podman_runner=_run_wt_script)
+            j_miss.worktree_owned = True
+            j_miss.worktree_dev_ino = (wt_st.st_dev, wt_st.st_ino)
+            res_miss = j_miss.teardown()
+            self.assertFalse(res_miss[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_miss["ownership_uncertain"])
+            self.assertIn("worktree_identity_mismatch", res_miss["errors"])
+            self.assertEqual((moved_wt / "sample.txt").read_text(encoding="utf-8"), "keep\n")
+
+            # 1b. Non-empty worktree under worker-writable /sandbox/wt preserves all contents untouched.
+            wt_nonempty = wt_dir / leaf
+            wt_nonempty.mkdir(mode=0o700)
+            (wt_nonempty / "unowned.txt").write_text("do-not-delete\n", encoding="utf-8")
+            wt_ne_st = os.lstat(wt_nonempty)
+            j_ne = _OwnershipJournal(jspec, podman_runner=_run_wt_script)
+            j_ne.worktree_owned = True
+            j_ne.worktree_dev_ino = (wt_ne_st.st_dev, wt_ne_st.st_ino)
+            res_ne = j_ne.teardown()
+            self.assertFalse(res_ne[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_ne["ownership_uncertain"])
+            self.assertIn("worktree_nonempty_preserved", res_ne["errors"])
+            self.assertEqual((wt_nonempty / "unowned.txt").read_text(encoding="utf-8"), "do-not-delete\n")
+
+            # 2. Clipped user prompt scrolled out of 32-row renderer must NOT satisfy fresh-reply check.
+            prompt_head = PROOF_PROMPT.removesuffix(f" {shell_driver.EXPECTED_REPLY}")
+            footer_line = f"▣ Build · {TEST_MODEL}"
+            scr_clip = shell_driver._TerminalScreen(rows=32, cols=120)
+            scr_clip.feed(f"{prompt_head}\nok\n" + ("\n" * 30) + footer_line)
+            clipped_rendered = scr_clip.render()
+            self.assertNotIn(prompt_head, clipped_rendered)
+            self.assertIn("ok", clipped_rendered)
+            self.assertIn(footer_line, clipped_rendered)
+            self.assertFalse(
+                shell_driver._has_new_exact_reply(
+                    clipped_rendered, (), f"ok\n{footer_line}", approved_model=TEST_MODEL,
+                ),
+            )
+            self.assertFalse(
+                shell_driver._has_new_exact_reply(
+                    clipped_rendered, (), None, approved_model=TEST_MODEL,
+                ),
+            )
+            # Positive controls that survive clipping or have explicit attribution still succeed.
+            self.assertTrue(
+                shell_driver._has_new_exact_reply("Assistant: ok", (), "Assistant: ok", approved_model=TEST_MODEL),
+            )
+            self.assertTrue(
+                shell_driver._has_new_exact_reply(
+                    f"Assistant\nok\n{TEST_MODEL}", (), "Assistant\nok", approved_model=TEST_MODEL,
+                ),
+            )
+            self.assertTrue(
+                shell_driver._has_new_exact_reply(
+                    f"{PROOF_PROMPT}\n\nok\n{footer_line}",
+                    (),
+                    f"{PROOF_PROMPT}\n\nok\n{footer_line}",
+                    approved_model=TEST_MODEL,
+                ),
+            )
+
+            # 3. FIFO at grant/lock must never block open() in either pinning or revocation paths.
+            no_pm = lambda args, timeout=20.0: subprocess.CompletedProcess(args, 1, b"", b"")
+            relay_cname = "oc-e2e-deadbeef-relay-0"
+            active_state = "active\n"
+
+            # 3a. FIFO present at pinning time (begin_slot_create) and at teardown.
+            fifo_journal_a = td / "j_r7_fifo_a.json"
+            jspec_fa = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=fifo_journal_a,
+            )
+            slot_fa = td / "slot_fifo_pin"
+            grant_fa = slot_fa / "grant"
+            grant_fa.mkdir(parents=True, mode=0o700)
+            os.mkfifo(grant_fa / "lock", 0o600)
+            (grant_fa / "state").write_text(active_state, encoding="utf-8")
+            j_fa = _OwnershipJournal(jspec_fa, podman_runner=no_pm, grant_lock_timeout=0.15)
+            t0 = time.monotonic()
+            j_fa.prepare_slot("turn-0", container_name=relay_cname, slot_root=str(slot_fa))
+            j_fa.begin_slot_create("turn-0", container_name=relay_cname, grant_dir=str(grant_fa), slot_root=str(slot_fa))
+            res_fa = j_fa.teardown()
+            self.assertLess(time.monotonic() - t0, 1.5)
+            self.assertFalse(res_fa[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_fa["ownership_uncertain"])
+            self.assertIn("grant_lock_mismatch:turn-0", res_fa["errors"])
+            self.assertEqual((grant_fa / "state").read_text(encoding="utf-8"), active_state)
+
+            # 3b. Regular lock replaced by FIFO before revocation teardown.
+            fifo_journal_b = td / "j_r7_fifo_b.json"
+            jspec_fb = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=fifo_journal_b,
+            )
+            slot_fb = td / "slot_fifo_revoke"
+            grant_fb = slot_fb / "grant"
+            grant_fb.mkdir(parents=True, mode=0o700)
+            lock_fb = grant_fb / "lock"
+            lock_fb.touch(mode=0o600)
+            (grant_fb / "state").write_text(active_state, encoding="utf-8")
+            j_fb = _OwnershipJournal(jspec_fb, podman_runner=no_pm, grant_lock_timeout=0.15)
+            j_fb.prepare_slot("turn-0", container_name=relay_cname, slot_root=str(slot_fb))
+            j_fb.begin_slot_create("turn-0", container_name=relay_cname, grant_dir=str(grant_fb), slot_root=str(slot_fb))
+            lock_fb.unlink()
+            os.mkfifo(lock_fb, 0o600)
+            t1 = time.monotonic()
+            res_fb = j_fb.teardown()
+            self.assertLess(time.monotonic() - t1, 1.5)
+            self.assertFalse(res_fb[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_fb["ownership_uncertain"])
+            self.assertIn("grant_lock_mismatch:turn-0", res_fb["errors"])
+            self.assertEqual((grant_fb / "state").read_text(encoding="utf-8"), active_state)
+            persisted_fb = json.loads(fifo_journal_b.read_text(encoding="utf-8"))
+            self.assertTrue(persisted_fb["ownership_uncertain"])
+            self.assertIn("grant_lock_mismatch:turn-0", persisted_fb["cleanup_errors"])
 
 
 if __name__ == "__main__":

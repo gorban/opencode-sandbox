@@ -131,15 +131,15 @@ def _normalize_reply_line(raw: str) -> str:
     return " ".join(raw.strip(_BORDER_CHARS).split())
 
 
-def _is_assistant_context_line(line: str, approved_model: str = "") -> bool:
+def _is_explicit_assistant_header(line: str) -> bool:
     if not line:
         return False
     low = line.lower()
-    if low in ("assistant", "assistant:") or low.startswith("assistant:") or low.startswith("assistant "):
-        return True
-    if approved_model and approved_model in line and PROOF_PROMPT not in line:
-        return True
-    return "chatgpt subscription" in low or "▣" in line
+    return low in ("assistant", "assistant:") or low.startswith("assistant:") or low.startswith("assistant ")
+
+
+def _is_model_turn_footer(line: str, approved_model: str) -> bool:
+    return bool(approved_model) and approved_model in line and "▣" in line and PROOF_PROMPT not in line
 
 
 def _is_wrapped_prompt_tail(lines: list[str], idx: int) -> bool:
@@ -1010,8 +1010,10 @@ def _line_is_visible_assistant_reply(lines: list[str], idx: int, approved_model:
     if line != EXPECTED_REPLY or _is_wrapped_prompt_tail(lines, idx):
         return False
     prev_line = lines[idx - 1] if idx > 0 else ""
+    if _is_explicit_assistant_header(prev_line):
+        return True
     next_line = lines[idx + 1] if idx + 1 < len(lines) else ""
-    return _is_assistant_context_line(prev_line, approved_model) or _is_assistant_context_line(next_line, approved_model)
+    return PROOF_PROMPT in prev_line and _is_model_turn_footer(next_line, approved_model)
 
 
 def _visible_assistant_reply_lines(lines: list[str], approved_model: str) -> Counter[str]:

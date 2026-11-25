@@ -41,24 +41,12 @@ _WORKTREE_TEARDOWN_SCRIPT = (
     "import errno, os, stat, sys\n"
     "leaf, dev_s, ino_s, wt_root = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]\n"
     "want = (int(dev_s), int(ino_s))\n"
-    "def _clear_dir_fd(dir_fd):\n"
-    "    for entry in os.listdir(dir_fd):\n"
-    "        st = os.stat(entry, dir_fd=dir_fd, follow_symlinks=False)\n"
-    "        if stat.S_ISDIR(st.st_mode):\n"
-    "            child_fd = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)\n"
-    "            try:\n"
-    "                _clear_dir_fd(child_fd)\n"
-    "            finally:\n"
-    "                os.close(child_fd)\n"
-    "            os.rmdir(entry, dir_fd=dir_fd)\n"
-    "        else:\n"
-    "            os.unlink(entry, dir_fd=dir_fd)\n"
     "wt_fd = os.open(wt_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n"
     "try:\n"
     "    try:\n"
     "        leaf_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=wt_fd)\n"
     "    except FileNotFoundError:\n"
-    "        raise SystemExit(0)\n"
+    "        raise SystemExit(2)\n"
     "    except OSError as exc:\n"
     "        if exc.errno in (errno.ENOTDIR, errno.ELOOP):\n"
     "            raise SystemExit(2)\n"
@@ -67,7 +55,8 @@ _WORKTREE_TEARDOWN_SCRIPT = (
     "        fst = os.fstat(leaf_fd)\n"
     "        if not stat.S_ISDIR(fst.st_mode) or (fst.st_dev, fst.st_ino) != want:\n"
     "            raise SystemExit(2)\n"
-    "        _clear_dir_fd(leaf_fd)\n"
+    "        if os.listdir(leaf_fd):\n"
+    "            raise SystemExit(3)\n"
     "        try:\n"
     "            st2 = os.stat(leaf, dir_fd=wt_fd, follow_symlinks=False)\n"
     "        except FileNotFoundError:\n"
@@ -258,7 +247,7 @@ def _open_pinned_grant_files(root_fd: int) -> tuple[int | None, tuple[int, int] 
     lock_fd: int | None = None
     lock_id: tuple[int, int] | None = None
     try:
-        lock_fd = os.open("lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=grant_fd)
+        lock_fd = os.open("lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=grant_fd)
         linfo = os.fstat(lock_fd)
         if stat.S_ISREG(linfo.st_mode) and linfo.st_uid == os.geteuid() and linfo.st_nlink == 1:
             lock_id = (linfo.st_dev, linfo.st_ino)
@@ -459,7 +448,7 @@ def _acquire_pinned_grant_lock(
     has_recorded_lock = type(want_lock_dev) is int and type(want_lock_ino) is int
     lock_fd: int | None = None
     try:
-        lock_fd = os.open("lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=grant_fd)
+        lock_fd = os.open("lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=grant_fd)
         linfo = os.fstat(lock_fd)
         if (
             not stat.S_ISREG(linfo.st_mode)
@@ -541,7 +530,7 @@ def _revoke_pinned_grant_dir(
 def _read_lock_helper_source(lock_helper: Path) -> str:
     """Capture verified oc-setup-lock.py source into RAM so cleanup survives snapshot deletion."""
     try:
-        fd = os.open(lock_helper, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(lock_helper, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     except OSError:
         raise CleanupOwnerError("lock helper unavailable") from None
     with os.fdopen(fd, "rb") as stream:
@@ -808,15 +797,22 @@ class _OwnershipJournal:
 
     def _create_owned_worktree(self) -> None:
         script = (
-            "import os, sys\n"
+            "import os, stat, sys\n"
             "rel = sys.argv[1]\n"
             "os.chdir('/sandbox')\n"
             "os.makedirs('wt', mode=0o755, exist_ok=True)\n"
             "fd = os.open('wt', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n"
             "try:\n"
             "    os.mkdir(rel, 0o700, dir_fd=fd)\n"
-            "    st = os.stat(rel, dir_fd=fd, follow_symlinks=False)\n"
-            "    print(f'{st.st_dev}:{st.st_ino}')\n"
+            "    leaf_fd = os.open(rel, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)\n"
+            "    try:\n"
+            "        fst = os.fstat(leaf_fd)\n"
+            "        st = os.stat(rel, dir_fd=fd, follow_symlinks=False)\n"
+            "        if not stat.S_ISDIR(fst.st_mode) or (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or os.listdir(leaf_fd):\n"
+            "            raise SystemExit(2)\n"
+            "        print(f'{fst.st_dev}:{fst.st_ino}')\n"
+            "    finally:\n"
+            "        os.close(leaf_fd)\n"
             "finally:\n"
             "    os.close(fd)\n"
         )
@@ -1079,6 +1075,10 @@ class _OwnershipJournal:
             self.ownership_uncertain = True
             self.cleanup_errors.append(f"grant_lock_timeout:{slot_key}")
             self._persist()
+        elif revoke_status == "mismatch":
+            self.ownership_uncertain = True
+            self.cleanup_errors.append(f"grant_lock_mismatch:{slot_key}")
+            self._persist()
         if status == _STATUS_CREATED:
             cid = entry.get("cid")
             if not isinstance(cid, str) or not _HEX64.fullmatch(cid):
@@ -1221,6 +1221,9 @@ class _OwnershipJournal:
         if res.returncode == 2:
             self.ownership_uncertain = True
             self.cleanup_errors.append("worktree_identity_mismatch")
+        elif res.returncode == 3:
+            self.ownership_uncertain = True
+            self.cleanup_errors.append("worktree_nonempty_preserved")
         elif res.returncode != 0:
             self.cleanup_errors.append("worktree_remove_failed")
 
