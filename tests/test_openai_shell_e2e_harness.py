@@ -2713,7 +2713,9 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 "while True:\n"
                 "    r, _, _ = select.select([sock, life_fd], [], [], 0.2)\n"
                 "    if life_fd in r and not os.read(life_fd, 64):\n"
-                f"        Path({str(marker)!r}).write_text('teardown_after_sigkill')\n"
+                f"        tmp = Path({str(marker)!r} + '.tmp')\n"
+                "        tmp.write_text('teardown_after_sigkill')\n"
+                f"        os.replace(tmp, {str(marker)!r})\n"
                 "        break\n",
                 encoding="utf-8",
             )
@@ -3914,6 +3916,22 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertEqual(shell_driver.render_terminal_screen("\x1b(0\x1b7\x1b(B\x1b[uq").strip(), "─")
             self.assertEqual(shell_driver.render_terminal_screen("\x1b(0\x1b[s\x1b(B\x1b8q").strip(), "─")
             self.assertEqual(shell_driver.render_terminal_screen("\x1b(0\x1b[?1049h\x1b(B\x1b[?1049lq").strip(), "─")
+            # Cursor save inside alternate screen must NOT overwrite main screen's saved charset!
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b(0\x1b[?1049h\x1b(B\x1b7\x1b[?1049lq").strip(), "─",
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b(0\x1b[?1049h\x1b(B\x1b[s\x1b[?1049lq").strip(), "─",
+            )
+            # Redundant ?1049l on main screen must be a no-op (not restore a stale saved charset).
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b(0\x1b[?1049lq").strip(), "─",
+            )
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(
+                    f"\x1b(0\x1b[?1049h\x1b(B\x1b7\x1b[?1049l{route_txt}", approval,
+                ),
+            )
             self.assertEqual(shell_driver.render_terminal_screen("\x1b[?1047h\x1b(0\x1b[?1047lq").strip(), "─")
             self.assertEqual(shell_driver.render_terminal_screen("\x1b(0\x1b[?1048h\x1b(B\x1b[?1048lq").strip(), "─")
             self.assertIsNone(
@@ -3959,6 +3977,7 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             for wrong_footer in (
                 f"Build · {TEST_MODEL}-v2 · 1s",
                 f"Build · prefix-{TEST_MODEL} · 1s",
+                f"Build · other-model · {TEST_MODEL}",
                 f"▣ {TEST_MODEL}-v2",
             ):
                 wrong_turn = f"{PROOF_PROMPT}\n\nok\n{wrong_footer}"

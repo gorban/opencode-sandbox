@@ -147,7 +147,7 @@ def _is_model_turn_footer(line: str, approved_model: str) -> bool:
         return False
     if "·" in line:
         parts = [seg.strip() for seg in line.split("·")]
-        return len(parts) >= 2 and bool(parts[0]) and any(seg == approved_model for seg in parts[1:])
+        return len(parts) >= 2 and bool(parts[0]) and parts[1] == approved_model
     return line.startswith("▣") and line[1:].strip() == approved_model
 
 
@@ -182,13 +182,9 @@ class _TerminalScreen:
         self._g0 = "B"
         self._g1 = "B"
         self._gl = 0
-        self._saved_pos = (0, 0)
-        self._saved_charset = ("B", "B", 0)
-        self._saved_sgr: tuple[
-            bool,
-            tuple[str, int] | tuple[str, int, int, int] | None,
-            tuple[str, int] | tuple[str, int, int, int] | None,
-        ] = (False, None, None)
+        self._in_alt_screen = False
+        default_saved = ((0, 0), ("B", "B", 0), (False, None, None))
+        self._saved_states: dict[bool, tuple] = {False: default_saved, True: default_saved}
         self._scroll_top = 0
         self._scroll_bottom = rows - 1
         self.grid = [[" "] * cols for _ in range(rows)]
@@ -202,14 +198,17 @@ class _TerminalScreen:
         self._bg: tuple[str, int] | tuple[str, int, int, int] | None = None
 
     def _save_cursor(self) -> None:
-        self._saved_pos = (self.row, self.col)
-        self._saved_charset = (self._g0, self._g1, self._gl)
-        self._saved_sgr = (self._concealed, self._fg, self._bg)
+        self._saved_states[self._in_alt_screen] = (
+            (self.row, self.col),
+            (self._g0, self._g1, self._gl),
+            (self._concealed, self._fg, self._bg),
+        )
 
     def _restore_cursor(self) -> None:
-        self.row, self.col = self._saved_pos
-        self._g0, self._g1, self._gl = self._saved_charset
-        self._concealed, self._fg, self._bg = self._saved_sgr
+        pos, charset, sgr = self._saved_states[self._in_alt_screen]
+        self.row, self.col = pos
+        self._g0, self._g1, self._gl = charset
+        self._concealed, self._fg, self._bg = sgr
 
     @property
     def is_certain(self) -> bool:
@@ -231,6 +230,8 @@ class _TerminalScreen:
         self._g0 = other._g0
         self._g1 = other._g1
         self._gl = other._gl
+        self._in_alt_screen = other._in_alt_screen
+        self._saved_states = dict(other._saved_states)
         if other._stream_invalid:
             self._stream_invalid = True
             self._uncertain = True
@@ -256,9 +257,9 @@ class _TerminalScreen:
             self._g0 = "B"
             self._g1 = "B"
             self._gl = 0
-            self._saved_pos = (0, 0)
-            self._saved_charset = ("B", "B", 0)
-            self._saved_sgr = (False, None, None)
+            self._in_alt_screen = False
+            default_saved = ((0, 0), ("B", "B", 0), (False, None, None))
+            self._saved_states = {False: default_saved, True: default_saved}
 
     def _erase_display(self, mode: int) -> None:
         if mode in (2, 3):
@@ -359,14 +360,20 @@ class _TerminalScreen:
         self.col = 0
 
     def _handle_alt_screen_mode(self, mode: str, final: str) -> None:
+        entering = final == "h"
+        if entering == self._in_alt_screen:
+            return
         if mode == "1049":
-            if final == "h":
+            if entering:
                 self._save_cursor()
+                self._in_alt_screen = True
                 self._reset_screen(reset_cursor=True, full_reset=False)
             else:
+                self._in_alt_screen = False
                 self._reset_screen(reset_cursor=False, full_reset=False)
                 self._restore_cursor()
             return
+        self._in_alt_screen = entering
         self._reset_screen(reset_cursor=True, full_reset=False)
 
     def _handle_mode_csi(self, params: str, final: str) -> None:
