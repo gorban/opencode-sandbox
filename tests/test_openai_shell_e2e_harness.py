@@ -3923,9 +3923,33 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertEqual(
                 shell_driver.render_terminal_screen("\x1b(0\x1b[?1049h\x1b(B\x1b[s\x1b[?1049lq").strip(), "─",
             )
-            # Redundant ?1049l on main screen must be a no-op (not restore a stale saved charset).
+            # Redundant ?1049l on main screen restores main saved state (xterm CursorRestore).
             self.assertEqual(
-                shell_driver.render_terminal_screen("\x1b(0\x1b[?1049lq").strip(), "─",
+                shell_driver.render_terminal_screen("\x1b(0\x1b7\x1b(B\x1b[?1049lq").strip(), "─",
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b(0\x1b[?1049lq").strip(), "q",
+            )
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(
+                    f"\x1b[8m\x1b7\x1b[0m\x1b[?1049l{route_txt}", approval,
+                ),
+            )
+            # Repeated ?1049h while already in alt screen saves alt cursor and clears display,
+            # preserving main saved charset and making erased route text ineligible for arming.
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[?1049hstatus\x1b[?1049h").strip(), "",
+            )
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(
+                    f"\x1b[?1049h{route_txt}\x1b[?1049h", approval,
+                ),
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[?1049h\x1b(0\x1b[?1049h\x1b(B\x1b8q").strip(), "─",
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b(0\x1b[?1049h\x1b(B\x1b[?1049h\x1b[?1049lq").strip(), "─",
             )
             self.assertIsNone(
                 shell_driver.extract_observed_route_row(

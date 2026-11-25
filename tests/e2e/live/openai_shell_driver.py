@@ -360,21 +360,18 @@ class _TerminalScreen:
         self.col = 0
 
     def _handle_alt_screen_mode(self, mode: str, final: str) -> None:
-        entering = final == "h"
-        if entering == self._in_alt_screen:
-            return
         if mode == "1049":
-            if entering:
+            if final == "h":
                 self._save_cursor()
                 self._in_alt_screen = True
-                self._reset_screen(reset_cursor=True, full_reset=False)
+                self._reset_screen(reset_cursor=False, full_reset=False)
             else:
                 self._in_alt_screen = False
                 self._reset_screen(reset_cursor=False, full_reset=False)
                 self._restore_cursor()
             return
-        self._in_alt_screen = entering
-        self._reset_screen(reset_cursor=True, full_reset=False)
+        self._in_alt_screen = final == "h"
+        self._reset_screen(reset_cursor=False, full_reset=False)
 
     def _handle_mode_csi(self, params: str, final: str) -> None:
         if not params.startswith("?"):
