@@ -1023,6 +1023,22 @@ class Connection:
                     continue
                 raise
 
+    @contextlib.contextmanager
+    def canary_responses(self, binding, body, *, authorization, before_write,
+                         limits=INTERACTIVE_STREAM_LIMITS, deadline=None, cancelled=None,
+                         inspect_media=True, observe_media=None):
+        """Stream one fenced single-turn canary with zero retries once reserved."""
+        self._validate_interactive_request(body, limits, deadline)
+        if set(body) != {"model", "input", "store", "stream"}:
+            raise ConnectionError("invalid_responses_body")
+        with self.interactive_responses(
+            binding, body, before_write,
+            authorization=authorization,
+            limits=limits, deadline=deadline, cancelled=cancelled,
+            inspect_media=inspect_media, observe_media=observe_media,
+        ) as guarded:
+            yield guarded
+
     def fenced_write(self, binding, authorization, action):
         """Run a bounded client write while holding authorization() -> store.lock."""
         with authorization(), self._store.locked() as directory:

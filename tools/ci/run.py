@@ -77,6 +77,7 @@ SUITES = (
     discover('OpenAI interactive session leases', 'test_openai_session_leases.py'),
     discover('OpenAI interactive session protocol', 'test_openai_session_protocol.py'),
     discover('OpenAI interactive session broker', 'test_openai_session_broker.py'),
+    discover('OpenAI zero-tool canary', 'test_openai_canary.py'),
 )
 
 SHELL_FILES = (
@@ -108,6 +109,11 @@ PYTHON_FILES = (
     'oc_providers/contracts.py',
     'oc_openai/__init__.py',
     'oc_openai/acceptance.py',
+    'oc_openai/canary.py',
+    'oc_openai/canary_ledger.py',
+    'oc_openai/canary_protocol.py',
+    'oc_openai/canary_relay.py',
+    'oc_openai/canary_runtime.py',
     'oc_openai/cli.py',
     'oc_openai/connection.py',
     'oc_openai/connection_job.py',
@@ -131,7 +137,9 @@ PYTHON_FILES = (
     'oc_openai/worker.py',
     'tests/bridge_merge_core.py',
     'tests/e2e/live/conftest.py',
+    'tests/e2e/live/openai_canary_driver.py',
     'tests/e2e/live/openai_driver.py',
+    'tests/e2e/live/test_openai_canary_e2e.py',
     'tests/e2e/live/test_openai_proof.py',
     'tests/host_state_leaves.py',
     'tests/orchestrator-owner-loss.py',
@@ -143,6 +151,7 @@ PYTHON_FILES = (
     'tests/test_ci_supervisor.py',
     'tests/test_ci_toolchain.py',
     'tests/test_controller_core.py',
+    'tests/test_openai_canary.py',
     'tests/test_openai_cli.py',
     'tests/test_openai_cli_launcher.py',
     'tests/test_openai_connection.py',
