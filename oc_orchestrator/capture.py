@@ -1,6 +1,6 @@
 """Capture bounded output from a host command in the offline proof."""
 
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 import os
 import selectors
 import signal
@@ -33,16 +33,27 @@ def drain(process, deadline, limit):
     return bytes(output)
 
 
-def capture(command, *, env, timeout, limit):
+def kill_group(process):
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+
+
+def capture(command, *, env, timeout, limit, lifeline=None, on_revoke=None):
     deadline = time.monotonic() + timeout
     with subprocess.Popen(command, env=env, cwd="/", stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
         try:
-            output = drain(process, deadline, limit)
-            result = process.wait(timeout=max(0, deadline - time.monotonic()))
+            def revoke():
+                kill_group(process)
+                if on_revoke is not None:
+                    on_revoke()
+
+            ownership = nullcontext() if lifeline is None else lifeline.revoke_on_loss(revoke)
+            with ownership:
+                output = drain(process, deadline, limit)
+                result = process.wait(timeout=max(0, deadline - time.monotonic()))
         except BaseException:
-            with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+            kill_group(process)
             process.wait()
             raise
         return subprocess.CompletedProcess(command, result, stdout=output)

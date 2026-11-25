@@ -55,6 +55,7 @@ Usage: ${0##*/} [--mini|--no-mini] [--provider KIND[/LABEL]] [-i NAME] [-r] [-n]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
        ${0##*/} openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect [LABEL]}
        ${0##*/} orchestrate [--synthetic-check]
+       ${0##*/} orchestrate --synthetic-check --provider claude
 
   (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
               OpenCode (defaulting to all enabled qualified providers when configured). Safe to run

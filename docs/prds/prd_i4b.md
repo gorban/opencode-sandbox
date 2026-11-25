@@ -22,5 +22,22 @@ and reuse from the intended workstation placement remain open.
   [I4 Stage 0](prd_i4.md#feasibility-spike--host-only-claude-subscription-routing).
   Keep fresh sign-in and credential isolation qualification separate from worker acceptance.
 
+### Local OpenCode acceptance
+
+OpenCode 2.3.0's built-in Claude Agent provider used unmodified Claude Code 2.1.330
+and an existing local Claude Pro registration. With an explicit title, tool
+plugins disabled and an empty workspace, it returned exactly `ok` and reported a
+normal stop. The operator's native credential file was mounted read-only in the
+stock workstation test namespace. This checks plan inference through stock
+OpenCode. The managed worker and the project launcher's live provider path remain
+open.
+
+- [x] Qualify the project launcher with OpenCode and the native credential
+  holder in separate namespaces in the local synthetic proof. The stock OpenCode
+  CLI returned the distinct fixture reply. Killing the launcher while the native
+  child was active retired both placements and their private scratch with no reply.
+- [ ] Qualify the project's exact live topology and registration placement before
+  enabling subscription inference through that launcher.
+
 [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference) ·
 [Claude Code authentication and compliance](https://code.claude.com/docs/en/legal-and-compliance)

@@ -273,7 +273,7 @@ def run_open_code(worker):
     verify_result(wire)
 
 
-def verify_result(wire):
+def verify_result(wire, *, expected="ok"):
     events = [json.loads(line, object_pairs_hook=unique, parse_constant=bad_constant)
               for line in wire.splitlines() if line.strip()]
     if len(events) != 3 or any(not isinstance(event, dict) or not isinstance(event.get("part"), dict) for event in events):
@@ -285,8 +285,9 @@ def verify_result(wire):
             or [part.get("type") for part in (start, text, finish)] != ["step-start", "text", "step-finish"]
             or any(event.get("sessionID") != session or event["part"].get("sessionID") != session
                    or event["part"].get("messageID") != message for event in events)
-            or text.get("text") != "ok" or finish.get("reason") != "stop"):
+            or text.get("text") != expected or finish.get("reason") != "stop"):
         raise Failure("OpenCode did not complete one successful text turn")
+    return text["text"]
 
 
 def wait_relay(relay):
