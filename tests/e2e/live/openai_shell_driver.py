@@ -7,6 +7,7 @@ and SIGKILL-surviving teardown to the zero-OAuth DetachedShellCleanupOwner.
 """
 
 import codecs
+from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass
 import fcntl
@@ -103,6 +104,7 @@ class _PtyState:
     armed: bool = False
     prompt_sent: bool = False
     prompt_offset: int = 0
+    pre_prompt_lines: tuple[str, ...] = ()
 
 
 def strip_ansi(text: str) -> str:
@@ -112,26 +114,57 @@ def strip_ansi(text: str) -> str:
 
 _CSI_TOKEN_RE = re.compile(r"\x1b\[([0-?]*[ -/]*)([@-~])")
 _OSC_TOKEN_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-_ALT_SCREEN_MODES = frozenset({"?47", "?1047", "?1049"})
+_ALT_SCREEN_MODES = frozenset({"47", "1047", "1049"})
+_SAFE_DEC_MODES = frozenset({"1", "7", "12", "25", "1000", "1002", "1003", "1004", "1006", "2004", "2026", "2027"})
+_CURSOR_MOVES = frozenset({"H", "f", "A", "B", "C", "D", "E", "F", "G", "d"})
+_EXACT_REPLY_LINE_RE = re.compile(r"(?:(?:[Aa]ssistant\s*:|[●•▸▹▶◆▪■>])\s*)?ok\Z")
+_BORDER_CHARS = " \t│┃┆┊║|"
+
+
+def _normalize_reply_line(raw: str) -> str:
+    return " ".join(raw.strip(_BORDER_CHARS).split())
+
+
+def _is_exact_reply_line(line: str) -> bool:
+    return bool(line) and _EXACT_REPLY_LINE_RE.fullmatch(line) is not None
 
 
 class _TerminalScreen:
-    """Bounded VT100/xterm virtual screen tracking current rendered TUI rows."""
+    """Bounded VT100/xterm virtual screen tracking current rendered TUI rows.
+
+    Fails closed (`is_certain == False`, `render() == ""`) whenever an unrecognized
+    or malformed escape sequence could have mutated screen contents, until a full
+    screen clear re-establishes known contents.
+    """
 
     def __init__(self, rows: int = 32, cols: int = 120) -> None:
         self.rows = rows
         self.cols = cols
         self.row = 0
         self.col = 0
+        self._saved_pos = (0, 0)
+        self._scroll_top = 0
+        self._scroll_bottom = rows - 1
         self.grid = [[" "] * cols for _ in range(rows)]
         self._pending = ""
+        self._uncertain = False
 
-    def _clear_all(self) -> None:
+    @property
+    def is_certain(self) -> bool:
+        return not self._uncertain and not self._pending
+
+    def _reset_screen(self, *, reset_cursor: bool = False) -> None:
         self.grid = [[" "] * self.cols for _ in range(self.rows)]
+        self._uncertain = False
+        if reset_cursor:
+            self.row = 0
+            self.col = 0
+            self._scroll_top = 0
+            self._scroll_bottom = self.rows - 1
 
     def _erase_display(self, mode: int) -> None:
         if mode in (2, 3):
-            self._clear_all()
+            self._reset_screen(reset_cursor=False)
             return
         if mode == 0:
             for c in range(self.col, self.cols):
@@ -143,6 +176,8 @@ class _TerminalScreen:
                 self.grid[r] = [" "] * self.cols
             for c in range(0, min(self.col + 1, self.cols)):
                 self.grid[self.row][c] = " "
+        else:
+            self._uncertain = True
 
     def _erase_line(self, mode: int) -> None:
         if mode == 2:
@@ -153,16 +188,15 @@ class _TerminalScreen:
         elif mode == 1:
             for c in range(0, min(self.col + 1, self.cols)):
                 self.grid[self.row][c] = " "
+        else:
+            self._uncertain = True
 
     @staticmethod
     def _csi_nums(params: str) -> list[int]:
         clean = params.lstrip("?")
         if not clean:
             return []
-        out: list[int] = []
-        for part in clean.split(";"):
-            out.append(int(part) if part.isdigit() else 0)
-        return out
+        return [int(part) if part.isdigit() else 0 for part in clean.split(";")]
 
     def _move_cursor(self, final: str, nums: list[int]) -> None:
         n1 = nums[0] if nums and nums[0] > 0 else 1
@@ -178,6 +212,12 @@ class _TerminalScreen:
             self.col = min(self.cols - 1, self.col + n1)
         elif final == "D":
             self.col = max(0, self.col - n1)
+        elif final == "E":
+            self.row = min(self.rows - 1, self.row + n1)
+            self.col = 0
+        elif final == "F":
+            self.row = max(0, self.row - n1)
+            self.col = 0
         elif final == "G":
             self.col = max(0, min(self.cols - 1, n1 - 1))
         elif final == "d":
@@ -191,34 +231,109 @@ class _TerminalScreen:
         tail = self.grid[self.row][self.col + count:]
         self.grid[self.row][self.col:] = tail + [" "] * (self.cols - self.col - len(tail))
 
-    def _handle_csi(self, params: str, final: str) -> None:
-        if final in ("h", "l") and params in _ALT_SCREEN_MODES:
-            self._clear_all()
-            self.row = 0
-            self.col = 0
+    def _insert_chars(self, count: int) -> None:
+        step = min(count, self.cols - self.col)
+        tail = self.grid[self.row][self.col:self.cols - step]
+        self.grid[self.row][self.col:] = [" "] * step + tail
+
+    def _scroll_region(self, top: int, bottom: int, count: int, *, up: bool) -> None:
+        height = bottom - top + 1
+        step = min(max(1, count), height)
+        blanks = [[" "] * self.cols for _ in range(step)]
+        region = self.grid[top:bottom + 1]
+        self.grid[top:bottom + 1] = (region[step:] + blanks) if up else (blanks + region[:-step])
+
+    def _delete_lines(self, count: int) -> None:
+        if self._scroll_top <= self.row <= self._scroll_bottom:
+            self._scroll_region(self.row, self._scroll_bottom, count, up=True)
+
+    def _insert_lines(self, count: int) -> None:
+        if self._scroll_top <= self.row <= self._scroll_bottom:
+            self._scroll_region(self.row, self._scroll_bottom, count, up=False)
+
+    def _set_scroll_margins(self, nums: list[int]) -> None:
+        top = (nums[0] - 1) if nums and nums[0] > 0 else 0
+        bottom = (nums[1] - 1) if len(nums) > 1 and nums[1] > 0 else (self.rows - 1)
+        if 0 <= top < bottom < self.rows:
+            self._scroll_top = top
+            self._scroll_bottom = bottom
+        self.row = 0
+        self.col = 0
+
+    def _handle_mode_csi(self, params: str) -> None:
+        if not params.startswith("?"):
+            self._uncertain = True
             return
-        nums = self._csi_nums(params)
-        first = nums[0] if nums else 0
+        modes = [p for p in params[1:].split(";") if p]
+        if not modes:
+            self._uncertain = True
+            return
+        if any(m in _ALT_SCREEN_MODES for m in modes):
+            self._reset_screen(reset_cursor=True)
+            return
+        if not all(m in _SAFE_DEC_MODES for m in modes):
+            self._uncertain = True
+
+    def _handle_edit_csi(self, final: str, first: int) -> bool:
+        count = first or 1
         if final == "J":
             self._erase_display(first)
         elif final == "K":
             self._erase_line(first)
         elif final == "X":
-            self._erase_chars(first or 1)
+            self._erase_chars(count)
         elif final == "P":
-            self._delete_chars(first or 1)
-        elif final in ("H", "f", "A", "B", "C", "D", "G", "d"):
+            self._delete_chars(count)
+        elif final == "@":
+            self._insert_chars(count)
+        elif final == "M":
+            self._delete_lines(count)
+        elif final == "L":
+            self._insert_lines(count)
+        elif final == "S":
+            self._scroll_region(self._scroll_top, self._scroll_bottom, count, up=True)
+        elif final == "T":
+            self._scroll_region(self._scroll_top, self._scroll_bottom, count, up=False)
+        else:
+            return False
+        return True
+
+    def _handle_csi(self, params: str, final: str) -> None:
+        if final in ("m", "n", "c", "t"):
+            return
+        if final == "q" and params.endswith(" "):
+            return
+        if final in ("h", "l"):
+            self._handle_mode_csi(params)
+            return
+        if any(ch not in "0123456789;" for ch in params):
+            self._uncertain = True
+            return
+        nums = self._csi_nums(params)
+        if self._handle_edit_csi(final, nums[0] if nums else 0):
+            return
+        if final in _CURSOR_MOVES:
             self._move_cursor(final, nums)
+        elif final == "r":
+            self._set_scroll_margins(nums)
+        elif final == "s":
+            self._saved_pos = (self.row, self.col)
+        elif final == "u":
+            self.row, self.col = self._saved_pos
+        else:
+            self._uncertain = True
+
+    def _linefeed(self) -> None:
+        if self.row == self._scroll_bottom:
+            self._scroll_region(self._scroll_top, self._scroll_bottom, 1, up=True)
+        elif self.row + 1 < self.rows:
+            self.row += 1
 
     def _put_char(self, ch: str) -> None:
         if ch == "\r":
             self.col = 0
         elif ch == "\n":
-            if self.row + 1 < self.rows:
-                self.row += 1
-            else:
-                self.grid.pop(0)
-                self.grid.append([" "] * self.cols)
+            self._linefeed()
         elif ch == "\b":
             self.col = max(0, self.col - 1)
         elif ch == "\t":
@@ -226,29 +341,61 @@ class _TerminalScreen:
         elif ch >= " ":
             if self.col >= self.cols:
                 self.col = 0
-                self._put_char("\n")
+                self._linefeed()
             self.grid[self.row][self.col] = ch
             self.col += 1
+
+    def _consume_two_byte_escape(self, nxt: str) -> bool:
+        if nxt == "c":
+            self._reset_screen(reset_cursor=True)
+        elif nxt == "7":
+            self._saved_pos = (self.row, self.col)
+        elif nxt == "8":
+            self.row, self.col = self._saved_pos
+        elif nxt == "D":
+            self._linefeed()
+        elif nxt == "E":
+            self.col = 0
+            self._linefeed()
+        elif nxt == "M":
+            if self.row == self._scroll_top:
+                self._scroll_region(self._scroll_top, self._scroll_bottom, 1, up=False)
+            elif self.row > 0:
+                self.row -= 1
+        elif nxt in ("=", ">"):
+            return True
+        else:
+            return False
+        return True
+
+    def _consume_csi_escape(self, data: str, idx: int) -> int | None:
+        m = _CSI_TOKEN_RE.match(data, idx)
+        if m is None:
+            if len(data) - idx < 64:
+                return None
+            self._uncertain = True
+            return idx + 2
+        self._handle_csi(m.group(1), m.group(2))
+        return m.end()
+
+    def _consume_osc_escape(self, data: str, idx: int) -> int | None:
+        m = _OSC_TOKEN_RE.match(data, idx)
+        if m is None:
+            return None if len(data) - idx < 256 else idx + 2
+        return m.end()
 
     def _consume_escape(self, data: str, idx: int) -> int | None:
         if idx + 1 >= len(data):
             return None
         nxt = data[idx + 1]
         if nxt == "[":
-            m = _CSI_TOKEN_RE.match(data, idx)
-            if m is None:
-                return None if len(data) - idx < 64 else idx + 2
-            self._handle_csi(m.group(1), m.group(2))
-            return m.end()
+            return self._consume_csi_escape(data, idx)
         if nxt == "]":
-            m = _OSC_TOKEN_RE.match(data, idx)
-            if m is None:
-                return None if len(data) - idx < 256 else idx + 2
-            return m.end()
-        if nxt == "c":
-            self._clear_all()
-            self.row = 0
-            self.col = 0
+            return self._consume_osc_escape(data, idx)
+        if nxt in ("(", ")"):
+            return None if idx + 2 >= len(data) else idx + 3
+        if not self._consume_two_byte_escape(nxt):
+            self._uncertain = True
         return idx + 2
 
     def feed(self, text: str) -> None:
@@ -269,6 +416,8 @@ class _TerminalScreen:
             idx += 1
 
     def render(self) -> str:
+        if not self.is_certain:
+            return ""
         return "\n".join("".join(row).rstrip() for row in self.grid)
 
 
@@ -656,6 +805,18 @@ def extract_observed_route_row(clean: str, approval: ProofApproval) -> str | Non
     return None
 
 
+def _has_new_exact_reply(
+    rendered: str,
+    pre_prompt_lines: tuple[str, ...],
+    post_prompt_text: str | None,
+) -> bool:
+    if post_prompt_text is not None and not post_prompt_text:
+        return False
+    cur_lines = [ln for ln in (_normalize_reply_line(r) for r in rendered.splitlines()) if ln]
+    added = Counter(cur_lines) - Counter(pre_prompt_lines)
+    return any(_is_exact_reply_line(ln) for ln in added)
+
+
 def _step_pty_driver(
     master_fd: int,
     clean: str,
@@ -679,11 +840,11 @@ def _step_pty_driver(
         return False
     if not state.prompt_sent:
         state.prompt_offset = len(clean)
+        state.pre_prompt_lines = tuple(ln for ln in (_normalize_reply_line(r) for r in clean.splitlines()) if ln)
         os.write(master_fd, (PROOF_PROMPT + "\r").encode("ascii"))
         state.prompt_sent = True
         return False
-    reply_haystack = post_prompt_text if post_prompt_text is not None else clean[state.prompt_offset:]
-    if proof_gate.exact_ok_delivered and (EXPECTED_REPLY in reply_haystack or EXPECTED_REPLY in clean):
+    if proof_gate.exact_ok_delivered and _has_new_exact_reply(clean, state.pre_prompt_lines, post_prompt_text):
         time.sleep(0.6)
         with suppress(OSError):
             os.write(master_fd, b"\x03")

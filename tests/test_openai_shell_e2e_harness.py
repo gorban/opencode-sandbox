@@ -2842,7 +2842,7 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertIn("pod_has_untracked_members", res_num["errors"])
             self.assertEqual(rm_calls, [])
 
-            # 3. Confirmed lease release with surviving slot directory (rmtree PermissionError) reports failure!
+            # 3. Confirmed lease release with surviving slot directory (real PermissionError) reports failure!
             slot_parent = td / "slot_parent"
             slot_parent.mkdir(mode=0o700)
             slot_dir = slot_parent / "turn-0"
@@ -2851,8 +2851,11 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             j_slot = _OwnershipJournal(jspec, podman_runner=_numeric_pod_pm)
             j_slot.prepare_slot("turn-0", container_name="oc-e2e-deadbeef-relay-0", slot_root=str(slot_dir))
             j_slot.mark_lease_released("turn-0")
-            with patch("oc_openai.shell_cleanup_owner.shutil.rmtree", side_effect=PermissionError("denied")):
+            os.chmod(slot_parent, 0o500)
+            try:
                 res_slot = j_slot.teardown()
+            finally:
+                os.chmod(slot_parent, 0o700)
             self.assertFalse(res_slot[KEY_CLEANUP_VERIFIED])
             self.assertIn("slot_root_remove_failed:turn-0", res_slot["errors"])
             self.assertTrue(slot_dir.exists())
@@ -2889,6 +2892,161 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 self.assertFalse(gate.verify_settled_evidence(), f"accepted tamper {patch_fields}")
             ev_path.write_bytes(good_raw)
             self.assertTrue(gate.verify_settled_evidence())
+
+    def test_reciprocal_g2_r3_delete_line_unknown_csi_pinned_slot_owner_and_exact_reply(self) -> None:
+        from oc_openai import session_broker
+
+        with tempfile.TemporaryDirectory(prefix="oc-g2-r3-") as td_raw:
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            exp = td / "exp"
+            exp.mkdir(mode=0o700)
+            os.chmod(exp, 0o700)
+            ev = td / "ev"
+            ev.mkdir(mode=0o700)
+            os.chmod(ev, 0o700)
+
+            approval = ProofApproval(
+                run_id=TEST_RUN_ID, instance_label="personal", scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL, ui_mode="mini", cwd=TEST_CWD,
+                selection_epoch="E" * 43, credential_generation=1,
+                history_digest_all_12_files=compute_exposure_history_digest(exp),
+                providers_config_digest=TEST_HEX_A,
+            )
+
+            # 1. Xterm delete-line (CSI M) and unknown mutating CSI fail closed; full clear recovers.
+            for raw in (
+                f"openai--personal/{TEST_MODEL}\x1b[1;1H\x1b[M",
+                f"openai--personal/{TEST_MODEL}\x1b[1;1H\x1b[1M",
+                f"openai--personal/{TEST_MODEL}\x1b[1;1H\x1b[L\x1b[1;1H\x1b[2M",
+                f"openai--personal/{TEST_MODEL}\x1b[5$z",
+                f"openai--personal/{TEST_MODEL}\x1b[?9999h",
+            ):
+                self.assertIsNone(shell_driver.extract_observed_route_row(raw, approval), raw)
+            recovered = f"openai--personal/{TEST_MODEL}\x1b[5$z\x1b[2J\x1b[Hopenai--personal/{TEST_MODEL}"
+            self.assertEqual(
+                shell_driver.extract_observed_route_row(recovered, approval),
+                f"openai--personal/{TEST_MODEL}",
+            )
+
+            # Subprocess PTY deletes approved row with CSI M -> must NOT arm!
+            gate_dl = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
+            gate_dl.bind_incarnation("inc-pty-del-line-01", 1)
+            armed_dl: list[tuple[str, str]] = []
+            fake_dl_tui = (
+                "import sys, time; "
+                f"sys.stdout.write('openai--personal/{TEST_MODEL}\\n'); sys.stdout.flush(); "
+                "time.sleep(0.1); "
+                "sys.stdout.write('\\x1b[1;1H\\x1b[M'); sys.stdout.flush(); "
+                "time.sleep(1.8)"
+            )
+            with patch.object(
+                shell_driver,
+                "_agent_start_command",
+                return_value=([sys.executable, "-IB", "-c", fake_dl_tui], dict(os.environ)),
+            ):
+                shell_driver._drive_agent_pty(
+                    TEST_HEX_A, threading.Event(), gate_dl, lambda r, d: armed_dl.append((r, d)),
+                )
+            self.assertEqual(armed_dl, [])
+
+            # 2. Single slot-root deletion owner + inode-pinned removal never deletes replacements!
+            jspec = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=td / "j_pin.json",
+            )
+            no_pm = lambda args, timeout=20.0: subprocess.CompletedProcess(args, 1, b"", b"")
+            # 2a. Replacement regular file at released slot path survives untouched!
+            slot_f = td / "slot_replaced_file"
+            slot_f.mkdir(mode=0o700)
+            j_f = _OwnershipJournal(jspec, podman_runner=no_pm)
+            j_f.prepare_slot("turn-0", container_name="oc-e2e-deadbeef-relay-0", slot_root=str(slot_f))
+            j_f.mark_lease_released("turn-0")
+            slot_f.rmdir()
+            slot_f.write_text("unrelated-user-file", encoding="utf-8")
+            res_f = j_f.teardown()
+            self.assertFalse(res_f[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_f["ownership_uncertain"])
+            self.assertIn("slot_root_identity_mismatch:turn-0", res_f["errors"])
+            self.assertTrue(slot_f.is_file())
+            self.assertEqual(slot_f.read_text(encoding="utf-8"), "unrelated-user-file")
+
+            # 2b. Replacement directory at released slot path survives untouched!
+            slot_d = td / "slot_replaced_dir"
+            slot_d.mkdir(mode=0o700)
+            j_d = _OwnershipJournal(jspec, podman_runner=no_pm)
+            j_d.prepare_slot("turn-0", container_name="oc-e2e-deadbeef-relay-0", slot_root=str(slot_d))
+            j_d.mark_lease_released("turn-0")
+            slot_d.rmdir()
+            slot_d.mkdir(mode=0o700)
+            keeper = slot_d / "precious.txt"
+            keeper.write_text("do-not-delete", encoding="utf-8")
+            res_d = j_d.teardown()
+            self.assertFalse(res_d[KEY_CLEANUP_VERIFIED])
+            self.assertIn("slot_root_identity_mismatch:turn-0", res_d["errors"])
+            self.assertEqual(keeper.read_text(encoding="utf-8"), "do-not-delete")
+
+            # 2c. _finalize_session_teardown delegates slot-root deletion solely to detached cleanup owner!
+            coord_slot_dir = td / "coord_owned_by_journal"
+            coord_slot_dir.mkdir(mode=0o700)
+            released_notified: list[str] = []
+            fake_coord = SimpleNamespace(
+                _lock=threading.Lock(),
+                _slots={
+                    0: SimpleNamespace(
+                        lease_confirmed_released=True,
+                        handle=SimpleNamespace(lease_release_confirmed=True),
+                    ),
+                },
+                teardown_all=lambda _aid: None,
+                remove_slot_roots=lambda **_kw: (_ for _ in ()).throw(AssertionError("coordinator must not remove roots")),
+            )
+            fake_cutover = SimpleNamespace(tracked_slot_keys=["turn-0"], tracked_slot_indices={"turn-0": 0})
+            proof_opts = session_broker.ProofSessionOptions(
+                proof_gate=gate_dl, on_slot_lease_released=released_notified.append,
+            )
+            cstate = {"clean": False}
+            ok_fin = session_broker._finalize_session_teardown(
+                fake_coord, None, fake_cutover, proof_opts, cstate, td, SimpleNamespace(error=lambda _m: None),
+            )
+            self.assertTrue(ok_fin)
+            self.assertTrue(cstate["clean"])
+            self.assertIn("turn-0", released_notified)
+            self.assertTrue(coord_slot_dir.is_dir())
+
+            # 3. Reply observation rejects "token usage" / zero post-prompt bytes / echoed prompt / stale "ok".
+            r_fd, w_fd = os.pipe()
+            try:
+                fake_gate = SimpleNamespace(admitted_writes=1, exact_ok_delivered=True)
+                st = shell_driver._PtyState(armed=True, prompt_sent=True, pre_prompt_lines=("token usage", "ok"))
+                self.assertFalse(
+                    shell_driver._step_pty_driver(w_fd, "token usage", 5.0, fake_gate, lambda _r, _d: None, st, post_prompt_text=""),
+                )
+                self.assertFalse(
+                    shell_driver._step_pty_driver(w_fd, "token usage", 5.0, fake_gate, lambda _r, _d: None, st, post_prompt_text="token usage"),
+                )
+                self.assertFalse(
+                    shell_driver._step_pty_driver(
+                        w_fd, f"token usage\n{PROOF_PROMPT}", 5.0, fake_gate, lambda _r, _d: None, st, post_prompt_text=PROOF_PROMPT,
+                    ),
+                )
+                # Stale pre-prompt "ok" without a second newly rendered "ok" must still fail!
+                self.assertFalse(
+                    shell_driver._step_pty_driver(
+                        w_fd, "token usage\nok", 5.0, fake_gate, lambda _r, _d: None, st, post_prompt_text="status",
+                    ),
+                )
+                # Newly rendered exact assistant reply ("ok" / "Assistant: ok") succeeds and sends Ctrl-C!
+                with patch.object(shell_driver.time, "sleep"):
+                    done = shell_driver._step_pty_driver(
+                        w_fd, "token usage\nok\nAssistant: ok", 5.0, fake_gate, lambda _r, _d: None, st, post_prompt_text="Assistant: ok",
+                    )
+                self.assertTrue(done)
+                self.assertEqual(os.read(r_fd, 16), b"\x03")
+            finally:
+                os.close(r_fd)
+                os.close(w_fd)
 
 
 if __name__ == "__main__":

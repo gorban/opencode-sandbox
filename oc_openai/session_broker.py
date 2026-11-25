@@ -1293,10 +1293,20 @@ class _SessionSlotCoordinator:
         self._slots: dict[int, _SlotState] = {}
         self._pre_revoked: set[int] = set()
         self._slot_roots: list[Path] = []
+        self._slot_root_ids: dict[Path, tuple[int, int]] = {}
         self._created_containers: list[str] = []
         self._removed_containers: set[str] = set()
         self._retire_threads: list[threading.Thread] = []
         self._cleanup_error: Exception | None = None
+
+    def _remember_slot_root_locked(self, slot_root: Path) -> None:
+        if slot_root not in self._slot_roots:
+            self._slot_roots.append(slot_root)
+        if slot_root not in self._slot_root_ids:
+            with suppress(OSError):
+                info = os.lstat(slot_root)
+                if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid():
+                    self._slot_root_ids[slot_root] = (info.st_dev, info.st_ino)
 
     def register_slot(self, slot_cm, handle: SlotHandle, slot_root: Path | None = None) -> _SlotState:
         resolved_root = slot_root if slot_root is not None else handle.job.root
@@ -1304,8 +1314,7 @@ class _SessionSlotCoordinator:
         should_revoke = False
         with self._lock:
             self._slots[handle.slot_index] = state
-            if resolved_root not in self._slot_roots:
-                self._slot_roots.append(resolved_root)
+            self._remember_slot_root_locked(resolved_root)
             if handle.slot_index in self._pre_revoked or handle.broker._revoked.is_set():
                 self._pre_revoked.discard(handle.slot_index)
                 should_revoke = True
@@ -1315,12 +1324,14 @@ class _SessionSlotCoordinator:
 
     def track_slot_root(self, slot_root: Path) -> None:
         with self._lock:
-            if slot_root not in self._slot_roots:
-                self._slot_roots.append(slot_root)
+            self._remember_slot_root_locked(slot_root)
 
     def remove_slot_roots(self, *, require_confirmed_leases: bool = False) -> None:
+        from .shell_cleanup_owner import _remove_pinned_dir
+
         with self._lock:
             roots = list(self._slot_roots)
+            root_ids = dict(self._slot_root_ids)
             confirmed = (
                 {
                     s.slot_root
@@ -1333,8 +1344,9 @@ class _SessionSlotCoordinator:
         for slot_root in roots:
             if confirmed is not None and slot_root not in confirmed:
                 continue
-            with suppress(OSError):
-                shutil.rmtree(slot_root)
+            ident = root_ids.get(slot_root)
+            if ident is not None:
+                _remove_pinned_dir(slot_root, ident[0], ident[1])
 
     def begin_relay_create(self, slot_index: int) -> bool:
         with self._lock:
@@ -1890,7 +1902,8 @@ def _finalize_session_teardown(
             return False
         for key in (*cutover.tracked_slot_keys, "agent"):
             _notify_slot_lease_released(proof_options, key)
-    coordinator.remove_slot_roots(require_confirmed_leases=(proof_options is not None))
+    if proof_options is None or proof_options.on_slot_lease_released is None:
+        coordinator.remove_slot_roots(require_confirmed_leases=(proof_options is not None))
     cleanup_state["clean"] = True
     return True
 

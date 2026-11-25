@@ -19,6 +19,7 @@ Lifecycle guarantees:
 
 from contextlib import suppress
 from dataclasses import dataclass
+import errno
 import fcntl
 import json
 import os
@@ -26,7 +27,6 @@ from pathlib import Path
 import re
 import secrets
 import select
-import shutil
 import signal
 import socket
 import stat
@@ -144,6 +144,92 @@ def _atomic_fsync_write(path: Path, data: bytes) -> None:
         with suppress(OSError):
             tmp.unlink(missing_ok=True)
         raise
+
+
+def _stat_owned_dir(path_str: str) -> tuple[int, int] | None:
+    if not path_str:
+        return None
+    try:
+        info = os.lstat(path_str)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _clear_dir_fd(dir_fd: int) -> None:
+    for name in os.listdir(dir_fd):
+        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            sub_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+            try:
+                _clear_dir_fd(sub_fd)
+            finally:
+                os.close(sub_fd)
+            os.rmdir(name, dir_fd=dir_fd)
+        else:
+            os.unlink(name, dir_fd=dir_fd)
+
+
+def _open_pinned_leaf_dir(parent_fd: int, leaf: str, want_dev: int, want_ino: int) -> tuple[int | None, str]:
+    try:
+        leaf_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None, "absent"
+    except OSError as exc:
+        if exc.errno in (errno.ENOTDIR, errno.ELOOP):
+            return None, "replaced"
+        return None, "error"
+    info = os.fstat(leaf_fd)
+    if (info.st_dev, info.st_ino) != (want_dev, want_ino) or info.st_uid != os.geteuid():
+        os.close(leaf_fd)
+        return None, "replaced"
+    return leaf_fd, "ok"
+
+
+def _remove_pinned_dir(root_path: Path, want_dev: int, want_ino: int) -> str:
+    """Remove only the exact (st_dev, st_ino) directory via dir_fd; never touch replacements."""
+    try:
+        parent_fd = os.open(root_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "error"
+    leaf = root_path.name
+    try:
+        leaf_fd, status = _open_pinned_leaf_dir(parent_fd, leaf, want_dev, want_ino)
+        if leaf_fd is None:
+            return status
+        try:
+            _clear_dir_fd(leaf_fd)
+        except OSError:
+            return "error"
+        finally:
+            os.close(leaf_fd)
+        try:
+            cur = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return "error"
+        if (cur.st_dev, cur.st_ino) != (want_dev, want_ino) or not stat.S_ISDIR(cur.st_mode):
+            return "replaced"
+        try:
+            os.rmdir(leaf, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return "error"
+        try:
+            after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return "removed"
+        except OSError:
+            return "error"
+        return "error" if (after.st_dev, after.st_ino) == (want_dev, want_ino) else "replaced"
+    finally:
+        os.close(parent_fd)
 
 
 def _revoke_grant_dir(grant_dir: str, *, slot_root: str = "") -> None:
@@ -438,26 +524,41 @@ class _OwnershipJournal:
         self.worktree_owned = True
         self._persist()
 
+    def _slot_root_identity(self, slot_key: str, slot_root: str) -> tuple[int | None, int | None]:
+        prev = self.slots.get(slot_key)
+        if prev is not None and prev.get("slot_root") == slot_root:
+            prev_dev, prev_ino = prev.get("slot_root_dev"), prev.get("slot_root_ino")
+            if type(prev_dev) is int and type(prev_ino) is int:
+                return prev_dev, prev_ino
+        ident = _stat_owned_dir(slot_root)
+        return ident if ident is not None else (None, None)
+
     def prepare_slot(self, slot_key: str, *, container_name: str, slot_root: str = "") -> None:
         """Persist intended slot BEFORE open_slot() acquires any profile lease in worker_leases."""
+        root_dev, root_ino = self._slot_root_identity(slot_key, slot_root)
         self.slots[slot_key] = {
             "status": _STATUS_LEASE_ACQUIRING,
             _KEY_CONTAINER_NAME: container_name,
             "cid": None,
             "grant_dir": "",
             "slot_root": slot_root,
+            "slot_root_dev": root_dev,
+            "slot_root_ino": root_ino,
             _KEY_LEASE_RELEASED: False,
         }
         self._persist()
 
     def begin_slot_create(self, slot_key: str, *, container_name: str, grant_dir: str = "", slot_root: str = "") -> None:
         """Persist in-flight container creation BEFORE invoking podman create."""
+        root_dev, root_ino = self._slot_root_identity(slot_key, slot_root)
         self.slots[slot_key] = {
             "status": _STATUS_CREATING,
             _KEY_CONTAINER_NAME: container_name,
             "cid": None,
             "grant_dir": grant_dir,
             "slot_root": slot_root,
+            "slot_root_dev": root_dev,
+            "slot_root_ino": root_ino,
             _KEY_LEASE_RELEASED: False,
         }
         self._persist()
@@ -573,29 +674,28 @@ class _OwnershipJournal:
         self.ownership_uncertain = True
         self.cleanup_errors.append(f"lease_unreleased:{slot_key}")
 
-    def _remove_released_slot_root(self, slot_key: str, slot_root: str) -> None:
+    def _remove_released_slot_root(self, slot_key: str, entry: dict[str, object]) -> None:
+        slot_root = str(entry.get("slot_root") or "")
         if not slot_root:
             return
-        root_path = Path(slot_root)
-        if not (root_path.exists() or root_path.is_symlink()):
+        want_dev = entry.get("slot_root_dev")
+        want_ino = entry.get("slot_root_ino")
+        if type(want_dev) is not int or type(want_ino) is not int:
+            self.ownership_uncertain = True
+            self.cleanup_errors.append(f"slot_root_identity_unknown:{slot_key}")
             return
-        err_code = f"slot_root_remove_failed:{slot_key}"
-        try:
-            if root_path.is_symlink() or not root_path.is_dir():
-                root_path.unlink()
-            else:
-                shutil.rmtree(root_path)
-        except OSError:
-            self.cleanup_errors.append(err_code)
-        if (root_path.exists() or root_path.is_symlink()) and err_code not in self.cleanup_errors:
-            self.cleanup_errors.append(err_code)
+        outcome = _remove_pinned_dir(Path(slot_root), want_dev, want_ino)
+        if outcome == "replaced":
+            self.ownership_uncertain = True
+            self.cleanup_errors.append(f"slot_root_identity_mismatch:{slot_key}")
+        elif outcome == "error":
+            self.cleanup_errors.append(f"slot_root_remove_failed:{slot_key}")
 
     def _reconcile_slots(self) -> None:
         for slot_key in reversed(list(self.slots)):
             entry = self.slots[slot_key]
-            slot_root = str(entry.get("slot_root") or "")
             if entry.get(_KEY_LEASE_RELEASED) is True:
-                self._remove_released_slot_root(slot_key, slot_root)
+                self._remove_released_slot_root(slot_key, entry)
                 continue
             self._retire_unreleased_slot(slot_key, entry)
 
