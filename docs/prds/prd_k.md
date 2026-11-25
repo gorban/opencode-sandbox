@@ -204,6 +204,66 @@ baseline and a required floor remain open.
   fixture is unconfigured before reporting a skip. Once enabled, unexpected absence, malformed
   config, authentication or engine errors, assertion failures, timeouts and incomplete cleanup
   fail the check. Keep remote credentials and jobs outside the PR workflow.
+- [ ] Reserve the local-only remote SSH target configuration file at
+  `~/.config/oc-sandbox/remote-ssh.env` (and optional named profiles at
+  `~/.config/oc-sandbox/remote-ssh.<NAME>.env`, with `<NAME>` restricted to
+  `[a-z0-9][a-z0-9._-]*`). Keep it mode `0600`, user-owned, outside Git repositories and outside
+  `~/opencode-sandbox`. Parse plain `KEY=VALUE` lines without shell `eval` or command substitution,
+  and never export its values into agent containers.
+- [ ] Support automated single-process SSH agent management (`OC_SSH_AGENT_MODE=keeper` in addition
+  to `env`) so local acceptance runs do not require manually juggling two terminals. Spawn
+  `keeper --config <OC_SSH_KEEPER_CONFIG> ssh-agent start` under a private PTY with `umask 077`,
+  capture `SSH_AUTH_SOCK` without logging Keeper output or SSH key identities, verify a loaded key
+  with `ssh-add -l >/dev/null`, run SSH with hardened flags, and shut down Keeper cleanly (`q\n`
+  with verified exit) on completion or error. Detect expired/logged-out Keeper sessions within a
+  bounded timeout and report actionable re-authentication steps instead of hanging.
+- [ ] Add an OS-aware preflight and setup helper to remote and parallel host acceptance runners
+  (including `tests/parallel-isolated.py --run` and future SSH/Tailcat e2e tests). When a run is
+  attempted without valid configuration or prerequisites, report exactly what is missing and print
+  copy-paste remediation for the detected target OS (creating `remote-ssh.env`, pinning host keys,
+  re-authenticating Keeper, layering missing packages on Fedora CoreOS vs `dnf` on Fedora,
+  installing `oc_chromium.cil`, or pointing to a clean account/VM when the local workstation holds
+  managed provider config).
+
+### Reserved `remote-ssh.env` variables and hardened SSH contract
+
+| Variable | Purpose | Example placeholder |
+|---|---|---|
+| `OC_SSH_TARGET` | SSH `user@host` endpoint | `worker@build-host.example` |
+| `OC_SSH_PORT` | SSH TCP port (default `22`) | `22` |
+| `OC_SSH_KNOWN_HOSTS` | Pinned host-keys file (default `~/.ssh/known_hosts`) | `/home/alice/.ssh/known_hosts` |
+| `OC_SSH_PODMAN_BIN` | Absolute path to `podman` on the SSH target | `/opt/podman/bin/podman` |
+| `OC_SSH_PODMAN_MACHINE` | Optional Podman Machine VM name (omit on direct Linux hosts) | `podman-machine-default` |
+| `OC_SSH_AGENT_MODE` | `env` (existing `SSH_AUTH_SOCK`) or `keeper` (managed PTY) | `keeper` |
+| `OC_SSH_KEEPER_BIN` | Absolute path to `keeper` CLI (`OC_SSH_AGENT_MODE=keeper`) | `/path/to/keeper-env/bin/keeper` |
+| `OC_SSH_KEEPER_CONFIG` | Absolute path to Keeper config JSON (`OC_SSH_AGENT_MODE=keeper`) | `/home/alice/.keeper/config.json` |
+
+All automated SSH invocations must pass `-F /dev/null`, `-o IdentityAgent=SSH_AUTH_SOCK`,
+`-o IdentityFile=none`, `-o BatchMode=yes`, `-o PreferredAuthentications=publickey`,
+`-o ForwardAgent=no`, `-o ClearAllForwardings=yes`, `-o StrictHostKeyChecking=yes`,
+`-o UserKnownHostsFile=<OC_SSH_KNOWN_HOSTS>`, and `-p <OC_SSH_PORT>`. Missing or changed host keys
+fail closed without `accept-new`.
+
+### SELinux-enforcing remote test host prerequisites
+
+Full host acceptance (`tests/security.sh`, `tests/parallel.sh`, and legacy
+`tests/parallel-isolated.py --run`) requires a Linux target running **rootless Podman** with
+**SELinux enforcing**, plus:
+
+- `python3` (with `libselinux.so.1` accessible and `os.pidfd_open`), `script` (`util-linux-script`),
+  `bash`, `git`, `curl`, and `sha256sum`
+- `semodule` and `/usr/share/udica/templates` (`base_container.cil`, etc.)
+- The `oc_chromium.cil` policy module loaded once via `sudo semodule -i`
+- A clean account home (no `~/.config/oc-sandbox/{providers.toml,openai}`) when exercising legacy
+  `tests/parallel-isolated.py --run`
+
+On macOS remote hosts, **Podman Machine** provides a Fedora CoreOS VM with rootless Podman,
+SELinux enforcing, `semodule`, and `/usr/share/udica/templates` already present (unlike Colima or
+OrbStack, which run non-SELinux Linux VMs). On Fedora CoreOS, layer missing tools with
+`sudo rpm-ostree install python3 util-linux-script` (followed by a VM restart or `--apply-live`)
+and install `oc_chromium.cil` once. Preflight diagnostics should detect the remote OS
+(`/etc/os-release`), `getenforce`, Podman rootless/SELinux status, missing tools, and missing
+policy modules, and print the exact commands needed to bring the target up to spec.
 
 ## Later runtime layout
 

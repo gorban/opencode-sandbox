@@ -25,6 +25,14 @@ Parent: [prd_i](prd_i.md) · related: [orchestrator](prd_i1.md), [broker](prd_i3
       reachable bastion where a relay is acceptable. Consider Tailcat for machines behind
       separate NATs and Tailscale/Headscale for a standing fleet that needs centralized
       enrollment and policy.
+- [ ] Reuse the reserved local-only `~/.config/oc-sandbox/remote-ssh.env` (and named
+      `remote-ssh.<NAME>.env`) variable contract, hardened SSH flags, and automated
+      `SSH_AUTH_SOCK` / Keeper agent lifecycle documented in
+      [PRD K · Remote acceptance](prd_k.md#remote-acceptance) so remote worker onboarding and
+      remote acceptance tests share one host-trusted transport configuration (never committed to
+      Git, never inside `~/opencode-sandbox`, and never exposed to agent containers). Give
+      operators actionable preflight diagnostics (host key pinning, agent auth, SELinux/Podman
+      capabilities, and OS-specific install/upgrade commands) when onboarding a remote worker.
 - [ ] Carry commands, results, preview streams and scoped agent messages over authenticated
       connections. Use a resumable SSE stream for status and messages to the dashboard, with
       separate authenticated requests for actions. Show direct/relayed status where available.
