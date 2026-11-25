@@ -236,6 +236,11 @@ AGY can deliver the private ChatGPT route through its existing review gates befo
 command migration or code extraction. Later integration preserves its browser options,
 registration binding and exposure holds.
 
+The [offline model picker spike](spikes/i4/model-picker/WALKTHROUGH.md) measures model labels,
+route attribution, and saved-route removal in both stock OpenCode 2.3.0 terminal frontends.
+Both frontends group normal browsing by provider. The spike uses synthetic accounts and leaves
+the managed launch and live provider acceptance checks below open.
+
 ## Acceptance
 
 - [ ] (decision needed) Confirm scoped CLI and environment naming with the grouped command plan.
