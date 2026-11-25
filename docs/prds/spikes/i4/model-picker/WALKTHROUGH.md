@@ -29,7 +29,10 @@ starts in a second filesystem and PID namespace sharing only the isolated networ
 Its mounts include the stock executable, read-only JSON configuration, read-only
 empty workspace, and its own scratch home and XDG directories. The tmux control
 socket and the fake's one-shot gate are outside the frontend's mounts. The
-launcher uses these managed startup settings.
+launcher uses a separate mode-0700 temporary directory for each frontend.
+The controller creates a mode-0700 staging directory at the location required
+by nested Bubblewrap. The frontend receives its own `TMPDIR` and no host temporary directory.
+The launcher uses these managed startup settings.
 
 - `OPENCODE_CONFIG_PROJECT_DISABLE=true`
 - `OPENCODE_DISABLE_MODELS_FETCH=true`
@@ -42,8 +45,10 @@ and a fixed fixture key. The endpoint only produces prerecorded text and
 cannot forward requests. Tools, title generation, summarization, and compaction
 are disabled. The fake records all syntactically valid HTTP methods that reach
 the application handler, with the request target taken from the original request
-line. The allow gate compares that target literally. A query string or extra
-leading slash changes the target and is refused. The probe fails if the request
+line. It records arrivals before reading the body, so an invalid or incomplete
+body still counts as a request. The allow gate compares the target literally
+and requires dispatch to the handler after the current approval. A query string
+or extra leading slash changes the target and is refused. The probe fails if the request
 log across all cases differs from the one authorized POST, even when every
 extra attempt was refused. Before checking the final log, the controller waits
 for each frontend pane to exit, then shuts down and joins the HTTP server so

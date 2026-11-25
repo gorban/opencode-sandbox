@@ -6,10 +6,25 @@ import json
 import socket
 import threading
 import unittest
+from unittest.mock import patch
 
 from probe import (
     APPROVED_TARGET, EXPECTED_REQUEST, Fake, PROMPT, SAVED_ROUTE, SELECT, request_log_matches, serving, stale_refusal,
 )
+
+
+def valid_payload():
+    return json.dumps({
+        "model": SELECT[1], "stream": True, "messages": [{"role": "user", "content": PROMPT}],
+    })
+
+
+def send_post(fake, payload):
+    with closing(http.client.HTTPConnection("127.0.0.1", fake.server_port, timeout=3)) as client:
+        client.request("POST", APPROVED_TARGET, payload, {"Authorization": "Bearer offline-fixture"})
+        response = client.getresponse()
+        response.read()
+        return response.status
 
 
 class EvidenceChecks(unittest.TestCase):
@@ -42,11 +57,11 @@ class EvidenceChecks(unittest.TestCase):
         statuses = []
 
         class DelayedFake(Fake):
-            def record(self, method, target, authorization, payload):
+            def arrive(self, method, target):
                 blocked.set()
                 if not release.wait(2):
                     raise TimeoutError("test did not release the blocked handler")
-                return super().record(method, target, authorization, payload)
+                return super().arrive(method, target)
 
             def shutdown(self):
                 stopping.set()
@@ -79,12 +94,51 @@ class EvidenceChecks(unittest.TestCase):
         self.assertFalse(events[1]["accepted"])
         self.assertFalse(request_log_matches(events))
 
+    def test_startup_request_cannot_consume_later_approval(self):
+        self.assertEqual({name for _, name in socket.if_nameindex()}, {"lo"})
+        arrived = threading.Event()
+
+        class ArrivingFake(Fake):
+            def arrive(self, method, target):
+                arrival = super().arrive(method, target)
+                arrived.set()
+                return arrival
+
+        payload = valid_payload().encode()
+        with ArrivingFake() as fake, serving(fake):
+            with closing(http.client.HTTPConnection("127.0.0.1", fake.server_port, timeout=3)) as client:
+                client.putrequest("POST", APPROVED_TARGET)
+                client.putheader("Content-Length", str(len(payload)))
+                client.putheader("Authorization", "Bearer offline-fixture")
+                client.endheaders()
+                self.assertTrue(arrived.wait(2))
+                fake.mark("approved", SELECT)
+                client.send(payload)
+                response = client.getresponse()
+                self.assertEqual(response.status, 403)
+                response.read()
+            self.assertEqual(send_post(fake, payload), 200)
+        startup, approved = fake.snapshot()
+        self.assertEqual(startup, dict(EXPECTED_REQUEST, phase="startup", accepted=False))
+        self.assertEqual(approved, EXPECTED_REQUEST)
+        self.assertFalse(request_log_matches(fake.snapshot()))
+
+    def test_parser_recursion_leaves_extra_request_in_the_log(self):
+        self.assertEqual({name for _, name in socket.if_nameindex()}, {"lo"})
+        with Fake() as fake, serving(fake):
+            fake.mark("approved", SELECT)
+            self.assertEqual(send_post(fake, valid_payload()), 200)
+            with patch("probe.json.loads", side_effect=RecursionError("fixture parser failure")):
+                self.assertEqual(send_post(fake, b"[]"), 403)
+        approved, malformed = fake.snapshot()
+        self.assertEqual(approved, EXPECTED_REQUEST)
+        self.assertEqual(malformed, dict(EXPECTED_REQUEST, model=None, fixed_prompt=False, accepted=False))
+        self.assertFalse(request_log_matches(fake.snapshot()))
+
     def test_http_method_and_exact_raw_target(self):
         self.assertEqual({name for _, name in socket.if_nameindex()}, {"lo"},
                          "run the regression checks inside a loopback-only network namespace")
-        payload = json.dumps({
-            "model": SELECT[1], "stream": True, "messages": [{"role": "user", "content": PROMPT}],
-        })
+        payload = valid_payload()
         cases = [
             ("POST", APPROVED_TARGET + "?extra=yes", 403),
             ("HEAD", APPROVED_TARGET, 403),
@@ -98,12 +152,17 @@ class EvidenceChecks(unittest.TestCase):
             fake.mark("approved", SELECT)
             try:
                 for method, target, status in cases:
-                    with self.subTest(method=method, target=target):
-                        with closing(http.client.HTTPConnection("127.0.0.1", fake.server_port, timeout=3)) as client:
-                            client.request(method, target, payload, {"Authorization": "Bearer offline-fixture"})
-                            response = client.getresponse()
-                            self.assertEqual(response.status, status)
-                            response.read()
+                    with (
+                        self.subTest(method=method, target=target),
+                        closing(http.client.HTTPConnection("127.0.0.1", fake.server_port, timeout=3)) as client,
+                    ):
+                        client.request(method, target, payload, {"Authorization": "Bearer offline-fixture"})
+                        response = client.getresponse()
+                        self.assertEqual(response.status, status)
+                        body = response.read()
+                        if status == 200:
+                            first_frame = body.splitlines()[0].removeprefix(b"data: ")
+                            self.assertEqual(json.loads(first_frame)["model"], SELECT[1])
             finally:
                 fake.shutdown()
                 thread.join(timeout=3)

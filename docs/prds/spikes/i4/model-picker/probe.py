@@ -22,6 +22,14 @@ import time
 SHA256 = "2e0e4656521ca56e5ba16a00d48429958b8105b3fa6466710a4350e68759381f"
 PORT = 8401
 PROMPT = "Reply with exactly: ok"
+PICKER_TITLE = "Select model"
+GOOGLE_LABEL = "google/personal"
+PROGRAM = "/program"
+OPENCODE = f"{PROGRAM}/opencode"
+CONFIG = "/config"
+OUTPUT = "/output"
+WORKSPACE = "/workspace"
+CONFIG_ENV = "OPENCODE_CONFIG"
 ENV = {
     "PATH": "/usr/bin:/bin",
     "LANG": "C.UTF-8",
@@ -46,13 +54,13 @@ CATALOG = {
         "opal-v1": "Opal v1 (opal-v2 work) - work [metered]",
     },
     "google--personal": {
-        "opal-v2": "Opal v2 - google/personal [subscription]",
+        "opal-v2": f"Opal v2 - {GOOGLE_LABEL} [subscription]",
     },
 }
 PROVIDER_NAMES = {
     "claude--personal": "claude/personal",
     "claude--work": "work",
-    "google--personal": "google/personal",
+    "google--personal": GOOGLE_LABEL,
 }
 TARGET_LABEL = CATALOG[SELECT[0]][SELECT[1]]
 LABELS = [label for models in CATALOG.values() for label in models.values()]
@@ -126,8 +134,8 @@ def config(port, *, stale=False, collision_model=None):
     }
 
 
-def stream(model):
-    common = {"id": "chatcmpl-picker", "object": "chat.completion.chunk", "created": 1, "model": model}
+def stream():
+    common = {"id": "chatcmpl-picker", "object": "chat.completion.chunk", "created": 1, "model": SELECT[1]}
     frames = [
         dict(common, choices=[{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": None}]),
         dict(common, choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}]),
@@ -145,18 +153,33 @@ class Fake(http.server.HTTPServer):
         self.events = []
         self.allow = None
         self.phase = "startup"
+        self.generation = 0
 
     def mark(self, phase, allow=None):
         with self.lock:
+            self.generation += 1
             self.phase = phase
             self.allow = allow
 
     def snapshot(self):
         with self.lock:
-            return self.events[:]
+            return [event.copy() for event in self.events]
 
-    def record(self, method, target, authorization, payload):
-        scope = next((scope for scope in CATALOG if target == f"/{scope}/v1/chat/completions"), None)
+    def arrive(self, method, target):
+        with self.lock:
+            scope = next((scope for scope in CATALOG if target == f"/{scope}/v1/chat/completions"), None)
+            event = {
+                "phase": self.phase, "method": method[:32], "target": target[:160],
+                "scope": scope, "model": None, "fixed_prompt": False,
+                "tools_advertised": False, "accepted": False,
+            }
+            # A second record already fails the exact-log check. Cap the diagnostic log.
+            if len(self.events) < 16:
+                self.events.append(event)
+            return self.generation, event
+
+    def complete(self, arrival, authorization, payload):
+        generation, event = arrival
         model = payload.get("model")
         messages = payload.get("messages")
         exact = (isinstance(messages, list) and bool(messages)
@@ -164,19 +187,15 @@ class Fake(http.server.HTTPServer):
         tools = bool(payload.get("tools") or payload.get("tool_choice"))
         with self.lock:
             accepted = (
-                method == "POST" and self.allow is not None and self.allow == (scope, model)
+                generation == self.generation
+                and event["method"] == "POST" and self.allow == (event["scope"], model)
                 and exact and not tools and payload.get("stream") is True
                 and authorization == "Bearer offline-fixture"
             )
             if accepted:
                 self.allow = None
-            # A second record already fails the exact-log check. Cap the diagnostic log.
-            if len(self.events) < 16:
-                self.events.append({
-                    "phase": self.phase, "method": method[:32], "target": target[:160],
-                    "scope": scope, "model": model if isinstance(model, str) and model in MODEL_IDS else None,
-                    "fixed_prompt": exact, "tools_advertised": tools, "accepted": accepted,
-                })
+            event.update(model=model if isinstance(model, str) and model in MODEL_IDS else None,
+                         fixed_prompt=exact, tools_advertised=tools, accepted=accepted)
             return accepted
 
 
@@ -202,6 +221,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.connection.settimeout(2)
 
     def log_message(self, *args):
+        # Keep one bounded structured request log. The default logger echoes raw request lines.
         pass
 
     def __getattr__(self, name):
@@ -211,20 +231,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raise AttributeError(name)
 
     def handle_request(self):
+        # Use the request-line target before the base class normalizes leading slashes.
+        target = self.requestline.split()[1]
+        arrival = self.server.arrive(self.command, target)
         payload = {}
         if self.command == "POST":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if 0 < length <= 65536:
                     payload = json.loads(self.rfile.read(length))
-            except (OSError, ValueError):
-                pass
+            except (OSError, ValueError, RecursionError):
+                # The arrival is already logged and cannot pass the exact-response gate.
+                payload = {}
         if not isinstance(payload, dict):
             payload = {}
-        # Use the request-line target before the base class normalizes leading slashes.
-        target = self.requestline.split()[1]
-        if self.server.record(self.command, target, self.headers.get("Authorization"), payload):
-            body = stream(payload["model"])
+        if self.server.complete(arrival, self.headers.get("Authorization"), payload):
+            body = stream()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
         else:
@@ -240,8 +262,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Terminal:
     def __init__(self, env, command):
         self.env = env
-        self.tmux = ["/usr/bin/tmux", "-f", "/dev/null", "-S", "/output/tmux.sock"]
-        self.run("new-session", "-d", "-x", "145", "-y", "38", "-c", "/workspace", *command)
+        self.tmux = ["/usr/bin/tmux", "-f", "/dev/null", "-S", f"{OUTPUT}/tmux.sock"]
+        self.run("new-session", "-d", "-x", "145", "-y", "38", "-c", WORKSPACE, *command)
         try:
             self.pane_pidfd = os.pidfd_open(int(self.run("display-message", "-p", "#{pane_pid}")))
         except BaseException:
@@ -280,7 +302,7 @@ class Terminal:
             self.type("Switch model")
             self.await_screen(lambda screen: "Switch model" in screen, "Mini Switch model command")
             self.key("Enter")
-        return self.await_screen(lambda screen: "Select model" in screen and CATALOG[DEFAULT[0]][DEFAULT[1]] in screen,
+        return self.await_screen(lambda screen: PICKER_TITLE in screen and CATALOG[DEFAULT[0]][DEFAULT[1]] in screen,
                                  f"{mode} model picker")
 
     def close(self):
@@ -312,7 +334,7 @@ def exact_ok(screen):
 def evidence(screen):
     return [line.strip() for line in screen.splitlines()
             if any(term in line.lower() for term in ("opal", "unavailable", "error", "forbidden",
-                                                     "select model", "reply with exactly", "no results"))]
+                                                     PICKER_TITLE.lower(), "reply with exactly", "no results"))]
 
 
 def environment(root):
@@ -325,27 +347,27 @@ def environment(root):
         path = root / leaf
         path.mkdir(exist_ok=True, mode=0o700)
         values[key] = str(path)
-    values["OPENCODE_CONFIG"] = "/config/opencode.json"
+    values[CONFIG_ENV] = f"{CONFIG}/opencode.json"
     return values
 
 
 def frontend(profile, mode, *, resumed=False):
     return [
         "/usr/bin/bwrap", "--unshare-all", "--share-net", "--die-with-parent", "--proc", "/proc",
-        "--dev", "/dev", "--tmpfs", "/tmp", "--ro-bind", "/usr", "/usr",
+        "--dev", "/dev", "--ro-bind", "/usr", "/usr",
         "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib64", "/lib64",
-        "--ro-bind", "/program/opencode", "/program/opencode", "--ro-bind", "/config", "/config",
-        "--ro-bind", "/workspace", "/workspace", "--bind", str(profile), str(profile),
-        "--chdir", "/workspace", "--", "/program/opencode",
+        "--ro-bind", OPENCODE, OPENCODE, "--ro-bind", CONFIG, CONFIG,
+        "--ro-bind", WORKSPACE, WORKSPACE, "--bind", str(profile), str(profile),
+        "--chdir", WORKSPACE, "--", OPENCODE,
         *(["mini"] if mode == "mini" else []), *(["--continue"] if resumed else []),
     ]
 
 
 def collision_case(mode, fake, collision_model):
-    profile = Path("/output") / f"{mode}-collision-{collision_model}"
+    profile = Path(OUTPUT) / f"{mode}-collision-{collision_model}"
     profile.mkdir()
     env = environment(profile)
-    env["OPENCODE_CONFIG"] = f"/config/collision-{collision_model}.json"
+    env[CONFIG_ENV] = f"{CONFIG}/collision-{collision_model}.json"
     fake.mark(f"collision-{collision_model}")
     terminal = Terminal(env, frontend(profile, mode))
     try:
@@ -355,7 +377,7 @@ def collision_case(mode, fake, collision_model):
         )
         browse = terminal.picker(mode)
         require(rows(browse).count(TARGET_LABEL) == 2, f"{mode} lost a duplicate title in browse:\n{browse}")
-        terminal.type("google/personal")
+        terminal.type(GOOGLE_LABEL)
 
         def ready(screen):
             if rows(screen) != [TARGET_LABEL, TARGET_LABEL]:
@@ -376,7 +398,7 @@ def collision_case(mode, fake, collision_model):
 
 
 def case(mode):
-    profile = Path("/output") / mode
+    profile = Path(OUTPUT) / mode
     env = environment(profile)
     with Fake() as fake, serving(fake):
         terminal = Terminal(env, frontend(profile, mode))
@@ -393,10 +415,10 @@ def case(mode):
                                            f"{mode} filtered search for the Opal rows")
             for _ in range(len("Opal v2")):
                 terminal.key("BSpace")
-            terminal.type("google/personal")
+            terminal.type(GOOGLE_LABEL)
             terminal.await_screen(lambda screen: rows(screen) == [TARGET_LABEL], f"{mode} exact target search")
             terminal.key("Enter")
-            selected = terminal.await_screen(lambda screen: "Select model" not in screen and TARGET_LABEL in screen,
+            selected = terminal.await_screen(lambda screen: PICKER_TITLE not in screen and TARGET_LABEL in screen,
                                              f"{mode} selected model")
             if "Select variant" in selected:
                 terminal.key("Escape")
@@ -414,7 +436,7 @@ def case(mode):
         finally:
             terminal.close()
         fake.mark("stale")
-        env["OPENCODE_CONFIG"] = "/config/stale.json"
+        env[CONFIG_ENV] = f"{CONFIG}/stale.json"
         terminal = Terminal(env, frontend(profile, mode, resumed=True))
         try:
             terminal.await_screen(lambda screen: PROMPT in screen and exact_ok(screen),
@@ -425,7 +447,7 @@ def case(mode):
             remaining = sorted(label for label in LABELS if label != TARGET_LABEL)
             require(sorted(rows(stale_picker)) == remaining, f"{mode} stale picker rows differ:\n{stale_picker}")
             terminal.key("Escape")
-            terminal.await_screen(lambda screen: "Select model" not in screen, f"{mode} stale composer")
+            terminal.await_screen(lambda screen: PICKER_TITLE not in screen, f"{mode} stale composer")
             terminal.type(PROMPT)
             terminal.await_screen(lambda screen: screen.count(PROMPT) >= 2,
                                   f"{mode} typed stale prompt in composer")
@@ -452,16 +474,16 @@ def case(mode):
 
 def isolated():
     require({name for _, name in socket.if_nameindex()} == {"lo"}, "probe requires a loopback-only namespace")
-    version_root = Path("/output/version")
+    version_root = Path(OUTPUT) / "version"
     version_root.mkdir()
-    result = subprocess.run(["/program/opencode", "--version"], text=True,
+    result = subprocess.run([OPENCODE, "--version"], text=True,
                             env=environment(version_root), capture_output=True, timeout=10)
     require(result.returncode == 0, f"version check failed: {result.stderr}")
     version = result.stdout.strip()
     require(version in {"2.3.0", "opencode v2.3.0"}, f"unexpected OpenCode version {version!r}")
     print(json.dumps({"opencode_version": version, "sha256": SHA256, "interfaces": ["lo"]}), flush=True)
     for mode in ("full", "mini"):
-        (Path("/output") / mode).mkdir()
+        (Path(OUTPUT) / mode).mkdir()
         print(json.dumps(case(mode), indent=2), flush=True)
 
 
@@ -485,12 +507,14 @@ def main():
         shutil.copyfile(Path(__file__), root / "program/probe.py")
         command = [
             "/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session",
-            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+            "--proc", "/proc", "--dev", "/dev",
+            # Nested bwrap hardcodes this staging location. It exists only in the controller namespace.
+            "--perms", "0700", "--dir", "/tmp",
             "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib64", "/lib64",
-            "--ro-bind", str(root / "program"), "/program", "--ro-bind", str(root / "config"), "/config",
-            "--bind", str(root / "output"), "/output", "--bind", str(root / "workspace"), "/workspace",
-            "--chdir", "/workspace", "--", "/usr/bin/python3", "-IB", "-c",
-            "import runpy; runpy.run_path('/program/probe.py')['isolated']()",
+            "--ro-bind", str(root / "program"), PROGRAM, "--ro-bind", str(root / "config"), CONFIG,
+            "--bind", str(root / "output"), OUTPUT, "--bind", str(root / "workspace"), WORKSPACE,
+            "--chdir", WORKSPACE, "--", "/usr/bin/python3", "-IB", "-c",
+            f"import runpy; runpy.run_path('{PROGRAM}/probe.py')['isolated']()",
         ]
         subprocess.run(command, env=ENV, check=True, timeout=180)
 
