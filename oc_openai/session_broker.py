@@ -39,6 +39,7 @@ from .connection import ConnectionError
 from .exposure import ExposureError, ExposureLedger
 from .live import make_backend
 from .profiles import ProfileError
+from .proof_gate import ProofGateError
 from .managed import relay as relay_mod
 from .managed.runtime import (
     HOST_SPAWN,
@@ -100,6 +101,8 @@ _OPTIONAL_SPEC_KEYS = frozenset({"provider_filter", "cli_ui_mode"})
 _SPEC_KEYS = _BASE_SPEC_KEYS | _OPTIONAL_SPEC_KEYS
 _VALID_CLI_UI_MODES = frozenset({"default", "full", "mini"})
 
+_ERR_PROOF_NOT_ARMED = "proof_gate_not_armed"
+
 _ERROR_MAP = {
     "chatgpt_usage_limit": (429, "rate_limit_exceeded", "ChatGPT plan usage limit reached."),
     "chatgpt_auth_rejected": (401, "auth_rejected", "ChatGPT authentication was rejected."),
@@ -118,6 +121,15 @@ _ERROR_MAP = {
     "exposure_lock_busy": (503, "exposure_busy", "ChatGPT exposure ledger is temporarily busy; retry shortly."),
     "invalid_exposure_record": (403, "exposure_hold", "ChatGPT exposure record is invalid; interactive dispatch blocked."),
     "untrusted_exposure_store": (403, "exposure_hold", "ChatGPT exposure store failed trust checks."),
+    _ERR_PROOF_NOT_ARMED: (403, _ERR_PROOF_NOT_ARMED, "Proof gate is closed during discovery."),
+    "proof_gate_spent": (403, "proof_gate_spent", "Proof gate single-send latch already spent."),
+    "proof_gate_incarnation_mismatch": (403, "proof_gate_incarnation_mismatch", "Proof gate job incarnation mismatch."),
+    "proof_slot_not_approved": (403, "proof_slot_not_approved", "Slot is not approved for this proof run."),
+    "proof_gate_foreground_lost": (403, "proof_gate_foreground_lost", "Foreground workstation terminal authority lost."),
+    "proof_gate_approval_drift": (403, "proof_gate_approval_drift", "Approved registration or provider policy drifted."),
+    "proof_evidence_sync_failed": (403, "proof_evidence_sync_failed", "Durable proof evidence sync failed."),
+    "proof_gate_relay_unverified": (403, "proof_gate_relay_unverified", "Replacement turn relay verification incomplete."),
+    "exposure_history_mutated": (403, "exposure_history_mutated", "Exposure history changed before proof write."),
     "exposure_store_unavailable": (403, "exposure_hold", "ChatGPT exposure store is unavailable."),
     "provider_tls_close_timeout": (502, "provider_error", "OpenAI stream did not close cleanly."),
 }
@@ -172,13 +184,28 @@ def _read_exact(sock: socket.socket, size: int, deadline: float) -> bytes:
 
 @dataclass(frozen=True)
 class SessionPolicy:
-    """Optional exposure hold, selection fence, and revocation callbacks for SessionBroker."""
+    """Optional exposure hold, selection fence, revocation, and proof-gate callbacks for SessionBroker."""
 
     exposure_dir: Path | None = None
     acknowledged_exposure_digest: str | None = None
     authorization: object = None
     is_selected: object = None
     on_revoke: object = None
+    proof_gate: object = None
+    job_incarnation: str | None = None
+
+
+@dataclass(frozen=True)
+class ProofSessionOptions:
+    """In-process proof-session hooks supplied only by the verified foreground owner."""
+
+    proof_gate: object
+    preconfirmed_plan: object = None
+    agent_runner: object = None
+    on_slot_prepare: object = None
+    on_slot_begin: object = None
+    on_slot_finish: object = None
+    on_slot_lease_released: object = None
 
 
 class SessionBroker:
@@ -217,6 +244,8 @@ class SessionBroker:
         self._authorization = active_policy.authorization
         self._is_selected = active_policy.is_selected
         self._on_revoke = active_policy.on_revoke
+        self._proof_gate = active_policy.proof_gate
+        self._job_incarnation = active_policy.job_incarnation
         self._vault = ReasoningVault()
         self._vault_lock = threading.Lock()
         self._turn_counter = 0
@@ -431,12 +460,34 @@ class SessionBroker:
         with self._lease.fence(), self._exposure_fence(peer):
             yield
 
+    def _claim_proof_write(self, arrival, outbound_body) -> None:
+        if self._proof_gate is None:
+            return
+        try:
+            self._proof_gate.claim_for_write(
+                arrival,
+                outbound_body,
+                job_incarnation=self._job_incarnation or "",
+            )
+        except ProofGateError as exc:
+            code = exc.args[0] if exc.args and type(exc.args[0]) is str else _ERR_PROOF_NOT_ARMED
+            raise ConnectionError(code) from None
+
     def _stream_responses_turn(self, peer: socket.socket, parsed, cancel: threading.Event,
-                               state: dict) -> tuple[str, tuple[int, int, int] | None]:
+                               state: dict, *, arrival=None) -> tuple[str, tuple[int, int, int] | None]:
         turn_deadline = min(time.monotonic() + TURN_TIMEOUT_SECONDS, self._lease.deadline_ns / 1e9)
+        outbound_body = parsed.body
+        allowed_tools = parsed.allowed_tools
+        if self._proof_gate is not None:
+            outbound_body = self._proof_gate.validate_and_canonicalize(
+                parsed.raw_body,
+                arrival=arrival,
+                job_incarnation=self._job_incarnation or "",
+            )
+            allowed_tools = frozenset()
         projector = SessionStreamProjector(
             model=parsed.model, local_response_id=self._next_response_id(), vault=self._vault,
-            allowed_tools=parsed.allowed_tools,
+            allowed_tools=allowed_tools,
         )
 
         def before_write():
@@ -444,9 +495,10 @@ class SessionBroker:
                 raise ConnectionError("connection_retired")
             if self._authorization is None and self._is_selected is not None and not self._is_selected():
                 raise ConnectionError("connection_retired")
+            self._claim_proof_write(arrival, outbound_body)
 
         with self._connection.interactive_responses(
-            self._binding, parsed.body, before_write,
+            self._binding, outbound_body, before_write,
             authorization=self._authorization,
             write_fence=lambda: self._first_write_fence(peer),
             limits=INTERACTIVE_STREAM_LIMITS, deadline=turn_deadline,
@@ -467,6 +519,13 @@ class SessionBroker:
             for frame in tail:
                 self._send_fenced(peer, encode_chunk(frame))
             self._send_fenced(peer, b"0\r\n\r\n")
+            if self._proof_gate is not None:
+                self._proof_gate.record_delivery_complete(
+                    usage=projector.usage,
+                    completed_text=projector.completed_assistant_text,
+                    streamed_text=projector.streamed_assistant_text,
+                    tool_calls=projector.tool_calls,
+                )
             return "completed", projector.usage
 
     def _send_peer_error(self, peer: socket.socket, headers_sent: bool, status: int, code: str, message: str) -> None:
@@ -475,6 +534,7 @@ class SessionBroker:
                 peer.sendall(format_error_response(status, code, message))
 
     def _handle_peer(self, peer: socket.socket) -> None:
+        arrival = self._proof_gate.snapshot_arrival() if self._proof_gate is not None else None
         cancel = threading.Event()
         with self._lock:
             self._cancels.add(cancel)
@@ -510,7 +570,7 @@ class SessionBroker:
             with self._lock:
                 self._streaming_peers.add(peer)
             try:
-                outcome, usage = self._stream_responses_turn(peer, parsed, cancel, state)
+                outcome, usage = self._stream_responses_turn(peer, parsed, cancel, state, arrival=arrival)
             finally:
                 with self._lock:
                     self._streaming_peers.discard(peer)
@@ -1086,21 +1146,23 @@ def _build_relay_args(
     slot_index: int | None = None,
     port: int = RELAY_PORT_MIN,
     provider_label: str = "openai",
+    relay_name_override: str | None = None,
+    defer_bind: bool = False,
 ) -> list[str]:
     if type(port) is not int or not RELAY_PORT_MIN <= port <= RELAY_PORT_MAX:
         raise ValueError("Invalid relay port")
     if slot_index is None:
-        relay_name = spec["relay"]
+        relay_name = relay_name_override or spec["relay"]
         role_labels = ["--label", "oc.role=openai-relay"]
-        port_args: list[str] = []
+        port_args: list[str] = [str(port), "--defer-bind"] if defer_bind else []
     else:
-        relay_name = f"{spec['pod']}-relay-{slot_index}"
+        relay_name = relay_name_override or f"{spec['pod']}-relay-{slot_index}"
         role_labels = [
             "--label", "oc.role=provider-relay",
             "--label", f"oc.provider-slot={slot_index}",
             "--label", f"oc.provider={provider_label}",
         ]
-        port_args = [str(port)]
+        port_args = [str(port), "--defer-bind"] if defer_bind else [str(port)]
     return [
         "create", "--pull=never", "--name", relay_name, "--pod", spec["pod"],
         "--label", "oc.sandbox=1", "--label", f"oc.instance={spec['instance']}",
@@ -1217,6 +1279,7 @@ class _SlotState:
         self.retiring = False
         self.retired = False
         self.exited = False
+        self.lease_confirmed_released = False
 
 
 class _SessionSlotCoordinator:
@@ -1253,10 +1316,20 @@ class _SessionSlotCoordinator:
             if slot_root not in self._slot_roots:
                 self._slot_roots.append(slot_root)
 
-    def remove_slot_roots(self) -> None:
+    def remove_slot_roots(self, *, require_confirmed_leases: bool = False) -> None:
         with self._lock:
             roots = list(self._slot_roots)
+            if require_confirmed_leases:
+                blocked = {
+                    s.slot_root
+                    for s in self._slots.values()
+                    if not s.lease_confirmed_released or s.handle.lease_release_confirmed is None
+                }
+            else:
+                blocked = set()
         for slot_root in roots:
+            if slot_root in blocked:
+                continue
             with suppress(OSError):
                 shutil.rmtree(slot_root)
 
@@ -1307,6 +1380,21 @@ class _SessionSlotCoordinator:
             if self._cleanup_error is None:
                 self._cleanup_error = exc
 
+    def _exit_slot_lease(self, state: _SlotState) -> None:
+        try:
+            state.slot_cm.__exit__(None, None, None)
+        except Exception as exc:
+            self._record_error(exc)
+            return
+        checker = state.handle.lease_release_confirmed
+        if checker is not None and not checker():
+            self._record_error(
+                RuntimeError("Slot lease release was not confirmed in the connection store")
+            )
+            return
+        with self._lock:
+            state.lease_confirmed_released = True
+
     def _finish_slot_retirement(self, state: _SlotState) -> None:
         try:
             state.handle.job.revoke()
@@ -1340,10 +1428,7 @@ class _SessionSlotCoordinator:
             should_exit = not state.exited
             state.exited = True
         if should_exit:
-            try:
-                state.slot_cm.__exit__(None, None, None)
-            except Exception as exc:
-                self._record_error(exc)
+            self._exit_slot_lease(state)
         with self._lock:
             state.retired = True
 
@@ -1400,7 +1485,7 @@ class _SessionSlotCoordinator:
                 should_exit = not slot.exited
                 slot.exited = True
             if should_exit:
-                slot.slot_cm.__exit__(None, None, None)
+                self._exit_slot_lease(slot)
         except Exception as exc:
             self._record_error(exc)
 
@@ -1415,12 +1500,12 @@ class _SessionSlotCoordinator:
                 if slot.exited:
                     continue
                 slot.exited = True
-            try:
-                slot.slot_cm.__exit__(None, None, None)
-            except Exception as exc:
-                self._record_error(exc)
+            self._exit_slot_lease(slot)
         with self._lock:
-            still_unconfirmed = any(s.creating_relay or not s.exited for s in self._slots.values())
+            still_unconfirmed = any(
+                s.creating_relay or not s.exited or not s.lease_confirmed_released
+                for s in self._slots.values()
+            )
         if still_unconfirmed:
             self._record_error(RuntimeError("Slot relay state remained unconfirmed during teardown"))
 
@@ -1469,7 +1554,7 @@ def _write_session_opencode_config(root: Path, config_payload: dict) -> Path:
     return cfg_path
 
 
-def _start_and_verify_slot_relay(
+def _start_slot_relay_deferred(
     spec: dict,
     pod_id: str,
     handle: SlotHandle,
@@ -1478,6 +1563,7 @@ def _start_and_verify_slot_relay(
     started_relay_ids: list[str],
     stop_event: threading.Event,
 ) -> str:
+    """Create, start, and verify a deferred-bind relay before activation or TCP bind."""
     if not coordinator.begin_relay_create(handle.slot_index):
         raise ConnectionError("connection_retired")
     try:
@@ -1506,6 +1592,28 @@ def _start_and_verify_slot_relay(
         handle.job,
         [*siblings, *started_relay_ids],
     )
+    if (
+        stop_event.is_set()
+        or handle.broker._revoked.is_set()
+        or handle.job.lease.status() != "pending"
+        or time.monotonic_ns() >= handle.job.lease.deadline_ns
+    ):
+        raise ConnectionError("connection_retired")
+    return relay_id
+
+
+def _start_and_verify_slot_relay(
+    spec: dict,
+    pod_id: str,
+    handle: SlotHandle,
+    coordinator: _SessionSlotCoordinator,
+    siblings: list[str],
+    started_relay_ids: list[str],
+    stop_event: threading.Event,
+) -> str:
+    relay_id = _start_slot_relay_deferred(
+        spec, pod_id, handle, coordinator, siblings, started_relay_ids, stop_event,
+    )
     _wait_relay_bound(relay_id, port=handle.port)
     if (
         stop_event.is_set()
@@ -1518,6 +1626,263 @@ def _start_and_verify_slot_relay(
     return relay_id
 
 
+def _notify_slot_prepare(proof_options, slot_key: str, *, container_name: str, slot_root: str = "") -> None:
+    if proof_options is not None and proof_options.on_slot_prepare is not None:
+        proof_options.on_slot_prepare(slot_key, container_name=container_name, slot_root=slot_root)
+
+
+def _notify_slot_begin(proof_options, slot_key: str, *, container_name: str, grant_dir: str = "", slot_root: str = "") -> None:
+    if proof_options is not None and proof_options.on_slot_begin is not None:
+        proof_options.on_slot_begin(
+            slot_key,
+            container_name=container_name,
+            grant_dir=grant_dir,
+            slot_root=slot_root,
+        )
+
+
+def _notify_slot_finish(proof_options, slot_key: str, cid: str) -> None:
+    if proof_options is not None and proof_options.on_slot_finish is not None:
+        proof_options.on_slot_finish(slot_key, cid)
+
+
+def _notify_slot_lease_released(proof_options, slot_key: str) -> None:
+    if proof_options is not None and proof_options.on_slot_lease_released is not None:
+        proof_options.on_slot_lease_released(slot_key)
+
+
+class _ProofTurnCutover:
+    """Manage two-phase discovery-to-turn relay cutover for the single approved proof slot."""
+
+    def __init__(self, *, spec: dict, pod_id: str, coordinator: _SessionSlotCoordinator,
+                 sidecars: list[str], started_relay_ids: list[str], stop_event: threading.Event,
+                 proof_options: ProofSessionOptions):
+        self._spec = spec
+        self._pod_id = pod_id
+        self._coordinator = coordinator
+        self._sidecars = sidecars
+        self._started_relay_ids = started_relay_ids
+        self._stop_event = stop_event
+        self._proof_options = proof_options
+        self._approved_info: dict[str, object] | None = None
+        self.tracked_slot_keys: list[str] = []
+        self.tracked_slot_indices: dict[str, int] = {}
+
+    def record_discovery_slot(self, *, slot_index: int, item, adapter, port: int,
+                              worker_token: str, ack_digest: str | None) -> None:
+        self._approved_info = {
+            "slot_index": slot_index,
+            "item": item,
+            "adapter": adapter,
+            "port": port,
+            "worker_token": worker_token,
+            "ack_digest": ack_digest,
+        }
+
+    def arm_turn_route(self, observed_row: str, observed_screen_digest: str) -> str:
+        if self._approved_info is None or self._stop_event.is_set():
+            raise ProofGateError(_ERR_PROOF_NOT_ARMED)
+        gate = self._proof_options.proof_gate
+        gate.verify_ready_for_arm()
+        idx = int(self._approved_info["slot_index"])
+        # Step A: completely retire discovery listener, join every discovery thread, verify relay & lease gone.
+        self._coordinator.on_revoke(idx)
+        for thread in list(self._coordinator._retire_threads):
+            thread.join(timeout=15)
+        with self._coordinator._lock:
+            disc_state = self._coordinator._slots.get(idx)
+            still_running = any(t.is_alive() for t in self._coordinator._retire_threads)
+            if (
+                disc_state is None
+                or not disc_state.retired
+                or not disc_state.lease_confirmed_released
+                or disc_state.handle.lease_release_confirmed is None
+                or still_running
+                or self._coordinator._cleanup_error is not None
+            ):
+                raise ProofGateError(_ERR_PROOF_NOT_ARMED)
+            with disc_state.handle.broker._lock:
+                active_disc_clients = bool(disc_state.handle.broker._clients)
+            if active_disc_clients:
+                raise ProofGateError(_ERR_PROOF_NOT_ARMED)
+            if disc_state.relay_id in self._started_relay_ids:
+                self._started_relay_ids.remove(disc_state.relay_id)
+        disc_key = f"disc-{idx}"
+        _notify_slot_lease_released(self._proof_options, disc_key)
+
+        # Step B: prepare slot & arm BEFORE starting any worker-reachable replacement turn relay.
+        turn_slot_index = len(self._coordinator._slots) + 100
+        turn_root = Path(tempfile.mkdtemp(prefix="oc-chat-turn-", dir=SHARED_TMP))
+        self._coordinator.track_slot_root(turn_root)
+        slot_key = f"turn-{idx}"
+        turn_cname = f"{self._spec['pod']}-relay-{turn_slot_index}"
+        self.tracked_slot_keys.append(slot_key)
+        self.tracked_slot_indices[slot_key] = turn_slot_index
+        _notify_slot_prepare(self._proof_options, slot_key, container_name=turn_cname, slot_root=str(turn_root))
+        adapter = self._approved_info["adapter"]
+        item = self._approved_info["item"]
+        port = int(self._approved_info["port"])
+        worker_token = str(self._approved_info["worker_token"])
+        ack_digest = self._approved_info["ack_digest"]
+        slot_cm = adapter.open_slot(
+            item,
+            slot_index=turn_slot_index,
+            slot_root=turn_root,
+            port=port,
+            worker_token=worker_token,
+            acknowledged_exposure_digest=ack_digest,
+            on_revoke=self._coordinator.on_revoke,
+        )
+        handle = slot_cm.__enter__()
+        self._coordinator.register_slot(slot_cm, handle, turn_root)
+        # Arm BEFORE creating or starting the deferred-bind replacement turn relay.
+        arm_nonce = gate.arm(observed_row=observed_row, observed_screen_digest=observed_screen_digest)
+        _notify_slot_begin(
+            self._proof_options,
+            slot_key,
+            container_name=turn_cname,
+            grant_dir=str(handle.job.grant),
+            slot_root=str(turn_root),
+        )
+        # B4: relay runs with --defer-bind (127.0.0.1:<port> stays unbound throughout isolation verification).
+        turn_relay_id = _start_slot_relay_deferred(
+            self._spec, self._pod_id, handle, self._coordinator,
+            self._sidecars, self._started_relay_ids, self._stop_event,
+        )
+        _notify_slot_finish(self._proof_options, slot_key, turn_relay_id)
+        self._started_relay_ids.append(turn_relay_id)
+        # B5: mark verified -> activate (enables bind) -> wait bound.
+        gate.mark_relay_verified(turn_relay_id)
+        handle.job.activate()
+        _wait_relay_bound(turn_relay_id, port=handle.port)
+        return arm_nonce
+
+
+def _open_single_admitted_slot(
+    idx: int,
+    item,
+    session_ctx: dict[str, object],
+) -> None:
+    spec = session_ctx["spec"]
+    pod_id = session_ctx["pod_id"]
+    adapters = session_ctx["adapters"]
+    coordinator = session_ctx["coordinator"]
+    sidecars = session_ctx["sidecars"]
+    started_relay_ids = session_ctx["started_relay_ids"]
+    stop_event = session_ctx["stop_event"]
+    proof_options = session_ctx["proof_options"]
+    cutover = session_ctx["cutover"]
+    approved_scoped = session_ctx["approved_scoped"]
+    port = session_ctx["slot_ports"][item.spec.scoped_id]
+    worker_token = session_ctx["slot_tokens"][item.spec.scoped_id]
+
+    adapter = adapters[item.spec.kind]
+    ack_digest = (
+        session_ctx["plan"].acknowledged_digests.get(item.exposure_hold.scope_id)
+        if item.exposure_hold is not None
+        else None
+    )
+    slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir=SHARED_TMP))
+    coordinator.track_slot_root(slot_root)
+    is_approved_disc = approved_scoped is not None and item.spec.scoped_id == approved_scoped
+    slot_key = f"disc-{idx}" if is_approved_disc else f"slot-{idx}"
+    cname = f"{spec['pod']}-relay-disc-{idx}" if is_approved_disc else f"{spec['pod']}-relay-{idx}"
+    if cutover is not None:
+        cutover.tracked_slot_keys.append(slot_key)
+        cutover.tracked_slot_indices[slot_key] = idx
+    _notify_slot_prepare(proof_options, slot_key, container_name=cname, slot_root=str(slot_root))
+    open_fn = adapter.open_discovery_slot if is_approved_disc else adapter.open_slot
+    slot_cm = open_fn(
+        item,
+        slot_index=idx,
+        slot_root=slot_root,
+        port=port,
+        worker_token=worker_token,
+        acknowledged_exposure_digest=ack_digest,
+        on_revoke=coordinator.on_revoke,
+    )
+    handle = slot_cm.__enter__()
+    coordinator.register_slot(slot_cm, handle, slot_root)
+    _notify_slot_begin(
+        proof_options, slot_key, container_name=cname,
+        grant_dir=str(getattr(handle.job, "grant", "")), slot_root=str(slot_root),
+    )
+    relay_id = _start_and_verify_slot_relay(
+        spec, pod_id, handle, coordinator, sidecars, started_relay_ids, stop_event,
+    )
+    _notify_slot_finish(proof_options, slot_key, relay_id)
+    started_relay_ids.append(relay_id)
+    if is_approved_disc and cutover is not None:
+        cutover.record_discovery_slot(
+            slot_index=idx, item=item, adapter=adapter,
+            port=port, worker_token=worker_token, ack_digest=ack_digest,
+        )
+
+
+def _start_session_agent(
+    spec: dict,
+    plan,
+    config_path: Path,
+    coordinator: _SessionSlotCoordinator,
+    proof_options,
+) -> str:
+    provider_label = (
+        plan.admitted[0].spec.kind
+        if len({item.spec.kind for item in plan.admitted}) == 1
+        else "multi"
+    )
+    _notify_slot_begin(proof_options, "agent", container_name=spec["agent"])
+    agent_id = podman(
+        *_build_agent_args(spec, config_path, ui_mode=plan.ui_mode, provider_label=provider_label)
+    ).stdout.decode("ascii").strip()
+    if not IMAGE_ID.fullmatch(agent_id):
+        raise RuntimeError("Podman did not return a complete agent container ID")
+    coordinator.record_container(agent_id)
+    _notify_slot_finish(proof_options, "agent", agent_id)
+    return agent_id
+
+
+def _all_proof_slots_lease_confirmed(
+    coordinator: _SessionSlotCoordinator,
+    cutover: _ProofTurnCutover,
+) -> bool:
+    with coordinator._lock:
+        for slot_key in cutover.tracked_slot_keys:
+            slot_idx = cutover.tracked_slot_indices.get(slot_key)
+            state = coordinator._slots.get(slot_idx) if slot_idx is not None else None
+            if (
+                state is None
+                or not state.lease_confirmed_released
+                or state.handle.lease_release_confirmed is None
+            ):
+                return False
+    return True
+
+
+def _finalize_session_teardown(
+    coordinator: _SessionSlotCoordinator,
+    agent_id: str | None,
+    cutover: _ProofTurnCutover | None,
+    proof_options,
+    cleanup_state: dict,
+    root: Path,
+    terminal: StreamTerminal,
+) -> bool:
+    cleanup_error = coordinator.teardown_all(agent_id)
+    if cleanup_error is not None:
+        terminal.error(f"Provider session cleanup needs verification. Retained directory {root}")
+        return False
+    if proof_options is not None and cutover is not None:
+        if not _all_proof_slots_lease_confirmed(coordinator, cutover):
+            terminal.error(f"Provider session cleanup needs verification. Retained directory {root}")
+            return False
+        for key in (*cutover.tracked_slot_keys, "agent"):
+            _notify_slot_lease_released(proof_options, key)
+    coordinator.remove_slot_roots(require_confirmed_leases=(proof_options is not None))
+    cleanup_state["clean"] = True
+    return True
+
+
 def _run_multi_slot_session(
     spec: dict,
     plan,
@@ -1528,88 +1893,66 @@ def _run_multi_slot_session(
     cleanup_state: dict,
 ) -> int:
     coordinator = _SessionSlotCoordinator(stop_event)
+    proof_options = cleanup_state.get("proof_options")
+    cutover: _ProofTurnCutover | None = None
     agent_id: str | None = None
     rc = 1
     try:
         pod_id, pod_containers = _verify_pod_with_containers(spec)
-        slot_ports: dict[str, int] = {}
-        slot_tokens: dict[str, str] = {}
-        slot_names: list[str] = []
-        for idx, item in enumerate(plan.admitted):
-            scoped_id = item.spec.scoped_id
-            slot_ports[scoped_id] = RELAY_PORT_MIN + idx
-            slot_tokens[scoped_id] = secrets.token_urlsafe(32)
-            slot_names.append(f"{spec['pod']}-relay-{idx}")
+        slot_ports = {item.spec.scoped_id: RELAY_PORT_MIN + idx for idx, item in enumerate(plan.admitted)}
+        slot_tokens = {item.spec.scoped_id: secrets.token_urlsafe(32) for item in plan.admitted}
+        slot_names = [f"{spec['pod']}-relay-{idx}" for idx in range(len(plan.admitted))]
 
         config_payload = build_multi_provider_opencode_config(
-            plan=plan,
-            adapters=adapters,
-            slot_ports=slot_ports,
-            slot_tokens=slot_tokens,
+            plan=plan, adapters=adapters, slot_ports=slot_ports, slot_tokens=slot_tokens,
         )
+        if proof_options is not None:
+            config_payload = proof_options.proof_gate.harden_opencode_config(config_payload)
         config_path = _write_session_opencode_config(root, config_payload)
 
         sidecars = [name for name in (spec["chromium"], spec["postgres"], spec["dind"]) if name]
         _ensure_containers_idle(
-            spec["agent"],
-            spec["relay"],
-            spec["instance"],
-            extra_relays=tuple(slot_names),
-            pod_containers=pod_containers,
-            sidecar_names=set(sidecars),
+            spec["agent"], spec["relay"], spec["instance"],
+            extra_relays=tuple(slot_names), pod_containers=pod_containers, sidecar_names=set(sidecars),
         )
 
         started_relay_ids: list[str] = []
-        for idx, item in enumerate(plan.admitted):
-            scoped_id = item.spec.scoped_id
-            adapter = adapters[item.spec.kind]
-            ack_digest = (
-                plan.acknowledged_digests.get(item.exposure_hold.scope_id)
-                if item.exposure_hold is not None
-                else None
+        if proof_options is not None:
+            cutover = _ProofTurnCutover(
+                spec=spec, pod_id=pod_id, coordinator=coordinator,
+                sidecars=sidecars, started_relay_ids=started_relay_ids,
+                stop_event=stop_event, proof_options=proof_options,
             )
-            slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir=SHARED_TMP))
-            coordinator.track_slot_root(slot_root)
-            slot_cm = adapter.open_slot(
-                item,
-                slot_index=idx,
-                slot_root=slot_root,
-                port=slot_ports[scoped_id],
-                worker_token=slot_tokens[scoped_id],
-                acknowledged_exposure_digest=ack_digest,
-                on_revoke=coordinator.on_revoke,
-            )
-            handle = slot_cm.__enter__()
-            coordinator.register_slot(slot_cm, handle, slot_root)
-            relay_id = _start_and_verify_slot_relay(
-                spec, pod_id, handle, coordinator, sidecars, started_relay_ids, stop_event,
-            )
-            started_relay_ids.append(relay_id)
-
-        if stop_event.is_set() or not coordinator.any_active():
-            raise ConnectionError("connection_retired")
-        provider_label = (
-            plan.admitted[0].spec.kind
-            if len({item.spec.kind for item in plan.admitted}) == 1
-            else "multi"
+        approved_scoped = (
+            proof_options.proof_gate.approval.scoped_provider_id
+            if proof_options is not None
+            else None
         )
-        agent_id = podman(
-            *_build_agent_args(spec, config_path, ui_mode=plan.ui_mode, provider_label=provider_label)
-        ).stdout.decode("ascii").strip()
-        if not IMAGE_ID.fullmatch(agent_id):
-            raise RuntimeError("Podman did not return a complete agent container ID")
-        coordinator.record_container(agent_id)
+        session_ctx = {
+            "spec": spec, "pod_id": pod_id, "plan": plan, "adapters": adapters,
+            "coordinator": coordinator, "sidecars": sidecars,
+            "started_relay_ids": started_relay_ids, "stop_event": stop_event,
+            "proof_options": proof_options, "cutover": cutover,
+            "approved_scoped": approved_scoped, "slot_ports": slot_ports,
+            "slot_tokens": slot_tokens,
+        }
+        for idx, item in enumerate(plan.admitted):
+            _open_single_admitted_slot(idx, item, session_ctx)
 
         if stop_event.is_set() or not coordinator.any_active():
             raise ConnectionError("connection_retired")
-        rc = _launch_agent_tty(agent_id, stop_event)
-    finally:
-        cleanup_error = coordinator.teardown_all(agent_id)
-        if cleanup_error is None:
-            coordinator.remove_slot_roots()
-            cleanup_state["clean"] = True
+        agent_id = _start_session_agent(spec, plan, config_path, coordinator, proof_options)
+
+        if stop_event.is_set() or not coordinator.any_active():
+            raise ConnectionError("connection_retired")
+        if proof_options is not None and proof_options.agent_runner is not None:
+            rc = proof_options.agent_runner(agent_id, stop_event, cutover.arm_turn_route)
         else:
-            terminal.error(f"Provider session cleanup needs verification. Retained directory {root}")
+            rc = _launch_agent_tty(agent_id, stop_event)
+    finally:
+        if not _finalize_session_teardown(
+            coordinator, agent_id, cutover, proof_options, cleanup_state, root, terminal,
+        ):
             rc = 1
     return rc
 
@@ -1621,6 +1964,41 @@ def _report_session_error(terminal: StreamTerminal, error: BaseException) -> int
     return report_failure(terminal, error, operation="Provider session")
 
 
+def _validate_preconfirmed_plan(plan, proof_gate) -> None:
+    if plan.ui_mode != proof_gate.approval.ui_mode:
+        raise LaunchRefusedError("Preconfirmed plan ui_mode does not match proof approval.")
+    admitted = [
+        item for item in plan.admitted
+        if item.spec.scoped_id == proof_gate.approval.scoped_provider_id
+        and proof_gate.approval.approved_model in item.models
+    ]
+    if len(admitted) != 1:
+        raise LaunchRefusedError("Approved proof route is not uniquely admitted in preconfirmed plan.")
+
+
+def _resolve_session_plan(
+    spec: dict,
+    config,
+    active_adapters: dict,
+    terminal: StreamTerminal,
+    proof_options: ProofSessionOptions | None,
+):
+    if proof_options is not None and proof_options.preconfirmed_plan is not None:
+        if proof_options.proof_gate is None:
+            raise LaunchRefusedError("Preconfirmed launch plan requires an active proof gate.")
+        _validate_preconfirmed_plan(proof_options.preconfirmed_plan, proof_options.proof_gate)
+        return proof_options.preconfirmed_plan
+    return plan_interactive_launch(
+        instance_name=spec["instance"],
+        cwd=spec["cwd"],
+        provider_filter=spec["provider_filter"],
+        cli_ui_mode=spec["cli_ui_mode"],
+        config=config,
+        adapters=active_adapters,
+        terminal=terminal,
+    )
+
+
 def run_interactive_session(
     spec: dict,
     terminal: StreamTerminal,
@@ -1628,6 +2006,7 @@ def run_interactive_session(
     config_dir: Path | None = None,
     adapters: dict | None = None,
     lock_dir: Path | None = None,
+    proof_options: ProofSessionOptions | None = None,
 ) -> int:
     """Supervise one interactive multi-provider oc-sandbox OpenCode session."""
     spec = _validate_spec(spec)
@@ -1643,23 +2022,16 @@ def run_interactive_session(
 
     try:
         config = load_provider_config(config_dir=config_dir)
+        proof_gate = proof_options.proof_gate if proof_options is not None else None
         if adapters is None:
             backend = make_backend()
             from .session_adapter import OpenAISessionAdapter
-            active_adapters = {"openai": OpenAISessionAdapter(backend)}
+            active_adapters = {"openai": OpenAISessionAdapter(backend, proof_gate=proof_gate)}
             resolved_lock_dir = lock_dir or backend._state
         else:
             active_adapters = adapters
             resolved_lock_dir = lock_dir if lock_dir is not None else make_backend()._state
-        plan = plan_interactive_launch(
-            instance_name=spec["instance"],
-            cwd=spec["cwd"],
-            provider_filter=spec["provider_filter"],
-            cli_ui_mode=spec["cli_ui_mode"],
-            config=config,
-            adapters=active_adapters,
-            terminal=terminal,
-        )
+        plan = _resolve_session_plan(spec, config, active_adapters, terminal, proof_options)
     except Exception as error:
         return _report_session_error(terminal, error)
 
@@ -1677,7 +2049,7 @@ def run_interactive_session(
     prev_term = signal.signal(signal.SIGTERM, lambda _s, _f: stop_event.set())
     prev_hup = signal.signal(signal.SIGHUP, lambda _s, _f: stop_event.set())
     rc = 1
-    cleanup_state = {"clean": False}
+    cleanup_state = {"clean": False, "proof_options": proof_options}
     try:
         rc = _run_multi_slot_session(
             spec, plan, active_adapters, root, stop_event, terminal, cleanup_state,

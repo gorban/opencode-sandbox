@@ -212,6 +212,7 @@ class SlotHandle:
     build_relay_args: Callable[[dict], list[str]]
     mark_relay_created: Callable[[], None] | None = None
     confirm_relay_removed: Callable[[], None] | None = None
+    lease_release_confirmed: Callable[[], bool] | None = None
 
 
 class ProviderIntegrityError(RuntimeError):

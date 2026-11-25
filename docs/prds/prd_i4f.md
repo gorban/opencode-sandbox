@@ -71,10 +71,16 @@ calls, and verified container/scratch cleanup.
   subscription (`Reply with exactly: ok`). Candidate verified live on PR #71; pending Gate 2
   re-review, serialized merge after PR #69, and final human review.
 - [ ] **OpenAI interactive shell e2e** (`tests/e2e/live/test_openai_shell_e2e.py`,
-  `--run-openai-shell-live`) — opt-in automated test driving the normal `oc-sandbox` interactive
-  OpenAI OpenCode launch path in a disposable sandbox pod/workspace, sending
-  `Reply with exactly: ok`, and verifying exact `ok` delivery, `0` unintended tool calls, zero
-  broker errors, intact fail-closed receipt/store checks, and clean teardown.
+  `--run-openai-shell-live`, bootstrapped via `tests/e2e/live/run_openai_shell_live.py`) — opt-in
+  broker-and-pinned-TUI integration milestone exercising `run_interactive_session` (real
+  `OpenAISessionAdapter`, `SessionBroker`, two-phase discovery-to-turn `session_relay.py` cutover,
+  pinned `oc-agent` Full and Mini TUIs, and read-only session export corroboration) inside a
+  disposable owner-managed pod with mandatory role-bound reviewed image IDs, single verified
+  foreground owner retaining attended `/dev/tty` approval and foreground/drift rechecks through the
+  first-write fence, `file + dir fsync` durability, and `SIGKILL`-surviving lifecycle-locked cleanup
+  with pod-membership verification. Separate offline configuration-first public CLI (`oc-sandbox` /
+  `oc-sandbox --mini`) spec-value parity and ambient-FD immunity checks run in CI. The I4fa
+  public-launch live milestone and live qualification/human review remain open.
 - [ ] **Claude live e2e** (`tests/e2e/live/test_claude_shell_e2e.py`, `--run-claude-shell-live`) —
   opt-in automated test replacing ad-hoc `/var/tmp/...` probe commands once the exact host-isolated
   Claude launch topology clears qualification and security review (remains open while PR #72's
