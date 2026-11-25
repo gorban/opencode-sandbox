@@ -355,18 +355,21 @@ class Broker:
                     jobs.append(pool.submit(self.serve_job, client))
 
                 if finished.is_set() and not self.stop.is_set():
-                    listener.setblocking(False)
-                    try:
-                        client, _address = listener.accept()
-                    except BlockingIOError:
-                        pass
-                    else:
-                        client.close()
-                        self.record_error(ProtocolError("unexpected queued Claude fixture request"))
-                    if any(not job.done() for job in jobs):
-                        self.record_error(ProtocolError("Claude fixture phase ended with active requests"))
+                    self.check_finished_phase(listener, jobs)
             except (OSError, RuntimeError) as error:
                 self.record_error(error)
+
+    def check_finished_phase(self, listener, jobs):
+        listener.setblocking(False)
+        try:
+            client, _address = listener.accept()
+        except BlockingIOError:
+            pass
+        else:
+            client.close()
+            self.record_error(ProtocolError("unexpected queued Claude fixture request"))
+        if any(not job.done() for job in jobs):
+            self.record_error(ProtocolError("Claude fixture phase ended with active requests"))
 
 
 def remove_scratch(root):

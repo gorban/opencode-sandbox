@@ -264,7 +264,7 @@ class OrchestratorTest(unittest.TestCase):
         for case in ("completed", "queued", "active"):
             with self.subTest(case=case), TemporaryDirectory(dir="/tmp") as directory:
                 root = Path(directory) / "scratch"
-                root.mkdir()
+                root.mkdir(mode=0o700)
                 stages = []
                 brokers = []
                 request_sent, handler_started, release_handler = Event(), Event(), Event()
@@ -319,7 +319,7 @@ class OrchestratorTest(unittest.TestCase):
     def test_claude_fixture_permissions_under_user_private_group_umask(self):
         with TemporaryDirectory(dir="/tmp") as directory:
             root = Path(directory) / "scratch"
-            root.mkdir()
+            root.mkdir(mode=0o700)
             stages = []
 
             def inspect_stage(root, stage, _lifeline, _broker):
@@ -387,8 +387,9 @@ class OrchestratorTest(unittest.TestCase):
             with TemporaryFile() as native:
                 native.write(payload)
                 native.seek(0)
+                frames = NativeFrames(native)
                 with self.assertRaises(ProtocolError):
-                    NativeFrames(native).next_line()
+                    frames.next_line()
 
     def test_claude_synthetic_requires_a_complete_native_tool_free_turn(self):
         session = "00000000-0000-4000-8000-000000000001"
@@ -502,7 +503,7 @@ class OrchestratorTest(unittest.TestCase):
         with TemporaryDirectory(dir="/tmp") as directory:
             parent = Path(directory)
             root = parent / "scratch"
-            root.mkdir()
+            root.mkdir(mode=0o700)
             outside = parent / "outside"
             outside.mkdir()
             outside.chmod(0)
@@ -537,7 +538,7 @@ class OrchestratorTest(unittest.TestCase):
     def test_claude_cleanup_retains_scratch_when_retirement_cannot_be_verified(self):
         with TemporaryDirectory(dir="/tmp") as directory:
             root = Path(directory) / "scratch"
-            root.mkdir()
+            root.mkdir(mode=0o700)
             lifeline = SimpleNamespace(check=lambda: None, active=lambda: True)
             with (patch("oc_orchestrator.claude.mkdtemp", return_value=str(root)),
                   patch("oc_orchestrator.claude.seed"),
@@ -571,7 +572,7 @@ class OrchestratorTest(unittest.TestCase):
 
         with TemporaryDirectory(dir="/tmp") as directory:
             root = Path(directory) / "scratch"
-            root.mkdir()
+            root.mkdir(mode=0o700)
             lifeline = SimpleNamespace(check=lambda: None, active=lambda: True)
             try:
                 with (patch("oc_orchestrator.claude.mkdtemp", return_value=str(root)),
