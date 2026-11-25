@@ -49,6 +49,7 @@ _OP_PREPARE_SLOT = "prepare_slot"
 _OP_BEGIN_SLOT = "begin_slot_create"
 _OP_FINISH_SLOT = "finish_slot_create"
 _OP_LEASE_RELEASED = "mark_lease_released"
+_OP_REGISTER_SESSION_ROOT = "register_session_root"
 _KEY_CONTAINER_NAME = "container_name"
 _KEY_UNCERTAIN = "ownership_uncertain"
 _KEY_LEASE_RELEASED = "lease_released"
@@ -194,73 +195,158 @@ def _open_pinned_leaf_dir(parent_fd: int, leaf: str, want_dev: int, want_ino: in
     return leaf_fd, "ok"
 
 
-def _remove_pinned_dir(root_path: Path, want_dev: int, want_ino: int) -> str:
-    """Remove only the exact (st_dev, st_ino) directory via dir_fd; never touch replacements."""
+def _stat_leaf_status(parent_fd: int, leaf: str, want_dev: int, want_ino: int) -> str:
     try:
-        parent_fd = os.open(root_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        cur = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         return "absent"
     except OSError:
         return "error"
+    if (cur.st_dev, cur.st_ino) == (want_dev, want_ino) and stat.S_ISDIR(cur.st_mode):
+        return "same"
+    return "replaced"
+
+
+def _verify_and_rmdir_pinned(parent_fd: int, leaf: str, leaf_fd: int, want_dev: int, want_ino: int) -> str:
+    cur_status = _stat_leaf_status(parent_fd, leaf, want_dev, want_ino)
+    if cur_status != "same":
+        if cur_status == "absent" and os.fstat(leaf_fd).st_nlink != 0:
+            return "replaced"
+        return cur_status
+    if os.fstat(leaf_fd).st_nlink != 2:
+        return "replaced"
+    try:
+        os.rmdir(leaf, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return "absent" if os.fstat(leaf_fd).st_nlink == 0 else "replaced"
+    except OSError:
+        return "replaced" if _stat_leaf_status(parent_fd, leaf, want_dev, want_ino) == "replaced" else "error"
+    if os.fstat(leaf_fd).st_nlink != 0:
+        return "replaced"
+    after_status = _stat_leaf_status(parent_fd, leaf, want_dev, want_ino)
+    if after_status == "absent":
+        return "removed"
+    return "replaced" if after_status == "replaced" else "error"
+
+
+def _check_preexisting_pin(
+    parent_fd: int, leaf: str, want_dev: int, want_ino: int, pinned_fd: int | None,
+) -> str | None:
+    if pinned_fd is None:
+        return None
+    pinfo = os.fstat(pinned_fd)
+    if (pinfo.st_dev, pinfo.st_ino) != (want_dev, want_ino) or pinfo.st_uid != os.geteuid():
+        return "replaced"
+    if pinfo.st_nlink == 0:
+        return "absent" if _stat_leaf_status(parent_fd, leaf, want_dev, want_ino) == "absent" else "replaced"
+    return None
+
+
+def _remove_pinned_dir(
+    root_path: Path,
+    want_dev: int,
+    want_ino: int,
+    *,
+    pinned_fd: int | None = None,
+) -> str:
+    """Remove only the exact (st_dev, st_ino) directory via dir_fd; never touch replacements."""
+    try:
+        parent_fd = os.open(root_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return "replaced" if (pinned_fd is not None and os.fstat(pinned_fd).st_nlink != 0) else "absent"
+    except OSError:
+        return "error"
     leaf = root_path.name
     try:
+        pre = _check_preexisting_pin(parent_fd, leaf, want_dev, want_ino, pinned_fd)
+        if pre is not None:
+            return pre
         leaf_fd, status = _open_pinned_leaf_dir(parent_fd, leaf, want_dev, want_ino)
         if leaf_fd is None:
+            if status == "absent" and pinned_fd is not None and os.fstat(pinned_fd).st_nlink != 0:
+                return "replaced"
             return status
         try:
-            _clear_dir_fd(leaf_fd)
-        except OSError:
-            return "error"
+            try:
+                _clear_dir_fd(leaf_fd)
+            except OSError:
+                return "error"
+            return _verify_and_rmdir_pinned(parent_fd, leaf, leaf_fd, want_dev, want_ino)
         finally:
             os.close(leaf_fd)
-        try:
-            cur = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return "absent"
-        except OSError:
-            return "error"
-        if (cur.st_dev, cur.st_ino) != (want_dev, want_ino) or not stat.S_ISDIR(cur.st_mode):
-            return "replaced"
-        try:
-            os.rmdir(leaf, dir_fd=parent_fd)
-        except FileNotFoundError:
-            return "absent"
-        except OSError:
-            return "error"
-        try:
-            after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return "removed"
-        except OSError:
-            return "error"
-        return "error" if (after.st_dev, after.st_ino) == (want_dev, want_ino) else "replaced"
     finally:
         os.close(parent_fd)
 
 
-def _revoke_grant_dir(grant_dir: str, *, slot_root: str = "") -> None:
-    if grant_dir:
-        target_dir: Path | None = Path(grant_dir)
-    elif slot_root:
-        target_dir = Path(slot_root) / "grant"
-    else:
-        target_dir = None
-    if target_dir is None or not target_dir.is_dir():
-        return
-    state_path = target_dir / "state"
-    lock_path = target_dir / "lock"
-    with suppress(OSError):
-        if lock_path.is_file():
-            lock_fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                _atomic_fsync_write(state_path, b"revoked\n")
-            finally:
+def _atomic_fsync_write_dir_fd(dir_fd: int, name: str, data: bytes) -> None:
+    tmp_name = f".{name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        raise
+
+
+def _acquire_pinned_grant_lock(grant_fd: int) -> tuple[bool, int | None]:
+    lock_fd: int | None = None
+    try:
+        lock_fd = os.open("lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=grant_fd)
+        linfo = os.fstat(lock_fd)
+        if not stat.S_ISREG(linfo.st_mode) or linfo.st_uid != os.geteuid():
+            os.close(lock_fd)
+            return False, None
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return True, lock_fd
+    except FileNotFoundError:
+        return True, None
+    except OSError:
+        if lock_fd is not None:
+            with suppress(OSError):
+                os.close(lock_fd)
+        return False, None
+
+
+def _revoke_pinned_grant_dir(slot_root_fd: int | None, want_dev: object, want_ino: object) -> bool:
+    """Revoke grant/state strictly through the pinned slot_root directory FD (never by pathname)."""
+    if slot_root_fd is None or type(want_dev) is not int or type(want_ino) is not int:
+        return False
+    try:
+        rinfo = os.fstat(slot_root_fd)
+    except OSError:
+        return False
+    if (rinfo.st_dev, rinfo.st_ino) != (want_dev, want_ino) or rinfo.st_uid != os.geteuid():
+        return False
+    try:
+        grant_fd = os.open("grant", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=slot_root_fd)
+    except OSError:
+        return False
+    try:
+        ginfo = os.fstat(grant_fd)
+        if not stat.S_ISDIR(ginfo.st_mode) or ginfo.st_uid != os.geteuid():
+            return False
+        ok_lock, lock_fd = _acquire_pinned_grant_lock(grant_fd)
+        if not ok_lock:
+            return False
+        try:
+            _atomic_fsync_write_dir_fd(grant_fd, "state", b"revoked\n")
+            return True
+        except OSError:
+            return False
+        finally:
+            if lock_fd is not None:
                 with suppress(OSError):
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                os.close(lock_fd)
-        else:
-            _atomic_fsync_write(state_path, b"revoked\n")
+                with suppress(OSError):
+                    os.close(lock_fd)
+    finally:
+        os.close(grant_fd)
 
 
 def _read_lock_helper_source(lock_helper: Path) -> str:
@@ -382,11 +468,21 @@ class _OwnershipJournal:
         self.volume_owned = False
         self.worktree_owned = False
         self.worktree_dev_ino: tuple[int, int] | None = None
+        self.session_root: str = ""
+        self.session_root_dev_ino: tuple[int, int] | None = None
+        self._pinned_session_root_fd: int | None = None
         self.slots: dict[str, dict[str, object]] = {}
         self._pinned_slot_fds: dict[str, int] = {}
         self.owned_cids: set[str] = set()
         self.ownership_uncertain = False
         self.cleanup_errors: list[str] = []
+
+    def _close_pinned_session_root_fd(self) -> None:
+        fd = self._pinned_session_root_fd
+        self._pinned_session_root_fd = None
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
 
     def _close_pinned_slot_fd(self, slot_key: str) -> None:
         fd = self._pinned_slot_fds.pop(slot_key, None)
@@ -395,6 +491,7 @@ class _OwnershipJournal:
                 os.close(fd)
 
     def _close_all_pinned_slot_fds(self) -> None:
+        self._close_pinned_session_root_fd()
         while self._pinned_slot_fds:
             _, fd = self._pinned_slot_fds.popitem()
             with suppress(OSError):
@@ -415,6 +512,8 @@ class _OwnershipJournal:
             "volume_owned": self.volume_owned,
             "worktree_owned": self.worktree_owned,
             "worktree_dev_ino": list(self.worktree_dev_ino) if self.worktree_dev_ino else None,
+            "session_root": self.session_root,
+            "session_root_dev_ino": list(self.session_root_dev_ino) if self.session_root_dev_ino else None,
             "slots": self.slots,
             "owned_cids": sorted(self.owned_cids),
             _KEY_UNCERTAIN: self.ownership_uncertain,
@@ -545,6 +644,42 @@ class _OwnershipJournal:
         self.worktree_dev_ino = (int(dev_s), int(ino_s))
         self.worktree_owned = True
         self._persist()
+
+    def register_session_root(self, session_root: str) -> None:
+        """Pin and persist the session configuration root before any slot opens."""
+        if not session_root:
+            raise CleanupOwnerError("session_root is required")
+        self._close_pinned_session_root_fd()
+        pinned = _open_owned_dir_pin(session_root)
+        if pinned is None:
+            raise CleanupOwnerError("session_root is missing or untrusted")
+        fd, dev, ino = pinned
+        self._pinned_session_root_fd = fd
+        self.session_root = session_root
+        self.session_root_dev_ino = (dev, ino)
+        self._persist()
+
+    def _teardown_session_root(self) -> None:
+        if not self.session_root:
+            self._close_pinned_session_root_fd()
+            return
+        ident = self.session_root_dev_ino
+        if ident is None:
+            self._close_pinned_session_root_fd()
+            self.ownership_uncertain = True
+            self.cleanup_errors.append("session_root_identity_unknown")
+            return
+        try:
+            outcome = _remove_pinned_dir(
+                Path(self.session_root), ident[0], ident[1], pinned_fd=self._pinned_session_root_fd,
+            )
+        finally:
+            self._close_pinned_session_root_fd()
+        if outcome == "replaced":
+            self.ownership_uncertain = True
+            self.cleanup_errors.append("session_root_identity_mismatch")
+        elif outcome == "error":
+            self.cleanup_errors.append("session_root_remove_failed")
 
     def _slot_root_identity(self, slot_key: str, slot_root: str) -> tuple[int | None, int | None]:
         prev = self.slots.get(slot_key)
@@ -678,15 +813,19 @@ class _OwnershipJournal:
 
     def _teardown_pod_volume_worktree(self) -> None:
         if not self._teardown_pod():
+            self._teardown_session_root()
             return
         self._teardown_volume()
         self._teardown_worktree()
+        self._teardown_session_root()
 
     def _retire_unreleased_slot(self, slot_key: str, entry: dict[str, object]) -> None:
         status = entry.get("status")
-        grant_dir = str(entry.get("grant_dir") or "")
-        slot_root = str(entry.get("slot_root") or "")
-        _revoke_grant_dir(grant_dir, slot_root=slot_root)
+        _revoke_pinned_grant_dir(
+            self._pinned_slot_fds.get(slot_key),
+            entry.get("slot_root_dev"),
+            entry.get("slot_root_ino"),
+        )
         if status == _STATUS_CREATED:
             cid = entry.get("cid")
             if not isinstance(cid, str) or not _HEX64.fullmatch(cid):
@@ -717,7 +856,9 @@ class _OwnershipJournal:
             self.cleanup_errors.append(f"slot_root_identity_unknown:{slot_key}")
             return
         try:
-            outcome = _remove_pinned_dir(Path(slot_root), want_dev, want_ino)
+            outcome = _remove_pinned_dir(
+                Path(slot_root), want_dev, want_ino, pinned_fd=self._pinned_slot_fds.get(slot_key),
+            )
         finally:
             self._close_pinned_slot_fd(slot_key)
         if outcome == "replaced":
@@ -924,6 +1065,12 @@ def _dispatch_owner_op(
         _handle_slot_op(op, msg, journal)
         _send_line(sock, {"ok": True})
         return False
+    if op == _OP_REGISTER_SESSION_ROOT:
+        if journal is None:
+            raise CleanupOwnerError("not created")
+        journal.register_session_root(str(msg.get("session_root") or ""))
+        _send_line(sock, {"ok": True})
+        return False
     if op == "teardown":
         result = (
             journal.teardown()
@@ -1073,6 +1220,9 @@ class DetachedShellCleanupOwner:
             "state_dir": str(state_dir),
         })
         return dict(reply["result"])
+
+    def register_session_root(self, session_root: str) -> None:
+        self._rpc({"op": _OP_REGISTER_SESSION_ROOT, "session_root": session_root})
 
     def prepare_slot(self, slot_key: str, *, container_name: str, slot_root: str = "") -> None:
         self._rpc({

@@ -202,6 +202,7 @@ class ProofSessionOptions:
     proof_gate: object
     preconfirmed_plan: object = None
     agent_runner: object = None
+    on_session_root_created: object = None
     on_slot_prepare: object = None
     on_slot_begin: object = None
     on_slot_finish: object = None
@@ -1366,7 +1367,9 @@ class _SessionSlotCoordinator:
             ident = root_ids.get(slot_root)
             try:
                 if ident is not None:
-                    _remove_pinned_dir(slot_root, ident[0], ident[1])
+                    _remove_pinned_dir(
+                        slot_root, ident[0], ident[1], pinned_fd=self._slot_root_fds.get(slot_root),
+                    )
             finally:
                 self._close_slot_root_fd(slot_root)
 
@@ -2151,12 +2154,15 @@ def run_interactive_session(
         return 1
 
     root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir=SHARED_TMP))
+    owner_removes_session_root = proof_options is not None and proof_options.on_session_root_created is not None
     stop_event = threading.Event()
     prev_term = signal.signal(signal.SIGTERM, lambda _s, _f: stop_event.set())
     prev_hup = signal.signal(signal.SIGHUP, lambda _s, _f: stop_event.set())
     rc = 1
     cleanup_state = {"clean": False, "proof_options": proof_options}
     try:
+        if owner_removes_session_root:
+            proof_options.on_session_root_created(str(root))
         rc = _run_multi_slot_session(
             spec, plan, active_adapters, root, stop_event, terminal, cleanup_state,
         )
@@ -2169,7 +2175,7 @@ def run_interactive_session(
         signal.signal(signal.SIGHUP, prev_hup)
         with suppress(OSError):
             os.close(instance_lock_fd)
-        if cleanup_state["clean"]:
+        if cleanup_state["clean"] and not owner_removes_session_root:
             with suppress(OSError):
                 shutil.rmtree(root)
     return rc

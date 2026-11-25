@@ -3048,6 +3048,189 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 os.close(r_fd)
                 os.close(w_fd)
 
+    def test_reciprocal_g2_r4_concealed_sgr_pinned_grant_revoke_reply_verdict_and_session_root(self) -> None:
+        from oc_openai import session_broker, shell_cleanup_owner as owner_mod
+
+        with tempfile.TemporaryDirectory(prefix="oc-g2-r4-") as td_raw:
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            exp = td / "exp"
+            exp.mkdir(mode=0o700)
+            os.chmod(exp, 0o700)
+            ev = td / "ev"
+            ev.mkdir(mode=0o700)
+            os.chmod(ev, 0o700)
+
+            approval = ProofApproval(
+                run_id=TEST_RUN_ID, instance_label="personal", scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL, ui_mode="mini", cwd=TEST_CWD,
+                selection_epoch="E" * 43, credential_generation=1,
+                history_digest_all_12_files=compute_exposure_history_digest(exp),
+                providers_config_digest=TEST_HEX_A,
+            )
+
+            # 1. Concealed SGR 8 and same-color fg==bg text must NOT arm; visible controls MUST arm!
+            for concealed in (
+                f"\x1b[8mopenai--personal/{TEST_MODEL}\x1b[28m",
+                f"\x1b[30;40mopenai--personal/{TEST_MODEL}\x1b[0m",
+                f"\x1b[38;2;12;34;56;48;2;12;34;56mChatGPT Subscription (personal)  {TEST_MODEL}\x1b[0m",
+            ):
+                self.assertIsNone(shell_driver.extract_observed_route_row(concealed, approval), concealed)
+            for visible, want in (
+                (f"\x1b[8mhidden\x1b[28m\x1b[32mopenai--personal/{TEST_MODEL}\x1b[0m", f"openai--personal/{TEST_MODEL}"),
+                (
+                    f"\x1b[37;40mChatGPT Subscription (personal)  {TEST_MODEL}\x1b[0m",
+                    f"ChatGPT Subscription (personal) {TEST_MODEL}",
+                ),
+            ):
+                self.assertEqual(shell_driver.extract_observed_route_row(visible, approval), want)
+
+            gate_sgr = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
+            gate_sgr.bind_incarnation("inc-pty-concealed-01", 1)
+            armed_sgr: list[tuple[str, str]] = []
+            fake_concealed = (
+                "import sys, time; "
+                f"sys.stdout.write('\\x1b[8mopenai--personal/{TEST_MODEL}\\x1b[28m\\n'); sys.stdout.flush(); "
+                "time.sleep(1.8)"
+            )
+            with patch.object(
+                shell_driver,
+                "_agent_start_command",
+                return_value=([sys.executable, "-IB", "-c", fake_concealed], dict(os.environ)),
+            ):
+                pty_out_no_reply: dict[str, bool] = {}
+                rc_child = shell_driver._drive_agent_pty(
+                    TEST_HEX_A, threading.Event(), gate_sgr,
+                    lambda r, d: armed_sgr.append((r, d)), outcome=pty_out_no_reply,
+                )
+            self.assertEqual(rc_child, 0)
+            self.assertEqual(armed_sgr, [])
+            # 3. Clean child rc=0 exit without a fresh visible reply records reply_observed=False!
+            self.assertFalse(pty_out_no_reply["reply_observed"])
+
+            # 2a. Unreleased crash cleanup revokes ONLY the pinned root's grant, NEVER a replacement at stale path!
+            jspec = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=td / "j_r4.json",
+            )
+            no_pm = lambda args, timeout=20.0: subprocess.CompletedProcess(args, 1, b"", b"")
+            orig_slot = td / "slot_unrel_swap"
+            orig_grant = orig_slot / "grant"
+            orig_grant.mkdir(parents=True, mode=0o700)
+            (orig_grant / "lock").touch(mode=0o600)
+            (orig_grant / "state").write_text("active\n", encoding="utf-8")
+
+            j_unrel = _OwnershipJournal(jspec, podman_runner=no_pm)
+            j_unrel.prepare_slot("turn-0", container_name="oc-e2e-deadbeef-relay-0", slot_root=str(orig_slot))
+            j_unrel.begin_slot_create(
+                "turn-0", container_name="oc-e2e-deadbeef-relay-0",
+                grant_dir=str(orig_grant), slot_root=str(orig_slot),
+            )
+            moved_slot = td / "slot_unrel_moved"
+            orig_slot.rename(moved_slot)
+            repl_grant = orig_slot / "grant"
+            repl_grant.mkdir(parents=True, mode=0o700)
+            (repl_grant / "lock").touch(mode=0o600)
+            (repl_grant / "state").write_text("active\n", encoding="utf-8")
+            j_unrel.teardown()
+            self.assertEqual((moved_slot / "grant" / "state").read_text(encoding="utf-8"), "revoked\n")
+            self.assertEqual((repl_grant / "state").read_text(encoding="utf-8"), "active\n")
+
+            # 2b. Released-root deletion detects split name/identity swap right before final os.rmdir!
+            swap_slot = td / "slot_rmdir_race"
+            swap_slot.mkdir(mode=0o700)
+            j_race = _OwnershipJournal(jspec, podman_runner=no_pm)
+            j_race.prepare_slot("turn-0", container_name="oc-e2e-deadbeef-relay-0", slot_root=str(swap_slot))
+            j_race.mark_lease_released("turn-0")
+            moved_race = td / "slot_rmdir_moved"
+            real_rmdir = os.rmdir
+
+            def _swap_before_rmdir(path, *, dir_fd=None):
+                if path == swap_slot.name and not moved_race.exists():
+                    swap_slot.rename(moved_race)
+                    swap_slot.mkdir(mode=0o700)
+                return real_rmdir(path, dir_fd=dir_fd)
+
+            with patch.object(owner_mod.os, "rmdir", side_effect=_swap_before_rmdir):
+                res_race = j_race.teardown()
+            self.assertFalse(res_race[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_race["ownership_uncertain"])
+            self.assertIn("slot_root_identity_mismatch:turn-0", res_race["errors"])
+
+            # 4. Session config root registered before first slot opens & cleaned by detached owner!
+            j_sess = _OwnershipJournal(jspec, podman_runner=no_pm)
+            seen_events: list[str] = []
+            cfg_dir = td / "cfg_r4"
+            cfg_dir.mkdir(mode=0o700)
+            os.chmod(cfg_dir, 0o700)
+            (cfg_dir / FILE_PROVIDERS_TOML).write_text(
+                '[providers.openai.personal]\nenabled = true\nauth_mode = "subscription"\n', encoding="utf-8",
+            )
+            os.chmod(cfg_dir / FILE_PROVIDERS_TOML, 0o600)
+            from oc_providers.catalog import ResolvedLaunchPlan
+            from oc_providers.config import load_provider_config_with_digest
+            from oc_providers.contracts import InstancePreflight, ProviderInstanceSpec, ReadinessState
+
+            _, cfg_dig = load_provider_config_with_digest(config_dir=cfg_dir, sandbox_dir=td / "sb")
+            appr_sess = ProofApproval(
+                run_id=TEST_RUN_ID, instance_label="personal", scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL, ui_mode="mini", cwd=TEST_CWD,
+                selection_epoch="E" * 43, credential_generation=1,
+                history_digest_all_12_files=compute_exposure_history_digest(exp),
+                providers_config_digest=cfg_dig or "",
+            )
+            gate_sess = ProofGate(appr_sess, evidence_dir=ev, exposure_dir=exp)
+            plan_sess = ResolvedLaunchPlan(
+                admitted=(
+                    InstancePreflight(
+                        spec=ProviderInstanceSpec(kind="openai", label="personal", enabled=True, auth_mode="subscription"),
+                        readiness=ReadinessState.READY, models=(TEST_MODEL,),
+                    ),
+                ),
+                excluded=(), acknowledged_digests={},
+                initial_provider_id=TEST_SCOPED, initial_model=TEST_MODEL,
+                ui_mode="mini", ui_source="cli",
+            )
+            captured_roots: list[str] = []
+
+            def _on_sess_root(r: str) -> None:
+                seen_events.append("session_root")
+                captured_roots.append(r)
+                j_sess.register_session_root(r)
+
+            def _abort_before_slot(*_a, **_kw):
+                seen_events.append("before_slot")
+                raise RuntimeError("simulated foreground crash before first slot")
+
+            term = SimpleNamespace(attended=lambda: True, write=lambda _m: None, error=lambda _m: None)
+            opts_sess = session_broker.ProofSessionOptions(
+                proof_gate=gate_sess, preconfirmed_plan=plan_sess,
+                on_session_root_created=_on_sess_root,
+            )
+            spec_sess = shell_driver.build_driver_session_spec(jspec, relay_image_id=TEST_HEX_B, ui_mode="mini")
+            lock_d = td / "locks_r4"
+            lock_d.mkdir(mode=0o700)
+            os.chmod(lock_d, 0o700)
+            with (
+                patch.object(session_broker, "check_devbox"),
+                patch.object(session_broker, "check_host"),
+                patch.object(session_broker, "_run_multi_slot_session", side_effect=_abort_before_slot),
+            ):
+                rc_s = session_broker.run_interactive_session(
+                    spec_sess, term, config_dir=cfg_dir, adapters={"openai": SimpleNamespace()},
+                    lock_dir=lock_d, proof_options=opts_sess,
+                )
+            self.assertNotEqual(rc_s, 0)
+            self.assertEqual(seen_events, ["session_root", "before_slot"])
+            self.assertEqual(len(captured_roots), 1)
+            self.assertTrue(Path(captured_roots[0]).is_dir())
+            persisted = json.loads((td / "j_r4.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["session_root"], captured_roots[0])
+            res_sess = j_sess.teardown()
+            self.assertTrue(res_sess[KEY_CLEANUP_VERIFIED], res_sess)
+            self.assertFalse(Path(captured_roots[0]).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

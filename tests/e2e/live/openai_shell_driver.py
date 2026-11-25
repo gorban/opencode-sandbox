@@ -97,6 +97,7 @@ class ShellLiveResult:
     receipt_history_unchanged: bool
     agent_rc: int
     evidence_path: str
+    tui_reply_observed: bool = False
 
 
 @dataclass
@@ -105,6 +106,7 @@ class _PtyState:
     prompt_sent: bool = False
     prompt_offset: int = 0
     pre_prompt_lines: tuple[str, ...] = ()
+    reply_observed: bool = False
 
 
 def strip_ansi(text: str) -> str:
@@ -148,10 +150,21 @@ class _TerminalScreen:
         self.grid = [[" "] * cols for _ in range(rows)]
         self._pending = ""
         self._uncertain = False
+        self._concealed = False
+        self._fg: tuple[str, int] | tuple[str, int, int, int] | None = None
+        self._bg: tuple[str, int] | tuple[str, int, int, int] | None = None
 
     @property
     def is_certain(self) -> bool:
         return not self._uncertain and not self._pending
+
+    def _reset_sgr(self) -> None:
+        self._concealed = False
+        self._fg = None
+        self._bg = None
+
+    def _is_text_hidden(self) -> bool:
+        return self._concealed or (self._fg is not None and self._fg == self._bg)
 
     def _reset_screen(self, *, reset_cursor: bool = False) -> None:
         self.grid = [[" "] * self.cols for _ in range(self.rows)]
@@ -161,6 +174,7 @@ class _TerminalScreen:
             self.col = 0
             self._scroll_top = 0
             self._scroll_bottom = self.rows - 1
+            self._reset_sgr()
 
     def _erase_display(self, mode: int) -> None:
         if mode in (2, 3):
@@ -298,8 +312,66 @@ class _TerminalScreen:
             return False
         return True
 
+    def _parse_extended_color(self, codes: list[int], idx: int) -> tuple[tuple[str, int] | tuple[str, int, int, int] | None, int]:
+        if idx + 1 >= len(codes):
+            return None, len(codes)
+        mode = codes[idx + 1]
+        if mode == 5 and idx + 2 < len(codes):
+            return ("idx", codes[idx + 2]), idx + 3
+        if mode == 2 and idx + 4 < len(codes):
+            return ("rgb", codes[idx + 2], codes[idx + 3], codes[idx + 4]), idx + 5
+        return None, len(codes)
+
+    def _apply_simple_sgr(self, code: int) -> None:
+        if code == 0:
+            self._reset_sgr()
+        elif code == 8:
+            self._concealed = True
+        elif code == 28:
+            self._concealed = False
+        elif 30 <= code <= 37:
+            self._fg = ("idx", code - 30)
+        elif 90 <= code <= 97:
+            self._fg = ("idx", code - 90 + 8)
+        elif code == 39:
+            self._fg = None
+        elif 40 <= code <= 47:
+            self._bg = ("idx", code - 40)
+        elif 100 <= code <= 107:
+            self._bg = ("idx", code - 100 + 8)
+        elif code == 49:
+            self._bg = None
+
+    def _handle_sgr(self, params: str) -> None:
+        if not params:
+            self._reset_sgr()
+            return
+        if any(ch not in "0123456789;:" for ch in params):
+            self._uncertain = True
+            return
+        normalized = params.replace(":", ";")
+        codes = [int(part) if part.isdigit() else 0 for part in normalized.split(";")]
+        idx = 0
+        while idx < len(codes):
+            code = codes[idx]
+            if code in (38, 48):
+                color, idx = self._parse_extended_color(codes, idx)
+                if code == 38:
+                    self._fg = color
+                else:
+                    self._bg = color
+                continue
+            if code == 58:
+                _, idx = self._parse_extended_color(codes, idx)
+                continue
+            self._apply_simple_sgr(code)
+            idx += 1
+
     def _handle_csi(self, params: str, final: str) -> None:
-        if final in ("m", "n", "c", "t"):
+        if final == "m":
+            self._handle_sgr(params)
+            return
+        if final in ("n", "c", "t"):
             return
         if final == "q" and params.endswith(" "):
             return
@@ -342,7 +414,7 @@ class _TerminalScreen:
             if self.col >= self.cols:
                 self.col = 0
                 self._linefeed()
-            self.grid[self.row][self.col] = ch
+            self.grid[self.row][self.col] = " " if self._is_text_hidden() else ch
             self.col += 1
 
     def _consume_two_byte_escape(self, nxt: str) -> bool:
@@ -845,6 +917,7 @@ def _step_pty_driver(
         state.prompt_sent = True
         return False
     if proof_gate.exact_ok_delivered and _has_new_exact_reply(clean, state.pre_prompt_lines, post_prompt_text):
+        state.reply_observed = True
         time.sleep(0.6)
         with suppress(OSError):
             os.write(master_fd, b"\x03")
@@ -854,7 +927,44 @@ def _step_pty_driver(
     return False
 
 
-def _drive_agent_pty(agent_id: str, stop_event, proof_gate: ProofGate, arm_turn_route) -> int:
+def _record_final_pty_reply(
+    master_fd: int,
+    screen: _TerminalScreen,
+    decoder,
+    post_prompt_buf: bytearray,
+    proof_gate: ProofGate,
+    state: _PtyState,
+) -> None:
+    tail_chunk = _read_pty_bytes(master_fd, 0.05)
+    if tail_chunk:
+        screen.feed(decoder.decode(tail_chunk, final=False))
+        if state.prompt_sent:
+            _append_bounded(post_prompt_buf, tail_chunk)
+    screen.feed(decoder.decode(b"", final=True))
+    if not state.reply_observed and state.prompt_sent and proof_gate.exact_ok_delivered:
+        post_text = strip_ansi(post_prompt_buf.decode("utf-8", errors="replace"))
+        if _has_new_exact_reply(screen.render(), state.pre_prompt_lines, post_text):
+            state.reply_observed = True
+
+
+def _wait_or_stop_agent_proc(proc: subprocess.Popen[bytes], agent_id: str) -> int:
+    try:
+        return proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        with suppress(OSError):
+            proc.terminate()
+        _run_podman(["stop", "-t", "2", agent_id], timeout=10.0)
+        return proc.wait(timeout=5)
+
+
+def _drive_agent_pty(
+    agent_id: str,
+    stop_event,
+    proof_gate: ProofGate,
+    arm_turn_route,
+    *,
+    outcome: dict[str, bool] | None = None,
+) -> int:
     master_fd, slave_fd = pty.openpty()
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 120, 0, 0))
     cmd, env = _agent_start_command(agent_id)
@@ -886,14 +996,11 @@ def _drive_agent_pty(agent_id: str, stop_event, proof_gate: ProofGate, arm_turn_
                 post_prompt_text=post_text,
             ):
                 break
-        try:
-            return proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            with suppress(OSError):
-                proc.terminate()
-            _run_podman(["stop", "-t", "2", agent_id], timeout=10.0)
-            return proc.wait(timeout=5)
+        _record_final_pty_reply(master_fd, screen, decoder, post_prompt_buf, proof_gate, state)
+        return _wait_or_stop_agent_proc(proc, agent_id)
     finally:
+        if outcome is not None:
+            outcome["reply_observed"] = state.reply_observed
         with suppress(OSError):
             os.close(master_fd)
 
@@ -1150,14 +1257,17 @@ def run_openai_shell_live(config: ShellLiveConfig) -> ShellLiveResult:
         )
         spec = build_driver_session_spec(jspec, relay_image_id=relay_image_id, ui_mode=config.ui_mode)
         proof_adapter = OpenAISessionAdapter(backend, proof_gate=proof_gate)
+        pty_outcome = {"reply_observed": False}
+
         def _run_agent(aid, ev, arm_fn):
             session_stop["event"] = ev
-            return _drive_agent_pty(aid, ev, proof_gate, arm_fn)
+            return _drive_agent_pty(aid, ev, proof_gate, arm_fn, outcome=pty_outcome)
 
         proof_options = ProofSessionOptions(
             proof_gate=proof_gate,
             preconfirmed_plan=plan,
             agent_runner=_run_agent,
+            on_session_root_created=owner.register_session_root,
             on_slot_prepare=owner.prepare_slot,
             on_slot_begin=owner.begin_slot_create,
             on_slot_finish=owner.finish_slot_create,
@@ -1185,10 +1295,12 @@ def run_openai_shell_live(config: ShellLiveConfig) -> ShellLiveResult:
     receipts_unchanged = hmac.compare_digest(history_digest_before, history_digest_after)
     cleanup_verified = bool(cleanup_result.get("cleanup_verified"))
     settled_on_disk = proof_gate.exact_ok_delivered and proof_gate.verify_settled_evidence()
+    tui_reply_observed = bool(pty_outcome.get("reply_observed"))
     overall_ok = (
         agent_rc == 0
         and proof_gate.admitted_writes == 1
         and settled_on_disk
+        and tui_reply_observed
         and export_verified
         and cleanup_verified
         and receipts_unchanged
@@ -1206,4 +1318,5 @@ def run_openai_shell_live(config: ShellLiveConfig) -> ShellLiveResult:
         receipt_history_unchanged=receipts_unchanged,
         agent_rc=agent_rc,
         evidence_path=str(proof_gate.evidence_path or evidence_dir),
+        tui_reply_observed=tui_reply_observed,
     )
