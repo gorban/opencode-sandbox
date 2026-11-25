@@ -10,9 +10,11 @@ import sys
 import time
 
 
+sys.path.insert(0, str(Path(__file__).parent))
+from claude_fixture import verify_frontend_boundary
+from claude_protocol import PROMPT, STOCK_MODEL
+
 CODE = "/opt/proof/opencode"
-MODEL = "claude-agent/haiku"
-PROMPT = "Reply with exactly: ok"
 
 
 def endpoint(server, path):
@@ -30,7 +32,10 @@ def request(address, *args):
                           stdout=subprocess.PIPE, check=True, timeout=8)
 
 
-def run():
+def run(stage):
+    if stage not in ("discovery", "turn"):
+        raise RuntimeError("unknown fixture stage")
+    verify_frontend_boundary()
     password = secrets.token_hex(24)
     os.environ.update(OPENCODE_PASSWORD=password, OPENCODE_SERVER_PASSWORD=password)
     log = Path("/state/server.log")
@@ -38,22 +43,26 @@ def run():
                                                    stdout=output, stderr=subprocess.STDOUT) as server:
         try:
             address = endpoint(server, log)
+            # This registers the offline SDK fixture inside the disposable frontend.
             request(address, "auth", "login", "claude-agent")
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
-                if MODEL.encode() in request(address, "models").stdout.splitlines():
+                if STOCK_MODEL.encode() in request(address, "models").stdout.splitlines():
                     break
                 time.sleep(.15)
             else:
                 raise RuntimeError("fixture model unavailable")
-            result = request(address, "run", "--agent", "fixture", "--model", MODEL, "--title", "Claude local proof",
-                             "--format", "json", PROMPT)
+            if stage == "discovery":
+                result = STOCK_MODEL.encode() + b"\n"
+            else:
+                result = request(address, "run", "--agent", "fixture", "--model", STOCK_MODEL,
+                                 "--title", "Claude local proof", "--format", "json", PROMPT).stdout
         finally:
             with suppress(ProcessLookupError):
                 server.kill()
             server.wait(timeout=2)
-    sys.stdout.buffer.write(result.stdout)
+    sys.stdout.buffer.write(result)
 
 
 if __name__ == "__main__":
-    run()
+    run(sys.argv[1])
