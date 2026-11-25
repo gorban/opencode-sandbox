@@ -3906,10 +3906,22 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             scr_unk.feed(f"\x1b(A{route_txt}")
             self.assertFalse(scr_unk.is_certain)
             self.assertEqual(scr_unk.render(), "")
-            # Mixed CSI s/u and DECSC/DECRC (ESC 7/8) never raise tuple-unpack ValueError.
+            # Mixed CSI s/u, ESC 7/8, CSI ?1048h/l, and alternate-screen return match xterm charset restoration.
             self.assertEqual(shell_driver.render_terminal_screen("\x1b[uok").strip(), "ok")
             self.assertEqual(shell_driver.render_terminal_screen("\x1b7\x1b[uok").strip(), "ok")
             self.assertEqual(shell_driver.render_terminal_screen("\x1b[s\x1b8ok").strip(), "ok")
+            self.assertEqual(shell_driver.render_terminal_screen("\x1b(0\x1b[s\x1b(B\x1b[uq").strip(), "─")
+            self.assertEqual(shell_driver.render_terminal_screen("\x1b(0\x1b7\x1b(B\x1b[uq").strip(), "─")
+            self.assertEqual(shell_driver.render_terminal_screen("\x1b(0\x1b[s\x1b(B\x1b8q").strip(), "─")
+            self.assertEqual(shell_driver.render_terminal_screen("\x1b(0\x1b[?1049h\x1b(B\x1b[?1049lq").strip(), "─")
+            self.assertEqual(shell_driver.render_terminal_screen("\x1b[?1047h\x1b(0\x1b[?1047lq").strip(), "─")
+            self.assertEqual(shell_driver.render_terminal_screen("\x1b(0\x1b[?1048h\x1b(B\x1b[?1048lq").strip(), "─")
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(f"\x1b(0\x1b[?1049h\x1b(B\x1b[?1049l{route_txt}", approval),
+            )
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(f"\x1b(0\x1b[s\x1b(B\x1b[u{route_txt}", approval),
+            )
 
             # End-to-end PTY guard: DEC Special Graphics route never arms _drive_agent_pty.
             gate_gfx = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
@@ -3930,12 +3942,22 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertEqual(armed_gfx, [])
 
             # 2. Pinned OpenCode 2.3.0 Full stock footer ("Build · <model> · 1s", without "▣") passes
-            #    as positive control while clipped user prompt with the same footer stays rejected.
+            #    as positive control while clipped prompt and suffix-extended model footers are rejected.
             stock_footer = f"Build · {TEST_MODEL} · 1s"
             full_turn = f"{PROOF_PROMPT}\n\nok\n{stock_footer}"
             self.assertTrue(
                 shell_driver._has_new_exact_reply(full_turn, (), full_turn, approved_model=TEST_MODEL),
             )
+            for wrong_footer in (
+                f"Build · {TEST_MODEL}-v2 · 1s",
+                f"Build · prefix-{TEST_MODEL} · 1s",
+                f"▣ {TEST_MODEL}-v2",
+            ):
+                wrong_turn = f"{PROOF_PROMPT}\n\nok\n{wrong_footer}"
+                self.assertFalse(
+                    shell_driver._has_new_exact_reply(wrong_turn, (), wrong_turn, approved_model=TEST_MODEL),
+                    wrong_footer,
+                )
             prompt_head = PROOF_PROMPT.removesuffix(f" {shell_driver.EXPECTED_REPLY}")
             scr_clip = shell_driver._TerminalScreen(rows=32, cols=120)
             scr_clip.feed(f"{prompt_head}\nok\n" + ("\n" * 30) + stock_footer)

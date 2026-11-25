@@ -143,12 +143,12 @@ def _is_explicit_assistant_header(line: str) -> bool:
 
 
 def _is_model_turn_footer(line: str, approved_model: str) -> bool:
-    return (
-        bool(approved_model)
-        and approved_model in line
-        and PROOF_PROMPT not in line
-        and ("·" in line or "▣" in line)
-    )
+    if not approved_model or PROOF_PROMPT in line:
+        return False
+    if "·" in line:
+        parts = [seg.strip() for seg in line.split("·")]
+        return len(parts) >= 2 and bool(parts[0]) and any(seg == approved_model for seg in parts[1:])
+    return line.startswith("▣") and line[1:].strip() == approved_model
 
 
 def _is_wrapped_prompt_tail(lines: list[str], idx: int) -> bool:
@@ -184,6 +184,11 @@ class _TerminalScreen:
         self._gl = 0
         self._saved_pos = (0, 0)
         self._saved_charset = ("B", "B", 0)
+        self._saved_sgr: tuple[
+            bool,
+            tuple[str, int] | tuple[str, int, int, int] | None,
+            tuple[str, int] | tuple[str, int, int, int] | None,
+        ] = (False, None, None)
         self._scroll_top = 0
         self._scroll_bottom = rows - 1
         self.grid = [[" "] * cols for _ in range(rows)]
@@ -195,6 +200,16 @@ class _TerminalScreen:
         self._concealed = False
         self._fg: tuple[str, int] | tuple[str, int, int, int] | None = None
         self._bg: tuple[str, int] | tuple[str, int, int, int] | None = None
+
+    def _save_cursor(self) -> None:
+        self._saved_pos = (self.row, self.col)
+        self._saved_charset = (self._g0, self._g1, self._gl)
+        self._saved_sgr = (self._concealed, self._fg, self._bg)
+
+    def _restore_cursor(self) -> None:
+        self.row, self.col = self._saved_pos
+        self._g0, self._g1, self._gl = self._saved_charset
+        self._concealed, self._fg, self._bg = self._saved_sgr
 
     @property
     def is_certain(self) -> bool:
@@ -228,24 +243,26 @@ class _TerminalScreen:
     def _is_text_hidden(self) -> bool:
         return self._concealed or (self._fg is not None and self._fg == self._bg)
 
-    def _reset_screen(self, *, reset_cursor: bool = False) -> None:
+    def _reset_screen(self, *, reset_cursor: bool = False, reset_charset: bool = True) -> None:
         self.grid = [[" "] * self.cols for _ in range(self.rows)]
         self._uncertain = False
         if reset_cursor:
             self.row = 0
             self.col = 0
+            self._scroll_top = 0
+            self._scroll_bottom = self.rows - 1
+            self._reset_sgr()
+        if reset_charset:
             self._g0 = "B"
             self._g1 = "B"
             self._gl = 0
             self._saved_pos = (0, 0)
             self._saved_charset = ("B", "B", 0)
-            self._scroll_top = 0
-            self._scroll_bottom = self.rows - 1
-            self._reset_sgr()
+            self._saved_sgr = (False, None, None)
 
     def _erase_display(self, mode: int) -> None:
         if mode in (2, 3):
-            self._reset_screen(reset_cursor=False)
+            self._reset_screen(reset_cursor=False, reset_charset=False)
             return
         if mode == 0:
             for c in range(self.col, self.cols):
@@ -341,7 +358,18 @@ class _TerminalScreen:
         self.row = 0
         self.col = 0
 
-    def _handle_mode_csi(self, params: str) -> None:
+    def _handle_alt_screen_mode(self, mode: str, final: str) -> None:
+        if mode == "1049":
+            if final == "h":
+                self._save_cursor()
+                self._reset_screen(reset_cursor=True, reset_charset=False)
+            else:
+                self._reset_screen(reset_cursor=False, reset_charset=False)
+                self._restore_cursor()
+            return
+        self._reset_screen(reset_cursor=True, reset_charset=False)
+
+    def _handle_mode_csi(self, params: str, final: str) -> None:
         if not params.startswith("?"):
             self._uncertain = True
             return
@@ -349,11 +377,16 @@ class _TerminalScreen:
         if not modes:
             self._uncertain = True
             return
-        if any(m in _ALT_SCREEN_MODES for m in modes):
-            self._reset_screen(reset_cursor=True)
-            return
-        if not all(m in _SAFE_DEC_MODES for m in modes):
-            self._uncertain = True
+        for mode in modes:
+            if mode in _ALT_SCREEN_MODES:
+                self._handle_alt_screen_mode(mode, final)
+            elif mode == "1048":
+                if final == "h":
+                    self._save_cursor()
+                else:
+                    self._restore_cursor()
+            elif mode not in _SAFE_DEC_MODES:
+                self._uncertain = True
 
     def _handle_edit_csi(self, final: str, first: int) -> bool:
         count = first or 1
@@ -471,7 +504,7 @@ class _TerminalScreen:
         if final == "q" and params.endswith(" "):
             return
         if final in ("h", "l"):
-            self._handle_mode_csi(params)
+            self._handle_mode_csi(params, final)
             return
         if any(ch not in "0123456789;" for ch in params):
             self._uncertain = True
@@ -484,9 +517,9 @@ class _TerminalScreen:
         elif final == "r":
             self._set_scroll_margins(nums)
         elif final == "s":
-            self._saved_pos = (self.row, self.col)
+            self._save_cursor()
         elif final == "u":
-            self.row, self.col = self._saved_pos
+            self._restore_cursor()
         else:
             self._uncertain = True
 
@@ -533,13 +566,11 @@ class _TerminalScreen:
 
     def _consume_two_byte_escape(self, nxt: str) -> bool:
         if nxt == "c":
-            self._reset_screen(reset_cursor=True)
+            self._reset_screen(reset_cursor=True, reset_charset=True)
         elif nxt == "7":
-            self._saved_pos = (self.row, self.col)
-            self._saved_charset = (self._g0, self._g1, self._gl)
+            self._save_cursor()
         elif nxt == "8":
-            self.row, self.col = self._saved_pos
-            self._g0, self._g1, self._gl = self._saved_charset
+            self._restore_cursor()
         elif nxt == "D":
             self._linefeed()
         elif nxt == "E":
