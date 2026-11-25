@@ -52,6 +52,7 @@ _ALLOWED_ROLES = frozenset({"user", "assistant", "developer", "system"})
 
 _EVENT_CREATED = "response.created"
 _EVENT_ITEM_ADDED = "response.output_item.added"
+_EVENT_TEXT_DELTA = "response.output_text.delta"
 _EVENT_TEXT_DONE = "response.output_text.done"
 _EVENT_COMPLETED = "response.completed"
 _DELTA_SUFFIX = ".delta"
@@ -60,7 +61,7 @@ _ALLOWED_STREAM_EVENTS = frozenset({
     _EVENT_CREATED, "response.in_progress", "response.queued",
     _EVENT_ITEM_ADDED, "response.output_item.done",
     "response.content_part.added", "response.content_part.done",
-    "response.output_text.delta", _EVENT_TEXT_DONE,
+    _EVENT_TEXT_DELTA, _EVENT_TEXT_DONE,
     "response.refusal.delta", "response.refusal.done",
     "response.function_call_arguments.delta", "response.function_call_arguments.done",
     "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
@@ -108,6 +109,7 @@ class ParsedRequest:
     body: dict | None = None
     model: str | None = None
     allowed_tools: frozenset[str] = frozenset()
+    raw_body: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -474,7 +476,7 @@ def parse_worker_request(raw: bytes, *, expected_token: str, allowed_models: fro
     _apply_optional_scalars(data, sanitized)
     _apply_optional_structures(data, sanitized)
     allowed_tools = _resolve_allowed_tools(sanitized)
-    return ParsedRequest(route="responses", body=sanitized, model=model, allowed_tools=allowed_tools)
+    return ParsedRequest(route="responses", body=sanitized, model=model, allowed_tools=allowed_tools, raw_body=body)
 
 
 def _check_moderation_or_metadata(low: str, value) -> None:
@@ -700,6 +702,9 @@ class SessionStreamProjector:
         self._non_tool_indices: set[int] = set()
         self._saw_refusal = False
         self._completed_seen = False
+        self.tool_calls = 0
+        self._streamed_text_deltas: list[str] = []
+        self.completed_assistant_text: str | None = None
 
     def _buffer_frame(self, frame: bytes) -> None:
         self._buffered_bytes += len(frame)
@@ -906,6 +911,8 @@ class SessionStreamProjector:
             field = "refusal"
         if type(event.get(field)) is not str:
             raise StreamAborted("invalid_delta")
+        if kind == _EVENT_TEXT_DELTA:
+            self._streamed_text_deltas.append(event[field])
         payload[field] = event[field]
         self._attach_content_fields(event, payload)
         return sse_frame(kind, payload), False
@@ -975,7 +982,7 @@ class SessionStreamProjector:
         payload: dict = {"type": kind}
         if "output_index" in event:
             payload["output_index"] = _valid_index(event["output_index"])
-        if kind in ("response.output_text.delta", "response.refusal.delta",
+        if kind in (_EVENT_TEXT_DELTA, "response.refusal.delta",
                     _EVENT_TEXT_DONE, "response.refusal.done"):
             return self._project_text_event(kind, event, payload)
         if kind in ("response.content_part.added", "response.content_part.done"):
@@ -1043,9 +1050,21 @@ class SessionStreamProjector:
         self._completed_tool_calls = {
             idx: item for idx, item in enumerate(projected_resp["output"]) if item["type"] == "function_call"
         }
+        self.tool_calls = len(self._completed_tool_calls)
+        self.completed_assistant_text = "".join(
+            part["text"]
+            for item in projected_resp["output"]
+            if item.get("type") == "message"
+            for part in item.get("content", ())
+            if part.get("type") == "output_text" and isinstance(part.get("text"), str)
+        )
         self._buffer_frame(sse_frame(_EVENT_COMPLETED, {"type": _EVENT_COMPLETED, "response": projected_resp}))
         self._completed_seen = True
         return []
+
+    @property
+    def streamed_assistant_text(self) -> str:
+        return "".join(self._streamed_text_deltas)
 
     def _validate_event_kind(self, event) -> str:
         self.events_seen += 1

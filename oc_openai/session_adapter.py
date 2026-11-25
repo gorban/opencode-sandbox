@@ -23,6 +23,7 @@ from .connection import ConnectionError
 from .exposure import ExposureError, ExposureLedger
 from .live import make_backend
 from .profiles import Profile, ProfileError
+from .proof_gate import ClosedProofSlotGate
 from .session_broker import (
     SessionBroker,
     SessionPolicy,
@@ -55,8 +56,9 @@ class OpenAISessionAdapter:
 
     kind: ProviderId = "openai"
 
-    def __init__(self, backend=None):
+    def __init__(self, backend=None, *, proof_gate=None):
         self._backend = backend
+        self._proof_gate = proof_gate
 
     def _get_backend(self):
         if self._backend is None:
@@ -196,18 +198,35 @@ class OpenAISessionAdapter:
             models=preflight.models,
         )
 
+    def _select_slot_proof_gate(self, scoped_id: str, job: _SessionJob, *, discovery_only: bool):
+        if self._proof_gate is None:
+            return None
+        if scoped_id != self._proof_gate.approval.scoped_provider_id:
+            return ClosedProofSlotGate(scoped_id)
+        if discovery_only:
+            return ClosedProofSlotGate(scoped_id, refusal_code="proof_gate_not_armed")
+        self._proof_gate.bind_incarnation(job.incarnation, job.generation)
+        return self._proof_gate
+
+    @staticmethod
+    def _teardown_slot_resources(job: _SessionJob, broker: SessionBroker | None, lease_cm) -> None:
+        cleanup_error: Exception | None = None
+        for step in (
+            job.revoke,
+            (broker.close if broker is not None else None),
+            (lambda: lease_cm.__exit__(None, None, None)),
+        ):
+            if step is None:
+                continue
+            try:
+                step()
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
+        if cleanup_error is not None:
+            raise cleanup_error
+
     @contextmanager
-    def open_slot(
-        self,
-        preflight: InstancePreflight,
-        *,
-        slot_index: int,
-        slot_root: Path,
-        port: int,
-        worker_token: str,
-        acknowledged_exposure_digest: str | None,
-        on_revoke: Callable[[int], None],
-    ):
+    def _open_slot_phase(self, preflight: InstancePreflight, cfg: dict[str, object], *, discovery_only: bool):
         backend = self._get_backend()
         target = preflight.handle
         if not isinstance(target, _OpenAISlotTarget):
@@ -216,21 +235,51 @@ class OpenAISessionAdapter:
         if profile.client_id is None:
             raise ProviderIntegrityError("invalid_slot_handle", "OpenAI registration is not published.")
 
+        slot_index = int(cfg["slot_index"])
+        slot_root = Path(cfg["slot_root"])
+        port = int(cfg["port"])
+        worker_token = str(cfg["worker_token"])
+        acknowledged_exposure_digest = cfg["acknowledged_exposure_digest"]
+        on_revoke = cfg["on_revoke"]
+
         slot_root.mkdir(mode=0o700, exist_ok=True)
         job = _SessionJob(slot_root, "inc_" + secrets.token_hex(16))
         job.prepare(config_payload=None)
-        release_state = {"allowed": True}
-        lease_cm = backend.profile_session_lease(
-            profile.label,
-            profile.epoch,
-            target.binding,
-            job,
-            directory=profile.directory,
-            client_id=profile.client_id,
-            release_gate=lambda: release_state["allowed"],
+        slot_proof_gate = self._select_slot_proof_gate(
+            preflight.spec.scoped_id, job, discovery_only=discovery_only,
         )
+        release_state: dict[str, object] = {"allowed": True, "outcome": None}
+
+        def record_release(outcome: str) -> None:
+            release_state["outcome"] = outcome
+
+        if hasattr(backend, "profile_session_lease_with_result"):
+            lease_cm = backend.profile_session_lease_with_result(
+                profile,
+                target.binding,
+                job,
+                release_gate=lambda: bool(release_state["allowed"]),
+                on_release_result=record_release,
+            )
+            has_release_result = True
+        else:
+            lease_cm = backend.profile_session_lease(
+                profile.label,
+                profile.epoch,
+                target.binding,
+                job,
+                directory=profile.directory,
+                client_id=profile.client_id,
+                release_gate=lambda: bool(release_state["allowed"]),
+            )
+            has_release_result = False
         lease = lease_cm.__enter__()
         broker: SessionBroker | None = None
+        defer_turn_bind = (
+            self._proof_gate is not None
+            and not discovery_only
+            and slot_proof_gate is self._proof_gate
+        )
         try:
             broker = SessionBroker(
                 socket_path=job.provider_socket,
@@ -253,6 +302,8 @@ class OpenAISessionAdapter:
                         profile.label, profile.epoch, directory=profile.directory, client_id=profile.client_id,
                     ),
                     on_revoke=lambda: on_revoke(slot_index),
+                    proof_gate=slot_proof_gate,
+                    job_incarnation=job.incarnation,
                 ),
             )
             broker.start()
@@ -264,6 +315,10 @@ class OpenAISessionAdapter:
                     slot_index=slot_index,
                     port=port,
                     provider_label=preflight.spec.qualified_name,
+                    relay_name_override=(
+                        f"{spec['pod']}-relay-disc-{slot_index}" if discovery_only else None
+                    ),
+                    defer_bind=defer_turn_bind,
                 )
 
             def mark_relay_created() -> None:
@@ -271,6 +326,9 @@ class OpenAISessionAdapter:
 
             def confirm_relay_removed() -> None:
                 release_state["allowed"] = True
+
+            def lease_release_confirmed() -> bool:
+                return release_state["outcome"] in ("removed", "absent")
 
             yield SlotHandle(
                 slot_index=slot_index,
@@ -283,21 +341,57 @@ class OpenAISessionAdapter:
                 build_relay_args=build_relay_args,
                 mark_relay_created=mark_relay_created,
                 confirm_relay_removed=confirm_relay_removed,
+                lease_release_confirmed=(
+                    lease_release_confirmed
+                    if (has_release_result or self._proof_gate is not None)
+                    else None
+                ),
             )
         finally:
-            cleanup_error: Exception | None = None
-            try:
-                job.revoke()
-            except Exception as exc:
-                cleanup_error = cleanup_error or exc
-            if broker is not None:
-                try:
-                    broker.close()
-                except Exception as exc:
-                    cleanup_error = cleanup_error or exc
-            try:
-                lease_cm.__exit__(None, None, None)
-            except Exception as exc:
-                cleanup_error = cleanup_error or exc
-            if cleanup_error is not None:
-                raise cleanup_error
+            self._teardown_slot_resources(job, broker, lease_cm)
+
+    @contextmanager
+    def open_slot(
+        self,
+        preflight: InstancePreflight,
+        *,
+        slot_index: int,
+        slot_root: Path,
+        port: int,
+        worker_token: str,
+        acknowledged_exposure_digest: str | None,
+        on_revoke: Callable[[int], None],
+    ):
+        cfg = {
+            "slot_index": slot_index,
+            "slot_root": slot_root,
+            "port": port,
+            "worker_token": worker_token,
+            "acknowledged_exposure_digest": acknowledged_exposure_digest,
+            "on_revoke": on_revoke,
+        }
+        with self._open_slot_phase(preflight, cfg, discovery_only=False) as handle:
+            yield handle
+
+    @contextmanager
+    def open_discovery_slot(
+        self,
+        preflight: InstancePreflight,
+        *,
+        slot_index: int,
+        slot_root: Path,
+        port: int,
+        worker_token: str,
+        acknowledged_exposure_digest: str | None,
+        on_revoke: Callable[[int], None],
+    ):
+        cfg = {
+            "slot_index": slot_index,
+            "slot_root": slot_root,
+            "port": port,
+            "worker_token": worker_token,
+            "acknowledged_exposure_digest": acknowledged_exposure_digest,
+            "on_revoke": on_revoke,
+        }
+        with self._open_slot_phase(preflight, cfg, discovery_only=True) as handle:
+            yield handle

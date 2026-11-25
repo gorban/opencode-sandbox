@@ -200,11 +200,46 @@ def _spawn_peer(listener: socket.socket, lease: relay.Lease, slots: threading.Bo
         client.close()
 
 
-def serve(lease: relay.Lease, proof: bytes, port: int = 8401) -> None:
+def _wait_until_active(lease: relay.Lease) -> bool:
+    """Wait while a deferred-bind lease is pending; return True iff it became active."""
+    while True:
+        status = lease.status()
+        if status == "terminal":
+            return False
+        if status == "active":
+            return True
+        time.sleep(relay.GRANT_POLL)
+
+
+def _run_accept_loop(
+    listener: socket.socket,
+    lease: relay.Lease,
+    slots: threading.BoundedSemaphore,
+    peers: set[socket.socket],
+    peers_lock: threading.Lock,
+    handle,
+    *,
+    was_active: bool,
+) -> None:
+    with selectors.DefaultSelector() as selector:
+        selector.register(listener, selectors.EVENT_READ)
+        while True:
+            status = lease.status()
+            if status == "terminal" or (was_active and status != "active"):
+                break
+            was_active = status == "active"
+            for _, _ in selector.select(relay.GRANT_POLL):
+                _spawn_peer(listener, lease, slots, peers, peers_lock, handle)
+
+
+def serve(lease: relay.Lease, proof: bytes, port: int = 8401, *, defer_bind: bool = False) -> None:
     if type(port) is not int or not RELAY_PORT_MIN <= port <= RELAY_PORT_MAX:
         raise RelayError("invalid relay port")
     os.umask(0o077)
-    if lease.status() == "terminal":
+    if defer_bind:
+        if not _wait_until_active(lease):
+            return
+    elif lease.status() == "terminal":
         return
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -226,16 +261,7 @@ def serve(lease: relay.Lease, proof: bytes, port: int = 8401) -> None:
                     slots.release()
 
         try:
-            with selectors.DefaultSelector() as selector:
-                selector.register(listener, selectors.EVENT_READ)
-                was_active = False
-                while True:
-                    status = lease.status()
-                    if status == "terminal" or (was_active and status != "active"):
-                        break
-                    was_active = status == "active"
-                    for _, _ in selector.select(relay.GRANT_POLL):
-                        _spawn_peer(listener, lease, slots, peers, peers_lock, handle)
+            _run_accept_loop(listener, lease, slots, peers, peers_lock, handle, was_active=defer_bind)
         finally:
             with peers_lock:
                 for client in peers:
@@ -244,18 +270,23 @@ def serve(lease: relay.Lease, proof: bytes, port: int = 8401) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (4, 5):
+    if len(sys.argv) not in (4, 5, 6):
         sys.exit("Invalid session relay arguments")
     bind_port = 8401
-    if len(sys.argv) == 5:
+    defer_bind = False
+    if len(sys.argv) >= 5:
         if not sys.argv[4].isdecimal():
             sys.exit("Invalid session relay port")
         bind_port = int(sys.argv[4])
         if not RELAY_PORT_MIN <= bind_port <= RELAY_PORT_MAX:
             sys.exit("Invalid session relay port")
+    if len(sys.argv) == 6:
+        if sys.argv[5] != "--defer-bind":
+            sys.exit("Invalid session relay arguments")
+        defer_bind = True
     active = relay.grant_record(sys.argv[1], int(sys.argv[2]), True)
     with relay.PROOF.open("rb") as file:
         secret = file.read(relay.PROOF_SIZE + 1)
     if len(secret) != relay.PROOF_SIZE:
         sys.exit("Relay proof is missing or invalid")
-    serve(relay.Lease(relay.GRANT, active, int(sys.argv[3])), secret, port=bind_port)
+    serve(relay.Lease(relay.GRANT, active, int(sys.argv[3])), secret, port=bind_port, defer_bind=defer_bind)

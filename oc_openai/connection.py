@@ -442,8 +442,43 @@ class Connection:
                     record.pop("worker_lease")
                     self._store.write(directory, record)
 
+    @staticmethod
+    def _registration_matches_or_empty(record, binding) -> bool:
+        if not record:
+            return True
+        same_identity = (
+            record.get("profile") == binding.profile
+            and (binding.client is None or record.get("client") == binding.client)
+        )
+        if not same_identity:
+            return False
+        return record.get("generation") == binding.generation or "tokens" not in record
+
+    def _release_session_lease_locked(self, directory, binding, lease, lease_record) -> str:
+        if directory is None:
+            return "retained_store_unavailable"
+        record = self._store.read(directory)
+        single = record.get("worker_lease")
+        if isinstance(single, dict) and single.get("root") == lease.root:
+            return "retained_conflict"
+        leases = record.get("worker_leases")
+        if isinstance(leases, dict) and leases.get(lease.root) == lease_record:
+            lease.confirm_terminal()
+            leases = dict(leases)
+            leases.pop(lease.root, None)
+            if leases:
+                record["worker_leases"] = leases
+            else:
+                record.pop("worker_leases", None)
+            self._store.write(directory, record)
+            return "removed"
+        root_absent = leases is None or (isinstance(leases, dict) and lease.root not in leases)
+        if root_absent and self._registration_matches_or_empty(record, binding):
+            return "absent"
+        return "retained_conflict"
+
     @contextlib.contextmanager
-    def session_lease(self, binding, job, *, release_gate=None):
+    def session_lease(self, binding, job, *, release_gate=None, on_release_result=None):
         """Register one concurrent interactive session lease (bounded to MAX_WORKER_LEASES)."""
         lease = WorkerLease.capture(job, self._host_probe())
         lease_record = lease.record()
@@ -459,19 +494,12 @@ class Connection:
         try:
             yield lease
         finally:
+            outcome = "retained_gate_closed"
             if release_gate is None or release_gate():
                 with self._store.locked() as directory:
-                    record = self._store.read(directory)
-                    leases = record.get("worker_leases")
-                    if isinstance(leases, dict) and leases.get(lease.root) == lease_record:
-                        lease.confirm_terminal()
-                        leases = dict(leases)
-                        leases.pop(lease.root, None)
-                        if leases:
-                            record["worker_leases"] = leases
-                        else:
-                            record.pop("worker_leases", None)
-                        self._store.write(directory, record)
+                    outcome = self._release_session_lease_locked(directory, binding, lease, lease_record)
+            if on_release_result is not None:
+                on_release_result(outcome)
 
     @contextlib.contextmanager
     def _operation(self, generation, check, *, timeout=REQUEST_SECONDS,

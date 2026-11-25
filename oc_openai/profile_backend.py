@@ -178,13 +178,17 @@ class ProfileBackend:
         return _fence()
 
     @contextmanager
-    def _acquire_session_lease(self, acquire_via, binding, job, *, release_gate=None):
+    def _acquire_session_lease(
+        self, acquire_via, binding, job, *, release_gate=None, on_release_result=None,
+    ):
         if not self._reviewed:
             raise RouteUnavailable(Reason.QUALIFICATION)
 
         def acquire(profile):
             conn = self._connection(profile.directory)
-            lease_cm = conn.session_lease(binding, job, release_gate=release_gate)
+            lease_cm = conn.session_lease(
+                binding, job, release_gate=release_gate, on_release_result=on_release_result,
+            )
             try:
                 return lease_cm, lease_cm.__enter__()
             except ConnectionError as error:
@@ -221,6 +225,24 @@ class ProfileBackend:
             binding,
             job,
             release_gate=release_gate,
+        )
+
+    def profile_session_lease_with_result(
+        self, profile, binding, job, *, release_gate=None, on_release_result=None,
+    ):
+        """Acquire a named profile session lease and report its store-locked release outcome."""
+        return self._acquire_session_lease(
+            lambda acquire: self.profiles.with_profile(
+                profile.label,
+                profile.epoch,
+                acquire,
+                directory=profile.directory,
+                client_id=profile.client_id,
+            ),
+            binding,
+            job,
+            release_gate=release_gate,
+            on_release_result=on_release_result,
         )
 
     def selected_fence(self, label, selection_epoch):
