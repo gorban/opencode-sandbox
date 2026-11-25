@@ -3508,6 +3508,51 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 shell_driver._feed_pty_bytes(scr, dec, raw_payload, final=False)
                 self.assertFalse(scr.is_certain)
                 self.assertEqual(scr.render(), "")
+                # Subsequent clear-screen escape in a later chunk must NOT clear sticky stream invalidation!
+                shell_driver._feed_pty_bytes(
+                    scr, dec, f"\x1b[2J\x1b[Hopenai--personal/{TEST_MODEL}\x07".encode("ascii"), final=False,
+                )
+                self.assertFalse(scr.is_certain)
+                self.assertEqual(scr.render(), "")
+
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(f"\ufffd0;openai--personal/{TEST_MODEL}", approval),
+            )
+
+            # Cursor-positioned TUI reply (\x1b[row;colH) must preserve row boundaries and observe "ok"!
+            gate_cursor = SimpleNamespace(
+                approval=approval,
+                admitted_writes=0,
+                exact_ok_delivered=False,
+            )
+            armed_cursor: list[tuple[str, str]] = []
+            cursor_tui_child = (
+                "import sys, time; "
+                f"sys.stdout.write('\\x1b[1;1Hopenai--personal/{TEST_MODEL}\\n'); sys.stdout.flush(); "
+                "line = sys.stdin.readline(); "
+                f"sys.stdout.write('\\x1b[10;1HAssistant\\x1b[11;1Hok\\x1b[12;1H{TEST_MODEL}'); "
+                "sys.stdout.flush(); time.sleep(0.9)"
+            )
+
+            def _arm_and_deliver(row: str, dig: str) -> None:
+                armed_cursor.append((row, dig))
+                gate_cursor.admitted_writes = 1
+                gate_cursor.exact_ok_delivered = True
+
+            with (
+                patch.object(
+                    shell_driver,
+                    "_agent_start_command",
+                    return_value=([sys.executable, "-IB", "-c", cursor_tui_child], dict(os.environ)),
+                ),
+                patch.object(shell_driver.time, "sleep"),
+            ):
+                pty_cursor_out: dict[str, bool] = {}
+                shell_driver._drive_agent_pty(
+                    TEST_HEX_A, threading.Event(), gate_cursor, _arm_and_deliver, outcome=pty_cursor_out,
+                )
+            self.assertEqual(len(armed_cursor), 1)
+            self.assertTrue(pty_cursor_out["reply_observed"])
 
             utf8_c1 = ("\x9d0;" + ("q" * 300) + f"openai--personal/{TEST_MODEL}\x9c").encode("utf-8")
             scr_u = shell_driver._TerminalScreen()

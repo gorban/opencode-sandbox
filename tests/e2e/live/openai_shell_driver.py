@@ -176,6 +176,7 @@ class _TerminalScreen:
         self.grid = [[" "] * cols for _ in range(rows)]
         self._pending = ""
         self._uncertain = False
+        self._stream_invalid = False
         self._ctrl_state: str | None = None
         self._ctrl_esc_seen = False
         self._concealed = False
@@ -184,10 +185,24 @@ class _TerminalScreen:
 
     @property
     def is_certain(self) -> bool:
-        return not self._uncertain and not self._pending and self._ctrl_state is None
+        return (
+            not self._stream_invalid
+            and not self._uncertain
+            and not self._pending
+            and self._ctrl_state is None
+        )
 
     def invalidate(self) -> None:
+        self._stream_invalid = True
         self._uncertain = True
+
+    def sync_sgr_from(self, other: "_TerminalScreen") -> None:
+        self._concealed = other._concealed
+        self._fg = other._fg
+        self._bg = other._bg
+        if other._stream_invalid:
+            self._stream_invalid = True
+            self._uncertain = True
 
     def _reset_sgr(self) -> None:
         self._concealed = False
@@ -462,7 +477,7 @@ class _TerminalScreen:
 
     def _put_char(self, ch: str) -> None:
         if ch == "\ufffd" or 0x80 <= ord(ch) <= 0x9F:
-            self._uncertain = True
+            self.invalidate()
             return
         if ch == "\r":
             self.col = 0
@@ -572,6 +587,8 @@ class _TerminalScreen:
         return False
 
     def feed(self, text: str) -> None:
+        if self._stream_invalid:
+            return
         data = self._pending + text
         self._pending = ""
         idx = 0
@@ -885,15 +902,6 @@ def _read_pty_bytes(master_fd: int, timeout: float) -> bytes | None:
     return bytes(chunks)
 
 
-def _append_bounded(buf: bytearray, chunk: bytes) -> None:
-    if len(buf) + len(chunk) <= _SCREEN_CAP:
-        buf.extend(chunk)
-        return
-    keep = _SCREEN_CAP - len(chunk)
-    del buf[:-keep if keep > 0 else len(buf)]
-    buf.extend(chunk[-_SCREEN_CAP:])
-
-
 _ANY_SCOPED_RE = re.compile(r"(?<![A-Za-z0-9_-])openai--[a-z0-9][a-z0-9-]*(?![A-Za-z0-9_-])")
 _ANY_DISPLAY_LABEL_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(?:ChatGPT\s+Subscription|OpenAI)\s*\(([a-z0-9][a-z0-9-]*)\)(?![A-Za-z0-9_-])"
@@ -962,9 +970,19 @@ def _screen_has_conflicting_route(lines: list[str], approval: ProofApproval, mod
     return False
 
 
+def _needs_terminal_render(text: str) -> bool:
+    return (
+        "\x1b" in text
+        or "\r" in text
+        or "\b" in text
+        or "\ufffd" in text
+        or any(0x80 <= ord(ch) <= 0x9F for ch in text)
+    )
+
+
 def extract_observed_route_row(clean: str, approval: ProofApproval) -> str | None:
     """Return an unambiguous currently rendered route row matching approved provider and model."""
-    rendered = render_terminal_screen(clean) if ("\x1b" in clean or "\r" in clean or "\b" in clean) else clean
+    rendered = render_terminal_screen(clean) if _needs_terminal_render(clean) else clean
     esc_model = re.escape(approval.approved_model)
     esc_scoped = re.escape(approval.scoped_provider_id)
     esc_label = re.escape(approval.instance_label)
@@ -1085,6 +1103,14 @@ def _step_pty_driver(
     return False
 
 
+@dataclass
+class _PtyScreens:
+    main: _TerminalScreen
+    main_decoder: object
+    post: _TerminalScreen
+    post_decoder: object
+
+
 def _feed_pty_bytes(screen: _TerminalScreen, decoder, data: bytes, *, final: bool = False) -> None:
     try:
         decoded = decoder.decode(data, final=final)
@@ -1097,22 +1123,23 @@ def _feed_pty_bytes(screen: _TerminalScreen, decoder, data: bytes, *, final: boo
 
 def _record_final_pty_reply(
     master_fd: int,
-    screen: _TerminalScreen,
-    decoder,
-    post_prompt_buf: bytearray,
+    screens: _PtyScreens,
     proof_gate: ProofGate,
     state: _PtyState,
 ) -> None:
     tail_chunk = _read_pty_bytes(master_fd, 0.05)
     if tail_chunk:
-        _feed_pty_bytes(screen, decoder, tail_chunk, final=False)
+        _feed_pty_bytes(screens.main, screens.main_decoder, tail_chunk, final=False)
         if state.prompt_sent:
-            _append_bounded(post_prompt_buf, tail_chunk)
-    _feed_pty_bytes(screen, decoder, b"", final=True)
+            _feed_pty_bytes(screens.post, screens.post_decoder, tail_chunk, final=False)
+    _feed_pty_bytes(screens.main, screens.main_decoder, b"", final=True)
+    if state.prompt_sent:
+        _feed_pty_bytes(screens.post, screens.post_decoder, b"", final=True)
     if not state.reply_observed and state.prompt_sent and proof_gate.exact_ok_delivered:
-        post_text = strip_ansi(post_prompt_buf.decode("utf-8", errors="replace"))
         model_name = getattr(getattr(proof_gate, "approval", None), "approved_model", "")
-        if _has_new_exact_reply(screen.render(), state.pre_prompt_lines, post_text, approved_model=model_name):
+        if _has_new_exact_reply(
+            screens.main.render(), state.pre_prompt_lines, screens.post.render(), approved_model=model_name,
+        ):
             state.reply_observed = True
 
 
@@ -1139,9 +1166,12 @@ def _drive_agent_pty(
     cmd, env = _agent_start_command(agent_id)
     proc = subprocess.Popen(cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, env=env, close_fds=True)
     os.close(slave_fd)
-    screen = _TerminalScreen(rows=32, cols=120)
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
-    post_prompt_buf = bytearray()
+    screens = _PtyScreens(
+        main=_TerminalScreen(rows=32, cols=120),
+        main_decoder=codecs.getincrementaldecoder("utf-8")(errors="strict"),
+        post=_TerminalScreen(rows=32, cols=120),
+        post_decoder=codecs.getincrementaldecoder("utf-8")(errors="strict"),
+    )
     state = _PtyState()
     started = time.monotonic()
     try:
@@ -1150,12 +1180,13 @@ def _drive_agent_pty(
             if chunk is None:
                 break
             if chunk:
-                _feed_pty_bytes(screen, decoder, chunk, final=False)
+                _feed_pty_bytes(screens.main, screens.main_decoder, chunk, final=False)
                 if state.prompt_sent:
-                    _append_bounded(post_prompt_buf, chunk)
-            rendered = screen.render()
-            post_text = strip_ansi(post_prompt_buf.decode("utf-8", errors="replace")) if state.prompt_sent else ""
-            if _step_pty_driver(
+                    _feed_pty_bytes(screens.post, screens.post_decoder, chunk, final=False)
+            rendered = screens.main.render()
+            post_text = screens.post.render() if state.prompt_sent else ""
+            was_sent = state.prompt_sent
+            done = _step_pty_driver(
                 master_fd,
                 rendered,
                 time.monotonic() - started,
@@ -1163,9 +1194,12 @@ def _drive_agent_pty(
                 arm_turn_route,
                 state,
                 post_prompt_text=post_text,
-            ):
+            )
+            if not was_sent and state.prompt_sent:
+                screens.post.sync_sgr_from(screens.main)
+            if done:
                 break
-        _record_final_pty_reply(master_fd, screen, decoder, post_prompt_buf, proof_gate, state)
+        _record_final_pty_reply(master_fd, screens, proof_gate, state)
         return _wait_or_stop_agent_proc(proc, agent_id)
     finally:
         if outcome is not None:
