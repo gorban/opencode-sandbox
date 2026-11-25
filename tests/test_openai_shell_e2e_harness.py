@@ -3951,6 +3951,42 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertEqual(
                 shell_driver.render_terminal_screen("\x1b(0\x1b[?1049h\x1b(B\x1b[?1049h\x1b[?1049lq").strip(), "─",
             )
+            # Dual screen buffers preserve live main/alt contents across ?1049l, ?1047h/l, and ?47h/l
+            # so conflicting routes and surviving partial-repaint suffixes still visible in xterm are retained.
+            self.assertEqual(
+                shell_driver.render_terminal_screen("panel-old\x1b[?1049h\x1b[?1049l\x1b[1;1Hnew").strip(),
+                "newel-old",
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[?47hpanel-old\x1b[?47h\x1b[1;1Hnew").strip(),
+                "newel-old",
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[?47hpanel-old\x1b[?47l\x1b[?47h\x1b[1;1Hnew").strip(),
+                "newel-old",
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[?1047hpanel-old\x1b[?1047l\x1b[?1047h\x1b[1;1Hnew").strip(),
+                "new",
+            )
+            wide_old = "x" * (len(route_txt) + 5)
+            conflict_txt = f"openai--work/{TEST_MODEL}"
+            for dual_buf_conflict in (
+                f"{conflict_txt}\x1b[?1049l\x1b[2;1H{route_txt}",
+                f"{conflict_txt}\x1b[?1049h\x1b[?1049l\x1b[2;1H{route_txt}",
+                f"\x1b[?1047h{conflict_txt}\x1b[?1047h\x1b[2;1H{route_txt}",
+                f"{conflict_txt}\x1b[?47l\x1b[2;1H{route_txt}",
+                f"{wide_old}\x1b[?1049h\x1b[?1049l\x1b[1;1H{route_txt}",
+                f"\x1b[?47h{wide_old}\x1b[?47h\x1b[1;1H{route_txt}",
+            ):
+                self.assertIsNone(shell_driver.extract_observed_route_row(dual_buf_conflict, approval))
+            # Returning from ?1049h to an uncertain main screen preserves main-screen uncertainty.
+            uncertain_screen = shell_driver._TerminalScreen()
+            uncertain_screen.feed(f"\x1b[?9999h\x1b[?1049h\x1b[?1049l{route_txt}")
+            self.assertFalse(uncertain_screen.is_certain)
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(f"\x1b[?9999h\x1b[?1049h\x1b[?1049l{route_txt}", approval),
+            )
             self.assertIsNone(
                 shell_driver.extract_observed_route_row(
                     f"\x1b(0\x1b[?1049h\x1b(B\x1b7\x1b[?1049l{route_txt}", approval,

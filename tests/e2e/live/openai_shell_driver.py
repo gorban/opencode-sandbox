@@ -187,15 +187,37 @@ class _TerminalScreen:
         self._saved_states: dict[bool, tuple] = {False: default_saved, True: default_saved}
         self._scroll_top = 0
         self._scroll_bottom = rows - 1
-        self.grid = [[" "] * cols for _ in range(rows)]
+        self._grids: dict[bool, list[list[str]]] = {
+            False: self._blank_grid(),
+            True: self._blank_grid(),
+        }
         self._pending = ""
-        self._uncertain = False
+        self._uncertain_by_screen: dict[bool, bool] = {False: False, True: False}
         self._stream_invalid = False
         self._ctrl_state: str | None = None
         self._ctrl_esc_seen = False
         self._concealed = False
         self._fg: tuple[str, int] | tuple[str, int, int, int] | None = None
         self._bg: tuple[str, int] | tuple[str, int, int, int] | None = None
+
+    def _blank_grid(self) -> list[list[str]]:
+        return [[" "] * self.cols for _ in range(self.rows)]
+
+    @property
+    def grid(self) -> list[list[str]]:
+        return self._grids[self._in_alt_screen]
+
+    @grid.setter
+    def grid(self, value: list[list[str]]) -> None:
+        self._grids[self._in_alt_screen] = value
+
+    @property
+    def _uncertain(self) -> bool:
+        return self._uncertain_by_screen[self._in_alt_screen]
+
+    @_uncertain.setter
+    def _uncertain(self, value: bool) -> None:
+        self._uncertain_by_screen[self._in_alt_screen] = value
 
     def _save_cursor(self) -> None:
         self._saved_states[self._in_alt_screen] = (
@@ -221,7 +243,7 @@ class _TerminalScreen:
 
     def invalidate(self) -> None:
         self._stream_invalid = True
-        self._uncertain = True
+        self._uncertain_by_screen = {False: True, True: True}
 
     def sync_sgr_from(self, other: "_TerminalScreen") -> None:
         self._concealed = other._concealed
@@ -232,9 +254,13 @@ class _TerminalScreen:
         self._gl = other._gl
         self._in_alt_screen = other._in_alt_screen
         self._saved_states = dict(other._saved_states)
+        self._uncertain_by_screen = {
+            False: other._uncertain_by_screen[False] if self._in_alt_screen else False,
+            True: other._uncertain_by_screen[True] if not self._in_alt_screen else False,
+        }
         if other._stream_invalid:
             self._stream_invalid = True
-            self._uncertain = True
+            self._uncertain_by_screen = {False: True, True: True}
 
     def _reset_sgr(self) -> None:
         self._concealed = False
@@ -245,7 +271,7 @@ class _TerminalScreen:
         return self._concealed or (self._fg is not None and self._fg == self._bg)
 
     def _reset_screen(self, *, reset_cursor: bool = False, full_reset: bool = True) -> None:
-        self.grid = [[" "] * self.cols for _ in range(self.rows)]
+        self.grid = self._blank_grid()
         self._uncertain = False
         if reset_cursor:
             self.row = 0
@@ -258,6 +284,8 @@ class _TerminalScreen:
             self._g1 = "B"
             self._gl = 0
             self._in_alt_screen = False
+            self._grids = {False: self._blank_grid(), True: self._blank_grid()}
+            self._uncertain_by_screen = {False: False, True: False}
             default_saved = ((0, 0), ("B", "B", 0), (False, None, None))
             self._saved_states = {False: default_saved, True: default_saved}
 
@@ -360,18 +388,23 @@ class _TerminalScreen:
         self.col = 0
 
     def _handle_alt_screen_mode(self, mode: str, final: str) -> None:
-        if mode == "1049":
-            if final == "h":
-                self._save_cursor()
-                self._in_alt_screen = True
-                self._reset_screen(reset_cursor=False, full_reset=False)
-            else:
-                self._in_alt_screen = False
-                self._reset_screen(reset_cursor=False, full_reset=False)
-                self._restore_cursor()
+        if mode == "1049" and final == "h":
+            self._save_cursor()
+            self._in_alt_screen = True
+            self._reset_screen(reset_cursor=False, full_reset=False)
             return
-        self._in_alt_screen = final == "h"
-        self._reset_screen(reset_cursor=False, full_reset=False)
+        if mode == "1049":
+            if self._in_alt_screen:
+                self._reset_screen(reset_cursor=False, full_reset=False)
+                self._in_alt_screen = False
+            self._restore_cursor()
+            return
+        if final == "h":
+            self._in_alt_screen = True
+        elif self._in_alt_screen:
+            if mode == "1047":
+                self._reset_screen(reset_cursor=False, full_reset=False)
+            self._in_alt_screen = False
 
     def _handle_mode_csi(self, params: str, final: str) -> None:
         if not params.startswith("?"):
