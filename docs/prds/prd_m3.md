@@ -144,6 +144,36 @@ Sidebar Tree (3-Level Hierarchy)
     throwaway `safe_run` container on the worker (never running host `git` inside
     `~/opencode-sandbox`), streaming bounded UTF-8 diffs to the right-hand diff drawer. "Open in
     Editor / 3-Way Merge" hands off through `oc-bridge.py` (`openat(O_NOFOLLOW)` staging).
+- **Agent-Assisted Dashboard Control ([UI SDK](https://ui-sdk.dev) & `data-agent-confirm`):**
+  - Evaluate integrating Vercel Labs' open-source **UI SDK** (`vercel-labs/ui`, Apache-2.0, Svelte
+    adapter `@ui-sdk/svelte/agent`) behind a thin local adapter in the shared SvelteKit SPA so an
+    authorized assistant/orchestrator (`-o`) can inspect view state (`snapshot()` / `query()`) and
+    drive safe dashboard navigation (`act()`) across both [M3a loopback web](prd_m3a.md) and
+    [M3b Tauri desktop](prd_m3b.md) without brittle screenshots or arbitrary JS execution.
+  - **Asymmetric confirmation via `data-agent-confirm`:** Annotate every protected control in
+    advance with `data-agent-confirm="<impact summary>"` (e.g., revoking grants, stopping,
+    restarting or deleting a sandbox, changing active provider/model/fallback settings, exporting
+    diffs, or toggling input control). A normal human click follows the ordinary UI flow without an
+    extra prompt. When an agent triggers that same control through UI SDK
+    (`details.source === "agent"`), the `allow` callback intercepts `step.confirm` and pops up a
+    **human confirmation modal in Trusted Host Chrome** showing the exact action, target,
+    parameters, and impact summary — requiring an explicit human click before execution even when a
+    direct human click would not prompt. Without an `allow` handler, or on human cancel/timeout,
+    the action fails closed.
+  - **Defense in depth & self-approval prevention:**
+    - Mark the confirmation modal itself, the **Approval Inbox** (approve/deny controls), provider
+      sign-in/credential flows, and auth/bootstrap chrome with **`data-agent-hidden`** so an agent
+      cannot inspect or click "Confirm" on its own confirmation dialog or approve its own
+      `oc_controller` request. Mark sensitive displayed values with **`data-agent-secret`**
+      (`[redacted]`).
+    - Confirmation dialogs accept only trusted human input (rejecting agent-originated or synthetic
+      events), bind to the exact action, target, and active session generation (auto-cancelling on
+      logout, expiry, reconnect, or target state drift), and never replace backend `oc_daemon`,
+      `oc_controller`, or Tauri Rust IPC authorization checks.
+    - Keep the UI SDK bridge strictly scoped to host-authorized orchestrator sessions via
+      `oc_daemon` — never exposed to untrusted sandbox containers or null-origin PTY/Browser
+      iframes (`connect-src 'none'`). Pin any `@ui-sdk/*` npm package and verify its Apache-2.0
+      license and lockfile integrity via `mise` ([prd_f](prd_f.md)).
 
 ### 4. Confined embedded PTY emulation, allowlist ANSI scrubber, and `MessageChannel` bridge
 
@@ -560,6 +590,15 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
   7. Navigation fixtures drop a frame while the URL and TLS state change. Verify the UI pairs
      only the matching image, navigation ID, and observed TLS state and shows `unknown` when
      same-document TLS evidence is unavailable.
+  8. Agent UI SDK confirmation & isolation fixtures verify: (a) a direct human click on a
+     `data-agent-confirm` control executes without an extra agent modal, whereas an agent `act()`
+     call on the exact same control pauses and opens the Trusted Chrome human confirmation modal;
+     (b) cancelling or omitting `allow` fails closed with zero mutation; (c) the confirmation
+     modal, Approval Inbox controls, and provider sign-in controls are `data-agent-hidden` so an
+     agent cannot see or self-confirm them, and `data-agent-secret` fields redact in snapshots;
+     (d) session logout/expiry cancels any pending confirmation modal and discards late replies;
+     and (e) host `oc_daemon` / `oc_controller` / Tauri Rust IPC still refuse unauthorized calls
+     even if DOM attributes are tampered with.
 
 ## Concrete gaps and checkboxes
 
@@ -588,3 +627,12 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
       composable `builtin/browser-axi` / `builtin/browser-devtools-mcp` /
       `builtin/browser-playwright-mcp` bundles (after `mise.lock` pinning & license check), and
       Pattern 4 in `orchestrator_skills/oc-sandbox-authoring/SKILL.md`.
+- [ ] **Gap M3.5 — Agent-assisted dashboard UI bridge ([UI SDK](https://ui-sdk.dev) &
+      `data-agent-confirm`):** annotate protected SvelteKit dashboard controls in advance with
+      `data-agent-confirm` (and approval/auth/confirmation chrome with `data-agent-hidden` and
+      sensitive fields with `data-agent-secret`), wire a host-brokered UI SDK agent bridge
+      (`@ui-sdk/svelte/agent`, Apache-2.0, pinned via lockfile, or equivalent thin adapter) shared
+      across [M3a loopback](prd_m3a.md) and [M3b Tauri](prd_m3b.md), enforce trusted human
+      confirmation popups on agent-triggered protected actions (even when direct human clicks skip
+      confirmation), bind modals to the session-generation fence, and keep authoritative
+      authorization in `oc_daemon` / `oc_controller` / Tauri Rust IPC.
