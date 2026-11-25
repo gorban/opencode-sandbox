@@ -116,6 +116,7 @@ def strip_ansi(text: str) -> str:
 
 _CSI_TOKEN_RE = re.compile(r"\x1b\[([0-?]*[ -/]*)([@-~])")
 _ALT_SCREEN_MODES = frozenset({"47", "1047", "1049"})
+_GEOMETRY_DEC_MODES = frozenset({"3", "6", "40", "69"})
 _SAFE_DEC_MODES = frozenset({"1", "12", "25", "1000", "1002", "1003", "1004", "1006", "2004", "2026", "2027"})
 _SAFE_XTWINOPS = frozenset({14, 15, 16, 18, 19, 20, 21, 22, 23})
 _CURSOR_MOVES = frozenset({"H", "f", "A", "B", "C", "D", "E", "F", "G", "d"})
@@ -180,12 +181,13 @@ class _TerminalScreen:
         self.cols = cols
         self.row = 0
         self.col = 0
+        self._wrap_pending = False
         self._g0 = "B"
         self._g1 = "B"
         self._gl = 0
         self._autowrap = True
         self._in_alt_screen = False
-        default_saved = ((0, 0), ("B", "B", 0), (False, None, None), True)
+        default_saved = ((0, 0), False, ("B", "B", 0), (False, None, None))
         self._saved_states: dict[bool, tuple] = {False: default_saved, True: default_saved}
         self._scroll_top = 0
         self._scroll_bottom = rows - 1
@@ -224,17 +226,17 @@ class _TerminalScreen:
     def _save_cursor(self) -> None:
         self._saved_states[self._in_alt_screen] = (
             (self.row, self.col),
+            self._wrap_pending,
             (self._g0, self._g1, self._gl),
             (self._concealed, self._fg, self._bg),
-            self._autowrap,
         )
 
     def _restore_cursor(self) -> None:
-        pos, charset, sgr, autowrap = self._saved_states[self._in_alt_screen]
+        pos, wrap_pending, charset, sgr = self._saved_states[self._in_alt_screen]
         self.row, self.col = pos
+        self._wrap_pending = wrap_pending
         self._g0, self._g1, self._gl = charset
         self._concealed, self._fg, self._bg = sgr
-        self._autowrap = autowrap
 
     @property
     def is_certain(self) -> bool:
@@ -278,6 +280,7 @@ class _TerminalScreen:
     def _reset_screen(self, *, reset_cursor: bool = False, full_reset: bool = True) -> None:
         self.grid = self._blank_grid()
         self._uncertain = False
+        self._wrap_pending = False
         if reset_cursor:
             self.row = 0
             self.col = 0
@@ -292,7 +295,7 @@ class _TerminalScreen:
             self._in_alt_screen = False
             self._grids = {False: self._blank_grid(), True: self._blank_grid()}
             self._uncertain_by_screen = {False: False, True: False}
-            default_saved = ((0, 0), ("B", "B", 0), (False, None, None), True)
+            default_saved = ((0, 0), False, ("B", "B", 0), (False, None, None))
             self._saved_states = {False: default_saved, True: default_saved}
 
     def _erase_display(self, mode: int) -> None:
@@ -334,6 +337,7 @@ class _TerminalScreen:
         return [int(part) if part.isdigit() else 0 for part in clean.split(";")]
 
     def _move_cursor(self, final: str, nums: list[int]) -> None:
+        self._wrap_pending = False
         n1 = nums[0] if nums and nums[0] > 0 else 1
         n2 = nums[1] if len(nums) > 1 and nums[1] > 0 else 1
         if final in ("H", "f"):
@@ -394,6 +398,7 @@ class _TerminalScreen:
             self._scroll_bottom = bottom
         self.row = 0
         self.col = 0
+        self._wrap_pending = False
 
     def _handle_alt_screen_mode(self, mode: str, final: str) -> None:
         if mode == "1049" and final == "h":
@@ -422,6 +427,8 @@ class _TerminalScreen:
                 self._save_cursor()
             else:
                 self._restore_cursor()
+        elif mode in _GEOMETRY_DEC_MODES:
+            self.invalidate()
         elif mode not in _SAFE_DEC_MODES:
             self._uncertain = True
 
@@ -562,8 +569,11 @@ class _TerminalScreen:
             self._move_cursor(final, nums)
         elif final == "r":
             self._set_scroll_margins(nums)
-        elif not params and final == "s":
-            self._save_cursor()
+        elif final == "s":
+            if not params:
+                self._save_cursor()
+            else:
+                self.invalidate()
         elif not params and final == "u":
             self._restore_cursor()
         else:
@@ -574,6 +584,9 @@ class _TerminalScreen:
             self._handle_sgr(params)
             return
         if self._is_ignored_csi(params, final):
+            return
+        if final == "t" or (final == "|" and ("*" in params or "$" in params)):
+            self.invalidate()
             return
         if final in ("h", "l"):
             self._handle_mode_csi(params, final)
@@ -587,6 +600,7 @@ class _TerminalScreen:
         self._handle_cursor_csi(final, params, nums)
 
     def _linefeed(self) -> None:
+        self._wrap_pending = False
         if self.row == self._scroll_bottom:
             self._scroll_region(self._scroll_top, self._scroll_bottom, 1, up=True)
         elif self.row + 1 < self.rows:
@@ -605,15 +619,16 @@ class _TerminalScreen:
         mapped = self._map_charset_glyph(ch)
         if mapped is None:
             return
-        if self.col >= self.cols:
+        if self._wrap_pending:
+            self._wrap_pending = False
             if self._autowrap:
                 self.col = 0
                 self._linefeed()
-            else:
-                self.col = self.cols - 1
         self.grid[self.row][self.col] = " " if self._is_text_hidden() else mapped
-        if self._autowrap or self.col + 1 < self.cols:
+        if self.col + 1 < self.cols:
             self.col += 1
+        elif self._autowrap:
+            self._wrap_pending = True
 
     def _put_char(self, ch: str) -> None:
         if ch == "\ufffd" or 0x80 <= ord(ch) <= 0x9F:
@@ -625,12 +640,15 @@ class _TerminalScreen:
             self._gl = 0
         elif ch == "\r":
             self.col = 0
+            self._wrap_pending = False
         elif ch in ("\n", "\x0b", "\x0c"):
             self._linefeed()
         elif ch == "\b":
             self.col = max(0, self.col - 1)
+            self._wrap_pending = False
         elif ch == "\t":
             self.col = min(self.cols - 1, ((self.col // 8) + 1) * 8)
+            self._wrap_pending = False
         elif ch >= " " and ch != "\x7f":
             self._put_printable(ch)
 
@@ -647,6 +665,7 @@ class _TerminalScreen:
             self.col = 0
             self._linefeed()
         elif nxt == "M":
+            self._wrap_pending = False
             if self.row == self._scroll_top:
                 self._scroll_region(self._scroll_top, self._scroll_bottom, 1, up=False)
             elif self.row > 0:

@@ -3996,22 +3996,59 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertIsNone(
                 shell_driver.extract_observed_route_row(f"\x1b[?07l{' ' * 120}{route_txt}", approval),
             )
-            self.assertIsNone(
-                shell_driver.extract_observed_route_row(
-                    f"\x1b[?7l\x1b[?1049h\x1b[?7h\x1b[?1049l{' ' * 120}{route_txt}", approval,
-                ),
+            # Cursor save/restore preserves pending wrap, NOT DECAWM (?7) autowrap mode (xterm cursor.c).
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b7\x1b[?7l\x1b8ABCDE", rows=4, cols=4).splitlines()[:2],
+                ["ABCE", ""],
             )
-            # Non-allowlisted XTWINOPS window resize ops fail closed; allowlisted title stack ops remain certain.
-            for resize_op in ("\x1b[8;24;80t", "\x1b[08;24;80t", "\x1b[4;480;640t", "\x1b[9;1t", "\x1b[10;1t"):
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[?1049h\x1b[?7l\x1b[?1049lABCDE", rows=4, cols=4).splitlines()[:2],
+                ["ABCE", ""],
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[?7hABCD\x1b7\x1b[1;1H\x1b8E", rows=4, cols=4).splitlines()[:2],
+                ["ABCD", "E"],
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[?7hABCD\x1b7\x1b[?7l\x1b8E", rows=4, cols=4).splitlines()[:2],
+                ["ABCE", ""],
+            )
+            # Non-allowlisted XTWINOPS / geometry ops permanently invalidate certainty across CSI 2J and ?1049h.
+            for resize_op in (
+                "\x1b[8;24;80t",
+                "\x1b[08;24;80t",
+                "\x1b[0008;24;80t",
+                "\x1b[4;480;640t",
+                "\x1b[9;1t",
+                "\x1b[10;1t",
+                "\x1b[?3h",
+                "\x1b[?6h",
+                "\x1b[1;40s",
+                "\x1b[24*|",
+            ):
                 self.assertIsNone(shell_driver.extract_observed_route_row(f"{resize_op}{route_txt}", approval))
+                self.assertIsNone(
+                    shell_driver.extract_observed_route_row(f"{resize_op}\x1b[2J\x1b[H{route_txt}", approval),
+                )
+                self.assertIsNone(
+                    shell_driver.extract_observed_route_row(f"{resize_op}\x1b[?1049h\x1b[H{route_txt}", approval),
+                )
             self.assertEqual(
                 shell_driver.extract_observed_route_row(f"\x1b[22;0;0t{route_txt}", approval),
                 route_txt,
             )
-            # VT (\x0b) and FF (\x0c) perform linefeed; DEL (\x7f) is non-printing.
+            # VT (\x0b) and FF (\x0c) clear pending wrap at the right margin (single vertical advance); DEL is ignored.
             self.assertEqual(
                 [ln.strip() for ln in shell_driver.render_terminal_screen("a\x0bb\x0cc").splitlines() if ln.strip()],
                 ["a", "b", "c"],
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("ABCD\x0bZ", rows=4, cols=4).splitlines()[:3],
+                ["ABCD", "   Z", ""],
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("ABCD\x0cZ", rows=4, cols=4).splitlines()[:3],
+                ["ABCD", "   Z", ""],
             )
             self.assertEqual(shell_driver.render_terminal_screen("ab\x7fc").strip(), "abc")
             wide_old = "x" * (len(route_txt) + 5)
