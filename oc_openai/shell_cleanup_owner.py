@@ -395,8 +395,10 @@ class _OwnershipJournal:
                 os.close(fd)
 
     def _close_all_pinned_slot_fds(self) -> None:
-        for slot_key in list(self._pinned_slot_fds):
-            self._close_pinned_slot_fd(slot_key)
+        while self._pinned_slot_fds:
+            _, fd = self._pinned_slot_fds.popitem()
+            with suppress(OSError):
+                os.close(fd)
 
     def __del__(self) -> None:
         self._close_all_pinned_slot_fds()
