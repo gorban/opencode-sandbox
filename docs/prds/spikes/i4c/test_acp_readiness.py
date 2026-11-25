@@ -61,19 +61,30 @@ class SyntheticReadinessTest(unittest.TestCase):
         self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
 
     def test_foreign_credential_with_matching_profile_metadata_is_rejected(self):
-        original = self.profile.read_text()
-        profile = json.loads(original)
         self.assertIs(self.probe(), State.READY)
         with TemporaryDirectory() as other:
             other_generation = acp.enroll_fixture(other)
             self.assertIs(acp.probe_fixture(other, other_generation), State.READY)
             other_credential = json.loads((Path(other) / acp.PROFILE).read_text())["credential"]
 
-        self.profile.write_text(json.dumps({**profile, "credential": other_credential}))
-        with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
-            self.probe()
-        self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
-        self.profile.write_text(original)
+        directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fd = os.open(acp.PROFILE, os.O_RDWR | os.O_NOFOLLOW, dir_fd=directory)
+        finally:
+            os.close(directory)
+        with os.fdopen(fd, "r+", encoding="ascii") as fixture:
+            original = fixture.read()
+            profile = json.loads(original)
+            fixture.seek(0)
+            json.dump({**profile, "credential": other_credential}, fixture)
+            fixture.truncate()
+            fixture.flush()
+            with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
+                self.probe()
+            self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
+            fixture.seek(0)
+            fixture.write(original)
+            fixture.truncate()
         self.assertIs(self.probe(), State.READY)
 
     def test_valid_profile_requires_independent_verifier_record(self):

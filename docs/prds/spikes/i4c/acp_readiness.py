@@ -244,7 +244,7 @@ class _Channel:
 def _classify(reply):
     result = reply.get("result")
     session_id = result.get("sessionId") if type(result) is dict else None
-    if type(session_id) is str and session_id.strip():
+    if isinstance(session_id, str) and session_id.strip():
         return ReadinessState.READY
 
     error = reply.get("error")
