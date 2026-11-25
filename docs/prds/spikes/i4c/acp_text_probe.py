@@ -119,12 +119,17 @@ class SpikePlacement(Placement):
         self.create_unconfirmed = False
 
     def create(self, role, *args):
+        # The shared placement sets this flag at the Podman create call, after preflight.
+        # Scope it to this role here while retaining the cumulative flag for close().
+        earlier_attempt = self.attempted
+        self.attempted = False
         try:
             return super().create(role, *args)
         finally:
             if self.attempted and role not in self.ids:
                 # A later empty label query cannot settle an unacknowledged create.
                 self.create_unconfirmed = True
+            self.attempted = self.attempted or earlier_attempt
 
     def record_identity(self, directory):
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from acp_readiness import RECEIPT, Record, RetirementUnconfirmed, _locked, _store, enroll_fixture
 from acp_text_probe import isolated_placement, synthetic_state
-from oc_orchestrator.runtime import CONTAINER_SHELL, LABEL, OPEN_CODE, Failure
+from oc_orchestrator.runtime import CONTAINER_SHELL, LABEL, OPEN_CODE, RELAY, Failure
 from oc_providers import ReadinessState
 
 
@@ -133,3 +133,38 @@ class ScratchTests(unittest.TestCase):
         self.assertEqual(json.loads((root / "placement.json").read_text()), {
             "label": LABEL, "value": placement.label, "names": placement.names,
         })
+
+    def test_relay_preflight_failure_cleans_the_acknowledged_worker(self):
+        lifeline = SimpleNamespace(check=lambda: None)
+        worker_id = "a" * 64
+        roots = []
+
+        def inspect_image(_kind, image):
+            if image == RELAY:
+                raise Failure("relay image inspection failed")
+            return {"Id": OPEN_CODE, "Config": {"Env": []}}
+
+        def podman(command, *unused):
+            return SimpleNamespace(stdout=worker_id.encode() if command == "create" else b"")
+
+        def launch_pair():
+            with isolated_placement(lifeline) as placement:
+                root = placement.root
+                roots.append(root)
+                placement.create("open-code", OPEN_CODE, "none", root / "worker.json",
+                                 "/etc/opencode/opencode.json", {}, (), CONTAINER_SHELL)
+                placement.create("relay", RELAY, f"container:{worker_id}", root / "relay",
+                                 "/fixture", {}, (), CONTAINER_SHELL)
+
+        with (patch("oc_orchestrator.runtime.inspect", side_effect=inspect_image),
+              patch("acp_text_probe.Placement.identity"),
+              patch("acp_text_probe.Placement.verify"),
+              patch("oc_orchestrator.runtime.podman", side_effect=podman) as host,
+              patch("sys.stderr")):
+            with self.assertRaisesRegex(Failure, "relay image inspection failed"):
+                launch_pair()
+
+        self.assertEqual([call.args[0] for call in host.call_args_list], ["create", "start", "ps", "rm", "ps"])
+        self.assertIn(worker_id, host.call_args_list[3].args)
+        self.assertEqual(len(roots), 1)
+        self.assertFalse(roots[0].exists())
