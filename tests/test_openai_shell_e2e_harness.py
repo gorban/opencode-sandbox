@@ -3140,7 +3140,8 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertEqual((moved_slot / "grant" / "state").read_text(encoding="utf-8"), "revoked\n")
             self.assertEqual((repl_grant / "state").read_text(encoding="utf-8"), "active\n")
 
-            # 2b. Released-root deletion detects split name/identity swap right before final os.rmdir!
+            # 2b. Released-root deletion detects split name/identity swap right before final os.rmdir
+            # and preserves a non-empty replacement directory intact!
             swap_slot = td / "slot_rmdir_race"
             swap_slot.mkdir(mode=0o700)
             j_race = _OwnershipJournal(jspec, podman_runner=no_pm)
@@ -3153,6 +3154,7 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 if path == swap_slot.name and not moved_race.exists():
                     swap_slot.rename(moved_race)
                     swap_slot.mkdir(mode=0o700)
+                    (swap_slot / "keep.txt").write_text("unowned\n", encoding="utf-8")
                 return real_rmdir(path, dir_fd=dir_fd)
 
             with patch.object(owner_mod.os, "rmdir", side_effect=_swap_before_rmdir):
@@ -3160,6 +3162,7 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertFalse(res_race[KEY_CLEANUP_VERIFIED])
             self.assertTrue(res_race["ownership_uncertain"])
             self.assertIn("slot_root_identity_mismatch:turn-0", res_race["errors"])
+            self.assertEqual((swap_slot / "keep.txt").read_text(encoding="utf-8"), "unowned\n")
 
             # 4. Session config root registered before first slot opens & cleaned by detached owner!
             j_sess = _OwnershipJournal(jspec, podman_runner=no_pm)
@@ -3233,6 +3236,227 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             res_sess = j_sess.teardown()
             self.assertTrue(res_sess[KEY_CLEANUP_VERIFIED], res_sess)
             self.assertFalse(Path(captured_roots[0]).exists())
+
+    def test_reciprocal_g2_r5_osc_split_and_wrapped_prompt_reply_guard(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oc-g2-r5-tui-") as td_raw:
+            exp = Path(td_raw) / "exp"
+            exp.mkdir(mode=0o700)
+            os.chmod(exp, 0o700)
+            approval = ProofApproval(
+                run_id=TEST_RUN_ID, instance_label="personal", scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL, ui_mode="mini", cwd=TEST_CWD,
+                selection_epoch="E" * 43, credential_generation=1,
+                history_digest_all_12_files=compute_exposure_history_digest(exp),
+                providers_config_digest=TEST_HEX_A,
+            )
+
+            # 1. Long (>256B) and chunk-split OSC/ST/C1 control strings never leak into screen cells.
+            scr_bel = shell_driver._TerminalScreen()
+            scr_bel.feed("\x1b]0;title-" + ("x" * 300))
+            self.assertFalse(scr_bel.is_certain)
+            self.assertEqual(scr_bel.render(), "")
+            scr_bel.feed(f"openai--personal/{TEST_MODEL}\x07")
+            self.assertTrue(scr_bel.is_certain)
+            self.assertIsNone(shell_driver.extract_observed_route_row(scr_bel.render(), approval))
+            self.assertNotIn(TEST_MODEL, scr_bel.render())
+
+            scr_st = shell_driver._TerminalScreen()
+            scr_st.feed("\x1b]2;" + ("y" * 400) + f"openai--personal/{TEST_MODEL}\x1b")
+            self.assertFalse(scr_st.is_certain)
+            self.assertEqual(scr_st.render(), "")
+            scr_st.feed("\\")
+            self.assertTrue(scr_st.is_certain)
+            self.assertNotIn(TEST_MODEL, scr_st.render())
+
+            scr_dcs = shell_driver._TerminalScreen()
+            scr_dcs.feed("\x1bP" + ("z" * 300) + f"openai--personal/{TEST_MODEL}\x1b\\")
+            self.assertFalse(scr_dcs.is_certain)
+            self.assertEqual(scr_dcs.render(), "")
+
+            scr_c1 = shell_driver._TerminalScreen()
+            scr_c1.feed("\x9d" + ("q" * 300) + f"openai--personal/{TEST_MODEL}\x9c")
+            self.assertTrue(scr_c1.is_certain)
+            self.assertNotIn(TEST_MODEL, scr_c1.render())
+
+            # 2. Wrapped user prompt echoes and bare unattributed "ok" must never satisfy reply observation.
+            prompt_head = PROOF_PROMPT.removesuffix(f" {shell_driver.EXPECTED_REPLY}")
+            fake_gate = SimpleNamespace(
+                admitted_writes=1,
+                exact_ok_delivered=True,
+                approval=SimpleNamespace(approved_model=TEST_MODEL),
+            )
+            r_fd, w_fd = os.pipe()
+            try:
+                for screen_text, pre_lines in (
+                    (f"{prompt_head}\nok", ()),
+                    (f"│ > {prompt_head} │\n│ > ok │", ()),
+                    (f"{prompt_head}\nok\n▣ Build · {TEST_MODEL}", ()),
+                    ("token usage\nok", ()),
+                    (
+                        f"ChatGPT Subscription (personal)\nok\n{prompt_head}\nok",
+                        ("ChatGPT Subscription (personal)", "ok"),
+                    ),
+                ):
+                    st = shell_driver._PtyState(armed=True, prompt_sent=True, pre_prompt_lines=pre_lines)
+                    self.assertFalse(
+                        shell_driver._step_pty_driver(
+                            w_fd, screen_text, 5.0, fake_gate, lambda _r, _d: None, st, post_prompt_text=screen_text,
+                        ),
+                        screen_text,
+                    )
+                    self.assertFalse(st.reply_observed, screen_text)
+
+                # Positive controls: explicit assistant prefix and unwrapped prompt + footer-adjacent "ok".
+                for screen_text in (
+                    "Assistant: ok",
+                    "● ok",
+                    f"{PROOF_PROMPT}\n\nok\n▣ Build · {TEST_MODEL}",
+                ):
+                    st_ok = shell_driver._PtyState(armed=True, prompt_sent=True, pre_prompt_lines=())
+                    with patch.object(shell_driver.time, "sleep"):
+                        done = shell_driver._step_pty_driver(
+                            w_fd, screen_text, 5.0, fake_gate, lambda _r, _d: None, st_ok, post_prompt_text="ok",
+                        )
+                    self.assertTrue(done, screen_text)
+                    self.assertTrue(st_ok.reply_observed, screen_text)
+                    self.assertEqual(os.read(r_fd, 16), b"\x03")
+            finally:
+                os.close(r_fd)
+                os.close(w_fd)
+
+    def test_reciprocal_g2_r5_empty_replacement_survives_and_grant_lock_pinned(self) -> None:
+        from oc_openai import shell_cleanup_owner as owner_mod
+
+        with tempfile.TemporaryDirectory(prefix="oc-g2-r5-pin-") as td_raw:
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            jspec = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=td / "j_r5.json",
+            )
+            no_pm = lambda args, timeout=20.0: subprocess.CompletedProcess(args, 1, b"", b"")
+            relay_cname = "oc-e2e-deadbeef-relay-0"
+            mismatch_err = "slot_root_identity_mismatch:turn-0"
+            active_state = "active\n"
+
+            # 1. Swap right after _clear_dir_fd (before final rmdir): empty replacement MUST survive untouched.
+            swap_slot = td / "slot_post_clear_swap"
+            swap_slot.mkdir(mode=0o700)
+            (swap_slot / "junk.txt").write_text("old\n", encoding="utf-8")
+            j_swap = _OwnershipJournal(jspec, podman_runner=no_pm)
+            j_swap.prepare_slot("turn-0", container_name=relay_cname, slot_root=str(swap_slot))
+            j_swap.mark_lease_released("turn-0")
+            moved_swap = td / "slot_post_clear_moved"
+            real_clear = owner_mod._clear_dir_fd
+            rmdir_calls: list[str] = []
+            real_rmdir = os.rmdir
+
+            def _clear_then_swap(dir_fd: int) -> None:
+                real_clear(dir_fd)
+                if not moved_swap.exists():
+                    swap_slot.rename(moved_swap)
+                    swap_slot.mkdir(mode=0o700)
+
+            def _spy_rmdir(path, *, dir_fd=None):
+                rmdir_calls.append(str(path))
+                return real_rmdir(path, dir_fd=dir_fd)
+
+            with (
+                patch.object(owner_mod, "_clear_dir_fd", side_effect=_clear_then_swap),
+                patch.object(owner_mod.os, "rmdir", side_effect=_spy_rmdir),
+            ):
+                res_swap = j_swap.teardown()
+            self.assertFalse(res_swap[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_swap["ownership_uncertain"])
+            self.assertIn(mismatch_err, res_swap["errors"])
+            self.assertTrue(swap_slot.is_dir())
+            self.assertEqual(rmdir_calls, [])
+
+            # 1b. Ancestor swap after _clear_dir_fd also preserves replacement untouched and fails closed.
+            anc_parent = td / "anc_parent"
+            anc_parent.mkdir(mode=0o700)
+            anc_slot = anc_parent / "slot_anc"
+            anc_slot.mkdir(mode=0o700)
+            j_anc = _OwnershipJournal(jspec, podman_runner=no_pm)
+            j_anc.prepare_slot("turn-0", container_name=relay_cname, slot_root=str(anc_slot))
+            j_anc.mark_lease_released("turn-0")
+            anc_moved = td / "anc_parent_moved"
+            anc_rmdirs: list[str] = []
+
+            def _clear_then_swap_anc(dir_fd: int) -> None:
+                real_clear(dir_fd)
+                if not anc_moved.exists():
+                    anc_parent.rename(anc_moved)
+                    anc_parent.mkdir(mode=0o700)
+                    anc_slot.mkdir(mode=0o700)
+
+            def _spy_anc_rmdir(path, *, dir_fd=None):
+                anc_rmdirs.append(str(path))
+                return real_rmdir(path, dir_fd=dir_fd)
+
+            with (
+                patch.object(owner_mod, "_clear_dir_fd", side_effect=_clear_then_swap_anc),
+                patch.object(owner_mod.os, "rmdir", side_effect=_spy_anc_rmdir),
+            ):
+                res_anc = j_anc.teardown()
+            self.assertFalse(res_anc[KEY_CLEANUP_VERIFIED])
+            self.assertIn(mismatch_err, res_anc["errors"])
+            self.assertTrue(anc_slot.is_dir())
+            self.assertEqual(anc_rmdirs, [])
+
+            # 2a. Same slot_root with replaced grant/ dir: replacement grant/state MUST stay "active\n".
+            slot_gswap = td / "slot_same_root_grant_swap"
+            grant_orig = slot_gswap / "grant"
+            grant_orig.mkdir(parents=True, mode=0o700)
+            (grant_orig / "lock").touch(mode=0o600)
+            (grant_orig / "state").write_text(active_state, encoding="utf-8")
+            j_gswap = _OwnershipJournal(jspec, podman_runner=no_pm)
+            j_gswap.prepare_slot("turn-0", container_name=relay_cname, slot_root=str(slot_gswap))
+            j_gswap.begin_slot_create(
+                "turn-0", container_name=relay_cname,
+                grant_dir=str(grant_orig), slot_root=str(slot_gswap),
+            )
+            grant_orig.rename(slot_gswap / "grant_old")
+            grant_orig.mkdir(mode=0o700)
+            (grant_orig / "lock").touch(mode=0o600)
+            (grant_orig / "state").write_text(active_state, encoding="utf-8")
+            j_gswap.teardown()
+            self.assertEqual((grant_orig / "state").read_text(encoding="utf-8"), active_state)
+
+            # 2b. Same slot_root and same grant/ with replaced grant/lock file: state MUST stay "active\n".
+            slot_lswap = td / "slot_same_grant_lock_swap"
+            grant_l = slot_lswap / "grant"
+            grant_l.mkdir(parents=True, mode=0o700)
+            lock_l = grant_l / "lock"
+            lock_l.touch(mode=0o600)
+            (grant_l / "state").write_text(active_state, encoding="utf-8")
+            j_lswap = _OwnershipJournal(jspec, podman_runner=no_pm)
+            j_lswap.prepare_slot("turn-0", container_name=relay_cname, slot_root=str(slot_lswap))
+            j_lswap.begin_slot_create(
+                "turn-0", container_name=relay_cname,
+                grant_dir=str(grant_l), slot_root=str(slot_lswap),
+            )
+            lock_l.rename(grant_l / "lock_old")
+            lock_l.touch(mode=0o600)
+            j_lswap.teardown()
+            self.assertEqual((grant_l / "state").read_text(encoding="utf-8"), active_state)
+
+            # 2c. Unmodified slot_root + grant/ + grant/lock (prepared before grant existed) revokes cleanly.
+            slot_ok = td / "slot_ok_revoke"
+            slot_ok.mkdir(mode=0o700)
+            j_ok = _OwnershipJournal(jspec, podman_runner=no_pm)
+            j_ok.prepare_slot("turn-0", container_name=relay_cname, slot_root=str(slot_ok))
+            grant_ok = slot_ok / "grant"
+            grant_ok.mkdir(mode=0o700)
+            (grant_ok / "lock").touch(mode=0o600)
+            (grant_ok / "state").write_text(active_state, encoding="utf-8")
+            j_ok.begin_slot_create(
+                "turn-0", container_name=relay_cname,
+                grant_dir=str(grant_ok), slot_root=str(slot_ok),
+            )
+            j_ok.teardown()
+            self.assertEqual((grant_ok / "state").read_text(encoding="utf-8"), "revoked\n")
 
 
 if __name__ == "__main__":

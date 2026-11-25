@@ -1295,23 +1295,26 @@ class _SessionSlotCoordinator:
         self._pre_revoked: set[int] = set()
         self._slot_roots: list[Path] = []
         self._slot_root_ids: dict[Path, tuple[int, int]] = {}
-        self._slot_root_fds: dict[Path, int] = {}
+        self._slot_root_fds: dict[Path, tuple[int, int]] = {}
         self._created_containers: list[str] = []
         self._removed_containers: set[str] = set()
         self._retire_threads: list[threading.Thread] = []
         self._cleanup_error: Exception | None = None
 
     def _close_slot_root_fd(self, slot_root: Path) -> None:
-        fd = self._slot_root_fds.pop(slot_root, None)
-        if fd is not None:
-            with suppress(OSError):
-                os.close(fd)
+        fds = self._slot_root_fds.pop(slot_root, None)
+        if fds is not None:
+            for fd in reversed(fds):
+                with suppress(OSError):
+                    os.close(fd)
 
     def release_slot_root_pins(self) -> None:
         with self._lock:
-            roots = list(self._slot_root_fds)
-        for slot_root in roots:
-            self._close_slot_root_fd(slot_root)
+            while self._slot_root_fds:
+                _, fds = self._slot_root_fds.popitem()
+                for fd in reversed(fds):
+                    with suppress(OSError):
+                        os.close(fd)
 
     def __del__(self) -> None:
         self.release_slot_root_pins()
@@ -1324,9 +1327,9 @@ class _SessionSlotCoordinator:
         if slot_root not in self._slot_root_ids:
             pinned = _open_owned_dir_pin(str(slot_root))
             if pinned is not None:
-                fd, dev, ino = pinned
+                parent_fd, fd, dev, ino = pinned
                 self._slot_root_ids[slot_root] = (dev, ino)
-                self._slot_root_fds[slot_root] = fd
+                self._slot_root_fds[slot_root] = (parent_fd, fd)
 
     def register_slot(self, slot_cm, handle: SlotHandle, slot_root: Path | None = None) -> _SlotState:
         resolved_root = slot_root if slot_root is not None else handle.job.root
@@ -1365,10 +1368,17 @@ class _SessionSlotCoordinator:
             if confirmed is not None and slot_root not in confirmed:
                 continue
             ident = root_ids.get(slot_root)
+            fds = self._slot_root_fds.get(slot_root)
+            parent_fd = fds[0] if fds is not None else None
+            root_fd = fds[1] if fds is not None else None
             try:
                 if ident is not None:
                     _remove_pinned_dir(
-                        slot_root, ident[0], ident[1], pinned_fd=self._slot_root_fds.get(slot_root),
+                        slot_root,
+                        ident[0],
+                        ident[1],
+                        pinned_fd=root_fd,
+                        pinned_parent_fd=parent_fd,
                     )
             finally:
                 self._close_slot_root_fd(slot_root)

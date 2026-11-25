@@ -115,20 +115,44 @@ def strip_ansi(text: str) -> str:
 
 
 _CSI_TOKEN_RE = re.compile(r"\x1b\[([0-?]*[ -/]*)([@-~])")
-_OSC_TOKEN_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _ALT_SCREEN_MODES = frozenset({"47", "1047", "1049"})
 _SAFE_DEC_MODES = frozenset({"1", "7", "12", "25", "1000", "1002", "1003", "1004", "1006", "2004", "2026", "2027"})
 _CURSOR_MOVES = frozenset({"H", "f", "A", "B", "C", "D", "E", "F", "G", "d"})
-_EXACT_REPLY_LINE_RE = re.compile(r"(?:(?:[Aa]ssistant\s*:|[●•▸▹▶◆▪■>])\s*)?ok\Z")
+_EXACT_ASSISTANT_LINE_RE = re.compile(r"(?:[Aa]ssistant\s*:|[●◆▪■])\s*ok\Z")
+_USER_PREFIX_RE = re.compile(r"^(?:[Yy]ou\s*:|[Uu]ser\s*:|[>›❯])\s*")
 _BORDER_CHARS = " \t│┃┆┊║|"
+_ST_STRING_INTRODUCERS = frozenset({"P", "X", "^", "_"})
+_C1_ST_INTRODUCERS = frozenset({"\x90", "\x98", "\x9e", "\x9f"})
 
 
 def _normalize_reply_line(raw: str) -> str:
     return " ".join(raw.strip(_BORDER_CHARS).split())
 
 
-def _is_exact_reply_line(line: str) -> bool:
-    return bool(line) and _EXACT_REPLY_LINE_RE.fullmatch(line) is not None
+def _is_assistant_context_line(line: str, approved_model: str = "") -> bool:
+    if not line:
+        return False
+    low = line.lower()
+    if low in ("assistant", "assistant:") or low.startswith("assistant:") or low.startswith("assistant "):
+        return True
+    if approved_model and approved_model in line and PROOF_PROMPT not in line:
+        return True
+    return "chatgpt subscription" in low or "▣" in line
+
+
+def _is_wrapped_prompt_tail(lines: list[str], idx: int) -> bool:
+    cur_clean = _USER_PREFIX_RE.sub("", lines[idx])
+    if cur_clean != EXPECTED_REPLY:
+        return False
+    for lookback in (1, 2, 3):
+        if idx - lookback < 0:
+            continue
+        prefix = " ".join(_USER_PREFIX_RE.sub("", lines[k]) for k in range(idx - lookback, idx))
+        if PROOF_PROMPT in prefix:
+            continue
+        if PROOF_PROMPT in f"{prefix} {cur_clean}":
+            return True
+    return False
 
 
 class _TerminalScreen:
@@ -150,13 +174,15 @@ class _TerminalScreen:
         self.grid = [[" "] * cols for _ in range(rows)]
         self._pending = ""
         self._uncertain = False
+        self._ctrl_state: str | None = None
+        self._ctrl_esc_seen = False
         self._concealed = False
         self._fg: tuple[str, int] | tuple[str, int, int, int] | None = None
         self._bg: tuple[str, int] | tuple[str, int, int, int] | None = None
 
     @property
     def is_certain(self) -> bool:
-        return not self._uncertain and not self._pending
+        return not self._uncertain and not self._pending and self._ctrl_state is None
 
     def _reset_sgr(self) -> None:
         self._concealed = False
@@ -474,15 +500,31 @@ class _TerminalScreen:
             if len(data) - idx < 64:
                 return None
             self._uncertain = True
+            self._ctrl_state = "csi_discard"
             return idx + 2
         self._handle_csi(m.group(1), m.group(2))
         return m.end()
 
-    def _consume_osc_escape(self, data: str, idx: int) -> int | None:
-        m = _OSC_TOKEN_RE.match(data, idx)
-        if m is None:
-            return None if len(data) - idx < 256 else idx + 2
-        return m.end()
+    def _consume_ctrl_string_step(self, ch: str) -> None:
+        if ch in ("\x18", "\x1a"):
+            self._uncertain = True
+            self._ctrl_state = None
+            self._ctrl_esc_seen = False
+            return
+        if self._ctrl_state == "csi_discard":
+            if "@" <= ch <= "~":
+                self._ctrl_state = None
+            return
+        if self._ctrl_esc_seen:
+            self._ctrl_esc_seen = False
+            if ch == "\\":
+                self._ctrl_state = None
+                return
+        if ch == "\x1b":
+            self._ctrl_esc_seen = True
+            return
+        if ch == "\x9c" or (self._ctrl_state == "osc" and ch == "\x07"):
+            self._ctrl_state = None
 
     def _consume_escape(self, data: str, idx: int) -> int | None:
         if idx + 1 >= len(data):
@@ -491,12 +533,35 @@ class _TerminalScreen:
         if nxt == "[":
             return self._consume_csi_escape(data, idx)
         if nxt == "]":
-            return self._consume_osc_escape(data, idx)
+            self._ctrl_state = "osc"
+            self._ctrl_esc_seen = False
+            return idx + 2
+        if nxt in _ST_STRING_INTRODUCERS:
+            self._uncertain = True
+            self._ctrl_state = "st"
+            self._ctrl_esc_seen = False
+            return idx + 2
         if nxt in ("(", ")"):
             return None if idx + 2 >= len(data) else idx + 3
         if not self._consume_two_byte_escape(nxt):
             self._uncertain = True
         return idx + 2
+
+    def _enter_c1_control(self, ch: str) -> bool:
+        if ch == "\x9d":
+            self._ctrl_state = "osc"
+            self._ctrl_esc_seen = False
+            return True
+        if ch in _C1_ST_INTRODUCERS:
+            self._uncertain = True
+            self._ctrl_state = "st"
+            self._ctrl_esc_seen = False
+            return True
+        if ch == "\x9b":
+            self._uncertain = True
+            self._ctrl_state = "csi_discard"
+            return True
+        return False
 
     def feed(self, text: str) -> None:
         data = self._pending + text
@@ -505,12 +570,19 @@ class _TerminalScreen:
         total = len(data)
         while idx < total:
             ch = data[idx]
+            if self._ctrl_state is not None:
+                self._consume_ctrl_string_step(ch)
+                idx += 1
+                continue
             if ch == "\x1b":
                 advanced = self._consume_escape(data, idx)
                 if advanced is None:
                     self._pending = data[idx:]
                     return
                 idx = advanced
+                continue
+            if self._enter_c1_control(ch):
+                idx += 1
                 continue
             self._put_char(ch)
             idx += 1
@@ -905,16 +977,38 @@ def extract_observed_route_row(clean: str, approval: ProofApproval) -> str | Non
     return None
 
 
+def _line_is_visible_assistant_reply(lines: list[str], idx: int, approved_model: str) -> bool:
+    line = lines[idx]
+    if _EXACT_ASSISTANT_LINE_RE.fullmatch(line) is not None:
+        return True
+    if line != EXPECTED_REPLY or _is_wrapped_prompt_tail(lines, idx):
+        return False
+    prev_line = lines[idx - 1] if idx > 0 else ""
+    next_line = lines[idx + 1] if idx + 1 < len(lines) else ""
+    return _is_assistant_context_line(prev_line, approved_model) or _is_assistant_context_line(next_line, approved_model)
+
+
+def _visible_assistant_reply_lines(lines: list[str], approved_model: str) -> Counter[str]:
+    return Counter(
+        lines[idx]
+        for idx in range(len(lines))
+        if _line_is_visible_assistant_reply(lines, idx, approved_model)
+    )
+
+
 def _has_new_exact_reply(
     rendered: str,
     pre_prompt_lines: tuple[str, ...],
     post_prompt_text: str | None,
+    *,
+    approved_model: str = "",
 ) -> bool:
     if post_prompt_text is not None and not post_prompt_text:
         return False
     cur_lines = [ln for ln in (_normalize_reply_line(r) for r in rendered.splitlines()) if ln]
-    added = Counter(cur_lines) - Counter(pre_prompt_lines)
-    return any(_is_exact_reply_line(ln) for ln in added)
+    cur_replies = _visible_assistant_reply_lines(cur_lines, approved_model)
+    pre_replies = _visible_assistant_reply_lines(list(pre_prompt_lines), approved_model)
+    return bool(cur_replies - pre_replies)
 
 
 def _step_pty_driver(
@@ -944,7 +1038,10 @@ def _step_pty_driver(
         os.write(master_fd, (PROOF_PROMPT + "\r").encode("ascii"))
         state.prompt_sent = True
         return False
-    if proof_gate.exact_ok_delivered and _has_new_exact_reply(clean, state.pre_prompt_lines, post_prompt_text):
+    model_name = getattr(getattr(proof_gate, "approval", None), "approved_model", "")
+    if proof_gate.exact_ok_delivered and _has_new_exact_reply(
+        clean, state.pre_prompt_lines, post_prompt_text, approved_model=model_name,
+    ):
         state.reply_observed = True
         time.sleep(0.6)
         with suppress(OSError):
@@ -971,7 +1068,8 @@ def _record_final_pty_reply(
     screen.feed(decoder.decode(b"", final=True))
     if not state.reply_observed and state.prompt_sent and proof_gate.exact_ok_delivered:
         post_text = strip_ansi(post_prompt_buf.decode("utf-8", errors="replace"))
-        if _has_new_exact_reply(screen.render(), state.pre_prompt_lines, post_text):
+        model_name = getattr(getattr(proof_gate, "approval", None), "approved_model", "")
+        if _has_new_exact_reply(screen.render(), state.pre_prompt_lines, post_text, approved_model=model_name):
             state.reply_observed = True
 
 

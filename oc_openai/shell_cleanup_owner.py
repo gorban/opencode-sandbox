@@ -147,22 +147,86 @@ def _atomic_fsync_write(path: Path, data: bytes) -> None:
         raise
 
 
-def _open_owned_dir_pin(path_str: str) -> tuple[int, int, int] | None:
+_SHARED_TMP = Path("/tmp")  # NOSONAR(S5443)
+
+
+def _is_trusted_parent_dir(info: os.stat_result, parent: Path) -> bool:
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    if info.st_uid == os.geteuid() and (info.st_mode & 0o022) == 0:
+        return True
+    return parent == _SHARED_TMP and info.st_uid in (0, 65534) and bool(info.st_mode & stat.S_ISVTX)
+
+
+def _open_owned_dir_pin(path_str: str) -> tuple[int, int, int, int] | None:
+    """Open and pin (parent_fd, dir_fd, st_dev, st_ino) for a trusted owned directory."""
     if not path_str:
         return None
+    root = Path(path_str)
     try:
-        fd = os.open(path_str, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        parent_fd = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return None
+    dir_fd: int | None = None
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
-            os.close(fd)
+        pinfo = os.fstat(parent_fd)
+        if not _is_trusted_parent_dir(pinfo, root.parent):
+            os.close(parent_fd)
             return None
-        return fd, info.st_dev, info.st_ino
+        dir_fd = os.open(root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+        info = os.fstat(dir_fd)
+        entry = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        absolute = os.lstat(root)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or (entry.st_dev, entry.st_ino) != (info.st_dev, info.st_ino)
+            or (absolute.st_dev, absolute.st_ino) != (info.st_dev, info.st_ino)
+        ):
+            os.close(dir_fd)
+            os.close(parent_fd)
+            return None
+        return parent_fd, dir_fd, info.st_dev, info.st_ino
     except OSError:
-        os.close(fd)
+        if dir_fd is not None:
+            with suppress(OSError):
+                os.close(dir_fd)
+        with suppress(OSError):
+            os.close(parent_fd)
         return None
+
+
+def _open_pinned_grant_files(root_fd: int) -> tuple[int | None, tuple[int, int] | None, int | None, tuple[int, int] | None]:
+    """Pin (grant_fd, (gdev, gino), lock_fd, (ldev, lino)) relative to pinned slot_root FD."""
+    try:
+        grant_fd = os.open("grant", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+    except OSError:
+        return None, None, None, None
+    try:
+        ginfo = os.fstat(grant_fd)
+        if not stat.S_ISDIR(ginfo.st_mode) or ginfo.st_uid != os.geteuid():
+            os.close(grant_fd)
+            return None, None, None, None
+        grant_id = (ginfo.st_dev, ginfo.st_ino)
+    except OSError:
+        os.close(grant_fd)
+        return None, None, None, None
+    lock_fd: int | None = None
+    lock_id: tuple[int, int] | None = None
+    try:
+        lock_fd = os.open("lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=grant_fd)
+        linfo = os.fstat(lock_fd)
+        if stat.S_ISREG(linfo.st_mode) and linfo.st_uid == os.geteuid() and linfo.st_nlink == 1:
+            lock_id = (linfo.st_dev, linfo.st_ino)
+        else:
+            os.close(lock_fd)
+            lock_fd = None
+    except OSError:
+        if lock_fd is not None:
+            with suppress(OSError):
+                os.close(lock_fd)
+        lock_fd = None
+    return grant_fd, grant_id, lock_fd, lock_id
 
 
 def _clear_dir_fd(dir_fd: int) -> None:
@@ -195,20 +259,32 @@ def _open_pinned_leaf_dir(parent_fd: int, leaf: str, want_dev: int, want_ino: in
     return leaf_fd, "ok"
 
 
-def _stat_leaf_status(parent_fd: int, leaf: str, want_dev: int, want_ino: int) -> str:
+def _stat_leaf_status(parent_fd: int, root_path: Path, want_dev: int, want_ino: int) -> str:
+    leaf = root_path.name
     try:
+        pinfo = os.fstat(parent_fd)
+        pcur = os.lstat(root_path.parent)
         cur = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        absolute = os.lstat(root_path)
     except FileNotFoundError:
         return "absent"
     except OSError:
         return "error"
-    if (cur.st_dev, cur.st_ino) == (want_dev, want_ino) and stat.S_ISDIR(cur.st_mode):
+    if (
+        (pcur.st_dev, pcur.st_ino) == (pinfo.st_dev, pinfo.st_ino)
+        and (cur.st_dev, cur.st_ino) == (want_dev, want_ino)
+        and (absolute.st_dev, absolute.st_ino) == (want_dev, want_ino)
+        and stat.S_ISDIR(cur.st_mode)
+    ):
         return "same"
     return "replaced"
 
 
-def _verify_and_rmdir_pinned(parent_fd: int, leaf: str, leaf_fd: int, want_dev: int, want_ino: int) -> str:
-    cur_status = _stat_leaf_status(parent_fd, leaf, want_dev, want_ino)
+def _verify_and_rmdir_pinned(
+    parent_fd: int, root_path: Path, leaf_fd: int, want_dev: int, want_ino: int,
+) -> str:
+    leaf = root_path.name
+    cur_status = _stat_leaf_status(parent_fd, root_path, want_dev, want_ino)
     if cur_status != "same":
         if cur_status == "absent" and os.fstat(leaf_fd).st_nlink != 0:
             return "replaced"
@@ -220,17 +296,17 @@ def _verify_and_rmdir_pinned(parent_fd: int, leaf: str, leaf_fd: int, want_dev: 
     except FileNotFoundError:
         return "absent" if os.fstat(leaf_fd).st_nlink == 0 else "replaced"
     except OSError:
-        return "replaced" if _stat_leaf_status(parent_fd, leaf, want_dev, want_ino) == "replaced" else "error"
+        return "replaced" if _stat_leaf_status(parent_fd, root_path, want_dev, want_ino) == "replaced" else "error"
     if os.fstat(leaf_fd).st_nlink != 0:
         return "replaced"
-    after_status = _stat_leaf_status(parent_fd, leaf, want_dev, want_ino)
+    after_status = _stat_leaf_status(parent_fd, root_path, want_dev, want_ino)
     if after_status == "absent":
         return "removed"
     return "replaced" if after_status == "replaced" else "error"
 
 
 def _check_preexisting_pin(
-    parent_fd: int, leaf: str, want_dev: int, want_ino: int, pinned_fd: int | None,
+    parent_fd: int, root_path: Path, want_dev: int, want_ino: int, pinned_fd: int | None,
 ) -> str | None:
     if pinned_fd is None:
         return None
@@ -238,8 +314,33 @@ def _check_preexisting_pin(
     if (pinfo.st_dev, pinfo.st_ino) != (want_dev, want_ino) or pinfo.st_uid != os.geteuid():
         return "replaced"
     if pinfo.st_nlink == 0:
-        return "absent" if _stat_leaf_status(parent_fd, leaf, want_dev, want_ino) == "absent" else "replaced"
+        return "absent" if _stat_leaf_status(parent_fd, root_path, want_dev, want_ino) == "absent" else "replaced"
     return None
+
+
+def _resolve_pinned_parent(
+    root_path: Path, pinned_parent_fd: int | None, pinned_fd: int | None,
+) -> tuple[int | None, bool, str]:
+    if pinned_parent_fd is not None:
+        return pinned_parent_fd, False, "ok"
+    try:
+        parent_fd = os.open(root_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        return parent_fd, True, "ok"
+    except FileNotFoundError:
+        status = "replaced" if (pinned_fd is not None and os.fstat(pinned_fd).st_nlink != 0) else "absent"
+        return None, False, status
+    except OSError:
+        return None, False, "error"
+
+
+def _clear_and_rmdir_pinned(
+    parent_fd: int, root_path: Path, leaf_fd: int, want_dev: int, want_ino: int,
+) -> str:
+    try:
+        _clear_dir_fd(leaf_fd)
+    except OSError:
+        return "error"
+    return _verify_and_rmdir_pinned(parent_fd, root_path, leaf_fd, want_dev, want_ino)
 
 
 def _remove_pinned_dir(
@@ -248,34 +349,32 @@ def _remove_pinned_dir(
     want_ino: int,
     *,
     pinned_fd: int | None = None,
+    pinned_parent_fd: int | None = None,
 ) -> str:
     """Remove only the exact (st_dev, st_ino) directory via dir_fd; never touch replacements."""
+    parent_fd, owns_parent, parent_status = _resolve_pinned_parent(root_path, pinned_parent_fd, pinned_fd)
+    if parent_fd is None:
+        return parent_status
     try:
-        parent_fd = os.open(root_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except FileNotFoundError:
-        return "replaced" if (pinned_fd is not None and os.fstat(pinned_fd).st_nlink != 0) else "absent"
-    except OSError:
-        return "error"
-    leaf = root_path.name
-    try:
-        pre = _check_preexisting_pin(parent_fd, leaf, want_dev, want_ino, pinned_fd)
+        if not _is_trusted_parent_dir(os.fstat(parent_fd), root_path.parent):
+            return "replaced"
+        pre = _check_preexisting_pin(parent_fd, root_path, want_dev, want_ino, pinned_fd)
         if pre is not None:
             return pre
-        leaf_fd, status = _open_pinned_leaf_dir(parent_fd, leaf, want_dev, want_ino)
+        if _stat_leaf_status(parent_fd, root_path, want_dev, want_ino) == "replaced":
+            return "replaced"
+        leaf_fd, status = _open_pinned_leaf_dir(parent_fd, root_path.name, want_dev, want_ino)
         if leaf_fd is None:
             if status == "absent" and pinned_fd is not None and os.fstat(pinned_fd).st_nlink != 0:
                 return "replaced"
             return status
         try:
-            try:
-                _clear_dir_fd(leaf_fd)
-            except OSError:
-                return "error"
-            return _verify_and_rmdir_pinned(parent_fd, leaf, leaf_fd, want_dev, want_ino)
+            return _clear_and_rmdir_pinned(parent_fd, root_path, leaf_fd, want_dev, want_ino)
         finally:
             os.close(leaf_fd)
     finally:
-        os.close(parent_fd)
+        if owns_parent:
+            os.close(parent_fd)
 
 
 def _atomic_fsync_write_dir_fd(dir_fd: int, name: str, data: bytes) -> None:
@@ -294,18 +393,27 @@ def _atomic_fsync_write_dir_fd(dir_fd: int, name: str, data: bytes) -> None:
         raise
 
 
-def _acquire_pinned_grant_lock(grant_fd: int) -> tuple[bool, int | None]:
+def _acquire_pinned_grant_lock(
+    grant_fd: int, want_lock_dev: object, want_lock_ino: object,
+) -> tuple[bool, int | None]:
+    has_recorded_lock = type(want_lock_dev) is int and type(want_lock_ino) is int
     lock_fd: int | None = None
     try:
-        lock_fd = os.open("lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=grant_fd)
+        lock_fd = os.open("lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=grant_fd)
         linfo = os.fstat(lock_fd)
-        if not stat.S_ISREG(linfo.st_mode) or linfo.st_uid != os.geteuid():
+        if (
+            not stat.S_ISREG(linfo.st_mode)
+            or linfo.st_uid != os.geteuid()
+            or linfo.st_nlink != 1
+            or not has_recorded_lock
+            or (linfo.st_dev, linfo.st_ino) != (want_lock_dev, want_lock_ino)
+        ):
             os.close(lock_fd)
             return False, None
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         return True, lock_fd
     except FileNotFoundError:
-        return True, None
+        return (not has_recorded_lock), None
     except OSError:
         if lock_fd is not None:
             with suppress(OSError):
@@ -313,9 +421,17 @@ def _acquire_pinned_grant_lock(grant_fd: int) -> tuple[bool, int | None]:
         return False, None
 
 
-def _revoke_pinned_grant_dir(slot_root_fd: int | None, want_dev: object, want_ino: object) -> None:
-    """Revoke grant/state strictly through the pinned slot_root directory FD (never by pathname)."""
-    if slot_root_fd is None or type(want_dev) is not int or type(want_ino) is not int:
+def _revoke_pinned_grant_dir(slot_root_fd: int | None, entry: dict[str, object]) -> None:
+    """Revoke grant/state strictly through pinned root, grant, and lock identities."""
+    want_dev, want_ino = entry.get("slot_root_dev"), entry.get("slot_root_ino")
+    want_gdev, want_gino = entry.get("grant_dev"), entry.get("grant_ino")
+    if (
+        slot_root_fd is None
+        or type(want_dev) is not int
+        or type(want_ino) is not int
+        or type(want_gdev) is not int
+        or type(want_gino) is not int
+    ):
         return
     try:
         rinfo = os.fstat(slot_root_fd)
@@ -329,9 +445,13 @@ def _revoke_pinned_grant_dir(slot_root_fd: int | None, want_dev: object, want_in
         return
     try:
         ginfo = os.fstat(grant_fd)
-        if not stat.S_ISDIR(ginfo.st_mode) or ginfo.st_uid != os.geteuid():
+        if (
+            not stat.S_ISDIR(ginfo.st_mode)
+            or ginfo.st_uid != os.geteuid()
+            or (ginfo.st_dev, ginfo.st_ino) != (want_gdev, want_gino)
+        ):
             return
-        ok_lock, lock_fd = _acquire_pinned_grant_lock(grant_fd)
+        ok_lock, lock_fd = _acquire_pinned_grant_lock(grant_fd, entry.get("lock_dev"), entry.get("lock_ino"))
         if not ok_lock:
             return
         try:
@@ -468,32 +588,38 @@ class _OwnershipJournal:
         self.worktree_dev_ino: tuple[int, int] | None = None
         self.session_root: str = ""
         self.session_root_dev_ino: tuple[int, int] | None = None
+        self._pinned_session_parent_fd: int | None = None
         self._pinned_session_root_fd: int | None = None
         self.slots: dict[str, dict[str, object]] = {}
-        self._pinned_slot_fds: dict[str, int] = {}
+        self._pinned_slot_fds: dict[str, tuple[int, int, int | None, int | None]] = {}
         self.owned_cids: set[str] = set()
         self.ownership_uncertain = False
         self.cleanup_errors: list[str] = []
 
-    def _close_pinned_session_root_fd(self) -> None:
-        fd = self._pinned_session_root_fd
-        self._pinned_session_root_fd = None
+    @staticmethod
+    def _close_fd(fd: int | None) -> None:
         if fd is not None:
             with suppress(OSError):
                 os.close(fd)
 
+    def _close_pinned_session_root_fd(self) -> None:
+        parent_fd, self._pinned_session_parent_fd = self._pinned_session_parent_fd, None
+        root_fd, self._pinned_session_root_fd = self._pinned_session_root_fd, None
+        self._close_fd(root_fd)
+        self._close_fd(parent_fd)
+
     def _close_pinned_slot_fd(self, slot_key: str) -> None:
-        fd = self._pinned_slot_fds.pop(slot_key, None)
-        if fd is not None:
-            with suppress(OSError):
-                os.close(fd)
+        fds = self._pinned_slot_fds.pop(slot_key, None)
+        if fds is not None:
+            for fd in reversed(fds):
+                self._close_fd(fd)
 
     def _close_all_pinned_slot_fds(self) -> None:
         self._close_pinned_session_root_fd()
         while self._pinned_slot_fds:
-            _, fd = self._pinned_slot_fds.popitem()
-            with suppress(OSError):
-                os.close(fd)
+            _, fds = self._pinned_slot_fds.popitem()
+            for fd in reversed(fds):
+                self._close_fd(fd)
 
     def __del__(self) -> None:
         self._close_all_pinned_slot_fds()
@@ -651,8 +777,9 @@ class _OwnershipJournal:
         pinned = _open_owned_dir_pin(session_root)
         if pinned is None:
             raise CleanupOwnerError("session_root is missing or untrusted")
-        fd, dev, ino = pinned
-        self._pinned_session_root_fd = fd
+        parent_fd, root_fd, dev, ino = pinned
+        self._pinned_session_parent_fd = parent_fd
+        self._pinned_session_root_fd = root_fd
         self.session_root = session_root
         self.session_root_dev_ino = (dev, ino)
         self._persist()
@@ -669,7 +796,11 @@ class _OwnershipJournal:
             return
         try:
             outcome = _remove_pinned_dir(
-                Path(self.session_root), ident[0], ident[1], pinned_fd=self._pinned_session_root_fd,
+                Path(self.session_root),
+                ident[0],
+                ident[1],
+                pinned_fd=self._pinned_session_root_fd,
+                pinned_parent_fd=self._pinned_session_parent_fd,
             )
         finally:
             self._close_pinned_session_root_fd()
@@ -679,46 +810,88 @@ class _OwnershipJournal:
         elif outcome == "error":
             self.cleanup_errors.append("session_root_remove_failed")
 
-    def _slot_root_identity(self, slot_key: str, slot_root: str) -> tuple[int | None, int | None]:
+    @staticmethod
+    def _opt_id_pair(pair: tuple[int, int] | None) -> tuple[int | None, int | None]:
+        return pair if pair is not None else (None, None)
+
+    @staticmethod
+    def _stored_int(entry: dict[str, object], key: str) -> int | None:
+        val = entry.get(key)
+        return val if type(val) is int else None
+
+    def _slot_pin_fields(self, slot_key: str, slot_root: str) -> dict[str, int | None]:
         prev = self.slots.get(slot_key)
-        if prev is not None and prev.get("slot_root") == slot_root:
-            prev_dev, prev_ino = prev.get("slot_root_dev"), prev.get("slot_root_ino")
-            if type(prev_dev) is int and type(prev_ino) is int:
-                return prev_dev, prev_ino
-        self._close_pinned_slot_fd(slot_key)
-        pinned = _open_owned_dir_pin(slot_root)
-        if pinned is None:
-            return None, None
-        fd, dev, ino = pinned
-        self._pinned_slot_fds[slot_key] = fd
-        return dev, ino
+        prev_dev = self._stored_int(prev, "slot_root_dev") if prev is not None else None
+        prev_ino = self._stored_int(prev, "slot_root_ino") if prev is not None else None
+        if prev is None or prev.get("slot_root") != slot_root or prev_dev is None or prev_ino is None:
+            self._close_pinned_slot_fd(slot_key)
+            pinned = _open_owned_dir_pin(slot_root)
+            if pinned is None:
+                return {
+                    "slot_root_dev": None,
+                    "slot_root_ino": None,
+                    "grant_dev": None,
+                    "grant_ino": None,
+                    "lock_dev": None,
+                    "lock_ino": None,
+                }
+            parent_fd, root_fd, dev, ino = pinned
+            grant_fd, grant_id, lock_fd, lock_id = _open_pinned_grant_files(root_fd)
+            self._pinned_slot_fds[slot_key] = (parent_fd, root_fd, grant_fd, lock_fd)
+            gdev, gino = self._opt_id_pair(grant_id)
+            ldev, lino = self._opt_id_pair(lock_id)
+            return {
+                "slot_root_dev": dev,
+                "slot_root_ino": ino,
+                "grant_dev": gdev,
+                "grant_ino": gino,
+                "lock_dev": ldev,
+                "lock_ino": lino,
+            }
+        fields: dict[str, int | None] = {
+            "slot_root_dev": prev_dev,
+            "slot_root_ino": prev_ino,
+            "grant_dev": self._stored_int(prev, "grant_dev"),
+            "grant_ino": self._stored_int(prev, "grant_ino"),
+            "lock_dev": self._stored_int(prev, "lock_dev"),
+            "lock_ino": self._stored_int(prev, "lock_ino"),
+        }
+        cur_fds = self._pinned_slot_fds.get(slot_key)
+        if fields["grant_dev"] is None and cur_fds is not None:
+            parent_fd, root_fd, old_gfd, old_lfd = cur_fds
+            grant_fd, grant_id, lock_fd, lock_id = _open_pinned_grant_files(root_fd)
+            if grant_id is not None:
+                self._close_fd(old_lfd)
+                self._close_fd(old_gfd)
+                self._pinned_slot_fds[slot_key] = (parent_fd, root_fd, grant_fd, lock_fd)
+                fields["grant_dev"], fields["grant_ino"] = grant_id
+                fields["lock_dev"], fields["lock_ino"] = self._opt_id_pair(lock_id)
+        return fields
 
     def prepare_slot(self, slot_key: str, *, container_name: str, slot_root: str = "") -> None:
         """Persist intended slot BEFORE open_slot() acquires any profile lease in worker_leases."""
-        root_dev, root_ino = self._slot_root_identity(slot_key, slot_root)
+        pin = self._slot_pin_fields(slot_key, slot_root)
         self.slots[slot_key] = {
             "status": _STATUS_LEASE_ACQUIRING,
             _KEY_CONTAINER_NAME: container_name,
             "cid": None,
             "grant_dir": "",
             "slot_root": slot_root,
-            "slot_root_dev": root_dev,
-            "slot_root_ino": root_ino,
+            **pin,
             _KEY_LEASE_RELEASED: False,
         }
         self._persist()
 
     def begin_slot_create(self, slot_key: str, *, container_name: str, grant_dir: str = "", slot_root: str = "") -> None:
         """Persist in-flight container creation BEFORE invoking podman create."""
-        root_dev, root_ino = self._slot_root_identity(slot_key, slot_root)
+        pin = self._slot_pin_fields(slot_key, slot_root)
         self.slots[slot_key] = {
             "status": _STATUS_CREATING,
             _KEY_CONTAINER_NAME: container_name,
             "cid": None,
             "grant_dir": grant_dir,
             "slot_root": slot_root,
-            "slot_root_dev": root_dev,
-            "slot_root_ino": root_ino,
+            **pin,
             _KEY_LEASE_RELEASED: False,
         }
         self._persist()
@@ -819,11 +992,9 @@ class _OwnershipJournal:
 
     def _retire_unreleased_slot(self, slot_key: str, entry: dict[str, object]) -> None:
         status = entry.get("status")
-        _revoke_pinned_grant_dir(
-            self._pinned_slot_fds.get(slot_key),
-            entry.get("slot_root_dev"),
-            entry.get("slot_root_ino"),
-        )
+        fds = self._pinned_slot_fds.get(slot_key)
+        root_fd = fds[1] if fds is not None else None
+        _revoke_pinned_grant_dir(root_fd, entry)
         if status == _STATUS_CREATED:
             cid = entry.get("cid")
             if not isinstance(cid, str) or not _HEX64.fullmatch(cid):
@@ -853,9 +1024,16 @@ class _OwnershipJournal:
             self.ownership_uncertain = True
             self.cleanup_errors.append(f"slot_root_identity_unknown:{slot_key}")
             return
+        fds = self._pinned_slot_fds.get(slot_key)
+        parent_fd = fds[0] if fds is not None else None
+        root_fd = fds[1] if fds is not None else None
         try:
             outcome = _remove_pinned_dir(
-                Path(slot_root), want_dev, want_ino, pinned_fd=self._pinned_slot_fds.get(slot_key),
+                Path(slot_root),
+                want_dev,
+                want_ino,
+                pinned_fd=root_fd,
+                pinned_parent_fd=parent_fd,
             )
         finally:
             self._close_pinned_slot_fd(slot_key)
