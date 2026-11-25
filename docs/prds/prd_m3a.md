@@ -1,7 +1,13 @@
 # prd_m3a: SvelteKit loopback dashboard
 
 Parent: [prd_m3](prd_m3.md) · follows: [M3.1 read-only projection](prd_m3.md#concrete-gaps-and-checkboxes) ·
-next: [prd_m3b Tauri desktop](prd_m3b.md)
+next: [prd_m3b Tauri desktop](prd_m3b.md) · children:
+[prd_m3a1 product design, design system and accessibility](prd_m3a1.md),
+[prd_m3a2 UI SDK agent bridge and markup](prd_m3a2.md)
+
+Design work for this SPA runs ahead of implementation in [prd_m3a1](prd_m3a1.md). Moving
+Chromium launches into the app (embedded browser views and the Browser Wall) is not part of
+this phase.
 
 Ship the first dashboard as a SvelteKit static single-page application. Use the static adapter for
 build output and client-side rendering for live routes. The host daemon serves static assets and
@@ -29,12 +35,14 @@ serve the dashboard only for UI paths. API and event paths have explicit handler
 - [ ] Prepare the shared SvelteKit components upfront for
       [M3 agent-assisted dashboard control](prd_m3.md#3-shared-sveltekit-frontend-loopback-web-auth-and-tauri-v2-uds-bridge)
       (evaluating [UI SDK](https://ui-sdk.dev) `@ui-sdk/svelte/agent`, Apache-2.0). Mark every
-      protected dashboard action with `data-agent-confirm="<impact summary>"` so agent invocations
-      via UI SDK always pop up a Trusted Chrome human confirmation dialog even when a direct human
-      click executes without a confirmation prompt. Mark the confirmation modal itself, Approval
+      protected dashboard action with `data-agent-confirm="<impact summary>"`. The daemon
+      independently classifies the typed action and initiating actor and requires Trusted
+      Chrome human confirmation on the agent path even when the ordinary human path can
+      execute directly. Mark the confirmation modal itself, Approval
       Inbox actions, and auth/sign-in controls `data-agent-hidden`, mark sensitive fields
       `data-agent-secret`, cancel open confirmation dialogs on session-generation retirement, and
-      keep authoritative enforcement in `oc_daemon` and `oc_controller`.
+      keep authoritative enforcement in `oc_daemon` and `oc_controller`. The current UI SDK
+      release, its limits and the resulting markup rules are in [prd_m3a2](prd_m3a2.md).
 - [ ] Run Lighthouse on a representative authenticated loopback fixture. Measure cold navigation
       to the first populated sandbox list and usable keyboard navigation. Defer terminal and
       browser modules until their views are opened. Consider build-time prerendering of public,

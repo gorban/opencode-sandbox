@@ -30,9 +30,11 @@ with peer identity enforced on the daemon side. The loopback build remains indep
       agent UI commands strictly through the daemon's typed native bridge (zero generic WebView
       eval or unprivileged frame access), verify that agent triggers on `data-agent-confirm`
       controls pop up Trusted Chrome human confirmation even when direct human clicks skip
-      confirmation, verify `data-agent-hidden` blocks self-confirmation and Approval Inbox access,
-      cancel open prompts on desktop session-generation retirement, and enforce privileged action
-      authorization independently in the Rust IPC layer and host daemon.
+      confirmation. Verify that agent projection and typed IPC exclude operator-only chrome,
+      including self-confirmation and Approval Inbox access. Treat `data-agent-hidden` as defense
+      in depth. Retire prompts and bridge transport on desktop session retirement, and enforce
+      actor-bound authorization independently in the Rust IPC layer and host daemon according
+      to [M3a2](prd_m3a2.md).
 
 [Tauri WebView engines](https://v2.tauri.app/reference/webview-versions/) ·
 [UI SDK](https://ui-sdk.dev)
