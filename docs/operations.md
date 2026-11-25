@@ -37,6 +37,24 @@ vi mode and your Git identity. A red `[sandbox:NAME]` prompt, `OC_SANDBOX=1` and
 `OC_INSTANCE=NAME` identify the session. The agent runs unprivileged with all capabilities
 dropped, `no-new-privileges`, and PID and memory limits.
 
+### OpenAI local acceptance
+
+This preview uses Sign in with ChatGPT from the trusted devbox terminal. The
+workstation retains the OAuth connection. The isolated OpenCode worker can
+perform one fixed scratch-file task through a private relay.
+
+| Command | What it does |
+|---|---|
+| `oc-sandbox openai connect personal` | Read the privacy notice and approve browser sign-in under the local label `personal` |
+| `oc-sandbox openai status` | List saved registrations and the active local label |
+| `oc-sandbox openai select personal` | Choose a saved connected registration |
+| `oc-sandbox openai disconnect` | Retire the active connection and try to revoke it at OpenAI |
+
+Labels are local and can distinguish your accounts or workspaces without
+showing provider identifiers. Only the active label can approve inference.
+Connection and live pytest prerequisites, usage limits, and interrupted-run
+recovery are in the [OpenAI acceptance guide](openai-acceptance.md).
+
 ## Startup, updates and rebuilds
 
 The first setup builds the agent and Chromium images and installs the SELinux module.

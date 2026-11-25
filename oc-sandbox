@@ -2,6 +2,7 @@
 # oc-sandbox — idempotent setup + launch + teardown for sandboxed OpenCode instances
 # (one rootless Podman pod per instance: OpenCode agent + Chromium on your Wayland desktop,
 # optional Postgres and docker-in-docker sidecar).
+# Use the system Bash and skip startup hooks before checking the launcher and helper paths.
 set -euo pipefail
 
 if [[ ${1:-} == orchestrate ]]; then
@@ -30,6 +31,7 @@ UNITS="$HOME/.config/systemd/user"
 UNITS_SOURCE=$UNITS
 AGENT_IMG=oc-agent
 CHROME_IMG=oc-chromium
+RELAY_IMG=oc-openai-relay
 # Images this script built, by full ID (one per line). Only those are ever removed by it: the tag
 # names could belong to anything else, and labels prove nothing (any image built FROM oc-agent
 # inherits them). The role label is informational only.
@@ -42,14 +44,16 @@ BC_BIN=${OC_BCOMPARE_BIN:-/usr/bin/bcompare}                         # host Beyo
 AGENT_MEM=${OC_AGENT_MEMORY:-4g} CHROME_MEM=${OC_CHROMIUM_MEMORY:-4g} DIND_MEM=${OC_DIND_MEMORY:-4g}
 FWD_ENV=(ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY GOOGLE_API_KEY)
 # Pod ports that must never be published: a mapped connection reaches the pod as 127.0.0.1, which
-# Chromium DevTools (full browser control) and Postgres (trust auth, any role) accept without a password.
-SENSITIVE_PORTS=(9222)
-RESERVED_NAMES=" agent chromium chrome postgres pg dind home "
+# Chromium DevTools (9222, full browser control), the pod-local provider relay (8401), and Postgres
+# (trust auth, any role) must never expose on host loopback.
+SENSITIVE_PORTS=(9222 8401)
+RESERVED_NAMES=" agent chromium chrome postgres pg dind home openai-relay openai-home "
 
 usage() {
   cat <<EOF
-Usage: ${0##*/} [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
+Usage: ${0##*/} [--provider openai] [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
+       ${0##*/} openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}
        ${0##*/} orchestrate [--synthetic-check]
 
   (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
@@ -102,8 +106,9 @@ die() { echo "${0##*/}: $*" >&2; exit 2; }
 # outside $SB, which the agent cannot change, remain; the walked physical path is used from then on.
 # The locations must not contain $SB either (-d -a deletes $STATE). Done before anything is touched.
 sb_real=$(/usr/bin/realpath -m -- "$SB")
+openai_sb_real=
 in_sb() {
-  [[ $1/ == "$sb_real"/* ]]
+  [[ $1/ == "$sb_real"/* || ( -n ${openai_sb_real:-} && $1/ == "$openai_sb_real"/* ) ]]
 }
 trusted_path() {  # absolute path -> its physical path on stdout; 1 if the walk enters $SB
   local cur="" comp next t n=0 todo=() tc=()
@@ -131,6 +136,68 @@ trusted_file() { # resolve repository helpers without following a path into the 
   [[ -f $r ]] || return 1
   printf '%s\n' "$r"
 }
+
+verify_openai_helper() {
+  local helper=$1 account_entry account_uid account_home launcher source_file owner mode links source_parent private_source index
+  local source_parents=()
+  # Check the system account's sandbox too, independently of caller HOME.
+  account_entry=$(/usr/bin/getent passwd "$EUID") || die "cannot verify the OpenAI workstation account"
+  IFS=: read -r _ _ account_uid _ _ account_home _ <<<"$account_entry"
+  [[ $account_uid == "$EUID" && $account_home == /* ]] || die "invalid OpenAI workstation account"
+  openai_sb_real=$(/usr/bin/realpath -m -- "$account_home/opencode-sandbox") ||
+    die "cannot verify the OpenAI workstation sandbox path"
+  launcher=$0
+  [[ $launcher == /* ]] || launcher=$CALLER_PHYSICAL/$launcher
+  [[ $(trusted_path "$launcher") == "$SCRIPT_REAL" && -f $SCRIPT_REAL ]] ||
+    die "refusing an unsafe OpenAI launcher path"
+  [[ $(trusted_file "$helper") == "$helper" && ! -L $helper ]] ||
+    die "refusing an unsafe OpenAI helper path"
+  for source_file in "$SCRIPT_REAL" "$helper"; do
+    read -r owner mode links < <(/usr/bin/stat -c '%u %a %h' -- "$source_file") ||
+      die "cannot verify OpenAI source ownership"
+    (( (owner == EUID || owner == 0) && !(8#$mode & 022) && links == 1 )) ||
+      die "refusing unprotected OpenAI source"
+  done
+  source_parent=$SCRIPT_DIR
+  while :; do
+    source_parents+=("$source_parent")
+    [[ $source_parent != / ]] || break
+    source_parent=${source_parent%/*}
+    source_parent=${source_parent:-/}
+  done
+  # A private, user-owned ancestor already excludes other users from its subtree.
+  private_source=0
+  for (( index=${#source_parents[@]}-1; index>=0; index-- )); do
+    source_parent=${source_parents[index]}
+    read -r owner mode < <(/usr/bin/stat -c '%u %a' -- "$source_parent") ||
+      die "cannot verify OpenAI source directory"
+    if [[ $source_parent != /tmp ]] || (( (owner != 0 && owner != 65534) || !(8#$mode & 01000) )); then
+      (( (owner == EUID || owner == 0) && (private_source || !(8#$mode & 022)) )) ||
+        die "refusing unprotected OpenAI source directory"
+    fi
+    if (( owner == EUID && !(8#$mode & 077) )); then private_source=1; fi
+  done
+}
+
+if [[ ${1:-} == openai ]]; then
+  case $#:${2:-} in
+    2:status|2:verify|2:disconnect) ;;
+    3:connect|3:select|4:connect)
+      [[ $# != 4 || $4 == --no-browser ]] ||
+        die "usage: oc-sandbox openai connect LABEL [--no-browser]"
+      LC_ALL=C
+      [[ $3 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] ||
+        die "OpenAI labels must be 1 to 32 ASCII letters, numbers, underscores or hyphens, starting with a letter or number"
+      ;;
+    *) die "usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}" ;;
+  esac
+  helper=$SCRIPT_DIR/oc-openai.py
+  verify_openai_helper "$helper"
+  cd -- "$SCRIPT_DIR"
+  shift
+  exec /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/python3 -IB "$helper" "$@"
+fi
+
 if [[ ${1:-} == orchestrate ]]; then
   shift
   orchestrator_source=$0
@@ -208,7 +275,7 @@ try:
     for path in paths: directory(path, True)
     for name in ("sb-level", "built-images", "built-images.lock", "pg-sig.key", "pg-sig.lock"):
         leaf(os.path.join(state, name), name in ("pg-sig.key", "pg-sig.lock"))
-    for name in ("Containerfile.agent", "Containerfile.chromium", "opencode-sandbox.json", "zshrc", "bridge-open", "gitconfig", "gitignore_global", "oc-opencode-update.py", "oc-opencode-run.py"):
+    for name in ("Containerfile.agent", "Containerfile.chromium", "Containerfile.relay", "opencode-sandbox.json", "zshrc", "bridge-open", "gitconfig", "gitignore_global", "oc-opencode-update.py", "oc-opencode-run.py"):
         leaf(os.path.join(build, name))
     for name in ("oc_chromium.cil", "installed"): leaf(os.path.join(policy, name))
     for name in ("oc-bridge.service", "oc-bridge.path"): leaf(os.path.join(units, name))
@@ -230,7 +297,44 @@ atomic_host_file() {  # destination, mode; contents on stdin
 
 # ---- option parsing ---------------------------------------------------------
 DELETE=0 ALL=0 REBUILD=0 NOLAUNCH=0 YES=0 LISTKEYS=0 NOKEY=0 EXEC=0 PG=0 DIND=0 LIST=0
-INST="" INST_SET=0 CWD_ARG="" WT_ARG="" PORT_ARGS=()
+INST="" INST_SET=0 CWD_ARG="" WT_ARG="" PORT_ARGS=() PROVIDER="" PROVIDER_SET=0
+GETOPTS_ARGS=()
+while (( $# )); do
+  case $1 in
+    --provider)
+      (( !PROVIDER_SET )) || die "--provider may only be specified once"
+      (( $# >= 2 )) && [[ -n $2 ]] || die "--provider needs a value (openai)"
+      PROVIDER=$2 PROVIDER_SET=1
+      shift 2
+      ;;
+    --provider=*)
+      (( !PROVIDER_SET )) || die "--provider may only be specified once"
+      PROVIDER=${1#--provider=}
+      [[ -n $PROVIDER ]] || die "--provider needs a value (openai)"
+      PROVIDER_SET=1
+      shift
+      ;;
+    --)
+      GETOPTS_ARGS+=("$@")
+      break
+      ;;
+    --*)
+      die "unknown option: $1"
+      ;;
+    *)
+      GETOPTS_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+if [[ -n $PROVIDER ]]; then
+  case $PROVIDER in
+    openai) ;;
+    claude|google) die "--provider $PROVIDER is not yet qualified for sandbox launch" ;;
+    *) die "unsupported provider '$PROVIDER' (supported: openai)" ;;
+  esac
+fi
+set -- ${GETOPTS_ARGS[@]+"${GETOPTS_ARGS[@]}"}
 while getopts ":hdarnykKxplDi:P:C:W:" o; do
   case $o in
     h) usage; exit 0 ;;
@@ -242,6 +346,9 @@ while getopts ":hdarnykKxplDi:P:C:W:" o; do
   esac
 done
 (( OPTIND > $# )) || die "unexpected argument: ${!OPTIND}"
+if [[ -n $PROVIDER ]] && (( DELETE || NOLAUNCH || EXEC || LIST || LISTKEYS )); then
+  die "--provider cannot be combined with -n, -d, -x, -l or -k"
+fi
 if (( ALL && !DELETE )); then die "-a only makes sense with -d"; fi
 if (( DELETE || EXEC || LIST || LISTKEYS )) && { (( PG || DIND || ${#PORT_ARGS[@]} )) || [[ -n $CWD_ARG$WT_ARG ]]; }; then
   die "-p, -D, -P, -C and -W only apply when setting up or starting an instance"
@@ -260,8 +367,8 @@ if (( INST_SET )) && [[ -z $INST ]]; then die "-i needs an instance name (use 'd
 set_names() {  # derive every per-instance resource name; the default instance keeps the original names
   local p
   if [[ -z $INST ]]; then p=oc ILABEL=default DEFAULT_CWD=construct POD=oc; else p=oc-$INST ILABEL=$INST DEFAULT_CWD=wt/$INST POD=$p; fi
-  AGENT=$p-agent CHROME=$p-chromium PGC=$p-postgres DINDC=$p-dind
-  CHROMEVOL=$p-chrome PGVOL=$p-pg PGSECRET=$p-pg-password PGPASSSECRET=$p-pg-passfile PGHBASECRET=$p-pg-hba DINDVOL=$p-dind DINDRUN=$p-dind-run
+  AGENT=$p-agent CHROME=$p-chromium PGC=$p-postgres DINDC=$p-dind RELAY=$p-openai-relay
+  CHROMEVOL=$p-chrome PGVOL=$p-pg PGSECRET=$p-pg-password PGPASSSECRET=$p-pg-passfile PGHBASECRET=$p-pg-hba DINDVOL=$p-dind DINDRUN=$p-dind-run OPENAI_HOMEVOL=$p-openai-home
 }
 set_names
 
@@ -690,7 +797,7 @@ parse_ports() {  # PORT_ARGS -> PORTS ("HOST:POD"), refusing unsafe or impossibl
       (( h >= 1 && h <= 65535 && c >= 1 && c <= 65535 )) || die "-P: '$it': ports are 1-65535"
       (( h >= low )) || die "-P: host port $h is below $low, which rootless Podman cannot bind; use e.g. $((h + 8000)):$c (the pod side may be any port)"
       for s in "${SENSITIVE_PORTS[@]}"; do
-        (( c != s )) || die "-P: refusing to publish pod port $c: Chromium DevTools trusts localhost"
+        (( c != s )) || die "-P: refusing to publish pod port $c: Chromium DevTools / provider relay trusts localhost"
       done
       (( c != 5432 || PG )) || die "-P: refusing to publish pod port 5432 without -p (Postgres authentication is required)"
       [[ $seen != *" $h "* ]] || die "-P: host port $h given twice"
@@ -745,8 +852,8 @@ if (( LIST )); then
     ports=$(pm pod inspect "$pod" --format '{{index .Labels "oc.ports"}}' 2>/dev/null || true)
     wd=$(pm container inspect --format '{{.Config.WorkingDir}}' "$AGENT" 2>/dev/null || true)
     side=""
-    for c in "$CHROME" "$PGC" "$DINDC"; do
-      s=$(cstate "$c"); [[ $s == none ]] || side+="${c##*-}:$s "
+    for c in "$CHROME" "$PGC" "$DINDC" "$RELAY"; do
+      s=$(cstate "$c"); [[ $s == none ]] || side+="${c#"$POD"-}:$s "
     done
     wt_info=""
     record_rc=0
@@ -855,8 +962,8 @@ has_unlabelled_instance_resources() {
     fi
   done <<<"$pods"
   while IFS= read -r name; do
-    case $name in oc-home|oc-chrome|oc-pg|oc-dind|oc-dind-run) return 0;; esac
-    if [[ $name =~ ^oc-(.+)-(chrome|pg|dind|dind-run)$ ]] && valid_instance "${BASH_REMATCH[1]}"; then
+    case $name in oc-home|oc-chrome|oc-pg|oc-dind|oc-dind-run|oc-openai-home) return 0;; esac
+    if [[ $name =~ ^oc-(.+)-(chrome|pg|dind|dind-run|openai-home)$ ]] && valid_instance "${BASH_REMATCH[1]}"; then
       return 0
     fi
   done <<<"$volumes"
@@ -969,9 +1076,9 @@ if (( DELETE )); then
     log "Removing instance '$ILABEL' (pod $POD)"
     remove_pod "$POD" || die "could not verify that pod '$POD' was removed"
     if (( ALL )); then
-      if confirm "Also delete volumes $CHROMEVOL $PGVOL $DINDVOL $DINDRUN (Chromium profile, Postgres data, docker storage)?"; then
+      if confirm "Also delete volumes $CHROMEVOL $PGVOL $DINDVOL $DINDRUN $OPENAI_HOMEVOL (Chromium profile, Postgres data, docker storage, provider home)?"; then
         purge_failed=0
-        for v in "$CHROMEVOL" "$PGVOL" "$DINDVOL" "$DINDRUN"; do
+        for v in "$CHROMEVOL" "$PGVOL" "$DINDVOL" "$DINDRUN" "$OPENAI_HOMEVOL"; do
           remove_instance_storage volume "$v" -f || { echo "could not verify removal of volume '$v'" >&2; purge_failed=1; }
         done
         for s in "$PGSECRET" "$PGPASSSECRET" "$PGHBASECRET"; do
@@ -1014,7 +1121,7 @@ if (( DELETE )); then
     log "Removing images, volumes, secrets, build files"
     # Only images this script built: drop our tag from them (not other tags you gave them), then
     # remove every recorded build that is untagged and unused. Never -f, never by tag alone.
-    for img in "$AGENT_IMG" "$CHROME_IMG"; do
+    for img in "$AGENT_IMG" "$CHROME_IMG" "$RELAY_IMG"; do
       id=$(pm image inspect --format '{{.Id}}' "$img" 2>/dev/null || true)
       if owned_image "$id"; then pm untag "$id" "localhost/$img:latest" >/dev/null 2>&1 || true
       elif [[ -n $id ]]; then echo "note: kept image '$img' (${id:0:12}): not built by this oc-sandbox installation" >&2; fi
@@ -1320,6 +1427,13 @@ chrome_hash=$(cd "$BUILD" && sha256sum Containerfile.chromium | cut -d' ' -f1)
 PULL=(); (( REBUILD )) && PULL=(--pull=always)
 ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"  agent
 ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash" chromium
+if [[ $PROVIDER == openai ]]; then
+  atomic_host_file "$BUILD/Containerfile.relay" 0644 <<'EOF'
+FROM docker.io/library/python:3.12-alpine@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df
+EOF
+  relay_hash=$(cd "$BUILD" && sha256sum Containerfile.relay | cut -d' ' -f1)
+  ensure_image "$RELAY_IMG" Containerfile.relay "$relay_hash" relay
+fi
 
 ensure_volume() { pm volume exists "$1" 2>/dev/null \
   || pm volume create --label oc.sandbox=1 --label "oc.instance=$2" "$1" >/dev/null; }
@@ -1333,7 +1447,9 @@ relabel_shared || { echo "could not relabel $SB for the agents (see above)" >&2;
 # An offline reader hashes the current binary, the networked updater sees no
 # mounts, and an offline writer promotes only a complete candidate. The host-side
 # supervisor verifies each CID-receipted container is gone before the next phase.
-if [[ $OPENCODE_VERSION == keep ]]; then
+if [[ $PROVIDER == openai ]]; then
+  : # --provider openai uses an isolated home volume and baked-in OpenCode binary
+elif [[ $OPENCODE_VERSION == keep ]]; then
   echo "OpenCode: keeping the installed version (OC_OPENCODE_VERSION=keep)"
 else
   log "Checking OpenCode for updates"
@@ -1716,7 +1832,7 @@ try:
         if not m or not isinstance(values, list): raise ValueError("unsupported binding")
         target = int(m.group(1))
         if not 1 <= target <= 65535: raise ValueError("invalid pod port")
-        if target == 9222: raise ValueError("DevTools port is published")
+        if target in (9222, 8401): raise ValueError("sensitive pod port is published")
         if target == 5432 and not pg: raise ValueError("Postgres port requires -p")
         for value in values:
             if not isinstance(value, dict) or value.get("HostIp") != "127.0.0.1": raise ValueError("non-loopback binding")
@@ -1763,6 +1879,11 @@ fi
 if [[ -n $recreate ]]; then
   if [[ $(cstate "$AGENT") == running ]]; then
     echo "Cannot recreate pod '$POD' ($recreate): OpenCode is running in instance '$ILABEL'." >&2
+    echo "Exit it first, then rerun this command." >&2
+    exit 1
+  fi
+  if [[ $(cstate "$RELAY") == running ]]; then
+    echo "Cannot recreate pod '$POD' ($recreate): Provider relay is running in instance '$ILABEL'." >&2
     echo "Exit it first, then rerun this command." >&2
     exit 1
   fi
@@ -1877,6 +1998,42 @@ if (( NOLAUNCH )); then
 fi
 
 # ---- launch OpenCode ------------------------------------------------------------------
+if [[ $PROVIDER == openai ]]; then
+  if [[ $(cstate "$AGENT") == running || $(cstate "$RELAY") == running ]]; then
+    release_lifecycle_lock
+    die "OpenCode or provider relay is already running in instance '$ILABEL'; exit it first"
+  fi
+  ensure_volume "$OPENAI_HOMEVOL" "$ILABEL"
+  agent_pg=0
+  if agent_pg_passfile; then agent_pg=1; fi
+  dind_container_arg=""
+  dind_run_arg=""
+  if [[ $(cstate "$DINDC") != none ]]; then dind_container_arg=$DINDC dind_run_arg=$DINDRUN; fi
+  pg_secret_arg=""
+  pg_container_arg=""
+  if (( agent_pg )); then pg_secret_arg=$PGPASSSECRET pg_container_arg=$PGC; fi
+  relay_image_id=$(pm image inspect --format '{{.Id}}' "$RELAY_IMG") || die "missing relay image '$RELAY_IMG'"
+  agent_image_id=$(pm image inspect --format '{{.Id}}' "$AGENT_IMG") || die "missing agent image '$AGENT_IMG'"
+  session_helper=$SCRIPT_DIR/oc-openai-session.py
+  verify_openai_helper "$session_helper"
+  session_spec=$(/usr/bin/python3 -I -c '
+import json, sys
+keys = ("instance", "pod", "agent", "relay", "relay_image", "agent_image", "agent_mem",
+        "level", "sandbox", "cwd", "home_vol", "chromium", "postgres", "pg_secret", "dind", "dind_run")
+print(json.dumps(dict(zip(keys, sys.argv[1:]))))
+' "$ILABEL" "$POD" "$AGENT" "$RELAY" "$relay_image_id" "$agent_image_id" "$AGENT_MEM" \
+  "$LEVEL" "$SB" "$CWD" "$OPENAI_HOMEVOL" "$CHROME" "$pg_container_arg" "$pg_secret_arg" "$dind_container_arg" "$dind_run_arg")
+  release_lifecycle_lock
+  cd -- "$SCRIPT_DIR"
+  log "Launching ChatGPT-backed OpenCode (instance '$ILABEL') in /sandbox/$CWD"
+  exec /usr/bin/env -i HOME="$HOME" TERM="${TERM:-xterm-256color}" PATH=/usr/bin:/bin \
+    /usr/bin/python3 -IB "$session_helper" 3<<<"$session_spec"
+fi
+if [[ $(cstate "$RELAY") == running ]]; then
+  release_lifecycle_lock
+  die "Provider relay is running in instance '$ILABEL'; exit the active provider session first"
+fi
+pm rm -f "$RELAY" >/dev/null 2>&1 || true
 if [[ $(cstate "$AGENT") == running ]]; then
   log "OpenCode is already running in instance '$ILABEL'; setup is up to date (acting like -n)."
   echo "Open a shell in it with:  ${0##*/}${INST:+ -i $INST} -x"

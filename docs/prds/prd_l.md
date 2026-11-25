@@ -1,6 +1,7 @@
 # prd_l: Composable sandbox configuration, host providers, communication adapters, and orchestrator config management
 
-[Index](README.md) · children: [external secret isolation](prd_l1.md) · related:
+[Index](README.md) · children: [external secret isolation](prd_l1.md),
+[grouped CLI and tests](prd_l2.md) · related:
 [Postgres host access](prd_a.md), [per-instance networking](prd_d.md),
 [local HTTPS](prd_e.md), [host tools](prd_f.md), [orchestrator](prd_i.md),
 [orchestrator UI and profiles](prd_i1.md), [SSH onboarding](prd_i2a.md),
@@ -19,7 +20,7 @@ architecture** that cleanly separates:
 2. **How containers execute** (pluggable Runtime Engines / Host Providers), and
 3. **How the controller communicates with the worker** (pluggable Communication Adapters).
 
-At the same time, give the restricted **`oc-sandbox orchestrate` (`-o`)** agent safe, human-gated
+At the same time, give the restricted **`oc-sandbox orchestrate`** agent safe, human-gated
 configuration-management capabilities via typed MCP tools and curated base Skills — **without**
 granting generic host filesystem, shell, Podman, or SSH access.
 
@@ -263,19 +264,13 @@ Every `service@1` declares its `endpoints[]` (`name`, `port`, `protocol`, `defau
   `redis`, `tcp`) and closed placeholders (`{host}`, `{port}`, `{user}`, `{db}`, `{path}`) with
   strict URL percent-encoding; password placeholders are permanently forbidden.
 
-## Reworked Clean-Slate CLI Interface
+## Grouped CLI interface
 
-| Command | Purpose |
-|---|---|
-| `oc-sandbox run [NAME] [--type TYPE] [--host WORKER] [--with MOD]... [--without MOD]... [--port SPEC]... [--allow-remote-write MCP=URL]... [--worktree REPO[:REF]]` | Compile plan, verify grants/drift, start services and OpenCode sandbox. |
-| `oc-sandbox plan [NAME] [...]` | Pure, inert dry-run emitting `plan.lock.json`, `plan_digest`, security elevations, port/auth summary, and drift diff against `applied_plan.json`. |
-| `oc-sandbox build [--type TYPE] [--host WORKER]` | Build/verify pinned images, compiled `mise` OCI toolchain layer, and warm seeds without launching OpenCode. |
-| `oc-sandbox orchestrate` (alias `oc-sandbox -o`) | Launch restricted host orchestrator with typed Config/Orchestration MCP tools and curated base Skills (no generic host file/shell/Podman/SSH access). |
-| `oc-sandbox config {list,show,validate,diff,history,approve,reject,reconcile,restore,lock}` | Host-operator config inspection, live-helper approval/rejection/reconciliation (`--operator-socket`, `--digest`), rollback, and `mise.lock` compilation. |
-| `oc-sandbox worker {list,enroll,probe,bootstrap,reconcile}` | Enroll pinned SSH/Tailcat/cloud workers, probe capabilities, run opt-in previewed bootstrap, reap verified orphans. |
-| `oc-sandbox ps` / `attach NAME` / `down NAME [--purge]` / `rollback NAME` | Inspect running sandboxes/services, attach, tear down via ownership labels/receipts, or restore prior `applied_plan.json`. |
+[L2](prd_l2.md) defines the production command tree, legacy migration, and
+test entry points. The offline spike records the earlier flat command
+grammar as feasibility evidence.
 
-## Restricted Orchestrator (`-o`) Config Management & Base Skills
+## Restricted Orchestrator Config Management & Base Skills
 
 Aligned with [prd_i1](prd_i1.md), the orchestrator runs in a restricted OS sandbox with **zero**
 generic host file reads/writes, shell, Podman socket, SSH agent, or raw secret access.

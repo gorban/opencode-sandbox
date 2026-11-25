@@ -2,6 +2,7 @@
 
 Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential broker](prd_i3.md)
 
+First local acceptance: [I4a OpenAI workstation connection and worker proof](prd_i4a.md).
 Initial workstation sign-in qualification: [Claude Code](prd_i4b.md),
 [Google Antigravity](prd_i4c.md). See [provider configuration and first-use sign-in](prd_i4d.md)
 for the common CLI and orchestrator behavior. See [live rollout and ownership](prd_i4f.md) for
