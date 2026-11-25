@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event, Thread
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from oc_orchestrator.capture import CaptureError, capture
 from oc_orchestrator.claude import Broker, NativeFrames, fixture_instances, native_process, run_proof as run_claude_proof
@@ -240,7 +240,7 @@ class OrchestratorTest(unittest.TestCase):
                 self.assertEqual(response(peer), b"")
 
             self.assertNotEqual(discovery["proof"], selected["proof"])
-            self.assertEqual({**discovery, "proof": selected["proof"]}, selected)
+            self.assertEqual(selected, {**discovery, "proof": selected["proof"]})
             accepted, peer = socket.socketpair()
             with accepted, peer:
                 queue_request(peer, selected)
@@ -397,6 +397,51 @@ class OrchestratorTest(unittest.TestCase):
                 with self.assertRaisesRegex(Failure, "retirement could not be verified"):
                     run_claude_proof(lifeline)
             self.assertTrue((root / "workspace" / "job.txt").is_file())
+
+    def test_claude_owner_retains_scratch_without_waiting_indefinitely_for_native_child(self):
+        session = "00000000-0000-4000-8000-000000000001"
+        args = [*PREFIX, "--model=haiku", "--include-partial-messages", f"--session-id={session}", *SETTINGS]
+        started = Event()
+        processes = []
+
+        def record_process(_broker, _client, _stream, process, _binding, _session):
+            process.wait = Mock(wraps=process.wait)
+            processes.append(process)
+            started.set()
+
+        def run_frontend(root, stage, _lifeline, _broker):
+            if stage == "discovery":
+                return subprocess.CompletedProcess([], 0, stdout=STOCK_MODEL.encode() + b"\n")
+            route = json.loads((root / "frontend" / "turn" / "route.json").read_text())
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+                peer.connect(str(root / "socket" / "native.sock"))
+                peer.sendall(encode({"route": route, "argv": args}))
+                self.assertTrue(started.wait(timeout=3))
+            return subprocess.CompletedProcess([], 1, stdout=b"")
+
+        with TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory) / "scratch"
+            root.mkdir()
+            lifeline = SimpleNamespace(check=lambda: None, active=lambda: True)
+            try:
+                with (patch("oc_orchestrator.claude.mkdtemp", return_value=str(root)),
+                      patch("oc_orchestrator.claude.seed"),
+                      patch("oc_orchestrator.claude.run_frontend", side_effect=run_frontend),
+                      patch("oc_orchestrator.claude.native_command", return_value=["/usr/bin/sleep", "6"]),
+                      patch("oc_orchestrator.claude.Broker.exchange", new=record_process),
+                      patch("oc_orchestrator.claude.kill_group")):
+                    with self.assertRaisesRegex(Failure, "retirement could not be verified"):
+                        run_claude_proof(lifeline)
+                self.assertEqual(processes[0].wait.call_args_list, [call(timeout=2)])
+                self.assertIsNone(processes[0].poll())
+                self.assertTrue(processes[0].stdin.closed)
+                self.assertTrue(processes[0].stdout.closed)
+                self.assertTrue((root / "workspace" / "job.txt").is_file())
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=2)
 
     def test_claude_probe_detects_an_inherited_descriptor_above_15(self):
         with TemporaryFile() as marker:

@@ -138,17 +138,22 @@ class RetirementUnverified(RuntimeError):
 
 @contextmanager
 def native_process(command):
-    with subprocess.Popen(command, env=SYSTEM_ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL, start_new_session=True) as process:
+    # Popen.__exit__ waits without a deadline. Own the unbuffered pipes and the wait here.
+    process = subprocess.Popen(command, env=SYSTEM_ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, start_new_session=True, bufsize=0)
+    try:
+        yield process
+    finally:
+        for pipe in (process.stdin, process.stdout):
+            with suppress(OSError):
+                pipe.close()
         try:
-            yield process
-        finally:
-            try:
-                if process.poll() is None:
+            if process.poll() is None:
+                with suppress(OSError):
                     kill_group(process)
-                process.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
-                raise RetirementUnverified("native fixture retirement could not be verified") from None
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RetirementUnverified("native fixture retirement could not be verified") from None
 
 
 class NativeFrames:
