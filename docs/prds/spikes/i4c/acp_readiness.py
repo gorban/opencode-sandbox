@@ -1,4 +1,4 @@
-"""Offline readiness proof for the bundled synthetic ACP peer."""
+"""Offline readiness proof for the bundled synthetic ACP peer on Linux with pidfd group signaling."""
 
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import secrets
 import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from acp_fixture import ENROLLMENT_LOCK, PROFILE, VERIFIER, credential_digest, d
 
 MAX_FRAME = 256 * 1024
 MAX_RECORD = 1024
+PIDFD_SIGNAL_PROCESS_GROUP = 1 << 2  # Linux UAPI <linux/pidfd.h>.
 JOURNAL = "readiness.json"
 RECEIPT = "readiness-inflight.json"
 FIXTURE = Path(__file__).resolve().with_name("acp_fixture.py")
@@ -33,6 +35,10 @@ class ProtocolError(RuntimeError):
 
 class IntegrityError(RuntimeError):
     """The synthetic profile journal could not be trusted or updated."""
+
+
+class RetirementUnconfirmed(RuntimeError):
+    """The failed readiness check still has a blocking retirement receipt."""
 
 
 @dataclass(frozen=True)
@@ -186,8 +192,9 @@ def read_status(root):
 
 
 class _Channel:
-    def __init__(self, process, io, deadline):
+    def __init__(self, process, pidfd, io, deadline):
         self.process = process
+        self.pidfd = pidfd
         self.io = io
         self.deadline = deadline
         self.buffer = bytearray()
@@ -231,14 +238,23 @@ class _Channel:
         return reply
 
     def finish(self):
-        self.process.stdin.close()
+        try:
+            self.process.stdin.close()
+        except OSError:
+            raise ProtocolError("synthetic ACP input could not be closed") from None
         if self._read():
             raise ProtocolError("unexpected trailing synthetic ACP output")
-        try:
-            if self.process.wait(timeout=max(self.deadline - time.monotonic(), 0)):
+        while time.monotonic() < self.deadline:
+            try:
+                result = _observe_exit(self.pidfd)
+            except OSError:
+                raise ProtocolError("synthetic ACP peer exit could not be observed") from None
+            if result is not None:
+                if result.si_code == os.CLD_EXITED and result.si_status == 0:
+                    return
                 raise ProtocolError("synthetic ACP peer did not finish cleanly")
-        except subprocess.TimeoutExpired:
-            raise ProtocolError("synthetic ACP peer did not exit by its deadline") from None
+            time.sleep(.01)
+        raise ProtocolError("synthetic ACP peer did not exit by its deadline")
 
 
 def _classify(reply):
@@ -260,9 +276,9 @@ def _classify(reply):
     raise ProtocolError("unrecognized synthetic ACP session verdict")
 
 
-def _transcript(process, workspace, timeout):
+def _transcript(process, pidfd, workspace, timeout):
     with selectors.DefaultSelector() as io:
-        channel = _Channel(process, io, time.monotonic() + timeout)
+        channel = _Channel(process, pidfd, io, time.monotonic() + timeout)
         hello = channel.exchange(1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}})
         version = hello["result"].get("protocolVersion") if type(hello.get("result")) is dict else None
         if type(version) is not int or version != 1:
@@ -272,28 +288,113 @@ def _transcript(process, workspace, timeout):
         return _classify(reply)
 
 
-def _retire(process):
+def _observe_exit(pidfd):
+    return os.waitid(os.P_PIDFD, pidfd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+
+@contextmanager
+def _owned_pidfd(process):
+    pid = process.pid
+    pidfd = os.pidfd_open(pid)
     try:
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=1)
-        return True
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+        # Correlate the live direct child with the stdout pipe created for this launch.
+        # If a reaper won before pidfd_open, another direct child cannot own this pipe.
+        pipe = os.fstat(process.stdout.fileno())
+        child_stdout = os.stat(f"/proc/{pid}/fd/1")
+        if not os.path.samestat(pipe, child_stdout) or os.getsid(pid) != pid or os.getpgid(pid) != pid:
+            raise ProcessLookupError("synthetic ACP child identity changed")
+        if _observe_exit(pidfd) is not None:
+            raise ProcessLookupError("synthetic ACP child already exited")
+        yield pidfd
     finally:
-        process.stdin.close()
-        process.stdout.close()
+        os.close(pidfd)
 
 
-def _finish_check(directory, process, workspace, current, check, readiness):
-    if not _retire(process):
+def _reap(process, pidfd):
+    result = os.waitid(os.P_PIDFD, pidfd, os.WEXITED | os.WNOHANG)
+    if result is None:
+        return False
+    process.returncode = result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
+    return True
+
+
+def _session_is_stopped(session, deadline):
+    with os.scandir("/proc") as entries:
+        for entry in entries:
+            if time.monotonic() >= deadline:
+                return False
+            if not entry.name.isascii() or not entry.name.isdecimal():
+                continue
+            try:
+                with open(f"{entry.path}/stat", "rb") as stream:
+                    state, _, _, member_session, *_ = stream.read(4096).rsplit(b")", 1)[1].split()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if int(member_session) == session and state not in {b"Z", b"X"}:
+                return False
+    return True
+
+
+def _retire_group(process, pidfd):
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        return False
+    pid = process.pid
+    try:
+        _observe_exit(pidfd)  # Recheck direct-child ownership without reaping.
+        with suppress(ProcessLookupError):
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL, None, PIDFD_SIGNAL_PROCESS_GROUP)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if _observe_exit(pidfd) is not None and _session_is_stopped(pid, deadline):
+                return _reap(process, pidfd)
+            time.sleep(.01)
+    except (OSError, ValueError, IndexError):
+        return False
+    return False
+
+
+def _close_pipes(process):
+    closed = True
+    for pipe in (process.stdin, process.stdout):
+        try:
+            pipe.close()
+        except OSError:
+            closed = False
+    return closed
+
+
+def _retire(process, pidfd):
+    try:
+        stopped = _retire_group(process, pidfd)
+    finally:
+        closed = _close_pipes(process)
+    return stopped and closed
+
+
+def _check_workspace(directory, check, workspace_fd):
+    opened = os.fstat(workspace_fd)
+    named = os.stat(check, dir_fd=directory, follow_symlinks=False)
+    if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700 or not os.path.samestat(opened, named)):
+        raise IntegrityError("the exact synthetic ACP workspace changed")
+
+
+def _remove_workspace(directory, check, workspace_fd):
+    _check_workspace(directory, check, workspace_fd)
+    if os.listdir(workspace_fd):
+        raise IntegrityError("synthetic ACP workspace is not empty")
+    os.rmdir(check, dir_fd=directory)
+
+
+def _finish_check(directory, process, pidfd, workspace_fd, current, check, readiness):
+    if not _retire(process, pidfd):
         return ReadinessState.REVOCATION_UNCONFIRMED
     expected = Record(current.generation, ReadinessState.REVOCATION_UNCONFIRMED, check)
     if _read(directory, JOURNAL) != current or _read(directory, RECEIPT) != expected:
         raise IntegrityError("the exact synthetic readiness check changed")
+    _remove_workspace(directory, check, workspace_fd)
     # Keep the receipt if final publication cannot be synced, even if the rename succeeded.
     _store(directory, JOURNAL, Record(current.generation, readiness))
-    workspace.rmdir()
     os.unlink(RECEIPT, dir_fd=directory)
     # The journal is already durable. This sync only makes receipt eviction durable.
     # If a crash brings the receipt back, it blocks reuse until inspected.
@@ -302,24 +403,67 @@ def _finish_check(directory, process, workspace, current, check, readiness):
     return readiness
 
 
-def _run_fixture(directory, current, check, scene, timeout):
-    workspace = Path(f"/proc/self/fd/{directory}") / check
-    workspace.mkdir(mode=0o700)
+def _check_transcript(directory, process, pidfd, workspace_fd, current, check, timeout):
     try:
-        args = [sys.executable, "-IBS", str(FIXTURE), scene, str(workspace.resolve().parent), current.generation]
-        process = subprocess.Popen(args, cwd=workspace,
+        workspace = Path(f"/proc/self/fd/{workspace_fd}").resolve(strict=True)
+        readiness = _transcript(process, pidfd, workspace, timeout)
+    except BaseException as cause:
+        retired = _finish_check(directory, process, pidfd, workspace_fd, current, check, ReadinessState.NEEDS_VERIFY)
+        if retired is ReadinessState.REVOCATION_UNCONFIRMED:
+            raise RetirementUnconfirmed("synthetic ACP retirement is unconfirmed") from cause
+        raise
+    return _finish_check(directory, process, pidfd, workspace_fd, current, check, readiness)
+
+
+def _prepare_owned_peer(process, pidfd):
+    try:
+        # Check the kernel's group flag before sending any ACP input.
+        signal.pidfd_send_signal(pidfd, 0, None, PIDFD_SIGNAL_PROCESS_GROUP)
+        return True
+    except (AttributeError, OSError):
+        # The bundled peer has received no requests. Close its input and reap it by pidfd.
+        _close_pipes(process)
+        deadline = time.monotonic() + 1
+        with suppress(OSError):
+            while time.monotonic() < deadline:
+                if _reap(process, pidfd):
+                    break
+                time.sleep(.01)
+        return False
+
+
+def _run_in_workspace(directory, workspace_fd, current, check, scene, timeout):
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        return ReadinessState.REVOCATION_UNCONFIRMED
+    workspace_link = Path(f"/proc/self/fd/{workspace_fd}")
+    workspace = workspace_link.resolve(strict=True)
+    try:
+        args = [sys.executable, "-IBS", str(FIXTURE), scene, str(workspace.parent), current.generation]
+        process = subprocess.Popen(args, cwd=workspace_link,
                                    env={"HOME": "/nonexistent", "LANG": "C.UTF-8"}, stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True)
     except OSError:
         # The process receipt is unavailable. Preserve the provisional record and scratch.
         return ReadinessState.REVOCATION_UNCONFIRMED
+    with ExitStack() as resources:
+        try:
+            pidfd = resources.enter_context(_owned_pidfd(process))
+        except (AttributeError, OSError):
+            _close_pipes(process)
+            return ReadinessState.REVOCATION_UNCONFIRMED
+        if not _prepare_owned_peer(process, pidfd):
+            return ReadinessState.REVOCATION_UNCONFIRMED
+        return _check_transcript(directory, process, pidfd, workspace_fd, current, check, timeout)
+
+
+def _run_fixture(directory, current, check, scene, timeout):
+    os.mkdir(check, mode=0o700, dir_fd=directory)
+    fd = os.open(check, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
     try:
-        # Pass the child's actual path, since /proc/self/fd is scoped to the parent.
-        readiness = _transcript(process, workspace.resolve(strict=True), timeout)
-    except BaseException:
-        _finish_check(directory, process, workspace, current, check, ReadinessState.NEEDS_VERIFY)
-        raise
-    return _finish_check(directory, process, workspace, current, check, readiness)
+        _check_workspace(directory, check, fd)
+        return _run_in_workspace(directory, fd, current, check, scene, timeout)
+    finally:
+        os.close(fd)
 
 
 def probe_fixture(root, generation, scene="ready", *, timeout=2):

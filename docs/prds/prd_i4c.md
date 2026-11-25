@@ -21,7 +21,8 @@ test completed a synthetic text turn while both containers lacked access to a sy
 workstation file and socket. Enrollment and the brokered native route still need qualification.
 
 The [synthetic ACP readiness probe](spikes/i4c/acp_readiness.py) exercises only `initialize` and
-`session/new` with a bundled fake peer. From the repository root, run
+`session/new` with a bundled fake peer. It requires Linux with
+`PIDFD_SIGNAL_PROCESS_GROUP` (upstream 6.9 or later). From the repository root, run
 `python3 -B -m unittest discover -s docs/prds/spikes/i4c -v`. The test enrollment writes a private
 credential record and a separate verifier record for the exact generation. The verifier binds the
 issued synthetic credential and its expiry to that generation. Substituting another enrollment's

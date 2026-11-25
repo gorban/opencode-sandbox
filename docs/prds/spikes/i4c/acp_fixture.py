@@ -118,6 +118,9 @@ def send_session(scene):
         print('{"jsonrpc":"2.0",', end="", flush=True)
         time.sleep(.01)
         print('"id":2,"result":{"sessionId":"synthetic-private-session"}}', flush=True)
+    elif scene == "dirty-workspace":
+        Path("peer-created").touch(exist_ok=False)
+        send(2, result={"sessionId": SESSION})
     elif scene in {"ready", "empty-session", "trailing", "bad-exit"}:
         send(2, result={"sessionId": " " if scene == "empty-session" else SESSION})
     else:

@@ -1,15 +1,29 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+import errno
 import json
 import os
 from pathlib import Path
+import selectors
+import signal
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import acp_readiness as acp
 from oc_providers import ReadinessState as State
+
+
+PROFILE_REJECTED = "rejected its private profile"
+
+
+def _pidfd_ready(fd, timeout):
+    with selectors.DefaultSelector() as io:
+        io.register(fd, selectors.EVENT_READ)
+        return bool(io.select(timeout))
 
 
 class SyntheticReadinessTest(unittest.TestCase):
@@ -53,10 +67,10 @@ class SyntheticReadinessTest(unittest.TestCase):
         with TemporaryDirectory() as other:
             acp.enroll_fixture(other)
             self.profile.write_bytes((Path(other) / acp.PROFILE).read_bytes())
-        with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
+        with self.assertRaisesRegex(acp.IntegrityError, PROFILE_REJECTED):
             self.probe()
         self.profile.write_text("{broken")
-        with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
+        with self.assertRaisesRegex(acp.IntegrityError, PROFILE_REJECTED):
             self.probe()
         self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
 
@@ -79,7 +93,7 @@ class SyntheticReadinessTest(unittest.TestCase):
             json.dump({**profile, "credential": other_credential}, fixture)
             fixture.truncate()
             fixture.flush()
-            with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
+            with self.assertRaisesRegex(acp.IntegrityError, PROFILE_REJECTED):
                 self.probe()
             self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
             fixture.seek(0)
@@ -92,7 +106,7 @@ class SyntheticReadinessTest(unittest.TestCase):
         self.assertNotIn(json.loads(self.profile.read_text())["credential"], verifier.read_text())
         self.assertEqual(verifier.stat().st_mode & 0o777, 0o600)
         verifier.unlink()
-        with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
+        with self.assertRaisesRegex(acp.IntegrityError, PROFILE_REJECTED):
             self.probe()
         self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
 
@@ -114,14 +128,16 @@ class SyntheticReadinessTest(unittest.TestCase):
             acp.fcntl.flock(lock, acp.fcntl.LOCK_EX | acp.fcntl.LOCK_NB)
             with TemporaryDirectory(dir=self.root) as scratch:
                 args = [sys.executable, "-IBS", str(acp.FIXTURE), "ready", str(self.root), self.generation]
+                workspace = Path(scratch)
                 process = subprocess.Popen(args, cwd=scratch, env={"HOME": "/nonexistent", "LANG": "C.UTF-8"},
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                           bufsize=0)
-                try:
-                    with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
-                        acp._transcript(process, Path(scratch), 2)
-                finally:
-                    self.assertTrue(acp._retire(process))
+                                           bufsize=0, start_new_session=True)
+                with acp._owned_pidfd(process) as pidfd:
+                    try:
+                        with self.assertRaisesRegex(acp.IntegrityError, PROFILE_REJECTED):
+                            acp._transcript(process, pidfd, workspace, 2)
+                    finally:
+                        self.assertTrue(acp._retire(process, pidfd))
 
     def test_bad_transcript_never_publishes_readiness_or_retains_raw_output(self):
         self.assertIs(self.probe(), State.READY)
@@ -143,8 +159,8 @@ class SyntheticReadinessTest(unittest.TestCase):
     def test_unconfirmed_retirement_keeps_evidence_and_blocks_new_processes(self):
         retire = acp._retire
 
-        def unconfirmed(process):
-            self.assertTrue(retire(process))
+        def unconfirmed(process, pidfd):
+            self.assertTrue(retire(process, pidfd))
             return False
 
         with patch.object(acp, "_retire", side_effect=unconfirmed):
@@ -159,6 +175,110 @@ class SyntheticReadinessTest(unittest.TestCase):
                 acp.enroll_fixture(self.root)
             launch.assert_not_called()
         self.assertEqual(acp.read_status(self.root), retained)
+
+    def test_timeout_surfaces_unconfirmed_retirement_with_cause_and_blocks_retry(self):
+        retire = acp._retire
+
+        def unconfirmed(process, pidfd):
+            self.assertTrue(retire(process, pidfd))
+            return False
+
+        with (patch.object(acp, "_retire", side_effect=unconfirmed),
+              self.assertRaises(acp.RetirementUnconfirmed) as error):
+            self.probe("timeout", timeout=.25)
+        self.assertIsInstance(error.exception.__cause__, acp.ProtocolError)
+        self.assertIn("deadline expired", str(error.exception.__cause__))
+        retained = acp.read_status(self.root)
+        self.assertIs(retained.readiness, State.REVOCATION_UNCONFIRMED)
+        with patch.object(acp.subprocess, "Popen") as launch:
+            self.assertIs(self.probe(), State.REVOCATION_UNCONFIRMED)
+            launch.assert_not_called()
+
+    def test_peer_created_workspace_file_prevents_publication(self):
+        original = self.journal.read_bytes()
+        with self.assertRaises(acp.IntegrityError) as error:
+            self.probe("dirty-workspace")
+        self.assertEqual(self.journal.read_bytes(), original)
+        self.assertIn("workspace is not empty", str(error.exception))
+        retained = acp.read_status(self.root)
+        self.assertIs(retained.readiness, State.REVOCATION_UNCONFIRMED)
+        self.assertTrue((self.root / retained.check / "peer-created").is_file())
+
+    def test_pipe_close_failure_does_not_escape_retirement(self):
+        process = Mock()
+        process.stdin.close.side_effect = OSError
+        with patch.object(acp, "_retire_group", return_value=False):
+            self.assertFalse(acp._retire(process, 0))
+        process.stdout.close.assert_called_once_with()
+
+    def test_automatic_reaping_refuses_group_signals_for_owned_child(self):
+        process = subprocess.Popen([sys.executable, "-IBS", "-c", "import sys; sys.stdin.read()"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True, bufsize=0)
+        with acp._owned_pidfd(process) as pidfd:
+            try:
+                previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+                try:
+                    with (patch.object(os, "killpg") as numeric,
+                          patch.object(signal, "pidfd_send_signal") as stable):
+                        self.assertFalse(acp._retire_group(process, pidfd))
+                        numeric.assert_not_called()
+                        stable.assert_not_called()
+                finally:
+                    signal.signal(signal.SIGCHLD, previous)
+            finally:
+                self.assertTrue(acp._retire(process, pidfd))
+
+    def test_unavailable_pidfd_group_flag_stops_before_transcript(self):
+        popen = acp.subprocess.Popen
+        launched = []
+
+        def capture(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            launched.append(process)
+            return process
+
+        unsupported = OSError(errno.EINVAL, "group flag unavailable")
+        with (patch.object(acp.subprocess, "Popen", side_effect=capture),
+              patch.object(signal, "pidfd_send_signal", side_effect=unsupported) as group_signal,
+              patch.object(acp, "_transcript") as transcript):
+            self.assertIs(self.probe(), State.REVOCATION_UNCONFIRMED)
+            transcript.assert_not_called()
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(group_signal.call_count, 1)
+        self.assertIsNotNone(launched[0].returncode)
+        self.assertTrue(launched[0].stdin.closed)
+        self.assertTrue(launched[0].stdout.closed)
+        self.assertIs(acp.read_status(self.root).readiness, State.REVOCATION_UNCONFIRMED)
+
+    def test_finish_leaves_group_leader_unreaped_for_owned_descendant_retirement(self):
+        script = (
+            "import subprocess, sys\n"
+            "child = subprocess.Popen([sys.executable, '-IBS', '-c', 'import time; time.sleep(30)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "print(child.pid, flush=True)\n"
+            "sys.stdin.buffer.read()\n"
+        )
+        process = subprocess.Popen([sys.executable, "-IBS", "-c", script], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True,
+                                   env={}, bufsize=0)
+        with acp._owned_pidfd(process) as pidfd, selectors.DefaultSelector() as io:
+            deadline = time.monotonic() + 2
+            channel = acp._Channel(process, pidfd, io, deadline)
+            descendant = int(channel._read())
+            descendant_fd = os.pidfd_open(descendant)
+            try:
+                channel.finish()
+                self.assertIsNone(process.returncode)
+                self.assertFalse(_pidfd_ready(descendant_fd, 0))
+                self.assertTrue(acp._retire(process, pidfd))
+                self.assertTrue(_pidfd_ready(descendant_fd, 1))
+                self.assertIsNotNone(process.returncode)
+            finally:
+                with suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(descendant_fd, signal.SIGKILL)
+                os.close(descendant_fd)
+                if process.returncode is None:
+                    acp._retire(process, pidfd)
 
     def test_missing_process_receipt_keeps_provisional_evidence(self):
         with patch.object(acp.subprocess, "Popen", side_effect=OSError):
@@ -244,7 +364,8 @@ class SyntheticReadinessTest(unittest.TestCase):
         self.assertEqual(json.loads(self.journal.read_text())["readiness"], "ready")
         retained = acp.read_status(self.root)
         self.assertIs(retained.readiness, State.REVOCATION_UNCONFIRMED)
-        self.assertTrue((self.root / retained.check).is_dir())
+        self.assertTrue((self.root / acp.RECEIPT).is_file())
+        self.assertFalse((self.root / retained.check).exists())
         with patch.object(acp.subprocess, "Popen") as launch:
             self.assertIs(self.probe(), State.REVOCATION_UNCONFIRMED)
             launch.assert_not_called()
