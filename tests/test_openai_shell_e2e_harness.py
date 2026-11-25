@@ -3969,6 +3969,22 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 shell_driver.render_terminal_screen("\x1b[?1047hpanel-old\x1b[?1047l\x1b[?1047h\x1b[1;1Hnew").strip(),
                 "new",
             )
+            # Leaving alt screen via ?1049l preserves the alt grid and its uncertainty for later ?47h/?1047h re-entry.
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[?1049hpanel-old\x1b[?1049l\x1b[?47h\x1b[1;1Hnew").strip(),
+                "newel-old",
+            )
+            alt_uncertain_screen = shell_driver._TerminalScreen()
+            alt_uncertain_screen.feed(f"\x1b[?1049h\x1b[?9999h\x1b[?1049l\x1b[?47h{route_txt}")
+            self.assertFalse(alt_uncertain_screen.is_certain)
+            # CSI 3J erases scrollback only, preserving visible grid contents and certainty.
+            self.assertEqual(
+                shell_driver.render_terminal_screen("panel-old\x1b[3J\x1b[1;1Hnew").strip(),
+                "newel-old",
+            )
+            scrollback_uncertain_screen = shell_driver._TerminalScreen()
+            scrollback_uncertain_screen.feed(f"\x1b[?9999h\x1b[3J{route_txt}")
+            self.assertFalse(scrollback_uncertain_screen.is_certain)
             wide_old = "x" * (len(route_txt) + 5)
             conflict_txt = f"openai--work/{TEST_MODEL}"
             for dual_buf_conflict in (
@@ -3978,6 +3994,10 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 f"{conflict_txt}\x1b[?47l\x1b[2;1H{route_txt}",
                 f"{wide_old}\x1b[?1049h\x1b[?1049l\x1b[1;1H{route_txt}",
                 f"\x1b[?47h{wide_old}\x1b[?47h\x1b[1;1H{route_txt}",
+                f"\x1b[?1049h{wide_old}\x1b[?1049l\x1b[?47h\x1b[1;1H{route_txt}",
+                f"\x1b[?1049h\x1b[?9999h\x1b[?1049l\x1b[?47h{route_txt}",
+                f"{wide_old}\x1b[3J\x1b[1;1H{route_txt}",
+                f"\x1b[?9999h\x1b[3J{route_txt}",
             ):
                 self.assertIsNone(shell_driver.extract_observed_route_row(dual_buf_conflict, approval))
             # Returning from ?1049h to an uncertain main screen preserves main-screen uncertainty.

@@ -290,8 +290,10 @@ class _TerminalScreen:
             self._saved_states = {False: default_saved, True: default_saved}
 
     def _erase_display(self, mode: int) -> None:
-        if mode in (2, 3):
+        if mode == 2:
             self._reset_screen(reset_cursor=False, full_reset=False)
+            return
+        if mode == 3:
             return
         if mode == 0:
             for c in range(self.col, self.cols):
@@ -394,9 +396,7 @@ class _TerminalScreen:
             self._reset_screen(reset_cursor=False, full_reset=False)
             return
         if mode == "1049":
-            if self._in_alt_screen:
-                self._reset_screen(reset_cursor=False, full_reset=False)
-                self._in_alt_screen = False
+            self._in_alt_screen = False
             self._restore_cursor()
             return
         if final == "h":
@@ -532,13 +532,31 @@ class _TerminalScreen:
             self._apply_simple_sgr(code)
             idx += 1
 
+    @staticmethod
+    def _is_ignored_csi(params: str, final: str) -> bool:
+        if final in ("n", "c"):
+            return True
+        if final == "q" and params.endswith(" "):
+            return True
+        return final == "t" and not params.startswith("8;")
+
+    def _handle_cursor_csi(self, final: str, params: str, nums: list[int]) -> None:
+        if final in _CURSOR_MOVES:
+            self._move_cursor(final, nums)
+        elif final == "r":
+            self._set_scroll_margins(nums)
+        elif not params and final == "s":
+            self._save_cursor()
+        elif not params and final == "u":
+            self._restore_cursor()
+        else:
+            self._uncertain = True
+
     def _handle_csi(self, params: str, final: str) -> None:
         if final == "m":
             self._handle_sgr(params)
             return
-        if final in ("n", "c", "t"):
-            return
-        if final == "q" and params.endswith(" "):
+        if self._is_ignored_csi(params, final):
             return
         if final in ("h", "l"):
             self._handle_mode_csi(params, final)
@@ -549,16 +567,7 @@ class _TerminalScreen:
         nums = self._csi_nums(params)
         if self._handle_edit_csi(final, nums[0] if nums else 0):
             return
-        if final in _CURSOR_MOVES:
-            self._move_cursor(final, nums)
-        elif final == "r":
-            self._set_scroll_margins(nums)
-        elif final == "s":
-            self._save_cursor()
-        elif final == "u":
-            self._restore_cursor()
-        else:
-            self._uncertain = True
+        self._handle_cursor_csi(final, params, nums)
 
     def _linefeed(self) -> None:
         if self.row == self._scroll_bottom:
