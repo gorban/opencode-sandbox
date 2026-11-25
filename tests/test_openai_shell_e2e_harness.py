@@ -4068,6 +4068,24 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 shell_driver.render_terminal_screen("ABCD\x1b[3JZ", rows=4, cols=4).splitlines()[:2],
                 ["ABCD", "Z"],
             )
+            # CSI L/M outside scrolling region leave cursor and pending wrap untouched;
+            # inside scrolling region they move to column 0 and clear pending wrap.
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[2;3r\x1b[1;1HABCD\x1b[1LE", rows=4, cols=4).splitlines()[:2],
+                ["ABCD", "E"],
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[2;3r\x1b[1;1HABCD\x1b[1ME", rows=4, cols=4).splitlines()[:2],
+                ["ABCD", "E"],
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[1;4r\x1b[1;1HABCD\x1b[1LZ", rows=4, cols=4).splitlines()[:2],
+                ["Z", "ABCD"],
+            )
+            self.assertEqual(
+                shell_driver.render_terminal_screen("\x1b[1;4r\x1b[1;1HABCD\x1b[1MZ", rows=4, cols=4).splitlines()[:2],
+                ["Z", ""],
+            )
             self.assertIsNone(
                 shell_driver.extract_observed_route_row(f"\x1b[1;120H \x1b[2K{route_txt}", approval),
             )

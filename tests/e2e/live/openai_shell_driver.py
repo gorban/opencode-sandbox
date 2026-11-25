@@ -391,14 +391,18 @@ class _TerminalScreen:
         self.grid[top:bottom + 1] = (region[step:] + blanks) if up else (blanks + region[:-step])
 
     def _delete_lines(self, count: int) -> None:
+        if not (self._scroll_top <= self.row <= self._scroll_bottom):
+            return
+        self.col = 0
         self._wrap_pending = False
-        if self._scroll_top <= self.row <= self._scroll_bottom:
-            self._scroll_region(self.row, self._scroll_bottom, count, up=True)
+        self._scroll_region(self.row, self._scroll_bottom, count, up=True)
 
     def _insert_lines(self, count: int) -> None:
+        if not (self._scroll_top <= self.row <= self._scroll_bottom):
+            return
+        self.col = 0
         self._wrap_pending = False
-        if self._scroll_top <= self.row <= self._scroll_bottom:
-            self._scroll_region(self.row, self._scroll_bottom, count, up=False)
+        self._scroll_region(self.row, self._scroll_bottom, count, up=False)
 
     def _set_scroll_margins(self, nums: list[int]) -> None:
         top = (nums[0] - 1) if nums and nums[0] > 0 else 0
