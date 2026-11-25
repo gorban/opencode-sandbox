@@ -192,9 +192,8 @@ class _TextSession:
                 resources = self._abandoned_resources
                 self._busy = False
             if resources is not None:
-                with resources:
-                    with suppress(RetirementUnconfirmed):
-                        self.abort()
+                with resources, suppress(RetirementUnconfirmed):
+                    self.abort()
 
     def close_owner(self, resources):
         with self._lease_lock:
@@ -239,12 +238,11 @@ class _TextSession:
             raise ProtocolError("unexpected output was already buffered across an ACP phase boundary")
         return frame
 
-    def initialize(self, workspace, sync):
+    def initialize(self, workspace, sync, deadline):
         stdin = self.process.stdin.fileno()
         os.set_blocking(stdin, False)
         os.set_blocking(self.process.stdout.fileno(), False)
         self.pipe_buf = os.fpathconf(stdin, "PC_PIPE_BUF")
-        deadline = time.monotonic() + self.timeout
         hello = self._exchange(INIT_ID, "initialize",
                                {"protocolVersion": 1, "clientCapabilities": {}}, deadline)
         version = _response(hello, INIT_ID, "result")
@@ -314,19 +312,21 @@ class _TextSession:
                 raise ProtocolError("synthetic ACP turn was cancelled or expired")
             frame = self._next_frame(self.deadline)
             if type(frame) is dict and "id" in frame:
-                terminal = _response(frame, PROMPT_ID, "result")
-                if not _object(terminal, {"stopReason"}) or terminal["stopReason"] != "end_turn":
-                    raise ProtocolError("unexpected synthetic ACP terminal result")
-                if text != EXPECTED_TEXT:
-                    raise ProtocolError("unexpected synthetic ACP turn text")
-                self._finish_transcript(self.deadline, self.cancelled)
-                return text, chunks, digest.hexdigest()
+                break
             chunk = _chunk(frame, self.session_id)
             text += chunk
             if not EXPECTED_TEXT.startswith(text):
                 raise ProtocolError("unexpected synthetic ACP text prefix")
             chunks += 1
             hash_chunk(digest, chunk)
+
+        terminal = _response(frame, PROMPT_ID, "result")
+        if not _object(terminal, {"stopReason"}) or terminal["stopReason"] != "end_turn":
+            raise ProtocolError("unexpected synthetic ACP terminal result")
+        if text != EXPECTED_TEXT:
+            raise ProtocolError("unexpected synthetic ACP turn text")
+        self._finish_transcript(self.deadline, self.cancelled)
+        return text, chunks, digest.hexdigest()
 
     def complete(self):
         """Return validated text only after receipt, verified retirement, and durable cleanup."""
@@ -467,8 +467,9 @@ def open_text_session(root: Path, generation: str, scene="ready", *, timeout=5, 
     """
     if scene not in SCENES or type(timeout) not in (int, float) or not 0 < timeout <= 30:
         raise ValueError("invalid synthetic ACP scene or timeout")
+    deadline = time.monotonic() + timeout
     with ExitStack() as resources:
-        directory = resources.enter_context(readiness._locked(root))
+        directory = resources.enter_context(readiness._locked(root, deadline=deadline, cancelled=cancelled))
         current = readiness._status(directory)
         if current is None or current.generation != generation:
             raise IntegrityError("the exact synthetic generation changed")
@@ -487,7 +488,9 @@ def open_text_session(root: Path, generation: str, scene="ready", *, timeout=5, 
         session, workspace, sync = _launch(resources, directory, workspace_fd, current, attempt,
                                            scene, timeout, cancelled)
         try:
-            session.initialize(workspace, sync)
+            session.initialize(workspace, sync, deadline)
+            if cancelled() or time.monotonic() >= deadline:
+                raise ProtocolError("synthetic ACP startup was cancelled or expired")
             yield session
         finally:
             session.close_owner(resources)

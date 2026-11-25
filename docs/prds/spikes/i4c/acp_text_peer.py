@@ -147,12 +147,7 @@ class TurnEvidence:
             os.close(self.fd)
 
 
-def turn(scene, evidence):
-    accepted = read_request(prompt_request(SESSION))
-    if accepted is not True:
-        evidence.write(0, scene)
-        return 0 if accepted is None else 2
-
+def emit_turn_text(scene, evidence):
     if scene == "mixed":
         evidence.emit("k")
     elif scene == "split":
@@ -165,6 +160,15 @@ def turn(scene, evidence):
         # The terminal reply will exceed the cap after we have published the receipt.
         for _ in range(MAX_FRAMES - 3):
             evidence.emit("")
+
+
+def turn(scene, evidence):
+    accepted = read_request(prompt_request(SESSION))
+    if accepted is not True:
+        evidence.write(0, scene)
+        return 0 if accepted is None else 2
+
+    emit_turn_text(scene, evidence)
     evidence.write(1, scene)
 
     if scene == "timeout":

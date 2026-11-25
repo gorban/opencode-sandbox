@@ -174,14 +174,16 @@ class TextBrokerTest(unittest.TestCase):
 
     def test_negative_acp_transcripts_release_zero_http_answer_bytes(self):
         for scene in ("early", "mixed", "permission", "wrong-stop", "trailing"):
-            with self.subTest(scene=scene), ExitStack() as resources:
+            with self.subTest(scene=scene), ExitStack() as resources, ExitStack() as broker_scope:
                 # Each negative control gets its own private socket and one-shot peer.
                 self.address = Path(resources.enter_context(TemporaryDirectory())) / "broker.sock"
-                with self.assertRaises(ProtocolError), self.broker() as broker:
-                    peer = self.open_peer(resources, broker, scene)
-                    broker.arm(peer)
-                    with self.request() as client:
-                        self.assertEqual(response(client), b"")
+                broker = broker_scope.enter_context(self.broker())
+                peer = self.open_peer(resources, broker, scene)
+                broker.arm(peer)
+                with self.request() as client:
+                    self.assertEqual(response(client), b"")
+                with self.assertRaises(ProtocolError):
+                    broker_scope.close()
                 self.assertEqual(peer.prompt_count, 1)
                 self.assertEqual(broker.outcome(), BrokerReceipt(1, 0, 1, 0, self.body))
 
@@ -241,36 +243,43 @@ class TextBrokerTest(unittest.TestCase):
 
     def test_failed_prompt_write_spends_the_claim_and_reaches_owner(self):
         self.peer.send_prompt.side_effect = ProtocolError("synthetic partial prompt write")
-        with self.assertRaisesRegex(ProtocolError, "partial prompt write"):
-            with self.broker() as broker:
-                broker.arm(self.peer)
-                with self.request() as client:
-                    self.assertEqual(response(client), b"")
-                self.assertEqual(broker.outcome(), BrokerReceipt(1, 0, 1, 0, self.body))
-                self.assertTrue(broker.cancelled())
+        with ExitStack() as broker_scope:
+            broker = broker_scope.enter_context(self.broker())
+            broker.arm(self.peer)
+            with self.request() as client:
+                self.assertEqual(response(client), b"")
+            self.assertEqual(broker.outcome(), BrokerReceipt(1, 0, 1, 0, self.body))
+            self.assertTrue(broker.cancelled())
+            with self.assertRaisesRegex(ProtocolError, "partial prompt write"):
+                broker_scope.close()
         self.peer.send_prompt.assert_called_once_with()
         self.peer.complete.assert_not_called()
 
     def test_failed_verification_reaches_owner_without_response_bytes(self):
         self.peer.complete.side_effect = ProtocolError("synthetic peer refused its transcript")
-        with self.assertRaisesRegex(ProtocolError, "peer refused its transcript"):
-            with self.broker() as broker:
-                broker.arm(self.peer)
-                with self.request() as client:
-                    self.assertEqual(response(client), b"")
-                self.assertEqual(broker.outcome(), BrokerReceipt(1, 0, 1, 0, self.body))
+        with ExitStack() as broker_scope:
+            broker = broker_scope.enter_context(self.broker())
+            broker.arm(self.peer)
+            with self.request() as client:
+                self.assertEqual(response(client), b"")
+            self.assertEqual(broker.outcome(), BrokerReceipt(1, 0, 1, 0, self.body))
+            with self.assertRaisesRegex(ProtocolError, "peer refused its transcript"):
                 broker.receipt()
+            with self.assertRaisesRegex(ProtocolError, "peer refused its transcript"):
+                broker_scope.close()
         self.peer.send_prompt.assert_called_once_with()
         self.peer.complete.assert_called_once_with()
 
     def test_retirement_failure_is_added_to_the_primary_error(self):
         self.peer.complete.side_effect = ProtocolError("synthetic transcript failed")
         self.peer.retire.side_effect = RetirementUnconfirmed("synthetic retirement unconfirmed")
-        with self.assertRaisesRegex(ProtocolError, "transcript failed") as failure:
-            with self.broker() as broker:
-                broker.arm(self.peer)
-                with self.request() as client:
-                    self.assertEqual(response(client), b"")
+        with ExitStack() as broker_scope:
+            broker = broker_scope.enter_context(self.broker())
+            broker.arm(self.peer)
+            with self.request() as client:
+                self.assertEqual(response(client), b"")
+            with self.assertRaisesRegex(ProtocolError, "transcript failed") as failure:
+                broker_scope.close()
         self.assertEqual(failure.exception.__notes__, [
             "Offline ACP peer retirement also failed: synthetic retirement unconfirmed",
         ])
@@ -278,22 +287,22 @@ class TextBrokerTest(unittest.TestCase):
     def test_short_response_is_not_retried_or_counted_as_an_answer(self):
         send = broker_module._send_once
         prefix = self.answer[:17]
-        with patch.object(broker_module, "_send_once", side_effect=lambda client, _: send(client, prefix)) as write:
-            with self.broker() as broker:
-                broker.arm(self.peer)
-                with self.request() as client:
-                    self.assertEqual(response(client), prefix)
-                self.assertEqual(broker.receipt(), BrokerReceipt(1, 0, 1, len(prefix), self.body))
+        with (patch.object(broker_module, "_send_once", side_effect=lambda client, _: send(client, prefix)) as write,
+              self.broker() as broker):
+            broker.arm(self.peer)
+            with self.request() as client:
+                self.assertEqual(response(client), prefix)
+            self.assertEqual(broker.receipt(), BrokerReceipt(1, 0, 1, len(prefix), self.body))
         write.assert_called_once()
         self.peer.send_prompt.assert_called_once_with()
 
     def test_interrupted_response_is_not_retried_or_counted_as_zero_bytes(self):
-        with patch.object(broker_module, "_libc_send", return_value=-1) as write:
-            with patch.object(broker_module.ctypes, "get_errno", return_value=errno.EINTR):
-                with self.broker() as broker:
-                    broker.arm(self.peer)
-                    with self.request() as client:
-                        self.assertEqual(response(client), b"")
-                    self.assertEqual(broker.receipt(), BrokerReceipt(1, 0, 1, None, self.body))
+        with (patch.object(broker_module, "_libc_send", return_value=-1) as write,
+              patch.object(broker_module.ctypes, "get_errno", return_value=errno.EINTR),
+              self.broker() as broker):
+            broker.arm(self.peer)
+            with self.request() as client:
+                self.assertEqual(response(client), b"")
+            self.assertEqual(broker.receipt(), BrokerReceipt(1, 0, 1, None, self.body))
         write.assert_called_once()
         self.peer.send_prompt.assert_called_once_with()

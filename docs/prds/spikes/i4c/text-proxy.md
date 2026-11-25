@@ -20,5 +20,9 @@ loopback only after the host accepts the one-shot arm. The spike uses synthetic 
 does not start native `agy`, a browser, or a provider session. If retirement cannot be verified,
 the report identifies the retained private scratch and the pending receipt stays in place.
 If the peer retired but journal settlement was interrupted, the retained receipt still blocks reuse.
+If the host cannot confirm container creation, the placement stays on disk. Its
+`placement.json` records the run label and exact owned names for reconciliation.
+The private runtime parent is trusted. Recursive cleanup uses the original directory descriptor,
+and the owner verifies the parent entry before removing the empty directory.
 
 [PRD I4c](../../prd_i4c.md) tracks native enrollment and live qualification.

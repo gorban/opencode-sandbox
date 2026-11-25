@@ -1,7 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
-import hashlib
+from contextlib import ExitStack
 import errno
+import hashlib
+from io import BytesIO
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -25,6 +26,11 @@ class SyntheticTextSessionTest(unittest.TestCase):
 
     def open(self, scene="ready", **kwargs):
         return acp.open_text_session(self.root, self.generation, scene, **kwargs)
+
+    def assert_startup_refused(self, assertion, scene="ready", **kwargs):
+        context = self.open(scene, **kwargs)
+        with ExitStack() as resources, assertion:
+            resources.enter_context(context)
 
     def assert_state(self, state):
         self.assertEqual(readiness.read_status(self.root), readiness.Record(self.generation, state))
@@ -115,15 +121,12 @@ class SyntheticTextSessionTest(unittest.TestCase):
                       "bool-id", "extra-result", "extra-envelope", "truncated", "oversized",
                       "coalesced-init", "coalesced-session", "wrong-version", "empty-line"):
             with self.subTest(scene=scene):
-                with self.assertRaises(acp.ProtocolError):
-                    with self.open(scene):
-                        self.fail("startup must refuse before yielding the session")
+                self.assert_startup_refused(self.assertRaises(acp.ProtocolError), scene)
                 self.assert_state(acp.ReadinessState.NEEDS_VERIFY)
 
     def test_deadlines_for_startup_and_turn_are_distinct(self):
-        with self.assertRaisesRegex(acp.ProtocolError, "deadline"):
-            with self.open("init-timeout", timeout=.2):
-                self.fail("startup timed out")
+        self.assert_startup_refused(self.assertRaisesRegex(acp.ProtocolError, "deadline"),
+                                    "init-timeout", timeout=.2)
         self.assert_state(acp.ReadinessState.NEEDS_VERIFY)
         timeout = .5
         with self.open(timeout=timeout) as session:
@@ -138,11 +141,122 @@ class SyntheticTextSessionTest(unittest.TestCase):
             self.assertIsNotNone(session.process.returncode)
         self.assert_state(acp.ReadinessState.NEEDS_VERIFY)
 
+    def test_session_startup_cancels_while_competing_journal_lock_stays_held(self):
+        def open_session(cancelled):
+            with self.open(cancelled=cancelled):
+                self.fail("cancelled startup must not yield a session")
+
+        self.assert_contended_journal_cancellation(self.root, open_session)
+        self.assert_state(acp.ReadinessState.NEEDS_VERIFY)
+
+    def test_enrollment_cancels_while_competing_journal_lock_stays_held(self):
+        with TemporaryDirectory() as scratch:
+            root = Path(scratch)
+
+            def enroll(cancelled):
+                return readiness.enroll_fixture(root, deadline=time.monotonic() + 5, cancelled=cancelled)
+
+            self.assert_contended_journal_cancellation(root, enroll)
+            self.assertIsNone(readiness.read_status(root))
+            self.assertFalse((root / readiness.ENROLLMENT_LOCK).exists())
+            self.assertFalse((root / readiness.PROFILE).exists())
+
+    def test_enrollment_completion_cancels_while_competing_journal_lock_stays_held(self):
+        with TemporaryDirectory() as scratch, ThreadPoolExecutor(max_workers=1) as worker:
+            root = Path(scratch)
+            generation_started = Event()
+            complete = Event()
+            cancelled = Event()
+            blocked = Event()
+
+            def enroll():
+                with readiness.enrollment_fixture(root, deadline=time.monotonic() + 5,
+                                                  cancelled=cancelled.is_set):
+                    generation_started.set()
+                    self.assertTrue(complete.wait(5))
+
+            outcome = worker.submit(enroll)
+            try:
+                self.assertTrue(generation_started.wait(1))
+                with readiness._locked(root), self.observe_flock_contention(blocked):
+                    complete.set()
+                    self.assertTrue(blocked.wait(1))
+                    self.assertFalse(outcome.done())
+                    cancelled.set()
+                    with self.assertRaisesRegex(acp.ProtocolError, "journal.*cancelled"):
+                        outcome.result(1)
+            finally:
+                complete.set()
+            self.assertFalse((root / readiness.PROFILE).exists())
+            self.assertFalse((root / readiness.VERIFIER).exists())
+            self.assertEqual(readiness.read_status(root).readiness, acp.ReadinessState.NEEDS_VERIFY)
+            with readiness._locked(root) as directory, readiness._enrollment_handle(directory) as closed:
+                self.assertTrue(closed)
+
+    def test_session_startup_journal_and_initialize_share_absolute_deadline(self):
+        initialize = acp._TextSession.initialize
+        with (
+            patch.object(readiness, "_locked", wraps=readiness._locked) as locked,
+            patch.object(acp._TextSession, "initialize", autospec=True, side_effect=initialize) as start,
+            self.open(timeout=1.5),
+        ):
+            self.assertEqual(locked.call_args.kwargs["deadline"], start.call_args.args[-1])
+
+    def test_contended_session_startup_expires_before_lock_release(self):
+        with ThreadPoolExecutor(max_workers=1) as worker, readiness._locked(self.root):
+            def enter_session():
+                with self.open(timeout=.15):
+                    self.fail("startup must fail before lock release")
+
+            outcome = worker.submit(enter_session)
+            with self.assertRaisesRegex(acp.ProtocolError, "journal.*deadline"):
+                outcome.result(1)
+        self.assert_state(acp.ReadinessState.NEEDS_VERIFY)
+
+    def assert_contended_journal_cancellation(self, root, operation):
+        for initially_cancelled in (True, False):
+            with self.subTest(initially_cancelled=initially_cancelled):
+                cancelled = Event()
+                blocked = Event()
+                if initially_cancelled:
+                    cancelled.set()
+                with (
+                    ThreadPoolExecutor(max_workers=1) as worker,
+                    readiness._locked(root),
+                    self.observe_flock_contention(blocked),
+                ):
+                    outcome = worker.submit(operation, cancelled.is_set)
+                    if not initially_cancelled:
+                        self.assertTrue(blocked.wait(1))
+                        self.assertFalse(outcome.done())
+                        cancelled.set()
+                    with self.assertRaisesRegex(acp.ProtocolError, "journal.*cancelled"):
+                        outcome.result(1)
+                    if initially_cancelled:
+                        self.assertFalse(blocked.is_set())
+
+    @staticmethod
+    def observe_flock_contention(blocked):
+        flock = readiness.fcntl.flock
+
+        def observed(lock, operation):
+            try:
+                return flock(lock, operation)
+            except BlockingIOError:
+                blocked.set()
+                raise
+
+        return patch.object(readiness.fcntl, "flock", side_effect=observed)
+
     def test_byte_bound_precedes_decode(self):
-        with self.open() as session:
-            with patch.object(acp, "MAX_BYTES", session.received + 1), patch.object(acp, "_read", return_value=b"xx"):
-                with self.assertRaisesRegex(acp.ProtocolError, "byte bound"):
-                    session._next_frame(time.monotonic() + 1)
+        with (
+            self.open() as session,
+            patch.object(acp, "MAX_BYTES", session.received + 1),
+            patch.object(acp, "_read", return_value=b"xx"),
+        ):
+            deadline = time.monotonic() + 1
+            with self.assertRaisesRegex(acp.ProtocolError, "byte bound"):
+                session._next_frame(deadline)
 
     def test_short_and_interrupted_prompt_writes_spend_attempt_without_retry(self):
         def partial(fd, packet):
@@ -166,9 +280,7 @@ class SyntheticTextSessionTest(unittest.TestCase):
 
     def test_signed_out_fails_before_prompt_and_persists_disconnected(self):
         (self.root / readiness.PROFILE).unlink()
-        with self.assertRaisesRegex(acp.ProtocolError, "session was refused"):
-            with self.open():
-                self.fail("a signed-out peer cannot be offered for a prompt")
+        self.assert_startup_refused(self.assertRaisesRegex(acp.ProtocolError, "session was refused"))
         self.assert_state(acp.ReadinessState.DISCONNECTED)
 
     def test_uncertain_retirement_keeps_exact_workspace_and_blocks_reuse(self):
@@ -189,9 +301,7 @@ class SyntheticTextSessionTest(unittest.TestCase):
             self.generation, acp.ReadinessState.REVOCATION_UNCONFIRMED, session.attempt
         ))
         self.assertTrue((self.root / session.attempt).is_dir())
-        with self.assertRaises(acp.RetirementUnconfirmed):
-            with self.open():
-                self.fail("a pending receipt must block further use")
+        self.assert_startup_refused(self.assertRaises(acp.RetirementUnconfirmed))
 
     def test_owner_exit_during_the_broker_finalizer_transfers_resources(self):
         entered = Event()
@@ -207,20 +317,24 @@ class SyntheticTextSessionTest(unittest.TestCase):
                 retired = retire(process, pidfd)
             return retired
 
-        with ThreadPoolExecutor(max_workers=1) as broker:
-            with patch.object(readiness, "_retire", side_effect=held_retirement) as retire_spy:
-                try:
+        with (
+            ThreadPoolExecutor(max_workers=1) as broker,
+            patch.object(readiness, "_retire", side_effect=held_retirement) as retire_spy,
+        ):
+            try:
+                with ExitStack() as peer_scope:
+                    session = peer_scope.enter_context(self.open())
+                    session.send_prompt()
+                    outcome = broker.submit(session.complete)
+                    self.assertTrue(entered.wait(5))
                     with self.assertRaisesRegex(acp.RetirementUnconfirmed, "still owns"):
-                        with self.open() as session:
-                            session.send_prompt()
-                            outcome = broker.submit(session.complete)
-                            self.assertTrue(entered.wait(5))
-                    self.assertTrue((self.root / readiness.RECEIPT).is_file())
-                finally:
-                    leave.set()
-                with self.assertRaises(acp.PublicationUnconfirmed):
-                    outcome.result(5)
-                retire_spy.assert_called_once()
+                        peer_scope.close()
+                self.assertTrue((self.root / readiness.RECEIPT).is_file())
+            finally:
+                leave.set()
+            with self.assertRaises(acp.PublicationUnconfirmed):
+                outcome.result(5)
+            retire_spy.assert_called_once()
         self.assertEqual(readiness.read_status(self.root).readiness, acp.ReadinessState.REVOCATION_UNCONFIRMED)
         self.assertTrue((self.root / session.attempt).is_dir())
 
@@ -235,20 +349,21 @@ class SyntheticTextSessionTest(unittest.TestCase):
                 self.assertTrue(leave.wait(5))
             return store(directory, target, record)
 
-        with ThreadPoolExecutor(max_workers=1) as broker:
-            with patch.object(readiness, "_store", side_effect=held_store):
-                try:
+        with ThreadPoolExecutor(max_workers=1) as broker, patch.object(readiness, "_store", side_effect=held_store):
+            try:
+                with ExitStack() as peer_scope:
+                    session = peer_scope.enter_context(self.open())
+                    session.send_prompt()
+                    outcome = broker.submit(session.complete)
+                    self.assertTrue(entered.wait(5))
+                    self.assertEqual(session.process.returncode, 0)
                     with self.assertRaisesRegex(acp.PublicationUnconfirmed, "peer retired"):
-                        with self.open() as session:
-                            session.send_prompt()
-                            outcome = broker.submit(session.complete)
-                            self.assertTrue(entered.wait(5))
-                            self.assertEqual(session.process.returncode, 0)
-                    self.assertTrue((self.root / readiness.RECEIPT).is_file())
-                finally:
-                    leave.set()
-                with self.assertRaises(acp.PublicationUnconfirmed):
-                    outcome.result(5)
+                        peer_scope.close()
+                self.assertTrue((self.root / readiness.RECEIPT).is_file())
+            finally:
+                leave.set()
+            with self.assertRaises(acp.PublicationUnconfirmed):
+                outcome.result(5)
         self.assertEqual(readiness.read_status(self.root), readiness.Record(
             self.generation, acp.ReadinessState.REVOCATION_UNCONFIRMED, session.attempt
         ))
@@ -264,25 +379,28 @@ class SyntheticTextSessionTest(unittest.TestCase):
             removed.set()
             self.assertTrue(leave.wait(5))
 
-        with ThreadPoolExecutor(max_workers=1) as broker:
-            with patch.object(readiness, "_remove_workspace", side_effect=held_removal):
-                try:
+        with (
+            ThreadPoolExecutor(max_workers=1) as broker,
+            patch.object(readiness, "_remove_workspace", side_effect=held_removal),
+        ):
+            try:
+                with ExitStack() as peer_scope:
+                    session = peer_scope.enter_context(self.open())
+                    session.send_prompt()
+                    outcome = broker.submit(session.complete)
+                    self.assertTrue(removed.wait(5))
                     with self.assertRaisesRegex(acp.PublicationUnconfirmed, "peer retired"):
-                        with self.open() as session:
-                            session.send_prompt()
-                            outcome = broker.submit(session.complete)
-                            self.assertTrue(removed.wait(5))
-                    self.assertEqual(session.process.returncode, 0)
-                    self.assertFalse((self.root / session.attempt).exists())
-                finally:
-                    leave.set()
-                with self.assertRaises(acp.PublicationUnconfirmed):
-                    outcome.result(5)
+                        peer_scope.close()
+                self.assertEqual(session.process.returncode, 0)
+                self.assertFalse((self.root / session.attempt).exists())
+            finally:
+                leave.set()
+            with self.assertRaises(acp.PublicationUnconfirmed):
+                outcome.result(5)
         self.assertEqual(readiness.read_status(self.root), readiness.Record(
             self.generation, acp.ReadinessState.REVOCATION_UNCONFIRMED, session.attempt
         ))
-        with self.assertRaises(acp.RetirementUnconfirmed), self.open():
-            self.fail("a pending receipt must block further use")
+        self.assert_startup_refused(self.assertRaises(acp.RetirementUnconfirmed))
 
     def test_owner_exit_after_receipt_commit_preserves_confirmed_retirement(self):
         finishing = Event()
@@ -296,18 +414,17 @@ class SyntheticTextSessionTest(unittest.TestCase):
                 self.assertTrue(leave.wait(5))
             return fsync(fd)
 
-        with ThreadPoolExecutor(max_workers=1) as broker:
-            with patch.object(acp.os, "fsync", side_effect=held_fsync):
-                try:
-                    with self.open() as session:
-                        session.send_prompt()
-                        finishing.set()
-                        outcome = broker.submit(session.complete)
-                        self.assertTrue(after_commit.wait(5))
-                    self.assertFalse(outcome.done())
-                finally:
-                    leave.set()
-                self.assertEqual(outcome.result(5), "ok")
+        with ThreadPoolExecutor(max_workers=1) as broker, patch.object(acp.os, "fsync", side_effect=held_fsync):
+            try:
+                with self.open() as session:
+                    session.send_prompt()
+                    finishing.set()
+                    outcome = broker.submit(session.complete)
+                    self.assertTrue(after_commit.wait(5))
+                self.assertFalse(outcome.done())
+            finally:
+                leave.set()
+            self.assertEqual(outcome.result(5), "ok")
         self.assert_state(acp.ReadinessState.READY)
 
 
@@ -315,19 +432,7 @@ class SyntheticPeerEvidenceTest(unittest.TestCase):
     def test_receipt_precedes_wrong_session_and_frame_overflow(self):
         for scene in ("wrong-session", "over-frames"):
             with self.subTest(scene=scene):
-                emitted = []
-                receipt = []
-
-                def record(evidence, count, _scene):
-                    receipt.append((len(emitted), count, evidence.chunks, evidence.digest.hexdigest()))
-
-                def stdout(raw):
-                    emitted.append(peer.frame_body(raw[:-1]))
-
-                with patch.object(peer, "read_request", return_value=True), patch.object(
-                        peer.sys, "stdin", SimpleNamespace(buffer=BytesIO())), patch.object(
-                        peer, "stdout", side_effect=stdout), patch.object(peer.TurnEvidence, "write", new=record):
-                    self.assertEqual(peer.turn(scene, peer.TurnEvidence(-1, "synthetic")), 0)
+                emitted, receipt = self._capture_turn(scene)
 
                 self.assertEqual(len(receipt), 1)
                 prefix_length, count, chunks, digest = receipt[0]
@@ -343,6 +448,25 @@ class SyntheticPeerEvidenceTest(unittest.TestCase):
                 for chunk in valid_chunks:
                     peer.hash_chunk(expected_digest, chunk)
                 self.assertEqual((count, chunks, digest), (1, len(valid_chunks), expected_digest.hexdigest()))
+
+    def _capture_turn(self, scene):
+        emitted = []
+        receipt = []
+
+        def record(evidence, count, _scene):
+            receipt.append((len(emitted), count, evidence.chunks, evidence.digest.hexdigest()))
+
+        def stdout(raw):
+            emitted.append(peer.frame_body(raw[:-1]))
+
+        with (
+            patch.object(peer, "read_request", return_value=True),
+            patch.object(peer.sys, "stdin", SimpleNamespace(buffer=BytesIO())),
+            patch.object(peer, "stdout", side_effect=stdout),
+            patch.object(peer.TurnEvidence, "write", new=record),
+        ):
+            self.assertEqual(peer.turn(scene, peer.TurnEvidence(-1, "synthetic")), 0)
+        return emitted, receipt
 
 
 if __name__ == "__main__":

@@ -1,12 +1,16 @@
+from contextlib import ExitStack, suppress
+import json
+import os
 from pathlib import Path
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from acp_readiness import RECEIPT, Record, RetirementUnconfirmed, _locked, _store, enroll_fixture
 from acp_text_probe import isolated_placement, synthetic_state
-from oc_orchestrator.runtime import Failure
+from oc_orchestrator.runtime import CONTAINER_SHELL, LABEL, OPEN_CODE, Failure
 from oc_providers import ReadinessState
 
 
@@ -24,12 +28,14 @@ class ScratchTests(unittest.TestCase):
         self.assertFalse(root.exists())
 
     def test_placement_cleanup_cannot_discard_unconfirmed_peer_receipt(self):
-        with self.assertRaises(RetirementUnconfirmed), patch("sys.stderr"):
-            with synthetic_state() as state, isolated_placement(None) as placement:
-                root = placement.root
-                generation = enroll_fixture(state)
-                with _locked(state) as directory:
-                    _store(directory, RECEIPT, Record(generation, ReadinessState.REVOCATION_UNCONFIRMED, "a" * 32))
+        with patch("sys.stderr"), ExitStack() as scope:
+            state = scope.enter_context(synthetic_state())
+            root = scope.enter_context(isolated_placement(None)).root
+            generation = enroll_fixture(state)
+            with _locked(state) as directory:
+                _store(directory, RECEIPT, Record(generation, ReadinessState.REVOCATION_UNCONFIRMED, "a" * 32))
+            with self.assertRaises(RetirementUnconfirmed):
+                scope.close()
         self.assertFalse(root.exists())
         self.assertTrue((state / RECEIPT).is_file())
 
@@ -59,19 +65,71 @@ class ScratchTests(unittest.TestCase):
 
     def test_failed_container_retirement_keeps_placement(self):
         with (patch("acp_text_probe.Placement.close", side_effect=Failure("cleanup unconfirmed")),
-              self.assertRaises(Failure), patch("sys.stderr")):
-            with isolated_placement(None) as placement:
-                root = placement.root
+              patch("sys.stderr"), ExitStack() as scope):
+            root = scope.enter_context(isolated_placement(None)).root
+            with self.assertRaisesRegex(Failure, "cleanup unconfirmed"):
+                scope.close()
         self.assertTrue(root.is_dir())
 
     def test_replacement_placement_root_is_preserved(self):
-        with self.assertRaises(Failure), patch("sys.stderr"):
-            with isolated_placement(None) as placement:
-                root = placement.root
-                original = root.with_name("moved-placement")
-                root.rename(original)
-                root.mkdir()
-                marker = root / "fixture"
-                marker.write_text("replacement")
+        with patch("sys.stderr"), ExitStack() as scope:
+            root = scope.enter_context(isolated_placement(None)).root
+            original = root.with_name("moved-placement")
+            root.rename(original)
+            root.mkdir()
+            marker = root / "fixture"
+            marker.write_text("replacement")
+            with self.assertRaisesRegex(Failure, "owned scratch directory changed"):
+                scope.close()
         self.assertEqual(marker.read_text(), "replacement")
         self.assertTrue(original.is_dir())
+
+    def test_original_scratch_inode_stays_pinned_after_unlink(self):
+        for kind in ("placement", "state"):
+            with self.subTest(kind=kind), patch("sys.stderr"), ExitStack() as scope:
+                if kind == "placement":
+                    root = scope.enter_context(isolated_placement(None)).root
+                    (root / "placement.json").unlink(missing_ok=True)
+                else:
+                    root = scope.enter_context(synthetic_state())
+                original = root.stat()
+                root.rmdir()
+                root.mkdir()
+                marker = root / "replacement"
+                marker.write_text("keep")
+                pinned = []
+                for fd in Path("/proc/self/fd").iterdir():
+                    with suppress(FileNotFoundError):
+                        if os.path.samestat(fd.stat(), original):
+                            pinned.append(fd.name)
+                with self.assertRaisesRegex(Failure, "scratch directory changed|synthetic state directory changed"):
+                    scope.close()
+                self.assertEqual(len(pinned), 1)
+                self.assertFalse(os.path.samestat(root.stat(), original))
+                self.assertEqual(marker.read_text(), "keep")
+
+    def test_lost_create_with_empty_label_queries_retains_run_identity(self):
+        lifeline = SimpleNamespace(check=lambda: None)
+
+        def podman(command, *unused):
+            if command == "create":
+                raise Failure("synthetic create acknowledgement lost")
+            self.assertEqual(command, "ps")
+            return SimpleNamespace(stdout=b"")
+
+        with (patch("oc_orchestrator.runtime.inspect",
+                    return_value={"Id": OPEN_CODE, "Config": {"Env": []}}),
+              patch("oc_orchestrator.runtime.podman", side_effect=podman) as host,
+              patch("sys.stderr"), ExitStack() as scope):
+            placement = scope.enter_context(isolated_placement(lifeline))
+            root = placement.root
+            with self.assertRaisesRegex(Failure, "acknowledgement lost"):
+                placement.create("open-code", OPEN_CODE, "none", root / "worker.json",
+                                 "/etc/opencode/opencode.json", {}, (), CONTAINER_SHELL)
+            with self.assertRaisesRegex(Failure, "container creation is unconfirmed"):
+                scope.close()
+
+        self.assertEqual([call.args[0] for call in host.call_args_list], ["create", "ps", "ps"])
+        self.assertEqual(json.loads((root / "placement.json").read_text()), {
+            "label": LABEL, "value": placement.label, "names": placement.names,
+        })

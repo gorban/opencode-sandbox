@@ -2,12 +2,14 @@
 
 from contextlib import ExitStack, contextmanager
 import fcntl
+import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import signal
 import sys
-import tempfile
+import time
 
 
 SOURCE = Path(__file__).resolve()
@@ -21,7 +23,7 @@ from acp_text_session import PublicationUnconfirmed, open_text_session
 from oc_orchestrator.owner import OwnerLost, accept_launch, supervise
 from oc_orchestrator.protocol import PORT, REFUSAL
 from oc_orchestrator.runtime import (
-    CONTAINER_SHELL, OPEN_CODE, RELAY, RELAY_PYTHON, Failure, Placement,
+    CONTAINER_SHELL, LABEL, OPEN_CODE, RELAY, RELAY_PYTHON, Failure, Placement,
     check_private_directory, fixture_request, podman, preflight, run_open_code,
     scratch_parent, seeds, wait_relay,
 )
@@ -29,70 +31,128 @@ from oc_providers import ReadinessState
 
 
 @contextmanager
+def pinned_scratch(prefix):
+    parent = scratch_parent()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as pins:
+        parent_fd = os.open(parent, flags)
+        pins.callback(os.close, parent_fd)
+        root = parent / (prefix + secrets.token_hex(16))
+        os.mkdir(root.name, mode=0o700, dir_fd=parent_fd)
+        directory = os.open(root.name, flags, dir_fd=parent_fd)
+        pins.callback(os.close, directory)
+        scratch = Scratch(root, parent_fd, directory)
+        scratch.verify_name()
+        yield scratch
+
+
+class Scratch:
+    """Keep the original inode allocated and remove contents through its descriptor."""
+
+    def __init__(self, root, parent, directory):
+        self.root = root
+        self.parent = parent
+        self.directory = directory
+
+    def verify_name(self):
+        entry = os.stat(self.root.name, dir_fd=self.parent, follow_symlinks=False)
+        absolute = self.root.lstat()
+        pinned = os.fstat(self.directory)
+        if not os.path.samestat(entry, pinned) or not os.path.samestat(absolute, pinned):
+            raise Failure("the owned scratch directory changed")
+
+    def remove(self):
+        self.verify_name()
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise Failure("descriptor-relative scratch cleanup is unavailable")
+        with os.scandir(self.directory) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.name, dir_fd=self.directory)
+                else:
+                    os.unlink(entry.name, dir_fd=self.directory)
+        self.verify_name()
+        os.rmdir(self.root.name, dir_fd=self.parent)
+
+
+@contextmanager
 def synthetic_state():
-    root = Path(tempfile.mkdtemp(prefix="oc-acp-text-state-", dir=scratch_parent()))
-    created = root.lstat()
-    retained = False
-    try:
-        check_private_directory(root)
-        yield root
-    except (RetirementUnconfirmed, PublicationUnconfirmed):
-        retained = True
-        print(f"ACP spike retained synthetic state at {root}", file=sys.stderr)
-        raise
-    finally:
-        if not retained:
-            discard_synthetic_state(root, created)
-
-
-def remove_owned_directory(root, created):
-    if not os.path.samestat(root.lstat(), created):
-        raise Failure("the owned scratch directory changed")
-    shutil.rmtree(root)
-
-
-def discard_synthetic_state(root, created):
-    try:
-        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    with pinned_scratch("oc-acp-text-state-") as scratch:
+        retained = False
         try:
-            if not os.path.samestat(os.fstat(directory), created):
-                raise Failure("the synthetic state directory changed")
-            lock = os.open("readiness.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                           0o600, dir_fd=directory)
-            try:
-                _private_file(lock)
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    raise Failure("the synthetic ACP journal is still locked") from None
-                status = _status(directory)
-                if status is not None and status.readiness is ReadinessState.REVOCATION_UNCONFIRMED:
-                    raise RetirementUnconfirmed("synthetic ACP retirement is unconfirmed")
-                remove_owned_directory(root, created)
-            finally:
-                os.close(lock)
+            check_private_directory(scratch.root)
+            yield scratch.root
+        except (RetirementUnconfirmed, PublicationUnconfirmed):
+            retained = True
+            print(f"ACP spike retained synthetic state at {scratch.root}", file=sys.stderr)
+            raise
         finally:
-            os.close(directory)
+            if not retained:
+                discard_synthetic_state(scratch)
+
+
+def discard_synthetic_state(scratch):
+    try:
+        scratch.verify_name()
+        lock = os.open("readiness.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                       0o600, dir_fd=scratch.directory)
+        try:
+            _private_file(lock)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Failure("the synthetic ACP journal is still locked") from None
+            status = _status(scratch.directory)
+            if status is not None and status.readiness is ReadinessState.REVOCATION_UNCONFIRMED:
+                raise RetirementUnconfirmed("synthetic ACP retirement is unconfirmed")
+            scratch.remove()
+        finally:
+            os.close(lock)
     except (OSError, RuntimeError):
-        print(f"ACP spike retained synthetic state at {root}", file=sys.stderr)
+        print(f"ACP spike retained synthetic state at {scratch.root}", file=sys.stderr)
         raise
+
+
+class SpikePlacement(Placement):
+    def __init__(self, root, lifeline):
+        super().__init__(root, lifeline)
+        self.create_unconfirmed = False
+
+    def create(self, role, *args):
+        try:
+            return super().create(role, *args)
+        finally:
+            if self.attempted and role not in self.ids:
+                # A later empty label query cannot settle an unacknowledged create.
+                self.create_unconfirmed = True
+
+    def record_identity(self, directory):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        fd = os.open("placement.json", flags, 0o600, dir_fd=directory)
+        with os.fdopen(fd, "w", encoding="ascii") as record:
+            json.dump({"label": LABEL, "value": self.label, "names": self.names}, record)
+            record.flush()
+            os.fsync(record.fileno())
+        os.fsync(directory)
 
 
 @contextmanager
 def isolated_placement(lifeline):
-    root = Path(tempfile.mkdtemp(prefix="oc-acp-text-placement-", dir=scratch_parent()))
-    created = root.lstat()
-    placement = Placement(root, lifeline)
-    try:
-        check_private_directory(root)
-        yield placement
-    finally:
+    with pinned_scratch("oc-acp-text-placement-") as scratch:
+        placement = SpikePlacement(scratch.root, lifeline)
         try:
-            placement.close()
-            remove_owned_directory(root, created)
-        except (OSError, Failure):
-            print(f"ACP spike retained placement at {root}", file=sys.stderr)
-            raise
+            check_private_directory(scratch.root)
+            placement.record_identity(scratch.directory)
+            yield placement
+        finally:
+            try:
+                placement.close()
+                if placement.create_unconfirmed:
+                    raise Failure("container creation is unconfirmed")
+                scratch.remove()
+            except (OSError, Failure):
+                print(f"ACP spike retained placement at {scratch.root} (run {placement.label})", file=sys.stderr)
+                raise
 
 
 def create_inert_pair(placement, worker_files, relay_files):
@@ -155,16 +215,16 @@ def run_proof(lifeline):
     lifeline.check()
     with synthetic_state() as state, isolated_placement(lifeline) as placement:
         worker_files, relay_files, proof = seeds(placement.root)
-        # The broker is always revoked and joined before the peer context can finalize.
-        with ExitStack() as peer_scope, TextBroker(
-                relay_files / "provider.sock", proof, authorized=lifeline.active) as broker:
-            with lifeline.revoke_on_loss(broker.revoke):
-                worker, relay = create_inert_pair(placement, worker_files, relay_files)
-                verify_prearm_refusal(relay)
-                peer = peer_scope.enter_context(open_text_session(
-                    state, enroll_fixture(state), cancelled=broker.cancelled))
-                broker.arm(peer)
-                verify_worker(lifeline, worker, relay, broker, peer)
+        # Revoke and join the broker before peer fallback, which preserves an active lease on timeout.
+        with (ExitStack() as peer_scope,
+              TextBroker(relay_files / "provider.sock", proof, authorized=lifeline.active) as broker,
+              lifeline.revoke_on_loss(broker.revoke)):
+            worker, relay = create_inert_pair(placement, worker_files, relay_files)
+            verify_prearm_refusal(relay)
+            generation = enroll_fixture(state, deadline=time.monotonic() + 5, cancelled=broker.cancelled)
+            peer = peer_scope.enter_context(open_text_session(state, generation, cancelled=broker.cancelled))
+            broker.arm(peer)
+            verify_worker(lifeline, worker, relay, broker, peer)
     lifeline.check()
 
 
@@ -179,7 +239,7 @@ def main():
         except (Failure, OwnerLost, PublicationUnconfirmed, RetirementUnconfirmed) as error:
             print(f"ACP spike: {error}", file=sys.stderr)
             return 1
-        except (KeyError, OSError, RecursionError, RuntimeError, TypeError, ValueError) as error:
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
             print(f"ACP spike: verification failed ({type(error).__name__})", file=sys.stderr)
             return 1
         return 0

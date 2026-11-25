@@ -154,18 +154,22 @@ class TextBroker:
             with self._lock:
                 self._error = error
         finally:
-            self.revoke()
+            self._close_route_and_retire_peer()
+
+    def _close_route_and_retire_peer(self):
+        self.revoke()
+        with self._lock:
+            session = self._session
+        if session is None:
+            return
+        try:
+            session.retire()
+        except Exception as error:
             with self._lock:
-                session = self._session
-            if session is not None:
-                try:
-                    session.retire()
-                except Exception as error:
-                    with self._lock:
-                        if self._error is None:
-                            self._error = error
-                        else:
-                            self._error.add_note(f"Offline ACP peer retirement also failed: {error}")
+                if self._error is None:
+                    self._error = error
+                else:
+                    self._error.add_note(f"Offline ACP peer retirement also failed: {error}")
 
     def _handle(self, control, session):
         with ExitStack() as sockets:

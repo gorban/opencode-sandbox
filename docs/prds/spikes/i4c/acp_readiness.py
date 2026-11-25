@@ -21,6 +21,7 @@ from acp_fixture import ENROLLMENT_LOCK, PROFILE, VERIFIER, credential_digest, d
 
 MAX_FRAME = 256 * 1024
 MAX_RECORD = 1024
+LOCK_POLL_INTERVAL = .025
 PIDFD_SIGNAL_PROCESS_GROUP = 1 << 2  # Linux UAPI <linux/pidfd.h>.
 JOURNAL = "readiness.json"
 RECEIPT = "readiness-inflight.json"
@@ -55,8 +56,35 @@ def _private_file(fd):
         raise IntegrityError("unsafe private journal file")
 
 
+def _journal_wait_interval(deadline, cancelled):
+    if cancelled is not None and cancelled():
+        raise ProtocolError("synthetic ACP journal acquisition was cancelled")
+    if deadline is None:
+        return LOCK_POLL_INTERVAL
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProtocolError("synthetic ACP journal acquisition deadline expired")
+    return min(remaining, LOCK_POLL_INTERVAL)
+
+
+def _lock_journal(fd, deadline, cancelled):
+    if deadline is None and cancelled is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    while True:
+        _journal_wait_interval(deadline, cancelled)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            time.sleep(_journal_wait_interval(deadline, cancelled))
+        else:
+            _journal_wait_interval(deadline, cancelled)
+            return
+
+
 @contextmanager
-def _locked(root):
+def _locked(root, *, deadline=None, cancelled=None):
+    _journal_wait_interval(deadline, cancelled)
     try:
         directory = os.open(root, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_RDONLY)
         try:
@@ -67,7 +95,7 @@ def _locked(root):
                          0o600, dir_fd=directory)
             with os.fdopen(fd, "rb") as lock:
                 _private_file(lock.fileno())
-                fcntl.flock(lock, fcntl.LOCK_EX)
+                _lock_journal(lock.fileno(), deadline, cancelled)
                 yield directory
         finally:
             os.close(directory)
@@ -155,12 +183,12 @@ def _enrollment_handle(directory, *, create=False):
 
 
 @contextmanager
-def enrollment_fixture(root, *, expires_at=None):
-    """Model an enrollment capability with an exclusive, process-local handle."""
+def enrollment_fixture(root, *, expires_at=None, deadline=None, cancelled=None):
+    """Model an exclusive enrollment handle with one optional monotonic deadline."""
     if expires_at is not None and (type(expires_at) is not int or expires_at < 0):
         raise IntegrityError("invalid synthetic enrollment expiration")
     with ExitStack() as enrollment:
-        with _locked(root) as directory:
+        with _locked(root, deadline=deadline, cancelled=cancelled) as directory:
             if _status(directory) is not None:
                 raise IntegrityError("synthetic profile already has a journal")
             if not enrollment.enter_context(_enrollment_handle(directory, create=True)):
@@ -169,7 +197,7 @@ def enrollment_fixture(root, *, expires_at=None):
             expected = Record(generation, ReadinessState.NEEDS_VERIFY)
             _store(directory, JOURNAL, expected)
         yield generation
-        with _locked(root) as directory:
+        with _locked(root, deadline=deadline, cancelled=cancelled) as directory:
             if _status(directory) != expected:
                 raise IntegrityError("the exact synthetic enrollment changed")
             credential = secrets.token_hex(16)
@@ -180,9 +208,9 @@ def enrollment_fixture(root, *, expires_at=None):
                                              "expires_at": expires_at}, durable_rename=False)
 
 
-def enroll_fixture(root, *, expires_at=None):
+def enroll_fixture(root, *, expires_at=None, deadline=None, cancelled=None):
     """Complete a synthetic enrollment and close its handle."""
-    with enrollment_fixture(root, expires_at=expires_at) as generation:
+    with enrollment_fixture(root, expires_at=expires_at, deadline=deadline, cancelled=cancelled) as generation:
         return generation
 
 
