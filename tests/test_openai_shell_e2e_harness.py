@@ -1,4 +1,4 @@
-"""Offline security and regression harness for AGY Slice 2 (OpenAI interactive shell e2e).
+"""Offline security and regression harness for OpenAI interactive shell e2e.
 
 All tests are strictly offline (zero real credentials, zero live network, zero real host changes).
 Covers direct CLI opt-in parsing, read-only snapshot provenance, ambient FD immunity, 3-state
@@ -35,6 +35,7 @@ from oc_openai.proof_gate import (
     STATE_ARMED,
     STATE_CLOSED_DISCOVERY,
     STATE_SPENT,
+    ArrivalSnapshot,
     ClosedProofSlotGate,
     ProofApproval,
     ProofGate,
@@ -319,14 +320,13 @@ class TestLiveConftestDirectCliParsing(unittest.TestCase):
 
     def test_assert_no_inherited_live_options_rejects_env_and_ini_forms(self) -> None:
         prefixes = (LIVE_FLAG, "--openai-shell-")
-        old_env = os.environ.get(TEST_PYTEST_ADDOPTS)
-        try:
-            os.environ[TEST_PYTEST_ADDOPTS] = f"{AGENT_IMG_OPT}={TEST_HEX_A}"
+        with patch.dict(os.environ, {TEST_PYTEST_ADDOPTS: f"{AGENT_IMG_OPT}={TEST_HEX_A}"}, clear=False):
             req = SimpleNamespace(config=SimpleNamespace(getini=lambda _k: []))
             with self.assertRaises(ValueError):
                 live_conftest.assert_no_inherited_live_options(req, prefixes, target_relpath=TARGET_REL)
-            os.environ.pop(TEST_PYTEST_ADDOPTS, None)
 
+        clean_env = {k: v for k, v in os.environ.items() if k != TEST_PYTEST_ADDOPTS}
+        with patch.dict(os.environ, clean_env, clear=True):
             req_str = SimpleNamespace(config=SimpleNamespace(getini=lambda _k: f"{LIVE_FLAG} {MODE_OPT}=mini"))
             with self.assertRaises(ValueError):
                 live_conftest.assert_no_inherited_live_options(req_str, prefixes, target_relpath=TARGET_REL)
@@ -337,11 +337,6 @@ class TestLiveConftestDirectCliParsing(unittest.TestCase):
 
             req_clean = SimpleNamespace(config=SimpleNamespace(getini=lambda _k: ["-q"]))
             live_conftest.assert_no_inherited_live_options(req_clean, prefixes, target_relpath=TARGET_REL)
-        finally:
-            if old_env is None:
-                os.environ.pop(TEST_PYTEST_ADDOPTS, None)
-            else:
-                os.environ[TEST_PYTEST_ADDOPTS] = old_env
 
     def test_require_explicit_test_target(self) -> None:
         target = (REPO_ROOT / TARGET_REL).resolve()
@@ -711,6 +706,8 @@ esac
                 MODEL_OPT, TEST_MODEL,
                 INSTANCE_OPT, "personal",
                 SOURCE_OPT, digest,
+                AGENT_IMG_OPT, TEST_HEX_A,
+                RELAY_IMG_OPT, TEST_HEX_B,
             ],
             cwd=str(REPO_ROOT),
             env=base_env,
@@ -1304,7 +1301,7 @@ class TestProofGateThreeStateAndAccounting(unittest.TestCase):
             t_rev.start()
             time.sleep(0.1)
             with self.assertRaises(ConnectionRefusedError):
-                socket.create_connection(("127.0.0.1", revoke_port), timeout=0.5).close()
+                socket.create_connection(("127.0.0.1", revoke_port), timeout=0.5)
             revoke_job.revoke()
             t_rev.join(timeout=5.0)
             self.assertFalse(t_rev.is_alive())
@@ -1347,7 +1344,7 @@ class TestProofGateThreeStateAndAccounting(unittest.TestCase):
                     time.sleep(0.15)
                     # B4: pending & unverified -> TCP listener does not exist yet!
                     with self.assertRaises(ConnectionRefusedError):
-                        socket.create_connection(("127.0.0.1", turn_port), timeout=0.5).close()
+                        socket.create_connection(("127.0.0.1", turn_port), timeout=0.5)
                     self.assertEqual(len(conn.calls), 0)
 
                     # B5: mark verified -> activate -> wait bound (empty readiness probe).
@@ -1624,8 +1621,10 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertTrue(res_pre["ownership_uncertain"])
             self.assertIn("lease_unreleased:turn-0", res_pre["errors"])
             self.assertEqual((grant_dir / "state").read_text(encoding="utf-8"), "revoked\n")
-            self.assertEqual((grant_dir.lstat().st_dev, grant_dir.lstat().st_ino), orig_grant_ino)
-            self.assertEqual(((grant_dir / "lock").lstat().st_dev, (grant_dir / "lock").lstat().st_ino), orig_lock_ino)
+            actual_grant_ino = (grant_dir.lstat().st_dev, grant_dir.lstat().st_ino)
+            actual_lock_ino = ((grant_dir / "lock").lstat().st_dev, (grant_dir / "lock").lstat().st_ino)
+            self.assertEqual(actual_grant_ino, orig_grant_ino)
+            self.assertEqual(actual_lock_ino, orig_lock_ino)
             self.assertIn("pod_has_untracked_members", res_pre["errors"])
             self.assertEqual([c for c in rm_calls if c[:2] == ["pod", "rm"]], [])
 
@@ -1942,6 +1941,335 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             # Trusted store check confirms absence in worker_leases.
             with conn3._store.locked() as sdir:
                 self.assertNotIn(slot_c.name, conn3._store.read(sdir).get("worker_leases") or {})
+
+    def test_live_binding_recheck_under_held_fences_and_live_generation_drift(self) -> None:
+        import pwd
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.profile_backend import ProfileBackend
+        from oc_openai.session_adapter import OpenAISessionAdapter, _OpenAISlotTarget
+        from oc_providers.contracts import InstancePreflight, ProviderInstanceSpec, ReadinessState
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with (
+            tempfile.TemporaryDirectory(prefix="oc-g2-fence-", dir=str(home)) as td_raw,
+            tempfile.TemporaryDirectory(prefix="oc-chat-", dir="/tmp") as slot_raw,
+        ):
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            state_dir = td / "openai"
+            state_dir.mkdir(mode=0o700)
+            os.chmod(state_dir, 0o700)
+            cfg_dir = td / "cfg"
+            cfg_dir.mkdir(mode=0o700)
+            os.chmod(cfg_dir, 0o700)
+            (cfg_dir / FILE_PROVIDERS_TOML).write_text("[launch]\n", encoding="utf-8")
+            os.chmod(cfg_dir / FILE_PROVIDERS_TOML, 0o600)
+            ev_dir = td / "evidence"
+            ev_dir.mkdir(mode=0o700)
+            os.chmod(ev_dir, 0o700)
+
+            host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+
+            class _OkTransport(FixtureTransport):
+                @contextmanager
+                def responses(self, body, bearer, cancellation, dispatch, **_kwargs):
+                    def send():
+                        self.sent += 1
+                        self.calls.append(("api", "/v1/responses", body, bearer))
+                    dispatch(send)
+                    yield iter(_ok_sse_events(TEST_MODEL))
+
+            transport = _OkTransport()
+            transport.models_outcome = (200, {"models": [{"slug": TEST_MODEL, "visibility": "list"}]})
+            backend = ProfileBackend(
+                state_dir,
+                reviewed=True,
+                connection=lambda reg_dir: Connection(
+                    reg_dir,
+                    browser=FixtureBrowser(),
+                    verifier=FixtureVerifier(),
+                    transport=transport,
+                    host_probe=lambda: host,
+                ),
+            )
+            backend.connect("personal")
+            prof, conn, binding = backend.profile_connection("personal")
+            self.assertEqual(conn.models(binding), (TEST_MODEL,))
+
+            approval = ProofApproval(
+                run_id=TEST_RUN_ID,
+                instance_label="personal",
+                scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL,
+                ui_mode="mini",
+                cwd=TEST_CWD,
+                selection_epoch=prof.epoch,
+                credential_generation=binding.generation,
+                history_digest_all_12_files=compute_exposure_history_digest(state_dir),
+                profile_directory=str(prof.directory),
+                client_id=str(prof.client_id),
+                auth_mode="subscription",
+                route_policy="subscription-only",
+                providers_config_digest=compute_providers_config_digest(cfg_dir),
+            )
+            gate = ProofGate(
+                approval,
+                evidence_dir=ev_dir,
+                exposure_dir=state_dir,
+                check_binding_intact=lambda a: shell_driver._verify_live_binding_intact(
+                    a, backend=backend, config_dir=cfg_dir, target_binding=binding,
+                ),
+                expected_instructions_sha256=FAKE_INSTRUCTIONS_DIGEST,
+            )
+            preflight = InstancePreflight(
+                spec=ProviderInstanceSpec(kind="openai", label="personal", enabled=True, auth_mode="subscription"),
+                readiness=ReadinessState.READY,
+                models=(TEST_MODEL,),
+                exposure_hold=None,
+                handle=_OpenAISlotTarget(profile=prof, conn=conn, binding=binding),
+            )
+            adapter = OpenAISessionAdapter(backend, proof_gate=gate)
+            slot_root = Path(slot_raw)
+            os.chmod(slot_root, 0o700)
+            with adapter.open_slot(
+                preflight, slot_index=0, slot_root=slot_root,
+                port=8401, worker_token="tok-fence-live",
+                acknowledged_exposure_digest=None, on_revoke=lambda _i: None,
+            ) as handle:
+                gate.arm(observed_row=f"{TEST_SCOPED}/{TEST_MODEL}", observed_screen_digest=TEST_HEX_C)
+                gate.mark_relay_verified(TEST_HEX_A)
+                handle.job.activate()
+                good_body = json.dumps(_valid_proof_payload()).encode("utf-8")
+                reply = _send_framed_request(
+                    handle.job.provider_socket,
+                    handle.job.relay_proof,
+                    _make_fake_request(worker_token="tok-fence-live", body_bytes=good_body),
+                )
+                self.assertIn(b"200 OK", reply)
+                self.assertEqual(gate.admitted_writes, 1)
+                self.assertTrue(gate.exact_ok_delivered)
+
+            # Live store generation drift (with frozen target_binding unchanged) must raise ProofGateError.
+            with conn._store.locked() as sdir:
+                rec = conn._store.read(sdir)
+                rec["generation"] = str(binding.generation) + "-drifted"
+                conn._store.write(sdir, rec)
+            with self.assertRaises(ProofGateError):
+                shell_driver._verify_live_binding_intact(
+                    approval, backend=backend, config_dir=cfg_dir, target_binding=binding,
+                )
+
+    def test_single_slot_cutover_arm_turn_route_and_arrival_relay_verified_latch(self) -> None:
+        import pwd
+        from oc_openai import session_broker
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.profile_backend import ProfileBackend
+        from oc_openai.session_adapter import OpenAISessionAdapter, _OpenAISlotTarget
+        from oc_openai.session_broker import ProofSessionOptions, _ProofTurnCutover, _SessionSlotCoordinator
+        from oc_providers.contracts import InstancePreflight, ProviderInstanceSpec, ReadinessState
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with (
+            tempfile.TemporaryDirectory(prefix="oc-g2-cutover-", dir=str(home)) as td_raw,
+            tempfile.TemporaryDirectory(prefix="oc-chat-", dir="/tmp") as disc_raw,
+        ):
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            state_dir = td / "openai"
+            state_dir.mkdir(mode=0o700)
+            os.chmod(state_dir, 0o700)
+            ev_dir = td / "evidence"
+            ev_dir.mkdir(mode=0o700)
+            os.chmod(ev_dir, 0o700)
+            host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+            backend = ProfileBackend(
+                state_dir,
+                reviewed=True,
+                connection=lambda reg_dir: Connection(
+                    reg_dir,
+                    browser=FixtureBrowser(),
+                    verifier=FixtureVerifier(),
+                    transport=FixtureTransport(),
+                    host_probe=lambda: host,
+                ),
+            )
+            backend.connect("personal")
+            prof, conn, binding = backend.profile_connection("personal")
+
+            approval = ProofApproval(
+                run_id=TEST_RUN_ID,
+                instance_label="personal",
+                scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL,
+                ui_mode="mini",
+                cwd=TEST_CWD,
+                selection_epoch=prof.epoch,
+                credential_generation=binding.generation,
+                history_digest_all_12_files=compute_exposure_history_digest(state_dir),
+                profile_directory=str(prof.directory),
+                client_id=str(prof.client_id),
+            )
+            stop_event = threading.Event()
+            gate = ProofGate(
+                approval,
+                evidence_dir=ev_dir,
+                exposure_dir=state_dir,
+                check_owner_alive=lambda: (_ for _ in ()).throw(ProofGateError("proof_gate_foreground_lost")) if stop_event.is_set() else None,
+                expected_instructions_sha256=FAKE_INSTRUCTIONS_DIGEST,
+            )
+            preflight = InstancePreflight(
+                spec=ProviderInstanceSpec(kind="openai", label="personal", enabled=True, auth_mode="subscription"),
+                readiness=ReadinessState.READY,
+                models=(TEST_MODEL,),
+                exposure_hold=None,
+                handle=_OpenAISlotTarget(profile=prof, conn=conn, binding=binding),
+            )
+            adapter = OpenAISessionAdapter(backend, proof_gate=gate)
+            coord = _SessionSlotCoordinator(stop_event)
+            released_keys: list[str] = []
+            proof_options = ProofSessionOptions(
+                proof_gate=gate,
+                on_slot_lease_released=released_keys.append,
+            )
+            spec = {
+                "pod": TEST_POD, "instance": TEST_INSTANCE, "relay": f"{TEST_POD}-relay",
+                "relay_image": TEST_HEX_B, "level": TEST_LEVEL,
+            }
+            disc_root = Path(disc_raw)
+            os.chmod(disc_root, 0o700)
+            disc_cm = adapter.open_discovery_slot(
+                preflight, slot_index=0, slot_root=disc_root,
+                port=8401, worker_token="tok-cut-1",
+                acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+            )
+            disc_handle = disc_cm.__enter__()
+            coord.register_slot(disc_cm, disc_handle, disc_root)
+            cutover = _ProofTurnCutover(
+                spec=spec, pod_id=TEST_HEX_A, coordinator=coord, sidecars=[],
+                started_relay_ids=[], stop_event=stop_event, proof_options=proof_options,
+            )
+            cutover.tracked_slot_keys.append("disc-0")
+            cutover.tracked_slot_indices["disc-0"] = 0
+            cutover.record_discovery_slot(
+                slot_index=0, item=preflight, adapter=adapter,
+                port=8401, worker_token="tok-cut-1", ack_digest=None,
+            )
+            with (
+                patch.object(session_broker, "_start_slot_relay_deferred", return_value=TEST_HEX_C),
+                patch.object(session_broker, "_wait_relay_bound"),
+            ):
+                nonce = cutover.arm_turn_route(f"{TEST_SCOPED}/{TEST_MODEL}", TEST_HEX_B)
+            try:
+                self.assertTrue(nonce)
+                self.assertFalse(stop_event.is_set(), "single-slot cutover must not set stop_event")
+                self.assertIn("disc-0", released_keys)
+                self.assertEqual(gate.state, STATE_ARMED)
+                # Arrival snapshot captured with relay_verified=False must remain ineligible even after verification.
+                stale_arrival = ArrivalSnapshot(
+                    state=STATE_ARMED, arm_nonce=nonce,
+                    job_incarnation=gate._job_incarnation, relay_verified=False,
+                )
+                with self.assertRaises(ProofGateError):
+                    gate.claim_for_write(
+                        stale_arrival, canonical_proof_body(TEST_MODEL),
+                        job_incarnation=gate._job_incarnation or "",
+                    )
+                self.assertEqual(gate.admitted_writes, 0)
+            finally:
+                err = coord.teardown_all(None)
+                self.assertIsNone(err)
+                coord.remove_slot_roots(require_confirmed_leases=True)
+
+    def test_gate2_isolated_import_subdir_readonly_volume_safety_and_root_allowlist(self) -> None:
+        from oc_openai.session_broker import _SessionSlotCoordinator
+
+        with tempfile.TemporaryDirectory(prefix="oc-g2-misc-") as td_raw:
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            # 1. Standalone import of test_openai_shell_e2e.py under python3 -IB (no PYTHONPATH, no __init__.py).
+            digest, _ = snap_runner.capture_manifest(REPO_ROOT)
+            snap = snap_runner.build_read_only_snapshot(REPO_ROOT, digest, base_dir=td)
+            try:
+                probe = subprocess.run(
+                    [
+                        sys.executable, "-IB", "-c",
+                        "import importlib.util, sys; "
+                        "spec = importlib.util.spec_from_file_location('test_openai_shell_e2e', sys.argv[1]); "
+                        "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
+                        "print(mod.LIVE_FLAG)",
+                        str(snap / "tests/e2e/live/test_openai_shell_e2e.py"),
+                    ],
+                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                self.assertEqual(probe.returncode, 0, probe.stderr)
+                self.assertIn(LIVE_FLAG, probe.stdout)
+
+                # 2. Writable intermediate directory (0700) inside snapshot must be rejected by verify_read_only_snapshot.
+                live_dir = snap / "tests/e2e/live"
+                os.chmod(live_dir, 0o700)
+                with self.assertRaises(snap_runner.SnapshotError):
+                    snap_runner.verify_read_only_snapshot(snap, digest)
+                os.chmod(live_dir, 0o500)
+            finally:
+                snap_runner.cleanup_snapshot(snap)
+
+            # 3. _OwnershipJournal skips volume/worktree teardown when pod has untracked members,
+            #    and normal volume removal omits '-f'.
+            vol_rm_cmds: list[list[str]] = []
+
+            def _untracked_pm(args, timeout=20.0):
+                del timeout
+                if args[:2] == ["volume", "rm"]:
+                    vol_rm_cmds.append(list(args))
+                if args[:2] == ["pod", "inspect"]:
+                    data = [{
+                        "Id": TEST_HEX_B, "InfraContainerID": "9" * 64,
+                        "Labels": {PROOF_OWNER_LABEL: TEST_RUN_ID},
+                        "Containers": [{"Id": "9" * 64}, {"Id": "8" * 64}],
+                    }]
+                    return subprocess.CompletedProcess(args, 0, json.dumps(data).encode(), b"")
+                return subprocess.CompletedProcess(args, 0, b"", b"")
+
+            spec = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=td / "owner_u.json",
+            )
+            j_u = _OwnershipJournal(spec, podman_runner=_untracked_pm)
+            j_u.pod_id = TEST_HEX_B
+            j_u.volume_owned = True
+            res_u = j_u.teardown()
+            self.assertFalse(res_u[KEY_CLEANUP_VERIFIED])
+            self.assertEqual(vol_rm_cmds, [], "volume teardown must be skipped when pod has untracked members")
+
+            def _clean_vol_pm(args, timeout=20.0):
+                del timeout
+                if args[:2] == ["volume", "rm"]:
+                    vol_rm_cmds.append(list(args))
+                    return subprocess.CompletedProcess(args, 0, b"", b"")
+                if args[:2] == ["volume", "inspect"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, json.dumps([{"Labels": {PROOF_OWNER_LABEL: TEST_RUN_ID}}]).encode(), b"",
+                    )
+                if args[:2] == ["volume", "exists"]:
+                    return subprocess.CompletedProcess(args, 1, b"", b"")
+                return subprocess.CompletedProcess(args, 0, b"", b"")
+
+            j_v = _OwnershipJournal(spec, podman_runner=_clean_vol_pm)
+            j_v.volume_owned = True
+            j_v.teardown()
+            self.assertEqual(vol_rm_cmds, [["volume", "rm", TEST_VOLUME]])
+
+            # 4. remove_slot_roots(require_confirmed_leases=True) uses strict allowlist (keeps unregistered root).
+            unreg_root = td / "unreg_root"
+            unreg_root.mkdir(mode=0o700)
+            coord = _SessionSlotCoordinator(threading.Event())
+            coord.track_slot_root(unreg_root)
+            coord.remove_slot_roots(require_confirmed_leases=True)
+            self.assertTrue(unreg_root.exists())
 
     def test_same_name_racing_resource_survives_and_uncertain_create_does_not_delete(self) -> None:
         with tempfile.TemporaryDirectory(prefix="oc-race-") as td_raw:

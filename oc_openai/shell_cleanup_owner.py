@@ -125,22 +125,33 @@ def _fsync_dir(directory: Path) -> None:
 def _atomic_fsync_write(path: Path, data: bytes) -> None:
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    fd_owned = True
     try:
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as stream:
+        stream = os.fdopen(fd, "wb")
+        fd_owned = False
+        with stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(tmp, path)
         _fsync_dir(path.parent)
     except BaseException:
+        if fd_owned:
+            with suppress(OSError):
+                os.close(fd)
         with suppress(OSError):
             tmp.unlink(missing_ok=True)
         raise
 
 
 def _revoke_grant_dir(grant_dir: str, *, slot_root: str = "") -> None:
-    target_dir = Path(grant_dir) if grant_dir else (Path(slot_root) / "grant" if slot_root else None)
+    if grant_dir:
+        target_dir: Path | None = Path(grant_dir)
+    elif slot_root:
+        target_dir = Path(slot_root) / "grant"
+    else:
+        target_dir = None
     if target_dir is None or not target_dir.is_dir():
         return
     state_path = target_dir / "state"
@@ -500,7 +511,8 @@ class _OwnershipJournal:
         }
 
     def _teardown_pod_volume_worktree(self) -> None:
-        self._teardown_pod()
+        if not self._teardown_pod():
+            return
         self._teardown_volume()
         self._teardown_worktree()
 
@@ -548,26 +560,29 @@ class _OwnershipJournal:
                 return True
         return False
 
-    def _teardown_pod(self) -> None:
+    def _teardown_pod(self) -> bool:
         if self.pod_id is None:
-            return
+            return True
         details = self._inspect_pod_details(self.pod_id)
         if details is None:
             if self._pm(["pod", "exists", self.pod_id], timeout=10.0).returncode == 0:
                 self.cleanup_errors.append("pod_inspect_failed")
-            return
+                return False
+            return True
         labels = details.get("Labels") if isinstance(details.get("Labels"), dict) else {}
         if labels.get(PROOF_OWNER_LABEL) != self.run_id:
             self.ownership_uncertain = True
             self.cleanup_errors.append("pod_owner_label_mismatch")
-            return
+            return False
         if self._pod_has_untracked_members(details):
             self.ownership_uncertain = True
             self.cleanup_errors.append("pod_has_untracked_members")
-            return
+            return False
         res = self._pm(["pod", "rm", "-f", self.pod_id], timeout=20.0)
         if res.returncode != 0 or self._pm(["pod", "exists", self.pod_id], timeout=10.0).returncode == 0:
             self.cleanup_errors.append("pod_remove_failed")
+            return False
+        return True
 
     def _teardown_volume(self) -> None:
         if not self.volume_owned:
@@ -581,7 +596,7 @@ class _OwnershipJournal:
             self.ownership_uncertain = True
             self.cleanup_errors.append("volume_owner_label_mismatch")
             return
-        res = self._pm(["volume", "rm", "-f", self.volume_name], timeout=15.0)
+        res = self._pm(["volume", "rm", self.volume_name], timeout=15.0)
         if res.returncode != 0 or self._pm(["volume", "exists", self.volume_name], timeout=10.0).returncode == 0:
             self.cleanup_errors.append("volume_remove_failed")
 

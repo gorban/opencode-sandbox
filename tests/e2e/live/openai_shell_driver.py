@@ -199,10 +199,10 @@ def prompt_attended_approval(summary: dict[str, object]) -> None:
         f"  scoped_provider_id    : {summary['scoped_provider_id']}",
         f"  approved_model        : {summary['approved_model']}",
         f"  ui_mode               : {summary['ui_mode']}",
-        f"  billing               : {summary['billing']}",
+        f"  route_policy          : {summary['route_policy']}",
         f"  client_id             : {summary['client_id']}",
         f"  selection_epoch       : {summary['selection_epoch']}",
-        f"  credential_generation : {summary['credential_generation']}",
+        f"  reg_generation        : {summary['registration_generation']}",
         f"  providers_cfg_sha256  : {summary['providers_config_digest']}",
         f"  exposure_12file_sha256: {summary['history_digest_all_12_files']}",
         f"  agent_image_id        : {summary['agent_image_id']}",
@@ -438,6 +438,44 @@ def _select_admitted_item(plan, scoped_provider_id: str, model: str):
     return item
 
 
+def _read_private_json_no_lock(path: Path) -> dict[str, object]:
+    """Read an atomically replaced private JSON store file without acquiring flock."""
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        raise ProofGateError(_ERR_APPROVAL_DRIFT) from None
+    try:
+        dinfo = os.fstat(dir_fd)
+        if dinfo.st_uid != os.geteuid() or dinfo.st_mode & 0o077:
+            raise ProofGateError(_ERR_APPROVAL_DRIFT)
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+        with os.fdopen(fd, "rb") as stream:
+            finfo = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(finfo.st_mode)
+                or finfo.st_uid != os.geteuid()
+                or finfo.st_mode & 0o077
+                or finfo.st_nlink != 1
+            ):
+                raise ProofGateError(_ERR_APPROVAL_DRIFT)
+            raw = stream.read(262_145)
+    except ProofGateError:
+        raise
+    except OSError:
+        raise ProofGateError(_ERR_APPROVAL_DRIFT) from None
+    finally:
+        os.close(dir_fd)
+    if len(raw) > 262_144:
+        raise ProofGateError(_ERR_APPROVAL_DRIFT)
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise ProofGateError(_ERR_APPROVAL_DRIFT) from None
+    if not isinstance(parsed, dict):
+        raise ProofGateError(_ERR_APPROVAL_DRIFT)
+    return parsed
+
+
 def _verify_live_binding_intact(
     approval: ProofApproval,
     *,
@@ -446,20 +484,32 @@ def _verify_live_binding_intact(
     target_binding,
 ) -> None:
     """Lock-free drift recheck safe inside arm() and inside before_write() under held fences."""
+    del target_binding
     current_cfg_digest = compute_providers_config_digest(config_dir)
     if not hmac.compare_digest(current_cfg_digest, approval.providers_config_digest):
         raise ProofGateError(_ERR_APPROVAL_DRIFT)
-    view = backend.profiles.snapshot()
-    matches = [p for p in (*view.saved, *view.unpublished) if p.label == approval.instance_label]
-    if len(matches) != 1:
+    profiles_root = Path(backend.profiles._root)
+    prof_state = _read_private_json_no_lock(profiles_root / "profiles" / "state.json")
+    registrations = prof_state.get("registrations")
+    if not isinstance(registrations, dict) or approval.instance_label not in registrations:
         raise ProofGateError(_ERR_APPROVAL_DRIFT)
-    prof = matches[0]
+    entry = registrations[approval.instance_label]
+    if not isinstance(entry, dict):
+        raise ProofGateError(_ERR_APPROVAL_DRIFT)
+    entry_dir = str(profiles_root / "registrations" / str(entry.get("key") or ""))
     if (
-        prof.retiring
-        or str(prof.directory) != approval.profile_directory
-        or str(prof.client_id or "") != approval.client_id
-        or prof.epoch != approval.selection_epoch
-        or target_binding.generation != approval.credential_generation
+        entry.get("retiring") is not False
+        or entry_dir != approval.profile_directory
+        or str(entry.get("client_id") or "") != approval.client_id
+        or str(prof_state.get("epoch") or "") != approval.selection_epoch
+    ):
+        raise ProofGateError(_ERR_APPROVAL_DRIFT)
+    reg_state = _read_private_json_no_lock(Path(approval.profile_directory) / "state.json")
+    if (
+        reg_state.get("generation") != approval.credential_generation
+        or str(reg_state.get("client") or "") != approval.client_id
+        or not reg_state.get("tokens")
+        or reg_state.get("worker_retiring") is True
     ):
         raise ProofGateError(_ERR_APPROVAL_DRIFT)
 
@@ -546,10 +596,10 @@ def run_openai_shell_live(config: ShellLiveConfig) -> ShellLiveResult:
         "scoped_provider_id": scoped_id,
         "approved_model": config.model,
         "ui_mode": config.ui_mode,
-        "billing": admitted.route_policy + (f" | prior holds: {'; '.join(hold_notes)}" if hold_notes else ""),
+        "route_policy": admitted.route_policy + (f" | prior holds: {'; '.join(hold_notes)}" if hold_notes else ""),
         "client_id": approval.client_id,
         "selection_epoch": approval.selection_epoch,
-        "credential_generation": approval.credential_generation,
+        "registration_generation": approval.credential_generation,
         "providers_config_digest": providers_cfg_digest,
         "history_digest_all_12_files": history_digest_before,
         "agent_image_id": agent_image_id,
@@ -635,7 +685,7 @@ def run_openai_shell_live(config: ShellLiveConfig) -> ShellLiveResult:
             spec,
             terminal,
             adapters={"openai": proof_adapter},
-            lock_dir=state_dir,
+            lock_dir=exposure_dir,
             proof_options=proof_options,
         )
         if proof_gate.exact_ok_delivered:

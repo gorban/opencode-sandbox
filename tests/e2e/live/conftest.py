@@ -101,9 +101,9 @@ def pytest_addoption(parser):
     parser.addoption("--openai-shell-source-sha256", metavar=_REVIEWED_SHA256, default=None,
                      help="Required exact 64-hex SHA-256 source-tree pin for --run-openai-shell-live.")
     parser.addoption("--openai-shell-agent-image-id", metavar="IMAGE_SHA256", default=None,
-                     help="Optional exact 64-hex SHA-256 pin for localhost/oc-agent:latest.")
+                     help="Required exact 64-hex SHA-256 pin for localhost/oc-agent:latest.")
     parser.addoption("--openai-shell-relay-image-id", metavar="IMAGE_SHA256", default=None,
-                     help="Optional exact 64-hex SHA-256 pin for localhost/oc-openai-relay:latest.")
+                     help="Required exact 64-hex SHA-256 pin for localhost/oc-openai-relay:latest.")
 
 
 def _resolve_argv(argv: Sequence[str] | None) -> tuple[str, ...]:

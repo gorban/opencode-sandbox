@@ -472,6 +472,8 @@ class SessionBroker:
         except ProofGateError as exc:
             code = exc.args[0] if exc.args and type(exc.args[0]) is str else _ERR_PROOF_NOT_ARMED
             raise ConnectionError(code) from None
+        except Exception:
+            raise ConnectionError(_ERR_PROOF_NOT_ARMED) from None
 
     def _stream_responses_turn(self, peer: socket.socket, parsed, cancel: threading.Event,
                                state: dict, *, arrival=None) -> tuple[str, tuple[int, int, int] | None]:
@@ -1319,16 +1321,17 @@ class _SessionSlotCoordinator:
     def remove_slot_roots(self, *, require_confirmed_leases: bool = False) -> None:
         with self._lock:
             roots = list(self._slot_roots)
-            if require_confirmed_leases:
-                blocked = {
+            confirmed = (
+                {
                     s.slot_root
                     for s in self._slots.values()
-                    if not s.lease_confirmed_released or s.handle.lease_release_confirmed is None
+                    if s.lease_confirmed_released and s.handle.lease_release_confirmed is not None
                 }
-            else:
-                blocked = set()
+                if require_confirmed_leases
+                else None
+            )
         for slot_root in roots:
-            if slot_root in blocked:
+            if confirmed is not None and slot_root not in confirmed:
                 continue
             with suppress(OSError):
                 shutil.rmtree(slot_root)
@@ -1432,8 +1435,7 @@ class _SessionSlotCoordinator:
         with self._lock:
             state.retired = True
 
-    def on_revoke(self, slot_index: int) -> None:
-        """Retire only the revoked slot; stop the whole session iff zero active slots remain."""
+    def _start_slot_retirement(self, slot_index: int, *, stop_if_last: bool) -> None:
         with self._lock:
             state = self._slots.get(slot_index)
             if state is None:
@@ -1459,8 +1461,16 @@ class _SessionSlotCoordinator:
                     self._cleanup_error = exc
                 self._stop_event.set()
                 return
-        if active_remaining == 0:
+        if stop_if_last and active_remaining == 0:
             self._stop_event.set()
+
+    def on_revoke(self, slot_index: int) -> None:
+        """Retire only the revoked slot; stop the whole session iff zero active slots remain."""
+        self._start_slot_retirement(slot_index, stop_if_last=True)
+
+    def retire_slot_for_cutover(self, slot_index: int) -> None:
+        """Retire the discovery slot cleanly during two-phase cutover without stopping the session."""
+        self._start_slot_retirement(slot_index, stop_if_last=False)
 
     def any_active(self) -> bool:
         with self._lock:
@@ -1686,8 +1696,10 @@ class _ProofTurnCutover:
         gate.verify_ready_for_arm()
         idx = int(self._approved_info["slot_index"])
         # Step A: completely retire discovery listener, join every discovery thread, verify relay & lease gone.
-        self._coordinator.on_revoke(idx)
-        for thread in list(self._coordinator._retire_threads):
+        self._coordinator.retire_slot_for_cutover(idx)
+        with self._coordinator._lock:
+            retire_threads = tuple(self._coordinator._retire_threads)
+        for thread in retire_threads:
             thread.join(timeout=15)
         with self._coordinator._lock:
             disc_state = self._coordinator._slots.get(idx)
@@ -1712,7 +1724,7 @@ class _ProofTurnCutover:
 
         # Step B: prepare slot & arm BEFORE starting any worker-reachable replacement turn relay.
         turn_slot_index = len(self._coordinator._slots) + 100
-        turn_root = Path(tempfile.mkdtemp(prefix="oc-chat-turn-", dir=SHARED_TMP))
+        turn_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir=SHARED_TMP))
         self._coordinator.track_slot_root(turn_root)
         slot_key = f"turn-{idx}"
         turn_cname = f"{self._spec['pod']}-relay-{turn_slot_index}"

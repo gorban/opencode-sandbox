@@ -110,22 +110,31 @@ def capture_manifest(root: Path) -> tuple[str, dict[Path, bytes]]:
     return hasher.hexdigest(), captured
 
 
+def _verify_snapshot_dir(directory: Path, label: str) -> None:
+    try:
+        info = directory.lstat()
+    except OSError:
+        raise SnapshotError(f"snapshot directory unavailable: {label}") from None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o277:
+        raise SnapshotError(
+            "live execution requires an owner-only read-only verified snapshot "
+            f"(unsafe directory: {label}; run via run_openai_shell_live.py)"
+        )
+
+
 def verify_read_only_snapshot(snapshot_root: Path, expected_sha256: str) -> str:
-    """Verify snapshot_root is owner-only read-only (mode & 0o222 == 0) and matches expected_sha256."""
+    """Verify snapshot_root, all intermediate directories, and manifest files are 0o400/0o500 and match expected_sha256."""
     if not _SHA256_RE.fullmatch(expected_sha256):
         raise SnapshotError("invalid expected source SHA-256 pin")
-    try:
-        root_info = snapshot_root.lstat()
-    except OSError:
-        raise SnapshotError("snapshot root unavailable") from None
-    if (
-        not stat.S_ISDIR(root_info.st_mode)
-        or root_info.st_uid != os.geteuid()
-        or root_info.st_mode & 0o277
-    ):
-        raise SnapshotError("live execution requires an owner-only read-only verified snapshot (run via run_openai_shell_live.py)")
+    _verify_snapshot_dir(snapshot_root, ".")
+    checked_dirs: set[Path] = {Path(".")}
     hasher = sha256()
     for rel in collect_manifest_relpaths(snapshot_root):
+        for parent in rel.parents:
+            if parent in checked_dirs:
+                continue
+            _verify_snapshot_dir(snapshot_root / parent, parent.as_posix())
+            checked_dirs.add(parent)
         target = snapshot_root / rel
         info = target.lstat()
         if info.st_uid != os.geteuid() or info.st_mode & 0o277:
@@ -227,6 +236,8 @@ def _build_pytest_args(args: argparse.Namespace, snapshot_root: Path) -> list[st
         "/dev/null",
         "-o",
         "addopts=",
+        "-o",
+        f"pythonpath={snapshot_root}",
         "--confcutdir",
         str(snapshot_root / "tests/e2e/live"),
         "--rootdir",

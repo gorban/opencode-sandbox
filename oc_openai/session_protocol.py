@@ -52,6 +52,7 @@ _ALLOWED_ROLES = frozenset({"user", "assistant", "developer", "system"})
 
 _EVENT_CREATED = "response.created"
 _EVENT_ITEM_ADDED = "response.output_item.added"
+_EVENT_TEXT_DELTA = "response.output_text.delta"
 _EVENT_TEXT_DONE = "response.output_text.done"
 _EVENT_COMPLETED = "response.completed"
 _DELTA_SUFFIX = ".delta"
@@ -60,7 +61,7 @@ _ALLOWED_STREAM_EVENTS = frozenset({
     _EVENT_CREATED, "response.in_progress", "response.queued",
     _EVENT_ITEM_ADDED, "response.output_item.done",
     "response.content_part.added", "response.content_part.done",
-    "response.output_text.delta", _EVENT_TEXT_DONE,
+    _EVENT_TEXT_DELTA, _EVENT_TEXT_DONE,
     "response.refusal.delta", "response.refusal.done",
     "response.function_call_arguments.delta", "response.function_call_arguments.done",
     "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
@@ -910,7 +911,7 @@ class SessionStreamProjector:
             field = "refusal"
         if type(event.get(field)) is not str:
             raise StreamAborted("invalid_delta")
-        if kind == "response.output_text.delta":
+        if kind == _EVENT_TEXT_DELTA:
             self._streamed_text_deltas.append(event[field])
         payload[field] = event[field]
         self._attach_content_fields(event, payload)
@@ -981,7 +982,7 @@ class SessionStreamProjector:
         payload: dict = {"type": kind}
         if "output_index" in event:
             payload["output_index"] = _valid_index(event["output_index"])
-        if kind in ("response.output_text.delta", "response.refusal.delta",
+        if kind in (_EVENT_TEXT_DELTA, "response.refusal.delta",
                     _EVENT_TEXT_DONE, "response.refusal.done"):
             return self._project_text_event(kind, event, payload)
         if kind in ("response.content_part.added", "response.content_part.done"):

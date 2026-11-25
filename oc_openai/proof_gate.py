@@ -129,6 +129,7 @@ class ArrivalSnapshot:
     state: str
     arm_nonce: str | None
     job_incarnation: str | None
+    relay_verified: bool = False
 
 
 def _unique_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -184,25 +185,6 @@ def compute_providers_config_digest(config_dir: Path) -> str:
         return sha256(b"PRESENT\0" + data).hexdigest()
     finally:
         os.close(dir_fd)
-
-
-def verify_foreground_tty() -> None:
-    """Verify this process group still owns the attended foreground controlling terminal."""
-    import sys as _sys
-
-    if not (_sys.stdin.isatty() and _sys.stdout.isatty() and _sys.stderr.isatty()):
-        raise ProofGateError(_ERR_FOREGROUND_LOST)
-    try:
-        tty_fd = os.open("/dev/tty", os.O_RDONLY | os.O_CLOEXEC)
-    except OSError:
-        raise ProofGateError(_ERR_FOREGROUND_LOST) from None
-    try:
-        if os.tcgetpgrp(tty_fd) != os.getpgrp():
-            raise ProofGateError(_ERR_FOREGROUND_LOST)
-    except OSError:
-        raise ProofGateError(_ERR_FOREGROUND_LOST) from None
-    finally:
-        os.close(tty_fd)
 
 
 def compute_exposure_history_digest(exposure_dir: Path) -> str:
@@ -270,7 +252,7 @@ def _normalize_instructions(instructions: str, *, expected_cwd: str) -> str | No
 
 
 def _valid_proof_input(items: object) -> bool:
-    if type(items) is not list or len(items) != 1 or type(items[0]) is not dict:
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
         return False
     msg = items[0]
     if msg.get("role") != "user" or msg.get("type", "message") != "message":
@@ -311,30 +293,34 @@ def canonical_proof_body(approved_model: str) -> dict[str, object]:
     }
 
 
+def _write_fd_fsync(fd: int, raw: bytes) -> None:
+    fd_owned = True
+    try:
+        os.fchmod(fd, 0o600)
+        stream = os.fdopen(fd, "wb")
+        fd_owned = False
+        with stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        if fd_owned:
+            with _suppress_oserror():
+                os.close(fd)
+        raise
+
+
 def _atomic_fsync_json(path: Path, payload: dict[str, object], *, exclusive: bool = False) -> None:
     raw = (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode("ascii")
     if exclusive:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(raw)
-                stream.flush()
-                os.fsync(stream.fileno())
-        except BaseException:
-            with _suppress_oserror():
-                os.close(fd)
-            raise
+        _write_fd_fsync(fd, raw)
         _fsync_dir(path.parent)
         return
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
+        _write_fd_fsync(fd, raw)
         os.replace(tmp, path)
         _fsync_dir(path.parent)
     except BaseException:
@@ -574,6 +560,7 @@ class ProofGate:
                 state=self._state,
                 arm_nonce=self._arm_nonce,
                 job_incarnation=self._job_incarnation,
+                relay_verified=self._relay_verified,
             )
 
     def verify_ready_for_arm(self) -> None:
@@ -646,7 +633,7 @@ class ProofGate:
             if self._state != STATE_ARMED or self._arm_nonce is None or not hmac.compare_digest(arrival.arm_nonce, self._arm_nonce):
                 self._record_refusal_locked(_ERR_NOT_ARMED, arrival_state=arrival.state)
                 raise RequestRefused(403, _ERR_NOT_ARMED, "Proof gate arming nonce mismatch.")
-            if not self._relay_verified:
+            if not self._relay_verified or not arrival.relay_verified:
                 self._record_refusal_locked(_ERR_RELAY_UNVERIFIED, arrival_state=arrival.state)
                 raise RequestRefused(403, _ERR_RELAY_UNVERIFIED, "Replacement turn relay verification incomplete.")
 
@@ -659,7 +646,7 @@ class ProofGate:
                 object_pairs_hook=_unique_object_pairs,
                 parse_constant=_reject_non_finite,
             )
-        except (UnicodeDecodeError, ValueError, RecursionError):
+        except (ValueError, RecursionError):
             self._refuse(_ERR_OPTIONS, arrival_state, "Malformed JSON in proof request.")
         if type(data) is not dict or not set(data) <= _ALLOWED_PROOF_KEYS:
             self._refuse(_ERR_OPTIONS, arrival_state, "Unexpected keys in proof request.")
@@ -714,7 +701,7 @@ class ProofGate:
         with self._lock:
             if self._job_incarnation is None or not hmac.compare_digest(job_incarnation, self._job_incarnation):
                 raise ProofGateError(_ERR_INCARNATION)
-            if not self._relay_verified or self._verified_relay_id is None:
+            if not self._relay_verified or not arrival.relay_verified or self._verified_relay_id is None:
                 raise ProofGateError(_ERR_RELAY_UNVERIFIED)
             if (
                 self._state != STATE_ARMED

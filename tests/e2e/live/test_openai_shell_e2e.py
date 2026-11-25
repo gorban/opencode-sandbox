@@ -6,16 +6,23 @@ Skipped by default unless invoked directly via `tests/e2e/live/run_openai_shell_
 
 from pathlib import Path
 import re
+import sys
 
-from .conftest import (
+_LIVE_DIR = Path(__file__).resolve().parent
+_SNAPSHOT_ROOT = _LIVE_DIR.parents[2]
+for _path in (str(_SNAPSHOT_ROOT), str(_LIVE_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+from conftest import (
     assert_no_inherited_live_options,
     explicit_cli_flag,
     explicit_cli_option,
     require_explicit_test_target,
     validate_source_sha256_pin,
 )
-from .openai_shell_driver import ShellLiveConfig, run_openai_shell_live
-from .run_openai_shell_live import SnapshotError, verify_read_only_snapshot
+from openai_shell_driver import ShellLiveConfig, run_openai_shell_live
+from run_openai_shell_live import SnapshotError, verify_read_only_snapshot
 
 
 LIVE_FLAG = "--run-openai-shell-live"
