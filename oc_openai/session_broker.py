@@ -1976,6 +1976,20 @@ def _report_session_error(terminal: StreamTerminal, error: BaseException) -> int
     return report_failure(terminal, error, operation="Provider session")
 
 
+def _validate_plan_entries_against_config(plan, config, err_plan_mismatch: str, err_config_mismatch: str) -> dict:
+    enabled_by_scoped = {item.scoped_id: item for item in config.instances if item.enabled}
+    seen_ids: set[str] = set()
+    for item in plan.admitted:
+        sid = item.spec.scoped_id
+        if sid in seen_ids:
+            raise LaunchRefusedError(err_plan_mismatch, "Preconfirmed plan contains duplicate admitted provider slots.")
+        seen_ids.add(sid)
+        cfg_item = enabled_by_scoped.get(sid)
+        if cfg_item is None or cfg_item.kind != item.spec.kind or cfg_item.label != item.spec.label or cfg_item.auth_mode != item.spec.auth_mode:
+            raise LaunchRefusedError(err_config_mismatch, "Preconfirmed plan slot is no longer enabled in current providers.toml.")
+    return enabled_by_scoped
+
+
 def _validate_preconfirmed_plan(plan, proof_gate, config, live_config_digest: str | None) -> None:
     err_plan_mismatch = "proof_plan_mismatch"
     err_config_mismatch = "proof_config_mismatch"
@@ -1989,15 +2003,13 @@ def _validate_preconfirmed_plan(plan, proof_gate, config, live_config_digest: st
         if item.spec.scoped_id == approval.scoped_provider_id
         and approval.approved_model in item.models
     ]
-    if len(plan.admitted) != 1 or len(admitted) != 1:
+    if len(admitted) != 1:
         raise LaunchRefusedError(err_plan_mismatch, "Approved proof route is not uniquely admitted in preconfirmed plan.")
     if config is None:
         raise LaunchRefusedError(err_config_mismatch, "Current provider configuration does not admit the approved proof route.")
-    cfg_matches = [
-        item for item in config.instances
-        if item.enabled and item.scoped_id == approval.scoped_provider_id
-    ]
-    if len(cfg_matches) != 1 or cfg_matches[0].auth_mode != approval.auth_mode:
+    enabled_by_scoped = _validate_plan_entries_against_config(plan, config, err_plan_mismatch, err_config_mismatch)
+    approved_cfg = enabled_by_scoped.get(approval.scoped_provider_id)
+    if approved_cfg is None or approved_cfg.auth_mode != approval.auth_mode:
         raise LaunchRefusedError(err_config_mismatch, "Approved proof route is no longer enabled in current providers.toml.")
     if (
         not approval.providers_config_digest

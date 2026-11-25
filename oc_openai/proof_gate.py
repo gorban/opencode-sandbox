@@ -182,7 +182,9 @@ def compute_providers_config_digest(config_dir: Path) -> str:
             data = stream.read(_MAX_RECEIPT_BYTES + 1)
         if len(data) > _MAX_RECEIPT_BYTES:
             raise ProofGateError("providers.toml exceeds size cap")
-        return sha256(b"PRESENT\0" + data).hexdigest()
+        from oc_providers.config import hash_providers_config_bytes
+
+        return hash_providers_config_bytes(data)
     finally:
         os.close(dir_fd)
 

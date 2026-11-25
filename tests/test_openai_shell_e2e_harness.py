@@ -2002,6 +2002,8 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             prof, conn, binding = backend.profile_connection("personal")
             self.assertEqual(conn.models(binding), (TEST_MODEL,))
 
+            from oc_providers.config import load_provider_config_with_digest
+            _, loaded_cfg_digest = load_provider_config_with_digest(config_dir=cfg_dir, sandbox_dir=td / "sb")
             approval = ProofApproval(
                 run_id=TEST_RUN_ID,
                 instance_label="personal",
@@ -2016,7 +2018,7 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 client_id=str(prof.client_id),
                 auth_mode="subscription",
                 route_policy="subscription-only",
-                providers_config_digest=compute_providers_config_digest(cfg_dir),
+                providers_config_digest=loaded_cfg_digest or "",
             )
             gate = ProofGate(
                 approval,
@@ -2298,12 +2300,15 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 '[providers.openai.personal]\n'
                 'enabled = true\n'
                 'auth_mode = "subscription"\n'
+                '[providers.openai.work]\n'
+                'enabled = true\n'
+                'auth_mode = "subscription"\n'
             ).encode("utf-8")
             toml_path.write_bytes(toml_bytes)
             os.chmod(toml_path, 0o600)
             cfg, digest = load_provider_config_with_digest(config_dir=cfg_dir, sandbox_dir=td / "sb")
             self.assertIsNotNone(cfg)
-            self.assertEqual(digest, sha256(toml_bytes).hexdigest())
+            self.assertEqual(digest, compute_providers_config_digest(cfg_dir))
 
             exp = td / "exp"
             exp.mkdir(mode=0o700)
@@ -2319,14 +2324,18 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 providers_config_digest=digest or "",
             )
             gate = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
+            personal_preflight = InstancePreflight(
+                spec=ProviderInstanceSpec(kind="openai", label="personal", enabled=True, auth_mode="subscription"),
+                readiness=ReadinessState.READY,
+                models=(TEST_MODEL,),
+            )
+            work_preflight = InstancePreflight(
+                spec=ProviderInstanceSpec(kind="openai", label="work", enabled=True, auth_mode="subscription"),
+                readiness=ReadinessState.READY,
+                models=(TEST_MODEL,),
+            )
             plan = ResolvedLaunchPlan(
-                admitted=(
-                    InstancePreflight(
-                        spec=ProviderInstanceSpec(kind="openai", label="personal", enabled=True, auth_mode="subscription"),
-                        readiness=ReadinessState.READY,
-                        models=(TEST_MODEL,),
-                    ),
-                ),
+                admitted=(personal_preflight, work_preflight),
                 excluded=(),
                 acknowledged_digests={},
                 initial_provider_id=TEST_SCOPED,
@@ -2346,9 +2355,22 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             # Digest mismatch on enabled config must reject preconfirmed plan.
             with self.assertRaises(LaunchRefusedError):
                 session_broker._resolve_session_plan({}, cfg, {}, None, opts, live_config_digest="0" * 64)
-            # Exact matching enabled config & digest succeeds.
+            # Multi-instance preconfirmed plan with matching enabled config & digest succeeds.
             resolved = session_broker._resolve_session_plan({}, cfg, {}, None, opts, live_config_digest=digest)
             self.assertIs(resolved, plan)
+            # Duplicate slot in preconfirmed plan is rejected.
+            dup_plan = ResolvedLaunchPlan(
+                admitted=(personal_preflight, personal_preflight),
+                excluded=(),
+                acknowledged_digests={},
+                initial_provider_id=TEST_SCOPED,
+                initial_model=TEST_MODEL,
+                ui_mode="mini",
+                ui_source="cli",
+            )
+            dup_opts = session_broker.ProofSessionOptions(proof_gate=gate, preconfirmed_plan=dup_plan)
+            with self.assertRaises(LaunchRefusedError):
+                session_broker._resolve_session_plan({}, cfg, {}, None, dup_opts, live_config_digest=digest)
 
         # Export corroboration strictness: reject missing user msg, padded " ok ", wrong prompt, or tool call.
         bad_exports = [
@@ -2442,13 +2464,22 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
         for bad_screen in (
             f"openai--work/{TEST_MODEL}-v2",
             f"openai--work/{TEST_MODEL}",
+            f"openai--personal/{TEST_MODEL}-v2",
             f"OpenAI (work)  {TEST_MODEL}",
             f"OpenAI (personal)  {TEST_MODEL}-v2",
+            f"ChatGPT Subscription (work)  {TEST_MODEL}",
+            f"ChatGPT Subscription (work)  openai--personal/{TEST_MODEL}",
+            f"ChatGPT Subscription (personal)  other/{TEST_MODEL}",
             f"{TEST_MODEL}",
         ):
             self.assertIsNone(shell_driver.extract_observed_route_row(bad_screen, appr), bad_screen)
-        row = shell_driver.extract_observed_route_row(f"Status: OpenAI (personal) / {TEST_MODEL}", appr)
-        self.assertEqual(row, f"Status: OpenAI (personal) / {TEST_MODEL}")
+        for good_screen in (
+            f"Status: OpenAI (personal) / {TEST_MODEL}",
+            f"Model: openai--personal/{TEST_MODEL}",
+            f"ChatGPT Subscription (personal)  {TEST_MODEL}",
+        ):
+            row = shell_driver.extract_observed_route_row(good_screen, appr)
+            self.assertEqual(row, " ".join(good_screen.split()))
 
     def test_reciprocal_g2_owner_partial_create_snapshot_delete_teardown_and_settlement_fsync(self) -> None:
         from oc_openai import shell_cleanup_owner as owner_mod

@@ -337,21 +337,26 @@ def _parse_provider_config_bytes(raw: bytes, *, sandbox: Path) -> ProviderConfig
     return ProviderConfig(instances=instances, provider_defaults=provider_defaults, launch=launch)
 
 
+def hash_providers_config_bytes(raw: bytes) -> str:
+    """Return the canonical domain-separated SHA-256 digest of trusted providers.toml bytes."""
+    from hashlib import sha256
+
+    return sha256(b"PRESENT\0" + raw).hexdigest()
+
+
 def load_provider_config_with_digest(
     *,
     config_dir: Path | None = None,
     sandbox_dir: Path | None = None,
 ) -> tuple[ProviderConfig | None, str | None]:
     """Atomically read, hash, and strictly validate providers.toml from one captured byte buffer."""
-    from hashlib import sha256
-
     pw_home = _account_home()
     target_dir = default_config_dir() if config_dir is None else Path(config_dir)
     sandbox = (pw_home / "opencode-sandbox").resolve() if sandbox_dir is None else Path(sandbox_dir).resolve()
     raw = _read_trusted_toml_bytes(target_dir, sandbox=sandbox)
     if raw is None:
         return None, None
-    return _parse_provider_config_bytes(raw, sandbox=sandbox), sha256(raw).hexdigest()
+    return _parse_provider_config_bytes(raw, sandbox=sandbox), hash_providers_config_bytes(raw)
 
 
 def load_provider_config(

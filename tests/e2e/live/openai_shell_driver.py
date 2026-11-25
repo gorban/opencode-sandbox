@@ -388,14 +388,16 @@ def _drain_pty_chunk(master_fd: int, screen_buf: bytearray) -> bool:
 
 
 _ANY_SCOPED_RE = re.compile(r"(?<![A-Za-z0-9_-])openai--[a-z0-9][a-z0-9-]*(?![A-Za-z0-9_-])")
-_ANY_OPENAI_LABEL_RE = re.compile(r"(?<![A-Za-z0-9_-])OpenAI\s*\(([a-z0-9][a-z0-9-]*)\)(?![A-Za-z0-9_-])")
+_ANY_DISPLAY_LABEL_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:ChatGPT\s+Subscription|OpenAI)\s*\(([a-z0-9][a-z0-9-]*)\)(?![A-Za-z0-9_-])"
+)
 
 
 def _line_has_conflicting_provider(line: str, approval: ProofApproval) -> bool:
     for found in _ANY_SCOPED_RE.findall(line):
         if found != approval.scoped_provider_id:
             return True
-    for found_label in _ANY_OPENAI_LABEL_RE.findall(line):
+    for found_label in _ANY_DISPLAY_LABEL_RE.findall(line):
         if found_label != approval.instance_label:
             return True
     return False
@@ -407,22 +409,52 @@ def _provider_matches_line(text: str, approval: ProofApproval, scoped_re: re.Pat
     return scoped_re.search(text) is not None or label_re.search(text) is not None
 
 
+def _line_matches_route(
+    line: str,
+    approval: ProofApproval,
+    exact_route_re: re.Pattern[str],
+    model_re: re.Pattern[str],
+    scoped_re: re.Pattern[str],
+    label_re: re.Pattern[str],
+) -> bool:
+    if _line_has_conflicting_provider(line, approval):
+        return False
+    if exact_route_re.search(line) is not None:
+        return True
+    return _provider_matches_line(line, approval, scoped_re, label_re) and model_re.search(line) is not None
+
+
+def _pair_matches_route(
+    a: str,
+    b: str,
+    approval: ProofApproval,
+    model_re: re.Pattern[str],
+    scoped_re: re.Pattern[str],
+    label_re: re.Pattern[str],
+) -> bool:
+    if _line_has_conflicting_provider(a, approval) or _line_has_conflicting_provider(b, approval):
+        return False
+    pair_a = _provider_matches_line(a, approval, scoped_re, label_re) and model_re.search(b) is not None
+    pair_b = model_re.search(a) is not None and _provider_matches_line(b, approval, scoped_re, label_re)
+    return pair_a or pair_b
+
+
 def extract_observed_route_row(clean: str, approval: ProofApproval) -> str | None:
     """Return an unambiguous observed route row matching exact approved provider and model, or None."""
-    model_re = re.compile(rf"(?<![A-Za-z0-9._/-]){re.escape(approval.approved_model)}(?![A-Za-z0-9._/-])")
-    scoped_re = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(approval.scoped_provider_id)}(?![A-Za-z0-9_-])")
-    label_re = re.compile(rf"(?<![A-Za-z0-9_-])OpenAI\s*\({re.escape(approval.instance_label)}\)(?![A-Za-z0-9_-])")
+    esc_model = re.escape(approval.approved_model)
+    esc_scoped = re.escape(approval.scoped_provider_id)
+    esc_label = re.escape(approval.instance_label)
+    exact_route_re = re.compile(rf"(?<![A-Za-z0-9._/-]){esc_scoped}/{esc_model}(?![A-Za-z0-9._/-])")
+    model_re = re.compile(rf"(?<![A-Za-z0-9._/-]){esc_model}(?![A-Za-z0-9._/-])")
+    scoped_re = re.compile(rf"(?<![A-Za-z0-9_-]){esc_scoped}(?![A-Za-z0-9_-])")
+    label_re = re.compile(rf"(?<![A-Za-z0-9_-])(?:ChatGPT\s+Subscription|OpenAI)\s*\({esc_label}\)(?![A-Za-z0-9_-])")
 
     lines = [ln for ln in (" ".join(raw.split()) for raw in clean.splitlines()) if ln]
     for line in lines:
-        if _provider_matches_line(line, approval, scoped_re, label_re) and model_re.search(line) is not None:
+        if _line_matches_route(line, approval, exact_route_re, model_re, scoped_re, label_re):
             return line[:200]
     for a, b in zip(lines, lines[1:]):
-        if _line_has_conflicting_provider(a, approval) or _line_has_conflicting_provider(b, approval):
-            continue
-        pair_a = _provider_matches_line(a, approval, scoped_re, label_re) and model_re.search(b) is not None
-        pair_b = model_re.search(a) is not None and _provider_matches_line(b, approval, scoped_re, label_re)
-        if pair_a or pair_b:
+        if _pair_matches_route(a, b, approval, model_re, scoped_re, label_re):
             return f"{a} | {b}"[:200]
     return None
 
