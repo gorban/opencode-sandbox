@@ -3862,6 +3862,87 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertTrue(persisted_fb["ownership_uncertain"])
             self.assertIn("grant_lock_mismatch:turn-0", persisted_fb["cleanup_errors"])
 
+    def test_reciprocal_g2_r8_dec_graphics_charset_and_stock_full_footer(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oc-g2-r8-") as td_raw:
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            exp = td / "exp"
+            exp.mkdir(mode=0o700)
+            os.chmod(exp, 0o700)
+            ev = td / "ev"
+            ev.mkdir(mode=0o700)
+            os.chmod(ev, 0o700)
+            approval = ProofApproval(
+                run_id=TEST_RUN_ID, instance_label="personal", scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL, ui_mode="full", cwd=TEST_CWD,
+                selection_epoch="E" * 43, credential_generation=1,
+                history_digest_all_12_files=compute_exposure_history_digest(exp),
+                providers_config_digest=TEST_HEX_A,
+            )
+
+            # 1a. DEC Special Graphics (G0 via ESC ( 0, G1 via ESC ) 0 + SO) renders glyphs, not ASCII route.
+            route_txt = f"openai--personal/{TEST_MODEL}"
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(f"\x1b(0{route_txt}\x1b(B", approval),
+            )
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(f"\x1b)0\x0e{route_txt}\x0f", approval),
+            )
+            # Chunk-split ESC ( / 0 keeps observation disabled while incomplete and translates payload.
+            scr_cs = shell_driver._TerminalScreen()
+            scr_cs.feed("\x1b(")
+            self.assertFalse(scr_cs.is_certain)
+            scr_cs.feed(f"0{route_txt}\n")
+            self.assertIsNone(shell_driver.extract_observed_route_row(scr_cs.render(), approval))
+            # Returning to ordinary US-ASCII (ESC ( B) restores normal route observation.
+            scr_cs.feed(f"\x1b(B{route_txt}\n")
+            self.assertEqual(shell_driver.extract_observed_route_row(scr_cs.render(), approval), route_txt)
+            # Returning from G1 graphics via SI (\x0f) also restores ordinary US-ASCII.
+            scr_so = shell_driver._TerminalScreen()
+            scr_so.feed(f"\x1b)0\x0e{route_txt}\n\x0f{route_txt}\n")
+            self.assertEqual(shell_driver.extract_observed_route_row(scr_so.render(), approval), route_txt)
+            # Unknown character set (e.g. ESC ( A UK) fails closed.
+            scr_unk = shell_driver._TerminalScreen()
+            scr_unk.feed(f"\x1b(A{route_txt}")
+            self.assertFalse(scr_unk.is_certain)
+            self.assertEqual(scr_unk.render(), "")
+
+            # End-to-end PTY guard: DEC Special Graphics route never arms _drive_agent_pty.
+            gate_gfx = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
+            gate_gfx.bind_incarnation("inc-pty-dec-gfx-01", 1)
+            armed_gfx: list[tuple[str, str]] = []
+            gfx_child = (
+                "import sys, time; "
+                f"sys.stdout.write('\\x1b(0{route_txt}\\x1b(B\\n'); sys.stdout.flush(); time.sleep(1.8)"
+            )
+            with patch.object(
+                shell_driver,
+                "_agent_start_command",
+                return_value=([sys.executable, "-IB", "-c", gfx_child], dict(os.environ)),
+            ):
+                shell_driver._drive_agent_pty(
+                    TEST_HEX_A, threading.Event(), gate_gfx, lambda r, d: armed_gfx.append((r, d)),
+                )
+            self.assertEqual(armed_gfx, [])
+
+            # 2. Pinned OpenCode 2.3.0 Full stock footer ("Build · <model> · 1s", without "▣") passes
+            #    as positive control while clipped user prompt with the same footer stays rejected.
+            stock_footer = f"Build · {TEST_MODEL} · 1s"
+            full_turn = f"{PROOF_PROMPT}\n\nok\n{stock_footer}"
+            self.assertTrue(
+                shell_driver._has_new_exact_reply(full_turn, (), full_turn, approved_model=TEST_MODEL),
+            )
+            prompt_head = PROOF_PROMPT.removesuffix(f" {shell_driver.EXPECTED_REPLY}")
+            scr_clip = shell_driver._TerminalScreen(rows=32, cols=120)
+            scr_clip.feed(f"{prompt_head}\nok\n" + ("\n" * 30) + stock_footer)
+            clipped_full = scr_clip.render()
+            self.assertNotIn(prompt_head, clipped_full)
+            self.assertFalse(
+                shell_driver._has_new_exact_reply(
+                    clipped_full, (), f"ok\n{stock_footer}", approved_model=TEST_MODEL,
+                ),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

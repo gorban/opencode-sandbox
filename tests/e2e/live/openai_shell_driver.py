@@ -125,6 +125,10 @@ _EXACT_OK_WORD_RE = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(EXPECTED_REPLY)}(?
 _BORDER_CHARS = " \t│┃┆┊║|"
 _ST_STRING_INTRODUCERS = frozenset({"P", "X", "^", "_"})
 _C1_ST_INTRODUCERS = frozenset({"\x90", "\x98", "\x9e", "\x9f"})
+_DEC_SPECIAL_GRAPHICS = str.maketrans(
+    "_`abcdefghijklmnopqrstuvwxyz{|}~",
+    " ◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·",
+)
 
 
 def _normalize_reply_line(raw: str) -> str:
@@ -139,7 +143,12 @@ def _is_explicit_assistant_header(line: str) -> bool:
 
 
 def _is_model_turn_footer(line: str, approved_model: str) -> bool:
-    return bool(approved_model) and approved_model in line and "▣" in line and PROOF_PROMPT not in line
+    return (
+        bool(approved_model)
+        and approved_model in line
+        and PROOF_PROMPT not in line
+        and ("·" in line or "▣" in line)
+    )
 
 
 def _is_wrapped_prompt_tail(lines: list[str], idx: int) -> bool:
@@ -170,7 +179,10 @@ class _TerminalScreen:
         self.cols = cols
         self.row = 0
         self.col = 0
-        self._saved_pos = (0, 0)
+        self._g0 = "B"
+        self._g1 = "B"
+        self._gl = 0
+        self._saved_pos = (0, 0, "B", "B", 0)
         self._scroll_top = 0
         self._scroll_bottom = rows - 1
         self.grid = [[" "] * cols for _ in range(rows)]
@@ -200,6 +212,9 @@ class _TerminalScreen:
         self._concealed = other._concealed
         self._fg = other._fg
         self._bg = other._bg
+        self._g0 = other._g0
+        self._g1 = other._g1
+        self._gl = other._gl
         if other._stream_invalid:
             self._stream_invalid = True
             self._uncertain = True
@@ -218,6 +233,9 @@ class _TerminalScreen:
         if reset_cursor:
             self.row = 0
             self.col = 0
+            self._g0 = "B"
+            self._g1 = "B"
+            self._gl = 0
             self._scroll_top = 0
             self._scroll_bottom = self.rows - 1
             self._reset_sgr()
@@ -475,11 +493,24 @@ class _TerminalScreen:
         elif self.row + 1 < self.rows:
             self.row += 1
 
+    def _map_charset_glyph(self, ch: str) -> str | None:
+        active_cs = self._g1 if self._gl else self._g0
+        if active_cs == "B":
+            return ch
+        if active_cs == "0":
+            return ch.translate(_DEC_SPECIAL_GRAPHICS)
+        self._uncertain = True
+        return None
+
     def _put_char(self, ch: str) -> None:
         if ch == "\ufffd" or 0x80 <= ord(ch) <= 0x9F:
             self.invalidate()
             return
-        if ch == "\r":
+        if ch == "\x0e":
+            self._gl = 1
+        elif ch == "\x0f":
+            self._gl = 0
+        elif ch == "\r":
             self.col = 0
         elif ch == "\n":
             self._linefeed()
@@ -488,19 +519,22 @@ class _TerminalScreen:
         elif ch == "\t":
             self.col = min(self.cols - 1, ((self.col // 8) + 1) * 8)
         elif ch >= " ":
+            mapped = self._map_charset_glyph(ch)
+            if mapped is None:
+                return
             if self.col >= self.cols:
                 self.col = 0
                 self._linefeed()
-            self.grid[self.row][self.col] = " " if self._is_text_hidden() else ch
+            self.grid[self.row][self.col] = " " if self._is_text_hidden() else mapped
             self.col += 1
 
     def _consume_two_byte_escape(self, nxt: str) -> bool:
         if nxt == "c":
             self._reset_screen(reset_cursor=True)
         elif nxt == "7":
-            self._saved_pos = (self.row, self.col)
+            self._saved_pos = (self.row, self.col, self._g0, self._g1, self._gl)
         elif nxt == "8":
-            self.row, self.col = self._saved_pos
+            self.row, self.col, self._g0, self._g1, self._gl = self._saved_pos
         elif nxt == "D":
             self._linefeed()
         elif nxt == "E":
@@ -549,6 +583,18 @@ class _TerminalScreen:
         if ch == "\x9c" or (self._ctrl_state == "osc" and ch == "\x07"):
             self._ctrl_state = None
 
+    def _consume_charset_escape(self, data: str, idx: int, nxt: str) -> int | None:
+        if idx + 2 >= len(data):
+            return None
+        cs = data[idx + 2]
+        if nxt == "(":
+            self._g0 = cs
+        elif nxt == ")":
+            self._g1 = cs
+        else:
+            self._uncertain = True
+        return idx + 3
+
     def _consume_escape(self, data: str, idx: int) -> int | None:
         if idx + 1 >= len(data):
             return None
@@ -564,8 +610,8 @@ class _TerminalScreen:
             self._ctrl_state = "st"
             self._ctrl_esc_seen = False
             return idx + 2
-        if nxt in ("(", ")"):
-            return None if idx + 2 >= len(data) else idx + 3
+        if nxt in ("(", ")", "*", "+"):
+            return self._consume_charset_escape(data, idx, nxt)
         if not self._consume_two_byte_escape(nxt):
             self._uncertain = True
         return idx + 2
