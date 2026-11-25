@@ -168,6 +168,15 @@ host chrome.
       challenger stops winning or after the round cap (about three divergent and two
       convergent rounds).
 - [ ] Record each round's slate, scores, decisions and the selected commit or artifact here.
+- [ ] Before locking `DESIGN.md`, run the finalist against a synthetic local/remote fleet
+      with simulated actions only. Start the triage clock when the operator opens the
+      authenticated dashboard. Require identification of the seeded attention items and
+      healthy control within five seconds, and record the loading time separately.
+      Require correct distinction between Tier A authorization and Tier B
+      workflow decisions, and correct local and remote message routing when two sandboxes
+      have the same name. Verify zero wrong-tier or wrong-target simulated effects. Record
+      observed outcomes, the fixture revision, and the operator's explicit selection of
+      the exact passing finalist artifact.
 
 ## Open decisions
 

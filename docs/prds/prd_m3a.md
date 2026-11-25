@@ -35,9 +35,10 @@ serve the dashboard only for UI paths. API and event paths have explicit handler
 - [ ] Prepare the shared SvelteKit components upfront for
       [M3 agent-assisted dashboard control](prd_m3.md#3-shared-sveltekit-frontend-loopback-web-auth-and-tauri-v2-uds-bridge)
       (evaluating [UI SDK](https://ui-sdk.dev) `@ui-sdk/svelte/agent`, Apache-2.0). Mark every
-      protected dashboard action with `data-agent-confirm="<impact summary>"` so agent invocations
-      via UI SDK always pop up a Trusted Chrome human confirmation dialog even when a direct human
-      click executes without a confirmation prompt. Mark the confirmation modal itself, Approval
+      protected dashboard action with `data-agent-confirm="<impact summary>"`. The daemon
+      independently classifies the typed action and initiating actor and requires Trusted
+      Chrome human confirmation on the agent path even when the ordinary human path can
+      execute directly. Mark the confirmation modal itself, Approval
       Inbox actions, and auth/sign-in controls `data-agent-hidden`, mark sensitive fields
       `data-agent-secret`, cancel open confirmation dialogs on session-generation retirement, and
       keep authoritative enforcement in `oc_daemon` and `oc_controller`. The current UI SDK

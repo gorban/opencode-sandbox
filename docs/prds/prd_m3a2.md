@@ -32,7 +32,8 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
   at 100 components and `query` lists at most 50 items.
 - **Markup:** exactly three attributes exist: `data-agent-confirm="<sentence>"` (covers the
   element and its subtree), `data-agent-hidden` (removes the subtree from snapshot and query)
-  and `data-agent-secret` (shows `[redacted]`, but the agent can still type into it).
+  and `data-agent-secret` (redacts the marked component value, but the agent can still type
+  into it). The SDK can collect secret-marked sibling text in another control's `row` field.
   There is no `data-agent-label` or `data-agent-description`.
 - **Default is permissive:** without `allow`, every supported action except
   `data-agent-confirm` targets is accepted. An `allow` that returns `true` without checking
@@ -58,7 +59,8 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
 - [ ] Mark the confirmation modal, Tier A Approval Inbox, sign-in and bootstrap chrome, and
       provider credential flows `data-agent-hidden`. Mark displayed secrets
       `data-agent-secret` and keep secret inputs out of agent-reachable views entirely,
-      because a secret-marked field can still be typed into.
+      because a secret-marked field can still be typed into. Keep sensitive displayed text
+      outside browsable SDK subtrees, including row, label, and section context.
 - [ ] Make each protected action a single, idempotent step whose effect is confirmed by the
       daemon, because `act` cannot roll back earlier steps.
 - [ ] Keep each view under the snapshot cap by sectioning and paging long lists, and give
@@ -70,15 +72,26 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
       Implement our own tool transport over the daemon channel. Never call `registerTools`
       (WebMCP would expose the dashboard to any browser-level agent), and never assign the
       agent to `window` or any global.
-- [ ] Always supply `allow`. It denies by default, sends every `step.confirm` action to the
-      Trusted Chrome confirmation modal, accepts only trusted human input there, binds the
-      decision to the exact action, target, parameters and session generation, and fails
-      closed on cancel, timeout, drift or session retirement.
-- [ ] Validate changes in component callbacks using `details.source`, because agent actions
-      call component APIs directly and bypass keyboard and click handlers.
-- [ ] Treat `snapshot()` and `query()` output as untrusted data when returning it to `-o`.
-      It contains page text, including agent-authored text. Wrap it in the nonce-framed
-      untrusted-data blocks used elsewhere in M and N.
+- [ ] Publish a host-owned allowlisted projection scoped to the authenticated actor, session
+      generation and permitted targets. Build names, rows, sections and values from typed,
+      authorized projection fields. Keep raw SDK DOM-derived snapshots, queries, action
+      results, errors and events inside the adapter. Apply the same scope to every result
+      and subscription delivery; default subscriptions off and discard retired-generation
+      entries. Nonce-frame any agent-authored text the projection explicitly permits.
+- [ ] Preserve the initiating actor end to end. The daemon classifies the typed action and
+      target independently of markup and browser-supplied source fields. Route agent
+      mutations through their restricted actor channel; the bridge cannot borrow the
+      ordinary operator session's mutation authority. Missing or out-of-scope actions,
+      Tier A approvals, Tier B `OPERATOR_ONLY` resolutions and operator-authored notes
+      are denied on the agent channel. Agent input cannot create a `HumanDecisionReceipt`
+      or operator provenance ([N3](prd_n3.md)).
+- [ ] Always supply a deny-by-default `allow`. For a permitted protected action, the daemon
+      initiates Trusted Chrome confirmation. The independent human path accepts trusted
+      input and issues a short-lived one-use decision bound to the initiating actor, exact
+      typed action, target identity and revision, canonical parameters and session generation.
+      Consume the decision atomically with authorization of the effect. Fail closed on
+      cancel, reuse, timeout, drift or retirement. Use `step.confirm` and `details.source`
+      as presentation and defense-in-depth signals.
 - [ ] Verify that production builds omit development `source` locations and
       `data-review-loc`, and that no `Preferences` inline script is emitted.
 - [ ] Pin exact package versions in the lockfile, verify the licence and integrity, and
@@ -95,6 +108,12 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
       inspect or click the confirmation modal, typing into a secret field, a multi-step `act`
       that fails halfway, a confirmation left open across logout, and tampered DOM attributes
       that the daemon still rejects.
+- [ ] Seed a secret beside an allowed row button and use an out-of-scope sandbox in the
+      same fixture. Check that neither appears in projected snapshots, queries, action
+      results, errors or any enabled subscription. Check that an action permitted on the
+      ordinary operator route still requires confirmation on the agent route, and that
+      forged source fields, stale or replayed decisions, and attempts to use Tier A or
+      Tier B human paths yield zero mutation, receipts or operator provenance.
 
 ## Open decision
 

@@ -154,12 +154,13 @@ Sidebar Tree (3-Level Hierarchy)
     advance with `data-agent-confirm="<impact summary>"` (e.g., revoking grants, stopping,
     restarting or deleting a sandbox, changing active provider/model/fallback settings, exporting
     diffs, or toggling input control). A normal human click follows the ordinary UI flow without an
-    extra prompt. When an agent triggers that same control through UI SDK
-    (`details.source === "agent"`), the `allow` callback intercepts `step.confirm` and pops up a
-    **human confirmation modal in Trusted Host Chrome** showing the exact action, target,
-    parameters, and impact summary — requiring an explicit human click before execution even when a
-    direct human click would not prompt. Without an `allow` handler, or on human cancel/timeout,
-    the action fails closed.
+    extra prompt. On the agent path, the daemon retains the initiating identity and independently
+    classifies the typed action. A permitted protected action requires a **human confirmation
+    modal in Trusted Host Chrome** showing the exact action, target and impact. The one-use
+    decision is consumed with the effect against the displayed target revision and parameters.
+    SDK attributes and event source fields guide presentation only. Without an `allow` handler,
+    or on human cancel/timeout, the agent path fails closed. Apply [M3a2](prd_m3a2.md) to every
+    bridge result and keep operator-only controls outside agent mutation authority.
   - **Defense in depth & self-approval prevention:**
     - Mark the confirmation modal itself, the **Approval Inbox** (approve/deny controls), provider
       sign-in/credential flows, and auth/bootstrap chrome with **`data-agent-hidden`** so an agent
@@ -594,8 +595,8 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
      `data-agent-confirm` control executes without an extra agent modal, whereas an agent `act()`
      call on the exact same control pauses and opens the Trusted Chrome human confirmation modal;
      (b) cancelling or omitting `allow` fails closed with zero mutation; (c) the confirmation
-     modal, Approval Inbox controls, and provider sign-in controls are `data-agent-hidden` so an
-     agent cannot see or self-confirm them, and `data-agent-secret` fields redact in snapshots;
+     modal, Approval Inbox controls, and provider sign-in controls stay out of the host-owned
+     agent projection, including secrets in sibling row labels and out-of-scope targets;
      (d) session logout/expiry cancels any pending confirmation modal and discards late replies;
      and (e) host `oc_daemon` / `oc_controller` / Tauri Rust IPC still refuse unauthorized calls
      even if DOM attributes are tampered with.
