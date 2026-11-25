@@ -5,6 +5,12 @@
 # Use the system Bash and skip startup hooks before checking the launcher and helper paths.
 set -euo pipefail
 
+if [[ ${1:-} == orchestrate ]]; then
+  export PATH=/usr/bin:/bin
+  IFS=: read -r _ _ orchestrator_uid _ _ HOME _ < <(/usr/bin/getent passwd "$EUID") || exit 2
+  [[ $orchestrator_uid == "$EUID" && $HOME == /* ]] || exit 2
+  export HOME
+fi
 CALLER_PWD=$PWD
 CALLER_PHYSICAL=$(pwd -P)
 SB="$HOME/opencode-sandbox"            # mounted at /sandbox in every agent
@@ -48,6 +54,7 @@ usage() {
 Usage: ${0##*/} [--provider openai] [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
        ${0##*/} openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}
+       ${0##*/} orchestrate [--synthetic-check]
 
   (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
               OpenCode. Safe to run repeatedly; only missing/changed pieces are touched.
@@ -191,6 +198,17 @@ if [[ ${1:-} == openai ]]; then
   exec /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/python3 -IB "$helper" "$@"
 fi
 
+if [[ ${1:-} == orchestrate ]]; then
+  shift
+  orchestrator_source=$0
+  if [[ $orchestrator_source != /* ]]; then orchestrator_source=$CALLER_PHYSICAL/$orchestrator_source; fi
+  [[ $(trusted_file "$orchestrator_source") == "$SCRIPT_REAL" ]] || die "untrusted orchestrator entry"
+  orchestrator_helper=$(trusted_file "$SCRIPT_DIR/oc-orchestrate.py") || die "unavailable orchestrator launcher"
+  orchestrator_host=local
+  if [[ -n ${CONTAINER_ID:-} ]]; then orchestrator_host=distrobox; fi
+  exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
+    /usr/bin/python3 -IB "$orchestrator_helper" "$orchestrator_host" "$@"
+fi
 trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
   local r
   r=$(trusted_path "$2") || die "refusing to use $2: the path leads into the sandbox directory $SB, which the agent controls (check XDG_DATA_HOME / XDG_CONFIG_HOME and symlinks)"

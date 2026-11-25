@@ -65,6 +65,7 @@ class PortableTests(unittest.TestCase):
         ), '/host/authority')
         expected = [
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_controller_core.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_orchestrator_text.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'bridge_merge_core.py'),
             ('python3', '-B', 'tests/setup-lifecycle.py'),
             ('python3', '-B', 'tests/host_state_leaves.py'),
