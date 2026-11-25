@@ -213,7 +213,7 @@ def _verify_and_rmdir_pinned(parent_fd: int, leaf: str, leaf_fd: int, want_dev: 
         if cur_status == "absent" and os.fstat(leaf_fd).st_nlink != 0:
             return "replaced"
         return cur_status
-    if os.fstat(leaf_fd).st_nlink != 2:
+    if os.fstat(leaf_fd).st_nlink not in (1, 2):
         return "replaced"
     try:
         os.rmdir(leaf, dir_fd=parent_fd)
@@ -313,32 +313,30 @@ def _acquire_pinned_grant_lock(grant_fd: int) -> tuple[bool, int | None]:
         return False, None
 
 
-def _revoke_pinned_grant_dir(slot_root_fd: int | None, want_dev: object, want_ino: object) -> bool:
+def _revoke_pinned_grant_dir(slot_root_fd: int | None, want_dev: object, want_ino: object) -> None:
     """Revoke grant/state strictly through the pinned slot_root directory FD (never by pathname)."""
     if slot_root_fd is None or type(want_dev) is not int or type(want_ino) is not int:
-        return False
+        return
     try:
         rinfo = os.fstat(slot_root_fd)
     except OSError:
-        return False
+        return
     if (rinfo.st_dev, rinfo.st_ino) != (want_dev, want_ino) or rinfo.st_uid != os.geteuid():
-        return False
+        return
     try:
         grant_fd = os.open("grant", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=slot_root_fd)
     except OSError:
-        return False
+        return
     try:
         ginfo = os.fstat(grant_fd)
         if not stat.S_ISDIR(ginfo.st_mode) or ginfo.st_uid != os.geteuid():
-            return False
+            return
         ok_lock, lock_fd = _acquire_pinned_grant_lock(grant_fd)
         if not ok_lock:
-            return False
+            return
         try:
-            _atomic_fsync_write_dir_fd(grant_fd, "state", b"revoked\n")
-            return True
-        except OSError:
-            return False
+            with suppress(OSError):
+                _atomic_fsync_write_dir_fd(grant_fd, "state", b"revoked\n")
         finally:
             if lock_fd is not None:
                 with suppress(OSError):

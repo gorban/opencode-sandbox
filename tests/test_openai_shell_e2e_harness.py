@@ -3074,10 +3074,13 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 f"\x1b[8mopenai--personal/{TEST_MODEL}\x1b[28m",
                 f"\x1b[30;40mopenai--personal/{TEST_MODEL}\x1b[0m",
                 f"\x1b[38;2;12;34;56;48;2;12;34;56mChatGPT Subscription (personal)  {TEST_MODEL}\x1b[0m",
+                f"\x1b[38:2::12:34:0;48:2::12:34:0mopenai--personal/{TEST_MODEL}\x1b[0m",
+                f"\x1b[38:2::12:34:56;48;2;12;34;56mopenai--personal/{TEST_MODEL}\x1b[0m",
             ):
                 self.assertIsNone(shell_driver.extract_observed_route_row(concealed, approval), concealed)
             for visible, want in (
                 (f"\x1b[8mhidden\x1b[28m\x1b[32mopenai--personal/{TEST_MODEL}\x1b[0m", f"openai--personal/{TEST_MODEL}"),
+                (f"\x1b[38:2::12:34:8mopenai--personal/{TEST_MODEL}\x1b[0m", f"openai--personal/{TEST_MODEL}"),
                 (
                     f"\x1b[37;40mChatGPT Subscription (personal)  {TEST_MODEL}\x1b[0m",
                     f"ChatGPT Subscription (personal) {TEST_MODEL}",

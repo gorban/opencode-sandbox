@@ -312,15 +312,38 @@ class _TerminalScreen:
             return False
         return True
 
-    def _parse_extended_color(self, codes: list[int], idx: int) -> tuple[tuple[str, int] | tuple[str, int, int, int] | None, int]:
-        if idx + 1 >= len(codes):
-            return None, len(codes)
-        mode = codes[idx + 1]
-        if mode == 5 and idx + 2 < len(codes):
-            return ("idx", codes[idx + 2]), idx + 3
-        if mode == 2 and idx + 4 < len(codes):
-            return ("rgb", codes[idx + 2], codes[idx + 3], codes[idx + 4]), idx + 5
-        return None, len(codes)
+    @staticmethod
+    def _parse_colon_color(parts: list[str]) -> tuple[str, int] | tuple[str, int, int, int] | None:
+        nums = [int(p) if p.isdigit() else 0 for p in parts]
+        if len(nums) >= 3 and nums[1] == 5:
+            return ("idx", nums[2])
+        if len(nums) >= 6 and nums[1] == 2:
+            return ("rgb", nums[3], nums[4], nums[5])
+        if len(nums) == 5 and nums[1] == 2:
+            return ("rgb", nums[2], nums[3], nums[4])
+        return None
+
+    def _apply_sgr_color_token(self, token: str) -> None:
+        parts = token.split(":")
+        head = int(parts[0]) if parts[0].isdigit() else -1
+        if head in (38, 48):
+            color = self._parse_colon_color(parts)
+            if head == 38:
+                self._fg = color
+            else:
+                self._bg = color
+
+    def _parse_semicolon_color(
+        self, tokens: list[str], idx: int,
+    ) -> tuple[tuple[str, int] | tuple[str, int, int, int] | None, int]:
+        if idx + 1 >= len(tokens) or not tokens[idx + 1].isdigit():
+            return None, len(tokens)
+        mode = int(tokens[idx + 1])
+        if mode == 5 and idx + 2 < len(tokens) and tokens[idx + 2].isdigit():
+            return ("idx", int(tokens[idx + 2])), idx + 3
+        if mode == 2 and idx + 4 < len(tokens) and all(tokens[idx + k].isdigit() for k in (2, 3, 4)):
+            return ("rgb", int(tokens[idx + 2]), int(tokens[idx + 3]), int(tokens[idx + 4])), idx + 5
+        return None, len(tokens)
 
     def _apply_simple_sgr(self, code: int) -> None:
         if code == 0:
@@ -342,6 +365,14 @@ class _TerminalScreen:
         elif code == 49:
             self._bg = None
 
+    def _apply_extended_sgr(self, code: int, tokens: list[str], idx: int) -> int:
+        color, next_idx = self._parse_semicolon_color(tokens, idx)
+        if code == 38:
+            self._fg = color
+        elif code == 48:
+            self._bg = color
+        return next_idx
+
     def _handle_sgr(self, params: str) -> None:
         if not params:
             self._reset_sgr()
@@ -349,20 +380,17 @@ class _TerminalScreen:
         if any(ch not in "0123456789;:" for ch in params):
             self._uncertain = True
             return
-        normalized = params.replace(":", ";")
-        codes = [int(part) if part.isdigit() else 0 for part in normalized.split(";")]
+        tokens = params.split(";")
         idx = 0
-        while idx < len(codes):
-            code = codes[idx]
-            if code in (38, 48):
-                color, idx = self._parse_extended_color(codes, idx)
-                if code == 38:
-                    self._fg = color
-                else:
-                    self._bg = color
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if ":" in tok:
+                self._apply_sgr_color_token(tok)
+                idx += 1
                 continue
-            if code == 58:
-                _, idx = self._parse_extended_color(codes, idx)
+            code = int(tok) if tok.isdigit() else 0
+            if code in (38, 48, 58):
+                idx = self._apply_extended_sgr(code, tokens, idx)
                 continue
             self._apply_simple_sgr(code)
             idx += 1
