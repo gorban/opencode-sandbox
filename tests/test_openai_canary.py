@@ -848,14 +848,14 @@ class CanaryProtocolAndBrokerTests(unittest.TestCase):
         with self.assertRaises(canary.RouteUnavailable):
             _enter_cm(stale_cm)
 
-        # Interactive --provider openai entry point is explicitly unavailable on the canary branch.
+        # Public CLI reserves openai subcommands without exposing any permanent canary subcommand.
         checkout = Path(__file__).resolve().parents[1]
         res = subprocess.run(
-            ["bash", str(checkout / "oc-sandbox"), "--provider", "openai"],
+            ["bash", str(checkout / "oc-sandbox"), "openai", "canary"],
             capture_output=True, text=True, timeout=10,
         )
-        self.assertNotEqual(res.returncode, 0)
-        self.assertIn("not yet qualified", res.stderr)
+        self.assertEqual(res.returncode, 2)
+        self.assertNotIn("canary", res.stderr)
 
     def test_broker_refused_turn_settles_usage_and_delivers_zero_bytes(self):
         cases = (

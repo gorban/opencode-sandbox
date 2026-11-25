@@ -5,6 +5,12 @@
 # Use the system Bash and skip startup hooks before checking the launcher and helper paths.
 set -euo pipefail
 
+if [[ ${1:-} == orchestrate ]]; then
+  export PATH=/usr/bin:/bin
+  IFS=: read -r _ _ orchestrator_uid _ _ HOME _ < <(/usr/bin/getent passwd "$EUID") || exit 2
+  [[ $orchestrator_uid == "$EUID" && $HOME == /* ]] || exit 2
+  export HOME
+fi
 CALLER_PWD=$PWD
 CALLER_PHYSICAL=$(pwd -P)
 SB="$HOME/opencode-sandbox"            # mounted at /sandbox in every agent
@@ -48,6 +54,7 @@ usage() {
 Usage: ${0##*/} [--provider openai] [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
        ${0##*/} openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}
+       ${0##*/} orchestrate [--synthetic-check]
 
   (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
               OpenCode. Safe to run repeatedly; only missing/changed pieces are touched.
@@ -191,6 +198,17 @@ if [[ ${1:-} == openai ]]; then
   exec /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/python3 -IB "$helper" "$@"
 fi
 
+if [[ ${1:-} == orchestrate ]]; then
+  shift
+  orchestrator_source=$0
+  if [[ $orchestrator_source != /* ]]; then orchestrator_source=$CALLER_PHYSICAL/$orchestrator_source; fi
+  [[ $(trusted_file "$orchestrator_source") == "$SCRIPT_REAL" ]] || die "untrusted orchestrator entry"
+  orchestrator_helper=$(trusted_file "$SCRIPT_DIR/oc-orchestrate.py") || die "unavailable orchestrator launcher"
+  orchestrator_host=local
+  if [[ -n ${CONTAINER_ID:-} ]]; then orchestrator_host=distrobox; fi
+  exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
+    /usr/bin/python3 -IB "$orchestrator_helper" "$orchestrator_host" "$@"
+fi
 trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
   local r
   r=$(trusted_path "$2") || die "refusing to use $2: the path leads into the sandbox directory $SB, which the agent controls (check XDG_DATA_HOME / XDG_CONFIG_HOME and symlinks)"
@@ -311,8 +329,9 @@ while (( $# )); do
 done
 if [[ -n $PROVIDER ]]; then
   case $PROVIDER in
-    openai|claude|google) die "--provider $PROVIDER is not yet qualified for sandbox launch" ;;
-    *) die "unsupported provider '$PROVIDER'" ;;
+    openai) ;;
+    claude|google) die "--provider $PROVIDER is not yet qualified for sandbox launch" ;;
+    *) die "unsupported provider '$PROVIDER' (supported: openai)" ;;
   esac
 fi
 set -- ${GETOPTS_ARGS[@]+"${GETOPTS_ARGS[@]}"}
@@ -1979,6 +1998,37 @@ if (( NOLAUNCH )); then
 fi
 
 # ---- launch OpenCode ------------------------------------------------------------------
+if [[ $PROVIDER == openai ]]; then
+  if [[ $(cstate "$AGENT") == running || $(cstate "$RELAY") == running ]]; then
+    release_lifecycle_lock
+    die "OpenCode or provider relay is already running in instance '$ILABEL'; exit it first"
+  fi
+  ensure_volume "$OPENAI_HOMEVOL" "$ILABEL"
+  agent_pg=0
+  if agent_pg_passfile; then agent_pg=1; fi
+  dind_container_arg=""
+  dind_run_arg=""
+  if [[ $(cstate "$DINDC") != none ]]; then dind_container_arg=$DINDC dind_run_arg=$DINDRUN; fi
+  pg_secret_arg=""
+  pg_container_arg=""
+  if (( agent_pg )); then pg_secret_arg=$PGPASSSECRET pg_container_arg=$PGC; fi
+  relay_image_id=$(pm image inspect --format '{{.Id}}' "$RELAY_IMG") || die "missing relay image '$RELAY_IMG'"
+  agent_image_id=$(pm image inspect --format '{{.Id}}' "$AGENT_IMG") || die "missing agent image '$AGENT_IMG'"
+  session_helper=$SCRIPT_DIR/oc-openai-session.py
+  verify_openai_helper "$session_helper"
+  session_spec=$(/usr/bin/python3 -I -c '
+import json, sys
+keys = ("instance", "pod", "agent", "relay", "relay_image", "agent_image", "agent_mem",
+        "level", "sandbox", "cwd", "home_vol", "chromium", "postgres", "pg_secret", "dind", "dind_run")
+print(json.dumps(dict(zip(keys, sys.argv[1:]))))
+' "$ILABEL" "$POD" "$AGENT" "$RELAY" "$relay_image_id" "$agent_image_id" "$AGENT_MEM" \
+  "$LEVEL" "$SB" "$CWD" "$OPENAI_HOMEVOL" "$CHROME" "$pg_container_arg" "$pg_secret_arg" "$dind_container_arg" "$dind_run_arg")
+  release_lifecycle_lock
+  cd -- "$SCRIPT_DIR"
+  log "Launching ChatGPT-backed OpenCode (instance '$ILABEL') in /sandbox/$CWD"
+  exec /usr/bin/env -i HOME="$HOME" TERM="${TERM:-xterm-256color}" PATH=/usr/bin:/bin \
+    /usr/bin/python3 -IB "$session_helper" 3<<<"$session_spec"
+fi
 if [[ $(cstate "$RELAY") == running ]]; then
   release_lifecycle_lock
   die "Provider relay is running in instance '$ILABEL'; exit the active provider session first"

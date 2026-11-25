@@ -32,6 +32,17 @@ The portable run reports real Podman security, real Postgres, and SELinux/Waylan
 skipped because it has no configured isolated fixtures. Remote acceptance is unavailable in this
 profile. Missing tools in the required portable suite fail the check.
 
+### Local OpenCode text proof
+
+From the Linux devbox, run `./oc-sandbox orchestrate --synthetic-check` with the pinned OpenCode
+and relay images already in the host's rootless Podman store. The command prints `ok` after one
+text-only turn through a disposable worker and a loopback fake provider. It verifies cleanup
+and rejection of a second request before reporting success. Run
+`python3 -B tests/orchestrator-owner-loss.py` from that devbox to check cleanup after launcher loss
+during startup and after both containers start, and to verify zero response bytes if the owner pipe
+closes before the broker writes.
+These checks use no provider credentials. Subscription routes require separate qualification.
+
 ### Real host gates
 
 [AGENTS.md](../AGENTS.md#gates-before-a-commit-and-before-asking-for-review) requires changed-shell

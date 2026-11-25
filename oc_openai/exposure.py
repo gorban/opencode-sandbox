@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 import fcntl
 from hashlib import sha256
+import hmac
 import json
 import os
 import re
@@ -29,10 +30,23 @@ _RECOVERY_NAMES = (
     _RECOVERY_PROOF, _RECOVERY_WORKER, _RECOVERY_WORKER_PROGRESS,
     _RECOVERY_TRACE, _RECOVERY_METADATA, _RECOVERY_MODERATION,
 )
+_CANARY = "canary.json"
+_CANARY_RECOVERY = "canary-recovery.json"
+_CANARY_E2E = "canary-e2e.json"
+_CANARY_NAMES = (_CANARY, _CANARY_RECOVERY, _CANARY_E2E)
 _LOCK = "exposure.lock"
 _RUN = re.compile(r"[0-9a-f]{32}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+_MODEL_SLUG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z", re.ASCII)
 _LOCAL_ID = re.compile(r"[A-Za-z0-9_-]{43}")
+_DIAG_KEYS = frozenset({"original_run", "binding", "run", "phase", "max_input", "max_output", "actual"})
+_STREAM_DIAG_KEYS = _DIAG_KEYS | {"previous_diagnostic_run"}
+_RECOVERY_KEYS = frozenset({"version", "prior", "source", "phases"})
+_CANARY_REQ_KEYS = frozenset({
+    "run_id", "binding", "model", "history_digest", "max_input", "max_output", "actual", "outcome",
+})
+_CANARY_RECOVERY_EXTRA = frozenset({"prior_canary_run_id", "prior_canary_digest"})
+_ERR_INVALID_RECORD = "invalid_exposure_record"
 
 
 class ExposureError(RuntimeError):
@@ -72,6 +86,14 @@ class Slot:
 
 
 @dataclass(frozen=True)
+class ExposureHold:
+    blocked: bool
+    file_count: int
+    unsettled_count: int
+    digest: str
+
+
+@dataclass(frozen=True)
 class Diagnostic:
     original: Slot
     request: Slot
@@ -101,6 +123,108 @@ def _unique(pairs):
     if len(obj) != len(pairs):
         raise ValueError
     return obj
+
+
+def _bad_constant(_value):
+    raise ValueError("non-finite JSON constant")
+
+
+def _validate_diagnostic_record(name: str, payload) -> tuple[bool, int]:
+    expected_keys = _STREAM_DIAG_KEYS if name == _STREAM_DIAGNOSTIC else _DIAG_KEYS
+    if type(payload) is not dict or set(payload) != expected_keys:
+        raise ExposureError(_ERR_INVALID_RECORD)
+    try:
+        phase = Phase(payload["phase"])
+    except ValueError:
+        raise ExposureError(_ERR_INVALID_RECORD) from None
+    slot = Slot(payload["run"], payload["binding"], phase)
+    valid_orig = type(payload["original_run"]) is str and bool(_RUN.fullmatch(payload["original_run"]))
+    valid_prev = (
+        name != _STREAM_DIAGNOSTIC
+        or (type(payload["previous_diagnostic_run"]) is str
+            and bool(_RUN.fullmatch(payload["previous_diagnostic_run"])))
+    )
+    if (not _valid_slot(slot) or not valid_orig or not valid_prev
+            or type(payload["max_input"]) is not int or payload["max_input"] != _INPUT_LIMIT
+            or type(payload["max_output"]) is not int or payload["max_output"] != _OUTPUT_LIMIT
+            or not _use(payload)):
+        raise ExposureError(_ERR_INVALID_RECORD)
+    return True, int(payload["actual"] is None)
+
+
+def _validate_recovery_record(name: str, payload) -> tuple[bool, int]:
+    if (type(payload) is not dict or set(payload) != _RECOVERY_KEYS
+            or type(payload["version"]) is not int or payload["version"] != 1
+            or type(payload["prior"]) is not list
+            or any(type(p) is not str or not (_RUN.fullmatch(p) or _DIGEST.fullmatch(p)) for p in payload["prior"])
+            or type(payload["source"]) is not str or not _DIGEST.fullmatch(payload["source"])):
+        raise ExposureError(_ERR_INVALID_RECORD)
+    first = Phase.ORCHESTRATOR if name == _RECOVERY_PROOF else Phase.INITIAL
+    try:
+        entries = _validate(payload["phases"], first=first)
+    except ValueError:
+        raise ExposureError(_ERR_INVALID_RECORD) from None
+    if not entries:
+        raise ExposureError(_ERR_INVALID_RECORD)
+    unsettled = sum(1 for entry in entries if entry["actual"] is None)
+    return True, unsettled
+
+
+def _valid_canary_links(record: dict) -> bool:
+    prior_run = record.get("prior_canary_run_id")
+    prior_digest = record.get("prior_canary_digest")
+    return (
+        type(prior_run) is str and bool(_RUN.fullmatch(prior_run))
+        and prior_run != record["run_id"]
+        and type(prior_digest) is str and bool(_DIGEST.fullmatch(prior_digest))
+    )
+
+
+def _valid_canary_strings(record: dict) -> bool:
+    return (
+        type(record["run_id"]) is str and bool(_RUN.fullmatch(record["run_id"]))
+        and type(record["binding"]) is str and bool(_DIGEST.fullmatch(record["binding"]))
+        and type(record["model"]) is str and bool(_MODEL_SLUG.fullmatch(record["model"]))
+        and type(record["history_digest"]) is str and bool(_DIGEST.fullmatch(record["history_digest"]))
+    )
+
+
+def _validate_canary_fields(record: dict, *, recovery: bool) -> None:
+    required = _CANARY_REQ_KEYS | (_CANARY_RECOVERY_EXTRA if recovery else frozenset())
+    if not required <= set(record) <= (required | {"delivered"}):
+        raise ExposureError(_ERR_INVALID_RECORD)
+    delivered = record.get("delivered", False)
+    if (type(delivered) is not bool or not _valid_canary_strings(record)
+            or record["max_input"] != _INPUT_LIMIT or record["max_output"] != _OUTPUT_LIMIT
+            or not _is_usage(record["max_input"]) or not _is_usage(record["max_output"])):
+        raise ExposureError(_ERR_INVALID_RECORD)
+    if recovery and not _valid_canary_links(record):
+        raise ExposureError(_ERR_INVALID_RECORD)
+
+
+def _validate_settled_canary(record: dict) -> tuple[bool, int]:
+    outcome = record["outcome"]
+    actual = record["actual"]
+    delivered = record.get("delivered", False)
+    if (outcome not in ("ok_settled", "refused_settled", "overage_settled")
+            or (delivered and outcome != "ok_settled")
+            or type(actual) is not list or len(actual) != 2 or not all(_is_usage(v) for v in actual)):
+        raise ExposureError(_ERR_INVALID_RECORD)
+    is_over = actual[0] > record["max_input"] or actual[1] > record["max_output"]
+    if (outcome == "overage_settled") != is_over:
+        raise ExposureError(_ERR_INVALID_RECORD)
+    return is_over, 0
+
+
+def _validate_canary_record(name: str, record) -> tuple[bool, int]:
+    if type(record) is not dict:
+        raise ExposureError(_ERR_INVALID_RECORD)
+    _validate_canary_fields(record, recovery=(name == _CANARY_RECOVERY))
+    if record["outcome"] == "unsettled":
+        if record["actual"] is not None or record.get("delivered", False) is not False:
+            raise ExposureError(_ERR_INVALID_RECORD)
+        return True, 1
+    return _validate_settled_canary(record)
 
 
 def _is_usage(value):
@@ -266,6 +390,135 @@ class ExposureLedger:
             return _validate(updated, first=first)
         except ValueError:
             raise ExposureError("unapproved_or_replayed_phase") from None
+
+    def _read_verified_hold_file(self, directory, name: str) -> tuple[bytes, object] | None:
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise ExposureError("untrusted_exposure_store") from None
+        with os.fdopen(fd, "rb") as stream:
+            if not _private_file(os.fstat(fd)):
+                raise ExposureError("untrusted_exposure_store")
+            raw = stream.read(_MAX_BYTES + 1)
+        if len(raw) > _MAX_BYTES:
+            raise ExposureError(_ERR_INVALID_RECORD)
+        try:
+            parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique, parse_constant=_bad_constant)
+        except (TypeError, ValueError, RecursionError):
+            raise ExposureError(_ERR_INVALID_RECORD) from None
+        return raw, parsed
+
+    def _validate_hold_entry(self, name: str, parsed) -> tuple[bool, int]:
+        if name == _LEDGER:
+            try:
+                records = _validate(parsed)
+            except (TypeError, ValueError):
+                raise ExposureError(_ERR_INVALID_RECORD) from None
+            if not records:
+                return False, 0
+            actual = records[-1]["actual"]
+            if actual is None:
+                return True, 1
+            return _overage(actual), 0
+        if name in _CANARY_NAMES:
+            return _validate_canary_record(name, parsed)
+        if name in (_DIAGNOSTIC, _STREAM_DIAGNOSTIC):
+            return _validate_diagnostic_record(name, parsed)
+        return _validate_recovery_record(name, parsed)
+
+    @staticmethod
+    def _validate_canary_recovery_link(loaded_files: dict[str, tuple[bytes, object]]) -> None:
+        if _CANARY_RECOVERY not in loaded_files:
+            return
+        canary = loaded_files.get(_CANARY)
+        if canary is None:
+            raise ExposureError(_ERR_INVALID_RECORD)
+        canary_raw, canary_parsed = canary
+        _rec_raw, rec_parsed = loaded_files[_CANARY_RECOVERY]
+        if (canary_parsed["outcome"] != "unsettled"
+                or rec_parsed["prior_canary_run_id"] != canary_parsed["run_id"]
+                or rec_parsed["binding"] != canary_parsed["binding"]
+                or rec_parsed["model"] != canary_parsed["model"]
+                or rec_parsed["history_digest"] != canary_parsed["history_digest"]
+                or not hmac.compare_digest(rec_parsed["prior_canary_digest"], sha256(canary_raw).hexdigest())):
+            raise ExposureError(_ERR_INVALID_RECORD)
+
+    @staticmethod
+    def _validate_diagnostic_links(loaded_files: dict[str, tuple[bytes, object]]) -> None:
+        exp = loaded_files.get(_LEDGER)
+        if _DIAGNOSTIC in loaded_files:
+            if exp is None or not exp[1]:
+                raise ExposureError(_ERR_INVALID_RECORD)
+            first_entry = exp[1][0]
+            diag = loaded_files[_DIAGNOSTIC][1]
+            if (diag["original_run"] != first_entry["run"] or diag["run"] == first_entry["run"]
+                    or diag["binding"] != first_entry["binding"]):
+                raise ExposureError(_ERR_INVALID_RECORD)
+        if _STREAM_DIAGNOSTIC in loaded_files:
+            diag = loaded_files.get(_DIAGNOSTIC)
+            if exp is None or not exp[1] or diag is None:
+                raise ExposureError(_ERR_INVALID_RECORD)
+            first_entry = exp[1][0]
+            prev_run = diag[1]["run"]
+            stream = loaded_files[_STREAM_DIAGNOSTIC][1]
+            if (stream["original_run"] != first_entry["run"]
+                    or stream["previous_diagnostic_run"] != prev_run
+                    or stream["binding"] != first_entry["binding"]
+                    or stream["run"] in (first_entry["run"], prev_run)):
+                raise ExposureError(_ERR_INVALID_RECORD)
+
+    @classmethod
+    def _validate_hold_links(cls, loaded_files: dict[str, tuple[bytes, object]]) -> None:
+        cls._validate_canary_recovery_link(loaded_files)
+        cls._validate_diagnostic_links(loaded_files)
+
+    def _inspect_locked(self, directory) -> ExposureHold:
+        names = (_LEDGER, _DIAGNOSTIC, _STREAM_DIAGNOSTIC, *_RECOVERY_NAMES, *_CANARY_NAMES)
+        hasher = sha256()
+        present = 0
+        unsettled = 0
+        blocked = False
+        loaded_files: dict[str, tuple[bytes, object]] = {}
+        for name in names:
+            loaded = self._read_verified_hold_file(directory, name)
+            if loaded is None:
+                hasher.update(name.encode("ascii") + b"\0missing\0")
+                continue
+            raw, parsed = loaded
+            loaded_files[name] = (raw, parsed)
+            file_blocked, file_unsettled = self._validate_hold_entry(name, parsed)
+            present += 1
+            unsettled += file_unsettled
+            blocked = blocked or file_blocked
+            hasher.update(name.encode("ascii") + b"\0" + sha256(raw).digest())
+        self._validate_hold_links(loaded_files)
+        if not blocked:
+            return ExposureHold(blocked=False, file_count=0, unsettled_count=0, digest="")
+        return ExposureHold(blocked=True, file_count=present, unsettled_count=unsettled, digest=hasher.hexdigest())
+
+    def inspect_hold(self) -> ExposureHold:
+        """Read-only inspection of whether an I4a/canary exposure hold blocks ordinary sends."""
+        with self._locked() as directory:
+            return self._inspect_locked(directory)
+
+    @contextmanager
+    def dispatch_fence(self, *, acknowledged_digest: str | None = None):
+        """Hold non-blocking exposure.lock across hold validation and the bounded first write."""
+        with self._locked() as directory:
+            hold = self._inspect_locked(directory)
+            if hold.blocked:
+                if acknowledged_digest is None or type(acknowledged_digest) is not str:
+                    raise ExposureError("exposure_hold_active")
+                if not hmac.compare_digest(hold.digest, acknowledged_digest):
+                    raise ExposureError("exposure_hold_changed")
+            yield hold
+
+    def require_dispatch_allowed(self, *, acknowledged_digest: str | None = None) -> None:
+        """Atomically enforce the shared exposure hold under non-blocking exposure.lock."""
+        with self.dispatch_fence(acknowledged_digest=acknowledged_digest):
+            return None
 
     def require_quiescent(self):
         """Keep a pending possible send from becoming a different account's run."""
