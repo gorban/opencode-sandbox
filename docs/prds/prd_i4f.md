@@ -22,6 +22,8 @@ tools inside its sandbox.
 
 ## Common interface
 
+See the [parallel lane walkthrough](prd_i4fa.md) for the common interface and review gates.
+
 Reuse I4d's provider instance and connection state across CLI, orchestrator and sandbox launch.
 Host-only discovery associates each model with the exact enabled instance, qualified placement,
 auth mode and billing policy. At selection, check the instance, model, placement and policy. Before
@@ -38,9 +40,13 @@ routing, exposure or revocation goes through both reviews before use by another 
 ## Testable PR milestones
 
 1. **Connect and list.** On the normal CLI or workstation flow, connect the selected instance and
-   verify readiness from a fresh process. Use inference-free discovery. The picker shows available
-   model names, the operator-assigned registration label and billing mode. Discovery leaves
-   account identity and invocation entitlement open until independently verified.
+   verify readiness from a fresh process. Use inference-free discovery. Enable the available
+   instances in trusted provider configuration, then launch with `oc-sandbox orchestrate` or
+   `oc-sandbox`. Select a model through the
+   [trusted route confirmation](prd_i4fa.md#first-inference-and-model-switches). The
+   [model-first picker](prd_i4d.md#model-first-picker) shows the model name, the configured
+   instance label and billing mode. Discovery leaves account identity and invocation entitlement
+   open until independently verified.
 2. **Live text.** Qualify and separately authorize a bounded `Reply with exactly: ok` canary on
    the actual orchestrator launch path first, then the same canary on the managed sandbox launch
    path. They may be separate PRs. For each request, review the exact instance, model, placement
@@ -80,18 +86,21 @@ calls, and verified container/scratch cleanup.
   Claude launch topology clears qualification and security review (remains open while PR #72's
   project launcher is synthetic), verifying exact `ok` delivery, `0` unintended tool calls, intact
   fail-closed checks, and clean teardown.
-- [ ] **Combined multi-provider default + `--mini` e2e** — once both OpenAI and Claude qualify on
-  `main` under [I4d](prd_i4d.md#default-multi-provider-launch-and---mini-ui-mode), opt-in e2e
-  verification that a default `oc-sandbox` launch (no `--provider` flag, and optional `--mini`)
-  exposes models from all enabled qualified providers together, completes
-  `Reply with exactly: ok` with `0` unintended tool calls on each explicitly selected provider, and
-  asserts negative isolation: selecting provider A produces `0` upstream requests on provider B's
-  broker/instance (and vice versa), zero cross-instance credential/token/vault visibility, and
-  verified teardown of all relays, containers, and scratch directories.
+- [ ] **Combined multi-provider default + `--mini` e2e** — once OpenAI and Claude qualify in the
+  sandbox, test both `oc-sandbox` and `oc-sandbox --mini` using the same trusted provider
+  configuration. Pick a model from each instance through trusted confirmation and send
+  `Reply with exactly: ok` in a fresh conversation. Require exact `ok`, zero tool calls,
+  zero upstream requests through the other instances, zero cross-instance credential, token or
+  vault visibility, and verified teardown. Start a new launch for each route until trusted
+  same-launch switching qualifies. Add Antigravity to the same matrix as its sandbox route
+  qualifies. Exercise overlap in an inference-free fixture with the same model across provider
+  kinds and across two instances of one kind. Include live overlap cases when the connected
+  subscriptions actually offer a common model.
 
 - [ ] For each candidate, publish the exact branch/commit, provider and placement, the scope
-  proven, and an attended test step when ready. Keep model use opt-in and human review open
-  until the maintainer explicitly records it.
+  proven, and an attended test step using the normal public launch command and model picker.
+  Use configuration to choose which instances are available for review. Keep model use opt-in
+  and human review open until the maintainer explicitly records it.
 - [ ] Cross-review the walkthroughs and diffs with **oc-sandbox reviewer** and
   **Security-Focused PR Reviewer Setup**. Require green CI and a passing SonarCloud quality gate
   on the exact PR head. Re-review and recheck a changed head. Serialize merges and require a fresh

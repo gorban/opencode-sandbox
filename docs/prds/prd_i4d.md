@@ -42,12 +42,11 @@ source may set each field and which routes and placements are allowed. Only trus
 TOML can create an instance or change `enabled`, `auth_mode`, `credential_ref`, its billing
 policy or `provider_defaults.<kind>`. A dedicated operator setup action can persist those
 changes after approval.
-CLI or environment settings may override `cli_path` for an existing instance. A default
-`oc-sandbox` launch catalogs all enabled, qualified provider instances for the selected placement;
-an optional `--provider` restricts one launch to a single already enabled instance. `--mini` is a
-trusted operator CLI/config UI-mode switch only (never settable from workspace files, sandbox
-environment, or agent requests; composable with optional `--provider`) that selects OpenCode Mini
-(defaulting to full OpenCode when omitted). Provider
+CLI or environment settings may override `cli_path` for an existing instance. The normal
+`oc-sandbox` and `oc-sandbox orchestrate` launch flows catalog all enabled, qualified provider
+instances for their placement. Choose a model in OpenCode after launch. An optional `--provider`
+restricts one launch to a single already enabled instance. `--mini` selects the OpenCode UI
+through trusted operator CLI or configuration. Full OpenCode is the default. Provider
 declarations, instance profiles and agent requests cannot use precedence to elevate authority.
 Use only trusted startup inputs for a persistent supervisor.
 
@@ -135,16 +134,20 @@ A normal `oc-sandbox` launch (without `--provider`) loads **all enabled, qualifi
 instances** declared in trusted operator TOML for the selected placement, projecting each admitted
 instance under its stable provider label into OpenCode's read-only configuration behind isolated
 host brokers and relays. The operator can select and switch between models from multiple configured
-providers (for example, both OpenAI and Claude once each adapter and placement is qualified) in the
-same OpenCode session without passing `--provider`.
+providers (for example, both OpenAI and Claude once each adapter and placement is qualified) without
+passing `--provider`. Same-session switching is the target after the trusted switch surface
+qualifies.
 
 - **Attended multi-instance disclosure and paid-route protection:** Before starting any relay on a
   default launch, the attended foreground confirmation must enumerate every admitted instance (its
-  label, kind, authentication mode, billing policy, and any active exposure hold). Initial active
-  model selection is governed strictly by explicit persisted selection or explicit operator default
-  (never by catalog ordering or silent fallthrough from a disconnected subscription onto a paid
-  `api_key` instance), and paid `api_key` routes still require visible billing disclosure and
-  opt-in per [I4](prd_i4.md).
+  label, kind, authentication mode, billing policy, and any active exposure hold). For the first
+  rollout phase, confirm the exact model and route on the workstation before attaching OpenCode.
+  An explicit saved model or operator default may preselect an eligible row for confirmation. If it
+  becomes unavailable, prompt for a new selection. The
+  [trusted first-write boundary](prd_i4fa.md#first-inference-and-model-switches) defines how picker
+  selection and later switches become authorized.
+  Catalog order carries no billing or routing authority. Paid `api_key` routes
+  require visible billing disclosure and opt-in per [I4](prd_i4.md).
 - **Concrete per-instance isolation boundary:** Cataloging multiple enabled instances never pools
   accounts, merges quotas, shares tokens across relays, or enables automatic fallback between
   providers or paid API keys. Each admitted instance receives its own collision-free scoped
@@ -177,7 +180,8 @@ same OpenCode session without passing `--provider`.
 - **Optional narrowing (`--provider KIND[/INSTANCE]`):** Passing `--provider KIND[/INSTANCE]`
   restricts one launch to a single already enabled instance, takes precedence over the default
   multi-provider catalog for that launch, and leaves persisted configuration and selections
-  unchanged. Passing `--provider` for a disabled, unqualified, disconnected, or unacknowledged-held
+  unchanged. Qualify normal human review through configuration and the in-session picker.
+  Passing `--provider` for a disabled, unqualified, disconnected, or unacknowledged-held
   instance **fails closed** with a typed reason (zero launch, zero fallback to other enabled
   instances). A bare `--provider KIND` (without `/INSTANCE`) resolves only via persisted selection
   or explicit default — never falling through from a disconnected selection to the TOML default.
@@ -188,6 +192,38 @@ same OpenCode session without passing `--provider`.
   `OPENCODE_CONFIG_PROJECT_DISABLE=true`, `OPENCODE_DISABLE_MODELS_FETCH=true`,
   `OPENCODE_DISABLE_FREE_MODELS=true`), host broker, read-only config, SELinux/container isolation,
   exposure hold, and worker credential isolation invariants as full OpenCode.
+
+### Model-first picker
+
+Show the model name first, with the configured provider instance label after a hyphen. For
+example, if `claude-personal`, `agy-personal`, and `claude-work` each offer the same model, the
+picker shows these entries together:
+
+```text
+Claude Opus - agy-personal
+Claude Opus - claude-personal
+Claude Opus - claude-work
+```
+
+Group and sort by model name, then by provider instance label. Preserve version distinctions
+when providers expose different model versions under similar names. Use `kind/label` if
+different provider kinds use the same configured label. Search by model name or instance label.
+A picker row binds to the exact provider instance and upstream model ID. Changing the display
+label or adding the same model in another account cannot change that binding, combine quotas,
+transfer reasoning state, or allow fallback. Keep billing and eligibility visible at selection.
+
+OpenCode supports configurable model display names. Both the pinned
+[full picker](https://github.com/anomalyco/opencode/blob/v2.3.0/packages/tui/src/component/dialog-model.tsx#L124-L175)
+and [Mini picker](https://github.com/anomalyco/opencode/blob/v2.3.0/packages/tui/src/mini/footer.command.tsx#L1124-L1155)
+group by provider today. Verify both frontends with a synthetic duplicate-model catalog.
+Use stock configuration for visible labels if it suffices, and review the smallest supported
+picker change for model-first browsing. Keep provider IDs, broker endpoints and grants stable
+across the presentation change.
+
+- [ ] Verify both full OpenCode and Mini show distinct rows for equal model names across
+      provider kinds and across two registrations of the same kind. Check model-first ordering,
+      repeated instance labels, version distinctions, and exact route attribution. Test a
+      disconnected selection with zero sends through any other route.
 
 ## Connection and first-use flow
 
