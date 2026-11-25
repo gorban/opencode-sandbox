@@ -182,7 +182,8 @@ class _TerminalScreen:
         self._g0 = "B"
         self._g1 = "B"
         self._gl = 0
-        self._saved_pos = (0, 0, "B", "B", 0)
+        self._saved_pos = (0, 0)
+        self._saved_charset = ("B", "B", 0)
         self._scroll_top = 0
         self._scroll_bottom = rows - 1
         self.grid = [[" "] * cols for _ in range(rows)]
@@ -236,6 +237,8 @@ class _TerminalScreen:
             self._g0 = "B"
             self._g1 = "B"
             self._gl = 0
+            self._saved_pos = (0, 0)
+            self._saved_charset = ("B", "B", 0)
             self._scroll_top = 0
             self._scroll_bottom = self.rows - 1
             self._reset_sgr()
@@ -532,9 +535,11 @@ class _TerminalScreen:
         if nxt == "c":
             self._reset_screen(reset_cursor=True)
         elif nxt == "7":
-            self._saved_pos = (self.row, self.col, self._g0, self._g1, self._gl)
+            self._saved_pos = (self.row, self.col)
+            self._saved_charset = (self._g0, self._g1, self._gl)
         elif nxt == "8":
-            self.row, self.col, self._g0, self._g1, self._gl = self._saved_pos
+            self.row, self.col = self._saved_pos
+            self._g0, self._g1, self._gl = self._saved_charset
         elif nxt == "D":
             self._linefeed()
         elif nxt == "E":

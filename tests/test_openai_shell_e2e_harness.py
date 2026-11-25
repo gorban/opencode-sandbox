@@ -3906,6 +3906,10 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             scr_unk.feed(f"\x1b(A{route_txt}")
             self.assertFalse(scr_unk.is_certain)
             self.assertEqual(scr_unk.render(), "")
+            # Mixed CSI s/u and DECSC/DECRC (ESC 7/8) never raise tuple-unpack ValueError.
+            self.assertEqual(shell_driver.render_terminal_screen("\x1b[uok").strip(), "ok")
+            self.assertEqual(shell_driver.render_terminal_screen("\x1b7\x1b[uok").strip(), "ok")
+            self.assertEqual(shell_driver.render_terminal_screen("\x1b[s\x1b8ok").strip(), "ok")
 
             # End-to-end PTY guard: DEC Special Graphics route never arms _drive_agent_pty.
             gate_gfx = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
