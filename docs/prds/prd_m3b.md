@@ -25,5 +25,14 @@ with peer identity enforced on the daemon side. The loopback build remains indep
 - [ ] Qualify native PTY and managed browser views when their [M3 confinement gates](prd_m3.md#concrete-gaps-and-checkboxes)
       are ready. Keep agent-controlled pixels and terminal data outside the privileged
       dashboard surface and require the daemon's approved input leases.
+- [ ] Qualify the shared [UI SDK / `data-agent-confirm` bridge](prd_m3.md#3-shared-sveltekit-frontend-loopback-web-auth-and-tauri-v2-uds-bridge)
+      inside the packaged Tauri WebView (Linux WebKitGTK and macOS WKWebView). Route authorized
+      agent UI commands strictly through the daemon's typed native bridge (zero generic WebView
+      eval or unprivileged frame access), verify that agent triggers on `data-agent-confirm`
+      controls pop up Trusted Chrome human confirmation even when direct human clicks skip
+      confirmation, verify `data-agent-hidden` blocks self-confirmation and Approval Inbox access,
+      cancel open prompts on desktop session-generation retirement, and enforce privileged action
+      authorization independently in the Rust IPC layer and host daemon.
 
-[Tauri WebView engines](https://v2.tauri.app/reference/webview-versions/)
+[Tauri WebView engines](https://v2.tauri.app/reference/webview-versions/) ·
+[UI SDK](https://ui-sdk.dev)

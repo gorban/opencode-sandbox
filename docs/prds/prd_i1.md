@@ -54,7 +54,12 @@ Parent: [prd_i](prd_i.md) · related: [worker fleet](prd_i2.md), [credential bro
       The host renderer validates data and permits catalog components and registered data bindings.
 - [ ] Give the orchestrator sanitized read-only view snapshots (DOM or accessibility projection,
       optionally rendered snapshots). Exclude secrets and approval/session capabilities. Keep
-      the operator dashboard outside the orchestrator's browser control tools.
+      the operator dashboard outside the orchestrator's browser control tools. If agent-assisted
+      dashboard navigation/control is enabled, route it exclusively through the scoped
+      [M3 UI SDK / `data-agent-confirm` bridge](prd_m3.md#3-shared-sveltekit-frontend-loopback-web-auth-and-tauri-v2-uds-bridge)
+      so protected actions marked `data-agent-confirm` always pop up Trusted Chrome human
+      confirmation on agent invocation (even when normal human clicks skip confirmation), while
+      approvals, credentials and confirmation dialogs stay `data-agent-hidden` and host-enforced.
 - [ ] Keep approvals, credential editing, browser takeover and terminal attach in trusted host
       components. Render the exact pending operation from the broker's record, including target,
       command or operation and arguments, ref/revision, scope, expiry and cost where relevant.
