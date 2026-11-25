@@ -61,6 +61,12 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
       `data-agent-secret` and keep secret inputs out of agent-reachable views entirely,
       because a secret-marked field can still be typed into. Keep sensitive displayed text
       outside browsable SDK subtrees, including row, label, and section context.
+- [ ] Render operator-only chrome as first-party, unregistered components outside the SDK
+      registry and agent projection. Cover confirmation, both inboxes, bootstrap/sign-in
+      and credential flows, the operator composer and target picker, the Input Lease Bar,
+      host-compiled workflow action chips, and logout/session controls. Mark the roots
+      `data-agent-hidden` for defense in depth. Apply hidden or confirmation markup
+      directly to any portaled root, or disable portal behavior for that subtree.
 - [ ] Make each protected action a single, idempotent step whose effect is confirmed by the
       daemon, because `act` cannot roll back earlier steps.
 - [ ] Keep each view under the snapshot cap by sectioning and paging long lists, and give
@@ -69,11 +75,18 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
 ### Bridge security
 
 - [ ] Run the bridge only for a host-authorized orchestrator session brokered by `oc_daemon`.
-      Implement our own tool transport over the daemon channel. Never call `registerTools`
-      (WebMCP would expose the dashboard to any browser-level agent), and never assign the
-      agent to `window` or any global.
+      Require explicit operator opt-in, off by default, for a single visible tab or
+      packaged window. Each opt-in gets a new daemon-owned activation ID. For loopback,
+      bind a CSRF-minted single-use WS ticket to
+      `agent_ui_bridge`, the activation ID, exact session generation, orchestrator identity, tab and
+      target scope. Check exact Host and Origin. For Tauri, use only the native typed
+      IPC channel with the registered window and exact WebView origin. Use one step per
+      request, at most 16 KiB per bridge message and at most four calls per second per
+      active bridge. Paginate projection data within the bound. Reconfirm these choices
+      at the M3.5 implementation review. Never call `registerTools` (WebMCP would expose
+      the dashboard to browser-level agents), or assign the agent to `window` or any global.
 - [ ] Publish a host-owned allowlisted projection scoped to the authenticated actor, session
-      generation and permitted targets. Build names, rows, sections and values from typed,
+      generation, bridge activation and permitted targets. Build names, rows, sections and values from typed,
       authorized projection fields. Keep raw SDK DOM-derived snapshots, queries, action
       results, errors and events inside the adapter. Apply the same scope to every result
       and subscription delivery; default subscriptions off and discard retired-generation
@@ -88,10 +101,34 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
 - [ ] Always supply a deny-by-default `allow`. For a permitted protected action, the daemon
       initiates Trusted Chrome confirmation. The independent human path accepts trusted
       input and issues a short-lived one-use decision bound to the initiating actor, exact
-      typed action, target identity and revision, canonical parameters and session generation.
+      typed action, target identity and revision, canonical parameters, bridge activation
+      and session generation.
       Consume the decision atomically with authorization of the effect. Fail closed on
       cancel, reuse, timeout, drift or retirement. Use `step.confirm` and `details.source`
       as presentation and defense-in-depth signals.
+- [ ] SDK execution is limited to allowlisted local view selection, tabs, view filter/sort,
+      and expand/collapse with no mutating API or IPC effects. Block SDK writes to shared
+      form state and any callback that can initiate a mutation. Intercept a proposed
+      mutation before SDK execution and submit a typed agent-channel intent. The operator
+      API client rejects mutating HTTP and IPC calls from agent-originated dispatch
+      or continuations and withholds its CSRF token there. The daemon still verifies the
+      initiating principal and authorizes the typed intent on its restricted channel.
+- [ ] Use single-flight confirmation with no pending queue, at most three requests
+      per minute and a five-second cooldown after cancel. Offer an operator pause
+      control that retires the bridge session.
+      Suppress unsolicited confirmation when the view is hidden, a text field is active,
+      or an operator input lease is in use. Cancel an open confirmation when the view loses
+      visibility and require fresh input after return. Render text from canonical daemon fields.
+      Initially focus Cancel or the dialog container and keep Confirm disabled until the
+      750 ms post-paint arming interval has elapsed and initiating input has been released.
+      Require a fresh deliberate activation. Held keys and pointer events predating the
+      dialog cannot confirm.
+- [ ] Bind intents, decisions, and subscriptions to the exact bridge activation. Recheck
+      it with the operator generation and orchestrator identity at every entry and
+      continuation, including decision consumption and result publication. Invalidate
+      it on pause, transport loss, logout, expiry, or page exit. Retire pending decisions,
+      disconnect subscriptions, and discard late callbacks. Require a fresh document if
+      the pinned SDK cannot fully detach its listeners or observers.
 - [ ] Verify that production builds omit development `source` locations and
       `data-review-loc`, and that no `Preferences` inline script is emitted.
 - [ ] Pin exact package versions in the lockfile, verify the licence and integrity, and
@@ -102,6 +139,11 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
 - [ ] Prove constructed-stylesheet injection works under the enforcing `style-src 'self'` CSP
       in Chromium and WebKitGTK without adding `unsafe-inline` or `style-src-attr`. If it
       cannot, return the CSP change to security review before adopting the primitives.
+- [ ] If adopted, security-review the exact nonce-less `<meta property="csp-nonce">`
+      allowance in the strict [static shell manifest](spikes/m/web-ui/scripts/csp.mjs).
+      Require the fixed tag with no content or extra attributes. Exercise each adopted
+      primitive in both engines under the emitted CSP, including opening and transitions,
+      and check for inline style attributes and violations. Repeat on SDK upgrades.
 - [ ] Measure the added bundle size on the loopback fixture and keep the agent module lazily
       loaded only for orchestrator-enabled sessions.
 - [ ] Test hostile cases: an agent pressing a `data-agent-confirm` control, attempting to
@@ -114,6 +156,15 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
       ordinary operator route still requires confirmation on the agent route, and that
       forged source fields, stale or replayed decisions, and attempts to use Tier A or
       Tier B human paths yield zero mutation, receipts or operator provenance.
+- [ ] Add fixture controls for a portaled protected/hidden subtree, delayed SDK continuation
+      trying the operator API, shared-form poisoning, held Enter/Space across modal opening,
+      prompt floods, hidden or busy views, ticket replay or wrong tab, and stale actions
+      or subscription deliveries after logout and fresh login. Verify zero operator
+      mutations and no stale disclosures.
+- [ ] Hold an approved decision and a queued subscription result across pause and re-enable
+      in the same tab without logout. Reject both old items and prove a fresh request on
+      the new activation works. Repeat for transport loss and reconnect. Hide the view with
+      a confirmation open and verify returning cannot consume that confirmation.
 
 ## Open decision
 

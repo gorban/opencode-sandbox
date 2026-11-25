@@ -66,8 +66,8 @@ these jobs in priority order:
 - [ ] Make the default landing screen a dense **Fleet overview**: a sortable table of sandboxes
       with status, attention, model and variant, last meaningful activity, health signal and
       active grants. Prefer tables and lists over card grids. Filters, sort and selected tab
-      live in the URL only as generic view parameters (no private identifiers, per
-      [M3a](prd_m3a.md)).
+      live in the URL only as closed-enum generic view parameters. Keep free text and
+      project, sandbox, branch and other private identifiers out of URLs and history.
 - [ ] Open the sandbox detail as tabs: Threads, Diff & Checkpoints, Terminals, and later
       Browser. Keep tab state above the panels so switching tabs cannot discard typed input.
 - [ ] Use a right-hand drawer for diffs and Human Inbox items, so the thread stays visible.
@@ -96,9 +96,11 @@ host chrome.
 - [ ] Design loading, empty, error, stale, offline, revoked and permission-denied states for
       every data region, plus session expired, logged out and reconnecting for the whole app.
       Show staleness explicitly (for example, "updated 2 min ago") rather than freezing silently.
-- [ ] Handle long and hostile text: very long names, bidirectional text (`<bdi>`), unbroken
-      strings, Markdown-looking text and zero-width characters. Use fixture text that includes
-      them in every prototype.
+- [ ] Handle long and hostile text: very long names, unbroken strings and Markdown-looking
+      text. Replace or remove C0, DEL, C1, bidi-control and zero-width formatting characters
+      in host labels before direction isolation with `<bdi>`. Preserve ordinary multilingual
+      text. Use hostile synthetic fixtures and follow the existing
+      [rendering walkthrough](spikes/m/web-ui/WALKTHROUGH.md) for thread bodies.
 - [ ] Never invent data in prototypes. Use synthetic fixture data shaped like the
       [M3a web-ui fixtures](spikes/m/web-ui/fixtures/workspace.mjs) and the M3 hierarchy.
 - [ ] Use tabular numerals for counts, quota and timings. Do not show trend arrows or
@@ -110,7 +112,8 @@ host chrome.
 
 - [ ] The enforcing CSP is `style-src 'self'` with no inline styles in generated HTML
       ([M3a web-ui walkthrough](spikes/m/web-ui/WALKTHROUGH.md)). Design for external
-      stylesheets and Svelte scoped styles only. Use no CDN fonts, remote images, icon fonts
+      stylesheets and Svelte scoped styles only. Keep `form-action 'none'` and limit images
+      to `img-src 'self'`. Use no CDN fonts, remote images, icon fonts
       or third-party embeds. Icons are bundled SVG components with text labels.
 - [ ] Fonts: the current CSP has no `font-src`, so bundled web fonts would be blocked. See the
       font decision below.
@@ -131,8 +134,10 @@ host chrome.
       cue, with 4.5:1 text and 3:1 non-text contrast in both themes (1.4.1, 1.4.3, 1.4.11);
       single-key shortcuts that can be turned off or remapped (2.1.4); no drag-only
       interactions (2.5.7); and status messages announced without moving focus (4.1.3).
-- [ ] Accessible authentication (3.3.8): the bootstrap-code field accepts paste and password
-      managers and has no timing puzzle. Show the remaining code lifetime as text.
+- [ ] Accessible authentication (3.3.8): allow pasting the short-lived bootstrap code
+      into the JS-only field with `autocomplete="off"` and no native form submission.
+      Show static expiry guidance on the unauthenticated page. Only the CLI may display
+      a live bootstrap-code countdown.
 - [ ] Throttle live-region announcements for streaming threads and the Health Ribbon so
       screen readers are not flooded. Give the operator a "pause announcements" control.
 - [ ] Run an automated and manual WCAG 2.2 AA audit on each finalist design and on the
@@ -160,6 +165,9 @@ host chrome.
       stripped) by a cross-provider council (OpenAI, Google and Anthropic models). Each
       reviewer scores the same rubric, names the best facet of each attempt, and does not
       vote for an attempt produced by its own model. Aggregate with Borda count.
+- [ ] Share only synthetic fixtures with external design providers, including in prompts
+      and screenshots. Strip workstation paths, account and host names, and real repo
+      or sandbox identifiers before sharing any artifact.
 - [ ] Give the operator a review point every round: rubric scores, per-facet
       keep / kill / merge tags and element-level comments. Record the reasons for every kill
       as constraints for the next round.
@@ -195,7 +203,9 @@ host chrome.
   - **UI SDK `web.css` base with token overrides.** Consistent with headless primitives. Ties
     the visual layer to a beta package. ~0.5 day, depends on [prd_m3a2](prd_m3a2.md).
 - [ ] (decision needed) **Themes.**
-  - **Light and dark, following the system with a manual override (recommended).** Works for
+  - **Light and dark, following the system with a manual override (recommended).** Keep the
+    override in memory or in a non-secret host preference. Avoid SDK inline preference scripts
+    and persistent browser session state. Works for
     long sessions and accessibility. Every token and contrast check runs twice. ~1–2 days extra.
   - **Dark only at first.** Faster. Fails some users and daylight use. ~0 days.
 - [ ] (decision needed) **Density.**

@@ -119,9 +119,9 @@ Sidebar Tree (3-Level Hierarchy)
   - **Loopback dashboard CSP ([M3a](prd_m3a.md)):** The daemon sends the enforcing header on
     each HTML response. Emit the **exact bound ephemeral port** at runtime when WebSockets
     are enabled:
-    `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;
+    `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self';
     connect-src 'self' ws://127.0.0.1:<bound_port>; frame-src 'self'; frame-ancestors 'none';
-    base-uri 'none'; form-action 'self'`. If the production build has an inline bootstrap,
+    base-uri 'none'; form-action 'none'`. If the production build has an inline bootstrap,
     add its exact build hash to `script-src`.
   - **Desktop dashboard CSP ([M3b](prd_m3b.md)):** Load only bundled assets and enable only
     the platform's required local IPC endpoints. Omit the loopback WebSocket destination.
@@ -152,14 +152,16 @@ Sidebar Tree (3-Level Hierarchy)
     [M3b Tauri desktop](prd_m3b.md) without brittle screenshots or arbitrary JS execution.
   - **Asymmetric confirmation via `data-agent-confirm`:** Annotate every protected control in
     advance with `data-agent-confirm="<impact summary>"` (e.g., revoking grants, stopping,
-    restarting or deleting a sandbox, changing active provider/model/fallback settings, exporting
-    diffs, or toggling input control). A normal human click follows the ordinary UI flow without an
-    extra prompt. On the agent path, the daemon retains the initiating identity and independently
+    restarting or deleting a sandbox, changing active provider/model/fallback settings, or
+    exporting diffs). Input control stays operator-only. A normal human click follows the ordinary
+    UI flow without an extra prompt. On the agent path, the daemon retains the initiating identity and independently
     classifies the typed action. A permitted protected action requires a **human confirmation
     modal in Trusted Host Chrome** showing the exact action, target and impact. The one-use
     decision is consumed with the effect against the displayed target revision and parameters.
-    SDK attributes and event source fields guide presentation only. Without an `allow` handler,
-    or on human cancel/timeout, the agent path fails closed. Apply [M3a2](prd_m3a2.md) to every
+    SDK attributes and event source fields guide presentation only. The adapter cancels SDK
+    execution of mutating component handlers and submits a typed intent on the agent channel.
+    Without an `allow` handler, or on human cancel/timeout, the agent path fails closed.
+    Apply [M3a2](prd_m3a2.md) to every
     bridge result and keep operator-only controls outside agent mutation authority.
   - **Defense in depth & self-approval prevention:**
     - Mark the confirmation modal itself, the **Approval Inbox** (approve/deny controls), provider
