@@ -376,6 +376,28 @@ class Profiles:
         self._write(directory, state)
         return self._profile(state, label)
 
+    def _collect_disconnect_targets(self, state, active_label: str | None, inactive_filter) -> list[str]:
+        entries = state["registrations"]
+        targets = [active_label] if active_label is not None else []
+        for name, entry in sorted(entries.items()):
+            if name == active_label:
+                continue
+            is_unpublished = entry["pending"] is not None or entry["client_id"] is None
+            if is_unpublished or (inactive_filter is not None and inactive_filter(self._profile(state, name))):
+                targets.append(name)
+        return targets
+
+    def _begin_bare_disconnect(self, directory, state, before_retirement, inactive_filter) -> Profile | None:
+        active_label = state.get("active")
+        entries = state["registrations"]
+        for name in self._collect_disconnect_targets(state, active_label, inactive_filter):
+            fenced = before_retirement(self._profile(state, name))
+            if fenced is not False and entries[name]["client_id"] is not None:
+                entries[name]["retiring"] = True
+        state["epoch"] = secrets.token_urlsafe(32)
+        self._write(directory, state)
+        return self._profile(state, active_label) if active_label is not None else None
+
     def begin_disconnect(self, before_retirement, *, inactive_filter=None, label: str | None = None) -> Profile | None:
         with self._state() as (directory, state):
             if not state:
@@ -384,19 +406,4 @@ class Profiles:
                 return None
             if label is not None:
                 return self._begin_targeted_disconnect(directory, state, label, before_retirement)
-            active_label = state.get("active")
-            entries = state["registrations"]
-            targets = [active_label] if active_label is not None else []
-            for name, entry in sorted(entries.items()):
-                if name == active_label:
-                    continue
-                if (entry["pending"] is not None or entry["client_id"] is None
-                        or (inactive_filter is not None and inactive_filter(self._profile(state, name)))):
-                    targets.append(name)
-            for name in targets:
-                fenced = before_retirement(self._profile(state, name))
-                if fenced is not False and entries[name]["client_id"] is not None:
-                    entries[name]["retiring"] = True
-            state["epoch"] = secrets.token_urlsafe(32)
-            self._write(directory, state)
-            return self._profile(state, active_label) if active_label is not None else None
+            return self._begin_bare_disconnect(directory, state, before_retirement, inactive_filter)

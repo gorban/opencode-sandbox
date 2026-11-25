@@ -5,10 +5,13 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from unittest.mock import patch
+
 from oc_providers.config import (
     CONFIG_FILENAME,
     MAX_CONFIG_BYTES,
     ProviderConfigError,
+    default_config_dir,
     load_provider_config,
 )
 
@@ -137,6 +140,8 @@ class ProviderConfigTests(unittest.TestCase):
             ("cli_path_on_openai", '[providers.openai.personal]\nenabled = true\nauth_mode = "subscription"\ncli_path = "/usr/bin/openai"\n'),
             ("cli_path_relative", '[providers.claude.personal]\nenabled = true\nauth_mode = "subscription"\ncli_path = "bin/claude"\n'),
             ("cli_path_dotdot", '[providers.claude.personal]\nenabled = true\nauth_mode = "subscription"\ncli_path = "/usr/../bin/claude"\n'),
+            ("cli_path_double_slash", '[providers.claude.personal]\nenabled = true\nauth_mode = "subscription"\ncli_path = "/usr//bin/claude"\n'),
+            ("cli_path_ansi_escape", '[providers.claude.personal]\nenabled = true\nauth_mode = "subscription"\ncli_path = "/usr/bin/\\u001b[31mclaude"\n'),
             ("cli_path_inside_sandbox", f'[providers.claude.personal]\nenabled = true\nauth_mode = "subscription"\ncli_path = "{self.sandbox}/claude"\n'),
             ("undeclared_provider_default", '[provider_defaults]\nopenai = "missing"\n'),
             ("launch_model_without_provider", '[launch]\ndefault_model = "gpt-6.2-sol"\n'),
@@ -157,6 +162,13 @@ class ProviderConfigTests(unittest.TestCase):
         _write_toml(self.cfg_dir, "\n".join(blocks))
         with self.assertRaisesRegex(ProviderConfigError, "at most 16"):
             self._load()
+
+    def test_default_config_dir_rejects_unset_empty_or_relative_home(self):
+        for bad_env in ({}, {"HOME": ""}, {"HOME": "relative/home"}):
+            with self.subTest(env=bad_env):
+                with patch.dict(os.environ, bad_env, clear=True):
+                    with self.assertRaises(ProviderConfigError):
+                        default_config_dir()
 
 
 if __name__ == "__main__":

@@ -17,9 +17,12 @@ from .contracts import (
     ProviderIntegrityError,
     ProviderSessionAdapter,
     ReadinessState,
+    SelectionState,
     UiMode,
     is_valid_instance_label,
 )
+
+_CANCELLED = "Cancelled."
 
 
 class LaunchRefusedError(RuntimeError):
@@ -103,9 +106,15 @@ def _resolve_narrowed_spec(
         )
     resolved_label = label
     if resolved_label is None:
-        persisted = adapter.active_label()
-        if persisted is not None:
-            resolved_label = persisted
+        selection = adapter.selection_state()
+        if selection.state is SelectionState.SELECTED and selection.label is not None:
+            resolved_label = selection.label
+        elif selection.state is SelectionState.DISCONNECTED:
+            raise LaunchRefusedError(
+                "selection_disconnected",
+                f"The active '{kind}' registration was disconnected. Select another with "
+                f"`oc-sandbox {kind} select <label>` or pass `--provider {kind}/<label>`.",
+            )
         elif config is not None and kind in config.provider_defaults:
             resolved_label = config.provider_defaults[kind]
         else:
@@ -243,7 +252,7 @@ def _resolve_exposure_holds(
         if terminal.confirm(f"Acknowledge prior exposure snapshot for {affected}?"):
             acknowledged[scope] = hold.digest
         elif narrowed:
-            raise LaunchRefusedError("exposure_hold_declined", "Cancelled.")
+            raise LaunchRefusedError("exposure_hold_declined", _CANCELLED)
         else:
             declined_scopes.add(scope)
 
@@ -289,12 +298,12 @@ def _prompt_initial_instance(
 ) -> InstancePreflight:
     terminal.write(reason)
     labels = [
-        f"{item.spec.qualified_name} ({item.spec.auth_mode}; {item.billing_summary})"
+        f"{item.spec.qualified_name} ({item.spec.auth_mode}; {item.route_policy})"
         for item in admitted
     ]
     picked = terminal.choose("Select initial active provider instance for this session:", labels)
     if picked is None or not 0 <= picked < len(admitted):
-        raise LaunchRefusedError("cancelled", "Cancelled.")
+        raise LaunchRefusedError("cancelled", _CANCELLED)
     return admitted[picked]
 
 
@@ -398,7 +407,7 @@ def plan_interactive_launch(
         preview = _format_model_preview(item.models)
         terminal.write(
             f"Provider {item.spec.qualified_name} [{item.spec.scoped_id}]: "
-            f"auth={item.spec.auth_mode}, billing={item.billing_summary} (models: {preview})"
+            f"auth={item.spec.auth_mode}, policy={item.route_policy} (models: {preview})"
         )
     ui_label = "OpenCode Mini" if ui_mode == "mini" else "OpenCode"
     terminal.write(
@@ -412,7 +421,7 @@ def plan_interactive_launch(
     )
     prompt = f"Start interactive {ui_label} session for instance '{instance_name}'?"
     if not terminal.confirm(prompt):
-        raise LaunchRefusedError("cancelled", "Cancelled.")
+        raise LaunchRefusedError("cancelled", _CANCELLED)
 
     return ResolvedLaunchPlan(
         admitted=tuple(admitted),

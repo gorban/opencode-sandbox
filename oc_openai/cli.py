@@ -432,6 +432,18 @@ def _valid_argv(argv: Sequence[str], command: str, *, labelled: bool, manual: bo
     return len(argv) == 1 and command in _LOCAL_COMMANDS
 
 
+def _run_disconnect(terminal: Terminal, backend: Backend, target_label: str | None) -> int:
+    confirmed = backend.disconnect() if target_label is None else backend.disconnect(target_label)
+    if confirmed is True:
+        if target_label is None:
+            terminal.write("ChatGPT is disconnected on this workstation.")
+        else:
+            terminal.write(f"ChatGPT registration {target_label} is disconnected on this workstation.")
+        return 0
+    terminal.error("ChatGPT is disconnected locally. Remote revocation could not be confirmed.")
+    return 1
+
+
 def run(
     argv: Sequence[str], *, terminal: Terminal, backend_factory: Callable[[], Backend] = _production_backend,
 ) -> int:
@@ -458,15 +470,6 @@ def run(
             return 0
         if command == "verify":
             return _run_verify(terminal, backend)
-        target_label = argv[1] if len(argv) == 2 else None
-        confirmed = backend.disconnect() if target_label is None else backend.disconnect(target_label)
-        if confirmed is True:
-            if target_label is None:
-                terminal.write("ChatGPT is disconnected on this workstation.")
-            else:
-                terminal.write(f"ChatGPT registration {target_label} is disconnected on this workstation.")
-            return 0
-        terminal.error("ChatGPT is disconnected locally. Remote revocation could not be confirmed.")
-        return 1
+        return _run_disconnect(terminal, backend, argv[1] if len(argv) == 2 else None)
     except (Exception, KeyboardInterrupt) as error:
         return report_failure(terminal, error)

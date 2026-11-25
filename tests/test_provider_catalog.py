@@ -14,10 +14,12 @@ from oc_providers.config import LaunchDefaults, ProviderConfig
 from oc_providers.contracts import (
     ExposureHoldSummary,
     InstancePreflight,
+    PersistedSelection,
     ProviderId,
     ProviderInstanceSpec,
     ProviderIntegrityError,
     ReadinessState,
+    SelectionState,
 )
 
 
@@ -56,6 +58,7 @@ class _FakeAdapter:
         *,
         qualified_modes: frozenset[str] = frozenset({"subscription"}),
         active: str | None = None,
+        selection: PersistedSelection | None = None,
         discovered: tuple[ProviderInstanceSpec, ...] = (),
         preflights: dict[str, InstancePreflight] | None = None,
         integrity_on: set[str] | None = None,
@@ -63,6 +66,7 @@ class _FakeAdapter:
         self.kind = kind
         self._qualified_modes = qualified_modes
         self._active = active
+        self._selection = selection
         self._discovered = discovered
         self._preflights = preflights or {}
         self._integrity_on = integrity_on or set()
@@ -72,6 +76,13 @@ class _FakeAdapter:
 
     def active_label(self) -> str | None:
         return self._active
+
+    def selection_state(self) -> PersistedSelection:
+        if self._selection is not None:
+            return self._selection
+        if self._active is not None:
+            return PersistedSelection(SelectionState.SELECTED, label=self._active)
+        return PersistedSelection(SelectionState.UNSET)
 
     def discover_instances(self) -> tuple[ProviderInstanceSpec, ...]:
         return self._discovered
@@ -124,15 +135,15 @@ class ProviderCatalogTests(unittest.TestCase):
                 "openai",
                 active="personal",
                 preflights={
-                    "personal": InstancePreflight(oa_personal, ReadinessState.READY, ("gpt-6.2-sol", "gpt-6.1-sol"), billing_summary="sub"),
-                    "work": InstancePreflight(oa_work, ReadinessState.READY, ("gpt-6.1-sol",), billing_summary="sub"),
+                    "personal": InstancePreflight(oa_personal, ReadinessState.READY, ("gpt-6.2-sol", "gpt-6.1-sol"), route_policy="sub"),
+                    "work": InstancePreflight(oa_work, ReadinessState.READY, ("gpt-6.1-sol",), route_policy="sub"),
                 },
             ),
             "claude": _FakeAdapter(
                 "claude",
                 active="personal",
                 preflights={
-                    "personal": InstancePreflight(cl_personal, ReadinessState.READY, ("claude-sonnet",), billing_summary="sub"),
+                    "personal": InstancePreflight(cl_personal, ReadinessState.READY, ("claude-sonnet",), route_policy="sub"),
                     "offline": InstancePreflight(cl_offline, ReadinessState.DISCONNECTED),
                 },
             ),
@@ -202,13 +213,13 @@ class ProviderCatalogTests(unittest.TestCase):
             "openai": _FakeAdapter(
                 "openai",
                 preflights={
-                    "personal": InstancePreflight(oa_a, ReadinessState.READY, ("gpt-6.2-sol",), exposure_hold=hold, billing_summary="sub"),
-                    "work": InstancePreflight(oa_b, ReadinessState.READY, ("gpt-6.2-sol",), exposure_hold=hold, billing_summary="sub"),
+                    "personal": InstancePreflight(oa_a, ReadinessState.READY, ("gpt-6.2-sol",), exposure_hold=hold, route_policy="sub"),
+                    "work": InstancePreflight(oa_b, ReadinessState.READY, ("gpt-6.2-sol",), exposure_hold=hold, route_policy="sub"),
                 },
             ),
             "claude": _FakeAdapter(
                 "claude",
-                preflights={"personal": InstancePreflight(cl_a, ReadinessState.READY, ("claude-sonnet",), billing_summary="sub")},
+                preflights={"personal": InstancePreflight(cl_a, ReadinessState.READY, ("claude-sonnet",), route_policy="sub")},
             ),
         }
         # Decline shared openai hold -> both openai instances excluded, claude admitted and confirmed.
@@ -236,7 +247,7 @@ class ProviderCatalogTests(unittest.TestCase):
                 qualified_modes=frozenset({"subscription", "api_key"}),
                 preflights={
                     "personal": InstancePreflight(oa_down, ReadinessState.DISCONNECTED),
-                    "team-api": InstancePreflight(oa_paid, ReadinessState.READY, ("gpt-6.2-sol",), billing_summary="paid api_key"),
+                    "team-api": InstancePreflight(oa_paid, ReadinessState.READY, ("gpt-6.2-sol",), route_policy="paid api_key"),
                 },
             ),
         }
@@ -302,7 +313,7 @@ class ProviderCatalogTests(unittest.TestCase):
         adapters = {
             "openai": _FakeAdapter(
                 "openai",
-                preflights={"personal": InstancePreflight(oa_a, ReadinessState.READY, ("gpt-6.2-sol",), billing_summary="sub")},
+                preflights={"personal": InstancePreflight(oa_a, ReadinessState.READY, ("gpt-6.2-sol",), route_policy="sub")},
             ),
         }
         plan_toml = plan_interactive_launch(
@@ -316,6 +327,43 @@ class ProviderCatalogTests(unittest.TestCase):
             cli_ui_mode="full", config=cfg, adapters=adapters, terminal=_FakeTerminal(confirms=[True]),
         )
         self.assertEqual((plan_override.ui_mode, plan_override.ui_source), ("full", "--no-mini"))
+
+    def test_narrowed_bare_provider_refuses_disconnected_selection_state_without_default_fallback(self):
+        oa_a = _spec("openai", "personal")
+        oa_b = _spec("openai", "backup")
+        cfg = ProviderConfig(
+            instances=(oa_a, oa_b),
+            provider_defaults={"openai": "backup"},
+            launch=LaunchDefaults(),
+        )
+        # Disconnected persisted selection MUST refuse instead of silently falling back to provider_defaults.
+        adapters_disc = {
+            "openai": _FakeAdapter(
+                "openai",
+                selection=PersistedSelection(SelectionState.DISCONNECTED),
+                preflights={"backup": InstancePreflight(oa_b, ReadinessState.READY, ("gpt-6.2-sol",), route_policy="sub")},
+            ),
+        }
+        with self.assertRaises(LaunchRefusedError) as ctx:
+            plan_interactive_launch(
+                instance_name="default", cwd="construct", provider_filter="openai",
+                cli_ui_mode="default", config=cfg, adapters=adapters_disc, terminal=_FakeTerminal(),
+            )
+        self.assertEqual(ctx.exception.code, "selection_disconnected")
+
+        # Never-selected (UNSET) adapter still resolves [provider_defaults].openai cleanly.
+        adapters_unset = {
+            "openai": _FakeAdapter(
+                "openai",
+                selection=PersistedSelection(SelectionState.UNSET),
+                preflights={"backup": InstancePreflight(oa_b, ReadinessState.READY, ("gpt-6.2-sol",), route_policy="sub")},
+            ),
+        }
+        plan = plan_interactive_launch(
+            instance_name="default", cwd="construct", provider_filter="openai",
+            cli_ui_mode="default", config=cfg, adapters=adapters_unset, terminal=_FakeTerminal(confirms=[True]),
+        )
+        self.assertEqual([item.spec.label for item in plan.admitted], ["backup"])
 
 
 if __name__ == "__main__":

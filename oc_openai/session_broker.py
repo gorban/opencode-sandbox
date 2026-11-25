@@ -1,6 +1,6 @@
 """Host-side interactive ChatGPT Responses broker and foreground pod supervisor."""
 
-from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 import fcntl
 import hmac
@@ -89,7 +89,7 @@ _RESERVED_INSTANCES = frozenset({
     "agent", "chromium", "chrome", "postgres", "pg", "dind", "home",
     "openai-relay", "openai-home", "relay",
 })
-_RELAY_INSTANCE_RE = re.compile(r"relay(?:-[0-9]+)?\Z", re.ASCII)
+_RELAY_INSTANCE_RE = re.compile(r"relay(?:-\d+)?\Z", re.ASCII)
 _BASE_SPEC_KEYS = frozenset({
     "instance", "pod", "agent", "relay", "relay_image", "agent_image",
     "agent_mem", "level", "sandbox", "cwd", "home_vol", "chromium",
@@ -1154,102 +1154,6 @@ def _launch_agent_tty(agent_id: str, stop_event: threading.Event) -> int:
     return child_proc.wait()
 
 
-def _teardown_session(job: _SessionJob, broker: SessionBroker | None,
-                      container_ids: tuple[str | None, ...], stack: ExitStack) -> Exception | None:
-    cleanup_error: Exception | None = None
-    steps = [job.revoke]
-    if broker is not None:
-        steps.append(broker.close)
-    for cid in container_ids:
-        if cid is not None:
-            steps.append(lambda c=cid: _remove_container_verified(c))
-    steps.append(stack.close)
-    for step in steps:
-        try:
-            step()
-        except Exception as exc:
-            cleanup_error = cleanup_error or exc
-    return cleanup_error
-
-
-def _run_session_body(spec: dict, backend, identity: tuple, models: tuple[str, ...],
-                      job: _SessionJob, stop_event: threading.Event,
-                      terminal: StreamTerminal, cleanup_state: dict) -> int:
-    label, selection_epoch, conn, binding, acknowledged_digest = identity
-    worker_token = secrets.token_urlsafe(32)
-    relay_id: str | None = None
-    agent_id: str | None = None
-    broker: SessionBroker | None = None
-    rc = 1
-    with ExitStack() as stack:
-        try:
-            pod_id = _verify_pod(spec)
-            job.prepare(generate_opencode_config(worker_token=worker_token, models=models))
-            stack.enter_context(backend.session_lease(label, selection_epoch, binding, job))
-            broker = SessionBroker(
-                socket_path=job.provider_socket,
-                relay_proof=job.relay_proof,
-                worker_token=worker_token,
-                lease=job.lease,
-                connection=conn,
-                binding=binding,
-                models=models,
-                profile_label=label,
-                usage_dir=backend._state,
-                policy=SessionPolicy(
-                    exposure_dir=backend._state,
-                    acknowledged_exposure_digest=acknowledged_digest,
-                    authorization=lambda: backend.selected_fence(label, selection_epoch),
-                    is_selected=lambda: backend.active_selection() == (label, selection_epoch),
-                    on_revoke=stop_event.set,
-                ),
-            )
-            broker.start()
-            _ensure_containers_idle(spec["agent"], spec["relay"], spec["instance"])
-
-            relay_id = podman(*_build_relay_args(spec, job)).stdout.decode("ascii").strip()
-            if not IMAGE_ID.fullmatch(relay_id):
-                raise RuntimeError("Podman did not return a complete relay container ID")
-            podman("start", relay_id)
-            siblings = [name for name in (spec["chromium"], spec["postgres"], spec["dind"]) if name]
-            _verify_relay_isolation(relay_id, spec["relay_image"], pod_id, spec["level"], job, siblings)
-            _wait_relay_bound(relay_id)
-            if (stop_event.is_set() or broker._revoked.is_set()
-                    or job.lease.status() != "pending" or time.monotonic_ns() >= job.lease.deadline_ns):
-                raise ConnectionError("connection_retired")
-            job.activate()
-
-            if stop_event.is_set() or broker._revoked.is_set() or not job.lease.active():
-                raise ConnectionError("connection_retired")
-            agent_id = podman(*_build_agent_args(spec, job)).stdout.decode("ascii").strip()
-            if not IMAGE_ID.fullmatch(agent_id):
-                raise RuntimeError("Podman did not return a complete agent container ID")
-
-            if stop_event.is_set() or broker._revoked.is_set() or not job.lease.active():
-                raise ConnectionError("connection_retired")
-            rc = _launch_agent_tty(agent_id, stop_event)
-        finally:
-            cleanup_error = _teardown_session(job, broker, (agent_id, relay_id), stack)
-            if cleanup_error is None:
-                cleanup_state["clean"] = True
-            else:
-                terminal.error(f"Provider session cleanup needs verification. Retained directory {job.root}")
-                rc = 1
-    return rc
-
-
-def _resolve_interactive_exposure(backend, terminal: StreamTerminal) -> str | None:
-    hold = ExposureLedger(backend._state).inspect_hold()
-    if not hold.blocked:
-        return None
-    terminal.write(
-        f"Prior exposure hold present ({hold.file_count} receipt file(s), "
-        f"{hold.unsettled_count} unsettled, snapshot {hold.digest[:12]}). "
-        "Existing receipt files will remain untouched."
-    )
-    return hold.digest
-
-
 class _SlotState:
     def __init__(self, slot_cm, handle: SlotHandle, slot_root: Path):
         self.slot_cm = slot_cm
@@ -1268,6 +1172,7 @@ class _SessionSlotCoordinator:
         self._stop_event = stop_event
         self._lock = threading.Lock()
         self._slots: dict[int, _SlotState] = {}
+        self._pre_revoked: set[int] = set()
         self._slot_roots: list[Path] = []
         self._created_containers: list[str] = []
         self._removed_containers: set[str] = set()
@@ -1277,9 +1182,16 @@ class _SessionSlotCoordinator:
     def register_slot(self, slot_cm, handle: SlotHandle, slot_root: Path | None = None) -> _SlotState:
         resolved_root = slot_root if slot_root is not None else handle.job.root
         state = _SlotState(slot_cm, handle, resolved_root)
+        should_revoke = False
         with self._lock:
             self._slots[handle.slot_index] = state
-            self._slot_roots.append(resolved_root)
+            if resolved_root not in self._slot_roots:
+                self._slot_roots.append(resolved_root)
+            if handle.slot_index in self._pre_revoked or handle.broker._revoked.is_set():
+                self._pre_revoked.discard(handle.slot_index)
+                should_revoke = True
+        if should_revoke:
+            self.on_revoke(handle.slot_index)
         return state
 
     def track_slot_root(self, slot_root: Path) -> None:
@@ -1294,11 +1206,16 @@ class _SessionSlotCoordinator:
             with suppress(OSError):
                 shutil.rmtree(slot_root)
 
-    def record_container(self, container_id: str, *, slot_index: int | None = None) -> None:
+    def record_container(self, container_id: str, *, slot_index: int | None = None) -> bool:
         with self._lock:
             self._created_containers.append(container_id)
-            if slot_index is not None and slot_index in self._slots:
-                self._slots[slot_index].relay_id = container_id
+            if slot_index is not None:
+                state = self._slots.get(slot_index)
+                if state is not None:
+                    state.relay_id = container_id
+                    if state.retiring:
+                        return False
+            return True
 
     def _record_error(self, exc: Exception) -> None:
         with self._lock:
@@ -1314,14 +1231,20 @@ class _SessionSlotCoordinator:
             state.handle.broker.close()
         except Exception as exc:
             self._record_error(exc)
-        relay_id = state.relay_id
+        with self._lock:
+            relay_id = state.relay_id
+        relay_removed = True
         if relay_id is not None:
             try:
                 _remove_container_verified(relay_id)
                 with self._lock:
                     self._removed_containers.add(relay_id)
             except Exception as exc:
+                relay_removed = False
                 self._record_error(exc)
+        if not relay_removed:
+            # Retain the session lease on disk when relay container removal cannot be confirmed.
+            return
         with self._lock:
             should_exit = not state.exited
             state.exited = True
@@ -1337,21 +1260,29 @@ class _SessionSlotCoordinator:
         """Retire only the revoked slot; stop the whole session iff zero active slots remain."""
         with self._lock:
             state = self._slots.get(slot_index)
-            if state is None or state.retiring:
+            if state is None:
+                self._pre_revoked.add(slot_index)
+                return
+            if state.retiring:
                 return
             state.retiring = True
             active_remaining = sum(1 for item in self._slots.values() if not item.retiring)
-        with suppress(Exception):
-            state.handle.job.revoke()
-        worker = threading.Thread(
-            target=self._finish_slot_retirement,
-            args=(state,),
-            name=f"oc-slot-retire-{slot_index}",
-            daemon=False,
-        )
-        with self._lock:
+            worker = threading.Thread(
+                target=self._finish_slot_retirement,
+                args=(state,),
+                name=f"oc-slot-retire-{slot_index}",
+                daemon=False,
+            )
             self._retire_threads.append(worker)
-        worker.start()
+            try:
+                worker.start()
+            except RuntimeError as exc:
+                self._retire_threads.remove(worker)
+                state.retiring = False
+                if self._cleanup_error is None:
+                    self._cleanup_error = exc
+                self._stop_event.set()
+                return
         if active_remaining == 0:
             self._stop_event.set()
 
@@ -1382,6 +1313,8 @@ class _SessionSlotCoordinator:
 
         for thread in threads:
             thread.join(timeout=15)
+            if thread.is_alive():
+                self._record_error(RuntimeError(f"Slot retirement thread '{thread.name}' did not finish"))
 
         for state in remaining_slots:
             self._finish_slot_retirement(state)
@@ -1420,7 +1353,8 @@ def _start_and_verify_slot_relay(
     relay_id = podman(*handle.build_relay_args(spec)).stdout.decode("ascii").strip()
     if not IMAGE_ID.fullmatch(relay_id):
         raise RuntimeError("Podman did not return a complete relay container ID")
-    coordinator.record_container(relay_id, slot_index=handle.slot_index)
+    if not coordinator.record_container(relay_id, slot_index=handle.slot_index):
+        raise ConnectionError("connection_retired")
     podman("start", relay_id)
     _verify_relay_isolation(
         relay_id,
@@ -1551,6 +1485,7 @@ def run_interactive_session(
     *,
     config_dir: Path | None = None,
     adapters: dict | None = None,
+    lock_dir: Path | None = None,
 ) -> int:
     """Supervise one interactive multi-provider oc-sandbox OpenCode session."""
     spec = _validate_spec(spec)
@@ -1566,12 +1501,14 @@ def run_interactive_session(
 
     try:
         config = load_provider_config(config_dir=config_dir)
-        backend = make_backend()
         if adapters is None:
+            backend = make_backend()
             from .session_adapter import OpenAISessionAdapter
             active_adapters = {"openai": OpenAISessionAdapter(backend)}
+            resolved_lock_dir = lock_dir or backend._state
         else:
             active_adapters = adapters
+            resolved_lock_dir = lock_dir if lock_dir is not None else make_backend()._state
         plan = plan_interactive_launch(
             instance_name=spec["instance"],
             cwd=spec["cwd"],
@@ -1585,9 +1522,12 @@ def run_interactive_session(
         return _report_session_error(terminal, error)
 
     try:
-        instance_lock_fd = _open_instance_lock(backend._state, spec["instance"])
-    except (OSError, RuntimeError):
+        instance_lock_fd = _open_instance_lock(resolved_lock_dir, spec["instance"])
+    except BlockingIOError:
         terminal.error(f"Instance '{spec['instance']}' already has an active provider session launch.")
+        return 1
+    except (OSError, RuntimeError) as error:
+        terminal.error(f"Could not acquire instance session lock: {error}")
         return 1
 
     root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir=SHARED_TMP))

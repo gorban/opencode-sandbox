@@ -160,15 +160,31 @@ class ExposureHoldSummary:
     digest: str
 
 
+class SelectionState(str, Enum):
+    """Tri-state persisted selection status for a provider kind."""
+
+    UNSET = "unset"
+    SELECTED = "selected"
+    DISCONNECTED = "disconnected"
+
+
+@dataclass(frozen=True)
+class PersistedSelection:
+    """Distinguishes never-selected from explicitly disconnected persisted selection."""
+
+    state: SelectionState
+    label: str | None = None
+
+
 @dataclass(frozen=True)
 class InstancePreflight:
-    """Redacted readiness and billing result for one candidate provider instance."""
+    """Redacted readiness and route-policy result for one candidate provider instance."""
 
     spec: ProviderInstanceSpec
     readiness: ReadinessState
     models: tuple[str, ...] = ()
     exposure_hold: ExposureHoldSummary | None = None
-    billing_summary: str = ""
+    route_policy: str = ""
     handle: object = None
 
 
@@ -243,6 +259,10 @@ class ProviderSessionAdapter(Protocol):
 
     def active_label(self) -> str | None:
         """Return persisted active registration label from local metadata only."""
+        ...
+
+    def selection_state(self) -> PersistedSelection:
+        """Return tri-state persisted selection (unset, selected, or disconnected)."""
         ...
 
     def discover_instances(self) -> tuple[ProviderInstanceSpec, ...]:

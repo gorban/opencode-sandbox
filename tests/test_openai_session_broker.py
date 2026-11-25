@@ -1689,8 +1689,9 @@ class SessionBrokerTests(unittest.TestCase):
 
         # Reserved relay instance names rejected in _validate_spec; ports 8401..8416 forbidden.
         for bad_inst in ("relay", "relay-0", "relay-15"):
+            bad_spec = self._valid_spec(instance=bad_inst)
             with self.assertRaises(ValueError):
-                session_broker._validate_spec(self._valid_spec(instance=bad_inst))
+                session_broker._validate_spec(bad_spec)
         for port in (8401, 8402, 8416):
             with self.assertRaisesRegex(RuntimeError, "forbidden port"):
                 session_broker._parse_pod_port_bindings(
@@ -1717,6 +1718,558 @@ class SessionBrokerTests(unittest.TestCase):
             )
             self.assertEqual(res.returncode, 2, f"argv={argv} stderr={res.stderr}")
             self.assertIn(expected, res.stderr)
+
+    def _make_real_profile_backend(self, state_dir: Path):
+        from unittest.mock import patch
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.profile_backend import ProfileBackend
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+
+        def _forbid_host_browser(url):
+            raise AssertionError(f"unit test attempted to open host browser: {url}")
+
+        self.enterContext(patch("oc_openai.connection._open_host_browser", side_effect=_forbid_host_browser))
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+        shared_verifier = FixtureVerifier()
+
+        def _make_conn(directory: Path):
+            transport = FixtureTransport()
+            transport.user = f"user-{directory.name}"
+            browser = FixtureBrowser()
+            browser.client = f"oaiapp_{directory.name}"
+            return Connection(
+                directory, transport=transport, verifier=shared_verifier,
+                browser=browser, host_probe=lambda: host,
+            )
+
+        return ProfileBackend(state_dir, connection=_make_conn)
+
+    def test_gate4_corrupt_or_world_writable_connection_state_aborts_default_launch(self):
+        import pwd
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.catalog import plan_interactive_launch
+        from oc_providers.contracts import ProviderIntegrityError
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        backend = self._make_real_profile_backend(scratch / "corrupt_state_profiles")
+        backend.connect("personal")
+        backend.connect("work")
+
+        view = backend.profiles.snapshot()
+        work_profile = next(p for p in view.saved if p.label == "work")
+        state_file = work_profile.directory / "state.json"
+        original_bytes = state_file.read_bytes()
+
+        adapter = OpenAISessionAdapter(backend)
+
+        class _Term:
+            def attended(self):
+                return True
+            def write(self, _text):
+                pass
+            def error(self, _text):
+                pass
+            def confirm(self, _prompt):
+                return True
+            def choose(self, _prompt, _options):
+                return 0
+
+        # 1. Corrupt JSON in one registration's state.json MUST abort the entire default launch.
+        state_file.write_text("{corrupt-json", encoding="utf-8")
+        with self.assertRaises(ProviderIntegrityError):
+            plan_interactive_launch(
+                instance_name="default", cwd="construct", provider_filter="",
+                cli_ui_mode="default", config=None, adapters={"openai": adapter}, terminal=_Term(),
+            )
+
+        # 2. World-writable state.json (0o666) MUST also abort with ProviderIntegrityError.
+        state_file.write_bytes(original_bytes)
+        os.chmod(state_file, 0o666)
+        try:
+            with self.assertRaises(ProviderIntegrityError):
+                plan_interactive_launch(
+                    instance_name="default", cwd="construct", provider_filter="",
+                    cli_ui_mode="default", config=None, adapters={"openai": adapter}, terminal=_Term(),
+                )
+        finally:
+            os.chmod(state_file, 0o600)
+
+    def test_gate4_legacy_noncanonical_label_disconnect_unblocks_discovery(self):
+        import pwd
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.contracts import ProviderIntegrityError
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        backend = self._make_real_profile_backend(scratch / "legacy_label_profiles")
+        # Simulate a pre-existing legacy registration with uppercase + underscore (valid before I4d).
+        backend.connect("legacy-seed")
+        reg_state = backend._state / "profiles" / "state.json"
+        data = json.loads(reg_state.read_text(encoding="utf-8"))
+        data["registrations"]["Work_2"] = data["registrations"].pop("legacy-seed")
+        data["active"] = "Work_2"
+        reg_state.write_text(json.dumps(data), encoding="utf-8")
+        reg_state.chmod(0o600)
+
+        adapter = OpenAISessionAdapter(backend)
+
+        with self.assertRaisesRegex(ProviderIntegrityError, "Work_2"):
+            adapter.discover_instances()
+
+        backend.disconnect("Work_2")
+        backend.connect("work-2")
+        discovered = adapter.discover_instances()
+        self.assertEqual([spec.label for spec in discovered], ["work-2"])
+
+    def test_gate4_real_profile_selection_disconnected_refuses_default_fallback(self):
+        import pwd
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.catalog import LaunchRefusedError, plan_interactive_launch
+        from oc_providers.config import LaunchDefaults, ProviderConfig
+        from oc_providers.contracts import ProviderInstanceSpec, SelectionState
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        backend = self._make_real_profile_backend(scratch / "tri_state_profiles")
+        adapter = OpenAISessionAdapter(backend)
+
+        cfg = ProviderConfig(
+            instances=(
+                ProviderInstanceSpec("openai", "backup", True, "subscription"),
+                ProviderInstanceSpec("openai", "personal", True, "subscription"),
+            ),
+            provider_defaults={"openai": "backup"},
+            launch=LaunchDefaults(),
+        )
+
+        class _Term:
+            def attended(self):
+                return True
+            def write(self, _text):
+                pass
+            def error(self, _text):
+                pass
+            def confirm(self, _prompt):
+                return True
+            def choose(self, _prompt, _options):
+                return 0
+
+        # Fresh empty registry is UNSET and resolves [provider_defaults].openai -> backup (which is disconnected).
+        self.assertEqual(adapter.selection_state().state, SelectionState.UNSET)
+        with self.assertRaises(LaunchRefusedError) as ctx_empty:
+            plan_interactive_launch(
+                instance_name="default", cwd="construct", provider_filter="openai",
+                cli_ui_mode="default", config=cfg, adapters={"openai": adapter}, terminal=_Term(),
+            )
+        self.assertEqual(ctx_empty.exception.code, "provider_disconnected")
+        self.assertIn("openai/backup", str(ctx_empty.exception))
+
+        # Connect backup, then personal (active), then disconnect personal -> active=None => DISCONNECTED.
+        backend.connect("backup")
+        backend.connect("personal")
+        backend.disconnect("personal")
+        self.assertEqual(adapter.selection_state().state, SelectionState.DISCONNECTED)
+
+        # Bare `--provider openai` MUST refuse instead of silently falling back to `backup`.
+        with self.assertRaises(LaunchRefusedError) as ctx_disc:
+            plan_interactive_launch(
+                instance_name="default", cwd="construct", provider_filter="openai",
+                cli_ui_mode="default", config=cfg, adapters={"openai": adapter}, terminal=_Term(),
+            )
+        self.assertEqual(ctx_disc.exception.code, "selection_disconnected")
+
+    def test_gate4_coordinator_retains_lease_on_failed_relay_removal_and_handles_races(self):
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.connection import ConnectionError
+        from oc_providers.contracts import SlotHandle
+
+        class _FakeJob:
+            def __init__(self, root: Path):
+                self.root = root
+                self.revoked = 0
+                self.lease = None
+
+            def revoke(self):
+                self.revoked += 1
+
+        class _FakeBroker:
+            def __init__(self):
+                self._revoked = threading.Event()
+                self.closed = 0
+
+            def close(self):
+                self.closed += 1
+
+        class _FakeCM:
+            def __init__(self):
+                self.exits = 0
+
+            def __exit__(self, *_exc):
+                self.exits += 1
+
+        # 1. Failed relay removal MUST NOT call slot_cm.__exit__ (lease retained on disk) and MUST report error.
+        stop_ev = threading.Event()
+        coord = session_broker._SessionSlotCoordinator(stop_ev)
+        cm = _FakeCM()
+        job = _FakeJob(self.root / "slot0")
+        broker = _FakeBroker()
+        handle = SlotHandle(
+            slot_index=0, scoped_id="openai--personal", provider_label="openai/personal",
+            port=8401, job=job, broker=broker, lease=None, build_relay_args=lambda _s: ["create"],
+        )
+        coord.register_slot(cm, handle)
+        self.assertTrue(coord.record_container("a" * 64, slot_index=0))
+        with patch.object(session_broker, "_remove_container_verified", side_effect=RuntimeError("rm failed")):
+            err = coord.teardown_all(None)
+        self.assertIsNotNone(err)
+        self.assertEqual(cm.exits, 0, "lease context manager exited despite unverified relay removal")
+        self.assertEqual(job.revoked, 1)
+        self.assertEqual(broker.closed, 1)
+
+        # 2. Hung retirement thread MUST record a cleanup error in teardown_all instead of returning None.
+        gate = threading.Event()
+        stop_ev2 = threading.Event()
+        coord2 = session_broker._SessionSlotCoordinator(stop_ev2)
+        hung_thread = threading.Thread(target=gate.wait, args=(5.0,), name="oc-slot-retire-hung", daemon=True)
+        hung_thread.start()
+        coord2._retire_threads.append(hung_thread)
+        orig_join = threading.Thread.join
+
+        def _fast_join(thread_self, timeout=None):
+            return orig_join(thread_self, timeout=0.02)
+
+        try:
+            with patch.object(threading.Thread, "join", _fast_join):
+                err2 = coord2.teardown_all(None)
+            self.assertIsNotNone(err2)
+            self.assertIn("did not finish", str(err2))
+        finally:
+            gate.set()
+            hung_thread.join(timeout=2.0)
+
+        # 3. Pre-registration revocation + startup revocation race MUST prevent `podman start`.
+        stop_ev3 = threading.Event()
+        coord3 = session_broker._SessionSlotCoordinator(stop_ev3)
+        coord3.on_revoke(0)  # Fired before register_slot!
+        cm3 = _FakeCM()
+        job3 = _FakeJob(self.root / "slot3")
+        broker3 = _FakeBroker()
+        handle3 = SlotHandle(
+            slot_index=0, scoped_id="openai--personal", provider_label="openai/personal",
+            port=8401, job=job3, broker=broker3, lease=None, build_relay_args=lambda _s: ["create", "relay"],
+        )
+        podman_calls: list[tuple] = []
+
+        def fake_podman(*args, **_kwargs):
+            podman_calls.append(args)
+            if args[0] == "create":
+                return subprocess.CompletedProcess(args, 0, ("b" * 64 + "\n").encode(), b"")
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        with patch.object(session_broker, "podman", side_effect=fake_podman):
+            coord3.register_slot(cm3, handle3)
+            with self.assertRaisesRegex(ConnectionError, "connection_retired"):
+                session_broker._start_and_verify_slot_relay(
+                    self._valid_spec(), "c" * 64, handle3, coord3, [], [], stop_ev3,
+                )
+        self.assertFalse(
+            any(call[0] == "start" for call in podman_calls),
+            f"podman start was called for a revoked slot: {podman_calls}",
+        )
+        with patch.object(session_broker, "_remove_container_verified"):
+            coord3.teardown_all(None)
+
+    def test_gate4_partial_startup_rollback_and_sibling_relay_mcs_collision(self):
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.cli import StreamTerminal
+        from oc_providers.catalog import ResolvedLaunchPlan
+        from oc_providers.contracts import (
+            InstancePreflight,
+            ProviderInstanceSpec,
+            ReadinessState,
+            SlotHandle,
+        )
+
+        spec = self._valid_spec()
+        pod_id = "1" * 64
+        relay0_id = "2" * 64
+        relay1_id = "3" * 64
+
+        # 1. Sibling relay MCS collision between slot 0 and slot 1 MUST raise RuntimeError.
+        mcs_dir = self.root / "mcs_slot1"
+        mcs_dir.mkdir(mode=0o700)
+        job1 = session_broker._SessionJob(mcs_dir, "inc_" + "e" * 32)
+        job1.prepare(config_payload=None)
+        self.addCleanup(job1.revoke)
+        shared_label = "system_u:system_r:container_t:s0:c30,c40"
+        mount_label = "system_u:object_r:container_file_t:s0:c30,c40"
+
+        def fake_inspected(*args):
+            if args[:2] == ("container", "inspect") and args[2] == relay1_id:
+                return {
+                    "Id": relay1_id,
+                    "Pod": pod_id,
+                    "Image": spec["relay_image"],
+                    "ProcessLabel": shared_label,
+                    "MountLabel": mount_label,
+                    "EffectiveCaps": [],
+                    "Config": {"User": "0:0"},
+                    "HostConfig": {
+                        "ReadonlyRootfs": True, "Privileged": False,
+                        "IpcMode": "private", "PidMode": "private", "CgroupMode": "private",
+                        "SecurityOpt": ["no-new-privileges"],
+                    },
+                    "Mounts": [
+                        {"Destination": "/source", "Type": "bind", "Source": str(job1.source_dir),
+                         "RW": False, "Mode": "Z", "Propagation": "rprivate", "Options": ["ro", "Z", "nosuid", "nodev", "noexec"]},
+                        {"Destination": "/provider", "Type": "bind", "Source": str(job1.provider_socket.parent),
+                         "RW": False, "Mode": "Z", "Propagation": "rprivate", "Options": ["ro", "Z", "nosuid", "nodev", "noexec"]},
+                        {"Destination": "/grant", "Type": "bind", "Source": str(job1.grant),
+                         "RW": False, "Mode": "Z", "Propagation": "rprivate", "Options": ["ro", "Z", "nosuid", "nodev", "noexec"]},
+                        {"Destination": "/proof", "Type": "bind", "Source": str(job1.proof_file.parent),
+                         "RW": False, "Mode": "Z", "Propagation": "rprivate", "Options": ["ro", "Z", "nosuid", "nodev", "noexec"]},
+                    ],
+                }
+            raise AssertionError(f"unexpected inspected: {args}")
+
+        def fake_podman_mcs(*args, **_kwargs):
+            if args[:2] == ("exec", relay1_id) and args[2] == "cat":
+                return subprocess.CompletedProcess(args, 0, shared_label.encode() + b"\0", b"")
+            if args[:2] == ("container", "inspect") and args[2] == relay0_id:
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"ProcessLabel": shared_label}]).encode(), b"",
+                )
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        with (
+            patch.object(session_broker, "inspected", side_effect=fake_inspected),
+            patch.object(session_broker, "podman", side_effect=fake_podman_mcs),
+            patch.object(session_broker, "host_output", return_value=mount_label.encode() + b"\0"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "collided with sibling container"):
+                session_broker._verify_relay_isolation(
+                    relay1_id, spec["relay_image"], pod_id, spec["level"], job1, [relay0_id],
+                )
+
+        # 2. Partial startup rollback: slot 0 succeeds, slot 1 fails -> relay 0 verified-removed & slot 0 exited.
+        slot0_exits = []
+        removed = []
+
+        class _RollbackAdapter:
+            def provider_config_entry(self, preflight, *, port, worker_token):
+                return {"name": preflight.spec.label, "settings": {"baseURL": f"http://127.0.0.1:{port}/v1", "apiKey": worker_token}, "models": {"gpt-6.2-sol": {"name": "gpt-6.2-sol"}}}
+
+            @contextlib.contextmanager
+            def open_slot(self, preflight, *, slot_index, slot_root, port, worker_token, acknowledged_exposure_digest, on_revoke):
+                if slot_index == 1:
+                    raise RuntimeError("slot 1 boom")
+
+                class _MiniJob:
+                    def __init__(self, r):
+                        self.root = r
+                        self.lease = None
+                    def revoke(self):
+                        pass
+
+                class _MiniBroker:
+                    def __init__(self):
+                        self._revoked = threading.Event()
+                    def close(self):
+                        pass
+
+                try:
+                    yield SlotHandle(
+                        slot_index=slot_index, scoped_id=preflight.spec.scoped_id,
+                        provider_label=preflight.spec.qualified_name, port=port,
+                        job=_MiniJob(slot_root), broker=_MiniBroker(), lease=None,
+                        build_relay_args=lambda _s: ["create"],
+                    )
+                finally:
+                    slot0_exits.append(slot_index)
+
+        p0 = InstancePreflight(ProviderInstanceSpec("openai", "personal", True, "subscription"), ReadinessState.READY, ("gpt-6.2-sol",))
+        p1 = InstancePreflight(ProviderInstanceSpec("openai", "work", True, "subscription"), ReadinessState.READY, ("gpt-6.2-sol",))
+        plan = ResolvedLaunchPlan(
+            admitted=(p0, p1), excluded=(), initial_provider_id="openai--personal",
+            initial_model="gpt-6.2-sol", ui_mode="full", ui_source="default",
+            acknowledged_digests={},
+        )
+        import io
+        term = StreamTerminal(io.StringIO(), io.StringIO(), io.StringIO())
+        cleanup_state = {"clean": False}
+        rb_root = self.root / "rb_root"
+        rb_root.mkdir(mode=0o700)
+
+        def fake_start_slot(spec_arg, pod_arg, handle, coordinator, siblings, started, stop_ev):
+            coordinator.record_container(relay0_id, slot_index=handle.slot_index)
+            return relay0_id
+
+        with (
+            patch.object(session_broker, "SHARED_TMP", str(self.root)),
+            patch.object(session_broker, "_verify_pod_with_containers", return_value=(pod_id, [])),
+            patch.object(session_broker, "_ensure_containers_idle"),
+            patch.object(session_broker, "_start_and_verify_slot_relay", side_effect=fake_start_slot),
+            patch.object(session_broker, "_remove_container_verified", side_effect=lambda cid: removed.append(cid)),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "slot 1 boom"):
+                session_broker._run_multi_slot_session(
+                    spec, plan, {"openai": _RollbackAdapter()}, rb_root,
+                    threading.Event(), term, cleanup_state,
+                )
+        self.assertEqual(removed, [relay0_id])
+        self.assertEqual(slot0_exits, [0])
+        self.assertTrue(cleanup_state["clean"])
+
+    def test_gate4_launcher_mini_managed_mode_symlink_config_and_pod_relays(self):
+        repo = Path(__file__).resolve().parents[1]
+        script = repo / "oc-sandbox"
+        stub_dir = self.root / "stubs"
+        stub_dir.mkdir(mode=0o700)
+        podman_log = self.root / "podman.log"
+
+        # Build safe stubbed podman + systemctl + editor binaries inside scratch tmp.
+        fake_editor = stub_dir / "fake-editor"
+        fake_editor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_editor.chmod(0o755)
+
+        fake_systemctl = stub_dir / "systemctl"
+        fake_systemctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_systemctl.chmod(0o755)
+
+        fake_podman = stub_dir / "podman"
+        fake_podman.write_text(
+            f"""#!/usr/bin/bash
+echo "podman $*" >> "{podman_log}"
+case "$1 $2" in
+  "--version "*) echo "podman version 5.0.0"; exit 0 ;;
+  "image inspect")
+    if [[ "$*" == *"oc.hash"* ]]; then echo ""; exit 1; fi
+    echo "{('d' * 64)}"; exit 0 ;;
+  "build "*) exit 0 ;;
+  "volume exists") exit 0 ;;
+  "pod exists")
+    if [[ -n "${{STUB_POD_EXISTS_RC:-}}" ]]; then exit "$STUB_POD_EXISTS_RC"; fi
+    if [[ -n "${{STUB_POD_PRESENT:-}}" && "$3" == "oc" ]]; then exit 0; fi
+    exit 1 ;;
+  "pod inspect")
+    if [[ "$*" == *"oc.ports"* ]]; then echo ""; exit 0; fi
+    if [[ "$*" == *"PortBindings"* ]]; then echo "{{}}"; exit 0; fi
+    if [[ "$*" == *"oc.podcfg"* ]]; then echo "v1|"; exit 0; fi
+    if [[ "$*" == *".Containers"* ]]; then printf '%b' "${{STUB_POD_CONTAINERS:-}}"; exit 0; fi
+    exit 0 ;;
+  "pod create"|"pod rm"|"pod ls") exit 0 ;;
+  "volume ls"|"secret ls") exit 0 ;;
+  "container inspect")
+    target="${{@: -1}}"
+    if [[ "$*" == *"oc.role"* ]]; then
+      if [[ "$target" == *-relay-* ]]; then echo "provider-relay"; exit 0; fi
+      echo ""; exit 0
+    fi
+    if [[ "$*" == *".State.Status"* ]]; then
+      if [[ -n "${{STUB_RUNNING_RELAY:-}}" && "$target" == "$STUB_RUNNING_RELAY" ]]; then echo "running"; exit 0; fi
+      if [[ "$target" == "oc-chromium" ]]; then echo "running"; exit 0; fi
+      exit 1
+    fi
+    if [[ "$*" == *".Image"* && "$target" == "oc-chromium" ]]; then echo "{('d' * 64)}"; exit 0; fi
+    exit 1 ;;
+  "exec oc-chromium") exit 0 ;;
+  "run "*) exit 0 ;;
+  "create "*) echo "{('e' * 64)}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+""",
+            encoding="utf-8",
+        )
+        fake_podman.chmod(0o755)
+
+        def _prepare_home(name: str) -> tuple[Path, dict]:
+            h = self.root / name
+            h.mkdir(mode=0o700)
+            (h / ".oh-my-zsh" / "custom" / "plugins" / "zsh-vi-mode").mkdir(parents=True, mode=0o700)
+            state_dir = h / ".local" / "share" / "oc-sandbox"
+            pol_dir = state_dir / "policy"
+            pol_dir.mkdir(parents=True, mode=0o700)
+            # Pre-seed policy installed digest so pkexec/sudo is never invoked.
+            cil_text = script.read_text(encoding="utf-8")
+            start = cil_text.index("; SELinux type for the sandboxed Chromium container only")
+            end = cil_text.index("\nPOL\n", start)
+            import hashlib
+            pol_hash = hashlib.sha256((cil_text[start:end] + "\n").encode("utf-8")).hexdigest()[:16]
+            (pol_dir / "installed").write_text(pol_hash + "\n", encoding="utf-8")
+            env = {
+                "PATH": f"{stub_dir}:/usr/bin:/bin",
+                "HOME": str(h),
+                "OC_CHROMIUM_MODE": "headless",
+                "OC_CODE_BIN": str(fake_editor),
+                "OC_BCOMPARE_BIN": str(fake_editor),
+                "OPENAI_API_KEY": "sk-test-never-forward",
+            }
+            return h, env
+
+        # 1. Bare `--mini` with zero provider config/state MUST enter managed mode (no updater, no ambient API key).
+        podman_log.write_text("", encoding="utf-8")
+        _, env1 = _prepare_home("mini_clean_home")
+        res1 = subprocess.run(
+            ["bash", str(script), "--mini"],
+            env=env1, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(res1.returncode, 2, res1.stderr)
+        self.assertIn("attended foreground workstation terminal", res1.stderr)
+        log1 = podman_log.read_text(encoding="utf-8")
+        self.assertNotIn("OPENAI_API_KEY", log1)
+        self.assertNotIn("oc-opencode-update", log1)
+        self.assertIn("oc-openai-relay", log1)
+
+        # 2. Symlinked $HOME/.config/oc-sandbox pointing outside $SB MUST enter managed mode (never silent legacy fallback).
+        podman_log.write_text("", encoding="utf-8")
+        h2, env2 = _prepare_home("symlink_cfg_home")
+        target_empty = self.root / "empty_target_cfg"
+        target_empty.mkdir(mode=0o700)
+        (h2 / ".config").mkdir(mode=0o700)
+        (h2 / ".config" / "oc-sandbox").symlink_to(target_empty)
+        res2 = subprocess.run(
+            ["bash", str(script)],
+            env=env2, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(res2.returncode, 2, res2.stderr)
+        self.assertIn("attended foreground workstation terminal", res2.stderr)
+
+        # 3. pod_relays / any_relay_running: running `oc-relay-0` blocks `-r -n`, and exact `pod inspect` is used.
+        podman_log.write_text("", encoding="utf-8")
+        _, env3 = _prepare_home("relay_busy_home")
+        env3["OC_OPENCODE_VERSION"] = "keep"
+        env3["STUB_POD_PRESENT"] = "1"
+        env3["STUB_POD_CONTAINERS"] = "oc-chromium\\noc-relay-0\\n"
+        env3["STUB_RUNNING_RELAY"] = "oc-relay-0"
+        res3 = subprocess.run(
+            ["bash", str(script), "-r", "-n"],
+            env=env3, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(res3.returncode, 1, res3.stderr)
+        self.assertIn("Provider relay is running in instance 'default'", res3.stderr)
+        log3 = podman_log.read_text(encoding="utf-8")
+        self.assertNotIn("ps -a --filter pod=", log3)
+        self.assertIn("pod inspect oc --format {{range .Containers}}", log3)
+
+        # 4. pod_relays fail-closed: when `podman pod exists oc` fails (rc=125), any_relay_running blocks `-r -n`.
+        _, env4 = _prepare_home("relay_err_home")
+        # Check pod_relays directly via a subshell sourcing just the helper behavior.
+        check_rc = subprocess.run(
+            [
+                "bash", "-c",
+                'eval "$(sed -n "/^cstate()/,/^any_relay_running()/p" "$1")"; '
+                'eval "$(sed -n "/^any_relay_running()/,/^}/p" "$1")"; '
+                'pm() { podman "$@"; }; '
+                'any_relay_running oc',
+                "_", str(script),
+            ],
+            env={**env4, "STUB_POD_EXISTS_RC": "125"},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(check_rc.returncode, 0, "any_relay_running must fail closed (return 0) on pod exists error")
 
 
 if __name__ == "__main__":

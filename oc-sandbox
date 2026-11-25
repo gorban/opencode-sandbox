@@ -389,7 +389,10 @@ if (( DELETE || EXEC || LIST || LISTKEYS )) && { (( PG || DIND || ${#PORT_ARGS[@
 fi
 
 MANAGED_MODE=0
-if (( PROVIDER_SET )) || [[ -e $PROVIDER_CONF_DIR/providers.toml || -L $PROVIDER_CONF_DIR/providers.toml || -e $PROVIDER_CONF_DIR/openai || -L $PROVIDER_CONF_DIR/openai ]]; then
+if (( PROVIDER_SET || UI_MODE_SET )) \
+  || [[ -L $HOME/.config || -L $HOME/.config/oc-sandbox \
+        || -e $PROVIDER_CONF_DIR/providers.toml || -L $PROVIDER_CONF_DIR/providers.toml \
+        || -e $PROVIDER_CONF_DIR/openai || -L $PROVIDER_CONF_DIR/openai ]]; then
   MANAGED_MODE=1
 fi
 
@@ -731,10 +734,13 @@ prune_images() {  # remove our recorded builds that are now untagged and unused;
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 cstate() { pm container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo none; }
 pod_relays() {  # pod name -> one relay container name per line (legacy + multi-slot provider-relay)
-  local pod=$1 seen=" " c role lines
-  if pm pod exists "$pod" >/dev/null 2>&1; then
-    lines=$(pm ps -a --filter "pod=$pod" --format '{{.Names}}' 2>/dev/null) || return 1
+  local pod=$1 seen=" " c role lines rc=0
+  pm pod exists "$pod" >/dev/null 2>&1 || rc=$?
+  (( rc == 0 || rc == 1 )) || return 1
+  if (( rc == 0 )); then
+    lines=$(pm pod inspect "$pod" --format '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}' 2>/dev/null) || return 1
     while IFS= read -r c; do
+      c=${c#/}
       [[ -n $c ]] || continue
       role=$(pm container inspect --format '{{index .Config.Labels "oc.role"}}' "$c" 2>/dev/null || true)
       if [[ $c == "$pod-openai-relay" || $c == "$pod-relay-"[0-9]* || $role == provider-relay || $role == openai-relay ]]; then
@@ -2110,10 +2116,6 @@ while IFS= read -r stale_relay; do
   pm rm -f "$stale_relay" >/dev/null 2>&1 || true
 done <<<"$stale_relays"
 if [[ $(cstate "$AGENT") == running ]]; then
-  if [[ $CLI_UI_MODE == mini ]]; then
-    release_lifecycle_lock
-    die "OpenCode is already running in instance '$ILABEL'; exit it first to launch with --mini"
-  fi
   log "OpenCode is already running in instance '$ILABEL'; setup is up to date (acting like -n)."
   echo "Open a shell in it with:  ${0##*/}${INST:+ -i $INST} -x"
   release_lifecycle_lock
@@ -2131,8 +2133,6 @@ if [[ $(cstate "$DINDC") != none ]]; then
   envargs+=(-v "$DINDRUN":/run/dind -e DOCKER_HOST=unix:///run/dind/podman.sock
             -e CONTAINER_HOST=unix:///run/dind/podman.sock)
 fi
-agent_cmd=()
-if [[ $CLI_UI_MODE == mini ]]; then agent_cmd=(mini); fi
 log "Preparing OpenCode (instance '$ILABEL') in /sandbox/$CWD"
 # Create while the lifecycle barrier is held; attach only after releasing it.
 # No ':Z' on the shared mounts: relabel_shared already gave them this level (see above).
@@ -2143,7 +2143,7 @@ agent_id=$(pm create -it --rm --name "$AGENT" --pod "$POD" --label oc.sandbox=1 
   -v "$HOMEVOL":/root \
   -w "/sandbox/$CWD" \
   "${envargs[@]}" \
-  "$AGENT_IMG" ${agent_cmd[@]+"${agent_cmd[@]}"})
+  "$AGENT_IMG")
 [[ $agent_id =~ ^[0-9a-f]{64}$ ]] || die "Podman did not return a complete agent container ID"
 release_lifecycle_lock
 log "Launching OpenCode (instance '$ILABEL') in /sandbox/$CWD"

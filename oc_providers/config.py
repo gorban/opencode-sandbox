@@ -72,13 +72,14 @@ def default_config_dir() -> Path:
     """Resolve ~/.config/oc-sandbox strictly from the workstation account home."""
     pw_home = _account_home()
     env_home = os.environ.get("HOME")
-    if env_home:
-        try:
-            caller_home = Path(env_home).resolve(strict=True)
-        except OSError:
-            raise ProviderConfigError(_ERR_UNTRUSTED, "untrusted HOME directory") from None
-        if caller_home != pw_home:
-            raise ProviderConfigError(_ERR_UNTRUSTED, "HOME does not match workstation account")
+    if not env_home or not Path(env_home).is_absolute():
+        raise ProviderConfigError(_ERR_UNTRUSTED, "HOME must be set to the workstation account directory")
+    try:
+        caller_home = Path(env_home).resolve(strict=True)
+    except OSError:
+        raise ProviderConfigError(_ERR_UNTRUSTED, "untrusted HOME directory") from None
+    if caller_home != pw_home:
+        raise ProviderConfigError(_ERR_UNTRUSTED, "HOME does not match workstation account")
     return pw_home / ".config" / "oc-sandbox"
 
 
@@ -88,12 +89,15 @@ def _inside_sandbox(path: Path, sandbox: Path, *, check_contains: bool = True) -
     return check_contains and sandbox.is_relative_to(path)
 
 
+_STICKY_TMP = Path("/tmp")  # NOSONAR(S5443) — checks sticky-bit ancestor during O_NOFOLLOW walk
+
+
 def _check_dir_stat(info: os.stat_result, *, current: Path, is_target: bool, uid: int) -> None:
     if not stat.S_ISDIR(info.st_mode):
         raise ProviderConfigError(_ERR_UNTRUSTED, "provider config parent is not a directory")
     sticky_tmp = (
         not is_target
-        and current == Path("/tmp")
+        and current == _STICKY_TMP
         and info.st_uid in (0, 65534)
         and bool(info.st_mode & stat.S_ISVTX)
     )
@@ -190,11 +194,15 @@ def _validate_cli_path(kind: str, raw_path: object, *, sandbox: Path) -> str | N
         return None
     if not PROVIDER_DESCRIPTORS[kind].supports_cli_path:
         raise ProviderConfigError(_ERR_INVALID, f"cli_path is not supported for provider '{kind}'")
-    if type(raw_path) is not str or not raw_path.startswith("/") or any(ch in raw_path for ch in "\x00\r\n"):
+    if (
+        type(raw_path) is not str
+        or not raw_path.startswith("/")
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_path)
+    ):
         raise ProviderConfigError(_ERR_INVALID, "cli_path must be a clean absolute path")
     parts = [part for part in raw_path.split("/") if part]
-    if not parts or any(part in (".", "..") for part in parts):
-        raise ProviderConfigError(_ERR_INVALID, "cli_path must be normalized without '.' or '..'")
+    if not parts or any(part in (".", "..") for part in parts) or raw_path != "/" + "/".join(parts):
+        raise ProviderConfigError(_ERR_INVALID, "cli_path must be normalized without '.' or '..' or duplicate slashes")
     candidate = Path(raw_path)
     resolved = Path(os.path.realpath(raw_path))
     if _inside_sandbox(candidate, sandbox) or _inside_sandbox(resolved, sandbox):
@@ -230,6 +238,24 @@ def _parse_single_instance(
     )
 
 
+def _parse_provider_kind(
+    kind: str, kind_table: object, *, sandbox: Path
+) -> list[ProviderInstanceSpec]:
+    if kind not in PROVIDER_DESCRIPTORS or type(kind_table) is not dict:
+        raise ProviderConfigError(_ERR_INVALID, f"unsupported provider table '{kind}'")
+    seen_normalized: set[str] = set()
+    parsed: list[ProviderInstanceSpec] = []
+    for label, entry in sorted(kind_table.items()):
+        if not is_valid_instance_label(label):
+            raise ProviderConfigError(_ERR_INVALID, f"invalid instance label '{label}'")
+        normalized = label.lower().replace("_", "-")
+        if normalized in seen_normalized:
+            raise ProviderConfigError(_ERR_INVALID, f"colliding instance label '{label}'")
+        seen_normalized.add(normalized)
+        parsed.append(_parse_single_instance(kind, label, entry, sandbox=sandbox))  # type: ignore[arg-type]
+    return parsed
+
+
 def _parse_providers(raw_providers: object, *, sandbox: Path) -> tuple[ProviderInstanceSpec, ...]:
     if raw_providers is None:
         return ()
@@ -237,17 +263,7 @@ def _parse_providers(raw_providers: object, *, sandbox: Path) -> tuple[ProviderI
         raise ProviderConfigError(_ERR_INVALID, "[providers] must be a table")
     instances: list[ProviderInstanceSpec] = []
     for kind, kind_table in sorted(raw_providers.items()):
-        if kind not in PROVIDER_DESCRIPTORS or type(kind_table) is not dict:
-            raise ProviderConfigError(_ERR_INVALID, f"unsupported provider table '{kind}'")
-        seen_normalized: set[str] = set()
-        for label, entry in sorted(kind_table.items()):
-            if not is_valid_instance_label(label):
-                raise ProviderConfigError(_ERR_INVALID, f"invalid instance label '{label}'")
-            normalized = label.lower().replace("_", "-")
-            if normalized in seen_normalized:
-                raise ProviderConfigError(_ERR_INVALID, f"colliding instance label '{label}'")
-            seen_normalized.add(normalized)
-            instances.append(_parse_single_instance(kind, label, entry, sandbox=sandbox))  # type: ignore[arg-type]
+        instances.extend(_parse_provider_kind(kind, kind_table, sandbox=sandbox))
     enabled_count = sum(1 for item in instances if item.enabled)
     if enabled_count > MAX_PROVIDER_SLOTS:
         raise ProviderConfigError(

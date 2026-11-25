@@ -9,10 +9,12 @@ import secrets
 from oc_providers.contracts import (
     ExposureHoldSummary,
     InstancePreflight,
+    PersistedSelection,
     ProviderId,
     ProviderInstanceSpec,
     ProviderIntegrityError,
     ReadinessState,
+    SelectionState,
     SlotHandle,
     is_valid_instance_label,
 )
@@ -29,9 +31,12 @@ from .session_broker import (
     build_openai_provider_entry,
 )
 
+_ERR_PROFILE_INTEGRITY = "OpenAI profile registry failed integrity checks."
+
 _INTEGRITY_REASONS = frozenset({
     Reason.EXPOSURE_UNAVAILABLE,
     Reason.PROFILE_CONFLICT,
+    Reason.PROOF_FAILED,
     Reason.PROVIDER_DATA,
     Reason.PYJWT_REQUIRED,
     Reason.PLACEMENT,
@@ -66,18 +71,39 @@ class OpenAISessionAdapter:
         try:
             return backend.active_label()
         except ProfileError as exc:
-            raise ProviderIntegrityError(exc.code, "OpenAI profile registry failed integrity checks.") from None
+            raise ProviderIntegrityError(exc.code, _ERR_PROFILE_INTEGRITY) from None
+
+    def selection_state(self) -> PersistedSelection:
+        backend = self._get_backend()
+        try:
+            view = backend.profiles.snapshot()
+        except ProfileError as exc:
+            raise ProviderIntegrityError(exc.code, _ERR_PROFILE_INTEGRITY) from None
+        if view.active is not None and not view.active.retiring:
+            return PersistedSelection(SelectionState.SELECTED, label=view.active.label)
+        if view.saved or view.unpublished:
+            return PersistedSelection(SelectionState.DISCONNECTED)
+        return PersistedSelection(SelectionState.UNSET)
 
     def discover_instances(self) -> tuple[ProviderInstanceSpec, ...]:
         backend = self._get_backend()
         try:
             view = backend.profiles.snapshot()
         except ProfileError as exc:
-            raise ProviderIntegrityError(exc.code, "OpenAI profile registry failed integrity checks.") from None
+            raise ProviderIntegrityError(exc.code, _ERR_PROFILE_INTEGRITY) from None
 
         seen_normalized: set[str] = set()
         discovered: list[ProviderInstanceSpec] = []
         for profile in (*view.saved, *view.unpublished):
+            if profile.retiring:
+                try:
+                    conn = backend._connection(profile.directory)
+                    if conn.status() == "disconnected" and not conn.has_active_leases():
+                        continue
+                except ConnectionError as exc:
+                    raise ProviderIntegrityError(
+                        exc.code, "OpenAI credential store failed integrity checks."
+                    ) from None
             if not is_valid_instance_label(profile.label):
                 raise ProviderIntegrityError(
                     "invalid_saved_label",
@@ -136,11 +162,10 @@ class OpenAISessionAdapter:
             return InstancePreflight(spec=instance, readiness=ReadinessState.UNQUALIFIED)
 
         backend = self._get_backend()
-        exposure_hold = self._inspect_shared_exposure(backend)
         try:
             profile, conn, binding = backend.profile_connection(instance.label)
         except ProfileError as exc:
-            raise ProviderIntegrityError(exc.code, "OpenAI profile registry failed integrity checks.") from None
+            raise ProviderIntegrityError(exc.code, _ERR_PROFILE_INTEGRITY) from None
         except RouteUnavailable as exc:
             if exc.reason in _INTEGRITY_REASONS:
                 raise ProviderIntegrityError(exc.reason.value, f"OpenAI integrity check failed ({exc.reason.value}).") from None
@@ -148,6 +173,7 @@ class OpenAISessionAdapter:
                 return InstancePreflight(spec=instance, readiness=ReadinessState.DISCONNECTED)
             return InstancePreflight(spec=instance, readiness=ReadinessState.NEEDS_VERIFY)
 
+        exposure_hold = self._inspect_shared_exposure(backend)
         models = self._preflight_models(conn, binding)
         if not models:
             return InstancePreflight(spec=instance, readiness=ReadinessState.NEEDS_VERIFY)
@@ -156,7 +182,7 @@ class OpenAISessionAdapter:
             readiness=ReadinessState.READY,
             models=models,
             exposure_hold=exposure_hold,
-            billing_summary="subscription (no verified spending ceiling)",
+            route_policy="subscription (no verified spending ceiling)",
             handle=_OpenAISlotTarget(profile=profile, conn=conn, binding=binding),
         )
 
@@ -249,7 +275,19 @@ class OpenAISessionAdapter:
                 build_relay_args=build_relay_args,
             )
         finally:
+            cleanup_error: Exception | None = None
+            try:
+                job.revoke()
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
             if broker is not None:
-                broker.close()
-            job.revoke()
-            lease_cm.__exit__(None, None, None)
+                try:
+                    broker.close()
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
+            try:
+                lease_cm.__exit__(None, None, None)
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
+            if cleanup_error is not None:
+                raise cleanup_error

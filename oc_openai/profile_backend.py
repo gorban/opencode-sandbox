@@ -160,8 +160,7 @@ class ProfileBackend:
         return _fence()
 
     @contextmanager
-    def profile_session_lease(self, label: str, selection_epoch: str, binding, job, *, directory: Path, client_id: str):
-        """Acquire a session lease for a named published profile atomically under profiles.lock."""
+    def _acquire_session_lease(self, acquire_via, binding, job):
         if not self._reviewed:
             raise RouteUnavailable(Reason.QUALIFICATION)
 
@@ -174,9 +173,7 @@ class ProfileBackend:
                 raise _mapped_connection_error(error) from None
 
         try:
-            lease_cm, lease = self.profiles.with_profile(
-                label, selection_epoch, acquire, directory=directory, client_id=client_id,
-            )
+            lease_cm, lease = acquire_via(acquire)
         except ProfileError:
             raise RouteUnavailable(Reason.CONNECTION_CHANGED) from None
 
@@ -194,6 +191,16 @@ class ProfileBackend:
                 if exc[0] is None:
                     raise mapped from None
                 raise mapped from exc[1]
+
+    def profile_session_lease(self, label: str, selection_epoch: str, binding, job, *, directory: Path, client_id: str):
+        """Acquire a session lease for a named published profile atomically under profiles.lock."""
+        return self._acquire_session_lease(
+            lambda acquire: self.profiles.with_profile(
+                label, selection_epoch, acquire, directory=directory, client_id=client_id,
+            ),
+            binding,
+            job,
+        )
 
     def selected_fence(self, label, selection_epoch):
         """Return a context manager holding profiles/state.lock while (label, selection_epoch) is active."""
@@ -214,39 +221,13 @@ class ProfileBackend:
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
 
-    @contextmanager
     def session_lease(self, label, selection_epoch, binding, job):
         """Acquire a concurrent session lease atomically under the profile registry mutex."""
-        if not self._reviewed:
-            raise RouteUnavailable(Reason.QUALIFICATION)
-
-        def acquire(profile):
-            conn = self._connection(profile.directory)
-            lease_cm = conn.session_lease(binding, job)
-            try:
-                return lease_cm, lease_cm.__enter__()
-            except ConnectionError as error:
-                raise _mapped_connection_error(error) from None
-
-        try:
-            lease_cm, lease = self.profiles.with_selected(label, selection_epoch, acquire)
-        except ProfileError:
-            raise RouteUnavailable(Reason.CONNECTION_CHANGED) from None
-
-        exc = (None, None, None)
-        try:
-            yield lease
-        except BaseException:
-            exc = sys.exc_info()
-            raise
-        finally:
-            try:
-                lease_cm.__exit__(*exc)
-            except ConnectionError as error:
-                mapped = _mapped_connection_error(error)
-                if exc[0] is None:
-                    raise mapped from None
-                raise mapped from exc[1]
+        return self._acquire_session_lease(
+            lambda acquire: self.profiles.with_selected(label, selection_epoch, acquire),
+            binding,
+            job,
+        )
 
     def connect(self, label, *, handoff=None):
         if not self._reviewed:
