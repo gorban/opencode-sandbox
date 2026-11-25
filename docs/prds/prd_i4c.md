@@ -41,6 +41,18 @@ the ordinary workstation login, and worker and relay denial require separate qua
 Live text also requires build-specific evidence that native and provider-side tools are disabled
 and that attempted calls are observable.
 
+The [offline text proxy spike](spikes/i4c/text-proxy.md) extends the synthetic transcript through one
+`session/prompt` from a pinned OpenCode orchestrator worker. It keeps ACP on the workstation and
+holds text through terminal completion, evidence from the bundled peer and verified retirement.
+The Gate 1 walkthrough cleared both reviews at SHA-256
+`83f1d8bc608d496905382a47f4f63c788c0eae080bc27e29da5348a2bae5d839`.
+The readiness-only check and production launch commands retain their existing scope.
+
+- [x] Demonstrate one text-only OpenCode turn through the bundled ACP peer
+  (`codex/antigravity-acp-text-proxy`). The pinned worker returned exact `ok` in devbox.
+  The peer counted one prompt, replay was refused, and cleanup was verified. Offline controls
+  observed zero prompts when revocation won before admission and zero answer bytes when
+  the peer emitted early text or a callback.
 - [ ] Qualify the pinned `agy` binary, rootless private provider home and keyring, bounded ACP
   channel, and separately scoped enrollment and execution egress. Verify the provider cannot
   access ordinary workstation credentials. Verify that the worker and relay get only the approved
