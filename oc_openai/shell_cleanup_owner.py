@@ -32,9 +32,53 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 
 
 PROOF_OWNER_LABEL = "io.oc-sandbox.shell-proof"
+_DEFAULT_GRANT_LOCK_TIMEOUT = 5.0
+_WORKTREE_TEARDOWN_SCRIPT = (
+    "import errno, os, stat, sys\n"
+    "leaf, dev_s, ino_s, wt_root = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]\n"
+    "want = (int(dev_s), int(ino_s))\n"
+    "def _clear_dir_fd(dir_fd):\n"
+    "    for entry in os.listdir(dir_fd):\n"
+    "        st = os.stat(entry, dir_fd=dir_fd, follow_symlinks=False)\n"
+    "        if stat.S_ISDIR(st.st_mode):\n"
+    "            child_fd = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)\n"
+    "            try:\n"
+    "                _clear_dir_fd(child_fd)\n"
+    "            finally:\n"
+    "                os.close(child_fd)\n"
+    "            os.rmdir(entry, dir_fd=dir_fd)\n"
+    "        else:\n"
+    "            os.unlink(entry, dir_fd=dir_fd)\n"
+    "wt_fd = os.open(wt_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n"
+    "try:\n"
+    "    try:\n"
+    "        leaf_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=wt_fd)\n"
+    "    except FileNotFoundError:\n"
+    "        raise SystemExit(0)\n"
+    "    except OSError as exc:\n"
+    "        if exc.errno in (errno.ENOTDIR, errno.ELOOP):\n"
+    "            raise SystemExit(2)\n"
+    "        raise\n"
+    "    try:\n"
+    "        fst = os.fstat(leaf_fd)\n"
+    "        if not stat.S_ISDIR(fst.st_mode) or (fst.st_dev, fst.st_ino) != want:\n"
+    "            raise SystemExit(2)\n"
+    "        _clear_dir_fd(leaf_fd)\n"
+    "        try:\n"
+    "            st2 = os.stat(leaf, dir_fd=wt_fd, follow_symlinks=False)\n"
+    "        except FileNotFoundError:\n"
+    "            raise SystemExit(2)\n"
+    "        if not stat.S_ISDIR(st2.st_mode) or (st2.st_dev, st2.st_ino) != want:\n"
+    "            raise SystemExit(2)\n"
+    "    finally:\n"
+    "        os.close(leaf_fd)\n"
+    "finally:\n"
+    "    os.close(wt_fd)\n"
+)
 _HOST_BRIDGE = "/usr/bin/host-spawn"
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _RUN_ID_RE = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
@@ -393,9 +437,25 @@ def _atomic_fsync_write_dir_fd(dir_fd: int, name: str, data: bytes) -> None:
         raise
 
 
+def _try_flock_with_timeout(lock_fd: int, timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+
 def _acquire_pinned_grant_lock(
-    grant_fd: int, want_lock_dev: object, want_lock_ino: object,
-) -> tuple[bool, int | None]:
+    grant_fd: int,
+    want_lock_dev: object,
+    want_lock_ino: object,
+    *,
+    timeout: float = _DEFAULT_GRANT_LOCK_TIMEOUT,
+) -> tuple[str, int | None]:
     has_recorded_lock = type(want_lock_dev) is int and type(want_lock_ino) is int
     lock_fd: int | None = None
     try:
@@ -409,20 +469,27 @@ def _acquire_pinned_grant_lock(
             or (linfo.st_dev, linfo.st_ino) != (want_lock_dev, want_lock_ino)
         ):
             os.close(lock_fd)
-            return False, None
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        return True, lock_fd
+            return "mismatch", None
+        if not _try_flock_with_timeout(lock_fd, timeout):
+            os.close(lock_fd)
+            return "timeout", None
+        return "locked", lock_fd
     except FileNotFoundError:
-        return (not has_recorded_lock), None
+        return ("unlocked_absent" if not has_recorded_lock else "mismatch"), None
     except OSError:
         if lock_fd is not None:
             with suppress(OSError):
                 os.close(lock_fd)
-        return False, None
+        return "error", None
 
 
-def _revoke_pinned_grant_dir(slot_root_fd: int | None, entry: dict[str, object]) -> None:
-    """Revoke grant/state strictly through pinned root, grant, and lock identities."""
+def _revoke_pinned_grant_dir(
+    slot_root_fd: int | None,
+    entry: dict[str, object],
+    *,
+    lock_timeout: float = _DEFAULT_GRANT_LOCK_TIMEOUT,
+) -> str:
+    """Revoke grant/state strictly through pinned root, grant, and bounded lock identities."""
     want_dev, want_ino = entry.get("slot_root_dev"), entry.get("slot_root_ino")
     want_gdev, want_gino = entry.get("grant_dev"), entry.get("grant_ino")
     if (
@@ -432,17 +499,17 @@ def _revoke_pinned_grant_dir(slot_root_fd: int | None, entry: dict[str, object])
         or type(want_gdev) is not int
         or type(want_gino) is not int
     ):
-        return
+        return "skipped"
     try:
         rinfo = os.fstat(slot_root_fd)
     except OSError:
-        return
+        return "error"
     if (rinfo.st_dev, rinfo.st_ino) != (want_dev, want_ino) or rinfo.st_uid != os.geteuid():
-        return
+        return "skipped"
     try:
         grant_fd = os.open("grant", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=slot_root_fd)
     except OSError:
-        return
+        return "skipped"
     try:
         ginfo = os.fstat(grant_fd)
         if (
@@ -450,13 +517,17 @@ def _revoke_pinned_grant_dir(slot_root_fd: int | None, entry: dict[str, object])
             or ginfo.st_uid != os.geteuid()
             or (ginfo.st_dev, ginfo.st_ino) != (want_gdev, want_gino)
         ):
-            return
-        ok_lock, lock_fd = _acquire_pinned_grant_lock(grant_fd, entry.get("lock_dev"), entry.get("lock_ino"))
-        if not ok_lock:
-            return
+            return "skipped"
+        lock_status, lock_fd = _acquire_pinned_grant_lock(
+            grant_fd, entry.get("lock_dev"), entry.get("lock_ino"), timeout=lock_timeout,
+        )
+        if lock_status not in ("locked", "unlocked_absent"):
+            return lock_status
         try:
-            with suppress(OSError):
-                _atomic_fsync_write_dir_fd(grant_fd, "state", b"revoked\n")
+            _atomic_fsync_write_dir_fd(grant_fd, "state", b"revoked\n")
+            return "revoked"
+        except OSError:
+            return "error"
         finally:
             if lock_fd is not None:
                 with suppress(OSError):
@@ -568,7 +639,13 @@ class JournalSpec:
 class _OwnershipJournal:
     """Track verified owned resources durably and perform exact ID/membership-gated teardown."""
 
-    def __init__(self, spec: JournalSpec, *, podman_runner=_run_podman):
+    def __init__(
+        self,
+        spec: JournalSpec,
+        *,
+        podman_runner=_run_podman,
+        grant_lock_timeout: float = _DEFAULT_GRANT_LOCK_TIMEOUT,
+    ):
         self.run_id = spec.run_id
         self.instance = spec.instance
         self.pod_name = spec.pod_name
@@ -579,6 +656,7 @@ class _OwnershipJournal:
         self.agent_image_id = spec.agent_image_id
         self.journal_path = spec.journal_path
         self._pm = podman_runner
+        self._grant_lock_timeout = grant_lock_timeout
         self._lock_helper: Path | None = None
         self._lock_helper_source: str | None = None
         self._state_dir: Path | None = None
@@ -994,7 +1072,13 @@ class _OwnershipJournal:
         status = entry.get("status")
         fds = self._pinned_slot_fds.get(slot_key)
         root_fd = fds[1] if fds is not None else None
-        _revoke_pinned_grant_dir(root_fd, entry)
+        revoke_status = _revoke_pinned_grant_dir(
+            root_fd, entry, lock_timeout=self._grant_lock_timeout,
+        )
+        if revoke_status == "timeout":
+            self.ownership_uncertain = True
+            self.cleanup_errors.append(f"grant_lock_timeout:{slot_key}")
+            self._persist()
         if status == _STATUS_CREATED:
             cid = entry.get("cid")
             if not isinstance(cid, str) or not _HEX64.fullmatch(cid):
@@ -1117,40 +1201,10 @@ class _OwnershipJournal:
         if not self.worktree_owned or self.worktree_dev_ino is None:
             return
         want_dev, want_ino = self.worktree_dev_ino
-        script = (
-            "import os, stat, sys\n"
-            "leaf, dev_s, ino_s = sys.argv[1], sys.argv[2], sys.argv[3]\n"
-            "want = (int(dev_s), int(ino_s))\n"
-            "def _clear_dir_fd(dir_fd):\n"
-            "    for entry in os.listdir(dir_fd):\n"
-            "        st = os.stat(entry, dir_fd=dir_fd, follow_symlinks=False)\n"
-            "        if stat.S_ISDIR(st.st_mode):\n"
-            "            child_fd = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)\n"
-            "            try:\n"
-            "                _clear_dir_fd(child_fd)\n"
-            "            finally:\n"
-            "                os.close(child_fd)\n"
-            "            os.rmdir(entry, dir_fd=dir_fd)\n"
-            "        else:\n"
-            "            os.unlink(entry, dir_fd=dir_fd)\n"
-            "wt_fd = os.open('/sandbox/wt', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n"
-            "try:\n"
-            "    leaf_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=wt_fd)\n"
-            "    try:\n"
-            "        fst = os.fstat(leaf_fd)\n"
-            "        if not stat.S_ISDIR(fst.st_mode) or (fst.st_dev, fst.st_ino) != want:\n"
-            "            raise SystemExit(2)\n"
-            "        _clear_dir_fd(leaf_fd)\n"
-            "    finally:\n"
-            "        os.close(leaf_fd)\n"
-            "    st2 = os.stat(leaf, dir_fd=wt_fd, follow_symlinks=False)\n"
-            "    if not stat.S_ISDIR(st2.st_mode) or (st2.st_dev, st2.st_ino) != want:\n"
-            "        raise SystemExit(2)\n"
-            "    os.rmdir(leaf, dir_fd=wt_fd)\n"
-            "finally:\n"
-            "    os.close(wt_fd)\n"
-        )
         leaf = self.cwd.split("/", 1)[1]
+        # /sandbox/wt is shared and writable by any running sandbox agent container;
+        # exclusive control of renames under /sandbox/wt cannot be established, so clear
+        # only verified leaf_fd contents and preserve the directory itself (no name-based rmdir).
         res = self._pm(
             [
                 "run", "--rm", "--pull=never", "--network=none", "--http-proxy=false",
@@ -1159,11 +1213,15 @@ class _OwnershipJournal:
                 "--pids-limit=64", "--memory=128m",
                 "-v", f"{self.sandbox_dir}:/sandbox",
                 "--entrypoint", "python3",
-                self.agent_image_id, "-I", "-c", script, leaf, str(want_dev), str(want_ino),
+                self.agent_image_id, "-I", "-c", _WORKTREE_TEARDOWN_SCRIPT,
+                leaf, str(want_dev), str(want_ino), "/sandbox/wt",
             ],
             timeout=20.0,
         )
-        if res.returncode != 0:
+        if res.returncode == 2:
+            self.ownership_uncertain = True
+            self.cleanup_errors.append("worktree_identity_mismatch")
+        elif res.returncode != 0:
             self.cleanup_errors.append("worktree_remove_failed")
 
 

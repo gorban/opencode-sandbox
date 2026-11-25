@@ -120,6 +120,8 @@ _SAFE_DEC_MODES = frozenset({"1", "7", "12", "25", "1000", "1002", "1003", "1004
 _CURSOR_MOVES = frozenset({"H", "f", "A", "B", "C", "D", "E", "F", "G", "d"})
 _EXACT_ASSISTANT_LINE_RE = re.compile(r"(?:[Aa]ssistant\s*:|[●◆▪■])\s*ok\Z")
 _USER_PREFIX_RE = re.compile(r"^(?:[Yy]ou\s*:|[Uu]ser\s*:|[>›❯])\s*")
+_PROMPT_WORDS_RE = re.compile(r"\s+".join(re.escape(w) for w in PROOF_PROMPT.split()))
+_EXACT_OK_WORD_RE = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(EXPECTED_REPLY)}(?![A-Za-z0-9_])")
 _BORDER_CHARS = " \t│┃┆┊║|"
 _ST_STRING_INTRODUCERS = frozenset({"P", "X", "^", "_"})
 _C1_ST_INTRODUCERS = frozenset({"\x90", "\x98", "\x9e", "\x9f"})
@@ -183,6 +185,9 @@ class _TerminalScreen:
     @property
     def is_certain(self) -> bool:
         return not self._uncertain and not self._pending and self._ctrl_state is None
+
+    def invalidate(self) -> None:
+        self._uncertain = True
 
     def _reset_sgr(self) -> None:
         self._concealed = False
@@ -456,6 +461,9 @@ class _TerminalScreen:
             self.row += 1
 
     def _put_char(self, ch: str) -> None:
+        if ch == "\ufffd" or 0x80 <= ord(ch) <= 0x9F:
+            self._uncertain = True
+            return
         if ch == "\r":
             self.col = 0
         elif ch == "\n":
@@ -996,6 +1004,26 @@ def _visible_assistant_reply_lines(lines: list[str], approved_model: str) -> Cou
     )
 
 
+def _non_prompt_line_counts(lines: list[str]) -> Counter[str]:
+    return Counter(
+        lines[idx]
+        for idx in range(len(lines))
+        if not _is_wrapped_prompt_tail(lines, idx)
+    )
+
+
+def _post_prompt_has_reply_text(post_prompt_text: str) -> bool:
+    if not post_prompt_text:
+        return False
+    cleaned_lines = [
+        _USER_PREFIX_RE.sub("", ln)
+        for ln in (_normalize_reply_line(r) for r in post_prompt_text.splitlines())
+        if ln
+    ]
+    without_prompt = _PROMPT_WORDS_RE.sub(" ", " ".join(cleaned_lines))
+    return _EXACT_OK_WORD_RE.search(without_prompt) is not None
+
+
 def _has_new_exact_reply(
     rendered: str,
     pre_prompt_lines: tuple[str, ...],
@@ -1003,12 +1031,17 @@ def _has_new_exact_reply(
     *,
     approved_model: str = "",
 ) -> bool:
-    if post_prompt_text is not None and not post_prompt_text:
+    if post_prompt_text is not None and not _post_prompt_has_reply_text(post_prompt_text):
         return False
     cur_lines = [ln for ln in (_normalize_reply_line(r) for r in rendered.splitlines()) if ln]
-    cur_replies = _visible_assistant_reply_lines(cur_lines, approved_model)
-    pre_replies = _visible_assistant_reply_lines(list(pre_prompt_lines), approved_model)
-    return bool(cur_replies - pre_replies)
+    pre_lines = list(pre_prompt_lines)
+    new_replies = _visible_assistant_reply_lines(cur_lines, approved_model) - _visible_assistant_reply_lines(
+        pre_lines, approved_model,
+    )
+    if not new_replies:
+        return False
+    new_non_prompt = _non_prompt_line_counts(cur_lines) - _non_prompt_line_counts(pre_lines)
+    return any(new_non_prompt[line] > 0 for line in new_replies)
 
 
 def _step_pty_driver(
@@ -1052,6 +1085,16 @@ def _step_pty_driver(
     return False
 
 
+def _feed_pty_bytes(screen: _TerminalScreen, decoder, data: bytes, *, final: bool = False) -> None:
+    try:
+        decoded = decoder.decode(data, final=final)
+    except UnicodeDecodeError:
+        screen.invalidate()
+        return
+    if decoded:
+        screen.feed(decoded)
+
+
 def _record_final_pty_reply(
     master_fd: int,
     screen: _TerminalScreen,
@@ -1062,10 +1105,10 @@ def _record_final_pty_reply(
 ) -> None:
     tail_chunk = _read_pty_bytes(master_fd, 0.05)
     if tail_chunk:
-        screen.feed(decoder.decode(tail_chunk, final=False))
+        _feed_pty_bytes(screen, decoder, tail_chunk, final=False)
         if state.prompt_sent:
             _append_bounded(post_prompt_buf, tail_chunk)
-    screen.feed(decoder.decode(b"", final=True))
+    _feed_pty_bytes(screen, decoder, b"", final=True)
     if not state.reply_observed and state.prompt_sent and proof_gate.exact_ok_delivered:
         post_text = strip_ansi(post_prompt_buf.decode("utf-8", errors="replace"))
         model_name = getattr(getattr(proof_gate, "approval", None), "approved_model", "")
@@ -1097,7 +1140,7 @@ def _drive_agent_pty(
     proc = subprocess.Popen(cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, env=env, close_fds=True)
     os.close(slave_fd)
     screen = _TerminalScreen(rows=32, cols=120)
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
     post_prompt_buf = bytearray()
     state = _PtyState()
     started = time.monotonic()
@@ -1107,7 +1150,7 @@ def _drive_agent_pty(
             if chunk is None:
                 break
             if chunk:
-                screen.feed(decoder.decode(chunk, final=False))
+                _feed_pty_bytes(screen, decoder, chunk, final=False)
                 if state.prompt_sent:
                     _append_bounded(post_prompt_buf, chunk)
             rendered = screen.render()

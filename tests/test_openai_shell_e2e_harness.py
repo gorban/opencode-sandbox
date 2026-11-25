@@ -3458,6 +3458,213 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             j_ok.teardown()
             self.assertEqual((grant_ok / "state").read_text(encoding="utf-8"), "revoked\n")
 
+    def test_reciprocal_g2_r6_pty_decoder_c1_bytes_and_footer_only_repaint(self) -> None:
+        import codecs
+
+        with tempfile.TemporaryDirectory(prefix="oc-g2-r6-pty-") as td_raw:
+            exp = Path(td_raw) / "exp"
+            exp.mkdir(mode=0o700)
+            os.chmod(exp, 0o700)
+            ev = Path(td_raw) / "ev"
+            ev.mkdir(mode=0o700)
+            os.chmod(ev, 0o700)
+            approval = ProofApproval(
+                run_id=TEST_RUN_ID, instance_label="personal", scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL, ui_mode="mini", cwd=TEST_CWD,
+                selection_epoch="E" * 43, credential_generation=1,
+                history_digest_all_12_files=compute_exposure_history_digest(exp),
+                providers_config_digest=TEST_HEX_A,
+            )
+
+            # 1. Validate raw 8-bit C1 bytes and UTF-8 C1 bytes through the real PTY decoder path.
+            gate_c1 = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
+            gate_c1.bind_incarnation("inc-pty-c1-raw-01", 1)
+            armed_c1: list[tuple[str, str]] = []
+            raw_c1_child = (
+                "import sys, time; "
+                f"sys.stdout.buffer.write(b'\\x9d0;openai--personal/{TEST_MODEL}\\x9c\\n'); "
+                "sys.stdout.buffer.flush(); time.sleep(1.8)"
+            )
+            with patch.object(
+                shell_driver,
+                "_agent_start_command",
+                return_value=([sys.executable, "-IB", "-c", raw_c1_child], dict(os.environ)),
+            ):
+                pty_out: dict[str, bool] = {}
+                rc_child = shell_driver._drive_agent_pty(
+                    TEST_HEX_A, threading.Event(), gate_c1,
+                    lambda r, d: armed_c1.append((r, d)), outcome=pty_out,
+                )
+            self.assertEqual(rc_child, 0)
+            self.assertEqual(armed_c1, [])
+            self.assertFalse(pty_out["reply_observed"])
+
+            for raw_payload in (
+                b"\x9d0;" + b"x" * 40 + f"openai--personal/{TEST_MODEL}".encode("ascii") + b"\x9c",
+                b"\x9b32m" + f"openai--personal/{TEST_MODEL}".encode("ascii"),
+            ):
+                scr = shell_driver._TerminalScreen()
+                dec = codecs.getincrementaldecoder("utf-8")(errors="strict")
+                shell_driver._feed_pty_bytes(scr, dec, raw_payload, final=False)
+                self.assertFalse(scr.is_certain)
+                self.assertEqual(scr.render(), "")
+
+            utf8_c1 = ("\x9d0;" + ("q" * 300) + f"openai--personal/{TEST_MODEL}\x9c").encode("utf-8")
+            scr_u = shell_driver._TerminalScreen()
+            dec_u = codecs.getincrementaldecoder("utf-8")(errors="strict")
+            shell_driver._feed_pty_bytes(scr_u, dec_u, utf8_c1[:120], final=False)
+            self.assertFalse(scr_u.is_certain)
+            self.assertEqual(scr_u.render(), "")
+            shell_driver._feed_pty_bytes(scr_u, dec_u, utf8_c1[120:], final=True)
+            self.assertTrue(scr_u.is_certain)
+            self.assertNotIn(TEST_MODEL, scr_u.render())
+
+            # 2. Footer-only repaint next to an old visible "ok" must NOT count as a fresh reply.
+            prompt_head = PROOF_PROMPT.removesuffix(f" {shell_driver.EXPECTED_REPLY}")
+            footer_line = f"▣ Build · {TEST_MODEL}"
+            fake_gate = SimpleNamespace(
+                admitted_writes=1,
+                exact_ok_delivered=True,
+                approval=SimpleNamespace(approved_model=TEST_MODEL),
+            )
+            r_fd, w_fd = os.pipe()
+            try:
+                old_pre = ("token usage", "ok")
+                for screen_text, post_text in (
+                    (f"token usage\nok\n{footer_line}", footer_line),
+                    (f"token usage\nok\n{footer_line}", None),
+                    (
+                        f"token usage\nok\n{footer_line}\n{prompt_head}\nok",
+                        f"{prompt_head}\nok\n{footer_line}",
+                    ),
+                ):
+                    st = shell_driver._PtyState(armed=True, prompt_sent=True, pre_prompt_lines=old_pre)
+                    self.assertFalse(
+                        shell_driver._step_pty_driver(
+                            w_fd, screen_text, 5.0, fake_gate, lambda _r, _d: None, st, post_prompt_text=post_text,
+                        ),
+                        (screen_text, post_text),
+                    )
+                    self.assertFalse(st.reply_observed)
+
+                # Positive control: genuine newly rendered assistant "ok" still succeeds.
+                fresh_screen = f"token usage\nok\n{PROOF_PROMPT}\n\nok\n{footer_line}"
+                fresh_post = f"{PROOF_PROMPT}\n\nok\n{footer_line}"
+                st_ok = shell_driver._PtyState(armed=True, prompt_sent=True, pre_prompt_lines=old_pre)
+                with patch.object(shell_driver.time, "sleep"):
+                    done = shell_driver._step_pty_driver(
+                        w_fd, fresh_screen, 5.0, fake_gate, lambda _r, _d: None, st_ok, post_prompt_text=fresh_post,
+                    )
+                self.assertTrue(done)
+                self.assertTrue(st_ok.reply_observed)
+                self.assertEqual(os.read(r_fd, 16), b"\x03")
+            finally:
+                os.close(r_fd)
+                os.close(w_fd)
+
+    def test_reciprocal_g2_r6_worktree_empty_replacement_survives_and_grant_lock_timeout(self) -> None:
+        import fcntl
+        import time
+
+        with tempfile.TemporaryDirectory(prefix="oc-g2-r6-wt-") as td_raw:
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            wt_dir = td / "wt"
+            wt_dir.mkdir(mode=0o700)
+            leaf = TEST_CWD.split("/", 1)[1]
+
+            def _make_wt_runner(swap_after_clear: bool = False):
+                def _runner(args, timeout=20.0):
+                    del timeout
+                    c_idx = args.index("-c")
+                    script = args[c_idx + 1].replace("'/sandbox/wt'", repr(str(wt_dir)))
+                    if swap_after_clear:
+                        # Inject a concurrent agent swap right after _clear_dir_fd completes.
+                        swap_hook = (
+                            "_clear_dir_fd(leaf_fd)\n"
+                            "        os.rename(leaf, leaf + '.moved', src_dir_fd=wt_fd, dst_dir_fd=wt_fd)\n"
+                            "        os.mkdir(leaf, 0o700, dir_fd=wt_fd)\n"
+                        )
+                        script = script.replace("_clear_dir_fd(leaf_fd)\n", swap_hook, 1)
+                    leaf_arg, dev_s, ino_s = args[c_idx + 2], args[c_idx + 3], args[c_idx + 4]
+                    return subprocess.run(
+                        [sys.executable, "-IB", "-c", script, leaf_arg, dev_s, ino_s, str(wt_dir)],
+                        capture_output=True,
+                        check=False,
+                    )
+                return _runner
+
+            # 1a. Genuine owned worktree: contents emptied strictly via leaf_fd; directory preserved.
+            wt_leaf = wt_dir / leaf
+            wt_leaf.mkdir(mode=0o700)
+            (wt_leaf / "artifact.txt").write_text("temp\n", encoding="utf-8")
+            wt_st = os.lstat(wt_leaf)
+            jspec = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=td / "j_r6_wt.json",
+            )
+            j_ok = _OwnershipJournal(jspec, podman_runner=_make_wt_runner())
+            j_ok.worktree_owned = True
+            j_ok.worktree_dev_ino = (wt_st.st_dev, wt_st.st_ino)
+            res_ok = j_ok.teardown()
+            self.assertTrue(res_ok[KEY_CLEANUP_VERIFIED], res_ok)
+            self.assertTrue(wt_leaf.is_dir())
+            self.assertEqual(list(wt_leaf.iterdir()), [])
+
+            # 1b. Empty replacement swapped at final removal MUST survive untouched and fail closed.
+            (wt_leaf / "artifact2.txt").write_text("temp2\n", encoding="utf-8")
+            j_swap = _OwnershipJournal(jspec, podman_runner=_make_wt_runner(swap_after_clear=True))
+            j_swap.worktree_owned = True
+            j_swap.worktree_dev_ino = (wt_st.st_dev, wt_st.st_ino)
+            res_swap = j_swap.teardown()
+            self.assertFalse(res_swap[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_swap["ownership_uncertain"])
+            self.assertIn("worktree_identity_mismatch", res_swap["errors"])
+            self.assertTrue(wt_leaf.is_dir())
+            self.assertNotEqual((os.lstat(wt_leaf).st_dev, os.lstat(wt_leaf).st_ino), (wt_st.st_dev, wt_st.st_ino))
+
+            # 2. Crash-cleanup grant-lock acquisition is bounded and persists uncertainty on timeout.
+            lock_journal = td / "j_r6_lock.json"
+            jspec_lock = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=lock_journal,
+            )
+            no_pm = lambda args, timeout=20.0: subprocess.CompletedProcess(args, 1, b"", b"")
+            slot_locked = td / "slot_locked_grant"
+            grant_locked = slot_locked / "grant"
+            grant_locked.mkdir(parents=True, mode=0o700)
+            lock_file = grant_locked / "lock"
+            lock_file.touch(mode=0o600)
+            (grant_locked / "state").write_text("active\n", encoding="utf-8")
+
+            j_lock = _OwnershipJournal(jspec_lock, podman_runner=no_pm, grant_lock_timeout=0.15)
+            j_lock.prepare_slot("turn-0", container_name="oc-e2e-deadbeef-relay-0", slot_root=str(slot_locked))
+            j_lock.begin_slot_create(
+                "turn-0", container_name="oc-e2e-deadbeef-relay-0",
+                grant_dir=str(grant_locked), slot_root=str(slot_locked),
+            )
+            holder_fd = os.open(lock_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                t0 = time.monotonic()
+                res_lock = j_lock.teardown()
+                elapsed = time.monotonic() - t0
+            finally:
+                with suppress(OSError):
+                    fcntl.flock(holder_fd, fcntl.LOCK_UN)
+                os.close(holder_fd)
+
+            self.assertLess(elapsed, 2.0)
+            self.assertFalse(res_lock[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_lock["ownership_uncertain"])
+            self.assertIn("grant_lock_timeout:turn-0", res_lock["errors"])
+            self.assertEqual((grant_locked / "state").read_text(encoding="utf-8"), "active\n")
+            persisted = json.loads(lock_journal.read_text(encoding="utf-8"))
+            self.assertTrue(persisted["ownership_uncertain"])
+            self.assertIn("grant_lock_timeout:turn-0", persisted["cleanup_errors"])
+
 
 if __name__ == "__main__":
     unittest.main()
