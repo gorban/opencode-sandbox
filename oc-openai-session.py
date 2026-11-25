@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private workstation supervisor bootstrap for `oc-sandbox --provider openai`.
+"""Private workstation supervisor bootstrap for managed multi-provider `oc-sandbox` sessions.
 
 Reads launch parameters from file descriptor 3 (never argv/cmdline) so stdin/stdout/stderr
 stay attached to the operator's controlling foreground terminal.
@@ -53,7 +53,7 @@ def _load_package(name: str):
 
 def main() -> int:
     if not sys.flags.isolated or not sys.flags.dont_write_bytecode or len(sys.argv) != 1:
-        print("oc-sandbox --provider openai: isolated workstation invocation required.", file=sys.stderr)
+        print("oc-sandbox: isolated workstation supervisor invocation required.", file=sys.stderr)
         return 2
     try:
         info = os.fstat(3)
@@ -70,7 +70,7 @@ def main() -> int:
         from oc_openai.session_broker import run_interactive_session
         launch_spec = decode_json(raw)
     except (ImportError, OSError, ValueError):
-        print("oc-sandbox --provider openai: trusted workstation supervisor unavailable.", file=sys.stderr)
+        print("oc-sandbox: trusted workstation supervisor unavailable.", file=sys.stderr)
         return 1
     return run_interactive_session(launch_spec, StreamTerminal(sys.stdin, sys.stdout, sys.stderr))
 

@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import stat
+import time
 
 
 _INPUT_LIMIT = 922_000
@@ -309,7 +310,7 @@ class ExposureLedger:
         self._state_dir = state_dir
 
     @contextmanager
-    def _locked(self):
+    def _locked(self, *, wait: float = 0.0):
         directory = lock = None
         try:
             directory = os.open(self._state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -321,7 +322,15 @@ class ExposureLedger:
             )
             if not _private_file(os.fstat(lock)):
                 raise ExposureError("untrusted_exposure_store")
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            deadline = time.monotonic() + max(0.0, wait)
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
             yield directory
         except OSError:
             raise ExposureError("exposure_store_unavailable") from None
@@ -504,9 +513,9 @@ class ExposureLedger:
             return self._inspect_locked(directory)
 
     @contextmanager
-    def dispatch_fence(self, *, acknowledged_digest: str | None = None):
+    def dispatch_fence(self, *, acknowledged_digest: str | None = None, wait: float = 0.0):
         """Hold non-blocking exposure.lock across hold validation and the bounded first write."""
-        with self._locked() as directory:
+        with self._locked(wait=wait) as directory:
             hold = self._inspect_locked(directory)
             if hold.blocked:
                 if acknowledged_digest is None or type(acknowledged_digest) is not str:

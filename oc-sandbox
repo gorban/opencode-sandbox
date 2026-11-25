@@ -44,21 +44,26 @@ BC_BIN=${OC_BCOMPARE_BIN:-/usr/bin/bcompare}                         # host Beyo
 AGENT_MEM=${OC_AGENT_MEMORY:-4g} CHROME_MEM=${OC_CHROMIUM_MEMORY:-4g} DIND_MEM=${OC_DIND_MEMORY:-4g}
 FWD_ENV=(ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY GOOGLE_API_KEY)
 # Pod ports that must never be published: a mapped connection reaches the pod as 127.0.0.1, which
-# Chromium DevTools (9222, full browser control), the pod-local provider relay (8401), and Postgres
+# Chromium DevTools (9222, full browser control), pod-local provider relays (8401-8416), and Postgres
 # (trust auth, any role) must never expose on host loopback.
-SENSITIVE_PORTS=(9222 8401)
-RESERVED_NAMES=" agent chromium chrome postgres pg dind home openai-relay openai-home "
+SENSITIVE_PORTS=(9222 8401 8402 8403 8404 8405 8406 8407 8408 8409 8410 8411 8412 8413 8414 8415 8416)
+RESERVED_NAMES=" agent chromium chrome postgres pg dind home openai-relay openai-home relay "
 
 usage() {
   cat <<EOF
-Usage: ${0##*/} [--provider openai] [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
+Usage: ${0##*/} [--mini|--no-mini] [--provider KIND[/LABEL]] [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
-       ${0##*/} openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}
+       ${0##*/} openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect [LABEL]}
        ${0##*/} orchestrate [--synthetic-check]
 
   (no flags)  Ensure everything exists (images, volumes, host bridge, pod, Chromium), then start
-              OpenCode. Safe to run repeatedly; only missing/changed pieces are touched.
+              OpenCode (defaulting to all enabled qualified providers when configured). Safe to run
+              repeatedly; only missing/changed pieces are touched.
               If that instance's OpenCode is already running it only completes the setup (like -n).
+  --mini      Launch OpenCode Mini (built-in minimal UI on the pinned OpenCode binary) instead of full OpenCode.
+  --no-mini   Launch full OpenCode even when [launch].mini = true in ~/.config/oc-sandbox/providers.toml.
+  --provider KIND[/LABEL]
+              Restrict this launch to a single enabled, qualified provider instance (e.g. openai or openai/personal).
   -i NAME     Work on instance NAME (default: the "default" instance). Every instance has its own
               pod, Chromium (and profile), Postgres data and docker-in-docker storage, so several can
               run the same app on the same ports at once. Names: a-z, 0-9, '-'.
@@ -71,7 +76,7 @@ Usage: ${0##*/} [--provider openai] [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:
               Existing worktrees must match the requested repository and branch.
   -P PORT or HOST:POD  Publish a pod port on host loopback (repeatable, or comma-separated).
               Kept until changed; '-P none' removes all. Changing ports recreates the pod, which is
-              refused while that instance's OpenCode runs. Port 9222 is refused; 5432 requires -p.
+              refused while that instance's OpenCode runs. Ports 9222 and 8401-8416 are refused; 5432 requires -p.
   -p          Also run Postgres in the pod (data volume per instance, survives restarts and -d;
               only -d -a deletes it). There are NO defaults: configure image/user/password/database
               first (~/.config/oc-sandbox/postgres.env, postgres.NAME.env, or OC_PG_*). See README.md.
@@ -182,14 +187,19 @@ verify_openai_helper() {
 if [[ ${1:-} == openai ]]; then
   case $#:${2:-} in
     2:status|2:verify|2:disconnect) ;;
-    3:connect|3:select|4:connect)
+    3:connect|4:connect)
       [[ $# != 4 || $4 == --no-browser ]] ||
         die "usage: oc-sandbox openai connect LABEL [--no-browser]"
+      LC_ALL=C
+      [[ ${#3} -le 32 && $3 =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ ]] ||
+        die "OpenAI labels must be 1 to 32 ASCII lowercase letters, numbers, or single inner hyphens, starting with a letter"
+      ;;
+    3:select|3:disconnect)
       LC_ALL=C
       [[ $3 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] ||
         die "OpenAI labels must be 1 to 32 ASCII letters, numbers, underscores or hyphens, starting with a letter or number"
       ;;
-    *) die "usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}" ;;
+    *) die "usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect [LABEL]}" ;;
   esac
   helper=$SCRIPT_DIR/oc-openai.py
   verify_openai_helper "$helper"
@@ -217,6 +227,7 @@ trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
 }
 trusted_dir STATE "$STATE"
 trusted_dir CONF_DIR "${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox"
+trusted_dir PROVIDER_CONF_DIR "$HOME/.config/oc-sandbox"
 trusted_dir BIN "$BIN"
 trusted_dir UNITS "$UNITS"
 trusted_dir INSTALL_DIR "$UNITS/.oc-sandbox"
@@ -298,19 +309,30 @@ atomic_host_file() {  # destination, mode; contents on stdin
 # ---- option parsing ---------------------------------------------------------
 DELETE=0 ALL=0 REBUILD=0 NOLAUNCH=0 YES=0 LISTKEYS=0 NOKEY=0 EXEC=0 PG=0 DIND=0 LIST=0
 INST="" INST_SET=0 CWD_ARG="" WT_ARG="" PORT_ARGS=() PROVIDER="" PROVIDER_SET=0
+CLI_UI_MODE="default" UI_MODE_SET=0
 GETOPTS_ARGS=()
 while (( $# )); do
   case $1 in
+    --mini)
+      (( !UI_MODE_SET )) || die "--mini and --no-mini may only be specified once"
+      CLI_UI_MODE="mini" UI_MODE_SET=1
+      shift
+      ;;
+    --no-mini)
+      (( !UI_MODE_SET )) || die "--mini and --no-mini may only be specified once"
+      CLI_UI_MODE="full" UI_MODE_SET=1
+      shift
+      ;;
     --provider)
       (( !PROVIDER_SET )) || die "--provider may only be specified once"
-      (( $# >= 2 )) && [[ -n $2 ]] || die "--provider needs a value (openai)"
+      (( $# >= 2 )) && [[ -n $2 ]] || die "--provider needs a value (openai or openai/LABEL)"
       PROVIDER=$2 PROVIDER_SET=1
       shift 2
       ;;
     --provider=*)
       (( !PROVIDER_SET )) || die "--provider may only be specified once"
       PROVIDER=${1#--provider=}
-      [[ -n $PROVIDER ]] || die "--provider needs a value (openai)"
+      [[ -n $PROVIDER ]] || die "--provider needs a value (openai or openai/LABEL)"
       PROVIDER_SET=1
       shift
       ;;
@@ -328,7 +350,16 @@ while (( $# )); do
   esac
 done
 if [[ -n $PROVIDER ]]; then
-  case $PROVIDER in
+  provider_kind=${PROVIDER%%/*}
+  provider_inst=""
+  if [[ $PROVIDER == */* ]]; then
+    provider_inst=${PROVIDER#*/}
+    [[ $provider_inst != */* ]] || die "invalid --provider target '$PROVIDER'"
+    LC_ALL=C
+    [[ ${#provider_inst} -le 32 && $provider_inst =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ ]] ||
+      die "invalid provider instance label '$provider_inst'"
+  fi
+  case $provider_kind in
     openai) ;;
     claude|google) die "--provider $PROVIDER is not yet qualified for sandbox launch" ;;
     *) die "unsupported provider '$PROVIDER' (supported: openai)" ;;
@@ -349,14 +380,22 @@ done
 if [[ -n $PROVIDER ]] && (( DELETE || NOLAUNCH || EXEC || LIST || LISTKEYS )); then
   die "--provider cannot be combined with -n, -d, -x, -l or -k"
 fi
+if (( UI_MODE_SET )) && (( DELETE || NOLAUNCH || EXEC || LIST || LISTKEYS )); then
+  die "--mini/--no-mini cannot be combined with -n, -d, -x, -l or -k"
+fi
 if (( ALL && !DELETE )); then die "-a only makes sense with -d"; fi
 if (( DELETE || EXEC || LIST || LISTKEYS )) && { (( PG || DIND || ${#PORT_ARGS[@]} )) || [[ -n $CWD_ARG$WT_ARG ]]; }; then
   die "-p, -D, -P, -C and -W only apply when setting up or starting an instance"
 fi
 
+MANAGED_MODE=0
+if (( PROVIDER_SET )) || [[ -e $PROVIDER_CONF_DIR/providers.toml || -L $PROVIDER_CONF_DIR/providers.toml || -e $PROVIDER_CONF_DIR/openai || -L $PROVIDER_CONF_DIR/openai ]]; then
+  MANAGED_MODE=1
+fi
+
 # ---- names ----------------------------------------------------------------------------------------
 valid_instance() {  # named instance, excluding the alias for the default instance
-  [[ $1 != default && $1 =~ ^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$ && $RESERVED_NAMES != *" $1 "* ]]
+  [[ $1 != default && $1 =~ ^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$ && ! $1 =~ ^relay(-[0-9]+)?$ && $RESERVED_NAMES != *" $1 "* ]]
 }
 # INST_SET records that -i was given at all: "-i default" selects the default instance only and must
 # never fall through to the all-instances scope of a bare -d (or -d -a).
@@ -691,6 +730,31 @@ prune_images() {  # remove our recorded builds that are now untagged and unused;
 }
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 cstate() { pm container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo none; }
+pod_relays() {  # pod name -> one relay container name per line (legacy + multi-slot provider-relay)
+  local pod=$1 seen=" " c role lines
+  if pm pod exists "$pod" >/dev/null 2>&1; then
+    lines=$(pm ps -a --filter "pod=$pod" --format '{{.Names}}' 2>/dev/null) || return 1
+    while IFS= read -r c; do
+      [[ -n $c ]] || continue
+      role=$(pm container inspect --format '{{index .Config.Labels "oc.role"}}' "$c" 2>/dev/null || true)
+      if [[ $c == "$pod-openai-relay" || $c == "$pod-relay-"[0-9]* || $role == provider-relay || $role == openai-relay ]]; then
+        [[ $seen == *" $c "* ]] || { seen+="$c "; printf '%s\n' "$c"; }
+      fi
+    done <<<"$lines"
+  fi
+  if [[ $seen != *" $pod-openai-relay "* && $(cstate "$pod-openai-relay") != none ]]; then
+    printf '%s\n' "$pod-openai-relay"
+  fi
+}
+any_relay_running() {  # 0 if any relay container in $1 is running or cannot be inspected, 1 if idle/absent
+  local pod=$1 relays c
+  relays=$(pod_relays "$pod") || return 0
+  while IFS= read -r c; do
+    [[ -n $c ]] || continue
+    [[ $(cstate "$c") == running ]] && return 0
+  done <<<"$relays"
+  return 1
+}
 
 # The helper holds an O_NOFOLLOW, owner/identity-checked flock on a persistent inode.
 # Its pipe and parent check release the lock if this shell exits or is killed.
@@ -852,9 +916,14 @@ if (( LIST )); then
     ports=$(pm pod inspect "$pod" --format '{{index .Labels "oc.ports"}}' 2>/dev/null || true)
     wd=$(pm container inspect --format '{{.Config.WorkingDir}}' "$AGENT" 2>/dev/null || true)
     side=""
-    for c in "$CHROME" "$PGC" "$DINDC" "$RELAY"; do
+    for c in "$CHROME" "$PGC" "$DINDC"; do
       s=$(cstate "$c"); [[ $s == none ]] || side+="${c#"$POD"-}:$s "
     done
+    relays=$(pod_relays "$POD" 2>/dev/null || true)
+    while IFS= read -r c; do
+      [[ -n $c ]] || continue
+      s=$(cstate "$c"); [[ $s == none ]] || side+="${c#"$POD"-}:$s "
+    done <<<"$relays"
     wt_info=""
     record_rc=0
     record=$(worktree_state read "$inst") || record_rc=$?
@@ -1427,7 +1496,7 @@ chrome_hash=$(cd "$BUILD" && sha256sum Containerfile.chromium | cut -d' ' -f1)
 PULL=(); (( REBUILD )) && PULL=(--pull=always)
 ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"  agent
 ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash" chromium
-if [[ $PROVIDER == openai ]]; then
+if (( MANAGED_MODE )); then
   atomic_host_file "$BUILD/Containerfile.relay" 0644 <<'EOF'
 FROM docker.io/library/python:3.12-alpine@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df
 EOF
@@ -1447,8 +1516,8 @@ relabel_shared || { echo "could not relabel $SB for the agents (see above)" >&2;
 # An offline reader hashes the current binary, the networked updater sees no
 # mounts, and an offline writer promotes only a complete candidate. The host-side
 # supervisor verifies each CID-receipted container is gone before the next phase.
-if [[ $PROVIDER == openai ]]; then
-  : # --provider openai uses an isolated home volume and baked-in OpenCode binary
+if (( MANAGED_MODE )); then
+  : # managed provider mode uses an isolated home volume and baked-in pinned OpenCode binary
 elif [[ $OPENCODE_VERSION == keep ]]; then
   echo "OpenCode: keeping the installed version (OC_OPENCODE_VERSION=keep)"
 else
@@ -1832,7 +1901,7 @@ try:
         if not m or not isinstance(values, list): raise ValueError("unsupported binding")
         target = int(m.group(1))
         if not 1 <= target <= 65535: raise ValueError("invalid pod port")
-        if target in (9222, 8401): raise ValueError("sensitive pod port is published")
+        if target == 9222 or 8401 <= target <= 8416: raise ValueError("sensitive pod port is published")
         if target == 5432 and not pg: raise ValueError("Postgres port requires -p")
         for value in values:
             if not isinstance(value, dict) or value.get("HostIp") != "127.0.0.1": raise ValueError("non-loopback binding")
@@ -1882,7 +1951,7 @@ if [[ -n $recreate ]]; then
     echo "Exit it first, then rerun this command." >&2
     exit 1
   fi
-  if [[ $(cstate "$RELAY") == running ]]; then
+  if any_relay_running "$POD"; then
     echo "Cannot recreate pod '$POD' ($recreate): Provider relay is running in instance '$ILABEL'." >&2
     echo "Exit it first, then rerun this command." >&2
     exit 1
@@ -1998,8 +2067,8 @@ if (( NOLAUNCH )); then
 fi
 
 # ---- launch OpenCode ------------------------------------------------------------------
-if [[ $PROVIDER == openai ]]; then
-  if [[ $(cstate "$AGENT") == running || $(cstate "$RELAY") == running ]]; then
+if (( MANAGED_MODE )); then
+  if [[ $(cstate "$AGENT") == running ]] || any_relay_running "$POD"; then
     release_lifecycle_lock
     die "OpenCode or provider relay is already running in instance '$ILABEL'; exit it first"
   fi
@@ -2019,22 +2088,32 @@ if [[ $PROVIDER == openai ]]; then
   session_spec=$(/usr/bin/python3 -I -c '
 import json, sys
 keys = ("instance", "pod", "agent", "relay", "relay_image", "agent_image", "agent_mem",
-        "level", "sandbox", "cwd", "home_vol", "chromium", "postgres", "pg_secret", "dind", "dind_run")
+        "level", "sandbox", "cwd", "home_vol", "chromium", "postgres", "pg_secret", "dind", "dind_run",
+        "provider_filter", "cli_ui_mode")
 print(json.dumps(dict(zip(keys, sys.argv[1:]))))
 ' "$ILABEL" "$POD" "$AGENT" "$RELAY" "$relay_image_id" "$agent_image_id" "$AGENT_MEM" \
-  "$LEVEL" "$SB" "$CWD" "$OPENAI_HOMEVOL" "$CHROME" "$pg_container_arg" "$pg_secret_arg" "$dind_container_arg" "$dind_run_arg")
+  "$LEVEL" "$SB" "$CWD" "$OPENAI_HOMEVOL" "$CHROME" "$pg_container_arg" "$pg_secret_arg" "$dind_container_arg" "$dind_run_arg" \
+  "$PROVIDER" "$CLI_UI_MODE")
   release_lifecycle_lock
   cd -- "$SCRIPT_DIR"
-  log "Launching ChatGPT-backed OpenCode (instance '$ILABEL') in /sandbox/$CWD"
+  log "Launching managed OpenCode (instance '$ILABEL') in /sandbox/$CWD"
   exec /usr/bin/env -i HOME="$HOME" TERM="${TERM:-xterm-256color}" PATH=/usr/bin:/bin \
     /usr/bin/python3 -IB "$session_helper" 3<<<"$session_spec"
 fi
-if [[ $(cstate "$RELAY") == running ]]; then
+if any_relay_running "$POD"; then
   release_lifecycle_lock
   die "Provider relay is running in instance '$ILABEL'; exit the active provider session first"
 fi
-pm rm -f "$RELAY" >/dev/null 2>&1 || true
+stale_relays=$(pod_relays "$POD" 2>/dev/null || true)
+while IFS= read -r stale_relay; do
+  [[ -n $stale_relay ]] || continue
+  pm rm -f "$stale_relay" >/dev/null 2>&1 || true
+done <<<"$stale_relays"
 if [[ $(cstate "$AGENT") == running ]]; then
+  if [[ $CLI_UI_MODE == mini ]]; then
+    release_lifecycle_lock
+    die "OpenCode is already running in instance '$ILABEL'; exit it first to launch with --mini"
+  fi
   log "OpenCode is already running in instance '$ILABEL'; setup is up to date (acting like -n)."
   echo "Open a shell in it with:  ${0##*/}${INST:+ -i $INST} -x"
   release_lifecycle_lock
@@ -2052,6 +2131,8 @@ if [[ $(cstate "$DINDC") != none ]]; then
   envargs+=(-v "$DINDRUN":/run/dind -e DOCKER_HOST=unix:///run/dind/podman.sock
             -e CONTAINER_HOST=unix:///run/dind/podman.sock)
 fi
+agent_cmd=()
+if [[ $CLI_UI_MODE == mini ]]; then agent_cmd=(mini); fi
 log "Preparing OpenCode (instance '$ILABEL') in /sandbox/$CWD"
 # Create while the lifecycle barrier is held; attach only after releasing it.
 # No ':Z' on the shared mounts: relabel_shared already gave them this level (see above).
@@ -2062,7 +2143,7 @@ agent_id=$(pm create -it --rm --name "$AGENT" --pod "$POD" --label oc.sandbox=1 
   -v "$HOMEVOL":/root \
   -w "/sandbox/$CWD" \
   "${envargs[@]}" \
-  "$AGENT_IMG")
+  "$AGENT_IMG" ${agent_cmd[@]+"${agent_cmd[@]}"})
 [[ $agent_id =~ ^[0-9a-f]{64}$ ]] || die "Podman did not return a complete agent container ID"
 release_lifecycle_lock
 log "Launching OpenCode (instance '$ILABEL') in /sandbox/$CWD"

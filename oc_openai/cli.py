@@ -11,7 +11,7 @@ import termios
 from typing import Protocol, TextIO
 
 from .exposure import Diagnostic, RecoveryMode
-from .profiles import ProfileError, valid_label
+from .profiles import ProfileError, valid_canonical_label, valid_label
 
 MODEL = "gpt-6.2-sol"
 PROPOSAL_MARKER = "OC_SANDBOX_WORKER_PROOF"
@@ -21,7 +21,7 @@ ORCHESTRATOR_INPUT = (
 )
 _LABEL_COMMANDS = ("connect", "select")
 _LOCAL_COMMANDS = ("status", "verify", "disconnect")
-USAGE = "Usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect}"
+USAGE = "Usage: oc-sandbox openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect [LABEL]}"
 BrowserHandoff = Callable[[str, Callable[[], bool]], None]
 # The Linux device identity also matches the PTY master, so exclude that side explicitly.
 _TIOCGDEV = 0x80045432
@@ -274,6 +274,39 @@ class StreamTerminal:
             return False
         return False
 
+    def _read_bounded_line(self, fd: int, max_len: int) -> bytes | None:
+        answer = b""
+        while len(answer) < max_len:
+            char = os.read(fd, 1)
+            if not char:
+                return None
+            answer += char
+            if char == b"\n":
+                return answer
+        termios.tcflush(fd, termios.TCIFLUSH)
+        return None
+
+    def choose(self, message: str, options: Sequence[str]) -> int | None:
+        if not options or not self.attended():
+            return None
+        try:
+            fd = self.reader.fileno()
+            termios.tcflush(fd, termios.TCIFLUSH)
+            self.write(message)
+            for idx, option in enumerate(options, 1):
+                self.write(f"  {idx}. {option}")
+            self.write(f"Enter 1-{len(options)} (or empty to cancel):")
+            answer = self._read_bounded_line(fd, 8)
+            if answer is None or not self.attended():
+                return None
+            raw = answer.decode("ascii", errors="ignore").strip()
+            if not raw.isdecimal():
+                return None
+            choice = int(raw)
+            return choice - 1 if 1 <= choice <= len(options) else None
+        except (OSError, termios.error, ValueError):
+            return None
+
 
 def _production_backend() -> Backend:
     try:
@@ -390,8 +423,12 @@ def _run_connect(terminal: Terminal, backend: Backend, label: str, *, manual: bo
 
 
 def _valid_argv(argv: Sequence[str], command: str, *, labelled: bool, manual: bool) -> bool:
+    if command == "connect":
+        return (len(argv) == 2 or manual) and valid_canonical_label(argv[1])
     if labelled:
-        return (len(argv) == 2 or manual) and valid_label(argv[1])
+        return len(argv) == 2 and valid_label(argv[1])
+    if command == "disconnect":
+        return len(argv) == 1 or (len(argv) == 2 and valid_label(argv[1]))
     return len(argv) == 1 and command in _LOCAL_COMMANDS
 
 
@@ -421,8 +458,13 @@ def run(
             return 0
         if command == "verify":
             return _run_verify(terminal, backend)
-        if backend.disconnect() is True:
-            terminal.write("ChatGPT is disconnected on this workstation.")
+        target_label = argv[1] if len(argv) == 2 else None
+        confirmed = backend.disconnect() if target_label is None else backend.disconnect(target_label)
+        if confirmed is True:
+            if target_label is None:
+                terminal.write("ChatGPT is disconnected on this workstation.")
+            else:
+                terminal.write(f"ChatGPT registration {target_label} is disconnected on this workstation.")
             return 0
         terminal.error("ChatGPT is disconnected locally. Remote revocation could not be confirmed.")
         return 1

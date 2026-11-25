@@ -394,31 +394,54 @@ class SessionBrokerTests(unittest.TestCase):
 
         class _FakeBackend:
             def __init__(self, state_dir: Path):
+                from oc_openai.profiles import Profile
                 self._state = state_dir
                 self._state.mkdir(parents=True, exist_ok=True)
                 self._state.chmod(0o700)
                 self.selected = ("work", "epoch-1")
+                self._profile = Profile(
+                    "work", state_dir / "work",
+                    "urn:uuid:" + "0" * 8 + "-0000-4000-8000-" + "0" * 12,
+                    "epoch-1", "client-1", False, True,
+                )
 
-            def active_connection(self):
+            def active_label(self):
+                return "work"
+
+            @property
+            def profiles(self):
+                from oc_openai.profiles import RegistryView
+                prof = self._profile
+
+                class _Snap:
+                    def snapshot(self):
+                        return RegistryView((prof,), prof)
+                return _Snap()
+
+            def profile_connection(self, label):
+                assert label == "work"
+
                 class _Conn:
                     def models(self, _binding):
                         return ("gpt-6.2-sol",)
 
                     def require_active(self, _binding):
                         return None
-                return "work", "epoch-1", _Conn(), object()
+                return self._profile, _Conn(), object()
 
-            def active_selection(self):
-                return self.selected
+            def profile_valid(self, label, epoch, *, directory, client_id):
+                return (label, epoch, directory, client_id) == (
+                    "work", "epoch-1", self._profile.directory, "client-1",
+                )
 
             @contextlib.contextmanager
-            def selected_fence(self, label, epoch):
-                assert (label, epoch) == ("work", "epoch-1")
+            def profile_fence(self, label, epoch, *, directory, client_id):
+                assert self.profile_valid(label, epoch, directory=directory, client_id=client_id)
                 yield
 
             @contextlib.contextmanager
-            def session_lease(self, label, epoch, binding, job):
-                assert (label, epoch) == ("work", "epoch-1")
+            def profile_session_lease(self, label, epoch, binding, job, *, directory, client_id):
+                assert self.profile_valid(label, epoch, directory=directory, client_id=client_id)
                 created_roots.append(job.root)
                 yield job.lease
 
@@ -468,12 +491,12 @@ class SessionBrokerTests(unittest.TestCase):
             raise AssertionError(f"unexpected inspected call: {args}")
 
         def fake_podman(*args, check=True, timeout=12):
-            if args[0] == "create" and spec["relay"] in args:
+            if args[0] == "create" and (spec["relay"] in args or f"{spec['pod']}-relay-0" in args):
                 return subprocess.CompletedProcess(args, 0, (relay_id + "\n").encode(), b"")
             if args[0] == "create" and spec["agent"] in args:
                 agent_create_args.extend(args)
                 return subprocess.CompletedProcess(args, 0, (agent_id + "\n").encode(), b"")
-            if args[:2] == ("container", "inspect") and args[2] in (spec["agent"], spec["relay"]):
+            if args[:2] == ("container", "inspect") and args[2] in (spec["agent"], spec["relay"], f"{spec['pod']}-relay-0"):
                 return subprocess.CompletedProcess(args, 1, b"", b"")
             if args[:2] == ("container", "inspect"):
                 inspected_siblings.append(args[2])
@@ -514,6 +537,8 @@ class SessionBrokerTests(unittest.TestCase):
 
         term = _FakeTerm()
         backend = _FakeBackend(self.root / "state")
+        empty_cfg = self.root / "empty_cfg"
+        empty_cfg.mkdir(mode=0o700)
         with (patch.object(session_broker, "check_devbox"),
               patch.object(session_broker, "check_host"),
               patch.object(session_broker, "make_backend", return_value=backend),
@@ -522,7 +547,7 @@ class SessionBrokerTests(unittest.TestCase):
               patch.object(session_broker, "podman", side_effect=fake_podman),
               patch.object(session_broker, "host_output", side_effect=fake_host_output),
               patch.object(session_broker.subprocess, "Popen", side_effect=fake_popen)):
-            rc = session_broker.run_interactive_session(spec, term)
+            rc = session_broker.run_interactive_session(spec, term, config_dir=empty_cfg)
 
         self.assertEqual(rc, 0, term.errors)
         # P1 #1: runtime directory cleaned up after pending -> activate -> start -> teardown.
@@ -806,23 +831,29 @@ class SessionBrokerTests(unittest.TestCase):
                 self._state.mkdir(parents=True, exist_ok=True)
                 self._state.chmod(0o700)
 
-            def active_connection(self):
+            def active_label(self):
+                return "work"
+
+            def profile_connection(self, label):
+                from oc_openai.profiles import Profile
+
                 class _Conn:
                     def models(self, _binding):
                         return ("gpt-6.2-sol",)
-                return "work", "epoch-1", _Conn(), object()
+                prof = Profile(label, self._state / label, "urn:uuid:" + "0" * 8 + "-0000-4000-8000-" + "0" * 12,
+                               "epoch-1", "client-1", False, True)
+                return prof, _Conn(), object()
 
-            def active_selection(self):
-                return ("work", "epoch-1")
+            @property
+            def profiles(self):
+                from oc_openai.profiles import Profile, RegistryView
+                prof = Profile("work", self._state / "work", "urn:uuid:" + "0" * 8 + "-0000-4000-8000-" + "0" * 12,
+                               "epoch-1", "client-1", False, True)
 
-            @contextlib.contextmanager
-            def selected_fence(self, _label, _epoch):
-                yield
-
-            @contextlib.contextmanager
-            def session_lease(self, _label, _epoch, _binding, job):
-                created_roots.append(job.root)
-                yield job.lease
+                class _Snap:
+                    def snapshot(self):
+                        return RegistryView((prof,), prof)
+                return _Snap()
 
         class _Term(StreamTerminal):
             def __init__(self):
@@ -840,16 +871,21 @@ class SessionBrokerTests(unittest.TestCase):
             def confirm(self, _prompt):
                 return True
 
+            def choose(self, _prompt, _options):
+                return 0
+
         def fake_verify_pod(_spec):
             raise KeyboardInterrupt
 
+        empty_cfg_dir = self.root / "int_cfg"
+        empty_cfg_dir.mkdir(mode=0o700)
         with (patch.object(session_broker, "check_devbox"),
               patch.object(session_broker, "check_host"),
               patch.object(session_broker, "make_backend", return_value=_InterruptBackend(self.root / "int_state")),
               patch.object(session_broker, "SHARED_TMP", str(self.root)),
-              patch.object(session_broker, "_verify_pod", side_effect=fake_verify_pod)):
+              patch.object(session_broker, "_verify_pod_with_containers", side_effect=fake_verify_pod)):
             before_dirs = set(self.root.glob("oc-chat-*"))
-            rc = session_broker.run_interactive_session(spec, _Term())
+            rc = session_broker.run_interactive_session(spec, _Term(), config_dir=empty_cfg_dir)
             after_dirs = set(self.root.glob("oc-chat-*"))
         self.assertEqual(rc, 130)
         self.assertEqual(after_dirs, before_dirs)
@@ -1456,6 +1492,231 @@ class SessionBrokerTests(unittest.TestCase):
         self.assertEqual(len(writes), 1, "revocation won the lease fence yet provider write still executed")
         self.assertEqual(len(results), 1)
         self.assertNotIn(b"response.completed", results[0])
+
+    def test_multi_instance_isolation_single_slot_revocation_and_lockouts(self):
+        import pwd
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.cli import RouteUnavailable
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.profile_backend import ProfileBackend
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.contracts import ProviderInstanceSpec
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+
+        def _forbid_host_browser(url):
+            raise AssertionError(f"unit test attempted to open host browser: {url}")
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        self.enterContext(patch("oc_openai.connection._open_host_browser", side_effect=_forbid_host_browser))
+
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+        writes_by_dir: dict[Path, int] = {}
+        shared_verifier = FixtureVerifier()
+
+        def _make_conn(directory: Path):
+            transport = FixtureTransport()
+            transport.user = f"user-{directory.name}"
+            browser = FixtureBrowser()
+            browser.client = f"oaiapp_{directory.name}"
+
+            @contextlib.contextmanager
+            def fake_responses(body, access, cancellation, dispatch, **kwargs):
+                def write():
+                    writes_by_dir[directory] = writes_by_dir.get(directory, 0) + 1
+                    return "ok"
+                dispatch(write)
+                yield iter([
+                    {"type": "response.created", "response": {"id": f"resp_{directory.name}", "status": "in_progress"}},
+                    {"type": "response.output_item.added", "output_index": 0,
+                     "item": {"id": f"rs_{directory.name}", "type": "reasoning", "summary": []}},
+                    {"type": "response.output_item.done", "output_index": 0,
+                     "item": {"id": f"rs_{directory.name}", "type": "reasoning", "summary": [],
+                              "encrypted_content": f"enc_{directory.name}"}},
+                    {"type": "response.completed", "response": {
+                        "id": f"resp_{directory.name}", "status": "completed",
+                        "output": [{"id": f"rs_{directory.name}", "type": "reasoning", "summary": [],
+                                    "encrypted_content": f"enc_{directory.name}"}],
+                        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+                    }},
+                ])
+
+            transport.responses = fake_responses
+            return Connection(
+                directory, transport=transport, verifier=shared_verifier,
+                browser=browser, host_probe=lambda: host,
+            )
+
+        prof_dir = scratch / "multi_profiles"
+        backend = ProfileBackend(prof_dir, connection=_make_conn)
+        backend.connect("personal")
+        backend.connect("work")
+
+        adapter = OpenAISessionAdapter(backend)
+        pref_a = adapter.preflight_instance(ProviderInstanceSpec("openai", "personal", True, "subscription"))
+        pref_b = adapter.preflight_instance(ProviderInstanceSpec("openai", "work", True, "subscription"))
+        self.assertEqual(pref_a.readiness.value, "ready")
+        self.assertEqual(pref_b.readiness.value, "ready")
+
+        stop_event = threading.Event()
+        coordinator = session_broker._SessionSlotCoordinator(stop_event)
+        removed_relays: list[str] = []
+
+        def fake_remove(cid: str):
+            removed_relays.append(cid)
+
+        tok_a = "tok-personal-" + "a" * 24
+        tok_b = "tok-work-" + "b" * 24
+        slot_a_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+        slot_b_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+        self.addCleanup(lambda: shutil.rmtree(slot_a_root, ignore_errors=True))
+        self.addCleanup(lambda: shutil.rmtree(slot_b_root, ignore_errors=True))
+        slot_a_cm = adapter.open_slot(
+            pref_a, slot_index=0, slot_root=slot_a_root, port=8401,
+            worker_token=tok_a, acknowledged_exposure_digest=None, on_revoke=coordinator.on_revoke,
+        )
+        slot_b_cm = adapter.open_slot(
+            pref_b, slot_index=1, slot_root=slot_b_root, port=8402,
+            worker_token=tok_b, acknowledged_exposure_digest=None, on_revoke=coordinator.on_revoke,
+        )
+        with patch.object(session_broker, "_remove_container_verified", side_effect=fake_remove):
+            handle_a = slot_a_cm.__enter__()
+            handle_b = slot_b_cm.__enter__()
+            coordinator.register_slot(slot_a_cm, handle_a)
+            coordinator.register_slot(slot_b_cm, handle_b)
+            coordinator.record_container("1" * 64, slot_index=0)
+            coordinator.record_container("2" * 64, slot_index=1)
+            handle_a.job.activate()
+            handle_b.job.activate()
+            try:
+                body = json.dumps({
+                    "model": "gpt-6.2-sol", "stream": True, "store": False,
+                    "input": [{"role": "user", "content": "hi"}],
+                }).encode()
+                req_a = (
+                    f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+                    f"Authorization: Bearer {tok_a}\r\nContent-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n\r\n"
+                ).encode("ascii") + body
+
+                # 1. Wrong Host header (8401 on slot B=8402) returns 403; cross-slot token A with Host 8402 returns 401.
+                wrong_host = _send_via_relay(handle_b.job.provider_socket, handle_b.job.lease, handle_b.job.relay_proof, req_a)
+                self.assertIn(b"403 Forbidden", wrong_host)
+                req_a_on_b_host = (
+                    f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8402\r\n"
+                    f"Authorization: Bearer {tok_a}\r\nContent-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n\r\n"
+                ).encode("ascii") + body
+                replay_resp = _send_via_relay(handle_b.job.provider_socket, handle_b.job.lease, handle_b.job.relay_proof, req_a_on_b_host)
+                self.assertIn(b"401 Unauthorized", replay_resp)
+                self.assertEqual(writes_by_dir, {})
+
+                # 2. Both slots serve isolated turns; vault handle from slot A is rejected by slot B.
+                resp_a = _send_via_relay(handle_a.job.provider_socket, handle_a.job.lease, handle_a.job.relay_proof, req_a)
+                self.assertIn(b"response.completed", resp_a)
+                marker = b'"encrypted_content":"oc_rs_'
+                start = resp_a.index(marker) + len(b'"encrypted_content":"')
+                handle_from_a = resp_a[start:resp_a.index(b'"', start)].decode("ascii")
+
+                cross_vault_body = json.dumps({
+                    "model": "gpt-6.2-sol", "stream": True, "store": False,
+                    "input": [
+                        {"type": "reasoning", "id": "rs_local_1", "summary": [], "encrypted_content": handle_from_a},
+                        {"role": "user", "content": "continue"},
+                    ],
+                }).encode()
+                req_cross = (
+                    f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8402\r\n"
+                    f"Authorization: Bearer {tok_b}\r\nContent-Type: application/json\r\n"
+                    f"Content-Length: {len(cross_vault_body)}\r\n\r\n"
+                ).encode("ascii") + cross_vault_body
+                resp_cross = _send_via_relay(handle_b.job.provider_socket, handle_b.job.lease, handle_b.job.relay_proof, req_cross)
+                self.assertIn(b"400 Bad Request", resp_cross)
+
+                # 3. select() refused while active leases exist.
+                with self.assertRaises(RouteUnavailable):
+                    backend.select("personal")
+
+                # 4. Targeted disconnect("work") retires ONLY slot B while slot A keeps serving cleanly!
+                backend.disconnect("work")
+                deadline = time.monotonic() + 3.0
+                while "2" * 64 not in removed_relays and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertIn("2" * 64, removed_relays)
+                self.assertFalse(stop_event.is_set(), "disconnecting one slot must not stop the remaining slot")
+
+                # 5. Even with active=None (work was active and disconnected), connect("third") MUST be refused
+                #    while personal still holds an active lease!
+                with self.assertRaises(RouteUnavailable):
+                    backend.connect("third")
+
+                # Slot A still serves turns cleanly after slot B was disconnected.
+                resp_a2 = _send_via_relay(handle_a.job.provider_socket, handle_a.job.lease, handle_a.job.relay_proof, req_a)
+                self.assertIn(b"response.completed", resp_a2)
+
+                # 6. Disconnecting the final remaining slot sets stop_event and retires relay A.
+                backend.disconnect("personal")
+                self.assertTrue(stop_event.wait(3.0))
+            finally:
+                self.assertIsNone(coordinator.teardown_all(None))
+        self.assertIn("1" * 64, removed_relays)
+
+    def test_mini_mode_agent_args_and_launcher_flags_and_ports(self):
+        from oc_openai import session_broker
+
+        spec = self._valid_spec(instance="work")
+        cfg_path = self.root / "opencode.json"
+        cfg_path.write_text("{}", encoding="ascii")
+
+        args_full = session_broker._build_agent_args(spec, cfg_path, ui_mode="full")
+        args_mini = session_broker._build_agent_args(spec, cfg_path, ui_mode="mini")
+        self.assertEqual(args_full[-1], spec["agent_image"])
+        self.assertEqual(args_mini[-2:], [spec["agent_image"], "mini"])
+        for env_flag in (
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "OPENCODE_CONFIG=/etc/opencode/opencode.json",
+            "OPENCODE_CONFIG_PROJECT_DISABLE=true",
+            "OPENCODE_DISABLE_MODELS_FETCH=true",
+            "OPENCODE_DISABLE_FREE_MODELS=true",
+            "OPENCODE_DISABLE_AUTOUPDATE=true",
+            "OPENCODE_DISABLE_CLAUDE_CODE=true",
+        ):
+            self.assertIn(env_flag, args_full)
+            self.assertIn(env_flag, args_mini)
+        with self.assertRaises(ValueError):
+            session_broker._build_agent_args(spec, cfg_path, ui_mode="invalid")
+
+        # Reserved relay instance names rejected in _validate_spec; ports 8401..8416 forbidden.
+        for bad_inst in ("relay", "relay-0", "relay-15"):
+            with self.assertRaises(ValueError):
+                session_broker._validate_spec(self._valid_spec(instance=bad_inst))
+        for port in (8401, 8402, 8416):
+            with self.assertRaisesRegex(RuntimeError, "forbidden port"):
+                session_broker._parse_pod_port_bindings(
+                    f"{port}/tcp", [{"HostIp": "127.0.0.1", "HostPort": str(port)}], allow_postgres=False,
+                )
+
+        # Launcher CLI validation for --mini, --no-mini, --provider KIND/LABEL, -i relay-0, and -P 8416.
+        repo = Path(__file__).resolve().parents[1]
+        script = repo / "oc-sandbox"
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.root / "cli_home")}
+        (self.root / "cli_home").mkdir(mode=0o700, exist_ok=True)
+        for argv, expected in (
+            (["--mini", "--no-mini"], "only be specified once"),
+            (["--mini", "-n"], "cannot be combined"),
+            (["--no-mini", "-d"], "cannot be combined"),
+            (["--provider", "claude/personal"], "not yet qualified"),
+            (["--provider", "openai/Bad_Label"], "invalid provider instance label"),
+            (["-i", "relay-0", "-n"], "invalid instance name"),
+            (["-P", "8416", "-n"], "refusing to publish pod port 8416"),
+        ):
+            res = subprocess.run(
+                ["bash", str(script), *argv],
+                env=env, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(res.returncode, 2, f"argv={argv} stderr={res.stderr}")
+            self.assertIn(expected, res.stderr)
 
 
 if __name__ == "__main__":

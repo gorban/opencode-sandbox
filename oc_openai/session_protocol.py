@@ -355,8 +355,11 @@ def _parse_headers(header_lines: list[bytes]) -> dict[bytes, bytes]:
     return headers
 
 
-def _validate_request_headers(headers: dict[bytes, bytes], body_len: int, expected_token: str) -> None:
-    _require_req(headers.get(b"host") == b"127.0.0.1:8401", 403, "invalid_host", "Unexpected Host header.")
+def _validate_request_headers(
+    headers: dict[bytes, bytes], body_len: int, expected_token: str, *, expected_port: int = 8401
+) -> None:
+    expected_host = f"127.0.0.1:{expected_port}".encode("ascii")
+    _require_req(headers.get(b"host") == expected_host, 403, "invalid_host", "Unexpected Host header.")
     auth = headers.get(b"authorization", b"")
     expected_auth = f"Bearer {expected_token}".encode("ascii")
     if not hmac.compare_digest(auth, expected_auth):
@@ -426,7 +429,7 @@ def _resolve_allowed_tools(sanitized: dict) -> frozenset[str]:
 
 
 def parse_worker_request(raw: bytes, *, expected_token: str, allowed_models: frozenset[str],
-                         vault: ReasoningVault) -> ParsedRequest:
+                         vault: ReasoningVault, expected_port: int = 8401) -> ParsedRequest:
     """Validate HTTP/1.1 framing, auth, CSRF headers, and sanitize the Responses payload."""
     head, end, body = raw.partition(b"\r\n\r\n")
     _require_req(bool(end) and len(head) <= MAX_INTERACTIVE_HEADER and len(body) <= MAX_INTERACTIVE_BODY)
@@ -436,7 +439,7 @@ def parse_worker_request(raw: bytes, *, expected_token: str, allowed_models: fro
     method, target = parts[0], parts[1]
 
     headers = _parse_headers(header_lines)
-    _validate_request_headers(headers, len(body), expected_token)
+    _validate_request_headers(headers, len(body), expected_token, expected_port=expected_port)
 
     if method == b"GET" and target == b"/v1/models":
         _require_req(len(body) == 0)

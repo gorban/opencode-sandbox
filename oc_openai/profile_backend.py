@@ -72,6 +72,13 @@ class ProfileBackend:
         return ConnectionStatus(tuple(sorted(saved, key=lambda profile: profile.label)),
                                 view.active.label if view.active is not None else None)
 
+    def _require_all_idle(self, profiles):
+        try:
+            for profile in profiles:
+                self._connection(profile.directory).require_switchable()
+        except ConnectionError as error:
+            raise _mapped_connection_error(error) from None
+
     def _require_idle(self, previous, target, *, allow_same=True):
         if previous is None or (allow_same and previous.directory == target.directory):
             return
@@ -91,7 +98,7 @@ class ProfileBackend:
             raise _mapped_connection_error(error) from None
 
     def select(self, label):
-        self.profiles.select(label, self._select_ready)
+        self.profiles.select(label, self._select_ready, all_saved_check=self._require_all_idle)
 
     def verify(self):
         if not self._reviewed:
@@ -112,6 +119,81 @@ class ProfileBackend:
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
         return profile.label, profile.epoch, conn, binding
+
+    def profile_connection(self, label: str):
+        """Return (profile, Connection, Binding) for a named published non-retiring registration."""
+        if not self._reviewed:
+            raise RouteUnavailable(Reason.QUALIFICATION)
+        view = self.profiles.snapshot()
+        profile = next((item for item in view.saved if item.label == label), None)
+        if profile is None or profile.retiring:
+            raise RouteUnavailable(Reason.PROFILE_NOT_FOUND if profile is None else Reason.CONNECTION_CHANGED)
+        conn = self._connection(profile.directory)
+        try:
+            binding = conn.binding()
+        except ConnectionError as error:
+            raise _mapped_connection_error(error) from None
+        return profile, conn, binding
+
+    def profile_valid(self, label: str, selection_epoch: str, *, directory: Path, client_id: str) -> bool:
+        """Return True iff the named published registration still matches (epoch, directory, client_id)."""
+        try:
+            with self.profiles.profile_fence(
+                label, selection_epoch, directory=directory, client_id=client_id,
+            ):
+                return True
+        except ProfileError:
+            return False
+
+    def profile_fence(self, label: str, selection_epoch: str, *, directory: Path, client_id: str):
+        """Hold profiles/state.lock while the named profile matches (epoch, directory, client_id)."""
+        @contextmanager
+        def _fence():
+            try:
+                with self.profiles.profile_fence(
+                    label, selection_epoch, directory=directory, client_id=client_id,
+                ):
+                    yield
+            except ProfileError:
+                raise RouteUnavailable(Reason.CONNECTION_CHANGED) from None
+
+        return _fence()
+
+    @contextmanager
+    def profile_session_lease(self, label: str, selection_epoch: str, binding, job, *, directory: Path, client_id: str):
+        """Acquire a session lease for a named published profile atomically under profiles.lock."""
+        if not self._reviewed:
+            raise RouteUnavailable(Reason.QUALIFICATION)
+
+        def acquire(profile):
+            conn = self._connection(profile.directory)
+            lease_cm = conn.session_lease(binding, job)
+            try:
+                return lease_cm, lease_cm.__enter__()
+            except ConnectionError as error:
+                raise _mapped_connection_error(error) from None
+
+        try:
+            lease_cm, lease = self.profiles.with_profile(
+                label, selection_epoch, acquire, directory=directory, client_id=client_id,
+            )
+        except ProfileError:
+            raise RouteUnavailable(Reason.CONNECTION_CHANGED) from None
+
+        exc = (None, None, None)
+        try:
+            yield lease
+        except BaseException:
+            exc = sys.exc_info()
+            raise
+        finally:
+            try:
+                lease_cm.__exit__(*exc)
+            except ConnectionError as error:
+                mapped = _mapped_connection_error(error)
+                if exc[0] is None:
+                    raise mapped from None
+                raise mapped from exc[1]
 
     def selected_fence(self, label, selection_epoch):
         """Return a context manager holding profiles/state.lock while (label, selection_epoch) is active."""
@@ -184,7 +266,9 @@ class ProfileBackend:
         connection = self._connection(candidate.profile.directory)
         try:
             def publish(client_id):
-                return self.profiles.publish(candidate, client_id, self._require_idle)
+                return self.profiles.publish(
+                    candidate, client_id, self._require_idle, all_saved_check=self._require_all_idle,
+                )
 
             saved = connection.saved_registration()
             if saved is None:
@@ -211,7 +295,7 @@ class ProfileBackend:
                 hosts[profile.directory] = proof
         return hosts
 
-    def _begin_disconnect_pass(self, physical_hosts, retired_dirs, retirements):
+    def _begin_disconnect_pass(self, physical_hosts, retired_dirs, retirements, *, label: str | None = None):
         def has_leases(profile):
             if profile.directory in retired_dirs:
                 return True
@@ -226,7 +310,7 @@ class ProfileBackend:
             connection = self._connection(profile.directory)
             placement = physical_hosts.get(profile.directory)
             try:
-                if (profile.client_id is not None and not profile.selected
+                if (label is None and profile.client_id is not None and not profile.selected
                         and connection.status() == "connected" and not connection.has_active_leases()):
                     return False
                 retirement = connection.begin_disconnect(physical_host=placement)
@@ -235,9 +319,9 @@ class ProfileBackend:
             retired_dirs.add(profile.directory)
             retirements.append((connection, retirement))
 
-        self.profiles.begin_disconnect(retire, inactive_filter=has_leases)
+        self.profiles.begin_disconnect(retire, inactive_filter=has_leases, label=label)
 
-    def disconnect(self):
+    def disconnect(self, label: str | None = None):
         retirements = []
         retired_dirs = set()
         errors = []
@@ -246,7 +330,7 @@ class ProfileBackend:
             for attempt in range(2):
                 physical_hosts = self._collect_retirement_hosts()
                 try:
-                    self._begin_disconnect_pass(physical_hosts, retired_dirs, retirements)
+                    self._begin_disconnect_pass(physical_hosts, retired_dirs, retirements, label=label)
                     break
                 except RouteUnavailable as error:
                     if error.reason is Reason.MANAGED_RETIREMENT and attempt == 0:
