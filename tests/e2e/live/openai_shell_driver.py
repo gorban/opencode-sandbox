@@ -6,6 +6,7 @@ read-only verified snapshot. Delegates disposable pod/volume/worktree/slot durab
 and SIGKILL-surviving teardown to the zero-OAuth DetachedShellCleanupOwner.
 """
 
+import codecs
 from contextlib import suppress
 from dataclasses import dataclass
 import fcntl
@@ -107,6 +108,175 @@ class _PtyState:
 def strip_ansi(text: str) -> str:
     """Remove ANSI/VT escape sequences for bounded TUI screen matching."""
     return _ANSI_RE.sub("", text)
+
+
+_CSI_TOKEN_RE = re.compile(r"\x1b\[([0-?]*[ -/]*)([@-~])")
+_OSC_TOKEN_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_ALT_SCREEN_MODES = frozenset({"?47", "?1047", "?1049"})
+
+
+class _TerminalScreen:
+    """Bounded VT100/xterm virtual screen tracking current rendered TUI rows."""
+
+    def __init__(self, rows: int = 32, cols: int = 120) -> None:
+        self.rows = rows
+        self.cols = cols
+        self.row = 0
+        self.col = 0
+        self.grid = [[" "] * cols for _ in range(rows)]
+        self._pending = ""
+
+    def _clear_all(self) -> None:
+        self.grid = [[" "] * self.cols for _ in range(self.rows)]
+
+    def _erase_display(self, mode: int) -> None:
+        if mode in (2, 3):
+            self._clear_all()
+            return
+        if mode == 0:
+            for c in range(self.col, self.cols):
+                self.grid[self.row][c] = " "
+            for r in range(self.row + 1, self.rows):
+                self.grid[r] = [" "] * self.cols
+        elif mode == 1:
+            for r in range(0, self.row):
+                self.grid[r] = [" "] * self.cols
+            for c in range(0, min(self.col + 1, self.cols)):
+                self.grid[self.row][c] = " "
+
+    def _erase_line(self, mode: int) -> None:
+        if mode == 2:
+            self.grid[self.row] = [" "] * self.cols
+        elif mode == 0:
+            for c in range(self.col, self.cols):
+                self.grid[self.row][c] = " "
+        elif mode == 1:
+            for c in range(0, min(self.col + 1, self.cols)):
+                self.grid[self.row][c] = " "
+
+    @staticmethod
+    def _csi_nums(params: str) -> list[int]:
+        clean = params.lstrip("?")
+        if not clean:
+            return []
+        out: list[int] = []
+        for part in clean.split(";"):
+            out.append(int(part) if part.isdigit() else 0)
+        return out
+
+    def _move_cursor(self, final: str, nums: list[int]) -> None:
+        n1 = nums[0] if nums and nums[0] > 0 else 1
+        n2 = nums[1] if len(nums) > 1 and nums[1] > 0 else 1
+        if final in ("H", "f"):
+            self.row = max(0, min(self.rows - 1, n1 - 1))
+            self.col = max(0, min(self.cols - 1, n2 - 1))
+        elif final == "A":
+            self.row = max(0, self.row - n1)
+        elif final == "B":
+            self.row = min(self.rows - 1, self.row + n1)
+        elif final == "C":
+            self.col = min(self.cols - 1, self.col + n1)
+        elif final == "D":
+            self.col = max(0, self.col - n1)
+        elif final == "G":
+            self.col = max(0, min(self.cols - 1, n1 - 1))
+        elif final == "d":
+            self.row = max(0, min(self.rows - 1, n1 - 1))
+
+    def _erase_chars(self, count: int) -> None:
+        for c in range(self.col, min(self.cols, self.col + count)):
+            self.grid[self.row][c] = " "
+
+    def _delete_chars(self, count: int) -> None:
+        tail = self.grid[self.row][self.col + count:]
+        self.grid[self.row][self.col:] = tail + [" "] * (self.cols - self.col - len(tail))
+
+    def _handle_csi(self, params: str, final: str) -> None:
+        if final in ("h", "l") and params in _ALT_SCREEN_MODES:
+            self._clear_all()
+            self.row = 0
+            self.col = 0
+            return
+        nums = self._csi_nums(params)
+        first = nums[0] if nums else 0
+        if final == "J":
+            self._erase_display(first)
+        elif final == "K":
+            self._erase_line(first)
+        elif final == "X":
+            self._erase_chars(first or 1)
+        elif final == "P":
+            self._delete_chars(first or 1)
+        elif final in ("H", "f", "A", "B", "C", "D", "G", "d"):
+            self._move_cursor(final, nums)
+
+    def _put_char(self, ch: str) -> None:
+        if ch == "\r":
+            self.col = 0
+        elif ch == "\n":
+            if self.row + 1 < self.rows:
+                self.row += 1
+            else:
+                self.grid.pop(0)
+                self.grid.append([" "] * self.cols)
+        elif ch == "\b":
+            self.col = max(0, self.col - 1)
+        elif ch == "\t":
+            self.col = min(self.cols - 1, ((self.col // 8) + 1) * 8)
+        elif ch >= " ":
+            if self.col >= self.cols:
+                self.col = 0
+                self._put_char("\n")
+            self.grid[self.row][self.col] = ch
+            self.col += 1
+
+    def _consume_escape(self, data: str, idx: int) -> int | None:
+        if idx + 1 >= len(data):
+            return None
+        nxt = data[idx + 1]
+        if nxt == "[":
+            m = _CSI_TOKEN_RE.match(data, idx)
+            if m is None:
+                return None if len(data) - idx < 64 else idx + 2
+            self._handle_csi(m.group(1), m.group(2))
+            return m.end()
+        if nxt == "]":
+            m = _OSC_TOKEN_RE.match(data, idx)
+            if m is None:
+                return None if len(data) - idx < 256 else idx + 2
+            return m.end()
+        if nxt == "c":
+            self._clear_all()
+            self.row = 0
+            self.col = 0
+        return idx + 2
+
+    def feed(self, text: str) -> None:
+        data = self._pending + text
+        self._pending = ""
+        idx = 0
+        total = len(data)
+        while idx < total:
+            ch = data[idx]
+            if ch == "\x1b":
+                advanced = self._consume_escape(data, idx)
+                if advanced is None:
+                    self._pending = data[idx:]
+                    return
+                idx = advanced
+                continue
+            self._put_char(ch)
+            idx += 1
+
+    def render(self) -> str:
+        return "\n".join("".join(row).rstrip() for row in self.grid)
+
+
+def render_terminal_screen(raw: str, *, rows: int = 32, cols: int = 120) -> str:
+    """Render raw PTY output through a bounded VT100 screen and return only visible rows."""
+    screen = _TerminalScreen(rows=rows, cols=cols)
+    screen.feed(raw)
+    return screen.render()
 
 
 def _read_private_regular(path: Path, *, max_bytes: int = 128 * 1024) -> bytes:
@@ -368,23 +538,31 @@ def _agent_start_command(agent_id: str) -> tuple[list[str], dict[str, str]]:
     return cmd, env
 
 
-def _drain_pty_chunk(master_fd: int, screen_buf: bytearray) -> bool:
-    ready, _, _ = select.select([master_fd], [], [], 0.15)
+def _read_pty_bytes(master_fd: int, timeout: float) -> bytes | None:
+    ready, _, _ = select.select([master_fd], [], [], timeout)
     if not ready:
-        return True
-    try:
-        chunk = os.read(master_fd, 4096)
-    except OSError:
-        return False
-    if not chunk:
-        return False
-    if len(screen_buf) + len(chunk) <= _SCREEN_CAP:
-        screen_buf.extend(chunk)
-    else:
-        keep = _SCREEN_CAP - len(chunk)
-        del screen_buf[:-keep if keep > 0 else len(screen_buf)]
-        screen_buf.extend(chunk[-_SCREEN_CAP:])
-    return True
+        return b""
+    chunks = bytearray()
+    while len(chunks) < _SCREEN_CAP:
+        try:
+            chunk = os.read(master_fd, 4096)
+        except OSError:
+            return bytes(chunks) if chunks else None
+        if not chunk:
+            return bytes(chunks) if chunks else None
+        chunks.extend(chunk)
+        if not select.select([master_fd], [], [], 0.0)[0]:
+            break
+    return bytes(chunks)
+
+
+def _append_bounded(buf: bytearray, chunk: bytes) -> None:
+    if len(buf) + len(chunk) <= _SCREEN_CAP:
+        buf.extend(chunk)
+        return
+    keep = _SCREEN_CAP - len(chunk)
+    del buf[:-keep if keep > 0 else len(buf)]
+    buf.extend(chunk[-_SCREEN_CAP:])
 
 
 _ANY_SCOPED_RE = re.compile(r"(?<![A-Za-z0-9_-])openai--[a-z0-9][a-z0-9-]*(?![A-Za-z0-9_-])")
@@ -439,8 +617,25 @@ def _pair_matches_route(
     return pair_a or pair_b
 
 
+def _screen_has_conflicting_route(lines: list[str], approval: ProofApproval, model_re: re.Pattern[str]) -> bool:
+    esc_model = re.escape(approval.approved_model)
+    any_slash_re = re.compile(rf"(?<![A-Za-z0-9._/-])openai--([a-z0-9][a-z0-9-]*)/{esc_model}(?![A-Za-z0-9._/-])")
+    for line in lines:
+        if any(f"openai--{lbl}" != approval.scoped_provider_id for lbl in any_slash_re.findall(line)):
+            return True
+        if _line_has_conflicting_provider(line, approval) and model_re.search(line) is not None:
+            return True
+    for a, b in zip(lines, lines[1:]):
+        if _line_has_conflicting_provider(a, approval) and model_re.search(b) is not None:
+            return True
+        if model_re.search(a) is not None and _line_has_conflicting_provider(b, approval):
+            return True
+    return False
+
+
 def extract_observed_route_row(clean: str, approval: ProofApproval) -> str | None:
-    """Return an unambiguous observed route row matching exact approved provider and model, or None."""
+    """Return an unambiguous currently rendered route row matching approved provider and model."""
+    rendered = render_terminal_screen(clean) if ("\x1b" in clean or "\r" in clean or "\b" in clean) else clean
     esc_model = re.escape(approval.approved_model)
     esc_scoped = re.escape(approval.scoped_provider_id)
     esc_label = re.escape(approval.instance_label)
@@ -449,7 +644,9 @@ def extract_observed_route_row(clean: str, approval: ProofApproval) -> str | Non
     scoped_re = re.compile(rf"(?<![A-Za-z0-9_-]){esc_scoped}(?![A-Za-z0-9_-])")
     label_re = re.compile(rf"(?<![A-Za-z0-9_-])(?:ChatGPT\s+Subscription|OpenAI)\s*\({esc_label}\)(?![A-Za-z0-9_-])")
 
-    lines = [ln for ln in (" ".join(raw.split()) for raw in clean.splitlines()) if ln]
+    lines = [ln for ln in (" ".join(raw.split()) for raw in rendered.splitlines()) if ln]
+    if _screen_has_conflicting_route(lines, approval, model_re):
+        return None
     for line in lines:
         if _line_matches_route(line, approval, exact_route_re, model_re, scoped_re, label_re):
             return line[:200]
@@ -466,6 +663,8 @@ def _step_pty_driver(
     proof_gate: ProofGate,
     arm_turn_route,
     state: _PtyState,
+    *,
+    post_prompt_text: str | None = None,
 ) -> bool:
     if not state.armed:
         if proof_gate.admitted_writes != 0:
@@ -483,8 +682,8 @@ def _step_pty_driver(
         os.write(master_fd, (PROOF_PROMPT + "\r").encode("ascii"))
         state.prompt_sent = True
         return False
-    tail = clean[state.prompt_offset:]
-    if proof_gate.exact_ok_delivered and EXPECTED_REPLY in tail:
+    reply_haystack = post_prompt_text if post_prompt_text is not None else clean[state.prompt_offset:]
+    if proof_gate.exact_ok_delivered and (EXPECTED_REPLY in reply_haystack or EXPECTED_REPLY in clean):
         time.sleep(0.6)
         with suppress(OSError):
             os.write(master_fd, b"\x03")
@@ -500,15 +699,31 @@ def _drive_agent_pty(agent_id: str, stop_event, proof_gate: ProofGate, arm_turn_
     cmd, env = _agent_start_command(agent_id)
     proc = subprocess.Popen(cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, env=env, close_fds=True)
     os.close(slave_fd)
-    screen_buf = bytearray()
+    screen = _TerminalScreen(rows=32, cols=120)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    post_prompt_buf = bytearray()
     state = _PtyState()
     started = time.monotonic()
     try:
         while proc.poll() is None and not stop_event.is_set():
-            if not _drain_pty_chunk(master_fd, screen_buf):
+            chunk = _read_pty_bytes(master_fd, 0.15)
+            if chunk is None:
                 break
-            clean = strip_ansi(screen_buf.decode("utf-8", errors="replace"))
-            if _step_pty_driver(master_fd, clean, time.monotonic() - started, proof_gate, arm_turn_route, state):
+            if chunk:
+                screen.feed(decoder.decode(chunk, final=False))
+                if state.prompt_sent:
+                    _append_bounded(post_prompt_buf, chunk)
+            rendered = screen.render()
+            post_text = strip_ansi(post_prompt_buf.decode("utf-8", errors="replace")) if state.prompt_sent else ""
+            if _step_pty_driver(
+                master_fd,
+                rendered,
+                time.monotonic() - started,
+                proof_gate,
+                arm_turn_route,
+                state,
+                post_prompt_text=post_text,
+            ):
                 break
         try:
             return proc.wait(timeout=10)

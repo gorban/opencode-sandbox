@@ -557,12 +557,15 @@ class _OwnershipJournal:
         slot_root = str(entry.get("slot_root") or "")
         _revoke_grant_dir(grant_dir, slot_root=slot_root)
         if status == _STATUS_CREATED:
-            cid = str(entry.get("cid") or "")
-            res = self._pm(["rm", "-f", cid], timeout=15.0)
-            absent = self._confirm_absent("container", cid, f"container_remove_failed:{cid[:12]}")
-            if res.returncode != 0 and absent:
-                # Container is confirmed absent (rc == 1); no extra remove error needed.
-                pass
+            cid = entry.get("cid")
+            if not isinstance(cid, str) or not _HEX64.fullmatch(cid):
+                self.cleanup_errors.append(f"invalid_container_id:{slot_key}")
+            else:
+                res = self._pm(["rm", "-f", cid], timeout=15.0)
+                absent = self._confirm_absent("container", cid, f"container_remove_failed:{cid[:12]}")
+                if res.returncode != 0 and absent:
+                    # Container is confirmed absent (rc == 1); no extra remove error needed.
+                    pass
         elif status == _STATUS_CREATING:
             self.cleanup_errors.append(f"slot_create_uncertain:{slot_key}")
         # Never delete slot_root or grant_dir while the profile lease in worker_leases is unreleased:
@@ -570,33 +573,50 @@ class _OwnershipJournal:
         self.ownership_uncertain = True
         self.cleanup_errors.append(f"lease_unreleased:{slot_key}")
 
+    def _remove_released_slot_root(self, slot_key: str, slot_root: str) -> None:
+        if not slot_root:
+            return
+        root_path = Path(slot_root)
+        if not (root_path.exists() or root_path.is_symlink()):
+            return
+        err_code = f"slot_root_remove_failed:{slot_key}"
+        try:
+            if root_path.is_symlink() or not root_path.is_dir():
+                root_path.unlink()
+            else:
+                shutil.rmtree(root_path)
+        except OSError:
+            self.cleanup_errors.append(err_code)
+        if (root_path.exists() or root_path.is_symlink()) and err_code not in self.cleanup_errors:
+            self.cleanup_errors.append(err_code)
+
     def _reconcile_slots(self) -> None:
         for slot_key in reversed(list(self.slots)):
             entry = self.slots[slot_key]
             slot_root = str(entry.get("slot_root") or "")
             if entry.get(_KEY_LEASE_RELEASED) is True:
-                if slot_root and Path(slot_root).is_dir():
-                    with suppress(OSError):
-                        shutil.rmtree(slot_root)
+                self._remove_released_slot_root(slot_key, slot_root)
                 continue
             self._retire_unreleased_slot(slot_key, entry)
 
     def _pod_has_untracked_members(self, details: dict[str, object]) -> bool:
-        infra_id = str(details.get("InfraContainerID") or "")
+        infra_id = details.get("InfraContainerID")
         containers = details.get("Containers")
-        if not infra_id or not isinstance(containers, list):
+        if not isinstance(infra_id, str) or not _HEX64.fullmatch(infra_id) or not isinstance(containers, list) or not containers:
             return True
+        saw_infra = False
         for member in containers:
             if not isinstance(member, dict):
                 return True
-            mid = str(member.get("Id") or "")
-            if not mid:
+            mid = member.get("Id")
+            if not isinstance(mid, str) or not _HEX64.fullmatch(mid):
                 return True
             if mid == infra_id:
+                saw_infra = True
                 continue
             if mid not in self.owned_cids:
                 return True
-        return False
+        return not saw_infra
 
     def _teardown_pod(self) -> bool:
         if self.pod_id is None:
@@ -604,6 +624,11 @@ class _OwnershipJournal:
         details = self._inspect_pod_details(self.pod_id)
         if details is None:
             return self._confirm_absent("pod", self.pod_id, "pod_inspect_failed")
+        inspected_id = details.get("Id")
+        if not isinstance(inspected_id, str) or inspected_id != self.pod_id:
+            self.ownership_uncertain = True
+            self.cleanup_errors.append("pod_id_mismatch")
+            return False
         labels = details.get("Labels") if isinstance(details.get("Labels"), dict) else {}
         if labels.get(PROOF_OWNER_LABEL) != self.run_id:
             self.ownership_uncertain = True

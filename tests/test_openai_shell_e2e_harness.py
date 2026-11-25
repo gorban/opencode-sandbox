@@ -2744,6 +2744,152 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                     parent.kill()
                     parent.wait(timeout=5)
 
+    def test_reciprocal_g2_r2_erased_tui_numeric_pod_id_slot_rmtree_and_receipt_attribution(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oc-g2-r2-") as td_raw:
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            exp = td / "exp"
+            exp.mkdir(mode=0o700)
+            os.chmod(exp, 0o700)
+            ev = td / "ev"
+            ev.mkdir(mode=0o700)
+            os.chmod(ev, 0o700)
+
+            approval = ProofApproval(
+                run_id=TEST_RUN_ID,
+                instance_label="personal",
+                scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL,
+                ui_mode="mini",
+                cwd=TEST_CWD,
+                selection_epoch="E" * 43,
+                credential_generation=1,
+                history_digest_all_12_files=compute_exposure_history_digest(exp),
+                profile_directory="prof-a",
+                client_id="client-a",
+                auth_mode="subscription",
+                route_policy="subscription-only",
+                providers_config_digest=TEST_HEX_A,
+            )
+
+            # 1. Erased TUI row (clear screen / alt screen / erase line / CR overwrite) must NEVER arm!
+            erased_screens = (
+                f"openai--personal/{TEST_MODEL}\x1b[2J\x1b[Hopenai--work/{TEST_MODEL}",
+                f"ChatGPT Subscription (personal)  {TEST_MODEL}\x1b[?1049hChatGPT Subscription (work)  {TEST_MODEL}",
+                f"openai--personal/{TEST_MODEL}\r\x1b[2Kopenai--work/{TEST_MODEL}",
+                f"openai--personal/{TEST_MODEL}\ropenai--work/{TEST_MODEL}      ",
+                f"openai--personal/{TEST_MODEL}\nopenai--work/{TEST_MODEL}",
+            )
+            for raw_screen in erased_screens:
+                self.assertIsNone(shell_driver.extract_observed_route_row(raw_screen, approval), raw_screen)
+            visible_after_clear = f"openai--work/{TEST_MODEL}\x1b[2J\x1b[HChatGPT Subscription (personal)  {TEST_MODEL}"
+            self.assertEqual(
+                shell_driver.extract_observed_route_row(visible_after_clear, approval),
+                f"ChatGPT Subscription (personal) {TEST_MODEL}",
+            )
+
+            # Real _drive_agent_pty subprocess: prints personal, clears screen, prints work -> must NOT arm.
+            gate_pty = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
+            gate_pty.bind_incarnation("inc-pty-erased-01", 1)
+            armed_calls: list[tuple[str, str]] = []
+            stop_ev = threading.Event()
+            fake_tui = (
+                "import sys, time; "
+                f"sys.stdout.write('openai--personal/{TEST_MODEL}\\n'); sys.stdout.flush(); "
+                "time.sleep(0.1); "
+                f"sys.stdout.write('\\x1b[2J\\x1b[Hopenai--work/{TEST_MODEL}\\n'); sys.stdout.flush(); "
+                "time.sleep(1.9)"
+            )
+            with patch.object(
+                shell_driver,
+                "_agent_start_command",
+                return_value=([sys.executable, "-IB", "-c", fake_tui], dict(os.environ)),
+            ):
+                shell_driver._drive_agent_pty(
+                    TEST_HEX_A, stop_ev, gate_pty, lambda row, dig: armed_calls.append((row, dig)),
+                )
+            self.assertEqual(armed_calls, [])
+
+            # 2. Numeric or non-64-hex pod/member IDs and pod ID mismatch fail closed without pod rm!
+            rm_calls: list[list[str]] = []
+
+            def _numeric_pod_pm(args, timeout=20.0):
+                del timeout
+                if args[:2] == ["pod", "rm"]:
+                    rm_calls.append(list(args))
+                if args[:2] == ["pod", "inspect"]:
+                    data = [{
+                        "Id": TEST_HEX_B,
+                        "InfraContainerID": 42,
+                        "Labels": {PROOF_OWNER_LABEL: TEST_RUN_ID},
+                        "Containers": [{"Id": 42}],
+                    }]
+                    return subprocess.CompletedProcess(args, 0, json.dumps(data).encode(), b"")
+                return subprocess.CompletedProcess(args, 1, b"", b"")
+
+            jspec = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=td / "j_num.json",
+            )
+            j_num = _OwnershipJournal(jspec, podman_runner=_numeric_pod_pm)
+            j_num.pod_id = TEST_HEX_B
+            self.assertTrue(j_num._pod_has_untracked_members({"InfraContainerID": 42, "Containers": [{"Id": 42}]}))
+            self.assertTrue(j_num._pod_has_untracked_members({"InfraContainerID": "short", "Containers": [{"Id": "short"}]}))
+            res_num = j_num.teardown()
+            self.assertFalse(res_num[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_num["ownership_uncertain"])
+            self.assertIn("pod_has_untracked_members", res_num["errors"])
+            self.assertEqual(rm_calls, [])
+
+            # 3. Confirmed lease release with surviving slot directory (rmtree PermissionError) reports failure!
+            slot_parent = td / "slot_parent"
+            slot_parent.mkdir(mode=0o700)
+            slot_dir = slot_parent / "turn-0"
+            slot_dir.mkdir(mode=0o700)
+            (slot_dir / "keep.txt").write_text("x", encoding="utf-8")
+            j_slot = _OwnershipJournal(jspec, podman_runner=_numeric_pod_pm)
+            j_slot.prepare_slot("turn-0", container_name="oc-e2e-deadbeef-relay-0", slot_root=str(slot_dir))
+            j_slot.mark_lease_released("turn-0")
+            with patch("oc_openai.shell_cleanup_owner.shutil.rmtree", side_effect=PermissionError("denied")):
+                res_slot = j_slot.teardown()
+            self.assertFalse(res_slot[KEY_CLEANUP_VERIFIED])
+            self.assertIn("slot_root_remove_failed:turn-0", res_slot["errors"])
+            self.assertTrue(slot_dir.exists())
+
+            # 4. Settlement read-back rejects tampered scoped_provider_id, job_incarnation, digest, or usage!
+            gate = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
+            ev_path = gate.bind_incarnation("inc-settle-attr-01", 2)
+            nonce = gate.arm(observed_row=f"openai--personal/{TEST_MODEL}", observed_screen_digest=TEST_HEX_B)
+            gate.mark_relay_verified(TEST_HEX_C)
+            arrival = ArrivalSnapshot(
+                state=STATE_ARMED, arm_nonce=nonce, job_incarnation="inc-settle-attr-01", relay_verified=True,
+            )
+            gate.claim_for_write(
+                arrival, canonical_proof_body(TEST_MODEL), job_incarnation="inc-settle-attr-01",
+            )
+            gate.record_delivery_complete(
+                usage=(10, 2, 12), completed_text=EXPECTED_REPLY, streamed_text=EXPECTED_REPLY, tool_calls=0,
+            )
+            self.assertTrue(gate.verify_settled_evidence())
+            good_raw = ev_path.read_bytes()
+            good_obj = json.loads(good_raw.decode("utf-8"))
+            tamper_cases = (
+                {"scoped_provider_id": "openai--work"},
+                {"job_incarnation": "inc-other-999999"},
+                {"canonical_request_digest": "0" * 64},
+                {"usage": None},
+                {"usage": [True, 2, 12]},
+                {"approved_model": "gpt-other"},
+            )
+            for patch_fields in tamper_cases:
+                bad_obj = dict(good_obj)
+                bad_obj.update(patch_fields)
+                ev_path.write_text(json.dumps(bad_obj), encoding="utf-8")
+                self.assertFalse(gate.verify_settled_evidence(), f"accepted tamper {patch_fields}")
+            ev_path.write_bytes(good_raw)
+            self.assertTrue(gate.verify_settled_evidence())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -790,12 +790,39 @@ class ProofGate:
             self._exact_ok_delivered = exact
             self._outcome = candidate_outcome
 
+    def _expected_settled_fields_locked(self) -> tuple[Path, dict[str, object], list[int]] | None:
+        if (
+            self._evidence_path is None
+            or self._state != STATE_SPENT
+            or self._exact_ok_delivered is not True
+            or self._outcome != "exact_ok_delivered"
+            or self._usage is None
+            or self._job_incarnation is None
+            or self._job_generation is None
+            or not self._relay_verified
+            or not self._verified_relay_id
+            or not self._arm_nonce
+            or not self._observed_row
+            or not self._observed_screen_digest
+            or not self._canonical_request_digest
+        ):
+            return None
+        expected_usage = [int(v) for v in self._usage]
+        if len(expected_usage) != 3 or any(v < 0 for v in expected_usage):
+            return None
+        expected = self._evidence_snapshot_locked()
+        expected.pop("updated_at", None)
+        expected.pop("refusal_count", None)
+        expected.pop("usage", None)
+        return self._evidence_path, expected, expected_usage
+
     def verify_settled_evidence(self) -> bool:
-        """Read back the durable evidence file and confirm settled exact_ok_delivered state."""
+        """Read back the durable evidence file and confirm full settled attribution and usage."""
         with self._lock:
-            path = self._evidence_path
-        if path is None:
+            spec = self._expected_settled_fields_locked()
+        if spec is None:
             return False
+        path, expected, expected_usage = spec
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError:
@@ -808,15 +835,23 @@ class ProofGate:
         if len(raw) > 131_072:
             return False
         try:
-            data = json.loads(raw.decode("utf-8"))
+            data = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_unique_object_pairs,
+                parse_constant=_reject_non_finite,
+            )
         except ValueError:
             return False
+        if type(data) is not dict:
+            return False
+        for key, want in expected.items():
+            got = data.get(key)
+            if type(got) is not type(want) or got != want:
+                return False
+        got_usage = data.get("usage")
         return (
-            isinstance(data, dict)
-            and data.get("run_id") == self.approval.run_id
-            and data.get("outcome") == "exact_ok_delivered"
-            and data.get("exact_ok_delivered") is True
-            and data.get("admitted_writes") == 1
-            and data.get("write_attempted") is True
-            and data.get("tool_call_count") == 0
+            isinstance(got_usage, list)
+            and len(got_usage) == 3
+            and all(type(v) is int and v >= 0 for v in got_usage)
+            and got_usage == expected_usage
         )
