@@ -1,6 +1,6 @@
 """Host-side interactive ChatGPT Responses broker and foreground pod supervisor."""
 
-from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 import fcntl
 import hmac
@@ -21,6 +21,19 @@ import tempfile
 import threading
 import time
 
+from oc_providers.catalog import (
+    LaunchRefusedError,
+    build_multi_provider_opencode_config,
+    parse_provider_filter,
+    plan_interactive_launch,
+)
+from oc_providers.config import load_provider_config
+from oc_providers.contracts import (
+    ProviderIntegrityError,
+    RELAY_PORT_MAX,
+    RELAY_PORT_MIN,
+    SlotHandle,
+)
 from .cli import Reason, RouteUnavailable, StreamTerminal, report_failure
 from .connection import ConnectionError
 from .exposure import ExposureError, ExposureLedger
@@ -30,6 +43,7 @@ from .managed import relay as relay_mod
 from .managed.runtime import (
     HOST_SPAWN,
     IMAGE_ID,
+    JobRuntimeError,
     MOUNT_LABEL,
     PROCESS_LABEL,
     SHARED_TMP,
@@ -74,13 +88,17 @@ _RELAY_MODULE = "relay.py"
 _SESSION_RELAY_MODULE = "session_relay.py"
 _RESERVED_INSTANCES = frozenset({
     "agent", "chromium", "chrome", "postgres", "pg", "dind", "home",
-    "openai-relay", "openai-home",
+    "openai-relay", "openai-home", "relay",
 })
-_SPEC_KEYS = frozenset({
+_RELAY_INSTANCE_RE = re.compile(r"relay(?:-\d+)?\Z", re.ASCII)
+_BASE_SPEC_KEYS = frozenset({
     "instance", "pod", "agent", "relay", "relay_image", "agent_image",
     "agent_mem", "level", "sandbox", "cwd", "home_vol", "chromium",
     "postgres", "pg_secret", "dind", "dind_run",
 })
+_OPTIONAL_SPEC_KEYS = frozenset({"provider_filter", "cli_ui_mode"})
+_SPEC_KEYS = _BASE_SPEC_KEYS | _OPTIONAL_SPEC_KEYS
+_VALID_CLI_UI_MODES = frozenset({"default", "full", "mini"})
 
 _ERROR_MAP = {
     "chatgpt_usage_limit": (429, "rate_limit_exceeded", "ChatGPT plan usage limit reached."),
@@ -97,6 +115,7 @@ _ERROR_MAP = {
     "openai_operation_cancelled": (503, "cancelled", "Request was cancelled."),
     "exposure_hold_active": (403, "exposure_hold", "ChatGPT interactive dispatch is blocked by an exposure hold."),
     "exposure_hold_changed": (403, "exposure_hold", "ChatGPT exposure hold changed; interactive dispatch blocked."),
+    "exposure_lock_busy": (503, "exposure_busy", "ChatGPT exposure ledger is temporarily busy; retry shortly."),
     "invalid_exposure_record": (403, "exposure_hold", "ChatGPT exposure record is invalid; interactive dispatch blocked."),
     "untrusted_exposure_store": (403, "exposure_hold", "ChatGPT exposure store failed trust checks."),
     "exposure_store_unavailable": (403, "exposure_hold", "ChatGPT exposure store is unavailable."),
@@ -178,11 +197,13 @@ class SessionBroker:
         profile_label: str,
         usage_dir: Path | None = None,
         policy: SessionPolicy | None = None,
+        expected_port: int = RELAY_PORT_MIN,
     ):
         active_policy = policy or SessionPolicy()
         self.socket_path = Path(socket_path)
         self._proof = relay_proof
         self._worker_token = worker_token
+        self._expected_port = expected_port
         self._lease = lease
         self._connection = connection
         self._binding = binding
@@ -201,8 +222,11 @@ class SessionBroker:
         self._turn_counter = 0
         self._stopped = threading.Event()
         self._revoked = threading.Event()
+        self._exposure_revoked = threading.Event()
+        self._revoke_notified = False
         self._lock = threading.Lock()
         self._clients: dict[socket.socket, threading.Thread] = {}
+        self._streaming_peers: set[socket.socket] = set()
         self._cancels: set[threading.Event] = set()
         self._listener: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
@@ -228,34 +252,68 @@ class SessionBroker:
         self._accept_thread.start()
         self._watch_thread.start()
 
+    def _exposure_mutated(self) -> bool:
+        if self._exposure_dir is None:
+            return False
+        try:
+            hold = ExposureLedger(self._exposure_dir).inspect_hold()
+        except ExposureError as exc:
+            code = exc.args[0] if exc.args and type(exc.args[0]) is str else ""
+            if code == "exposure_lock_busy":
+                return False
+            return True
+        if hold.blocked:
+            return (
+                self._acknowledged_exposure_digest is None
+                or not hmac.compare_digest(hold.digest, self._acknowledged_exposure_digest)
+            )
+        return self._acknowledged_exposure_digest is not None
+
+    def _trigger_revocation(self, *, exposure: bool = False, exclude_peer: socket.socket | None = None) -> None:
+        if exposure:
+            self._exposure_revoked.set()
+        self._revoked.set()
+        self._cancel_active_turns(exclude_peer=exclude_peer, streaming_only=exposure)
+        notify = False
+        with self._lock:
+            if not self._revoke_notified:
+                self._revoke_notified = True
+                notify = True
+        if notify and self._on_revoke is not None:
+            with suppress(Exception):
+                self._on_revoke()
+
     def _watch_revocation(self) -> None:
         while not self._stopped.is_set():
             retired = False
+            exposure_changed = False
             try:
                 self._connection.require_active(self._binding)
                 if self._is_selected is not None and not self._is_selected():
                     retired = True
             except ConnectionError:
                 retired = True
+            if not retired and self._exposure_mutated():
+                exposure_changed = True
+                retired = True
             if retired or self._lease.status() == "terminal":
-                self._revoked.set()
-                self._cancel_active_turns()
-                if self._on_revoke is not None:
-                    with suppress(Exception):
-                        self._on_revoke()
+                self._trigger_revocation(exposure=exposure_changed)
                 return
             self._stopped.wait(0.15)
 
-    def _cancel_active_turns(self) -> None:
+    def _cancel_active_turns(self, *, exclude_peer: socket.socket | None = None, streaming_only: bool = False) -> None:
         with self._lock:
             for event in self._cancels:
                 event.set()
-            for peer in self._clients:
+            targets = self._streaming_peers if streaming_only else self._clients
+            for peer in targets:
+                if peer is exclude_peer:
+                    continue
                 with suppress(OSError):
                     peer.shutdown(socket.SHUT_RDWR)
 
     def _accept_loop(self) -> None:
-        while not self._stopped.is_set() and not self._revoked.is_set():
+        while not self._stopped.is_set():
             try:
                 peer, _ = self._listener.accept()
             except TimeoutError:
@@ -263,7 +321,7 @@ class SessionBroker:
             except OSError:
                 return
             with self._lock:
-                if self._stopped.is_set() or self._revoked.is_set() or len(self._clients) >= MAX_CLIENTS:
+                if self._stopped.is_set() or len(self._clients) >= MAX_CLIENTS:
                     peer.close()
                     continue
                 worker = threading.Thread(target=self._handle_peer, args=(peer,), daemon=True)
@@ -304,16 +362,19 @@ class SessionBroker:
         return _read_exact(peer, size, deadline)
 
     @contextmanager
-    def _exposure_fence(self):
+    def _exposure_fence(self, peer: socket.socket | None = None):
         if self._exposure_dir is None:
             raise ConnectionError("exposure_store_unavailable")
         try:
             with ExposureLedger(self._exposure_dir).dispatch_fence(
                 acknowledged_digest=self._acknowledged_exposure_digest,
+                wait=0.5,
             ):
                 yield
         except ExposureError as exc:
             code = exc.args[0] if exc.args and type(exc.args[0]) is str else "exposure_hold_active"
+            if code != "exposure_lock_busy":
+                self._trigger_revocation(exposure=True, exclude_peer=peer)
             raise ConnectionError(code) from None
 
     def _require_turn_active(self) -> None:
@@ -366,8 +427,8 @@ class SessionBroker:
             offset += self._send_slice_fenced(peer, view[offset:])
 
     @contextmanager
-    def _first_write_fence(self):
-        with self._lease.fence(), self._exposure_fence():
+    def _first_write_fence(self, peer: socket.socket | None = None):
+        with self._lease.fence(), self._exposure_fence(peer):
             yield
 
     def _stream_responses_turn(self, peer: socket.socket, parsed, cancel: threading.Event,
@@ -387,7 +448,7 @@ class SessionBroker:
         with self._connection.interactive_responses(
             self._binding, parsed.body, before_write,
             authorization=self._authorization,
-            write_fence=self._first_write_fence,
+            write_fence=lambda: self._first_write_fence(peer),
             limits=INTERACTIVE_STREAM_LIMITS, deadline=turn_deadline,
             cancelled=cancel, inspect_media=True, observe_media=lambda _kind: None,
         ) as upstream_events:
@@ -425,6 +486,12 @@ class SessionBroker:
             raw = self._read_peer_request(peer)
             if raw is None:
                 return
+            if self._exposure_revoked.is_set():
+                peer.sendall(format_error_response(
+                    403, "exposure_hold", "ChatGPT interactive dispatch is blocked by an exposure hold.",
+                ))
+                outcome = "exposure_hold_active"
+                return
             if self._revoked.is_set() or not self._lease.active():
                 peer.sendall(format_error_response(401, "session_revoked", "ChatGPT session is no longer active."))
                 outcome = "session_revoked"
@@ -433,13 +500,20 @@ class SessionBroker:
                 parsed = parse_worker_request(
                     raw, expected_token=self._worker_token,
                     allowed_models=self._allowed_models, vault=self._vault,
+                    expected_port=self._expected_port,
                 )
             if parsed.route == "models":
                 peer.sendall(format_models_response(self._models))
                 outcome = "models_ok"
                 return
             model = parsed.model
-            outcome, usage = self._stream_responses_turn(peer, parsed, cancel, state)
+            with self._lock:
+                self._streaming_peers.add(peer)
+            try:
+                outcome, usage = self._stream_responses_turn(peer, parsed, cancel, state)
+            finally:
+                with self._lock:
+                    self._streaming_peers.discard(peer)
         except RequestRefused as error:
             outcome = error.code
             self._send_peer_error(peer, state["headers_sent"], error.status, error.code, error.message)
@@ -474,15 +548,17 @@ class SessionBroker:
         if self._listener is not None:
             with suppress(OSError):
                 self._listener.close()
-        if self._accept_thread is not None:
+        current = threading.current_thread()
+        if self._accept_thread is not None and self._accept_thread is not current:
             self._accept_thread.join(timeout=1.5)
-        if self._watch_thread is not None:
+        if self._watch_thread is not None and self._watch_thread is not current:
             self._watch_thread.join(timeout=1.5)
         with self._lock:
             threads = list(self._clients.values())
         deadline = time.monotonic() + 2
         for thread in threads:
-            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread is not current:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._socket_id is not None and self.socket_path.exists():
             info = self.socket_path.lstat()
             if (info.st_dev, info.st_ino) == self._socket_id:
@@ -490,9 +566,10 @@ class SessionBroker:
                     self.socket_path.unlink()
 
 
-def generate_opencode_config(*, worker_token: str, models: tuple[str, ...]) -> dict:
-    """Build the read-only /etc/opencode/opencode.json enforcing local-only ChatGPT routing."""
-    default_model = "gpt-6.2-sol" if "gpt-6.2-sol" in models else models[0]
+def build_openai_provider_entry(
+    *, label: str, port: int, worker_token: str, models: tuple[str, ...]
+) -> dict:
+    """Build one OpenCode `providers[<id>]` entry pointing at an isolated OpenAI relay port."""
     model_defs = {
         slug: {
             "name": slug,
@@ -501,6 +578,26 @@ def generate_opencode_config(*, worker_token: str, models: tuple[str, ...]) -> d
         }
         for slug in models
     }
+    return {
+        "name": f"ChatGPT Subscription ({label})",
+        "package": "@opencode/ai/providers/openai-compatible/responses",
+        "settings": {
+            "baseURL": f"http://127.0.0.1:{port}/v1",
+            "apiKey": worker_token,
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
+        },
+        "models": model_defs,
+    }
+
+
+def generate_opencode_config(*, worker_token: str, models: tuple[str, ...]) -> dict:
+    """Build the read-only /etc/opencode/opencode.json enforcing local-only ChatGPT routing."""
+    default_model = "gpt-6.2-sol" if "gpt-6.2-sol" in models else models[0]
+    provider = build_openai_provider_entry(
+        label="Workstation Broker", port=RELAY_PORT_MIN, worker_token=worker_token, models=models,
+    )
+    provider["name"] = "ChatGPT Subscription (Workstation Broker)"
     return {
         "$schema": "https://opencode.ai/config.json",
         "model": f"local/{default_model}",
@@ -511,19 +608,7 @@ def generate_opencode_config(*, worker_token: str, models: tuple[str, ...]) -> d
                 "command": ["npx", "-y", "chrome-devtools-mcp@latest", "--browserUrl", "http://127.0.0.1:9222"],
             }
         },
-        "providers": {
-            "local": {
-                "name": "ChatGPT Subscription (Workstation Broker)",
-                "package": "@opencode/ai/providers/openai-compatible/responses",
-                "settings": {
-                    "baseURL": "http://127.0.0.1:8401/v1",
-                    "apiKey": worker_token,
-                    "store": False,
-                    "include": ["reasoning.encrypted_content"],
-                },
-                "models": model_defs,
-            }
-        },
+        "providers": {"local": provider},
         "policies": [
             {"action": "integration.connect", "resource": "*", "effect": "deny"},
             {"action": "provider.use", "resource": "*", "effect": "deny"},
@@ -549,9 +634,12 @@ class _SessionJob:
         self._lifetime_fd: int | None = None
         self._terminal = False
 
-    def prepare(self, config_payload: dict) -> None:
+    def prepare(self, config_payload: dict | None = None) -> None:
         self.root.chmod(0o700)
-        for sub in ("grant", "provider", "proof", "source", "opencode"):
+        subdirs = ("grant", "provider", "proof", "source", "opencode") if config_payload is not None else (
+            "grant", "provider", "proof", "source"
+        )
+        for sub in subdirs:
             (self.root / sub).mkdir(mode=0o700)
         (self.grant / "lock").touch(mode=0o600)
         lifetime = self.grant / "lifetime"
@@ -568,9 +656,10 @@ class _SessionJob:
         shutil.copyfile(pkg_dir / _SESSION_RELAY_MODULE, self.source_dir / _SESSION_RELAY_MODULE)
         (self.source_dir / _RELAY_MODULE).chmod(0o444)
         (self.source_dir / _SESSION_RELAY_MODULE).chmod(0o444)
-        cfg_bytes = (json.dumps(config_payload, indent=2, ensure_ascii=True) + "\n").encode("ascii")
-        atomic_write(self.opencode_config, cfg_bytes)
-        self.opencode_config.chmod(0o444)
+        if config_payload is not None:
+            cfg_bytes = (json.dumps(config_payload, indent=2, ensure_ascii=True) + "\n").encode("ascii")
+            atomic_write(self.opencode_config, cfg_bytes)
+            self.opencode_config.chmod(0o444)
         deadline_ns = time.monotonic_ns() + SESSION_TTL_NS
         active = relay_mod.grant_record(self.incarnation, self.generation, True)
         self.lease = relay_mod.Lease(self.grant, active, deadline_ns)
@@ -615,12 +704,21 @@ def _mcs_pair(label: str, *, allow_custom_type: bool = False) -> set[int] | None
     return pair if len(pair) == 2 else None
 
 
+def _is_forbidden_pod_port(target: int, *, allow_postgres: bool) -> bool:
+    return (
+        not 1 <= target <= 65535
+        or target == 9222
+        or RELAY_PORT_MIN <= target <= RELAY_PORT_MAX
+        or (target == 5432 and not allow_postgres)
+    )
+
+
 def _parse_pod_port_bindings(key, values, *, allow_postgres: bool) -> list[str]:
     match = _PORT_KEY_RE.fullmatch(key) if type(key) is str else None
     if not match or type(values) is not list:
         raise RuntimeError("Pod has unsupported port bindings")
     target = int(match.group(1))
-    if not 1 <= target <= 65535 or target in (9222, 8401) or (target == 5432 and not allow_postgres):
+    if _is_forbidden_pod_port(target, allow_postgres=allow_postgres):
         raise RuntimeError(f"Pod publishes forbidden port {target}")
     mapped: list[str] = []
     for entry in values:
@@ -646,7 +744,7 @@ def _verify_pod_ports(bindings, port_label: str, *, allow_postgres: bool) -> Non
         raise RuntimeError("Pod port bindings do not match oc.ports label")
 
 
-def _verify_pod(spec: dict) -> str:
+def _verify_pod_with_containers(spec: dict) -> tuple[str, list[dict]]:
     pod_info = inspected("pod", "inspect", spec["pod"])
     pod_id = pod_info.get("Id") or ""
     labels = pod_info.get("Labels") or {}
@@ -662,6 +760,14 @@ def _verify_pod(spec: dict) -> str:
     if type(infra) is not dict:
         raise RuntimeError("Pod infra config is malformed")
     _verify_pod_ports(infra.get("PortBindings"), port_label, allow_postgres=bool(spec["pg_secret"]))
+    containers = pod_info.get("Containers") or []
+    if type(containers) is not list:
+        raise RuntimeError("Pod container listing is malformed")
+    return pod_id, [entry for entry in containers if type(entry) is dict]
+
+
+def _verify_pod(spec: dict) -> str:
+    pod_id, _containers = _verify_pod_with_containers(spec)
     return pod_id
 
 
@@ -794,9 +900,11 @@ def _open_instance_lock(state_dir: Path, instance: str):
         os.close(parent_fd)
 
 
-def _wait_relay_bound(relay_id: str) -> None:
+def _wait_relay_bound(relay_id: str, port: int = RELAY_PORT_MIN) -> None:
+    if type(port) is not int or not RELAY_PORT_MIN <= port <= RELAY_PORT_MAX:
+        raise RuntimeError("Invalid relay port")
     probe = (
-        "import socket; s=socket.create_connection(('127.0.0.1', 8401), 1); s.close()"
+        f"import socket; s=socket.create_connection(('127.0.0.1', {port}), 1); s.close()"
     )
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -804,7 +912,7 @@ def _wait_relay_bound(relay_id: str) -> None:
         if res.returncode == 0:
             return
         time.sleep(0.1)
-    raise RuntimeError("Interactive ChatGPT relay did not bind 127.0.0.1:8401")
+    raise RuntimeError(f"Interactive provider relay did not bind 127.0.0.1:{port}")
 
 
 def _valid_sandbox_path(path: str) -> bool:
@@ -825,11 +933,37 @@ def _validate_optional_pair(first: str, second: str, exp_first: str, exp_second:
     return (first == "" and second == "") or (first == exp_first and second == exp_second)
 
 
+def _validate_spec_options(spec: dict) -> dict:
+    provider_filter = spec.get("provider_filter", "")
+    cli_ui_mode = spec.get("cli_ui_mode", "default")
+    if type(provider_filter) is not str or type(cli_ui_mode) is not str:
+        raise ValueError("Invalid launch spec option")
+    if provider_filter:
+        try:
+            parse_provider_filter(provider_filter)
+        except LaunchRefusedError:
+            raise ValueError("Invalid provider filter in launch spec") from None
+    if cli_ui_mode not in _VALID_CLI_UI_MODES:
+        raise ValueError("Invalid cli_ui_mode in launch spec")
+    normalized = dict(spec)
+    normalized["provider_filter"] = provider_filter
+    normalized["cli_ui_mode"] = cli_ui_mode
+    return normalized
+
+
 def _validate_spec(spec: dict) -> dict:
-    if type(spec) is not dict or set(spec) != _SPEC_KEYS or not all(type(v) is str for v in spec.values()):
+    if (
+        type(spec) is not dict
+        or not _BASE_SPEC_KEYS <= set(spec) <= _SPEC_KEYS
+        or not all(type(v) is str for v in spec.values())
+    ):
         raise ValueError("Invalid launch spec")
     instance = spec["instance"]
-    if not _INSTANCE_NAME.fullmatch(instance) or instance in _RESERVED_INSTANCES:
+    if (
+        not _INSTANCE_NAME.fullmatch(instance)
+        or instance in _RESERVED_INSTANCES
+        or _RELAY_INSTANCE_RE.fullmatch(instance) is not None
+    ):
         raise ValueError("Malformed instance name")
     expected_pod = "oc" if instance == "default" else f"oc-{instance}"
     level_match = _LEVEL_RE.fullmatch(spec["level"])
@@ -850,7 +984,7 @@ def _validate_spec(spec: dict) -> dict:
             or not _valid_sandbox_path(spec["sandbox"])
             or not _valid_relpath(spec["cwd"])):
         raise ValueError("Malformed launch spec field")
-    return spec
+    return _validate_spec_options(spec)
 
 
 def _remove_stopped_owned_container(container_id: str) -> None:
@@ -878,7 +1012,9 @@ def _inspect_existing_container(cname: str) -> dict | None:
     return parsed[0]
 
 
-def _verify_stopped_container_owner(details: dict, cname: str, instance: str, expected_role: str | None) -> str:
+def _verify_stopped_container_owner(
+    details: dict, cname: str, instance: str, expected_roles: tuple[str | None, ...]
+) -> str:
     cid = details.get("Id") or ""
     state = details.get("State") or {}
     labels = (details.get("Config") or {}).get("Labels") or {}
@@ -887,33 +1023,88 @@ def _verify_stopped_container_owner(details: dict, cname: str, instance: str, ex
     if state.get("Running") is True or state.get("Status") in ("running", "paused", "restarting", "stopping"):
         raise RuntimeError(f"Container {cname} is already running")
     role = labels.get("oc.role")
-    role_ok = (role == expected_role) if expected_role is not None else (role in (None, ""))
+    normalized_role = None if role in (None, "") else role
     if (type(cid) is not str or not IMAGE_ID.fullmatch(cid)
             or labels.get("oc.sandbox") != "1"
             or labels.get("oc.instance") != instance
-            or not role_ok):
+            or normalized_role not in expected_roles):
         raise RuntimeError(f"Refusing to remove unowned stopped container {cname}")
     return cid
 
 
-def _ensure_single_container_idle(cname: str, instance: str, expected_role: str | None) -> None:
+def _ensure_single_container_idle(
+    cname: str, instance: str, expected_roles: tuple[str | None, ...]
+) -> None:
     details = _inspect_existing_container(cname)
     if details is None:
         return
-    cid = _verify_stopped_container_owner(details, cname, instance, expected_role)
+    cid = _verify_stopped_container_owner(details, cname, instance, expected_roles)
     _remove_stopped_owned_container(cid)
 
 
-def _ensure_containers_idle(agent_name: str, relay_name: str, instance: str) -> None:
-    _ensure_single_container_idle(agent_name, instance, None)
-    _ensure_single_container_idle(relay_name, instance, "openai-relay")
+def _ensure_pod_attached_idle(
+    pod_containers: list[dict], instance: str, sidecar_names: set[str]
+) -> None:
+    for entry in pod_containers:
+        cid = entry.get("Id")
+        cname = entry.get("Name") or cid or "unknown"
+        if type(cid) is not str or not IMAGE_ID.fullmatch(cid):
+            raise RuntimeError("Malformed container entry in pod inspect")
+        details = _inspect_existing_container(cid)
+        if details is None or details.get("IsInfra") is True:
+            continue
+        actual_name = (details.get("Name") or "").lstrip("/")
+        if actual_name in sidecar_names:
+            continue
+        verified_id = _verify_stopped_container_owner(
+            details, actual_name or cname, instance, (None, "openai-relay", "provider-relay")
+        )
+        _remove_stopped_owned_container(verified_id)
 
 
-def _build_relay_args(spec: dict, job: _SessionJob) -> list[str]:
+def _ensure_containers_idle(
+    agent_name: str,
+    relay_name: str,
+    instance: str,
+    *,
+    extra_relays: tuple[str, ...] = (),
+    pod_containers: list[dict] | None = None,
+    sidecar_names: set[str] | None = None,
+) -> None:
+    if pod_containers:
+        _ensure_pod_attached_idle(pod_containers, instance, sidecar_names or set())
+    _ensure_single_container_idle(agent_name, instance, (None,))
+    _ensure_single_container_idle(relay_name, instance, ("openai-relay",))
+    for slot_relay in extra_relays:
+        _ensure_single_container_idle(slot_relay, instance, ("provider-relay",))
+
+
+def _build_relay_args(
+    spec: dict,
+    job: _SessionJob,
+    *,
+    slot_index: int | None = None,
+    port: int = RELAY_PORT_MIN,
+    provider_label: str = "openai",
+) -> list[str]:
+    if type(port) is not int or not RELAY_PORT_MIN <= port <= RELAY_PORT_MAX:
+        raise ValueError("Invalid relay port")
+    if slot_index is None:
+        relay_name = spec["relay"]
+        role_labels = ["--label", "oc.role=openai-relay"]
+        port_args: list[str] = []
+    else:
+        relay_name = f"{spec['pod']}-relay-{slot_index}"
+        role_labels = [
+            "--label", "oc.role=provider-relay",
+            "--label", f"oc.provider-slot={slot_index}",
+            "--label", f"oc.provider={provider_label}",
+        ]
+        port_args = [str(port)]
     return [
-        "create", "--pull=never", "--name", spec["relay"], "--pod", spec["pod"],
+        "create", "--pull=never", "--name", relay_name, "--pod", spec["pod"],
         "--label", "oc.sandbox=1", "--label", f"oc.instance={spec['instance']}",
-        "--label", "oc.role=openai-relay",
+        *role_labels,
         "--http-proxy=false", "--image-volume=ignore", "--log-driver=none", "--restart=no",
         "--user=0:0", "--ipc=private", "--pid=private", "--cgroupns=private",
         "--cap-drop=ALL", "--security-opt=no-new-privileges",
@@ -924,22 +1115,32 @@ def _build_relay_args(spec: dict, job: _SessionJob) -> list[str]:
         "-v", f"{job.proof_file.parent}:/proof:ro,Z,nosuid,nodev,noexec",
         spec["relay_image"],
         "python3", "-B", "/source/session_relay.py",
-        job.incarnation, str(job.generation), str(job.lease.deadline_ns),
+        job.incarnation, str(job.generation), str(job.lease.deadline_ns), *port_args,
     ]
 
 
-def _build_agent_args(spec: dict, job: _SessionJob) -> list[str]:
+def _build_agent_args(
+    spec: dict,
+    config_source: _SessionJob | Path,
+    *,
+    ui_mode: str = "full",
+    provider_label: str = "managed",
+) -> list[str]:
+    if ui_mode not in ("full", "mini"):
+        raise ValueError("Invalid ui_mode")
+    config_path = config_source.opencode_config if isinstance(config_source, _SessionJob) else Path(config_source)
     args = [
         "create", "-it", "--rm", "--pull=never", "--name", spec["agent"], "--pod", spec["pod"],
         "--label", "oc.sandbox=1", "--label", f"oc.instance={spec['instance']}",
-        "--label", "oc.provider=openai",
+        "--label", f"oc.provider={provider_label}",
+        "--label", f"oc.ui_mode={ui_mode}",
         "--http-proxy=false", "--image-volume=ignore", "--restart=no",
         "--cap-drop=ALL", "--security-opt=no-new-privileges",
         "--security-opt", f"label=level:{spec['level']}",
         "--pids-limit=512", "--memory", spec["agent_mem"],
         "-v", f"{spec['sandbox']}:/sandbox",
         "-v", f"{spec['home_vol']}:/root:Z",
-        "-v", f"{job.opencode_config}:/etc/opencode/opencode.json:ro,Z,nosuid,nodev,noexec",
+        "-v", f"{config_path}:/etc/opencode/opencode.json:ro,Z,nosuid,nodev,noexec",
         "-w", f"/sandbox/{spec['cwd']}",
         "-e", f"OC_INSTANCE={spec['instance']}",
         "-e", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -962,6 +1163,8 @@ def _build_agent_args(spec: dict, job: _SessionJob) -> list[str]:
             "-e", "CONTAINER_HOST=unix:///run/dind/podman.sock",
         ])
     args.append(spec["agent_image"])
+    if ui_mode == "mini":
+        args.append("mini")
     return args
 
 
@@ -1004,161 +1207,485 @@ def _launch_agent_tty(agent_id: str, stop_event: threading.Event) -> int:
     return child_proc.wait()
 
 
-def _teardown_session(job: _SessionJob, broker: SessionBroker | None,
-                      container_ids: tuple[str | None, ...], stack: ExitStack) -> Exception | None:
-    cleanup_error: Exception | None = None
-    steps = [job.revoke]
-    if broker is not None:
-        steps.append(broker.close)
-    for cid in container_ids:
-        if cid is not None:
-            steps.append(lambda c=cid: _remove_container_verified(c))
-    steps.append(stack.close)
-    for step in steps:
+class _SlotState:
+    def __init__(self, slot_cm, handle: SlotHandle, slot_root: Path):
+        self.slot_cm = slot_cm
+        self.handle = handle
+        self.slot_root = slot_root
+        self.relay_id: str | None = None
+        self.creating_relay = False
+        self.retiring = False
+        self.retired = False
+        self.exited = False
+
+
+class _SessionSlotCoordinator:
+    """Thread-safe coordinator for multi-instance slot startup, single-slot revocation, and teardown."""
+
+    def __init__(self, stop_event: threading.Event):
+        self._stop_event = stop_event
+        self._lock = threading.Lock()
+        self._slots: dict[int, _SlotState] = {}
+        self._pre_revoked: set[int] = set()
+        self._slot_roots: list[Path] = []
+        self._created_containers: list[str] = []
+        self._removed_containers: set[str] = set()
+        self._retire_threads: list[threading.Thread] = []
+        self._cleanup_error: Exception | None = None
+
+    def register_slot(self, slot_cm, handle: SlotHandle, slot_root: Path | None = None) -> _SlotState:
+        resolved_root = slot_root if slot_root is not None else handle.job.root
+        state = _SlotState(slot_cm, handle, resolved_root)
+        should_revoke = False
+        with self._lock:
+            self._slots[handle.slot_index] = state
+            if resolved_root not in self._slot_roots:
+                self._slot_roots.append(resolved_root)
+            if handle.slot_index in self._pre_revoked or handle.broker._revoked.is_set():
+                self._pre_revoked.discard(handle.slot_index)
+                should_revoke = True
+        if should_revoke:
+            self.on_revoke(handle.slot_index)
+        return state
+
+    def track_slot_root(self, slot_root: Path) -> None:
+        with self._lock:
+            if slot_root not in self._slot_roots:
+                self._slot_roots.append(slot_root)
+
+    def remove_slot_roots(self) -> None:
+        with self._lock:
+            roots = list(self._slot_roots)
+        for slot_root in roots:
+            with suppress(OSError):
+                shutil.rmtree(slot_root)
+
+    def begin_relay_create(self, slot_index: int) -> bool:
+        with self._lock:
+            state = self._slots.get(slot_index)
+            if state is None or state.retiring:
+                return False
+            state.creating_relay = True
+            if state.handle.mark_relay_created is not None:
+                state.handle.mark_relay_created()
+            return True
+
+    def finish_relay_create(self, slot_index: int, relay_id: str | None) -> bool:
+        with self._lock:
+            state = self._slots.get(slot_index)
+            if state is None:
+                return False
+            state.creating_relay = False
+            if relay_id is not None:
+                self._created_containers.append(relay_id)
+                state.relay_id = relay_id
+                if state.handle.mark_relay_created is not None:
+                    state.handle.mark_relay_created()
+                return not state.retiring
+            if self._cleanup_error is None:
+                self._cleanup_error = RuntimeError(
+                    "Podman relay create did not complete with a verified container ID"
+                )
+            return False
+
+    def record_container(self, container_id: str, *, slot_index: int | None = None) -> bool:
+        with self._lock:
+            self._created_containers.append(container_id)
+            if slot_index is not None:
+                state = self._slots.get(slot_index)
+                if state is not None:
+                    state.creating_relay = False
+                    state.relay_id = container_id
+                    if state.handle.mark_relay_created is not None:
+                        state.handle.mark_relay_created()
+                    if state.retiring:
+                        return False
+            return True
+
+    def _record_error(self, exc: Exception) -> None:
+        with self._lock:
+            if self._cleanup_error is None:
+                self._cleanup_error = exc
+
+    def _finish_slot_retirement(self, state: _SlotState) -> None:
         try:
-            step()
+            state.handle.job.revoke()
         except Exception as exc:
-            cleanup_error = cleanup_error or exc
-    return cleanup_error
-
-
-def _run_session_body(spec: dict, backend, identity: tuple, models: tuple[str, ...],
-                      job: _SessionJob, stop_event: threading.Event,
-                      terminal: StreamTerminal, cleanup_state: dict) -> int:
-    label, selection_epoch, conn, binding, acknowledged_digest = identity
-    worker_token = secrets.token_urlsafe(32)
-    relay_id: str | None = None
-    agent_id: str | None = None
-    broker: SessionBroker | None = None
-    rc = 1
-    with ExitStack() as stack:
+            self._record_error(exc)
         try:
-            pod_id = _verify_pod(spec)
-            job.prepare(generate_opencode_config(worker_token=worker_token, models=models))
-            stack.enter_context(backend.session_lease(label, selection_epoch, binding, job))
-            broker = SessionBroker(
-                socket_path=job.provider_socket,
-                relay_proof=job.relay_proof,
-                worker_token=worker_token,
-                lease=job.lease,
-                connection=conn,
-                binding=binding,
-                models=models,
-                profile_label=label,
-                usage_dir=backend._state,
-                policy=SessionPolicy(
-                    exposure_dir=backend._state,
-                    acknowledged_exposure_digest=acknowledged_digest,
-                    authorization=lambda: backend.selected_fence(label, selection_epoch),
-                    is_selected=lambda: backend.active_selection() == (label, selection_epoch),
-                    on_revoke=stop_event.set,
-                ),
+            state.handle.broker.close()
+        except Exception as exc:
+            self._record_error(exc)
+        with self._lock:
+            relay_id = state.relay_id
+            creating = state.creating_relay
+        if creating and relay_id is None:
+            # Relay creation is still in flight; retain the durable lease until creation finishes and is cleaned up.
+            return
+        relay_removed = True
+        if relay_id is not None:
+            try:
+                _remove_container_verified(relay_id)
+                with self._lock:
+                    self._removed_containers.add(relay_id)
+                if state.handle.confirm_relay_removed is not None:
+                    state.handle.confirm_relay_removed()
+            except Exception as exc:
+                relay_removed = False
+                self._record_error(exc)
+        if not relay_removed:
+            # Retain the session lease on disk when relay container removal cannot be confirmed.
+            return
+        with self._lock:
+            should_exit = not state.exited
+            state.exited = True
+        if should_exit:
+            try:
+                state.slot_cm.__exit__(None, None, None)
+            except Exception as exc:
+                self._record_error(exc)
+        with self._lock:
+            state.retired = True
+
+    def on_revoke(self, slot_index: int) -> None:
+        """Retire only the revoked slot; stop the whole session iff zero active slots remain."""
+        with self._lock:
+            state = self._slots.get(slot_index)
+            if state is None:
+                self._pre_revoked.add(slot_index)
+                return
+            if state.retiring:
+                return
+            state.retiring = True
+            active_remaining = sum(1 for item in self._slots.values() if not item.retiring)
+            worker = threading.Thread(
+                target=self._finish_slot_retirement,
+                args=(state,),
+                name=f"oc-slot-retire-{slot_index}",
+                daemon=False,
             )
-            broker.start()
-            _ensure_containers_idle(spec["agent"], spec["relay"], spec["instance"])
+            self._retire_threads.append(worker)
+            try:
+                worker.start()
+            except RuntimeError as exc:
+                self._retire_threads.remove(worker)
+                state.retiring = False
+                if self._cleanup_error is None:
+                    self._cleanup_error = exc
+                self._stop_event.set()
+                return
+        if active_remaining == 0:
+            self._stop_event.set()
 
-            relay_id = podman(*_build_relay_args(spec, job)).stdout.decode("ascii").strip()
-            if not IMAGE_ID.fullmatch(relay_id):
-                raise RuntimeError("Podman did not return a complete relay container ID")
-            podman("start", relay_id)
-            siblings = [name for name in (spec["chromium"], spec["postgres"], spec["dind"]) if name]
-            _verify_relay_isolation(relay_id, spec["relay_image"], pod_id, spec["level"], job, siblings)
-            _wait_relay_bound(relay_id)
-            if (stop_event.is_set() or broker._revoked.is_set()
-                    or job.lease.status() != "pending" or time.monotonic_ns() >= job.lease.deadline_ns):
-                raise ConnectionError("connection_retired")
-            job.activate()
+    def any_active(self) -> bool:
+        with self._lock:
+            return any(
+                not state.retiring
+                and not state.handle.broker._revoked.is_set()
+                and state.handle.job.lease is not None
+                and state.handle.job.lease.active()
+                for state in self._slots.values()
+            )
 
-            if stop_event.is_set() or broker._revoked.is_set() or not job.lease.active():
-                raise ConnectionError("connection_retired")
-            agent_id = podman(*_build_agent_args(spec, job)).stdout.decode("ascii").strip()
-            if not IMAGE_ID.fullmatch(agent_id):
-                raise RuntimeError("Podman did not return a complete agent container ID")
+    def _remove_leftover_container(self, cid: str, slot: _SlotState | None) -> None:
+        try:
+            _remove_container_verified(cid)
+            with self._lock:
+                self._removed_containers.add(cid)
+            if slot is None:
+                return
+            if slot.handle.confirm_relay_removed is not None:
+                slot.handle.confirm_relay_removed()
+            with self._lock:
+                should_exit = not slot.exited
+                slot.exited = True
+            if should_exit:
+                slot.slot_cm.__exit__(None, None, None)
+        except Exception as exc:
+            self._record_error(exc)
 
-            if stop_event.is_set() or broker._revoked.is_set() or not job.lease.active():
-                raise ConnectionError("connection_retired")
-            rc = _launch_agent_tty(agent_id, stop_event)
-        finally:
-            cleanup_error = _teardown_session(job, broker, (agent_id, relay_id), stack)
-            if cleanup_error is None:
-                cleanup_state["clean"] = True
-            else:
-                terminal.error(f"Provider session cleanup needs verification. Retained directory {job.root}")
-                rc = 1
+    def _exit_uncreated_slots(self) -> None:
+        with self._lock:
+            unexited = [
+                s for s in self._slots.values()
+                if not s.exited and s.relay_id is None and not s.creating_relay
+            ]
+        for slot in unexited:
+            with self._lock:
+                if slot.exited:
+                    continue
+                slot.exited = True
+            try:
+                slot.slot_cm.__exit__(None, None, None)
+            except Exception as exc:
+                self._record_error(exc)
+        with self._lock:
+            still_unconfirmed = any(s.creating_relay or not s.exited for s in self._slots.values())
+        if still_unconfirmed:
+            self._record_error(RuntimeError("Slot relay state remained unconfirmed during teardown"))
+
+    def teardown_all(self, agent_id: str | None) -> Exception | None:
+        if agent_id is not None:
+            try:
+                _remove_container_verified(agent_id)
+                with self._lock:
+                    self._removed_containers.add(agent_id)
+            except Exception as exc:
+                self._record_error(exc)
+
+        with self._lock:
+            threads = list(self._retire_threads)
+            remaining_slots = [state for state in self._slots.values() if not state.retiring]
+            for state in remaining_slots:
+                state.retiring = True
+
+        for thread in threads:
+            thread.join(timeout=15)
+            if thread.is_alive():
+                self._record_error(RuntimeError(f"Slot retirement thread '{thread.name}' did not finish"))
+
+        for state in remaining_slots:
+            self._finish_slot_retirement(state)
+
+        with self._lock:
+            leftover = [cid for cid in self._created_containers if cid not in self._removed_containers]
+            slots_by_relay = {state.relay_id: state for state in self._slots.values() if state.relay_id is not None}
+        for cid in reversed(leftover):
+            self._remove_leftover_container(cid, slots_by_relay.get(cid))
+
+        self._exit_uncreated_slots()
+        with self._lock:
+            return self._cleanup_error
+
+
+def _write_session_opencode_config(root: Path, config_payload: dict) -> Path:
+    root.chmod(0o700)
+    cfg_dir = root / "opencode"
+    cfg_dir.mkdir(mode=0o700, exist_ok=True)
+    cfg_path = cfg_dir / "opencode.json"
+    cfg_bytes = (json.dumps(config_payload, indent=2, ensure_ascii=True) + "\n").encode("ascii")
+    atomic_write(cfg_path, cfg_bytes)
+    cfg_path.chmod(0o444)
+    return cfg_path
+
+
+def _start_and_verify_slot_relay(
+    spec: dict,
+    pod_id: str,
+    handle: SlotHandle,
+    coordinator: _SessionSlotCoordinator,
+    siblings: list[str],
+    started_relay_ids: list[str],
+    stop_event: threading.Event,
+) -> str:
+    if not coordinator.begin_relay_create(handle.slot_index):
+        raise ConnectionError("connection_retired")
+    try:
+        res = podman(*handle.build_relay_args(spec), check=False)
+    except BaseException:
+        # Host create outcome is unknown (timeout / lost ack / interrupt): retain lease and grant dir.
+        coordinator.finish_relay_create(handle.slot_index, None)
+        raise
+    if res.returncode != 0:
+        # Return code comes from the host-spawn wrapper and does not prove the host-side
+        # podman create finished; retain durable lease and grant dir without trusting name absence.
+        coordinator.finish_relay_create(handle.slot_index, None)
+        raise JobRuntimeError(f"Podman create failed ({res.returncode})")
+    relay_id = res.stdout.decode("ascii").strip()
+    if not IMAGE_ID.fullmatch(relay_id):
+        coordinator.finish_relay_create(handle.slot_index, None)
+        raise RuntimeError("Podman did not return a complete relay container ID")
+    if not coordinator.finish_relay_create(handle.slot_index, relay_id):
+        raise ConnectionError("connection_retired")
+    podman("start", relay_id)
+    _verify_relay_isolation(
+        relay_id,
+        spec["relay_image"],
+        pod_id,
+        spec["level"],
+        handle.job,
+        [*siblings, *started_relay_ids],
+    )
+    _wait_relay_bound(relay_id, port=handle.port)
+    if (
+        stop_event.is_set()
+        or handle.broker._revoked.is_set()
+        or handle.job.lease.status() != "pending"
+        or time.monotonic_ns() >= handle.job.lease.deadline_ns
+    ):
+        raise ConnectionError("connection_retired")
+    handle.job.activate()
+    return relay_id
+
+
+def _run_multi_slot_session(
+    spec: dict,
+    plan,
+    adapters: dict,
+    root: Path,
+    stop_event: threading.Event,
+    terminal: StreamTerminal,
+    cleanup_state: dict,
+) -> int:
+    coordinator = _SessionSlotCoordinator(stop_event)
+    agent_id: str | None = None
+    rc = 1
+    try:
+        pod_id, pod_containers = _verify_pod_with_containers(spec)
+        slot_ports: dict[str, int] = {}
+        slot_tokens: dict[str, str] = {}
+        slot_names: list[str] = []
+        for idx, item in enumerate(plan.admitted):
+            scoped_id = item.spec.scoped_id
+            slot_ports[scoped_id] = RELAY_PORT_MIN + idx
+            slot_tokens[scoped_id] = secrets.token_urlsafe(32)
+            slot_names.append(f"{spec['pod']}-relay-{idx}")
+
+        config_payload = build_multi_provider_opencode_config(
+            plan=plan,
+            adapters=adapters,
+            slot_ports=slot_ports,
+            slot_tokens=slot_tokens,
+        )
+        config_path = _write_session_opencode_config(root, config_payload)
+
+        sidecars = [name for name in (spec["chromium"], spec["postgres"], spec["dind"]) if name]
+        _ensure_containers_idle(
+            spec["agent"],
+            spec["relay"],
+            spec["instance"],
+            extra_relays=tuple(slot_names),
+            pod_containers=pod_containers,
+            sidecar_names=set(sidecars),
+        )
+
+        started_relay_ids: list[str] = []
+        for idx, item in enumerate(plan.admitted):
+            scoped_id = item.spec.scoped_id
+            adapter = adapters[item.spec.kind]
+            ack_digest = (
+                plan.acknowledged_digests.get(item.exposure_hold.scope_id)
+                if item.exposure_hold is not None
+                else None
+            )
+            slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir=SHARED_TMP))
+            coordinator.track_slot_root(slot_root)
+            slot_cm = adapter.open_slot(
+                item,
+                slot_index=idx,
+                slot_root=slot_root,
+                port=slot_ports[scoped_id],
+                worker_token=slot_tokens[scoped_id],
+                acknowledged_exposure_digest=ack_digest,
+                on_revoke=coordinator.on_revoke,
+            )
+            handle = slot_cm.__enter__()
+            coordinator.register_slot(slot_cm, handle, slot_root)
+            relay_id = _start_and_verify_slot_relay(
+                spec, pod_id, handle, coordinator, sidecars, started_relay_ids, stop_event,
+            )
+            started_relay_ids.append(relay_id)
+
+        if stop_event.is_set() or not coordinator.any_active():
+            raise ConnectionError("connection_retired")
+        provider_label = (
+            plan.admitted[0].spec.kind
+            if len({item.spec.kind for item in plan.admitted}) == 1
+            else "multi"
+        )
+        agent_id = podman(
+            *_build_agent_args(spec, config_path, ui_mode=plan.ui_mode, provider_label=provider_label)
+        ).stdout.decode("ascii").strip()
+        if not IMAGE_ID.fullmatch(agent_id):
+            raise RuntimeError("Podman did not return a complete agent container ID")
+        coordinator.record_container(agent_id)
+
+        if stop_event.is_set() or not coordinator.any_active():
+            raise ConnectionError("connection_retired")
+        rc = _launch_agent_tty(agent_id, stop_event)
+    finally:
+        cleanup_error = coordinator.teardown_all(agent_id)
+        if cleanup_error is None:
+            coordinator.remove_slot_roots()
+            cleanup_state["clean"] = True
+        else:
+            terminal.error(f"Provider session cleanup needs verification. Retained directory {root}")
+            rc = 1
     return rc
 
 
-def _resolve_interactive_exposure(backend, terminal: StreamTerminal) -> str | None:
-    hold = ExposureLedger(backend._state).inspect_hold()
-    if not hold.blocked:
-        return None
-    terminal.write(
-        f"Prior exposure hold present ({hold.file_count} receipt file(s), "
-        f"{hold.unsettled_count} unsettled, snapshot {hold.digest[:12]}). "
-        "Existing receipt files will remain untouched."
-    )
-    return hold.digest
+def _report_session_error(terminal: StreamTerminal, error: BaseException) -> int:
+    if isinstance(error, (LaunchRefusedError, ProviderIntegrityError)):
+        terminal.error(str(error))
+        return 1
+    return report_failure(terminal, error, operation="Provider session")
 
 
-def run_interactive_session(spec: dict, terminal: StreamTerminal) -> int:
-    """Supervise one interactive ChatGPT-backed oc-sandbox OpenCode session."""
+def run_interactive_session(
+    spec: dict,
+    terminal: StreamTerminal,
+    *,
+    config_dir: Path | None = None,
+    adapters: dict | None = None,
+    lock_dir: Path | None = None,
+) -> int:
+    """Supervise one interactive multi-provider oc-sandbox OpenCode session."""
     spec = _validate_spec(spec)
     if not terminal.attended():
-        terminal.error("An attended foreground workstation terminal is required for --provider openai.")
+        terminal.error("An attended foreground workstation terminal is required for managed provider sessions.")
         return 2
     try:
         check_devbox()
         check_host()
     except Exception:
-        terminal.error("Interactive --provider openai requires the qualified devbox host with SELinux enforcing.")
+        terminal.error("Interactive managed provider sessions require the qualified devbox host with SELinux enforcing.")
         return 1
 
     try:
-        backend = make_backend()
-        label, selection_epoch, conn, binding = backend.active_connection()
-        models = conn.models(binding)
-        if not models:
-            raise RouteUnavailable(Reason.MODEL_UNAVAILABLE)
-        acknowledged_digest = _resolve_interactive_exposure(backend, terminal)
+        config = load_provider_config(config_dir=config_dir)
+        if adapters is None:
+            backend = make_backend()
+            from .session_adapter import OpenAISessionAdapter
+            active_adapters = {"openai": OpenAISessionAdapter(backend)}
+            resolved_lock_dir = lock_dir or backend._state
+        else:
+            active_adapters = adapters
+            resolved_lock_dir = lock_dir if lock_dir is not None else make_backend()._state
+        plan = plan_interactive_launch(
+            instance_name=spec["instance"],
+            cwd=spec["cwd"],
+            provider_filter=spec["provider_filter"],
+            cli_ui_mode=spec["cli_ui_mode"],
+            config=config,
+            adapters=active_adapters,
+            terminal=terminal,
+        )
     except Exception as error:
-        return report_failure(terminal, error, operation="ChatGPT session")
-
-    preview = ", ".join(models[:6]) + (f" (+{len(models) - 6} more)" if len(models) > 6 else "")
-    terminal.write(f"ChatGPT registration: {label} (models: {preview})")
-    terminal.write(
-        "No API-key fallback will be forwarded. Provider tokens stay on the workstation behind an "
-        "isolated relay. One approval covers multiple interactive turns and subagents in this session "
-        "with no verified spending ceiling. Disconnect with `oc-sandbox openai disconnect` or exit OpenCode."
-    )
-    prompt = (
-        f"Acknowledge prior exposure snapshot and start interactive ChatGPT OpenCode session for instance '{spec['instance']}'?"
-        if acknowledged_digest is not None
-        else f"Start interactive ChatGPT OpenCode session for instance '{spec['instance']}'?"
-    )
-    if not terminal.confirm(prompt):
-        terminal.error("Cancelled.")
-        return 1
+        return _report_session_error(terminal, error)
 
     try:
-        instance_lock_fd = _open_instance_lock(backend._state, spec["instance"])
-    except (OSError, RuntimeError):
+        instance_lock_fd = _open_instance_lock(resolved_lock_dir, spec["instance"])
+    except BlockingIOError:
         terminal.error(f"Instance '{spec['instance']}' already has an active provider session launch.")
+        return 1
+    except (OSError, RuntimeError) as error:
+        terminal.error(f"Could not acquire instance session lock: {error}")
         return 1
 
     root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir=SHARED_TMP))
-    job = _SessionJob(root, "inc_" + secrets.token_hex(16))
     stop_event = threading.Event()
     prev_term = signal.signal(signal.SIGTERM, lambda _s, _f: stop_event.set())
     prev_hup = signal.signal(signal.SIGHUP, lambda _s, _f: stop_event.set())
     rc = 1
     cleanup_state = {"clean": False}
     try:
-        identity = (label, selection_epoch, conn, binding, acknowledged_digest)
-        rc = _run_session_body(spec, backend, identity, models, job, stop_event, terminal, cleanup_state)
+        rc = _run_multi_slot_session(
+            spec, plan, active_adapters, root, stop_event, terminal, cleanup_state,
+        )
     except KeyboardInterrupt:
         rc = 130
     except Exception as error:
-        return report_failure(terminal, error, operation="ChatGPT session")
+        return _report_session_error(terminal, error)
     finally:
         signal.signal(signal.SIGTERM, prev_term)
         signal.signal(signal.SIGHUP, prev_hup)

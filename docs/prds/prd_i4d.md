@@ -265,11 +265,11 @@ registration binding and exposure holds.
   ambient fallback, excludes benign unavailable instances while failing closed on integrity
   failures or zero admitted instances, isolates mid-session single-instance revocation, and honors
   fail-closed `--provider KIND[/INSTANCE]` narrowing for a single launch.
-- [ ] (decision needed) Confirm OpenCode Mini packaging and pinned provenance mechanism (pinned
-  flag/subcommand on pinned OpenCode, separate pinned binary, or pinned image), then verify
-  `--mini` launches OpenCode Mini while default (no `--mini`) launches full OpenCode with identical
-  hardening env flags, read-only config, broker isolation, exposure hold, and credential-separation
-  invariants in both modes.
+- [ ] Confirm OpenCode Mini packaging and pinned provenance mechanism (**Option A approved**: built-in
+  `opencode mini` subcommand on the same pinned OpenCode v2.3.0 artifact in `oc-agent`, selected via
+  `--mini` with `--no-mini` override), and verify `--mini` launches OpenCode Mini while default (no
+  `--mini`) launches full OpenCode with identical hardening env flags, read-only config, broker
+  isolation, exposure hold, and credential-separation invariants in both modes.
 - [ ] Link and qualify the per-provider and combined opt-in live e2e pytest milestones in
   [I4f](prd_i4f.md#opt-in-live-e2e-pytest-milestones).
 - [ ] Review every live adapter and placement independently under [I3a](prd_i3a.md),

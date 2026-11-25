@@ -408,6 +408,7 @@ def interruption_cleanup(distro, *, smoke_timeout=False):
         base=Path(td)/'private'; base.mkdir(); calls=[]
         runtime_base=Path(td)/'runtime-private'; runtime_base.mkdir()
         m.preflight=lambda: 'policy'
+        m.require_clean_legacy_account=lambda: None
         m.host_preflight=lambda desktop: (Path(td), Path(td)/'unused' if desktop else None)
         def prepare_fixture(*args):
             (base/'store').mkdir(mode=0o700)

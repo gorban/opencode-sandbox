@@ -13,6 +13,7 @@ from .connection_state import CREATE_FLAGS, ConnectionError, Store, _directory, 
 
 
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
+_CANONICAL_LABEL = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z", re.ASCII)
 _LOCAL_ID = re.compile(r"[A-Za-z0-9_-]{43}")
 _DIRECTORY_ID = re.compile(r"[0-9a-f]{32}")
 _CLIENT_ID = re.compile(r"[!-~]{1,512}")
@@ -22,6 +23,10 @@ _MAX_REGISTRATIONS = 16
 
 def valid_label(value: object) -> bool:
     return type(value) is str and _LABEL.fullmatch(value) is not None
+
+
+def valid_canonical_label(value: object) -> bool:
+    return type(value) is str and len(value) <= 32 and _CANONICAL_LABEL.fullmatch(value) is not None
 
 
 class ProfileError(RuntimeError):
@@ -155,7 +160,7 @@ class Profiles:
         return self._begin(label, reclaim, abandoned_pending=False)
 
     def _begin(self, label: str, reclaim, *, abandoned_pending: bool) -> Candidate:
-        if not valid_label(label):
+        if not valid_canonical_label(label):
             raise ProfileError("profile_invalid_label")
         with self._state(create=True) as (directory, state):
             if not state:
@@ -257,8 +262,15 @@ class Profiles:
         finally:
             os.close(mutex)
 
+    def _all_saved_non_retiring(self, state) -> tuple[Profile, ...]:
+        return tuple(
+            self._profile(state, name)
+            for name, entry in sorted(state["registrations"].items())
+            if entry["client_id"] is not None and not entry["retiring"]
+        )
+
     @contextmanager
-    def publish(self, candidate: Candidate, client_id: str, callback=None):
+    def publish(self, candidate: Candidate, client_id: str, callback=None, *, all_saved_check=None):
         if not _matches(client_id, _CLIENT_ID):
             raise ProfileError("profile_client_conflict")
         label = candidate.profile.label
@@ -270,6 +282,8 @@ class Profiles:
                 or any(other["client_id"] == client_id for name, other in entries.items() if name != label)
             ):
                 raise ProfileError("profile_client_conflict")
+            if all_saved_check is not None:
+                all_saved_check(self._all_saved_non_retiring(state))
             if callback is not None:
                 active = state["active"]
                 callback(self._profile(state, active) if active is not None else None, candidate.profile)
@@ -278,7 +292,7 @@ class Profiles:
             state.update(active=label, epoch=secrets.token_urlsafe(32))
             self._write(directory, state)
 
-    def select(self, label: str, callback) -> Profile:
+    def select(self, label: str, callback, *, all_saved_check=None) -> Profile:
         if not valid_label(label):
             raise ProfileError("profile_invalid_label")
         with self.foreground(), self._state() as (directory, state):
@@ -287,11 +301,49 @@ class Profiles:
                 raise ProfileError("profile_unknown")
             if entry["retiring"]:
                 raise ProfileError("profile_retiring")
+            if all_saved_check is not None:
+                all_saved_check(self._all_saved_non_retiring(state))
             active = state["active"]
             callback(self._profile(state, active) if active is not None else None, self._profile(state, label))
             state.update(active=label, epoch=secrets.token_urlsafe(32))
             self._write(directory, state)
             return self._profile(state, label)
+
+    @contextmanager
+    def profile_fence(
+        self,
+        label: str,
+        epoch: str,
+        *,
+        directory: Path | None = None,
+        client_id: str | None = None,
+    ):
+        """Hold the registry mutex while (label, epoch, directory, client_id) remains published and non-retiring."""
+        with self._state() as (_directory, state):
+            if not state or state.get("epoch") != epoch:
+                raise ProfileError("profile_stale")
+            entry = state["registrations"].get(label)
+            if entry is None or entry["client_id"] is None or entry["retiring"]:
+                raise ProfileError("profile_retiring")
+            profile = self._profile(state, label)
+            if directory is not None and profile.directory != Path(directory):
+                raise ProfileError("profile_stale")
+            if client_id is not None and profile.client_id != client_id:
+                raise ProfileError("profile_stale")
+            yield profile
+
+    def with_profile(
+        self,
+        label: str,
+        epoch: str,
+        callback,
+        *,
+        directory: Path | None = None,
+        client_id: str | None = None,
+    ):
+        """Run callback under the registry mutex while the named profile remains valid and non-retiring."""
+        with self.profile_fence(label, epoch, directory=directory, client_id=client_id) as profile:
+            return callback(profile)
 
     def with_selected(self, label: str, epoch: str, callback):
         """Run callback under the registry mutex only while (label, epoch) is active and non-retiring."""
@@ -309,23 +361,49 @@ class Profiles:
                 raise ProfileError("profile_retiring")
             yield self._profile(state, label)
 
-    def begin_disconnect(self, before_retirement, *, inactive_filter=None) -> Profile | None:
+    def _begin_targeted_disconnect(self, directory, state, label: str, before_retirement) -> Profile:
+        if not valid_label(label):
+            raise ProfileError("profile_invalid_label")
+        entries = state["registrations"]
+        if label not in entries:
+            raise ProfileError("profile_unknown")
+        profile = self._profile(state, label)
+        fenced = before_retirement(profile)
+        if fenced is not False and entries[label]["client_id"] is not None:
+            entries[label]["retiring"] = True
+        if state.get("active") == label:
+            state["active"] = None
+        self._write(directory, state)
+        return self._profile(state, label)
+
+    def _collect_disconnect_targets(self, state, active_label: str | None, inactive_filter) -> tuple[str, ...]:
+        entries = state["registrations"]
+        targets = [active_label] if active_label is not None else []
+        for name, entry in sorted(entries.items()):
+            if name == active_label:
+                continue
+            is_unpublished = entry["pending"] is not None or entry["client_id"] is None
+            if is_unpublished or (inactive_filter is not None and inactive_filter(self._profile(state, name))):
+                targets.append(name)
+        return tuple(targets)
+
+    def _begin_bare_disconnect(self, directory, state, before_retirement, inactive_filter) -> Profile | None:
+        active_label = state.get("active")
+        entries = state["registrations"]
+        for name in self._collect_disconnect_targets(state, active_label, inactive_filter):
+            fenced = before_retirement(self._profile(state, name))
+            if fenced is not False and entries[name]["client_id"] is not None:
+                entries[name]["retiring"] = True
+        state["epoch"] = secrets.token_urlsafe(32)
+        self._write(directory, state)
+        return self._profile(state, active_label) if active_label is not None else None
+
+    def begin_disconnect(self, before_retirement, *, inactive_filter=None, label: str | None = None) -> Profile | None:
         with self._state() as (directory, state):
             if not state:
+                if label is not None:
+                    raise ProfileError("profile_unknown")
                 return None
-            label = state.get("active")
-            entries = state["registrations"]
-            targets = [label] if label is not None else []
-            for name, entry in sorted(entries.items()):
-                if name == label:
-                    continue
-                if (entry["pending"] is not None or entry["client_id"] is None
-                        or (inactive_filter is not None and inactive_filter(self._profile(state, name)))):
-                    targets.append(name)
-            for name in targets:
-                fenced = before_retirement(self._profile(state, name))
-                if fenced is not False and entries[name]["client_id"] is not None:
-                    entries[name]["retiring"] = True
-            state["epoch"] = secrets.token_urlsafe(32)
-            self._write(directory, state)
-            return self._profile(state, label) if label is not None else None
+            if label is not None:
+                return self._begin_targeted_disconnect(directory, state, label, before_retirement)
+            return self._begin_bare_disconnect(directory, state, before_retirement, inactive_filter)

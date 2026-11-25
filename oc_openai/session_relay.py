@@ -19,6 +19,8 @@ else:
 
 
 PROVIDER = ("127.0.0.1", 8401)
+RELAY_PORT_MIN = 8401
+RELAY_PORT_MAX = 8416
 MAX_HEADER = 16 * 1024
 MAX_BODY = 4 * 1024 * 1024
 MAX_WIRE_RESPONSE = 9 * 1024 * 1024
@@ -198,13 +200,15 @@ def _spawn_peer(listener: socket.socket, lease: relay.Lease, slots: threading.Bo
         client.close()
 
 
-def serve(lease: relay.Lease, proof: bytes) -> None:
+def serve(lease: relay.Lease, proof: bytes, port: int = 8401) -> None:
+    if type(port) is not int or not RELAY_PORT_MIN <= port <= RELAY_PORT_MAX:
+        raise RelayError("invalid relay port")
     os.umask(0o077)
     if lease.status() == "terminal":
         return
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(PROVIDER)
+        listener.bind((PROVIDER[0], port))
         listener.listen(8)
         slots = threading.BoundedSemaphore(8)
         peers: set[socket.socket] = set()
@@ -240,11 +244,18 @@ def serve(lease: relay.Lease, proof: bytes) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         sys.exit("Invalid session relay arguments")
+    bind_port = 8401
+    if len(sys.argv) == 5:
+        if not sys.argv[4].isdecimal():
+            sys.exit("Invalid session relay port")
+        bind_port = int(sys.argv[4])
+        if not RELAY_PORT_MIN <= bind_port <= RELAY_PORT_MAX:
+            sys.exit("Invalid session relay port")
     active = relay.grant_record(sys.argv[1], int(sys.argv[2]), True)
     with relay.PROOF.open("rb") as file:
         secret = file.read(relay.PROOF_SIZE + 1)
     if len(secret) != relay.PROOF_SIZE:
         sys.exit("Relay proof is missing or invalid")
-    serve(relay.Lease(relay.GRANT, active, int(sys.argv[3])), secret)
+    serve(relay.Lease(relay.GRANT, active, int(sys.argv[3])), secret, port=bind_port)

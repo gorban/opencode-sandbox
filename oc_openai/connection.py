@@ -51,6 +51,7 @@ class Binding:
 
     generation: str
     profile: str
+    client: str | None = None
 
 
 @dataclass(frozen=True)
@@ -305,7 +306,9 @@ def _open_host_browser(url):
 
 def _active(record, binding):
     return (record.get("generation") == binding.generation
-            and record.get("profile") == binding.profile and bool(record.get("tokens"))
+            and record.get("profile") == binding.profile
+            and (binding.client is None or record.get("client") == binding.client)
+            and bool(record.get("tokens"))
             and record.get("worker_retiring") is not True)
 
 
@@ -377,12 +380,14 @@ class Connection:
                 "worker_lease", "worker_leases", "worker_retiring", "retiring",
             }.intersection(record) and record.get("registration_observed") is not True
 
-    def binding(self):
+    def binding(self, *, expected_client: str | None = None):
         with self._store.locked() as directory:
             record = self._store.read(directory)
             if not record.get("tokens") or record.get("worker_retiring") is True:
                 raise ConnectionError("openai_connection_required")
-            return Binding(record["generation"], record["profile"])
+            if expected_client is not None and record.get("client") != expected_client:
+                raise ConnectionError("openai_account_mismatch")
+            return Binding(record["generation"], record["profile"], client=expected_client)
 
     def saved_registration(self):
         """Recover a verified registration whose selection publication was interrupted."""
@@ -438,7 +443,7 @@ class Connection:
                     self._store.write(directory, record)
 
     @contextlib.contextmanager
-    def session_lease(self, binding, job):
+    def session_lease(self, binding, job, *, release_gate=None):
         """Register one concurrent interactive session lease (bounded to MAX_WORKER_LEASES)."""
         lease = WorkerLease.capture(job, self._host_probe())
         lease_record = lease.record()
@@ -454,18 +459,19 @@ class Connection:
         try:
             yield lease
         finally:
-            with self._store.locked() as directory:
-                record = self._store.read(directory)
-                leases = record.get("worker_leases")
-                if isinstance(leases, dict) and leases.get(lease.root) == lease_record:
-                    lease.confirm_terminal()
-                    leases = dict(leases)
-                    leases.pop(lease.root, None)
-                    if leases:
-                        record["worker_leases"] = leases
-                    else:
-                        record.pop("worker_leases", None)
-                    self._store.write(directory, record)
+            if release_gate is None or release_gate():
+                with self._store.locked() as directory:
+                    record = self._store.read(directory)
+                    leases = record.get("worker_leases")
+                    if isinstance(leases, dict) and leases.get(lease.root) == lease_record:
+                        lease.confirm_terminal()
+                        leases = dict(leases)
+                        leases.pop(lease.root, None)
+                        if leases:
+                            record["worker_leases"] = leases
+                        else:
+                            record.pop("worker_leases", None)
+                        self._store.write(directory, record)
 
     @contextlib.contextmanager
     def _operation(self, generation, check, *, timeout=REQUEST_SECONDS,

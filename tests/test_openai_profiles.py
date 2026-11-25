@@ -34,12 +34,14 @@ class ProfilesTests(unittest.TestCase):
         self.assertNotIn("personal", str(personal.directory))
 
         self.profiles = Profiles(self.root)
-        work = self.save("Work_2", "issued-two")
+        work = self.save("work-2", "issued-two")
         self.assertNotEqual(personal.directory, work.directory)
         self.assertEqual(personal.host_id, work.host_id)
         self.assertNotEqual(personal.epoch, work.epoch)
-        self.assertEqual([profile.label for profile in self.profiles.list()], ["Work_2", "personal"])
+        self.assertEqual([profile.label for profile in self.profiles.list()], ["personal", "work-2"])
         self.assertEqual(self.profiles.selected(), work)
+        with self.assertRaisesRegex(ProfileError, "profile_invalid_label"):
+            self.profiles.begin("Work_2")
         for name in ("state.lock", "state.json", "foreground.lock"):
             self.assertEqual((self.root / "profiles" / name).stat().st_mode & 0o777, 0o600)
 

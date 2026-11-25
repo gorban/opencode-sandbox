@@ -4,6 +4,10 @@
 A private rootless Podman store is mandatory. Never point it at an existing store.
 The default real run uses headless Chromium. --run --wayland runs the opt-in
 desktop smoke. Failed or uncertain cleanup retains the private directory for inspection.
+
+Because oc-sandbox fails closed into managed mode whenever the calling Linux account has
+~/.config/oc-sandbox/{providers.toml,openai}, run --run under a dedicated local test user,
+SELinux VM, or host CI runner without managed provider state in its account home.
 """
 import argparse
 import ctypes
@@ -404,6 +408,18 @@ def supervised_suite(command, env, *, grace=3, timeout=float('inf')):
             signal.signal(sig, handler)
 
 
+def require_clean_legacy_account(account_home=None):
+    """Fail fast before --run if the calling Linux account has managed provider state."""
+    home = Path(account_home) if account_home is not None else Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    cfg = home / '.config' / 'oc-sandbox'
+    if any((cfg / leaf).exists() or (cfg / leaf).is_symlink() for leaf in ('providers.toml', 'openai')):
+        die(
+            'account home has managed provider configuration (~/.config/oc-sandbox/{providers.toml,openai}); '
+            'oc-sandbox enforces managed mode fail-closed for this account. Run tests/parallel-isolated.py --run '
+            'under a clean local test user, SELinux VM, or host CI runner without managed provider state.'
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', action='store_true', help='run real isolated headless Podman acceptance')
@@ -414,6 +430,7 @@ def main():
     pol = preflight()
     if not args.run:
         return 0
+    require_clean_legacy_account()
     runtime_parent, wayland = host_preflight(args.wayland)
     # The distrobox /tmp is not necessarily visible to the host bridge.
     base = Path(tempfile.mkdtemp(prefix='.oc-parallel-private-', dir=Path.home()))
