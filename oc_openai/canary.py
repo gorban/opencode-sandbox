@@ -614,6 +614,69 @@ def _verify_and_record_completion(
     return 1
 
 
+@dataclass(frozen=True)
+class _LiveUpstream:
+    backend: object
+    label: str
+    epoch: str
+    conn: object
+    binding: object
+
+
+@dataclass(frozen=True)
+class _LiveRunContext:
+    proof: bytes
+    worker_token: str
+    model: str
+    ledger: CanaryLedger
+    run_id: str
+    binding_hash: str
+    history_digest: str
+    check_alive: object
+    recovery_prior: tuple[str, str] | None = None
+    expected_prior: tuple[str, str] | None = None
+
+
+def _create_live_broker(root: Path, upstream: _LiveUpstream, ctx: _LiveRunContext) -> CanaryBroker:
+    broker_ref: list[CanaryBroker] = []
+
+    @contextmanager
+    def upstream_stream(body, *, before_write, deadline, cancelled):
+        with upstream.conn.canary_responses(
+            upstream.binding, body,
+            authorization=lambda: upstream.backend.selected_fence(upstream.label, upstream.epoch),
+            before_write=before_write,
+            limits=CANARY_STREAM_LIMITS,
+            deadline=deadline,
+            cancelled=cancelled,
+            inspect_media=True,
+            observe_media=broker_ref[0].observe_media,
+        ) as events:
+            yield events
+
+    broker = CanaryBroker(
+        root / "relay" / _RELAY_SOCK,
+        CanaryBrokerConfig(
+            proof=ctx.proof,
+            worker_token=ctx.worker_token,
+            bound_model=ctx.model,
+            ledger=ctx.ledger,
+            run_id=ctx.run_id,
+            binding_hash=ctx.binding_hash,
+            history_digest=ctx.history_digest,
+            upstream_stream=upstream_stream,
+            fenced_client_write=lambda fn: upstream.backend.canary_fenced_write(
+                upstream.label, upstream.epoch, upstream.conn, upstream.binding, fn,
+            ),
+            check_alive=ctx.check_alive,
+            recovery_prior=ctx.recovery_prior,
+            expected_prior=ctx.expected_prior,
+        ),
+    )
+    broker_ref.append(broker)
+    return broker
+
+
 def _execute_canary_session(
     *,
     terminal: Terminal,
@@ -641,32 +704,17 @@ def _execute_canary_session(
         def check_alive():
             _check_tty_and_owner(terminal, owner)
 
-        @contextmanager
-        def upstream_stream(body, *, before_write, deadline, cancelled):
-            with conn.canary_responses(
-                binding, body,
-                authorization=lambda: backend.selected_fence(label, epoch),
-                before_write=before_write,
-                limits=CANARY_STREAM_LIMITS,
-                deadline=deadline,
-                cancelled=cancelled,
-                inspect_media=True,
-                observe_media=broker.observe_media,
-            ) as events:
-                yield events
-
-        broker = CanaryBroker(
-            root / "relay" / _RELAY_SOCK,
-            CanaryBrokerConfig(
+        broker = _create_live_broker(
+            root,
+            _LiveUpstream(backend, label, epoch, conn, binding),
+            _LiveRunContext(
                 proof=proof,
                 worker_token=worker_token,
-                bound_model=model,
+                model=model,
                 ledger=ledger,
                 run_id=run_id,
                 binding_hash=b_hash,
                 history_digest=history.digest,
-                upstream_stream=upstream_stream,
-                fenced_client_write=lambda fn: backend.canary_fenced_write(label, epoch, conn, binding, fn),
                 check_alive=check_alive,
                 recovery_prior=recovery_prior,
                 expected_prior=expected_prior,
@@ -914,33 +962,17 @@ def run_live_canary_e2e(
         root: Path | None = None
         try:
             root, proof = owner.prepare()
-
-            @contextmanager
-            def upstream_stream(body, *, before_write, deadline, cancelled):
-                with conn.canary_responses(
-                    binding, body,
-                    authorization=lambda: backend.selected_fence(label, epoch),
-                    before_write=before_write,
-                    limits=CANARY_STREAM_LIMITS,
-                    deadline=deadline,
-                    cancelled=cancelled,
-                    inspect_media=True,
-                    observe_media=broker.observe_media,
-                ) as events:
-                    yield events
-
-            broker = CanaryBroker(
-                root / "relay" / _RELAY_SOCK,
-                CanaryBrokerConfig(
+            broker = _create_live_broker(
+                root,
+                _LiveUpstream(backend, label, epoch, conn, binding),
+                _LiveRunContext(
                     proof=proof,
                     worker_token=worker_token,
-                    bound_model=model,
+                    model=model,
                     ledger=ledger,
                     run_id=run_id,
                     binding_hash=b_hash,
                     history_digest=history.digest,
-                    upstream_stream=upstream_stream,
-                    fenced_client_write=lambda fn: backend.canary_fenced_write(label, epoch, conn, binding, fn),
                     check_alive=owner.check_alive,
                 ),
             )

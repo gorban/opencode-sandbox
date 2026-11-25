@@ -142,6 +142,10 @@ def _decode_json_bytes(raw: bytes, *, err_code: str = _ERR_CORRUPT):
         raise CanaryLedgerError(err_code) from None
 
 
+def _is_valid_run_id(value) -> bool:
+    return type(value) is str and bool(_RUN.fullmatch(value))
+
+
 def _validate_diagnostic_entry(name: str, payload) -> list[dict]:
     expected_keys = _STREAM_DIAG_KEYS if name == _STREAM_DIAGNOSTIC else _DIAG_KEYS
     if type(payload) is not dict or set(payload) != expected_keys:
@@ -150,17 +154,15 @@ def _validate_diagnostic_entry(name: str, payload) -> list[dict]:
         phase = Phase(payload["phase"])
     except ValueError:
         raise CanaryLedgerError(_ERR_CORRUPT) from None
-    slot = Slot(payload["run"], payload["binding"], phase)
-    valid_orig = type(payload["original_run"]) is str and bool(_RUN.fullmatch(payload["original_run"]))
-    valid_prev = (
-        name != _STREAM_DIAGNOSTIC
-        or (type(payload["previous_diagnostic_run"]) is str
-            and bool(_RUN.fullmatch(payload["previous_diagnostic_run"])))
+    checks = (
+        _valid_slot(Slot(payload["run"], payload["binding"], phase)),
+        _is_valid_run_id(payload["original_run"]),
+        name != _STREAM_DIAGNOSTIC or _is_valid_run_id(payload["previous_diagnostic_run"]),
+        type(payload["max_input"]) is int and payload["max_input"] == _INPUT_LIMIT,
+        type(payload["max_output"]) is int and payload["max_output"] == _OUTPUT_LIMIT,
+        _use(payload),
     )
-    if (not _valid_slot(slot) or not valid_orig or not valid_prev
-            or type(payload["max_input"]) is not int or payload["max_input"] != _INPUT_LIMIT
-            or type(payload["max_output"]) is not int or payload["max_output"] != _OUTPUT_LIMIT
-            or not _use(payload)):
+    if not all(checks):
         raise CanaryLedgerError(_ERR_CORRUPT)
     return [payload]
 
