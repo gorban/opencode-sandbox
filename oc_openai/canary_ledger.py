@@ -15,6 +15,8 @@ import time
 
 from .connection_state import ConnectionError as StateError, _directory
 from .exposure import (
+    ExposureError,
+    ExposureLedger,
     Phase,
     Slot,
     _DIAGNOSTIC,
@@ -216,6 +218,7 @@ def _tally_entries(entries: list[dict]) -> tuple[int, int, int, int, int, int, i
 def _inspect_history_fd(dir_fd: int) -> HistorySnapshot:
     hasher = sha256()
     present = []
+    loaded_files: dict[str, tuple[bytes, object]] = {}
     totals = [0, 0, 0, 0, 0, 0, 0, 0]
     for name in I4A_HOLD_FILES:
         raw = _read_private_bytes(dir_fd, name)
@@ -223,11 +226,16 @@ def _inspect_history_fd(dir_fd: int) -> HistorySnapshot:
             continue
         payload = _decode_json_bytes(raw)
         entries = _validate_i4a_entries(name, payload)
+        loaded_files[name] = (raw, payload)
         counts = _tally_entries(entries)
         present.append(name)
         for idx, value in enumerate(counts):
             totals[idx] += value
         hasher.update(name.encode("ascii") + b"\0" + str(len(raw)).encode("ascii") + b"\0" + raw + b"\0")
+    try:
+        ExposureLedger._validate_diagnostic_links(loaded_files)
+    except ExposureError as error:
+        raise CanaryLedgerError(str(error)) from None
     return HistorySnapshot(
         digest=hasher.hexdigest(),
         present_files=tuple(present),
@@ -696,7 +704,28 @@ class E2ECanaryLedger(CanaryLedger):
     cleanly settled in-bounds records (or a valid linked settled recovery) permit explicit re-runs.
     """
 
+    def _enforce_i4a_exposure_admission(self, dir_fd: int) -> None:
+        """Apply the shared ExposureLedger I4a hold and link validation under held exposure.lock."""
+        exposure = ExposureLedger(self.root)
+        loaded_files: dict[str, tuple[bytes, object]] = {}
+        blocked = False
+        try:
+            for name in I4A_HOLD_FILES:
+                loaded = exposure._read_verified_hold_file(dir_fd, name)
+                if loaded is None:
+                    continue
+                raw, parsed = loaded
+                loaded_files[name] = (raw, parsed)
+                file_blocked, _file_unsettled = exposure._validate_hold_entry(name, parsed)
+                blocked = blocked or file_blocked
+            exposure._validate_diagnostic_links(loaded_files)
+        except ExposureError as error:
+            raise CanaryLedgerError(str(error)) from None
+        if blocked:
+            raise CanaryLedgerError("exposure_hold_active")
+
     def _validate_readonly_history(self, dir_fd: int) -> HistorySnapshot:
+        self._enforce_i4a_exposure_admission(dir_fd)
         history = _inspect_history_fd(dir_fd)
         _check_readonly_canary_files(dir_fd, max_input=self.max_input, max_output=self.max_output)
         return history

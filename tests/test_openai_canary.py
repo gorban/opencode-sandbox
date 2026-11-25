@@ -369,11 +369,12 @@ class CanaryLedgerTests(unittest.TestCase):
         snap = self.ledger.preflight()
 
         # Mutating history between consent and reserve fails closed.
-        (self.state / "diagnostic.json").write_bytes((json.dumps({
-            "original_run": "1" * 32, "binding": "2" * 64, "run": "4" * 32, "phase": "orchestrator",
+        (self.state / "diagnostic-stream.json").write_bytes((json.dumps({
+            "original_run": "1" * 32, "previous_diagnostic_run": "3" * 32, "binding": "2" * 64,
+            "run": "6" * 32, "phase": "orchestrator",
             "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": None,
         }) + "\n").encode("ascii"))
-        os.chmod(self.state / "diagnostic.json", 0o600)
+        os.chmod(self.state / "diagnostic-stream.json", 0o600)
         with self.assertRaisesRegex(CanaryLedgerError, "canary_history_changed"):
             self.ledger.reserve("1" * 32, self.binding, "gpt-6.2-sol", snap.digest)
         self.assertFalse((self.state / CANARY_FILE).exists())
@@ -1857,7 +1858,7 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
             hist_exp = state_dir / "exposure.json"
             hist_exp.write_text(json.dumps([{
                 "run": "1" * 32, "binding": b_hash, "phase": "orchestrator",
-                "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": None,
+                "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [10, 5],
             }]), encoding="ascii")
             hist_exp.chmod(0o600)
             hist_canary = state_dir / CANARY_FILE
@@ -2336,6 +2337,157 @@ class CanaryTransportAndPlacementTests(unittest.TestCase):
                 e2e_ledger.preflight()
             with self.assertRaisesRegex(CanaryLedgerError, "canary_storage_unavailable"):
                 base_ledger.preflight_recovery(b_hash, MODEL, expected_prior=("3" * 32, c_digest))
+
+    @staticmethod
+    def _write_private_json(path: Path, payload) -> None:
+        path.write_text(json.dumps(payload), encoding="ascii")
+        path.chmod(0o600)
+
+    def _assert_e2e_run_blocked(self, state_dir: Path, expected_err: str) -> None:
+        sends = [0]
+        owner_calls = [0]
+
+        class _FakeBinding:
+            profile = "a" * 43
+            generation = "b" * 43
+
+        class _FakeConn:
+            def models(self, _binding):
+                return (MODEL,)
+
+            @contextmanager
+            def canary_responses(self, _binding, _body, *, before_write=None, **_kwargs):
+                if before_write is not None:
+                    before_write()
+                sends[0] += 1
+                yield iter(_ok_events())
+
+        class _FakeBackend:
+            _state = state_dir
+
+            def active_connection(self):
+                return "personal", "c" * 43, _FakeConn(), _FakeBinding()
+
+        def _forbid_owner(*_args, **_kwargs):
+            owner_calls[0] += 1
+            raise AssertionError("owner must not start when E2E admission fails")
+
+        with self.assertRaisesRegex(CanaryLedgerError, expected_err):
+            canary.run_live_canary_e2e(
+                requested_model=MODEL,
+                backend_factory=_FakeBackend,
+                owner_factory=_forbid_owner,
+                ledger_dir=state_dir,
+            )
+        self.assertEqual(sends[0], 0)
+        self.assertEqual(owner_calls[0], 0)
+        self.assertFalse((state_dir / canary_ledger.CANARY_E2E_FILE).exists())
+
+    def test_e2e_admission_blocks_unacknowledged_i4a_exposure_hold(self):
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        b_hash = binding_digest("a" * 43, "b" * 43, "c" * 43)
+        settled_exp = [{
+            "run": "1" * 32, "binding": b_hash, "phase": "orchestrator",
+            "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [10, 5],
+        }]
+        cases = (
+            ("unsettled_exposure", {
+                "exposure.json": [{
+                    "run": "1" * 32, "binding": b_hash, "phase": "orchestrator",
+                    "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": None,
+                }],
+            }),
+            ("overage_exposure", {
+                "exposure.json": [{
+                    "run": "1" * 32, "binding": b_hash, "phase": "orchestrator",
+                    "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [_INPUT_LIMIT + 1, 1],
+                }],
+            }),
+            ("linked_diagnostic", {
+                "exposure.json": settled_exp,
+                "diagnostic.json": {
+                    "original_run": "1" * 32, "binding": b_hash, "run": "2" * 32, "phase": "orchestrator",
+                    "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [10, 5],
+                },
+            }),
+            ("recovery_receipt", {
+                "recovery-proof.json": {
+                    "version": 1, "prior": ["1" * 32], "source": "7" * 64,
+                    "phases": [{
+                        "run": "3" * 32, "binding": b_hash, "phase": "orchestrator",
+                        "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [4, 2],
+                    }],
+                },
+            }),
+        )
+        hold_err = "exposure_hold_active"
+        for label, files in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory(prefix="oc-e2e-hold-", dir=home) as tmp:
+                state_dir = Path(tmp) / "state"
+                state_dir.mkdir(mode=0o700)
+                ledger = canary_ledger.E2ECanaryLedger(state_dir)
+                clean_digest = ledger.preflight().digest
+                for name, payload in files.items():
+                    self._write_private_json(state_dir / name, payload)
+                with self.assertRaisesRegex(CanaryLedgerError, hold_err):
+                    ledger.preflight()
+                # Also verify reservation re-checks under exposure.lock even with a prior clean preflight digest.
+                with self.assertRaisesRegex(CanaryLedgerError, hold_err):
+                    ledger.reserve("9" * 32, b_hash, MODEL, clean_digest)
+                self.assertFalse((state_dir / canary_ledger.CANARY_E2E_FILE).exists())
+                self._assert_e2e_run_blocked(state_dir, hold_err)
+
+    def test_e2e_admission_blocks_orphan_diagnostic_and_mismatched_links(self):
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        b_hash = binding_digest("a" * 43, "b" * 43, "c" * 43)
+        settled_exp = [{
+            "run": "1" * 32, "binding": b_hash, "phase": "orchestrator",
+            "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [10, 5],
+        }]
+        cases = (
+            ("orphan_diagnostic", {
+                "diagnostic.json": {
+                    "original_run": "1" * 32, "binding": b_hash, "run": "2" * 32, "phase": "orchestrator",
+                    "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [10, 5],
+                },
+            }),
+            ("mismatched_diagnostic_original_run", {
+                "exposure.json": settled_exp,
+                "diagnostic.json": {
+                    "original_run": "9" * 32, "binding": b_hash, "run": "2" * 32, "phase": "orchestrator",
+                    "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [10, 5],
+                },
+            }),
+            ("orphan_stream_diagnostic", {
+                "exposure.json": settled_exp,
+                "diagnostic-stream.json": {
+                    "original_run": "1" * 32, "previous_diagnostic_run": "2" * 32, "binding": b_hash,
+                    "run": "3" * 32, "phase": "orchestrator",
+                    "max_input": _INPUT_LIMIT, "max_output": _OUTPUT_LIMIT, "actual": [10, 5],
+                },
+            }),
+        )
+        invalid_err = "invalid_exposure_record"
+        for label, files in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory(prefix="oc-e2e-orphan-", dir=home) as tmp:
+                state_dir = Path(tmp) / "state"
+                state_dir.mkdir(mode=0o700)
+                e2e_ledger = canary_ledger.E2ECanaryLedger(state_dir)
+                base_ledger = CanaryLedger(state_dir)
+                clean_digest = e2e_ledger.preflight().digest
+                for name, payload in files.items():
+                    self._write_private_json(state_dir / name, payload)
+                with self.assertRaisesRegex(CanaryLedgerError, invalid_err):
+                    inspect_i4a_history(state_dir)
+                with self.assertRaisesRegex(CanaryLedgerError, invalid_err):
+                    base_ledger.preflight()
+                with self.assertRaisesRegex(CanaryLedgerError, invalid_err):
+                    e2e_ledger.preflight()
+                # Also verify reservation re-checks under exposure.lock even with a prior clean preflight digest.
+                with self.assertRaisesRegex(CanaryLedgerError, invalid_err):
+                    e2e_ledger.reserve("9" * 32, b_hash, MODEL, clean_digest)
+                self.assertFalse((state_dir / canary_ledger.CANARY_E2E_FILE).exists())
+                self._assert_e2e_run_blocked(state_dir, invalid_err)
 
 
 if __name__ == "__main__":
