@@ -440,7 +440,7 @@ class SessionBrokerTests(unittest.TestCase):
                 yield
 
             @contextlib.contextmanager
-            def profile_session_lease(self, label, epoch, binding, job, *, directory, client_id):
+            def profile_session_lease(self, label, epoch, binding, job, *, directory, client_id, release_gate=None):
                 assert self.profile_valid(label, epoch, directory=directory, client_id=client_id)
                 created_roots.append(job.root)
                 yield job.lease
@@ -2167,11 +2167,21 @@ case "$1 $2" in
     exit 0 ;;
   "pod create"|"pod rm"|"pod ls") exit 0 ;;
   "volume ls"|"secret ls") exit 0 ;;
+  "container exists")
+    target="${{@: -1}}"
+    if [[ -n "${{STUB_RUNNING_RELAY:-}}" && "$target" == "$STUB_RUNNING_RELAY" ]]; then exit 0; fi
+    exit 1 ;;
   "container inspect")
     target="${{@: -1}}"
-    if [[ "$*" == *"oc.role"* ]]; then
+    if [[ "$*" == *"oc.role"* && "$*" != *"{{{{.Id}}}}"* ]]; then
       if [[ "$target" == *-relay-* ]]; then echo "provider-relay"; exit 0; fi
       echo ""; exit 0
+    fi
+    if [[ "$*" == *"{{{{.Id}}}}"* ]]; then
+      if [[ -n "${{STUB_RUNNING_RELAY:-}}" && "$target" == "$STUB_RUNNING_RELAY" ]]; then
+        echo "{('f' * 64)} running 1 default provider-relay"; exit 0
+      fi
+      exit 1
     fi
     if [[ "$*" == *".State.Status"* ]]; then
       if [[ -n "${{STUB_RUNNING_RELAY:-}}" && "$target" == "$STUB_RUNNING_RELAY" ]]; then echo "running"; exit 0; fi
@@ -2265,8 +2275,7 @@ esac
         check_rc = subprocess.run(
             [
                 "bash", "-c",
-                'eval "$(sed -n "/^cstate()/,/^any_relay_running()/p" "$1")"; '
-                'eval "$(sed -n "/^any_relay_running()/,/^}/p" "$1")"; '
+                r'eval "$(sed -n "/^cstate()/,/^remove_stale_relays()/p" "$1" | sed "\$d")"; '
                 'pm() { podman "$@"; }; '
                 'any_relay_running oc',
                 "_", str(script),
@@ -2275,6 +2284,364 @@ esac
             capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(check_rc.returncode, 0, "any_relay_running must fail closed (return 0) on pod exists error")
+
+    def test_gate4_r2_swapped_credential_client_id_refused_with_zero_provider_calls(self):
+        import pwd
+        from unittest.mock import patch
+        from oc_openai.cli import RouteUnavailable
+        from oc_openai.connection import Connection, ConnectionError, PhysicalHost
+        from oc_openai.profile_backend import ProfileBackend
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.contracts import ProviderInstanceSpec, ProviderIntegrityError
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+
+        def _forbid_host_browser(url):
+            raise AssertionError(f"unit test attempted to open host browser: {url}")
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        self.enterContext(patch("oc_openai.connection._open_host_browser", side_effect=_forbid_host_browser))
+
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+        shared_verifier = FixtureVerifier()
+        provider_calls: list[str] = []
+
+        def _make_conn(directory: Path):
+            transport = FixtureTransport()
+            transport.user = f"user-{directory.name}"
+            browser = FixtureBrowser()
+            browser.client = f"oaiapp_{directory.name}"
+            orig_json = transport.json
+
+            def counting_json(*args, **kwargs):
+                provider_calls.append(f"json:{args[:2]}")
+                return orig_json(*args, **kwargs)
+
+            transport.json = counting_json
+            return Connection(
+                directory, transport=transport, verifier=shared_verifier,
+                browser=browser, host_probe=lambda: host,
+            )
+
+        backend = ProfileBackend(scratch / "swapped_cred_profiles", connection=_make_conn)
+        backend.connect("personal")
+        backend.connect("work")
+
+        # Grab valid personal binding BEFORE swap to test mid-session swap rejection too.
+        _prof_before, conn_before, valid_personal_binding = backend.profile_connection("personal")
+        provider_calls.clear()
+
+        # Copy work's valid credential state.json into personal's store (client_id mismatch!).
+        view = backend.profiles.snapshot()
+        personal_prof = next(p for p in view.saved if p.label == "personal")
+        work_prof = next(p for p in view.saved if p.label == "work")
+        (personal_prof.directory / "state.json").write_bytes((work_prof.directory / "state.json").read_bytes())
+        (personal_prof.directory / "state.json").chmod(0o600)
+
+        adapter = OpenAISessionAdapter(backend)
+        personal_spec = ProviderInstanceSpec("openai", "personal", True, "subscription")
+        with self.assertRaises(ProviderIntegrityError):
+            adapter.preflight_instance(personal_spec)
+        self.assertEqual(provider_calls, [], "mismatched client_id must trigger zero provider calls")
+
+        with self.assertRaises(RouteUnavailable):
+            backend.select("personal")
+        with self.assertRaises(ConnectionError):
+            conn_before.require_active(valid_personal_binding)
+        with self.assertRaises(ConnectionError):
+            conn_before.models(valid_personal_binding)
+        self.assertEqual(provider_calls, [], "mid-session client_id swap must trigger zero provider calls")
+
+    def test_gate4_r2_bare_launch_checks_account_home_and_fails_closed_on_inspect_error(self):
+        repo = Path(__file__).resolve().parents[1]
+        script = repo / "oc-sandbox"
+        src = script.read_text(encoding="utf-8")
+
+        # Extract detect_managed_mode from oc-sandbox and test with synthetic account_home vs alternate HOME.
+        self.assertIn("detect_managed_mode()", src)
+        start = src.index("detect_managed_mode()")
+        end = src.index("\nMANAGED_MODE=0", start)
+        fn_src = src[start:end]
+
+        acct_home = self.root / "acct_home"
+        alt_home = self.root / "empty_alt_home"
+        acct_cfg = acct_home / ".config" / "oc-sandbox"
+        acct_cfg.mkdir(parents=True, mode=0o700)
+        alt_home.mkdir(mode=0o700)
+        (acct_cfg / "providers.toml").write_text("[launch]\nmini = true\n", encoding="utf-8")
+        (acct_cfg / "providers.toml").chmod(0o600)
+
+        # Wrap python3 in stub PATH to override pwd.getpwuid to return synthetic acct_home (without touching real $HOME).
+        py_stub_dir = self.root / "py_stub"
+        py_stub_dir.mkdir(mode=0o700)
+        py_wrapper = py_stub_dir / "python3"
+        py_wrapper.write_text(
+            "#!/usr/bin/python3 -I\n"
+            "import os, pwd, sys, types\n"
+            "fake_dir = os.environ['SYNTHETIC_ACCT_HOME']\n"
+            "orig_getpwuid = pwd.getpwuid\n"
+            "def _patched(uid):\n"
+            "    entry = orig_getpwuid(uid)\n"
+            "    return types.SimpleNamespace(pw_dir=fake_dir, pw_uid=entry.pw_uid)\n"
+            "pwd.getpwuid = _patched\n"
+            "code = sys.stdin.read()\n"
+            "sys.argv = ['-', sys.argv[-1]]\n"
+            "exec(compile(code, '<detect_managed_mode>', 'exec'), {'__name__': '__main__'})\n",
+            encoding="utf-8",
+        )
+        py_wrapper.chmod(0o755)
+        patched_fn = fn_src.replace("/usr/bin/python3 -I -", f"{py_wrapper} -")
+
+        def _run_detect(caller_home: Path, synthetic_acct: Path) -> subprocess.CompletedProcess:
+            cmd = f"set -euo pipefail\ndie() {{ echo \"$*\" >&2; exit 2; }}\nPROVIDER_SET=0 UI_MODE_SET=0\n{patched_fn}\nif detect_managed_mode; then echo MANAGED; else echo LEGACY; fi\n"
+            return subprocess.run(
+                ["bash", "-c", cmd],
+                env={"PATH": "/usr/bin:/bin", "HOME": str(caller_home), "SYNTHETIC_ACCT_HOME": str(synthetic_acct)},
+                capture_output=True, text=True, timeout=10,
+            )
+
+        # 1. Alternate empty HOME while account_home has [launch].mini = true MUST select MANAGED!
+        r_mismatch = _run_detect(alt_home, acct_home)
+        self.assertEqual(r_mismatch.returncode, 0, r_mismatch.stderr)
+        self.assertEqual(r_mismatch.stdout.strip(), "MANAGED")
+
+        # 2. Confirmed absence in BOTH account_home and caller HOME selects LEGACY.
+        clean_acct = self.root / "clean_acct_home"
+        clean_acct.mkdir(mode=0o700)
+        r_clean = _run_detect(alt_home, clean_acct)
+        self.assertEqual(r_clean.returncode, 0, r_clean.stderr)
+        self.assertEqual(r_clean.stdout.strip(), "LEGACY")
+
+        # 3. Unreadable account_home/.config (EACCES) MUST fail closed (die rc=2), NOT fall back to LEGACY!
+        locked_acct = self.root / "locked_acct_home"
+        locked_cfg = locked_acct / ".config"
+        locked_cfg.mkdir(parents=True, mode=0o700)
+        os.chmod(locked_cfg, 0o000)
+        try:
+            r_err = _run_detect(alt_home, locked_acct)
+            self.assertEqual(r_err.returncode, 2, r_err.stdout + r_err.stderr)
+            self.assertIn("cannot verify provider configuration state", r_err.stderr)
+        finally:
+            os.chmod(locked_cfg, 0o700)
+
+    def test_gate4_r2_unconfirmed_relay_removal_retains_durable_lease_after_gc(self):
+        import gc
+        import pwd
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.connection import Connection, PhysicalHost
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.contracts import ProviderInstanceSpec
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        backend = self._make_real_profile_backend(scratch / "durable_lease_profiles")
+        backend.connect("personal")
+        view = backend.profiles.snapshot()
+        personal_dir = next(p.directory for p in view.saved if p.label == "personal")
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+
+        def _run_failed_teardown_in_inner_scope() -> Path:
+            adapter = OpenAISessionAdapter(backend)
+            pref = adapter.preflight_instance(ProviderInstanceSpec("openai", "personal", True, "subscription"))
+            stop_ev = threading.Event()
+            coord = session_broker._SessionSlotCoordinator(stop_ev)
+            slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+            slot_cm = adapter.open_slot(
+                pref, slot_index=0, slot_root=slot_root, port=8401,
+                worker_token="tok-durable-" + "a" * 24,
+                acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+            )
+            handle = slot_cm.__enter__()
+            coord.register_slot(slot_cm, handle, slot_root)
+            coord.record_container("a" * 64, slot_index=0)
+            handle.job.activate()
+            with patch.object(session_broker, "_remove_container_verified", side_effect=RuntimeError("rm failed")):
+                err = coord.teardown_all(None)
+            self.assertIsNotNone(err)
+            return slot_root
+
+        retained_root = _run_failed_teardown_in_inner_scope()
+        # Force generator GC finalization after launcher scope has exited!
+        gc.collect()
+        gc.collect()
+
+        fresh_conn = Connection(personal_dir, host_probe=lambda: host)
+        self.assertTrue(
+            fresh_conn.has_active_leases(),
+            "generator finalization erased durable worker_leases despite unconfirmed relay removal!",
+        )
+        state_data = json.loads((personal_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertIn(retained_root.name, state_data.get("worker_leases", {}))
+
+    def test_gate4_r2_exposure_hold_mutation_permanently_retires_slot_even_after_settle(self):
+        import pwd
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.exposure import binding_digest
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.contracts import ProviderInstanceSpec
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        backend = self._make_real_profile_backend(scratch / "exposure_retire_profiles")
+        backend.connect("personal")
+        adapter = OpenAISessionAdapter(backend)
+        pref = adapter.preflight_instance(ProviderInstanceSpec("openai", "personal", True, "subscription"))
+
+        # 1. Live coordinator slot: adding a synthetic exposure hold MUST retire lease, broker, and relay
+        #    via the watcher, and settling the hold afterwards MUST NOT revive the retired grant.
+        stop_ev = threading.Event()
+        coord = session_broker._SessionSlotCoordinator(stop_ev)
+        removed: list[str] = []
+        slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+        self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+        slot_cm = adapter.open_slot(
+            pref, slot_index=0, slot_root=slot_root, port=8401,
+            worker_token="tok-exp-" + "a" * 24,
+            acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+        )
+        e2e_path = backend._state / "canary-e2e.json"
+        hold_payload = json.dumps({
+            "run_id": "a" * 32, "binding": binding_digest("a" * 43, "b" * 43), "model": "gpt-6.2-sol",
+            "history_digest": "0" * 64, "max_input": 922_000, "max_output": 128_000,
+            "actual": None, "outcome": "unsettled", "delivered": False,
+        })
+        with patch.object(session_broker, "_remove_container_verified", side_effect=lambda cid: removed.append(cid)):
+            handle = slot_cm.__enter__()
+            coord.register_slot(slot_cm, handle, slot_root)
+            coord.record_container("f" * 64, slot_index=0)
+            handle.job.activate()
+            try:
+                e2e_path.write_text(hold_payload, encoding="ascii")
+                e2e_path.chmod(0o600)
+                self.assertTrue(stop_ev.wait(3.0), "watcher did not retire slot after exposure hold mutation")
+                deadline = time.monotonic() + 3.0
+                while "f" * 64 not in removed and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertIn("f" * 64, removed)
+                self.assertEqual(handle.job.lease.status(), "terminal")
+                self.assertTrue(handle.broker._revoked.is_set())
+
+                # Settle the hold: the retired grant and broker MUST remain permanently unusable!
+                e2e_path.unlink()
+                self.assertEqual(handle.job.lease.status(), "terminal")
+                self.assertTrue(handle.broker._revoked.is_set())
+            finally:
+                self.assertIsNone(coord.teardown_all(None))
+
+        # 2. Standalone broker: exposure refusal permanently fences the broker even after hold settlement.
+        writes: list[str] = []
+
+        def make_events(_body):
+            writes.append("write")
+            yield {"type": "response.created", "response": {"id": "resp_e", "status": "in_progress"}}
+            yield {"type": "response.completed", "response": {"id": "resp_e", "status": "completed", "output": []}}
+
+        exp_dir = self.root / "standalone_exp"
+        exp_dir.mkdir(mode=0o700)
+        sock_e = self.root / "provider_exp_perm.sock"
+        broker = SessionBroker(
+            socket_path=sock_e, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=_FakeConn(make_events), binding=object(), models=("gpt-6.2-sol",),
+            profile_label="personal", usage_dir=exp_dir, policy=SessionPolicy(exposure_dir=exp_dir),
+        )
+        broker.start()
+        self.addCleanup(broker.close)
+        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
+                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        req = (
+            f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+            f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode("ascii") + body
+
+        ok_resp = _send_via_relay(sock_e, self.lease, self.proof, req)
+        self.assertIn(b"response.completed", ok_resp)
+        self.assertEqual(len(writes), 1)
+
+        hold_file = exp_dir / "canary-e2e.json"
+        hold_file.write_text(hold_payload, encoding="ascii")
+        hold_file.chmod(0o600)
+        blocked_resp = _send_via_relay(sock_e, self.lease, self.proof, req)
+        self.assertIn(b"403 Forbidden", blocked_resp)
+        self.assertEqual(len(writes), 1)
+
+        # Settle hold: broker MUST stay permanently revoked with 0 additional upstream writes!
+        hold_file.unlink()
+        after_settle = _send_via_relay(sock_e, self.lease, self.proof, req)
+        self.assertIn(b"403 Forbidden", after_settle)
+        self.assertEqual(len(writes), 1)
+
+    def test_gate4_r2_relay_guard_blocks_paused_restarting_inspect_error_and_removes_by_id(self):
+        repo = Path(__file__).resolve().parents[1]
+        script = repo / "oc-sandbox"
+        stub_dir = self.root / "relay_guard_stubs"
+        stub_dir.mkdir(mode=0o700)
+        rm_log = self.root / "relay_rm.log"
+        relay_cid = "a" * 64
+
+        fake_podman = stub_dir / "podman"
+        fake_podman.write_text(
+            f"""#!/usr/bin/bash
+case "$1 $2" in
+  "pod exists") exit 0 ;;
+  "pod inspect") printf 'oc-relay-0\\n'; exit 0 ;;
+  "container exists")
+    if [[ "${{3:-}}" == "oc-relay-0" ]]; then exit 0; fi
+    exit 1 ;;
+  "container inspect")
+    if [[ "$*" == *"oc.role"* && "$*" != *".Id"* ]]; then
+      echo "provider-relay"; exit 0
+    fi
+    if [[ "${{STUB_INSPECT_FAIL:-}}" == "1" ]]; then exit 125; fi
+    echo "{relay_cid} ${{STUB_RELAY_STATE:-exited}} 1 ${{STUB_RELAY_INST:-default}} provider-relay"; exit 0 ;;
+  "rm "*)
+    echo "rm $*" >> "{rm_log}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+""",
+            encoding="utf-8",
+        )
+        fake_podman.chmod(0o755)
+
+        def _run_helper(fn_call: str, **extra_env) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [
+                    "bash", "-c",
+                    r'eval "$(sed -n "/^cstate()/,/^# The helper holds/p" "$1" | sed "\$d")"; '
+                    'ILABEL=default; pm() { podman "$@"; }; '
+                    + fn_call,
+                    "_", str(script),
+                ],
+                env={"PATH": f"{stub_dir}:/usr/bin:/bin", **extra_env},
+                capture_output=True, text=True, timeout=10,
+            )
+
+        # 1. paused, restarting, and inspect error 125 MUST all report busy (return 0) from any_relay_running.
+        for label, extra in (
+            ("paused", {"STUB_RELAY_STATE": "paused"}),
+            ("restarting", {"STUB_RELAY_STATE": "restarting"}),
+            ("inspect_125", {"STUB_INSPECT_FAIL": "1"}),
+        ):
+            res = _run_helper("any_relay_running oc", **extra)
+            self.assertEqual(res.returncode, 0, f"{label} was treated as idle!")
+
+        # 2. Positively stopped owned relay -> idle (rc=1) and remove_stale_relays removes by verified 64-hex ID!
+        rm_log.write_text("", encoding="utf-8")
+        res_idle = _run_helper("any_relay_running oc", STUB_RELAY_STATE="exited")
+        self.assertEqual(res_idle.returncode, 1)
+        res_rm = _run_helper("remove_stale_relays oc", STUB_RELAY_STATE="exited")
+        self.assertEqual(res_rm.returncode, 0, res_rm.stderr)
+        rm_lines = rm_log.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(rm_lines, [f"rm rm -- {relay_cid}"])
+
+        # 3. Foreign stopped relay (oc.instance=other) MUST be refused without removing it!
+        rm_log.write_text("", encoding="utf-8")
+        res_foreign = _run_helper("remove_stale_relays oc", STUB_RELAY_STATE="exited", STUB_RELAY_INST="other")
+        self.assertNotEqual(res_foreign.returncode, 0)
+        self.assertEqual(rm_log.read_text(encoding="utf-8"), "")
 
 
 if __name__ == "__main__":

@@ -220,8 +220,11 @@ class SessionBroker:
         self._turn_counter = 0
         self._stopped = threading.Event()
         self._revoked = threading.Event()
+        self._exposure_revoked = threading.Event()
+        self._revoke_notified = False
         self._lock = threading.Lock()
         self._clients: dict[socket.socket, threading.Thread] = {}
+        self._streaming_peers: set[socket.socket] = set()
         self._cancels: set[threading.Event] = set()
         self._listener: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
@@ -247,34 +250,60 @@ class SessionBroker:
         self._accept_thread.start()
         self._watch_thread.start()
 
+    def _exposure_mutated(self) -> bool:
+        if self._exposure_dir is None:
+            return False
+        try:
+            hold = ExposureLedger(self._exposure_dir).inspect_hold()
+        except ExposureError:
+            return True
+        return hold.blocked and hold.digest != self._acknowledged_exposure_digest
+
+    def _trigger_revocation(self, *, exposure: bool = False, exclude_peer: socket.socket | None = None) -> None:
+        if exposure:
+            self._exposure_revoked.set()
+        self._revoked.set()
+        self._cancel_active_turns(exclude_peer=exclude_peer, streaming_only=exposure)
+        notify = False
+        with self._lock:
+            if not self._revoke_notified:
+                self._revoke_notified = True
+                notify = True
+        if notify and self._on_revoke is not None:
+            with suppress(Exception):
+                self._on_revoke()
+
     def _watch_revocation(self) -> None:
         while not self._stopped.is_set():
             retired = False
+            exposure_changed = False
             try:
                 self._connection.require_active(self._binding)
                 if self._is_selected is not None and not self._is_selected():
                     retired = True
             except ConnectionError:
                 retired = True
+            if not retired and self._exposure_mutated():
+                exposure_changed = True
+                retired = True
             if retired or self._lease.status() == "terminal":
-                self._revoked.set()
-                self._cancel_active_turns()
-                if self._on_revoke is not None:
-                    with suppress(Exception):
-                        self._on_revoke()
+                self._trigger_revocation(exposure=exposure_changed)
                 return
             self._stopped.wait(0.15)
 
-    def _cancel_active_turns(self) -> None:
+    def _cancel_active_turns(self, *, exclude_peer: socket.socket | None = None, streaming_only: bool = False) -> None:
         with self._lock:
             for event in self._cancels:
                 event.set()
-            for peer in self._clients:
+            targets = self._streaming_peers if streaming_only else self._clients
+            for peer in targets:
+                if peer is exclude_peer:
+                    continue
                 with suppress(OSError):
                     peer.shutdown(socket.SHUT_RDWR)
 
     def _accept_loop(self) -> None:
-        while not self._stopped.is_set() and not self._revoked.is_set():
+        while not self._stopped.is_set():
             try:
                 peer, _ = self._listener.accept()
             except TimeoutError:
@@ -282,7 +311,7 @@ class SessionBroker:
             except OSError:
                 return
             with self._lock:
-                if self._stopped.is_set() or self._revoked.is_set() or len(self._clients) >= MAX_CLIENTS:
+                if self._stopped.is_set() or len(self._clients) >= MAX_CLIENTS:
                     peer.close()
                     continue
                 worker = threading.Thread(target=self._handle_peer, args=(peer,), daemon=True)
@@ -323,7 +352,7 @@ class SessionBroker:
         return _read_exact(peer, size, deadline)
 
     @contextmanager
-    def _exposure_fence(self):
+    def _exposure_fence(self, peer: socket.socket | None = None):
         if self._exposure_dir is None:
             raise ConnectionError("exposure_store_unavailable")
         try:
@@ -334,6 +363,7 @@ class SessionBroker:
                 yield
         except ExposureError as exc:
             code = exc.args[0] if exc.args and type(exc.args[0]) is str else "exposure_hold_active"
+            self._trigger_revocation(exposure=True, exclude_peer=peer)
             raise ConnectionError(code) from None
 
     def _require_turn_active(self) -> None:
@@ -386,8 +416,8 @@ class SessionBroker:
             offset += self._send_slice_fenced(peer, view[offset:])
 
     @contextmanager
-    def _first_write_fence(self):
-        with self._lease.fence(), self._exposure_fence():
+    def _first_write_fence(self, peer: socket.socket | None = None):
+        with self._lease.fence(), self._exposure_fence(peer):
             yield
 
     def _stream_responses_turn(self, peer: socket.socket, parsed, cancel: threading.Event,
@@ -407,7 +437,7 @@ class SessionBroker:
         with self._connection.interactive_responses(
             self._binding, parsed.body, before_write,
             authorization=self._authorization,
-            write_fence=self._first_write_fence,
+            write_fence=lambda: self._first_write_fence(peer),
             limits=INTERACTIVE_STREAM_LIMITS, deadline=turn_deadline,
             cancelled=cancel, inspect_media=True, observe_media=lambda _kind: None,
         ) as upstream_events:
@@ -445,6 +475,12 @@ class SessionBroker:
             raw = self._read_peer_request(peer)
             if raw is None:
                 return
+            if self._exposure_revoked.is_set():
+                peer.sendall(format_error_response(
+                    403, "exposure_hold", "ChatGPT interactive dispatch is blocked by an exposure hold.",
+                ))
+                outcome = "exposure_hold_active"
+                return
             if self._revoked.is_set() or not self._lease.active():
                 peer.sendall(format_error_response(401, "session_revoked", "ChatGPT session is no longer active."))
                 outcome = "session_revoked"
@@ -460,7 +496,13 @@ class SessionBroker:
                 outcome = "models_ok"
                 return
             model = parsed.model
-            outcome, usage = self._stream_responses_turn(peer, parsed, cancel, state)
+            with self._lock:
+                self._streaming_peers.add(peer)
+            try:
+                outcome, usage = self._stream_responses_turn(peer, parsed, cancel, state)
+            finally:
+                with self._lock:
+                    self._streaming_peers.discard(peer)
         except RequestRefused as error:
             outcome = error.code
             self._send_peer_error(peer, state["headers_sent"], error.status, error.code, error.message)
@@ -1213,6 +1255,8 @@ class _SessionSlotCoordinator:
                 state = self._slots.get(slot_index)
                 if state is not None:
                     state.relay_id = container_id
+                    if state.handle.mark_relay_created is not None:
+                        state.handle.mark_relay_created()
                     if state.retiring:
                         return False
             return True
@@ -1239,6 +1283,8 @@ class _SessionSlotCoordinator:
                 _remove_container_verified(relay_id)
                 with self._lock:
                     self._removed_containers.add(relay_id)
+                if state.handle.confirm_relay_removed is not None:
+                    state.handle.confirm_relay_removed()
             except Exception as exc:
                 relay_removed = False
                 self._record_error(exc)
@@ -1296,6 +1342,23 @@ class _SessionSlotCoordinator:
                 for state in self._slots.values()
             )
 
+    def _remove_leftover_container(self, cid: str, slot: _SlotState | None) -> None:
+        try:
+            _remove_container_verified(cid)
+            with self._lock:
+                self._removed_containers.add(cid)
+            if slot is None:
+                return
+            if slot.handle.confirm_relay_removed is not None:
+                slot.handle.confirm_relay_removed()
+            with self._lock:
+                should_exit = not slot.exited
+                slot.exited = True
+            if should_exit:
+                slot.slot_cm.__exit__(None, None, None)
+        except Exception as exc:
+            self._record_error(exc)
+
     def teardown_all(self, agent_id: str | None) -> Exception | None:
         if agent_id is not None:
             try:
@@ -1321,11 +1384,9 @@ class _SessionSlotCoordinator:
 
         with self._lock:
             leftover = [cid for cid in self._created_containers if cid not in self._removed_containers]
+            slots_by_relay = {state.relay_id: state for state in self._slots.values() if state.relay_id is not None}
         for cid in reversed(leftover):
-            try:
-                _remove_container_verified(cid)
-            except Exception as exc:
-                self._record_error(exc)
+            self._remove_leftover_container(cid, slots_by_relay.get(cid))
         with self._lock:
             return self._cleanup_error
 

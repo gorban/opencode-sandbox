@@ -93,7 +93,7 @@ class ProfileBackend:
     def _select_ready(self, previous, target):
         self._require_idle(previous, target, allow_same=False)
         try:
-            self._connection(target.directory).binding()
+            self._connection(target.directory).binding(expected_client=target.client_id)
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
 
@@ -111,13 +111,21 @@ class ProfileBackend:
         if not self._reviewed:
             raise RouteUnavailable(Reason.QUALIFICATION)
         profile = self.profiles.selected()
-        if profile is None or profile.retiring:
+        if profile is None or profile.retiring or profile.client_id is None:
             raise RouteUnavailable(Reason.CONNECTION_CHANGED)
         conn = self._connection(profile.directory)
+        binding_error: ConnectionError | None = None
+        binding = None
         try:
-            binding = conn.binding()
-        except ConnectionError as error:
-            raise _mapped_connection_error(error) from None
+            with self.profiles.selected_fence(profile.label, profile.epoch):
+                try:
+                    binding = conn.binding(expected_client=profile.client_id)
+                except ConnectionError as error:
+                    binding_error = error
+        except ProfileError:
+            raise RouteUnavailable(Reason.CONNECTION_CHANGED) from None
+        if binding_error is not None:
+            raise _mapped_connection_error(binding_error) from None
         return profile.label, profile.epoch, conn, binding
 
     def profile_connection(self, label: str):
@@ -126,13 +134,23 @@ class ProfileBackend:
             raise RouteUnavailable(Reason.QUALIFICATION)
         view = self.profiles.snapshot()
         profile = next((item for item in view.saved if item.label == label), None)
-        if profile is None or profile.retiring:
+        if profile is None or profile.retiring or profile.client_id is None:
             raise RouteUnavailable(Reason.PROFILE_NOT_FOUND if profile is None else Reason.CONNECTION_CHANGED)
         conn = self._connection(profile.directory)
+        binding_error: ConnectionError | None = None
+        binding = None
         try:
-            binding = conn.binding()
-        except ConnectionError as error:
-            raise _mapped_connection_error(error) from None
+            with self.profiles.profile_fence(
+                profile.label, profile.epoch, directory=profile.directory, client_id=profile.client_id,
+            ):
+                try:
+                    binding = conn.binding(expected_client=profile.client_id)
+                except ConnectionError as error:
+                    binding_error = error
+        except ProfileError:
+            raise RouteUnavailable(Reason.CONNECTION_CHANGED) from None
+        if binding_error is not None:
+            raise _mapped_connection_error(binding_error) from None
         return profile, conn, binding
 
     def profile_valid(self, label: str, selection_epoch: str, *, directory: Path, client_id: str) -> bool:
@@ -160,13 +178,13 @@ class ProfileBackend:
         return _fence()
 
     @contextmanager
-    def _acquire_session_lease(self, acquire_via, binding, job):
+    def _acquire_session_lease(self, acquire_via, binding, job, *, release_gate=None):
         if not self._reviewed:
             raise RouteUnavailable(Reason.QUALIFICATION)
 
         def acquire(profile):
             conn = self._connection(profile.directory)
-            lease_cm = conn.session_lease(binding, job)
+            lease_cm = conn.session_lease(binding, job, release_gate=release_gate)
             try:
                 return lease_cm, lease_cm.__enter__()
             except ConnectionError as error:
@@ -192,7 +210,9 @@ class ProfileBackend:
                     raise mapped from None
                 raise mapped from exc[1]
 
-    def profile_session_lease(self, label: str, selection_epoch: str, binding, job, *, directory: Path, client_id: str):
+    def profile_session_lease(
+        self, label: str, selection_epoch: str, binding, job, *, directory: Path, client_id: str, release_gate=None,
+    ):
         """Acquire a session lease for a named published profile atomically under profiles.lock."""
         return self._acquire_session_lease(
             lambda acquire: self.profiles.with_profile(
@@ -200,6 +220,7 @@ class ProfileBackend:
             ),
             binding,
             job,
+            release_gate=release_gate,
         )
 
     def selected_fence(self, label, selection_epoch):

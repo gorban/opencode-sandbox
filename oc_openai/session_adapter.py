@@ -219,6 +219,7 @@ class OpenAISessionAdapter:
         slot_root.mkdir(mode=0o700, exist_ok=True)
         job = _SessionJob(slot_root, "inc_" + secrets.token_hex(16))
         job.prepare(config_payload=None)
+        release_state = {"allowed": True}
         lease_cm = backend.profile_session_lease(
             profile.label,
             profile.epoch,
@@ -226,6 +227,7 @@ class OpenAISessionAdapter:
             job,
             directory=profile.directory,
             client_id=profile.client_id,
+            release_gate=lambda: release_state["allowed"],
         )
         lease = lease_cm.__enter__()
         broker: SessionBroker | None = None
@@ -264,6 +266,12 @@ class OpenAISessionAdapter:
                     provider_label=preflight.spec.qualified_name,
                 )
 
+            def mark_relay_created() -> None:
+                release_state["allowed"] = False
+
+            def confirm_relay_removed() -> None:
+                release_state["allowed"] = True
+
             yield SlotHandle(
                 slot_index=slot_index,
                 scoped_id=preflight.spec.scoped_id,
@@ -273,6 +281,8 @@ class OpenAISessionAdapter:
                 broker=broker,
                 lease=lease,
                 build_relay_args=build_relay_args,
+                mark_relay_created=mark_relay_created,
+                confirm_relay_removed=confirm_relay_removed,
             )
         finally:
             cleanup_error: Exception | None = None

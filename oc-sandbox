@@ -227,7 +227,6 @@ trusted_dir() {  # VAR path: set VAR to the checked physical path, or die
 }
 trusted_dir STATE "$STATE"
 trusted_dir CONF_DIR "${XDG_CONFIG_HOME:-$HOME/.config}/oc-sandbox"
-trusted_dir PROVIDER_CONF_DIR "$HOME/.config/oc-sandbox"
 trusted_dir BIN "$BIN"
 trusted_dir UNITS "$UNITS"
 trusted_dir INSTALL_DIR "$UNITS/.oc-sandbox"
@@ -388,11 +387,65 @@ if (( DELETE || EXEC || LIST || LISTKEYS )) && { (( PG || DIND || ${#PORT_ARGS[@
   die "-p, -D, -P, -C and -W only apply when setting up or starting an instance"
 fi
 
+detect_managed_mode() {  # 0 if managed mode required, 1 if confirmed absent in both account and caller homes
+  (( PROVIDER_SET || UI_MODE_SET )) && return 0
+  local rc=0
+  /usr/bin/python3 -I - "$HOME" <<'PYCODE' || rc=$?
+import os, pwd, stat, sys
+def inspect_base(base):
+    if not base or not base.startswith("/"):
+        return 2
+    cfg = os.path.join(base, ".config")
+    try:
+        st = os.lstat(cfg)
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return 2
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return 1
+    oc_dir = os.path.join(cfg, "oc-sandbox")
+    try:
+        st = os.lstat(oc_dir)
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return 2
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return 1
+    for leaf in ("providers.toml", "openai"):
+        try:
+            os.lstat(os.path.join(oc_dir, leaf))
+            return 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return 2
+    return 0
+try:
+    account_home = pwd.getpwuid(os.geteuid()).pw_dir
+except KeyError:
+    sys.exit(2)
+if not account_home or not account_home.startswith("/"):
+    sys.exit(2)
+found = False
+for base in dict.fromkeys((account_home, sys.argv[1])):
+    status = inspect_base(base)
+    if status == 2:
+        sys.exit(2)
+    if status == 1:
+        found = True
+sys.exit(1 if found else 0)
+PYCODE
+  case $rc in
+    0) return 1 ;;
+    1) return 0 ;;
+    *) die "cannot verify provider configuration state in account home" ;;
+  esac
+}
+
 MANAGED_MODE=0
-if (( PROVIDER_SET || UI_MODE_SET )) \
-  || [[ -L $HOME/.config || -L $HOME/.config/oc-sandbox \
-        || -e $PROVIDER_CONF_DIR/providers.toml || -L $PROVIDER_CONF_DIR/providers.toml \
-        || -e $PROVIDER_CONF_DIR/openai || -L $PROVIDER_CONF_DIR/openai ]]; then
+if (( !DELETE && !LIST && !EXEC && !LISTKEYS )) && detect_managed_mode; then
   MANAGED_MODE=1
 fi
 
@@ -734,7 +787,7 @@ prune_images() {  # remove our recorded builds that are now untagged and unused;
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 cstate() { pm container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo none; }
 pod_relays() {  # pod name -> one relay container name per line (legacy + multi-slot provider-relay)
-  local pod=$1 seen=" " c role lines rc=0
+  local pod=$1 seen=" " c role lines rc=0 ex_rc=0
   pm pod exists "$pod" >/dev/null 2>&1 || rc=$?
   (( rc == 0 || rc == 1 )) || return 1
   if (( rc == 0 )); then
@@ -742,24 +795,73 @@ pod_relays() {  # pod name -> one relay container name per line (legacy + multi-
     while IFS= read -r c; do
       c=${c#/}
       [[ -n $c ]] || continue
-      role=$(pm container inspect --format '{{index .Config.Labels "oc.role"}}' "$c" 2>/dev/null || true)
+      if ! role=$(pm container inspect --format '{{index .Config.Labels "oc.role"}}' "$c" 2>/dev/null); then
+        ex_rc=0
+        pm container exists "$c" >/dev/null 2>&1 || ex_rc=$?
+        (( ex_rc == 1 )) && continue
+        return 1
+      fi
       if [[ $c == "$pod-openai-relay" || $c == "$pod-relay-"[0-9]* || $role == provider-relay || $role == openai-relay ]]; then
         [[ $seen == *" $c "* ]] || { seen+="$c "; printf '%s\n' "$c"; }
       fi
     done <<<"$lines"
   fi
-  if [[ $seen != *" $pod-openai-relay "* && $(cstate "$pod-openai-relay") != none ]]; then
-    printf '%s\n' "$pod-openai-relay"
+  if [[ $seen != *" $pod-openai-relay "* ]]; then
+    ex_rc=0
+    pm container exists "$pod-openai-relay" >/dev/null 2>&1 || ex_rc=$?
+    case $ex_rc in
+      0) printf '%s\n' "$pod-openai-relay" ;;
+      1) ;;
+      *) return 1 ;;
+    esac
   fi
 }
-any_relay_running() {  # 0 if any relay container in $1 is running or cannot be inspected, 1 if idle/absent
-  local pod=$1 relays c
+relay_inspect_id_and_state() {  # container -> "<id> <status> <sandbox> <instance> <role>", rc 3 if absent, 1 on error
+  local target=$1 out="" rc=0
+  if out=$(pm container inspect --format '{{.Id}} {{.State.Status}} {{index .Config.Labels "oc.sandbox"}} {{index .Config.Labels "oc.instance"}} {{index .Config.Labels "oc.role"}}' "$target" 2>/dev/null); then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  pm container exists "$target" >/dev/null 2>&1 || rc=$?
+  (( rc == 1 )) && return 3
+  return 1
+}
+any_relay_running() {  # 0 if any relay in $1 is active/paused/restarting/uninspectable, 1 iff positively stopped/absent
+  local pod=$1 relays c info cid st rc=0
   relays=$(pod_relays "$pod") || return 0
   while IFS= read -r c; do
     [[ -n $c ]] || continue
-    [[ $(cstate "$c") == running ]] && return 0
+    rc=0
+    info=$(relay_inspect_id_and_state "$c") || rc=$?
+    (( rc == 3 )) && continue
+    (( rc == 0 )) || return 0
+    read -r cid st _ <<<"$info"
+    [[ $cid =~ ^[0-9a-f]{64}$ ]] || return 0
+    case $st in
+      exited|stopped|created|configured|initialized) ;;
+      *) return 0 ;;
+    esac
   done <<<"$relays"
   return 1
+}
+remove_stale_relays() {  # remove positively stopped, owned relay containers in $1 by verified container ID
+  local pod=$1 relays c info cid st sbox inst role rc=0
+  relays=$(pod_relays "$pod") || return 1
+  while IFS= read -r c; do
+    [[ -n $c ]] || continue
+    rc=0
+    info=$(relay_inspect_id_and_state "$c") || rc=$?
+    (( rc == 3 )) && continue
+    (( rc == 0 )) || return 1
+    read -r cid st sbox inst role <<<"$info"
+    [[ $cid =~ ^[0-9a-f]{64}$ && $sbox == 1 && $inst == "$ILABEL" ]] || return 1
+    [[ $role == provider-relay || $role == openai-relay ]] || return 1
+    case $st in
+      exited|stopped|created|configured|initialized) ;;
+      *) return 1 ;;
+    esac
+    pm rm -- "$cid" >/dev/null 2>&1 || return 1
+  done <<<"$relays"
 }
 
 # The helper holds an O_NOFOLLOW, owner/identity-checked flock on a persistent inode.
@@ -2110,11 +2212,10 @@ if any_relay_running "$POD"; then
   release_lifecycle_lock
   die "Provider relay is running in instance '$ILABEL'; exit the active provider session first"
 fi
-stale_relays=$(pod_relays "$POD" 2>/dev/null || true)
-while IFS= read -r stale_relay; do
-  [[ -n $stale_relay ]] || continue
-  pm rm -f "$stale_relay" >/dev/null 2>&1 || true
-done <<<"$stale_relays"
+if ! remove_stale_relays "$POD"; then
+  release_lifecycle_lock
+  die "Could not verify or remove stopped provider relay in instance '$ILABEL'"
+fi
 if [[ $(cstate "$AGENT") == running ]]; then
   log "OpenCode is already running in instance '$ILABEL'; setup is up to date (acting like -n)."
   echo "Open a shell in it with:  ${0##*/}${INST:+ -i $INST} -x"
