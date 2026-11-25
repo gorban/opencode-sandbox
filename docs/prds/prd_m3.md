@@ -635,4 +635,5 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
       across [M3a loopback](prd_m3a.md) and [M3b Tauri](prd_m3b.md), enforce trusted human
       confirmation popups on agent-triggered protected actions (even when direct human clicks skip
       confirmation), bind modals to the session-generation fence, and keep authoritative
-      authorization in `oc_daemon` / `oc_controller` / Tauri Rust IPC.
+      authorization in `oc_daemon` / `oc_controller` / Tauri Rust IPC. Current UI SDK
+      capabilities, limits and markup rules: [prd_m3a2](prd_m3a2.md).
