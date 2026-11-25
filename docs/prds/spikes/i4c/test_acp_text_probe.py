@@ -160,9 +160,8 @@ class ScratchTests(unittest.TestCase):
               patch("acp_text_probe.Placement.identity"),
               patch("acp_text_probe.Placement.verify"),
               patch("oc_orchestrator.runtime.podman", side_effect=podman) as host,
-              patch("sys.stderr")):
-            with self.assertRaisesRegex(Failure, "relay image inspection failed"):
-                launch_pair()
+              patch("sys.stderr"), self.assertRaisesRegex(Failure, "relay image inspection failed")):
+            launch_pair()
 
         self.assertEqual([call.args[0] for call in host.call_args_list], ["create", "start", "ps", "rm", "ps"])
         self.assertIn(worker_id, host.call_args_list[3].args)
