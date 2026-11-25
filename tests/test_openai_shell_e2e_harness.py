@@ -3985,6 +3985,35 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             scrollback_uncertain_screen = shell_driver._TerminalScreen()
             scrollback_uncertain_screen.feed(f"\x1b[?9999h\x1b[3J{route_txt}")
             self.assertFalse(scrollback_uncertain_screen.is_certain)
+            # DECAWM off (?7l / ?07l) overwrites the final column in place instead of wrapping onto row 1.
+            self.assertEqual(
+                shell_driver.render_terminal_screen(f"\x1b[?7l{' ' * 120}{route_txt}").strip(),
+                route_txt[-1],
+            )
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(f"\x1b[?7l{' ' * 120}{route_txt}", approval),
+            )
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(f"\x1b[?07l{' ' * 120}{route_txt}", approval),
+            )
+            self.assertIsNone(
+                shell_driver.extract_observed_route_row(
+                    f"\x1b[?7l\x1b[?1049h\x1b[?7h\x1b[?1049l{' ' * 120}{route_txt}", approval,
+                ),
+            )
+            # Non-allowlisted XTWINOPS window resize ops fail closed; allowlisted title stack ops remain certain.
+            for resize_op in ("\x1b[8;24;80t", "\x1b[08;24;80t", "\x1b[4;480;640t", "\x1b[9;1t", "\x1b[10;1t"):
+                self.assertIsNone(shell_driver.extract_observed_route_row(f"{resize_op}{route_txt}", approval))
+            self.assertEqual(
+                shell_driver.extract_observed_route_row(f"\x1b[22;0;0t{route_txt}", approval),
+                route_txt,
+            )
+            # VT (\x0b) and FF (\x0c) perform linefeed; DEL (\x7f) is non-printing.
+            self.assertEqual(
+                [ln.strip() for ln in shell_driver.render_terminal_screen("a\x0bb\x0cc").splitlines() if ln.strip()],
+                ["a", "b", "c"],
+            )
+            self.assertEqual(shell_driver.render_terminal_screen("ab\x7fc").strip(), "abc")
             wide_old = "x" * (len(route_txt) + 5)
             conflict_txt = f"openai--work/{TEST_MODEL}"
             for dual_buf_conflict in (

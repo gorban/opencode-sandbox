@@ -116,7 +116,8 @@ def strip_ansi(text: str) -> str:
 
 _CSI_TOKEN_RE = re.compile(r"\x1b\[([0-?]*[ -/]*)([@-~])")
 _ALT_SCREEN_MODES = frozenset({"47", "1047", "1049"})
-_SAFE_DEC_MODES = frozenset({"1", "7", "12", "25", "1000", "1002", "1003", "1004", "1006", "2004", "2026", "2027"})
+_SAFE_DEC_MODES = frozenset({"1", "12", "25", "1000", "1002", "1003", "1004", "1006", "2004", "2026", "2027"})
+_SAFE_XTWINOPS = frozenset({14, 15, 16, 18, 19, 20, 21, 22, 23})
 _CURSOR_MOVES = frozenset({"H", "f", "A", "B", "C", "D", "E", "F", "G", "d"})
 _EXACT_ASSISTANT_LINE_RE = re.compile(r"(?:[Aa]ssistant\s*:|[●◆▪■])\s*ok\Z")
 _USER_PREFIX_RE = re.compile(r"^(?:[Yy]ou\s*:|[Uu]ser\s*:|[>›❯])\s*")
@@ -182,8 +183,9 @@ class _TerminalScreen:
         self._g0 = "B"
         self._g1 = "B"
         self._gl = 0
+        self._autowrap = True
         self._in_alt_screen = False
-        default_saved = ((0, 0), ("B", "B", 0), (False, None, None))
+        default_saved = ((0, 0), ("B", "B", 0), (False, None, None), True)
         self._saved_states: dict[bool, tuple] = {False: default_saved, True: default_saved}
         self._scroll_top = 0
         self._scroll_bottom = rows - 1
@@ -224,13 +226,15 @@ class _TerminalScreen:
             (self.row, self.col),
             (self._g0, self._g1, self._gl),
             (self._concealed, self._fg, self._bg),
+            self._autowrap,
         )
 
     def _restore_cursor(self) -> None:
-        pos, charset, sgr = self._saved_states[self._in_alt_screen]
+        pos, charset, sgr, autowrap = self._saved_states[self._in_alt_screen]
         self.row, self.col = pos
         self._g0, self._g1, self._gl = charset
         self._concealed, self._fg, self._bg = sgr
+        self._autowrap = autowrap
 
     @property
     def is_certain(self) -> bool:
@@ -252,6 +256,7 @@ class _TerminalScreen:
         self._g0 = other._g0
         self._g1 = other._g1
         self._gl = other._gl
+        self._autowrap = other._autowrap
         self._in_alt_screen = other._in_alt_screen
         self._saved_states = dict(other._saved_states)
         self._uncertain_by_screen = {
@@ -283,10 +288,11 @@ class _TerminalScreen:
             self._g0 = "B"
             self._g1 = "B"
             self._gl = 0
+            self._autowrap = True
             self._in_alt_screen = False
             self._grids = {False: self._blank_grid(), True: self._blank_grid()}
             self._uncertain_by_screen = {False: False, True: False}
-            default_saved = ((0, 0), ("B", "B", 0), (False, None, None))
+            default_saved = ((0, 0), ("B", "B", 0), (False, None, None), True)
             self._saved_states = {False: default_saved, True: default_saved}
 
     def _erase_display(self, mode: int) -> None:
@@ -406,24 +412,32 @@ class _TerminalScreen:
                 self._reset_screen(reset_cursor=False, full_reset=False)
             self._in_alt_screen = False
 
+    def _apply_dec_mode(self, mode: str, final: str) -> None:
+        if mode in _ALT_SCREEN_MODES:
+            self._handle_alt_screen_mode(mode, final)
+        elif mode == "7":
+            self._autowrap = final == "h"
+        elif mode == "1048":
+            if final == "h":
+                self._save_cursor()
+            else:
+                self._restore_cursor()
+        elif mode not in _SAFE_DEC_MODES:
+            self._uncertain = True
+
     def _handle_mode_csi(self, params: str, final: str) -> None:
         if not params.startswith("?"):
             self._uncertain = True
             return
-        modes = [p for p in params[1:].split(";") if p]
-        if not modes:
+        raw_modes = [p for p in params[1:].split(";") if p]
+        if not raw_modes:
             self._uncertain = True
             return
-        for mode in modes:
-            if mode in _ALT_SCREEN_MODES:
-                self._handle_alt_screen_mode(mode, final)
-            elif mode == "1048":
-                if final == "h":
-                    self._save_cursor()
-                else:
-                    self._restore_cursor()
-            elif mode not in _SAFE_DEC_MODES:
+        for raw in raw_modes:
+            if not raw.isdigit():
                 self._uncertain = True
+                continue
+            self._apply_dec_mode(raw.lstrip("0") or "0", final)
 
     def _handle_edit_csi(self, final: str, first: int) -> bool:
         count = first or 1
@@ -538,7 +552,10 @@ class _TerminalScreen:
             return True
         if final == "q" and params.endswith(" "):
             return True
-        return final == "t" and not params.startswith("8;")
+        if final == "t":
+            first = params.split(";", 1)[0]
+            return first.isdigit() and int(first) in _SAFE_XTWINOPS
+        return False
 
     def _handle_cursor_csi(self, final: str, params: str, nums: list[int]) -> None:
         if final in _CURSOR_MOVES:
@@ -584,6 +601,20 @@ class _TerminalScreen:
         self._uncertain = True
         return None
 
+    def _put_printable(self, ch: str) -> None:
+        mapped = self._map_charset_glyph(ch)
+        if mapped is None:
+            return
+        if self.col >= self.cols:
+            if self._autowrap:
+                self.col = 0
+                self._linefeed()
+            else:
+                self.col = self.cols - 1
+        self.grid[self.row][self.col] = " " if self._is_text_hidden() else mapped
+        if self._autowrap or self.col + 1 < self.cols:
+            self.col += 1
+
     def _put_char(self, ch: str) -> None:
         if ch == "\ufffd" or 0x80 <= ord(ch) <= 0x9F:
             self.invalidate()
@@ -594,21 +625,14 @@ class _TerminalScreen:
             self._gl = 0
         elif ch == "\r":
             self.col = 0
-        elif ch == "\n":
+        elif ch in ("\n", "\x0b", "\x0c"):
             self._linefeed()
         elif ch == "\b":
             self.col = max(0, self.col - 1)
         elif ch == "\t":
             self.col = min(self.cols - 1, ((self.col // 8) + 1) * 8)
-        elif ch >= " ":
-            mapped = self._map_charset_glyph(ch)
-            if mapped is None:
-                return
-            if self.col >= self.cols:
-                self.col = 0
-                self._linefeed()
-            self.grid[self.row][self.col] = " " if self._is_text_hidden() else mapped
-            self.col += 1
+        elif ch >= " " and ch != "\x7f":
+            self._put_printable(ch)
 
     def _consume_two_byte_escape(self, nxt: str) -> bool:
         if nxt == "c":
