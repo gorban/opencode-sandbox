@@ -243,7 +243,7 @@ class _TerminalScreen:
     def _is_text_hidden(self) -> bool:
         return self._concealed or (self._fg is not None and self._fg == self._bg)
 
-    def _reset_screen(self, *, reset_cursor: bool = False, reset_charset: bool = True) -> None:
+    def _reset_screen(self, *, reset_cursor: bool = False, full_reset: bool = True) -> None:
         self.grid = [[" "] * self.cols for _ in range(self.rows)]
         self._uncertain = False
         if reset_cursor:
@@ -251,8 +251,8 @@ class _TerminalScreen:
             self.col = 0
             self._scroll_top = 0
             self._scroll_bottom = self.rows - 1
+        if full_reset:
             self._reset_sgr()
-        if reset_charset:
             self._g0 = "B"
             self._g1 = "B"
             self._gl = 0
@@ -262,7 +262,7 @@ class _TerminalScreen:
 
     def _erase_display(self, mode: int) -> None:
         if mode in (2, 3):
-            self._reset_screen(reset_cursor=False, reset_charset=False)
+            self._reset_screen(reset_cursor=False, full_reset=False)
             return
         if mode == 0:
             for c in range(self.col, self.cols):
@@ -362,12 +362,12 @@ class _TerminalScreen:
         if mode == "1049":
             if final == "h":
                 self._save_cursor()
-                self._reset_screen(reset_cursor=True, reset_charset=False)
+                self._reset_screen(reset_cursor=True, full_reset=False)
             else:
-                self._reset_screen(reset_cursor=False, reset_charset=False)
+                self._reset_screen(reset_cursor=False, full_reset=False)
                 self._restore_cursor()
             return
-        self._reset_screen(reset_cursor=True, reset_charset=False)
+        self._reset_screen(reset_cursor=True, full_reset=False)
 
     def _handle_mode_csi(self, params: str, final: str) -> None:
         if not params.startswith("?"):
@@ -566,7 +566,7 @@ class _TerminalScreen:
 
     def _consume_two_byte_escape(self, nxt: str) -> bool:
         if nxt == "c":
-            self._reset_screen(reset_cursor=True, reset_charset=True)
+            self._reset_screen(reset_cursor=True, full_reset=True)
         elif nxt == "7":
             self._save_cursor()
         elif nxt == "8":

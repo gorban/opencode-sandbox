@@ -3922,6 +3922,14 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             self.assertIsNone(
                 shell_driver.extract_observed_route_row(f"\x1b(0\x1b[s\x1b(B\x1b[u{route_txt}", approval),
             )
+            # Active SGR conceal / same-color fg==bg is preserved across alternate-screen transitions.
+            for alt_hidden in (
+                f"\x1b[8m\x1b[?1049h{route_txt}",
+                f"\x1b[30;40m\x1b[?1049h{route_txt}",
+                f"\x1b[8m\x1b[?1047h{route_txt}",
+                f"\x1b[8m\x1b[?47h{route_txt}",
+            ):
+                self.assertIsNone(shell_driver.extract_observed_route_row(alt_hidden, approval), alt_hidden)
 
             # End-to-end PTY guard: DEC Special Graphics route never arms _drive_agent_pty.
             gate_gfx = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
