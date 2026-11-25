@@ -329,7 +329,7 @@ class ExposureLedger:
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise
+                        raise ExposureError("exposure_lock_busy") from None
                     time.sleep(0.01)
             yield directory
         except OSError:
@@ -522,6 +522,8 @@ class ExposureLedger:
                     raise ExposureError("exposure_hold_active")
                 if not hmac.compare_digest(hold.digest, acknowledged_digest):
                     raise ExposureError("exposure_hold_changed")
+            elif acknowledged_digest is not None:
+                raise ExposureError("exposure_hold_changed")
             yield hold
 
     def require_dispatch_allowed(self, *, acknowledged_digest: str | None = None) -> None:

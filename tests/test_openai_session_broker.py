@@ -1174,7 +1174,7 @@ class SessionBrokerTests(unittest.TestCase):
         raw = _send_via_relay(sock_exp, self.lease, self.proof, req)
         self.assertIn(b"response.completed", raw)
         # During write(), exposure.lock MUST have been held so concurrent reserve() failed closed.
-        self.assertEqual(lock_contested, ["exposure_store_unavailable"])
+        self.assertEqual(lock_contested, ["exposure_lock_busy"])
         # Once write() finishes, exposure.lock is released cleanly.
         ExposureLedger(backend._state).reserve(Slot("b" * 32, binding_digest("a" * 43, "b" * 43), Phase.ORCHESTRATOR))
 
@@ -2642,6 +2642,242 @@ esac
         res_foreign = _run_helper("remove_stale_relays oc", STUB_RELAY_STATE="exited", STUB_RELAY_INST="other")
         self.assertNotEqual(res_foreign.returncode, 0)
         self.assertEqual(rm_log.read_text(encoding="utf-8"), "")
+
+    def test_gate4_r3_settling_acknowledged_hold_retires_old_grant(self):
+        import pwd
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.exposure import ExposureError, ExposureLedger, binding_digest
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.contracts import ProviderInstanceSpec
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        backend = self._make_real_profile_backend(scratch / "ack_settle_profiles")
+        backend.connect("personal")
+
+        hold_payload = json.dumps({
+            "run_id": "a" * 32, "binding": binding_digest("a" * 43, "b" * 43), "model": "gpt-6.2-sol",
+            "history_digest": "0" * 64, "max_input": 922_000, "max_output": 128_000,
+            "actual": None, "outcome": "unsettled", "delivered": False,
+        })
+        e2e_path = backend._state / "canary-e2e.json"
+        e2e_path.write_text(hold_payload, encoding="ascii")
+        e2e_path.chmod(0o600)
+        ack_hold = ExposureLedger(backend._state).inspect_hold()
+        self.assertTrue(ack_hold.blocked)
+
+        # 1. Live coordinator slot with acknowledged hold stays healthy while hold is unchanged,
+        #    then retires immediately once the acknowledged hold is settled.
+        adapter = OpenAISessionAdapter(backend)
+        pref = adapter.preflight_instance(ProviderInstanceSpec("openai", "personal", True, "subscription"))
+        stop_ev = threading.Event()
+        coord = session_broker._SessionSlotCoordinator(stop_ev)
+        removed: list[str] = []
+        slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+        self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+        slot_cm = adapter.open_slot(
+            pref, slot_index=0, slot_root=slot_root, port=8401,
+            worker_token="tok-ack-" + "a" * 24,
+            acknowledged_exposure_digest=ack_hold.digest, on_revoke=coord.on_revoke,
+        )
+        with patch.object(session_broker, "_remove_container_verified", side_effect=lambda cid: removed.append(cid)):
+            handle = slot_cm.__enter__()
+            coord.register_slot(slot_cm, handle, slot_root)
+            coord.record_container("e" * 64, slot_index=0)
+            handle.job.activate()
+            try:
+                time.sleep(0.25)
+                self.assertFalse(stop_ev.is_set(), "unchanged acknowledged hold should stay active")
+                # Settle the acknowledged hold -> watcher MUST retire the old grant!
+                e2e_path.unlink()
+                self.assertTrue(stop_ev.wait(3.0), "settling an acknowledged hold must retire the slot")
+                deadline = time.monotonic() + 3.0
+                while "e" * 64 not in removed and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertIn("e" * 64, removed)
+                self.assertEqual(handle.job.lease.status(), "terminal")
+                self.assertTrue(handle.broker._revoked.is_set())
+            finally:
+                self.assertIsNone(coord.teardown_all(None))
+
+        # 2. First-write dispatch_fence and standalone broker also refuse after acknowledged hold settles.
+        exp_dir = self.root / "ack_settle_standalone"
+        exp_dir.mkdir(mode=0o700)
+        hold_file = exp_dir / "canary-e2e.json"
+        hold_file.write_text(hold_payload, encoding="ascii")
+        hold_file.chmod(0o600)
+        ledger = ExposureLedger(exp_dir)
+        hold2 = ledger.inspect_hold()
+        writes: list[str] = []
+
+        def make_events(_body):
+            writes.append("write")
+            yield {"type": "response.created", "response": {"id": "resp_ack", "status": "in_progress"}}
+            yield {"type": "response.completed", "response": {"id": "resp_ack", "status": "completed", "output": []}}
+
+        sock_ack = self.root / "provider_ack_settle.sock"
+        broker = SessionBroker(
+            socket_path=sock_ack, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=_FakeConn(make_events), binding=object(), models=("gpt-6.2-sol",),
+            profile_label="personal", usage_dir=exp_dir,
+            policy=SessionPolicy(exposure_dir=exp_dir, acknowledged_exposure_digest=hold2.digest),
+        )
+        broker.start()
+        self.addCleanup(broker.close)
+        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
+                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        req = (
+            f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+            f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode("ascii") + body
+
+        ok_resp = _send_via_relay(sock_ack, self.lease, self.proof, req)
+        self.assertIn(b"response.completed", ok_resp)
+        self.assertEqual(len(writes), 1)
+
+        hold_file.unlink()
+        with self.assertRaises(ExposureError) as exp_ctx:
+            with ledger.dispatch_fence(acknowledged_digest=hold2.digest):
+                pass
+        self.assertEqual(exp_ctx.exception.args[0], "exposure_hold_changed")
+        after_settle = _send_via_relay(sock_ack, self.lease, self.proof, req)
+        self.assertIn(b"403 Forbidden", after_settle)
+        self.assertEqual(len(writes), 1)
+
+    def test_gate4_r3_ordinary_exposure_lock_contention_does_not_retire_healthy_slot(self):
+        from oc_openai.exposure import ExposureError, ExposureLedger
+
+        exp_dir = self.root / "lock_contention_exp"
+        exp_dir.mkdir(mode=0o700)
+        ledger = ExposureLedger(exp_dir)
+        writes: list[str] = []
+
+        def make_events(_body):
+            writes.append("write")
+            yield {"type": "response.created", "response": {"id": "resp_busy", "status": "in_progress"}}
+            yield {"type": "response.completed", "response": {"id": "resp_busy", "status": "completed", "output": []}}
+
+        revoked_cb: list[str] = []
+        sock_busy = self.root / "provider_lock_busy.sock"
+        broker = SessionBroker(
+            socket_path=sock_busy, relay_proof=self.proof, worker_token=self.worker_token,
+            lease=self.lease, connection=_FakeConn(make_events), binding=object(), models=("gpt-6.2-sol",),
+            profile_label="personal", usage_dir=exp_dir,
+            policy=SessionPolicy(exposure_dir=exp_dir, on_revoke=lambda: revoked_cb.append("revoked")),
+        )
+        broker.start()
+        self.addCleanup(broker.close)
+        body = json.dumps({"model": "gpt-6.2-sol", "stream": True, "store": False,
+                           "input": [{"role": "user", "content": "hi"}]}).encode()
+        req = (
+            f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+            f"Authorization: Bearer {self.worker_token}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode("ascii") + body
+
+        # Hold normal dispatch_fence across multiple watcher poll cycles (>0.35s) AND past send wait (0.5s).
+        with ledger.dispatch_fence(wait=1.0):
+            with self.assertRaises(ExposureError) as busy_ctx:
+                ledger.inspect_hold()
+            self.assertEqual(busy_ctx.exception.args[0], "exposure_lock_busy")
+            time.sleep(0.35)
+            self.assertFalse(broker._revoked.is_set(), "ordinary lock contention must not retire a healthy slot")
+            self.assertEqual(revoked_cb, [])
+            busy_resp = _send_via_relay(sock_busy, self.lease, self.proof, req)
+            self.assertIn(b"503 Service Unavailable", busy_resp)
+            self.assertIn(b"exposure_busy", busy_resp)
+            self.assertEqual(len(writes), 0)
+            self.assertFalse(broker._revoked.is_set(), "busy send refusal must not permanently retire slot")
+
+        # Once the lock is released, the healthy slot MUST still complete turns cleanly.
+        ok_resp = _send_via_relay(sock_busy, self.lease, self.proof, req)
+        self.assertIn(b"response.completed", ok_resp)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(revoked_cb, [])
+
+    def test_gate4_r3_revocation_during_relay_create_retains_durable_lease_on_failed_remove(self):
+        import gc
+        import pwd
+        from unittest.mock import patch
+        from oc_openai import session_broker
+        from oc_openai.connection import Connection, ConnectionError, PhysicalHost
+        from oc_openai.session_adapter import OpenAISessionAdapter
+        from oc_providers.contracts import ProviderInstanceSpec
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir=home)))
+        backend = self._make_real_profile_backend(scratch / "create_race_profiles")
+        backend.connect("personal")
+        view = backend.profiles.snapshot()
+        personal_dir = next(p.directory for p in view.saved if p.label == "personal")
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+        created_id = "c" * 64
+
+        def _run_mid_create_revocation() -> Path:
+            adapter = OpenAISessionAdapter(backend)
+            pref = adapter.preflight_instance(ProviderInstanceSpec("openai", "personal", True, "subscription"))
+            stop_ev = threading.Event()
+            coord = session_broker._SessionSlotCoordinator(stop_ev)
+            slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+            slot_cm = adapter.open_slot(
+                pref, slot_index=0, slot_root=slot_root, port=8401,
+                worker_token="tok-create-race-" + "a" * 24,
+                acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+            )
+            handle = slot_cm.__enter__()
+            coord.register_slot(slot_cm, handle, slot_root)
+
+            in_create = threading.Event()
+            release_create = threading.Event()
+            podman_calls: list[tuple] = []
+
+            def paused_podman(*args, **_kwargs):
+                podman_calls.append(args)
+                if args[0] == "create":
+                    in_create.set()
+                    self.assertTrue(release_create.wait(5.0))
+                    return subprocess.CompletedProcess(args, 0, (created_id + "\n").encode(), b"")
+                return subprocess.CompletedProcess(args, 0, b"", b"")
+
+            def trigger_revoke_mid_create():
+                self.assertTrue(in_create.wait(5.0))
+                coord.on_revoke(0)
+                with coord._lock:
+                    threads = list(coord._retire_threads)
+                for th in threads:
+                    th.join(timeout=5.0)
+                release_create.set()
+
+            revoker = threading.Thread(target=trigger_revoke_mid_create, daemon=True)
+            revoker.start()
+            spec = self._valid_spec()
+            with patch.object(session_broker, "podman", side_effect=paused_podman):
+                with self.assertRaisesRegex(ConnectionError, "connection_retired"):
+                    session_broker._start_and_verify_slot_relay(
+                        spec, "1" * 64, handle, coord, [], [], stop_ev,
+                    )
+            revoker.join(timeout=5.0)
+            self.assertFalse(any(call[0] == "start" for call in podman_calls))
+
+            with patch.object(session_broker, "_remove_container_verified", side_effect=RuntimeError("rm failed")):
+                err = coord.teardown_all(None)
+            self.assertIsNotNone(err)
+            return slot_root
+
+        retained_root = _run_mid_create_revocation()
+        gc.collect()
+        gc.collect()
+
+        fresh_conn = Connection(personal_dir, host_probe=lambda: host)
+        self.assertTrue(
+            fresh_conn.has_active_leases(),
+            "revocation during relay create erased durable lease despite failed removal!",
+        )
+        state_data = json.loads((personal_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertIn(retained_root.name, state_data.get("worker_leases", {}))
 
 
 if __name__ == "__main__":

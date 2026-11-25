@@ -114,6 +114,7 @@ _ERROR_MAP = {
     "openai_operation_cancelled": (503, "cancelled", "Request was cancelled."),
     "exposure_hold_active": (403, "exposure_hold", "ChatGPT interactive dispatch is blocked by an exposure hold."),
     "exposure_hold_changed": (403, "exposure_hold", "ChatGPT exposure hold changed; interactive dispatch blocked."),
+    "exposure_lock_busy": (503, "exposure_busy", "ChatGPT exposure ledger is temporarily busy; retry shortly."),
     "invalid_exposure_record": (403, "exposure_hold", "ChatGPT exposure record is invalid; interactive dispatch blocked."),
     "untrusted_exposure_store": (403, "exposure_hold", "ChatGPT exposure store failed trust checks."),
     "exposure_store_unavailable": (403, "exposure_hold", "ChatGPT exposure store is unavailable."),
@@ -255,9 +256,17 @@ class SessionBroker:
             return False
         try:
             hold = ExposureLedger(self._exposure_dir).inspect_hold()
-        except ExposureError:
+        except ExposureError as exc:
+            code = exc.args[0] if exc.args and type(exc.args[0]) is str else ""
+            if code == "exposure_lock_busy":
+                return False
             return True
-        return hold.blocked and hold.digest != self._acknowledged_exposure_digest
+        if hold.blocked:
+            return (
+                self._acknowledged_exposure_digest is None
+                or not hmac.compare_digest(hold.digest, self._acknowledged_exposure_digest)
+            )
+        return self._acknowledged_exposure_digest is not None
 
     def _trigger_revocation(self, *, exposure: bool = False, exclude_peer: socket.socket | None = None) -> None:
         if exposure:
@@ -363,7 +372,8 @@ class SessionBroker:
                 yield
         except ExposureError as exc:
             code = exc.args[0] if exc.args and type(exc.args[0]) is str else "exposure_hold_active"
-            self._trigger_revocation(exposure=True, exclude_peer=peer)
+            if code != "exposure_lock_busy":
+                self._trigger_revocation(exposure=True, exclude_peer=peer)
             raise ConnectionError(code) from None
 
     def _require_turn_active(self) -> None:
@@ -1202,6 +1212,7 @@ class _SlotState:
         self.handle = handle
         self.slot_root = slot_root
         self.relay_id: str | None = None
+        self.creating_relay = False
         self.retiring = False
         self.retired = False
         self.exited = False
@@ -1248,12 +1259,41 @@ class _SessionSlotCoordinator:
             with suppress(OSError):
                 shutil.rmtree(slot_root)
 
+    def begin_relay_create(self, slot_index: int) -> bool:
+        with self._lock:
+            state = self._slots.get(slot_index)
+            if state is None or state.retiring:
+                return False
+            state.creating_relay = True
+            if state.handle.mark_relay_created is not None:
+                state.handle.mark_relay_created()
+            return True
+
+    def finish_relay_create(self, slot_index: int, relay_id: str | None, *, confirmed_absent: bool = False) -> bool:
+        with self._lock:
+            state = self._slots.get(slot_index)
+            if state is None:
+                return False
+            state.creating_relay = False
+            if relay_id is not None:
+                self._created_containers.append(relay_id)
+                state.relay_id = relay_id
+                if state.handle.mark_relay_created is not None:
+                    state.handle.mark_relay_created()
+                return not state.retiring
+            if confirmed_absent and state.handle.confirm_relay_removed is not None:
+                state.handle.confirm_relay_removed()
+            elif not confirmed_absent and self._cleanup_error is None:
+                self._cleanup_error = RuntimeError("Could not confirm relay container absence after failed create")
+            return False
+
     def record_container(self, container_id: str, *, slot_index: int | None = None) -> bool:
         with self._lock:
             self._created_containers.append(container_id)
             if slot_index is not None:
                 state = self._slots.get(slot_index)
                 if state is not None:
+                    state.creating_relay = False
                     state.relay_id = container_id
                     if state.handle.mark_relay_created is not None:
                         state.handle.mark_relay_created()
@@ -1277,6 +1317,10 @@ class _SessionSlotCoordinator:
             self._record_error(exc)
         with self._lock:
             relay_id = state.relay_id
+            creating = state.creating_relay
+        if creating and relay_id is None:
+            # Relay creation is still in flight; retain the durable lease until creation finishes and is cleaned up.
+            return
         relay_removed = True
         if relay_id is not None:
             try:
@@ -1359,6 +1403,22 @@ class _SessionSlotCoordinator:
         except Exception as exc:
             self._record_error(exc)
 
+    def _exit_uncreated_slots(self) -> None:
+        with self._lock:
+            unexited = [
+                s for s in self._slots.values()
+                if not s.exited and s.relay_id is None and not s.creating_relay
+            ]
+        for slot in unexited:
+            with self._lock:
+                if slot.exited:
+                    continue
+                slot.exited = True
+            try:
+                slot.slot_cm.__exit__(None, None, None)
+            except Exception as exc:
+                self._record_error(exc)
+
     def teardown_all(self, agent_id: str | None) -> Exception | None:
         if agent_id is not None:
             try:
@@ -1387,6 +1447,8 @@ class _SessionSlotCoordinator:
             slots_by_relay = {state.relay_id: state for state in self._slots.values() if state.relay_id is not None}
         for cid in reversed(leftover):
             self._remove_leftover_container(cid, slots_by_relay.get(cid))
+
+        self._exit_uncreated_slots()
         with self._lock:
             return self._cleanup_error
 
@@ -1411,10 +1473,20 @@ def _start_and_verify_slot_relay(
     started_relay_ids: list[str],
     stop_event: threading.Event,
 ) -> str:
-    relay_id = podman(*handle.build_relay_args(spec)).stdout.decode("ascii").strip()
+    if not coordinator.begin_relay_create(handle.slot_index):
+        raise ConnectionError("connection_retired")
+    relay_name = f"{spec['pod']}-relay-{handle.slot_index}"
+    try:
+        relay_id = podman(*handle.build_relay_args(spec)).stdout.decode("ascii").strip()
+    except BaseException:
+        exists = podman("container", "exists", relay_name, check=False, timeout=4)
+        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=(exists.returncode == 1))
+        raise
     if not IMAGE_ID.fullmatch(relay_id):
+        exists = podman("container", "exists", relay_name, check=False, timeout=4)
+        coordinator.finish_relay_create(handle.slot_index, None, confirmed_absent=(exists.returncode == 1))
         raise RuntimeError("Podman did not return a complete relay container ID")
-    if not coordinator.record_container(relay_id, slot_index=handle.slot_index):
+    if not coordinator.finish_relay_create(handle.slot_index, relay_id):
         raise ConnectionError("connection_retired")
     podman("start", relay_id)
     _verify_relay_isolation(
