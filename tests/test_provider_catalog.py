@@ -344,10 +344,11 @@ class ProviderCatalogTests(unittest.TestCase):
                 preflights={"backup": InstancePreflight(oa_b, ReadinessState.READY, ("gpt-6.2-sol",), route_policy="sub")},
             ),
         }
+        term_disc = _FakeTerminal()
         with self.assertRaises(LaunchRefusedError) as ctx:
             plan_interactive_launch(
                 instance_name="default", cwd="construct", provider_filter="openai",
-                cli_ui_mode="default", config=cfg, adapters=adapters_disc, terminal=_FakeTerminal(),
+                cli_ui_mode="default", config=cfg, adapters=adapters_disc, terminal=term_disc,
             )
         self.assertEqual(ctx.exception.code, "selection_disconnected")
 

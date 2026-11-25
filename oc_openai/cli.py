@@ -196,7 +196,7 @@ class Backend(Protocol):
         """Check read-only local acceptance prerequisites without opening the provider route."""
         ...
 
-    def disconnect(self) -> bool:
+    def disconnect(self, label: str | None = None) -> bool:
         """Fence local use and report whether upstream revocation was confirmed."""
         ...
 

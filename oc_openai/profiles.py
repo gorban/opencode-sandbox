@@ -376,7 +376,7 @@ class Profiles:
         self._write(directory, state)
         return self._profile(state, label)
 
-    def _collect_disconnect_targets(self, state, active_label: str | None, inactive_filter) -> list[str]:
+    def _collect_disconnect_targets(self, state, active_label: str | None, inactive_filter) -> tuple[str, ...]:
         entries = state["registrations"]
         targets = [active_label] if active_label is not None else []
         for name, entry in sorted(entries.items()):
@@ -385,7 +385,7 @@ class Profiles:
             is_unpublished = entry["pending"] is not None or entry["client_id"] is None
             if is_unpublished or (inactive_filter is not None and inactive_filter(self._profile(state, name))):
                 targets.append(name)
-        return targets
+        return tuple(targets)
 
     def _begin_bare_disconnect(self, directory, state, before_retirement, inactive_filter) -> Profile | None:
         active_label = state.get("active")

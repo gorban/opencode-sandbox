@@ -194,11 +194,9 @@ def _validate_cli_path(kind: str, raw_path: object, *, sandbox: Path) -> str | N
         return None
     if not PROVIDER_DESCRIPTORS[kind].supports_cli_path:
         raise ProviderConfigError(_ERR_INVALID, f"cli_path is not supported for provider '{kind}'")
-    if (
-        type(raw_path) is not str
-        or not raw_path.startswith("/")
-        or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_path)
-    ):
+    if not isinstance(raw_path, str) or type(raw_path) is not str:
+        raise ProviderConfigError(_ERR_INVALID, "cli_path must be a clean absolute path")
+    if not raw_path.startswith("/") or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_path):
         raise ProviderConfigError(_ERR_INVALID, "cli_path must be a clean absolute path")
     parts = [part for part in raw_path.split("/") if part]
     if not parts or any(part in (".", "..") for part in parts) or raw_path != "/" + "/".join(parts):

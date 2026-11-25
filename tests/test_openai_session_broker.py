@@ -1776,11 +1776,12 @@ class SessionBrokerTests(unittest.TestCase):
                 return 0
 
         # 1. Corrupt JSON in one registration's state.json MUST abort the entire default launch.
+        term = _Term()
         state_file.write_text("{corrupt-json", encoding="utf-8")
         with self.assertRaises(ProviderIntegrityError):
             plan_interactive_launch(
                 instance_name="default", cwd="construct", provider_filter="",
-                cli_ui_mode="default", config=None, adapters={"openai": adapter}, terminal=_Term(),
+                cli_ui_mode="default", config=None, adapters={"openai": adapter}, terminal=term,
             )
 
         # 2. World-writable state.json (0o666) MUST also abort with ProviderIntegrityError.
@@ -1790,7 +1791,7 @@ class SessionBrokerTests(unittest.TestCase):
             with self.assertRaises(ProviderIntegrityError):
                 plan_interactive_launch(
                     instance_name="default", cwd="construct", provider_filter="",
-                    cli_ui_mode="default", config=None, adapters={"openai": adapter}, terminal=_Term(),
+                    cli_ui_mode="default", config=None, adapters={"openai": adapter}, terminal=term,
                 )
         finally:
             os.chmod(state_file, 0o600)
@@ -1856,11 +1857,12 @@ class SessionBrokerTests(unittest.TestCase):
                 return 0
 
         # Fresh empty registry is UNSET and resolves [provider_defaults].openai -> backup (which is disconnected).
+        term = _Term()
         self.assertEqual(adapter.selection_state().state, SelectionState.UNSET)
         with self.assertRaises(LaunchRefusedError) as ctx_empty:
             plan_interactive_launch(
                 instance_name="default", cwd="construct", provider_filter="openai",
-                cli_ui_mode="default", config=cfg, adapters={"openai": adapter}, terminal=_Term(),
+                cli_ui_mode="default", config=cfg, adapters={"openai": adapter}, terminal=term,
             )
         self.assertEqual(ctx_empty.exception.code, "provider_disconnected")
         self.assertIn("openai/backup", str(ctx_empty.exception))
@@ -1875,7 +1877,7 @@ class SessionBrokerTests(unittest.TestCase):
         with self.assertRaises(LaunchRefusedError) as ctx_disc:
             plan_interactive_launch(
                 instance_name="default", cwd="construct", provider_filter="openai",
-                cli_ui_mode="default", config=cfg, adapters={"openai": adapter}, terminal=_Term(),
+                cli_ui_mode="default", config=cfg, adapters={"openai": adapter}, terminal=term,
             )
         self.assertEqual(ctx_disc.exception.code, "selection_disconnected")
 
@@ -1968,11 +1970,12 @@ class SessionBrokerTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, ("b" * 64 + "\n").encode(), b"")
             return subprocess.CompletedProcess(args, 0, b"", b"")
 
+        spec3 = self._valid_spec()
         with patch.object(session_broker, "podman", side_effect=fake_podman):
             coord3.register_slot(cm3, handle3)
             with self.assertRaisesRegex(ConnectionError, "connection_retired"):
                 session_broker._start_and_verify_slot_relay(
-                    self._valid_spec(), "c" * 64, handle3, coord3, [], [], stop_ev3,
+                    spec3, "c" * 64, handle3, coord3, [], [], stop_ev3,
                 )
         self.assertFalse(
             any(call[0] == "start" for call in podman_calls),
@@ -2107,6 +2110,8 @@ class SessionBrokerTests(unittest.TestCase):
             coordinator.record_container(relay0_id, slot_index=handle.slot_index)
             return relay0_id
 
+        rb_adapter = _RollbackAdapter()
+        rb_stop = threading.Event()
         with (
             patch.object(session_broker, "SHARED_TMP", str(self.root)),
             patch.object(session_broker, "_verify_pod_with_containers", return_value=(pod_id, [])),
@@ -2116,8 +2121,8 @@ class SessionBrokerTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "slot 1 boom"):
                 session_broker._run_multi_slot_session(
-                    spec, plan, {"openai": _RollbackAdapter()}, rb_root,
-                    threading.Event(), term, cleanup_state,
+                    spec, plan, {"openai": rb_adapter}, rb_root,
+                    rb_stop, term, cleanup_state,
                 )
         self.assertEqual(removed, [relay0_id])
         self.assertEqual(slot0_exits, [0])
