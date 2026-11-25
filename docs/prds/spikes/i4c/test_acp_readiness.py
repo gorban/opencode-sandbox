@@ -37,7 +37,7 @@ class SyntheticReadinessTest(unittest.TestCase):
 
     def assert_scratch_clean(self):
         self.assertEqual({item.name for item in self.root.iterdir()},
-                         {acp.JOURNAL, acp.PROFILE, "readiness.lock", acp.ENROLLMENT_LOCK})
+                         {acp.JOURNAL, acp.PROFILE, acp.VERIFIER, "readiness.lock", acp.ENROLLMENT_LOCK})
 
     def test_signed_out_and_expired_have_distinct_readiness(self):
         with TemporaryDirectory() as root:
@@ -56,6 +56,31 @@ class SyntheticReadinessTest(unittest.TestCase):
         with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
             self.probe()
         self.profile.write_text("{broken")
+        with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
+            self.probe()
+        self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
+
+    def test_foreign_credential_with_matching_profile_metadata_is_rejected(self):
+        original = self.profile.read_text()
+        profile = json.loads(original)
+        self.assertIs(self.probe(), State.READY)
+        with TemporaryDirectory() as other:
+            other_generation = acp.enroll_fixture(other)
+            self.assertIs(acp.probe_fixture(other, other_generation), State.READY)
+            other_credential = json.loads((Path(other) / acp.PROFILE).read_text())["credential"]
+
+        self.profile.write_text(json.dumps({**profile, "credential": other_credential}))
+        with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
+            self.probe()
+        self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
+        self.profile.write_text(original)
+        self.assertIs(self.probe(), State.READY)
+
+    def test_valid_profile_requires_independent_verifier_record(self):
+        verifier = self.root / acp.VERIFIER
+        self.assertNotIn(json.loads(self.profile.read_text())["credential"], verifier.read_text())
+        self.assertEqual(verifier.stat().st_mode & 0o777, 0o600)
+        verifier.unlink()
         with self.assertRaisesRegex(acp.IntegrityError, "rejected its private profile"):
             self.probe()
         self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
@@ -99,9 +124,8 @@ class SyntheticReadinessTest(unittest.TestCase):
                 self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
 
     def test_cancel_with_confirmed_retirement_leaves_generation_unverified(self):
-        with patch.object(acp, "_transcript", side_effect=KeyboardInterrupt):
-            with self.assertRaises(KeyboardInterrupt):
-                self.probe()
+        with patch.object(acp, "_transcript", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.probe()
         self.assertEqual(acp.read_status(self.root), acp.Record(self.generation, State.NEEDS_VERIFY))
         self.assert_scratch_clean()
 
@@ -144,9 +168,9 @@ class SyntheticReadinessTest(unittest.TestCase):
             self.journal.write_text(json.dumps({"generation": "0" * 32, "readiness": "needs_verify", "check": None}))
             return State.READY
 
-        with patch.object(acp, "_transcript", side_effect=replace_receipt):
-            with self.assertRaisesRegex(acp.IntegrityError, "exact synthetic readiness check changed"):
-                self.probe()
+        with (patch.object(acp, "_transcript", side_effect=replace_receipt),
+              self.assertRaisesRegex(acp.IntegrityError, "exact synthetic readiness check changed")):
+            self.probe()
         with self.assertRaisesRegex(acp.IntegrityError, "receipt does not match its journal"):
             acp.read_status(self.root)
         self.assertEqual(json.loads(self.journal.read_text())["generation"], "0" * 32)
@@ -204,9 +228,8 @@ class SyntheticReadinessTest(unittest.TestCase):
                 raise OSError
             fsync(fd)
 
-        with patch.object(acp.os, "fsync", side_effect=fail_final_directory_sync):
-            with self.assertRaises(acp.IntegrityError):
-                self.probe()
+        with patch.object(acp.os, "fsync", side_effect=fail_final_directory_sync), self.assertRaises(acp.IntegrityError):
+            self.probe()
         self.assertEqual(json.loads(self.journal.read_text())["readiness"], "ready")
         retained = acp.read_status(self.root)
         self.assertIs(retained.readiness, State.REVOCATION_UNCONFIRMED)

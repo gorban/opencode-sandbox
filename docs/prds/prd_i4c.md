@@ -23,8 +23,11 @@ workstation file and socket. Enrollment and the brokered native route still need
 The [synthetic ACP readiness probe](spikes/i4c/acp_readiness.py) exercises only `initialize` and
 `session/new` with a bundled fake peer. From the repository root, run
 `python3 -B -m unittest discover -s docs/prds/spikes/i4c -v`. The test enrollment writes a private
-credential record for the exact generation. The launcher and fresh peer both check that the
-synthetic enrollment handle has closed. This models enrollment authority with a file lock.
+credential record and a separate verifier record for the exact generation. The verifier binds the
+issued synthetic credential and its expiry to that generation. Substituting another enrollment's
+credential fails even when the profile still names the expected generation. The launcher and fresh
+peer both check that the synthetic enrollment handle has closed. This models enrollment authority
+with a file lock.
 The peer reads the separate credential record. A missing record returns `DISCONNECTED`, synthetic
 expiry returns `NEEDS_VERIFY`, and a mismatched or untrusted record gives an integrity error.
 Readiness publishes only after the fresh peer retires and the new journal state is synced.

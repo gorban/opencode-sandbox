@@ -15,7 +15,7 @@ import time
 
 from oc_providers import ReadinessState
 
-from acp_fixture import ENROLLMENT_LOCK, PROFILE, decode_json, is_identifier
+from acp_fixture import ENROLLMENT_LOCK, PROFILE, VERIFIER, credential_digest, decode_json, is_identifier
 
 
 MAX_FRAME = 256 * 1024
@@ -166,7 +166,11 @@ def enrollment_fixture(root, *, expires_at=None):
         with _locked(root) as directory:
             if _status(directory) != expected:
                 raise IntegrityError("the exact synthetic enrollment changed")
-            _store_json(directory, PROFILE, {"generation": generation, "credential": secrets.token_hex(16),
+            credential = secrets.token_hex(16)
+            digest = credential_digest(generation, credential, expires_at)
+            # Persist the independent verifier before publishing the peer's profile.
+            _store_json(directory, VERIFIER, {"generation": generation, "digest": digest})
+            _store_json(directory, PROFILE, {"generation": generation, "credential": credential,
                                              "expires_at": expires_at}, durable_rename=False)
 
 
@@ -238,19 +242,21 @@ class _Channel:
 
 
 def _classify(reply):
-    if "result" in reply:
-        result = reply["result"]
-        if type(result) is dict and type(result.get("sessionId")) is str and result["sessionId"].strip():
-            return ReadinessState.READY
-    else:
-        error = reply["error"]
-        if type(error) is dict and type(error.get("code")) is int:
-            if error["code"] == -32000 and error.get("message") == "authentication required":
-                return ReadinessState.DISCONNECTED
-            if error["code"] == -32001 and error.get("message") == "synthetic credential expired":
-                return ReadinessState.NEEDS_VERIFY
-            if error["code"] == -32002 and error.get("message") == "synthetic profile integrity error":
-                raise IntegrityError("synthetic ACP peer rejected its private profile")
+    result = reply.get("result")
+    session_id = result.get("sessionId") if type(result) is dict else None
+    if type(session_id) is str and session_id.strip():
+        return ReadinessState.READY
+
+    error = reply.get("error")
+    if type(error) is not dict or type(error.get("code")) is not int:
+        raise ProtocolError("unrecognized synthetic ACP session verdict")
+    verdict = (error["code"], error.get("message"))
+    if verdict == (-32000, "authentication required"):
+        return ReadinessState.DISCONNECTED
+    if verdict == (-32001, "synthetic credential expired"):
+        return ReadinessState.NEEDS_VERIFY
+    if verdict == (-32002, "synthetic profile integrity error"):
+        raise IntegrityError("synthetic ACP peer rejected its private profile")
     raise ProtocolError("unrecognized synthetic ACP session verdict")
 
 
