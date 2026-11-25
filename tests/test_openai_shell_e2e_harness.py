@@ -6,7 +6,7 @@ ProofGate arming and whole-request canonicalization, lock-safe 12-file exposure 
 pinned image IDs against tag drift, and lifecycle-locked SIGKILL-surviving cleanup ownership.
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from hashlib import sha256
 import json
 import os
@@ -622,7 +622,7 @@ esac
                 "OC_CODE_BIN": str(stub_bin / FAKE_EDITOR_NAME),
                 "OC_BCOMPARE_BIN": str(stub_bin / FAKE_EDITOR_NAME),
             }
-            for extra_args, want_ui in (([], "default"), (["--mini"], "mini")):
+            for extra_args, driver_mode, want_ui in (([], "full", "default"), (["--mini"], "mini", "mini")):
                 spec_out.unlink(missing_ok=True)
                 args_str = " ".join(extra_args)
                 proc = subprocess.run(
@@ -642,19 +642,24 @@ esac
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", errors="replace"))
                 emitted = json.loads(spec_out.read_text(encoding="utf-8"))
-                self.assertEqual(emitted["instance"], TEST_INSTANCE)
-                self.assertEqual(emitted["pod"], TEST_POD)
-                self.assertEqual(emitted["agent"], f"{TEST_POD}-agent")
-                self.assertEqual(emitted["relay"], f"{TEST_POD}-openai-relay")
-                self.assertEqual(emitted["relay_image"], TEST_HEX_B)
-                self.assertEqual(emitted["agent_image"], TEST_HEX_A)
-                self.assertEqual(emitted["level"], TEST_LEVEL)
-                self.assertEqual(emitted["sandbox"], str(home / "opencode-sandbox"))
-                self.assertEqual(emitted["cwd"], TEST_CWD)
-                self.assertEqual(emitted["home_vol"], TEST_VOLUME)
-                self.assertEqual(emitted["chromium"], f"{TEST_POD}-chromium")
-                self.assertEqual(emitted["provider_filter"], "")
+                jspec = JournalSpec(
+                    run_id=TEST_RUN_ID,
+                    instance=TEST_INSTANCE,
+                    pod_name=TEST_POD,
+                    volume_name=TEST_VOLUME,
+                    sandbox_dir=home / "opencode-sandbox",
+                    cwd=TEST_CWD,
+                    level=TEST_LEVEL,
+                    agent_image_id=TEST_HEX_A,
+                )
+                expected_driver_spec = shell_driver.build_driver_session_spec(
+                    jspec,
+                    relay_image_id=TEST_HEX_B,
+                    ui_mode=driver_mode,
+                    agent_mem=emitted["agent_mem"],
+                )
                 self.assertEqual(emitted["cli_ui_mode"], want_ui)
+                self.assertEqual(emitted, expected_driver_spec)
 
     def test_pytest_live_default_skip_and_mutable_checkout_refusal(self) -> None:
         check = subprocess.run(
@@ -2171,9 +2176,10 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                     state=STATE_ARMED, arm_nonce=nonce,
                     job_incarnation=gate._job_incarnation, relay_verified=False,
                 )
+                stale_body = canonical_proof_body(TEST_MODEL)
                 with self.assertRaises(ProofGateError):
                     gate.claim_for_write(
-                        stale_arrival, canonical_proof_body(TEST_MODEL),
+                        stale_arrival, stale_body,
                         job_incarnation=gate._job_incarnation or "",
                     )
                 self.assertEqual(gate.admitted_writes, 0)
@@ -2270,6 +2276,333 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             coord.track_slot_root(unreg_root)
             coord.remove_slot_roots(require_confirmed_leases=True)
             self.assertTrue(unreg_root.exists())
+
+    def test_reciprocal_g2_config_digest_preconfirmed_plan_and_export_strictness(self) -> None:
+        from oc_openai import session_broker
+        from oc_providers.catalog import LaunchRefusedError, ResolvedLaunchPlan
+        from oc_providers.config import load_provider_config_with_digest
+        from oc_providers.contracts import (
+            InstancePreflight,
+            ProviderInstanceSpec,
+            ReadinessState,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="oc-g2-cfg-") as td_raw:
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            cfg_dir = td / "cfg"
+            cfg_dir.mkdir(mode=0o700)
+            os.chmod(cfg_dir, 0o700)
+            toml_path = cfg_dir / FILE_PROVIDERS_TOML
+            toml_bytes = (
+                '[providers.openai.personal]\n'
+                'enabled = true\n'
+                'auth_mode = "subscription"\n'
+            ).encode("utf-8")
+            toml_path.write_bytes(toml_bytes)
+            os.chmod(toml_path, 0o600)
+            cfg, digest = load_provider_config_with_digest(config_dir=cfg_dir, sandbox_dir=td / "sb")
+            self.assertIsNotNone(cfg)
+            self.assertEqual(digest, sha256(toml_bytes).hexdigest())
+
+            exp = td / "exp"
+            exp.mkdir(mode=0o700)
+            os.chmod(exp, 0o700)
+            ev = td / "ev"
+            ev.mkdir(mode=0o700)
+            os.chmod(ev, 0o700)
+            approval = ProofApproval(
+                run_id=TEST_RUN_ID, instance_label="personal", scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL, ui_mode="mini", cwd=TEST_CWD,
+                selection_epoch="E" * 43, credential_generation=1,
+                history_digest_all_12_files=compute_exposure_history_digest(exp),
+                providers_config_digest=digest or "",
+            )
+            gate = ProofGate(approval, evidence_dir=ev, exposure_dir=exp)
+            plan = ResolvedLaunchPlan(
+                admitted=(
+                    InstancePreflight(
+                        spec=ProviderInstanceSpec(kind="openai", label="personal", enabled=True, auth_mode="subscription"),
+                        readiness=ReadinessState.READY,
+                        models=(TEST_MODEL,),
+                    ),
+                ),
+                excluded=(),
+                acknowledged_digests={},
+                initial_provider_id=TEST_SCOPED,
+                initial_model=TEST_MODEL,
+                ui_mode="mini",
+                ui_source="cli",
+            )
+            opts = session_broker.ProofSessionOptions(proof_gate=gate, preconfirmed_plan=plan)
+            # Empty/missing current config must reject preconfirmed plan.
+            with self.assertRaises(LaunchRefusedError):
+                session_broker._resolve_session_plan({}, None, {}, None, opts, live_config_digest=digest)
+            # Disabled route in current config must reject preconfirmed plan.
+            toml_path.write_text('[providers.openai.personal]\nenabled = false\nauth_mode = "subscription"\n', encoding="utf-8")
+            cfg_dis, digest_dis = load_provider_config_with_digest(config_dir=cfg_dir, sandbox_dir=td / "sb")
+            with self.assertRaises(LaunchRefusedError):
+                session_broker._resolve_session_plan({}, cfg_dis, {}, None, opts, live_config_digest=digest_dis)
+            # Digest mismatch on enabled config must reject preconfirmed plan.
+            with self.assertRaises(LaunchRefusedError):
+                session_broker._resolve_session_plan({}, cfg, {}, None, opts, live_config_digest="0" * 64)
+            # Exact matching enabled config & digest succeeds.
+            resolved = session_broker._resolve_session_plan({}, cfg, {}, None, opts, live_config_digest=digest)
+            self.assertIs(resolved, plan)
+
+        # Export corroboration strictness: reject missing user msg, padded " ok ", wrong prompt, or tool call.
+        bad_exports = [
+            {"messages": [{"info": {"role": "assistant"}, "parts": [{"type": "text", "text": " ok "}]}]},
+            {"messages": [
+                {"info": {"role": "user"}, "parts": [{"type": "text", "text": PROOF_PROMPT}]},
+                {"info": {"role": "assistant"}, "parts": [{"type": "text", "text": " ok "}]},
+            ]},
+            {"messages": [
+                {"info": {"role": "user"}, "parts": [{"type": "text", "text": "wrong prompt"}]},
+                {"info": {"role": "assistant"}, "parts": [{"type": "text", "text": EXPECTED_REPLY}]},
+            ]},
+            {"messages": [
+                {"info": {"role": "user"}, "parts": [{"type": "text", "text": PROOF_PROMPT}]},
+                {"info": {"role": "assistant"}, "parts": [{"type": "text", "text": EXPECTED_REPLY}, {"type": "tool"}]},
+            ]},
+        ]
+        for bad in bad_exports:
+            with self.assertRaises(shell_driver.ShellDriverError):
+                shell_driver._verify_export_messages(bad)
+        shell_driver._verify_export_messages({
+            "messages": [
+                {"info": {"role": "user"}, "parts": [{"type": "text", "text": PROOF_PROMPT}]},
+                {"info": {"role": "assistant"}, "parts": [{"type": "text", "text": EXPECTED_REPLY}]},
+            ]
+        })
+
+    @staticmethod
+    def _drive_pty_approval_subprocess(reply_line: str) -> tuple[int, str]:
+        import pty as pty_mod
+        import select
+
+        master_fd, slave_fd = pty_mod.openpty()
+        child_code = (
+            "import fcntl, os, sys, termios\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            f"sys.path.insert(0, {str(REPO_ROOT / 'tests/e2e/live')!r})\n"
+            "os.setsid()\n"
+            "fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
+            "import openai_shell_driver as drv\n"
+            "drv.prompt_attended_approval({\n"
+            f"    'run_id': {TEST_RUN_ID!r}, 'instance_label': 'personal',\n"
+            f"    'scoped_provider_id': {TEST_SCOPED!r}, 'approved_model': {TEST_MODEL!r},\n"
+            "    'ui_mode': 'mini', 'route_policy': 'subscription-only', 'client_id': 'c1',\n"
+            "    'selection_epoch': 'e1', 'registration_generation': 1,\n"
+            f"    'providers_config_digest': {TEST_HEX_A!r}, 'history_digest_all_12_files': {TEST_HEX_B!r},\n"
+            f"    'agent_image_id': {TEST_HEX_A!r}, 'relay_image_id': {TEST_HEX_B!r},\n"
+            f"    'source_sha256': {TEST_HEX_C!r},\n"
+            "})\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-IB", "-c", child_code],
+            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True,
+        )
+        os.close(slave_fd)
+        buf = bytearray()
+        sent = False
+        deadline = time.monotonic() + 10.0
+        try:
+            while time.monotonic() < deadline and proc.poll() is None:
+                if not select.select([master_fd], [], [], 0.1)[0]:
+                    continue
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if not sent and b"to authorize" in buf:
+                    os.write(master_fd, (reply_line + "\n").encode("utf-8"))
+                    sent = True
+            rc = proc.wait(timeout=5)
+        finally:
+            os.close(master_fd)
+        return rc, buf.decode("utf-8", errors="replace")
+
+    def test_reciprocal_g2_real_controlling_pty_approval_and_strict_route_observation(self) -> None:
+        rc_ok, out_ok = self._drive_pty_approval_subprocess(f"APPROVE {TEST_RUN_ID[:8]}")
+        self.assertEqual(rc_ok, 0, out_ok)
+        self.assertIn("Live OpenAI Interactive Shell E2E Approval", out_ok)
+        rc_no, _ = self._drive_pty_approval_subprocess("WRONG PHRASE")
+        self.assertNotEqual(rc_no, 0)
+
+        # Strict route observation: wrong instance or suffix-extended model must NOT arm.
+        appr = ProofApproval(
+            run_id=TEST_RUN_ID, instance_label="personal", scoped_provider_id=TEST_SCOPED,
+            approved_model=TEST_MODEL, ui_mode="full", cwd=TEST_CWD,
+            selection_epoch="E" * 43, credential_generation=1, history_digest_all_12_files=TEST_HEX_A,
+        )
+        for bad_screen in (
+            f"openai--work/{TEST_MODEL}-v2",
+            f"openai--work/{TEST_MODEL}",
+            f"OpenAI (work)  {TEST_MODEL}",
+            f"OpenAI (personal)  {TEST_MODEL}-v2",
+            f"{TEST_MODEL}",
+        ):
+            self.assertIsNone(shell_driver.extract_observed_route_row(bad_screen, appr), bad_screen)
+        row = shell_driver.extract_observed_route_row(f"Status: OpenAI (personal) / {TEST_MODEL}", appr)
+        self.assertEqual(row, f"Status: OpenAI (personal) / {TEST_MODEL}")
+
+    def test_reciprocal_g2_owner_partial_create_snapshot_delete_teardown_and_settlement_fsync(self) -> None:
+        from oc_openai import shell_cleanup_owner as owner_mod
+
+        with tempfile.TemporaryDirectory(prefix="oc-g2-owner-") as td_raw:
+            td = Path(td_raw)
+            os.chmod(td, 0o700)
+            # 1. Partial create in _owner_loop installs journal BEFORE create_under_lock so teardown runs!
+            teardown_called = {"n": 0}
+            s_client, s_server = socket.socketpair()
+            life_r, life_w = os.pipe()
+            orig_build = owner_mod._build_journal_from_msg
+
+            def _partial_build(msg):
+                j = orig_build(msg)
+                def _fail_create(_lh, _sd):
+                    j.pod_id = TEST_HEX_B
+                    j.ownership_uncertain = True
+                    raise CleanupOwnerError("simulated partial create failure")
+                def _track_teardown():
+                    teardown_called["n"] += 1
+                    return {"cleanup_verified": False, "ownership_uncertain": True, "errors": ["partial_create"]}
+                j.create_under_lock = _fail_create
+                j.teardown = _track_teardown
+                return j
+
+            with (
+                patch.object(owner_mod, "_build_journal_from_msg", side_effect=_partial_build),
+                patch.object(owner_mod.signal, "signal"),
+            ):
+                t_loop = threading.Thread(target=owner_mod._owner_loop, args=(s_server.fileno(), life_r), daemon=True)
+                t_loop.start()
+                try:
+                    s_client.settimeout(5.0)
+                    owner_mod._send_line(s_client, {
+                        "op": "create", "run_id": TEST_RUN_ID, "instance": TEST_INSTANCE,
+                        "level": TEST_LEVEL, "agent_image_id": TEST_HEX_A, "sandbox_dir": str(td),
+                        "lock_helper": str(REPO_ROOT / FILE_SETUP_LOCK), "state_dir": str(td / "st"),
+                    })
+                    resp_create = json.loads(s_client.makefile("rb").readline().decode("ascii"))
+                    self.assertFalse(resp_create["ok"])
+                    owner_mod._send_line(s_client, {"op": "teardown"})
+                    resp_td = json.loads(s_client.makefile("rb").readline().decode("ascii"))
+                    self.assertTrue(resp_td["ok"])
+                    self.assertFalse(resp_td["result"][KEY_CLEANUP_VERIFIED])
+                    self.assertEqual(teardown_called["n"], 1)
+                finally:
+                    s_client.close()
+                    os.close(life_w)
+                    t_loop.join(timeout=5.0)
+                    with suppress(OSError):
+                        s_server.close()
+
+            # 2. In-memory verified lock helper survives snapshot deletion during teardown!
+            lock_copy = td / FILE_SETUP_LOCK
+            lock_copy.write_bytes((REPO_ROOT / FILE_SETUP_LOCK).read_bytes())
+            os.chmod(lock_copy, 0o500)
+
+            def _clean_pm(args, timeout=20.0):
+                del timeout
+                if args[:2] in (["pod", "exists"], ["volume", "exists"], ["container", "exists"]):
+                    return subprocess.CompletedProcess(args, 1, b"", b"")
+                if args[:2] == ["pod", "create"]:
+                    return subprocess.CompletedProcess(args, 0, (TEST_HEX_B + "\n").encode(), b"")
+                if args[:2] == ["pod", "inspect"]:
+                    data = [{"Id": TEST_HEX_B, "InfraContainerID": "9" * 64,
+                             "Labels": {PROOF_OWNER_LABEL: TEST_RUN_ID}, "Containers": [{"Id": "9" * 64}]}]
+                    return subprocess.CompletedProcess(args, 0, json.dumps(data).encode(), b"")
+                if args[:2] == ["volume", "inspect"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, json.dumps([{"Labels": {PROOF_OWNER_LABEL: TEST_RUN_ID}}]).encode(), b"",
+                    )
+                if args[0] == "run":
+                    return subprocess.CompletedProcess(args, 0, b"12:34\n", b"")
+                return subprocess.CompletedProcess(args, 0, b"", b"")
+
+            jspec = JournalSpec(
+                run_id=TEST_RUN_ID, instance=TEST_INSTANCE, pod_name=TEST_POD,
+                volume_name=TEST_VOLUME, sandbox_dir=td, cwd=TEST_CWD,
+                level=TEST_LEVEL, agent_image_id=TEST_HEX_A, journal_path=td / "j_mem.json",
+            )
+            j_mem = _OwnershipJournal(jspec, podman_runner=_clean_pm)
+            j_mem.create_under_lock(lock_copy, td / "state_mem")
+            lock_copy.unlink()
+            res_mem = j_mem.teardown()
+            self.assertTrue(res_mem[KEY_CLEANUP_VERIFIED], res_mem)
+
+            # 3. Incomplete pod membership & pod/volume exists rc=125 fail closed!
+            self.assertTrue(j_mem._pod_has_untracked_members({"InfraContainerID": "9" * 64}))
+            self.assertTrue(j_mem._pod_has_untracked_members({"InfraContainerID": "9" * 64, "Containers": [{}]}))
+            def _rc125_pm(args, timeout=20.0):
+                del timeout
+                if args[:2] in (["pod", "exists"], ["volume", "exists"]):
+                    return subprocess.CompletedProcess(args, 125, b"", b"podman error")
+                return subprocess.CompletedProcess(args, 1, b"", b"inspect failed")
+            j_125 = _OwnershipJournal(jspec, podman_runner=_rc125_pm)
+            j_125.pod_id = TEST_HEX_B
+            j_125.volume_owned = True
+            res_125 = j_125.teardown()
+            self.assertFalse(res_125[KEY_CLEANUP_VERIFIED])
+            self.assertTrue(res_125["ownership_uncertain"])
+
+            # 4. Failed settlement fsync must keep exact_ok_delivered=False and verify_settled_evidence()=False!
+            exp = td / "exp_s"
+            exp.mkdir(mode=0o700)
+            os.chmod(exp, 0o700)
+            ev = td / "ev_s"
+            ev.mkdir(mode=0o700)
+            os.chmod(ev, 0o700)
+            appr_s = ProofApproval(
+                run_id=TEST_RUN_ID, instance_label="personal", scoped_provider_id=TEST_SCOPED,
+                approved_model=TEST_MODEL, ui_mode="mini", cwd=TEST_CWD,
+                selection_epoch="E" * 43, credential_generation=1,
+                history_digest_all_12_files=compute_exposure_history_digest(exp),
+            )
+            gate_s = ProofGate(appr_s, evidence_dir=ev, exposure_dir=exp, expected_instructions_sha256=FAKE_INSTRUCTIONS_DIGEST)
+            gate_s.bind_incarnation("inc_" + "1" * 32, 1)
+            gate_s.arm(observed_row=f"{TEST_SCOPED}/{TEST_MODEL}", observed_screen_digest=TEST_HEX_C)
+            gate_s.mark_relay_verified(TEST_HEX_A)
+            arr_s = gate_s.snapshot_arrival()
+            gate_s.claim_for_write(arr_s, canonical_proof_body(TEST_MODEL), job_incarnation="inc_" + "1" * 32)
+            with patch("os.fsync", side_effect=OSError("disk full")):
+                with self.assertRaises(ProofGateError):
+                    gate_s.record_delivery_complete(
+                        usage=(1, 1, 2), completed_text=EXPECTED_REPLY, streamed_text=EXPECTED_REPLY, tool_calls=0,
+                    )
+            self.assertFalse(gate_s.exact_ok_delivered)
+            self.assertFalse(gate_s.verify_settled_evidence())
+            gate_s.record_delivery_complete(
+                usage=(1, 1, 2), completed_text=EXPECTED_REPLY, streamed_text=EXPECTED_REPLY, tool_calls=0,
+            )
+            self.assertTrue(gate_s.exact_ok_delivered)
+            self.assertTrue(gate_s.verify_settled_evidence())
+
+            # 5. Snapshot verifier rejects unmeasured extra .py file & build rejects world-writable parent!
+            digest, _ = snap_runner.capture_manifest(REPO_ROOT)
+            snap = snap_runner.build_read_only_snapshot(REPO_ROOT, digest, base_dir=td)
+            try:
+                live_dir = snap / "tests/e2e/live"
+                os.chmod(live_dir, 0o700)
+                extra = live_dir / "unmeasured_extra.py"
+                extra.write_text("X = 1\n", encoding="utf-8")
+                os.chmod(extra, 0o400)
+                os.chmod(live_dir, 0o500)
+                with self.assertRaises(snap_runner.SnapshotError):
+                    snap_runner.verify_read_only_snapshot(snap, digest)
+            finally:
+                snap_runner.cleanup_snapshot(snap)
+
+            bad_parent = td / "world_writable"
+            bad_parent.mkdir()
+            os.chmod(bad_parent, 0o777)
+            with self.assertRaises(snap_runner.SnapshotError):
+                snap_runner.build_read_only_snapshot(REPO_ROOT, digest, base_dir=bad_parent)
 
     def test_same_name_racing_resource_survives_and_uncertain_create_does_not_delete(self) -> None:
         with tempfile.TemporaryDirectory(prefix="oc-race-") as td_raw:

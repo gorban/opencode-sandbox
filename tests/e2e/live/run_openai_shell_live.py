@@ -110,6 +110,34 @@ def capture_manifest(root: Path) -> tuple[str, dict[Path, bytes]]:
     return hasher.hexdigest(), captured
 
 
+def _validate_staging_parent(parent: Path) -> Path:
+    """Validate snapshot staging parent ancestry is outside sandbox and protected from non-owners."""
+    try:
+        resolved = parent.resolve(strict=True)
+    except OSError:
+        raise SnapshotError(f"snapshot staging parent unavailable: {parent}") from None
+    import pwd
+    sandbox = (Path(pwd.getpwuid(os.getuid()).pw_dir) / "opencode-sandbox").resolve()
+    if resolved.is_relative_to(sandbox):
+        raise SnapshotError("snapshot staging parent must not be inside agent-writable sandbox")
+    uid = os.geteuid()
+    cur = parent
+    while True:
+        try:
+            info = cur.lstat()
+        except OSError:
+            raise SnapshotError(f"snapshot staging ancestor unavailable: {cur}") from None
+        sticky_tmp = cur == Path("/tmp") and info.st_uid in (0, 65534) and bool(info.st_mode & stat.S_ISVTX)
+        if not stat.S_ISDIR(info.st_mode) or (
+            not sticky_tmp and (info.st_uid not in (0, uid) or bool(info.st_mode & 0o022))
+        ):
+            raise SnapshotError(f"unsafe snapshot staging directory ancestor: {cur}")
+        if cur == cur.parent:
+            break
+        cur = cur.parent
+    return resolved
+
+
 def _verify_snapshot_dir(directory: Path, label: str) -> None:
     try:
         info = directory.lstat()
@@ -122,24 +150,41 @@ def _verify_snapshot_dir(directory: Path, label: str) -> None:
         )
 
 
+def _verify_snapshot_file_meta(fpath: Path, rel_file: Path) -> None:
+    info = fpath.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o277:
+        raise SnapshotError(f"snapshot file is not owner-only read-only: {rel_file}")
+
+
+def _scan_snapshot_tree(snapshot_root: Path) -> set[Path]:
+    observed: set[Path] = set()
+    for root, dirs, files in os.walk(snapshot_root, topdown=True, followlinks=False):
+        root_path = Path(root)
+        rel_dir = root_path.relative_to(snapshot_root)
+        _verify_snapshot_dir(root_path, "." if rel_dir == Path(".") else rel_dir.as_posix())
+        for dname in dirs:
+            _verify_snapshot_dir(root_path / dname, (rel_dir / dname).as_posix())
+        for fname in files:
+            fpath = root_path / fname
+            rel_file = fpath.relative_to(snapshot_root)
+            _verify_snapshot_file_meta(fpath, rel_file)
+            observed.add(rel_file)
+    return observed
+
+
 def verify_read_only_snapshot(snapshot_root: Path, expected_sha256: str) -> str:
-    """Verify snapshot_root, all intermediate directories, and manifest files are 0o400/0o500 and match expected_sha256."""
+    """Verify complete snapshot tree is owner-only read-only with zero unmeasured files and matches expected_sha256."""
     if not _SHA256_RE.fullmatch(expected_sha256):
         raise SnapshotError("invalid expected source SHA-256 pin")
     _verify_snapshot_dir(snapshot_root, ".")
-    checked_dirs: set[Path] = {Path(".")}
+    expected_files = collect_manifest_relpaths(snapshot_root)
+    observed_files = _scan_snapshot_tree(snapshot_root)
+    extra = sorted(p.as_posix() for p in (observed_files - set(expected_files)))
+    if extra:
+        raise SnapshotError(f"unexpected unmeasured file in snapshot: {extra[0]}")
     hasher = sha256()
-    for rel in collect_manifest_relpaths(snapshot_root):
-        for parent in rel.parents:
-            if parent in checked_dirs:
-                continue
-            _verify_snapshot_dir(snapshot_root / parent, parent.as_posix())
-            checked_dirs.add(parent)
-        target = snapshot_root / rel
-        info = target.lstat()
-        if info.st_uid != os.geteuid() or info.st_mode & 0o277:
-            raise SnapshotError(f"snapshot file is not owner-only read-only: {rel}")
-        data = _read_trusted_file(target)
+    for rel in expected_files:
+        data = _read_trusted_file(snapshot_root / rel)
         hasher.update(rel.as_posix().encode("ascii") + b"\0" + sha256(data).digest())
     actual = hasher.hexdigest()
     if not hmac.compare_digest(actual, expected_sha256):
@@ -159,8 +204,8 @@ def build_read_only_snapshot(source_root: Path, expected_sha256: str, *, base_di
     if not hmac.compare_digest(sha256(self_bytes).digest(), sha256(captured[self_rel]).digest()):
         raise SnapshotError("running bootstrap bytes differ from verified snapshot copy")
 
-    parent = str(base_dir) if base_dir is not None else tempfile.gettempdir()
-    stage = Path(tempfile.mkdtemp(prefix="oc-shell-snap-", dir=parent))
+    parent_path = _validate_staging_parent(Path("/tmp") if base_dir is None else Path(base_dir))
+    stage = Path(tempfile.mkdtemp(prefix="oc-shell-snap-", dir=str(parent_path)))
     try:
         os.chmod(stage, 0o700)
         created_dirs: set[Path] = {stage}

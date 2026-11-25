@@ -29,6 +29,7 @@ import select
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 
@@ -170,11 +171,32 @@ def _revoke_grant_dir(grant_dir: str, *, slot_root: str = "") -> None:
             _atomic_fsync_write(state_path, b"revoked\n")
 
 
-class _LifecycleLock:
-    """Acquire `oc-sandbox`'s real exclusive lifecycle lock via `oc-setup-lock.py`."""
+def _read_lock_helper_source(lock_helper: Path) -> str:
+    """Capture verified oc-setup-lock.py source into RAM so cleanup survives snapshot deletion."""
+    try:
+        fd = os.open(lock_helper, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        raise CleanupOwnerError("lock helper unavailable") from None
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+            raise CleanupOwnerError("untrusted lock helper file")
+        raw = stream.read(65_537)
+    if len(raw) > 65_536:
+        raise CleanupOwnerError("lock helper exceeds size cap")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise CleanupOwnerError("lock helper is not valid UTF-8") from None
 
-    def __init__(self, lock_helper: Path, state_dir: Path, instance: str):
-        self._helper = lock_helper
+
+class _LifecycleLock:
+    """Acquire `oc-sandbox`'s real exclusive lifecycle lock via verified `oc-setup-lock.py` source."""
+
+    def __init__(self, lock_helper: Path | str, state_dir: Path, instance: str):
+        self._helper_source = (
+            lock_helper if isinstance(lock_helper, str) else _read_lock_helper_source(lock_helper)
+        )
         self._state_dir = state_dir
         self._instance = instance
         self._proc: subprocess.Popen[bytes] | None = None
@@ -185,7 +207,8 @@ class _LifecycleLock:
             [
                 sys.executable,
                 "-IB",
-                str(self._helper),
+                "-c",
+                self._helper_source,
                 str(self._state_dir),
                 "lifecycle",
                 "exclusive",
@@ -261,6 +284,7 @@ class _OwnershipJournal:
         self.journal_path = spec.journal_path
         self._pm = podman_runner
         self._lock_helper: Path | None = None
+        self._lock_helper_source: str | None = None
         self._state_dir: Path | None = None
         self.pod_id: str | None = None
         self.volume_owned = False
@@ -309,9 +333,10 @@ class _OwnershipJournal:
 
     def create_under_lock(self, lock_helper: Path, state_dir: Path) -> dict[str, object]:
         self._lock_helper = lock_helper
+        self._lock_helper_source = _read_lock_helper_source(lock_helper)
         self._state_dir = state_dir
         self._persist()
-        with _LifecycleLock(lock_helper, state_dir, self.instance):
+        with _LifecycleLock(self._lock_helper_source, state_dir, self.instance):
             if self._pod_exists(self.pod_name):
                 raise CleanupOwnerError(f"refusing reuse of pre-existing pod {self.pod_name}")
             if self._volume_exists(self.volume_name):
@@ -494,9 +519,10 @@ class _OwnershipJournal:
 
     def teardown(self) -> dict[str, object]:
         self._reconcile_slots()
-        if self._lock_helper is not None and self._state_dir is not None:
+        lock_target: Path | str | None = self._lock_helper_source or self._lock_helper
+        if lock_target is not None and self._state_dir is not None:
             try:
-                with _LifecycleLock(self._lock_helper, self._state_dir, self.instance):
+                with _LifecycleLock(lock_target, self._state_dir, self.instance):
                     self._teardown_pod_volume_worktree()
             except CleanupOwnerError:
                 self.ownership_uncertain = True
@@ -509,6 +535,15 @@ class _OwnershipJournal:
             _KEY_UNCERTAIN: self.ownership_uncertain,
             "errors": list(self.cleanup_errors),
         }
+
+    def _confirm_absent(self, kind: str, target: str, error_code: str) -> bool:
+        """Return True ONLY when podman `<kind> exists <target>` exits with explicit absence code 1."""
+        res = self._pm([kind, "exists", target], timeout=10.0)
+        if res.returncode == 1:
+            return True
+        self.ownership_uncertain = True
+        self.cleanup_errors.append(error_code)
+        return False
 
     def _teardown_pod_volume_worktree(self) -> None:
         if not self._teardown_pod():
@@ -524,9 +559,10 @@ class _OwnershipJournal:
         if status == _STATUS_CREATED:
             cid = str(entry.get("cid") or "")
             res = self._pm(["rm", "-f", cid], timeout=15.0)
-            still_exists = self._pm(["container", "exists", cid], timeout=10.0).returncode == 0
-            if res.returncode != 0 and still_exists:
-                self.cleanup_errors.append(f"container_remove_failed:{cid[:12]}")
+            absent = self._confirm_absent("container", cid, f"container_remove_failed:{cid[:12]}")
+            if res.returncode != 0 and absent:
+                # Container is confirmed absent (rc == 1); no extra remove error needed.
+                pass
         elif status == _STATUS_CREATING:
             self.cleanup_errors.append(f"slot_create_uncertain:{slot_key}")
         # Never delete slot_root or grant_dir while the profile lease in worker_leases is unreleased:
@@ -548,13 +584,15 @@ class _OwnershipJournal:
     def _pod_has_untracked_members(self, details: dict[str, object]) -> bool:
         infra_id = str(details.get("InfraContainerID") or "")
         containers = details.get("Containers")
-        if not isinstance(containers, list):
-            return False
+        if not infra_id or not isinstance(containers, list):
+            return True
         for member in containers:
             if not isinstance(member, dict):
                 return True
             mid = str(member.get("Id") or "")
-            if not mid or mid == infra_id:
+            if not mid:
+                return True
+            if mid == infra_id:
                 continue
             if mid not in self.owned_cids:
                 return True
@@ -565,10 +603,7 @@ class _OwnershipJournal:
             return True
         details = self._inspect_pod_details(self.pod_id)
         if details is None:
-            if self._pm(["pod", "exists", self.pod_id], timeout=10.0).returncode == 0:
-                self.cleanup_errors.append("pod_inspect_failed")
-                return False
-            return True
+            return self._confirm_absent("pod", self.pod_id, "pod_inspect_failed")
         labels = details.get("Labels") if isinstance(details.get("Labels"), dict) else {}
         if labels.get(PROOF_OWNER_LABEL) != self.run_id:
             self.ownership_uncertain = True
@@ -579,8 +614,9 @@ class _OwnershipJournal:
             self.cleanup_errors.append("pod_has_untracked_members")
             return False
         res = self._pm(["pod", "rm", "-f", self.pod_id], timeout=20.0)
-        if res.returncode != 0 or self._pm(["pod", "exists", self.pod_id], timeout=10.0).returncode == 0:
-            self.cleanup_errors.append("pod_remove_failed")
+        if res.returncode != 0 or not self._confirm_absent("pod", self.pod_id, "pod_remove_failed"):
+            if "pod_remove_failed" not in self.cleanup_errors:
+                self.cleanup_errors.append("pod_remove_failed")
             return False
         return True
 
@@ -589,32 +625,53 @@ class _OwnershipJournal:
             return
         labels = self._inspect_volume_labels(self.volume_name)
         if labels is None:
-            if self._pm(["volume", "exists", self.volume_name], timeout=10.0).returncode == 0:
-                self.cleanup_errors.append("volume_inspect_failed")
+            self._confirm_absent("volume", self.volume_name, "volume_inspect_failed")
             return
         if labels.get(PROOF_OWNER_LABEL) != self.run_id:
             self.ownership_uncertain = True
             self.cleanup_errors.append("volume_owner_label_mismatch")
             return
         res = self._pm(["volume", "rm", self.volume_name], timeout=15.0)
-        if res.returncode != 0 or self._pm(["volume", "exists", self.volume_name], timeout=10.0).returncode == 0:
-            self.cleanup_errors.append("volume_remove_failed")
+        if res.returncode != 0 or not self._confirm_absent("volume", self.volume_name, "volume_remove_failed"):
+            if "volume_remove_failed" not in self.cleanup_errors:
+                self.cleanup_errors.append("volume_remove_failed")
 
     def _teardown_worktree(self) -> None:
         if not self.worktree_owned or self.worktree_dev_ino is None:
             return
         want_dev, want_ino = self.worktree_dev_ino
         script = (
-            "import os, shutil, stat, sys\n"
+            "import os, stat, sys\n"
             "leaf, dev_s, ino_s = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+            "want = (int(dev_s), int(ino_s))\n"
+            "def _clear_dir_fd(dir_fd):\n"
+            "    for entry in os.listdir(dir_fd):\n"
+            "        st = os.stat(entry, dir_fd=dir_fd, follow_symlinks=False)\n"
+            "        if stat.S_ISDIR(st.st_mode):\n"
+            "            child_fd = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)\n"
+            "            try:\n"
+            "                _clear_dir_fd(child_fd)\n"
+            "            finally:\n"
+            "                os.close(child_fd)\n"
+            "            os.rmdir(entry, dir_fd=dir_fd)\n"
+            "        else:\n"
+            "            os.unlink(entry, dir_fd=dir_fd)\n"
             "wt_fd = os.open('/sandbox/wt', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n"
             "try:\n"
-            "    st = os.stat(leaf, dir_fd=wt_fd, follow_symlinks=False)\n"
-            "    if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != (int(dev_s), int(ino_s)):\n"
+            "    leaf_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=wt_fd)\n"
+            "    try:\n"
+            "        fst = os.fstat(leaf_fd)\n"
+            "        if not stat.S_ISDIR(fst.st_mode) or (fst.st_dev, fst.st_ino) != want:\n"
+            "            raise SystemExit(2)\n"
+            "        _clear_dir_fd(leaf_fd)\n"
+            "    finally:\n"
+            "        os.close(leaf_fd)\n"
+            "    st2 = os.stat(leaf, dir_fd=wt_fd, follow_symlinks=False)\n"
+            "    if not stat.S_ISDIR(st2.st_mode) or (st2.st_dev, st2.st_ino) != want:\n"
             "        raise SystemExit(2)\n"
+            "    os.rmdir(leaf, dir_fd=wt_fd)\n"
             "finally:\n"
             "    os.close(wt_fd)\n"
-            "shutil.rmtree(os.path.join('/sandbox/wt', leaf))\n"
         )
         leaf = self.cwd.split("/", 1)[1]
         res = self._pm(
@@ -690,20 +747,23 @@ def _handle_slot_op(op: str, msg: dict[str, object], journal: _OwnershipJournal 
 def _dispatch_owner_op(
     sock: socket.socket,
     msg: dict[str, object],
-    journal: _OwnershipJournal | None,
-) -> tuple[_OwnershipJournal | None, bool]:
+    state: dict[str, _OwnershipJournal | None],
+) -> bool:
     op = str(msg.get("op") or "")
+    journal = state["journal"]
     if op == "create":
         if journal is not None:
             raise CleanupOwnerError("already created")
         new_journal = _build_journal_from_msg(msg)
+        # Install BEFORE first side effect so partial create or lost reply still tears down!
+        state["journal"] = new_journal
         info = new_journal.create_under_lock(Path(str(msg["lock_helper"])), Path(str(msg["state_dir"])))
         _send_line(sock, {"ok": True, "result": info})
-        return new_journal, False
+        return False
     if op in (_OP_PREPARE_SLOT, _OP_BEGIN_SLOT, _OP_FINISH_SLOT, _OP_LEASE_RELEASED):
         _handle_slot_op(op, msg, journal)
         _send_line(sock, {"ok": True})
-        return journal, False
+        return False
     if op == "teardown":
         result = (
             journal.teardown()
@@ -711,15 +771,15 @@ def _dispatch_owner_op(
             else {"cleanup_verified": True, _KEY_UNCERTAIN: False, "errors": []}
         )
         _send_line(sock, {"ok": True, "result": result})
-        return journal, True
+        return True
     _send_line(sock, {"ok": False, "error": "unknown_op"})
-    return journal, False
+    return False
 
 
 def _owner_loop(control_fd: int, lifeline_fd: int) -> int:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     sock = socket.socket(fileno=control_fd)
-    journal: _OwnershipJournal | None = None
+    state: dict[str, _OwnershipJournal | None] = {"journal": None}
     torn_down = False
     try:
         while True:
@@ -727,14 +787,16 @@ def _owner_loop(control_fd: int, lifeline_fd: int) -> int:
             if msg is None:
                 break
             try:
-                journal, done = _dispatch_owner_op(sock, msg, journal)
+                done = _dispatch_owner_op(sock, msg, state)
             except Exception as exc:
-                _send_line(sock, {"ok": False, "error": str(exc)})
+                with suppress(OSError):
+                    _send_line(sock, {"ok": False, "error": str(exc)})
                 continue
             if done:
                 torn_down = True
                 break
     finally:
+        journal = state["journal"]
         if journal is not None and not torn_down:
             with suppress(Exception):
                 journal.teardown()

@@ -48,7 +48,7 @@ from oc_openai.shell_cleanup_owner import (
     _run_podman,
 )
 from oc_providers.catalog import ResolvedLaunchPlan, _preflight_default_catalog
-from oc_providers.config import load_provider_config
+from oc_providers.config import load_provider_config_with_digest
 
 
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
@@ -212,15 +212,33 @@ def prompt_attended_approval(summary: dict[str, object]) -> None:
         f"Type exact confirmation phrase '{expected_phrase}' to authorize (anything else aborts):",
         "> ",
     ]
-    with open("/dev/tty", "r+", encoding="utf-8", buffering=1) as tty:
-        tty.write("\n".join(lines))
-        tty.flush()
-        response = tty.readline()
+    rfd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC)
+    rfd_owned = True
+    wfd = -1
+    wfd_owned = False
+    try:
+        wfd = os.dup(rfd)
+        wfd_owned = True
+        tty_in = os.fdopen(rfd, "r", encoding="utf-8", buffering=1)
+        rfd_owned = False
+        tty_out = os.fdopen(wfd, "w", encoding="utf-8", buffering=1)
+        wfd_owned = False
+        with tty_in, tty_out:
+            tty_out.write("\n".join(lines))
+            tty_out.flush()
+            response = tty_in.readline()
+    finally:
+        if wfd_owned:
+            with suppress(OSError):
+                os.close(wfd)
+        if rfd_owned:
+            with suppress(OSError):
+                os.close(rfd)
     if not response or response.strip() != expected_phrase:
         raise ShellDriverError("operator declined live OpenAI shell approval")
 
 
-def _collect_parts(parts: object, assistant_texts: list[str]) -> int:
+def _collect_parts(parts: object, texts: list[str]) -> int:
     if not isinstance(parts, list):
         return 0
     tool_parts = 0
@@ -229,25 +247,33 @@ def _collect_parts(parts: object, assistant_texts: list[str]) -> int:
             continue
         ptype = part.get("type")
         if ptype == "text" and isinstance(part.get("text"), str):
-            assistant_texts.append(part["text"])
+            texts.append(part["text"])
         elif ptype in ("tool", "tool-invocation", "tool_call", "function_call"):
             tool_parts += 1
     return tool_parts
 
 
-def _extract_export_assistant_parts(export_data: dict[str, object]) -> tuple[list[str], int]:
+def _verify_export_messages(export_data: dict[str, object]) -> None:
     messages = export_data.get("messages")
-    if not isinstance(messages, list):
-        raise ShellDriverError("session export missing messages list")
-    assistant_texts: list[str] = []
-    tool_parts = 0
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        info = msg.get("info") if isinstance(msg.get("info"), dict) else msg
-        if info.get("role") == "assistant":
-            tool_parts += _collect_parts(msg.get("parts"), assistant_texts)
-    return assistant_texts, tool_parts
+    if not isinstance(messages, list) or len(messages) != 2:
+        raise ShellDriverError("session export must contain exactly one user message and one assistant message")
+    user_msg, asst_msg = messages
+    if not isinstance(user_msg, dict) or not isinstance(asst_msg, dict):
+        raise ShellDriverError("session export message entries must be JSON objects")
+    user_info = user_msg.get("info") if isinstance(user_msg.get("info"), dict) else user_msg
+    asst_info = asst_msg.get("info") if isinstance(asst_msg.get("info"), dict) else asst_msg
+    if user_info.get("role") != "user" or asst_info.get("role") != "assistant":
+        raise ShellDriverError("session export roles must be exact [user, assistant]")
+    user_texts: list[str] = []
+    asst_texts: list[str] = []
+    tool_parts = _collect_parts(user_msg.get("parts"), user_texts)
+    tool_parts += _collect_parts(asst_msg.get("parts"), asst_texts)
+    if tool_parts != 0:
+        raise ShellDriverError("session export recorded unexpected tool calls")
+    if "".join(user_texts) != PROOF_PROMPT:
+        raise ShellDriverError("session export user prompt did not match exact proof prompt")
+    if "".join(asst_texts) != EXPECTED_REPLY:
+        raise ShellDriverError("session export assistant reply did not match exact untrimmed 'ok'")
 
 
 def inspect_session_export(
@@ -302,9 +328,7 @@ def inspect_session_export(
         export_data = json.loads(res.stdout.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise ShellDriverError("session export returned invalid JSON") from None
-    texts, tool_parts = _extract_export_assistant_parts(export_data)
-    if tool_parts != 0 or "".join(texts).strip() != EXPECTED_REPLY:
-        raise ShellDriverError("session export did not match exact 'ok' with zero tools")
+    _verify_export_messages(export_data)
     return True
 
 
@@ -363,6 +387,46 @@ def _drain_pty_chunk(master_fd: int, screen_buf: bytearray) -> bool:
     return True
 
 
+_ANY_SCOPED_RE = re.compile(r"(?<![A-Za-z0-9_-])openai--[a-z0-9][a-z0-9-]*(?![A-Za-z0-9_-])")
+_ANY_OPENAI_LABEL_RE = re.compile(r"(?<![A-Za-z0-9_-])OpenAI\s*\(([a-z0-9][a-z0-9-]*)\)(?![A-Za-z0-9_-])")
+
+
+def _line_has_conflicting_provider(line: str, approval: ProofApproval) -> bool:
+    for found in _ANY_SCOPED_RE.findall(line):
+        if found != approval.scoped_provider_id:
+            return True
+    for found_label in _ANY_OPENAI_LABEL_RE.findall(line):
+        if found_label != approval.instance_label:
+            return True
+    return False
+
+
+def _provider_matches_line(text: str, approval: ProofApproval, scoped_re: re.Pattern[str], label_re: re.Pattern[str]) -> bool:
+    if _line_has_conflicting_provider(text, approval):
+        return False
+    return scoped_re.search(text) is not None or label_re.search(text) is not None
+
+
+def extract_observed_route_row(clean: str, approval: ProofApproval) -> str | None:
+    """Return an unambiguous observed route row matching exact approved provider and model, or None."""
+    model_re = re.compile(rf"(?<![A-Za-z0-9._/-]){re.escape(approval.approved_model)}(?![A-Za-z0-9._/-])")
+    scoped_re = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(approval.scoped_provider_id)}(?![A-Za-z0-9_-])")
+    label_re = re.compile(rf"(?<![A-Za-z0-9_-])OpenAI\s*\({re.escape(approval.instance_label)}\)(?![A-Za-z0-9_-])")
+
+    lines = [ln for ln in (" ".join(raw.split()) for raw in clean.splitlines()) if ln]
+    for line in lines:
+        if _provider_matches_line(line, approval, scoped_re, label_re) and model_re.search(line) is not None:
+            return line[:200]
+    for a, b in zip(lines, lines[1:]):
+        if _line_has_conflicting_provider(a, approval) or _line_has_conflicting_provider(b, approval):
+            continue
+        pair_a = _provider_matches_line(a, approval, scoped_re, label_re) and model_re.search(b) is not None
+        pair_b = model_re.search(a) is not None and _provider_matches_line(b, approval, scoped_re, label_re)
+        if pair_a or pair_b:
+            return f"{a} | {b}"[:200]
+    return None
+
+
 def _step_pty_driver(
     master_fd: int,
     clean: str,
@@ -374,12 +438,10 @@ def _step_pty_driver(
     if not state.armed:
         if proof_gate.admitted_writes != 0:
             raise ShellDriverError("unexpected upstream write during CLOSED_DISCOVERY")
-        if proof_gate.approval.approved_model in clean and elapsed >= 1.5:
+        observed_row = extract_observed_route_row(clean, proof_gate.approval)
+        if observed_row is not None and elapsed >= 1.5:
             screen_digest = sha256(clean.encode("utf-8")).hexdigest()
-            arm_turn_route(
-                f"{proof_gate.approval.scoped_provider_id}/{proof_gate.approval.approved_model}",
-                screen_digest,
-            )
+            arm_turn_route(observed_row, screen_digest)
             state.armed = True
         elif elapsed > 25.0:
             raise ShellDriverError("timed out waiting for OpenCode TUI readiness row")
@@ -514,6 +576,36 @@ def _verify_live_binding_intact(
         raise ProofGateError(_ERR_APPROVAL_DRIFT)
 
 
+def build_driver_session_spec(
+    jspec: JournalSpec,
+    *,
+    relay_image_id: str,
+    ui_mode: str,
+    agent_mem: str = "4g",
+) -> dict[str, str]:
+    """Build the session spec matching `oc-sandbox` / `oc-sandbox --mini` fd-3 JSON schema."""
+    return {
+        "instance": jspec.instance,
+        "pod": jspec.pod_name,
+        "agent": f"oc-{jspec.instance}-agent",
+        "relay": f"oc-{jspec.instance}-openai-relay",
+        "relay_image": relay_image_id,
+        "agent_image": jspec.agent_image_id,
+        "agent_mem": agent_mem,
+        "level": jspec.level,
+        "sandbox": str(jspec.sandbox_dir),
+        "cwd": jspec.cwd,
+        "home_vol": jspec.volume_name,
+        "chromium": f"oc-{jspec.instance}-chromium",
+        "postgres": "",
+        "pg_secret": "",
+        "dind": "",
+        "dind_run": "",
+        "provider_filter": "",
+        "cli_ui_mode": "mini" if ui_mode == "mini" else "default",
+    }
+
+
 def _build_preflight_plan(provider_config, preflight_adapter, scoped_id: str, config: ShellLiveConfig):
     plan_candidates, excluded = _preflight_default_catalog(provider_config, {"openai": preflight_adapter})
     acknowledged_digests: dict[str, str] = {}
@@ -558,8 +650,9 @@ def run_openai_shell_live(config: ShellLiveConfig) -> ShellLiveResult:
         role="relay", image_id=config.relay_image_id, built_images_path=built_images_path,
     )
 
-    provider_config = load_provider_config(config_dir=config_dir)
-    providers_cfg_digest = compute_providers_config_digest(config_dir)
+    provider_config, providers_cfg_digest = load_provider_config_with_digest(config_dir=config_dir)
+    if provider_config is None or providers_cfg_digest is None:
+        raise ShellDriverError("providers.toml is required for configuration-first live OpenAI shell e2e")
     backend = make_backend()
     exposure_dir = backend._state
     history_digest_before = compute_locked_exposure_digest(exposure_dir)
@@ -647,26 +740,7 @@ def run_openai_shell_live(config: ShellLiveConfig) -> ShellLiveResult:
             lock_helper=config.snapshot_root / "oc-setup-lock.py",
             state_dir=state_dir,
         )
-        spec = {
-            "instance": instance_name,
-            "pod": str(created["pod_name"]),
-            "agent": f"oc-{instance_name}-agent",
-            "relay": f"oc-{instance_name}-openai-relay",
-            "relay_image": relay_image_id,
-            "agent_image": agent_image_id,
-            "agent_mem": "4g",
-            "level": level,
-            "sandbox": str(sandbox_dir),
-            "cwd": cwd,
-            "home_vol": str(created["volume_name"]),
-            "chromium": f"oc-{instance_name}-chromium",
-            "postgres": "",
-            "pg_secret": "",
-            "dind": "",
-            "dind_run": "",
-            "provider_filter": "",
-            "cli_ui_mode": config.ui_mode,
-        }
+        spec = build_driver_session_spec(jspec, relay_image_id=relay_image_id, ui_mode=config.ui_mode)
         proof_adapter = OpenAISessionAdapter(backend, proof_gate=proof_gate)
         def _run_agent(aid, ev, arm_fn):
             session_stop["event"] = ev
@@ -688,7 +762,8 @@ def run_openai_shell_live(config: ShellLiveConfig) -> ShellLiveResult:
             lock_dir=exposure_dir,
             proof_options=proof_options,
         )
-        if proof_gate.exact_ok_delivered:
+        settled_verified = proof_gate.exact_ok_delivered and proof_gate.verify_settled_evidence()
+        if settled_verified:
             export_verified = inspect_session_export(
                 volume_name=str(created["volume_name"]),
                 level=level,
@@ -701,10 +776,11 @@ def run_openai_shell_live(config: ShellLiveConfig) -> ShellLiveResult:
     history_digest_after = compute_locked_exposure_digest(exposure_dir)
     receipts_unchanged = hmac.compare_digest(history_digest_before, history_digest_after)
     cleanup_verified = bool(cleanup_result.get("cleanup_verified"))
+    settled_on_disk = proof_gate.exact_ok_delivered and proof_gate.verify_settled_evidence()
     overall_ok = (
         agent_rc == 0
         and proof_gate.admitted_writes == 1
-        and proof_gate.exact_ok_delivered
+        and settled_on_disk
         and export_verified
         and cleanup_verified
         and receipts_unchanged
@@ -716,7 +792,7 @@ def run_openai_shell_live(config: ShellLiveConfig) -> ShellLiveResult:
         instance_label=config.instance_label,
         model=config.model,
         admitted_writes=proof_gate.admitted_writes,
-        exact_ok_delivered=proof_gate.exact_ok_delivered,
+        exact_ok_delivered=settled_on_disk,
         export_verified=export_verified,
         cleanup_verified=cleanup_verified,
         receipt_history_unchanged=receipts_unchanged,

@@ -763,18 +763,58 @@ class ProofGate:
         streamed_text: str,
         tool_calls: int,
     ) -> None:
-        """Settle evidence as exact_ok_delivered ONLY after validated completion + final peer write."""
+        """Settle evidence as exact_ok_delivered ONLY after durable file + dir fsync succeeds."""
         with self._lock:
             if self._state != STATE_SPENT or self._evidence_path is None:
                 raise ProofGateError("cannot settle proof evidence before write admission")
-            self._usage = usage
-            self._tool_call_count = int(tool_calls)
             exact = (
                 completed_text == EXPECTED_REPLY
                 and streamed_text == EXPECTED_REPLY
                 and tool_calls == 0
                 and usage is not None
             )
+            candidate_outcome = "exact_ok_delivered" if exact else "unexpected_output"
+            candidate = self._evidence_snapshot_locked()
+            candidate["usage"] = list(usage) if usage is not None else None
+            candidate["tool_call_count"] = int(tool_calls)
+            candidate["exact_ok_delivered"] = exact
+            candidate["outcome"] = candidate_outcome
+            try:
+                _atomic_fsync_json(self._evidence_path, candidate, exclusive=False)
+            except OSError:
+                raise ProofGateError(_ERR_SYNC_FAILED) from None
+            self._usage = usage
+            self._tool_call_count = int(tool_calls)
             self._exact_ok_delivered = exact
-            self._outcome = "exact_ok_delivered" if exact else "unexpected_output"
-            _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
+            self._outcome = candidate_outcome
+
+    def verify_settled_evidence(self) -> bool:
+        """Read back the durable evidence file and confirm settled exact_ok_delivered state."""
+        with self._lock:
+            path = self._evidence_path
+        if path is None:
+            return False
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            return False
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                return False
+            raw = stream.read(131_073)
+        if len(raw) > 131_072:
+            return False
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            return False
+        return (
+            isinstance(data, dict)
+            and data.get("run_id") == self.approval.run_id
+            and data.get("outcome") == "exact_ok_delivered"
+            and data.get("exact_ok_delivered") is True
+            and data.get("admitted_writes") == 1
+            and data.get("write_attempted") is True
+            and data.get("tool_call_count") == 0
+        )

@@ -1976,16 +1976,35 @@ def _report_session_error(terminal: StreamTerminal, error: BaseException) -> int
     return report_failure(terminal, error, operation="Provider session")
 
 
-def _validate_preconfirmed_plan(plan, proof_gate) -> None:
-    if plan.ui_mode != proof_gate.approval.ui_mode:
-        raise LaunchRefusedError("Preconfirmed plan ui_mode does not match proof approval.")
+def _validate_preconfirmed_plan(plan, proof_gate, config, live_config_digest: str | None) -> None:
+    err_plan_mismatch = "proof_plan_mismatch"
+    err_config_mismatch = "proof_config_mismatch"
+    approval = proof_gate.approval
+    if plan.ui_mode != approval.ui_mode:
+        raise LaunchRefusedError(err_plan_mismatch, "Preconfirmed plan ui_mode does not match proof approval.")
+    if plan.initial_provider_id != approval.scoped_provider_id or plan.initial_model != approval.approved_model:
+        raise LaunchRefusedError(err_plan_mismatch, "Preconfirmed plan initial route does not match proof approval.")
     admitted = [
         item for item in plan.admitted
-        if item.spec.scoped_id == proof_gate.approval.scoped_provider_id
-        and proof_gate.approval.approved_model in item.models
+        if item.spec.scoped_id == approval.scoped_provider_id
+        and approval.approved_model in item.models
     ]
-    if len(admitted) != 1:
-        raise LaunchRefusedError("Approved proof route is not uniquely admitted in preconfirmed plan.")
+    if len(plan.admitted) != 1 or len(admitted) != 1:
+        raise LaunchRefusedError(err_plan_mismatch, "Approved proof route is not uniquely admitted in preconfirmed plan.")
+    if config is None:
+        raise LaunchRefusedError(err_config_mismatch, "Current provider configuration does not admit the approved proof route.")
+    cfg_matches = [
+        item for item in config.instances
+        if item.enabled and item.scoped_id == approval.scoped_provider_id
+    ]
+    if len(cfg_matches) != 1 or cfg_matches[0].auth_mode != approval.auth_mode:
+        raise LaunchRefusedError(err_config_mismatch, "Approved proof route is no longer enabled in current providers.toml.")
+    if (
+        not approval.providers_config_digest
+        or live_config_digest is None
+        or not hmac.compare_digest(live_config_digest, approval.providers_config_digest)
+    ):
+        raise LaunchRefusedError("proof_config_digest_drift", "Current providers.toml digest drifted from approved proof configuration.")
 
 
 def _resolve_session_plan(
@@ -1994,11 +2013,18 @@ def _resolve_session_plan(
     active_adapters: dict,
     terminal: StreamTerminal,
     proof_options: ProofSessionOptions | None,
+    *,
+    live_config_digest: str | None = None,
 ):
     if proof_options is not None and proof_options.preconfirmed_plan is not None:
         if proof_options.proof_gate is None:
-            raise LaunchRefusedError("Preconfirmed launch plan requires an active proof gate.")
-        _validate_preconfirmed_plan(proof_options.preconfirmed_plan, proof_options.proof_gate)
+            raise LaunchRefusedError("proof_gate_required", "Preconfirmed launch plan requires an active proof gate.")
+        _validate_preconfirmed_plan(
+            proof_options.preconfirmed_plan,
+            proof_options.proof_gate,
+            config,
+            live_config_digest,
+        )
         return proof_options.preconfirmed_plan
     return plan_interactive_launch(
         instance_name=spec["instance"],
@@ -2009,6 +2035,26 @@ def _resolve_session_plan(
         adapters=active_adapters,
         terminal=terminal,
     )
+
+
+def _load_session_config(config_dir: Path | None, proof_options: ProofSessionOptions | None):
+    if proof_options is not None and proof_options.preconfirmed_plan is not None:
+        from oc_providers.config import load_provider_config_with_digest
+        return load_provider_config_with_digest(config_dir=config_dir)
+    return load_provider_config(config_dir=config_dir), None
+
+
+def _resolve_adapters_and_lock_dir(
+    adapters: dict | None,
+    lock_dir: Path | None,
+    proof_options: ProofSessionOptions | None,
+) -> tuple[dict, Path]:
+    proof_gate = proof_options.proof_gate if proof_options is not None else None
+    if adapters is None:
+        backend = make_backend()
+        from .session_adapter import OpenAISessionAdapter
+        return {"openai": OpenAISessionAdapter(backend, proof_gate=proof_gate)}, (lock_dir or backend._state)
+    return adapters, (lock_dir if lock_dir is not None else make_backend()._state)
 
 
 def run_interactive_session(
@@ -2033,17 +2079,16 @@ def run_interactive_session(
         return 1
 
     try:
-        config = load_provider_config(config_dir=config_dir)
-        proof_gate = proof_options.proof_gate if proof_options is not None else None
-        if adapters is None:
-            backend = make_backend()
-            from .session_adapter import OpenAISessionAdapter
-            active_adapters = {"openai": OpenAISessionAdapter(backend, proof_gate=proof_gate)}
-            resolved_lock_dir = lock_dir or backend._state
-        else:
-            active_adapters = adapters
-            resolved_lock_dir = lock_dir if lock_dir is not None else make_backend()._state
-        plan = _resolve_session_plan(spec, config, active_adapters, terminal, proof_options)
+        config, live_config_digest = _load_session_config(config_dir, proof_options)
+        active_adapters, resolved_lock_dir = _resolve_adapters_and_lock_dir(adapters, lock_dir, proof_options)
+        plan = _resolve_session_plan(
+            spec,
+            config,
+            active_adapters,
+            terminal,
+            proof_options,
+            live_config_digest=live_config_digest,
+        )
     except Exception as error:
         return _report_session_error(terminal, error)
 

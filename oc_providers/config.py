@@ -323,18 +323,7 @@ def _parse_launch_defaults(raw_launch: object, known: set[tuple[str, str]]) -> L
     return LaunchDefaults(default_provider=default_provider, default_model=default_model, mini=mini)
 
 
-def load_provider_config(
-    *,
-    config_dir: Path | None = None,
-    sandbox_dir: Path | None = None,
-) -> ProviderConfig | None:
-    """Load and strictly validate providers.toml, returning None iff the file is absent."""
-    pw_home = _account_home()
-    target_dir = default_config_dir() if config_dir is None else Path(config_dir)
-    sandbox = (pw_home / "opencode-sandbox").resolve() if sandbox_dir is None else Path(sandbox_dir).resolve()
-    raw = _read_trusted_toml_bytes(target_dir, sandbox=sandbox)
-    if raw is None:
-        return None
+def _parse_provider_config_bytes(raw: bytes, *, sandbox: Path) -> ProviderConfig:
     try:
         parsed = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError):
@@ -346,3 +335,30 @@ def load_provider_config(
     provider_defaults = _parse_provider_defaults(parsed.get("provider_defaults"), known)
     launch = _parse_launch_defaults(parsed.get("launch"), known)
     return ProviderConfig(instances=instances, provider_defaults=provider_defaults, launch=launch)
+
+
+def load_provider_config_with_digest(
+    *,
+    config_dir: Path | None = None,
+    sandbox_dir: Path | None = None,
+) -> tuple[ProviderConfig | None, str | None]:
+    """Atomically read, hash, and strictly validate providers.toml from one captured byte buffer."""
+    from hashlib import sha256
+
+    pw_home = _account_home()
+    target_dir = default_config_dir() if config_dir is None else Path(config_dir)
+    sandbox = (pw_home / "opencode-sandbox").resolve() if sandbox_dir is None else Path(sandbox_dir).resolve()
+    raw = _read_trusted_toml_bytes(target_dir, sandbox=sandbox)
+    if raw is None:
+        return None, None
+    return _parse_provider_config_bytes(raw, sandbox=sandbox), sha256(raw).hexdigest()
+
+
+def load_provider_config(
+    *,
+    config_dir: Path | None = None,
+    sandbox_dir: Path | None = None,
+) -> ProviderConfig | None:
+    """Load and strictly validate providers.toml, returning None iff the file is absent."""
+    config, _ = load_provider_config_with_digest(config_dir=config_dir, sandbox_dir=sandbox_dir)
+    return config
