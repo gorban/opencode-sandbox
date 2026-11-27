@@ -118,11 +118,17 @@ def phase(prefix, directory, token, name, options, image, level, memory, inp, ou
 
 
 def main():
-    if len(sys.argv) < 7: raise ValueError('invalid updater supervisor arguments')
-    state, level, volume, image, memory, version = sys.argv[1:7]
-    prefix = sys.argv[7:]
+    if len(sys.argv) < 8:
+        raise ValueError('invalid updater supervisor arguments')
+    state, level, volume, image, memory, version, expected_sha256 = sys.argv[1:8]
+    prefix = sys.argv[8:]
+    archive_sha256 = os.environ.get('OC_OPENCODE_ARCHIVE_SHA256', '')
     if prefix not in ([], ['distrobox-host-exec']): raise ValueError('invalid host command prefix')
     if not re.fullmatch(r's0:c\d+,c\d+', level, flags=re.ASCII): raise ValueError('invalid SELinux level')
+    if not re.fullmatch(r'[0-9a-f]{64}', expected_sha256, flags=re.ASCII):
+        raise ValueError('invalid expected OpenCode SHA-256 digest')
+    if archive_sha256 and not re.fullmatch(r'[0-9a-f]{64}', archive_sha256, flags=re.ASCII):
+        raise ValueError('invalid expected OpenCode archive SHA-256 digest')
     if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', volume)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]*', image)):
         raise ValueError('invalid volume or image name')
@@ -134,13 +140,17 @@ def main():
     directory = Path(tempfile.mkdtemp(prefix='opencode-update.', dir=state_path))
     token = secrets.token_hex(16); parent = os.getppid(); safe = True
     try:
+        stage_opts = ['-e', f'OC_OPENCODE_VERSION={version}', '-e', f'OC_OPENCODE_SHA256={expected_sha256}']
+        if archive_sha256:
+            stage_opts += ['-e', f'OC_OPENCODE_ARCHIVE_SHA256={archive_sha256}']
         with tempfile.TemporaryFile(dir=directory) as snapshot, tempfile.TemporaryFile(dir=directory) as candidate:
             phase(prefix, directory, token, 'snapshot', ['--network=none', '-v', f'{volume}:/source:ro'],
                   image, level, memory, None, snapshot, 30, parent)
-            phase(prefix, directory, token, 'stage', ['-e', f'OC_OPENCODE_VERSION={version}'],
+            phase(prefix, directory, token, 'stage', stage_opts,
                   image, level, memory, snapshot, candidate, 120, parent)
             # Stage and reader containers have both been verified gone before promotion begins.
-            phase(prefix, directory, token, 'promote', ['--network=none', '-v', f'{volume}:/root'],
+            phase(prefix, directory, token, 'promote',
+                  ['--network=none', '-e', f'OC_OPENCODE_SHA256={expected_sha256}', '-v', f'{volume}:/root'],
                   image, level, memory, candidate, None, 30, parent)
         print('OpenCode update check complete', file=sys.stderr)
     except UnsafeCleanup:

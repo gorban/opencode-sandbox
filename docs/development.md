@@ -101,3 +101,22 @@ CI workflow, runner and policy changes require human review. Changes that instal
 write hooks or Git state, or enable remote acceptance need separate approval. The
 [future hook plan](prds/prd_k.md#exact-git-snapshots-and-hook-proof) would check the exact content
 selected for the commit by Git. The local commands above check working files when explicitly run.
+
+## Pin refresh cadence
+
+Digest pins and fixed commit SHAs prevent unexpected upstream drift but freeze security updates until
+refreshed. Review and refresh pins on a regular cadence (target: every 14 days, matching the default
+`OC_IMAGE_MAX_AGE_DAYS` warning threshold, or sooner for Chromium/Podman security advisories):
+
+1. Refresh multi-arch OCI digests in `oc-sandbox` (`Containerfile.agent`, `Containerfile.chromium`,
+   `Containerfile.relay`, and default `DIND_IMG`).
+2. Refresh `chrome-devtools-mcp` version, tarball URL, SHA-512/SHA-256 hashes, and `bin` check in
+   `Containerfile.agent`.
+3. Refresh `OHMYZSH_COMMIT` and `ZSH_VI_MODE_COMMIT` in `oc-sandbox`.
+4. Rebuild local images with `oc-sandbox -r` and rerun `bash tests/security.sh` plus
+   `python3 tests/parallel-isolated.py --run`.
+
+**Open residual gate:** `Containerfile.agent` (`apk add`) and `Containerfile.chromium` (`dnf install`)
+install distro-signed packages from live Alpine and Fedora repositories. Two uncached builds from the
+same commit can still diverge over time as upstream distro repositories supersede packages until
+locked or snapshotted distro mirrors are introduced.
