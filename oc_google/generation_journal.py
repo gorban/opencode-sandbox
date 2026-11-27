@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from hashlib import sha256
 import json
@@ -134,6 +134,7 @@ class WriteReceipt:
     target: object
     byte_count: int
     packet_sha256: str
+    _origin: object = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -144,6 +145,7 @@ class SettlementEvidence:
     target: object
     byte_count: int
     packet_sha256: str
+    closure: object | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -158,6 +160,10 @@ class _InFlight:
     operation: Operation
     pid: int
     thread: int
+    target: object
+    byte_count: int
+    packet_sha256: str
+    settlement_guard: object | None
 
 
 def _matches_write(target, count, digest, evidence):
@@ -314,6 +320,7 @@ class _LeaseAuthority:
     in_flight: _InFlight | None = None
     flight_checked: bool = False
     pending: WriteReceipt | None = None
+    pending_guard: Callable[[SettlementEvidence], None] | None = None
     sent: AcpSentReceipt | None = None
 
 
@@ -375,6 +382,12 @@ class _Files:
             os.rename(_LATCH, _PARKED + secrets.token_hex(16), src_dir_fd=self.directory, dst_dir_fd=self.directory)
             os.fsync(self.directory)
 
+    def _retain_after_error(self, error):
+        try:
+            self._hold_after_failed_save()
+        except (OSError, GenerationHeld):
+            error.add_note("Google synthetic generation latch still requires inspection")
+
     def save(self, phase, binding, check):
         check()
         temporary = _TEMP + secrets.token_hex(16)
@@ -393,10 +406,7 @@ class _Files:
             self._latch(_HELD)
             check()
         except BaseException as error:
-            try:
-                self._hold_after_failed_save()
-            except (OSError, GenerationHeld):
-                error.add_note("Google synthetic generation latch still requires inspection")
+            self._retain_after_error(error)
             raise
         finally:
             with suppress(FileNotFoundError):
@@ -420,9 +430,10 @@ class _Run:
             authority.revoked = True
             authority.capability = None
             authority.in_flight = authority.pending = authority.sent = None
+            authority.pending_guard = None
             authority.flight_checked = False
 
-    def _check(self):
+    def _check(self, local=None):
         self._owner_fence()
         authority = self._files._authority
         deadline = self._control.deadline
@@ -434,7 +445,9 @@ class _Run:
             if self._control.authorized(self._control.binding) is not True or authority.revoked:
                 raise GenerationHeld()
             self._files.verify()
-            if deadline is not None and monotonic() >= deadline:
+            if local is not None:
+                local()
+            if authority.revoked or (deadline is not None and monotonic() >= deadline):
                 raise GenerationHeld()
         finally:
             authority.checking = False
@@ -455,9 +468,17 @@ class _Run:
         finally:
             authority.busy = False
 
-    def _save(self, phase):
-        self._files.save(phase, self._control.binding, self._check)
-        self._check()
+    def _save(self, phase, *, local=None):
+        def check():
+            self._check(local)
+
+        self._files.save(phase, self._control.binding, check)
+        try:
+            check()
+        except BaseException as error:
+            if local is not None:
+                self._files._retain_after_error(error)
+            raise
         self._files._authority.phase = phase
 
     def _launch(self):
@@ -494,7 +515,7 @@ class _Run:
                 or self._files.current[1] != _record(self._files.anchor.enrollment, phase, self._control.binding)):
             raise GenerationHeld()
 
-    def write_once(self, capability, effect, *, target, data):
+    def write_once(self, capability, effect, *, target, data, settlement_guard=None):
         """Spend an issued capability before the adapter's bounded synchronous write."""
         with self._owner_fence():
             authority = self._files._authority
@@ -506,10 +527,13 @@ class _Run:
                 if target is None or type(data) is not bytes or not 0 < len(data) <= _MAX_WRITE_BYTES:
                     raise GenerationHeld()
                 operation = capability.operation
+                if settlement_guard is not None and (operation is not Operation.DELIVERY or not callable(settlement_guard)):
+                    raise GenerationHeld()
                 self._check_phase(_STEPS[operation][1])
                 digest = _digest(data)
-                proof = _InFlight(operation, self._control.pid, get_ident())
+                proof = _InFlight(operation, self._control.pid, get_ident(), target, len(data), digest, settlement_guard)
                 authority.in_flight = proof
+                authority.pending_guard = settlement_guard
                 try:
                     evidence = effect(proof)
                     checked = authority.flight_checked
@@ -519,10 +543,10 @@ class _Run:
                 self._check_phase(_STEPS[operation][1])
                 if type(evidence) is not WriteEvidence or not checked or not _matches_write(target, len(data), digest, evidence):
                     raise GenerationHeld()
-                authority.pending = WriteReceipt(operation, target, len(data), digest)
+                authority.pending = WriteReceipt(operation, target, len(data), digest, self._control)
                 return authority.pending
 
-    def verify_in_flight(self, proof, operation):
+    def verify_in_flight(self, proof, operation, *, target=None, data=None, settlement_guard=None):
         """Verify the exact write claim synchronously just before its effect."""
         if (type(proof) is not _InFlight or proof.pid != os.getpid() or proof.thread != get_ident()
                 or proof.operation is not operation):
@@ -530,6 +554,13 @@ class _Run:
         with self._owner_fence():
             authority = self._files._authority
             if proof is not authority.in_flight or not authority.busy or authority.checking:
+                raise GenerationHeld()
+            if target is not None or data is not None:
+                if (target is not proof.target or type(data) is not bytes or len(data) != proof.byte_count
+                        or _digest(data) != proof.packet_sha256):
+                    raise GenerationHeld()
+            if settlement_guard is not None and (settlement_guard is not proof.settlement_guard
+                                                 or settlement_guard is not authority.pending_guard):
                 raise GenerationHeld()
             try:
                 self._check_phase(_STEPS[operation][1])
@@ -546,13 +577,15 @@ class _Run:
             with self._transition():
                 authority = self._files._authority
                 pending, authority.pending = authority.pending, None
+                guard, authority.pending_guard = authority.pending_guard, None
                 if (type(receipt) is not WriteReceipt or receipt is not pending or type(evidence) is not SettlementEvidence
                         or evidence.write is not receipt
-                        or not _matches_write(receipt.target, receipt.byte_count, receipt.packet_sha256, evidence)):
+                        or not _matches_write(receipt.target, receipt.byte_count, receipt.packet_sha256, evidence)
+                        or (guard is None and evidence.closure is not None)):
                     raise GenerationHeld()
                 operation = receipt.operation
                 self._check_phase(_STEPS[operation][1])
-                self._save(_STEPS[operation][2])
+                self._save(_STEPS[operation][2], local=(lambda: guard(evidence)) if guard is not None else None)
                 if operation is Operation.ACP:
                     authority.sent = AcpSentReceipt(receipt)
 

@@ -18,6 +18,7 @@ from time import monotonic
 
 from oc_orchestrator import protocol
 
+from .generation_journal import Operation, SettlementEvidence, WriteReceipt, _Run
 from .route import _send_once
 
 
@@ -63,6 +64,16 @@ def _dead(fd):
     poll = select.poll()
     poll.register(fd, select.POLLIN)
     return any(events & select.POLLIN for _, events in poll.poll(0))
+
+
+def _proc_cgroups(pid):
+    with open(f"/proc/{pid}/cgroup", "rb") as source:
+        return source.read(4097)
+
+
+def _proc_netns_identity(pid):
+    info = os.stat(f"/proc/{pid}/ns/net")
+    return info.st_dev, info.st_ino
 
 
 class ProcessPin:
@@ -205,6 +216,33 @@ class DeliveryReceipt:
     complete: bool = False
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class PreparedWorkerWrite:
+    adoption: AdoptedWorker
+    relay: RelayRetirement
+    packet: bytes
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ClosedWorkerWrite:
+    prepared: PreparedWorkerWrite
+    delivery: DeliveryReceipt
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _WorkerSettlementGuard:
+    channel: "RetainedWorkerChannel"
+    prepared: PreparedWorkerWrite
+    run_control: object
+
+    def __call__(self, evidence):
+        _require(type(evidence) is SettlementEvidence and evidence.target is self.prepared
+                 and type(evidence.write) is WriteReceipt and evidence.write._origin is self.run_control
+                 and type(evidence.closure) is ClosedWorkerWrite and evidence.closure.prepared is self.prepared,
+                 "Exact worker closure evidence is unavailable")
+        self.channel.verify_closed_pins(evidence.closure)
+
+
 @dataclass(frozen=True, slots=True)
 class _DescriptorPin:
     fd: int
@@ -307,7 +345,10 @@ class _Phase(Enum):
     ADOPTED = auto()
     CLOSED = auto()
     SEALED = auto()
+    PREPARING = auto()
+    PREPARED = auto()
     SPENT = auto()
+    DELIVERY_CLOSED = auto()
     REVOKED = auto()
 
 
@@ -355,6 +396,8 @@ class RetainedWorkerChannel:
         self._phase = _Phase.OPEN
         self._control = self._control_pin = self._client = self._identity = None
         self._adopted = self._retirement = None
+        self._prepared = self._prepared_run = self._closed_write = self._settlement_guard = None
+        self._worker_netns = None
         self._delivery = DeliveryReceipt()
 
     def __enter__(self):
@@ -392,7 +435,15 @@ class RetainedWorkerChannel:
             if client is not None:
                 self._close_exact(client, self._identity.pin, shutdown=True)
         finally:
-            self._close_control_locked(shutdown=True)
+            try:
+                self._close_control_locked(shutdown=True)
+            finally:
+                pin, self._worker_netns = self._worker_netns, None
+                if pin is not None:
+                    fd, identity = pin
+                    with suppress(OSError):
+                        if _ident(fd) == identity:
+                            os.close(fd)
 
     def revoke(self):
         with self._fence:
@@ -413,7 +464,7 @@ class RetainedWorkerChannel:
                  "Retained worker or owner is no longer current")
 
     def _check_worker_pin(self, phase):
-        _require(self._phase is phase and self._placement.worker.alive(),
+        _require(self._phase is phase and self._placement.worker.alive() and self._phase is phase,
                  "Retained worker or owner is no longer current")
 
     def _check_live_adoption(self):
@@ -541,3 +592,137 @@ class RetainedWorkerChannel:
                 return self._delivery
             finally:
                 self._revoke_locked()
+
+    def prepare_delivery(self, adopted, retirement, *, run):
+        """Freeze exact private reply bytes after fresh placement observations."""
+        with self._fence:
+            _require(self._phase is _Phase.SEALED and adopted is self._adopted
+                     and retirement is self._retirement, "Exact sealed worker delivery is unavailable")
+            _require(type(run) is _Run and run._owner_fence() is self._fence,
+                     "Exact worker delivery journal is unavailable")
+            self._phase = _Phase.PREPARING
+        try:
+            _require(self._placement.worker.active() and self._worker_current(self._placement) is True
+                     and self._placement.relay.retired() and self._retirement_current(retirement) is True,
+                     "Retained worker or relay retirement is no longer current")
+            with self._fence:
+                _require(self._phase is _Phase.PREPARING and self._owner_current() is True,
+                         "Exact prepared worker delivery is unavailable")
+                self._check_delivery_pins(_Phase.PREPARING)
+                self._pin_worker_placement()
+                self._prepared = PreparedWorkerWrite(adopted, retirement, protocol.text_reply_bytes(self._model))
+                self._prepared_run = run._control
+                self._settlement_guard = _WorkerSettlementGuard(self, self._prepared, self._prepared_run)
+                self._phase = _Phase.PREPARED
+                return self._prepared
+        except BaseException:
+            self.revoke()
+            raise
+
+    def _check_delivery_pins(self, phase):
+        self._check_client()
+        _require(self._placement.relay.retired(), "Exact relay retirement is unconfirmed")
+        self._check_worker_pin(phase)
+
+    def _pin_worker_placement(self):
+        worker = self._placement.worker
+        try:
+            fd = os.open(f"/proc/{worker._pid}/ns/net", os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            raise WorkerChannelError("Original worker namespace pin is unavailable") from None
+        try:
+            self._worker_netns = (fd, _ident(fd))
+        except BaseException:
+            os.close(fd)
+            raise
+        self._check_local_placement(_Phase.PREPARING)
+
+    def _check_local_placement(self, phase):
+        worker, pin = self._placement.worker, self._worker_netns
+        _require(pin is not None and worker.alive(), "Original worker placement is no longer current")
+        fd, namespace = pin
+        try:
+            group = _proc_cgroups(worker._pid)
+            current_namespace = _proc_netns_identity(worker._pid)
+            current_pin = _ident(fd)
+        except OSError:
+            raise WorkerChannelError("Original worker placement is unconfirmed") from None
+        _require(len(group) <= 4096 and group.splitlines() == [worker._group]
+                 and current_namespace == namespace and current_pin == namespace,
+                 "Original worker placement is no longer current")
+        self._check_worker_pin(phase)
+
+    def settlement_guard(self, prepared, *, run):
+        with self._fence:
+            _require(self._phase is _Phase.PREPARED and prepared is self._prepared and type(run) is _Run
+                     and run._control is self._prepared_run and run._owner_fence() is self._fence,
+                     "Exact prepared worker settlement guard is unavailable")
+            return self._settlement_guard
+
+    def verify_prepared(self, prepared):
+        with self._fence:
+            _require(self._phase is _Phase.PREPARED and prepared is self._prepared
+                     and self._owner_current() is True, "Exact prepared worker delivery is unavailable")
+            self._check_delivery_pins(_Phase.PREPARED)
+            self._check_local_placement(_Phase.PREPARED)
+
+    def write_prepared(self, prepared, *, run, proof):
+        """Perform the bounded joined write with the journal effect's live proof."""
+        with self._fence:
+            _require(self._phase is _Phase.PREPARED and prepared is self._prepared,
+                     "Exact prepared worker delivery is unavailable")
+            _require(type(run) is _Run and run._control is self._prepared_run and run._owner_fence() is self._fence,
+                     "Exact worker delivery journal is unavailable")
+            self._phase = _Phase.SPENT
+            try:
+                _require(self._owner_current() is True, "Retained worker owner is no longer current")
+                run.verify_in_flight(proof, Operation.DELIVERY, target=prepared, data=prepared.packet,
+                                     settlement_guard=self._settlement_guard)
+                self._check_delivery_pins(_Phase.SPENT)
+                self._check_local_placement(_Phase.SPENT)
+                self._delivery = DeliveryReceipt(True, None, False)
+                sent = _send_once(self._client, prepared.packet)
+                if type(sent) is int and 0 <= sent <= len(prepared.packet):
+                    self._delivery = DeliveryReceipt(True, sent, sent == len(prepared.packet))
+                _require(self._delivery.complete, "Worker response write was incomplete")
+                return self._delivery
+            except BaseException:
+                self._revoke_locked()
+                raise
+
+    def close_written(self, prepared, delivery):
+        """Observe exact owned channel shutdown and close after the write."""
+        with self._fence:
+            _require(self._phase is _Phase.SPENT and prepared is self._prepared
+                     and delivery is self._delivery and delivery.complete,
+                     "Exact worker write is not available for closure")
+            try:
+                client = self._client
+                pin = self._identity.pin
+                _require(client is not None and pin.matches(client), "Retained worker descriptor changed at closure")
+                client.shutdown(socket.SHUT_RDWR)
+                _require(pin.matches(client), "Retained worker descriptor changed at closure")
+                client.close()
+                _require(client.fileno() == -1, "Exact worker channel closure is unconfirmed")
+                self._client = None
+                self._closed_write = ClosedWorkerWrite(prepared, delivery)
+                self._phase = _Phase.DELIVERY_CLOSED
+                return self._closed_write
+            except BaseException:
+                self._revoke_locked()
+                raise
+
+    def verify_closed_write(self, closure):
+        with self._fence:
+            _require(self._phase is _Phase.DELIVERY_CLOSED and closure is self._closed_write
+                     and self._owner_current() is True, "Exact closed worker delivery is unavailable")
+            self.verify_closed_pins(closure)
+
+    def verify_closed_pins(self, closure):
+        """Recheck the exact closure and process pins without any observer callbacks."""
+        with self._fence:
+            _require(self._phase is _Phase.DELIVERY_CLOSED and closure is self._closed_write
+                     and closure.prepared is self._prepared and closure.delivery is self._delivery
+                     and self._client is None and self._placement.relay.retired(),
+                     "Exact closed worker delivery is unavailable")
+            self._check_local_placement(_Phase.DELIVERY_CLOSED)
