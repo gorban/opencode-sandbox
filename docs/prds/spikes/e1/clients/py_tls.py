@@ -3,6 +3,7 @@ ver = "py%s-%s" % (sys.version.split()[0], ssl.OPENSSL_VERSION.split()[1])
 for line in open("/w/combos.tsv"):
     V, L, port, check, kind = line.rstrip("\n").split("\t")
     ctx = ssl.create_default_context(cafile="/w/ca/%s/ca.pem" % V)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     try:
         with (
             socket.create_connection((check, int(port)), timeout=10) as s,

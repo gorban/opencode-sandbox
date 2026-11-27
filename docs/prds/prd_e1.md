@@ -72,6 +72,10 @@ A separate eight-server run tested host and Alpine OpenSSL verification across t
 (32 cells, 16 accepts and 16 rejects); the matrix checks passed. Stubbed regressions also confirm
 restart and chain-import failures cannot emit a result cell.
 
+The retained Python probe explicitly requires TLS 1.2 or newer. Its
+[offline setup regression](spikes/e1/setup-regression.py) checks that the client sets the floor before
+connecting and supplies the expected CA and hostname.
+
 ### Clients and versions
 
 9 clients, 12 test paths:
