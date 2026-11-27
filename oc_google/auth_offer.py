@@ -46,7 +46,7 @@ _SUCCESS_METADATA = {"iss", "scope", "authuser", "prompt"}
 _DENIAL_FIELDS = {"state", "error"}
 _HEADERS = frozenset({
     b"host", b"accept", b"accept-encoding", b"accept-language", b"cache-control", b"connection", b"cookie",
-    b"pragma", b"priority", b"sec-ch-ua", b"sec-ch-ua-mobile", b"sec-ch-ua-platform",
+    b"pragma", b"priority", b"referer", b"sec-ch-ua", b"sec-ch-ua-mobile", b"sec-ch-ua-platform",
     b"sec-fetch-dest", b"sec-fetch-mode", b"sec-fetch-site", b"sec-fetch-storage-access",
     b"sec-fetch-user", b"sec-gpc", b"upgrade-insecure-requests", b"user-agent",
 })
@@ -289,8 +289,8 @@ def parse_callback(head, port):
             diagnostic = (CallbackDiagnostic.HEADER_DUPLICATE if key in fields
                           else _HEADER_DIAGNOSTICS.get(key, CallbackDiagnostic.HEADER_OTHER))
             raise _CallbackRefused("invalid callback header", diagnostic)
-        # Keep only the Cookie name so a second field is still refused.
-        fields[key] = None if key == b"cookie" else value.strip(b" ")
+        # Keep only these names so duplicate fields are still refused.
+        fields[key] = None if key in (b"cookie", b"referer") else value.strip(b" ")
     if fields.get(b"host") != f"{HOST}:{port}".encode("ascii"):
         raise _CallbackRefused("invalid callback host", CallbackDiagnostic.TARGET)
     path, separator, query = parts[1].partition(b"?")

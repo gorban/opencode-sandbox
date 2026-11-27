@@ -23,6 +23,8 @@ OBSERVED_SCOPES = ORIGINAL_SCOPES + " email openid"
 OBSERVED_QUERY = "&" + urlencode({"iss": ISSUER, "scope": OBSERVED_SCOPES, "authuser": "1", "prompt": "consent"})
 COOKIE_MARKER = b"synthetic-loopback-cookie"
 COOKIE_HEADER = b"CoOkIe: fixture=" + COOKIE_MARKER + b"; other=2\r\n"
+REFERER_MARKER = b"synthetic-loopback-referer"
+REFERER_HEADER = b"ReFeReR: https://fixture.invalid/" + REFERER_MARKER + b"\r\n"
 
 
 def offer(port, **changes):
@@ -164,7 +166,7 @@ class CallbackGateTest(unittest.TestCase):
             "FRAMING": {},
             "TARGET": {"host": "localhost"},
             "PARAMETERS": {"extra_query": "&hd=fixture.invalid"},
-            "HEADER_REFERER": {"extra_headers": b"ReFeReR: https://fixture.invalid/synthetic\r\n"},
+            "HEADER_REFERER": {"extra_headers": REFERER_HEADER.removesuffix(b"\r\n") + b"\x00\r\n"},
             "HEADER_ORIGIN": {"extra_headers": b"Origin: https://fixture.invalid\r\n"},
             "HEADER_DNT": {"extra_headers": b"DNT: 1\r\n"},
             "HEADER_COOKIE": {"extra_headers": b"Cookie: synthetic\x00\r\n"},
@@ -347,6 +349,62 @@ class CallbackGateTest(unittest.TestCase):
                 self.assertNotIn(COOKIE_MARKER, reply)
                 self.assertNotIn(COOKIE_MARKER, native)
                 self.assertEqual(gate.take_forwarded(), auth.Callback(STATE, CODE))
+                self.assertIsNone(gate.take_forwarded())
+                self.assert_no_native_bytes(recorder)
+
+    def test_referer_cookie_and_gpc_preserve_only_canonical_state_and_code(self):
+        for referer in (REFERER_HEADER, b"Referer: " + REFERER_MARKER + b"\r\n"):
+            with self.subTest(url=referer == REFERER_HEADER), placement() as (gate, recorder, port):
+                headers = referer + COOKIE_HEADER + b"Sec-GPC: 1\r\n"
+                browser = request(port, extra_query=OBSERVED_QUERY, extra_headers=headers)
+                reply = self.exchange(gate, port, browser)
+                self.assertEqual(reply, auth.acknowledgement(True))
+                self.assertIn(b"Referrer-Policy: no-referrer\r\n", reply)
+                recorder.settimeout(1)
+                native = recorder.recv(4096)
+                self.assertEqual(native, request(port))
+                for marker in (COOKIE_MARKER, REFERER_MARKER):
+                    self.assertNotIn(marker, native)
+                    self.assertNotIn(marker, reply)
+                self.assertEqual(gate.take_forwarded(), auth.Callback(STATE, CODE))
+                self.assertIsNone(gate.take_forwarded())
+                self.assertEqual(self.exchange(gate, port, browser), auth.acknowledgement(False))
+                self.assert_no_native_bytes(recorder)
+
+    def test_referer_does_not_relax_callback_validation(self):
+        cases = {
+            "duplicate": {"extra_headers": REFERER_HEADER + b"referer: duplicate\r\n"},
+            "control byte": {"extra_headers": REFERER_HEADER.replace(b"\r\n", b"\x00\r\n")},
+            "non-ASCII byte": {"extra_headers": REFERER_HEADER.replace(b"\r\n", b"\xff\r\n")},
+            "size bound": {"extra_headers": REFERER_HEADER.replace(b"\r\n", b"a" * auth._LIMIT + b"\r\n")},
+            "origin": {"extra_headers": REFERER_HEADER + b"Origin: https://fixture.invalid\r\n"},
+            "unknown header": {"extra_headers": REFERER_HEADER + b"X-Browser-Metadata: fixture\r\n"},
+            "wrong host": {"host": "localhost"},
+            "wrong issuer": {"extra_query": OBSERVED_QUERY.replace(ISSUER.partition("://")[2], "fixture.invalid")},
+            "request body": {"tail": b"fixture"},
+        }
+        categories = {
+            "duplicate": auth.CallbackDiagnostic.HEADER_DUPLICATE,
+            "control byte": auth.CallbackDiagnostic.HEADER_REFERER,
+            "non-ASCII byte": auth.CallbackDiagnostic.HEADER_REFERER,
+            "size bound": auth.CallbackDiagnostic.FRAMING,
+            "origin": auth.CallbackDiagnostic.HEADER_ORIGIN,
+            "unknown header": auth.CallbackDiagnostic.HEADER_OTHER,
+            "wrong host": auth.CallbackDiagnostic.TARGET,
+            "wrong issuer": auth.CallbackDiagnostic.PARAMETERS,
+            "request body": auth.CallbackDiagnostic.FRAMING,
+        }
+        for case, options in cases.items():
+            with self.subTest(case=case), placement() as (gate, recorder, port):
+                payload = request(port, **({"extra_headers": REFERER_HEADER, "extra_query": OBSERVED_QUERY} | options))
+                reply = self.exchange(gate, port, payload)
+                if case == "size bound":
+                    self.assertIn(reply, (b"", auth.acknowledgement(False)))
+                else:
+                    self.assertEqual(reply, auth.acknowledgement(False))
+                self.assertNotIn(REFERER_MARKER, reply)
+                self.assertIs(gate.outcome, auth.Outcome.CANCELLED)
+                self.assertIs(gate.diagnostic, categories[case])
                 self.assertIsNone(gate.take_forwarded())
                 self.assert_no_native_bytes(recorder)
 

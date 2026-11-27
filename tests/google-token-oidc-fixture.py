@@ -14,7 +14,7 @@ import tempfile
 
 
 CALLBACK_PINS = {
-    "oc_google/auth_offer.py": "726efc6369adae604f020a65b5273dfa71a86f04f91a5da437b0dbc8103d8c54",
+    "oc_google/auth_offer.py": "f1918857c09eb31bf51f85c27f996419e2c3a780437819fb3000a449038f5b14",
     "tests/google-connect-fixture.py": "423f99ddbbc83abe67081cfb272d9a48854281868a516ee9f3ad97e37cefd23f",
 }
 MATRIX = ((False, False), (False, True), (True, False), (True, True))

@@ -436,7 +436,7 @@ class RuntimeCustodyTest(unittest.TestCase):
             with placement(authorized=authorized, opened=False) as (gate, _recorder, port), \
                     ThreadPoolExecutor(max_workers=1) as browser:
                 disclosed = gate.accept_offer(offer(port))
-                payload = request(port, extra_headers=b"Referer: https://fixture.invalid/synthetic-referer-marker\r\n")
+                payload = request(port, extra_headers=b"Referer: https://fixture.invalid/synthetic-referer-marker\x00\r\n")
                 reply = browser.submit(exchange, port, payload)
                 owner = SimpleNamespace(fence=fence, authorizes_offer=lambda _: True, active=authorized)
                 try:
