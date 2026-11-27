@@ -11,6 +11,12 @@ import sys
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _STORE_TRUE = "store_true"
 _REVIEWED_SHA256 = "REVIEWED_SHA256"
+_GOOGLE_TEST = Path(__file__).with_name("test_google_text_e2e.py")
+_GOOGLE_CASES = {
+    "test_google_cached_login_text": ("--run-google-text-live", "native ACP"),
+    "test_google_opencode_text": ("--run-google-opencode-live", "isolated OpenCode via ACP"),
+    "test_google_public_shell": ("--run-google-public-shell-live", "public OpenCode Google shell"),
+}
 
 # Known pytest short options by arity. Any unknown short option immediately preceding
 # a live option fails closed as ambiguous rather than guessing boolean arity.
@@ -72,10 +78,19 @@ _BOOL_LONG_OPTS = frozenset({
     "--run-openai-canary-live",
     "--run-openai-shell-live",
     "--run-claude-shell-live",
+    "--run-google-text-live",
+    "--run-google-opencode-live",
+    "--run-google-public-shell-live",
 })
 
 
 def pytest_addoption(parser):
+    parser.addoption("--run-google-opencode-live", action=_STORE_TRUE,
+                     help="Offer one attended fixed-text prompt from isolated OpenCode via workstation ACP.")
+    parser.addoption("--run-google-public-shell-live", action=_STORE_TRUE,
+                     help="Offer one attended fixed-text prompt through the public named Google shell.")
+    parser.addoption("--run-google-text-live", action=_STORE_TRUE,
+                     help="Offer one attended fixed-text prompt through the cached workstation Antigravity login.")
     parser.addoption("--run-openai-live", action=_STORE_TRUE,
                      help="Offer the two attended approvals for the live OpenAI proof.")
     parser.addoption("--recover-openai-live", action=_STORE_TRUE,
@@ -295,3 +310,64 @@ def require_explicit_test_target(request, target_file: Path) -> bool:
     except OSError:
         return False
     return direct_target == resolved and config_target == resolved
+
+
+def _approve_google_cases(routes: list[str]) -> bool:
+    try:
+        with open("/dev/tty", "r+b", buffering=0) as terminal:
+            if os.tcgetpgrp(terminal.fileno()) != os.getpgrp():
+                return False
+            terminal.write(
+                (f"Google Antigravity subscription test routes: {', '.join(routes)}.\n"
+                 f"Maximum fixed Hydrogen prompts: {len(routes)}. Native retries or usage may still occur.\n"
+                 "Authorize this test selection? [y/N] ").encode("ascii")
+            )
+            return (terminal.readline(16).strip().lower() == b"y"
+                    and os.tcgetpgrp(terminal.fileno()) == os.getpgrp())
+    except OSError:
+        return False
+
+
+def _selected_google_cases(session):
+    config = session.config
+    flags = tuple(flag for flag, _ in _GOOGLE_CASES.values())
+    if config.getoption("collectonly", False) or not any(config.getoption(flag) for flag in flags):
+        return {}
+    assert_no_inherited_live_options(session, flags)
+    direct_flags = {flag for flag in flags if explicit_cli_flag(flag, config.invocation_params.args)}
+    if direct_flags != {flag for flag in flags if config.getoption(flag)}:
+        raise ValueError("Pass Google subscription test flags directly on the pytest command line.")
+    cases = {}
+    for item in session.items:
+        case = getattr(item, "originalname", None)
+        if item.path == _GOOGLE_TEST and case in _GOOGLE_CASES:
+            flag, route = _GOOGLE_CASES[case]
+            if flag in direct_flags:
+                cases[case] = route
+    if cases and (config.getoption("numprocesses", 0) or hasattr(config, "workerinput")):
+        raise ValueError("Google subscription tests require one local pytest process.")
+    return cases
+
+
+def pytest_collection_finish(session):
+    """Approve only selected Google subscription tests, once, before any test runs."""
+    import pytest
+
+    config = session.config
+    config._oc_google_live_cases = set()
+    try:
+        cases = _selected_google_cases(session)
+    except ValueError as error:
+        raise pytest.UsageError(str(error)) from None
+    if cases and _approve_google_cases(list(cases.values())):
+        config._oc_google_live_cases = set(cases)
+
+
+def claim_google_case(request):
+    """Consume one authorization from the exact selected collection."""
+    cases = request.config._oc_google_live_cases
+    case = request.node.originalname
+    if case not in cases:
+        return False
+    cases.remove(case)
+    return True

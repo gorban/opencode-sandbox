@@ -42,6 +42,10 @@ class RegistrationUnavailable(RuntimeError):
     """The local enrollment authority cannot advance or be verified."""
 
 
+class RegistrationLabelOccupied(RegistrationUnavailable):
+    """A new enrollment cannot reuse a previously allocated label."""
+
+
 @contextmanager
 def _metadata_storage_errors():
     try:
@@ -1075,7 +1079,7 @@ class RegistrationJournal:
             raise RegistrationUnavailable("invalid Google enrollment artifact binding")
         with self._locked(create=True) as slot, ExitStack() as pins:
             if not slot.new:
-                raise RegistrationUnavailable("Google registration already exists or requires inspection")
+                raise RegistrationLabelOccupied("Google registration already exists or requires inspection")
             registration, generation, attempt = (secrets.token_hex(16) for _ in range(3))
             profile = _profile(pins, slot, generation, create=True)
             enrolled = Enrollment(self.label, registration, generation, attempt, build_digest,

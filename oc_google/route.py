@@ -264,7 +264,7 @@ class TurnBroker(_TextBroker):
     """Use the owner's exact single-turn worker token, model and system digest."""
 
     def __init__(self, address, proof, *, authorized, worker_token: str, model: str,
-                 system_digest: str, port=protocol.PORT):
+                 system_digest: str, normalized_label=None, port=protocol.PORT):
         if not re.fullmatch(r"[A-Za-z0-9._~+/-]{1,256}={0,2}", worker_token):
             raise ValueError("Invalid worker token")
         if not isinstance(model, str) or not model or not re.fullmatch(r"[0-9a-f]{64}", system_digest):
@@ -272,11 +272,13 @@ class TurnBroker(_TextBroker):
         self._worker_token = worker_token.encode("ascii")
         self._model = model
         self._system_digest = system_digest
+        self._normalized_label = normalized_label
         super().__init__(address, proof, authorized=authorized, port=port)
 
     def _request(self, client, deadline):
         body = protocol.request_body(client, deadline, self._port, worker_token=self._worker_token)
-        protocol.accept_text(body, model=self._model, system_digest=self._system_digest)
+        protocol.accept_text(body, model=self._model, system_digest=self._system_digest,
+                             normalized_label=self._normalized_label)
         return body
 
     def _answer(self):

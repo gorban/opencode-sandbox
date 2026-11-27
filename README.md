@@ -83,6 +83,10 @@ security-key options and teardown.
 
 ## Guides
 
+### Experimental Gemini text shell
+
+[Use a named Google subscription in the restricted OpenCode shell.](docs/subscriptions.md#gemini-text-shell)
+
 ### Parallel instances
 
 [Start parallel instances and create Git worktrees.](docs/operations.md#parallel-instances)

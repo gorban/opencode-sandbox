@@ -13,8 +13,8 @@ from .oauth_exchange import (
     validate_enrollment_grant,
 )
 from .token_diagnostic import (
-    CurrentTierDetail, LoadBodyReason, OriginalProjectDetail, PostTokenStage, ScopedPostTokenDiagnostic,
-    TokenDiagnostic, observe_post_token,
+    CurrentTierDetail, FirstUseOfferDetail, LoadBodyReason, OriginalProjectDetail, PostTokenStage,
+    ScopedPostTokenDiagnostic, TokenDiagnostic, observe_post_token,
 )
 
 
@@ -254,6 +254,22 @@ def _original_project_detail(fields, project):
     return OriginalProjectDetail.IDENTIFIER_SHAPE
 
 
+def _first_use_offer(fields, reasons):
+    """Classify the exact offline-measured offer shape without choosing a tier."""
+    if reasons != [LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT]:
+        return FirstUseOfferDetail.UNVERIFIED
+    allowed = fields.get("allowedTiers")
+    if allowed is None or not allowed:
+        return FirstUseOfferDetail.ABSENT
+    if len(allowed) != 1 or any(row["tierId"] == "free-tier" for row in fields.get("ineligibleTiers") or ()):
+        return FirstUseOfferDetail.UNVERIFIED
+    tier = allowed[0]
+    if (tier["id"] == "free-tier" and _valid_tier({"id": tier["id"], "name": tier.get("name")})
+            and not _nonpersonal_tier(tier) and tier.get("isDefault", True) is True):
+        return FirstUseOfferDetail.PERSONAL_OFFER
+    return FirstUseOfferDetail.UNVERIFIED
+
+
 def project_load_reply(body) -> VerifiedLoadReply:
     """Keep legacy bytes or project an already complete personal LOAD result."""
     try:
@@ -282,6 +298,8 @@ def project_load_reply(body) -> VerifiedLoadReply:
         error = _load_body_refused(reasons)
         if LoadBodyReason.CURRENT_TIER in reasons and LoadBodyReason.ORIGINAL_PROJECT in reasons:
             error.load_account_details = _current_tier_detail(fields, current), _original_project_detail(fields, project)
+            if error.load_account_details == (CurrentTierDetail.ABSENT, OriginalProjectDetail.ABSENT):
+                error.first_use_offer = _first_use_offer(fields, reasons)
         raise error
     projected = {"currentTier": _retained_tier(current), "cloudaicompanionProject": project}
     if paid is not None:

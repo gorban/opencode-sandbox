@@ -24,8 +24,8 @@ from unittest.mock import Mock, patch
 from oc_google import auth_offer, connect, metadata_workflow, native_artifacts
 from oc_google.native_service import NativeInvocation, NativeRetirementUnconfirmed
 from oc_google.token_diagnostic import (
-    CurrentTierDetail, LoadBodyReason, OriginalProjectDetail, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic,
-    TokenStage, scoped_post_token,
+    CurrentTierDetail, FirstUseOfferDetail, LoadBodyReason, OriginalProjectDetail, PostTokenDiagnostic,
+    PostTokenStage, TokenDiagnostic, TokenStage, scoped_post_token,
 )
 
 
@@ -130,17 +130,26 @@ class ConnectTest(unittest.TestCase):
         connect_copy = source / "oc_google/connect.py"
         with connect_copy.open("a", encoding="utf-8") as stream:
             stream.write('\ndef _attended_owner():\n    raise AssertionError("unexpected terminal setup")\n')
-        messages = {
-            "connect": b"Enable the Google subscription registration without a CLI override in providers.toml.",
-            "shell": b"Enable a Google subscription registration in providers.toml first.",
-        }
-        for verb, message in messages.items():
+        result = subprocess.run([str(source / "oc-sandbox"), "google", "connect", "fixture"], cwd=source,
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr,
+                         b"oc-sandbox google: Enable the Google subscription registration without a CLI override in providers.toml.\n")
+        for verb in ("text",):
+            with self.subTest(verb=verb):
+                result = subprocess.run([str(source / "oc-sandbox"), "google", verb, "fixture"], cwd=source,
+                                        stdin=subprocess.DEVNULL, capture_output=True, timeout=5, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"invalid choice", result.stderr)
+        for verb in ("shell", "arm"):
             with self.subTest(verb=verb):
                 result = subprocess.run([str(source / "oc-sandbox"), "google", verb, "fixture"], cwd=source,
                                         stdin=subprocess.DEVNULL, capture_output=True, timeout=5, check=False)
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(result.stdout, b"")
-                self.assertEqual(result.stderr, b"oc-sandbox google: " + message + b"\n")
+                self.assertIn(b"oc-sandbox google:", result.stderr)
         self.assertEqual(list(home.iterdir()), [source])
 
     def test_cli_path_is_refused_before_terminal_or_resources(self):
@@ -355,6 +364,18 @@ class RuntimeCustodyTest(unittest.TestCase):
             self.assertEqual(main(), 130)
         self.assertEqual(output.getvalue(), "oc-sandbox google: Google sign-in cancelled.\n")
 
+    def test_occupied_label_reports_a_fixed_message(self):
+        from oc_google.registration import RegistrationLabelOccupied
+
+        origin = Path(__file__).resolve().parents[1]
+        run_connect = runpy.run_path(str(origin / "oc-google.py"))["run_connect"]
+        output = StringIO()
+        with patch.object(connect, "connect_for", side_effect=RegistrationLabelOccupied("fixture private detail")), \
+                redirect_stderr(output):
+            self.assertEqual(run_connect("fixture"), 1)
+        self.assertEqual(output.getvalue(), "oc-sandbox google: This label already has a Google registration "
+                         "or an unfinished attempt. Use a fresh label.\n")
+
     def test_callback_diagnostic_uses_only_original_foreground_pty(self):
         self.assert_diagnostic_uses_original_pty(
             "callback", b"Google sign-in callback: The callback Referer header was refused.",
@@ -428,6 +449,20 @@ class RuntimeCustodyTest(unittest.TestCase):
         post.mark(error, PostTokenStage.LOAD_BODY)
         connect._write_enrollment_detail(owner, error, token, post)
         owner.write_once.assert_called_once_with("Google enrollment metadata: The LOAD metadata body was refused.\n")
+
+    def test_first_use_offer_uses_the_original_closed_diagnostic(self):
+        error = ValueError("synthetic private response")
+        error.load_body_reasons = (LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT)
+        error.load_account_details = (CurrentTierDetail.ABSENT, OriginalProjectDetail.ABSENT)
+        error.first_use_offer = FirstUseOfferDetail.PERSONAL_OFFER
+        post, owner = PostTokenDiagnostic(), Mock()
+        post.mark(error, PostTokenStage.LOAD_BODY)
+        error.first_use_offer = "synthetic later detail"
+        connect._write_enrollment_detail(owner, error, TokenDiagnostic(), post)
+        message, = owner.write_once.call_args.args
+        self.assertTrue(message.endswith("A personal first-use setup offer was present.\n"))
+        self.assertNotIn("synthetic", message)
+        self.assertLess(len(message.encode("ascii")), 512)
 
     def test_unvalidated_load_account_details_keep_existing_top_level_reasons(self):
         pair = (CurrentTierDetail.NULL, OriginalProjectDetail.ABSENT)

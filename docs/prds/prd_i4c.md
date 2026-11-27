@@ -65,6 +65,63 @@ process and container retirement. A separate fake authorization-code exchange pr
 an owner-only credential file and reopened it from a fresh isolated process with zero
 prompts.
 
+The live pytest in [test_google_text_e2e.py](../../tests/e2e/live/test_google_text_e2e.py)
+exercises stock OpenCode 2.3.0 through the workstation's cached `agy acp` 1.5.15 login.
+`--run-google-opencode-live` selects the OpenCode check and `--run-google-text-live`
+selects the direct ACP check. Pytest asks once, before running the selected cases. Each
+case sends one fixed Hydrogen prompt after approval. The automated OpenCode check reads
+`[providers.google.elgoog]` from a scratch TOML and verifies the display
+`gemini-4-hydrogen - elgoog [subscription]`, exact `ok`, replay refusal and retirement.
+The configured label identifies a provider instance. The subscription always uses the
+workstation's credential custody and upstream connection, independent of the worker's location.
+Normal launcher integration, multiple configured providers in the same session, and
+qualification of provider-side tool and retry behavior remain open.
+
+The first public shell, `oc-sandbox google shell LABEL`, loads the named enabled Google
+subscription entry from trusted `providers.toml`. It presents the selected model and the
+one permitted prompt before the second-terminal arm. The worker displays
+`MODEL - LABEL [subscription]` in the stock OpenCode picker. The worker and relay have no
+native login or keyring. The workstation launches the pinned `agy acp` process with a
+private home and opens the previously authenticated session before permitting the first
+turn. ACP frames use the documented editor client protocol while `clientInfo` states the
+actual `oc-sandbox` client. Native tools are disabled in the test profile, client tool
+callbacks are refused, and no client identity is impersonated.
+
+The local public-path check used trusted `[providers.google.elgoog]` with
+`enabled = true`, `auth_mode = "subscription"`, and
+`default_model = "gemini-4-hydrogen"`. `oc-sandbox google shell elgoog` opened the stock
+OpenCode picker, displayed `gemini-4-hydrogen - elgoog [subscription]`, and returned
+exact `ok` after `oc-sandbox google arm RUN_ID` in a second terminal. Both containers and
+the private run directory retired. The label is configurable: the implementation
+accepts any enabled Google subscription label with the qualified Hydrogen model.
+The broker checks that exactly two occurrences of the configured label normalize to
+the measured `elgoog` system transcript before admitting a turn. A second live run
+with a temporary `custom-google` label initially failed at that check, then returned
+exact `ok` after the bounded substitution was added. The temporary provider entry was
+removed after verified cleanup.
+The opt-in [public shell live test](../../tests/e2e/live/test_google_text_e2e.py)
+uses `--run-google-public-shell-live` and one collection-time approval. It requires a
+cached workstation Antigravity login and an enabled `elgoog` entry for that test fixture.
+Ordinary test and CI runs skip it.
+
+This public slice admits only the measured Hydrogen model and exact one-turn
+OpenCode transcript. The broker validates the selected route and fixed prompt, spends
+one approval under the owner fence, buffers the native text until terminal completion,
+and retires the native process before returning `ok`. Replay and changed inputs are
+refused. An uncertain turn retains no authority to send another prompt. A later adapter
+will join the default multi-provider session after the account binding, spend journal,
+and original worker incarnation conditions below are qualified. The general route
+must bind consent to a verified account and authorization mode, recheck it before the
+first prompt write, persist the approval as spent before that write, and bind delivery
+to the original worker connection and slot. Google exhaustion must leave an authorized
+OpenAI slot usable.
+
+Google's [Antigravity FAQ](https://antigravity.google/docs/faq#why-cant-i-use-third-party-software-such-as-claude-code-openclaw-or-opencode-with-my-antigravity-login)
+calls out OpenCode. The operator may choose this experimental local route with the
+known account risk. Release documentation should describe that risk and the supported
+Gemini API-key path. The product must respect provider authentication and entitlement
+responses and avoid changing client identity to alter those responses.
+
 The pinned standalone fixture's cold refresh used the same client ID and the same three
 scopes as enrollment. The local metadata controller now joins the initial and cold
 request parsers to the durable profile and checks owner authority before a destination
@@ -87,13 +144,32 @@ The command presents link-only consent on the verified foreground terminal.
 A copied-launcher fixture ran the pinned native process, recorded seven ordered fake
 metadata operations across sign-in and a fresh reopen, and verified both native
 retirements. The resulting local observation grants no invocation authority.
-Attended sign-in and exact public endpoint behavior remain to be qualified.
+The attended Chrome run completed the authorization callback after a successful
+official `agy acp --login`. The standalone metadata response still omitted both
+the current tier and companion project. The broker refused enrollment and the
+registration remained incomplete. The refusal now distinguishes the shape of a
+personal first-use offer using fixed categories. A separate offline test of the
+pinned standalone build observed native setup and a subsequent metadata reload.
+The live account's first-use eligibility remains unknown.
+
+The attended test in `tests/e2e/live/test_google_text_e2e.py` exercises a separate path using the
+workstation's existing official `agy acp` personal login. It opened a private native session
+using the pinned CLI 1.5.15 and an empty, read-only workspace. The broker closed the Secret
+Service proxy before the prompt. A live `gemini-4-neon` turn returned exact `ok` and a terminal
+ACP event with no tool calls reported. This proves one ACP prompt and the text result. Native
+provider requests and billing remain opaque. The driver presents foreground consent and accepts
+only its fixed prompt. Normal sandbox and orchestrator launch remain the intended OpenCode entry
+points for named Google subscriptions.
 
 - [x] Demonstrate one text-only OpenCode turn through the bundled ACP peer
   (`codex/antigravity-acp-text-proxy`). The pinned worker returned exact `ok` in devbox.
   The peer counted one prompt, replay was refused, and cleanup was verified. Offline controls
   observed zero prompts when revocation won before admission and zero answer bytes when
   the peer emitted early text or a callback.
+- [x] Qualify the first public, fixed-text Hydrogen shell on `codex/gemini-public-shell`.
+  The live stock OpenCode picker selected a named subscription, two configured labels returned
+  exact `ok` through the cached workstation ACP login, and worker, relay and run cleanup passed.
+  Preserve the opt-in live regression and the ordinary no-inference test default.
 - [ ] Qualify the pinned `agy` binary, rootless private provider home and keyring, bounded ACP
   channel, and separately scoped enrollment and execution egress. Verify the provider cannot
   access ordinary workstation credentials. Verify that the worker and relay get only the approved
@@ -109,6 +185,11 @@ Attended sign-in and exact public endpoint behavior remain to be qualified.
   identifiers, browser state, codes and credentials outside the worker. Keep enrollment
   limited to authentication and metadata. Test cancellation, expiration, subject replacement,
   and denial of non-subscription fallback. Preserve the ordinary Antigravity login.
+- [ ] Qualify a separately authorized native first-use setup path for the standalone ACP
+  build. Require a verified personal offer, keep the vendor request bound to the same
+  account and enrollment, and cap setup to one mutation and bounded status checks. Require
+  Google's completed tier and project metadata before cold verification. A missing or
+  contradictory offer leaves enrollment unavailable.
 - [ ] From a fresh process in the same qualified placement, negotiate ACP and open a session
   in an empty scratch directory with no MCP servers. Verify only `initialize` and `session/new`
   were sent, zero tool grants, bounded redacted output and cleanup. A signed-out profile must
@@ -120,6 +201,23 @@ Attended sign-in and exact public endpoint behavior remain to be qualified.
   mode `AUTO` and requested 65,535 output tokens in the measured turn. A typed candidate
   projection to `NONE` and 64 output tokens passed offline validation. Establish the public
   endpoint behavior before offering inference.
+
+### Native first-use walkthrough for review
+
+1. Bind the verified Google account and native process to the attended enrollment. If the
+   first metadata response already contains the tier and project, continue to the existing
+   cold check.
+2. If Google returns an unambiguous personal first-use offer, ask for separate foreground
+   consent before opening additional routes. Explain the provider-side enrollment effect.
+   Absent, contradictory, enterprise, project-selection, or paid-plan-change requirements
+   stop the enrollment.
+3. The pinned native process must originate the setup request. Recheck the account, process,
+   consent, and observed offer immediately before reserving its single write. Poll only the
+   returned operation under a deadline. An ambiguous write leaves a held receipt and cannot
+   retry automatically.
+4. Re-read Google metadata. Require the completed tier and project and continuity of any
+   earlier paid-tier evidence. Retire the initial process, then require the existing fresh
+   zero-prompt cold check. Failed or denied setup publishes no launchable provider.
 
 [Antigravity ACP authentication](https://antigravity.google/docs/ide/extensions/acp/#authentication)
 

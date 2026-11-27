@@ -96,7 +96,7 @@ def bad_constant(_value):
     raise Refused()
 
 
-def accept_text(body, *, model=MODEL, system_digest=None):
+def accept_text(body, *, model=MODEL, system_digest=None, normalized_label=None):
     data = json.loads(body.decode("utf-8"), object_pairs_hook=unique, parse_constant=bad_constant)
     if not isinstance(data, dict):
         raise Refused()
@@ -110,6 +110,16 @@ def accept_text(body, *, model=MODEL, system_digest=None):
             or not isinstance(system["content"], str)):
         raise Refused()
     normalized, count = SYSTEM_DATE.subn("Today's date: [date]", system["content"])
+    if normalized_label is not None:
+        if (type(normalized_label) is not tuple or len(normalized_label) != 2
+                or any(type(label) is not str or len(label) > 32
+                       or not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", label)
+                       for label in normalized_label)):
+            raise Refused()
+        source_label, baseline_label = normalized_label
+        if normalized.count(source_label) != 2:
+            raise Refused()
+        normalized = normalized.replace(source_label, baseline_label)
     digest = SYSTEM_DIGEST if system_digest is None else system_digest
     if count != 1 or hashlib.sha256(normalized.encode()).hexdigest() != digest:
         raise Refused()

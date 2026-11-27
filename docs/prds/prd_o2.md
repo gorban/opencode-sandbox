@@ -149,6 +149,16 @@ before committing to hosted Tier 1 gating:
 The maintainer asked whether we will need API keys as GitHub Actions secrets for basic inference
 tests.
 
+Use the lowest-cost model verified to support the behavior the smoke test exercises. Pin that
+model in the test so the requested route and usage scope can be reviewed. A model-picker,
+capability, or compatibility test can pin a different model when the distinction is under test.
+
+Approve real-resource tests once for the selected pytest cases before execution. The approval
+lists the resource, authentication type and maximum test actions. The cases then run without
+operator input. Default runs skip live tests. Workstation subscriptions use local consent.
+Dedicated API keys and disposable remote SSH fixtures may use a separately authorized GitHub
+Environment. Keep remote fixtures outside the PR execution boundary and verify teardown.
+
 ### Direct answer
 
 - **For Tier 0 PR checks and Tier 1 container integration:** **No.** All unit, contract, broker,

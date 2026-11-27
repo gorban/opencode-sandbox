@@ -27,8 +27,8 @@ from .native_namespace import public_certificate
 from .native_service import NativeRetirementUnconfirmed, retain_cleanup_failure
 from .registration import RegistrationJournal, _absent, _DIRECTORY, _write_private
 from .token_diagnostic import (
-    CurrentTierDetail, LoadBodyReason, OriginalProjectDetail, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic,
-    TokenStage,
+    CurrentTierDetail, FirstUseOfferDetail, LoadBodyReason, OriginalProjectDetail, PostTokenDiagnostic,
+    PostTokenStage, TokenDiagnostic, TokenStage,
 )
 
 
@@ -141,6 +141,11 @@ _ORIGINAL_PROJECT_DETAILS = {
     OriginalProjectDetail.WRONG_TYPE: "a wrong type",
     OriginalProjectDetail.IDENTIFIER_SHAPE: "a refused identifier shape",
 }
+_FIRST_USE_OFFER_DETAILS = {
+    FirstUseOfferDetail.PERSONAL_OFFER: "A personal first-use setup offer was present.",
+    FirstUseOfferDetail.ABSENT: "No personal first-use setup offer was present.",
+    FirstUseOfferDetail.UNVERIFIED: "A personal first-use setup offer could not be verified.",
+}
 
 
 class ConnectError(RuntimeError):
@@ -192,6 +197,9 @@ def _write_enrollment_detail(owner, error, token_diagnostic, post_diagnostic):
                     tier, project = account
                     detail += (f" Current tier check found {_CURRENT_TIER_DETAILS[tier]}."
                                f" Original project check found {_ORIGINAL_PROJECT_DETAILS[project]}.")
+                offer = post_diagnostic.first_use_offer(error)
+                if offer is not None:
+                    detail += " " + _FIRST_USE_OFFER_DETAILS[offer]
     else:
         return
     with suppress(OSError, ConnectError):

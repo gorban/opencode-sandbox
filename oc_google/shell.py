@@ -40,7 +40,7 @@ RELAY_SOURCE = Path(__file__).absolute().parents[1] / "oc_orchestrator/relay.py"
 
 def project(target, worker_token):
     scope = scoped_provider_id("google", target.label)
-    display = f"google/{target.label}"
+    display = target.label
     deny = [{"action": "*", "resource": "*", "effect": "deny"}]
     policies = [{"action": action, "resource": "*", "effect": "deny"}
                 for action in ("provider.use", "integration.connect", "mcp.use", "skill.use", "websearch.use")]
@@ -279,7 +279,9 @@ def run_placed(target, placement, workspace, parent, directory, lifeline, shell_
     pinned_name(workspace, parent, directory)
     with (ExitStack() as peer_scope,
           TurnBroker(workspace / "relay" / "provider.sock", proof, authorized=authorized, worker_token=worker_token,
-                     model=target.model, system_digest=target.system_digest) as broker,
+                     model=target.model, system_digest=target.system_digest,
+                     normalized_label=(target.label, target.system_baseline_label)
+                     if hasattr(target, "system_baseline_label") else None) as broker,
           lifeline.revoke_on_loss(broker.revoke)):
         worker, relay = create_pair(placement)
         lifeline.check()

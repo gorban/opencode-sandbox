@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the normal Google shell command on the qualified host with a bundled fake ACP peer."""
+"""Exercise an isolated OpenCode shell with an explicit test peer."""
 
 import argparse
 import hashlib
@@ -21,14 +21,21 @@ PEER_FILES = ("acp_fixture.py", "acp_readiness.py", "acp_text_peer.py", "acp_tex
 ENTRY = "oc-google.py"
 MODEL = "gemini-2.5-pro"
 LABEL = "fixture"
-DISPLAY = f"{MODEL} - google/{LABEL} [subscription]"
+NATIVE_MODEL = "gemini-4-hydrogen"
+NATIVE_LABEL = "elgoog"
 PROMPT = "Reply with exactly: ok"
-SYSTEM_DIGEST = "9a3d1b7338b6df44a532258f845327acdbabfe7b0671c2089fa0ef8f9dc1bf6a"
+SYSTEM_DIGEST = "cd7021db39cf648e085a4dc4ff92e3879c87bd384fc2d33cc5f99c0092dbe74a"
+# OpenCode's normalized system message includes the selected model and provider IDs.
+NATIVE_SYSTEM_DIGEST = "5e9e60d4323abaec8d0a7d4dc4f0257da8ed1f647f7d48f4a39078e8cfd2d99c"
 RUN_PATTERN = re.compile(r"Google shell run ([0-9a-f]{32})\.")
 ENV = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "TERM": "xterm-256color", "LANG": "C.UTF-8"}
 
 
-def snapshot_inputs():
+class FixtureError(RuntimeError):
+    """A fixed diagnostic for a failed OpenCode fixture check."""
+
+
+def snapshot_inputs(native=False):
     paths = [Path("oc-sandbox"), Path(ENTRY)]
     for package in PACKAGES:
         paths.extend(path.relative_to(ROOT) for path in (ROOT / package).glob("*.py"))
@@ -51,14 +58,38 @@ def substitute(source, original, replacement):
 def fixture_sources(files, scene):
     files = files.copy()
     cli = files[ENTRY].decode("utf-8")
-    cli = substitute(cli, "CONFIG_DIR = None", 'CONFIG_DIR = SOURCE_ROOT.parent / "config"')
-    cli = substitute(cli, '        "route.py", "shell.py",\n    ),',
-                     '        "route.py", "shell.py", "fixture_peer.py",\n    ),')
-    cli = substitute(cli,
-                     '    raise GoogleUnavailable("This Google subscription route has yet to qualify for native inference.")',
-                     '    from oc_google.fixture_peer import target\n    return target(spec)')
+    cli = substitute(cli, '        "route.py", "shell.py", "native_text.py", "token_diagnostic.py",\n    ),',
+                     '        "route.py", "shell.py", "native_text.py", "token_diagnostic.py", "fixture_peer.py",\n    ),')
+    model, label = (NATIVE_MODEL, NATIVE_LABEL) if scene == "native" else (MODEL, LABEL)
+    cli = substitute(cli, "    from oc_google.native_text import target_from_config\n",
+                     "    from oc_google.fixture_peer import target_from_config\n")
     files[ENTRY] = cli.encode("utf-8")
-    files["oc_google/fixture_peer.py"] = f"""
+    if scene == "native":
+        files["oc_google/fixture_peer.py"] = f"""
+from oc_google.native_text import open_opencode_session
+from oc_providers.config import load_provider_config
+from pathlib import Path
+
+def target_from_config(label):
+    from types import SimpleNamespace
+    from functools import partial
+    config = load_provider_config(config_dir=Path(__file__).resolve().parents[2] / "config")
+    instance = config.get("google", label) if config else None
+    if instance is None or not instance.enabled or instance.auth_mode != "subscription":
+        raise ValueError("The test subscription is not enabled.")
+    model = instance.default_model
+    if (label, model) != ({label!r}, {model!r}):
+        raise ValueError("The test model transcript has not been measured.")
+    return SimpleNamespace(label=label, model=model, system_digest={NATIVE_SYSTEM_DIGEST!r},
+                           open_session=partial(open_opencode_session, model))
+""".lstrip().encode()
+    else:
+        files["oc_google/fixture_peer.py"] = fake_peer_source(scene)
+    return files
+
+
+def fake_peer_source(scene):
+    return f"""
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,6 +101,7 @@ ROOT = SOURCE.parent
 sys.path.append(str(SOURCE / {str(SPIKE)!r}))
 import acp_readiness
 import acp_text_session
+from oc_providers.config import load_provider_config
 
 
 @contextmanager
@@ -84,18 +116,25 @@ def open_session(cancelled):
         {{"prompts": session.prompt_count, "state": result.readiness.value}}))
 
 
-def target(spec):
-    return SimpleNamespace(label=spec.label, model={MODEL!r}, system_digest={SYSTEM_DIGEST!r},
+def target_from_config(label):
+    config = load_provider_config(config_dir=ROOT / "config")
+    instance = config.get("google", label) if config else None
+    if instance is None or not instance.enabled or instance.auth_mode != "subscription":
+        raise ValueError("The test subscription is not enabled.")
+    model = instance.default_model
+    if (label, model) != ({LABEL!r}, {MODEL!r}):
+        raise ValueError("The test model transcript has not been measured.")
+    return SimpleNamespace(label=label, model=model, system_digest={SYSTEM_DIGEST!r},
                            open_session=open_session)
 """.lstrip().encode()
-    return files
 
 
-def write_fixture(files, tree, private, expected):
+def write_fixture(files, tree, private, expected, label, model):
     config = private / "config"
     config.mkdir(mode=0o700)
     source = config / "providers.toml"
-    source.write_text(f'[providers.google.{LABEL}]\nenabled = true\nauth_mode = "subscription"\n')
+    source.write_text(f'[providers.google.{label}]\nenabled = true\nauth_mode = "subscription"\n'
+                      f'default_model = "{model}"\n')
     source.chmod(0o600)
     tree.mkdir(mode=0o700)
     for name, data in files.items():
@@ -143,7 +182,7 @@ class Terminal:
             if history and "Fixture exit" in screen:
                 break
             time.sleep(.1)
-        raise RuntimeError(f"Waiting for {description}\n{self.screen(name, history)}")
+        raise FixtureError(f"The OpenCode fixture did not observe {description}.")
 
     def close(self):
         self.run("kill-server", check=False)
@@ -178,37 +217,39 @@ with socket.socket() as sock:
                     str(source), relay, command), env=ENV, check=True, timeout=12)
 
 
-def exact_answer(screen):
+def exact_answer(screen, display):
     rows = [line.strip(" │┃") for line in screen.splitlines()]
     prompt = [index for index, row in enumerate(rows) if row.startswith(PROMPT)]
     answer = [index for index, row in enumerate(rows) if row == "ok"]
     if len(prompt) != 1 or len(answer) != 1 or not prompt[0] < answer[0] <= prompt[0] + 6:
         return False
     end = rows[answer[0] + 1:answer[0] + 5]
-    return any(row.startswith(f"Restricted-Text · {DISPLAY} · ") for row in end)
+    return any(row.startswith(f"Restricted-Text · {display} · ") for row in end)
 
 
-def selected_model(screen):
+def selected_model(screen, model, label):
     return "Select model" not in screen and any(
-        MODEL in row and f"[subscription] google/{LABEL}" in row for row in screen.splitlines()
+        model in row and f"[subscription] {label}" in row for row in screen.splitlines()
     )
 
 
 def drive(term, launcher, private, scene):
-    term.start("shell", launcher, "shell", LABEL)
+    model, label = (NATIVE_MODEL, NATIVE_LABEL) if scene == "native" else (MODEL, LABEL)
+    display = f"{model} - {label} [subscription]"
+    term.start("shell", launcher, "shell", label)
     run_id = None
     try:
         screen = term.await_screen("shell", RUN_PATTERN.search, "run identity", history=True)
         run_id = RUN_PATTERN.search(screen)[1]
         term.await_screen("shell", lambda s: "Ask anything" in s, "the OpenCode input")
         term.keys("shell", "C-x", "m")
-        term.await_screen("shell", lambda s: "Select model" in s and DISPLAY in s, "the Gemini picker row")
+        term.await_screen("shell", lambda s: "Select model" in s and display in s, "the Gemini picker row")
         term.keys("shell", "Enter")
         selected = term.await_screen("shell", lambda s: "Select model" not in s
-                                     and ("Select variant" in s or selected_model(s)), "selected Gemini model")
+                                     and ("Select variant" in s or selected_model(s, model, label)), "selected Gemini model")
         if "Select variant" in selected:
             term.keys("shell", "Escape")
-            term.await_screen("shell", lambda s: "Select variant" not in s and selected_model(s),
+            term.await_screen("shell", lambda s: "Select variant" not in s and selected_model(s, model, label),
                               "dismissed variant picker")
         check_prearm_listener(run_id, Path(launcher).parent)
         if (private / "peer").exists():
@@ -218,28 +259,32 @@ def drive(term, launcher, private, scene):
         term.type_line("arm", "arm")
         term.await_screen("arm", lambda s: "Fixture exit 0" in s, "successful arming", history=True)
         term.start("replay", launcher, "arm", run_id)
-        term.await_screen("replay", lambda s: "Google shell arm is unavailable" in s and "Fixture exit 1" in s,
+        term.await_screen("replay", lambda s: "oc-sandbox google: The shell arm did not complete." in s
+                          and "Fixture exit 1" in s,
                           "duplicate approval refusal", history=True)
         term.type_line("shell", PROMPT)
-        if scene == "ready":
-            term.await_screen("shell", exact_answer, "the exact assistant reply")
+        if scene != "bad-receipt":
+            term.await_screen("shell", lambda s: exact_answer(s, display), "the exact assistant reply", timeout=50)
             term.keys("shell", "C-x", "n")
             term.await_screen("shell", lambda s: "Ask anything" in s and PROMPT not in s,
                               "fresh conversation for exact request replay")
             term.type_line("shell", PROMPT)
             term.await_screen("shell", lambda s: "Provider request failed with HTTP 403" in s,
                               "HTTP refusal of the repeated first prompt")
-            term.keys("shell", "C-c", "C-c")
-            term.await_screen("shell", lambda s: "Fixture exit 0" in s, "ordinary shell exit", history=True)
+            if scene != "native":
+                term.keys("shell", "C-c", "C-c")
+                term.await_screen("shell", lambda s: "Fixture exit 0" in s, "ordinary shell exit", history=True)
         else:
             screen = term.await_screen("shell", lambda s: "Fixture exit 1" in s, "refusal of invalid ACP evidence",
                                        history=True)
-            if exact_answer(screen):
+            if exact_answer(screen, display):
                 raise RuntimeError("The shell displayed an answer after invalid ACP evidence")
     finally:
         term.close()
         if run_id:
             wait_for_cleanup(run_id)
+    if scene == "native":
+        return
     peer = json.loads((private / "peer-evidence").read_text())
     expected = "ready" if scene == "ready" else "needs_verify"
     if peer != {"prompts": 1, "state": expected}:
@@ -262,12 +307,18 @@ def main():
         return
     if actual != expected:
         raise SystemExit("Google shell fixture manifest changed")
+    run_projection(projected, args.fixture_sha256, args.scene)
+    print(f"Verified stock OpenCode through the private Google shell fixture ({args.scene}).")
+
+
+def run_projection(projected, projection_digest, scene):
     private = Path(tempfile.mkdtemp(prefix=".gsh-", dir=Path.home()))
     tree = private / "source"
     try:
-        write_fixture(projected, tree, private, args.fixture_sha256)
-        print(f"Fixture source {args.fixture_sha256}", flush=True)
-        drive(Terminal(private), str(tree / "oc-sandbox"), private, args.scene)
+        model, label = (NATIVE_MODEL, NATIVE_LABEL) if scene == "native" else (MODEL, LABEL)
+        write_fixture(projected, tree, private, projection_digest, label, model)
+        print(f"Fixture source {projection_digest}", flush=True)
+        drive(Terminal(private), str(tree / "oc-sandbox"), private, scene)
     finally:
         if (private / "peer/readiness-inflight.json").exists():
             print(f"Retained the unresolved fixture evidence in {private}", flush=True)
@@ -276,7 +327,6 @@ def main():
                 if path.is_dir():
                     path.chmod(0o700)
             shutil.rmtree(private)
-    print(f"Verified stock OpenCode through the public Google shell command ({args.scene}).")
 
 
 if __name__ == "__main__":

@@ -94,6 +94,12 @@ class OriginalProjectDetail(Enum):
     IDENTIFIER_SHAPE = auto()
 
 
+class FirstUseOfferDetail(Enum):
+    PERSONAL_OFFER = auto()
+    ABSENT = auto()
+    UNVERIFIED = auto()
+
+
 def _load_reasons(error):
     try:
         reasons = getattr(error, "load_body_reasons", None)
@@ -124,7 +130,7 @@ class PostTokenDiagnostic:
 
     _failure: tuple[
         Exception, PostTokenStage, BaseException | None, tuple[LoadBodyReason, ...],
-        tuple[CurrentTierDetail, OriginalProjectDetail] | None,
+        tuple[CurrentTierDetail, OriginalProjectDetail] | None, FirstUseOfferDetail | None,
     ] | None = field(default=None, init=False, repr=False)
 
     def __reduce_ex__(self, _protocol):
@@ -133,7 +139,14 @@ class PostTokenDiagnostic:
     def mark(self, error, stage):
         if self._failure is None and isinstance(error, Exception) and type(stage) is PostTokenStage:
             reasons = _load_reasons(error) if stage is PostTokenStage.LOAD_BODY else ()
-            self._failure = error, stage, error.__context__, reasons, _load_account_details(error, reasons)
+            account = _load_account_details(error, reasons)
+            offer = None
+            if account == (CurrentTierDetail.ABSENT, OriginalProjectDetail.ABSENT):
+                with suppress(Exception):
+                    candidate = getattr(error, "first_use_offer", None)
+                    if type(candidate) is FirstUseOfferDetail:
+                        offer = candidate
+            self._failure = error, stage, error.__context__, reasons, account, offer
 
     def stage(self, error):
         failure = self._failure
@@ -154,6 +167,12 @@ class PostTokenDiagnostic:
         failure = self._failure
         if failure is not None and self.stage(error) is PostTokenStage.LOAD_BODY:
             return failure[4]
+        return None
+
+    def first_use_offer(self, error):
+        failure = self._failure
+        if failure is not None and self.stage(error) is PostTokenStage.LOAD_BODY:
+            return failure[5]
         return None
 
 

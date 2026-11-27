@@ -24,7 +24,7 @@ from oc_orchestrator.claude_protocol import (
     select_native, validate_sdk, validate_turn_output,
 )
 from oc_orchestrator.owner import Lifeline
-from oc_orchestrator.protocol import OPTIONS, PROMPT, RecordingFake, accept_text
+from oc_orchestrator.protocol import OPTIONS, PROMPT, RecordingFake, Refused, accept_text
 from oc_orchestrator.relay import handoff
 from oc_orchestrator.runtime import Failure, Placement, container_categories, verify_result
 
@@ -38,6 +38,27 @@ TEST_DIGEST = hashlib.sha256(b"Fixture system content.\nToday's date: [date]").h
 def payload(**changes):
     return {**OPTIONS, "messages": [{"role": "system", "content": SYSTEM},
                                     {"role": "user", "content": PROMPT}], **changes}
+
+
+class NamedProviderSystemTest(unittest.TestCase):
+    def test_measured_transcript_accepts_only_the_named_label_substitution(self):
+        baseline = "Provider google/elgoog; selected label elgoog.\nToday's date: [date]"
+        actual = baseline.replace("elgoog", "custom-google").replace("[date]", "Tue Nov 24 2026")
+        digest = hashlib.sha256(baseline.encode()).hexdigest()
+        request = payload(messages=[{"role": "system", "content": actual},
+                                    {"role": "user", "content": PROMPT}])
+        accept_text(json.dumps(request).encode(), system_digest=digest,
+                    normalized_label=("custom-google", "elgoog"))
+        for broken in (
+            actual.replace("selected label custom-google", "selected label wrong"),
+            actual.replace("selected label custom-google", "selected label custom-google extra"),
+            actual.replace("selected label custom-google", "selected label"),
+        ):
+            with self.subTest(broken=broken), self.assertRaises(Refused):
+                modified = payload(messages=[{"role": "system", "content": broken},
+                                             {"role": "user", "content": PROMPT}])
+                accept_text(json.dumps(modified).encode(), system_digest=digest,
+                            normalized_label=("custom-google", "elgoog"))
 
 
 @contextmanager

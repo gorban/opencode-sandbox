@@ -82,6 +82,7 @@ class PortableTests(unittest.TestCase):
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_google_metadata_workflow.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_google_native_artifacts.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_google_native_browser.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_google_native_cli_text.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_google_native_enrollment_acp.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_google_native_generation_transcript.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_google_native_namespace.py'),

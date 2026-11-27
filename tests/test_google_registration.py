@@ -102,8 +102,10 @@ class RegistrationTests(unittest.TestCase):
         with self.assertRaises(registration.RegistrationUnavailable):
             with self.journal.enrollment_profile(enrolled):
                 self.fail("enrollment started twice")
-        with self.assertRaises(registration.RegistrationUnavailable):
+        saved = self.journal.status()
+        with self.assertRaises(registration.RegistrationLabelOccupied):
             self.journal.begin(BUILD)
+        self.assertEqual(self.journal.status(), saved)
         for path in (self.root, self.slot, self.profile_path(enrolled)):
             self.assertEqual(path.stat().st_mode & 0o777, 0o700)
         for path in (self.lock, self.receipt):

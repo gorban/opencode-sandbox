@@ -8,7 +8,7 @@ import unittest
 from oc_google.account_binding import bind_subject
 from oc_google.enrollment import EnrollmentMetadataError, LoadObservation, _LoadCodeAssist
 from oc_google.metadata_destination import MetadataRoute
-from oc_google.token_diagnostic import CurrentTierDetail, LoadBodyReason, OriginalProjectDetail
+from oc_google.token_diagnostic import CurrentTierDetail, FirstUseOfferDetail, LoadBodyReason, OriginalProjectDetail
 
 
 PROJECT = "synthetic-projection-project"
@@ -217,6 +217,25 @@ class LoadProjectionTests(unittest.TestCase):
             self.assertEqual(refusal.exception.load_body_reasons, (reason,))
             self.assertFalse(hasattr(refusal.exception, "load_account_details"))
             self.assertNotIn("secret", str(refusal.exception))
+
+    def test_first_use_offer_is_redacted_and_cannot_complete_load(self):
+        cases = (
+            ({"allowedTiers": [CURRENT]}, FirstUseOfferDetail.PERSONAL_OFFER),
+            ({"allowedTiers": []}, FirstUseOfferDetail.ABSENT),
+            ({"paidTier": PAID}, FirstUseOfferDetail.ABSENT),
+            ({"allowedTiers": [CURRENT, PAID]}, FirstUseOfferDetail.UNVERIFIED),
+            ({"allowedTiers": [{**CURRENT, "usesGcpTos": True}]}, FirstUseOfferDetail.UNVERIFIED),
+            ({"allowedTiers": [{**CURRENT, "isDefault": False}]}, FirstUseOfferDetail.UNVERIFIED),
+            ({"allowedTiers": [CURRENT], "ineligibleTiers": [{"tierId": "free-tier"}]},
+             FirstUseOfferDetail.UNVERIFIED),
+            ({"allowedTiers": [CURRENT], "gcpManaged": True}, FirstUseOfferDetail.UNVERIFIED),
+            ({"allowedTiers": [CURRENT], "currentTier": None}, None),
+        )
+        for fields, expected in cases:
+            with self.subTest(expected=expected), self.assertRaises(EnrollmentMetadataError) as refusal:
+                self.load(encode(fields))
+            self.assertIs(getattr(refusal.exception, "first_use_offer", None), expected)
+            self.assertNotIn(CURRENT["name"], str(refusal.exception))
 
     def test_both_account_groups_distinguish_every_closed_pair(self):
         tier_cases = (
