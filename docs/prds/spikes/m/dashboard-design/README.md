@@ -15,9 +15,18 @@ tokens, components and behaviour; don't ship these files.
 | `brief/` | The design input: `DESIGN_BRIEF.md` and the synthetic `fixtures/workspace.json`. |
 | `audit/` | Machine-readable WCAG 2.2 AA findings from the final audits. |
 
-To view it under the production CSP (`style-src 'self'`, no inline styles or scripts), serve
-`out/` with a server that sends that policy, for example `tools/serve-csp.py out 8765` from
-design-starter-kit, and open `/fleet.html`.
+## View and rebuild
+
+Serve `out/` over loopback with the reference CSP below, for example with
+`tools/serve-csp.py out 8765` from design-starter-kit, and open `/fleet.html`.
+
+```text
+default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+```
+
+Direct page loads work with `connect-src` omitted. In-place navigation fetches HTML from
+the same origin and needs `connect-src 'self'` to keep theme, density and drafts in memory.
+The reference uses external stylesheets and scripts throughout.
 
 To rebuild after a change: run `node build/build.mjs`, and commit `build/`, `out/` and
 `DESIGN.md` together.
@@ -27,19 +36,33 @@ To rebuild after a change: run `node build/build.mjs`, and commit `build/`, `out
 It was designed and selected with
 [design-starter-kit](https://github.com/gorban/design-starter-kit), task `oc-dashboard`:
 
-- Four isolated attempts worked from the same brief and fixtures, each with its own design
-  skill.
-- A cross-provider council reviewed them blind, with no reviewer voting for its own model.
-- The operator decided each round.
-- The champion was then refined in polish passes, followed by WCAG audits and the operator's
-  acceptance check.
+Four isolated attempts used the same brief and fixtures. Three used different design skills
+and one ran without a design skill. The cross-provider council used neutral labels in both
+scored rounds. Raw ballots could include a same-model candidate. The Borda tally excluded
+those entries. The operator recorded scores and facet decisions in both rounds.
+
+| Round | Candidate | Borda | Council rubric | Operator rubric |
+| --- | --- | ---: | ---: | ---: |
+| 1 | a4-claude-design | 0.75 | 83.0 | 72.0 |
+| 1 | a1-hallmark | 0.75 | 84.5 | 66.0 |
+| 1 | a3-frontend-design | 0.50 | 65.5 | 77.0 |
+| 1 | a2-impeccable | 0.00 | 52.5 | 97.0 |
+| 2 | a1-hallmark | 1.00 | 85.0 | 93.0 |
+| 2 | a4-claude-design | 0.25 | 81.0 | 87.0 |
+| 2 | a2-impeccable | 0.00 | 69.5 | 95.0 |
+
+The first round narrowed the slate to three candidates. The operator selected a1-hallmark
+after round two and kept the attention indicators and confirmation pattern from
+a2-impeccable for the single-design refinement. Polish passes, WCAG audits and the
+operator's acceptance check followed without a third scored council round.
 
 The brief was synced to this repository at `3d3f408`.
 
 The selected artifact is attempt `a1-hallmark` at commit
 `26d81cf58435e6660023b993c7f45891ebdc1bb3`, tagged `design-final` in the design lab's attempt
-repository, which isn't published. `DESIGN.md`, `out/` and `build/` here are byte-identical
-to that commit, and rebuilding from `build/` reproduces `out/`.
+repository, which isn't published. `DESIGN.md`, the prototype files in `out/` and
+`build/` here are byte-identical to that commit. The lab's empty `out/.gitkeep` was
+omitted. Rebuilding from `build/` reproduces the committed `out/`.
 
 ## Accessibility (WCAG 2.2 AA)
 
@@ -51,10 +74,10 @@ to that commit, and rebuilding from `build/` reproduces `out/`.
 
 - **Earlier failures:** the first full audit, on an earlier commit, found 6 failures, and a
   second found 1 more. All were fixed in the design's source before the passing audit.
-- **The selected commit:** `26d81cf` changes only the fleet table footer since `f1902bc`. It
-  now has one `colspan="5"` cell, so the footer lines up when the Health column is hidden at
-  medium widths. The operator waived its re-audit. Re-audit the footer in the
-  implementation.
+- **The selected commit:** `26d81cf` updates the shared fleet table footer in Fleet, Inbox and
+  Confirm, with the corresponding stylesheet and design note. A single `colspan="5"` cell
+  aligns the footer when the Health column is hidden at medium widths. The operator waived
+  its re-audit. Re-audit the footer in the implementation.
 - **Open: 2.2.1 Timing Adjustable.** Approval expiry and session lifetime are backend
   behaviour. Confirm they're adjustable or exempt before claiming conformance. The audits
   weren't verified with assistive technology.
