@@ -141,9 +141,9 @@ CodeQL merge requirement.
         (`ci/codeql-main-baseline`). Pull request triggers and concurrency are unchanged.
         Coverage and Dependency Review still run on pull requests only. Runs on `main` are
         not cancelled. `tests/test_ci.py` pins the triggers, permissions and action pins.
-        The security and PR-style reviews in the
-        [implementation review gates](README.md#implementation-review-gates) are still owed,
-        for the design and for the diff. Record their outcome in the pull request.
+        Security and general review cleared the design and workflow at `49ccf0a` on
+        [PR #95](https://github.com/gorban/opencode-sandbox/pull/95). Human review of the
+        workflow remains open.
   - [ ] After merge, confirm the push run and the first scheduled run upload both categories
         for `refs/heads/main`, and that a later pull request is compared with them.
   - [ ] Qualify SARIF upload on a fork PR. With CodeQL required, a failed or missing upload
