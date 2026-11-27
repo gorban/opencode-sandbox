@@ -93,6 +93,9 @@ _PORT_LABEL_RE = re.compile(r"\d+:\d+\Z", re.ASCII)
 _RELAY_MODULE = "relay.py"
 _SESSION_RELAY_MODULE = "session_relay.py"
 _IMAGE_DIGEST_PREFIX = "sha256:"
+_SANDBOX_LABEL = "oc.sandbox"
+_INSTANCE_LABEL = "oc.instance"
+_ROLE_LABEL = "oc.role"
 _RESERVED_INSTANCES = frozenset({
     "agent", "chromium", "chrome", "postgres", "pg", "dind", "home",
     "openai-relay", "openai-home", "relay",
@@ -830,8 +833,8 @@ def _verify_pod_with_containers(spec: dict) -> tuple[str, list[dict]]:
     labels = pod_info.get("Labels") or {}
     if (type(pod_id) is not str or not IMAGE_ID.fullmatch(pod_id)
             or type(labels) is not dict
-            or labels.get("oc.sandbox") != "1"
-            or labels.get("oc.instance") != spec["instance"]):
+            or labels.get(_SANDBOX_LABEL) != "1"
+            or labels.get(_INSTANCE_LABEL) != spec["instance"]):
         raise RuntimeError("Pod failed ownership verification")
     port_label = labels.get("oc.ports", "")
     if type(port_label) is not str:
@@ -1174,11 +1177,11 @@ def _verify_stopped_container_owner(
         raise RuntimeError(f"Malformed inspect metadata for container {cname}")
     if state.get("Running") is True or state.get("Status") in ("running", "paused", "restarting", "stopping"):
         raise RuntimeError(f"Container {cname} is already running")
-    role = labels.get("oc.role")
+    role = labels.get(_ROLE_LABEL)
     normalized_role = None if role in (None, "") else role
     if (type(cid) is not str or not IMAGE_ID.fullmatch(cid)
-            or labels.get("oc.sandbox") != "1"
-            or labels.get("oc.instance") != instance
+            or labels.get(_SANDBOX_LABEL) != "1"
+            or labels.get(_INSTANCE_LABEL) != instance
             or normalized_role not in expected_roles
             or (expected_pod is not None and details.get("Pod") != expected_pod)
             or (expected_pod is not None and state.get("Status") not in {
@@ -1207,7 +1210,7 @@ def _remove_verified_predecessor(details, cid, instance, name, expected_pod):
     actual_name = (details.get("Name") or "").lstrip("/")
     if actual_name != name:
         raise RuntimeError("Stopped container name changed before removal")
-    role = details["Config"]["Labels"].get("oc.role")
+    role = details["Config"]["Labels"].get(_ROLE_LABEL)
     _remove_filtered_container(cid, _owned_container_selector(cid, instance, name, role))
 
 
@@ -1238,13 +1241,13 @@ def _inspect_prepared_identity(receipt: _PreparedCreateReceipt) -> dict:
     name_on_host = details.get("Name")
     image_on_host = details.get("Image")
     labels = (details.get("Config") or {}).get("Labels") or {}
-    role = labels.get("oc.role") if isinstance(labels, dict) else None
+    role = labels.get(_ROLE_LABEL) if isinstance(labels, dict) else None
     if (
         details.get("Id") != receipt.container_id or details.get("Pod") != receipt.pod_id
         or type(name_on_host) is not str or name_on_host.lstrip("/") != receipt.name
         or type(image_on_host) is not str or image_on_host.removeprefix(_IMAGE_DIGEST_PREFIX) != receipt.image
-        or type(labels) is not dict or labels.get("oc.sandbox") != "1"
-        or labels.get("oc.instance") != receipt.instance or (role or None) != receipt.role
+        or type(labels) is not dict or labels.get(_SANDBOX_LABEL) != "1"
+        or labels.get(_INSTANCE_LABEL) != receipt.instance or (role or None) != receipt.role
         or labels.get("oc.session.create") != receipt.marker
     ):
         raise RuntimeError("Created container failed placement and ownership verification")
@@ -1430,6 +1433,13 @@ def _cancel_agent_attach(child: subprocess.Popen, selector: tuple[str, ...]) -> 
     return status
 
 
+def _poll_agent_exit(child: subprocess.Popen, stop_event: threading.Event) -> int | None:
+    while (status := child.poll()) is None:
+        if stop_event.wait(0.2):
+            return None
+    return status
+
+
 def _launch_agent_tty(
     agent_id: str, stop_event: threading.Event, *, container_selector: tuple[str, ...] | None = None,
     attach_evidence=None,
@@ -1465,8 +1475,7 @@ def _launch_agent_tty(
         raise ConnectionError("connection_retired")
     child_proc = subprocess.Popen(cmd, env=spawn_env)
     try:
-        while (status := child_proc.poll()) is None and not stop_event.wait(0.2):
-            pass
+        status = _poll_agent_exit(child_proc, stop_event)
     except KeyboardInterrupt:
         _cancel_agent_attach(child_proc, selector)
         raise
