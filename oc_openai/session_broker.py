@@ -1,5 +1,6 @@
 """Host-side interactive ChatGPT Responses broker and foreground pod supervisor."""
 
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 import fcntl
@@ -281,12 +282,15 @@ class SessionBroker:
             info = self.socket_path.lstat()
             self._socket_id = (info.st_dev, info.st_ino)
             listener.listen(MAX_CLIENTS)
-            listener.settimeout(relay_mod.GRANT_POLL)
+            listener.setblocking(False)
         except BaseException:
             with suppress(OSError):
                 listener.close()
             raise
         self._listener = listener
+        reg_drain = getattr(self._proof_gate, "register_accept_drain", None)
+        if callable(reg_drain):
+            reg_drain(self._drain_pending_accepts)
         self._accept_thread = threading.Thread(target=self._accept_loop, name="oc-chat-broker", daemon=True)
         self._watch_thread = threading.Thread(target=self._watch_revocation, name="oc-chat-watch", daemon=True)
         self._accept_thread.start()
@@ -352,28 +356,68 @@ class SessionBroker:
                 with suppress(OSError):
                     peer.shutdown(socket.SHUT_RDWR)
 
-    def _accept_loop(self) -> None:
-        while not self._stopped.is_set():
+    def _try_accept_nonblocking(self) -> socket.socket | None:
+        listener = self._listener
+        if listener is None or self._stopped.is_set():
+            return None
+        try:
+            peer, _ = listener.accept()
+            return peer
+        except (BlockingIOError, TimeoutError, OSError):
+            return None
+
+    def _dispatch_accepted_peer(self, peer: socket.socket, arrival) -> None:
+        with suppress(OSError):
+            peer.setblocking(True)
+        with self._lock:
+            if self._stopped.is_set() or len(self._clients) >= MAX_CLIENTS:
+                peer.close()
+                return
+            worker = threading.Thread(target=self._handle_peer, args=(peer,), daemon=True)
+            self._clients[peer] = worker
+            self._client_arrivals[peer] = arrival
             try:
-                peer, _ = self._listener.accept()
-            except TimeoutError:
-                continue
-            except OSError:
+                worker.start()
+            except RuntimeError:
+                self._clients.pop(peer, None)
+                self._client_arrivals.pop(peer, None)
+                peer.close()
+
+    def _drain_pending_accepts(self) -> None:
+        """Drain already-queued kernel backlog connections under the gate fence before a transition."""
+        while not self._stopped.is_set():
+            peer = self._try_accept_nonblocking()
+            if peer is None:
                 return
             arrival = self._proof_gate.snapshot_arrival() if self._proof_gate is not None else None
-            with self._lock:
-                if self._stopped.is_set() or len(self._clients) >= MAX_CLIENTS:
-                    peer.close()
-                    continue
-                worker = threading.Thread(target=self._handle_peer, args=(peer,), daemon=True)
-                self._clients[peer] = worker
-                self._client_arrivals[peer] = arrival
-                try:
-                    worker.start()
-                except RuntimeError:
-                    self._clients.pop(peer, None)
-                    self._client_arrivals.pop(peer, None)
-                    peer.close()
+            self._dispatch_accepted_peer(peer, arrival)
+
+    def _accept_one_serialized(self) -> tuple[socket.socket | None, object]:
+        accept_fenced = getattr(self._proof_gate, "accept_with_snapshot", None)
+        if callable(accept_fenced):
+            return accept_fenced(self._try_accept_nonblocking)
+        peer = self._try_accept_nonblocking()
+        if peer is None:
+            return None, None
+        arrival = self._proof_gate.snapshot_arrival() if self._proof_gate is not None else None
+        return peer, arrival
+
+    def _accept_loop(self) -> None:
+        while not self._stopped.is_set():
+            listener = self._listener
+            if listener is None:
+                return
+            try:
+                ready, _, _ = select.select([listener], [], [], relay_mod.GRANT_POLL)
+            except (OSError, ValueError):
+                return
+            if not ready:
+                continue
+            while not self._stopped.is_set():
+                peer, arrival = self._accept_one_serialized()
+                if peer is None:
+                    break
+                self._dispatch_accepted_peer(peer, arrival)
 
     def _record_usage(self, *, model: str | None, outcome: str, usage: tuple[int, int, int] | None = None) -> None:
         if self._usage_dir is None:
@@ -623,6 +667,9 @@ class SessionBroker:
 
     def close(self) -> None:
         self._stopped.set()
+        unreg_drain = getattr(self._proof_gate, "unregister_accept_drain", None)
+        if callable(unreg_drain):
+            unreg_drain(self._drain_pending_accepts)
         self._cancel_active_turns()
         if self._listener is not None:
             with suppress(OSError):
@@ -860,15 +907,14 @@ _REQUIRED_CALLABLE_SLOT_HOOKS = (
     "has_active_clients",
     "mark_relay_created",
     "confirm_relay_removed",
+    "authorize_lease_release",
+    "deny_lease_release",
+    "bind_release_authority",
     "lease_release_confirmed",
 )
 
 
-_OPTIONAL_CALLABLE_SLOT_HOOKS = (
-    "authorize_lease_release",
-    "deny_lease_release",
-    "bind_release_authority",
-)
+_OPTIONAL_CALLABLE_SLOT_HOOKS: tuple[str, ...] = ()
 
 
 def _is_openai_slot_identity(handle: SlotHandle) -> bool:
@@ -939,7 +985,11 @@ def _verify_slot_handle_identity(
     allow_legacy: bool = False,
 ) -> None:
     if (
-        handle.slot_index != expected_slot_index
+        type(handle.slot_index) is not int
+        or type(handle.scoped_id) is not str
+        or type(handle.provider_label) is not str
+        or type(handle.port) is not int
+        or handle.slot_index != expected_slot_index
         or handle.scoped_id != expected_scoped_id
         or handle.provider_label != expected_provider_label
         or handle.port != expected_port

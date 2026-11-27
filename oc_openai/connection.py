@@ -454,7 +454,21 @@ class Connection:
             return False
         return record.get("generation") == binding.generation or "tokens" not in record
 
-    def _release_session_lease_locked(self, directory, binding, lease, lease_record) -> str:
+    @staticmethod
+    def _release_commit_fence(release_gate):
+        if release_gate is None:
+            return None
+        custom = getattr(release_gate, "commit_fence", None)
+        if callable(custom):
+            return custom
+
+        @contextlib.contextmanager
+        def _fallback_fence():
+            yield bool(release_gate())
+
+        return _fallback_fence
+
+    def _release_session_lease_locked(self, directory, binding, lease, lease_record, *, release_gate=None) -> str:
         if directory is None:
             return "retained_store_unavailable"
         record = self._store.read(directory)
@@ -470,8 +484,9 @@ class Connection:
                 record["worker_leases"] = leases
             else:
                 record.pop("worker_leases", None)
-            self._store.write(directory, record)
-            return "removed"
+            commit_fence = self._release_commit_fence(release_gate)
+            committed = self._store.write(directory, record, before_commit=commit_fence)
+            return "removed" if committed is not False else "retained_gate_closed"
         root_absent = leases is None or (isinstance(leases, dict) and lease.root not in leases)
         if root_absent and self._registration_matches_or_empty(record, binding):
             return "absent"
@@ -497,7 +512,9 @@ class Connection:
             outcome = "retained_gate_closed"
             if release_gate is None or release_gate():
                 with self._store.locked() as directory:
-                    outcome = self._release_session_lease_locked(directory, binding, lease, lease_record)
+                    outcome = self._release_session_lease_locked(
+                        directory, binding, lease, lease_record, release_gate=release_gate,
+                    )
             if on_release_result is not None:
                 on_release_result(outcome)
 

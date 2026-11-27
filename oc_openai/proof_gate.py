@@ -440,6 +440,8 @@ class ProofGate:
         self._usage: tuple[int, int, int] | None = None
         self._tool_call_count = 0
         self._refusals: list[dict[str, object]] = []
+        self._accept_fence = threading.Lock()
+        self._accept_drains: list = []
 
     @staticmethod
     def _validate_approval(approval: ProofApproval, instructions_sha256: str) -> None:
@@ -555,6 +557,28 @@ class ProofGate:
                 raise ProofGateError("duplicate per-incarnation evidence file") from None
             return evidence_path
 
+    def register_accept_drain(self, drain_fn) -> None:
+        with self._accept_fence:
+            if drain_fn not in self._accept_drains:
+                self._accept_drains.append(drain_fn)
+
+    def unregister_accept_drain(self, drain_fn) -> None:
+        with self._accept_fence:
+            if drain_fn in self._accept_drains:
+                self._accept_drains.remove(drain_fn)
+
+    def accept_with_snapshot(self, accept_nonblocking):
+        """Serialize nonblocking socket accept with state transitions under the same fence."""
+        with self._accept_fence:
+            peer = accept_nonblocking()
+            if peer is None:
+                return None, None
+            return peer, self.snapshot_arrival()
+
+    def _drain_accepts_locked(self) -> None:
+        for drain_fn in list(self._accept_drains):
+            drain_fn()
+
     def snapshot_arrival(self) -> ArrivalSnapshot:
         """Capture arrival-time gate state before a peer request body is read."""
         with self._lock:
@@ -577,33 +601,37 @@ class ProofGate:
         if not observed_row or not _SHA256_RE.fullmatch(observed_screen_digest):
             raise ProofGateError("arming requires observed_row and 64-hex observed_screen_digest")
         self._verify_owner_and_history()
-        with self._lock:
-            if self._state != STATE_CLOSED_DISCOVERY:
-                raise ProofGateError(f"cannot arm proof gate from state {self._state}")
-            if self._job_incarnation is None or self._evidence_path is None:
-                raise ProofGateError("cannot arm proof gate before job incarnation binding")
-            nonce = secrets.token_hex(32)
-            self._arm_nonce = nonce
-            self._observed_row = observed_row
-            self._observed_screen_digest = observed_screen_digest
-            self._state = STATE_ARMED
-            self._outcome = "armed"
-            _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
-            return nonce
+        with self._accept_fence:
+            self._drain_accepts_locked()
+            with self._lock:
+                if self._state != STATE_CLOSED_DISCOVERY:
+                    raise ProofGateError(f"cannot arm proof gate from state {self._state}")
+                if self._job_incarnation is None or self._evidence_path is None:
+                    raise ProofGateError("cannot arm proof gate before job incarnation binding")
+                nonce = secrets.token_hex(32)
+                self._arm_nonce = nonce
+                self._observed_row = observed_row
+                self._observed_screen_digest = observed_screen_digest
+                self._state = STATE_ARMED
+                self._outcome = "armed"
+                _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
+                return nonce
 
     def mark_relay_verified(self, relay_id: str) -> None:
         """Record verified isolation + bind of the replacement turn relay before activating writes."""
         if not _SHA256_RE.fullmatch(relay_id):
             raise ProofGateError("invalid verified turn relay ID")
         self._verify_owner_and_history()
-        with self._lock:
-            if self._state != STATE_ARMED or self._evidence_path is None:
-                raise ProofGateError("cannot verify relay outside ARMED state")
-            if self._relay_verified:
-                raise ProofGateError("turn relay already verified")
-            self._relay_verified = True
-            self._verified_relay_id = relay_id
-            _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
+        with self._accept_fence:
+            self._drain_accepts_locked()
+            with self._lock:
+                if self._state != STATE_ARMED or self._evidence_path is None:
+                    raise ProofGateError("cannot verify relay outside ARMED state")
+                if self._relay_verified:
+                    raise ProofGateError("turn relay already verified")
+                self._relay_verified = True
+                self._verified_relay_id = relay_id
+                _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
 
     def validate_and_canonicalize(
         self,

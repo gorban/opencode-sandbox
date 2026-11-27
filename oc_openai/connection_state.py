@@ -245,7 +245,7 @@ class Store:
             except (ValueError, RecursionError):
                 raise ConnectionError("invalid_connection_state") from None
 
-    def write(self, directory, record):
+    def write(self, directory, record, *, before_commit=None):
         data = json.dumps({**record, "version": 1}, allow_nan=False).encode("utf-8")
         if len(data) > MAX_STATE:
             raise ConnectionError("invalid_connection_state")
@@ -257,8 +257,15 @@ class Store:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, _STATE_FILE, src_dir_fd=directory, dst_dir_fd=directory)
+            if before_commit is not None:
+                with before_commit() as allowed:
+                    if not allowed:
+                        return False
+                    os.replace(temporary, _STATE_FILE, src_dir_fd=directory, dst_dir_fd=directory)
+            else:
+                os.replace(temporary, _STATE_FILE, src_dir_fd=directory, dst_dir_fd=directory)
             os.fsync(directory)
+            return True
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary, dir_fd=directory)

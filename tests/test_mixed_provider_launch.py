@@ -307,6 +307,25 @@ class _OwnerChallengedReceiptGate:
         self._spent = False
         self.claim_count = 0
         self.accept_count = 0
+        self._accept_fence = threading.Lock()
+        self._accept_drains: list = []
+
+    def register_accept_drain(self, drain_fn) -> None:
+        with self._accept_fence:
+            if drain_fn not in self._accept_drains:
+                self._accept_drains.append(drain_fn)
+
+    def unregister_accept_drain(self, drain_fn) -> None:
+        with self._accept_fence:
+            if drain_fn in self._accept_drains:
+                self._accept_drains.remove(drain_fn)
+
+    def accept_with_snapshot(self, accept_nonblocking):
+        with self._accept_fence:
+            peer = accept_nonblocking()
+            if peer is None:
+                return None, None
+            return peer, self.snapshot_arrival()
 
     @property
     def challenge_token(self) -> str:
@@ -359,27 +378,30 @@ class _OwnerChallengedReceiptGate:
         epoch: int,
         probe_observation: str | None = None,
     ) -> int:
-        """Deliver attempt-scoped receipt requiring an actual matching broker probe observation."""
-        with self._lock:
-            if self._revoked:
-                raise ProofGateError("proof_gate_revoked")
-            if not hmac.compare_digest(challenge, self._challenge_token):
-                raise ProofGateError("proof_owner_challenge_mismatch")
-            if relay_id != self._expected_relay_id or job_incarnation != self._job_incarnation:
-                raise ProofGateError("proof_gate_incarnation_mismatch")
-            if epoch != self._epoch:
-                raise ProofGateError("proof_gate_epoch_mismatch")
-            expected_key = (relay_id, job_incarnation, epoch)
-            if (
-                not self._observed_probe_nonce
-                or self._observed_probe_key != expected_key
-                or not probe_observation
-                or not hmac.compare_digest(probe_observation, self._observed_probe_nonce)
-            ):
-                raise ProofGateError("proof_probe_not_observed")
-            self._receipt_generation += 1
-            self._receipt_delivered = True
-            return self._receipt_generation
+        """Deliver attempt-scoped receipt serialized with pending socket accepts under the same fence."""
+        with self._accept_fence:
+            for drain_fn in list(self._accept_drains):
+                drain_fn()
+            with self._lock:
+                if self._revoked:
+                    raise ProofGateError("proof_gate_revoked")
+                if not hmac.compare_digest(challenge, self._challenge_token):
+                    raise ProofGateError("proof_owner_challenge_mismatch")
+                if relay_id != self._expected_relay_id or job_incarnation != self._job_incarnation:
+                    raise ProofGateError("proof_gate_incarnation_mismatch")
+                if epoch != self._epoch:
+                    raise ProofGateError("proof_gate_epoch_mismatch")
+                expected_key = (relay_id, job_incarnation, epoch)
+                if (
+                    not self._observed_probe_nonce
+                    or self._observed_probe_key != expected_key
+                    or not probe_observation
+                    or not hmac.compare_digest(probe_observation, self._observed_probe_nonce)
+                ):
+                    raise ProofGateError("proof_probe_not_observed")
+                self._receipt_generation += 1
+                self._receipt_delivered = True
+                return self._receipt_generation
 
     def snapshot_arrival(self) -> _SyntheticArrival:
         with self._lock:
@@ -477,6 +499,7 @@ class _SyntheticSlotBroker:
         before_claim_hook=None,
         write_fence_hook=None,
         before_dispatch_hook=None,
+        before_accept_hook=None,
     ):
         self.socket_path = Path(socket_path)
         self._proof = relay_proof
@@ -495,6 +518,7 @@ class _SyntheticSlotBroker:
         self._before_claim_hook = before_claim_hook
         self._write_fence_hook = write_fence_hook
         self._before_dispatch_hook = before_dispatch_hook
+        self._before_accept_hook = before_accept_hook
         self._stopped = threading.Event()
         self._revoked = threading.Event()
         self._lock = threading.Lock()
@@ -509,8 +533,10 @@ class _SyntheticSlotBroker:
         listener.bind(str(self.socket_path))
         self.socket_path.chmod(0o600)
         listener.listen(8)
-        listener.settimeout(0.1)
+        listener.setblocking(False)
         self._listener = listener
+        if self._receipt_gate is not None:
+            self._receipt_gate.register_accept_drain(self._drain_pending_accepts)
         self._thread = threading.Thread(target=self._accept_loop, name="oc-synth-broker", daemon=True)
         self._thread.start()
 
@@ -529,6 +555,8 @@ class _SyntheticSlotBroker:
     def close(self) -> None:
         self._stopped.set()
         self._revoked.set()
+        if self._receipt_gate is not None:
+            self._receipt_gate.unregister_accept_drain(self._drain_pending_accepts)
         if self._listener is not None:
             with suppress(OSError):
                 self._listener.close()
@@ -542,23 +570,56 @@ class _SyntheticSlotBroker:
         with suppress(OSError):
             self.socket_path.unlink()
 
+    def _try_accept_nonblocking(self) -> socket.socket | None:
+        listener = self._listener
+        if listener is None or self._stopped.is_set():
+            return None
+        try:
+            peer, _ = listener.accept()
+            return peer
+        except (BlockingIOError, TimeoutError, OSError):
+            return None
+
+    def _enqueue_peer(self, peer: socket.socket, arrival) -> None:
+        with suppress(OSError):
+            peer.setblocking(True)
+        with self._lock:
+            if self._stopped.is_set():
+                peer.close()
+                return
+            self._clients.add(peer)
+        threading.Thread(target=self._dispatch_accepted_peer, args=(peer, arrival), daemon=True).start()
+
+    def _drain_pending_accepts(self) -> None:
+        while not self._stopped.is_set():
+            peer = self._try_accept_nonblocking()
+            if peer is None:
+                return
+            arrival = self._receipt_gate.snapshot_arrival() if self._receipt_gate is not None else None
+            self._enqueue_peer(peer, arrival)
+
     def _accept_loop(self) -> None:
         while not self._stopped.is_set():
-            try:
-                peer, _ = self._listener.accept()
-            except TimeoutError:
-                continue
-            except OSError:
+            listener = self._listener
+            if listener is None:
                 return
-            # Capture arrival snapshot immediately under the accepted-socket boundary BEFORE
-            # spawning the handler thread so late handler scheduling cannot promote pre-receipt arrivals.
-            arrival = self._receipt_gate.snapshot_arrival() if self._receipt_gate is not None else None
-            with self._lock:
-                if self._stopped.is_set():
-                    peer.close()
-                    continue
-                self._clients.add(peer)
-            threading.Thread(target=self._dispatch_accepted_peer, args=(peer, arrival), daemon=True).start()
+            try:
+                ready, _, _ = select.select([listener], [], [], 0.1)
+            except (OSError, ValueError):
+                return
+            if not ready:
+                continue
+            if self._before_accept_hook is not None:
+                self._before_accept_hook()
+            while not self._stopped.is_set():
+                if self._receipt_gate is not None:
+                    peer, arrival = self._receipt_gate.accept_with_snapshot(self._try_accept_nonblocking)
+                else:
+                    peer = self._try_accept_nonblocking()
+                    arrival = None
+                if peer is None:
+                    break
+                self._enqueue_peer(peer, arrival)
 
     def _dispatch_accepted_peer(self, peer: socket.socket, arrival) -> None:
         if self._before_dispatch_hook is not None:
@@ -1028,7 +1089,10 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
             "has_active_clients": lambda: state["active_clients"],
             "mark_relay_created": mark_relay_created,
             "confirm_relay_removed": confirm_relay_removed,
-            "lease_release_confirmed": lambda: state["lease_released"],
+            "authorize_lease_release": lambda: state.__setitem__("release_authorized", True),
+            "deny_lease_release": lambda: state.__setitem__("release_denied", True),
+            "bind_release_authority": lambda pred: state.__setitem__("authority", pred),
+            "lease_release_confirmed": lambda: bool(state["lease_released"]) and not bool(state.get("release_denied")),
         }
         if overrides:
             kwargs.update(overrides)
@@ -1158,10 +1222,11 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual((state["revoke_calls"], state["close_calls"], state["relay_confirmed_removed"], state["cm_exits"]), (1, 1, 1, 1))
 
-        # 2. Removing ANY of the 10 hooks from an opaque handle fails closed before container creation.
+        # 2. Removing ANY required hook (including release coordination) from an opaque handle fails closed.
         all_hooks = (
             "relay_paths", "revoke_grant", "close_broker", "activate_route", "route_state",
             "is_revoked", "has_active_clients", "mark_relay_created", "confirm_relay_removed",
+            "authorize_lease_release", "deny_lease_release", "bind_release_authority",
             "lease_release_confirmed",
         )
         for missing in all_hooks:
@@ -1661,11 +1726,20 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
             initial_model=SYNTHETIC_MODEL, ui_mode="mini", ui_source="--mini", acknowledged_digests={},
         )
 
+        class _SubStr(str):
+            pass
+
+        class _SubInt(int):
+            pass
+
         for label, bad_overrides in (
             ("wrong_slot_index", {"slot_index": 7}),
+            ("bool_slot_index", {"slot_index": False}),
             ("wrong_scoped_id", {"scoped_id": "openai--personal"}),
+            ("str_subclass_scoped_id", {"scoped_id": _SubStr("google--personal")}),
             ("wrong_provider_label", {"provider_label": "openai/personal"}),
             ("wrong_port", {"port": 8415}),
+            ("int_subclass_port", {"port": _SubInt(8401)}),
             ("escaped_relay_paths", {"relay_paths": escaped_paths}),
         ):
             with self.subTest(mismatch=label):
@@ -1701,6 +1775,9 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
                             "has_active_clients": lambda: False,
                             "mark_relay_created": lambda: None,
                             "confirm_relay_removed": lambda: None,
+                            "authorize_lease_release": lambda: None,
+                            "deny_lease_release": lambda: None,
+                            "bind_release_authority": lambda _pred: None,
                             "lease_release_confirmed": lambda: True,
                         }
                         base_kwargs.update(bad_overrides)
@@ -2105,6 +2182,8 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
             activate_route=h_col.activate_route, route_state=lambda: "pending",
             is_revoked=lambda: False, has_active_clients=lambda: False,
             mark_relay_created=h_col.mark_relay_created, confirm_relay_removed=h_col.confirm_relay_removed,
+            authorize_lease_release=h_col.authorize_lease_release, deny_lease_release=h_col.deny_lease_release,
+            bind_release_authority=h_col.bind_release_authority,
             lease_release_confirmed=h_col.lease_release_confirmed,
         )
         coord = _SessionSlotCoordinator(threading.Event())
@@ -2169,6 +2248,282 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
         self.assertTrue(any(call[:1] == ("start",) for call in ok_calls))
         self.assertTrue(any(call[:1] == ("exec",) for call in ok_calls))
         self.assertEqual(len(getfattr_paths), 6)
+
+    def test_store_commit_fenced_against_sticky_timeout_retains_durable_lease(self):
+        # Regression (d5aaf07 residual #1): pausing after Connection's initial release_gate() check
+        # and inside _store.locked() before os.replace across teardown_all()'s join timeout MUST
+        # fail closed inside ConnectionState.write's commit_fence and retain durable worker_leases.
+        import gc
+        import pwd
+        from oc_openai.connection import Connection
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        orig_join = threading.Thread.join
+
+        def _fast_join(thread_self, timeout=None):
+            return orig_join(thread_self, timeout=0.05)
+
+        with tempfile.TemporaryDirectory(prefix="oc-mix-storefence-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+            _, adapter, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                home_scratch / "profiles",
+            )
+            store_cls = type(pref.handle.conn._store)
+            entered_write = threading.Event()
+            release_write = threading.Event()
+            slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+            orig_write = store_cls.write
+            paused_once = [False]
+
+            def delayed_write(store_self, directory, record, *, before_commit=None):
+                if before_commit is not None and not paused_once[0]:
+                    paused_once[0] = True
+                    entered_write.set()
+                    release_write.wait(timeout=5.0)
+                return orig_write(store_self, directory, record, before_commit=before_commit)
+
+            def _run_delayed_store_commit() -> None:
+                coord = _SessionSlotCoordinator(threading.Event())
+                slot_cm = adapter.open_slot(
+                    pref, slot_index=0, slot_root=slot_root, port=8401,
+                    worker_token="tok-sf-" + "a" * 24,
+                    acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+                )
+                handle = slot_cm.__enter__()
+                coord.register_slot(slot_cm, handle, slot_root, allow_legacy=True)
+                coord.record_container("a" * 64, slot_index=0)
+                handle.job.activate()
+                with (
+                    patch.object(session_broker, "_remove_container_verified"),
+                    patch.object(store_cls, "write", delayed_write),
+                ):
+                    coord.on_revoke(0)
+                    self.assertTrue(entered_write.wait(timeout=2.0))
+                    with patch.object(threading.Thread, "join", _fast_join):
+                        err = coord.teardown_all(None)
+                    self.assertIsNotNone(err)
+                    release_write.set()
+                    for t in list(coord._retire_threads):
+                        orig_join(t, timeout=2.0)
+                self.assertFalse(coord._slots[0].lease_confirmed_released)
+
+            _run_delayed_store_commit()
+            gc.collect()
+            gc.collect()
+
+            fresh_conn = Connection(personal_dir, host_probe=lambda: host)
+            self.assertTrue(
+                fresh_conn.has_active_leases(),
+                "delayed store commit erased durable worker_leases after sticky timeout!",
+            )
+            state_data = json.loads((personal_dir / "state.json").read_text(encoding="utf-8"))
+            self.assertIn(slot_root.name, state_data.get("worker_leases", {}))
+
+    def test_pre_receipt_socket_paused_before_accept_cannot_inherit_receipt(self):
+        # Regression (d5aaf07 residual #2): a pre-receipt client that connects while the accept
+        # loop is paused BEFORE accept() MUST be drained/stamped under the shared transition fence
+        # before receipt/verify flips true (both synthetic broker AND production SessionBroker).
+        # Part A: Synthetic broker + _OwnerChallengedReceiptGate.
+        slot_root = self.root / "pre_accept_synth"
+        slot_root.mkdir(mode=0o700)
+        inc = "inc_" + secrets.token_hex(16)
+        job = _SessionJob(slot_root, inc)
+        job.prepare(config_payload=None)
+        self.addCleanup(job.revoke)
+        job.activate()
+        relay_id = "e" * 64
+        tok = "tok-preacc-" + "a" * 24
+        gate = _OwnerChallengedReceiptGate(
+            approved_scoped_id="google--personal", expected_relay_id=relay_id, job_incarnation=inc,
+        )
+        recorder: list[dict] = []
+        pause_enabled = [False]
+        paused_before_accept = threading.Event()
+        release_accept = threading.Event()
+
+        def before_accept():
+            if pause_enabled[0]:
+                pause_enabled[0] = False
+                paused_before_accept.set()
+                release_accept.wait(timeout=5.0)
+
+        broker = _SyntheticSlotBroker(
+            socket_path=job.provider_socket,
+            relay_proof=job.relay_proof,
+            worker_token=tok,
+            lease=job.lease,
+            models=(SYNTHETIC_MODEL,),
+            expected_port=8402,
+            job_incarnation=inc,
+            receipt_gate=gate,
+            recorder=recorder,
+            before_accept_hook=before_accept,
+        )
+        broker.start()
+        self.addCleanup(broker.close)
+
+        probe_req = _make_http_request(
+            method="GET", path="/v1/models", port=8402, token=tok,
+            extra_headers={_OWNER_PROBE_HEADER: gate.challenge_token},
+        )
+        self.assertIn(b"200 OK", _send_framed_uds(job.provider_socket, job.relay_proof, probe_req))
+        obs = broker.owner_probe_observations[-1]
+
+        req_body = json.dumps({
+            "model": SYNTHETIC_MODEL, "stream": True, "store": False,
+            "input": [{"role": "user", "content": PROOF_PROMPT}],
+        }).encode("utf-8")
+        turn_req = _make_http_request(method="POST", path="/v1/responses", port=8402, token=tok, body=req_body)
+
+        pause_enabled[0] = True
+        pre_res: list[bytes] = []
+        t_pre = threading.Thread(
+            target=lambda: pre_res.append(_send_framed_uds(job.provider_socket, job.relay_proof, turn_req)),
+            daemon=True,
+        )
+        t_pre.start()
+        self.assertTrue(paused_before_accept.wait(timeout=2.0))
+
+        # Deliver receipt WHILE accept_loop is paused BEFORE calling accept()!
+        gate.deliver_owner_receipt(
+            challenge=gate.challenge_token, relay_id=relay_id, job_incarnation=inc,
+            epoch=gate.epoch, probe_observation=obs,
+        )
+        release_accept.set()
+        t_pre.join(timeout=3.0)
+        self.assertEqual(len(pre_res), 1)
+        self.assertIn(b"403 Forbidden", pre_res[0])
+        self.assertEqual((gate.claim_count, gate.accept_count, len(recorder)), (0, 0, 0))
+
+        # Fresh post-receipt socket succeeds 1/1.
+        fresh_resp = _send_framed_uds(job.provider_socket, job.relay_proof, turn_req)
+        self.assertIn(b"200 OK", fresh_resp)
+        self.assertEqual((gate.claim_count, gate.accept_count, len(recorder)), (1, 1, 1))
+
+        # Part B: Production SessionBroker + ProofGate paused BEFORE accept across mark_relay_verified.
+        import pwd
+        from types import SimpleNamespace
+        from oc_openai.proof_gate import ProofGate, _normalize_instructions, compute_exposure_history_digest
+        from oc_openai.session_broker import SessionBroker, SessionPolicy
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        home_td = self.enterContext(tempfile.TemporaryDirectory(prefix="oc-mix-preacc-", dir=home))
+        os.chmod(home_td, 0o700)
+        sb_root = self.root / "pre_accept_prod"
+        sb_root.mkdir(mode=0o700)
+        exp_dir = Path(home_td) / "pre_accept_exp"
+        exp_dir.mkdir(mode=0o700)
+        ev_dir = Path(home_td) / "pre_accept_ev"
+        ev_dir.mkdir(mode=0o700)
+        sb_inc = "inc_" + secrets.token_hex(16)
+        sb_job = _SessionJob(sb_root, sb_inc)
+        sb_job.prepare(config_payload=None)
+        self.addCleanup(sb_job.revoke)
+        sb_job.activate()
+        instr = (
+            "Today's date: Thu Nov 26 2026\n"
+            "  Working directory: /sandbox/workspace\n"
+            "  Workspace root folder: /sandbox/workspace\n"
+        )
+        norm_instr = _normalize_instructions(instr, expected_cwd="workspace")
+        assert norm_instr is not None
+        instr_sha = sha256(norm_instr.encode("utf-8")).hexdigest()
+        approval = ProofApproval(
+            run_id=secrets.token_hex(16), instance_label="personal", scoped_provider_id="openai--personal",
+            approved_model="gpt-6.2-sol", ui_mode="mini", cwd="workspace",
+            selection_epoch="ep-1", credential_generation=1,
+            history_digest_all_12_files=compute_exposure_history_digest(exp_dir),
+            profile_directory=str(exp_dir), client_id="client-1",
+        )
+        pg = ProofGate(
+            approval, evidence_dir=ev_dir, exposure_dir=exp_dir,
+            check_owner_alive=lambda: None, expected_instructions_sha256=instr_sha,
+        )
+        pg.bind_incarnation(sb_inc, sb_job.generation)
+        pg.arm(observed_row="openai--personal/gpt-6.2-sol", observed_screen_digest="a" * 64)
+
+        class _OkConn:
+            def require_active(self, _binding):
+                return None
+
+            @contextmanager
+            def interactive_responses(self, _binding, body, before_write, **kwargs):
+                write_fence = kwargs.get("write_fence")
+                if write_fence is not None:
+                    with write_fence():
+                        before_write()
+                else:
+                    before_write()
+                yield iter((
+                    {"type": "response.output_text.delta", "delta": "ok"},
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "status": "completed",
+                            "model": body["model"],
+                            "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}],
+                            "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+                        },
+                    },
+                ))
+
+        sb_tok = "tok-sbacc-" + "a" * 24
+        sb = SessionBroker(
+            socket_path=sb_job.provider_socket,
+            relay_proof=sb_job.relay_proof,
+            worker_token=sb_tok,
+            lease=sb_job.lease,
+            connection=_OkConn(),
+            binding=SimpleNamespace(generation=1),
+            models=("gpt-6.2-sol",),
+            profile_label="personal",
+            expected_port=8401,
+            policy=SessionPolicy(exposure_dir=exp_dir, proof_gate=pg, job_incarnation=sb_inc),
+        )
+        orig_accept_one = sb._accept_one_serialized
+        sb_paused = threading.Event()
+        sb_release = threading.Event()
+        sb_armed_pause = [True]
+
+        def paused_accept_one():
+            if sb_armed_pause[0]:
+                sb_armed_pause[0] = False
+                sb_paused.set()
+                sb_release.wait(timeout=5.0)
+            return orig_accept_one()
+
+        sb._accept_one_serialized = paused_accept_one
+        sb.start()
+        self.addCleanup(sb.close)
+
+        sb_body = json.dumps({
+            "model": "gpt-6.2-sol", "stream": True, "store": False,
+            "instructions": instr,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": PROOF_PROMPT}]}],
+        }).encode("utf-8")
+        sb_req = _make_http_request(method="POST", path="/v1/responses", port=8401, token=sb_tok, body=sb_body)
+        sb_pre: list[bytes] = []
+        t_sb = threading.Thread(
+            target=lambda: sb_pre.append(_send_framed_uds(sb_job.provider_socket, sb_job.relay_proof, sb_req)),
+            daemon=True,
+        )
+        t_sb.start()
+        self.assertTrue(sb_paused.wait(timeout=2.0))
+        # Transition relay_verified WHILE accept_loop is paused BEFORE accept()!
+        pg.mark_relay_verified("b" * 64)
+        sb_release.set()
+        t_sb.join(timeout=3.0)
+        self.assertEqual(len(sb_pre), 1)
+        self.assertIn(b"403 Forbidden", sb_pre[0])
+        self.assertIn(b"proof_gate_relay_unverified", sb_pre[0])
+        self.assertEqual(pg.admitted_writes, 0)
+
+        # Fresh post-verify connection succeeds cleanly.
+        sb_ok = _send_framed_uds(sb_job.provider_socket, sb_job.relay_proof, sb_req)
+        self.assertIn(b"200 OK", sb_ok)
+        self.assertEqual(pg.admitted_writes, 1)
 
     def test_post_hardening_validation_blocks_tampered_proof_config_before_container_create(self):
         gg_spec = _spec_obj("google", "personal")

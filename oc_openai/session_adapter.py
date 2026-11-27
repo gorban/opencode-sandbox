@@ -59,6 +59,7 @@ class _SlotReleaseGate:
     """Thread-safe durable lease release predicate bound to coordinator authority and sticky revocation."""
 
     def __init__(self) -> None:
+        self._commit_lock = threading.Lock()
         self._lock = threading.Lock()
         self._relay_created = False
         self._relay_removed = False
@@ -86,10 +87,11 @@ class _SlotReleaseGate:
                 self._release_authorized = True
 
     def deny_release(self) -> None:
-        with self._lock:
-            self._release_denied = True
-            self._release_authorized = False
-            self._relay_removed = False
+        with self._commit_lock:
+            with self._lock:
+                self._release_denied = True
+                self._release_authorized = False
+                self._relay_removed = False
 
     def bind_authority(self, predicate: Callable[[], bool]) -> None:
         if not callable(predicate):
@@ -120,6 +122,15 @@ class _SlotReleaseGate:
             return authority() is True
         except Exception:
             return False
+
+    def __call__(self) -> bool:
+        return self.allows_release()
+
+    @contextmanager
+    def commit_fence(self):
+        """Serialize sticky revocation against the final atomic store commit (os.replace)."""
+        with self._commit_lock:
+            yield self.allows_release()
 
 
 class OpenAISessionAdapter:
@@ -333,7 +344,7 @@ class OpenAISessionAdapter:
                 profile,
                 binding,
                 job,
-                release_gate=release_gate.allows_release,
+                release_gate=release_gate,
                 on_release_result=release_gate.record_outcome,
             )
             return lease_cm, True
@@ -344,7 +355,7 @@ class OpenAISessionAdapter:
             job,
             directory=profile.directory,
             client_id=profile.client_id,
-            release_gate=release_gate.allows_release,
+            release_gate=release_gate,
         )
         return lease_cm, False
 
