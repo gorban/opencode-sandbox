@@ -147,9 +147,12 @@ class OpenAISessionAdapter:
             digest=hold.digest,
         )
 
-    def _preflight_models(self, conn, binding) -> tuple[str, ...]:
+    def _preflight_models(self, conn, binding, *, deadline=None, cancelled=None) -> tuple[str, ...]:
         try:
-            models = conn.models(binding)
+            models = (
+                conn.models(binding, deadline=deadline, cancelled=cancelled)
+                if deadline is not None else conn.models(binding)
+            )
         except ConnectionError as exc:
             if exc.code in {
                 "untrusted_connection_path", "untrusted_connection_file", "invalid_connection_state",
@@ -160,6 +163,21 @@ class OpenAISessionAdapter:
         return tuple(models) if models else ()
 
     def preflight_instance(self, instance: ProviderInstanceSpec) -> InstancePreflight:
+        return self.preflight_for_admission(instance)
+
+    @staticmethod
+    def same_admission_target(original: object, current: object) -> bool:
+        if not isinstance(original, _OpenAISlotTarget) or not isinstance(current, _OpenAISlotTarget):
+            return False
+        first = original.profile
+        second = current.profile
+        return (first.label, first.directory, first.host_id, first.epoch, first.client_id, original.binding) == (
+            second.label, second.directory, second.host_id, second.epoch, second.client_id, current.binding
+        )
+
+    def preflight_for_admission(
+        self, instance: ProviderInstanceSpec, *, deadline=None, cancelled=None
+    ) -> InstancePreflight:
         if instance.kind != "openai" or not self.is_qualified(instance.auth_mode, "sandbox"):
             return InstancePreflight(spec=instance, readiness=ReadinessState.UNQUALIFIED)
 
@@ -176,7 +194,7 @@ class OpenAISessionAdapter:
             return InstancePreflight(spec=instance, readiness=ReadinessState.NEEDS_VERIFY)
 
         exposure_hold = self._inspect_shared_exposure(backend)
-        models = self._preflight_models(conn, binding)
+        models = self._preflight_models(conn, binding, deadline=deadline, cancelled=cancelled)
         if not models:
             return InstancePreflight(spec=instance, readiness=ReadinessState.NEEDS_VERIFY)
         return InstancePreflight(

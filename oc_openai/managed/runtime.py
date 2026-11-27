@@ -1,5 +1,7 @@
 """Create, verify and retire the two containers for one managed OpenCode job."""
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 from pathlib import Path
@@ -76,6 +78,24 @@ class JobRuntimeError(RuntimeError):
     """A concise diagnostic containing only trusted labels, roles, and identifiers."""
 
 
+_HOST_OPERATION_BUDGET = ContextVar("host_operation_budget", default=None)
+
+
+@contextmanager
+def host_operation_budget(deadline, cancelled=None):
+    """Constrain host commands in the current guarded launcher phase."""
+    token = _HOST_OPERATION_BUDGET.set((deadline, cancelled))
+    try:
+        yield
+    finally:
+        _HOST_OPERATION_BUDGET.reset(token)
+
+
+def limited_operation_wait(seconds: float) -> float:
+    budget = _HOST_OPERATION_BUDGET.get()
+    return seconds if budget is None else min(seconds, max(0.0, budget[0] - time.monotonic()))
+
+
 def account_home() -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
@@ -92,6 +112,15 @@ def host_command(program: str, *args: str, timeout: int = 12) -> subprocess.Comp
         "LC_ALL": "C",
     }
     # Clear the physical host command's inherited environment too.
+    wrapper_timeout = timeout + 4
+    budget = _HOST_OPERATION_BUDGET.get()
+    if budget is not None:
+        deadline, cancelled = budget
+        remaining = deadline - time.monotonic()
+        if remaining <= 2 or (cancelled is not None and cancelled.is_set()):
+            raise JobRuntimeError(f"Host {program} command cancelled or deadline expired")
+        timeout = min(timeout, remaining - 2)
+        wrapper_timeout = min(wrapper_timeout, remaining)
     command = [
         HOST_SPAWN, "--no-pty", "--env=", "/usr/bin/env", "-i",
         *(f"{key}={value}" for key, value in environment.items()),
@@ -101,7 +130,7 @@ def host_command(program: str, *args: str, timeout: int = 12) -> subprocess.Comp
     try:
         return subprocess.run(
             command, stdin=subprocess.DEVNULL, capture_output=True, env=environment,
-            timeout=timeout + 4,
+            timeout=wrapper_timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
         raise JobRuntimeError(f"Host {program} command failed or timed out") from None

@@ -19,4 +19,10 @@ docker-in-docker, implemented in PR #2).
       at P1/P2 severity. Add a deterministic two-launch stub regression and real same-instance check;
       cover owner death and the create-to-start gap without holding a shared lock for the session.
 
+- [ ] Run managed provider admission before Chromium or instance setup.
+      See [G1](prd_g1.md) for the walkthrough and observed failure.
+- [ ] Roll back resources owned by a launch that fails after admission.
+      Stop only the verified startup incarnation if no worker has adopted it.
+      Preserve existing resources, profiles and unresolved cleanup receipts.
+
 - [ ] **Human review**: checked only when the user says so

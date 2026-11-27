@@ -548,15 +548,37 @@ class TestAmbientFdImmunity(unittest.TestCase):
                 dst.write_bytes((REPO_ROOT / fname).read_bytes())
                 os.chmod(dst, 0o755 if fname == FILE_OC_SANDBOX else 0o644)
 
-            # Stub oc-openai-session.py inside scratch launcher dir to capture exact fd 3 JSON.
+            # Capture both framed launcher requests without using a real supervisor or provider.
             spec_out = td / "emitted_spec.json"
             stub_helper = launcher_dir / "oc-openai-session.py"
             stub_helper.write_text(
-                "import os, sys\n"
-                "from pathlib import Path\n"
-                "data = os.fdopen(3, 'rb').read()\n"
-                f"Path({str(spec_out)!r}).write_bytes(data)\n"
-                "raise SystemExit(0)\n",
+                f"""import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+assert sys.argv[1:] == ["--admission"]
+with os.fdopen(3, "rb") as requests, os.fdopen(4, "wb", buffering=0) as replies:
+    intent = json.loads(requests.readline())
+    replies.write(b"ADMITTED\\n")
+    placement = json.loads(requests.readline())
+    Path({str(spec_out)!r}).write_text(json.dumps([intent, placement]), encoding="utf-8")
+    replies.write(b"CREATED\\n")
+    replies.close()
+    # Keep the coprocess open until Bash consumes the acknowledgement and releases its guard.
+    deadline = time.monotonic() + 3
+    with (Path(intent["lifecycle_dir"]) / "lifecycle.lock").open("rb") as lock:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("launcher did not release the lifecycle guard")
+                time.sleep(.02)
+""",
                 encoding="utf-8",
             )
             os.chmod(stub_helper, 0o644)
@@ -583,7 +605,9 @@ case "$1 $2" in
     echo "{TEST_HEX_A}"; exit 0 ;;
   "volume exists") exit 0 ;;
   "pod exists") exit 1 ;;
+  "pod create") echo "{TEST_HEX_C}"; exit 0 ;;
   "pod inspect")
+    if [[ "$*" == *"{{{{.Id}}}}"* ]]; then echo "{TEST_HEX_C}"; exit 0; fi
     if [[ "$*" == *"oc.ports"* ]]; then echo ""; exit 0; fi
     if [[ "$*" == *"PortBindings"* ]]; then echo "{{}}"; exit 0; fi
     if [[ "$*" == *"oc.podcfg"* ]]; then echo "v1|"; exit 0; fi
@@ -593,6 +617,7 @@ case "$1 $2" in
     target="${{@: -1}}"
     if [[ "$*" == *".State.Status"* && "$target" == *-chromium ]]; then echo "running"; exit 0; fi
     if [[ "$*" == *".Image"* && "$target" == *-chromium ]]; then echo "{TEST_HEX_A}"; exit 0; fi
+    if [[ "$*" == *"{{{{.Pod}}}}"* && "$target" == *-chromium ]]; then echo "{TEST_HEX_C}"; exit 0; fi
     exit 1 ;;
   *) exit 0 ;;
 esac
@@ -646,7 +671,14 @@ esac
                     check=False,
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", errors="replace"))
-                emitted = json.loads(spec_out.read_text(encoding="utf-8"))
+                intent, placement = json.loads(spec_out.read_text(encoding="utf-8"))
+                self.assertEqual(set(placement), {"spec", "pod_id", "lifecycle_pid"})
+                self.assertEqual(placement["pod_id"], TEST_HEX_C)
+                self.assertGreater(placement["lifecycle_pid"], 1)
+                self.assertEqual(intent["instance"], TEST_INSTANCE)
+                self.assertEqual(intent["provider_filter"], "")
+                self.assertEqual(intent["cli_ui_mode"], want_ui)
+                emitted = placement["spec"]
                 jspec = JournalSpec(
                     run_id=TEST_RUN_ID,
                     instance=TEST_INSTANCE,

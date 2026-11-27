@@ -175,6 +175,7 @@ class PortableTests(unittest.TestCase):
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_session_leases.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_session_protocol.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_session_broker.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_session_admission.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_canary.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_shell_e2e_harness.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_supply_chain_pins.py'),
