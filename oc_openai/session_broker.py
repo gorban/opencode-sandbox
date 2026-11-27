@@ -37,6 +37,7 @@ from oc_providers.contracts import (
 )
 from .cli import Reason, RouteUnavailable, StreamTerminal, report_failure
 from .connection import ConnectionError
+from .connection_state import decode_json
 from .exposure import ExposureError, ExposureLedger
 from .live import make_backend
 from .profiles import ProfileError
@@ -747,10 +748,12 @@ class _SessionJob:
         active = relay_mod.grant_record(self.incarnation, self.generation, True)
         self.lease = relay_mod.Lease(self.grant, active, deadline_ns)
 
-    def activate(self) -> None:
+    def activate(self, verify=None) -> None:
         with self.lease.fence():
             if self.lease.status() != "pending":
                 raise RuntimeError("session grant is no longer pending")
+            if verify is not None:
+                verify()
             atomic_write(self.grant / "state", self.lease.active_record)
             (self.grant / "state").chmod(0o600)
 
@@ -976,11 +979,15 @@ def _owned_container_selector(container_id: str, instance: str, name: str, role=
 
 def _filtered_container_exists(container_id: str) -> bool:
     result = podman("ps", "-a", "--no-trunc", "--filter", _id_filter(container_id),
-                    "--format", "{{.ID}}", check=False, timeout=4)
+                    "--format", "json", check=False, timeout=4)
     if result.returncode == 0:
-        if not result.stdout:
+        try:
+            rows = decode_json(result.stdout)
+        except ValueError:
+            raise RuntimeError("Malformed filtered container inventory") from None
+        if rows == []:
             return False
-        if result.stdout.splitlines() == [container_id.encode("ascii")]:
+        if type(rows) is list and len(rows) == 1 and type(rows[0]) is dict and rows[0].get("Id") == container_id:
             return True
     raise RuntimeError("Could not confirm filtered container inventory")
 
@@ -1044,24 +1051,35 @@ def _verify_prepared_relay_log(details: dict, path: Path) -> None:
         raise RuntimeError("Prepared provider relay log or running state is unverified")
 
 
-def _wait_prepared_relay_bound(job: _SessionJob, process_label: bytes, port: int, cancelled) -> None:
-    if job.ready_fd is None:
+def _require_relay_ready_record(job: _SessionJob, process_label: bytes, port: int) -> None:
+    fd = job.ready_fd
+    if fd is None:
         raise RuntimeError("Missing prepared provider relay readiness file")
     mac = readiness_mac(job.relay_proof, job.lease.active_record, port, process_label).hex().encode("ascii")
     expected = b"stdout F " + READY_MARKER + b" " + mac + b"\n"
+    received = os.pread(fd, 257, 0)
+    info = os.fstat(fd)
+    if (
+        len(received) > 256 or received.count(b"\n") != 1 or info.st_size != len(received)
+        or not os.path.samestat(info, job.ready_path.lstat())
+    ):
+        raise RuntimeError("Invalid prepared provider relay readiness")
+    stamp, _, record = received.partition(b" ")
+    if not re.fullmatch(rb"[!-~]+", stamp) or not hmac.compare_digest(record, expected):
+        raise RuntimeError("Invalid prepared provider relay readiness")
+
+
+def _wait_prepared_relay_bound(job: _SessionJob, process_label: bytes, port: int, cancelled) -> None:
+    fd = job.ready_fd
+    if fd is None:
+        raise RuntimeError("Missing prepared provider relay readiness file")
     deadline = time.monotonic() + limited_operation_wait(8)
     while time.monotonic() < deadline and not cancelled.is_set() and job.lease.status() == "pending":
-        received = os.pread(job.ready_fd, 257, 0)
-        if not received:
-            cancelled.wait(0.05)
-            continue
-        verify_shared_file(job.ready_path, job.ready_fd)
-        if len(received) > 256 or received.count(b"\n") != 1:
-            raise RuntimeError("Invalid prepared provider relay readiness")
-        stamp, _, record = received.partition(b" ")
-        if not re.fullmatch(rb"[!-~]+", stamp) or not hmac.compare_digest(record, expected):
-            raise RuntimeError("Invalid prepared provider relay readiness")
-        return
+        if os.fstat(fd).st_size:
+            verify_shared_file(job.ready_path, fd)
+            _require_relay_ready_record(job, process_label, port)
+            return
+        cancelled.wait(0.05)
     raise RuntimeError("Prepared provider relay did not confirm readiness")
 
 
@@ -1409,6 +1427,10 @@ class _AgentTransportUnverified(JobRuntimeError):
     """The owned local attach process could not be reaped."""
 
 
+class _AgentAttachUnverified(JobRuntimeError):
+    """The reaped transport supplied no positive attached-selection evidence."""
+
+
 def _reap_agent_transport(child: subprocess.Popen) -> int:
     try:
         try:
@@ -1488,7 +1510,7 @@ def _launch_agent_tty(
         try:
             attach_evidence.verify()
         except (ValueError, OSError, JobRuntimeError):
-            raise _AgentTransportUnverified("Could not verify the attached worker selection.") from None
+            raise _AgentAttachUnverified("Could not verify the attached worker selection.") from None
     return status
 
 
@@ -1939,7 +1961,6 @@ def _start_slot_relay_deferred(
     )
     if receipt is not None:
         _wait_prepared_relay_bound(handle.job, process_label, handle.port, stop_event)
-        _verify_prepared_relay_log(_inspect_prepared_identity(receipt), handle.job.ready_path)
     if (
         stop_event.is_set()
         or handle.broker._revoked.is_set()
@@ -1960,6 +1981,30 @@ def _start_verified_relay(relay_id: str, receipt: _PreparedCreateReceipt | None)
         raise RuntimeError("Podman did not confirm the verified relay start")
 
 
+def _check_relay_activation(handle: SlotHandle, stop_event: threading.Event) -> None:
+    if (
+        stop_event.is_set()
+        or handle.broker._revoked.is_set()
+        or handle.job.lease.status() != "pending"
+        or time.monotonic_ns() >= handle.job.lease.deadline_ns
+    ):
+        raise ConnectionError("connection_retired")
+
+
+def _activate_prepared_relay(handle: SlotHandle, receipt: _PreparedCreateReceipt, stop_event) -> None:
+    job = handle.job
+    details = _inspect_prepared_identity(receipt)
+    _verify_prepared_relay_log(details, job.ready_path)
+    verify_shared_file(job.ready_path, job.ready_fd)
+    process_label = details["ProcessLabel"].encode("ascii")
+
+    def verify():
+        _require_relay_ready_record(job, process_label, handle.port)
+        _check_relay_activation(handle, stop_event)
+
+    job.activate(verify)
+
+
 def _start_and_verify_slot_relay(
     spec: dict,
     pod_id: str,
@@ -1975,16 +2020,15 @@ def _start_and_verify_slot_relay(
         relay_id = _start_slot_relay_deferred(
             spec, pod_id, handle, coordinator, siblings, started_relay_ids, stop_event,
         )
-        if not prepared:
+        if prepared:
+            receipt = coordinator.verified_receipt(relay_id)
+            if receipt is None:
+                raise RuntimeError("Prepared relay has no verified create receipt")
+            _activate_prepared_relay(handle, receipt, stop_event)
+        else:
             _wait_relay_bound(relay_id, port=handle.port)
-    if (
-        stop_event.is_set()
-        or handle.broker._revoked.is_set()
-        or handle.job.lease.status() != "pending"
-        or time.monotonic_ns() >= handle.job.lease.deadline_ns
-    ):
-        raise ConnectionError("connection_retired")
-    handle.job.activate()
+            _check_relay_activation(handle, stop_event)
+            handle.job.activate()
     return relay_id
 
 

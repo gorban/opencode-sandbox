@@ -126,7 +126,8 @@ the worker or relay by an anchored full-ID filter and the receipt's immutable
 create label for start, attached start, stop and force removal. Supply no
 positional name or ID. For a verified stopped predecessor, use its anchored
 ID and checked ownership labels with non-force removal. Verify removal with
-filtered full-ID inventory. An error, unexpected result or surviving ID
+filtered full-ID JSON inventory and require an explicit empty array for
+absence. An error, missing or unexpected result, or surviving ID
 keeps the cleanup outcome unresolved. Qualify the native Podman selector and
 attached start in the isolated guest, and test a mismatched identity with
 inert stubs.
@@ -146,8 +147,10 @@ guest and permitted the private conmon log without a policy change.
 The record's MAC binds the grant incarnation, generation, port and
 effective SELinux process label to the slot proof. Verify the configured
 log path and pinned inode, exact live relay, and independently measured
-bind-mount labels. An invalid, oversized, repeated or stale record aborts
-before activation. The log remains outside the worker and relay mounts.
+bind-mount labels. After the final host query, re-read the pinned record
+inside the pending grant's activation fence. An invalid, oversized,
+repeated or stale record aborts before activation. The log remains outside
+the worker and relay mounts.
 
 ## Verification before review and merge
 

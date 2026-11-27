@@ -585,15 +585,19 @@ class AdmissionTests(unittest.TestCase):
     def test_verified_cleanup_uses_only_full_id_filters_and_confirms_absence(self):
         cid = "e" * 64
         receipt = broker._PreparedCreateReceipt(cid, "default", POD_ID, "oc-agent", None, "c" * 64, "marker")
-        expected = subprocess.CompletedProcess((), 0, b"", b"")
-        still_present = subprocess.CompletedProcess((), 0, cid.encode("ascii") + b"\n", b"")
-        with patch.object(broker, "podman", side_effect=(expected, still_present, expected, expected)) as pm:
+        blank = subprocess.CompletedProcess((), 0, b"", b"")
+        absent = subprocess.CompletedProcess((), 0, b"[]", b"")
+        still_present = subprocess.CompletedProcess((), 0, json.dumps([{"Id": cid}]).encode("ascii"), b"")
+        replies = (blank, blank, blank, still_present, blank, absent)
+        with patch.object(broker, "podman", side_effect=replies) as pm:
+            with self.assertRaisesRegex(RuntimeError, "Malformed filtered container"):
+                broker._remove_filtered_container(cid, receipt.selector, force=True)
             with self.assertRaisesRegex(RuntimeError, "exact container selector"):
                 broker._remove_filtered_container(cid, receipt.selector, force=True)
             broker._remove_filtered_container(cid, receipt.selector, force=True)
         self.assertEqual(pm.call_args_list[0].args, ("rm", "-f", *receipt.selector))
         self.assertEqual(pm.call_args_list[1].args, ("ps", "-a", "--no-trunc", "--filter", f"id=^{cid}$",
-                                                    "--format", "{{.ID}}"))
+                                                    "--format", "json"))
         self.assertNotIn(cid, receipt.selector)
         self.assertIn("label=oc.session.create=marker", receipt.selector)
 
@@ -656,6 +660,59 @@ class AdmissionTests(unittest.TestCase):
             path.write_bytes(packet * 2)
         else:
             path.write_bytes(packet)
+
+    def test_activation_rejects_new_log_bytes_after_final_host_check(self):
+        job = broker._SessionJob(self.state, "test-slot")
+        job.prepare()
+        self.addCleanup(job.revoke)
+        label = "system_u:system_r:container_t:s0:c1,c2"
+        mac = broker.readiness_mac(job.relay_proof, job.lease.active_record, 8401, label.encode("ascii"))
+        record = f"2026-01-01T00:00:00Z stdout F OC_RELAY_READY {mac.hex()}\n".encode("ascii")
+        details = {
+            "HostConfig": {"LogConfig": {"Type": "k8s-file", "Path": str(job.ready_path)}},
+            "State": {"Running": True}, "ProcessLabel": label,
+        }
+        handle = SimpleNamespace(job=job, port=8401, broker=SimpleNamespace(_revoked=threading.Event()))
+        cancelled = threading.Event()
+        receipt = object()
+
+        def append_during_check(_path, _fd):
+            with job.ready_path.open("ab") as log:
+                log.write(record)
+
+        with (
+            patch.object(session_attach, "host_output",
+                         side_effect=lambda *args: session_attach._identity(Path(args[-1]).lstat())),
+            job.relay_ready_log(),
+        ):
+            job.ready_path.write_bytes(record)
+            with (
+                patch.object(broker, "_inspect_prepared_identity", return_value=details),
+                patch.object(broker, "verify_shared_file", side_effect=append_during_check),
+                self.assertRaisesRegex(RuntimeError, "Invalid prepared"),
+            ):
+                broker._activate_prepared_relay(handle, receipt, cancelled)
+            self.assertEqual(job.lease.status(), "pending")
+
+    def test_missing_attach_evidence_does_not_report_unreaped_transport(self):
+        stop_event = threading.Event()
+        coordinator = broker._SessionSlotCoordinator(stop_event)
+        worker = "e" * 64
+        receipt = broker._PreparedCreateReceipt(worker, "default", POD_ID, "oc-agent", None, "c" * 64, "marker")
+        coordinator._verified_creates[worker] = receipt
+        options = {"prepared_pod": POD_ID, "created": Mock(), "checkpoint": Mock()}
+        evidence = SimpleNamespace(variables={}, options=(), verify=Mock(side_effect=ValueError("No attach event")))
+        child = SimpleNamespace(poll=lambda: 0)
+        with (
+            patch.object(coordinator, "any_active", return_value=True),
+            patch.object(broker, "filtered_attach_evidence", return_value=nullcontext(evidence)),
+            patch.object(broker, "_verify_prepared_create"),
+            patch.object(broker.subprocess, "Popen", return_value=child),
+            self.assertRaisesRegex(broker._AgentAttachUnverified, "attached worker selection"),
+        ):
+            broker._attach_session_worker(worker, coordinator, stop_event, self.state, options, None)
+        self.assertIsNone(coordinator._cleanup_error)
+        evidence.verify.assert_called_once()
 
     def test_cancelled_create_receipt_is_verified_with_fresh_cleanup_budget(self):
         for is_relay in (False, True):
