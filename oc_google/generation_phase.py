@@ -3,6 +3,7 @@
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from hashlib import sha256
 import os
 from pathlib import Path
 import re
@@ -33,6 +34,7 @@ class Phase(Enum):
     STARTUP_COMPLETE = auto()
     CLOSING_STARTUP = auto()
     BOUND = auto()
+    BINDING_JOURNAL = auto()
     OPENING = auto()
     LISTENING = auto()
     ACCEPTING = auto()
@@ -79,6 +81,37 @@ class PhaseReceipt:
     fake_writes: int
     refusal_observed: bool
     connector_retired: bool
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _JournalExpectation:
+    proxy_binding: GenerationBinding
+    journal_binding: object
+    fence: object
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _JoinCapability:
+    nonce: bytes = field(repr=False)
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("Gemini fixture journal setup cannot be copied or serialized")
+
+
+class _JoinInstaller:
+    """Keep the private one-use capability with the original supervisor."""
+
+    __slots__ = ("__phase", "__capability")
+
+    def __init__(self, phase, capability):
+        self.__phase = phase
+        self.__capability = capability
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("Gemini fixture journal setup cannot be copied or serialized")
+
+    def __call__(self, journal_binding, *, proxy_binding, fence):
+        self.__phase._install_journal(self.__capability, journal_binding, proxy_binding=proxy_binding, fence=fence)
 
 
 class _PeerPin:
@@ -171,10 +204,14 @@ class FixturePhase:
     """
 
     def __init__(self, directory, *, port, binding, fence, authorized, verify_helper,
-                 sent_receipt_is_current, destination_claim_is_current):
+                 sent_receipt_is_current=None, destination_claim_is_current=None, _join_key=None):
+        joined = _join_key is not None
+        valid_mode = (sent_receipt_is_current is None
+                      and destination_claim_is_current is None) if joined else (
+                          callable(sent_receipt_is_current) and callable(destination_claim_is_current))
         if (type(binding) is not GenerationBinding or fence is None
                 or type(port) is not int or not 1024 <= port <= 65535
-                or not callable(sent_receipt_is_current) or not callable(destination_claim_is_current)):
+                or not valid_mode):
             raise ProxyRefused("Gemini fixture phase binding differs")
         self._binding = binding
         self._fence = fence
@@ -182,6 +219,9 @@ class FixturePhase:
         self._verify_helper = verify_helper
         self._sent_receipt_is_current = sent_receipt_is_current
         self._destination_claim_is_current = destination_claim_is_current
+        self._joined = joined
+        self._join_key = _join_key
+        self._journal_expectation = None
         start = monotonic()
         self.launch = ProxyLaunch(directory, port, os.urandom(16), os.getpid(),
                                   start + STARTUP_SECONDS, start + HARD_SECONDS)
@@ -193,6 +233,36 @@ class FixturePhase:
         self._baseline = self._sent_receipt = self._journal_run = None
         self._startup_eofs = self._helper_accepts = self._owner_accepts = self._fake_writes = 0
         self._refusal = self._connector_retired = False
+
+    @classmethod
+    def joined(cls, directory, *, port, binding, fence, authorized, verify_helper):
+        """Create a journal-only phase and a separate supervisor setup installer."""
+        from .generation_journal import _RLOCK
+
+        if type(fence) is not _RLOCK:
+            raise ProxyRefused("Gemini fixture phase binding differs")
+        capability = _JoinCapability(os.urandom(32))
+        # The phase can verify identity without retaining the capability.
+        key = (id(capability), sha256(capability.nonce).digest())
+        phase = cls(directory, port=port, binding=binding, fence=fence, authorized=authorized,
+                    verify_helper=verify_helper, _join_key=key)
+        return phase, _JoinInstaller(phase, capability)
+
+    def _install_journal(self, capability, journal_binding, *, proxy_binding, fence):
+        from .generation_journal import Binding
+
+        with self._fence:
+            key = self._join_key
+            if (key is None or type(capability) is not _JoinCapability or id(capability) != key[0]
+                    or sha256(capability.nonce).digest() != key[1]):
+                raise ProxyRefused("Gemini fixture journal setup is unavailable")
+            self._join_key = None
+            if (os.getpid() != self.launch.owner_pid or self._phase is not Phase.STARTING
+                    or proxy_binding is not self._binding or fence is not self._fence
+                    or type(journal_binding) is not Binding or journal_binding.epoch != proxy_binding.epoch
+                    or journal_binding.model != proxy_binding.alias):
+                raise ProxyRefused("Gemini fixture journal setup differs")
+            self._journal_expectation = _JournalExpectation(proxy_binding, journal_binding, fence)
 
     def __reduce_ex__(self, _protocol):
         raise TypeError("Gemini fixture phase ownership cannot be copied or serialized")
@@ -403,6 +473,10 @@ class FixturePhase:
         deadline = self.launch.startup_deadline
         with self._step(Phase.STARTUP_COMPLETE, Phase.CLOSING_STARTUP):
             with self._fence:
+                if self._joined and (self._journal_expectation is None
+                                     or self._journal_expectation.journal_binding.launch
+                                     != self._original_helper.invocation):
+                    raise ProxyRefused("Gemini fixture journal setup differs")
                 self._audit(deadline)
                 self._startup.close()
                 self._audit(deadline)
@@ -432,24 +506,30 @@ class FixturePhase:
         self._check_output_authority(deadline, peer)
 
     def bind_journal(self, run, sent_receipt, *, proxy_binding, journal_binding):
-        """Pin the separately prepared owner, exact journal run and durable scope before arm."""
-        from .generation_journal import Binding, Phase as JournalPhase, _Run
+        """Match the first durable receipt to the supervisor's pinned expectation."""
+        from .generation_journal import Phase as JournalPhase, _Run
 
         try:
             with self._fence:
-                if (self._phase is not Phase.BOUND or self._journal_run is not None
-                        or proxy_binding is not self._binding
-                        or type(run) is not _Run or run._owner_fence() is not self._fence
-                        or type(journal_binding) is not Binding or run._control.binding is not journal_binding
-                        or run._control.deadline is None or journal_binding.epoch != proxy_binding.epoch
-                        or journal_binding.model != proxy_binding.alias):
+                expected = self._journal_expectation
+                if (self._phase is not Phase.BOUND or expected is None or self._journal_run is not None
+                        or proxy_binding is not expected.proxy_binding or expected.proxy_binding is not self._binding
+                        or expected.fence is not self._fence or journal_binding is not expected.journal_binding
+                        or type(run) is not _Run or run._control.binding is not expected.journal_binding
+                        or run._owner_fence() is not expected.fence
+                        or run._files.anchor.enrollment.generation != expected.journal_binding.generation
+                        or expected.journal_binding.launch != self._original_helper.invocation
+                        or type(run._control.deadline) not in (int, float)
+                        or not 0 < run._control.deadline < float("inf")):
                     raise ProxyRefused("Gemini fixture journal run differs")
+                self._phase = Phase.BINDING_JOURNAL
                 run.verify_acp_sent(sent_receipt)
                 self._check_owner(run._control.deadline)
                 run._verify_local_acp_sent(sent_receipt, phase=JournalPhase.ACP_SENT)
                 self._check_output_pins(run._control.deadline, None)
                 self._sent_receipt = sent_receipt
                 self._journal_run = run
+                self._phase = Phase.BOUND
         except BaseException:
             self.revoke()
             raise
@@ -487,11 +567,13 @@ class FixturePhase:
         with self._step(Phase.BOUND, Phase.OPENING):
             with self._fence:
                 self._deadline = min(self.launch.hard_deadline, monotonic() + TURN_SECONDS)
-            if journal_run is not None or self._journal_run is not None:
+            if self._joined:
                 if journal_run is None or self._journal_run is None:
                     raise ProxyRefused("Gemini fixture journal run differs")
                 self._activate_journal(sent_receipt, journal_run)
                 return
+            if journal_run is not None:
+                raise ProxyRefused("Gemini fixture journal run differs")
             with self._fence:
                 self._sent_receipt = sent_receipt
                 self._check_sent(self._deadline)
@@ -613,7 +695,7 @@ class FixturePhase:
         with self._step(Phase.LISTENING, Phase.ACCEPTING):
             if type(destination) is not FakeDestination:
                 raise ProxyRefused("Gemini fixture destination is unavailable")
-            if run is None or run is not self._journal_run:
+            if not self._joined or run is None or run is not self._journal_run:
                 raise ProxyRefused("Gemini fixture journal run differs")
             deadline = self._deadline
             with self._fence:
@@ -642,7 +724,7 @@ class FixturePhase:
         with self._step(Phase.LISTENING, Phase.ACCEPTING):
             if type(destination) is not FakeDestination:
                 raise ProxyRefused("Gemini fixture destination is unavailable")
-            if self._journal_run is not None or not callable(claim_destination):
+            if self._joined or not callable(claim_destination):
                 raise ProxyRefused("Gemini fixture durable destination claim is unavailable")
             deadline = self._deadline
             with self._turn_request(deadline) as (connection, peer, request):

@@ -1,12 +1,13 @@
 """Exercise the durable-to-proxy join in a private, offline fixture."""
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from copy import copy
+from contextlib import ExitStack, contextmanager, suppress
+from copy import copy, deepcopy
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import pickle
 import socket
 from tempfile import TemporaryDirectory
 from threading import Event, RLock
@@ -33,6 +34,7 @@ class JournalTurnTest(unittest.TestCase):
         self.journal_observer = lambda: None
         self.slot_root = self.home / ".local/state/oc-sandbox/google" / journal._FIXTURE_DIR
         self.slot = self.slot_root / "registrations" / self.registration.label
+        self.journal_homes = {self.home}
 
     def durable_phase(self):
         return journal.Phase(json.loads((self.slot / journal._STATE).read_bytes())["phase"])
@@ -57,47 +59,62 @@ class JournalTurnTest(unittest.TestCase):
             run.settle(write, journal.SettlementEvidence(write, owner, len(packet), digest))
         return run.acp_sent()
 
+    def assert_helper_has_no_journal_fds(self, child):
+        for descriptor in Path(f"/proc/{child}/fd").iterdir():
+            with suppress(FileNotFoundError):
+                target = descriptor.readlink()
+                self.assertFalse(any(target.is_relative_to(home) for home in self.journal_homes))
+
     @contextmanager
-    def session(self, *, expect_success=False, activate=True, run_fence=None, bind=True):
+    def pending(self, *, expect_success=False):
         p = self.proxy
-        with generation_phase.FixturePhase(
+        phase, install = generation_phase.FixturePhase.joined(
             p.root, port=p.port, binding=p.binding, fence=self.fence,
             authorized=lambda binding: p.live and binding is p.binding,
             verify_helper=lambda helper: helper is p.scope,
-            sent_receipt_is_current=lambda *_: self.fail("legacy receipt verifier in journal turn"),
-            destination_claim_is_current=lambda *_: self.fail("legacy claim verifier in journal turn"),
-        ) as phase:
+        )
+        with phase:
             # The helper forks before any D1 file is provisioned or opened.
             with p.helper(phase, expect_success=expect_success) as child:
                 p.scope = generation_phase.HelperPlacement(child, os.geteuid(), b"/fixture.service", "a" * 32)
                 try:
-                    p.prepare(phase)
-                    anchor = provision(self.registration, self.addCleanup)
-                    ledger = journal.GenerationJournal(self.registration, anchor)
-                    binding = anchor.binding(epoch=p.binding.epoch, launch="a" * 32)
-                    fence = self.fence if run_fence is None else run_fence
-                    def journal_owner(value):
-                        self.journal_observer()
-                        return value is binding
-
-                    with ledger.launch(binding, fence=fence, authorized=journal_owner,
-                                       deadline=monotonic() + 20) as run:
-                        sent = self.publish(run, journal.Operation.ACP)
-                        if bind:
-                            phase.bind_journal(run, sent, proxy_binding=p.binding, journal_binding=binding)
-                        if activate:
-                            phase.activate(sent, journal_run=run)
-                        yield phase, run, sent
-                    with self.assertRaises(journal.GenerationHeld):
-                        ledger.status()
-                    with self.assertRaises(journal.GenerationHeld):
-                        with ledger.launch(binding, fence=self.fence, authorized=lambda _: True,
-                                           deadline=monotonic() + 1):
-                            self.fail("the spent generation reopened")
+                    yield phase, install, child
                 finally:
                     if phase.receipt().phase is not generation_phase.Phase.COMPLETE:
                         phase.revoke()
         self.assertEqual(list(p.root.iterdir()), [])
+
+    @contextmanager
+    def session(self, *, expect_success=False, activate=True, run_fence=None, bind=True, copy_binding=False):
+        p = self.proxy
+        self.journal_homes.add(self.home)
+        with self.pending(expect_success=expect_success) as (phase, install, child), ExitStack() as journal_fds:
+            anchor = provision(self.registration, journal_fds.callback)
+            ledger = journal.GenerationJournal(self.registration, anchor)
+            original = anchor.binding(epoch=p.binding.epoch, launch=p.scope.invocation)
+            install(original, proxy_binding=p.binding, fence=self.fence)
+            self.assert_helper_has_no_journal_fds(child)
+            p.prepare(phase)
+            binding = copy(original) if copy_binding else original
+            fence = self.fence if run_fence is None else run_fence
+
+            def journal_owner(value):
+                self.journal_observer()
+                return value is binding
+
+            with ledger.launch(binding, fence=fence, authorized=journal_owner, deadline=monotonic() + 20) as run:
+                self.assert_helper_has_no_journal_fds(child)
+                sent = self.publish(run, journal.Operation.ACP)
+                if bind:
+                    phase.bind_journal(run, sent, proxy_binding=p.binding, journal_binding=binding)
+                if activate:
+                    phase.activate(sent, journal_run=run)
+                yield phase, run, sent
+            with self.assertRaises(journal.GenerationHeld):
+                ledger.status()
+            with self.assertRaises(journal.GenerationHeld):
+                with ledger.launch(binding, fence=self.fence, authorized=lambda _: True, deadline=monotonic() + 1):
+                    self.fail("the spent generation reopened")
 
     def test_write_and_observe_settle_before_native_publication(self):
         with self.session(expect_success=True) as (phase, run, sent):
@@ -169,12 +186,162 @@ class JournalTurnTest(unittest.TestCase):
             self.assertEqual(phase.receipt().owner_turn_accepts, 0)
             self.assertEqual(self.durable_phase(), journal.Phase.ACP_SENT)
 
-    def test_genuine_foreign_run_with_shared_fence_epoch_and_model_cannot_arm(self):
-        with self.session(activate=False) as (phase, run, _):
-            with TemporaryDirectory(prefix="oc-google-foreign-join-") as path, \
+    def test_genuine_foreign_run_cannot_be_the_first_binding(self):
+        p = self.proxy
+        with self.session(activate=False, bind=False) as (phase, run, sent):
+            original = run._control.binding
+            with TemporaryDirectory(prefix="oc-google-foreign-first-") as path, ExitStack() as files, \
                     patch.object(registration, "_account_home", return_value=Path(path)):
                 independent = journal.FixtureRegistrationJournal()
-                anchor = provision(independent, self.addCleanup)
+                anchor = provision(independent, files.callback)
+                ledger = journal.GenerationJournal(independent, anchor)
+                alternate = anchor.binding(epoch=original.epoch, launch=original.launch)
+                self.assertEqual(alternate.model, original.model)
+                self.assertNotEqual(alternate.generation, original.generation)
+                with ledger.launch(alternate, fence=self.fence, authorized=lambda value: value is alternate,
+                                   deadline=monotonic() + 10) as foreign:
+                    foreign_sent = self.publish(foreign, journal.Operation.ACP)
+                    with patch.object(phase, "_send") as control, \
+                            patch.object(generation_phase, "_send_once") as wire, \
+                            patch.object(generation.FakeDestination, "write") as dispatch:
+                        with self.assertRaisesRegex(ProxyRefused, "journal run differs"):
+                            phase.bind_journal(foreign, foreign_sent, proxy_binding=p.binding,
+                                               journal_binding=alternate)
+                    control.assert_not_called()
+                    wire.assert_not_called()
+                    dispatch.assert_not_called()
+                    foreign.verify_acp_sent(foreign_sent)
+            run.verify_acp_sent(sent)
+            self.assertIs(phase.receipt().phase, generation_phase.Phase.HELD)
+            self.assertEqual(phase.receipt().owner_turn_accepts, 0)
+            self.assertEqual(phase.receipt().fake_writes, 0)
+
+    def test_value_equal_journal_binding_cannot_be_the_first_binding(self):
+        with self.session(activate=False, bind=False, copy_binding=True) as (phase, run, sent):
+            with self.assertRaisesRegex(ProxyRefused, "journal run differs"):
+                phase.bind_journal(run, sent, proxy_binding=self.proxy.binding, journal_binding=run._control.binding)
+            run.verify_acp_sent(sent)
+            self.assertIs(phase.receipt().phase, generation_phase.Phase.HELD)
+
+    def test_reentrant_first_binding_cannot_publish_or_arm(self):
+        p = self.proxy
+        with self.session(activate=False, bind=False) as (phase, run, sent):
+            original = run._control.binding
+            attempts = []
+
+            def observe(binding):
+                attempts.append(binding)
+                with self.assertRaisesRegex(ProxyRefused, "journal run differs"):
+                    phase.bind_journal(run, sent, proxy_binding=p.binding, journal_binding=original)
+                return True
+
+            with patch.object(phase, "_authorized", side_effect=observe), \
+                    patch.object(phase, "_send") as control, \
+                    patch.object(generation_phase, "_send_once") as wire:
+                with self.assertRaisesRegex(ProxyRefused, "owner retired"):
+                    phase.bind_journal(run, sent, proxy_binding=p.binding, journal_binding=original)
+            self.assertEqual(attempts, [p.binding])
+            control.assert_not_called()
+            wire.assert_not_called()
+            run.verify_acp_sent(sent)
+            self.assertIs(phase.receipt().phase, generation_phase.Phase.HELD)
+
+    def test_join_setup_cannot_be_copied_serialized_or_repeated(self):
+        p = self.proxy
+        with self.pending() as (phase, install, _), ExitStack() as files:
+            anchor = provision(self.registration, files.callback)
+            original = anchor.binding(epoch=p.binding.epoch, launch=p.scope.invocation)
+            for value in (phase, install):
+                for operation in (copy, deepcopy, pickle.dumps):
+                    with self.subTest(value=type(value).__name__, operation=operation.__name__):
+                        with self.assertRaises(TypeError):
+                            operation(value)
+            with self.assertRaisesRegex(ProxyRefused, "journal setup is unavailable"):
+                phase._install_journal(generation_phase._JoinCapability(os.urandom(32)), original,
+                                       proxy_binding=p.binding, fence=self.fence)
+            install(original, proxy_binding=p.binding, fence=self.fence)
+            with self.assertRaisesRegex(ProxyRefused, "journal setup is unavailable"):
+                install(copy(original), proxy_binding=p.binding, fence=self.fence)
+            p.prepare(phase)
+
+    def test_failed_or_late_join_setup_spends_the_installer(self):
+        p = self.proxy
+        for case in ("wrong fence", "wrong pid", "late"):
+            with self.subTest(case=case), TemporaryDirectory(prefix="oc-google-join-setup-") as path, \
+                    patch.object(registration, "_account_home", return_value=Path(path)), \
+                    self.pending() as (phase, install, _), ExitStack() as files:
+                anchor = provision(self.registration, files.callback)
+                original = anchor.binding(epoch=p.binding.epoch, launch=p.scope.invocation)
+                if case == "late":
+                    p.attach(phase)
+                fence = RLock() if case == "wrong fence" else self.fence
+                owner_pid = os.getpid()
+                with patch.object(generation_phase.os, "getpid", return_value=owner_pid + (case == "wrong pid")):
+                    with self.assertRaisesRegex(ProxyRefused, "journal setup differs"):
+                        install(original, proxy_binding=p.binding, fence=fence)
+                with self.assertRaisesRegex(ProxyRefused, "journal setup is unavailable"):
+                    install(original, proxy_binding=p.binding, fence=self.fence)
+
+    def test_joined_phase_cannot_reach_bound_without_exact_launch_setup(self):
+        p = self.proxy
+        for case in ("absent", "other launch"):
+            with self.subTest(case=case), self.pending() as (phase, install, _), ExitStack() as files:
+                if case == "other launch":
+                    anchor = provision(self.registration, files.callback)
+                    wrong = anchor.binding(epoch=p.binding.epoch, launch="b" * 32)
+                    install(wrong, proxy_binding=p.binding, fence=self.fence)
+                with self.assertRaisesRegex(ProxyRefused, "journal setup differs"):
+                    p.prepare(phase)
+                self.assertIs(phase.receipt().phase, generation_phase.Phase.HELD)
+
+    def test_joined_phase_refuses_legacy_paths_before_receipt_binding(self):
+        for method in ("activate", "serve"):
+            with self.subTest(method=method), TemporaryDirectory(prefix="oc-google-legacy-join-") as path:
+                self.home = Path(path)
+                with patch.object(registration, "_account_home", return_value=self.home), \
+                        self.session(activate=False, bind=False) as (phase, _run, sent):
+                    p = self.proxy
+                    with patch.object(phase, "_send") as control, \
+                            patch.object(generation.FakeDestination, "write") as dispatch:
+                        with self.assertRaises(ProxyRefused):
+                            if method == "activate":
+                                phase.activate(sent)
+                            else:
+                                phase.serve_turn(p.destination(), claim_destination=p.claim_destination)
+                    control.assert_not_called()
+                    dispatch.assert_not_called()
+                    self.assertIs(phase.receipt().phase, generation_phase.Phase.HELD)
+
+    def test_legacy_phase_refuses_all_joined_paths(self):
+        p = self.proxy
+        for method in ("setup", "bind", "activate", "serve"):
+            with self.subTest(method=method), p.fixture(expect_success=False) as phase:
+                if method == "setup":
+                    with self.assertRaisesRegex(ProxyRefused, "journal setup is unavailable"):
+                        phase._install_journal(object(), None, proxy_binding=p.binding, fence=phase._fence)
+                    continue
+                p.prepare(phase)
+                if method == "serve":
+                    p.sent = True
+                    phase.activate(p.receipt)
+                with patch.object(phase, "_send") as control, \
+                        patch.object(generation.FakeDestination, "write") as dispatch:
+                    with self.assertRaisesRegex(ProxyRefused, "journal run differs"):
+                        if method == "bind":
+                            phase.bind_journal(None, None, proxy_binding=p.binding, journal_binding=None)
+                        elif method == "activate":
+                            phase.activate(None, journal_run=object())
+                        else:
+                            phase.serve_journal_turn(p.destination(), object())
+                control.assert_not_called()
+                dispatch.assert_not_called()
+
+    def test_genuine_foreign_run_with_shared_fence_epoch_and_model_cannot_arm(self):
+        with self.session(activate=False) as (phase, run, _):
+            with TemporaryDirectory(prefix="oc-google-foreign-join-") as path, ExitStack() as files, \
+                    patch.object(registration, "_account_home", return_value=Path(path)):
+                independent = journal.FixtureRegistrationJournal()
+                anchor = provision(independent, files.callback)
                 ledger = journal.GenerationJournal(independent, anchor)
                 binding = anchor.binding(epoch=run._control.binding.epoch, launch="b" * 32)
                 with ledger.launch(binding, fence=self.fence, authorized=lambda value: value is binding,
