@@ -25,6 +25,8 @@
   "vulnerabilityAlerts": { "enabled": false },
   "osvVulnerabilityAlerts": false,
   "minimumReleaseAge": "7 days",
+  "minimumReleaseAgeBehaviour": "timestamp-required",
+  "internalChecksFilter": "strict",
   "schedule": ["* 0-5 * * 1"],
   "prConcurrentLimit": 3,
   "prHourlyLimit": 1,
@@ -32,7 +34,7 @@
   "labels": ["dependencies"],
   "packageRules": [
     {
-      "description": "Only Docker Hub reports when a digest was published. Propose digests from these registries without the seven-day wait, and label the pull request so the reviewer applies the wait.",
+      "description": "Allow a missing release timestamp only for these registries. Label their pull requests so a reviewer handles the cooldown when a timestamp is unavailable.",
       "matchDatasources": ["docker"],
       "matchPackageNames": ["ghcr.io/**", "quay.io/**", "registry.fedoraproject.org/**"],
       "minimumReleaseAgeBehaviour": "timestamp-optional",
@@ -41,6 +43,7 @@
     {
       "description": "A mise tool update also needs new checksums in tools/ci/mise.lock and tools/ci/toolchain.py, which a person adds.",
       "matchManagers": ["mise"],
+      "skipArtifactsUpdate": true,
       "addLabels": ["needs-checksum-update"]
     }
   ]

@@ -32,8 +32,9 @@ for the attended import and its scope.
   release is seven days old. Review the upstream changes between the two commits before merging.
   Dependabot security updates are a repository setting and are not delayed.
 - **Renovate** (`.github/renovate.json`) proposes updates only for image references pinned by
-  digest in the launcher and for the mise tools under `tools/ci`. It is configured never to merge, and opens no
-  dashboard issue and no vulnerability pull requests. A pull request labelled
-  `no-release-age-check` comes from a registry that reports no release date, so leave it open for
-  a week before merging. One labelled `needs-checksum-update` also needs new checksums in
-  `tools/ci/mise.lock` and `tools/ci/toolchain.py` before its checks can pass.
+  digest in the launcher and for the mise tools under `tools/ci`. It opens no dashboard issue
+  or vulnerability pull requests and never merges. The seven-day cooldown on Docker Hub uses
+  the tag's last-pushed timestamp. A pull request labelled `no-release-age-check` can lack a
+  release timestamp. Check its age yourself, or leave it open for a week before merging.
+  For a `needs-checksum-update` PR, update the checksums in `tools/ci/mise.lock` and
+  `tools/ci/toolchain.py` manually. Renovate skips mise artifact updates.

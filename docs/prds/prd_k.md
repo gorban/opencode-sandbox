@@ -146,9 +146,12 @@ when inspected. This establishes the check identity and a scope gap. PR qualific
         uploads, and changed the commit and the comment at all four uses.
   - [x] Scope Mend Renovate to what Dependabot cannot read: image references pinned by digest
         in the launcher, and the mise tools under `tools/ci`. `.github/renovate.json` turns off
-        automerge, the dashboard issue and vulnerability pull requests, opens at most three
-        pull requests in a weekly window, and waits seven days after a release. Registries that
-        report no release date get a `no-release-age-check` label instead of the wait. A
+        automerge, the dashboard issue and vulnerability pull requests. It allows three open
+        pull requests and one new pull request per hour. Branch creation is Monday 00:00–06:00
+        UTC, with existing branches eligible for updates outside the window. The seven-day
+        cooldown requires a release timestamp by default. Three named registries can propose
+        updates without a timestamp under `no-release-age-check`. For mise, Renovate skips
+        artifact updates so a maintainer updates both checksum files. A
         contract test in `tests/test_ci.py` holds those settings and checks that every
         digest-pinned launcher image is matched (`chore/renovate-gaps`).
   - [ ] Install the Mend Renovate app on this repository only, after the config is on `main`,

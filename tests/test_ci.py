@@ -308,16 +308,33 @@ class RenovateConfigTests(unittest.TestCase):
         for rule in self.config['packageRules']:
             self.assertNotIn('automerge', rule)
             self.assertNotIn('platformAutomerge', rule)
+            self.assertNotIn('vulnerabilityAlerts', rule)
+            self.assertNotIn('osvVulnerabilityAlerts', rule)
+
+    def test_schedule_and_concurrency(self):
+        self.assertEqual(self.config['schedule'], ['* 0-5 * * 1'])
+        self.assertEqual(self.config['prConcurrentLimit'], 3)
+        self.assertEqual(self.config['prHourlyLimit'], 1)
 
     def test_scope_is_launcher_images_and_ci_tools(self):
         self.assertEqual(self.config['enabledManagers'], ['custom.regex', 'mise'])
         self.assertEqual(self.config['includePaths'], ['oc-sandbox', 'tools/ci/mise.toml', 'tools/ci/mise.lock'])
         self.assertEqual(self.config['minimumReleaseAge'], '7 days')
+        self.assertEqual(self.config['minimumReleaseAgeBehaviour'], 'timestamp-required')
+        self.assertEqual(self.config['internalChecksFilter'], 'strict')
+        for rule in self.config['packageRules']:
+            self.assertNotIn('minimumReleaseAge', rule)
         untimed = [rule for rule in self.config['packageRules']
                    if rule.get('minimumReleaseAgeBehaviour') == 'timestamp-optional']
-        self.assertEqual(len(untimed), 1)
-        self.assertEqual(untimed[0]['addLabels'], ['no-release-age-check'])
-        self.assertNotIn('docker.io/**', untimed[0]['matchPackageNames'])
+        (registry_rule,) = untimed
+        self.assertEqual(registry_rule['matchDatasources'], ['docker'])
+        self.assertEqual(registry_rule['matchPackageNames'], ['ghcr.io/**', 'quay.io/**', 'registry.fedoraproject.org/**'])
+        self.assertEqual(registry_rule['addLabels'], ['no-release-age-check'])
+
+    def test_mise_artifacts_stay_under_manual_control(self):
+        (mise_rule,) = [rule for rule in self.config['packageRules'] if rule.get('matchManagers') == ['mise']]
+        self.assertIs(mise_rule['skipArtifactsUpdate'], True)
+        self.assertEqual(mise_rule['addLabels'], ['needs-checksum-update'])
 
     def test_every_digest_pinned_launcher_image_is_matched(self):
         pattern = self.image_pattern()
