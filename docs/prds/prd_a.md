@@ -44,4 +44,17 @@ Port numbers must never be picked automatically: another app may want that port.
 | Init script only (`/docker-entrypoint-initdb.d`) | simple | only applies to new volumes; old ones stay `trust` until recreated | 0.25 day |
 | Refuse `-P 5432` until the volume is recreated | no migration code | the user loses data or has to dump and restore | 0.25 day |
 
-- [x] **Human review**: checked only when the user says so
+### Reopened: published-port check imported modules from the caller's directory
+
+Found by the 2026-11-26 security audit after this grouping passed human review.
+
+- [x] The check that compares an existing pod's real port bindings with its label ran host Python
+      without isolated mode. The launcher keeps the caller's directory, which can be a sandbox
+      repository, so an agent-planted `json.py` or `re.py` there ran as the operator on the next
+      launch against an existing pod. Run that check, and the bridge's Python version probe, with
+      `-I`. `tests/postgres-host.sh` now runs the check from a directory holding canary modules, and
+      `tests/security.sh` audits that every `python3` option list in the launcher starts with `-I`.
+      Both fail on the previous launcher. Branch `fix/launcher-isolated-host-python`; external
+      review pending.
+
+- [ ] **Human review**: checked only when the user says so

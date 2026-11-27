@@ -34,6 +34,15 @@ host_input_functions() {
 SECRET=TOP-SECRET-HOST-DATA
 
 # ================================================================================================
+echo "host Python isolation (source audit)"
+# The launcher runs from the caller's directory, which can be inside the agent-writable sandbox.
+# Without -I, an inline or stdin Python program imports modules from that directory first.
+# Require every python3 option list in the launcher to start with an isolated-mode cluster.
+unisolated=$(grep -nE 'python3"?[[:space:]]+-([^I[:space:]][^[:space:]]*)?([[:space:]]|$)' "$SCRIPT" || true)
+check "every launcher python3 option list starts with -I" test -z "$unisolated"
+[[ -z $unisolated ]] || sed 's/^/        /' <<<"$unisolated"
+
+# ================================================================================================
 echo "postgres.env parsing"
 cat > "$T/pg.env" <<EOF
 # comment line

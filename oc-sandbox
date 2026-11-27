@@ -1648,7 +1648,7 @@ fi
 # agent-writable tree by name and never hands one to VS Code / Beyond Compare: it copies the requested
 # files with descriptor-relative no-follow opens into a host-owned staging directory, opens the copy,
 # and writes saved edits back the same way. See the header of oc-bridge.py. Shared by all instances.
-"${H[@]}" python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
+"${H[@]}" python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
   || echo "warning: the host bridge needs python3 >= 3.11 on the host; 'code'/'bcompare' will do nothing" >&2
 atomic_host_file "$BIN/oc-bridge" 0755 < "$BRIDGE_SRC"
 {
@@ -1997,8 +1997,10 @@ pod_exists() {
 }
 # The stored label is not proof of actual bindings. Refuse malformed, hidden,
 # non-loopback or mismatched mappings before reusing or recreating an existing pod.
+# The caller's directory can be inside the sandbox, so run isolated: without -I, Python
+# would import json and re from that directory before the standard library.
 validate_existing_ports() {
-  python3 -c '
+  python3 -I -c '
 import json, re, sys
 try:
     bindings = json.loads(sys.argv[1]); label = sys.argv[2]; pg = sys.argv[3] == "1"

@@ -50,6 +50,14 @@ check 'hidden 5432 mapping rejected even with -p' bash -c 'bash "$1" "$2" "" 1 >
 check 'malformed binding metadata rejected' bash -c 'bash "$1" not-json "" 1 >/dev/null 2>&1; [[ $? -eq 1 ]]' _ "$T/bindings.sh"
 public_binding='{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"15432"}]}'
 check 'unexpected public binding rejected' bash -c 'bash "$1" "$2" "15432:5432" 1 >/dev/null 2>&1; [[ $? -eq 1 ]]' _ "$T/bindings.sh" "$public_binding"
+# The launcher keeps the caller's directory, which may be an agent-writable sandbox repository.
+# Host Python must not import the modules planted there. Each canary only records that it loaded.
+mkdir "$T/hostile-cwd"
+for module in json re; do
+  printf 'import os\nopen(os.environ["OC_TEST_CANARY"], "a").write("%s\\n")\n' "$module" >"$T/hostile-cwd/$module.py"
+done
+(cd "$T/hostile-cwd" && OC_TEST_CANARY="$T/canary" bash "$T/bindings.sh" "$binding" '15432:5432' 1 >/dev/null 2>&1); rc=$?
+check 'port validation ignores modules in the current directory' bash -c '[[ $1 -eq 0 && ! -e $2 ]]' _ "$rc" "$T/canary"
 # Exercise the actual inherited-port validation and restoration with a stubbed verifier.
 sed -n '/^INHERITED_PG_VERIFIED=0$/,/^want_podcfg=/p' "$SCRIPT" | sed '$d' >"$T/inherit.block"
 cat >"$T/inherit.sh" <<EOF2
