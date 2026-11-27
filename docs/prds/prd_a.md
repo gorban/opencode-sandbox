@@ -61,5 +61,9 @@ Found by the 2026-11-26 security audit after this grouping passed human review.
       the probe reaches the host through distrobox's installed dispatcher path.
       `tests/postgres-host.sh` and `tests/security.sh` cover both with stand-in commands on
       `PATH`. Same branch.
+- [x] Review follow-up: the source check in `tests/security.sh` is now an audit that separates host
+      calls from container entry points, requires the system interpreter and isolated mode where
+      each call is made, covers direct-script and array forms, and fails if it cannot read the
+      launcher. Fixtures for each form are checked alongside it. Same branch.
 
 - [ ] **Human review**: checked only when the user says so

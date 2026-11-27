@@ -34,13 +34,209 @@ host_input_functions() {
 SECRET=TOP-SECRET-HOST-DATA
 
 # ================================================================================================
-echo "host Python isolation (source audit)"
-# The launcher runs from the caller's directory, which can be inside the agent-writable sandbox.
-# Without -I, an inline or stdin Python program imports modules from that directory first.
-# Require every python3 option list in the launcher to start with an isolated-mode cluster.
-unisolated=$(grep -nE 'python3"?[[:space:]]+-([^I[:space:]][^[:space:]]*)?([[:space:]]|$)' "$SCRIPT" || true)
-check "every launcher python3 option list starts with -I" test -z "$unisolated"
-[[ -z $unisolated ]] || sed 's/^/        /' <<<"$unisolated"
+echo "host Python invocation (source audit)"
+# The launcher inherits the caller's directory and PATH, and an agent can influence both. Every host
+# Python call must name the system interpreter by absolute path and pass isolated mode where it is
+# invoked. Container entry points use the image's interpreter and must be isolated as well. Any other
+# mention of an interpreter has to be a known inert form, so a new form fails until it is classified.
+# The audit reads source text only. It cannot see a helper started through its own shebang line.
+cat > "$T/host-python-audit.py" <<'PYCODE'
+import re, sys
+
+INTERPRETER = "/usr/bin/python3"
+DISPATCHERS = {'"${H[@]}"', '"$HOST_DISPATCH"'}
+ISOLATED = r"-[A-Za-z]*I[A-Za-z]*"
+MENTION = re.compile(r"python[0-9.]*(?![\w-])")
+ARRAY = re.compile(r"(\w+)=\(([^()]*)\)")
+FUNCTION = re.compile(r"^(\w+)\(\) \{")
+WORD_BREAK = set(" \t;|&()<>='\"`,[]")
+
+
+def logical_lines(text):
+    start, parts = None, []
+    for number, line in enumerate(text.split("\n"), 1):
+        if start is None:
+            start = number
+        if line.endswith("\\"):
+            parts.append(line[:-1])
+            continue
+        parts.append(line)
+        yield start, " ".join(parts)
+        start, parts = None, []
+    if parts:
+        yield start, " ".join(parts)
+
+
+def audit(text):
+    findings, counts, arrays = [], {"host": 0, "container": 0, "inert": 0}, {}
+    scope, scoped = "", []
+    for number, line in logical_lines(text):
+        opened = FUNCTION.match(line)
+        if opened:
+            scope = opened.group(1)
+        scoped.append((scope, number, line))
+        if line.startswith("}"):
+            scope = ""
+
+    def report(number, line, message):
+        findings.append(f"{number}: {message}: {line.strip()[:120]}")
+
+    for scope, number, line in scoped:
+        if line.lstrip().startswith("#"):
+            continue
+        literals = [(found.start(2), found.end(2), found) for found in ARRAY.finditer(line)]
+        for mention in MENTION.finditer(line):
+            begin = mention.start()
+            while begin > 0 and line[begin - 1] not in WORD_BREAK:
+                begin -= 1
+            word, before, after = line[begin:mention.end()], line[:begin], line[mention.end():]
+            literal = next((found for start, end, found in literals if start <= begin < end), None)
+            if after[:1] in (":", "@"):
+                counts["inert"] += 1  # image reference
+            elif word == "python3" and after.startswith(" >= "):
+                counts["inert"] += 1  # version requirement in a message
+            elif word == "python3" and re.search(r"\bapk add(\s+[\w.+-]+)*\s*$", before):
+                counts["inert"] += 1  # package name
+            elif before.endswith('ENTRYPOINT ["'):
+                if word == "python3" and re.match(r'", "' + ISOLATED + '"', after):
+                    counts["container"] += 1
+                else:
+                    report(number, line, "container entry point is not isolated")
+            elif re.search(r"--entrypoint\s+$", before):
+                if word == "python3" and re.match(r'\s+"\$\w+"\s+' + ISOLATED + r"(\s|$)", after):
+                    counts["container"] += 1
+                else:
+                    report(number, line, "container entry point is not isolated")
+            elif literal:
+                elements = literal.group(2).split()
+                if elements[-1:] == [INTERPRETER] and all(item in DISPATCHERS for item in elements[:-1]):
+                    arrays.setdefault((scope, literal.group(1)), number)
+                else:
+                    report(number, line, "interpreter array is not the system interpreter behind a known dispatcher")
+            elif word != INTERPRETER:
+                report(number, line, "interpreter is not named by its system path")
+            elif re.match(r"\s+" + ISOLATED + r"(\s|$)", after):
+                counts["host"] += 1
+            else:
+                report(number, line, "host interpreter is not isolated where it is invoked")
+
+    for (owner, name), defined in arrays.items():
+        use = re.compile(r"\$\{[#!]?" + name + r"\b[^}]*\}|\$" + name + r"\b")
+        isolated = re.compile(r'"\$\{' + name + r'\[@\]\}"\s+' + ISOLATED + r"(\s|$)")
+        invoked = 0
+        for scope, number, line in scoped:
+            if scope != owner or line.lstrip().startswith("#"):
+                continue
+            for found in use.finditer(line):
+                if isolated.match(line, found.start() - 1):
+                    invoked += 1
+                else:
+                    report(number, line, f"interpreter array {name} is used without isolated mode")
+        if invoked:
+            counts["host"] += invoked
+        else:
+            findings.append(f"{defined}: interpreter array {name} is never invoked with isolated mode")
+    return findings, counts
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("usage: host-python-audit FILE", file=sys.stderr)
+        return 2
+    try:
+        with open(sys.argv[1], encoding="utf-8") as source:
+            text = source.read()
+    except (OSError, UnicodeError) as error:
+        print(f"audit could not read its input: {error}", file=sys.stderr)
+        return 2
+    findings, counts = audit(text)
+    if findings:
+        print("\n".join(findings))
+        return 1
+    if not counts["host"] and not counts["container"]:
+        print("audit found no interpreter invocation and cannot vouch for this file", file=sys.stderr)
+        return 2
+    print(" ".join(f"{kind}={count}" for kind, count in counts.items()))
+    return 0
+
+
+sys.exit(main())
+PYCODE
+audit_rc() {  # FILE -> exit status of the audit: 0 clean, 1 findings, 2 the audit itself failed
+  local rc=0
+  /usr/bin/python3 -I "$T/host-python-audit.py" "$1" >"$T/audit.out" 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+rc=$(audit_rc "$SCRIPT")
+check "every launcher Python call is isolated and uses the system interpreter" test "$rc" = 0
+[[ $rc == 0 ]] || sed 's/^/        /' "$T/audit.out"
+check "the audit recognised host calls and container entry points in the launcher" \
+  grep -Eq '^host=[1-9][0-9]* container=[1-9][0-9]* ' "$T/audit.out"
+# Inert fixtures: each file is source text for the audit and is never executed.
+audit_fixture() {  # name, expected status; the fixture text is on stdin
+  local name=$1 expected=$2 rc
+  cat > "$T/fixture-$name.sh"
+  rc=$(audit_rc "$T/fixture-$name.sh")
+  check "audit fixture $name gives status $expected" test "$rc" = "$expected"
+  [[ $rc == "$expected" ]] || sed 's/^/        /' "$T/audit.out"
+}
+audit_fixture accepted-forms 0 <<'EOF'
+/usr/bin/python3 -I -c 'pass'
+exec /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -IB "$helper" "$@"
+probe() {
+  local command=(/usr/bin/python3)
+  if (( ${#H[@]} )); then command=("$HOST_DISPATCH" /usr/bin/python3); fi
+  "${command[@]}" -I - "$1"
+}
+safe_run --entrypoint python3 "$AGENT_IMG" \
+  -I -c "$PROGRAM"
+ENTRYPOINT ["python3", "-I", "/usr/local/bin/tool"]
+RUN apk add --no-cache git python3 py3-pip
+FROM docker.io/library/python:3.12-alpine
+EOF
+audit_fixture inline-through-path 1 <<'EOF'
+python3 -I -c 'pass'
+EOF
+audit_fixture inline-not-isolated 1 <<'EOF'
+/usr/bin/python3 -c 'pass'
+EOF
+audit_fixture direct-script-through-path 1 <<'EOF'
+python3 "$helper" "$state"
+EOF
+audit_fixture direct-script-not-isolated 1 <<'EOF'
+/usr/bin/python3 "$helper" "$state"
+EOF
+audit_fixture array-through-path 1 <<'EOF'
+probe() {
+  local command=(python3)
+  "${command[@]}" -I - "$1"
+}
+EOF
+audit_fixture array-not-isolated 1 <<'EOF'
+probe() {
+  local command=(/usr/bin/python3)
+  "${command[@]}" - "$1"
+}
+EOF
+audit_fixture array-unknown-dispatcher 1 <<'EOF'
+probe() {
+  local command=(distrobox-host-exec /usr/bin/python3)
+  "${command[@]}" -I - "$1"
+}
+EOF
+audit_fixture scalar-interpreter 1 <<'EOF'
+interpreter=python3
+"$interpreter" -I "$helper"
+EOF
+audit_fixture container-not-isolated 1 <<'EOF'
+safe_run --entrypoint python3 "$AGENT_IMG" -c "$PROGRAM"
+EOF
+audit_fixture no-interpreter 2 <<'EOF'
+printf 'nothing to audit\n'
+EOF
+rc=$(audit_rc "$T/fixture-missing.sh")
+check "audit fails when it cannot read its input" test "$rc" = 2
+
 # The bridge probe is the one host Python call that crosses from a distrobox to the host. It must
 # use the system interpreter and the dispatcher named by HOST_DISPATCH, never one found through PATH.
 # The PATH canaries record that they ran; the stand-in dispatcher records its arguments and runs them.
