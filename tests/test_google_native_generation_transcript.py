@@ -56,8 +56,20 @@ def update(text, *, session=_SESSION, update_type="agent_message_chunk", content
     }})
 
 
+def usage(*, session=_SESSION, size=10, used=2, **extra):
+    return frame({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": session,
+        "update": {"sessionUpdate": "usage_update", "size": size, "used": used, **extra},
+    }})
+
+
 def terminal(*, request_id=4, reason="end_turn", **extra):
     return frame({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": reason, **extra}})
+
+
+def terminal_usage(**changed):
+    return {"inputTokens": 2, "outputTokens": 1, "totalTokens": 3,
+            "thoughtTokens": 0, "cachedReadTokens": 0, "cachedWriteTokens": 0, **changed}
 
 
 def cleanup_child(process):
@@ -120,12 +132,134 @@ class GenerationTranscriptTests(unittest.TestCase):
         self.assertEqual(result, b"ok")
         self.check_denied()
 
+    def test_one_usage_notice_preserves_exact_value_and_original_exit_checks(self):
+        notice = usage()
+        padded = b" " * (2048 - len(notice) + 1) + notice
+        self.assertEqual(len(padded) - 1, 2048)
+        for case, record in (("normal", notice), ("raw byte bound", padded)):
+            with self.subTest(case=case):
+                proof = self.peer(update("o") + update("k") + record + terminal())
+                self.assertIsNone(proof.read_to_eof())
+                self.assertTrue(self.process.stdin.closed)
+                self.check_denied()
+                self.assertIsNone(proof.attest_exit(self.observe_exit))
+                self.assertEqual(proof.finish(self.retirement()), b"ok")
+                self.check_denied()
+
+    def test_exact_terminal_usage_preserves_original_exit_checks(self):
+        for notice in (False, True):
+            with self.subTest(notice=notice):
+                prefix = update("o") + update("k") + (usage() if notice else b"")
+                proof = self.peer(prefix + terminal(usage=terminal_usage(totalTokens=2**31 - 1)))
+                self.assertIsNone(proof.read_to_eof())
+                self.assertTrue(self.process.stdin.closed)
+                self.check_denied()
+                self.assertIsNone(proof.attest_exit(self.observe_exit))
+                self.assertEqual(proof.finish(self.retirement()), b"ok")
+                self.check_denied()
+
+    def test_terminal_usage_shape_and_values_fail_closed(self):
+        valid = terminal(usage=terminal_usage())
+        missing = terminal_usage()
+        missing.pop("cachedWriteTokens")
+        cases = {
+            "wrong id": terminal(request_id=5, usage=terminal_usage()),
+            "noninteger id": terminal(request_id=4.0, usage=terminal_usage()),
+            "wrong stop reason": terminal(reason="max_tokens", usage=terminal_usage()),
+            "missing field": terminal(usage=missing),
+            "extra field": terminal(usage=terminal_usage(extra=0)),
+            "extra result field": terminal(usage=terminal_usage(), extra=0),
+            "nested value": terminal(usage=terminal_usage(used={"totalTokens": 0})),
+            "nested count": terminal(usage=terminal_usage(inputTokens={"min": 0})),
+            "duplicate key": valid.replace(b'"inputTokens":2', b'"inputTokens":2,"inputTokens":2'),
+            "duplicate usage": valid.replace(b'"usage":', b'"usage":{},"usage":'),
+            "bool": terminal(usage=terminal_usage(inputTokens=True)),
+            "float": terminal(usage=terminal_usage(outputTokens=1.0)),
+            "string": terminal(usage=terminal_usage(totalTokens="3")),
+            "null counter": terminal(usage=terminal_usage(thoughtTokens=None)),
+            "null usage": terminal(usage=None),
+            "wrong usage type": terminal(usage=[]),
+            "negative": terminal(usage=terminal_usage(cachedReadTokens=-1)),
+            "above bound": terminal(usage=terminal_usage(cachedWriteTokens=2**31)),
+            "oversized frame": b" " * 4096 + valid,
+        }
+        for case, result in cases.items():
+            with self.subTest(case=case):
+                proof = self.peer(update("ok") + usage() + result)
+                with self.assertRaises(TranscriptUnavailable):
+                    proof.read_to_eof()
+                self.check_denied()
+
+    def test_terminal_usage_does_not_allow_post_terminal_data(self):
+        valid = update("ok") + usage() + terminal(usage=terminal_usage())
+        for buffered in (False, True):
+            with self.subTest(buffered=buffered):
+                proof = self.peer(valid + usage() if buffered else valid, suffix=None if buffered else usage())
+                with self.assertRaisesRegex(TranscriptUnavailable, "trailing output"):
+                    proof.read_to_eof()
+                self.check_denied()
+
+    def test_terminal_usage_cannot_release_output_after_forced_stop(self):
+        proof = self.peer(update("ok") + usage() + terminal(usage=terminal_usage()), mode="trap-zero")
+        proof.read_to_eof()
+        proof.forced_stop()
+        with self.assertRaises(TranscriptUnavailable):
+            proof.attest_exit(lambda *_: self.fail("forced stop reached natural exit observer"))
+        self.check_denied()
+
+    def test_usage_notice_order_shape_and_types_fail_closed(self):
+        valid = usage()
+        text = update("ok")
+        cases = {
+            "before text": valid + text,
+            "during text": update("o") + valid + update("k"),
+            "text after usage": text + valid + update("ok"),
+            "duplicate usage": text + valid + valid,
+            "wrong session": text + usage(session="d4eb6168-17cd-44ff-a98c-ac4676ba4939"),
+            "extra field": text + usage(extra=0),
+            "cost": text + usage(cost={"amount": 0, "currency": "USD"}),
+            "attributes": text + usage(attributes={}),
+            "wrong method": text + valid.replace(b'"session/update"', b'"session/other"'),
+            "unknown update": text + valid.replace(b'"usage_update"', b'"usage_unknown"'),
+            "extra parameter": text + valid.replace(b'"sessionId":', b'"extra":0,"sessionId":'),
+            "missing count": text + valid.replace(b',"used":2', b""),
+            "duplicate count": text + valid.replace(b'"used":2', b'"used":2,"used":2'),
+            "bool size": text + usage(size=True),
+            "bool used": text + usage(used=False),
+            "float size": text + usage(size=10.0),
+            "float used": text + usage(used=2.0),
+            "used below range": text + usage(used=-1),
+            "used larger than size": text + usage(used=11),
+            "size above range": text + usage(size=2**31),
+            "raw byte bound exceeded": text + b" " * (2049 - len(valid) + 1) + valid,
+        }
+        for case, wire in cases.items():
+            with self.subTest(case=case):
+                proof = self.peer(wire + terminal())
+                with self.assertRaises(TranscriptUnavailable):
+                    proof.read_to_eof()
+                self.check_denied()
+
+    def test_usage_notice_after_terminal_is_always_trailing_output(self):
+        valid = update("ok") + terminal()
+        for early in (True, False):
+            with self.subTest(early=early):
+                proof = self.peer(valid + usage() if early else valid, suffix=None if early else usage())
+                with self.assertRaisesRegex(TranscriptUnavailable, "trailing output"):
+                    proof.read_to_eof()
+                self.check_denied()
+
+    def test_usage_notice_cannot_release_output_after_forced_stop(self):
+        proof = self.peer(update("ok") + usage() + terminal())
+        proof.read_to_eof()
+        proof.forced_stop()
+        with self.assertRaises(TranscriptUnavailable):
+            proof.attest_exit(lambda *_: self.fail("forced stop reached natural exit observer"))
+        self.check_denied()
+
     def test_other_sessions_controls_callbacks_and_wrong_terminals_are_refused(self):
-        wrong_update = frame({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": _SESSION,
-                              "update": {"sessionUpdate": "usage_update", "size": 10, "used": 2}}})
         cases = (update("ok", session="other") + terminal(), update("", content_type="text") + terminal(),
                  update("ok", update_type="tool_call") + terminal(), update("ok", content_type="image") + terminal(),
-                 update("ok") + wrong_update + terminal(),
                  update("ok") + frame({"jsonrpc": "2.0", "id": 6, "method": "fs/read_text_file", "params": {}}),
                  update("ok") + terminal(request_id=5), update("ok") + terminal(request_id=4.0),
                  update("ok") + terminal(reason="max_tokens"), update("ok") + terminal(extra=0),

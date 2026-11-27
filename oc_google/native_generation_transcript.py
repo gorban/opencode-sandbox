@@ -11,7 +11,7 @@ import stat
 from threading import RLock
 import time
 
-from .native_enrollment_acp import NativeAcpError, _SESSION_ID, _parse_frame
+from .native_enrollment_acp import NativeAcpError, _SESSION_ID, _parse_frame, _usage_session
 from .native_service import NativeInvocation
 
 
@@ -20,6 +20,9 @@ _TURN_SECONDS = 20
 _FRAME_BYTES = 4096
 _POLL_MS = 50
 _RLOCK_TYPE = type(RLock())
+_TERMINAL_USAGE_FIELDS = frozenset({
+    "inputTokens", "outputTokens", "totalTokens", "thoughtTokens", "cachedReadTokens", "cachedWriteTokens",
+})
 
 
 class TranscriptUnavailable(RuntimeError):
@@ -124,6 +127,17 @@ def _text(frame, session_id):
             or type(content["text"]) is not str or not content["text"]):
         raise TranscriptUnavailable("Unexpected standalone Google ACP content")
     return content["text"]
+
+
+def _valid_terminal_result(result):
+    if type(result) is not dict or result.get("stopReason") != "end_turn":
+        return False
+    if result.keys() == {"stopReason"}:
+        return True
+    usage = result.get("usage")
+    return (result.keys() == {"stopReason", "usage"} and type(usage) is dict
+            and usage.keys() == _TERMINAL_USAGE_FIELDS
+            and all(type(value) is int and 0 <= value <= 2**31 - 1 for value in usage.values()))
 
 
 class GenerationTranscript:
@@ -269,20 +283,37 @@ class GenerationTranscript:
                 raise TranscriptUnavailable("Standalone Google ACP output ended or exceeded its frame bound")
         frame, _, self._buffer = self._buffer.partition(b"\n")
         try:
-            return _parse_frame(frame)
+            return _parse_frame(frame), len(frame)
         except NativeAcpError:
             raise TranscriptUnavailable("Standalone Google ACP emitted a malformed generation frame") from None
 
     def _terminal(self, fd, poll):
         text = ""
+        usage_seen = False
         while True:
-            frame = self._frame(fd, poll)
+            frame, frame_size = self._frame(fd, poll)
             if "id" in frame:
                 if (set(frame) != {"jsonrpc", "id", "result"} or type(frame["id"]) is not int
-                        or frame["id"] != PROMPT_REQUEST_ID or frame["result"] != {"stopReason": "end_turn"}
+                        or frame["id"] != PROMPT_REQUEST_ID or not _valid_terminal_result(frame["result"])
                         or text != "ok"):
                     raise TranscriptUnavailable("Unexpected standalone Google ACP terminal result")
                 return
+            if usage_seen:
+                raise TranscriptUnavailable("Unexpected standalone Google ACP output after usage")
+            params = frame.get("params")
+            update = params.get("update") if type(params) is dict else None
+            if type(update) is dict and update.get("sessionUpdate") == "usage_update":
+                if text != "ok":
+                    raise TranscriptUnavailable("Unexpected standalone Google ACP usage notification")
+                try:
+                    session = _usage_session(frame, frame_size)
+                except NativeAcpError:
+                    raise TranscriptUnavailable("Unexpected standalone Google ACP usage notification") from None
+                if session != self._session_id:
+                    raise TranscriptUnavailable("Unexpected standalone Google ACP usage notification")
+                usage_seen = True
+                del frame, frame_size, params, update
+                continue
             text += _text(frame, self._session_id)
             if not "ok".startswith(text):
                 raise TranscriptUnavailable("Unexpected standalone Google ACP answer")
