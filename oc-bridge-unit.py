@@ -84,7 +84,7 @@ def check_service(record, runner, sandbox, stage, caller_stage, phase):
     # The manager omits empty command and environment arrays from show output.
     require(not any(record.get(name) for name in hooks))
     if record.get("ExecStartPre"):
-        require(phase == "existing")
+        require(phase in {"existing", "disarmed"})
         one_command(record["ExecStartPre"], ["/usr/bin/sleep", "1"])
     one_command(record["ExecStart"], [runner])
     check_environment(record["Environment"], sandbox, stage, caller_stage)

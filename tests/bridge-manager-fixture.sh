@@ -56,8 +56,8 @@ case $command in
     if [[ $unit == oc-bridge.service && $load == loaded ]]; then
       runner=$HOME/.local/bin/oc-bridge
       printf 'Type=oneshot\nExecStart={ path=%s ; argv[]=%s ; ignore_errors=no ; pid=0 }\n' "$runner" "$runner"
-      printf 'ExecStartPre=\nExecStartPost=\nExecStop=%s\nExecStopPost=\nExecReload=\nExecCondition=\n' \
-        "${STUB_BRIDGE_STOP_HOOK:-}"
+      printf 'ExecStartPre=%s\nExecStartPost=\nExecStop=%s\nExecStopPost=\nExecReload=\nExecCondition=\n' \
+        "${STUB_BRIDGE_PRE_HOOK:-}" "${STUB_BRIDGE_STOP_HOOK:-}"
       printf 'Environment=OC_SB="%s" OC_BRIDGE_STAGE="%s"\n' \
         "$HOME/opencode-sandbox" "${STUB_BRIDGE_STAGE:-$stage}"
       printf 'EnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\n'

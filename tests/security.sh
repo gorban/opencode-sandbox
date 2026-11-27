@@ -1458,6 +1458,17 @@ check 'new drain activation dependency after disable prevents publication' \
   grep -q 'activation remains enabled' <<<"$out"
 check 'drain activation dependency prevents rearming the timer' \
   ! grep -q '^systemctl --user enable --now ' "$T/stub.log"
+legacy_pre='STUB_BRIDGE_PRE_HOOK={ path=/usr/bin/sleep ; argv[]=/usr/bin/sleep 1 ; ignore_errors=no ; pid=0 }'
+out=$(bridge_install_fixture 'STUB_BRIDGE_LOADED=oc-bridge.timer oc-bridge.service' \
+  "$legacy_pre" STUB_BRIDGE_PUBLISH_FAIL=1)
+check 'trusted historical pre-start passes the old drain recheck' \
+  grep -qx 'fixture bridge publication failed' "$T/stub.log"
+out=$(bridge_install_fixture 'STUB_BRIDGE_LOADED=oc-bridge.timer oc-bridge.service' "$legacy_pre")
+check 'replacement with a historical hook is inspected after reload' \
+  grep -qx 'systemctl --user daemon-reload' "$T/stub.log"
+check 'replacement still rejects a pre-start hook' grep -q 'could not install the host bridge' <<<"$out"
+check 'replacement with a pre-start hook is never activated' \
+  ! grep -q '^systemctl --user enable --now ' "$T/stub.log"
 global_units="$T/global-units"
 for relation in wants requires upholds; do
   directory="$global_units/default.target.$relation"
