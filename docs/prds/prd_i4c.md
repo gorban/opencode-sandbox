@@ -94,8 +94,9 @@ OpenCode picker, displayed `gemini-4-hydrogen - elgoog [subscription]`, and retu
 exact `ok` after `oc-sandbox google arm RUN_ID` in a second terminal. Both containers and
 the private run directory retired. The label is configurable: the implementation
 accepts any enabled Google subscription label with the qualified Hydrogen model.
-The broker checks that exactly two occurrences of the configured label normalize to
-the measured `elgoog` system transcript before admitting a turn. A second live run
+The broker checks the configured label at the measured model-display and provider-ID
+positions, then matches the complete normalized `elgoog` system digest before admitting
+a turn. A second live run
 with a temporary `custom-google` label initially failed at that check, then returned
 exact `ok` after the bounded substitution was added. The temporary provider entry was
 removed after verified cleanup.
@@ -166,10 +167,17 @@ points for named Google subscriptions.
   The peer counted one prompt, replay was refused, and cleanup was verified. Offline controls
   observed zero prompts when revocation won before admission and zero answer bytes when
   the peer emitted early text or a callback.
-- [x] Qualify the first public, fixed-text Hydrogen shell on `codex/gemini-public-shell`.
+- [x] Demonstrate the experimental public, fixed-text Hydrogen shell on `codex/gemini-public-shell`.
   The live stock OpenCode picker selected a named subscription, two configured labels returned
   exact `ok` through the cached workstation ACP login, and worker, relay and run cleanup passed.
   Preserve the opt-in live regression and the ordinary no-inference test default.
+- [ ] Bind a named Google provider to a verified subscription subject before claiming
+  multi-account or general-release support. The tested ACP session exposes a model and tier
+  but no account subject. The current command displays that it uses the workstation's active
+  Antigravity login and cannot verify which account the login represents.
+- [ ] Resolve the release eligibility of this Antigravity subscription route against the
+  provider's published third-party software restriction. This does not block the
+  maintainer's attended local interoperability proof. Keep final Human review open.
 - [ ] Qualify the pinned `agy` binary, rootless private provider home and keyring, bounded ACP
   channel, and separately scoped enrollment and execution egress. Verify the provider cannot
   access ordinary workstation credentials. Verify that the worker and relay get only the approved

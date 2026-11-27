@@ -4,12 +4,9 @@ from pathlib import Path
 import runpy
 import sys
 
-from oc_google.native_text import (
-    NativeCliTextError, _Acp, _one_turn, _open_session, open_native, open_opencode_session,
-)
-
-
 def run_text(model):
+    from oc_google.native_text import _one_turn, open_native
+
     with open_native(model, "oc-sandbox") as (client, selected):
         print(f"Gemini model {selected} via the workstation Antigravity subscription.")
         _one_turn(client)
@@ -18,6 +15,7 @@ def run_text(model):
 
 
 def run_opencode(fixture):
+    from oc_google.native_text import NativeCliTextError
     from oc_orchestrator.runtime import preflight
 
     preflight()
@@ -42,12 +40,15 @@ def main():
         if sys.stdin.isatty() or sys.stdin.buffer.read(33) != f"pytest approved {route}\n".encode("ascii"):
             return 2
         runpy.run_path(str(root / "oc-google.py"))["verify_sources"]()
+        from oc_google.native_text import NativeCliTextError
+
         fixture = runpy.run_path(str(root / "tests/google-shell-fixture.py"))
-        return run_opencode(fixture) if route == "opencode" else run_text(fixture["NATIVE_MODEL"])
+        try:
+            return run_opencode(fixture) if route == "opencode" else run_text(fixture["NATIVE_MODEL"])
+        except NativeCliTextError as error:
+            print(f"Gemini ACP test: {error}", file=sys.stderr)
     except KeyboardInterrupt:
         return 130
-    except NativeCliTextError as error:
-        print(f"Gemini ACP test: {error}", file=sys.stderr)
     except (EOFError, OSError, ValueError, RuntimeError):
         print("Gemini ACP test: The workstation proof did not complete.", file=sys.stderr)
     return 1

@@ -4,16 +4,13 @@ import json
 import os
 from pathlib import Path
 import runpy
+import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from oc_google.native_text import target_from_config
 
-operations = runpy.run_path(str(Path(__file__).parent / "e2e/live/google_text_driver.py"))
-NativeCliTextError = operations["NativeCliTextError"]
-_Acp = operations["_Acp"]
-_one_turn = operations["_one_turn"]
-_open_session = operations["_open_session"]
+from oc_google.native_text import NativeCliTextError, _Acp, _OpenCodeSession, _one_turn, _open_session
 consent = runpy.run_path(str(Path(__file__).resolve().parent / "e2e/live/conftest.py"))
 
 
@@ -22,6 +19,29 @@ def option(ident, current, choices):
 
 
 class NativeCliTextTest(unittest.TestCase):
+    def test_failed_retirement_stays_unconfirmed_on_repeat(self):
+        calls = []
+
+        def close():
+            calls.append("close")
+            if len(calls) == 1:
+                raise TimeoutError("synthetic retirement uncertainty")
+
+        session = _OpenCodeSession(SimpleNamespace(close=close), SimpleNamespace())
+        with self.assertRaises(TimeoutError):
+            session.retire()
+        with self.assertRaises(NativeCliTextError):
+            session.retire()
+        self.assertEqual(calls, ["close"])
+        self.assertFalse(session.retirement_confirmed)
+
+    def test_isolated_live_driver_rejects_invalid_route_without_import_error(self):
+        driver = Path(__file__).parent / "e2e/live/google_text_driver.py"
+        result = subprocess.run(["/usr/bin/python3", "-IBS", str(driver), "invalid"],
+                                cwd=driver.parents[3], input=b"", capture_output=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(b"ModuleNotFoundError", result.stderr)
+
     def test_named_google_provider_uses_its_config_label(self):
         instance = SimpleNamespace(label="custom-google", enabled=True, auth_mode="subscription",
                                    default_model="gemini-4-hydrogen")
@@ -40,7 +60,8 @@ class NativeCliTextTest(unittest.TestCase):
                 on_update(update)
             return {"stopReason": stop}
 
-        return SimpleNamespace(request=request, session="fixture-session"), sent
+        return SimpleNamespace(request=request, session="fixture-session",
+                               verify_terminal_tail=lambda: None), sent
 
     @staticmethod
     def chunk(text):
@@ -108,6 +129,24 @@ class NativeCliTextTest(unittest.TestCase):
                     peer.session = "exact"
                     with self.assertRaises(NativeCliTextError):
                         peer.request("session/prompt", {}, self.fail, seconds=1)
+
+    def test_completed_turn_with_queued_frame_has_no_verified_tail(self):
+        response_read, response_write = os.pipe()
+        request_read, request_write = os.pipe()
+        with (os.fdopen(response_read, "rb", buffering=0) as native_stdout,
+              os.fdopen(response_write, "wb", buffering=0) as response,
+              os.fdopen(request_read, "rb", buffering=0) as _request,
+              os.fdopen(request_write, "wb", buffering=0) as native_stdin):
+            result = {"jsonrpc": "2.0", "id": 1, "result": {"stopReason": "end_turn"}}
+            trailing = {"jsonrpc": "2.0", "method": "unexpected", "params": {}}
+            response.write(json.dumps(result).encode() + b"\n" + json.dumps(trailing).encode() + b"\n")
+            response.flush()
+            child = SimpleNamespace(stdin=native_stdin, stdout=native_stdout,
+                                    poll=lambda: 0, wait=lambda timeout: 0)
+            peer = _Acp(child)
+            self.assertEqual(peer.receive(1, "session/prompt", self.fail, seconds=1), result["result"])
+            with self.assertRaises(NativeCliTextError):
+                peer.verify_terminal_tail()
 
 
 class GoogleConsentTest(unittest.TestCase):

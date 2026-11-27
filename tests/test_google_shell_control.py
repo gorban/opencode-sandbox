@@ -109,6 +109,7 @@ class ShellControlTests(unittest.TestCase):
                         self.assertIn(b"personal", prompt)
                         self.assertIn(b"gemini-pro", prompt)
                         self.assertIn(b"Reply with exactly: ok", prompt)
+                        self.assertIn(b"Account: current workstation Antigravity login", prompt)
                         os.write(master, text)
                         output.append("ok")
                     except AssertionError as error:

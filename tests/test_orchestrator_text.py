@@ -42,17 +42,22 @@ def payload(**changes):
 
 class NamedProviderSystemTest(unittest.TestCase):
     def test_measured_transcript_accepts_only_the_named_label_substitution(self):
-        baseline = "Provider google/elgoog; selected label elgoog.\nToday's date: [date]"
+        baseline = ("Model: text-proof - elgoog [subscription]\n"
+                    "Provider ID: google--elgoog\nToday's date: [date]")
         actual = baseline.replace("elgoog", "custom-google").replace("[date]", "Tue Nov 24 2026")
         digest = hashlib.sha256(baseline.encode()).hexdigest()
         request = payload(messages=[{"role": "system", "content": actual},
                                     {"role": "user", "content": PROMPT}])
         accept_text(json.dumps(request).encode(), system_digest=digest,
                     normalized_label=("custom-google", "elgoog"))
+        short = baseline.replace("elgoog", "a").replace("[date]", "Tue Nov 24 2026")
+        accept_text(json.dumps(payload(messages=[{"role": "system", "content": short},
+                                                 {"role": "user", "content": PROMPT}])).encode(),
+                    system_digest=digest, normalized_label=("a", "elgoog"))
         for broken in (
-            actual.replace("selected label custom-google", "selected label wrong"),
-            actual.replace("selected label custom-google", "selected label custom-google extra"),
-            actual.replace("selected label custom-google", "selected label"),
+            actual.replace("google--custom-google", "google--wrong"),
+            actual.replace("custom-google [subscription]", "custom-google [subscription] extra"),
+            actual.replace("custom-google [subscription]", "wrong [subscription]"),
         ):
             with self.subTest(broken=broken), self.assertRaises(Refused):
                 modified = payload(messages=[{"role": "system", "content": broken},

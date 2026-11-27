@@ -123,6 +123,7 @@ def _start_native(clean, fd, home, workspace, proxy_socket):
 
 class _Acp:
     def __init__(self, child, cancelled=lambda: False):
+        self.child = child
         self.input = child.stdin.fileno()
         self.output = child.stdout.fileno()
         self.buffer = bytearray()
@@ -186,6 +187,23 @@ class _Acp:
                 raise NativeCliTextError("The native ACP update named a different session.")
             update(params["update"])
         raise NativeCliTextError("The native ACP update count exceeded its bound.")
+
+    def verify_terminal_tail(self):
+        """Stop the exact native peer and require EOF without queued output."""
+        if self.child.poll() is None:
+            self.child.terminate()
+        try:
+            self.child.wait(timeout=3)
+        except subprocess.TimeoutExpired as error:
+            raise NativeCliTextError("Native ACP retirement could not be verified.") from error
+        if self.buffer or not select.select([self.output], [], [], .2)[0]:
+            raise NativeCliTextError("Native ACP left an unverified terminal tail.")
+        try:
+            tail = os.read(self.output, _MAX_FRAME + 1)
+        except BlockingIOError as error:
+            raise NativeCliTextError("Native ACP terminal output stayed open.") from error
+        if tail:
+            raise NativeCliTextError("Native ACP sent data after the terminal event.")
 
 
 def _startup_update(update):
@@ -265,6 +283,7 @@ def _prompt_params(client):
 def _one_turn(client):
     update, answer = _answer_collector()
     answer(client.request("session/prompt", _prompt_params(client), update, seconds=45))
+    client.verify_terminal_tail()
 
 
 @contextmanager
@@ -299,6 +318,7 @@ class _OpenCodeSession:
         self._number = None
         self._retire_lock = threading.Lock()
         self.retirement_confirmed = False
+        self.retirement_uncertain = False
 
     def send_prompt(self):
         if self._number is not None:
@@ -309,14 +329,22 @@ class _OpenCodeSession:
         update, answer = _answer_collector()
         result = self._client.receive(self._number, "session/prompt", update, seconds=45)
         text = answer(result)
+        self._client.verify_terminal_tail()
         self.retire()
         return text
 
     def retire(self):
         with self._retire_lock:
-            if not self.retirement_confirmed:
+            if self.retirement_uncertain:
+                raise NativeCliTextError("Native ACP retirement needs independent inspection.")
+            if self.retirement_confirmed:
+                return
+            try:
                 self._stack.close()
-                self.retirement_confirmed = True
+            except BaseException:
+                self.retirement_uncertain = True
+                raise
+            self.retirement_confirmed = True
 
 
 @contextmanager

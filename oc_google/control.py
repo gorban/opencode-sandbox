@@ -261,7 +261,8 @@ def confirm(offer):
     if not termios.tcgetattr(0)[3] & termios.ICANON:
         raise ControlError("Google shell arm requires an ordinary terminal input line")
     termios.tcflush(0, termios.TCIFLUSH)
-    print(f"Google subscription {offer['label']} · model {offer['model']} · prompt {PROMPT}", flush=True)
+    print(f"Google route {offer['label']} · model {offer['model']} · prompt {PROMPT}", flush=True)
+    print("Account: current workstation Antigravity login (ACP does not verify its identity).", flush=True)
     print("Type arm to authorize this one turn: ", end="", flush=True)
     ready, _, _ = select.select([0], [], [], CONFIRM_TIME)
     if not ready or os.read(0, 32) != b"arm\n" or select.select([0], [], [], 0)[0]:

@@ -48,6 +48,13 @@ def main():
             term.keys("shell", "C-c", "C-c")
             term.await_screen("shell", lambda s: "Fixture exit 0" in s,
                               "shell cleanup", history=True, timeout=35)
+        except BaseException:
+            screen = term.screen("shell", history=True)
+            for line in screen.splitlines():
+                if ("Google shell stopped" in line or "Provider request failed" in line
+                        or "Fixture exit" in line):
+                    print(line.strip(), flush=True)
+            raise
         finally:
             term.close()
             if run_id:

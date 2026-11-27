@@ -117,9 +117,12 @@ def accept_text(body, *, model=MODEL, system_digest=None, normalized_label=None)
                        for label in normalized_label)):
             raise Refused()
         source_label, baseline_label = normalized_label
-        if normalized.count(source_label) != 2:
+        display = f"{model} - {source_label} [subscription]"
+        provider = f"Provider ID: google--{source_label}\n"
+        if normalized.count(display) != 1 or normalized.count(provider) != 1:
             raise Refused()
-        normalized = normalized.replace(source_label, baseline_label)
+        normalized = normalized.replace(display, f"{model} - {baseline_label} [subscription]")
+        normalized = normalized.replace(provider, f"Provider ID: google--{baseline_label}\n")
     digest = SYSTEM_DIGEST if system_digest is None else system_digest
     if count != 1 or hashlib.sha256(normalized.encode()).hexdigest() != digest:
         raise Refused()

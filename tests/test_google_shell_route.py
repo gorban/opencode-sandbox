@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock
 
 from oc_google.route import TurnBroker
+from oc_google.native_text import NativeCliTextError
 from oc_orchestrator import protocol
 from oc_orchestrator.relay import handoff
 
@@ -149,3 +150,12 @@ class TurnBrokerTest(unittest.TestCase):
             self.assertEqual((receipt.claims, receipt.answers, receipt.response_bytes), (1, 0, 0))
         self.session.send_prompt.assert_called_once_with()
         self.session.retire.assert_called_once_with()
+
+    def test_native_terminal_tail_failure_releases_zero_reply_bytes(self):
+        self.session.complete.side_effect = NativeCliTextError("queued terminal frame")
+        broker = self.broker()
+        with self.assertRaises(NativeCliTextError), broker:
+            broker.arm(self.session)
+            self.assertEqual(self.request(), b"")
+            receipt = broker.outcome()
+            self.assertEqual((receipt.claims, receipt.answers, receipt.response_bytes), (1, 0, 0))

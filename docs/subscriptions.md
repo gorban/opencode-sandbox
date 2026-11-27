@@ -6,6 +6,9 @@ This experimental route uses the cached workstation Antigravity login. The Googl
 the workstation. Its credentials and ACP connection are absent from the disposable OpenCode worker.
 The current public route allows one fixed, tool-free prompt per shell and only the measured
 `gemini-4-hydrogen` model. The [I4c plan](prds/prd_i4c.md) records the boundary and remaining work.
+Google's [Antigravity FAQ](https://antigravity.google/docs/faq#why-cant-i-use-third-party-software-such-as-claude-code-openclaw-or-opencode-with-my-antigravity-login)
+names OpenCode in its third-party software restriction. This local check is experimental and
+account eligibility is the operator's decision.
 
 Add a named provider to the trusted `~/.config/oc-sandbox/providers.toml`:
 
@@ -17,6 +20,10 @@ default_model = "gemini-4-hydrogen"
 ```
 
 The name `elgoog` is an example. Any valid, enabled Google subscription label works with this model.
+The label names this route; it does not select or verify a Google account. The public shell uses
+whichever Antigravity account is currently signed in on the workstation. Check that account in
+the official client before authorizing a turn. Multiple separately bound Google accounts remain
+outside this first shell slice.
 Sign in on the workstation with `agy acp --login` if the official client is not already signed in.
 The shell currently requires the tested `agy` 1.5.15 executable at `~/.local/bin/agy`.
 

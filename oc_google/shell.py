@@ -402,8 +402,15 @@ def run_shell(target):
             exit_code = run_owned(target, Lifeline(reader), shell_terminal)
         except (Failure, ControlError) as error:
             print(f"Google shell: {error}", file=sys.stderr, flush=True)
-        except (KeyboardInterrupt, OSError, RuntimeError, TypeError, ValueError, KeyError) as error:
-            print(f"Google shell stopped ({type(error).__name__}).", file=sys.stderr, flush=True)
+        except KeyboardInterrupt:
+            print("Google shell stopped (KeyboardInterrupt).", file=sys.stderr, flush=True)
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError) as error:
+            from .native_text import NativeCliTextError
+
+            if isinstance(error, NativeCliTextError):
+                print(f"Google shell: {error}", file=sys.stderr, flush=True)
+            else:
+                print(f"Google shell stopped ({type(error).__name__}).", file=sys.stderr, flush=True)
         os.close(reader)
         restore_terminal(settings)
         os._exit(exit_code if isinstance(exit_code, int) and 0 <= exit_code < 256 else 1)
