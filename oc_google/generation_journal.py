@@ -1,5 +1,6 @@
 """One durable generation hold for a sealed synthetic registration fixture."""
 
+from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass
 from enum import StrEnum
@@ -230,10 +231,21 @@ class GenerationJournal:
                 run.revoke()
 
 
+@dataclass(slots=True)
+class _LeaseAuthority:
+    """Mutable state of one held registration lease, shared by every run view."""
+
+    phase: Phase = Phase.UNSTARTED
+    revoked: bool = False
+    busy: bool = False
+    capability: Capability | None = None
+
+
 class _Files:
     """Pin the registration, immutable authority, and independent save latch."""
 
     def __init__(self, anchor, slot, record, profile, pins, key_fd):
+        self._authority = _LeaseAuthority()
         self.anchor, self.slot, self.record, self.profile, self.key_fd = anchor, slot, record, profile, key_fd
         self.directory = slot.directory.fd
         self.registration_fd = _open(pins, self.directory, reg._RECORD)
@@ -315,35 +327,34 @@ class _Files:
                 os.unlink(temporary, dir_fd=self.directory)
 
 
+@dataclass(frozen=True, slots=True)
 class _Run:
-    def __init__(self, files, binding, fence, authorized):
-        self._files = files
-        self._binding = binding
-        self._fence = fence
-        self._authorized = authorized
-        self._phase = Phase.UNSTARTED
-        self._revoked = False
-        self._busy = False
-        self._capability = None
+    _files: _Files
+    _binding: Binding
+    _fence: object
+    _authorized: Callable[[Binding], bool]
 
     def revoke(self):
         with self._fence:
-            self._revoked = True
-            self._capability = None
+            authority = self._files._authority
+            authority.revoked = True
+            authority.capability = None
 
     def _check(self):
-        if self._revoked:
+        authority = self._files._authority
+        if authority.revoked:
             raise GenerationHeld()
         self._files.verify()
-        if self._authorized(self._binding) is not True or self._revoked:
+        if self._authorized(self._binding) is not True or authority.revoked:
             raise GenerationHeld()
         self._files.verify()
 
     @contextmanager
     def _transition(self):
-        if self._busy or self._revoked:
+        authority = self._files._authority
+        if authority.busy or authority.revoked:
             raise GenerationHeld()
-        self._busy = True
+        authority.busy = True
         try:
             self._check()
             yield
@@ -351,12 +362,12 @@ class _Run:
             self.revoke()
             raise
         finally:
-            self._busy = False
+            authority.busy = False
 
     def _save(self, phase):
         self._files.save(phase, self._binding, self._check)
         self._check()
-        self._phase = phase
+        self._files._authority.phase = phase
 
     def _launch(self):
         with self._fence, self._transition():
@@ -365,21 +376,23 @@ class _Run:
     def issue(self, operation):
         """Persist a claim before issuing its exact one-use capability."""
         with self._fence:
-            if (type(operation) is not Operation or self._phase != _STEPS[operation][0]
-                    or self._capability is not None):
+            authority = self._files._authority
+            if (type(operation) is not Operation or authority.phase != _STEPS[operation][0]
+                    or authority.capability is not None):
                 raise GenerationHeld()
             with self._transition():
                 self._save(_STEPS[operation][1])
-                self._capability = Capability(operation)
-                return self._capability
+                authority.capability = Capability(operation)
+                return authority.capability
 
     def consume(self, capability, effect):
         """Spend before the bounded synthetic effect and settle only its exact observation."""
         with self._fence:
-            if type(capability) is not Capability or capability is not self._capability or not callable(effect):
+            authority = self._files._authority
+            if type(capability) is not Capability or capability is not authority.capability or not callable(effect):
                 raise GenerationHeld()
             with self._transition():
-                self._capability = None
+                authority.capability = None
                 self._effect(capability, effect)
                 self._save(_STEPS[capability.operation][2])
 

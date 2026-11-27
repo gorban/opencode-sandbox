@@ -1,6 +1,7 @@
 """Exercise durable generation authority only in disposable synthetic accounts."""
 
 from contextlib import ExitStack, suppress
+from copy import copy
 from dataclasses import replace
 import errno
 import json
@@ -327,6 +328,37 @@ class GenerationJournalTests(unittest.TestCase):
 
             run.consume(capability, effect)
             self.assertEqual(self.phase(), gen.Phase.ACP_SENT)
+
+    def test_copy_before_issue_cannot_rewind_the_durable_phase(self):
+        with self.launch() as run:
+            stale = copy(run)
+            first = run.issue(gen.Operation.ACP)
+            run.consume(first, lambda observe: observe())
+            run.issue(gen.Operation.DESTINATION)
+            with self.assertRaises(gen.GenerationHeld):
+                stale.issue(gen.Operation.ACP)
+            self.assertEqual(self.phase(), gen.Phase.DESTINATION_CLAIMED)
+
+    def test_copy_after_issue_cannot_repeat_effect_or_outlive_the_lease(self):
+        effects = []
+
+        def effect(observe):
+            effects.append("ran")
+            return observe()
+
+        with self.launch() as run:
+            first = run.issue(gen.Operation.ACP)
+            stale = copy(run)
+            run.consume(first, effect)
+            with self.assertRaises(gen.GenerationHeld):
+                stale.consume(first, effect)
+            self.assertEqual(self.phase(), gen.Phase.ACP_SENT)
+            second = run.issue(gen.Operation.DESTINATION)
+            closed = copy(run)
+        with self.assertRaises(gen.GenerationHeld):
+            closed.consume(second, effect)
+        self.assertEqual(effects, ["ran"])
+        self.assertEqual(self.phase(), gen.Phase.DESTINATION_CLAIMED)
 
     def test_forged_stale_or_revoked_effect_observation_never_settles(self):
         for mode in ("forged", "stale", "revoked"):
