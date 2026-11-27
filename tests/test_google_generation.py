@@ -639,7 +639,7 @@ class SplitAttemptTests(unittest.TestCase):
         self.assertEqual(attempt.receipt().destination_attempts, 0)
 
     def test_missing_or_revoked_effect_has_no_independent_sink_receipt(self):
-        for status in ("invalid", "non-bool", "revoked", "owner-lost"):
+        for status in ("invalid", "non-bool", "revoked"):
             with self.subTest(status=status):
                 self.current = True
                 attempt, sink = self.create()
@@ -650,8 +650,6 @@ class SplitAttemptTests(unittest.TestCase):
                     checks.append(status)
                     if status == "revoked":
                         attempt.revoke()
-                    if status == "owner-lost":
-                        self.current = False
                     return {"invalid": False, "non-bool": 1}.get(status, True)
 
                 with self.assertRaises(generation.GenerationRefused):
@@ -663,6 +661,70 @@ class SplitAttemptTests(unittest.TestCase):
                 with self.assertRaises(generation.GenerationRefused):
                     attempt.write_prepared(prepared, admit=admit)
                 self.assertEqual(checks, [status])
+
+    def test_journal_admission_follows_the_last_external_owner_observation(self):
+        journal_active = True
+        accept_boundary_checks = 0
+        admissions = []
+
+        def authorized(binding):
+            nonlocal journal_active, accept_boundary_checks
+            if attempt.receipt().destination_attempts:
+                accept_boundary_checks += 1
+                if accept_boundary_checks == 2:
+                    journal_active = False
+            return binding is self.binding
+
+        def admit():
+            admissions.append(journal_active)
+            return journal_active
+
+        attempt, sink = self.create(authorized=authorized)
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.write_prepared(self.prepare(attempt), admit=admit)
+        self.assertIsNone(sink.receipt())
+        self.assertEqual(accept_boundary_checks, 2)
+        self.assertEqual(admissions, [False])
+        self.assertEqual(attempt.receipt(), generation.GenerationReceipt(
+            generation.GenerationState.UNCERTAIN, 1, 1, 0, 0,
+        ))
+
+    def test_no_injectable_owner_or_clock_callback_runs_after_admission(self):
+        admitted = False
+
+        def authorized(binding):
+            self.assertFalse(admitted)
+            return binding is self.binding
+
+        def clock():
+            self.assertFalse(admitted)
+            return self.now
+
+        sink = generation.FakeDestination(response(), end_of_input=True)
+        attempt = generation.GenerationAttempt(self.binding, sink, authorized=authorized, now=clock)
+
+        def admit():
+            nonlocal admitted
+            admitted = True
+            return True
+
+        write = attempt.write_prepared(self.prepare(attempt), admit=admit)
+        self.assertIs(sink.receipt(), write.sink_receipt)
+
+    def test_local_monotonic_deadline_can_expire_while_admission_is_checked(self):
+        attempt, sink = self.create()
+        prepared = self.prepare(attempt, deadline=self.now + .25)
+        real_now = 100.0
+
+        def admit():
+            nonlocal real_now
+            real_now += .25
+            return True
+
+        with patch.object(generation, "monotonic", side_effect=lambda: real_now):
+            with self.assertRaisesRegex(generation.GenerationRefused, "owner or deadline changed"):
+                attempt.write_prepared(prepared, admit=admit)
+        self.assertIsNone(sink.receipt())
 
     def test_captured_write_check_is_unusable_after_synchronous_effect(self):
         attempt, _ = self.create()

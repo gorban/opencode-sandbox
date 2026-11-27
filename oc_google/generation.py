@@ -335,15 +335,18 @@ class GenerationAttempt:
                                      complete, self._releases)
 
     def _check_local(self, deadline):
-        if self._revoked or deadline != self._deadline or not self._now() < deadline or self._revoked:
-            self._revoked = True
-            raise GenerationRefused("Gemini fixture owner or deadline changed")
+        if not self._revoked and deadline == self._deadline:
+            observed = self._now()
+            if observed < deadline and not self._revoked:
+                return observed
+        self._revoked = True
+        raise GenerationRefused("Gemini fixture owner or deadline changed")
 
     def _check(self, deadline):
         try:
             if self._revoked or deadline != self._deadline or self._authorized(self._binding) is not True:
                 raise GenerationRefused("Gemini fixture owner or deadline changed")
-            self._check_local(deadline)
+            return self._check_local(deadline)
         except BaseException:
             self._revoked = True
             raise
@@ -408,19 +411,34 @@ class GenerationAttempt:
         deadline = self._deadline
         self._check(deadline)
         owner_thread = get_ident()
+        split = admit is not None
         open_check = True
         used_check = False
+        admitted_until = None
+
+        def check_final():
+            if not split:
+                self._check(deadline)
+            elif (self._revoked or not self._active or self._state is not GenerationState.CLAIMED
+                  or deadline is not self._deadline or admitted_until is None or not monotonic() < admitted_until):
+                raise GenerationRefused("Gemini fixture owner or deadline changed")
 
         def check(checked_deadline):
-            nonlocal used_check
+            nonlocal used_check, admitted_until
             if not open_check or used_check or get_ident() != owner_thread:
                 raise GenerationRefused("Gemini fixture write check is unavailable")
             used_check = True
             self._check(checked_deadline)
-            if admit is not None:
+            if split:
+                # Sample the injectable clock and external owner before the
+                # journal check. Only the local monotonic clock may run after it.
+                started = monotonic()
+                observed = self._check(checked_deadline)
+                cutoff = started + float(checked_deadline - observed)
                 if admit() is not True:
                     raise GenerationRefused("Gemini fixture journal admission is unavailable")
-                self._check(checked_deadline)
+                admitted_until = cutoff
+                check_final()
 
         self._destination_attempts += 1
         try:
@@ -428,13 +446,13 @@ class GenerationAttempt:
         finally:
             open_check = False
             admit = None
-        self._check(deadline)
+        check_final()
         receipt = self._destination.receipt()
         if (not used_check or type(written) is not int or written != prepared.byte_count
                 or type(receipt) is not _SinkReceipt or receipt.attempt is not self._attempt
                 or receipt.packet_digest != prepared.packet_digest or not self._destination.confirms_write(receipt)):
             raise GenerationRefused("Gemini fixture dispatch is unconfirmed")
-        self._check(deadline)
+        check_final()
         return GenerationWrite(written, prepared.packet_digest, receipt)
 
     def observe(self, write):
