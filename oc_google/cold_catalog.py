@@ -3,9 +3,10 @@
 from dataclasses import dataclass, field
 import json
 
-from .account_binding import MetadataOperation
-from .enrollment import EnrollmentMetadataError, _bounded_object, _valid_identifier
+from .account_binding import AccountBindingError, MetadataOperation
+from .enrollment import EnrollmentMetadataError, _bounded_object, _exchange_observed, _valid_identifier
 from .metadata_destination import MetadataRoute
+from .token_diagnostic import PostTokenStage, observe_post_token
 
 
 _CATALOG_FIELDS = {"models", "defaultAgentModelId", "agentModelSorts"}
@@ -63,18 +64,21 @@ def _observe_catalog(body):
                         and model["apiProvider"] == "API_PROVIDER_GOOGLE_GEMINI"))
 
 
-def verify_cold_catalog(*, proof, load_reply, authorization, body, deadline, spend, destination):
+def verify_cold_catalog(*, proof, load_reply, authorization, body, deadline, spend, destination, post_diagnostic=None):
     """Verify the catalog on the same bearer and project as the preceding load call."""
-    if type(authorization) is not bytes or not authorization.startswith(b"Bearer "):
-        raise EnrollmentMetadataError("Invalid Google cold catalog authorization")
-    proof.require_metadata_bearer(MetadataOperation.FETCH_AVAILABLE_MODELS, authorization[7:])
-    project = _bounded_object(load_reply.body, 4096).get("cloudaicompanionProject")
-    request = _bounded_object(body, 1024)
-    if not _valid_identifier(project) or request != {"project": project}:
-        raise EnrollmentMetadataError("Google cold catalog project does not match the verified load reply")
+    with observe_post_token(post_diagnostic, PostTokenStage.COLD_CATALOG, EnrollmentMetadataError, AccountBindingError):
+        if type(authorization) is not bytes or not authorization.startswith(b"Bearer "):
+            raise EnrollmentMetadataError("Invalid Google cold catalog authorization")
+        proof.require_metadata_bearer(MetadataOperation.FETCH_AVAILABLE_MODELS, authorization[7:])
+        project = _bounded_object(load_reply.body, 4096).get("cloudaicompanionProject")
+        request = _bounded_object(body, 1024)
+        if not _valid_identifier(project) or request != {"project": project}:
+            raise EnrollmentMetadataError("Google cold catalog project does not match the verified load reply")
     route = MetadataRoute.FETCH_AVAILABLE_MODELS
-    response = destination(
+    response, observed = _exchange_observed(
         route, authorization=authorization, body=json.dumps(request).encode("ascii"), deadline=deadline,
-        deliver=lambda send: spend(route, send),
+        spend=spend, destination=destination, post_diagnostic=post_diagnostic,
     )
-    return VerifiedColdCatalog(response, _observe_catalog(response))
+    with observe_post_token(post_diagnostic if observed else None, PostTokenStage.COLD_CATALOG,
+                            EnrollmentMetadataError):
+        return VerifiedColdCatalog(response, _observe_catalog(response))

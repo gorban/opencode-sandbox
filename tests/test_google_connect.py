@@ -22,8 +22,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from oc_google import auth_offer, connect, metadata_workflow, native_artifacts
-from oc_google.native_service import NativeInvocation
-from oc_google.token_diagnostic import TokenStage
+from oc_google.native_service import NativeInvocation, NativeRetirementUnconfirmed
+from oc_google.token_diagnostic import PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage, scoped_post_token
 
 
 class TerminalOwnerTest(unittest.TestCase):
@@ -372,6 +372,45 @@ class RuntimeCustodyTest(unittest.TestCase):
 
     def test_token_diagnostic_text_covers_every_stage(self):
         self.assertEqual(set(connect._TOKEN_DETAILS), set(TokenStage))
+        self.assertEqual(set(connect._POST_TOKEN_DETAILS), set(PostTokenStage))
+
+    def test_post_token_load_body_uses_only_original_foreground_pty(self):
+        self.assert_diagnostic_uses_original_pty(
+            "load", b"Google enrollment metadata: The LOAD metadata body was refused.", b"synthetic-load-marker",
+        )
+
+    def test_post_token_detail_cannot_preempt_token_callback_or_inherit_custody(self):
+        callback = metadata_workflow.CallbackWorkflowError(auth_offer.CallbackDiagnostic.NO_MATCHING_CALLBACK)
+        token = RuntimeError("fixture token")
+        token.token_stage = TokenStage.HTTP_400
+        token_diagnostic = TokenDiagnostic()
+        token_diagnostic.mark(token)
+        for error, expected in (
+            (callback, "Google sign-in callback: No matching callback was accepted.\n"),
+            (token, "Google sign-in token reply: The token endpoint returned HTTP 400.\n"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                post = PostTokenDiagnostic()
+                post.mark(error, PostTokenStage.LOAD_BODY)
+                owner = Mock()
+                connect._write_enrollment_detail(owner, error, token_diagnostic, post)
+                owner.write_once.assert_called_once_with(expected)
+        original = RuntimeError("original fixture failure")
+        original.__context__ = NativeRetirementUnconfirmed("fixture custody uncertainty")
+        post = PostTokenDiagnostic()
+        post.mark(original, PostTokenStage.LOAD_BODY)
+        owner = Mock()
+        for error, attempt in (
+            (original, post), (RuntimeError(str(original)), post), (original, PostTokenDiagnostic()),
+        ):
+            connect._write_enrollment_detail(owner, error, token_diagnostic, attempt)
+        owner.write_once.assert_not_called()
+        replaced_context = RuntimeError("fixture failure before cleanup")
+        post = PostTokenDiagnostic()
+        post.mark(replaced_context, PostTokenStage.LOAD_BODY)
+        replaced_context.__context__ = RuntimeError("fixture cleanup replaced the context")
+        connect._write_enrollment_detail(owner, replaced_context, token_diagnostic, post)
+        owner.write_once.assert_not_called()
 
     def assert_diagnostic_uses_original_pty(self, kind, expected_stage, marker):
         origin = Path(__file__).resolve().parents[1]
@@ -380,6 +419,8 @@ class RuntimeCustodyTest(unittest.TestCase):
 
         terminal_states = (("foreground", "background") if kind == "callback"
                            else ("foreground", "background", "interrupted", "custody"))
+        if kind == "load":
+            terminal_states += ("expired",)
         for terminal_state in terminal_states:
             with self.subTest(terminal_state=terminal_state):
                 stderr = self.parent / f"stderr-{terminal_state}"
@@ -449,6 +490,8 @@ class RuntimeCustodyTest(unittest.TestCase):
             finally:
                 if terminal_state == "interrupted" and not cold:
                     os.kill(os.getpid(), signal.SIGINT)
+                if terminal_state == "expired" and not cold:
+                    owner.deadline = time.monotonic() - 1
                 if terminal_state == "background" and not cold:
                     assert not list(runtime.iterdir())
                     blocker = os.fork()
@@ -481,22 +524,32 @@ class RuntimeCustodyTest(unittest.TestCase):
                 finally:
                     assert reply.result(timeout=3) == auth_offer.acknowledgement(False)
 
-        def refuse_token(*args, authorized, fence, destination, diagnostic=None, **kwargs):
+        def refuse_token(*args, authorized, fence, destination, diagnostic=None, post_diagnostic=None, **kwargs):
             from oc_google import enrollment, metadata_destination
+            from test_google_enrollment import BEARER, LOAD_REQUEST, SUBJECT
             from test_google_metadata_destination import FakeChannel, IPV4, response
             from test_google_oauth_exchange import AUTHORIZATION, CODE, SCOPE, STATE, form, grant, offer
 
             if kind == "scope":
-                token = FakeChannel(response(grant(scope=SCOPE + " synthetic-unapproved-permission")))
+                channels = (FakeChannel(response(grant(scope=SCOPE + " synthetic-unapproved-permission"))),)
+            elif kind == "load":
+                channels = (
+                    FakeChannel(response(grant())), FakeChannel(response(SUBJECT)),
+                    FakeChannel(response(b'{"synthetic-load-marker":1}')),
+                )
             else:
-                token = FakeChannel(response(status=b"HTTP/1.1 400 synthetic-token-marker"))
-            trust = Mock(wrap_socket=Mock(return_value=token))
+                channels = (FakeChannel(response(status=b"HTTP/1.1 400 synthetic-token-marker")),)
+            trust = Mock(wrap_socket=Mock(side_effect=channels))
             gate = Mock(take_forwarded=Mock(return_value=auth_offer.Callback(STATE, CODE)))
+            route_type = metadata_destination.MetadataRoute
+            routes = (route_type.TOKEN, route_type.USERINFO, route_type.LOAD_CODE_ASSIST)
+            sent = []
 
             def spend(route, send):
                 with fence:
-                    assert authorized() and route is metadata_destination.MetadataRoute.TOKEN
+                    assert authorized() and route is routes[len(sent)]
                     send()
+                    sent.append(route)
 
             # Passing the optional observer only when the launcher supplied it
             # also lets this PTY regression run against the unchanged baseline.
@@ -505,13 +558,16 @@ class RuntimeCustodyTest(unittest.TestCase):
                     patch.object(metadata_destination, "_resolve", return_value=(2, IPV4)), \
                     patch.object(metadata_destination, "_system_tls_context", return_value=trust):
                 try:
-                    enrollment.verify_initial_exchange(
+                    verified = enrollment.verify_initial_exchange(
                         offer=offer(), callback_gate=gate, authorization=AUTHORIZATION, form=form(),
                         bind_subject=Mock(), deadline=time.monotonic() + 2, spend=spend,
                         destination=destination, **options,
                     )
+                    if kind == "load":
+                        live = scoped_post_token(post_diagnostic, fence, authorized)
+                        verified.load_code_assist(authorization=BEARER, body=LOAD_REQUEST, post_diagnostic=live)
                 finally:
-                    assert len(token.sent) == 1
+                    assert len(sent) == len(channels) and all(len(channel.sent) == 1 for channel in channels)
 
         refuse = refuse_callback if kind == "callback" else refuse_token
         try:

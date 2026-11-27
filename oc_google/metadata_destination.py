@@ -72,6 +72,12 @@ class _ObservedDelivery:
         return self.deliver(send)
 
 
+class _ObservedPostDelivery(_ObservedDelivery):
+    """Observe an exact protected response for a post-token stage."""
+
+    __slots__ = ()
+
+
 def _remaining(deadline):
     if type(deadline) not in (int, float):
         raise MetadataDestinationError("Invalid Google metadata deadline")
@@ -372,10 +378,11 @@ def exchange(
     fence while invoking its one-use send closure synchronously. Any uncertain
     write remains the caller's blocking receipt. No automatic retry is made.
     """
-    observed = (deliver if type(deliver) is _ObservedDelivery and route is deliver.route
-                and authorization is not None else None)
-    observe_token = observed is not None and route is MetadataRoute.TOKEN
-    observe_userinfo = observed is not None and route is MetadataRoute.USERINFO
+    observed = deliver if type(deliver) in (_ObservedDelivery, _ObservedPostDelivery) and route is deliver.route else None
+    observe_token = type(observed) is _ObservedDelivery and route is MetadataRoute.TOKEN and authorization is not None
+    observe_userinfo = type(observed) is _ObservedDelivery and route is MetadataRoute.USERINFO and authorization is not None
+    observe_post_reply = type(observed) is _ObservedPostDelivery
+    post_reply_error = None
     admission_started = False
     written = False
 
@@ -399,9 +406,16 @@ def exchange(
                     raise _MetadataSetupError("Unexpected Google metadata TLS protocol")
                 _send_under_gate(connection, packet, deadline, admit if observe_userinfo else deliver)
                 written = True
-                reply = _response(connection, limit, deadline)
+                try:
+                    reply = _response(connection, limit, deadline)
+                except (MetadataDestinationError, OSError) as error:
+                    if observe_post_reply:
+                        post_reply_error = error
+                    raise
     except (_ResponseRefused, _MetadataDeadlineError, _MetadataSetupError) as error:
-        if observe_token and written and type(error) is not _MetadataSetupError:
+        if error is post_reply_error:
+            observed._observe(error)
+        elif observe_token and written and type(error) is not _MetadataSetupError:
             if type(error) is _MetadataDeadlineError:
                 error.token_stage = TokenStage.TRANSPORT
             observed._observe(error)
@@ -411,8 +425,9 @@ def exchange(
         raise
     except OSError as error:
         stage = TokenStage.TLS_EOF if isinstance(error, ssl.SSLEOFError) else TokenStage.TRANSPORT
+        post_reply_io_failure = error is post_reply_error
     else:
-        if observe_token:
+        if observe_token or observe_post_reply:
             observed._observe(reply)
         return reply
     message = "Google metadata transport did not settle"
@@ -424,4 +439,7 @@ def exchange(
         error = _ResponseRefused(message, stage)
         observed._observe(error)
         raise error
-    raise MetadataDestinationError(message)
+    error = MetadataDestinationError(message)
+    if post_reply_io_failure:
+        observed._observe(error)
+    raise error

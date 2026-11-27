@@ -2,16 +2,17 @@
 
 from dataclasses import dataclass, field
 import json
+import math
 import re
 from threading import Lock
 
-from .account_binding import MetadataOperation, SubjectProof, _unique_fields
-from .metadata_destination import MetadataDestinationError, MetadataRoute, _ObservedDelivery, exchange
+from .account_binding import AccountBindingError, MetadataOperation, SubjectProof, _unique_fields
+from .metadata_destination import MetadataDestinationError, MetadataRoute, _ObservedDelivery, _ObservedPostDelivery, exchange
 from .oauth_exchange import (
     _GrantRefused, _reject_constant, validate_authorization_code_exchange, validate_cold_grant,
     validate_enrollment_grant,
 )
-from .token_diagnostic import TokenDiagnostic
+from .token_diagnostic import ScopedPostTokenDiagnostic, PostTokenStage, TokenDiagnostic, observe_post_token
 
 
 _LOAD_BODY = {"metadata": {"ideType": "ANTIGRAVITY"}}
@@ -20,6 +21,23 @@ _REQUEST_LIMIT = 256
 _REPLY_LIMIT = 4096
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _METADATA_FIELDS = {"currentTier", "cloudaicompanionProject"}
+
+_RICH_REPLY_LIMIT = 16 * 1024
+_RICH_STRINGS = {"manageSubscriptionUri", "upgradeSubscriptionUri", "g1Tier"}
+_RICH_FIELDS = _METADATA_FIELDS | _RICH_STRINGS | {
+    "paidTier", "allowedTiers", "ineligibleTiers", "projectValidationError", "gcpManaged", "releaseChannel",
+}
+_TIER_FLAGS = {"usesGcpTos", "userDefinedCloudaicompanionProject", "isDefault"}
+_TIER_STRINGS = {
+    "name", "description", "upgradeSubscriptionUri", "upgradeSubscriptionText", "upgradeButtonText",
+    "clientExperienceTag", "referralInviteUri",
+}
+_TIER_FIELDS = _TIER_FLAGS | _TIER_STRINGS | {"id", "privacyNotice", "availableCredits", "upgradeSubscriptionType"}
+_INELIGIBLE_STRINGS = {
+    "reasonMessage", "tierName", "validationErrorMessage", "validationUrlLinkText", "validationUrl",
+    "validationLearnMoreLinkText", "validationLearnMoreUrl",
+}
+_ENUM = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 
 
 class EnrollmentMetadataError(ValueError):
@@ -82,6 +100,115 @@ def _observe_load_reply(body):
     return LoadObservation("currentTier" in fields, "cloudaicompanionProject" in fields)
 
 
+def _bounded_rich_value(value, depth=1):
+    if type(value) is dict:
+        return (depth <= 6 and len(value) <= 24
+                and all(_bounded_rich_value(key) and _bounded_rich_value(item, depth + 1)
+                        for key, item in value.items()))
+    if type(value) is list:
+        return depth <= 6 and len(value) <= 16 and all(_bounded_rich_value(item, depth + 1) for item in value)
+    if type(value) is str:
+        return len(value.encode("utf-8")) <= 1024
+    if type(value) is float:
+        return math.isfinite(value)
+    return value is None or type(value) in (bool, int)
+
+
+def _printable(value):
+    return type(value) is str and (not value or value.isprintable())
+
+
+def _known_enum_shape(value):
+    return (type(value) is str and _ENUM.fullmatch(value) is not None
+            or type(value) is int and 0 <= value < (1 << 31))
+
+
+def _rich_tier(tier):
+    if type(tier) is not dict or tier.keys() - _TIER_FIELDS or not _valid_identifier(tier.get("id")):
+        return False
+    return (all(_printable(tier[key]) for key in tier.keys() & _TIER_STRINGS)
+            and all(type(tier[key]) is bool for key in tier.keys() & _TIER_FLAGS)
+            and ("privacyNotice" not in tier or type(tier["privacyNotice"]) is dict)
+            and ("availableCredits" not in tier or type(tier["availableCredits"]) is list
+                 and all(type(credit) is dict for credit in tier["availableCredits"]))
+            and ("upgradeSubscriptionType" not in tier or _known_enum_shape(tier["upgradeSubscriptionType"])))
+
+
+def _personal_tier(tier):
+    return (_rich_tier(tier) and _valid_tier({key: tier.get(key) for key in ("id", "name")})
+            and tier.get("usesGcpTos", False) is False
+            and tier.get("userDefinedCloudaicompanionProject", False) is False)
+
+
+def _valid_alternatives(allowed, ineligible, active):
+    if allowed is not None:
+        if type(allowed) is not list or not all(_rich_tier(tier) for tier in allowed):
+            return False
+        ids = {tier["id"] for tier in allowed}
+        if len(ids) != len(allowed):
+            return False
+        for alternative in allowed:
+            for retained in active:
+                if alternative["id"] == retained["id"] and (
+                    alternative.get("name", retained["name"]) != retained["name"]
+                    or alternative.get("usesGcpTos", False) is True
+                    or alternative.get("userDefinedCloudaicompanionProject", False) is True
+                ):
+                    return False
+    if ineligible is None:
+        return True
+    if type(ineligible) is not list:
+        return False
+    seen = {tier["id"] for tier in active}
+    for row in ineligible:
+        if (type(row) is not dict or row.keys() - (_INELIGIBLE_STRINGS | {"tierId", "reasonCode"})
+                or not _valid_identifier(row.get("tierId")) or row["tierId"] in seen
+                or any(not _printable(row[key]) for key in row.keys() & _INELIGIBLE_STRINGS)
+                or ("reasonCode" in row and not _known_enum_shape(row["reasonCode"]))):
+            return False
+        seen.add(row["tierId"])
+    return True
+
+
+def _retained_tier(tier):
+    retained = {"id": tier["id"], "name": tier["name"]}
+    if "usesGcpTos" in tier:
+        retained["usesGcpTos"] = tier["usesGcpTos"]
+    return retained
+
+
+def project_load_reply(body) -> VerifiedLoadReply:
+    """Keep legacy bytes or project an already complete personal LOAD result."""
+    try:
+        return VerifiedLoadReply(body, _observe_load_reply(body))
+    except EnrollmentMetadataError:
+        pass
+
+    fields = _bounded_object(body, _RICH_REPLY_LIMIT)
+    try:
+        bounded = _bounded_rich_value(fields)
+    except UnicodeError:
+        bounded = False
+    current = fields.get("currentTier")
+    paid = fields.get("paidTier")
+    project = fields.get("cloudaicompanionProject")
+    if (not bounded or fields.keys() - _RICH_FIELDS
+            or not _personal_tier(current) or not _valid_identifier(project)
+            or (paid is not None and not _personal_tier(paid))
+            or fields.get("gcpManaged", False) is not False or fields.get("projectValidationError") is not None
+            or ("releaseChannel" in fields and type(fields["releaseChannel"]) is not dict)
+            or any(fields[key] is not None and not _printable(fields[key]) for key in fields.keys() & _RICH_STRINGS)):
+        raise EnrollmentMetadataError("Invalid Google enrollment metadata response")
+    active = (current,) if paid is None else (current, paid)
+    if not _valid_alternatives(fields.get("allowedTiers"), fields.get("ineligibleTiers"), active):
+        raise EnrollmentMetadataError("Invalid Google enrollment metadata response")
+    projected = {"currentTier": _retained_tier(current), "cloudaicompanionProject": project}
+    if paid is not None:
+        projected["paidTier"] = _retained_tier(paid)
+    body = json.dumps(projected, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return VerifiedLoadReply(body, LoadObservation(True, True))
+
+
 class _LoadCodeAssist:
     def __init__(self, proof, deadline, spend, destination):
         self._proof = proof
@@ -91,21 +218,24 @@ class _LoadCodeAssist:
         self._lock = Lock()
         self._claimed = False
 
-    def __call__(self, *, authorization, body):
-        with self._lock:
-            if self._claimed:
-                raise EnrollmentMetadataError("Google enrollment metadata attempt was already consumed")
-            self._claimed = True
-        if type(authorization) is not bytes or not authorization.startswith(b"Bearer "):
-            raise EnrollmentMetadataError("Invalid Google enrollment metadata authorization")
-        self._proof.require_metadata_bearer(MetadataOperation.LOAD_CODE_ASSIST, authorization[7:])
-        _validate_load_request(body)
-        route = MetadataRoute.LOAD_CODE_ASSIST
-        reply = self._destination(
-            route, authorization=authorization, body=_LOAD_REQUEST, deadline=self._deadline,
-            deliver=lambda send: self._spend(route, send),
+    def __call__(self, *, authorization, body, post_diagnostic=None):
+        with observe_post_token(post_diagnostic, PostTokenStage.LOAD_ADMISSION,
+                                EnrollmentMetadataError, AccountBindingError):
+            with self._lock:
+                if self._claimed:
+                    raise EnrollmentMetadataError("Google enrollment metadata attempt was already consumed")
+                self._claimed = True
+            if type(authorization) is not bytes or not authorization.startswith(b"Bearer "):
+                raise EnrollmentMetadataError("Invalid Google enrollment metadata authorization")
+            self._proof.require_metadata_bearer(MetadataOperation.LOAD_CODE_ASSIST, authorization[7:])
+            _validate_load_request(body)
+        reply, observed = _exchange_observed(
+            MetadataRoute.LOAD_CODE_ASSIST, authorization=authorization, body=_LOAD_REQUEST, deadline=self._deadline,
+            spend=self._spend, destination=self._destination, post_diagnostic=post_diagnostic,
         )
-        return VerifiedLoadReply(reply, _observe_load_reply(reply))
+        with observe_post_token(post_diagnostic if observed else None, PostTokenStage.LOAD_BODY,
+                                EnrollmentMetadataError):
+            return project_load_reply(reply)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,9 +246,9 @@ class VerifiedTokenReply:
     proof: SubjectProof = field(repr=False)
     _load: _LoadCodeAssist = field(repr=False, compare=False)
 
-    def load_code_assist(self, *, authorization: bytes, body: bytes) -> VerifiedLoadReply:
+    def load_code_assist(self, *, authorization: bytes, body: bytes, post_diagnostic=None) -> VerifiedLoadReply:
         """Validate and spend a single native metadata attempt after subject proof."""
-        return self._load(authorization=authorization, body=body)
+        return self._load(authorization=authorization, body=body, post_diagnostic=post_diagnostic)
 
     def __reduce_ex__(self, _protocol):
         raise TypeError("Google enrollment reply must remain in memory")
@@ -151,7 +281,16 @@ def verify_initial_exchange(
                              diagnostic=diagnostic if observed else None)
 
 
-def _exchange_observed(route, *, authorization, deadline, spend, destination, diagnostic, **request):
+_POST_HTTP_STAGE = {
+    MetadataRoute.TOKEN: PostTokenStage.COLD_REFRESH,
+    MetadataRoute.USERINFO: PostTokenStage.COLD_SUBJECT,
+    MetadataRoute.LOAD_CODE_ASSIST: PostTokenStage.LOAD_HTTP_REPLY,
+    MetadataRoute.FETCH_AVAILABLE_MODELS: PostTokenStage.COLD_CATALOG,
+}
+
+
+def _exchange_observed(route, *, authorization, deadline, spend, destination, diagnostic=None,
+                       post_diagnostic=None, **request):
     observed = object()
 
     def deliver(send):
@@ -163,11 +302,16 @@ def _exchange_observed(route, *, authorization, deadline, spend, destination, di
 
     if type(diagnostic) is TokenDiagnostic:
         deliver = _ObservedDelivery(route, deliver, observe)
+    elif type(post_diagnostic) is ScopedPostTokenDiagnostic:
+        deliver = _ObservedPostDelivery(route, deliver, observe)
     try:
         reply = destination(route, authorization=authorization, deadline=deadline, deliver=deliver, **request)
     except MetadataDestinationError as error:
         if error is observed:
-            diagnostic.mark(error)
+            if type(diagnostic) is TokenDiagnostic:
+                diagnostic.mark(error)
+            else:
+                post_diagnostic.mark(error, _POST_HTTP_STAGE[route])
         raise
     else:
         return reply, reply is observed
@@ -175,22 +319,29 @@ def _exchange_observed(route, *, authorization, deadline, spend, destination, di
         observed = None
 
 
-def verify_cold_refresh(*, form, prepare_form, bind_subject, deadline, spend, destination=exchange):
+def verify_cold_refresh(*, form, prepare_form, bind_subject, deadline, spend, destination=exchange,
+                        post_diagnostic=None):
     """Refresh only the pinned cold profile and verify the same subject before reply."""
     body = prepare_form(form)
-    grant = validate_cold_grant(destination(
+    reply, observed = _exchange_observed(
         MetadataRoute.TOKEN, authorization=None, body=body, deadline=deadline,
-        deliver=lambda send: spend(MetadataRoute.TOKEN, send),
-    ))
-    return _bind_token_reply(grant, bind_subject, deadline, spend, destination)
-
-
-def _bind_token_reply(grant, bind_subject, deadline, spend, destination, *, diagnostic=None):
-    access = grant.access_token
-    subject_reply, _ = _exchange_observed(
-        MetadataRoute.USERINFO, authorization=b"Bearer " + access, deadline=deadline,
-        spend=spend, destination=destination, diagnostic=diagnostic,
+        spend=spend, destination=destination, post_diagnostic=post_diagnostic,
     )
-    proof = bind_subject(access, subject_reply)
+    with observe_post_token(post_diagnostic if observed else None, PostTokenStage.COLD_REFRESH, _GrantRefused):
+        grant = validate_cold_grant(reply)
+    return _bind_token_reply(grant, bind_subject, deadline, spend, destination, post_diagnostic=post_diagnostic,
+                             cold=True)
+
+
+def _bind_token_reply(grant, bind_subject, deadline, spend, destination, *, diagnostic=None, post_diagnostic=None,
+                      cold=False):
+    access = grant.access_token
+    subject_reply, observed = _exchange_observed(
+        MetadataRoute.USERINFO, authorization=b"Bearer " + access, deadline=deadline,
+        spend=spend, destination=destination, diagnostic=diagnostic, post_diagnostic=post_diagnostic if cold else None,
+    )
+    with observe_post_token(post_diagnostic if cold and observed else None, PostTokenStage.COLD_SUBJECT,
+                            AccountBindingError):
+        proof = bind_subject(access, subject_reply)
     proof.require_metadata_bearer(MetadataOperation.LOAD_CODE_ASSIST, access)
     return VerifiedTokenReply(grant.native_body, proof, _LoadCodeAssist(proof, deadline, spend, destination))

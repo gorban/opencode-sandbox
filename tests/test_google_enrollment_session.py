@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from oc_google import connect, metadata_destination, registration
+from oc_google import connect, enrollment, metadata_destination, registration
 from oc_google.account_binding import AccountBindingError
 from oc_google.auth_offer import Callback
 from oc_google.enrollment import EnrollmentMetadataError
@@ -25,7 +25,7 @@ from oc_google.native_service import (
 )
 from oc_google.native_namespace import NativeNamespaceError
 from oc_google.native_transport import NativeChannel
-from oc_google.token_diagnostic import TokenDiagnostic, TokenStage
+from oc_google.token_diagnostic import PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage
 from google_registration_fixture import record_enrollment_retired
 from test_google_enrollment import BEARER, LOAD_REPLY, LOAD_REQUEST, SUBJECT
 from test_google_metadata_ingress import FakePeer, packet
@@ -125,21 +125,22 @@ class EnrollmentSessionTest(unittest.TestCase):
             self.peers[TOKEN].live = False
         return self.responses[route]
 
-    def session(self, *, diagnostic=None):
+    def session(self, *, diagnostic=None, post_diagnostic=None):
         return serve_initial_metadata(
             offer=offer(), callback_gate=self.callback_gate, profile=self.profile,
             deadline=time.monotonic() + 3, accept=self.accept, fence=self.fence,
             authorized=lambda: self.active, destination=self.destination, diagnostic=diagnostic,
+            post_diagnostic=post_diagnostic,
         )
 
-    def attended_exchange(self, *, token_reply=None, userinfo=None, route_override=None):
+    def attended_exchange(self, *, token_reply=None, userinfo=None, load=None, route_override=None):
         token = FakeChannel(response(grant() if token_reply is None else token_reply))
         token_socket, userinfo_socket = FakeChannel(), FakeChannel()
-        trust = Mock(wrap_socket=Mock(side_effect=[token, userinfo]))
+        trust = Mock(wrap_socket=Mock(side_effect=[token, userinfo, load]))
         self.enterContext(patch.object(metadata_destination, "_resolve", return_value=(2, IPV4)))
         self.enterContext(patch.object(metadata_destination, "_system_tls_context", return_value=trust))
         self.enterContext(patch.object(metadata_destination.socket, "socket",
-                                       side_effect=[token_socket, userinfo_socket]))
+                                       side_effect=[token_socket, userinfo_socket, FakeChannel()]))
 
         def deliver(route, **request):
             actual = route_override if route is USERINFO and route_override is not None else route
@@ -157,6 +158,152 @@ class EnrollmentSessionTest(unittest.TestCase):
         self.assertIsNone(saved["subject_digest"])
         self.assertEqual(self.accepted, [TOKEN])
         self.assertEqual(self.peers[TOKEN].replies, [])
+
+    def test_load_request_admission_records_the_exact_local_error(self):
+        diagnostic = PostTokenDiagnostic()
+        self.peers[LOAD] = NativePeer(packet(LOAD, body=b"{}", changes={b"Authorization": BEARER}))
+        with self.assertRaises(EnrollmentMetadataError) as refusal:
+            self.session(post_diagnostic=diagnostic)
+        self.assertIs(diagnostic.stage(refusal.exception), PostTokenStage.LOAD_ADMISSION)
+        self.assertEqual(self.sent, [TOKEN, USERINFO])
+
+    def test_load_http_reply_records_only_the_exact_attested_transport_error(self):
+        diagnostic = PostTokenDiagnostic()
+        http = FakeChannel(response(status=b"HTTP/1.1 400 synthetic-load-marker"))
+        self.attended_exchange(userinfo=FakeChannel(response(SUBJECT)), load=http)
+        with self.assertRaises(metadata_destination.MetadataDestinationError) as refusal:
+            self.session(post_diagnostic=diagnostic)
+        self.assertIs(diagnostic.stage(refusal.exception), PostTokenStage.LOAD_HTTP_REPLY)
+        self.assertIsNone(diagnostic.stage(metadata_destination.MetadataDestinationError(str(refusal.exception))))
+        self.assertIsNone(PostTokenDiagnostic().stage(refusal.exception))
+        self.assertEqual(len(http.sent), 1)
+        self.assertNotIn("synthetic-load-marker", self.journal_file.read_text())
+
+    def test_load_body_records_only_the_exact_protected_reply(self):
+        diagnostic = PostTokenDiagnostic()
+        loaded = FakeChannel(response(b'{"synthetic-load-marker":1}'))
+        self.attended_exchange(userinfo=FakeChannel(response(SUBJECT)), load=loaded)
+        with self.assertRaises(EnrollmentMetadataError) as refusal:
+            self.session(post_diagnostic=diagnostic)
+        self.assertIs(diagnostic.stage(refusal.exception), PostTokenStage.LOAD_BODY)
+        self.assertEqual(len(loaded.sent), 1)
+        self.assertNotIn("synthetic-load-marker", self.journal_file.read_text())
+
+    def test_load_fake_response_cannot_inherit_the_protected_stage(self):
+        diagnostic = PostTokenDiagnostic()
+        loaded = FakeChannel(response(b'{"synthetic-load-marker":1}'))
+        self.attended_exchange(userinfo=FakeChannel(response(SUBJECT)), load=loaded)
+        original = self.destination
+
+        def substitute(route, **request):
+            received = original(route, **request)
+            return bytes(bytearray(received)) if route is LOAD else received
+
+        self.destination = substitute
+        with self.assertRaises(EnrollmentMetadataError) as refusal:
+            self.session(post_diagnostic=diagnostic)
+        self.assertIsNone(diagnostic.stage(refusal.exception))
+        self.assertEqual(len(loaded.sent), 1)
+
+    def assert_load_read_loss_has_no_diagnostic(self, *, lose_peer=False, bad_http=False, lose_pin=False):
+        diagnostic = PostTokenDiagnostic()
+        wire = (response(status=b"HTTP/1.1 400 synthetic-load-transport") if bad_http
+                else response(b'{"synthetic-load-body":1}'))
+        loaded = FakeChannel(wire)
+        self.attended_exchange(userinfo=FakeChannel(response(SUBJECT)), load=loaded)
+        primary = []
+        original_recv = loaded.recv
+        original_response = metadata_destination._response
+        original_load = enrollment.VerifiedTokenReply.load_code_assist
+
+        def lose_during_read(count):
+            if lose_pin:
+                self.native_gate.side_effect = registration.RegistrationUnavailable("synthetic exact native pin loss")
+            elif lose_peer:
+                self.peers[LOAD].live = False
+            else:
+                self.active = False
+            return original_recv(count)
+
+        def capture_response(connection, *args):
+            try:
+                return original_response(connection, *args)
+            except metadata_destination.MetadataDestinationError as error:
+                if connection is loaded:
+                    primary.append(error)
+                raise
+
+        def capture_load(verified, **request):
+            try:
+                return original_load(verified, **request)
+            except EnrollmentMetadataError as error:
+                primary.append(error)
+                raise
+
+        expected = metadata_destination.MetadataDestinationError if bad_http else EnrollmentMetadataError
+        with patch.object(loaded, "recv", side_effect=lose_during_read) as receive, \
+                patch.object(metadata_destination, "_response", side_effect=capture_response), \
+                patch.object(enrollment.VerifiedTokenReply, "load_code_assist", new=capture_load):
+            with self.assertRaises(expected) as refused:
+                self.session(post_diagnostic=diagnostic)
+        self.assertIsNone(diagnostic.stage(refused.exception))
+        error, = primary
+        self.assertIs(refused.exception, error)
+        if lose_pin:
+            self.assertTrue(self.active)
+            self.assertTrue(self.peers[LOAD].live)
+        receive.assert_called()
+        self.assertEqual(len(loaded.sent), 1)
+        self.assertEqual(self.accepted, [TOKEN, LOAD])
+        self.assertEqual(self.peers[LOAD].replies, [])
+        self.assertTrue(self.peers[LOAD].closed)
+
+    def test_load_body_refusal_does_not_mark_after_phase_owner_loss_in_receive(self):
+        self.assert_load_read_loss_has_no_diagnostic()
+
+    def test_load_http_refusal_does_not_mark_after_exact_peer_loss_in_receive(self):
+        self.assert_load_read_loss_has_no_diagnostic(lose_peer=True, bad_http=True)
+
+    def test_load_body_refusal_does_not_mark_after_exact_native_pin_loss_in_receive(self):
+        self.assert_load_read_loss_has_no_diagnostic(lose_pin=True)
+
+    def assert_load_native_reply_failure(self, *, timeout_setup=False, owner_loss=False):
+        post = PostTokenDiagnostic()
+        peer = self.peers[LOAD]
+        original_timeout = peer.settimeout
+
+        def fail_send(packet):
+            if owner_loss:
+                self.active = False
+            raise BrokenPipeError("synthetic LOAD publication failure")
+
+        def fail_timeout(seconds):
+            if LOAD in self.sent:
+                raise OSError("synthetic LOAD publication timeout setup failure")
+            original_timeout(seconds)
+
+        with patch.object(peer, "settimeout", side_effect=fail_timeout if timeout_setup else original_timeout), \
+                patch.object(peer, "sendall", side_effect=fail_send) as send:
+            with self.assertRaisesRegex(EnrollmentSessionError, "native metadata reply did not settle") as refusal:
+                self.session(post_diagnostic=post)
+
+        stage = post.stage(refusal.exception)
+        self.assertEqual(getattr(stage, "name", None), None if owner_loss else "LOAD_NATIVE_REPLY")
+        self.assertEqual(self.sent, [TOKEN, USERINFO, LOAD])
+        self.assertEqual(self.accepted, [TOKEN, LOAD])
+        self.assertEqual(send.call_count, 0 if timeout_setup else 1)
+        self.assertEqual(peer.replies, [])
+        self.assertTrue(peer.closed)
+        self.assertNotIn("synthetic LOAD", str(refusal.exception))
+
+    def test_load_native_send_failure_records_only_the_translated_error(self):
+        self.assert_load_native_reply_failure()
+
+    def test_load_native_timeout_setup_failure_records_before_any_send(self):
+        self.assert_load_native_reply_failure(timeout_setup=True)
+
+    def test_load_native_send_failure_with_owner_loss_has_no_diagnostic(self):
+        self.assert_load_native_reply_failure(owner_loss=True)
 
     def test_attended_initial_token_rejection_has_exact_grant_stage(self):
         diagnostic = TokenDiagnostic()

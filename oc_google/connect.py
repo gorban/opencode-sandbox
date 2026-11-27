@@ -20,14 +20,13 @@ from oc_providers.contracts import is_valid_instance_label
 
 from .auth_offer import CallbackDiagnostic
 from .control import terminal
-from .metadata_destination import MetadataDestinationError, MetadataRoute, exchange
+from .metadata_destination import MetadataRoute, exchange
 from .metadata_workflow import CallbackWorkflowError, MetadataRuntime, enroll_metadata, reopen_metadata
 from .native_artifacts import stage_standalone, verify_standalone_source
 from .native_namespace import public_certificate
 from .native_service import NativeRetirementUnconfirmed, retain_cleanup_failure
-from .oauth_exchange import OAuthExchangeError
 from .registration import RegistrationJournal, _absent, _DIRECTORY, _write_private
-from .token_diagnostic import TokenDiagnostic, TokenStage
+from .token_diagnostic import PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage
 
 
 _libc_write = ctypes.CDLL(None, use_errno=True).write
@@ -95,6 +94,21 @@ _TOKEN_DETAILS = {
     TokenStage.GRANT_REFRESH: "The token grant had incompatible refresh fields.",
     TokenStage.USERINFO_PRE_WRITE: "The token grant passed validation. UserInfo setup failed before its write.",
 }
+_POST_TOKEN_DETAILS = {
+    PostTokenStage.LOAD_ADMISSION: "The LOAD request or its local admission did not settle.",
+    PostTokenStage.LOAD_HTTP_REPLY: "The LOAD HTTP reply was refused.",
+    PostTokenStage.LOAD_BODY: "The LOAD metadata body was refused.",
+    PostTokenStage.LOAD_NATIVE_REPLY: "The LOAD reply could not be delivered to the native process.",
+    PostTokenStage.AUTH_COMPLETE: "The native sign-in completion was refused.",
+    PostTokenStage.ENROLLMENT_DRAIN: "The retired native sign-in dialogue could not be verified.",
+    PostTokenStage.ENROLLMENT_COMMIT: "The final enrollment record could not be committed.",
+    PostTokenStage.COLD_REFRESH: "The cold refresh was refused.",
+    PostTokenStage.COLD_SUBJECT: "The cold account continuity check was refused.",
+    PostTokenStage.COLD_CATALOG: "The cold metadata catalog was refused.",
+    PostTokenStage.COLD_ACP_COMPLETE: "The native cold session completion was refused.",
+    PostTokenStage.COLD_DRAIN: "The retired native cold dialogue could not be verified.",
+    PostTokenStage.COLD_COMMIT: "The final cold metadata record could not be committed.",
+}
 
 
 class ConnectError(RuntimeError):
@@ -105,28 +119,38 @@ class CustodyUnconfirmed(ConnectError):
     """Retain the exact affected private enrollment runtime for inspection."""
 
 
-def needs_custody_inspection(error):
+def needs_custody_inspection(error, *, include_context=False):
     """Project typed custody uncertainty as a safe operator instruction."""
     seen = set()
     types = (CustodyUnconfirmed, NativeRetirementUnconfirmed)
-    while error is not None and id(error) not in seen:
+    pending = [error]
+    while pending:
+        error = pending.pop()
+        if error is None or id(error) in seen:
+            continue
         if isinstance(error, types) or getattr(error, "cleanup_uncertainties", ()):
             return True
         seen.add(id(error))
-        error = error.__cause__
+        pending.append(error.__cause__)
+        if include_context:
+            pending.append(error.__context__)
     return False
 
 
-def _write_enrollment_detail(owner, error, token_diagnostic):
+def _write_enrollment_detail(owner, error, token_diagnostic, post_diagnostic):
     if needs_custody_inspection(error):
         return
     if isinstance(error, CallbackWorkflowError) and type(error.diagnostic) is CallbackDiagnostic:
         detail = "Google sign-in callback: " + _CALLBACK_DETAILS[error.diagnostic]
     elif error.__cause__ is None and not getattr(error, "__notes__", ()):
         stage = token_diagnostic.stage(error)
-        if stage is None:
-            return
-        detail = "Google sign-in token reply: " + _TOKEN_DETAILS[stage]
+        if stage is not None:
+            detail = "Google sign-in token reply: " + _TOKEN_DETAILS[stage]
+        else:
+            stage = post_diagnostic.stage(error)
+            if stage is None or needs_custody_inspection(error, include_context=True):
+                return
+            detail = "Google enrollment metadata: " + _POST_TOKEN_DETAILS[stage]
     else:
         return
     with suppress(OSError, ConnectError):
@@ -465,6 +489,7 @@ def connect_for(label):
     with _attended_owner() as owner:
         _preflight(parent)
         token_diagnostic = TokenDiagnostic()
+        post_diagnostic = PostTokenDiagnostic()
         try:
             with ExitStack() as initial_root, ExitStack() as cold_root:
                 with _artifacts() as source:
@@ -476,13 +501,17 @@ def connect_for(label):
                 journal = RegistrationJournal(label)
                 enrollment = enroll_metadata(journal, initial, disclose_offer=owner.offer, destination=exchange,
                                              authorized=owner.authorized, fence=owner.fence,
-                                             diagnostic=token_diagnostic)
+                                             diagnostic=token_diagnostic, post_diagnostic=post_diagnostic)
                 initial_root.close()
                 with owner.fence:
                     owner.deadline = min(owner.deadline, time.monotonic() + 18)
-                reopen_metadata(journal, enrollment, cold, destination=exchange, authorized=owner.authorized, fence=owner.fence)
-        except (CallbackWorkflowError, MetadataDestinationError, OAuthExchangeError) as error:
-            _write_enrollment_detail(owner, error, token_diagnostic)
+                reopen_metadata(journal, enrollment, cold, destination=exchange, authorized=owner.authorized,
+                                fence=owner.fence, post_diagnostic=post_diagnostic)
+        except (OSError, ValueError, RuntimeError) as error:
+            try:
+                _write_enrollment_detail(owner, error, token_diagnostic, post_diagnostic)
+            finally:
+                post_diagnostic.clear()
             raise
         with owner.fence:
             owner.write_once(f"Verified Google registration {label} for workstation metadata.\n")

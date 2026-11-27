@@ -11,11 +11,12 @@ from .auth_offer import CallbackDiagnostic, Outcome
 from .enrollment_session import serve_cold_metadata, serve_initial_metadata
 from .metadata_destination import MetadataDestinationError, MetadataRoute, _remaining
 from .native_artifacts import StagedNativeBuild
-from .native_enrollment_acp import NativeEnrollmentAcp
+from .native_enrollment_acp import NativeAcpError, NativeEnrollmentAcp
 from .native_namespace import public_certificate, reserve_native_unit
 from .native_service import NativeRetirementUnconfirmed, open_cold_service, open_enrollment_service, read_host_cgroup
 from .native_transport import native_server_context, open_native_browser_listener, open_native_metadata_listener
-from .registration import ColdObservation, _DIRECTORY, _write_private
+from .registration import ColdObservation, RegistrationUnavailable, _DIRECTORY, _write_private
+from .token_diagnostic import PostTokenStage, scoped_post_token, observe_post_token
 
 
 class MetadataWorkflowError(RuntimeError):
@@ -145,7 +146,34 @@ def _initialize_settings(profile):
         raise MetadataWorkflowError("Google enrollment settings could not be initialized") from None
 
 
-def enroll_metadata(journal, runtime, *, disclose_offer, destination, authorized, fence, diagnostic=None):
+def _live_acp_diagnostic(diagnostic, owner, profile):
+    def exact():
+        if not owner.active():
+            return False
+        profile.verify_native_invocation(authorized=owner.active)
+        return owner.active()
+
+    return scoped_post_token(diagnostic, owner.fence, exact)
+
+
+def _retired_phase_diagnostic(diagnostic, owner, service, *, retired=False):
+    """Match the revoked phase's original service, requiring settled retirement for commit."""
+    def exact():
+        return (not owner.open and service is owner.service and owner.identity is not None
+                and service.attested is owner.identity and (not retired or service.retired == owner.identity)
+                and owner.authorized())
+
+    return scoped_post_token(diagnostic, owner.fence, exact)
+
+
+def _drain_credential_phase(diagnostic, stage, owner, service, drain):
+    exact = _retired_phase_diagnostic(diagnostic, owner, service)
+    with observe_post_token(exact, stage, NativeAcpError, MetadataDestinationError):
+        drain()
+
+
+def enroll_metadata(journal, runtime, *, disclose_offer, destination, authorized, fence, diagnostic=None,
+                    post_diagnostic=None):
     """Enroll under one owner and return an exact credential-bearing local registration.
 
     The caller owns the trusted attended gate, route destination and runtime
@@ -176,7 +204,10 @@ def enroll_metadata(journal, runtime, *, disclose_offer, destination, authorized
         with open_enrollment_service(runtime.root, runtime.build, profile=profile, connector=connector,
                                      ca=runtime.certificate, browser=browser,
                                      authorized=owner.authorized, fence=owner.fence,
-                                     after_stop=lambda: acp.drain_retired_enrollment(), unit=unit, custody=custody) as service:
+                                     after_stop=lambda: _drain_credential_phase(
+                                         post_diagnostic, PostTokenStage.ENROLLMENT_DRAIN, owner, service,
+                                         acp.drain_retired_enrollment,
+                                     ), unit=unit, custody=custody) as service:
             try:
                 owner.bind(service, profile)
                 deadline = owner.deadline
@@ -189,16 +220,22 @@ def enroll_metadata(journal, runtime, *, disclose_offer, destination, authorized
                     observed = serve_initial_metadata(offer=offer, callback_gate=gate, profile=profile,
                                                       deadline=deadline, accept=accept, fence=owner.fence,
                                                       authorized=owner.active, destination=destination,
-                                                      diagnostic=diagnostic)
-                    acp.finish_personal_sign_in()
+                                                      diagnostic=diagnostic, post_diagnostic=post_diagnostic)
+                    live = _live_acp_diagnostic(post_diagnostic, owner, profile)
+                    with observe_post_token(live, PostTokenStage.AUTH_COMPLETE,
+                                            NativeAcpError, MetadataDestinationError):
+                        acp.finish_personal_sign_in()
             finally:
                 owner.revoke()
         with owner.fence:
-            profile.complete_enrollment(service, acp, completion=observed.completion, authorized=owner.authorized)
+            completion = observed.completion
+            exact = _retired_phase_diagnostic(post_diagnostic, owner, service, retired=True)
+            with observe_post_token(exact, PostTokenStage.ENROLLMENT_COMMIT, RegistrationUnavailable):
+                profile.complete_enrollment(service, acp, completion=completion, authorized=owner.authorized)
     return enrollment
 
 
-def reopen_metadata(journal, enrollment, runtime, *, destination, authorized, fence):
+def reopen_metadata(journal, enrollment, runtime, *, destination, authorized, fence, post_diagnostic=None):
     """Observe a fresh same-registration model catalog with zero prompts."""
     owner = _PhaseOwner(authorized, fence, 18)
     with owner.fence:
@@ -220,7 +257,10 @@ def reopen_metadata(journal, enrollment, runtime, *, destination, authorized, fe
                         custody.delegate_cold_cleanup()
                 with open_cold_service(runtime.root, runtime.build, replica=replica, connector=connector,
                                        ca=runtime.certificate, authorized=owner.authorized, fence=owner.fence,
-                                       after_stop=lambda: acp.drain_retired_metadata(), custody=custody) as service:
+                                       after_stop=lambda: _drain_credential_phase(
+                                           post_diagnostic, PostTokenStage.COLD_DRAIN, owner, service,
+                                           acp.drain_retired_metadata,
+                                       ), custody=custody) as service:
                     try:
                         owner.bind(service, profile)
                         deadline = owner.deadline
@@ -228,8 +268,12 @@ def reopen_metadata(journal, enrollment, runtime, *, destination, authorized, fe
                         acp.initialize()
                         acp.open_metadata_session()
                         observed = serve_cold_metadata(profile=profile, deadline=deadline, accept=accept,
-                                                       fence=owner.fence, authorized=owner.active, destination=destination)
-                        acp.finish_metadata_session()
+                                                       fence=owner.fence, authorized=owner.active, destination=destination,
+                                                       post_diagnostic=post_diagnostic)
+                        live = _live_acp_diagnostic(post_diagnostic, owner, profile)
+                        with observe_post_token(live, PostTokenStage.COLD_ACP_COMPLETE,
+                                                NativeAcpError, MetadataDestinationError):
+                            acp.finish_metadata_session()
                     finally:
                         owner.revoke()
         except BaseException as error:
@@ -241,8 +285,11 @@ def reopen_metadata(journal, enrollment, runtime, *, destination, authorized, fe
             raise
         _retire_replica(replica, service, owner.fence, runtime.custody)
         with owner.fence:
-            profile.complete_cold_custody(ColdObservation(check, True, 0, True), completion=observed.completion,
-                                          service=service, acp=acp, authorized=owner.authorized)
+            completion = observed.completion
+            exact = _retired_phase_diagnostic(post_diagnostic, owner, service, retired=True)
+            with observe_post_token(exact, PostTokenStage.COLD_COMMIT, RegistrationUnavailable):
+                profile.complete_cold_custody(ColdObservation(check, True, 0, True), completion=completion,
+                                              service=service, acp=acp, authorized=owner.authorized)
         return observed
 
 

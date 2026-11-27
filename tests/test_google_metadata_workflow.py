@@ -1,6 +1,7 @@
 """Protect the metadata-only workflow's setup and authorization boundaries."""
 
 from contextlib import contextmanager, nullcontext
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import RLock
@@ -9,11 +10,16 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from oc_google import connect, native_service
 from oc_google.auth_offer import CallbackDiagnostic, Outcome
+from oc_google.enrollment import EnrollmentMetadataError
 from oc_google.metadata_workflow import (
     CallbackWorkflowError, MetadataRuntime, MetadataWorkflowError, _receive_callback, enroll_metadata, reopen_metadata,
 )
-from oc_google.native_service import NativeRetirementUnconfirmed
+from oc_google.native_enrollment_acp import NativeAcpError
+from oc_google.native_service import NativeInvocation, NativeRetirementUnconfirmed
+from oc_google.registration import RegistrationUnavailable
+from oc_google.token_diagnostic import PostTokenDiagnostic, PostTokenStage, TokenDiagnostic
 
 
 class MetadataWorkflowTest(unittest.TestCase):
@@ -132,6 +138,100 @@ class MetadataWorkflowTest(unittest.TestCase):
         self.assertIs(result, enrollment)
         disclose.assert_called_once_with(offer)
         self.assertIs(profile.complete_enrollment.call_args.kwargs["completion"], outcome.completion)
+
+    def test_actual_service_exit_uses_only_the_original_primary_drain_or_commit_error(self):
+        for case, stage in (
+            ("load", PostTokenStage.LOAD_BODY),
+            ("unrelated", None),
+            ("live ACP", PostTokenStage.AUTH_COMPLETE),
+            ("live ACP pin lost", None),
+            ("drain", PostTokenStage.ENROLLMENT_DRAIN),
+            ("drain expired", None),
+            ("retirement uncertain", None),
+            ("commit", PostTokenStage.ENROLLMENT_COMMIT),
+            ("commit expired", None),
+        ):
+            with self.subTest(case=case):
+                journal, profile, _, _, runtime, _ = self.workflow_fixture()
+                diagnostic = PostTokenDiagnostic()
+                unit = "oc-google-acp-" + "1" * 24 + ".service"
+                identity = NativeInvocation(unit, "2" * 32, b"/fixture", 123)
+                namespace = SimpleNamespace(unit=unit, description="synthetic native")
+                proc = Mock()
+                proc.poll.return_value = None
+                gate = Mock(outcome=Outcome.FORWARDED)
+                handoff = nullcontext((Path("/fixture/browser.sock"), lambda _: nullcontext((object(), gate))))
+                acp = Mock()
+                primary_type = (RegistrationUnavailable if case.startswith("commit") else
+                                EnrollmentMetadataError if case == "load" else NativeAcpError)
+                primary = primary_type("synthetic primary")
+                clock = Mock(return_value=100)
+
+                @contextmanager
+                def opened(*args, after_stop, **kwargs):
+                    with native_service._run_service(namespace, after_stop) as service:
+                        yield service
+
+                def serve_initial(**kwargs):
+                    if case == "load":
+                        diagnostic.mark(primary, PostTokenStage.LOAD_BODY)
+                    if case in {"load", "unrelated"}:
+                        raise primary
+                    return SimpleNamespace(completion=object())
+
+                def commit(service, *_, **kwargs):
+                    self.assertIs(service.retired, identity)
+                    if case == "commit expired":
+                        clock.return_value = 281
+                    raise primary
+
+                def drain():
+                    if case == "drain expired":
+                        clock.return_value = 281
+                    raise primary
+
+                def finish_auth():
+                    if case == "live ACP pin lost":
+                        profile.verify_native_invocation.side_effect = RegistrationUnavailable("synthetic native pin loss")
+                    raise primary
+
+                if case.startswith("live ACP"):
+                    acp.finish_personal_sign_in.side_effect = finish_auth
+                if case in {"drain", "drain expired", "retirement uncertain"}:
+                    acp.drain_retired_enrollment.side_effect = drain
+                if case.startswith("commit"):
+                    profile.complete_enrollment.side_effect = commit
+                receipt = Mock(returncode=int(case == "retirement uncertain"),
+                               stdout=b"ActiveState=inactive\nControlGroup=\n")
+                fd = os.open(os.devnull, os.O_RDONLY)
+                with patch("oc_google.metadata_workflow.time.monotonic", clock), \
+                        patch("oc_google.metadata_workflow._initialize_settings"), \
+                        patch("oc_google.metadata_workflow.open_enrollment_service", side_effect=opened), \
+                        patch("oc_google.metadata_workflow.open_native_browser_listener", return_value=handoff), \
+                        patch("oc_google.metadata_workflow.NativeEnrollmentAcp", return_value=acp), \
+                        patch("oc_google.metadata_workflow.serve_initial_metadata", side_effect=serve_initial), \
+                        patch.object(native_service, "_spawn", return_value=proc), \
+                        patch.object(native_service, "_pin", return_value=(identity, fd)), \
+                        patch.object(native_service, "_pid_exited", return_value=True), \
+                        patch.object(native_service.signal, "pidfd_send_signal") as stop, \
+                        patch.object(native_service, "host", return_value=receipt):
+                    with self.assertRaises(type(primary)) as result:
+                        enroll_metadata(journal, runtime, disclose_offer=Mock(), destination=Mock(),
+                                        authorized=lambda: True, fence=RLock(), post_diagnostic=diagnostic)
+                self.assertIs(result.exception, primary)
+                self.assertIs(diagnostic.stage(primary), stage)
+                if case == "retirement uncertain":
+                    self.assertIsInstance(primary.__cause__, NativeRetirementUnconfirmed)
+                stop.assert_called_once()
+                self.assertEqual(acp.drain_retired_enrollment.call_count,
+                                 int(case not in {"load", "unrelated"} and not case.startswith("live ACP")))
+                console = Mock()
+                connect._write_enrollment_detail(console, primary, TokenDiagnostic(), diagnostic)
+                if stage is None or case == "retirement uncertain":
+                    console.write_once.assert_not_called()
+                else:
+                    console.write_once.assert_called_once()
+                    self.assertNotIn("synthetic primary", console.write_once.call_args.args[0])
 
     def test_cold_success_cleans_replica_before_publishing(self):
         journal, profile, replica, enrollment, runtime, opened = self.workflow_fixture()
