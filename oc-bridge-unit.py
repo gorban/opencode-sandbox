@@ -44,8 +44,10 @@ def properties(raw, fields):
     return result
 
 
-def same_path(observed, expected):
-    return (observed.startswith("/") and os.path.realpath(observed) == os.path.realpath(expected))
+def known_path(observed, *expected):
+    # Resolve only paths established by the launcher. A manager-provided alias
+    # may otherwise cross agent-writable directories before reaching storage.
+    return any(observed in (value, os.path.realpath(value)) for value in expected)
 
 
 def one_command(record, expected):
@@ -55,23 +57,24 @@ def one_command(record, expected):
     require(argv_marker and errors_marker)
     runner = shlex.split(path)
     argv = shlex.split(command)
-    require(len(runner) == 1 and len(argv) == len(expected) and same_path(runner[0], expected[0]))
-    require(same_path(argv[0], expected[0]) and argv[1:] == expected[1:])
+    require(len(runner) == 1 and len(argv) == len(expected) and known_path(runner[0], expected[0]))
+    require(known_path(argv[0], expected[0]) and argv[1:] == expected[1:])
 
 
-def check_environment(record, sandbox, stage):
+def check_environment(record, sandbox, stage, caller_stage):
     result = {}
     for value in shlex.split(record):
         key, sep, content = value.partition("=")
         require(sep and key in BRIDGE_ENV and key not in result)
         result[key] = content
-    require(same_path(result.get("OC_SB", ""), sandbox))
-    require(same_path(result.get("OC_BRIDGE_STAGE", ""), stage))
+    require(known_path(result.get("OC_SB", ""), sandbox))
+    require(known_path(result.get("OC_BRIDGE_STAGE", ""), stage, caller_stage))
 
 
-def check_service(record, runner, sandbox, stage, phase):
+def check_service(record, runner, sandbox, stage, caller_stage, phase):
     require(record.get("Type") == "oneshot")
     require(set(record["TriggeredBy"].split()) <= {TIMER, LEGACY})
+    require(not any(record[key] for key in ("WantedBy", "RequiredBy", "UpheldBy")))
     if record["DropInPaths"]:
         require(record["DropInPaths"] == FEDORA_DROP_IN)
         info = os.stat(FEDORA_DROP_IN, follow_symlinks=False)
@@ -84,21 +87,23 @@ def check_service(record, runner, sandbox, stage, phase):
         require(phase == "existing")
         one_command(record["ExecStartPre"], ["/usr/bin/sleep", "1"])
     one_command(record["ExecStart"], [runner])
-    check_environment(record["Environment"], sandbox, stage)
+    check_environment(record["Environment"], sandbox, stage, caller_stage)
 
 
-def check_unit(raw, name, units, runner, sandbox, stage, phase):
+def check_unit(raw, name, units, caller_units, runner, sandbox, stage, caller_stage, phase):
     record = properties(raw, IDENTITY_FIELDS | SERVICE_FIELDS)
     require(IDENTITY_FIELDS <= record.keys() and record["Id"] == name)
     load, active, job = (record[key] for key in ("LoadState", "ActiveState", "Job"))
-    require(load in {"loaded", "not-found"} and active in ACTIVE_STATES and re.fullmatch(r"[0-9]*", job))
+    require(load in {"loaded", "not-found"} and active in ACTIVE_STATES and re.fullmatch(r"\d*", job, re.ASCII))
     if load == "not-found":
         require(phase in {"existing", "disarmed"} and not record["FragmentPath"] and not record["DropInPaths"])
+        require(active == "inactive" and not job)
+        require(not any(record[key] for key in ("Triggers", "TriggeredBy", "WantedBy", "RequiredBy", "UpheldBy")))
     else:
         fragment = Path(record["FragmentPath"])
-        require(fragment.name == name and same_path(str(fragment.parent), units))
+        require(fragment.name == name and known_path(str(fragment.parent), units, caller_units))
         if name == DRAIN:
-            check_service(record, runner, sandbox, stage, phase)
+            check_service(record, runner, sandbox, stage, caller_stage, phase)
         else:
             require(not record["DropInPaths"] and record["Triggers"] == DRAIN)
     require(name in {TIMER, LEGACY, DRAIN})

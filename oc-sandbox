@@ -1229,14 +1229,17 @@ bridge_unit_state() {
   fi
   helper=$(trusted_file "$SCRIPT_DIR/oc-bridge-unit.py") || return 1
   sc show --all --property="$fields" "$unit" |
-    host_python "$helper" unit "$unit" "$HOST_UNITS" "$BIN/oc-bridge" "$SB" "$HOST_BRIDGE_STAGE" "$phase"
+    host_python "$helper" unit "$unit" "$HOST_UNITS" "$UNITS_SOURCE" "$BIN/oc-bridge" "$SB" \
+      "$HOST_BRIDGE_STAGE" "$BRIDGE_STAGE" "$phase"
 }
 stop_bridge() {
   local unit state
+  local -a loaded=()
   for unit in oc-bridge.timer oc-bridge.path oc-bridge.service; do
-    bridge_unit_state "$unit" >/dev/null || return 1
+    state=$(bridge_unit_state "$unit") || return 1
+    if [[ $state == $'LoadState=loaded\n'* ]]; then loaded+=("$unit"); fi
   done
-  for unit in oc-bridge.timer oc-bridge.path oc-bridge.service; do
+  for unit in "${loaded[@]}"; do
     sc stop "$unit" >/dev/null 2>&1 || true
     state=$(bridge_unit_state "$unit") || return 1
     [[ $state == *$'\nActiveState=inactive\nJob=' || $state == *$'\nActiveState=failed\nJob=' ]] || return 1
@@ -1275,8 +1278,9 @@ disarm_bridge() {
         $timer == $'LoadState=loaded\n'* ]]; then
     sc disable oc-bridge.timer >/dev/null || die "could not disarm the host bridge timer"
   fi
-  verify_bridge_disarmed oc-bridge.timer && verify_bridge_disarmed oc-bridge.path ||
-    die "host bridge activation remains enabled or could not be verified"
+  verify_bridge_disarmed oc-bridge.timer && verify_bridge_disarmed oc-bridge.path &&
+    bridge_unit_state oc-bridge.service disarmed >/dev/null ||
+      die "host bridge activation remains enabled or could not be verified"
 }
 # The module is installed by semodule at its default priority (400). A lower-priority
 # module with the same name belongs to someone else and must not be removed.

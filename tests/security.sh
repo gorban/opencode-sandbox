@@ -1374,7 +1374,7 @@ check "-i default -d -a removes pod oc"                 grep -qx 'podman pod rm 
 check "-i default -d -a leaves other instances"         ! grep -q 'oc-other' <<<"$out"
 check "-i default -d -a leaves bridge, images, login"   ! grep -qE '^systemctl|rmi|oc-home|semodule' <<<"$out"
 check "-i default -d -a removes only default volumes"   grep -qx 'podman volume rm -f oc-pg' <<<"$out"
-out=$(del -d)
+out=$(STUB_BRIDGE_LOADED=oc-bridge.service del -d)
 check "bare -d still removes every instance pod"        grep -qx 'podman pod rm --ignore -f -- oc-other' <<<"$out"
 check 'bare -d stops the active bridge service' grep -qx 'systemctl --user stop oc-bridge.service' <<<"$out"
 DSTATE=$T/dhome/.local/share/oc-sandbox
@@ -1392,7 +1392,7 @@ bridge_install_fixture() {
   pathrun STUB_SETUP=1 STUB_SETUP_DIR="$T/bridge-install" \
     OC_CHROMIUM_MODE=headless OC_OPENCODE_VERSION=keep "$@" -- -n
 }
-out=$(bridge_install_fixture)
+out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.service)
 check 'legacy watcher migration refuses while an old stage can have a live runner' \
   grep -q 'staged editor sessions remain' <<<"$out"
 check 'blocked migration keeps the old unit file' test -f "$legacy_unit"
@@ -1401,7 +1401,7 @@ check 'blocked migration stops the drain before returning' \
 check 'blocked migration does not activate a new trigger' \
   ! grep -qE 'systemctl --user (enable --now|start) oc-bridge\.timer' "$T/stub.log"
 unlink "$legacy_unit"
-out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.path)
+out=$(bridge_install_fixture 'STUB_BRIDGE_LOADED=oc-bridge.path oc-bridge.service')
 check 'manager-loaded legacy bridge still requires recovery if its file is missing' \
   grep -q 'staged editor sessions remain' <<<"$out"
 check 'missing legacy file does not bypass drain stop' \
@@ -1415,8 +1415,11 @@ for fault in STUB_BRIDGE_STAYS_ACTIVE=1 STUB_BRIDGE_PENDING=oc-bridge.timer STUB
   check "bridge remains disarmed on $fault" \
     ! grep -qE 'systemctl --user (enable --now|start) oc-bridge\.timer' "$T/stub.log"
 done
+out=$(bridge_install_fixture STUB_BRIDGE_STAYS_ACTIVE=1)
+check 'active not-found record is refused before any stop' \
+  ! grep -q '^systemctl --user stop ' "$T/stub.log"
 
-out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.timer \
+out=$(bridge_install_fixture 'STUB_BRIDGE_LOADED=oc-bridge.timer oc-bridge.service' \
   STUB_BRIDGE_ACTIVE_TIMER=oc-bridge.timer STUB_BRIDGE_PUBLISH_FAIL=1)
 check 'failed bridge publication happens after quiescing the active timer' awk '
   FNR == 1 {timer = drain = failure = 0}
@@ -1436,6 +1439,11 @@ for fault in STUB_BRIDGE_WRONG_FRAGMENT=oc-bridge.service STUB_BRIDGE_DROPIN=oc-
     grep -q 'could not quiesce' <<<"$out"
   check "unexpected unit is never stopped on $fault" ! grep -q '^systemctl --user stop ' "$T/stub.log"
 done
+ln -s "$DSTATE/bridge-stage" "$DSB/fixture-stage-alias"
+out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.service STUB_BRIDGE_STAGE="$DSB/fixture-stage-alias")
+check 'untrusted alias to the installed stage cannot authorize service stop' grep -q 'could not quiesce' <<<"$out"
+check 'untrusted alias is refused before any stop' ! grep -q '^systemctl --user stop ' "$T/stub.log"
+unlink "$DSB/fixture-stage-alias"
 for enablement in enabled enabled-runtime; do
   out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.timer \
     STUB_BRIDGE_STILL_ENABLED=oc-bridge.timer STUB_BRIDGE_ENABLEMENT="$enablement")
@@ -1444,6 +1452,12 @@ for enablement in enabled enabled-runtime; do
   check "replacement checks fresh enablement after disable for $enablement" \
     grep -qx 'systemctl --user is-enabled oc-bridge.timer' "$T/stub.log"
 done
+out=$(bridge_install_fixture 'STUB_BRIDGE_LOADED=oc-bridge.timer oc-bridge.service' \
+  STUB_BRIDGE_UPHOLD_AFTER_DISABLE=oc-bridge.service)
+check 'new drain activation dependency after disable prevents publication' \
+  grep -q 'activation remains enabled' <<<"$out"
+check 'drain activation dependency prevents rearming the timer' \
+  ! grep -q '^systemctl --user enable --now ' "$T/stub.log"
 global_units="$T/global-units"
 for relation in wants requires upholds; do
   directory="$global_units/default.target.$relation"

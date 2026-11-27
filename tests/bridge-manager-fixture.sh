@@ -6,7 +6,7 @@ unit=${!#}
 units=$HOME/.config/systemd/user
 stage=${XDG_DATA_HOME:-$HOME/.local/share}/oc-sandbox/bridge-stage
 load=not-found
-if [[ -f $units/$unit || $unit == "${STUB_BRIDGE_LOADED:-}" ]]; then load=loaded; fi
+if [[ -f $units/$unit || " ${STUB_BRIDGE_LOADED:-} " == *" $unit "* ]]; then load=loaded; fi
 
 case $command in
   enable)
@@ -30,7 +30,7 @@ case $command in
       printf 'UnitPath=%s\n' "$units ${STUB_BRIDGE_GLOBAL_UNITS:-$units}"
       exit 0
     fi
-    fragment= dropin= triggers= active=inactive job= wanted=
+    fragment= dropin= triggers= active=inactive job= wanted= upheld=
     if [[ $load == loaded ]]; then
       fragment="$units/$unit"
       if [[ $unit == "${STUB_BRIDGE_WRONG_FRAGMENT:-}" ]]; then fragment="/foreign/$unit"; fi
@@ -42,13 +42,17 @@ case $command in
        ! grep -Fqx "systemctl --user stop $unit" "${OC_TEST_BRIDGE_LOG:-/dev/null}"; then active=active; fi
     if [[ $unit == "${STUB_BRIDGE_PENDING:-}" ]]; then job=9; fi
     if [[ $unit == "${STUB_BRIDGE_DEPENDENCY:-}" ]]; then wanted=default.target; fi
+    if [[ $unit == "${STUB_BRIDGE_UPHOLD_AFTER_DISABLE:-}" ]] &&
+       grep -Fqx 'systemctl --user disable oc-bridge.timer' "${OC_TEST_BRIDGE_LOG:-/dev/null}"; then
+      upheld=fixture.target
+    fi
     if [[ ${3:-} == --property=LoadState ]]; then
       printf 'LoadState=%s\nActiveState=%s\nJob=%s\n' "$load" "$active" "$job"
       exit 0
     fi
     printf 'Id=%s\nLoadState=%s\nActiveState=%s\nJob=%s\nFragmentPath=%s\nDropInPaths=%s\n' \
       "$unit" "$load" "$active" "$job" "$fragment" "$dropin"
-    printf 'Triggers=%s\nTriggeredBy=\nWantedBy=%s\nRequiredBy=\nUpheldBy=\n' "$triggers" "$wanted"
+    printf 'Triggers=%s\nTriggeredBy=\nWantedBy=%s\nRequiredBy=\nUpheldBy=%s\n' "$triggers" "$wanted" "$upheld"
     if [[ $unit == oc-bridge.service && $load == loaded ]]; then
       runner=$HOME/.local/bin/oc-bridge
       printf 'Type=oneshot\nExecStart={ path=%s ; argv[]=%s ; ignore_errors=no ; pid=0 }\n' "$runner" "$runner"
