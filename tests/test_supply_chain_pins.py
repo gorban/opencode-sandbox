@@ -682,11 +682,89 @@ sys.exit(0)
             res = self._run_launcher(env)
             self.assertEqual(res.returncode, 0, res.stderr)
             receipt = (build / "oh-my-zsh-host.receipt").read_text(encoding="utf-8")
-            self.assertIn("layout=physical-v1", receipt)
+            self.assertIn("layout=physical-private-v2", receipt)
             rebuilt_leaf = build / "oh-my-zsh-host/custom/plugins/zsh-vi-mode"
             self.assertTrue(rebuilt_leaf.is_dir())
             self.assertFalse(rebuilt_leaf.is_symlink())
             self.assertEqual((outside / "sentinel").read_text(encoding="utf-8"), "keep\n")
+
+    def test_legacy_host_omz_preserves_owner_only_stage_and_cache_boundary_despite_broad_source_modes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home, state, _, _, env = self._make_env(root, with_host_omz=False)
+            omz = home / ".oh-my-zsh"
+            (omz / "custom/plugins").mkdir(parents=True, mode=0o755)
+            (omz / "oh-my-zsh.sh").write_text("# host omz\n", encoding="utf-8")
+            # Broaden source permissions so cp -a would widen any directly targeted stage dir.
+            for p in (omz, omz / "custom", omz / "custom/plugins"):
+                p.chmod(0o777)
+
+            observed_log = root / "stage_modes.json"
+            fake_git = root / "stub" / "git"
+            fake_git.write_text(
+                f"""#!/usr/bin/python3
+import json, os, pathlib, stat, sys
+args = sys.argv[1:]
+if "config" in args:
+    sys.exit(0)
+if "init" in args:
+    d = pathlib.Path(args[-1]); (d / ".git").mkdir(parents=True, exist_ok=True)
+    # Observe the active private stage wrapper and tree while clone_pinned_repo runs.
+    build_dir = d.parent
+    wraps = sorted(build_dir.glob(".omz-host-stage.*"))
+    if wraps:
+        wrap = wraps[0]
+        tree = wrap / "tree"
+        rec = {{
+            "wrap_mode": stat.S_IMODE(wrap.lstat().st_mode),
+            "tree_mode": stat.S_IMODE(tree.lstat().st_mode),
+            "custom_mode": stat.S_IMODE((tree / "custom").lstat().st_mode),
+            "plugins_mode": stat.S_IMODE((tree / "custom/plugins").lstat().st_mode),
+        }}
+        pathlib.Path({str(observed_log)!r}).write_text(json.dumps(rec), encoding="utf-8")
+    sys.exit(0)
+if "fetch" in args:
+    d = pathlib.Path(args[args.index("-C") + 1])
+    (d / ".git" / "FETCH_HEAD").write_text(args[-1], encoding="utf-8")
+    (d / "zsh-vi-mode.plugin.zsh").write_text("# pinned\\n", encoding="utf-8")
+    sys.exit(0)
+if "checkout" in args:
+    sys.exit(0)
+if "rev-parse" in args:
+    d = pathlib.Path(args[args.index("-C") + 1])
+    print((d / ".git" / "FETCH_HEAD").read_text(encoding="utf-8").strip())
+    sys.exit(0)
+sys.exit(0)
+""",
+                encoding="utf-8",
+            )
+            fake_git.chmod(0o755)
+
+            res = self._run_launcher(env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue(observed_log.is_file(), "expected private enclosing stage wrapper during clone")
+            stage_obs = json.loads(observed_log.read_text(encoding="utf-8"))
+            self.assertEqual(stage_obs["wrap_mode"] & 0o7077, 0, stage_obs)
+            self.assertEqual(stage_obs["tree_mode"] & 0o7077, 0, stage_obs)
+            self.assertEqual(stage_obs["custom_mode"] & 0o7022, 0, stage_obs)
+            self.assertEqual(stage_obs["plugins_mode"] & 0o7022, 0, stage_obs)
+
+            build = state / "build"
+            published = build / "oh-my-zsh-host"
+            self.assertEqual(published.lstat().st_mode & 0o7077, 0)
+            for rel in ("custom", "custom/plugins", "custom/plugins/zsh-vi-mode"):
+                self.assertEqual((published / rel).lstat().st_mode & 0o7022, 0, rel)
+            self.assertEqual(list(build.glob(".omz-host-stage.*")), [])
+
+            # Broadening the cached directory later must invalidate cache reuse and restore 0700.
+            published.chmod(0o777)
+            (published / "custom").chmod(0o777)
+            observed_log.unlink()
+            res2 = self._run_launcher(env)
+            self.assertEqual(res2.returncode, 0, res2.stderr)
+            self.assertTrue(observed_log.is_file(), "expected broadened cached directory to be rebuilt")
+            self.assertEqual(published.lstat().st_mode & 0o7077, 0)
+            self.assertEqual((published / "custom").lstat().st_mode & 0o7022, 0)
 
 
 if __name__ == "__main__":

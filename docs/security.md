@@ -47,7 +47,11 @@ default. The containers share your host kernel. A microVM runtime such as libkru
   `oc-dind` image pin upstream container bases by multi-arch OCI digest. `chrome-devtools-mcp` is
   verified by SHA-512 and SHA-256 and baked into `oc-agent` at build time without running `npm`
   scripts. Fallback `oh-my-zsh` and `zsh-vi-mode` checkouts are pinned by 40-character commit SHA into
-  a receipted cache separate from legacy host copies. OpenCode defaults to the read-only image-baked
+  an owner-only (`0700`) receipted cache (`oh-my-zsh-pinned`) separate from legacy host copies.
+  Legacy host `~/.oh-my-zsh` copies are staged inside an owner-only enclosing boundary, verify
+  effective `0700` / non-group-or-world-writable layout on both staging and cache reuse, and refuse
+  linked or non-directory `custom`, `custom/plugins`, or `custom/plugins/zsh-vi-mode` paths
+  (including when the plugin already exists through a link). OpenCode defaults to the read-only image-baked
   binary; verified opt-in updates download the direct release tarball without running a remote shell
   installer, verify the expected SHA-256 before first execution and again in the offline promoter, and
   execute a kernel-sealed immutable `memfd` verified at launch. Built images warn when older than

@@ -38,6 +38,14 @@ vi mode and your Git identity. A red `[sandbox:NAME]` prompt, `OC_SANDBOX=1` and
 `OC_INSTANCE=NAME` identify the session. The agent runs unprivileged with all capabilities
 dropped, `no-new-privileges`, and PID and memory limits.
 
+When `~/.oh-my-zsh` is absent on the host, setup uses the supported commit-pinned upstream
+`oh-my-zsh` and `zsh-vi-mode` checkouts stored in the owner-only `oh-my-zsh-pinned` build cache.
+If a legacy host `~/.oh-my-zsh` directory is present, setup stages it inside an owner-only
+(`0700`) private build boundary and refuses setup if `custom`, `custom/plugins`, or
+`custom/plugins/zsh-vi-mode` is a symlink or non-directory (including when `zsh-vi-mode` already
+exists through a symlink). Hosts that manage Oh My Zsh plugins through symlinks should use the
+pinned upstream path instead by keeping `~/.oh-my-zsh` absent from the sandbox host home.
+
 ### OpenAI local acceptance
 
 This preview uses Sign in with ChatGPT from the trusted devbox terminal. The
