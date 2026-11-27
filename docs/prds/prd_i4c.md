@@ -48,6 +48,39 @@ The Gate 1 walkthrough cleared both reviews at SHA-256
 `83f1d8bc608d496905382a47f4f63c788c0eae080bc27e29da5348a2bae5d839`.
 The readiness-only check and production launch commands retain their existing scope.
 
+The installed `agy acp` 1.5.15 and a separately downloaded 1.5.17 retained native tools
+and sent two prompt-bearing requests in the synthetic text trial, including with session
+filter metadata. The separately published editor ACP server 1.5.2 is a distinct candidate.
+An isolated fake personal login discovered the fixture models,
+and a selected model with the empty allowlist sent zero tool declarations and one request
+for a plain prompt. A separate fake tool response failed to obtain the synthetic file marker
+but induced another prompt-bearing request. Before a live turn, qualify a response gate and
+an independently enforced request allowance. The standalone archive and its required
+companion executable stay host-only and outside the repository. [Official ACP registry entry][standalone-acp]
+
+The stock OpenCode Full shell selected a fixture Gemini model and returned exact `ok`
+through the pinned standalone server and a local fake upstream. The broker admitted one
+generation, refused replay, withheld invalid tool or trailing response data, and verified
+process and container retirement. A separate fake authorization-code exchange produced
+an owner-only credential file and reopened it from a fresh isolated process with zero
+prompts.
+
+The pinned standalone fixture's cold refresh used the same client ID and the same three
+scopes as enrollment. The local metadata controller now joins the initial and cold
+request parsers to the durable profile and checks owner authority before a destination
+write, subject binding, or native reply. A synthetic cold replay admitted exactly
+token refresh, subject lookup, load metadata and model catalog. Missing credentials,
+changed subjects, and mismatched catalog projects fail closed.
+
+The pinned standalone supervisor passed a synthetic sign-in through a private callback
+without opening a browser. It then started a separate zero-prompt reopen. The broker
+observed the same subject and a fixture Gemini model, and settled the observation after
+the exact service exited and its disposable profile was removed. The native server
+replaced the disposable credential inode during refresh. The registered credential's
+inode and bytes remained intact. Startup ACP notifications were discarded after exact
+session and schema validation. This evidence covers the fake metadata path. Review of
+the public launcher, an attended personal sign-in, and live model qualification remain open.
+
 - [x] Demonstrate one text-only OpenCode turn through the bundled ACP peer
   (`codex/antigravity-acp-text-proxy`). The pinned worker returned exact `ok` in devbox.
   The peer counted one prompt, replay was refused, and cleanup was verified. Offline controls
@@ -61,15 +94,25 @@ The readiness-only check and production launch commands retain their existing sc
   item after both bus and daemon restart, reach signed-out ACP with pinned `agy`, and check worker
   and relay denial with known-present workstation fixtures. Qualify same-UID devbox denial and
   sudo-free routine launches separately before offering the optional stronger placement.
-- [ ] In the qualified placement, guide the operator through documented `agy acp --login`
-  for personal Google OAuth. Use the native terminal or browser handoff without sharing browser
-  state, codes or credential material with agents. Test unavailable binary, cancellation,
-  expiration and denial of non-subscription fallback. Preserve the ordinary Antigravity login.
+- [ ] Qualify personal Google OAuth enrollment with the pinned standalone editor ACP server.
+  Present the verified workstation-only consent link without opening a browser automatically.
+  Verify the pinned desktop callback envelope and host server identities. Bind the initial
+  OAuth subject and a fresh reopen to the exact private profile, while keeping account
+  identifiers, browser state, codes and credentials outside the worker. Keep enrollment
+  limited to authentication and metadata. Test cancellation, expiration, subject replacement,
+  and denial of non-subscription fallback. Preserve the ordinary Antigravity login.
 - [ ] From a fresh process in the same qualified placement, negotiate ACP and open a session
   in an empty scratch directory with no MCP servers. Verify only `initialize` and `session/new`
   were sent, zero tool grants, bounded redacted output and cleanup. A signed-out profile must
   request authentication. Keep identity, plan tier and billing unknown where unsupported.
 - [ ] Record sign-in and reuse evidence. Review the exact route, host tool boundary, provider
   scope and first live prompt separately before enabling Antigravity in a managed worker.
+- [ ] Qualify provider-side tool disabling and output bounds for the exact personal
+  subscription endpoint and selected model. The standalone build emitted function-calling
+  mode `AUTO` and requested 65,535 output tokens in the measured turn. A typed candidate
+  projection to `NONE` and 64 output tokens passed offline validation. Establish the public
+  endpoint behavior before offering inference.
 
 [Antigravity ACP authentication](https://antigravity.google/docs/ide/extensions/acp/#authentication)
+
+[standalone-acp]: https://github.com/agentclientprotocol/registry/blob/e29b5bf3bfd8756db5d901690b43dc31e926ccd5/antigravity-acp/agent.json

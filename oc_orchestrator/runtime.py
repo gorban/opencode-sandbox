@@ -136,8 +136,13 @@ class Placement:
         self.ids = {}
         self.attempted = False
 
-    def create(self, role, image, network, source, target, env, tmpfs, executable, *args):
+    def create(self, role, image, network, source, target, env, tmpfs, executable, *args, exec_tmpfs=()):
         self.lifeline.check()
+        exec_tmpfs = frozenset(exec_tmpfs)
+        if not exec_tmpfs <= set(tmpfs):
+            raise Failure("executable tmpfs is outside the restricted placement")
+        tmpfs_options = {path: f"{TMPFS.replace('noexec', 'exec') if path in exec_tmpfs else TMPFS},size=96m"
+                         for path in tmpfs}
         image_data = inspect("image", image)
         inherited = environment(image_data["Config"].get("Env") or [])
         if image_data["Id"].removeprefix("sha256:") != image or inherited.keys() - ALLOWED_IMAGE_ENV[image]:
@@ -152,15 +157,15 @@ class Placement:
                    "--volume", f"{source}:{target}:ro,Z,nosuid,nodev,noexec"]
         for name, value in env.items():
             command.extend(("--env", f"{name}={value}"))
-        for path in tmpfs:
-            command.extend(("--tmpfs", f"{path}:{TMPFS},size=96m"))
+        for path, options in tmpfs_options.items():
+            command.extend(("--tmpfs", f"{path}:{options}"))
         self.attempted = True
         identifier = podman(*command, image, *args).stdout.decode("ascii").strip()
         if not FULL_ID.fullmatch(identifier):
             raise Failure("missing immutable container ID")
         self.ids[role] = identifier
         data = self.identity(identifier, role)
-        self.verify(data, image, network, source, target, inherited | env | {"container": "podman"}, tmpfs)
+        self.verify(data, image, network, source, target, inherited | env | {"container": "podman"}, tmpfs_options)
         self.lifeline.check()
         podman("start", identifier)
         self.lifeline.check()
@@ -176,6 +181,8 @@ class Placement:
     @staticmethod
     def verify(data, image, network, source, target, env, tmpfs):
         host_config = data["HostConfig"]
+        observed_tmpfs = {path: set(flags.split(",")) for path, flags in (host_config.get("Tmpfs") or {}).items()}
+        expected_tmpfs = {path: set(flags.split(",")) | {"rprivate", "tmpcopyup"} for path, flags in tmpfs.items()}
         networks = data["NetworkSettings"]
         settings = data["Config"]
         memory = 1024**3 if image == OPEN_CODE else 128 * 1024**2
@@ -189,7 +196,7 @@ class Placement:
                 or host_config.get("SecurityOpt") != ["no-new-privileges"]
                 or data["Image"].removeprefix("sha256:") != image
                 or environment(settings["Env"]) != env
-                or set(host_config.get("Tmpfs") or {}) != set(tmpfs)):
+                or observed_tmpfs != expected_tmpfs):
             raise Failure("container settings did not match the restricted placement")
         mount, = data["Mounts"]
         if (mount.get("Type") != "bind" or mount.get("RW") is not False or mount.get("Source") != str(source)
@@ -214,6 +221,9 @@ class Placement:
                ' && test ! -e /var/run/docker.sock && test ! -e "$1"', "fixture", pwd.getpwuid(os.getuid()).pw_dir)
         podman("exec", relay, CONTAINER_SHELL, "-ec", 'test -S /fixture/provider.sock && test -r /fixture/proof')
 
+    def remember_recovered(self, role, identifier):
+        self.ids[role] = identifier
+
     def close(self):
         if not self.attempted:
             return
@@ -231,6 +241,8 @@ class Placement:
             with suppress(Failure, KeyError, OSError, TypeError, ValueError):
                 identity = owned[role]
                 self.identity(identity, role)
+                if role not in self.ids:
+                    self.remember_recovered(role, identity)
                 podman("rm", "--force", "--time", "1", "--ignore", identity)
         if podman("ps", "--all", "--filter", selector, "--quiet").stdout.strip():
             raise Failure("cleanup left a container")

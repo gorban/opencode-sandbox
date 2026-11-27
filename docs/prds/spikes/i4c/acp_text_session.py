@@ -341,6 +341,12 @@ class _TextSession:
             self._finalize(ReadinessState.READY, transcript=(chunks, digest))
             return text
 
+    @property
+    def retirement_confirmed(self):
+        """Report whether this attempt retired and cleared its pending receipt."""
+        with self._lease_lock:
+            return self._peer_retired and self._receipt_committed
+
     def retire(self):
         """Retire an idle or spent peer from the broker thread after revocation."""
         with self._peer_operation():

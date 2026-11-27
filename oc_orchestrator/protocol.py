@@ -64,7 +64,7 @@ def fixed_bytes(connection, length, deadline):
     return bytes(data)
 
 
-def request_body(connection, deadline, port):
+def request_body(connection, deadline, port, *, worker_token=b"offline-fixture"):
     delimiter = b"\r\n\r\n"
     head = bytearray()
     while delimiter not in head:
@@ -83,7 +83,7 @@ def request_body(connection, deadline, port):
             raise Refused()
         fields[name] = value
     if (fields.get(b"host") != f"127.0.0.1:{port}".encode()
-            or fields.get(b"authorization") != b"Bearer offline-fixture"
+            or not hmac.compare_digest(fields.get(b"authorization", b""), b"Bearer " + worker_token)
             or fields.get(b"content-type", b"").lower() not in {b"application/json", b"application/json; charset=utf-8"}):
         raise Refused()
     length = fields.get(b"content-length", b"")
@@ -96,12 +96,12 @@ def bad_constant(_value):
     raise Refused()
 
 
-def accept_text(body):
+def accept_text(body, *, model=MODEL, system_digest=None):
     data = json.loads(body.decode("utf-8"), object_pairs_hook=unique, parse_constant=bad_constant)
     if not isinstance(data, dict):
         raise Refused()
     messages = data.pop("messages", None)
-    if (json.dumps(data, sort_keys=True) != json.dumps(OPTIONS, sort_keys=True)
+    if (json.dumps(data, sort_keys=True) != json.dumps(dict(OPTIONS, model=model), sort_keys=True)
             or not isinstance(messages, list) or len(messages) != 2
             or messages[1] != {"role": "user", "content": PROMPT}):
         raise Refused()
@@ -110,7 +110,8 @@ def accept_text(body):
             or not isinstance(system["content"], str)):
         raise Refused()
     normalized, count = SYSTEM_DATE.subn("Today's date: [date]", system["content"])
-    if count != 1 or hashlib.sha256(normalized.encode()).hexdigest() != SYSTEM_DIGEST:
+    digest = SYSTEM_DIGEST if system_digest is None else system_digest
+    if count != 1 or hashlib.sha256(normalized.encode()).hexdigest() != digest:
         raise Refused()
 
 
@@ -149,7 +150,12 @@ def reply_bytes(events):
     # cannot enter OpenCode even after the admission has been recorded.
     if tuple(json.loads(event, object_pairs_hook=unique) for event in events) != ({"text": "ok"}, {"finish": "stop"}):
         raise Refused()
-    base = {"id": "chatcmpl-offline", "object": "chat.completion.chunk", "created": 1, "model": MODEL}
+    return text_reply_bytes(MODEL)
+
+
+def text_reply_bytes(model):
+    """Frame the exact verified text response for OpenCode."""
+    base = {"id": "chatcmpl-offline", "object": "chat.completion.chunk", "created": 1, "model": model}
     frames = (
         {**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": None}]},
         {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},

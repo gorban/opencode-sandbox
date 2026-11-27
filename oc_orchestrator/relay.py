@@ -4,6 +4,7 @@ from array import array
 from contextlib import suppress
 from pathlib import Path
 import socket
+import sys
 import time
 
 
@@ -23,12 +24,21 @@ def handoff(client, address, proof):
 
 
 def main():
+    arguments = sys.argv[1:]
+    if arguments not in ([], ["--owner-pipe"]):
+        raise SystemExit(2)
     root = Path("/fixture")
     proof = (root / "proof").read_bytes()
     if len(proof) != 32:
         raise SystemExit(2)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", PORT))
+        if arguments:
+            # Signal readiness with the endpoint bound but unable to queue TCP clients.
+            sys.stdout.buffer.write(b"R")
+            sys.stdout.buffer.flush()
+            if sys.stdin.buffer.read(1) != b"A":
+                raise SystemExit(2)
         listener.listen(2)
         deadline = time.monotonic() + LIFETIME
         while True:
