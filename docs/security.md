@@ -76,7 +76,8 @@ default. The containers share your host kernel. A microVM runtime such as libkru
     conflict gets a new sibling copy, usually `NAME.host-edit`. If the destination exists, its
     identity changes during publication, or publication crosses a mount boundary, the staged save
     remains available for recovery. A concurrent edit can still race the final check and rename;
-  - pins `.bridge/requests` the same way before draining it in paced batches. A symlink there is
+  - polls on a user-systemd timer and pins `.bridge/requests` before draining it in paced batches.
+    The timer starts the service without checking agent-writable file paths. A symlink there is
     unlinked. Invalid nonempty directories are moved out of the queue without traversing their
     contents. The move leaves them under `.bridge/` until sandbox bridge cleanup.
 - **Bridge copies:** `code`/`bcompare` on a path outside `/sandbox` copies it into `.bridge/files/` first

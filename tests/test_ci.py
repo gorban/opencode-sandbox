@@ -235,7 +235,8 @@ class QualityTests(unittest.TestCase):
             return '/binary/bash version\n' if command[0].endswith('/bash') else 'version: 0.9.0\n'
 
         shell_files = (
-            'oc-sandbox', 'tests/parallel.sh', 'tests/postgres-host.sh', 'tests/security.sh', 'tests/worktrees.sh',
+            'oc-sandbox', 'tests/parallel.sh', 'tests/postgres-host.sh',
+            'tests/bridge-manager-fixture.sh', 'tests/security.sh', 'tests/worktrees.sh',
         )
         with patch.dict(os.environ, {'BASH_ENV': '/host/bashenv', 'SHELLCHECK_OPTS': '-x'}), \
                 patch.object(ci, 'tool_required', side_effect=lambda name, path: f'/binary/{name}'), \
