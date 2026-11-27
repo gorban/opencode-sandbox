@@ -311,7 +311,7 @@ class RenovateConfigTests(unittest.TestCase):
 
     def test_scope_is_launcher_images_and_ci_tools(self):
         self.assertEqual(self.config['enabledManagers'], ['custom.regex', 'mise'])
-        self.assertEqual(self.config['ignorePaths'], ['docs/prds/spikes/**'])
+        self.assertEqual(self.config['includePaths'], ['oc-sandbox', 'tools/ci/mise.toml', 'tools/ci/mise.lock'])
         self.assertEqual(self.config['minimumReleaseAge'], '7 days')
         untimed = [rule for rule in self.config['packageRules']
                    if rule.get('minimumReleaseAgeBehaviour') == 'timestamp-optional']

@@ -7,7 +7,7 @@
   ],
   "extends": [":disableDependencyDashboard"],
   "enabledManagers": ["custom.regex", "mise"],
-  "ignorePaths": ["docs/prds/spikes/**"],
+  "includePaths": ["oc-sandbox", "tools/ci/mise.toml", "tools/ci/mise.lock"],
   "customManagers": [
     {
       "customType": "regex",
