@@ -352,15 +352,28 @@ class RuntimeCustodyTest(unittest.TestCase):
         self.assertEqual(output.getvalue(), "oc-sandbox google: Google sign-in cancelled.\n")
 
     def test_callback_diagnostic_uses_only_original_foreground_pty(self):
+        self.assert_diagnostic_uses_original_pty(
+            "callback", b"Google sign-in callback: The callback Referer header was refused.",
+            b"synthetic-referer-marker",
+        )
+
+    def test_token_diagnostic_uses_only_original_foreground_pty(self):
+        self.assert_diagnostic_uses_original_pty(
+            "token", b"Google sign-in token reply: The token endpoint returned HTTP 400.",
+            b"synthetic-token-marker",
+        )
+
+    def assert_diagnostic_uses_original_pty(self, kind, expected_stage, marker):
         origin = Path(__file__).resolve().parents[1]
         run_connect = runpy.run_path(str(origin / "oc-google.py"))["run_connect"]
-        expected_stage = b"Google sign-in callback: The callback Referer header was refused."
         generic = b"oc-sandbox google: Workstation enrollment did not complete.\n"
 
-        for lose_foreground in (False, True):
-            with self.subTest(lose_foreground=lose_foreground):
-                stderr = self.parent / f"stderr-{lose_foreground}"
-                runtime = self.parent / f"runtime-{lose_foreground}"
+        terminal_states = (("foreground", "background", "interrupted", "custody") if kind == "token"
+                           else ("foreground", "background"))
+        for terminal_state in terminal_states:
+            with self.subTest(terminal_state=terminal_state):
+                stderr = self.parent / f"stderr-{terminal_state}"
+                runtime = self.parent / f"runtime-{terminal_state}"
                 runtime.mkdir(mode=0o700)
                 process, terminal = pty.fork()
                 if process == 0:
@@ -368,7 +381,7 @@ class RuntimeCustodyTest(unittest.TestCase):
                         os.dup2(stream.fileno(), 2)
                     sys.stderr = os.fdopen(2, "w", buffering=1)
                     try:
-                        self.run_pty_callback_fixture(run_connect, runtime, lose_foreground)
+                        self.run_pty_diagnostic_fixture(run_connect, runtime, terminal_state, kind)
                     except BaseException:
                         os._exit(2)
                     os._exit(0)
@@ -400,16 +413,20 @@ class RuntimeCustodyTest(unittest.TestCase):
                 self.assertTrue(finished)
                 self.assertEqual(os.waitstatus_to_exitcode(status), 0)
                 self.assertEqual(list(runtime.iterdir()), [])
-                self.assertEqual(stderr.read_bytes(), generic)
-                self.assertEqual(bytes(output).strip(), b"" if lose_foreground else expected_stage)
-                self.assertNotIn(b"synthetic-referer-marker", output)
-                self.assertNotIn(b"synthetic-referer-marker", stderr.read_bytes())
+                expected_stderr = generic
+                if terminal_state == "custody":
+                    expected_stderr += b"oc-sandbox google: Google enrollment cleanup requires inspection.\n"
+                self.assertEqual(stderr.read_bytes(), expected_stderr)
+                self.assertEqual(bytes(output).strip(), expected_stage if terminal_state == "foreground" else b"")
+                self.assertNotIn(marker, output)
+                self.assertNotIn(marker, stderr.read_bytes())
                 runtime.rmdir()
 
     @staticmethod
-    def run_pty_callback_fixture(run_connect, runtime, lose_foreground):
+    def run_pty_diagnostic_fixture(run_connect, runtime, terminal_state, kind):
         spec = SimpleNamespace(enabled=True, auth_mode="subscription", cli_path=None)
         original_runtime = connect._private_runtime
+        original_cleanup = connect._RuntimeCustody.cleanup
         blocker = None
         read_fd, write_fd = os.pipe()
 
@@ -420,7 +437,9 @@ class RuntimeCustodyTest(unittest.TestCase):
                 with original_runtime(parent, label, cold, owner) as custody:
                     yield custody
             finally:
-                if lose_foreground and not cold:
+                if terminal_state == "interrupted" and not cold:
+                    os.kill(os.getpid(), signal.SIGINT)
+                if terminal_state == "background" and not cold:
                     assert not list(runtime.iterdir())
                     blocker = os.fork()
                     if blocker == 0:
@@ -430,7 +449,12 @@ class RuntimeCustodyTest(unittest.TestCase):
                     os.setpgid(blocker, blocker)
                     os.tcsetpgrp(0, blocker)
 
-        def refuse(*args, authorized, fence, **kwargs):
+        def cleanup(custody):
+            original_cleanup(custody)
+            if terminal_state == "custody" and not custody.cold:
+                raise OSError("synthetic cleanup uncertainty")
+
+        def refuse_callback(*args, authorized, fence, **kwargs):
             from test_google_auth_offer import exchange, offer, placement, request
 
             with placement(authorized=authorized, opened=False) as (gate, _recorder, port), \
@@ -447,6 +471,36 @@ class RuntimeCustodyTest(unittest.TestCase):
                 finally:
                     assert reply.result(timeout=3) == auth_offer.acknowledgement(False)
 
+        def refuse_token(*args, authorized, fence, destination, diagnostic=None, **kwargs):
+            from oc_google import enrollment, metadata_destination
+            from test_google_metadata_destination import FakeChannel, IPV4, response
+            from test_google_oauth_exchange import AUTHORIZATION, CODE, STATE, form, offer
+
+            token = FakeChannel(response(status=b"HTTP/1.1 400 synthetic-token-marker"))
+            trust = Mock(wrap_socket=Mock(return_value=token))
+            gate = Mock(take_forwarded=Mock(return_value=auth_offer.Callback(STATE, CODE)))
+
+            def spend(route, send):
+                with fence:
+                    assert authorized() and route is metadata_destination.MetadataRoute.TOKEN
+                    send()
+
+            # Passing the optional observer only when the launcher supplied it
+            # also lets this PTY regression run against the unchanged baseline.
+            options = {} if diagnostic is None else {"diagnostic": diagnostic}
+            with patch.object(metadata_destination.socket, "socket", return_value=FakeChannel()), \
+                    patch.object(metadata_destination, "_resolve", return_value=(2, IPV4)), \
+                    patch.object(metadata_destination, "_system_tls_context", return_value=trust):
+                try:
+                    enrollment.verify_initial_exchange(
+                        offer=offer(), callback_gate=gate, authorization=AUTHORIZATION, form=form(),
+                        bind_subject=Mock(), deadline=time.monotonic() + 2, spend=spend,
+                        destination=destination, **options,
+                    )
+                finally:
+                    assert len(token.sent) == 1
+
+        refuse = refuse_token if kind == "token" else refuse_callback
         try:
             with patch.object(connect, "load_provider_config", return_value=Mock(get=Mock(return_value=spec))), \
                     patch.object(connect, "scratch_parent", return_value=runtime), \
@@ -455,6 +509,7 @@ class RuntimeCustodyTest(unittest.TestCase):
                     patch.object(connect, "verify_standalone_source"), \
                     patch.object(connect, "_prepare_runtime"), patch.object(connect, "RegistrationJournal"), \
                     patch.object(connect._TerminalOwner, "consent", return_value=True), \
+                    patch.object(connect._RuntimeCustody, "cleanup", autospec=True, side_effect=cleanup), \
                     patch.object(connect, "enroll_metadata", side_effect=refuse):
                 assert run_connect("fixture") == 1
         finally:

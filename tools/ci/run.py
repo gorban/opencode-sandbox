@@ -158,6 +158,7 @@ PYTHON_FILES = (
     'oc_google/registration.py',
     'oc_google/route.py',
     'oc_google/shell.py',
+    'oc_google/token_diagnostic.py',
     'oc_google/worker_channel.py',
     'oc-openai.py',
     'oc-openai-session.py',

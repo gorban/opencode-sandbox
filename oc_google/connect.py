@@ -20,12 +20,14 @@ from oc_providers.contracts import is_valid_instance_label
 
 from .auth_offer import CallbackDiagnostic
 from .control import terminal
-from .metadata_destination import MetadataRoute, exchange
+from .metadata_destination import MetadataDestinationError, MetadataRoute, exchange
 from .metadata_workflow import CallbackWorkflowError, MetadataRuntime, enroll_metadata, reopen_metadata
 from .native_artifacts import stage_standalone, verify_standalone_source
 from .native_namespace import public_certificate
 from .native_service import NativeRetirementUnconfirmed, retain_cleanup_failure
+from .oauth_exchange import OAuthExchangeError
 from .registration import RegistrationJournal, _absent, _DIRECTORY, _write_private
+from .token_diagnostic import TokenDiagnostic, TokenStage
 
 
 _libc_write = ctypes.CDLL(None, use_errno=True).write
@@ -70,6 +72,25 @@ _CALLBACK_DETAILS = {
     CallbackDiagnostic.NO_MATCHING_CALLBACK: "No matching callback was accepted.",
     CallbackDiagnostic.FORWARDED_BEFORE_METADATA: "The callback was forwarded, but metadata setup did not begin.",
 }
+_TOKEN_DETAILS = {
+    TokenStage.HTTP_400: "The token endpoint returned HTTP 400.",
+    TokenStage.HTTP_401_403: "The token endpoint returned HTTP 401 or 403.",
+    TokenStage.HTTP_429: "The token endpoint returned HTTP 429.",
+    TokenStage.HTTP_5XX: "The token endpoint returned a server error.",
+    TokenStage.HTTP_OTHER: "The token endpoint returned an unexpected HTTP status.",
+    TokenStage.CHUNKED: "The token reply used unsupported chunked framing.",
+    TokenStage.HEADER: "The token reply had an invalid or duplicate header.",
+    TokenStage.FRAMING: "The token reply framing was incomplete or incompatible.",
+    TokenStage.TRAILING: "The token reply contained unexpected trailing data.",
+    TokenStage.TLS_EOF: "The token reply lacked a complete authenticated TLS close.",
+    TokenStage.TRANSPORT: "The token reply transport did not settle.",
+    TokenStage.GRANT_SHAPE: "The token grant had an incompatible response format.",
+    TokenStage.GRANT_SCOPE: "The token grant had incompatible scopes.",
+    TokenStage.GRANT_BEARER: "The token grant had incompatible bearer fields.",
+    TokenStage.GRANT_IDENTITY: "The token grant had an incompatible identity field.",
+    TokenStage.GRANT_REFRESH: "The token grant had incompatible refresh fields.",
+    TokenStage.USERINFO_PRE_WRITE: "The token grant passed validation. UserInfo setup failed before its write.",
+}
 
 
 class ConnectError(RuntimeError):
@@ -90,6 +111,22 @@ def needs_custody_inspection(error):
         seen.add(id(error))
         error = error.__cause__
     return False
+
+
+def _write_enrollment_detail(owner, error, token_diagnostic):
+    if needs_custody_inspection(error):
+        return
+    if isinstance(error, CallbackWorkflowError) and type(error.diagnostic) is CallbackDiagnostic:
+        detail = "Google sign-in callback: " + _CALLBACK_DETAILS[error.diagnostic]
+    elif error.__cause__ is None and not getattr(error, "__notes__", ()):
+        stage = token_diagnostic.stage(error)
+        if stage is None:
+            return
+        detail = "Google sign-in token reply: " + _TOKEN_DETAILS[stage]
+    else:
+        return
+    with suppress(OSError, ConnectError):
+        owner.write_once(detail + "\n")
 
 
 class _TerminalOwner:
@@ -423,6 +460,7 @@ def connect_for(label):
     parent = scratch_parent()
     with _attended_owner() as owner:
         _preflight(parent)
+        token_diagnostic = TokenDiagnostic()
         try:
             with ExitStack() as initial_root, ExitStack() as cold_root:
                 with _artifacts() as source:
@@ -433,15 +471,14 @@ def connect_for(label):
                     cold = _prepare_runtime(cold_root.enter_context(_private_runtime(parent, label, True, owner)), source)
                 journal = RegistrationJournal(label)
                 enrollment = enroll_metadata(journal, initial, disclose_offer=owner.offer, destination=exchange,
-                                             authorized=owner.authorized, fence=owner.fence)
+                                             authorized=owner.authorized, fence=owner.fence,
+                                             diagnostic=token_diagnostic)
                 initial_root.close()
                 with owner.fence:
                     owner.deadline = min(owner.deadline, time.monotonic() + 18)
                 reopen_metadata(journal, enrollment, cold, destination=exchange, authorized=owner.authorized, fence=owner.fence)
-        except CallbackWorkflowError as error:
-            if not needs_custody_inspection(error) and type(error.diagnostic) is CallbackDiagnostic:
-                with suppress(OSError, ConnectError):
-                    owner.write_once("Google sign-in callback: " + _CALLBACK_DETAILS[error.diagnostic] + "\n")
+        except (CallbackWorkflowError, MetadataDestinationError, OAuthExchangeError) as error:
+            _write_enrollment_detail(owner, error, token_diagnostic)
             raise
         with owner.fence:
             owner.write_once(f"Verified Google registration {label} for workstation metadata.\n")

@@ -145,7 +145,7 @@ def _initialize_settings(profile):
         raise MetadataWorkflowError("Google enrollment settings could not be initialized") from None
 
 
-def enroll_metadata(journal, runtime, *, disclose_offer, destination, authorized, fence):
+def enroll_metadata(journal, runtime, *, disclose_offer, destination, authorized, fence, diagnostic=None):
     """Enroll under one owner and return an exact credential-bearing local registration.
 
     The caller owns the trusted attended gate, route destination and runtime
@@ -188,7 +188,8 @@ def enroll_metadata(journal, runtime, *, disclose_offer, destination, authorized
                     _receive_callback(offer, gate, notify=disclose_offer, deadline=deadline, owner=owner, profile=profile)
                     observed = serve_initial_metadata(offer=offer, callback_gate=gate, profile=profile,
                                                       deadline=deadline, accept=accept, fence=owner.fence,
-                                                      authorized=owner.active, destination=destination)
+                                                      authorized=owner.active, destination=destination,
+                                                      diagnostic=diagnostic)
                     acp.finish_personal_sign_in()
             finally:
                 owner.revoke()

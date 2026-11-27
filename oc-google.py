@@ -18,7 +18,7 @@ PACKAGES = {
         "metadata_ingress.py", "metadata_workflow.py", "native_artifacts.py", "native_browser.py",
         "native_enrollment_acp.py", "native_namespace.py", "native_peer.py", "native_proxy.py",
         "native_service.py", "native_transport.py", "oauth_exchange.py", "registration.py",
-        "route.py", "shell.py",
+        "route.py", "shell.py", "token_diagnostic.py",
     ),
     "oc_orchestrator": ("__init__.py", "capture.py", "owner.py", "protocol.py", "relay.py", "runtime.py"),
     "oc_providers": ("__init__.py", "config.py", "contracts.py"),

@@ -33,7 +33,7 @@ class InitialMetadataObservation:
 
 
 def serve_initial_metadata(
-    *, offer, callback_gate, profile, deadline, accept, fence, authorized, destination,
+    *, offer, callback_gate, profile, deadline, accept, fence, authorized, destination, diagnostic=None,
 ):
     """Serve the ordered native token and load requests and return a redacted observation.
 
@@ -43,7 +43,7 @@ def serve_initial_metadata(
     """
     return _serve_metadata(
         offer=offer, callback_gate=callback_gate, profile=profile, deadline=deadline, accept=accept,
-        fence=fence, authorized=authorized, destination=destination, cold=False,
+        fence=fence, authorized=authorized, destination=destination, cold=False, diagnostic=diagnostic,
     )
 
 
@@ -62,7 +62,8 @@ def serve_cold_metadata(*, profile, deadline, accept, fence, authorized, destina
     )
 
 
-def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, authorized, destination, cold):
+def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, authorized, destination, cold,
+                    diagnostic=None):
     channel_active = None
 
     def dispatch(route, *, deadline, **request):
@@ -126,6 +127,7 @@ def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, a
         return verify_initial_exchange(
             offer=offer, callback_gate=callback_gate, authorization=token.authorization,
             form=token.body, bind_subject=bind_subject, deadline=deadline, spend=spend, destination=dispatch,
+            diagnostic=diagnostic,
         )
 
     def native_round_trip(route, handle):

@@ -6,10 +6,12 @@ import re
 from threading import Lock
 
 from .account_binding import MetadataOperation, SubjectProof, _unique_fields
-from .metadata_destination import MetadataRoute, exchange
+from .metadata_destination import MetadataDestinationError, MetadataRoute, _ObservedDelivery, exchange
 from .oauth_exchange import (
-    _reject_constant, validate_authorization_code_exchange, validate_cold_grant, validate_enrollment_grant,
+    _GrantRefused, _reject_constant, validate_authorization_code_exchange, validate_cold_grant,
+    validate_enrollment_grant,
 )
+from .token_diagnostic import TokenDiagnostic
 
 
 _LOAD_BODY = {"metadata": {"ideType": "ANTIGRAVITY"}}
@@ -124,6 +126,7 @@ class VerifiedTokenReply:
 
 def verify_initial_exchange(
     *, offer, callback_gate, authorization, form, bind_subject, deadline, spend, destination=exchange,
+    diagnostic=None,
 ):
     """Return the native token reply only after the same issued bearer proves a subject.
 
@@ -134,11 +137,42 @@ def verify_initial_exchange(
     """
     callback = callback_gate.take_forwarded()
     validate_authorization_code_exchange(offer, callback, authorization=authorization, body=form)
-    grant = validate_enrollment_grant(destination(
+    reply, observed = _exchange_observed(
         MetadataRoute.TOKEN, authorization=authorization, body=form, deadline=deadline,
-        deliver=lambda send: spend(MetadataRoute.TOKEN, send),
-    ))
-    return _bind_token_reply(grant, bind_subject, deadline, spend, destination)
+        spend=spend, destination=destination, diagnostic=diagnostic,
+    )
+    try:
+        grant = validate_enrollment_grant(reply)
+    except _GrantRefused as error:
+        if observed:
+            diagnostic.mark(error)
+        raise
+    return _bind_token_reply(grant, bind_subject, deadline, spend, destination,
+                             diagnostic=diagnostic if observed else None)
+
+
+def _exchange_observed(route, *, authorization, deadline, spend, destination, diagnostic, **request):
+    observed = object()
+
+    def deliver(send):
+        return spend(route, send)
+
+    def observe(result):
+        nonlocal observed
+        observed = result
+
+    if type(diagnostic) is TokenDiagnostic:
+        deliver = _ObservedDelivery(route, deliver, observe)
+    try:
+        reply = destination(route, authorization=authorization, deadline=deadline, deliver=deliver, **request)
+    except MetadataDestinationError as error:
+        if error is observed:
+            diagnostic.mark(error)
+        raise
+    else:
+        return reply, reply is observed
+    finally:
+        observed = None
 
 
 def verify_cold_refresh(*, form, prepare_form, bind_subject, deadline, spend, destination=exchange):
@@ -151,11 +185,11 @@ def verify_cold_refresh(*, form, prepare_form, bind_subject, deadline, spend, de
     return _bind_token_reply(grant, bind_subject, deadline, spend, destination)
 
 
-def _bind_token_reply(grant, bind_subject, deadline, spend, destination):
+def _bind_token_reply(grant, bind_subject, deadline, spend, destination, *, diagnostic=None):
     access = grant.access_token
-    subject_reply = destination(
+    subject_reply, _ = _exchange_observed(
         MetadataRoute.USERINFO, authorization=b"Bearer " + access, deadline=deadline,
-        deliver=lambda send: spend(MetadataRoute.USERINFO, send),
+        spend=spend, destination=destination, diagnostic=diagnostic,
     )
     proof = bind_subject(access, subject_reply)
     proof.require_metadata_bearer(MetadataOperation.LOAD_CODE_ASSIST, access)

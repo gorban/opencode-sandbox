@@ -13,6 +13,7 @@ from .auth_offer import (
     CLIENT_ID, SCOPES, Callback, Offer, Refused,
     _CODE, _STATE, _query_fields, redirect_uri, validate_offer,
 )
+from .token_diagnostic import TokenStage
 
 
 _CODE_FIELDS = {"code", "code_verifier", "grant_type", "redirect_uri"}
@@ -37,6 +38,12 @@ _COMPACT_JWS = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", re.
 
 class OAuthExchangeError(ValueError):
     """A redacted rejection of OAuth application data."""
+
+class _GrantRefused(OAuthExchangeError):
+    def __init__(self, message, stage):
+        super().__init__(message)
+        self.token_stage = stage
+
 
 
 def _valid_client(authorization):
@@ -162,7 +169,7 @@ def _grant_fields(body, required, optional):
         except (ValueError, RecursionError):
             pass
     if type(fields) is not dict or not required <= fields.keys() <= required | optional:
-        raise OAuthExchangeError("Invalid Google OAuth grant")
+        raise _GrantRefused("Invalid Google OAuth grant", TokenStage.GRANT_SHAPE)
     return fields
 
 
@@ -193,17 +200,17 @@ def _access_from_grant(fields):
     scopes = scope.split(" ") if type(scope) is str else ()
     distinct = set(scopes)
     if len(scopes) != len(distinct) or distinct not in (SCOPES, _OIDC_SCOPES):
-        raise OAuthExchangeError("Google OAuth grant scopes do not match")
+        raise _GrantRefused("Google OAuth grant scopes do not match", TokenStage.GRANT_SCOPE)
     if _IDENTITY_FIELD in fields:
         token = fields[_IDENTITY_FIELD]
         # An opaque compatibility field. The separate UserInfo response proves the subject.
         if (distinct != _OIDC_SCOPES or type(token) is not str or len(token) > _MAX_TOKEN
                 or _COMPACT_JWS.fullmatch(token) is None):
-            raise OAuthExchangeError("Invalid Google OAuth identity token field")
+            raise _GrantRefused("Invalid Google OAuth identity token field", TokenStage.GRANT_IDENTITY)
     access = fields["access_token"]
     if (fields["token_type"] != "Bearer" or type(access) is not str or not access.isascii()
             or not _valid_bearer(access.encode("ascii")) or not _positive_expiry(fields["expires_in"])):
-        raise OAuthExchangeError("Invalid Google OAuth bearer grant")
+        raise _GrantRefused("Invalid Google OAuth bearer grant", TokenStage.GRANT_BEARER)
     return access.encode("ascii")
 
 
@@ -211,7 +218,7 @@ def _reject_identity_alias(fields, *tokens):
     if _IDENTITY_FIELD in fields:
         identity = fields[_IDENTITY_FIELD].encode("ascii")
         if any(hmac.compare_digest(identity, token) for token in tokens):
-            raise OAuthExchangeError("Google OAuth token roles overlap")
+            raise _GrantRefused("Google OAuth token roles overlap", TokenStage.GRANT_IDENTITY)
 
 
 def _native_body(fields, allowed):
@@ -229,7 +236,7 @@ def validate_enrollment_grant(body: bytes) -> EnrollmentGrant:
     refresh_expires = fields.get("refresh_token_expires_in")
     if (type(refresh) is not str or not _REFRESH_TOKEN.fullmatch(refresh)
             or ("refresh_token_expires_in" in fields and not _positive_expiry(refresh_expires))):
-        raise OAuthExchangeError("Invalid Google enrollment bearer grant")
+        raise _GrantRefused("Invalid Google enrollment bearer grant", TokenStage.GRANT_REFRESH)
     refresh_bytes = refresh.encode("ascii")
     _reject_identity_alias(fields, access, refresh_bytes)
     native = _native_body(fields, _GRANT_FIELDS | _OPTIONAL_GRANT_FIELDS)

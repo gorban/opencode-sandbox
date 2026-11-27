@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 
 from oc_google import metadata_destination as destination
 from oc_google.auth_offer import CLIENT_ID
+from oc_google.token_diagnostic import TokenStage
 
 
 BEARER = b"Bearer synthetic-access"
@@ -318,6 +319,50 @@ class MetadataDestinationTest(unittest.TestCase):
         self.tls.alpn = "h2"
         with self.assertRaisesRegex(destination.MetadataDestinationError, "TLS protocol"):
             self.exchange()
+
+    def test_completed_initial_token_write_observes_only_fixed_response_stages(self):
+        marker = b"synthetic-reply-marker"
+        route = destination.MetadataRoute.TOKEN
+        cases = (
+            (TokenStage.HTTP_400, [response(status=b"HTTP/1.1 400 " + marker), b"unopened"]),
+            (TokenStage.HTTP_401_403, [response(status=b"HTTP/1.1 401 " + marker)]),
+            (TokenStage.HTTP_401_403, [response(status=b"HTTP/1.1 403 " + marker)]),
+            (TokenStage.HTTP_429, [response(status=b"HTTP/1.1 429 " + marker)]),
+            (TokenStage.HTTP_5XX, [response(status=b"HTTP/1.1 599 " + marker)]),
+            (TokenStage.HTTP_OTHER, [response(status=b"HTTP/1.1 418 " + marker)]),
+            (TokenStage.CHUNKED, [response(headers=(b"Transfer-Encoding: Chunked",))]),
+            (TokenStage.HEADER, [response(headers=(b"Content-Type: " + marker,))]),
+            (TokenStage.FRAMING, [response()[:-1]]),
+            (TokenStage.TRAILING, [response(), marker]),
+            (TokenStage.TLS_EOF, [response(), ssl.SSLEOFError(marker.decode())]),
+            (TokenStage.TRANSPORT, [response(), TimeoutError(marker.decode())]),
+        )
+        for stage, chunks in cases:
+            with self.subTest(stage=stage):
+                self.tls.chunks = deque(chunks)
+                self.tls.sent.clear()
+                observed = []
+                deliver = destination._ObservedDelivery(route, lambda send: send(), observed.append)
+                with self.assertRaises(destination.MetadataDestinationError) as rejected:
+                    self.exchange(route, authorization=BASIC, body=b"code=fixture", deliver=deliver)
+                self.assertEqual(len(self.tls.sent), 1)
+                self.assertEqual(observed, [rejected.exception])
+                self.assertIs(rejected.exception.token_stage, stage)
+                self.assertNotIn(marker.decode(), str(rejected.exception))
+                if stage is TokenStage.HTTP_400:
+                    self.assertEqual(list(self.tls.chunks), [b"unopened"])
+
+    def test_short_token_send_cannot_observe_any_response(self):
+        route = destination.MetadataRoute.TOKEN
+        observed = []
+        deliver = destination._ObservedDelivery(route, lambda send: send(), observed.append)
+        self.tls.send_limit = 1
+        raw = response(status=b"HTTP/1.1 400 synthetic")
+        self.tls.chunks = deque([raw])
+        with self.assertRaisesRegex(destination.MetadataDestinationError, "write was incomplete"):
+            self.exchange(route, authorization=BASIC, body=b"code=fixture", deliver=deliver)
+        self.assertEqual(observed, [])
+        self.assertEqual(list(self.tls.chunks), [raw])
 
     def test_bounded_identity_json_can_arrive_in_multiple_reads(self):
         wire = response(headers=(b"Content-Encoding: identity",))

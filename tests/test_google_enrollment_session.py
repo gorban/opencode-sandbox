@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from oc_google import connect, registration
+from oc_google import connect, metadata_destination, registration
 from oc_google.account_binding import AccountBindingError
 from oc_google.auth_offer import Callback
 from oc_google.enrollment import EnrollmentMetadataError
@@ -24,9 +24,11 @@ from oc_google.native_service import (
 )
 from oc_google.native_namespace import NativeNamespaceError
 from oc_google.native_transport import NativeChannel
+from oc_google.token_diagnostic import TokenDiagnostic, TokenStage
 from google_registration_fixture import record_enrollment_retired
 from test_google_enrollment import BEARER, LOAD_REPLY, LOAD_REQUEST, SUBJECT
 from test_google_metadata_ingress import FakePeer, packet
+from test_google_metadata_destination import FakeChannel, IPV4, response
 from test_google_oauth_exchange import (
     AUTHORIZATION, CODE, ID_SENTINEL, OIDC_SCOPE, STATE, cold_credential, cold_grant,
     form, grant, native_json, offer, refresh_form,
@@ -122,12 +124,118 @@ class EnrollmentSessionTest(unittest.TestCase):
             self.peers[TOKEN].live = False
         return self.responses[route]
 
-    def session(self):
+    def session(self, *, diagnostic=None):
         return serve_initial_metadata(
             offer=offer(), callback_gate=self.callback_gate, profile=self.profile,
             deadline=time.monotonic() + 3, accept=self.accept, fence=self.fence,
-            authorized=lambda: self.active, destination=self.destination,
+            authorized=lambda: self.active, destination=self.destination, diagnostic=diagnostic,
         )
+
+    def attended_exchange(self, *, token_reply=None, userinfo=None, route_override=None):
+        token = FakeChannel(response(grant() if token_reply is None else token_reply))
+        token_socket, userinfo_socket = FakeChannel(), FakeChannel()
+        trust = Mock(wrap_socket=Mock(side_effect=[token, userinfo]))
+        self.enterContext(patch.object(metadata_destination, "_resolve", return_value=(2, IPV4)))
+        self.enterContext(patch.object(metadata_destination, "_system_tls_context", return_value=trust))
+        self.enterContext(patch.object(metadata_destination.socket, "socket",
+                                       side_effect=[token_socket, userinfo_socket]))
+
+        def deliver(route, **request):
+            actual = route_override if route is USERINFO and route_override is not None else route
+            if actual is LOAD:
+                request["body"] = b"{}"
+            return metadata_destination.exchange(actual, **request)
+
+        self.destination = deliver
+        return token, userinfo_socket
+
+    def assert_token_only_refusal(self, *, spent, pending):
+        saved = json.loads(self.journal_file.read_text())
+        self.assertEqual(saved["enrollment_metadata_spent"], spent)
+        self.assertIs(saved["metadata_pending"], pending)
+        self.assertIsNone(saved["subject_digest"])
+        self.assertEqual(self.accepted, [TOKEN])
+        self.assertEqual(self.peers[TOKEN].replies, [])
+
+    def test_attended_initial_token_rejection_has_exact_grant_stage(self):
+        diagnostic = TokenDiagnostic()
+        token, _ = self.attended_exchange(token_reply=grant(scope="synthetic-invalid-scope"))
+        with self.assertRaises(OAuthExchangeError) as refusal:
+            self.session(diagnostic=diagnostic)
+        self.assertIs(diagnostic.stage(refusal.exception), TokenStage.GRANT_SCOPE)
+        self.assertEqual(len(token.sent), 1)
+        self.assert_token_only_refusal(spent=1, pending=False)
+        self.assertNotIn("synthetic-invalid-scope", self.journal_file.read_text())
+
+    def test_valid_token_then_userinfo_setup_failure_has_distinct_stage(self):
+        diagnostic = TokenDiagnostic()
+        token, userinfo_socket = self.attended_exchange()
+        userinfo_socket.connect.side_effect = OSError("synthetic-userinfo-network")
+        with self.assertRaises(metadata_destination.MetadataDestinationError) as refusal:
+            self.session(diagnostic=diagnostic)
+        self.assertIs(diagnostic.stage(refusal.exception), TokenStage.USERINFO_PRE_WRITE)
+        self.assertEqual(len(token.sent), 1)
+        self.assertFalse(userinfo_socket.sent)
+        self.assert_token_only_refusal(spent=1, pending=False)
+
+    def test_userinfo_reservation_refusal_before_send_remains_generic(self):
+        diagnostic = TokenDiagnostic()
+        userinfo = FakeChannel()
+        token, _ = self.attended_exchange(userinfo=userinfo)
+        original = registration._HeldProfile._save
+
+        def save(held, record, **kwargs):
+            original(held, record, **kwargs)
+            if record.enrollment_metadata_spent == 2 and record.metadata_pending:
+                raise metadata_destination._MetadataSetupError("synthetic reservation refusal")
+
+        with patch.object(registration._HeldProfile, "_save", autospec=True, side_effect=save):
+            with self.assertRaises(metadata_destination.MetadataDestinationError) as refusal:
+                self.session(diagnostic=diagnostic)
+        self.assertIsNone(diagnostic.stage(refusal.exception))
+        self.assertEqual(len(token.sent), 1)
+        self.assertEqual(userinfo.sent, [])
+        self.assert_token_only_refusal(spent=2, pending=True)
+
+    def test_partial_userinfo_write_remains_generic(self):
+        diagnostic = TokenDiagnostic()
+        userinfo = FakeChannel()
+        userinfo.send_limit = 1
+        token, _ = self.attended_exchange(userinfo=userinfo)
+        with self.assertRaises(registration.RegistrationUnavailable) as refusal:
+            self.session(diagnostic=diagnostic)
+        self.assertIsNone(diagnostic.stage(refusal.exception))
+        self.assertEqual(len(token.sent), 1)
+        self.assertEqual(len(userinfo.sent), 1)
+        self.assert_token_only_refusal(spent=2, pending=True)
+
+    def test_userinfo_diagnostic_refuses_other_route(self):
+        diagnostic = TokenDiagnostic()
+        token, other_socket = self.attended_exchange(route_override=LOAD)
+        other_socket.connect.side_effect = OSError("synthetic-foreign-route")
+        with self.assertRaises(metadata_destination.MetadataDestinationError) as refusal:
+            self.session(diagnostic=diagnostic)
+        self.assertIsNone(diagnostic.stage(refusal.exception))
+        self.assertEqual(len(token.sent), 1)
+        self.assert_token_only_refusal(spent=1, pending=False)
+
+    def test_fake_typed_refusal_cannot_reuse_foreign_observation(self):
+        diagnostic = TokenDiagnostic()
+        foreign = TokenDiagnostic()
+        error = metadata_destination._ResponseRefused("synthetic foreign refusal", TokenStage.HTTP_400)
+        foreign.mark(error)
+        fake = self.destination
+
+        def fail_after_fake_write(route, **request):
+            fake(route, **request)
+            raise error
+
+        self.destination = fail_after_fake_write
+        with self.assertRaises(metadata_destination.MetadataDestinationError) as refusal:
+            self.session(diagnostic=diagnostic)
+        self.assertIs(refusal.exception, error)
+        self.assertIsNone(diagnostic.stage(error))
+        self.assert_token_only_refusal(spent=1, pending=False)
 
     def test_exact_operations_use_separate_native_connections(self):
         observation = self.session()
