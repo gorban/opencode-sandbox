@@ -44,6 +44,20 @@ mid-session. Related: [prd_h](prd_h.md) (warm start: shared setup done once unde
       pass the 35-check lifecycle/update suite. Real fresh and warm updates pass; real parallel
       acceptance passes 45 checks. The in-app restart requirement remains open as above.
 - [x] **Human approval of the pre-launch update slice** (`codex/foundations-batch`, `d4782b6`).
+- [x] Supply-chain pinning and baked-default launch (`agy/target3-supply-chain-pins`): digest-pinned
+      base images (`ghcr.io/anomalyco/opencode:2.3.0@sha256:...`, Chromium, relay, DinD), baked
+      `chrome-devtools-mcp` `1.14.0` verified by SHA-512/SHA-256, commit-pinned Oh My Zsh and
+      `zsh-vi-mode`, stale-image warnings (`OC_IMAGE_MAX_AGE_DAYS`), baked-only default execution
+      (`OC_OPENCODE_VERSION=baked`, running `/usr/local/bin/opencode` directly without `PATH`
+      lookup or writable-volume precedence), verified opt-in 2.x updates (`OC_OPENCODE_VERSION`
+      plus `OC_OPENCODE_SHA256`, executed via kernel-sealed `memfd` in `oc-opencode-run.py`), and
+      explicit unverified compatibility mode (`OC_OPENCODE_VERSION=keep`).
+- [x] Qualification (`agy/target3-supply-chain-pins`, integrated with `5c69e91`): byte-identical
+      14-file runtime manifest (`oc-sandbox` SHA-256 `92de6c5f419cbb247fcc3d4c53ad0a8d0c3822d8fa80cb6b5c7e9aed6e0edb30`)
+      passed all 48 headless parallel acceptance checks with verified cleanup in a clean
+      SELinux-enforcing rootless Fedora 45 VM, real-Podman `tests/security.sh` (335/0), portable
+      CI suites (including 14/14 supply-chain tests and Renovate config tests), and locked quality
+      checks (`ShellCheck 0.9.0`).
 
 Estimated time: 0.5–1 day.
 

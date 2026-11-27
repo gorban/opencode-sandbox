@@ -525,7 +525,7 @@ cat > "$B/tool" <<EOF
 #!/bin/sh
 # fake VS Code / Beyond Compare: record what it was given, optionally act like the agent or an edit
 pwd -P > $T/tool.cwd
-for a in "\$@"; do case \$a in --*) ;; *)
+for a in "\$@"; do case \$a in --*|-solo) ;; *)
   printf '%s\n' "\$a" >> $T/tool.relative
   a=\$(realpath -s -- "\$a")
   printf '%s\n' "\$a" >> $T/tool.args
@@ -544,6 +544,10 @@ req() { local id=$1; shift; printf '%s\n' "$@" > "$SB/.bridge/requests/$id.req";
 bridge() { timeout 20 python3 -I "$BRIDGE" 2>>"$T/bridge.log"; }
 victim_ok() { [[ "$(cat "$V/secret" "$V/requests/precious" "$V/f")" == "$SECRET"$'\n'"$SECRET"$'\n'"$SECRET" ]]; }
 reset_tool() { rm -f "$T/tool.args" "$T/tool.seen" "$T/tool.cwd" "$T/tool.relative"; }
+retire_fixture_stages() {
+  # All fixture editors above run synchronously under the scratch launcher.
+  find "$T/stage" -mindepth 1 -depth -delete
+}
 
 reset_tool; req 1 code /sandbox/construct/a.txt; FAKE_EDIT=edited bridge
 check "file opened as a host-owned staged copy" grep -q "^$T/stage/" "$T/tool.args"
@@ -551,8 +555,9 @@ check "editor receives a relative staged operand" grep -Fxq './files/1/a.txt' "$
 check "editor starts from the private stage session" grep -q "^$T/stage/" "$T/tool.cwd"
 check "staged copy had the sandbox content" grep -qx hello "$T/tool.seen"
 check "saved edit written back into the sandbox" [ "$(cat "$SB/construct/a.txt")" = edited ]
-check "staging cleaned after the session"   [ -z "$(ls -A "$T/stage")" ]
+check "staging retained after unqualified editor exit" test -s "$(head -1 "$T/tool.args")"
 check "queue drained"                       [ -z "$(ls -A "$SB/.bridge/requests")" ]
+retire_fixture_stages
 
 reset_tool
 echo '{}' > "$SB/construct/test.code-workspace"
@@ -563,7 +568,8 @@ check 'workspace definitions and oversized requests never reach the host editor'
 check 'bridge drains rejected requests' [ -z "$(ls -A "$SB/.bridge/requests")" ]
 req failed-launch code /sandbox/construct/a.txt
 OC_BRIDGE_LAUNCH=/usr/bin/false bridge
-check 'known editor launch failure reclaims its staging directory' [ -z "$(ls -A "$T/stage")" ]
+check 'uncertain session submission keeps the stage private' test -n "$(ls -A "$T/stage")"
+retire_fixture_stages
 
 reset_tool; req 2 code /sandbox/construct/dir /etc/passwd /sandbox/../victim/secret \
   /sandbox/construct/link/secret /sandbox/construct/./a.txt; bridge
@@ -593,8 +599,36 @@ for (( batch=0; batch<6; batch++ )); do bridge; done
 check 'queue backlog drains in bounded batches' [ -z "$(ls -A "$SB/.bridge/requests")" ]
 reset_tool; req after-backlog code /sandbox/construct/a.txt; bridge
 check 'bridge still handles requests after backlog' test -s "$T/tool.args"
-check 'bridge units pace bounded batches without tripping the start limits' bash -c \
-  'grep -qF "ExecStartPre=/usr/bin/sleep 1" "$1" && grep -qF "StartLimitIntervalSec=0" "$1" && grep -qF "TriggerLimitIntervalSec=0" "$1"' _ "$SCRIPT"
+check 'bridge timer starts and rearms without following a sandbox path' bash -c \
+  'grep -qxF "OnActiveSec=2s" "$1" && grep -qxF "OnUnitInactiveSec=2s" "$1" &&
+   grep -qxF "AccuracySec=100ms" "$1" && ! grep -qF "DirectoryNotEmpty=" "$1"' _ "$SCRIPT"
+
+missing_editor_reclaims_slots() {
+  local entry remaining
+  retire_fixture_stages
+  for (( entry=1; entry<=9; entry++ )); do
+    req "missing-editor-$entry" code /sandbox/construct/a.txt
+    OC_CODE_BIN="$B/not-installed" OC_BRIDGE_LAUNCH="$B/submit" bridge
+  done
+  remaining=$(ls -A "$T/stage")
+  if [[ -n $remaining ]]; then
+    find "$T/stage" -type f -delete
+    find "$T/stage" -mindepth 1 -type d -depth -delete
+    return 1
+  fi
+  reset_tool
+  req after-missing-editor code /sandbox/construct/a.txt
+  bridge && test -s "$T/tool.args"
+}
+cat > "$B/submit" <<'EOF'
+#!/bin/sh
+# Simulate successful transient submission regardless of the service's later exit.
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+shift
+"$@" || :
+EOF
+chmod +x "$B/submit"
+check 'nine missing editor launches do not retain never-opened slots' missing_editor_reclaims_slots
 
 mv "$SB/.bridge" "$T/bridge.real"; ln -s ../victim "$SB/.bridge"     # $SB/.bridge -> $V (has requests/)
 bridge
@@ -688,7 +722,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 bridge_path, scratch = sys.argv[1:]
 base, edit = b"before", b"host edit with more bytes"
@@ -702,7 +736,8 @@ class CopyTests(unittest.TestCase):
         sandbox.mkdir()
         self.target = sandbox / "edit.txt"
         self.target.write_bytes(base)
-        self.enterContext(patch.dict(os.environ, OC_SB=str(sandbox), OC_BRIDGE_STAGE=str(stage)))
+        self.enterContext(patch.dict(os.environ, OC_SB=str(sandbox), OC_BRIDGE_STAGE=str(stage),
+                                     OC_BRIDGE_BLOCKING_TOOLS="code,bcompare"))
         self.bridge = runpy.run_path(bridge_path)["run_session"].__globals__
 
     def stage(self):
@@ -818,7 +853,7 @@ class CopyTests(unittest.TestCase):
         self.assertEqual(errors.getvalue().count("must share a mount"), 1)
         self.assertEqual(errors.getvalue().count(str(session)), 1)
 
-    def test_abandoned_prepared_save_expires_with_session(self):
+    def test_abandoned_prepared_save_is_retained(self):
         session, staged = self.stage()
 
         def editor(*args, **kwargs):
@@ -831,12 +866,79 @@ class CopyTests(unittest.TestCase):
             self.bridge["run_session"](str(session))
         self.assertEqual(len(list(session.glob(".oc-bridge-*"))), 1)
         os.utime(session, (1, 1))
-        self.bridge["expire_stage"]()
-        self.assertEqual(list(session.parent.iterdir()), [])
+        self.bridge["process_queue"]()
+        self.assertEqual(list(session.parent.iterdir()), [session])
 
-    def sync(self, session):
+    def test_exit_at_conventional_editor_path_retains_staged_edits(self):
+        session, staged = self.stage()
+
+        def forward(*_args, **_options):
+            staged.write_bytes(edit)
+            return SimpleNamespace(poll=lambda: 0)
+
+        with patch.dict(self.bridge["TOOLS"], code="/usr/bin/code"), patch("subprocess.Popen", side_effect=forward):
+            self.bridge["run_session"](str(session))
+        self.assertEqual(self.target.read_bytes(), edit)
+        late_save = b"save after launcher exit"
+        staged.write_bytes(late_save)
+        self.assertEqual(staged.read_bytes(), late_save)
+        self.assertFalse((session / "recovery").exists())
+
+    def test_existing_closed_recovery_does_not_consume_active_capacity(self):
+        session, staged = self.stage()
+        staged.write_bytes(edit)
+        (session / "recovery").touch(mode=0o600)
+        with patch.dict(self.bridge, MAX_STAGE_SESSIONS=1, MAX_RETAINED_SESSIONS=2):
+            try:
+                self.stage()
+            except self.bridge["OverBudget"]:
+                self.fail("closed recovery consumed the active staging allowance")
+            with self.assertRaises(self.bridge["OverBudget"]):
+                self.stage()
+        self.assert_preserved(staged)
+
+    def test_unreadable_snapshot_entries_produce_one_batch_diagnostic(self):
+        sandbox = self.target.parent
+        queue = sandbox / ".bridge" / "requests"
+        queue.mkdir(parents=True)
+        (queue / "snapshot.req").write_text("bcompare\n/sandbox/tree\n", encoding="utf-8")
+        tree = sandbox / "tree"
+        tree.mkdir()
+        for number in range(50):
+            (tree / f"unreadable-{number}.txt").write_text("fixture", encoding="utf-8")
+        inspect = os.stat
+
+        def unreadable(path, *args, **kwargs):
+            if isinstance(path, str) and path.startswith("unreadable-"):
+                raise PermissionError("fixture")
+            return inspect(path, *args, **kwargs)
+
+        errors = StringIO()
+        with patch.object(os, "stat", side_effect=unreadable), patch("subprocess.run"), patch.object(sys, "stderr", errors):
+            self.bridge["process_queue"]()
+        self.assertEqual(errors.getvalue().splitlines(), ["oc-bridge: bridge batch: 50 snapshot entries"])
+
+    def test_write_back_diagnostics_are_bounded_and_escape_paths(self):
+        original = self.target.rename(self.target.with_name("ordinary\tname.txt"))
+        session = Path(self.bridge["stage_request"]("code", ["/sandbox/" + original.name]))
+        staged = session / "files/1/selection.txt"
+        staged.write_bytes(edit)
+        errors = StringIO()
         with (session / "manifest.json").open() as manifest:
             entry = json.load(manifest)["entries"][0]
+        failure = Mock(side_effect=PermissionError("fixture\tmessage"))
+        with patch.dict(self.bridge, write_back=failure), patch.object(sys, "stderr", errors):
+            for _ in range(30):
+                self.assertFalse(self.sync(session, entry))
+        report = errors.getvalue()
+        self.assertIn(r"ordinary\tname.txt", report)
+        self.assertNotIn("\t", report)
+        self.assertEqual(report.count("write-back of"), 1)
+
+    def sync(self, session, entry=None):
+        if entry is None:
+            with (session / "manifest.json").open() as manifest:
+                entry = json.load(manifest)["entries"][0]
         session_fd = os.open(session, os.O_RDONLY | os.O_DIRECTORY)
         try:
             files_fd = os.open("files", os.O_RDONLY | os.O_DIRECTORY, dir_fd=session_fd)
@@ -891,7 +993,7 @@ class CopyTests(unittest.TestCase):
         with patch("subprocess.Popen", side_effect=editor), patch("time.sleep"), patch.object(os, "write", side_effect=write):
             self.bridge["run_session"](str(session))
         self.assertEqual(self.target.read_bytes(), edit)
-        self.assertFalse(session.exists())
+        self.assertEqual(staged.read_bytes(), edit)
 
     def test_oversized_save_keeps_recovery(self):
         session, staged = self.stage()
@@ -959,6 +1061,7 @@ while True:                      # keep flipping even when the code under test r
         except OSError: pass' "$@"
 }
 swap "$SB/construct" d & swapper=$!
+retire_fixture_stages
 reset_tool
 for i in $(seq 1 150); do req "r$i" code /sandbox/construct/d/f; FAKE_EDIT="race-$i" bridge; done
 kill $swapper; wait $swapper 2>/dev/null || true
@@ -978,14 +1081,15 @@ cat > "$T/stub/podman" <<EOF
 echo "\${0##*/} \$*" >> "$T/stub.log"
 # Optional lifecycle integration stub: every image/volume/pod operation stays in scratch.
 if [ -n "\${STUB_SETUP:-}" ]; then
+  setup_dir=\${STUB_SETUP_DIR:-"$T/lifecycle"}
   if [ "\$1 \${2:-} \${3:-} \${4:-}" = 'run -d --name oc-headless-chromium' ]; then
-    printf '%s\\n' "\$*" > "$T/lifecycle/headless.args"
+    printf '%s\\n' "\$*" > "\$setup_dir/headless.args"
   fi
   case "\$1 \${2:-}" in
-    "pod ls") [ -s "$T/lifecycle/builds" ] || exit 0;;
+    "pod ls") [ -s "\$setup_dir/builds" ] || exit 0;;
     "image inspect")
       case "\$4" in *RepoTags*) echo 1; exit 0;; esac
-      name=\$5; record="$T/lifecycle/images/\$name"
+      name=\$5; record="\$setup_dir/images/\$name"
       [ -f "\$record" ] || exit 125
       hash=\$(cat "\$record")
       epoch=""
@@ -997,11 +1101,11 @@ if [ -n "\${STUB_SETUP:-}" ]; then
     "pod exists"|"container inspect") exit 1;;
     "pod create")
       if [ -n "\${STUB_HOLD_POD:-}" ]; then
-        : > "$T/lifecycle/entered"
-        while [ ! -e "$T/lifecycle/release" ]; do sleep .05; done
+        : > "\$setup_dir/entered"
+        while [ ! -e "\$setup_dir/release" ]; do sleep .05; done
       fi
       exit 0;;
-    "pod rm") [ -n "\${STUB_DELETE_SIGNAL:-}" ] && : > "$T/lifecycle/deleted"; exit 0;;
+    "pod rm") [ -n "\${STUB_DELETE_SIGNAL:-}" ] && : > "\$setup_dir/deleted"; exit 0;;
   esac
   if [ "\$1" = build ]; then
     shift; tag= hash= epoch=
@@ -1017,10 +1121,10 @@ if [ -n "\${STUB_SETUP:-}" ]; then
         *) shift;;
       esac
     done
-    echo "\$tag" >> "$T/lifecycle/builds"
+    echo "\$tag" >> "\$setup_dir/builds"
     sleep .3
-    printf '%s\n' "\$hash" > "$T/lifecycle/images/\$tag"
-    printf '%s\n' "\$epoch" > "$T/lifecycle/images/\$tag.epoch"
+    printf '%s\n' "\$hash" > "\$setup_dir/images/\$tag"
+    printf '%s\n' "\$epoch" > "\$setup_dir/images/\$tag.epoch"
     exit 0
   fi
 fi
@@ -1061,13 +1165,24 @@ case "\$1 \$2" in
     case "\$*" in *RepoTags*) echo 0; exit 0 ;; esac
     for m in \${STUB_IDS:-}; do [ "\${m%%=*}" = "\$5" ] && { echo "\${m#*=}"; exit 0; }; done; exit 125 ;;
 esac
-if [ "\${0##*/}" = systemctl ] && [ -n "\${STUB_BRIDGE_STAYS_ACTIVE:-}" ]; then
-  case "\$2" in stop) exit 1 ;; show) echo active; exit 0 ;; esac
+if [ "\${0##*/}" = systemctl ]; then
+  OC_TEST_BRIDGE_LOG="$T/stub.log" exec /usr/bin/bash "$REPO/tests/bridge-manager-fixture.sh" "\$@"
 fi
 exit 0
 EOF
 chmod +x "$T/stub/podman"
 for c in systemctl pkexec sudo semodule; do ln -s podman "$T/stub/$c"; done
+cat > "$T/stub/mv" <<EOF
+#!/bin/sh
+if [ -n "\${STUB_BRIDGE_PUBLISH_FAIL:-}" ]; then
+  for arg in "\$@"; do last=\$arg; done
+  case "\$last" in
+    */oc-bridge.service) printf '%s\n' 'fixture bridge publication failed' >> "$T/stub.log"; exit 1 ;;
+  esac
+fi
+exec /usr/bin/mv "\$@"
+EOF
+chmod +x "$T/stub/mv"
 cat > "$T/stub/distrobox-host-exec" <<'EOF'
 #!/usr/bin/env bash
 set -eu
@@ -1267,10 +1382,121 @@ check "-i default -d -a removes pod oc"                 grep -qx 'podman pod rm 
 check "-i default -d -a leaves other instances"         ! grep -q 'oc-other' <<<"$out"
 check "-i default -d -a leaves bridge, images, login"   ! grep -qE '^systemctl|rmi|oc-home|semodule' <<<"$out"
 check "-i default -d -a removes only default volumes"   grep -qx 'podman volume rm -f oc-pg' <<<"$out"
-out=$(del -d)
+out=$(STUB_BRIDGE_LOADED=oc-bridge.service del -d)
 check "bare -d still removes every instance pod"        grep -qx 'podman pod rm --ignore -f -- oc-other' <<<"$out"
 check 'bare -d stops the active bridge service' grep -qx 'systemctl --user stop oc-bridge.service' <<<"$out"
 DSTATE=$T/dhome/.local/share/oc-sandbox
+mkdir -m 700 -p "$DSTATE/bridge-stage/retained"
+printf 'private edit\n' > "$DSTATE/bridge-stage/retained/save.txt"
+out=$(pathrun -- -d)
+check 'global teardown refuses a retained bridge session before removing pods' \
+  grep -q 'staged editor sessions remain' <<<"$out"
+check 'retained session prevents Podman removals' ! grep -q 'podman pod rm' "$T/stub.log"
+check 'global teardown keeps the retained edit' grep -qx 'private edit' "$DSTATE/bridge-stage/retained/save.txt"
+legacy_unit="$T/dhome/.config/systemd/user/oc-bridge.path"
+printf '[Unit]\nDescription=Legacy bridge fixture\n' > "$legacy_unit"
+mkdir -p "$T/bridge-install/images"
+bridge_install_fixture() {
+  pathrun STUB_SETUP=1 STUB_SETUP_DIR="$T/bridge-install" \
+    OC_CHROMIUM_MODE=headless OC_OPENCODE_VERSION=keep "$@" -- -n
+}
+out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.service)
+check 'legacy watcher migration refuses while an old stage can have a live runner' \
+  grep -q 'staged editor sessions remain' <<<"$out"
+check 'blocked migration keeps the old unit file' test -f "$legacy_unit"
+check 'blocked migration stops the drain before returning' \
+  grep -qx 'systemctl --user stop oc-bridge.service' "$T/stub.log"
+check 'blocked migration does not activate a new trigger' \
+  ! grep -qE 'systemctl --user (enable --now|start) oc-bridge\.timer' "$T/stub.log"
+unlink "$legacy_unit"
+out=$(bridge_install_fixture 'STUB_BRIDGE_LOADED=oc-bridge.path oc-bridge.service')
+check 'manager-loaded legacy bridge still requires recovery if its file is missing' \
+  grep -q 'staged editor sessions remain' <<<"$out"
+check 'missing legacy file does not bypass drain stop' \
+  grep -qx 'systemctl --user stop oc-bridge.service' "$T/stub.log"
+check 'unresolved missing-file migration preserves the retained edit' \
+  grep -qx 'private edit' "$DSTATE/bridge-stage/retained/save.txt"
+
+for fault in STUB_BRIDGE_STAYS_ACTIVE=1 STUB_BRIDGE_PENDING=oc-bridge.timer STUB_BRIDGE_MANAGER_FAIL=1; do
+  out=$(bridge_install_fixture "$fault")
+  check "bridge replacement fails closed on $fault" grep -Eq 'could not (quiesce|inspect)' <<<"$out"
+  check "bridge remains disarmed on $fault" \
+    ! grep -qE 'systemctl --user (enable --now|start) oc-bridge\.timer' "$T/stub.log"
+done
+out=$(bridge_install_fixture STUB_BRIDGE_STAYS_ACTIVE=1)
+check 'active not-found record is refused before any stop' \
+  ! grep -q '^systemctl --user stop ' "$T/stub.log"
+
+out=$(bridge_install_fixture 'STUB_BRIDGE_LOADED=oc-bridge.timer oc-bridge.service' \
+  STUB_BRIDGE_ACTIVE_TIMER=oc-bridge.timer STUB_BRIDGE_PUBLISH_FAIL=1)
+check 'failed bridge publication happens after quiescing the active timer' awk '
+  FNR == 1 {timer = drain = failure = 0}
+  /^systemctl --user stop oc-bridge.timer$/ {timer = FNR}
+  /^systemctl --user stop oc-bridge.service$/ {drain = FNR}
+  /^fixture bridge publication failed$/ {failure = FNR}
+  END {exit !(timer && timer < drain && drain < failure)}
+' "$T/stub.log"
+check 'timer is disabled before failed publication' grep -qx 'systemctl --user disable oc-bridge.timer' "$T/stub.log"
+check 'partial publication does not rearm the timer' \
+  ! grep -qE 'systemctl --user (enable --now|start) oc-bridge\.timer' "$T/stub.log"
+check 'partial publication preserves retained staged bytes' grep -qx 'private edit' "$DSTATE/bridge-stage/retained/save.txt"
+for fault in STUB_BRIDGE_WRONG_FRAGMENT=oc-bridge.service STUB_BRIDGE_DROPIN=oc-bridge.service \
+             STUB_BRIDGE_STOP_HOOK=fixture STUB_BRIDGE_STAGE="$T/foreign-stage"; do
+  out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.service "$fault")
+  check "foreign or modified service refuses setup before stop on $fault" \
+    grep -q 'could not quiesce' <<<"$out"
+  check "unexpected unit is never stopped on $fault" ! grep -q '^systemctl --user stop ' "$T/stub.log"
+done
+ln -s "$DSTATE/bridge-stage" "$DSB/fixture-stage-alias"
+out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.service STUB_BRIDGE_STAGE="$DSB/fixture-stage-alias")
+check 'untrusted alias to the installed stage cannot authorize service stop' grep -q 'could not quiesce' <<<"$out"
+check 'untrusted alias is refused before any stop' ! grep -q '^systemctl --user stop ' "$T/stub.log"
+unlink "$DSB/fixture-stage-alias"
+for enablement in enabled enabled-runtime; do
+  out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.timer \
+    STUB_BRIDGE_STILL_ENABLED=oc-bridge.timer STUB_BRIDGE_ENABLEMENT="$enablement")
+  check "disable is insufficient when the timer remains $enablement" \
+    grep -q 'activation remains enabled' <<<"$out"
+  check "replacement checks fresh enablement after disable for $enablement" \
+    grep -qx 'systemctl --user is-enabled oc-bridge.timer' "$T/stub.log"
+done
+out=$(bridge_install_fixture 'STUB_BRIDGE_LOADED=oc-bridge.timer oc-bridge.service' \
+  STUB_BRIDGE_UPHOLD_AFTER_DISABLE=oc-bridge.service)
+check 'new drain activation dependency after disable prevents publication' \
+  grep -q 'activation remains enabled' <<<"$out"
+check 'drain activation dependency prevents rearming the timer' \
+  ! grep -q '^systemctl --user enable --now ' "$T/stub.log"
+legacy_pre='STUB_BRIDGE_PRE_HOOK={ path=/usr/bin/sleep ; argv[]=/usr/bin/sleep 1 ; ignore_errors=no ; pid=0 }'
+out=$(bridge_install_fixture 'STUB_BRIDGE_LOADED=oc-bridge.timer oc-bridge.service' \
+  "$legacy_pre" STUB_BRIDGE_PUBLISH_FAIL=1)
+check 'trusted historical pre-start passes the old drain recheck' \
+  grep -qx 'fixture bridge publication failed' "$T/stub.log"
+out=$(bridge_install_fixture 'STUB_BRIDGE_LOADED=oc-bridge.timer oc-bridge.service' "$legacy_pre")
+check 'replacement with a historical hook is inspected after reload' \
+  grep -qx 'systemctl --user daemon-reload' "$T/stub.log"
+check 'replacement still rejects a pre-start hook' grep -q 'could not install the host bridge' <<<"$out"
+check 'replacement with a pre-start hook is never activated' \
+  ! grep -q '^systemctl --user enable --now ' "$T/stub.log"
+global_units="$T/global-units"
+for relation in wants requires upholds; do
+  directory="$global_units/default.target.$relation"
+  mkdir -p "$directory"
+  ln -s "$T/absent.timer" "$directory/oc-bridge.timer"
+  out=$(bridge_install_fixture STUB_BRIDGE_GLOBAL_UNITS="$global_units")
+  check "dangling global $relation link blocks bridge publication" \
+    grep -q 'activation remains enabled' <<<"$out"
+  unlink "$directory/oc-bridge.timer"
+done
+out=$(pathrun STUB_BRIDGE_LOADED=oc-bridge.timer STUB_BRIDGE_STILL_ENABLED=oc-bridge.timer -- -d)
+check 'global teardown refuses a timer that remains effectively enabled' \
+  grep -q 'activation remains enabled' <<<"$out"
+check 'enabled timer prevents Podman removal during teardown' ! grep -q '^podman pod rm' "$T/stub.log"
+out=$(bridge_install_fixture STUB_BRIDGE_ENABLE_FAIL=1)
+check 'replacement reports failed activation' grep -q 'could not install the host bridge' <<<"$out"
+check 'failed enablement does not fall back to a direct start' \
+  ! grep -qx 'systemctl --user start oc-bridge.timer' "$T/stub.log"
+unlink "$DSTATE/bridge-stage/retained/save.txt"
+rmdir "$DSTATE/bridge-stage/retained"
 for fault in STUB_LIST_PODS_FAIL STUB_POD_REMOVE_FAIL STUB_POD_REMAINS STUB_BRIDGE_STAYS_ACTIVE; do
   mkdir -p "$DSB/.bridge" "$DSTATE/build"
   : > "$DSB/.bridge/keep"

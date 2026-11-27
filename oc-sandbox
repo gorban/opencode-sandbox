@@ -296,7 +296,7 @@ try:
     for name in ("Containerfile.agent", "Containerfile.chromium", "Containerfile.relay", "opencode-sandbox.json", "zshrc", "bridge-open", "gitconfig", "gitignore_global", "oc-opencode-update.py", "oc-opencode-run.py", "oh-my-zsh-pinned.receipt", "oh-my-zsh-host.receipt"):
         leaf(os.path.join(build, name))
     for name in ("oc_chromium.cil", "installed"): leaf(os.path.join(policy, name))
-    for name in ("oc-bridge.service", "oc-bridge.path"): leaf(os.path.join(units, name))
+    for name in ("oc-bridge.service", "oc-bridge.path", "oc-bridge.timer"): leaf(os.path.join(units, name))
     leaf(os.path.join(install, "binding"), private=True)
     leaf(os.path.join(binary, "oc-bridge"))
 except (OSError, ValueError) as exc:
@@ -569,10 +569,10 @@ verify_bridge_stage() {
 safe_run() { pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
   --security-opt=label=disable -v "$SB":/sandbox "$@"; }
 tree_run() {
-  "${H[@]}" timeout -k 5s 70s podman run --rm -i --network=none --http-proxy=false \
+  "${H[@]}" timeout -k 5s 70s podman run --rm --network=none --http-proxy=false \
     --timeout=60 --cap-drop=ALL --security-opt=no-new-privileges --security-opt "label=level:$LEVEL" \
     --pids-limit=128 --memory="$AGENT_MEM" -v "$SB":/sandbox \
-    --entrypoint python3 "$AGENT_IMG" -I -c "$SANDBOX_TREE_PY" "$@"
+    --entrypoint python3 "$AGENT_IMG" -I -c "$SANDBOX_TREE_PY" "$@" </dev/null
 }
 
 # These commands execute only in the sandbox-only container. Git receives a clean environment;
@@ -1183,7 +1183,7 @@ require_empty_installation() {
 
 bind_installation() {
   local installed="$UNITS/oc-bridge.service" receipt="$INSTALL_DIR/binding" host_state current expected
-  shared_host_directory "$UNITS" 'systemd user' "$UNITS_SOURCE" >/dev/null || return 1
+  HOST_UNITS=$(shared_host_directory "$UNITS" 'systemd user' "$UNITS_SOURCE") || return 1
   shared_host_directory "$INSTALL_DIR" 'installation binding' "$UNITS_SOURCE/.oc-sandbox" >/dev/null || return 1
   host_state=$(shared_host_directory "$STATE" 'installation state') || return 1
   expected=$(printf '%s\n%s\n' "$host_state" "$HOST_BRIDGE_STAGE")
@@ -1227,14 +1227,67 @@ remove_instance_storage() {
   pm "$kind" exists "$name" || rc=$?
   (( rc == 1 ))
 }
+bridge_unit_state() {
+  local unit=$1 phase=${2:-existing} helper
+  local fields=Id,LoadState,ActiveState,Job,FragmentPath,DropInPaths,Triggers,TriggeredBy,WantedBy,RequiredBy,UpheldBy
+  if [[ $unit == oc-bridge.service ]]; then
+    fields+=,Type,ExecStart,ExecStartPre,ExecStartPost,ExecStop,ExecStopPost,ExecReload,ExecCondition
+    fields+=,Environment,EnvironmentFiles,PassEnvironment,UnsetEnvironment
+  fi
+  helper=$(trusted_file "$SCRIPT_DIR/oc-bridge-unit.py") || return 1
+  sc show --all --property="$fields" "$unit" |
+    host_python "$helper" unit "$unit" "$HOST_UNITS" "$UNITS_SOURCE" "$BIN/oc-bridge" "$SB" \
+      "$HOST_BRIDGE_STAGE" "$BRIDGE_STAGE" "$phase"
+}
 stop_bridge() {
   local unit state
-  for unit in oc-bridge.path oc-bridge.service; do
-    if ! sc stop "$unit" >/dev/null 2>&1; then
-      state=$(sc show --property=ActiveState --value "$unit") || return 1
-      [[ $state == inactive || $state == failed ]] || return 1
-    fi
+  local -a loaded=()
+  for unit in oc-bridge.timer oc-bridge.path oc-bridge.service; do
+    state=$(bridge_unit_state "$unit") || return 1
+    if [[ $state == $'LoadState=loaded\n'* ]]; then loaded+=("$unit"); fi
   done
+  for unit in "${loaded[@]}"; do
+    sc stop "$unit" >/dev/null 2>&1 || true
+    state=$(bridge_unit_state "$unit") || return 1
+    [[ $state == *$'\nActiveState=inactive\nJob=' || $state == *$'\nActiveState=failed\nJob=' ]] || return 1
+  done
+}
+require_empty_bridge_stage() {
+  local staged
+  [[ -d $BRIDGE_STAGE ]] || return 0
+  staged=$(find "$BRIDGE_STAGE" -mindepth 1 -maxdepth 1 -printf x -quit) \
+    || die "could not inspect staged editor sessions"
+  [[ -z $staged ]] || die "staged editor sessions remain in $BRIDGE_STAGE; close editors or recover their files and retry"
+}
+verify_bridge_disarmed() {
+  local unit=$1 state enablement status=0 helper
+  state=$(bridge_unit_state "$unit" disarmed) || return 1
+  enablement=$(sc is-enabled "$unit" 2>/dev/null) || status=$?
+  case "$status:$enablement" in
+    1:disabled) ;;
+    4:not-found) [[ $state == $'LoadState=not-found\n'* && ! -e $UNITS/$unit ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  helper=$(trusted_file "$SCRIPT_DIR/oc-bridge-unit.py") || return 1
+  sc show --property=UnitPath | host_python "$helper" links "$unit"
+}
+disarm_bridge() {
+  local legacy timer
+  validate_host_state || die "refusing unsafe host bridge installation"
+  legacy=$(bridge_unit_state oc-bridge.path) || die "could not inspect the legacy host bridge"
+  timer=$(bridge_unit_state oc-bridge.timer) || die "could not inspect the host bridge timer"
+  stop_bridge || die "could not quiesce the installed host bridge"
+  if [[ -f $UNITS/oc-bridge.path || $legacy == $'LoadState=loaded\n'* ]]; then
+    require_empty_bridge_stage
+    sc disable oc-bridge.path >/dev/null || die "could not disable the legacy host bridge"
+  fi
+  if [[ -f $UNITS/oc-bridge.timer || -L $UNITS/default.target.wants/oc-bridge.timer ||
+        $timer == $'LoadState=loaded\n'* ]]; then
+    sc disable oc-bridge.timer >/dev/null || die "could not disarm the host bridge timer"
+  fi
+  verify_bridge_disarmed oc-bridge.timer && verify_bridge_disarmed oc-bridge.path &&
+    bridge_unit_state oc-bridge.service disarmed >/dev/null ||
+      die "host bridge activation remains enabled or could not be verified"
 }
 # The module is installed by semodule at its default priority (400). A lower-priority
 # module with the same name belongs to someone else and must not be removed.
@@ -1291,6 +1344,8 @@ if (( DELETE )); then
   if compgen -G "$STATE/opencode-update.*" >/dev/null; then
     die "unresolved OpenCode updater receipts in $STATE; inspect and clean the recorded container IDs before teardown"
   fi
+  disarm_bridge
+  require_empty_bridge_stage
   pods=$(instance_pods) || die "could not list instance pods; teardown stopped"
   while IFS= read -r pod; do
     [[ -n $pod ]] || continue
@@ -1300,18 +1355,11 @@ if (( DELETE )); then
   pods=$(instance_pods) || die "could not verify that all instance pods were removed"
   [[ -z $pods ]] || die "instance pods remain; teardown stopped"
   log "Removing host bridge"
-  stop_bridge || die "could not confirm the host bridge stopped"
-  sc disable oc-bridge.path >/dev/null 2>&1 || true
-  rm -f "$UNITS/oc-bridge.path" "$UNITS/oc-bridge.service" "$BIN/oc-bridge"
-  sc daemon-reload >/dev/null 2>&1 || true
+  rm -f -- "$UNITS/oc-bridge.path" "$UNITS/oc-bridge.timer" "$UNITS/oc-bridge.service" "$BIN/oc-bridge"
+  sc daemon-reload >/dev/null || die "could not reload the user service manager"
   if (( ALL )); then
     if ! confirm "Also delete ALL oc-sandbox volumes (OpenCode login, Chromium profiles, Postgres data, docker storage), images and build files?"; then
       echo "Skipped -a part."; exit 0
-    fi
-    if [[ -d $BRIDGE_STAGE ]]; then
-      staged=$(find "$BRIDGE_STAGE" -mindepth 1 -maxdepth 1 -type d -print -quit) \
-        || die "could not inspect staged editor sessions"
-      [[ -z $staged ]] || die "staged editor sessions remain in $BRIDGE_STAGE; close editors or recover their files and retry"
     fi
     log "Removing images, volumes, secrets, build files"
     # Only images this script built: drop our tag from them (not other tags you gave them), then
@@ -1802,28 +1850,46 @@ fi
 # The bridge runs under the host's system Python, so check that interpreter.
 host_python -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
   || echo "warning: the host bridge needs python3 >= 3.11 on the host; 'code'/'bcompare' will do nothing" >&2
-atomic_host_file "$BIN/oc-bridge" 0755 < "$BRIDGE_SRC"
-{
-  # Keep batches bounded without allowing a backlog to put the watcher in a failed state.
-  printf '[Unit]\nDescription=Restricted host bridge for the OpenCode sandbox\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\nExecStartPre=/usr/bin/sleep 1\n'
+bridge_service_file() {
+  # The separate timer paces the bounded request batches.
+  printf '[Unit]\nDescription=Restricted host bridge for the OpenCode sandbox\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\n'
   unit_env OC_SB "$SB"; unit_env OC_BRIDGE_STAGE "$HOST_BRIDGE_STAGE"
   unit_env OC_BRIDGE_SELINUX_LEVEL "$LEVEL"
   unit_env OC_CODE_BIN "$CODE_BIN"; unit_env OC_BCOMPARE_BIN "$BC_BIN"
   printf 'ExecStart=%%h/.local/bin/oc-bridge\n'
-} | atomic_host_file "$UNITS/oc-bridge.service" 0644
-atomic_host_file "$UNITS/oc-bridge.path" 0644 <<'EOF'
+}
+bridge_timer_file() {
+  cat <<'EOF'
 [Unit]
-Description=Watch the OpenCode sandbox bridge queue
-[Path]
-DirectoryNotEmpty=%h/opencode-sandbox/.bridge/requests
-TriggerLimitIntervalSec=0
+Description=Poll the OpenCode sandbox bridge queue
+[Timer]
+OnActiveSec=2s
+OnUnitInactiveSec=2s
+AccuracySec=100ms
 Unit=oc-bridge.service
 [Install]
 WantedBy=default.target
 EOF
-sc daemon-reload
-sc reset-failed oc-bridge.path oc-bridge.service >/dev/null 2>&1 || true
-sc enable --now oc-bridge.path >/dev/null 2>&1 || sc start oc-bridge.path
+}
+install_bridge() (
+  draft=$(mktemp -d "$BUILD/bridge.XXXXXXXX") || exit 1
+  trap 'rm -f -- "$draft/runner" "$draft/service" "$draft/timer"; rmdir -- "$draft"' EXIT
+  cat "$BRIDGE_SRC" > "$draft/runner" || exit 1
+  bridge_service_file > "$draft/service" || exit 1
+  bridge_timer_file > "$draft/timer" || exit 1
+  disarm_bridge
+  rm -f -- "$UNITS/oc-bridge.path" || exit 1
+  atomic_host_file "$BIN/oc-bridge" 0755 < "$draft/runner" || exit 1
+  atomic_host_file "$UNITS/oc-bridge.service" 0644 < "$draft/service" || exit 1
+  atomic_host_file "$UNITS/oc-bridge.timer" 0644 < "$draft/timer" || exit 1
+  sc daemon-reload || exit 1
+  bridge_unit_state oc-bridge.service replacement >/dev/null || exit 1
+  bridge_unit_state oc-bridge.timer replacement >/dev/null || exit 1
+  verify_bridge_disarmed oc-bridge.timer && verify_bridge_disarmed oc-bridge.path || exit 1
+  sc reset-failed oc-bridge.timer oc-bridge.service >/dev/null 2>&1 || true
+  sc enable --now oc-bridge.timer >/dev/null
+)
+install_bridge || die "could not install the host bridge"
 
 # ---- SELinux policy: dedicated type so ONLY the Chromium containers may use the Wayland socket ----
 TPL=/usr/share/udica/templates

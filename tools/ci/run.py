@@ -88,12 +88,14 @@ SHELL_FILES = (
     'oc-sandbox',
     'tests/parallel.sh',
     'tests/postgres-host.sh',
+    'tests/bridge-manager-fixture.sh',
     'tests/security.sh',
     'tests/worktrees.sh',
 )
 
 PYTHON_FILES = (
     'oc-bridge.py',
+    'oc-bridge-unit.py',
     'oc-opencode-run.py',
     'oc-opencode-supervisor.py',
     'oc-opencode-update.py',

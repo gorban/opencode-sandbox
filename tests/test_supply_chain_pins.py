@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -348,7 +349,14 @@ sys.exit(0)
             encoding="utf-8",
         )
         podman.chmod(0o755)
-        for name in ("systemctl", "semodule", "pkexec", "sudo", "curl"):
+        fake_systemctl = stub / "systemctl"
+        manager_fixture = ROOT / "tests/bridge-manager-fixture.sh"
+        fake_systemctl.write_text(
+            "#!/bin/sh\n" + shlex.join(("/usr/bin/bash", str(manager_fixture))) + ' "$@"\n',
+            encoding="utf-8",
+        )
+        fake_systemctl.chmod(0o755)
+        for name in ("semodule", "pkexec", "sudo", "curl"):
             p = stub / name
             p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             p.chmod(0o755)
@@ -367,7 +375,7 @@ sys.exit(0)
         import shutil
         copy_dir = root / "launcher"
         copy_dir.mkdir(mode=0o700, exist_ok=True)
-        for helper in ("oc-bridge.py", "oc-setup-lock.py", "oc-opencode-run.py",
+        for helper in ("oc-bridge.py", "oc-bridge-unit.py", "oc-setup-lock.py", "oc-opencode-run.py",
                        "oc-opencode-update.py", "oc-opencode-supervisor.py"):
             shutil.copy2(ROOT / helper, copy_dir / helper)
         launcher_text = (ROOT / "oc-sandbox").read_text(encoding="utf-8")

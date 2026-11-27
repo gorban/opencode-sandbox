@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -236,7 +237,8 @@ class QualityTests(unittest.TestCase):
             return '/binary/bash version\n' if command[0].endswith('/bash') else 'version: 0.9.0\n'
 
         shell_files = (
-            'oc-sandbox', 'tests/parallel.sh', 'tests/postgres-host.sh', 'tests/security.sh', 'tests/worktrees.sh',
+            'oc-sandbox', 'tests/parallel.sh', 'tests/postgres-host.sh',
+            'tests/bridge-manager-fixture.sh', 'tests/security.sh', 'tests/worktrees.sh',
         )
         with patch.dict(os.environ, {'BASH_ENV': '/host/bashenv', 'SHELLCHECK_OPTS': '-x'}), \
                 patch.object(ci, 'tool_required', side_effect=lambda name, path: f'/binary/{name}'), \
@@ -278,6 +280,86 @@ class QualityTests(unittest.TestCase):
                 ci.quality(Supervisor())
             self.assertEqual(stub.call_count, 2)
             self.assertFalse(stub.call_args.kwargs['scratch'].exists())
+
+
+class RenovateConfigTests(unittest.TestCase):
+    """Renovate may only propose updates for the pins it is scoped to; a person merges them."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def setUp(self):
+        self.config = json.loads((self.ROOT / '.github/renovate.json').read_text(encoding='utf-8'))
+
+    def image_pattern(self):
+        (manager,) = self.config['customManagers']
+        self.assertEqual(manager['customType'], 'regex')
+        self.assertEqual(manager['managerFilePatterns'], ['/^oc-sandbox$/'])
+        self.assertEqual(manager['datasourceTemplate'], 'docker')
+        (pattern,) = manager['matchStrings']
+        # Renovate uses RE2, which has no lookaround or backreferences.
+        for unsupported in ('(?=', '(?!', '(?<=', '(?<!', '\\1'):
+            self.assertNotIn(unsupported, pattern)
+        return re.compile(pattern.replace('(?<', '(?P<'))
+
+    def test_never_merges_or_publishes_vulnerability_state(self):
+        self.assertIs(self.config['automerge'], False)
+        self.assertIs(self.config['platformAutomerge'], False)
+        self.assertEqual(self.config['vulnerabilityAlerts'], {'enabled': False})
+        self.assertIs(self.config['osvVulnerabilityAlerts'], False)
+        self.assertEqual(self.config['extends'], [':disableDependencyDashboard'])
+        for rule in self.config['packageRules']:
+            self.assertNotIn('automerge', rule)
+            self.assertNotIn('platformAutomerge', rule)
+            self.assertNotIn('vulnerabilityAlerts', rule)
+            self.assertNotIn('osvVulnerabilityAlerts', rule)
+
+    def test_schedule_and_concurrency(self):
+        self.assertEqual(self.config['schedule'], ['* 0-5 * * 1'])
+        self.assertEqual(self.config['prConcurrentLimit'], 3)
+        self.assertEqual(self.config['prHourlyLimit'], 1)
+
+    def test_scope_is_launcher_images_and_ci_tools(self):
+        self.assertEqual(self.config['enabledManagers'], ['custom.regex', 'mise'])
+        self.assertEqual(self.config['includePaths'], ['oc-sandbox', 'tools/ci/mise.toml', 'tools/ci/mise.lock'])
+        self.assertEqual(self.config['minimumReleaseAge'], '7 days')
+        self.assertEqual(self.config['minimumReleaseAgeBehaviour'], 'timestamp-required')
+        self.assertEqual(self.config['internalChecksFilter'], 'strict')
+        for rule in self.config['packageRules']:
+            self.assertNotIn('minimumReleaseAge', rule)
+        untimed = [rule for rule in self.config['packageRules']
+                   if rule.get('minimumReleaseAgeBehaviour') == 'timestamp-optional']
+        (registry_rule,) = untimed
+        self.assertEqual(registry_rule['matchDatasources'], ['docker'])
+        self.assertEqual(registry_rule['matchPackageNames'], ['ghcr.io/**', 'quay.io/**', 'registry.fedoraproject.org/**'])
+        self.assertEqual(registry_rule['addLabels'], ['no-release-age-check'])
+
+    def test_mise_artifacts_stay_under_manual_control(self):
+        (mise_rule,) = [rule for rule in self.config['packageRules'] if rule.get('matchManagers') == ['mise']]
+        self.assertIs(mise_rule['skipArtifactsUpdate'], True)
+        self.assertEqual(mise_rule['addLabels'], ['needs-checksum-update'])
+
+    def test_every_digest_pinned_launcher_image_is_matched(self):
+        pattern = self.image_pattern()
+        launcher = (self.ROOT / 'oc-sandbox').read_text(encoding='utf-8')
+        matches = list(pattern.finditer(launcher))
+        self.assertGreaterEqual(len(matches), 1)
+        self.assertEqual(len(matches), launcher.count('@sha256:'))
+        for found in matches:
+            self.assertRegex(found.group('depName'), r'^[a-z0-9.-]+\.[a-z]+/')
+            self.assertTrue(found.group('currentValue'))
+
+    def test_image_pattern_forms(self):
+        pattern = self.image_pattern()
+        digest = 'sha256:' + 'a' * 64
+        for name, tag in (('docker.io/library/python', '3.12-alpine'), ('ghcr.io/example/tool', '2.3.0'),
+                          ('quay.io/example/stable', 'v6.2.0'), ('registry.example.org/base', '45')):
+            found = pattern.search(f'FROM {name}:{tag}@{digest}')
+            self.assertIsNotNone(found, name)
+            self.assertEqual((found.group('depName'), found.group('currentValue'), found.group('currentDigest')),
+                             (name, tag, digest))
+        for unpinned in ('FROM registry.example.org/base:latest', f'FROM docker.io/library/python@{digest}',
+                         'IMAGE=${OC_IMAGE:-quay.io/example/stable:latest}'):
+            self.assertIsNone(pattern.search(unpinned), unpinned)
 
 
 if __name__ == '__main__':

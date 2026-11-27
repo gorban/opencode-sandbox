@@ -65,7 +65,7 @@ class StagingTests(unittest.TestCase):
         launch.assert_called_once()
         self.assertEqual(left.read_text(encoding="utf-8"), "left edited")
         self.assertEqual(right.read_text(encoding="utf-8"), "right edited atomically")
-        self.assertFalse(session.exists())
+        self.assertEqual((session / "files/1/item.txt").read_text(encoding="utf-8"), "left edited")
 
     def test_direct_selection_refuses_metadata_and_its_descendants(self):
         for name in ("fixture.Code-Workspace", "fixture.BCPKG", "fixture.bcs", "fixture.bcss",
@@ -84,7 +84,7 @@ class StagingTests(unittest.TestCase):
         session = Path(self.select("bcompare", "tree"))
 
         def inspect(argv, **options):
-            self.assertEqual(argv, ["/fake/bcompare", "./files/1"])
+            self.assertEqual(argv, ["/fake/bcompare", "-solo", "./files/1"])
             snapshot = Path(options["cwd"]) / argv[-1]
             self.assertEqual(
                 {str(path.relative_to(snapshot)) for path in snapshot.rglob("*")},
@@ -105,11 +105,11 @@ class StagingTests(unittest.TestCase):
         session = Path(self.select("bcompare", "left/Quarterly draft.txt", "right/Résumé.txt"))
 
         def edit(argv, **options):
-            self.assertEqual(argv, ["/fake/bcompare", "./files/1/selection.txt", "./files/2/selection.txt"])
+            self.assertEqual(argv, ["/fake/bcompare", "-solo", "./files/1/selection.txt", "./files/2/selection.txt"])
             workdir = Path(options["cwd"])
             self.assertEqual(workdir, session)
-            (workdir / argv[1]).write_text("first saved", encoding="utf-8")
-            (workdir / argv[2]).write_text("second saved", encoding="utf-8")
+            (workdir / argv[2]).write_text("first saved", encoding="utf-8")
+            (workdir / argv[3]).write_text("second saved", encoding="utf-8")
             proc = MagicMock()
             proc.poll.return_value = 0
             return proc

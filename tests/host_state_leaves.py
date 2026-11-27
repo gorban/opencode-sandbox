@@ -7,6 +7,8 @@ with tempfile.TemporaryDirectory(prefix='oc-leaf-') as tmp:
     base = pathlib.Path(tmp); home = base / 'home'; sb = home / 'opencode-sandbox'; sb.mkdir(parents=True)
     state = home / '.local/share/oc-sandbox'; build = state / 'build'; policy = state / 'policy'
     build.mkdir(parents=True); policy.mkdir()
+    units = home / '.config/systemd/user'
+    units.mkdir(parents=True)
     stub = base / 'stub'; stub.mkdir()
     for name in ('podman', 'systemctl', 'pkexec', 'sudo', 'distrobox-host-exec'):
         f = stub / name; f.write_text('#!/bin/sh\nexit 0\n'); f.chmod(0o755)
@@ -17,7 +19,7 @@ with tempfile.TemporaryDirectory(prefix='oc-leaf-') as tmp:
     for target in (build / 'Containerfile.agent', policy / 'oc_chromium.cil', state / 'sb-level',
                    state / 'built-images', state / 'built-images.lock', state / 'pg-sig.key', state / 'pg-sig.lock',
                    build / 'gitconfig', build / 'oh-my-zsh-pinned.receipt', build / 'oh-my-zsh-host.receipt',
-                   policy / 'installed'):
+                   policy / 'installed', units / 'oc-bridge.timer'):
         for kind in ('symlink', 'hardlink'):
             if kind == 'symlink': target.symlink_to(sentinel)
             else: os.link(sentinel, target)
@@ -84,7 +86,10 @@ with tempfile.TemporaryDirectory(prefix='oc-leaf-') as tmp:
             start = text.index(function)
             end = text.index('\n}', start) + 2
             validators.append(text[start:end])
-    harness = '\n'.join(validators) + '\ndie() { echo "$*" >&2; exit 2; }\nH=()\numask 0002\n' + setup_block
+    # The bridge migration has its own stubbed setup and teardown tests. This
+    # fragment only verifies the directory creation before that integration.
+    harness = ('\n'.join(validators) + '\ndie() { echo "$*" >&2; exit 2; }\n'
+               'migrate_bridge_trigger() { :; }\nH=()\numask 0002\n' + setup_block)
     creation_env = {**env, 'HOME': str(check_home), 'SB': str(sb2), 'STATE': str(state2),
                     'BUILD': str(build2), 'POLDIR': str(policy2), 'BRIDGE_STAGE': str(stage2),
                     'BIN': str(bin2), 'UNITS': str(units2), 'INSTALL_DIR': str(units2 / '.oc-sandbox')}

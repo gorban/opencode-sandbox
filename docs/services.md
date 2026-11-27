@@ -153,13 +153,19 @@ Compare (files or folders). The host tools work on a **copy**:
 - Changes the agent makes while the file is open are not shown in the editor. If the agent changed the
   file in the meantime, your save goes to `FILE.host-edit` next to it instead of overwriting the agent's
   version.
-- `code` waits for you to close the tab (`--wait`); the copy is deleted after successful write-back. Folders opened in Beyond
-  Compare are read-only snapshots (ordinary files and directories). The bridge excludes repository
-  and editor metadata from selections and snapshots. A detached copy can appear as `selection`
-  with the original extension when the original name has spaces or other characters outside the
-  editor's staging filename rules. Saves still return to the recorded original path.
-  Snapshots are limited to 64 MiB per file, 512 MiB and 5000 visited entries per
-  session, and 64 levels of nesting. At most eight staging directories are admitted at once.
+- VS Code is asked to wait for you to close the tab (`--wait`). The bridge retains
+  staged files after an editor starts because the launcher can exit before the editor closes.
+  Beyond Compare folders are read-only snapshots of ordinary files and directories.
+- The bridge excludes repository and editor metadata from selections and snapshots. A detached
+  file can appear as `selection` with the original extension when its name falls outside the
+  staging filename rules. Saves return to the recorded original path.
+- Snapshots are limited to 64 MiB per file, 512 MiB and 5000 visited entries per session, and
+  64 levels of nesting. The bridge allows up to eight active or uncertain sessions and up to
+  sixteen private session directories total, including closed recovery.
+- Recovery files have no automatic expiry. Use the private session path in the bridge message
+  to copy out the saved files. After confirming any associated editor and bridge session have
+  closed, remove that session directory to release capacity. Close or recover sessions before
+  upgrading a legacy bridge or performing global teardown.
 - Symlinks inside the sandbox are not followed by the host; `code` resolves them inside the sandbox
   first, so links that stay inside the sandbox still work.
 - One bridge serves all instances.

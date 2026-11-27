@@ -34,6 +34,10 @@
 - [x] (codex/foundations-batch) `oc-sandbox -l` shows the repo/branch of each instance's worktree.
 - [x] (codex/foundations-batch) Tests: detection from a nested directory, a symlinked repo (refused, as `-W` already does), a
       mismatch refused, and relaunch without `-W`.
+- [x] (`codex/noninteractive-worktree-helper`) Close stdin for the temporary worktree container.
+      Its requests arrive through arguments. A launch from a terminal can now prepare the worktree
+      without the bounded Podman helper waiting on that terminal. The OpenCode session still receives
+      terminal input.
 
 ### Options: where a detected repo's worktrees go
 
