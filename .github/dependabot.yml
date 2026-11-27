@@ -1,0 +1,13 @@
+# Dependabot version updates for the pinned GitHub Actions in .github/workflows.
+# Security updates are a repository setting and need no entry here.
+# Dependabot cannot see mise tools, image references or pins inside the launcher.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # Wait a week after a release so a compromised or withdrawn one is less likely to be proposed.
+    cooldown:
+      default-days: 7

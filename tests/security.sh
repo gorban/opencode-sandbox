@@ -34,6 +34,316 @@ host_input_functions() {
 SECRET=TOP-SECRET-HOST-DATA
 
 # ================================================================================================
+echo "host Python invocation (source audit)"
+# The launcher inherits the caller's directory and PATH, and an agent can influence both. Every host
+# Python call must name the system interpreter by absolute path and pass isolated mode where it is
+# invoked. Container entry points use the image's interpreter and must be isolated as well. Any other
+# mention of an interpreter has to be a known inert form, so a new form fails until it is classified.
+# The audit reads source text only. It cannot see a helper started through its own shebang line.
+cat > "$T/host-python-audit.py" <<'PYCODE'
+import re, sys
+
+INTERPRETER = "/usr/bin/python3"
+# Only these spellings count as isolated. A grouped option such as -cI is not: -c takes the rest.
+ISOLATED = r"(?:-I|-IB)"
+DISPATCH = '"$HOST_DISPATCH"'
+BINDING = "readonly HOST_DISPATCH=/usr/bin/distrobox-host-exec"
+DISPATCH_PATH = "PATH=/usr/bin:/bin"
+MENTION = re.compile(r"python[0-9.]*(?![\w-])")
+NAME = re.compile(r"python[0-9.]*")
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*")
+FUNCTION = re.compile(r"^(\w+)\(\) \{")
+WORD_BREAK = set(" \t;|&()<>='\"`,[]")
+COMMAND_START = {"", "exec", "then", "else", "do", "if", "elif", "while", "!", "{", "&&", "||", "|"}
+
+
+def logical_lines(text):
+    start, parts = None, []
+    for number, line in enumerate(text.split("\n"), 1):
+        if start is None:
+            start = number
+        if line.endswith("\\"):
+            parts.append(line[:-1])
+            continue
+        parts.append(line)
+        yield start, " ".join(parts)
+        start, parts = None, []
+    if parts:
+        yield start, " ".join(parts)
+
+
+def command_prefix(before):
+    """Return (dispatched, problem) for the words in front of a host interpreter."""
+    words = before.split()
+    dispatched = bool(words) and words[-1] == DISPATCH
+    if dispatched:
+        words.pop()
+        if not words or words[-1] != DISPATCH_PATH:
+            return True, "dispatcher runs without the fixed search path"
+        words.pop()
+    else:
+        while words and ASSIGNMENT.fullmatch(words[-1]):
+            words.pop()
+        if words[-2:] == ["/usr/bin/env", "-i"]:
+            del words[-2:]
+    head = words[-1] if words else ""
+    if head in COMMAND_START or head.endswith((";", "$(", "(")):
+        return dispatched, None
+    return dispatched, "host interpreter runs behind a command the audit does not recognise"
+
+
+def audit(text):
+    findings, counts = [], {"host": 0, "container": 0, "inert": 0}
+    scope, scoped = "", []
+    for number, line in logical_lines(text):
+        opened = FUNCTION.match(line)
+        if opened:
+            scope = opened.group(1)
+        if not line.lstrip().startswith("#"):
+            scoped.append((scope, number, line))
+        if line.startswith("}"):
+            scope = ""
+
+    def report(number, line, message):
+        findings.append(f"{number}: {message}: {line.strip()[:120]}")
+
+    # The dispatcher name is trusted only when its one definition is the installed path.
+    defined, used = [], []
+    for scope, number, line in scoped:
+        if "HOST_DISPATCH" not in line:
+            continue
+        rest = line.replace(DISPATCH, "")
+        if "HOST_DISPATCH" in rest:
+            defined.append((scope, number, line))
+        if DISPATCH in line:
+            used.append((number, line))
+    bound = len(defined) == 1 and defined[0][0] == "" and defined[0][2].strip() == BINDING
+    if (defined or used) and not bound:
+        number, line = (defined[0][1:] if defined else used[0])
+        report(number, line, "dispatcher is not bound once, read-only, to its installed path")
+    approved = re.compile(re.escape(f"{DISPATCH_PATH} {DISPATCH} {INTERPRETER} ") + ISOLATED + r"(\s|$)")
+    for number, line in used:
+        if len(approved.findall(line)) != line.count(DISPATCH):
+            report(number, line, "dispatcher is used for something other than an isolated host Python call")
+
+    for scope, number, line in scoped:
+        for mention in MENTION.finditer(line):
+            begin = mention.start()
+            while begin > 0 and line[begin - 1] not in WORD_BREAK:
+                begin -= 1
+            word, before, after = line[begin:mention.end()], line[:begin], line[mention.end():]
+            if not NAME.fullmatch(word.rsplit("/", 1)[-1]):
+                continue  # a longer name that only contains the word, such as a function
+            if after[:1] in (":", "@"):
+                counts["inert"] += 1  # image reference
+            elif word == "python3" and after.startswith(" >= "):
+                counts["inert"] += 1  # version requirement in a message
+            elif word == "python3" and re.search(r"\bapk add(\s+[\w.+-]+)*\s*$", before):
+                counts["inert"] += 1  # package name
+            elif before.endswith('ENTRYPOINT ["'):
+                if word == "python3" and re.match(r'", "' + ISOLATED + '"', after):
+                    counts["container"] += 1
+                else:
+                    report(number, line, "container entry point is not isolated")
+            elif re.search(r"--entrypoint\s+$", before):
+                if word == "python3" and re.match(r'\s+"\$\w+"\s+' + ISOLATED + r"(\s|$)", after):
+                    counts["container"] += 1
+                else:
+                    report(number, line, "container entry point is not isolated")
+            elif re.search(r"\w=\([^()]*$", before):
+                report(number, line, "interpreter is held in an array instead of being invoked directly")
+            elif word != INTERPRETER:
+                report(number, line, "interpreter is not named by its system path")
+            elif not re.match(r"\s+" + ISOLATED + r"(\s|$)", after):
+                report(number, line, "host interpreter is not isolated where it is invoked")
+            else:
+                dispatched, problem = command_prefix(before)
+                if problem:
+                    report(number, line, problem)
+                elif dispatched and not bound:
+                    pass  # already reported with the binding
+                else:
+                    counts["host"] += 1
+    return findings, counts
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("usage: host-python-audit FILE", file=sys.stderr)
+        return 2
+    try:
+        with open(sys.argv[1], encoding="utf-8") as source:
+            text = source.read()
+    except (OSError, UnicodeError) as error:
+        print(f"audit could not read its input: {error}", file=sys.stderr)
+        return 2
+    findings, counts = audit(text)
+    if findings:
+        print("\n".join(findings))
+        return 1
+    if not counts["host"] and not counts["container"]:
+        print("audit found no interpreter invocation and cannot vouch for this file", file=sys.stderr)
+        return 2
+    print(" ".join(f"{kind}={count}" for kind, count in counts.items()))
+    return 0
+
+
+sys.exit(main())
+PYCODE
+audit_rc() {  # FILE -> exit status of the audit: 0 clean, 1 findings, 2 the audit itself failed
+  local rc=0
+  /usr/bin/python3 -I "$T/host-python-audit.py" "$1" >"$T/audit.out" 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+rc=$(audit_rc "$SCRIPT")
+check "every launcher Python call is isolated and uses the system interpreter" test "$rc" = 0
+[[ $rc == 0 ]] || sed 's/^/        /' "$T/audit.out"
+check "the audit recognised host calls and container entry points in the launcher" \
+  grep -Eq '^host=[1-9][0-9]* container=[1-9][0-9]* ' "$T/audit.out"
+# Inert fixtures: each file is source text for the audit and is never executed.
+audit_fixture() {  # name, expected status; the fixture text is on stdin
+  local name=$1 expected=$2 rc
+  cat > "$T/fixture-$name.sh"
+  rc=$(audit_rc "$T/fixture-$name.sh")
+  check "audit fixture $name gives status $expected" test "$rc" = "$expected"
+  [[ $rc == "$expected" ]] || sed 's/^/        /' "$T/audit.out"
+}
+audit_fixture accepted-forms 0 <<'EOF'
+readonly HOST_DISPATCH=/usr/bin/distrobox-host-exec
+/usr/bin/python3 -I -c 'pass'
+exec /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/python3 -IB "$helper" "$@"
+host_python() {
+  if (( ${#H[@]} )); then
+    PATH=/usr/bin:/bin "$HOST_DISPATCH" /usr/bin/python3 -I "$@"
+  else
+    /usr/bin/python3 -I "$@"
+  fi
+}
+value=$(/usr/bin/python3 -I -c 'pass')
+safe_run --entrypoint python3 "$AGENT_IMG" \
+  -I -c "$PROGRAM"
+ENTRYPOINT ["python3", "-I", "/usr/local/bin/tool"]
+RUN apk add --no-cache git python3 py3-pip
+FROM docker.io/library/python:3.12-alpine
+EOF
+audit_fixture inline-through-path 1 <<'EOF'
+python3 -I -c 'pass'
+EOF
+audit_fixture inline-not-isolated 1 <<'EOF'
+/usr/bin/python3 -c 'pass'
+EOF
+audit_fixture option-group-not-isolating 1 <<'EOF'
+/usr/bin/python3 -cI 'pass'
+EOF
+audit_fixture option-group-unsupported 1 <<'EOF'
+/usr/bin/python3 -BI "$helper"
+EOF
+audit_fixture direct-script-through-path 1 <<'EOF'
+python3 "$helper" "$state"
+EOF
+audit_fixture direct-script-not-isolated 1 <<'EOF'
+/usr/bin/python3 "$helper" "$state"
+EOF
+audit_fixture array-through-path 1 <<'EOF'
+probe() {
+  local command=(python3)
+  "${command[@]}" -I - "$1"
+}
+EOF
+audit_fixture array-system-interpreter 1 <<'EOF'
+probe() {
+  local command=(/usr/bin/python3)
+  "${command[@]}" -I - "$1"
+}
+EOF
+audit_fixture scalar-interpreter 1 <<'EOF'
+interpreter=python3
+"$interpreter" -I "$helper"
+EOF
+audit_fixture dispatcher-from-search-path 1 <<'EOF'
+"${H[@]}" /usr/bin/python3 -I - "$1"
+EOF
+audit_fixture dispatcher-named-inline 1 <<'EOF'
+distrobox-host-exec /usr/bin/python3 -I - "$1"
+EOF
+audit_fixture dispatcher-unbound 1 <<'EOF'
+PATH=/usr/bin:/bin "$HOST_DISPATCH" /usr/bin/python3 -I "$@"
+EOF
+audit_fixture dispatcher-bound-elsewhere 1 <<'EOF'
+readonly HOST_DISPATCH=/opt/tools/distrobox-host-exec
+PATH=/usr/bin:/bin "$HOST_DISPATCH" /usr/bin/python3 -I "$@"
+EOF
+audit_fixture dispatcher-rebound 1 <<'EOF'
+readonly HOST_DISPATCH=/usr/bin/distrobox-host-exec
+HOST_DISPATCH=$(command -v distrobox-host-exec)
+PATH=/usr/bin:/bin "$HOST_DISPATCH" /usr/bin/python3 -I "$@"
+EOF
+audit_fixture dispatcher-open-search-path 1 <<'EOF'
+readonly HOST_DISPATCH=/usr/bin/distrobox-host-exec
+"$HOST_DISPATCH" /usr/bin/python3 -I "$@"
+EOF
+audit_fixture dispatcher-other-command 1 <<'EOF'
+readonly HOST_DISPATCH=/usr/bin/distrobox-host-exec
+PATH=/usr/bin:/bin "$HOST_DISPATCH" /usr/bin/python3 -I "$@"
+PATH=/usr/bin:/bin "$HOST_DISPATCH" podman ps
+EOF
+audit_fixture container-not-isolated 1 <<'EOF'
+safe_run --entrypoint python3 "$AGENT_IMG" -c "$PROGRAM"
+EOF
+audit_fixture no-interpreter 2 <<'EOF'
+printf 'nothing to audit\n'
+EOF
+rc=$(audit_rc "$T/fixture-missing.sh")
+check "audit fails when it cannot read its input" test "$rc" = 2
+
+# Host Python has one route to the host: host_python. In a distrobox it must run the dispatcher named
+# by HOST_DISPATCH with a fixed search path, because the real dispatcher finds its transport through
+# PATH. Nothing may come from the caller's PATH. The PATH stand-ins record that they ran; the stand-in
+# dispatcher records the search path and arguments it was given and then runs the arguments.
+mkdir "$T/probe-path"
+for tool in python3 distrobox-host-exec host-spawn; do
+  printf '#!/usr/bin/bash\nprintf "%s\\n" >>"$OC_TEST_CANARY"\nexit 1\n' "$tool" > "$T/probe-path/$tool"
+  chmod +x "$T/probe-path/$tool"
+done
+printf '#!/usr/bin/bash\nprintf "%%s|%%s\\n" "$PATH" "$*" >>"$OC_TEST_DISPATCHED"\nexec "$@"\n' > "$T/probe-dispatch"
+chmod +x "$T/probe-dispatch"
+{
+  printf 'set -u\nH=()\nif [[ $1 == distrobox ]]; then H=(distrobox-host-exec); fi\nHOST_DISPATCH=%q\n' "$T/probe-dispatch"
+  printf 'STATE=%q BUILD=%q POLDIR=%q BRIDGE_STAGE=%q BIN=%q UNITS=%q INSTALL_DIR=%q\n' \
+    "$T/probe-state" "$T/probe-state" "$T/probe-state" "$T/probe-state" "$T/probe-state" "$T/probe-state" "$T/probe-state"
+  fn host_python
+  fn validate_host_state
+  # shellcheck disable=SC2016  # expanded by the generated script
+  printf 'case $2 in\n  probe) host_python -c "import sys; sys.exit(sys.version_info < (3, 11))" ;;\n'
+  # shellcheck disable=SC2016
+  printf '  state) validate_host_state host "$3" >/dev/null ;;\nesac\n'
+} > "$T/probe.sh"
+mkdir -m 700 "$T/probe-state"
+host_python_rc() {  # local|distrobox probe|state -> exit status under a hostile PATH
+  local rc=0
+  rm -f "$T/probe-canary" "$T/probe-dispatched"
+  PATH="$T/probe-path:$PATH" OC_TEST_CANARY="$T/probe-canary" OC_TEST_DISPATCHED="$T/probe-dispatched" \
+    bash "$T/probe.sh" "$1" "$2" "$T/probe-state" >/dev/null 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+rc=$(host_python_rc local probe)
+check "bridge probe uses the system interpreter, not PATH" \
+  bash -c '[[ $1 == 0 && ! -e $2 && ! -e $3 ]]' _ "$rc" "$T/probe-canary" "$T/probe-dispatched"
+rc=$(host_python_rc distrobox probe)
+check "bridge probe reaches the host through HOST_DISPATCH with a fixed search path" \
+  bash -c '[[ $1 == 0 && ! -e $2 && $(cat "$3" 2>/dev/null) == "/usr/bin:/bin|/usr/bin/python3 -I -c "* ]]' \
+  _ "$rc" "$T/probe-canary" "$T/probe-dispatched"
+rc=$(host_python_rc local state)
+check "host-state validation uses the system interpreter, not PATH" \
+  bash -c '[[ $1 == 0 && ! -e $2 && ! -e $3 ]]' _ "$rc" "$T/probe-canary" "$T/probe-dispatched"
+rc=$(host_python_rc distrobox state)
+check "host-state validation reaches the host through HOST_DISPATCH with a fixed search path" \
+  bash -c '[[ $1 == 0 && ! -e $2 && $(cat "$3" 2>/dev/null) == "/usr/bin:/bin|/usr/bin/python3 -I - host "* ]]' \
+  _ "$rc" "$T/probe-canary" "$T/probe-dispatched"
+check "HOST_DISPATCH is the installed distrobox dispatcher" \
+  grep -qx 'readonly HOST_DISPATCH=/usr/bin/distrobox-host-exec' "$SCRIPT"
+
+# ================================================================================================
 echo "postgres.env parsing"
 cat > "$T/pg.env" <<EOF
 # comment line
@@ -815,11 +1125,22 @@ check "refuses empty -i (no global -d)"    argfail "-i needs an instance name" -
 
 echo "host state outside the sandbox (stubbed)"
 # The agent controls everything under $SB; host state (the image ledger above all) must not be there.
+# The launcher names the distrobox dispatcher for host Python by its installed path, so a stand-in on
+# PATH cannot replace it. Runs that model a distrobox use a scratch copy of the launcher that differs
+# only in that one binding, which points at the stand-in dispatcher.
+mkdir "$T/fixture-launcher"
+cp -r "$REPO"/oc-*.py "$REPO"/oc_*/ "$REPO/README.md" "$T/fixture-launcher/"
+sed "s|^readonly HOST_DISPATCH=/usr/bin/distrobox-host-exec\$|readonly HOST_DISPATCH=$T/stub/distrobox-host-exec|" \
+  "$SCRIPT" > "$T/fixture-launcher/oc-sandbox"
+chmod +x "$T/fixture-launcher/oc-sandbox"
+check "distrobox fixture launcher differs from the launcher only in the dispatcher binding" \
+  test "$(diff "$SCRIPT" "$T/fixture-launcher/oc-sandbox" | grep -c '^[<>]')" = 2
 pathrun() {  # VAR=value... -- script-args...: stderr+rc of a stubbed run with these variables
-  local envs=() rc=0 out next_setting=$1 default_binding=1 option
+  local envs=() rc=0 out next_setting=$1 default_binding=1 option launcher=$SCRIPT
   while [[ $next_setting != -- ]]; do
     envs+=("$next_setting")
     case $next_setting in HOME=*|XDG_DATA_HOME=*) default_binding=0 ;; esac
+    case $next_setting in CONTAINER_ID=*) launcher=$T/fixture-launcher/oc-sandbox ;; esac
     shift
     next_setting=$1
   done
@@ -829,7 +1150,7 @@ pathrun() {  # VAR=value... -- script-args...: stderr+rc of a stubbed run with t
   fi
   : > "$T/stub.log"
   out=$(env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$T/dhome" PATH="$T/stub:$PATH" "${envs[@]}" \
-        "$SCRIPT" "$@" 2>&1 </dev/null) || rc=$?
+        "$launcher" "$@" 2>&1 </dev/null) || rc=$?
   printf '%s\nrc=%s\n' "$out" "$rc"
 }
 DSB=$T/dhome/opencode-sandbox; mkdir -p "$DSB/st/oc-sandbox" "$T/outer/oc-sandbox/h"

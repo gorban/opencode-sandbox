@@ -75,7 +75,7 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 
 | PRD | Grouping | Status |
 |---|---|---|
-| [prd_a](prd_a.md) | Postgres reachable from the host (`-P 5432`, `-P 5433:5432`) | implemented; external static review complete; human review passed |
+| [prd_a](prd_a.md) | Postgres reachable from the host (`-P 5432`, `-P 5433:5432`) | implemented; reopened for a host Python isolation fix (external and human review pending) |
 | [prd_b](prd_b.md) | OpenCode upgrades ready before launch; no drop to the host shell | pre-launch slice human-approved; in-app restart and final review open |
 | [prd_c](prd_c.md) | Worktree defaults: current repo, `wt/<repo>/NAME`, relaunch | implemented; external static review complete; human review passed |
 | [prd_d](prd_d.md) | Per-instance address and DNS name (no port mapping needed) | forwarding feasibility measured; implementation open |
