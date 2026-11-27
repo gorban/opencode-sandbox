@@ -244,6 +244,36 @@ class CallbackGateTest(unittest.TestCase):
                 self.assertEqual(gate.take_forwarded(), auth.Callback(STATE, CODE))
                 self.assert_no_native_bytes(recorder)
 
+    def test_sec_gpc_is_ignored_and_preserves_only_canonical_state_and_code(self):
+        for value in (b"1", b"fixture-ignored"):
+            with self.subTest(typical=value == b"1"), placement() as (gate, recorder, port):
+                header = b"SeC-gPc: " + value + b"\r\n"
+                browser = request(port, extra_query=OBSERVED_QUERY, extra_headers=header)
+                self.assertEqual(self.exchange(gate, port, browser), auth.acknowledgement(True))
+                recorder.settimeout(1)
+                self.assertEqual(recorder.recv(4096), request(port))
+                self.assertEqual(gate.take_forwarded(), auth.Callback(STATE, CODE))
+                self.assertIsNone(gate.take_forwarded())
+                self.assert_no_native_bytes(recorder)
+
+    def test_ambiguous_or_unapproved_gpc_headers_cancel_matching_callback(self):
+        hint = b"Sec-GPC: 1\r\n"
+        cases = {
+            "duplicate": hint + b"sEc-gPc: 1\r\n",
+            "control": b"Sec-GPC: \x001\r\n",
+            "non-ASCII": b"Sec-GPC: \xff\r\n",
+            "DNT": hint + b"DNT: 1\r\n",
+            "unknown": hint + b"X-Privacy-Option: 1\r\n",
+            "lookalike": b"Sec_GPC: 1\r\n",
+        }
+        for case, headers in cases.items():
+            with self.subTest(case=case), placement() as (gate, recorder, port):
+                browser = request(port, extra_query=OBSERVED_QUERY, extra_headers=headers)
+                self.assertEqual(self.exchange(gate, port, browser), auth.acknowledgement(False))
+                self.assertEqual(gate.outcome, auth.Outcome.CANCELLED)
+                self.assertIsNone(gate.take_forwarded())
+                self.assert_no_native_bytes(recorder)
+
     def test_chromium_client_hints_preserve_only_canonical_state_and_code(self):
         hints = (b'Sec-CH-UA: "Chromium";v="131", "Not_A Brand";v="24"\r\n'
                  b"Sec-CH-UA-Mobile: ?0\r\n"
