@@ -311,20 +311,20 @@ check "staged save symlink refused before write-back" grep -qx replaced "$SB/con
 make_session() {
   local session=$T/stage/$1 fixture_tool=$2 manifest_padding=$3
   mkdir -m 700 "$session"
-  mkdir -m 700 -p "$session/files/construct"
-  printf 'fixture\n' > "$session/files/construct/session.txt"
+  mkdir -m 700 -p "$session/files/1"
+  printf 'fixture\n' > "$session/files/1/session.txt"
   python3 -I - "$session" "$fixture_tool" "$manifest_padding" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 session = Path(sys.argv[1])
-staged = session / "files/construct/session.txt"
+staged = session / "files/1/session.txt"
 st = staged.stat()
-entry = {"kind": "file", "parts": ["construct", "session.txt"], "staged": str(staged),
+entry = {"kind": "file", "parts": ["construct", "session.txt"], "slot": 1,
          "mode": 0o600, "target": [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns],
          "seen": [st.st_ino, st.st_size, st.st_mtime_ns]}
-manifest = json.dumps({"tool": sys.argv[2], "entries": [entry]})
+manifest = json.dumps({"version": 2, "tool": sys.argv[2], "entries": [entry]})
 (session / "manifest.json").write_text(manifest + " " * int(sys.argv[3]), encoding="utf-8")
 PY
 }
@@ -345,7 +345,7 @@ reset_tool; make_session oversized code 262144
 check "oversized session manifest rejected before editor launch" session_refused oversized
 
 reset_tool; make_session non-regular code 0
-ln -sf -- "$T/staged-save-control" "$T/stage/non-regular/files/construct/session.txt"
+ln -sf -- "$T/staged-save-control" "$T/stage/non-regular/files/1/session.txt"
 check "non-regular staged input rejected before editor launch" session_refused non-regular
 
 mkdir "$SB/construct/save-recovery"
@@ -353,7 +353,7 @@ echo original > "$SB/construct/save-recovery/a.txt"; req 7 code /sandbox/constru
 FAKE_AGENT="mv '$SB/construct/save-recovery' '$SB/construct/recovery-original'" FAKE_EDIT=recover-me bridge
 retained_edit() {
   local path
-  for path in "$T/stage"/*/files/construct/save-recovery/a.txt; do
+  for path in "$T/stage"/*/files/1/a.txt; do
     if [[ -f $path ]] && grep -qx recover-me "$path"; then return 0; fi
   done
   return 1
@@ -392,7 +392,7 @@ class CopyTests(unittest.TestCase):
 
     def stage(self):
         session = Path(self.bridge["stage_request"]("code", ["/sandbox/edit.txt"]))
-        staged = session / "files/edit.txt"
+        staged = session / "files/1/edit.txt"
         self.assertEqual(staged.read_bytes(), base)
         return session, staged
 
@@ -628,6 +628,8 @@ unittest.main(argv=[sys.argv[0]])
 PY
 }
 check "bounded bridge copies preserve and retry incomplete saves" bridge_copy_regressions
+check "bridge isolates editor selections and filters staged metadata" \
+  timeout 20 python3 -IB "$REPO/tests/bridge-staging-isolated.py" "$BRIDGE"
 
 # race: a directory on the path flips between a real directory and a symlink to the host, as fast as
 # possible, while requests (with edits) are processed

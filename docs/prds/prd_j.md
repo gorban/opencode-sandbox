@@ -54,6 +54,11 @@ Git documents [merge tool selection](https://git-scm.com/docs/git-mergetool) and
 
 ## Review record
 
+- [x] Isolate selections in the existing host bridge's private stage and exclude repository and
+      editor metadata before giving paths to a desktop tool. Ordinary file saves still go back
+      to their recorded sandbox paths. Recover legacy staged files manually. Design review
+      cleared walkthrough `efbe9485bdd3f47a90f448d66eef15724c93d3a093831bd2b765bdbfc00d815c`
+      for `codex/audit-bridge-staging`.
 - `oc-sandbox reviewer` cleared the three-way design and tool selector at SHA-256
   `f302a6ba7f6db3845aaac1ccf9f74637885cd3108693f267577676788fa25c8b`.
 - Independent and external reviewers cleared the offline core at `98b86bf` and the
