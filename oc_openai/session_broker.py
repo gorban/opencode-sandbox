@@ -26,14 +26,23 @@ from oc_providers.catalog import (
     build_multi_provider_opencode_config,
     parse_provider_filter,
     plan_interactive_launch,
+    validate_opencode_config,
 )
-from oc_providers.config import load_provider_config
+from oc_providers.config import (
+    ProviderConfigError,
+    _account_home,
+    _check_dir_stat,
+    _inside_sandbox,
+    load_provider_config,
+)
 from oc_providers.contracts import (
     ProviderIntegrityError,
     RELAY_PORT_MAX,
     RELAY_PORT_MIN,
+    RelayMountPaths,
     SlotHandle,
 )
+from oc_providers.registry import default_session_adapters
 from .cli import Reason, RouteUnavailable, StreamTerminal, report_failure
 from .connection import ConnectionError
 from .exposure import ExposureError, ExposureLedger
@@ -834,12 +843,208 @@ def _verify_pod(spec: dict) -> str:
     return pod_id
 
 
-def _verify_relay_mounts(details: dict, job: _SessionJob) -> None:
+_VALID_SLOT_ROUTE_STATES = frozenset({"pending", "active", "retired"})
+_REQUIRED_CALLABLE_SLOT_HOOKS = (
+    "revoke_grant",
+    "close_broker",
+    "activate_route",
+    "route_state",
+    "is_revoked",
+    "has_active_clients",
+    "mark_relay_created",
+    "confirm_relay_removed",
+    "lease_release_confirmed",
+)
+
+
+def _is_legacy_openai_handle(handle: SlotHandle) -> bool:
+    if isinstance(handle.job, _SessionJob) and isinstance(handle.broker, SessionBroker):
+        return True
+    has_legacy_broker = hasattr(handle.broker, "close") and hasattr(handle.broker, "_revoked")
+    if isinstance(handle.job, _SessionJob) and has_legacy_broker:
+        return True
+    return (
+        handle.provider_label.startswith("openai/")
+        and hasattr(handle.job, "revoke")
+        and has_legacy_broker
+    )
+
+
+def _validate_relay_paths(paths: object, provider_label: str) -> RelayMountPaths:
+    if not isinstance(paths, RelayMountPaths):
+        raise ProviderIntegrityError(
+            "incomplete_slot_handle",
+            f"Slot handle for '{provider_label}' must provide RelayMountPaths.",
+        )
+    for field_name in ("source_dir", "provider_socket", "grant_dir", "proof_file"):
+        if not isinstance(getattr(paths, field_name), Path):
+            raise ProviderIntegrityError(
+                "incomplete_slot_handle",
+                f"Slot handle for '{provider_label}' has invalid relay path '{field_name}'.",
+            )
+    return paths
+
+
+def _validate_slot_handle(handle: SlotHandle) -> None:
+    if _is_legacy_openai_handle(handle):
+        if handle.relay_paths is not None:
+            _validate_relay_paths(handle.relay_paths, handle.provider_label)
+        return
+    _validate_relay_paths(handle.relay_paths, handle.provider_label)
+    for hook_name in _REQUIRED_CALLABLE_SLOT_HOOKS:
+        if not callable(getattr(handle, hook_name, None)):
+            raise ProviderIntegrityError(
+                "incomplete_slot_handle",
+                f"Slot handle for '{handle.provider_label}' is missing required hook '{hook_name}'.",
+            )
+
+
+def _slot_relay_paths(handle: SlotHandle) -> RelayMountPaths:
+    if handle.relay_paths is not None:
+        return _validate_relay_paths(handle.relay_paths, handle.provider_label)
+    if _is_legacy_openai_handle(handle) and hasattr(handle.job, "source_dir"):
+        return RelayMountPaths(
+            source_dir=handle.job.source_dir,
+            provider_socket=handle.job.provider_socket,
+            grant_dir=handle.job.grant,
+            proof_file=handle.job.proof_file,
+        )
+    raise ProviderIntegrityError(
+        "incomplete_slot_handle",
+        f"Slot handle for '{handle.provider_label}' is missing relay_paths.",
+    )
+
+
+def _slot_is_revoked(handle: SlotHandle) -> bool:
+    if handle.is_revoked is not None:
+        result = handle.is_revoked()
+        if type(result) is not bool:
+            raise ProviderIntegrityError("invalid_slot_hook", "Slot is_revoked hook must return bool.")
+        return result
+    if _is_legacy_openai_handle(handle):
+        return bool(handle.broker._revoked.is_set())
+    raise ProviderIntegrityError(
+        "incomplete_slot_handle",
+        f"Slot handle for '{handle.provider_label}' is missing is_revoked hook.",
+    )
+
+
+def _legacy_lease_route_state(lease) -> str:
+    if lease is None:
+        return "retired"
+    status = lease.status()
+    if status == "pending":
+        return "pending" if lease.deadline_ns > time.monotonic_ns() else "retired"
+    if status == "active":
+        return "active" if lease.active() else "retired"
+    return "retired"
+
+
+def _slot_route_state(handle: SlotHandle) -> str:
+    if handle.route_state is not None:
+        result = handle.route_state()
+        if type(result) is not str or result not in _VALID_SLOT_ROUTE_STATES:
+            raise ProviderIntegrityError("invalid_slot_hook", "Slot route_state hook returned invalid state.")
+        return result
+    if _is_legacy_openai_handle(handle):
+        return _legacy_lease_route_state(getattr(handle.job, "lease", None))
+    raise ProviderIntegrityError(
+        "incomplete_slot_handle",
+        f"Slot handle for '{handle.provider_label}' is missing route_state hook.",
+    )
+
+
+def _slot_has_active_clients(handle: SlotHandle) -> bool:
+    if handle.has_active_clients is not None:
+        result = handle.has_active_clients()
+        if type(result) is not bool:
+            raise ProviderIntegrityError("invalid_slot_hook", "Slot has_active_clients hook must return bool.")
+        return result
+    if _is_legacy_openai_handle(handle):
+        if isinstance(handle.broker, SessionBroker):
+            with handle.broker._lock:
+                return bool(handle.broker._clients)
+        return False
+    raise ProviderIntegrityError(
+        "incomplete_slot_handle",
+        f"Slot handle for '{handle.provider_label}' is missing has_active_clients hook.",
+    )
+
+
+def _slot_revoke_grant(handle: SlotHandle) -> None:
+    if handle.revoke_grant is not None:
+        handle.revoke_grant()
+        return
+    if _is_legacy_openai_handle(handle):
+        handle.job.revoke()
+        return
+    raise ProviderIntegrityError(
+        "incomplete_slot_handle",
+        f"Slot handle for '{handle.provider_label}' is missing revoke_grant hook.",
+    )
+
+
+def _slot_close_broker(handle: SlotHandle) -> None:
+    if handle.close_broker is not None:
+        handle.close_broker()
+        return
+    if _is_legacy_openai_handle(handle):
+        handle.broker.close()
+        return
+    raise ProviderIntegrityError(
+        "incomplete_slot_handle",
+        f"Slot handle for '{handle.provider_label}' is missing close_broker hook.",
+    )
+
+
+def _slot_activate_route(handle: SlotHandle) -> None:
+    if handle.activate_route is not None:
+        handle.activate_route()
+        return
+    if _is_legacy_openai_handle(handle):
+        handle.job.activate()
+        return
+    raise ProviderIntegrityError(
+        "incomplete_slot_handle",
+        f"Slot handle for '{handle.provider_label}' is missing activate_route hook.",
+    )
+
+
+def _slot_lease_release_confirmed(handle: SlotHandle) -> bool:
+    checker = handle.lease_release_confirmed
+    if checker is not None:
+        result = checker()
+        if type(result) is not bool:
+            raise ProviderIntegrityError(
+                "invalid_slot_hook", "Slot lease_release_confirmed hook must return bool.",
+            )
+        return result
+    if _is_legacy_openai_handle(handle):
+        return True
+    raise ProviderIntegrityError(
+        "incomplete_slot_handle",
+        f"Slot handle for '{handle.provider_label}' is missing lease_release_confirmed hook.",
+    )
+
+
+def _extract_mount_paths(job_or_paths: _SessionJob | RelayMountPaths) -> RelayMountPaths:
+    if isinstance(job_or_paths, RelayMountPaths):
+        return job_or_paths
+    return RelayMountPaths(
+        source_dir=job_or_paths.source_dir,
+        provider_socket=job_or_paths.provider_socket,
+        grant_dir=job_or_paths.grant,
+        proof_file=job_or_paths.proof_file,
+    )
+
+
+def _verify_relay_mounts(details: dict, job: _SessionJob | RelayMountPaths) -> None:
+    paths = _extract_mount_paths(job)
     expected = {
-        "/source": job.source_dir,
-        "/provider": job.provider_socket.parent,
-        "/grant": job.grant,
-        "/proof": job.proof_file.parent,
+        "/source": paths.source_dir,
+        "/provider": paths.provider_socket.parent,
+        "/grant": paths.grant_dir,
+        "/proof": paths.proof_file.parent,
     }
     actual_mounts = details.get("Mounts") or []
     if len(actual_mounts) != len(expected) or {m.get("Destination") for m in actual_mounts} != set(expected):
@@ -854,19 +1059,20 @@ def _verify_relay_mounts(details: dict, job: _SessionJob) -> None:
             raise RuntimeError("Relay bind mount failed verification")
 
 
-def _verify_relay_labels(relay_id: str, details: dict, job: _SessionJob) -> None:
+def _verify_relay_labels(relay_id: str, details: dict, job: _SessionJob | RelayMountPaths) -> None:
     expected_proc = (details.get("ProcessLabel") or "").encode("ascii")
     effective_proc = podman("exec", relay_id, "cat", "/proc/self/attr/current").stdout.removesuffix(b"\0")
     if effective_proc != expected_proc:
         raise RuntimeError("Unexpected effective relay SELinux process label")
     expected_mount = (details.get("MountLabel") or "").encode("ascii")
+    mount_paths = _extract_mount_paths(job)
     paths = (
-        job.source_dir,
-        job.provider_socket.parent,
-        job.provider_socket,
-        job.grant,
-        job.proof_file.parent,
-        job.proof_file,
+        mount_paths.source_dir,
+        mount_paths.provider_socket.parent,
+        mount_paths.provider_socket,
+        mount_paths.grant_dir,
+        mount_paths.proof_file.parent,
+        mount_paths.proof_file,
     )
     for path in paths:
         label = host_output("getfattr", "--only-values", "-n", "security.selinux", "--", str(path)).removesuffix(b"\0")
@@ -900,22 +1106,42 @@ def _verify_sibling_mcs(other_containers: list[str], relay_mcs: set[int]) -> Non
             raise RuntimeError(f"Relay MCS collided with sibling container {name}")
 
 
+def _valid_relay_security_opt(sec_opt: object, expected_level: str) -> bool:
+    if type(sec_opt) is not list or not all(type(item) is str for item in sec_opt):
+        return False
+    if sec_opt == ["no-new-privileges"]:
+        return True
+    return len(sec_opt) == 2 and set(sec_opt) == {"no-new-privileges", f"label=level:{expected_level}"}
+
+
+def _random_relay_mcs_level(forbidden_level: str) -> str:
+    forbidden_match = _LEVEL_RE.fullmatch(forbidden_level or "")
+    forbidden_pair = set(map(int, forbidden_match.groups())) if forbidden_match else set()
+    rng = secrets.SystemRandom()
+    while True:
+        first, second = sorted(rng.sample(range(1024), 2))
+        if {first, second} != forbidden_pair:
+            return f"s0:c{first},c{second}"
+
+
 def _verify_relay_isolation(relay_id: str, relay_image: str, pod_id: str, agent_level: str,
-                            job: _SessionJob, other_containers: list[str]) -> None:
+                            job: _SessionJob | RelayMountPaths, other_containers: list[str]) -> None:
     details = inspected("container", "inspect", relay_id)
     host = details["HostConfig"]
     config = details["Config"]
     relay_mcs = _mcs_pair(details.get("ProcessLabel") or "")
     mount_label = details.get("MountLabel") or ""
+    relay_level = (details.get("ProcessLabel") or "").split(":", 3)[-1]
     if (not relay_mcs
             or not MOUNT_LABEL.fullmatch(mount_label)
-            or (details.get("ProcessLabel") or "").split(":", 3)[-1] != mount_label.split(":", 3)[-1]
+            or relay_level != mount_label.split(":", 3)[-1]
             or details.get("Pod") != pod_id
             or details.get("Image", "").removeprefix("sha256:") != relay_image.removeprefix("sha256:")
             or not host.get("ReadonlyRootfs") or host.get("Privileged")
             or host.get("IpcMode") != "private" or host.get("PidMode") != "private"
             or host.get("CgroupMode") != "private" or config.get("User") != "0:0"
-            or details.get("EffectiveCaps") or host.get("SecurityOpt") != ["no-new-privileges"]):
+            or details.get("EffectiveCaps")
+            or not _valid_relay_security_opt(host.get("SecurityOpt"), relay_level)):
         raise RuntimeError("Relay container failed isolation verification")
     agent_match = _LEVEL_RE.fullmatch(agent_level)
     if not agent_match or set(map(int, agent_match.groups())) == relay_mcs:
@@ -932,9 +1158,64 @@ def _remove_container_verified(container_id: str) -> None:
         raise RuntimeError(f"Could not confirm container removal ({container_id[:12]})")
 
 
+def _normalize_lock_root(state_dir: Path) -> Path:
+    path = Path(state_dir)
+    if not path.is_absolute():
+        raise RuntimeError("Session lock directory must be absolute")
+    parts = [part for part in path.parts[1:] if part]
+    if not parts or any(part in (".", "..") for part in parts):
+        raise RuntimeError("Session lock directory is not normalized")
+    if parts[0] == "home":
+        home_path = Path("/home")
+        var_home = Path("/var/home")
+        try:
+            home_stat = os.lstat(home_path)
+            if stat.S_ISLNK(home_stat.st_mode) and home_stat.st_uid == 0 and home_path.resolve(strict=True) == var_home:
+                vh_stat = os.lstat(var_home)
+                if stat.S_ISDIR(vh_stat.st_mode) and vh_stat.st_uid == 0:
+                    return var_home.joinpath(*parts[1:])
+        except OSError:
+            raise RuntimeError("Untrusted session lock directory") from None
+    return Path("/", *parts)
+
+
+def _open_lock_parent_fd(state_dir: Path) -> int:
+    target = _normalize_lock_root(state_dir)
+    uid = os.geteuid()
+    try:
+        sandbox = _account_home() / "opencode-sandbox"
+    except ProviderConfigError as exc:
+        raise RuntimeError(f"Untrusted account home for session lock: {exc}") from None
+    parts = [part for part in target.parts[1:] if part]
+    dir_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    current = Path("/")
+    try:
+        for index, part in enumerate(parts):
+            current = current / part
+            is_last = index == len(parts) - 1
+            if _inside_sandbox(current, sandbox, check_contains=is_last):
+                raise RuntimeError("Session lock directory overlaps agent sandbox")
+            next_fd = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd,
+            )
+            os.close(dir_fd)
+            dir_fd = next_fd
+            try:
+                _check_dir_stat(os.fstat(dir_fd), current=current, is_target=is_last, uid=uid)
+            except ProviderConfigError:
+                raise RuntimeError("Untrusted session lock directory") from None
+        return dir_fd
+    except BaseException:
+        os.close(dir_fd)
+        raise
+
+
 def _open_instance_lock(state_dir: Path, instance: str):
     """Acquire an exclusive per-instance launch lock under the private OpenAI state dir."""
-    parent_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    if type(instance) is not str or not _INSTANCE_NAME.fullmatch(instance):
+        raise RuntimeError("Malformed instance name for session lock")
+    uid = os.geteuid()
+    parent_fd = _open_lock_parent_fd(state_dir)
     try:
         try:
             os.mkdir("sessions", 0o700, dir_fd=parent_fd)
@@ -943,16 +1224,26 @@ def _open_instance_lock(state_dir: Path, instance: str):
         sess_fd = os.open("sessions", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
         try:
             sinfo = os.fstat(sess_fd)
-            if sinfo.st_uid != os.getuid() or sinfo.st_mode & 0o077:
+            if sinfo.st_uid != uid or sinfo.st_mode & 0o077:
                 raise RuntimeError("Untrusted session lock directory")
+            lock_name = f"{instance}.lock"
             lock_fd = os.open(
-                f"{instance}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=sess_fd
+                lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=sess_fd
             )
             try:
                 linfo = os.fstat(lock_fd)
-                if not stat.S_ISREG(linfo.st_mode) or linfo.st_uid != os.getuid() or linfo.st_mode & 0o077:
+                if (
+                    not stat.S_ISREG(linfo.st_mode)
+                    or linfo.st_uid != uid
+                    or linfo.st_mode & 0o077
+                    or linfo.st_nlink != 1
+                ):
                     raise RuntimeError("Untrusted session lock file")
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                post_fd = os.fstat(lock_fd)
+                post_path = os.stat(lock_name, dir_fd=sess_fd, follow_symlinks=False)
+                if not os.path.samestat(post_fd, post_path) or post_fd.st_nlink != 1:
+                    raise RuntimeError("Session lock file changed during acquisition")
             except BaseException:
                 os.close(lock_fd)
                 raise
@@ -1157,6 +1448,7 @@ def _build_relay_args(
     if slot_index is None:
         relay_name = relay_name_override or spec["relay"]
         role_labels = ["--label", "oc.role=openai-relay"]
+        mcs_args: list[str] = []
         port_args: list[str] = [str(port), "--defer-bind"] if defer_bind else []
     else:
         relay_name = relay_name_override or f"{spec['pod']}-relay-{slot_index}"
@@ -1165,6 +1457,7 @@ def _build_relay_args(
             "--label", f"oc.provider-slot={slot_index}",
             "--label", f"oc.provider={provider_label}",
         ]
+        mcs_args = ["--security-opt", f"label=level:{_random_relay_mcs_level(spec.get('level', ''))}"]
         port_args = [str(port), "--defer-bind"] if defer_bind else [str(port)]
     return [
         "create", "--pull=never", "--name", relay_name, "--pod", spec["pod"],
@@ -1172,7 +1465,7 @@ def _build_relay_args(
         *role_labels,
         "--http-proxy=false", "--image-volume=ignore", "--log-driver=none", "--restart=no",
         "--user=0:0", "--ipc=private", "--pid=private", "--cgroupns=private",
-        "--cap-drop=ALL", "--security-opt=no-new-privileges",
+        "--cap-drop=ALL", "--security-opt=no-new-privileges", *mcs_args,
         "--read-only", "--pids-limit=64", "--memory=128m", "--memory-swap=128m",
         "-v", f"{job.source_dir}:/source:ro,Z,nosuid,nodev,noexec",
         "-v", f"{job.provider_socket.parent}:/provider:ro,Z,nosuid,nodev,noexec",
@@ -1279,8 +1572,15 @@ class _SlotState:
         self.slot_root = slot_root
         self.relay_id: str | None = None
         self.creating_relay = False
+        self.create_unconfirmed = False
         self.retiring = False
         self.retired = False
+        self.retire_owner_active = False
+        self.retire_timed_out = False
+        self.grant_revoked = False
+        self.broker_closed = False
+        self.revoke_or_close_failed = False
+        self.release_gate_opened = False
         self.exited = False
         self.lease_confirmed_released = False
 
@@ -1299,6 +1599,7 @@ class _SessionSlotCoordinator:
         self._created_containers: list[str] = []
         self._removed_containers: set[str] = set()
         self._retire_threads: list[threading.Thread] = []
+        self._retire_thread_slots: dict[threading.Thread, int] = {}
         self._cleanup_error: Exception | None = None
 
     def _close_slot_root_fd(self, slot_root: Path) -> None:
@@ -1332,13 +1633,26 @@ class _SessionSlotCoordinator:
                 self._slot_root_fds[slot_root] = (parent_fd, fd)
 
     def register_slot(self, slot_cm, handle: SlotHandle, slot_root: Path | None = None) -> _SlotState:
-        resolved_root = slot_root if slot_root is not None else handle.job.root
+        if slot_root is not None:
+            resolved_root = slot_root
+        elif _is_legacy_openai_handle(handle):
+            resolved_root = handle.job.root
+        else:
+            raise ProviderIntegrityError(
+                "incomplete_slot_handle",
+                f"Slot handle for '{handle.provider_label}' requires explicit slot_root.",
+            )
         state = _SlotState(slot_cm, handle, resolved_root)
+        try:
+            already_revoked = _slot_is_revoked(handle)
+        except Exception as exc:
+            self._record_error(exc)
+            already_revoked = True
         should_revoke = False
         with self._lock:
             self._slots[handle.slot_index] = state
             self._remember_slot_root_locked(resolved_root)
-            if handle.slot_index in self._pre_revoked or handle.broker._revoked.is_set():
+            if handle.slot_index in self._pre_revoked or already_revoked:
                 self._pre_revoked.discard(handle.slot_index)
                 should_revoke = True
         if should_revoke:
@@ -1405,6 +1719,7 @@ class _SessionSlotCoordinator:
                 if state.handle.mark_relay_created is not None:
                     state.handle.mark_relay_created()
                 return not state.retiring
+            state.create_unconfirmed = True
             if self._cleanup_error is None:
                 self._cleanup_error = RuntimeError(
                     "Podman relay create did not complete with a verified container ID"
@@ -1436,8 +1751,12 @@ class _SessionSlotCoordinator:
         except Exception as exc:
             self._record_error(exc)
             return
-        checker = state.handle.lease_release_confirmed
-        if checker is not None and not checker():
+        try:
+            confirmed = _slot_lease_release_confirmed(state.handle)
+        except Exception as exc:
+            self._record_error(exc)
+            return
+        if not confirmed:
             self._record_error(
                 RuntimeError("Slot lease release was not confirmed in the connection store")
             )
@@ -1445,42 +1764,142 @@ class _SessionSlotCoordinator:
         with self._lock:
             state.lease_confirmed_released = True
 
-    def _finish_slot_retirement(self, state: _SlotState) -> None:
-        try:
-            state.handle.job.revoke()
-        except Exception as exc:
-            self._record_error(exc)
-        try:
-            state.handle.broker.close()
-        except Exception as exc:
-            self._record_error(exc)
+    def _claim_retire_ownership(self, state: _SlotState) -> tuple[bool, bool, str | None]:
+        """Return (already_done, claimed, fallback_relay_id_to_remove)."""
+        with self._lock:
+            if state.exited and state.lease_confirmed_released:
+                return True, False, None
+            if state.retire_owner_active or state.retire_timed_out:
+                state.retire_timed_out = True
+                rid = state.relay_id
+                fallback_rid = rid if (rid is not None and rid not in self._removed_containers) else None
+                return False, False, fallback_rid
+            state.retire_owner_active = True
+            return False, True, None
+
+    def _revoke_and_close_slot(self, state: _SlotState) -> None:
+        with self._lock:
+            need_revoke = not state.grant_revoked
+            need_close = not state.broker_closed
+        if need_revoke:
+            try:
+                _slot_revoke_grant(state.handle)
+                with self._lock:
+                    state.grant_revoked = True
+            except Exception as exc:
+                with self._lock:
+                    state.revoke_or_close_failed = True
+                self._record_error(exc)
+        if need_close:
+            try:
+                _slot_close_broker(state.handle)
+                with self._lock:
+                    state.broker_closed = True
+            except Exception as exc:
+                with self._lock:
+                    state.revoke_or_close_failed = True
+                self._record_error(exc)
+
+    def _remove_slot_relay_if_needed(self, state: _SlotState) -> bool:
         with self._lock:
             relay_id = state.relay_id
             creating = state.creating_relay
+            already_removed = relay_id in self._removed_containers if relay_id is not None else True
         if creating and relay_id is None:
-            # Relay creation is still in flight; retain the durable lease until creation finishes and is cleaned up.
-            return
-        relay_removed = True
-        if relay_id is not None:
+            return False
+        if relay_id is not None and not already_removed:
             try:
                 _remove_container_verified(relay_id)
                 with self._lock:
                     self._removed_containers.add(relay_id)
-                if state.handle.confirm_relay_removed is not None:
-                    state.handle.confirm_relay_removed()
             except Exception as exc:
-                relay_removed = False
                 self._record_error(exc)
-        if not relay_removed:
-            # Retain the session lease on disk when relay container removal cannot be confirmed.
+        return True
+
+    def _check_broker_quiescent(self, state: _SlotState) -> bool:
+        try:
+            has_clients = _slot_has_active_clients(state.handle)
+        except Exception as exc:
+            self._record_error(exc)
+            return False
+        if has_clients:
+            self._record_error(RuntimeError("Slot broker still has active clients during teardown"))
+            return False
+        return True
+
+    def _can_release_slot_locked(self, state: _SlotState, *, broker_quiescent: bool) -> bool:
+        relay_gone = state.relay_id is None or state.relay_id in self._removed_containers
+        return (
+            not state.creating_relay
+            and not state.create_unconfirmed
+            and not state.retire_timed_out
+            and state.grant_revoked
+            and state.broker_closed
+            and not state.revoke_or_close_failed
+            and broker_quiescent
+            and relay_gone
+        )
+
+    def _remove_timed_out_fallback_relay(self, fallback_rid: str | None, *, remove_relay_if_timed_out: bool) -> None:
+        self._record_error(RuntimeError("Slot retirement worker is still active"))
+        if not remove_relay_if_timed_out or fallback_rid is None:
             return
-        with self._lock:
-            should_exit = not state.exited
-            state.exited = True
+        try:
+            _remove_container_verified(fallback_rid)
+            with self._lock:
+                self._removed_containers.add(fallback_rid)
+        except Exception as exc:
+            self._record_error(exc)
+
+    def _complete_slot_release(self, state: _SlotState, *, open_confirm_relay: bool, should_exit: bool) -> None:
+        if open_confirm_relay and state.handle.confirm_relay_removed is not None:
+            try:
+                state.handle.confirm_relay_removed()
+            except Exception as exc:
+                self._record_error(exc)
+                return
         if should_exit:
             self._exit_slot_lease(state)
         with self._lock:
-            state.retired = True
+            if state.lease_confirmed_released:
+                state.retired = True
+
+    def _try_release_slot_lease(self, state: _SlotState, *, remove_relay_if_timed_out: bool = False) -> None:
+        done, claimed, fallback_rid = self._claim_retire_ownership(state)
+        if done:
+            return
+        if not claimed:
+            self._remove_timed_out_fallback_relay(
+                fallback_rid, remove_relay_if_timed_out=remove_relay_if_timed_out,
+            )
+            return
+        try:
+            self._revoke_and_close_slot(state)
+            if not self._remove_slot_relay_if_needed(state):
+                return
+            broker_quiescent = self._check_broker_quiescent(state)
+            open_confirm_relay = False
+            should_exit = False
+            with self._lock:
+                can_release = self._can_release_slot_locked(state, broker_quiescent=broker_quiescent)
+                if can_release and not state.exited:
+                    if state.relay_id is not None and not state.release_gate_opened:
+                        state.release_gate_opened = True
+                        open_confirm_relay = True
+                    state.exited = True
+                    should_exit = True
+            if not can_release:
+                self._record_error(RuntimeError("Slot release invariants were not satisfied during teardown"))
+                return
+            self._complete_slot_release(
+                state, open_confirm_relay=open_confirm_relay, should_exit=should_exit,
+            )
+        finally:
+            with self._lock:
+                state.retire_owner_active = False
+
+    def _finish_slot_retirement(self, state: _SlotState) -> None:
+        self._try_release_slot_lease(state)
 
     def _start_slot_retirement(self, slot_index: int, *, stop_if_last: bool) -> None:
         with self._lock:
@@ -1499,10 +1918,12 @@ class _SessionSlotCoordinator:
                 daemon=False,
             )
             self._retire_threads.append(worker)
+            self._retire_thread_slots[worker] = slot_index
             try:
                 worker.start()
             except RuntimeError as exc:
                 self._retire_threads.remove(worker)
+                self._retire_thread_slots.pop(worker, None)
                 state.retiring = False
                 if self._cleanup_error is None:
                     self._cleanup_error = exc
@@ -1521,50 +1942,55 @@ class _SessionSlotCoordinator:
 
     def any_active(self) -> bool:
         with self._lock:
-            return any(
-                not state.retiring
-                and not state.handle.broker._revoked.is_set()
-                and state.handle.job.lease is not None
-                and state.handle.job.lease.active()
-                for state in self._slots.values()
-            )
+            candidates = [state for state in self._slots.values() if not state.retiring]
+        for state in candidates:
+            try:
+                if _slot_is_revoked(state.handle) is False and _slot_route_state(state.handle) == "active":
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _remove_leftover_container(self, cid: str, slot: _SlotState | None) -> None:
+        if slot is not None:
+            self._try_release_slot_lease(slot, remove_relay_if_timed_out=True)
+            return
         try:
             _remove_container_verified(cid)
             with self._lock:
                 self._removed_containers.add(cid)
-            if slot is None:
-                return
-            if slot.handle.confirm_relay_removed is not None:
-                slot.handle.confirm_relay_removed()
-            with self._lock:
-                should_exit = not slot.exited
-                slot.exited = True
-            if should_exit:
-                self._exit_slot_lease(slot)
         except Exception as exc:
             self._record_error(exc)
 
     def _exit_uncreated_slots(self) -> None:
         with self._lock:
-            unexited = [
+            pending = [
                 s for s in self._slots.values()
-                if not s.exited and s.relay_id is None and not s.creating_relay
+                if not s.exited or not s.lease_confirmed_released
             ]
-        for slot in unexited:
-            with self._lock:
-                if slot.exited:
-                    continue
-                slot.exited = True
-            self._exit_slot_lease(slot)
+        for slot in pending:
+            self._try_release_slot_lease(slot, remove_relay_if_timed_out=True)
         with self._lock:
             still_unconfirmed = any(
-                s.creating_relay or not s.exited or not s.lease_confirmed_released
+                s.creating_relay
+                or s.create_unconfirmed
+                or s.retire_timed_out
+                or not s.exited
+                or not s.lease_confirmed_released
                 for s in self._slots.values()
             )
         if still_unconfirmed:
             self._record_error(RuntimeError("Slot relay state remained unconfirmed during teardown"))
+
+    def _join_retire_threads(self, threads: list[threading.Thread]) -> None:
+        for thread in threads:
+            thread.join(timeout=15)
+            if thread.is_alive():
+                with self._lock:
+                    slot_idx = self._retire_thread_slots.get(thread)
+                    if slot_idx is not None and slot_idx in self._slots:
+                        self._slots[slot_idx].retire_timed_out = True
+                self._record_error(RuntimeError(f"Slot retirement thread '{thread.name}' did not finish"))
 
     def teardown_all(self, agent_id: str | None) -> Exception | None:
         if agent_id is not None:
@@ -1581,10 +2007,7 @@ class _SessionSlotCoordinator:
             for state in remaining_slots:
                 state.retiring = True
 
-        for thread in threads:
-            thread.join(timeout=15)
-            if thread.is_alive():
-                self._record_error(RuntimeError(f"Slot retirement thread '{thread.name}' did not finish"))
+        self._join_retire_threads(threads)
 
         for state in remaining_slots:
             self._finish_slot_retirement(state)
@@ -1621,6 +2044,7 @@ def _start_slot_relay_deferred(
     stop_event: threading.Event,
 ) -> str:
     """Create, start, and verify a deferred-bind relay before activation or TCP bind."""
+    _validate_slot_handle(handle)
     if not coordinator.begin_relay_create(handle.slot_index):
         raise ConnectionError("connection_retired")
     try:
@@ -1646,14 +2070,13 @@ def _start_slot_relay_deferred(
         spec["relay_image"],
         pod_id,
         spec["level"],
-        handle.job,
+        _slot_relay_paths(handle),
         [*siblings, *started_relay_ids],
     )
     if (
         stop_event.is_set()
-        or handle.broker._revoked.is_set()
-        or handle.job.lease.status() != "pending"
-        or time.monotonic_ns() >= handle.job.lease.deadline_ns
+        or _slot_is_revoked(handle)
+        or _slot_route_state(handle) != "pending"
     ):
         raise ConnectionError("connection_retired")
     return relay_id
@@ -1674,12 +2097,11 @@ def _start_and_verify_slot_relay(
     _wait_relay_bound(relay_id, port=handle.port)
     if (
         stop_event.is_set()
-        or handle.broker._revoked.is_set()
-        or handle.job.lease.status() != "pending"
-        or time.monotonic_ns() >= handle.job.lease.deadline_ns
+        or _slot_is_revoked(handle)
+        or _slot_route_state(handle) != "pending"
     ):
         raise ConnectionError("connection_retired")
-    handle.job.activate()
+    _slot_activate_route(handle)
     return relay_id
 
 
@@ -1745,9 +2167,8 @@ class _ProofTurnCutover:
         # Step A: completely retire discovery listener, join every discovery thread, verify relay & lease gone.
         self._coordinator.retire_slot_for_cutover(idx)
         with self._coordinator._lock:
-            retire_threads = tuple(self._coordinator._retire_threads)
-        for thread in retire_threads:
-            thread.join(timeout=15)
+            retire_entries = list(self._coordinator._retire_threads)
+        self._coordinator._join_retire_threads(retire_entries)
         with self._coordinator._lock:
             disc_state = self._coordinator._slots.get(idx)
             still_running = any(t.is_alive() for t in self._coordinator._retire_threads)
@@ -1760,10 +2181,13 @@ class _ProofTurnCutover:
                 or self._coordinator._cleanup_error is not None
             ):
                 raise ProofGateError(_ERR_PROOF_NOT_ARMED)
-            with disc_state.handle.broker._lock:
-                active_disc_clients = bool(disc_state.handle.broker._clients)
-            if active_disc_clients:
-                raise ProofGateError(_ERR_PROOF_NOT_ARMED)
+        try:
+            active_disc_clients = _slot_has_active_clients(disc_state.handle)
+        except Exception:
+            raise ProofGateError(_ERR_PROOF_NOT_ARMED) from None
+        if active_disc_clients:
+            raise ProofGateError(_ERR_PROOF_NOT_ARMED)
+        with self._coordinator._lock:
             if disc_state.relay_id in self._started_relay_ids:
                 self._started_relay_ids.remove(disc_state.relay_id)
         disc_key = f"disc-{idx}"
@@ -1793,6 +2217,11 @@ class _ProofTurnCutover:
             on_revoke=self._coordinator.on_revoke,
         )
         handle = slot_cm.__enter__()
+        try:
+            _validate_slot_handle(handle)
+        except BaseException:
+            slot_cm.__exit__(None, None, None)
+            raise
         self._coordinator.register_slot(slot_cm, handle, turn_root)
         # Arm BEFORE creating or starting the deferred-bind replacement turn relay.
         arm_nonce = gate.arm(observed_row=observed_row, observed_screen_digest=observed_screen_digest)
@@ -1800,7 +2229,7 @@ class _ProofTurnCutover:
             self._proof_options,
             slot_key,
             container_name=turn_cname,
-            grant_dir=str(handle.job.grant),
+            grant_dir=str(_slot_relay_paths(handle).grant_dir),
             slot_root=str(turn_root),
         )
         # B4: relay runs with --defer-bind (127.0.0.1:<port> stays unbound throughout isolation verification).
@@ -1812,7 +2241,7 @@ class _ProofTurnCutover:
         self._started_relay_ids.append(turn_relay_id)
         # B5: mark verified -> activate (enables bind) -> wait bound.
         gate.mark_relay_verified(turn_relay_id)
-        handle.job.activate()
+        _slot_activate_route(handle)
         _wait_relay_bound(turn_relay_id, port=handle.port)
         return arm_nonce
 
@@ -1861,10 +2290,20 @@ def _open_single_admitted_slot(
         on_revoke=coordinator.on_revoke,
     )
     handle = slot_cm.__enter__()
+    try:
+        _validate_slot_handle(handle)
+    except BaseException:
+        slot_cm.__exit__(None, None, None)
+        raise
     coordinator.register_slot(slot_cm, handle, slot_root)
+    grant_dir = ""
+    if handle.relay_paths is not None:
+        grant_dir = str(handle.relay_paths.grant_dir)
+    elif _is_legacy_openai_handle(handle):
+        grant_dir = str(getattr(handle.job, "grant", ""))
     _notify_slot_begin(
         proof_options, slot_key, container_name=cname,
-        grant_dir=str(getattr(handle.job, "grant", "")), slot_root=str(slot_root),
+        grant_dir=grant_dir, slot_root=str(slot_root),
     )
     relay_id = _start_and_verify_slot_relay(
         spec, pod_id, handle, coordinator, sidecars, started_relay_ids, stop_event,
@@ -1929,10 +2368,14 @@ def _finalize_session_teardown(
 ) -> bool:
     cleanup_error = coordinator.teardown_all(agent_id)
     if cleanup_error is not None:
+        if hasattr(coordinator, "release_slot_root_pins"):
+            coordinator.release_slot_root_pins()
         terminal.error(f"Provider session cleanup needs verification. Retained directory {root}")
         return False
     if proof_options is not None and cutover is not None:
         if not _all_proof_slots_lease_confirmed(coordinator, cutover):
+            if hasattr(coordinator, "release_slot_root_pins"):
+                coordinator.release_slot_root_pins()
             terminal.error(f"Provider session cleanup needs verification. Retained directory {root}")
             return False
         for key in (*cutover.tracked_slot_keys, "agent"):
@@ -1970,6 +2413,15 @@ def _run_multi_slot_session(
         )
         if proof_options is not None:
             config_payload = proof_options.proof_gate.harden_opencode_config(config_payload)
+            approval = proof_options.proof_gate.approval
+            validate_opencode_config(
+                config_payload,
+                plan=plan,
+                slot_ports=slot_ports,
+                slot_tokens=slot_tokens,
+                proof_hardened=True,
+                expected_model=f"{approval.scoped_provider_id}/{approval.approved_model}",
+            )
         config_path = _write_session_opencode_config(root, config_payload)
 
         sidecars = [name for name in (spec["chromium"], spec["postgres"], spec["dind"]) if name]
@@ -2040,7 +2492,27 @@ def _validate_plan_entries_against_config(plan, config, err_plan_mismatch: str, 
     return enabled_by_scoped
 
 
-def _validate_preconfirmed_plan(plan, proof_gate, config, live_config_digest: str | None) -> None:
+def _validate_plan_adapters_qualified(plan, active_adapters: dict | None) -> None:
+    if active_adapters is None:
+        return
+    for item in plan.admitted:
+        adapter = active_adapters.get(item.spec.kind)
+        is_qual = getattr(adapter, "is_qualified", None)
+        if not callable(is_qual) or is_qual(item.spec.auth_mode, "sandbox") is not True:
+            raise LaunchRefusedError(
+                "provider_unqualified",
+                f"Provider '{item.spec.qualified_name}' is not qualified for sandbox execution.",
+            )
+
+
+def _validate_preconfirmed_plan(
+    plan,
+    proof_gate,
+    config,
+    live_config_digest: str | None,
+    *,
+    active_adapters: dict | None = None,
+) -> None:
     err_plan_mismatch = "proof_plan_mismatch"
     err_config_mismatch = "proof_config_mismatch"
     approval = proof_gate.approval
@@ -2058,6 +2530,7 @@ def _validate_preconfirmed_plan(plan, proof_gate, config, live_config_digest: st
     if config is None:
         raise LaunchRefusedError(err_config_mismatch, "Current provider configuration does not admit the approved proof route.")
     enabled_by_scoped = _validate_plan_entries_against_config(plan, config, err_plan_mismatch, err_config_mismatch)
+    _validate_plan_adapters_qualified(plan, active_adapters)
     approved_cfg = enabled_by_scoped.get(approval.scoped_provider_id)
     if approved_cfg is None or approved_cfg.auth_mode != approval.auth_mode:
         raise LaunchRefusedError(err_config_mismatch, "Approved proof route is no longer enabled in current providers.toml.")
@@ -2086,6 +2559,7 @@ def _resolve_session_plan(
             proof_options.proof_gate,
             config,
             live_config_digest,
+            active_adapters=active_adapters,
         )
         return proof_options.preconfirmed_plan
     return plan_interactive_launch(
@@ -2114,8 +2588,10 @@ def _resolve_adapters_and_lock_dir(
     proof_gate = proof_options.proof_gate if proof_options is not None else None
     if adapters is None:
         backend = make_backend()
-        from .session_adapter import OpenAISessionAdapter
-        return {"openai": OpenAISessionAdapter(backend, proof_gate=proof_gate)}, (lock_dir or backend._state)
+        return (
+            default_session_adapters(backend_factory=lambda: backend, proof_gate=proof_gate),
+            lock_dir or backend._state,
+        )
     return adapters, (lock_dir if lock_dir is not None else make_backend()._state)
 
 

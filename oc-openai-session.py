@@ -29,9 +29,14 @@ def _trusted_node(path: Path, *, directory: bool = False) -> None:
 def _verify_package(directory: Path) -> None:
     _trusted_node(directory, directory=True)
     for entry in directory.iterdir():
-        if entry.is_dir():
+        info = entry.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            if entry.name == "__pycache__":
+                raise ValueError("unverified cache directory in package")
             _verify_package(entry)
         else:
+            if entry.suffix != ".py":
+                raise ValueError("unverified non-source file in package")
             _trusted_node(entry)
 
 

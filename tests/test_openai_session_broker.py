@@ -539,6 +539,8 @@ class SessionBrokerTests(unittest.TestCase):
         backend = _FakeBackend(self.root / "state")
         empty_cfg = self.root / "empty_cfg"
         empty_cfg.mkdir(mode=0o700)
+        lock_dir = self.root / "lock_state"
+        lock_dir.mkdir(mode=0o700)
         with (patch.object(session_broker, "check_devbox"),
               patch.object(session_broker, "check_host"),
               patch.object(session_broker, "make_backend", return_value=backend),
@@ -547,7 +549,7 @@ class SessionBrokerTests(unittest.TestCase):
               patch.object(session_broker, "podman", side_effect=fake_podman),
               patch.object(session_broker, "host_output", side_effect=fake_host_output),
               patch.object(session_broker.subprocess, "Popen", side_effect=fake_popen)):
-            rc = session_broker.run_interactive_session(spec, term, config_dir=empty_cfg)
+            rc = session_broker.run_interactive_session(spec, term, config_dir=empty_cfg, lock_dir=lock_dir)
 
         self.assertEqual(rc, 0, term.errors)
         # P1 #1: runtime directory cleaned up after pending -> activate -> start -> teardown.
@@ -879,13 +881,15 @@ class SessionBrokerTests(unittest.TestCase):
 
         empty_cfg_dir = self.root / "int_cfg"
         empty_cfg_dir.mkdir(mode=0o700)
+        int_lock_dir = self.root / "int_lock_state"
+        int_lock_dir.mkdir(mode=0o700)
         with (patch.object(session_broker, "check_devbox"),
               patch.object(session_broker, "check_host"),
               patch.object(session_broker, "make_backend", return_value=_InterruptBackend(self.root / "int_state")),
               patch.object(session_broker, "SHARED_TMP", str(self.root)),
               patch.object(session_broker, "_verify_pod_with_containers", side_effect=fake_verify_pod)):
             before_dirs = set(self.root.glob("oc-chat-*"))
-            rc = session_broker.run_interactive_session(spec, _Term(), config_dir=empty_cfg_dir)
+            rc = session_broker.run_interactive_session(spec, _Term(), config_dir=empty_cfg_dir, lock_dir=int_lock_dir)
             after_dirs = set(self.root.glob("oc-chat-*"))
         self.assertEqual(rc, 130)
         self.assertEqual(after_dirs, before_dirs)
@@ -2062,8 +2066,13 @@ class SessionBrokerTests(unittest.TestCase):
         removed = []
 
         class _RollbackAdapter:
-            def provider_config_entry(self, preflight, *, port, worker_token):
-                return {"name": preflight.spec.label, "settings": {"baseURL": f"http://127.0.0.1:{port}/v1", "apiKey": worker_token}, "models": {"gpt-6.2-sol": {"name": "gpt-6.2-sol"}}}
+            def provider_config_entry(self, preflight, *, port, worker_token, display_label=None):
+                return session_broker.build_openai_provider_entry(
+                    label=display_label or preflight.spec.label,
+                    port=port,
+                    worker_token=worker_token,
+                    models=preflight.models,
+                )
 
             @contextlib.contextmanager
             def open_slot(self, preflight, *, slot_index, slot_root, port, worker_token, acknowledged_exposure_digest, on_revoke):

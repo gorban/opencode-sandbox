@@ -8,7 +8,10 @@ import unittest
 from oc_providers.catalog import (
     LaunchRefusedError,
     build_multi_provider_opencode_config,
+    expected_provider_display_name,
     plan_interactive_launch,
+    project_picker_rows,
+    validate_opencode_config,
 )
 from oc_providers.config import LaunchDefaults, ProviderConfig
 from oc_providers.contracts import (
@@ -20,7 +23,9 @@ from oc_providers.contracts import (
     ProviderIntegrityError,
     ReadinessState,
     SelectionState,
+    sanitize_display_text,
 )
+from oc_providers.registry import UnqualifiedProviderAdapter, default_session_adapters
 
 
 class _FakeTerminal:
@@ -95,12 +100,27 @@ class _FakeAdapter:
             InstancePreflight(spec=instance, readiness=ReadinessState.DISCONNECTED),
         )
 
-    def provider_config_entry(self, preflight: InstancePreflight, *, port: int, worker_token: str) -> dict:
+    def provider_config_entry(
+        self,
+        preflight: InstancePreflight,
+        *,
+        port: int,
+        worker_token: str,
+        display_label: str | None = None,
+    ) -> dict:
+        label = display_label or preflight.spec.label
         return {
-            "name": f"{self.kind} ({preflight.spec.label})",
+            "name": expected_provider_display_name(preflight, label),
             "package": "@opencode/ai/providers/openai-compatible/responses",
             "settings": {"baseURL": f"http://127.0.0.1:{port}/v1", "apiKey": worker_token, "store": False},
-            "models": {slug: {"name": slug} for slug in preflight.models},
+            "models": {
+                slug: {
+                    "name": slug,
+                    "capabilities": {"tools": True, "input": ["text"], "output": ["text"]},
+                    "limit": {"context": 128000, "output": 16384},
+                }
+                for slug in preflight.models
+            },
         }
 
     def open_slot(self, *_args, **_kwargs):
@@ -365,6 +385,164 @@ class ProviderCatalogTests(unittest.TestCase):
             cli_ui_mode="default", config=cfg, adapters=adapters_unset, terminal=_FakeTerminal(confirms=[True]),
         )
         self.assertEqual([item.spec.label for item in plan.admitted], ["backup"])
+
+    def test_sanitize_display_text_and_picker_row_collision_projection(self):
+        # Strips ANSI CSI, OSC, 2-byte ESC, 8-bit C1, and control/format/bidi/line-sep chars.
+        dirty = "\x1b[31mChatGPT\x1b]0;evil\x07\x1bM \x9b2J\x9d0;title\x9c\u202eWork\u2028\t  Slot\x00"
+        self.assertEqual(sanitize_display_text(dirty), "ChatGPT Work Slot")
+        self.assertEqual(len(sanitize_display_text("a" * 100, max_len=16)), 16)
+        with self.assertRaises(ValueError):
+            sanitize_display_text("\x1b[31m\u200b\u202e   ")
+        with self.assertRaises(ValueError):
+            sanitize_display_text(123)  # type: ignore[arg-type]
+
+        oa_p = InstancePreflight(_spec("openai", "personal"), ReadinessState.READY, ("shared-slug",), route_policy="sub")
+        oa_w = InstancePreflight(_spec("openai", "work"), ReadinessState.READY, ("gpt-6.2-sol",), route_policy="sub")
+        gg_p = InstancePreflight(_spec("google", "personal"), ReadinessState.READY, ("shared-slug",), route_policy="sub")
+        rows = project_picker_rows((oa_p, oa_w, gg_p))
+        self.assertEqual([r.display_label for r in rows], ["work", "google/personal", "openai/personal"])
+        self.assertEqual([r.scoped_provider_id for r in rows], [
+            "openai--work", "google--personal", "openai--personal",
+        ])
+
+    def test_exact_bool_qualification_and_unqualified_registry_adapter(self):
+        oa_a = _spec("openai", "personal")
+        cfg = ProviderConfig(instances=(oa_a,), provider_defaults={}, launch=LaunchDefaults())
+
+        class _TruthyNonBoolAdapter(_FakeAdapter):
+            def is_qualified(self, auth_mode: str, placement: str):
+                return 1  # truthy non-bool MUST be rejected
+
+        adapters = {
+            "openai": _TruthyNonBoolAdapter(
+                "openai",
+                preflights={"personal": InstancePreflight(oa_a, ReadinessState.READY, ("gpt-6.2-sol",))},
+            ),
+        }
+        with self.assertRaises(LaunchRefusedError) as ctx_def:
+            plan_interactive_launch(
+                instance_name="default", cwd="construct", provider_filter="",
+                cli_ui_mode="default", config=cfg, adapters=adapters, terminal=_FakeTerminal(),
+            )
+        self.assertEqual(ctx_def.exception.code, "no_admitted_providers")
+        with self.assertRaises(LaunchRefusedError) as ctx_nar:
+            plan_interactive_launch(
+                instance_name="default", cwd="construct", provider_filter="openai/personal",
+                cli_ui_mode="default", config=cfg, adapters=adapters, terminal=_FakeTerminal(),
+            )
+        self.assertEqual(ctx_nar.exception.code, "route_unqualified")
+
+        unqual = UnqualifiedProviderAdapter("google")
+        self.assertIs(unqual.is_qualified("subscription", "sandbox"), False)
+        self.assertEqual(unqual.selection_state().state, SelectionState.UNSET)
+        self.assertEqual(unqual.discover_instances(), ())
+        gg_spec = _spec("google", "personal")
+        self.assertEqual(unqual.preflight_instance(gg_spec).readiness, ReadinessState.UNQUALIFIED)
+        with self.assertRaises(ProviderIntegrityError):
+            unqual.provider_config_entry(
+                InstancePreflight(gg_spec, ReadinessState.UNQUALIFIED), port=8401, worker_token="tok",
+            )
+        with self.assertRaises(ProviderIntegrityError):
+            with unqual.open_slot(
+                InstancePreflight(gg_spec, ReadinessState.UNQUALIFIED),
+                slot_index=0, slot_root=Path("/tmp"), port=8401, worker_token="tok",
+                acknowledged_exposure_digest=None, on_revoke=lambda _i: None,
+            ):
+                pass
+        with self.assertRaises(ProviderIntegrityError):
+            with unqual.open_discovery_slot(
+                InstancePreflight(gg_spec, ReadinessState.UNQUALIFIED),
+                slot_index=0, slot_root=Path("/tmp"), port=8401, worker_token="tok",
+                acknowledged_exposure_digest=None, on_revoke=lambda _i: None,
+            ):
+                pass
+
+        reg = default_session_adapters(backend_factory=lambda: object())
+        self.assertEqual(set(reg), {"openai", "google", "claude"})
+        self.assertIs(reg["google"].is_qualified("subscription", "sandbox"), False)
+        self.assertIs(reg["claude"].is_qualified("subscription", "sandbox"), False)
+
+    def test_validate_opencode_config_rejects_tampering_pre_and_post_hardening(self):
+        import copy
+
+        oa_p = _spec("openai", "personal")
+        gg_p = _spec("google", "personal")
+        cfg = ProviderConfig(instances=(oa_p, gg_p), provider_defaults={}, launch=LaunchDefaults())
+        adapters = {
+            "openai": _FakeAdapter(
+                "openai",
+                preflights={"personal": InstancePreflight(oa_p, ReadinessState.READY, ("gpt-6.2-sol",), route_policy="sub")},
+            ),
+            "google": _FakeAdapter(
+                "google",
+                preflights={"personal": InstancePreflight(gg_p, ReadinessState.READY, ("gemini-pro",), route_policy="sub")},
+            ),
+        }
+        plan = plan_interactive_launch(
+            instance_name="default", cwd="construct", provider_filter="",
+            cli_ui_mode="mini", config=cfg, adapters=adapters, terminal=_FakeTerminal(confirms=[True]),
+        )
+        slot_ports = {"openai--personal": 8401, "google--personal": 8402}
+        slot_tokens = {"openai--personal": "tok-oa", "google--personal": "tok-gg"}
+        base_cfg = build_multi_provider_opencode_config(
+            plan=plan, adapters=adapters, slot_ports=slot_ports, slot_tokens=slot_tokens,
+        )
+        self.assertEqual(base_cfg["providers"]["openai--personal"]["name"], "ChatGPT Subscription (openai/personal)")
+        self.assertEqual(base_cfg["providers"]["google--personal"]["name"], "Google Subscription (google/personal)")
+
+        # Pre-hardening mutations that MUST all fail closed:
+        bad_cases: list[tuple[str, object]] = [
+            ("wrong_schema", lambda d: d.__setitem__("$schema", "https://evil.example/config.json")),
+            ("wrong_update", lambda d: d.__setitem__("update", "auto")),
+            ("extra_top_key", lambda d: d.__setitem__("extra", True)),
+            ("extra_provider", lambda d: d["providers"].__setitem__("rogue", copy.deepcopy(d["providers"]["openai--personal"]))),
+            ("spoofed_display_substring", lambda d: d["providers"]["google--personal"].__setitem__("name", "ChatGPT Subscription (google/personal) Google Subscription")),
+            ("unapproved_openai_pkg", lambda d: d["providers"]["openai--personal"].__setitem__("package", "@opencode/ai/providers/openai-compatible/chat")),
+            ("non_canonical_url", lambda d: d["providers"]["openai--personal"]["settings"].__setitem__("baseURL", "http://127.0.0.1:8401/v1/")),
+            ("wrong_token", lambda d: d["providers"]["openai--personal"]["settings"].__setitem__("apiKey", "wrong-tok")),
+            ("caps_bool", lambda d: d["providers"]["openai--personal"]["models"]["gpt-6.2-sol"].__setitem__("capabilities", True)),
+            ("extra_nested_key", lambda d: d["providers"]["openai--personal"]["models"]["gpt-6.2-sol"]["limit"].__setitem__("extra", 1)),
+            ("bool_limit", lambda d: d["providers"]["openai--personal"]["models"]["gpt-6.2-sol"]["limit"].__setitem__("context", True)),
+        ]
+        for label, mutator in bad_cases:
+            with self.subTest(case=label):
+                mutated = copy.deepcopy(base_cfg)
+                mutator(mutated)
+                with self.assertRaises(ProviderIntegrityError):
+                    validate_opencode_config(
+                        mutated, plan=plan, slot_ports=slot_ports, slot_tokens=slot_tokens, proof_hardened=False,
+                    )
+
+        # Valid proof-hardened config passes, while lingering mcp, tools=True, or port/token drift fails closed.
+        hardened = copy.deepcopy(base_cfg)
+        hardened.pop("mcp")
+        hardened["model"] = "google--personal/gemini-pro"
+        hardened["snapshots"] = False
+        hardened["permissions"] = [{"action": "*", "resource": "*", "effect": "deny"}]
+        hardened["plugins"] = ["-opencode.tool.*"]
+        for pdef in hardened["providers"].values():
+            for mdef in pdef["models"].values():
+                mdef["capabilities"]["tools"] = False
+        validate_opencode_config(
+            hardened, plan=plan, slot_ports=slot_ports, slot_tokens=slot_tokens,
+            proof_hardened=True, expected_model="google--personal/gemini-pro",
+        )
+
+        for label, mutator in (
+            ("lingering_mcp", lambda d: d.__setitem__("mcp", {})),
+            ("tools_true_hardened", lambda d: d["providers"]["google--personal"]["models"]["gemini-pro"]["capabilities"].__setitem__("tools", True)),
+            ("port_drift_hardened", lambda d: d["providers"]["google--personal"]["settings"].__setitem__("baseURL", "http://127.0.0.1:8409/v1")),
+            ("token_drift_hardened", lambda d: d["providers"]["google--personal"]["settings"].__setitem__("apiKey", "drifted")),
+            ("wrong_model_hardened", lambda d: d.__setitem__("model", "openai--personal/gpt-6.2-sol")),
+        ):
+            with self.subTest(hardened_case=label):
+                mutated = copy.deepcopy(hardened)
+                mutator(mutated)
+                with self.assertRaises(ProviderIntegrityError):
+                    validate_opencode_config(
+                        mutated, plan=plan, slot_ports=slot_ports, slot_tokens=slot_tokens,
+                        proof_hardened=True, expected_model="google--personal/gemini-pro",
+                    )
 
 
 if __name__ == "__main__":

@@ -2356,7 +2356,8 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
             with self.assertRaises(LaunchRefusedError):
                 session_broker._resolve_session_plan({}, cfg, {}, None, opts, live_config_digest="0" * 64)
             # Multi-instance preconfirmed plan with matching enabled config & digest succeeds.
-            resolved = session_broker._resolve_session_plan({}, cfg, {}, None, opts, live_config_digest=digest)
+            qualified_oa = {"openai": SimpleNamespace(is_qualified=lambda m, p: m == "subscription" and p == "sandbox")}
+            resolved = session_broker._resolve_session_plan({}, cfg, qualified_oa, None, opts, live_config_digest=digest)
             self.assertIs(resolved, plan)
             # Duplicate slot in preconfirmed plan is rejected.
             dup_plan = ResolvedLaunchPlan(
@@ -3226,7 +3227,8 @@ class TestPinnedImagesAndLifecycleOwnership(unittest.TestCase):
                 patch.object(session_broker, "_run_multi_slot_session", side_effect=_abort_before_slot),
             ):
                 rc_s = session_broker.run_interactive_session(
-                    spec_sess, term, config_dir=cfg_dir, adapters={"openai": SimpleNamespace()},
+                    spec_sess, term, config_dir=cfg_dir,
+                    adapters={"openai": SimpleNamespace(is_qualified=lambda m, p: m == "subscription" and p == "sandbox")},
                     lock_dir=lock_d, proof_options=opts_sess,
                 )
             self.assertNotEqual(rc_s, 0)

@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import secrets
+import time
 
 from oc_providers.contracts import (
     ExposureHoldSummary,
@@ -14,8 +15,10 @@ from oc_providers.contracts import (
     ProviderInstanceSpec,
     ProviderIntegrityError,
     ReadinessState,
+    RelayMountPaths,
     SelectionState,
     SlotHandle,
+    SlotRouteState,
     is_valid_instance_label,
 )
 from .cli import Reason, RouteUnavailable
@@ -189,10 +192,15 @@ class OpenAISessionAdapter:
         )
 
     def provider_config_entry(
-        self, preflight: InstancePreflight, *, port: int, worker_token: str
+        self,
+        preflight: InstancePreflight,
+        *,
+        port: int,
+        worker_token: str,
+        display_label: str | None = None,
     ) -> dict:
         return build_openai_provider_entry(
-            label=preflight.spec.label,
+            label=display_label or preflight.spec.label,
             port=port,
             worker_token=worker_token,
             models=preflight.models,
@@ -330,6 +338,24 @@ class OpenAISessionAdapter:
             def lease_release_confirmed() -> bool:
                 return release_state["outcome"] in ("removed", "absent")
 
+            def route_state() -> SlotRouteState:
+                lease_obj = job.lease
+                if lease_obj is None:
+                    return "retired"
+                status = lease_obj.status()
+                if status == "pending":
+                    return "pending" if lease_obj.deadline_ns > time.monotonic_ns() else "retired"
+                if status == "active":
+                    return "active" if lease_obj.active() else "retired"
+                return "retired"
+
+            def is_revoked() -> bool:
+                return bool(broker._revoked.is_set())
+
+            def has_active_clients() -> bool:
+                with broker._lock:
+                    return bool(broker._clients)
+
             yield SlotHandle(
                 slot_index=slot_index,
                 scoped_id=preflight.spec.scoped_id,
@@ -346,6 +372,18 @@ class OpenAISessionAdapter:
                     if (has_release_result or self._proof_gate is not None)
                     else None
                 ),
+                relay_paths=RelayMountPaths(
+                    source_dir=job.source_dir,
+                    provider_socket=job.provider_socket,
+                    grant_dir=job.grant,
+                    proof_file=job.proof_file,
+                ),
+                revoke_grant=job.revoke,
+                close_broker=broker.close,
+                activate_route=job.activate,
+                route_state=route_state,
+                is_revoked=is_revoked,
+                has_active_clients=has_active_clients,
             )
         finally:
             self._teardown_slot_resources(job, broker, lease_cm)

@@ -12,11 +12,13 @@ from enum import Enum
 from pathlib import Path
 import re
 from typing import Literal, Protocol
+import unicodedata
 
 ProviderId = Literal["openai", "claude", "google"]
 AuthMode = Literal["subscription", "api_key"]
 UiMode = Literal["full", "mini"]
 CliUiMode = Literal["default", "full", "mini"]
+SlotRouteState = Literal["pending", "active", "retired"]
 
 PROVIDERS: frozenset[str] = frozenset({"openai", "claude", "google"})
 AUTH_MODES: frozenset[str] = frozenset({"subscription", "api_key"})
@@ -27,6 +29,14 @@ RELAY_PORT_MAX = RELAY_PORT_MIN + MAX_PROVIDER_SLOTS - 1
 INSTANCE_LABEL_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z", re.ASCII)
 LEGACY_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}\Z", re.ASCII)
 MODEL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z", re.ASCII)
+_ANSI_STRIP_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b[@-Z\\-_]"
+    r"|\x9b[0-?]*[ -/]*[@-~]"
+    r"|\x9d[^\x07\x9c]*(?:\x07|\x9c)"
+)
+_DISALLOWED_UNICODE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
 BrowserHandoff = Callable[[str, Callable[[], bool]], None]
 
@@ -38,6 +48,25 @@ def is_valid_instance_label(value: object) -> bool:
 
 def is_valid_model_slug(value: object) -> bool:
     return type(value) is str and MODEL_SLUG_RE.fullmatch(value) is not None
+
+
+def sanitize_display_text(value: object, *, max_len: int = 64) -> str:
+    """Strip terminal escapes and control/bidi characters from host-displayed metadata.
+
+    Display text carries zero routing authority.
+    """
+    if type(value) is not str:
+        raise ValueError("display text must be a string")
+    if type(max_len) is not int or max_len <= 0:
+        raise ValueError("max_len must be a positive integer")
+    stripped = _ANSI_STRIP_RE.sub("", value)
+    filtered = "".join(
+        ch for ch in stripped if unicodedata.category(ch) not in _DISALLOWED_UNICODE_CATEGORIES
+    )
+    normalized = " ".join(filtered.split())[:max_len].strip()
+    if not normalized:
+        raise ValueError("display text is empty after sanitization")
+    return normalized
 
 
 def scoped_provider_id(kind: ProviderId, label: str) -> str:
@@ -199,6 +228,30 @@ class ExcludedInstance:
 
 
 @dataclass(frozen=True)
+class PickerRow:
+    """Host-authoritative display projection for one admitted (instance, model) route."""
+
+    scoped_provider_id: str
+    kind: ProviderId
+    label: str
+    display_label: str
+    upstream_model_id: str
+    display_model: str
+    auth_mode: AuthMode
+    route_policy: str
+
+
+@dataclass(frozen=True)
+class RelayMountPaths:
+    """Host filesystem paths mounted read-only into an isolated provider relay container."""
+
+    source_dir: Path
+    provider_socket: Path
+    grant_dir: Path
+    proof_file: Path
+
+
+@dataclass(frozen=True)
 class SlotHandle:
     """Live per-instance broker/relay handle returned by ProviderSessionAdapter.open_slot."""
 
@@ -213,6 +266,41 @@ class SlotHandle:
     mark_relay_created: Callable[[], None] | None = None
     confirm_relay_removed: Callable[[], None] | None = None
     lease_release_confirmed: Callable[[], bool] | None = None
+    relay_paths: RelayMountPaths | None = None
+    revoke_grant: Callable[[], None] | None = None
+    close_broker: Callable[[], None] | None = None
+    activate_route: Callable[[], None] | None = None
+    route_state: Callable[[], SlotRouteState] | None = None
+    is_revoked: Callable[[], bool] | None = None
+    has_active_clients: Callable[[], bool] | None = None
+
+
+class ProofApprovalProtocol(Protocol):
+    """Provider-neutral approved tuple for a two-phase single-turn proof run."""
+
+    scoped_provider_id: str
+    approved_model: str
+    ui_mode: str
+    auth_mode: str
+    providers_config_digest: str
+
+
+class ProofGateProtocol(Protocol):
+    """Provider-neutral proof gate contract shared by multi-provider cutover supervision."""
+
+    approval: ProofApprovalProtocol
+
+    def harden_opencode_config(self, config_payload: dict[str, object]) -> dict[str, object]:
+        ...
+
+    def verify_ready_for_arm(self) -> None:
+        ...
+
+    def arm(self, *, observed_row: str, observed_screen_digest: str) -> str:
+        ...
+
+    def mark_relay_verified(self, relay_id: str) -> None:
+        ...
 
 
 class ProviderIntegrityError(RuntimeError):
@@ -292,4 +380,22 @@ class ProviderSessionAdapter(Protocol):
         on_revoke: Callable[[int], None],
     ) -> AbstractContextManager[SlotHandle]:
         """Acquire per-instance lease and start isolated broker for this admitted slot."""
+        ...
+
+
+class TwoPhaseProofAdapter(ProviderSessionAdapter, Protocol):
+    """Optional two-phase discovery-to-turn proof extension on ProviderSessionAdapter."""
+
+    def open_discovery_slot(
+        self,
+        preflight: InstancePreflight,
+        *,
+        slot_index: int,
+        slot_root: Path,
+        port: int,
+        worker_token: str,
+        acknowledged_exposure_digest: str | None,
+        on_revoke: Callable[[int], None],
+    ) -> AbstractContextManager[SlotHandle]:
+        """Open a closed discovery-only slot retired before arming the turn route."""
         ...
