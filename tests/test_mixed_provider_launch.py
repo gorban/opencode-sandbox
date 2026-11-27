@@ -4601,6 +4601,101 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
             unpub_backend.profiles.begin("draft")
             self.assertTrue(unpub_backend.disconnect("draft"))
 
+    def test_r10_persisted_retiring_profile_checked_during_switch_and_publish(self):
+        # Regression (R9 residual P2): a previously persisted published profile with retiring=True
+        # MUST still be verified (matching bound state + zero holds) during select() and publish()
+        # all-profile idle checks, while a cleanly verified retired profile allows select/publish.
+        import pwd
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+        from oc_openai.cli import Reason, RouteUnavailable
+        from oc_openai.connection import Connection
+        from oc_openai.connection_job import PhysicalHost
+        from oc_openai.profile_backend import ProfileBackend
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+
+        with tempfile.TemporaryDirectory(prefix="oc-r10-ret-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+
+            for scenario in (
+                "missing_state_json",
+                "missing_conn_dir",
+                "mismatched_client",
+                "unsettled_hold",
+                "clean_verified_retirement",
+            ):
+                with self.subTest(scenario=scenario):
+                    state_root = home_scratch / f"profiles_{scenario}"
+                    state_root.mkdir(mode=0o700)
+                    transport = FixtureTransport()
+                    browser_counter = [0]
+
+                    def _make_conn(directory):
+                        browser_counter[0] += 1
+                        fb = FixtureBrowser()
+                        fb.client = f"oaiapp_r10_{browser_counter[0]}"
+                        return Connection(
+                            directory,
+                            transport=transport,
+                            verifier=FixtureVerifier(),
+                            browser=fb,
+                            host_probe=lambda: host,
+                        )
+
+                    backend = ProfileBackend(state_root, connection=_make_conn)
+                    backend.connect("personal")
+                    backend.connect("work")
+                    backend.connect("extra")
+                    backend.select("extra")
+
+                    # Cleanly retire "personal" first (persisting retiring=True in profiles/state.json).
+                    self.assertTrue(backend.disconnect("personal"))
+                    view = backend.profiles.snapshot()
+                    personal_prof = next(p for p in view.saved if p.label == "personal")
+                    self.assertTrue(personal_prof.retiring)
+                    personal_dir = personal_prof.directory
+
+                    if scenario == "missing_state_json":
+                        (personal_dir / "state.json").unlink()
+                    elif scenario == "missing_conn_dir":
+                        shutil.rmtree(personal_dir)
+                    elif scenario == "mismatched_client":
+                        rec = json.loads((personal_dir / "state.json").read_text(encoding="utf-8"))
+                        rec["client"] = "oaiapp_wrongclient"
+                        (personal_dir / "state.json").write_text(json.dumps(rec), encoding="utf-8")
+                    elif scenario == "unsettled_hold":
+                        hid = "bc" * 16
+                        hp = personal_dir / f".lease-hold-{hid}"
+                        payload = json.dumps({
+                            "version": 1, "state": "hold", "hold_id": hid,
+                            "root": "oc-chat-deadbeef", "incarnation": "inc_" + "4" * 32,
+                        }).encode("utf-8") + b"\n"
+                        fd = os.open(hp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        try:
+                            os.write(fd, payload)
+                        finally:
+                            os.close(fd)
+
+                    if scenario == "clean_verified_retirement":
+                        # Positive control: cleanly retired published profile allows both select() and publish().
+                        backend.select("work")
+                        self.assertEqual(backend.active_label(), "work")
+                        backend.connect("fresh")
+                        self.assertEqual(backend.active_label(), "fresh")
+                    else:
+                        # Negative controls: select() AND publish() (via connect) MUST fail closed!
+                        with self.assertRaises(RouteUnavailable) as sel_err:
+                            backend.select("work")
+                        self.assertIs(sel_err.exception.reason, Reason.MANAGED_RETIREMENT)
+                        self.assertEqual(backend.active_label(), "extra")
+
+                        with self.assertRaises(RouteUnavailable) as pub_err:
+                            backend.connect("fresh")
+                        self.assertIs(pub_err.exception.reason, Reason.MANAGED_RETIREMENT)
+                        self.assertEqual(backend.active_label(), "extra")
+
     def test_proof_gate_evidence_and_dir_sync_failure_fails_closed_with_zero_dispatch(self):
         # Regression (R4 P2 #2): evidence write failure OR post-write _fsync_dir failure during
         # ProofGate.arm() or ProofGate.mark_relay_verified() MUST fail permanently closed across

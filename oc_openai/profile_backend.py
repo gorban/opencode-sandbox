@@ -75,7 +75,7 @@ class ProfileBackend:
     def _require_all_idle(self, profiles):
         try:
             for profile in profiles:
-                bound = profile.client_id is not None and not profile.retiring
+                bound = profile.client_id is not None
                 self._connection(profile.directory).require_switchable(
                     expected_client=profile.client_id if bound else None,
                     require_existing=bound,
@@ -87,7 +87,7 @@ class ProfileBackend:
         if previous is None or (allow_same and previous.directory == target.directory):
             return
         try:
-            bound = previous.client_id is not None and not previous.retiring
+            bound = previous.client_id is not None
             self._connection(previous.directory).require_switchable(
                 expected_client=previous.client_id if bound else None,
                 require_existing=bound,

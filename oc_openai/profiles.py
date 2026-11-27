@@ -262,11 +262,11 @@ class Profiles:
         finally:
             os.close(mutex)
 
-    def _all_saved_non_retiring(self, state) -> tuple[Profile, ...]:
+    def _all_saved(self, state) -> tuple[Profile, ...]:
         return tuple(
             self._profile(state, name)
             for name, entry in sorted(state["registrations"].items())
-            if entry["client_id"] is not None and not entry["retiring"]
+            if entry["client_id"] is not None
         )
 
     @contextmanager
@@ -283,7 +283,7 @@ class Profiles:
             ):
                 raise ProfileError("profile_client_conflict")
             if all_saved_check is not None:
-                all_saved_check(self._all_saved_non_retiring(state))
+                all_saved_check(self._all_saved(state))
             if callback is not None:
                 active = state["active"]
                 callback(self._profile(state, active) if active is not None else None, candidate.profile)
@@ -302,7 +302,7 @@ class Profiles:
             if entry["retiring"]:
                 raise ProfileError("profile_retiring")
             if all_saved_check is not None:
-                all_saved_check(self._all_saved_non_retiring(state))
+                all_saved_check(self._all_saved(state))
             active = state["active"]
             callback(self._profile(state, active) if active is not None else None, self._profile(state, label))
             state.update(active=label, epoch=secrets.token_urlsafe(32))
