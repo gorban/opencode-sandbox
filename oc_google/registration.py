@@ -160,7 +160,7 @@ class ColdReplica:
         self._service = None
         self._invocation = None
         self._cleanup_confirmed = False
-        self._definite_no_spawn = False
+        self._definite_no_spawn = None
         try:
             self._runtime_fd = os.dup(runtime_fd)
             self._root_fd = os.dup(root_fd)
@@ -226,8 +226,11 @@ class ColdReplica:
     def reserve_spawn(self, authorized):
         self._reserve_spawn(self, authorized)
 
-    def _failed_to_spawn(self):
-        self._definite_no_spawn = True
+    def _failed_to_spawn(self, confirmed=lambda: True):
+        self._definite_no_spawn = confirmed
+
+    def _confirmed_no_spawn(self):
+        return self._definite_no_spawn is not None and self._definite_no_spawn()
 
     def abandon_unlaunched(self):
         self._abandon(self)
@@ -698,7 +701,7 @@ class _HeldProfile:
     def abandon_cold_replica(self, replica):
         with self._lock, _metadata_storage_errors():
             if (replica is self._replica and not replica._cleanup_confirmed
-                    and (not self._spawn_consumed or replica._definite_no_spawn)):
+                    and (not self._spawn_consumed or replica._confirmed_no_spawn())):
                 replica._remove_files()
 
     def bind_native_invocation(self, service, *, authorized):
@@ -891,7 +894,7 @@ class _HeldProfile:
                     raise RegistrationUnavailable("Google metadata route is unavailable in this phase")
                 self._check_authority(authorized)
                 self._native_current()
-                self._save(replace(self._record, metadata_pending=True, **{counter: index + 1}))
+                self._save(replace(self._record, metadata_pending=True, **{counter: index + 1}), authorized=authorized)
                 self._check_current(pending=True)
                 self._check_authority(authorized)
                 self._native_current()

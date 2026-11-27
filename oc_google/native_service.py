@@ -187,6 +187,18 @@ def _verify_retired(service, identity, fd):
     object.__setattr__(service, "retired", identity)
 
 
+def _confirm_no_spawn(custody, replica, failure):
+    """Record the definite prelaunch outcome before releasing replica custody."""
+    try:
+        if custody is not None:
+            custody.no_spawn(replica)
+        elif replica is not None:
+            replica._failed_to_spawn()
+    except BaseException as cleanup:
+        uncertainty = NativeRetirementUnconfirmed("Google native no-spawn custody receipt requires inspection.")
+        retain_cleanup_failure(failure, uncertainty, cleanup)
+
+
 @contextmanager
 def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_spawn=None, fence=None,
                  replica=None, custody=None, authorized=None):
@@ -195,19 +207,16 @@ def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_s
             reserve_spawn()
         if custody is not None:
             custody.before_spawn(namespace.unit)
-        if authorized is not None and authorized() is not True:
-            if custody is not None:
-                custody.no_spawn()
-            if replica is not None:
-                replica._failed_to_spawn()
-            raise NativeNamespaceError("Google native launch owner retired before spawn")
+        try:
+            if authorized is not None and authorized() is not True:
+                raise NativeNamespaceError("Google native launch owner retired before spawn")
+        except BaseException as failure:
+            _confirm_no_spawn(custody, replica, failure)
+            raise
         try:
             process = _spawn(namespace)
-        except OSError:
-            if custody is not None:
-                custody.no_spawn()
-            if replica is not None:
-                replica._failed_to_spawn()
+        except OSError as failure:
+            _confirm_no_spawn(custody, replica, failure)
             raise
     service = NativeService(namespace.unit, process, namespace.description, enrollment_scope)
     try:

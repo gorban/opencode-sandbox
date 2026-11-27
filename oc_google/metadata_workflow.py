@@ -202,6 +202,8 @@ def reopen_metadata(journal, enrollment, runtime, *, destination, authorized, fe
                     if custody is not None:
                         custody.bind(profile.record_native_custody)
                     replica = profile.stage_cold_source(runtime.root, reserve_native_unit(), authorized=owner.authorized)
+                    if custody is not None:
+                        custody.delegate_cold_cleanup()
                 with open_cold_service(runtime.root, runtime.build, replica=replica, connector=connector,
                                        ca=runtime.certificate, authorized=owner.authorized, fence=owner.fence,
                                        after_stop=lambda: acp.drain_retired_metadata(), custody=custody) as service:

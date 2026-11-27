@@ -21,7 +21,7 @@ from oc_providers.contracts import is_valid_instance_label
 from .control import terminal
 from .metadata_destination import MetadataRoute, exchange
 from .metadata_workflow import MetadataRuntime, enroll_metadata, reopen_metadata
-from .native_artifacts import stage_standalone
+from .native_artifacts import stage_standalone, verify_standalone_source
 from .native_namespace import public_certificate
 from .native_service import NativeRetirementUnconfirmed, retain_cleanup_failure
 from .registration import RegistrationJournal, _absent, _DIRECTORY, _write_private
@@ -145,14 +145,23 @@ class _TerminalOwner:
     def consent(self, label):
         if not self.authorized():
             return False
-        termios.tcflush(self.fd, termios.TCIFLUSH)
+        try:
+            termios.tcflush(self.fd, termios.TCIFLUSH)
+        except OSError:
+            self.cancelled = True
+            return False
         self.write_once(f"Google registration {label}\n{_CONSENT}")
         deadline = time.monotonic() + 45
         answer = b""
         while len(answer) < 4 and self._ready(select.POLLIN, deadline):
-            byte = os.read(self.fd, 1)
+            try:
+                byte = os.read(self.fd, 1)
+            except OSError:
+                break
             if byte in (b"\n", b"\r"):
-                return answer in (b"y", b"Y") and self.authorized()
+                if answer in (b"y", b"Y") and self.authorized():
+                    return True
+                break
             if not byte:
                 break
             answer += byte
@@ -189,7 +198,8 @@ def _preflight(parent):
             != os.readlink("/proc/self/ns/net").encode("ascii")):
         raise ConnectError("Google sign-in requires the workstation loopback and account.")
     check_private_directory(parent)
-    for path in ("/usr/bin/openssl", "/usr/bin/bwrap", "/usr/bin/systemd-run", "/usr/bin/systemctl", "/usr/bin/python3"):
+    for path in ("/usr/bin/openssl", "/usr/bin/bwrap", "/usr/bin/systemd-run", "/usr/bin/systemctl",
+                 "/usr/bin/python3", "/usr/bin/sh", "/usr/bin/env"):
         receipt = host("stat", "-Lc", "%u %a", "--", path, timeout=2).stdout.split()
         if len(receipt) != 2 or receipt[0] != b"0" or int(receipt[1], 8) & 0o022:
             raise ConnectError("Google sign-in requires protected workstation tools.")
@@ -220,19 +230,19 @@ def _artifacts():
 
 
 class _RuntimeCustody:
-    def __init__(self, parent, parent_fd, root, root_fd, label, cold, authorized):
+    def __init__(self, parent, parent_fd, root, root_fd, label, cold):
         self.parent = parent
         self.parent_fd = parent_fd
         self.root = root
         self.root_fd = root_fd
         self.label = label
         self.cold = cold
-        self.authorized = authorized
         self.quarantine = "." + root.name + "-retire"
         self.record = None
         self.unit = None
         self.identity = None
         self.cleanable = True
+        self.cold_replica_managed = False
 
     def bind(self, record):
         if self.record is not None:
@@ -252,21 +262,16 @@ class _RuntimeCustody:
             raise CustodyUnconfirmed("Google enrollment runtime parent changed.")
 
     def before_spawn(self, unit):
+        self.cleanable = False
         self._verify_parent()
         original = self._verify(self.root.name, self.parent_fd)
         if self.unit is not None or self.record is None:
             raise CustodyUnconfirmed("Google enrollment launch custody changed.")
-        if not self.authorized():
-            raise ConnectError("Google enrollment owner retired before launch.")
-        self.cleanable = False
         self.unit = unit
         self.record("launch", {"label": self.label, "root": str(self.root), "device": original.st_dev,
                                "inode": original.st_ino, "unit": unit})
         self._verify_parent()
         self._verify(self.root.name, self.parent_fd)
-        if not self.authorized():
-            self.no_spawn()
-            raise ConnectError("Google enrollment owner retired before launch.")
 
     def attest(self, identity):
         if identity.unit != self.unit or self.identity is not None:
@@ -278,9 +283,14 @@ class _RuntimeCustody:
         return {"unit": self.unit, "invocation": identity.invocation_id,
                 "pid": identity.pid, "cgroup": identity.group.decode("ascii")}
 
-    def no_spawn(self):
+    def no_spawn(self, replica):
         self.record("no-spawn", {"unit": self.unit})
+        if replica is not None:
+            replica._failed_to_spawn(lambda: self.cleanable)
         self.cleanable = True
+
+    def delegate_cold_cleanup(self):
+        self.cold_replica_managed = True
 
     def retire(self, identity):
         if self.identity is None:
@@ -301,6 +311,8 @@ class _RuntimeCustody:
                 raise CustodyUnconfirmed("Google enrollment runtime disappearance requires inspection.")
             return
         self._verify(self.root.name, self.parent_fd)
+        if self.cold and (self.cold_replica_managed or not _absent("profile", directory=self.root_fd)):
+            raise CustodyUnconfirmed("Google cold replica cleanup requires inspection.")
         os.mkdir(self.quarantine, 0o700, dir_fd=self.parent_fd)
         quarantine_fd = os.open(self.quarantine, _DIRECTORY, dir_fd=self.parent_fd)
         try:
@@ -325,6 +337,8 @@ def _private_runtime(parent, label, cold, owner):
         if (not os.path.samestat(info, parent.lstat()) or info.st_uid != os.geteuid()
                 or stat.S_IMODE(info.st_mode) != 0o700):
             raise ConnectError("Google enrollment runtime parent is unavailable.")
+        if not owner.authorized():
+            raise ConnectError("Google sign-in cancelled.")
         name = "oc-g-" + secrets.token_hex(12)
         os.mkdir(name, 0o700, dir_fd=parent_fd)
         try:
@@ -332,7 +346,7 @@ def _private_runtime(parent, label, cold, owner):
         except OSError as error:
             raise CustodyUnconfirmed("Google enrollment runtime creation requires inspection.") from error
         clean.callback(os.close, root_fd)
-        custody = _RuntimeCustody(parent, parent_fd, parent / name, root_fd, label, cold, owner.authorized)
+        custody = _RuntimeCustody(parent, parent_fd, parent / name, root_fd, label, cold)
         failure = None
         try:
             yield custody
@@ -351,7 +365,7 @@ def _prepare_runtime(custody, source):
     root = custody.root
     check_private_directory(root)
     native = root / "native"
-    native.mkdir(mode=0o700)
+    os.mkdir("native", 0o700, dir_fd=custody.root_fd)
     build = stage_standalone(source, native)
     cert, key, config = (root / name for name in ("metadata.pem", "metadata-key.pem", "openssl.cnf"))
     routes = [MetadataRoute.TOKEN, MetadataRoute.LOAD_CODE_ASSIST]
@@ -391,10 +405,11 @@ def connect_for(label):
         _preflight(parent)
         with ExitStack() as initial_root, ExitStack() as cold_root:
             with _artifacts() as source:
+                verify_standalone_source(source)
+                if not owner.consent(label):
+                    raise ConnectError("Google sign-in cancelled.")
                 initial = _prepare_runtime(initial_root.enter_context(_private_runtime(parent, label, False, owner)), source)
                 cold = _prepare_runtime(cold_root.enter_context(_private_runtime(parent, label, True, owner)), source)
-            if not owner.consent(label):
-                raise ConnectError("Google sign-in cancelled.")
             journal = RegistrationJournal(label)
             enrollment = enroll_metadata(journal, initial, disclose_offer=owner.offer, destination=exchange,
                                          authorized=owner.authorized, fence=owner.fence)

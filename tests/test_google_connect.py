@@ -8,6 +8,7 @@ from pathlib import Path
 import runpy
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -16,7 +17,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from oc_google import connect
+from oc_google import connect, native_artifacts
 from oc_google.native_service import NativeInvocation
 
 
@@ -61,6 +62,22 @@ class TerminalOwnerTest(unittest.TestCase):
         text = calls.notice.call_args.args[0]
         for wording in ("cloud-platform", "Broad access", "userinfo.email", "aicode", "offline refresh", "zero inference"):
             self.assertIn(wording, text)
+
+
+    def test_decline_blank_timeout_or_read_race_latches_rejection(self):
+        for label, chunks, ready in (
+            ("decline", [b"n", b"\n"], True),
+            ("blank", [b"\n"], True),
+            ("timeout", [], False),
+            ("read race", [BlockingIOError(errno.EAGAIN, "fixture input race")], True),
+        ):
+            with self.subTest(label=label):
+                self.owner.cancelled = False
+                with patch.object(connect.termios, "tcflush"), patch.object(self.owner, "write_once"), \
+                        patch.object(self.owner, "_ready", return_value=ready), \
+                        patch.object(connect.os, "read", side_effect=chunks):
+                    self.assertFalse(self.owner.consent("fixture"))
+                self.assertFalse(self.owner.authorized())
 
 
 class TerminalDescriptorTest(unittest.TestCase):
@@ -127,6 +144,95 @@ class ConnectTest(unittest.TestCase):
         attended.assert_not_called()
         journal.assert_not_called()
 
+    def test_consent_refusal_precedes_runtime_openssl_and_journal(self):
+        spec = SimpleNamespace(enabled=True, auth_mode="subscription", cli_path=None)
+        owner = Mock(consent=Mock(return_value=False))
+        with patch.object(connect, "load_provider_config", return_value=Mock(get=Mock(return_value=spec))), \
+                patch.object(connect, "_attended_owner", return_value=nullcontext(owner)), \
+                patch.object(connect, "_preflight"), patch.object(connect, "_private_runtime") as place, \
+                patch.object(connect, "_artifacts", return_value=nullcontext(1)), \
+                patch.object(connect, "verify_standalone_source", create=True) as source_check, \
+                patch.object(connect, "host") as host, patch.object(connect, "RegistrationJournal") as journal:
+            with self.assertRaisesRegex(connect.ConnectError, "cancelled"):
+                connect.connect_for("fixture")
+        source_check.assert_called_once_with(1)
+        owner.consent.assert_called_once_with("fixture")
+        place.assert_not_called()
+        host.assert_not_called()
+        journal.assert_not_called()
+
+    def test_missing_or_untrusted_artifact_refuses_before_consent_or_effects(self):
+        spec = SimpleNamespace(enabled=True, auth_mode="subscription", cli_path=None)
+        owner = Mock()
+        for failure in ("missing", "symlink", "writable", "size"):
+            with self.subTest(failure=failure), TemporaryDirectory() as path:
+                source = Path(path)
+                (source / "companion").write_bytes(b"fixture")
+                member = source / "standalone"
+                if failure == "symlink":
+                    member.symlink_to(source / "companion")
+                elif failure != "missing":
+                    member.write_bytes(b"x" if failure == "size" else b"fixture")
+                    member.chmod(0o620 if failure == "writable" else 0o600)
+                source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with patch.object(connect, "load_provider_config", return_value=Mock(get=Mock(return_value=spec))), \
+                            patch.object(connect, "_attended_owner", return_value=nullcontext(owner)), \
+                            patch.object(connect, "_preflight"), patch.object(connect, "_private_runtime") as place, \
+                            patch.object(connect, "_artifacts", return_value=nullcontext(source_fd)), \
+                            patch.object(native_artifacts, "_PINNED", {"standalone": (7, ""), "companion": (7, "")}), \
+                            patch.object(connect, "host") as host, patch.object(connect, "RegistrationJournal") as journal:
+                        with self.assertRaises(native_artifacts.NativeArtifactError):
+                            connect.connect_for("fixture")
+                finally:
+                    os.close(source_fd)
+                owner.consent.assert_not_called()
+                place.assert_not_called()
+                host.assert_not_called()
+                journal.assert_not_called()
+
+    def test_preflight_verifies_the_exact_host_shell_and_env_tools(self):
+        def host(tool, *args, **_kwargs):
+            replies = {
+                "id": b"1000\n", "readlink": b"net:[123]\n",
+                "stat": b"0 755\n", "test": b"",
+            }
+            return Mock(stdout=replies[tool])
+
+        bridge = SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+        with patch.object(connect.os, "getuid", return_value=1000), \
+                patch.object(connect.os, "geteuid", return_value=1000), \
+                patch.object(connect.os, "lstat", return_value=bridge), \
+                patch.object(connect.os, "readlink", return_value="net:[123]"), \
+                patch.object(connect, "check_private_directory"), patch.object(connect, "host", side_effect=host) as verify:
+            connect._preflight(Path("/fixture"))
+        for path in ("/usr/bin/sh", "/usr/bin/env"):
+            self.assertIn(("stat", "-Lc", "%u %a", "--", path), [call.args for call in verify.call_args_list])
+            self.assertIn(("test", "-x", path), [call.args for call in verify.call_args_list])
+
+    def test_runtime_refuses_wrong_certificate_sans_or_nonprivate_tls_key(self):
+        for failure in ("san", "key"):
+            with self.subTest(failure=failure), TemporaryDirectory() as path:
+                root = Path(path)
+                key = root / "metadata-key.pem"
+                key.touch(mode=0o600)
+                key.chmod(0o640)
+                root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                custody = SimpleNamespace(root=root, root_fd=root_fd, cold=False)
+                output = (b"X509v3 Subject Alternative Name:\n DNS:oauth2.googleapis.com, DNS:cloudcode-pa.googleapis.com\n"
+                          if failure == "key" else b"X509v3 Subject Alternative Name:\n DNS:other.invalid\n")
+                message = "private TLS key" if failure == "key" else "certificate scope"
+                try:
+                    mkdir = os.mkdir
+                    with patch.object(connect, "stage_standalone"), patch.object(connect, "check_private_directory"), \
+                            patch.object(connect, "public_certificate"), patch.object(connect, "host", return_value=Mock(stdout=output)), \
+                            patch.object(connect.os, "mkdir", wraps=mkdir) as make_directory:
+                        with self.assertRaisesRegex(connect.ConnectError, message):
+                            connect._prepare_runtime(custody, 1)
+                    make_directory.assert_called_once_with("native", 0o700, dir_fd=root_fd)
+                finally:
+                    os.close(root_fd)
+
     def test_success_follows_initial_and_cold_cleanups_and_uses_compiled_exchange(self):
         events = []
         spec = SimpleNamespace(enabled=True, auth_mode="subscription", cli_path=None)
@@ -143,6 +249,7 @@ class ConnectTest(unittest.TestCase):
                 patch.object(connect, "_attended_owner", return_value=nullcontext(owner)), \
                 patch.object(connect, "_preflight"), patch.object(connect, "_private_runtime", place), \
                 patch.object(connect, "_artifacts", return_value=nullcontext(1)), \
+                patch.object(connect, "verify_standalone_source", create=True), \
                 patch.object(connect, "_prepare_runtime", side_effect=lambda custody, _: custody), \
                 patch.object(connect, "enroll_metadata", return_value=enrollment) as enroll, \
                 patch.object(connect, "reopen_metadata", side_effect=lambda *a, **k: events.append("cold")) as reopen:
@@ -228,6 +335,24 @@ class RuntimeCustodyTest(unittest.TestCase):
             "oc-sandbox google: Google enrollment cleanup requires inspection.",
         ])
         self.assertEqual(len(list(self.parent.iterdir())), 1)
+
+    def test_keyboard_interrupt_preserves_redacted_cancellation_and_exit_code(self):
+        origin = Path(__file__).resolve().parents[1]
+        main = runpy.run_path(str(origin / "oc-google.py"))["main"]
+        output = StringIO()
+        with patch.dict(main.__globals__, verify_sources=Mock()), \
+                patch.object(sys, "argv", ["oc-google.py", "connect", "fixture"]), \
+                patch.object(connect, "connect_for", side_effect=KeyboardInterrupt("private fixture detail")), \
+                redirect_stderr(output):
+            self.assertEqual(main(), 130)
+        self.assertEqual(output.getvalue(), "oc-sandbox google: Google sign-in cancelled.\n")
+
+    def test_cold_runtime_does_not_replace_replica_cleanup(self):
+        with self.assertRaisesRegex(connect.CustodyUnconfirmed, "requires inspection"):
+            with connect._private_runtime(self.parent, "fixture", True, self.owner) as custody:
+                replica = custody.root / "profile"
+                replica.mkdir()
+        self.assertTrue(replica.is_dir())
 
     def test_cold_disappearance_with_quarantine_requires_inspection(self):
         with self.assertRaisesRegex(connect.CustodyUnconfirmed, "requires inspection"):

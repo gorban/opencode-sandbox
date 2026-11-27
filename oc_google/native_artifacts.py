@@ -29,13 +29,32 @@ def _fingerprint(info):
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
-def _copy_member(source, destination, name, size, digest):
+def _open_member(source, name, size):
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=source)
-    with os.fdopen(fd, "rb") as reader:
-        before = os.fstat(reader.fileno())
-        if (not stat.S_ISREG(before.st_mode) or before.st_uid not in {0, os.geteuid()}
-                or before.st_mode & 0o022 or before.st_size != size):
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.geteuid()}
+                or info.st_mode & 0o022 or info.st_size != size):
             raise NativeArtifactError("Unrecognized standalone Google ACP artifact")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, info
+
+
+def verify_standalone_source(source_fd: int):
+    """Check the two pinned members before consent without reading their contents."""
+    try:
+        for name, (size, _) in _PINNED.items():
+            fd, _ = _open_member(source_fd, name, size)
+            os.close(fd)
+    except OSError:
+        raise NativeArtifactError("Standalone Google ACP artifacts are unavailable") from None
+
+
+def _copy_member(source, destination, name, size, digest):
+    fd, before = _open_member(source, name, size)
+    with os.fdopen(fd, "rb") as reader:
         created = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                           0o600, dir_fd=destination)
         with os.fdopen(created, "wb") as out:

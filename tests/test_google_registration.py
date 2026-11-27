@@ -475,10 +475,19 @@ class RegistrationTests(unittest.TestCase):
                 profile.spend_metadata(MetadataRoute.TOKEN, lambda: writes.append("pre-cancel"),
                                        authorized=lambda: False)
             self.assertEqual(json.loads(self.receipt.read_text())["enrollment_metadata_spent"], 0)
-            checks = iter((True, False))
-            with self.assertRaisesRegex(registration.RegistrationUnavailable, "authority"):
-                profile.spend_metadata(MetadataRoute.TOKEN, lambda: writes.append("unexpected"),
-                                       authorized=lambda: next(checks))
+            live = True
+            save = registration._HeldProfile._save
+
+            def revoke_after_saved_pending(held, value, **kwargs):
+                nonlocal live
+                save(held, value, **kwargs)
+                if value.metadata_pending:
+                    live = False
+
+            with patch.object(registration._HeldProfile, "_save", new=revoke_after_saved_pending):
+                with self.assertRaisesRegex(registration.RegistrationUnavailable, "authority"):
+                    profile.spend_metadata(MetadataRoute.TOKEN, lambda: writes.append("unexpected"),
+                                           authorized=lambda: live)
             saved = json.loads(self.receipt.read_text())
             self.assertEqual(saved["enrollment_metadata_spent"], 1)
             self.assertTrue(saved["metadata_pending"])
@@ -487,6 +496,27 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(writes, [])
         with self.assertRaises(registration.RegistrationUnavailable):
             record_enrollment_retired(registration.RegistrationJournal(LABEL), enrollment)
+
+    def test_owner_loss_during_pending_receipt_sync_prevents_committing_the_spend(self):
+        enrollment = self.journal.begin(BUILD)
+        authorized = True
+        sync = os.fsync
+
+        def expire_while_syncing(fd):
+            nonlocal authorized
+            if Path(os.readlink(f"/proc/self/fd/{fd}")).name.startswith(".registration-"):
+                authorized = False
+            sync(fd)
+
+        with self.journal.enrollment_profile(enrollment) as profile, \
+                patch.object(registration.os, "fsync", side_effect=expire_while_syncing):
+            with self.assertRaisesRegex(registration.RegistrationUnavailable, "authority"):
+                profile.spend_metadata(MetadataRoute.TOKEN, lambda: self.fail("owner loss sent a provider write"),
+                                       authorized=lambda: authorized)
+        self.assertEqual(self.lock.read_bytes(), b"!")
+        receipt = json.loads(self.receipt.read_text())
+        self.assertFalse(receipt["metadata_pending"])
+        self.assertEqual(receipt["enrollment_metadata_spent"], 0)
 
     def test_loss_during_native_identity_verification_blocks_dispatch(self):
         enrollment = self.journal.begin(BUILD)

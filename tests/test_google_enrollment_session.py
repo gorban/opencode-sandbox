@@ -3,14 +3,14 @@
 import json
 import os
 from pathlib import Path
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from tempfile import TemporaryDirectory
 from threading import RLock
 import time
 import unittest
 from unittest.mock import Mock, patch
 
-from oc_google import registration
+from oc_google import connect, registration
 from oc_google.account_binding import AccountBindingError
 from oc_google.auth_offer import Callback
 from oc_google.enrollment import EnrollmentMetadataError
@@ -19,7 +19,9 @@ from oc_google.oauth_exchange import OAuthExchangeError
 from oc_google.metadata_destination import MetadataRoute
 from oc_google.metadata_ingress import MetadataIngressError
 from oc_google.native_enrollment_acp import NativeEnrollmentAcp
-from oc_google.native_service import NativeInvocation, NativeService, open_cold_service, open_enrollment_service
+from oc_google.native_service import (
+    NativeInvocation, NativeRetirementUnconfirmed, NativeService, open_cold_service, open_enrollment_service,
+)
 from oc_google.native_namespace import NativeNamespaceError
 from oc_google.native_transport import NativeChannel
 from google_registration_fixture import record_enrollment_retired
@@ -456,6 +458,86 @@ class ColdMetadataSessionTest(unittest.TestCase):
             spawn.assert_not_called()
         replica.abandon_unlaunched()
         self.assertFalse(root.exists())
+
+    def exercise_prelaunch_owner_loss(self, when, failure=None):
+        runtime = self.scratch / "runtime"
+        parent = runtime / str(os.geteuid())
+        parent.mkdir(mode=0o700, parents=True)
+        self.enterContext(patch.object(registration, "_RUNTIME_PARENT", runtime))
+        live = True
+        authorized = lambda: live
+        owner = Mock(authorized=authorized)
+        unit = "oc-google-acp-" + "b" * 24 + ".service"
+        slot = self.scratch / ".local/state/oc-sandbox/google/registrations/fixture"
+        with (self.assertRaises(connect.CustodyUnconfirmed) if failure else nullcontext()):
+            with connect._private_runtime(parent, "fixture", True, owner) as custody:
+                root = custody.root
+                replica = self.profile.stage_cold_source(root, unit, authorized=authorized)
+
+                def record(event, value):
+                    nonlocal live
+                    if event == "no-spawn" and failure == "receipt":
+                        raise OSError("fixture no-spawn sync failed")
+                    self.profile.record_native_custody(event, value)
+                    if event == "launch" and when == "after":
+                        live = False
+
+                custody.bind(record)
+                before_spawn = custody.before_spawn
+
+                def entered(reserved_unit):
+                    nonlocal live
+                    if when == "entry":
+                        live = False
+                    before_spawn(reserved_unit)
+
+                mark = replica._failed_to_spawn
+
+                def interrupted_marker(*args):
+                    mark(*args)
+                    raise OSError("fixture replica marker was interrupted")
+
+                with ExitStack() as fixture:
+                    fixture.enter_context(patch.object(custody, "before_spawn", side_effect=entered))
+                    fixture.enter_context(patch("oc_google.native_service.check_private_directory"))
+                    fixture.enter_context(patch("oc_google.native_service.prepare_cold_namespace",
+                                                return_value=Mock(unit=unit)))
+                    spawn = fixture.enter_context(patch("oc_google.native_service._spawn"))
+                    if failure == "marker":
+                        fixture.enter_context(patch.object(replica, "_failed_to_spawn", side_effect=interrupted_marker))
+                    with self.assertRaisesRegex(RuntimeError, "owner retired before") as caught, open_cold_service(
+                        root, None, replica=replica, connector=None, ca=None,
+                        authorized=authorized, fence=self.fence, custody=custody,
+                    ):
+                        self.fail("a retired owner started the native service")
+                    spawn.assert_not_called()
+
+                replica.abandon_unlaunched()
+                receipt = slot / "cold-native-no-spawn.json"
+                if failure:
+                    uncertainty, = caught.exception.cleanup_uncertainties
+                    self.assertIsInstance(uncertainty, NativeRetirementUnconfirmed)
+                    self.assertFalse(custody.cleanable)
+                    self.assertFalse(replica.removed())
+                    self.assertTrue((root / "profile").is_dir())
+                    self.assertEqual(receipt.exists(), failure == "marker")
+                else:
+                    self.assertTrue(replica.removed())
+                    self.assertFalse(root.exists())
+                    self.assertEqual(json.loads(receipt.read_text())["unit"], unit)
+        self.assertEqual(root.exists(), failure is not None)
+
+    def test_owner_loss_at_custody_entry_keeps_replica_cleanup_with_the_replica(self):
+        self.exercise_prelaunch_owner_loss("entry")
+
+    def test_owner_loss_after_launch_receipt_keeps_replica_cleanup_with_the_replica(self):
+        self.exercise_prelaunch_owner_loss("after")
+
+    def test_failed_no_spawn_receipt_holds_the_cold_replica(self):
+        self.exercise_prelaunch_owner_loss("after", failure="receipt")
+
+    def test_unsettled_replica_marker_holds_the_cold_replica(self):
+        self.exercise_prelaunch_owner_loss("after", failure="marker")
 
     def test_failed_launcher_exec_does_not_strand_a_credential_copy(self):
         root, unit = self.make_replica_root()
