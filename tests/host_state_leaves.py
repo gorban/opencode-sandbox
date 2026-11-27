@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory(prefix='oc-leaf-') as tmp:
     build2 = state2 / 'build'; policy2 = state2 / 'policy'; stage2 = state2 / 'bridge-stage'
     bin2 = check_home / '.local/bin'; units2 = check_home / '.config/systemd/user'
     validators = []
-    for name in ('validate_host_state', 'shared_host_directory', 'verify_bridge_stage'):
+    for name in ('host_python', 'validate_host_state', 'shared_host_directory', 'verify_bridge_stage'):
         function = name + '() {'
         if function in text:
             start = text.index(function)

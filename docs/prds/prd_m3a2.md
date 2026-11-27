@@ -64,9 +64,10 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
 - [ ] Render operator-only chrome as first-party, unregistered components outside the SDK
       registry and agent projection. Cover confirmation, both inboxes, bootstrap/sign-in
       and credential flows, the operator composer and target picker, the Input Lease Bar,
-      host-compiled workflow action chips, and logout/session controls. Mark the roots
-      `data-agent-hidden` for defense in depth. Apply hidden or confirmation markup
-      directly to any portaled root, or disable portal behavior for that subtree.
+      the bridge Pause/Resume control, host-compiled workflow action chips, and logout/session
+      controls. Mark the roots `data-agent-hidden` for defense in depth. Apply hidden or
+      confirmation markup directly to any portaled root, or disable portal behavior for that
+      subtree.
 - [ ] Make each protected action a single, idempotent step whose effect is confirmed by the
       daemon, because `act` cannot roll back earlier steps.
 - [ ] Keep each view under the snapshot cap by sectioning and paging long lists, and give
@@ -114,15 +115,24 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
       or continuations and withholds its CSRF token there. The daemon still verifies the
       initiating principal and authorizes the typed intent on its restricted channel.
 - [ ] Use single-flight confirmation with no pending queue, at most three requests
-      per minute and a five-second cooldown after cancel. Offer an operator pause
-      control that retires the bridge session.
+      per minute and a five-second cooldown after cancel that stays enforced independently of
+      bridge Pause/Resume state (pausing and resuming must not clear or shorten the cooldown).
+      Offer an operator-only pause control (outside the SDK registry and marked
+      `data-agent-hidden`) that retires the bridge session.
       Suppress unsolicited confirmation when the view is hidden, a text field is active,
-      or an operator input lease is in use. Cancel an open confirmation when the view loses
-      visibility and require fresh input after return. Render text from canonical daemon fields.
-      Initially focus Cancel or the dialog container and keep Confirm disabled until the
-      750 ms post-paint arming interval has elapsed and initiating input has been released.
-      Require a fresh deliberate activation. Held keys and pointer events predating the
-      dialog cannot confirm.
+      or an operator input lease is in use. Never arm a confirmation modal while the tab or view
+      is hidden; cancel an open confirmation when the view loses visibility and require fresh
+      input after return. Render text from canonical daemon fields using the direction-isolated
+      address component ([prd_m3a1](prd_m3a1.md)).
+      Define the 750 ms post-first-paint arming delay as an immutable constant in code (never
+      read from a CSS token that can silently fall back on unit changes). Focus placement,
+      visible-after-paint arming, fresh trusted activation (`event.isTrusted === true`), and
+      post-cancel cooldown complement the daemon's authoritative one-use authorization rather
+      than replacing it. Initially focus Cancel or the dialog container and keep Confirm
+      disabled until the post-first-paint arming interval has elapsed and initiating input has
+      been released. Require a fresh deliberate activation; reject synthetic/script-dispatched
+      events, held keys and pointer events predating the dialog, while preserving accessible
+      keyboard and assistive-technology activation.
 - [ ] Bind intents, decisions, and subscriptions to the exact bridge activation. Recheck
       it with the operator generation and orchestrator identity at every entry and
       continuation, including decision consumption and result publication. Invalidate
@@ -157,10 +167,13 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
       forged source fields, stale or replayed decisions, and attempts to use Tier A or
       Tier B human paths yield zero mutation, receipts or operator provenance.
 - [ ] Add fixture controls for a portaled protected/hidden subtree, delayed SDK continuation
-      trying the operator API, shared-form poisoning, held Enter/Space across modal opening,
-      prompt floods, hidden or busy views, ticket replay or wrong tab, and stale actions
-      or subscription deliveries after logout and fresh login. Verify zero operator
-      mutations and no stale disclosures.
+      trying the operator API, shared-form poisoning, synthetic/untrusted pointer and click
+      dispatch on Confirm and Approve controls, held Enter/Space across modal opening,
+      opening a modal in a hidden tab, Pause/Resume during the five-second cooldown, unknown
+      approval scope keys, prompt floods, hidden or busy views, ticket replay or wrong tab, and
+      stale actions or subscription deliveries after logout and fresh login. Verify zero
+      operator mutations and no stale disclosures, and confirm legitimate keyboard and
+      assistive-technology activation still succeeds.
 - [ ] Hold an approved decision and a queued subscription result across pause and re-enable
       in the same tab without logout. Reject both old items and prove a fresh request on
       the new activation works. Repeat for transport loss and reconnect. Hide the view with

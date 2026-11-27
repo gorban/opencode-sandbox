@@ -96,11 +96,31 @@ host chrome.
 - [ ] Design loading, empty, error, stale, offline, revoked and permission-denied states for
       every data region, plus session expired, logged out and reconnecting for the whole app.
       Show staleness explicitly (for example, "updated 2 min ago") rather than freezing silently.
-- [ ] Handle long and hostile text: very long names, unbroken strings and Markdown-looking
-      text. Replace or remove C0, DEL, C1, bidi-control and zero-width formatting characters
-      in host labels before direction isolation with `<bdi>`. Preserve ordinary multilingual
-      text. Use hostile synthetic fixtures and follow the existing
-      [rendering walkthrough](spikes/m/web-ui/WALKTHROUGH.md) for thread bodies.
+- [ ] Handle long and hostile text and prevent target identity collisions:
+      key the composer target picker, per-target drafts, Send label, same-name twin detection
+      and protected-action summaries strictly on host-minted opaque identifiers (never on cleaned
+      or stripped display text), and derive local vs. remote and peer vs. sandbox kind solely from
+      typed projection fields (never by parsing display prefixes). Sanitize C0, DEL, C1,
+      bidi-control and invisible zero-width formatting characters across the full PRD codepoint
+      set before direction isolation with `<bdi>`, preferring to preserve joiners needed by
+      display languages while keeping identity and disambiguation trusted and separate. Reject
+      disallowed control characters at the host grammar or replace removed characters visibly,
+      compute same-name twin warnings on the normalized display form, and always surface an
+      explicit trusted host discriminator whenever two targets share or collide on normalized
+      display text (even when normalization operates as designed). Never silently default a
+      missing or unknown target to the first item in the list; fail closed with submission
+      disabled until the operator selects a live target. Construct every host sentence embedding
+      a target, project or sandbox name (confirmation target, impact line, same-name warning,
+      Send label) from a dedicated direction-isolated address component (`<bdi>`). Keep sandbox,
+      project and branch names out of `document.title`. Use hostile synthetic fixtures and follow
+      the existing [rendering walkthrough](spikes/m/web-ui/WALKTHROUGH.md) for thread bodies.
+- [ ] Apply fresh-press deliberate-activation checks (`event.isTrusted === true`) to Tier A
+      Approval Inbox Approve controls as defense in depth alongside daemon authorization; never
+      auto-advance the next pending approval item under the operator's pointer after an Approve
+      or Deny click; fail closed (refuse to render Approve and display an explicit invalid-scope
+      error) when an approval carries an unknown or unmapped scope key rather than rendering an
+      undefined label. Keep keyboard and assistive-technology activation working in acceptance
+      criteria alongside negative synthetic-input tests.
 - [ ] Never invent data in prototypes. Use synthetic fixture data shaped like the
       [M3a web-ui fixtures](spikes/m/web-ui/fixtures/workspace.mjs) and the M3 hierarchy.
 - [ ] Use tabular numerals for counts, quota and timings. Do not show trend arrows or
@@ -112,11 +132,14 @@ host chrome.
 
 - [ ] The enforcing CSP is `style-src 'self'` with no inline styles in generated HTML
       ([M3a web-ui walkthrough](spikes/m/web-ui/WALKTHROUGH.md)). Design for external
-      stylesheets and Svelte scoped styles only. Keep `form-action 'none'` and limit images
-      to `img-src 'self'`. Use no CDN fonts, remote images, icon fonts
-      or third-party embeds. Icons are bundled SVG components with text labels.
-- [ ] Fonts: the current CSP has no `font-src`, so bundled web fonts would be blocked. See the
-      font decision below.
+      stylesheets and Svelte scoped styles only. Keep `form-action 'none'`, `img-src 'self'`
+      (no `data:` images) and explicit `font-src 'none'` unless self-hosted fonts are separately
+      reviewed. Use no CDN fonts, remote images, icon fonts or third-party embeds. Icons are
+      bundled SVG components with text labels. Keep unverified or non-reproducible third-party
+      design-skill trees, hook installers and network clients out of the product repository;
+      pin and verify every retained build dependency per [prd_f](prd_f.md).
+- [ ] Fonts: the production CSP sets `font-src 'none'` by default, so bundled web fonts stay
+      blocked unless `font-src 'self'` is separately reviewed. See the font decision below.
 - [ ] Render correctly in Chromium (loopback) and WebKitGTK (Linux Tauri), and later
       WKWebView. Avoid CSS features that WebKitGTK does not ship without a fallback, and
       check prototypes in a WebKit engine (for example, Playwright WebKit or GNOME Web).

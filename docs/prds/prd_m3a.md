@@ -18,20 +18,37 @@ serve the dashboard only for UI paths. API and event paths have explicit handler
 
 - [ ] Build the read-only `Project → Sandbox → Thread` view against synthetic projection data
       first. Show bounded status, mailbox and provenance entries. Render agent-supplied text as
-      text. All API state and authorization come from the host daemon. Keep private state out of
-      the static bundle and URLs. Disable storage or caching of private responses. Retire the
+      text with uniform escape-by-default rendering for every dynamic and fixture field. Restrict
+      in-page navigation strictly to declared SPA routes (never fetch or adopt arbitrary
+      same-origin `.html` bodies or untrusted paths). Namespace all data-derived DOM element IDs
+      so entity identifiers can never collide with host-chrome control IDs (such as Confirm or
+      Approve controls). All API state and authorization come from the host daemon. Keep private
+      state (including sandbox, project and branch names) out of the static bundle, URLs and
+      `document.title`. Disable storage or caching of private responses. Implement sign-out as an
+      authenticated `POST` mutation with CSRF verification (never a plain link). Retire the
       session generation on logout or expiry, cancel in-flight requests, close subscriptions,
-      and clear displayed and in-memory state. Discard every completion or queued event
-      belonging to a retired generation, including after a new login.
+      and clear all displayed and in-memory state (including drafts, pending confirmations and
+      approval UI state). Discard every completion or queued event belonging to a retired
+      generation, including after a new login.
 - [ ] Qualify actual loopback serving with the [M3 web auth and CSP](prd_m3.md#3-shared-sveltekit-frontend-loopback-web-auth-and-tauri-v2-uds-bridge).
       Bind to loopback, enforce exact Host and Origin checks where specified, exchange a one-use
-      bootstrap code for the strict session cookie, and require CSRF and scoped WebSocket tickets
-      where applicable. The daemon supplies the authoritative CSP response header. Account for
-      generated SvelteKit bootstrapping in the actual header with an exact SHA-256 build hash,
-      or load a reviewed external bootstrap from the same origin. Verify that a production
-      deep link starts under CSP and authentication and rejects unapproved connections. Exercise
-      a held reply and queued event delivered after logout or expiry and a fresh login.
-      Privileged actions, PTY and browser streams have separate review gates.
+      bootstrap code for session auth, and require CSRF and scoped WebSocket tickets where
+      applicable. Address loopback cookie port-sharing explicitly before shipping web auth:
+      host-scoped cookies on `127.0.0.1` ignore ports, and Host/Origin/CSRF checks protect what
+      the dashboard accepts but cannot stop the browser sending a cookie to another listener on
+      that host (such as an agent-published `-P` app). Either require verified listener and
+      addressing isolation that prevents any agent-reachable listener from ever receiving the
+      auth cookie, or choose a transport that does not attach credentials across ports, and add
+      a synthetic second-listener regression with no real credentials. The daemon supplies the
+      authoritative CSP response header (`img-src 'self'` with no `data:` images, explicit
+      `font-src 'none'` unless self-hosted fonts are separately reviewed) and aligns its route
+      grammar with closed-enum SPA query parameters. Account for generated SvelteKit
+      bootstrapping in the actual header with an exact SHA-256 build hash, or load a reviewed
+      external bootstrap from the same origin. Any CSP report or fixture test server must reject
+      negative or oversized `Content-Length` reads and escape all logged report fields. Verify
+      that a production deep link starts under CSP and authentication and rejects unapproved
+      connections. Exercise a held reply and queued event delivered after logout or expiry and a
+      fresh login. Privileged actions, PTY and browser streams have separate review gates.
 - [ ] Prepare the shared SvelteKit components upfront for
       [M3 agent-assisted dashboard control](prd_m3.md#3-shared-sveltekit-frontend-loopback-web-auth-and-tauri-v2-uds-bridge)
       (evaluating [UI SDK](https://ui-sdk.dev) `@ui-sdk/svelte/agent`, Apache-2.0). Mark every

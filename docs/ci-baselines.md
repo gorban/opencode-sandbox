@@ -28,3 +28,6 @@ for the attended import and its scope.
   The job fails if GitHub reports a new high or critical dependency advisory. Check the job
   summary even when the graph has no changes. Mise tools, direct runtime downloads, and packages
   installed in images need separate inventory and scanning.
+- **Dependabot version updates** propose new commits for the pinned Actions each week, once a
+  release is seven days old. Review the upstream changes between the two commits before merging.
+  Dependabot security updates are a repository setting and are not delayed.

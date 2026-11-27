@@ -137,6 +137,13 @@ when inspected. This establishes the check identity and a scope gap. PR qualific
   PRs and reviewing lockfile updates. The offline Python cores use the standard library.
   Use focused local Semgrep rules if they add coverage for repository-specific trust boundaries.
   Add OSV-Scanner when resolved language lockfiles become part of a build or bootstrap.
+  - [x] Dependabot alerts and security updates are enabled in the repository settings
+        (2026-11-27). `.github/dependabot.yml` adds weekly version updates for the pinned
+        Actions with a seven-day cooldown (`fix/launcher-isolated-host-python`).
+  - [ ] Qualify the first Dependabot update PR: the required checks run, the CodeQL upload
+        completes, and the pinned commit and its version comment are both updated.
+  - [ ] Decide how the web UI spike lockfile, mise tools, image references and pins inside the
+        launcher are refreshed. Dependabot version updates do not cover them.
 - [ ] Keep baseline scanners in jobs outside the merge requirement. A completed scan reports
   findings without blocking. A tool, config, input, inventory, database or upload failure fails
   its job. An expected scan that cannot run is an explicit error. Preserve raw finding counts
