@@ -57,7 +57,10 @@ def main():
             term.await_screen("shell", lambda s: "Fixture exit 0" in s,
                               "shell cleanup", history=True, timeout=35)
         except BaseException:
-            screen = term.screen("shell", history=True)
+            try:
+                screen = term.screen("shell", history=True)
+            except Exception:
+                screen = ""
             print(failure_summary(screen), flush=True)
             raise
         finally:

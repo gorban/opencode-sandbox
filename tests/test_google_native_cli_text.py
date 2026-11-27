@@ -1,11 +1,14 @@
 """Exercise the fixed text command without credentials or provider traffic."""
 
 from contextlib import ExitStack
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
 import runpy
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -29,7 +32,8 @@ class NativeCliTextTest(unittest.TestCase):
             retirement = _NativeRetirement(root)
             actor = SimpleNamespace(pid=os.getpid())
             with ExitStack() as clean:
-                retirement.track(clean, actor, "native-acp")
+                slot = retirement.reserve("native-acp")
+                retirement.track(clean, actor, slot)
                 with patch("oc_google.native_text._retire", side_effect=subprocess.TimeoutExpired("native", 3)):
                     with self.assertRaises(subprocess.TimeoutExpired):
                         clean.close()
@@ -39,12 +43,55 @@ class NativeCliTextTest(unittest.TestCase):
             self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(receipt.read_text())["actors"][0]["pid"], os.getpid())
 
+    def test_failed_actor_record_and_retirement_keeps_pending_receipt(self):
+        with TemporaryDirectory() as base:
+            root = Path(base) / "native"
+            root.mkdir(mode=0o700)
+            retirement = _NativeRetirement(root)
+            actor = SimpleNamespace(pid=os.getpid())
+            with ExitStack() as clean:
+                proxy_slot = retirement.reserve("keyring-proxy")
+                retirement.track(clean, actor, proxy_slot)
+                native_slot = retirement.reserve("native-acp")
+                with patch.object(retirement, "_persist", side_effect=OSError("synthetic receipt failure")):
+                    with self.assertRaises(OSError):
+                        retirement.track(clean, actor, native_slot)
+                with patch("oc_google.native_text._retire", side_effect=subprocess.TimeoutExpired("native", 3)):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        clean.close()
+            retirement.remove_scratch_if_retired()
+            receipt = json.loads((root / "native-cleanup.json").read_text())
+            self.assertEqual(receipt["actors"][0]["state"], "tracked")
+            self.assertEqual(receipt["actors"][1], {"role": "native-acp", "state": "launch-pending"})
+
     def test_public_driver_failure_summary_never_echoes_terminal_data(self):
         secret = "synthetic-sensitive-terminal-value"
         result = public_driver["failure_summary"](
             f"Provider request failed {secret}\nFixture exit 7\n")
         self.assertEqual(result, "Public Google shell failed: provider-refusal; exit=7")
         self.assertNotIn(secret, result)
+
+    def test_public_driver_preserves_primary_failure_when_capture_fails(self):
+        class Terminal:
+            def start(self, *_):
+                raise RuntimeError("primary synthetic failure")
+
+            def screen(self, *_args, **_kwargs):
+                raise LookupError("capture failed")
+
+            def close(self):
+                pass
+
+        output = io.StringIO()
+        with (TemporaryDirectory() as base,
+              patch.object(sys, "stdin", SimpleNamespace(isatty=lambda: False,
+                                                        buffer=io.BytesIO(b"pytest approved public shell\n"))),
+              patch("runpy.run_path", return_value={"Terminal": lambda _: Terminal()}),
+              patch("pathlib.Path.home", return_value=Path(base)),
+              redirect_stdout(output),
+              self.assertRaisesRegex(RuntimeError, "primary synthetic failure")):
+            public_driver["main"]()
+        self.assertIn("Public Google shell failed: incomplete-shell; exit=None", output.getvalue())
 
     def test_failed_retirement_stays_unconfirmed_on_repeat(self):
         calls = []

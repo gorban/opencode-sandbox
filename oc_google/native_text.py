@@ -40,13 +40,7 @@ class _NativeRetirement:
         self.actors = []
         self.uncertain = False
 
-    def track(self, clean, process, role):
-        clean.callback(self.retire, process)
-        fields = (Path(f"/proc/{process.pid}/stat").read_text(encoding="ascii")
-                  .rpartition(") ")[2].split())
-        if len(fields) <= 19 or not fields[19].isdigit():
-            raise NativeCliTextError("Native ACP actor identity could not be recorded.")
-        self.actors.append({"role": role, "pid": process.pid, "start_ticks": int(fields[19])})
+    def _persist(self):
         destination = self.root / "native-cleanup.json"
         next_file = self.root / "native-cleanup.next"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -60,6 +54,23 @@ class _NativeRetirement:
             os.fsync(parent)
         finally:
             os.close(parent)
+
+    def reserve(self, role):
+        """Durably name an actor before a process can be launched for that role."""
+        slot = len(self.actors)
+        self.actors.append({"role": role, "state": "launch-pending"})
+        self._persist()
+        return slot
+
+    def track(self, clean, process, slot):
+        clean.callback(self.retire, process)
+        fields = (Path(f"/proc/{process.pid}/stat").read_text(encoding="ascii")
+                  .rpartition(") ")[2].split())
+        if len(fields) <= 19 or not fields[19].isdigit():
+            raise NativeCliTextError("Native ACP actor identity could not be recorded.")
+        self.actors[slot] = {"role": self.actors[slot]["role"], "state": "tracked",
+                             "pid": process.pid, "start_ticks": int(fields[19])}
+        self._persist()
 
     def retire(self, process):
         try:
@@ -131,11 +142,12 @@ def _keyring_proxy(clean, runtime, proxy_socket, retirement):
                       if os.path.isfile(path)), None)
     if proxy_exe is None or not bus.is_socket():
         raise NativeCliTextError("The workstation Secret Service proxy is unavailable.")
+    slot = retirement.reserve("keyring-proxy")
     proxy = subprocess.Popen(
         [proxy_exe, f"unix:path={bus}", str(proxy_socket), "--filter", "--talk=org.freedesktop.secrets"],
         env=_SYSTEM_ENV, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    retirement.track(clean, proxy, "keyring-proxy")
+    retirement.track(clean, proxy, slot)
     end = time.monotonic() + 4
     while proxy.poll() is None and not proxy_socket.is_socket() and time.monotonic() < end:
         time.sleep(.025)
@@ -158,9 +170,10 @@ def _start_native(clean, fd, home, workspace, proxy_socket, retirement):
         "/opt/agy", "acp", "--gemini-dir", "/home/provider/.gemini", "--app-data-dir", "antigravity-acp",
         "--agent", _AGENT, "--include-default-customizations=false", "--disable-telemetry", "--log-file", "/dev/null",
     ]
+    slot = retirement.reserve("native-acp")
     child = subprocess.Popen(argv, env=_SYSTEM_ENV, pass_fds=(fd,), stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
-    retirement.track(clean, child, "native-acp")
+    retirement.track(clean, child, slot)
     return child
 
 
