@@ -5,6 +5,7 @@ from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 import fcntl
 import hmac
+import inspect
 import json
 import os
 from pathlib import Path
@@ -2103,19 +2104,33 @@ class _SessionSlotCoordinator:
         with self._lock:
             self._record_error_locked(exc)
 
+    def _is_release_authorized_locked(self, state: _SlotState) -> bool:
+        relay_gone = state.relay_id is None or state.relay_id in self._removed_containers
+        return (
+            state.exited
+            and not state.creating_relay
+            and not state.create_unconfirmed
+            and not state.retire_timed_out
+            and state.grant_revoked
+            and state.broker_closed
+            and not state.revoke_or_close_failed
+            and relay_gone
+        )
+
     def _is_release_authorized(self, state: _SlotState) -> bool:
         with self._lock:
-            relay_gone = state.relay_id is None or state.relay_id in self._removed_containers
-            return (
-                state.exited
-                and not state.creating_relay
-                and not state.create_unconfirmed
-                and not state.retire_timed_out
-                and state.grant_revoked
-                and state.broker_closed
-                and not state.revoke_or_close_failed
-                and relay_gone
-            )
+            return self._is_release_authorized_locked(state)
+
+    def _claim_slot_settlement(self, state: _SlotState, leaf_claim: Callable[[], bool]) -> bool:
+        """Authorize publication under state.lock -> coordinator._lock -> release_gate._lock (zero I/O)."""
+        with self._lock:
+            if (
+                not self._is_release_authorized_locked(state)
+                or not state.store_released
+                or state.lease_confirmed_released
+            ):
+                return False
+            return leaf_claim() is True
 
     def _deny_slot_release(self, state: _SlotState) -> None:
         if state.handle.deny_lease_release is not None:
@@ -2124,6 +2139,25 @@ class _SessionSlotCoordinator:
             except Exception as exc:
                 self._record_error(exc)
 
+    def _invoke_slot_finalize(self, state: _SlotState, finalize: Callable[..., bool]) -> bool:
+        try:
+            if "authorizer" in inspect.signature(finalize).parameters:
+                settled = finalize(
+                    authorizer=lambda leaf_claim, s=state: self._claim_slot_settlement(s, leaf_claim),
+                )
+            else:
+                settled = finalize()
+        except Exception as exc:
+            self._deny_slot_release(state)
+            self._record_error(exc)
+            return False
+        if settled is not True:
+            self._record_error(
+                RuntimeError("Slot durable lease hold could not be settled after retirement")
+            )
+            return False
+        return True
+
     def _finalize_slot_hold(self, state: _SlotState) -> None:
         with self._lock:
             if state.retire_timed_out or state.revoke_or_close_failed or not state.store_released:
@@ -2131,17 +2165,8 @@ class _SessionSlotCoordinator:
             if state.lease_confirmed_released:
                 return
         finalize = getattr(state.handle, "finalize_lease_release", None)
-        if callable(finalize):
-            try:
-                if finalize() is not True:
-                    self._record_error(
-                        RuntimeError("Slot durable lease hold could not be cleared after retirement")
-                    )
-                    return
-            except Exception as exc:
-                self._deny_slot_release(state)
-                self._record_error(exc)
-                return
+        if callable(finalize) and not self._invoke_slot_finalize(state, finalize):
+            return
         try:
             confirmed = _slot_lease_release_confirmed(state.handle, allow_legacy=state.allow_legacy)
         except Exception as exc:

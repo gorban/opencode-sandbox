@@ -65,14 +65,19 @@ class _SlotReleaseGate:
         self._release_authorized = False
         self._release_denied = False
         self._coordinated = False
+        self._publish_claimed = False
         self._hold_cleared = False
-        self._hold_releaser: Callable[[], None] | None = None
+        self._hold_settler: Callable[..., bool] | None = None
         self._authority: Callable[[], bool] | None = None
         self._outcome: str | None = None
 
-    def bind_hold_releaser(self, releaser: Callable[[], None]) -> None:
+    def bind_hold_settler(self, settler: Callable[..., bool]) -> None:
         with self._lock:
-            self._hold_releaser = releaser
+            self._hold_settler = settler
+
+    def mark_hold_settled(self) -> None:
+        with self._lock:
+            self._hold_cleared = True
 
     def is_coordinated(self) -> bool:
         with self._lock:
@@ -116,27 +121,54 @@ class _SlotReleaseGate:
         with self._lock:
             self._outcome = outcome
 
-    def finalize_durable_release(self) -> bool:
-        """Clear pre-persisted durable hold ONLY after coordinator confirmed retirement without timeout."""
+    def claim_settlement_publish(self, *, require_outcome: bool = True) -> bool:
+        """Strict leaf lock: atomically claim one-shot publication authority (zero I/O, no callbacks)."""
         with self._lock:
-            if self._release_denied or self._outcome not in ("removed", "absent"):
+            if self._release_denied or self._publish_claimed:
                 return False
+            if require_outcome and self._outcome != "removed":
+                return False
+            if self._relay_created and not (self._relay_removed and self._release_authorized):
+                return False
+            self._publish_claimed = True
+            return True
+
+    def finalize_durable_release(
+        self, *, authorizer: Callable[[Callable[[], bool]], bool] | None = None,
+    ) -> bool:
+        """Publish durable settlement receipt ONLY after coordinator/gate authorization."""
+        with self._lock:
             if self._hold_cleared:
                 return True
-            releaser = self._hold_releaser
-        if releaser is not None:
-            releaser()
-        with self._lock:
-            if self._release_denied:
+            if self._release_denied or self._outcome not in ("removed", "absent"):
                 return False
+            if self._outcome == "absent":
+                self._hold_cleared = True
+                return True
+            settler = self._hold_settler
+        before_publish = (
+            (lambda: authorizer(self.claim_settlement_publish) is True)
+            if authorizer is not None
+            else self.claim_settlement_publish
+        )
+        if settler is not None:
+            if settler(before_publish=before_publish) is not True:
+                return False
+        elif before_publish() is not True:
+            return False
+        with self._lock:
             self._hold_cleared = True
             return True
 
     def is_release_confirmed(self) -> bool:
         with self._lock:
-            if self._release_denied or self._outcome not in ("removed", "absent"):
+            if self._outcome not in ("removed", "absent"):
                 return False
-            if self._coordinated and self._hold_releaser is not None and not self._hold_cleared:
+            if self._hold_cleared and self._publish_claimed:
+                return True
+            if self._release_denied:
+                return False
+            if self._coordinated and self._hold_settler is not None and not self._hold_cleared:
                 return False
             return True
 

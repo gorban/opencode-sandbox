@@ -269,7 +269,7 @@ class SlotHandle:
     deny_lease_release: Callable[[], None] | None = None
     bind_release_authority: Callable[[Callable[[], bool]], None] | None = None
     lease_release_confirmed: Callable[[], bool] | None = None
-    finalize_lease_release: Callable[[], bool] | None = None
+    finalize_lease_release: Callable[..., bool] | None = None
     relay_paths: RelayMountPaths | None = None
     revoke_grant: Callable[[], None] | None = None
     close_broker: Callable[[], None] | None = None

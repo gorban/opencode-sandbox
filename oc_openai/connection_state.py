@@ -7,9 +7,12 @@ import html
 import json
 import math
 import os
+import re
 import secrets
 import stat
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -48,6 +51,19 @@ def _timestamp(value):
 
 _STATE_FILE = "state.json"
 _HOLD_PREFIX = ".lease-hold-"
+_SETTLED_PREFIX = ".lease-settled-"
+_HOLD_MAX_BYTES = 1024
+_HOLD_JSON_KEYS = frozenset({"version", "state", "hold_id", "root", "incarnation"})
+_HOLD_ID_RE = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
+
+
+@dataclass(frozen=True)
+class LeaseHoldToken:
+    """Unique per-retirement hold identity binding hold and settlement markers."""
+
+    hold_id: str
+    root: str
+    incarnation: str
 
 
 def _valid_scalar_fields(value):
@@ -160,50 +176,184 @@ def _lock(fd):
             time.sleep(0.025)
 
 
-def lease_hold_name(root_name: str) -> str:
-    """Return a deterministic collision-free hold marker filename for one lease root."""
-    digest = hashlib.sha256(root_name.encode("utf-8", errors="surrogateescape")).hexdigest()[:32]
-    return f"{_HOLD_PREFIX}{digest}"
+def _valid_marker_stat(fd: int) -> bool:
+    info = os.fstat(fd)
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == os.geteuid()
+        and stat.S_IMODE(info.st_mode) == 0o600
+        and info.st_nlink == 1
+    )
 
 
-def _write_hold_in_dir(directory: int, name: str) -> None:
-    fd = os.open(name, os.O_WRONLY | os.O_CREAT | CREATE_FLAGS, 0o600, dir_fd=directory)
+def _read_bounded_fd(fd: int, limit: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) <= limit:
+        chunk = os.read(fd, (limit + 1) - len(chunks))
+        if not chunk:
+            break
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _write_all_fd(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    offset = 0
+    while offset < len(view):
+        written = os.write(fd, view[offset:])
+        if written <= 0:
+            raise OSError("short write")
+        offset += written
+
+
+def _encode_marker_payload(state: str, token: LeaseHoldToken) -> bytes:
+    payload = {
+        "version": 1,
+        "state": state,
+        "hold_id": token.hold_id,
+        "root": token.root,
+        "incarnation": token.incarnation,
+    }
+    return (json.dumps(payload, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("utf-8")
+
+
+def _parse_marker_payload(data: bytes, expected_state: str, expected_suffix: str) -> LeaseHoldToken | None:
+    if len(data) > _HOLD_MAX_BYTES or not _HOLD_ID_RE.fullmatch(expected_suffix):
+        return None
+    try:
+        obj = decode_json(data)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if type(obj) is not dict or set(obj) != _HOLD_JSON_KEYS:
+        return None
+    if type(obj["version"]) is not int or obj["version"] != 1 or obj["state"] != expected_state:
+        return None
+    hold_id, root, incarnation = obj["hold_id"], obj["root"], obj["incarnation"]
+    if (
+        type(hold_id) is not str or type(root) is not str or type(incarnation) is not str
+        or not root or not incarnation or hold_id != expected_suffix
+    ):
+        return None
+    return LeaseHoldToken(hold_id=hold_id, root=root, incarnation=incarnation)
+
+
+def _assert_marker_absent(directory: int, name: str) -> None:
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ConnectionError("managed_retirement_incomplete") from None
+    raise ConnectionError("managed_retirement_incomplete")
+
+
+def _open_validated_marker(
+    directory: int, name: str, expected_state: str, expected_suffix: str,
+) -> tuple[int, LeaseHoldToken] | None:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | CREATE_FLAGS, dir_fd=directory)
+    except OSError:
+        return None
+    try:
+        if not _valid_marker_stat(fd):
+            os.close(fd)
+            return None
+        data = _read_bounded_fd(fd, _HOLD_MAX_BYTES)
+        token = _parse_marker_payload(data, expected_state, expected_suffix)
+        if token is None:
+            os.close(fd)
+            return None
+        return fd, token
+    except OSError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _has_lockless_state_or_markers(directory: int) -> bool:
+    try:
+        os.stat(_STATE_FILE, dir_fd=directory, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return True
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return True
+    return any(name.startswith((_HOLD_PREFIX, _SETTLED_PREFIX)) for name in entries)
+
+
+def _write_hold_in_dir(directory: int, token: LeaseHoldToken, data: bytes) -> None:
+    hold_name = f"{_HOLD_PREFIX}{token.hold_id}"
+    settled_name = f"{_SETTLED_PREFIX}{token.hold_id}"
+    _assert_marker_absent(directory, hold_name)
+    _assert_marker_absent(directory, settled_name)
+    try:
+        fd = os.open(hold_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | CREATE_FLAGS, 0o600, dir_fd=directory)
+    except FileExistsError:
+        raise ConnectionError("managed_retirement_incomplete") from None
     try:
         _regular(fd)
-        os.write(fd, b"hold\n")
+        _write_all_fd(fd, data)
         os.fsync(fd)
     finally:
         os.close(fd)
     os.fsync(directory)
 
 
-def _restore_hold_best_effort(directory: int, name: str) -> None:
+def _gc_settled_pair(directory: int, hold_id: str) -> None:
+    hold_name = f"{_HOLD_PREFIX}{hold_id}"
+    settled_name = f"{_SETTLED_PREFIX}{hold_id}"
+    try:
+        try:
+            os.unlink(hold_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.fsync(directory)
+    except OSError:
+        return
     with contextlib.suppress(OSError):
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | CREATE_FLAGS, 0o600, dir_fd=directory)
+        try:
+            os.unlink(settled_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.fsync(directory)
+
+
+def _publish_settled_temp(
+    directory: int,
+    settled_name: str,
+    data: bytes,
+    before_publish: Callable[[], bool] | None,
+) -> bool:
+    tmp_name = ".lease-settle-tmp-" + secrets.token_hex(16)
+    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | CREATE_FLAGS, 0o600, dir_fd=directory)
+    tmp_unlinked = False
+    try:
         try:
             _regular(fd)
-            os.write(fd, b"hold\n")
-            with contextlib.suppress(OSError):
-                os.fsync(fd)
+            _write_all_fd(fd, data)
+            os.fsync(fd)
         finally:
             os.close(fd)
-    with contextlib.suppress(OSError):
+        if before_publish is not None and before_publish() is not True:
+            return False
+        try:
+            os.link(tmp_name, settled_name, src_dir_fd=directory, dst_dir_fd=directory)
+        except FileExistsError:
+            raise ConnectionError("managed_retirement_incomplete") from None
+        os.unlink(tmp_name, dir_fd=directory)
+        tmp_unlinked = True
         os.fsync(directory)
-
-
-def _clear_hold_in_dir(directory: int, name: str) -> None:
-    unlinked = False
-    try:
-        os.unlink(name, dir_fd=directory)
-        unlinked = True
-    except FileNotFoundError:
-        pass
-    try:
-        os.fsync(directory)
-    except BaseException:
-        if unlinked:
-            _restore_hold_best_effort(directory, name)
-        raise
+        return True
+    finally:
+        if not tmp_unlinked:
+            with contextlib.suppress(FileNotFoundError, OSError):
+                os.unlink(tmp_name, dir_fd=directory)
 
 
 class Store:
@@ -254,10 +404,8 @@ class Store:
             try:
                 mutex = os.open("state.lock", flags, 0o600, dir_fd=directory)
             except FileNotFoundError:
-                # An absent lock is an empty state only if no snapshot exists.
-                try:
-                    os.stat(_STATE_FILE, dir_fd=directory, follow_symlinks=False)
-                except FileNotFoundError:
+                # An absent lock is an empty state only if no snapshot or hold marker exists.
+                if not _has_lockless_state_or_markers(directory):
                     yield None
                     return
                 raise ConnectionError("untrusted_connection_file") from None
@@ -318,29 +466,67 @@ class Store:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary, dir_fd=directory)
 
-    def write_lease_hold(self, root_name: str, *, directory: int | None = None) -> None:
-        """Persist a durable hold marker before any irreversible lease release can occur."""
-        name = lease_hold_name(root_name)
+    def write_lease_hold(
+        self, root_name: str, incarnation: str, *, directory: int | None = None,
+    ) -> LeaseHoldToken:
+        """Persist a unique durable hold marker before any irreversible lease release."""
+        if (
+            type(root_name) is not str or not root_name
+            or type(incarnation) is not str or not incarnation
+        ):
+            raise ConnectionError("managed_retirement_incomplete")
+        hold_nonce = secrets.token_hex(16)
+        hold_id = hashlib.sha256(
+            f"{root_name}\0{incarnation}\0{hold_nonce}".encode("utf-8", errors="surrogateescape")
+        ).hexdigest()[:32]
+        token = LeaseHoldToken(hold_id=hold_id, root=root_name, incarnation=incarnation)
+        data = _encode_marker_payload("hold", token)
+        if len(data) > _HOLD_MAX_BYTES:
+            raise ConnectionError("managed_retirement_incomplete")
         if directory is not None:
-            _write_hold_in_dir(directory, name)
-            return
+            _write_hold_in_dir(directory, token, data)
+            return token
         opened = _directory(self.path, create=False)
         try:
-            _write_hold_in_dir(opened, name)
+            _write_hold_in_dir(opened, token, data)
+            return token
         finally:
             os.close(opened)
 
-    def clear_lease_hold(self, root_name: str, *, directory: int | None = None) -> None:
-        """Remove a durable hold marker after lease release is confirmed without timeout."""
-        name = lease_hold_name(root_name)
-        if directory is not None:
-            _clear_hold_in_dir(directory, name)
-            return
-        opened = _directory(self.path, create=False)
-        try:
-            _clear_hold_in_dir(opened, name)
-        finally:
-            os.close(opened)
+    def settle_lease_hold(
+        self,
+        token: LeaseHoldToken,
+        *,
+        directory: int | None = None,
+        before_publish: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Publish an authoritative settlement receipt for one validated hold, then GC best-effort."""
+        if directory is None:
+            raise ConnectionError("connection_storage_unavailable")
+        if not isinstance(token, LeaseHoldToken) or not _HOLD_ID_RE.fullmatch(token.hold_id):
+            raise ConnectionError("managed_retirement_incomplete")
+        record = self.read(directory)
+        single = record.get("worker_lease")
+        leases = record.get("worker_leases") or {}
+        if (isinstance(single, dict) and single.get("root") == token.root) or token.root in leases:
+            raise ConnectionError("managed_retirement_incomplete")
+        hold_name = f"{_HOLD_PREFIX}{token.hold_id}"
+        settled_name = f"{_SETTLED_PREFIX}{token.hold_id}"
+        opened = _open_validated_marker(directory, hold_name, "hold", token.hold_id)
+        if opened is None:
+            raise ConnectionError("managed_retirement_incomplete")
+        hold_fd, disk_token = opened
+        os.close(hold_fd)
+        if disk_token != token:
+            raise ConnectionError("managed_retirement_incomplete")
+        _assert_marker_absent(directory, settled_name)
+        data = _encode_marker_payload("settled", token)
+        if len(data) > _HOLD_MAX_BYTES:
+            raise ConnectionError("managed_retirement_incomplete")
+        if not _publish_settled_temp(directory, settled_name, data, before_publish):
+            return False
+        _gc_settled_pair(directory, token.hold_id)
+        return True
 
     def lease_hold_names(self, directory) -> frozenset[str] | None:
         if directory is None:
@@ -351,6 +537,42 @@ class Store:
             return None
         return frozenset(name for name in entries if name.startswith(_HOLD_PREFIX))
 
-    def has_lease_holds(self, directory) -> bool:
+    def _reconcile_hold_entry(self, directory: int, name: str, active_roots: frozenset[str]) -> bool:
+        suffix = name[len(_HOLD_PREFIX):]
+        if not _HOLD_ID_RE.fullmatch(suffix):
+            return False
+        opened_hold = _open_validated_marker(directory, name, "hold", suffix)
+        if opened_hold is None:
+            return False
+        hold_fd, hold_token = opened_hold
+        os.close(hold_fd)
+        if hold_token.root in active_roots:
+            return False
+        settled_name = f"{_SETTLED_PREFIX}{suffix}"
+        opened_settled = _open_validated_marker(directory, settled_name, "settled", suffix)
+        if opened_settled is None:
+            return False
+        settled_fd, settled_token = opened_settled
+        try:
+            if settled_token != hold_token:
+                return False
+            os.fsync(settled_fd)
+            os.fsync(directory)
+        except OSError:
+            return False
+        finally:
+            os.close(settled_fd)
+        _gc_settled_pair(directory, suffix)
+        return True
+
+    def has_lease_holds(self, directory, active_roots=()) -> bool:
         holds = self.lease_hold_names(directory)
-        return holds is None or bool(holds)
+        if holds is None:
+            return True
+        if not holds:
+            return False
+        active = frozenset(active_roots)
+        for name in sorted(holds):
+            if not self._reconcile_hold_entry(directory, name, active):
+                return True
+        return False

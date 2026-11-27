@@ -3297,9 +3297,10 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
             self.assertEqual(sw_err.exception.code, "managed_retirement_incomplete")
 
     def test_clear_hold_post_unlink_dir_fsync_failure_restores_guard_and_blocks_switch(self):
-        # Regression (R5 P2): if final os.fsync(directory) fails AFTER os.unlink() of the last
-        # .lease-hold-* guard (in BOTH coordinated and standalone teardown), the effective hold
-        # guard MUST be restored before state.lock releases so fresh Connection readers remain blocked.
+        # Regression (R5/R7): if final os.fsync(directory) fails AFTER durable settlement publication
+        # (.lease-settled-*), caller reports unconfirmed and fresh Connection readers remain blocked
+        # while fsync failure persists (both coordinated and standalone teardown).
+        import errno
         import pwd
         from oc_openai import connection_state as cs_mod
         from oc_openai.connection import Connection
@@ -3327,48 +3328,49 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
             coord.record_container("e" * 64, slot_index=0)
             handle.job.activate()
 
-            orig_unlink = cs_mod.os.unlink
+            orig_link = cs_mod.os.link
             orig_fsync = cs_mod.os.fsync
-            unlinked_hold = [False]
+            linked_settled = [False]
 
-            def track_unlink(path, *, dir_fd=None):
-                if isinstance(path, str) and path.startswith(".lease-hold-"):
-                    unlinked_hold[0] = True
-                return orig_unlink(path, dir_fd=dir_fd)
+            def track_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                if isinstance(dst, str) and dst.startswith(".lease-settled-"):
+                    linked_settled[0] = True
+                return orig_link(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-            def fail_fsync_after_hold_unlink(fd):
-                if unlinked_hold[0]:
-                    raise OSError("simulated post-unlink dir fsync failure")
+            def fail_fsync_after_publish(fd):
+                if linked_settled[0]:
+                    raise OSError(errno.EIO, "simulated post-publish dir fsync failure")
                 return orig_fsync(fd)
 
-            with (
-                patch.object(session_broker, "_remove_container_verified"),
-                patch.object(cs_mod.os, "unlink", side_effect=track_unlink),
-                patch.object(cs_mod.os, "fsync", side_effect=fail_fsync_after_hold_unlink),
-            ):
-                err = coord.teardown_all(None)
-
-            self.assertTrue(unlinked_hold[0])
-            self.assertIsNotNone(err)
-            self.assertFalse(coord._slots[0].lease_confirmed_released)
-            self.assertFalse(handle.lease_release_confirmed())
-            coord.remove_slot_roots(require_confirmed_leases=True)
-            self.assertTrue(slot_root.exists())
-
-            fresh_conn = Connection(personal_dir, host_probe=lambda: host)
-            self.assertTrue(fresh_conn.has_active_leases())
-            with self.assertRaises(ConnError) as sw_err:
-                fresh_conn.require_switchable()
-            self.assertEqual(sw_err.exception.code, "managed_retirement_incomplete")
             next_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
             self.addCleanup(lambda: shutil.rmtree(next_root, ignore_errors=True))
             next_job = _SessionJob(next_root, "inc_" + secrets.token_hex(16))
             next_job.prepare(config_payload=None)
             self.addCleanup(next_job.revoke)
-            lease_cm = fresh_conn.session_lease(pref.handle.binding, next_job)
-            with self.assertRaises(ConnError) as lease_err:
-                lease_cm.__enter__()
-            self.assertEqual(lease_err.exception.code, "managed_retirement_incomplete")
+
+            with (
+                patch.object(session_broker, "_remove_container_verified"),
+                patch.object(cs_mod.os, "link", side_effect=track_link),
+                patch.object(cs_mod.os, "fsync", side_effect=fail_fsync_after_publish),
+            ):
+                err = coord.teardown_all(None)
+
+                self.assertTrue(linked_settled[0])
+                self.assertIsNotNone(err)
+                self.assertFalse(coord._slots[0].lease_confirmed_released)
+                self.assertFalse(handle.lease_release_confirmed())
+                coord.remove_slot_roots(require_confirmed_leases=True)
+                self.assertTrue(slot_root.exists())
+
+                fresh_conn = Connection(personal_dir, host_probe=lambda: host)
+                self.assertTrue(fresh_conn.has_active_leases())
+                with self.assertRaises(ConnError) as sw_err:
+                    fresh_conn.require_switchable()
+                self.assertEqual(sw_err.exception.code, "managed_retirement_incomplete")
+                lease_cm = fresh_conn.session_lease(pref.handle.binding, next_job)
+                with self.assertRaises(ConnError) as lease_err:
+                    lease_cm.__enter__()
+                self.assertEqual(lease_err.exception.code, "managed_retirement_incomplete")
 
         # Case 2: Standalone Connection.session_lease() teardown path.
         with tempfile.TemporaryDirectory(prefix="oc-mix-clrsyn-sa-", dir=home) as home_raw:
@@ -3385,42 +3387,43 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
             self.addCleanup(sa_job.revoke)
             sa_job.activate()
 
-            orig_unlink = cs_mod.os.unlink
+            orig_link = cs_mod.os.link
             orig_fsync = cs_mod.os.fsync
-            sa_unlinked = [False]
+            sa_linked = [False]
 
-            def sa_track_unlink(path, *, dir_fd=None):
-                if isinstance(path, str) and path.startswith(".lease-hold-"):
-                    sa_unlinked[0] = True
-                return orig_unlink(path, dir_fd=dir_fd)
+            def sa_track_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                if isinstance(dst, str) and dst.startswith(".lease-settled-"):
+                    sa_linked[0] = True
+                return orig_link(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
             def sa_fail_fsync(fd):
-                if sa_unlinked[0]:
-                    raise OSError("simulated standalone post-unlink dir fsync failure")
+                if sa_linked[0]:
+                    raise OSError(errno.EIO, "simulated standalone post-publish dir fsync failure")
                 return orig_fsync(fd)
 
-            with (
-                patch.object(cs_mod.os, "unlink", side_effect=sa_track_unlink),
-                patch.object(cs_mod.os, "fsync", side_effect=sa_fail_fsync),
-            ):
-                with self.assertRaises(ConnError):
-                    with conn.session_lease(pref.handle.binding, sa_job):
-                        sa_job.revoke()
-            self.assertTrue(sa_unlinked[0])
-            fresh_sa = Connection(personal_dir, host_probe=lambda: host)
-            self.assertTrue(fresh_sa.has_active_leases())
-            with self.assertRaises(ConnError) as sa_sw:
-                fresh_sa.require_switchable()
-            self.assertEqual(sa_sw.exception.code, "managed_retirement_incomplete")
             other_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
             self.addCleanup(lambda: shutil.rmtree(other_root, ignore_errors=True))
             other_job = _SessionJob(other_root, "inc_" + secrets.token_hex(16))
             other_job.prepare(config_payload=None)
             self.addCleanup(other_job.revoke)
-            sa_lease_cm = fresh_sa.session_lease(pref.handle.binding, other_job)
-            with self.assertRaises(ConnError) as sa_new:
-                sa_lease_cm.__enter__()
-            self.assertEqual(sa_new.exception.code, "managed_retirement_incomplete")
+
+            with (
+                patch.object(cs_mod.os, "link", side_effect=sa_track_link),
+                patch.object(cs_mod.os, "fsync", side_effect=sa_fail_fsync),
+            ):
+                with self.assertRaises(ConnError):
+                    with conn.session_lease(pref.handle.binding, sa_job):
+                        sa_job.revoke()
+                self.assertTrue(sa_linked[0])
+                fresh_sa = Connection(personal_dir, host_probe=lambda: host)
+                self.assertTrue(fresh_sa.has_active_leases())
+                with self.assertRaises(ConnError) as sa_sw:
+                    fresh_sa.require_switchable()
+                self.assertEqual(sa_sw.exception.code, "managed_retirement_incomplete")
+                sa_lease_cm = fresh_sa.session_lease(pref.handle.binding, other_job)
+                with self.assertRaises(ConnError) as sa_new:
+                    sa_lease_cm.__enter__()
+                self.assertEqual(sa_new.exception.code, "managed_retirement_incomplete")
 
     def test_refused_final_write_matching_hold_blocks_new_same_registration_lease(self):
         # Regression (R5 matching-hold admission): when a refused final store write leaves BOTH
@@ -3466,6 +3469,853 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
             with self.assertRaises(ConnError) as mh_err:
                 mh_lease_cm.__enter__()
             self.assertEqual(mh_err.exception.code, "managed_retirement_incomplete")
+
+    def _make_probe_job(self) -> _SessionJob:
+        probe_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+        self.addCleanup(lambda: shutil.rmtree(probe_root, ignore_errors=True))
+        probe_job = _SessionJob(probe_root, "inc_" + secrets.token_hex(16))
+        probe_job.prepare(config_payload=None)
+        self.addCleanup(probe_job.revoke)
+        return probe_job
+
+    def _assert_fresh_reader_blocked(
+        self, personal_dir: Path, host, binding, *, probe_job: _SessionJob | None = None,
+        expect_session_lease_blocked: bool = True,
+    ) -> None:
+        from oc_openai.connection import Connection
+        from oc_openai.connection_state import ConnectionError as ConnError
+
+        fresh = Connection(personal_dir, host_probe=lambda: host)
+        self.assertTrue(fresh.has_active_leases())
+        with self.assertRaises(ConnError) as sw_err:
+            fresh.require_switchable()
+        self.assertEqual(sw_err.exception.code, "managed_retirement_incomplete")
+        job = probe_job if probe_job is not None else self._make_probe_job()
+        wl_cm = fresh.worker_lease(binding, job)
+        with self.assertRaises(ConnError) as wl_err:
+            wl_cm.__enter__()
+        self.assertEqual(wl_err.exception.code, "managed_retirement_incomplete")
+        if expect_session_lease_blocked:
+            lease_cm = fresh.session_lease(binding, job)
+            with self.assertRaises(ConnError) as lease_err:
+                lease_cm.__enter__()
+            self.assertEqual(lease_err.exception.code, "managed_retirement_incomplete")
+
+    def test_r7_lock_dag_contention_and_nonblocking_timeout_denial(self):
+        # Regression (R7 #1): deterministic lock-DAG contention (coordinator._lock -> release_gate._lock
+        # alongside _finalize_slot_hold -> state.lock -> coordinator._lock -> release_gate._lock) and
+        # non-blocking timeout denial across BOTH joined background-worker and synchronous teardown paths.
+        import pwd
+        from oc_openai import connection_state as cs_mod
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        for mode in ("joined", "synchronous"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory(prefix=f"oc-r7-dag-{mode}-", dir=home) as home_raw:
+                    home_scratch = Path(home_raw)
+                    os.chmod(home_scratch, 0o700)
+                    _, adapter, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                        home_scratch / "profiles",
+                    )
+                    slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+                    self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+                    coord = _SessionSlotCoordinator(threading.Event())
+                    slot_cm = adapter.open_slot(
+                        pref, slot_index=0, slot_root=slot_root, port=8401,
+                        worker_token="tok-r7dag-" + "a" * 24,
+                        acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+                    )
+                    handle = slot_cm.__enter__()
+                    coord.register_slot(slot_cm, handle, slot_root, allow_legacy=True)
+                    coord.record_container("a" * 64, slot_index=0)
+                    handle.job.activate()
+
+                    orig_settle = cs_mod.Store.settle_lease_hold
+                    entered_before_pub = threading.Event()
+                    release_before_pub = threading.Event()
+                    contender_done = threading.Event()
+                    contender_err: list[BaseException] = []
+
+                    def wrapped_settle(store_self, token, *, directory=None, before_publish=None):
+                        def wrapped_bp():
+                            entered_before_pub.set()
+                            release_before_pub.wait(timeout=3.0)
+                            return before_publish() if before_publish is not None else True
+
+                        return orig_settle(store_self, token, directory=directory, before_publish=wrapped_bp)
+
+                    def contender():
+                        try:
+                            self.assertTrue(entered_before_pub.wait(timeout=3.0))
+                            # Acquires coordinator._lock -> release_gate._lock while main thread holds state.lock
+                            # and is about to acquire coordinator._lock -> release_gate._lock (zero deadlock!).
+                            coord.record_container("b" * 64, slot_index=0)
+                        except BaseException as exc:  # pragma: no cover
+                            contender_err.append(exc)
+                        finally:
+                            release_before_pub.set()
+                            contender_done.set()
+
+                    worker = threading.Thread(target=contender, daemon=True)
+                    worker.start()
+                    t0 = time.monotonic()
+                    with (
+                        patch.object(session_broker, "_remove_container_verified"),
+                        patch.object(cs_mod.Store, "settle_lease_hold", wrapped_settle),
+                    ):
+                        if mode == "joined":
+                            coord.on_revoke(0)
+                            # Wait for background retire thread to release store before teardown_all joins it.
+                            for t in list(coord._retire_threads):
+                                t.join(timeout=3.0)
+                        err = coord.teardown_all(None)
+                    elapsed = time.monotonic() - t0
+                    worker.join(timeout=3.0)
+                    self.assertTrue(contender_done.is_set())
+                    self.assertEqual(contender_err, [])
+                    self.assertLess(elapsed, 2.0, f"lock-DAG contention took too long ({elapsed:.2f}s)")
+                    # Because contender recorded a new unremoved container before publication claim,
+                    # coordinator invariants MUST deny settlement cleanly with zero deadlock!
+                    self.assertIsNotNone(err)
+                    self.assertFalse(handle.lease_release_confirmed())
+                    self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
+        # Also prove non-blocking timeout denial never invokes settle_lease_hold or write_lease_hold.
+        with tempfile.TemporaryDirectory(prefix="oc-r7-dag-to-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+            _, adapter, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                home_scratch / "profiles",
+            )
+            slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+            coord = _SessionSlotCoordinator(threading.Event())
+            slot_cm = adapter.open_slot(
+                pref, slot_index=0, slot_root=slot_root, port=8401,
+                worker_token="tok-r7to-" + "b" * 24,
+                acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+            )
+            handle = slot_cm.__enter__()
+            coord.register_slot(slot_cm, handle, slot_root, allow_legacy=True)
+            coord.record_container("c" * 64, slot_index=0)
+            handle.job.activate()
+
+            entered = threading.Event()
+            release = threading.Event()
+            orig_replace = cs_mod.os.replace
+            orig_join = threading.Thread.join
+
+            def slow_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                if dst == cs_mod._STATE_FILE and not entered.is_set():
+                    entered.set()
+                    release.wait(timeout=5.0)
+                return orig_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+            def forbid_io(*_a, **_kw):
+                raise AssertionError("timeout denial must not perform store I/O")
+
+            try:
+                with (
+                    patch.object(session_broker, "_remove_container_verified"),
+                    patch.object(cs_mod.os, "replace", side_effect=slow_replace),
+                ):
+                    coord.on_revoke(0)
+                    self.assertTrue(entered.wait(timeout=2.0))
+                    with (
+                        patch.object(cs_mod.Store, "write_lease_hold", side_effect=forbid_io),
+                        patch.object(cs_mod.Store, "settle_lease_hold", side_effect=forbid_io),
+                    ):
+                        t0 = time.monotonic()
+                        with patch.object(threading.Thread, "join", lambda s, timeout=None: orig_join(s, timeout=0.05)):
+                            err = coord.teardown_all(None)
+                        elapsed = time.monotonic() - t0
+                self.assertIsNotNone(err)
+                self.assertLess(elapsed, 0.5)
+            finally:
+                release.set()
+                for t in list(coord._retire_threads):
+                    orig_join(t, timeout=2.0)
+            self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
+    def test_r7_pre_claim_vs_post_claim_denial_coordinated_and_standalone(self):
+        # Regression (R7 #2): pre-claim denial during temp-file fsync blocks receipt publication;
+        # post-claim denial after claim_settlement_publish() allows publication (distinct from pre-claim),
+        # and if caller sync then fails, fresh reader reconciles only after disk validation + fsyncs.
+        import errno
+        import pwd
+        from oc_openai import connection_state as cs_mod
+        from oc_openai.connection import Connection
+        from oc_openai.connection_state import ConnectionError as ConnError
+        from oc_openai.session_adapter import _SlotReleaseGate
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+        # Part A: Pre-claim denial during os.fsync(tmp_fd) — coordinated AND standalone.
+        for path_kind in ("coordinated", "standalone_gate", "standalone_callable"):
+            with self.subTest(phase="pre_claim", path_kind=path_kind):
+                with tempfile.TemporaryDirectory(prefix="oc-r7-pre-", dir=home) as home_raw:
+                    home_scratch = Path(home_raw)
+                    os.chmod(home_scratch, 0o700)
+                    _, adapter, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                        home_scratch / "profiles",
+                    )
+                    orig_open = cs_mod.os.open
+                    orig_fsync = cs_mod.os.fsync
+                    tmp_fds: set[int] = set()
+                    denied_in_tmp_fsync = [False]
+                    trigger_deny: list[object] = []
+
+                    def track_open(path, flags, mode=0o777, *, dir_fd=None):
+                        fd = orig_open(path, flags, mode, dir_fd=dir_fd)
+                        if isinstance(path, str) and path.startswith(".lease-settle-tmp-"):
+                            tmp_fds.add(fd)
+                        return fd
+
+                    def deny_during_tmp_fsync(fd):
+                        res = orig_fsync(fd)
+                        if fd in tmp_fds and not denied_in_tmp_fsync[0]:
+                            denied_in_tmp_fsync[0] = True
+                            trigger_deny[0]()
+                        return res
+
+                    if path_kind == "coordinated":
+                        slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+                        self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+                        coord = _SessionSlotCoordinator(threading.Event())
+                        slot_cm = adapter.open_slot(
+                            pref, slot_index=0, slot_root=slot_root, port=8401,
+                            worker_token="tok-r7pre-" + "a" * 24,
+                            acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+                        )
+                        handle = slot_cm.__enter__()
+                        coord.register_slot(slot_cm, handle, slot_root, allow_legacy=True)
+                        coord.record_container("d" * 64, slot_index=0)
+                        handle.job.activate()
+                        trigger_deny.append(handle.deny_lease_release)
+                        with (
+                            patch.object(session_broker, "_remove_container_verified"),
+                            patch.object(cs_mod.os, "open", side_effect=track_open),
+                            patch.object(cs_mod.os, "fsync", side_effect=deny_during_tmp_fsync),
+                        ):
+                            err = coord.teardown_all(None)
+                        self.assertIsNotNone(err)
+                        self.assertFalse(handle.lease_release_confirmed())
+                    else:
+                        conn = Connection(personal_dir, host_probe=lambda: host)
+                        job_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+                        self.addCleanup(lambda: shutil.rmtree(job_root, ignore_errors=True))
+                        job = _SessionJob(job_root, "inc_" + secrets.token_hex(16))
+                        job.prepare(config_payload=None)
+                        self.addCleanup(job.revoke)
+                        job.activate()
+                        outcomes: list[str] = []
+                        if path_kind == "standalone_gate":
+                            gate = _SlotReleaseGate()
+                            trigger_deny.append(gate.deny_release)
+                        else:
+                            allowed_box = [True]
+                            gate = lambda: allowed_box[0]
+                            trigger_deny.append(lambda: allowed_box.__setitem__(0, False))
+                        with (
+                            patch.object(cs_mod.os, "open", side_effect=track_open),
+                            patch.object(cs_mod.os, "fsync", side_effect=deny_during_tmp_fsync),
+                        ):
+                            with conn.session_lease(
+                                pref.handle.binding, job, release_gate=gate, on_release_result=outcomes.append,
+                            ):
+                                job.revoke()
+                        self.assertEqual(outcomes, ["retained_gate_closed"])
+
+                    self.assertTrue(denied_in_tmp_fsync[0])
+                    names = sorted(p.name for p in personal_dir.iterdir())
+                    self.assertFalse(any(n.startswith(".lease-settled-") for n in names))
+                    self.assertFalse(any(n.startswith(".lease-settle-tmp-") for n in names))
+                    self.assertTrue(any(n.startswith(".lease-hold-") for n in names))
+                    self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
+        # Part B: Post-claim denial strictly AFTER claim_settlement_publish() returned True.
+        for fail_dir_sync in (False, True):
+            with self.subTest(phase="post_claim", fail_dir_sync=fail_dir_sync):
+                with tempfile.TemporaryDirectory(prefix="oc-r7-post-", dir=home) as home_raw:
+                    home_scratch = Path(home_raw)
+                    os.chmod(home_scratch, 0o700)
+                    _, adapter, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                        home_scratch / "profiles",
+                    )
+                    slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+                    self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+                    coord = _SessionSlotCoordinator(threading.Event())
+                    slot_cm = adapter.open_slot(
+                        pref, slot_index=0, slot_root=slot_root, port=8401,
+                        worker_token="tok-r7post-" + "c" * 24,
+                        acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+                    )
+                    handle = slot_cm.__enter__()
+                    coord.register_slot(slot_cm, handle, slot_root, allow_legacy=True)
+                    coord.record_container("e" * 64, slot_index=0)
+                    handle.job.activate()
+
+                    orig_link = cs_mod.os.link
+                    orig_fsync = cs_mod.os.fsync
+                    linked = [False]
+
+                    def post_claim_deny_at_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                        if isinstance(dst, str) and dst.startswith(".lease-settled-"):
+                            # Strictly AFTER claim_settlement_publish() already returned True!
+                            handle.deny_lease_release()
+                            linked[0] = True
+                        return orig_link(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+                    def maybe_fail_sync(fd):
+                        if fail_dir_sync and linked[0]:
+                            raise OSError(errno.EIO, "simulated post-claim dir fsync EIO")
+                        return orig_fsync(fd)
+
+                    probe_job = self._make_probe_job()
+                    with (
+                        patch.object(session_broker, "_remove_container_verified"),
+                        patch.object(cs_mod.os, "link", side_effect=post_claim_deny_at_link),
+                        patch.object(cs_mod.os, "fsync", side_effect=maybe_fail_sync),
+                    ):
+                        err = coord.teardown_all(None)
+                        self.assertTrue(linked[0])
+                        if fail_dir_sync:
+                            self.assertIsNotNone(err)
+                            self.assertFalse(handle.lease_release_confirmed())
+                            # While EIO persists, fresh reader stays blocked.
+                            self._assert_fresh_reader_blocked(
+                                personal_dir, host, pref.handle.binding, probe_job=probe_job,
+                            )
+                        else:
+                            self.assertIsNone(err)
+                            self.assertTrue(handle.lease_release_confirmed())
+
+                    # Once fsync works, fresh reader reconciles cleanly!
+                    recovered = Connection(personal_dir, host_probe=lambda: host)
+                    self.assertFalse(recovered.has_active_leases())
+                    recovered.require_switchable()
+
+    def test_r7_forced_hold_id_collision_with_orphan_settled_fails_closed(self):
+        # Regression (R7 #3): forced hold_id collision with a pre-existing orphan .lease-settled-<id>
+        # during write_lease_hold() MUST fail closed, retain worker_leases[root], and block readers.
+        import hashlib
+        import pwd
+        from oc_openai import connection_state as cs_mod
+        from oc_openai.connection import Connection
+        from oc_openai.connection_state import ConnectionError as ConnError
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with tempfile.TemporaryDirectory(prefix="oc-r7-coll-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+            _, _, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                home_scratch / "profiles",
+            )
+            conn = Connection(personal_dir, host_probe=lambda: host)
+            job_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(job_root, ignore_errors=True))
+            incarnation = "inc_" + secrets.token_hex(16)
+            job = _SessionJob(job_root, incarnation)
+            job.prepare(config_payload=None)
+            self.addCleanup(job.revoke)
+            job.activate()
+
+            forced_nonce = "00112233445566778899aabbccddeeff"
+            expected_hold_id = hashlib.sha256(
+                f"{job.root.name}\0{incarnation}\0{forced_nonce}".encode("utf-8")
+            ).hexdigest()[:32]
+            orphan_settled = personal_dir / f".lease-settled-{expected_hold_id}"
+            orphan_payload = json.dumps({
+                "version": 1, "state": "settled", "hold_id": expected_hold_id,
+                "root": job.root.name, "incarnation": incarnation,
+            }).encode("utf-8") + b"\n"
+            fd = os.open(orphan_settled, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, orphan_payload)
+            finally:
+                os.close(fd)
+
+            with patch.object(cs_mod.secrets, "token_hex", return_value=forced_nonce):
+                with self.assertRaises(ConnError) as coll_err:
+                    with conn.session_lease(pref.handle.binding, job):
+                        job.revoke()
+            self.assertEqual(coll_err.exception.code, "managed_retirement_incomplete")
+            self.assertFalse((personal_dir / f".lease-hold-{expected_hold_id}").exists())
+            state_data = json.loads((personal_dir / "state.json").read_text(encoding="utf-8"))
+            self.assertIn(job.root.name, state_data.get("worker_leases", {}))
+            self._assert_fresh_reader_blocked(
+                personal_dir, host, pref.handle.binding, expect_session_lease_blocked=False,
+            )
+            # Same-root session_lease is also refused while worker_leases[job.root.name] is retained.
+            dup_cm = Connection(personal_dir, host_probe=lambda: host).session_lease(pref.handle.binding, job)
+            with self.assertRaises(ConnError) as dup_err:
+                dup_cm.__enter__()
+            self.assertEqual(dup_err.exception.code, "managed_retirement_incomplete")
+
+    def test_r7_pre_publication_on_disk_hold_and_receipt_checks(self):
+        # Regression (R7 #4): (a) missing on-disk hold -> writer refuses without publishing;
+        # (b) mutated/malformed hold -> writer refuses AND reader stays blocked;
+        # (c) pre-existing .lease-settled-* -> writer refuses without overwriting AND reader stays blocked.
+        import pwd
+        from oc_openai.connection_state import ConnectionError as ConnError
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        for scenario in ("missing_hold", "mutated_hold", "existing_settled"):
+            with self.subTest(scenario=scenario):
+                with tempfile.TemporaryDirectory(prefix=f"oc-r7-prepub-{scenario}-", dir=home) as home_raw:
+                    home_scratch = Path(home_raw)
+                    os.chmod(home_scratch, 0o700)
+                    _, adapter, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                        home_scratch / "profiles",
+                    )
+                    slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+                    self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+                    coord = _SessionSlotCoordinator(threading.Event())
+                    slot_cm = adapter.open_slot(
+                        pref, slot_index=0, slot_root=slot_root, port=8401,
+                        worker_token="tok-r7prepub-" + "f" * 24,
+                        acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+                    )
+                    handle = slot_cm.__enter__()
+                    coord.register_slot(slot_cm, handle, slot_root, allow_legacy=True)
+                    coord.record_container("f" * 64, slot_index=0)
+                    handle.job.activate()
+
+                    with patch.object(session_broker, "_remove_container_verified"):
+                        coord.on_revoke(0)
+                        for t in list(coord._retire_threads):
+                            t.join(timeout=3.0)
+
+                    holds = [p for p in personal_dir.iterdir() if p.name.startswith(".lease-hold-")]
+                    self.assertEqual(len(holds), 1)
+                    hold_path = holds[0]
+                    hold_id = hold_path.name[len(".lease-hold-"):]
+                    settled_path = personal_dir / f".lease-settled-{hold_id}"
+                    planted_bytes = b'{"version":1,"state":"settled","hold_id":"' + hold_id.encode("ascii") + b'","root":"other","incarnation":"inc_0"}\n'
+
+                    if scenario == "missing_hold":
+                        hold_path.unlink()
+                    elif scenario == "mutated_hold":
+                        hold_path.write_bytes(b"corrupted-hold\n")
+                    else:
+                        fd = os.open(settled_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        try:
+                            os.write(fd, planted_bytes)
+                        finally:
+                            os.close(fd)
+
+                    with patch.object(session_broker, "_remove_container_verified"):
+                        err = coord.teardown_all(None)
+
+                    self.assertIsNotNone(err)
+                    self.assertFalse(coord._slots[0].lease_confirmed_released)
+                    self.assertFalse(handle.lease_release_confirmed())
+                    coord.remove_slot_roots(require_confirmed_leases=True)
+                    self.assertTrue(slot_root.exists())
+
+                    if scenario == "missing_hold":
+                        # Writer refusal only; no .lease-settled-* published.
+                        self.assertFalse(settled_path.exists())
+                    elif scenario == "mutated_hold":
+                        self.assertFalse(settled_path.exists())
+                        self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+                    else:
+                        # Existing settled marker MUST NOT be overwritten, and reader stays blocked.
+                        self.assertEqual(settled_path.read_bytes(), planted_bytes)
+                        self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
+    def test_r7_publish_before_sync_persistent_and_recovered_eio_plus_enospc(self):
+        # Regression (R7 #5): publish-before-sync EIO across joined, synchronous, and standalone paths
+        # paired with ENOSPC on O_CREAT and EIO on unlink; reader stays blocked while EIO persists
+        # and reconciles via fsync(settled_fd) + fsync(directory) once fsync recovers.
+        import errno
+        import pwd
+        from oc_openai import connection_state as cs_mod
+        from oc_openai.connection import Connection
+        from oc_openai.connection_state import ConnectionError as ConnError
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        for mode in ("joined", "synchronous", "standalone"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory(prefix=f"oc-r7-eio-{mode}-", dir=home) as home_raw:
+                    home_scratch = Path(home_raw)
+                    os.chmod(home_scratch, 0o700)
+                    _, adapter, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                        home_scratch / "profiles",
+                    )
+                    orig_link = cs_mod.os.link
+                    orig_fsync = cs_mod.os.fsync
+                    orig_open = cs_mod.os.open
+                    orig_unlink = cs_mod.os.unlink
+                    published = [False]
+
+                    def track_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                        if isinstance(dst, str) and dst.startswith(".lease-settled-"):
+                            published[0] = True
+                        return orig_link(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+                    def persistent_eio_fsync(fd):
+                        if published[0]:
+                            raise OSError(errno.EIO, "persistent EIO on fsync")
+                        return orig_fsync(fd)
+
+                    def paired_enospc_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+                        if published[0] and (flags & os.O_CREAT):
+                            raise OSError(errno.ENOSPC, "paired ENOSPC on O_CREAT")
+                        return orig_open(path, flags, mode_bits, dir_fd=dir_fd)
+
+                    def paired_eio_unlink(path, *, dir_fd=None):
+                        if published[0] and isinstance(path, str) and path.startswith(".lease-hold-"):
+                            raise OSError(errno.EIO, "paired EIO on hold unlink")
+                        return orig_unlink(path, dir_fd=dir_fd)
+
+                    probe_job = self._make_probe_job()
+                    sa_job = self._make_probe_job() if mode == "standalone" else None
+                    slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp")) if mode != "standalone" else None
+                    if slot_root is not None:
+                        self.addCleanup(lambda sr=slot_root: shutil.rmtree(sr, ignore_errors=True))
+                    with (
+                        patch.object(session_broker, "_remove_container_verified"),
+                        patch.object(cs_mod.os, "link", side_effect=track_link),
+                        patch.object(cs_mod.os, "fsync", side_effect=persistent_eio_fsync),
+                        patch.object(cs_mod.os, "open", side_effect=paired_enospc_open),
+                        patch.object(cs_mod.os, "unlink", side_effect=paired_eio_unlink),
+                    ):
+                        if mode == "standalone":
+                            conn = Connection(personal_dir, host_probe=lambda: host)
+                            assert sa_job is not None
+                            sa_job.activate()
+                            with self.assertRaises(ConnError):
+                                with conn.session_lease(pref.handle.binding, sa_job):
+                                    sa_job.revoke()
+                        else:
+                            assert slot_root is not None
+                            coord = _SessionSlotCoordinator(threading.Event())
+                            slot_cm = adapter.open_slot(
+                                pref, slot_index=0, slot_root=slot_root, port=8401,
+                                worker_token="tok-r7eio-" + "a" * 24,
+                                acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+                            )
+                            handle = slot_cm.__enter__()
+                            coord.register_slot(slot_cm, handle, slot_root, allow_legacy=True)
+                            coord.record_container("1" * 64, slot_index=0)
+                            handle.job.activate()
+                            if mode == "joined":
+                                coord.on_revoke(0)
+                                for t in list(coord._retire_threads):
+                                    t.join(timeout=3.0)
+                            err = coord.teardown_all(None)
+                            self.assertIsNotNone(err)
+                            self.assertFalse(handle.lease_release_confirmed())
+                            coord.remove_slot_roots(require_confirmed_leases=True)
+                            self.assertTrue(slot_root.exists())
+
+                        self.assertTrue(published[0])
+                        # While EIO + ENOSPC persist, fresh reader MUST stay blocked!
+                        self._assert_fresh_reader_blocked(
+                            personal_dir, host, pref.handle.binding, probe_job=probe_job,
+                        )
+
+                    # Once fsync recovers, fresh reader reconciles via fsync(settled_fd) + fsync(directory).
+                    fsync_calls: list[int] = []
+
+                    def record_fsync(fd):
+                        fsync_calls.append(fd)
+                        return orig_fsync(fd)
+
+                    with patch.object(cs_mod.os, "fsync", side_effect=record_fsync):
+                        recovered = Connection(personal_dir, host_probe=lambda: host)
+                        self.assertFalse(recovered.has_active_leases())
+                        recovered.require_switchable()
+                    self.assertGreaterEqual(len(fsync_calls), 2)
+                    leftovers = [p.name for p in personal_dir.iterdir() if p.name.startswith((".lease-hold-", ".lease-settled-"))]
+                    self.assertEqual(leftovers, [])
+
+    def test_r7_gc_ordering_under_hold_delete_dir_fsync_eio_preserves_settled(self):
+        # Regression (R7 #6): when os.fsync(directory) fails with EIO right after os.unlink(".lease-hold-*")
+        # in BOTH caller Step 2 AND reader reconciliation, os.unlink(".lease-settled-*") MUST NEVER be called
+        # and .lease-settled-* MUST remain preserved on disk.
+        import errno
+        import pwd
+        from oc_openai import connection_state as cs_mod
+        from oc_openai.connection import Connection
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+        # Path 1: Caller Step 2 GC under hold-delete dir-fsync EIO.
+        with tempfile.TemporaryDirectory(prefix="oc-r7-gc-caller-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+            _, adapter, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                home_scratch / "profiles",
+            )
+            slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+            coord = _SessionSlotCoordinator(threading.Event())
+            slot_cm = adapter.open_slot(
+                pref, slot_index=0, slot_root=slot_root, port=8401,
+                worker_token="tok-r7gc1-" + "a" * 24,
+                acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+            )
+            handle = slot_cm.__enter__()
+            coord.register_slot(slot_cm, handle, slot_root, allow_legacy=True)
+            coord.record_container("2" * 64, slot_index=0)
+            handle.job.activate()
+
+            orig_unlink = cs_mod.os.unlink
+            orig_fsync = cs_mod.os.fsync
+            hold_unlinked = [False]
+            settled_unlink_attempts: list[str] = []
+
+            def spy_unlink(path, *, dir_fd=None):
+                if isinstance(path, str) and path.startswith(".lease-hold-"):
+                    hold_unlinked[0] = True
+                if isinstance(path, str) and path.startswith(".lease-settled-"):
+                    settled_unlink_attempts.append(path)
+                return orig_unlink(path, dir_fd=dir_fd)
+
+            def fail_fsync_after_hold_unlink(fd):
+                if hold_unlinked[0]:
+                    raise OSError(errno.EIO, "GC hold-delete dir fsync EIO")
+                return orig_fsync(fd)
+
+            with (
+                patch.object(session_broker, "_remove_container_verified"),
+                patch.object(cs_mod.os, "unlink", side_effect=spy_unlink),
+                patch.object(cs_mod.os, "fsync", side_effect=fail_fsync_after_hold_unlink),
+            ):
+                err = coord.teardown_all(None)
+
+            self.assertIsNone(err)
+            self.assertTrue(handle.lease_release_confirmed())
+            self.assertTrue(hold_unlinked[0])
+            self.assertEqual(settled_unlink_attempts, [])
+            settled_files = [p.name for p in personal_dir.iterdir() if p.name.startswith(".lease-settled-")]
+            self.assertEqual(len(settled_files), 1)
+
+        # Path 2: Reader reconciliation GC under hold-delete dir-fsync EIO.
+        with tempfile.TemporaryDirectory(prefix="oc-r7-gc-reader-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+            _, _, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                home_scratch / "profiles",
+            )
+            hold_id = "ab" * 16
+            for state_name, prefix in (("hold", ".lease-hold-"), ("settled", ".lease-settled-")):
+                payload = json.dumps({
+                    "version": 1, "state": state_name, "hold_id": hold_id,
+                    "root": "oc-chat-deadbeef", "incarnation": "inc_" + "1" * 32,
+                }).encode("utf-8") + b"\n"
+                fd = os.open(personal_dir / f"{prefix}{hold_id}", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.write(fd, payload)
+                finally:
+                    os.close(fd)
+
+            orig_unlink = cs_mod.os.unlink
+            orig_fsync = cs_mod.os.fsync
+            reader_hold_unlinked = [False]
+            reader_settled_unlinks: list[str] = []
+
+            def reader_spy_unlink(path, *, dir_fd=None):
+                if isinstance(path, str) and path.startswith(".lease-hold-"):
+                    reader_hold_unlinked[0] = True
+                if isinstance(path, str) and path.startswith(".lease-settled-"):
+                    reader_settled_unlinks.append(path)
+                return orig_unlink(path, dir_fd=dir_fd)
+
+            def reader_fail_gc_fsync(fd):
+                if reader_hold_unlinked[0]:
+                    raise OSError(errno.EIO, "reader GC hold-delete dir fsync EIO")
+                return orig_fsync(fd)
+
+            with (
+                patch.object(cs_mod.os, "unlink", side_effect=reader_spy_unlink),
+                patch.object(cs_mod.os, "fsync", side_effect=reader_fail_gc_fsync),
+            ):
+                fresh = Connection(personal_dir, host_probe=lambda: host)
+                self.assertFalse(fresh.has_active_leases())
+
+            self.assertTrue(reader_hold_unlinked[0])
+            self.assertEqual(reader_settled_unlinks, [])
+            self.assertTrue((personal_dir / f".lease-settled-{hold_id}").exists())
+
+    def test_r7_negative_authority_two_link_crash_fifo_and_tamper_controls(self):
+        # Regression (R7 #7): standalone negative authority (absent/failed confirm_terminal),
+        # clean first connection vs lost state.lock with hold, unavailable dir, two-link crash,
+        # non-blocking FIFO refusal, symlink, wrong mode, extra keys, legacy hold, mismatched tuple,
+        # and matching hold with root in active_roots.
+        import errno
+        import pwd
+        from oc_openai import connection_state as cs_mod
+        from oc_openai.connection import Connection
+        from oc_openai.connection_state import ConnectionError as ConnError, Store
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+        # 1. Clean first connection (non-existent dir & empty 0o700 dir) vs missing state.lock with hold.
+        with tempfile.TemporaryDirectory(prefix="oc-r7-neg-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+            self.assertFalse(Connection(home_scratch / "never_created").has_active_leases())
+            empty_dir = home_scratch / "empty_first"
+            empty_dir.mkdir(mode=0o700)
+            self.assertFalse(Connection(empty_dir).has_active_leases())
+
+            # Missing state.lock while .lease-hold-* exists (even without state.json) MUST fail closed.
+            fd = os.open(empty_dir / (".lease-hold-" + "0" * 32), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
+            with self.assertRaises(ConnError) as lockless_err:
+                Connection(empty_dir).has_active_leases()
+            self.assertEqual(lockless_err.exception.code, "untrusted_connection_file")
+
+            # Unavailable private directory / os.listdir error fails closed.
+            _, _, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                home_scratch / "profiles",
+            )
+            with patch.object(cs_mod.os, "listdir", side_effect=OSError(errno.EIO, "listdir failed")):
+                self.assertTrue(Connection(personal_dir, host_probe=lambda: host).has_active_leases())
+
+            # 2. Standalone negative authority: outcome == "absent" publishes NO receipt;
+            # failed confirm_terminal() mints NO hold and publishes NO receipt.
+            conn = Connection(personal_dir, host_probe=lambda: host)
+            abs_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(abs_root, ignore_errors=True))
+            abs_job = _SessionJob(abs_root, "inc_" + secrets.token_hex(16))
+            abs_job.prepare(config_payload=None)
+            self.addCleanup(abs_job.revoke)
+            abs_job.activate()
+            abs_outcomes: list[str] = []
+            with conn.session_lease(pref.handle.binding, abs_job, on_release_result=abs_outcomes.append):
+                # Externally remove worker_leases entry for same registration -> exit sees "absent".
+                st_path = personal_dir / "state.json"
+                rec = json.loads(st_path.read_text(encoding="utf-8"))
+                rec.pop("worker_leases", None)
+                st_path.write_text(json.dumps(rec), encoding="utf-8")
+                abs_job.revoke()
+            self.assertEqual(abs_outcomes, ["absent"])
+            self.assertEqual(
+                [p.name for p in personal_dir.iterdir() if p.name.startswith((".lease-hold-", ".lease-settled-"))],
+                [],
+            )
+
+            nonterm_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(nonterm_root, ignore_errors=True))
+            nonterm_job = _SessionJob(nonterm_root, "inc_" + secrets.token_hex(16))
+            nonterm_job.prepare(config_payload=None)
+            self.addCleanup(nonterm_job.revoke)
+            nonterm_job.activate()
+            with self.assertRaises(ConnError) as nt_err:
+                with conn.session_lease(pref.handle.binding, nonterm_job):
+                    pass  # Not revoked -> confirm_terminal() fails!
+            self.assertEqual(nt_err.exception.code, "managed_retirement_incomplete")
+            self.assertEqual(
+                [p.name for p in personal_dir.iterdir() if p.name.startswith((".lease-hold-", ".lease-settled-"))],
+                [],
+            )
+            # Clean up nonterm lease for subsequent tamper subtests.
+            nonterm_job.revoke()
+            st_path = personal_dir / "state.json"
+            rec = json.loads(st_path.read_text(encoding="utf-8"))
+            rec.pop("worker_leases", None)
+            st_path.write_text(json.dumps(rec), encoding="utf-8")
+
+            # 3. Tamper, crash & FIFO controls on Store.has_lease_holds / Connection.
+            def _write_0600(path: Path, data: bytes) -> None:
+                mfd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(mfd, data)
+                finally:
+                    os.close(mfd)
+
+            def _clear_markers() -> None:
+                for p in list(personal_dir.iterdir()):
+                    if p.name.startswith((".lease-hold-", ".lease-settled-", ".lease-settle-tmp-")):
+                        p.unlink()
+
+            hid = "cd" * 16
+            valid_hold = json.dumps({
+                "version": 1, "state": "hold", "hold_id": hid,
+                "root": "oc-chat-deadbeef", "incarnation": "inc_" + "2" * 32,
+            }).encode("utf-8") + b"\n"
+            valid_settled = json.dumps({
+                "version": 1, "state": "settled", "hold_id": hid,
+                "root": "oc-chat-deadbeef", "incarnation": "inc_" + "2" * 32,
+            }).encode("utf-8") + b"\n"
+            hold_p = personal_dir / f".lease-hold-{hid}"
+            settled_p = personal_dir / f".lease-settled-{hid}"
+
+            # 3a. Two-link crash (st_nlink == 2) on .lease-settled-*
+            _clear_markers()
+            _write_0600(hold_p, valid_hold)
+            _write_0600(settled_p, valid_settled)
+            os.link(settled_p, personal_dir / ".lease-settle-tmp-crash")
+            self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
+            # 3b. FIFO (os.mkfifo) on hold AND on settled must return immediately without blocking!
+            _clear_markers()
+            os.mkfifo(hold_p, 0o600)
+            t0 = time.monotonic()
+            self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+            self.assertLess(time.monotonic() - t0, 0.5)
+
+            _clear_markers()
+            _write_0600(hold_p, valid_hold)
+            os.mkfifo(settled_p, 0o600)
+            t0 = time.monotonic()
+            self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+            self.assertLess(time.monotonic() - t0, 0.5)
+
+            # 3c. Symlink on settled
+            _clear_markers()
+            _write_0600(hold_p, valid_hold)
+            target_p = personal_dir / ".lease-settle-tmp-target"
+            _write_0600(target_p, valid_settled)
+            os.symlink(target_p.name, settled_p)
+            self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
+            # 3d. Wrong mode (0o644) on settled
+            _clear_markers()
+            _write_0600(hold_p, valid_hold)
+            _write_0600(settled_p, valid_settled)
+            os.chmod(settled_p, 0o644)
+            self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
+            # 3e. Extra JSON keys on settled
+            _clear_markers()
+            _write_0600(hold_p, valid_hold)
+            _write_0600(settled_p, json.dumps({
+                "version": 1, "state": "settled", "hold_id": hid,
+                "root": "oc-chat-deadbeef", "incarnation": "inc_" + "2" * 32, "extra": 1,
+            }).encode("utf-8") + b"\n")
+            self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
+            # 3f. Legacy b"hold\n" hold marker
+            _clear_markers()
+            _write_0600(hold_p, b"hold\n")
+            _write_0600(settled_p, valid_settled)
+            self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
+            # 3g. Mismatched incarnation tuple
+            _clear_markers()
+            _write_0600(hold_p, valid_hold)
+            _write_0600(settled_p, json.dumps({
+                "version": 1, "state": "settled", "hold_id": hid,
+                "root": "oc-chat-deadbeef", "incarnation": "inc_" + "9" * 32,
+            }).encode("utf-8") + b"\n")
+            self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
+            # 3h. Matching hold + matching settled while root is STILL in active_roots
+            _clear_markers()
+            _write_0600(hold_p, valid_hold)
+            _write_0600(settled_p, valid_settled)
+            store = Store(personal_dir)
+            with store.locked() as dir_fd:
+                self.assertTrue(store.has_lease_holds(dir_fd, active_roots={"oc-chat-deadbeef"}))
+                # Both markers MUST remain untouched while root is active!
+                self.assertTrue(hold_p.exists())
+                self.assertTrue(settled_p.exists())
+            _clear_markers()
 
     def test_proof_gate_evidence_and_dir_sync_failure_fails_closed_with_zero_dispatch(self):
         # Regression (R4 P2 #2): evidence write failure OR post-write _fsync_dir failure during

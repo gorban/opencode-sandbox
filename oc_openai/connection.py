@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .connection_job import LeaseHostProof, LeaseSetHostProof, PhysicalHost, WorkerLease
-from .connection_state import ConnectionError, MAX_WORKER_LEASES, Store
+from .connection_state import ConnectionError, LeaseHoldToken, MAX_WORKER_LEASES, Store
 from .profiles import ProfileError
 from .responses import AUTH_HOST, API_HOST, DISCOVERY, INTERACTIVE_STREAM_LIMITS, JWKS, MODELS, TOKEN
 from .responses import Cancellation, OpenAITransport, StreamLimits, response_error
@@ -375,10 +375,15 @@ class Connection:
             record = self._store.read(directory)
             if "pending" in record and abandoned_attempt is not True:
                 return False
-            return not self._uncertain(record) and not {
-                "client", "pending_client", "tokens", "refresh_pending",
-                "worker_lease", "worker_leases", "worker_retiring", "retiring",
-            }.intersection(record) and record.get("registration_observed") is not True
+            return (
+                not self._uncertain(record)
+                and not {
+                    "client", "pending_client", "tokens", "refresh_pending",
+                    "worker_lease", "worker_leases", "worker_retiring", "retiring",
+                }.intersection(record)
+                and record.get("registration_observed") is not True
+                and not self._store.has_lease_holds(directory, self._active_lease_roots(record))
+            )
 
     def binding(self, *, expected_client: str | None = None):
         with self._store.locked() as directory:
@@ -410,6 +415,17 @@ class Connection:
         if tokens["expiry"] <= self._clock() or tokens["access"] != access:
             raise ConnectionError("openai_access_token_changed")
 
+    @staticmethod
+    def _active_lease_roots(record) -> frozenset[str]:
+        roots = set()
+        single = record.get("worker_lease")
+        if isinstance(single, dict) and type(single.get("root")) is str:
+            roots.add(single["root"])
+        leases = record.get("worker_leases")
+        if isinstance(leases, dict):
+            roots.update(k for k in leases if type(k) is str)
+        return frozenset(roots)
+
     def has_active_leases(self):
         with self._store.locked() as directory:
             record = self._store.read(directory)
@@ -417,7 +433,7 @@ class Connection:
                 record.get("worker_lease") is not None
                 or record.get("worker_leases")
                 or record.get("worker_retiring") is True
-                or self._store.has_lease_holds(directory)
+                or self._store.has_lease_holds(directory, self._active_lease_roots(record))
             )
 
     def require_switchable(self):
@@ -433,7 +449,7 @@ class Connection:
                 not _active(record, binding)
                 or "worker_lease" in record
                 or record.get("worker_leases")
-                or self._store.has_lease_holds(directory)
+                or self._store.has_lease_holds(directory, self._active_lease_roots(record))
             ):
                 raise ConnectionError("managed_retirement_incomplete")
             record["worker_lease"] = lease.record()
@@ -474,37 +490,84 @@ class Connection:
 
         return _fallback_fence
 
-    def _release_session_lease_locked(self, directory, binding, lease, lease_record, *, release_gate=None) -> str:
+    @staticmethod
+    def _standalone_settlement_authorizer(release_gate):
+        if release_gate is None:
+            return None
+        claim = getattr(release_gate, "claim_settlement_publish", None)
+        if callable(claim):
+            return lambda: claim(require_outcome=False) is True
+        return lambda: bool(release_gate())
+
+    def _commit_session_lease_removal(
+        self, directory, record, leases, lease, *, release_gate=None,
+    ) -> tuple[str, LeaseHoldToken | None]:
+        if release_gate is not None and not release_gate():
+            return "retained_gate_closed", None
+        lease.confirm_terminal()
+        # Persist a unique durable hold BEFORE any irreversible os.replace() removes worker_leases.
+        hold_token = self._store.write_lease_hold(lease.root, lease.incarnation, directory=directory)
+        remaining = dict(leases)
+        remaining.pop(lease.root, None)
+        if remaining:
+            record["worker_leases"] = remaining
+        else:
+            record.pop("worker_leases", None)
+        commit_fence = self._release_commit_fence(release_gate)
+        committed = self._store.write(directory, record, before_commit=commit_fence)
+        if committed is False:
+            return "retained_gate_closed", None
+        return "removed", hold_token
+
+    def _release_session_lease_locked(
+        self, directory, binding, lease, lease_record, *, release_gate=None,
+    ) -> tuple[str, LeaseHoldToken | None]:
         if directory is None:
-            return "retained_store_unavailable"
+            return "retained_store_unavailable", None
         record = self._store.read(directory)
         single = record.get("worker_lease")
         if isinstance(single, dict) and single.get("root") == lease.root:
-            return "retained_conflict"
+            return "retained_conflict", None
         leases = record.get("worker_leases")
         if isinstance(leases, dict) and leases.get(lease.root) == lease_record:
-            if release_gate is not None and not release_gate():
-                return "retained_gate_closed"
-            lease.confirm_terminal()
-            # Persist an effective durable hold BEFORE any irreversible os.replace() removes worker_leases.
-            self._store.write_lease_hold(lease.root, directory=directory)
-            leases = dict(leases)
-            leases.pop(lease.root, None)
-            if leases:
-                record["worker_leases"] = leases
-            else:
-                record.pop("worker_leases", None)
-            commit_fence = self._release_commit_fence(release_gate)
-            committed = self._store.write(directory, record, before_commit=commit_fence)
-            return "removed" if committed is not False else "retained_gate_closed"
+            return self._commit_session_lease_removal(
+                directory, record, leases, lease, release_gate=release_gate,
+            )
         root_absent = leases is None or (isinstance(leases, dict) and lease.root not in leases)
         if root_absent and self._registration_matches_or_empty(record, binding):
-            return "absent"
-        return "retained_conflict"
+            return "absent", None
+        return "retained_conflict", None
 
-    def _clear_session_hold(self, root_name: str) -> None:
+    def _settle_session_hold(
+        self, token: LeaseHoldToken, *, before_publish: Callable[[], bool] | None = None,
+    ) -> bool:
         with self._store.locked() as directory:
-            self._store.clear_lease_hold(root_name, directory=directory)
+            return self._store.settle_lease_hold(token, directory=directory, before_publish=before_publish)
+
+    def _finalize_standalone_hold(self, directory, hold_token: LeaseHoldToken, release_gate) -> bool:
+        before_pub = self._standalone_settlement_authorizer(release_gate)
+        settled = self._store.settle_lease_hold(hold_token, directory=directory, before_publish=before_pub)
+        if settled:
+            mark_settled = getattr(release_gate, "mark_hold_settled", None)
+            if callable(mark_settled):
+                mark_settled()
+        return settled
+
+    def _release_session_lease_on_exit(
+        self, binding, lease, lease_record, hold_box: list[LeaseHoldToken | None], *, release_gate=None,
+    ) -> str:
+        if release_gate is not None and not release_gate():
+            return "retained_gate_closed"
+        with self._store.locked() as directory:
+            outcome, hold_token = self._release_session_lease_locked(
+                directory, binding, lease, lease_record, release_gate=release_gate,
+            )
+            hold_box[0] = hold_token
+            coordinated = bool(getattr(release_gate, "is_coordinated", lambda: False)())
+            if not coordinated and outcome == "removed" and hold_token is not None:
+                if not self._finalize_standalone_hold(directory, hold_token, release_gate):
+                    return "retained_gate_closed"
+            return outcome
 
     @contextlib.contextmanager
     def session_lease(self, binding, job, *, release_gate=None, on_release_result=None):
@@ -516,28 +579,28 @@ class Connection:
             leases = dict(record.get("worker_leases") or {})
             if (not _active(record, binding) or "worker_lease" in record
                     or lease.root in leases or len(leases) >= MAX_WORKER_LEASES
-                    or self._store.has_lease_holds(directory)):
+                    or self._store.has_lease_holds(directory, self._active_lease_roots(record))):
                 raise ConnectionError("managed_retirement_incomplete")
             leases[lease.root] = lease_record
             record["worker_leases"] = leases
             self._store.write(directory, record)
-        bind_releaser = getattr(release_gate, "bind_hold_releaser", None)
-        if callable(bind_releaser):
-            bind_releaser(lambda r=lease.root: self._clear_session_hold(r))
+        hold_box: list[LeaseHoldToken | None] = [None]
+        bind_settler = getattr(release_gate, "bind_hold_settler", None)
+        if callable(bind_settler):
+            bind_settler(
+                lambda before_publish=None: (
+                    self._settle_session_hold(hold_box[0], before_publish=before_publish)
+                    if hold_box[0] is not None
+                    else False
+                )
+            )
         try:
             yield lease
         finally:
-            outcome = "retained_gate_closed"
             try:
-                if release_gate is None or release_gate():
-                    with self._store.locked() as directory:
-                        outcome = self._release_session_lease_locked(
-                            directory, binding, lease, lease_record, release_gate=release_gate,
-                        )
-                        coordinated = bool(getattr(release_gate, "is_coordinated", lambda: False)())
-                        if not coordinated and outcome in ("removed", "absent"):
-                            if release_gate is None or release_gate():
-                                self._store.clear_lease_hold(lease.root, directory=directory)
+                outcome = self._release_session_lease_on_exit(
+                    binding, lease, lease_record, hold_box, release_gate=release_gate,
+                )
             except BaseException:
                 if on_release_result is not None:
                     on_release_result("uncertain_commit_error")
