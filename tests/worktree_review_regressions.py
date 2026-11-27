@@ -45,15 +45,30 @@ with tempfile.TemporaryDirectory(prefix='oc-c-review-') as tmp:
         start_run = source.index('tree_run() {')
         tree_run = source[start_run:source.index('\n}', start_run) + 2]
         fixture = '''
-H=(); LEVEL=s0:c7,c9; SB=/fixture; AGENT_MEM=512m; AGENT_IMG=fixture; SANDBOX_TREE_PY=stub
-timeout() { printf '%s\\n' "$@"; }
-tree_run init dest a feature
+LEVEL=s0:c7,c9; SB=/fixture; AGENT_MEM=512m; AGENT_IMG=fixture; SANDBOX_TREE_PY=stub
+timeout() {
+  if IFS= read -r line; then printf '%s\\n' 'worktree worker inherited stdin'; fi
+  printf '%s\\n' "$@"
+}
+host_dispatch() { "$@"; }
 '''
-        launch = cmd('bash', '-c', tree_run + '\n' + fixture).stdout.splitlines()
-        if (launch[:3] != ['-k', '5s', '70s'] or '--timeout=60' not in launch
-                or '--network=none' not in launch or 'label=level:s0:c7,c9' not in launch
-                or 'label=disable' in launch):
-            failures.append('unsafe worktree worker launch arguments')
+        first_worker_failure = len(failures)
+        for dispatch in ('H=()', 'H=(host_dispatch)'):
+            call = tree_run + '\n' + fixture + dispatch + '\ntree_run init dest a feature\n'
+            launch = cmd('bash', '-c', call, input='fixture terminal data\n').stdout.splitlines()
+            if 'worktree worker inherited stdin' in launch:
+                failures.append('worktree worker inherited stdin with ' + dispatch)
+                launch.remove('worktree worker inherited stdin')
+            if any(arg in launch for arg in ('-i', '--interactive')):
+                failures.append('worktree worker requested interactive attachment with ' + dispatch)
+            if (launch[:3] != ['-k', '5s', '70s'] or '--timeout=60' not in launch
+                    or '--network=none' not in launch or 'label=level:s0:c7,c9' not in launch
+                    or 'label=disable' in launch):
+                failures.append('unsafe worktree worker launch arguments with ' + dispatch)
+        for failure in failures[first_worker_failure:]:
+            print('FAIL: ' + failure)
+        if len(failures) == first_worker_failure:
+            print('PASS: worktree worker launches without terminal input or attachment')
 
     for swap in ('symlink', 'directory'):
         sb = base / swap; sb.mkdir()

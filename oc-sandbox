@@ -562,10 +562,10 @@ verify_bridge_stage() {
 safe_run() { pm run --rm -i --network=none --cap-drop=ALL --security-opt=no-new-privileges \
   --security-opt=label=disable -v "$SB":/sandbox "$@"; }
 tree_run() {
-  "${H[@]}" timeout -k 5s 70s podman run --rm -i --network=none --http-proxy=false \
+  "${H[@]}" timeout -k 5s 70s podman run --rm --network=none --http-proxy=false \
     --timeout=60 --cap-drop=ALL --security-opt=no-new-privileges --security-opt "label=level:$LEVEL" \
     --pids-limit=128 --memory="$AGENT_MEM" -v "$SB":/sandbox \
-    --entrypoint python3 "$AGENT_IMG" -I -c "$SANDBOX_TREE_PY" "$@"
+    --entrypoint python3 "$AGENT_IMG" -I -c "$SANDBOX_TREE_PY" "$@" </dev/null
 }
 
 # These commands execute only in the sandbox-only container. Git receives a clean environment;
