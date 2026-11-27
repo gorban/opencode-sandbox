@@ -1363,16 +1363,31 @@ if (( DELETE )); then
       elif [[ -n $id ]]; then echo "note: kept image '$img' (${id:0:12}): not built by this oc-sandbox installation" >&2; fi
     done
     prune_images
-    mapfile -t vols < <({ pm volume ls -q --filter label=oc.sandbox=1; printf '%s\n' "$HOMEVOL" oc-chrome oc-pg; } | sort -u)
-    for v in "${vols[@]}"; do pm volume rm -f "$v" >/dev/null 2>&1 || true; done
-    # No matching secret (never used -p) is normal; failing to list them only warns, so the rest of
-    # the cleanup (SELinux module, state, .bridge) still runs.
+    # Volumes and secrets hold logins and database passwords. Confirm each one is gone. If one may
+    # remain, finish the other steps but keep the state and binding: without the binding, a later
+    # run refuses to touch what was left, so the same command could not be retried.
+    teardown_status=0
+    labelled_volumes=$(pm volume ls -q --filter label=oc.sandbox=1) || {
+      echo "error: could not list oc-sandbox volumes" >&2; teardown_status=1; labelled_volumes=
+    }
+    mapfile -t vols < <(printf '%s\n' "$labelled_volumes" "$HOMEVOL" oc-chrome oc-pg | sort -u)
+    for v in "${vols[@]}"; do
+      [[ -n $v ]] || continue
+      remove_instance_storage volume "$v" -f \
+        || { echo "error: could not verify removal of volume '$v'" >&2; teardown_status=1; }
+    done
+    # No matching secret (never used -p) is normal.
     if secrets=$(pm secret ls --format '{{.Name}}' 2>/dev/null); then
       while read -r s; do
-        if [[ $s =~ ^oc(-[a-z0-9-]+)?-pg-(password|passfile|hba)$ ]]; then pm secret rm "$s" >/dev/null 2>&1 || true; fi
+        if [[ $s =~ ^oc(-[a-z0-9-]+)?-pg-(password|passfile|hba)$ ]]; then
+          remove_instance_storage secret "$s" \
+            || { echo "error: could not verify removal of secret '$s'" >&2; teardown_status=1; }
+        fi
       done <<<"$secrets"
-    else echo "warning: could not list Podman secrets; remove any oc-*-pg-password secrets by hand" >&2; fi
-    teardown_status=0
+    else
+      echo "error: could not list Podman secrets, so any oc-*-pg-* secrets may remain" >&2
+      teardown_status=1
+    fi
     remove_chromium_policy || teardown_status=1
     # We verified that the pods are gone and stopped the bridge path and service above.
     # GNU rm -r unlinks symlinks instead of traversing their targets.
@@ -1383,7 +1398,7 @@ if (( DELETE )); then
       rm -f "$INSTALL_DIR/binding"
     fi
     if (( teardown_status != 0 )); then
-      echo "Cleanup incomplete; state retained at $STATE. Fix the SELinux error and retry." >&2
+      echo "Cleanup incomplete; state retained at $STATE. Fix the errors above and run the same command again." >&2
       exit 1
     fi
   fi

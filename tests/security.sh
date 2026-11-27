@@ -1147,10 +1147,13 @@ case "\$1 \$2" in
     if [ -z "\${STUB_POD_REMAINS:-}" ] && grep -Fqx "podman pod rm --ignore -f -- \$3" "$T/stub.log"; then exit 1; fi ;;
   "pod rm") [ -n "\${STUB_POD_REMOVE_FAIL:-}" ] && exit 125 ;;
   "volume exists"|"secret exists")
+    [ "\${STUB_STORAGE_STAYS:-}" = "\$3" ] && exit 0
     if grep -Fqx "podman \$1 rm \$3" "$T/stub.log" || \
        grep -Fqx "podman \$1 rm -f \$3" "$T/stub.log"; then exit 1; fi ;;
   "volume rm") [ "\${STUB_VOLUME_REMOVE_FAIL:-}" = "\${4:-}" ] && exit 125 ;;
-  "volume ls") [ "\${4:-}" = --filter ] || printf '%b' "\${STUB_LEGACY_VOLUMES:-}" ;;
+  "volume ls")
+    if [ "\${4:-}" = --filter ]; then [ -n "\${STUB_VOLUME_LS_FAIL:-}" ] && exit 125
+    else printf '%b' "\${STUB_LEGACY_VOLUMES:-}"; fi ;;
   "secret rm") [ "\${STUB_SECRET_REMOVE_FAIL:-}" = "\${3:-}" ] && exit 125 ;;
   "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
   "image inspect")  # STUB_IDS="name=id ...": the image each tag points to; images have no tags left
@@ -1510,7 +1513,7 @@ check 'clearing the selection record succeeds' grep -qx 'rc=0' <<<"$out"
 out=$(pathrun STUB_POD_EXISTS_FAIL=1 -- -l)
 check 'instance listing reports incomplete inventory' grep -q 'could not list instance pods' <<<"$out"
 check 'instance listing prints no successful table on inventory failure' ! grep -q '^INSTANCE' <<<"$out"
-for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_FAIL=1" \
+for case in "no Postgres secrets:STUB_SECRETS=" \
             "secrets present:STUB_SECRETS=oc-pg-password\\nother\\noc-x-pg-password\\n"; do
   seed_default_binding
   name=${case%%:*} envset=${case#*:}
@@ -1525,6 +1528,29 @@ for case in "no Postgres secrets:STUB_SECRETS=" "secret ls fails:STUB_SECRET_LS_
 done
 check "-d -a removes only oc Postgres secrets" sh -c "grep -qx 'podman secret rm oc-pg-password' '$T/stub.log' \
   && grep -qx 'podman secret rm oc-x-pg-password' '$T/stub.log' && ! grep -q 'secret rm other' '$T/stub.log'"
+# Volumes and secrets hold logins and database passwords. Global -d -a must not report success or
+# clear its records while one may remain: without the installation binding, no later run can remove
+# what was left. The rest of the cleanup still runs, and the same command can be retried.
+for fault in STUB_VOLUME_REMOVE_FAIL=oc-home STUB_SECRET_REMOVE_FAIL=oc-pg-password \
+             STUB_STORAGE_STAYS=oc-home STUB_STORAGE_STAYS=oc-pg-password \
+             STUB_VOLUME_LS_FAIL=1 STUB_SECRET_LS_FAIL=1; do
+  mkdir -p "$DSTATE/build" "$DSB/.bridge"
+  : > "$DSB/.bridge/keep"
+  out=$(pathrun "$fault" 'STUB_SECRETS=oc-pg-password\n' -- -d -a -y)
+  check "global purge ($fault) returns failure" grep -qx 'rc=1' <<<"$out"
+  check "global purge ($fault) reports incomplete cleanup" grep -q 'Cleanup incomplete; state retained' <<<"$out"
+  check "global purge ($fault) retains state for retry" test -d "$DSTATE/build"
+  check "global purge ($fault) retains the installation binding" \
+    test -f "$T/dhome/.config/systemd/user/.oc-sandbox/binding"
+  check "global purge ($fault) keeps the bridge spool" test -f "$DSB/.bridge/keep"
+  check "global purge ($fault) still removes the SELinux module" \
+    grep -q 'semodule -X 400 -r oc_chromium' "$T/stub.log"
+done
+check "a failed volume removal names the volume" \
+  grep -q "could not verify removal of volume 'oc-home'" <<<"$(pathrun STUB_VOLUME_REMOVE_FAIL=oc-home -- -d -a -y)"
+out=$(pathrun 'STUB_SECRETS=oc-pg-password\n' -- -d -a -y)
+check "global purge succeeds when retried without the fault" grep -qx 'rc=0' <<<"$out"
+check "the retried purge clears the retained state" test ! -e "$DSTATE/build"
 
 echo "shared setup and teardown barrier (Podman stubbed; scratch HOME)"
 LHOME=$T/lifecycle/home LSTATE=$T/lifecycle/home/.local/share/oc-sandbox

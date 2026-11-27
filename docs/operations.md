@@ -152,6 +152,9 @@ Global `-d -a` deletes OpenCode login and sessions, Chromium profiles, Postgres 
 Docker-in-Docker storage. It removes `~/opencode-sandbox/.bridge/` with its queued requests and
 copies. If any editor staging directories remain in `bridge-stage/`, teardown stops
 before deleting volumes. Close the editors or recover the saved copies before retrying.
+It confirms that each volume and Postgres secret is gone. If one cannot be confirmed removed, or
+Podman cannot list them, it finishes the remaining steps, keeps the installed state, and exits with
+an error. Fix the reported problem and run the same command again.
 Use the same `XDG_DATA_HOME` for setup and teardown. The launcher retains the installed state and
 staging paths for retries, even after stopping the bridge and removing its units.
 If an older teardown removed the service before recording that binding, the launcher refuses to
