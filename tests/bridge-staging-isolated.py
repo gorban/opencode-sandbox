@@ -41,8 +41,10 @@ class StagingTests(unittest.TestCase):
         session = Path(self.select("code", "left/item.txt", "right/item.txt"))
 
         def edit(argv, **options):
-            first, second = map(Path, argv[-2:])
-            self.assertEqual(Path(options.get("cwd", ".")), session)
+            self.assertEqual(argv, ["/fake/code", "--wait", "--", "./files/1/item.txt", "./files/2/item.txt"])
+            workdir = Path(options.get("cwd", "."))
+            self.assertEqual(workdir, session)
+            first, second = (workdir / operand for operand in argv[-2:])
             self.assertNotEqual(first.parent, second.parent)
             self.assertEqual(first.parent.parent, session / "files")
             self.assertEqual(second.parent.parent, session / "files")
@@ -81,8 +83,9 @@ class StagingTests(unittest.TestCase):
         self.put("tree/nested/fixture.bcpkg")
         session = Path(self.select("bcompare", "tree"))
 
-        def inspect(argv, **_options):
-            snapshot = Path(argv[-1])
+        def inspect(argv, **options):
+            self.assertEqual(argv, ["/fake/bcompare", "./files/1"])
+            snapshot = Path(options["cwd"]) / argv[-1]
             self.assertEqual(
                 {str(path.relative_to(snapshot)) for path in snapshot.rglob("*")},
                 {"nested", "nested/ordinary.txt"},
@@ -95,6 +98,26 @@ class StagingTests(unittest.TestCase):
         with patch("subprocess.Popen", side_effect=inspect) as launch:
             self.bridge["run_session"](str(session))
         launch.assert_called_once()
+
+    def test_editor_operands_use_safe_names_and_write_to_distinct_sources(self):
+        first = self.put("left/Quarterly draft.txt")
+        second = self.put("right/Résumé.txt")
+        session = Path(self.select("bcompare", "left/Quarterly draft.txt", "right/Résumé.txt"))
+
+        def edit(argv, **options):
+            self.assertEqual(argv, ["/fake/bcompare", "./files/1/selection.txt", "./files/2/selection.txt"])
+            workdir = Path(options["cwd"])
+            self.assertEqual(workdir, session)
+            (workdir / argv[1]).write_text("first saved", encoding="utf-8")
+            (workdir / argv[2]).write_text("second saved", encoding="utf-8")
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            return proc
+
+        with patch("subprocess.Popen", side_effect=edit):
+            self.bridge["run_session"](str(session))
+        self.assertEqual(first.read_text(encoding="utf-8"), "first saved")
+        self.assertEqual(second.read_text(encoding="utf-8"), "second saved")
 
     def test_manifest_refuses_unlisted_slots(self):
         self.put("item.txt")

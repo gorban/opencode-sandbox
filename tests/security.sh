@@ -214,7 +214,10 @@ EOF
 cat > "$B/tool" <<EOF
 #!/bin/sh
 # fake VS Code / Beyond Compare: record what it was given, optionally act like the agent or an edit
+pwd -P > $T/tool.cwd
 for a in "\$@"; do case \$a in --*) ;; *)
+  printf '%s\n' "\$a" >> $T/tool.relative
+  a=\$(realpath -s -- "\$a")
   printf '%s\n' "\$a" >> $T/tool.args
   if [ -f "\$a" ]; then cat "\$a" >> $T/tool.seen; elif [ -d "\$a" ]; then find "\$a" >> $T/tool.seen; cat \$(find "\$a" -type f) >> $T/tool.seen 2>/dev/null; fi
   [ -n "\${FAKE_AGENT:-}" ] && sh -c "\$FAKE_AGENT"
@@ -230,10 +233,12 @@ export OC_SB=$SB OC_BRIDGE_STAGE=$T/stage OC_CODE_BIN=$B/tool OC_BCOMPARE_BIN=$B
 req() { local id=$1; shift; printf '%s\n' "$@" > "$SB/.bridge/requests/$id.req"; }
 bridge() { timeout 20 python3 -I "$BRIDGE" 2>>"$T/bridge.log"; }
 victim_ok() { [[ "$(cat "$V/secret" "$V/requests/precious" "$V/f")" == "$SECRET"$'\n'"$SECRET"$'\n'"$SECRET" ]]; }
-reset_tool() { rm -f "$T/tool.args" "$T/tool.seen"; }
+reset_tool() { rm -f "$T/tool.args" "$T/tool.seen" "$T/tool.cwd" "$T/tool.relative"; }
 
 reset_tool; req 1 code /sandbox/construct/a.txt; FAKE_EDIT=edited bridge
 check "file opened as a host-owned staged copy" grep -q "^$T/stage/" "$T/tool.args"
+check "editor receives a relative staged operand" grep -Fxq './files/1/a.txt' "$T/tool.relative"
+check "editor starts from the private stage session" grep -q "^$T/stage/" "$T/tool.cwd"
 check "staged copy had the sandbox content" grep -qx hello "$T/tool.seen"
 check "saved edit written back into the sandbox" [ "$(cat "$SB/construct/a.txt")" = edited ]
 check "staging cleaned after the session"   [ -z "$(ls -A "$T/stage")" ]
@@ -324,7 +329,7 @@ st = staged.stat()
 entry = {"kind": "file", "parts": ["construct", "session.txt"], "slot": 1,
          "mode": 0o600, "target": [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns],
          "seen": [st.st_ino, st.st_size, st.st_mtime_ns]}
-manifest = json.dumps({"version": 2, "tool": sys.argv[2], "entries": [entry]})
+manifest = json.dumps({"version": 3, "tool": sys.argv[2], "entries": [entry]})
 (session / "manifest.json").write_text(manifest + " " * int(sys.argv[3]), encoding="utf-8")
 PY
 }

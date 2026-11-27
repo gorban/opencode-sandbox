@@ -53,9 +53,11 @@ MAX_TREE_DEPTH = 64
 MAX_SESSION_BYTES = 512 << 20
 MAX_STAGE_SESSIONS = 8
 STAGE_MAX_AGE = 7 * 86400
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 STAGING_METADATA_NAMES = frozenset((".git", "head", ".vscode"))
 STAGING_METADATA_SUFFIXES = (".code-workspace", ".bcpkg", ".bcs", ".bcss")
+SAFE_EDITOR_LEAF = re.compile(r"[a-zA-Z0-9_.-]+")
+SAFE_EDITOR_SUFFIX = re.compile(r"[a-zA-Z0-9]{1,16}")
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -186,6 +188,13 @@ def mkdirs_private(path):
 def staging_metadata(name):
     folded = name.casefold()
     return folded in STAGING_METADATA_NAMES or folded.endswith(STAGING_METADATA_SUFFIXES)
+
+
+def staged_leaf(source_name):
+    if SAFE_EDITOR_LEAF.fullmatch(source_name):
+        return source_name
+    _, dot, suffix = source_name.rpartition(".")
+    return "selection" + (dot + suffix if SAFE_EDITOR_SUFFIX.fullmatch(suffix) else "")
 
 
 def snapshot_tree(src_fd, dst_fd, budget, depth=0):
@@ -330,11 +339,12 @@ def stage_selection(root, files_fd, tool, parts, slot, budget):
                     os.close(src)
                 return dict(entry, kind="dir")
             fd, fst = open_regular(parent, leaf)
+            staged = staged_leaf(leaf)
             try:
-                copy_into_session((fd, fst), dst, leaf, budget)
+                copy_into_session((fd, fst), dst, staged, budget)
             finally:
                 os.close(fd)
-            sst = os.stat(leaf, dir_fd=dst, follow_symlinks=False)
+            sst = os.stat(staged, dir_fd=dst, follow_symlinks=False)
             return dict(entry, kind="file", mode=stat.S_IMODE(fst.st_mode),
                         target=ident(fst), seen=staged_identity(sst))
         finally:
@@ -412,7 +422,7 @@ def open_staged_file(files_fd, parts):
 
 def staged_parts(entry):
     slot = [str(entry["slot"])]
-    return slot if entry["kind"] == "dir" else slot + [entry["parts"][-1]]
+    return slot if entry["kind"] == "dir" else slot + [staged_leaf(entry["parts"][-1])]
 
 
 def sync(session_fd, files_fd, entries, cross_mounts):
@@ -499,7 +509,7 @@ def read_session_manifest(session_fd):
     return tool, entries
 
 
-def staged_arguments(session, files_fd, entries):
+def staged_arguments(files_fd, entries):
     if set(os.listdir(files_fd)) != {str(entry["slot"]) for entry in entries}:
         raise Refused("stage contains unexpected slots")
     paths = []
@@ -513,7 +523,7 @@ def staged_arguments(session, files_fd, entries):
                 validate_staged_leaf(slot_fd, parts[-1], entry["seen"])
             finally:
                 os.close(slot_fd)
-        paths.append(os.path.join(session, "files", *parts))
+        paths.append(os.path.join(".", "files", *parts))
     return paths
 
 
@@ -537,7 +547,7 @@ def run_session(session):
         tool, entries = read_session_manifest(session_fd)
         files_fd = open_dirs(session_fd, ["files"])
         try:
-            staged = staged_arguments(real, files_fd, entries)
+            staged = staged_arguments(files_fd, entries)
             options = ["--wait", "--"] if tool == "code" else []
             proc = subprocess.Popen([TOOLS[tool], *options, *staged], cwd=real, stdin=subprocess.DEVNULL)
             cross_mounts = set()
