@@ -1410,10 +1410,10 @@ if [[ $OPENCODE_VERSION == baked || $OPENCODE_VERSION == keep ]]; then
   if [[ -n $OPENCODE_SHA256 || -n $OPENCODE_ARCHIVE_SHA256 ]]; then
     die "OC_OPENCODE_SHA256 and OC_OPENCODE_ARCHIVE_SHA256 require an explicit OC_OPENCODE_VERSION release"
   fi
-elif [[ $OPENCODE_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]]; then
+elif [[ $OPENCODE_VERSION =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([-+][A-Za-z0-9.-]+)?$ ]]; then
   opencode_major=${OPENCODE_VERSION#v}
   opencode_major=${opencode_major%%.*}
-  if (( opencode_major < 2 )); then
+  if (( 10#$opencode_major < 2 )); then
     die "OC_OPENCODE_VERSION opt-in release updates require version 2.x or newer"
   fi
   if [[ ! $OPENCODE_SHA256 =~ ^[0-9a-f]{64}$ ]]; then
@@ -1670,9 +1670,31 @@ mv -f -- "$gitconfig_tmp" "$BUILD/gitconfig"
 if [[ -f $HOST_GITIGNORE ]]; then atomic_host_file "$BUILD/gitignore_global" 0644 < "$HOST_GITIGNORE"
 else atomic_host_file "$BUILD/gitignore_global" 0644 </dev/null; fi
 
+omz_stage_paths_safe() {  # root require_plugin(0|1)
+  local root=$1 require_plugin=${2:-0} p
+  [[ -n $root && ! -L $root && -d $root ]] || return 1
+  for p in "$root/custom" "$root/custom/plugins"; do
+    if [[ -L $p ]]; then return 1; fi
+    if [[ -e $p && ! -d $p ]]; then return 1; fi
+  done
+  p="$root/custom/plugins/zsh-vi-mode"
+  if [[ -L $p ]]; then return 1; fi
+  if (( require_plugin )); then
+    [[ -d $p ]] || return 1
+  elif [[ -e $p && ! -d $p ]]; then
+    return 1
+  fi
+  return 0
+}
+
 clone_pinned_repo() {  # url commit dest
-  local url=$1 commit=$2 dest=$3 tmp resolved
+  local url=$1 commit=$2 dest=$3 tmp resolved build_real dest_parent
   [[ $commit =~ ^[0-9a-f]{40}$ ]] || die "invalid pinned commit SHA for $url"
+  [[ -n $dest && ! -L $dest ]] || die "refusing unsafe destination for $url"
+  build_real=$(/usr/bin/realpath -e -- "$BUILD") || die "missing build directory"
+  dest_parent=$(/usr/bin/realpath -e -- "$(dirname -- "$dest")") || die "missing destination parent for $url"
+  [[ $dest_parent == "$build_real" || $dest_parent == "$build_real/"* ]] \
+    || die "refusing destination outside private build directory for $url"
   tmp=$(mktemp -d "$BUILD/.clone.XXXXXXXX") || die "failed to create staging directory for $url"
   if ! (
     host_git -c core.hooksPath=/dev/null init -q "$tmp" \
@@ -1689,12 +1711,19 @@ clone_pinned_repo() {  # url commit dest
     die "fetched commit '$resolved' did not match pinned '$commit' for $url"
   fi
   find "$tmp" -name .git -prune -exec rm -rf {} +
+  dest_parent=$(/usr/bin/realpath -e -- "$(dirname -- "$dest")") || { rm -rf -- "$tmp"; die "missing destination parent for $url"; }
+  if [[ -L $dest ]] || { [[ $dest_parent != "$build_real" && $dest_parent != "$build_real/"* ]]; }; then
+    rm -rf -- "$tmp"
+    die "refusing changed or unsafe destination for $url"
+  fi
   rm -rf -- "$dest"
   mv -f -- "$tmp" "$dest"
 }
 
 # oh-my-zsh: separate pinned upstream checkout vs legacy host copy (with distinct receipts)
 if [[ -d $HOST_OHMYZSH ]]; then
+  omz_stage_paths_safe "$HOST_OHMYZSH" 0 \
+    || die "refusing linked or non-directory oh-my-zsh plugin path under $HOST_OHMYZSH"
   OHMYZSH_BUILD_DIR=oh-my-zsh-host
   OHMYZSH_RECEIPT=oh-my-zsh-host.receipt
   host_zvm_source=host
@@ -1703,17 +1732,29 @@ if [[ -d $HOST_OHMYZSH ]]; then
     host_zvm_source=upstream-pinned
     host_zvm_commit=$ZSH_VI_MODE_COMMIT
   fi
-  want_ohmyzsh_receipt=$(printf 'source=host-legacy\nzsh_vi_mode_source=%s\nzsh_vi_mode_commit=%s\n' \
+  want_ohmyzsh_receipt=$(printf 'source=host-legacy\nlayout=physical-v1\nzsh_vi_mode_source=%s\nzsh_vi_mode_commit=%s\n' \
     "$host_zvm_source" "$host_zvm_commit")
-  if [[ ! -d $BUILD/$OHMYZSH_BUILD_DIR || ! -f $BUILD/$OHMYZSH_RECEIPT ]] \
+  if ! omz_stage_paths_safe "$BUILD/$OHMYZSH_BUILD_DIR" 1 \
+     || [[ -L $BUILD/$OHMYZSH_RECEIPT || ! -f $BUILD/$OHMYZSH_RECEIPT ]] \
      || [[ "$(<"$BUILD/$OHMYZSH_RECEIPT")" != "$want_ohmyzsh_receipt" ]]; then
     log "Preparing legacy host oh-my-zsh copy"
     stage_omz=$(mktemp -d "$BUILD/.omz-host.XXXXXXXX")
     cp -a "$HOST_OHMYZSH/." "$stage_omz/"
+    if ! omz_stage_paths_safe "$stage_omz" 0; then
+      rm -rf -- "$stage_omz"
+      die "refusing linked or non-directory oh-my-zsh path in private stage"
+    fi
     if [[ ! -d $stage_omz/custom/plugins/zsh-vi-mode ]]; then
       mkdir -p "$stage_omz/custom/plugins"
-      trusted_path "$stage_omz/custom/plugins/zsh-vi-mode" >/dev/null || { rm -rf -- "$stage_omz"; die "refusing sandbox-controlled plugin path"; }
+      if ! omz_stage_paths_safe "$stage_omz" 0; then
+        rm -rf -- "$stage_omz"
+        die "refusing linked or non-directory oh-my-zsh plugin path in private stage"
+      fi
       clone_pinned_repo "$ZSH_VI_MODE_URL" "$ZSH_VI_MODE_COMMIT" "$stage_omz/custom/plugins/zsh-vi-mode"
+    fi
+    if ! omz_stage_paths_safe "$stage_omz" 1; then
+      rm -rf -- "$stage_omz"
+      die "refusing incomplete or linked oh-my-zsh stage layout"
     fi
     find "$stage_omz" -name .git -prune -exec rm -rf {} +
     rm -rf -- "$BUILD/$OHMYZSH_BUILD_DIR"
@@ -1723,16 +1764,25 @@ if [[ -d $HOST_OHMYZSH ]]; then
 else
   OHMYZSH_BUILD_DIR=oh-my-zsh-pinned
   OHMYZSH_RECEIPT=oh-my-zsh-pinned.receipt
-  want_ohmyzsh_receipt=$(printf 'source=upstream-pinned\nohmyzsh_url=%s\nohmyzsh_commit=%s\nzsh_vi_mode_url=%s\nzsh_vi_mode_commit=%s\n' \
+  want_ohmyzsh_receipt=$(printf 'source=upstream-pinned\nlayout=physical-v1\nohmyzsh_url=%s\nohmyzsh_commit=%s\nzsh_vi_mode_url=%s\nzsh_vi_mode_commit=%s\n' \
     "$OHMYZSH_URL" "$OHMYZSH_COMMIT" "$ZSH_VI_MODE_URL" "$ZSH_VI_MODE_COMMIT")
-  if [[ ! -d $BUILD/$OHMYZSH_BUILD_DIR || ! -f $BUILD/$OHMYZSH_RECEIPT ]] \
+  if ! omz_stage_paths_safe "$BUILD/$OHMYZSH_BUILD_DIR" 1 \
+     || [[ -L $BUILD/$OHMYZSH_RECEIPT || ! -f $BUILD/$OHMYZSH_RECEIPT ]] \
      || [[ "$(<"$BUILD/$OHMYZSH_RECEIPT")" != "$want_ohmyzsh_receipt" ]]; then
     log "Preparing pinned oh-my-zsh ($OHMYZSH_COMMIT)"
     stage_omz=$(mktemp -d "$BUILD/.omz-pinned.XXXXXXXX")
     rm -rf -- "$stage_omz"
     clone_pinned_repo "$OHMYZSH_URL" "$OHMYZSH_COMMIT" "$stage_omz"
+    if ! omz_stage_paths_safe "$stage_omz" 0; then
+      rm -rf -- "$stage_omz"
+      die "refusing linked or non-directory oh-my-zsh path in pinned stage"
+    fi
     mkdir -p "$stage_omz/custom/plugins"
     clone_pinned_repo "$ZSH_VI_MODE_URL" "$ZSH_VI_MODE_COMMIT" "$stage_omz/custom/plugins/zsh-vi-mode"
+    if ! omz_stage_paths_safe "$stage_omz" 1; then
+      rm -rf -- "$stage_omz"
+      die "refusing incomplete or linked oh-my-zsh pinned layout"
+    fi
     rm -rf -- "$BUILD/$OHMYZSH_BUILD_DIR"
     mv -f -- "$stage_omz" "$BUILD/$OHMYZSH_BUILD_DIR"
     printf '%s\n' "$want_ohmyzsh_receipt" | atomic_host_file "$BUILD/$OHMYZSH_RECEIPT" 0644

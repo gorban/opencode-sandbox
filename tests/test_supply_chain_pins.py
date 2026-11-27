@@ -138,7 +138,7 @@ class LaunchWrapperVerificationTests(unittest.TestCase):
             **extra_env,
         }
         return subprocess.run(
-            [sys.executable, "-I", "-c", self._WRAPPER_HARNESS, str(ROOT / "oc-opencode-run.py"), str(baked_bin), *args],
+            [sys.executable, "-IB", "-c", self._WRAPPER_HARNESS, str(ROOT / "oc-opencode-run.py"), str(baked_bin), *args],
             env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
         )
 
@@ -402,6 +402,7 @@ sys.exit(0)
                 {"OC_OPENCODE_VERSION": "2.3.0"},
                 {"OC_OPENCODE_VERSION": "2.3.0", "OC_OPENCODE_SHA256": "short"},
                 {"OC_OPENCODE_VERSION": "1.19.2", "OC_OPENCODE_SHA256": "a" * 64},
+                {"OC_OPENCODE_VERSION": "08.0.0", "OC_OPENCODE_SHA256": "a" * 64},
                 {"OC_OPENCODE_SHA256": "a" * 64},
                 {"OC_OPENCODE_VERSION": "keep", "OC_OPENCODE_SHA256": "a" * 64},
                 {"OC_OPENCODE_VERSION": "baked", "OC_OPENCODE_ARCHIVE_SHA256": "a" * 64},
@@ -572,6 +573,120 @@ sys.exit(0)
             self.assertIn(f"zsh_vi_mode_commit={zvm_sha}", receipt)
             pinned_hash = json.loads((images / "oc-agent").read_text(encoding="utf-8"))["hash"]
             self.assertNotEqual(pinned_hash, hashes[0][0])
+
+    def _install_fake_git(self, stub_dir: Path):
+        fake_git = stub_dir / "git"
+        fake_git.write_text(
+            """#!/usr/bin/python3
+import pathlib, sys
+args = sys.argv[1:]
+if "config" in args:
+    sys.exit(0)
+if "init" in args:
+    d = pathlib.Path(args[-1]); (d / ".git").mkdir(parents=True, exist_ok=True); sys.exit(0)
+if "fetch" in args:
+    d = pathlib.Path(args[args.index("-C") + 1])
+    (d / ".git" / "FETCH_HEAD").write_text(args[-1], encoding="utf-8")
+    (d / "zsh-vi-mode.plugin.zsh").write_text("# pinned\\n", encoding="utf-8")
+    sys.exit(0)
+if "checkout" in args:
+    sys.exit(0)
+if "rev-parse" in args:
+    d = pathlib.Path(args[args.index("-C") + 1])
+    print((d / ".git" / "FETCH_HEAD").read_text(encoding="utf-8").strip())
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+
+    def test_legacy_host_omz_refuses_linked_or_nondir_plugin_paths_without_mutating_outside(self):
+        cases = (
+            "symlink_custom",
+            "symlink_plugins",
+            "symlink_plugins_with_existing_leaf",
+            "symlink_leaf_dir",
+            "dangling_symlink_leaf",
+            "file_custom",
+            "file_plugins",
+            "file_leaf",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                home, state, _, _, env = self._make_env(root, with_host_omz=False)
+                self._install_fake_git(root / "stub")
+                outside = root / "outside"
+                outside.mkdir(mode=0o700)
+                sentinel = outside / "sentinel"
+                sentinel.write_text("intact\n", encoding="utf-8")
+
+                omz = home / ".oh-my-zsh"
+                omz.mkdir(mode=0o700)
+                if case == "symlink_custom":
+                    (omz / "custom").symlink_to(outside)
+                elif case == "symlink_plugins":
+                    (omz / "custom").mkdir(mode=0o700)
+                    (omz / "custom/plugins").symlink_to(outside)
+                elif case == "symlink_plugins_with_existing_leaf":
+                    outside_leaf = outside / "zsh-vi-mode"
+                    outside_leaf.mkdir(mode=0o700)
+                    (outside_leaf / "sentinel").write_text("intact-leaf\n", encoding="utf-8")
+                    (omz / "custom").mkdir(mode=0o700)
+                    (omz / "custom/plugins").symlink_to(outside)
+                elif case == "symlink_leaf_dir":
+                    (omz / "custom/plugins").mkdir(parents=True, mode=0o700)
+                    (omz / "custom/plugins/zsh-vi-mode").symlink_to(outside)
+                elif case == "dangling_symlink_leaf":
+                    (omz / "custom/plugins").mkdir(parents=True, mode=0o700)
+                    (omz / "custom/plugins/zsh-vi-mode").symlink_to(outside / "missing-target")
+                elif case == "file_custom":
+                    (omz / "custom").write_text("not a dir\n", encoding="utf-8")
+                elif case == "file_plugins":
+                    (omz / "custom").mkdir(mode=0o700)
+                    (omz / "custom/plugins").write_text("not a dir\n", encoding="utf-8")
+                elif case == "file_leaf":
+                    (omz / "custom/plugins").mkdir(parents=True, mode=0o700)
+                    (omz / "custom/plugins/zsh-vi-mode").write_text("not a dir\n", encoding="utf-8")
+
+                res = self._run_launcher(env)
+                self.assertNotEqual(res.returncode, 0, f"expected refusal for {case}: stdout={res.stdout} stderr={res.stderr}")
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "intact\n")
+                self.assertFalse((outside / "plugins").exists(), f"outside/plugins mutated for {case}")
+                if case == "symlink_plugins_with_existing_leaf":
+                    self.assertEqual((outside / "zsh-vi-mode/sentinel").read_text(encoding="utf-8"), "intact-leaf\n")
+                    self.assertFalse((outside / "zsh-vi-mode/zsh-vi-mode.plugin.zsh").exists())
+                else:
+                    self.assertFalse((outside / "zsh-vi-mode").exists(), f"outside/zsh-vi-mode mutated for {case}")
+                self.assertFalse((state / "build/oh-my-zsh-host").exists())
+
+    def test_legacy_host_omz_invalidates_old_receipt_and_linked_cached_layout_on_reuse(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home, state, _, _, env = self._make_env(root, with_host_omz=True)
+            build = state / "build"
+            build.mkdir(parents=True, mode=0o700, exist_ok=True)
+            # Pre-seed an old receipt lacking layout=physical-v1 and a symlinked plugin leaf.
+            outside = root / "outside-cache"
+            outside.mkdir(mode=0o700)
+            (outside / "sentinel").write_text("keep\n", encoding="utf-8")
+            cached = build / "oh-my-zsh-host"
+            (cached / "custom/plugins").mkdir(parents=True, mode=0o700)
+            (cached / "custom/plugins/zsh-vi-mode").symlink_to(outside)
+            (build / "oh-my-zsh-host.receipt").write_text(
+                "source=host-legacy\nzsh_vi_mode_source=host\nzsh_vi_mode_commit=host\n",
+                encoding="utf-8",
+            )
+
+            res = self._run_launcher(env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            receipt = (build / "oh-my-zsh-host.receipt").read_text(encoding="utf-8")
+            self.assertIn("layout=physical-v1", receipt)
+            rebuilt_leaf = build / "oh-my-zsh-host/custom/plugins/zsh-vi-mode"
+            self.assertTrue(rebuilt_leaf.is_dir())
+            self.assertFalse(rebuilt_leaf.is_symlink())
+            self.assertEqual((outside / "sentinel").read_text(encoding="utf-8"), "keep\n")
 
 
 if __name__ == "__main__":

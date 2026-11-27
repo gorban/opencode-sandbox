@@ -52,12 +52,12 @@ mid-session. Related: [prd_h](prd_h.md) (warm start: shared setup done once unde
       lookup or writable-volume precedence), verified opt-in 2.x updates (`OC_OPENCODE_VERSION`
       plus `OC_OPENCODE_SHA256`, executed via kernel-sealed `memfd` in `oc-opencode-run.py`), and
       explicit unverified compatibility mode (`OC_OPENCODE_VERSION=keep`).
-- [x] Qualification (`agy/target3-supply-chain-pins`, integrated with `5c69e91`): byte-identical
-      14-file runtime manifest (`oc-sandbox` SHA-256 `92de6c5f419cbb247fcc3d4c53ad0a8d0c3822d8fa80cb6b5c7e9aed6e0edb30`)
+- [x] Qualification (`agy/target3-supply-chain-pins`, integrated with `5c69e91`): the 14-file
+      runtime manifest (`0804998`, `oc-sandbox` SHA-256 `92de6c5f419cbb247fcc3d4c53ad0a8d0c3822d8fa80cb6b5c7e9aed6e0edb30`)
       passed all 48 headless parallel acceptance checks with verified cleanup in a clean
-      SELinux-enforcing rootless Fedora 45 VM, real-Podman `tests/security.sh` (335/0), portable
-      CI suites (including 14/14 supply-chain tests and Renovate config tests), and locked quality
-      checks (`ShellCheck 0.9.0`).
+      SELinux-enforcing rootless Fedora 45 VM; subsequent follow-up hardened legacy Oh My Zsh
+      staging confinement and cache-layout validation with real-Podman `tests/security.sh` (335/0),
+      portable CI suites, and locked quality checks (`ShellCheck 0.9.0`).
 
 Estimated time: 0.5–1 day.
 
