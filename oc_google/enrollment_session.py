@@ -69,7 +69,9 @@ def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, a
         return destination(route, deadline=min(deadline, time.monotonic() + 30), **request)
 
     def active_authority():
-        return authorized() is True and (channel_active is None or channel_active() is True)
+        return (time.monotonic() < deadline and authorized() is True
+                and (channel_active is None or channel_active() is True)
+                and authorized() is True and time.monotonic() < deadline)
 
     def check_owner():
         _remaining(deadline)
@@ -78,7 +80,8 @@ def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, a
         if cold:
             profile.verify_cold_source()
         profile.verify_native_invocation(authorized=active_authority)
-        _remaining(deadline)
+        if not active_authority():
+            raise EnrollmentSessionError("Google enrollment owner retired")
 
     def spend(route, send):
         with fence:
@@ -88,7 +91,7 @@ def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, a
     def bind_subject(bearer, body):
         with fence:
             check_owner()
-            return profile.bind_subject(bearer, body)
+            return profile.bind_subject(bearer, body, authorized=active_authority)
 
     def prepare_refresh(form):
         with fence:
@@ -105,6 +108,8 @@ def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, a
             check_owner()
             try:
                 connection.settimeout(min(2, _remaining(deadline)))
+                if not active_authority():
+                    raise EnrollmentSessionError("Google enrollment owner retired")
                 connection.sendall(packet)
             except OSError:
                 raise EnrollmentSessionError("Google native metadata reply did not settle") from None

@@ -37,6 +37,7 @@ class NativeService:
     process: subprocess.Popen
     description: str
     enrollment_scope: object | None = None
+    attested: NativeInvocation | None = field(default=None, init=False)
     retired: NativeInvocation | None = field(default=None, init=False)
 
     def control_group(self):
@@ -126,7 +127,7 @@ def _stop(service, identity, fd, after_stop=None):
     except BaseException as error:
         primary = error
     try:
-        _verify_retired(service, identity)
+        _verify_retired(service, identity, fd)
     except BaseException as error:
         retirement = error
         if not isinstance(retirement, NativeRetirementUnconfirmed):
@@ -148,7 +149,13 @@ def _close_pipes(process):
             pipe.close()
 
 
-def _verify_retired(service, identity):
+def _pid_exited(fd):
+    poll = select.poll()
+    poll.register(fd, select.POLLIN)
+    return any(event & select.POLLIN for _, event in poll.poll(0))
+
+
+def _verify_retired(service, identity, fd):
     process = service.process
     try:
         _close_pipes(process)
@@ -164,7 +171,7 @@ def _verify_retired(service, identity):
                       timeout=2, check=False)
     except (Failure, OSError, subprocess.TimeoutExpired):
         raise NativeRetirementUnconfirmed("Could not verify standalone Google ACP retirement") from None
-    if receipt.returncode or cgroup.returncode or sorted(receipt.stdout.splitlines()) not in (
+    if not _pid_exited(fd) or receipt.returncode or cgroup.returncode or sorted(receipt.stdout.splitlines()) not in (
         [b"ActiveState=inactive", b"ControlGroup="], [b"ActiveState=failed", b"ControlGroup="],
     ):
         raise NativeRetirementUnconfirmed("Could not verify standalone Google ACP retirement")
@@ -172,13 +179,24 @@ def _verify_retired(service, identity):
 
 
 @contextmanager
-def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_spawn=None, fence=None, replica=None):
+def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_spawn=None, fence=None,
+                 replica=None, custody=None, authorized=None):
     with nullcontext() if fence is None else fence:
         if reserve_spawn is not None:
             reserve_spawn()
+        if custody is not None:
+            custody.before_spawn(namespace.unit)
+        if authorized is not None and authorized() is not True:
+            if custody is not None:
+                custody.no_spawn()
+            if replica is not None:
+                replica._failed_to_spawn()
+            raise NativeNamespaceError("Google native launch owner retired before spawn")
         try:
             process = _spawn(namespace)
         except OSError:
+            if custody is not None:
+                custody.no_spawn()
             if replica is not None:
                 replica._failed_to_spawn()
             raise
@@ -194,8 +212,11 @@ def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_s
             process.wait(timeout=3)
         finally:
             raise NativeRetirementUnconfirmed("Google native launch ownership could not be attested") from pin_error
+    object.__setattr__(service, "attested", identity)
     try:
         try:
+            if custody is not None:
+                custody.attest(identity)
             if replica is not None:
                 replica._bind(service, identity)
             yield service
@@ -209,7 +230,11 @@ def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_s
         else:
             _stop(service, identity, fd, after_stop)
     finally:
-        os.close(fd)
+        try:
+            if custody is not None and service.retired is not None:
+                custody.retire(service.retired)
+        finally:
+            os.close(fd)
 
 
 def open_signed_out_service(root, build):
@@ -222,7 +247,7 @@ def open_signed_out_service(root, build):
     return _run_service(prepare_signed_out_namespace(root, build))
 
 
-def open_cold_service(root, build, *, replica, connector, ca, authorized, fence, after_stop=None):
+def open_cold_service(root, build, *, replica, connector, ca, authorized, fence, after_stop=None, custody=None):
     """Run the same owner placement with the sole private metadata connector mounted."""
     if type(replica) is not ColdReplica or replica.root != root or fence is None or not callable(authorized):
         raise NativeNamespaceError("Google cold launch requires its staged replica")
@@ -232,10 +257,11 @@ def open_cold_service(root, build, *, replica, connector, ca, authorized, fence,
     namespace = prepare_cold_namespace(root, build, profile=profile, mount_source=replica.mount_source(),
                                        connector=connector, ca=ca, unit=replica.unit)
     return _run_service(namespace, after_stop, reserve_spawn=lambda: replica.reserve_spawn(authorized),
-                        fence=fence, replica=replica)
+                        fence=fence, replica=replica, custody=custody, authorized=authorized)
 
 
-def open_enrollment_service(root, build, *, profile, connector, ca, browser, authorized, fence, after_stop=None):
+def open_enrollment_service(root, build, *, profile, connector, ca, browser, authorized, fence,
+                            after_stop=None, unit=None, custody=None):
     """Run the isolated native consent handoff, with no direct network or browser launch."""
     if (type(profile) is not PinnedProfile or profile.reserve_enrollment_spawn is None
             or fence is None or not callable(authorized)):
@@ -247,6 +273,6 @@ def open_enrollment_service(root, build, *, profile, connector, ca, browser, aut
         raise NativeNamespaceError("Google enrollment profile changed before launch")
     source = Path(f"/proc/{os.getpid()}/fd/{profile.fd}"), info.st_dev, info.st_ino
     namespace = prepare_enrollment_namespace(root, build, profile=profile.path, mount_source=source,
-                                             connector=connector, ca=ca, browser=browser)
+                                             connector=connector, ca=ca, browser=browser, unit=unit)
     return _run_service(namespace, after_stop, enrollment_scope=profile.phase_scope,
-                        reserve_spawn=lambda: profile.reserve_enrollment_spawn(authorized), fence=fence)
+                        reserve_spawn=lambda: profile.reserve_enrollment_spawn(authorized), fence=fence, custody=custody, authorized=authorized)

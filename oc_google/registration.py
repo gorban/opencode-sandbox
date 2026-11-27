@@ -113,7 +113,7 @@ class PinnedProfile:
     path: Path
     fd: int
     reserve_enrollment_spawn: Callable[..., None] | None
-    bind_subject: Callable[[bytes, bytes], SubjectProof]
+    bind_subject: Callable[..., SubjectProof]
     spend_metadata: Callable[..., None]
     refresh_form: Callable[[bytes], bytes]
     verify_cold_source: Callable[[], None]
@@ -123,6 +123,7 @@ class PinnedProfile:
     complete_cold_custody: Callable[..., RegistrationStatus]
     complete_enrollment: Callable[..., RegistrationStatus]
     phase_scope: object
+    record_native_custody: Callable[..., None]
 
 
 @dataclass(frozen=True)
@@ -192,7 +193,7 @@ class ColdReplica:
 
     def _remove_files(self):
         self.mount_path()
-        quarantine = "." + self.root.name + "-retire"
+        quarantine = self._quarantine
         try:
             os.mkdir(quarantine, 0o700, dir_fd=self._runtime_fd)
             quarantine_fd = os.open(quarantine, _DIRECTORY, dir_fd=self._runtime_fd)
@@ -234,12 +235,17 @@ class ColdReplica:
     def removed(self):
         return self._cleanup_confirmed and self._deletion_absent()
 
+    @property
+    def _quarantine(self):
+        return "." + self.root.name + "-retire"
+
     def _deletion_absent(self):
         self._require_open()
         try:
             return (os.path.samestat(os.fstat(self._runtime_fd), self.root.parent.lstat())
                     and os.fstat(self._root_fd).st_nlink == 0 and os.fstat(self._profile_fd).st_nlink == 0
-                    and _absent(self.root.name, directory=self._runtime_fd))
+                    and _absent(self.root.name, directory=self._runtime_fd)
+                    and _absent(self._quarantine, directory=self._runtime_fd))
         except OSError:
             raise RegistrationUnavailable("Google cold replica removal cannot be verified") from None
 
@@ -705,7 +711,9 @@ class _HeldProfile:
             self._check_authority(authorized)
             if self._native is not None or not self._spawn_consumed:
                 raise RegistrationUnavailable("Google native invocation is already bound or was not authorized")
-            identity = service.invocation()
+            identity = service.attested
+            if identity is None or service.invocation() != identity:
+                raise RegistrationUnavailable("Google native invocation does not match the original attestation")
             if self._record.phase is Phase.COLD_CHECKING:
                 custody = _custody_record(self._slot, self._record)
                 if self._replica is None or custody["unit"] != identity.unit or self._replica.unit != identity.unit:
@@ -732,6 +740,21 @@ class _HeldProfile:
             invocation = _custody_invocation(self._slot, _custody_record(self._slot, self._record))
             if invocation["invocation"] != self._invocation.invocation_id:
                 raise RegistrationUnavailable("Google cold invocation receipt changed")
+
+    def record_native_custody(self, event, receipt):
+        """Keep process evidence in the registration slot beyond runtime deletion."""
+        with self._lock, _metadata_storage_errors():
+            self._verify()
+            if event not in ("launch", "attested", "no-spawn", "retired"):
+                raise RegistrationUnavailable("Google native custody event is invalid")
+            if self._record.phase not in (Phase.ENROLLING, Phase.COLD_CHECKING):
+                raise RegistrationUnavailable("Google native custody phase is unavailable")
+            label = "enrollment" if self._record.phase is Phase.ENROLLING else "cold"
+            enrollment = self._record.enrollment
+            data = {**receipt, "label": enrollment.label, "registration": enrollment.registration_id,
+                    "generation": enrollment.generation}
+            _write_private(self._slot.directory.fd, f"{label}-native-{event}.json",
+                           json.dumps(data, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n")
 
     def verify_native_invocation(self, *, authorized):
         with self._lock, _metadata_storage_errors():
@@ -802,7 +825,7 @@ class _HeldProfile:
         self._slot.store(record, recheck=recheck)
         self._record = record
 
-    def bind(self, bearer, body):
+    def bind(self, bearer, body, *, authorized):
         with self._lock:
             if not self._active or not self._subject_available:
                 raise RegistrationUnavailable("the exact Google subject binding is already spent")
@@ -811,6 +834,7 @@ class _HeldProfile:
             self._subject_available = False
             try:
                 self._check_current()
+                self._check_authority(authorized)
                 key = os.pread(self._key_fd, 33, 0)
                 if self._record.phase == Phase.ENROLLING:
                     proof = bind_subject(key, bearer, body)
@@ -818,7 +842,7 @@ class _HeldProfile:
                 else:
                     proof = rebind_subject(key, bearer, body, bytes.fromhex(self._record.subject_digest))
                     updated = replace(self._record, cold_subject_observed=True)
-                self._save(updated)
+                self._save(updated, authorized=authorized)
                 return proof
             except (OSError, ProviderConfigError):
                 raise RegistrationUnavailable("Google subject binding storage is unavailable") from None
@@ -871,6 +895,7 @@ class _HeldProfile:
                 self._check_current(pending=True)
                 self._check_authority(authorized)
                 self._native_current()
+                self._check_authority(authorized)
                 try:
                     result = send()
                 except Exception:
@@ -892,7 +917,7 @@ def _pinned_profile(pins, slot, record, profile, key_fd):
     return PinnedProfile(profile.path, profile.fd, launch, held.bind, held.spend, held.refresh,
                          held.verify_cold_source, held.stage_cold_source,
                          held.bind_native_invocation, held.verify_native_invocation, held.complete_cold_custody,
-                         held.complete_enrollment, held._phase_scope)
+                         held.complete_enrollment, held._phase_scope, held.record_native_custody)
 
 
 @contextmanager

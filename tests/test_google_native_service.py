@@ -17,6 +17,9 @@ class NativeServiceTest(unittest.TestCase):
     description = "oc-sandbox ACP " + "a" * 32
     identity = NativeInvocation(unit, "e" * 32, ("/user.slice/app.slice/" + unit).encode(), 123)
 
+    def setUp(self):
+        self.pid_exited = self.enterContext(patch("oc_google.native_service._pid_exited", return_value=True))
+
     def test_cold_placement_refuses_a_profile_path_as_a_replica(self):
         with self.assertRaisesRegex(NativeNamespaceError, "staged replica"):
             open_cold_service(Path("/fixture"), None, replica=Path("/fixture/authoritative"), connector=None, ca=None,
@@ -56,6 +59,36 @@ class NativeServiceTest(unittest.TestCase):
         service.process.stdout.close.assert_called_once_with()
         service.process.wait.assert_called_once_with(timeout=3)
         self.assertEqual(service.retired, self.identity)
+
+    def test_empty_unit_is_insufficient_while_original_pidfd_remains_live(self):
+        service = NativeService(self.unit, Mock(), self.description)
+        receipt = Mock(returncode=0, stdout=b"ActiveState=inactive\nControlGroup=\n")
+        self.pid_exited.return_value = False
+        with patch("oc_google.native_service.signal.pidfd_send_signal"), \
+                patch("oc_google.native_service.host", return_value=receipt):
+            with self.assertRaises(NativeRetirementUnconfirmed):
+                _stop(service, self.identity, 9)
+        self.pid_exited.assert_called_once_with(9)
+        self.assertIsNone(service.retired)
+
+    def test_custody_records_exact_reserved_unit_before_spawn_and_original_attestation(self):
+        namespace = Mock(unit=self.unit, description=self.description)
+        custody = Mock()
+        with patch("oc_google.native_service._spawn") as spawn, \
+                patch("oc_google.native_service._pin", return_value=(self.identity, 9)), \
+                patch("oc_google.native_service._stop") as stop, patch("oc_google.native_service.os.close"):
+            steps = Mock()
+            steps.attach_mock(custody, "custody")
+            steps.attach_mock(spawn, "spawn")
+
+            def retire(service, identity, _fd, _after_stop):
+                object.__setattr__(service, "retired", identity)
+
+            stop.side_effect = retire
+            with _run_service(namespace, custody=custody) as service:
+                self.assertEqual(service.attested, self.identity)
+        self.assertEqual(steps.mock_calls, [call.custody.before_spawn(self.unit), call.spawn(namespace),
+                                          call.custody.attest(self.identity), call.custody.retire(self.identity)])
 
     def test_failed_pin_reaps_launcher_even_when_both_pipe_closes_fail(self):
         namespace = Mock(unit=self.unit, description=self.description)

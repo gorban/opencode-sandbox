@@ -42,6 +42,9 @@ class NativePeer(FakePeer):
         self.closed = False
         self.live = True
 
+    def active(self):
+        return self.live
+
     def sendall(self, reply):
         self.replies.append(reply)
 
@@ -51,7 +54,7 @@ class NativePeer(FakePeer):
     @contextmanager
     def channel(self):
         try:
-            yield NativeChannel(self, lambda: self.live)
+            yield NativeChannel(self, self.active)
         finally:
             self.close()
 
@@ -156,6 +159,50 @@ class EnrollmentSessionTest(unittest.TestCase):
         self.assertEqual(self.peers[TOKEN].replies, [])
         self.assertIsNone(json.loads(self.journal_file.read_text())["subject_digest"])
 
+    def test_live_peer_returning_after_owner_loss_cannot_spend_provider_write(self):
+        checked_after_spend = False
+
+        def verify_invocation():
+            nonlocal checked_after_spend
+            checked_after_spend |= json.loads(self.journal_file.read_text())["metadata_pending"]
+
+        def peer_check():
+            if checked_after_spend:
+                self.active = False
+            return True
+
+        self.native_gate.side_effect = verify_invocation
+        peer = self.peers[TOKEN]
+        with patch.object(peer, "active", side_effect=peer_check):
+            with self.assertRaisesRegex(registration.RegistrationUnavailable, "authority"):
+                self.session()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(peer.replies, [])
+        self.assertTrue(json.loads(self.journal_file.read_text())["metadata_pending"])
+
+    def test_live_peer_returning_after_owner_loss_cannot_release_native_reply(self):
+        peer = self.peers[TOKEN]
+        reply_pending = False
+        settimeout = peer.settimeout
+
+        def note_reply_timeout(timeout):
+            nonlocal reply_pending
+            settimeout(timeout)
+            reply_pending |= self.sent == [TOKEN, USERINFO]
+
+        def peer_check():
+            if reply_pending:
+                self.active = False
+            return True
+
+        with patch.object(peer, "settimeout", side_effect=note_reply_timeout), \
+                patch.object(peer, "active", side_effect=peer_check):
+            with self.assertRaisesRegex(EnrollmentSessionError, "owner retired"):
+                self.session()
+        self.assertTrue(reply_pending)
+        self.assertEqual(self.sent, [TOKEN, USERINFO])
+        self.assertEqual(peer.replies, [])
+
     def test_invocation_loss_after_upstream_response_withholds_all_native_bytes(self):
         destination = self.destination
 
@@ -185,6 +232,11 @@ class EnrollmentSessionTest(unittest.TestCase):
         self.profile.reserve_enrollment_spawn(lambda: True)
         with self.assertRaises(registration.RegistrationUnavailable):
             self.profile.reserve_enrollment_spawn(lambda: True)
+        object.__setattr__(service, "attested", identity)
+        replacement = NativeInvocation(identity.unit, "f" * 32, identity.group, identity.pid + 1)
+        with patch.object(NativeService, "invocation", return_value=replacement):
+            with self.assertRaisesRegex(registration.RegistrationUnavailable, "original attestation"):
+                self.profile.bind_native_invocation(service, authorized=lambda: True)
         with patch.object(NativeService, "invocation", return_value=identity):
             with self.assertRaises(registration.RegistrationUnavailable):
                 self.profile.bind_native_invocation(other, authorized=lambda: True)
@@ -215,7 +267,7 @@ class ColdMetadataSessionTest(unittest.TestCase):
         journal = registration.RegistrationJournal("fixture")
         enrolled = journal.begin("e" * 64)
         with journal.enrollment_profile(enrolled) as initial:
-            initial.bind_subject(b"old-fixture-bearer", SUBJECT)
+            initial.bind_subject(b"old-fixture-bearer", SUBJECT, authorized=lambda: True)
             native = initial.path / "antigravity-acp"
             native.mkdir(mode=0o700)
             self.credential = native / "acp_token.json"
@@ -335,6 +387,7 @@ class ColdMetadataSessionTest(unittest.TestCase):
         process = Mock()
         service = NativeService(unit, process, "fixture")
         identity = NativeInvocation(unit, "c" * 32, b"/fixture", 123)
+        object.__setattr__(service, "attested", identity)
         self.enterContext(patch.object(NativeService, "invocation", return_value=identity))
         replica.reserve_spawn(lambda: True)
         self.profile.bind_native_invocation(service, authorized=lambda: True)
@@ -358,6 +411,13 @@ class ColdMetadataSessionTest(unittest.TestCase):
             self.profile.complete_cold_custody(observation, **settlement, authorized=lambda: True)
         moved.rename(root)
         replica.remove()
+        quarantine = root.with_name("." + root.name + "-retire")
+        quarantine.mkdir()
+        try:
+            with self.assertRaisesRegex(registration.RegistrationUnavailable, "retirement is incomplete"):
+                self.profile.complete_cold_custody(observation, **settlement, authorized=lambda: True)
+        finally:
+            quarantine.rmdir()
         with self.assertRaises(registration.RegistrationUnavailable):
             self.profile.complete_cold_custody(observation, **settlement, authorized=lambda: False)
         status = self.profile.complete_cold_custody(observation, **settlement, authorized=lambda: True)

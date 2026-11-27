@@ -36,7 +36,7 @@ class ColdRefreshTest(unittest.TestCase):
         journal = registration.RegistrationJournal("fixture")
         enrolled = journal.begin("e" * 64)
         with journal.enrollment_profile(enrolled) as initial:
-            initial.bind_subject(b"old-fixture-bearer", SUBJECT)
+            initial.bind_subject(b"old-fixture-bearer", SUBJECT, authorized=lambda: True)
             native = initial.path / "antigravity-acp"
             native.mkdir(mode=0o700)
             credential = native / "acp_token.json"
@@ -68,7 +68,7 @@ class ColdRefreshTest(unittest.TestCase):
     def refresh(self, body=None):
         return verify_cold_refresh(
             form=refresh_form() if body is None else body, prepare_form=self.profile.refresh_form,
-            bind_subject=self.profile.bind_subject, deadline=time.monotonic() + 3,
+            bind_subject=lambda bearer, body: self.profile.bind_subject(bearer, body, authorized=lambda: True), deadline=time.monotonic() + 3,
             spend=self.spend, destination=self.destination,
         )
 
@@ -143,7 +143,7 @@ class InitialExchangeTest(unittest.TestCase):
     def run_exchange(self, request=None):
         return verify_initial_exchange(
             offer=offer(), callback_gate=self.gate, authorization=AUTHORIZATION,
-            form=form() if request is None else request, bind_subject=self.profile.bind_subject,
+            form=form() if request is None else request, bind_subject=lambda bearer, body: self.profile.bind_subject(bearer, body, authorized=lambda: True),
             deadline=time.monotonic() + 3, spend=self.spend, destination=self.destination,
         )
 

@@ -52,8 +52,8 @@ def fixture_sources(files, scene):
     files = files.copy()
     cli = files[ENTRY].decode("utf-8")
     cli = substitute(cli, "CONFIG_DIR = None", 'CONFIG_DIR = SOURCE_ROOT.parent / "config"')
-    cli = substitute(cli, '"control.py", "route.py", "shell.py")',
-                     '"control.py", "route.py", "shell.py", "fixture_peer.py")')
+    cli = substitute(cli, '        "route.py", "shell.py",\n    ),',
+                     '        "route.py", "shell.py", "fixture_peer.py",\n    ),')
     cli = substitute(cli,
                      '    raise GoogleUnavailable("This Google subscription route has yet to qualify for native inference.")',
                      '    from oc_google.fixture_peer import target\n    return target(spec)')

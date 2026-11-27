@@ -56,7 +56,7 @@ def _copy_member(source, destination, name, size, digest):
             os.fsync(out.fileno())
 
 
-def stage_standalone(source: Path, destination: Path) -> StagedNativeBuild:
+def stage_standalone(source: Path | int, destination: Path) -> StagedNativeBuild:
     """Copy the fixed pair into a launcher-owned empty private directory.
 
     The private staging tree belongs to the supervisor. It may contain an
@@ -65,7 +65,7 @@ def stage_standalone(source: Path, destination: Path) -> StagedNativeBuild:
     try:
         if not destination.is_absolute() or destination.resolve(strict=True) != destination:
             raise NativeArtifactError("Standalone Google ACP staging path is not canonical")
-        src = os.open(source, _DIRECTORY)
+        src = os.dup(source) if isinstance(source, int) else os.open(source, _DIRECTORY)
         try:
             dst = os.open(destination, _DIRECTORY)
             try:

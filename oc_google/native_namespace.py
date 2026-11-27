@@ -82,9 +82,10 @@ def prepare_cold_namespace(root: Path, build: StagedNativeBuild, *, profile, mou
     return _prepare_namespace(root, build, transport=_MetadataMounts(profile, connector, ca, mount_source=mount_source), unit=unit)
 
 
-def prepare_enrollment_namespace(root, build, *, profile, mount_source, connector, ca, browser):
+def prepare_enrollment_namespace(root, build, *, profile, mount_source, connector, ca, browser, unit=None):
     """Limit the OAuth handoff to the owner-only private socket in the namespace."""
-    return _prepare_namespace(root, build, transport=_MetadataMounts(profile, connector, ca, browser, mount_source))
+    return _prepare_namespace(root, build, transport=_MetadataMounts(profile, connector, ca, browser, mount_source),
+                              unit=unit)
 
 
 def _prepare_namespace(root, build, *, transport=None, unit=None):

@@ -432,7 +432,7 @@ class CallbackGate:
                 return False
             self._outcome = Outcome.UNCERTAIN
             try:
-                if _send_once(self._native, data) == len(data):
+                if _send_once(self._native, data) == len(data) and self._authority_alive():
                     self._forwarded = callback
                     self._outcome = Outcome.FORWARDED
             except OSError:
@@ -444,7 +444,7 @@ class CallbackGate:
                     except OSError:
                         with suppress(OSError):
                             self._native.close()
-            return True
+            return self._outcome is Outcome.FORWARDED
 
     def serve_one(self):
         """Handle at most one bounded browser request and reply with local text."""
@@ -470,4 +470,13 @@ class CallbackGate:
                 pass
             with suppress(OSError):
                 connection.settimeout(.2)
-                connection.sendall(acknowledgement(accepted))
+                if accepted:
+                    with self._fence, self._lock:
+                        accepted = (self._authority_alive()
+                                    and (self._outcome is Outcome.DENIED or self._forwarded is not None))
+                        if not accepted and self._outcome is Outcome.FORWARDED:
+                            self._forwarded = None
+                            self._outcome = Outcome.UNCERTAIN
+                        connection.sendall(acknowledgement(accepted))
+                else:
+                    connection.sendall(acknowledgement(False))

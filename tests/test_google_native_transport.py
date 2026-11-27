@@ -1,7 +1,8 @@
 """Verify metadata CONNECT and private TLS admission without network I/O."""
 
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+import os
 from pathlib import Path
 import socket
 import stat
@@ -11,7 +12,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from oc_google.metadata_destination import MetadataRoute
-from oc_google import native_transport
+from oc_google import auth_offer, native_peer, native_transport
+from test_google_auth_offer import offer, request
 
 
 _AUTHORITY = b"oauth2.googleapis.com:443"
@@ -39,6 +41,21 @@ class Peer:
 
     def sendall(self, packet):
         self.writes.append(packet)
+
+
+@contextmanager
+def admit_fixture_peer(_connection, *, expected_group, read_cgroup):
+    # The read end is live until close, so the exact group checks are exercised
+    # without requiring the test runner to support the SO_PEERPIDFD sockopt.
+    read_fd, write_fd = os.pipe()
+    peer = native_peer._NativePeer(os.getpid(), read_fd, expected_group, read_cgroup)
+    try:
+        if not peer.active():
+            raise AssertionError("The synthetic peer did not authenticate")
+        yield peer
+    finally:
+        peer.close()
+        os.close(write_fd)
 
 
 class NativeTransportTest(unittest.TestCase):
@@ -99,6 +116,86 @@ class NativeTransportTest(unittest.TestCase):
                 self.fail("Retired owner permitted")
         self.assertEqual(peer.writes, [])
         self.context.wrap_socket.assert_not_called()
+
+    def test_owner_loss_during_final_cgroup_read_withholds_connect_reply(self):
+        self.peer_admission.side_effect = admit_fixture_peer
+        live = True
+        reads = 0
+
+        def read_group(pid):
+            nonlocal live, reads
+            self.assertEqual(pid, os.getpid())
+            reads += 1
+            if reads == 3:
+                live = False
+            return b"0::/fixture\n"
+
+        server, connector = socket.socketpair()
+        with server, connector:
+            connector.settimeout(1)
+            connector.sendall(_CONNECT)
+            with self.assertRaisesRegex(native_transport.NativeTransportError, "owner retired"):
+                with native_transport.open_native_metadata_channel(
+                    server, route=MetadataRoute.TOKEN, deadline=time.monotonic() + 1,
+                    expected_group=b"/fixture", read_cgroup=read_group, context=self.context,
+                    authorized=lambda: live,
+                ):
+                    self.fail("Native TLS started after owner loss")
+            self.assertEqual(connector.recv(128), b"")
+        self.assertEqual(reads, 3)
+        self.context.wrap_socket.assert_not_called()
+
+    def test_owner_loss_during_browser_cgroup_read_withholds_private_forward_or_success_ack(self):
+        self.peer_admission.side_effect = admit_fixture_peer
+        for during in ("forward", "acknowledge"):
+            with self.subTest(during=during), tempfile.TemporaryDirectory() as directory:
+                live = True
+                cancel_during_read = False
+
+                def read_group(pid):
+                    nonlocal live
+                    self.assertEqual(pid, os.getpid())
+                    if cancel_during_read:
+                        live = False
+                    return b"0::/fixture\n"
+
+                with native_transport.open_native_browser_listener(
+                    Path(directory), expected_group=lambda: b"/fixture", read_cgroup=read_group,
+                    authorized=lambda: live,
+                ) as (path, receive), socket.socket(socket.AF_UNIX) as connector:
+                    connector.connect(str(path))
+                    with socket.socket(socket.AF_INET) as reserve:
+                        reserve.bind((auth_offer.HOST, 0))
+                        port = reserve.getsockname()[1]
+                    connector.sendall((offer(port) + "\n").encode("ascii"))
+                    with receive(time.monotonic() + 2) as (_, gate):
+                        gate.activate()
+                        consume = gate._consume
+
+                        def cancel_at_ack(callback, address):
+                            nonlocal cancel_during_read
+                            accepted = consume(callback, address)
+                            cancel_during_read = True
+                            return accepted
+
+                        with socket.create_connection((auth_offer.HOST, port), timeout=1) as browser:
+                            browser.sendall(request(port))
+                            browser.shutdown(socket.SHUT_WR)
+                            if during == "forward":
+                                cancel_during_read = True
+                                gate.serve_one()
+                                connector.setblocking(False)
+                                with self.assertRaises(BlockingIOError):
+                                    connector.recv(4096)
+                            else:
+                                with patch.object(gate, "_consume", side_effect=cancel_at_ack):
+                                    gate.serve_one()
+                                self.assertEqual(gate.outcome, auth_offer.Outcome.UNCERTAIN)
+                                connector.settimeout(1)
+                                self.assertTrue(connector.recv(4096).startswith(b"GET /?"))
+                            self.assertEqual(browser.recv(4096), auth_offer.acknowledgement(False))
+                        self.assertIsNone(gate.take_forwarded())
+                        self.assertFalse(live)
 
     def test_userinfo_is_an_owner_only_route(self):
         peer = Peer(_CONNECT)

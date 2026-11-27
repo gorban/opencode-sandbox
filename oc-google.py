@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enter the restricted Google shell through the trusted workstation launcher."""
+"""Enter the Google workstation commands through the trusted launcher."""
 
 import argparse
 import os
@@ -12,7 +12,14 @@ import sys
 SOURCE_ROOT = Path(__file__).absolute().parent
 CONFIG_DIR = None
 PACKAGES = {
-    "oc_google": ("__init__.py", "control.py", "route.py", "shell.py"),
+    "oc_google": (
+        "__init__.py", "account_binding.py", "auth_offer.py", "cold_catalog.py", "connect.py",
+        "control.py", "enrollment.py", "enrollment_session.py", "metadata_destination.py",
+        "metadata_ingress.py", "metadata_workflow.py", "native_artifacts.py", "native_browser.py",
+        "native_enrollment_acp.py", "native_namespace.py", "native_peer.py", "native_proxy.py",
+        "native_service.py", "native_transport.py", "oauth_exchange.py", "registration.py",
+        "route.py", "shell.py",
+    ),
     "oc_orchestrator": ("__init__.py", "capture.py", "owner.py", "protocol.py", "relay.py", "runtime.py"),
     "oc_providers": ("__init__.py", "config.py", "contracts.py"),
 }
@@ -63,7 +70,8 @@ def shell_for(label):
 
     if not is_valid_instance_label(label):
         raise GoogleUnavailable("Invalid Google registration label.")
-    spec = load_provider_config(config_dir=CONFIG_DIR).get("google", label)
+    config = load_provider_config(config_dir=CONFIG_DIR)
+    spec = config.get("google", label) if config is not None else None
     if spec is None or not spec.enabled or spec.auth_mode != "subscription":
         raise GoogleUnavailable("Enable a Google subscription registration in providers.toml first.")
     target = qualified_route(spec)
@@ -88,9 +96,22 @@ def main():
         return 1
     parser = argparse.ArgumentParser(prog="oc-sandbox google", allow_abbrev=False)
     verbs = parser.add_subparsers(dest="verb", required=True)
+    verbs.add_parser("connect", help="Enroll Google workstation metadata using a sign-in link").add_argument("label")
     verbs.add_parser("shell", help="Open the restricted Google text shell").add_argument("label")
     verbs.add_parser("arm", help="Authorize one turn in the specified shell").add_argument("run_id")
     args = parser.parse_args()
+
+    if args.verb == "connect":
+        from oc_google.connect import ConnectError, connect_for
+
+        try:
+            return connect_for(args.label)
+        except ConnectError as error:
+            print(f"oc-sandbox google: {error}", file=sys.stderr)
+            return 1
+        except (OSError, ValueError, RuntimeError):
+            print("oc-sandbox google: Workstation enrollment did not complete.", file=sys.stderr)
+            return 1
 
     from oc_google.control import ControlError
     from oc_orchestrator.owner import OwnerLost

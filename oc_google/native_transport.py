@@ -6,6 +6,7 @@ import os
 import socket
 import ssl
 import stat
+import time
 from threading import Lock
 from typing import Callable
 
@@ -118,6 +119,12 @@ def _read_offer(connection, deadline):
     return raw, port
 
 
+def _peer_authorized(peer, authorized, deadline):
+    """Recheck the phase owner after the potentially blocking cgroup read."""
+    return (time.monotonic() < deadline and authorized() is True and peer.active()
+            and authorized() is True and time.monotonic() < deadline)
+
+
 @contextmanager
 def open_native_browser_listener(directory, *, expected_group, read_cgroup, authorized, fence=None):
     """Receive one native browser offer and hold its independently verified callback."""
@@ -138,7 +145,7 @@ def open_native_browser_listener(directory, *, expected_group, read_cgroup, auth
             connection = _accept_owned(listener, deadline, authorized)
             with connection, admit_native_peer(connection, expected_group=group, read_cgroup=read_cgroup) as peer:
                 def active():
-                    return authorized() is True and peer.active()
+                    return _peer_authorized(peer, authorized, deadline)
 
                 if not active():
                     raise NativeTransportError("Google native sign-in owner retired")
@@ -205,7 +212,7 @@ def open_native_metadata_channel(
             raise NativeTransportError("Invalid native metadata route")
         with admit_native_peer(connection, expected_group=expected_group, read_cgroup=read_cgroup) as peer:
             def active():
-                return authorized() is True and peer.active()
+                return _peer_authorized(peer, authorized, deadline)
 
             if not active():
                 raise NativeTransportError("Native metadata tunnel owner retired")

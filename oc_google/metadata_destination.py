@@ -192,13 +192,16 @@ def _send_under_gate(connection, packet, deadline, deliver):
     active = True
     attempted = False
     sent = False
+    # Prepare the nonblocking TLS write before durable admission. A socket
+    # that cannot accept the complete request in one call stays spent.
+    connection.settimeout(0)
 
     def send():
         nonlocal attempted, sent
         if get_ident() != owner or not active or attempted:
             raise MetadataDestinationError("Google metadata write authority is unavailable")
         attempted = True
-        connection.settimeout(_remaining(deadline))
+        _remaining(deadline)
         if connection.send(packet) != len(packet):
             raise MetadataDestinationError("Google metadata write was incomplete")
         sent = True

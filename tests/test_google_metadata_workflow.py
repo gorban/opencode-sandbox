@@ -27,7 +27,7 @@ class MetadataWorkflowTest(unittest.TestCase):
         journal.begin.return_value = enrollment
         journal.enrollment_profile.return_value = nullcontext(profile)
         journal.cold_profile.return_value = nullcontext(profile)
-        runtime = SimpleNamespace(root=Path("/fixture"), build=build, certificate=Path("/fixture/ca"),
+        runtime = SimpleNamespace(root=Path("/fixture"), build=build, certificate=Path("/fixture/ca"), custody=None,
                                   listeners=Mock(return_value=nullcontext((Path("/fixture/metadata.sock"), Mock()))))
 
         @contextmanager
@@ -54,6 +54,40 @@ class MetadataWorkflowTest(unittest.TestCase):
             _receive_callback(object(), gate, notify=notify, deadline=time.monotonic() + 1, owner=owner, profile=None)
         gate.activate.assert_not_called()
         notify.assert_not_called()
+
+    def test_offer_delivery_and_fresh_owner_check_precede_activation(self):
+        owner = SimpleNamespace(fence=RLock(), authorizes_offer=Mock(side_effect=[True, False]))
+        gate = Mock()
+        notify = Mock(side_effect=lambda _: gate.activate.assert_not_called())
+        with self.assertRaisesRegex(MetadataWorkflowError, "after offer disclosure"):
+            _receive_callback(object(), gate, notify=notify, deadline=time.monotonic() + 1,
+                              owner=owner, profile=None)
+        notify.assert_called_once()
+        gate.activate.assert_not_called()
+
+    def test_cold_phase_expiry_during_retirement_withholds_settlement(self):
+        journal, profile, _replica, enrollment, runtime, opened = self.workflow_fixture()
+        clock = Mock(return_value=100)
+
+        @contextmanager
+        def slow_retirement(*args, **kwargs):
+            with opened() as service:
+                yield service
+                clock.return_value = 119
+
+        def settle(*args, authorized, **kwargs):
+            if not authorized():
+                raise MetadataWorkflowError("Google metadata settlement owner expired")
+
+        profile.complete_cold_custody.side_effect = settle
+        with patch("oc_google.metadata_workflow.time.monotonic", clock), \
+                patch("oc_google.metadata_workflow.open_cold_service", side_effect=slow_retirement), \
+                patch("oc_google.metadata_workflow.NativeEnrollmentAcp"), \
+                patch("oc_google.metadata_workflow.serve_cold_metadata") as observed:
+            with self.assertRaisesRegex(MetadataWorkflowError, "settlement owner expired"):
+                reopen_metadata(journal, enrollment, runtime, destination=Mock(), authorized=lambda: True,
+                                fence=RLock())
+        self.assertEqual(observed.call_args.kwargs["deadline"], 118)
 
     def test_missing_certificate_is_refused_before_replica_creation(self):
         with TemporaryDirectory() as temporary:

@@ -78,8 +78,16 @@ observed the same subject and a fixture Gemini model, and settled the observatio
 the exact service exited and its disposable profile was removed. The native server
 replaced the disposable credential inode during refresh. The registered credential's
 inode and bytes remained intact. Startup ACP notifications were discarded after exact
-session and schema validation. This evidence covers the fake metadata path. Review of
-the public launcher, an attended personal sign-in, and live model qualification remain open.
+session and schema validation.
+
+The workstation command is `oc-sandbox google connect LABEL`. It requires an enabled
+`google/LABEL` subscription entry in the trusted `providers.toml` and the two pinned
+standalone 1.5.2 files under `~/.local/share/oc-sandbox/google/standalone-1.5.2`.
+The command presents link-only consent on the verified foreground terminal.
+A copied-launcher fixture ran the pinned native process, recorded seven ordered fake
+metadata operations across sign-in and a fresh reopen, and verified both native
+retirements. The resulting local observation grants no invocation authority.
+Attended sign-in and exact public endpoint behavior remain to be qualified.
 
 - [x] Demonstrate one text-only OpenCode turn through the bundled ACP peer
   (`codex/antigravity-acp-text-proxy`). The pinned worker returned exact `ok` in devbox.

@@ -1,0 +1,389 @@
+"""Attended, link-only enrollment with workstation-owned metadata transport."""
+
+from contextlib import ExitStack, contextmanager
+import ctypes
+import errno
+from fcntl import F_GETFL, fcntl, ioctl
+import os
+import secrets
+import select
+import shutil
+import signal
+import stat
+from threading import RLock
+import termios
+import time
+
+from oc_orchestrator.runtime import check_private_directory, host, scratch_parent
+from oc_providers.config import _account_home, _open_trusted_dir, load_provider_config
+from oc_providers.contracts import is_valid_instance_label
+
+from .control import terminal
+from .metadata_destination import MetadataRoute, exchange
+from .metadata_workflow import MetadataRuntime, enroll_metadata, reopen_metadata
+from .native_artifacts import stage_standalone
+from .native_namespace import public_certificate
+from .registration import RegistrationJournal, _absent, _DIRECTORY, _write_private
+
+
+_libc_write = ctypes.CDLL(None, use_errno=True).write
+_libc_write.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t)
+_libc_write.restype = ctypes.c_ssize_t
+
+_TIOCGDEV = 0x80045432
+_TIOCGPTN = 0x80045430
+_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGTSTP, signal.SIGCONT,
+            signal.SIGTTIN, signal.SIGTTOU)
+_CONSENT = (
+    "Sign in to Google Antigravity using a personal account on this workstation.\n"
+    "The Google grant includes these scopes:\n"
+    "  https://www.googleapis.com/auth/cloud-platform\n"
+    "    Broad access to Google Cloud resources available to this account.\n"
+    "  https://www.googleapis.com/auth/userinfo.email\n"
+    "    Authorizes email metadata. The broker requests only the opaque account ID.\n"
+    "  https://www.googleapis.com/auth/aicode\n"
+    "    Authorizes Google coding service access.\n"
+    "The offline refresh grant stays in a private workstation profile. This attempt uses "
+    "only sign-in, account verification, account metadata, and model catalog requests. "
+    "It sends zero inference prompts. Open the link yourself in a browser on this "
+    "workstation and keep this terminal in the foreground.\n"
+    "Continue? [y/N] "
+)
+
+
+class ConnectError(RuntimeError):
+    """A fixed enrollment refusal for the workstation operator."""
+
+
+class CustodyUnconfirmed(ConnectError):
+    """Retain the exact affected private enrollment runtime for inspection."""
+
+
+class _TerminalOwner:
+    def __init__(self, fd):
+        self.fd = fd
+        self.fence = RLock()
+        self.cancelled = False
+        self.signal = None
+        self.deadline = time.monotonic() + 260
+        self.identity = self._identify()
+
+    def _identify(self):
+        identity = terminal(os.getpid())
+        device = ioctl(self.fd, _TIOCGDEV, bytes(4))
+        if os.tcgetpgrp(self.fd) != os.getpgrp() or identity[3] != os.getsid(0):
+            raise ConnectError("Google sign-in requires a foreground workstation terminal.")
+        for fd, insufficient_access in ((0, os.O_WRONLY), (1, os.O_RDONLY)):
+            if (fcntl(fd, F_GETFL) & os.O_ACCMODE) == insufficient_access:
+                raise ConnectError("Google sign-in requires readable input and writable output.")
+            try:
+                ioctl(fd, _TIOCGPTN, bytes(4))
+            except OSError as error:
+                if error.errno != errno.ENOTTY:
+                    raise
+            else:
+                raise ConnectError("Google sign-in requires a controlling terminal.")
+            if ioctl(fd, _TIOCGDEV, bytes(4)) != device:
+                raise ConnectError("Google sign-in input and output must share a controlling terminal.")
+        return identity, device
+
+    def mark_signal(self, number, _frame):
+        self.signal = number
+
+    def authorized(self):
+        with self.fence:
+            if self.cancelled or self.signal is not None or time.monotonic() >= self.deadline:
+                self.cancelled = True
+                return False
+            try:
+                valid = self._identify() == self.identity
+            except (OSError, RuntimeError, ValueError):
+                valid = False
+            self.cancelled = not valid or self.signal is not None or time.monotonic() >= self.deadline
+            return not self.cancelled
+
+    def _ready(self, events, deadline):
+        poll = select.poll()
+        poll.register(self.fd, events)
+        while self.authorized() and time.monotonic() < deadline:
+            ready = poll.poll(max(1, int(min(.1, deadline - time.monotonic()) * 1000)))
+            if ready:
+                observed = ready[0][1]
+                if observed & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                    self.cancelled = True
+                    return False
+                return bool(observed & events)
+        return False
+
+    def write_once(self, message):
+        payload = message.encode("ascii")
+        if not 0 < len(payload) <= 8300 or not self._ready(select.POLLOUT, time.monotonic() + .2):
+            self.cancelled = True
+            raise ConnectError("Google sign-in terminal write was unavailable.")
+        with self.fence:
+            try:
+                if self.authorized() and _libc_write(self.fd, payload, len(payload)) == len(payload) and self.authorized():
+                    return
+            except OSError:
+                pass
+            self.cancelled = True
+            raise ConnectError("Google sign-in terminal write did not settle.")
+
+    def consent(self, label):
+        if not self.authorized():
+            return False
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+        self.write_once(f"Google registration {label}\n{_CONSENT}")
+        deadline = time.monotonic() + 45
+        answer = b""
+        while len(answer) < 4 and self._ready(select.POLLIN, deadline):
+            byte = os.read(self.fd, 1)
+            if byte in (b"\n", b"\r"):
+                return answer in (b"y", b"Y") and self.authorized()
+            if not byte:
+                break
+            answer += byte
+        self.cancelled = True
+        return False
+
+    def offer(self, offer):
+        self.write_once(f"Google sign-in link for this workstation\n{offer.url}\n")
+
+
+@contextmanager
+def _attended_owner():
+    fd = os.open("/dev/tty", os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    with ExitStack() as clean:
+        clean.callback(os.close, fd)
+        owner = _TerminalOwner(fd)
+        for number in _SIGNALS:
+            old = signal.signal(number, owner.mark_signal)
+            clean.callback(signal.signal, number, old)
+        if not owner.authorized():
+            raise ConnectError("Google sign-in requires a foreground workstation terminal.")
+        yield owner
+
+
+def _preflight(parent):
+    uid = os.geteuid()
+    if not uid or uid != os.getuid():
+        raise ConnectError("Google sign-in requires a non-root workstation account.")
+    bridge = os.lstat("/usr/bin/host-spawn")
+    if not stat.S_ISREG(bridge.st_mode) or bridge.st_uid != 0 or bridge.st_mode & 0o022:
+        raise ConnectError("Google sign-in requires a trusted host bridge.")
+    if (host("id", "-ru").stdout.strip() != str(uid).encode("ascii")
+            or host("readlink", "/proc/self/ns/net", timeout=2).stdout.strip()
+            != os.readlink("/proc/self/ns/net").encode("ascii")):
+        raise ConnectError("Google sign-in requires the workstation loopback and account.")
+    check_private_directory(parent)
+    for path in ("/usr/bin/openssl", "/usr/bin/bwrap", "/usr/bin/systemd-run", "/usr/bin/systemctl", "/usr/bin/python3"):
+        receipt = host("stat", "-Lc", "%u %a", "--", path, timeout=2).stdout.split()
+        if len(receipt) != 2 or receipt[0] != b"0" or int(receipt[1], 8) & 0o022:
+            raise ConnectError("Google sign-in requires protected workstation tools.")
+        host("test", "-f", path, timeout=2)
+        host("test", "-x", path, timeout=2)
+
+
+@contextmanager
+def _artifacts():
+    home = _account_home()
+    sandbox = (home / "opencode-sandbox").resolve()
+    path = home / ".local/share/oc-sandbox/google/standalone-1.5.2"
+    fd = _open_trusted_dir(path, sandbox=sandbox)
+    if fd is None:
+        raise ConnectError("Install the pinned Google standalone ACP pair in the workstation artifact directory.")
+    try:
+        yield fd
+        current = _open_trusted_dir(path, sandbox=sandbox)
+        if current is None:
+            raise ConnectError("The Google standalone artifact directory changed during staging.")
+        try:
+            if not os.path.samestat(os.fstat(current), os.fstat(fd)):
+                raise ConnectError("The Google standalone artifact directory changed during staging.")
+        finally:
+            os.close(current)
+    finally:
+        os.close(fd)
+
+
+class _RuntimeCustody:
+    def __init__(self, parent, parent_fd, root, root_fd, label, cold, authorized):
+        self.parent = parent
+        self.parent_fd = parent_fd
+        self.root = root
+        self.root_fd = root_fd
+        self.label = label
+        self.cold = cold
+        self.authorized = authorized
+        self.quarantine = "." + root.name + "-retire"
+        self.record = None
+        self.unit = None
+        self.identity = None
+        self.cleanable = True
+
+    def bind(self, record):
+        if self.record is not None:
+            raise CustodyUnconfirmed("Google enrollment custody is already bound.")
+        self.record = record
+
+    def _verify(self, name, fd):
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        original = os.fstat(self.root_fd)
+        if (not os.path.samestat(info, original) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise CustodyUnconfirmed("Google enrollment runtime identity changed.")
+        return original
+
+    def _verify_parent(self):
+        if not os.path.samestat(self.parent.lstat(), os.fstat(self.parent_fd)):
+            raise CustodyUnconfirmed("Google enrollment runtime parent changed.")
+
+    def before_spawn(self, unit):
+        self._verify_parent()
+        original = self._verify(self.root.name, self.parent_fd)
+        if self.unit is not None or self.record is None:
+            raise CustodyUnconfirmed("Google enrollment launch custody changed.")
+        if not self.authorized():
+            raise ConnectError("Google enrollment owner retired before launch.")
+        self.cleanable = False
+        self.unit = unit
+        self.record("launch", {"label": self.label, "root": str(self.root), "device": original.st_dev,
+                               "inode": original.st_ino, "unit": unit})
+        self._verify_parent()
+        self._verify(self.root.name, self.parent_fd)
+        if not self.authorized():
+            self.no_spawn()
+            raise ConnectError("Google enrollment owner retired before launch.")
+
+    def attest(self, identity):
+        if identity.unit != self.unit or self.identity is not None:
+            raise CustodyUnconfirmed("Google enrollment process identity changed.")
+        self.record("attested", self._process(identity))
+        self.identity = identity
+
+    def _process(self, identity):
+        return {"unit": self.unit, "invocation": identity.invocation_id,
+                "pid": identity.pid, "cgroup": identity.group.decode("ascii")}
+
+    def no_spawn(self):
+        self.record("no-spawn", {"unit": self.unit})
+        self.cleanable = True
+
+    def retire(self, identity):
+        if self.identity is None:
+            return
+        if identity != self.identity:
+            raise CustodyUnconfirmed("Google enrollment retirement identity changed.")
+        self.record("retired", self._process(identity))
+        self.cleanable = True
+
+    def cleanup(self):
+        if not self.cleanable:
+            raise CustodyUnconfirmed("Google enrollment cleanup requires inspection.")
+        self._verify_parent()
+        if not _absent(self.quarantine, directory=self.parent_fd):
+            raise CustodyUnconfirmed("Google enrollment cleanup quarantine requires inspection.")
+        if _absent(self.root.name, directory=self.parent_fd):
+            if not self.cold or os.fstat(self.root_fd).st_nlink != 0:
+                raise CustodyUnconfirmed("Google enrollment runtime disappearance requires inspection.")
+            return
+        self._verify(self.root.name, self.parent_fd)
+        os.mkdir(self.quarantine, 0o700, dir_fd=self.parent_fd)
+        quarantine_fd = os.open(self.quarantine, _DIRECTORY, dir_fd=self.parent_fd)
+        try:
+            os.rename(self.root.name, "runtime", src_dir_fd=self.parent_fd, dst_dir_fd=quarantine_fd)
+            self._verify("runtime", quarantine_fd)
+            shutil.rmtree("runtime", dir_fd=quarantine_fd)
+        finally:
+            os.close(quarantine_fd)
+        os.rmdir(self.quarantine, dir_fd=self.parent_fd)
+        self._verify_parent()
+        if (os.fstat(self.root_fd).st_nlink != 0 or not _absent(self.root.name, directory=self.parent_fd)
+                or not _absent(self.quarantine, directory=self.parent_fd)):
+            raise CustodyUnconfirmed("Google enrollment cleanup could not confirm removal.")
+
+
+@contextmanager
+def _private_runtime(parent, label, cold, owner):
+    with ExitStack() as clean:
+        parent_fd = os.open(parent, _DIRECTORY)
+        clean.callback(os.close, parent_fd)
+        info = os.fstat(parent_fd)
+        if (not os.path.samestat(info, parent.lstat()) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise ConnectError("Google enrollment runtime parent is unavailable.")
+        name = "oc-g-" + secrets.token_hex(12)
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        try:
+            root_fd = os.open(name, _DIRECTORY, dir_fd=parent_fd)
+        except OSError as error:
+            raise CustodyUnconfirmed("Google enrollment runtime creation requires inspection.") from error
+        clean.callback(os.close, root_fd)
+        custody = _RuntimeCustody(parent, parent_fd, parent / name, root_fd, label, cold, owner.authorized)
+        try:
+            yield custody
+        finally:
+            try:
+                custody.cleanup()
+            except (OSError, RuntimeError) as error:
+                raise CustodyUnconfirmed("Google enrollment cleanup requires inspection.") from error
+
+
+def _prepare_runtime(custody, source):
+    root = custody.root
+    check_private_directory(root)
+    native = root / "native"
+    native.mkdir(mode=0o700)
+    build = stage_standalone(source, native)
+    cert, key, config = (root / name for name in ("metadata.pem", "metadata-key.pem", "openssl.cnf"))
+    routes = [MetadataRoute.TOKEN, MetadataRoute.LOAD_CODE_ASSIST]
+    if custody.cold:
+        routes.append(MetadataRoute.FETCH_AVAILABLE_MODELS)
+    names = ", ".join("DNS:" + route.value[0] for route in routes)
+    _write_private(custody.root_fd, config.name, (
+        "[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=extensions\n"
+        "[dn]\nCN=oc-sandbox Google private metadata\n"
+        f"[extensions]\nsubjectAltName={names}\n"
+    ).encode("ascii"))
+    host("sh", "-c", 'umask 077; exec /usr/bin/env -i HOME="$1" PATH=/usr/bin:/bin LANG=C '
+         '/usr/bin/openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 1 '
+         '-config "$2" -out "$3" -keyout "$4" </dev/null', "oc-sandbox-google", str(root), str(config),
+         str(cert), str(key), timeout=6)
+    actual = host("env", "-i", f"HOME={root}", "PATH=/usr/bin:/bin", "LANG=C", "/usr/bin/openssl",
+                  "x509", "-in", str(cert), "-noout", "-ext", "subjectAltName", timeout=2).stdout.splitlines()
+    if ([line.strip() for line in actual] != [b"X509v3 Subject Alternative Name:", names.encode("ascii")]):
+        raise ConnectError("Google enrollment certificate scope did not match its phase.")
+    public_certificate(cert)
+    info = key.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+        raise ConnectError("Google enrollment private TLS key is unavailable.")
+    return MetadataRuntime(root, build, cert, key, custody)
+
+
+def connect_for(label):
+    """Run the exact public command only on an attended workstation."""
+    if not is_valid_instance_label(label):
+        raise ConnectError("Invalid Google registration label.")
+    config = load_provider_config()
+    spec = config.get("google", label) if config is not None else None
+    if spec is None or not spec.enabled or spec.auth_mode != "subscription" or spec.cli_path is not None:
+        raise ConnectError("Enable the Google subscription registration without a CLI override in providers.toml.")
+    parent = scratch_parent()
+    with _attended_owner() as owner:
+        _preflight(parent)
+        with ExitStack() as initial_root, ExitStack() as cold_root:
+            with _artifacts() as source:
+                initial = _prepare_runtime(initial_root.enter_context(_private_runtime(parent, label, False, owner)), source)
+                cold = _prepare_runtime(cold_root.enter_context(_private_runtime(parent, label, True, owner)), source)
+            if not owner.consent(label):
+                raise ConnectError("Google sign-in cancelled.")
+            journal = RegistrationJournal(label)
+            enrollment = enroll_metadata(journal, initial, disclose_offer=owner.offer, destination=exchange,
+                                         authorized=owner.authorized, fence=owner.fence)
+            initial_root.close()
+            with owner.fence:
+                owner.deadline = min(owner.deadline, time.monotonic() + 18)
+            reopen_metadata(journal, enrollment, cold, destination=exchange, authorized=owner.authorized, fence=owner.fence)
+        with owner.fence:
+            owner.write_once(f"Verified Google registration {label} for workstation metadata.\n")
+    return 0

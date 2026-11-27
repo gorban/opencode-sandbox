@@ -56,7 +56,7 @@ class RegistrationTests(unittest.TestCase):
         enrollment = self.journal.begin(BUILD)
         with self.journal.enrollment_profile(enrollment) as profile:
             self.assertTrue(os.path.samestat(profile.path.stat(), os.fstat(profile.fd)))
-            profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT)
+            profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: True)
             credential = self.fake_credential(profile.path)
         record_enrollment_retired(self.journal, enrollment)
         return enrollment, credential
@@ -67,7 +67,7 @@ class RegistrationTests(unittest.TestCase):
         with self.journal.cold_profile(check) as profile:
             self.assertEqual(profile.path, self.profile_path(enrollment))
             self.assertTrue(os.path.samestat(profile.path.stat(), os.fstat(profile.fd)))
-            profile.bind_subject(FAKE_REFRESHED, FAKE_SUBJECT)
+            profile.bind_subject(FAKE_REFRESHED, FAKE_SUBJECT, authorized=lambda: True)
         return check, credential
 
     def test_refresh_is_bound_to_the_live_cold_profile(self):
@@ -75,7 +75,7 @@ class RegistrationTests(unittest.TestCase):
         with self.journal.enrollment_profile(enrolled) as initial:
             with self.assertRaises(registration.RegistrationUnavailable):
                 initial.refresh_form(refresh_form())
-            initial.bind_subject(FAKE_BEARER, FAKE_SUBJECT)
+            initial.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: True)
             self.fake_credential(initial.path).write_bytes(cold_credential())
         record_enrollment_retired(self.journal, enrolled)
         check = self.journal.begin_cold_check(enrolled)
@@ -150,7 +150,7 @@ class RegistrationTests(unittest.TestCase):
     def test_token_symlink_permissions_and_hardlink_refused(self):
         enrollment = self.journal.begin(BUILD)
         with self.journal.enrollment_profile(enrollment) as profile:
-            profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT)
+            profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: True)
             other = self.fake_credential(profile.path, name="other.json")
             token = other.with_name("acp_token.json")
             token.symlink_to(other.name)
@@ -339,10 +339,10 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(registration.FileIdentity.of(keys[0].stat()), first.subject_key_identity)
         with self.journal.enrollment_profile(first) as profile:
             self.assertFalse(keys[0].is_relative_to(profile.path))
-            proof = profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT)
+            proof = profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: True)
             proof.require_metadata_bearer(account_binding.MetadataOperation.LOAD_CODE_ASSIST, FAKE_BEARER)
         with other.enrollment_profile(second) as profile:
-            other_proof = profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT)
+            other_proof = profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: True)
         self.assertNotEqual(proof.digest, other_proof.digest)
         raw = self.receipt.read_bytes()
         self.assertEqual(json.loads(raw)["subject_digest"], proof.digest.hex())
@@ -354,12 +354,12 @@ class RegistrationTests(unittest.TestCase):
         enrollment = self.journal.begin(BUILD)
         with self.journal.enrollment_profile(enrollment) as profile:
             with self.assertRaises(account_binding.AccountBindingError):
-                profile.bind_subject(FAKE_BEARER, b"not a subject")
+                profile.bind_subject(FAKE_BEARER, b"not a subject", authorized=lambda: True)
             with self.assertRaisesRegex(registration.RegistrationUnavailable, "already spent"):
-                profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT)
+                profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: True)
             self.fake_credential(profile.path)
         with self.assertRaisesRegex(registration.RegistrationUnavailable, "already spent"):
-            profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT)
+            profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: True)
         self.assertIsNone(json.loads(self.receipt.read_text())["subject_digest"])
         record_enrollment_retired(self.journal, enrollment)
         with self.assertRaisesRegex(registration.RegistrationUnavailable, "no subject binding"):
@@ -376,7 +376,7 @@ class RegistrationTests(unittest.TestCase):
 
         with self.journal.enrollment_profile(enrollment) as profile, patch.object(registration, "bind_subject", swapped):
             with self.assertRaisesRegex(registration.RegistrationUnavailable, "directory changed"):
-                profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT)
+                profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: True)
         self.assertIsNone(json.loads(self.receipt.read_text())["subject_digest"])
 
     def test_same_cold_subject_gets_new_phase_proof_only_once(self):
@@ -384,12 +384,12 @@ class RegistrationTests(unittest.TestCase):
         original = json.loads(self.receipt.read_text())["subject_digest"]
         check = registration.RegistrationJournal(LABEL).begin_cold_check(enrollment)
         with self.journal.cold_profile(check) as profile:
-            proof = profile.bind_subject(FAKE_REFRESHED, FAKE_SUBJECT)
+            proof = profile.bind_subject(FAKE_REFRESHED, FAKE_SUBJECT, authorized=lambda: True)
             proof.require_metadata_bearer(account_binding.MetadataOperation.FETCH_AVAILABLE_MODELS, FAKE_REFRESHED)
             with self.assertRaises(account_binding.AccountBindingError):
                 proof.require_metadata_bearer(account_binding.MetadataOperation.FETCH_AVAILABLE_MODELS, FAKE_BEARER)
             with self.assertRaisesRegex(registration.RegistrationUnavailable, "already spent"):
-                profile.bind_subject(FAKE_REFRESHED, FAKE_SUBJECT)
+                profile.bind_subject(FAKE_REFRESHED, FAKE_SUBJECT, authorized=lambda: True)
         observed = record_cold_observation(self.journal, check, registration.ColdObservation(check, True, 0, True))
         self.assertEqual(observed.phase, registration.Phase.COLD_RETIREMENT_OBSERVED)
         self.assertEqual(json.loads(self.receipt.read_text())["subject_digest"], original)
@@ -399,9 +399,9 @@ class RegistrationTests(unittest.TestCase):
         check = self.journal.begin_cold_check(enrollment)
         with self.journal.cold_profile(check) as profile:
             with self.assertRaises(account_binding.AccountBindingError):
-                profile.bind_subject(FAKE_REFRESHED, b'{"id":"123456"}')
+                profile.bind_subject(FAKE_REFRESHED, b'{"id":"123456"}', authorized=lambda: True)
             with self.assertRaisesRegex(registration.RegistrationUnavailable, "already spent"):
-                profile.bind_subject(FAKE_REFRESHED, FAKE_SUBJECT)
+                profile.bind_subject(FAKE_REFRESHED, FAKE_SUBJECT, authorized=lambda: True)
         with self.assertRaisesRegex(registration.RegistrationUnavailable, "no subject observation"):
             record_cold_observation(self.journal, check, registration.ColdObservation(check, True, 0, True))
 
@@ -436,7 +436,7 @@ class RegistrationTests(unittest.TestCase):
                 self.assertFalse(held["metadata_pending"])
                 self.assertEqual(held[counter], index)
                 if route is MetadataRoute.USERINFO:
-                    profile.bind_subject(bearer, FAKE_SUBJECT)
+                    profile.bind_subject(bearer, FAKE_SUBJECT, authorized=lambda: True)
 
         def refuse(profile, route):
             with self.assertRaises(registration.RegistrationUnavailable):
@@ -487,6 +487,44 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(writes, [])
         with self.assertRaises(registration.RegistrationUnavailable):
             record_enrollment_retired(registration.RegistrationJournal(LABEL), enrollment)
+
+    def test_loss_during_native_identity_verification_blocks_dispatch(self):
+        enrollment = self.journal.begin(BUILD)
+        live = True
+
+        def verify():
+            nonlocal live
+            if json.loads(self.receipt.read_text())["metadata_pending"]:
+                live = False
+
+        with self.journal.enrollment_profile(enrollment) as profile, \
+                patch.object(registration._HeldProfile, "_native_current", side_effect=verify):
+            with self.assertRaisesRegex(registration.RegistrationUnavailable, "authority"):
+                profile.spend_metadata(MetadataRoute.TOKEN, lambda: self.fail("lost owner sent"),
+                                       authorized=lambda: live)
+        saved = json.loads(self.receipt.read_text())
+        self.assertEqual(saved["enrollment_metadata_spent"], 1)
+        self.assertTrue(saved["metadata_pending"])
+
+    def test_loss_inside_subject_sync_holds_the_registration(self):
+        enrollment = self.journal.begin(BUILD)
+        live = True
+        sync = os.fsync
+
+        def lose_owner(fd):
+            nonlocal live
+            if Path(os.readlink(f"/proc/self/fd/{fd}")).name.startswith(".registration-"):
+                live = False
+            sync(fd)
+
+        with self.journal.enrollment_profile(enrollment) as profile, \
+                patch.object(registration.os, "fsync", side_effect=lose_owner):
+            with self.assertRaisesRegex(registration.RegistrationUnavailable, "authority"):
+                profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: live)
+        self.assertIsNone(json.loads(self.receipt.read_text())["subject_digest"])
+        self.assertEqual(self.lock.read_bytes(), b"!")
+        with self.assertRaisesRegex(registration.RegistrationUnavailable, "interrupted write"):
+            self.journal.status()
 
     def test_authority_loss_during_each_settlement_sync_persists_hold(self):
         for window in ("temporary", "directory", "latch"):
@@ -547,7 +585,7 @@ class RegistrationTests(unittest.TestCase):
                     with self.assertRaises(registration.RegistrationUnavailable):
                         profile.spend_metadata(MetadataRoute.TOKEN, send, authorized=lambda: True)
                     with self.assertRaises(registration.RegistrationUnavailable):
-                        profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT)
+                        profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: True)
                 self.assertEqual(calls, [label])
                 saved = json.loads((self.slot.with_name(label) / "registration.json").read_text())
                 self.assertEqual(saved["enrollment_metadata_spent"], 1)
@@ -561,7 +599,7 @@ class RegistrationTests(unittest.TestCase):
                     profile.spend_metadata(MetadataRoute.TOKEN, lambda: self.fail("reentrant write"),
                                            authorized=lambda: True)
                 with self.assertRaises(registration.RegistrationUnavailable):
-                    profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT)
+                    profile.bind_subject(FAKE_BEARER, FAKE_SUBJECT, authorized=lambda: True)
 
             profile.spend_metadata(MetadataRoute.TOKEN, send, authorized=lambda: True)
         saved = json.loads(self.receipt.read_text())

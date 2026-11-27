@@ -243,6 +243,37 @@ class MetadataDestinationTest(unittest.TestCase):
             self.exchange()
         self.assertEqual(len(self.tls.sent), 2)
 
+    def test_timeout_preparation_cannot_bypass_final_write_authority(self):
+        live = True
+        sink = Mock()
+
+        def timeout(_value):
+            nonlocal live
+            live = False
+
+        def deliver(send):
+            if live:
+                send()
+
+        sink.settimeout.side_effect = timeout
+        with self.assertRaisesRegex(destination.MetadataDestinationError, "request was not sent"):
+            destination._send_under_gate(sink, b"fixture", time.monotonic() + 1, deliver)
+        sink.settimeout.assert_called_once_with(0)
+        sink.send.assert_not_called()
+
+    def test_deadline_is_checked_again_after_durable_admission(self):
+        sink = Mock()
+        clock = Mock(return_value=10)
+
+        def deliver(send):
+            clock.return_value = 12
+            send()
+
+        with patch.object(destination.time, "monotonic", clock):
+            with self.assertRaisesRegex(destination.MetadataDestinationError, "deadline expired"):
+                destination._send_under_gate(sink, b"fixture", 11, deliver)
+        sink.send.assert_not_called()
+
     def test_wrong_thread_cannot_invoke_owner_write(self):
         rejected = []
 

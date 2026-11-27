@@ -54,7 +54,7 @@ usage() {
 Usage: ${0##*/} [--mini|--no-mini] [--provider KIND[/LABEL]] [-i NAME] [-r] [-n] [-p] [-D] [-K] [-P HOST:POD]... [-C DIR] [-W REPO[:BRANCH]]
        ${0##*/} [-i NAME] -x | -l | -k | [-i NAME] -d [-a] [-y] | -h
        ${0##*/} openai {connect LABEL [--no-browser]|select LABEL|status|verify|disconnect [LABEL]}
-       ${0##*/} google {shell LABEL|arm RUN_ID}
+       ${0##*/} google {connect LABEL|shell LABEL|arm RUN_ID}
        ${0##*/} orchestrate [--synthetic-check]
        ${0##*/} orchestrate --synthetic-check --provider claude
 

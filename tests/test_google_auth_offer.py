@@ -406,12 +406,49 @@ class CallbackGateTest(unittest.TestCase):
                 self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
                 self.assert_no_native_bytes(recorder)
 
+    def test_owner_loss_after_consume_withholds_success_ack(self):
+        live = Event()
+        live.set()
+        consume = auth.CallbackGate._consume
+
+        def revoke_after_forward(gate, callback, address):
+            accepted = consume(gate, callback, address)
+            live.clear()
+            return accepted
+
+        with placement(authorized=live.is_set) as (gate, _recorder, port), \
+                patch.object(auth.CallbackGate, "_consume", autospec=True, side_effect=revoke_after_forward):
+            self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
+            self.assertEqual(gate.outcome, auth.Outcome.UNCERTAIN)
+            live.set()
+            self.assertIsNone(gate.take_forwarded())
+            self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
+
+    def test_owner_loss_inside_full_forward_withholds_success_ack(self):
+        live = Event()
+        live.set()
+        original_send = auth._send_once
+
+        def forward(channel, data):
+            sent = original_send(channel, data)
+            live.clear()
+            return sent
+
+        with placement(authorized=live.is_set) as (gate, _recorder, port), \
+                patch.object(auth, "_send_once", side_effect=forward) as send:
+            self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
+            self.assertEqual(gate.outcome, auth.Outcome.UNCERTAIN)
+            live.set()
+            self.assertIsNone(gate.take_forwarded())
+            self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
+            send.assert_called_once()
+
     def test_short_forward_is_uncertain_and_cannot_replay(self):
         def short_write(channel, payload):
             return channel.send(payload[:4])
 
         with placement() as (gate, recorder, port), patch.object(auth, "_send_once", side_effect=short_write) as send:
-            self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(True))
+            self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
             self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
             self.assertEqual(gate.outcome, auth.Outcome.UNCERTAIN)
             self.assertIsNone(gate.take_forwarded())
