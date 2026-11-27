@@ -45,7 +45,7 @@ _SUCCESS_FIELDS = {"state", "code"}
 _SUCCESS_METADATA = {"iss", "scope", "authuser", "prompt"}
 _DENIAL_FIELDS = {"state", "error"}
 _HEADERS = frozenset({
-    b"host", b"accept", b"accept-encoding", b"accept-language", b"cache-control", b"connection",
+    b"host", b"accept", b"accept-encoding", b"accept-language", b"cache-control", b"connection", b"cookie",
     b"pragma", b"priority", b"sec-ch-ua", b"sec-ch-ua-mobile", b"sec-ch-ua-platform",
     b"sec-fetch-dest", b"sec-fetch-mode", b"sec-fetch-site", b"sec-fetch-storage-access",
     b"sec-fetch-user", b"sec-gpc", b"upgrade-insecure-requests", b"user-agent",
@@ -248,7 +248,8 @@ def parse_callback(head, port):
         if (not separator or key not in _HEADERS or key in fields
                 or any(not 32 <= char <= 126 for char in value)):
             raise Refused("invalid callback header")
-        fields[key] = value.strip(b" ")
+        # Keep only the Cookie name so a second field is still refused.
+        fields[key] = None if key == b"cookie" else value.strip(b" ")
     if fields.get(b"host") != f"{HOST}:{port}".encode("ascii"):
         raise Refused("invalid callback host")
     path, separator, query = parts[1].partition(b"?")

@@ -21,6 +21,8 @@ ISSUER = "https://accounts.google.com"
 ORIGINAL_SCOPES = " ".join(sorted(auth.SCOPES))
 OBSERVED_SCOPES = ORIGINAL_SCOPES + " email openid"
 OBSERVED_QUERY = "&" + urlencode({"iss": ISSUER, "scope": OBSERVED_SCOPES, "authuser": "1", "prompt": "consent"})
+COOKIE_MARKER = b"synthetic-loopback-cookie"
+COOKIE_HEADER = b"CoOkIe: fixture=" + COOKIE_MARKER + b"; other=2\r\n"
 
 
 def offer(port, **changes):
@@ -274,6 +276,60 @@ class CallbackGateTest(unittest.TestCase):
                 self.assertIsNone(gate.take_forwarded())
                 self.assert_no_native_bytes(recorder)
 
+    def test_cookie_is_discarded_before_native_forward_and_acknowledgment(self):
+        for gpc in (b"", b"Sec-GPC: 1\r\n"):
+            with self.subTest(gpc=bool(gpc)), placement() as (gate, recorder, port):
+                browser = request(port, extra_query=OBSERVED_QUERY, extra_headers=COOKIE_HEADER + gpc)
+                reply = self.exchange(gate, port, browser)
+                self.assertEqual(reply, auth.acknowledgement(True))
+                recorder.settimeout(1)
+                native = recorder.recv(4096)
+                self.assertEqual(native, request(port))
+                self.assertNotIn(COOKIE_MARKER, reply)
+                self.assertNotIn(COOKIE_MARKER, native)
+                self.assertEqual(gate.take_forwarded(), auth.Callback(STATE, CODE))
+                self.assertIsNone(gate.take_forwarded())
+                self.assert_no_native_bytes(recorder)
+
+    def test_cookie_does_not_relax_callback_validation(self):
+        cases = {
+            "duplicate": {"extra_headers": COOKIE_HEADER + b"cOoKiE: fixture=duplicate\r\n"},
+            "control byte": {"extra_headers": COOKIE_HEADER.replace(b";", b"\x00;")},
+            "non-ASCII byte": {"extra_headers": COOKIE_HEADER.replace(b";", b"\xff;")},
+            "authorization": {"extra_headers": COOKIE_HEADER + b"Authorization: Bearer fixture\r\n"},
+            "origin": {"extra_headers": COOKIE_HEADER + b"Origin: https://accounts.google.com\r\n"},
+            "unknown header": {"extra_headers": COOKIE_HEADER + b"X-Browser-Metadata: fixture\r\n"},
+            "size bound": {"extra_headers": COOKIE_HEADER.replace(b";", b"a" * auth._LIMIT)},
+            "unapproved parameter": {"extra_query": "&hd=fixture.invalid"},
+            "wrong host": {"host": "localhost"},
+            "request body": {"tail": b"fixture"},
+        }
+        for case, options in cases.items():
+            with self.subTest(case=case), placement() as (gate, recorder, port):
+                browser = request(port, **({"extra_headers": COOKIE_HEADER, "extra_query": OBSERVED_QUERY} | options))
+                reply = self.exchange(gate, port, browser)
+                if case == "size bound":
+                    self.assertIn(reply, (b"", auth.acknowledgement(False)))
+                else:
+                    self.assertEqual(reply, auth.acknowledgement(False))
+                self.assertNotIn(COOKIE_MARKER, reply)
+                self.assertEqual(gate.outcome, auth.Outcome.CANCELLED)
+                self.assertIsNone(gate.take_forwarded())
+                self.assert_no_native_bytes(recorder)
+
+        with placement() as (gate, recorder, port):
+            browser = request(port, state="b" * 30, extra_query=OBSERVED_QUERY, extra_headers=COOKIE_HEADER)
+            self.assertEqual(self.exchange(gate, port, browser), auth.acknowledgement(False))
+            self.assertEqual(gate.outcome, auth.Outcome.OPEN)
+            self.assert_no_native_bytes(recorder)
+
+    def test_malformed_cookie_refusal_does_not_expose_its_value(self):
+        header = COOKIE_HEADER.removesuffix(b"\r\n") + b"\x00\r\n"
+        head = request(49000, extra_query=OBSERVED_QUERY, extra_headers=header).removesuffix(b"\r\n\r\n")
+        with self.assertRaisesRegex(auth.Refused, "^invalid callback header$") as refusal:
+            auth.parse_callback(head, 49000)
+        self.assertNotIn(COOKIE_MARKER.decode("ascii"), str(refusal.exception))
+
     def test_chromium_client_hints_preserve_only_canonical_state_and_code(self):
         hints = (b'Sec-CH-UA: "Chromium";v="131", "Not_A Brand";v="24"\r\n'
                  b"Sec-CH-UA-Mobile: ?0\r\n"
@@ -297,7 +353,6 @@ class CallbackGateTest(unittest.TestCase):
             "non-ASCII value": approved.replace(b"Linux", b"Linu\xff"),
             "unknown hint": approved + b'Sec-CH-UA-Full-Version: "131.0"\r\n',
             "lookalike name": approved + b"Sec_CH_UA: fixture\r\n",
-            "cookie": approved + b"Cookie: fixture=value\r\n",
             "authorization": approved + b"Authorization: Bearer fixture\r\n",
             "forwarded": approved + b"X-Forwarded-Host: fixture.invalid\r\n",
         }
