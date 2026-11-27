@@ -15,7 +15,7 @@ from time import monotonic
 from .generation import FakeDestination, GenerationAttempt, GenerationBinding, project_generation
 from .generation_proxy import (
     CONTROL, HARD_SECONDS, STARTUP, STARTUP_LIMIT, STARTUP_SECONDS, TURN, TURN_SECONDS,
-    ProxyRefused, Signal, directory_identity, expect_frame, peer_credentials, remaining, send_frame,
+    ProxyRefused, Signal, _FRAME, directory_identity, expect_frame, peer_credentials, remaining, send_frame,
 )
 from .native_peer import _alive, admit_native_peer
 from .route import _send_once
@@ -190,7 +190,7 @@ class FixturePhase:
         self._control_listener = self._startup = self._turn = self._control = None
         self._helper = self._original_helper = self._control_peer = self._accepted = None
         self._read_cgroup = self._network_fd = None
-        self._baseline = self._sent_receipt = None
+        self._baseline = self._sent_receipt = self._journal_run = None
         self._startup_eofs = self._helper_accepts = self._owner_accepts = self._fake_writes = 0
         self._refusal = self._connector_retired = False
 
@@ -223,6 +223,8 @@ class FixturePhase:
     def revoke(self):
         with self._fence:
             self._phase = Phase.HELD
+            if self._journal_run is not None:
+                self._journal_run.revoke()
             for sock in (self._control_listener, self._startup, self._turn, self._control, self._accepted):
                 if sock is not None:
                     with suppress(OSError):
@@ -274,6 +276,9 @@ class FixturePhase:
             raise ProxyRefused("Gemini fixture turn peer retired")
         self._check_owner(deadline)
 
+        self._check_output_pins(deadline, peer)
+
+    def _check_output_pins(self, deadline, peer):
         # No observer callback follows these local checks. They settle the
         # pins even when the last owner/cgroup observation changed a peer.
         if self._helper is not self._original_helper:
@@ -426,11 +431,68 @@ class FixturePhase:
             raise ProxyRefused("Gemini fixture durable destination claim differs")
         self._check_output_authority(deadline, peer)
 
-    def activate(self, sent_receipt):
+    def bind_journal(self, run, sent_receipt, *, proxy_binding, journal_binding):
+        """Pin the separately prepared owner, exact journal run and durable scope before arm."""
+        from .generation_journal import Binding, Phase as JournalPhase, _Run
+
+        try:
+            with self._fence:
+                if (self._phase is not Phase.BOUND or self._journal_run is not None
+                        or proxy_binding is not self._binding
+                        or type(run) is not _Run or run._owner_fence() is not self._fence
+                        or type(journal_binding) is not Binding or run._control.binding is not journal_binding
+                        or run._control.deadline is None or journal_binding.epoch != proxy_binding.epoch
+                        or journal_binding.model != proxy_binding.alias):
+                    raise ProxyRefused("Gemini fixture journal run differs")
+                run.verify_acp_sent(sent_receipt)
+                self._check_owner(run._control.deadline)
+                run._verify_local_acp_sent(sent_receipt, phase=JournalPhase.ACP_SENT)
+                self._check_output_pins(run._control.deadline, None)
+                self._sent_receipt = sent_receipt
+                self._journal_run = run
+        except BaseException:
+            self.revoke()
+            raise
+
+    def _activate_journal(self, sent_receipt, run):
+        from .generation_journal import Phase as JournalPhase
+
+        with self._fence:
+            if run is not self._journal_run or sent_receipt is not self._sent_receipt:
+                raise ProxyRefused("Gemini fixture journal run or ACP sent receipt differs")
+            deadline = min(self._deadline, run._control.deadline)
+            self._deadline = deadline
+        self._observe_turn_authority(deadline)
+        packet = _FRAME.pack(self.launch.stamp, Signal.OPEN_TURN, 0)
+        try:
+            writable = select.select([], [self._control], [], remaining(deadline))[1]
+        except ValueError:
+            raise ProxyRefused("Gemini fixture journal arm is unavailable") from None
+        if not writable:
+            raise ProxyRefused("Gemini fixture journal arm expired")
+        with self._fence:
+            self._check_journal_turn(run, deadline, journal_phase=JournalPhase.ACP_SENT)
+            self._turn.listen(1)
+            self._check_journal_turn(run, deadline, journal_phase=JournalPhase.ACP_SENT)
+            if _send_once(self._control, packet) != len(packet):
+                raise ProxyRefused("Gemini fixture proxy control write is unconfirmed")
+        self._expect(Signal.TURN_LISTENING, deadline)
+        self._observe_turn_authority(deadline)
+        with self._fence:
+            self._check_journal_turn(run, deadline, journal_phase=JournalPhase.ACP_SENT)
+            self._phase = Phase.LISTENING
+
+    def activate(self, sent_receipt, *, journal_run=None):
         """Listen only after the current exact durable ACP_SENT is visible to the owner."""
         with self._step(Phase.BOUND, Phase.OPENING):
             with self._fence:
                 self._deadline = min(self.launch.hard_deadline, monotonic() + TURN_SECONDS)
+            if journal_run is not None or self._journal_run is not None:
+                if journal_run is None or self._journal_run is None:
+                    raise ProxyRefused("Gemini fixture journal run differs")
+                self._activate_journal(sent_receipt, journal_run)
+                return
+            with self._fence:
                 self._sent_receipt = sent_receipt
                 self._check_sent(self._deadline)
                 self._turn.listen(1)
@@ -439,6 +501,136 @@ class FixturePhase:
             with self._fence:
                 self._check_sent(self._deadline)
                 self._phase = Phase.LISTENING
+
+    @contextmanager
+    def _turn_request(self, deadline):
+        with self._owned_connection(self._turn, deadline, turn=True) as connection:
+            with self._peer(connection, deadline) as peer:
+                yield connection, peer, _read_eof(connection, deadline, _MAX_REQUEST)
+
+    def _send_turn_reply(self, connection, reply, deadline, *, check, observe=None):
+        packet = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n"
+                  b"Content-Length: " + str(len(reply)).encode("ascii") + b"\r\n\r\n" + reply)
+        try:
+            writable = select.select([], [connection], [], remaining(deadline))[1]
+        except ValueError:
+            raise ProxyRefused("Gemini fixture native reply is unavailable") from None
+        if not writable:
+            raise ProxyRefused("Gemini fixture native reply expired")
+        if observe is not None:
+            observe()
+        with self._fence:
+            check()
+            if _send_once(connection, packet) != len(packet):
+                raise ProxyRefused("Gemini fixture native reply is unconfirmed")
+            connection.shutdown(socket.SHUT_WR)
+
+    def _retire_turn(self, deadline, *, check, observe=None):
+        self._expect(Signal.TURN_RETIRED, deadline, count=1)
+        _read_eof(self._control, deadline, 0)
+        if observe is not None:
+            observe()
+        with self._fence:
+            check()
+            self._helper_accepts = 1
+            self._connector_retired = True
+            self._control.shutdown(socket.SHUT_WR)
+            self._phase = Phase.COMPLETE
+
+    def _observe_turn_authority(self, deadline, peer=None):
+        self._audit(deadline)
+        if peer is not None and not peer.active():
+            raise ProxyRefused("Gemini fixture turn peer retired")
+
+    def _check_journal_turn(self, run, deadline, peer=None, *, journal_phase):
+        run.verify_acp_sent(self._sent_receipt)
+        self._check_owner(deadline)
+        run._verify_local_acp_sent(self._sent_receipt, phase=journal_phase)
+        self._check_output_pins(deadline, peer)
+
+    def _journal_turn_reply(self, destination, run, request, deadline, peer):
+        from .generation_journal import Operation, Phase as JournalPhase, SettlementEvidence, WriteEvidence
+
+        durable_phase = JournalPhase.ACP_SENT
+
+        def check():
+            self._check_journal_turn(run, deadline, peer, journal_phase=durable_phase)
+
+        def current_scope(binding):
+            if binding is not self._binding:
+                return False
+            with self._fence:
+                check()
+            return True
+
+        attempt = GenerationAttempt(self._binding, destination, authorized=current_scope)
+        try:
+            self._observe_turn_authority(deadline, peer)
+            prepared = attempt.prepare(self._binding, request, end_of_input=True, deadline=deadline)
+            fake_write = None
+
+            def write_effect(proof):
+                nonlocal fake_write
+
+                def admit():
+                    run.verify_acp_sent(self._sent_receipt)
+                    run.verify_in_flight(proof, Operation.DESTINATION)
+                    self._check_owner(deadline)
+                    run._verify_local_acp_sent(self._sent_receipt, phase=durable_phase)
+                    run._verify_local_destination(proof)
+                    self._check_output_pins(deadline, peer)
+                    return True
+
+                try:
+                    fake_write = attempt.write_prepared(prepared, admit=admit)
+                finally:
+                    self._fake_writes = attempt.receipt().complete_requests
+                return WriteEvidence(destination, fake_write.byte_count, fake_write.packet_digest.hex())
+
+            with self._fence:
+                check()
+                claim = run.issue(Operation.DESTINATION)
+                durable_phase = JournalPhase.DESTINATION_CLAIMED
+                pending = run.write_once(claim, write_effect, target=destination, data=prepared._packet)
+
+            completion = attempt.observe(fake_write)
+            self._observe_turn_authority(deadline, peer)
+            with self._fence:
+                check()
+                reply = attempt.settle(fake_write, completion)
+                observed = SettlementEvidence(pending, destination, fake_write.byte_count,
+                                              fake_write.packet_digest.hex())
+                run.settle(pending, observed)
+                return reply
+        except BaseException:
+            attempt.revoke()
+            raise
+
+    def serve_journal_turn(self, destination, run):
+        """Serve the private R2 fixture from the exact journal run that armed it."""
+        from .generation_journal import Phase as JournalPhase
+
+        with self._step(Phase.LISTENING, Phase.ACCEPTING):
+            if type(destination) is not FakeDestination:
+                raise ProxyRefused("Gemini fixture destination is unavailable")
+            if run is None or run is not self._journal_run:
+                raise ProxyRefused("Gemini fixture journal run differs")
+            deadline = self._deadline
+            with self._fence:
+                self._check_journal_turn(run, deadline, journal_phase=JournalPhase.ACP_SENT)
+            with self._turn_request(deadline) as (connection, peer, request):
+                reply = self._journal_turn_reply(destination, run, request, deadline, peer)
+                self._send_turn_reply(
+                    connection, reply, deadline,
+                    check=lambda: self._check_journal_turn(run, deadline, peer, journal_phase=JournalPhase.DESTINATION_SETTLED),
+                    observe=lambda: self._observe_turn_authority(deadline, peer),
+                )
+            self._retire_turn(
+                deadline,
+                check=lambda: self._check_journal_turn(run, deadline, journal_phase=JournalPhase.DESTINATION_SETTLED),
+                observe=lambda: self._observe_turn_authority(deadline),
+            )
+        return self.receipt()
 
     def serve_turn(self, destination, *, claim_destination=None):
         """Accept one connection and require the owner to consume an exact destination claim.
@@ -450,77 +642,52 @@ class FixturePhase:
         with self._step(Phase.LISTENING, Phase.ACCEPTING):
             if type(destination) is not FakeDestination:
                 raise ProxyRefused("Gemini fixture destination is unavailable")
-            if not callable(claim_destination):
+            if self._journal_run is not None or not callable(claim_destination):
                 raise ProxyRefused("Gemini fixture durable destination claim is unavailable")
             deadline = self._deadline
-            with self._owned_connection(self._turn, deadline, turn=True) as connection:
-                with self._peer(connection, deadline) as peer:
-                    request = _read_eof(connection, deadline, _MAX_REQUEST)
-                    # Reject malformed native input before asking the owner to
-                    # make a durable claim. The attempt reprojects the exact
-                    # immutable packet at the fake destination boundary.
-                    project_generation(request, end_of_input=True)
-                    reply = capability = None
-                    entered = False
-                    live_effect = True
-                    effect_owner = get_ident()
-
-                    def current_scope(binding):
-                        if binding is not self._binding:
-                            return False
+            with self._turn_request(deadline) as (connection, peer, request):
+                # Reject malformed native input before asking the owner to
+                # make a durable claim. The attempt reprojects the exact
+                # immutable packet at the fake destination boundary.
+                project_generation(request, end_of_input=True)
+                reply = capability = None
+                entered = False
+                live_effect = True
+                effect_owner = get_ident()
+                def current_scope(binding):
+                    if binding is not self._binding:
+                        return False
+                    self._check_destination_claim(capability, deadline, peer)
+                    return True
+                attempt = GenerationAttempt(self._binding, destination, authorized=current_scope)
+                def dispatch(claim=None):
+                    nonlocal entered, reply, capability
+                    # Reject another thread without waiting on the owner's
+                    # fence, which the synchronous claim driver still holds.
+                    if get_ident() != effect_owner:
+                        raise ProxyRefused("Gemini fixture destination effect has a different owner")
+                    with self._fence:
+                        if entered or not live_effect:
+                            self.revoke()
+                            raise ProxyRefused("Gemini fixture destination effect was spent")
+                        entered = True
+                        capability = claim
                         self._check_destination_claim(capability, deadline, peer)
-                        return True
-
-                    attempt = GenerationAttempt(self._binding, destination, authorized=current_scope)
-
-                    def dispatch(claim=None):
-                        nonlocal entered, reply, capability
-                        # Reject another thread without waiting on the owner's
-                        # fence, which the synchronous claim driver still holds.
-                        if get_ident() != effect_owner:
-                            raise ProxyRefused("Gemini fixture destination effect has a different owner")
-                        with self._fence:
-                            if entered or not live_effect:
-                                self.revoke()
-                                raise ProxyRefused("Gemini fixture destination effect was spent")
-                            entered = True
-                            capability = claim
-                            self._check_destination_claim(capability, deadline, peer)
-                            try:
-                                reply = attempt.run(self._binding, request, end_of_input=True)
-                            finally:
-                                self._fake_writes = attempt.receipt().complete_requests
-                            self._check_sent(deadline, peer)
-                            return reply
-
-                    try:
-                        with self._fence:
-                            self._check_sent(deadline, peer)
-                            result = claim_destination(self._binding, self._sent_receipt, dispatch)
-                            if not entered or reply is None or result is not reply or self._fake_writes != 1:
-                                raise ProxyRefused("Gemini fixture destination effect is unconfirmed")
-                            self._check_sent(deadline, peer)
-                    finally:
-                        live_effect = False
-                    packet = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n"
-                              b"Content-Length: " + str(len(reply)).encode("ascii") + b"\r\n\r\n" + reply)
-                    try:
-                        writable = select.select([], [connection], [], remaining(deadline))[1]
-                    except ValueError:
-                        raise ProxyRefused("Gemini fixture native reply is unavailable") from None
-                    if not writable:
-                        raise ProxyRefused("Gemini fixture native reply expired")
+                        try:
+                            reply = attempt.run(self._binding, request, end_of_input=True)
+                        finally:
+                            self._fake_writes = attempt.receipt().complete_requests
+                        self._check_sent(deadline, peer)
+                        return reply
+                try:
                     with self._fence:
                         self._check_sent(deadline, peer)
-                        if _send_once(connection, packet) != len(packet):
-                            raise ProxyRefused("Gemini fixture native reply is unconfirmed")
-                        connection.shutdown(socket.SHUT_WR)
-            self._expect(Signal.TURN_RETIRED, deadline, count=1)
-            _read_eof(self._control, deadline, 0)
-            with self._fence:
-                self._check_sent(deadline)
-                self._helper_accepts = 1
-                self._connector_retired = True
-                self._control.shutdown(socket.SHUT_WR)
-                self._phase = Phase.COMPLETE
+                        result = claim_destination(self._binding, self._sent_receipt, dispatch)
+                        if not entered or reply is None or result is not reply or self._fake_writes != 1:
+                            raise ProxyRefused("Gemini fixture destination effect is unconfirmed")
+                        self._check_sent(deadline, peer)
+                finally:
+                    live_effect = False
+                self._send_turn_reply(connection, reply, deadline, check=lambda: self._check_sent(deadline, peer))
+            self._retire_turn(deadline, check=lambda: self._check_sent(deadline))
         return self.receipt()

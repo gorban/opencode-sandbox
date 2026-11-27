@@ -350,6 +350,158 @@ class GenerationJournalTests(unittest.TestCase):
             self.check_unchanged()
         self.check_held()
 
+    def test_local_acp_pin_has_no_owner_callback_and_requires_exact_current_receipt(self):
+        owner_calls = []
+
+        def owner(binding):
+            owner_calls.append(binding)
+            return binding is self.binding
+
+        with self.launch(authorized=owner, deadline=monotonic() + 5) as run:
+            write, evidence = self.split_write(run, run.issue(gen.Operation.ACP))
+            run.settle(write, evidence)
+            sent = run.acp_sent()
+            prior = len(owner_calls)
+
+            with self.assertRaises(gen.GenerationHeld):
+                run._verify_local_acp_sent(sent, phase=gen.Phase.ACP_SENT)
+            with self.fence:
+                run._verify_local_acp_sent(sent, phase=gen.Phase.ACP_SENT)
+                for receipt, phase in ((copy(sent), gen.Phase.ACP_SENT),
+                                       (sent, gen.Phase.DESTINATION_SETTLED)):
+                    with self.assertRaises(gen.GenerationHeld):
+                        run._verify_local_acp_sent(receipt, phase=phase)
+                run._verify_local_acp_sent(sent, phase=gen.Phase.ACP_SENT)
+            self.assertEqual(len(owner_calls), prior)
+
+    def test_local_destination_pin_requires_ordinary_proof_in_current_effect(self):
+        owner_calls = []
+
+        def owner(binding):
+            owner_calls.append(binding)
+            return binding is self.binding
+
+        with self.launch(authorized=owner, deadline=monotonic() + 5) as run:
+            write, evidence = self.split_write(run, run.issue(gen.Operation.ACP))
+            run.settle(write, evidence)
+            cap = run.issue(gen.Operation.DESTINATION)
+            target, data = object(), b"synthetic destination gate"
+            proofs = []
+
+            def effect(proof):
+                proofs.append(proof)
+                prior = len(owner_calls)
+                with self.assertRaises(gen.GenerationHeld):
+                    run._verify_local_destination(proof)
+                self.assertEqual(len(owner_calls), prior)
+                self.assertFalse(run._files._authority.flight_checked)
+                run.verify_in_flight(proof, gen.Operation.DESTINATION)
+                prior = len(owner_calls)
+                with self.assertRaises(gen.GenerationHeld):
+                    run._verify_local_destination(copy(proof))
+                with patch.object(gen, "get_ident", return_value=proof.thread + 1):
+                    with self.assertRaises(gen.GenerationHeld):
+                        run._verify_local_destination(proof)
+                run._verify_local_destination(proof)
+                self.assertEqual(len(owner_calls), prior)
+                return gen.WriteEvidence(target, len(data), gen._digest(data))
+
+            run.write_once(cap, effect, target=target, data=data)
+            with self.fence, self.assertRaises(gen.GenerationHeld):
+                run._verify_local_destination(proofs[0])
+
+    def test_local_acp_durable_drift_stays_revoked_after_restoration(self):
+        for replaced in (False, True):
+            with self.subTest(replaced=replaced):
+                self.create_fixture()
+                with self.launch(deadline=monotonic() + 5) as run:
+                    write, evidence = self.split_write(run, run.issue(gen.Operation.ACP))
+                    run.settle(write, evidence)
+                    sent = run.acp_sent()
+                    state = self.slot / gen._STATE
+                    saved = self.slot / "saved-synthetic-state"
+                    original, inode = state.read_bytes(), state.stat().st_ino
+                    with self.fence:
+                        if replaced:
+                            state.rename(saved)
+                            state.write_bytes(original)
+                            state.chmod(0o600)
+                            self.assertNotEqual(state.stat().st_ino, inode)
+                        else:
+                            state.write_bytes(original + b"\n")
+                        try:
+                            with self.assertRaises(gen.GenerationHeld):
+                                run._verify_local_acp_sent(sent, phase=gen.Phase.ACP_SENT)
+                        finally:
+                            if replaced:
+                                saved.replace(state)
+                            else:
+                                state.write_bytes(original)
+                        self.assertEqual(state.stat().st_ino, inode)
+                        run._files.verify()
+                        with self.assertRaises(gen.GenerationHeld):
+                            run._verify_local_acp_sent(sent, phase=gen.Phase.ACP_SENT)
+                    with self.assertRaises(gen.GenerationHeld):
+                        run.issue(gen.Operation.DESTINATION)
+
+    def test_local_acp_expiry_stays_revoked_after_clock_is_restored(self):
+        for during_verification in (False, True):
+            with self.subTest(during_verification=during_verification):
+                self.create_fixture()
+                deadline = monotonic() + 5
+                with self.launch(deadline=deadline) as run:
+                    write, evidence = self.split_write(run, run.issue(gen.Operation.ACP))
+                    run.settle(write, evidence)
+                    sent = run.acp_sent()
+                    clock = [deadline - 1, deadline] if during_verification else [deadline]
+                    with self.fence:
+                        with patch.object(gen, "monotonic", side_effect=clock), self.assertRaises(gen.GenerationHeld):
+                            run._verify_local_acp_sent(sent, phase=gen.Phase.ACP_SENT)
+                        self.assertLess(monotonic(), deadline)
+                        with self.assertRaises(gen.GenerationHeld):
+                            run._verify_local_acp_sent(sent, phase=gen.Phase.ACP_SENT)
+
+    def test_local_acp_rechecks_sticky_revocation_after_durable_verification(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            write, evidence = self.split_write(run, run.issue(gen.Operation.ACP))
+            run.settle(write, evidence)
+            sent = run.acp_sent()
+            verify = gen._Files.verify
+
+            def verify_and_revoke(files):
+                verify(files)
+                run.revoke()
+
+            with self.fence, patch.object(gen._Files, "verify", new=verify_and_revoke):
+                with self.assertRaises(gen.GenerationHeld):
+                    run._verify_local_acp_sent(sent, phase=gen.Phase.ACP_SENT)
+
+    def test_local_destination_durable_drift_stays_revoked_inside_same_write(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            write, evidence = self.split_write(run, run.issue(gen.Operation.ACP))
+            run.settle(write, evidence)
+            cap = run.issue(gen.Operation.DESTINATION)
+            target, data = object(), b"synthetic destination gate"
+
+            def effect(proof):
+                run.verify_in_flight(proof, gen.Operation.DESTINATION)
+                state = self.slot / gen._STATE
+                original = state.read_bytes()
+                state.write_bytes(original + b"\n")
+                try:
+                    with self.assertRaises(gen.GenerationHeld):
+                        run._verify_local_destination(proof)
+                finally:
+                    state.write_bytes(original)
+                run._files.verify()
+                with self.assertRaises(gen.GenerationHeld):
+                    run._verify_local_destination(proof)
+                return gen.WriteEvidence(target, len(data), gen._digest(data))
+
+            with self.assertRaises(gen.GenerationHeld):
+                run.write_once(cap, effect, target=target, data=data)
+            self.assertEqual(self.phase(), gen.Phase.DESTINATION_CLAIMED)
+
     def test_legacy_consume_cannot_mint_acp_sent_or_use_split_write(self):
         with self.launch() as run:
             cap = run.issue(gen.Operation.ACP)

@@ -511,6 +511,9 @@ class _Run:
 
     def _check_phase(self, phase):
         self._check()
+        self._match_phase(phase)
+
+    def _match_phase(self, phase):
         if (self._files._authority.phase is not phase
                 or self._files.current[1] != _record(self._files.anchor.enrollment, phase, self._control.binding)):
             raise GenerationHeld()
@@ -607,6 +610,44 @@ class _Run:
             except BaseException:
                 self.revoke()
                 raise
+
+    def _verify_local_phase(self, phase):
+        fence = self._owner_fence()
+        authority = self._files._authority
+        deadline = self._control.deadline
+        if (not fence._is_owned() or authority.revoked or authority.checking
+                or deadline is None or authority.phase is not phase):
+            raise GenerationHeld()
+        # After the caller's proof and the live lease match, losing a durable
+        # pin or the deadline spends the lease even if the pin is restored.
+        try:
+            if monotonic() >= deadline:
+                raise GenerationHeld()
+            self._files.verify()
+            self._match_phase(phase)
+            if monotonic() >= deadline or authority.revoked:
+                raise GenerationHeld()
+        except BaseException:
+            self.revoke()
+            raise
+
+    def _verify_local_acp_sent(self, receipt, *, phase):
+        """Pin the exact current ACP evidence after ordinary owner verification."""
+        authority = self._files._authority
+        if (type(phase) is not Phase or phase not in _SENT_PHASES
+                or type(receipt) is not AcpSentReceipt or receipt is not authority.sent):
+            raise GenerationHeld()
+        self._verify_local_phase(phase)
+
+    def _verify_local_destination(self, proof):
+        """Pin a destination proof already verified in this exact write effect."""
+        authority = self._files._authority
+        if (type(proof) is not _InFlight or proof is not authority.in_flight
+                or proof.pid != os.getpid() or proof.thread != get_ident()
+                or proof.operation is not Operation.DESTINATION
+                or not authority.busy or not authority.flight_checked):
+            raise GenerationHeld()
+        self._verify_local_phase(Phase.DESTINATION_CLAIMED)
 
     def _effect(self, capability, effect):
         self._owner_fence()
