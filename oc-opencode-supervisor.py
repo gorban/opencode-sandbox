@@ -18,6 +18,7 @@ import time
 
 MAX_FRAME = 512 * 1024 * 1024 + 4096
 OWNER_LABEL = 'io.github.gorban.opencode-sandbox.update'
+HEX64 = re.compile(r'[0-9a-f]{64}', re.ASCII)
 
 
 class UnsafeCleanup(Exception): pass
@@ -56,7 +57,7 @@ def read_cid(path):
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1 or st.st_size > 128:
             raise ValueError('unsafe container ID receipt')
         data = os.read(fd, 129).decode('ascii').strip()
-        if not re.fullmatch(r'[0-9a-f]{64}', data): raise ValueError('invalid container ID receipt')
+        if not HEX64.fullmatch(data): raise ValueError('invalid container ID receipt')
         return data
     finally: os.close(fd)
 
@@ -125,9 +126,9 @@ def main():
     archive_sha256 = os.environ.get('OC_OPENCODE_ARCHIVE_SHA256', '')
     if prefix not in ([], ['distrobox-host-exec']): raise ValueError('invalid host command prefix')
     if not re.fullmatch(r's0:c\d+,c\d+', level, flags=re.ASCII): raise ValueError('invalid SELinux level')
-    if not re.fullmatch(r'[0-9a-f]{64}', expected_sha256, flags=re.ASCII):
+    if not HEX64.fullmatch(expected_sha256):
         raise ValueError('invalid expected OpenCode SHA-256 digest')
-    if archive_sha256 and not re.fullmatch(r'[0-9a-f]{64}', archive_sha256, flags=re.ASCII):
+    if archive_sha256 and not HEX64.fullmatch(archive_sha256):
         raise ValueError('invalid expected OpenCode archive SHA-256 digest')
     if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', volume)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]*', image)):

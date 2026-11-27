@@ -136,14 +136,17 @@ def download_release(url, dest, env, timeout=60, max_bytes=MAX_ARCHIVE):
         '--connect-timeout', '5', '--max-time', str(int(timeout)),
         '--max-filesize', str(int(max_bytes)), url,
     ]
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        env=env, start_new_session=True,
-    )
-    deadline = time.monotonic() + timeout
+    # Open the exclusive destination BEFORE spawning curl so open failures never leak a child.
     fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    proc = None
+    succeeded = False
     try:
         with os.fdopen(fd, 'wb') as out:
+            deadline = time.monotonic() + timeout
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env=env, start_new_session=True,
+            )
             total = _stream_download(proc, out, deadline, max_bytes)
             out.flush()
         remaining = deadline - time.monotonic()
@@ -154,16 +157,19 @@ def download_release(url, dest, env, timeout=60, max_bytes=MAX_ARCHIVE):
             raise RuntimeError(f'curl failed ({rc})')
         if total == 0:
             raise ValueError('downloaded release archive is empty')
+        succeeded = True
         return total
-    except BaseException:
-        if proc.poll() is None:
-            _kill_process_group(proc)
-        raise
     finally:
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.poll() is None:
-            _kill_process_group(proc)
+        if proc is not None:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.poll() is None:
+                _kill_process_group(proc)
+        if not succeeded:
+            try:
+                os.unlink(dest)
+            except FileNotFoundError:
+                pass
 
 
 class _BoundedReader:
@@ -216,8 +222,11 @@ def _copy_member_bounded(src, dest_path, expected_size, max_binary):
 
 
 def _drain_stream(stream):
-    while stream.read(65536):
-        pass
+    """Consume remaining bytes through _BoundedReader so trailing bombs or truncation fail closed."""
+    drained = 0
+    while chunk := stream.read(65536):
+        drained += len(chunk)
+    return drained
 
 
 def extract_opencode_binary(

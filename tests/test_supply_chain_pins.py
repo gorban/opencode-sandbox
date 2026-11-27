@@ -110,7 +110,16 @@ class SupplyChainPinningInvariants(unittest.TestCase):
 
 
 class LaunchWrapperVerificationTests(unittest.TestCase):
-    """Verify oc-opencode-run.py baked default, sealed memfd verification, and compat mode."""
+    """Verify oc-opencode-run.py fixed baked default, sealed memfd verification, and compat mode."""
+
+    _WRAPPER_HARNESS = (
+        "import importlib.util, sys; "
+        "spec = importlib.util.spec_from_file_location('oc_run', sys.argv[1]); "
+        "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
+        "mod.BAKED_OPENCODE = sys.argv[2]; "
+        "sys.argv = ['oc-opencode-run.py', *sys.argv[3:]]; "
+        "sys.exit(mod.main())"
+    )
 
     def _make_stub(self, path: Path, marker: str):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -121,30 +130,67 @@ class LaunchWrapperVerificationTests(unittest.TestCase):
         path.chmod(0o755)
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def _run_wrapper(self, *, home: Path, path_env: str, extra_env: dict[str, str], args=()):
+    def _run_wrapper(self, *, home: Path, baked_bin: Path, path_env: str, extra_env: dict[str, str], args=()):
         env = {
             "HOME": str(home),
             "PATH": path_env,
             **extra_env,
         }
         return subprocess.run(
-            [sys.executable, "-I", str(ROOT / "oc-opencode-run.py"), *args],
+            [sys.executable, "-I", "-c", self._WRAPPER_HARNESS, str(ROOT / "oc-opencode-run.py"), str(baked_bin), *args],
             env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
         )
 
-    def test_default_mode_runs_baked_binary_even_when_volume_bin_leads_path(self):
+    def test_default_mode_runs_fixed_baked_binary_ignoring_path_and_volume_candidates(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
-            baked_dir = root / "sysbin"
+            baked_dir = root / "baked"
+            extra_path_dir = root / "external_path"
             vol_bin = home / ".opencode" / "bin" / "opencode"
+            path_bin = extra_path_dir / "opencode"
             baked_bin = baked_dir / "opencode"
             self._make_stub(vol_bin, "VOLUME")
+            self._make_stub(path_bin, "PATH_SHADOW")
             self._make_stub(baked_bin, "BAKED")
-            path_env = f"{vol_bin.parent}:{baked_dir}:/usr/bin:/bin"
-            res = self._run_wrapper(home=home, path_env=path_env, extra_env={}, args=("hello",))
+            path_env = f"{extra_path_dir}:{vol_bin.parent}:/usr/bin:/bin"
+            res = self._run_wrapper(home=home, baked_bin=baked_bin, path_env=path_env, extra_env={}, args=("hello",))
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertEqual(res.stdout.strip(), "BAKED:hello")
+
+    def test_verified_mode_closes_source_fd_once_if_memfd_allocation_fails(self):
+        import errno
+        import importlib.util
+        from unittest.mock import patch
+
+        spec = importlib.util.spec_from_file_location("oc_run_fdcheck", ROOT / "oc-opencode-run.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            vol_bin = home / ".opencode" / "bin" / "opencode"
+            expected_sha = self._make_stub(vol_bin, "VERIFIED")
+            opened_fds = []
+            closed_fds = []
+            real_open_vol = mod._open_volume_binary
+            real_close = os.close
+
+            def track_open(h):
+                fd = real_open_vol(h)
+                opened_fds.append(fd)
+                return fd
+
+            def track_close(fd):
+                closed_fds.append(fd)
+                return real_close(fd)
+
+            with patch.object(mod, "_open_volume_binary", side_effect=track_open), \
+                    patch.object(mod.os, "memfd_create", side_effect=OSError(errno.ENOMEM, "fixture")), \
+                    patch.object(mod.os, "close", side_effect=track_close):
+                with self.assertRaises(OSError):
+                    mod._load_verified_memfd(str(home), expected_sha)
+            self.assertEqual(len(opened_fds), 1)
+            self.assertEqual(closed_fds.count(opened_fds[0]), 1)
 
     def test_verified_mode_executes_matching_volume_binary_and_refuses_tampering(self):
         with tempfile.TemporaryDirectory() as td:
@@ -159,7 +205,7 @@ class LaunchWrapperVerificationTests(unittest.TestCase):
 
             # Matching digest executes verified binary via sealed memfd.
             ok = self._run_wrapper(
-                home=home, path_env=path_env,
+                home=home, baked_bin=baked_bin, path_env=path_env,
                 extra_env={"OC_OPENCODE_EXPECTED_SHA256": expected_sha},
                 args=("--flag",),
             )
@@ -171,7 +217,7 @@ class LaunchWrapperVerificationTests(unittest.TestCase):
             vol_bin.write_text(f"#!/bin/sh\necho RAN > {str(tampered_marker)!r}\necho TAMPERED\n", encoding="utf-8")
             vol_bin.chmod(0o755)
             bad = self._run_wrapper(
-                home=home, path_env=path_env,
+                home=home, baked_bin=baked_bin, path_env=path_env,
                 extra_env={"OC_OPENCODE_EXPECTED_SHA256": expected_sha},
             )
             self.assertNotEqual(bad.returncode, 0)
@@ -181,7 +227,7 @@ class LaunchWrapperVerificationTests(unittest.TestCase):
 
             # Conflicting verified + compat env fails closed.
             conflict = self._run_wrapper(
-                home=home, path_env=path_env,
+                home=home, baked_bin=baked_bin, path_env=path_env,
                 extra_env={"OC_OPENCODE_EXPECTED_SHA256": expected_sha, "OC_OPENCODE_USE_VOLUME": "1"},
             )
             self.assertNotEqual(conflict.returncode, 0)
@@ -198,7 +244,7 @@ class LaunchWrapperVerificationTests(unittest.TestCase):
             self._make_stub(baked_bin, "BAKED")
             path_env = f"{baked_dir}:/usr/bin:/bin"
             res = self._run_wrapper(
-                home=home, path_env=path_env,
+                home=home, baked_bin=baked_bin, path_env=path_env,
                 extra_env={"OC_OPENCODE_USE_VOLUME": "1"},
                 args=("ok",),
             )

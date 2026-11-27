@@ -3,20 +3,20 @@
 
 Execution modes (controlled strictly by host-supplied environment variables):
   - default (neither OC_OPENCODE_EXPECTED_SHA256 nor OC_OPENCODE_USE_VOLUME):
-      baked-only; resolves OpenCode strictly outside $HOME/.opencode.
+      baked-only; runs the fixed image-baked executable path without searching PATH.
   - verified opt-in (OC_OPENCODE_EXPECTED_SHA256=<64-hex>):
       reads $HOME/.opencode/bin/opencode via trusted O_NOFOLLOW parent descriptors,
       copies its exact bytes into a private kernel-sealed immutable memfd while
       computing SHA-256, verifies digest parity, and executes /proc/self/fd/<fd>.
   - explicit unverified compatibility (OC_OPENCODE_USE_VOLUME=1):
-      allows $HOME/.opencode/bin/opencode if present, else falls back to baked.
+      allows $HOME/.opencode/bin/opencode if present, else falls back to the
+      fixed image-baked executable path.
 """
 import fcntl
 import hashlib
 import os
 from pathlib import Path
 import re
-import shutil
 import signal
 import stat
 import subprocess
@@ -26,6 +26,7 @@ WAIT_ALL_CHILDREN = 0x40000000  # Linux __WALL includes non-SIGCHLD clone childr
 CHECKSUM = re.compile(r'[0-9a-f]{64}', re.ASCII)
 MAX_BINARY = 512 * 1024 * 1024
 INSTALL_DIRNAME = '.opencode'
+BAKED_OPENCODE = '/usr/local/bin/opencode'
 MFD_ALLOW_SEALING = getattr(os, 'MFD_ALLOW_SEALING', 2)
 F_ADD_SEALS = getattr(fcntl, 'F_ADD_SEALS', 1033)
 SEAL_IMMUTABLE = (
@@ -82,56 +83,48 @@ def _open_volume_binary(home):
 def _load_verified_memfd(home, expected_sha256):
     """Copy exact bytes from $HOME/.opencode/bin/opencode into a sealed memfd and verify SHA-256."""
     src_fd = _open_volume_binary(home)
-    mfd = os.memfd_create('opencode-verified', MFD_ALLOW_SEALING)
+    mfd = None
     try:
+        mfd = os.memfd_create('opencode-verified', MFD_ALLOW_SEALING)
         hasher = hashlib.sha256()
         total = 0
-        try:
-            while True:
-                chunk = os.read(src_fd, 1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > MAX_BINARY:
-                    raise ValueError('volume OpenCode binary exceeds size limit')
-                hasher.update(chunk)
-                _write_all(mfd, chunk)
-        finally:
-            os.close(src_fd)
+        while True:
+            chunk = os.read(src_fd, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_BINARY:
+                raise ValueError('volume OpenCode binary exceeds size limit')
+            hasher.update(chunk)
+            _write_all(mfd, chunk)
         if total == 0 or hasher.hexdigest() != expected_sha256:
             raise ValueError('volume OpenCode binary digest does not match expected SHA-256')
         os.lseek(mfd, 0, os.SEEK_SET)
         os.fchmod(mfd, 0o700)
         fcntl.fcntl(mfd, F_ADD_SEALS, SEAL_IMMUTABLE)
-        return mfd
-    except BaseException:
-        os.close(mfd)
-        raise
+        sealed, mfd = mfd, None
+        return sealed
+    finally:
+        os.close(src_fd)
+        if mfd is not None:
+            os.close(mfd)
 
 
-def _is_under(path_str, root):
-    try:
-        Path(path_str).resolve().relative_to(root)
-        return True
-    except (OSError, ValueError):
-        return False
-
-
-def _resolve_baked_binary(home):
-    volume_root = (Path(home) / INSTALL_DIRNAME).resolve()
-    raw_path = os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')
-    filtered = [entry for entry in raw_path.split(os.pathsep) if entry and not _is_under(entry, volume_root)]
-    candidate = shutil.which('opencode', path=os.pathsep.join(filtered))
-    if not candidate:
-        raise FileNotFoundError('baked OpenCode binary not found on system PATH')
-    return candidate
+def _resolve_baked_binary():
+    """Return the fixed trusted image-baked executable path without consulting PATH."""
+    if not os.path.isabs(BAKED_OPENCODE):
+        raise ValueError('baked OpenCode path must be absolute')
+    st = os.lstat(BAKED_OPENCODE)
+    if not stat.S_ISREG(st.st_mode) or not (st.st_mode & 0o111):
+        raise ValueError('baked OpenCode binary is not an executable regular file')
+    return BAKED_OPENCODE
 
 
 def _resolve_volume_compat_binary(home):
     volume_bin = Path(home) / INSTALL_DIRNAME / 'bin' / 'opencode'
     if volume_bin.is_file() and not volume_bin.is_symlink() and os.access(volume_bin, os.X_OK):
         return str(volume_bin)
-    return _resolve_baked_binary(home)
+    return _resolve_baked_binary()
 
 
 def _spawn_opencode(argv):
@@ -151,7 +144,7 @@ def _spawn_opencode(argv):
     if use_volume == '1':
         binary = _resolve_volume_compat_binary(home)
     elif use_volume == '':
-        binary = _resolve_baked_binary(home)
+        binary = _resolve_baked_binary()
     else:
         raise ValueError('OC_OPENCODE_USE_VOLUME must be 1 or unset')
     return subprocess.Popen([binary, *argv])
