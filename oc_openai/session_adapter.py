@@ -235,6 +235,22 @@ class OpenAISessionAdapter:
             return PersistedSelection(SelectionState.DISCONNECTED)
         return PersistedSelection(SelectionState.UNSET)
 
+    @staticmethod
+    def _is_retired_and_idle(backend, profile: Profile) -> bool:
+        if not profile.retiring:
+            return False
+        try:
+            conn = backend._connection(profile.directory)
+            bound = profile.client_id is not None
+            return conn.status() == "disconnected" and not conn.has_active_leases(
+                expected_client=profile.client_id if bound else None,
+                require_existing=bound,
+            )
+        except ConnectionError as exc:
+            raise ProviderIntegrityError(
+                exc.code, "OpenAI credential store failed integrity checks."
+            ) from None
+
     def discover_instances(self) -> tuple[ProviderInstanceSpec, ...]:
         backend = self._get_backend()
         try:
@@ -245,15 +261,8 @@ class OpenAISessionAdapter:
         seen_normalized: set[str] = set()
         discovered: list[ProviderInstanceSpec] = []
         for profile in (*view.saved, *view.unpublished):
-            if profile.retiring:
-                try:
-                    conn = backend._connection(profile.directory)
-                    if conn.status() == "disconnected" and not conn.has_active_leases():
-                        continue
-                except ConnectionError as exc:
-                    raise ProviderIntegrityError(
-                        exc.code, "OpenAI credential store failed integrity checks."
-                    ) from None
+            if self._is_retired_and_idle(backend, profile):
+                continue
             if not is_valid_instance_label(profile.label):
                 raise ProviderIntegrityError(
                     "invalid_saved_label",

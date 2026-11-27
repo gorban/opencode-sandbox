@@ -1276,16 +1276,24 @@ class Connection:
                     record.pop("worker_leases", None)
                 self._store.write(directory, record)
 
-    def begin_disconnect(self, *, physical_host=None):
+    def begin_disconnect(
+        self, *, physical_host=None, expected_client: str | None = None, require_existing: bool = False,
+    ):
         """Order local token and worker retirement before any provider I/O."""
+        effective_client = self._expected_client if expected_client is None else expected_client
+        bound = require_existing or effective_client is not None
         generation = _random()
-        with self._store.locked() as directory:
-            record = self._store.read(directory)
+        with self._store.locked(require_existing=bound) as directory:
+            record = self._store.read(directory, require_existing=bound)
+            if effective_client is not None and record.get("client") != effective_client:
+                raise ConnectionError("managed_retirement_incomplete")
             if not record:
                 return None
             if record.get("retiring", 0) > self._clock():
                 raise ConnectionError("openai_disconnect_in_progress")
             self._retire_leases(directory, record, physical_host)
+            if self._store.has_lease_holds(directory, self._active_lease_roots(record)):
+                raise ConnectionError("managed_retirement_incomplete")
             record.pop("worker_retiring", None)
             previous = record.get("generation")
             client = record.get("client")

@@ -332,7 +332,7 @@ class ProfileBackend:
             if profile.directory in retired_dirs:
                 return True
             try:
-                bound = profile.client_id is not None and not profile.retiring
+                bound = profile.client_id is not None
                 return self._connection(profile.directory).has_active_leases(
                     expected_client=profile.client_id if bound else None,
                     require_existing=bound,
@@ -352,7 +352,12 @@ class ProfileBackend:
                             expected_client=profile.client_id, require_existing=True,
                         )):
                     return False
-                retirement = connection.begin_disconnect(physical_host=placement)
+                bound = profile.client_id is not None
+                retirement = connection.begin_disconnect(
+                    physical_host=placement,
+                    expected_client=profile.client_id if bound else None,
+                    require_existing=bound,
+                )
             except ConnectionError as error:
                 raise _mapped_connection_error(error) from None
             retired_dirs.add(profile.directory)

@@ -4499,6 +4499,108 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
                         self.assertTrue(slot_root.exists())
                         self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
 
+    def test_r9_disconnect_missing_bound_state_or_unsettled_hold_fails_closed_and_keeps_switch_blocked(self):
+        # Regression (R8 P2): ProfileBackend.disconnect (targeted and bare) MUST require the matching
+        # bound connection record and zero unsettled holds before marking a published profile retiring,
+        # so missing dir/state.json, mismatched client, or unsettled holds cannot clear the guard and
+        # unblock later select(). Unpublished candidates without state.json still disconnect cleanly.
+        import pwd
+        from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+        from oc_openai.cli import Reason, RouteUnavailable
+        from oc_openai.connection import Connection
+        from oc_openai.connection_job import PhysicalHost
+        from oc_openai.profile_backend import ProfileBackend
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+
+        with tempfile.TemporaryDirectory(prefix="oc-r9-disc-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+
+            for disconnect_mode in ("targeted", "bare"):
+                for scenario in ("missing_state_json", "missing_conn_dir", "mismatched_client", "unsettled_hold"):
+                    with self.subTest(disconnect_mode=disconnect_mode, scenario=scenario):
+                        state_root = home_scratch / f"profiles_{disconnect_mode}_{scenario}"
+                        state_root.mkdir(mode=0o700)
+                        transport = FixtureTransport()
+                        browser_counter = [0]
+
+                        def _make_conn(directory):
+                            browser_counter[0] += 1
+                            fb = FixtureBrowser()
+                            fb.client = f"oaiapp_r9_{browser_counter[0]}"
+                            return Connection(
+                                directory,
+                                transport=transport,
+                                verifier=FixtureVerifier(),
+                                browser=fb,
+                                host_probe=lambda: host,
+                            )
+
+                        backend = ProfileBackend(state_root, connection=_make_conn)
+                        backend.connect("personal")
+                        backend.connect("work")
+                        backend.select("personal")
+                        view = backend.profiles.snapshot()
+                        personal_prof = next(p for p in view.saved if p.label == "personal")
+                        personal_dir = personal_prof.directory
+
+                        if scenario == "missing_state_json":
+                            (personal_dir / "state.json").unlink()
+                            self.assertTrue((personal_dir / "state.lock").exists())
+                        elif scenario == "missing_conn_dir":
+                            shutil.rmtree(personal_dir)
+                            self.assertFalse(personal_dir.exists())
+                        elif scenario == "mismatched_client":
+                            rec = json.loads((personal_dir / "state.json").read_text(encoding="utf-8"))
+                            rec["client"] = "oaiapp_wrongclient"
+                            (personal_dir / "state.json").write_text(json.dumps(rec), encoding="utf-8")
+                        else:
+                            hid = "ab" * 16
+                            hp = personal_dir / f".lease-hold-{hid}"
+                            payload = json.dumps({
+                                "version": 1, "state": "hold", "hold_id": hid,
+                                "root": "oc-chat-deadbeef", "incarnation": "inc_" + "3" * 32,
+                            }).encode("utf-8") + b"\n"
+                            fd = os.open(hp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                            try:
+                                os.write(fd, payload)
+                            finally:
+                                os.close(fd)
+
+                        with self.assertRaises(RouteUnavailable) as disc_err:
+                            if disconnect_mode == "targeted":
+                                backend.disconnect("personal")
+                            else:
+                                backend.disconnect()
+                        self.assertIs(disc_err.exception.reason, Reason.MANAGED_RETIREMENT)
+
+                        after = backend.profiles.snapshot()
+                        personal_after = next(p for p in after.saved if p.label == "personal")
+                        self.assertFalse(personal_after.retiring)
+                        self.assertEqual(after.active.label if after.active else None, "personal")
+
+                        with self.assertRaises(RouteUnavailable) as sw_err:
+                            backend.select("work")
+                        self.assertIs(sw_err.exception.reason, Reason.MANAGED_RETIREMENT)
+
+            # Unpublished candidate without state.json still disconnects cleanly.
+            unpub_root = home_scratch / "profiles_unpub"
+            unpub_root.mkdir(mode=0o700)
+            unpub_backend = ProfileBackend(
+                unpub_root,
+                connection=lambda directory: Connection(
+                    directory,
+                    transport=FixtureTransport(),
+                    verifier=FixtureVerifier(),
+                    browser=FixtureBrowser(),
+                    host_probe=lambda: host,
+                ),
+            )
+            unpub_backend.profiles.begin("draft")
+            self.assertTrue(unpub_backend.disconnect("draft"))
+
     def test_proof_gate_evidence_and_dir_sync_failure_fails_closed_with_zero_dispatch(self):
         # Regression (R4 P2 #2): evidence write failure OR post-write _fsync_dir failure during
         # ProofGate.arm() or ProofGate.mark_relay_verified() MUST fail permanently closed across
