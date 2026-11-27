@@ -176,10 +176,8 @@ def prepare(base, runtime_base, pol, wayland):
                    ' '.join(q(k + '=' + v) for k, v in clean_env.items()) + ' "$@";;\nesac')
     else:
         shell_file(base / 'bin/podman', 'exec ' + q(local_podman) + ' "$@"')
-    shell_file(base / 'bin/systemctl',
-               """if [ "${2-}" = show ]; then
-  printf 'LoadState=not-found\\nActiveState=inactive\\nJob=\\n'
-fi""")
+    manager_fixture = q(str(REPO / 'tests/bridge-manager-fixture.sh'))
+    shell_file(base / 'bin/systemctl', f'exec /usr/bin/bash {manager_fixture} "$@"')
     for cmd in ('sudo', 'pkexec', 'semodule'):
         shell_file(base / ('bin/' + cmd), 'echo "privileged command refused" >&2; exit 1')
     env = {k: os.environ[k] for k in ('CONTAINER_ID', 'LANG', 'TERM') if k in os.environ}

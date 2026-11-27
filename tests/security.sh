@@ -1158,21 +1158,7 @@ case "\$1 \$2" in
     for m in \${STUB_IDS:-}; do [ "\${m%%=*}" = "\$5" ] && { echo "\${m#*=}"; exit 0; }; done; exit 125 ;;
 esac
 if [ "\${0##*/}" = systemctl ]; then
-  case "\$2" in
-    stop) [ -z "\${STUB_BRIDGE_STAYS_ACTIVE:-}" ] || exit 1 ;;
-    show)
-      last=
-      for arg in "\$@"; do last=\$arg; done
-      [ -z "\${STUB_BRIDGE_MANAGER_FAIL:-}" ] || exit 1
-      load=not-found active=inactive job=
-      [ -z "\${STUB_BRIDGE_STAYS_ACTIVE:-}" ] || active=active
-      if [ "\$last" = "\${STUB_BRIDGE_ACTIVE_TIMER:-}" ] && \
-         ! grep -Fqx "systemctl --user stop \$last" "$T/stub.log"; then active=active; fi
-      [ "\$last" != "\${STUB_BRIDGE_LOADED:-}" ] || load=loaded
-      [ "\$last" != "\${STUB_BRIDGE_PENDING:-}" ] || job=9
-      printf 'LoadState=%s\nActiveState=%s\nJob=%s\n' "\$load" "\$active" "\$job"
-      ;;
-  esac
+  OC_TEST_BRIDGE_LOG="$T/stub.log" exec /usr/bin/bash "$REPO/tests/bridge-manager-fixture.sh" "\$@"
 fi
 exit 0
 EOF
@@ -1443,6 +1429,39 @@ check 'timer is disabled before failed publication' grep -qx 'systemctl --user d
 check 'partial publication does not rearm the timer' \
   ! grep -qE 'systemctl --user (enable --now|start) oc-bridge\.timer' "$T/stub.log"
 check 'partial publication preserves retained staged bytes' grep -qx 'private edit' "$DSTATE/bridge-stage/retained/save.txt"
+for fault in STUB_BRIDGE_WRONG_FRAGMENT=oc-bridge.service STUB_BRIDGE_DROPIN=oc-bridge.service \
+             STUB_BRIDGE_STOP_HOOK=fixture STUB_BRIDGE_STAGE="$T/foreign-stage"; do
+  out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.service "$fault")
+  check "foreign or modified service refuses setup before stop on $fault" \
+    grep -q 'could not quiesce' <<<"$out"
+  check "unexpected unit is never stopped on $fault" ! grep -q '^systemctl --user stop ' "$T/stub.log"
+done
+for enablement in enabled enabled-runtime; do
+  out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.timer \
+    STUB_BRIDGE_STILL_ENABLED=oc-bridge.timer STUB_BRIDGE_ENABLEMENT="$enablement")
+  check "disable is insufficient when the timer remains $enablement" \
+    grep -q 'activation remains enabled' <<<"$out"
+  check "replacement checks fresh enablement after disable for $enablement" \
+    grep -qx 'systemctl --user is-enabled oc-bridge.timer' "$T/stub.log"
+done
+global_units="$T/global-units"
+for relation in wants requires upholds; do
+  directory="$global_units/default.target.$relation"
+  mkdir -p "$directory"
+  ln -s "$T/absent.timer" "$directory/oc-bridge.timer"
+  out=$(bridge_install_fixture STUB_BRIDGE_GLOBAL_UNITS="$global_units")
+  check "dangling global $relation link blocks bridge publication" \
+    grep -q 'activation remains enabled' <<<"$out"
+  unlink "$directory/oc-bridge.timer"
+done
+out=$(pathrun STUB_BRIDGE_LOADED=oc-bridge.timer STUB_BRIDGE_STILL_ENABLED=oc-bridge.timer -- -d)
+check 'global teardown refuses a timer that remains effectively enabled' \
+  grep -q 'activation remains enabled' <<<"$out"
+check 'enabled timer prevents Podman removal during teardown' ! grep -q '^podman pod rm' "$T/stub.log"
+out=$(bridge_install_fixture STUB_BRIDGE_ENABLE_FAIL=1)
+check 'replacement reports failed activation' grep -q 'could not install the host bridge' <<<"$out"
+check 'failed enablement does not fall back to a direct start' \
+  ! grep -qx 'systemctl --user start oc-bridge.timer' "$T/stub.log"
 unlink "$DSTATE/bridge-stage/retained/save.txt"
 rmdir "$DSTATE/bridge-stage/retained"
 for fault in STUB_LIST_PODS_FAIL STUB_POD_REMOVE_FAIL STUB_POD_REMAINS STUB_BRIDGE_STAYS_ACTIVE; do

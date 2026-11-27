@@ -4,6 +4,7 @@ import contextlib
 import fcntl
 import json
 import os
+import shlex
 from pathlib import Path
 import secrets
 import shutil
@@ -2141,11 +2142,9 @@ class SessionBrokerTests(unittest.TestCase):
         fake_editor.chmod(0o755)
 
         fake_systemctl = stub_dir / "systemctl"
+        manager_fixture = repo / "tests/bridge-manager-fixture.sh"
         fake_systemctl.write_text(
-            "#!/bin/sh\n"
-            "if [ \"${2-}\" = show ]; then\n"
-            "  printf 'LoadState=not-found\\nActiveState=inactive\\nJob=\\n'\n"
-            "fi\n",
+            "#!/bin/sh\n" + shlex.join(("/usr/bin/bash", str(manager_fixture))) + ' "$@"\n',
             encoding="utf-8",
         )
         fake_systemctl.chmod(0o755)

@@ -10,6 +10,7 @@ from contextlib import contextmanager, suppress
 from hashlib import sha256
 import json
 import os
+import shlex
 from pathlib import Path
 import secrets
 import signal
@@ -541,7 +542,7 @@ class TestAmbientFdImmunity(unittest.TestCase):
             os.chmod(td, 0o700)
             launcher_dir = td / "launcher"
             launcher_dir.mkdir(mode=0o700)
-            for fname in (FILE_OC_SANDBOX, FILE_SETUP_LOCK, "oc-bridge.py",
+            for fname in (FILE_OC_SANDBOX, FILE_SETUP_LOCK, "oc-bridge.py", "oc-bridge-unit.py",
                           "oc-opencode-run.py", "oc-opencode-update.py", "oc-opencode-supervisor.py"):
                 dst = launcher_dir / fname
                 dst.write_bytes((REPO_ROOT / fname).read_bytes())
@@ -562,9 +563,9 @@ class TestAmbientFdImmunity(unittest.TestCase):
 
             stub_bin = td / "bin"
             stub_bin.mkdir(mode=0o700)
+            manager_fixture = REPO_ROOT / "tests/bridge-manager-fixture.sh"
             for tool, script in (
-                ("systemctl", 'if [ "${2-}" = show ]; then printf '
-                 "'LoadState=not-found\\nActiveState=inactive\\nJob=\\n'; fi\n"),
+                ("systemctl", shlex.join(("/usr/bin/bash", str(manager_fixture))) + ' "$@"\n'),
                 (FAKE_EDITOR_NAME, "exit 0\n"),
             ):
                 p = stub_bin / tool
