@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -28,6 +30,47 @@ _PROMPT = "Reply with exactly: ok. Do not use any tools."
 
 class NativeCliTextError(RuntimeError):
     """A fixed workstation diagnostic that contains no native reply data."""
+
+
+class _NativeRetirement:
+    """Keep actor identity in private scratch until every native actor retires."""
+
+    def __init__(self, root):
+        self.root = root
+        self.actors = []
+        self.uncertain = False
+
+    def track(self, clean, process, role):
+        clean.callback(self.retire, process)
+        fields = (Path(f"/proc/{process.pid}/stat").read_text(encoding="ascii")
+                  .rpartition(") ")[2].split())
+        if len(fields) <= 19 or not fields[19].isdigit():
+            raise NativeCliTextError("Native ACP actor identity could not be recorded.")
+        self.actors.append({"role": role, "pid": process.pid, "start_ticks": int(fields[19])})
+        destination = self.root / "native-cleanup.json"
+        next_file = self.root / "native-cleanup.next"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        with os.fdopen(os.open(next_file, flags, 0o600), "w", encoding="ascii") as output:
+            json.dump({"version": 1, "actors": self.actors}, output, sort_keys=True)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(next_file, destination)
+        parent = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+
+    def retire(self, process):
+        try:
+            _retire(process)
+        except BaseException:
+            self.uncertain = True
+            raise
+
+    def remove_scratch_if_retired(self):
+        if not self.uncertain:
+            shutil.rmtree(self.root)
 
 
 def _retire(process):
@@ -82,7 +125,7 @@ def _write_profile(home):
     )
 
 
-def _keyring_proxy(clean, runtime, proxy_socket):
+def _keyring_proxy(clean, runtime, proxy_socket, retirement):
     bus = runtime / "bus"
     proxy_exe = next((path for path in ("/usr/bin/xdg-dbus-proxy", "/run/host/usr/bin/xdg-dbus-proxy")
                       if os.path.isfile(path)), None)
@@ -92,7 +135,7 @@ def _keyring_proxy(clean, runtime, proxy_socket):
         [proxy_exe, f"unix:path={bus}", str(proxy_socket), "--filter", "--talk=org.freedesktop.secrets"],
         env=_SYSTEM_ENV, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    clean.callback(_retire, proxy)
+    retirement.track(clean, proxy, "keyring-proxy")
     end = time.monotonic() + 4
     while proxy.poll() is None and not proxy_socket.is_socket() and time.monotonic() < end:
         time.sleep(.025)
@@ -101,7 +144,7 @@ def _keyring_proxy(clean, runtime, proxy_socket):
     return proxy
 
 
-def _start_native(clean, fd, home, workspace, proxy_socket):
+def _start_native(clean, fd, home, workspace, proxy_socket, retirement):
     argv = [
         "/usr/bin/bwrap", "--unshare-all", "--share-net", "--die-with-parent", "--new-session", "--clearenv",
         "--ro-bind", "/usr/lib64", "/lib64", "--ro-bind", "/usr/lib64", "/usr/lib64",
@@ -117,7 +160,7 @@ def _start_native(clean, fd, home, workspace, proxy_socket):
     ]
     child = subprocess.Popen(argv, env=_SYSTEM_ENV, pass_fds=(fd,), stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
-    clean.callback(_retire, child)
+    retirement.track(clean, child, "native-acp")
     return child
 
 
@@ -190,12 +233,16 @@ class _Acp:
 
     def verify_terminal_tail(self):
         """Stop the exact native peer and require EOF without queued output."""
-        if self.child.poll() is None:
+        deliberate_stop = self.child.poll() is None
+        if deliberate_stop:
             self.child.terminate()
         try:
-            self.child.wait(timeout=3)
+            status = self.child.wait(timeout=3)
         except subprocess.TimeoutExpired as error:
             raise NativeCliTextError("Native ACP retirement could not be verified.") from error
+        allowed = {0, -signal.SIGTERM} if deliberate_stop else {0}
+        if status not in allowed:
+            raise NativeCliTextError("Native ACP exited unsuccessfully after the terminal event.")
         if self.buffer or not select.select([self.output], [], [], .2)[0]:
             raise NativeCliTextError("Native ACP left an unverified terminal tail.")
         try:
@@ -287,7 +334,7 @@ def _one_turn(client):
 
 
 @contextmanager
-def open_native(model, client_name, cancelled=lambda: False):
+def open_native(model, client_name, cancelled=lambda: False, record_root=None):
     from oc_providers.config import _account_home
 
     if model is not None and not _MODEL_ID.fullmatch(model):
@@ -297,18 +344,24 @@ def open_native(model, client_name, cancelled=lambda: False):
     info = runtime.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
         raise NativeCliTextError("The workstation runtime directory is not private.")
-    with ExitStack() as clean:
-        fd = _pinned_agy(clean, home)
-        root = Path(clean.enter_context(tempfile.TemporaryDirectory(prefix="oc-agy-text-", dir=runtime)))
-        workspace, profile, sock = root / "workspace", root / "home", root / "bus"
-        workspace.mkdir(mode=0o700)
-        profile.mkdir(mode=0o700)
-        _write_profile(profile)
-        proxy = _keyring_proxy(clean, runtime, sock)
-        client = _Acp(_start_native(clean, fd, profile, workspace, sock), cancelled)
-        selected = _open_session(client, model, client_name)
-        _retire(proxy)
-        yield client, selected
+    root = Path(tempfile.mkdtemp(prefix="oc-agy-text-", dir=runtime))
+    retirement = _NativeRetirement(root)
+    try:
+        if record_root is not None:
+            record_root(root)
+        with ExitStack() as clean:
+            fd = _pinned_agy(clean, home)
+            workspace, profile, sock = root / "workspace", root / "home", root / "bus"
+            workspace.mkdir(mode=0o700)
+            profile.mkdir(mode=0o700)
+            _write_profile(profile)
+            proxy = _keyring_proxy(clean, runtime, sock, retirement)
+            client = _Acp(_start_native(clean, fd, profile, workspace, sock, retirement), cancelled)
+            selected = _open_session(client, model, client_name)
+            retirement.retire(proxy)
+            yield client, selected
+    finally:
+        retirement.remove_scratch_if_retired()
 
 
 class _OpenCodeSession:
@@ -348,9 +401,9 @@ class _OpenCodeSession:
 
 
 @contextmanager
-def open_opencode_session(model, cancelled):
+def open_opencode_session(model, cancelled, *, record_root=None):
     with ExitStack() as stack:
-        client, _ = stack.enter_context(open_native(model, "oc-sandbox", cancelled))
+        client, _ = stack.enter_context(open_native(model, "oc-sandbox", cancelled, record_root))
         session = _OpenCodeSession(stack.pop_all(), client)
         try:
             yield session
@@ -376,4 +429,5 @@ def target_from_config(label):
         system_digest="5e9e60d4323abaec8d0a7d4dc4f0257da8ed1f647f7d48f4a39078e8cfd2d99c",
         system_baseline_label="elgoog",
         open_session=partial(open_opencode_session, instance.default_model),
+        native_cleanup_record=True,
     )

@@ -1,9 +1,17 @@
 """Attended live check of the public Google shell and named model picker."""
 
 from pathlib import Path
+import re
 import runpy
 import sys
 import tempfile
+
+
+def failure_summary(screen):
+    category = "provider-refusal" if "Provider request failed" in screen else "incomplete-shell"
+    exits = re.findall(r"^Fixture exit ([0-9]{1,3})$", screen, flags=re.MULTILINE)
+    exit_code = int(exits[-1]) if exits and int(exits[-1]) <= 255 else None
+    return f"Public Google shell failed: {category}; exit={exit_code}"
 
 
 def main():
@@ -50,10 +58,7 @@ def main():
                               "shell cleanup", history=True, timeout=35)
         except BaseException:
             screen = term.screen("shell", history=True)
-            for line in screen.splitlines():
-                if ("Google shell stopped" in line or "Provider request failed" in line
-                        or "Fixture exit" in line):
-                    print(line.strip(), flush=True)
+            print(failure_summary(screen), flush=True)
             raise
         finally:
             term.close()

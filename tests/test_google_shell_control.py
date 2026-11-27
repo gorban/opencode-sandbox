@@ -320,6 +320,23 @@ shell.run_shell(SimpleNamespace(label="personal", model="gemini-pro", system_dig
                         self.assertIs(shell.open_peer(placement, peers, target, lambda: False), session)
                     self.assertIs(placement.peer_unconfirmed, not confirmed)
 
+    def test_private_placement_links_native_cleanup_receipt_before_peer_starts(self):
+        with control.owned_run() as (path, _, directory):
+            placement = shell.ShellPlacement(path, directory, None)
+            native = path / "native"
+            session = SimpleNamespace(retirement_confirmed=False)
+
+            def open_session(_, *, record_root):
+                record_root(native)
+                receipt = json.loads((path / "placement.json").read_text())
+                self.assertEqual(receipt["native_cleanup_root"], str(native))
+                return nullcontext(session)
+
+            target = SimpleNamespace(native_cleanup_record=True, open_session=open_session)
+            with ExitStack() as peers:
+                self.assertIs(shell.open_peer(placement, peers, target, lambda: False), session)
+            self.assertTrue(placement.peer_unconfirmed)
+
     def test_failed_precreate_receipt_does_not_hide_prior_owned_worker(self):
         with control.owned_run() as (path, _, directory):
             placement = shell.ShellPlacement(path, directory, None)

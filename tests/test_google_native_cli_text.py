@@ -1,17 +1,20 @@
 """Exercise the fixed text command without credentials or provider traffic."""
 
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
 import runpy
 import subprocess
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from oc_google.native_text import target_from_config
 
-from oc_google.native_text import NativeCliTextError, _Acp, _OpenCodeSession, _one_turn, _open_session
+from oc_google.native_text import NativeCliTextError, _Acp, _NativeRetirement, _OpenCodeSession, _one_turn, _open_session
 consent = runpy.run_path(str(Path(__file__).resolve().parent / "e2e/live/conftest.py"))
+public_driver = runpy.run_path(str(Path(__file__).resolve().parent / "e2e/live/google_public_shell_driver.py"))
 
 
 def option(ident, current, choices):
@@ -19,6 +22,30 @@ def option(ident, current, choices):
 
 
 class NativeCliTextTest(unittest.TestCase):
+    def test_uncertain_native_retirement_keeps_private_actor_receipt(self):
+        with TemporaryDirectory() as base:
+            root = Path(base) / "native"
+            root.mkdir(mode=0o700)
+            retirement = _NativeRetirement(root)
+            actor = SimpleNamespace(pid=os.getpid())
+            with ExitStack() as clean:
+                retirement.track(clean, actor, "native-acp")
+                with patch("oc_google.native_text._retire", side_effect=subprocess.TimeoutExpired("native", 3)):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        clean.close()
+            self.assertTrue(retirement.uncertain)
+            retirement.remove_scratch_if_retired()
+            receipt = root / "native-cleanup.json"
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(receipt.read_text())["actors"][0]["pid"], os.getpid())
+
+    def test_public_driver_failure_summary_never_echoes_terminal_data(self):
+        secret = "synthetic-sensitive-terminal-value"
+        result = public_driver["failure_summary"](
+            f"Provider request failed {secret}\nFixture exit 7\n")
+        self.assertEqual(result, "Public Google shell failed: provider-refusal; exit=7")
+        self.assertNotIn(secret, result)
+
     def test_failed_retirement_stays_unconfirmed_on_repeat(self):
         calls = []
 

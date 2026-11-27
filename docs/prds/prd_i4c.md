@@ -109,7 +109,13 @@ This public slice admits only the measured Hydrogen model and exact one-turn
 OpenCode transcript. The broker validates the selected route and fixed prompt, spends
 one approval under the owner fence, buffers the native text until terminal completion,
 and retires the native process before returning `ok`. Replay and changed inputs are
-refused. An uncertain turn retains no authority to send another prompt. A later adapter
+refused. An uncertain turn retains no authority to send another prompt. The broker
+checks the native exit status as well as its terminal output before releasing reply bytes.
+If native retirement cannot be verified, the owner keeps its private ACP scratch and an
+actor-identity receipt; the retained shell placement links to that cleanup directory.
+The live test reports only fixed failure categories and a bounded exit code, without
+echoing terminal content.
+A later adapter
 will join the default multi-provider session after the account binding, spend journal,
 and original worker incarnation conditions below are qualified. The general route
 must bind consent to a verified account and authorization mode, recheck it before the

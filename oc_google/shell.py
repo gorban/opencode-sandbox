@@ -86,10 +86,12 @@ class ShellPlacement(Placement):
         self.directory = directory
         self.create_unconfirmed = False
         self.peer_unconfirmed = False
+        self.native_cleanup_root = None
 
     def record(self, state):
         data = {"state": state, "podman_label": LABEL, "value": self.label,
-                "containers": self.names, "ids": self.ids}
+                "containers": self.names, "ids": self.ids,
+                "native_cleanup_root": self.native_cleanup_root}
         seed_file(self.directory, "placement.next", json.dumps(data).encode("ascii"))
         os.replace("placement.next", "placement.json", src_dir_fd=self.directory, dst_dir_fd=self.directory)
         os.fsync(self.directory)
@@ -108,6 +110,10 @@ class ShellPlacement(Placement):
     def remember_recovered(self, role, identifier):
         super().remember_recovered(role, identifier)
         self.record("cleanup-pending")
+
+    def remember_native_root(self, root):
+        self.native_cleanup_root = str(root)
+        self.record("native-starting")
 
     def close(self):
         # Keep the first-party identity even if an exact removal or inspection fails.
@@ -239,7 +245,11 @@ def stop_attach(child):
 def open_peer(placement, peer_scope, target, cancelled):
     stack = ExitStack()
     try:
-        session = stack.enter_context(target.open_session(cancelled))
+        if getattr(target, "native_cleanup_record", False):
+            session = stack.enter_context(target.open_session(
+                cancelled, record_root=placement.remember_native_root))
+        else:
+            session = stack.enter_context(target.open_session(cancelled))
     except BaseException:
         placement.peer_unconfirmed = True
         raise
