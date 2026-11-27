@@ -26,7 +26,10 @@ from .native_artifacts import stage_standalone, verify_standalone_source
 from .native_namespace import public_certificate
 from .native_service import NativeRetirementUnconfirmed, retain_cleanup_failure
 from .registration import RegistrationJournal, _absent, _DIRECTORY, _write_private
-from .token_diagnostic import LoadBodyReason, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage
+from .token_diagnostic import (
+    CurrentTierDetail, LoadBodyReason, OriginalProjectDetail, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic,
+    TokenStage,
+)
 
 
 _libc_write = ctypes.CDLL(None, use_errno=True).write
@@ -121,6 +124,23 @@ _LOAD_BODY_DETAILS = {
     LoadBodyReason.OPTIONAL_METADATA: "optional metadata",
     LoadBodyReason.ALTERNATIVE_TIER_POLICY: "alternative tier policy",
 }
+_CURRENT_TIER_DETAILS = {
+    CurrentTierDetail.ABSENT: "a missing key",
+    CurrentTierDetail.NULL: "an explicit null",
+    CurrentTierDetail.NON_OBJECT: "a non-object value",
+    CurrentTierDetail.EMPTY_OBJECT: "an empty object",
+    CurrentTierDetail.UNSUPPORTED_FIELDS: "unsupported fields",
+    CurrentTierDetail.IDENTIFIER: "an absent or invalid identifier",
+    CurrentTierDetail.DISPLAY_NAME: "an absent or invalid display name",
+    CurrentTierDetail.OTHER_SHAPE: "another refused tier shape",
+}
+_ORIGINAL_PROJECT_DETAILS = {
+    OriginalProjectDetail.ABSENT: "a missing key",
+    OriginalProjectDetail.NULL: "an explicit null",
+    OriginalProjectDetail.EMPTY_STRING: "an empty string",
+    OriginalProjectDetail.WRONG_TYPE: "a wrong type",
+    OriginalProjectDetail.IDENTIFIER_SHAPE: "a refused identifier shape",
+}
 
 
 class ConnectError(RuntimeError):
@@ -167,6 +187,11 @@ def _write_enrollment_detail(owner, error, token_diagnostic, post_diagnostic):
                 reasons = post_diagnostic.load_body_reasons(error)
                 if reasons:
                     detail += " Failed checks include " + ", ".join(_LOAD_BODY_DETAILS[reason] for reason in reasons) + "."
+                account = post_diagnostic.load_account_details(error)
+                if account is not None:
+                    tier, project = account
+                    detail += (f" Current tier check found {_CURRENT_TIER_DETAILS[tier]}."
+                               f" Original project check found {_ORIGINAL_PROJECT_DETAILS[project]}.")
     else:
         return
     with suppress(OSError, ConnectError):

@@ -12,7 +12,10 @@ from .oauth_exchange import (
     _GrantRefused, _reject_constant, validate_authorization_code_exchange, validate_cold_grant,
     validate_enrollment_grant,
 )
-from .token_diagnostic import LoadBodyReason, ScopedPostTokenDiagnostic, PostTokenStage, TokenDiagnostic, observe_post_token
+from .token_diagnostic import (
+    CurrentTierDetail, LoadBodyReason, OriginalProjectDetail, PostTokenStage, ScopedPostTokenDiagnostic,
+    TokenDiagnostic, observe_post_token,
+)
 
 
 _LOAD_BODY = {"metadata": {"ideType": "ANTIGRAVITY"}}
@@ -221,6 +224,36 @@ def _rich_load_reasons(fields, current, project, paid):
     return reasons
 
 
+def _current_tier_detail(fields, tier):
+    if "currentTier" not in fields:
+        return CurrentTierDetail.ABSENT
+    if tier is None:
+        return CurrentTierDetail.NULL
+    if type(tier) is not dict:
+        return CurrentTierDetail.NON_OBJECT
+    if not tier:
+        return CurrentTierDetail.EMPTY_OBJECT
+    if tier.keys() - _TIER_FIELDS:
+        return CurrentTierDetail.UNSUPPORTED_FIELDS
+    if not _valid_identifier(tier.get("id")):
+        return CurrentTierDetail.IDENTIFIER
+    if not _valid_tier({"id": tier["id"], "name": tier.get("name")}):
+        return CurrentTierDetail.DISPLAY_NAME
+    return CurrentTierDetail.OTHER_SHAPE
+
+
+def _original_project_detail(fields, project):
+    if "cloudaicompanionProject" not in fields:
+        return OriginalProjectDetail.ABSENT
+    if project is None:
+        return OriginalProjectDetail.NULL
+    if type(project) is str and not project:
+        return OriginalProjectDetail.EMPTY_STRING
+    if type(project) is not str:
+        return OriginalProjectDetail.WRONG_TYPE
+    return OriginalProjectDetail.IDENTIFIER_SHAPE
+
+
 def project_load_reply(body) -> VerifiedLoadReply:
     """Keep legacy bytes or project an already complete personal LOAD result."""
     try:
@@ -246,7 +279,10 @@ def project_load_reply(body) -> VerifiedLoadReply:
     project = fields.get("cloudaicompanionProject")
     reasons = _rich_load_reasons(fields, current, project, paid)
     if reasons:
-        raise _load_body_refused(reasons)
+        error = _load_body_refused(reasons)
+        if LoadBodyReason.CURRENT_TIER in reasons and LoadBodyReason.ORIGINAL_PROJECT in reasons:
+            error.load_account_details = _current_tier_detail(fields, current), _original_project_detail(fields, project)
+        raise error
     projected = {"currentTier": _retained_tier(current), "cloudaicompanionProject": project}
     if paid is not None:
         projected["paidTier"] = _retained_tier(paid)

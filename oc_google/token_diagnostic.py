@@ -75,6 +75,25 @@ class LoadBodyReason(Enum):
     ALTERNATIVE_TIER_POLICY = auto()
 
 
+class CurrentTierDetail(Enum):
+    ABSENT = auto()
+    NULL = auto()
+    NON_OBJECT = auto()
+    EMPTY_OBJECT = auto()
+    UNSUPPORTED_FIELDS = auto()
+    IDENTIFIER = auto()
+    DISPLAY_NAME = auto()
+    OTHER_SHAPE = auto()
+
+
+class OriginalProjectDetail(Enum):
+    ABSENT = auto()
+    NULL = auto()
+    EMPTY_STRING = auto()
+    WRONG_TYPE = auto()
+    IDENTIFIER_SHAPE = auto()
+
+
 def _load_reasons(error):
     try:
         reasons = getattr(error, "load_body_reasons", None)
@@ -86,13 +105,27 @@ def _load_reasons(error):
     return tuple(reason for reason in LoadBodyReason if reason in reasons)
 
 
+def _load_account_details(error, reasons):
+    if LoadBodyReason.CURRENT_TIER not in reasons or LoadBodyReason.ORIGINAL_PROJECT not in reasons:
+        return None
+    try:
+        pair = getattr(error, "load_account_details", None)
+    except Exception:
+        return None
+    if (type(pair) is tuple and len(pair) == 2
+            and type(pair[0]) is CurrentTierDetail and type(pair[1]) is OriginalProjectDetail):
+        return pair
+    return None
+
+
 @dataclass(slots=True, eq=False)
 class PostTokenDiagnostic:
     """The first exact failure recorded by this attended enrollment."""
 
-    _failure: tuple[Exception, PostTokenStage, BaseException | None, tuple[LoadBodyReason, ...]] | None = field(
-        default=None, init=False, repr=False,
-    )
+    _failure: tuple[
+        Exception, PostTokenStage, BaseException | None, tuple[LoadBodyReason, ...],
+        tuple[CurrentTierDetail, OriginalProjectDetail] | None,
+    ] | None = field(default=None, init=False, repr=False)
 
     def __reduce_ex__(self, _protocol):
         raise TypeError("Google enrollment diagnostics must remain with the exact attempt")
@@ -100,7 +133,7 @@ class PostTokenDiagnostic:
     def mark(self, error, stage):
         if self._failure is None and isinstance(error, Exception) and type(stage) is PostTokenStage:
             reasons = _load_reasons(error) if stage is PostTokenStage.LOAD_BODY else ()
-            self._failure = error, stage, error.__context__, reasons
+            self._failure = error, stage, error.__context__, reasons, _load_account_details(error, reasons)
 
     def stage(self, error):
         failure = self._failure
@@ -116,6 +149,12 @@ class PostTokenDiagnostic:
         if failure is not None and self.stage(error) is PostTokenStage.LOAD_BODY:
             return failure[3]
         return ()
+
+    def load_account_details(self, error):
+        failure = self._failure
+        if failure is not None and self.stage(error) is PostTokenStage.LOAD_BODY:
+            return failure[4]
+        return None
 
 
 @dataclass(frozen=True, slots=True, eq=False)

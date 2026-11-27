@@ -25,7 +25,10 @@ from oc_google.native_service import (
 )
 from oc_google.native_namespace import NativeNamespaceError
 from oc_google.native_transport import NativeChannel
-from oc_google.token_diagnostic import LoadBodyReason, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage
+from oc_google.token_diagnostic import (
+    CurrentTierDetail, LoadBodyReason, OriginalProjectDetail, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic,
+    TokenStage,
+)
 from google_registration_fixture import record_enrollment_retired
 from test_google_enrollment import BEARER, LOAD_REPLY, LOAD_REQUEST, SUBJECT
 from test_google_metadata_ingress import FakePeer, packet
@@ -188,6 +191,9 @@ class EnrollmentSessionTest(unittest.TestCase):
         self.assertIs(diagnostic.stage(refusal.exception), PostTokenStage.LOAD_BODY)
         self.assertEqual(diagnostic.load_body_reasons(refusal.exception), (
             LoadBodyReason.TOP_LEVEL_FIELDS, LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT,
+        ))
+        self.assertEqual(diagnostic.load_account_details(refusal.exception), (
+            CurrentTierDetail.ABSENT, OriginalProjectDetail.ABSENT,
         ))
         self.assertEqual(len(loaded.sent), 1)
         self.assertNotIn("synthetic-load-marker", self.journal_file.read_text())
@@ -664,6 +670,9 @@ class ColdMetadataSessionTest(unittest.TestCase):
         self.assertIs(diagnostic.stage(refusal.exception), PostTokenStage.LOAD_BODY)
         self.assertEqual(diagnostic.load_body_reasons(refusal.exception), (
             LoadBodyReason.TOP_LEVEL_FIELDS, LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT,
+        ))
+        self.assertEqual(diagnostic.load_account_details(refusal.exception), (
+            CurrentTierDetail.ABSENT, OriginalProjectDetail.ABSENT,
         ))
         self.assertEqual([len(channel.sent) for channel in channels], [1, 1, 1])
         self.assertFalse(self.peers[CATALOG].closed)

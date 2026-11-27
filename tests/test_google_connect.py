@@ -23,7 +23,10 @@ from unittest.mock import Mock, patch
 
 from oc_google import auth_offer, connect, metadata_workflow, native_artifacts
 from oc_google.native_service import NativeInvocation, NativeRetirementUnconfirmed
-from oc_google.token_diagnostic import LoadBodyReason, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage, scoped_post_token
+from oc_google.token_diagnostic import (
+    CurrentTierDetail, LoadBodyReason, OriginalProjectDetail, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic,
+    TokenStage, scoped_post_token,
+)
 
 
 class TerminalOwnerTest(unittest.TestCase):
@@ -374,26 +377,40 @@ class RuntimeCustodyTest(unittest.TestCase):
         self.assertEqual(set(connect._TOKEN_DETAILS), set(TokenStage))
         self.assertEqual(set(connect._POST_TOKEN_DETAILS), set(PostTokenStage))
         self.assertEqual(set(connect._LOAD_BODY_DETAILS), set(LoadBodyReason))
+        for mapping, detail in (
+            (connect._CURRENT_TIER_DETAILS, CurrentTierDetail),
+            (connect._ORIGINAL_PROJECT_DETAILS, OriginalProjectDetail),
+        ):
+            self.assertEqual(set(mapping), set(detail))
+            self.assertEqual(len(set(mapping.values())), len(detail))
 
     def test_post_token_load_body_uses_only_original_foreground_pty(self):
         self.assert_diagnostic_uses_original_pty(
             "load", b"Google enrollment metadata: The LOAD metadata body was refused. Failed checks include "
-            b"top-level field allowlist, current tier structure, original project.", b"synthetic-load-marker",
+            b"top-level field allowlist, current tier structure, original project. "
+            b"Current tier check found an explicit null. Original project check found a missing key.",
+            b"synthetic-load-marker",
         )
 
     def test_load_body_details_only_use_the_bounded_exact_failure_snapshot(self):
         token = TokenDiagnostic()
         error = ValueError("synthetic raw exception")
         error.load_body_reasons = tuple(reversed(tuple(LoadBodyReason)))
+        tier = max(CurrentTierDetail, key=lambda detail: len(connect._CURRENT_TIER_DETAILS[detail]))
+        project = max(OriginalProjectDetail, key=lambda detail: len(connect._ORIGINAL_PROJECT_DETAILS[detail]))
+        error.load_account_details = tier, project
         post = PostTokenDiagnostic()
         post.mark(error, PostTokenStage.LOAD_BODY)
         error.load_body_reasons = ("synthetic altered reason",)
+        error.load_account_details = ("synthetic altered tier", "synthetic altered project")
         owner = Mock()
         connect._write_enrollment_detail(owner, error, token, post)
         line = owner.write_once.call_args.args[0]
         expected = ", ".join(connect._LOAD_BODY_DETAILS[reason] for reason in LoadBodyReason)
         self.assertEqual(line, "Google enrollment metadata: The LOAD metadata body was refused. "
-                              f"Failed checks include {expected}.\n")
+                              f"Failed checks include {expected}. "
+                              f"Current tier check found {connect._CURRENT_TIER_DETAILS[tier]}. "
+                              f"Original project check found {connect._ORIGINAL_PROJECT_DETAILS[project]}.\n")
         self.assertLess(len(line.encode("ascii")), 512)
         for other, scope in ((ValueError(str(error)), post), (error, PostTokenDiagnostic())):
             owner.reset_mock()
@@ -411,6 +428,24 @@ class RuntimeCustodyTest(unittest.TestCase):
         post.mark(error, PostTokenStage.LOAD_BODY)
         connect._write_enrollment_detail(owner, error, token, post)
         owner.write_once.assert_called_once_with("Google enrollment metadata: The LOAD metadata body was refused.\n")
+
+    def test_unvalidated_load_account_details_keep_existing_top_level_reasons(self):
+        pair = (CurrentTierDetail.NULL, OriginalProjectDetail.ABSENT)
+        both = (LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT)
+        for reasons, details in (
+            (both, None), (both, list(pair)), (both, pair[::-1]), (both, pair[:1]),
+            (both, pair + (CurrentTierDetail.NULL,)), (both, (CurrentTierDetail.NULL, "synthetic raw detail")),
+            ((LoadBodyReason.CURRENT_TIER,), pair), ((LoadBodyReason.ORIGINAL_PROJECT,), pair),
+        ):
+            error = ValueError("synthetic raw exception")
+            error.load_body_reasons = reasons
+            error.load_account_details = details
+            post, owner = PostTokenDiagnostic(), Mock()
+            post.mark(error, PostTokenStage.LOAD_BODY)
+            connect._write_enrollment_detail(owner, error, TokenDiagnostic(), post)
+            existing = ", ".join(connect._LOAD_BODY_DETAILS[reason] for reason in reasons)
+            owner.write_once.assert_called_once_with("Google enrollment metadata: The LOAD metadata body was refused. "
+                                                    f"Failed checks include {existing}.\n")
 
     def test_post_token_detail_cannot_preempt_token_callback_or_inherit_custody(self):
         callback = metadata_workflow.CallbackWorkflowError(auth_offer.CallbackDiagnostic.NO_MATCHING_CALLBACK)
@@ -568,7 +603,7 @@ class RuntimeCustodyTest(unittest.TestCase):
             elif kind == "load":
                 channels = (
                     FakeChannel(response(grant())), FakeChannel(response(SUBJECT)),
-                    FakeChannel(response(b'{"synthetic-load-marker":1}')),
+                    FakeChannel(response(b'{"synthetic-load-marker":1,"currentTier":null}')),
                 )
             else:
                 channels = (FakeChannel(response(status=b"HTTP/1.1 400 synthetic-token-marker")),)

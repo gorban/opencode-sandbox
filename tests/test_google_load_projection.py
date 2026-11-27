@@ -8,7 +8,7 @@ import unittest
 from oc_google.account_binding import bind_subject
 from oc_google.enrollment import EnrollmentMetadataError, LoadObservation, _LoadCodeAssist
 from oc_google.metadata_destination import MetadataRoute
-from oc_google.token_diagnostic import LoadBodyReason
+from oc_google.token_diagnostic import CurrentTierDetail, LoadBodyReason, OriginalProjectDetail
 
 
 PROJECT = "synthetic-projection-project"
@@ -215,7 +215,48 @@ class LoadProjectionTests(unittest.TestCase):
             with self.subTest(reason=reason), self.assertRaises(EnrollmentMetadataError) as refusal:
                 self.load(raw)
             self.assertEqual(refusal.exception.load_body_reasons, (reason,))
+            self.assertFalse(hasattr(refusal.exception, "load_account_details"))
             self.assertNotIn("secret", str(refusal.exception))
+
+    def test_both_account_groups_distinguish_every_closed_pair(self):
+        tier_cases = (
+            ({}, CurrentTierDetail.ABSENT),
+            ({"currentTier": None}, CurrentTierDetail.NULL),
+            ({"currentTier": ["synthetic-tier-marker"]}, CurrentTierDetail.NON_OBJECT),
+            ({"currentTier": {}}, CurrentTierDetail.EMPTY_OBJECT),
+            ({"currentTier": {"synthetic-tier-marker": 1}}, CurrentTierDetail.UNSUPPORTED_FIELDS),
+            ({"currentTier": {"id": "synthetic tier marker", "name": "Synthetic"}}, CurrentTierDetail.IDENTIFIER),
+            ({"currentTier": {"id": "synthetic-tier-marker"}}, CurrentTierDetail.DISPLAY_NAME),
+            ({"currentTier": {"id": "valid", "name": "Synthetic", "privacyNotice": []}}, CurrentTierDetail.OTHER_SHAPE),
+        )
+        project_cases = (
+            ({}, OriginalProjectDetail.ABSENT),
+            ({"cloudaicompanionProject": None}, OriginalProjectDetail.NULL),
+            ({"cloudaicompanionProject": ""}, OriginalProjectDetail.EMPTY_STRING),
+            ({"cloudaicompanionProject": ["synthetic-project-marker"]}, OriginalProjectDetail.WRONG_TYPE),
+            ({"cloudaicompanionProject": "synthetic project marker"}, OriginalProjectDetail.IDENTIFIER_SHAPE),
+        )
+        for tier, tier_detail in tier_cases:
+            for project, project_detail in project_cases:
+                with self.subTest(tier=tier_detail, project=project_detail):
+                    with self.assertRaises(EnrollmentMetadataError) as refusal:
+                        self.load(encode({"releaseChannel": {}} | tier | project))
+                    self.assertEqual(refusal.exception.load_body_reasons, (
+                        LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT,
+                    ))
+                    self.assertEqual(refusal.exception.load_account_details, (tier_detail, project_detail))
+                    self.assertEqual(str(refusal.exception), "Invalid Google enrollment metadata response")
+
+    def test_a_single_account_group_has_no_pair(self):
+        for fields, reason in (
+            ({"cloudaicompanionProject": PROJECT}, LoadBodyReason.CURRENT_TIER),
+            ({"currentTier": CURRENT}, LoadBodyReason.ORIGINAL_PROJECT),
+        ):
+            with self.subTest(reason=reason):
+                with self.assertRaises(EnrollmentMetadataError) as refusal:
+                    self.load(encode({"releaseChannel": {}} | fields))
+                self.assertEqual(refusal.exception.load_body_reasons, (reason,))
+                self.assertFalse(hasattr(refusal.exception, "load_account_details"))
 
 
 if __name__ == "__main__":
