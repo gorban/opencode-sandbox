@@ -17,6 +17,7 @@ from unittest.mock import patch
 HERE = Path(__file__).resolve().parent
 VARIANTS = ("E", "X")
 BROWSER_DIRS = ("home", "config", "data", "cache", "state", "profile")
+ORIGINAL_LAUNCHER = "before\n"
 
 
 def load_repair(root):
@@ -36,7 +37,7 @@ def make_fixture(root):
         (chrome / name).mkdir(mode=0o700)
 
     launcher = chrome / "launch-chrome.sh"
-    launcher.write_text("before\n", encoding="utf-8")
+    launcher.write_text(ORIGINAL_LAUNCHER, encoding="utf-8")
     launcher.chmod(0o700)
     (chrome / "profile/sentinel").write_text("unchanged", encoding="utf-8")
     data = {
@@ -81,10 +82,10 @@ def check_repair(repair, chrome, manifest, launcher, exports):
     assert not any("ignore-certificate-errors" in arg or arg in ("--no-sandbox", "--socket=session-bus")
                    for arg in argv)
 
-    assert launcher.read_text(encoding="utf-8") == "before\n"
+    assert launcher.read_text(encoding="utf-8") == ORIGINAL_LAUNCHER
     with launcher.open(encoding="utf-8") as original:
         repair.replace_launcher(target, content)
-        assert original.read() == "before\n"
+        assert original.read() == ORIGINAL_LAUNCHER
     assert launcher.read_text(encoding="utf-8") == content
     assert launcher.stat().st_mode & 0o777 == 0o700
     assert (chrome / "profile/sentinel").read_text(encoding="utf-8") == "unchanged"
