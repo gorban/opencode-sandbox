@@ -75,7 +75,11 @@ class ProfileBackend:
     def _require_all_idle(self, profiles):
         try:
             for profile in profiles:
-                self._connection(profile.directory).require_switchable()
+                bound = profile.client_id is not None and not profile.retiring
+                self._connection(profile.directory).require_switchable(
+                    expected_client=profile.client_id if bound else None,
+                    require_existing=bound,
+                )
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
 
@@ -83,7 +87,11 @@ class ProfileBackend:
         if previous is None or (allow_same and previous.directory == target.directory):
             return
         try:
-            self._connection(previous.directory).require_switchable()
+            bound = previous.client_id is not None and not previous.retiring
+            self._connection(previous.directory).require_switchable(
+                expected_client=previous.client_id if bound else None,
+                require_existing=bound,
+            )
             self.ledger.require_quiescent()
         except ConnectionError as error:
             raise _mapped_connection_error(error) from None
@@ -324,7 +332,11 @@ class ProfileBackend:
             if profile.directory in retired_dirs:
                 return True
             try:
-                return self._connection(profile.directory).has_active_leases()
+                bound = profile.client_id is not None and not profile.retiring
+                return self._connection(profile.directory).has_active_leases(
+                    expected_client=profile.client_id if bound else None,
+                    require_existing=bound,
+                )
             except ConnectionError as error:
                 raise _mapped_connection_error(error) from None
 
@@ -335,7 +347,10 @@ class ProfileBackend:
             placement = physical_hosts.get(profile.directory)
             try:
                 if (label is None and profile.client_id is not None and not profile.selected
-                        and connection.status() == "connected" and not connection.has_active_leases()):
+                        and connection.status() == "connected"
+                        and not connection.has_active_leases(
+                            expected_client=profile.client_id, require_existing=True,
+                        )):
                     return False
                 retirement = connection.begin_disconnect(physical_host=placement)
             except ConnectionError as error:

@@ -4317,6 +4317,188 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
                 self.assertTrue(settled_p.exists())
             _clear_markers()
 
+    def test_r8_bound_profile_missing_state_or_dir_refuses_switch_while_first_use_works(self):
+        # Regression (R7 P2 #1): genuine first-use absence must still allow clean connect/idle,
+        # whereas losing state.json, the connection directory, or client binding for a previously
+        # published profile MUST report active leases / managed_retirement_incomplete and block switch.
+        import pwd
+        from oc_openai.cli import Reason, RouteUnavailable
+        from oc_openai.connection import Connection
+        from oc_openai.connection_state import ConnectionError as ConnError
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with tempfile.TemporaryDirectory(prefix="oc-r8-bound-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+
+            # Genuine first-use absence still returns False / switchable.
+            self.assertFalse(Connection(home_scratch / "brand_new_dir").has_active_leases())
+            Connection(home_scratch / "brand_new_dir").require_switchable()
+            empty_dir = home_scratch / "empty_first_dir"
+            empty_dir.mkdir(mode=0o700)
+            self.assertFalse(Connection(empty_dir).has_active_leases())
+            Connection(empty_dir).require_switchable()
+
+            # Build two published profiles ("personal" and "work") via the real ProfileBackend.
+            from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
+            from oc_openai.connection_job import PhysicalHost
+            from oc_openai.profile_backend import ProfileBackend
+
+            host = PhysicalHost("a" * 64, "11111111-2222-3333-4444-555555555555")
+            for scenario in ("missing_state_json", "missing_conn_dir", "mismatched_client"):
+                with self.subTest(scenario=scenario):
+                    state_root = home_scratch / f"profiles_{scenario}"
+                    state_root.mkdir(mode=0o700)
+                    transport = FixtureTransport()
+                    browser_counter = [0]
+
+                    def _make_conn(directory):
+                        browser_counter[0] += 1
+                        fb = FixtureBrowser()
+                        fb.client = f"oaiapp_r8_{browser_counter[0]}"
+                        return Connection(
+                            directory,
+                            transport=transport,
+                            verifier=FixtureVerifier(),
+                            browser=fb,
+                            host_probe=lambda: host,
+                        )
+
+                    backend = ProfileBackend(state_root, connection=_make_conn)
+                    backend.connect("personal")
+                    backend.connect("work")
+                    backend.select("personal")
+                    view = backend.profiles.snapshot()
+                    personal_prof = next(p for p in view.saved if p.label == "personal")
+                    self.assertIsNotNone(personal_prof.client_id)
+                    personal_dir = personal_prof.directory
+
+                    # Acquire a synthetic lease on personal so the grant is active.
+                    job = self._make_probe_job()
+                    job.activate()
+                    _, conn, binding = backend.profile_connection("personal")
+                    lease_cm = conn.session_lease(binding, job)
+                    lease_cm.__enter__()
+
+                    if scenario == "missing_state_json":
+                        (personal_dir / "state.json").unlink()
+                        self.assertTrue((personal_dir / "state.lock").exists())
+                    elif scenario == "missing_conn_dir":
+                        shutil.rmtree(personal_dir)
+                        self.assertFalse(personal_dir.exists())
+                    else:
+                        rec = json.loads((personal_dir / "state.json").read_text(encoding="utf-8"))
+                        rec.pop("worker_leases", None)
+                        rec["client"] = "oaiapp_wrongclient"
+                        (personal_dir / "state.json").write_text(json.dumps(rec), encoding="utf-8")
+
+                    bound_conn = Connection(
+                        personal_dir, host_probe=lambda: host, expected_client=personal_prof.client_id,
+                    )
+                    self.assertTrue(bound_conn.has_active_leases())
+                    with self.assertRaises(ConnError) as req_err:
+                        bound_conn.require_switchable()
+                    self.assertEqual(req_err.exception.code, "managed_retirement_incomplete")
+
+                    unbound_conn = Connection(personal_dir, host_probe=lambda: host)
+                    self.assertTrue(
+                        unbound_conn.has_active_leases(expected_client=personal_prof.client_id)
+                    )
+                    with self.assertRaises(ConnError) as kw_err:
+                        unbound_conn.require_switchable(expected_client=personal_prof.client_id)
+                    self.assertEqual(kw_err.exception.code, "managed_retirement_incomplete")
+
+                    with self.assertRaises(RouteUnavailable) as sw_err:
+                        backend.select("work")
+                    self.assertIs(sw_err.exception.reason, Reason.MANAGED_RETIREMENT)
+                    job.revoke()
+
+    def test_r8_coordinated_absent_outcome_with_unsettled_hold_stays_unconfirmed(self):
+        # Regression (R7 P2 #2): on the coordinated path, an absent worker_leases entry while an
+        # unsettled .lease-hold-* exists on disk (either BEFORE session_lease.__exit__ OR planted
+        # AFTER exit recorded "absent" and BEFORE _finalize_slot_hold) MUST stay unconfirmed,
+        # publish NO .lease-settled-* receipt, retain slot_root, and keep fresh readers blocked.
+        import pwd
+        from oc_openai import connection_state as cs_mod
+        from oc_openai.connection import Connection
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        for timing in ("hold_before_exit", "hold_after_absent_before_finalize", "clean_absent_no_hold"):
+            with self.subTest(timing=timing):
+                with tempfile.TemporaryDirectory(prefix=f"oc-r8-abs-{timing}-", dir=home) as home_raw:
+                    home_scratch = Path(home_raw)
+                    os.chmod(home_scratch, 0o700)
+                    _, adapter, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                        home_scratch / "profiles",
+                    )
+                    slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+                    self.addCleanup(lambda sr=slot_root: shutil.rmtree(sr, ignore_errors=True))
+                    coord = _SessionSlotCoordinator(threading.Event())
+                    slot_cm = adapter.open_slot(
+                        pref, slot_index=0, slot_root=slot_root, port=8401,
+                        worker_token="tok-r8abs-" + "a" * 24,
+                        acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+                    )
+                    handle = slot_cm.__enter__()
+                    coord.register_slot(slot_cm, handle, slot_root, allow_legacy=True)
+                    coord.record_container("7" * 64, slot_index=0)
+                    handle.job.activate()
+
+                    # Remove worker_leases[root] from state.json so exit observes root_absent.
+                    st_path = personal_dir / "state.json"
+                    rec = json.loads(st_path.read_text(encoding="utf-8"))
+                    rec.pop("worker_leases", None)
+                    st_path.write_text(json.dumps(rec), encoding="utf-8")
+
+                    def _plant_unsettled_hold() -> Path:
+                        hid = "ef" * 16
+                        hp = personal_dir / f".lease-hold-{hid}"
+                        payload = json.dumps({
+                            "version": 1, "state": "hold", "hold_id": hid,
+                            "root": handle.job.root.name, "incarnation": handle.job.incarnation,
+                        }).encode("utf-8") + b"\n"
+                        fd = os.open(hp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        try:
+                            os.write(fd, payload)
+                        finally:
+                            os.close(fd)
+                        return hp
+
+                    if timing == "hold_before_exit":
+                        _plant_unsettled_hold()
+                        with patch.object(session_broker, "_remove_container_verified"):
+                            err = coord.teardown_all(None)
+                    elif timing == "hold_after_absent_before_finalize":
+                        with patch.object(session_broker, "_remove_container_verified"):
+                            coord.on_revoke(0)
+                            for t in list(coord._retire_threads):
+                                t.join(timeout=3.0)
+                        _plant_unsettled_hold()
+                        with patch.object(session_broker, "_remove_container_verified"):
+                            err = coord.teardown_all(None)
+                    else:
+                        with patch.object(session_broker, "_remove_container_verified"):
+                            err = coord.teardown_all(None)
+
+                    settled_files = [
+                        p.name for p in personal_dir.iterdir() if p.name.startswith(".lease-settled-")
+                    ]
+                    self.assertEqual(settled_files, [])
+
+                    if timing == "clean_absent_no_hold":
+                        self.assertIsNone(err)
+                        self.assertTrue(coord._slots[0].lease_confirmed_released)
+                        self.assertTrue(handle.lease_release_confirmed())
+                        fresh = Connection(personal_dir, host_probe=lambda: host)
+                        self.assertFalse(fresh.has_active_leases())
+                    else:
+                        self.assertIsNotNone(err)
+                        self.assertFalse(coord._slots[0].lease_confirmed_released)
+                        self.assertFalse(handle.lease_release_confirmed())
+                        coord.remove_slot_roots(require_confirmed_leases=True)
+                        self.assertTrue(slot_root.exists())
+                        self._assert_fresh_reader_blocked(personal_dir, host, pref.handle.binding)
+
     def test_proof_gate_evidence_and_dir_sync_failure_fails_closed_with_zero_dispatch(self):
         # Regression (R4 P2 #2): evidence write failure OR post-write _fsync_dir failure during
         # ProofGate.arm() or ProofGate.mark_relay_verified() MUST fail permanently closed across

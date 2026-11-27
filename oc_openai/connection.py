@@ -331,13 +331,14 @@ def _parse_tokens(value, now):
 
 class Connection:
     def __init__(self, state_dir: Path, *, transport=None, verifier=None, browser=None, clock=None,
-                 host_probe=None):
+                 host_probe=None, expected_client: str | None = None):
         self._store = Store(Path(state_dir))
         self._transport = transport if transport is not None else OpenAITransport()
         self._verifier = verifier if verifier is not None else IDTokenVerifier()
         self._browser = browser if browser is not None else _open_host_browser
         self._clock = clock if clock is not None else time.time
         self._host_probe = host_probe if host_probe is not None else PhysicalHost.observe
+        self._expected_client = expected_client
         self._running = {}
         self._running_lock = threading.Lock()
 
@@ -426,18 +427,27 @@ class Connection:
             roots.update(k for k in leases if type(k) is str)
         return frozenset(roots)
 
-    def has_active_leases(self):
-        with self._store.locked() as directory:
-            record = self._store.read(directory)
-            return bool(
-                record.get("worker_lease") is not None
-                or record.get("worker_leases")
-                or record.get("worker_retiring") is True
-                or self._store.has_lease_holds(directory, self._active_lease_roots(record))
-            )
+    def has_active_leases(self, *, expected_client: str | None = None, require_existing: bool = False):
+        effective_client = self._expected_client if expected_client is None else expected_client
+        bound = require_existing or effective_client is not None
+        try:
+            with self._store.locked(require_existing=bound) as directory:
+                record = self._store.read(directory, require_existing=bound)
+                if effective_client is not None and record.get("client") != effective_client:
+                    return True
+                return bool(
+                    record.get("worker_lease") is not None
+                    or record.get("worker_leases")
+                    or record.get("worker_retiring") is True
+                    or self._store.has_lease_holds(directory, self._active_lease_roots(record))
+                )
+        except ConnectionError as error:
+            if bound and error.code == "managed_retirement_incomplete":
+                return True
+            raise
 
-    def require_switchable(self):
-        if self.has_active_leases():
+    def require_switchable(self, *, expected_client: str | None = None, require_existing: bool = False):
+        if self.has_active_leases(expected_client=expected_client, require_existing=require_existing):
             raise ConnectionError("managed_retirement_incomplete")
 
     @contextlib.contextmanager
@@ -467,7 +477,7 @@ class Connection:
     @staticmethod
     def _registration_matches_or_empty(record, binding) -> bool:
         if not record:
-            return True
+            return binding.client is None
         same_identity = (
             record.get("profile") == binding.profile
             and (binding.client is None or record.get("client") == binding.client)
@@ -535,14 +545,37 @@ class Connection:
             )
         root_absent = leases is None or (isinstance(leases, dict) and lease.root not in leases)
         if root_absent and self._registration_matches_or_empty(record, binding):
+            if self._store.has_lease_holds(directory, self._active_lease_roots(record)):
+                return "retained_unsettled_hold", None
             return "absent", None
         return "retained_conflict", None
 
     def _settle_session_hold(
         self, token: LeaseHoldToken, *, before_publish: Callable[[], bool] | None = None,
     ) -> bool:
-        with self._store.locked() as directory:
+        with self._store.locked(require_existing=True) as directory:
             return self._store.settle_lease_hold(token, directory=directory, before_publish=before_publish)
+
+    def _verify_absent_session_release(
+        self, binding, root_name: str, *, before_publish: Callable[[], bool] | None = None,
+    ) -> bool:
+        bound = binding.client is not None
+        with self._store.locked(require_existing=bound) as directory:
+            if directory is None:
+                return False
+            record = self._store.read(directory, require_existing=bound)
+            single = record.get("worker_lease")
+            leases = record.get("worker_leases")
+            if (
+                (isinstance(single, dict) and single.get("root") == root_name)
+                or (isinstance(leases, dict) and root_name in leases)
+                or not self._registration_matches_or_empty(record, binding)
+                or self._store.has_lease_holds(directory, self._active_lease_roots(record))
+            ):
+                return False
+            if before_publish is not None and before_publish() is not True:
+                return False
+            return True
 
     def _finalize_standalone_hold(self, directory, hold_token: LeaseHoldToken, release_gate) -> bool:
         before_pub = self._standalone_settlement_authorizer(release_gate)
@@ -591,7 +624,7 @@ class Connection:
                 lambda before_publish=None: (
                     self._settle_session_hold(hold_box[0], before_publish=before_publish)
                     if hold_box[0] is not None
-                    else False
+                    else self._verify_absent_session_release(binding, lease.root, before_publish=before_publish)
                 )
             )
         try:

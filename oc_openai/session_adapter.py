@@ -121,12 +121,13 @@ class _SlotReleaseGate:
         with self._lock:
             self._outcome = outcome
 
-    def claim_settlement_publish(self, *, require_outcome: bool = True) -> bool:
+    def claim_settlement_publish(self, *, require_outcome: bool = True, allow_absent: bool = False) -> bool:
         """Strict leaf lock: atomically claim one-shot publication authority (zero I/O, no callbacks)."""
         with self._lock:
             if self._release_denied or self._publish_claimed:
                 return False
-            if require_outcome and self._outcome != "removed":
+            allowed_outcomes = ("removed", "absent") if allow_absent else ("removed",)
+            if require_outcome and self._outcome not in allowed_outcomes:
                 return False
             if self._relay_created and not (self._relay_removed and self._release_authorized):
                 return False
@@ -136,20 +137,23 @@ class _SlotReleaseGate:
     def finalize_durable_release(
         self, *, authorizer: Callable[[Callable[[], bool]], bool] | None = None,
     ) -> bool:
-        """Publish durable settlement receipt ONLY after coordinator/gate authorization."""
+        """Settle durable hold or verify clean absent release under coordinator/gate authorization."""
         with self._lock:
             if self._hold_cleared:
                 return True
             if self._release_denied or self._outcome not in ("removed", "absent"):
                 return False
-            if self._outcome == "absent":
-                self._hold_cleared = True
-                return True
+            is_absent = self._outcome == "absent"
             settler = self._hold_settler
-        before_publish = (
-            (lambda: authorizer(self.claim_settlement_publish) is True)
-            if authorizer is not None
+        leaf_claim = (
+            (lambda: self.claim_settlement_publish(allow_absent=True))
+            if is_absent
             else self.claim_settlement_publish
+        )
+        before_publish = (
+            (lambda: authorizer(leaf_claim) is True)
+            if authorizer is not None
+            else leaf_claim
         )
         if settler is not None:
             if settler(before_publish=before_publish) is not True:

@@ -387,12 +387,14 @@ class Store:
             raise ConnectionError("connection_storage_unavailable") from None
 
     @contextlib.contextmanager
-    def locked(self, *, create=False):
+    def locked(self, *, create=False, require_existing=False):
         try:
             directory = _directory(self.path, create=create)
         except FileNotFoundError:
             if create:
                 raise ConnectionError("connection_storage_unavailable") from None
+            if require_existing:
+                raise ConnectionError("managed_retirement_incomplete") from None
             yield None
             return
         except OSError:
@@ -405,10 +407,12 @@ class Store:
                 mutex = os.open("state.lock", flags, 0o600, dir_fd=directory)
             except FileNotFoundError:
                 # An absent lock is an empty state only if no snapshot or hold marker exists.
-                if not _has_lockless_state_or_markers(directory):
-                    yield None
-                    return
-                raise ConnectionError("untrusted_connection_file") from None
+                if _has_lockless_state_or_markers(directory):
+                    raise ConnectionError("untrusted_connection_file") from None
+                if require_existing:
+                    raise ConnectionError("managed_retirement_incomplete") from None
+                yield None
+                return
             try:
                 _regular(mutex)
                 _lock(mutex)
@@ -420,13 +424,17 @@ class Store:
         finally:
             os.close(directory)
 
-    def read(self, directory):
+    def read(self, directory, *, require_existing=False):
         if directory is None:
+            if require_existing:
+                raise ConnectionError("managed_retirement_incomplete")
             return {}
         try:
             fd = os.open(_STATE_FILE, os.O_RDONLY | os.O_NONBLOCK | CREATE_FLAGS,
                          dir_fd=directory)
         except FileNotFoundError:
+            if require_existing:
+                raise ConnectionError("managed_retirement_incomplete") from None
             return {}
         with os.fdopen(fd, "rb") as stream:
             _regular(stream.fileno())

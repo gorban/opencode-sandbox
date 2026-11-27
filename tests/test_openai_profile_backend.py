@@ -17,6 +17,7 @@ from unittest.mock import patch
 from oc_openai.acceptance import run_attended
 from oc_openai import cli
 from oc_openai.connection import Connection, ConnectionError
+from oc_openai.connection_state import Store
 from oc_openai.profile_backend import ProfileBackend
 from oc_openai.profiles import ProfileError
 from test_openai_connection import FixtureBrowser, FixtureTransport, FixtureVerifier
@@ -226,9 +227,12 @@ class ProfileBackendTests(unittest.TestCase):
                 state = self.state / f"claims-{int(disconnect)}-{int(possible_exchange)}"
                 backend = ProfileBackend(state, connection=self.connection, reviewed=True)
                 for index in range(15):
+                    client_id = f"oaiapp_fixture_{index}"
                     saved = backend.profiles.begin(f"saved-{index}")
-                    with backend.profiles.publish(saved, f"oaiapp_fixture_{index}"):
-                        pass
+                    with backend.profiles.publish(saved, client_id):
+                        store = Store(saved.profile.directory)
+                        with store.locked(create=True) as directory:
+                            store.write(directory, {"client": client_id})
                 process = subprocess.Popen(
                     [sys.executable, "-B", "-c", """
 from pathlib import Path
@@ -283,9 +287,12 @@ with profiles.connect_candidate("crashed") as candidate:
     def test_acknowledged_callback_survives_crash_before_exchange_and_preserves_slot(self):
         backend = self.backend()
         for index in range(15):
+            client_id = f"oaiapp_fixture_{index}"
             saved = backend.profiles.begin(f"saved-{index}")
-            with backend.profiles.publish(saved, f"oaiapp_fixture_{index}"):
-                pass
+            with backend.profiles.publish(saved, client_id):
+                store = Store(saved.profile.directory)
+                with store.locked(create=True) as directory:
+                    store.write(directory, {"client": client_id})
         tests = Path(__file__).resolve().parent
         result = subprocess.run([sys.executable, "-B", "-c", """
 import contextlib
