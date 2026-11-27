@@ -142,40 +142,69 @@ host chrome.
       screen readers are not flooded. Give the operator a "pause announcements" control.
 - [ ] Run an automated and manual WCAG 2.2 AA audit on each finalist design and on the
       implemented build. Record the report and fixes here.
+      - Finalist: done. Two full audits found 7 failures, all fixed, then a full audit of
+        `763cbac` passed, with 0 failures and 2.2.1 needing review. A scoped re-audit of
+        `f1902bc` also passed. The selected `26d81cf` only realigns the fleet footer, and the
+        operator waived its re-audit. Findings and follow-ups are in the
+        [reference design](spikes/m/dashboard-design/README.md). Open: confirm 2.2.1 (backend time
+        limits), and audit the implemented build.
 
 ## Design system deliverables
 
-- [ ] `tokens.css`: colour roles (including reserved Trusted Chrome roles), type scale
+- [x] `tokens.css`: colour roles (including reserved Trusted Chrome roles), type scale
       (ratio 1.125–1.2), spacing, radius, elevation, focus ring and motion durations, with
       light and dark values. Every colour and font in components goes through a token.
+      `claude/m3a-design-selection`: `out/tokens.css` in the
+      [reference design](spikes/m/dashboard-design/README.md), with a 1.125 type scale.
 - [ ] Component inventory mapping each dashboard component to its UI SDK primitive or our own
       primitive ([prd_m3a2](prd_m3a2.md)), with states and keyboard behaviour.
-- [ ] Static prototypes of the screens in scope, using synthetic fixtures, viewable through
-      the same CSP as production.
+- [x] Static prototypes of the screens in scope, using synthetic fixtures, viewable through
+      the same CSP as production. `claude/m3a-design-selection`:
+      [reference design](spikes/m/dashboard-design/README.md) `out/`.
 - [ ] A states sheet, a hostile-content sheet, and the WCAG 2.2 AA report.
-- [ ] A locked `DESIGN.md` describing the chosen system and the reasons for it, which
+      - The states sheet (`out/states.html`) and the audit findings (`audit/`) are in the
+        [reference design](spikes/m/dashboard-design/README.md). There's no separate hostile-content
+        sheet: hostile fixture strings run through every screen instead.
+- [x] A locked `DESIGN.md` describing the chosen system and the reasons for it, which
       implementation agents read before building M3a views.
+      `claude/m3a-design-selection`: [`DESIGN.md`](spikes/m/dashboard-design/DESIGN.md).
 
 ## Design selection process
 
-- [ ] Produce at least three independent design attempts. Isolate their context: each
+Run with [design-starter-kit](https://github.com/gorban/design-starter-kit) (task
+`oc-dashboard`). The result and its provenance are in the
+[reference design](spikes/m/dashboard-design/README.md).
+
+- [x] Produce at least three independent design attempts. Isolate their context: each
       attempt gets the same brief and fixtures, but its own design skill, and no access to
       other attempts, prior rounds' rationale or this repository's other agents' notes.
-- [ ] Review the attempts blind (neutral labels, shuffled order, authoring metadata
+      `claude/m3a-design-selection`: four attempts.
+- [x] Review the attempts blind (neutral labels, shuffled order, authoring metadata
       stripped) by a cross-provider council (OpenAI, Google and Anthropic models). Each
       reviewer scores the same rubric, names the best facet of each attempt, and does not
       vote for an attempt produced by its own model. Aggregate with Borda count.
+      `claude/m3a-design-selection`: two blinded rounds.
 - [ ] Share only synthetic fixtures with external design providers, including in prompts
       and screenshots. Strip workstation paths, account and host names, and real repo
       or sandbox identifiers before sharing any artifact.
-- [ ] Give the operator a review point every round: rubric scores, per-facet
+      - Partly met. The fixtures were synthetic and contained no workstation paths, but they
+        kept this repository's name as a project label. The ownership note the operator
+        requested names this repository's GitHub address and the owner.
+- [x] Give the operator a review point every round: rubric scores, per-facet
       keep / kill / merge tags and element-level comments. Record the reasons for every kill
-      as constraints for the next round.
+      as constraints for the next round. `claude/m3a-design-selection`.
 - [ ] Hill-climb: the next round builds on the winner and merges named facets from others.
       Re-judge the new version against the previous winner in both orders. Stop when the
       challenger stops winning or after the round cap (about three divergent and two
       convergent rounds).
-- [ ] Record each round's slate, scores, decisions and the selected commit or artifact here.
+      - Partly met. After two blinded rounds the operator chose the champion. Polish passes
+        followed, driven by operator fix lists and audit findings. There was no pairwise
+        re-judge in both orders.
+- [x] Record each round's slate, scores, decisions and the selected commit or artifact here.
+      `claude/m3a-design-selection`: the selected artifact is attempt `a1-hallmark` at
+      `26d81cf58435e6660023b993c7f45891ebdc1bb3`, tagged `design-final` in the design lab.
+      The per-round detail stays in the lab. The
+      [reference design](spikes/m/dashboard-design/README.md) summarises it.
 - [ ] Before locking `DESIGN.md`, run the finalist against a synthetic local/remote fleet
       with simulated actions only. Start the triage clock when the operator opens the
       authenticated dashboard. Require identification of the seeded attention items and
@@ -185,16 +214,22 @@ host chrome.
       have the same name. Verify zero wrong-tier or wrong-target simulated effects. Record
       observed outcomes, the fixture revision, and the operator's explicit selection of
       the exact passing finalist artifact.
+      - The operator reported a pass on 2026-11-26 for `26d81cf`, with fixture
+        `brief/fixtures/workspace.json` (sha256 `6a191ce7a8d1fcb1…`). The observed outcomes
+        (load time, triage time, items found, tiers, routing, wrong-target count) aren't
+        recorded yet. Tick this once they're added.
 
 ## Open decisions
 
-- [ ] (decision needed) **Fonts.**
+- [x] **Fonts.** Decided: the system font stack, as the selected design uses.
+  `claude/m3a-design-selection`.
   - **System font stack (recommended).** No CSP change, no font payload, native rendering in
     WebKitGTK and Chromium. Less distinctive, and metrics vary slightly by OS. ~0 days.
   - **Bundled self-hosted fonts** (for example, a grotesque plus a hyperlegible mono for
     values). More consistent and polished. Needs `font-src 'self'` added to the reviewed CSP,
     licence checks and pinned assets, and adds payload. ~0.5–1 day plus a security review.
-- [ ] (decision needed) **Styling approach.**
+- [x] **Styling approach.** Decided: plain CSS custom-property tokens with Svelte scoped
+  styles, as the selected design uses. `claude/m3a-design-selection`.
   - **Plain CSS custom-property tokens with Svelte scoped styles (recommended).** Matches the
     current spike and the `style-src 'self'` CSP, adds no dependency, and design skills emit it
     directly. More hand-written CSS. ~0 days.
@@ -202,13 +237,16 @@ host chrome.
     supply-chain review, and some design skills lint against its patterns. ~1 day.
   - **UI SDK `web.css` base with token overrides.** Consistent with headless primitives. Ties
     the visual layer to a beta package. ~0.5 day, depends on [prd_m3a2](prd_m3a2.md).
-- [ ] (decision needed) **Themes.**
+- [x] **Themes.** Decided: light and dark, following the system, with a manual override held
+  in memory, as the selected design uses. `claude/m3a-design-selection`.
   - **Light and dark, following the system with a manual override (recommended).** Keep the
     override in memory or in a non-secret host preference. Avoid SDK inline preference scripts
     and persistent browser session state. Works for
     long sessions and accessibility. Every token and contrast check runs twice. ~1–2 days extra.
   - **Dark only at first.** Faster. Fails some users and daylight use. ~0 days.
-- [ ] (decision needed) **Density.**
+- [x] **Density.** Decided: the compact and comfortable toggle, as the selected design uses
+  (its "Comfortable" control scales the root size to 112.5%). This is the non-recommended
+  option, chosen by the operator. `claude/m3a-design-selection`.
   - **One compact-but-comfortable density with 32–40 px controls (recommended).** Simpler to
     test and keeps 2.5.8 margins. Power users may want tighter tables. ~0 days.
   - **Compact and comfortable toggle.** More flexible. Doubles visual QA. ~1–2 days.

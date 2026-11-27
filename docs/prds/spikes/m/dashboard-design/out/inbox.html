@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Human Inbox, oc-sandbox</title>
+<meta name="description" content="Human Inbox screen of the oc-sandbox operator dashboard prototype.">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body class="app has-drawer">
+<a class="skip" href="#main">Skip to main content</a>
+<header class="chrome" data-trusted aria-label="Workspace header">
+  <div class="hdr">
+    <span class="tipwrap"><button type="button" class="btn btn--sm btn--ghost btn--icon hdr__menu" id="nav-toggle" aria-label="Workspace menu" aria-controls="sidebar" aria-expanded="false" aria-describedby="tip-menu"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 4.500h11M2.5 8h11M2.5 11.500h11"/></svg></button><span class="tip" role="tooltip" id="tip-menu">Open the workspace tree and page links.</span></span>
+    <a class="brand" href="fleet.html"><svg class="i brand__mark" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 1.8l5.4 3v6.4L8 14.2l-5.4-3V4.8z"/><path d="M2.6 4.8L8 7.8l5.4-3M8 7.8v6.4"/></svg><span class="brand__name">oc-sandbox</span></a>
+    <div class="hdr__tiers">
+      <span class="tipwrap"><a class="tier tier--a" href="approvals.html" data-agent-hidden aria-describedby="tip-tier-a"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3.5" y="7.5" width="9" height="6" rx="1"/><path d="M5.5 7.5V5.5a2.5 2.5 0 0 1 5 0v2"/></svg><span class="tier__name">Approval Inbox</span><span class="tier__count num" data-count data-n="2" data-apr="apr-7f3c@2 apr-a91d@1">2</span><span class="vh"> blocking</span></a><span class="tip" role="tooltip" id="tip-tier-a">Tier A. Blocking security approvals. Only you can decide them.</span></span>
+      <span class="tipwrap"><a class="tier tier--b" href="inbox.html" data-agent-hidden aria-describedby="tip-tier-b"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 9.500l1.6-5.500h7.800l1.6 5.500v3h-11z"/><path d="M2.5 9.500h3.200l.8 1.500h3l.8-1.500h3.2"/></svg><span class="tier__name">Human Inbox</span><span class="tier__count num">3</span><span class="vh"> open</span></a><span class="tip" role="tooltip" id="tip-tier-b">Tier B. Decisions that wait for you without blocking an agent.</span></span>
+    </div>
+    <div class="hdr__tools" role="group" aria-label="Agent bridge and display">
+      <div class="bridge" id="bridge" role="group" aria-label="Agent bridge" data-bridge="off">
+        <span class="tipwrap"><button type="button" class="btn btn--sm bridge__toggle" id="bridge-toggle" aria-pressed="false" aria-describedby="tip-bridge" data-agent-hidden><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 11.500h13M4 11.500V6.500M12 11.500V6.500M4 6.500c1.5 2.2 6.5 2.2 8 0M1.5 4.500c1.2.6 2 1.2 2.5 2M14.5 4.500c-1.2.6-2 1.2-2.5 2"/></svg><span class="bridge__name">Bridge</span><span class="bridge__val" id="bridge-val">Off</span></button><span class="tip" role="tooltip" id="tip-bridge">Agent bridge. Off by default. While it is on, the root orchestrator may press the controls it can see in this tab. Protected controls still stop for your confirmation.</span></span>
+        <span class="tipwrap"><button type="button" class="btn btn--sm btn--ghost" id="bridge-pause" aria-pressed="false" aria-disabled="true" aria-describedby="tip-pause"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5.5 3.500v9M10.5 3.500v9"/></svg><span class="hdr__t" id="bridge-pause-t">Pause</span></button><span class="tip" role="tooltip" id="tip-pause">Pause holds every agent request until you resume, and cancels one that is waiting. Works while the bridge is on.</span></span>
+        <span class="vh" id="bridge-state" role="status">Agent bridge off</span>
+      </div>
+      <span class="tipwrap"><button type="button" class="btn btn--sm btn--ghost" id="density-toggle" aria-pressed="false" aria-describedby="tip-density"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.6 12.4l3-8 3 8M2.7 10h3.8M9.2 12.4l2.4-6 2.4 6M10 10.4h3.2"/></svg><span class="hdr__t">Comfortable</span></button><span class="tip" role="tooltip" id="tip-density">Comfortable sizing: larger type, spacing and targets. Lasts until you leave this page.</span></span>
+      <span class="tipwrap tipwrap--end"><button type="button" class="btn btn--sm btn--ghost btn--icon" id="theme-toggle" aria-label="Switch theme" aria-describedby="tip-theme"><svg class="i i--sun" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="2.8"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1"/></svg><svg class="i i--moon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M13 9.6A5.6 5.6 0 1 1 6.4 3 4.4 4.4 0 0 0 13 9.6z"/></svg></button><span class="tip" role="tooltip" id="tip-theme">Switch between the light and dark theme. The choice lasts until you leave this page.</span></span>
+    </div>
+  </div>
+  <div class="ribbon" role="group" aria-label="Health, Tier C. Clears on its own">
+    <span class="ribbon__label"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 8.500h3l1.5-4 3 7.5 1.7-3.500h3.8"/></svg>Health</span>
+    <ul class="ribbon__list">
+      <li class="pill pill--warning"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.500l6 10.500H2z"/><path d="M8 6.500v3M8 11.200h.01"/></svg><span class="vh">Warning: </span><bdi>claude-max 5h quota 88%</bdi></li>
+      <li class="pill pill--info"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.500v3.200M8 5.300h.01"/></svg><span class="vh">Info: </span><bdi>review-auth auto-nudged 1/2</bdi></li>
+      <li class="pill pill--warning"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.500l6 10.500H2z"/><path d="M8 6.500v3M8 11.200h.01"/></svg><span class="vh">Warning: </span><bdi>gpu-box reconnecting</bdi></li>
+    </ul>
+  </div>
+</header>
+<div class="stage">
+<nav class="side" id="sidebar" aria-label="Workspace">
+  <a class="side__link" href="fleet.html" aria-current="page"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2.5" y="2.5" width="11" height="11" rx="1"/><path d="M2.5 6.500h11M2.5 10h11M6.5 6.500v7"/></svg><span>Fleet overview</span></a>
+  <div class="side__scroll">
+    <ul role="tree" class="tree" aria-label="Orchestrator, projects and sandboxes">
+      <li role="none"><div role="treeitem" class="tree__row tree__row--root"><span class="tree__twist"></span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="2"/><path d="M8 2v4M8 10v4M2 8h4M10 8h4"/></svg><span class="tree__body"><span class="tree__name">Root Orchestrator</span><span class="tree__meta"><span class="wk">pinned</span><span class="st st--ok"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 3.500l7 4.5-7 4.500z"/></svg><span>Running</span></span></span></span></div></li>
+      <li role="none"><div role="treeitem" class="tree__row tree__row--proj" aria-expanded="true"><span class="tree__twist"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 6L8 10.5 12.5 6"/></svg></span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 4h4l1.4 1.6H14v6.9H2z"/></svg><span class="tree__body"><span class="tree__name"><bdi>oc-sandbox</bdi></span></span><span class="vh"> project</span><span class="attn attn--caution" data-n="3" data-apr="apr-7f3c@2"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4.5 2.500h7M4.5 13.500h7M5 2.500c0 3 6 3.5 6 5.500s-6 2.5-6 5.500M11 2.500c0 3-6 3.5-6 5.500s6 2.5 6 5.5"/></svg><span class="vh">Severity: stalled. </span><span class="num" data-attn-n>3</span><span class="vh" data-attn-w> need you</span></span></div>
+        <ul role="group"><li role="none"><a role="treeitem" class="tree__row tree__row--sb" aria-expanded="true" data-fold href="thread.html"><span class="tree__twist"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 6L8 10.5 12.5 6"/></svg></span><span class="tree__body"><span class="tree__name"><bdi>feat-dashboard</bdi></span><span class="tree__meta"><span class="wk wk--local"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg><bdi>local</bdi></span><span class="st st--ok"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 3.500l7 4.5-7 4.500z"/></svg><span>Running</span></span></span></span><span class="attn attn--note" data-n="1" data-apr=""><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 3.500h11v7h-6l-3 2.500v-2.500h-2z"/></svg><span class="vh">Unread work. </span><span class="num" data-attn-n>1</span><span class="vh" data-attn-w> needs you</span></span></a><ul role="group"><li role="none"><a role="treeitem" class="tree__row" aria-expanded="true" href="thread.html"><span class="tree__twist"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 6L8 10.5 12.5 6"/></svg></span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 3.500h11v7h-6l-3 2.500v-2.500h-2z"/></svg><span class="tree__body"><span class="tree__name"><bdi>#main</bdi></span></span><span class="vh"> in local / feat-dashboard</span><span class="attn attn--plain"><span class="attn__gap"></span><span class="num">4</span><span class="vh"> unread</span></span></a><ul role="group"><li role="none"><a role="treeitem" class="tree__row" href="thread.html"><span class="tree__twist"></span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 3.500h11v7h-6l-3 2.500v-2.500h-2z"/></svg><span class="tree__body"><span class="tree__name"><span class="vh">Sub-agent thread </span><bdi>task: write tests</bdi></span></span><span class="vh"> in local / feat-dashboard</span></a></li></ul></li><li role="none"><a role="treeitem" class="tree__row" href="thread.html"><span class="tree__twist"></span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 3.500h11v7h-6l-3 2.500v-2.500h-2z"/></svg><span class="tree__body"><span class="tree__name"><bdi>#review</bdi></span></span><span class="vh"> in local / feat-dashboard</span></a></li></ul></li><li role="none"><a role="treeitem" class="tree__row tree__row--sb" aria-expanded="true" data-fold href="thread-2.html"><span class="tree__twist"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 6L8 10.5 12.5 6"/></svg></span><span class="tree__body"><span class="tree__name"><bdi>review-auth</bdi></span><span class="tree__meta"><span class="wk wk--local"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg><bdi>local</bdi></span><span class="st st--caution"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4.5 2.500h7M4.5 13.500h7M5 2.500c0 3 6 3.5 6 5.500s-6 2.5-6 5.500M11 2.500c0 3-6 3.5-6 5.500s6 2.5 6 5.5"/></svg><span>Stalled</span></span></span></span><span class="attn attn--caution" data-n="2" data-apr="apr-7f3c@2"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4.5 2.500h7M4.5 13.500h7M5 2.500c0 3 6 3.5 6 5.500s-6 2.5-6 5.500M11 2.500c0 3-6 3.5-6 5.500s6 2.5 6 5.5"/></svg><span class="vh">Severity: stalled. </span><span class="num" data-attn-n>2</span><span class="vh" data-attn-w> need you</span></span></a><ul role="group"><li role="none"><a role="treeitem" class="tree__row" href="thread-2.html"><span class="tree__twist"></span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 3.500h11v7h-6l-3 2.500v-2.500h-2z"/></svg><span class="tree__body"><span class="tree__name"><bdi>#main</bdi></span></span><span class="vh"> in local / review-auth</span><span class="attn attn--plain"><span class="attn__gap"></span><span class="num">1</span><span class="vh"> unread</span></span></a></li></ul></li><li role="none"><a role="treeitem" class="tree__row tree__row--sb" aria-expanded="true" data-fold href="thread-3.html"><span class="tree__twist"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 6L8 10.5 12.5 6"/></svg></span><span class="tree__body"><span class="tree__name"><bdi>bench-runner</bdi></span><span class="tree__meta"><span class="wk wk--remote"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2.5" y="3" width="11" height="4" rx="1"/><rect x="2.5" y="9" width="11" height="4" rx="1"/><path d="M5 5h.01M5 11h.01"/></svg><bdi>gpu-box</bdi></span><span class="st st--caution"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M13 8a5 5 0 0 1-9 3M3 8a5 5 0 0 1 9-3"/><path d="M12.5 2.500V5H10M3.5 13.500V11H6"/></svg><span>Reconnecting</span></span></span></span></a><ul role="group"><li role="none"><a role="treeitem" class="tree__row" href="thread-3.html"><span class="tree__twist"></span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 3.500h11v7h-6l-3 2.500v-2.500h-2z"/></svg><span class="tree__body"><span class="tree__name"><bdi>#main</bdi></span></span><span class="vh"> in gpu-box / bench-runner</span></a></li></ul></li><li role="none"><a role="treeitem" class="tree__row tree__row--sb" aria-expanded="true" data-fold href="thread-4.html"><span class="tree__twist"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 6L8 10.5 12.5 6"/></svg></span><span class="tree__body"><span class="tree__name"><bdi>feat-dashboard</bdi></span><span class="tree__meta"><span class="wk wk--remote"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2.5" y="3" width="11" height="4" rx="1"/><rect x="2.5" y="9" width="11" height="4" rx="1"/><path d="M5 5h.01M5 11h.01"/></svg><bdi>build-host</bdi></span><span class="st st--ok"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 3.500l7 4.5-7 4.500z"/></svg><span>Running</span></span></span></span></a><ul role="group"><li role="none"><a role="treeitem" class="tree__row" href="thread-4.html"><span class="tree__twist"></span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 3.500h11v7h-6l-3 2.500v-2.500h-2z"/></svg><span class="tree__body"><span class="tree__name"><bdi>#main</bdi></span></span><span class="vh"> in build-host / feat-dashboard</span></a></li></ul></li></ul></li>
+      <li role="none"><div role="treeitem" class="tree__row tree__row--proj" aria-expanded="true"><span class="tree__twist"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 6L8 10.5 12.5 6"/></svg></span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 4h4l1.4 1.6H14v6.9H2z"/></svg><span class="tree__body"><span class="tree__name"><bdi>web-client</bdi></span></span><span class="vh"> project</span><span class="attn attn--bad" data-n="1" data-apr=""><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5.5 2.500h5l3 3v5l-3 3h-5l-3-3v-5z"/><path d="M6 6l4 4M10 6l-4 4"/></svg><span class="vh">Severity: error. </span><span class="num" data-attn-n>1</span><span class="vh" data-attn-w> needs you</span></span></div>
+        <ul role="group"><li role="none"><a role="treeitem" class="tree__row tree__row--sb" href="thread-5.html"><span class="tree__twist"></span><span class="tree__body"><span class="tree__name"><bdi>studio-polish</bdi></span><span class="tree__meta"><span class="wk wk--local"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg><bdi>local</bdi></span><span class="st st--quiet"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.5"/><path d="M5.5 8h5"/></svg><span>Idle</span></span></span></span></a></li><li role="none"><a role="treeitem" class="tree__row tree__row--sb" href="thread-6.html"><span class="tree__twist"></span><span class="tree__body"><span class="tree__name"><bdi>an-extremely-long-sandbox-name-that-keeps-going-to-test-truncation-and-wrapping</bdi></span><span class="tree__meta"><span class="wk wk--local"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg><bdi>local</bdi></span><span class="st st--bad"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5.5 2.500h5l3 3v5l-3 3h-5l-3-3v-5z"/><path d="M6 6l4 4M10 6l-4 4"/></svg><span>Error</span></span></span></span><span class="attn attn--bad" data-n="1" data-apr=""><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5.5 2.500h5l3 3v5l-3 3h-5l-3-3v-5z"/><path d="M6 6l4 4M10 6l-4 4"/></svg><span class="vh">Severity: error. </span><span class="num" data-attn-n>1</span><span class="vh" data-attn-w> needs you</span></span></a></li></ul></li>
+      <li role="none"><div role="treeitem" class="tree__row tree__row--proj" aria-expanded="true"><span class="tree__twist"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 6L8 10.5 12.5 6"/></svg></span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 4h4l1.4 1.6H14v6.9H2z"/></svg><span class="tree__body"><span class="tree__name"><bdi>Scratch / Ad-hoc</bdi></span></span><span class="vh"> project</span></div>
+        <ul role="group"><li role="none"><a role="treeitem" class="tree__row tree__row--sb" href="thread-7.html"><span class="tree__twist"></span><span class="tree__body"><span class="tree__name"><bdi>مختبر-تجريبي</bdi></span><span class="tree__meta"><span class="wk wk--local"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg><bdi>local</bdi></span><span class="st st--quiet"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.5"/><path d="M4.2 4.200l7.6 7.6"/></svg><span>Offline</span></span></span></span></a></li></ul></li>
+    </ul>
+  </div>
+  <div class="side__foot">
+    <ul class="pages" aria-label="Pages">
+      <li><a class="pages__link" href="fleet.html"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2.5" y="2.5" width="11" height="11" rx="1"/><path d="M2.5 6.500h11M2.5 10h11M6.5 6.500v7"/></svg><span>Fleet</span></a></li>
+      <li><a class="pages__link" href="thread.html"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 3.500h11v7h-6l-3 2.500v-2.500h-2z"/></svg><span>Thread</span></a></li>
+      <li><a class="pages__link" href="diff.html"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4 2.500h5l3 3v8H4z"/><path d="M6.5 8.500h3M8 7v3M6.5 12h3"/></svg><span>Diff</span></a></li>
+      <li><a class="pages__link" href="catalog.html"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.500l6 3-6 3-6-3z"/><path d="M2 9.500l6 3 6-3"/></svg><span>Workflows</span></a></li>
+      <li><a class="pages__link" href="confirm.html"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3.5" y="7.5" width="9" height="6" rx="1"/><path d="M5.5 7.5V5.5a2.5 2.5 0 0 1 5 0v2"/></svg><span>Confirm gate</span></a></li>
+      <li><a class="pages__link" href="states.html"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.500v3.200M8 5.300h.01"/></svg><span>States</span></a></li>
+    </ul>
+    <div class="profile">
+      <span class="tipwrap tipwrap--up tipwrap--block"><button type="button" class="profile__btn" id="profile-toggle" aria-haspopup="menu" aria-expanded="false" aria-controls="profile-menu" aria-describedby="tip-profile"><svg class="i profile__av" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="5.5" r="2.5"/><path d="M3 13.500c.6-2.6 2.6-4 5-4s4.4 1.4 5 4"/></svg><span class="profile__t"><span class="profile__name">Operator</span><span class="sub">Workspace session</span></span><svg class="i profile__chev" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 10L8 5.5 12.5 10"/></svg></button><span class="tip" role="tooltip" id="tip-profile">Session menu: sign in or sign out.</span></span>
+      <ul class="menu" id="profile-menu" role="menu" aria-label="Session" data-agent-hidden hidden>
+        <li role="none"><a role="menuitem" class="menu__item" href="signin.html" tabindex="-1"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M9.4 2.6H13v10.8H9.4M6.4 5l3 3-3 3M9.4 8H3"/></svg><span>Sign in</span></a></li>
+        <li role="none"><a role="menuitem" class="menu__item" href="signin.html" tabindex="-1"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6.5 2.500H3v11h3.500M9.5 5l3 3-3 3M12.5 8H6"/></svg><span>Sign out</span></a></li>
+      </ul>
+    </div>
+    <p class="owner"><span class="owner__line">Copyright © David Bruck</span><a class="owner__link" href="https://github.com/gorban/opencode-sandbox" target="_blank" rel="noopener noreferrer" data-agent-hidden>github.com/gorban/opencode-sandbox<span class="vh"> (opens in a new tab)</span></a></p>
+  </div>
+</nav>
+<div class="side-scrim" id="side-scrim" hidden></div>
+<main id="main" class="main" tabindex="-1" aria-labelledby="page-title">
+  <div class="pagehead">
+    <h1 id="page-title">Fleet overview</h1>
+    <ul class="sum" aria-label="Fleet summary">
+      <li><span class="num">3 of 7</span> sandboxes need you</li>
+      <li><span class="num" data-count data-n="4" data-apr="apr-7f3c@2">4</span> items waiting</li>
+      <li><span class="num">2</span> healthy</li>
+    </ul>
+    <p class="snap">Snapshot <svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3.200l2 1.3"/></svg><time class="num" datetime="2026-11-25T15:30:00-06:00">15:30 CST</time></p>
+  </div>
+
+  <div class="toolbar" role="group" aria-label="Filter sandboxes">
+    <div class="seg" role="group" aria-label="Show">
+      <button type="button" class="seg__btn" data-show="all" aria-pressed="true">All sandboxes<span class="seg__n num">7</span></button><button type="button" class="seg__btn" data-show="attention" aria-pressed="false">Needs attention<span class="seg__n num">3</span></button>
+    </div>
+    <div class="toolbar__end">
+      <div class="mselect" id="status-filter">
+        <button type="button" class="btn mselect__btn" id="status-btn" aria-expanded="false" aria-controls="status-menu"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.6 4h10.8M4.6 8h6.8M6.6 12h2.8"/></svg><span id="status-label">All statuses</span><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 6L8 10.5 12.5 6"/></svg></button>
+        <fieldset class="mselect__menu" id="status-menu" hidden>
+          <legend class="vh">Show only these statuses. None ticked shows all.</legend>
+          <label class="mcheck"><input type="checkbox" value="error" data-status-opt><span>Error</span></label>
+          <label class="mcheck"><input type="checkbox" value="stalled" data-status-opt><span>Stalled</span></label>
+          <label class="mcheck"><input type="checkbox" value="idle" data-status-opt><span>Idle</span></label>
+          <label class="mcheck"><input type="checkbox" value="reconnecting" data-status-opt><span>Reconnecting</span></label>
+          <label class="mcheck"><input type="checkbox" value="running" data-status-opt><span>Running</span></label>
+          <label class="mcheck"><input type="checkbox" value="offline" data-status-opt><span>Offline</span></label>
+        </fieldset>
+      </div>
+      <label class="vh" for="fleet-worker">Worker</label>
+      <select id="fleet-worker" class="select">
+        <option value="all">All workers</option>
+        <option value="local">Local</option>
+        <option value="remote">Remote hosts</option>
+      </select>
+    </div>
+  </div>
+  <div class="tablewrap">
+    <div class="sortpick"><label for="fleet-sort">Sort</label><select id="fleet-sort" class="select"><option value="attention:desc">Attention, most first</option><option value="attention:asc">Attention, fewest first</option><option value="status:asc">Status, most severe first</option><option value="status:desc">Status, least severe first</option><option value="name:asc">Sandbox, A to Z</option><option value="name:desc">Sandbox, Z to A</option><option value="changed:desc">Last change, newest first</option><option value="changed:asc">Last change, oldest first</option></select></div>
+    <table class="fleet" id="fleet-table">
+      <caption class="vh">All sandboxes, ranked by what needs you. Column headers sort.</caption>
+      <thead><tr>
+        <th scope="col" class="c-name" aria-sort="none"><button type="button" class="sort" data-sort="name"><span>Sandbox</span><svg class="i sort__i sort__i--none" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 13V3M2.8 5.2L5 3l2.2 2.2M11 3v10M8.8 10.8L11 13l2.2-2.2"/></svg><svg class="i sort__i sort__i--desc" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M4 9l4 4 4-4"/></svg><svg class="i sort__i sort__i--asc" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 13V3M4 7l4-4 4 4"/></svg></button></th>
+        <th scope="col" class="c-status" aria-sort="none"><button type="button" class="sort" data-sort="status"><span>Status</span><svg class="i sort__i sort__i--none" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 13V3M2.8 5.2L5 3l2.2 2.2M11 3v10M8.8 10.8L11 13l2.2-2.2"/></svg><svg class="i sort__i sort__i--desc" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M4 9l4 4 4-4"/></svg><svg class="i sort__i sort__i--asc" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 13V3M4 7l4-4 4 4"/></svg></button></th>
+        <th scope="col" class="c-attention" aria-sort="descending"><button type="button" class="sort" data-sort="attention"><span>Attention</span><svg class="i sort__i sort__i--none" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 13V3M2.8 5.2L5 3l2.2 2.2M11 3v10M8.8 10.8L11 13l2.2-2.2"/></svg><svg class="i sort__i sort__i--desc" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M4 9l4 4 4-4"/></svg><svg class="i sort__i sort__i--asc" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 13V3M4 7l4-4 4 4"/></svg></button></th>
+        <th scope="col" class="c-health">Health</th>
+        <th scope="col" class="c-changed" aria-sort="none"><button type="button" class="sort" data-sort="changed"><span>Last change</span><svg class="i sort__i sort__i--none" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 13V3M2.8 5.2L5 3l2.2 2.2M11 3v10M8.8 10.8L11 13l2.2-2.2"/></svg><svg class="i sort__i sort__i--desc" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M4 9l4 4 4-4"/></svg><svg class="i sort__i sort__i--asc" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 13V3M4 7l4-4 4 4"/></svg></button></th>
+      </tr></thead>
+      <tbody data-band="attention">
+        <tr class="band band--attention"><th colspan="5" scope="rowgroup"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.500l6 10.500H2z"/><path d="M8 6.500v3M8 11.200h.01"/></svg><span>Needs you</span><span class="band__n num">3</span></th></tr>
+        <tr data-row data-band="attention" data-worker="local" data-status="stalled" data-attn="2" data-sev="1" data-rank="0" data-changed="1795639923">
+          <th scope="row" class="c-name" data-label="Sandbox"><div class="rowhead">
+            <span class="tipwrap"><button type="button" class="rowbtn" data-toggle aria-expanded="false" aria-controls="row-2" aria-label="Details for local / review-auth" aria-describedby="tip-row-2"><svg class="i twist" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.500L10.5 8 6 12.5"/></svg></button><span class="tip" role="tooltip" id="tip-row-2">Show or hide branch, model and grants.</span></span>
+            <svg class="i rowhead__i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg>
+            <span class="rowhead__t"><a class="rowlink" href="thread-2.html" aria-label="Open local / review-auth"><bdi>review-auth</bdi></a><span class="sub"><bdi>oc-sandbox</bdi> / Local</span></span>
+          </div></th>
+          <td class="c-status" data-label="Status"><span class="st st--caution"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4.5 2.500h7M4.5 13.500h7M5 2.500c0 3 6 3.5 6 5.500s-6 2.5-6 5.500M11 2.500c0 3-6 3.5-6 5.500s6 2.5 6 5.5"/></svg><span>Stalled</span></span><span class="c-status__h"><span class="c-health__t"><bdi>possible stall</bdi></span><span class="sub"><bdi>38 min without progress</bdi></span></span></td>
+          <td class="c-attn" data-label="Attention"><span class="need"><span class="attn attn--caution" data-n="2" data-apr="apr-7f3c@2"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4.5 2.500h7M4.5 13.500h7M5 2.500c0 3 6 3.5 6 5.500s-6 2.5-6 5.500M11 2.500c0 3-6 3.5-6 5.500s6 2.5 6 5.5"/></svg><span class="vh">Severity: stalled. </span><span class="num" data-attn-n>2</span><span class="vh" data-attn-w> need you</span></span><span class="need__why" data-why data-apr="apr-7f3c@2" data-inbox="1" data-other="">1 approval · 1 inbox item</span></span><span class="quiet" data-none hidden>None</span></td>
+          <td class="c-health" data-label="Health"><span class="c-health__t"><bdi>possible stall</bdi></span><span class="sub"><bdi>38 min without progress</bdi></span></td>
+          <td class="c-time" data-label="Last change"><span class="num">14:52</span><span class="sub">38 min ago</span></td>
+        </tr>
+        <tr class="detail" id="row-2" hidden><td colspan="5">
+          <dl class="facts facts--row">
+            <div class="facts__row"><dt>Branch</dt><dd><bdi>wt/oc-sandbox/review-auth</bdi></dd></div>
+            <div class="facts__row"><dt>Model</dt><dd><bdi>gpt-sol</bdi><span class="sub"><bdi>high</bdi></span></dd></div>
+            <div class="facts__row"><dt>Grants</dt><dd><ul class="grants"><li class="grant"><bdi>llm:openai-pro</bdi></li><li class="grant"><bdi>fs:worktree</bdi></li></ul></dd></div>
+          </dl>
+          <div class="acts"><button type="button" class="btn btn--sm" data-revoke data-agent-confirm="Removes llm:openai-pro and fs:worktree from local / review-auth. Its agent stops until grants are restored." aria-label="Revoke grants for local / review-auth"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3.5" y="7.5" width="9" height="6" rx="1"/><path d="M5.5 7.5V5.5a2.5 2.5 0 0 1 5 0v2"/></svg><span>Revoke grants</span></button></div>
+        </td></tr>
+        <tr data-row data-band="attention" data-worker="local" data-status="error" data-attn="1" data-sev="0" data-rank="1" data-changed="1795629600">
+          <th scope="row" class="c-name" data-label="Sandbox"><div class="rowhead">
+            <span class="tipwrap"><button type="button" class="rowbtn" data-toggle aria-expanded="false" aria-controls="row-6" aria-label="Details for local / an-extremely-long-sandbox-name-that-keeps-going-to-test-truncation-and-wrapping" aria-describedby="tip-row-6"><svg class="i twist" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.500L10.5 8 6 12.5"/></svg></button><span class="tip" role="tooltip" id="tip-row-6">Show or hide branch, model and grants.</span></span>
+            <svg class="i rowhead__i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg>
+            <span class="rowhead__t"><a class="rowlink" href="thread-6.html" aria-label="Open local / an-extremely-long-sandbox-name-that-keeps-going-to-test-truncation-and-wrapping"><bdi>an-extremely-long-sandbox-name-that-keeps-going-to-test-truncation-and-wrapping</bdi></a><span class="sub"><bdi>web-client</bdi> / Local</span></span>
+          </div></th>
+          <td class="c-status" data-label="Status"><span class="st st--bad"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5.5 2.500h5l3 3v5l-3 3h-5l-3-3v-5z"/><path d="M6 6l4 4M10 6l-4 4"/></svg><span>Error</span></span><span class="c-status__h"><span class="c-health__t"><bdi>exited with code 137</bdi></span></span></td>
+          <td class="c-attn" data-label="Attention"><span class="need"><span class="attn attn--bad" data-n="1" data-apr=""><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5.5 2.500h5l3 3v5l-3 3h-5l-3-3v-5z"/><path d="M6 6l4 4M10 6l-4 4"/></svg><span class="vh">Severity: error. </span><span class="num" data-attn-n>1</span><span class="vh" data-attn-w> needs you</span></span><span class="need__why" data-why data-apr="" data-inbox="0" data-other="Stopped with an error">Stopped with an error</span></span><span class="quiet" data-none hidden>None</span></td>
+          <td class="c-health" data-label="Health"><span class="c-health__t"><bdi>exited with code 137</bdi></span></td>
+          <td class="c-time" data-label="Last change"><span class="num">12:00</span><span class="sub">3 h 30 min ago</span></td>
+        </tr>
+        <tr class="detail" id="row-6" hidden><td colspan="5">
+          <dl class="facts facts--row">
+            <div class="facts__row"><dt>Branch</dt><dd><bdi>wt/web-client/long-name</bdi></dd></div>
+            <div class="facts__row"><dt>Model</dt><dd><bdi>gpt-sol</bdi><span class="sub"><bdi>low</bdi></span></dd></div>
+            <div class="facts__row"><dt>Grants</dt><dd><span class="quiet">None</span></dd></div>
+          </dl>
+
+        </td></tr>
+        <tr data-row data-band="attention" data-worker="local" data-status="running" data-attn="1" data-sev="4" data-rank="2" data-changed="1795642060">
+          <th scope="row" class="c-name" data-label="Sandbox"><div class="rowhead">
+            <span class="tipwrap"><button type="button" class="rowbtn" data-toggle aria-expanded="false" aria-controls="row-1" aria-label="Details for local / feat-dashboard" aria-describedby="tip-row-1"><svg class="i twist" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.500L10.5 8 6 12.5"/></svg></button><span class="tip" role="tooltip" id="tip-row-1">Show or hide branch, model and grants.</span></span>
+            <svg class="i rowhead__i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg>
+            <span class="rowhead__t"><a class="rowlink" href="thread.html" aria-label="Open local / feat-dashboard"><bdi>feat-dashboard</bdi></a><span class="sub"><bdi>oc-sandbox</bdi> / Local</span></span>
+          </div></th>
+          <td class="c-status" data-label="Status"><span class="st st--ok"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 3.500l7 4.5-7 4.500z"/></svg><span>Running</span></span><span class="c-status__h"><span class="c-health__t"><bdi>on track</bdi></span></span></td>
+          <td class="c-attn" data-label="Attention"><span class="need"><span class="attn attn--note" data-n="1" data-apr=""><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 3.500h11v7h-6l-3 2.500v-2.500h-2z"/></svg><span class="vh">Unread work. </span><span class="num" data-attn-n>1</span><span class="vh" data-attn-w> needs you</span></span><span class="need__why" data-why data-apr="" data-inbox="0" data-other="4 unread in #main">4 unread in #main</span></span><span class="quiet" data-none hidden>None</span></td>
+          <td class="c-health" data-label="Health"><span class="c-health__t"><bdi>on track</bdi></span></td>
+          <td class="c-time" data-label="Last change"><span class="num">15:27</span><span class="sub">2 min ago</span></td>
+        </tr>
+        <tr class="detail" id="row-1" hidden><td colspan="5">
+          <dl class="facts facts--row">
+            <div class="facts__row"><dt>Branch</dt><dd><bdi>wt/oc-sandbox/feat-dashboard</bdi></dd></div>
+            <div class="facts__row"><dt>Model</dt><dd><bdi>claude-fable</bdi><span class="sub"><bdi>high</bdi></span></dd></div>
+            <div class="facts__row"><dt>Grants</dt><dd><ul class="grants"><li class="grant"><bdi>llm:claude-max</bdi></li><li class="grant"><bdi>fs:worktree</bdi></li></ul></dd></div>
+          </dl>
+          <div class="acts"><button type="button" class="btn btn--sm" data-revoke data-agent-confirm="Removes llm:claude-max and fs:worktree from local / feat-dashboard. Its agent stops until grants are restored." aria-label="Revoke grants for local / feat-dashboard"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3.5" y="7.5" width="9" height="6" rx="1"/><path d="M5.5 7.5V5.5a2.5 2.5 0 0 1 5 0v2"/></svg><span>Revoke grants</span></button></div>
+        </td></tr>
+      </tbody>
+      <tbody data-band="degraded">
+        <tr class="band band--degraded"><th colspan="5" scope="rowgroup"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M13 8a5 5 0 0 1-9 3M3 8a5 5 0 0 1 9-3"/><path d="M12.5 2.500V5H10M3.5 13.500V11H6"/></svg><span>Degraded, no action needed</span><span class="band__n num">2</span></th></tr>
+        <tr data-row data-band="degraded" data-worker="remote" data-status="reconnecting" data-attn="0" data-sev="3" data-rank="3" data-changed="1795640700">
+          <th scope="row" class="c-name" data-label="Sandbox"><div class="rowhead">
+            <span class="tipwrap"><button type="button" class="rowbtn" data-toggle aria-expanded="false" aria-controls="row-3" aria-label="Details for gpu-box / bench-runner" aria-describedby="tip-row-3"><svg class="i twist" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.500L10.5 8 6 12.5"/></svg></button><span class="tip" role="tooltip" id="tip-row-3">Show or hide branch, model and grants.</span></span>
+            <svg class="i rowhead__i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2.5" y="3" width="11" height="4" rx="1"/><rect x="2.5" y="9" width="11" height="4" rx="1"/><path d="M5 5h.01M5 11h.01"/></svg>
+            <span class="rowhead__t"><a class="rowlink" href="thread-3.html" aria-label="Open gpu-box / bench-runner"><bdi>gpu-box</bdi> <span class="rowlink__sep">/</span> <bdi>bench-runner</bdi></a><span class="sub"><bdi>oc-sandbox</bdi> / <bdi>gpu-box</bdi></span></span>
+          </div></th>
+          <td class="c-status" data-label="Status"><span class="st st--caution"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M13 8a5 5 0 0 1-9 3M3 8a5 5 0 0 1 9-3"/><path d="M12.5 2.500V5H10M3.5 13.500V11H6"/></svg><span>Reconnecting</span></span><span class="c-status__h"><span class="c-health__t"><bdi>unknown</bdi></span><span class="sub"><bdi>telemetry stale</bdi></span></span></td>
+          <td class="c-attn" data-label="Attention"><span class="quiet">None</span></td>
+          <td class="c-health" data-label="Health"><span class="c-health__t"><bdi>unknown</bdi></span><span class="sub"><bdi>telemetry stale</bdi></span></td>
+          <td class="c-time" data-label="Last change"><span class="num">15:05</span><span class="sub">25 min ago</span></td>
+        </tr>
+        <tr class="detail" id="row-3" hidden><td colspan="5">
+          <dl class="facts facts--row">
+            <div class="facts__row"><dt>Branch</dt><dd><bdi>wt/oc-sandbox/bench-runner</bdi></dd></div>
+            <div class="facts__row"><dt>Model</dt><dd><bdi>gemini-neon</bdi><span class="sub"><bdi>medium</bdi></span></dd></div>
+            <div class="facts__row"><dt>Grants</dt><dd><ul class="grants"><li class="grant"><bdi>llm:gemini-ultra</bdi></li></ul></dd></div>
+          </dl>
+          <div class="acts"><button type="button" class="btn btn--sm" data-revoke data-agent-confirm="Removes llm:gemini-ultra from gpu-box / bench-runner. Its agent stops until grants are restored." aria-label="Revoke grants for gpu-box / bench-runner"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3.5" y="7.5" width="9" height="6" rx="1"/><path d="M5.5 7.5V5.5a2.5 2.5 0 0 1 5 0v2"/></svg><span>Revoke grants</span></button></div>
+        </td></tr>
+        <tr data-row data-band="degraded" data-worker="local" data-status="offline" data-attn="0" data-sev="5" data-rank="4" data-changed="1795564800">
+          <th scope="row" class="c-name" data-label="Sandbox"><div class="rowhead">
+            <span class="tipwrap"><button type="button" class="rowbtn" data-toggle aria-expanded="false" aria-controls="row-7" aria-label="Details for local / مختبر-تجريبي" aria-describedby="tip-row-7"><svg class="i twist" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.500L10.5 8 6 12.5"/></svg></button><span class="tip" role="tooltip" id="tip-row-7">Show or hide branch, model and grants.</span></span>
+            <svg class="i rowhead__i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg>
+            <span class="rowhead__t"><a class="rowlink" href="thread-7.html" aria-label="Open local / مختبر-تجريبي"><bdi>مختبر-تجريبي</bdi></a><span class="sub"><bdi>Scratch / Ad-hoc</bdi> / Local</span></span>
+          </div></th>
+          <td class="c-status" data-label="Status"><span class="st st--quiet"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.5"/><path d="M4.2 4.200l7.6 7.6"/></svg><span>Offline</span></span><span class="c-status__h"><span class="c-health__t"><bdi>offline</bdi></span></span></td>
+          <td class="c-attn" data-label="Attention"><span class="quiet">None</span></td>
+          <td class="c-health" data-label="Health"><span class="c-health__t"><bdi>offline</bdi></span></td>
+          <td class="c-time" data-label="Last change"><span class="num">Tue 24 Nov, 18:00</span><span class="sub">yesterday</span></td>
+        </tr>
+        <tr class="detail" id="row-7" hidden><td colspan="5">
+          <dl class="facts facts--row">
+            <div class="facts__row"><dt>Branch</dt><dd><span class="quiet">None</span></dd></div>
+            <div class="facts__row"><dt>Model</dt><dd><span class="quiet">None</span></dd></div>
+            <div class="facts__row"><dt>Grants</dt><dd><span class="quiet">None</span></dd></div>
+          </dl>
+
+        </td></tr>
+      </tbody>
+      <tbody data-band="ok">
+        <tr class="band band--ok"><th colspan="5" scope="rowgroup"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.5"/><path d="M5.5 8.200l1.8 1.8 3.2-3.6"/></svg><span>On track or idle</span><span class="band__n num">2</span></th></tr>
+        <tr data-row data-band="ok" data-worker="remote" data-status="running" data-attn="0" data-sev="4" data-rank="5" data-changed="1795641675">
+          <th scope="row" class="c-name" data-label="Sandbox"><div class="rowhead">
+            <span class="tipwrap"><button type="button" class="rowbtn" data-toggle aria-expanded="false" aria-controls="row-4" aria-label="Details for build-host / feat-dashboard" aria-describedby="tip-row-4"><svg class="i twist" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.500L10.5 8 6 12.5"/></svg></button><span class="tip" role="tooltip" id="tip-row-4">Show or hide branch, model and grants.</span></span>
+            <svg class="i rowhead__i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2.5" y="3" width="11" height="4" rx="1"/><rect x="2.5" y="9" width="11" height="4" rx="1"/><path d="M5 5h.01M5 11h.01"/></svg>
+            <span class="rowhead__t"><a class="rowlink" href="thread-4.html" aria-label="Open build-host / feat-dashboard"><bdi>build-host</bdi> <span class="rowlink__sep">/</span> <bdi>feat-dashboard</bdi></a><span class="sub"><bdi>oc-sandbox</bdi> / <bdi>build-host</bdi></span></span>
+          </div></th>
+          <td class="c-status" data-label="Status"><span class="st st--ok"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 3.500l7 4.5-7 4.500z"/></svg><span>Running</span></span><span class="c-status__h"><span class="c-health__t"><bdi>on track</bdi></span></span></td>
+          <td class="c-attn" data-label="Attention"><span class="quiet">None</span></td>
+          <td class="c-health" data-label="Health"><span class="c-health__t"><bdi>on track</bdi></span></td>
+          <td class="c-time" data-label="Last change"><span class="num">15:21</span><span class="sub">9 min ago</span></td>
+        </tr>
+        <tr class="detail" id="row-4" hidden><td colspan="5">
+          <dl class="facts facts--row">
+            <div class="facts__row"><dt>Branch</dt><dd><bdi>wt/oc-sandbox/feat-dashboard</bdi></dd></div>
+            <div class="facts__row"><dt>Model</dt><dd><bdi>gpt-sol</bdi><span class="sub"><bdi>medium</bdi></span></dd></div>
+            <div class="facts__row"><dt>Grants</dt><dd><ul class="grants"><li class="grant"><bdi>llm:openai-pro</bdi></li><li class="grant"><bdi>fs:worktree</bdi></li></ul></dd></div>
+          </dl>
+          <div class="acts"><button type="button" class="btn btn--sm" data-revoke data-agent-confirm="Removes llm:openai-pro and fs:worktree from build-host / feat-dashboard. Its agent stops until grants are restored." aria-label="Revoke grants for build-host / feat-dashboard"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3.5" y="7.5" width="9" height="6" rx="1"/><path d="M5.5 7.5V5.5a2.5 2.5 0 0 1 5 0v2"/></svg><span>Revoke grants</span></button></div>
+        </td></tr>
+        <tr data-row data-band="ok" data-worker="local" data-status="idle" data-attn="0" data-sev="2" data-rank="6" data-changed="1795633800">
+          <th scope="row" class="c-name" data-label="Sandbox"><div class="rowhead">
+            <span class="tipwrap"><button type="button" class="rowbtn" data-toggle aria-expanded="false" aria-controls="row-5" aria-label="Details for local / studio-polish" aria-describedby="tip-row-5"><svg class="i twist" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.500L10.5 8 6 12.5"/></svg></button><span class="tip" role="tooltip" id="tip-row-5">Show or hide branch, model and grants.</span></span>
+            <svg class="i rowhead__i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg>
+            <span class="rowhead__t"><a class="rowlink" href="thread-5.html" aria-label="Open local / studio-polish"><bdi>studio-polish</bdi></a><span class="sub"><bdi>web-client</bdi> / Local</span></span>
+          </div></th>
+          <td class="c-status" data-label="Status"><span class="st st--quiet"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.5"/><path d="M5.5 8h5"/></svg><span>Idle</span></span><span class="c-status__h"><span class="c-health__t"><bdi>idle</bdi></span></span></td>
+          <td class="c-attn" data-label="Attention"><span class="quiet">None</span></td>
+          <td class="c-health" data-label="Health"><span class="c-health__t"><bdi>idle</bdi></span></td>
+          <td class="c-time" data-label="Last change"><span class="num">13:10</span><span class="sub">2 h 20 min ago</span></td>
+        </tr>
+        <tr class="detail" id="row-5" hidden><td colspan="5">
+          <dl class="facts facts--row">
+            <div class="facts__row"><dt>Branch</dt><dd><bdi>wt/web-client/studio-polish</bdi></dd></div>
+            <div class="facts__row"><dt>Model</dt><dd><bdi>claude-fable</bdi><span class="sub"><bdi>medium</bdi></span></dd></div>
+            <div class="facts__row"><dt>Grants</dt><dd><span class="quiet">None</span></dd></div>
+          </dl>
+
+        </td></tr>
+      </tbody>
+      <tfoot><tr>
+        <td colspan="5"><div class="fleet__foot"><span class="fleet__count" id="fleet-count" role="status">Showing 7 of 7 sandboxes</span><p class="tz fleet__tz"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3.200l2 1.3"/></svg><span>Times in CST</span></p></div></td>
+      </tr></tfoot>
+    </table>
+    <p class="empty" id="fleet-empty" hidden>No sandboxes match these filters. <button type="button" class="linkbtn" id="fleet-clear">Clear filters</button></p>
+  </div>
+</main>
+<aside class="drawer drawer--b" id="drawer" aria-labelledby="drawer-title" data-agent-hidden>
+  <div class="drawer__head drawer__head--b">
+    <svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 9.500l1.6-5.500h7.800l1.6 5.500v3h-11z"/><path d="M2.5 9.500h3.200l.8 1.500h3l.8-1.500h3.2"/></svg><h2 id="drawer-title">Human Inbox</h2><span class="tiermark tiermark--b">Tier B</span>
+    <a class="btn btn--sm drawer__first" href="fleet.html" data-close-drawer aria-label="Close inbox"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4 4l8 8M12 4l-8 8"/></svg><span>Close</span></a>
+  </div>
+  <div class="drawer__body">
+    <p class="sub">3 open. None of these block an agent.</p>
+    <ul class="picklist" aria-label="Open inbox items">
+      <li><button type="button" class="pick pick--b" data-pick="hi-3" aria-current="true">
+        <span class="pick__title"><bdi>review-auth: no progress after 2 nudges</bdi></span>
+        <span class="pick__line sub"><bdi>Stuck-lane escalation</bdi></span>
+        <span class="pick__flag pick__flag--high"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.500l6 10.500H2z"/><path d="M8 6.500v3M8 11.200h.01"/></svg>High</span>
+      </button></li>
+      <li><button type="button" class="pick pick--b" data-pick="hi-1" aria-current="false">
+        <span class="pick__title"><bdi>prd_m3a1 ready for human review</bdi></span>
+        <span class="pick__line sub"><bdi>PRD Human review</bdi></span>
+
+      </button></li>
+      <li><button type="button" class="pick pick--b" data-pick="hi-2" aria-current="false">
+        <span class="pick__title"><bdi>Pick a default theme</bdi></span>
+        <span class="pick__line sub"><bdi>captain_hold</bdi></span>
+
+      </button></li>
+    </ul>
+    <article class="item" id="hi-3" aria-labelledby="hi-3-title">
+      <h3 id="hi-3-title"><bdi>review-auth: no progress after 2 nudges</bdi></h3>
+      <dl class="facts facts--tight">
+        <div class="facts__row"><dt>Kind</dt><dd><bdi>Stuck-lane escalation</bdi></dd></div>
+        <div class="facts__row"><dt>Severity</dt><dd><span class="st st--caution"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.500l6 10.500H2z"/><path d="M8 6.500v3M8 11.200h.01"/></svg><span>High</span></span></dd></div>
+        <div class="facts__row"><dt>Sandbox</dt><dd><span class="addr addr--local"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3" y="3.5" width="10" height="6.5" rx="1"/><path d="M1.5 12.500h13"/></svg><span class="addr__w"><bdi>local</bdi></span><span class="addr__sep">/</span><span class="addr__n"><bdi>review-auth</bdi></span></span></dd></div>
+        <div class="facts__row facts__row--wide"><dt>Summary</dt><dd><div class="well" dir="auto">Last meaningful change 38 min ago. Suggested check: inspect test runner output.</div></dd></div>
+      </dl>
+      <div class="item__act" data-acts>
+        <a class="btn btn--primary" href="thread-2.html" aria-label="Open thread for local / review-auth">Open thread</a>
+        <button type="button" class="btn" data-decide="Snooze 30 min" aria-label="Snooze 30 min, review-auth: no progress after 2 nudges">Snooze 30 min</button>
+        <button type="button" class="btn" data-decide="Dismiss" aria-label="Dismiss, review-auth: no progress after 2 nudges">Dismiss</button>
+        <p class="item__status" role="status"></p>
+      </div>
+    </article>
+    <article class="item" id="hi-1" aria-labelledby="hi-1-title" hidden>
+      <h3 id="hi-1-title"><bdi>prd_m3a1 ready for human review</bdi></h3>
+      <dl class="facts facts--tight">
+        <div class="facts__row"><dt>Kind</dt><dd><bdi>PRD Human review</bdi></dd></div>
+        <div class="facts__row"><dt>Severity</dt><dd>Normal</dd></div>
+
+        <div class="facts__row facts__row--wide"><dt>Summary</dt><dd><div class="well" dir="auto">All checkboxes complete except Human review. Commit 4be19c2.</div></dd></div>
+      </dl>
+      <div class="item__act" data-acts>
+        <button type="button" class="btn btn--primary" data-decide="Mark reviewed" aria-label="Mark reviewed, prd_m3a1 ready for human review">Mark reviewed</button>
+        <button type="button" class="btn" data-decide="Request changes" aria-label="Request changes, prd_m3a1 ready for human review">Request changes</button>
+        <button type="button" class="btn" data-decide="Snooze" aria-label="Snooze, prd_m3a1 ready for human review">Snooze</button>
+        <p class="item__status" role="status"></p>
+      </div>
+    </article>
+    <article class="item" id="hi-2" aria-labelledby="hi-2-title" hidden>
+      <h3 id="hi-2-title"><bdi>Pick a default theme</bdi></h3>
+      <dl class="facts facts--tight">
+        <div class="facts__row"><dt>Kind</dt><dd><bdi>captain_hold</bdi></dd></div>
+        <div class="facts__row"><dt>Severity</dt><dd>Normal</dd></div>
+
+        <div class="facts__row facts__row--wide"><dt>Summary</dt><dd><div class="well" dir="auto">Lane design-tokens paused; other lanes continue.</div></dd></div>
+      </dl>
+      <div class="item__act" data-acts>
+        <button type="button" class="btn btn--primary" data-decide="Light" aria-label="Light, Pick a default theme">Light</button>
+        <button type="button" class="btn" data-decide="Dark" aria-label="Dark, Pick a default theme">Dark</button>
+        <button type="button" class="btn" data-decide="Follow system" aria-label="Follow system, Pick a default theme">Follow system</button>
+        <p class="item__status" role="status"></p>
+      </div>
+    </article>
+  </div>
+</aside>
+</div>
+<footer class="usage" data-trusted aria-label="Account usage">
+  <div class="usage__head">
+    <p class="usage__title"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.4 11.6a5.6 5.6 0 1 1 11.2 0z"/><path d="M8 11.6l2.4-3.4"/></svg><span>Account usage</span></p>
+    <button type="button" class="usage__toggle" id="usage-toggle" aria-expanded="false" aria-controls="usage-list"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.4 11.6a5.6 5.6 0 1 1 11.2 0z"/><path d="M8 11.6l2.4-3.4"/></svg><span>Account usage</span><svg class="i twist" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.500L10.5 8 6 12.5"/></svg></button>
+    <p class="usage__lock"><svg class="i" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="3.5" y="7.5" width="9" height="6" rx="1"/><path d="M5.5 7.5V5.5a2.5 2.5 0 0 1 5 0v2"/></svg><span>Paid fallback locked</span></p>
+  </div>
+  <ul class="usage__list" id="usage-list">
+    <li class="acct"><span class="acct__name"><bdi>openai-pro</bdi></span><span class="acct__win"><span class="acct__k">5h<span class="vh"> 5 hour window</span></span><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true" focusable="false"><rect class="meter__track" width="100" height="4"/><rect class="meter__fill" width="41" height="4"/></svg><span class="acct__pct num">41%</span></span><span class="acct__win"><span class="acct__k">7d<span class="vh"> 7 day window</span></span><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true" focusable="false"><rect class="meter__track" width="100" height="4"/><rect class="meter__fill" width="63" height="4"/></svg><span class="acct__pct num">63%</span></span></li>
+    <li class="acct"><span class="acct__name"><bdi>claude-max</bdi></span><span class="acct__win acct__win--warn"><span class="acct__k">5h<span class="vh"> 5 hour window</span></span><svg class="meter meter--warn" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true" focusable="false"><rect class="meter__track" width="100" height="4"/><rect class="meter__fill" width="88" height="4"/></svg><span class="acct__pct num">88%</span></span><span class="acct__win"><span class="acct__k">7d<span class="vh"> 7 day window</span></span><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true" focusable="false"><rect class="meter__track" width="100" height="4"/><rect class="meter__fill" width="52" height="4"/></svg><span class="acct__pct num">52%</span></span></li>
+    <li class="acct"><span class="acct__name"><bdi>gemini-ultra</bdi></span><span class="acct__win"><span class="acct__k">5h<span class="vh"> 5 hour window</span></span><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true" focusable="false"><rect class="meter__track" width="100" height="4"/><rect class="meter__fill" width="12" height="4"/></svg><span class="acct__pct num">12%</span></span><span class="acct__win"><span class="acct__k">7d<span class="vh"> 7 day window</span></span><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true" focusable="false"><rect class="meter__track" width="100" height="4"/><rect class="meter__fill" width="30" height="4"/></svg><span class="acct__pct num">30%</span></span></li>
+  </ul>
+</footer>
+</body>
+</html>
