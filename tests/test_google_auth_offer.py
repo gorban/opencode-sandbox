@@ -484,11 +484,19 @@ class CallbackGateTest(unittest.TestCase):
                     self.assertFalse(revoked.done())
                 finally:
                     released.set()
-                self.assertEqual(client.result(timeout=3), auth.acknowledgement(True))
+                reply = client.result(timeout=3)
                 server.result(timeout=3)
                 revoked.result(timeout=3)
+            # Revocation can win before or after browser acknowledgement. Both
+            # orders preserve the one private write and refuse replay.
+            expected = {
+                auth.acknowledgement(True): auth.Outcome.FORWARDED,
+                auth.acknowledgement(False): auth.Outcome.UNCERTAIN,
+            }
+            self.assertIn(reply, expected)
+            self.assertEqual(gate.outcome, expected[reply])
+            self.assertIsNone(gate.take_forwarded())
             self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
-            self.assertEqual(gate.outcome, auth.Outcome.FORWARDED)
             recorder.settimeout(1)
             self.assertEqual(recorder.recv(4096), request(port))
             self.assert_no_native_bytes(recorder)

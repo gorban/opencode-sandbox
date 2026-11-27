@@ -23,6 +23,7 @@ from .metadata_destination import MetadataRoute, exchange
 from .metadata_workflow import MetadataRuntime, enroll_metadata, reopen_metadata
 from .native_artifacts import stage_standalone
 from .native_namespace import public_certificate
+from .native_service import NativeRetirementUnconfirmed, retain_cleanup_failure
 from .registration import RegistrationJournal, _absent, _DIRECTORY, _write_private
 
 
@@ -57,6 +58,18 @@ class ConnectError(RuntimeError):
 
 class CustodyUnconfirmed(ConnectError):
     """Retain the exact affected private enrollment runtime for inspection."""
+
+
+def needs_custody_inspection(error):
+    """Project typed custody uncertainty as a safe operator instruction."""
+    seen = set()
+    types = (CustodyUnconfirmed, NativeRetirementUnconfirmed)
+    while error is not None and id(error) not in seen:
+        if isinstance(error, types) or getattr(error, "cleanup_uncertainties", ()):
+            return True
+        seen.add(id(error))
+        error = error.__cause__
+    return False
 
 
 class _TerminalOwner:
@@ -320,13 +333,18 @@ def _private_runtime(parent, label, cold, owner):
             raise CustodyUnconfirmed("Google enrollment runtime creation requires inspection.") from error
         clean.callback(os.close, root_fd)
         custody = _RuntimeCustody(parent, parent_fd, parent / name, root_fd, label, cold, owner.authorized)
+        failure = None
         try:
             yield custody
+        except BaseException as error:
+            failure = error
+            raise
         finally:
             try:
                 custody.cleanup()
-            except (OSError, RuntimeError) as error:
-                raise CustodyUnconfirmed("Google enrollment cleanup requires inspection.") from error
+            except BaseException as cleanup:
+                uncertainty = CustodyUnconfirmed("Google enrollment cleanup requires inspection.")
+                retain_cleanup_failure(failure, uncertainty, cleanup)
 
 
 def _prepare_runtime(custody, source):

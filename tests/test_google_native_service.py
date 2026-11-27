@@ -90,6 +90,48 @@ class NativeServiceTest(unittest.TestCase):
         self.assertEqual(steps.mock_calls, [call.custody.before_spawn(self.unit), call.spawn(namespace),
                                           call.custody.attest(self.identity), call.custody.retire(self.identity)])
 
+    def test_retirement_receipt_failure_preserves_active_error_and_cause(self):
+        namespace = Mock(unit=self.unit, description=self.description)
+        cause = OSError("fixture underlying primary cause")
+        primary = ValueError("fixture enrollment failure")
+        storage = OSError("fixture retirement receipt write failed")
+        custody = Mock()
+        custody.retire.side_effect = storage
+
+        def stopped(service, identity, _fd):
+            object.__setattr__(service, "retired", identity)
+
+        with patch("oc_google.native_service._spawn"), \
+                patch("oc_google.native_service._pin", return_value=(self.identity, 9)), \
+                patch("oc_google.native_service._stop", side_effect=stopped), \
+                patch("oc_google.native_service.os.close") as close:
+            with self.assertRaises(ValueError) as caught, _run_service(namespace, custody=custody):
+                raise primary from cause
+        self.assertIs(caught.exception, primary)
+        self.assertIs(primary.__cause__, cause)
+        uncertainty, = primary.cleanup_uncertainties
+        self.assertIsInstance(uncertainty, NativeRetirementUnconfirmed)
+        self.assertIs(uncertainty.__cause__, storage)
+        custody.retire.assert_called_once_with(self.identity)
+        close.assert_called_once_with(9)
+
+    def test_retirement_receipt_failure_alone_reports_typed_uncertainty(self):
+        namespace = Mock(unit=self.unit, description=self.description)
+        storage = OSError("fixture retirement receipt write failed")
+        custody = Mock()
+        custody.retire.side_effect = storage
+
+        def stopped(service, identity, _fd, _after_stop):
+            object.__setattr__(service, "retired", identity)
+
+        with patch("oc_google.native_service._spawn"), \
+                patch("oc_google.native_service._pin", return_value=(self.identity, 9)), \
+                patch("oc_google.native_service._stop", side_effect=stopped), \
+                patch("oc_google.native_service.os.close"):
+            with self.assertRaises(NativeRetirementUnconfirmed) as caught, _run_service(namespace, custody=custody):
+                pass
+        self.assertIs(caught.exception.__cause__, storage)
+
     def test_failed_pin_reaps_launcher_even_when_both_pipe_closes_fail(self):
         namespace = Mock(unit=self.unit, description=self.description)
         process = Mock()

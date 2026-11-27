@@ -1,12 +1,15 @@
 """Exercise attended enrollment boundaries with local fixtures only."""
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stderr
 import errno
+from io import StringIO
 import os
 from pathlib import Path
+import runpy
 import shutil
 import signal
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from threading import RLock
 from types import SimpleNamespace
@@ -187,6 +190,44 @@ class RuntimeCustodyTest(unittest.TestCase):
         self.assertEqual([item.args[0] for item in record.call_args_list], ["launch", "attested", "retired"])
         self.assertFalse(root.exists())
         self.assertEqual(list(self.parent.iterdir()), [])
+
+    def test_runtime_cleanup_failure_preserves_active_error_and_cause(self):
+        cause = ValueError("fixture original cause")
+        primary = connect.ConnectError("Google sign-in cancelled.")
+        storage = OSError("fixture cleanup failed")
+
+        with patch.object(connect._RuntimeCustody, "cleanup", side_effect=storage):
+            with self.assertRaises(connect.ConnectError) as caught:
+                with connect._private_runtime(self.parent, "fixture", False, self.owner) as custody:
+                    root = custody.root
+                    raise primary from cause
+        self.assertIs(caught.exception, primary)
+        self.assertIs(primary.__cause__, cause)
+        uncertainty, = primary.cleanup_uncertainties
+        self.assertIsInstance(uncertainty, connect.CustodyUnconfirmed)
+        self.assertIs(uncertainty.__cause__, storage)
+        self.assertTrue(root.is_dir())
+
+    def test_public_error_projection_keeps_safe_primary_and_inspection_notice(self):
+        root = Path(__file__).resolve().parents[1]
+        main = runpy.run_path(str(root / "oc-google.py"))["main"]
+
+        def cancelled(_label):
+            with connect._private_runtime(self.parent, "fixture", False, self.owner) as custody:
+                custody.bind(Mock())
+                custody.before_spawn(self.unit)
+                raise connect.ConnectError("Google sign-in cancelled.")
+
+        output = StringIO()
+        with patch.dict(main.__globals__, verify_sources=Mock()), \
+                patch.object(sys, "argv", ["oc-google.py", "connect", "fixture"]), \
+                patch.object(connect, "connect_for", side_effect=cancelled), redirect_stderr(output):
+            self.assertEqual(main(), 1)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "oc-sandbox google: Google sign-in cancelled.",
+            "oc-sandbox google: Google enrollment cleanup requires inspection.",
+        ])
+        self.assertEqual(len(list(self.parent.iterdir())), 1)
 
     def test_cold_disappearance_with_quarantine_requires_inspection(self):
         with self.assertRaisesRegex(connect.CustodyUnconfirmed, "requires inspection"):

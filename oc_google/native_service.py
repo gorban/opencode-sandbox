@@ -23,6 +23,15 @@ class NativeRetirementUnconfirmed(NativeNamespaceError):
     """Private runtime state must be retained until exact ownership is reconciled."""
 
 
+def retain_cleanup_failure(primary: BaseException | None, uncertainty: BaseException, cause: BaseException):
+    """Keep typed cleanup evidence without changing the primary error chain."""
+    if primary is None:
+        raise uncertainty from cause
+    uncertainty.__cause__ = cause
+    primary.cleanup_uncertainties = getattr(primary, "cleanup_uncertainties", ()) + (uncertainty,)
+    primary.add_note(str(uncertainty))
+
+
 @dataclass(frozen=True, slots=True)
 class NativeInvocation:
     unit: str
@@ -213,6 +222,7 @@ def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_s
         finally:
             raise NativeRetirementUnconfirmed("Google native launch ownership could not be attested") from pin_error
     object.__setattr__(service, "attested", identity)
+    failure = None
     try:
         try:
             if custody is not None:
@@ -229,10 +239,16 @@ def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_s
             raise
         else:
             _stop(service, identity, fd, after_stop)
+    except BaseException as error:
+        failure = error
+        raise
     finally:
         try:
             if custody is not None and service.retired is not None:
                 custody.retire(service.retired)
+        except BaseException as cleanup:
+            uncertainty = NativeRetirementUnconfirmed("Google native retirement custody receipt requires inspection.")
+            retain_cleanup_failure(failure, uncertainty, cleanup)
         finally:
             os.close(fd)
 

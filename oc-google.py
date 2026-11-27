@@ -88,6 +88,29 @@ def arm_turn(run_id):
     return arm(run_id)
 
 
+def run_connect(label):
+    from oc_google.connect import ConnectError, CustodyUnconfirmed, connect_for, needs_custody_inspection
+    from oc_google.native_service import NativeRetirementUnconfirmed
+
+    try:
+        return connect_for(label)
+    except (OSError, ValueError, RuntimeError, KeyboardInterrupt) as error:
+        interrupted = isinstance(error, KeyboardInterrupt)
+        cleanup_only = isinstance(error, (CustodyUnconfirmed, NativeRetirementUnconfirmed))
+        if cleanup_only:
+            message = "Google enrollment cleanup requires inspection."
+        elif isinstance(error, ConnectError):
+            message = str(error)
+        elif interrupted:
+            message = "Google sign-in cancelled."
+        else:
+            message = "Workstation enrollment did not complete."
+        print(f"oc-sandbox google: {message}", file=sys.stderr)
+        if not cleanup_only and needs_custody_inspection(error):
+            print("oc-sandbox google: Google enrollment cleanup requires inspection.", file=sys.stderr)
+        return 130 if interrupted else 1
+
+
 def main():
     try:
         verify_sources()
@@ -102,16 +125,7 @@ def main():
     args = parser.parse_args()
 
     if args.verb == "connect":
-        from oc_google.connect import ConnectError, connect_for
-
-        try:
-            return connect_for(args.label)
-        except ConnectError as error:
-            print(f"oc-sandbox google: {error}", file=sys.stderr)
-            return 1
-        except (OSError, ValueError, RuntimeError):
-            print("oc-sandbox google: Workstation enrollment did not complete.", file=sys.stderr)
-            return 1
+        return run_connect(args.label)
 
     from oc_google.control import ControlError
     from oc_orchestrator.owner import OwnerLost
