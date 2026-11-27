@@ -25,8 +25,9 @@
 | `oc-sandbox -h` | Help |
 
 Flags combine (`oc-sandbox -i b -W myrepo -P 3001:3000 -p -D`). It is idempotent: rerun it any time;
-shared images are rebuilt only when their inputs change or `-r` is given, and OpenCode is checked for
-updates on each setup unless `OC_OPENCODE_VERSION=keep`. If that instance's OpenCode is already running, it just
+shared images are rebuilt only when their inputs change or `-r` is given (stale built images past
+`OC_IMAGE_MAX_AGE_DAYS`, default `14`, emit a warning recommending `-r`), and OpenCode defaults to the
+digest-pinned image-baked binary (`OC_OPENCODE_VERSION=baked`). If that instance's OpenCode is already running, it just
 completes the setup (like `-n`) and tells you to use `-x`. Closing a Chromium window stops that
 container, and the next run starts it again. Memory limits can be changed with `OC_AGENT_MEMORY`,
 `OC_CHROMIUM_MEMORY` and `OC_DIND_MEMORY` (default `4g` each; Postgres has `2g`); they apply per
@@ -36,6 +37,14 @@ The agent image includes zsh, Git, Vim and the Docker CLI. The agent shell uses 
 vi mode and your Git identity. A red `[sandbox:NAME]` prompt, `OC_SANDBOX=1` and
 `OC_INSTANCE=NAME` identify the session. The agent runs unprivileged with all capabilities
 dropped, `no-new-privileges`, and PID and memory limits.
+
+When `~/.oh-my-zsh` is absent on the host, setup uses the supported commit-pinned upstream
+`oh-my-zsh` and `zsh-vi-mode` checkouts stored in the owner-only `oh-my-zsh-pinned` build cache.
+If a legacy host `~/.oh-my-zsh` directory is present, setup stages it inside an owner-only
+(`0700`) private build boundary and refuses setup if `custom`, `custom/plugins`, or
+`custom/plugins/zsh-vi-mode` is a symlink or non-directory (including when `zsh-vi-mode` already
+exists through a symlink). Hosts that manage Oh My Zsh plugins through symlinks should use the
+pinned upstream path instead by keeping `~/.oh-my-zsh` absent from the sandbox host home.
 
 ### OpenAI local acceptance
 
@@ -65,14 +74,29 @@ starts to finish creating resources; neither lock is held during an interactive 
 The small `setup.lock` and `lifecycle.lock` files under `~/.local/share/oc-sandbox` are retained even
 after `-d -a` so that concurrent commands cannot accidentally lock different inodes.
 
-Each setup checks for an OpenCode update, including `-n`. The networked updater has its own SELinux
-label and has neither the shared home nor sandbox mounted. It stages a fresh release and receives
-only a digest of the current binary for change detection and promotion. Set
-`OC_OPENCODE_VERSION=keep` to skip the update or specify a version such as `2.3.0` to stage it with
-the official versioned installer. On failure or timeout, setup keeps the working copy or uses the
-image's baked-in copy if needed.
-Choosing Restart after an in-app update currently ends the session. Launch `oc-sandbox` again.
-An update in another instance and quitting OpenCode can produce the same signal as Restart.
+By default (`OC_OPENCODE_VERSION=baked` or unset), setup skips network updates and runs only the
+digest-pinned OpenCode binary baked into `oc-agent`, ignoring any binary in the shared `oc-home`
+volume. Chrome DevTools MCP is also baked into `oc-agent` from a hash-verified release tarball instead
+of fetched via `npx` at session start.
+
+Two explicit opt-in modes remain available for unmanaged sessions:
+- **Verified release opt-in:** set both `OC_OPENCODE_VERSION=<2.x semver>` and
+  `OC_OPENCODE_SHA256=<64-char lowercase hex>` (and optionally `OC_OPENCODE_ARCHIVE_SHA256`).
+  The isolated networked `stage` container downloads the direct GitHub release archive under strict
+  size and decompression bounds and verifies the binary SHA-256 before running `--version`. The
+  offline `promote` container independently verifies the same SHA-256 before updating `oc-home`.
+  At launch, `oc-opencode-run` copies the promoted binary through descriptor-relative `O_NOFOLLOW`
+  opens into a kernel-sealed immutable `memfd`, verifies `OC_OPENCODE_EXPECTED_SHA256` on the exact
+  copied bytes, and executes the sealed snapshot. If the updater fails cleanly (for example offline
+  or on digest mismatch), setup falls back to the baked-in image binary rather than selecting volume
+  bytes.
+- **Unverified compatibility fallback:** set `OC_OPENCODE_VERSION=keep` to skip network updates and
+  allow an existing binary already present in `oc-home` (`OC_OPENCODE_USE_VOLUME=1`).
+
+Built images record UTC build timestamps (`oc.built_epoch` and `oc.built_at`). When an owned image
+is older than `OC_IMAGE_MAX_AGE_DAYS` (default `14`, bounded `1..3650`) or has a missing/invalid
+timestamp, setup warns on `stderr` to run `oc-sandbox -r` for fresh distro security updates (especially
+for `oc-chromium`, which runs without its inner sandbox).
 
 ## Parallel instances
 

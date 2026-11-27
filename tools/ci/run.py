@@ -81,6 +81,7 @@ SUITES = (
     discover('OpenAI interactive session broker', 'test_openai_session_broker.py'),
     discover('OpenAI zero-tool canary', 'test_openai_canary.py'),
     discover('OpenAI interactive shell e2e harness', 'test_openai_shell_e2e_harness.py'),
+    discover('Supply-chain pinning and image age invariants', 'test_supply_chain_pins.py'),
 )
 
 SHELL_FILES = (
@@ -191,6 +192,7 @@ PYTHON_FILES = (
     'tests/test_provider_config.py',
     'tests/test_provider_contracts.py',
     'tests/test_sonar_publisher.py',
+    'tests/test_supply_chain_pins.py',
     'tests/worktree_review_regressions.py',
     'tests/worktree_state_regressions.py',
     'tools/ci/core_coverage.py',

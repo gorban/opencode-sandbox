@@ -1092,9 +1092,11 @@ if [ -n "\${STUB_SETUP:-}" ]; then
       name=\$5; record="\$setup_dir/images/\$name"
       [ -f "\$record" ] || exit 125
       hash=\$(cat "\$record")
+      epoch=""
+      [ -f "\$record.epoch" ] && epoch=\$(cat "\$record.epoch")
       case "\$name" in oc-agent) id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;;
         *) id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb;; esac
-      case "\$4" in *oc.hash*) printf '%s %s\n' "\$id" "\$hash";; *) echo "\$id";; esac
+      case "\$4" in *oc.hash*) printf '%s %s %s\n' "\$id" "\$hash" "\$epoch";; *) echo "\$id";; esac
       exit 0;;
     "pod exists"|"container inspect") exit 1;;
     "pod create")
@@ -1106,17 +1108,23 @@ if [ -n "\${STUB_SETUP:-}" ]; then
     "pod rm") [ -n "\${STUB_DELETE_SIGNAL:-}" ] && : > "\$setup_dir/deleted"; exit 0;;
   esac
   if [ "\$1" = build ]; then
-    shift; tag= hash=
+    shift; tag= hash= epoch=
     while [ \$# -gt 0 ]; do
       case "\$1" in
         -t) tag=\$2; shift 2;;
-        --label) case "\$2" in oc.hash=*) hash=\${2#oc.hash=};; esac; shift 2;;
+        --label)
+          case "\$2" in
+            oc.hash=*) hash=\${2#oc.hash=};;
+            oc.built_epoch=*) epoch=\${2#oc.built_epoch=};;
+          esac
+          shift 2;;
         *) shift;;
       esac
     done
     echo "\$tag" >> "\$setup_dir/builds"
     sleep .3
     printf '%s\n' "\$hash" > "\$setup_dir/images/\$tag"
+    printf '%s\n' "\$epoch" > "\$setup_dir/images/\$tag.epoch"
     exit 0
   fi
 fi
@@ -1548,6 +1556,17 @@ check "agent image built once across concurrent setups" test "$(grep -c '^oc-age
 check "chromium image built once across concurrent setups" test "$(grep -c '^oc-chromium$' "$T/lifecycle/builds")" = 1
 check "keep skips update containers" ! grep -q 'oc-opencode-update' "$T/stub.log"
 check "waiting setup names the holder" grep -qE 'Waiting for setup \(pid=[0-9]+ instance=(first|second)\)' "$T/lifecycle/first.out" "$T/lifecycle/second.out"
+: > "$T/stub.log"
+life_run env -u OC_OPENCODE_VERSION timeout 30 "$SCRIPT" -n -i baked-default -K > "$T/lifecycle/baked.out" 2>&1 </dev/null
+rc=$?
+check "default baked mode skips update containers" sh -c \
+  "[ '$rc' -eq 0 ] && ! grep -q 'oc-opencode-update' '$T/stub.log' && ! grep -q 'warning: image' '$T/lifecycle/baked.out'"
+printf '%s\n' "$(( $(date -u +%s) - 20 * 86400 ))" > "$T/lifecycle/images/oc-chromium.epoch"
+life_run env -u OC_OPENCODE_VERSION timeout 30 "$SCRIPT" -n -i stale-chrome -K > "$T/lifecycle/stale.out" 2>&1 </dev/null
+rc=$?
+check "stale Chromium image emits age warning with -r guidance" sh -c \
+  "[ '$rc' -eq 0 ] && grep -q \"warning: image 'oc-chromium' is 20 days old\" '$T/lifecycle/stale.out' && grep -q 'oc-sandbox -r' '$T/lifecycle/stale.out'"
+printf '%s\n' "$(date -u +%s)" > "$T/lifecycle/images/oc-chromium.epoch"
 for mode in '' invalid; do
   : > "$T/stub.log"
   life_run env OC_CHROMIUM_MODE="$mode" "$SCRIPT" -n -i invalid-mode > "$T/lifecycle/chrome-mode.out" 2>&1

@@ -37,7 +37,14 @@ RELAY_IMG=oc-openai-relay
 # inherits them). The role label is informational only.
 IMAGE_LOG="$STATE/built-images"
 OWNER_LABEL=io.github.gorban.opencode-sandbox.image
-DIND_IMG=${OC_DIND_IMAGE:-quay.io/podman/stable:latest}
+DIND_IMG=${OC_DIND_IMAGE:-quay.io/podman/stable:v6.2.0@sha256:6fc7e3c47e3f9f9552f8ae47467297f6e97b3cbb6149cea62b67a5dc65ca15da}
+OHMYZSH_URL=https://github.com/ohmyzsh/ohmyzsh
+OHMYZSH_COMMIT=abfce729ab56543b976b08ef34a54b3dc57601a4
+ZSH_VI_MODE_URL=https://github.com/jeffreytse/zsh-vi-mode
+ZSH_VI_MODE_COMMIT=91cafe4a09b6670cb8e761aa413e5f7b9e00816f
+IMAGE_MAX_AGE_DAYS_MIN=1
+IMAGE_MAX_AGE_DAYS_MAX=3650
+IMAGE_EPOCH_MIN=1577836800
 HOMEVOL=oc-home                        # OpenCode login, sessions, self-updated binary: shared by all instances
 CODE_BIN=${OC_CODE_BIN:-/home/linuxbrew/.linuxbrew/bin/code}   # host VS Code (override with OC_CODE_BIN)
 BC_BIN=${OC_BCOMPARE_BIN:-/usr/bin/bcompare}                         # host Beyond Compare (override with OC_BCOMPARE_BIN)
@@ -286,7 +293,7 @@ try:
     for path in paths: directory(path, True)
     for name in ("sb-level", "built-images", "built-images.lock", "pg-sig.key", "pg-sig.lock"):
         leaf(os.path.join(state, name), name in ("pg-sig.key", "pg-sig.lock"))
-    for name in ("Containerfile.agent", "Containerfile.chromium", "Containerfile.relay", "opencode-sandbox.json", "zshrc", "bridge-open", "gitconfig", "gitignore_global", "oc-opencode-update.py", "oc-opencode-run.py"):
+    for name in ("Containerfile.agent", "Containerfile.chromium", "Containerfile.relay", "opencode-sandbox.json", "zshrc", "bridge-open", "gitconfig", "gitignore_global", "oc-opencode-update.py", "oc-opencode-run.py", "oh-my-zsh-pinned.receipt", "oh-my-zsh-host.receipt"):
         leaf(os.path.join(build, name))
     for name in ("oc_chromium.cil", "installed"): leaf(os.path.join(policy, name))
     for name in ("oc-bridge.service", "oc-bridge.path", "oc-bridge.timer"): leaf(os.path.join(units, name))
@@ -1396,9 +1403,31 @@ BRIDGE_SRC=$(trusted_file "$SCRIPT_DIR/oc-bridge.py") || die "missing or unsafe 
 CODE_BIN=$(host_input editor "$CODE_BIN") || die "OC_CODE_BIN must be an absolute path outside the sandbox"
 BC_BIN=$(host_input editor "$BC_BIN") || die "OC_BCOMPARE_BIN must be an absolute path outside the sandbox"
 verify_bridge_stage
-OPENCODE_VERSION=${OC_OPENCODE_VERSION:-}
-if [[ -n $OPENCODE_VERSION && $OPENCODE_VERSION != keep && ! $OPENCODE_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]]; then
-  die "OC_OPENCODE_VERSION must be keep or a version such as 2.3.0"
+OPENCODE_VERSION=${OC_OPENCODE_VERSION:-baked}
+OPENCODE_SHA256=${OC_OPENCODE_SHA256:-}
+OPENCODE_ARCHIVE_SHA256=${OC_OPENCODE_ARCHIVE_SHA256:-}
+if [[ $OPENCODE_VERSION == baked || $OPENCODE_VERSION == keep ]]; then
+  if [[ -n $OPENCODE_SHA256 || -n $OPENCODE_ARCHIVE_SHA256 ]]; then
+    die "OC_OPENCODE_SHA256 and OC_OPENCODE_ARCHIVE_SHA256 require an explicit OC_OPENCODE_VERSION release"
+  fi
+elif [[ $OPENCODE_VERSION =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([-+][A-Za-z0-9.-]+)?$ ]]; then
+  opencode_major=${OPENCODE_VERSION#v}
+  opencode_major=${opencode_major%%.*}
+  if (( 10#$opencode_major < 2 )); then
+    die "OC_OPENCODE_VERSION opt-in release updates require version 2.x or newer"
+  fi
+  if [[ ! $OPENCODE_SHA256 =~ ^[0-9a-f]{64}$ ]]; then
+    die "OC_OPENCODE_SHA256 (64-char lowercase hex SHA-256 of the opencode binary) is required when opting into OC_OPENCODE_VERSION updates"
+  fi
+  if [[ -n $OPENCODE_ARCHIVE_SHA256 && ! $OPENCODE_ARCHIVE_SHA256 =~ ^[0-9a-f]{64}$ ]]; then
+    die "OC_OPENCODE_ARCHIVE_SHA256 must be a 64-char lowercase hex SHA-256 digest"
+  fi
+else
+  die "OC_OPENCODE_VERSION must be baked, keep, or a 2.x version such as 2.3.0"
+fi
+IMAGE_MAX_AGE_DAYS=${OC_IMAGE_MAX_AGE_DAYS:-14}
+if [[ ! $IMAGE_MAX_AGE_DAYS =~ ^[1-9][0-9]{0,3}$ ]] || (( IMAGE_MAX_AGE_DAYS < IMAGE_MAX_AGE_DAYS_MIN || IMAGE_MAX_AGE_DAYS > IMAGE_MAX_AGE_DAYS_MAX )); then
+  die "OC_IMAGE_MAX_AGE_DAYS must be an integer between $IMAGE_MAX_AGE_DAYS_MIN and $IMAGE_MAX_AGE_DAYS_MAX"
 fi
 CHROMIUM_MODE=${OC_CHROMIUM_MODE-wayland}
 case $CHROMIUM_MODE in
@@ -1505,11 +1534,29 @@ for helper in oc-opencode-update.py oc-opencode-run.py; do
   atomic_host_file "$BUILD/$helper" 0644 < "$helper_path"
 done
 atomic_host_file "$BUILD/Containerfile.agent" 0644 <<'EOF'
-FROM ghcr.io/anomalyco/opencode:2.3.0
+FROM ghcr.io/anomalyco/opencode:2.3.0@sha256:998e3e184c650e603d8bacb5cbeaeb090837078262c25521a7136b0375d2b652
+ARG OHMYZSH_DIR=oh-my-zsh-pinned
 RUN apk add --no-cache nodejs npm git zsh vim tmux jq curl less ripgrep fd ncurses \
       build-base make perl xz python3 py3-pip postgresql17-client \
       bash tar unzip docker-cli docker-cli-compose
-COPY oh-my-zsh /opt/oh-my-zsh
+RUN curl -fsSL --proto =https --tlsv1.2 \
+      https://registry.npmjs.org/chrome-devtools-mcp/-/chrome-devtools-mcp-1.14.0.tgz \
+      -o /tmp/chrome-devtools-mcp.tgz \
+ && printf '%s  /tmp/chrome-devtools-mcp.tgz\n' \
+      'b0eec6626aa7be68d0d25f638aebf0d83c8fc62de70404c56f1bcd53c02b6a960e51713bf73e9f6e280ab836c9f3f8ec8bfe0e0373af1e51aaf379872f07a618' \
+      | sha512sum -c - \
+ && printf '%s  /tmp/chrome-devtools-mcp.tgz\n' \
+      '6c2eb2bdfc4dd0ed762804fe08689b8dc217bb935a583e0237c9cc347cdecf8a' \
+      | sha256sum -c - \
+ && mkdir -p /opt/chrome-devtools-mcp \
+ && tar --no-same-owner --no-same-permissions -xzf /tmp/chrome-devtools-mcp.tgz \
+      --strip-components=1 -C /opt/chrome-devtools-mcp \
+ && rm -f /tmp/chrome-devtools-mcp.tgz \
+ && /usr/bin/python3 -I -c 'import json, pathlib, subprocess; p = json.loads(pathlib.Path("/opt/chrome-devtools-mcp/package.json").read_text()); assert p["version"] == "1.14.0" and p["bin"]["chrome-devtools-mcp"] == "./out/Default/gen/src/bin/chrome-devtools-mcp.js" and not p.get("dependencies") and not p.get("optionalDependencies"); major, minor = (int(x) for x in subprocess.check_output(["node", "-v"], text=True).strip().lstrip("v").split(".")[:2]); assert (major == 20 and minor >= 19) or (major == 22 and minor >= 12) or major >= 23' \
+ && chmod 0755 /opt/chrome-devtools-mcp/out/Default/gen/src/bin/chrome-devtools-mcp.js \
+ && ln -s /opt/chrome-devtools-mcp/out/Default/gen/src/bin/chrome-devtools-mcp.js /usr/local/bin/chrome-devtools-mcp \
+ && /usr/local/bin/chrome-devtools-mcp --version
+COPY ${OHMYZSH_DIR} /opt/oh-my-zsh
 COPY zshrc /opt/zsh/.zshrc
 COPY gitconfig /etc/gitconfig
 COPY gitignore_global /etc/gitignore_global
@@ -1521,12 +1568,13 @@ ENTRYPOINT ["python3", "-I", "/usr/local/bin/oc-opencode-run"]
 RUN chmod +x /usr/local/bin/bridge-open \
  && ln -s bridge-open /usr/local/bin/code \
  && ln -s bridge-open /usr/local/bin/bcompare
-# PATH: self-updating OpenCode lives in the oc-home volume (/root/.opencode) and wins over the baked copy.
-# TAR_OPTIONS: the updater untars as root without CHOWN (we drop all caps), so skip ownership restore.
+# PATH: default execution uses only the digest-pinned baked OpenCode binary; verified opt-in updates
+# are loaded by oc-opencode-run via a kernel-sealed memfd.
+# TAR_OPTIONS: skip ownership restore when extracting without CHOWN.
 # OPENCODE_CONFIG: extra config (Chromium DevTools MCP) merged with your global and project configs.
 ENV OC_SANDBOX=1 ZDOTDIR=/opt/zsh LANG=en_US.UTF-8 TAR_OPTIONS=--no-same-owner \
     OPENCODE_CONFIG=/etc/opencode/oc-sandbox.json \
-    PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
 
 atomic_host_file "$BUILD/opencode-sandbox.json" 0644 <<'EOF'
@@ -1535,7 +1583,7 @@ atomic_host_file "$BUILD/opencode-sandbox.json" 0644 <<'EOF'
   "mcp": {
     "chrome-devtools": {
       "type": "local",
-      "command": ["npx", "-y", "chrome-devtools-mcp@latest",
+      "command": ["/usr/local/bin/chrome-devtools-mcp",
                   "--browserUrl", "http://127.0.0.1:9222"]
     }
   }
@@ -1543,7 +1591,7 @@ atomic_host_file "$BUILD/opencode-sandbox.json" 0644 <<'EOF'
 EOF
 
 atomic_host_file "$BUILD/Containerfile.chromium" 0644 <<'EOF'
-FROM registry.fedoraproject.org/fedora:latest
+FROM registry.fedoraproject.org/fedora:45@sha256:1bd80cd53c142fe07d25dac925494e02fa7aec33534ea30440e74f85014359a1
 RUN dnf install -y chromium curl && dnf clean all
 # Hide the "unsupported command-line flag: --no-sandbox" bar (the container is the sandbox here).
 # This policy only affects that warning; it does not turn the Chromium sandbox back on.
@@ -1622,27 +1670,196 @@ mv -f -- "$gitconfig_tmp" "$BUILD/gitconfig"
 if [[ -f $HOST_GITIGNORE ]]; then atomic_host_file "$BUILD/gitignore_global" 0644 < "$HOST_GITIGNORE"
 else atomic_host_file "$BUILD/gitignore_global" 0644 </dev/null; fi
 
-# oh-my-zsh: copy from the host if present (without .git), else clone
-if [[ ! -d $BUILD/oh-my-zsh ]]; then
-  log "Preparing oh-my-zsh"
-  if [[ -d $HOST_OHMYZSH ]]; then cp -a "$HOST_OHMYZSH" "$BUILD/oh-my-zsh"
-  else host_git clone -q --depth 1 https://github.com/ohmyzsh/ohmyzsh "$BUILD/oh-my-zsh"; fi
-  if [[ ! -d $BUILD/oh-my-zsh/custom/plugins/zsh-vi-mode ]]; then
-    trusted_path "$BUILD/oh-my-zsh/custom/plugins/zsh-vi-mode" >/dev/null || die "refusing sandbox-controlled plugin path"
-    host_git clone -q --depth 1 https://github.com/jeffreytse/zsh-vi-mode \
-      "$BUILD/oh-my-zsh/custom/plugins/zsh-vi-mode"
+omz_dir_private() {  # path mask_octal
+  local path=$1 mask=$2 owner mode
+  read -r owner mode < <(stat -c '%u %a' -- "$path" 2>/dev/null) || return 1
+  [[ $owner == "$(id -u)" && $mode =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$mode & 8#$mask) == 0 ))
+}
+
+omz_stage_paths_safe() {  # root require_plugin(0|1) require_private(0|1)
+  local root=$1 require_plugin=${2:-0} require_private=${3:-0} p
+  [[ -n $root && ! -L $root && -d $root ]] || return 1
+  if (( require_private )); then
+    omz_dir_private "$root" 7077 || return 1
   fi
-  find "$BUILD/oh-my-zsh" -name .git -prune -exec rm -rf {} +
+  for p in "$root/custom" "$root/custom/plugins"; do
+    if [[ -L $p ]]; then return 1; fi
+    if [[ -e $p ]]; then
+      [[ -d $p ]] || return 1
+      if (( require_private )); then
+        omz_dir_private "$p" 7022 || return 1
+      fi
+    fi
+  done
+  p="$root/custom/plugins/zsh-vi-mode"
+  if [[ -L $p ]]; then return 1; fi
+  if (( require_plugin )); then
+    [[ -d $p ]] || return 1
+  elif [[ -e $p && ! -d $p ]]; then
+    return 1
+  fi
+  if [[ -d $p ]] && (( require_private )); then
+    omz_dir_private "$p" 7022 || return 1
+  fi
+  return 0
+}
+
+clone_pinned_repo() {  # url commit dest
+  local url=$1 commit=$2 dest=$3 tmp resolved build_real dest_parent
+  [[ $commit =~ ^[0-9a-f]{40}$ ]] || die "invalid pinned commit SHA for $url"
+  [[ -n $dest && ! -L $dest ]] || die "refusing unsafe destination for $url"
+  build_real=$(/usr/bin/realpath -e -- "$BUILD") || die "missing build directory"
+  dest_parent=$(/usr/bin/realpath -e -- "$(dirname -- "$dest")") || die "missing destination parent for $url"
+  [[ $dest_parent == "$build_real" || $dest_parent == "$build_real/"* ]] \
+    || die "refusing destination outside private build directory for $url"
+  tmp=$(mktemp -d "$BUILD/.clone.XXXXXXXX") || die "failed to create staging directory for $url"
+  if ! (
+    host_git -c core.hooksPath=/dev/null init -q "$tmp" \
+    && host_git -C "$tmp" -c core.hooksPath=/dev/null -c protocol.file.allow=never \
+         fetch -q --no-tags --depth 1 "$url" "$commit" \
+    && host_git -C "$tmp" -c core.hooksPath=/dev/null checkout -q --detach FETCH_HEAD
+  ); then
+    rm -rf -- "$tmp"
+    die "failed to fetch pinned commit $commit from $url"
+  fi
+  resolved=$(host_git -C "$tmp" rev-parse --verify HEAD 2>/dev/null || true)
+  if [[ $resolved != "$commit" ]]; then
+    rm -rf -- "$tmp"
+    die "fetched commit '$resolved' did not match pinned '$commit' for $url"
+  fi
+  find "$tmp" -name .git -prune -exec rm -rf {} +
+  chmod 00700 "$tmp"
+  chmod -R go-w,a-s "$tmp"
+  dest_parent=$(/usr/bin/realpath -e -- "$(dirname -- "$dest")") || { rm -rf -- "$tmp"; die "missing destination parent for $url"; }
+  if [[ -L $dest ]] || { [[ $dest_parent != "$build_real" && $dest_parent != "$build_real/"* ]]; }; then
+    rm -rf -- "$tmp"
+    die "refusing changed or unsafe destination for $url"
+  fi
+  rm -rf -- "$dest"
+  mv -f -- "$tmp" "$dest"
+}
+
+# oh-my-zsh: separate pinned upstream checkout vs legacy host copy (with distinct receipts)
+if [[ -d $HOST_OHMYZSH ]]; then
+  omz_stage_paths_safe "$HOST_OHMYZSH" 0 0 \
+    || die "refusing linked or non-directory oh-my-zsh plugin path under $HOST_OHMYZSH"
+  OHMYZSH_BUILD_DIR=oh-my-zsh-host
+  OHMYZSH_RECEIPT=oh-my-zsh-host.receipt
+  host_zvm_source=host
+  host_zvm_commit=host
+  if [[ ! -d $HOST_OHMYZSH/custom/plugins/zsh-vi-mode ]]; then
+    host_zvm_source=upstream-pinned
+    host_zvm_commit=$ZSH_VI_MODE_COMMIT
+  fi
+  want_ohmyzsh_receipt=$(printf 'source=host-legacy\nlayout=physical-private-v2\nzsh_vi_mode_source=%s\nzsh_vi_mode_commit=%s\n' \
+    "$host_zvm_source" "$host_zvm_commit")
+  if ! omz_stage_paths_safe "$BUILD/$OHMYZSH_BUILD_DIR" 1 1 \
+     || [[ -L $BUILD/$OHMYZSH_RECEIPT || ! -f $BUILD/$OHMYZSH_RECEIPT ]] \
+     || [[ "$(<"$BUILD/$OHMYZSH_RECEIPT")" != "$want_ohmyzsh_receipt" ]]; then
+    log "Preparing legacy host oh-my-zsh copy"
+    stage_wrap=$(mktemp -d "$BUILD/.omz-host-stage.XXXXXXXX")
+    chmod 00700 "$stage_wrap"
+    stage_omz="$stage_wrap/tree"
+    mkdir -m 0700 "$stage_omz"
+    cp -a "$HOST_OHMYZSH/." "$stage_omz/"
+    if ! omz_stage_paths_safe "$stage_omz" 0 0; then
+      rm -rf -- "$stage_wrap"
+      die "refusing linked or non-directory oh-my-zsh path in private stage"
+    fi
+    chmod 00700 "$stage_omz"
+    chmod -R go-w,a-s "$stage_omz"
+    if ! omz_dir_private "$stage_wrap" 7077 || ! omz_stage_paths_safe "$stage_omz" 0 1; then
+      rm -rf -- "$stage_wrap"
+      die "refusing broadened permissions on oh-my-zsh private stage"
+    fi
+    if [[ ! -d $stage_omz/custom/plugins/zsh-vi-mode ]]; then
+      mkdir -p "$stage_omz/custom/plugins"
+      chmod go-w,a-s "$stage_omz/custom" "$stage_omz/custom/plugins"
+      if ! omz_dir_private "$stage_wrap" 7077 || ! omz_stage_paths_safe "$stage_omz" 0 1; then
+        rm -rf -- "$stage_wrap"
+        die "refusing linked or broadened oh-my-zsh plugin path in private stage"
+      fi
+      clone_pinned_repo "$ZSH_VI_MODE_URL" "$ZSH_VI_MODE_COMMIT" "$stage_omz/custom/plugins/zsh-vi-mode"
+    fi
+    chmod 00700 "$stage_omz"
+    if ! omz_dir_private "$stage_wrap" 7077 || ! omz_stage_paths_safe "$stage_omz" 1 1; then
+      rm -rf -- "$stage_wrap"
+      die "refusing incomplete, linked, or broadened oh-my-zsh stage layout"
+    fi
+    find "$stage_omz" -name .git -prune -exec rm -rf {} +
+    rm -rf -- "$BUILD/$OHMYZSH_BUILD_DIR"
+    mv -f -- "$stage_omz" "$BUILD/$OHMYZSH_BUILD_DIR"
+    rmdir -- "$stage_wrap"
+    printf '%s\n' "$want_ohmyzsh_receipt" | atomic_host_file "$BUILD/$OHMYZSH_RECEIPT" 0644
+  fi
+else
+  OHMYZSH_BUILD_DIR=oh-my-zsh-pinned
+  OHMYZSH_RECEIPT=oh-my-zsh-pinned.receipt
+  want_ohmyzsh_receipt=$(printf 'source=upstream-pinned\nlayout=physical-private-v2\nohmyzsh_url=%s\nohmyzsh_commit=%s\nzsh_vi_mode_url=%s\nzsh_vi_mode_commit=%s\n' \
+    "$OHMYZSH_URL" "$OHMYZSH_COMMIT" "$ZSH_VI_MODE_URL" "$ZSH_VI_MODE_COMMIT")
+  if ! omz_stage_paths_safe "$BUILD/$OHMYZSH_BUILD_DIR" 1 1 \
+     || [[ -L $BUILD/$OHMYZSH_RECEIPT || ! -f $BUILD/$OHMYZSH_RECEIPT ]] \
+     || [[ "$(<"$BUILD/$OHMYZSH_RECEIPT")" != "$want_ohmyzsh_receipt" ]]; then
+    log "Preparing pinned oh-my-zsh ($OHMYZSH_COMMIT)"
+    stage_wrap=$(mktemp -d "$BUILD/.omz-pinned-stage.XXXXXXXX")
+    chmod 00700 "$stage_wrap"
+    stage_omz="$stage_wrap/tree"
+    clone_pinned_repo "$OHMYZSH_URL" "$OHMYZSH_COMMIT" "$stage_omz"
+    if ! omz_dir_private "$stage_wrap" 7077 || ! omz_stage_paths_safe "$stage_omz" 0 1; then
+      rm -rf -- "$stage_wrap"
+      die "refusing linked or broadened oh-my-zsh path in pinned stage"
+    fi
+    mkdir -p "$stage_omz/custom/plugins"
+    chmod go-w,a-s "$stage_omz/custom" "$stage_omz/custom/plugins"
+    clone_pinned_repo "$ZSH_VI_MODE_URL" "$ZSH_VI_MODE_COMMIT" "$stage_omz/custom/plugins/zsh-vi-mode"
+    chmod 00700 "$stage_omz"
+    if ! omz_dir_private "$stage_wrap" 7077 || ! omz_stage_paths_safe "$stage_omz" 1 1; then
+      rm -rf -- "$stage_wrap"
+      die "refusing incomplete, linked, or broadened oh-my-zsh pinned layout"
+    fi
+    rm -rf -- "$BUILD/$OHMYZSH_BUILD_DIR"
+    mv -f -- "$stage_omz" "$BUILD/$OHMYZSH_BUILD_DIR"
+    rmdir -- "$stage_wrap"
+    printf '%s\n' "$want_ohmyzsh_receipt" | atomic_host_file "$BUILD/$OHMYZSH_RECEIPT" 0644
+  fi
 fi
 
 # ---- images (rebuilt only when inputs change, or with -r) -------------------------
-ensure_image() {  # name containerfile hash role(agent|chromium)
-  local name=$1 file=$2 want=$3 role=$4 cur="" id="" hash="" new
-  cur=$(pm image inspect --format '{{.Id}} {{index .Labels "oc.hash"}}' "$name" 2>/dev/null || true)
-  read -r id hash <<<"$cur" || true
+check_image_age() {  # name built_epoch role
+  local name=$1 built_epoch=$2 role=$3 now_epoch age_secs age_days max_secs extra=""
+  now_epoch=$(date -u +%s)
+  if [[ $role == chromium ]]; then
+    extra=" (Chromium runs without its inner sandbox)"
+  fi
+  # Validate epoch digit width and bounds BEFORE any Bash arithmetic.
+  if [[ ! $built_epoch =~ ^[1-9][0-9]{8,10}$ ]]; then
+    echo "warning: image '$name' has a missing or invalid build timestamp; run 'oc-sandbox -r' to rebuild$extra" >&2
+    return 0
+  fi
+  if (( built_epoch < IMAGE_EPOCH_MIN || built_epoch > now_epoch )); then
+    echo "warning: image '$name' has an out-of-range or future build timestamp ($built_epoch); run 'oc-sandbox -r' to rebuild$extra" >&2
+    return 0
+  fi
+  age_secs=$(( now_epoch - built_epoch ))
+  max_secs=$(( IMAGE_MAX_AGE_DAYS * 86400 ))
+  if (( age_secs >= max_secs )); then
+    age_days=$(( age_secs / 86400 ))
+    echo "warning: image '$name' is ${age_days} days old (threshold: ${IMAGE_MAX_AGE_DAYS} days); run 'oc-sandbox -r' to rebuild with fresh security updates$extra" >&2
+  fi
+}
+
+ensure_image() {  # name containerfile hash role(agent|chromium|relay) [extra build args...]
+  local name=$1 file=$2 want=$3 role=$4 cur="" id="" hash="" built_epoch="" new built_at now_epoch
+  shift 4
+  cur=$(pm image inspect --format '{{.Id}} {{index .Labels "oc.hash"}} {{index .Labels "oc.built_epoch"}}' "$name" 2>/dev/null || true)
+  read -r id hash built_epoch <<<"$cur" || true
   if (( REBUILD )) || [[ $hash != "$want" ]] || ! owned_image "$id"; then
     log "Building $name"
-    pm build "${PULL[@]}" --label "$OWNER_LABEL=$role" --label "oc.hash=$want" -t "$name" \
+    now_epoch=$(date -u +%s)
+    built_at=$(date -u -d "@$now_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    pm build "${PULL[@]}" "$@" --label "$OWNER_LABEL=$role" --label "oc.hash=$want" \
+       --label "oc.built_epoch=$now_epoch" --label "oc.built_at=$built_at" -t "$name" \
        -f "$BUILD/$file" "$BUILD"
     new=$(pm image inspect --format '{{.Id}}' "$name")
     # The build moved the tag to the new image and left the previous one untagged. prune_images
@@ -1656,12 +1873,13 @@ ensure_image() {  # name containerfile hash role(agent|chromium)
     prune_images   # a previous build still used by a container (e.g. a running agent) stays for later
   else
     echo "image $name up to date"
+    check_image_age "$name" "$built_epoch" "$role"
   fi
 }
-agent_hash=$(cd "$BUILD" && cat Containerfile.agent zshrc gitconfig gitignore_global bridge-open opencode-sandbox.json oc-opencode-update.py oc-opencode-run.py | sha256sum | cut -d' ' -f1)
+agent_hash=$(cd "$BUILD" && cat Containerfile.agent "$OHMYZSH_RECEIPT" zshrc gitconfig gitignore_global bridge-open opencode-sandbox.json oc-opencode-update.py oc-opencode-run.py | sha256sum | cut -d' ' -f1)
 chrome_hash=$(cd "$BUILD" && sha256sum Containerfile.chromium | cut -d' ' -f1)
 PULL=(); (( REBUILD )) && PULL=(--pull=always)
-ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"  agent
+ensure_image "$AGENT_IMG"  Containerfile.agent    "$agent_hash"  agent --build-arg "OHMYZSH_DIR=$OHMYZSH_BUILD_DIR"
 ensure_image "$CHROME_IMG" Containerfile.chromium "$chrome_hash" chromium
 if (( MANAGED_MODE )); then
   atomic_host_file "$BUILD/Containerfile.relay" 0644 <<'EOF'
@@ -1679,25 +1897,34 @@ init_bridge_spool \
   || { echo "could not prepare $SB/.bridge (see above)" >&2; exit 1; }
 relabel_shared || { echo "could not relabel $SB for the agents (see above)" >&2; exit 1; }
 
-# ---- OpenCode self-update -----------------------------------------------------
-# An offline reader hashes the current binary, the networked updater sees no
-# mounts, and an offline writer promotes only a complete candidate. The host-side
-# supervisor verifies each CID-receipted container is gone before the next phase.
+# ---- OpenCode binary selection / verified opt-in update -----------------------
+# Default mode (`baked`) runs only the digest-pinned image-baked binary with no
+# network updater. Explicit compatibility mode (`keep`) skips updates and allows
+# an existing binary in oc-home. Verified opt-in updates require both
+# OC_OPENCODE_VERSION and OC_OPENCODE_SHA256; the offline promoter and the
+# launch wrapper independently verify the expected SHA-256.
+OPENCODE_RUN_ENV=()
 if (( MANAGED_MODE )); then
   : # managed provider mode uses an isolated home volume and baked-in pinned OpenCode binary
+elif [[ $OPENCODE_VERSION == baked ]]; then
+  echo "OpenCode: using baked-in image binary (default)"
 elif [[ $OPENCODE_VERSION == keep ]]; then
-  echo "OpenCode: keeping the installed version (OC_OPENCODE_VERSION=keep)"
+  echo "OpenCode: keeping existing volume binary if present (OC_OPENCODE_VERSION=keep, unverified compatibility mode)"
+  OPENCODE_RUN_ENV=(-e OC_OPENCODE_USE_VOLUME=1)
 else
-  log "Checking OpenCode for updates"
+  log "Verifying opt-in OpenCode release ($OPENCODE_VERSION)"
   supervisor=$(trusted_file "$SCRIPT_DIR/oc-opencode-supervisor.py") || die "missing or unsafe oc-opencode-supervisor.py"
   update_rc=0
-  /usr/bin/python3 -I "$supervisor" "$STATE" "$LEVEL" "$HOMEVOL" \
-    "$AGENT_IMG" "$AGENT_MEM" "$OPENCODE_VERSION" "${H[@]}" </dev/null || update_rc=$?
-  if (( update_rc != 0 )); then
+  OC_OPENCODE_ARCHIVE_SHA256=$OPENCODE_ARCHIVE_SHA256 \
+    /usr/bin/python3 -I "$supervisor" "$STATE" "$LEVEL" "$HOMEVOL" \
+      "$AGENT_IMG" "$AGENT_MEM" "$OPENCODE_VERSION" "$OPENCODE_SHA256" "${H[@]}" </dev/null || update_rc=$?
+  if (( update_rc == 0 )); then
+    OPENCODE_RUN_ENV=(-e "OC_OPENCODE_EXPECTED_SHA256=$OPENCODE_SHA256")
+  else
     if compgen -G "$STATE/opencode-update.*" >/dev/null; then
       die "OpenCode updater cleanup is uncertain; inspect receipts in $STATE before retrying"
     fi
-    echo "warning: OpenCode update failed (offline?); keeping the existing copy or baked-in fallback" >&2
+    echo "warning: OpenCode update failed (offline or digest mismatch); falling back to baked-in image binary" >&2
   fi
 fi
 
@@ -2306,7 +2533,7 @@ fi
 agent_pg=0
 if agent_pg_passfile; then agent_pg=1; fi
 pm rm -f "$AGENT" >/dev/null 2>&1 || true
-envargs=(-e "OC_INSTANCE=$ILABEL")
+envargs=(-e "OC_INSTANCE=$ILABEL" "${OPENCODE_RUN_ENV[@]}")
 for v in "${FWD_ENV[@]}"; do [[ -n ${!v:-} ]] && envargs+=(-e "$v"); done
 if (( agent_pg )); then
   envargs+=(--secret "$PGPASSSECRET",type=mount,target=/run/secrets/oc-pgpass,mode=0600 -e PGPASSFILE=/run/secrets/oc-pgpass)

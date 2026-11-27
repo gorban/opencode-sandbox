@@ -22,6 +22,7 @@ import threading
 import time
 
 from oc_providers.catalog import (
+    CHROME_DEVTOOLS_MCP_COMMAND,
     LaunchRefusedError,
     build_multi_provider_opencode_config,
     parse_provider_filter,
@@ -668,7 +669,7 @@ def generate_opencode_config(*, worker_token: str, models: tuple[str, ...]) -> d
         "mcp": {
             "chrome-devtools": {
                 "type": "local",
-                "command": ["npx", "-y", "chrome-devtools-mcp@latest", "--browserUrl", "http://127.0.0.1:9222"],
+                "command": list(CHROME_DEVTOOLS_MCP_COMMAND),
             }
         },
         "providers": {"local": provider},

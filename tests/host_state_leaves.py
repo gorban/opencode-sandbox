@@ -18,7 +18,8 @@ with tempfile.TemporaryDirectory(prefix='oc-leaf-') as tmp:
     failures = []
     for target in (build / 'Containerfile.agent', policy / 'oc_chromium.cil', state / 'sb-level',
                    state / 'built-images', state / 'built-images.lock', state / 'pg-sig.key', state / 'pg-sig.lock',
-                   build / 'gitconfig', policy / 'installed', units / 'oc-bridge.timer'):
+                   build / 'gitconfig', build / 'oh-my-zsh-pinned.receipt', build / 'oh-my-zsh-host.receipt',
+                   policy / 'installed', units / 'oc-bridge.timer'):
         for kind in ('symlink', 'hardlink'):
             if kind == 'symlink': target.symlink_to(sentinel)
             else: os.link(sentinel, target)

@@ -183,93 +183,203 @@ class UpdateTests(unittest.TestCase):
     def tearDown(self): self.tmp.cleanup()
     def snapshot(self):
         out=io.BytesIO(); update.snapshot(self.home,out); return io.BytesIO(out.getvalue())
-    def runner(self, new=b'new binary', version='2.3.0'):
+    def make_archive(self, dest, members):
+        import tarfile as tf_mod
+        with tf_mod.open(dest, 'w:gz') as tf:
+            for item in members:
+                if item[0] == 'reg':
+                    _, name, data = item
+                    info = tf_mod.TarInfo(name=name); info.size = len(data); info.mode = 0o755
+                    tf.addfile(info, io.BytesIO(data))
+                elif item[0] == 'sym':
+                    _, name, target = item
+                    info = tf_mod.TarInfo(name=name); info.type = tf_mod.SYMTYPE; info.linkname = target
+                    tf.addfile(info)
+                elif item[0] == 'dir':
+                    _, name = item
+                    info = tf_mod.TarInfo(name=name); info.type = tf_mod.DIRTYPE; info.mode = 0o755
+                    tf.addfile(info)
+    def downloader(self, payload=b'new binary', members=None):
+        urls=[]
+        def fake_dl(url, dest, env, timeout, max_bytes):
+            urls.append((url, timeout, max_bytes))
+            items = members if members is not None else [('reg', 'opencode', payload)]
+            self.make_archive(dest, items)
+            return dest.stat().st_size
+        return fake_dl, urls
+    def runner(self, version='opencode v2.3.0\n'):
         calls=[]
-        def fake(args,env,timeout):
-            calls.append((args,timeout))
-            if args[0] == 'curl':
-                return ''
-            if args[0] == 'bash':
-                (Path(env['HOME'])/'.opencode/bin/opencode').write_bytes(new)
-                (Path(env['HOME'])/'.opencode/bin/opencode').chmod(0o755)
-                return ''
-            if args[-1]=='--version': return version
+        def fake(args, env, timeout):
+            calls.append((args, timeout))
+            if args[-1] == '--version': return version
             raise AssertionError(args)
-        return fake,calls
-    def stage(self, runner, pin=''):
-        out=io.BytesIO(); update.stage(self.snapshot(),pin,out,runner); return out.getvalue()
+        return fake, calls
+    def stage(self, *, payload=b'new binary', pin='2.3.0', sha256=None, version='opencode v2.3.0\n',
+              archive_sha256='', members=None):
+        expected = hashlib.sha256(payload).hexdigest() if sha256 is None else sha256
+        dl, urls = self.downloader(payload=payload, members=members)
+        fake, calls = self.runner(version=version)
+        out = io.BytesIO()
+        update.stage(self.snapshot(), pin, expected, out,
+                     expected_archive_sha256=archive_sha256, runner=fake, downloader=dl)
+        return out.getvalue(), urls, calls, expected
     def test_version_output_is_not_trimmed_by_real_runner(self):
         script=Path(self.tmp.name)/'version'; script.write_text('#!/bin/sh\nprintf "opencode v2.3.0\\n\\n"\n'); script.chmod(0o755)
         self.assertEqual(update.run([str(script)],os.environ,10),'opencode v2.3.0\n\n')
     def test_rejects_extra_or_control_version_output(self):
         for suffix in (' trailing', '\r', '\x00', '\nextra'):
             with self.subTest(suffix=suffix):
-                fake, _ = self.runner(version='opencode v2.3.0' + suffix)
                 with self.assertRaises(ValueError):
-                    self.stage(fake)
+                    self.stage(version='opencode v2.3.0' + suffix)
                 self.assertEqual(self.live.read_bytes(), b'old binary')
-
-    def test_stages_then_promotes_atomically_and_honours_pin(self):
-        fake,calls=self.runner(version='opencode v2.3.0\n'); frame=self.stage(fake,'2.3.0')
-        self.assertEqual(self.live.read_bytes(),b'old binary')
-        self.assertEqual(calls[0][0][-1], 'https://opencode.ai/v2/install')
-        self.assertEqual(calls[1][0][-2:], ['--version', '2.3.0'])
-        self.assertEqual(len(calls), 3)
-        update.promote(self.home,io.BytesIO(frame)); self.assertEqual(self.live.read_bytes(),b'new binary')
-    def test_offline_and_timeout_do_not_modify_live_binary(self):
-        for exc in (RuntimeError('offline'),subprocess.TimeoutExpired('updater',1)):
-            out=io.BytesIO()
-            def fail(*args): raise exc
-            snapshot = self.snapshot()
-            with self.assertRaises(type(exc)):
-                update.stage(snapshot, '', out, fail)
-            self.assertEqual(out.getvalue(),b''); self.assertEqual(self.live.read_bytes(),b'old binary')
-    def test_wrong_pin_and_incomplete_or_corrupt_frame_do_not_promote(self):
-        fake,_=self.runner(version='2.3.1'); out=io.BytesIO()
-        snapshot = self.snapshot()
-        with self.assertRaises(ValueError):
-            update.stage(snapshot, '2.3.0', out, fake)
-        self.assertEqual(out.getvalue(),b''); self.assertEqual(self.live.read_bytes(),b'old binary')
-        fake,_=self.runner(); frame=self.stage(fake)
-        for bad in (frame[:-1],frame[:-len(update.END)]+b'bad'):
-            with self.assertRaises(ValueError): update.promote(self.home,io.BytesIO(bad))
-            self.assertEqual(self.live.read_bytes(),b'old binary')
-    def test_concurrent_binary_change_is_not_overwritten(self):
-        fake,_=self.runner(); frame=self.stage(fake)
-        self.live.write_bytes(b'another update')
-        with self.assertRaises(ValueError): update.promote(self.home,io.BytesIO(frame))
-        self.assertEqual(self.live.read_bytes(),b'another update')
-    def test_up_to_date_still_checks_each_time_and_sends_no_update(self):
-        fake,calls=self.runner(new=b'old binary')
-        self.assertEqual(self.stage(fake),b''); self.assertEqual(self.stage(fake),b'')
-        self.assertEqual(sum(args[0] == 'curl' for args,_ in calls),2)
-    def test_unpinned_uses_fresh_installer_without_running_previous_binary(self):
-        fake, calls = self.runner(version='opencode v2.3.0\n')
-        frame = self.stage(fake)
-        self.assertEqual([args[0] for args, _ in calls][:2], ['curl', 'bash'])
-        self.assertEqual(calls[0][0][-1], 'https://opencode.ai/v2/install')
-        self.assertEqual(len(calls), 3)
-        update.promote(self.home, io.BytesIO(frame))
+    def test_stages_direct_release_verifies_digest_before_exec_and_promotes_atomically(self):
+        frame, urls, calls, expected = self.stage(payload=b'new binary', pin='2.3.0')
+        self.assertEqual(self.live.read_bytes(), b'old binary')
+        self.assertEqual(len(urls), 1)
+        self.assertTrue(urls[0][0].startswith('https://github.com/anomalyco/opencode/releases/download/v2.3.0/opencode-linux-'))
+        self.assertTrue(urls[0][0].endswith('-musl.tar.gz'))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][-1], '--version')
+        update.promote(self.home, io.BytesIO(frame), expected)
         self.assertEqual(self.live.read_bytes(), b'new binary')
-
-    def test_legacy_to_v2_pin_uses_versioned_v2_installer(self):
-        calls=[]
-        def fake(args,env,timeout):
-            calls.append(args)
-            candidate=Path(env['HOME'])/'.opencode/bin/opencode'
-            if args[0]=='curl': Path(args[args.index('-o')+1]).write_text('fixture'); return ''
-            if args[0]=='bash': candidate.write_bytes(b'version two'); candidate.chmod(0o755); return ''
-            if args[-1]=='--version': return 'opencode v2.3.0\n'
-            raise AssertionError(args)
-        frame=self.stage(fake,'2.3.0')
-        self.assertEqual(next(a for a in calls if a[0]=='bash')[-3:],['--no-modify-path','--version','2.3.0'])
-        update.promote(self.home,io.BytesIO(frame)); self.assertEqual(self.live.read_bytes(),b'version two')
-    def test_v1_pin_selects_official_v1_installer_without_running_previous_binary(self):
-        fake, calls = self.runner(version='1.19.2')
-        self.stage(fake, '1.19.2')
-        self.assertEqual(calls[0][0][-1], 'https://opencode.ai/install')
-        self.assertEqual(calls[1][0][-2:], ['--version', '1.19.2'])
-        self.assertEqual(len(calls), 3)
+    def test_wrong_binary_digest_refused_before_executing_version(self):
+        wrong = '0' * 64
+        dl, urls = self.downloader(payload=b'untrusted payload')
+        fake, calls = self.runner(version='opencode v2.3.0\n')
+        snap = self.snapshot()
+        out = io.BytesIO()
+        with self.assertRaisesRegex(ValueError, 'OC_OPENCODE_SHA256'):
+            update.stage(snap, '2.3.0', wrong, out, runner=fake, downloader=dl)
+        self.assertEqual(len(urls), 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(out.getvalue(), b'')
+        self.assertEqual(self.live.read_bytes(), b'old binary')
+    def test_promote_independently_rejects_consistent_forged_frame_with_wrong_digest(self):
+        frame, _, _, real_sha = self.stage(payload=b'new binary', pin='2.3.0')
+        other_sha = hashlib.sha256(b'different expected binary').hexdigest()
+        self.assertNotEqual(real_sha, other_sha)
+        stream = io.BytesIO(frame)
+        with self.assertRaisesRegex(ValueError, 'OC_OPENCODE_SHA256'):
+            update.promote(self.home, stream, other_sha)
+        self.assertEqual(self.live.read_bytes(), b'old binary')
+    def test_matching_existing_digest_short_circuits_without_network(self):
+        old_sha = hashlib.sha256(b'old binary').hexdigest()
+        dl, urls = self.downloader(payload=b'old binary')
+        fake, calls = self.runner()
+        out = io.BytesIO()
+        update.stage(self.snapshot(), '2.3.0', old_sha, out, runner=fake, downloader=dl)
+        self.assertEqual(out.getvalue(), b'')
+        self.assertEqual(urls, [])
+        self.assertEqual(calls, [])
+    def test_offline_and_timeout_do_not_modify_live_binary(self):
+        expected = hashlib.sha256(b'new binary').hexdigest()
+        for exc in (RuntimeError('offline'), subprocess.TimeoutExpired('curl', 1)):
+            snap = self.snapshot()
+            out = io.BytesIO()
+            def fail(*args): raise exc
+            with self.assertRaises(type(exc)):
+                update.stage(snap, '2.3.0', expected, out, downloader=fail)
+            self.assertEqual(out.getvalue(), b''); self.assertEqual(self.live.read_bytes(), b'old binary')
+    def test_wrong_pin_and_incomplete_or_corrupt_frame_do_not_promote(self):
+        with self.assertRaises(ValueError):
+            self.stage(pin='2.3.0', version='2.3.1')
+        self.assertEqual(self.live.read_bytes(), b'old binary')
+        frame, _, _, expected = self.stage()
+        for bad in (frame[:-1], frame[:-len(update.END)] + b'bad'):
+            stream = io.BytesIO(bad)
+            with self.assertRaises(ValueError):
+                update.promote(self.home, stream, expected)
+            self.assertEqual(self.live.read_bytes(), b'old binary')
+    def test_concurrent_binary_change_is_not_overwritten(self):
+        frame, _, _, expected = self.stage()
+        self.live.write_bytes(b'another update')
+        stream = io.BytesIO(frame)
+        with self.assertRaises(ValueError):
+            update.promote(self.home, stream, expected)
+        self.assertEqual(self.live.read_bytes(), b'another update')
+    def test_v1_and_missing_digest_are_rejected(self):
+        valid_sha = hashlib.sha256(b'new binary').hexdigest()
+        with self.assertRaises(ValueError):
+            self.stage(pin='1.19.2', version='1.19.2')
+        with self.assertRaises(ValueError):
+            self.stage(pin='', sha256=valid_sha)
+        with self.assertRaises(ValueError):
+            self.stage(pin='2.3.0', sha256='not-a-digest')
+    def test_archive_bounds_special_members_truncation_and_temp_cleanup(self):
+        with tempfile.TemporaryDirectory() as scratch_tmp:
+            scratch = Path(scratch_tmp)
+            env_patch = {'TMPDIR': str(scratch)}
+            cases = [
+                ('symlink', [('sym', 'opencode', '/etc/passwd')]),
+                ('traversal', [('reg', '../opencode', b'new binary')]),
+                ('duplicate', [('reg', 'opencode', b'a'), ('reg', './opencode', b'b')]),
+                ('missing', [('reg', 'README.md', b'hi')]),
+                ('too_many', [('reg', f'f{i}', b'x') for i in range(65)]),
+            ]
+            for label, members in cases:
+                with self.subTest(case=label), patch.dict(os.environ, env_patch):
+                    with self.assertRaises(ValueError):
+                        self.stage(members=members)
+                    self.assertEqual(list(scratch.iterdir()), [])
+            # Truncated gzip archive and oversized total decompressed stream (including skipped member)
+            with patch.dict(os.environ, env_patch):
+                def trunc_dl(url, dest, env, timeout, max_bytes):
+                    self.make_archive(dest, [('reg', 'opencode', b'x' * 4096)])
+                    raw = dest.read_bytes()
+                    dest.write_bytes(raw[:len(raw) // 2])
+                    return dest.stat().st_size
+                fake, calls = self.runner()
+                snap = self.snapshot()
+                expected_trunc = hashlib.sha256(b'x' * 4096).hexdigest()
+                out = io.BytesIO()
+                with self.assertRaises(ValueError):
+                    update.stage(snap, '2.3.0', expected_trunc, out, runner=fake, downloader=trunc_dl)
+                self.assertEqual(calls, [])
+                self.assertEqual(list(scratch.iterdir()), [])
+                # Oversized total decompressed stream covering skipped members + opencode
+                archive = scratch / 'bomb.tar.gz'
+                self.make_archive(archive, [('reg', 'pad.bin', b'a' * 8192), ('reg', 'opencode', b'b' * 4096)])
+                with self.assertRaisesRegex(ValueError, 'decompressed'):
+                    update.extract_opencode_binary(archive, scratch / 'out', max_decompressed=4096)
+                archive.unlink()
+                self.assertEqual(list(scratch.iterdir()), [])
+    def test_download_release_enforces_streaming_size_bound_and_timeout_cleanup(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td); fakebin = d / 'bin'; fakebin.mkdir()
+            # 1) Streaming response without Content-Length exceeding max_bytes
+            curl_big = fakebin / 'curl'
+            curl_big.write_text('#!/usr/bin/python3\nimport sys\nsys.stdout.buffer.write(b"x" * 20000)\nsys.stdout.buffer.flush()\n')
+            curl_big.chmod(0o755)
+            env = {**os.environ, 'PATH': f'{fakebin}:/usr/bin:/bin'}
+            with self.assertRaisesRegex(ValueError, 'size limit'):
+                update.download_release('https://example.invalid/a.tar.gz', d / 'a.tar.gz', env, timeout=5, max_bytes=4096)
+            self.assertFalse((d / 'a.tar.gz').exists())
+            # 2) Hanging download killed cleanly within deadline
+            marker = d / 'child.pid'
+            curl_hang = fakebin / 'curl'
+            curl_hang.write_text(f'#!/usr/bin/python3\nimport os, pathlib, time\npathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\ntime.sleep(30)\n')
+            curl_hang.chmod(0o755)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                update.download_release('https://example.invalid/b.tar.gz', d / 'b.tar.gz', env, timeout=0.4, max_bytes=4096)
+            self.assertFalse((d / 'b.tar.gz').exists())
+            if marker.exists():
+                pid = int(marker.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+    def test_download_release_does_not_spawn_curl_when_destination_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / 'existing.tar.gz'
+            dest.write_bytes(b'already present')
+            with patch.object(update.subprocess, 'Popen') as popen:
+                with self.assertRaises(FileExistsError):
+                    update.download_release('https://example.invalid/c.tar.gz', dest, os.environ, timeout=5, max_bytes=4096)
+                popen.assert_not_called()
+            self.assertEqual(dest.read_bytes(), b'already present')
+            fresh = Path(td) / 'spawn-fail.tar.gz'
+            with patch.object(update.subprocess, 'Popen', side_effect=FileNotFoundError('missing curl')):
+                with self.assertRaises(FileNotFoundError):
+                    update.download_release('https://example.invalid/d.tar.gz', fresh, os.environ, timeout=5, max_bytes=4096)
+            self.assertFalse(fresh.exists())
     def test_snapshot_refuses_fifo_without_a_writer(self):
         self.live.unlink()
         os.mkfifo(self.live)
@@ -290,25 +400,22 @@ class UpdateTests(unittest.TestCase):
         self.assertNotIn(b'PRIVATE-TEST-CREDENTIAL',source)
         self.assertNotIn(b'old binary', source)
         self.assertEqual(update.read_snapshot(io.BytesIO(source)), hashlib.sha256(b'old binary').hexdigest())
-    def test_first_install_uses_official_pinned_installer_in_staging(self):
-        self.live.unlink(); source=self.snapshot(); calls=[]
-        def fake(args,env,timeout):
-            calls.append(args)
-            if args[0]=='curl': Path(args[args.index('-o')+1]).write_text('fixture installer'); return ''
-            if args[0]=='bash':
-                candidate=Path(env['HOME'])/'.opencode/bin/opencode'
-                candidate.write_bytes(b'first install'); candidate.chmod(0o755); return ''
-            if args[-1]=='--version': return 'opencode v2.3.0\n'
-            raise AssertionError(args)
-        frame=io.BytesIO(); update.stage(source,'2.3.0',frame,fake)
+    def test_first_install_uses_direct_release_and_verifies_optional_archive_digest(self):
+        self.live.unlink()
+        payload = b'first install'
+        expected = hashlib.sha256(payload).hexdigest()
+        # Verify archive digest mismatch fails before extraction
+        with self.assertRaisesRegex(ValueError, 'OC_OPENCODE_ARCHIVE_SHA256'):
+            self.stage(payload=payload, pin='2.3.0', archive_sha256='f' * 64)
         self.assertFalse(self.live.exists())
-        self.assertEqual(calls[0][-1],'https://opencode.ai/v2/install')
-        self.assertEqual(calls[1][-3:],['--no-modify-path','--version','2.3.0'])
-        update.promote(self.home,io.BytesIO(frame.getvalue()))
-        self.assertEqual(self.live.read_bytes(),b'first install')
+        frame, _, _, _ = self.stage(payload=payload, pin='2.3.0')
+        self.assertFalse(self.live.exists())
+        update.promote(self.home, io.BytesIO(frame), expected)
+        self.assertEqual(self.live.read_bytes(), payload)
 
 
 class SupervisorTests(unittest.TestCase):
+    TEST_SHA = 'a' * 64
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.base=Path(self.tmp.name)
         self.state=self.base/'state'; self.state.mkdir(mode=0o700)
@@ -348,9 +455,9 @@ sys.exit(125)
         self.env={**os.environ,'HOME':self.tmp.name,'PATH':str(self.bin)+':/usr/bin:/bin',
                   'FAKE_DB':str(self.db),'FAKE_LOG':str(self.log)}
     def tearDown(self): self.tmp.cleanup()
-    def invoke(self, *, volume='oc-home', image='oc-agent', memory='4g', version='2.3.0', **extra):
+    def invoke(self, *, volume='oc-home', image='oc-agent', memory='4g', version='2.3.0', sha256=TEST_SHA, **extra):
         return subprocess.run([sys.executable,'-I',str(ROOT/'oc-opencode-supervisor.py'),str(self.state),
-                               's0:c1,c2',volume,image,memory,version],
+                               's0:c1,c2',volume,image,memory,version,sha256],
                               env={**self.env,**extra},stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=15)
     def actions(self):
         import json
@@ -359,6 +466,8 @@ sys.exit(125)
         p=self.invoke(); self.assertEqual(p.returncode,0,p.stderr)
         acts=self.actions(); create=[x for x in acts if x[0]=='create']; self.assertEqual([x[-1] for x in create],['snapshot','stage','promote'])
         self.assertIn('--network=none',create[0]); self.assertIn('oc-home:/source:ro',create[0]); self.assertNotIn('-v',create[1]); self.assertIn('--http-proxy=false',create[1]); self.assertIn('--network=none',create[2]); self.assertIn('oc-home:/root',create[2])
+        self.assertIn(f'OC_OPENCODE_SHA256={self.TEST_SHA}', create[1])
+        self.assertIn(f'OC_OPENCODE_SHA256={self.TEST_SHA}', create[2])
         self.assertIn('label=level:s0:c1,c2', create[0])
         self.assertFalse(any(option.startswith('label=level:') for option in create[1]))
         self.assertIn('label=level:s0:c1,c2', create[2])
@@ -377,7 +486,14 @@ sys.exit(125)
             self.assertEqual(args[-5:], ['--', 'oc-agent', '-I', '/usr/local/bin/oc-opencode-update', phase])
             self.assertEqual(args.count('--memory=4g'), 1)
             if phase == 'stage':
-                self.assertEqual(args[args.index('-e') + 1], 'OC_OPENCODE_VERSION=2.3.0-rc.1')
+                self.assertIn('OC_OPENCODE_VERSION=2.3.0-rc.1', args)
+                self.assertIn(f'OC_OPENCODE_SHA256={self.TEST_SHA}', args)
+            if phase == 'promote':
+                self.assertIn(f'OC_OPENCODE_SHA256={self.TEST_SHA}', args)
+    def test_invalid_digest_rejected_before_podman(self):
+        result = self.invoke(sha256='not-hex')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(self.log.exists())
 
     def test_option_like_container_operands_are_rejected_before_podman(self):
         for kind in ('image', 'volume'):
@@ -486,9 +602,27 @@ envargs=(); H=("$HOST")
 
 
 class AgentGuardTests(unittest.TestCase):
+    _HARNESS = (
+        'import ctypes, importlib.util, sys; '
+        'subreaper = sys.argv[1] == "1"; '
+        'subreaper and (ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0 or sys.exit(99)); '
+        'spec = importlib.util.spec_from_file_location("oc_run", sys.argv[2]); '
+        'mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); '
+        'mod.BAKED_OPENCODE = sys.argv[3]; '
+        'sys.argv = ["oc-opencode-run.py", *sys.argv[4:]]; '
+        'sys.exit(mod.main())'
+    )
+
+    def _wrapper_cmd(self, exe: Path, *args, subreaper: bool = False):
+        return [
+            sys.executable, '-I', '-c', self._HARNESS,
+            '1' if subreaper else '0', str(ROOT / 'oc-opencode-run.py'), str(exe), *args,
+        ]
+
     def test_signal_during_spawn_is_forwarded_and_all_children_are_reaped(self):
-        import runpy
-        main = runpy.run_path(str(ROOT / 'oc-opencode-run.py'))['main']
+        spec = importlib.util.spec_from_file_location('oc_run_sig', ROOT / 'oc-opencode-run.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
         child = SimpleNamespace(pid=42, returncode=None, wait=lambda: 0)
         handlers = {}
 
@@ -496,12 +630,17 @@ class AgentGuardTests(unittest.TestCase):
             handlers[signal.SIGTERM](signal.SIGTERM, None)
             return child
 
-        with patch.object(signal, 'signal', side_effect=handlers.__setitem__), \
-                patch.object(subprocess, 'Popen', side_effect=spawn), \
-                patch.object(os, 'pidfd_open', return_value=99), \
-                patch.object(os, 'close'), patch.object(signal, 'pidfd_send_signal') as send, \
-                patch.object(os, 'waitpid', side_effect=[(42, 0), (0, 0)]) as wait:
-            self.assertEqual(main(), 0)
+        with tempfile.TemporaryDirectory() as td:
+            baked = Path(td) / 'opencode'
+            baked.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+            baked.chmod(0o755)
+            mod.BAKED_OPENCODE = str(baked)
+            with patch.object(signal, 'signal', side_effect=handlers.__setitem__), \
+                    patch.object(subprocess, 'Popen', side_effect=spawn), \
+                    patch.object(os, 'pidfd_open', return_value=99), \
+                    patch.object(os, 'close'), patch.object(signal, 'pidfd_send_signal') as send, \
+                    patch.object(os, 'waitpid', side_effect=[(42, 0), (0, 0)]) as wait:
+                self.assertEqual(mod.main(), 0)
         send.assert_called_once_with(99, signal.SIGTERM)
         self.assertEqual([call.args for call in wait.call_args_list],
                          [(-1, 0x40000000), (-1, os.WNOHANG | 0x40000000)])
@@ -534,11 +673,8 @@ os._exit(9)
 ''')
             exe.chmod(0o755)
             # Make the wrapper the adoptive parent without needing a system-wide PID namespace.
-            script = ('import ctypes, runpy, sys; '
-                      'assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0; '
-                      'runpy.run_path(sys.argv[1], run_name="__main__")')
-            env = {**os.environ, 'PATH': temp + ':/usr/bin:/bin'}
-            result = subprocess.run([sys.executable, '-I', '-c', script, str(ROOT/'oc-opencode-run.py')],
+            env = {**os.environ, 'PATH': '/usr/bin:/bin'}
+            result = subprocess.run(self._wrapper_cmd(exe, subreaper=True),
                                     env=env, capture_output=True, timeout=6)
             self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -548,9 +684,9 @@ os._exit(9)
             exe.write_text('#!/usr/bin/python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
             exe.chmod(0o755)
             arguments = ['--title', 'two words', 'literal *', '--', '-fixture']
-            env = {**os.environ, 'PATH': temp + ':/usr/bin:/bin'}
+            env = {**os.environ, 'PATH': '/usr/bin:/bin'}
             result = subprocess.run(
-                [sys.executable, '-I', str(ROOT/'oc-opencode-run.py'), *arguments],
+                self._wrapper_cmd(exe, *arguments),
                 env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -566,8 +702,8 @@ if os.environ['CHANGE']=='1':
  t=p.with_name('next'); t.write_text(p.read_text()+'\\n#new'+str(n)); t.chmod(0o755); os.replace(t,p)
 sys.exit(int(os.environ['RC']))
 '''); exe.chmod(0o755)
-            env={**os.environ,'HOME':td,'PATH':td+':/usr/bin:/bin','COUNT':str(counter),'CHANGE':str(changed),'RC':str(rc)}
-            p=subprocess.run([sys.executable,'-I',str(ROOT/'oc-opencode-run.py')],env=env,stdin=subprocess.DEVNULL,capture_output=True,timeout=10)
+            env={**os.environ,'HOME':td,'PATH':'/usr/bin:/bin','COUNT':str(counter),'CHANGE':str(changed),'RC':str(rc)}
+            p=subprocess.run(self._wrapper_cmd(exe),env=env,stdin=subprocess.DEVNULL,capture_output=True,timeout=10)
             return p.returncode,int(counter.read_text())
     def test_normal_exit_does_not_restart_even_if_binary_changed(self): self.assertEqual(self.run_case(1,0),(0,1))
     def test_failure_without_binary_change_does_not_restart(self): self.assertEqual(self.run_case(0,1),(1,1))
@@ -576,8 +712,8 @@ sys.exit(int(os.environ['RC']))
         with tempfile.TemporaryDirectory() as td:
             d=Path(td); exe=d/'opencode'; marker=d/'child'
             exe.write_text('#!/usr/bin/python3\nimport os,pathlib,time\npathlib.Path(os.environ["MARKER"]).write_text(str(os.getpid()))\ntime.sleep(120)\n'); exe.chmod(0o755)
-            env={**os.environ,'HOME':td,'PATH':td+':/usr/bin:/bin','MARKER':str(marker)}
-            p=subprocess.Popen([sys.executable,'-I',str(ROOT/'oc-opencode-run.py')],env=env,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+            env={**os.environ,'HOME':td,'PATH':'/usr/bin:/bin','MARKER':str(marker)}
+            p=subprocess.Popen(self._wrapper_cmd(exe),env=env,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
             try:
                 deadline=time.monotonic()+5
                 while not marker.exists() and time.monotonic()<deadline: time.sleep(.02)

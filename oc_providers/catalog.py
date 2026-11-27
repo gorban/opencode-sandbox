@@ -434,6 +434,13 @@ def plan_interactive_launch(
     )
 
 
+CHROME_DEVTOOLS_MCP_COMMAND: tuple[str, ...] = (
+    "/usr/local/bin/chrome-devtools-mcp",
+    "--browserUrl",
+    "http://127.0.0.1:9222",
+)
+
+
 def build_multi_provider_opencode_config(
     *,
     plan: ResolvedLaunchPlan,
@@ -464,9 +471,7 @@ def build_multi_provider_opencode_config(
         "mcp": {
             "chrome-devtools": {
                 "type": "local",
-                "command": [
-                    "npx", "-y", "chrome-devtools-mcp@latest", "--browserUrl", "http://127.0.0.1:9222"
-                ],
+                "command": list(CHROME_DEVTOOLS_MCP_COMMAND),
             }
         },
         "providers": providers_block,
