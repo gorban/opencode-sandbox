@@ -23,7 +23,6 @@ class StagingTests(unittest.TestCase):
             "HOME": str(root), "OC_SB": str(self.sandbox),
             "OC_BRIDGE_STAGE": str(self.stage), "OC_CODE_BIN": "/fake/code",
             "OC_BCOMPARE_BIN": "/fake/bcompare",
-            "OC_BRIDGE_BLOCKING_TOOLS": "code,bcompare",
         }))
         self.bridge = runpy.run_path(BRIDGE)["run_session"].__globals__
 
@@ -66,7 +65,7 @@ class StagingTests(unittest.TestCase):
         launch.assert_called_once()
         self.assertEqual(left.read_text(encoding="utf-8"), "left edited")
         self.assertEqual(right.read_text(encoding="utf-8"), "right edited atomically")
-        self.assertFalse(session.exists())
+        self.assertEqual((session / "files/1/item.txt").read_text(encoding="utf-8"), "left edited")
 
     def test_direct_selection_refuses_metadata_and_its_descendants(self):
         for name in ("fixture.Code-Workspace", "fixture.BCPKG", "fixture.bcs", "fixture.bcss",

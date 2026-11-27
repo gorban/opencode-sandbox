@@ -230,11 +230,14 @@ esac; done; exit 0
 EOF
 chmod +x "$B/launch" "$B/tool"
 export OC_SB=$SB OC_BRIDGE_STAGE=$T/stage OC_CODE_BIN=$B/tool OC_BCOMPARE_BIN=$B/tool OC_BRIDGE_LAUNCH=$B/launch
-export OC_BRIDGE_BLOCKING_TOOLS=code,bcompare
 req() { local id=$1; shift; printf '%s\n' "$@" > "$SB/.bridge/requests/$id.req"; }
 bridge() { timeout 20 python3 -I "$BRIDGE" 2>>"$T/bridge.log"; }
 victim_ok() { [[ "$(cat "$V/secret" "$V/requests/precious" "$V/f")" == "$SECRET"$'\n'"$SECRET"$'\n'"$SECRET" ]]; }
 reset_tool() { rm -f "$T/tool.args" "$T/tool.seen" "$T/tool.cwd" "$T/tool.relative"; }
+retire_fixture_stages() {
+  # All fixture editors above run synchronously under the scratch launcher.
+  find "$T/stage" -mindepth 1 -depth -delete
+}
 
 reset_tool; req 1 code /sandbox/construct/a.txt; FAKE_EDIT=edited bridge
 check "file opened as a host-owned staged copy" grep -q "^$T/stage/" "$T/tool.args"
@@ -242,8 +245,9 @@ check "editor receives a relative staged operand" grep -Fxq './files/1/a.txt' "$
 check "editor starts from the private stage session" grep -q "^$T/stage/" "$T/tool.cwd"
 check "staged copy had the sandbox content" grep -qx hello "$T/tool.seen"
 check "saved edit written back into the sandbox" [ "$(cat "$SB/construct/a.txt")" = edited ]
-check "staging cleaned after the session"   [ -z "$(ls -A "$T/stage")" ]
+check "staging retained after unqualified editor exit" test -s "$(head -1 "$T/tool.args")"
 check "queue drained"                       [ -z "$(ls -A "$SB/.bridge/requests")" ]
+retire_fixture_stages
 
 reset_tool
 echo '{}' > "$SB/construct/test.code-workspace"
@@ -255,8 +259,7 @@ check 'bridge drains rejected requests' [ -z "$(ls -A "$SB/.bridge/requests")" ]
 req failed-launch code /sandbox/construct/a.txt
 OC_BRIDGE_LAUNCH=/usr/bin/false bridge
 check 'uncertain session submission keeps the stage private' test -n "$(ls -A "$T/stage")"
-find "$T/stage" -type f -delete
-find "$T/stage" -mindepth 1 -type d -depth -delete
+retire_fixture_stages
 
 reset_tool; req 2 code /sandbox/construct/dir /etc/passwd /sandbox/../victim/secret \
   /sandbox/construct/link/secret /sandbox/construct/./a.txt; bridge
@@ -292,6 +295,7 @@ check 'bridge timer starts and rearms without following a sandbox path' bash -c 
 
 missing_editor_reclaims_slots() {
   local entry remaining
+  retire_fixture_stages
   for (( entry=1; entry<=9; entry++ )); do
     req "missing-editor-$entry" code /sandbox/construct/a.txt
     OC_CODE_BIN="$B/not-installed" OC_BRIDGE_LAUNCH="$B/submit" bridge
@@ -422,7 +426,8 @@ class CopyTests(unittest.TestCase):
         sandbox.mkdir()
         self.target = sandbox / "edit.txt"
         self.target.write_bytes(base)
-        self.enterContext(patch.dict(os.environ, OC_SB=str(sandbox), OC_BRIDGE_STAGE=str(stage)))
+        self.enterContext(patch.dict(os.environ, OC_SB=str(sandbox), OC_BRIDGE_STAGE=str(stage),
+                                     OC_BRIDGE_BLOCKING_TOOLS="code,bcompare"))
         self.bridge = runpy.run_path(bridge_path)["run_session"].__globals__
 
     def stage(self):
@@ -554,28 +559,25 @@ class CopyTests(unittest.TestCase):
         self.bridge["process_queue"]()
         self.assertEqual(list(session.parent.iterdir()), [session])
 
-    def test_forwarding_editor_exit_retains_edits(self):
+    def test_exit_at_conventional_editor_path_retains_staged_edits(self):
         session, staged = self.stage()
 
         def forward(*_args, **_options):
             staged.write_bytes(edit)
             return SimpleNamespace(poll=lambda: 0)
 
-        with patch.dict(self.bridge, BLOCKING_TOOLS=frozenset()), patch("subprocess.Popen", side_effect=forward):
+        with patch.dict(self.bridge["TOOLS"], code="/usr/bin/code"), patch("subprocess.Popen", side_effect=forward):
             self.bridge["run_session"](str(session))
-        self.assert_preserved(staged)
+        self.assertEqual(self.target.read_bytes(), edit)
+        late_save = b"save after launcher exit"
+        staged.write_bytes(late_save)
+        self.assertEqual(staged.read_bytes(), late_save)
         self.assertFalse((session / "recovery").exists())
 
-    def test_finished_recovery_does_not_consume_active_capacity(self):
+    def test_existing_closed_recovery_does_not_consume_active_capacity(self):
         session, staged = self.stage()
-
-        def editor(*_args, **_options):
-            staged.write_bytes(edit)
-            return SimpleNamespace(poll=lambda: 0)
-
-        with patch("subprocess.Popen", side_effect=editor), \
-                patch.object(os, "rename", side_effect=OSError(errno.EXDEV, "fixture")):
-            self.bridge["run_session"](str(session))
+        staged.write_bytes(edit)
+        (session / "recovery").touch(mode=0o600)
         with patch.dict(self.bridge, MAX_STAGE_SESSIONS=1, MAX_RETAINED_SESSIONS=2):
             try:
                 self.stage()
@@ -681,7 +683,7 @@ class CopyTests(unittest.TestCase):
         with patch("subprocess.Popen", side_effect=editor), patch("time.sleep"), patch.object(os, "write", side_effect=write):
             self.bridge["run_session"](str(session))
         self.assertEqual(self.target.read_bytes(), edit)
-        self.assertFalse(session.exists())
+        self.assertEqual(staged.read_bytes(), edit)
 
     def test_oversized_save_keeps_recovery(self):
         session, staged = self.stage()
@@ -749,6 +751,7 @@ while True:                      # keep flipping even when the code under test r
         except OSError: pass' "$@"
 }
 swap "$SB/construct" d & swapper=$!
+retire_fixture_stages
 reset_tool
 for i in $(seq 1 150); do req "r$i" code /sandbox/construct/d/f; FAKE_EDIT="race-$i" bridge; done
 kill $swapper; wait $swapper 2>/dev/null || true
@@ -768,14 +771,15 @@ cat > "$T/stub/podman" <<EOF
 echo "\${0##*/} \$*" >> "$T/stub.log"
 # Optional lifecycle integration stub: every image/volume/pod operation stays in scratch.
 if [ -n "\${STUB_SETUP:-}" ]; then
+  setup_dir=\${STUB_SETUP_DIR:-"$T/lifecycle"}
   if [ "\$1 \${2:-} \${3:-} \${4:-}" = 'run -d --name oc-headless-chromium' ]; then
-    printf '%s\\n' "\$*" > "$T/lifecycle/headless.args"
+    printf '%s\\n' "\$*" > "\$setup_dir/headless.args"
   fi
   case "\$1 \${2:-}" in
-    "pod ls") [ -s "$T/lifecycle/builds" ] || exit 0;;
+    "pod ls") [ -s "\$setup_dir/builds" ] || exit 0;;
     "image inspect")
       case "\$4" in *RepoTags*) echo 1; exit 0;; esac
-      name=\$5; record="$T/lifecycle/images/\$name"
+      name=\$5; record="\$setup_dir/images/\$name"
       [ -f "\$record" ] || exit 125
       hash=\$(cat "\$record")
       case "\$name" in oc-agent) id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;;
@@ -785,11 +789,11 @@ if [ -n "\${STUB_SETUP:-}" ]; then
     "pod exists"|"container inspect") exit 1;;
     "pod create")
       if [ -n "\${STUB_HOLD_POD:-}" ]; then
-        : > "$T/lifecycle/entered"
-        while [ ! -e "$T/lifecycle/release" ]; do sleep .05; done
+        : > "\$setup_dir/entered"
+        while [ ! -e "\$setup_dir/release" ]; do sleep .05; done
       fi
       exit 0;;
-    "pod rm") [ -n "\${STUB_DELETE_SIGNAL:-}" ] && : > "$T/lifecycle/deleted"; exit 0;;
+    "pod rm") [ -n "\${STUB_DELETE_SIGNAL:-}" ] && : > "\$setup_dir/deleted"; exit 0;;
   esac
   if [ "\$1" = build ]; then
     shift; tag= hash=
@@ -800,9 +804,9 @@ if [ -n "\${STUB_SETUP:-}" ]; then
         *) shift;;
       esac
     done
-    echo "\$tag" >> "$T/lifecycle/builds"
+    echo "\$tag" >> "\$setup_dir/builds"
     sleep .3
-    printf '%s\n' "\$hash" > "$T/lifecycle/images/\$tag"
+    printf '%s\n' "\$hash" > "\$setup_dir/images/\$tag"
     exit 0
   fi
 fi
@@ -843,13 +847,38 @@ case "\$1 \$2" in
     case "\$*" in *RepoTags*) echo 0; exit 0 ;; esac
     for m in \${STUB_IDS:-}; do [ "\${m%%=*}" = "\$5" ] && { echo "\${m#*=}"; exit 0; }; done; exit 125 ;;
 esac
-if [ "\${0##*/}" = systemctl ] && [ -n "\${STUB_BRIDGE_STAYS_ACTIVE:-}" ]; then
-  case "\$2" in stop) exit 1 ;; show) echo active; exit 0 ;; esac
+if [ "\${0##*/}" = systemctl ]; then
+  case "\$2" in
+    stop) [ -z "\${STUB_BRIDGE_STAYS_ACTIVE:-}" ] || exit 1 ;;
+    show)
+      last=
+      for arg in "\$@"; do last=\$arg; done
+      [ -z "\${STUB_BRIDGE_MANAGER_FAIL:-}" ] || exit 1
+      load=not-found active=inactive job=
+      [ -z "\${STUB_BRIDGE_STAYS_ACTIVE:-}" ] || active=active
+      if [ "\$last" = "\${STUB_BRIDGE_ACTIVE_TIMER:-}" ] && \
+         ! grep -Fqx "systemctl --user stop \$last" "$T/stub.log"; then active=active; fi
+      [ "\$last" != "\${STUB_BRIDGE_LOADED:-}" ] || load=loaded
+      [ "\$last" != "\${STUB_BRIDGE_PENDING:-}" ] || job=9
+      printf 'LoadState=%s\nActiveState=%s\nJob=%s\n' "\$load" "\$active" "\$job"
+      ;;
+  esac
 fi
 exit 0
 EOF
 chmod +x "$T/stub/podman"
 for c in systemctl pkexec sudo semodule; do ln -s podman "$T/stub/$c"; done
+cat > "$T/stub/mv" <<EOF
+#!/bin/sh
+if [ -n "\${STUB_BRIDGE_PUBLISH_FAIL:-}" ]; then
+  for arg in "\$@"; do last=\$arg; done
+  case "\$last" in
+    */oc-bridge.service) printf '%s\n' 'fixture bridge publication failed' >> "$T/stub.log"; exit 1 ;;
+  esac
+fi
+exec /usr/bin/mv "\$@"
+EOF
+chmod +x "$T/stub/mv"
 cat > "$T/stub/distrobox-host-exec" <<'EOF'
 #!/usr/bin/env bash
 set -eu
@@ -1051,7 +1080,12 @@ check 'retained session prevents Podman removals' ! grep -q 'podman pod rm' "$T/
 check 'global teardown keeps the retained edit' grep -qx 'private edit' "$DSTATE/bridge-stage/retained/save.txt"
 legacy_unit="$T/dhome/.config/systemd/user/oc-bridge.path"
 printf '[Unit]\nDescription=Legacy bridge fixture\n' > "$legacy_unit"
-out=$(pathrun OC_CHROMIUM_MODE=headless OC_OPENCODE_VERSION=keep -- -n)
+mkdir -p "$T/bridge-install/images"
+bridge_install_fixture() {
+  pathrun STUB_SETUP=1 STUB_SETUP_DIR="$T/bridge-install" \
+    OC_CHROMIUM_MODE=headless OC_OPENCODE_VERSION=keep "$@" -- -n
+}
+out=$(bridge_install_fixture)
 check 'legacy watcher migration refuses while an old stage can have a live runner' \
   grep -q 'staged editor sessions remain' <<<"$out"
 check 'blocked migration keeps the old unit file' test -f "$legacy_unit"
@@ -1060,6 +1094,34 @@ check 'blocked migration stops the drain before returning' \
 check 'blocked migration does not activate a new trigger' \
   ! grep -qE 'systemctl --user (enable --now|start) oc-bridge\.timer' "$T/stub.log"
 unlink "$legacy_unit"
+out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.path)
+check 'manager-loaded legacy bridge still requires recovery if its file is missing' \
+  grep -q 'staged editor sessions remain' <<<"$out"
+check 'missing legacy file does not bypass drain stop' \
+  grep -qx 'systemctl --user stop oc-bridge.service' "$T/stub.log"
+check 'unresolved missing-file migration preserves the retained edit' \
+  grep -qx 'private edit' "$DSTATE/bridge-stage/retained/save.txt"
+
+for fault in STUB_BRIDGE_STAYS_ACTIVE=1 STUB_BRIDGE_PENDING=oc-bridge.timer STUB_BRIDGE_MANAGER_FAIL=1; do
+  out=$(bridge_install_fixture "$fault")
+  check "bridge replacement fails closed on $fault" grep -Eq 'could not (quiesce|inspect)' <<<"$out"
+  check "bridge remains disarmed on $fault" \
+    ! grep -qE 'systemctl --user (enable --now|start) oc-bridge\.timer' "$T/stub.log"
+done
+
+out=$(bridge_install_fixture STUB_BRIDGE_LOADED=oc-bridge.timer \
+  STUB_BRIDGE_ACTIVE_TIMER=oc-bridge.timer STUB_BRIDGE_PUBLISH_FAIL=1)
+check 'failed bridge publication happens after quiescing the active timer' awk '
+  FNR == 1 {timer = drain = failure = 0}
+  /^systemctl --user stop oc-bridge.timer$/ {timer = FNR}
+  /^systemctl --user stop oc-bridge.service$/ {drain = FNR}
+  /^fixture bridge publication failed$/ {failure = FNR}
+  END {exit !(timer && timer < drain && drain < failure)}
+' "$T/stub.log"
+check 'timer is disabled before failed publication' grep -qx 'systemctl --user disable oc-bridge.timer' "$T/stub.log"
+check 'partial publication does not rearm the timer' \
+  ! grep -qE 'systemctl --user (enable --now|start) oc-bridge\.timer' "$T/stub.log"
+check 'partial publication preserves retained staged bytes' grep -qx 'private edit' "$DSTATE/bridge-stage/retained/save.txt"
 unlink "$DSTATE/bridge-stage/retained/save.txt"
 rmdir "$DSTATE/bridge-stage/retained"
 for fault in STUB_LIST_PODS_FAIL STUB_POD_REMOVE_FAIL STUB_POD_REMAINS STUB_BRIDGE_STAYS_ACTIVE; do

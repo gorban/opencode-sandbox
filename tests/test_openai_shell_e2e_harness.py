@@ -562,9 +562,13 @@ class TestAmbientFdImmunity(unittest.TestCase):
 
             stub_bin = td / "bin"
             stub_bin.mkdir(mode=0o700)
-            for tool in ("systemctl", FAKE_EDITOR_NAME):
+            for tool, script in (
+                ("systemctl", 'if [ "${2-}" = show ]; then printf '
+                 "'LoadState=not-found\\nActiveState=inactive\\nJob=\\n'; fi\n"),
+                (FAKE_EDITOR_NAME, "exit 0\n"),
+            ):
                 p = stub_bin / tool
-                p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                p.write_text("#!/bin/sh\n" + script, encoding="utf-8")
                 os.chmod(p, 0o755)
 
             fake_podman = stub_bin / "podman"

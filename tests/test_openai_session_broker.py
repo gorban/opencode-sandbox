@@ -2141,7 +2141,13 @@ class SessionBrokerTests(unittest.TestCase):
         fake_editor.chmod(0o755)
 
         fake_systemctl = stub_dir / "systemctl"
-        fake_systemctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_systemctl.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${2-}\" = show ]; then\n"
+            "  printf 'LoadState=not-found\\nActiveState=inactive\\nJob=\\n'\n"
+            "fi\n",
+            encoding="utf-8",
+        )
         fake_systemctl.chmod(0o755)
 
         fake_podman = stub_dir / "podman"

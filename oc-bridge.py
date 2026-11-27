@@ -17,7 +17,7 @@ a pathname inside OC_SB to anything (desktop tools included), and never resolves
   It writes a replacement in private host staging and checks the target before renaming
   into its pinned sandbox parent. An observed conflict is saved under a new sibling name
   without replacing an older conflict copy. An edit can still race the final check and rename.
-  A session with an unsuccessful final write-back keeps its staged copies for recovery.
+  A started session keeps its staged copies until the operator confirms closure and recovers them.
 
 Modes:  oc-bridge                 process the request queue (oc-bridge.service)
         oc-bridge session DIR     run the tool on a staged copy, write edits back (internal)
@@ -41,9 +41,7 @@ STAGE = os.environ.get("OC_BRIDGE_STAGE", os.path.expanduser("~/.local/share/oc-
 TOOLS = {"code": os.environ.get("OC_CODE_BIN", ""), "bcompare": os.environ.get("OC_BCOMPARE_BIN", "")}
 LAUNCH = os.environ.get("OC_BRIDGE_LAUNCH", "systemd-run --user --quiet --collect").split()
 SELINUX_LEVEL = os.environ.get("OC_BRIDGE_SELINUX_LEVEL")
-BLOCKING_TOOLS = frozenset(os.environ.get("OC_BRIDGE_BLOCKING_TOOLS", "").split(","))
-CONFIG_VARS = ("OC_SB", "OC_BRIDGE_STAGE", "OC_CODE_BIN", "OC_BCOMPARE_BIN",
-               "OC_BRIDGE_SELINUX_LEVEL", "OC_BRIDGE_BLOCKING_TOOLS")
+CONFIG_VARS = ("OC_SB", "OC_BRIDGE_STAGE", "OC_CODE_BIN", "OC_BCOMPARE_BIN", "OC_BRIDGE_SELINUX_LEVEL")
 
 MAX_REQUESTS = 20         # per run
 MAX_QUEUE_SCAN = 256
@@ -624,23 +622,14 @@ def run_staged_editor(real, session_fd):
         while (status := proc.poll()) is None:
             time.sleep(1)
             sync(session_fd, files_fd, entries, cross_mounts)
-        if status != 0 or tool not in BLOCKING_TOOLS:
-            report_repeated_saves(entries)
-            log(f"{tool}: editor completion is unverified; staged files remain in {real!r}")
-            return False
-        complete = sync(session_fd, files_fd, entries, cross_mounts)
+        if status == 0:
+            sync(session_fd, files_fd, entries, cross_mounts)
         report_repeated_saves(entries)
-        if not complete:
-            mark_recovery(session_fd)
-            log(f"could not copy all staged saves back; recover them in {real!r}")
-        return complete
+        log(f"{tool}: editor completion is unverified; recover staged files in {quoted(real)}. "
+            "After confirming the editor and bridge session closed, remove that session to release capacity.")
+        return False
     finally:
         os.close(files_fd)
-
-
-def mark_recovery(session_fd):
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-    os.close(os.open(RECOVERY_MARKER, flags, 0o600, dir_fd=session_fd))
 
 
 def report_repeated_saves(entries):

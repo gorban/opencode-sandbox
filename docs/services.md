@@ -153,10 +153,9 @@ Compare (files or folders). The host tools work on a **copy**:
 - Changes the agent makes while the file is open are not shown in the editor. If the agent changed the
   file in the meantime, your save goes to `FILE.host-edit` next to it instead of overwriting the agent's
   version.
-- The packaged VS Code launcher waits for you to close the tab (`--wait`). Its copy is removed
-  after a confirmed close and successful write-back. Beyond Compare folders are read-only
-  snapshots of ordinary files and directories. The bridge retains files when it cannot verify
-  that a custom launcher or Beyond Compare has finished.
+- VS Code is asked to wait for you to close the tab (`--wait`). The bridge retains
+  staged files after an editor starts because the launcher can exit before the editor closes.
+  Beyond Compare folders are read-only snapshots of ordinary files and directories.
 - The bridge excludes repository and editor metadata from selections and snapshots. A detached
   file can appear as `selection` with the original extension when its name falls outside the
   staging filename rules. Saves return to the recorded original path.

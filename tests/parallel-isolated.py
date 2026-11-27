@@ -170,13 +170,16 @@ def prepare(base, runtime_base, pol, wayland):
         shell_file(base / 'bin/distrobox-host-exec',
                    'case "${1-}" in\n'
                    ' podman) shift; exec ' + q(HOST_EXEC) + ' ' + q(local_podman) + ' "$@";;\n'
-                   ' systemctl) exit 0;;\n'
+                   ' systemctl) shift; exec ' + q(str(base / 'bin/systemctl')) + ' "$@";;\n'
                    ' pkexec|sudo|semodule) echo "privileged command refused" >&2; exit 1;;\n'
                    ' *) exec ' + q(HOST_EXEC) + ' /usr/bin/env -i ' +
                    ' '.join(q(k + '=' + v) for k, v in clean_env.items()) + ' "$@";;\nesac')
     else:
         shell_file(base / 'bin/podman', 'exec ' + q(local_podman) + ' "$@"')
-    shell_file(base / 'bin/systemctl', 'exit 0')
+    shell_file(base / 'bin/systemctl',
+               """if [ "${2-}" = show ]; then
+  printf 'LoadState=not-found\\nActiveState=inactive\\nJob=\\n'
+fi""")
     for cmd in ('sudo', 'pkexec', 'semodule'):
         shell_file(base / ('bin/' + cmd), 'echo "privileged command refused" >&2; exit 1')
     env = {k: os.environ[k] for k in ('CONTAINER_ID', 'LANG', 'TERM') if k in os.environ}

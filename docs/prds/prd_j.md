@@ -66,6 +66,10 @@ Git documents [merge tool selection](https://git-scm.com/docs/git-mergetool) and
       a retained session needs attention. Design review cleared
       `5dc97f63f8dec1b85367cb4efb3484f9197773f183376d2515ff278bb84713a2`
       for `codex/audit-bridge-lifecycle`.
+- [x] Confirm the bridge triggers and drain are quiescent before replacing the runner and units.
+      Keep started editor sessions recoverable until an operator confirms closure.
+      The cutover and recovery walkthrough cleared both design reviews at
+      `5f413a34a5ceeeb53971e27b4bae3f637faa2710befd1defb19cc40bf35aea4e`.
 - `oc-sandbox reviewer` cleared the three-way design and tool selector at SHA-256
   `f302a6ba7f6db3845aaac1ccf9f74637885cd3108693f267577676788fa25c8b`.
 - Independent and external reviewers cleared the offline core at `98b86bf` and the

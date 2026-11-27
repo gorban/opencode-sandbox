@@ -1210,14 +1210,22 @@ remove_instance_storage() {
   pm "$kind" exists "$name" || rc=$?
   (( rc == 1 ))
 }
+bridge_unit_state() {
+  local output
+  local -a fields
+  output=$(sc show --property=LoadState --property=ActiveState --property=Job "$1") || return 1
+  readarray -t fields <<<"$output"
+  [[ ${#fields[@]} == 3 && ${fields[0]} =~ ^LoadState=(loaded|not-found)$ &&
+     ${fields[1]} =~ ^ActiveState=(active|inactive|failed|activating|deactivating|reloading|maintenance|refreshing)$ &&
+     ${fields[2]} =~ ^Job=[0-9]*$ ]] || return 1
+  printf '%s\n' "$output"
+}
 stop_bridge() {
   local unit state
   for unit in oc-bridge.timer oc-bridge.path oc-bridge.service; do
-    if ! sc stop "$unit" >/dev/null 2>&1; then
-      state=$(sc show --property=ActiveState --property=Job --value "$unit") || return 1
-      # A queued unit job adds a line. Require a known state with no pending job.
-      [[ $state == inactive || $state == failed ]] || return 1
-    fi
+    sc stop "$unit" >/dev/null 2>&1 || true
+    state=$(bridge_unit_state "$unit") || return 1
+    [[ $state == *$'\nActiveState=inactive\nJob=' || $state == *$'\nActiveState=failed\nJob=' ]] || return 1
   done
 }
 require_empty_bridge_stage() {
@@ -1231,12 +1239,21 @@ disable_bridge_trigger() {
   local unit=$1
   if [[ -f $UNITS/$unit ]]; then sc disable "$unit" >/dev/null || return 1; fi
 }
-migrate_bridge_trigger() {
-  [[ -f $UNITS/oc-bridge.path ]] || return 0
-  stop_bridge || die "could not quiesce the legacy host bridge"
-  require_empty_bridge_stage
-  disable_bridge_trigger oc-bridge.path || die "could not disable the legacy host bridge"
-  rm -f -- "$UNITS/oc-bridge.path"
+quiesce_bridge_installation() {
+  local legacy timer
+  validate_host_state || die "refusing unsafe host bridge installation"
+  legacy=$(bridge_unit_state oc-bridge.path) || die "could not inspect the legacy host bridge"
+  timer=$(bridge_unit_state oc-bridge.timer) || die "could not inspect the host bridge timer"
+  stop_bridge || die "could not quiesce the host bridge before replacement"
+  if [[ -f $UNITS/oc-bridge.path || $legacy == $'LoadState=loaded\n'* ]]; then
+    require_empty_bridge_stage
+    sc disable oc-bridge.path >/dev/null || die "could not disable the legacy host bridge"
+    rm -f -- "$UNITS/oc-bridge.path" || die "could not remove the legacy host bridge"
+  fi
+  if [[ -f $UNITS/oc-bridge.timer || -L $UNITS/default.target.wants/oc-bridge.timer ||
+        $timer == $'LoadState=loaded\n'* ]]; then
+    sc disable oc-bridge.timer >/dev/null || die "could not disarm the host bridge timer"
+  fi
 }
 # The module is installed by semodule at its default priority (400). A lower-priority
 # module with the same name belongs to someone else and must not be removed.
@@ -1354,11 +1371,6 @@ BRIDGE_SRC=$(trusted_file "$SCRIPT_DIR/oc-bridge.py") || die "missing or unsafe 
 CODE_BIN=$(host_input editor "$CODE_BIN") || die "OC_CODE_BIN must be an absolute path outside the sandbox"
 BC_BIN=$(host_input editor "$BC_BIN") || die "OC_BCOMPARE_BIN must be an absolute path outside the sandbox"
 verify_bridge_stage
-BLOCKING_BRIDGE_TOOLS=
-# Stock VS Code documents --wait. A custom launcher may return after handing the file off.
-for bridge_code in /home/linuxbrew/.linuxbrew/bin/code /usr/bin/code; do
-  if [[ $CODE_BIN == "$(host_input editor "$bridge_code")" ]]; then BLOCKING_BRIDGE_TOOLS=code; break; fi
-done
 OPENCODE_VERSION=${OC_OPENCODE_VERSION:-}
 if [[ -n $OPENCODE_VERSION && $OPENCODE_VERSION != keep && ! $OPENCODE_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]]; then
   die "OC_OPENCODE_VERSION must be keep or a version such as 2.3.0"
@@ -1396,8 +1408,6 @@ mkdir -p "$SB"
 (umask 077; mkdir -p "$BUILD" "$BIN" "$UNITS" "$POLDIR" "$BRIDGE_STAGE")
 validate_host_state || die "refusing unsafe host state after directory creation"
 verify_bridge_stage
-
-migrate_bridge_trigger
 
 # One SELinux level (MCS categories) shared by all agents, so several can use $SB at once; generated
 # once per installation. Podman's ':Z' would give every agent a new level (cutting the others off)
@@ -1673,17 +1683,16 @@ fi
 # and writes saved edits back the same way. See the header of oc-bridge.py. Shared by all instances.
 "${H[@]}" python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
   || echo "warning: the host bridge needs python3 >= 3.11 on the host; 'code'/'bcompare' will do nothing" >&2
-atomic_host_file "$BIN/oc-bridge" 0755 < "$BRIDGE_SRC"
-{
+bridge_service_file() {
   # The separate timer paces the bounded request batches.
   printf '[Unit]\nDescription=Restricted host bridge for the OpenCode sandbox\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\n'
   unit_env OC_SB "$SB"; unit_env OC_BRIDGE_STAGE "$HOST_BRIDGE_STAGE"
   unit_env OC_BRIDGE_SELINUX_LEVEL "$LEVEL"
   unit_env OC_CODE_BIN "$CODE_BIN"; unit_env OC_BCOMPARE_BIN "$BC_BIN"
-  unit_env OC_BRIDGE_BLOCKING_TOOLS "$BLOCKING_BRIDGE_TOOLS"
   printf 'ExecStart=%%h/.local/bin/oc-bridge\n'
-} | atomic_host_file "$UNITS/oc-bridge.service" 0644
-atomic_host_file "$UNITS/oc-bridge.timer" 0644 <<'EOF'
+}
+bridge_timer_file() {
+  cat <<'EOF'
 [Unit]
 Description=Poll the OpenCode sandbox bridge queue
 [Timer]
@@ -1694,9 +1703,22 @@ Unit=oc-bridge.service
 [Install]
 WantedBy=default.target
 EOF
-sc daemon-reload
-sc reset-failed oc-bridge.timer oc-bridge.service >/dev/null 2>&1 || true
-sc enable --now oc-bridge.timer >/dev/null 2>&1 || sc start oc-bridge.timer
+}
+install_bridge() (
+  draft=$(mktemp -d "$BUILD/bridge.XXXXXXXX") || exit 1
+  trap 'rm -f -- "$draft/runner" "$draft/service" "$draft/timer"; rmdir -- "$draft"' EXIT
+  cat "$BRIDGE_SRC" > "$draft/runner" || exit 1
+  bridge_service_file > "$draft/service" || exit 1
+  bridge_timer_file > "$draft/timer" || exit 1
+  quiesce_bridge_installation
+  atomic_host_file "$BIN/oc-bridge" 0755 < "$draft/runner" || exit 1
+  atomic_host_file "$UNITS/oc-bridge.service" 0644 < "$draft/service" || exit 1
+  atomic_host_file "$UNITS/oc-bridge.timer" 0644 < "$draft/timer" || exit 1
+  sc daemon-reload || exit 1
+  sc reset-failed oc-bridge.timer oc-bridge.service >/dev/null 2>&1 || true
+  sc enable --now oc-bridge.timer >/dev/null 2>&1 || sc start oc-bridge.timer
+)
+install_bridge || die "could not install the host bridge"
 
 # ---- SELinux policy: dedicated type so ONLY the Chromium containers may use the Wayland socket ----
 TPL=/usr/share/udica/templates
