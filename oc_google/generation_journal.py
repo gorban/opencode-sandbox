@@ -8,7 +8,8 @@ from hashlib import sha256
 import json
 import os
 import secrets
-from threading import RLock
+from threading import RLock, get_ident
+from time import monotonic
 
 from . import registration as reg
 from .generation import MODEL_ALIAS
@@ -27,6 +28,7 @@ _RLOCK = type(RLock())
 _FIXTURE_DIR = "generation-fixtures"
 _FIXTURE_LABEL = "generation-fixture"
 _FIXTURE_BUILD = sha256(b"oc-sandbox synthetic durable generation fixture v1").hexdigest()
+_MAX_WRITE_BYTES = 32768
 
 
 class GenerationHeld(reg.RegistrationUnavailable):
@@ -58,6 +60,7 @@ _STEPS = {
     Operation.DESTINATION: (Phase.ACP_SENT, Phase.DESTINATION_CLAIMED, Phase.DESTINATION_SETTLED),
     Operation.DELIVERY: (Phase.DESTINATION_SETTLED, Phase.DELIVERY_CLAIMED, Phase.SETTLED),
 }
+_SENT_PHASES = (Phase.ACP_SENT, Phase.DESTINATION_CLAIMED, Phase.DESTINATION_SETTLED)
 
 
 def _digest(data):
@@ -112,6 +115,54 @@ class Capability:
 @dataclass(frozen=True, slots=True, eq=False)
 class _Observation:
     capability: Capability
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class WriteEvidence:
+    """Result of one bounded write to the exact private target."""
+
+    target: object
+    byte_count: int
+    packet_sha256: str
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class WriteReceipt:
+    """A pending write, still requiring independent settlement observations."""
+
+    operation: Operation
+    target: object
+    byte_count: int
+    packet_sha256: str
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class SettlementEvidence:
+    """Trusted adapter projection of exact observations made outside the fence."""
+
+    write: WriteReceipt
+    target: object
+    byte_count: int
+    packet_sha256: str
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class AcpSentReceipt:
+    """The original journal-owned proof of durable ACP_SENT."""
+
+    write: WriteReceipt
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _InFlight:
+    operation: Operation
+    pid: int
+    thread: int
+
+
+def _matches_write(target, count, digest, evidence):
+    return (evidence.target is target and type(evidence.byte_count) is int and evidence.byte_count == count
+            and type(evidence.packet_sha256) is str and evidence.packet_sha256 == digest)
 
 
 def _read(directory, leaf, fd):
@@ -214,16 +265,24 @@ class GenerationJournal:
             reg._write_private(files.directory, f"fixture-writer-{marker}", b"synthetic writer reached the slot\n")
 
     @contextmanager
-    def launch(self, binding, *, fence, authorized):
+    def launch(self, binding, *, fence, authorized, deadline=None):
         if (type(binding) is not Binding or type(fence) is not _RLOCK or not callable(authorized)
+                or (deadline is not None and (type(deadline) not in (float, int)
+                                              or not monotonic() < deadline < float("inf")))
                 or any(type(value) is not str for value in (
                     binding.generation, binding.profile_digest, binding.credential_digest, binding.model,
                     binding.policy_digest, binding.launch,
                 ))
                 or binding != self._anchor.binding(epoch=binding.epoch, launch=binding.launch)):
             raise GenerationHeld()
-        with self._fresh(authorized=lambda: authorized(binding)) as files:
-            run = _Run(files, binding, fence, authorized)
+
+        def current():
+            return authorized(binding) is True and (deadline is None or monotonic() < deadline)
+
+        with self._fresh(authorized=current) as files:
+            control = _LeaseControl(binding, fence, authorized, deadline, os.getpid())
+            files._authority.control = control
+            run = _Run(files, control)
             try:
                 run._launch()
                 yield run
@@ -231,14 +290,31 @@ class GenerationJournal:
                 run.revoke()
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _LeaseControl:
+    """The immutable owner, synchronization, and mode of one exact lease."""
+
+    binding: Binding
+    fence: object
+    authorized: Callable[[Binding], bool]
+    deadline: float | None
+    pid: int
+
+
 @dataclass(slots=True)
 class _LeaseAuthority:
     """Mutable state of one held registration lease, shared by every run view."""
 
     phase: Phase = Phase.UNSTARTED
+    control: _LeaseControl | None = None
     revoked: bool = False
     busy: bool = False
+    checking: bool = False
     capability: Capability | None = None
+    in_flight: _InFlight | None = None
+    flight_checked: bool = False
+    pending: WriteReceipt | None = None
+    sent: AcpSentReceipt | None = None
 
 
 class _Files:
@@ -330,29 +406,44 @@ class _Files:
 @dataclass(frozen=True, slots=True)
 class _Run:
     _files: _Files
-    _binding: Binding
-    _fence: object
-    _authorized: Callable[[Binding], bool]
+    _control: _LeaseControl
+
+    def _owner_fence(self):
+        if (type(self._files) is not _Files or type(self._control) is not _LeaseControl
+                or self._files._authority.control is not self._control or os.getpid() != self._control.pid):
+            raise GenerationHeld()
+        return self._control.fence
 
     def revoke(self):
-        with self._fence:
+        with self._owner_fence():
             authority = self._files._authority
             authority.revoked = True
             authority.capability = None
+            authority.in_flight = authority.pending = authority.sent = None
+            authority.flight_checked = False
 
     def _check(self):
+        self._owner_fence()
         authority = self._files._authority
-        if authority.revoked:
+        deadline = self._control.deadline
+        if authority.revoked or authority.checking or (deadline is not None and monotonic() >= deadline):
             raise GenerationHeld()
-        self._files.verify()
-        if self._authorized(self._binding) is not True or authority.revoked:
-            raise GenerationHeld()
-        self._files.verify()
+        authority.checking = True
+        try:
+            self._files.verify()
+            if self._control.authorized(self._control.binding) is not True or authority.revoked:
+                raise GenerationHeld()
+            self._files.verify()
+            if deadline is not None and monotonic() >= deadline:
+                raise GenerationHeld()
+        finally:
+            authority.checking = False
 
     @contextmanager
     def _transition(self):
+        self._owner_fence()
         authority = self._files._authority
-        if authority.busy or authority.revoked:
+        if authority.busy or authority.revoked or authority.checking:
             raise GenerationHeld()
         authority.busy = True
         try:
@@ -365,17 +456,17 @@ class _Run:
             authority.busy = False
 
     def _save(self, phase):
-        self._files.save(phase, self._binding, self._check)
+        self._files.save(phase, self._control.binding, self._check)
         self._check()
         self._files._authority.phase = phase
 
     def _launch(self):
-        with self._fence, self._transition():
+        with self._owner_fence(), self._transition():
             self._save(Phase.LAUNCH_HELD)
 
     def issue(self, operation):
         """Persist a claim before issuing its exact one-use capability."""
-        with self._fence:
+        with self._owner_fence():
             authority = self._files._authority
             if (type(operation) is not Operation or authority.phase != _STEPS[operation][0]
                     or authority.capability is not None):
@@ -387,23 +478,112 @@ class _Run:
 
     def consume(self, capability, effect):
         """Spend before the bounded synthetic effect and settle only its exact observation."""
-        with self._fence:
+        with self._owner_fence():
             authority = self._files._authority
-            if type(capability) is not Capability or capability is not authority.capability or not callable(effect):
+            if (self._control.deadline is not None or type(capability) is not Capability
+                    or capability is not authority.capability or not callable(effect)):
                 raise GenerationHeld()
             with self._transition():
                 authority.capability = None
                 self._effect(capability, effect)
                 self._save(_STEPS[capability.operation][2])
 
+    def _check_phase(self, phase):
+        self._check()
+        if (self._files._authority.phase is not phase
+                or self._files.current[1] != _record(self._files.anchor.enrollment, phase, self._control.binding)):
+            raise GenerationHeld()
+
+    def write_once(self, capability, effect, *, target, data):
+        """Spend an issued capability before the adapter's bounded synchronous write."""
+        with self._owner_fence():
+            authority = self._files._authority
+            if (self._control.deadline is None or type(capability) is not Capability or capability is not authority.capability
+                    or not callable(effect) or authority.pending is not None):
+                raise GenerationHeld()
+            with self._transition():
+                authority.capability = None
+                if target is None or type(data) is not bytes or not 0 < len(data) <= _MAX_WRITE_BYTES:
+                    raise GenerationHeld()
+                operation = capability.operation
+                self._check_phase(_STEPS[operation][1])
+                digest = _digest(data)
+                proof = _InFlight(operation, self._control.pid, get_ident())
+                authority.in_flight = proof
+                try:
+                    evidence = effect(proof)
+                    checked = authority.flight_checked
+                finally:
+                    authority.in_flight = None
+                    authority.flight_checked = False
+                self._check_phase(_STEPS[operation][1])
+                if type(evidence) is not WriteEvidence or not checked or not _matches_write(target, len(data), digest, evidence):
+                    raise GenerationHeld()
+                authority.pending = WriteReceipt(operation, target, len(data), digest)
+                return authority.pending
+
+    def verify_in_flight(self, proof, operation):
+        """Verify the exact write claim synchronously just before its effect."""
+        if (type(proof) is not _InFlight or proof.pid != os.getpid() or proof.thread != get_ident()
+                or proof.operation is not operation):
+            raise GenerationHeld()
+        with self._owner_fence():
+            authority = self._files._authority
+            if proof is not authority.in_flight or not authority.busy or authority.checking:
+                raise GenerationHeld()
+            try:
+                self._check_phase(_STEPS[operation][1])
+            except BaseException:
+                self.revoke()
+                raise
+            authority.flight_checked = True
+
+    def settle(self, receipt, evidence):
+        """Settle once from immutable evidence already verified by the adapter."""
+        with self._owner_fence():
+            if self._control.deadline is None:
+                raise GenerationHeld()
+            with self._transition():
+                authority = self._files._authority
+                pending, authority.pending = authority.pending, None
+                if (type(receipt) is not WriteReceipt or receipt is not pending or type(evidence) is not SettlementEvidence
+                        or evidence.write is not receipt
+                        or not _matches_write(receipt.target, receipt.byte_count, receipt.packet_sha256, evidence)):
+                    raise GenerationHeld()
+                operation = receipt.operation
+                self._check_phase(_STEPS[operation][1])
+                self._save(_STEPS[operation][2])
+                if operation is Operation.ACP:
+                    authority.sent = AcpSentReceipt(receipt)
+
+    def acp_sent(self):
+        """Return the original ACP-sent evidence while its delivery phase permits it."""
+        with self._owner_fence():
+            receipt = self._files._authority.sent
+            self.verify_acp_sent(receipt)
+            return receipt
+
+    def verify_acp_sent(self, receipt):
+        with self._owner_fence():
+            authority = self._files._authority
+            if (type(receipt) is not AcpSentReceipt or receipt is not authority.sent
+                    or authority.phase not in _SENT_PHASES or authority.checking):
+                raise GenerationHeld()
+            try:
+                self._check_phase(authority.phase)
+            except BaseException:
+                self.revoke()
+                raise
+
     def _effect(self, capability, effect):
+        self._owner_fence()
         observation = None
         live = True
         called = False
 
         def observe():
             nonlocal called, observation
-            with self._fence:
+            with self._owner_fence():
                 if not live or called:
                     raise GenerationHeld()
                 called = True

@@ -11,7 +11,8 @@ import secrets
 import select
 import signal
 from tempfile import TemporaryDirectory
-from threading import RLock
+from threading import Event, RLock, Thread
+from time import monotonic
 import unittest
 from unittest.mock import patch
 
@@ -90,9 +91,21 @@ class GenerationJournalTests(unittest.TestCase):
         self.baseline = (self.metadata.read_bytes(), self.lock.stat().st_ino, self.metadata.stat().st_ino,
                          self.credential.read_bytes(), self.credential.stat().st_ino)
 
-    def launch(self, *, authorized=None):
+    def launch(self, *, authorized=None, deadline=None):
         owner = authorized if authorized is not None else lambda binding: self.current is binding
-        return self.journal.launch(self.binding, fence=self.fence, authorized=owner)
+        return self.journal.launch(self.binding, fence=self.fence, authorized=owner, deadline=deadline)
+
+    def split_write(self, run, capability, *, write=None):
+        target = object()
+        data = ("synthetic " + capability.operation.value).encode("ascii")
+
+        def effect(proof):
+            run.verify_in_flight(proof, capability.operation)
+            count = len(data) if write is None else write(data)
+            return gen.WriteEvidence(target, count, gen._digest(data))
+
+        receipt = run.write_once(capability, effect, target=target, data=data)
+        return receipt, gen.SettlementEvidence(receipt, target, len(data), gen._digest(data))
 
     def phase(self):
         return gen.Phase(json.loads((self.slot / gen._STATE).read_bytes())["phase"])
@@ -297,6 +310,295 @@ class GenerationJournalTests(unittest.TestCase):
                     self.fail("unbound generation reached launch")
         self.assertEqual(self.journal.status(), gen.Phase.UNSTARTED)
         self.journal.fixture_writer(1)
+
+    def test_split_write_requires_observed_settlement_in_every_durable_phase(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            with self.assertRaises(gen.GenerationHeld):
+                run.acp_sent()
+            acp_sent = None
+            writes = []
+            for operation in _STEPS:
+                _, claimed, settled = gen._STEPS[operation]
+                cap = run.issue(operation)
+                if operation is gen.Operation.DELIVERY:
+                    with self.assertRaises(gen.GenerationHeld):
+                        run.verify_acp_sent(acp_sent)
+                elif acp_sent is not None:
+                    run.verify_acp_sent(acp_sent)
+                with self.assertRaises(gen.GenerationHeld):
+                    run.consume(cap, lambda _: self.fail("legacy settlement ran inside a join"))
+
+                def write(data):
+                    self.assertEqual(self.phase(), claimed)
+                    writes.append(data)
+                    return len(data)
+
+                receipt, evidence = self.split_write(run, cap, write=write)
+                self.assertEqual((receipt.operation, receipt.byte_count, receipt.packet_sha256),
+                                 (operation, len(writes[-1]), gen._digest(writes[-1])))
+                self.assertEqual(self.phase(), claimed)
+                with self.assertRaises(gen.GenerationHeld):
+                    self.split_write(copy(run), cap, write=write)
+                run.settle(receipt, evidence)
+                self.assertEqual(self.phase(), settled)
+                if operation is gen.Operation.ACP:
+                    acp_sent = run.acp_sent()
+                    self.assertIs(acp_sent.write, receipt)
+                    with self.assertRaises(gen.GenerationHeld):
+                        run.verify_acp_sent(copy(acp_sent))
+            self.assertEqual(writes, [b"synthetic acp", b"synthetic destination", b"synthetic delivery"])
+            self.check_unchanged()
+        self.check_held()
+
+    def test_legacy_consume_cannot_mint_acp_sent_or_use_split_write(self):
+        with self.launch() as run:
+            cap = run.issue(gen.Operation.ACP)
+            with self.assertRaises(gen.GenerationHeld):
+                self.split_write(run, cap, write=lambda _: self.fail("split write ran inside a legacy lease"))
+            run.consume(cap, lambda observe: observe())
+            self.assertEqual(self.phase(), gen.Phase.ACP_SENT)
+            with self.assertRaises(gen.GenerationHeld):
+                run.acp_sent()
+
+    def test_divergent_deadline_view_cannot_use_legacy_consume_on_split_lease(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            cap = run.issue(gen.Operation.ACP)
+            try:
+                forged = replace(run, _deadline=None)
+            except TypeError:
+                pass
+            else:
+                with self.assertRaises(gen.GenerationHeld):
+                    forged.consume(cap, lambda observe: observe())
+            self.assertEqual(self.phase(), gen.Phase.ACP_CLAIMED)
+            receipt, evidence = self.split_write(copy(run), cap)
+            run.settle(receipt, evidence)
+            self.assertEqual(self.phase(), gen.Phase.ACP_SENT)
+
+    def test_divergent_authorizer_view_cannot_write_after_real_owner_loss(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            cap = run.issue(gen.Operation.ACP)
+            effects = []
+            self.current = None
+            try:
+                forged = replace(run, _authorized=lambda _: True)
+            except TypeError:
+                pass
+            else:
+                with self.assertRaises(gen.GenerationHeld):
+                    self.split_write(forged, cap, write=lambda data: effects.append(data) or len(data))
+            with self.assertRaises(gen.GenerationHeld):
+                self.split_write(copy(run), cap, write=lambda data: effects.append(data) or len(data))
+            self.assertEqual(effects, [])
+            self.assertEqual(self.phase(), gen.Phase.ACP_CLAIMED)
+
+    def test_divergent_fence_view_cannot_write_without_the_shared_fence(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            cap = run.issue(gen.Operation.ACP)
+            try:
+                forged = replace(run, _fence=RLock())
+            except TypeError:
+                pass
+            else:
+                with self.assertRaises(gen.GenerationHeld):
+                    self.split_write(forged, cap)
+            self.assertEqual(self.phase(), gen.Phase.ACP_CLAIMED)
+            receipt, evidence = self.split_write(run, cap)
+            copy(run).settle(receipt, evidence)
+            self.assertEqual(self.phase(), gen.Phase.ACP_SENT)
+
+    def test_reconstructed_control_is_rejected_before_touching_the_exact_lease(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            cap = run.issue(gen.Operation.ACP)
+            for changes in ({}, {"deadline": None}, {"fence": RLock()}, {"authorized": lambda _: True},
+                            {"binding": replace(self.binding, epoch=2)}, {"pid": os.getpid() + 1}):
+                with self.subTest(fields=tuple(changes)):
+                    forged = replace(run, _control=replace(run._control, **changes))
+                    with self.assertRaises(gen.GenerationHeld):
+                        forged.revoke()
+                    with self.assertRaises(gen.GenerationHeld):
+                        forged.consume(cap, lambda _: self.fail("reconstructed control ran legacy consume"))
+                    with self.assertRaises(gen.GenerationHeld):
+                        self.split_write(forged, cap, write=lambda _: self.fail("reconstructed control wrote"))
+            self.assertEqual(self.phase(), gen.Phase.ACP_CLAIMED)
+            receipt, evidence = self.split_write(replace(run), cap)
+            copy(run).settle(receipt, evidence)
+            self.assertIs(run.acp_sent().write, receipt)
+
+    def test_inflight_proof_requires_exact_identity_method_thread_and_current_call(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            cap = run.issue(gen.Operation.ACP)
+            target, data = object(), b"synthetic"
+            captured = []
+
+            def effect(proof):
+                captured.append(proof)
+                with self.assertRaises(gen.GenerationHeld):
+                    run.verify_in_flight(copy(proof), gen.Operation.ACP)
+                with self.assertRaises(gen.GenerationHeld):
+                    run.verify_in_flight(proof, gen.Operation.DESTINATION)
+                response = []
+
+                def cross_thread():
+                    try:
+                        run.verify_in_flight(proof, gen.Operation.ACP)
+                    except gen.GenerationHeld:
+                        response.append("rejected")
+
+                outsider = Thread(target=cross_thread, daemon=True)
+                outsider.start()
+                outsider.join(1)
+                self.assertFalse(outsider.is_alive())
+                self.assertEqual(response, ["rejected"])
+                child = os.fork()
+                if child == 0:
+                    try:
+                        run.verify_in_flight(proof, gen.Operation.ACP)
+                    except gen.GenerationHeld:
+                        os._exit(0)
+                    os._exit(1)
+                self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(child, 0)[1]), 0)
+                with self.assertRaises(gen.GenerationHeld):
+                    run.settle(None, None)
+                run.verify_in_flight(proof, gen.Operation.ACP)
+                return gen.WriteEvidence(target, len(data), gen._digest(data))
+
+            receipt = run.write_once(cap, effect, target=target, data=data)
+            with self.assertRaises(gen.GenerationHeld):
+                run.verify_in_flight(captured[0], gen.Operation.ACP)
+            run.settle(receipt, gen.SettlementEvidence(receipt, target, len(data), gen._digest(data)))
+            self.assertEqual(self.phase(), gen.Phase.ACP_SENT)
+
+    def test_write_failure_no_proof_or_uncertain_evidence_cannot_create_a_receipt(self):
+        for kind in ("no-proof", "short", "wrong-target", "wrong-bytes", "boolean", "interrupt", "owner-loss"):
+            with self.subTest(kind=kind):
+                self.create_fixture()
+                with self.launch(deadline=monotonic() + 5) as run:
+                    cap = run.issue(gen.Operation.ACP)
+                    target, data = object(), b"synthetic"
+                    captured = []
+
+                    def effect(proof):
+                        captured.append(proof)
+                        if kind == "owner-loss":
+                            self.current = None
+                            with self.assertRaises(gen.GenerationHeld):
+                                run.verify_in_flight(proof, gen.Operation.ACP)
+                            self.current = self.binding
+                        elif kind != "no-proof":
+                            run.verify_in_flight(proof, gen.Operation.ACP)
+                        if kind == "interrupt":
+                            raise InterruptedError
+                        if kind == "boolean":
+                            return True
+                        return gen.WriteEvidence(object() if kind == "wrong-target" else target,
+                                                 1 if kind == "short" else len(data),
+                                                 gen._digest(b"other" if kind == "wrong-bytes" else data))
+
+                    failure = InterruptedError if kind == "interrupt" else gen.GenerationHeld
+                    with self.assertRaises(failure):
+                        run.write_once(cap, effect, target=target, data=data)
+                    with self.assertRaises(gen.GenerationHeld):
+                        run.verify_in_flight(captured[0], gen.Operation.ACP)
+                    with self.assertRaises(gen.GenerationHeld):
+                        run.write_once(cap, effect, target=target, data=data)
+                    self.assertEqual(self.phase(), gen.Phase.ACP_CLAIMED)
+                self.check_held()
+
+    def test_forged_foreign_or_replayed_write_receipt_cannot_settle(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            previous, previous_evidence = self.split_write(run, run.issue(gen.Operation.ACP))
+            run.settle(previous, previous_evidence)
+            with self.assertRaises(gen.GenerationHeld):
+                run.settle(previous, previous_evidence)
+            self.assertEqual(self.phase(), gen.Phase.ACP_SENT)
+        for variant in ("copy", "foreign", "wrong-observation"):
+            with self.subTest(variant=variant):
+                self.create_fixture()
+                with self.launch(deadline=monotonic() + 5) as run:
+                    receipt, evidence = self.split_write(run, run.issue(gen.Operation.ACP))
+                    invalid = copy(receipt) if variant == "copy" else previous if variant == "foreign" else receipt
+                    invalid_evidence = replace(evidence, write=invalid, byte_count=1 if variant == "wrong-observation"
+                                               else receipt.byte_count)
+                    with self.assertRaises(gen.GenerationHeld):
+                        run.settle(invalid, invalid_evidence)
+                    with self.assertRaises(gen.GenerationHeld):
+                        run.settle(receipt, evidence)
+                    with self.assertRaises(gen.GenerationHeld):
+                        run.acp_sent()
+                    self.assertEqual(self.phase(), gen.Phase.ACP_CLAIMED)
+
+    def test_observer_stall_allows_revocation_and_no_other_write(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            cap = run.issue(gen.Operation.ACP)
+            receipt, evidence = self.split_write(run, cap)
+            waiting, resume, revoked = Event(), Event(), Event()
+            outcomes = []
+
+            def observe():
+                waiting.set()
+                if resume.wait(2):
+                    try:
+                        run.settle(receipt, evidence)
+                    except gen.GenerationHeld:
+                        outcomes.append("held")
+
+            def revoke():
+                run.revoke()
+                revoked.set()
+
+            observer = Thread(target=observe, daemon=True)
+            revoker = Thread(target=revoke, daemon=True)
+            observer.start()
+            try:
+                self.assertTrue(waiting.wait(1))
+                with self.assertRaises(gen.GenerationHeld):
+                    self.split_write(run, cap, write=lambda _: self.fail("observer permitted another write"))
+                revoker.start()
+                self.assertTrue(revoked.wait(1), "observer blocked revocation")
+            finally:
+                resume.set()
+                observer.join(1)
+                if revoker.ident is not None:
+                    revoker.join(1)
+            self.assertEqual(outcomes, ["held"])
+            self.assertEqual(self.phase(), gen.Phase.ACP_CLAIMED)
+        self.check_held()
+
+    def test_deadline_or_metadata_drift_between_write_and_settlement_withholds_sent_proof(self):
+        for expired in (False, True):
+            with self.subTest(expired=expired):
+                self.create_fixture()
+                deadline = monotonic() + 5
+                with self.launch(deadline=deadline) as run:
+                    receipt, evidence = self.split_write(run, run.issue(gen.Operation.ACP))
+                    if expired:
+                        with patch.object(gen, "monotonic", return_value=deadline), self.assertRaises(gen.GenerationHeld):
+                            run.settle(receipt, evidence)
+                    else:
+                        self.metadata.write_bytes(self.metadata.read_bytes() + b"\n")
+                        with self.assertRaises(gen.GenerationHeld):
+                            run.settle(receipt, evidence)
+                    with self.assertRaises(gen.GenerationHeld):
+                        run.acp_sent()
+                    self.assertEqual(self.phase(), gen.Phase.ACP_CLAIMED)
+
+    def test_acp_sent_proof_rechecks_durable_bytes_and_stays_revoked_after_restore(self):
+        with self.launch(deadline=monotonic() + 5) as run:
+            receipt, evidence = self.split_write(run, run.issue(gen.Operation.ACP))
+            run.settle(receipt, evidence)
+            sent = run.acp_sent()
+            state = self.slot / gen._STATE
+            valid = state.read_bytes()
+            state.write_bytes(valid + b"\n")
+            with self.assertRaises(gen.GenerationHeld):
+                run.verify_acp_sent(sent)
+            state.write_bytes(valid)
+            with self.assertRaises(gen.GenerationHeld):
+                run.verify_acp_sent(sent)
+            with self.assertRaises(gen.GenerationHeld):
+                run.issue(gen.Operation.DESTINATION)
+        self.check_held()
 
     def test_scope_exit_and_explicit_revocation_invalidate_outstanding_capability(self):
         for revoke in (False, True):
@@ -513,14 +815,34 @@ class GenerationJournalTests(unittest.TestCase):
                 self.assertEqual(self.phase(), target)
                 self.assertFalse((self.slot / "fixture-writer-2").exists())
 
-    def _fork_holder(self, target):
+    def test_killed_split_holder_blocks_restart_before_or_after_each_actual_write(self):
+        for operation in _STEPS:
+            target = gen._STEPS[operation][1]
+            for boundary in ("claimed", "written"):
+                with self.subTest(operation=operation, boundary=boundary):
+                    self.create_fixture()
+                    self.journal.fixture_writer(1)
+                    holder = self._fork_holder(target, split_boundary=boundary)
+                    try:
+                        self.assertEqual(self.phase(), target)
+                    finally:
+                        os.kill(holder, signal.SIGKILL)
+                        self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(holder, 0)[1]), -signal.SIGKILL)
+                    self.check_held()
+                    self.check_unchanged()
+
+    def _fork_holder(self, target, *, split_boundary=None):
         source, ready = os.pipe()
         pid = os.fork()
         if pid == 0:
             os.close(source)
             try:
-                with self.launch() as run:
-                    self._advance_to(run, target)
+                deadline = monotonic() + 10 if split_boundary is not None else None
+                with self.launch(deadline=deadline) as run:
+                    if split_boundary is None:
+                        self._advance_to(run, target)
+                    else:
+                        self._advance_split(run, target, split_boundary)
                     os.write(ready, b"!")
                     signal.pause()
             except BaseException:
@@ -550,3 +872,22 @@ class GenerationJournalTests(unittest.TestCase):
             if self.phase() is target:
                 return
         self.fail("holder did not reach requested phase")
+
+    def _advance_split(self, run, target, boundary):
+        for operation in _STEPS:
+            cap = run.issue(operation)
+            selected = self.phase() is target
+            if selected and boundary == "claimed":
+                return
+            reader, writer = os.pipe()
+            try:
+                receipt, evidence = self.split_write(run, cap, write=lambda data: os.write(writer, data))
+                actual = os.read(reader, receipt.byte_count)
+                self.assertEqual(gen._digest(actual), receipt.packet_sha256)
+            finally:
+                os.close(writer)
+                os.close(reader)
+            if selected:
+                return
+            run.settle(receipt, evidence)
+        self.fail("holder did not reach requested split write boundary")
