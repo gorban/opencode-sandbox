@@ -157,6 +157,9 @@ Compare (files or folders). The host tools work on a **copy**:
   after a confirmed close and successful write-back. Beyond Compare folders are read-only
   snapshots of ordinary files and directories. The bridge retains files when it cannot verify
   that a custom launcher or Beyond Compare has finished.
+- The bridge excludes repository and editor metadata from selections and snapshots. A detached
+  file can appear as `selection` with the original extension when its name falls outside the
+  staging filename rules. Saves return to the recorded original path.
 - Snapshots are limited to 64 MiB per file, 512 MiB and 5000 visited entries per session, and
   64 levels of nesting. The bridge allows up to eight active or uncertain sessions and up to
   sixteen private session directories total, including closed recovery.

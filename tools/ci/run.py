@@ -148,6 +148,7 @@ PYTHON_FILES = (
     'oc_openai/shell_cleanup_owner.py',
     'oc_openai/worker.py',
     'tests/bridge_merge_core.py',
+    'tests/bridge-staging-isolated.py',
     'tests/e2e/live/conftest.py',
     'tests/e2e/live/openai_canary_driver.py',
     'tests/e2e/live/openai_driver.py',

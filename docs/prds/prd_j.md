@@ -54,6 +54,12 @@ Git documents [merge tool selection](https://git-scm.com/docs/git-mergetool) and
 
 ## Review record
 
+- [x] Isolate selections in the existing host bridge's private stage and exclude repository and
+      editor metadata before giving paths to a desktop tool. Ordinary file saves still go back
+      to their recorded sandbox paths. Recover legacy staged files manually. Design review
+      cleared walkthrough `efbe9485bdd3f47a90f448d66eef15724c93d3a093831bd2b765bdbfc00d815c`
+      for `codex/audit-bridge-staging`. The editor operand grammar follow-up cleared
+      `6e989f377b6b9f10232c066b01848795020828f7ce06911ccca51fca79aab93e`.
 - [x] Make the existing bridge poll its request spool without following sandbox paths from systemd.
       Keep uncertain sessions and closed recovery files private, bound staging traffic and quote
       save diagnostics. Quiesce the bridge and hold global teardown or legacy migration when

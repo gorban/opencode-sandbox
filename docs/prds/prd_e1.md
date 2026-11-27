@@ -129,6 +129,9 @@ not. These file snapshots do not establish that every possible host store or set
 The test profiles and their two specifically identified Chrome document-portal exports were removed;
 the loopback listeners were closed. See the [host-browser walkthrough](spikes/e1/HOST-BROWSERS.md).
 
+- [x] Make the offline Chrome portal repair regression use only disposable synthetic inputs and
+  cover exact mounts, atomic launcher replacement, and refusal cases (`codex/offline-portal-regression`).
+
 ### Results
 
 Cell: `all` = accepted by all 12 paths, `none` = rejected by all, otherwise the exceptions or the accepting
