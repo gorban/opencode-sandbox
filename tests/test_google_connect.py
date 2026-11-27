@@ -23,6 +23,7 @@ from unittest.mock import Mock, patch
 
 from oc_google import auth_offer, connect, metadata_workflow, native_artifacts
 from oc_google.native_service import NativeInvocation
+from oc_google.token_diagnostic import TokenStage
 
 
 class TerminalOwnerTest(unittest.TestCase):
@@ -363,13 +364,22 @@ class RuntimeCustodyTest(unittest.TestCase):
             b"synthetic-token-marker",
         )
 
+    def test_token_scope_diagnostic_uses_only_original_foreground_pty(self):
+        self.assert_diagnostic_uses_original_pty(
+            "scope", b"Google sign-in token reply: The token grant included an unapproved permission.",
+            b"synthetic-unapproved-permission",
+        )
+
+    def test_token_diagnostic_text_covers_every_stage(self):
+        self.assertEqual(set(connect._TOKEN_DETAILS), set(TokenStage))
+
     def assert_diagnostic_uses_original_pty(self, kind, expected_stage, marker):
         origin = Path(__file__).resolve().parents[1]
         run_connect = runpy.run_path(str(origin / "oc-google.py"))["run_connect"]
         generic = b"oc-sandbox google: Workstation enrollment did not complete.\n"
 
-        terminal_states = (("foreground", "background", "interrupted", "custody") if kind == "token"
-                           else ("foreground", "background"))
+        terminal_states = (("foreground", "background") if kind == "callback"
+                           else ("foreground", "background", "interrupted", "custody"))
         for terminal_state in terminal_states:
             with self.subTest(terminal_state=terminal_state):
                 stderr = self.parent / f"stderr-{terminal_state}"
@@ -474,9 +484,12 @@ class RuntimeCustodyTest(unittest.TestCase):
         def refuse_token(*args, authorized, fence, destination, diagnostic=None, **kwargs):
             from oc_google import enrollment, metadata_destination
             from test_google_metadata_destination import FakeChannel, IPV4, response
-            from test_google_oauth_exchange import AUTHORIZATION, CODE, STATE, form, offer
+            from test_google_oauth_exchange import AUTHORIZATION, CODE, SCOPE, STATE, form, grant, offer
 
-            token = FakeChannel(response(status=b"HTTP/1.1 400 synthetic-token-marker"))
+            if kind == "scope":
+                token = FakeChannel(response(grant(scope=SCOPE + " synthetic-unapproved-permission")))
+            else:
+                token = FakeChannel(response(status=b"HTTP/1.1 400 synthetic-token-marker"))
             trust = Mock(wrap_socket=Mock(return_value=token))
             gate = Mock(take_forwarded=Mock(return_value=auth_offer.Callback(STATE, CODE)))
 
@@ -500,7 +513,7 @@ class RuntimeCustodyTest(unittest.TestCase):
                 finally:
                     assert len(token.sent) == 1
 
-        refuse = refuse_token if kind == "token" else refuse_callback
+        refuse = refuse_callback if kind == "callback" else refuse_token
         try:
             with patch.object(connect, "load_provider_config", return_value=Mock(get=Mock(return_value=spec))), \
                     patch.object(connect, "scratch_parent", return_value=runtime), \

@@ -24,7 +24,12 @@ _ACCESS_FIELDS = {"access_token", "expires_in", "scope", "token_type"}
 _GRANT_FIELDS = _ACCESS_FIELDS | {"refresh_token"}
 _OPTIONAL_GRANT_FIELDS = {"refresh_token_expires_in"}
 _IDENTITY_FIELD = "id_token"
-_OIDC_SCOPES = SCOPES | {"email", "openid"}
+_GRANT_RESOURCE_SCOPES = frozenset({
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/aicode",
+})
+_GRANT_EMAIL_SCOPES = frozenset({"https://www.googleapis.com/auth/userinfo.email", "email"})
+_ALLOWED_GRANT_SCOPES = _GRANT_RESOURCE_SCOPES | _GRANT_EMAIL_SCOPES | {"openid"}
 _MAX_FORM = 8192
 _MAX_BASIC = 2048
 _MAX_GRANT = 32768
@@ -199,12 +204,19 @@ def _access_from_grant(fields):
     scope = fields["scope"]
     scopes = scope.split(" ") if type(scope) is str else ()
     distinct = set(scopes)
-    if len(scopes) != len(distinct) or distinct not in (SCOPES, _OIDC_SCOPES):
-        raise _GrantRefused("Google OAuth grant scopes do not match", TokenStage.GRANT_SCOPE)
+    if (not scopes or len(scopes) != len(distinct)
+            or any(not label or not label.isascii() or not label.isprintable() for label in scopes)):
+        raise _GrantRefused("Invalid Google OAuth grant scope list", TokenStage.GRANT_SCOPE_LIST)
+    if not distinct <= _ALLOWED_GRANT_SCOPES:
+        raise _GrantRefused("Unapproved Google OAuth grant permission", TokenStage.GRANT_SCOPE_UNKNOWN)
+    if not _GRANT_RESOURCE_SCOPES <= distinct:
+        raise _GrantRefused("Missing Google OAuth grant resource permission", TokenStage.GRANT_SCOPE_RESOURCE)
+    if not distinct & _GRANT_EMAIL_SCOPES:
+        raise _GrantRefused("Missing Google OAuth grant email permission", TokenStage.GRANT_SCOPE_EMAIL)
     if _IDENTITY_FIELD in fields:
         token = fields[_IDENTITY_FIELD]
         # An opaque compatibility field. The separate UserInfo response proves the subject.
-        if (distinct != _OIDC_SCOPES or type(token) is not str or len(token) > _MAX_TOKEN
+        if ("openid" not in distinct or type(token) is not str or len(token) > _MAX_TOKEN
                 or _COMPACT_JWS.fullmatch(token) is None):
             raise _GrantRefused("Invalid Google OAuth identity token field", TokenStage.GRANT_IDENTITY)
     access = fields["access_token"]

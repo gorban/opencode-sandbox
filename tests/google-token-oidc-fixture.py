@@ -17,7 +17,17 @@ CALLBACK_PINS = {
     "oc_google/auth_offer.py": "f1918857c09eb31bf51f85c27f996419e2c3a780437819fb3000a449038f5b14",
     "tests/google-connect-fixture.py": "423f99ddbbc83abe67081cfb272d9a48854281868a516ee9f3ad97e37cefd23f",
 }
-MATRIX = ((False, False), (False, True), (True, False), (True, True))
+MATRIX = (
+    ("outbound", "outbound"),
+    ("outbound", "both-openid"),
+    ("both-openid", "outbound"),
+    ("both-openid", "both-openid"),
+    ("outbound-openid", "outbound-openid"),
+    ("email", "email"),
+    ("email-openid", "email-openid"),
+    ("both", "both"),
+)
+EMAIL_URI = "https://www.googleapis.com/auth/userinfo.email"
 FIXTURE_ID_TOKEN = "fixtureOpaque.fakeValue.sandboxDummy"
 INITIAL_BEARER = "synthetic-initial-opaque-bearer"
 COLD_BEARER = "synthetic-cold-opaque-bearer"
@@ -41,15 +51,30 @@ def replace(source, original, patched):
     source.write_text(data.replace(original, patched), encoding="utf-8")
 
 
-def configure_trial(fixture, directory, root, *, initial_five, cold_five):
+def response_scopes(fixture):
+    outbound = json.loads(fixture.grant())["scope"]
+    email_only = outbound.replace(EMAIL_URI, "email")
+    return {
+        "outbound": outbound,
+        "outbound-openid": outbound + " openid",
+        "email": email_only,
+        "email-openid": email_only + " openid",
+        "both": outbound + " email",
+        "both-openid": fixture.BROWSER_SCOPE,
+    }
+
+
+def configure_trial(fixture, directory, root, *, scopes):
     token = json.loads(fixture.grant())
     legacy = token["scope"]
     initial = dict(token, access_token=INITIAL_BEARER)
     cold = dict(token, access_token=COLD_BEARER)
     del cold["refresh_token"]
-    for reply, full in ((initial, initial_five), (cold, cold_five)):
-        if full:
-            reply.update(scope=fixture.BROWSER_SCOPE, id_token=FIXTURE_ID_TOKEN)
+    with_identity = tuple("openid" in scope.split(" ") for scope in scopes)
+    for reply, scope, include_identity in zip((initial, cold), scopes, with_identity):
+        reply["scope"] = scope
+        if include_identity:
+            reply["id_token"] = FIXTURE_ID_TOKEN
     destination = directory / "oc_google/metadata_destination.py"
     contents = destination.read_text(encoding="utf-8")
     prefix, separator, _ = contents.partition("\ndef _request(")
@@ -63,7 +88,8 @@ from urllib.parse import parse_qs
 _steps = {fixture.STEPS!r}
 _token = ({initial!r}, {cold!r})
 _legacy = {legacy!r}
-_five = {fixture.BROWSER_SCOPE!r}
+_scopes = {scopes!r}
+_with_identity = {with_identity!r}
 _identity = {FIXTURE_ID_TOKEN!r}
 _replies = (None, {fixture.SUBJECT!r}, {fixture.LOAD_REPLY!r},
             None, {fixture.SUBJECT!r}, {fixture.LOAD_REPLY!r}, {fixture.catalog()!r})
@@ -78,10 +104,10 @@ def _measure(result):
 
 
 def _sanitized(cold):
-    # The fake raw grant includes the opaque sentinel only for the five-label fixture.
-    data = dict(_token[int(cold)])
+    index = int(cold)
+    data = dict(_token[index])
     identity = data.pop("id_token", None)
-    if data["scope"] not in (_legacy, _five) or ((identity == _identity) != (data["scope"] == _five)):
+    if data["scope"] != _scopes[index] or identity != (_identity if _with_identity[index] else None):
         raise MetadataDestinationError("Synthetic grant did not match the trial")
     return json.dumps(data, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
 
@@ -238,14 +264,16 @@ def exact_retirements(state):
     return count
 
 
-def report_trial(fixture, vendor, *, initial_five, cold_five):
+def report_trial(fixture, vendor, *, variants):
+    choices = response_scopes(fixture)
+    scopes = tuple(choices[variant] for variant in variants)
     root = Path(tempfile.mkdtemp(prefix="oc-g-oidc-fixture-", dir=f"/run/user/{os.getuid()}"))
     directory = root / "source"
     success = False
-    expected = [5 if full else 3 for full in (initial_five, cold_five)]
+    expected = [len(scope.split(" ")) for scope in scopes]
     try:
         home, launcher, log = fixture.copy_fixture(root, vendor)
-        configure_trial(fixture, directory, root, initial_five=initial_five, cold_five=cold_five)
+        configure_trial(fixture, directory, root, scopes=scopes)
         manifest = seal(directory)
         fixture.launch(home, launcher)
         state = home / ".local/state/oc-sandbox/google/registrations/fixture"
@@ -271,7 +299,8 @@ def report_trial(fixture, vendor, *, initial_five, cold_five):
         replica, = (entry for entry in observations if entry["phase"] == "cold-replica-retired")
         if replica["credential_schema_exact"] is not True or replica["credential_scope_authorized_three"] is not True:
             raise AssertionError("The retired native replica did not retain the authorized three-label scope")
-        print(json.dumps({"trial_labels": expected, "operations": operations, "exact_retirements": 2,
+        print(json.dumps({"trial_variants": variants, "trial_labels": expected, "operations": operations,
+                          "exact_retirements": 2,
                           "source_sha256": manifest, "observations": observations}, sort_keys=True), flush=True)
         success = True
     finally:
@@ -282,7 +311,7 @@ def report_trial(fixture, vendor, *, initial_five, cold_five):
             directory.chmod(0o700)
             shutil.rmtree(root)
         else:
-            print(json.dumps({"trial_labels": expected, "observations": read_observations(root),
+            print(json.dumps({"trial_variants": variants, "trial_labels": expected, "observations": read_observations(root),
                               "retained_synthetic_fixture": str(root)}, sort_keys=True), flush=True)
 
 
@@ -292,8 +321,9 @@ def main():
     parser.add_argument("--vendor", required=True, type=Path)
     args = parser.parse_args()
     fixture = load_source(args.source.resolve(strict=True))
-    for initial, cold in MATRIX:
-        report_trial(fixture, args.vendor.resolve(strict=True), initial_five=initial, cold_five=cold)
+    vendor = args.vendor.resolve(strict=True)
+    for variants in MATRIX:
+        report_trial(fixture, vendor, variants=variants)
 
 
 if __name__ == "__main__":

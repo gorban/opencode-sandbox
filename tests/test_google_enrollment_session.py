@@ -163,7 +163,7 @@ class EnrollmentSessionTest(unittest.TestCase):
         token, _ = self.attended_exchange(token_reply=grant(scope="synthetic-invalid-scope"))
         with self.assertRaises(OAuthExchangeError) as refusal:
             self.session(diagnostic=diagnostic)
-        self.assertIs(diagnostic.stage(refusal.exception), TokenStage.GRANT_SCOPE)
+        self.assertIs(diagnostic.stage(refusal.exception), TokenStage.GRANT_SCOPE_UNKNOWN)
         self.assertEqual(len(token.sent), 1)
         self.assert_token_only_refusal(spent=1, pending=False)
         self.assertNotIn("synthetic-invalid-scope", self.journal_file.read_text())

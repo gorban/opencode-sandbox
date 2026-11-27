@@ -16,6 +16,7 @@ from oc_google.oauth_exchange import (
     validate_enrollment_grant,
     validate_refresh_form,
 )
+from oc_google.token_diagnostic import TokenStage
 
 
 PORT = 48081
@@ -26,6 +27,16 @@ CHALLENGE = base64.urlsafe_b64encode(hashlib.sha256(VERIFIER.encode("ascii")).di
 SECRET = b"fixture-only-secret"
 SCOPE = " ".join(sorted(SCOPES))
 OIDC_SCOPE = "openid " + " ".join(reversed(SCOPE.split())) + " email"
+EMAIL_URI = "https://www.googleapis.com/auth/userinfo.email"
+SHORT_EMAIL_SCOPE = SCOPE.replace(EMAIL_URI, "email")
+SCOPE_VARIANTS = (
+    SCOPE,
+    SCOPE + " openid",
+    SHORT_EMAIL_SCOPE,
+    SHORT_EMAIL_SCOPE + " openid",
+    SCOPE + " email",
+    OIDC_SCOPE,
+)
 ID_SENTINEL = "fixture-header.opaque_body.synthetic-signature"
 ACCESS = "fixture-access-token"
 REFRESH = "fixture-refresh-token"
@@ -180,7 +191,7 @@ class EnrollmentGrantTest(unittest.TestCase):
                 self.assertEqual(parsed.access_token, ACCESS.encode("ascii"))
 
     def test_refuses_incomplete_extended_duplicate_or_noncanonical_scope_lists(self):
-        options = ("", None, SCOPE.split(" ", 1)[0], SCOPE + " openid", SCOPE + " " + SCOPE.split(" ")[0],
+        options = ("", None, SCOPE.split(" ", 1)[0], SCOPE + " " + SCOPE.split(" ")[0],
                    SCOPE.replace(" ", "  ", 1), SCOPE.replace(" ", "\t", 1), SCOPE.upper())
         for scope in options:
             with self.subTest(scope=scope), self.assertRaises(OAuthExchangeError):
@@ -268,6 +279,75 @@ class ColdGrantTest(unittest.TestCase):
         for field in ({"refresh_token": REFRESH}, {"refresh_token_expires_in": 7200}, {"extra": ID_SENTINEL}):
             with self.assertRaises(OAuthExchangeError):
                 validate_cold_grant(cold_grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, **field))
+
+
+class GrantScopeVariantsTest(unittest.TestCase):
+    grant_paths = ((grant, validate_enrollment_grant), (cold_grant, validate_cold_grant))
+
+    def test_six_scope_sets_preserve_exact_reported_native_reply(self):
+        for factory, validate in self.grant_paths:
+            for variant, scope in enumerate(SCOPE_VARIANTS):
+                with self.subTest(mode=validate.__name__, variant=variant):
+                    data = factory(scope=scope)
+                    parsed = validate(data)
+                    self.assertEqual(parsed.access_token, ACCESS.encode("ascii"))
+                    self.assertEqual(parsed.native_body, native_json(json.loads(data)))
+                    if factory is grant:
+                        self.assertEqual(parsed.refresh_token, REFRESH.encode("ascii"))
+                        self.assertEqual(parsed.expires_in, 3600)
+
+    def test_identity_token_needs_exact_openid_and_never_shares_token_roles(self):
+        for factory, validate in self.grant_paths:
+            for variant, scope in enumerate(SCOPE_VARIANTS):
+                with self.subTest(mode=validate.__name__, variant=variant):
+                    data = factory(scope=scope, id_token=ID_SENTINEL)
+                    if "openid" not in scope.split(" "):
+                        with self.assertRaises(OAuthExchangeError) as denied:
+                            validate(data)
+                        self.assertIs(denied.exception.token_stage, TokenStage.GRANT_IDENTITY)
+                        continue
+                    parsed = validate(data)
+                    expected = json.loads(data)
+                    del expected["id_token"]
+                    self.assertEqual(parsed.native_body, native_json(expected))
+                    self.assertNotIn(ID_SENTINEL.encode("ascii"), parsed.native_body)
+                    alias_roles = ("access_token", "refresh_token") if factory is grant else ("access_token",)
+                    for role in alias_roles:
+                        with self.assertRaises(OAuthExchangeError) as denied:
+                            validate(factory(scope=scope, id_token=ID_SENTINEL, **{role: ID_SENTINEL}))
+                        self.assertIs(denied.exception.token_stage, TokenStage.GRANT_IDENTITY)
+                        self.assertNotIn(ID_SENTINEL, str(denied.exception))
+
+    def test_scope_refusals_use_only_fixed_categories(self):
+        first_label = SCOPE.split(" ")[0]
+        resources = " ".join(label for label in SCOPE.split(" ") if label != EMAIL_URI)
+        unknown = "synthetic-unapproved-permission"
+        invalid = {
+            TokenStage.GRANT_SCOPE_LIST: (
+                None, [], "", " " + SCOPE, SCOPE + " ", SCOPE.replace(" ", "  ", 1),
+                SCOPE.replace(" ", "\t", 1), SCOPE + "\n", SCOPE + "\x7f",
+                SCOPE + "\u00a0" + unknown, SCOPE + " " + first_label, OIDC_SCOPE + " openid",
+            ),
+            TokenStage.GRANT_SCOPE_UNKNOWN: (
+                SCOPE + " " + unknown, SCOPE + " profile", SCOPE + " OpenID",
+                SCOPE.replace(EMAIL_URI, "Email"), SCOPE.replace("https://", "HTTPS://", 1),
+                SCOPE.replace(EMAIL_URI, EMAIL_URI + "/"), SCOPE.replace(EMAIL_URI, "userinfo.email"),
+            ),
+            TokenStage.GRANT_SCOPE_RESOURCE: tuple(
+                " ".join(label for label in SCOPE.split(" ") if label != omitted)
+                for omitted in resources.split(" ")
+            ),
+            TokenStage.GRANT_SCOPE_EMAIL: (resources, resources + " openid"),
+        }
+        for factory, validate in self.grant_paths:
+            for stage, cases in invalid.items():
+                for index, scope in enumerate(cases):
+                    with self.subTest(mode=validate.__name__, stage=stage, case=index):
+                        with self.assertRaises(OAuthExchangeError) as denied:
+                            validate(factory(scope=scope))
+                        self.assertIs(denied.exception.token_stage, stage)
+                        for marker in (unknown, EMAIL_URI, first_label, ACCESS, REFRESH):
+                            self.assertNotIn(marker, str(denied.exception))
 
 
 class RefreshFormTest(unittest.TestCase):
