@@ -17,7 +17,7 @@ from .generation_proxy import (
     CONTROL, HARD_SECONDS, STARTUP, STARTUP_LIMIT, STARTUP_SECONDS, TURN, TURN_SECONDS,
     ProxyRefused, Signal, directory_identity, expect_frame, peer_credentials, remaining, send_frame,
 )
-from .native_peer import admit_native_peer
+from .native_peer import _alive, admit_native_peer
 from .route import _send_once
 
 
@@ -79,6 +79,39 @@ class PhaseReceipt:
     fake_writes: int
     refusal_observed: bool
     connector_retired: bool
+
+
+class _PeerPin:
+    """Pin the exact socket and original kernel peer across observer calls."""
+
+    def __init__(self, connection, peer, placement):
+        self.connection = connection
+        self.peer = peer
+        self.placement = placement
+        self.socket_identity = os.fstat(connection.fileno())
+        self.pidfd_identity = os.fstat(peer._pidfd)
+
+    def active(self):
+        return self.peer.active()
+
+    def locally_current(self, placement):
+        with self.peer._lock:
+            pidfd = self.peer._pidfd
+            return (placement is self.placement and pidfd is not None
+                    and os.path.samestat(self.socket_identity, os.fstat(self.connection.fileno()))
+                    and os.path.samestat(self.pidfd_identity, os.fstat(pidfd))
+                    and peer_credentials(self.connection)[:2] == (placement.pid, placement.uid)
+                    and _alive(pidfd))
+
+
+def _local_cgroup(pid):
+    # Keep the kernel's local view independently of the supervisor's exact
+    # host cgroup reader, whose path may be relative to another namespace.
+    with open(f"/proc/{pid}/cgroup", "rb") as membership:
+        raw = membership.read(4097)
+    if not raw or len(raw) > 4096:
+        raise ProxyRefused("Gemini fixture local cgroup observation is unavailable")
+    return raw
 
 
 def tcp_attempt_fails(pid):
@@ -155,7 +188,7 @@ class FixturePhase:
         self._phase = Phase.NEW
         self._resources = ExitStack()
         self._control_listener = self._startup = self._turn = self._control = None
-        self._helper = self._control_peer = self._accepted = None
+        self._helper = self._original_helper = self._control_peer = self._accepted = None
         self._read_cgroup = self._network_fd = None
         self._baseline = self._sent_receipt = None
         self._startup_eofs = self._helper_accepts = self._owner_accepts = self._fake_writes = 0
@@ -235,6 +268,27 @@ class FixturePhase:
             raise ProxyRefused("Gemini fixture proxy control peer retired")
         self._check_owner(deadline)
 
+    def _check_output_authority(self, deadline, peer=None):
+        self._check_helper(deadline)
+        if peer is not None and not peer.active():
+            raise ProxyRefused("Gemini fixture turn peer retired")
+        self._check_owner(deadline)
+
+        # No observer callback follows these local checks. They settle the
+        # pins even when the last owner/cgroup observation changed a peer.
+        if self._helper is not self._original_helper:
+            raise ProxyRefused("Gemini fixture proxy invocation changed")
+        self._verify_network()
+        if _local_cgroup(self._helper.pid) != self._local_membership:
+            raise ProxyRefused("Gemini fixture proxy local cgroup changed")
+        if (self._control is not self._control_peer.connection
+                or not self._control_peer.locally_current(self._original_helper)):
+            raise ProxyRefused("Gemini fixture proxy control peer retired")
+        if peer is not None and (self._accepted is not peer.connection
+                                 or not peer.locally_current(self._original_helper)):
+            raise ProxyRefused("Gemini fixture turn peer retired")
+        self._check_live(deadline)
+
     def _verify_network(self):
         if not os.path.samestat(os.fstat(self._network_fd), os.stat(self._network_path)):
             raise ProxyRefused("Gemini fixture proxy network namespace changed")
@@ -253,7 +307,7 @@ class FixturePhase:
             raise ProxyRefused("Gemini fixture proxy observed a TCP attempt failure")
 
     def _send(self, signal, deadline):
-        check = self._check_sent if signal is Signal.OPEN_TURN else self._check_helper
+        check = self._check_sent if signal is Signal.OPEN_TURN else self._check_output_authority
         send_frame(self._control, self.launch.stamp, signal, deadline, check=lambda: check(deadline))
 
     def _expect(self, signal, deadline, *, count=0):
@@ -285,11 +339,14 @@ class FixturePhase:
                 with self._fence:
                     self._accepted = None
 
+    @contextmanager
     def _peer(self, connection, deadline):
         self._check_helper(deadline)
-        if peer_credentials(connection)[:2] != (self._helper.pid, self._helper.uid):
+        placement = self._original_helper
+        if self._helper is not placement or peer_credentials(connection)[:2] != (placement.pid, placement.uid):
             raise ProxyRefused("Gemini fixture proxy peer identity differs")
-        return admit_native_peer(connection, expected_group=self._helper.cgroup, read_cgroup=self._read_cgroup)
+        with admit_native_peer(connection, expected_group=placement.cgroup, read_cgroup=self._read_cgroup) as peer:
+            yield _PeerPin(connection, peer, placement)
 
     def attach(self, helper, *, read_cgroup):
         """Authenticate exactly one helper before sending the first command."""
@@ -297,7 +354,7 @@ class FixturePhase:
         with self._step(Phase.STARTING, Phase.STARTUP_WORK):
             if type(helper) is not HelperPlacement:
                 raise ProxyRefused("Gemini fixture proxy helper differs")
-            self._helper = helper
+            self._helper = self._original_helper = helper
             self._read_cgroup = read_cgroup
             control = self._resources.enter_context(self._accept(self._control_listener, deadline))
             self._control_listener.close()
@@ -308,6 +365,7 @@ class FixturePhase:
                 self._network_path = f"/proc/{helper.pid}/ns/net"
                 self._network_fd = os.open(self._network_path, os.O_RDONLY | os.O_CLOEXEC)
                 self._resources.callback(os.close, self._network_fd)
+                self._local_membership = _local_cgroup(helper.pid)
                 self._audit(deadline)
                 self._send(Signal.START, deadline)
             self._expect(Signal.STARTED, deadline)
@@ -321,7 +379,8 @@ class FixturePhase:
         with self._step(Phase.STARTUP, Phase.STARTUP_WORK):
             for _ in range(STARTUP_LIMIT):
                 with self._owned_connection(self._startup, deadline) as connection, self._peer(connection, deadline) as peer:
-                    self._check_helper(deadline)
+                    with self._fence:
+                        self._check_output_authority(deadline, peer)
                     handler(connection, deadline)
                     connection.shutdown(socket.SHUT_WR)
                     _read_eof(connection, deadline, 0)
@@ -353,19 +412,19 @@ class FixturePhase:
                 self._audit(deadline)
                 self._phase = Phase.BOUND
 
-    def _check_sent(self, deadline):
+    def _check_sent(self, deadline, peer=None):
         self._audit(deadline)
         if (self._sent_receipt is None
                 or self._sent_receipt_is_current(self._binding, self._sent_receipt) is not True):
             raise ProxyRefused("Gemini fixture durable ACP sent receipt differs")
-        self._check_owner(deadline)
+        self._check_output_authority(deadline, peer)
 
-    def _check_destination_claim(self, capability, deadline):
-        self._check_sent(deadline)
+    def _check_destination_claim(self, capability, deadline, peer):
+        self._check_sent(deadline, peer)
         if (capability is None
                 or self._destination_claim_is_current(self._binding, self._sent_receipt, capability) is not True):
             raise ProxyRefused("Gemini fixture durable destination claim differs")
-        self._check_owner(deadline)
+        self._check_output_authority(deadline, peer)
 
     def activate(self, sent_receipt):
         """Listen only after the current exact durable ACP_SENT is visible to the owner."""
@@ -407,9 +466,9 @@ class FixturePhase:
                     effect_owner = get_ident()
 
                     def current_scope(binding):
-                        if binding is not self._binding or not peer.active():
+                        if binding is not self._binding:
                             return False
-                        self._check_destination_claim(capability, deadline)
+                        self._check_destination_claim(capability, deadline, peer)
                         return True
 
                     attempt = GenerationAttempt(self._binding, destination, authorized=current_scope)
@@ -426,23 +485,21 @@ class FixturePhase:
                                 raise ProxyRefused("Gemini fixture destination effect was spent")
                             entered = True
                             capability = claim
-                            if not peer.active():
-                                raise ProxyRefused("Gemini fixture turn peer retired")
-                            self._check_destination_claim(capability, deadline)
+                            self._check_destination_claim(capability, deadline, peer)
                             try:
                                 reply = attempt.run(self._binding, request, end_of_input=True)
                             finally:
                                 self._fake_writes = attempt.receipt().complete_requests
-                            self._check_sent(deadline)
+                            self._check_sent(deadline, peer)
                             return reply
 
                     try:
                         with self._fence:
-                            self._check_sent(deadline)
+                            self._check_sent(deadline, peer)
                             result = claim_destination(self._binding, self._sent_receipt, dispatch)
                             if not entered or reply is None or result is not reply or self._fake_writes != 1:
                                 raise ProxyRefused("Gemini fixture destination effect is unconfirmed")
-                            self._check_sent(deadline)
+                            self._check_sent(deadline, peer)
                     finally:
                         live_effect = False
                     packet = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n"
@@ -454,9 +511,7 @@ class FixturePhase:
                     if not writable:
                         raise ProxyRefused("Gemini fixture native reply expired")
                     with self._fence:
-                        if not peer.active():
-                            raise ProxyRefused("Gemini fixture turn peer retired")
-                        self._check_sent(deadline)
+                        self._check_sent(deadline, peer)
                         if _send_once(connection, packet) != len(packet):
                             raise ProxyRefused("Gemini fixture native reply is unconfirmed")
                         connection.shutdown(socket.SHUT_WR)

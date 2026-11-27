@@ -35,6 +35,7 @@ class FixturePhaseTest(unittest.TestCase):
         self.binding = generation.GenerationBinding(object(), object(), 1, generation.MODEL_ALIAS)
         self.sent = False
         self.live = True
+        self.helper_cgroup_current = True
         self.receipt = object()
         self.capability = object()
         self.claim_live = False
@@ -73,7 +74,7 @@ class FixturePhaseTest(unittest.TestCase):
         return generation.FakeDestination(response(), end_of_input=True)
 
     @contextmanager
-    def helper(self, phase, pause_at_listen=None, *, expect_success=True):
+    def helper(self, phase, pause_at_listen=None, *, expect_success=True, expected_signal=None):
         owner = os.getpid()
         launch = phase.launch
         child = os.fork()
@@ -123,7 +124,9 @@ class FixturePhaseTest(unittest.TestCase):
                     self.fail("The fixture helper did not settle")
                 _, status = os.waitpid(child, 0)
                 exit_code = os.waitstatus_to_exitcode(status)
-                if expect_success is None:
+                if expected_signal is not None:
+                    self.assertEqual(exit_code, -expected_signal)
+                elif expect_success is None:
                     self.assertIn(exit_code, (0, 2))
                 else:
                     self.assertEqual(exit_code, 0 if expect_success else 2)
@@ -131,14 +134,14 @@ class FixturePhaseTest(unittest.TestCase):
                 os.close(pidfd)
 
     @contextmanager
-    def fixture(self, pause_at_listen=None, *, expect_success=True, wrong_pid=False):
+    def fixture(self, pause_at_listen=None, *, expect_success=True, wrong_pid=False, expected_signal=None):
         with generation_phase.FixturePhase(
             self.root, port=self.port, binding=self.binding, fence=RLock(),
             authorized=lambda binding: self.live and binding is self.binding,
             verify_helper=lambda scope: scope is self.scope,
             sent_receipt_is_current=self.current_sent, destination_claim_is_current=self.current_claim,
         ) as phase:
-            with self.helper(phase, pause_at_listen, expect_success=expect_success) as child:
+            with self.helper(phase, pause_at_listen, expect_success=expect_success, expected_signal=expected_signal) as child:
                 self.scope = generation_phase.HelperPlacement(child + int(wrong_pid), os.geteuid(),
                                                               b"/fixture.service", "a" * 32)
                 try:
@@ -151,7 +154,7 @@ class FixturePhaseTest(unittest.TestCase):
     def attach(self, phase):
         def membership(pid):
             self.assertEqual(pid, self.scope.pid)
-            return b"0::/fixture.service\n"
+            return b"0::/fixture.service\n" if self.helper_cgroup_current else b"0::/misplaced.service\n"
 
         phase.attach(self.scope, read_cgroup=membership)
 
@@ -498,6 +501,152 @@ class FixturePhaseTest(unittest.TestCase):
                 self.assertIsNone(sink.receipt())
                 self.assertEqual(phase.receipt().fake_writes, 0)
                 self.assertIs(phase.receipt().phase, generation_phase.Phase.HELD)
+
+    def test_cgroup_loss_inside_final_sent_proof_blocks_open_control_write(self):
+        with self.fixture(expect_success=False) as phase:
+            self.prepare(phase)
+            self.sent = True
+            at_control_write = False
+            send = generation_phase.send_frame
+
+            def verify_then_lose_group(binding, receipt):
+                current = self.current_sent(binding, receipt)
+                if at_control_write:
+                    self.assertTrue(current)
+                    self.helper_cgroup_current = False
+                return current
+
+            def open_control(*args, **kwargs):
+                nonlocal at_control_write
+                self.assertIs(args[2], generation_proxy.Signal.OPEN_TURN)
+                at_control_write = True
+                return send(*args, **kwargs)
+
+            with patch.object(phase, "_sent_receipt_is_current", side_effect=verify_then_lose_group), \
+                    patch.object(generation_phase, "send_frame", side_effect=open_control), \
+                    patch.object(generation_proxy, "_send_once", wraps=generation_proxy._send_once) as write:
+                with self.assertRaisesRegex(generation_proxy.ProxyRefused, "control peer retired"):
+                    phase.activate(self.receipt)
+            self.assertFalse(self.helper_cgroup_current)
+            write.assert_not_called()
+            self.assertIs(phase.receipt().phase, generation_phase.Phase.HELD)
+
+    def test_local_membership_change_during_last_owner_check_blocks_open(self):
+        with self.fixture(expect_success=False) as phase:
+            self.prepare(phase)
+            self.sent = True
+            reading_open_proof = False
+            proof_seen = False
+            local_changed = False
+            send = generation_phase.send_frame
+            local_cgroup = getattr(generation_phase, "_local_cgroup", None)
+            authorized = phase._authorized
+
+            def read_local(pid):
+                if local_changed:
+                    return b"0::/synthetic-local-change\n"
+                return local_cgroup(pid)
+
+            def verify_sent(binding, receipt):
+                nonlocal proof_seen
+                proof_seen |= reading_open_proof
+                return self.current_sent(binding, receipt)
+
+            def observe_owner(binding):
+                nonlocal local_changed
+                local_changed |= proof_seen
+                return authorized(binding)
+
+            def open_control(*args, **kwargs):
+                nonlocal reading_open_proof
+                self.assertIs(args[2], generation_proxy.Signal.OPEN_TURN)
+                reading_open_proof = True
+                return send(*args, **kwargs)
+
+            with patch.object(phase, "_sent_receipt_is_current", side_effect=verify_sent), \
+                    patch.object(phase, "_authorized", side_effect=observe_owner), \
+                    patch.object(generation_phase, "_local_cgroup", side_effect=read_local, create=True), \
+                    patch.object(generation_phase, "send_frame", side_effect=open_control), \
+                    patch.object(generation_proxy, "_send_once", wraps=generation_proxy._send_once) as write:
+                with self.assertRaisesRegex(generation_proxy.ProxyRefused, "local cgroup changed"):
+                    phase.activate(self.receipt)
+            self.assertTrue(local_changed)
+            write.assert_not_called()
+            self.assertIs(phase.receipt().phase, generation_phase.Phase.HELD)
+
+    def test_exact_helper_death_in_final_claim_proof_prevents_fake_write(self):
+        with self.fixture(expected_signal=signal.SIGKILL) as phase:
+            self.prepare(phase)
+            self.sent = True
+            phase.activate(self.receipt)
+            sink = self.destination()
+            at_sink_write = False
+            write = sink.write
+
+            def enter_sink(*args, **kwargs):
+                nonlocal at_sink_write
+                at_sink_write = True
+                return write(*args, **kwargs)
+
+            def verify_then_retire_helper(binding, receipt, capability):
+                current = self.current_claim(binding, receipt, capability)
+                if at_sink_write:
+                    self.assertTrue(current)
+                    fd = os.pidfd_open(self.scope.pid)
+                    try:
+                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                        self.assertTrue(select.select([fd], [], [], 1)[0])
+                    finally:
+                        os.close(fd)
+                return current
+
+            with ThreadPoolExecutor(max_workers=1) as runner:
+                native = runner.submit(self.client, request())
+                with patch.object(phase, "_destination_claim_is_current", side_effect=verify_then_retire_helper), \
+                        patch.object(sink, "write", side_effect=enter_sink):
+                    with self.assertRaises((generation_proxy.ProxyRefused, generation.GenerationRefused)) as stopped:
+                        phase.serve_turn(sink, claim_destination=self.claim_destination)
+                self.assertEqual(native.result(timeout=3), b"")
+            self.assertTrue(at_sink_write)
+            self.assertIsNone(sink.receipt())
+            self.assertRegex(str(stopped.exception), "control peer retired")
+            self.assertEqual(phase.receipt().fake_writes, 0)
+            self.assertIs(phase.receipt().phase, generation_phase.Phase.HELD)
+
+    def test_cgroup_loss_in_sent_proof_at_native_reply_withholds_native_bytes(self):
+        with self.fixture(expect_success=False) as phase:
+            self.prepare(phase)
+            self.sent = True
+            phase.activate(self.receipt)
+            sink = self.destination()
+            native_reply_ready = False
+            select_ready = select.select
+
+            def mark_native_reply(readable, writable, exceptional, timeout):
+                nonlocal native_reply_ready
+                ready = select_ready(readable, writable, exceptional, timeout)
+                native_reply_ready |= bool(writable)
+                return ready
+
+            def verify_then_lose_group(binding, receipt):
+                current = self.current_sent(binding, receipt)
+                if native_reply_ready:
+                    self.assertTrue(current)
+                    self.helper_cgroup_current = False
+                return current
+
+            with ThreadPoolExecutor(max_workers=1) as runner:
+                native = runner.submit(self.client, request())
+                with patch.object(phase, "_sent_receipt_is_current", side_effect=verify_then_lose_group), \
+                        patch.object(generation_phase.select, "select", side_effect=mark_native_reply), \
+                        patch.object(generation_phase, "_send_once", wraps=generation_phase._send_once) as write:
+                    with self.assertRaisesRegex(generation_proxy.ProxyRefused, "control peer retired"):
+                        phase.serve_turn(sink, claim_destination=self.claim_destination)
+                self.assertEqual(native.result(timeout=3), b"")
+            self.assertTrue(native_reply_ready)
+            write.assert_not_called()
+            self.assertEqual(phase.receipt().fake_writes, 1)
+            self.assertIs(phase.receipt().phase, generation_phase.Phase.HELD)
 
     def test_wrong_pid_cannot_receive_a_control_command(self):
         with self.fixture(expect_success=False, wrong_pid=True) as phase:
