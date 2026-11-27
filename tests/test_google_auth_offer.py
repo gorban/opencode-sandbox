@@ -244,6 +244,75 @@ class CallbackGateTest(unittest.TestCase):
                 self.assertEqual(gate.take_forwarded(), auth.Callback(STATE, CODE))
                 self.assert_no_native_bytes(recorder)
 
+    def test_chromium_client_hints_preserve_only_canonical_state_and_code(self):
+        hints = (b'Sec-CH-UA: "Chromium";v="131", "Not_A Brand";v="24"\r\n'
+                 b"Sec-CH-UA-Mobile: ?0\r\n"
+                 b'sec-CH-ua-platform: "Linux"\r\n')
+        with placement() as (gate, recorder, port):
+            browser = request(port, extra_query=OBSERVED_QUERY, extra_headers=hints)
+            self.assertEqual(self.exchange(gate, port, browser), auth.acknowledgement(True))
+            recorder.settimeout(1)
+            self.assertEqual(recorder.recv(4096), request(port))
+            self.assertEqual(gate.take_forwarded(), auth.Callback(STATE, CODE))
+            self.assertIsNone(gate.take_forwarded())
+            self.assert_no_native_bytes(recorder)
+
+    def test_unapproved_or_ambiguous_chromium_hint_headers_cancel_matching_callback(self):
+        approved = (b'Sec-CH-UA: "Chromium";v="131"\r\n'
+                    b"Sec-CH-UA-Mobile: ?0\r\n"
+                    b'Sec-CH-UA-Platform: "Linux"\r\n')
+        cases = {
+            "case-insensitive duplicate": approved + b"sec-ch-uA: duplicate\r\n",
+            "control character": approved.replace(b"?0", b"?0\x00"),
+            "non-ASCII value": approved.replace(b"Linux", b"Linu\xff"),
+            "unknown hint": approved + b'Sec-CH-UA-Full-Version: "131.0"\r\n',
+            "lookalike name": approved + b"Sec_CH_UA: fixture\r\n",
+            "cookie": approved + b"Cookie: fixture=value\r\n",
+            "authorization": approved + b"Authorization: Bearer fixture\r\n",
+            "forwarded": approved + b"X-Forwarded-Host: fixture.invalid\r\n",
+        }
+        for case, headers in cases.items():
+            with self.subTest(case=case), placement() as (gate, recorder, port):
+                browser = request(port, extra_query=OBSERVED_QUERY, extra_headers=headers)
+                self.assertEqual(self.exchange(gate, port, browser), auth.acknowledgement(False))
+                self.assertEqual(gate.outcome, auth.Outcome.CANCELLED)
+                self.assertIsNone(gate.take_forwarded())
+                self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
+                self.assert_no_native_bytes(recorder)
+
+    def test_storage_access_hint_is_ignored_in_forward_and_acknowledgment(self):
+        hints = (b'Sec-CH-UA: "Chromium";v="131"\r\n'
+                 b"Sec-CH-UA-Mobile: ?0\r\n"
+                 b'Sec-CH-UA-Platform: "Linux"\r\n')
+        for value in (b"none", b"active", b"fixture-unused"):
+            with self.subTest(value=value), placement() as (gate, recorder, port):
+                headers = hints + b"Sec-Fetch-Storage-Access: " + value + b"\r\n"
+                browser = request(port, extra_query=OBSERVED_QUERY, extra_headers=headers)
+                reply = self.exchange(gate, port, browser)
+                self.assertEqual(reply, auth.acknowledgement(True))
+                self.assertNotIn(b"activate-storage-access:", reply.lower())
+                recorder.settimeout(1)
+                self.assertEqual(recorder.recv(4096), request(port))
+                self.assertEqual(gate.take_forwarded(), auth.Callback(STATE, CODE))
+                self.assert_no_native_bytes(recorder)
+
+    def test_ambiguous_storage_access_or_origin_cancels_matching_callback(self):
+        hint = b"Sec-Fetch-Storage-Access: none\r\n"
+        for headers in (
+            hint + b"sEc-fEtCh-StOrAgE-aCcEsS: active\r\n",
+            hint.replace(b"none", b"non\x00e"),
+            hint + b"Origin: https://accounts.google.com\r\n",
+        ):
+            with self.subTest(headers=headers), placement() as (gate, recorder, port):
+                browser = request(port, extra_query=OBSERVED_QUERY, extra_headers=headers)
+                reply = self.exchange(gate, port, browser)
+                self.assertEqual(reply, auth.acknowledgement(False))
+                self.assertNotIn(b"activate-storage-access:", reply.lower())
+                self.assertEqual(gate.outcome, auth.Outcome.CANCELLED)
+                self.assertIsNone(gate.take_forwarded())
+                self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
+                self.assert_no_native_bytes(recorder)
+
     def test_owner_can_take_forwarded_fields_only_once(self):
         with placement() as (gate, _, port), ThreadPoolExecutor(max_workers=2) as workers:
             self.assertIsNone(gate.take_forwarded())

@@ -215,6 +215,7 @@ PYTHON_FILES = (
     'tests/google_registration_fixture.py',
     'tests/google-shell-fixture.py',
     'tests/google-connect-fixture.py',
+    'tests/google-token-oidc-fixture.py',
     'tests/mixed_picker_portable.py',
     'tests/host_state_leaves.py',
     'tests/orchestrator-owner-loss.py',

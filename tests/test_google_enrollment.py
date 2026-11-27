@@ -18,7 +18,9 @@ from oc_google.enrollment import EnrollmentMetadataError, LoadObservation, verif
 from oc_google.metadata_destination import MetadataRoute
 from oc_google.oauth_exchange import OAuthExchangeError
 from google_registration_fixture import record_enrollment_retired
-from test_google_oauth_exchange import ACCESS, AUTHORIZATION, CODE, STATE, cold_credential, form, grant, offer, refresh_form
+from test_google_oauth_exchange import (
+    ACCESS, AUTHORIZATION, CODE, STATE, cold_credential, form, grant, native_json, offer, refresh_form,
+)
 
 
 SUBJECT = b'{"id":"2527739134"}'
@@ -153,7 +155,7 @@ class InitialExchangeTest(unittest.TestCase):
             ("permit", MetadataRoute.TOKEN), ("write", MetadataRoute.TOKEN),
             ("permit", MetadataRoute.USERINFO), ("write", MetadataRoute.USERINFO),
         ])
-        self.assertEqual(reply.body, self.token_reply)
+        self.assertEqual(reply.body, native_json(json.loads(self.token_reply)))
         self.assertNotIn(ACCESS, repr(reply))
         with self.assertRaises(TypeError):
             pickle.dumps(reply)

@@ -134,30 +134,29 @@ def verify_initial_exchange(
     """
     callback = callback_gate.take_forwarded()
     validate_authorization_code_exchange(offer, callback, authorization=authorization, body=form)
-    token_reply = destination(
+    grant = validate_enrollment_grant(destination(
         MetadataRoute.TOKEN, authorization=authorization, body=form, deadline=deadline,
         deliver=lambda send: spend(MetadataRoute.TOKEN, send),
-    )
-    grant = validate_enrollment_grant(token_reply)
-    return _bind_token_reply(token_reply, grant.access_token, bind_subject, deadline, spend, destination)
+    ))
+    return _bind_token_reply(grant, bind_subject, deadline, spend, destination)
 
 
 def verify_cold_refresh(*, form, prepare_form, bind_subject, deadline, spend, destination=exchange):
     """Refresh only the pinned cold profile and verify the same subject before reply."""
     body = prepare_form(form)
-    token_reply = destination(
+    grant = validate_cold_grant(destination(
         MetadataRoute.TOKEN, authorization=None, body=body, deadline=deadline,
         deliver=lambda send: spend(MetadataRoute.TOKEN, send),
-    )
-    access = validate_cold_grant(token_reply)
-    return _bind_token_reply(token_reply, access, bind_subject, deadline, spend, destination)
+    ))
+    return _bind_token_reply(grant, bind_subject, deadline, spend, destination)
 
 
-def _bind_token_reply(token_reply, access, bind_subject, deadline, spend, destination):
+def _bind_token_reply(grant, bind_subject, deadline, spend, destination):
+    access = grant.access_token
     subject_reply = destination(
         MetadataRoute.USERINFO, authorization=b"Bearer " + access, deadline=deadline,
         deliver=lambda send: spend(MetadataRoute.USERINFO, send),
     )
     proof = bind_subject(access, subject_reply)
     proof.require_metadata_bearer(MetadataOperation.LOAD_CODE_ASSIST, access)
-    return VerifiedTokenReply(token_reply, proof, _LoadCodeAssist(proof, deadline, spend, destination))
+    return VerifiedTokenReply(grant.native_body, proof, _LoadCodeAssist(proof, deadline, spend, destination))

@@ -46,8 +46,9 @@ _SUCCESS_METADATA = {"iss", "scope", "authuser", "prompt"}
 _DENIAL_FIELDS = {"state", "error"}
 _HEADERS = frozenset({
     b"host", b"accept", b"accept-encoding", b"accept-language", b"cache-control", b"connection",
-    b"pragma", b"priority", b"sec-fetch-dest", b"sec-fetch-mode", b"sec-fetch-site", b"sec-fetch-user",
-    b"upgrade-insecure-requests", b"user-agent",
+    b"pragma", b"priority", b"sec-ch-ua", b"sec-ch-ua-mobile", b"sec-ch-ua-platform",
+    b"sec-fetch-dest", b"sec-fetch-mode", b"sec-fetch-site", b"sec-fetch-storage-access",
+    b"sec-fetch-user", b"upgrade-insecure-requests", b"user-agent",
 })
 
 

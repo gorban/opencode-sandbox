@@ -12,6 +12,7 @@ from oc_google.auth_offer import AUTH_URL, CLIENT_ID, SCOPES, Callback, redirect
 from oc_google.oauth_exchange import (
     OAuthExchangeError,
     validate_authorization_code_exchange,
+    validate_cold_grant,
     validate_enrollment_grant,
     validate_refresh_form,
 )
@@ -24,6 +25,8 @@ VERIFIER = "fixture-verifier." + "a" * 50
 CHALLENGE = base64.urlsafe_b64encode(hashlib.sha256(VERIFIER.encode("ascii")).digest()).decode().rstrip("=")
 SECRET = b"fixture-only-secret"
 SCOPE = " ".join(sorted(SCOPES))
+OIDC_SCOPE = "openid " + " ".join(reversed(SCOPE.split())) + " email"
+ID_SENTINEL = "fixture-header.opaque_body.synthetic-signature"
 ACCESS = "fixture-access-token"
 REFRESH = "fixture-refresh-token"
 
@@ -66,6 +69,16 @@ def grant(**changes):
         "scope": SCOPE,
         "token_type": "Bearer",
     } | changes).encode("utf-8")
+
+
+def cold_grant(**changes):
+    fields = json.loads(grant())
+    del fields["refresh_token"]
+    return json.dumps(fields | changes).encode("utf-8")
+
+
+def native_json(fields):
+    return json.dumps(fields, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
 
 
 def cold_credential(**changes):
@@ -149,6 +162,23 @@ class EnrollmentGrantTest(unittest.TestCase):
         self.assertEqual(validate_enrollment_grant(grant(refresh_token_expires_in=7200)).refresh_token_expires_in,
                          7200)
 
+    def test_keeps_exact_reported_scope_and_projects_only_validated_initial_fields(self):
+        cases = (
+            grant(scope=OIDC_SCOPE),
+            grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, refresh_token_expires_in=7200),
+            grant(scope=OIDC_SCOPE, id_token="a" * 8188 + ".b.c"),
+            grant(),
+        )
+        for raw in cases:
+            with self.subTest(labels=len(json.loads(raw)["scope"].split())):
+                parsed = validate_enrollment_grant(raw)
+                expected = json.loads(raw)
+                expected.pop("id_token", None)
+                self.assertEqual(parsed.native_body, native_json(expected))
+                self.assertNotIn(b'"id_token"', parsed.native_body)
+                self.assertNotIn(ID_SENTINEL, repr(parsed))
+                self.assertEqual(parsed.access_token, ACCESS.encode("ascii"))
+
     def test_refuses_incomplete_extended_duplicate_or_noncanonical_scope_lists(self):
         options = ("", None, SCOPE.split(" ", 1)[0], SCOPE + " openid", SCOPE + " " + SCOPE.split(" ")[0],
                    SCOPE.replace(" ", "  ", 1), SCOPE.replace(" ", "\t", 1), SCOPE.upper())
@@ -182,12 +212,62 @@ class EnrollmentGrantTest(unittest.TestCase):
         parsed = validate_enrollment_grant(grant())
         for credential in (ACCESS, REFRESH):
             self.assertNotIn(credential, repr(parsed))
-        with self.assertRaisesRegex(TypeError, "^Google enrollment grant must remain in memory$"):
+        with self.assertRaisesRegex(TypeError, "must remain in memory$"):
             pickle.dumps(parsed)
         with self.assertRaises(OAuthExchangeError) as denied:
             validate_enrollment_grant(grant()[:-1])
         self.assertIsNone(denied.exception.__context__)
         self.assertNotIn(ACCESS, str(denied.exception))
+
+
+class ColdGrantTest(unittest.TestCase):
+    def test_cold_projection_preserves_reported_scope_and_strips_the_optional_identity_token(self):
+        for raw in (cold_grant(), cold_grant(scope=OIDC_SCOPE), cold_grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL)):
+            parsed = validate_cold_grant(raw)
+            expected = json.loads(raw)
+            expected.pop("id_token", None)
+            self.assertEqual(parsed.native_body, native_json(expected))
+            self.assertEqual(parsed.access_token, ACCESS.encode("ascii"))
+            self.assertNotIn(ACCESS, repr(parsed))
+            self.assertNotIn(ID_SENTINEL, repr(parsed))
+            with self.assertRaises(TypeError):
+                pickle.dumps(parsed)
+
+    def test_distinct_compact_tokens_remain_eligible(self):
+        access = ID_SENTINEL[:-1] + "x"
+        refresh = ID_SENTINEL[:-1] + "y"
+        initial = validate_enrollment_grant(grant(
+            scope=OIDC_SCOPE, id_token=ID_SENTINEL, access_token=access, refresh_token=refresh,
+        ))
+        cold = validate_cold_grant(cold_grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, access_token=access))
+        self.assertEqual(initial.access_token, access.encode("ascii"))
+        self.assertEqual(initial.refresh_token, refresh.encode("ascii"))
+        self.assertEqual(cold.access_token, access.encode("ascii"))
+        self.assertEqual(json.loads(initial.native_body)["scope"], OIDC_SCOPE)
+        self.assertEqual(json.loads(cold.native_body)["scope"], OIDC_SCOPE)
+
+    def test_both_grant_modes_refuse_unexpected_identity_or_scope_shapes(self):
+        invalid_identity = ("a.b", "a.b.c.d", "a..c", "a.b.c=", "a.b.é", "a.b.c\n",
+                            "a" * 8189 + ".b.c", None, False, [ID_SENTINEL])
+        invalid_scope = (OIDC_SCOPE + " openid", OIDC_SCOPE.replace("email", "profile"),
+                         OIDC_SCOPE.replace("openid ", ""), OIDC_SCOPE.replace(" ", "  ", 1))
+        for factory, validate in (
+            (grant, validate_enrollment_grant), (cold_grant, validate_cold_grant),
+        ):
+            invalid = [factory(id_token=ID_SENTINEL)]
+            invalid.extend(factory(scope=OIDC_SCOPE, id_token=value) for value in invalid_identity)
+            invalid.extend(factory(scope=value, id_token=ID_SENTINEL) for value in invalid_scope)
+            raw = factory(scope=OIDC_SCOPE, id_token=ID_SENTINEL)
+            invalid.append(raw[:-1] + rb', "id_token": "a.b.c"}')
+            for index, body in enumerate(invalid):
+                with self.subTest(mode=validate.__name__, case=index), self.assertRaises(OAuthExchangeError) as denied:
+                    validate(body)
+                self.assertNotIn(ID_SENTINEL, str(denied.exception))
+
+    def test_cold_grant_refuses_rotation_and_unknown_fields_even_with_valid_oidc(self):
+        for field in ({"refresh_token": REFRESH}, {"refresh_token_expires_in": 7200}, {"extra": ID_SENTINEL}):
+            with self.assertRaises(OAuthExchangeError):
+                validate_cold_grant(cold_grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, **field))
 
 
 class RefreshFormTest(unittest.TestCase):

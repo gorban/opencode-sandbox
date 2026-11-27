@@ -27,7 +27,10 @@ from oc_google.native_transport import NativeChannel
 from google_registration_fixture import record_enrollment_retired
 from test_google_enrollment import BEARER, LOAD_REPLY, LOAD_REQUEST, SUBJECT
 from test_google_metadata_ingress import FakePeer, packet
-from test_google_oauth_exchange import AUTHORIZATION, CODE, STATE, cold_credential, form, grant, offer, refresh_form
+from test_google_oauth_exchange import (
+    AUTHORIZATION, CODE, ID_SENTINEL, OIDC_SCOPE, STATE, cold_credential, cold_grant,
+    form, grant, native_json, offer, refresh_form,
+)
 
 
 TOKEN = MetadataRoute.TOKEN
@@ -59,6 +62,23 @@ class NativePeer(FakePeer):
             yield NativeChannel(self, self.active)
         finally:
             self.close()
+
+
+def assert_alias_denied(test, raw_grant):
+    test.responses[TOKEN] = raw_grant
+    destination = test.destination
+
+    def observe(route, **request):
+        if route is not TOKEN:
+            test.fail("Token alias reached UserInfo or another metadata route")
+        return destination(route, **request)
+
+    with patch.object(test, "destination", side_effect=observe):
+        with test.assertRaisesRegex(OAuthExchangeError, "^Google OAuth token roles overlap$"):
+            test.session()
+    test.assertEqual(test.sent, [TOKEN])
+    test.assertTrue(test.peers[TOKEN].closed)
+    test.assertEqual(test.peers[TOKEN].replies, [])
 
 
 class EnrollmentSessionTest(unittest.TestCase):
@@ -120,8 +140,36 @@ class EnrollmentSessionTest(unittest.TestCase):
             reply, = peer.replies
             headers, body = reply.split(b"\r\n\r\n", 1)
             self.assertIn(b"Connection: close", headers)
-            self.assertEqual(body, self.responses[route])
+            expected = self.responses[route]
+            if route is TOKEN:
+                expected = native_json(json.loads(expected))
+            self.assertEqual(body, expected)
         self.callback_gate.take_forwarded.assert_called_once_with()
+
+    def test_initial_oidc_reply_reaches_native_with_scope_and_without_identity_token(self):
+        self.responses[TOKEN] = grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, refresh_token_expires_in=7200)
+        self.session()
+        self.assertEqual(self.sent, [TOKEN, USERINFO, LOAD])
+        response, = self.peers[TOKEN].replies
+        self.assertEqual(response.split(b"\r\n\r\n", 1)[1], native_json(json.loads(
+            grant(scope=OIDC_SCOPE, refresh_token_expires_in=7200),
+        )))
+        self.assertNotIn(ID_SENTINEL.encode("ascii"), response)
+
+    def test_invalid_initial_identity_stops_before_userinfo_or_native_reply(self):
+        self.responses[TOKEN] = grant(id_token=ID_SENTINEL)
+        with self.assertRaises(OAuthExchangeError):
+            self.session()
+        self.assertEqual(self.sent, [TOKEN])
+        self.assertEqual(self.accepted, [TOKEN])
+        self.assertTrue(self.peers[TOKEN].closed)
+        self.assertEqual(self.peers[TOKEN].replies, [])
+
+    def test_initial_identity_alias_as_access_never_leaves_token_exchange(self):
+        assert_alias_denied(self, grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, access_token=ID_SENTINEL))
+
+    def test_initial_identity_alias_as_refresh_never_leaves_token_exchange(self):
+        assert_alias_denied(self, grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, refresh_token=ID_SENTINEL))
 
     def test_unverified_subject_withholds_token_and_closes_channel(self):
         self.responses[USERINFO] = b"{}"
@@ -327,6 +375,25 @@ class ColdMetadataSessionTest(unittest.TestCase):
         self.assertEqual(observation.gemini_models, ("gemini-fixture",))
         self.assertEqual(self.sent, [TOKEN, USERINFO, LOAD, CATALOG])
         self.assertTrue(all(peer.closed and len(peer.replies) == 1 for peer in self.peers.values()))
+
+    def test_cold_oidc_reply_reaches_native_with_scope_and_without_identity_token(self):
+        self.responses[TOKEN] = cold_grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL)
+        self.session()
+        self.assertEqual(self.sent, [TOKEN, USERINFO, LOAD, CATALOG])
+        response, = self.peers[TOKEN].replies
+        self.assertEqual(response.split(b"\r\n\r\n", 1)[1], native_json(json.loads(cold_grant(scope=OIDC_SCOPE))))
+        self.assertNotIn(ID_SENTINEL.encode("ascii"), response)
+
+    def test_invalid_cold_oidc_envelope_stops_before_userinfo_or_native_reply(self):
+        self.responses[TOKEN] = cold_grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, refresh_token_expires_in=7200)
+        with self.assertRaises(OAuthExchangeError):
+            self.session()
+        self.assertEqual(self.sent, [TOKEN])
+        self.assertTrue(self.peers[TOKEN].closed)
+        self.assertEqual(self.peers[TOKEN].replies, [])
+
+    def test_cold_identity_alias_as_access_never_leaves_token_exchange(self):
+        assert_alias_denied(self, cold_grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, access_token=ID_SENTINEL))
 
     def test_wrong_project_blocks_catalog_before_outbound_write(self):
         self.peers[CATALOG] = self.catalog_peer(b'{"project":"different-project"}')

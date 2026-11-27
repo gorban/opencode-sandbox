@@ -1,6 +1,7 @@
 """Validate the standalone Google authorization-code exchange and initial grant."""
 
 import base64
+from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
@@ -21,6 +22,8 @@ _TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 _ACCESS_FIELDS = {"access_token", "expires_in", "scope", "token_type"}
 _GRANT_FIELDS = _ACCESS_FIELDS | {"refresh_token"}
 _OPTIONAL_GRANT_FIELDS = {"refresh_token_expires_in"}
+_IDENTITY_FIELD = "id_token"
+_OIDC_SCOPES = SCOPES | {"email", "openid"}
 _MAX_FORM = 8192
 _MAX_BASIC = 2048
 _MAX_GRANT = 32768
@@ -29,6 +32,7 @@ _MAX_CREDENTIAL = 65536
 _MAX_EXPIRY = (1 << 31) - 1
 _VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}")
 _REFRESH_TOKEN = re.compile(r"[!-~]{1," + str(_MAX_TOKEN) + r"}")
+_COMPACT_JWS = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", re.ASCII)
 
 
 class OAuthExchangeError(ValueError):
@@ -166,27 +170,36 @@ def _positive_expiry(value):
     return type(value) is int and 0 < value <= _MAX_EXPIRY
 
 
-class EnrollmentGrant:
-    """An in-memory bearer grant with redacted representation."""
+@dataclass(frozen=True, slots=True)
+class AccessGrant:
+    """An in-memory bearer and its projected native JSON reply."""
 
-    __slots__ = ("access_token", "refresh_token", "expires_in", "refresh_token_expires_in")
-
-    def __init__(self, access_token: bytes, refresh_token: bytes, expires_in: int,
-                 refresh_token_expires_in: int | None):
-        self.access_token = access_token
-        self.refresh_token = refresh_token
-        self.expires_in = expires_in
-        self.refresh_token_expires_in = refresh_token_expires_in
+    access_token: bytes = field(repr=False)
+    native_body: bytes = field(repr=False)
 
     def __reduce_ex__(self, _protocol):
-        raise TypeError("Google enrollment grant must remain in memory")
+        raise TypeError("Google OAuth grant must remain in memory")
+
+
+@dataclass(frozen=True, slots=True)
+class EnrollmentGrant(AccessGrant):
+    refresh_token: bytes = field(repr=False)
+    expires_in: int
+    refresh_token_expires_in: int | None
 
 
 def _access_from_grant(fields):
     scope = fields["scope"]
     scopes = scope.split(" ") if type(scope) is str else ()
-    if len(scopes) != len(SCOPES) or set(scopes) != SCOPES:
+    distinct = set(scopes)
+    if len(scopes) != len(distinct) or distinct not in (SCOPES, _OIDC_SCOPES):
         raise OAuthExchangeError("Google OAuth grant scopes do not match")
+    if _IDENTITY_FIELD in fields:
+        token = fields[_IDENTITY_FIELD]
+        # An opaque compatibility field. The separate UserInfo response proves the subject.
+        if (distinct != _OIDC_SCOPES or type(token) is not str or len(token) > _MAX_TOKEN
+                or _COMPACT_JWS.fullmatch(token) is None):
+            raise OAuthExchangeError("Invalid Google OAuth identity token field")
     access = fields["access_token"]
     if (fields["token_type"] != "Bearer" or type(access) is not str or not access.isascii()
             or not _valid_bearer(access.encode("ascii")) or not _positive_expiry(fields["expires_in"])):
@@ -194,9 +207,22 @@ def _access_from_grant(fields):
     return access.encode("ascii")
 
 
+def _reject_identity_alias(fields, *tokens):
+    if _IDENTITY_FIELD in fields:
+        identity = fields[_IDENTITY_FIELD].encode("ascii")
+        if any(hmac.compare_digest(identity, token) for token in tokens):
+            raise OAuthExchangeError("Google OAuth token roles overlap")
+
+
+def _native_body(fields, allowed):
+    projected = {name: fields[name] for name in allowed if name in fields}
+    return json.dumps(projected, ensure_ascii=True, allow_nan=False, sort_keys=True,
+                      separators=(",", ":")).encode("ascii")
+
+
 def validate_enrollment_grant(body: bytes) -> EnrollmentGrant:
-    """Validate a bounded token response body after the caller checks HTTP."""
-    fields = _grant_fields(body, _GRANT_FIELDS, _OPTIONAL_GRANT_FIELDS)
+    """Validate and project the initial token reply after the caller checks HTTP."""
+    fields = _grant_fields(body, _GRANT_FIELDS, _OPTIONAL_GRANT_FIELDS | {_IDENTITY_FIELD})
     access = _access_from_grant(fields)
     refresh = fields["refresh_token"]
     expires = fields["expires_in"]
@@ -204,9 +230,15 @@ def validate_enrollment_grant(body: bytes) -> EnrollmentGrant:
     if (type(refresh) is not str or not _REFRESH_TOKEN.fullmatch(refresh)
             or ("refresh_token_expires_in" in fields and not _positive_expiry(refresh_expires))):
         raise OAuthExchangeError("Invalid Google enrollment bearer grant")
-    return EnrollmentGrant(access, refresh.encode("ascii"), expires, refresh_expires)
+    refresh_bytes = refresh.encode("ascii")
+    _reject_identity_alias(fields, access, refresh_bytes)
+    native = _native_body(fields, _GRANT_FIELDS | _OPTIONAL_GRANT_FIELDS)
+    return EnrollmentGrant(access, native, refresh_bytes, expires, refresh_expires)
 
 
-def validate_cold_grant(body: bytes) -> bytes:
-    """Validate the cold reply's scoped bearer. Credential rotation is unqualified."""
-    return _access_from_grant(_grant_fields(body, _ACCESS_FIELDS, set()))
+def validate_cold_grant(body: bytes) -> AccessGrant:
+    """Validate and project the cold token reply without credential rotation."""
+    fields = _grant_fields(body, _ACCESS_FIELDS, {_IDENTITY_FIELD})
+    access = _access_from_grant(fields)
+    _reject_identity_alias(fields, access)
+    return AccessGrant(access, _native_body(fields, _ACCESS_FIELDS))
