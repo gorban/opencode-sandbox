@@ -110,7 +110,8 @@ when inspected. This establishes the check identity and a scope gap. PR qualific
 
 ## Quality ratchet
 
-[Coverage and scanner baselines](../ci-baselines.md) describes the first advisory jobs.
+[Coverage and scanner baselines](../ci-baselines.md) describes the baseline jobs and the
+CodeQL merge requirement.
 
 - [ ] Establish reproducible coverage for the two Python policy cores before enforcing per-core
   line or branch floors. Report subprocess and separate-interpreter exclusions. Measure shell
@@ -131,6 +132,26 @@ when inspected. This establishes the check identity and a scope gap. PR qualific
   `pull_request_target` to run contributor code. Before declaring the baseline complete or
   requiring CodeQL, separately review and enable a default-branch analysis on trusted `main`
   and periodic refresh. The initial PR trial stays advisory.
+  - [x] The owner made CodeQL results required on 2026-11-27, ahead of the order above. The
+        `main` ruleset (id `27794764`, no bypass actors) has a code scanning rule for the
+        `CodeQL` tool: security alerts high or higher, other alerts at error level. At that
+        point `refs/heads/main` had no CodeQL analysis; every result was on a pull request
+        merge ref.
+  - [x] Run the same CodeQL job on every push to `main` and weekly
+        (`ci/codeql-main-baseline`). Pull request triggers and concurrency are unchanged.
+        Coverage and Dependency Review still run on pull requests only. Runs on `main` are
+        not cancelled. `tests/test_ci.py` pins the triggers, permissions and action pins.
+        Security and general review cleared the design and workflow at `49ccf0a` on
+        [PR #95](https://github.com/gorban/opencode-sandbox/pull/95). Human review of the
+        workflow remains open.
+  - [ ] After merge, confirm the push run and the first scheduled run upload both categories
+        for `refs/heads/main`, and that a later pull request is compared with them.
+  - [ ] Qualify SARIF upload on a fork PR. With CodeQL required, a failed or missing upload
+        blocks that pull request. A Dependabot PR uploaded both categories on
+        [PR 91](https://github.com/gorban/opencode-sandbox/pull/91).
+  - [ ] Confirm the push run after the next Dependabot merge uploads. The repository allows
+        merge commits only. GitHub documents that a squash-merge commit is authored by
+        Dependabot and its push run cannot upload, so squash merging stays off.
 - [ ] Enable the dependency graph and Dependabot alerts for supported dependencies. Assess Dependency Review
   when the graph has useful coverage, and add Dependabot update PRs for Actions and supported
   manifests. Consider Renovate for mise and image pins after checking for duplicate update
@@ -165,6 +186,9 @@ when inspected. This establishes the check identity and a scope gap. PR qualific
   and redacted diagnostics without using `continue-on-error` to hide scan failures.
   Review the baselines and agree on which new findings should block merging. Prioritize
   high-confidence secrets and unsafe workflow changes. Record scope and exceptions.
+  - Exception: CodeQL results have been a merge requirement since 2026-11-27, through the
+    ruleset's code scanning rule and not a required status check. Coverage and Dependency
+    Review remain outside the merge requirement.
 
 A local measurement at `676dc65` using its two existing offline suites, CPython 3.14 and Coverage.py
 7.11.0 counted 320/323 bridge statements and 93/94 bridge branches, and 411/425 controller statements

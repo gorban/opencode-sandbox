@@ -1,7 +1,9 @@
 # Coverage and security baselines
 
 The [baseline workflow](../.github/workflows/ci-baselines.yml) runs on pull requests to `main`.
-Its jobs are advisory. Job failures stay visible for triage.
+Its CodeQL job also runs on every push to `main` and once a week. The coverage and Dependency
+Review jobs are advisory, and their failures stay visible for triage. CodeQL results are
+[required to merge](#codeql-merge-requirement).
 
 ## Python coverage
 
@@ -19,11 +21,48 @@ This baseline gives CI and local coverage counts. A required floor and a safe wa
 publish coverage have separate qualification. See [the trusted publisher](sonar-publisher.md)
 for the attended import and its scope.
 
+## CodeQL merge requirement
+
+Since 2026-11-27 the `main` ruleset requires code scanning results from CodeQL. A pull request
+cannot merge while its CodeQL analysis is running or missing, or when it adds a security alert
+rated high or critical or any other alert at error level. Warnings, notes, and medium or low
+security alerts do not block. The thresholds live in the ruleset, not in this repository.
+
+GitHub finds the alerts a pull request adds by comparing its analysis with the one for `main`.
+The same job therefore scans three things:
+
+| Event | Commit scanned | Purpose |
+|---|---|---|
+| Pull request to `main` | synthetic merge commit | results for the ruleset |
+| Push to `main` | the pushed commit | the trusted result pull requests are compared with |
+| Weekly schedule | tip of `main` | unchanged code against the queries in the pinned CodeQL release |
+
+Keep the three in one workflow file and job, with the same categories. Code scanning matches a
+pull request's results to `main`'s by workflow path, job and category, so a separate workflow
+would leave pull requests without a matching result. Runs on `main` are never cancelled.
+Do not add `paths` filters: a skipped scan gives the rule no result to evaluate.
+
+Open items:
+
+- SARIF upload is unqualified for fork pull requests. Their token is read-only, and a failed
+  upload now blocks the merge. Dependabot's pull request upload completed for both categories
+  on [PR 91](https://github.com/gorban/opencode-sandbox/pull/91).
+- Merge Dependabot pull requests with a merge commit. GitHub
+  [documents](https://docs.github.com/en/code-security/code-scanning/troubleshooting-code-scanning/resource-not-accessible)
+  that a squash-merge commit is authored by Dependabot, so its push run on `main` gets a
+  read-only token and cannot upload. The repository settings allow merge commits only; keep
+  squash merging off. Re-running such a run keeps the read-only token. The next merge or the
+  weekly run restores the `main` result.
+- The first push and scheduled runs on `main` have not been observed yet. Confirm both
+  categories appear for `refs/heads/main` under the repository's code scanning tool status.
+- A failed run on `main` leaves the previous analysis in place. Re-run the failed job.
+- GitHub disables scheduled workflows in a public repository after 60 days without activity.
+  The next push to `main` still scans; re-enable the workflow to restore the weekly refresh.
+
 ## CodeQL and dependency review
 
-- **CodeQL** scans Python and GitHub Actions on the synthetic PR merge commit without building
-  the project. Check the two job logs and GitHub code scanning results. Qualify SARIF processing
-  for fork and Dependabot PRs and establish a trusted `main` baseline before requiring it.
+- **CodeQL** scans Python and GitHub Actions without building the project. Check the two job
+  logs and GitHub code scanning results.
 - **Dependency Review** compares the GitHub dependency graph for the PR's base and head.
   The job fails if GitHub reports a new high or critical dependency advisory. Check the job
   summary even when the graph has no changes. Mise tools, direct runtime downloads, and packages
