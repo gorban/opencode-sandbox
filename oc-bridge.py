@@ -11,7 +11,9 @@ a pathname inside OC_SB to anything (desktop tools included), and never resolves
 * Files are opened O_NONBLOCK, then checked with fstat() on the open descriptor, so a FIFO or device
   swapped in cannot block or be read.
 * VS Code / Beyond Compare open a *copy* in OC_BRIDGE_STAGE (host-owned, mode 0700, never mounted).
-  The watcher checks and reads each staged save through the same no-follow regular-file descriptor.
+  Each selection gets its own slot. The stage excludes repository and editor metadata so the
+  host tools do not discover a repository or workspace supplied by the sandbox. The watcher
+  checks and reads each staged save through the same no-follow regular-file descriptor.
   It writes a replacement in private host staging and checks the target before renaming
   into its pinned sandbox parent. An observed conflict is saved under a new sibling name
   without replacing an older conflict copy. An edit can still race the final check and rename.
@@ -51,6 +53,11 @@ MAX_TREE_DEPTH = 64
 MAX_SESSION_BYTES = 512 << 20
 MAX_STAGE_SESSIONS = 8
 STAGE_MAX_AGE = 7 * 86400
+MANIFEST_VERSION = 3
+STAGING_METADATA_NAMES = frozenset((".git", "head", ".vscode"))
+STAGING_METADATA_SUFFIXES = (".code-workspace", ".bcpkg", ".bcs", ".bcss")
+SAFE_EDITOR_LEAF = re.compile(r"[a-zA-Z0-9_.-]+")
+SAFE_EDITOR_SUFFIX = re.compile(r"[a-zA-Z0-9]{1,16}")
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -178,18 +185,16 @@ def mkdirs_private(path):
     os.chmod(path, 0o700)
 
 
-def stage_dir_fd(base_fd, parts):
-    """Create/open base/parts... inside the (host-owned) stage directory."""
-    fd = os.dup(base_fd)
-    for p in parts:
-        try:
-            os.mkdir(p, 0o700, dir_fd=fd)
-        except FileExistsError:
-            pass
-        nfd = os.open(p, DIR_FLAGS, dir_fd=fd)
-        os.close(fd)
-        fd = nfd
-    return fd
+def staging_metadata(name):
+    folded = name.casefold()
+    return folded in STAGING_METADATA_NAMES or folded.endswith(STAGING_METADATA_SUFFIXES)
+
+
+def staged_leaf(source_name):
+    if SAFE_EDITOR_LEAF.fullmatch(source_name):
+        return source_name
+    _, dot, suffix = source_name.rpartition(".")
+    return "selection" + (dot + suffix if SAFE_EDITOR_SUFFIX.fullmatch(suffix) else "")
 
 
 def snapshot_tree(src_fd, dst_fd, budget, depth=0):
@@ -201,7 +206,8 @@ def snapshot_tree(src_fd, dst_fd, budget, depth=0):
             budget["files"] -= 1
             if budget["files"] < 0:
                 raise OverBudget("directory snapshot has too many entries")
-            snapshot_entry(src_fd, dst_fd, entry.name, budget, depth)
+            if not staging_metadata(entry.name):
+                snapshot_entry(src_fd, dst_fd, entry.name, budget, depth)
 
 
 def snapshot_entry(src_fd, dst_fd, name, budget, depth):
@@ -251,10 +257,6 @@ def reserve_session():
         os.close(stage_fd)
 
 
-def code_workspace(tool, leaf):
-    return tool == "code" and leaf.casefold().endswith(".code-workspace")
-
-
 def stage_request(tool, paths):
     if tool not in TOOLS:
         raise Refused(f"unknown tool {tool!r}")
@@ -264,8 +266,7 @@ def stage_request(tool, paths):
     try:
         entries = stage_files(session, tool, paths)
         if entries:
-            with open(os.path.join(session, "manifest.json"), "x") as f:
-                json.dump({"tool": tool, "entries": entries}, f)
+            write_session_manifest(session, tool, entries)
             return session
     except BaseException:
         shutil.rmtree(session, ignore_errors=True)
@@ -274,62 +275,82 @@ def stage_request(tool, paths):
     return None
 
 
+def write_session_manifest(session, tool, entries):
+    session_fd = os.open(session, DIR_FLAGS)
+    try:
+        fd = os.open("manifest.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=session_fd)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"version": MANIFEST_VERSION, "tool": tool, "entries": entries}, stream)
+    finally:
+        os.close(session_fd)
+
+
 def stage_files(session, tool, paths):
     budget = {"files": MAX_TREE_FILES, "bytes": MAX_SESSION_BYTES}
+    files = os.path.join(session, "files")
+    os.mkdir(files, 0o700)
     entries, root = [], open_root()
     try:
-        base = os.open(session, DIR_FLAGS)
+        files_fd = os.open(files, DIR_FLAGS)
     except BaseException:
         os.close(root)
         raise
     try:
         for sp in dict.fromkeys(paths[:MAX_PATHS]):
+            slot = len(entries) + 1
             try:
                 parts = components(sp)
-                if code_workspace(tool, parts[-1]):
-                    raise Refused("code does not open workspace definition files")
-                parent = open_dirs(root, parts[:-1])
-                try:
-                    st = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
-                    dparent = stage_dir_fd(base, ["files"] + parts[:-1])
-                    try:
-                        staged = os.path.join(session, "files", *parts)
-                        if stat.S_ISDIR(st.st_mode):
-                            if tool == "code":
-                                raise Refused(f"code opens files only, not folders: {sp!r}")
-                            src = open_dirs(parent, [parts[-1]])
-                            try:
-                                os.mkdir(parts[-1], 0o700, dir_fd=dparent)
-                                dst = os.open(parts[-1], DIR_FLAGS, dir_fd=dparent)
-                                try:
-                                    snapshot_tree(src, dst, budget)
-                                finally:
-                                    os.close(dst)
-                            finally:
-                                os.close(src)
-                            entries.append({"parts": parts, "staged": staged, "kind": "dir"})
-                        else:
-                            fd, fst = open_regular(parent, parts[-1])
-                            try:
-                                copy_into_session((fd, fst), dparent, parts[-1], budget)
-                            finally:
-                                os.close(fd)
-                            sst = os.stat(staged)
-                            entries.append({"parts": parts, "staged": staged, "kind": "file",
-                                            "mode": stat.S_IMODE(fst.st_mode), "target": ident(fst),
-                                            "seen": staged_identity(sst)})
-                    finally:
-                        os.close(dparent)
-                finally:
-                    os.close(parent)
+                if any(map(staging_metadata, parts)):
+                    raise Refused("repository or editor metadata is excluded from staging")
+            except Refused as e:
+                log(f"{tool}: skipped {sp!r}: {e}")
+                continue
+            os.mkdir(str(slot), 0o700, dir_fd=files_fd)
+            try:
+                entries.append(stage_selection(root, files_fd, tool, parts, slot, budget))
             except OverBudget:
                 raise
             except (Refused, OSError) as e:
+                # If removing a partial slot fails, stage_request aborts the whole session.
+                shutil.rmtree(str(slot), dir_fd=files_fd)
                 log(f"{tool}: skipped {sp!r}: {e}")
     finally:
-        os.close(base)
+        os.close(files_fd)
         os.close(root)
     return entries
+
+
+def stage_selection(root, files_fd, tool, parts, slot, budget):
+    parent = open_dirs(root, parts[:-1])
+    try:
+        dst = open_dirs(files_fd, [str(slot)])
+        try:
+            leaf = parts[-1]
+            st = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+            entry = {"parts": parts, "slot": slot}
+            if stat.S_ISDIR(st.st_mode):
+                if tool == "code":
+                    raise Refused("code opens files only, not folders")
+                src = open_dirs(parent, [leaf])
+                try:
+                    snapshot_tree(src, dst, budget)
+                finally:
+                    os.close(src)
+                return dict(entry, kind="dir")
+            fd, fst = open_regular(parent, leaf)
+            staged = staged_leaf(leaf)
+            try:
+                copy_into_session((fd, fst), dst, staged, budget)
+            finally:
+                os.close(fd)
+            sst = os.stat(staged, dir_fd=dst, follow_symlinks=False)
+            return dict(entry, kind="file", mode=stat.S_IMODE(fst.st_mode),
+                        target=ident(fst), seen=staged_identity(sst))
+        finally:
+            os.close(dst)
+    finally:
+        os.close(parent)
 
 
 # ---- write-back --------------------------------------------------------------------------------
@@ -399,6 +420,11 @@ def open_staged_file(files_fd, parts):
         os.close(parent)
 
 
+def staged_parts(entry):
+    slot = [str(entry["slot"])]
+    return slot if entry["kind"] == "dir" else slot + [staged_leaf(entry["parts"][-1])]
+
+
 def sync(session_fd, files_fd, entries, cross_mounts):
     complete = True
     for entry in entries:
@@ -410,7 +436,7 @@ def sync(session_fd, files_fd, entries, cross_mounts):
             complete = False
             continue
         try:
-            src_fd, st = open_staged_file(files_fd, parts)
+            src_fd, st = open_staged_file(files_fd, staged_parts(entry))
         except (Refused, OSError):
             complete = False
             continue
@@ -437,8 +463,11 @@ def valid_identity(value, length):
 def validate_session_entry(tool, entry):
     if not isinstance(entry, dict) or not canonical_parts(entry.get("parts")):
         raise Refused("non-canonical staged path")
-    if code_workspace(tool, entry["parts"][-1]):
-        raise Refused("code does not open workspace definition files")
+    if any(map(staging_metadata, entry["parts"])):
+        raise Refused("repository or editor metadata is excluded from staging")
+    slot = entry.get("slot")
+    if type(slot) is not int or not 1 <= slot <= MAX_PATHS:
+        raise Refused("invalid staging slot")
     kind = entry.get("kind")
     if kind == "dir" and tool == "bcompare":
         return
@@ -460,38 +489,53 @@ def read_session_manifest(session_fd):
         raise Refused("invalid session manifest") from exc
     if not isinstance(manifest, dict):
         raise Refused("invalid session manifest")
+    if type(manifest.get("version")) is not int or manifest["version"] != MANIFEST_VERSION:
+        raise Refused("unsupported session manifest version; recover staged files manually")
     tool, entries = manifest.get("tool"), manifest.get("entries")
     if not isinstance(tool, str) or not TOOLS.get(tool):
         raise Refused("invalid or unconfigured session tool")
     if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_PATHS:
         raise Refused("invalid session entry count")
-    recorded_paths = set()
+    recorded_paths, recorded_slots = set(), set()
     for entry in entries:
         validate_session_entry(tool, entry)
         path = tuple(entry["parts"])
         if path in recorded_paths:
             raise Refused("duplicate staged path")
+        if entry["slot"] in recorded_slots:
+            raise Refused("duplicate staging slot")
         recorded_paths.add(path)
+        recorded_slots.add(entry["slot"])
     return tool, entries
 
 
-def staged_arguments(session, files_fd, entries):
+def staged_arguments(files_fd, entries):
+    if set(os.listdir(files_fd)) != {str(entry["slot"]) for entry in entries}:
+        raise Refused("stage contains unexpected slots")
     paths = []
     for entry in entries:
-        parts = entry["parts"]
+        parts = staged_parts(entry)
         if entry["kind"] == "dir":
             os.close(open_dirs(files_fd, parts))
         else:
-            fd, st = open_staged_file(files_fd, parts)
+            slot_fd = open_dirs(files_fd, parts[:-1])
             try:
-                if staged_identity(st) != entry["seen"] or st.st_size > MAX_FILE:
-                    raise Refused("staged file changed or exceeds the size limit before editor launch")
+                validate_staged_leaf(slot_fd, parts[-1], entry["seen"])
             finally:
-                os.close(fd)
-        # Older manifests store an absolute path. The current session and
-        # checked components determine the editor argument.
-        paths.append(os.path.join(session, "files", *parts))
+                os.close(slot_fd)
+        paths.append(os.path.join(".", "files", *parts))
     return paths
+
+
+def validate_staged_leaf(slot_fd, leaf, seen):
+    if os.listdir(slot_fd) != [leaf]:
+        raise Refused("stage contains an unexpected file layout")
+    fd, st = open_regular(slot_fd, leaf)
+    try:
+        if staged_identity(st) != seen or st.st_size > MAX_FILE:
+            raise Refused("staged file changed or exceeds the size limit before editor launch")
+    finally:
+        os.close(fd)
 
 
 def run_session(session):
@@ -503,9 +547,9 @@ def run_session(session):
         tool, entries = read_session_manifest(session_fd)
         files_fd = open_dirs(session_fd, ["files"])
         try:
-            staged = staged_arguments(real, files_fd, entries)
+            staged = staged_arguments(files_fd, entries)
             options = ["--wait", "--"] if tool == "code" else []
-            proc = subprocess.Popen([TOOLS[tool], *options, *staged], stdin=subprocess.DEVNULL)
+            proc = subprocess.Popen([TOOLS[tool], *options, *staged], cwd=real, stdin=subprocess.DEVNULL)
             cross_mounts = set()
             while proc.poll() is None:
                 time.sleep(1)
