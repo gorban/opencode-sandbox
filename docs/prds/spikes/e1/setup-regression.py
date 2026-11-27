@@ -1,8 +1,49 @@
 #!/usr/bin/env python3
-"""Exercise failed row setup using only fake commands and private fixtures.
-Pass a directory containing clients/psql.sh and clients/nss_certutil.sh to test an old revision.
+"""Exercise client setup using only fake commands and private fixtures.
+Pass a directory containing the clients under test to test an old revision.
 """
-import os, pathlib, signal, subprocess, sys, tempfile
+import os
+import pathlib
+import runpy
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+from contextlib import redirect_stdout
+from io import StringIO
+from unittest.mock import MagicMock, mock_open, patch
+
+
+def check_python_tls(client):
+    """Require a protocol floor before socket setup, with no network or real CA files."""
+    ctx = MagicMock()
+    ctx.minimum_version = None
+    connection = MagicMock()
+    observed = []
+    output = StringIO()
+
+    def connect(address, *, timeout):
+        observed.append((address, timeout, ctx.minimum_version))
+        return connection
+
+    with (
+        patch('builtins.open', mock_open(read_data='A\tfeat\t20000\tlocalhost\tdns\n')),
+        patch.object(ssl, 'create_default_context', return_value=ctx) as create_context,
+        patch.object(socket, 'create_connection', side_effect=connect),
+        redirect_stdout(output),
+    ):
+        runpy.run_path(str(client))
+
+    if observed != [(('localhost', 20000), 10, ssl.TLSVersion.TLSv1_2)]:
+        raise SystemExit('py_tls: expected an explicit TLS 1.2 floor before connecting')
+    create_context.assert_called_once_with(cafile='/w/ca/A/ca.pem')
+    ctx.wrap_socket.assert_called_once_with(connection.__enter__.return_value, server_hostname='localhost')
+    if output.getvalue().rstrip('\n').split('\t')[1:] != ['A', 'feat', 'OK', '']:
+        raise SystemExit('py_tls: expected an accepted fixture row')
+    print('py_tls: TLS 1.2 minimum set before connecting')
+
 
 def run_fixture(args, *, env, timeout=10):
     """Run only fixture commands in a private session; never signal the caller's group."""
@@ -87,6 +128,7 @@ def main():
         if result.returncode == 0 or result.stdout.strip() or 'missing chain A/atk' not in result.stderr.splitlines():
             raise SystemExit(f'openssl_verify: missing chain not rejected: rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}')
         print('openssl_verify missing chain: aborted without a result cell')
+    check_python_tls(src / 'clients' / 'py_tls.py')
 
 
 if __name__ == "__main__":
