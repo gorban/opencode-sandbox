@@ -25,7 +25,7 @@ from oc_google.native_service import (
 )
 from oc_google.native_namespace import NativeNamespaceError
 from oc_google.native_transport import NativeChannel
-from oc_google.token_diagnostic import PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage
+from oc_google.token_diagnostic import LoadBodyReason, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage
 from google_registration_fixture import record_enrollment_retired
 from test_google_enrollment import BEARER, LOAD_REPLY, LOAD_REQUEST, SUBJECT
 from test_google_metadata_ingress import FakePeer, packet
@@ -186,6 +186,9 @@ class EnrollmentSessionTest(unittest.TestCase):
         with self.assertRaises(EnrollmentMetadataError) as refusal:
             self.session(post_diagnostic=diagnostic)
         self.assertIs(diagnostic.stage(refusal.exception), PostTokenStage.LOAD_BODY)
+        self.assertEqual(diagnostic.load_body_reasons(refusal.exception), (
+            LoadBodyReason.TOP_LEVEL_FIELDS, LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT,
+        ))
         self.assertEqual(len(loaded.sent), 1)
         self.assertNotIn("synthetic-load-marker", self.journal_file.read_text())
 
@@ -641,11 +644,31 @@ class ColdMetadataSessionTest(unittest.TestCase):
         deliver(lambda: self.sent.append(route))
         return self.responses[route]
 
-    def session(self):
+    def session(self, *, post_diagnostic=None):
         return serve_cold_metadata(
             profile=self.profile, deadline=time.monotonic() + 3, accept=lambda route, deadline: self.peers[route].channel(),
-            fence=self.fence, authorized=lambda: True, destination=self.destination,
+            fence=self.fence, authorized=lambda: True, destination=self.destination, post_diagnostic=post_diagnostic,
         )
+
+    def test_cold_load_body_keeps_the_same_protected_fixed_reasons(self):
+        diagnostic = PostTokenDiagnostic()
+        channels = [FakeChannel(response(self.responses[TOKEN])), FakeChannel(response(SUBJECT)),
+                    FakeChannel(response(b'{"synthetic-cold-load-marker":1}'))]
+        trust = Mock(wrap_socket=Mock(side_effect=channels))
+        with patch.object(metadata_destination, "_resolve", return_value=(2, IPV4)), \
+                patch.object(metadata_destination, "_system_tls_context", return_value=trust), \
+                patch.object(metadata_destination.socket, "socket", side_effect=[FakeChannel() for _ in channels]), \
+                patch.object(self, "destination", metadata_destination.exchange):
+            with self.assertRaises(EnrollmentMetadataError) as refusal:
+                self.session(post_diagnostic=diagnostic)
+        self.assertIs(diagnostic.stage(refusal.exception), PostTokenStage.LOAD_BODY)
+        self.assertEqual(diagnostic.load_body_reasons(refusal.exception), (
+            LoadBodyReason.TOP_LEVEL_FIELDS, LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT,
+        ))
+        self.assertEqual([len(channel.sent) for channel in channels], [1, 1, 1])
+        self.assertFalse(self.peers[CATALOG].closed)
+        self.assertEqual(self.peers[LOAD].replies, [])
+        self.assertNotIn("synthetic-cold-load-marker", str(refusal.exception))
 
     def test_cold_phase_observes_gemini_on_four_exact_metadata_routes(self):
         observation = self.session()

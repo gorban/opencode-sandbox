@@ -12,7 +12,7 @@ from .oauth_exchange import (
     _GrantRefused, _reject_constant, validate_authorization_code_exchange, validate_cold_grant,
     validate_enrollment_grant,
 )
-from .token_diagnostic import ScopedPostTokenDiagnostic, PostTokenStage, TokenDiagnostic, observe_post_token
+from .token_diagnostic import LoadBodyReason, ScopedPostTokenDiagnostic, PostTokenStage, TokenDiagnostic, observe_post_token
 
 
 _LOAD_BODY = {"metadata": {"ideType": "ANTIGRAVITY"}}
@@ -27,7 +27,8 @@ _RICH_STRINGS = {"manageSubscriptionUri", "upgradeSubscriptionUri", "g1Tier"}
 _RICH_FIELDS = _METADATA_FIELDS | _RICH_STRINGS | {
     "paidTier", "allowedTiers", "ineligibleTiers", "projectValidationError", "gcpManaged", "releaseChannel",
 }
-_TIER_FLAGS = {"usesGcpTos", "userDefinedCloudaicompanionProject", "isDefault"}
+_PERSONAL_FLAGS = {"usesGcpTos", "userDefinedCloudaicompanionProject"}
+_TIER_FLAGS = _PERSONAL_FLAGS | {"isDefault"}
 _TIER_STRINGS = {
     "name", "description", "upgradeSubscriptionUri", "upgradeSubscriptionText", "upgradeButtonText",
     "clientExperienceTag", "referralInviteUri",
@@ -100,18 +101,28 @@ def _observe_load_reply(body):
     return LoadObservation("currentTier" in fields, "cloudaicompanionProject" in fields)
 
 
-def _bounded_rich_value(value, depth=1):
+def _rich_bound_failure(value, depth=1):
     if type(value) is dict:
-        return (depth <= 6 and len(value) <= 24
-                and all(_bounded_rich_value(key) and _bounded_rich_value(item, depth + 1)
-                        for key, item in value.items()))
+        if depth > 6 or len(value) > 24:
+            return LoadBodyReason.STRUCTURE_LIMITS
+        for key, item in value.items():
+            failure = _rich_bound_failure(key) or _rich_bound_failure(item, depth + 1)
+            if failure is not None:
+                return failure
+        return None
     if type(value) is list:
-        return depth <= 6 and len(value) <= 16 and all(_bounded_rich_value(item, depth + 1) for item in value)
+        if depth > 6 or len(value) > 16:
+            return LoadBodyReason.STRUCTURE_LIMITS
+        for item in value:
+            failure = _rich_bound_failure(item, depth + 1)
+            if failure is not None:
+                return failure
+        return None
     if type(value) is str:
-        return len(value.encode("utf-8")) <= 1024
+        return None if len(value.encode("utf-8")) <= 1024 else LoadBodyReason.STRUCTURE_LIMITS
     if type(value) is float:
-        return math.isfinite(value)
-    return value is None or type(value) in (bool, int)
+        return None if math.isfinite(value) else LoadBodyReason.JSON_OBJECT
+    return None if value is None or type(value) in (bool, int) else LoadBodyReason.STRUCTURE_LIMITS
 
 
 def _printable(value):
@@ -123,21 +134,24 @@ def _known_enum_shape(value):
             or type(value) is int and 0 <= value < (1 << 31))
 
 
-def _rich_tier(tier):
+def _rich_tier(tier, *, flags=_TIER_FLAGS):
     if type(tier) is not dict or tier.keys() - _TIER_FIELDS or not _valid_identifier(tier.get("id")):
         return False
     return (all(_printable(tier[key]) for key in tier.keys() & _TIER_STRINGS)
-            and all(type(tier[key]) is bool for key in tier.keys() & _TIER_FLAGS)
+            and all(type(tier[key]) is bool for key in tier.keys() & flags)
             and ("privacyNotice" not in tier or type(tier["privacyNotice"]) is dict)
             and ("availableCredits" not in tier or type(tier["availableCredits"]) is list
                  and all(type(credit) is dict for credit in tier["availableCredits"]))
             and ("upgradeSubscriptionType" not in tier or _known_enum_shape(tier["upgradeSubscriptionType"])))
 
 
-def _personal_tier(tier):
-    return (_rich_tier(tier) and _valid_tier({key: tier.get(key) for key in ("id", "name")})
-            and tier.get("usesGcpTos", False) is False
-            and tier.get("userDefinedCloudaicompanionProject", False) is False)
+def _retained_tier_shape(tier):
+    return (_rich_tier(tier, flags=_TIER_FLAGS - _PERSONAL_FLAGS)
+            and _valid_tier({key: tier.get(key) for key in ("id", "name")}))
+
+
+def _nonpersonal_tier(tier):
+    return type(tier) is dict and any(tier.get(key, False) is not False for key in _PERSONAL_FLAGS)
 
 
 def _valid_alternatives(allowed, ineligible, active):
@@ -177,6 +191,36 @@ def _retained_tier(tier):
     return retained
 
 
+def _load_body_refused(reasons):
+    error = EnrollmentMetadataError("Invalid Google enrollment metadata response")
+    error.load_body_reasons = tuple(reasons)
+    return error
+
+
+def _rich_load_reasons(fields, current, project, paid):
+    reasons = []
+    current_valid = _retained_tier_shape(current)
+    paid_valid = paid is not None and _retained_tier_shape(paid)
+    if fields.keys() - _RICH_FIELDS:
+        reasons.append(LoadBodyReason.TOP_LEVEL_FIELDS)
+    if not current_valid:
+        reasons.append(LoadBodyReason.CURRENT_TIER)
+    if not _valid_identifier(project):
+        reasons.append(LoadBodyReason.ORIGINAL_PROJECT)
+    if paid is not None and not paid_valid:
+        reasons.append(LoadBodyReason.PAID_TIER)
+    if (fields.get("gcpManaged", False) is not False or fields.get("projectValidationError") is not None
+            or _nonpersonal_tier(current) or _nonpersonal_tier(paid)):
+        reasons.append(LoadBodyReason.CONSUMER_PROJECT_POLICY)
+    if (("releaseChannel" in fields and type(fields["releaseChannel"]) is not dict)
+            or any(fields[key] is not None and not _printable(fields[key]) for key in fields.keys() & _RICH_STRINGS)):
+        reasons.append(LoadBodyReason.OPTIONAL_METADATA)
+    active = tuple(tier for tier, valid in ((current, current_valid), (paid, paid_valid)) if valid)
+    if not _valid_alternatives(fields.get("allowedTiers"), fields.get("ineligibleTiers"), active):
+        reasons.append(LoadBodyReason.ALTERNATIVE_TIER_POLICY)
+    return reasons
+
+
 def project_load_reply(body) -> VerifiedLoadReply:
     """Keep legacy bytes or project an already complete personal LOAD result."""
     try:
@@ -184,24 +228,25 @@ def project_load_reply(body) -> VerifiedLoadReply:
     except EnrollmentMetadataError:
         pass
 
-    fields = _bounded_object(body, _RICH_REPLY_LIMIT)
     try:
-        bounded = _bounded_rich_value(fields)
+        fields = _bounded_object(body, _RICH_REPLY_LIMIT)
+    except EnrollmentMetadataError as error:
+        reason = (LoadBodyReason.SIZE if type(body) is bytes and not 0 < len(body) <= _RICH_REPLY_LIMIT
+                  else LoadBodyReason.JSON_OBJECT)
+        error.load_body_reasons = (reason,)
+        raise
+    try:
+        bound_failure = _rich_bound_failure(fields)
     except UnicodeError:
-        bounded = False
+        bound_failure = LoadBodyReason.JSON_OBJECT
+    if bound_failure is not None:
+        raise _load_body_refused((bound_failure,))
     current = fields.get("currentTier")
     paid = fields.get("paidTier")
     project = fields.get("cloudaicompanionProject")
-    if (not bounded or fields.keys() - _RICH_FIELDS
-            or not _personal_tier(current) or not _valid_identifier(project)
-            or (paid is not None and not _personal_tier(paid))
-            or fields.get("gcpManaged", False) is not False or fields.get("projectValidationError") is not None
-            or ("releaseChannel" in fields and type(fields["releaseChannel"]) is not dict)
-            or any(fields[key] is not None and not _printable(fields[key]) for key in fields.keys() & _RICH_STRINGS)):
-        raise EnrollmentMetadataError("Invalid Google enrollment metadata response")
-    active = (current,) if paid is None else (current, paid)
-    if not _valid_alternatives(fields.get("allowedTiers"), fields.get("ineligibleTiers"), active):
-        raise EnrollmentMetadataError("Invalid Google enrollment metadata response")
+    reasons = _rich_load_reasons(fields, current, project, paid)
+    if reasons:
+        raise _load_body_refused(reasons)
     projected = {"currentTier": _retained_tier(current), "cloudaicompanionProject": project}
     if paid is not None:
         projected["paidTier"] = _retained_tier(paid)

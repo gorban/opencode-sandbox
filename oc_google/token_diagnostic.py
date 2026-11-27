@@ -62,11 +62,35 @@ class PostTokenStage(Enum):
     COLD_COMMIT = auto()
 
 
+class LoadBodyReason(Enum):
+    SIZE = auto()
+    JSON_OBJECT = auto()
+    STRUCTURE_LIMITS = auto()
+    TOP_LEVEL_FIELDS = auto()
+    CURRENT_TIER = auto()
+    ORIGINAL_PROJECT = auto()
+    PAID_TIER = auto()
+    CONSUMER_PROJECT_POLICY = auto()
+    OPTIONAL_METADATA = auto()
+    ALTERNATIVE_TIER_POLICY = auto()
+
+
+def _load_reasons(error):
+    try:
+        reasons = getattr(error, "load_body_reasons", None)
+    except Exception:
+        return ()
+    if (type(reasons) is not tuple or not 0 < len(reasons) <= len(LoadBodyReason)
+            or any(type(reason) is not LoadBodyReason for reason in reasons)):
+        return ()
+    return tuple(reason for reason in LoadBodyReason if reason in reasons)
+
+
 @dataclass(slots=True, eq=False)
 class PostTokenDiagnostic:
     """The first exact failure recorded by this attended enrollment."""
 
-    _failure: tuple[Exception, PostTokenStage, BaseException | None] | None = field(
+    _failure: tuple[Exception, PostTokenStage, BaseException | None, tuple[LoadBodyReason, ...]] | None = field(
         default=None, init=False, repr=False,
     )
 
@@ -75,7 +99,8 @@ class PostTokenDiagnostic:
 
     def mark(self, error, stage):
         if self._failure is None and isinstance(error, Exception) and type(stage) is PostTokenStage:
-            self._failure = error, stage, error.__context__
+            reasons = _load_reasons(error) if stage is PostTokenStage.LOAD_BODY else ()
+            self._failure = error, stage, error.__context__, reasons
 
     def stage(self, error):
         failure = self._failure
@@ -85,6 +110,12 @@ class PostTokenDiagnostic:
 
     def clear(self):
         self._failure = None
+
+    def load_body_reasons(self, error):
+        failure = self._failure
+        if failure is not None and self.stage(error) is PostTokenStage.LOAD_BODY:
+            return failure[3]
+        return ()
 
 
 @dataclass(frozen=True, slots=True, eq=False)

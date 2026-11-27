@@ -26,7 +26,7 @@ from .native_artifacts import stage_standalone, verify_standalone_source
 from .native_namespace import public_certificate
 from .native_service import NativeRetirementUnconfirmed, retain_cleanup_failure
 from .registration import RegistrationJournal, _absent, _DIRECTORY, _write_private
-from .token_diagnostic import PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage
+from .token_diagnostic import LoadBodyReason, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage
 
 
 _libc_write = ctypes.CDLL(None, use_errno=True).write
@@ -109,6 +109,18 @@ _POST_TOKEN_DETAILS = {
     PostTokenStage.COLD_DRAIN: "The retired native cold dialogue could not be verified.",
     PostTokenStage.COLD_COMMIT: "The final cold metadata record could not be committed.",
 }
+_LOAD_BODY_DETAILS = {
+    LoadBodyReason.SIZE: "body size",
+    LoadBodyReason.JSON_OBJECT: "JSON object encoding",
+    LoadBodyReason.STRUCTURE_LIMITS: "structure limits",
+    LoadBodyReason.TOP_LEVEL_FIELDS: "top-level field allowlist",
+    LoadBodyReason.CURRENT_TIER: "current tier structure",
+    LoadBodyReason.ORIGINAL_PROJECT: "original project",
+    LoadBodyReason.PAID_TIER: "paid tier structure",
+    LoadBodyReason.CONSUMER_PROJECT_POLICY: "consumer and project policy",
+    LoadBodyReason.OPTIONAL_METADATA: "optional metadata",
+    LoadBodyReason.ALTERNATIVE_TIER_POLICY: "alternative tier policy",
+}
 
 
 class ConnectError(RuntimeError):
@@ -151,6 +163,10 @@ def _write_enrollment_detail(owner, error, token_diagnostic, post_diagnostic):
             if stage is None or needs_custody_inspection(error, include_context=True):
                 return
             detail = "Google enrollment metadata: " + _POST_TOKEN_DETAILS[stage]
+            if stage is PostTokenStage.LOAD_BODY:
+                reasons = post_diagnostic.load_body_reasons(error)
+                if reasons:
+                    detail += " Failed checks include " + ", ".join(_LOAD_BODY_DETAILS[reason] for reason in reasons) + "."
     else:
         return
     with suppress(OSError, ConnectError):

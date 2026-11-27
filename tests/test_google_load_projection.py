@@ -8,6 +8,7 @@ import unittest
 from oc_google.account_binding import bind_subject
 from oc_google.enrollment import EnrollmentMetadataError, LoadObservation, _LoadCodeAssist
 from oc_google.metadata_destination import MetadataRoute
+from oc_google.token_diagnostic import LoadBodyReason
 
 
 PROJECT = "synthetic-projection-project"
@@ -175,6 +176,46 @@ class LoadProjectionTests(unittest.TestCase):
             with self.subTest(literal=literal), self.assertRaises(EnrollmentMetadataError):
                 value["releaseChannel"] = "PLACEHOLDER"
                 self.load(encode(value).replace(b'"PLACEHOLDER"', literal))
+
+    def test_bounded_body_reports_independent_failed_groups_in_order(self):
+        fields = rich_load()
+        del fields["cloudaicompanionProject"]
+        fields.update({
+            "synthetic-unapproved-key": "synthetic-private-value",
+            "currentTier": {"id": "synthetic-tier-id", "name": 3, "usesGcpTos": True},
+            "paidTier": {"name": "Synthetic incomplete paid"},
+            "releaseChannel": None,
+            "allowedTiers": [{"id": "repeat"}, {"id": "repeat"}],
+        })
+        with self.assertRaises(EnrollmentMetadataError) as refusal:
+            self.load(encode(fields))
+        self.assertEqual(refusal.exception.load_body_reasons, (
+            LoadBodyReason.TOP_LEVEL_FIELDS, LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT,
+            LoadBodyReason.PAID_TIER, LoadBodyReason.CONSUMER_PROJECT_POLICY, LoadBodyReason.OPTIONAL_METADATA,
+            LoadBodyReason.ALTERNATIVE_TIER_POLICY,
+        ))
+        self.assertEqual(str(refusal.exception), "Invalid Google enrollment metadata response")
+
+    def test_size_json_and_structure_failures_report_one_group(self):
+        cases = (
+            (LoadBodyReason.SIZE, b""),
+            (LoadBodyReason.SIZE, b"x" * 16385),
+            (LoadBodyReason.JSON_OBJECT, b"[]"),
+            (LoadBodyReason.JSON_OBJECT, b"\xff"),
+            (LoadBodyReason.JSON_OBJECT, b'{"secret":1,"secret":2}'),
+            (LoadBodyReason.JSON_OBJECT, b'{"secret":NaN}'),
+            (LoadBodyReason.JSON_OBJECT, b'{"secret":1e999}'),
+            (LoadBodyReason.JSON_OBJECT, b'{"secret":"\\ud800"}'),
+            (LoadBodyReason.STRUCTURE_LIMITS, encode({"secret": "x" * 1025})),
+            (LoadBodyReason.STRUCTURE_LIMITS, encode({"secret": [None] * 17})),
+            (LoadBodyReason.STRUCTURE_LIMITS, encode({str(i): True for i in range(25)})),
+            (LoadBodyReason.STRUCTURE_LIMITS, b'{"secret":' + b"[" * 7 + b"0" + b"]" * 7 + b"}"),
+        )
+        for reason, raw in cases:
+            with self.subTest(reason=reason), self.assertRaises(EnrollmentMetadataError) as refusal:
+                self.load(raw)
+            self.assertEqual(refusal.exception.load_body_reasons, (reason,))
+            self.assertNotIn("secret", str(refusal.exception))
 
 
 if __name__ == "__main__":

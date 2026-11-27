@@ -23,7 +23,7 @@ from unittest.mock import Mock, patch
 
 from oc_google import auth_offer, connect, metadata_workflow, native_artifacts
 from oc_google.native_service import NativeInvocation, NativeRetirementUnconfirmed
-from oc_google.token_diagnostic import PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage, scoped_post_token
+from oc_google.token_diagnostic import LoadBodyReason, PostTokenDiagnostic, PostTokenStage, TokenDiagnostic, TokenStage, scoped_post_token
 
 
 class TerminalOwnerTest(unittest.TestCase):
@@ -373,11 +373,44 @@ class RuntimeCustodyTest(unittest.TestCase):
     def test_token_diagnostic_text_covers_every_stage(self):
         self.assertEqual(set(connect._TOKEN_DETAILS), set(TokenStage))
         self.assertEqual(set(connect._POST_TOKEN_DETAILS), set(PostTokenStage))
+        self.assertEqual(set(connect._LOAD_BODY_DETAILS), set(LoadBodyReason))
 
     def test_post_token_load_body_uses_only_original_foreground_pty(self):
         self.assert_diagnostic_uses_original_pty(
-            "load", b"Google enrollment metadata: The LOAD metadata body was refused.", b"synthetic-load-marker",
+            "load", b"Google enrollment metadata: The LOAD metadata body was refused. Failed checks include "
+            b"top-level field allowlist, current tier structure, original project.", b"synthetic-load-marker",
         )
+
+    def test_load_body_details_only_use_the_bounded_exact_failure_snapshot(self):
+        token = TokenDiagnostic()
+        error = ValueError("synthetic raw exception")
+        error.load_body_reasons = tuple(reversed(tuple(LoadBodyReason)))
+        post = PostTokenDiagnostic()
+        post.mark(error, PostTokenStage.LOAD_BODY)
+        error.load_body_reasons = ("synthetic altered reason",)
+        owner = Mock()
+        connect._write_enrollment_detail(owner, error, token, post)
+        line = owner.write_once.call_args.args[0]
+        expected = ", ".join(connect._LOAD_BODY_DETAILS[reason] for reason in LoadBodyReason)
+        self.assertEqual(line, "Google enrollment metadata: The LOAD metadata body was refused. "
+                              f"Failed checks include {expected}.\n")
+        self.assertLess(len(line.encode("ascii")), 512)
+        for other, scope in ((ValueError(str(error)), post), (error, PostTokenDiagnostic())):
+            owner.reset_mock()
+            connect._write_enrollment_detail(owner, other, token, scope)
+            owner.write_once.assert_not_called()
+        owner.reset_mock()
+        error.__context__ = ValueError("synthetic replaced context")
+        connect._write_enrollment_detail(owner, error, token, post)
+        owner.write_once.assert_not_called()
+
+    def test_invalid_load_reason_metadata_keeps_the_plain_body_message(self):
+        token, post, owner = TokenDiagnostic(), PostTokenDiagnostic(), Mock()
+        error = ValueError("synthetic raw exception")
+        error.load_body_reasons = (LoadBodyReason.SIZE, "synthetic open category")
+        post.mark(error, PostTokenStage.LOAD_BODY)
+        connect._write_enrollment_detail(owner, error, token, post)
+        owner.write_once.assert_called_once_with("Google enrollment metadata: The LOAD metadata body was refused.\n")
 
     def test_post_token_detail_cannot_preempt_token_callback_or_inherit_custody(self):
         callback = metadata_workflow.CallbackWorkflowError(auth_offer.CallbackDiagnostic.NO_MATCHING_CALLBACK)
