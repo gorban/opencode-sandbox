@@ -65,5 +65,10 @@ Found by the 2026-11-26 security audit after this grouping passed human review.
       calls from container entry points, requires the system interpreter and isolated mode where
       each call is made, covers direct-script and array forms, and fails if it cannot read the
       launcher. Fixtures for each form are checked alongside it. Same branch.
+- [x] Re-review follow-up: host-state validation and the bridge probe now share one route to the
+      host, `host_python`, which runs distrobox's wrapper at its installed path with a fixed search
+      path. The audit accepts only `-I` and `-IB`, requires the one read-only dispatcher binding,
+      and rejects interpreter arrays. Distrobox-mode tests run a scratch copy of the launcher that
+      differs only in that binding. Same branch.
 
 - [ ] **Human review**: checked only when the user says so

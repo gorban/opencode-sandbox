@@ -240,11 +240,11 @@ IMAGE_LOG="$STATE/built-images"
 # Validate each script-owned leaf before even listing or deleting state. Parent
 # directories must prevent other users replacing entries between checks and use.
 validate_host_state() {
-  local scope=${1:-} command=(/usr/bin/python3)
+  local scope=${1:-}
   local paths=("$STATE" "$BUILD" "$POLDIR" "$BRIDGE_STAGE" "$BIN" "$UNITS" "$INSTALL_DIR")
   if [[ -n $scope ]]; then paths=("$2"); fi
-  if [[ $scope == host ]]; then command=("${H[@]}" /usr/bin/python3); fi
-  "${command[@]}" -I - "$scope" "${paths[@]}" <<'PYCODE'
+  if [[ $scope == host ]]; then host_python - "$scope" "${paths[@]}"
+  else /usr/bin/python3 -I - "$scope" "${paths[@]}"; fi <<'PYCODE'
 import os, stat, sys
 scope, *paths = sys.argv[1:]
 uid = os.geteuid()
@@ -489,8 +489,16 @@ if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null 2>&1;
 else
   H=()
 fi
-# Host Python checks reach the host through distrobox's installed dispatcher, named by path.
+# Host Python has one route to the host: distrobox's wrapper at its installed path. The wrapper is
+# a shell script that finds its transport through PATH, so it runs with a fixed search path.
 readonly HOST_DISPATCH=/usr/bin/distrobox-host-exec
+host_python() {  # arguments for the host's system Python, which always runs isolated
+  if (( ${#H[@]} )); then
+    PATH=/usr/bin:/bin "$HOST_DISPATCH" /usr/bin/python3 -I "$@"
+  else
+    /usr/bin/python3 -I "$@"
+  fi
+}
 pm() { "${H[@]}" podman "$@"; }
 sc() { "${H[@]}" systemctl --user "$@"; }
 
@@ -1650,14 +1658,8 @@ fi
 # agent-writable tree by name and never hands one to VS Code / Beyond Compare: it copies the requested
 # files with descriptor-relative no-follow opens into a host-owned staging directory, opens the copy,
 # and writes saved edits back the same way. See the header of oc-bridge.py. Shared by all instances.
-# The bridge runs under the host's system Python. PATH is inherited from the caller, so name the
-# interpreter, and the dispatcher that reaches it from a distrobox, by absolute path.
-host_python_supported() {
-  local command=(/usr/bin/python3)
-  if (( ${#H[@]} )); then command=("$HOST_DISPATCH" /usr/bin/python3); fi
-  "${command[@]}" -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null
-}
-host_python_supported \
+# The bridge runs under the host's system Python, so check that interpreter.
+host_python -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
   || echo "warning: the host bridge needs python3 >= 3.11 on the host; 'code'/'bcompare' will do nothing" >&2
 atomic_host_file "$BIN/oc-bridge" 0755 < "$BRIDGE_SRC"
 {
