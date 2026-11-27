@@ -23,5 +23,8 @@ docker-in-docker, implemented in PR #2).
       installation binding so the same command can be retried, and exits with an error. Stubbed
       regressions cover a failed removal, a resource that survives its removal, and failed listings
       (`fix/global-teardown-status`).
+- [x] Global storage purge verifies ownership before removal, never forces volume removal, and
+      retains the installation binding when legacy storage or an incomplete inventory needs manual
+      attention. New Postgres secrets carry ownership labels (`fix/global-teardown-status`).
 
 - [ ] **Human review**: checked only when the user says so

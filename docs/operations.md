@@ -140,26 +140,39 @@ oc-sandbox -l                               # what is running
 - **An agent gets "Permission denied" on a file in `~/opencode-sandbox`:** the file kept a label from
   elsewhere (for example after `mv` on the host); rerun `oc-sandbox` (any instance, `-n` is enough) to
   relabel.
-- **Restarting from scratch:** `oc-sandbox -d -a -y && oc-sandbox -p` deletes all project
-  volumes and starts the default instance with [configured Postgres](services.md#postgres-configuration-required-for--p).
+- **Restarting from scratch:** `oc-sandbox -d -a -y && oc-sandbox -p` deletes volumes whose ownership
+  it can verify and starts the default instance with [configured Postgres](services.md#postgres-configuration-required-for--p).
+  See [Uninstall](#uninstall) to resolve any legacy volumes left behind.
 
 ## Uninstall
 
 A named `-d -a` clears the saved worktree selection after the instance's volumes and secrets
 are confirmed absent. If storage cleanup fails, the selection is retained for retry.
 
-Global `-d -a` deletes OpenCode login and sessions, Chromium profiles, Postgres data and
-Docker-in-Docker storage. It removes `~/opencode-sandbox/.bridge/` with its queued requests and
-copies. If any editor staging directories remain in `bridge-stage/`, teardown stops
-before deleting volumes. Close the editors or recover the saved copies before retrying.
-It confirms that each volume and Postgres secret is gone. If one cannot be confirmed removed, or
-Podman cannot list them, it finishes the remaining steps, keeps the installed state, and exits with
-an error. Fix the reported problem and run the same command again.
+Global `-d -a` deletes owned OpenCode login and sessions, Chromium profiles, Postgres data and
+Docker-in-Docker storage. Before running it, pause other tools and direct Podman commands that
+change volumes or secrets in the same user store. The launcher serializes its own operations.
+Podman looks up volume names and prefixes and cannot atomically verify labels and remove a volume.
+Use the same quiescent store when starting Postgres with `-p`, which refreshes its secrets.
+
+Global teardown requires both `oc.sandbox=1` and the exact `oc.instance` label expected for the
+volume or secret name. It leaves in-use volumes and storage with unresolved ownership in place.
+If Podman cannot verify the complete inventory or such storage remains, teardown reports the issue
+and retains the host state, installation binding, and bridge spool for retry. Inspect the reported
+volumes or secret IDs in the original Podman store. Back up legacy data and resolve ambiguous names
+or ownership manually after verifying each resource, then retry. For an unlabelled legacy
+Postgres secret, verify its origin and remove it by its full ID before retrying Postgres setup.
+Existing containers can retain copies of deleted secrets. Review those containers separately if
+you are retiring a credential.
+
+Teardown removes `~/opencode-sandbox/.bridge/` and its queued requests and copies when cleanup
+succeeds. If editor staging directories remain in `bridge-stage/`, close the editors or recover the
+saved copies before retrying.
 Use the same `XDG_DATA_HOME` for setup and teardown. The launcher retains the installed state and
 staging paths for retries, even after stopping the bridge and removing its units.
 If an older teardown removed the service before recording that binding, the launcher refuses to
 adopt leftover pods, volumes or secrets. Restore the original service file from a trusted backup
-or recover the staged edits and back up the legacy volumes before removing those resources by name.
+or recover the staged edits and back up the legacy volumes before manually resolving those resources.
 Successful teardown clears the installation binding and host state and retains the lock files.
 A SELinux removal failure keeps host state and the workspace's `.bridge/` spool for retry.
 Remove the checkout or extracted ZIP directory once teardown succeeds. The example uses the

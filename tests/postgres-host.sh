@@ -93,6 +93,7 @@ PGPASSSECRET=oc-pg-passfile PGHBASECRET=oc-pg-hba PG_INIT=$T/no-init INST= ILABE
 PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD='p:a\\b' PORTS=(15432:5432)
 SB=$T/sandbox H=()
 $(fn in_sb); $(fn trusted_path); $(fn host_input); $(fn inspect_pg_init)
+$(fn secret_name_inventory); $(fn secret_ownership); $(fn create_pg_secret)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 cstate() { printf '%s\\n' "\${FAKE_STATE:-none}"; }
 log() { :; }; sleep() { :; }
@@ -101,7 +102,7 @@ pm() {
   case "\$1 \${2:-}" in
     'volume exists') return 1 ;;
     'container inspect') return 1 ;;
-    'secret create') cat >"$T/secret.\$4" ;;
+    'secret create') while [[ \$# -gt 2 ]]; do shift; done; cat >"$T/secret.\$1" ;;
     'exec oc-postgres') [[ \${FAIL_AUTH:-0} == 1 && \$* == *' psql '* ]] && return 1 ;;
   esac
   return 0

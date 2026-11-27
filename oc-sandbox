@@ -1220,6 +1220,197 @@ remove_instance_storage() {
   pm "$kind" exists "$name" || rc=$?
   (( rc == 1 ))
 }
+
+storage_instance() {  # expected oc.instance for a name the launcher creates
+  local instance suffix
+  case "$1:$2" in
+    "volume:$HOMEVOL") printf '%s\n' shared; return 0 ;;
+    volume:oc-chrome|volume:oc-pg|volume:oc-dind|volume:oc-dind-run|volume:oc-openai-home|\
+    secret:oc-pg-password|secret:oc-pg-passfile|secret:oc-pg-hba)
+      printf '%s\n' default; return 0 ;;
+  esac
+  case $1 in
+    volume) suffix='chrome|pg|dind|dind-run|openai-home' ;;
+    secret) suffix='pg-password|pg-passfile|pg-hba' ;;
+    *) return 1 ;;
+  esac
+  [[ $2 =~ ^oc-(.+)-($suffix)$ ]] || return 1
+  instance=${BASH_REMATCH[1]}
+  valid_instance "$instance" || return 1
+  printf '%s\n' "$instance"
+}
+
+volume_name_inventory() {
+  local names name
+  local -A seen=()
+  names=$(pm volume ls -q) || return 1
+  [[ -n $names ]] || return 0
+  while IFS= read -r name; do
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 1
+    [[ -z ${seen[$name]:-} ]] || return 1
+    seen[$name]=1
+  done <<<"$names"
+  printf '%s\n' "$names"
+}
+
+inspect_volume_metadata() {
+  # `volume ls` formats .Labels as text in Podman 6. The inspect field stays a map.
+  pm volume inspect --format '{{.Name}} {{if eq (index .Labels "oc.sandbox") "1"}}1{{else}}0{{end}} {{printf "%q" (index .Labels "oc.instance")}}' "$@"
+}
+
+volume_inventory() {
+  local names rows row name quoted='"([^"\\[:cntrl:]]|\\.)*"'
+  local -A pending=()
+  names=$(volume_name_inventory) || return 1
+  while IFS= read -r name; do
+    [[ -n $name ]] && pending[$name]=1
+  done <<<"$names"
+  rows=$(inspect_volume_metadata --all) || return 1
+  while IFS= read -r row; do
+    [[ -n $rows ]] || break
+    [[ $row =~ ^([A-Za-z0-9][A-Za-z0-9_.-]*)\ [01]\ $quoted$ ]] || return 1
+    name=${BASH_REMATCH[1]}
+    [[ ${pending[$name]:-} == 1 ]] || return 1
+    unset 'pending[$name]'
+  done <<<"$rows"
+  (( ${#pending[@]} == 0 )) || return 1
+  printf '%s' "$rows"
+}
+
+remove_global_volume() {
+  local target=$1 expected=$2 names name metadata found=0
+  names=$(volume_name_inventory) || return 1
+  while IFS= read -r name; do
+    if [[ $name == "$target" ]]; then
+      found=1
+    elif [[ $name == "$target"* ]]; then
+      # Podman also accepts unique name prefixes. Leave a possible fallback target alone.
+      return 1
+    fi
+  done <<<"$names"
+  (( found )) || return 1
+  metadata=$(inspect_volume_metadata -- "$target") || return 1
+  [[ $metadata == "$target 1 \"$expected\"" ]] || return 1
+  pm volume rm -- "$target" >/dev/null
+}
+
+purge_global_volumes() {
+  local rows ordered name marker owner expected failed=0
+  local -a by_length=()
+  rows=$(volume_inventory) || { echo 'error: could not verify Podman volume inventory' >&2; return 1; }
+  while IFS=' ' read -r name marker owner; do
+    if expected=$(storage_instance volume "$name"); then
+      if [[ $marker == 1 && $owner == \""$expected"\" ]]; then
+        by_length+=("${#name} $name $expected")
+        continue
+      fi
+    elif [[ $marker != 1 ]]; then
+      continue
+    fi
+    echo "error: could not establish ownership of volume '$name'; kept" >&2
+    failed=1
+  done <<<"$rows"
+  # Remove longer owned names first, so oc-dind-run can be removed before oc-dind.
+  if (( ${#by_length[@]} )); then
+    ordered=$(printf '%s\n' "${by_length[@]}" | LC_ALL=C sort -k1,1nr) || {
+      echo 'error: could not order Podman volume inventory' >&2; return 1;
+    }
+    while IFS=' ' read -r _ name expected; do
+      if ! remove_global_volume "$name" "$expected"; then
+        echo "error: could not verify removal of volume '$name'" >&2
+        failed=1
+      fi
+    done <<<"$ordered"
+  fi
+  rows=$(volume_inventory) || { echo 'error: could not verify final Podman volume inventory' >&2; return 1; }
+  while IFS=' ' read -r name marker _; do
+    if [[ $marker == 1 ]] || storage_instance volume "$name" >/dev/null; then
+      echo "error: volume '$name' remains" >&2
+      failed=1
+    fi
+  done <<<"$rows"
+  (( failed == 0 ))
+}
+
+# Secret names can contain whitespace. Go-quote names and labels before parsing, and use only
+# full IDs (25 hex characters for Podman secrets). These queries never use --showsecret.
+secret_name_inventory() {
+  local rows row id name quoted='"([^"\\[:cntrl:]]|\\.)+"'
+  local -A ids=() names=()
+  rows=$(pm secret ls --format '{{.ID}} {{printf "%q" .Name}}') || return 1
+  [[ -n $rows ]] || return 0
+  while IFS= read -r row; do
+    [[ $row =~ ^([0-9a-f]{25})\ ($quoted)$ ]] || return 1
+    id=${BASH_REMATCH[1]} name=${BASH_REMATCH[2]}
+    [[ -z ${ids[$id]:-} && -z ${names[$name]:-} ]] || return 1
+    ids[$id]=1 names[$name]=1
+  done <<<"$rows"
+  printf '%s\n' "$rows"
+}
+
+secret_ownership() {  # checked ID and quoted name in, marker and quoted instance out
+  local id=$1 name=$2 row prefix="$1 $2 " quoted='"([^"\\[:cntrl:]]|\\.)*"'
+  row=$(pm secret inspect --format '{{.ID}} {{printf "%q" .Spec.Name}} {{if eq (index .Spec.Labels "oc.sandbox") "1"}}1{{else}}0{{end}} {{printf "%q" (index .Spec.Labels "oc.instance")}}' -- "$id") || return 1
+  [[ $row == "$prefix"* ]] || return 1
+  row=${row#"$prefix"}
+  [[ $row =~ ^[01]\ $quoted$ ]] || return 1
+  printf '%s\n' "$row"
+}
+
+secret_inventory() {
+  local rows id name ownership
+  rows=$(secret_name_inventory) || return 1
+  [[ -n $rows ]] || return 0
+  while IFS=' ' read -r id name; do
+    ownership=$(secret_ownership "$id" "$name") || return 1
+    printf '%s\t%s\t%s\n' "$id" "$name" "$ownership"
+  done <<<"$rows"
+}
+
+remove_global_secret() {
+  local id=$1 name=$2 expected=$3 rows current_id current_name ownership found=0
+  rows=$(secret_name_inventory) || return 1
+  while IFS=' ' read -r current_id current_name; do
+    if [[ $current_id == "$id" && $current_name == "$name" ]]; then
+      found=1
+    elif [[ $current_name == \""$id"\" ]]; then
+      # Podman can also interpret this argument as a name if the ID disappears.
+      return 1
+    fi
+  done <<<"$rows"
+  (( found )) || return 1
+  ownership=$(secret_ownership "$id" "$name") || return 1
+  [[ $ownership == "1 \"$expected\"" ]] || return 1
+  pm secret rm -- "$id" >/dev/null
+}
+
+purge_global_secrets() {
+  local rows id ownership name expected failed=0
+  rows=$(secret_inventory) || { echo 'error: could not verify Podman secret inventory' >&2; return 1; }
+  while IFS=$'\t' read -r id name ownership; do
+    if expected=$(storage_instance secret "${name:1:-1}"); then
+      if [[ $ownership == "1 \"$expected\"" ]]; then
+        if ! remove_global_secret "$id" "$name" "$expected"; then
+          echo "error: could not verify removal of secret $name" >&2
+          failed=1
+        fi
+        continue
+      fi
+    elif [[ $ownership != '1 '* ]]; then
+      continue
+    fi
+    echo "error: could not establish ownership of secret ID '$id'; kept" >&2
+    failed=1
+  done <<<"$rows"
+  rows=$(secret_inventory) || { echo 'error: could not verify final Podman secret inventory' >&2; return 1; }
+  while IFS=$'\t' read -r id name ownership; do
+    if [[ $ownership == '1 '* ]] || storage_instance secret "${name:1:-1}" >/dev/null; then
+      echo "error: secret ID '$id' remains" >&2
+      failed=1
+    fi
+  done <<<"$rows"
+  (( failed == 0 ))
+}
 bridge_unit_state() {
   local unit=$1 phase=${2:-existing} helper
   local fields=Id,LoadState,ActiveState,Job,FragmentPath,DropInPaths,Triggers,TriggeredBy,WantedBy,RequiredBy,UpheldBy
@@ -1367,27 +1558,8 @@ if (( DELETE )); then
     # remain, finish the other steps but keep the state and binding: without the binding, a later
     # run refuses to touch what was left, so the same command could not be retried.
     teardown_status=0
-    labelled_volumes=$(pm volume ls -q --filter label=oc.sandbox=1) || {
-      echo "error: could not list oc-sandbox volumes" >&2; teardown_status=1; labelled_volumes=
-    }
-    mapfile -t vols < <(printf '%s\n' "$labelled_volumes" "$HOMEVOL" oc-chrome oc-pg | sort -u)
-    for v in "${vols[@]}"; do
-      [[ -n $v ]] || continue
-      remove_instance_storage volume "$v" -f \
-        || { echo "error: could not verify removal of volume '$v'" >&2; teardown_status=1; }
-    done
-    # No matching secret (never used -p) is normal.
-    if secrets=$(pm secret ls --format '{{.Name}}' 2>/dev/null); then
-      while read -r s; do
-        if [[ $s =~ ^oc(-[a-z0-9-]+)?-pg-(password|passfile|hba)$ ]]; then
-          remove_instance_storage secret "$s" \
-            || { echo "error: could not verify removal of secret '$s'" >&2; teardown_status=1; }
-        fi
-      done <<<"$secrets"
-    else
-      echo "error: could not list Podman secrets, so any oc-*-pg-* secrets may remain" >&2
-      teardown_status=1
-    fi
+    purge_global_volumes || teardown_status=1
+    purge_global_secrets || teardown_status=1
     remove_chromium_policy || teardown_status=1
     # We verified that the pods are gone and stopped the bridge path and service above.
     # GNU rm -r unlinks symlinks instead of traversing their targets.
@@ -1895,11 +2067,26 @@ pgpass_field() {
   field=${field//\\/\\\\}; field=${field//:/\\:}
   printf '%s' "$field"
 }
+create_pg_secret() {
+  local target=$1 rows id name ownership
+  local -a options=(--label oc.sandbox=1 --label "oc.instance=$ILABEL")
+  rows=$(secret_name_inventory) || { echo 'Could not verify Podman secret inventory.' >&2; return 1; }
+  while IFS=' ' read -r id name; do
+    [[ $name == \""$target"\" ]] || continue
+    if ! ownership=$(secret_ownership "$id" "$name") || [[ $ownership != "1 \"$ILABEL\"" ]]; then
+      echo "Could not establish ownership of Podman secret '$target'; kept. See the Uninstall guide for recovery." >&2
+      return 1
+    fi
+    options+=(--replace)
+    break
+  done <<<"$rows"
+  pm secret create "${options[@]}" -- "$target" - >/dev/null
+}
 create_pg_auth_secrets() {
   printf '%s\n' 'local all all trust' 'host all all 0.0.0.0/0 scram-sha-256' 'host all all ::/0 scram-sha-256' |
-    pm secret create --replace "$PGHBASECRET" - >/dev/null || return 1
+    create_pg_secret "$PGHBASECRET" || return 1
   { printf '127.0.0.1:5432:'; pgpass_field "$PG_DB"; printf ':'; pgpass_field "$PG_USER"; printf ':'; pgpass_field "$PG_PASSWORD"; printf '\n'; } |
-    pm secret create --replace "$PGPASSSECRET" - >/dev/null || return 1
+    create_pg_secret "$PGPASSSECRET" || return 1
 }
 ensure_postgres() {
   local pg_state pg_cfg want_cfg sig legacy vsig init_hash ok=0 p init
@@ -1957,7 +2144,7 @@ ensure_postgres() {
       log "Creating Postgres in pod '$POD' (image $PG_IMAGE, volume $PGVOL)"
       # The password goes over stdin into a Podman secret and is mounted as a file: it never appears
       # in any argv, in the container's environment, or in 'podman inspect'.
-      printf '%s' "$PG_PASSWORD" | pm secret create --replace "$PGSECRET" - >/dev/null
+      printf '%s' "$PG_PASSWORD" | create_pg_secret "$PGSECRET" || return 1
       pm run -d --name "$PGC" --pod "$POD" --label "oc.pg=$want_cfg" --security-opt=no-new-privileges \
         --cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID \
         --cap-add=FOWNER --cap-add=DAC_OVERRIDE \

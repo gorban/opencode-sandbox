@@ -31,6 +31,11 @@ host_input_functions() {
   fn inspect_pg_init
   printf 'SB=%q\nH=()\n' "$T/pg-sandbox"
 }
+pg_secret_functions() {
+  fn secret_name_inventory
+  fn secret_ownership
+  fn create_pg_secret
+}
 SECRET=TOP-SECRET-HOST-DATA
 
 # ================================================================================================
@@ -445,6 +450,7 @@ PW='S3cr3t-pw:@/#'
 cat > "$T/pg.sh" <<EOF
 set -euo pipefail
 $(host_input_functions)
+$(pg_secret_functions)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { echo "==> \$*"; }
@@ -452,7 +458,11 @@ sleep() { :; }
 pm() {
   printf '%s\0' "\$@" >> $T/argv.log; printf '\n' >> $T/argv.log
   case "\$1 \${2:-}" in
-    "secret create") cat > "$T/secret.\$4" ;;
+    "secret ls") printf '%s' "\${FAKE_SECRET_LIST:-}" ;;
+    "secret inspect") printf '%s' "\${FAKE_SECRET_INSPECT:-}" ;;
+    "secret create")
+      while [[ \$# -gt 2 ]]; do shift; done
+      cat > "$T/secret.\$1" ;;
     "volume exists"|"container inspect") return 1 ;;
   esac
   return 0
@@ -475,11 +485,30 @@ check "postgres gets POSTGRES_PASSWORD_FILE" grep -qa POSTGRES_PASSWORD_FILE "$T
 unkeyed=$(printf '%s|%s|%s|%s' app "$PW" db "" | sha256sum | cut -c1-16)
 check "volume label is not the unkeyed hash" ! grep -qa "$unkeyed" "$T/argv.log"
 check "signature key is private (0600)"    [ "$(stat -c %a "$T/state/pg-sig.key" 2>/dev/null)" = 600 ]
+check 'new Postgres secrets have both ownership labels' \
+  grep -qF 'secret create --label oc.sandbox=1 --label oc.instance=default' <(tr '\000' ' ' < "$T/argv.log")
+check 'new Postgres secrets are created without replace' ! grep -qaF -- --replace "$T/argv.log"
+pg_fixture_id=aaaaaaaaaaaaaaaaaaaaaaaaa
+for pg_ownership in '0 ""' '1 "other"'; do
+  : > "$T/argv.log"
+  FAKE_SECRET_LIST="$pg_fixture_id \"oc-pg-hba\"" \
+    FAKE_SECRET_INSPECT="$pg_fixture_id \"oc-pg-hba\" $pg_ownership" bash "$T/pg.sh" > "$T/pg.out" 2>&1; rc=$?
+  check "Postgres setup refuses unverified secret ($pg_ownership)" test "$rc" -ne 0
+  check "unverified secret ($pg_ownership) is left intact" \
+    ! grep -qE 'secret create|--replace|--showsecret' <(tr '\000' ' ' < "$T/argv.log")
+done
+: > "$T/argv.log"
+FAKE_SECRET_LIST="$pg_fixture_id \"oc-pg-hba\"" \
+  FAKE_SECRET_INSPECT="$pg_fixture_id \"oc-pg-hba\" 1 \"default\"" bash "$T/pg.sh" > "$T/pg.out" 2>&1; rc=$?
+check 'Postgres setup refreshes a verified same-name secret' test "$rc" -eq 0
+check 'existing owned Postgres secret is replaced with labels' \
+  grep -qaF -- --replace "$T/argv.log"
 
 pgmsg() {  # volume-label [init-directory] -> stderr of ensure_postgres with an existing volume
   cat > "$T/pgm.sh" <<EOF
 set -euo pipefail
 $(host_input_functions)
+$(pg_secret_functions)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { :; }; sleep() { :; }
@@ -1079,6 +1108,37 @@ mkdir -p "$T/stub" "$T/dhome"
 cat > "$T/stub/podman" <<EOF
 #!/bin/sh
 echo "\${0##*/} \$*" >> "$T/stub.log"
+list_volume_fixture() {
+  mode=\$1 target=\${2:-}
+  count=\$(grep -c '^podman volume ls -q\$' "$T/stub.log")
+  if [ "\$mode" = names ]; then
+    [ -n "\${STUB_VOLUME_LS_FAIL:-}" ] && return 125
+    [ "\${STUB_VOLUME_LS_FAIL_AT:-}" = "\$count" ] && return 125
+  else
+    [ -n "\${STUB_VOLUME_INSPECT_FAIL:-}" ] && return 125
+  fi
+  printf '%b' "\${STUB_VOLUME_ROWS:-}" | while IFS= read -r row; do
+    name=\${row%% *}
+    if [ "\${STUB_VOLUME_DISAPPEARS:-}" = "\$name" ] && [ "\$count" -gt 1 ]; then continue; fi
+    if [ "\${STUB_STORAGE_STAYS:-}" != "\$name" ] && [ "\${STUB_VOLUME_REMOVE_FAIL:-}" != "\$name" ] &&
+       [ "\${STUB_VOLUME_IN_USE:-}" != "\$name" ] &&
+       grep -Fqx "podman volume rm -- \$name" "$T/stub.log"; then continue; fi
+    case "\$mode:\$target" in
+      names:) printf '%s\n' "\$name" ;;
+      metadata:--all|metadata:\$name) printf '%s\n' "\$row" ;;
+    esac
+  done
+}
+list_secret_fixture() {
+  count=\$(grep -c '^podman secret ls --format {{.ID}} ' "$T/stub.log")
+  [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && return 125
+  [ "\${STUB_SECRET_LS_FAIL_AT:-}" = "\$count" ] && return 125
+  printf '%b' "\${STUB_SECRET_ROWS:-}" | while read -r id name marker owner; do
+    if [ "\${STUB_STORAGE_STAYS:-}" != "\$id" ] && [ "\${STUB_SECRET_REMOVE_FAIL:-}" != "\$id" ] &&
+       grep -Fqx "podman secret rm -- \$id" "$T/stub.log"; then continue; fi
+    printf '%s %s\n' "\$id" "\$name"
+  done
+}
 # Optional lifecycle integration stub: every image/volume/pod operation stays in scratch.
 if [ -n "\${STUB_SETUP:-}" ]; then
   setup_dir=\${STUB_SETUP_DIR:-"$T/lifecycle"}
@@ -1150,12 +1210,28 @@ case "\$1 \$2" in
     [ "\${STUB_STORAGE_STAYS:-}" = "\$3" ] && exit 0
     if grep -Fqx "podman \$1 rm \$3" "$T/stub.log" || \
        grep -Fqx "podman \$1 rm -f \$3" "$T/stub.log"; then exit 1; fi ;;
-  "volume rm") [ "\${STUB_VOLUME_REMOVE_FAIL:-}" = "\${4:-}" ] && exit 125 ;;
+  "volume rm")
+    [ "\${STUB_VOLUME_REMOVE_FAIL:-}" = "\${4:-}" ] && exit 125
+    if [ "\${3:-}" = -- ] && [ "\${STUB_VOLUME_IN_USE:-}" = "\${4:-}" ]; then exit 2; fi ;;
   "volume ls")
-    if [ "\${4:-}" = --filter ]; then [ -n "\${STUB_VOLUME_LS_FAIL:-}" ] && exit 125
+    if [ "\${4:-}" = --filter ]; then
+      [ -n "\${STUB_VOLUME_LS_FAIL:-}" ] && exit 125
+      printf '%b' "\${STUB_VOLUME_ROWS:-}" | awk '\$2 == 1 { print \$1 }'
+    elif [ "\${STUB_VOLUME_ROWS+x}" ]; then list_volume_fixture names; exit \$?
     else printf '%b' "\${STUB_LEGACY_VOLUMES:-}"; fi ;;
-  "secret rm") [ "\${STUB_SECRET_REMOVE_FAIL:-}" = "\${3:-}" ] && exit 125 ;;
-  "secret ls") [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}" ;;
+  "volume inspect")
+    if [ "\${5:-}" = --all ]; then list_volume_fixture metadata --all; else list_volume_fixture metadata "\${6:-}"; fi
+    exit \$? ;;
+  "secret rm") [ "\${STUB_SECRET_REMOVE_FAIL:-}" = "\${4:-\${3:-}}" ] && exit 125 ;;
+  "secret ls")
+    if [ "\${4:-}" = '{{.Name}}' ]; then
+      [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && exit 125; printf '%b' "\${STUB_SECRETS:-}"
+    else list_secret_fixture; exit \$?; fi ;;
+  "secret inspect")
+    [ -n "\${STUB_SECRET_INSPECT_FAIL:-}" ] && exit 125
+    printf '%b' "\${STUB_SECRET_ROWS:-}" | while read -r id name marker owner; do
+      [ "\$id" = "\${6:-}" ] && printf '%s %s %s %s\n' "\$id" "\$name" "\$marker" "\$owner"
+    done; exit 0 ;;
   "image inspect")  # STUB_IDS="name=id ...": the image each tag points to; images have no tags left
     case "\$*" in *RepoTags*) echo 0; exit 0 ;; esac
     for m in \${STUB_IDS:-}; do [ "\${m%%=*}" = "\$5" ] && { echo "\${m#*=}"; exit 0; }; done; exit 125 ;;
@@ -1513,30 +1589,45 @@ check 'clearing the selection record succeeds' grep -qx 'rc=0' <<<"$out"
 out=$(pathrun STUB_POD_EXISTS_FAIL=1 -- -l)
 check 'instance listing reports incomplete inventory' grep -q 'could not list instance pods' <<<"$out"
 check 'instance listing prints no successful table on inventory failure' ! grep -q '^INSTANCE' <<<"$out"
-for case in "no Postgres secrets:STUB_SECRETS=" \
-            "secrets present:STUB_SECRETS=oc-pg-password\\nother\\noc-x-pg-password\\n"; do
-  seed_default_binding
-  name=${case%%:*} envset=${case#*:}
-  : > "$T/stub.log"; mkdir -p "$DSTATE/build"; rc=0
-  env -u CONTAINER_ID -u XDG_DATA_HOME -u XDG_CONFIG_HOME "$envset" HOME="$T/dhome" PATH="$T/stub:$PATH" \
-    "$SCRIPT" -d -a -y >/dev/null 2>&1 </dev/null || rc=$?
-  check "-d -a ($name) completes"              [ $rc -eq 0 ]
+echo 'global storage teardown (Podman stubbed; scratch HOME)'
+volume_rows=$'oc-home 1 "shared"\noc-dind 1 "default"\noc-dind-run 1 "default"\noc-team-pg 1 "team"\nother 0 ""\n'
+secret_default=aaaaaaaaaaaaaaaaaaaaaaaaa secret_team=bbbbbbbbbbbbbbbbbbbbbbbbb secret_other=ccccccccccccccccccccccccc
+secret_rows="$secret_default \"oc-pg-password\" 1 \"default\"
+$secret_team \"oc-team-pg-passfile\" 1 \"team\"
+$secret_other \"other\" 0 \"\"
+"
+for name in empty owned; do
+  mkdir -p "$DSTATE/build"
+  if [[ $name == owned ]]; then
+    out=$(pathrun STUB_VOLUME_ROWS="$volume_rows" STUB_SECRET_ROWS="$secret_rows" \
+      STUB_SECRETS=$'oc-pg-password\noc-team-pg-passfile\nother\n' -- -d -a -y)
+  else
+    out=$(pathrun -- -d -a -y)
+  fi
+  check "-d -a ($name) completes" grep -qx 'rc=0' <<<"$out"
   check "-d -a ($name) retains the persistent setup lock" [ -f "$DSTATE/setup.lock" ]
   check "-d -a ($name) retains the lifecycle barrier" [ -f "$DSTATE/lifecycle.lock" ]
   check "-d -a ($name) removes other state"    [ ! -e "$DSTATE/build" ]
   check "-d -a ($name) removes SELinux module" grep -q 'semodule -X 400 -r oc_chromium' "$T/stub.log"
 done
-check "-d -a removes only oc Postgres secrets" sh -c "grep -qx 'podman secret rm oc-pg-password' '$T/stub.log' \
-  && grep -qx 'podman secret rm oc-x-pg-password' '$T/stub.log' && ! grep -q 'secret rm other' '$T/stub.log'"
+check 'global purge removes owned volumes by exact name without force, longer names first' \
+  test "$(grep '^podman volume rm ' "$T/stub.log")" = $'podman volume rm -- oc-dind-run\npodman volume rm -- oc-team-pg\npodman volume rm -- oc-dind\npodman volume rm -- oc-home'
+check 'global purge removes only owned secrets and uses full IDs' \
+  test "$(grep '^podman secret rm ' "$T/stub.log")" = "$(printf 'podman secret rm -- %s\n' "$secret_default" "$secret_team")"
+check 'global purge uses metadata only for secrets' ! grep -q -- --showsecret "$T/stub.log"
 # Volumes and secrets hold logins and database passwords. Global -d -a must not report success or
 # clear its records while one may remain: without the installation binding, no later run can remove
 # what was left. The rest of the cleanup still runs, and the same command can be retried.
-for fault in STUB_VOLUME_REMOVE_FAIL=oc-home STUB_SECRET_REMOVE_FAIL=oc-pg-password \
-             STUB_STORAGE_STAYS=oc-home STUB_STORAGE_STAYS=oc-pg-password \
-             STUB_VOLUME_LS_FAIL=1 STUB_SECRET_LS_FAIL=1; do
+volume_one=$'oc-home 1 "shared"\n'
+secret_one="$secret_default \"oc-pg-password\" 1 \"default\""$'\n'
+for fault in STUB_VOLUME_REMOVE_FAIL=oc-home STUB_VOLUME_IN_USE=oc-home STUB_SECRET_REMOVE_FAIL="$secret_default" \
+             STUB_STORAGE_STAYS=oc-home STUB_STORAGE_STAYS="$secret_default" \
+             STUB_VOLUME_LS_FAIL=1 STUB_SECRET_LS_FAIL=1 \
+             STUB_VOLUME_LS_FAIL_AT=3 STUB_SECRET_LS_FAIL_AT=3; do
   mkdir -p "$DSTATE/build" "$DSB/.bridge"
   : > "$DSB/.bridge/keep"
-  out=$(pathrun "$fault" 'STUB_SECRETS=oc-pg-password\n' -- -d -a -y)
+  out=$(pathrun "$fault" STUB_VOLUME_ROWS="$volume_one" STUB_SECRET_ROWS="$secret_one" \
+    STUB_SECRETS=$'oc-pg-password\n' -- -d -a -y)
   check "global purge ($fault) returns failure" grep -qx 'rc=1' <<<"$out"
   check "global purge ($fault) reports incomplete cleanup" grep -q 'Cleanup incomplete; state retained' <<<"$out"
   check "global purge ($fault) retains state for retry" test -d "$DSTATE/build"
@@ -1547,10 +1638,47 @@ for fault in STUB_VOLUME_REMOVE_FAIL=oc-home STUB_SECRET_REMOVE_FAIL=oc-pg-passw
     grep -q 'semodule -X 400 -r oc_chromium' "$T/stub.log"
 done
 check "a failed volume removal names the volume" \
-  grep -q "could not verify removal of volume 'oc-home'" <<<"$(pathrun STUB_VOLUME_REMOVE_FAIL=oc-home -- -d -a -y)"
-out=$(pathrun 'STUB_SECRETS=oc-pg-password\n' -- -d -a -y)
+  grep -q "could not verify removal of volume 'oc-home'" \
+    <<<"$(pathrun STUB_VOLUME_ROWS="$volume_one" STUB_VOLUME_REMOVE_FAIL=oc-home -- -d -a -y)"
+out=$(pathrun STUB_VOLUME_ROWS="$volume_one" STUB_SECRET_ROWS="$secret_one" -- -d -a -y)
 check "global purge succeeds when retried without the fault" grep -qx 'rc=0' <<<"$out"
 check "the retried purge clears the retained state" test ! -e "$DSTATE/build"
+
+mkdir -p "$DSTATE/build"
+out=$(pathrun STUB_VOLUME_ROWS=$'oc-home 0 ""\noc-pg 1 "team"\noc-team-openai-home 1 "default"\nforeign 1 "shared"\n' \
+  STUB_SECRET_ROWS="$secret_default \"oc-pg-password\" 0 \"\"
+$secret_team \"oc-team-pg-passfile\" 1 \"default\"
+$secret_other \"foreign\" 1 \"shared\"
+" STUB_SECRETS=$'oc-pg-password\noc-team-pg-passfile\nforeign\n' -- -d -a -y)
+check 'global purge preserves legacy, mismatched and unexpected labelled storage' \
+  ! grep -qE '^podman (volume|secret) rm' "$T/stub.log"
+check 'unresolved storage prevents completion' grep -qx 'rc=1' <<<"$out"
+check 'unresolved storage keeps the installation binding and state' \
+  test -d "$DSTATE/build" -a -f "$T/dhome/.config/systemd/user/.oc-sandbox/binding"
+
+for disappearance in '' oc-home; do
+  out=$(pathrun STUB_VOLUME_ROWS="$volume_one"$'oc-home-foreign 0 ""\n' \
+    STUB_VOLUME_DISAPPEARS="$disappearance" -- -d -a -y)
+  check "global purge never removes a volume with an ambiguous prefix ($disappearance)" \
+    ! grep -q '^podman volume rm' "$T/stub.log"
+  check "global purge retains state when a prefix cannot be resolved ($disappearance)" grep -qx 'rc=1' <<<"$out"
+done
+
+out=$(pathrun STUB_VOLUME_ROWS="$volume_one"$'malformed\n' \
+  STUB_SECRET_ROWS="$secret_one"$'bad-id "other" 0 ""\n' -- -d -a -y)
+check 'malformed inventories prevent storage removal' ! grep -qE '^podman (volume|secret) rm' "$T/stub.log"
+check 'malformed inventories prevent completion' grep -qx 'rc=1' <<<"$out"
+out=$(pathrun STUB_VOLUME_ROWS="$volume_one" STUB_SECRET_ROWS="$secret_one" \
+  STUB_VOLUME_LS_FAIL=1 STUB_SECRET_INSPECT_FAIL=1 -- -d -a -y)
+check 'failed inventories prevent storage removal' ! grep -qE '^podman (volume|secret) rm' "$T/stub.log"
+check 'failed inventories prevent completion' grep -qx 'rc=1' <<<"$out"
+out=$(pathrun STUB_VOLUME_ROWS="$volume_one" STUB_VOLUME_INSPECT_FAIL=1 -- -d -a -y)
+check 'missing volume inspection prevents removal' ! grep -q '^podman volume rm' "$T/stub.log"
+check 'missing volume inspection prevents completion' grep -qx 'rc=1' <<<"$out"
+out=$(pathrun STUB_SECRET_ROWS="$secret_one$secret_other \"$secret_default\" 0 \"\""$'\n' \
+  STUB_SECRETS=$'oc-pg-password\n' -- -d -a -y)
+check 'a secret naming the target ID blocks deletion' ! grep -q '^podman secret rm' "$T/stub.log"
+check 'ambiguous secret ID retains state for retry' grep -qx 'rc=1' <<<"$out"
 
 echo "shared setup and teardown barrier (Podman stubbed; scratch HOME)"
 LHOME=$T/lifecycle/home LSTATE=$T/lifecycle/home/.local/share/oc-sandbox
