@@ -26,6 +26,8 @@ _PASSIVE_TURN_UPDATES = _STARTUP_UPDATES | {"agent_thought_chunk", "plan"}
 _TOOL_UPDATES = {"tool_call", "tool_call_update"}
 _AGENT = "oc-sandbox-text"
 _PROMPT = "Reply with exactly: ok. Do not use any tools."
+_START_GATE = ('gate_fd=$1; shift; IFS= read -r -n 1 -u "$gate_fd" gate || exit 1; '
+               'exec {gate_fd}<&-; [[ $gate == G ]] || exit 1; exec "$@"')
 
 
 class NativeCliTextError(RuntimeError):
@@ -97,6 +99,24 @@ def _retire(process):
             stream.close()
 
 
+def _start_gated(clean, retirement, role, argv, *, pass_fds=(), **options):
+    """Hold the exact spawned PID at a fixed gate until its receipt is durable."""
+    slot = retirement.reserve(role)
+    reader, writer = os.pipe2(os.O_CLOEXEC)
+    try:
+        child = subprocess.Popen(
+            ["/usr/bin/bash", "-p", "-c", _START_GATE, "oc-native-gate", str(reader), *argv],
+            env=_SYSTEM_ENV, pass_fds=(*pass_fds, reader), **options,
+        )
+        retirement.track(clean, child, slot)
+        if os.write(writer, b"G") != 1:
+            raise NativeCliTextError("The native ACP start gate did not open.")
+        return child
+    finally:
+        os.close(reader)
+        os.close(writer)
+
+
 def _pinned_agy(clean, home):
     from oc_providers.config import _open_trusted_dir
 
@@ -142,12 +162,11 @@ def _keyring_proxy(clean, runtime, proxy_socket, retirement):
                       if os.path.isfile(path)), None)
     if proxy_exe is None or not bus.is_socket():
         raise NativeCliTextError("The workstation Secret Service proxy is unavailable.")
-    slot = retirement.reserve("keyring-proxy")
-    proxy = subprocess.Popen(
+    proxy = _start_gated(
+        clean, retirement, "keyring-proxy",
         [proxy_exe, f"unix:path={bus}", str(proxy_socket), "--filter", "--talk=org.freedesktop.secrets"],
-        env=_SYSTEM_ENV, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    retirement.track(clean, proxy, slot)
     end = time.monotonic() + 4
     while proxy.poll() is None and not proxy_socket.is_socket() and time.monotonic() < end:
         time.sleep(.025)
@@ -170,11 +189,9 @@ def _start_native(clean, fd, home, workspace, proxy_socket, retirement):
         "/opt/agy", "acp", "--gemini-dir", "/home/provider/.gemini", "--app-data-dir", "antigravity-acp",
         "--agent", _AGENT, "--include-default-customizations=false", "--disable-telemetry", "--log-file", "/dev/null",
     ]
-    slot = retirement.reserve("native-acp")
-    child = subprocess.Popen(argv, env=_SYSTEM_ENV, pass_fds=(fd,), stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
-    retirement.track(clean, child, slot)
-    return child
+    return _start_gated(clean, retirement, "native-acp", argv, pass_fds=(fd,),
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, bufsize=0)
 
 
 class _Acp:

@@ -1,6 +1,7 @@
 """Exercise the fixed text command without credentials or provider traffic."""
 
 from contextlib import ExitStack
+from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 import io
 import json
@@ -9,13 +10,15 @@ from pathlib import Path
 import runpy
 import subprocess
 import sys
+import time
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from oc_google.native_text import target_from_config
 
-from oc_google.native_text import NativeCliTextError, _Acp, _NativeRetirement, _OpenCodeSession, _one_turn, _open_session
+from oc_google.native_text import (NativeCliTextError, _Acp, _NativeRetirement,
+                                   _OpenCodeSession, _one_turn, _open_session, _start_gated)
 consent = runpy.run_path(str(Path(__file__).resolve().parent / "e2e/live/conftest.py"))
 public_driver = runpy.run_path(str(Path(__file__).resolve().parent / "e2e/live/google_public_shell_driver.py"))
 
@@ -25,6 +28,48 @@ def option(ident, current, choices):
 
 
 class NativeCliTextTest(unittest.TestCase):
+    def test_native_command_cannot_start_when_identity_commit_fails(self):
+        with TemporaryDirectory() as base:
+            root = Path(base) / "native"
+            root.mkdir(mode=0o700)
+            marker = Path(base) / "started"
+            retirement = _NativeRetirement(root)
+            original = retirement._persist
+            calls = 0
+
+            def persist():
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("synthetic identity commit failure")
+                original()
+
+            with (ExitStack() as clean,
+                  patch.object(retirement, "_persist", side_effect=persist),
+                  self.assertRaises(OSError)):
+                _start_gated(clean, retirement, "native-acp", ["/usr/bin/touch", str(marker)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            time.sleep(.05)
+            self.assertFalse(marker.exists())
+            receipt = json.loads((root / "native-cleanup.json").read_text())
+            self.assertEqual(receipt["actors"], [{"role": "native-acp", "state": "launch-pending"}])
+
+    def test_native_command_starts_after_identity_commit(self):
+        with TemporaryDirectory() as base:
+            root = Path(base) / "native"
+            root.mkdir(mode=0o700)
+            marker = Path(base) / "started"
+            retirement = _NativeRetirement(root)
+            with ExitStack() as clean:
+                child = _start_gated(clean, retirement, "native-acp", ["/usr/bin/touch", str(marker)],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                self.assertEqual(child.wait(timeout=2), 0)
+            self.assertTrue(marker.exists())
+            actor = json.loads((root / "native-cleanup.json").read_text())["actors"][0]
+            self.assertEqual((actor["state"], actor["pid"]), ("tracked", child.pid))
+
     def test_uncertain_native_retirement_keeps_private_actor_receipt(self):
         with TemporaryDirectory() as base:
             root = Path(base) / "native"
@@ -80,18 +125,22 @@ class NativeCliTextTest(unittest.TestCase):
                 raise LookupError("capture failed")
 
             def close(self):
-                pass
+                raise OSError("synthetic close failure")
 
         output = io.StringIO()
+        errors = io.StringIO()
         with (TemporaryDirectory() as base,
               patch.object(sys, "stdin", SimpleNamespace(isatty=lambda: False,
                                                         buffer=io.BytesIO(b"pytest approved public shell\n"))),
               patch("runpy.run_path", return_value={"Terminal": lambda _: Terminal()}),
               patch("pathlib.Path.home", return_value=Path(base)),
               redirect_stdout(output),
+              redirect_stderr(errors),
               self.assertRaisesRegex(RuntimeError, "primary synthetic failure")):
             public_driver["main"]()
         self.assertIn("Public Google shell failed: incomplete-shell; exit=None", output.getvalue())
+        self.assertIn("Public Google shell cleanup unverified: terminal-close", errors.getvalue())
+        self.assertNotIn("synthetic close failure", errors.getvalue())
 
     def test_failed_retirement_stays_unconfirmed_on_repeat(self):
         calls = []

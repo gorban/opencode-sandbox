@@ -114,10 +114,13 @@ checks the native exit status as well as its terminal output before releasing re
 If native retirement cannot be verified, the owner keeps its private ACP scratch and an
 actor-identity receipt; the retained shell placement links to that cleanup directory.
 Each native actor has a durable pending entry before launch, followed by a PID and
-start-time entry before that actor can proceed. A failed identity write leaves the
-pending entry visible for recovery.
+start-time entry before that actor can proceed. A fixed start gate holds the spawned
+PID until that commit is verified. A failed identity write leaves the pending entry
+visible for recovery and the native command never starts.
 The live test reports only fixed failure categories and a bounded exit code, without
 echoing terminal content. Failed terminal capture retains the original test failure.
+If fixture cleanup also fails, its fixed category is reported separately and the first
+failure remains primary.
 A later adapter
 will join the default multi-provider session after the account binding, spend journal,
 and original worker incarnation conditions below are qualified. The general route

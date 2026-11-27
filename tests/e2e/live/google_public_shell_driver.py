@@ -23,6 +23,7 @@ def main():
     run_id = None
     with tempfile.TemporaryDirectory(prefix=".oc-public-", dir=Path.home()) as root:
         term = fixture["Terminal"](Path(root))
+        primary_failed = False
         try:
             term.start("shell", str(source / "oc-sandbox"), "shell", "elgoog")
             screen = term.await_screen("shell", fixture["RUN_PATTERN"].search,
@@ -57,6 +58,7 @@ def main():
             term.await_screen("shell", lambda s: "Fixture exit 0" in s,
                               "shell cleanup", history=True, timeout=35)
         except BaseException:
+            primary_failed = True
             try:
                 screen = term.screen("shell", history=True)
             except Exception:
@@ -64,9 +66,21 @@ def main():
             print(failure_summary(screen), flush=True)
             raise
         finally:
-            term.close()
+            cleanup_failures = []
+            try:
+                term.close()
+            except BaseException:
+                cleanup_failures.append("terminal-close")
             if run_id:
-                fixture["wait_for_cleanup"](run_id)
+                try:
+                    fixture["wait_for_cleanup"](run_id)
+                except BaseException:
+                    cleanup_failures.append("run-retirement")
+            if cleanup_failures:
+                print("Public Google shell cleanup unverified: " + ", ".join(cleanup_failures),
+                      file=sys.stderr, flush=True)
+                if not primary_failed:
+                    raise RuntimeError("Public Google shell cleanup is unverified.")
     print("Public shell run directory retired.", flush=True)
     return 0
 
