@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
+import errno
 from enum import StrEnum
 import fcntl
 from hashlib import sha256
@@ -475,16 +476,23 @@ class _Slot:
                 os.unlink(temporary, dir_fd=self.directory.fd)
 
 
-def _acquire(fd):
+def _acquire(fd, *, authorized=None):
     deadline = time.monotonic() + _LOCK_TIME
     while True:
+        if authorized is not None and authorized() is not True:
+            raise RegistrationUnavailable("Google registration owner is unavailable")
+        if time.monotonic() >= deadline:
+            raise RegistrationUnavailable("Google registration is busy")
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
+        except OSError as error:
+            if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise RegistrationUnavailable("Google registration is busy") from None
-            time.sleep(.025)
+            time.sleep(min(.025, remaining))
 
 
 def _profile(pins, slot, generation, *, create=False):
@@ -1012,11 +1020,14 @@ class RegistrationJournal:
             raise RegistrationUnavailable("invalid Google registration label")
         self.label = label
 
+    def _registration_root(self, pins, create):
+        return _state_root(pins, create)
+
     @contextmanager
-    def _locked(self, *, create=False):
+    def _locked(self, *, create=False, authorized=None):
         with ExitStack() as pins:
             try:
-                root = _state_root(pins, create)
+                root = self._registration_root(pins, create)
                 registrations, _ = _child(pins, root, "registrations", create=create, private=True)
                 directory, new = _child(pins, registrations, self.label, create=create, private=True)
             except FileNotFoundError:
@@ -1037,7 +1048,7 @@ class RegistrationJournal:
                     os.fsync(directory.fd)
                 slot = _Slot(root, directory, fd, new)
                 slot.verify()
-                _acquire(fd)
+                _acquire(fd, authorized=authorized)
                 slot.verify()
                 if os.pread(fd, 1, 0):
                     raise RegistrationUnavailable("Google registration requires inspection after an interrupted write")
@@ -1073,10 +1084,10 @@ class RegistrationJournal:
             return enrolled
 
     @contextmanager
-    def _exact(self, enrollment, phase):
+    def _exact(self, enrollment, phase, *, authorized=None):
         if type(enrollment) is not Enrollment:
             raise RegistrationUnavailable("invalid Google enrollment")
-        with self._locked() as slot, ExitStack() as pins:
+        with self._locked(authorized=authorized) as slot, ExitStack() as pins:
             if slot is None:
                 raise RegistrationUnavailable("Google registration is unavailable")
             record = slot.fetch()
