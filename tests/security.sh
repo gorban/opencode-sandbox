@@ -214,7 +214,7 @@ EOF
 cat > "$B/tool" <<EOF
 #!/bin/sh
 # fake VS Code / Beyond Compare: record what it was given, optionally act like the agent or an edit
-for a in "\$@"; do case \$a in --*) ;; *)
+for a in "\$@"; do case \$a in --*|-solo) ;; *)
   printf '%s\n' "\$a" >> $T/tool.args
   if [ -f "\$a" ]; then cat "\$a" >> $T/tool.seen; elif [ -d "\$a" ]; then find "\$a" >> $T/tool.seen; cat \$(find "\$a" -type f) >> $T/tool.seen 2>/dev/null; fi
   [ -n "\${FAKE_AGENT:-}" ] && sh -c "\$FAKE_AGENT"
@@ -227,6 +227,7 @@ esac; done; exit 0
 EOF
 chmod +x "$B/launch" "$B/tool"
 export OC_SB=$SB OC_BRIDGE_STAGE=$T/stage OC_CODE_BIN=$B/tool OC_BCOMPARE_BIN=$B/tool OC_BRIDGE_LAUNCH=$B/launch
+export OC_BRIDGE_BLOCKING_TOOLS=code,bcompare
 req() { local id=$1; shift; printf '%s\n' "$@" > "$SB/.bridge/requests/$id.req"; }
 bridge() { timeout 20 python3 -I "$BRIDGE" 2>>"$T/bridge.log"; }
 victim_ok() { [[ "$(cat "$V/secret" "$V/requests/precious" "$V/f")" == "$SECRET"$'\n'"$SECRET"$'\n'"$SECRET" ]]; }
@@ -248,7 +249,9 @@ check 'workspace definitions and oversized requests never reach the host editor'
 check 'bridge drains rejected requests' [ -z "$(ls -A "$SB/.bridge/requests")" ]
 req failed-launch code /sandbox/construct/a.txt
 OC_BRIDGE_LAUNCH=/usr/bin/false bridge
-check 'known editor launch failure reclaims its staging directory' [ -z "$(ls -A "$T/stage")" ]
+check 'uncertain session submission keeps the stage private' test -n "$(ls -A "$T/stage")"
+find "$T/stage" -type f -delete
+find "$T/stage" -mindepth 1 -type d -depth -delete
 
 reset_tool; req 2 code /sandbox/construct/dir /etc/passwd /sandbox/../victim/secret \
   /sandbox/construct/link/secret /sandbox/construct/./a.txt; bridge
@@ -278,8 +281,35 @@ for (( batch=0; batch<6; batch++ )); do bridge; done
 check 'queue backlog drains in bounded batches' [ -z "$(ls -A "$SB/.bridge/requests")" ]
 reset_tool; req after-backlog code /sandbox/construct/a.txt; bridge
 check 'bridge still handles requests after backlog' test -s "$T/tool.args"
-check 'bridge units pace bounded batches without tripping the start limits' bash -c \
-  'grep -qF "ExecStartPre=/usr/bin/sleep 1" "$1" && grep -qF "StartLimitIntervalSec=0" "$1" && grep -qF "TriggerLimitIntervalSec=0" "$1"' _ "$SCRIPT"
+check 'bridge timer starts and rearms without following a sandbox path' bash -c \
+  'grep -qxF "OnActiveSec=2s" "$1" && grep -qxF "OnUnitInactiveSec=2s" "$1" &&
+   grep -qxF "AccuracySec=100ms" "$1" && ! grep -qF "DirectoryNotEmpty=" "$1"' _ "$SCRIPT"
+
+missing_editor_reclaims_slots() {
+  local entry remaining
+  for (( entry=1; entry<=9; entry++ )); do
+    req "missing-editor-$entry" code /sandbox/construct/a.txt
+    OC_CODE_BIN="$B/not-installed" OC_BRIDGE_LAUNCH="$B/submit" bridge
+  done
+  remaining=$(ls -A "$T/stage")
+  if [[ -n $remaining ]]; then
+    find "$T/stage" -type f -delete
+    find "$T/stage" -mindepth 1 -type d -depth -delete
+    return 1
+  fi
+  reset_tool
+  req after-missing-editor code /sandbox/construct/a.txt
+  bridge && test -s "$T/tool.args"
+}
+cat > "$B/submit" <<'EOF'
+#!/bin/sh
+# Simulate successful transient submission regardless of the service's later exit.
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+shift
+"$@" || :
+EOF
+chmod +x "$B/submit"
+check 'nine missing editor launches do not retain never-opened slots' missing_editor_reclaims_slots
 
 mv "$SB/.bridge" "$T/bridge.real"; ln -s ../victim "$SB/.bridge"     # $SB/.bridge -> $V (has requests/)
 bridge
@@ -373,7 +403,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 bridge_path, scratch = sys.argv[1:]
 base, edit = b"before", b"host edit with more bytes"
@@ -503,7 +533,7 @@ class CopyTests(unittest.TestCase):
         self.assertEqual(errors.getvalue().count("must share a mount"), 1)
         self.assertEqual(errors.getvalue().count(str(session)), 1)
 
-    def test_abandoned_prepared_save_expires_with_session(self):
+    def test_abandoned_prepared_save_is_retained(self):
         session, staged = self.stage()
 
         def editor(*args, **kwargs):
@@ -516,12 +546,82 @@ class CopyTests(unittest.TestCase):
             self.bridge["run_session"](str(session))
         self.assertEqual(len(list(session.glob(".oc-bridge-*"))), 1)
         os.utime(session, (1, 1))
-        self.bridge["expire_stage"]()
-        self.assertEqual(list(session.parent.iterdir()), [])
+        self.bridge["process_queue"]()
+        self.assertEqual(list(session.parent.iterdir()), [session])
 
-    def sync(self, session):
+    def test_forwarding_editor_exit_retains_edits(self):
+        session, staged = self.stage()
+
+        def forward(*_args, **_options):
+            staged.write_bytes(edit)
+            return SimpleNamespace(poll=lambda: 0)
+
+        with patch.dict(self.bridge, BLOCKING_TOOLS=frozenset()), patch("subprocess.Popen", side_effect=forward):
+            self.bridge["run_session"](str(session))
+        self.assert_preserved(staged)
+        self.assertFalse((session / "recovery").exists())
+
+    def test_finished_recovery_does_not_consume_active_capacity(self):
+        session, staged = self.stage()
+
+        def editor(*_args, **_options):
+            staged.write_bytes(edit)
+            return SimpleNamespace(poll=lambda: 0)
+
+        with patch("subprocess.Popen", side_effect=editor), \
+                patch.object(os, "rename", side_effect=OSError(errno.EXDEV, "fixture")):
+            self.bridge["run_session"](str(session))
+        with patch.dict(self.bridge, MAX_STAGE_SESSIONS=1, MAX_RETAINED_SESSIONS=2):
+            try:
+                self.stage()
+            except self.bridge["OverBudget"]:
+                self.fail("closed recovery consumed the active staging allowance")
+            with self.assertRaises(self.bridge["OverBudget"]):
+                self.stage()
+        self.assert_preserved(staged)
+
+    def test_unreadable_snapshot_entries_produce_one_batch_diagnostic(self):
+        sandbox = self.target.parent
+        queue = sandbox / ".bridge" / "requests"
+        queue.mkdir(parents=True)
+        (queue / "snapshot.req").write_text("bcompare\n/sandbox/tree\n", encoding="utf-8")
+        tree = sandbox / "tree"
+        tree.mkdir()
+        for number in range(50):
+            (tree / f"unreadable-{number}.txt").write_text("fixture", encoding="utf-8")
+        inspect = os.stat
+
+        def unreadable(path, *args, **kwargs):
+            if isinstance(path, str) and path.startswith("unreadable-"):
+                raise PermissionError("fixture")
+            return inspect(path, *args, **kwargs)
+
+        errors = StringIO()
+        with patch.object(os, "stat", side_effect=unreadable), patch("subprocess.run"), patch.object(sys, "stderr", errors):
+            self.bridge["process_queue"]()
+        self.assertEqual(errors.getvalue().splitlines(), ["oc-bridge: bridge batch: 50 snapshot entries"])
+
+    def test_write_back_diagnostics_are_bounded_and_escape_paths(self):
+        original = self.target.rename(self.target.with_name("ordinary\tname.txt"))
+        session = Path(self.bridge["stage_request"]("code", ["/sandbox/" + original.name]))
+        staged = session / "files" / original.name
+        staged.write_bytes(edit)
+        errors = StringIO()
         with (session / "manifest.json").open() as manifest:
             entry = json.load(manifest)["entries"][0]
+        failure = Mock(side_effect=PermissionError("fixture\tmessage"))
+        with patch.dict(self.bridge, write_back=failure), patch.object(sys, "stderr", errors):
+            for _ in range(30):
+                self.assertFalse(self.sync(session, entry))
+        report = errors.getvalue()
+        self.assertIn(r"ordinary\tname.txt", report)
+        self.assertNotIn("\t", report)
+        self.assertEqual(report.count("write-back of"), 1)
+
+    def sync(self, session, entry=None):
+        if entry is None:
+            with (session / "manifest.json").open() as manifest:
+                entry = json.load(manifest)["entries"][0]
         session_fd = os.open(session, os.O_RDONLY | os.O_DIRECTORY)
         try:
             files_fd = os.open("files", os.O_RDONLY | os.O_DIRECTORY, dir_fd=session_fd)
@@ -935,6 +1035,26 @@ out=$(del -d)
 check "bare -d still removes every instance pod"        grep -qx 'podman pod rm --ignore -f -- oc-other' <<<"$out"
 check 'bare -d stops the active bridge service' grep -qx 'systemctl --user stop oc-bridge.service' <<<"$out"
 DSTATE=$T/dhome/.local/share/oc-sandbox
+mkdir -m 700 -p "$DSTATE/bridge-stage/retained"
+printf 'private edit\n' > "$DSTATE/bridge-stage/retained/save.txt"
+out=$(pathrun -- -d)
+check 'global teardown refuses a retained bridge session before removing pods' \
+  grep -q 'staged editor sessions remain' <<<"$out"
+check 'retained session prevents Podman removals' ! grep -q 'podman pod rm' "$T/stub.log"
+check 'global teardown keeps the retained edit' grep -qx 'private edit' "$DSTATE/bridge-stage/retained/save.txt"
+legacy_unit="$T/dhome/.config/systemd/user/oc-bridge.path"
+printf '[Unit]\nDescription=Legacy bridge fixture\n' > "$legacy_unit"
+out=$(pathrun OC_CHROMIUM_MODE=headless OC_OPENCODE_VERSION=keep -- -n)
+check 'legacy watcher migration refuses while an old stage can have a live runner' \
+  grep -q 'staged editor sessions remain' <<<"$out"
+check 'blocked migration keeps the old unit file' test -f "$legacy_unit"
+check 'blocked migration stops the drain before returning' \
+  grep -qx 'systemctl --user stop oc-bridge.service' "$T/stub.log"
+check 'blocked migration does not activate a new trigger' \
+  ! grep -qE 'systemctl --user (enable --now|start) oc-bridge\.timer' "$T/stub.log"
+unlink "$legacy_unit"
+unlink "$DSTATE/bridge-stage/retained/save.txt"
+rmdir "$DSTATE/bridge-stage/retained"
 for fault in STUB_LIST_PODS_FAIL STUB_POD_REMOVE_FAIL STUB_POD_REMAINS STUB_BRIDGE_STAYS_ACTIVE; do
   mkdir -p "$DSB/.bridge" "$DSTATE/build"
   : > "$DSB/.bridge/keep"

@@ -54,6 +54,12 @@ Git documents [merge tool selection](https://git-scm.com/docs/git-mergetool) and
 
 ## Review record
 
+- [x] Make the existing bridge poll its request spool without following sandbox paths from systemd.
+      Keep uncertain sessions and closed recovery files private, bound staging traffic and quote
+      save diagnostics. Quiesce the bridge and hold global teardown or legacy migration when
+      a retained session needs attention. Design review cleared
+      `5dc97f63f8dec1b85367cb4efb3484f9197773f183376d2515ff278bb84713a2`
+      for `codex/audit-bridge-lifecycle`.
 - `oc-sandbox reviewer` cleared the three-way design and tool selector at SHA-256
   `f302a6ba7f6db3845aaac1ccf9f74637885cd3108693f267577676788fa25c8b`.
 - Independent and external reviewers cleared the offline core at `98b86bf` and the

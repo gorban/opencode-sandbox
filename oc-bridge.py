@@ -22,6 +22,7 @@ Modes:  oc-bridge                 process the request queue (oc-bridge.service)
 """
 import errno
 import fcntl
+from collections import Counter
 from itertools import islice
 import json
 import os
@@ -38,7 +39,9 @@ STAGE = os.environ.get("OC_BRIDGE_STAGE", os.path.expanduser("~/.local/share/oc-
 TOOLS = {"code": os.environ.get("OC_CODE_BIN", ""), "bcompare": os.environ.get("OC_BCOMPARE_BIN", "")}
 LAUNCH = os.environ.get("OC_BRIDGE_LAUNCH", "systemd-run --user --quiet --collect").split()
 SELINUX_LEVEL = os.environ.get("OC_BRIDGE_SELINUX_LEVEL")
-CONFIG_VARS = ("OC_SB", "OC_BRIDGE_STAGE", "OC_CODE_BIN", "OC_BCOMPARE_BIN", "OC_BRIDGE_SELINUX_LEVEL")
+BLOCKING_TOOLS = frozenset(os.environ.get("OC_BRIDGE_BLOCKING_TOOLS", "").split(","))
+CONFIG_VARS = ("OC_SB", "OC_BRIDGE_STAGE", "OC_CODE_BIN", "OC_BCOMPARE_BIN",
+               "OC_BRIDGE_SELINUX_LEVEL", "OC_BRIDGE_BLOCKING_TOOLS")
 
 MAX_REQUESTS = 20         # per run
 MAX_QUEUE_SCAN = 256
@@ -50,7 +53,8 @@ MAX_TREE_FILES = 5000     # per directory snapshot (bcompare only)
 MAX_TREE_DEPTH = 64
 MAX_SESSION_BYTES = 512 << 20
 MAX_STAGE_SESSIONS = 8
-STAGE_MAX_AGE = 7 * 86400
+MAX_RETAINED_SESSIONS = 16
+RECOVERY_MARKER = "recovery"
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -60,11 +64,27 @@ def log(msg):
     print(f"oc-bridge: {msg}", file=sys.stderr, flush=True)
 
 
+def quoted(value):
+    value = str(value)
+    return ascii(value[:256]) + (" (truncated)" if len(value) > 256 else "")
+
+
+def once_per_file(entry, key, message):
+    count = entry.get(key, 0)
+    entry[key] = count + 1
+    if not count:
+        log(message)
+
+
 class Refused(Exception):
     pass
 
 
 class OverBudget(Refused):
+    pass
+
+
+class StageCapacity(OverBudget):
     pass
 
 
@@ -226,8 +246,8 @@ def snapshot_entry(src_fd, dst_fd, name, budget, depth):
                 os.close(fd)
     except OverBudget:
         raise
-    except (OSError, Refused) as e:
-        log(f"snapshot: skipped {name!r}: {e}")
+    except (OSError, Refused):
+        budget["refusals"]["snapshot entries"] += 1
 
 
 def copy_into_session(source, directory, name, budget, mode=0o600):
@@ -241,9 +261,9 @@ def reserve_session():
     stage_fd = os.open(STAGE, DIR_FLAGS)
     try:
         fcntl.flock(stage_fd, fcntl.LOCK_EX)
-        with os.scandir(stage_fd) as contents:
-            if sum(entry.is_dir(follow_symlinks=False) for entry in contents) >= MAX_STAGE_SESSIONS:
-                raise OverBudget("too many staged editor sessions")
+        active, total = count_sessions(stage_fd)
+        if active >= MAX_STAGE_SESSIONS or total >= MAX_RETAINED_SESSIONS:
+            raise StageCapacity("bridge session capacity reached")
         sid = time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(4)
         os.mkdir(sid, 0o700, dir_fd=stage_fd)
         return os.path.join(STAGE, sid)
@@ -251,18 +271,45 @@ def reserve_session():
         os.close(stage_fd)
 
 
+def count_sessions(stage_fd):
+    active = total = 0
+    with os.scandir(stage_fd) as entries:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                total += 1
+                active += not is_closed_recovery(stage_fd, entry.name)
+                if active >= MAX_STAGE_SESSIONS or total >= MAX_RETAINED_SESSIONS:
+                    break
+    return active, total
+
+
+def is_closed_recovery(stage_fd, name):
+    try:
+        session_fd = open_dirs(stage_fd, [name])
+        try:
+            fd, st = open_regular(session_fd, RECOVERY_MARKER)
+            os.close(fd)
+            return st.st_uid == os.geteuid() and st.st_nlink == 1 and (
+                stat.S_IMODE(st.st_mode) == 0o600 and st.st_size == 0
+            )
+        finally:
+            os.close(session_fd)
+    except (Refused, OSError):
+        return False
+
+
 def code_workspace(tool, leaf):
     return tool == "code" and leaf.casefold().endswith(".code-workspace")
 
 
-def stage_request(tool, paths):
+def stage_request(tool, paths, refusals=None):
     if tool not in TOOLS:
         raise Refused(f"unknown tool {tool!r}")
     if not TOOLS[tool]:
         raise Refused(f"{tool} is not configured")
     session = reserve_session()
     try:
-        entries = stage_files(session, tool, paths)
+        entries = stage_files(session, tool, paths, Counter() if refusals is None else refusals)
         if entries:
             with open(os.path.join(session, "manifest.json"), "x") as f:
                 json.dump({"tool": tool, "entries": entries}, f)
@@ -274,8 +321,8 @@ def stage_request(tool, paths):
     return None
 
 
-def stage_files(session, tool, paths):
-    budget = {"files": MAX_TREE_FILES, "bytes": MAX_SESSION_BYTES}
+def stage_files(session, tool, paths, refusals):
+    budget = {"files": MAX_TREE_FILES, "bytes": MAX_SESSION_BYTES, "refusals": refusals}
     entries, root = [], open_root()
     try:
         base = os.open(session, DIR_FLAGS)
@@ -324,8 +371,8 @@ def stage_files(session, tool, paths):
                     os.close(parent)
             except OverBudget:
                 raise
-            except (Refused, OSError) as e:
-                log(f"{tool}: skipped {sp!r}: {e}")
+            except (Refused, OSError):
+                refusals["selections"] += 1
     finally:
         os.close(base)
         os.close(root)
@@ -388,7 +435,8 @@ def publish_save(entry, parent, stage, tmp, prepared):
     if unchanged:
         entry["target"] = prepared
     else:
-        log(f"{'/'.join(parts)} changed in the sandbox; saved your edit as {dest}")
+        once_per_file(entry, "_diversions",
+                      f"{quoted('/'.join(parts))} changed in the sandbox; saved your edit as {quoted(dest)}")
 
 
 def open_staged_file(files_fd, parts):
@@ -423,7 +471,7 @@ def sync(session_fd, files_fd, entries, cross_mounts):
             if isinstance(err, CrossMount):
                 cross_mounts.add(key)
             complete = False
-            log(f"write-back of {'/'.join(parts)} failed: {err}")
+            once_per_file(entry, "_write_failures", f"write-back of {quoted('/'.join(parts))} failed: {quoted(err)}")
         finally:
             os.close(src_fd)
     return complete
@@ -495,30 +543,67 @@ def staged_arguments(session, files_fd, entries):
 
 
 def run_session(session):
-    real = os.path.realpath(session)
-    if os.path.dirname(real) != os.path.realpath(STAGE):
+    stage = os.path.realpath(STAGE)
+    real = os.path.abspath(session)
+    if os.path.dirname(real) != stage:
         raise Refused("session directory is not in the stage directory")
-    session_fd = os.open(real, DIR_FLAGS)
+    stage_fd = os.open(stage, DIR_FLAGS)
     try:
-        tool, entries = read_session_manifest(session_fd)
-        files_fd = open_dirs(session_fd, ["files"])
+        name = os.path.basename(real)
+        session_fd = open_dirs(stage_fd, [name])
         try:
-            staged = staged_arguments(real, files_fd, entries)
-            options = ["--wait", "--"] if tool == "code" else []
-            proc = subprocess.Popen([TOOLS[tool], *options, *staged], stdin=subprocess.DEVNULL)
-            cross_mounts = set()
-            while proc.poll() is None:
-                time.sleep(1)
-                sync(session_fd, files_fd, entries, cross_mounts)
-            complete = sync(session_fd, files_fd, entries, cross_mounts)
+            retire = run_staged_editor(real, session_fd)
+            if retire:
+                expected = os.fstat(session_fd)
+                observed = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+                if (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino):
+                    raise Refused("staged editor session changed before cleanup")
+                shutil.rmtree(name, dir_fd=stage_fd)
         finally:
-            os.close(files_fd)
+            os.close(session_fd)
     finally:
-        os.close(session_fd)
-    if complete:
-        shutil.rmtree(real, ignore_errors=True)
-    else:
-        log(f"could not copy all staged saves back; recover them in {real!r}")
+        os.close(stage_fd)
+
+
+def run_staged_editor(real, session_fd):
+    tool, entries = read_session_manifest(session_fd)
+    files_fd = open_dirs(session_fd, ["files"])
+    try:
+        staged = staged_arguments(real, files_fd, entries)
+        options = ["--wait", "--"] if tool == "code" else ["-solo"]
+        try:
+            proc = subprocess.Popen([TOOLS[tool], *options, *staged], stdin=subprocess.DEVNULL)
+        except (FileNotFoundError, PermissionError):
+            log(f"{tool}: editor could not start")
+            return True
+        cross_mounts = set()
+        while (status := proc.poll()) is None:
+            time.sleep(1)
+            sync(session_fd, files_fd, entries, cross_mounts)
+        if status != 0 or tool not in BLOCKING_TOOLS:
+            report_repeated_saves(entries)
+            log(f"{tool}: editor completion is unverified; staged files remain in {real!r}")
+            return False
+        complete = sync(session_fd, files_fd, entries, cross_mounts)
+        report_repeated_saves(entries)
+        if not complete:
+            mark_recovery(session_fd)
+            log(f"could not copy all staged saves back; recover them in {real!r}")
+        return complete
+    finally:
+        os.close(files_fd)
+
+
+def mark_recovery(session_fd):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    os.close(os.open(RECOVERY_MARKER, flags, 0o600, dir_fd=session_fd))
+
+
+def report_repeated_saves(entries):
+    failures = sum(max(0, entry.get("_write_failures", 0) - 1) for entry in entries)
+    diversions = sum(max(0, entry.get("_diversions", 0) - 1) for entry in entries)
+    if failures or diversions:
+        log(f"repeated save diagnostics: {failures} write failures, {diversions} diversions")
 
 
 # ---- queue -------------------------------------------------------------------------------------
@@ -567,18 +652,7 @@ def read_request(q, name):
     return lines[0], [line for line in lines[1:] if line]
 
 
-def expire_stage():
-    try:
-        now = time.time()
-        for e in os.scandir(STAGE):
-            if e.is_dir(follow_symlinks=False) and now - e.stat(follow_symlinks=False).st_mtime > STAGE_MAX_AGE:
-                shutil.rmtree(e.path, ignore_errors=True)
-    except FileNotFoundError:
-        pass
-
-
 def process_queue():
-    expire_stage()
     root = open_root()
     try:
         bridge = open_queue_dir(root, ".bridge")
@@ -600,29 +674,35 @@ def process_queue():
 def drain_queue(bridge, q):
     with os.scandir(q) as contents:
         names = sorted(entry.name for entry in islice(contents, MAX_QUEUE_SCAN))
+    refusals = Counter()
     try:
         for name in [n for n in names if n.endswith(".req")][:MAX_REQUESTS]:
             try:
                 tool, paths = read_request(q, name)
-                session = stage_request(tool, paths)
+                session = stage_request(tool, paths, refusals)
                 if session:
                     launch_session(session)
-            except (Refused, OSError, subprocess.CalledProcessError) as e:
-                log(f"request {name!r} ignored: {e}")
+            except subprocess.CalledProcessError:
+                refusals["unverified submissions"] += 1
+            except StageCapacity:
+                refusals["requests over staging capacity"] += 1
+            except (Refused, OSError):
+                refusals["requests"] += 1
     finally:
         for name in names:
             unlink_entry(bridge, q, name)
+    if refusals:
+        log("bridge batch: " + ", ".join(f"{count} {reason}" for reason, count in sorted(refusals.items())))
+    if refusals["requests over staging capacity"]:
+        log(f"close editors or recover retained files in {STAGE!r} before retrying")
 
 
 def launch_session(session):
     # The transient unit does not inherit our environment.
     setenv = [f"--setenv={k}={os.environ[k]}" for k in CONFIG_VARS if k in os.environ]
-    try:
-        subprocess.run([*LAUNCH, *setenv, "--", sys.executable, "-I", os.path.realpath(__file__),
-                        "session", session], check=True, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.CalledProcessError):
-        shutil.rmtree(session, ignore_errors=True)
-        raise
+    subprocess.run([*LAUNCH, *setenv, "--", sys.executable, "-I", os.path.realpath(__file__),
+                    "session", session], check=True, stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":
@@ -630,7 +710,7 @@ if __name__ == "__main__":
         try:
             run_session(sys.argv[2])
         except (Refused, OSError) as exc:
-            log(f"session refused: {exc}")
+            log(f"session refused: {quoted(exc)}")
             sys.exit(2)
     elif len(sys.argv) == 1:
         process_queue()
