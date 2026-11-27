@@ -25,12 +25,15 @@ AUTH_URL = f"https://{AUTHORITY}{AUTH_PATH}"
 CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 SCOPES = frozenset(f"https://www.googleapis.com/auth/{name}"
                    for name in ("cloud-platform", "userinfo.email", "aicode"))
+_BROWSER_SCOPES = SCOPES | {"email", "openid"}
+_ISSUER = f"https://{AUTHORITY}"
 _PARAMETERS = {"client_id": CLIENT_ID, "response_type": "code", "code_challenge_method": "S256",
                "access_type": "offline", "prompt": "consent"}
 _FIELDS = _PARAMETERS.keys() | {"scope", "redirect_uri", "state", "code_challenge"}
 _PRIVATE_PORTS = {9222, *range(8401, 8417)}
 _LIMIT = 8192
 _FIELDS_LIMIT = 24
+_CALLBACK_FIELDS_LIMIT = 6
 _CALLBACK_SECONDS = 2
 _STATE = re.compile(r"[A-Za-z0-9_-]{30}")
 _CHALLENGE = re.compile(r"[A-Za-z0-9_-]{43}")
@@ -39,7 +42,7 @@ _AUTHUSER = re.compile(r"[0-9]{1,3}")
 _ERROR_DESCRIPTION_LIMIT = 256
 _BAD_ESCAPE = re.compile(rb"%(?![0-9a-fA-F]{2})")
 _SUCCESS_FIELDS = {"state", "code"}
-_SUCCESS_METADATA = {"scope", "authuser", "prompt"}
+_SUCCESS_METADATA = {"iss", "scope", "authuser", "prompt"}
 _DENIAL_FIELDS = {"state", "error"}
 _HEADERS = frozenset({
     b"host", b"accept", b"accept-encoding", b"accept-language", b"cache-control", b"connection",
@@ -86,9 +89,9 @@ def _query_fields(query, count):
     return fields
 
 
-def _exact_scopes(value):
+def _exact_scopes(value, expected=SCOPES):
     scopes = value.split(" ")
-    return len(scopes) == len(SCOPES) and set(scopes) == SCOPES
+    return len(scopes) == len(expected) and set(scopes) == expected
 
 
 def _canonical_challenge(value):
@@ -165,8 +168,8 @@ def _decode_component(raw):
 
 
 def _callback_fields(query):
-    pairs = query.split(b"&", 5)
-    if len(pairs) > 5:
+    pairs = query.split(b"&", _CALLBACK_FIELDS_LIMIT)
+    if len(pairs) > _CALLBACK_FIELDS_LIMIT:
         raise Refused("too many callback parameters")
     fields = {}
     for pair in pairs:
@@ -220,6 +223,12 @@ def _safe_description(value):
     return 0 < len(value.encode("utf-8")) <= _ERROR_DESCRIPTION_LIMIT and value.isprintable()
 
 
+def _callback_scopes(parameters):
+    scope = parameters.get("scope")
+    return (scope is None or _exact_scopes(scope)
+            or (parameters.get("iss") == _ISSUER and _exact_scopes(scope, _BROWSER_SCOPES)))
+
+
 def parse_callback(head, port):
     _validate_port(port)
     if type(head) is not bytes or len(head) > _LIMIT - 4:
@@ -248,13 +257,15 @@ def parse_callback(head, port):
     state = parameters.get("state", "")
     if not _STATE.fullmatch(state):
         raise Refused("invalid callback state")
+    if "iss" in parameters and parameters["iss"] != _ISSUER:
+        raise Refused("invalid callback issuer")
     if _SUCCESS_FIELDS <= parameters.keys() <= _SUCCESS_FIELDS | _SUCCESS_METADATA:
         if (_CODE.fullmatch(parameters["code"])
-                and ("scope" not in parameters or _exact_scopes(parameters["scope"]))
+                and _callback_scopes(parameters)
                 and _AUTHUSER.fullmatch(parameters.get("authuser", "0"))
                 and parameters.get("prompt", "none") in {"consent", "none"}):
             return Callback(state, parameters["code"])
-    if (_DENIAL_FIELDS <= parameters.keys() <= _DENIAL_FIELDS | {"error_description"}
+    if (_DENIAL_FIELDS <= parameters.keys() <= _DENIAL_FIELDS | {"iss", "error_description"}
             and parameters["error"] == "access_denied"
             and _safe_description(parameters.get("error_description", "denied"))):
         return Callback(state, None)

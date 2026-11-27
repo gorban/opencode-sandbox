@@ -17,6 +17,10 @@ from oc_google import auth_offer as auth
 STATE = "a" * 29 + "B"
 CHALLENGE = "A" * 43
 CODE = "4/synthetic_test-code"
+ISSUER = "https://accounts.google.com"
+ORIGINAL_SCOPES = " ".join(sorted(auth.SCOPES))
+OBSERVED_SCOPES = ORIGINAL_SCOPES + " email openid"
+OBSERVED_QUERY = "&" + urlencode({"iss": ISSUER, "scope": OBSERVED_SCOPES, "authuser": "1", "prompt": "consent"})
 
 
 def offer(port, **changes):
@@ -109,6 +113,7 @@ class OfferTest(unittest.TestCase):
             offer(port, redirect_uri=auth.redirect_uri(port + 1)),
             offer(port, scope=" ".join(sorted(auth.SCOPES) + [next(iter(auth.SCOPES))])),
             offer(port, scope=next(iter(auth.SCOPES))),
+            offer(port, scope=OBSERVED_SCOPES),
             offer(port, prompt="none"), offer(port, client_id="other-public-client"),
             offer(port, access_type="online"), offer(port, response_type="token"),
             offer(port, state=STATE + "x"), offer(port, state=STATE[:-1] + "\x00"),
@@ -222,6 +227,23 @@ class CallbackGateTest(unittest.TestCase):
                 self.assert_no_native_bytes(recorder)
                 self.assertEqual(gate.outcome, auth.Outcome.FORWARDED)
 
+    def test_observed_browser_envelope_forwards_only_canonical_state_and_code(self):
+        for suffix in (
+            OBSERVED_QUERY,
+            "&iss=" + ISSUER + "&scope=" + quote(OBSERVED_SCOPES) + "&authuser=1&prompt=consent",
+            "&" + urlencode({"iss": ISSUER, "scope": " ".join(reversed(OBSERVED_SCOPES.split(" "))),
+                              "authuser": "1", "prompt": "consent"}),
+            "&iss=" + ISSUER,
+            "&iss=" + ISSUER + "&scope=" + quote(ORIGINAL_SCOPES),
+        ):
+            with self.subTest(suffix=suffix), placement() as (gate, recorder, port):
+                browser = self.exchange(gate, port, request(port, extra_query=suffix))
+                self.assertEqual(browser, auth.acknowledgement(True))
+                recorder.settimeout(1)
+                self.assertEqual(recorder.recv(4096), request(port))
+                self.assertEqual(gate.take_forwarded(), auth.Callback(STATE, CODE))
+                self.assert_no_native_bytes(recorder)
+
     def test_owner_can_take_forwarded_fields_only_once(self):
         with placement() as (gate, _, port), ThreadPoolExecutor(max_workers=2) as workers:
             self.assertIsNone(gate.take_forwarded())
@@ -288,6 +310,26 @@ class CallbackGateTest(unittest.TestCase):
             {"extra_query": "&scope=" + quote(scopes + " " + next(iter(auth.SCOPES)))},
             {"extra_query": "&scope=" + quote(next(iter(auth.SCOPES)))},
             {"extra_query": "&scope=" + quote(scopes + " unknown")},
+            {"extra_query": "&scope=" + quote(OBSERVED_SCOPES)},
+            {"extra_query": "&iss=" + ISSUER + "&scope=" + quote(scopes + " email")},
+            {"extra_query": "&iss=" + ISSUER + "&scope=" + quote(scopes + " openid")},
+            {"extra_query": "&iss=" + ISSUER + "&scope=" + quote(OBSERVED_SCOPES + " email")},
+            {"extra_query": "&iss=" + ISSUER + "&scope=" + quote(OBSERVED_SCOPES + " unknown")},
+            {"extra_query": "&iss=" + ISSUER + "&scope=" + quote("email openid")},
+            {"extra_query": "&iss=" + ISSUER + "&scope=" + quote(scopes + " email openid ")},
+            {"extra_query": "&iss=&scope=" + quote(OBSERVED_SCOPES)},
+            {"extra_query": "&iss=https://other.example&scope=" + quote(OBSERVED_SCOPES)},
+            {"extra_query": "&iss=http://accounts.google.com"},
+            {"extra_query": "&iss=https://accounts.google.com/"},
+            {"extra_query": "&iss=accounts.google.com"},
+            {"extra_query": "&iss=https%3A%2F%2Faccounts.google.com%00"},
+            {"extra_query": "&iss=%ff"},
+            {"extra_query": "&iss=" + ISSUER + "&%69ss=" + ISSUER},
+            {"extra_query": "&iss=" + ISSUER + "&iss=https://other.example"},
+            {"extra_query": "&scope=" + quote(scopes) + "&scope=" + quote(OBSERVED_SCOPES)},
+            {"extra_query": OBSERVED_QUERY + "&hd=workspace.example"},
+            {"extra_query": OBSERVED_QUERY + "&error=access_denied"},
+            {"extra_query": OBSERVED_QUERY + "&unknown=seventh"},
             {"extra_query": "&authuser=1234"},
             {"extra_query": "&authuser=%D9%A1"},
             {"extra_query": "&authuser=1+2"},
@@ -295,6 +337,9 @@ class CallbackGateTest(unittest.TestCase):
             {"extra_query": "&prompt=consent&prompt=none"},
             {"extra_query": "&error=access_denied"},
             {"code": None, "extra_query": "&scope=" + quote(scopes)},
+            {"code": None, "extra_query": "&iss=https://other.example"},
+            {"code": None, "extra_query": "&iss=" + ISSUER + "&iss=" + ISSUER},
+            {"code": None, "extra_query": "&iss=" + ISSUER + "&scope=" + quote(OBSERVED_SCOPES)},
             {"code": None, "extra_query": "&error_description=" + "a" * 257},
             {"code": None, "extra_query": "&error_description=denied%0D%0Aignored"},
             {"code": None, "extra_query": "&error_description=%E2%80%8B"},
@@ -323,7 +368,8 @@ class CallbackGateTest(unittest.TestCase):
 
     def test_denial_is_consumed_with_no_forward_and_ack_is_static(self):
         for suffix in ("", "&error_description=The%20operator%20declined%2E",
-                       "&error_description=" + quote("Autorización cancelada.")):
+                       "&error_description=" + quote("Autorización cancelada."),
+                       "&iss=" + ISSUER, "&" + urlencode({"iss": ISSUER, "error_description": "Operator declined."})):
             with self.subTest(suffix=suffix), placement() as (gate, recorder, port):
                 declined = self.exchange(gate, port, request(port, code=None, extra_query=suffix))
                 replay = self.exchange(gate, port, request(port))
@@ -335,6 +381,7 @@ class CallbackGateTest(unittest.TestCase):
                 for reply in (declined, replay):
                     self.assertNotIn(STATE.encode(), reply)
                     self.assertNotIn(CODE.encode(), reply)
+                    self.assertNotIn(ISSUER.encode(), reply)
                     self.assertNotIn(b"operator declined", reply)
                     self.assertNotIn(b"Location:", reply)
                     self.assertIn(b"Cache-Control: no-store\r\n", reply)
@@ -350,7 +397,8 @@ class CallbackGateTest(unittest.TestCase):
                         gate.revoke()
                     else:
                         alive.clear()
-                    self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
+                    self.assertEqual(self.exchange(gate, port, request(port, extra_query=OBSERVED_QUERY)),
+                                     auth.acknowledgement(False))
                     self.assertEqual(gate.outcome, auth.Outcome.CANCELLED)
                     self.assert_no_native_bytes(recorder)
 

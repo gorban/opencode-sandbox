@@ -24,6 +24,13 @@ PACKAGE_FILES = ("oc_google", "oc_orchestrator", "oc_providers")
 AUTH_URL = rb"https://accounts\.google\.com/o/oauth2/v2/auth\?[^\r\n ]+"
 VENDOR_FILES = ("agy_acp_server.par", "localharness_external")
 STEPS = ("TOKEN", "USERINFO", "LOAD_CODE_ASSIST", "TOKEN", "USERINFO", "LOAD_CODE_ASSIST", "FETCH_AVAILABLE_MODELS")
+BROWSER_SCOPE = " ".join((
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/aicode",
+    "email",
+    "openid",
+))
 
 
 def catalog():
@@ -99,7 +106,14 @@ def forward_fixture_offer(raw):
     if destination.scheme != "http" or destination.hostname != "127.0.0.1" or destination.path != "/":
         raise AssertionError("Synthetic browser saw an unexpected loopback callback")
     port = destination.port
-    query = urlencode({"state": fields["state"][0], "code": CODE})
+    query = urlencode({
+        "state": fields["state"][0],
+        "code": CODE,
+        "iss": "https://accounts.google.com",
+        "scope": BROWSER_SCOPE,
+        "authuser": "1",
+        "prompt": "consent",
+    })
     with socket.create_connection(("127.0.0.1", port), timeout=5) as callback:
         callback.sendall(f"GET /?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode("ascii"))
         if b"200 OK" not in callback.recv(512):
