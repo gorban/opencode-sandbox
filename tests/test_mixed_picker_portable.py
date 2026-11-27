@@ -246,6 +246,58 @@ class MixedPickerPortableTests(unittest.TestCase):
         self.assertIn("launch spec differs from the pinned portable fixture", invoked.stderr)
         self.assertFalse((fixture.root / "observations.json").exists())
 
+    def test_rejects_wrong_relay_port_in_discovery_and_replacement_create_args(self):
+        for case in ("wrong-discovery-port", "wrong-turn-port"):
+            with self.subTest(case=case):
+                fixture = self.fixture(case=case)
+                invoked = fixture.run()
+                self.assertEqual(invoked.returncode, 1, invoked.stdout + invoked.stderr)
+                result = fixture.result()
+                rejected, = (event[1] for event in result["placement_events"] if event[0] == "reject-relay-argv")
+                self.assertFalse(any(event[:2] == ["bound", rejected] for event in result["placement_events"]))
+                self.assertEqual(result["writes"], [])
+                self.assertEqual(result["gate"]["admitted_writes"], 0)
+                self.assertEqual(result["live_containers"], [])
+                self.assertEqual(result["live_ports"], [])
+                self.assertEqual(result["remaining_jobs"], [])
+
+    def test_rejects_tool_fields_in_delivered_sse_envelope_and_nested_usage(self):
+        for case in ("tool-event-field", "nested-tool-field"):
+            with self.subTest(case=case):
+                fixture = self.fixture(case=case)
+                invoked = fixture.run()
+                self.assertEqual(invoked.returncode, 1, invoked.stdout + invoked.stderr)
+                result = fixture.result()
+                self.assertEqual(result["sse_refusal"], "unexpected field in fixture SSE")
+                self.assertNotIn("received_sse", result)
+                self.assertEqual(len(result["writes"]), 1)
+                self.assertTrue(result["gate"]["exact_ok_delivered"])
+                self.assertEqual(result["live_containers"], [])
+                self.assertEqual(result["live_ports"], [])
+
+    def test_owner_loss_after_claim_stops_the_fake_transport_write(self):
+        fixture = self.fixture(case="owner-loss-after-claim")
+        invoked = fixture.run()
+        self.assertEqual(invoked.returncode, 0, invoked.stdout + invoked.stderr)
+        result = fixture.result()
+        self.assertEqual(result["owner_loss_after_claim"], 401)
+        self.assertEqual(result["gate"]["admitted_writes"], 1)
+        self.assertEqual(result["writes"], [])
+        self.assertNotIn("received_sse", result)
+        self.assertEqual(result["live_ports"], [])
+
+    def test_wrong_mounted_model_is_refused_before_any_projected_request(self):
+        fixture = self.fixture(case="wrong-mounted-model")
+        invoked = fixture.run()
+        self.assertEqual(invoked.returncode, 1, invoked.stdout + invoked.stderr)
+        result = fixture.result()
+        self.assertEqual(result["raw_route"], f"{SCOPES[0]}/{MODEL}")
+        self.assertEqual(result["mounted_model"], f"{SCOPES[1]}/opal-v1")
+        self.assertFalse(any(event[0] == "worker-request" for event in result["placement_events"]))
+        self.assertEqual(result["writes"], [])
+        self.assertEqual(result["gate"]["admitted_writes"], 0)
+        self.assertEqual(result["live_ports"], [])
+
     def assert_exact_attribution(self, result, scope):
         ports = {key: value["port"] for key, value in result["slots"].items()}
         self.assertEqual(ports, dict(zip(SCOPES, range(8401, 8404))))
@@ -269,6 +321,8 @@ class MixedPickerPortableTests(unittest.TestCase):
         self.assertTrue(result["worker_routes_checked"])
         self.assertEqual(result["received_sse"], {"text": "ok", "completed": True, "tool_parts": 0, "events": 8})
         self.assertEqual(result["runner_worker_id"], result["worker_id"])
+        self.assertEqual(result["mounted_model"], f"{scope}/{MODEL}")
+        self.assertEqual(result["live_ports"], [])
         self.assertIn(["create", result["worker_id"]], result["placement_events"])
         self.assertIn(["remove", result["worker_id"]], result["placement_events"])
         self.assertEqual(result["live_containers"], [])
@@ -296,6 +350,8 @@ class MixedPickerPortableTests(unittest.TestCase):
         self.assertEqual(deferred, gate["verified_relay_id"])
         self.assertLess(events.index(["verify", deferred, gate["job_incarnation"]]),
                         events.index(["bound", deferred, ports[scope]]))
+        self.assertLess(events.index(["bound", deferred, ports[scope]]),
+                        events.index(["worker-request", deferred, ports[scope]]))
 
 
 if __name__ == "__main__":

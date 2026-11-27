@@ -9,7 +9,7 @@ from pathlib import Path
 import secrets
 import socket
 import sys
-from threading import Lock
+from threading import Lock, RLock
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlsplit
@@ -50,6 +50,10 @@ class FakePlacement:
         self.root = root
         self.spec = spec
         self.containers = {}
+        self.relay_args = {}
+        self.relay_plans = {}
+        self.verified_relays = {}
+        self.bound_ports = {}
         self.events = []
         self.config_path = None
         self.worker_id = None
@@ -66,6 +70,7 @@ class FakePlacement:
                 if "-it" in args:
                     self.record_worker(ident, args)
                 else:
+                    self.relay_args[ident] = args
                     self.events.append(("relay", ident, "--defer-bind" in args))
                 stdout = ident.encode()
             case ("start", ident):
@@ -75,6 +80,10 @@ class FakePlacement:
             case ("rm", "-f", ident):
                 require(ident in self.containers, "unexpected container removal")
                 del self.containers[ident]
+                self.relay_args.pop(ident, None)
+                verified = self.verified_relays.pop(ident, None)
+                if verified is not None and self.bound_ports.get(verified[0]) == ident:
+                    del self.bound_ports[verified[0]]
                 self.events.append(("remove", ident))
             case ("container", "exists", ident):
                 status = int(ident not in self.containers)
@@ -126,15 +135,61 @@ class FakePlacement:
     def idle(*_args, **kwargs):
         require(not kwargs["pod_containers"], "unexpected existing containers")
 
-    def verify_relay(self, ident, _image, pod, _level, job, _siblings):
-        require(pod == POD_ID and self.containers.get(ident) == "started"
-                and job.lease.status() == "pending", "unexpected relay verification")
+    def plan_relay(self, job, *, scope, discovery, turn):
+        ordinal = SCOPES.index(scope)
+        index = 100 + len(SCOPES) if turn else ordinal
+        port = 8401 + ordinal
+        label = scope.replace("--", "/")
+        phase = "-disc" if discovery else ""
+        spec = self.spec
+        require(job.root.parent == self.root / "jobs" and job.incarnation not in self.relay_plans,
+                "unexpected portable relay root or incarnation")
+        expected = [
+            "--pull=never", "--name", f"{spec['pod']}-relay{phase}-{index}", "--pod", spec["pod"],
+            "--label", "oc.sandbox=1", "--label", f"oc.instance={spec['instance']}",
+            "--label", "oc.role=provider-relay", "--label", f"oc.provider-slot={index}",
+            "--label", f"oc.provider={label}",
+            "--http-proxy=false", "--image-volume=ignore", "--log-driver=none", "--restart=no",
+            "--user=0:0", "--ipc=private", "--pid=private", "--cgroupns=private",
+            "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+            "--pids-limit=64", "--memory=128m", "--memory-swap=128m",
+            "-v", f"{job.root / 'source'}:/source:ro,Z,nosuid,nodev,noexec",
+            "-v", f"{job.root / 'provider'}:/provider:ro,Z,nosuid,nodev,noexec",
+            "-v", f"{job.root / 'grant'}:/grant:ro,Z,nosuid,nodev,noexec",
+            "-v", f"{job.root / 'proof'}:/proof:ro,Z,nosuid,nodev,noexec",
+            spec["relay_image"], "python3", "-B", "/source/session_relay.py",
+            job.incarnation, str(job.generation), str(job.lease.deadline_ns), str(port),
+        ]
+        if turn:
+            expected.append("--defer-bind")
+        self.relay_plans[job.incarnation] = expected
+
+    def verify_relay(self, ident, image, pod, level, job, _siblings):
+        require(pod == self.pod == POD_ID and image == self.spec["relay_image"] and level == self.spec["level"]
+                and self.containers.get(ident) == "started" and job.lease.status() == "pending",
+                "unexpected relay verification")
+        args = self.relay_args.get(ident)
+        expected = self.relay_plans.pop(job.incarnation, None)
+        if expected is None or args != expected:
+            self.events.append(("reject-relay-argv", ident, job.incarnation))
+            raise ProofGateError("unexpected portable relay create arguments")
+        port = int(args[-2] if args[-1] == "--defer-bind" else args[-1])
+        self.verified_relays[ident] = (port, job)
         self.events.append(("verify", ident, job.incarnation))
 
     def wait_bound(self, ident, *, port):
-        require(any(event[:2] == ("verify", ident) for event in self.events),
-                "relay bound before verification")
+        require(ident in self.verified_relays and self.verified_relays[ident][0] == port
+                and port not in self.bound_ports, "unexpected simulated relay bind")
+        self.bound_ports[port] = ident
         self.events.append(("bound", ident, port))
+
+    def bound_job(self, port, *, request=False):
+        require(port in self.bound_ports, "no accepted simulated relay at projected endpoint")
+        ident = self.bound_ports[port]
+        require(self.containers.get(ident) == "started", "projected relay is no longer started")
+        if request:
+            self.events.append(("worker-request", ident, port))
+        return self.verified_relays[ident][1]
 
 
 @dataclass(frozen=True)
@@ -164,10 +219,10 @@ class Recorder:
 
 
 class Transport:
-    def __init__(self, scope, binding, recorder):
-        self.scope = scope
+    def __init__(self, owner, binding, job):
+        self.owner = owner
         self.binding = binding
-        self.recorder = recorder
+        self.job = job
 
     def require_active(self, binding):
         require(binding == self.binding, "wrong fixture transport binding")
@@ -175,9 +230,13 @@ class Transport:
     @contextmanager
     def interactive_responses(self, binding, body, before_write, *, authorization, write_fence, **_):
         self.require_active(binding)
-        with (authorization or nullcontext)(), write_fence():
+        with self.owner.fence, (authorization or nullcontext)(), write_fence():
             before_write()
-            self.recorder.record(self.scope, binding, body)
+            if self.owner.scenario == "owner-loss-after-claim":
+                self.owner.revoke()
+            with self.owner.authorize(binding, self.job):
+                self.owner.check_binding(self.owner.approval)
+                self.owner.recorder.record(binding.scope, binding, body)
         yield response_events(body["model"])
 
 
@@ -202,8 +261,9 @@ def response_events(model):
 
 
 class ProjectionGate(ProofGate):
-    def __init__(self, approval, **kwargs):
+    def __init__(self, approval, *, scenario, **kwargs):
         super().__init__(approval, **kwargs)
+        self.scenario = scenario
         self.raw_route = None
         self.projected = False
 
@@ -212,7 +272,11 @@ class ProjectionGate(ProofGate):
         self.raw_route = payload.get("model")
         require(self.raw_route == expected, "raw projected route differs from fixture approval")
         self.projected = True
-        return super().harden_opencode_config(payload)
+        result = super().harden_opencode_config(payload)
+        if self.scenario == "wrong-mounted-model":
+            sibling = next(scope for scope in SCOPES if scope != self.approval.scoped_provider_id)
+            result["model"] = f"{sibling}/opal-v1"
+        return result
 
     def verify_ready_for_arm(self):
         require(self.projected, "raw projected route was never checked")
@@ -264,6 +328,7 @@ class FixtureAdapter:
         closed = ClosedProofSlotGate(scope)
         job.prepare()
         try:
+            owner.placement.plan_relay(job, scope=scope, discovery=discovery, turn=turn)
             binding = Binding(
                 scope=scope, registration_id=owner.registrations[scope],
                 generation=owner.approval.credential_generation, epoch=owner.approval.selection_epoch,
@@ -278,7 +343,7 @@ class FixtureAdapter:
                 relay_proof=job.relay_proof,
                 worker_token=worker_token,
                 lease=job.lease,
-                connection=Transport(scope, binding, owner.recorder),
+                connection=Transport(owner, binding, job),
                 binding=binding,
                 models=preflight.models,
                 profile_label=preflight.spec.label,
@@ -297,16 +362,23 @@ class FixtureAdapter:
                 job=job, port=port, token=worker_token, closed=not turn, released=False,
             )
             owner.slots[scope] = record
+            def build_relay_args(spec):
+                wrong_port = (
+                    (owner.scenario == "wrong-turn-port" and turn)
+                    or (owner.scenario == "wrong-discovery-port" and discovery)
+                )
+                return broker._build_relay_args(
+                    spec, job, slot_index=slot_index, port=port + 1 if wrong_port else port,
+                    provider_label=preflight.spec.qualified_name,
+                    relay_name_override=f"{spec['pod']}-relay-disc-{slot_index}" if discovery else None,
+                    defer_bind=turn,
+                )
+
             try:
                 yield SlotHandle(
                     slot_index=slot_index, scoped_id=scope, provider_label=preflight.spec.qualified_name,
                     port=port, job=job, broker=session, lease=job.lease,
-                    build_relay_args=lambda spec: broker._build_relay_args(
-                        spec, job, slot_index=slot_index, port=port,
-                        provider_label=preflight.spec.qualified_name,
-                        relay_name_override=f"{spec['pod']}-relay-disc-{slot_index}" if discovery else None,
-                        defer_bind=turn,
-                    ),
+                    build_relay_args=build_relay_args,
                     lease_release_confirmed=lambda: record.released,
                 )
             finally:
@@ -325,13 +397,21 @@ class ProjectedRoute:
 class ProjectedWorker:
     """Use mounted settings for requests, mapping the fake loopback ports to Unix relays."""
 
-    def __init__(self, config_path, slots):
+    def __init__(self, placement, slots):
+        self.placement = placement
         self.slots = slots
-        self.projection = json.loads(config_path.read_bytes())
+        self.projection = json.loads(placement.config_path.read_bytes())
         self.routes = {}
         for scope, entry in self.projection["providers"].items():
             settings = entry["settings"]
             self.routes[scope] = ProjectedRoute(settings["baseURL"], settings["apiKey"])
+
+    def check_selection(self, approval):
+        self.selected_scope, separator, self.selected_model = self.projection["model"].partition("/")
+        require(separator and self.selected_scope == approval.scoped_provider_id
+                and self.selected_model == approval.approved_model
+                and self.selected_model in self.projection["providers"][self.selected_scope]["models"],
+                "mounted model differs from fixture approval")
 
     def check_bearers(self):
         require(self.routes.keys() == self.slots.keys(), "unexpected worker provider projection")
@@ -339,15 +419,18 @@ class ProjectedWorker:
             slot = self.slots[scope]
             require(route.endpoint == f"http://127.0.0.1:{slot.port}/v1",
                     "projected endpoint does not belong to its fixture route")
+            require(self.placement.bound_job(urlsplit(route.endpoint).port) is slot.job,
+                    "projected endpoint is bound to another fixture job")
             require(type(route.bearer) is str and route.bearer.isascii()
                     and compare_digest(route.bearer, slot.token),
                     "projected bearer does not belong to its fixture route")
 
-    def request(self, scope, *, bearer_scope=None, model=MODEL, extra=None):
+    def request(self, scope, *, bearer_scope=None, model=None, extra=None):
         endpoint = urlsplit(self.routes[scope].endpoint)
         bearer = self.routes[scope if bearer_scope is None else bearer_scope].bearer
-        slot, = (slot for slot in self.slots.values() if slot.port == endpoint.port)
-        body = dict(canonical_proof_body(model), instructions=INSTRUCTIONS)
+        job = self.placement.bound_job(endpoint.port, request=True)
+        require(job is self.slots[scope].job, "projected request did not select its accepted relay")
+        body = dict(canonical_proof_body(self.selected_model if model is None else model), instructions=INSTRUCTIONS)
         body.update(extra or {})
         data = json.dumps(body).encode("ascii")
         raw = (
@@ -357,10 +440,10 @@ class ProjectedWorker:
             f"Content-Type: application/json\r\n"
             f"Content-Length: {len(data)}\r\n\r\n"
         ).encode("ascii") + data
-        frame = broker.relay_mod.PROOF_PREFIX + slot.job.relay_proof + broker.REQUEST_LENGTH.pack(len(raw)) + raw
+        frame = broker.relay_mod.PROOF_PREFIX + job.relay_proof + broker.REQUEST_LENGTH.pack(len(raw)) + raw
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
             peer.settimeout(5)
-            peer.connect(str(slot.job.provider_socket))
+            peer.connect(str(job.provider_socket))
             peer.sendall(frame)
             with peer.makefile("rb") as stream:
                 return stream.read()
@@ -392,42 +475,102 @@ def chunk_payload(reply):
     raise ProofGateError("missing terminal fixture response chunk")
 
 
-TEXT_EVENTS = (
-    "response.created", "response.output_item.added", "response.content_part.added",
-    "response.output_text.delta", "response.output_text.done", "response.content_part.done",
-    "response.output_item.done", "response.completed",
-)
+STREAM_FIELDS = ("output_index", "item_id", "content_index")
+EVENT_FIELDS = {
+    "response.created": ("response",),
+    "response.output_item.added": ("output_index", "item"),
+    "response.content_part.added": (*STREAM_FIELDS, "part"),
+    "response.output_text.delta": (*STREAM_FIELDS, "delta"),
+    "response.output_text.done": (*STREAM_FIELDS, "text"),
+    "response.content_part.done": (*STREAM_FIELDS, "part"),
+    "response.output_item.done": ("output_index", "item"),
+    "response.completed": ("response",),
+}
 
 
-def read_assistant_sse(reply, model):
+def sse_fields(value, *keys):
+    require(type(value) is dict and value.keys() == set(keys), "unexpected field in fixture SSE")
+
+
+def unique_json_fields(items):
+    result = dict(items)
+    require(len(result) == len(items), "duplicate field in fixture SSE")
+    return result
+
+
+def fixture_events(reply):
     payload = chunk_payload(reply)
     require(payload.endswith(b"\n\n"), "truncated fixture SSE")
     events = []
     for frame in payload[:-2].split(b"\n\n"):
         event, separator, data = frame.partition(b"\ndata: ")
         require(separator and event.startswith(b"event: "), "invalid fixture SSE frame")
-        item = json.loads(data)
-        require(item["type"] == event[len(b"event: "):].decode("ascii"),
-                "fixture SSE types disagree")
+        kind = event[len(b"event: "):].decode("ascii")
+        require(kind in EVENT_FIELDS, "unexpected fixture SSE event")
+        item = json.loads(data, object_pairs_hook=unique_json_fields)
+        sse_fields(item, "type", *EVENT_FIELDS[kind])
+        require(item["type"] == kind, "fixture SSE types disagree")
         events.append(item)
-    require(tuple(event["type"] for event in events) == TEXT_EVENTS, "unexpected fixture SSE event sequence")
+    require(tuple(event["type"] for event in events) == tuple(EVENT_FIELDS), "unexpected fixture SSE event sequence")
+    return events
+
+
+def read_assistant_sse(reply, model):
+    events = fixture_events(reply)
     created, added, part_added, delta, text_done, part_done, done, completed = events
-    require(created["response"]["model"] == model and created["response"]["output"] == [],
+    start, finish = created["response"], completed["response"]
+    envelope_fields = ("id", "object", "model", "status", "output")
+    sse_fields(start, *envelope_fields)
+    sse_fields(finish, *envelope_fields, "usage")
+    for response in (start, finish):
+        require(type(response["id"]) is str and response["id"]
+                and response["object"] == "response" and response["model"] == model,
+                "wrong fixture response identity")
+    require(start["id"] == finish["id"] and start["status"] == "in_progress" and start["output"] == [],
             "unexpected fixture response start")
-    for event in (added, done):
+    usage = finish["usage"]
+    sse_fields(usage, "input_tokens", "output_tokens", "total_tokens")
+    require(all(type(value) is int and value >= 0 for value in usage.values())
+            and usage["input_tokens"] + usage["output_tokens"] == usage["total_tokens"],
+            "unexpected fixture response usage")
+
+    for event, expected_status in ((added, "in_progress"), (done, "completed")):
         item = event["item"]
-        require(item["type"] == "message" and item["role"] == "assistant",
+        sse_fields(item, "id", "type", "role", "status", "content")
+        require(type(item["id"]) is str and item["id"] and item["type"] == "message"
+                and item["role"] == "assistant" and item["status"] == expected_status,
                 "non-assistant fixture response item")
     for event in (part_added, part_done):
-        require(event["part"]["type"] == "output_text", "non-text fixture response part")
+        part = event["part"]
+        sse_fields(part, "type", "text", "annotations")
+        require(part["type"] == "output_text" and part["annotations"] == [], "non-text fixture response part")
+    require(all(type(event["output_index"]) is int and event["output_index"] == 0
+                for event in (added, part_added, delta, text_done, part_done, done)),
+            "unexpected fixture output index")
+    require(all(type(event["content_index"]) is int and event["content_index"] == 0
+                and event["item_id"] == added["item"]["id"] for event in (part_added, delta, text_done, part_done))
+            and added["item"]["id"] == done["item"]["id"], "unexpected fixture content identity")
     require(added["item"]["content"] == [] and part_added["part"]["text"] == "",
             "nonempty initial fixture response content")
-    response = completed["response"]
-    require(response["status"] == "completed" and response["model"] == model
-            and response["output"] == [done["item"]] and done["item"]["content"] == [part_done["part"]]
+    require(finish["status"] == "completed" and finish["output"] == [done["item"]]
+            and done["item"]["content"] == [part_done["part"]]
             and delta["delta"] == text_done["text"] == part_done["part"]["text"] == "ok",
             "unexpected completed fixture assistant text or content")
     return {"text": delta["delta"], "completed": True, "tool_parts": 0, "events": len(events)}
+
+
+def add_unexpected_tool_field(frame, scenario):
+    mutations = {
+        "tool-event-field": b"event: response.output_text.delta\ndata: ",
+        "nested-tool-field": b"event: response.completed\ndata: ",
+    }
+    prefix = mutations.get(scenario)
+    if prefix is None or not frame.startswith(prefix):
+        return frame
+    event = json.loads(frame[len(prefix):])
+    container = event if scenario == "tool-event-field" else event["response"]["usage"]
+    container["tool_calls"] = [{"type": "function_call"}]
+    return prefix + json.dumps(event).encode("ascii") + b"\n\n"
 
 
 class Owner:
@@ -443,6 +586,7 @@ class Owner:
         self.slots = {}
         self.registrations = {scope: secrets.token_hex(16) for scope in SCOPES}
         self.confirmed = False
+        self.fence = RLock()
         self.alive = True
         self.permit = None
         self.observations = {}
@@ -459,7 +603,7 @@ class Owner:
             self.approval, evidence_dir=root / "evidence", exposure_dir=self.exposure,
             check_owner_alive=self.require_owner,
             check_binding_intact=self.check_binding,
-            expected_instructions_sha256=INSTRUCTIONS_DIGEST,
+            expected_instructions_sha256=INSTRUCTIONS_DIGEST, scenario=scenario,
         )
 
     def config_digest(self):
@@ -467,8 +611,14 @@ class Owner:
             config_dir=self.config_dir, sandbox_dir=self.home / "opencode-sandbox",
         )[1]
 
+    def revoke(self):
+        with self.fence:
+            self.alive = False
+
     def require_owner(self):
-        require(self.alive and self.confirmed, "fixture foreground authority is closed")
+        # ProofGate may call this while holding the same owner fence during dispatch.
+        with self.fence:
+            require(self.alive and self.confirmed, "fixture foreground authority is closed")
 
     def check_binding(self, approval):
         require(approval is self.approval and self.config_digest() == approval.providers_config_digest,
@@ -476,20 +626,21 @@ class Owner:
 
     @contextmanager
     def authorize(self, binding, job):
-        approval = self.approval
-        if not (
-            self.alive and self.confirmed and binding.scope == approval.scoped_provider_id
-            and binding.registration_id == self.registrations[binding.scope]
-            and binding.generation == approval.credential_generation
-            and binding.epoch == approval.selection_epoch
-            and binding.incarnation == job.incarnation
-            and binding.launch_id == approval.run_id
-            and binding.pod == self.placement.pod == POD_ID
-            and binding.placement == "sandbox"
-            and binding.auth_mode == approval.auth_mode and binding.route_policy == approval.route_policy
-        ):
-            raise broker.ConnectionError("connection_retired")
-        yield
+        with self.fence:
+            approval = self.approval
+            if not (
+                self.alive and self.confirmed and binding.scope == approval.scoped_provider_id
+                and binding.registration_id == self.registrations[binding.scope]
+                and binding.generation == approval.credential_generation
+                and binding.epoch == approval.selection_epoch
+                and binding.incarnation == job.incarnation
+                and binding.launch_id == approval.run_id
+                and binding.pod == self.placement.pod == POD_ID
+                and binding.placement == "sandbox"
+                and binding.auth_mode == approval.auth_mode and binding.route_policy == approval.route_policy
+            ):
+                raise broker.ConnectionError("connection_retired")
+            yield
 
     def confirm(self, prompt):
         require("Start interactive " in prompt, "unexpected workstation confirmation")
@@ -514,7 +665,9 @@ class Owner:
                 and self.placement.pod == POD_ID and not stop_event.is_set(), "unexpected agent attachment")
         self.observations["worker_id"] = self.placement.worker_id
         self.observations["runner_worker_id"] = agent_id
-        worker = ProjectedWorker(self.placement.config_path, self.slots)
+        worker = ProjectedWorker(self.placement, self.slots)
+        self.observations["mounted_model"] = worker.projection["model"]
+        worker.check_selection(self.approval)
         worker.check_bearers()
         self.observations["worker_routes_checked"] = True
         projection = worker.projection
@@ -569,7 +722,7 @@ class Owner:
         }))
         self.observations["tool_request"] = status(worker.request(target, extra={"tools": [{"type": "web_search"}]}))
         if self.scenario == "owner-loss":
-            self.alive = False
+            self.revoke()
             self.observations["owner_loss"] = status(worker.request(target))
             return 0
         if self.scenario == "config-drift":
@@ -578,7 +731,14 @@ class Owner:
             self.observations["config_drift"] = status(worker.request(target))
             return 0
         reply = worker.request(target)
-        self.observations["received_sse"] = read_assistant_sse(reply, MODEL)
+        if self.scenario == "owner-loss-after-claim":
+            self.observations["owner_loss_after_claim"] = status(reply)
+            return 0
+        try:
+            self.observations["received_sse"] = read_assistant_sse(reply, worker.selected_model)
+        except ProofGateError as exc:
+            self.observations["sse_refusal"] = str(exc)
+            raise
         self.observations["replay"] = status(worker.request(target))
         try:
             arm(projected_model_label, sha256(projected_model_label.encode()).hexdigest())
@@ -592,7 +752,11 @@ def run(supervise, spec, terminal):
     root = Path(__file__).resolve().parents[2]
     scenario = json.loads((root / "case.json").read_text())
     target = scenario["target"]
-    cases = {"positive", "wrong-model-evidence", "owner-loss", "config-drift", "cancelled", "wrong-bearer"}
+    cases = {
+        "positive", "wrong-model-evidence", "owner-loss", "owner-loss-after-claim", "config-drift",
+        "cancelled", "wrong-bearer", "wrong-mounted-model", "wrong-discovery-port", "wrong-turn-port",
+        "tool-event-field", "nested-tool-field",
+    }
     require(target in SCOPES and scenario["mode"] in cases, "unexpected fixture case")
     expected_spec = {
         "instance": "fixture", "pod": "oc-fixture", "agent": "oc-fixture-agent",
@@ -617,12 +781,14 @@ def run(supervise, spec, terminal):
     with patch.object(provider_config, "_account_home", return_value=root / "home"):
         owner = Owner(root, spec, target, scenario["mode"])
         hardware = owner.placement
+        encode_chunk = broker.encode_chunk
         with (
             patch.multiple(broker, check_devbox=lambda: None, check_host=lambda: None,
                            _verify_pod_with_containers=hardware.verify_pod,
                            _ensure_containers_idle=hardware.idle, podman=hardware.podman,
                            _verify_relay_isolation=hardware.verify_relay, _wait_relay_bound=hardware.wait_bound,
-                           make_backend=unavailable, _launch_agent_tty=unavailable, SHARED_TMP=root / "jobs"),
+                           make_backend=unavailable, _launch_agent_tty=unavailable, SHARED_TMP=root / "jobs",
+                           encode_chunk=lambda frame: encode_chunk(add_unexpected_tool_field(frame, owner.scenario))),
             patch.object(broker.subprocess, "Popen", side_effect=unavailable),
             patch.object(StreamTerminal, "attended", return_value=True),
             patch.object(StreamTerminal, "confirm", side_effect=owner.confirm),
@@ -637,6 +803,7 @@ def run(supervise, spec, terminal):
         observations.update(
             target=target, writes=owner.recorder.writes, live_containers=list(hardware.containers),
             placement_events=hardware.events, remaining_jobs=list(map(str, (root / "jobs").iterdir())),
+            live_ports=sorted(hardware.bound_ports),
             mini_argument=bool(hardware.worker_args and hardware.worker_args[-1] == "mini"),
             gate=owner.gate.snapshot_evidence(), raw_route=owner.gate.raw_route,
         )
