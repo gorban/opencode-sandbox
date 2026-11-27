@@ -154,8 +154,11 @@ Compare (files or folders). The host tools work on a **copy**:
   file in the meantime, your save goes to `FILE.host-edit` next to it instead of overwriting the agent's
   version.
 - `code` waits for you to close the tab (`--wait`); the copy is deleted after successful write-back. Folders opened in Beyond
-  Compare are read-only snapshots (ordinary files and directories). `code` refuses `.code-workspace`
-  definitions. Snapshots are limited to 64 MiB per file, 512 MiB and 5000 visited entries per
+  Compare are read-only snapshots (ordinary files and directories). The bridge excludes repository
+  and editor metadata from selections and snapshots. A detached copy can appear as `selection`
+  with the original extension when the original name has spaces or other characters outside the
+  editor's staging filename rules. Saves still return to the recorded original path.
+  Snapshots are limited to 64 MiB per file, 512 MiB and 5000 visited entries per
   session, and 64 levels of nesting. At most eight staging directories are admitted at once.
 - Symlinks inside the sandbox are not followed by the host; `code` resolves them inside the sandbox
   first, so links that stay inside the sandbox still work.

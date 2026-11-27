@@ -44,4 +44,31 @@ Port numbers must never be picked automatically: another app may want that port.
 | Init script only (`/docker-entrypoint-initdb.d`) | simple | only applies to new volumes; old ones stay `trust` until recreated | 0.25 day |
 | Refuse `-P 5432` until the volume is recreated | no migration code | the user loses data or has to dump and restore | 0.25 day |
 
-- [x] **Human review**: checked only when the user says so
+### Reopened: published-port check imported modules from the caller's directory
+
+Found by the 2026-11-26 security audit after this grouping passed human review.
+
+- [x] The check that compares an existing pod's real port bindings with its label ran host Python
+      without isolated mode. The launcher keeps the caller's directory, which can be a sandbox
+      repository, so an agent-planted `json.py` or `re.py` there ran as the operator on the next
+      launch against an existing pod. Run that check, and the bridge's Python version probe, with
+      `-I`. `tests/postgres-host.sh` now runs the check from a directory holding canary modules, and
+      `tests/security.sh` audits that every `python3` option list in the launcher starts with `-I`.
+      Both fail on the previous launcher. Branch `fix/launcher-isolated-host-python`; external
+      review pending.
+- [x] Review follow-up: that check and the bridge's version probe still found `python3` through the
+      caller's `PATH`. Every host Python call in the launcher now names `/usr/bin/python3`, and
+      the probe reaches the host through distrobox's installed dispatcher path.
+      `tests/postgres-host.sh` and `tests/security.sh` cover both with stand-in commands on
+      `PATH`. Same branch.
+- [x] Review follow-up: the source check in `tests/security.sh` is now an audit that separates host
+      calls from container entry points, requires the system interpreter and isolated mode where
+      each call is made, covers direct-script and array forms, and fails if it cannot read the
+      launcher. Fixtures for each form are checked alongside it. Same branch.
+- [x] Re-review follow-up: host-state validation and the bridge probe now share one route to the
+      host, `host_python`, which runs distrobox's wrapper at its installed path with a fixed search
+      path. The audit accepts only `-I` and `-IB`, requires the one read-only dispatcher binding,
+      and rejects interpreter arrays. Distrobox-mode tests run a scratch copy of the launcher that
+      differs only in that binding. Same branch.
+
+- [ ] **Human review**: checked only when the user says so
