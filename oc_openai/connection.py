@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .connection_job import LeaseHostProof, LeaseSetHostProof, PhysicalHost, WorkerLease
-from .connection_state import ConnectionError, MAX_WORKER_LEASES, Store, lease_hold_name
+from .connection_state import ConnectionError, MAX_WORKER_LEASES, Store
 from .profiles import ProfileError
 from .responses import AUTH_HOST, API_HOST, DISCOVERY, INTERACTIVE_STREAM_LIMITS, JWKS, MODELS, TOKEN
 from .responses import Cancellation, OpenAITransport, StreamLimits, response_error
@@ -514,12 +514,9 @@ class Connection:
         with self._store.locked() as directory:
             record = self._store.read(directory)
             leases = dict(record.get("worker_leases") or {})
-            hold_names = self._store.lease_hold_names(directory)
-            hold_name = lease_hold_name(lease.root)
             if (not _active(record, binding) or "worker_lease" in record
                     or lease.root in leases or len(leases) >= MAX_WORKER_LEASES
-                    or hold_names is None or hold_name in hold_names
-                    or self._store.has_orphan_lease_holds(directory, leases.keys())):
+                    or self._store.has_lease_holds(directory)):
                 raise ConnectionError("managed_retirement_incomplete")
             leases[lease.root] = lease_record
             record["worker_leases"] = leases

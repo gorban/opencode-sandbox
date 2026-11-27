@@ -3296,6 +3296,177 @@ class MixedProviderContractAndLifecycleTests(unittest.TestCase):
                 fresh_conn.require_switchable()
             self.assertEqual(sw_err.exception.code, "managed_retirement_incomplete")
 
+    def test_clear_hold_post_unlink_dir_fsync_failure_restores_guard_and_blocks_switch(self):
+        # Regression (R5 P2): if final os.fsync(directory) fails AFTER os.unlink() of the last
+        # .lease-hold-* guard (in BOTH coordinated and standalone teardown), the effective hold
+        # guard MUST be restored before state.lock releases so fresh Connection readers remain blocked.
+        import pwd
+        from oc_openai import connection_state as cs_mod
+        from oc_openai.connection import Connection
+        from oc_openai.connection_state import ConnectionError as ConnError
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+        # Case 1: Coordinated teardown path.
+        with tempfile.TemporaryDirectory(prefix="oc-mix-clrsyn-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+            _, adapter, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                home_scratch / "profiles",
+            )
+            slot_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(slot_root, ignore_errors=True))
+            coord = _SessionSlotCoordinator(threading.Event())
+            slot_cm = adapter.open_slot(
+                pref, slot_index=0, slot_root=slot_root, port=8401,
+                worker_token="tok-clrs-" + "a" * 24,
+                acknowledged_exposure_digest=None, on_revoke=coord.on_revoke,
+            )
+            handle = slot_cm.__enter__()
+            coord.register_slot(slot_cm, handle, slot_root, allow_legacy=True)
+            coord.record_container("e" * 64, slot_index=0)
+            handle.job.activate()
+
+            orig_unlink = cs_mod.os.unlink
+            orig_fsync = cs_mod.os.fsync
+            unlinked_hold = [False]
+
+            def track_unlink(path, *, dir_fd=None):
+                if isinstance(path, str) and path.startswith(".lease-hold-"):
+                    unlinked_hold[0] = True
+                return orig_unlink(path, dir_fd=dir_fd)
+
+            def fail_fsync_after_hold_unlink(fd):
+                if unlinked_hold[0]:
+                    raise OSError("simulated post-unlink dir fsync failure")
+                return orig_fsync(fd)
+
+            with (
+                patch.object(session_broker, "_remove_container_verified"),
+                patch.object(cs_mod.os, "unlink", side_effect=track_unlink),
+                patch.object(cs_mod.os, "fsync", side_effect=fail_fsync_after_hold_unlink),
+            ):
+                err = coord.teardown_all(None)
+
+            self.assertTrue(unlinked_hold[0])
+            self.assertIsNotNone(err)
+            self.assertFalse(coord._slots[0].lease_confirmed_released)
+            self.assertFalse(handle.lease_release_confirmed())
+            coord.remove_slot_roots(require_confirmed_leases=True)
+            self.assertTrue(slot_root.exists())
+
+            fresh_conn = Connection(personal_dir, host_probe=lambda: host)
+            self.assertTrue(fresh_conn.has_active_leases())
+            with self.assertRaises(ConnError) as sw_err:
+                fresh_conn.require_switchable()
+            self.assertEqual(sw_err.exception.code, "managed_retirement_incomplete")
+            next_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(next_root, ignore_errors=True))
+            next_job = _SessionJob(next_root, "inc_" + secrets.token_hex(16))
+            next_job.prepare(config_payload=None)
+            self.addCleanup(next_job.revoke)
+            lease_cm = fresh_conn.session_lease(pref.handle.binding, next_job)
+            with self.assertRaises(ConnError) as lease_err:
+                lease_cm.__enter__()
+            self.assertEqual(lease_err.exception.code, "managed_retirement_incomplete")
+
+        # Case 2: Standalone Connection.session_lease() teardown path.
+        with tempfile.TemporaryDirectory(prefix="oc-mix-clrsyn-sa-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+            _, _, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                home_scratch / "profiles",
+            )
+            conn = Connection(personal_dir, host_probe=lambda: host)
+            sa_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(sa_root, ignore_errors=True))
+            sa_job = _SessionJob(sa_root, "inc_" + secrets.token_hex(16))
+            sa_job.prepare(config_payload=None)
+            self.addCleanup(sa_job.revoke)
+            sa_job.activate()
+
+            orig_unlink = cs_mod.os.unlink
+            orig_fsync = cs_mod.os.fsync
+            sa_unlinked = [False]
+
+            def sa_track_unlink(path, *, dir_fd=None):
+                if isinstance(path, str) and path.startswith(".lease-hold-"):
+                    sa_unlinked[0] = True
+                return orig_unlink(path, dir_fd=dir_fd)
+
+            def sa_fail_fsync(fd):
+                if sa_unlinked[0]:
+                    raise OSError("simulated standalone post-unlink dir fsync failure")
+                return orig_fsync(fd)
+
+            with (
+                patch.object(cs_mod.os, "unlink", side_effect=sa_track_unlink),
+                patch.object(cs_mod.os, "fsync", side_effect=sa_fail_fsync),
+            ):
+                with self.assertRaises(ConnError):
+                    with conn.session_lease(pref.handle.binding, sa_job):
+                        sa_job.revoke()
+            self.assertTrue(sa_unlinked[0])
+            fresh_sa = Connection(personal_dir, host_probe=lambda: host)
+            self.assertTrue(fresh_sa.has_active_leases())
+            with self.assertRaises(ConnError) as sa_sw:
+                fresh_sa.require_switchable()
+            self.assertEqual(sa_sw.exception.code, "managed_retirement_incomplete")
+            other_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(other_root, ignore_errors=True))
+            other_job = _SessionJob(other_root, "inc_" + secrets.token_hex(16))
+            other_job.prepare(config_payload=None)
+            self.addCleanup(other_job.revoke)
+            sa_lease_cm = fresh_sa.session_lease(pref.handle.binding, other_job)
+            with self.assertRaises(ConnError) as sa_new:
+                sa_lease_cm.__enter__()
+            self.assertEqual(sa_new.exception.code, "managed_retirement_incomplete")
+
+    def test_refused_final_write_matching_hold_blocks_new_same_registration_lease(self):
+        # Regression (R5 matching-hold admission): when a refused final store write leaves BOTH
+        # worker_leases[old_root] AND its matching .lease-hold-*, fail-closed session_lease MUST
+        # refuse a new lease for a different job on the same registration.
+        import pwd
+        from oc_openai.connection import Connection
+        from oc_openai.connection_state import ConnectionError as ConnError
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with tempfile.TemporaryDirectory(prefix="oc-mix-matchhold-", dir=home) as home_raw:
+            home_scratch = Path(home_raw)
+            os.chmod(home_scratch, 0o700)
+            _, _, pref, personal_dir, host = self._make_real_openai_adapter_fixture(
+                home_scratch / "profiles",
+            )
+            conn = Connection(personal_dir, host_probe=lambda: host)
+            old_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(old_root, ignore_errors=True))
+            old_job = _SessionJob(old_root, "inc_" + secrets.token_hex(16))
+            old_job.prepare(config_payload=None)
+            self.addCleanup(old_job.revoke)
+            old_job.activate()
+
+            class _DenyAtCommitGate:
+                def __call__(self):
+                    return True
+
+                @contextmanager
+                def commit_fence(self):
+                    yield False
+
+            with conn.session_lease(pref.handle.binding, old_job, release_gate=_DenyAtCommitGate()):
+                old_job.revoke()
+            fresh_mh = Connection(personal_dir, host_probe=lambda: host)
+            self.assertTrue(fresh_mh.has_active_leases())
+            new_root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir="/tmp"))
+            self.addCleanup(lambda: shutil.rmtree(new_root, ignore_errors=True))
+            new_job = _SessionJob(new_root, "inc_" + secrets.token_hex(16))
+            new_job.prepare(config_payload=None)
+            self.addCleanup(new_job.revoke)
+            mh_lease_cm = fresh_mh.session_lease(pref.handle.binding, new_job)
+            with self.assertRaises(ConnError) as mh_err:
+                mh_lease_cm.__enter__()
+            self.assertEqual(mh_err.exception.code, "managed_retirement_incomplete")
+
     def test_proof_gate_evidence_and_dir_sync_failure_fails_closed_with_zero_dispatch(self):
         # Regression (R4 P2 #2): evidence write failure OR post-write _fsync_dir failure during
         # ProofGate.arm() or ProofGate.mark_relay_verified() MUST fail permanently closed across

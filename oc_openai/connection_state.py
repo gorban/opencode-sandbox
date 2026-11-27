@@ -177,10 +177,33 @@ def _write_hold_in_dir(directory: int, name: str) -> None:
     os.fsync(directory)
 
 
+def _restore_hold_best_effort(directory: int, name: str) -> None:
+    with contextlib.suppress(OSError):
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | CREATE_FLAGS, 0o600, dir_fd=directory)
+        try:
+            _regular(fd)
+            os.write(fd, b"hold\n")
+            with contextlib.suppress(OSError):
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+    with contextlib.suppress(OSError):
+        os.fsync(directory)
+
+
 def _clear_hold_in_dir(directory: int, name: str) -> None:
-    with contextlib.suppress(FileNotFoundError):
+    unlinked = False
+    try:
         os.unlink(name, dir_fd=directory)
-    os.fsync(directory)
+        unlinked = True
+    except FileNotFoundError:
+        pass
+    try:
+        os.fsync(directory)
+    except BaseException:
+        if unlinked:
+            _restore_hold_best_effort(directory, name)
+        raise
 
 
 class Store:
@@ -331,10 +354,3 @@ class Store:
     def has_lease_holds(self, directory) -> bool:
         holds = self.lease_hold_names(directory)
         return holds is None or bool(holds)
-
-    def has_orphan_lease_holds(self, directory, active_roots) -> bool:
-        holds = self.lease_hold_names(directory)
-        if holds is None:
-            return True
-        active_names = {lease_hold_name(str(root)) for root in active_roots}
-        return bool(holds - active_names)
