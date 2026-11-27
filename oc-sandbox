@@ -2107,8 +2107,26 @@ create_pg_auth_secrets() {
   { printf '127.0.0.1:5432:'; pgpass_field "$PG_DB"; printf ':'; pgpass_field "$PG_USER"; printf ':'; pgpass_field "$PG_PASSWORD"; printf '\n'; } |
     create_pg_secret "$PGPASSSECRET" || return 1
 }
+postgres_container_metadata() {
+  local metadata rc=0
+  pm container exists -- "$PGC" >/dev/null 2>&1 || rc=$?
+  case $rc in
+    0) ;;
+    1) printf '%s\n' 'none:'; return 0 ;;
+    *) echo "Could not determine whether Postgres container '$PGC' exists." >&2; return 1 ;;
+  esac
+  # Read state and configuration together. Inspection failure is not a legacy label.
+  if metadata=$(pm container inspect --format '{{.State.Status}}:{{index .Config.Labels "oc.pg"}}' -- "$PGC" 2>/dev/null) &&
+      [[ $metadata == *:* && $metadata != *$'\n'* && $metadata != *$'\r'* ]]; then
+    case ${metadata%%:*} in
+      running|exited|stopped|paused|created|configured|initialized) printf '%s\n' "$metadata"; return 0 ;;
+    esac
+  fi
+  echo "Could not verify Postgres container '$PGC' state and settings." >&2
+  return 1
+}
 ensure_postgres() {
-  local pg_state pg_cfg want_cfg sig legacy vsig init_hash ok=0 p init volume_missing=0
+  local pg_metadata pg_state pg_cfg want_cfg sig legacy vsig init_hash ok=0 p init volume_rc=0
   local pgargs=() init_fields=()
   local -a required_secrets=("$PGHBASECRET" "$PGPASSSECRET")
   init=$(host_input postgres-init "$PG_INIT") || die "could not inspect the host Postgres init directory"
@@ -2122,8 +2140,14 @@ ensure_postgres() {
   # Postgres only reads user/password/db/init scripts when the data volume is first created, so the
   # volume remembers the settings it was created with; a mismatch is refused instead of silently ignored.
   sig=k1:$(pg_sig "$init_hash")
-  if pm volume exists "$PGVOL" 2>/dev/null; then
-    vsig=$(pm volume inspect "$PGVOL" --format '{{index .Labels "oc.pgcfg"}}' 2>/dev/null || true)
+  pm volume exists -- "$PGVOL" >/dev/null 2>&1 || volume_rc=$?
+  (( volume_rc == 0 || volume_rc == 1 )) || {
+    echo "Could not determine whether Postgres volume '$PGVOL' exists." >&2; return 1;
+  }
+  if (( volume_rc == 0 )); then
+    vsig=$(pm volume inspect "$PGVOL" --format '{{index .Labels "oc.pgcfg"}}' 2>/dev/null) || {
+      echo "Could not verify Postgres volume '$PGVOL' settings." >&2; return 1;
+    }
     # volumes made by earlier versions carry an unkeyed hash: still accepted, with a notice
     legacy=$(printf '%s|%s|%s|%s' "$PG_USER" "$PG_PASSWORD" "$PG_DB" "$init_hash" | sha256sum | cut -c1-16)
     if [[ $vsig == "$legacy" ]]; then
@@ -2141,17 +2165,15 @@ ensure_postgres() {
       echo "    ${0##*/} -i $ILABEL -d && podman volume rm $PGVOL     # then rerun with -p" >&2
       exit 1
     fi
-  else
-    volume_missing=1
   fi
 
   want_cfg="v3:scram:$sig:$PG_IMAGE"
-  pg_state=$(cstate "$PGC")
-  pg_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.pg"}}' "$PGC" 2>/dev/null || true)
+  pg_metadata=$(postgres_container_metadata) || return 1
+  pg_state=${pg_metadata%%:*} pg_cfg=${pg_metadata#*:}
   # A fresh server needs all three secrets. A matching running server only refreshes auth files.
   if [[ $pg_state != running || $pg_cfg != "$want_cfg" ]]; then required_secrets+=("$PGSECRET"); fi
   preflight_pg_secrets "${required_secrets[@]}" || return 1
-  if (( volume_missing )); then
+  if (( volume_rc == 1 )); then
     pm volume create --label oc.sandbox=1 --label "oc.instance=$ILABEL" --label "oc.pgcfg=$sig" "$PGVOL" >/dev/null || return 1
   fi
   if [[ $pg_state != none && $pg_cfg != "$want_cfg" ]]; then
@@ -2281,9 +2303,9 @@ ensure_dind() {
 
 # Stop a legacy Postgres before any pod publishing/recreation can expose it. The
 # versioned label is set only on containers created with the enforced SCRAM HBA.
-if (( PG )) && [[ $(cstate "$PGC") == running ]]; then
-  pg_old_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.pg"}}' "$PGC" 2>/dev/null || true)
-  if [[ $pg_old_cfg != v3:scram:* ]]; then
+if (( PG )); then
+  pg_metadata=$(postgres_container_metadata) || exit 1
+  if [[ $pg_metadata == running:* && $pg_metadata != running:v3:scram:* ]]; then
     log "Stopping legacy Postgres before enabling authenticated host access"
     pm stop -t 5 "$PGC" >/dev/null || die "could not stop legacy Postgres; refusing to publish ports"
   fi

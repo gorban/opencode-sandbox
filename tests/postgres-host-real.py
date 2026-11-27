@@ -113,7 +113,7 @@ def main(scratch):
     shell_functions = '\n'.join(source_function(n) for n in (
         'in_sb', 'trusted_path', 'host_input', 'inspect_pg_init',
         'secret_name_inventory', 'secret_ownership', 'pg_secret_replace_flag', 'preflight_pg_secrets', 'create_pg_secret',
-        'pg_sig', 'urlenc', 'pgpass_field', 'create_pg_auth_secrets', 'ensure_postgres',
+        'pg_sig', 'urlenc', 'pgpass_field', 'create_pg_auth_secrets', 'postgres_container_metadata', 'ensure_postgres',
     ))
     script.write_text('''#!/usr/bin/env bash
 set -euo pipefail

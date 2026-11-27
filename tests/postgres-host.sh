@@ -98,6 +98,7 @@ $(fn secret_ownership)
 $(fn pg_secret_replace_flag)
 $(fn preflight_pg_secrets)
 $(fn create_pg_secret)
+$(fn postgres_container_metadata)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 cstate() { printf '%s\\n' "\${FAKE_STATE:-none}"; }
 log() { :; }; sleep() { :; }
@@ -105,7 +106,7 @@ pm() {
   printf '%s\\0' "\$@" >>"$T/argv"; printf '\\n' >>"$T/argv"
   case "\$1 \${2:-}" in
     'volume exists') return 1 ;;
-    'container inspect') return 1 ;;
+    'container exists'|'container inspect') return 1 ;;
     'secret create') while [[ \$# -gt 2 ]]; do shift; done; cat >"$T/secret.\$1" ;;
     'exec oc-postgres') [[ \${FAIL_AUTH:-0} == 1 && \$* == *' psql '* ]] && return 1 ;;
   esac
@@ -144,8 +145,17 @@ sed -n '/^# Stop a legacy Postgres before/,/^# ---- pod /p' "$SCRIPT" | sed '$d'
 cat >"$T/guard.sh" <<EOF2
 set -u -o pipefail
 PG=1 PGC=oc-postgres
+$(fn postgres_container_metadata)
 cstate() { echo running; }
-pm() { printf '%s\\n' "\$*" >>"$T/guard.log"; [[ \$1 == 'container' ]] && { echo v2:legacy; return 0; }; [[ \$1 == stop ]] && return "\${STOP_FAIL:-0}"; return 0; }
+pm() {
+  printf '%s\\n' "\$*" >>"$T/guard.log"
+  case "\$1 \${2:-}" in
+    'container inspect')
+      [[ \${GUARD_INSPECT_FAIL:-0} == 0 ]] || return 125
+      if [[ \$4 == *State.Status* ]]; then echo running:v2:legacy; else echo v2:legacy; fi ;;
+    'stop -t') return "\${STOP_FAIL:-0}" ;;
+  esac
+}
 log() { :; }; die() { echo "\$*" >&2; exit 2; }
 $(cat "$T/guard.block")
 printf 'after guard\\n'
@@ -154,6 +164,11 @@ EOF2
 check 'legacy running Postgres is stopped before pod handling' grep -q '^stop -t 5 oc-postgres' "$T/guard.log"
 STOP_FAIL=1 bash "$T/guard.sh" >"$T/guard-fail.out" 2>&1; rc=$?
 check 'failed legacy stop prevents pod handling' bash -c '[[ $1 -ne 0 ]] && ! grep -q "after guard" "$2"' _ "$rc" "$T/guard-fail.out"
+: >"$T/guard.log"
+GUARD_INSPECT_FAIL=1 bash "$T/guard.sh" >"$T/guard-fail.out" 2>&1; rc=$?
+check 'a failed Postgres inspection stops pod handling without stopping the server' \
+  bash -c '[[ $1 -ne 0 ]] && ! grep -q "after guard" "$2" && ! grep -q "^stop " "$3"' _ \
+  "$rc" "$T/guard-fail.out" "$T/guard.log"
 # Exercise the pod recreation branch without any real Podman commands.
 sed -n '/^if \[\[ -n \$recreate \]\]; then$/,/^if ! pod_exists; then$/p' "$SCRIPT" | sed '$d' >"$T/recreate.block"
 cat >"$T/recreate.sh" <<EOF2

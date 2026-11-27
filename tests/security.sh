@@ -454,6 +454,7 @@ cat > "$T/pg.sh" <<EOF
 set -euo pipefail
 $(host_input_functions)
 $(pg_secret_functions)
+$(fn postgres_container_metadata)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { echo "==> \$*"; }
@@ -470,11 +471,20 @@ pm() {
     "secret create")
       while [[ \$# -gt 2 ]]; do shift; done
       cat > "$T/secret.\$1" ;;
-    "volume exists") [[ -n \${FAKE_VOLUME_LABEL:-} ]] || return 1 ;;
-    "volume inspect") printf '%s\n' "\${FAKE_VOLUME_LABEL:-}" ;;
+    "volume exists")
+      [[ -z \${FAKE_VOLUME_EXISTS_RC:-} ]] || return "\$FAKE_VOLUME_EXISTS_RC"
+      [[ -n \${FAKE_VOLUME_LABEL:-} ]] || return 1 ;;
+    "volume inspect")
+      [[ -z \${FAKE_VOLUME_INSPECT_FAIL:-} ]] || return 125
+      printf '%s\n' "\${FAKE_VOLUME_LABEL:-}" ;;
+    "container exists")
+      [[ -z \${FAKE_PG_EXISTS_RC:-} ]] || return "\$FAKE_PG_EXISTS_RC"
+      [[ -n \${FAKE_PG_LABEL:-} ]] || return 1 ;;
     "container inspect")
       [[ -n \${FAKE_PG_LABEL:-} ]] || return 1
+      if [[ \$4 == *oc.pg* && -n \${FAKE_PG_INSPECT_FAIL:-} ]]; then return 125; fi
       case "\$4" in
+        *State.Status*oc.pg*) printf 'running:%s\n' "\$FAKE_PG_LABEL" ;;
         *State.Status*) printf '%s\n' running ;;
         *oc.pg*) printf '%s\n' "\$FAKE_PG_LABEL" ;;
       esac ;;
@@ -544,11 +554,27 @@ check 'a matching running Postgres does not preflight its unused bootstrap passw
 check 'a matching running Postgres keeps its unused bootstrap password and container' \
   ! grep -qE '^(rm |stop |run |secret create .* oc-pg-password )' <(tr '\000' ' ' < "$T/argv.log")
 
+for fault in FAKE_PG_INSPECT_FAIL=1 FAKE_PG_EXISTS_RC=125 FAKE_VOLUME_EXISTS_RC=125 FAKE_VOLUME_INSPECT_FAIL=1; do
+  : > "$T/argv.log"
+  env "$fault" FAKE_VOLUME_LABEL="$pg_fixture_sig" FAKE_PG_LABEL="v3:scram:$pg_fixture_sig:img" \
+    bash "$T/pg.sh" </dev/null > "$T/pg.out" 2>&1; rc=$?
+  check "uncertain Postgres state ($fault) refuses setup" test "$rc" -ne 0
+  check "uncertain Postgres state ($fault) leaves the running server and storage intact" \
+    ! grep -qE '^(rm |stop |run |secret create |volume create )' <(tr '\000' ' ' < "$T/argv.log")
+  if [[ $fault == FAKE_VOLUME_INSPECT_FAIL=1 ]]; then
+    check 'failed Postgres volume inspection reports a metadata error' \
+      grep -Fqx "Could not verify Postgres volume 'oc-pg' settings." "$T/pg.out"
+    check 'failed Postgres volume inspection does not suggest discarding data' \
+      ! grep -qF 'discard the data' "$T/pg.out"
+  fi
+done
+
 pgmsg() {  # volume-label [init-directory] -> stderr of ensure_postgres with an existing volume
   cat > "$T/pgm.sh" <<EOF
 set -euo pipefail
 $(host_input_functions)
 $(pg_secret_functions)
+$(fn postgres_container_metadata)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 $(grep "^cstate()" "$SCRIPT")
 log() { :; }; sleep() { :; }
@@ -556,7 +582,7 @@ pm() {
   case "\$1 \${2:-}" in
     "volume exists") return 0 ;;
     "volume inspect") echo '$1' ;;
-    "container inspect") return 1 ;;
+    "container exists"|"container inspect") return 1 ;;
   esac
   return 0
 }
