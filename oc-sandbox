@@ -240,7 +240,7 @@ IMAGE_LOG="$STATE/built-images"
 # Validate each script-owned leaf before even listing or deleting state. Parent
 # directories must prevent other users replacing entries between checks and use.
 validate_host_state() {
-  local scope=${1:-} command=(python3)
+  local scope=${1:-} command=(/usr/bin/python3)
   local paths=("$STATE" "$BUILD" "$POLDIR" "$BRIDGE_STAGE" "$BIN" "$UNITS" "$INSTALL_DIR")
   if [[ -n $scope ]]; then paths=("$2"); fi
   if [[ $scope == host ]]; then command=("${H[@]}" /usr/bin/python3); fi
@@ -489,6 +489,8 @@ if [[ -n ${CONTAINER_ID:-} ]] && command -v distrobox-host-exec >/dev/null 2>&1;
 else
   H=()
 fi
+# Host Python checks reach the host through distrobox's installed dispatcher, named by path.
+readonly HOST_DISPATCH=/usr/bin/distrobox-host-exec
 pm() { "${H[@]}" podman "$@"; }
 sc() { "${H[@]}" systemctl --user "$@"; }
 
@@ -873,7 +875,7 @@ acquire_guard() {  # name, mode; acquire installation, lifecycle, then setup
   if [[ $name == installation ]]; then guard_state=$INSTALL_DIR; fi
   (umask 077; mkdir -p "$guard_state")
   helper=$(trusted_file "$SCRIPT_DIR/oc-setup-lock.py") || die "missing or unsafe oc-setup-lock.py"
-  coproc OC_LOCK_GUARD { exec python3 -I "$helper" "$guard_state" "$guard_name" "$mode" "$ILABEL" "$$"; }
+  coproc OC_LOCK_GUARD { exec /usr/bin/python3 -I "$helper" "$guard_state" "$guard_name" "$mode" "$ILABEL" "$$"; }
   pid=$OC_LOCK_GUARD_PID rfd=${OC_LOCK_GUARD[0]} wfd=${OC_LOCK_GUARD[1]}
   if ! IFS= read -r -u "$rfd" line || [[ $line != LOCKED ]]; then
     exec {wfd}>&-; exec {rfd}<&-; wait "$pid" || true
@@ -893,7 +895,7 @@ release_worktree_lock() { exec {WORKTREE_LOCK_FD}>&-; wait "$WORKTREE_LOCK_PID" 
 # Host-owned metadata: directory and records are opened relative to a no-follow
 # directory fd, and never trusted if a symlink, hard link or unsafe mode is found.
 worktree_state() {  # create | read NAME | drop NAME | write NAME CWD REPO BRANCH
-  python3 -I -c '
+  /usr/bin/python3 -I -c '
 import os, re, secrets, stat, sys
 state, mode, *args = sys.argv[1:]
 def checked_dir(fd, private=False):
@@ -1633,7 +1635,7 @@ else
   log "Checking OpenCode for updates"
   supervisor=$(trusted_file "$SCRIPT_DIR/oc-opencode-supervisor.py") || die "missing or unsafe oc-opencode-supervisor.py"
   update_rc=0
-  python3 -I "$supervisor" "$STATE" "$LEVEL" "$HOMEVOL" \
+  /usr/bin/python3 -I "$supervisor" "$STATE" "$LEVEL" "$HOMEVOL" \
     "$AGENT_IMG" "$AGENT_MEM" "$OPENCODE_VERSION" "${H[@]}" </dev/null || update_rc=$?
   if (( update_rc != 0 )); then
     if compgen -G "$STATE/opencode-update.*" >/dev/null; then
@@ -1648,7 +1650,14 @@ fi
 # agent-writable tree by name and never hands one to VS Code / Beyond Compare: it copies the requested
 # files with descriptor-relative no-follow opens into a host-owned staging directory, opens the copy,
 # and writes saved edits back the same way. See the header of oc-bridge.py. Shared by all instances.
-"${H[@]}" python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
+# The bridge runs under the host's system Python. PATH is inherited from the caller, so name the
+# interpreter, and the dispatcher that reaches it from a distrobox, by absolute path.
+host_python_supported() {
+  local command=(/usr/bin/python3)
+  if (( ${#H[@]} )); then command=("$HOST_DISPATCH" /usr/bin/python3); fi
+  "${command[@]}" -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null
+}
+host_python_supported \
   || echo "warning: the host bridge needs python3 >= 3.11 on the host; 'code'/'bcompare' will do nothing" >&2
 atomic_host_file "$BIN/oc-bridge" 0755 < "$BRIDGE_SRC"
 {
@@ -1774,7 +1783,7 @@ fi
 pg_sig() {
   local key=$STATE/pg-sig.key fd old_umask tmp
   (umask 077; mkdir -p "$STATE")
-  python3 -I -c 'import os, sys
+  /usr/bin/python3 -I -c 'import os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 s = os.fstat(fd)
 if s.st_uid != os.geteuid() or s.st_mode & 0o022: sys.exit("unsafe Postgres state directory")' "$STATE" || return 1
@@ -1786,7 +1795,7 @@ if s.st_uid != os.geteuid() or s.st_mode & 0o022: sys.exit("unsafe Postgres stat
   flock "$fd" || { exec {fd}>&-; return 1; }
   if [[ ! -s $key ]]; then
     tmp=$(mktemp "$STATE/.pg-sig.XXXXXXXX") || { exec {fd}>&-; return 1; }
-    if ! python3 -I -c 'import secrets; print(secrets.token_hex(32), end="")' > "$tmp" \
+    if ! /usr/bin/python3 -I -c 'import secrets; print(secrets.token_hex(32), end="")' > "$tmp" \
       || ! mv -f -- "$tmp" "$key"; then
       rm -f -- "$tmp"; exec {fd}>&-; return 1
     fi
@@ -1998,9 +2007,10 @@ pod_exists() {
 # The stored label is not proof of actual bindings. Refuse malformed, hidden,
 # non-loopback or mismatched mappings before reusing or recreating an existing pod.
 # The caller's directory can be inside the sandbox, so run isolated: without -I, Python
-# would import json and re from that directory before the standard library.
+# would import json and re from that directory before the standard library. PATH is the
+# caller's too, so name the system interpreter by absolute path.
 validate_existing_ports() {
-  python3 -I -c '
+  /usr/bin/python3 -I -c '
 import json, re, sys
 try:
     bindings = json.loads(sys.argv[1]); label = sys.argv[2]; pg = sys.argv[3] == "1"

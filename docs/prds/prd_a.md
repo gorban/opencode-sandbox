@@ -56,5 +56,10 @@ Found by the 2026-11-26 security audit after this grouping passed human review.
       `tests/security.sh` audits that every `python3` option list in the launcher starts with `-I`.
       Both fail on the previous launcher. Branch `fix/launcher-isolated-host-python`; external
       review pending.
+- [x] Review follow-up: that check and the bridge's version probe still found `python3` through the
+      caller's `PATH`. Every host Python call in the launcher now names `/usr/bin/python3`, and
+      the probe reaches the host through distrobox's installed dispatcher path.
+      `tests/postgres-host.sh` and `tests/security.sh` cover both with stand-in commands on
+      `PATH`. Same branch.
 
 - [ ] **Human review**: checked only when the user says so

@@ -41,6 +41,36 @@ echo "host Python isolation (source audit)"
 unisolated=$(grep -nE 'python3"?[[:space:]]+-([^I[:space:]][^[:space:]]*)?([[:space:]]|$)' "$SCRIPT" || true)
 check "every launcher python3 option list starts with -I" test -z "$unisolated"
 [[ -z $unisolated ]] || sed 's/^/        /' <<<"$unisolated"
+# The bridge probe is the one host Python call that crosses from a distrobox to the host. It must
+# use the system interpreter and the dispatcher named by HOST_DISPATCH, never one found through PATH.
+# The PATH canaries record that they ran; the stand-in dispatcher records its arguments and runs them.
+mkdir "$T/probe-path"
+for tool in python3 distrobox-host-exec; do
+  printf '#!/usr/bin/bash\nprintf "%s\\n" >>"$OC_TEST_CANARY"\nexit 1\n' "$tool" > "$T/probe-path/$tool"
+  chmod +x "$T/probe-path/$tool"
+done
+printf '#!/usr/bin/bash\nprintf "%%s\\n" "$*" >>"$OC_TEST_DISPATCHED"\nexec "$@"\n' > "$T/probe-dispatch"
+chmod +x "$T/probe-dispatch"
+{
+  printf 'set -u\nH=()\nif [[ $1 == distrobox ]]; then H=(distrobox-host-exec); fi\nHOST_DISPATCH=%q\n' "$T/probe-dispatch"
+  fn host_python_supported
+  printf 'host_python_supported\n'
+} > "$T/probe.sh"
+probe_rc() {  # local|distrobox -> exit status of the extracted probe under a hostile PATH
+  local rc=0
+  PATH="$T/probe-path:$PATH" OC_TEST_CANARY="$T/probe-canary" OC_TEST_DISPATCHED="$T/probe-dispatched" \
+    bash "$T/probe.sh" "$1" >/dev/null 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+rc=$(probe_rc local)
+check "bridge probe uses the system interpreter, not PATH" \
+  bash -c '[[ $1 == 0 && ! -e $2 && ! -e $3 ]]' _ "$rc" "$T/probe-canary" "$T/probe-dispatched"
+rc=$(probe_rc distrobox)
+check "bridge probe reaches the host through the dispatcher named by HOST_DISPATCH" \
+  bash -c '[[ $1 == 0 && ! -e $2 && $(cat "$3" 2>/dev/null) == "/usr/bin/python3 -I -c "* ]]' \
+  _ "$rc" "$T/probe-canary" "$T/probe-dispatched"
+check "HOST_DISPATCH is the installed distrobox dispatcher" \
+  grep -qx 'readonly HOST_DISPATCH=/usr/bin/distrobox-host-exec' "$SCRIPT"
 
 # ================================================================================================
 echo "postgres.env parsing"

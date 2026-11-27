@@ -58,6 +58,13 @@ for module in json re; do
 done
 (cd "$T/hostile-cwd" && OC_TEST_CANARY="$T/canary" bash "$T/bindings.sh" "$binding" '15432:5432' 1 >/dev/null 2>&1); rc=$?
 check 'port validation ignores modules in the current directory' bash -c '[[ $1 -eq 0 && ! -e $2 ]]' _ "$rc" "$T/canary"
+# PATH is inherited from the caller as well. The interpreter must be the system one, not whichever
+# python3 is found first. The canary records that it ran and then behaves like the real interpreter.
+mkdir "$T/hostile-path"
+printf '#!/usr/bin/bash\nprintf "ran\\n" >>"$OC_TEST_CANARY"\nexec /usr/bin/python3 "$@"\n' >"$T/hostile-path/python3"
+chmod +x "$T/hostile-path/python3"
+(PATH="$T/hostile-path:$PATH" OC_TEST_CANARY="$T/path-canary" bash "$T/bindings.sh" "$binding" '15432:5432' 1 >/dev/null 2>&1); rc=$?
+check 'port validation ignores python3 found through PATH' bash -c '[[ $1 -eq 0 && ! -e $2 ]]' _ "$rc" "$T/path-canary"
 # Exercise the actual inherited-port validation and restoration with a stubbed verifier.
 sed -n '/^INHERITED_PG_VERIFIED=0$/,/^want_podcfg=/p' "$SCRIPT" | sed '$d' >"$T/inherit.block"
 cat >"$T/inherit.sh" <<EOF2
