@@ -1158,18 +1158,24 @@ has_unlabelled_instance_resources() {
   return 1
 }
 
+legacy_pg_secret_name() {
+  [[ $1 =~ ^oc(-[a-z0-9-]+)?-pg-(password|passfile|hba)$ ]]
+}
+
 require_empty_installation() {
-  local managed_pods pods managed_volumes volumes secrets
+  local managed_pods pods managed_volumes volumes secrets name legacy_secret=0
   managed_pods=$(pm pod ls --filter label=oc.sandbox=1 --format '{{.Name}}') \
     || die "could not verify managed pod inventory"
   pods=$(pm pod ls --format '{{.Name}}') || die "could not verify installation pod inventory"
   managed_volumes=$(pm volume ls -q --filter label=oc.sandbox=1) || die "could not verify managed volume inventory"
   volumes=$(pm volume ls -q) || die "could not verify legacy volume inventory"
-  secrets=$(pm secret ls --format '{{.Name}}') || die "could not verify installation secret inventory"
+  secrets=$(secret_name_inventory) || die "could not verify installation secret inventory"
+  while IFS=' ' read -r _ name; do
+    if legacy_pg_secret_name "${name:1:-1}"; then legacy_secret=1; break; fi
+  done <<<"$secrets"
   # Named teardown can also remove these resources when they have no labels.
-  if [[ -n $managed_pods || -n $managed_volumes ]] ||
-      has_unlabelled_instance_resources "$pods" "$volumes" ||
-      grep -qxE 'oc(-[a-z0-9-]+)?-pg-(password|passfile|hba)' <<<"$secrets"; then
+  if [[ -n $managed_pods || -n $managed_volumes ]] || (( legacy_secret )) ||
+      has_unlabelled_instance_resources "$pods" "$volumes"; then
     die "legacy sandbox resources remain without an installation binding; recover the original data root before setup or teardown"
   fi
 }
@@ -1396,7 +1402,7 @@ purge_global_secrets() {
         fi
         continue
       fi
-    elif [[ $ownership != '1 '* ]]; then
+    elif [[ $ownership != '1 '* ]] && ! legacy_pg_secret_name "${name:1:-1}"; then
       continue
     fi
     echo "error: could not establish ownership of secret ID '$id'; kept" >&2
@@ -1404,7 +1410,7 @@ purge_global_secrets() {
   done <<<"$rows"
   rows=$(secret_inventory) || { echo 'error: could not verify final Podman secret inventory' >&2; return 1; }
   while IFS=$'\t' read -r id name ownership; do
-    if [[ $ownership == '1 '* ]] || storage_instance secret "${name:1:-1}" >/dev/null; then
+    if [[ $ownership == '1 '* ]] || legacy_pg_secret_name "${name:1:-1}"; then
       echo "error: secret ID '$id' remains" >&2
       failed=1
     fi
@@ -2067,19 +2073,32 @@ pgpass_field() {
   field=${field//\\/\\\\}; field=${field//:/\\:}
   printf '%s' "$field"
 }
-create_pg_secret() {
-  local target=$1 rows id name ownership
-  local -a options=(--label oc.sandbox=1 --label "oc.instance=$ILABEL")
-  rows=$(secret_name_inventory) || { echo 'Could not verify Podman secret inventory.' >&2; return 1; }
+pg_secret_replace_flag() {
+  local target=$1 rows=$2 id name ownership
   while IFS=' ' read -r id name; do
     [[ $name == \""$target"\" ]] || continue
     if ! ownership=$(secret_ownership "$id" "$name") || [[ $ownership != "1 \"$ILABEL\"" ]]; then
       echo "Could not establish ownership of Podman secret '$target'; kept. See the Uninstall guide for recovery." >&2
       return 1
     fi
-    options+=(--replace)
-    break
+    printf '%s\n' --replace
+    return 0
   done <<<"$rows"
+  return 0
+}
+preflight_pg_secrets() {
+  local rows target
+  rows=$(secret_name_inventory) || { echo 'Could not verify Podman secret inventory.' >&2; return 1; }
+  for target in "$@"; do
+    pg_secret_replace_flag "$target" "$rows" >/dev/null || return 1
+  done
+}
+create_pg_secret() {
+  local target=$1 rows replace
+  local -a options=(--label oc.sandbox=1 --label "oc.instance=$ILABEL")
+  rows=$(secret_name_inventory </dev/null) || { echo 'Could not verify Podman secret inventory.' >&2; return 1; }
+  replace=$(pg_secret_replace_flag "$target" "$rows" </dev/null) || return 1
+  [[ -z $replace ]] || options+=("$replace")
   pm secret create "${options[@]}" -- "$target" - >/dev/null
 }
 create_pg_auth_secrets() {
@@ -2089,8 +2108,9 @@ create_pg_auth_secrets() {
     create_pg_secret "$PGPASSSECRET" || return 1
 }
 ensure_postgres() {
-  local pg_state pg_cfg want_cfg sig legacy vsig init_hash ok=0 p init
+  local pg_state pg_cfg want_cfg sig legacy vsig init_hash ok=0 p init volume_missing=0
   local pgargs=() init_fields=()
+  local -a required_secrets=("$PGHBASECRET" "$PGPASSSECRET")
   init=$(host_input postgres-init "$PG_INIT") || die "could not inspect the host Postgres init directory"
   mapfile -t init_fields <<<"$init"
   init_hash=${init_fields[1]:-}
@@ -2122,15 +2142,21 @@ ensure_postgres() {
       exit 1
     fi
   else
-    pm volume create --label oc.sandbox=1 --label "oc.instance=$ILABEL" --label "oc.pgcfg=$sig" "$PGVOL" >/dev/null
+    volume_missing=1
   fi
 
   want_cfg="v3:scram:$sig:$PG_IMAGE"
   pg_state=$(cstate "$PGC")
   pg_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.pg"}}' "$PGC" 2>/dev/null || true)
+  # A fresh server needs all three secrets. A matching running server only refreshes auth files.
+  if [[ $pg_state != running || $pg_cfg != "$want_cfg" ]]; then required_secrets+=("$PGSECRET"); fi
+  preflight_pg_secrets "${required_secrets[@]}" || return 1
+  if (( volume_missing )); then
+    pm volume create --label oc.sandbox=1 --label "oc.instance=$ILABEL" --label "oc.pgcfg=$sig" "$PGVOL" >/dev/null || return 1
+  fi
   if [[ $pg_state != none && $pg_cfg != "$want_cfg" ]]; then
     log "Postgres container settings changed; recreating it (data volume $PGVOL is kept)"
-    pm rm -f "$PGC" >/dev/null; pg_state=none
+    pm rm -f "$PGC" >/dev/null || return 1; pg_state=none
   fi
   # A stopped container is recreated so every start receives fresh, script-owned
   # secrets. PostgreSQL reads hba_file at process start, before any TCP listener.
@@ -2348,7 +2374,19 @@ if [[ -n $recreate ]]; then
     exit 1
   fi
   # keep the sidecars this instance had (their data lives in volumes)
-  if [[ $(cstate "$PGC") != none ]] && (( !PG )); then PG=1; load_pg_config; fi
+  if (( !PG )); then
+    pg_exists_rc=0
+    pm container exists -- "$PGC" || pg_exists_rc=$?
+    case $pg_exists_rc in
+      0) PG=1; load_pg_config ;;
+      1) ;;
+      *) die "could not determine whether Postgres container '$PGC' exists; pod retained" ;;
+    esac
+  fi
+  if (( PG )); then
+    preflight_pg_secrets "$PGHBASECRET" "$PGPASSSECRET" "$PGSECRET" ||
+      die "refusing to recreate pod '$POD' without verified Postgres secrets"
+  fi
   [[ $(cstate "$DINDC") != none ]] && DIND=1
   log "Recreating pod '$POD' ($recreate)"
   pm pod rm -f "$POD" >/dev/null

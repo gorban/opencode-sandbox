@@ -93,7 +93,11 @@ PGPASSSECRET=oc-pg-passfile PGHBASECRET=oc-pg-hba PG_INIT=$T/no-init INST= ILABE
 PG_IMAGE=img PG_USER=app PG_DB=db PG_PASSWORD='p:a\\b' PORTS=(15432:5432)
 SB=$T/sandbox H=()
 $(fn in_sb); $(fn trusted_path); $(fn host_input); $(fn inspect_pg_init)
-$(fn secret_name_inventory); $(fn secret_ownership); $(fn create_pg_secret)
+$(fn secret_name_inventory)
+$(fn secret_ownership)
+$(fn pg_secret_replace_flag)
+$(fn preflight_pg_secrets)
+$(fn create_pg_secret)
 $(fn pg_sig); $(fn urlenc); $(fn pgpass_field); $(fn create_pg_auth_secrets); $(fn ensure_postgres)
 cstate() { printf '%s\\n' "\${FAKE_STATE:-none}"; }
 log() { :; }; sleep() { :; }
@@ -150,6 +154,49 @@ EOF2
 check 'legacy running Postgres is stopped before pod handling' grep -q '^stop -t 5 oc-postgres' "$T/guard.log"
 STOP_FAIL=1 bash "$T/guard.sh" >"$T/guard-fail.out" 2>&1; rc=$?
 check 'failed legacy stop prevents pod handling' bash -c '[[ $1 -ne 0 ]] && ! grep -q "after guard" "$2"' _ "$rc" "$T/guard-fail.out"
+# Exercise the pod recreation branch without any real Podman commands.
+sed -n '/^if \[\[ -n \$recreate \]\]; then$/,/^if ! pod_exists; then$/p' "$SCRIPT" | sed '$d' >"$T/recreate.block"
+cat >"$T/recreate.sh" <<EOF2
+set -euo pipefail
+PG=\$1 POD=oc AGENT=oc-agent PGC=oc-postgres DINDC=oc-dind ILABEL=default
+PGHBASECRET=oc-pg-hba PGPASSSECRET=oc-pg-passfile PGSECRET=oc-pg-password
+recreate='port mapping changed'
+$(fn secret_name_inventory)
+$(fn secret_ownership)
+$(fn pg_secret_replace_flag)
+$(fn preflight_pg_secrets)
+cstate() { if [[ \$1 == oc-postgres ]]; then printf '%s\\n' "\${FAKE_PG_STATE:-none}"; else echo none; fi; }
+any_relay_running() { return 1; }
+load_pg_config() { :; }
+log() { :; }; die() { echo "\$*" >&2; exit 2; }
+pm() {
+  printf '%s\\n' "\$*" >>"$T/recreate.log"
+  case "\$1 \${2:-}" in
+    'container exists')
+      [[ \${FAKE_PG_EXISTS_FAIL:-0} == 0 ]] || return 125
+      [[ \${FAKE_PG_STATE:-none} != none ]] ;;
+    'secret ls') printf '%s\\n' 'aaaaaaaaaaaaaaaaaaaaaaaaa "oc-pg-password"' ;;
+    'secret inspect') printf '%s\\n' 'aaaaaaaaaaaaaaaaaaaaaaaaa "oc-pg-password" 0 ""' ;;
+  esac
+}
+$(cat "$T/recreate.block")
+EOF2
+for requested_postgres in 1 0; do
+  : >"$T/recreate.log"
+  FAKE_PG_STATE=running bash "$T/recreate.sh" "$requested_postgres" >"$T/recreate.out" 2>&1; rc=$?
+  check "pod recreation with Postgres preserves the pod on preflight failure (explicit -p: $requested_postgres)" \
+    bash -c '[[ $1 -ne 0 ]] && grep -q "without verified Postgres secrets" "$2" && ! grep -q "^pod rm " "$3"' \
+    _ "$rc" "$T/recreate.out" "$T/recreate.log"
+done
+: >"$T/recreate.log"
+FAKE_PG_EXISTS_FAIL=1 bash "$T/recreate.sh" 0 >"$T/recreate.out" 2>&1; rc=$?
+check 'an uncertain inherited Postgres container keeps the pod intact' \
+  bash -c '[[ $1 -ne 0 ]] && grep -q "could not determine whether Postgres container" "$2" && ! grep -q "^pod rm " "$3"' \
+  _ "$rc" "$T/recreate.out" "$T/recreate.log"
+: >"$T/recreate.log"
+bash "$T/recreate.sh" 0 >"$T/recreate.out" 2>&1; rc=$?
+check 'pod recreation without Postgres does not query Postgres secrets' \
+  bash -c '[[ $1 -eq 0 ]] && grep -qx "pod rm -f oc" "$2" && ! grep -q "^secret " "$2"' _ "$rc" "$T/recreate.log"
 # Run the actual agent passfile decision and launch-argument block with stubbed Podman.
 sed -n '/^agent_pg=0$/,/^if \[\[ \$(cstate "\$DINDC")/p' "$SCRIPT" | sed '$d' >"$T/agent.block"
 cat >"$T/agent.sh" <<EOF2

@@ -34,6 +34,8 @@ host_input_functions() {
 pg_secret_functions() {
   fn secret_name_inventory
   fn secret_ownership
+  fn pg_secret_replace_flag
+  fn preflight_pg_secrets
   fn create_pg_secret
 }
 SECRET=TOP-SECRET-HOST-DATA
@@ -431,6 +433,7 @@ set -euo pipefail
 $(host_input_functions)
 $(fn ensure_postgres)
 PG_INIT=$T/pg-init
+PGHBASECRET=oc-pg-hba PGPASSSECRET=oc-pg-passfile PGSECRET=oc-pg-password
 die() { echo "\$*"; exit 2; }
 pg_sig() { :; }
 pm() { echo unexpected-podman-call; exit 4; }
@@ -458,12 +461,23 @@ sleep() { :; }
 pm() {
   printf '%s\0' "\$@" >> $T/argv.log; printf '\n' >> $T/argv.log
   case "\$1 \${2:-}" in
-    "secret ls") printf '%s' "\${FAKE_SECRET_LIST:-}" ;;
-    "secret inspect") printf '%s' "\${FAKE_SECRET_INSPECT:-}" ;;
+    "secret ls"|"secret inspect")
+      if [[ \${FAKE_ASSERT_METADATA_STDIN:-0} == 1 ]] && { IFS= read -r unexpected || [[ -n \$unexpected ]]; }; then
+        echo 'metadata received fixture input' >&2
+        return 97
+      fi
+      if [[ \$2 == ls ]]; then printf '%s' "\${FAKE_SECRET_LIST:-}"; else printf '%s' "\${FAKE_SECRET_INSPECT:-}"; fi ;;
     "secret create")
       while [[ \$# -gt 2 ]]; do shift; done
       cat > "$T/secret.\$1" ;;
-    "volume exists"|"container inspect") return 1 ;;
+    "volume exists") [[ -n \${FAKE_VOLUME_LABEL:-} ]] || return 1 ;;
+    "volume inspect") printf '%s\n' "\${FAKE_VOLUME_LABEL:-}" ;;
+    "container inspect")
+      [[ -n \${FAKE_PG_LABEL:-} ]] || return 1
+      case "\$4" in
+        *State.Status*) printf '%s\n' running ;;
+        *oc.pg*) printf '%s\n' "\$FAKE_PG_LABEL" ;;
+      esac ;;
   esac
   return 0
 }
@@ -499,10 +513,36 @@ for pg_ownership in '0 ""' '1 "other"'; do
 done
 : > "$T/argv.log"
 FAKE_SECRET_LIST="$pg_fixture_id \"oc-pg-hba\"" \
-  FAKE_SECRET_INSPECT="$pg_fixture_id \"oc-pg-hba\" 1 \"default\"" bash "$T/pg.sh" > "$T/pg.out" 2>&1; rc=$?
+  FAKE_SECRET_INSPECT="$pg_fixture_id \"oc-pg-hba\" 1 \"default\"" FAKE_ASSERT_METADATA_STDIN=1 \
+  bash "$T/pg.sh" </dev/null > "$T/pg.out" 2>&1; rc=$?
 check 'Postgres setup refreshes a verified same-name secret' test "$rc" -eq 0
+check 'only the secret writer receives credential stdin' ! grep -q 'metadata received fixture input' "$T/pg.out"
 check 'existing owned Postgres secret is replaced with labels' \
   grep -qaF -- --replace "$T/argv.log"
+
+pg_fixture_sig=k1:$({ cat "$T/state/pg-sig.key"; printf '|app|%s|db|' "$PW"; } | sha256sum | cut -c1-16)
+for pg_secret in oc-pg-hba oc-pg-passfile oc-pg-password; do
+  : > "$T/argv.log"
+  FAKE_VOLUME_LABEL="$pg_fixture_sig" FAKE_PG_LABEL="v3:scram:$pg_fixture_sig:previous-image" \
+    FAKE_SECRET_LIST="$pg_fixture_id \"$pg_secret\"" FAKE_SECRET_INSPECT="$pg_fixture_id \"$pg_secret\" 0 \"\"" \
+    bash "$T/pg.sh" > "$T/pg.out" 2>&1; rc=$?
+  check "Postgres image change refuses unverified $pg_secret" test "$rc" -ne 0
+  check "unverified $pg_secret preserves the running server and every secret" \
+    ! grep -qE '^(rm |stop |run |secret create |volume create )' <(tr '\000' ' ' < "$T/argv.log")
+done
+: > "$T/argv.log"
+FAKE_SECRET_LIST="$pg_fixture_id \"oc-pg-password\"" FAKE_SECRET_INSPECT="$pg_fixture_id \"oc-pg-password\" 0 \"\"" \
+  bash "$T/pg.sh" > "$T/pg.out" 2>&1; rc=$?
+check 'unverified password on first start fails before creating the data volume or secrets' \
+  ! grep -qE '^(secret create |volume create )' <(tr '\000' ' ' < "$T/argv.log")
+check 'unverified password on first start prevents setup' test "$rc" -ne 0
+: > "$T/argv.log"
+FAKE_VOLUME_LABEL="$pg_fixture_sig" FAKE_PG_LABEL="v3:scram:$pg_fixture_sig:img" \
+  FAKE_SECRET_LIST="$pg_fixture_id \"oc-pg-password\"" FAKE_SECRET_INSPECT="$pg_fixture_id \"oc-pg-password\" 0 \"\"" \
+  bash "$T/pg.sh" > "$T/pg.out" 2>&1; rc=$?
+check 'a matching running Postgres does not preflight its unused bootstrap password' test "$rc" -eq 0
+check 'a matching running Postgres keeps its unused bootstrap password and container' \
+  ! grep -qE '^(rm |stop |run |secret create .* oc-pg-password )' <(tr '\000' ' ' < "$T/argv.log")
 
 pgmsg() {  # volume-label [init-directory] -> stderr of ensure_postgres with an existing volume
   cat > "$T/pgm.sh" <<EOF
@@ -1133,7 +1173,9 @@ list_secret_fixture() {
   count=\$(grep -c '^podman secret ls --format {{.ID}} ' "$T/stub.log")
   [ -n "\${STUB_SECRET_LS_FAIL:-}" ] && return 125
   [ "\${STUB_SECRET_LS_FAIL_AT:-}" = "\$count" ] && return 125
-  printf '%b' "\${STUB_SECRET_ROWS:-}" | while read -r id name marker owner; do
+  rows=\${STUB_SECRET_ROWS:-}
+  if [ "\$count" -ge 3 ]; then rows=\$rows\${STUB_SECRET_LATE_ROWS:-}; fi
+  printf '%b' "\$rows" | while read -r id name marker owner; do
     if [ "\${STUB_STORAGE_STAYS:-}" != "\$id" ] && [ "\${STUB_SECRET_REMOVE_FAIL:-}" != "\$id" ] &&
        grep -Fqx "podman secret rm -- \$id" "$T/stub.log"; then continue; fi
     printf '%s %s\n' "\$id" "\$name"
@@ -1229,7 +1271,7 @@ case "\$1 \$2" in
     else list_secret_fixture; exit \$?; fi ;;
   "secret inspect")
     [ -n "\${STUB_SECRET_INSPECT_FAIL:-}" ] && exit 125
-    printf '%b' "\${STUB_SECRET_ROWS:-}" | while read -r id name marker owner; do
+    printf '%b' "\${STUB_SECRET_ROWS:-}\${STUB_SECRET_LATE_ROWS:-}" | while read -r id name marker owner; do
       [ "\$id" = "\${6:-}" ] && printf '%s %s %s %s\n' "\$id" "\$name" "\$marker" "\$owner"
     done; exit 0 ;;
   "image inspect")  # STUB_IDS="name=id ...": the image each tag points to; images have no tags left
@@ -1655,6 +1697,23 @@ check 'global purge preserves legacy, mismatched and unexpected labelled storage
 check 'unresolved storage prevents completion' grep -qx 'rc=1' <<<"$out"
 check 'unresolved storage keeps the installation binding and state' \
   test -d "$DSTATE/build" -a -f "$T/dhome/.config/systemd/user/.oc-sandbox/binding"
+
+secret_alias="$secret_other \"oc-default-pg-password\" 0 \"\""$'\n'
+out=$(pathrun STUB_SECRET_ROWS="$secret_alias" STUB_SECRETS=$'oc-default-pg-password\n' -- -d -a -y)
+check 'a legacy default-alias secret is kept untouched' ! grep -q '^podman secret rm' "$T/stub.log"
+check 'a legacy default-alias secret makes the purge incomplete' grep -qx 'rc=1' <<<"$out"
+check 'a legacy default-alias secret keeps the installation binding' \
+  test -f "$T/dhome/.config/systemd/user/.oc-sandbox/binding"
+mkdir -p "$T/alias-secret-home"
+out=$(pathrun HOME="$T/alias-secret-home" STUB_PODS_ABSENT=1 \
+  STUB_SECRET_ROWS="$secret_alias" STUB_SECRETS=$'oc-default-pg-password\n' -- -d -a -y)
+check 'installation admission recognises the same unbound legacy default-alias secret' \
+  grep -q 'legacy sandbox resources remain without an installation binding' <<<"$out"
+out=$(pathrun STUB_SECRET_ROWS="$secret_one" STUB_SECRET_LATE_ROWS="$secret_alias" -- -d -a -y)
+check 'final inventory detects a legacy alias absent from the initial inventory' grep -qx 'rc=1' <<<"$out"
+check 'a final legacy alias retains binding and is never removed' \
+  bash -c 'test -f "$1" && ! grep -Fxq "podman secret rm -- $2" "$3"' _ \
+  "$T/dhome/.config/systemd/user/.oc-sandbox/binding" "$secret_other" "$T/stub.log"
 
 for disappearance in '' oc-home; do
   out=$(pathrun STUB_VOLUME_ROWS="$volume_one"$'oc-home-foreign 0 ""\n' \
