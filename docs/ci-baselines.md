@@ -31,3 +31,9 @@ for the attended import and its scope.
 - **Dependabot version updates** propose new commits for the pinned Actions each week, once a
   release is seven days old. Review the upstream changes between the two commits before merging.
   Dependabot security updates are a repository setting and are not delayed.
+- **Renovate** (`.github/renovate.json`) proposes updates only for image references pinned by
+  digest in the launcher and for the mise tools under `tools/ci`. It is configured never to merge, and opens no
+  dashboard issue and no vulnerability pull requests. A pull request labelled
+  `no-release-age-check` comes from a registry that reports no release date, so leave it open for
+  a week before merging. One labelled `needs-checksum-update` also needs new checksums in
+  `tools/ci/mise.lock` and `tools/ci/toolchain.py` before its checks can pass.

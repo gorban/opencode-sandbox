@@ -140,10 +140,22 @@ when inspected. This establishes the check identity and a scope gap. PR qualific
   - [x] Dependabot alerts and security updates are enabled in the repository settings
         (2026-11-27). `.github/dependabot.yml` adds weekly version updates for the pinned
         Actions with a seven-day cooldown (`fix/launcher-isolated-host-python`).
-  - [ ] Qualify the first Dependabot update PR: the required checks run, the CodeQL upload
-        completes, and the pinned commit and its version comment are both updated.
-  - [ ] Decide how the web UI spike lockfile, mise tools, image references and pins inside the
-        launcher are refreshed. Dependabot version updates do not cover them.
+  - [x] Qualify the first Dependabot update PR: the required checks run, the CodeQL upload
+        completes, and the pinned commit and its version comment are both updated. PR #91
+        (`actions/checkout` 6.0.2 to 7.0.1) passed all ten checks, including both CodeQL
+        uploads, and changed the commit and the comment at all four uses.
+  - [x] Scope Mend Renovate to what Dependabot cannot read: image references pinned by digest
+        in the launcher, and the mise tools under `tools/ci`. `.github/renovate.json` turns off
+        automerge, the dashboard issue and vulnerability pull requests, opens at most three
+        pull requests in a weekly window, and waits seven days after a release. Registries that
+        report no release date get a `no-release-age-check` label instead of the wait. A
+        contract test in `tests/test_ci.py` holds those settings and checks that every
+        digest-pinned launcher image is matched (`chore/renovate-gaps`).
+  - [ ] Install the Mend Renovate app on this repository only, after the config is on `main`,
+        and qualify its first pull request the same way as the Dependabot one.
+  - [ ] Still refreshed by hand: the two digest-only Sonar images in
+        `tools/ci/sonar_sandbox.py`, which have no tag for a bot to follow; the file hashes for
+        the mise bootstrap, the coverage wheel and ShellCheck; and the web UI spike lockfile.
 - [ ] Keep baseline scanners in jobs outside the merge requirement. A completed scan reports
   findings without blocking. A tool, config, input, inventory, database or upload failure fails
   its job. An expected scan that cannot run is an explicit error. Preserve raw finding counts

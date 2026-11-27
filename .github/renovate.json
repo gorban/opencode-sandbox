@@ -1,0 +1,47 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Renovate refreshes only the pins that Dependabot cannot read: image references pinned by digest inside the launcher, and the mise tools used by CI.",
+    "GitHub Actions stay with Dependabot (.github/dependabot.yml).",
+    "Every update is a pull request for a person to review and merge. Renovate is configured never to merge."
+  ],
+  "extends": [":disableDependencyDashboard"],
+  "enabledManagers": ["custom.regex", "mise"],
+  "ignorePaths": ["docs/prds/spikes/**"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Image references written as name:tag@sha256:digest in the launcher.",
+      "managerFilePatterns": ["/^oc-sandbox$/"],
+      "matchStrings": [
+        "(?<depName>[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:/[a-z0-9][a-z0-9._-]*)+):(?<currentValue>[A-Za-z0-9_][A-Za-z0-9._-]*)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    }
+  ],
+  "automerge": false,
+  "platformAutomerge": false,
+  "vulnerabilityAlerts": { "enabled": false },
+  "osvVulnerabilityAlerts": false,
+  "minimumReleaseAge": "7 days",
+  "schedule": ["* 0-5 * * 1"],
+  "prConcurrentLimit": 3,
+  "prHourlyLimit": 1,
+  "rebaseWhen": "conflicted",
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Only Docker Hub reports when a digest was published. Propose digests from these registries without the seven-day wait, and label the pull request so the reviewer applies the wait.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["ghcr.io/**", "quay.io/**", "registry.fedoraproject.org/**"],
+      "minimumReleaseAgeBehaviour": "timestamp-optional",
+      "addLabels": ["no-release-age-check"]
+    },
+    {
+      "description": "A mise tool update also needs new checksums in tools/ci/mise.lock and tools/ci/toolchain.py, which a person adds.",
+      "matchManagers": ["mise"],
+      "addLabels": ["needs-checksum-update"]
+    }
+  ]
+}
