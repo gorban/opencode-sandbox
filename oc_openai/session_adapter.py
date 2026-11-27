@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import secrets
+import threading
 import time
 
 from oc_providers.contracts import (
@@ -52,6 +53,73 @@ class _OpenAISlotTarget:
     profile: Profile
     conn: object
     binding: object
+
+
+class _SlotReleaseGate:
+    """Thread-safe durable lease release predicate bound to coordinator authority and sticky revocation."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._relay_created = False
+        self._relay_removed = False
+        self._release_authorized = False
+        self._release_denied = False
+        self._authority: Callable[[], bool] | None = None
+        self._outcome: str | None = None
+
+    def mark_relay_created(self) -> None:
+        with self._lock:
+            self._relay_created = True
+            self._relay_removed = False
+            self._release_authorized = False
+
+    def confirm_relay_removed(self) -> None:
+        with self._lock:
+            if not self._release_denied:
+                self._relay_removed = True
+
+    def authorize_release(self) -> None:
+        with self._lock:
+            if self._release_denied:
+                return
+            if not self._relay_created or self._relay_removed:
+                self._release_authorized = True
+
+    def deny_release(self) -> None:
+        with self._lock:
+            self._release_denied = True
+            self._release_authorized = False
+            self._relay_removed = False
+
+    def bind_authority(self, predicate: Callable[[], bool]) -> None:
+        if not callable(predicate):
+            raise ProviderIntegrityError("invalid_slot_hook", "Release authority predicate must be callable.")
+        with self._lock:
+            if self._authority is not None:
+                raise ProviderIntegrityError("duplicate_release_authority", "Release authority is already bound.")
+            self._authority = predicate
+
+    def record_outcome(self, outcome: str) -> None:
+        with self._lock:
+            self._outcome = outcome
+
+    def is_release_confirmed(self) -> bool:
+        with self._lock:
+            return (not self._release_denied) and self._outcome in ("removed", "absent")
+
+    def allows_release(self) -> bool:
+        with self._lock:
+            if self._release_denied:
+                return False
+            if self._relay_created and not (self._relay_removed and self._release_authorized):
+                return False
+            authority = self._authority
+        if authority is None:
+            return True
+        try:
+            return authority() is True
+        except Exception:
+            return False
 
 
 class OpenAISessionAdapter:
@@ -217,31 +285,88 @@ class OpenAISessionAdapter:
         return self._proof_gate
 
     @staticmethod
-    def _teardown_slot_resources(job: _SessionJob, broker: SessionBroker | None, lease_cm) -> None:
-        cleanup_error: Exception | None = None
-        for step in (
-            job.revoke,
-            (broker.close if broker is not None else None),
-            (lambda: lease_cm.__exit__(None, None, None)),
-        ):
-            if step is None:
-                continue
-            try:
-                step()
-            except Exception as exc:
-                cleanup_error = cleanup_error or exc
+    def _run_cleanup_step(
+        step: Callable[[], None] | None,
+        on_cleanup_error: Callable[[], None] | None,
+    ) -> Exception | None:
+        if step is None:
+            return None
+        try:
+            step()
+        except Exception as exc:
+            if on_cleanup_error is not None:
+                on_cleanup_error()
+            return exc
+        return None
+
+    @staticmethod
+    def _teardown_slot_resources(
+        job: _SessionJob,
+        broker: SessionBroker | None,
+        lease_cm,
+        *,
+        on_cleanup_error: Callable[[], None] | None = None,
+    ) -> None:
+        cleanup_error = OpenAISessionAdapter._run_cleanup_step(job.revoke, on_cleanup_error)
+        broker_err = OpenAISessionAdapter._run_cleanup_step(
+            broker.close if broker is not None else None, on_cleanup_error,
+        )
+        cleanup_error = cleanup_error or broker_err
+        if broker is not None:
+            with broker._lock:
+                still_active = bool(broker._clients)
+            if still_active:
+                cleanup_error = cleanup_error or RuntimeError("Slot broker still has active clients during teardown")
+                if on_cleanup_error is not None:
+                    on_cleanup_error()
+        lease_err = OpenAISessionAdapter._run_cleanup_step(
+            lambda: lease_cm.__exit__(None, None, None), None,
+        )
+        cleanup_error = cleanup_error or lease_err
         if cleanup_error is not None:
             raise cleanup_error
+
+    @staticmethod
+    def _open_slot_lease(backend, profile: Profile, binding, job: _SessionJob, release_gate: _SlotReleaseGate):
+        if hasattr(backend, "profile_session_lease_with_result"):
+            lease_cm = backend.profile_session_lease_with_result(
+                profile,
+                binding,
+                job,
+                release_gate=release_gate.allows_release,
+                on_release_result=release_gate.record_outcome,
+            )
+            return lease_cm, True
+        lease_cm = backend.profile_session_lease(
+            profile.label,
+            profile.epoch,
+            binding,
+            job,
+            directory=profile.directory,
+            client_id=profile.client_id,
+            release_gate=release_gate.allows_release,
+        )
+        return lease_cm, False
+
+    @staticmethod
+    def _job_route_state(job: _SessionJob) -> SlotRouteState:
+        lease_obj = job.lease
+        if lease_obj is None:
+            return "retired"
+        status = lease_obj.status()
+        if status == "pending":
+            return "pending" if lease_obj.deadline_ns > time.monotonic_ns() else "retired"
+        if status == "active":
+            return "active" if lease_obj.active() else "retired"
+        return "retired"
 
     @contextmanager
     def _open_slot_phase(self, preflight: InstancePreflight, cfg: dict[str, object], *, discovery_only: bool):
         backend = self._get_backend()
         target = preflight.handle
-        if not isinstance(target, _OpenAISlotTarget):
-            raise ProviderIntegrityError("invalid_slot_handle", "Missing OpenAI preflight handle.")
+        if not isinstance(target, _OpenAISlotTarget) or target.profile.client_id is None:
+            raise ProviderIntegrityError("invalid_slot_handle", "Missing or unpublished OpenAI preflight handle.")
         profile = target.profile
-        if profile.client_id is None:
-            raise ProviderIntegrityError("invalid_slot_handle", "OpenAI registration is not published.")
 
         slot_index = int(cfg["slot_index"])
         slot_root = Path(cfg["slot_root"])
@@ -256,31 +381,10 @@ class OpenAISessionAdapter:
         slot_proof_gate = self._select_slot_proof_gate(
             preflight.spec.scoped_id, job, discovery_only=discovery_only,
         )
-        release_state: dict[str, object] = {"allowed": True, "outcome": None}
-
-        def record_release(outcome: str) -> None:
-            release_state["outcome"] = outcome
-
-        if hasattr(backend, "profile_session_lease_with_result"):
-            lease_cm = backend.profile_session_lease_with_result(
-                profile,
-                target.binding,
-                job,
-                release_gate=lambda: bool(release_state["allowed"]),
-                on_release_result=record_release,
-            )
-            has_release_result = True
-        else:
-            lease_cm = backend.profile_session_lease(
-                profile.label,
-                profile.epoch,
-                target.binding,
-                job,
-                directory=profile.directory,
-                client_id=profile.client_id,
-                release_gate=lambda: bool(release_state["allowed"]),
-            )
-            has_release_result = False
+        release_gate = _SlotReleaseGate()
+        lease_cm, has_release_result = self._open_slot_lease(
+            backend, profile, target.binding, job, release_gate,
+        )
         lease = lease_cm.__enter__()
         broker: SessionBroker | None = None
         defer_turn_bind = (
@@ -329,29 +433,6 @@ class OpenAISessionAdapter:
                     defer_bind=defer_turn_bind,
                 )
 
-            def mark_relay_created() -> None:
-                release_state["allowed"] = False
-
-            def confirm_relay_removed() -> None:
-                release_state["allowed"] = True
-
-            def lease_release_confirmed() -> bool:
-                return release_state["outcome"] in ("removed", "absent")
-
-            def route_state() -> SlotRouteState:
-                lease_obj = job.lease
-                if lease_obj is None:
-                    return "retired"
-                status = lease_obj.status()
-                if status == "pending":
-                    return "pending" if lease_obj.deadline_ns > time.monotonic_ns() else "retired"
-                if status == "active":
-                    return "active" if lease_obj.active() else "retired"
-                return "retired"
-
-            def is_revoked() -> bool:
-                return bool(broker._revoked.is_set())
-
             def has_active_clients() -> bool:
                 with broker._lock:
                     return bool(broker._clients)
@@ -365,10 +446,13 @@ class OpenAISessionAdapter:
                 broker=broker,
                 lease=lease,
                 build_relay_args=build_relay_args,
-                mark_relay_created=mark_relay_created,
-                confirm_relay_removed=confirm_relay_removed,
+                mark_relay_created=release_gate.mark_relay_created,
+                confirm_relay_removed=release_gate.confirm_relay_removed,
+                authorize_lease_release=release_gate.authorize_release,
+                deny_lease_release=release_gate.deny_release,
+                bind_release_authority=release_gate.bind_authority,
                 lease_release_confirmed=(
-                    lease_release_confirmed
+                    release_gate.is_release_confirmed
                     if (has_release_result or self._proof_gate is not None)
                     else None
                 ),
@@ -381,12 +465,14 @@ class OpenAISessionAdapter:
                 revoke_grant=job.revoke,
                 close_broker=broker.close,
                 activate_route=job.activate,
-                route_state=route_state,
-                is_revoked=is_revoked,
+                route_state=lambda: self._job_route_state(job),
+                is_revoked=lambda: bool(broker._revoked.is_set()),
                 has_active_clients=has_active_clients,
             )
         finally:
-            self._teardown_slot_resources(job, broker, lease_cm)
+            self._teardown_slot_resources(
+                job, broker, lease_cm, on_cleanup_error=release_gate.deny_release,
+            )
 
     @contextmanager
     def open_slot(

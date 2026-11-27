@@ -3023,6 +3023,7 @@ esac
                 patch.object(session_broker.tempfile, "mkdtemp", side_effect=tracking_mkdtemp),
                 patch.object(session_broker, "_verify_pod_with_containers", return_value=("1" * 64, [])),
                 patch.object(session_broker, "_ensure_containers_idle"),
+                patch.object(session_broker, "_verify_relay_prestart"),
                 patch.object(session_broker, "podman", side_effect=podman_fn),
             ):
                 with self.assertRaisesRegex(JobRuntimeError, expected_pat):
