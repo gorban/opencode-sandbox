@@ -104,11 +104,15 @@ support the inference, but that message alone does not identify the exact cause.
   test. Report exactly what was checked and any unrelated changes; a finite file list cannot establish
   that every host setting was unchanged.
 
-The host-only `host-browser-control-regression.py`, `host-chrome-isolation-regression.py`,
-`host-chrome-portal-regression.py`, and `repair-host-chrome-portal-regression.py` check control-file
-isolation, sibling mounts, the filtered-bus wrapper requirement and the scoped repair. Read each
-script's usage; they use disposable scratch and do not open a GUI or install trust.
+The host-only `host-browser-control-regression.py`, `host-chrome-isolation-regression.py`, and
+`host-chrome-portal-regression.py` check control-file isolation, sibling mounts, and the filtered-bus
+wrapper requirement. Read each script's usage. They use disposable scratch without opening a GUI
+or installing trust.
+
+Run the offline repair check with `python3 -I docs/prds/spikes/e1/repair-host-chrome-portal-regression.py`.
+It creates its own temporary browser and portal fixtures and verifies the real repair builder's mounts,
+launcher replacement, and refusal cases. The attended repair above takes its own manifest and exports.
 
 `host-browser-source-regression.py` uses private temporary fixtures to check rejection of external
 executable-source arguments and host-home paths containing spaces. Run it with `python3 -I`; it needs
-no Flatpak or retained crypto assets. The other regressions load only their adjacent repository builders.
+no Flatpak or retained crypto assets. The regressions load only their adjacent repository builders.
