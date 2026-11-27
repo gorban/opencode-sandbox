@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from contextlib import ExitStack, contextmanager, nullcontext
+import ssl
 from tempfile import TemporaryDirectory
 from threading import RLock
 import time
@@ -28,7 +29,7 @@ from oc_google.token_diagnostic import TokenDiagnostic, TokenStage
 from google_registration_fixture import record_enrollment_retired
 from test_google_enrollment import BEARER, LOAD_REPLY, LOAD_REQUEST, SUBJECT
 from test_google_metadata_ingress import FakePeer, packet
-from test_google_metadata_destination import FakeChannel, IPV4, response
+from test_google_metadata_destination import FakeChannel, IPV4, chunked_response, response
 from test_google_oauth_exchange import (
     AUTHORIZATION, CODE, ID_SENTINEL, OIDC_SCOPE, STATE, cold_credential, cold_grant,
     form, grant, native_json, offer, refresh_form,
@@ -177,6 +178,27 @@ class EnrollmentSessionTest(unittest.TestCase):
         self.assertEqual(len(token.sent), 1)
         self.assertFalse(userinfo_socket.sent)
         self.assert_token_only_refusal(spent=1, pending=False)
+
+    def test_complete_chunked_token_and_ignored_vary_reach_validation_without_persistence(self):
+        diagnostic = TokenDiagnostic()
+        token, userinfo_socket = self.attended_exchange()
+        raw_grant = grant()
+        marker = b"synthetic-ignored-vary-value"
+        encoded = f"{len(raw_grant):x}\r\n".encode("ascii") + raw_grant + b"\r\n0\r\n\r\n"
+        token.chunks.clear()
+        token.chunks.extend((
+            chunked_response(encoded, headers=(b"Vary: " + marker, b"vary: Origin")),
+            ssl.SSLEOFError("synthetic TLS shutdown"),
+        ))
+        userinfo_socket.connect.side_effect = OSError("synthetic UserInfo setup refusal")
+        with self.assertRaises(metadata_destination.MetadataDestinationError) as refusal:
+            self.session(diagnostic=diagnostic)
+        self.assertIs(diagnostic.stage(refusal.exception), TokenStage.USERINFO_PRE_WRITE)
+        self.assert_token_only_refusal(spent=1, pending=False)
+        saved = self.journal_file.read_bytes()
+        self.assertNotIn(marker, saved)
+        self.assertNotIn(raw_grant, saved)
+        self.assertNotIn(marker.decode("ascii"), str(refusal.exception))
 
     def test_userinfo_reservation_refusal_before_send_remains_generic(self):
         diagnostic = TokenDiagnostic()

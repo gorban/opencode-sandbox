@@ -37,6 +37,15 @@ def response(payload=JSON, *, status=b"HTTP/1.1 200 OK", headers=()):
     )) + b"\r\n\r\n" + payload
 
 
+def chunked_response(chunks, *, transfer=b"chunked", status=b"HTTP/1.1 200 OK", headers=()):
+    return b"\r\n".join((
+        status,
+        b"Content-Type: application/json; charset=UTF-8",
+        b"Transfer-Encoding: " + transfer,
+        *headers,
+    )) + b"\r\n\r\n" + chunks
+
+
 class FakeChannel:
     def __init__(self, *chunks):
         self.chunks = deque(chunks)
@@ -330,11 +339,12 @@ class MetadataDestinationTest(unittest.TestCase):
             (TokenStage.HTTP_429, [response(status=b"HTTP/1.1 429 " + marker)]),
             (TokenStage.HTTP_5XX, [response(status=b"HTTP/1.1 599 " + marker)]),
             (TokenStage.HTTP_OTHER, [response(status=b"HTTP/1.1 418 " + marker)]),
-            (TokenStage.CHUNKED, [response(headers=(b"Transfer-Encoding: Chunked",))]),
-            (TokenStage.HEADER, [response(headers=(b"Content-Type: " + marker,))]),
+            (TokenStage.CHUNKED, [chunked_response(b"1;x=unsupported\r\na\r\n0\r\n\r\n")]),
+            (TokenStage.HEADER, [response(headers=(b"Vary: " + marker + b"\x00",))]),
+            (TokenStage.DUPLICATE_HEADER, [response(headers=(b"CoNtEnT-TyPe: " + marker,))]),
             (TokenStage.FRAMING, [response()[:-1]]),
             (TokenStage.TRAILING, [response(), marker]),
-            (TokenStage.TLS_EOF, [response(), ssl.SSLEOFError(marker.decode())]),
+            (TokenStage.TLS_EOF, [response()[:-1], ssl.SSLEOFError(marker.decode())]),
             (TokenStage.TRANSPORT, [response(), TimeoutError(marker.decode())]),
         )
         for stage, chunks in cases:
@@ -369,6 +379,128 @@ class MetadataDestinationTest(unittest.TestCase):
         self.tls.chunks = deque(wire[pos:pos + 3] for pos in range(0, len(wire), 3))
         self.assertEqual(self.exchange(), JSON)
         self.assertGreater(self.tls.timeout, 0)
+
+    def test_compatible_vary_chunked_and_completed_ragged_eof(self):
+        marker = b"synthetic-vary-value"
+        vary = (b"VaRy: " + marker, b"vary: Accept-Encoding", b"Vary: Origin")
+        chunks = b"00000004\r\n" + JSON[:4] + b"\r\n0000000C\r\n" + JSON[4:] + b"\r\n00000000\r\n\r\n"
+        cases = (
+            ([response(headers=vary)], None),
+            ([chunked_response(chunks, transfer=b" ChUnKeD ", headers=(b"Content-Encoding: IDENTITY",))], None),
+            ([response()], ssl.SSLEOFError("synthetic TLS close")),
+            ([chunked_response(chunks, headers=vary)], ssl.SSLEOFError("synthetic TLS close")),
+        )
+        for parts, eof in cases:
+            with self.subTest(chunked=b"Transfer-Encoding" in parts[0], abrupt=eof is not None):
+                self.tls.chunks = deque(parts if eof is None else [*parts, eof])
+                self.assertEqual(self.exchange(), JSON)
+                self.assertEqual(list(self.tls.chunks), [])
+
+    def test_chunked_response_accepts_every_split_and_single_byte_reads(self):
+        wire = chunked_response(b"1\r\n{\r\n2\r\n}\n\r\n0\r\n\r\n",
+                                headers=(b"Vary: Origin", b"vary: Accept-Encoding"))
+        for split in range(1, len(wire)):
+            with self.subTest(split=split):
+                self.tls.chunks = deque([wire[:split], wire[split:]])
+                self.assertEqual(self.exchange(), b"{}\n")
+        self.tls.chunks = deque(wire[pos:pos + 1] for pos in range(len(wire)))
+        self.assertEqual(self.exchange(), b"{}\n")
+
+    def test_non_200_still_refuses_at_status_without_another_receive(self):
+        unread = b"synthetic unread response body"
+        self.tls.chunks = deque([chunked_response(b"", status=b"HTTP/1.1 503 synthetic"), unread])
+        with patch.object(destination, "_chunked_body") as decode:
+            with self.assertRaises(destination.MetadataDestinationError) as refused:
+                self.exchange()
+        self.assertIs(refused.exception.token_stage, TokenStage.HTTP_5XX)
+        decode.assert_not_called()
+        self.assertEqual(list(self.tls.chunks), [unread])
+
+    def test_strict_chunk_and_message_errors_never_return_data(self):
+        valid = b"1\r\na\r\n0\r\n\r\n"
+        invalid = (
+            b"0\r\n\r\n",
+            b"000000001\r\na\r\n0\r\n\r\n",
+            b"g\r\na\r\n0\r\n\r\n",
+            b" 1\r\na\r\n0\r\n\r\n",
+            b"+1\r\na\r\n0\r\n\r\n",
+            b"1;scope=synthetic\r\na\r\n0\r\n\r\n",
+            b"1\na\r\n0\r\n\r\n",
+            b"1\r\na\n0\r\n\r\n",
+            b"1\r\na\r\n0\r\nTrailer-Field: synthetic\r\n\r\n",
+            b"FFFFFFFF\r\na\r\n0\r\n\r\n",
+            valid + b"0\r\n\r\n",
+        )
+        for index, body in enumerate((*invalid, *(valid[:pos] for pos in range(len(valid))))):
+            with self.subTest(case=index):
+                self.tls.chunks = deque([chunked_response(body)])
+                with self.assertRaises(destination.MetadataDestinationError) as refused:
+                    self.exchange()
+                self.assertNotIn("synthetic", str(refused.exception))
+        for headers in (
+            (b"Content-Length: 1",), (b"Trailer: name",), (b"Upgrade: tls",),
+            (b"tRaNsFeR-eNcOdInG: chunked",), (b"Connection: keep-alive",),
+            (b"Content-Encoding: gzip",), (b"Content-Encoding: identity, identity",),
+            (b"Content-Encoding: identity; x=y",), (b"Content-Encoding: ",),
+            (b"Vary: synthetic\xff",), (b"Vary: x", b" Vary: y"),
+        ):
+            self.tls.chunks = deque([chunked_response(valid, headers=headers)])
+            with self.assertRaises(destination.MetadataDestinationError):
+                self.exchange()
+        for coding in (b"", b"chunked, gzip", b"gzip, chunked", b"chunked; x=y", b"identity"):
+            self.tls.chunks = deque([chunked_response(valid, transfer=coding)])
+            with self.assertRaises(destination.MetadataDestinationError):
+                self.exchange()
+
+    def test_chunk_decoded_header_and_overhead_bounds(self):
+        def parse(wire, bound):
+            return destination._response(FakeChannel(wire), bound, time.monotonic() + 2)
+
+        self.assertEqual(parse(chunked_response(b"2\r\nab\r\n1\r\nc\r\n0\r\n\r\n"), 3), b"abc")
+        with self.assertRaises(destination.MetadataDestinationError):
+            parse(chunked_response(b"2\r\nab\r\n1\r\nc\r\n0\r\n\r\n"), 2)
+
+        header_limit = destination._CHUNK_HEADER_LIMIT
+        prefix = b"1\r\na\r\n" * (header_limit - 1)
+        self.assertEqual(parse(chunked_response(prefix + b"0\r\n\r\n"), header_limit), b"a" * (header_limit - 1))
+        with self.assertRaises(destination.MetadataDestinationError):
+            parse(chunked_response(prefix + b"1\r\na\r\n0\r\n\r\n"), header_limit)
+
+        wire = chunked_response(b"1\r\na\r\n0\r\n\r\n")
+        with patch.object(destination, "_CHUNK_OVERHEAD_LIMIT", 10):
+            self.assertEqual(parse(wire, 1), b"a")
+        with patch.object(destination, "_CHUNK_OVERHEAD_LIMIT", 9):
+            with self.assertRaises(destination.MetadataDestinationError):
+                parse(wire, 1)
+
+    def test_only_final_receive_can_accept_ragged_eof(self):
+        complete = chunked_response(b"1\r\na\r\n0\r\n\r\n")
+        incomplete = complete[:-1]
+        ragged = ssl.SSLEOFError("synthetic TLS close")
+        for prefix in (incomplete, response()[:-1]):
+            self.tls.chunks = deque([prefix, ragged])
+            with self.assertRaises(destination.MetadataDestinationError):
+                self.exchange()
+        for wire in (complete, response()):
+            self.tls.chunks = deque([wire, TimeoutError("synthetic timeout")])
+            with self.assertRaises(destination.MetadataDestinationError):
+                self.exchange()
+            self.tls.chunks = deque([wire, ssl.SSLError("synthetic TLS failure")])
+            with self.assertRaises(destination.MetadataDestinationError):
+                self.exchange()
+            self.tls.chunks = deque([wire, b"x", ragged])
+            with self.assertRaises(destination.MetadataDestinationError):
+                self.exchange()
+            self.assertEqual(list(self.tls.chunks), [ragged])
+        for wire in (complete, response()):
+            buffered = FakeChannel(wire + b"x", ragged)
+            with self.assertRaises(destination.MetadataDestinationError):
+                destination._response(buffered, 1024, time.monotonic() + 1)
+            self.assertEqual(list(buffered.chunks), [ragged])
+        final_prepare = FakeChannel(response())
+        with patch.object(final_prepare, "settimeout", side_effect=[None, ragged]):
+            with self.assertRaises(ssl.SSLEOFError):
+                destination._response(final_prepare, 1024, time.monotonic() + 1)
 
 
 class SystemTrustTest(unittest.TestCase):

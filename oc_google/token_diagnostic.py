@@ -12,6 +12,7 @@ class TokenStage(Enum):
     HTTP_OTHER = auto()
     CHUNKED = auto()
     HEADER = auto()
+    DUPLICATE_HEADER = auto()
     FRAMING = auto()
     TRAILING = auto()
     TLS_EOF = auto()

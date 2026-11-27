@@ -25,6 +25,10 @@ _FORM = b"application/x-www-form-urlencoded"
 _DELIMITER = b"\r\n\r\n"
 _HEADER_NAME = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _LENGTH = re.compile(rb"[1-9][0-9]{0,5}")
+_CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,8}")
+_CHUNK_LINE_LIMIT = 10
+_CHUNK_HEADER_LIMIT = 2048
+_CHUNK_OVERHEAD_LIMIT = 32 * 1024
 
 
 class MetadataRoute(Enum):
@@ -191,6 +195,93 @@ def _status_stage(status):
     return TokenStage.HTTP_OTHER
 
 
+def _invalid_chunks():
+    return _ResponseRefused("Invalid Google metadata chunk framing", TokenStage.CHUNKED)
+
+
+class _ChunkReader:
+    """Consume the prefetched body and refill only as the decoder needs."""
+
+    def __init__(self, connection, pending, deadline):
+        self.connection = connection
+        self.pending = pending
+        self.deadline = deadline
+        self.cursor = 0
+
+    def _fill(self, limit):
+        del self.pending[:self.cursor]
+        self.cursor = 0
+        chunk = _recv(self.connection, limit, self.deadline)
+        if not chunk:
+            raise _invalid_chunks()
+        self.pending.extend(chunk)
+
+    def size(self, limit):
+        while True:
+            end = self.pending.find(b"\r\n", self.cursor, self.cursor + limit)
+            if end != -1:
+                digits = self.pending[self.cursor:end]
+                self.cursor = end + 2
+                if _CHUNK_SIZE.fullmatch(digits) is None:
+                    raise _invalid_chunks()
+                return int(digits, 16), len(digits) + 2
+            remaining = limit - (len(self.pending) - self.cursor)
+            if remaining <= 0:
+                raise _invalid_chunks()
+            self._fill(remaining)
+
+    def append(self, target, size):
+        while size:
+            if self.cursor == len(self.pending):
+                self._fill(min(4096, size))
+            count = min(size, len(self.pending) - self.cursor)
+            target.extend(self.pending[self.cursor:self.cursor + count])
+            self.cursor += count
+            size -= count
+
+    def delimiter(self):
+        ending = bytearray()
+        self.append(ending, 2)
+        if ending != b"\r\n":
+            raise _invalid_chunks()
+
+    def has_pending(self):
+        return self.cursor < len(self.pending)
+
+
+def _chunked_body(connection, pending, limit, deadline):
+    reader = _ChunkReader(connection, pending, deadline)
+    body = bytearray()
+    overhead = 0
+    for _ in range(_CHUNK_HEADER_LIMIT):
+        # Reserve the body delimiter or empty trailer terminator as well.
+        line_limit = min(_CHUNK_LINE_LIMIT, _CHUNK_OVERHEAD_LIMIT - overhead - 2)
+        if line_limit < 3:
+            raise _invalid_chunks()
+        size, width = reader.size(line_limit)
+        overhead += width + 2
+        if size > limit - len(body) or (size == 0 and not body):
+            raise _invalid_chunks()
+        reader.append(body, size)
+        reader.delimiter()
+        if size == 0:
+            if reader.has_pending():
+                raise _ResponseRefused("Unexpected bytes after Google metadata response", TokenStage.TRAILING)
+            return body
+    raise _invalid_chunks()
+
+
+def _check_response_end(connection, deadline):
+    connection.settimeout(_remaining(deadline))
+    try:
+        tail = connection.recv(1)
+    except ssl.SSLEOFError:
+        # The complete HTTP body was already recovered from authenticated records.
+        return
+    if tail:
+        raise _ResponseRefused("Unexpected bytes after Google metadata response", TokenStage.TRAILING)
+
+
 def _response(connection, limit, deadline):
     buffer = bytearray()
     while _DELIMITER not in buffer:
@@ -208,27 +299,34 @@ def _response(connection, limit, deadline):
     for line in lines:
         name, separator, value = line.partition(b":")
         name = name.lower()
-        if (not separator or not _HEADER_NAME.fullmatch(name) or name in fields
-                or not re.fullmatch(rb"[ -~]*", value)):
+        if not separator or not _HEADER_NAME.fullmatch(name) or not re.fullmatch(rb"[ -~]*", value):
             raise _ResponseRefused("Invalid Google metadata response header", TokenStage.HEADER)
+        if name == b"vary":
+            continue
+        if name in fields:
+            raise _ResponseRefused("Duplicate Google metadata response header", TokenStage.DUPLICATE_HEADER)
         fields[name] = value.strip(b" ")
     length = fields.get(b"content-length", b"")
-    if ({b"transfer-encoding", b"trailer", b"upgrade"} & fields.keys()
+    transfer = fields.get(b"transfer-encoding")
+    if ({b"trailer", b"upgrade"} & fields.keys()
             or fields.get(b"content-encoding", b"identity").lower() != b"identity"
             or fields.get(b"connection", b"close").lower() != b"close"
-            or fields.get(b"content-type", b"").lower() not in {_JSON, _JSON + b"; charset=utf-8"}
-            or not _LENGTH.fullmatch(length) or not len(body) <= int(length) <= limit):
-        stage = (TokenStage.CHUNKED if fields.get(b"transfer-encoding", b"").lower() == b"chunked"
-                 else TokenStage.FRAMING)
-        raise _ResponseRefused("Invalid Google metadata response framing", stage)
-    size = int(length)
-    while len(body) < size:
-        chunk = _recv(connection, min(4096, size - len(body)), deadline)
-        if not chunk:
-            raise _ResponseRefused("Incomplete Google metadata response", TokenStage.FRAMING)
-        body.extend(chunk)
-    if _recv(connection, 1, deadline):
-        raise _ResponseRefused("Unexpected bytes after Google metadata response", TokenStage.TRAILING)
+            or fields.get(b"content-type", b"").lower() not in {_JSON, _JSON + b"; charset=utf-8"}):
+        raise _ResponseRefused("Invalid Google metadata response framing", TokenStage.FRAMING)
+    if transfer is not None:
+        if transfer.lower() != b"chunked" or b"content-length" in fields:
+            raise _ResponseRefused("Invalid Google metadata response framing", TokenStage.FRAMING)
+        body = _chunked_body(connection, body, limit, deadline)
+    else:
+        if not _LENGTH.fullmatch(length) or not len(body) <= int(length) <= limit:
+            raise _ResponseRefused("Invalid Google metadata response framing", TokenStage.FRAMING)
+        size = int(length)
+        while len(body) < size:
+            chunk = _recv(connection, min(4096, size - len(body)), deadline)
+            if not chunk:
+                raise _ResponseRefused("Incomplete Google metadata response", TokenStage.FRAMING)
+            body.extend(chunk)
+    _check_response_end(connection, deadline)
     return bytes(body)
 
 
