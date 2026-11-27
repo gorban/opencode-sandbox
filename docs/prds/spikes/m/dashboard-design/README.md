@@ -60,9 +60,10 @@ The brief was synced to this repository at `3d3f408`.
 
 The selected artifact is attempt `a1-hallmark` at commit
 `26d81cf58435e6660023b993c7f45891ebdc1bb3`, tagged `design-final` in the design lab's attempt
-repository, which isn't published. `DESIGN.md`, the prototype files in `out/` and
-`build/` here are byte-identical to that commit. The lab's empty `out/.gitkeep` was
-omitted. Rebuilding from `build/` reproduces the committed `out/`.
+repository, which isn't published. `DESIGN.md` and the files in `out/` are byte-identical
+to that commit. The lab's empty `out/.gitkeep` was omitted.
+The generator and fixture include source cleanup after selection. Rebuilding from
+`build/` reproduces the committed `out/` byte for byte.
 
 ## Accessibility (WCAG 2.2 AA)
 

@@ -2,14 +2,24 @@
 // Run: node build/build.mjs
 import { writeFileSync, mkdirSync } from 'node:fs';
 import {
-  data, esc, clean, label, attr, icon, iconSprite, hhmm, epoch, ago, when, isToday, TZ, parseAddr, addr,
+  data, esc, clean, label, attr, icon, iconSprite, hhmm, epoch, ago, when, TZ, parseAddr, addr,
   status, statusWord, statusTone, statusIcon, STATUS_ORDER, prov, wfPill, well, plain, meter, notice, fleet, ranked, BAND_ORDER,
 } from './lib.mjs';
 import { tokensCss } from './tokens.mjs';
 
 const OUT = new URL('../out/', import.meta.url);
 mkdirSync(new URL('assets/', OUT), { recursive: true });
-const write = (name, html) => writeFileSync(new URL(name, OUT), html.replace(/[ \t]+\n/g, '\n'));
+const trimLineEnd = (line) => {
+  let end = line.length;
+  while (line[end - 1] === ' ' || line[end - 1] === '\t') end--;
+  return line.slice(0, end);
+};
+const write = (name, html) => {
+  const lines = html.split('\n');
+  const last = lines.pop();
+  const output = lines.map(trimLineEnd).concat(last).join('\n');
+  writeFileSync(new URL(name, OUT), output);
+};
 
 const H = data.header;
 const QUOTA_WARN = 80;
@@ -117,30 +127,40 @@ const need = (sb) => {
   if (rest !== 0) throw new Error(`attention for ${sb.addr} is not accounted for`);
   return { aprs, inbox, other };
 };
-const why = ({ aprs, inbox, other }) => [
-  aprs.length ? `${aprs.length} ${aprs.length === 1 ? 'approval' : 'approvals'}` : '',
-  inbox ? `${inbox} ${inbox === 1 ? 'inbox item' : 'inbox items'}` : '', other,
-].filter(Boolean).join(' · ');
+const why = ({ aprs, inbox, other }) => {
+  const approvalWord = aprs.length === 1 ? 'approval' : 'approvals';
+  const inboxWord = inbox === 1 ? 'inbox item' : 'inbox items';
+  return [
+    aprs.length ? `${aprs.length} ${approvalWord}` : '',
+    inbox ? `${inbox} ${inboxWord}` : '', other,
+  ].filter(Boolean).join(' · ');
+};
 // A glyph beside a numeral, no box. The glyph's shape carries the severity; assistive technology hears
 // the severity and the count as two separate phrases.
 const attn = (n, st, aprs = []) => {
   const tone = statusTone(st), urgent = tone === 'bad' || tone === 'caution';
-  return `<span class="attn attn--${urgent ? tone : 'note'}" data-n="${n}" data-apr="${attr(aprs.join(' '))}">${icon(urgent ? statusIcon(st) : 'thread')}<span class="vh">${urgent ? `Severity: ${statusWord(st).toLowerCase()}` : 'Unread work'}. </span><span class="num" data-attn-n>${n}</span><span class="vh" data-attn-w> ${n === 1 ? 'needs' : 'need'} you</span></span>`;
+  const severity = urgent ? `Severity: ${statusWord(st).toLowerCase()}` : 'Unread work';
+  return `<span class="attn attn--${urgent ? tone : 'note'}" data-n="${n}" data-apr="${attr(aprs.join(' '))}">${icon(urgent ? statusIcon(st) : 'thread')}<span class="vh">${severity}. </span><span class="num" data-attn-n>${n}</span><span class="vh" data-attn-w> ${n === 1 ? 'needs' : 'need'} you</span></span>`;
 };
 
 // ---------------------------------------------------------------- sidebar tree
 const treeThread = (t, sb, cur, child = false) => {
   const here = cur.sb === sb.addr && cur.thread === t.label && !child;
   const kids = t.children || [];
-  const inner = `<span class="tree__twist">${kids.length ? icon('chevd') : ''}</span>${icon('thread')}<span class="tree__body"><span class="tree__name">${child ? '<span class="vh">Sub-agent thread </span>' : ''}${label(t.label)}</span></span><span class="vh"> in ${attr(sb.a.text)}</span>${t.unread ? `<span class="attn attn--plain"><span class="attn__gap"></span><span class="num">${t.unread}</span><span class="vh"> unread</span></span>` : ''}`;
-  return `<li role="none"><a role="treeitem" class="tree__row"${kids.length ? ' aria-expanded="true"' : ''}${here ? ' aria-current="page"' : ''} href="${pageOf(sb)}">${inner}</a>${kids.length ? `<ul role="group">${kids.map((k) => treeThread(k, sb, cur, true)).join('')}</ul>` : ''}</li>`;
+  const unread = t.unread ? `<span class="attn attn--plain"><span class="attn__gap"></span><span class="num">${t.unread}</span><span class="vh"> unread</span></span>` : '';
+  const inner = `<span class="tree__twist">${kids.length ? icon('chevd') : ''}</span>${icon('thread')}<span class="tree__body"><span class="tree__name">${child ? '<span class="vh">Sub-agent thread </span>' : ''}${label(t.label)}</span></span><span class="vh"> in ${attr(sb.a.text)}</span>${unread}`;
+  const group = kids.length ? `<ul role="group">${kids.map((k) => treeThread(k, sb, cur, true)).join('')}</ul>` : '';
+  return `<li role="none"><a role="treeitem" class="tree__row"${kids.length ? ' aria-expanded="true"' : ''}${here ? ' aria-current="page"' : ''} href="${pageOf(sb)}">${inner}</a>${group}</li>`;
 };
 // Only the selected sandbox starts with its threads open; the script folds the others.
 const treeSandbox = (sb, cur) => {
   const has = sb.threads.length > 0;
   const here = cur.sb === sb.addr && !cur.thread;
   const inner = `<span class="tree__twist">${has ? icon('chevd') : ''}</span><span class="tree__body"><span class="tree__name">${label(sb.a.name)}</span><span class="tree__meta"><span class="wk wk--${sb.a.kind}">${icon(sb.a.kind === 'remote' ? 'server' : 'laptop')}${label(sb.a.worker)}</span>${status(sb.status)}</span></span>${sb.attention ? attn(sb.attention, sb.status, need(sb).aprs) : ''}`;
-  return `<li role="none"><a role="treeitem" class="tree__row tree__row--sb"${has ? ` aria-expanded="true"${cur.sb === sb.addr ? '' : ' data-fold'}` : ''}${here ? ' aria-current="page"' : ''} href="${pageOf(sb)}">${inner}</a>${has ? `<ul role="group">${sb.threads.map((t) => treeThread(t, sb, cur)).join('')}</ul>` : ''}</li>`;
+  const fold = cur.sb === sb.addr ? '' : ' data-fold';
+  const expanded = has ? ` aria-expanded="true"${fold}` : '';
+  const group = has ? `<ul role="group">${sb.threads.map((t) => treeThread(t, sb, cur)).join('')}</ul>` : '';
+  return `<li role="none"><a role="treeitem" class="tree__row tree__row--sb"${expanded}${here ? ' aria-current="page"' : ''} href="${pageOf(sb)}">${inner}</a>${group}</li>`;
 };
 // A project shows the sum of what its sandboxes need, with the glyph of the most urgent one inside it.
 const TONE_RANK = ['bad', 'caution', 'ok', 'quiet'];
@@ -202,30 +222,38 @@ const fleetRow = (sb) => {
   const [h0, ...hRest] = split(sb.health);
   const shown = sb.a.kind === 'remote' ? `${label(sb.a.worker)} <span class="rowlink__sep">/</span> ${label(sb.a.name)}` : label(sb.a.name);
   const where = sb.a.kind === 'remote' ? label(sb.a.worker) : 'Local';
+  const grantRows = sb.grants.map((g) => `<li class="grant">${label(g)}</li>`).join('');
   const grants = sb.grants.length
-    ? `<ul class="grants">${sb.grants.map((g) => `<li class="grant">${label(g)}</li>`).join('')}</ul>`
+    ? `<ul class="grants">${grantRows}</ul>`
     : '<span class="quiet">None</span>';
   const revoke = sb.grants.length
     ? `<div class="acts"><button type="button" class="btn btn--sm" data-revoke data-agent-confirm="Removes ${attr(sb.grants.join(' and '))} from ${name}. Its agent stops until grants are restored." aria-label="Revoke grants for ${name}">${icon('lock')}<span>Revoke grants</span></button></div>`
     : '';
   const id = `row-${sb.n}`;
   const nd = need(sb);
-  const health = `<span class="c-health__t">${label(h0)}</span>${hRest.map((p) => `<span class="sub">${label(p)}</span>`).join('')}`;
+  const healthDetail = hRest.map((p) => `<span class="sub">${label(p)}</span>`).join('');
+  const health = `<span class="c-health__t">${label(h0)}</span>${healthDetail}`;
+  const detailButton = `<button type="button" class="rowbtn" data-toggle aria-expanded="false" aria-controls="${id}" aria-label="Details for ${name}" aria-describedby="tip-${id}">${icon('chevr', 'twist')}</button>`;
+  const attention = sb.attention
+    ? `<span class="need">${attn(sb.attention, sb.status, nd.aprs)}<span class="need__why" data-why data-apr="${attr(nd.aprs.join(' '))}" data-inbox="${nd.inbox}" data-other="${attr(nd.other)}">${esc(why(nd))}</span></span><span class="quiet" data-none hidden>None</span>`
+    : '<span class="quiet">None</span>';
+  const effortDetail = effort ? `<span class="sub">${label(effort)}</span>` : '';
+  const modelDetail = model === '—' ? '<span class="quiet">None</span>' : label(model) + effortDetail;
   return `<tr data-row data-band="${sb.band}" data-worker="${sb.a.kind}" data-status="${sb.status}" data-attn="${sb.attention}" data-sev="${sb.sev}" data-rank="${ranked.indexOf(sb)}" data-changed="${epoch(sb.last_meaningful_change)}">
           <th scope="row" class="c-name" data-label="Sandbox"><div class="rowhead">
-            ${tip(`tip-${id}`, 'Show or hide branch, model and grants.', `<button type="button" class="rowbtn" data-toggle aria-expanded="false" aria-controls="${id}" aria-label="Details for ${name}" aria-describedby="tip-${id}">${icon('chevr', 'twist')}</button>`)}
+            ${tip('tip-' + id, 'Show or hide branch, model and grants.', detailButton)}
             ${icon(sb.a.kind === 'remote' ? 'server' : 'laptop', 'rowhead__i')}
             <span class="rowhead__t"><a class="rowlink" href="${pageOf(sb)}" aria-label="Open ${name}">${shown}</a><span class="sub">${label(sb.project)} / ${where}</span></span>
           </div></th>
           <td class="c-status" data-label="Status">${status(sb.status)}<span class="c-status__h">${health}</span></td>
-          <td class="c-attn" data-label="Attention">${sb.attention ? `<span class="need">${attn(sb.attention, sb.status, nd.aprs)}<span class="need__why" data-why data-apr="${attr(nd.aprs.join(' '))}" data-inbox="${nd.inbox}" data-other="${attr(nd.other)}">${esc(why(nd))}</span></span><span class="quiet" data-none hidden>None</span>` : '<span class="quiet">None</span>'}</td>
+          <td class="c-attn" data-label="Attention">${attention}</td>
           <td class="c-health" data-label="Health">${health}</td>
           <td class="c-time" data-label="Last change"><span class="num">${when(sb.last_meaningful_change)}</span><span class="sub">${ago(sb.last_meaningful_change)}</span></td>
         </tr>
         <tr class="detail" id="${id}" hidden><td colspan="5">
           <dl class="facts facts--row">
             <div class="facts__row"><dt>Branch</dt><dd>${sb.branch === '—' ? '<span class="quiet">None</span>' : label(sb.branch)}</dd></div>
-            <div class="facts__row"><dt>Model</dt><dd>${model === '—' ? '<span class="quiet">None</span>' : `${label(model)}${effort ? `<span class="sub">${label(effort)}</span>` : ''}`}</dd></div>
+            <div class="facts__row"><dt>Model</dt><dd>${modelDetail}</dd></div>
             <div class="facts__row"><dt>Grants</dt><dd>${grants}</dd></div>
           </dl>
           ${revoke}
@@ -347,20 +375,38 @@ const subThread = (t, sb, parent) => {
 };
 const threadList = (sb, th) => {
   const unreadAt = T.messages.length - th.unread;
+  const messages = T.messages.map((m, i) => {
+    const unread = i === unreadAt ? `<li class="unread" id="unread"><span>${th.unread} unread</span></li>\n      ` : '';
+    return unread + msg(m);
+  });
   return `<ol class="thread">
-      ${T.messages.map((m, i) => `${i === unreadAt ? `<li class="unread" id="unread"><span>${th.unread} unread</span></li>\n      ` : ''}${msg(m)}`).join('\n      ')}
+      ${messages.join('\n      ')}
       ${th.children.map((c) => subThread(c, sb, th.label)).join('\n      ')}
     </ol>`;
 };
 
 const targets = T.composer_targets.map(parseAddr);
-const dupNames = targets.filter((t) => ['local', 'remote'].includes(t.kind)).map((t) => t.name).filter((n, i, a) => a.indexOf(n) !== i);
+const targetNames = new Set();
+const dupNames = new Set();
+for (const { kind, name } of targets) {
+  if (!['local', 'remote'].includes(kind)) continue;
+  if (targetNames.has(name)) dupNames.add(name);
+  targetNames.add(name);
+}
 const KIND = { local: 'Local sandbox on this machine', peer: 'External peer agent', orch: 'Root orchestrator of this workspace' };
 const kindText = (t) => (t.kind === 'remote' ? `Remote sandbox on ${clean(t.worker)}` : KIND[t.kind]);
-const twinOf = (t) => (dupNames.includes(t.name) ? targets.find((o) => o !== t && o.name === t.name) : null);
+const twinOf = (t) => (dupNames.has(t.name) ? targets.find((o) => o !== t && o.name === t.name) : null);
 const composer = (sb) => {
   const first = Math.max(0, targets.findIndex((t) => t.text === sb.a.text));
   const now = targets[first], twin = twinOf(now);
+  const twinWarning = twin ? `Not ${attr(twin.text)}, which shares the name.` : '';
+  const targetOptions = targets.map((t, i) => {
+    const tw = twinOf(t);
+    const twinData = tw ? ` data-twin="${attr(tw.text)}"` : '';
+    const twinLabel = tw ? `<span class="tgt__dup">${icon('warn')}Same name as ${attr(tw.text)}</span>` : '';
+    return `<label class="tgt"><input type="radio" name="target" value="t${i}"${i === first ? ' checked' : ''} data-text="${attr(t.text)}"${twinData}>
+            <span class="tgt__t">${addr(t)}<span class="sub">${esc(kindText(t))}</span>${twinLabel}</span></label>`;
+  }).join('\n          ');
   return `<section class="composer" id="composer" data-agent-hidden aria-label="Message composer">
       <div class="lease" data-agent-hidden role="group" aria-label="Input Lease Bar">
         ${icon('keyboard')}<p class="lease__text"><strong>Input lease</strong> <span id="lease-state" role="status">The TUI can type here.</span></p>
@@ -370,17 +416,13 @@ const composer = (sb) => {
         <span class="sendto__k">Send to</span>
         <span class="sendto__v" id="target-now">${addr(now)}</span>
         <button type="button" class="btn btn--sm" id="target-change" aria-haspopup="dialog" aria-expanded="false" aria-controls="target-pop">Change target</button>
-        <span class="twin" id="target-twin"${twin ? '' : ' hidden'}>${icon('warn')}<span id="target-twin-text">${twin ? `Not ${attr(twin.text)}, which shares the name.` : ''}</span></span>
+        <span class="twin" id="target-twin"${twin ? '' : ' hidden'}>${icon('warn')}<span id="target-twin-text">${twinWarning}</span></span>
       </div>
       <div class="tpop" id="target-pop" role="dialog" aria-label="Choose one target" hidden>
         <fieldset class="targets" id="targets">
           <legend>Send to exactly one target</legend>
           <div class="targets__grid">
-          ${targets.map((t, i) => {
-            const tw = twinOf(t);
-            return `<label class="tgt"><input type="radio" name="target" value="t${i}"${i === first ? ' checked' : ''} data-text="${attr(t.text)}"${tw ? ` data-twin="${attr(tw.text)}"` : ''}>
-            <span class="tgt__t">${addr(t)}<span class="sub">${esc(kindText(t))}</span>${tw ? `<span class="tgt__dup">${icon('warn')}Same name as ${attr(tw.text)}</span>` : ''}</span></label>`;
-          }).join('\n          ')}
+          ${targetOptions}
           </div>
         </fieldset>
       </div>
@@ -439,17 +481,20 @@ const tab = (id, text, sel) => `<button type="button" role="tab" class="tab" id=
 const threadMain = (sb) => {
   const isEx = sb.addr === EXAMPLE;
   const th = sb.threads[0];
+  const branch = sb.branch === '—' ? '' : `, branch ${label(sb.branch)}`;
   const facts = [status(sb.status), ...split(sb.health).filter((p) => p !== sb.status).map((p) => `<span class="sub">${label(p)}</span>`),
-    `<span class="sub">${label(sb.project)}${sb.branch !== '—' ? `, branch ${label(sb.branch)}` : ''}</span>`,
+    `<span class="sub">${label(sb.project)}${branch}</span>`,
     sb.model !== '—' ? `<span class="sub">${label(split(sb.model).join(', '))}</span>` : ''].join('');
+  const unreadJump = isEx ? `<a class="btn btn--sm threadbar__end" href="#unread">${icon('down')}<span>Jump to unread</span></a>` : '';
+  const transcript = isEx && th ? threadList(sb, th) : notice({ ic: 'thread', title: 'Transcript not in the prototype data', body: 'The fixture holds one example transcript, in feat-dashboard. This thread exists and you can still address it below.' });
   const threads = th
     ? `<div class="threadbar">
       ${icon('thread')}<h2 class="threadbar__name">${label(th.label)}</h2>
       <span class="sub">${th.unread} unread</span>
-      ${isEx ? `<a class="btn btn--sm threadbar__end" href="#unread">${icon('down')}<span>Jump to unread</span></a>` : ''}
+      ${unreadJump}
     </div>
     <div class="thread-scroll" id="thread-scroll" tabindex="0" role="log" aria-label="Transcript of ${attr(th.label)} in ${attr(sb.a.text)}">
-    ${isEx ? threadList(sb, th) : notice({ ic: 'thread', title: 'Transcript not in the prototype data', body: 'The fixture holds one example transcript, in feat-dashboard. This thread exists and you can still address it below.' })}
+    ${transcript}
     </div>
     ${composer(sb)}`
     : `<div class="thread-scroll">${notice({ ic: 'thread', title: 'No threads in this sandbox', body: 'A thread appears here when an agent starts work in this sandbox.' })}</div>`;
@@ -487,7 +532,10 @@ fleet.filter((sb) => sb.addr !== EXAMPLE).forEach((sb) => page({
 // ---------------------------------------------------------------- approvals (Tier A)
 const SCOPE = { allowed_models: 'Allowed models', max_concurrent: 'Max concurrent', capabilities: 'Capabilities', model: 'Model' };
 const scopeVal = (v) => {
-  if (Array.isArray(v)) return `<ul class="grants">${v.map((x) => `<li class="grant">${label(x)}</li>`).join('')}</ul>`;
+  if (Array.isArray(v)) {
+    const entries = v.map((x) => `<li class="grant">${label(x)}</li>`).join('');
+    return `<ul class="grants">${entries}</ul>`;
+  }
   if (typeof v === 'number') return `<span class="num">${v}</span>`;
   return label(split(v).join(', '));
 };
@@ -644,6 +692,31 @@ const laneState = { ok: 'ok', stalled: 'stalled', waiting: 'waiting' };
 const sp = W.sparkline_series.values;
 const done = W.checklist_progress.items.filter((i) => i[1]).length;
 const chipHref = { 'Open thread': 'thread.html', 'Open diff': 'diff.html', 'Open inbox item': 'inbox.html' };
+const statusDetail = split(W.status_card.detail).map((p) => `<span class="sub">${label(p)}</span>`).join('');
+const kvRows = W.kv_table.rows.map(([k, v]) => `<div class="kv__row"><dt>${label(k)}</dt><dd class="num">${label(v)}</dd></div>`).join('');
+const laneRows = W.lane_health_matrix.lanes.map(({ lane, state }) => {
+  const word = state === 'ok' ? 'OK' : statusWord(laneState[state]);
+  return `<tr><th scope="row">${label(lane)}</th><td>${status(laneState[state], word)}</td></tr>`;
+}).join('');
+const timeline = W.timeline_log.events.map(([t, e]) => `<li><time class="num">${esc(t)}</time><span>${label(e)}</span></li>`).join('');
+const checklist = W.checklist_progress.items.map(([t, d]) => `<li>[${d ? 'x' : ' '}] ${esc(t)}</li>`).join('');
+const chips = W.action_chips.chips.map((c) => `<li><a class="chip" href="${chipHref[c]}">${esc(c)}</a></li>`).join('');
+const workflowSurfaces = [
+  surface('status_card', `<p class="surf__line"><span class="surf__title">${label(W.status_card.title)}</span>${status(W.status_card.status)}</p>
+      ${statusDetail}`),
+  surface('metric_kpi', `<p class="kpi num">${label(W.metric_kpi.value)}</p><p class="sub">${label(W.metric_kpi.label)}</p>`),
+  surface('kv_table', `<dl class="kv">${kvRows}</dl>`),
+  surface('lane_health_matrix', `<table class="mini lanes"><caption class="vh">Lane health</caption><thead><tr><th scope="col">Lane</th><th scope="col">State</th></tr></thead><tbody>${laneRows}</tbody></table>`),
+  surface('timeline_log', `<ol class="trail">${timeline}</ol>
+      ${tz()}`),
+  surface('checklist_progress', `<div class="well well--frame"><p class="well__title">${esc(W.checklist_progress.title)}</p><ul class="checks">${checklist}</ul></div>
+      <p class="sub"><span class="num">${done} of ${W.checklist_progress.items.length}</span> checked, counted by the host.</p>`),
+  surface('sparkline_series', `<p class="sub">${label(W.sparkline_series.label)}</p>
+      ${spark(sp)}
+      <dl class="legend"><div><dt>Min</dt><dd class="num">${Math.min(...sp)}</dd></div><div><dt>Max</dt><dd class="num">${Math.max(...sp)}</dd></div><div><dt>Latest</dt><dd class="num">${sp[sp.length - 1]}</dd></div></dl>`),
+  surface('action_chips', `<ul class="chips">${chips}</ul>
+      <p class="sub">The overlay proposes these, so they are dashed and monospace. A solid button is always the host’s.</p>`, ' data-agent-hidden'),
+];
 page({
   file: 'catalog.html', title: 'Workflow surface catalog', cur: { nav: 'catalog' },
   main: `<main id="main" class="main" tabindex="-1" aria-labelledby="page-title">
@@ -652,20 +725,7 @@ page({
     <p class="pagehead__sum">Eight surfaces a workflow can place in the main area. Each carries the pill that says who wrote it.</p>
   </div>
   <div class="surfs">
-    ${surface('status_card', `<p class="surf__line"><span class="surf__title">${label(W.status_card.title)}</span>${status(W.status_card.status)}</p>
-      ${split(W.status_card.detail).map((p) => `<span class="sub">${label(p)}</span>`).join('')}`)}
-    ${surface('metric_kpi', `<p class="kpi num">${label(W.metric_kpi.value)}</p><p class="sub">${label(W.metric_kpi.label)}</p>`)}
-    ${surface('kv_table', `<dl class="kv">${W.kv_table.rows.map(([k, v]) => `<div class="kv__row"><dt>${label(k)}</dt><dd class="num">${label(v)}</dd></div>`).join('')}</dl>`)}
-    ${surface('lane_health_matrix', `<table class="mini lanes"><caption class="vh">Lane health</caption><thead><tr><th scope="col">Lane</th><th scope="col">State</th></tr></thead><tbody>${W.lane_health_matrix.lanes.map((l) => `<tr><th scope="row">${label(l.lane)}</th><td>${status(laneState[l.state], l.state === 'ok' ? 'OK' : statusWord(laneState[l.state]))}</td></tr>`).join('')}</tbody></table>`)}
-    ${surface('timeline_log', `<ol class="trail">${W.timeline_log.events.map(([t, e]) => `<li><time class="num">${esc(t)}</time><span>${label(e)}</span></li>`).join('')}</ol>
-      ${tz()}`)}
-    ${surface('checklist_progress', `<div class="well well--frame"><p class="well__title">${esc(W.checklist_progress.title)}</p><ul class="checks">${W.checklist_progress.items.map(([t, d]) => `<li>[${d ? 'x' : ' '}] ${esc(t)}</li>`).join('')}</ul></div>
-      <p class="sub"><span class="num">${done} of ${W.checklist_progress.items.length}</span> checked, counted by the host.</p>`)}
-    ${surface('sparkline_series', `<p class="sub">${label(W.sparkline_series.label)}</p>
-      ${spark(sp)}
-      <dl class="legend"><div><dt>Min</dt><dd class="num">${Math.min(...sp)}</dd></div><div><dt>Max</dt><dd class="num">${Math.max(...sp)}</dd></div><div><dt>Latest</dt><dd class="num">${sp[sp.length - 1]}</dd></div></dl>`)}
-    ${surface('action_chips', `<ul class="chips">${W.action_chips.chips.map((c) => `<li><a class="chip" href="${chipHref[c]}">${esc(c)}</a></li>`).join('')}</ul>
-      <p class="sub">The overlay proposes these, so they are dashed and monospace. A solid button is always the host’s.</p>`, ' data-agent-hidden')}
+    ${workflowSurfaces.join('\n    ')}
   </div>
 </main>`,
 });
@@ -702,7 +762,10 @@ const STATES = [
     notice({ ic: 'lock', title: 'This session cannot view the fleet', body: 'Sign in again with a new bootstrap code.', actions: '<a class="btn btn--sm" href="signin.html" data-agent-hidden aria-label="Go to sign-in, table permission state">Go to sign-in</a>' }),
     notice({ ic: 'lock', title: 'This session cannot read this thread', body: 'Sign in again with a new bootstrap code.', actions: '<a class="btn btn--sm" href="signin.html" data-agent-hidden aria-label="Go to sign-in, thread permission state">Go to sign-in</a>' })],
 ];
-const stateCard = (id, where, tone, body) => `<div class="state${tone ? ` state--${tone}` : ''}" role="group" aria-labelledby="st-${id} st-${id}-w"><p class="state__where" id="st-${id}-w">${where}</p>${body}</div>`;
+const stateCard = (id, where, tone, body) => {
+  const toneClass = tone ? ` state--${tone}` : '';
+  return `<div class="state${toneClass}" role="group" aria-labelledby="st-${id} st-${id}-w"><p class="state__where" id="st-${id}-w">${where}</p>${body}</div>`;
+};
 page({
   file: 'states.html', title: 'States sheet', cur: { nav: 'states' },
   main: `<main id="main" class="main" tabindex="-1" aria-labelledby="page-title">

@@ -5,8 +5,8 @@ import { readFileSync } from 'node:fs';
 export const data = JSON.parse(readFileSync(new URL('../brief/fixtures/workspace.json', import.meta.url), 'utf8'));
 
 export const esc = (s) => String(s)
-  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
 
 // Host labels: drop control, bidi-control and zero-width characters, then isolate direction.
 const UNSAFE = /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/g;
@@ -169,19 +169,34 @@ export const wfPill = (p) => p === 'Deterministic Workflow'
 // Invisible and direction-changing characters are spelled out as host-drawn markers.
 const HIDDEN = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/g;
 const code = (c) => `U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`;
-export const plain = (text) => esc(String(text).replace(HIDDEN, (c) => `\u0001${code(c)}\u0002`))
-  .replace(/\u0001(U\+[0-9A-F]+)\u0002/g, '<span class="ctl"><span class="vh">invisible character </span>$1</span>');
+export const plain = (text) => {
+  const value = String(text);
+  let start = 0;
+  let html = '';
+  for (const match of value.matchAll(HIDDEN)) {
+    const character = match[0];
+    html += esc(value.slice(start, match.index));
+    html += `<span class="ctl"><span class="vh">invisible character </span>${code(character)}</span>`;
+    start = match.index + character.length;
+  }
+  return html + esc(value.slice(start));
+};
 export const well = (text, cls = '', tag = 'div') => `<${tag} class="well${cls ? ' ' + cls : ''}" dir="auto">${plain(text)}</${tag}>`;
 
 export const meter = (pct, warn) => `<svg class="meter${warn ? ' meter--warn' : ''}" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true" focusable="false"><rect class="meter__track" width="100" height="4"/><rect class="meter__fill" width="${pct}" height="4"/></svg>`;
 
-export const notice = ({ tone = 'quiet', ic = 'info', title, titleId = '', body = '', actions = '' }) =>
-  `<div class="notice notice--${tone}">${icon(ic)}<div class="notice__main">${titleId ? `<h2 class="notice__title" id="${titleId}">${title}</h2>` : `<p class="notice__title">${title}</p>`}${body ? `<p class="notice__body">${body}</p>` : ''}${actions ? `<div class="notice__actions">${actions}</div>` : ''}</div></div>`;
+export const notice = ({ tone = 'quiet', ic = 'info', title, titleId = '', body = '', actions = '' }) => {
+  const heading = titleId ? `<h2 class="notice__title" id="${titleId}">${title}</h2>` : `<p class="notice__title">${title}</p>`;
+  const description = body ? `<p class="notice__body">${body}</p>` : '';
+  const controls = actions ? `<div class="notice__actions">${actions}</div>` : '';
+  return `<div class="notice notice--${tone}">${icon(ic)}<div class="notice__main">${heading}${description}${controls}</div></div>`;
+};
 
 // ---------- flattened fleet ----------
 export const fleet = data.projects.flatMap((p) => p.sandboxes.map((s) => {
   const a = parseAddr(s.addr);
-  const band = s.attention > 0 ? 'attention' : (['reconnecting', 'offline', 'stalled', 'error'].includes(s.status) ? 'degraded' : 'ok');
+  const baseBand = ['reconnecting', 'offline', 'stalled', 'error'].includes(s.status) ? 'degraded' : 'ok';
+  const band = s.attention > 0 ? 'attention' : baseBand;
   return { ...s, project: p.label, a, band, sev: SEVERITY[s.status] };
 })).map((s, i) => ({ ...s, n: i + 1 }));
 export const BAND_ORDER = ['attention', 'degraded', 'ok'];

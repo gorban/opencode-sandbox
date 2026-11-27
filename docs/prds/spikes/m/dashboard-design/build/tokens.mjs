@@ -28,7 +28,7 @@ export const DARK = {
 
 export const toLinear = (s) => {
   const [lch, a = '1'] = s.split('/').map((x) => x.trim());
-  const [L, C, H] = lch.split(/\s+/).map((v, i) => (i === 0 ? parseFloat(v) / 100 : parseFloat(v)));
+  const [L, C, H] = lch.split(/\s+/).map((v, i) => (i === 0 ? Number.parseFloat(v) / 100 : Number.parseFloat(v)));
   const h = (H * Math.PI) / 180, A = C * Math.cos(h), B = C * Math.sin(h);
   const l = (L + 0.3963377774 * A + 0.2158037573 * B) ** 3;
   const m = (L - 0.1055613458 * A - 0.0638541728 * B) ** 3;
@@ -38,7 +38,7 @@ export const toLinear = (s) => {
     -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s2,
     -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s2,
   ].map((v) => Math.min(1, Math.max(0, v)));
-  return { lin, a: parseFloat(a) };
+  return { lin, a: Number.parseFloat(a) };
 };
 const gamma = (v) => (v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055);
 const h2 = (v) => Math.round(v * 255).toString(16).padStart(2, '0');

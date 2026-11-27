@@ -28,7 +28,7 @@ const pairs = [
   ['bad', 'paper-3', TEXT], ['ok', 'paper-3', TEXT], ['caution', 'paper-3', TEXT], ['caution-edge', 'paper-3', UI], ['ok', 'paper-3', UI],
 ];
 let fails = 0;
-for (const [name, set] of [['light', light], ['dark', dark]]) {
+for (const [name, set] of Object.entries({ light, dark })) {
   for (const [fg, bg, min] of pairs) {
     const r = ratio(set[`--color-${fg}`], set[`--color-${bg}`]);
     if (r < min) { fails++; console.log(`FAIL ${name} ${fg} on ${bg}: ${r.toFixed(2)} < ${min}`); }
