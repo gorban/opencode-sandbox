@@ -2,6 +2,7 @@
 
 import contextlib
 import fcntl
+import hashlib
 import html
 import json
 import math
@@ -159,6 +160,29 @@ def _lock(fd):
             time.sleep(0.025)
 
 
+def lease_hold_name(root_name: str) -> str:
+    """Return a deterministic collision-free hold marker filename for one lease root."""
+    digest = hashlib.sha256(root_name.encode("utf-8", errors="surrogateescape")).hexdigest()[:32]
+    return f"{_HOLD_PREFIX}{digest}"
+
+
+def _write_hold_in_dir(directory: int, name: str) -> None:
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | CREATE_FLAGS, 0o600, dir_fd=directory)
+    try:
+        _regular(fd)
+        os.write(fd, b"hold\n")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.fsync(directory)
+
+
+def _clear_hold_in_dir(directory: int, name: str) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(name, dir_fd=directory)
+    os.fsync(directory)
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -271,28 +295,46 @@ class Store:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary, dir_fd=directory)
 
-    def write_lease_hold(self, root_name: str) -> None:
-        """Persist an independent durable hold marker without waiting on state.lock."""
-        safe = "".join(ch for ch in root_name if ch.isalnum() or ch in ("-", "_", "."))[:96] or "unknown"
-        name = f"{_HOLD_PREFIX}{safe}"
-        directory = _directory(self.path, create=False)
+    def write_lease_hold(self, root_name: str, *, directory: int | None = None) -> None:
+        """Persist a durable hold marker before any irreversible lease release can occur."""
+        name = lease_hold_name(root_name)
+        if directory is not None:
+            _write_hold_in_dir(directory, name)
+            return
+        opened = _directory(self.path, create=False)
         try:
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | CREATE_FLAGS, 0o600, dir_fd=directory)
-            try:
-                _regular(fd)
-                os.write(fd, b"hold\n")
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.fsync(directory)
+            _write_hold_in_dir(opened, name)
         finally:
-            os.close(directory)
+            os.close(opened)
 
-    def has_lease_holds(self, directory) -> bool:
+    def clear_lease_hold(self, root_name: str, *, directory: int | None = None) -> None:
+        """Remove a durable hold marker after lease release is confirmed without timeout."""
+        name = lease_hold_name(root_name)
+        if directory is not None:
+            _clear_hold_in_dir(directory, name)
+            return
+        opened = _directory(self.path, create=False)
+        try:
+            _clear_hold_in_dir(opened, name)
+        finally:
+            os.close(opened)
+
+    def lease_hold_names(self, directory) -> frozenset[str] | None:
         if directory is None:
-            return False
+            return frozenset()
         try:
             entries = os.listdir(directory)
         except OSError:
+            return None
+        return frozenset(name for name in entries if name.startswith(_HOLD_PREFIX))
+
+    def has_lease_holds(self, directory) -> bool:
+        holds = self.lease_hold_names(directory)
+        return holds is None or bool(holds)
+
+    def has_orphan_lease_holds(self, directory, active_roots) -> bool:
+        holds = self.lease_hold_names(directory)
+        if holds is None:
             return True
-        return any(name.startswith(_HOLD_PREFIX) for name in entries)
+        active_names = {lease_hold_name(str(root)) for root in active_roots}
+        return bool(holds - active_names)

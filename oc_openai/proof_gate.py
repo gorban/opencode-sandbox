@@ -443,6 +443,7 @@ class ProofGate:
         self._refusals: list[dict[str, object]] = []
         self._accept_fence = threading.Lock()
         self._accept_drains: list = []
+        self._accept_revokers: dict = {}
 
     @staticmethod
     def _validate_approval(approval: ProofApproval, instructions_sha256: str) -> None:
@@ -555,18 +556,30 @@ class ProofGate:
                 self._job_incarnation = None
                 self._job_generation = None
                 self._evidence_path = None
+                self._state = STATE_SPENT
+                self._outcome = "aborted_duplicate_evidence"
                 raise ProofGateError("duplicate per-incarnation evidence file") from None
+            except BaseException:
+                self._job_incarnation = None
+                self._job_generation = None
+                self._evidence_path = None
+                self._state = STATE_SPENT
+                self._outcome = "aborted_bind_publication_failed"
+                raise
             return evidence_path
 
-    def register_accept_drain(self, drain_fn) -> None:
+    def register_accept_drain(self, drain_fn, revoke_fn=None) -> None:
         with self._accept_fence:
             if drain_fn not in self._accept_drains:
                 self._accept_drains.append(drain_fn)
+            if callable(revoke_fn):
+                self._accept_revokers[drain_fn] = revoke_fn
 
     def unregister_accept_drain(self, drain_fn) -> None:
         with self._accept_fence:
             if drain_fn in self._accept_drains:
                 self._accept_drains.remove(drain_fn)
+            self._accept_revokers.pop(drain_fn, None)
 
     def accept_with_snapshot(self, accept_nonblocking):
         """Serialize nonblocking socket accept with state transitions under the same fence."""
@@ -579,6 +592,20 @@ class ProofGate:
     def _rotate_accepts_locked(self, pre_snapshot: ArrivalSnapshot) -> None:
         for rotate_or_drain in list(self._accept_drains):
             rotate_or_drain(pre_snapshot)
+
+    def _fail_closed_publication_locked(self, reason: str) -> None:
+        """Fail permanently closed across in-memory state and registered listeners under _accept_fence."""
+        with self._lock:
+            self._state = STATE_SPENT
+            self._arm_nonce = None
+            self._observed_row = None
+            self._observed_screen_digest = None
+            self._relay_verified = False
+            self._verified_relay_id = None
+            self._outcome = reason
+        for revoke_fn in list(self._accept_revokers.values()):
+            with suppress(Exception):
+                revoke_fn()
 
     def snapshot_arrival(self) -> ArrivalSnapshot:
         """Capture arrival-time gate state before a peer request body is read."""
@@ -598,7 +625,7 @@ class ProofGate:
                 raise ProofGateError(f"cannot arm proof gate from state {self._state}")
 
     def arm(self, *, observed_row: str, observed_screen_digest: str) -> str:
-        """Transition CLOSED_DISCOVERY -> ARMED with atomic listener rotation to fence kernel backlog."""
+        """Transition CLOSED_DISCOVERY -> ARMED with fail-closed evidence + listener rotation."""
         if not observed_row or not _SHA256_RE.fullmatch(observed_screen_digest):
             raise ProofGateError("arming requires observed_row and 64-hex observed_screen_digest")
         self._verify_owner_and_history()
@@ -615,24 +642,18 @@ class ProofGate:
                 self._observed_screen_digest = observed_screen_digest
                 self._state = STATE_ARMED
                 self._outcome = "armed"
-                _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
-            # Atomically replace listener AFTER state/fsync publication and drain old listener with pre_snapshot.
+                evidence_path = self._evidence_path
+                evidence_payload = self._evidence_snapshot_locked()
             try:
+                _atomic_fsync_json(evidence_path, evidence_payload, exclusive=False)
                 self._rotate_accepts_locked(pre_snapshot)
             except BaseException:
-                with self._lock:
-                    self._state = STATE_CLOSED_DISCOVERY
-                    self._arm_nonce = None
-                    self._observed_row = None
-                    self._observed_screen_digest = None
-                    self._outcome = "aborted_rotation_failed"
-                    with suppress(OSError):
-                        _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
+                self._fail_closed_publication_locked("aborted_arm_publication_failed")
                 raise
             return nonce
 
     def mark_relay_verified(self, relay_id: str) -> None:
-        """Record verified isolation + bind with atomic listener rotation to fence kernel backlog."""
+        """Record verified isolation + bind with fail-closed evidence + listener rotation."""
         if not _SHA256_RE.fullmatch(relay_id):
             raise ProofGateError("invalid verified turn relay ID")
         self._verify_owner_and_history()
@@ -645,16 +666,13 @@ class ProofGate:
                     raise ProofGateError("turn relay already verified")
                 self._relay_verified = True
                 self._verified_relay_id = relay_id
-                _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
-            # Atomically replace listener AFTER verification/fsync and drain old listener with pre_snapshot.
+                evidence_path = self._evidence_path
+                evidence_payload = self._evidence_snapshot_locked()
             try:
+                _atomic_fsync_json(evidence_path, evidence_payload, exclusive=False)
                 self._rotate_accepts_locked(pre_snapshot)
             except BaseException:
-                with self._lock:
-                    self._relay_verified = False
-                    self._verified_relay_id = None
-                    with suppress(OSError):
-                        _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
+                self._fail_closed_publication_locked("aborted_verify_publication_failed")
                 raise
 
     def validate_and_canonicalize(

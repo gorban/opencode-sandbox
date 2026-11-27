@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .connection_job import LeaseHostProof, LeaseSetHostProof, PhysicalHost, WorkerLease
-from .connection_state import ConnectionError, MAX_WORKER_LEASES, Store
+from .connection_state import ConnectionError, MAX_WORKER_LEASES, Store, lease_hold_name
 from .profiles import ProfileError
 from .responses import AUTH_HOST, API_HOST, DISCOVERY, INTERACTIVE_STREAM_LIMITS, JWKS, MODELS, TOKEN
 from .responses import Cancellation, OpenAITransport, StreamLimits, response_error
@@ -483,7 +483,11 @@ class Connection:
             return "retained_conflict"
         leases = record.get("worker_leases")
         if isinstance(leases, dict) and leases.get(lease.root) == lease_record:
+            if release_gate is not None and not release_gate():
+                return "retained_gate_closed"
             lease.confirm_terminal()
+            # Persist an effective durable hold BEFORE any irreversible os.replace() removes worker_leases.
+            self._store.write_lease_hold(lease.root, directory=directory)
             leases = dict(leases)
             leases.pop(lease.root, None)
             if leases:
@@ -498,6 +502,10 @@ class Connection:
             return "absent"
         return "retained_conflict"
 
+    def _clear_session_hold(self, root_name: str) -> None:
+        with self._store.locked() as directory:
+            self._store.clear_lease_hold(root_name, directory=directory)
+
     @contextlib.contextmanager
     def session_lease(self, binding, job, *, release_gate=None, on_release_result=None):
         """Register one concurrent interactive session lease (bounded to MAX_WORKER_LEASES)."""
@@ -506,16 +514,19 @@ class Connection:
         with self._store.locked() as directory:
             record = self._store.read(directory)
             leases = dict(record.get("worker_leases") or {})
+            hold_names = self._store.lease_hold_names(directory)
+            hold_name = lease_hold_name(lease.root)
             if (not _active(record, binding) or "worker_lease" in record
                     or lease.root in leases or len(leases) >= MAX_WORKER_LEASES
-                    or self._store.has_lease_holds(directory)):
+                    or hold_names is None or hold_name in hold_names
+                    or self._store.has_orphan_lease_holds(directory, leases.keys())):
                 raise ConnectionError("managed_retirement_incomplete")
             leases[lease.root] = lease_record
             record["worker_leases"] = leases
             self._store.write(directory, record)
-        bind_hold = getattr(release_gate, "bind_hold_writer", None)
-        if callable(bind_hold):
-            bind_hold(lambda r=lease.root: self._store.write_lease_hold(r))
+        bind_releaser = getattr(release_gate, "bind_hold_releaser", None)
+        if callable(bind_releaser):
+            bind_releaser(lambda r=lease.root: self._clear_session_hold(r))
         try:
             yield lease
         finally:
@@ -526,11 +537,13 @@ class Connection:
                         outcome = self._release_session_lease_locked(
                             directory, binding, lease, lease_record, release_gate=release_gate,
                         )
+                        coordinated = bool(getattr(release_gate, "is_coordinated", lambda: False)())
+                        if not coordinated and outcome in ("removed", "absent"):
+                            if release_gate is None or release_gate():
+                                self._store.clear_lease_hold(lease.root, directory=directory)
             except BaseException:
                 if on_release_result is not None:
                     on_release_result("uncertain_commit_error")
-                with contextlib.suppress(OSError, ConnectionError):
-                    self._store.write_lease_hold(lease.root)
                 raise
             if on_release_result is not None:
                 on_release_result(outcome)

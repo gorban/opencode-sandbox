@@ -289,27 +289,40 @@ class SessionBroker:
         with suppress(OSError):
             os.read(wake_r, 64)
 
-    def _bind_nonblocking_listener(self, path: Path) -> socket.socket:
+    def _bind_nonblocking_listener(self, path: Path) -> tuple[socket.socket, tuple[int, int]]:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound_id: tuple[int, int] | None = None
         try:
             listener.bind(str(path))
+            info = path.lstat()
+            bound_id = (info.st_dev, info.st_ino)
             path.chmod(0o600)
             listener.listen(MAX_CLIENTS)
             listener.setblocking(False)
-            return listener
+            return listener, bound_id
         except BaseException:
             with suppress(OSError):
                 listener.close()
-            with suppress(OSError):
-                path.unlink()
+            if bound_id is not None:
+                with suppress(OSError):
+                    cur = path.lstat()
+                    if (cur.st_dev, cur.st_ino) == bound_id:
+                        path.unlink()
             raise
+
+    def _revoke_listener_on_publication_failure(self) -> None:
+        self._trigger_revocation()
+        old = self._listener
+        self._listener = None
+        if old is not None:
+            with suppress(OSError):
+                old.close()
+        self._wake_accept_loop()
 
     def start(self) -> None:
         wake_r, wake_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
         try:
-            listener = self._bind_nonblocking_listener(self.socket_path)
-            info = self.socket_path.lstat()
-            self._socket_id = (info.st_dev, info.st_ino)
+            listener, self._socket_id = self._bind_nonblocking_listener(self.socket_path)
         except BaseException:
             os.close(wake_r)
             os.close(wake_w)
@@ -319,7 +332,10 @@ class SessionBroker:
         self._listener = listener
         reg_drain = getattr(self._proof_gate, "register_accept_drain", None)
         if callable(reg_drain):
-            reg_drain(self._rotate_listener_locked)
+            try:
+                reg_drain(self._rotate_listener_locked, self._revoke_listener_on_publication_failure)
+            except TypeError:
+                reg_drain(self._rotate_listener_locked)
         self._accept_thread = threading.Thread(target=self._accept_loop, name="oc-chat-broker", daemon=True)
         self._watch_thread = threading.Thread(target=self._watch_revocation, name="oc-chat-watch", daemon=True)
         self._accept_thread.start()
@@ -428,7 +444,7 @@ class SessionBroker:
             return
         old_listener = self._listener
         tmp_path = self.socket_path.parent / f"s.{secrets.token_hex(4)}"
-        new_listener = self._bind_nonblocking_listener(tmp_path)
+        new_listener, tmp_id = self._bind_nonblocking_listener(tmp_path)
         try:
             os.replace(tmp_path, self.socket_path)
             info = self.socket_path.lstat()
@@ -436,7 +452,9 @@ class SessionBroker:
             with suppress(OSError):
                 new_listener.close()
             with suppress(OSError):
-                tmp_path.unlink()
+                cur = tmp_path.lstat()
+                if (cur.st_dev, cur.st_ino) == tmp_id:
+                    tmp_path.unlink()
             raise
         self._listener = new_listener
         self._socket_id = (info.st_dev, info.st_ino)
@@ -1884,6 +1902,7 @@ class _SlotState:
         self.revoke_or_close_failed = False
         self.release_gate_opened = False
         self.exited = False
+        self.store_released = False
         self.lease_confirmed_released = False
 
 
@@ -2105,13 +2124,24 @@ class _SessionSlotCoordinator:
             except Exception as exc:
                 self._record_error(exc)
 
-    def _exit_slot_lease(self, state: _SlotState) -> None:
-        try:
-            state.slot_cm.__exit__(None, None, None)
-        except Exception as exc:
-            self._deny_slot_release(state)
-            self._record_error(exc)
-            return
+    def _finalize_slot_hold(self, state: _SlotState) -> None:
+        with self._lock:
+            if state.retire_timed_out or state.revoke_or_close_failed or not state.store_released:
+                return
+            if state.lease_confirmed_released:
+                return
+        finalize = getattr(state.handle, "finalize_lease_release", None)
+        if callable(finalize):
+            try:
+                if finalize() is not True:
+                    self._record_error(
+                        RuntimeError("Slot durable lease hold could not be cleared after retirement")
+                    )
+                    return
+            except Exception as exc:
+                self._deny_slot_release(state)
+                self._record_error(exc)
+                return
         try:
             confirmed = _slot_lease_release_confirmed(state.handle, allow_legacy=state.allow_legacy)
         except Exception as exc:
@@ -2125,6 +2155,21 @@ class _SessionSlotCoordinator:
         with self._lock:
             if not state.retire_timed_out:
                 state.lease_confirmed_released = True
+                state.retired = True
+
+    def _exit_slot_lease(self, state: _SlotState, *, finalize_hold: bool) -> None:
+        try:
+            state.slot_cm.__exit__(None, None, None)
+        except Exception as exc:
+            self._deny_slot_release(state)
+            self._record_error(exc)
+            return
+        with self._lock:
+            if state.retire_timed_out:
+                return
+            state.store_released = True
+        if finalize_hold or getattr(state.handle, "finalize_lease_release", None) is None:
+            self._finalize_slot_hold(state)
 
     def _claim_retire_ownership(self, state: _SlotState) -> tuple[bool, bool, str | None]:
         """Return (already_done, claimed, fallback_relay_id_to_remove)."""
@@ -2262,7 +2307,9 @@ class _SessionSlotCoordinator:
             return False
         return True
 
-    def _complete_slot_release(self, state: _SlotState, *, broker_quiescent: bool) -> None:
+    def _complete_slot_release(
+        self, state: _SlotState, *, broker_quiescent: bool, finalize_hold: bool,
+    ) -> None:
         if not self._open_relay_confirm_gate(state, broker_quiescent=broker_quiescent):
             return
         should_exit = False
@@ -2278,12 +2325,18 @@ class _SessionSlotCoordinator:
             self._deny_slot_release(state)
             return
         if should_exit and self._authorize_slot_release(state):
-            self._exit_slot_lease(state)
+            self._exit_slot_lease(state, finalize_hold=finalize_hold)
         with self._lock:
             if state.lease_confirmed_released and not state.retire_timed_out:
                 state.retired = True
 
-    def _try_release_slot_lease(self, state: _SlotState, *, remove_relay_if_timed_out: bool = False) -> None:
+    def _try_release_slot_lease(
+        self,
+        state: _SlotState,
+        *,
+        remove_relay_if_timed_out: bool = False,
+        finalize_hold: bool = True,
+    ) -> None:
         done, claimed, fallback_rid = self._claim_retire_ownership(state)
         if done:
             return
@@ -2297,13 +2350,13 @@ class _SessionSlotCoordinator:
             if not self._remove_slot_relay_if_needed(state):
                 return
             broker_quiescent = self._check_broker_quiescent(state)
-            self._complete_slot_release(state, broker_quiescent=broker_quiescent)
+            self._complete_slot_release(state, broker_quiescent=broker_quiescent, finalize_hold=finalize_hold)
         finally:
             with self._lock:
                 state.retire_owner_active = False
 
-    def _finish_slot_retirement(self, state: _SlotState) -> None:
-        self._try_release_slot_lease(state)
+    def _finish_slot_retirement(self, state: _SlotState, *, finalize_hold: bool = True) -> None:
+        self._try_release_slot_lease(state, finalize_hold=finalize_hold)
 
     def _start_slot_retirement(self, slot_index: int, *, stop_if_last: bool) -> None:
         with self._lock:
@@ -2318,6 +2371,7 @@ class _SessionSlotCoordinator:
             worker = threading.Thread(
                 target=self._finish_slot_retirement,
                 args=(state,),
+                kwargs={"finalize_hold": False},
                 name=f"oc-slot-retire-{slot_index}",
                 daemon=False,
             )
@@ -2389,24 +2443,31 @@ class _SessionSlotCoordinator:
         if still_unconfirmed:
             self._record_error(RuntimeError("Slot relay state remained unconfirmed during teardown"))
 
+    def _handle_retire_thread_result(self, thread: threading.Thread, *, timed_out: bool) -> None:
+        state: _SlotState | None = None
+        with self._lock:
+            slot_idx = self._retire_thread_slots.get(thread)
+            if slot_idx is not None and slot_idx in self._slots:
+                state = self._slots[slot_idx]
+                if timed_out:
+                    state.retire_timed_out = True
+        if timed_out:
+            if state is not None:
+                self._deny_slot_release(state)
+            self._record_error(
+                RuntimeError(
+                    f"Slot retirement thread '{thread.name}' did not finish; "
+                    "durable lease publication state is uncertain"
+                )
+            )
+            return
+        if state is not None:
+            self._finalize_slot_hold(state)
+
     def _join_retire_threads(self, threads: list[threading.Thread]) -> None:
         for thread in threads:
             thread.join(timeout=15)
-            if thread.is_alive():
-                timed_out_state: _SlotState | None = None
-                with self._lock:
-                    slot_idx = self._retire_thread_slots.get(thread)
-                    if slot_idx is not None and slot_idx in self._slots:
-                        timed_out_state = self._slots[slot_idx]
-                        timed_out_state.retire_timed_out = True
-                if timed_out_state is not None:
-                    self._deny_slot_release(timed_out_state)
-                self._record_error(
-                    RuntimeError(
-                        f"Slot retirement thread '{thread.name}' did not finish; "
-                        "durable lease publication state is uncertain"
-                    )
-                )
+            self._handle_retire_thread_result(thread, timed_out=thread.is_alive())
 
     def teardown_all(self, agent_id: str | None) -> Exception | None:
         if agent_id is not None:
