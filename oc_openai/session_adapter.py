@@ -197,6 +197,9 @@ class OpenAISessionAdapter:
         models = self._preflight_models(conn, binding, deadline=deadline, cancelled=cancelled)
         if not models:
             return InstancePreflight(spec=instance, readiness=ReadinessState.NEEDS_VERIFY)
+        if deadline is not None:
+            # A hold can change while authenticated model discovery is in flight.
+            exposure_hold = self._inspect_shared_exposure(backend)
         return InstancePreflight(
             spec=instance,
             readiness=ReadinessState.READY,

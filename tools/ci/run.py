@@ -147,6 +147,7 @@ PYTHON_FILES = (
     'oc_openai/responses.py',
     'oc_openai/session_adapter.py',
     'oc_openai/session_admission.py',
+    'oc_openai/session_attach.py',
     'oc_openai/session_broker.py',
     'oc_openai/session_protocol.py',
     'oc_openai/session_relay.py',

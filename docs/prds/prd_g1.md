@@ -118,6 +118,37 @@ residue after admission, especially if the host may finish a timed-out mutation
 or all owners die before quiescence can be observed.
 Report that error and preserve evidence for the rollback follow-up.
 
+## Container identity during the prepared session
+
+Keep the verified create receipt through retirement. Podman's positional
+namespace can resolve a name before a full ID. For a prepared session, select
+the worker or relay by an anchored full-ID filter and the receipt's immutable
+create label for start, attached start, stop and force removal. Supply no
+positional name or ID. For a verified stopped predecessor, use its anchored
+ID and checked ownership labels with non-force removal. Verify removal with
+filtered full-ID inventory. An error, unexpected result or surviving ID
+keeps the cleanup outcome unresolved. Qualify the native Podman selector and
+attached start in the isolated guest, and test a mismatched identity with
+inert stubs.
+
+Because an empty filtered attached start can return zero, the invocation
+gets a private, initially empty Podman file event log through its own minimal
+configuration override. Pin the file and verify the devbox and physical host
+see the same trusted inode. Require a bounded exact-ID attach record on
+success and preserve the transport status and independently verified
+cleanup. The clean Podman 6.1.3 guest emitted the exact attach record for a
+short-lived worker and no record for the zero-match command.
+
+Bind relay readiness to the verified relay. After listening while the grant
+is pending, the relay writes one fixed record to its bounded private
+container log. SELinux denied the isolated socket variants in the clean
+guest and permitted the private conmon log without a policy change.
+The record's MAC binds the grant incarnation, generation, port and
+effective SELinux process label to the slot proof. Verify the configured
+log path and pinned inode, exact live relay, and independently measured
+bind-mount labels. An invalid, oversized, repeated or stale record aborts
+before activation. The log remains outside the worker and relay mounts.
+
 ## Verification before review and merge
 
 Security and general walkthrough reviews cleared the pre-admission scope. The

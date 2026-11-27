@@ -52,9 +52,7 @@ def _load_package(name: str):
     return module
 
 
-def _admission_parent() -> int:
-    parent = os.getppid()
-    process = Path(f"/proc/{parent}")
+def _verify_launcher_command(process: Path) -> None:
     source = Path(__file__).resolve().with_name("oc-sandbox")
     _trusted_node(source)
     if process.stat().st_uid != os.geteuid() or not os.path.samefile(process / "exe", "/usr/bin/bash"):
@@ -70,15 +68,8 @@ def _admission_parent() -> int:
     if not script or ((process / "cwd") / os.fsdecode(script)).resolve(strict=True) != source:
         raise ValueError("invalid launcher source")
 
-    in_pipe, out_pipe = os.fstat(3), os.fstat(4)
-    if (
-        any(not stat.S_ISFIFO(info.st_mode) for info in (in_pipe, out_pipe))
-        or os.path.samestat(in_pipe, out_pipe)
-        or fcntl.fcntl(3, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
-        or fcntl.fcntl(4, fcntl.F_GETFL) & os.O_ACCMODE != os.O_WRONLY
-    ):
-        raise ValueError("invalid managed launch channel")
-    missing = {(in_pipe.st_dev, in_pipe.st_ino, os.O_WRONLY), (out_pipe.st_dev, out_pipe.st_ino, os.O_RDONLY)}
+
+def _launcher_pipe_endpoints(process: Path):
     for remote in (process / "fd").iterdir():
         try:
             info = remote.stat()
@@ -87,10 +78,25 @@ def _admission_parent() -> int:
             with (process / "fdinfo" / remote.name).open(encoding="ascii") as metadata:
                 flags = next((line.split()[1] for line in metadata if line.startswith("flags:")), None)
             if flags is not None:
-                missing.discard((info.st_dev, info.st_ino, int(flags, 8) & os.O_ACCMODE))
+                yield info.st_dev, info.st_ino, int(flags, 8) & os.O_ACCMODE
         except FileNotFoundError:
             continue
-    if missing or os.getppid() != parent:
+
+
+def _admission_parent() -> int:
+    parent = os.getppid()
+    process = Path(f"/proc/{parent}")
+    _verify_launcher_command(process)
+    in_pipe, out_pipe = os.fstat(3), os.fstat(4)
+    if (
+        any(not stat.S_ISFIFO(info.st_mode) for info in (in_pipe, out_pipe))
+        or os.path.samestat(in_pipe, out_pipe)
+        or fcntl.fcntl(3, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
+        or fcntl.fcntl(4, fcntl.F_GETFL) & os.O_ACCMODE != os.O_WRONLY
+    ):
+        raise ValueError("invalid managed launch channel")
+    required = {(in_pipe.st_dev, in_pipe.st_ino, os.O_WRONLY), (out_pipe.st_dev, out_pipe.st_ino, os.O_RDONLY)}
+    if required - set(_launcher_pipe_endpoints(process)) or os.getppid() != parent:
         raise ValueError("managed launch channels are not owned by the launcher")
     os.set_inheritable(3, False)
     os.set_inheritable(4, False)

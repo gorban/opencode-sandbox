@@ -74,11 +74,12 @@ class AdmissionChannel:
             buffered.extend(chunk)
             if len(buffered) > MAX_FRAME:
                 raise ValueError("Oversized managed launch frame")
-            if b"\n" in buffered:
-                if buffered.count(b"\n") != 1 or not buffered.endswith(b"\n"):
-                    raise ValueError("Unexpected data after managed launch frame")
-                self.checkpoint()
-                return decode_json(buffered[:-1])
+            if b"\n" not in buffered:
+                continue
+            if buffered.count(b"\n") != 1 or not buffered.endswith(b"\n"):
+                raise ValueError("Unexpected data after managed launch frame")
+            self.checkpoint()
+            return decode_json(buffered[:-1])
         raise LaunchRefusedError("launch_interrupted", "Managed launch cancelled or preparation timed out.")
 
     def acknowledge(self, message: bytes, *, final: bool = False):
@@ -138,6 +139,10 @@ class AdmissionTerminal(StreamTerminal):
         return None
 
 
+def _valid_absolute_launch_path(value: str) -> bool:
+    return value.startswith("/") and os.path.normpath(value) == value and not any(c in value for c in "\x00\n\r")
+
+
 def _validate_intent(raw):
     if type(raw) is not dict or set(raw) != _INTENT_KEYS or any(type(v) is not str for v in raw.values()):
         raise ValueError("Invalid managed launch intent")
@@ -152,10 +157,8 @@ def _validate_intent(raw):
         default = "construct" if raw["instance"] == "default" else f"wt/{raw['instance']}"
         if raw["cwd"] != default:
             raise ValueError("Malformed initial automatic workspace")
-    for name in ("caller_cwd", "lifecycle_dir"):
-        value = raw[name]
-        if not value.startswith("/") or os.path.normpath(value) != value or any(c in value for c in "\x00\n\r"):
-            raise ValueError("Malformed managed launch path")
+    if not all(_valid_absolute_launch_path(raw[name]) for name in ("caller_cwd", "lifecycle_dir")):
+        raise ValueError("Malformed managed launch path")
     if any(raw[name] for name in ("worktree_repo", "worktree_branch")) and (
         not broker._valid_relpath(raw["worktree_repo"]) or not _WORKTREE_BRANCH.fullmatch(raw["worktree_branch"])
     ):
@@ -334,7 +337,7 @@ def _validate_placement(raw):
         raise ValueError("Invalid managed launch placement")
     pod_id = raw["pod_id"]
     pid = raw["lifecycle_pid"]
-    if type(pid) is str and re.fullmatch(r"[1-9][0-9]{0,9}", pid):
+    if type(pid) is str and re.fullmatch(r"[1-9]\d{0,9}", pid, re.ASCII):
         pid = int(pid)
     if type(pod_id) is not str or not IMAGE_ID.fullmatch(pod_id) or type(pid) is not int or not 1 < pid < 2**31:
         raise ValueError("Malformed managed launch placement")
@@ -439,23 +442,31 @@ def _run_admission_session(channel, terminal):
             if workspace is not None and _verify_workspace(spec, intent, sandbox, expected) != workspace:
                 raise ValueError("Managed launch workspace changed")
 
+        def verify_approved_routes():
+            try:
+                checkpoint()
+                verify_config_and_selection()
+                revalidate_interactive_launch(
+                    plan, adapters, deadline=deadline, cancelled=channel.cancelled, checkpoint=checkpoint,
+                )
+                verify_config_and_selection()
+                checkpoint()
+            except Exception:
+                # Retire any already-open slots under the cleanup budget before returning.
+                channel.cancelled.set()
+                raise
+
         creation.enter_context(_lifecycle_guard(intent, sandbox, channel.parent, pid, checkpoint))
         creation.enter_context(host_operation_budget(deadline, channel.cancelled))
         workspace = _verify_workspace(spec, intent, sandbox, expected)
         _report_prepared_workspace(spec["cwd"], checkpoint)
-        verify_config_and_selection()
-        revalidate_interactive_launch(
-            plan, adapters, deadline=deadline, cancelled=channel.cancelled, checkpoint=checkpoint,
-        )
-        checkpoint()
-        verify_config_and_selection()
+        verify_approved_routes()
 
         guard_held = True
 
         def created():
             nonlocal guard_held
-            verify_config_and_selection()
-            checkpoint()
+            verify_approved_routes()
             channel.acknowledge(b"CREATED\n", final=True)
             creation.close()
             guard_held = False
@@ -469,6 +480,6 @@ def _run_admission_session(channel, terminal):
         return broker._run_admitted_session(
             spec, plan, adapters, lock_dir, guarded_terminal, None,
             stop_event=channel.cancelled,
-            prepared_pod=pod_id, checkpoint=checkpoint, before_lease=verify_config_and_selection,
+            prepared_pod=pod_id, checkpoint=checkpoint, before_lease=verify_approved_routes,
             created=created, cleanup_budget=cleanup_budget,
         )
