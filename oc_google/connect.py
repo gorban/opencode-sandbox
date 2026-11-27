@@ -1,6 +1,6 @@
 """Attended, link-only enrollment with workstation-owned metadata transport."""
 
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 import ctypes
 import errno
 from fcntl import F_GETFL, fcntl, ioctl
@@ -18,9 +18,10 @@ from oc_orchestrator.runtime import check_private_directory, host, scratch_paren
 from oc_providers.config import _account_home, _open_trusted_dir, load_provider_config
 from oc_providers.contracts import is_valid_instance_label
 
+from .auth_offer import CallbackDiagnostic
 from .control import terminal
 from .metadata_destination import MetadataRoute, exchange
-from .metadata_workflow import MetadataRuntime, enroll_metadata, reopen_metadata
+from .metadata_workflow import CallbackWorkflowError, MetadataRuntime, enroll_metadata, reopen_metadata
 from .native_artifacts import stage_standalone, verify_standalone_source
 from .native_namespace import public_certificate
 from .native_service import NativeRetirementUnconfirmed, retain_cleanup_failure
@@ -50,6 +51,25 @@ _CONSENT = (
     "workstation and keep this terminal in the foreground.\n"
     "Continue? [y/N] "
 )
+_CALLBACK_DETAILS = {
+    CallbackDiagnostic.FRAMING: "The callback request framing was invalid.",
+    CallbackDiagnostic.TARGET: "The callback request target or Host was invalid.",
+    CallbackDiagnostic.PARAMETERS: "The callback parameters were invalid.",
+    CallbackDiagnostic.HEADER_REFERER: "The callback Referer header was refused.",
+    CallbackDiagnostic.HEADER_ORIGIN: "The callback Origin header was refused.",
+    CallbackDiagnostic.HEADER_DNT: "The callback DNT header was refused.",
+    CallbackDiagnostic.HEADER_COOKIE: "The callback Cookie header was refused.",
+    CallbackDiagnostic.HEADER_CONTENT_LENGTH: "The callback Content-Length header was refused.",
+    CallbackDiagnostic.HEADER_TRANSFER_ENCODING: "The callback Transfer-Encoding header was refused.",
+    CallbackDiagnostic.HEADER_SEC_PURPOSE: "The callback Sec-Purpose header was refused.",
+    CallbackDiagnostic.HEADER_OTHER: "A callback header was invalid or unapproved.",
+    CallbackDiagnostic.HEADER_DUPLICATE: "A callback header was duplicated.",
+    CallbackDiagnostic.AUTHORITY_UNAVAILABLE: "Callback authority was unavailable.",
+    CallbackDiagnostic.HANDOFF_UNCONFIRMED: "The local callback handoff could not be confirmed.",
+    CallbackDiagnostic.SIGN_IN_DENIED: "The callback reported that sign-in was denied.",
+    CallbackDiagnostic.NO_MATCHING_CALLBACK: "No matching callback was accepted.",
+    CallbackDiagnostic.FORWARDED_BEFORE_METADATA: "The callback was forwarded, but metadata setup did not begin.",
+}
 
 
 class ConnectError(RuntimeError):
@@ -403,20 +423,26 @@ def connect_for(label):
     parent = scratch_parent()
     with _attended_owner() as owner:
         _preflight(parent)
-        with ExitStack() as initial_root, ExitStack() as cold_root:
-            with _artifacts() as source:
-                verify_standalone_source(source)
-                if not owner.consent(label):
-                    raise ConnectError("Google sign-in cancelled.")
-                initial = _prepare_runtime(initial_root.enter_context(_private_runtime(parent, label, False, owner)), source)
-                cold = _prepare_runtime(cold_root.enter_context(_private_runtime(parent, label, True, owner)), source)
-            journal = RegistrationJournal(label)
-            enrollment = enroll_metadata(journal, initial, disclose_offer=owner.offer, destination=exchange,
-                                         authorized=owner.authorized, fence=owner.fence)
-            initial_root.close()
-            with owner.fence:
-                owner.deadline = min(owner.deadline, time.monotonic() + 18)
-            reopen_metadata(journal, enrollment, cold, destination=exchange, authorized=owner.authorized, fence=owner.fence)
+        try:
+            with ExitStack() as initial_root, ExitStack() as cold_root:
+                with _artifacts() as source:
+                    verify_standalone_source(source)
+                    if not owner.consent(label):
+                        raise ConnectError("Google sign-in cancelled.")
+                    initial = _prepare_runtime(initial_root.enter_context(_private_runtime(parent, label, False, owner)), source)
+                    cold = _prepare_runtime(cold_root.enter_context(_private_runtime(parent, label, True, owner)), source)
+                journal = RegistrationJournal(label)
+                enrollment = enroll_metadata(journal, initial, disclose_offer=owner.offer, destination=exchange,
+                                             authorized=owner.authorized, fence=owner.fence)
+                initial_root.close()
+                with owner.fence:
+                    owner.deadline = min(owner.deadline, time.monotonic() + 18)
+                reopen_metadata(journal, enrollment, cold, destination=exchange, authorized=owner.authorized, fence=owner.fence)
+        except CallbackWorkflowError as error:
+            if not needs_custody_inspection(error) and type(error.diagnostic) is CallbackDiagnostic:
+                with suppress(OSError, ConnectError):
+                    owner.write_once("Google sign-in callback: " + _CALLBACK_DETAILS[error.diagnostic] + "\n")
+            raise
         with owner.fence:
             owner.write_once(f"Verified Google registration {label} for workstation metadata.\n")
     return 0

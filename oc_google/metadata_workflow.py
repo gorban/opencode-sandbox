@@ -7,9 +7,9 @@ import os
 import stat
 import time
 
-from .auth_offer import Outcome
+from .auth_offer import CallbackDiagnostic, Outcome
 from .enrollment_session import serve_cold_metadata, serve_initial_metadata
-from .metadata_destination import MetadataRoute, _remaining
+from .metadata_destination import MetadataDestinationError, MetadataRoute, _remaining
 from .native_artifacts import StagedNativeBuild
 from .native_enrollment_acp import NativeEnrollmentAcp
 from .native_namespace import public_certificate, reserve_native_unit
@@ -20,6 +20,14 @@ from .registration import ColdObservation, _DIRECTORY, _write_private
 
 class MetadataWorkflowError(RuntimeError):
     """The exact local metadata-only workflow could not complete."""
+
+
+class CallbackWorkflowError(MetadataWorkflowError):
+    """The callback did not yield an authorized metadata handoff."""
+
+    def __init__(self, diagnostic):
+        super().__init__("Google sign-in callback was unavailable")
+        self.diagnostic = diagnostic
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,10 +121,15 @@ def _receive_callback(offer, gate, *, notify, deadline, owner, profile):
             raise MetadataWorkflowError("Google sign-in owner retired after offer disclosure")
         gate.activate()
     while gate.outcome is Outcome.OPEN and owner.active():
-        _remaining(deadline)
+        try:
+            _remaining(deadline)
+        except MetadataDestinationError as error:
+            raise CallbackWorkflowError(CallbackDiagnostic.NO_MATCHING_CALLBACK) from error
         gate.serve_one()
-    if gate.outcome is not Outcome.FORWARDED or not owner.active():
-        raise MetadataWorkflowError("Google sign-in callback was unavailable")
+    if gate.outcome is not Outcome.FORWARDED:
+        raise CallbackWorkflowError(gate.diagnostic or CallbackDiagnostic.NO_MATCHING_CALLBACK)
+    if not owner.active():
+        raise CallbackWorkflowError(CallbackDiagnostic.FORWARDED_BEFORE_METADATA)
 
 
 def _initialize_settings(profile):

@@ -66,6 +66,45 @@ class Outcome(Enum):
     UNCERTAIN = auto()
 
 
+class CallbackDiagnostic(Enum):
+    """Closed local stages for the attended owner's failure report."""
+
+    FRAMING = auto()
+    TARGET = auto()
+    PARAMETERS = auto()
+    HEADER_REFERER = auto()
+    HEADER_ORIGIN = auto()
+    HEADER_DNT = auto()
+    HEADER_COOKIE = auto()
+    HEADER_CONTENT_LENGTH = auto()
+    HEADER_TRANSFER_ENCODING = auto()
+    HEADER_SEC_PURPOSE = auto()
+    HEADER_OTHER = auto()
+    HEADER_DUPLICATE = auto()
+    AUTHORITY_UNAVAILABLE = auto()
+    HANDOFF_UNCONFIRMED = auto()
+    SIGN_IN_DENIED = auto()
+    NO_MATCHING_CALLBACK = auto()
+    FORWARDED_BEFORE_METADATA = auto()
+
+
+_HEADER_DIAGNOSTICS = {
+    b"referer": CallbackDiagnostic.HEADER_REFERER,
+    b"origin": CallbackDiagnostic.HEADER_ORIGIN,
+    b"dnt": CallbackDiagnostic.HEADER_DNT,
+    b"cookie": CallbackDiagnostic.HEADER_COOKIE,
+    b"content-length": CallbackDiagnostic.HEADER_CONTENT_LENGTH,
+    b"transfer-encoding": CallbackDiagnostic.HEADER_TRANSFER_ENCODING,
+    b"sec-purpose": CallbackDiagnostic.HEADER_SEC_PURPOSE,
+}
+
+
+class _CallbackRefused(Refused):
+    def __init__(self, message, diagnostic):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
 def _validate_port(port):
     if type(port) is not int or not 1024 <= port <= 65535 or port in _PRIVATE_PORTS:
         raise Refused("callback port is outside the approved range")
@@ -233,34 +272,39 @@ def _callback_scopes(parameters):
 def parse_callback(head, port):
     _validate_port(port)
     if type(head) is not bytes or len(head) > _LIMIT - 4:
-        raise Refused("invalid callback headers")
+        raise _CallbackRefused("invalid callback headers", CallbackDiagnostic.FRAMING)
     lines = head.split(b"\r\n")
     if not 2 <= len(lines) <= _FIELDS_LIMIT + 1:
-        raise Refused("invalid callback headers")
+        raise _CallbackRefused("invalid callback headers", CallbackDiagnostic.FRAMING)
     parts = lines[0].split(b" ")
     if (len(parts) != 3 or parts[0] != b"GET" or parts[2] != b"HTTP/1.1"
             or not parts[1] or any(not 33 <= value <= 126 for value in parts[1])):
-        raise Refused("invalid callback request")
+        raise _CallbackRefused("invalid callback request", CallbackDiagnostic.TARGET)
     fields = {}
     for line in lines[1:]:
         name, separator, value = line.partition(b":")
         key = name.lower()
         if (not separator or key not in _HEADERS or key in fields
                 or any(not 32 <= char <= 126 for char in value)):
-            raise Refused("invalid callback header")
+            diagnostic = (CallbackDiagnostic.HEADER_DUPLICATE if key in fields
+                          else _HEADER_DIAGNOSTICS.get(key, CallbackDiagnostic.HEADER_OTHER))
+            raise _CallbackRefused("invalid callback header", diagnostic)
         # Keep only the Cookie name so a second field is still refused.
         fields[key] = None if key == b"cookie" else value.strip(b" ")
     if fields.get(b"host") != f"{HOST}:{port}".encode("ascii"):
-        raise Refused("invalid callback host")
+        raise _CallbackRefused("invalid callback host", CallbackDiagnostic.TARGET)
     path, separator, query = parts[1].partition(b"?")
     if path != CALLBACK_PATH.encode("ascii") or not separator or b"#" in query:
-        raise Refused("invalid callback path")
-    parameters = _callback_fields(query)
+        raise _CallbackRefused("invalid callback path", CallbackDiagnostic.TARGET)
+    try:
+        parameters = _callback_fields(query)
+    except Refused as error:
+        raise _CallbackRefused(str(error), CallbackDiagnostic.PARAMETERS) from None
     state = parameters.get("state", "")
     if not _STATE.fullmatch(state):
-        raise Refused("invalid callback state")
+        raise _CallbackRefused("invalid callback state", CallbackDiagnostic.PARAMETERS)
     if "iss" in parameters and parameters["iss"] != _ISSUER:
-        raise Refused("invalid callback issuer")
+        raise _CallbackRefused("invalid callback issuer", CallbackDiagnostic.PARAMETERS)
     if _SUCCESS_FIELDS <= parameters.keys() <= _SUCCESS_FIELDS | _SUCCESS_METADATA:
         if (_CODE.fullmatch(parameters["code"])
                 and _callback_scopes(parameters)
@@ -271,7 +315,7 @@ def parse_callback(head, port):
             and parameters["error"] == "access_denied"
             and _safe_description(parameters.get("error_description", "denied"))):
         return Callback(state, None)
-    raise Refused("incompatible Google callback")
+    raise _CallbackRefused("incompatible Google callback", CallbackDiagnostic.PARAMETERS)
 
 
 def acknowledgement(accepted):
@@ -337,6 +381,7 @@ class CallbackGate:
         self._fence = nullcontext() if fence is None else fence
         self._lock = Lock()
         self._outcome = Outcome.WAITING
+        self._diagnostic = None
         self._state = None
         self._forwarded = None
 
@@ -344,6 +389,11 @@ class CallbackGate:
     def outcome(self):
         with self._lock:
             return self._outcome
+
+    @property
+    def diagnostic(self):
+        with self._lock:
+            return self._diagnostic
 
     def _authority_alive(self):
         try:
@@ -406,24 +456,27 @@ class CallbackGate:
                 return callback
             return None
 
-    def _reject_matching(self, head, address):
+    def _reject_matching(self, head, address, diagnostic):
         with self._lock:
             if (self._outcome is Outcome.OPEN and address == self._address
                     and any(hmac.compare_digest(state, self._state) for state in _states_from_rejected_request(head))):
                 self._state = None
                 self._outcome = Outcome.CANCELLED
+                self._diagnostic = diagnostic
 
     def _receive_callback(self, connection, deadline):
         address = connection.getsockname()
         head, complete = _read_request(connection, deadline)
+        diagnostic = CallbackDiagnostic.FRAMING
         if complete:
             try:
                 callback = parse_callback(head, self._address[1])
-            except Refused:
-                pass
+            except Refused as error:
+                if isinstance(error, _CallbackRefused):
+                    diagnostic = error.diagnostic
             else:
                 return self._consume(callback, address)
-        self._reject_matching(head, address)
+        self._reject_matching(head, address, diagnostic)
         return False
 
     def _consume(self, callback, address):
@@ -435,13 +488,16 @@ class CallbackGate:
             self._outcome = Outcome.CANCELLED
             if callback.code is None:
                 if not self._available():
+                    self._diagnostic = CallbackDiagnostic.AUTHORITY_UNAVAILABLE
                     return False
                 self._outcome = Outcome.DENIED
+                self._diagnostic = CallbackDiagnostic.SIGN_IN_DENIED
                 return True
             query = urlencode({"state": callback.state, "code": callback.code})
             data = (f"GET {CALLBACK_PATH}?{query} HTTP/1.1\r\n"
                     f"Host: {HOST}:{self._address[1]}\r\nConnection: close\r\n\r\n").encode("ascii")
             if not self._available():
+                self._diagnostic = CallbackDiagnostic.AUTHORITY_UNAVAILABLE
                 return False
             self._outcome = Outcome.UNCERTAIN
             try:
@@ -452,6 +508,7 @@ class CallbackGate:
                 pass
             finally:
                 if self._outcome is Outcome.UNCERTAIN:
+                    self._diagnostic = CallbackDiagnostic.HANDOFF_UNCONFIRMED
                     try:
                         self._native.shutdown(socket.SHUT_WR)
                     except OSError:
@@ -490,6 +547,7 @@ class CallbackGate:
                         if not accepted and self._outcome is Outcome.FORWARDED:
                             self._forwarded = None
                             self._outcome = Outcome.UNCERTAIN
+                            self._diagnostic = CallbackDiagnostic.HANDOFF_UNCONFIRMED
                         connection.sendall(acknowledgement(accepted))
                 else:
                     connection.sendall(acknowledgement(False))

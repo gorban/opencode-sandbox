@@ -9,9 +9,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from oc_google.auth_offer import Outcome
+from oc_google.auth_offer import CallbackDiagnostic, Outcome
 from oc_google.metadata_workflow import (
-    MetadataRuntime, MetadataWorkflowError, _receive_callback, enroll_metadata, reopen_metadata,
+    CallbackWorkflowError, MetadataRuntime, MetadataWorkflowError, _receive_callback, enroll_metadata, reopen_metadata,
 )
 from oc_google.native_service import NativeRetirementUnconfirmed
 
@@ -64,6 +64,21 @@ class MetadataWorkflowTest(unittest.TestCase):
                               owner=owner, profile=None)
         notify.assert_called_once()
         gate.activate.assert_not_called()
+
+    def test_callback_workflow_distinguishes_refusal_absence_and_forwarded_owner_loss(self):
+        cases = (
+            (Outcome.CANCELLED, CallbackDiagnostic.HEADER_REFERER, CallbackDiagnostic.HEADER_REFERER),
+            (Outcome.OPEN, None, CallbackDiagnostic.NO_MATCHING_CALLBACK),
+            (Outcome.FORWARDED, None, CallbackDiagnostic.FORWARDED_BEFORE_METADATA),
+        )
+        owner = SimpleNamespace(fence=RLock(), authorizes_offer=lambda _: True, active=lambda: False)
+        for outcome, stage, expected in cases:
+            with self.subTest(outcome=outcome):
+                gate = Mock(outcome=outcome, diagnostic=stage)
+                with self.assertRaises(CallbackWorkflowError) as refused:
+                    _receive_callback(object(), gate, notify=Mock(), deadline=time.monotonic() + 1,
+                                      owner=owner, profile=None)
+                self.assertIs(refused.exception.diagnostic, expected)
 
     def test_cold_phase_expiry_during_retirement_withholds_settlement(self):
         journal, profile, _replica, enrollment, runtime, opened = self.workflow_fixture()

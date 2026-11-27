@@ -1,11 +1,14 @@
 """Exercise attended enrollment boundaries with local fixtures only."""
 
-from contextlib import contextmanager, nullcontext, redirect_stderr
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext, redirect_stderr, suppress
 import errno
 from io import StringIO
 import os
 from pathlib import Path
+import pty
 import runpy
+import select
 import shutil
 import signal
 import stat
@@ -13,11 +16,12 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from threading import RLock
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from oc_google import connect, native_artifacts
+from oc_google import auth_offer, connect, metadata_workflow, native_artifacts
 from oc_google.native_service import NativeInvocation
 
 
@@ -346,6 +350,152 @@ class RuntimeCustodyTest(unittest.TestCase):
                 redirect_stderr(output):
             self.assertEqual(main(), 130)
         self.assertEqual(output.getvalue(), "oc-sandbox google: Google sign-in cancelled.\n")
+
+    def test_callback_diagnostic_uses_only_original_foreground_pty(self):
+        origin = Path(__file__).resolve().parents[1]
+        run_connect = runpy.run_path(str(origin / "oc-google.py"))["run_connect"]
+        expected_stage = b"Google sign-in callback: The callback Referer header was refused."
+        generic = b"oc-sandbox google: Workstation enrollment did not complete.\n"
+
+        for lose_foreground in (False, True):
+            with self.subTest(lose_foreground=lose_foreground):
+                stderr = self.parent / f"stderr-{lose_foreground}"
+                runtime = self.parent / f"runtime-{lose_foreground}"
+                runtime.mkdir(mode=0o700)
+                process, terminal = pty.fork()
+                if process == 0:
+                    with stderr.open("wb") as stream:
+                        os.dup2(stream.fileno(), 2)
+                    sys.stderr = os.fdopen(2, "w", buffering=1)
+                    try:
+                        self.run_pty_callback_fixture(run_connect, runtime, lose_foreground)
+                    except BaseException:
+                        os._exit(2)
+                    os._exit(0)
+
+                output = bytearray()
+                deadline = time.monotonic() + 5
+                finished = False
+                try:
+                    while time.monotonic() < deadline:
+                        if not select.select([terminal], [], [], .05)[0]:
+                            continue
+                        try:
+                            chunk = os.read(terminal, 4096)
+                        except OSError as error:
+                            if error.errno != errno.EIO:
+                                raise
+                            chunk = b""
+                        if not chunk:
+                            finished = True
+                            break
+                        output.extend(chunk)
+                        self.assertLess(len(output), 8192)
+                finally:
+                    if not finished:
+                        with suppress(ProcessLookupError):
+                            os.kill(process, signal.SIGKILL)
+                    os.close(terminal)
+                    _, status = os.waitpid(process, 0)
+                self.assertTrue(finished)
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+                self.assertEqual(list(runtime.iterdir()), [])
+                self.assertEqual(stderr.read_bytes(), generic)
+                self.assertEqual(bytes(output).strip(), b"" if lose_foreground else expected_stage)
+                self.assertNotIn(b"synthetic-referer-marker", output)
+                self.assertNotIn(b"synthetic-referer-marker", stderr.read_bytes())
+                runtime.rmdir()
+
+    @staticmethod
+    def run_pty_callback_fixture(run_connect, runtime, lose_foreground):
+        spec = SimpleNamespace(enabled=True, auth_mode="subscription", cli_path=None)
+        original_runtime = connect._private_runtime
+        blocker = None
+        read_fd, write_fd = os.pipe()
+
+        @contextmanager
+        def place(parent, label, cold, owner):
+            nonlocal blocker
+            try:
+                with original_runtime(parent, label, cold, owner) as custody:
+                    yield custody
+            finally:
+                if lose_foreground and not cold:
+                    assert not list(runtime.iterdir())
+                    blocker = os.fork()
+                    if blocker == 0:
+                        os.close(write_fd)
+                        os.read(read_fd, 1)
+                        os._exit(0)
+                    os.setpgid(blocker, blocker)
+                    os.tcsetpgrp(0, blocker)
+
+        def refuse(*args, authorized, fence, **kwargs):
+            from test_google_auth_offer import exchange, offer, placement, request
+
+            with placement(authorized=authorized, opened=False) as (gate, _recorder, port), \
+                    ThreadPoolExecutor(max_workers=1) as browser:
+                disclosed = gate.accept_offer(offer(port))
+                payload = request(port, extra_headers=b"Referer: https://fixture.invalid/synthetic-referer-marker\r\n")
+                reply = browser.submit(exchange, port, payload)
+                owner = SimpleNamespace(fence=fence, authorizes_offer=lambda _: True, active=authorized)
+                try:
+                    metadata_workflow._receive_callback(
+                        disclosed, gate, notify=lambda _: None, deadline=time.monotonic() + 2, owner=owner,
+                        profile=None,
+                    )
+                finally:
+                    assert reply.result(timeout=3) == auth_offer.acknowledgement(False)
+
+        try:
+            with patch.object(connect, "load_provider_config", return_value=Mock(get=Mock(return_value=spec))), \
+                    patch.object(connect, "scratch_parent", return_value=runtime), \
+                    patch.object(connect, "_preflight"), patch.object(connect, "_private_runtime", place), \
+                    patch.object(connect, "_artifacts", return_value=nullcontext(1)), \
+                    patch.object(connect, "verify_standalone_source"), \
+                    patch.object(connect, "_prepare_runtime"), patch.object(connect, "RegistrationJournal"), \
+                    patch.object(connect._TerminalOwner, "consent", return_value=True), \
+                    patch.object(connect, "enroll_metadata", side_effect=refuse):
+                assert run_connect("fixture") == 1
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+            if blocker is not None:
+                os.waitpid(blocker, 0)
+
+    def test_diagnostic_write_refusal_or_cleanup_uncertainty_preserves_primary_error(self):
+        spec = SimpleNamespace(enabled=True, auth_mode="subscription", cli_path=None)
+        for uncertain in (False, True):
+            with self.subTest(uncertain=uncertain), TemporaryDirectory(dir=self.parent) as directory:
+                runtime = Path(directory)
+                owner = Mock(fence=RLock(), authorized=Mock(return_value=True), consent=Mock(return_value=True))
+                primary = metadata_workflow.CallbackWorkflowError(auth_offer.CallbackDiagnostic.HEADER_REFERER)
+                original_cleanup = connect._RuntimeCustody.cleanup
+
+                def cleanup(custody):
+                    original_cleanup(custody)
+                    if uncertain and not custody.cold:
+                        raise OSError("synthetic cleanup failure")
+
+                def refuse_write(_message):
+                    self.assertEqual(list(runtime.iterdir()), [])
+                    raise connect.ConnectError("synthetic diagnostic output refusal")
+
+                owner.write_once.side_effect = refuse_write
+                with patch.object(connect, "load_provider_config", return_value=Mock(get=Mock(return_value=spec))), \
+                        patch.object(connect, "scratch_parent", return_value=runtime), \
+                        patch.object(connect, "_preflight"), patch.object(connect, "_attended_owner",
+                                                                          return_value=nullcontext(owner)), \
+                        patch.object(connect, "_artifacts", return_value=nullcontext(1)), \
+                        patch.object(connect, "verify_standalone_source"), \
+                        patch.object(connect, "_prepare_runtime"), patch.object(connect, "RegistrationJournal"), \
+                        patch.object(connect, "enroll_metadata", side_effect=primary), \
+                        patch.object(connect._RuntimeCustody, "cleanup", autospec=True, side_effect=cleanup):
+                    with self.assertRaises(metadata_workflow.CallbackWorkflowError) as result:
+                        connect.connect_for("fixture")
+                self.assertIs(result.exception, primary)
+                self.assertEqual(connect.needs_custody_inspection(primary), uncertain)
+                self.assertEqual(owner.write_once.call_count, 0 if uncertain else 1)
 
     def test_cold_runtime_does_not_replace_replica_cleanup(self):
         with self.assertRaisesRegex(connect.CustodyUnconfirmed, "requires inspection"):

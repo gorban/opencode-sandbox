@@ -159,6 +159,65 @@ class CallbackGateTest(unittest.TestCase):
             served.result(timeout=3)
             return answer
 
+    def test_callback_refusal_records_only_reviewed_stages(self):
+        cases = {
+            "FRAMING": {},
+            "TARGET": {"host": "localhost"},
+            "PARAMETERS": {"extra_query": "&hd=fixture.invalid"},
+            "HEADER_REFERER": {"extra_headers": b"ReFeReR: https://fixture.invalid/synthetic\r\n"},
+            "HEADER_ORIGIN": {"extra_headers": b"Origin: https://fixture.invalid\r\n"},
+            "HEADER_DNT": {"extra_headers": b"DNT: 1\r\n"},
+            "HEADER_COOKIE": {"extra_headers": b"Cookie: synthetic\x00\r\n"},
+            "HEADER_CONTENT_LENGTH": {"extra_headers": b"Content-Length: 1\r\n"},
+            "HEADER_TRANSFER_ENCODING": {"extra_headers": b"Transfer-Encoding: synthetic\r\n"},
+            "HEADER_SEC_PURPOSE": {"extra_headers": b"Sec-Purpose: synthetic\r\n"},
+            "HEADER_OTHER": {"extra_headers": b"X-Synthetic-Unapproved: marker\r\n"},
+            "HEADER_DUPLICATE": {"extra_headers": COOKIE_HEADER + b"cookie: synthetic\r\n"},
+        }
+        for stage, options in cases.items():
+            with self.subTest(stage=stage), placement() as (gate, recorder, port):
+                payload = request(port, **options)
+                if stage == "FRAMING":
+                    payload = payload.removesuffix(b"\r\n")
+                self.assertEqual(self.exchange(gate, port, payload), auth.acknowledgement(False))
+                self.assertEqual(gate.outcome, auth.Outcome.CANCELLED)
+                self.assertEqual(getattr(getattr(gate, "diagnostic", None), "name", None), stage)
+                self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
+                self.assertEqual(gate.diagnostic.name, stage)
+                self.assert_no_native_bytes(recorder)
+
+    def test_unrelated_requests_leave_no_callback_diagnostic(self):
+        with placement() as (gate, recorder, port):
+            headers = b"Referer: https://fixture.invalid/synthetic\r\n"
+            payloads = (
+                request(port, state="b" * 30),
+                request(port, state="b" * 30, extra_headers=headers),
+                request(port, target="/favicon.ico", extra_headers=headers),
+            )
+            for payload in payloads:
+                self.assertEqual(self.exchange(gate, port, payload), auth.acknowledgement(False))
+                self.assertIs(gate.outcome, auth.Outcome.OPEN)
+                self.assertIsNone(gate.diagnostic)
+            self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(True))
+            self.assertIsNone(gate.diagnostic)
+            recorder.settimeout(1)
+            self.assertEqual(recorder.recv(4096), request(port))
+
+    def test_consumed_callback_reports_authority_loss_or_denial(self):
+        alive = Event()
+        alive.set()
+        with placement(authorized=alive.is_set) as (gate, recorder, port):
+            alive.clear()
+            self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
+            self.assertIs(gate.outcome, auth.Outcome.CANCELLED)
+            self.assertIs(gate.diagnostic, auth.CallbackDiagnostic.AUTHORITY_UNAVAILABLE)
+            self.assert_no_native_bytes(recorder)
+        with placement() as (gate, recorder, port):
+            self.assertEqual(self.exchange(gate, port, request(port, code=None)), auth.acknowledgement(True))
+            self.assertIs(gate.outcome, auth.Outcome.DENIED)
+            self.assertIs(gate.diagnostic, auth.CallbackDiagnostic.SIGN_IN_DENIED)
+            self.assert_no_native_bytes(recorder)
+
     def test_matching_callbacks_race_and_only_one_canonical_request_is_forwarded(self):
         with placement() as (gate, recorder, port), ThreadPoolExecutor(max_workers=4) as workers:
             start = Barrier(2)
@@ -622,6 +681,7 @@ class CallbackGateTest(unittest.TestCase):
                 patch.object(auth.CallbackGate, "_consume", autospec=True, side_effect=revoke_after_forward):
             self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
             self.assertEqual(gate.outcome, auth.Outcome.UNCERTAIN)
+            self.assertIs(gate.diagnostic, auth.CallbackDiagnostic.HANDOFF_UNCONFIRMED)
             live.set()
             self.assertIsNone(gate.take_forwarded())
             self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
@@ -653,6 +713,7 @@ class CallbackGateTest(unittest.TestCase):
             self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
             self.assertEqual(self.exchange(gate, port, request(port)), auth.acknowledgement(False))
             self.assertEqual(gate.outcome, auth.Outcome.UNCERTAIN)
+            self.assertIs(gate.diagnostic, auth.CallbackDiagnostic.HANDOFF_UNCONFIRMED)
             self.assertIsNone(gate.take_forwarded())
             recorder.settimeout(1)
             self.assertEqual(recorder.recv(4096), b"GET ")
