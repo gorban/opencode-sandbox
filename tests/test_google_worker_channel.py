@@ -1,7 +1,7 @@
 """Verify the private retained worker channel using only synthetic local sockets."""
 
 from array import array
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from copy import copy, deepcopy
 from dataclasses import replace
 from hashlib import sha256
@@ -138,8 +138,14 @@ class WorkerChannelTest(unittest.TestCase):
         finally:
             os.close(fd)
 
+    def real_pin(self, pid):
+        membership = Path(f"/proc/{pid}/cgroup").read_bytes().splitlines()
+        if len(membership) != 1 or not membership[0].startswith(b"0::/") or membership[0] == b"0::/":
+            self.skipTest("joined fixture requires a non-root unified cgroup")
+        return self.pin(pid, membership[0].removeprefix(b"0::"))
+
     def fixture(self, *, mode="exact", foreign=False, wrong_pid=False, wrong_group=False,
-                distinct_worker=False, token=TOKEN, extra=b""):
+                distinct_worker=False, token=TOKEN, extra=b"", delivery_owner=None):
         if foreign:
             worker, accepted = self.foreign_worker()
         else:
@@ -152,20 +158,33 @@ class WorkerChannelTest(unittest.TestCase):
             proc = self.proc("import sys; sys.stdin.buffer.read(1)") if wrong_pid else relay
             if distinct_worker:
                 self.worker_proc = self.proc("import sys; sys.stdin.buffer.read(1)")
-            worker_pin = self.pin(self.worker_proc.pid if distinct_worker else os.getpid(), WORKER_GROUP)
+            worker_pid = self.worker_proc.pid if distinct_worker else os.getpid()
+            reference = self.reference
+            if delivery_owner is None:
+                worker_pin = self.pin(worker_pid, WORKER_GROUP)
+            else:
+                binding = delivery_owner._binding
+                worker_pin = self.real_pin(worker_pid)
+                probe = self.real_pin(os.getpid())
+                pins = self.enterContext(ExitStack())
+                reference = channel.WorkerNamespaceReference.from_verified_probe(
+                    worker=worker_pin, probe=probe, resources=pins, worker_id=WORKER_ID,
+                    run=binding.launch, epoch=str(binding.epoch), probe_id="joined-reference",
+                )
             relay_pin = self.pin(proc.pid, RELAY_GROUP)
             if wrong_group:
                 self.groups[relay.pid] = b"0::/other-fixture.scope\n"
             self.placement = channel.WorkerPlacement(
                 worker_id=WORKER_ID, worker_image="c" * 64, relay_id=RELAY_ID, relay_image="d" * 64,
-                run="test-run", route="google--personal", epoch="epoch-1", network_mode="none",
+                run=reference.run, route="google--personal", epoch=reference.epoch, network_mode="none",
                 relay_network_mode=f"container:{WORKER_ID}", worker=worker_pin, relay=relay_pin,
-                reference=self.reference,
+                reference=reference,
             )
         retained = self.enterContext(channel.RetainedWorkerChannel(
             self.placement, port=self.port, model=MODEL, system_digest=SYSTEM_DIGEST,
             worker_token=TOKEN, proof=PROOF, fence=self.fence, owner_current=lambda: self.owner,
             worker_current=self.check_worker, retirement_current=self.check_retirement, claim_delivery=self.claim,
+            delivery_owner=delivery_owner,
         ))
         body = json.dumps(dict(protocol.OPTIONS, model=MODEL, messages=[
             {"role": "system", "content": SYSTEM}, {"role": "user", "content": protocol.PROMPT},

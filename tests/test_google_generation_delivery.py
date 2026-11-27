@@ -1,6 +1,8 @@
 """Exercise the joined synthetic delivery with actual disposable pipes and sockets."""
 
-from contextlib import suppress
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, suppress
+from copy import copy, deepcopy
 from dataclasses import replace
 from hashlib import sha256
 import os
@@ -8,7 +10,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
-from threading import RLock
+from threading import Event, RLock
 from time import monotonic
 import unittest
 from unittest.mock import patch
@@ -38,27 +40,17 @@ class JoinedDeliveryTests(unittest.TestCase):
         self.worker.setUp()
         self.worker.fence = self.journal.fence
         binding = self.journal.binding
+        self.delivery_owner = journal._DeliveryOwner(binding, self.journal.fence)
         with patch.object(worker_fixture, "MODEL", binding.model):
-            self.channel, self.relay, self.client, self.control, _ = self.worker.fixture(distinct_worker=True)
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reference:
-            reference_pin = channel.WorkerNamespaceReference(
-                reference, worker_id=self.worker.placement.worker_id, run=binding.launch,
-                epoch=str(binding.epoch), probe_id="joined-reference",
+            self.channel, self.relay, self.client, self.control, _ = self.worker.fixture(
+                distinct_worker=True, delivery_owner=self.delivery_owner,
             )
-        worker_pid = self.worker.worker_proc.pid
-        membership = Path(f"/proc/{worker_pid}/cgroup").read_bytes().splitlines()
-        if len(membership) != 1 or not membership[0].startswith(b"0::/") or membership[0] == b"0::/":
-            self.skipTest("joined fixture requires a non-root unified worker cgroup")
-        member, = membership
-        worker_pin = self.worker.pin(worker_pid, member.removeprefix(b"0::"))
-        placement = replace(self.worker.placement, run=binding.launch, epoch=str(binding.epoch),
-                            reference=reference_pin, worker=worker_pin)
-        self.channel._placement = self.worker.placement = placement
         self.adoption, self.relay_retirement = self.worker.seal(self.channel, self.relay, self.control)
         self.packet = protocol.text_reply_bytes(binding.model)
-        self.before_authority = None
+        self.before_authority = self.after_authority = None
 
-    def provision_native(self, *, mode="ok", prove_exit=True, settle_destination=True, monitor_worker=True):
+    def provision_native(self, *, mode="ok", prove_exit=True, settle_destination=True, monitor_worker=True,
+                         monitor_channel_owner=True):
         wire = transcript_fixture.update("ok") + transcript_fixture.terminal()
         child = subprocess.Popen(
             [sys.executable, "-IBS", "-c", transcript_fixture._PEER, wire.hex(), mode], bufsize=0,
@@ -73,10 +65,16 @@ class JoinedDeliveryTests(unittest.TestCase):
         def authorized(binding):
             if self.before_authority is not None:
                 self.before_authority()
-            return (binding is self.journal.current and self.worker.owner
-                    and (not monitor_worker or self.worker.placement.worker.alive()))
+            current = (binding is self.journal.current and (not monitor_channel_owner or self.worker.owner)
+                       and (not monitor_worker or self.worker.placement.worker.alive()))
+            if self.after_authority is not None:
+                self.after_authority()
+            return current
 
-        self.run_lease = self.enterContext(self.journal.launch(authorized=authorized, deadline=monotonic() + 10))
+        self.run_lease = self.enterContext(self.journal.journal.launch(
+            self.journal.binding, fence=fence, authorized=authorized, deadline=monotonic() + 10,
+            delivery_owner=self.delivery_owner,
+        ))
         self.transcript = self.enterContext(GenerationTranscript(
             child.stdin, child.stdout, invocation=self.invocation, pidfd=pidfd,
             session_id=transcript_fixture._SESSION, deadline=monotonic() + 5, fence=fence,
@@ -195,6 +193,527 @@ class JoinedDeliveryTests(unittest.TestCase):
                     os.close(fd)
         self.assertEqual(self.worker.read_all(self.client), self.packet)
         self.assertEqual(self.journal.phase(), journal.Phase.DELIVERY_CLAIMED)
+
+    def assert_prepare_namespace_loss(self, kind):
+        self.provision_native()
+        moved = False
+        pid = self.worker.worker_proc.pid
+        namespace_path = f"/proc/{pid}/ns/{kind}"
+        alternate_kind = "mnt" if kind == "net" else "net"
+        alternate = f"/proc/{pid}/ns/{alternate_kind}"
+        original_open, identity = os.open, channel._proc_ns_identity
+
+        def owner():
+            nonlocal moved
+            if self.channel._phase is channel._Phase.PREPARING:
+                moved = True
+            return True
+
+        def sample(process, namespace):
+            return identity(process, alternate_kind if moved and process == pid and namespace == kind else namespace)
+
+        def open_namespace(path, *args, **kwargs):
+            # On the earlier revision, the replacement observation and open
+            # must agree so prepare would mistake it for the original pin.
+            return original_open(alternate if moved and path == namespace_path else path, *args, **kwargs)
+
+        with (patch.object(self.channel, "_owner_current", owner),
+              patch.object(channel, "_proc_ns_identity", sample),
+              patch.object(os, "open", open_namespace),
+              patch.object(channel, "_send_once", wraps=channel._send_once) as once):
+            with self.assertRaisesRegex(channel.WorkerChannelError, "placement is no longer current"):
+                self.deliver()
+            once.assert_not_called()
+        self.assertTrue(moved)
+        self.assertIsNone(self.worker.worker_proc.poll())
+        self.assertEqual(self.worker.read_all(self.client), b"")
+        self.assertEqual(self.journal.phase(), journal.Phase.DESTINATION_SETTLED)
+
+    def test_prepare_callback_cannot_rebaseline_original_network_namespace(self):
+        self.assert_prepare_namespace_loss("net")
+
+    def test_prepare_callback_cannot_rebaseline_original_mount_namespace(self):
+        self.assert_prepare_namespace_loss("mnt")
+
+    def new_adoption(self):
+        worker = worker_fixture.WorkerChannelTest()
+        self.addCleanup(worker.doCleanups)
+        worker.setUp()
+        worker.fence = self.journal.fence
+        binding = self.journal.binding
+        owner = journal._DeliveryOwner(binding, worker.fence)
+        with patch.object(worker_fixture, "MODEL", binding.model):
+            retained, relay, client, control, _ = worker.fixture(distinct_worker=True, delivery_owner=owner)
+        return worker, retained, relay, client, control
+
+    def test_namespace_reference_requires_actual_creating_probe(self):
+        worker, retained, _, _, _ = self.new_adoption()
+        worker_pin = worker.placement.worker
+        another_process = self.worker.placement.worker
+        reference = retained._placement.reference
+        with ExitStack() as resources:
+            with self.assertRaisesRegex(channel.WorkerChannelError, "namespace probe is unavailable"):
+                channel.WorkerNamespaceReference.from_verified_probe(
+                    worker=worker_pin, probe=another_process, resources=resources,
+                    worker_id=reference.worker_id, run=reference.run, epoch=reference.epoch, probe_id=reference.probe_id,
+                )
+
+    def test_worker_placement_drift_after_probe_prevents_adoption(self):
+        worker, retained, _, client, control = self.new_adoption()
+        observed = 0
+        proc_identity = channel._proc_ns_identity
+
+        def observe(placement):
+            nonlocal observed
+            observed += 1
+            return placement is worker.placement
+
+        def sample(pid, kind):
+            device, inode = proc_identity(pid, kind)
+            drift = pid == worker.worker_proc.pid and kind == "mnt" and observed == 3
+            return device, inode + drift
+
+        with patch.object(worker.check_worker, "side_effect", observe), patch.object(channel, "_proc_ns_identity", sample):
+            with self.assertRaisesRegex(channel.WorkerChannelError, "placement is no longer current"):
+                retained.adopt(control)
+        self.assertEqual(observed, 3)
+        self.assertIsNone(retained._adopted)
+        self.assertEqual(worker.read_all(client), b"")
+
+    def test_foreign_probe_cannot_replace_original_even_in_same_namespace(self):
+        worker, retained, _, client, control = self.new_adoption()
+        original = retained._placement.reference
+        foreign = self.channel._placement.reference
+        self.assertEqual(original.cookie, foreign.cookie)
+        self.assertIsNot(original, foreign)
+        observed = 0
+
+        def observe(placement):
+            nonlocal observed
+            observed += 1
+            if observed == 3:
+                retained._placement = replace(placement, reference=foreign)
+            return True
+
+        with patch.object(worker.check_worker, "side_effect", observe):
+            with self.assertRaisesRegex(channel.WorkerChannelError, "placement is no longer current"):
+                retained.adopt(control)
+        self.assertEqual(observed, 3)
+        self.assertIsNone(retained._adopted)
+        self.assertEqual(worker.read_all(client), b"")
+
+    def test_foreign_owner_on_same_fence_cannot_claim_worker_delivery(self):
+        self.provision_native()
+        unrelated = journal._DeliveryOwner(self.journal.binding, self.journal.fence)
+        with patch.object(self.channel, "_delivery_owner", unrelated):
+            with self.assertRaisesRegex(channel.WorkerChannelError, "journal is unavailable"):
+                self.deliver()
+        self.assertEqual(self.journal.phase(), journal.Phase.DESTINATION_SETTLED)
+        self.assertFalse(self.channel.delivery.attempted)
+
+    def test_channel_observation_cannot_send_after_revoking_journal(self):
+        self.provision_native()
+        invalidated = False
+
+        def observe():
+            nonlocal invalidated
+            if self.channel._phase is channel._Phase.SPENT:
+                self.run_lease.revoke()
+                invalidated = True
+            return True
+
+        with (patch.object(self.channel, "_owner_current", observe),
+              patch.object(channel, "_send_once", wraps=channel._send_once) as once):
+            with self.assertRaises(journal.GenerationHeld):
+                self.deliver()
+            once.assert_not_called()
+        self.assertTrue(invalidated)
+        self.assertEqual(self.journal.phase(), journal.Phase.DELIVERY_CLAIMED)
+        self.assertEqual(self.worker.read_all(self.client), b"")
+
+    def make_channel_from_used_pin(self, owner):
+        source = self.channel
+        return channel.RetainedWorkerChannel(
+            source._placement, port=source._port, model=source._model, system_digest=source._system_digest,
+            worker_token=source._worker_token, proof=source._proof, fence=source._fence,
+            owner_current=source._owner_current, worker_current=source._worker_current,
+            retirement_current=source._retirement_current, claim_delivery=source._claim_delivery,
+            delivery_owner=owner,
+        )
+
+    def test_original_placement_cannot_be_copied_reused_or_downgraded(self):
+        reference = self.channel._placement.reference
+        for pin in (reference, reference._adoption):
+            for clone in (copy, deepcopy):
+                with self.assertRaises(TypeError):
+                    clone(pin)
+        with self.assertRaisesRegex(channel.WorkerChannelError, "placement was already spent"):
+            self.make_channel_from_used_pin(journal._DeliveryOwner(self.journal.binding, self.journal.fence))
+        with self.assertRaisesRegex(channel.WorkerChannelError, "joined worker authority is unavailable"):
+            self.make_channel_from_used_pin(None)
+
+    def test_failed_adoption_releases_owned_namespace_fds_immediately(self):
+        worker, retained, _, _, control = self.new_adoption()
+        placement = retained._placement.reference._adoption
+        fds = (placement.network[0], placement.mount[0])
+        with patch.object(worker.check_worker, "side_effect", lambda _: False):
+            with self.assertRaises(channel.WorkerChannelError):
+                retained.adopt(control)
+        for fd in fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_placement_cleanup_does_not_close_foreign_reused_descriptor(self):
+        placement = self.channel._placement.reference._adoption
+        fd = placement.network[0]
+        foreign = os.open(self.worker.root, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.dup2(foreign, fd, inheritable=False)
+            self.channel.revoke()
+            self.assertTrue(os.path.samestat(os.fstat(fd), os.fstat(foreign)))
+        finally:
+            os.close(fd)
+            os.close(foreign)
+
+    def test_terminal_delivery_releases_owned_namespace_fds_immediately(self):
+        placement = self.channel._placement.reference._adoption
+        fds = (placement.network[0], placement.mount[0])
+        self.provision_native()
+        self.assertTrue(self.deliver().complete)
+        for fd in fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def assert_revoke_during_placement_observation(self, stage):
+        worker, retained, relay, client, control = self.new_adoption()
+        entered, resume, revoked = Event(), Event(), Event()
+        observed_under_fence = []
+
+        def pause(_):
+            observed_under_fence.append(self.journal.fence._is_owned())
+            entered.set()
+            if not resume.wait(timeout=5):
+                self.fail("placement observer did not resume")
+            return True
+
+        if stage == "adopt":
+            observer = worker.check_worker
+            operation = lambda: retained.adopt(control)
+        else:
+            adopted = retained.adopt(control)
+            retained.close_admission()
+            self.assertEqual(worker.stop(relay), 0)
+            receipt = channel.RelayRetirement(adopted, worker_fixture.RELAY_ID)
+            observer = worker.check_retirement if stage == "retirement" else worker.check_worker
+            if stage == "seal":
+                worker.genuine_retirement = receipt
+            operation = lambda: retained.seal(receipt)
+
+        def revoke():
+            retained.revoke()
+            revoked.set()
+
+        with ThreadPoolExecutor(max_workers=2) as threads, patch.object(observer, "side_effect", pause):
+            attempt = threads.submit(operation)
+            try:
+                self.assertTrue(entered.wait(timeout=2))
+                revoker = threads.submit(revoke)
+                self.assertTrue(revoked.wait(timeout=1), "placement observer blocked the revoker")
+            finally:
+                resume.set()
+            revoker.result(timeout=2)
+            with self.assertRaises((journal.GenerationHeld, channel.WorkerChannelError)):
+                attempt.result(timeout=2)
+        self.assertEqual(observed_under_fence, [False])
+        self.assertEqual(worker.read_all(client), b"")
+        self.assertIsNone(retained._retirement)
+
+    def test_revocation_can_finish_during_joined_adoption_observer(self):
+        self.assert_revoke_during_placement_observation("adopt")
+
+    def test_revocation_can_finish_during_joined_seal_worker_observer(self):
+        self.assert_revoke_during_placement_observation("seal")
+
+    def test_revocation_can_finish_during_joined_retirement_observer(self):
+        self.assert_revoke_during_placement_observation("retirement")
+
+    def test_joined_journal_cannot_claim_delivery_before_channel_prepares_exact_plan(self):
+        self.provision_native()
+        with self.assertRaises(journal.GenerationHeld):
+            self.run_lease.issue(journal.Operation.DELIVERY)
+        self.assertEqual(self.journal.phase(), journal.Phase.DESTINATION_SETTLED)
+
+    def test_joined_channel_refuses_legacy_entry_before_any_prepare(self):
+        with patch.object(channel, "_send_once", wraps=channel._send_once) as once:
+            with self.assertRaises(channel.WorkerChannelError):
+                self.channel.deliver()
+            once.assert_not_called()
+        self.worker.claim.assert_not_called()
+
+    def lose_joined_owner(self):
+        self.worker.owner = False
+        self.delivery_owner.revoke()
+
+    def test_final_journal_proof_cannot_send_after_channel_owner_loss(self):
+        self.provision_native(monitor_channel_owner=False)
+        checking = False
+        observed = Event()
+        verify = journal._Run.verify_in_flight
+
+        def verify_effect(run, proof, operation, **kwargs):
+            nonlocal checking
+            checking = operation is journal.Operation.DELIVERY
+            try:
+                return verify(run, proof, operation, **kwargs)
+            finally:
+                checking = False
+
+        def invalidate():
+            if checking and not observed.is_set():
+                self.lose_joined_owner()
+                observed.set()
+
+        self.after_authority = invalidate
+        with (patch.object(journal._Run, "verify_in_flight", new=verify_effect),
+              patch.object(channel, "_send_once", wraps=channel._send_once) as once):
+            with self.assertRaises((journal.GenerationHeld, channel.WorkerChannelError)):
+                self.deliver()
+            once.assert_not_called()
+        self.assertTrue(observed.is_set())
+        self.assertEqual(self.worker.read_all(self.client), b"")
+        self.assertEqual(self.journal.phase(), journal.Phase.DELIVERY_CLAIMED)
+
+    def assert_owner_loss_during_save(self, barrier):
+        self.provision_native(monitor_channel_owner=False)
+        save = journal._Files.save
+        checking = False
+        checks = 0
+
+        def settle(files, phase, binding, check):
+            nonlocal checking
+            if phase is journal.Phase.SETTLED:
+                checking = True
+            return save(files, phase, binding, check)
+
+        def invalidate():
+            nonlocal checks
+            if checking:
+                checks += 1
+                if checks == barrier:
+                    self.lose_joined_owner()
+
+        self.after_authority = invalidate
+        with (patch.object(journal._Files, "save", settle),
+              patch.object(channel, "_send_once", wraps=channel._send_once) as once):
+            with self.assertRaises((journal.GenerationHeld, channel.WorkerChannelError)):
+                self.deliver()
+            self.assertEqual(checks, barrier)
+            self.assertIs(self.run_lease._files._authority.phase, journal.Phase.DELIVERY_CLAIMED)
+            if barrier >= 3:
+                self.assertEqual(self.journal.phase(), journal.Phase.SETTLED)
+            if barrier >= 2:
+                self.assertEqual((self.journal.slot / journal._LATCH).read_bytes(), journal._DIRTY)
+            self.worker.owner = True
+            self.after_authority = None
+            with self.assertRaises((journal.GenerationHeld, channel.WorkerChannelError)):
+                self.deliver()
+            once.assert_called_once()
+        self.assertEqual(self.worker.read_all(self.client), self.packet)
+
+    def test_owner_loss_at_settlement_save_entry(self):
+        self.assert_owner_loss_during_save(1)
+
+    def test_owner_loss_after_settlement_candidate_is_synced(self):
+        self.assert_owner_loss_during_save(2)
+
+    def test_owner_loss_after_settlement_record_replacement(self):
+        self.assert_owner_loss_during_save(3)
+
+    def test_owner_loss_after_settlement_latch_sync(self):
+        self.assert_owner_loss_during_save(4)
+
+    def test_owner_loss_after_settlement_save_returns(self):
+        self.assert_owner_loss_during_save(5)
+
+    def assert_revoke_after_send_before_closer(self, method):
+        self.provision_native()
+        retained = self.channel._client
+        gap, after_gap, closing, finish, revoked = (Event() for _ in range(5))
+        actual = getattr(socket.socket, method)
+        operations = []
+
+        def skip_normal_closer(prepared, receipt):
+            self.assertTrue(receipt.complete)
+            gap.set()
+            if not after_gap.wait(timeout=5):
+                self.fail("delivery did not leave the post-send gap")
+            raise OSError("synthetic interruption before normal closer")
+
+        def pause(sock, *args):
+            if sock is retained:
+                operations.append(self.journal.fence._is_owned())
+                closing.set()
+                if not finish.wait(timeout=5):
+                    self.fail("reserved cleanup did not resume")
+            return actual(sock, *args)
+
+        def revoke():
+            self.channel.revoke()
+            revoked.set()
+
+        with (ThreadPoolExecutor(max_workers=2) as threads,
+              patch.object(self.channel, "close_written", side_effect=skip_normal_closer),
+              patch.object(socket.socket, method, new=pause),
+              patch.object(channel, "_send_once", wraps=channel._send_once) as once):
+            result = threads.submit(self.deliver)
+            try:
+                self.assertTrue(gap.wait(timeout=2))
+                threads.submit(revoke)
+                self.assertTrue(revoked.wait(timeout=1), "revoker tried to close the completed socket")
+                self.assertFalse(closing.is_set())
+                after_gap.set()
+                self.assertTrue(closing.wait(timeout=2))
+                threads.submit(self.channel.revoke).result(timeout=1)
+            finally:
+                after_gap.set()
+                finish.set()
+            with self.assertRaisesRegex(OSError, "interruption before normal closer"):
+                result.result(timeout=2)
+            once.assert_called_once()
+        self.assertEqual(operations, [False])
+        self.assertEqual(retained.fileno(), -1)
+        self.assertIsNone(self.channel._closed_write)
+        self.assertEqual(self.journal.phase(), journal.Phase.DELIVERY_CLAIMED)
+        self.assertEqual(self.worker.read_all(self.client), self.packet)
+
+    def test_post_send_revocation_does_not_block_on_actual_shutdown(self):
+        self.assert_revoke_after_send_before_closer("shutdown")
+
+    def test_post_send_revocation_does_not_block_on_actual_close(self):
+        self.assert_revoke_after_send_before_closer("close")
+
+    def test_journal_failure_after_complete_send_discards_reserved_socket(self):
+        self.provision_native()
+        retained = self.channel._client
+        actual_shutdown = socket.socket.shutdown
+        verify = journal._Run._check_phase
+        observed = []
+
+        def fail_after_send(run, phase):
+            if phase is journal.Phase.DELIVERY_CLAIMED and self.channel.delivery.complete:
+                raise journal.GenerationHeld()
+            return verify(run, phase)
+
+        def observe_shutdown(sock, *args):
+            if sock is retained:
+                observed.append(self.journal.fence._is_owned())
+            return actual_shutdown(sock, *args)
+
+        with (patch.object(journal._Run, "_check_phase", new=fail_after_send),
+              patch.object(socket.socket, "shutdown", new=observe_shutdown),
+              patch.object(self.channel, "close_written", wraps=self.channel.close_written) as closer,
+              self.assertRaises(journal.GenerationHeld)):
+            self.deliver()
+        closer.assert_not_called()
+        self.assertEqual(observed, [False])
+        self.assertEqual(retained.fileno(), -1)
+        self.assertIsNone(self.channel._closed_write)
+        self.assertEqual(self.journal.phase(), journal.Phase.DELIVERY_CLAIMED)
+        self.assertEqual(self.worker.read_all(self.client), self.packet)
+
+    def assert_real_close_operation_failure(self, method):
+        self.provision_native()
+        retained = self.channel._client
+        actual = getattr(socket.socket, method)
+        operations = []
+
+        def fail_original(sock, *args):
+            if sock is retained:
+                operations.append(self.journal.fence._is_owned())
+                if method == "close":
+                    actual(sock, *args)
+                raise OSError("synthetic socket syscall failure")
+            return actual(sock, *args)
+
+        with (patch.object(socket.socket, method, new=fail_original),
+              patch.object(channel, "_send_once", wraps=channel._send_once) as once):
+            with self.assertRaisesRegex(OSError, "socket syscall failure"):
+                self.deliver()
+            once.assert_called_once()
+        self.assertEqual(operations, [False])
+        self.assertEqual(retained.fileno(), -1)
+        self.assertIsNone(self.channel._closed_write)
+        self.assertEqual(self.journal.phase(), journal.Phase.DELIVERY_CLAIMED)
+        self.assertEqual(self.worker.read_all(self.client), self.packet)
+
+    def test_actual_shutdown_failure_cannot_mint_closure(self):
+        self.assert_real_close_operation_failure("shutdown")
+
+    def test_actual_close_failure_cannot_mint_closure(self):
+        self.assert_real_close_operation_failure("close")
+
+    def test_close_written_refuses_caller_who_keeps_shared_fence(self):
+        self.provision_native()
+        close = self.channel.close_written
+
+        def verify_and_close(prepared, receipt):
+            with self.journal.fence, self.assertRaisesRegex(channel.WorkerChannelError, "fence to be released"):
+                close(prepared, receipt)
+            return close(prepared, receipt)
+
+        with patch.object(self.channel, "close_written", verify_and_close):
+            self.assertTrue(self.deliver().complete)
+        self.assertEqual(self.journal.phase(), journal.Phase.SETTLED)
+        self.assertEqual(self.worker.read_all(self.client), self.packet)
+
+    def assert_revoke_during_closure(self, method):
+        self.provision_native()
+        retained = self.channel._client
+        entered, resume, revoked = Event(), Event(), Event()
+        actual = getattr(socket.socket, method)
+        operations = []
+
+        def pause(sock, *args):
+            if sock is retained:
+                operations.append(self.journal.fence._is_owned())
+                entered.set()
+                if not resume.wait(timeout=5):
+                    self.fail("closure did not resume")
+            return actual(sock, *args)
+
+        def revoke():
+            self.channel.revoke()
+            revoked.set()
+
+        def duplicate():
+            return self.channel.close_written(self.channel._prepared, self.channel._delivery)
+
+        with (ThreadPoolExecutor(max_workers=2) as threads,
+              patch.object(socket.socket, method, new=pause),
+              patch.object(channel, "_send_once", wraps=channel._send_once) as once):
+            result = threads.submit(self.deliver)
+            try:
+                self.assertTrue(entered.wait(timeout=2))
+                retirement = threads.submit(revoke)
+                self.assertTrue(revoked.wait(timeout=1), "actual socket closure blocked the revoker")
+                with self.assertRaises(channel.WorkerChannelError):
+                    threads.submit(duplicate).result(timeout=2)
+            finally:
+                resume.set()
+            retirement.result(timeout=2)
+            with self.assertRaises((journal.GenerationHeld, channel.WorkerChannelError)):
+                result.result(timeout=2)
+            once.assert_called_once()
+        self.assertEqual(operations, [False])
+        self.assertIsNone(self.channel._closed_write)
+        self.assertEqual(self.journal.phase(), journal.Phase.DELIVERY_CLAIMED)
+        self.assertEqual(self.worker.read_all(self.client), self.packet)
+
+    def test_revocation_can_finish_during_actual_worker_shutdown(self):
+        self.assert_revoke_during_closure("shutdown")
+
+    def test_revocation_can_finish_during_actual_worker_close(self):
+        self.assert_revoke_during_closure("close")
 
     def test_worker_exit_in_final_callback_holds_one_claim_without_send(self):
         self.provision_native()
@@ -396,13 +915,14 @@ class JoinedDeliveryTests(unittest.TestCase):
     def test_prepared_plan_refuses_reconstructed_live_delivery_proof(self):
         self.provision_native()
         prepared = self.channel.prepare_delivery(self.adoption, self.relay_retirement, run=self.run_lease)
+        guard = self.channel.settlement_guard(prepared, run=self.run_lease)
         cap = self.run_lease.issue(journal.Operation.DELIVERY)
 
         def effect(proof):
             return self.channel.write_prepared(prepared, run=self.run_lease, proof=replace(proof))
 
         with patch.object(channel, "_send_once") as once, self.assertRaises(journal.GenerationHeld):
-            self.run_lease.write_once(cap, effect, target=prepared, data=prepared.packet)
+            self.run_lease.write_once(cap, effect, target=prepared, data=prepared.packet, settlement_guard=guard)
         once.assert_not_called()
         self.assertEqual(self.journal.phase(), journal.Phase.DELIVERY_CLAIMED)
 
@@ -418,10 +938,13 @@ class JoinedDeliveryTests(unittest.TestCase):
             captured.append(proof)
             return journal.WriteEvidence(prepared, len(prepared.packet), digest)
 
-        self.run_lease.write_once(cap, effect, target=prepared, data=prepared.packet)
-        with patch.object(channel, "_send_once") as once, self.assertRaises(journal.GenerationHeld):
-            self.channel.write_prepared(prepared, run=self.run_lease, proof=captured[0])
-        once.assert_not_called()
+        guard = self.channel.settlement_guard(prepared, run=self.run_lease)
+        with patch.object(channel, "_send_once") as once:
+            with self.assertRaisesRegex(channel.WorkerChannelError, "delivery write is unconfirmed"):
+                self.run_lease.write_once(cap, effect, target=prepared, data=prepared.packet, settlement_guard=guard)
+            with self.assertRaises(journal.GenerationHeld):
+                self.channel.write_prepared(prepared, run=self.run_lease, proof=captured[0])
+            once.assert_not_called()
         self.assertEqual(self.journal.phase(), journal.Phase.DELIVERY_CLAIMED)
 
     def assert_wrong_write_binding_refused(self, variant):
@@ -464,7 +987,7 @@ class JoinedDeliveryTests(unittest.TestCase):
         with (patch.object(self.channel, "close_written", substitute_after_close),
               patch.object(self.channel, "verify_closed_write", return_value=None),
               patch.object(channel, "_send_once", wraps=channel._send_once) as once,
-              self.assertRaises(channel.WorkerChannelError)):
+              self.assertRaises((journal.GenerationHeld, channel.WorkerChannelError))):
             self.deliver()
         once.assert_called_once()
         self.assertEqual(self.worker.read_all(self.client), self.packet)

@@ -271,7 +271,7 @@ class GenerationJournal:
             reg._write_private(files.directory, f"fixture-writer-{marker}", b"synthetic writer reached the slot\n")
 
     @contextmanager
-    def launch(self, binding, *, fence, authorized, deadline=None):
+    def launch(self, binding, *, fence, authorized, deadline=None, delivery_owner=None):
         if (type(binding) is not Binding or type(fence) is not _RLOCK or not callable(authorized)
                 or (deadline is not None and (type(deadline) not in (float, int)
                                               or not monotonic() < deadline < float("inf")))
@@ -282,11 +282,22 @@ class GenerationJournal:
                 or binding != self._anchor.binding(epoch=binding.epoch, launch=binding.launch)):
             raise GenerationHeld()
 
+        if delivery_owner is not None:
+            if type(delivery_owner) is not _DeliveryOwner or deadline is None:
+                raise GenerationHeld()
+            delivery_owner._require_current(binding, fence)
+
         def current():
-            return authorized(binding) is True and (deadline is None or monotonic() < deadline)
+            if authorized(binding) is not True or (deadline is not None and monotonic() >= deadline):
+                return False
+            if delivery_owner is not None:
+                delivery_owner._require_current(binding, fence)
+            return True
 
         with self._fresh(authorized=current) as files:
-            control = _LeaseControl(binding, fence, authorized, deadline, os.getpid())
+            control = _LeaseControl(binding, fence, authorized, deadline, os.getpid(), delivery_owner)
+            if delivery_owner is not None:
+                delivery_owner._bind_run(control)
             files._authority.control = control
             run = _Run(files, control)
             try:
@@ -294,6 +305,69 @@ class GenerationJournal:
                 yield run
             finally:
                 run.revoke()
+
+
+class _DeliveryOwner:
+    """One sticky fixture owner shared between the worker and its journal."""
+
+    __slots__ = ("_binding", "_fence", "_pid", "_held", "_run", "_channel", "_guard")
+
+    def __init__(self, binding, fence):
+        if type(binding) is not Binding or type(fence) is not _RLOCK:
+            raise GenerationHeld()
+        self._binding, self._fence = binding, fence
+        self._pid, self._held = os.getpid(), False
+        self._run = self._channel = self._guard = None
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("Worker delivery authority cannot be copied or serialized")
+
+    def _bind_run(self, control):
+        with self._fence:
+            self._require_current(control.binding, control.fence)
+            if self._run is not None:
+                raise GenerationHeld()
+            self._run = control
+
+    def _bind_channel(self, channel, fence):
+        with self._fence:
+            self._require_current(self._binding, fence)
+            if self._channel is not None:
+                raise GenerationHeld()
+            self._channel = channel
+
+    def _bind_guard(self, guard):
+        from .worker_channel import _WorkerSettlementGuard
+
+        with self._fence:
+            self._require_current(self._binding, self._fence)
+            if (self._guard is not None or type(guard) is not _WorkerSettlementGuard
+                    or guard.channel is not self._channel or guard.run_control is not self._run
+                    or guard is not self._channel._settlement_guard):
+                raise GenerationHeld()
+            self._guard = guard
+
+    def _delivery_guard(self, control):
+        self._require_current(control.binding, control.fence)
+        guard = self._guard
+        if (control is not self._run or guard is None or guard.channel is not self._channel
+                or guard is not self._channel._settlement_guard
+                or guard.prepared is not self._channel._prepared):
+            raise GenerationHeld()
+        return guard
+
+    def _require_current(self, binding, fence):
+        if binding is not self._binding or fence is not self._fence or os.getpid() != self._pid:
+            raise GenerationHeld()
+        with self._fence:
+            if self._held:
+                raise GenerationHeld()
+
+    def revoke(self):
+        if os.getpid() != self._pid:
+            raise GenerationHeld()
+        with self._fence:
+            self._held = True
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -305,6 +379,7 @@ class _LeaseControl:
     authorized: Callable[[Binding], bool]
     deadline: float | None
     pid: int
+    delivery_owner: _DeliveryOwner | None = None
 
 
 @dataclass(slots=True)
@@ -426,12 +501,21 @@ class _Run:
 
     def revoke(self):
         with self._owner_fence():
+            if self._control.delivery_owner is not None:
+                self._control.delivery_owner.revoke()
             authority = self._files._authority
             authority.revoked = True
             authority.capability = None
             authority.in_flight = authority.pending = authority.sent = None
             authority.pending_guard = None
             authority.flight_checked = False
+
+    def _check_delivery_owner(self):
+        owner = self._control.delivery_owner
+        if owner is not None:
+            if owner._run is not self._control:
+                raise GenerationHeld()
+            owner._require_current(self._control.binding, self._control.fence)
 
     def _check(self, local=None):
         self._owner_fence()
@@ -441,6 +525,7 @@ class _Run:
             raise GenerationHeld()
         authority.checking = True
         try:
+            self._check_delivery_owner()
             self._files.verify()
             if self._control.authorized(self._control.binding) is not True or authority.revoked:
                 raise GenerationHeld()
@@ -449,6 +534,7 @@ class _Run:
                 local()
             if authority.revoked or (deadline is not None and monotonic() >= deadline):
                 raise GenerationHeld()
+            self._check_delivery_owner()
         finally:
             authority.checking = False
 
@@ -492,8 +578,10 @@ class _Run:
             if (type(operation) is not Operation or authority.phase != _STEPS[operation][0]
                     or authority.capability is not None):
                 raise GenerationHeld()
+            owner = self._control.delivery_owner
+            guard = owner._delivery_guard(self._control) if owner is not None and operation is Operation.DELIVERY else None
             with self._transition():
-                self._save(_STEPS[operation][1])
+                self._save(_STEPS[operation][1], local=guard.verify_claim if guard is not None else None)
                 authority.capability = Capability(operation)
                 return authority.capability
 
@@ -525,6 +613,14 @@ class _Run:
             if (self._control.deadline is None or type(capability) is not Capability or capability is not authority.capability
                     or not callable(effect) or authority.pending is not None):
                 raise GenerationHeld()
+            owner = self._control.delivery_owner
+            if owner is not None and capability.operation is Operation.DELIVERY:
+                guard = owner._delivery_guard(self._control)
+                if (settlement_guard is not guard or target is not guard.prepared
+                        or type(data) is not bytes or data != guard.prepared.packet):
+                    raise GenerationHeld()
+            else:
+                guard = None
             with self._transition():
                 authority.capability = None
                 if target is None or type(data) is not bytes or not 0 < len(data) <= _MAX_WRITE_BYTES:
@@ -538,7 +634,11 @@ class _Run:
                 authority.in_flight = proof
                 authority.pending_guard = settlement_guard
                 try:
+                    if guard is not None:
+                        guard.verify_claim()
                     evidence = effect(proof)
+                    if guard is not None:
+                        guard.verify_write()
                     checked = authority.flight_checked
                 finally:
                     authority.in_flight = None
@@ -587,6 +687,10 @@ class _Run:
                         or (guard is None and evidence.closure is not None)):
                     raise GenerationHeld()
                 operation = receipt.operation
+                owner = self._control.delivery_owner
+                if (owner is not None and operation is Operation.DELIVERY
+                        and (guard is not owner._delivery_guard(self._control) or evidence.closure is None)):
+                    raise GenerationHeld()
                 self._check_phase(_STEPS[operation][1])
                 self._save(_STEPS[operation][2], local=(lambda: guard(evidence)) if guard is not None else None)
                 if operation is Operation.ACP:
@@ -627,6 +731,7 @@ class _Run:
             self._match_phase(phase)
             if monotonic() >= deadline or authority.revoked:
                 raise GenerationHeld()
+            self._check_delivery_owner()
         except BaseException:
             self.revoke()
             raise
@@ -648,6 +753,21 @@ class _Run:
                 or not authority.busy or not authority.flight_checked):
             raise GenerationHeld()
         self._verify_local_phase(Phase.DESTINATION_CLAIMED)
+
+    def _verify_local_delivery(self, proof, *, target, data, settlement_guard):
+        """Pin an already-checked DELIVERY proof and the same shared owner."""
+        authority = self._files._authority
+        if (type(proof) is not _InFlight or proof is not authority.in_flight
+                or proof.pid != os.getpid() or proof.thread != get_ident()
+                or proof.operation is not Operation.DELIVERY
+                or not authority.busy or not authority.flight_checked
+                or self._control.delivery_owner is None
+                or target is not proof.target or type(data) is not bytes
+                or len(data) != proof.byte_count or _digest(data) != proof.packet_sha256
+                or settlement_guard is None or settlement_guard is not proof.settlement_guard
+                or settlement_guard is not authority.pending_guard):
+            raise GenerationHeld()
+        self._verify_local_phase(Phase.DELIVERY_CLAIMED)
 
     def _effect(self, capability, effect):
         self._owner_fence()

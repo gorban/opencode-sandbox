@@ -44,7 +44,10 @@ def deliver_worker(run, channel, *, adopted, relay_retirement, transcript, nativ
     fence = run._owner_fence()
     if channel._fence is not fence:
         raise WorkerChannelError("Joined worker delivery must share the journal owner fence")
+    channel._require_joined_run(run)
+    prepared = None
     try:
+        channel._check_joined_owner()
         binding = run._control.binding
         if (type(transcript) is not GenerationTranscript or transcript._fence is not fence
                 or type(native_retirement) is not UnitRetirementReceipt
@@ -85,9 +88,17 @@ def deliver_worker(run, channel, *, adopted, relay_retirement, transcript, nativ
             channel.verify_closed_write(closed)
             run.settle(write_receipt, evidence)
         return delivery
-    except BaseException:
+    except BaseException as error:
         try:
-            run.revoke()
+            try:
+                run.revoke()
+            finally:
+                channel.revoke()
         finally:
-            channel.revoke()
+            try:
+                channel._discard_unclosed_write(prepared)
+            except OSError:
+                error.add_note("Exact worker socket cleanup is unconfirmed")
         raise
+    finally:
+        channel._release_placement()
