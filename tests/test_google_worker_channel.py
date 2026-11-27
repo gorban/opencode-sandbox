@@ -360,6 +360,100 @@ class WorkerChannelTest(unittest.TestCase):
         self.assertEqual(self.read_all(worker), b"")
         self.claim.assert_not_called()
 
+    def test_worker_exit_during_final_owner_lookup_spends_claim_without_writing(self):
+        self.assert_late_worker_exit_cannot_write(owner_lookup=True)
+
+    def test_worker_exit_during_final_descriptor_check_spends_claim_without_writing(self):
+        self.assert_late_worker_exit_cannot_write(owner_lookup=False)
+
+    def assert_late_worker_exit_cannot_write(self, *, owner_lookup):
+        retained, relay, worker, control, _ = self.fixture(distinct_worker=True)
+        adoption, retirement = self.seal(retained, relay, control)
+
+        def owner():
+            if self.claim.called:
+                self.assertEqual(self.stop(self.worker_proc), 0)
+            return True
+
+        quiet_client = channel._quiet_client
+
+        def final_client(connection):
+            quiet_client(connection)
+            if self.claim.called:
+                self.assertEqual(self.stop(self.worker_proc), 0)
+
+        hook = (patch.object(retained, "_owner_current", owner) if owner_lookup
+                else patch.object(channel, "_quiet_client", final_client))
+        with hook, patch.object(channel, "_send_once", wraps=channel._send_once) as write:
+            with self.assertRaisesRegex(channel.WorkerChannelError, "worker or owner is no longer current"):
+                retained.deliver()
+            write.assert_not_called()
+        self.claim.assert_called_once_with(adoption, retirement)
+        self.assertEqual(retained.delivery, channel.DeliveryReceipt())
+        self.assertEqual(self.read_all(worker), b"")
+
+    def test_worker_exit_during_final_adoption_owner_lookup_cannot_publish_adoption(self):
+        retained, relay, worker, control, _ = self.fixture(distinct_worker=True)
+
+        def owner():
+            if retained._client is not None:
+                self.assertEqual(self.stop(self.worker_proc), 0)
+            return True
+
+        with patch.object(retained, "_owner_current", owner):
+            with self.assertRaisesRegex(channel.WorkerChannelError, "worker or owner is no longer current"):
+                retained.adopt(control)
+        self.stop(relay)
+        self.assertEqual(self.read_all(worker), b"")
+        self.claim.assert_not_called()
+
+    def test_relay_exit_during_final_adoption_owner_lookup_cannot_publish_adoption(self):
+        retained, relay, worker, control, _ = self.fixture()
+
+        def owner():
+            if retained._client is not None:
+                self.assertEqual(self.stop(relay), 0)
+            return True
+
+        with patch.object(retained, "_owner_current", owner):
+            with self.assertRaisesRegex(channel.WorkerChannelError, "Relay exited"):
+                retained.adopt(control)
+        self.assertEqual(self.read_all(worker), b"")
+        self.claim.assert_not_called()
+
+    def test_candidate_descriptor_rebound_during_adoption_is_not_adopted_or_closed(self):
+        retained, relay, worker, control, _ = self.fixture()
+        sibling = self.enterContext(socket.create_connection(("127.0.0.1", self.port), timeout=3))
+        replacement, _ = self.local_listener.accept()
+        with replacement:
+            identity = channel._socket_identity
+            candidate_fd = None
+
+            def inspect(connection, port):
+                nonlocal candidate_fd
+                candidate_fd = connection.fileno()
+                return identity(connection, port)
+
+            def owner():
+                if candidate_fd is not None:
+                    os.dup2(replacement.fileno(), candidate_fd, inheritable=False)
+                return True
+
+            try:
+                with patch.object(channel, "_socket_identity", inspect), patch.object(retained, "_owner_current", owner):
+                    with self.assertRaisesRegex(channel.WorkerChannelError, "descriptor changed"):
+                        retained.adopt(control)
+                self.assertTrue(os.path.samestat(os.fstat(candidate_fd), os.fstat(replacement.fileno())))
+                sibling.sendall(b"x")
+                self.assertEqual(replacement.recv(1), b"x")
+            finally:
+                if candidate_fd is not None:
+                    with suppress(OSError):
+                        os.close(candidate_fd)
+        self.stop(relay)
+        self.assertEqual(self.read_all(worker), b"")
+        self.claim.assert_not_called()
+
     def test_reused_descriptor_number_is_not_written_or_closed(self):
         retained, relay, worker, control, _ = self.fixture()
         self.seal(retained, relay, control)

@@ -115,6 +115,12 @@ class ProcessPin:
             return (type(group) is bytes and len(group) <= 4096 and group.splitlines() == [self._group]
                     and self._fd == fd and self._matches(fd) and not _dead(fd))
 
+    def alive(self):
+        """Recheck the kernel pin without calling the placement observer."""
+        with self._lock:
+            fd = self._fd
+            return self._matches(fd) and _pidfd_pid(fd) == self._pid and not _dead(fd)
+
     def retired(self):
         with self._lock:
             fd = self._fd
@@ -406,6 +412,14 @@ class RetainedWorkerChannel:
                  and self._owner_current() is True and self._phase is phase,
                  "Retained worker or owner is no longer current")
 
+    def _check_worker_pin(self, phase):
+        _require(self._phase is phase and self._placement.worker.alive(),
+                 "Retained worker or owner is no longer current")
+
+    def _check_live_adoption(self):
+        _require(self._placement.relay.alive(), "Relay exited before worker socket adoption")
+        self._check_worker_pin(_Phase.ADOPTING)
+
     def _check_client(self):
         client = self._client
         try:
@@ -434,12 +448,13 @@ class RetainedWorkerChannel:
                 raise WorkerChannelError("Worker admission is closed")
             self._phase = _Phase.ADOPTING
             self._control, self._control_pin = control, pin
-        candidate = None
+        candidate = identity = None
         try:
             self._placement.relay.require_peer(control)
             with self._fence:
                 self._check_worker(_Phase.ADOPTING)
                 self._check_control(control)
+                self._check_live_adoption()
             proof = _receive_proof(control, deadline)
             _require(hmac.compare_digest(proof, self._proof), "Worker handoff proof differs")
             with self._fence:
@@ -452,6 +467,8 @@ class RetainedWorkerChannel:
                 _require(self._placement.relay.active(), "Relay exited before worker socket adoption")
                 self._check_worker(_Phase.ADOPTING)
                 self._check_control(control)
+                _require(_socket_identity(candidate, self._port) == identity, "Retained worker descriptor changed")
+                self._check_live_adoption()
                 self._client, self._identity = candidate, identity
                 candidate = None
                 client = self._client
@@ -462,6 +479,7 @@ class RetainedWorkerChannel:
                 self._check_worker(_Phase.ADOPTING)
                 self._check_client()
                 self._check_control(control)
+                self._check_live_adoption()
                 self._adopted = AdoptedWorker(self._placement, sha256(body).hexdigest(), identity.pin.cookie)
                 self._phase = _Phase.ADOPTED
                 return self._adopted
@@ -472,7 +490,10 @@ class RetainedWorkerChannel:
             raise
         finally:
             if candidate is not None:
-                candidate.close()
+                if identity is None:
+                    candidate.close()
+                else:
+                    self._close_exact(candidate, identity.pin, shutdown=False)
             with self._fence:
                 if self._control is control:
                     self._close_control_locked(shutdown=False)
@@ -484,6 +505,9 @@ class RetainedWorkerChannel:
                  "Exact relay retirement is unconfirmed")
         self._check_worker(phase)
         self._check_client()
+        _require(self._placement.relay.retired(), "Exact relay retirement is unconfirmed")
+        # Both observers and socket checks precede the final kernel liveness sample.
+        self._check_worker_pin(phase)
 
     def seal(self, receipt):
         """Bind exact observed relay retirement to the retained worker channel."""
