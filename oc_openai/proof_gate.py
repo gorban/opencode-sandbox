@@ -15,6 +15,7 @@ owner process:
 """
 
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 import hmac
@@ -575,9 +576,9 @@ class ProofGate:
                 return None, None
             return peer, self.snapshot_arrival()
 
-    def _drain_accepts_locked(self) -> None:
-        for drain_fn in list(self._accept_drains):
-            drain_fn()
+    def _rotate_accepts_locked(self, pre_snapshot: ArrivalSnapshot) -> None:
+        for rotate_or_drain in list(self._accept_drains):
+            rotate_or_drain(pre_snapshot)
 
     def snapshot_arrival(self) -> ArrivalSnapshot:
         """Capture arrival-time gate state before a peer request body is read."""
@@ -597,12 +598,12 @@ class ProofGate:
                 raise ProofGateError(f"cannot arm proof gate from state {self._state}")
 
     def arm(self, *, observed_row: str, observed_screen_digest: str) -> str:
-        """Transition CLOSED_DISCOVERY -> ARMED after observing TUI readiness and exact row."""
+        """Transition CLOSED_DISCOVERY -> ARMED with atomic listener rotation to fence kernel backlog."""
         if not observed_row or not _SHA256_RE.fullmatch(observed_screen_digest):
             raise ProofGateError("arming requires observed_row and 64-hex observed_screen_digest")
         self._verify_owner_and_history()
         with self._accept_fence:
-            self._drain_accepts_locked()
+            pre_snapshot = self.snapshot_arrival()
             with self._lock:
                 if self._state != STATE_CLOSED_DISCOVERY:
                     raise ProofGateError(f"cannot arm proof gate from state {self._state}")
@@ -615,15 +616,28 @@ class ProofGate:
                 self._state = STATE_ARMED
                 self._outcome = "armed"
                 _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
-                return nonce
+            # Atomically replace listener AFTER state/fsync publication and drain old listener with pre_snapshot.
+            try:
+                self._rotate_accepts_locked(pre_snapshot)
+            except BaseException:
+                with self._lock:
+                    self._state = STATE_CLOSED_DISCOVERY
+                    self._arm_nonce = None
+                    self._observed_row = None
+                    self._observed_screen_digest = None
+                    self._outcome = "aborted_rotation_failed"
+                    with suppress(OSError):
+                        _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
+                raise
+            return nonce
 
     def mark_relay_verified(self, relay_id: str) -> None:
-        """Record verified isolation + bind of the replacement turn relay before activating writes."""
+        """Record verified isolation + bind with atomic listener rotation to fence kernel backlog."""
         if not _SHA256_RE.fullmatch(relay_id):
             raise ProofGateError("invalid verified turn relay ID")
         self._verify_owner_and_history()
         with self._accept_fence:
-            self._drain_accepts_locked()
+            pre_snapshot = self.snapshot_arrival()
             with self._lock:
                 if self._state != STATE_ARMED or self._evidence_path is None:
                     raise ProofGateError("cannot verify relay outside ARMED state")
@@ -632,6 +646,16 @@ class ProofGate:
                 self._relay_verified = True
                 self._verified_relay_id = relay_id
                 _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
+            # Atomically replace listener AFTER verification/fsync and drain old listener with pre_snapshot.
+            try:
+                self._rotate_accepts_locked(pre_snapshot)
+            except BaseException:
+                with self._lock:
+                    self._relay_verified = False
+                    self._verified_relay_id = None
+                    with suppress(OSError):
+                        _atomic_fsync_json(self._evidence_path, self._evidence_snapshot_locked(), exclusive=False)
+                raise
 
     def validate_and_canonicalize(
         self,

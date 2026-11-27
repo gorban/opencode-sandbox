@@ -417,6 +417,7 @@ class Connection:
                 record.get("worker_lease") is not None
                 or record.get("worker_leases")
                 or record.get("worker_retiring") is True
+                or self._store.has_lease_holds(directory)
             )
 
     def require_switchable(self):
@@ -428,7 +429,12 @@ class Connection:
         lease = WorkerLease.capture(job, self._host_probe())
         with self._store.locked() as directory:
             record = self._store.read(directory)
-            if not _active(record, binding) or "worker_lease" in record or record.get("worker_leases"):
+            if (
+                not _active(record, binding)
+                or "worker_lease" in record
+                or record.get("worker_leases")
+                or self._store.has_lease_holds(directory)
+            ):
                 raise ConnectionError("managed_retirement_incomplete")
             record["worker_lease"] = lease.record()
             self._store.write(directory, record)
@@ -501,20 +507,31 @@ class Connection:
             record = self._store.read(directory)
             leases = dict(record.get("worker_leases") or {})
             if (not _active(record, binding) or "worker_lease" in record
-                    or lease.root in leases or len(leases) >= MAX_WORKER_LEASES):
+                    or lease.root in leases or len(leases) >= MAX_WORKER_LEASES
+                    or self._store.has_lease_holds(directory)):
                 raise ConnectionError("managed_retirement_incomplete")
             leases[lease.root] = lease_record
             record["worker_leases"] = leases
             self._store.write(directory, record)
+        bind_hold = getattr(release_gate, "bind_hold_writer", None)
+        if callable(bind_hold):
+            bind_hold(lambda r=lease.root: self._store.write_lease_hold(r))
         try:
             yield lease
         finally:
             outcome = "retained_gate_closed"
-            if release_gate is None or release_gate():
-                with self._store.locked() as directory:
-                    outcome = self._release_session_lease_locked(
-                        directory, binding, lease, lease_record, release_gate=release_gate,
-                    )
+            try:
+                if release_gate is None or release_gate():
+                    with self._store.locked() as directory:
+                        outcome = self._release_session_lease_locked(
+                            directory, binding, lease, lease_record, release_gate=release_gate,
+                        )
+            except BaseException:
+                if on_release_result is not None:
+                    on_release_result("uncertain_commit_error")
+                with contextlib.suppress(OSError, ConnectionError):
+                    self._store.write_lease_hold(lease.root)
+                raise
             if on_release_result is not None:
                 on_release_result(outcome)
 

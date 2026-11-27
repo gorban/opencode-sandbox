@@ -270,27 +270,56 @@ class SessionBroker:
         self._streaming_peers: set[socket.socket] = set()
         self._cancels: set[threading.Event] = set()
         self._listener: socket.socket | None = None
+        self._wake_r: int | None = None
+        self._wake_w: int | None = None
         self._accept_thread: threading.Thread | None = None
         self._watch_thread: threading.Thread | None = None
         self._socket_id: tuple[int, int] | None = None
 
-    def start(self) -> None:
+    def _wake_accept_loop(self) -> None:
+        wake_w = self._wake_w
+        if wake_w is not None:
+            with suppress(OSError):
+                os.write(wake_w, b"\x01")
+
+    def _drain_wakeup(self) -> None:
+        wake_r = self._wake_r
+        if wake_r is None:
+            return
+        with suppress(OSError):
+            os.read(wake_r, 64)
+
+    def _bind_nonblocking_listener(self, path: Path) -> socket.socket:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(str(self.socket_path))
-            self.socket_path.chmod(0o600)
-            info = self.socket_path.lstat()
-            self._socket_id = (info.st_dev, info.st_ino)
+            listener.bind(str(path))
+            path.chmod(0o600)
             listener.listen(MAX_CLIENTS)
             listener.setblocking(False)
+            return listener
         except BaseException:
             with suppress(OSError):
                 listener.close()
+            with suppress(OSError):
+                path.unlink()
             raise
+
+    def start(self) -> None:
+        wake_r, wake_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            listener = self._bind_nonblocking_listener(self.socket_path)
+            info = self.socket_path.lstat()
+            self._socket_id = (info.st_dev, info.st_ino)
+        except BaseException:
+            os.close(wake_r)
+            os.close(wake_w)
+            raise
+        self._wake_r = wake_r
+        self._wake_w = wake_w
         self._listener = listener
         reg_drain = getattr(self._proof_gate, "register_accept_drain", None)
         if callable(reg_drain):
-            reg_drain(self._drain_pending_accepts)
+            reg_drain(self._rotate_listener_locked)
         self._accept_thread = threading.Thread(target=self._accept_loop, name="oc-chat-broker", daemon=True)
         self._watch_thread = threading.Thread(target=self._watch_revocation, name="oc-chat-watch", daemon=True)
         self._accept_thread.start()
@@ -356,15 +385,25 @@ class SessionBroker:
                 with suppress(OSError):
                     peer.shutdown(socket.SHUT_RDWR)
 
-    def _try_accept_nonblocking(self) -> socket.socket | None:
-        listener = self._listener
+    def _try_accept_from(self, listener: socket.socket | None) -> tuple[socket.socket | None, bool]:
+        """Return (peer, fatal_error). BlockingIOError/EINTR/ECONNABORTED are non-fatal empty drains."""
         if listener is None or self._stopped.is_set():
-            return None
+            return None, False
         try:
             peer, _ = listener.accept()
-            return peer
-        except (BlockingIOError, TimeoutError, OSError):
-            return None
+            return peer, False
+        except (BlockingIOError, InterruptedError, ConnectionAbortedError):
+            return None, False
+        except OSError:
+            if self._stopped.is_set() or listener is not self._listener:
+                return None, False
+            return None, True
+
+    def _try_accept_nonblocking(self) -> socket.socket | None:
+        peer, fatal = self._try_accept_from(self._listener)
+        if fatal:
+            self._trigger_revocation()
+        return peer
 
     def _dispatch_accepted_peer(self, peer: socket.socket, arrival) -> None:
         with suppress(OSError):
@@ -383,14 +422,38 @@ class SessionBroker:
                 self._client_arrivals.pop(peer, None)
                 peer.close()
 
-    def _drain_pending_accepts(self) -> None:
-        """Drain already-queued kernel backlog connections under the gate fence before a transition."""
-        while not self._stopped.is_set():
-            peer = self._try_accept_nonblocking()
-            if peer is None:
-                return
-            arrival = self._proof_gate.snapshot_arrival() if self._proof_gate is not None else None
-            self._dispatch_accepted_peer(peer, arrival)
+    def _rotate_listener_locked(self, pre_snapshot=None) -> None:
+        """Atomically replace UDS listener (os.replace) and drain old backlog with pre_snapshot."""
+        if self._stopped.is_set() or self._listener is None:
+            return
+        old_listener = self._listener
+        tmp_path = self.socket_path.parent / f"s.{secrets.token_hex(4)}"
+        new_listener = self._bind_nonblocking_listener(tmp_path)
+        try:
+            os.replace(tmp_path, self.socket_path)
+            info = self.socket_path.lstat()
+        except BaseException:
+            with suppress(OSError):
+                new_listener.close()
+            with suppress(OSError):
+                tmp_path.unlink()
+            raise
+        self._listener = new_listener
+        self._socket_id = (info.st_dev, info.st_ino)
+        self._wake_accept_loop()
+        # Every connection enqueued by the kernel BEFORE os.replace landed on old_listener.
+        drain_arrival = pre_snapshot
+        if drain_arrival is None and self._proof_gate is not None:
+            drain_arrival = self._proof_gate.snapshot_arrival()
+        try:
+            while not self._stopped.is_set():
+                peer, _ = self._try_accept_from(old_listener)
+                if peer is None:
+                    break
+                self._dispatch_accepted_peer(peer, drain_arrival)
+        finally:
+            with suppress(OSError):
+                old_listener.close()
 
     def _accept_one_serialized(self) -> tuple[socket.socket | None, object]:
         accept_fenced = getattr(self._proof_gate, "accept_with_snapshot", None)
@@ -402,16 +465,40 @@ class SessionBroker:
         arrival = self._proof_gate.snapshot_arrival() if self._proof_gate is not None else None
         return peer, arrival
 
+    def _poll_listener_once(self) -> bool:
+        listener = self._listener
+        wake_r = self._wake_r
+        if listener is None:
+            return False
+        poller = select.poll()
+        try:
+            listen_fd = listener.fileno()
+            if listen_fd < 0:
+                return False
+            poller.register(listen_fd, select.POLLIN)
+            if wake_r is not None:
+                poller.register(wake_r, select.POLLIN)
+            events = poller.poll(int(relay_mod.GRANT_POLL * 1000))
+        except (OSError, ValueError):
+            if self._stopped.is_set():
+                return False
+            if listener is not self._listener:
+                return True
+            self._trigger_revocation()
+            return False
+        for fd, mask in events:
+            if wake_r is not None and fd == wake_r:
+                self._drain_wakeup()
+            elif mask & (select.POLLERR | select.POLLNVAL) and listener is self._listener and not self._stopped.is_set():
+                self._trigger_revocation()
+                return False
+        return True
+
     def _accept_loop(self) -> None:
         while not self._stopped.is_set():
-            listener = self._listener
-            if listener is None:
-                return
-            try:
-                ready, _, _ = select.select([listener], [], [], relay_mod.GRANT_POLL)
-            except (OSError, ValueError):
-                return
-            if not ready:
+            if not self._poll_listener_once():
+                if self._stopped.is_set() or self._revoked.is_set():
+                    return
                 continue
             while not self._stopped.is_set():
                 peer, arrival = self._accept_one_serialized()
@@ -669,7 +756,8 @@ class SessionBroker:
         self._stopped.set()
         unreg_drain = getattr(self._proof_gate, "unregister_accept_drain", None)
         if callable(unreg_drain):
-            unreg_drain(self._drain_pending_accepts)
+            unreg_drain(self._rotate_listener_locked)
+        self._wake_accept_loop()
         self._cancel_active_turns()
         if self._listener is not None:
             with suppress(OSError):
@@ -679,6 +767,12 @@ class SessionBroker:
             self._accept_thread.join(timeout=1.5)
         if self._watch_thread is not None and self._watch_thread is not current:
             self._watch_thread.join(timeout=1.5)
+        for attr in ("_wake_r", "_wake_w"):
+            fd = getattr(self, attr)
+            if fd is not None:
+                setattr(self, attr, None)
+                with suppress(OSError):
+                    os.close(fd)
         with self._lock:
             threads = list(self._clients.values())
         deadline = time.monotonic() + 2
@@ -2307,7 +2401,12 @@ class _SessionSlotCoordinator:
                         timed_out_state.retire_timed_out = True
                 if timed_out_state is not None:
                     self._deny_slot_release(timed_out_state)
-                self._record_error(RuntimeError(f"Slot retirement thread '{thread.name}' did not finish"))
+                self._record_error(
+                    RuntimeError(
+                        f"Slot retirement thread '{thread.name}' did not finish; "
+                        "durable lease publication state is uncertain"
+                    )
+                )
 
     def teardown_all(self, agent_id: str | None) -> Exception | None:
         if agent_id is not None:

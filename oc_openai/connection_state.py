@@ -46,6 +46,7 @@ def _timestamp(value):
 
 
 _STATE_FILE = "state.json"
+_HOLD_PREFIX = ".lease-hold-"
 
 
 def _valid_scalar_fields(value):
@@ -269,3 +270,29 @@ class Store:
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary, dir_fd=directory)
+
+    def write_lease_hold(self, root_name: str) -> None:
+        """Persist an independent durable hold marker without waiting on state.lock."""
+        safe = "".join(ch for ch in root_name if ch.isalnum() or ch in ("-", "_", "."))[:96] or "unknown"
+        name = f"{_HOLD_PREFIX}{safe}"
+        directory = _directory(self.path, create=False)
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | CREATE_FLAGS, 0o600, dir_fd=directory)
+            try:
+                _regular(fd)
+                os.write(fd, b"hold\n")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def has_lease_holds(self, directory) -> bool:
+        if directory is None:
+            return False
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            return True
+        return any(name.startswith(_HOLD_PREFIX) for name in entries)

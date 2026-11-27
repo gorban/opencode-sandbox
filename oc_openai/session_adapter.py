@@ -65,8 +65,15 @@ class _SlotReleaseGate:
         self._relay_removed = False
         self._release_authorized = False
         self._release_denied = False
+        self._commit_attempted = False
+        self._commit_uncertain = False
+        self._hold_writer: Callable[[], None] | None = None
         self._authority: Callable[[], bool] | None = None
         self._outcome: str | None = None
+
+    def bind_hold_writer(self, writer: Callable[[], None]) -> None:
+        with self._lock:
+            self._hold_writer = writer
 
     def mark_relay_created(self) -> None:
         with self._lock:
@@ -87,11 +94,26 @@ class _SlotReleaseGate:
                 self._release_authorized = True
 
     def deny_release(self) -> None:
-        with self._commit_lock:
+        """Non-blocking sticky denial; persists an independent hold marker if os.replace() is in flight."""
+        acquired = self._commit_lock.acquire(blocking=False)
+        hold_writer: Callable[[], None] | None = None
+        try:
             with self._lock:
                 self._release_denied = True
                 self._release_authorized = False
                 self._relay_removed = False
+                if not acquired or self._commit_attempted:
+                    self._commit_uncertain = True
+                    hold_writer = self._hold_writer
+        finally:
+            if acquired:
+                self._commit_lock.release()
+        if hold_writer is not None:
+            hold_writer()
+
+    def is_commit_uncertain(self) -> bool:
+        with self._lock:
+            return self._commit_uncertain
 
     def bind_authority(self, predicate: Callable[[], bool]) -> None:
         if not callable(predicate):
@@ -107,11 +129,15 @@ class _SlotReleaseGate:
 
     def is_release_confirmed(self) -> bool:
         with self._lock:
-            return (not self._release_denied) and self._outcome in ("removed", "absent")
+            return (
+                not self._release_denied
+                and not self._commit_uncertain
+                and self._outcome in ("removed", "absent")
+            )
 
     def allows_release(self) -> bool:
         with self._lock:
-            if self._release_denied:
+            if self._release_denied or self._commit_uncertain:
                 return False
             if self._relay_created and not (self._relay_removed and self._release_authorized):
                 return False
@@ -128,9 +154,13 @@ class _SlotReleaseGate:
 
     @contextmanager
     def commit_fence(self):
-        """Serialize sticky revocation against the final atomic store commit (os.replace)."""
+        """Serialize sticky denial against the final atomic store commit (os.replace)."""
         with self._commit_lock:
-            yield self.allows_release()
+            allowed = self.allows_release()
+            if allowed:
+                with self._lock:
+                    self._commit_attempted = True
+            yield allowed
 
 
 class OpenAISessionAdapter:
