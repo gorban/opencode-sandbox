@@ -44,6 +44,8 @@ def deliver_worker(run, channel, *, adopted, relay_retirement, transcript, nativ
     fence = run._owner_fence()
     if channel._fence is not fence:
         raise WorkerChannelError("Joined worker delivery must share the journal owner fence")
+    if fence._is_owned():
+        raise WorkerChannelError("Joined worker delivery requires the owner fence to be released")
     channel._require_joined_run(run)
     prepared = None
     try:

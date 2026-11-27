@@ -110,6 +110,30 @@ class JoinedDeliveryTests(unittest.TestCase):
                           native_retirement=self.native_retirement, proxy_retirement=self.proxy_retirement)
         return delivery.deliver_worker(self.run_lease, self.channel, **(parameters | overrides))
 
+    def test_caller_holding_shared_fence_cannot_start_delivery_and_can_retry_after_release(self):
+        self.provision_native()
+        retained = self.channel._client
+        with (patch.object(self.transcript, "finish", wraps=self.transcript.finish) as finish,
+              patch.object(self.channel, "prepare_delivery", wraps=self.channel.prepare_delivery) as prepare,
+              patch.object(channel, "_send_once", wraps=channel._send_once) as once):
+            with self.journal.fence, self.assertRaises(channel.WorkerChannelError) as refusal:
+                self.deliver()
+            once.assert_not_called()
+            finish.assert_not_called()
+            prepare.assert_not_called()
+            self.assertEqual(str(refusal.exception), "Joined worker delivery requires the owner fence to be released")
+            self.assertEqual(self.journal.phase(), journal.Phase.DESTINATION_SETTLED)
+            self.assertIs(self.channel._client, retained)
+            self.assertFalse(self.channel.delivery.attempted)
+
+            self.assertEqual(self.deliver(), channel.DeliveryReceipt(True, len(self.packet), True))
+            once.assert_called_once()
+            finish.assert_called_once()
+            prepare.assert_called_once()
+        self.assertEqual(self.journal.phase(), journal.Phase.SETTLED)
+        self.assertEqual(self.worker.read_all(self.client), self.packet)
+        self.assertEqual(retained.fileno(), -1)
+
     def test_exact_observations_one_real_send_and_verified_close_settle_delivery(self):
         self.provision_native()
         phases = []
