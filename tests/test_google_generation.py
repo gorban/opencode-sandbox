@@ -1,9 +1,11 @@
 """Offline wire, accounting and retirement checks for the fixed Flash fixture."""
 
+from copy import copy, deepcopy
 import json
+import pickle
 import unittest
 from dataclasses import replace
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 from unittest.mock import patch
 
 from oc_google import generation
@@ -259,6 +261,21 @@ class AttemptTests(unittest.TestCase):
             return replace(original(sink), packet_digest=b"wrong digest")
 
         with patch.object(generation.FakeDestination, "receipt", receipt), self.assertRaises(generation.GenerationRefused):
+            self.run_attempt()
+        self.assert_receipt(generation.GenerationState.UNCERTAIN, 1, 1, 1)
+
+    def test_legacy_run_refuses_a_substituted_write_receipt_before_read(self):
+        self.create()
+        original = generation.FakeDestination.receipt
+
+        def copied(sink):
+            return copy(original(sink))
+
+        with (
+            patch.object(generation.FakeDestination, "receipt", copied),
+            patch.object(generation.FakeDestination, "read", side_effect=AssertionError("unverified sink receipt reached read")),
+            self.assertRaisesRegex(generation.GenerationRefused, "dispatch is unconfirmed"),
+        ):
             self.run_attempt()
         self.assert_receipt(generation.GenerationState.UNCERTAIN, 1, 1, 1)
 
@@ -529,3 +546,261 @@ class AttemptTests(unittest.TestCase):
         with patch.object(generation.FakeDestination, "read", read), self.assertRaises(generation.GenerationRefused):
             self.run_attempt()
         self.assert_receipt(generation.GenerationState.UNCERTAIN, 1, 1, 1)
+
+
+class SplitAttemptTests(unittest.TestCase):
+    def setUp(self):
+        self.binding = generation.GenerationBinding(object(), object(), 1, generation.MODEL_ALIAS)
+        self.now = 10.0
+        self.current = True
+
+    def create(self, *, authorized=None):
+        sink = generation.FakeDestination(response(), end_of_input=True)
+        if authorized is None:
+            authorized = lambda exact: self.current and exact is self.binding
+        return generation.GenerationAttempt(self.binding, sink, authorized=authorized, now=lambda: self.now), sink
+
+    def prepare(self, attempt, *, deadline=None):
+        return attempt.prepare(self.binding, request(), end_of_input=True, deadline=deadline)
+
+    def test_split_uses_exact_evidence_and_only_checks_owner_inside_effect_and_settlement(self):
+        checking_authority = True
+
+        def authorized(binding):
+            self.assertTrue(checking_authority, "outside observation invoked the owner's check")
+            return binding is self.binding
+
+        attempt, sink = self.create(authorized=authorized)
+        expected_packet = generation.project_generation(request(), end_of_input=True)
+        with patch.object(generation, "project_generation", return_value=expected_packet) as projection:
+            prepared = self.prepare(attempt)
+            projection.assert_called_once()
+        self.assertEqual(prepared.byte_count, len(expected_packet))
+        self.assertEqual(prepared.packet_digest, generation.sha256(expected_packet).digest())
+        self.assertIsNone(sink.receipt())
+        in_effect = True
+        checks = []
+
+        def admit():
+            checks.append(in_effect)
+            return in_effect
+
+        write = attempt.write_prepared(prepared, admit=admit)
+        in_effect = False
+        self.assertEqual(checks, [True])
+        self.assertIs(write.sink_receipt, sink.receipt())
+        self.assertEqual((write.byte_count, write.packet_digest), (prepared.byte_count, prepared.packet_digest))
+        self.assertEqual(attempt.receipt().releases, 0)
+
+        checking_authority = False
+        completed = attempt.observe(write)
+        self.assertIs(completed.write, write)
+        self.assertIs(completed.retirement.receipt, write.sink_receipt)
+        self.assertEqual(completed.reply_digest, generation.sha256(event(response_body())).digest())
+        self.assertFalse(hasattr(completed, "body"))
+        self.assertEqual(attempt.receipt().releases, 0)
+
+        checking_authority = True
+        self.assertEqual(attempt.settle(write, completed), event(response_body()))
+        attempt.revoke()
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.settle(write, completed)
+        self.assertEqual(attempt.receipt(), generation.GenerationReceipt(generation.GenerationState.SENT, 1, 1, 1, 1))
+
+    def test_copy_foreign_preparation_and_revocation_have_no_effect(self):
+        attempt, sink = self.create()
+        other, _ = self.create()
+        prepared = self.prepare(attempt)
+        for fake in (copy(prepared), replace(prepared), self.prepare(other)):
+            with self.assertRaises(generation.GenerationRefused):
+                attempt.write_prepared(fake, admit=lambda: self.fail("Rejected preparation queried the journal"))
+        self.assertEqual(attempt.receipt().destination_attempts, 0)
+        for resource in (attempt, sink):
+            for clone in (copy, deepcopy, pickle.dumps):
+                with self.subTest(kind=type(resource).__name__, operation=clone.__name__):
+                    with self.assertRaisesRegex(TypeError, "exclusive fixture ownership"):
+                        clone(resource)
+        attempt.revoke()
+        self.assertEqual(attempt.receipt().state, generation.GenerationState.UNSPENT)
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.write_prepared(prepared, admit=lambda: self.fail("Revoked preparation queried the journal"))
+        self.assertIsNone(sink.receipt())
+
+    def test_finite_deadline_cannot_be_extended_by_repreparing(self):
+        attempt, sink = self.create()
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.prepare(self.binding, b"invalid", end_of_input=True, deadline=10.25)
+        self.now = 10.1
+        prepared = self.prepare(attempt, deadline=20.0)
+        self.now = 10.25
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.write_prepared(prepared, admit=lambda: self.fail("Expired preparation queried the journal"))
+        self.assertIsNone(sink.receipt())
+        self.assertEqual(attempt.receipt().destination_attempts, 0)
+
+    def test_missing_or_revoked_effect_has_no_independent_sink_receipt(self):
+        for status in ("invalid", "non-bool", "revoked", "owner-lost"):
+            with self.subTest(status=status):
+                self.current = True
+                attempt, sink = self.create()
+                prepared = self.prepare(attempt)
+                checks = []
+
+                def admit():
+                    checks.append(status)
+                    if status == "revoked":
+                        attempt.revoke()
+                    if status == "owner-lost":
+                        self.current = False
+                    return {"invalid": False, "non-bool": 1}.get(status, True)
+
+                with self.assertRaises(generation.GenerationRefused):
+                    attempt.write_prepared(prepared, admit=admit)
+                self.assertIsNone(sink.receipt())
+                self.assertEqual(attempt.receipt(), generation.GenerationReceipt(
+                    generation.GenerationState.UNCERTAIN, 1, 1, 0, 0,
+                ))
+                with self.assertRaises(generation.GenerationRefused):
+                    attempt.write_prepared(prepared, admit=admit)
+                self.assertEqual(checks, [status])
+
+    def test_captured_write_check_is_unusable_after_synchronous_effect(self):
+        attempt, _ = self.create()
+        original = generation.FakeDestination.write
+        saved = []
+        admissions = []
+
+        def write(sink, *args, **kwargs):
+            saved.append((kwargs["check"], kwargs["deadline"]))
+            return original(sink, *args, **kwargs)
+
+        def admit():
+            admissions.append(True)
+            return True
+
+        with patch.object(generation.FakeDestination, "write", write):
+            attempt.write_prepared(self.prepare(attempt), admit=admit)
+        check, deadline = saved[0]
+        with self.assertRaises(generation.GenerationRefused):
+            check(deadline)
+        self.assertEqual(admissions, [True])
+
+    def test_substituted_same_shape_sink_receipt_fails_at_write_boundary(self):
+        attempt, sink = self.create()
+        original = generation.FakeDestination.receipt
+
+        def copied(sink):
+            return copy(original(sink))
+
+        with patch.object(generation.FakeDestination, "receipt", copied):
+            with self.assertRaisesRegex(generation.GenerationRefused, "dispatch is unconfirmed"):
+                attempt.write_prepared(self.prepare(attempt), admit=lambda: True)
+        self.assertIsNotNone(sink.receipt())
+        self.assertEqual(attempt.receipt(), generation.GenerationReceipt(
+            generation.GenerationState.UNCERTAIN, 1, 1, 1, 0,
+        ))
+
+    def test_replayed_or_copied_write_and_completion_cannot_release(self):
+        attempt, sink = self.create()
+        write = attempt.write_prepared(self.prepare(attempt), admit=lambda: True)
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.observe(copy(write))
+        observed = attempt.observe(write)
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.observe(write)
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.settle(copy(write), observed)
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.settle(write, copy(observed))
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.settle(write, observed)
+        self.assertIs(sink.receipt(), write.sink_receipt)
+        self.assertEqual(attempt.receipt(), generation.GenerationReceipt(
+            generation.GenerationState.UNCERTAIN, 1, 1, 1, 0,
+        ))
+
+    def test_revoke_before_settlement_immediately_holds_the_exact_write(self):
+        for observed in (False, True):
+            with self.subTest(observed=observed):
+                attempt, sink = self.create()
+                prepared = self.prepare(attempt)
+                write = attempt.write_prepared(prepared, admit=lambda: True)
+                completion = attempt.observe(write) if observed else None
+                self.assertEqual(attempt.receipt().state, generation.GenerationState.SENT)
+                attempt.revoke()
+                attempt.revoke()
+                held = generation.GenerationReceipt(generation.GenerationState.UNCERTAIN, 1, 1, 1, 0)
+                self.assertEqual(attempt.receipt(), held)
+                with self.assertRaises(generation.GenerationRefused):
+                    attempt.settle(write, completion)
+                with self.assertRaises(generation.GenerationRefused):
+                    attempt.observe(write)
+                with self.assertRaises(generation.GenerationRefused):
+                    attempt.write_prepared(prepared, admit=lambda: self.fail("Revoked write queried the journal"))
+                self.assertIs(sink.receipt(), write.sink_receipt)
+                self.assertEqual(attempt.receipt(), held)
+
+    def test_owner_loss_before_settlement_keeps_observed_reply_private(self):
+        attempt, _ = self.create()
+        write = attempt.write_prepared(self.prepare(attempt), admit=lambda: True)
+        observed = attempt.observe(write)
+        self.current = False
+        with self.assertRaises(generation.GenerationRefused):
+            attempt.settle(write, observed)
+        self.assertEqual(attempt.receipt().releases, 0)
+
+    def test_blocked_observation_allows_shared_fence_revocation_and_no_new_write(self):
+        for method in ("read", "retire", "confirms_retirement"):
+            with self.subTest(method=method):
+                self.assert_observation_can_be_revoked(method)
+
+    def assert_observation_can_be_revoked(self, method):
+        shared_fence = RLock()
+        attempt, sink = self.create()
+        prepared = self.prepare(attempt)
+        with shared_fence:
+            write = attempt.write_prepared(prepared, admit=lambda: True)
+        original = getattr(generation.FakeDestination, method)
+        paused, resume, revoked = Event(), Event(), Event()
+        observations, failures = [], []
+
+        def pause(sink, *args, **kwargs):
+            paused.set()
+            if not resume.wait(5):
+                raise RuntimeError("synthetic observation did not resume")
+            return original(sink, *args, **kwargs)
+
+        def observe():
+            try:
+                observations.append(attempt.observe(write))
+            except BaseException as exc:
+                failures.append(exc)
+
+        def revoke():
+            with shared_fence:
+                attempt.revoke()
+                revoked.set()
+
+        reader = Thread(target=observe, daemon=True)
+        disposer = Thread(target=revoke, daemon=True)
+        with patch.object(generation.FakeDestination, method, pause):
+            reader.start()
+            try:
+                self.assertTrue(paused.wait(2))
+                disposer.start()
+                self.assertTrue(revoked.wait(2), "stalled observation held the owner or leaf fence")
+                with self.assertRaises(generation.GenerationRefused):
+                    attempt.write_prepared(prepared, admit=lambda: self.fail("Replay queried the journal"))
+            finally:
+                resume.set()
+                reader.join(2)
+                if disposer.ident is not None:
+                    disposer.join(2)
+        self.assertFalse(reader.is_alive() or disposer.is_alive())
+        self.assertEqual(observations, [])
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], generation.GenerationRefused)
+        self.assertIs(sink.receipt(), write.sink_receipt)
+        self.assertEqual(attempt.receipt(), generation.GenerationReceipt(
+            generation.GenerationState.UNCERTAIN, 1, 1, 1, 0,
+        ))

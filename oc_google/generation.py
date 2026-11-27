@@ -1,11 +1,11 @@
 """Closed, in-process transport for one offline Gemini generation fixture."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from hashlib import sha256
 import json
 import re
-from threading import RLock
+from threading import RLock, get_ident
 from time import monotonic
 
 
@@ -170,8 +170,14 @@ class _Retirement:
     receipt: _SinkReceipt
 
 
+def _deny_copy(self, *_):
+    raise TypeError(f"{type(self).__name__} has exclusive fixture ownership")
+
+
 class FakeDestination:
     """Record one complete canonical request without any network or credential access."""
+
+    __copy__ = __deepcopy__ = __reduce_ex__ = _deny_copy
 
     def __init__(self, reply: bytes, *, end_of_input: bool):
         if type(reply) is not bytes or type(end_of_input) is not bool:
@@ -207,6 +213,10 @@ class FakeDestination:
         with self._lock:
             return self._receipt
 
+    def confirms_write(self, receipt):
+        with self._lock:
+            return receipt is not None and receipt is self._receipt
+
     def read(self, receipt, *, deadline, check):
         check(deadline)
         with self._lock:
@@ -230,6 +240,33 @@ class FakeDestination:
                     and receipt is self._receipt)
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class PreparedGeneration:
+    """An exact, immutable request reserved for one attempt."""
+
+    byte_count: int
+    packet_digest: bytes
+    _packet: bytes = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class GenerationWrite:
+    """Evidence of one complete fake write, before reply verification."""
+
+    byte_count: int
+    packet_digest: bytes
+    sink_receipt: _SinkReceipt
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class GenerationCompletion:
+    """Exact sink evidence prepared for settlement, with no reply bytes."""
+
+    write: GenerationWrite
+    reply_digest: bytes
+    retirement: _Retirement
+
+
 class GenerationState(Enum):
     UNSPENT = auto()
     CLAIMED = auto()
@@ -251,6 +288,8 @@ class GenerationReceipt:
 class GenerationAttempt:
     """Share one sticky authority and one non-retrying write across all call sites."""
 
+    __copy__ = __deepcopy__ = __reduce_ex__ = _deny_copy
+
     def __init__(self, binding: GenerationBinding, destination: FakeDestination, *, authorized, now=monotonic):
         if type(binding) is not GenerationBinding or type(destination) is not FakeDestination:
             raise TypeError("Expected a bound Gemini fixture destination")
@@ -267,12 +306,26 @@ class GenerationAttempt:
         self._deadline = None
         self._native_requests = 0
         self._destination_attempts = 0
-        self._sent_receipt = None
         self._releases = 0
+        self._prepared = self._write = self._completion = self._validated = None
+        self._observing = False
+
+    def _clear_evidence(self):
+        self._prepared = self._write = self._completion = self._validated = None
 
     def revoke(self):
         with self._fence:
-            self._revoked = True
+            if self._active and self._state in (GenerationState.CLAIMED, GenerationState.SENT):
+                self._hold()
+            else:
+                self._revoked = True
+                self._clear_evidence()
+
+    def _hold(self):
+        self._state = GenerationState.UNCERTAIN
+        self._revoked = True
+        self._active = False
+        self._clear_evidence()
 
     def receipt(self):
         with self._fence:
@@ -281,79 +334,174 @@ class GenerationAttempt:
             return GenerationReceipt(self._state, self._native_requests, self._destination_attempts,
                                      complete, self._releases)
 
-    def _check(self, deadline):
-        try:
-            current = (not self._revoked and deadline == self._deadline
-                       and self._authorized(self._binding) is True
-                       and self._now() < deadline and not self._revoked)
-        except BaseException:
-            self._revoked = True
-            raise
-        if not current:
+    def _check_local(self, deadline):
+        if self._revoked or deadline != self._deadline or not self._now() < deadline or self._revoked:
             self._revoked = True
             raise GenerationRefused("Gemini fixture owner or deadline changed")
 
-    def run(self, binding, packet, *, end_of_input) -> bytes:
-        """Return one immutable reply only after exact fake retirement and settlement."""
+    def _check(self, deadline):
+        try:
+            if self._revoked or deadline != self._deadline or self._authorized(self._binding) is not True:
+                raise GenerationRefused("Gemini fixture owner or deadline changed")
+            self._check_local(deadline)
+        except BaseException:
+            self._revoked = True
+            raise
+
+    def prepare(self, binding, packet, *, end_of_input, deadline=None):
+        """Project one exact input before the caller charges a durable claim."""
         with self._fence:
             self._native_requests += 1
             if (self._active or self._state is not GenerationState.UNSPENT or self._revoked
                     or binding is not self._binding):
                 raise GenerationRefused("Gemini fixture attempt is unavailable")
-            # Set this before any callback can run, including the first clock read.
+            # Reserve the attempt before invoking the clock or authority.
             self._active = True
-        try:
-            with self._fence:
+            try:
+                if deadline is not None and (type(deadline) not in (int, float)
+                                             or not float("-inf") < deadline < float("inf")):
+                    raise GenerationRefused("Invalid Gemini fixture deadline")
                 if self._deadline is None:
                     self._deadline = self._now() + DEADLINE_SECONDS
+                if deadline is not None:
+                    self._deadline = min(self._deadline, deadline)
                 self._check(self._deadline)
                 projected = project_generation(packet, end_of_input=end_of_input)
-                self._state = GenerationState.CLAIMED
-                receipt = self._dispatch(projected)
-            return self._settle(receipt, self._deadline)
+                self._prepared = PreparedGeneration(len(projected), sha256(projected).digest(), projected)
+                return self._prepared
+            except BaseException:
+                self._active = False
+                raise
+
+    def run(self, binding, packet, *, end_of_input) -> bytes:
+        """Return one immutable reply only after exact fake retirement and settlement."""
+        prepared = self.prepare(binding, packet, end_of_input=end_of_input)
+        write = self._write_prepared(prepared, admit=None)
+        return self.settle(write, self._observe(write, check_authority=True))
+
+    def write_prepared(self, prepared, *, admit):
+        """Accept one prepared request inside the caller's live synthetic effect.
+
+        Admit is the private synchronous D1 proof check. It must perform no I/O
+        or wait and is neither stored nor passed to the observer.
+        """
+        if not callable(admit):
+            raise TypeError("Expected the private Gemini fixture admission check")
+        return self._write_prepared(prepared, admit=admit)
+
+    def _write_prepared(self, prepared, *, admit):
+        with self._fence:
+            if (prepared is None or prepared is not self._prepared or not self._active
+                    or self._state is not GenerationState.UNSPENT):
+                raise GenerationRefused("Gemini fixture preparation is unavailable")
+            self._prepared = None
+            self._state = GenerationState.CLAIMED
+            try:
+                self._write = self._dispatch(prepared, admit=admit)
+                self._state = GenerationState.SENT
+                return self._write
+            except BaseException:
+                self._hold()
+                raise
+
+    def _dispatch(self, prepared, *, admit):
+        deadline = self._deadline
+        self._check(deadline)
+        owner_thread = get_ident()
+        open_check = True
+        used_check = False
+
+        def check(checked_deadline):
+            nonlocal used_check
+            if not open_check or used_check or get_ident() != owner_thread:
+                raise GenerationRefused("Gemini fixture write check is unavailable")
+            used_check = True
+            self._check(checked_deadline)
+            if admit is not None:
+                if admit() is not True:
+                    raise GenerationRefused("Gemini fixture journal admission is unavailable")
+                self._check(checked_deadline)
+
+        self._destination_attempts += 1
+        try:
+            written = self._destination.write(prepared._packet, attempt=self._attempt, deadline=deadline, check=check)
+        finally:
+            open_check = False
+            admit = None
+        self._check(deadline)
+        receipt = self._destination.receipt()
+        if (not used_check or type(written) is not int or written != prepared.byte_count
+                or type(receipt) is not _SinkReceipt or receipt.attempt is not self._attempt
+                or receipt.packet_digest != prepared.packet_digest or not self._destination.confirms_write(receipt)):
+            raise GenerationRefused("Gemini fixture dispatch is unconfirmed")
+        self._check(deadline)
+        return GenerationWrite(written, prepared.packet_digest, receipt)
+
+    def observe(self, write):
+        """Observe the exact fake reply and retirement outside the shared owner fence."""
+        return self._observe(write, check_authority=False)
+
+    def _observe(self, write, *, check_authority):
+        with self._fence:
+            if (write is None or write is not self._write or not self._active
+                    or self._state is not GenerationState.SENT or self._observing or self._completion is not None):
+                raise GenerationRefused("Gemini fixture visit changed")
+            self._observing = True
+
+        def check(deadline):
+            with self._fence:
+                if not self._observing or write is not self._write:
+                    raise GenerationRefused("Gemini fixture visit changed")
+                if check_authority:
+                    self._check(deadline)
+                else:
+                    self._check_local(deadline)
+
+        deadline = self._deadline
+        sink_receipt = write.sink_receipt
+        try:
+            check(deadline)
+            reply, eof = self._destination.read(sink_receipt, deadline=deadline, check=check)
+            check(deadline)
+            validated = validate_generation_reply(reply, end_of_input=eof)
+            check(deadline)
+            retired = self._destination.retire(sink_receipt, deadline=deadline, check=check)
+            check(deadline)
+            if not self._destination.confirms_retirement(sink_receipt, retired):
+                raise GenerationRefused("Gemini fixture retirement is unconfirmed")
+            with self._fence:
+                check(deadline)
+                self._completion = GenerationCompletion(write, sha256(validated).digest(), retired)
+                self._validated = validated
+                return self._completion
         except BaseException:
             with self._fence:
-                if self._state is not GenerationState.UNSPENT:
-                    self._state = GenerationState.UNCERTAIN
-                    self._revoked = True
+                self._hold()
             raise
         finally:
             with self._fence:
-                self._active = False
+                self._observing = False
 
-    def _dispatch(self, packet):
-        deadline = self._deadline
-        self._check(deadline)
-        self._destination_attempts += 1
-        written = self._destination.write(packet, attempt=self._attempt, deadline=deadline, check=self._check)
-        self._check(deadline)
-        receipt = self._destination.receipt()
-        self._check(deadline)
-        if (type(written) is not int or written != len(packet) or type(receipt) is not _SinkReceipt
-                or receipt.attempt is not self._attempt or receipt.packet_digest != sha256(packet).digest()):
-            raise GenerationRefused("Gemini fixture dispatch is unconfirmed")
-        self._state = GenerationState.SENT
-        self._sent_receipt = receipt
-        return receipt
-
-    def _settle(self, receipt, deadline):
-        def check(deadline):
-            # During fake I/O, a separate thread can revoke this exact attempt.
-            with self._fence:
-                if not self._active or self._state is not GenerationState.SENT or receipt is not self._sent_receipt:
-                    raise GenerationRefused("Gemini fixture visit changed")
-                self._check(deadline)
-
-        check(deadline)
-        reply, eof = self._destination.read(receipt, deadline=deadline, check=check)
-        check(deadline)
-        validated = validate_generation_reply(reply, end_of_input=eof)
-        check(deadline)
-        retired = self._destination.retire(receipt, deadline=deadline, check=check)
+    def settle(self, write, completion):
+        """Release verified bytes to the trusted caller for post-commit delivery."""
         with self._fence:
-            check(deadline)
-            if not self._destination.confirms_retirement(receipt, retired):
-                raise GenerationRefused("Gemini fixture retirement is unconfirmed")
-            check(deadline)
-            self._releases = 1
-            return validated
+            if (write is None or write is not self._write or not self._active
+                    or self._state is not GenerationState.SENT or self._observing):
+                raise GenerationRefused("Gemini fixture settlement is unavailable")
+            try:
+                if completion is None or completion is not self._completion or completion.write is not write:
+                    raise GenerationRefused("Gemini fixture completion changed")
+                validated = self._validated
+                self._clear_evidence()
+                self._check(self._deadline)
+                if (completion.reply_digest != sha256(validated).digest()
+                        or not self._destination.confirms_write(write.sink_receipt)
+                        or not self._destination.confirms_retirement(write.sink_receipt, completion.retirement)):
+                    raise GenerationRefused("Gemini fixture retirement is unconfirmed")
+                self._check(self._deadline)
+                self._releases = 1
+                self._active = False
+                return validated
+            except BaseException:
+                self._hold()
+                raise
