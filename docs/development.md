@@ -95,7 +95,7 @@ and observed version and fails. Review the tool version, lockfile and policy tog
 updating the pin. Verify the observed versions and check identity on the first hosted run.
 
 [Set up SonarQube Cloud and Codex MCP, find PR issues, and qualify the required check.](sonarqube.md)
-[Run local Python coverage and understand the advisory security scans.](ci-baselines.md)
+[Run local Python coverage and understand the security scans and CodeQL gate.](ci-baselines.md)
 
 CI workflow, runner and policy changes require human review. Changes that install or update tools,
 write hooks or Git state, or enable remote acceptance need separate approval. The

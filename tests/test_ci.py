@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -50,6 +51,82 @@ class CoverageTests(unittest.TestCase):
                     patch.object(core_coverage, 'report_coverage'):
                 core_coverage.main()
             self.assertEqual((root / 'calls').read_text().splitlines(), ['run', 'run', 'json', 'xml'])
+
+
+def workflow_blocks(lines, indent):
+    """Group workflow lines under each key at this indent; an inline value is the first entry."""
+    blocks, body = {}, None
+    for line in lines:
+        text = line.strip()
+        if not text or text.startswith('#'):
+            continue
+        if len(line) - len(line.lstrip()) == indent:
+            key, _, value = text.partition(':')
+            body = blocks[key] = [value.strip()] if value.strip() else []
+        elif body is not None:
+            body.append(line)
+    return blocks
+
+
+def stripped(lines):
+    return [line.strip() for line in lines]
+
+
+class BaselineWorkflowTests(unittest.TestCase):
+    """The ruleset requires CodeQL results, so main needs its own analysis to compare against."""
+
+    PR_ONLY = "if: ${{ github.event_name == 'pull_request' }}"
+
+    def setUp(self):
+        self.text = (ci.ROOT / '.github/workflows/ci-baselines.yml').read_text()
+        self.top = workflow_blocks(self.text.splitlines(), 0)
+        self.jobs = workflow_blocks(self.top['jobs'], 2)
+
+    def test_codeql_scans_pull_requests_every_main_commit_and_a_weekly_refresh(self):
+        *events, cron = stripped(self.top['on'])
+        self.assertEqual(events, [
+            'pull_request:', 'branches: [main]', 'types: [opened, synchronize, reopened, edited]',
+            'push:', 'branches: [main]',
+            'schedule:',
+        ])
+        self.assertRegex(cron, r"^- cron: '[0-5]?\d ([01]?\d|2[0-3]) \* \* [0-6]'$")
+        codeql = stripped(self.jobs['codeql'])
+        self.assertEqual([line for line in codeql if line.startswith('if:')], [])
+        for setting in ('language: [python, actions]', 'build-mode: none',
+                        'category: /language:${{ matrix.language }}', 'wait-for-processing: true'):
+            self.assertIn(setting, codeql)
+
+    def test_pull_request_jobs_skip_main_and_main_runs_are_never_cancelled(self):
+        self.assertEqual(stripped(self.top['concurrency']), [
+            'group: ci-baselines-${{ github.event.pull_request.number || github.run_id }}',
+            'cancel-in-progress: true',
+        ])
+        self.assertEqual(set(self.jobs), {'coverage', 'codeql', 'dependency-review'})
+        for name in ('coverage', 'dependency-review'):
+            with self.subTest(job=name):
+                self.assertIn(self.PR_ONLY, stripped(self.jobs[name]))
+
+    def test_least_privilege_and_pinned_actions(self):
+        self.assertEqual(self.top['permissions'], ['{}'])
+        self.assertEqual(
+            {name: stripped(workflow_blocks(body, 4)['permissions']) for name, body in self.jobs.items()},
+            {
+                'coverage': ['contents: read'],
+                'codeql': ['contents: read', 'security-events: write'],
+                'dependency-review': ['contents: read'],
+            },
+        )
+        uses = re.findall(r'uses: (\S+)(.*)', self.text)
+        self.assertTrue(uses)
+        for action, comment in uses:
+            with self.subTest(action=action):
+                self.assertRegex(action, r'^[\w./-]+@[0-9a-f]{40}$')
+                self.assertRegex(comment, r'^ # v\d+\.\d+\.\d+$')
+        checkouts = self.text.count('uses: actions/checkout@')
+        self.assertGreater(checkouts, 0)
+        self.assertEqual(self.text.count('persist-credentials: false'), checkouts)
+        self.assertEqual(self.text.count('ref: ${{ github.sha }}'), checkouts)
+        self.assertNotIn('secrets.', self.text)
 
 
 class PortableTests(unittest.TestCase):
