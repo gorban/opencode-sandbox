@@ -11,6 +11,8 @@ from pathlib import Path
 import shlex
 import shutil
 import socket
+import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -63,6 +65,20 @@ def verify_digest(path, digest):
 
 
 @contextmanager
+def preserving_cleanup(action, description):
+    try:
+        yield
+    except BaseException as primary:
+        try:
+            action()
+        except BaseException as secondary:
+            primary.add_note(f"Unable to finish {description}: {type(secondary).__name__}")
+        raise
+    else:
+        action()
+
+
+@contextmanager
 def measured_command(binary, libraries):
     binary = binary.resolve(strict=True)
     verify_digest(binary, STOCK_SHA256)
@@ -70,13 +86,14 @@ def measured_command(binary, libraries):
     verify_digest(loader, MUSL_LOADER_SHA256)
     alias = loader.with_name("libc.musl-x86_64.so.1")
     require(alias.resolve(strict=True) == loader.resolve(strict=True), "Incorrect stock musl loader alias")
-    with tempfile.TemporaryDirectory(prefix="oc-tools-musl-") as scratch:
+    scratch = tempfile.TemporaryDirectory(prefix="oc-tools-musl-")
+    with preserving_cleanup(scratch.cleanup, "stock library scratch cleanup"):
         for name, digest in MUSL_PINS.items():
-            target = Path(scratch) / name
+            target = Path(scratch.name) / name
             shutil.copyfile(libraries / name, target)
             verify_digest(target, digest)
             target.chmod(0o400)
-        yield ("/usr/bin/env", f"LD_LIBRARY_PATH={scratch}", str(binary))
+        yield ("/usr/bin/env", f"LD_LIBRARY_PATH={scratch.name}", str(binary))
 
 
 class Terminal:
@@ -128,10 +145,10 @@ class FakeUpstream:
 
 
 class Observer(ThreadingHTTPServer):
-    daemon_threads = True
+    # server_close joins request handlers before the failure snapshot.
+    daemon_threads = False
 
     def __init__(self, case, ledger):
-        super().__init__(("127.0.0.1", PORT), WireHandler)
         self.case = case
         self.abort = None
         self.upstream = FakeUpstream(case)
@@ -142,6 +159,7 @@ class Observer(ThreadingHTTPServer):
         self.prefix_refusals = 0
         self.error = None
         self.lock = Lock()
+        super().__init__(("127.0.0.1", PORT), WireHandler)
 
     def dispatch(self, body, outbound):
         history = classify(body)
@@ -296,18 +314,71 @@ def verify_scope():
     require(WORKSPACE.is_dir() and not any(WORKSPACE.iterdir()), "Use an empty synthetic stock workspace")
 
 
-def capture(command, evidence_path, case):
-    with tempfile.TemporaryDirectory(prefix="oc-tools-") as scratch, Observer(case, Path(scratch) / "synthetic-exposure.sqlite") as observer:
-        root = Path(scratch)
-        home = root / "home"
-        home.mkdir(mode=0o700)
-        config = root / "opencode.json"
-        config.write_text(json.dumps(stock_config()))
-        env = {**JOB_ENV, "HOME": str(home), "OPENCODE_CONFIG": str(config)}
-        term = Terminal(root, env)
-        thread = Thread(target=observer.serve_forever)
-        thread.start()
+def write_capture_evidence(path, data):
+    payload = json.dumps(data, allow_nan=False) + "\n"
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    with preserving_cleanup(lambda: os.close(directory), "evidence directory close"):
+        info = os.fstat(directory)
+        require(info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o077,
+                "Capture evidence directory must be private and owned")
+        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
         try:
+            with preserving_cleanup(lambda: os.close(fd), "evidence descriptor close"):
+                out = os.fdopen(fd, "w", closefd=False)
+                with preserving_cleanup(out.close, "evidence file close"):
+                    os.fchmod(fd, 0o600)
+                    out.write(payload)
+                    out.flush()
+                    os.fsync(fd)
+            os.fsync(directory)
+        except BaseException as primary:
+            try:
+                os.unlink(path.name, dir_fd=directory)
+            except BaseException as secondary:
+                primary.add_note(f"Unable to remove partial evidence: {type(secondary).__name__}")
+            raise
+
+
+def save_failed_capture(path, observer, stopped, primary):
+    status = "unavailable"
+    if stopped:
+        try:
+            claims = observer.turns.verified_records()
+        except FixtureMismatch:
+            status = "corrupt"
+        except sqlite3.Error as error:
+            corrupt = {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_TOOBIG,
+                       sqlite3.SQLITE_SCHEMA, sqlite3.SQLITE_ERROR}
+            code = getattr(error, "sqlite_errorcode", None)
+            if code is not None and (code & 0xff) in corrupt:
+                status = "corrupt"
+        else:
+            status = "verified"
+    evidence = {"status": status}
+    if status == "verified":
+        evidence["claims"] = claims
+    else:
+        primary.add_note(f"Synthetic exposure evidence {status}")
+    write_capture_evidence(path, {"requests": observer.requests, "phase": "failed", "exposure": evidence})
+    print(json.dumps(summarize(observer.requests)), file=sys.stderr)
+
+
+def capture(command, evidence_path, case):
+    scratch = tempfile.TemporaryDirectory(prefix="oc-tools-")
+    with preserving_cleanup(scratch.cleanup, "capture scratch cleanup"):
+        root = Path(scratch.name)
+        observer = Observer(case, root / "synthetic-exposure.sqlite")
+        term = thread = None
+        primary = None
+        try:
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            config = root / "opencode.json"
+            config.write_text(json.dumps(stock_config()))
+            env = {**JOB_ENV, "HOME": str(home), "OPENCODE_CONFIG": str(config)}
+            term = Terminal(root, env)
+            thread = Thread(target=observer.serve_forever)
+            thread.start()
             term.start(*command, str(WORKSPACE))
             term.await_screen(lambda screen: "Ask anything" in screen, "ordinary stock input", observer)
             term.type_line(PROMPT)
@@ -340,25 +411,40 @@ def capture(command, evidence_path, case):
                       "requests": summarize(observer.requests), "stock_export": exported, "abort": observer.abort,
                       "synthetic_claims": records, "synthetic_writes": observer.upstream.writes,
                       "local_titles": observer.local_titles, "earlier_prefix_refusals": observer.prefix_refusals}
-            with os.fdopen(os.open(evidence_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600),
-                           "w") as out:
-                json.dump({"requests": observer.requests, "report": report}, out)
-                out.write("\n")
-            print(json.dumps({key: value for key, value in report.items() if key != "stock_export"}))
-        except Exception as primary:
-            try:
-                with os.fdopen(os.open(evidence_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600),
-                               "w") as out:
-                    json.dump({"requests": observer.requests, "phase": "failed"}, out)
-                    out.write("\n")
-            except OSError as evidence_error:
-                primary.add_note(f"Unable to save secondary evidence: {type(evidence_error).__name__}")
-            print(json.dumps(summarize(observer.requests)), file=sys.stderr)
+        except BaseException as error:
+            primary = error
             raise
         finally:
-            term.run("kill-server", check=False)
-            observer.shutdown()
-            thread.join()
+            cleanup_primary = None
+            actions = []
+            if term is not None:
+                actions.append(("terminal cleanup", lambda: term.run("kill-server", check=False)))
+            if thread is not None and thread.ident is not None:
+                actions.extend((("observer shutdown", observer.shutdown),
+                                ("observer thread", lambda: thread.join(timeout=10))))
+            actions.append(("observer close", observer.server_close))
+            stopped = True
+            for description, action in actions:
+                try:
+                    action()
+                    if description == "observer thread":
+                        require(not thread.is_alive(), "Capture observer thread did not stop")
+                except BaseException as cleanup_error:
+                    if description != "terminal cleanup":
+                        stopped = False
+                    if primary is None:
+                        primary = cleanup_primary = cleanup_error
+                    else:
+                        primary.add_note(f"Unable to finish {description}: {type(cleanup_error).__name__}")
+            if primary is not None:
+                try:
+                    save_failed_capture(evidence_path, observer, stopped, primary)
+                except BaseException as evidence_error:
+                    primary.add_note(f"Unable to save secondary evidence: {type(evidence_error).__name__}")
+                if cleanup_primary is not None:
+                    raise cleanup_primary
+        write_capture_evidence(evidence_path, {"requests": observer.requests, "report": report})
+        print(json.dumps({key: value for key, value in report.items() if key != "stock_export"}))
 
 
 def main():

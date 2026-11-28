@@ -39,9 +39,14 @@ python3 -IB tests/e2e/stock_worker_tools_capture.py /oc-bin/opencode \
 python3 -IB tests/e2e/test_stock_worker_tools_turns.py
 ```
 
-The capture's evidence file contains only synthetic traffic and has mode 0600. Record
-its SHA-256 and the source revision. The capture is a loopback proof with a synthetic
-accounting store. The public launcher, production broker and TLS peer are exercised by
+The capture writes a new mode 0600 evidence file in a private directory owned by the
+capture user. If the capture fails, it stops the observer and snapshots the bounded
+synthetic journal before removing scratch. An unresolved claim retains null usage
+only when the settled prefix and the exact claim match, including when SQLite
+commits before reporting an error. Cleanup errors accompany the original failure
+as exception notes. A missing or invalid journal produces an unavailable or corrupt
+status. Record the evidence SHA-256 and the source revision. The capture is a loopback proof with a
+synthetic accounting store. The public launcher, production broker and TLS peer are exercised by
 the separate sealed guest procedure below.
 
 ## Pinned built-in inventory

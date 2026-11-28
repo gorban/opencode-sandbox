@@ -1,11 +1,14 @@
 """Inert guards for the offline worker-tools proof fixtures."""
 
+from contextlib import closing
 from copy import deepcopy
 from io import StringIO
 import json
 import os
 from pathlib import Path
 import runpy
+import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -17,7 +20,8 @@ sys.path[:0] = [str(ROOT), str(Path(__file__).resolve().parent)]
 
 from oc_openai.session_broker import SessionBroker
 from oc_openai.session_protocol import ReasoningVault, SessionStreamProjector, StreamAborted
-from stock_worker_tools_capture import Terminal, await_idle, verify_scope
+from stock_worker_tools_capture import AUTHORITY, Observer, Terminal, await_idle, capture, verify_scope
+from stock_worker_tools_history import stock_history
 from stock_worker_tools_guest import (
     HOLD_READER, TCP_CONNECT, WIRE, broker_exchange, confirm_foreground, reap_held_child, run_cleanup,
     verify_direct_broker, verify_loopback_listener, verify_outside_candidates, verify_relay_mcs,
@@ -35,6 +39,122 @@ class CaptureGuardTests(unittest.TestCase):
         with patch("stock_worker_tools_capture.socket.if_nameindex", return_value=[(1, "lo"), (2, "eth0")]):
             with self.assertRaisesRegex(FixtureMismatch, "loopback-only"):
                 verify_scope()
+
+    def capture_with_failed_send(self, destination, *, damage=None, after_commit=False):
+        primary = RuntimeError("synthetic send dropped after durable claim")
+        observed = {}
+        history = stock_history([{"type": "message", "role": "user",
+                                  "content": [{"type": "input_text", "text": PROMPT}]}])
+
+        def fail_send(request):
+            self.assertFalse(after_commit, "Ambiguous commit reached first write")
+            observed["dispatch"] = request
+            raise primary
+
+        def fail_after_claim(_predicate, _description, observer):
+            observed["observer"] = observer
+            claim = observer.turns._claim
+
+            def claim_then_fail(request):
+                claim(request)
+                raise primary
+
+            try:
+                with patch.object(observer.turns, "_claim", side_effect=claim_then_fail if after_commit else claim):
+                    observer.turns.dispatch(AUTHORITY, "ses_capture", history, fail_send)
+            finally:
+                observed["rows"] = observer.turns.records()
+                if damage is not None:
+                    damage(observer.turns._path)
+
+        command = ("/unused-stock-fixture",)
+        with patch("stock_worker_tools_capture.PORT", 0), patch("stock_worker_tools_capture.stock_config", return_value={}), \
+                patch.object(Terminal, "start"), patch.object(Terminal, "run"), \
+                patch.object(Terminal, "await_screen", side_effect=fail_after_claim), patch("sys.stderr", StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "synthetic send dropped") as raised:
+                capture(command, destination, "tools")
+        self.assertIs(raised.exception, primary)
+        observer = observed["observer"]
+        self.assertEqual(observer.socket.fileno(), -1)
+        self.assertFalse(observer.turns._path.parent.exists())
+        return primary, observed
+
+    def test_failed_capture_preserves_exact_unresolved_claim_after_scratch_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "failure.json"
+            _, observed = self.capture_with_failed_send(evidence)
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o600)
+            report = json.loads(evidence.read_text())
+            self.assertEqual(report["phase"], "failed")
+            self.assertEqual(report["exposure"], {"status": "verified", "claims": observed["rows"]})
+            (row,) = report["exposure"]["claims"]
+            self.assertEqual(row["sequence"], observed["dispatch"].sequence)
+            self.assertIsNone(row["actual_input"])
+            self.assertIsNone(row["actual_output"])
+
+    def test_failed_capture_snapshots_exact_claim_when_commit_returns_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "failure.json"
+            _, observed = self.capture_with_failed_send(evidence, after_commit=True)
+            self.assertEqual(json.loads(evidence.read_text())["exposure"],
+                             {"status": "verified", "claims": observed["rows"]})
+            row, = observed["rows"]
+            self.assertEqual((row["sequence"], row["actual_input"], row["actual_output"]), (1, None, None))
+
+    def test_failed_capture_preserves_primary_when_scratch_cleanup_raises(self):
+        cleanup = tempfile.TemporaryDirectory.cleanup
+
+        def fail_cleanup(scratch):
+            cleanup(scratch)
+            raise OSError("synthetic scratch cleanup failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "failure.json"
+            with patch.object(tempfile.TemporaryDirectory, "cleanup", fail_cleanup):
+                primary, observed = self.capture_with_failed_send(evidence)
+            self.assertEqual(json.loads(evidence.read_text())["exposure"],
+                             {"status": "verified", "claims": observed["rows"]})
+            self.assertTrue(any("scratch cleanup" in note for note in primary.__notes__))
+
+    def test_failed_capture_closes_observer_only_once(self):
+        close = Observer.server_close
+        closed = []
+
+        def fail_second_close(observer):
+            closed.append(observer)
+            if len(closed) > 1:
+                raise OSError("synthetic duplicate observer close")
+            close(observer)
+
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "failure.json"
+            with patch.object(Observer, "server_close", fail_second_close):
+                _, observed = self.capture_with_failed_send(evidence)
+            self.assertEqual(closed, [observed["observer"]])
+
+    def test_failed_capture_marks_damaged_journal_without_inventing_claims(self):
+        def alter_ledger(path):
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute("UPDATE exposure SET actual_input = 12")
+
+        for damage, status in ((alter_ledger, "corrupt"), (Path.unlink, "unavailable")):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                evidence = Path(directory) / "failure.json"
+                primary, _ = self.capture_with_failed_send(evidence, damage=damage)
+                self.assertEqual(json.loads(evidence.read_text())["exposure"], {"status": status})
+                self.assertIn(f"Synthetic exposure evidence {status}", primary.__notes__)
+
+    def test_failed_capture_never_changes_existing_evidence_leaf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = root / "preserve"
+            existing.write_text("sentinel")
+            evidence = root / "failure.json"
+            evidence.symlink_to(existing)
+            primary, _ = self.capture_with_failed_send(evidence)
+            self.assertTrue(evidence.is_symlink())
+            self.assertEqual(existing.read_text(), "sentinel")
+            self.assertTrue(any("Unable to save secondary evidence" in note for note in primary.__notes__))
 
     def test_capsule_cannot_run_from_checkout(self):
         with self.assertRaisesRegex(RuntimeError, "outside its fixed root-owned"):

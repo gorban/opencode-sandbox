@@ -17,6 +17,9 @@ DEADLINE_SECONDS = 300
 MAX_WRITES = 8
 TOTAL_INPUT = 262_144
 TOTAL_OUTPUT = 32_768
+_EXPOSURE_FIELDS = ("sequence", "authority", "turn", "parent", "suffix", "reserved_input", "reserved_output",
+                    "actual_input", "actual_output")
+_MAX_EXPOSURE_ROW_BYTES = 4096
 HANDOFF_END = b"0\r\n\r\n"
 
 
@@ -101,6 +104,17 @@ class FixtureTurns:
             db.row_factory = sqlite3.Row
             return [dict(row) for row in db.execute("SELECT * FROM exposure ORDER BY sequence")]
 
+    def verified_records(self):
+        """Snapshot bounded durable records after the fixture observer has stopped."""
+        with self._lock, closing(self._connect()) as db:
+            db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _MAX_EXPOSURE_ROW_BYTES)
+            columns = db.execute("SELECT * FROM exposure LIMIT 0").description
+            require(tuple(column[0] for column in columns) == _EXPOSURE_FIELDS, "Wrong stock exposure schema")
+            rows = self._rows(db)
+            unresolved = self._request if rows and rows[-1][-2:] == (None, None) else None
+            self._verify_journal(rows, request=unresolved)
+            return [dict(zip(_EXPOSURE_FIELDS, row, strict=True)) for row in rows]
+
     def _validate_history(self, history):
         require(history.closed == self._closed, "Unverified completed stock history")
         if self._user is None:
@@ -153,27 +167,25 @@ class FixtureTurns:
             request = Dispatch(self._writes + 1, self._turn + (self._user is None),
                                self._eligible.identity if suffix else None, suffix)
             try:
+                # A commit can persist even when its caller sees an error. Keep
+                # the exact candidate for evidence before touching the ledger.
+                self._request = request
                 self._claim(request)
-            except (OSError, sqlite3.Error):
-                self._owner_current = False
-                raise
-            if self._user is None:
-                self._turn = request.turn
-                self._user = history.user
-                self._continuations = 0
-            else:
-                self._continuations += 1
-            self._prefix += suffix
-            if suffix:
-                self._call_ids.update(call.call_id for call in self._eligible.calls)
-            self._writes = request.sequence
-            self._session = session
-            self._eligible = None
-            self._request = request
-            try:
+                if self._user is None:
+                    self._turn = request.turn
+                    self._user = history.user
+                    self._continuations = 0
+                else:
+                    self._continuations += 1
+                self._prefix += suffix
+                if suffix:
+                    self._call_ids.update(call.call_id for call in self._eligible.calls)
+                self._writes = request.sequence
+                self._session = session
+                self._eligible = None
                 self._require_current(authority)
                 return request, start(request)
-            except Exception:
+            except BaseException:
                 self._owner_current = False
                 raise
 

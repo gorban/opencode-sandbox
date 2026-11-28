@@ -62,15 +62,19 @@ class HistoryTests(unittest.TestCase):
     def test_rejects_duplicate_unknown_arguments_wrong_types_result_metadata_and_unmeasured_order(self):
         for arguments in ('{"path":"file","path":"first"}', '{"path":"file","extra":true}',
                           '{"path":"file","offset":true}', '{"path":"file","limit":-1}', '[]'):
-            with self.subTest(arguments=arguments), self.assertRaises(FixtureMismatch):
-                stock_pair(*call_and_result("call", arguments=arguments))
+            with self.subTest(arguments=arguments):
+                call, result = call_and_result("call", arguments=arguments)
+                with self.assertRaises(FixtureMismatch):
+                    stock_pair(call, result)
         call, result = call_and_result("call")
         with self.assertRaises(FixtureMismatch):
             stock_pair(call, {**result, "id": "unmeasured"})
+        reversed_pair = [user("ordinary"), result, call]
         with self.assertRaises(FixtureMismatch):
-            stock_history([user("ordinary"), result, call])
+            stock_history(reversed_pair)
+        duplicate_pair = [user("ordinary"), call, result, call, result]
         with self.assertRaises(FixtureMismatch):
-            stock_history([user("ordinary"), call, result, call, result])
+            stock_history(duplicate_pair)
 
     def test_requires_entire_measured_title_shape(self):
         instructions = "Synthetic exact title instructions"
@@ -118,10 +122,11 @@ class FixtureTurnsTests(unittest.TestCase):
                                    self.send if send is None else send)[0]
 
     def assert_refused(self, match, history=None, **kwargs):
-        before = self.turns.records(), list(self.sent)
+        expected = self.turns.records(), list(self.sent)
         with self.assertRaisesRegex(FixtureMismatch, match):
             self.dispatch(history, **kwargs)
-        self.assertEqual((self.turns.records(), self.sent), before)
+        actual = self.turns.records(), self.sent
+        self.assertEqual(actual, expected)
 
     def stage(self, request, *pairs, usage=(2, 3, 5), message=None):
         return self.turns.settle(AUTHORITY, request, calls=tuple(stock_pair(*pair).call for pair in pairs),
@@ -240,8 +245,9 @@ class FixtureTurnsTests(unittest.TestCase):
                 worker.close()
                 yield b"final"
 
+            frames = lose_peer()
             with self.assertRaises(BrokenPipeError):
-                self.deliver(request, pending, write=broker.sendall, frames=lose_peer())
+                self.deliver(request, pending, write=broker.sendall, frames=frames)
         self.assert_refused("Stale or expired")
         self.assertEqual(self.turns.records()[0]["actual_output"], 3)
 
@@ -276,17 +282,19 @@ class FixtureTurnsTests(unittest.TestCase):
         self.history.extend(pair)
         events = list(response_events(0, {"patchText": "synthetic"}))
         events[-1]["response"]["model"] = "wrong-model"
+        response = SyntheticResponse(encode_sse(events))
+        vault = ReasoningVault()
         projected_writes = []
-        with self.assertRaisesRegex(FixtureMismatch, "Wrong synthetic terminal model"):
-            try:
-                frames, usage = project_stream(SyntheticResponse(encode_sse(events)), ReasoningVault(),
-                                               ("patch",), "resp_local_wrong_model")
-            except FixtureMismatch:
-                self.turns.fail(request)
-                raise
+        try:
+            frames, usage = project_stream(response, vault, ("patch",), "resp_local_wrong_model")
+        except FixtureMismatch as error:
+            self.turns.fail(request)
+            self.assertRegex(str(error), "Wrong synthetic terminal model")
+        else:
             calls, message = terminal_output(frames[-1])
             pending = self.turns.settle(AUTHORITY, request, calls=calls, completed_message=message, usage=usage)
             self.deliver(request, pending, write=projected_writes.append)
+            self.fail("Wrong synthetic terminal model was accepted")
         self.assertEqual(projected_writes, [])
         self.assertIsNone(self.turns.records()[0]["actual_input"])
         self.assertIsNone(self.turns.records()[0]["actual_output"])
@@ -373,17 +381,74 @@ class FixtureTurnsTests(unittest.TestCase):
         self.assertIsNone(record["actual_input"])
         self.assert_refused("Stale or expired")
 
+    def test_commit_error_retains_only_exact_unresolved_claim_after_verified_prefix(self):
+        request = self.dispatch()
+        pair = call_and_result("first")
+        pending = self.stage(request, pair)
+        self.deliver(request, pending)
+        self.history.extend(pair)
+        first, = self.turns.verified_records()
+        claim = self.turns._claim
+        primary = sqlite3.OperationalError("synthetic error after SQLite commit")
+
+        def commit_then_fail(request):
+            claim(request)
+            raise primary
+
+        with patch.object(self.turns, "_claim", side_effect=commit_then_fail):
+            with self.assertRaises(sqlite3.OperationalError) as raised:
+                self.dispatch()
+        self.assertIs(raised.exception, primary)
+        settled, unresolved = self.turns.verified_records()
+        self.assertEqual(settled, first)
+        self.assertEqual(self.turns.records(), [settled, unresolved])
+        self.assertEqual((unresolved["sequence"], unresolved["turn"], unresolved["parent"]),
+                         (2, 1, pending.identity))
+        self.assertEqual(unresolved["suffix"], f'["{stock_pair(*pair).identity}"]')
+        self.assertEqual((unresolved["reserved_input"], unresolved["reserved_output"]), (MAX_INPUT, MAX_OUTPUT))
+        self.assertIsNone(unresolved["actual_input"])
+        self.assertIsNone(unresolved["actual_output"])
+        self.assert_refused("Stale or expired")
+        self.assertEqual(self.sent, [1])
+
+        for field, sequence in (("actual_input", 1), ("reserved_input", 2)):
+            with self.subTest(field=field):
+                with closing(sqlite3.connect(self.path)) as db, db:
+                    db.execute(f"UPDATE exposure SET {field} = ? WHERE sequence = ?", (1, sequence))
+                with self.assertRaisesRegex(FixtureMismatch, "needs reconciliation"):
+                    self.turns.verified_records()
+                with closing(sqlite3.connect(self.path)) as db, db:
+                    exact_value = (settled, unresolved)[sequence - 1][field]
+                    db.execute(f"UPDATE exposure SET {field} = ? WHERE sequence = ?", (exact_value, sequence))
+                self.assert_refused("Stale or expired")
+
+    def test_rolled_back_claim_does_not_invent_a_record_or_allow_retry(self):
+        def rollback(request):
+            with closing(self.turns._connect()) as db, db:
+                db.execute("INSERT INTO exposure VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           self.turns._claimed_row(request))
+                raise sqlite3.OperationalError("synthetic error before SQLite commit")
+
+        with patch.object(self.turns, "_claim", side_effect=rollback):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.dispatch()
+        self.assertEqual(self.turns.verified_records(), [])
+        self.assert_refused("Stale or expired")
+        self.assertEqual(self.sent, [])
+
     def test_overage_is_recorded_and_closes_grant(self):
         request = self.dispatch()
+        pair = call_and_result("a")
         with self.assertRaisesRegex(FixtureMismatch, "exceeded reservation"):
-            self.stage(request, call_and_result("a"), usage=(MAX_INPUT + 1, MAX_OUTPUT, MAX_INPUT + MAX_OUTPUT + 1))
+            self.stage(request, pair, usage=(MAX_INPUT + 1, MAX_OUTPUT, MAX_INPUT + MAX_OUTPUT + 1))
         self.assertEqual(self.turns.records()[0]["actual_input"], MAX_INPUT + 1)
         self.assert_refused("Stale or expired")
 
     def test_batch_count_and_terminal_usage_fail_closed(self):
         request = self.dispatch()
+        pairs = [call_and_result(f"call{i}") for i in range(MAX_BATCH + 1)]
         with self.assertRaisesRegex(FixtureMismatch, "terminal output"):
-            self.stage(request, *[call_and_result(f"call{i}") for i in range(MAX_BATCH + 1)])
+            self.stage(request, *pairs)
         self.assert_refused("Stale or expired")
         self.assertIsNone(self.turns.records()[0]["actual_input"])
 
