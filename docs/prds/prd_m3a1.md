@@ -218,7 +218,12 @@ and components stay as they are. This is a Wave 0 item in the
       field-level differences, security triggers, and for workflows the diagram before and after
       ([M3 §7](prd_m3.md#7-settings-proposed-changes-and-operator-only-secret-entry)).
 - [ ] **Settings.** Effective values with their source, provider instances and their state, and
-      the form editor for non-secret settings.
+      the form editor for non-secret settings, if the
+      [configuration editing decision](prd_j.md#later-configuration-and-editor) chooses it.
+- [ ] **Browser view.** The observe-only view of a sandbox's browser: the confined frame, the
+      sanitised address, and the connection badge while internal HTTPS is not in place
+      ([M3 §5](prd_m3.md#5-unified-embedded-sandbox-browser-views-opt-in-zero-separate-chrome-windows)).
+      It is a Wave 2 gate in the [delivery order](prd_m.md#wave-2-widen).
 - [ ] **Secret entry.** The operator-only surface for entering a secret, with the slot it fills,
       who asked, and the set or not-set state afterwards. It uses the security frame and is
       hidden from the agent bridge.
@@ -228,22 +233,17 @@ and components stay as they are. This is a Wave 0 item in the
       from it ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
 - [ ] Add each new screen to the states sheet and the hostile-content specimen, and run the
       WCAG 2.2 AA audit on it.
-- [ ] (decision needed) **Process for the supplement.** Time estimates are rough.
-  - **One design extending the locked system, with operator review and an audit
-    (recommended).** The visual language is already chosen, so the open questions are layout and
-    content. Fast, and consistent with the lock. No independent alternatives to compare.
-    ~2–3 days.
-  - **A full council round for the workflow screens only.** Independent attempts where the
-    design is least settled. More operator time, and a risk that attempts drift from the locked
-    system. ~4–6 days.
-  - **A full council round for every new screen.** The most alternatives. The slowest, and most
-    of the settings and secret-entry layout follows from existing components. ~1–2 weeks.
-  - **Design the new screens directly as Storybook stories**, once the
-    [frontend foundation](prd_m3a3.md) exists. The designed artifact is then the one that is
-    tested and integrated, with no second mockup to rebuild
-    ([consistency rules](prd_m3a3.md#stories-match-the-app)). It cannot start until the
-    foundation and the presentational primitives exist, and it gives no independent attempts to
-    compare. It can be combined with the first option. ~2–4 days after the foundation.
+- [x] **Process for the supplement.** Decided by the operator on 2026-11-28: a council round
+      for the workflow screens, and one design for the rest. Time estimates are rough.
+  - **Workflow list, workflow definition and workflow run: a full council round.** Independent
+    attempts where the design is least settled. Every attempt extends the locked system and may
+    not change its tokens, trust vocabulary, tiers or components, which guards against drift.
+    These three screens are the ones Wave 1 needs, so this round runs first. ~4–6 days.
+  - **Change review, settings, secret entry and the browser view: one design extending the
+    locked system**, with operator review and an audit. Their layout mostly follows from
+    existing components. They are needed in Waves 2 and 3. ~2–4 days.
+  - Considered and not chosen: one design for every screen, a council round for every screen,
+    and designing the screens directly as Storybook stories.
 
 ## Design selection process
 

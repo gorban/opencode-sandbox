@@ -198,7 +198,8 @@ Only after admission succeeds (auto-admitted effect-allowlisted `observe_only` o
      migrations (matching [prd_n](prd_n.md) Trap T10 and preventing any caller from silently
      downgrading an operator-owned supervisor; `-o` may never initiate or migrate an
      operator-owned run). Fresh `observe_only` starts remain governed by §5 below, and daemon
-     restart UX remains governed by the open restart decision in §5;
+     restart behaviour is governed by the
+     [restart decision](#concrete-checkboxes-and-open-decisions), settled on 2026-11-28;
    - **Full quiescent safe-point** across **all** outstanding effects—zero in-flight `oc_hub`
      outbox dispatches, zero in-flight `/decisions/*` or blind-check upstream requests, zero firing
      timers, and zero unresolved `workflow_awakeables` or pending human decisions;
@@ -296,6 +297,10 @@ single-writer ACID transactions as `oc_hub` outbox & revocation tombstones):
     **only** on `-o`-owned runs (or signals explicitly listed in
     `WorkflowRunLease.allowed_orchestrator_signals`)—never disabling an operator-launched
     `fleet_supervisor` watching `-o`'s subtree.
+  - `workflow_resume` from `-o` **fails closed** on a run in
+    `paused (lease_reconfirm_required)`, including an `-o`-owned one. After a restart only the
+    operator's Tier A approval resumes such a run
+    ([restart decision](#concrete-checkboxes-and-open-decisions)).
 - **Coordinated `oc_coord_contract.py` extensions (`CoordRole.WORKFLOW` & `msg_kind = "nudge"`):**
   Explicitly extends `oc_coord_contract.py` ([prd_m2](prd_m2.md)) with `CoordRole.WORKFLOW` mapping
   to `TrustClass.SYSTEM_ALERT` and `msg_kind = "nudge"`. `SYSTEM_ALERT` / `"nudge"` is strictly
@@ -432,16 +437,34 @@ for the crew pipeline.
       outstanding-effects safe-point, unconditional Tier-A `(new_spec_digest,
       new_grant_generation)` re-authorization on every live migration, and late tool-result
       re-verification fence.
-- [ ] **(decision needed)** Restart behavior for active `nudge_bounded` / metered workflows after
-      `oc_daemon` restart (Trap T13):
-  - **Option A (Recommended):** `observe_only` runs auto-resume; active/metered runs boot into
+- [x] Restart behavior for active `nudge_bounded` / metered workflows after
+      `oc_daemon` restart (Trap T13). **Decided by the operator on 2026-11-28: Option A for the
+      first slice.** It also covers the crew pipeline's run lease. Option B is not rejected. It
+      is a Wave 3 decision in the [delivery order](prd_n.md#wave-3-later), to be taken once
+      unattended overnight runs are real, and it still needs its own Gate 1 review.
+  - **Option A (chosen):** `observe_only` runs auto-resume; active/metered runs boot into
     `paused (lease_reconfirm_required)` and present a **single batched "Resume N paused workflows"
-    card** in `Approval Inbox (Tier A)`.
+    card** in `Approval Inbox (Tier A)`. As chosen, it carries these rules:
+    - **Every run that is not `observe_only` pauses**, including one with no model spend, such
+      as the synthetic crew pipeline in Wave 1.
+    - **The approval is bound to what the card shows.** For each run the card lists the
+      `run_id`, the workflow, the pinned `spec_digest` and `workflow_plan_digest`, the owner
+      role, the autonomy level and the limits that remain. Approving resumes exactly that set.
+    - **Each resumed run gets a fresh `grant_generation`.** No grant from before the restart is
+      reused.
+    - **Changed or unsettled runs stay paused.** A run stays paused, and is shown apart from
+      the batch, if its pinned digests no longer match, if it has outstanding effects that have
+      not settled, or if it changed after the card was shown.
+    - **The degraded-store gate comes first.** While `.coord_degraded` is set the card cannot
+      be approved, and nothing resumes until `confirm_recovery()` has completed.
+    - **Only the operator resumes.** The approval is a `Role.OPERATOR` action in Trusted Chrome.
+      `workflow_resume` from `-o` refuses a run in this state.
     - *Pros:* Preserves `prd_m2`'s strict invariant that controller restarts invalidate prior grant
       generations; one click resumes the whole fleet cleanly.
     - *Cons:* Overnight host reboot requires one morning click before auto-nudges resume.
     - *Effort:* ~0.5 days.
-  - **Option B:** Allow an explicit opt-in `durable_auto_resume = true` flag on `WorkflowRunLease`
+  - **Option B (deferred to Wave 3):** Allow an explicit opt-in `durable_auto_resume = true`
+    flag on `WorkflowRunLease`
     (operator-signed, bounded by `expires_at` and hard spend/nudge ceilings) for unattended
     overnight runs.
     - *Pros:* Survives unattended daemon restarts overnight without manual resume.

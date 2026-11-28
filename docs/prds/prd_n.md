@@ -194,7 +194,7 @@ or is a **non-negotiable baseline invariant**:
 | **T10** | **Long-running workflow migration, restart & outstanding-effect settlement** | Running instances pin immutable `spec_digest` (`workflow_spec_snapshots`). **Every** live migration to a new digest unconditionally requires fresh **Tier-A** authority (`WorkflowRunLease`) bound to `(new_spec_digest, new_grant_generation)` (no `observe_only` carve-out on live migration) at a full quiescent safe-point (zero in-flight outbox dispatches, `/decisions/*` or blind-check calls, firing timers, or pending awakeables/decisions), invalidating stale callbacks. Apply `prd_m1` durable first-write & uncertain-outcome settlement to all supervision calls; re-verify lease, incarnation, lane ownership, and `InputLease` before any late tool result acts. | **Mandatory durability & security invariant**; **Runtime Approval Inbox (Tier A)** required for config revision (`config_propose_revision`) and **every** live migration to a new digest. | [prd_n1](prd_n1.md) |
 | **T11** | **Reference-verdict sampling, abstentions & cap-drop bias** | Run scheduled blind audits only on active lanes under a reserved non-starvable fleet audit floor; label blind-model output as **reference verdict** (not infallible ground truth); track actual inclusion rates, cap drops/delays, abstentions, and explicit strata (`triggered_leading`, `triggered_trailing`, `scheduled_audit_uniform`, `scheduled_audit_near_threshold`) before policy tuning. | **Design decision needed** on default audit cadence & optional near-threshold stratification. | [prd_n2](prd_n2.md#concrete-checkboxes-and-open-decisions) |
 | **T12** | **Classifier drift calibration, unapproved outbound replay rubric, unleased replay spend & Tier-B grant escalation** | Default is **human-triggered only**: drift posts a non-blocking **Human Inbox (Tier B)** alert; candidate tuning is prepared **locally offline first** via pure `compile_workflow_plan()` (zero upstream calls); requesting replay creates a **Tier-A `Approval Inbox` proposal** (Tier B has zero grant authority) displaying the exact outbound `rubric`/`choices` and binding `(requesting_principal, run_id, candidate_spec_digest, candidate_rubric_digest, sample_scope, route/model, disclosure policy, call/spend caps, expiry)` in `CalibrationReplayGrant` **before** any paid replay (any rubric/choice edit requires fresh Tier-A approval). Subsequent config edits require a separate **Tier-A** `config_propose_revision` approval. | **Requires Tier-A Approval Inbox grant** (`CalibrationReplayGrant` bound to exact outbound rubric/choices digest) prior to paid replay **plus** separate **Tier-A Approval Inbox** grant for any config mutation. | [prd_n2](prd_n2.md), [prd_n3](prd_n3.md) |
-| **T13** | **Daemon restart re-authorization, degraded-store halt & budget exhaustion** | `observe_only` runs auto-resume (effect-allowlisted, concurrency/rate-capped); active/metered runs pause on restart for a batched **"Resume N paused workflows"** card in **Approval Inbox (Tier A)**. Any `.coord_degraded` / unclean-shutdown state halts `WorkflowEngine` completely until `confirm_recovery()`. Spend exhaustion falls back to Tier-0 deterministic monitoring + Tier-B notice; late results re-verify active lease/incarnation/lane/human-lease regardless of restart UX. | **Runtime Approval Inbox (Tier A)** after restart unless user explicitly opts into a scoped durable lease policy (**Design decision needed**). | [prd_n1](prd_n1.md#concrete-checkboxes-and-open-decisions) |
+| **T13** | **Daemon restart re-authorization, degraded-store halt & budget exhaustion** | `observe_only` runs auto-resume (effect-allowlisted, concurrency/rate-capped); active/metered runs pause on restart for a batched **"Resume N paused workflows"** card in **Approval Inbox (Tier A)**. Any `.coord_degraded` / unclean-shutdown state halts `WorkflowEngine` completely until `confirm_recovery()`. Spend exhaustion falls back to Tier-0 deterministic monitoring + Tier-B notice; late results re-verify active lease/incarnation/lane/human-lease regardless of restart UX. | **Runtime Approval Inbox (Tier A)** after restart. Decided 2026-11-28: every run that is not `observe_only` pauses and waits for an operator approval bound to the displayed runs. An opt-in durable lease is a Wave 3 decision. | [prd_n1](prd_n1.md#concrete-checkboxes-and-open-decisions) |
 | **T14** | **SQLite metrics write amplification & container-probe thrash** | Aggregate high-frequency telemetry in memory inside `oc_daemon` and flush rolled-up buckets to `metrics_rollups` every `5–10s` (pruned ring). Run containerized `safe_run` git probes lazily/on-demand (per-lane concurrency `1`, hard timeout) rather than every `60s` tick. | **Mandatory implementation invariant**. | [prd_n2](prd_n2.md) |
 
 ---
@@ -223,7 +223,8 @@ desktop surfaces explicitly depend on completing the open upstream slices:
 
 Wave 1 of the [delivery order](#delivery-order) is a local, synthetic slice. From the list above
 it needs the joint local transport proof and Trusted Host Chrome. It does not need live provider
-routes or SSH onboarding, provided the operator confirms the synthetic route. Live and remote
+routes or SSH onboarding. The operator confirmed the synthetic route on 2026-11-28. One live run
+of the pipeline follows in Wave 2 once a live route is accepted. Full live and remote
 qualification of the same pipeline still depends on every item above.
 
 - [*] **N0 — PRD N Gate 1 design & security review** (`prd_n.md`, `prd_n1.md`, `prd_n2.md`,
@@ -284,13 +285,16 @@ Direction recorded:
       [Reserved: Dashboard design.]
 - [ ] Reciprocal review of this PRD and its children, the open part of N0.
       [Reserved: PRD N workflows & supervision.]
-- [ ] Settle the decisions the built-in crew pipeline needs, and only those:
-  - the [initial slice scope](#open-top-level-decisions);
-  - the [restart behaviour](prd_n1.md#concrete-checkboxes-and-open-decisions) for active runs,
-    because the pipeline holds a run lease;
-  - the operator's confirmation of the synthetic model route for Wave 1;
-  - design and security review of the workflow list, definition and run views
-    ([prd_n3 §4](prd_n3.md#4-workflow-views-and-change-review)).
+- [ ] Settle the decisions the built-in crew pipeline needs, and only those. The operator
+      settled the first three on 2026-11-28. The review is still open.
+  - [x] The [initial slice scope](#open-top-level-decisions): `workflow@1` from the start,
+        pipeline first.
+  - [x] The [restart behaviour](prd_n1.md#concrete-checkboxes-and-open-decisions) for active
+        runs, because the pipeline holds a run lease: pause, and resume with one approval.
+  - [x] The model route for Wave 1: synthetic, with one live run in Wave 2.
+  - [ ] Design and security review of the workflow list, definition and run views
+        ([prd_n3 §4](prd_n3.md#4-workflow-views-and-change-review)). The screens come from the
+        council round in the [design supplement](prd_m3a1.md#design-supplement).
 
 The other open decisions in this PRD and its children do not block Wave 1. Each is settled
 before the wave that uses it:
@@ -300,15 +304,24 @@ before the wave that uses it:
   tier and audit sampling ([prd_n2](prd_n2.md#concrete-checkboxes-and-open-decisions)); overlays
   outside a run ([prd_n3](prd_n3.md#concrete-checkboxes-and-open-decisions)).
 - Wave 3: the runtime for
-  [authored steps](prd_n1.md#authoring-surface-and-authored-deterministic-steps).
+  [authored steps](prd_n1.md#authoring-surface-and-authored-deterministic-steps), and whether a
+  run lease may opt in to unattended resume after a restart
+  ([prd_n1](prd_n1.md#concrete-checkboxes-and-open-decisions)).
 
 ### Wave 1: thin live slice
 
-Parallel once Wave 0 lands. Control-plane items for this wave are in
-[prd_m](prd_m.md#wave-1-thin-live-slice), with the shared finish line. This wave starts only
-after the shared frontend qualification has passed. The finish line is then defined for both
-outcomes of the Tauri qualification: the Tauri app if it passes, the authenticated loopback
-dashboard if it fails. The items below are the same either way.
+Control-plane items for this wave are in [prd_m](prd_m.md#wave-1-thin-live-slice), with the
+shared finish line. The streams do not all start together, as that section sets out:
+
+- The host and backend items below start when their own prerequisites pass: the N0 reciprocal
+  review, the decisions settled in Wave 0, and each item's Gate 1 review. They do not wait for
+  the frontend.
+- The workflow views are UI. They wait for the frontend foundation, the reviewed contract and
+  the screens from the design supplement.
+
+The finish line needs all of them. It is defined for both outcomes of the Tauri qualification:
+the Tauri app if it passes, the authenticated loopback dashboard if it fails. The items below
+are the same either way.
 
 - [ ] A minimal statechart kernel: the part of [N1](prd_n1.md) the pipeline needs. That is the
       schema and pure compile for `deterministic`, `ship_lane` and `human_gate_async` stages,
@@ -320,10 +333,30 @@ dashboard if it fails. The items below are the same either way.
 - [ ] The Human Inbox store, read projection and resolve path with the display-bound checks
       ([prd_n3 §1](prd_n3.md#1-three-tier-human-inbox-strict-separation-from-oc_controller-approvals)).
 - [ ] Workflow list, definition and run views
-      ([prd_n3 §4](prd_n3.md#4-workflow-views-and-change-review)).
+      ([prd_n3 §4](prd_n3.md#4-workflow-views-and-change-review)). UI: these wait for the
+      frontend foundation.
 
 ### Wave 2: widen
 
+- [ ] One live run of the minimal crew pipeline, as soon as a live route is accepted
+      ([prd_i4](prd_i4.md)): the same definition. It does not hold up the other items in this
+      wave. The route itself is reserved to Outside-in integrations. A live run sends content to
+      an outside provider and spends real quota, so all of these hold before it starts:
+  - **The exact qualified route.** The run names the provider instance, model, placement and
+    capability that passed live acceptance, and a reviewer route policy: either its own
+    qualified route, or an explicit statement that it shares the implementor's. Nothing is
+    substituted at run time.
+  - **A fresh live plan.** The definition is compiled again through the host `ModelCatalog`
+    with the live route and its limits bound in, which gives a new `workflow_plan_digest`. A
+    synthetic plan is never switched to a live route.
+  - **A fresh Tier A lease.** The operator approves a new `WorkflowRunLease` for that digest,
+    showing what is exposed to the provider and carrying hard spend and turn limits. The
+    approval for the synthetic run does not carry over.
+  - **A scratch workspace.** The run works on a workspace made for it, holding no private
+    repository content and no secrets.
+  - **Brokered credentials and egress controls.** The worker gets its credential through the
+    broker ([prd_i3](prd_i3.md), [prd_i3a](prd_i3a.md)), and the request controls for that
+    provider apply ([prd_m1](prd_m1.md)).
 - [ ] The fleet supervisor, observe-only first: host metrics, the classifier route, the
       throttler and the blind check ([prd_n2](prd_n2.md)).
       [Reserved: PRD N workflows & supervision.]
@@ -336,10 +369,15 @@ dashboard if it fails. The items below are the same either way.
 ### Wave 3: later
 
 - [ ] Bounded nudging on live routes, calibration and replay ([prd_n2](prd_n2.md)).
+      [Reserved: PRD N workflows & supervision.]
 - [ ] Live providers and remote workers ([prd_i4](prd_i4.md), [prd_i2](prd_i2.md)).
       [Reserved: Outside-in integrations.]
 - [ ] The spike for authored deterministic steps
       ([prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps)).
+      [Reserved: PRD N workflows & supervision.]
+- [ ] Decide whether a run lease may opt in to unattended resume after a restart
+      ([prd_n1](prd_n1.md#concrete-checkboxes-and-open-decisions)), once unattended overnight
+      runs are real. [Reserved: PRD N workflows & supervision.]
 
 ### Shared blockers and decisions
 
@@ -350,8 +388,19 @@ Decisions:
 - Shell order: [prd_m control-plane decision](prd_m.md#control-plane-decision), settled by the
   [tech-stack spike](prd_m3b.md#tech-stack-spike).
 - How much of the UI is built on UI SDK primitives: [prd_m3a2](prd_m3a2.md#open-decision).
-- Process for the design supplement: [prd_m3a1](prd_m3a1.md#design-supplement).
-- Frontend conventions and development add-ons: [prd_m3a3](prd_m3a3.md#open-decisions).
+- Process for the design supplement, decided: a council round for the three workflow screens
+  and one design for the rest ([prd_m3a1](prd_m3a1.md#design-supplement)).
+- Frontend code home and development add-ons, decided:
+  [prd_m3a3](prd_m3a3.md#code-home) and [prd_m3a3](prd_m3a3.md#open-decisions).
+- How OpenCode agents get the Svelte tooling: open, and for the owners of
+  [prd_b](prd_b.md) and [prd_l](prd_l.md) to review
+  ([prd_m3a3](prd_m3a3.md#open-decisions)). It does not block seeding.
+- Model route for the first slice, decided: synthetic in Wave 1, then one live run in Wave 2.
+- Engine under the first slice, decided: `workflow@1` from the start, pipeline first
+  ([prd_n](prd_n.md#open-top-level-decisions)).
+- Restart behaviour for active runs, decided for Wave 1: pause and resume with one approval.
+  Opt-in unattended resume is a Wave 3 decision
+  ([prd_n1](prd_n1.md#concrete-checkboxes-and-open-decisions)).
 - Workflow authoring surface and authored deterministic steps:
   [prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps).
 - Configuration editing interface: [prd_j](prd_j.md#later-configuration-and-editor).
@@ -371,11 +420,11 @@ Dependencies owned elsewhere:
 
 ## Open top-level decisions
 
-- [ ] **(decision needed)** Initial implementation slice scope:
-  - *Operator direction, 2026-11-28:* the first example is the minimal crew pipeline, built as a
-    `workflow@1` statechart with built-in actions, ahead of the supervisor
-    ([delivery order](#delivery-order)). That is Option 1's approach with its sequence
-    reversed. The choice between the options below is still to be confirmed.
+- [x] Initial implementation slice scope. **Decided by the operator on 2026-11-28: Option 1
+      with its sequence reversed.** The first example is the minimal crew pipeline, built as a
+      `workflow@1` statechart with built-in actions on a minimal kernel. The supervisor follows
+      in Wave 2 on the same kernel ([delivery order](#delivery-order)). Option 2 and Option 1
+      in its original order were considered and not chosen.
   - **Option 1 (Recommended):** Build **N1 + N2 + N3** in vertical phased PRs, starting with the
     minimal `workflow@1` runner + `builtin/firstmate-supervisor` + `Human Inbox` + `/decisions/*`
     + metrics, then expanding general multi-stage `workflow@1` statecharts (`builtin/prd-delivery-pipeline`)

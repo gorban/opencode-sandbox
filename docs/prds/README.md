@@ -52,8 +52,10 @@ reservation explicitly in this index.
 
 - [*] Delivery order for the dashboard and workflows: the wave plan in
   [prd_m](prd_m.md#delivery-order) and [prd_n](prd_n.md#delivery-order), the new
-  [M3a3](prd_m3a3.md) frontend foundation, and the sections it added to M3, M3a1, M3b, N1, N3
-  and J — **Delivery planning** (`spike-prd-n3-workflow-poc`).
+  [M3a3](prd_m3a3.md) frontend foundation, and the sections and notes it added to M3, M3a,
+  M3a1, M3a2, M3b, N1, N3, J and K and to the
+  [dashboard design README](spikes/m/dashboard-design/README.md) — **Delivery planning**
+  (`spike-prd-n3-workflow-poc`, then `plan-wave0-code-home`).
   This reserves the plan text only. A `[ ]` in a wave list tracks delivery order. It does not
   open or release a reservation. Scope already reserved above keeps its owner when a wave list
   repeats it as an unchecked task, including N0–N2, the M first PoC and M3 projection, the
@@ -62,6 +64,17 @@ reservation explicitly in this index.
   made at the operator's direction and wait for those owners' reciprocal review.
   Acknowledgments still open: **Dashboard design**, **PRD M coordination**, **PRD N workflows &
   supervision**.
+- [ ] Frontend foundation: Wave 0 steps 1 to 5
+  ([prd_m](prd_m.md#wave-0-prove-and-decide), [M3a3](prd_m3a3.md)) — open. The workstream that
+  takes it marks this line `[*]` and adds its name and branch. It alone edits the shared files
+  of `apps/dashboard/` listed under the [code home](prd_m3a3.md#code-home), and it owns the
+  typed client in `apps/dashboard/src/lib/client/`.
+- [ ] Shared UI contract and fixture set
+  ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)) — open. The workstream that takes it
+  marks this line `[*]` and adds its name and branch. It owns
+  `apps/dashboard/src/lib/contract/` and `apps/dashboard/src/lib/fixtures/`. It drafts in its
+  own branch from the start and merges into `apps/dashboard/` only after the base is seeded
+  (step 2). The client is built on its work in step 5.
 
 Coordinate SSH fixtures and remote acceptance with **Warm worker seeding**
 (`codex/warm-worker-seeding`). That workstream owns [I5](prd_i5.md) warm-start
