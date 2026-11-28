@@ -1,0 +1,138 @@
+{
+ "audit": {
+  "standard": "WCAG 2.2",
+  "targetLevel": "AA",
+  "application": "oc-sandbox operator dashboard (prototype build final-763cbac)",
+  "page": "Operator process: fleet, thread, approvals, inbox, signin, confirm, states",
+  "url": "http://127.0.0.1:8765/fleet.html",
+  "pages": [
+   {
+    "id": "fleet",
+    "url": "http://127.0.0.1:8765/fleet.html"
+   },
+   {
+    "id": "thread",
+    "url": "http://127.0.0.1:8765/thread.html"
+   },
+   {
+    "id": "approvals",
+    "url": "http://127.0.0.1:8765/approvals.html"
+   },
+   {
+    "id": "inbox",
+    "url": "http://127.0.0.1:8765/inbox.html"
+   },
+   {
+    "id": "signin",
+    "url": "http://127.0.0.1:8765/signin.html"
+   },
+   {
+    "id": "confirm",
+    "url": "http://127.0.0.1:8765/confirm.html"
+   },
+   {
+    "id": "states",
+    "url": "http://127.0.0.1:8765/states.html"
+   }
+  ],
+  "colourSchemes": [
+   "light",
+   "dark"
+  ],
+  "date": "2026-11-26",
+  "method": "Chromium 155 headless driven with puppeteer-core running the skill's probes.js unchanged (collect + interactive phase), with supplementary focus-cover, clip and overlap probes. The chrome-devtools MCP browser was unavailable (profile locked by another session).",
+  "previousAudit": "audits/final-773e1c5/reports/wcag-issues.json",
+  "changedSincePreviousAudit": [
+   "app.css (States sheet .pair__cols container query moved after its base rule; .notice__actions .btn may wrap)",
+   "DESIGN.md (Polish 3 note)"
+  ],
+  "scopeNotes": [
+   "Level A + AA only (55 criteria). AAA not assessed. 4.1.1 Parsing excluded (removed in WCAG 2.2).",
+   "Seven screens audited as one process, each in light and dark, at 1280x800, 640x400 (200%) and 320x256 (400%), plus 320x568, 400x300 and 900x700 where layouts change.",
+   "Only app.css and DESIGN.md differ from final-773e1c5; the full sweep was re-run to catch regressions.",
+   "Text spacing was applied with a constructable stylesheet because the CSP (style-src 'self') blocks the <style> element probes.js injects.",
+   "chrome-devtools MCP not used: its profile was held by Chromium from another running MCP session. Landmarks read from the DOM; HTML unchanged since final-773e1c5 where the MCP tree confirmed them.",
+   "No screen reader or speech-input software was run; semantics verified in the accessibility tree.",
+   "Not sampled in depth: diff.html, catalog.html, index.html, thread-2..thread-7 (titles, cross-page consistency, and catalog .surfs reflow only).",
+   "final-763cbac/ is a read-only generated snapshot: make any fixes in the generator source, not in that folder."
+  ]
+ },
+ "summary": {
+  "byStatus": {
+   "fail": 0,
+   "needsReview": 1,
+   "pass": 43,
+   "notApplicable": 11
+  },
+  "bySeverity": {
+   "critical": 0,
+   "serious": 0,
+   "moderate": 0,
+   "minor": 0
+  },
+  "conforms": null,
+  "note": "Counts cover the 55 Level A + AA criteria and match the coverage table in the HTML report. No failures. The 1.4.10 failure from final-773e1c5 is fixed and no regressions were found. Conformance can be claimed once 2.2.1 (backend time limits) is confirmed; not verified with assistive technology."
+ },
+ "previousFailuresRetested": {
+  "1.4.10": "fixed: .pair__cols is one 296 px column at 320 px; 0 px card overflow at 320x568 and 320x256, with and without WCAG text spacing (was 47 / 81 px); still two columns at 1280 px"
+ },
+ "resolvedByInteractivePhase": {
+  "toPass": {
+   "1.4.10": "Fixed: States sheet pairs stack at 320 px; 0 px card overflow with and without text spacing (was 47 / 81 px)",
+   "1.4.12": "Text spacing at 320, 640 and 1280 px: no States card collisions left; two pre-existing few-pixel spills lose no text (A6)",
+   "2.5.8": "Re-measured the wrapped notice buttons: 28 px tall (30 px with spacing); 0 undersized targets in 14 bundles",
+   "2.4.11": "Slow walks (650 ms per stop) at 11 page/size cases: no control obscured; States 320×256 now fully clear",
+   "2.4.3": "Clear filters still lands on \"Open local / review-auth\"",
+   "1.4.13": "Bridge tooltip: hoverable, shown after 3 s, hidden by Escape with pointer on trigger or tip",
+   "2.1.1 / 2.1.2": "Tree, tabs, menus, picker, drawers, dialog operated by keyboard; all 42 walks cycle",
+   "2.5.2": "Press on Confirm, drag off, release: no confirmation",
+   "3.2.2": "Worker select and status boxes filter in place (replaceState only)",
+   "3.3.1 / 3.3.3": "Empty code: alert text, aria-invalid, focus back to the field",
+   "1.4.4": "Zoom 2 at 1280×800 and 640×400: no horizontal scroll or clipping on any page"
+  },
+  "toFail": {}
+ },
+ "issues": [],
+ "needsReview": [
+  {
+   "criterion": "2.2.1",
+   "title": "Timing Adjustable",
+   "level": "A",
+   "blocked": "session/app-level",
+   "whatToReview": "Approval expiry (\"expires 19:30 CST\", \"expires 16:30 CST\") and session expiry (the \"Session expired\" sign-in state) in the product: can the operator turn off, adjust or extend each limit with at least 20 seconds' warning, or does an exception (essential, real-time, longer than 20 hours) apply?",
+   "whyOpen": "This prototype shows both limits but runs neither; their lengths come from the backend. The 750 ms arming delay and 3 s cooldown are safety holds, not time limits on the user.",
+   "howToConfirm": "Leave an approval open near its expiry and leave a session idle. Pass if a warning gives at least 20 seconds and a simple way to extend (at least 10 times), or the limit is adjustable, off, essential, or longer than 20 hours. Fail if it expires silently."
+  }
+ ],
+ "advisories": [
+  {
+   "id": "A1",
+   "note": "Comfortable sizing at 320 px: header, main and footer are 328 px wide in a 320 px viewport; the right 8 px is clipped (pre-existing).",
+   "evidence": "evidence/fleet-light-320-comfortable.png"
+  },
+  {
+   "id": "A2",
+   "note": "Inbox drawer open with a tooltip showing: one Escape closes the drawer and the tooltip comes back (focus moves to main and re-enables tips); a second Escape hides it."
+  },
+  {
+   "id": "A3",
+   "note": "Tooltips linger 400 ms (--dur-tip) after focus leaves; rapid Tab at 320x256 can briefly cover most of the next focused control (Cancel, Confirm)."
+  },
+  {
+   "id": "A4",
+   "note": "While a request waits below 60rem the Workspace menu button is live but does nothing (sidebar is inert); the skip link targets the inert main."
+  },
+  {
+   "id": "A5",
+   "note": "The alertdialog's aria-describedby points at a region with aria-label \"Request details\", so its description is that label rather than the request text."
+  },
+  {
+   "id": "A6",
+   "note": "With WCAG text spacing: a.tier.tier--b \"Human Inbox 3\" runs 4 px past a 320 px viewport (right border cut, text intact); sidebar a.pages__link \"Confirm gate\" label runs 6 px past its current-page highlight. No content lost (pre-existing).",
+   "evidence": [
+    "evidence/fleet-light-320x256-textspacing-header.png",
+    "evidence/confirm-light-1280-textspacing-pages.png"
+   ]
+  }
+ ]
+}

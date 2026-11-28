@@ -38,8 +38,9 @@ def check(label, result):
     checks += 1
     print('PASS ' + label, flush=True)
 
-def secret(name, data):
-    r = run(['secret', 'create', name, '-'], input=data)
+def secret(name, data, *, owner=None):
+    labels = ['--label', 'oc.sandbox=1', '--label', f'oc.instance={owner}'] if owner else []
+    r = run(['secret', 'create', *labels, name, '-'], input=data)
     sid = r.stdout.strip()
     if not sid:
         raise RuntimeError('secret creation returned no ID')
@@ -111,7 +112,8 @@ def main(scratch):
     script = scratch / 'exercise.sh'
     shell_functions = '\n'.join(source_function(n) for n in (
         'in_sb', 'trusted_path', 'host_input', 'inspect_pg_init',
-        'pg_sig', 'urlenc', 'pgpass_field', 'create_pg_auth_secrets', 'ensure_postgres',
+        'secret_name_inventory', 'secret_ownership', 'pg_secret_replace_flag', 'preflight_pg_secrets', 'create_pg_secret',
+        'pg_sig', 'urlenc', 'pgpass_field', 'create_pg_auth_secrets', 'postgres_container_metadata', 'ensure_postgres',
     ))
     script.write_text('''#!/usr/bin/env bash
 set -euo pipefail
@@ -207,7 +209,7 @@ agent_pg_passfile
     wrong_id = secret(pass_name, '127.0.0.1:5432:pgtest:pgtest:wrong-fixture-password\n')
     check('plain relaunch rejects replaced passfile secret', verify_passfile().returncode != 0)
     run(['secret', 'rm', wrong_id])
-    secret(pass_name, f'127.0.0.1:5432:{db}:{user}:{esc}\n')
+    secret(pass_name, f'127.0.0.1:5432:{db}:{user}:{esc}\n', owner=prefix)
     check('plain relaunch accepts restored passfile secret', verify_passfile().returncode == 0)
     run(['exec', prefix + '-postgres', 'psql', '-X', '-h', '/var/run/postgresql', '-U', user, '-d', db, '-c', 'CREATE TABLE oc_pgtest_marker (id integer)'])
     # Verify the actual private passfile mount and TCP login in a separate container in the pod.

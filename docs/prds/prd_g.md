@@ -18,5 +18,13 @@ docker-in-docker, implemented in PR #2).
       sandbox escape, authentication bypass, credential disclosure or data loss; it was non-blocking
       at P1/P2 severity. Add a deterministic two-launch stub regression and real same-instance check;
       cover owner death and the create-to-start gap without holding a shared lock for the session.
+- [x] Global `-d -a` confirms that each volume and secret is gone. If one may remain, or the
+      inventory cannot be listed, it still finishes the other steps, keeps the state and the
+      installation binding so the same command can be retried, and exits with an error. Stubbed
+      regressions cover a failed removal, a resource that survives its removal, and failed listings
+      (`fix/global-teardown-status`).
+- [x] Global storage purge verifies ownership before removal, never forces volume removal, and
+      retains the installation binding when legacy storage or an incomplete inventory needs manual
+      attention. New Postgres secrets carry ownership labels (`fix/global-teardown-status`).
 
 - [ ] **Human review**: checked only when the user says so
