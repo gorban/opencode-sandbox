@@ -230,7 +230,10 @@ minimal crew pipeline come first.
 - [ ] Expose `workflow_*`, `metrics_*`, `fleet_bearings_snapshot`, `inbox_*`, `dashboard_*`, and
       `calibration_*` MCP tools on `-o`'s private UDS RPC server (`oc_coord_rpc.py` /
       `oc_config_mcp.py`).
-- [ ] Build Trusted Host Chrome views for [M3a loopback](prd_m3a.md), then [M3b Tauri](prd_m3b.md):
+- [ ] Build Trusted Host Chrome views in the shell the
+      [control-plane decision](prd_m.md#control-plane-decision) selects: the
+      [M3b Tauri](prd_m3b.md) app if the tech-stack spike passes, the
+      [M3a loopback](prd_m3a.md) dashboard first if it fails. The views are:
       `Tier B Human Inbox` drawer (strictly separate from `Tier A Approval Inbox`), `Tier C Health
       Ribbon`, `Workflows` panel, and closed `oc-ui@1` Svelte component catalog with provenance pills.
 - [ ] Author `builtin/prd-delivery-pipeline.toml` + `SKILL.md` demonstrating parallel implementor /

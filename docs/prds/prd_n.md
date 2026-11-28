@@ -216,7 +216,9 @@ desktop surfaces explicitly depend on completing the open upstream slices:
 - Joint local OpenCode transport + `oc_hub` restart qualification ([prd_m](prd_m.md#first-poc-split))
 - Live provider routes & full `5h`/`7d` `QuotaLedger` telemetry ([prd_m1](prd_m1.md), [prd_i4](prd_i4.md))
 - SSH remote worker onboarding (`REMOTE / NAME`, [prd_i2](prd_i2.md))
-- Trusted Host Chrome ([M3a loopback first](prd_m3a.md), [M3b Tauri desktop](prd_m3b.md))
+- Trusted Host Chrome, in the shell the
+  [control-plane decision](prd_m.md#control-plane-decision) selects: [M3b Tauri desktop](prd_m3b.md)
+  if the tech-stack spike passes, [M3a loopback](prd_m3a.md) first if it fails
 
 Wave 1 of the [delivery order](#delivery-order) is a local, synthetic slice. From the list above
 it needs the joint local transport proof and Trusted Host Chrome. It does not need live provider

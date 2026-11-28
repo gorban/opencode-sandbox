@@ -100,8 +100,10 @@ Sidebar Tree (3-Level Hierarchy)
 
 ### 3. Shared SvelteKit frontend, loopback web auth, and Tauri v2 UDS bridge
 
-- **One static SPA, two authenticated shells:** Reach initial acceptance in M3a first. M3b
-  then packages the same client with a typed native transport.
+- **One static SPA, two authenticated shells:** Reach initial acceptance in the shell the
+  [control-plane decision](prd_m.md#control-plane-decision) selects: M3b if the tech-stack
+  spike passes, M3a first if it fails. Both use the same client. M3b gives it a typed native
+  transport.
   - **Tauri v2 Native Desktop App (M3b):** zero browser
      extensions. A minimal Rust backend opens `oc_daemon`'s host-only `0o600` UDS directly
      (`SO_PEERCRED` UID verified) to proxy API/SSE/PTY/Browser streams to the WebView without
@@ -646,7 +648,9 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
       auto-importing host-trusted `$STATE/worktrees/<NAME>` via `O_NOFOLLOW` (zero host `git` in
       `~/opencode-sandbox`), with full 5-tuple write-ahead provenance receipts and bootstrap-code +
       cookie + CSRF + single-use WS-ticket auth.
-- [ ] **Gap M3.2 — [M3a loopback frontend](prd_m3a.md), then [M3b Tauri shell](prd_m3b.md):** implement
+- [ ] **Gap M3.2 — frontend in the shell the
+      [control-plane decision](prd_m.md#control-plane-decision) selects ([M3b Tauri shell](prd_m3b.md),
+      or [M3a loopback frontend](prd_m3a.md) first):** implement
       3-level sidebar tree (with conditional `Browser` item & optional fleet PiP Browser Wall),
       pinned `-o` orchestrator view, inert Markdown thread renderer, Trusted Chrome Approval Inbox
       & 5h/7d quota bar, unambiguous target picker (`NAME`, `REMOTE / NAME`, `@PEER`), `safe_run`

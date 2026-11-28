@@ -1,7 +1,8 @@
 # prd_m3a: SvelteKit loopback dashboard
 
 Parent: [prd_m3](prd_m3.md) · follows: [M3.1 read-only projection](prd_m3.md#concrete-gaps-and-checkboxes) ·
-next: [prd_m3b Tauri desktop](prd_m3b.md) · children:
+other shell: [prd_m3b Tauri desktop](prd_m3b.md) · order:
+[control-plane decision](prd_m.md#control-plane-decision) · children:
 [prd_m3a1 product design, design system and accessibility](prd_m3a1.md),
 [prd_m3a2 UI SDK agent bridge and markup](prd_m3a2.md),
 [prd_m3a3 frontend foundation, style guide and test pyramid](prd_m3a3.md)

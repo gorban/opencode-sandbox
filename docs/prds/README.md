@@ -42,8 +42,9 @@ reservation explicitly in this index.
   ([N milestones](prd_n.md#phased-milestones-and-ownership)) — **PRD N workflows & supervision**
   *(builds on `[*] PRD M coordination` and open PRD I/L/M prerequisites; re-coordinate ownership
   at the start of the next phase)*.
-- [*] Dashboard product design and requirements for the shared SvelteKit static SPA (loopback
-  first, Tauri-ready): [M3a](prd_m3a.md), [M3a1](prd_m3a1.md) design system and
+- [*] Dashboard product design and requirements for the shared SvelteKit static SPA (for both
+  shells; the order is set by the [control-plane decision](prd_m.md#control-plane-decision)):
+  [M3a](prd_m3a.md), [M3a1](prd_m3a1.md) design system and
   accessibility, [M3a2](prd_m3a2.md) UI SDK bridge and markup, and the visual design of the
   [N3](prd_n3.md) Trusted Chrome views — **Dashboard design** (`codex/m3a-dashboard-design`).
   Excludes moving Chromium launches into the app ([Gap M3.4](prd_m3.md#concrete-gaps-and-checkboxes)),

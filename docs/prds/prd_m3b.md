@@ -1,6 +1,7 @@
 # prd_m3b: Tauri desktop dashboard
 
-Parent: [prd_m3](prd_m3.md) · follows: [prd_m3a loopback dashboard](prd_m3a.md)
+Parent: [prd_m3](prd_m3.md) · shares the SPA with: [prd_m3a loopback dashboard](prd_m3a.md) ·
+order: [control-plane decision](prd_m.md#control-plane-decision)
 
 Package the qualified SvelteKit static SPA in Tauri v2. Reuse the same views and typed data
 contract. The desktop client uses a narrow native transport to the daemon's host-only socket,

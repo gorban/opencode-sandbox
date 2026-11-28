@@ -5,8 +5,9 @@ Parent: [prd_m3a](prd_m3a.md) · siblings: [prd_m3a2 UI SDK agent bridge](prd_m3
 related: [M3 control plane](prd_m3.md), [M3b Tauri desktop](prd_m3b.md),
 [N3 Human Inbox and `oc-ui@1` surfaces](prd_n3.md), [I1 operator dashboard](prd_i1.md)
 
-Design the shared SvelteKit static SPA once, for the loopback dashboard first and the Tauri
-WebView later. This PRD owns screens, interaction patterns, the visual language, design tokens,
+Design the shared SvelteKit static SPA once, for both the loopback dashboard and the Tauri
+WebView. Which shell ships first is set by the
+[control-plane decision](prd_m.md#control-plane-decision). This PRD owns screens, interaction patterns, the visual language, design tokens,
 accessibility and the design selection process. It does not change protocols, authority or
 the M3 security design. Where a design need appears to conflict with a security requirement,
 the security requirement wins and the conflict is recorded here as an open item.

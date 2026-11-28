@@ -25,7 +25,8 @@ a cohesive, zero-trust multi-model control plane covering three tightly linked a
    parallel Codex implementors each paired with an adversarial Claude reviewer), and host-enrolled
    external top-level peer streams, all addressed unambiguously as `"NAME"` (local),
    `"REMOTE / NAME"` (remote), or `"@PEER"` (external harness).
-3. **Shared SvelteKit control plane (hardened loopback web first, then Tauri v2)**
+3. **Shared SvelteKit control plane (Tauri v2 or hardened loopback web, in the order the
+   [control-plane decision](#control-plane-decision) sets)**
    ([prd_m3](prd_m3.md)) replacing per-sandbox Chrome windows and terminals with a single
    `Project -> Sandbox -> Thread` workspace where both the human operator and the root orchestrator
    message the same targets, alongside confined embedded terminal emulation (`opencode-tui` and
@@ -170,10 +171,10 @@ merged M command/event contract. M3a frontend implementation follows the project
 - [ ] **M3 — Unified Tauri v2 + hardened web control plane, confined PTY, and opt-in embedded
       browser views** ([prd_m3](prd_m3.md)): build `oc_daemon.py` (`$STATE/registry.sqlite`
       Command/Event/Projection + Outbox, auto-importing host-trusted `$STATE/worktrees/<NAME>` via
-      `O_NOFOLLOW`), a SvelteKit static SPA served first through hardened
-      [loopback web mode](prd_m3a.md) (bootstrap-code exchange + `HttpOnly` cookie + CSRF +
-      single-use WS tickets), followed by [Tauri v2](prd_m3b.md) with a minimal Rust UDS
-      bridge, full-key write-ahead provenance receipts, Trusted Chrome Approval Inbox + 5h/7d
+      `O_NOFOLLOW`), a SvelteKit static SPA in the shell the
+      [control-plane decision](#control-plane-decision) selects: [Tauri v2](prd_m3b.md) with a
+      minimal Rust UDS bridge, or hardened [loopback web mode](prd_m3a.md) (bootstrap-code
+      exchange + `HttpOnly` cookie + CSRF + single-use WS tickets) first, full-key write-ahead provenance receipts, Trusted Chrome Approval Inbox + 5h/7d
       quota bar, zero-network null-origin `xterm.js` iframe behind an allowlist host VT/UTF-8
       scrubber + non-blocking PTY relay, opt-in per-sandbox `Browser` view + fleet PiP Browser Wall
       (backed by `builtin/chromium-managed`, [prd_d](prd_d.md)/[prd_e](prd_e.md) internal HTTPS,
@@ -319,9 +320,11 @@ Dependencies owned elsewhere:
 - [x] Use SvelteKit with the static adapter and a client-rendered SPA. Qualify the
       [loopback dashboard](prd_m3a.md) before packaging the shared frontend for
       [Tauri v2](prd_m3b.md). Reuse the documented T3Code architectural patterns.
-- [ ] **Shell order.** The operator chose Tauri only on 2026-11-28. The choice takes effect when
-      the [tech-stack spike](prd_m3b.md#tech-stack-spike) passes. Until then, and if it fails,
-      the loopback-first order above stands. Time estimates are rough.
+- [ ] **Shell order.** The operator chose Tauri only on 2026-11-28, and approved changing the
+      order across these PRDs to match. The choice takes effect when the
+      [tech-stack spike](prd_m3b.md#tech-stack-spike) passes. Until then, and if it fails, the
+      loopback-first order above stands. This item is the one place the order is set. Every
+      other mention of shell order in the PRDs defers to it. Time estimates are rough.
   - **Tauri only; loopback serves fixtures for tests (chosen).** The dashboard has no TCP
     listener. The web sign-in work and the cookie port-sharing problem in
     [prd_m3a](prd_m3a.md) are not needed. Each stream surface is qualified once. No access from a
