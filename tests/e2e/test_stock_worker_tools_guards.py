@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, nullcontext
 from copy import deepcopy
+import errno
 from io import StringIO
 import json
 import os
@@ -24,8 +25,10 @@ sys.path[:0] = [str(ROOT), str(Path(__file__).resolve().parent)]
 
 from oc_openai.session_broker import SessionBroker
 from oc_openai.session_protocol import ReasoningVault, SessionStreamProjector, StreamAborted
+import stock_worker_tools_capture as capture_fixture
 from stock_worker_tools_capture import AUTHORITY, Observer, Terminal, WireHandler, await_idle, capture, verify_scope
 from stock_worker_tools_history import stock_history
+from stock_worker_tools_turns import FixtureTurns, PinnedLedger
 from stock_worker_tools_guest import (
     HOLD_READER, TCP_CONNECT, WIRE, broker_exchange, confirm_foreground, reap_held_child, run_cleanup,
     verify_direct_broker, verify_loopback_listener, verify_outside_candidates, verify_relay_mcs,
@@ -44,7 +47,87 @@ class CaptureGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(FixtureMismatch, "loopback-only"):
                 verify_scope()
 
-    def capture_with_failed_send(self, destination, *, damage=None, after_commit=False):
+    def test_exposure_parent_sync_failure_precedes_observer_and_terminal_start(self):
+        primary = OSError("synthetic evidence-parent sync failed")
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "failure.json"
+            with patch("stock_worker_tools_capture.os.fsync", side_effect=primary), \
+                    patch("stock_worker_tools_capture.Observer") as observer, \
+                    patch("stock_worker_tools_capture.Terminal") as terminal:
+                with self.assertRaises(OSError) as raised:
+                    capture(("/unused-stock-fixture",), evidence, "tools")
+            self.assertIs(raised.exception, primary)
+            observer.assert_not_called()
+            terminal.assert_not_called()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_failed_observer_bind_records_empty_exposure_and_removes_owned_scratch(self):
+        with tempfile.TemporaryDirectory() as directory, closing(socket.socket()) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            root = Path(directory)
+            evidence = root / "failure.json"
+            with patch("stock_worker_tools_capture.PORT", listener.getsockname()[1]), \
+                    patch("stock_worker_tools_capture.Terminal") as terminal, patch("sys.stderr", StringIO()):
+                with self.assertRaises(OSError) as raised:
+                    capture(("/unused-stock-fixture",), evidence, "tools")
+            self.assertEqual(raised.exception.errno, errno.EADDRINUSE)
+            terminal.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [evidence])
+            self.assertEqual(json.loads(evidence.read_text()), {
+                "phase": "failed", "exposure": {"status": "verified", "claims": []}, "requests": [],
+            })
+
+    def test_observer_socket_allocation_failure_cleans_empty_owned_scratch(self):
+        primary = OSError(errno.EMFILE, "synthetic socket allocation failure")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / "failure.json"
+            with patch("stock_worker_tools_capture.socket.socket", side_effect=primary), \
+                    patch("stock_worker_tools_capture.Terminal") as terminal:
+                with self.assertRaises(OSError) as raised:
+                    capture(("/unused-stock-fixture",), evidence, "tools")
+            self.assertIs(raised.exception, primary)
+            terminal.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [evidence])
+            self.assertEqual(json.loads(evidence.read_text()),
+                             {"phase": "failed", "exposure": {"status": "unavailable"}})
+
+    def test_initial_publication_sync_uncertainty_retains_owned_ledger_and_receipt(self):
+        primary = OSError("synthetic initial ledger directory sync failed")
+        sync = os.fsync
+        injected = False
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = root.stat()
+            evidence = root / "failure.json"
+
+            def fail_initial_publication(fd):
+                nonlocal injected
+                info = os.fstat(fd)
+                if not injected and stat.S_ISDIR(info.st_mode) and not os.path.samestat(info, identity):
+                    injected = True
+                    raise primary
+                return sync(fd)
+
+            with patch("stock_worker_tools_turns.os.fsync", side_effect=fail_initial_publication), \
+                    patch("stock_worker_tools_capture.Terminal") as terminal:
+                with self.assertRaises(OSError) as raised:
+                    capture(("/unused-stock-fixture",), evidence, "tools")
+            self.assertIs(raised.exception, primary)
+            terminal.assert_not_called()
+            (ledger,) = root.glob("*/synthetic-exposure.sqlite")
+            receipt = json.loads((ledger.parent / "recovery.json").read_text())
+            self.assertEqual(receipt["exposure_ledger"], ledger.name)
+            self.assertEqual(receipt["terminal_scratch"], {"status": "unavailable"})
+            self.assertTrue(any(str(ledger.parent) in note for note in primary.__notes__))
+            with closing(sqlite3.connect(ledger)) as db:
+                self.assertEqual(db.execute("SELECT sequence FROM exposure").fetchall(), [])
+            self.assertEqual(json.loads(evidence.read_text()),
+                             {"phase": "failed", "exposure": {"status": "unavailable"}})
+
+    def capture_with_failed_send(self, destination, *, damage=None, after_commit=False,
+                                 retain=False, terminal_error=None, exit_error=None):
         primary = RuntimeError("synthetic send dropped after durable claim")
         observed = {}
         history = stock_history([{"type": "message", "role": "user",
@@ -54,6 +137,17 @@ class CaptureGuardTests(unittest.TestCase):
             self.assertFalse(after_commit, "Ambiguous commit reached first write")
             observed["dispatch"] = request
             raise primary
+
+        def start_terminal(term, *_args):
+            observed["terminal_scratch"] = Path(term.command[4]).parent
+            observed["terminal_client_command"] = getattr(term, "client_command", term.command)
+            if retain:
+                self.addCleanup(shutil.rmtree, observed["terminal_scratch"], ignore_errors=True)
+
+        def run_terminal(*args, check=True, timeout=10):
+            if args == ("kill-server",) and terminal_error is not None:
+                if check or isinstance(terminal_error, subprocess.TimeoutExpired):
+                    raise terminal_error
 
         def fail_after_claim(_predicate, _description, observer):
             observed["observer"] = observer
@@ -72,15 +166,22 @@ class CaptureGuardTests(unittest.TestCase):
                     damage(observer.turns._path)
 
         command = ("/unused-stock-fixture",)
+        terminal_server = MagicMock()
+        terminal_server.poll.return_value = None
+        terminal_server.wait.side_effect = exit_error
+        observed["terminal_server"] = terminal_server
         with patch("stock_worker_tools_capture.PORT", 0), patch("stock_worker_tools_capture.stock_config", return_value={}), \
-                patch.object(Terminal, "start"), patch.object(Terminal, "run"), \
+                patch.object(Terminal, "launch_server", return_value=terminal_server, create=True), \
+                patch.object(Terminal, "await_server", create=True), \
+                patch.object(Terminal, "start", start_terminal), patch.object(Terminal, "run", side_effect=run_terminal), \
                 patch.object(Terminal, "await_screen", side_effect=fail_after_claim), patch("sys.stderr", StringIO()):
             with self.assertRaisesRegex(RuntimeError, "synthetic send dropped") as raised:
                 capture(command, destination, "tools")
         self.assertIs(raised.exception, primary)
         observer = observed["observer"]
         self.assertEqual(observer.socket.fileno(), -1)
-        self.assertFalse(observer.turns._path.parent.exists())
+        self.assertEqual(observer.turns._path.parent.exists(), retain)
+        self.assertEqual(observed["terminal_scratch"].is_dir(), retain)
         return primary, observed
 
     def test_failed_capture_preserves_exact_unresolved_claim_after_scratch_cleanup(self):
@@ -136,10 +237,246 @@ class CaptureGuardTests(unittest.TestCase):
                 _, observed = self.capture_with_failed_send(evidence)
             self.assertEqual(closed, [observed["observer"]])
 
+    def test_capture_client_never_autostarts_a_replacement_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, observed = self.capture_with_failed_send(Path(directory) / "failure.json")
+            self.assertIn("-N", observed["terminal_client_command"])
+
+    def test_durable_directory_displacement_preserves_owned_journal_and_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "failure.json"
+            moved = Path(directory) / "moved-fixture"
+            observed_replacement = []
+
+            def displace(ledger):
+                root = ledger.parent
+                root.rename(moved)
+                root.mkdir(mode=0o700)
+                sentinel = root / "sentinel"
+                sentinel.write_text("separate synthetic directory")
+                observed_replacement.append(sentinel)
+
+            primary, _ = self.capture_with_failed_send(evidence, damage=displace, retain=True)
+            sentinel, = observed_replacement
+            self.assertEqual(sentinel.read_text(), "separate synthetic directory")
+            self.assertEqual(list(sentinel.parent.iterdir()), [sentinel])
+            receipt = json.loads((moved / "recovery.json").read_text())
+            self.assertEqual(receipt["run_id"], sentinel.parent.name)
+            self.assertTrue((moved / receipt["exposure_ledger"]).is_file())
+            self.assertTrue(any("visible name changed" in note for note in primary.__notes__))
+            self.assertEqual(json.loads(evidence.read_text()),
+                             {"phase": "failed", "exposure": {"status": "unavailable"}})
+
+    def test_terminal_cleanup_uncertainty_retains_both_roots_after_observer_stops(self):
+        cases = (
+            ("kill timed out", subprocess.TimeoutExpired("synthetic tmux", 10), None),
+            ("kill failed", subprocess.CalledProcessError(1, "synthetic tmux"), None),
+            ("owned server exit unproven", None, subprocess.TimeoutExpired("synthetic foreground child", 10)),
+        )
+        for label, terminal_error, exit_error in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                evidence = Path(directory) / "failure.json"
+                primary, observed = self.capture_with_failed_send(
+                    evidence, retain=True, terminal_error=terminal_error, exit_error=exit_error,
+                )
+                if exit_error is not None:
+                    observed["terminal_server"].wait.assert_called_once()
+                ledger = observed["observer"].turns._path
+                receipt = json.loads((ledger.parent / "recovery.json").read_text())
+                self.assertEqual(receipt["exposure_ledger"], ledger.name)
+                self.assertEqual(receipt["terminal_scratch"]["path"], str(observed["terminal_scratch"]))
+                self.assertTrue(ledger.is_file())
+                self.assertTrue(any("terminal cleanup" in note for note in primary.__notes__))
+                self.assertEqual(json.loads(evidence.read_text()),
+                                 {"phase": "failed", "exposure": {"status": "unavailable"}})
+
     def test_capture_deadline_retains_journal_while_observer_may_still_write(self):
         for stalled_in in ("serving", "handler"):
             with self.subTest(stalled_in=stalled_in), tempfile.TemporaryDirectory() as directory:
                 self.assert_stalled_observer_retains_journal(stalled_in, Path(directory) / "failure.json")
+
+    def test_recovery_receipt_and_revocation_do_not_wait_for_stuck_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "failure.json"
+            observed = self.assert_stalled_observer_retains_journal("writer", evidence)
+            identity, inheritable = observed["borrowed_after_retirement"]
+            expected = observed["ledger"].parent.stat()
+            self.assertTrue(os.path.samestat(identity, expected))
+            self.assertFalse(inheritable)
+            self.assertTrue(observed["new_borrow_refused"])
+            self.assertTrue(observed["unfinished_write_refused"])
+            with closing(sqlite3.connect(observed["ledger"])) as db:
+                self.assertEqual(db.execute("SELECT actual_input FROM exposure").fetchall(), [(None,)])
+
+    def test_revocation_before_final_first_write_authorization_has_zero_sends(self):
+        checked = Event()
+        resume = Event()
+        with tempfile.TemporaryDirectory() as directory, \
+                capture_fixture.make_exposure_scratch(Path(directory)) as scratch, ThreadPoolExecutor() as pool:
+            ledger = scratch.root / "test-exposure.sqlite"
+            turns = FixtureTurns(ledger, AUTHORITY, ledger=PinnedLedger(ledger.name, scratch))
+            history = self.first_turn()
+            upstream = MagicMock()
+            authorize = scratch.authorize_first_write
+
+            def stop_before_authorization(**options):
+                checked.set()
+                self.assertTrue(resume.wait(2))
+                authorize(**options)
+
+            with patch.object(scratch, "authorize_first_write", side_effect=stop_before_authorization):
+                result = pool.submit(turns.dispatch, AUTHORITY, "ses_capture", history, upstream)
+                try:
+                    self.assertTrue(checked.wait(2))
+                    scratch.revoke()
+                finally:
+                    resume.set()
+                with self.assertRaisesRegex(FixtureMismatch, "directory retired"):
+                    result.result(timeout=2)
+            upstream.assert_not_called()
+            with closing(sqlite3.connect(ledger)) as db:
+                self.assertEqual(db.execute("SELECT sequence, actual_input FROM exposure").fetchall(), [(1, None)])
+
+    def test_grant_expiry_during_final_directory_verification_has_zero_sends(self):
+        now = 10
+        authorizing = False
+        with tempfile.TemporaryDirectory() as directory, capture_fixture.make_exposure_scratch(Path(directory)) as scratch:
+            ledger = scratch.root / "test-exposure.sqlite"
+            turns = FixtureTurns(ledger, AUTHORITY, ledger=PinnedLedger(ledger.name, scratch), clock=lambda: now)
+            authorize = scratch.authorize_first_write
+            verify = scratch.verify
+            upstream = MagicMock()
+
+            def enter_final_authorization(**options):
+                nonlocal authorizing
+                authorizing = True
+                return authorize(**options)
+
+            def slow_verification(*args, **kwargs):
+                nonlocal now
+                verify(*args, **kwargs)
+                if authorizing:
+                    now = 310
+
+            with patch.object(scratch, "authorize_first_write", side_effect=enter_final_authorization), \
+                    patch.object(scratch, "verify", side_effect=slow_verification):
+                with self.assertRaisesRegex(FixtureMismatch, "Stale or expired"):
+                    turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), upstream)
+            upstream.assert_not_called()
+            with closing(sqlite3.connect(ledger)) as db:
+                self.assertEqual(db.execute("SELECT sequence, actual_input FROM exposure").fetchall(), [(1, None)])
+
+    def test_displaced_pinned_ledger_refuses_claim_before_touching_replacement(self):
+        with tempfile.TemporaryDirectory() as directory, capture_fixture.make_exposure_scratch(Path(directory)) as scratch:
+            ledger_name = "test-exposure.sqlite"
+            turns = FixtureTurns(scratch.root / ledger_name, AUTHORITY, ledger=PinnedLedger(ledger_name, scratch))
+            moved = Path(directory) / "owned-fixture"
+            scratch.root.rename(moved)
+            scratch.root.mkdir(mode=0o700)
+            replacement = scratch.root / ledger_name
+            replacement.write_bytes((moved / ledger_name).read_bytes())
+            sentinel = replacement.read_bytes()
+            upstream = MagicMock()
+            with self.assertRaisesRegex(FixtureMismatch, "Capture exposure directory changed"):
+                turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), upstream)
+            upstream.assert_not_called()
+            self.assertEqual(replacement.read_bytes(), sentinel)
+            with closing(sqlite3.connect(moved / ledger_name)) as db:
+                self.assertEqual(db.execute("SELECT sequence FROM exposure").fetchall(), [])
+
+    def test_ambiguous_pinned_replace_retains_exact_claim_with_no_send(self):
+        primary = OSError("synthetic replace persisted before error")
+        replace = os.replace
+
+        def replace_then_raise(*args, **kwargs):
+            replace(*args, **kwargs)
+            raise primary
+
+        with tempfile.TemporaryDirectory() as directory, capture_fixture.make_exposure_scratch(Path(directory)) as scratch:
+            ledger = scratch.root / "test-exposure.sqlite"
+            turns = FixtureTurns(ledger, AUTHORITY, ledger=PinnedLedger(ledger.name, scratch))
+            upstream = MagicMock()
+            with patch("stock_worker_tools_turns.os.replace", side_effect=replace_then_raise):
+                with self.assertRaises(OSError) as raised:
+                    turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), upstream)
+            self.assertIs(raised.exception, primary)
+            upstream.assert_not_called()
+            claim, = turns.verified_records()
+            self.assertEqual((claim["sequence"], claim["parent"], claim["actual_input"], claim["actual_output"]),
+                             (1, None, None, None))
+            with self.assertRaisesRegex(FixtureMismatch, "Stale or expired"):
+                turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), upstream)
+
+    def test_settlement_sync_uncertainty_retains_exact_usage_and_receipt(self):
+        primary = OSError("synthetic settlement directory sync failed")
+        sync = os.fsync
+
+        def fail_directory_sync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise primary
+            return sync(fd)
+
+        self.assert_settlement_uncertainty_retains_usage(primary, "stock_worker_tools_turns.os.fsync", fail_directory_sync)
+
+    def test_settlement_late_borrow_close_retains_exact_usage_and_receipt(self):
+        primary = OSError("synthetic late settlement descriptor close failed")
+        close = os.close
+        injected = False
+
+        def close_directory_then_fail(fd):
+            nonlocal injected
+            directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+            close(fd)
+            if directory and not injected:
+                injected = True
+                raise primary
+
+        self.assert_settlement_uncertainty_retains_usage(
+            primary, "stock_worker_tools_capture.os.close", close_directory_then_fail,
+        )
+
+    def assert_settlement_uncertainty_retains_usage(self, primary, fault_target, fault):
+        observed = {}
+
+        def start_terminal(term, *_args):
+            observed["local_root"] = Path(term.command[4]).parent
+            self.addCleanup(shutil.rmtree, observed["local_root"], ignore_errors=True)
+
+        def fail_settlement(_predicate, _description, observer):
+            observed["ledger"] = observer.turns._path
+            request, _ = observer.turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), lambda _request: None)
+            with patch(fault_target, side_effect=fault):
+                observer.turns.settle(AUTHORITY, request, calls=(), completed_message="synthetic", usage=(2, 3, 5))
+
+        terminal_server = MagicMock()
+        terminal_server.poll.return_value = None
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "failure.json"
+            with patch("stock_worker_tools_capture.PORT", 0), \
+                    patch("stock_worker_tools_capture.stock_config", return_value={}), patch("sys.stderr", StringIO()), \
+                    patch.object(Terminal, "launch_server", return_value=terminal_server), \
+                    patch.object(Terminal, "await_server"), patch.object(Terminal, "start", start_terminal), \
+                    patch.object(Terminal, "await_screen", side_effect=fail_settlement), patch.object(Terminal, "run"):
+                with self.assertRaises(OSError) as raised:
+                    capture(("/unused-stock-fixture",), evidence, "tools")
+            self.assertIs(raised.exception, primary)
+            terminal_server.wait.assert_called_once()
+            ledger = observed["ledger"]
+            self.assertTrue(ledger.is_file())
+            self.assertTrue(observed["local_root"].is_dir())
+            receipt = json.loads((ledger.parent / "recovery.json").read_text())
+            self.assertEqual(receipt["exposure_ledger"], ledger.name)
+            self.assertTrue(any(str(ledger.parent) in note for note in primary.__notes__))
+            with closing(sqlite3.connect(ledger)) as db:
+                self.assertEqual(db.execute("SELECT sequence, actual_input, actual_output FROM exposure").fetchall(),
+                                 [(1, 2, 3)])
+            self.assertEqual(json.loads(evidence.read_text()),
+                             {"phase": "failed", "exposure": {"status": "unavailable"}})
+
+    @staticmethod
+    def first_turn():
+        return stock_history([{"type": "message", "role": "user",
+                               "content": [{"type": "input_text", "text": PROMPT}]}])
 
     def test_observer_joins_serving_and_handlers_with_one_remaining_budget(self):
         with tempfile.TemporaryDirectory() as directory, patch("stock_worker_tools_capture.PORT", 0), \
@@ -220,6 +557,7 @@ class CaptureGuardTests(unittest.TestCase):
         entered = Event()
         released = Event()
         finished = Event()
+        writer_done = Event()
         primary = RuntimeError("synthetic terminal failure")
         observed = {}
         accept = Observer.get_request
@@ -238,7 +576,30 @@ class CaptureGuardTests(unittest.TestCase):
 
         def stall_handler(handler):
             handler.server.requests.append({"synthetic_private_marker": "unsettled request"})
-            wait_for_release()
+            if stalled_in != "writer":
+                wait_for_release()
+                return
+            scratch = observed["scratch"]
+            try:
+                with handler.server.turns._lock, scratch.borrow() as (descriptor, _verify):
+                    try:
+                        with handler.server.turns._database(write=True) as db, db:
+                            db.execute("UPDATE exposure SET actual_input = 7")
+                            wait_for_release()
+                    except FixtureMismatch as error:
+                        observed["unfinished_write_refused"] = str(error) == "Capture exposure directory retired"
+                    observed["borrowed_after_retirement"] = os.fstat(descriptor), os.get_inheritable(descriptor)
+                    try:
+                        with scratch.borrow():
+                            observed["new_borrow_refused"] = False
+                    except FixtureMismatch as error:
+                        observed["new_borrow_refused"] = str(error) == "Capture exposure directory retired"
+            finally:
+                writer_done.set()
+
+        def observe_scope(command, evidence_name, case, scratch):
+            observed["scratch"] = scratch
+            return original_scope(command, evidence_name, case, scratch)
 
         def start_terminal(term, *_args):
             socket_path = Path(term.command[4])
@@ -262,9 +623,16 @@ class CaptureGuardTests(unittest.TestCase):
             raise primary
 
         fixture = "stock_worker_tools_capture"
+        terminal_server = MagicMock()
+        terminal_server.poll.return_value = None
+        original_scope = getattr(capture_fixture, "capture_in_scope", None)
+        scope_probe = (patch.object(capture_fixture, "capture_in_scope", observe_scope) if stalled_in == "writer"
+                       else nullcontext())
         stall = (patch.object(Observer, "get_request", stall_serving) if stalled_in == "serving"
                  else patch.object(WireHandler, "do_GET", stall_handler, create=True))
-        with stall, patch(f"{fixture}.PORT", 0), patch(f"{fixture}.OBSERVER_STOP_SECONDS", .2, create=True), \
+        with scope_probe, stall, patch(f"{fixture}.PORT", 0), patch(f"{fixture}.OBSERVER_STOP_SECONDS", .2, create=True), \
+                patch.object(Terminal, "launch_server", return_value=terminal_server, create=True), \
+                patch.object(Terminal, "await_server", create=True), \
                 patch(f"{fixture}.stock_config", return_value={}), patch.object(Terminal, "start", start_terminal), \
                 patch.object(Terminal, "run"), patch.object(Terminal, "await_screen", side_effect=fail_terminal), \
                 patch("sys.stderr", StringIO()) as stderr, ThreadPoolExecutor() as pool:
@@ -281,6 +649,8 @@ class CaptureGuardTests(unittest.TestCase):
                 self.assertTrue(any(str(ledger.parent) in note for note in primary.__notes__))
                 self.assertFalse(finished.is_set())
                 observed["snapshot"].assert_not_called()
+                if stalled_in == "writer":
+                    self.assertTrue((ledger.parent / "recovery.json").is_file())
                 self.assertEqual(json.loads(evidence.read_text()),
                                  {"phase": "failed", "exposure": {"status": "unavailable"}})
                 self.assertEqual(stderr.getvalue(), "")
@@ -289,6 +659,8 @@ class CaptureGuardTests(unittest.TestCase):
                 self.assertTrue(finished.wait(2))
                 for root in {observed["ledger"].parent, observed["terminal_scratch"]}:
                     self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+                if stalled_in == "writer":
+                    self.assertTrue(writer_done.wait(2))
         return observed
 
     def test_failed_capture_marks_damaged_journal_without_inventing_claims(self):

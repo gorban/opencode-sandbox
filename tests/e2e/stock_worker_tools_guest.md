@@ -44,7 +44,10 @@ capture user. If the capture fails, it stops the observer and snapshots the boun
 synthetic journal before removing scratch. An unresolved claim retains null usage
 only when the settled prefix and the exact claim values and SQLite types match,
 including when SQLite commits before reporting an error. Observer serving and
-request handlers share one shutdown deadline. If their exit cannot be confirmed,
+request handlers share one shutdown deadline. Capture commands require the
+existing foreground tmux server. Terminal teardown checks its shutdown command
+and observes the exact child exit within a separate deadline. If either teardown,
+initial journal publication, or settlement cannot be confirmed,
 the capture retains the journal and an owner-only recovery receipt in a private
 child of the persistent evidence directory. The raised diagnostic gives that
 location and the requested failure evidence gives only the unavailable status.
@@ -53,9 +56,18 @@ Terminal scratch uses the namespace's short local path while it may still be
 in use. It can disappear with the namespace while the journal and receipt
 survive. The receipt records the run and local scratch identity. It includes the
 tmux socket identity when verified and records it as unavailable otherwise.
-Cleanup errors accompany the original failure as
-exception notes. A missing or invalid journal produces an unavailable or
-corrupt status. Record the evidence SHA-256 and the source revision. The
+The capture holds private directory descriptors and verifies their visible names
+before publishing evidence or removing scratch. It syncs the evidence parent
+before starting and persists bounded SQLite snapshots through the held run
+directory before authorizing synthetic sends. If a name has moved, preserve
+the original directory and use the private diagnostic's run and inode to locate
+it after retirement. This fixture assumes exclusive same-UID access to the
+evidence bind and terminal scratch during capture. Peers with the same UID can
+mutate directory names, and POSIX checks inode identity and removes a name in
+separate calls.
+Cleanup errors accompany the original failure as exception notes. A missing
+or invalid journal produces an unavailable or corrupt status. Record the
+evidence SHA-256 and the source revision. The
 capture is a loopback proof with a synthetic accounting store. The separate
 sealed guest procedure below exercises the public launcher, production broker
 and TLS peer.

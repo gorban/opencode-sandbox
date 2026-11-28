@@ -35,7 +35,7 @@ from stock_worker_tools_protocol import (
     validate_refused_export,
 )
 from stock_worker_tools_stream import project_stream, scripted_response, terminal_output
-from stock_worker_tools_turns import HANDOFF_END, Authority, FixtureTurns
+from stock_worker_tools_turns import HANDOFF_END, Authority, FixtureTurns, PinnedLedger
 
 STOCK_SHA256 = "9e0cb0e096666f955c3f72d1b517fd2cb5cca65c2876e1012492d955fc974a7b"
 MUSL_LOADER_SHA256 = "095b047c631447e4fa50401fa7ffce01f678587040d65ba18c574981dc630de5"
@@ -45,6 +45,7 @@ MUSL_PINS = {
 }
 PORT = 8401
 OBSERVER_STOP_SECONDS = 10
+TERMINAL_STOP_SECONDS = 10
 FIXTURE_BEARER = "stock-tools-synthetic-only"
 WORKSPACE = Path("/sandbox/construct")
 AUTHORITY = Authority("synthetic-job", "harbor", "capture-generation", "/v1/responses", MODEL)
@@ -98,13 +99,39 @@ def measured_command(binary, libraries):
 
 
 class Terminal:
-    def __init__(self, root, env):
-        self.command = ("/usr/bin/tmux", "-f", "/dev/null", "-S", str(root / "t"))
+    def __init__(self, root, env, *, allow_autostart=True):
+        self.socket_path = root / "t"
+        self.command = ("/usr/bin/tmux", "-f", "/dev/null", "-S", str(self.socket_path))
+        self.client_command = self.command if allow_autostart else (*self.command, "-N")
         self.env = env
 
-    def run(self, *args, check=True):
-        return subprocess.run((*self.command, *args), env=self.env, check=check, timeout=10,
+    def run(self, *args, check=True, timeout=10):
+        return subprocess.run((*self.client_command, *args), env=self.env, check=check, timeout=timeout,
                               capture_output=True, text=True).stdout
+
+    def launch_server(self):
+        return subprocess.Popen((*self.command, "-D"), env=self.env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def await_server(self, server, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            require(server.poll() is None, "Foreground capture terminal exited during startup")
+            try:
+                info = self.socket_path.lstat()
+            except FileNotFoundError:
+                time.sleep(.05)
+                continue
+            require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.geteuid(), "Unexpected capture terminal socket")
+            return
+        raise TimeoutError("Foreground capture terminal did not become ready")
+
+    def stop_server(self, server):
+        require(server is not None, "Foreground capture terminal was never identified")
+        if server.poll() is None:
+            deadline = time.monotonic() + TERMINAL_STOP_SECONDS
+            self.run("kill-server", timeout=max(0, deadline - time.monotonic()))
+            server.wait(timeout=max(0, deadline - time.monotonic()))
 
     def start(self, *command, width=104):
         launcher = shlex.join(command) + '; result=$?; printf "\\nFixture exit %s\\n" "$result"; sleep 120'
@@ -150,11 +177,11 @@ class Observer(ThreadingHTTPServer):
     block_on_close = False
     timeout = .1
 
-    def __init__(self, case, ledger):
+    def __init__(self, case, ledger=None, *, bind_and_activate=True):
         self.case = case
         self.abort = None
         self.upstream = FakeUpstream(case)
-        self.turns = FixtureTurns(ledger, AUTHORITY)
+        self.turns = None if ledger is None else FixtureTurns(ledger, AUTHORITY)
         self.vault = ReasoningVault()
         self.requests = []
         self.local_titles = 0
@@ -163,7 +190,7 @@ class Observer(ThreadingHTTPServer):
         self.lock = Lock()
         self._stop_serving = Event()
         self._handlers = []
-        super().__init__(("127.0.0.1", PORT), WireHandler)
+        super().__init__(("127.0.0.1", PORT), WireHandler, bind_and_activate=bind_and_activate)
 
     def serve_until_stopped(self):
         while not self._stop_serving.is_set():
@@ -348,52 +375,142 @@ def verify_scope():
 def private_evidence_root(path):
     directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     with preserving_cleanup(lambda: os.close(directory), "evidence directory close"):
-        info = os.fstat(directory)
-        require(info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o077,
-                "Capture evidence directory must be private and owned")
+        verify_private_directory(os.fstat(directory))
         yield directory
 
 
-def make_exposure_scratch(evidence_root):
-    with private_evidence_root(evidence_root) as directory:
-        created = Path(tempfile.mkdtemp(prefix=".oc-tools-exposure-", dir=f"/proc/self/fd/{directory}"))
-        root = evidence_root.absolute() / created.name
-        try:
-            require(os.path.samestat(created.lstat(), root.lstat()), "Capture evidence directory changed")
-        except BaseException:
-            with preserving_cleanup(created.rmdir, "uninitialized exposure scratch cleanup"):
-                raise
-        return root
+def verify_private_directory(info):
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o077,
+            "Capture evidence directory must be private and owned")
 
 
-def write_capture_evidence(path, data):
-    payload = json.dumps(data, allow_nan=False) + "\n"
-    with private_evidence_root(path.parent) as directory:
-        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-        try:
-            with preserving_cleanup(lambda: os.close(fd), "evidence descriptor close"):
-                out = os.fdopen(fd, "w", closefd=False)
-                with preserving_cleanup(out.close, "evidence file close"):
-                    os.fchmod(fd, 0o600)
-                    out.write(payload)
-                    out.flush()
-                    os.fsync(fd)
-            os.fsync(directory)
-        except BaseException as primary:
+class ExposureScratch:
+    def __init__(self, root, parent, directory):
+        self.root = root
+        self.parent = parent
+        self.directory = directory
+        self.identity = os.fstat(directory)
+        self._descriptor_lock = Lock()
+        self._revoked = False
+
+    def verify_parent(self, parent=None):
+        parent = self.parent if parent is None else parent
+        observed = self.root.parent.lstat()
+        verify_private_directory(observed)
+        require(os.path.samestat(observed, os.fstat(parent)), "Capture evidence parent changed")
+
+    def verify(self, parent=None):
+        parent = self.parent if parent is None else parent
+        self.verify_parent(parent)
+        observed = os.stat(self.root.name, dir_fd=parent, follow_symlinks=False)
+        verify_private_directory(observed)
+        require(os.path.samestat(observed, self.identity), "Capture exposure directory changed")
+
+    def require_active(self):
+        with self._descriptor_lock:
+            require(not self._revoked, "Capture exposure directory retired")
+
+    def authorize_first_write(self, *, deadline, clock):
+        with self.borrow() as (_directory, verify):
+            verify()
+        # The deadline and revocation must both be current after filesystem
+        # verification, without holding this lock across I/O or the callback.
+        with self._descriptor_lock:
+            require(not self._revoked, "Capture exposure directory retired")
+            require(clock() < deadline, "Stale or expired stock fixture authority")
+
+    def revoke(self):
+        with self._descriptor_lock:
+            self._revoked = True
+
+    @contextmanager
+    def borrow(self):
+        with self._descriptor_lock:
+            require(not self._revoked, "Capture exposure directory retired")
+            parent = os.dup(self.parent)
             try:
-                os.unlink(path.name, dir_fd=directory)
-            except BaseException as secondary:
-                primary.add_note(f"Unable to remove partial evidence: {type(secondary).__name__}")
-            raise
+                directory = os.dup(self.directory)
+            except BaseException:
+                with preserving_cleanup(lambda: os.close(parent), "borrowed evidence parent close"):
+                    raise
+        with preserving_cleanup(lambda: os.close(parent), "borrowed evidence parent close"), \
+                preserving_cleanup(lambda: os.close(directory), "borrowed exposure directory close"):
+            self.verify(parent)
+            yield directory, lambda: self.verify(parent)
+
+    def still_named(self):
+        try:
+            self.verify()
+        except (OSError, FixtureMismatch):
+            return False
+        return True
+
+    def discard(self, ledger=None):
+        self.verify()
+        with os.scandir(self.directory) as entries:
+            entry = next(entries, None)
+            if entry is not None:
+                require(ledger is not None and entry.name == ledger.name and next(entries, None) is None
+                        and ledger.owns(entry.stat(follow_symlinks=False)),
+                        "Unexpected capture exposure artifacts")
+        if entry is not None:
+            os.unlink(ledger.name, dir_fd=self.directory)
+        self.verify()
+        os.rmdir(self.root.name, dir_fd=self.parent)
 
 
-def save_failed_capture(path, observer, stopped, primary):
+@contextmanager
+def make_exposure_scratch(evidence_root):
+    with private_evidence_root(evidence_root) as parent:
+        created = Path(tempfile.mkdtemp(prefix=".oc-tools-exposure-", dir=f"/proc/self/fd/{parent}"))
+        root = evidence_root.absolute() / created.name
+        identity = created.lstat()
+        directory = os.open(root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        with preserving_cleanup(lambda: os.close(directory), "exposure directory close"):
+            scratch = ExposureScratch(root, parent, directory)
+            require(os.path.samestat(identity, scratch.identity), "Capture exposure directory changed")
+            scratch.verify()
+            try:
+                os.fsync(parent)
+            except BaseException:
+                with preserving_cleanup(scratch.discard, "uninitialized exposure scratch cleanup"):
+                    raise
+            with preserving_cleanup(scratch.revoke, "exposure descriptor retirement"):
+                yield scratch
+
+
+def write_capture_evidence(directory, name, data):
+    payload = json.dumps(data, allow_nan=False) + "\n"
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+    identity = None
+    try:
+        with preserving_cleanup(lambda: os.close(fd), "evidence descriptor close"):
+            identity = os.fstat(fd)
+            out = os.fdopen(fd, "w", closefd=False)
+            with preserving_cleanup(out.close, "evidence file close"):
+                os.fchmod(fd, 0o600)
+                out.write(payload)
+                out.flush()
+                os.fsync(fd)
+        os.fsync(directory)
+    except BaseException as primary:
+        try:
+            if identity is not None and os.path.samestat(identity, os.stat(name, dir_fd=directory, follow_symlinks=False)):
+                os.unlink(name, dir_fd=directory)
+        except BaseException as secondary:
+            primary.add_note(f"Unable to remove partial evidence: {type(secondary).__name__}")
+        raise
+
+
+def save_failed_capture(scratch, evidence_name, observer, stopped, primary):
     status = "unavailable"
-    if stopped:
+    if stopped and scratch.still_named():
         try:
             claims = observer.turns.verified_records()
         except FixtureMismatch:
             status = "corrupt"
+        except OSError:
+            pass
         except sqlite3.Error as error:
             corrupt = {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_TOOBIG,
                        sqlite3.SQLITE_SCHEMA, sqlite3.SQLITE_ERROR}
@@ -402,6 +519,9 @@ def save_failed_capture(path, observer, stopped, primary):
                 status = "corrupt"
         else:
             status = "verified"
+    if stopped and not scratch.still_named():
+        stopped = False
+        status = "unavailable"
     evidence = {"status": status}
     if status == "verified":
         evidence["claims"] = claims
@@ -410,38 +530,102 @@ def save_failed_capture(path, observer, stopped, primary):
     report = {"phase": "failed", "exposure": evidence}
     if stopped:
         report["requests"] = observer.requests
-    write_capture_evidence(path, report)
+    scratch.verify_parent()
+    write_capture_evidence(scratch.parent, evidence_name, report)
     if stopped:
         print(json.dumps(summarize(observer.requests)), file=sys.stderr)
 
 
+def capture_report(observer, case, exported):
+    if case == "tools":
+        script = observer.upstream.script
+        records = observer.turns.records()
+        require(len(script.requests) == len(records) == observer.upstream.writes == 4
+                and len(script.outputs) == 3 and observer.local_titles == 1
+                and observer.prefix_refusals == 5 and script.title_requests == 0,
+                "Wrong synthetic claim, send, tool or local title counts")
+        require(records[0]["parent"] is None and all(record["parent"] for record in records[1:])
+                and all((record["actual_input"], record["actual_output"]) == (2, 3) for record in records),
+                "Synthetic exposure does not link and settle every write")
+        require((WORKSPACE / FILE_NAME).read_bytes() == FILE_TEXT.encode(), "Independent workspace bytes differ")
+        validate_export(exported, script)
+    else:
+        verify_abort = {"hosted": "unsupported_event", "undeclared": "unauthorized_tool_call"}[case]
+        require(not (WORKSPACE / REFUSED_FILE).exists() and observer.abort == verify_abort,
+                "Refused stock tool crossed the execution boundary")
+        validate_refused_export(exported)
+        records = observer.turns.records()
+        require(len(records) == observer.upstream.writes == observer.local_titles == 1
+                and records[0]["actual_input"] is None and records[0]["parent"] is None,
+                "A refused upstream tool acquired extra synthetic exposure")
+    return {"binary_sha256": STOCK_SHA256, "model": f"{PROVIDER}/{MODEL}", "tools": TOOL_NAMES,
+            "requests": summarize(observer.requests), "stock_export": exported, "abort": observer.abort,
+            "synthetic_claims": records, "synthetic_writes": observer.upstream.writes,
+            "local_titles": observer.local_titles, "earlier_prefix_refusals": observer.prefix_refusals}
+
+
+def record_capture_failure(scratch, evidence_name, observer, stopped, primary, ledger, local):
+    turns = observer.turns if observer is not None else None
+    publication_uncertain = ledger.publication_uncertain if turns is None else turns.settlement_uncertain
+    retain = not (stopped and not publication_uncertain and scratch.still_named())
+    if retain:
+        scratch.revoke()
+    try:
+        save_failed_capture(scratch, evidence_name, observer, not retain and turns is not None, primary)
+    except BaseException as evidence_error:
+        primary.add_note(f"Unable to save secondary evidence: {type(evidence_error).__name__}")
+    named = scratch.still_named()
+    retain = retain or not named
+    if retain:
+        scratch.revoke()
+        save_recovery_receipt(scratch, ledger.name, *local, primary, named=named)
+    return retain
+
+
 def capture(command, evidence_path, case):
-    root = make_exposure_scratch(evidence_path.parent)
+    with make_exposure_scratch(evidence_path.parent) as scratch:
+        capture_in_scope(command, evidence_path.name, case, scratch)
+
+
+def capture_in_scope(command, evidence_name, case, scratch):
+    ledger = PinnedLedger("synthetic-exposure.sqlite", scratch)
     local_root = None
-    stopped = True
+    local_identity = None
+    retain = False
+    observer_stopped = terminal_stopped = True
+    observer = None
+    thread = server = None
 
     def remove_exposure_scratch():
-        if stopped:
-            shutil.rmtree(root)
+        if not retain:
+            scratch.discard(ledger)
 
     def remove_local_scratch():
-        if stopped and local_root is not None:
+        if not retain and local_root is not None:
+            require(os.path.samestat(local_identity, local_root.lstat()), "Capture terminal directory changed")
             shutil.rmtree(local_root)
 
     with preserving_cleanup(remove_exposure_scratch, "exposure scratch cleanup"), \
             preserving_cleanup(remove_local_scratch, "capture scratch cleanup"):
-        ledger = root / "synthetic-exposure.sqlite"
-        observer = Observer(case, ledger)
-        thread = None
-
         def stop_observer():
-            nonlocal stopped
+            nonlocal observer_stopped
             with preserving_cleanup(observer.server_close, "observer close"):
                 observer.stop(thread, time.monotonic() + OBSERVER_STOP_SECONDS)
-            stopped = True
+            observer_stopped = True
+
+        def stop_terminal():
+            nonlocal terminal_stopped
+            if not terminal_stopped:
+                require(os.path.samestat(local_identity, local_root.lstat()), "Capture terminal directory changed")
+                term.stop_server(server)
+                terminal_stopped = True
 
         try:
+            observer = Observer(case, bind_and_activate=False)
             with preserving_cleanup(stop_observer, "observer shutdown"):
+                observer.turns = FixtureTurns(scratch.root / ledger.name, AUTHORITY, ledger=ledger)
+                observer.server_bind()
+                observer.server_activate()
                 local_root = Path(tempfile.mkdtemp(prefix="oc-tools-"))
                 local_identity = local_root.lstat()
                 home = local_root / "home"
@@ -449,11 +633,14 @@ def capture(command, evidence_path, case):
                 config = local_root / "opencode.json"
                 config.write_text(json.dumps(stock_config()))
                 env = {**JOB_ENV, "HOME": str(home), "OPENCODE_CONFIG": str(config)}
-                term = Terminal(local_root, env)
-                with preserving_cleanup(lambda: term.run("kill-server", check=False), "terminal cleanup"):
+                term = Terminal(local_root, env, allow_autostart=False)
+                with preserving_cleanup(stop_terminal, "terminal cleanup"):
                     thread = Thread(target=observer.serve_until_stopped, daemon=True)
-                    stopped = False
+                    observer_stopped = False
                     thread.start()
+                    terminal_stopped = False
+                    server = term.launch_server()
+                    term.await_server(server)
                     term.start(*command, str(WORKSPACE))
                     term.await_screen(lambda screen: "Ask anything" in screen, "ordinary stock input", observer)
                     term.type_line(PROMPT)
@@ -461,40 +648,14 @@ def capture(command, evidence_path, case):
                         term.await_screen(lambda screen: any(line.strip(" │┃▏●") == REPLY for line in screen.splitlines()),
                                           "exact final reply", observer)
                     exported = await_idle(lambda: session_export(command, env), observer=observer)
-            if case == "tools":
-                script = observer.upstream.script
-                records = observer.turns.records()
-                require(len(script.requests) == len(records) == observer.upstream.writes == 4
-                        and len(script.outputs) == 3 and observer.local_titles == 1
-                        and observer.prefix_refusals == 5 and script.title_requests == 0,
-                        "Wrong synthetic claim, send, tool or local title counts")
-                require(records[0]["parent"] is None and all(record["parent"] for record in records[1:])
-                        and all((record["actual_input"], record["actual_output"]) == (2, 3) for record in records),
-                        "Synthetic exposure does not link and settle every write")
-                require((WORKSPACE / FILE_NAME).read_bytes() == FILE_TEXT.encode(), "Independent workspace bytes differ")
-                validate_export(exported, script)
-            else:
-                verify_abort = {"hosted": "unsupported_event", "undeclared": "unauthorized_tool_call"}[case]
-                require(not (WORKSPACE / REFUSED_FILE).exists() and observer.abort == verify_abort,
-                        "Refused stock tool crossed the execution boundary")
-                validate_refused_export(exported)
-                records = observer.turns.records()
-                require(len(records) == observer.upstream.writes == observer.local_titles == 1
-                        and records[0]["actual_input"] is None and records[0]["parent"] is None,
-                        "A refused upstream tool acquired extra synthetic exposure")
-            report = {"binary_sha256": STOCK_SHA256, "model": f"{PROVIDER}/{MODEL}", "tools": TOOL_NAMES,
-                      "requests": summarize(observer.requests), "stock_export": exported, "abort": observer.abort,
-                      "synthetic_claims": records, "synthetic_writes": observer.upstream.writes,
-                      "local_titles": observer.local_titles, "earlier_prefix_refusals": observer.prefix_refusals}
+            scratch.verify()
+            report = capture_report(observer, case, exported)
+            scratch.verify()
+            write_capture_evidence(scratch.parent, evidence_name, {"requests": observer.requests, "report": report})
         except BaseException as primary:
-            if not stopped:
-                save_recovery_receipt(ledger, local_root, local_identity, primary)
-            try:
-                save_failed_capture(evidence_path, observer, stopped, primary)
-            except BaseException as evidence_error:
-                primary.add_note(f"Unable to save secondary evidence: {type(evidence_error).__name__}")
+            retain = record_capture_failure(scratch, evidence_name, observer, observer_stopped and terminal_stopped,
+                                            primary, ledger, (local_root, local_identity))
             raise
-        write_capture_evidence(evidence_path, {"requests": observer.requests, "report": report})
         print(json.dumps({key: value for key, value in report.items() if key != "stock_export"}))
 
 
@@ -508,9 +669,14 @@ def terminal_socket_identity(local_root, local_identity):
     return {"path": str(local_root / "t"), "device": info.st_dev, "inode": info.st_ino}
 
 
-def save_recovery_receipt(ledger, local_root, local_identity, primary):
-    root = ledger.parent
-    primary.add_note(f"Private synthetic exposure journal retained in {root}")
+def save_recovery_receipt(scratch, ledger_name, local_root, local_identity, primary, *, named):
+    if named:
+        primary.add_note(f"Private synthetic exposure journal retained in {scratch.root}")
+    else:
+        primary.add_note(
+            f"Private exposure directory retained with run {scratch.root.name}, "
+            f"device {scratch.identity.st_dev}, inode {scratch.identity.st_ino}. Its visible name changed."
+        )
     terminal_socket = {"status": "unavailable"}
     try:
         terminal_socket = terminal_socket_identity(local_root, local_identity) or terminal_socket
@@ -518,10 +684,13 @@ def save_recovery_receipt(ledger, local_root, local_identity, primary):
         # Volatile socket inspection cannot prevent the durable receipt.
         pass
     try:
-        write_capture_evidence(root / "recovery.json", {
-            "run_id": root.name,
-            "exposure_ledger": ledger.name,
-            "terminal_scratch": {"path": str(local_root), "device": local_identity.st_dev, "inode": local_identity.st_ino},
+        verify_private_directory(os.fstat(scratch.directory))
+        terminal_scratch = ({"path": str(local_root), "device": local_identity.st_dev, "inode": local_identity.st_ino}
+                            if local_identity is not None else {"status": "unavailable"})
+        write_capture_evidence(scratch.directory, "recovery.json", {
+            "run_id": scratch.root.name,
+            "exposure_ledger": ledger_name,
+            "terminal_scratch": terminal_scratch,
             "terminal_socket": terminal_socket,
         })
     except BaseException as receipt_error:
