@@ -104,16 +104,18 @@ class LoadProjectionTests(unittest.TestCase):
                     fields.pop(key)
                 else:
                     fields[key] = invalid
+                raw = encode(fields)
                 with self.assertRaises(EnrollmentMetadataError):
-                    self.load(encode(fields))
+                    self.load(raw)
         for tier in ("paidTier", "currentTier"):
             for key in ("usesGcpTos", "userDefinedCloudaicompanionProject"):
                 for invalid in (True, None, 0, "false"):
                     with self.subTest(tier=tier, key=key, invalid=invalid):
                         fields = rich_load()
                         fields[tier][key] = invalid
+                        raw = encode(fields)
                         with self.assertRaises(EnrollmentMetadataError):
-                            self.load(encode(fields))
+                            self.load(raw)
 
     def test_contradictory_active_alternatives_and_negative_entries_are_refused(self):
         alternatives = [
@@ -126,8 +128,9 @@ class LoadProjectionTests(unittest.TestCase):
             with self.subTest(row=row):
                 fields = rich_load()
                 fields["allowedTiers"] = [row]
+                raw = encode(fields)
                 with self.assertRaises(EnrollmentMetadataError):
-                    self.load(encode(fields))
+                    self.load(raw)
         for key, invalid in (
             ("allowedTiers", [{"id": "other"}, {"id": "other"}]),
             ("allowedTiers", [{"name": "No ID"}]),
@@ -141,8 +144,9 @@ class LoadProjectionTests(unittest.TestCase):
             with self.subTest(key=key, invalid=invalid):
                 fields = rich_load()
                 fields[key] = invalid
+                raw = encode(fields)
                 with self.assertRaises(EnrollmentMetadataError):
-                    self.load(encode(fields))
+                    self.load(raw)
 
     def test_rich_schema_checks_types_nulls_and_bounds(self):
         for key, invalid in (
@@ -154,8 +158,9 @@ class LoadProjectionTests(unittest.TestCase):
             with self.subTest(key=key, invalid=invalid):
                 fields = rich_load()
                 fields["currentTier"][key] = invalid
+                raw = encode(fields)
                 with self.assertRaises(EnrollmentMetadataError):
-                    self.load(encode(fields))
+                    self.load(raw)
         for key, invalid in (
             ("releaseChannel", []), ("releaseChannel", None),
             ("releaseChannel", {"rows": [0] * 17}),
@@ -167,15 +172,18 @@ class LoadProjectionTests(unittest.TestCase):
             with self.subTest(key=key):
                 fields = rich_load()
                 fields[key] = invalid
+                raw = encode(fields)
                 with self.assertRaises(EnrollmentMetadataError):
-                    self.load(encode(fields))
+                    self.load(raw)
 
     def test_rich_json_refuses_duplicates_nonfinite_and_surrogate(self):
         value = deepcopy(rich_load())
         for literal in (b'{"key":1,"key":2}', b'{"key":NaN}', b'{"key":1e999}', b'{"key":"\\ud800"}'):
-            with self.subTest(literal=literal), self.assertRaises(EnrollmentMetadataError):
+            with self.subTest(literal=literal):
                 value["releaseChannel"] = "PLACEHOLDER"
-                self.load(encode(value).replace(b'"PLACEHOLDER"', literal))
+                raw = encode(value).replace(b'"PLACEHOLDER"', literal)
+                with self.assertRaises(EnrollmentMetadataError):
+                    self.load(raw)
 
     def test_bounded_body_reports_independent_failed_groups_in_order(self):
         fields = rich_load()
@@ -187,8 +195,9 @@ class LoadProjectionTests(unittest.TestCase):
             "releaseChannel": None,
             "allowedTiers": [{"id": "repeat"}, {"id": "repeat"}],
         })
+        raw = encode(fields)
         with self.assertRaises(EnrollmentMetadataError) as refusal:
-            self.load(encode(fields))
+            self.load(raw)
         self.assertEqual(refusal.exception.load_body_reasons, (
             LoadBodyReason.TOP_LEVEL_FIELDS, LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT,
             LoadBodyReason.PAID_TIER, LoadBodyReason.CONSUMER_PROJECT_POLICY, LoadBodyReason.OPTIONAL_METADATA,
@@ -239,8 +248,9 @@ class LoadProjectionTests(unittest.TestCase):
         for tier, tier_detail in tier_cases:
             for project, project_detail in project_cases:
                 with self.subTest(tier=tier_detail, project=project_detail):
+                    raw = encode({"releaseChannel": {}} | tier | project)
                     with self.assertRaises(EnrollmentMetadataError) as refusal:
-                        self.load(encode({"releaseChannel": {}} | tier | project))
+                        self.load(raw)
                     self.assertEqual(refusal.exception.load_body_reasons, (
                         LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT,
                     ))
@@ -253,8 +263,9 @@ class LoadProjectionTests(unittest.TestCase):
             ({"currentTier": CURRENT}, LoadBodyReason.ORIGINAL_PROJECT),
         ):
             with self.subTest(reason=reason):
+                raw = encode({"releaseChannel": {}} | fields)
                 with self.assertRaises(EnrollmentMetadataError) as refusal:
-                    self.load(encode({"releaseChannel": {}} | fields))
+                    self.load(raw)
                 self.assertEqual(refusal.exception.load_body_reasons, (reason,))
                 self.assertFalse(hasattr(refusal.exception, "load_account_details"))
 

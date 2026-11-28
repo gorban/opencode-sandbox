@@ -60,8 +60,10 @@ class MetadataWorkflowTest(unittest.TestCase):
     def test_revoked_offer_is_neither_activated_nor_disclosed(self):
         notify, gate = Mock(), Mock()
         owner = SimpleNamespace(fence=RLock(), authorizes_offer=lambda _: False)
+        offer = object()
+        deadline = time.monotonic() + 1
         with self.assertRaisesRegex(MetadataWorkflowError, "owner retired"):
-            _receive_callback(object(), gate, notify=notify, deadline=time.monotonic() + 1, owner=owner, profile=None)
+            _receive_callback(offer, gate, notify=notify, deadline=deadline, owner=owner, profile=None)
         gate.activate.assert_not_called()
         notify.assert_not_called()
 
@@ -69,9 +71,10 @@ class MetadataWorkflowTest(unittest.TestCase):
         owner = SimpleNamespace(fence=RLock(), authorizes_offer=Mock(side_effect=[True, False]))
         gate = Mock()
         notify = Mock(side_effect=lambda _: gate.activate.assert_not_called())
+        offer = object()
+        deadline = time.monotonic() + 1
         with self.assertRaisesRegex(MetadataWorkflowError, "after offer disclosure"):
-            _receive_callback(object(), gate, notify=notify, deadline=time.monotonic() + 1,
-                              owner=owner, profile=None)
+            _receive_callback(offer, gate, notify=notify, deadline=deadline, owner=owner, profile=None)
         notify.assert_called_once()
         gate.activate.assert_not_called()
 
@@ -85,9 +88,11 @@ class MetadataWorkflowTest(unittest.TestCase):
         for outcome, stage, expected in cases:
             with self.subTest(outcome=outcome):
                 gate = Mock(outcome=outcome, diagnostic=stage)
+                offer = object()
+                notify = Mock()
+                deadline = time.monotonic() + 1
                 with self.assertRaises(CallbackWorkflowError) as refused:
-                    _receive_callback(object(), gate, notify=Mock(), deadline=time.monotonic() + 1,
-                                      owner=owner, profile=None)
+                    _receive_callback(offer, gate, notify=notify, deadline=deadline, owner=owner, profile=None)
                 self.assertIs(refused.exception.diagnostic, expected)
 
     def test_cold_phase_expiry_during_retirement_withholds_settlement(self):

@@ -108,7 +108,7 @@ class NativeServiceTest(unittest.TestCase):
             with self.assertRaises(ValueError) as caught, _run_service(namespace, custody=custody):
                 raise primary from cause
         self.assertIs(caught.exception, primary)
-        self.assertIs(primary.__cause__, cause)
+        self.assertIs(caught.exception.__cause__, cause)
         uncertainty, = primary.cleanup_uncertainties
         self.assertIsInstance(uncertainty, NativeRetirementUnconfirmed)
         self.assertIs(uncertainty.__cause__, storage)
@@ -183,8 +183,9 @@ class NativeServiceTest(unittest.TestCase):
     @patch("oc_google.native_service.host")
     def test_different_pid_namespace_refuses_group_receipt(self, host, _link):
         host.return_value.stdout = b"pid:[123]\n"
+        service = NativeService(self.unit, Mock(), self.description)
         with self.assertRaises(NativeNamespaceError):
-            NativeService(self.unit, Mock(), self.description).control_group()
+            service.control_group()
         host.assert_called_once_with("readlink", "/proc/self/ns/pid", timeout=2)
 
     @patch("oc_google.native_service.host")

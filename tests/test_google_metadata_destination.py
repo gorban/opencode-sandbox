@@ -203,8 +203,9 @@ class MetadataDestinationTest(unittest.TestCase):
 
         self.resolve.side_effect = slow
         try:
+            deadline = time.monotonic() + .03
             with self.assertRaises(destination.MetadataDestinationError):
-                self.exchange(deadline=time.monotonic() + .03)
+                self.exchange(deadline=deadline)
         finally:
             release.set()
         self.socket.assert_not_called()
@@ -266,8 +267,9 @@ class MetadataDestinationTest(unittest.TestCase):
                 send()
 
         sink.settimeout.side_effect = timeout
+        deadline = time.monotonic() + 1
         with self.assertRaisesRegex(destination.MetadataDestinationError, "request was not sent"):
-            destination._send_under_gate(sink, b"fixture", time.monotonic() + 1, deliver)
+            destination._send_under_gate(sink, b"fixture", deadline, deliver)
         sink.settimeout.assert_called_once_with(0)
         sink.send.assert_not_called()
 
@@ -457,14 +459,16 @@ class MetadataDestinationTest(unittest.TestCase):
             return destination._response(FakeChannel(wire), bound, time.monotonic() + 2)
 
         self.assertEqual(parse(chunked_response(b"2\r\nab\r\n1\r\nc\r\n0\r\n\r\n"), 3), b"abc")
+        wire = chunked_response(b"2\r\nab\r\n1\r\nc\r\n0\r\n\r\n")
         with self.assertRaises(destination.MetadataDestinationError):
-            parse(chunked_response(b"2\r\nab\r\n1\r\nc\r\n0\r\n\r\n"), 2)
+            parse(wire, 2)
 
         header_limit = destination._CHUNK_HEADER_LIMIT
         prefix = b"1\r\na\r\n" * (header_limit - 1)
         self.assertEqual(parse(chunked_response(prefix + b"0\r\n\r\n"), header_limit), b"a" * (header_limit - 1))
+        wire = chunked_response(prefix + b"1\r\na\r\n0\r\n\r\n")
         with self.assertRaises(destination.MetadataDestinationError):
-            parse(chunked_response(prefix + b"1\r\na\r\n0\r\n\r\n"), header_limit)
+            parse(wire, header_limit)
 
         wire = chunked_response(b"1\r\na\r\n0\r\n\r\n")
         with patch.object(destination, "_CHUNK_OVERHEAD_LIMIT", 10):
@@ -494,13 +498,15 @@ class MetadataDestinationTest(unittest.TestCase):
             self.assertEqual(list(self.tls.chunks), [ragged])
         for wire in (complete, response()):
             buffered = FakeChannel(wire + b"x", ragged)
+            deadline = time.monotonic() + 1
             with self.assertRaises(destination.MetadataDestinationError):
-                destination._response(buffered, 1024, time.monotonic() + 1)
+                destination._response(buffered, 1024, deadline)
             self.assertEqual(list(buffered.chunks), [ragged])
         final_prepare = FakeChannel(response())
         with patch.object(final_prepare, "settimeout", side_effect=[None, ragged]):
+            deadline = time.monotonic() + 1
             with self.assertRaises(ssl.SSLEOFError):
-                destination._response(final_prepare, 1024, time.monotonic() + 1)
+                destination._response(final_prepare, 1024, deadline)
 
 
 class SystemTrustTest(unittest.TestCase):

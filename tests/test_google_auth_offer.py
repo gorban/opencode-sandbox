@@ -134,16 +134,19 @@ class OfferTest(unittest.TestCase):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
             occupied.bind((auth.HOST, 0))
             occupied.listen()
+            port = occupied.getsockname()[1]
             with self.assertRaisesRegex(auth.Refused, "callback port could not be held"):
-                auth.bind_callback(occupied.getsockname()[1])
+                auth.bind_callback(port)
 
     def test_invalid_offer_consumes_the_only_offer_slot(self):
         with placement(opened=False) as (gate, _, port):
+            invalid = offer(port, state="result")
             with self.assertRaises(auth.Refused):
-                gate.accept_offer(offer(port, state="result"))
+                gate.accept_offer(invalid)
             self.assertEqual(gate.outcome, auth.Outcome.CANCELLED)
+            valid = offer(port)
             with self.assertRaisesRegex(auth.Refused, "already attempted"):
-                gate.accept_offer(offer(port))
+                gate.accept_offer(valid)
             with self.assertRaises(auth.Refused):
                 gate.activate()
 

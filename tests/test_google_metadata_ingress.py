@@ -79,8 +79,10 @@ class NativeMetadataIngressTest(unittest.TestCase):
         self.assertEqual(cold.body, refresh_form())
         with self.assertRaises(MetadataIngressError):
             self.read(wire)
+        peer = FakePeer(packet(MetadataRoute.TOKEN))
+        deadline = time.monotonic() + 1
         with self.assertRaises(MetadataIngressError):
-            read_cold_refresh_request(FakePeer(packet(MetadataRoute.TOKEN)), deadline=time.monotonic() + 1)
+            read_cold_refresh_request(peer, deadline=deadline)
 
     def test_measured_token_request_yields_immutable_redacted_application_data(self):
         enrollment = self.read(packet(MetadataRoute.TOKEN), TimeoutError())
@@ -105,8 +107,10 @@ class NativeMetadataIngressTest(unittest.TestCase):
         for route in (MetadataRoute.USERINFO, MetadataRoute.FETCH_AVAILABLE_MODELS,
                       "streamGenerateContent", ("POST", "/token")):
             peer = FakePeer(packet(MetadataRoute.TOKEN))
-            with self.subTest(route=route), self.assertRaisesRegex(MetadataIngressError, "route is unavailable"):
-                read_enrollment_request(peer, route=route, deadline=time.monotonic() + 1)
+            with self.subTest(route=route):
+                deadline = time.monotonic() + 1
+                with self.assertRaisesRegex(MetadataIngressError, "route is unavailable"):
+                    read_enrollment_request(peer, route=route, deadline=deadline)
             self.assertEqual(peer.reads, [])
 
     def test_rejects_cross_phase_nonliteral_and_non_http11_request_lines(self):
@@ -119,8 +123,10 @@ class NativeMetadataIngressTest(unittest.TestCase):
             b"POST /token?extra=1 HTTP/1.1", b"POST /%74oken HTTP/1.1",
             b"POST https://oauth2.googleapis.com/token HTTP/1.1",
         ):
-            with self.subTest(request_line=request_line), self.assertRaisesRegex(MetadataIngressError, "request route"):
-                self.read(packet(MetadataRoute.TOKEN, request_line=request_line))
+            with self.subTest(request_line=request_line):
+                wire = packet(MetadataRoute.TOKEN, request_line=request_line)
+                with self.assertRaisesRegex(MetadataIngressError, "request route"):
+                    self.read(wire)
 
     def test_rejects_wrong_host_media_authorization_or_hop_values(self):
         for key, value in (
@@ -131,12 +137,15 @@ class NativeMetadataIngressTest(unittest.TestCase):
             (b"Connection", b"upgrade"), (b"Authorization", ACCESS),
             (b"Authorization", b"Basic malformed"), (b"Authorization", b"Basic " + base64.b64encode(b"other:fixture")),
         ):
-            with self.subTest(key=key), self.assertRaises(MetadataIngressError):
-                self.read(packet(MetadataRoute.TOKEN, changes={key: value}))
+            with self.subTest(key=key):
+                wire = packet(MetadataRoute.TOKEN, changes={key: value})
+                with self.assertRaises(MetadataIngressError):
+                    self.read(wire)
         for value in (CLIENT, b"Bearer bad token", b"Bearer"):
-            with self.subTest(value=value), self.assertRaises(MetadataIngressError):
-                self.read(packet(MetadataRoute.LOAD_CODE_ASSIST, changes={b"Authorization": value}),
-                          route=MetadataRoute.LOAD_CODE_ASSIST)
+            with self.subTest(value=value):
+                wire = packet(MetadataRoute.LOAD_CODE_ASSIST, changes={b"Authorization": value})
+                with self.assertRaises(MetadataIngressError):
+                    self.read(wire, route=MetadataRoute.LOAD_CODE_ASSIST)
 
     def test_rejects_duplicate_extra_missing_and_unclean_headers(self):
         for changes, extra in (
@@ -155,22 +164,27 @@ class NativeMetadataIngressTest(unittest.TestCase):
             ({b"Accept": b"application/\x80json"}, ()),
             ({b"Accept": b"x" * 4097}, ()),
         ):
-            with self.subTest(changes=changes, extra=extra), self.assertRaises(MetadataIngressError):
-                self.read(packet(MetadataRoute.TOKEN, changes=changes, extra=extra))
+            with self.subTest(changes=changes, extra=extra):
+                wire = packet(MetadataRoute.TOKEN, changes=changes, extra=extra)
+                with self.assertRaises(MetadataIngressError):
+                    self.read(wire)
+        wire = packet(MetadataRoute.LOAD_CODE_ASSIST, extra=(b"Accept: application/json",))
         with self.assertRaises(MetadataIngressError):
-            self.read(packet(MetadataRoute.LOAD_CODE_ASSIST, extra=(b"Accept: application/json",)),
-                      route=MetadataRoute.LOAD_CODE_ASSIST)
+            self.read(wire, route=MetadataRoute.LOAD_CODE_ASSIST)
 
     def test_rejects_noncanonical_oversized_or_partial_length(self):
         wire = packet(MetadataRoute.TOKEN)
         for value in (None, b"0", b"00", b"+5", b"5,5", b"8193", b"9" * 30, b" 5"):
-            with self.subTest(value=value), self.assertRaises(MetadataIngressError):
-                self.read(packet(MetadataRoute.TOKEN, changes={b"Content-Length": value}))
+            with self.subTest(value=value):
+                bad_length = packet(MetadataRoute.TOKEN, changes={b"Content-Length": value})
+                with self.assertRaises(MetadataIngressError):
+                    self.read(bad_length)
         for partial in (wire[:-1], wire.split(b"\r\n\r\n", 1)[0], b"x" * 8193):
             with self.assertRaises(MetadataIngressError):
                 self.read(partial)
+        oversized = packet(MetadataRoute.LOAD_CODE_ASSIST, body=b"x" * 32769)
         with self.assertRaises(MetadataIngressError):
-            self.read(packet(MetadataRoute.LOAD_CODE_ASSIST, body=b"x" * 32769), route=MetadataRoute.LOAD_CODE_ASSIST)
+            self.read(oversized, route=MetadataRoute.LOAD_CODE_ASSIST)
 
     def test_detects_body_overrun_at_head_body_boundary_and_socket_lookahead(self):
         wire = packet(MetadataRoute.TOKEN)
@@ -185,11 +199,13 @@ class NativeMetadataIngressTest(unittest.TestCase):
         read_enrollment_request(peer, route=MetadataRoute.TOKEN, deadline=time.monotonic() + 25)
         self.assertTrue(all(0 < timeout <= 2.5 for timeout in peer.timeouts))
         peer = FakePeer(wire)
+        deadline = time.monotonic() - 1
         with self.assertRaises(MetadataIngressError):
-            read_enrollment_request(peer, route=MetadataRoute.TOKEN, deadline=time.monotonic() - 1)
+            read_enrollment_request(peer, route=MetadataRoute.TOKEN, deadline=deadline)
         self.assertEqual(peer.reads, [])
+        error = OSError("synthetic-not-for-repr")
         with self.assertRaises(MetadataIngressError) as denied:
-            self.read(OSError("synthetic-not-for-repr"))
+            self.read(error)
         self.assertNotIn("synthetic-not-for-repr", str(denied.exception))
         self.assertIsNone(denied.exception.__context__)
 

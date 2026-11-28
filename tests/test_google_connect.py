@@ -1,7 +1,7 @@
 """Exercise attended enrollment boundaries with local fixtures only."""
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext, redirect_stderr, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, suppress
 import errno
 from hashlib import sha256
 from io import StringIO
@@ -68,11 +68,14 @@ class OfflineGuestGuardTest(unittest.TestCase):
             return json.dumps({"nftables": entries}).encode("ascii")
 
         self.assertRegex(offline.firewall(data(table)), r"^[0-9a-f]{64}$")
+        extra_rule = {"rule": {**base, "chain": "output", "expr": [{"accept": None}]}}
+        extra_rule_data = data([*table, extra_rule])
         with self.assertRaises(offline.Refused):
-            offline.firewall(data([*table, {"rule": {**base, "chain": "output", "expr": [{"accept": None}]}}]))
+            offline.firewall(extra_rule_data)
         chains[0]["chain"]["policy"] = "accept"
+        accept_default_data = data(table)
         with self.assertRaises(offline.Refused):
-            offline.firewall(data(table))
+            offline.firewall(accept_default_data)
 
     def test_projection_changes_only_account_home_and_binds_sealed_descriptor(self):
         root = Path(__file__).resolve().parents[1]
@@ -185,20 +188,20 @@ class OfflineGuestGuardTest(unittest.TestCase):
                     self.assertEqual(found, (case, home, sandbox))
                 marker = sandbox / "unexpected"
                 marker.touch()
-                with self.assertRaises(offline.Refused):
-                    with offline.case_paths(seal, "fixture-alpha"):
-                        self.fail("Nonempty sandbox reached enrollment")
+                paths = offline.case_paths(seal, "fixture-alpha")
+                with self.assertRaises(offline.Refused, msg="Nonempty sandbox reached enrollment"):
+                    self.enterContext(paths)
                 marker.unlink()
                 sandbox.rename(sandbox.with_name("retained"))
                 sandbox.mkdir(mode=0o700)
-                with self.assertRaises(offline.Refused):
-                    with offline.case_paths(seal, "fixture-alpha"):
-                        self.fail("Replacement sandbox reached enrollment")
+                paths = offline.case_paths(seal, "fixture-alpha")
+                with self.assertRaises(offline.Refused, msg="Replacement sandbox reached enrollment"):
+                    self.enterContext(paths)
                 case.rename(case.with_name("replaced"))
                 case.mkdir(mode=0o700)
-                with self.assertRaises(offline.Refused):
-                    with offline.case_paths(seal, "fixture-alpha"):
-                        self.fail("Replacement case reached enrollment")
+                paths = offline.case_paths(seal, "fixture-alpha")
+                with self.assertRaises(offline.Refused, msg="Replacement case reached enrollment"):
+                    self.enterContext(paths)
 
     def test_boot_and_pid_identity_precede_firewall_and_source(self):
         uid = os.getuid()
@@ -307,8 +310,10 @@ class OfflineGuestGuardTest(unittest.TestCase):
                         raise PermissionError("fixture blocked directory")
                     return opened(path, *args, **kwargs)
                 with patch.object(offline, "TEST_HOME", root), patch.object(offline.os, "open", side_effect=read_directory):
+                    uid = os.getuid()
+                    home_id = offline.identity(root.stat())
                     with self.assertRaises((offline.Refused, PermissionError)):
-                        offline.ordinary_provider_roots(os.getuid(), offline.identity(root.stat()))
+                        offline.ordinary_provider_roots(uid, home_id)
 
     def test_unbound_home_before_refuses_before_targeted_walk(self):
         scope = {"uid": 1000, "tree": "1" * 40, "boot": "0" * 36, "home_id": [2, 6], "seal": "2" * 64}
@@ -447,8 +452,9 @@ class OfflineGuestGuardTest(unittest.TestCase):
 
             with patch.object(controller, "SOURCE", source), patch.object(controller, "protected_directory"), \
                     patch.object(controller, "protected_bytes", side_effect=read):
+                digest = sha256(payload).hexdigest()
                 with self.assertRaises(controller.ControllerRefused):
-                    controller.pinned_driver(sha256(payload).hexdigest())
+                    controller.pinned_driver(digest)
                 with self.assertRaises(controller.ControllerRefused):
                     controller.pinned_driver("0" * 64)
 
@@ -973,11 +979,13 @@ class RuntimeCustodyTest(unittest.TestCase):
 
     def test_unknown_launch_retains_root_and_exact_durable_launch_record(self):
         record = Mock()
-        with self.assertRaisesRegex(connect.CustodyUnconfirmed, "requires inspection"):
-            with connect._private_runtime(self.parent, "fixture", False, self.owner) as custody:
-                root = custody.root
-                custody.bind(record)
-                custody.before_spawn(self.unit)
+        with ExitStack() as runtime:
+            custody = runtime.enter_context(connect._private_runtime(self.parent, "fixture", False, self.owner))
+            root = custody.root
+            custody.bind(record)
+            custody.before_spawn(self.unit)
+            with self.assertRaisesRegex(connect.CustodyUnconfirmed, "requires inspection"):
+                runtime.close()
         self.assertTrue(root.is_dir())
         event, data = record.call_args.args
         self.assertEqual((event, data["label"], data["root"], data["unit"], data["inode"]),
@@ -1295,7 +1303,8 @@ class RuntimeCustodyTest(unittest.TestCase):
 
             def spend(route, send):
                 with fence:
-                    assert authorized() and route is routes[len(sent)]
+                    assert authorized()
+                    assert route is routes[len(sent)]
                     send()
                     sent.append(route)
 
@@ -1315,7 +1324,8 @@ class RuntimeCustodyTest(unittest.TestCase):
                         live = scoped_post_token(post_diagnostic, fence, authorized)
                         verified.load_code_assist(authorization=BEARER, body=LOAD_REQUEST, post_diagnostic=live)
                 finally:
-                    assert len(sent) == len(channels) and all(len(channel.sent) == 1 for channel in channels)
+                    assert len(sent) == len(channels)
+                    assert all(len(channel.sent) == 1 for channel in channels)
 
         refuse = refuse_callback if kind == "callback" else refuse_token
         try:
@@ -1370,15 +1380,19 @@ class RuntimeCustodyTest(unittest.TestCase):
                 self.assertEqual(owner.write_once.call_count, 0 if uncertain else 1)
 
     def test_cold_runtime_does_not_replace_replica_cleanup(self):
-        with self.assertRaisesRegex(connect.CustodyUnconfirmed, "requires inspection"):
-            with connect._private_runtime(self.parent, "fixture", True, self.owner) as custody:
-                replica = custody.root / "profile"
-                replica.mkdir()
+        with ExitStack() as runtime:
+            custody = runtime.enter_context(connect._private_runtime(self.parent, "fixture", True, self.owner))
+            replica = custody.root / "profile"
+            replica.mkdir()
+            with self.assertRaisesRegex(connect.CustodyUnconfirmed, "requires inspection"):
+                runtime.close()
         self.assertTrue(replica.is_dir())
 
     def test_cold_disappearance_with_quarantine_requires_inspection(self):
-        with self.assertRaisesRegex(connect.CustodyUnconfirmed, "requires inspection"):
-            with connect._private_runtime(self.parent, "fixture", True, self.owner) as custody:
-                quarantine = self.parent / custody.quarantine
-                os.rename(custody.root, quarantine)
+        with ExitStack() as runtime:
+            custody = runtime.enter_context(connect._private_runtime(self.parent, "fixture", True, self.owner))
+            quarantine = self.parent / custody.quarantine
+            os.rename(custody.root, quarantine)
+            with self.assertRaisesRegex(connect.CustodyUnconfirmed, "requires inspection"):
+                runtime.close()
         self.assertTrue(quarantine.is_dir())

@@ -101,9 +101,9 @@ class NativeTransportTest(unittest.TestCase):
         for wire in (_CONNECT.replace(_AUTHORITY, b"other.invalid:443"), _CONNECT + b"x",
                      _CONNECT[:-2] + b"Extra: yes\r\n\r\n", b"x" * 4096):
             peer = Peer(wire)
-            with self.assertRaises(native_transport.NativeTransportError):
-                with self.open(peer):
-                    self.fail("Unexpected CONNECT permitted")
+            channel = self.open(peer)
+            with self.assertRaises(native_transport.NativeTransportError, msg="Unexpected CONNECT permitted"):
+                self.enterContext(channel)
             self.assertEqual(peer.writes, [])
             self.assertTrue(peer.closed)
         self.context.wrap_socket.assert_not_called()
@@ -111,9 +111,9 @@ class NativeTransportTest(unittest.TestCase):
     def test_owner_loss_before_connect_reply_never_starts_tls(self):
         self.owner.active.side_effect = [True, False]
         peer = Peer(_CONNECT)
-        with self.assertRaises(native_transport.NativeTransportError):
-            with self.open(peer):
-                self.fail("Retired owner permitted")
+        channel = self.open(peer)
+        with self.assertRaises(native_transport.NativeTransportError, msg="Retired owner permitted"):
+            self.enterContext(channel)
         self.assertEqual(peer.writes, [])
         self.context.wrap_socket.assert_not_called()
 
@@ -134,13 +134,14 @@ class NativeTransportTest(unittest.TestCase):
         with server, connector:
             connector.settimeout(1)
             connector.sendall(_CONNECT)
-            with self.assertRaisesRegex(native_transport.NativeTransportError, "owner retired"):
-                with native_transport.open_native_metadata_channel(
-                    server, route=MetadataRoute.TOKEN, deadline=time.monotonic() + 1,
-                    expected_group=b"/fixture", read_cgroup=read_group, context=self.context,
-                    authorized=lambda: live,
-                ):
-                    self.fail("Native TLS started after owner loss")
+            channel = native_transport.open_native_metadata_channel(
+                server, route=MetadataRoute.TOKEN, deadline=time.monotonic() + 1,
+                expected_group=b"/fixture", read_cgroup=read_group, context=self.context,
+                authorized=lambda: live,
+            )
+            with self.assertRaisesRegex(native_transport.NativeTransportError, "owner retired",
+                                        msg="Native TLS started after owner loss"):
+                self.enterContext(channel)
             self.assertEqual(connector.recv(128), b"")
         self.assertEqual(reads, 3)
         self.context.wrap_socket.assert_not_called()
@@ -199,9 +200,9 @@ class NativeTransportTest(unittest.TestCase):
 
     def test_userinfo_is_an_owner_only_route(self):
         peer = Peer(_CONNECT)
-        with self.assertRaises(native_transport.NativeTransportError):
-            with self.open(peer, MetadataRoute.USERINFO):
-                self.fail("Unexpected native userinfo accepted")
+        channel = self.open(peer, MetadataRoute.USERINFO)
+        with self.assertRaises(native_transport.NativeTransportError, msg="Unexpected native userinfo accepted"):
+            self.enterContext(channel)
         self.peer_admission.assert_not_called()
         self.assertTrue(peer.closed)
 
@@ -233,18 +234,21 @@ class NativeTransportTest(unittest.TestCase):
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connector:
                     connector.connect(str(path))
                     connector.sendall(b"invalid.example\n")
-                    with self.assertRaisesRegex(native_transport.NativeTransportError, "Invalid Google native sign-in link"):
-                        with receive(time.monotonic() + 1):
-                            self.fail("Invalid browser offer passed")
-                with self.assertRaisesRegex(native_transport.NativeTransportError, "owner retired"):
-                    with receive(time.monotonic() + 1):
-                        self.fail("Consumed browser offer restarted")
+                    admission = receive(time.monotonic() + 1)
+                    with self.assertRaisesRegex(native_transport.NativeTransportError, "Invalid Google native sign-in link",
+                                                msg="Invalid browser offer passed"):
+                        self.enterContext(admission)
+                admission = receive(time.monotonic() + 1)
+                with self.assertRaisesRegex(native_transport.NativeTransportError, "owner retired",
+                                            msg="Consumed browser offer restarted"):
+                    self.enterContext(admission)
 
     def test_waiting_for_ownership_ends_on_cancellation(self):
         listener = Mock()
         listener.accept.side_effect = TimeoutError
         owner = iter((True, True, False))
+        deadline = time.monotonic() + 60
         with self.assertRaisesRegex(native_transport.NativeTransportError, "owner retired"):
-            native_transport._accept_owned(listener, time.monotonic() + 60, lambda: next(owner))
+            native_transport._accept_owned(listener, deadline, lambda: next(owner))
         self.assertEqual(listener.accept.call_count, 2)
         self.assertTrue(all(call.args[0] <= .1 for call in listener.settimeout.call_args_list))

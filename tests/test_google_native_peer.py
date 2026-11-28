@@ -34,23 +34,23 @@ class NativePeerTest(unittest.TestCase):
 
     def test_rejects_different_uid_before_opening_pidfd_or_reading(self):
         self.connection.getsockopt.side_effect = [struct.pack("=3i", 123, 1001, 1000)]
-        with self.assertRaises(native_peer.NativePeerError):
-            with self.admit():
-                self.fail("unexpected peer")
+        admission = self.admit()
+        with self.assertRaises(native_peer.NativePeerError, msg="unexpected peer"):
+            self.enterContext(admission)
         self.membership.assert_not_called()
         self.closed.assert_not_called()
 
     def test_peer_exit_during_membership_read_denies_admission(self):
         self.alive.side_effect = [True, False]
-        with self.assertRaises(native_peer.NativePeerError):
-            with self.admit():
-                self.fail("unexpected peer")
+        admission = self.admit()
+        with self.assertRaises(native_peer.NativePeerError, msg="unexpected peer"):
+            self.enterContext(admission)
         self.membership.assert_called_once_with(123)
         self.closed.assert_called_once_with(77)
 
     def test_missing_pidfd_support_fails_closed(self):
         self.connection.getsockopt.side_effect = [struct.pack("=3i", 123, 1000, 1000), OSError()]
-        with self.assertRaises(native_peer.NativePeerError):
-            with self.admit():
-                self.fail("unexpected peer")
+        admission = self.admit()
+        with self.assertRaises(native_peer.NativePeerError, msg="unexpected peer"):
+            self.enterContext(admission)
         self.membership.assert_not_called()

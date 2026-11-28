@@ -99,9 +99,9 @@ class RegistrationTests(unittest.TestCase):
             self.assertEqual(json.loads(self.receipt.read_text())["phase"], "enrolling")
             self.assertEqual(list(profile.path.iterdir()), [])
             self.assertEqual(profile.path.parent, self.root / "profiles")
-        with self.assertRaises(registration.RegistrationUnavailable):
-            with self.journal.enrollment_profile(enrolled):
-                self.fail("enrollment started twice")
+        profile = self.journal.enrollment_profile(enrolled)
+        with self.assertRaises(registration.RegistrationUnavailable, msg="enrollment started twice"):
+            self.enterContext(profile)
         with self.assertRaises(registration.RegistrationUnavailable):
             self.journal.begin(BUILD)
         for path in (self.root, self.slot, self.profile_path(enrolled)):
@@ -138,14 +138,14 @@ class RegistrationTests(unittest.TestCase):
         proof = registration.ColdObservation(check, True, 0, True)
         with self.assertRaises(registration.RegistrationUnavailable):
             record_cold_observation(self.journal, check, proof)
-        with self.assertRaises(registration.RegistrationUnavailable):
-            with self.journal.cold_profile(replace(check, nonce="c" * 32)):
-                self.fail("stale cold check started")
+        profile = self.journal.cold_profile(replace(check, nonce="c" * 32))
+        with self.assertRaises(registration.RegistrationUnavailable, msg="stale cold check started"):
+            self.enterContext(profile)
         with self.journal.cold_profile(check):
             pass
-        with self.assertRaises(registration.RegistrationUnavailable):
-            with self.journal.cold_profile(check):
-                self.fail("cold check started twice")
+        profile = self.journal.cold_profile(check)
+        with self.assertRaises(registration.RegistrationUnavailable, msg="cold check started twice"):
+            self.enterContext(profile)
 
     def test_token_symlink_permissions_and_hardlink_refused(self):
         enrollment = self.journal.begin(BUILD)
@@ -281,8 +281,9 @@ class RegistrationTests(unittest.TestCase):
             with self.assertRaises(registration.RegistrationUnavailable):
                 record_cold_observation(self.journal, check, registration.ColdObservation(check, True, 0, True))
         self.assertEqual(self.lock.read_bytes(), b"!")
+        fresh_journal = registration.RegistrationJournal(LABEL)
         with self.assertRaisesRegex(registration.RegistrationUnavailable, "inspection after an interrupted write"):
-            registration.RegistrationJournal(LABEL).status()
+            fresh_journal.status()
 
     def test_uncertain_latch_clear_fsync_keeps_fresh_open_blocked(self):
         check, _ = self.checked()
@@ -296,8 +297,9 @@ class RegistrationTests(unittest.TestCase):
         with patch.object(registration.os, "fsync", side_effect=fail_clear):
             with self.assertRaises(registration.RegistrationUnavailable):
                 record_cold_observation(self.journal, check, registration.ColdObservation(check, True, 0, True))
+        fresh_journal = registration.RegistrationJournal(LABEL)
         with self.assertRaisesRegex(registration.RegistrationUnavailable, "inspection after an interrupted write"):
-            registration.RegistrationJournal(LABEL).status()
+            fresh_journal.status()
 
     def test_failed_latch_restore_parks_exact_lock_instead_of_reopening_slot(self):
         check, _ = self.checked()
@@ -324,8 +326,9 @@ class RegistrationTests(unittest.TestCase):
         self.assertFalse(self.lock.exists())
         parked, = self.slot.glob(".registration-held-*")
         self.assertTrue(os.path.samestat(lock_info, parked.stat()))
+        fresh_journal = registration.RegistrationJournal(LABEL)
         with self.assertRaises(registration.RegistrationUnavailable):
-            registration.RegistrationJournal(LABEL).status()
+            fresh_journal.status()
 
     def test_generation_key_and_digest_are_private_and_independent(self):
         first = self.journal.begin(BUILD)
@@ -593,8 +596,9 @@ class RegistrationTests(unittest.TestCase):
 
                 self.assertEqual(writes, ["one"])
                 self.assertEqual(lock.read_bytes(), b"!")
+                fresh_journal = registration.RegistrationJournal(window)
                 with self.assertRaisesRegex(registration.RegistrationUnavailable, "interrupted write"):
-                    registration.RegistrationJournal(window).status()
+                    fresh_journal.status()
 
     def test_uncertain_send_return_consumes_and_blocks_additional_routes(self):
         for label, outcome in (("raised", OSError("synthetic short write")), ("short", 1)):
@@ -655,8 +659,9 @@ class RegistrationTests(unittest.TestCase):
         saved = json.loads(self.receipt.read_text())
         self.assertEqual(saved["cold_metadata_spent"], 1)
         self.assertTrue(saved["metadata_pending"])
+        fresh_journal = registration.RegistrationJournal(LABEL)
         with self.assertRaisesRegex(registration.RegistrationUnavailable, "interrupted write"):
-            registration.RegistrationJournal(LABEL).status()
+            fresh_journal.status()
 
     def test_canonical_state_never_follows_a_profile_or_state_symlink(self):
         someplace = self.home / "other-state"

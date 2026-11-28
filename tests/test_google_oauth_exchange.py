@@ -140,10 +140,14 @@ class AuthorizationCodeExchangeTest(unittest.TestCase):
             self.check(binding=replace(self.offer, challenge=CHALLENGE + "="))
         alternate = "b" * 64
         changed = base64.urlsafe_b64encode(hashlib.sha256(alternate.encode()).digest()).decode().rstrip("=")
+        binding = replace(self.offer, challenge=changed)
+        body = form(code_verifier=alternate)
         with self.assertRaises(OAuthExchangeError):
-            self.check(binding=replace(self.offer, challenge=changed), body=form(code_verifier=alternate))
+            self.check(binding=binding, body=body)
+        binding = replace(self.offer, port=PORT + 1)
+        body = form(redirect_uri=redirect_uri(PORT + 1))
         with self.assertRaises(OAuthExchangeError):
-            self.check(binding=replace(self.offer, port=PORT + 1), body=form(redirect_uri=redirect_uri(PORT + 1)))
+            self.check(binding=binding, body=body)
 
     def test_form_rejects_duplicates_unknown_fields_and_malformed_encoding(self):
         invalid = (form() + b"&code=other", form() + b"&%63ode=other", form(client_id=CLIENT_ID),
@@ -194,8 +198,10 @@ class EnrollmentGrantTest(unittest.TestCase):
         options = ("", None, SCOPE.split(" ", 1)[0], SCOPE + " " + SCOPE.split(" ")[0],
                    SCOPE.replace(" ", "  ", 1), SCOPE.replace(" ", "\t", 1), SCOPE.upper())
         for scope in options:
-            with self.subTest(scope=scope), self.assertRaises(OAuthExchangeError):
-                validate_enrollment_grant(grant(scope=scope))
+            with self.subTest(scope=scope):
+                body = grant(scope=scope)
+                with self.assertRaises(OAuthExchangeError):
+                    validate_enrollment_grant(body)
 
     def test_refuses_malformed_or_unexpected_response_fields(self):
         without_refresh = json.loads(grant())
@@ -225,8 +231,9 @@ class EnrollmentGrantTest(unittest.TestCase):
             self.assertNotIn(credential, repr(parsed))
         with self.assertRaisesRegex(TypeError, "must remain in memory$"):
             pickle.dumps(parsed)
+        truncated = grant()[:-1]
         with self.assertRaises(OAuthExchangeError) as denied:
-            validate_enrollment_grant(grant()[:-1])
+            validate_enrollment_grant(truncated)
         self.assertIsNone(denied.exception.__context__)
         self.assertNotIn(ACCESS, str(denied.exception))
 
@@ -277,8 +284,9 @@ class ColdGrantTest(unittest.TestCase):
 
     def test_cold_grant_refuses_rotation_and_unknown_fields_even_with_valid_oidc(self):
         for field in ({"refresh_token": REFRESH}, {"refresh_token_expires_in": 7200}, {"extra": ID_SENTINEL}):
+            body = cold_grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, **field)
             with self.assertRaises(OAuthExchangeError):
-                validate_cold_grant(cold_grant(scope=OIDC_SCOPE, id_token=ID_SENTINEL, **field))
+                validate_cold_grant(body)
 
 
 class GrantScopeVariantsTest(unittest.TestCase):
@@ -313,8 +321,9 @@ class GrantScopeVariantsTest(unittest.TestCase):
                     self.assertNotIn(ID_SENTINEL.encode("ascii"), parsed.native_body)
                     alias_roles = ("access_token", "refresh_token") if factory is grant else ("access_token",)
                     for role in alias_roles:
+                        body = factory(scope=scope, id_token=ID_SENTINEL, **{role: ID_SENTINEL})
                         with self.assertRaises(OAuthExchangeError) as denied:
-                            validate(factory(scope=scope, id_token=ID_SENTINEL, **{role: ID_SENTINEL}))
+                            validate(body)
                         self.assertIs(denied.exception.token_stage, TokenStage.GRANT_IDENTITY)
                         self.assertNotIn(ID_SENTINEL, str(denied.exception))
 
@@ -343,8 +352,9 @@ class GrantScopeVariantsTest(unittest.TestCase):
             for stage, cases in invalid.items():
                 for index, scope in enumerate(cases):
                     with self.subTest(mode=validate.__name__, stage=stage, case=index):
+                        body = factory(scope=scope)
                         with self.assertRaises(OAuthExchangeError) as denied:
-                            validate(factory(scope=scope))
+                            validate(body)
                         self.assertIs(denied.exception.token_stage, stage)
                         for marker in (unknown, EMAIL_URI, first_label, ACCESS, REFRESH):
                             self.assertNotIn(marker, str(denied.exception))
@@ -361,8 +371,9 @@ class RefreshFormTest(unittest.TestCase):
             refresh_form(client_id="other-client"), refresh_form(scope=SCOPE + " openid"),
             refresh_form(grant_type="authorization_code"), refresh_form() + b"&refresh_token=other",
         ):
+            credential = cold_credential()
             with self.assertRaises(OAuthExchangeError) as denied:
-                validate_refresh_form(native, pinned_credential=cold_credential())
+                validate_refresh_form(native, pinned_credential=credential)
             self.assertNotIn(REFRESH, str(denied.exception))
 
     def test_credential_cannot_select_a_different_endpoint_or_schema(self):
@@ -370,8 +381,9 @@ class RefreshFormTest(unittest.TestCase):
             cold_credential(token_uri="https://other.invalid/token"), cold_credential(extra=True),
             cold_credential(scopes=[SCOPE]), cold_credential()[:-1] + b', "refresh_token": "other"}',
         ):
+            native = refresh_form()
             with self.assertRaises(OAuthExchangeError):
-                validate_refresh_form(refresh_form(), pinned_credential=record)
+                validate_refresh_form(native, pinned_credential=record)
 
 
 if __name__ == "__main__":
