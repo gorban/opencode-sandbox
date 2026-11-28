@@ -44,6 +44,10 @@ cannot reuse them as authority descriptors. Stdio failures are silent so a
 refusal cannot write to a substituted descriptor. The controller service
 keeps its separate standard-descriptor policy.
 
+The contention test waits for both authenticated holder channels to report
+the same pinned scope lock. It credits a losing holder only for bounded
+lock contention or a verified successor written by the other contender.
+
 The legacy adapter runs the exact archived connector and its registration
 store. It counts sends inside the real connection dispatch callback and uses
 the exact proof and ledger code. Its canary placement seam substitutes the
@@ -67,8 +71,11 @@ guest. Mount the verified root-owned bundle read-only at
 `r3legacy` and `r3worker` with distinct numeric UIDs and GIDs. The legacy
 sibling deliberately shares the legacy account. Give the two operator-mounted
 fixture filesystems mountpoints `/mnt/r3h` and `/mnt/r3c` and set those
-mount roots and `/run/oc-r3` to root-owned mode 0711. The appliance allocates
-fresh private run roots under them. Use a filesystem with working Unix socket
+mount roots to root-owned mode 0711. Set the root-owned `/run/oc-r3`
+scratch ancestor to mode 0755. Its controller-owned per-run directory also
+uses mode 0755 so the archived connector's read-only directory opens can
+traverse it as the legacy UID. Role homes and holder and receipt run roots
+use private mode 0700. Use a filesystem with working Unix socket
 and flock support. There is no user-namespace or same-UID fallback.
 
 For later activation, the operator independently compares the reviewed

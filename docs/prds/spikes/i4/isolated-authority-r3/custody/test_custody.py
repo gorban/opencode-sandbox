@@ -8,12 +8,13 @@ import os
 from pathlib import Path
 import select
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent
 SPIKE = ROOT.parent / "spike" if (ROOT.parent / "spike").is_dir() else ROOT.parent
@@ -27,7 +28,7 @@ from descriptor import Denied, Peer, canonical, descriptor_pair
 from preflight import (
     LEGACY, PLAN_OVERLAY, MeasurementRefused, _mount_record, _open_root, _run_checked, scan, verify_bundle,
 )
-from run import Appliance, _one, _role_command, _spawn_report, main
+from run import Appliance, _contending, _one, _role_command, _spawn_report, main
 
 
 CONTROLLER = Peer(os.getpid(), os.getuid(), os.getgid())
@@ -224,8 +225,9 @@ class IndependentPreflightTests(unittest.TestCase):
     def test_noncanonical_manifest_is_not_executed_even_with_matching_digest(self):
         raw = self.manifest.read_bytes() + b" "
         self.manifest.write_bytes(raw)
+        changed_pin = sha256(raw).hexdigest()
         with self.assertRaises(MeasurementRefused):
-            _run_checked(self.source, sha256(raw).hexdigest(), (), self.enter, sealed=False)
+            _run_checked(self.source, changed_pin, (), self.enter, sealed=False)
         self.assertFalse(self.marker.exists())
 
     def test_mount_refusals_leave_marker_absent_with_otherwise_matching_manifest(self):
@@ -239,13 +241,12 @@ class IndependentPreflightTests(unittest.TestCase):
         )
         for records, selected in cases:
             with self.subTest(selected=selected, lines=records.count(b"\n")):
-                def mount(_proc, _descriptor, path):
+                def mount(_proc, _descriptor, path, records=records, selected=selected):
                     return _mount_record(records, path, selected, "8:1")
 
                 with (patch("preflight._open_root", side_effect=lambda path, sealed: _open_root(path, sealed=False)),
-                      patch("preflight._SealedMount", side_effect=mount)):
-                    with self.assertRaises(MeasurementRefused):
-                        _run_checked(self.source, self.pin, (), self.enter, sealed=True)
+                      patch("preflight._SealedMount", side_effect=mount), self.assertRaises(MeasurementRefused)):
+                    _run_checked(self.source, self.pin, (), self.enter, sealed=True)
                 self.assertFalse(self.marker.exists())
 
 
@@ -284,9 +285,9 @@ class RolePreflightTests(unittest.TestCase):
                         verify_root_parent(proc, assertion=assertion, pidfd=pin)
             non_root_status = root_status.replace("Uid: 0 0 0 0", "Uid: 1234 1234 1234 1234")
             with (patch("bootstrap.os.getppid", return_value=parent),
-                  patch("bootstrap._parent_status", return_value=non_root_status)):
-                with self.assertRaises(CustodyRefused):
-                    verify_root_parent(proc, assertion=[parent, 0, 0], pidfd=parent_pin)
+                  patch("bootstrap._parent_status", return_value=non_root_status),
+                  self.assertRaises(CustodyRefused)):
+                verify_root_parent(proc, assertion=[parent, 0, 0], pidfd=parent_pin)
 
 
 class RoleDescriptorTests(unittest.TestCase):
@@ -530,11 +531,13 @@ class RestartTests(unittest.TestCase):
     def test_no_retirement_claim_for_live_process_or_self(self):
         from restart import lifetime, require_retired
 
+        own = lifetime()
         with self.assertRaises(CustodyRefused):
-            require_retired(lifetime())
-        with idle_child() as controller:
-            with self.assertRaises(CustodyRefused):
-                require_retired(lifetime(controller.pid))
+            require_retired(own)
+        controller = self.enterContext(idle_child())
+        live = lifetime(controller.pid)
+        with self.assertRaises(CustodyRefused):
+            require_retired(live)
 
     def test_retired_controller_and_new_exec_use_same_retained_bytes(self):
         scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -595,6 +598,123 @@ print(json.dumps({**evidence, "distinct_pid": fresh[1] != record["controller"][1
                                              "legacy_history_preserved": True, "distinct_pid": True})
 
 
+class QualificationRegressions(unittest.TestCase):
+    def test_legacy_scratch_has_readable_protected_ancestor_and_private_home(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        for leaf in ("holder", "receipt", "scratch"):
+            (root / leaf).mkdir(mode=0o700)
+        identities = {role: (os.getuid(), os.getgid()) for role in ACCOUNTS}
+        with (patch("run._HOLDER_MOUNT", root / "holder"), patch("run._RECEIPT_MOUNT", root / "receipt"),
+              patch("run._SCRATCH_ROOT", root / "scratch")):
+            appliance = Appliance(identities)
+            try:
+                mode = stat.S_IMODE(appliance.group.stat().st_mode)
+                # Give this same-UID test the ancestor permissions that a
+                # dropped nonowner would see. No account or privilege change.
+                appliance.group.chmod((mode & 0o007) * 0o111)
+                try:
+                    directory = os.open(appliance.group, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    os.close(directory)
+                finally:
+                    appliance.group.chmod(mode)
+                self.assertEqual(mode, 0o755)
+                self.assertEqual(stat.S_IMODE(appliance.legacy_home.stat().st_mode), 0o700)
+            finally:
+                appliance.drain()
+                appliance.cleanup()
+
+    def test_unrelated_loser_is_not_credited_as_scope_contention(self):
+        from run import _accept, _FAILURE, _POSITIVE_LEGACY
+
+        appliance = Mock()
+        appliance.count.return_value = 0
+        appliance.local.read.return_value = appliance.store.head.return_value = "initial"
+
+        def report(_job):
+            if appliance.report.call_count == 1:
+                return {"sends": 1, "settled": True}
+            appliance.count.return_value = 1
+            return {"refused": "wrong_grant"}
+
+        def before_contention(_appliance, revision, *_args, **options):
+            if revision:
+                self.fail("unrelated loser was credited as a contender")
+            return _FAILURE if options.get("wrong_peer") or options.get("route_mismatch") else {"refused": "wrong_grant"}
+
+        appliance.report.side_effect = report
+        with (patch("run._read_report", return_value=_POSITIVE_LEGACY), patch("run._history"),
+              patch("run._one", side_effect=before_contention),
+              self.assertRaisesRegex(CustodyRefused, "contending launch")):
+            _accept(appliance)
+
+    def test_unauthenticated_scope_gate_cannot_release_other_holder(self):
+        from run import _serve_contender
+
+        channel, store, gate = Mock(), Mock(), Mock()
+        channel.receive.return_value = ["scope-gate", "unrelated", [1, 2]]
+        with self.assertRaises(CustodyRefused):
+            _serve_contender(channel, store, gate, "expected", (1, 2))
+        gate.wait.assert_not_called()
+        channel.send.assert_not_called()
+
+    def test_spawn_parent_close_fault_reaps_already_owned_child(self):
+        process = Mock()
+        process.poll.return_value = None
+        process.pid = 123
+        process.returncode = None
+        owns_child = []
+        fault = OSError("synthetic parent descriptor close")
+
+        def spawn(*_args, **_kwargs):
+            owns_child.append(process)
+            return process
+
+        actual_close = os.close
+        failed = False
+
+        def close(fd):
+            nonlocal failed
+            actual_close(fd)
+            if owns_child and not failed:
+                failed = True
+                raise fault
+
+        fixture = SimpleNamespace(identities={"owner": (1000, 1000)}, homes={"owner": "/synthetic"}, children=[])
+        incoming = {"bootstrap": 3, "controller_pidfd": 4, "owner": 5}
+        with (patch("run.subprocess.Popen", side_effect=spawn), patch("run.os.close", side_effect=close),
+              self.assertRaises(OSError) as failure):
+            Appliance.spawn(fixture, "owner", {}, incoming)
+        self.assertIs(failure.exception, fault)
+        self.assertEqual(fixture.children, [process])
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=4)
+        self.assertTrue(process.stdout.closed)
+
+
+    def test_spawn_error_is_not_replaced_by_parent_close_fault(self):
+        original = OSError("synthetic spawn failure")
+        attempted = False
+        actual_close = os.close
+
+        def spawn(*_args, **_kwargs):
+            nonlocal attempted
+            attempted = True
+            raise original
+
+        def close(fd):
+            actual_close(fd)
+            if attempted:
+                raise OSError("synthetic close failure after spawn")
+
+        fixture = SimpleNamespace(identities={"worker": (1000, 1000)}, homes={"worker": "/synthetic"}, children=[])
+        with (patch("run.subprocess.Popen", side_effect=spawn), patch("run.os.close", side_effect=close),
+              self.assertRaises(OSError) as failure):
+            Appliance.spawn(fixture, "worker", {})
+        self.assertIs(failure.exception, original)
+        self.assertIn("Parent descriptor cleanup also failed", original.__notes__)
+        self.assertEqual(fixture.children, [])
+
+
 class RoleWiringTests(unittest.TestCase):
     def test_unprivileged_processes_wire_one_owner_and_holder_turn(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -624,8 +744,7 @@ with proc_self(inherited=fds.values()) as proc:
 print(json.dumps(result))
 '''
             child = _spawn_report([sys.executable, "-I", "-S", "-B", "-c", script, str(ROOT), role,
-                                   json.dumps({**config, "fds": fds})], {}, fds.values())
-            appliance.children.append(child)
+                                   json.dumps({**config, "fds": fds})], {}, fds.values(), appliance.children)
             return child
 
         roles = {role: (os.getuid(), os.getgid()) for role in ("holder", "owner", "legacy", "worker")}
@@ -636,9 +755,14 @@ print(json.dumps(result))
                 wrong = _one(appliance, 0, "initial", "first", fault="wrong-role")
                 self.assertEqual(wrong, {"refused": "wrong_grant"})
                 self.assertEqual(appliance.count(), 0)
-                self.assertEqual(_one(appliance, 0, "initial", "first"), {"sends": 1, "settled": True})
+                with patch.object(appliance, "probe") as probe:
+                    lost = _contending(appliance)
+                probe.assert_called_once()
+                won = "second" if lost == "first" else "first"
                 self.assertEqual(appliance.count(), 1)
-                self.assertEqual(appliance.store.head(), appliance.local.commitment(2, "settled-first"))
+                self.assertEqual(appliance.store.head(), appliance.local.commitment(2, "settled-" + won))
+                self.assertEqual(_one(appliance, 2, "settled-" + won, lost), {"sends": 1, "settled": True})
+                self.assertEqual(appliance.count(), 2)
             finally:
                 appliance.drain()
             appliance.cleanup()

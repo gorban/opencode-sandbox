@@ -78,24 +78,28 @@ def require_retired(before):
              and type(before[1]) is int and type(before[2]) is int and 1 < before[1] and 0 < before[2],
              "cannot confirm old controller lifetime")
     old_pid = before[1]
+    _check_prior_pid(old_pid, before[2])
+    return now
+
+
+def _check_prior_pid(old_pid, expected_start):
     try:
         pidfd = os.pidfd_open(old_pid)
     except ProcessLookupError:
-        return now
+        return
     try:
         with _kernel() as proc:
             try:
                 start = _start(proc, old_pid)
             except FileNotFoundError:
-                start = before[2]
-        if start == before[2]:
+                start = expected_start
+        if start == expected_start:
             poll = select.poll()
             poll.register(pidfd, select.POLLIN)
             _require(any(events & select.POLLIN for _, events in poll.poll(0)),
                      "previous controller is still live or retirement is unavailable")
     finally:
         os.close(pidfd)
-    return now
 
 
 def _read_at(root, leaf, uid):

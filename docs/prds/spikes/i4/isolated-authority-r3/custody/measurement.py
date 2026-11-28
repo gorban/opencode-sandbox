@@ -19,7 +19,7 @@ _SPIKE_FILES = {"descriptor.py", "receipt.py", "test_receipt.py", "WALKTHROUGH.m
 _MAX_ARCHIVE = 32 << 20
 
 
-def _extract(tree, source, destination, *, flat=False):
+def _archive(tree, source):
     args = ["/usr/bin/git", "archive", "--format=tar", tree]
     if source is not None:
         args.extend(["--", str(source)])
@@ -30,6 +30,11 @@ def _extract(tree, source, destination, *, flat=False):
             raise CustodyRefused("source archive exceeds limit")
         if process.wait(timeout=5):
             raise CustodyRefused("source archive unavailable")
+    return archive
+
+
+def _extract(tree, source, destination, *, flat=False):
+    archive = _archive(tree, source)
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
         for index, member in enumerate(tar):
             if index >= _MAX_FILES:

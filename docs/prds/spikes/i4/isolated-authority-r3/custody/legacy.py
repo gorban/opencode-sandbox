@@ -104,8 +104,8 @@ def _legacy_backend(state, mode, *, worker=None):
             "tokens": {"access": access, "refresh": "inert-" + secrets.token_urlsafe(24),
                        "expiry": int(time.time()) + 3600},
         })
-    with backend.profiles.publish(candidate, client):
-        pass
+    with backend.profiles.publish(candidate, client) as published:
+        require(published == candidate.profile, "legacy profile publication differs")
     return backend, transport
 
 
@@ -191,11 +191,43 @@ def _receive_unix_client(control, port):
         raise
 
 
+def _run_e2e_canary(case, mode, protected, backend, owner_factory):
+    from oc_openai import canary
+    from oc_openai.canary_ledger import CanaryLedgerError
+    from oc_openai.connection import ConnectionError
+
+    path = protected if mode == "protected" else None
+    if mode == "alternate":
+        path = case / "alt"
+        path.mkdir(mode=0o700)
+    try:
+        result = canary.run_live_canary_e2e(backend_factory=lambda: backend,
+                                           owner_factory=owner_factory, ledger_dir=path)
+    except (PermissionError, CanaryLedgerError, ConnectionError):
+        if mode != "protected":
+            raise
+        return
+    require(mode != "protected" and result.ok and result.upstream_calls == 1,
+            "legacy e2e accounting did not match placement")
+    ledger = path or case / "state"
+    require((ledger / "canary-e2e.json").exists(), "legacy e2e ledger absent")
+
+
+def _require_protected_registration(transport, protected):
+    from oc_openai.connection import ConnectionError
+
+    connection = _connection_factory(transport)(protected)
+    try:
+        connection.binding()
+    except (PermissionError, ConnectionError):
+        return
+    raise CustodyRefused("legacy registration crossed the holder boundary")
+
+
 def _canary(case, mode, legacy_archive, protected):
     from unittest.mock import patch
     from oc_openai import canary, canary_protocol
-    from oc_openai.canary_ledger import CANARY_FILE, CanaryLedgerError
-    from oc_openai.connection import ConnectionError
+    from oc_openai.canary_ledger import CANARY_FILE
     from test_openai_canary import _MEASURED_INSTRUCTIONS_HEADER
     from test_openai_live import Terminal
 
@@ -209,29 +241,10 @@ def _canary(case, mode, legacy_archive, protected):
                                        owner_factory=owner_factory, source_root=legacy_archive)
             require(result == 0 and (case / "state" / CANARY_FILE).exists(), "legacy canary did not settle")
         else:
-            path = None if mode == "canonical" else protected if mode == "protected" else case / "alt"
-            if mode == "alternate":
-                path.mkdir(mode=0o700)
-            try:
-                result = canary.run_live_canary_e2e(backend_factory=lambda: backend,
-                                                   owner_factory=owner_factory, ledger_dir=path)
-            except (PermissionError, CanaryLedgerError, ConnectionError):
-                if mode != "protected":
-                    raise
-            else:
-                require(mode != "protected" and result.ok and result.upstream_calls == 1,
-                        "legacy e2e accounting did not match placement")
-                ledger = path or case / "state"
-                require((ledger / "canary-e2e.json").exists(), "legacy e2e ledger absent")
+            _run_e2e_canary(case, mode, protected, backend, owner_factory)
     require(transport.sends == int(mode != "protected"), "unexpected legacy canary send count")
     if mode == "protected":
-        connection = _connection_factory(transport)(protected)
-        try:
-            connection.binding()
-        except (PermissionError, ConnectionError):
-            pass
-        else:
-            raise CustodyRefused("legacy registration crossed the holder boundary")
+        _require_protected_registration(transport, protected)
     return transport.sends
 
 

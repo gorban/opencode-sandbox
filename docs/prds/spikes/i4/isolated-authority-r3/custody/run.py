@@ -16,15 +16,17 @@ import stat
 import subprocess
 import sys
 import tempfile
+from threading import Barrier, BrokenBarrierError
 import time
 
 
 _SCRIPT = Path(__file__).resolve(strict=True)
 _SOURCE = Path("/opt/oc-r3/appliance")
+_SEALED_RUNNER = _SOURCE / "custody" / "run.py"
 if __name__ == "__main__":
     sealed_entry = sys.argv[1:2] in (["sealed"], ["restart"])
     if sealed_entry or os.geteuid() == 0:
-        if (not sealed_entry or os.geteuid() != 0 or _SCRIPT != _SOURCE / "custody" / "run.py"
+        if (not sealed_entry or os.geteuid() != 0 or _SCRIPT != _SEALED_RUNNER
                 or len(sys.argv) < 3 or os.environ != {"OC_R3_PREIMPORT": sys.argv[2]}):
             if sys.argv[1:2] != ["role"]:
                 print('{"result":"sealed_unavailable"}')
@@ -49,6 +51,7 @@ from test_receipt import LocalPair
 _HOLDER_MOUNT = Path("/mnt/r3h")
 _RECEIPT_MOUNT = Path("/mnt/r3c")
 _SCRATCH_ROOT = Path("/run/oc-r3")
+_SCRATCH_ANCESTOR_MODE = 0o755
 _OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _POSITIVE_LEGACY = {"canonical": 1, "alternate": 1, "canary": 1, "proof": 3, "ordinary": 1, "protected": 0}
 _FAILURE = {"refused": "custody_refused"}
@@ -93,7 +96,7 @@ def _mount_identity(path, proc):
 
 
 def _sealed_preflight(pin, evidence):
-    if (os.geteuid() != 0 or _SCRIPT != _SOURCE / "custody" / "run.py"
+    if (os.geteuid() != 0 or _SCRIPT != _SEALED_RUNNER
             or not sys.flags.isolated or not sys.flags.no_site or not sys.flags.dont_write_bytecode
             or not fingerprint(pin) or not fingerprint(evidence)):
         raise Unavailable("sealed service preconditions unavailable")
@@ -104,7 +107,7 @@ def _sealed_preflight(pin, evidence):
     if set(os.listdir("/sys/class/net")) - {"lo"}:
         raise Unavailable("guest network device detected")
     try:
-        _private_root(_SCRATCH_ROOT, 0o711)
+        _private_root(_SCRATCH_ROOT, _SCRATCH_ANCESTOR_MODE)
         with proc_self(inherited=()) as proc:
             holder = _mount_identity(_HOLDER_MOUNT, proc)
             receipt = _mount_identity(_RECEIPT_MOUNT, proc)
@@ -125,33 +128,61 @@ def _role_command(uid, gid, role):
             "/usr/bin/python3", "-I", "-S", "-B", str(_SCRIPT), "role", role]
 
 
-def _spawn_report(command, env, inherited):
-    with ExitStack() as opened:
-        # subprocess.DEVNULL uses a shared O_RDWR descriptor. Open the
-        # intended read and write roles separately and close the parent copies.
-        flags = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-        stdin = os.open("/dev/null", os.O_RDONLY | flags)
-        opened.callback(os.close, stdin)
-        stderr = os.open("/dev/null", os.O_WRONLY | flags)
-        opened.callback(os.close, stderr)
-        incoming, outgoing = os.pipe2(os.O_CLOEXEC)
-        opened.callback(os.close, outgoing)
-        reader = None
+def _retire_role(process):
+    try:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=4)
+    finally:
+        process.stdout.close()
+
+
+def _spawn_report(command, env, inherited, children):
+    cleanup_failures = []
+
+    def close_parent(fd):
         try:
-            reader = os.fdopen(incoming, "rb")
+            os.close(fd)
+        except OSError as failure:
+            cleanup_failures.append(failure)
+
+    process = None
+    reader = None
+    try:
+        with ExitStack() as opened:
+            flags = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+            stdin = os.open("/dev/null", os.O_RDONLY | flags)
+            opened.callback(close_parent, stdin)
+            stderr = os.open("/dev/null", os.O_WRONLY | flags)
+            opened.callback(close_parent, stderr)
+            incoming, outgoing = os.pipe2(os.O_CLOEXEC)
+            opened.callback(close_parent, outgoing)
+            try:
+                reader = os.fdopen(incoming, "rb")
+            except BaseException:
+                close_parent(incoming)
+                raise
             identity = os.fstat(outgoing)
             process = subprocess.Popen(
                 [*command, str(identity.st_dev), str(identity.st_ino)], env=env,
                 stdin=stdin, stdout=outgoing, stderr=stderr,
                 close_fds=True, pass_fds=tuple(inherited), start_new_session=True,
             )
-        except BaseException:
-            if reader is None:
-                os.close(incoming)
-            else:
+            process.stdout = reader
+            children.append(process)
+        if cleanup_failures:
+            raise cleanup_failures.pop(0)
+    except BaseException as primary:
+        try:
+            if process is not None:
+                _retire_role(process)
+            elif reader is not None:
                 reader.close()
-            raise
-    process.stdout = reader
+        except (OSError, subprocess.TimeoutExpired) as failure:
+            primary.add_note(f"Measured role cleanup failed ({type(failure).__name__})")
+        if cleanup_failures:
+            primary.add_note("Parent descriptor cleanup also failed")
+        raise
     return process
 
 
@@ -187,7 +218,7 @@ def _read_report(process):
         raise CustodyRefused("unexpected measured role exit")
     try:
         result = json.loads(stdout)
-    except (UnicodeError, ValueError):
+    except ValueError:
         raise CustodyRefused("invalid measured role report") from None
     if type(result) is not dict:
         raise CustodyRefused("invalid measured role report")
@@ -217,7 +248,7 @@ class Appliance:
     def __init__(self, identities):
         self.identities = {**identities, "sibling": identities["legacy"], "legacy-probe": identities["legacy"]}
         self.group = Path(tempfile.mkdtemp(prefix="r", dir=_SCRATCH_ROOT))
-        self.group.chmod(0o711)
+        self.group.chmod(_SCRATCH_ANCESTOR_MODE)
         self.receipt = _RECEIPT_MOUNT / ("r" + secrets.token_hex(16))
         self.receipt.mkdir(mode=0o700)
         self.scope = Path(tempfile.mkdtemp(prefix="r", dir=_HOLDER_MOUNT))
@@ -263,10 +294,8 @@ class Appliance:
         if len(encoded) > 8192:
             raise CustodyRefused("role config exceeds limit")
         home = self.homes["legacy" if role in ("legacy-probe", "sibling") else role]
-        process = _spawn_report(_role_command(uid, gid, role), {"HOME": str(home), "OC_R3_ROLE": encoded},
-                                inherited.values())
-        self.children.append(process)
-        return process
+        return _spawn_report(_role_command(uid, gid, role), {"HOME": str(home), "OC_R3_ROLE": encoded},
+                             inherited.values(), self.children)
 
     def count(self):
         files = sorted(self.scope.glob("send-*"))
@@ -274,7 +303,7 @@ class Appliance:
             raise CustodyRefused("invalid fixture counter evidence")
         return len(files)
 
-    def launch(self, stack, pool, revision, phase, profile, *, fault="none", route_mismatch=False):
+    def launch(self, stack, pool, revision, phase, profile, *, fault="none", route_mismatch=False, gate=None):
         controller_sock, receipt = descriptor_pair()
         holder_sock, owner_sock = descriptor_pair()
         holder_root, holder_boot = descriptor_pair()
@@ -294,7 +323,7 @@ class Appliance:
                             "owner": owner_sock.fileno()})
         holder = self.spawn("holder", {**common, "purposes": {"owner": self.identities["owner"]},
                                        "profile": profile, "registration": str(self.registration), "revision": revision,
-                                       "phase": phase, "lock": self.local.lock_identity},
+                                       "phase": phase, "lock": self.local.lock_identity, "contending": gate is not None},
                             {"controller_pidfd": controller_pidfd, "bootstrap": holder_boot.fileno(),
                              "owner": holder_sock.fileno(), "receipt": receipt.fileno(), "scope": self.scope_fd})
         for endpoint in (owner_boot, owner_sock, holder_boot, holder_sock, receipt):
@@ -308,7 +337,10 @@ class Appliance:
             verify_pidfd(proc, holder_pin, holder.pid)
         controller = stack.enter_context(Channel(controller_sock, _peer(holder, self.identities["holder"]),
                                                  os.dup(holder_pin)))
-        server = pool.submit(serve_receipts, controller, self.store)
+        if gate is None:
+            server = pool.submit(serve_receipts, controller, self.store)
+        else:
+            server = pool.submit(_serve_contender, controller, self.store, gate, slot, self.local.lock_identity)
         return (owner, holder, owner_root, holder_root, owner_pin, holder_pin, controller, server)
 
     def release(self, job, *, wrong_peer=False):
@@ -343,14 +375,23 @@ class Appliance:
             _require(result == {"protected_reads": 0, "job_readable": role == "worker"},
                      "fixture custody exclusion failed")
 
-    def drain(self):
+    def drain(self, primary=None):
+        failures = []
+
+        def attempt(retire, resource):
+            try:
+                retire(resource)
+            except (OSError, subprocess.TimeoutExpired) as failure:
+                failures.append(failure)
+
         for process in reversed(self.children):
-            if process.poll() is None:
-                process.kill()
-            process.wait(timeout=4)
-            process.stdout.close()
-        os.close(self.lock)
-        os.close(self.scope_fd)
+            attempt(_retire_role, process)
+        for descriptor in (self.lock, self.scope_fd):
+            attempt(os.close, descriptor)
+        if failures and primary is not None:
+            primary.add_note("Measured appliance retirement was incomplete")
+        elif failures:
+            raise failures[0]
 
     def cleanup(self):
         for root, expected in self.roots.items():
@@ -366,6 +407,33 @@ def _one(appliance, revision, phase, profile, *, wrong_peer=False, **options):
         job = appliance.launch(stack, pool, revision, phase, profile, **options)
         appliance.release(job, wrong_peer=wrong_peer)
         return appliance.report(job)
+
+
+def _serve_contender(channel, store, gate, slot, lock):
+    _require(channel.receive() == ["scope-gate", slot, list(lock)], "wrong canonical contention gate")
+    try:
+        gate.wait()
+    except BrokenBarrierError:
+        raise CustodyRefused("both exact holders did not reach the canonical scope gate") from None
+    channel.send(["scope-gate-open", slot])
+    serve_receipts(channel, store)
+
+
+def _contending(appliance):
+    accepted = {"sends": 1, "settled": True}
+    canonical_losses = ({"refused": Refusal.LOCK_BUSY.value}, {"refused": Refusal.PAIR_MISMATCH.value})
+    gate = Barrier(2, timeout=2)
+    with ExitStack() as stack, ThreadPoolExecutor(max_workers=2) as pool:
+        first = appliance.launch(stack, pool, 0, "initial", "first", gate=gate)
+        second = appliance.launch(stack, pool, 0, "initial", "second", gate=gate)
+        appliance.probe(first)
+        _require(appliance.count() == 0, "exclusive probes changed holder counter")
+        appliance.release(first)
+        appliance.release(second)
+        results = [appliance.report(first), appliance.report(second)]
+    _require(results.count(accepted) == 1 and appliance.count() == 1
+             and any(result in canonical_losses for result in results), "contending launch verdict mismatch")
+    return "second" if results[0] == accepted else "first"
 
 
 def _accept(appliance):
@@ -385,16 +453,7 @@ def _accept(appliance):
     result = _one(appliance, 0, "initial", "first", route_mismatch=True)
     _require(result == _FAILURE and appliance.count() == 0, "wrong holder binding was admitted")
 
-    with ExitStack() as stack, ThreadPoolExecutor(max_workers=2) as pool:
-        first = appliance.launch(stack, pool, 0, "initial", "first")
-        second = appliance.launch(stack, pool, 0, "initial", "second")
-        appliance.probe(first)
-        _require(appliance.count() == 0, "exclusive probes changed holder counter")
-        appliance.release(first)
-        appliance.release(second)
-        results = [appliance.report(first), appliance.report(second)]
-    _require(results.count(accepted) == 1 and appliance.count() == 1, "contending launch count mismatch")
-    lost = "second" if results[0] == accepted else "first"
+    lost = _contending(appliance)
     settled = "settled-first" if lost == "second" else "settled-second"
     _require(_one(appliance, 2, settled, lost) == accepted and appliance.count() == 2,
              "holder restart and second profile failed")
@@ -433,8 +492,10 @@ def _accept_failures(identities):
             else:
                 _require(appliance.local.snapshot() == appliance.initial
                          and not (appliance.receipt / "continuity.json").exists(), "receipt loss was repaired")
-        finally:
-            appliance.drain()
+        except BaseException as primary:
+            appliance.drain(primary)
+            raise
+        appliance.drain()
         appliance.cleanup()
 
 
@@ -450,8 +511,10 @@ def _sealed(pin, evidence):
         result = _accept(appliance)
         initial = appliance.local.commitment(0, "initial").wire()
         head = appliance.store.head().wire()
-    finally:
-        appliance.drain()
+    except BaseException as primary:
+        appliance.drain(primary)
+        raise
+    appliance.drain()
     _accept_failures(roles)
     state = {
         "controller": controller, "children_reaped": True, "bundle_pin": pin, "storage_pin": evidence,
@@ -476,7 +539,7 @@ def _restart(pin, evidence, handle):
                  and state["holder_mount"] == list(holder) and state["receipt_mount"] == list(controller_volume),
                  "retained installation does not match")
         receipt, scope, legacy = retained_paths(handle, _HOLDER_MOUNT, _RECEIPT_MOUNT, _SCRATCH_ROOT, state)
-        scratch = _private_root(legacy.parent, 0o711)
+        scratch = _private_root(legacy.parent, _SCRATCH_ANCESTOR_MODE)
         _require([scratch.st_dev, scratch.st_ino] == state["scratch_inode"], "retained scratch root changed")
         fresh = require_retired(state["controller"])
         _require(capture(receipt, scope, legacy, _retained_ids(roles)) == state["snapshot"],
@@ -498,7 +561,7 @@ def _restart(pin, evidence, handle):
 
 
 def _role_main(role, report):
-    if os.geteuid() == 0 or _SCRIPT != _SOURCE / "custody" / "run.py" or not sys.flags.isolated:
+    if os.geteuid() == 0 or _SCRIPT != _SEALED_RUNNER or not sys.flags.isolated:
         raise Unavailable("measured child entry unavailable")
     if set(os.environ) != {"HOME", "OC_R3_ROLE"} or len(os.environ["OC_R3_ROLE"]) > 8192:
         raise Unavailable("invalid measured child environment")
@@ -508,37 +571,41 @@ def _role_main(role, report):
     return run_role(role, config, report)
 
 
+def _entry(args, report):
+    if len(args) in (3, 4) and args[0] == "bundle" and os.geteuid() != 0:
+        pin = build_bundle(args[1], args[2], args[3] if len(args) == 4 else PLAN_OVERLAY)
+        return {"manifest_sha256": pin, "result": "offline_bundle_prepared"}
+    if len(args) == 3 and args[0] == "verify" and os.geteuid() != 0:
+        return {**verify_bundle(args[1], args[2]), "result": "offline_measurement_passed"}
+    if len(args) == 3 and args[0] == "sealed":
+        return _sealed(args[1], args[2])
+    if len(args) == 4 and args[0] == "restart":
+        return _restart(args[1], args[2], args[3])
+    if report is not None:
+        return _role_main(args[1], report)
+    raise Unavailable("invalid fixture invocation")
+
+
 def main(args):
     report = None
     if args[:1] == ["role"]:
         # Even a negative report must never be written to an unverified FD.
         try:
-            if len(args) != 4 or not all(re.fullmatch(r"[0-9]{1,20}", value) for value in args[2:]):
+            if len(args) != 4 or not all(re.fullmatch(r"\d{1,20}", value, re.ASCII) for value in args[2:]):
                 return 3
             report = int(args[2]), int(args[3])
             verify_role_stdio(report)
         except (CustodyRefused, OSError):
             return 3
     try:
-        if len(args) in (3, 4) and args[0] == "bundle" and os.geteuid() != 0:
-            pin = build_bundle(args[1], args[2], args[3] if len(args) == 4 else PLAN_OVERLAY)
-            result = {"manifest_sha256": pin, "result": "offline_bundle_prepared"}
-        elif len(args) == 3 and args[0] == "verify" and os.geteuid() != 0:
-            result = {**verify_bundle(args[1], args[2]), "result": "offline_measurement_passed"}
-        elif len(args) == 3 and args[0] == "sealed":
-            result = _sealed(args[1], args[2])
-        elif len(args) == 4 and args[0] == "restart":
-            result = _restart(args[1], args[2], args[3])
-        elif report is not None:
-            result = _role_main(args[1], report)
-        else:
-            raise Unavailable("invalid fixture invocation")
+        result = _entry(args, report)
         print(json.dumps(result, separators=(",", ":")))
         return 0
     except Unavailable:
         print(json.dumps({"result": "sealed_unavailable"}, separators=(",", ":")))
         return 2
-    except (CustodyRefused, MeasurementRefused, Denied, OSError, ValueError, TypeError, KeyError):
+    except (CustodyRefused, MeasurementRefused, Denied, OSError, ValueError, TypeError, KeyError,
+            subprocess.TimeoutExpired):
         print(json.dumps(_FAILURE, separators=(",", ":")))
         return 3
 

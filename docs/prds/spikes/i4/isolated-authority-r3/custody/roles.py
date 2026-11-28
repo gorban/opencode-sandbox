@@ -14,8 +14,8 @@ from bootstrap import (
     CustodyRefused, proc_self, receive_bootstrap, role_accounts, verify_role, verify_role_record, verify_role_stdio,
     verify_root_parent,
 )
-from descriptor import Channel, Denied, OwnerGrant, Peer, canonical, decode, fingerprint
-from receipt import ReceiptClient
+from descriptor import Channel, Denied, OwnerGrant, Peer, Refusal, canonical, decode, fingerprint
+from receipt import ReceiptClient, advance_locked
 from test_receipt import LocalPair
 
 
@@ -190,6 +190,48 @@ def _owner(config, owner_socket, holder, holder_pidfd):
     return {"owner": "closed"}
 
 
+def _scope_gate(pair, receipt, slot):
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    lock = os.open("scope.lock", flags, dir_fd=pair.directory)
+    try:
+        pair._require_lock(lock)
+        receipt.send(["scope-gate", slot, list(pair.lock_identity)])
+        if receipt.receive() != ["scope-gate-open", slot]:
+            raise CustodyRefused("controller did not release the scope gate")
+        pair._require_lock(lock)
+    finally:
+        os.close(lock)
+
+
+def _claim_contender(pair, client, config, claimed, authority):
+    revision, slot, profile = config["revision"], config["slot"], config["profile"]
+    other = {"first": "second", "second": "first"}[profile]
+    expected = pair.commitment(revision, config["phase"])
+    proposed = pair.commitment(revision + 1, claimed)
+    locked = False
+    try:
+        with pair.locked():
+            locked = True
+            current = pair.read()
+            if current != expected:
+                competing = (pair.commitment(revision + 1, "claimed-" + other),
+                             pair.commitment(revision + 2, "settled-" + other))
+                if current not in competing:
+                    raise CustodyRefused("canonical scope does not contain the other contender")
+                client.require(current)
+                authority()
+                return Refusal.PAIR_MISMATCH
+            advance_locked(client, expected, proposed, read_local=pair.read,
+                           publish_local=lambda: pair.restore(pair.pair(revision + 1, claimed)),
+                           require_authority=authority, dispatch=lambda: _mark_send(pair.directory, slot))
+    except Denied as failure:
+        if not locked and failure.reason is Refusal.LOCK_BUSY:
+            authority()
+            return Refusal.LOCK_BUSY
+        raise CustodyRefused("contender failed outside canonical scope competition") from failure
+    return None
+
+
 def _holder(config, scope, receipt, owner):
     pair = LocalPair(scope, tuple(config["lock"]))
     grant = OwnerGrant(owner, config["slot"], config["intent"])
@@ -211,8 +253,14 @@ def _holder(config, scope, receipt, owner):
     authority = lambda: grant.require_live(config["slot"], config["intent"])
     claimed = "claimed-" + config["profile"]
     settled = "settled-" + config["profile"]
-    pair.advance(client, revision, phase, claimed, authority, lambda: _mark_send(scope, config["slot"]),
-                 partial=config["fault"] == "partial")
+    if config.get("contending"):
+        _scope_gate(pair, receipt, config["slot"])
+        loss = _claim_contender(pair, client, config, claimed, authority)
+        if loss is not None:
+            return {"refused": loss.value}
+    else:
+        pair.advance(client, revision, phase, claimed, authority, lambda: _mark_send(scope, config["slot"]),
+                     partial=config["fault"] == "partial")
     pair.advance(client, revision + 1, claimed, settled, authority)
     return {"sends": 1, "settled": True}
 

@@ -322,8 +322,9 @@ def main(args):
                 or (len(args) == 4 and not _HANDLE.fullmatch(args[3]))):
             raise MeasurementRefused("independent sealed service unavailable")
         _install_pins(args[1])
-        with _proc_self(check_inherited=True):
-            pass
+        with _proc_self(check_inherited=True) as proc:
+            if os.get_inheritable(proc):
+                raise MeasurementRefused("bootstrap verifier descriptor must close on exec")
         _run_checked(SOURCE, args[1], args, _exec, sealed=True)
     except (MeasurementRefused, OSError, ValueError, RecursionError):
         print('{"result":"preimport_refused"}')
