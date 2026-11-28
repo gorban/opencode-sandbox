@@ -203,8 +203,9 @@ Direction recorded:
 - Tauri becomes the only shipping shell if Tauri qualification passes, once the shared frontend
   qualification has passed. See the [control-plane decision](#control-plane-decision).
 - The first end-to-end example is a minimal crew pipeline ([prd_n](prd_n.md#delivery-order)).
-- Assumption, not yet confirmed by the operator: the slice uses a synthetic model route first, as
-  the [local proof](spikes/m/local/README.md) does, so it does not wait on live providers.
+- The slice uses a synthetic model route first, as the [local proof](spikes/m/local/README.md)
+  does, so it does not wait on live providers. The operator confirmed this on 2026-11-28 and
+  added one live run of the same pipeline in Wave 2, as soon as a live route is accepted.
 
 ### Wave 0: prove and decide
 
@@ -213,9 +214,13 @@ one before it. The other items run in parallel with them.
 
 In order:
 
-- [ ] **Step 1: production code home and toolchain pins.** Decide where the frontend, the Tauri
-      shell and the daemon modules live outside `docs/prds/spikes/`
-      ([prd_k](prd_k.md#later-runtime-layout)), and pin Node and Rust ([prd_f](prd_f.md)).
+- [ ] **Step 1: production code home and toolchain pins.** Decided by the operator on
+      2026-11-28: the frontend lives in `apps/dashboard/`, which holds the generated project as
+      it comes, with the Tauri shell in `src-tauri/` inside it
+      ([prd_m3a3](prd_m3a3.md#code-home)). Still to do in this step: pin Node and Rust
+      ([prd_f](prd_f.md)). Where the daemon modules live is not decided here. It stays with
+      [prd_k](prd_k.md#later-runtime-layout) and is needed before the Wave 1 daemon port, not
+      before steps 2 to 4.
 - [ ] **Step 2: seed the skeleton** ([prd_m3a3](prd_m3a3.md#skeleton)). Generate the stock
       `sv create` skeleton with its add-ons in that home, with async Svelte on, and record the
       exact command and versions. Nothing is built on it yet.
@@ -279,13 +284,16 @@ verification pass, resolves the human gate and sees the run complete.
 - **If the shared frontend qualification fails,** there is no finish line yet. Work stops for
   the operator's decision, as the [control-plane decision](#control-plane-decision) says.
 
-Either way the slice is local and synthetic. It needs no live provider route and no SSH worker,
-provided the operator confirms the synthetic route recorded above as an assumption. Without that
-confirmation Wave 1 also waits on a live route ([prd_i4](prd_i4.md)). Live and remote
-qualification of the same pipeline stays in Wave 3.
+Either way the slice is local and synthetic. It needs no live provider route and no SSH worker.
+One live run of the same pipeline follows in Wave 2. Full live and remote qualification stays in
+Wave 3.
 
 ### Wave 2: widen
 
+- [ ] One live run of the crew pipeline, as soon as a live route is accepted
+      ([prd_i4](prd_i4.md)). It does not hold up the other items in this wave. The route itself
+      is reserved to Outside-in integrations. Workflow-side detail is in
+      [prd_n](prd_n.md#wave-2-widen).
 - [ ] Composer, target picker and message sending
       ([M3 §2](prd_m3.md#2-symmetric-human--root-orchestrator-messaging--full-key-write-ahead-provenance)).
 - [ ] Diff drawer and checkpoints.
@@ -317,8 +325,16 @@ Decisions:
 - Shell order: [control-plane decision](#control-plane-decision), settled by the
   [tech-stack spike](prd_m3b.md#tech-stack-spike).
 - How much of the UI is built on UI SDK primitives: [prd_m3a2](prd_m3a2.md#open-decision).
-- Process for the design supplement: [prd_m3a1](prd_m3a1.md#design-supplement).
-- Frontend conventions and development add-ons: [prd_m3a3](prd_m3a3.md#open-decisions).
+- Process for the design supplement, decided: a council round for the three workflow screens
+  and one design for the rest ([prd_m3a1](prd_m3a1.md#design-supplement)).
+- Frontend code home and development add-ons, decided:
+  [prd_m3a3](prd_m3a3.md#code-home) and [prd_m3a3](prd_m3a3.md#open-decisions).
+- Model route for the first slice, decided: synthetic in Wave 1, then one live run in Wave 2.
+- Engine under the first slice, decided: `workflow@1` from the start, pipeline first
+  ([prd_n](prd_n.md#open-top-level-decisions)).
+- Restart behaviour for active runs, decided for Wave 1: pause and resume with one approval.
+  Opt-in unattended resume is a Wave 3 decision
+  ([prd_n1](prd_n1.md#concrete-checkboxes-and-open-decisions)).
 - Workflow authoring surface and authored deterministic steps:
   [prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps).
 - Configuration editing interface: [prd_j](prd_j.md#later-configuration-and-editor).

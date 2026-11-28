@@ -318,5 +318,7 @@ policy modules, and print the exact commands needed to bring the target up to sp
   Preserve root launch and symlink behavior, source markers, helper and image lookup, and test
   fixture behavior on each move. Run rootless host acceptance for affected runtime pieces.
   Group tests by fixture type when it makes them easier to find.
+  The dashboard frontend is outside these moves. It lives in `apps/dashboard/`
+  ([prd_m3a3](prd_m3a3.md#code-home)).
 
 - [ ] **Human review**: checked only when the user says so

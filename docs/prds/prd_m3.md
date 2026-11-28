@@ -688,7 +688,9 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
       two existing fixtures ([design brief](spikes/m/dashboard-design/brief/fixtures/workspace.json)
       and [web-ui](spikes/m/web-ui/fixtures/workspace.mjs)) into one synthetic set that also
       holds a crew pipeline run, its lease approval and its human gate
-      ([prd_n](prd_n.md#delivery-order)). Keep the hostile strings. This is a Wave 0 blocker in
+      ([prd_n](prd_n.md#delivery-order)). Keep the hostile strings. The contract and the fixture
+      set live inside the frontend project, as plain data the host side also reads
+      ([prd_m3a3](prd_m3a3.md#code-home)). This is a Wave 0 blocker in
       the [delivery order](prd_m.md#delivery-order).
 - [ ] **Gap M3.7 — Settings, change review and operator-only secret entry:** implement
       [§7](#7-settings-proposed-changes-and-operator-only-secret-entry) in three steps: the

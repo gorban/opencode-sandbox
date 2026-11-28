@@ -432,16 +432,20 @@ for the crew pipeline.
       outstanding-effects safe-point, unconditional Tier-A `(new_spec_digest,
       new_grant_generation)` re-authorization on every live migration, and late tool-result
       re-verification fence.
-- [ ] **(decision needed)** Restart behavior for active `nudge_bounded` / metered workflows after
-      `oc_daemon` restart (Trap T13):
-  - **Option A (Recommended):** `observe_only` runs auto-resume; active/metered runs boot into
+- [x] Restart behavior for active `nudge_bounded` / metered workflows after
+      `oc_daemon` restart (Trap T13). **Decided by the operator on 2026-11-28: Option A for the
+      first slice.** It also covers the crew pipeline's run lease. Option B is not rejected. It
+      is a Wave 3 decision in the [delivery order](prd_n.md#wave-3-later), to be taken once
+      unattended overnight runs are real, and it still needs its own Gate 1 review.
+  - **Option A (chosen):** `observe_only` runs auto-resume; active/metered runs boot into
     `paused (lease_reconfirm_required)` and present a **single batched "Resume N paused workflows"
     card** in `Approval Inbox (Tier A)`.
     - *Pros:* Preserves `prd_m2`'s strict invariant that controller restarts invalidate prior grant
       generations; one click resumes the whole fleet cleanly.
     - *Cons:* Overnight host reboot requires one morning click before auto-nudges resume.
     - *Effort:* ~0.5 days.
-  - **Option B:** Allow an explicit opt-in `durable_auto_resume = true` flag on `WorkflowRunLease`
+  - **Option B (deferred to Wave 3):** Allow an explicit opt-in `durable_auto_resume = true`
+    flag on `WorkflowRunLease`
     (operator-signed, bounded by `expires_at` and hard spend/nudge ceilings) for unattended
     overnight runs.
     - *Pros:* Survives unattended daemon restarts overnight without manual resume.

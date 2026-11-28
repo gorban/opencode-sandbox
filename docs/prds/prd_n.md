@@ -223,7 +223,8 @@ desktop surfaces explicitly depend on completing the open upstream slices:
 
 Wave 1 of the [delivery order](#delivery-order) is a local, synthetic slice. From the list above
 it needs the joint local transport proof and Trusted Host Chrome. It does not need live provider
-routes or SSH onboarding, provided the operator confirms the synthetic route. Live and remote
+routes or SSH onboarding. The operator confirmed the synthetic route on 2026-11-28. One live run
+of the pipeline follows in Wave 2 once a live route is accepted. Full live and remote
 qualification of the same pipeline still depends on every item above.
 
 - [*] **N0 — PRD N Gate 1 design & security review** (`prd_n.md`, `prd_n1.md`, `prd_n2.md`,
@@ -284,13 +285,16 @@ Direction recorded:
       [Reserved: Dashboard design.]
 - [ ] Reciprocal review of this PRD and its children, the open part of N0.
       [Reserved: PRD N workflows & supervision.]
-- [ ] Settle the decisions the built-in crew pipeline needs, and only those:
-  - the [initial slice scope](#open-top-level-decisions);
-  - the [restart behaviour](prd_n1.md#concrete-checkboxes-and-open-decisions) for active runs,
-    because the pipeline holds a run lease;
-  - the operator's confirmation of the synthetic model route for Wave 1;
-  - design and security review of the workflow list, definition and run views
-    ([prd_n3 §4](prd_n3.md#4-workflow-views-and-change-review)).
+- [ ] Settle the decisions the built-in crew pipeline needs, and only those. The operator
+      settled the first three on 2026-11-28. The review is still open.
+  - [x] The [initial slice scope](#open-top-level-decisions): `workflow@1` from the start,
+        pipeline first.
+  - [x] The [restart behaviour](prd_n1.md#concrete-checkboxes-and-open-decisions) for active
+        runs, because the pipeline holds a run lease: pause, and resume with one approval.
+  - [x] The model route for Wave 1: synthetic, with one live run in Wave 2.
+  - [ ] Design and security review of the workflow list, definition and run views
+        ([prd_n3 §4](prd_n3.md#4-workflow-views-and-change-review)). The screens come from the
+        council round in the [design supplement](prd_m3a1.md#design-supplement).
 
 The other open decisions in this PRD and its children do not block Wave 1. Each is settled
 before the wave that uses it:
@@ -324,6 +328,10 @@ dashboard if it fails. The items below are the same either way.
 
 ### Wave 2: widen
 
+- [ ] One live run of the minimal crew pipeline, as soon as a live route is accepted
+      ([prd_i4](prd_i4.md)): the same definition, with the reviewer on its own route if one is
+      available. It does not hold up the other items in this wave. The route itself is reserved
+      to Outside-in integrations.
 - [ ] The fleet supervisor, observe-only first: host metrics, the classifier route, the
       throttler and the blind check ([prd_n2](prd_n2.md)).
       [Reserved: PRD N workflows & supervision.]
@@ -340,6 +348,9 @@ dashboard if it fails. The items below are the same either way.
       [Reserved: Outside-in integrations.]
 - [ ] The spike for authored deterministic steps
       ([prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps)).
+- [ ] Decide whether a run lease may opt in to unattended resume after a restart
+      ([prd_n1](prd_n1.md#concrete-checkboxes-and-open-decisions)), once unattended overnight
+      runs are real.
 
 ### Shared blockers and decisions
 
@@ -350,8 +361,16 @@ Decisions:
 - Shell order: [prd_m control-plane decision](prd_m.md#control-plane-decision), settled by the
   [tech-stack spike](prd_m3b.md#tech-stack-spike).
 - How much of the UI is built on UI SDK primitives: [prd_m3a2](prd_m3a2.md#open-decision).
-- Process for the design supplement: [prd_m3a1](prd_m3a1.md#design-supplement).
-- Frontend conventions and development add-ons: [prd_m3a3](prd_m3a3.md#open-decisions).
+- Process for the design supplement, decided: a council round for the three workflow screens
+  and one design for the rest ([prd_m3a1](prd_m3a1.md#design-supplement)).
+- Frontend code home and development add-ons, decided:
+  [prd_m3a3](prd_m3a3.md#code-home) and [prd_m3a3](prd_m3a3.md#open-decisions).
+- Model route for the first slice, decided: synthetic in Wave 1, then one live run in Wave 2.
+- Engine under the first slice, decided: `workflow@1` from the start, pipeline first
+  ([prd_n](prd_n.md#open-top-level-decisions)).
+- Restart behaviour for active runs, decided for Wave 1: pause and resume with one approval.
+  Opt-in unattended resume is a Wave 3 decision
+  ([prd_n1](prd_n1.md#concrete-checkboxes-and-open-decisions)).
 - Workflow authoring surface and authored deterministic steps:
   [prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps).
 - Configuration editing interface: [prd_j](prd_j.md#later-configuration-and-editor).
@@ -371,11 +390,11 @@ Dependencies owned elsewhere:
 
 ## Open top-level decisions
 
-- [ ] **(decision needed)** Initial implementation slice scope:
-  - *Operator direction, 2026-11-28:* the first example is the minimal crew pipeline, built as a
-    `workflow@1` statechart with built-in actions, ahead of the supervisor
-    ([delivery order](#delivery-order)). That is Option 1's approach with its sequence
-    reversed. The choice between the options below is still to be confirmed.
+- [x] Initial implementation slice scope. **Decided by the operator on 2026-11-28: Option 1
+      with its sequence reversed.** The first example is the minimal crew pipeline, built as a
+      `workflow@1` statechart with built-in actions on a minimal kernel. The supervisor follows
+      in Wave 2 on the same kernel ([delivery order](#delivery-order)). Option 2 and Option 1
+      in its original order were considered and not chosen.
   - **Option 1 (Recommended):** Build **N1 + N2 + N3** in vertical phased PRs, starting with the
     minimal `workflow@1` runner + `builtin/firstmate-supervisor` + `Human Inbox` + `/decisions/*`
     + metrics, then expanding general multi-stage `workflow@1` statecharts (`builtin/prd-delivery-pipeline`)

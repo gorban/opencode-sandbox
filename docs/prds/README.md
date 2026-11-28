@@ -62,6 +62,14 @@ reservation explicitly in this index.
   made at the operator's direction and wait for those owners' reciprocal review.
   Acknowledgments still open: **Dashboard design**, **PRD M coordination**, **PRD N workflows &
   supervision**.
+- [ ] Frontend foundation: Wave 0 steps 1 to 4
+  ([prd_m](prd_m.md#wave-0-prove-and-decide), [M3a3](prd_m3a3.md)) — open. The workstream that
+  takes it marks this line `[*]` and adds its name and branch. It alone edits the shared files
+  of `apps/dashboard/` listed under the [code home](prd_m3a3.md#code-home).
+- [ ] Shared UI contract and fixture set
+  ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)) — open. The workstream that takes it
+  marks this line `[*]` and adds its name and branch. It owns
+  `apps/dashboard/src/lib/contract/` and `apps/dashboard/src/lib/fixtures/`.
 
 Coordinate SSH fixtures and remote acceptance with **Warm worker seeding**
 (`codex/warm-worker-seeding`). That workstream owns [I5](prd_i5.md) warm-start

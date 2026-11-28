@@ -22,6 +22,8 @@ Implementing the skeleton and harness is code, so the
   (styling is already decided in [prd_m3a1](prd_m3a1.md#open-decisions)), `drizzle` and
   `better-auth` (server-side), `mdsvex` (it compiles Markdown into components, against the inert
   Markdown rule), `paraglide` (translation is not planned) and `enhanced-img`.
+- **Development add-ons.** Take `ai-tools` and `devtools` as well, set up as the
+  [decision below](#open-decisions) records.
 - **Async Svelte, now.** Enable it for its architectural benefits. The style guide says it is
   experimental. Watch for Svelte 6 and remove the flag then. Reconsider only if a critical issue
   appears. If it fails for one specific case, convert that case to conventional code, record the
@@ -67,6 +69,17 @@ Re-verify at Gate 1.
   `ai-tools`, `better-auth`, `devtools`, `drizzle`, `enhanced-img`, `eslint`, `mdsvex`,
   `paraglide`, `playwright`, `prettier`, `storybook`, `sveltekit-adapter`, `tailwindcss` and
   `vitest`. [sv create](https://svelte.dev/docs/cli/sv-create)
+- **What `sv create` generates.** Read from the CLI's source and its own snapshots at `sv`
+  1.7.1, without running it. The `minimal` template with TypeScript gives `package.json`,
+  `tsconfig.json`, `vite.config.ts`, `src/app.html`, `src/app.d.ts`, `src/lib/index.ts`,
+  `src/routes/+layout.svelte`, `src/routes/+page.svelte` and `static/robots.txt`, with a `#lib`
+  import alias declared in `package.json`. `eslint` adds `eslint.config.js`. `prettier` adds
+  `prettier.config.js` and `.prettierignore`. `vitest` adds two test projects to
+  `vite.config.ts`: `*.svelte.spec.ts` in a real browser, Chromium only, and other `*.spec.ts`
+  in Node. `playwright` adds `playwright.config.ts`, which matches `*.e2e.ts` anywhere and runs
+  against the built preview. `sveltekit-adapter` sets the adapter in `vite.config.ts`.
+  `storybook` runs `create-storybook@latest`, and what that writes is not in the CLI's
+  snapshots. [sveltejs/cli](https://github.com/sveltejs/cli)
 - **Tauri.** Its SvelteKit guide requires `adapter-static`, recommends SPA mode with server
   rendering off, and says "Tauri doesn't support server-based solutions". The guide was written
   for SvelteKit 2 and its older config file.
@@ -106,14 +119,37 @@ Re-verify at Gate 1.
 
 ## Requirements
 
+### Code home
+
+Decided by the operator on 2026-11-28.
+
+- The frontend lives in `apps/dashboard/`. That directory holds the project exactly as
+  `sv create` generates it. The Tauri shell goes in `src-tauri/` beside `src/`, which is Tauri's
+  own layout.
+- The shared UI contract lives in `apps/dashboard/src/lib/contract/` and the shared fixture set
+  in `apps/dashboard/src/lib/fixtures/` ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)).
+  Both are plain data, a JSON Schema and JSON fixtures, so the host side reads the same files.
+- Fixtures are imported only by stories and tests. A lint rule enforces this, so a production
+  route cannot ship a fixture.
+- Tests sit beside the code they test, under the file names the add-ons generate: `*.spec.ts`
+  for unit tests, `*.svelte.spec.ts` for component tests and `*.e2e.ts` for end-to-end tests.
+  There is no separate test directory.
+- A lane owns whole sub-directories under `src/routes/` and `src/lib/`, tests included. Files
+  every lane shares are edited only by the lane that owns the foundation: `package.json`, the
+  lockfile, `vite.config.ts`, `eslint.config.js`, `prettier.config.js`, `playwright.config.ts`,
+  `tsconfig.json`, `src/app.html`, `src/app.d.ts`, the root layout and the Storybook
+  configuration. Another lane that needs a change there asks for it.
+- [prd_k](prd_k.md#later-runtime-layout) plans a root `src/` for the existing Python code. The
+  frontend stays out of it.
+
 ### Order of work
 
 The foundation is built in two parts, with the tech-stack spike between them. This is steps 2
 to 4 of [Wave 0](prd_m.md#wave-0-prove-and-decide).
 
-1. **Seed.** After the code home and toolchain pins are decided, generate the skeleton there and
-   record the command. This covers the [skeleton](#skeleton) items up to the static adapter,
-   and turning the async flag on.
+1. **Seed.** After the toolchain pins are set, generate the skeleton in the
+   [code home](#code-home) and record the command. This covers the [skeleton](#skeleton) items
+   up to the static adapter, and turning the async flag on.
 2. **Spike.** The [tech-stack spike](prd_m3b.md#tech-stack-spike) generates the same skeleton
    from the recorded command under `docs/prds/spikes/` and runs the
    [shared frontend qualification](#shared-frontend-qualification). It does not edit the seeded
@@ -128,10 +164,13 @@ the third part is done.
 ### Skeleton
 
 - [ ] Generate the project with `sv create` (the `minimal` template, TypeScript) and the add-ons
-      listed above, in the production code home decided under
-      [prd_k](prd_k.md#later-runtime-layout). Record the exact command and the resolved versions.
+      listed above, in the [code home](#code-home). Record the exact command and the resolved
+      versions. The `storybook` add-on runs `create-storybook@latest`, so the command alone does
+      not reproduce the result. Record what it resolved to as well.
 - [ ] Keep a deviation register beside the project: every change to a generated file or default,
-      with its reason. A reviewer can ask for any unlisted departure to be removed.
+      with its reason. A reviewer can ask for any unlisted departure to be removed. Two entries
+      are known in advance: the async flag, and a WebKit instance beside the generated
+      Chromium-only component test project.
 - [ ] Turn server rendering off at the root and use the static adapter with a fallback page, as
       Tauri's guide describes. Check that guide's steps against SvelteKit 3's config location.
 - [ ] Rebuild on the skeleton what the web-ui spike proved: the typed, transport-neutral client
@@ -158,7 +197,9 @@ the third part is done.
 
 ### Style guide
 
-- [ ] Write the style guide as one document in the frontend's home. Give every rule an ID, so a
+- [ ] Write the style guide as one document in the [code home](#code-home). Its structure and
+      tooling areas carry the rules recorded there: fixture imports, where tests sit, and who
+      edits the shared files. Give every rule an ID, so a
       reviewer cites the rule and an exception names the rule it departs from.
 - [ ] State for each rule how it is enforced: by lint, by the type checker, by a test, or by
       review. Prefer a machine check wherever one exists.
@@ -288,30 +329,43 @@ as Tauri ([control-plane decision](prd_m.md#control-plane-decision)).
 - [ ] Lint rules exist for the banned waits and the selector rule. Record their exact names, or
       write the rule if none exists.
 - [ ] The dependency tree the add-ons bring passes the [prd_f](prd_f.md) review.
+- [ ] The production build contains no `devtools` code and opens no development endpoint. Record
+      where the `devtools` endpoint listens on the development server and what it exposes.
+- [ ] The pinned local MCP server starts from the committed configuration without fetching
+      anything at run time.
 
 ## Open decisions
 
-- [ ] (decision needed) **`ai-tools` and `devtools` add-ons.** Both are development aids and do
-      not ship in the product. What each does is recorded
-      [above](#what-the-stack-offers-today-checked-2026-11-28). Time estimates are rough.
-  - **Neither in the repository (recommended).** `ai-tools` writes an `AGENTS.md` and agent
-    settings into a repository that already has its own [`AGENTS.md`](../../AGENTS.md), and its
-    recommended mode updates itself, which is the opposite of pinning under
-    [prd_f](prd_f.md). Its hosted server receives generated code, and its local mode fetches and
-    runs an unpinned package. One of its bundled best-practice notes is already wrong for
-    SvelteKit 3: it places the async flag in a config file SvelteKit 3 rejects. `devtools` adds
-    plugins to the Vite configuration that builds the product, and an endpoint whose listening
-    address and contents are not documented. Agents rely on the style guide and the published
-    documentation. ~0 days.
-  - **Documentation lookup for agents, outside the repository.** Give implementing agents the
-    Svelte MCP server as a pinned local package in their own configuration, for example as a
-    sandbox bundle under [prd_l](prd_l.md), with no instruction files written here and no
-    self-updating plugin. Async Svelte and SvelteKit 3 are newer than most models' knowledge, so
-    current documentation helps. Needs the package pinned and reviewed. ~0.5 to 1 day.
-  - **`devtools` later, if debugging needs it.** Add it as a development-only dependency once a
-    real debugging problem shows the need, after checking what its endpoint exposes. ~0.5 day.
-  - **Both add-ons in the repository.** The most assistance with the least setup. Takes on every
-    drawback above. ~0.5 day.
+- [x] **`ai-tools` and `devtools` add-ons.** Decided by the operator on 2026-11-28: both go
+      in the repository. Both are development aids and do not ship in the product. What each
+      does is recorded [above](#what-the-stack-offers-today-checked-2026-11-28). The options
+      considered were neither, documentation lookup kept outside the repository, `devtools`
+      added later, and both. The setup below was read from the add-ons' source at `sv` 1.7.1.
+  - **`ai-tools` for Claude Code, as committed files.** Answer "Individual tools", not the
+    Svelte plugin, so the skills, the sub-agent and the MCP configuration are files a reviewer
+    can read and nothing updates itself. Skip the opt-in feedback skill, which reports
+    corrections to an outside repository.
+  - **MCP server, local.** Choose the local setup, which runs over stdio, so no code goes to the
+    hosted endpoint. The generated configuration fetches an unpinned package each time. Replace
+    that with an exact pinned version reviewed under [prd_f](prd_f.md), and list the change in
+    the deviation register.
+  - **Instruction file.** The add-on writes `apps/dashboard/AGENTS.md`. It covers the frontend
+    only. The root [`AGENTS.md`](../../AGENTS.md) stays as it is and wins where the two differ.
+    Add a line to the generated file saying so, and pointing to the style guide.
+  - **`ai-tools` for OpenCode.** OpenCode has no committed-files mode. The add-on writes a
+    project configuration that loads the `@sveltejs/opencode` plugin. A sandboxed OpenCode agent
+    working in this repository would then load an npm plugin that the repository names. Pin it
+    to an exact version, and get it reviewed by the owners of the sandbox configuration and
+    OpenCode runtime ([prd_l](prd_l.md), [prd_b](prd_b.md)) before it is committed. Seeding
+    does not wait for that review. The OpenCode part lands as its own change after it.
+  - **`devtools`.** Take the add-on's default plugins. It configures itself for the development
+    server only, with client authentication on. Before relying on it, record where its endpoint
+    listens and what it exposes, and confirm that the production build contains none of it
+    ([shared frontend qualification](#shared-frontend-qualification)).
+  - **The style guide wins.** One of the bundled best-practice notes is already wrong for
+    SvelteKit 3: it places the async flag in a config file SvelteKit 3 rejects. Where a bundled
+    note and the style guide differ, the style guide applies. Record each such difference in
+    the style guide's tooling area.
 
 Rough estimates for the foundation itself: the skeleton and two-engine harness, 2 to 3 days;
 the first style guide, 1 to 2 days. The conversion lane's size depends on the mockup and is not

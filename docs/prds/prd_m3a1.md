@@ -228,22 +228,17 @@ and components stay as they are. This is a Wave 0 item in the
       from it ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
 - [ ] Add each new screen to the states sheet and the hostile-content specimen, and run the
       WCAG 2.2 AA audit on it.
-- [ ] (decision needed) **Process for the supplement.** Time estimates are rough.
-  - **One design extending the locked system, with operator review and an audit
-    (recommended).** The visual language is already chosen, so the open questions are layout and
-    content. Fast, and consistent with the lock. No independent alternatives to compare.
-    ~2–3 days.
-  - **A full council round for the workflow screens only.** Independent attempts where the
-    design is least settled. More operator time, and a risk that attempts drift from the locked
-    system. ~4–6 days.
-  - **A full council round for every new screen.** The most alternatives. The slowest, and most
-    of the settings and secret-entry layout follows from existing components. ~1–2 weeks.
-  - **Design the new screens directly as Storybook stories**, once the
-    [frontend foundation](prd_m3a3.md) exists. The designed artifact is then the one that is
-    tested and integrated, with no second mockup to rebuild
-    ([consistency rules](prd_m3a3.md#stories-match-the-app)). It cannot start until the
-    foundation and the presentational primitives exist, and it gives no independent attempts to
-    compare. It can be combined with the first option. ~2–4 days after the foundation.
+- [x] **Process for the supplement.** Decided by the operator on 2026-11-28: a council round
+      for the workflow screens, and one design for the rest. Time estimates are rough.
+  - **Workflow list, workflow definition and workflow run: a full council round.** Independent
+    attempts where the design is least settled. Every attempt extends the locked system and may
+    not change its tokens, trust vocabulary, tiers or components, which guards against drift.
+    These three screens are the ones Wave 1 needs, so this round runs first. ~4–6 days.
+  - **Change review, settings and secret entry: one design extending the locked system**, with
+    operator review and an audit. Their layout mostly follows from existing components. They
+    are needed in Waves 2 and 3. ~2–3 days.
+  - Considered and not chosen: one design for every screen, a council round for every screen,
+    and designing the screens directly as Storybook stories.
 
 ## Design selection process
 
