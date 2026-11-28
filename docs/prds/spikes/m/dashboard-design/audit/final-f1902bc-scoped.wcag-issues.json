@@ -1,0 +1,279 @@
+{
+ "audit": {
+  "standard": "WCAG 2.2",
+  "targetLevel": "AA",
+  "application": "oc-sandbox operator dashboard (prototype build final-f1902bc)",
+  "page": "Scoped re-audit: ownership note on fleet, thread and signin",
+  "url": "http://127.0.0.1:8765/fleet.html",
+  "type": "scoped re-audit",
+  "pages": [
+   {
+    "id": "fleet",
+    "url": "http://127.0.0.1:8765/fleet.html"
+   },
+   {
+    "id": "thread",
+    "url": "http://127.0.0.1:8765/thread.html"
+   },
+   {
+    "id": "signin",
+    "url": "http://127.0.0.1:8765/signin.html"
+   },
+   {
+    "id": "signin-expired",
+    "url": "http://127.0.0.1:8765/signin.html?state=expired"
+   },
+   {
+    "id": "signin-reconnecting",
+    "url": "http://127.0.0.1:8765/signin.html?state=reconnecting"
+   }
+  ],
+  "colourSchemes": [
+   "light",
+   "dark"
+  ],
+  "viewports": [
+   "1280x800",
+   "640x400",
+   "320x568",
+   "320x256"
+  ],
+  "textSpacing": [
+   false,
+   true
+  ],
+  "date": "2026-11-26",
+  "method": "Chromium 155 headless driven with puppeteer-core (own profile) running the skill's probes.js unchanged, plus ownership-note contrast, hit-test, clip, overlap and focus-ring probes; 80 combinations, each with a keyboard walk (650 ms per stop around the note). The chrome-devtools MCP browser was unavailable (profile locked by another session).",
+  "previousAudit": "audits/final-763cbac/reports/wcag-issues.json",
+  "changedSincePreviousAudit": [
+   "p.owner (\"Copyright © David Bruck\" + a.owner__link to https://github.com/gorban/opencode-sandbox, target=_blank, rel=\"noopener noreferrer\", visually hidden \" (opens in a new tab)\") added after .profile in the sidebar foot of every sidebar page, and after the sign-in panels on signin.html (shown in all three states)",
+   "app.css: .owner, .owner__link, .owner__link:hover, .owner--page",
+   "DESIGN.md: Polish 4 note"
+  ],
+  "retestedCriteria": [
+   "1.3.1",
+   "1.4.3",
+   "1.4.4",
+   "1.4.10",
+   "1.4.11",
+   "1.4.12",
+   "2.1.1",
+   "2.4.3",
+   "2.4.4",
+   "2.4.7",
+   "2.4.11",
+   "2.5.8",
+   "4.1.2"
+  ],
+  "carriedOverCriteria": [
+   "1.1.1",
+   "1.2.1",
+   "1.2.2",
+   "1.2.3",
+   "1.2.4",
+   "1.2.5",
+   "1.3.2",
+   "1.3.3",
+   "1.3.4",
+   "1.3.5",
+   "1.4.1",
+   "1.4.2",
+   "1.4.5",
+   "1.4.13",
+   "2.1.2",
+   "2.1.4",
+   "2.2.1",
+   "2.2.2",
+   "2.3.1",
+   "2.4.1",
+   "2.4.2",
+   "2.4.5",
+   "2.4.6",
+   "2.5.1",
+   "2.5.2",
+   "2.5.3",
+   "2.5.4",
+   "2.5.7",
+   "3.1.1",
+   "3.1.2",
+   "3.2.1",
+   "3.2.2",
+   "3.2.3",
+   "3.2.4",
+   "3.2.6",
+   "3.3.1",
+   "3.3.2",
+   "3.3.3",
+   "3.3.4",
+   "3.3.7",
+   "3.3.8",
+   "4.1.3"
+  ],
+  "scopeNotes": [
+   "Level A + AA only (55 criteria). AAA not assessed. 4.1.1 Parsing excluded (removed in WCAG 2.2).",
+   "13 criteria re-tested against the change; the other 42 keep their final-763cbac status and note.",
+   "Before/after drawer measurements against final-763cbac served read-only on 127.0.0.1:8799.",
+   "Text spacing applied with a constructable stylesheet (the CSP blocks the <style> element probes.js injects); no CSP violations.",
+   "Link activation tested by keyboard with navigation cancelled in the page; no request was sent to github.com.",
+   "No screen reader or speech-input software was run; names and roles verified in Chromium's accessibility snapshot.",
+   "Other sidebar pages (approvals, inbox, confirm, states, diff, catalog, thread-2..7) carry the identical markup but were not walked in this run.",
+   "final-f1902bc/ is a read-only generated snapshot: make any change in the generator source."
+  ]
+ },
+ "summary": {
+  "byStatus": {
+   "fail": 0,
+   "needsReview": 1,
+   "pass": 43,
+   "notApplicable": 11
+  },
+  "bySeverity": {
+   "critical": 0,
+   "serious": 0,
+   "moderate": 0,
+   "minor": 0
+  },
+  "conforms": null,
+  "note": "Counts cover the 55 Level A + AA criteria and match the coverage table in the HTML report (13 re-tested, 42 carried over). No failures in the changed area; totals unchanged from final-763cbac. Conformance can be claimed once 2.2.1 (backend time limits) is confirmed; not verified with assistive technology."
+ },
+ "measurements": {
+  "contrast": {
+   "sidebarLine": {
+    "light": 6.92,
+    "dark": 7.13
+   },
+   "sidebarLink": {
+    "light": 10.87,
+    "dark": 10.85
+   },
+   "signinLine": {
+    "light": 7.43,
+    "dark": 7.69
+   },
+   "signinLink": {
+    "light": 11.68,
+    "dark": 11.7
+   },
+   "focusRingMin": 15.32,
+   "required": {
+    "text": 4.5,
+    "nonText": 3
+   }
+  },
+  "linkTargetPx": [
+   "24x222 (sidebar)",
+   "24x222 to 24x271 (sign-in)",
+   "36x231 (sign-in, text spacing, 2 lines)"
+  ],
+  "accessibleName": "github.com/gorban/opencode-sandbox (opens in a new tab)",
+  "focusOrder": {
+   "sidebar1280": "States → Operator → link → main",
+   "drawer": "Operator → link → Account usage",
+   "signin": "Sign in / Sign in with new code / Retry now → link → end"
+  },
+  "drawerTreeAreaPx": {
+   "320x568": {
+    "before": 164,
+    "after": 108
+   },
+   "320x568 text spacing": {
+    "before": 138,
+    "after": 45
+   },
+   "375x667 text spacing": {
+    "before": 251,
+    "after": 158
+   },
+   "1280x800": {
+    "before": 456,
+    "after": 400
+   }
+  }
+ },
+ "resolvedByInteractivePhase": {
+  "toPass": {
+   "1.4.3": "Line 6.92:1 or better, link 10.85:1 or better, on the sidebar and sign-in in both schemes",
+   "1.4.4": "Zoom 2 at 1280×800: no horizontal scroll; the note fully visible on all 5 page states × 2 schemes",
+   "1.4.10": "320×568 and 320×256: no horizontal scroll or spill; drawer tree area smaller (advisory A7)",
+   "1.4.12": "Text spacing at 1280, 640 and 320 px: no clipping or overlap; the link wraps to 2 lines on sign-in",
+   "2.1.1": "Enter fires the link in the sidebar, the drawer and on sign-in; Escape from the link closes the drawer",
+   "2.4.3": "The link is the last stop in its container; Shift+Tab returns to Operator",
+   "2.4.7": "2 px ring at every stop of 80 walks (ring bottom edge starts below the fold on sign-in at 320 px, A8)",
+   "2.4.11": "Slow walk: 25/25 sample points on the link at every size; the profile tooltip opens upward",
+   "2.5.8": "Link 24 px tall, 222 to 271 px wide (36 px when wrapped); 0 undersized targets",
+   "1.3.1 / 2.4.4 / 4.1.2": "Accessibility tree: static text, then link \"github.com/gorban/opencode-sandbox (opens in a new tab)\"",
+   "1.4.11": "Focus ring at least 15.3:1; the link is underlined"
+  },
+  "toFail": {}
+ },
+ "issues": [],
+ "needsReview": [
+  {
+   "criterion": "2.2.1",
+   "title": "Timing Adjustable",
+   "level": "A",
+   "blocked": "session/app-level",
+   "carriedOver": true,
+   "whatToReview": "Approval expiry (\"expires 19:30 CST\", \"expires 16:30 CST\") and session expiry (the \"Session expired\" sign-in state) in the product: can the operator turn off, adjust or extend each limit with at least 20 seconds' warning, or does an exception (essential, real-time, longer than 20 hours) apply?",
+   "whyOpen": "Carried over from final-763cbac; outside this scoped re-audit. The prototype shows both limits but runs neither; their lengths come from the backend.",
+   "howToConfirm": "Leave an approval open near its expiry and leave a session idle. Pass if a warning gives at least 20 seconds and a simple way to extend (at least 10 times), or the limit is adjustable, off, essential, or longer than 20 hours. Fail if it expires silently."
+  }
+ ],
+ "advisories": [
+  {
+   "id": "A7",
+   "new": true,
+   "causedByThisChange": true,
+   "related": [
+    "1.4.10",
+    "1.4.12"
+   ],
+   "note": "The note adds ~56 px (69 px with text spacing) to the non-scrolling .side__foot. In the drawer layout (below 60rem) at 320x568 the scrolling tree area (.side__scroll) shrinks from 164 to 108 px, and with WCAG text spacing from 138 to 45 px, less than one 48 px tree row. Content stays reachable by scrolling (not a failure). 320x256 is unaffected (page scrolls as a whole).",
+   "selectors": [
+    ".side__foot",
+    ".side__scroll",
+    "p.owner"
+   ],
+   "suggestion": "Let the note scroll with the tree in the drawer layout (e.g. render it at the end of .side__scroll below 60rem), or make the whole drawer scroll on short heights: @media (max-width: 59.99rem) and (max-height: 40rem) { .js .side { overflow-y: auto; grid-template-rows: auto auto auto; } .side__scroll { overflow: visible; } }",
+   "acceptanceCriteria": [
+    "At 320x568 with WCAG text spacing and the Workspace drawer open, .side__scroll (or the drawer) shows at least three tree rows, as in final-763cbac",
+    "The note remains reachable by keyboard as the last stop in the drawer"
+   ],
+   "evidence": [
+    "evidence/drawer-before-fleet-light-320x568-ts-treefocus.png",
+    "evidence/drawer-after-fleet-light-320x568-ts-treefocus.png",
+    "evidence/data/drawer-before-after.json"
+   ]
+  },
+  {
+   "id": "A8",
+   "new": true,
+   "related": [
+    "2.4.7"
+   ],
+   "note": "On sign-in at 320x568 (and 320x256 in the Reconnecting state), focusing the link scrolls it flush with the viewport bottom; the 2 px ring drawn 2 px outside extends 4 px below the fold. Top and sides visible; not covered.",
+   "selectors": [
+    "p.owner--page a.owner__link"
+   ],
+   "suggestion": ".owner__link { scroll-margin-block: var(--sp-8); } (or on :focus-visible generally)",
+   "evidence": [
+    "evidence/focus-signin-light-320x568-link.png"
+   ]
+  },
+  {
+   "id": "A9",
+   "new": true,
+   "related": [
+    "1.3.1"
+   ],
+   "note": "On sidebar pages the ownership note (copyright line + external link) sits inside nav#sidebar[aria-label=\"Workspace\"], so landmark navigation presents it as workspace navigation. Allowed; no change needed for conformance.",
+   "selectors": [
+    "nav#sidebar p.owner"
+   ]
+  },
+  {
+   "id": "A1-A6",
+   "note": "Pre-existing advisories from final-763cbac still stand; see audits/final-763cbac/reports/wcag-issues.json."
+  }
+ ]
+}
