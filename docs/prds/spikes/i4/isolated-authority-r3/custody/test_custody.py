@@ -332,7 +332,7 @@ except run.Unavailable:
         self.assertEqual(accepted, {"role": "worker", "config": config, "environment": expected})
         for environment in ({**expected, "LC_ALL": "C.UTF-8"},
                             {**expected, "LC_CTYPE": "C.UTF-8"}, {**expected, "PYTHONCOERCECLOCALE": "0"},
-                            *(dict((key, value) for key, value in expected.items() if key != unset)
+                            *({key: value for key, value in expected.items() if key != unset}
                               for unset in expected)):
             with self.subTest(environment=environment):
                 rejected = self.probe(source, environment)
