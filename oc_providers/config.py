@@ -9,6 +9,7 @@ import pwd
 import re
 import stat
 import tomllib
+from typing import cast
 
 from .contracts import (
     MAX_PROVIDER_SLOTS,
@@ -410,15 +411,17 @@ def hash_providers_config_bytes(raw: bytes) -> str:
 
 
 def _parse_profile_set_models(raw_models: object) -> tuple[str, ...]:
-    if type(raw_models) is not list or not 1 <= len(raw_models) <= MAX_PROFILE_SET_MODELS_PER_MEMBER:
-        raise ProviderConfigError(
-            _ERR_INVALID, f"profile set member requires 1 to {MAX_PROFILE_SET_MODELS_PER_MEMBER} models"
-        )
-    if not all(is_valid_model_slug(model) for model in raw_models):
+    count_error = f"profile set member requires 1 to {MAX_PROFILE_SET_MODELS_PER_MEMBER} models"
+    if type(raw_models) is not list:
+        raise ProviderConfigError(_ERR_INVALID, count_error)
+    models = cast(list, raw_models)
+    if not 1 <= len(models) <= MAX_PROFILE_SET_MODELS_PER_MEMBER:
+        raise ProviderConfigError(_ERR_INVALID, count_error)
+    if not all(is_valid_model_slug(model) for model in models):
         raise ProviderConfigError(_ERR_INVALID, "invalid profile set member model ID")
-    if len(set(raw_models)) != len(raw_models):
+    if len(set(models)) != len(models):
         raise ProviderConfigError(_ERR_INVALID, "duplicate profile set member model ID")
-    return tuple(sorted(raw_models))
+    return tuple(sorted(models))
 
 
 def _parse_profile_set_member(
@@ -434,10 +437,14 @@ def _parse_profile_set_member(
 
 
 def _parse_profile_set(
-    name: str, table: object, instances: dict[tuple[ProviderId, str], ProviderInstanceSpec]
+    name: str, raw_table: object, instances: dict[tuple[ProviderId, str], ProviderInstanceSpec]
 ) -> ProfileSet:
-    if not is_valid_instance_label(name) or type(table) is not dict or set(table) != _PROFILE_SET_KEYS:
-        raise ProviderConfigError(_ERR_INVALID, "invalid name or fields in profile set")
+    fields_error = "invalid name or fields in profile set"
+    if type(raw_table) is not dict:
+        raise ProviderConfigError(_ERR_INVALID, fields_error)
+    table = cast(dict, raw_table)
+    if not is_valid_instance_label(name) or set(table) != _PROFILE_SET_KEYS:
+        raise ProviderConfigError(_ERR_INVALID, fields_error)
     raw_members = table["members"]
     if type(raw_members) is not dict or not 1 <= len(raw_members) <= MAX_PROVIDER_SLOTS:
         raise ProviderConfigError(_ERR_INVALID, f"profile set requires 1 to {MAX_PROVIDER_SLOTS} members")

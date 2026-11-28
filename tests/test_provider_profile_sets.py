@@ -251,8 +251,9 @@ class ProviderProfileSetTests(unittest.TestCase):
             )
 
         self.assertEqual(len(self.parse(members(MAX_PROVIDER_SLOTS), instances).sets[0].members), MAX_PROVIDER_SLOTS)
+        too_many_members = members(MAX_PROVIDER_SLOTS + 1)
         with self.assertRaisesRegex(ProviderConfigError, "requires 1 to .* members"):
-            self.parse(members(MAX_PROVIDER_SLOTS + 1), instances)
+            self.parse(too_many_members, instances)
 
         def many_models(count):
             models = ", ".join(f'"extra-{index}"' for index in range(count - 1))
