@@ -161,6 +161,7 @@ def upstream_response(home, case, method, path, headers, raw):
 def openai_peer(home, case, descriptor, certificate, key):
     receipt(home, "open")
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certificate, key)
     with socket.socket(fileno=descriptor) as plain:
         plain.settimeout(10)

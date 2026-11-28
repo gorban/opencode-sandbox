@@ -336,8 +336,9 @@ class ProtocolGuardTests(unittest.TestCase):
         for stage in range(4):
             self.script.respond(self.request(stage))
         self.script.verify_done()
+        extra_inference = self.request(3)
         with self.assertRaisesRegex(FixtureMismatch, "Unexpected stock inference"):
-            self.script.respond(self.request(3))
+            self.script.respond(extra_inference)
 
     def test_rejects_changed_tool_result_before_sending_later_tool(self):
         self.script.respond(self.request(0))
