@@ -1,12 +1,15 @@
 """Real inert Python children for the standalone named Claude fixture launcher."""
 
+from contextlib import contextmanager
 import ctypes
+import errno
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import select
 import signal
+import socket
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -40,8 +43,10 @@ class InertClaudeLauncherTests(unittest.TestCase):
             os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
 
     def assert_refused(self, turn, reason, *, cancelled=None, expected=launcher.FixtureLaunchError):
+        if cancelled is None:
+            cancelled = Event()
         with self.assertRaises(expected) as failure:
-            turn.run("synthetic local text", cancelled=cancelled if cancelled is not None else Event())
+            turn.run("synthetic local text", cancelled=cancelled)
         self.assertEqual(str(failure.exception), reason)
         self.assert_drained()
         with self.assertRaisesRegex(launcher.FixtureLaunchError, "^native_turn_spent$"):
@@ -421,3 +426,279 @@ sys.exit(not unittest.TextTestRunner().run(suite).wasSuccessful())
         self.assertEqual(launcher.FixtureTurn(alternate).run("fresh fixture", cancelled=Event()).text,
                          "fixture: fresh fixture")
         self.assert_drained()
+
+    def test_pidfd_close_failure_does_not_clear_unverified_descendant_retirement(self):
+        self._isolated_probe("_drain_and_pidfd_close_probe")
+
+    def _drain_and_pidfd_close_probe(self):
+        controller = os.getpid()
+        original_drain = Supervisor.drain
+        open_pidfd = os.pidfd_open
+        close = os.close
+        native_pidfd = None
+        drain_failed = self.root / "drain-fault"
+        close_failed = self.root / "close-fault"
+
+        def open_and_track_native(pid, *args):
+            nonlocal native_pidfd
+            descriptor = open_pidfd(pid, *args)
+            if os.getpid() != controller and pid != os.getpid() and native_pidfd is None:
+                native_pidfd = descriptor
+            return descriptor
+
+        def lose_retirement_evidence(supervisor, process):
+            original_drain(supervisor, process)
+            supervisor.drained = False
+            drain_failed.touch()
+            raise OSError("synthetic drain failure")
+
+        def close_with_fault(descriptor):
+            close(descriptor)
+            if os.getpid() != controller and descriptor == native_pidfd:
+                close_failed.touch()
+                raise OSError("synthetic native pidfd close failure")
+
+        turn = self.variant('sys.stdout.buffer.write(b"{}\\n"); sys.stdout.buffer.flush()')
+        cancelled = Event()
+        with (patch.object(Supervisor, "drain", autospec=True, side_effect=lose_retirement_evidence),
+              patch.object(os, "pidfd_open", side_effect=open_and_track_native),
+              patch.object(os, "close", side_effect=close_with_fault),
+              self.assertRaises((wire.TextWireError, launcher.FixtureLaunchError)) as failure):
+            turn.run("fixture text", cancelled=cancelled)
+
+        self.assertTrue(drain_failed.exists())
+        self.assertTrue(close_failed.exists())
+        self.assert_drained()
+        self.assert_refused(launcher.FixtureTurn(self.work), "native_workspace_quarantined")
+        self.assertIsInstance(failure.exception, wire.TextWireError)
+        self.assertEqual(failure.exception.__notes__, ["Native descendant retirement could not be verified."])
+
+    @contextmanager
+    def post_fork_socket_close_fault(self, *, in_child):
+        controller = os.getpid()
+        socketpair = socket.socketpair
+        close = socket.socket.close
+        endpoints = []
+        faulted = self.root / "socket-close-fault"
+
+        def track_endpoints():
+            pair = socketpair()
+            endpoints[:] = pair
+            return pair
+
+        def close_with_fault(connection):
+            close(connection)
+            side = 0 if in_child else 1
+            if (os.getpid() != controller) == in_child and endpoints and connection is endpoints[side]:
+                endpoints[side] = None
+                faulted.touch()
+                raise OSError("synthetic post-fork socket close failure")
+
+        with (patch.object(socket, "socketpair", side_effect=track_endpoints),
+              patch.object(socket.socket, "close", autospec=True, side_effect=close_with_fault)):
+            yield faulted
+
+    def test_parent_socket_close_failure_reaps_the_exact_owner(self):
+        fork = os.fork
+        owned = []
+
+        def track_owner():
+            child = fork()
+            if child:
+                owned.append(child)
+            return child
+
+        def wait_for_controller_release(connection, *_):
+            try:
+                connection.settimeout(1)
+                connection.recv(1)
+            finally:
+                os._exit(0)
+
+        turn = launcher.FixtureTurn(self.work)
+        cancelled = Event()
+        with (self.post_fork_socket_close_fault(in_child=False) as faulted,
+              patch.object(os, "fork", side_effect=track_owner),
+              patch.object(launcher, "_owner_entry", side_effect=wait_for_controller_release),
+              self.assertRaisesRegex(OSError, "synthetic post-fork socket close failure")):
+            turn.run("fixture text", cancelled=cancelled)
+        self.assertTrue(faulted.exists())
+        self.assertEqual(len(owned), 1)
+        try:
+            # Drain the exact synthetic owner for old-red runs before reporting a regression.
+            launcher._reap_owner(owned[0], None, grace=1.5)
+        except ChildProcessError:
+            pass
+        else:
+            self.fail("the controller left its disposable owner unreaped")
+        self.assert_drained()
+
+    def test_child_socket_close_failure_exits_without_resuming_controller_code(self):
+        self._isolated_probe("_child_socket_close_probe")
+
+    def _child_socket_close_probe(self):
+        controller = os.getpid()
+        escaped = self.root / "owner-returned-to-controller"
+        with self.post_fork_socket_close_fault(in_child=True) as faulted:
+            try:
+                launcher.FixtureTurn(self.work).run("fixture text", cancelled=Event())
+            except BaseException as error:
+                if os.getpid() != controller:
+                    escaped.touch()
+                    os._exit(70)
+                self.assertIsInstance(error, launcher.FixtureLaunchError)
+                self.assertEqual(str(error), "native_owner_failed")
+            else:
+                self.fail("the controller accepted an owner without a result")
+        self.assertTrue(faulted.exists())
+        self.assertFalse(escaped.exists())
+        self.assert_drained()
+
+    @contextmanager
+    def final_controller_close_fault(self, site):
+        controller = os.getpid()
+        open_pidfd = os.pidfd_open
+        close_fd = os.close
+        socketpair = socket.socketpair
+        close_socket = socket.socket.close
+        pidfd = control = None
+        released = []
+
+        def track_pidfd(pid, *args):
+            nonlocal pidfd
+            descriptor = open_pidfd(pid, *args)
+            if os.getpid() == controller:
+                pidfd = descriptor
+            return descriptor
+
+        def track_socketpair():
+            nonlocal control
+            control, owner = socketpair()
+            return control, owner
+
+        def report_after_close(descriptor):
+            self.assert_drained()
+            with self.assertRaises(OSError) as failure:
+                os.fstat(descriptor)
+            self.assertEqual(failure.exception.errno, errno.EBADF)
+            released.append(descriptor)
+            raise OSError("synthetic controller close report")
+
+        def close_pidfd(descriptor):
+            close_fd(descriptor)
+            if site == "pidfd" and os.getpid() == controller and descriptor == pidfd:
+                report_after_close(descriptor)
+
+        def close_control(connection):
+            descriptor = connection.fileno()
+            close_socket(connection)
+            if site == "control" and os.getpid() == controller and connection is control:
+                report_after_close(descriptor)
+
+        with (patch.object(os, "pidfd_open", side_effect=track_pidfd),
+              patch.object(os, "close", side_effect=close_pidfd),
+              patch.object(socket, "socketpair", side_effect=track_socketpair),
+              patch.object(socket.socket, "close", autospec=True, side_effect=close_control)):
+            yield released
+
+    def test_controller_pidfd_release_preserves_checked_retirement_failure(self):
+        self._isolated_probe("_controller_pidfd_release_probe")
+
+    def _controller_pidfd_release_probe(self):
+        self._controller_release_probe("pidfd")
+
+    def test_controller_socket_release_preserves_checked_retirement_failure(self):
+        self._isolated_probe("_controller_socket_release_probe")
+
+    def _controller_socket_release_probe(self):
+        self._controller_release_probe("control")
+
+    def _controller_release_probe(self, site):
+        work = self.root / "ordinary"
+        work.mkdir(mode=0o700)
+        cancelled = Event()
+        ordinary = launcher.FixtureTurn(work).run("fixture text", cancelled=cancelled)
+        self.assertEqual(ordinary.text, "fixture: fixture text")
+        self.assert_drained()
+
+        success_with_close_error = launcher.FixtureTurn(work)
+        with (self.final_controller_close_fault(site) as released,
+              self.assertRaisesRegex(OSError, "^synthetic controller close report$")):
+            success_with_close_error.run("fixture text", cancelled=cancelled)
+        self.assertEqual(len(released), 1)
+
+        original_drain = Supervisor.drain
+
+        def lose_retirement_evidence(supervisor, process):
+            original_drain(supervisor, process)
+            supervisor.drained = False
+            raise OSError("synthetic retirement proof failure")
+
+        turn = self.variant('sys.stdout.buffer.write(b"{}\\n"); sys.stdout.buffer.flush()')
+        with (patch.object(Supervisor, "drain", autospec=True, side_effect=lose_retirement_evidence),
+              self.final_controller_close_fault(site) as released,
+              self.assertRaises(wire.TextWireError) as failure):
+            turn.run("fixture text", cancelled=cancelled)
+
+        self.assertEqual(len(released), 1)
+        self.assertEqual(str(failure.exception), "Unexpected named Claude text fixture message")
+        self.assertEqual(failure.exception.__notes__, ["Native descendant retirement could not be verified."])
+        self.assert_drained()
+        self.assert_refused(launcher.FixtureTurn(self.work), "native_workspace_quarantined")
+
+    def test_workspace_close_report_preserves_a_checked_refusal_and_blocks_a_valid_reply(self):
+        controller = os.getpid()
+        pin_workspace = launcher._pin_workspace
+        read_owner = launcher._read_owner
+        close = os.close
+        cancelled = Event()
+        for refused in (True, False):
+            with self.subTest(refused=refused):
+                workspace_fd = None
+                checked = []
+                releases = []
+                close_report = OSError(errno.EIO, "synthetic workspace close report")
+
+                def track_pin(workspace):
+                    nonlocal workspace_fd
+                    binding = pin_workspace(workspace)
+                    workspace_fd = binding.fd
+                    return binding
+
+                def track_outcome(connection, pidfd, pid, cancellation):
+                    record, status = read_owner(connection, pidfd, pid, cancellation)
+                    checked.append((pid, record, status))
+                    return record, status
+
+                def close_and_report(fd):
+                    close(fd)
+                    if os.getpid() != controller or fd != workspace_fd:
+                        return
+                    self.assertEqual(len(checked), 1)
+                    pid, record, status = checked[0]
+                    self.assertEqual(status, 0)
+                    self.assertEqual("error" in record, refused)
+                    with self.assertRaises(ChildProcessError):
+                        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    with self.assertRaises(OSError) as failure:
+                        os.fstat(fd)
+                    self.assertEqual(failure.exception.errno, errno.EBADF)
+                    releases.append(fd)
+                    raise close_report
+
+                turn = (self.variant('sys.stdout.buffer.write(b"{}\\n"); sys.stdout.buffer.flush()')
+                        if refused else launcher.FixtureTurn(self.work))
+                expected = wire.TextWireError if refused else OSError
+                with (patch.object(launcher, "_pin_workspace", side_effect=track_pin),
+                      patch.object(launcher, "_read_owner", side_effect=track_outcome),
+                      patch.object(os, "close", side_effect=close_and_report),
+                      self.assertRaises(expected) as failure):
+                    turn.run("fixture text", cancelled=cancelled)
+
+                self.assertEqual(releases, [workspace_fd])
+                if refused:
+                    self.assertEqual(str(failure.exception), "Unexpected named Claude text fixture message")
+                    self.assertIs(failure.exception.__cause__, close_report)
+                else:
+                    self.assertIs(failure.exception, close_report)
+                self.assert_drained()

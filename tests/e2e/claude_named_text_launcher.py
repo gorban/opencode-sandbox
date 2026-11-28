@@ -289,6 +289,12 @@ class _OwnerCancellation:
             return False
 
 
+@dataclass
+class _ExchangeDisposition:
+    retirement_verified: bool = True
+    primary_error: BaseException | None = None
+
+
 def _owner_entry(connection, turn, text, workspace):
     # Dispose of the owner's inherited descriptors and never return to the caller, even on uncertainty.
     try:
@@ -301,18 +307,22 @@ def _owner_entry(connection, turn, text, workspace):
                 with suppress(OSError):
                     os.close(fd)
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-        status = 0
+        disposition = _ExchangeDisposition()
         try:
-            result = turn._owned_exchange(text, workspace=workspace, cancelled=_OwnerCancellation(connection))
+            result = turn._owned_exchange(
+                text, workspace=workspace, cancelled=_OwnerCancellation(connection), disposition=disposition,
+            )
+            _require(disposition.retirement_verified, "native_owner_retirement_unverified")
             record = {"result": asdict(result)}
         except BaseException as error:
+            if disposition.primary_error is not None:
+                error = disposition.primary_error
             known = isinstance(error, (FixtureLaunchError, TextWireError, CheckError))
             record = {
                 "error": type(error).__name__ if known else "FixtureLaunchError",
                 "message": str(error) if known else "native_owner_failed",
             }
-            if _RETIREMENT_NOTE in getattr(error, "__notes__", ()):
-                status = _OWNER_UNVERIFIED
+        status = 0 if disposition.retirement_verified else _OWNER_UNVERIFIED
         connection.settimeout(_POLL_SECONDS * 10)
         connection.sendall(json.dumps(record, ensure_ascii=True).encode("ascii"))
     except BaseException:
@@ -403,15 +413,23 @@ def _reap_owner(pid, pidfd, *, grace):
 
 def _run_owner_process(turn, text, workspace, cancelled):
     control, owner = socket.socketpair()
-    with control, owner:
+    resources = ExitStack()
+    release_error = None
+    try:
+        resources.enter_context(control)
+        resources.enter_context(owner)
         pid = os.fork()
         if pid == 0:
-            control.close()
-            _owner_entry(owner, turn, text, workspace)
-        owner.close()
+            try:
+                control.close()
+                _owner_entry(owner, turn, text, workspace)
+            finally:
+                os._exit(1)
         pidfd = None
         try:
+            owner.close()
             pidfd = os.pidfd_open(pid)
+            resources.callback(os.close, pidfd)
             record, status = _read_owner(control, pidfd, pid, cancelled)
             _reap_owner(pid, pidfd, grace=0)
         except BaseException as error:
@@ -423,33 +441,47 @@ def _run_owner_process(turn, text, workspace, cancelled):
             finally:
                 error.add_note(_RETIREMENT_NOTE)
                 raise error from None
-        finally:
-            if pidfd is not None:
-                os.close(pidfd)
-    return record, status
+    finally:
+        try:
+            resources.close()
+        except BaseException as error:
+            # A close can fail after consuming the descriptor. Keep the checked
+            # owner outcome and any primary error without retrying descriptor release.
+            release_error = error
+    return record, status, release_error
 
 
 def _disposable_owner(turn, text, workspace_path, cancelled):
     _require(len(os.listdir("/proc/self/task")) == 1 and signal.getsignal(signal.SIGCHLD) is signal.SIG_DFL,
              "exclusive fixture ownership unavailable")
     _require(_WORKSPACE_GATE.acquire(blocking=False), "exclusive fixture ownership unavailable")
+    workspace_release_error = None
     try:
         _require(len(_QUARANTINE) < _QUARANTINE_LIMIT, "native_workspace_quarantine_full")
         workspace = _pin_workspace(workspace_path)
         quarantine = True
         try:
-            record, status = _run_owner_process(turn, text, workspace, cancelled)
+            record, status, release_error = _run_owner_process(turn, text, workspace, cancelled)
             quarantine = status == _OWNER_UNVERIFIED
         finally:
             if quarantine:
                 _quarantine_workspace(workspace)
             else:
-                os.close(workspace.fd)
+                try:
+                    os.close(workspace.fd)
+                except BaseException as error:
+                    workspace_release_error = error
     finally:
         _WORKSPACE_GATE.release()
 
     if "result" in record:
         _require(status == 0 and record.keys() == {"result"}, "native_owner_failed")
+        if release_error is not None:
+            if workspace_release_error is not None:
+                raise release_error from workspace_release_error
+            raise release_error
+        if workspace_release_error is not None:
+            raise workspace_release_error
         _require(not cancelled.is_set(), "native_cancelled")
         return NativeText(**record["result"])
     error_type = {"CheckError": CheckError, "FixtureLaunchError": FixtureLaunchError, "TextWireError": TextWireError}
@@ -457,6 +489,8 @@ def _disposable_owner(turn, text, workspace_path, cancelled):
     error = TextWireError() if kind is TextWireError else kind(record["message"])
     if status == _OWNER_UNVERIFIED:
         error.add_note(_RETIREMENT_NOTE)
+    if workspace_release_error is not None:
+        raise error from workspace_release_error
     raise error
 
 
@@ -479,7 +513,7 @@ class FixtureTurn:
         _require(not cancelled.is_set(), "native_cancelled")
         return _disposable_owner(self, text, workspace_path, cancelled)
 
-    def _owned_exchange(self, text, *, workspace, cancelled):
+    def _owned_exchange(self, text, *, workspace, cancelled, disposition):
         deadline = time.monotonic() + _TURN_SECONDS
         with supervise() as supervisor, ExitStack() as resources:
             signal.pthread_sigmask(signal.SIG_UNBLOCK, _OWNER_INTERRUPTS)
@@ -496,6 +530,7 @@ class FixtureTurn:
                        _SOURCE.name, session, _MODEL, _PROFILE, _ACCOUNT)
             environment = {"LC_ALL": "C", "HOME": str(workspace.path)}
             supervisor.drained = False
+            disposition.retirement_verified = False
             process = None
             try:
                 _verify_workspace(workspace.path, workspace.fd)
@@ -522,15 +557,20 @@ class FixtureTurn:
                     frames, session=session, challenge=challenge, model=_MODEL, max_input=512, max_output=1024,
                 )
                 _finish_child(process, pidfd, supervisor, checkpoint)
+                disposition.retirement_verified = True
                 return result
             except BaseException as error:
+                disposition.primary_error = error
                 if process is not None:
                     _close_pipes(process)
                 try:
                     if not supervisor.drained:
                         supervisor.drain(process)
                 except BaseException:
-                    error.add_note(_RETIREMENT_NOTE)
+                    # Keep retirement uncertain independently of the primary error.
+                    pass
+                else:
+                    disposition.retirement_verified = supervisor.drained
                 raise
             finally:
                 if process is not None:

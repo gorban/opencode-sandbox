@@ -128,8 +128,10 @@ class NamedClaudeTextProtocolTests(unittest.TestCase):
             {"max_output_tokens": 16384.0}, {"prompt_cache_key": "wrong-cache"},
         )
         for edits in edits_examples:
-            with self.subTest(edits=edits), self.assertRaises((wire.TextWireError, RequestRefused)):
-                _lower(_request({**_body(), **edits}))
+            with self.subTest(edits=edits):
+                request = _request({**_body(), **edits})
+                with self.assertRaises((wire.TextWireError, RequestRefused)):
+                    _lower(request)
 
     def test_only_one_fresh_user_message_and_one_bounded_plain_text_part(self):
         original = _body()["input"]
@@ -140,11 +142,13 @@ class NamedClaudeTextProtocolTests(unittest.TestCase):
             [{**original[0], "content": original[0]["content"] * 2}],
             [{**original[0], "content": [{**original[0]["content"][0], "type": "input_image"}]}],
         ):
+            request = _request({**_body(), "input": change})
             with self.assertRaises((wire.TextWireError, RequestRefused)):
-                _lower(_request({**_body(), "input": change}))
+                _lower(request)
         for prompt in ("", " ", "ab\0cd", "\ud800", "é" * 257):
+            request = _request(_body(prompt))
             with self.assertRaises((wire.TextWireError, RequestRefused)):
-                _lower(_request(_body(prompt)))
+                _lower(request)
         self.assertEqual(_lower(_request(_body("é" * 256))), "é" * 256)
 
     def test_stock_non_string_role_and_part_type_are_refused(self):
@@ -157,20 +161,25 @@ class NamedClaudeTextProtocolTests(unittest.TestCase):
                         item["role"] = value
                     else:
                         item["content"][0]["type"] = value
+                    request = _request(body)
                     with self.assertRaises((wire.TextWireError, RequestRefused)):
-                        _lower(_request(body))
+                        _lower(request)
 
     def test_other_token_and_duplicate_json_refuse(self):
+        wrong_token = _request(_body(), token="different-job-token")
         with self.assertRaises(RequestRefused):
-            _lower(_request(_body(), token="different-job-token"))
+            _lower(wrong_token)
         duplicate = b'{"store":true,' + json.dumps(_body()).encode("utf-8")[1:]
+        duplicate_request = _request_bytes(duplicate)
         with self.assertRaises((wire.TextWireError, RequestRefused)):
-            _lower(_request_bytes(duplicate))
+            _lower(duplicate_request)
+        utf16_request = _request_bytes(json.dumps(_body()).encode("utf-16"))
         with self.assertRaises(wire.TextWireError):
-            _lower(_request_bytes(json.dumps(_body()).encode("utf-16")))
+            _lower(utf16_request)
         body = {**_body(), "extra": "x" * (32 * 1024)}
+        oversized_request = _request(body)
         with self.assertRaises(wire.TextWireError):
-            _lower(_request(body))
+            _lower(oversized_request)
 
     def test_fake_child_requires_one_packet_followed_by_eof(self):
         status, (ready,) = _child_output(_packet() * 2)
@@ -194,10 +203,11 @@ class NamedClaudeTextProtocolTests(unittest.TestCase):
             with self.subTest(kind=kind), self.assertRaises(wire.TextWireError):
                 _ready(frame)
         for index, raw in enumerate((delta, terminal)):
-            with self.subTest(frame=json.loads(raw)["type"]), self.assertRaises(wire.TextWireError):
+            with self.subTest(frame=json.loads(raw)["type"]):
                 frames = [delta, terminal]
                 frames[index] = json.dumps(json.loads(raw), indent=2).encode() + b"\n"
-                _result(frames)
+                with self.assertRaises(wire.TextWireError):
+                    _result(frames)
         self.assertEqual(_result(_child_output(_packet("one\ntwo"))[1][1:]).text, "fixture: one\ntwo")
 
     def test_ready_requires_the_exact_model_profile_and_empty_tool_inventory(self):
@@ -206,8 +216,9 @@ class NamedClaudeTextProtocolTests(unittest.TestCase):
             {"session": "3" * 32}, {"model": "alternate"}, {"profile": "wrong"},
             {"account": "wrong"}, {"hooks": ["unexpected"]}, {"tools": ["unexpected"]}, {"mcp": ["unexpected"]},
         ):
+            frame = _frame_update(ready, **edits)
             with self.assertRaises(wire.TextWireError):
-                _ready(_frame_update(ready, **edits))
+                _ready(frame)
 
     def test_native_uncertainty_yields_no_completed_reply(self):
         _, (_, delta, terminal) = _child_output(_packet())
