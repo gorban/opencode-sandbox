@@ -16,6 +16,10 @@ fixtures for tests and carries no real authority. Delivery order:
 A throwaway probe under `docs/prds/spikes/`, following the spike rules in
 [`AGENTS.md`](../../AGENTS.md#branches). It uses synthetic data and a fixture daemon only.
 
+- [ ] Build the probe on the stock skeleton from [prd_m3a3](prd_m3a3.md#skeleton), with async
+      Svelte on, and answer the
+      [foundation's open questions](prd_m3a3.md#qualification-in-the-tech-stack-spike) here.
+
 - [ ] Package the SvelteKit static build in Tauri v2 on Linux WebKitGTK under the strict
       desktop CSP. Record which CSS the [locked design](spikes/m/dashboard-design/DESIGN.md#engine-notes)
       relies on that this engine lacks.

@@ -194,8 +194,11 @@ owner, named in brackets where the index reserves it.
 
 Direction recorded:
 
-- Prove the tech stack on a thin live slice before porting the whole
-  [locked design](spikes/m/dashboard-design/DESIGN.md).
+- Prove the tech stack on a thin live slice before rebuilding the whole
+  [locked design](spikes/m/dashboard-design/DESIGN.md). That design is a UX mockup: the target
+  for look and feel, not an implementation guide ([prd_m3a3](prd_m3a3.md#direction-recorded)).
+- Lock the frontend's conventions before any UI stream starts: the stock skeleton, the style
+  guide and the test pyramid ([prd_m3a3](prd_m3a3.md)).
 - Tauri becomes the only shipping shell if the tech-stack spike passes. See the
   [control-plane decision](#control-plane-decision).
 - The first end-to-end example is a minimal crew pipeline ([prd_n](prd_n.md#delivery-order)).
@@ -206,8 +209,12 @@ Direction recorded:
 
 These unblock every later stream. They can run in parallel with each other.
 
-- [ ] **Tech-stack spike** ([prd_m3b](prd_m3b.md#tech-stack-spike)). Decides the shell order and
-      the [UI SDK decision](prd_m3a2.md#open-decision).
+- [ ] **Frontend foundation** ([prd_m3a3](prd_m3a3.md)): the `sv create` skeleton with its
+      add-ons, async Svelte enabled, the style guide with rule IDs, and the test harness in two
+      browser engines. Every UI stream builds on it and is reviewed against it.
+- [ ] **Tech-stack spike** ([prd_m3b](prd_m3b.md#tech-stack-spike)), built on that skeleton.
+      Decides the shell order and the [UI SDK decision](prd_m3a2.md#open-decision), and answers
+      the [foundation's open questions](prd_m3a3.md#qualification-in-the-tech-stack-spike).
 - [ ] **Shared UI contract and one fixture set**
       ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)). Every view stream builds against the
       fixtures and every host stream against the contract.
@@ -227,8 +234,10 @@ Parallel once Wave 0 lands. Workflow-side items for this wave are in
       [M2](prd_m2.md#concrete-gaps-and-checkboxes)). [Reserved: PRD M coordination.]
 - [ ] Port the local worker transport: one OpenCode job with the synthetic broker
       ([first PoC split](#first-poc-split)).
-- [ ] Port the design system and shell: tokens, trust primitives, header and footer bands, stage,
-      sidebar and drawer ([prd_m3a1](prd_m3a1.md)).
+- [ ] Rebuild the design system and shell to match the mockup: tokens, trust primitives, header
+      and footer bands, stage, sidebar and drawer ([prd_m3a1](prd_m3a1.md)). The
+      [conversion lane](prd_m3a3.md#conversion-lane) can start on the presentational pieces as
+      soon as the frontend foundation exists, ahead of the rest of this wave.
 - [ ] Fleet overview and sidebar tree.
 - [ ] Read-only thread view with provenance badges.
 - [ ] Tier A Approval Inbox wired to `oc_controller`, at least for the run lease the pipeline
@@ -287,6 +296,7 @@ Decisions:
   [tech-stack spike](prd_m3b.md#tech-stack-spike).
 - How much of the UI is built on UI SDK primitives: [prd_m3a2](prd_m3a2.md#open-decision).
 - Process for the design supplement: [prd_m3a1](prd_m3a1.md#design-supplement).
+- Frontend conventions and development add-ons: [prd_m3a3](prd_m3a3.md#open-decisions).
 - Workflow authoring surface and authored deterministic steps:
   [prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps).
 - Configuration editing interface: [prd_j](prd_j.md#later-configuration-and-editor).

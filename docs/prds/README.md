@@ -50,8 +50,9 @@ reservation explicitly in this index.
   the M3.1 projection and N3 backend work.
 
 - [*] Delivery order for the dashboard and workflows: the wave plan in
-  [prd_m](prd_m.md#delivery-order) and [prd_n](prd_n.md#delivery-order), and the sections it
-  added to M3, M3a1, M3b, N1, N3 and J — **Delivery planning** (`spike-prd-n3-workflow-poc`).
+  [prd_m](prd_m.md#delivery-order) and [prd_n](prd_n.md#delivery-order), the new
+  [M3a3](prd_m3a3.md) frontend foundation, and the sections it added to M3, M3a1, M3b, N1, N3
+  and J — **Delivery planning** (`spike-prd-n3-workflow-poc`).
   This reserves the plan text only. A `[ ]` in a wave list tracks delivery order. It does not
   open or release a reservation. Scope already reserved above keeps its owner when a wave list
   repeats it as an unchecked task, including N0–N2, the M first PoC and M3 projection, the

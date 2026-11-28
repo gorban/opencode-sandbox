@@ -678,7 +678,9 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
       capabilities, limits and markup rules: [prd_m3a2](prd_m3a2.md).
 - [ ] **Gap M3.6 — Shared UI contract and one fixture set:** define one versioned, typed contract
       between the dashboard and `oc_daemon` for projection reads, events and commands, with a
-      transport-neutral client (native bridge in the app, fixture transport in tests). Merge the
+      transport-neutral client (native bridge in the app, fixture transport in tests). Shape the
+      client as awaitable queries, commands and a live event stream
+      ([prd_m3a3](prd_m3a3.md#async-svelte)). Merge the
       two existing fixtures ([design brief](spikes/m/dashboard-design/brief/fixtures/workspace.json)
       and [web-ui](spikes/m/web-ui/fixtures/workspace.mjs)) into one synthetic set that also
       holds a crew pipeline run, its lease approval and its human gate

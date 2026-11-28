@@ -347,6 +347,7 @@ Decisions:
   [tech-stack spike](prd_m3b.md#tech-stack-spike).
 - How much of the UI is built on UI SDK primitives: [prd_m3a2](prd_m3a2.md#open-decision).
 - Process for the design supplement: [prd_m3a1](prd_m3a1.md#design-supplement).
+- Frontend conventions and development add-ons: [prd_m3a3](prd_m3a3.md#open-decisions).
 - Workflow authoring surface and authored deterministic steps:
   [prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps).
 - Configuration editing interface: [prd_j](prd_j.md#later-configuration-and-editor).

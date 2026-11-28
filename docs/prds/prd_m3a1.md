@@ -1,6 +1,7 @@
 # prd_m3a1: Dashboard product design, design system, and accessibility
 
-Parent: [prd_m3a](prd_m3a.md) · sibling: [prd_m3a2 UI SDK agent bridge](prd_m3a2.md) ·
+Parent: [prd_m3a](prd_m3a.md) · siblings: [prd_m3a2 UI SDK agent bridge](prd_m3a2.md),
+[prd_m3a3 frontend foundation and style guide](prd_m3a3.md) ·
 related: [M3 control plane](prd_m3.md), [M3b Tauri desktop](prd_m3b.md),
 [N3 Human Inbox and `oc-ui@1` surfaces](prd_n3.md), [I1 operator dashboard](prd_i1.md)
 
@@ -196,6 +197,9 @@ host chrome.
 ## Design supplement
 
 Added on 2026-11-28. The [locked design](spikes/m/dashboard-design/DESIGN.md) covers 16 screens.
+The operator treats that design as a UX mockup: the target for look and feel, not an
+implementation guide. The build matches it and follows the
+[style guide](prd_m3a3.md#style-guide) for how.
 The screens below are missing. They extend the locked system: its tokens, trust vocabulary, tiers
 and components stay as they are. This is a Wave 0 item in the
 [delivery order](prd_m.md#delivery-order).
