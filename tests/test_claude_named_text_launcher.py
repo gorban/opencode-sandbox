@@ -326,6 +326,66 @@ sys.exit(not unittest.TextTestRunner().run(suite).wasSuccessful())
             self.assert_refused(launcher.FixtureTurn(self.work), "native_cancelled", cancelled=cancelled)
         self.assertFalse(wrote.exists())
 
+    def test_stdin_close_report_preserves_send_refusals_and_blocks_success(self):
+        for reason, writes in (("native_cancelled", b""), ("native_write_uncertain", b"x"),
+                               ("native_owner_failed", b"w")):
+            with self.subTest(reason=reason):
+                self._stdin_close_report_probe(reason, writes)
+
+    def _stdin_close_report_probe(self, reason, expected_writes):
+        send = launcher._send_once
+        write = launcher._WRITE
+        is_cancelled = launcher._OwnerCancellation.is_set
+        cancelled_at_send = False
+        writes = self.root / f"{reason}-writes"
+        released = self.root / f"{reason}-released"
+        writes.touch()
+
+        def observe_cancellation(owner):
+            return cancelled_at_send or is_cancelled(owner)
+
+        def observe_write(descriptor, packet, length):
+            result = -1 if reason == "native_write_uncertain" else write(descriptor, packet, length)
+            with writes.open("ab") as log:
+                log.write(b"w" if result == length else b"x")
+            return result
+
+        def install_close_report(process, packet, checkpoint):
+            nonlocal cancelled_at_send
+            stream = process.stdin
+            descriptor = stream.fileno()
+            close = stream.close
+
+            def close_and_report():
+                stream.close = close
+                close()
+                with self.assertRaises(OSError) as failure:
+                    os.fstat(descriptor)
+                self.assertEqual(failure.exception.errno, errno.EBADF)
+                released.write_text(str(process.pid))
+                raise OSError("synthetic native stdin close report")
+
+            stream.close = close_and_report
+            cancelled_at_send = reason == "native_cancelled"
+            send(process, packet, checkpoint)
+
+        turn = launcher.FixtureTurn(self.work)
+        cancelled = Event()
+        with (patch.object(launcher, "_send_once", side_effect=install_close_report),
+              patch.object(launcher._OwnerCancellation, "is_set", autospec=True, side_effect=observe_cancellation),
+              patch.object(launcher, "_WRITE", side_effect=observe_write),
+              self.assertRaises(launcher.FixtureLaunchError) as failure):
+            turn.run("fixture text", cancelled=cancelled)
+
+        self.assert_drained()
+        native_pid = int(released.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(native_pid, 0)
+        self.assertEqual(writes.read_bytes(), expected_writes)
+        self.assertIs(type(failure.exception), launcher.FixtureLaunchError)
+        self.assertEqual(str(failure.exception), reason)
+        self.assertIsNone(failure.exception.__cause__)
+
     def test_mixed_terminal_error_and_result_refuses_on_success_and_uncertainty_status(self):
         record = {
             "error": "FixtureLaunchError", "message": "unverified",
@@ -524,13 +584,9 @@ sys.exit(not unittest.TextTestRunner().run(suite).wasSuccessful())
             turn.run("fixture text", cancelled=cancelled)
         self.assertTrue(faulted.exists())
         self.assertEqual(len(owned), 1)
-        try:
-            # Drain the exact synthetic owner for old-red runs before reporting a regression.
+        # Drain the exact synthetic owner for old-red runs before reporting a regression.
+        with self.assertRaises(ChildProcessError):
             launcher._reap_owner(owned[0], None, grace=1.5)
-        except ChildProcessError:
-            pass
-        else:
-            self.fail("the controller left its disposable owner unreaped")
         self.assert_drained()
 
     def test_child_socket_close_failure_exits_without_resuming_controller_code(self):
@@ -539,17 +595,16 @@ sys.exit(not unittest.TextTestRunner().run(suite).wasSuccessful())
     def _child_socket_close_probe(self):
         controller = os.getpid()
         escaped = self.root / "owner-returned-to-controller"
+        turn = launcher.FixtureTurn(self.work)
+        cancelled = Event()
         with self.post_fork_socket_close_fault(in_child=True) as faulted:
             try:
-                launcher.FixtureTurn(self.work).run("fixture text", cancelled=Event())
-            except BaseException as error:
+                with self.assertRaisesRegex(launcher.FixtureLaunchError, "^native_owner_failed$"):
+                    turn.run("fixture text", cancelled=cancelled)
+            finally:
                 if os.getpid() != controller:
                     escaped.touch()
                     os._exit(70)
-                self.assertIsInstance(error, launcher.FixtureLaunchError)
-                self.assertEqual(str(error), "native_owner_failed")
-            else:
-                self.fail("the controller accepted an owner without a result")
         self.assertTrue(faulted.exists())
         self.assertFalse(escaped.exists())
         self.assert_drained()
@@ -645,6 +700,140 @@ sys.exit(not unittest.TextTestRunner().run(suite).wasSuccessful())
         self.assertEqual(failure.exception.__notes__, ["Native descendant retirement could not be verified."])
         self.assert_drained()
         self.assert_refused(launcher.FixtureTurn(self.work), "native_workspace_quarantined")
+
+    def test_workspace_pin_close_report_preserves_checked_refusal(self):
+        (self.work / "nonempty").touch()
+        open_fd = os.open
+        close = os.close
+        opened = []
+        close_attempts = []
+        close_report = OSError(errno.EIO, "synthetic workspace pin close report")
+
+        def track_open(path, *args, **kwargs):
+            fd = open_fd(path, *args, **kwargs)
+            if path == self.work:
+                opened.append(fd)
+            return fd
+
+        def close_and_report(fd):
+            if fd not in opened:
+                return close(fd)
+            close_attempts.append(fd)
+            close(fd)
+            with self.assertRaises(OSError) as failure:
+                os.fstat(fd)
+            self.assertEqual(failure.exception.errno, errno.EBADF)
+            raise close_report
+
+        turn = launcher.FixtureTurn(self.work)
+        cancelled = Event()
+        with (patch.object(os, "open", side_effect=track_open),
+              patch.object(os, "close", side_effect=close_and_report),
+              patch.object(launcher, "_run_owner_process") as run_owner,
+              self.assertRaises((launcher.FixtureLaunchError, OSError)) as failure):
+            turn.run("fixture text", cancelled=cancelled)
+
+        run_owner.assert_not_called()
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(close_attempts, opened)
+        self.assert_drained()
+        self.assertIsInstance(failure.exception, launcher.FixtureLaunchError)
+        self.assertEqual(str(failure.exception), "native_workspace_unverified")
+        self.assertIs(failure.exception.__cause__, close_report)
+
+    def test_startup_pin_close_report_preserves_checked_refusals(self):
+        self._isolated_probe("_startup_pin_close_report_probe")
+
+    def _startup_pin_close_report_probe(self):
+        for site, reason in (("raw source", "native_source_unverified"),
+                             ("source digest", "native_source_unverified"),
+                             ("sealed source", "native_source_unverified"),
+                             ("executable", "native_executable_unverified")):
+            with self.subTest(site=site):
+                self._assert_startup_pin_close_report(site, reason)
+
+    def _assert_startup_pin_close_report(self, site, reason):
+        source = launcher._SOURCE
+        if site == "raw source":
+            source = self.root / "inert-source-fifo"
+            os.mkfifo(source)
+        elif site == "source digest":
+            source = self.root / "inert-wrong-digest.py"
+            source.write_bytes(b"# synthetic wrong-digest source\n")
+        raw_source = site in ("raw source", "source digest")
+        executable = self.root if site == "executable" else launcher._PYTHON
+        turn = launcher.FixtureTurn(self.work, _source=source)
+        cancelled = Event()
+        disposition = launcher._ExchangeDisposition()
+        open_fd = os.open
+        open_stream = os.fdopen
+        create_memfd = os.memfd_create
+        control_fd = launcher.fcntl.fcntl
+        close_fd = os.close
+        opened = []
+        close_attempts = []
+        close_report = OSError(errno.EIO, "synthetic startup pin close report")
+
+        def report_after_close(fd, close):
+            close_attempts.append(fd)
+            close()
+            with self.assertRaises(OSError) as failure:
+                os.fstat(fd)
+            self.assertEqual(failure.exception.errno, errno.EBADF)
+            raise close_report
+
+        def track_open(path, *args, **kwargs):
+            fd = open_fd(path, *args, **kwargs)
+            if site == "executable" and path == executable:
+                opened.append(fd)
+            return fd
+
+        def track_stream(fd, *args, **kwargs):
+            stream = open_stream(fd, *args, **kwargs)
+            if raw_source:
+                opened.append(fd)
+                close = stream.close
+                stream.close = lambda: report_after_close(fd, close)
+            return stream
+
+        def track_memfd(*args, **kwargs):
+            fd = create_memfd(*args, **kwargs)
+            if site == "sealed source":
+                opened.append(fd)
+            return fd
+
+        def check_seals(fd, command, *args):
+            if site == "sealed source" and command == launcher.fcntl.F_GET_SEALS and fd in opened:
+                return 0
+            return control_fd(fd, command, *args)
+
+        def close_resource(fd):
+            if not raw_source and fd in opened:
+                return report_after_close(fd, lambda: close_fd(fd))
+            return close_fd(fd)
+
+        workspace = launcher._pin_workspace(self.work)
+        try:
+            with (patch.object(os, "open", side_effect=track_open),
+                  patch.object(os, "fdopen", side_effect=track_stream),
+                  patch.object(os, "memfd_create", side_effect=track_memfd),
+                  patch.object(launcher.fcntl, "fcntl", side_effect=check_seals),
+                  patch.object(os, "close", side_effect=close_resource),
+                  patch.object(launcher, "_PYTHON", executable),
+                  patch.object(subprocess, "Popen") as native_launch,
+                  self.assertRaises((launcher.FixtureLaunchError, OSError)) as failure):
+                turn._owned_exchange("fixture text", workspace=workspace, cancelled=cancelled,
+                                     disposition=disposition)
+        finally:
+            close_fd(workspace.fd)
+
+        native_launch.assert_not_called()
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(close_attempts, opened)
+        self.assert_drained()
+        self.assertIsInstance(failure.exception, launcher.FixtureLaunchError)
+        self.assertEqual(str(failure.exception), reason)
+        self.assertIs(failure.exception.__cause__, close_report)
 
     def test_workspace_close_report_preserves_a_checked_refusal_and_blocks_a_valid_reply(self):
         controller = os.getpid()

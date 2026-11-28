@@ -1,6 +1,6 @@
 """Own one inert Claude wire fixture in an exclusive offline subprocess owner."""
 
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, contextmanager, suppress
 import ctypes
 from dataclasses import asdict, dataclass
 import fcntl
@@ -78,12 +78,26 @@ def _check(supervisor, cancelled, deadline):
     return min(remaining, _POLL_SECONDS)
 
 
+@contextmanager
+def _closing_preserving_error(resource):
+    try:
+        yield resource
+    except BaseException as error:
+        try:
+            resource.close()
+        except BaseException as close_error:
+            raise error from close_error
+        raise
+    else:
+        resource.close()
+
+
 def _pin_source(resources, source, digest):
     source_fd = os.open(source, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
-    with os.fdopen(source_fd, "rb") as stream:
+    with _closing_preserving_error(os.fdopen(source_fd, "rb")) as stream:
         _require(stat.S_ISREG(os.fstat(source_fd).st_mode), "native_source_unverified")
         data = stream.read(65537)
-    _require(0 < len(data) <= 65536 and sha256(data).hexdigest() == digest, "native_source_unverified")
+        _require(0 < len(data) <= 65536 and sha256(data).hexdigest() == digest, "native_source_unverified")
     descriptor = os.memfd_create("claude-named-fixture", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
     resources.callback(os.close, descriptor)
     _require(os.write(descriptor, data) == len(data), "native_source_unverified")
@@ -117,8 +131,11 @@ def _pin_workspace(workspace):
                  "native_workspace_quarantined")
         _verify_workspace(workspace, fd)
         return _WorkspaceBinding(workspace, fd)
-    except BaseException:
-        os.close(fd)
+    except BaseException as error:
+        try:
+            os.close(fd)
+        except BaseException as close_error:
+            raise error from close_error
         raise
 
 
@@ -274,7 +291,14 @@ def _send_once(process, packet, checkpoint):
         _require(signal.getsignal(signal.SIGPIPE) is signal.SIG_IGN, "native_sigpipe_unverified")
         checkpoint()
         _require(_WRITE(descriptor, packet, len(packet)) == len(packet), "native_write_uncertain")
-    finally:
+    except BaseException as error:
+        try:
+            process.stdin.close()
+        except BaseException as close_error:
+            # The owner's record carries the checked send error, with the close report kept local.
+            raise error from close_error
+        raise
+    else:
         process.stdin.close()
 
 
@@ -515,7 +539,7 @@ class FixtureTurn:
 
     def _owned_exchange(self, text, *, workspace, cancelled, disposition):
         deadline = time.monotonic() + _TURN_SECONDS
-        with supervise() as supervisor, ExitStack() as resources:
+        with supervise() as supervisor, _closing_preserving_error(ExitStack()) as resources:
             signal.pthread_sigmask(signal.SIG_UNBLOCK, _OWNER_INTERRUPTS)
 
             def checkpoint():
