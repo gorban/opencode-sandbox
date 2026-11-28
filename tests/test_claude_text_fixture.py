@@ -565,6 +565,29 @@ class ScratchRetirementTest(unittest.TestCase):
             saved.rename(root)
             scratch.remove()
 
+    def test_pending_retirement_refuses_removal_even_without_a_record(self):
+        with FixtureCustody() as custody:
+            scratch = self.enterContext(custody.pin_scratch())
+            sentinel = scratch.path / "expected-owner"
+            sentinel.write_text("retained")
+            receipt = scratch.expect_recovery("occlaude-expected")
+            another_pin = self.enterContext(custody.pin_scratch())
+        self.assertEqual(scratch.recovery_names(), ())
+        try:
+            with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                scratch.remove()
+            with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                another_pin.remove()
+            self.assertEqual(sentinel.read_text(), "retained")
+            with self.assertRaisesRegex(FixtureError, "^integrity_error$"):
+                scratch.confirm_recovery("occlaude-expected", object())
+            with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                scratch.remove()
+        finally:
+            # This portable test never starts a process or creates a cgroup.
+            scratch.confirm_recovery("occlaude-expected", receipt)
+            scratch.remove()
+
     def test_held_entry_is_retained_without_reading_its_contents(self):
         with FixtureCustody() as custody:
             scratch = self.enterContext(custody.pin_scratch())
@@ -762,16 +785,15 @@ class LinuxClaudeFixtureTest(unittest.TestCase):
                 self.assertIsNone(unrelated.poll())
 
     def _check_supervisor_disappearance(self, launcher, binding):
-        import json
-        import os
-        import re
         import select
         import signal
-        import stat
 
-        from fixtures.claude_kernel import DIR, FILE, PollCancellation
+        from fixtures.claude_kernel import PollCancellation
 
         launcher.scenario = "stall_ready"
+        # The controller keeps its own cgroup and record descriptors before it
+        # forks. The child receives this unit without opening another by name.
+        unit = launcher.prepare_unit()
         read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
         supervisor = os.fork()
         if supervisor == 0:
@@ -779,7 +801,7 @@ class LinuxClaudeFixtureTest(unittest.TestCase):
             start = launcher.start
 
             def announce(*args):
-                child = start(*args)
+                child = start(*args, prepared_unit=unit)
                 os.write(write_fd, b"R" + child.unit.name.encode("ascii"))
                 return child
 
@@ -800,13 +822,11 @@ class LinuxClaudeFixtureTest(unittest.TestCase):
             poller.register(read_fd, select.POLLIN | select.POLLHUP)
             try:
                 self.assertTrue(poller.poll(2000))
-                notice = os.read(read_fd, 64).decode("ascii")
-                self.assertRegex(notice, r"^Rocclaude-[0-9a-f]{24}$")
-                record_name = notice[1:]
-                self.assertEqual(launcher.scratch.recovery_names(), (record_name,))
-                record_fd = os.open(record_name, DIR, dir_fd=launcher.scratch.fd)
-                self.addCleanup(os.close, record_fd)
-                evidence = self._read_recovery(record_fd)
+                notice = os.read(read_fd, 64)
+                self.assertEqual(notice, b"R" + unit.name.encode("ascii"))
+                # A ready child is not evidence of a dead supervisor.
+                with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                    unit.recover(pidfd, notice, time.monotonic() + 2)
             finally:
                 poller.unregister(read_fd)
                 poller.register(pidfd, select.POLLIN)
@@ -815,53 +835,60 @@ class LinuxClaudeFixtureTest(unittest.TestCase):
                 _pid, status = os.waitpid(supervisor, os.WNOHANG)
                 self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL)
             self.assertEqual(os.read(read_fd, 1), b"")
+            with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                unit.recover(pidfd, b"", time.monotonic() + 2)
+            self._check_missing_or_substituted_recovery(launcher, unit, pidfd, notice)
+            unit.recover(pidfd, notice, time.monotonic() + 2)
+            self.assertEqual(launcher.scratch.recovery_names(), ())
+            self.assertFalse((launcher.delegated / unit.name).exists())
         finally:
             os.close(pidfd)
             os.close(read_fd)
 
-        # A surviving test owner inspects the exact held unit before removing it.
-        with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
-            launcher.scratch.remove()
-        self.assertEqual(self._read_recovery(record_fd), evidence)
-        held = json.loads(evidence)
-        self.assertEqual(held["uid"], os.geteuid())
-        self.assertEqual(held["parent"], str(launcher.delegated))
-        self.assertRegex(held["cgroup"], re.compile(r"^occlaude-[0-9a-f]{24}$"))
-        self.assertEqual(held["cgroup"], record_name)
-        with ExitStack() as fds:
-            root_fd = os.open(launcher.delegated, DIR)
-            fds.callback(os.close, root_fd)
-            unit_fd = os.open(held["cgroup"], DIR, dir_fd=root_fd)
-            fds.callback(os.close, unit_fd)
-            for fd, identity in ((unit_fd, held["identity"]), (record_fd, held["scratch_identity"])):
-                info = os.fstat(fd)
-                self.assertEqual([info.st_dev, info.st_ino], identity)
-                self.assertEqual(info.st_uid, os.geteuid())
-                self.assertTrue(stat.S_ISDIR(info.st_mode))
-            kill_fd = os.open("cgroup.kill", os.O_WRONLY | FILE, dir_fd=unit_fd)
-            fds.callback(os.close, kill_fd)
-            events_fd = os.open("cgroup.events", os.O_RDONLY | FILE, dir_fd=unit_fd)
-            fds.callback(os.close, events_fd)
-            self.assertEqual(os.write(kill_fd, b"1"), 1)
-            end = time.monotonic() + 2
-            while b"populated 0" not in os.pread(events_fd, 1024, 0).splitlines():
-                self.assertLess(time.monotonic(), end)
-                time.sleep(.01)
-            os.rmdir(held["cgroup"], dir_fd=root_fd)
-            self.assertTrue(_same_private_dir(record_name, launcher.scratch.fd, tuple(held["scratch_identity"])))
-            os.unlink("recovery.json", dir_fd=record_fd)
-            os.rmdir(record_name, dir_fd=launcher.scratch.fd)
+    def _check_missing_or_substituted_recovery(self, launcher, unit, pidfd, notice):
+        scratch = launcher.scratch
+        record = unit.record
+        evidence = record / "recovery.json"
+        original_record = scratch.path.with_name(scratch.path.name + "-held")
+        original_file = record / "expected.json"
+        sentinel = scratch.path / "recovery-sentinel"
+        sentinel.write_text("retain expected scratch")
 
-    @staticmethod
-    def _read_recovery(record_fd):
-        from fixtures.claude_kernel import FILE
+        def must_refuse():
+            with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                scratch.remove()
+            with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                unit.recover(pidfd, notice, time.monotonic() + 2)
+            self.assertEqual(sentinel.read_text(), "retain expected scratch")
+            self.assertTrue((launcher.delegated / unit.name).is_dir())
 
-        fd = os.open("recovery.json", os.O_RDONLY | FILE, dir_fd=record_fd)
+        record.rename(original_record)
         try:
-            # Read only the trusted supervisor's bounded synthetic record.
-            return os.read(fd, 4096)
+            self.assertEqual(scratch.recovery_names(), ())
+            must_refuse()
+
+            record.mkdir(mode=0o700)
+            try:
+                evidence.write_bytes(unit.evidence)
+                evidence.chmod(0o600)
+                must_refuse()
+                self.assertEqual(evidence.read_bytes(), unit.evidence)
+            finally:
+                evidence.unlink()
+                record.rmdir()
         finally:
-            os.close(fd)
+            original_record.rename(record)
+
+        evidence.rename(original_file)
+        try:
+            must_refuse()
+            evidence.write_bytes(unit.evidence)
+            evidence.chmod(0o600)
+            must_refuse()
+            self.assertEqual(evidence.read_bytes(), unit.evidence)
+        finally:
+            evidence.unlink(missing_ok=True)
+            original_file.rename(evidence)
 
     @staticmethod
     def _retire_unrelated(process):

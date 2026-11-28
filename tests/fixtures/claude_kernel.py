@@ -220,7 +220,10 @@ class KernelLauncher:
                         str(PYTHON), "-IB", "-c", _DROP_SETUP_FDS, mode, self.scenario, session, *self.denied))
         return command
 
-    def start(self, profile, mode, deadline, cancel):
+    def prepare_unit(self):
+        return _Cgroup(self.delegated, self.scratch)
+
+    def start(self, profile, mode, deadline, cancel, *, prepared_unit=None):
         require(mode in {"status", "turn"} and profile.snapshot().executable_identity == self.executable_identity)
         _remaining(deadline, cancel)
         unit = None
@@ -238,7 +241,12 @@ class KernelLauncher:
                 stack.callback(os.close, image)
                 os.lseek(image, 0, os.SEEK_SET)
                 _remaining(deadline, cancel)
-                unit = _Cgroup(self.delegated, self.scratch)
+                if prepared_unit is None:
+                    unit = self.prepare_unit()
+                    unit.claim(self.delegated, self.scratch)
+                else:
+                    prepared_unit.claim(self.delegated, self.scratch)
+                    unit = prepared_unit
                 gate_read, gate_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
                 stack.callback(os.close, gate_read)
                 stack.callback(os.close, gate_write)
@@ -278,15 +286,20 @@ class KernelLauncher:
 class _Cgroup:
     def __init__(self, delegated, scratch):
         scratch.require_reachable()
+        self.delegated = delegated
         self.parent = os.open(delegated, DIR)
         self.root = None
         self.identity = None
         self.scratch = scratch
         self.record = None
         self.record_fd = None
+        self.evidence_fd = None
         self.name = "occlaude-" + secrets.token_hex(12)
         self.events = self.kill = self.procs = None
+        self._claimed = False
+        self._closed = False
         try:
+            self.receipt = scratch.expect_recovery(self.name)
             parent_info = os.fstat(self.parent)
             require(parent_info.st_uid == os.geteuid())
             os.mkdir(self.name, mode=0o700, dir_fd=self.parent)
@@ -307,18 +320,57 @@ class _Cgroup:
             os.mkdir(self.name, mode=0o700, dir_fd=scratch.fd)
             self.record_fd, self.record_identity = _open_private_dir(self.name, scratch.fd)
             self.record = scratch.path / self.name
-            record = os.open("recovery.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY | FILE,
-                             0o600, dir_fd=self.record_fd)
-            with os.fdopen(record, "w") as stream:
-                json.dump({"cgroup": self.name, "parent": str(delegated), "identity": self.identity,
-                           "scratch_identity": self.record_identity, "uid": os.geteuid()}, stream)
+            self.evidence = json.dumps(
+                {"cgroup": self.name, "parent": str(delegated), "identity": self.identity,
+                 "scratch_identity": self.record_identity, "uid": os.geteuid()},
+            ).encode("ascii")
+            self.evidence_fd = os.open("recovery.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY | FILE,
+                                       0o600, dir_fd=self.record_fd)
+            require(os.write(self.evidence_fd, self.evidence) == len(self.evidence))
+            self.evidence_identity = _identity(os.fstat(self.evidence_fd))
         except BaseException:
             # No process can have joined this unexposed leaf during setup.
-            self._close_files()
-            if self.identity is not None:
-                self._remove_leaf()
-            os.close(self.parent)
+            try:
+                if self.identity is not None:
+                    self._remove_leaf()
+            finally:
+                self._close_files()
+                os.close(self.parent)
             raise
+
+    def _verify_recovery(self):
+        self.scratch.require_reachable()
+        self._verify_leaf()
+        require(_same_private_dir(self.name, self.scratch.fd, self.record_identity))
+        record = os.open("recovery.json", os.O_RDONLY | FILE, dir_fd=self.record_fd)
+        try:
+            info = os.fstat(record)
+            require(_identity(info) == self.evidence_identity and info.st_uid == os.geteuid()
+                    and stat.S_ISREG(info.st_mode) and info.st_mode & 0o777 == 0o600
+                    and info.st_size == len(self.evidence))
+            require(os.read(record, len(self.evidence) + 1) == self.evidence)
+        finally:
+            os.close(record)
+
+    def claim(self, delegated, scratch):
+        require(not self._closed and not self._claimed and self.delegated == delegated and self.scratch is scratch)
+        self._verify_recovery()
+        self._claimed = True
+
+    def recover(self, supervisor_pidfd, launch_receipt, deadline):
+        # The receipt comes over the private supervisor pipe after child attachment.
+        # Process exit alone cannot prove what happened to a launch in progress.
+        try:
+            supervisor = select.poll()
+            supervisor.register(supervisor_pidfd, select.POLLIN)
+            require(launch_receipt == b"R" + self.name.encode("ascii"))
+            require(any(mask & select.POLLIN for _fd, mask in supervisor.poll(0)))
+            require(not self._closed)
+            self._verify_recovery()
+        except (OSError, FixtureError):
+            raise FixtureError("retirement_unverified") from None
+        if not self.retire(None, None, deadline):
+            raise FixtureError("retirement_unverified")
 
     def _file(self, name, flags):
         fd = os.open(name, flags | FILE, dir_fd=self.root)
@@ -340,14 +392,23 @@ class _Cgroup:
         return value == [b"populated 0"]
 
     def _close_files(self):
-        for fd in (self.events, self.kill, self.procs, self.root, self.record_fd):
+        for fd in (self.events, self.kill, self.procs, self.root, self.record_fd, self.evidence_fd):
             _close(fd)
 
+    def _verify_leaf(self):
+        info = os.stat(self.name, dir_fd=self.parent, follow_symlinks=False)
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and _identity(info) == self.identity)
+        if self.root is not None:
+            require(_identity(os.fstat(self.root)) == self.identity)
+
     def _remove_leaf(self):
-        require(_identity(os.stat(self.name, dir_fd=self.parent, follow_symlinks=False)) == self.identity)
+        self._verify_leaf()
         os.rmdir(self.name, dir_fd=self.parent)
 
     def retire(self, process, pidfd, deadline):
+        if self._closed:
+            return False
+        self._closed = True
         confirmed = False
         try:
             for stream in (() if process is None else (process.stdin, process.stdout, process.stderr)):
@@ -366,13 +427,12 @@ class _Cgroup:
                 if remaining <= 0:
                     return False
                 time.sleep(min(remaining, .01))
-            if self.record_fd is not None:
-                require(_same_private_dir(self.name, self.scratch.fd, self.record_identity))
+            self._verify_recovery()
             self._remove_leaf()
-            if self.record_fd is not None:
-                os.unlink("recovery.json", dir_fd=self.record_fd)
-                require(_same_private_dir(self.name, self.scratch.fd, self.record_identity))
-                os.rmdir(self.name, dir_fd=self.scratch.fd)
+            os.unlink("recovery.json", dir_fd=self.record_fd)
+            require(_same_private_dir(self.name, self.scratch.fd, self.record_identity))
+            os.rmdir(self.name, dir_fd=self.scratch.fd)
+            self.scratch.confirm_recovery(self.name, self.receipt)
             confirmed = True
         except (OSError, FixtureError):
             pass

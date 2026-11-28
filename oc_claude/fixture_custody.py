@@ -76,7 +76,7 @@ def _rename_without_replacing(source, source_fd, target, target_fd):
 class PinnedFixtureScratch:
     """Retain the exact scratch pins through registry close and fixture retirement."""
 
-    def __init__(self, anchor_fd, dir_fd, path, identity):
+    def __init__(self, anchor_fd, dir_fd, path, identity, *, recovery_lock, pending):
         self._anchor = os.dup(anchor_fd)
         try:
             self.fd = os.dup(dir_fd)
@@ -85,6 +85,8 @@ class PinnedFixtureScratch:
             raise
         self.path = path
         self._identity = identity
+        self._recovery_lock = recovery_lock
+        self._pending = pending
 
     def __enter__(self):
         return self
@@ -99,6 +101,19 @@ class PinnedFixtureScratch:
 
     def recovery_names(self):
         return tuple(name for name in os.listdir(self.fd) if name.startswith(_RECOVERY_PREFIX))
+
+    def expect_recovery(self, name):
+        with self._recovery_lock:
+            self.require_reachable()
+            require(name not in self._pending)
+            receipt = object()
+            self._pending[name] = receipt
+            return receipt
+
+    def confirm_recovery(self, name, receipt):
+        with self._recovery_lock:
+            require(name in self._pending and self._pending[name] is receipt)
+            del self._pending[name]
 
     def _move_owned_scratch(self, quarantine):
         # The private quarantine has no user-supplied children. If a swap won
@@ -142,9 +157,10 @@ class PinnedFixtureScratch:
 
     def remove(self):
         try:
-            self.require_reachable()
-            require(shutil.rmtree.avoids_symlink_attacks and not self.recovery_names())
-            self._quarantine_and_remove()
+            with self._recovery_lock:
+                self.require_reachable()
+                require(not self._pending and shutil.rmtree.avoids_symlink_attacks and not self.recovery_names())
+                self._quarantine_and_remove()
         except (OSError, FixtureError):
             raise FixtureError("retirement_unverified") from None
 
@@ -235,6 +251,8 @@ class FixtureCustody:
     def __init__(self, *, now=time.monotonic, wall=time.time):
         self._profiles, self._retired = {}, []
         self._registry_lock = Lock()
+        self._recovery_lock = Lock()
+        self._pending_recovery = {}
         self._now, self._wall = now, wall
         self._root_fd = None
         self._anchor_fd = os.open(ANCHOR, _DIR_FLAGS)
@@ -274,7 +292,10 @@ class FixtureCustody:
 
     def pin_scratch(self):
         require(self._root_fd is not None)
-        return PinnedFixtureScratch(self._anchor_fd, self._root_fd, self.root, self._root_identity)
+        return PinnedFixtureScratch(
+            self._anchor_fd, self._root_fd, self.root, self._root_identity,
+            recovery_lock=self._recovery_lock, pending=self._pending_recovery,
+        )
 
     def enroll(self, instance, generation, *, profile_id, account_tag, model, executable_identity, expires_at,
                cancel=None):
