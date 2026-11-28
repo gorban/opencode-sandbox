@@ -57,7 +57,7 @@ class SessionProtocolTests(unittest.TestCase):
             session_protocol._parse_headers([b"HoSt:\t127.0.0.1:8401  ", b"X-Session-ID: abc"]),
             {b"host": b"127.0.0.1:8401", b"x-session-id": b"abc"},
         )
-        for lines, expected in (
+        for lines, (expected_status, expected_code) in (
             ([b"OrIgIn: \xff"], (403, "forbidden_header")),
             ([b"Sec-Fetch-Site: local"], (403, "forbidden_header")),
             ([b"sEc-Ch-Ua: client"], (403, "forbidden_header")),
@@ -70,7 +70,8 @@ class SessionProtocolTests(unittest.TestCase):
             with self.subTest(lines=lines):
                 with self.assertRaises(RequestRefused) as error:
                     session_protocol._parse_headers(lines)
-                self.assertEqual((error.exception.status, error.exception.code), expected)
+                self.assertEqual(error.exception.status, expected_status)
+                self.assertEqual(error.exception.code, expected_code)
 
     def test_rejects_csrf_bad_host_bad_auth_and_forbidden_fields(self):
         base = {"model": "gpt-6.2-sol", "stream": True, "store": False,
