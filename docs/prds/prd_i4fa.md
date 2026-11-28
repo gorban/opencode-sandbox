@@ -99,6 +99,17 @@ configuration and policy. One provider can reach this milestone while the others
   credentials to isolated `agy`, and known-present private home, keyring and socket
   denial to worker and relay. Verify that non-subscription fallback is unavailable.
 
+### Shared-scope exposure foundation
+
+The offline `oc_openai/scoped_exposure.py` helper serializes compatible OpenAI profiles on the
+canonical exposure lock. Its private anchor binds the exact journal bytes, and claim admission
+reserves space for maximum supported terminal usage, including overage. Scratch tests cover
+contention, interruption, stale and partial publications, and exact settlement.
+
+- [ ] Qualify independent deployment evidence for writer compatibility and scope continuity across
+  rollback or loss of both files before wiring any public dispatch path. Require separate review
+  of shared enforcement across existing and named sends.
+
 ## Parallel lanes
 
 | Owner | First slice | Boundaries |
