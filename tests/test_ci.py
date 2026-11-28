@@ -138,11 +138,13 @@ class PortableTests(unittest.TestCase):
             'GIT_DIR', 'GIT_INDEX_FILE', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR', 'GIT_SSH_COMMAND',
             'GIT_ASKPASS', 'SSH_ASKPASS', 'SSH_AUTH_SOCK', 'DBUS_SESSION_BUS_ADDRESS', 'WAYLAND_DISPLAY',
             'GITHUB_TOKEN', 'GITHUB_ENV', 'CONTAINER_HOST', 'CONTAINER_ID', 'DOCKER_HOST',
-            'OC_TEST_SCRIPT', 'OC_TEST_LOCK_HELPER', 'OC_TEST_NO_PODMAN', 'BASH_ENV', 'PYTHONPATH',
+            'OC_TEST_SCRIPT', 'OC_TEST_LOCK_HELPER', 'OC_TEST_NO_PODMAN', 'OC_TEST_CLAUDE_CGROUP',
+            'BASH_ENV', 'PYTHONPATH',
         ), '/host/authority')
         expected = [
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_controller_core.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_orchestrator_text.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_claude_text_fixture.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'bridge_merge_core.py'),
             ('python3', '-B', 'tests/setup-lifecycle.py'),
             ('python3', '-B', 'tests/host_state_leaves.py'),
