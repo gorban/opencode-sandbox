@@ -9,6 +9,13 @@ Design work for this SPA runs ahead of implementation in [prd_m3a1](prd_m3a1.md)
 Chromium launches into the app (embedded browser views and the Browser Wall) is not part of
 this phase.
 
+On 2026-11-28 the operator chose Tauri as the only shipping shell, taking effect if the
+[tech-stack spike](prd_m3b.md#tech-stack-spike) passes
+([control-plane decision](prd_m.md#control-plane-decision)). In that case this phase keeps the
+static SPA, its view rules and a loopback fixture server for tests. The loopback sign-in
+qualification and the cookie port-sharing item below wait until loopback is asked to carry real
+authority again. Delivery order: [prd_m](prd_m.md#delivery-order).
+
 Ship the first dashboard as a SvelteKit static single-page application. Use the static adapter for
 build output and client-side rendering for live routes. The host daemon serves static assets and
 the authenticated API on one loopback origin. Node is build tooling. The packaged app has no

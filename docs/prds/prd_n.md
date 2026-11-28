@@ -242,9 +242,101 @@ desktop surfaces explicitly depend on completing the open upstream slices:
       `calibration_*`), `builtin/prd-delivery-pipeline`, and end-to-end adversarial suite.
       *(Est. 5–7 days.)*
 
+## Delivery order
+
+Operator direction from the 2026-11-28 planning session. This section orders the workflow side.
+The control-plane side is ordered in [prd_m](prd_m.md#delivery-order). The two lists share wave
+numbers and the same [shared blockers and decisions](#shared-blockers-and-decisions). Change both
+in one PR when a wave moves.
+
+Direction recorded:
+
+- The first end-to-end example is our own interpretation of `kunchenguid/firstmate`, starting
+  with a **minimal crew pipeline**: one ship lane, one `safe_run` verification and one
+  non-blocking human gate, as a cut-down `builtin/prd-delivery-pipeline`. It shows an LLM lane
+  beside a deterministic step and a human decision, which the fleet supervisor alone does not.
+- The fleet supervisor (`builtin/firstmate-supervisor`) follows in Wave 2, observe-only first.
+- The first waves use built-in host actions only. Authored deterministic steps are scoped for
+  the roadmap in [prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps) and are
+  not a foundation.
+- This puts the pipeline ahead of the supervisor, which reverses the sequence inside Option 1 of
+  the [initial slice decision](#open-top-level-decisions). The N1 to N3 milestones above keep
+  their content. Only their order of delivery changes.
+
+### Wave 0: prove and decide
+
+- [ ] Add a synthetic crew pipeline run, its lease approval and its human gate to the shared
+      fixture set ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)).
+- [ ] Design the missing workflow screens ([prd_m3a1](prd_m3a1.md#design-supplement)).
+- [ ] Decide the [authoring surface](prd_n1.md#authoring-surface-and-authored-deterministic-steps)
+      before any workflow other than a built-in is authored.
+- [ ] Finish N0: reciprocal review and the open decisions in this PRD and its children.
+
+### Wave 1: thin live slice
+
+Parallel once Wave 0 lands. Control-plane items for this wave are in
+[prd_m](prd_m.md#wave-1-thin-live-slice), with the shared finish line.
+
+- [ ] A minimal statechart kernel: the part of [N1](prd_n1.md) the pipeline needs. That is the
+      schema and pure compile for `deterministic`, `ship_lane` and `human_gate_async` stages,
+      the run lease, and the event-sourced engine with awakeables.
+- [ ] The minimal `builtin/prd-delivery-pipeline` and its skill ([prd_n3](prd_n3.md)). On the
+      synthetic route the reviewer can share the implementor's route.
+- [ ] The Human Inbox store, read projection and resolve path with the display-bound checks
+      ([prd_n3 §1](prd_n3.md#1-three-tier-human-inbox-strict-separation-from-oc_controller-approvals)).
+- [ ] Workflow list, definition and run views
+      ([prd_n3 §4](prd_n3.md#4-workflow-views-and-change-review)).
+
+### Wave 2: widen
+
+- [ ] The fleet supervisor, observe-only first: host metrics, the classifier route, the
+      throttler and the blind check ([prd_n2](prd_n2.md)).
+- [ ] Parallel lanes, the scout lane and the full delivery pipeline ([prd_n1](prd_n1.md)).
+- [ ] Orchestrator overlays and the orchestrator's tool surface
+      ([prd_n3 §2 and §3](prd_n3.md#2-declarative-dashboard-surfaces-oc-ui1--zero-untrusted-js-in-trusted-host-chrome)).
+- [ ] Workflow change review ([prd_n3 §4](prd_n3.md#4-workflow-views-and-change-review)).
+
+### Wave 3: later
+
+- [ ] Bounded nudging on live routes, calibration and replay ([prd_n2](prd_n2.md)).
+- [ ] Live providers and remote workers ([prd_i4](prd_i4.md), [prd_i2](prd_i2.md)).
+- [ ] The spike for authored deterministic steps
+      ([prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps)).
+
+### Shared blockers and decisions
+
+[prd_m](prd_m.md#shared-blockers-and-decisions) carries the same list. Keep the two in step.
+
+Decisions:
+
+- Shell order: [prd_m control-plane decision](prd_m.md#control-plane-decision), settled by the
+  [tech-stack spike](prd_m3b.md#tech-stack-spike).
+- How much of the UI is built on UI SDK primitives: [prd_m3a2](prd_m3a2.md#open-decision).
+- Process for the design supplement: [prd_m3a1](prd_m3a1.md#design-supplement).
+- Workflow authoring surface and authored deterministic steps:
+  [prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps).
+- Configuration editing interface: [prd_j](prd_j.md#later-configuration-and-editor).
+- Secret storage and broker integration: [prd_i3](prd_i3.md#open-choices).
+- Loopback cookie port-sharing ([prd_m3a](prd_m3a.md)) matters only if loopback ever carries real
+  authority again.
+
+Dependencies owned elsewhere:
+
+- Credential brokering for sandboxes: [prd_i3](prd_i3.md), [prd_i3a](prd_i3a.md),
+  [prd_i4](prd_i4.md) and [prd_l1](prd_l1.md). The dashboard's part is the Approval Inbox and
+  grant revocation.
+- Sandbox profiles and the config tools the orchestrator uses: the
+  [prd_l](prd_l.md) production port.
+- Named workstream [reservations](README.md#workstream-reservations). Take an epic by reserving it
+  there.
+
 ## Open top-level decisions
 
 - [ ] **(decision needed)** Initial implementation slice scope:
+  - *Operator direction, 2026-11-28:* the first example is the minimal crew pipeline, built as a
+    `workflow@1` statechart with built-in actions, ahead of the supervisor
+    ([delivery order](#delivery-order)). That is Option 1's approach with its sequence
+    reversed. The choice between the options below is still to be confirmed.
   - **Option 1 (Recommended):** Build **N1 + N2 + N3** in vertical phased PRs, starting with the
     minimal `workflow@1` runner + `builtin/firstmate-supervisor` + `Human Inbox` + `/decisions/*`
     + metrics, then expanding general multi-stage `workflow@1` statecharts (`builtin/prd-delivery-pipeline`)

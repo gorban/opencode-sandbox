@@ -168,9 +168,45 @@ host-owned `0o700`/`0o600` source, 0 base tokens until invoked). The skill teach
    and continue driving sibling lanes while checking `inbox_list` asynchronously.
 5. How to run the human-triggered calibration/replay workflow when asked to tune classifier drift.
 
+### 4. Workflow views and change review
+
+Added on 2026-11-28, after the Gate 1 clearance recorded in [prd_n](prd_n.md). It needs design
+and security review before implementation. The `oc-ui@1` surfaces in §2 show a run's status and
+health. They do not show what a workflow is, where a run stands in it, or what a proposed change
+would do. The locked dashboard design has only a specimen sheet of the eight surfaces
+([prd_m3a1](prd_m3a1.md#design-supplement)).
+
+All of these views are host-rendered Trusted Host Chrome. They read the compiled plan and the
+run's event log, never text an agent supplied.
+
+- **Workflow list.** Available workflows and active runs, with owner (operator or `-o`), mode,
+  autonomy level, status and lease state.
+- **Workflow definition.** A diagram the host generates from the compiled plan
+  ([prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps)): stages, lanes, gates
+  and transitions. Each stage is marked as an LLM lane, a deterministic host action or a human
+  gate. Beside it sit the reachable effects, the limits and the plan digest.
+- **Workflow run.** The same diagram with the run's current position, per-lane state and the
+  step log. Each lane links to its sandbox thread, each gate to its Human Inbox item or
+  approval. `oc-ui@1` surfaces for the run appear here with their provenance pills.
+- **Change review.** A proposed workflow revision arrives as a Tier A approval from
+  `config_propose_revision`. Show what changed in the workflow's own terms: stages, transitions,
+  effects, limits and templates added, removed or altered. Show the security triggers it raises
+  ([prd_n1 §1](prd_n1.md#1-storage-mutability-and-oc_config_mcp-authoring-prd_l-parity)) and the
+  diagram before and after, with changed elements marked by shape and label as well as colour.
+  The approval binds to the exact revision and digest shown. The shared flow for other
+  configuration kinds is in
+  [M3 §7](prd_m3.md#7-settings-proposed-changes-and-operator-only-secret-entry).
+
 ---
 
 ## Concrete checkboxes and open decisions
+
+The order these are delivered in is in [prd_n](prd_n.md#delivery-order). The Human Inbox and the
+minimal crew pipeline come first.
+
+- [ ] Build the [workflow list, definition and run views](#4-workflow-views-and-change-review)
+      (Wave 1) and the change review (Wave 2), from the
+      [design supplement](prd_m3a1.md#design-supplement).
 
 - [ ] Add `human_inbox_items` and `dashboard_surfaces` tables + TOCTOU fingerprint verification +
       `HumanDecisionReceipt` audit trail in `oc_registry.py` / `oc_daemon.py`.

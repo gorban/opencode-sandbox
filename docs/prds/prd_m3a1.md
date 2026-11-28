@@ -193,6 +193,43 @@ host chrome.
       implementation agents read before building M3a views.
       `claude/m3a-design-selection`: [`DESIGN.md`](spikes/m/dashboard-design/DESIGN.md).
 
+## Design supplement
+
+Added on 2026-11-28. The [locked design](spikes/m/dashboard-design/DESIGN.md) covers 16 screens.
+The screens below are missing. They extend the locked system: its tokens, trust vocabulary, tiers
+and components stay as they are. This is a Wave 0 item in the
+[delivery order](prd_m.md#delivery-order).
+
+- [ ] **Workflow list.** Available workflows and active runs, with owner, status and the run
+      lease state. The locked "Workflows" page is a specimen sheet of the eight `oc-ui@1`
+      surfaces. It stays as the catalog and does not stand in for this.
+- [ ] **Workflow definition.** The host-generated diagram of stages, lanes and gates, with the
+      effect summary and limits beside it. Mark which stages are LLM lanes, which are
+      deterministic host actions and which are human gates
+      ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
+- [ ] **Workflow run.** Where a run is now on that diagram, per-lane state, the step log, and
+      links to the lanes' threads, inbox items and approvals.
+- [ ] **Change review.** A proposed configuration or workflow revision as a Tier A approval:
+      field-level differences, security triggers, and for workflows the diagram before and after
+      ([M3 §7](prd_m3.md#7-settings-proposed-changes-and-operator-only-secret-entry)).
+- [ ] **Settings.** Effective values with their source, provider instances and their state, and
+      the form editor for non-secret settings.
+- [ ] **Secret entry.** The operator-only surface for entering a secret, with the slot it fills,
+      who asked, and the set or not-set state afterwards. It uses the security frame and is
+      hidden from the agent bridge.
+- [ ] Add each new screen to the states sheet and the hostile-content specimen, and run the
+      WCAG 2.2 AA audit on it.
+- [ ] (decision needed) **Process for the supplement.** Time estimates are rough.
+  - **One design extending the locked system, with operator review and an audit
+    (recommended).** The visual language is already chosen, so the open questions are layout and
+    content. Fast, and consistent with the lock. No independent alternatives to compare.
+    ~2–3 days.
+  - **A full council round for the workflow screens only.** Independent attempts where the
+    design is least settled. More operator time, and a risk that attempts drift from the locked
+    system. ~4–6 days.
+  - **A full council round for every new screen.** The most alternatives. The slowest, and most
+    of the settings and secret-entry layout follows from existing components. ~1–2 weeks.
+
 ## Design selection process
 
 Run with [design-starter-kit](https://github.com/gorban/design-starter-kit) (task

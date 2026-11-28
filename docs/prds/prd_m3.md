@@ -411,6 +411,40 @@ instructions = [
 "npm:chrome-devtools-axi" = "1.2.0" # example exact semver; pre-baked & verified via mise.lock
 ```
 
+### 7. Settings, proposed changes, and operator-only secret entry
+
+Added on 2026-11-28, after the Gate 1 clearance recorded in [prd_m](prd_m.md#review-record). It
+needs its own design and security review before implementation. Delivery order:
+[prd_m](prd_m.md#delivery-order).
+
+The pieces exist in other PRDs. This section joins them into one dashboard flow.
+
+- **What the orchestrator can do.** It reads and proposes revisions to sandbox types, bundles,
+  services and workflows through the config tools ([prd_l](prd_l.md), [prd_n1](prd_n1.md)). A
+  proposal never writes to disk. It becomes a Tier A approval that shows the security changes.
+  For providers it gets a typed readiness result and can ask the workstation to offer a
+  connection action ([prd_i4d](prd_i4d.md#connection-and-first-use-flow)). It never receives
+  credentials, native commands or executable paths.
+- **Change review.** A proposed revision opens in Trusted Host Chrome as a review of what
+  changed. Show a field-level difference in the configuration's own terms, the security triggers
+  it raises, and the exact revision and digest the approval binds to. Workflow revisions also
+  show the host-generated diagram before and after
+  ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
+- **Secret entry.** When a setting needs a secret, Trusted Host Chrome opens an operator-only
+  entry surface. The value goes straight to the host secret store. Configuration keeps a
+  reference only ([prd_i4d](prd_i4d.md#named-instances-and-credentials),
+  [prd_i3](prd_i3.md#open-choices)). The orchestrator and every agent see the slot name and
+  whether it is set, never the value. The surface is outside the agent bridge's registry and
+  marked `data-agent-hidden` ([prd_m3a2](prd_m3a2.md)). It is never opened by an agent action
+  alone: the operator opens it from a host-rendered request.
+- **Form editor.** Non-secret settings are edited through a form generated from the declared
+  setting schema, so the operator never escapes values for TOML, JSON or an environment file by
+  hand. The form writes through the same validated store as the CLI and the config tools
+  ([prd_j](prd_j.md#later-configuration-and-editor), [prd_l](prd_l.md)). Editing the file
+  directly stays supported.
+- **Read-only settings view first.** Show the effective value and source of each setting, and
+  each provider instance's state, before any editing ships.
+
 ## Gate 1 pseudocode walkthrough
 
 ### A. Confined PTY WebSocket relay
@@ -640,3 +674,17 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
       confirmation), bind modals to the session-generation fence, and keep authoritative
       authorization in `oc_daemon` / `oc_controller` / Tauri Rust IPC. Current UI SDK
       capabilities, limits and markup rules: [prd_m3a2](prd_m3a2.md).
+- [ ] **Gap M3.6 — Shared UI contract and one fixture set:** define one versioned, typed contract
+      between the dashboard and `oc_daemon` for projection reads, events and commands, with a
+      transport-neutral client (native bridge in the app, fixture transport in tests). Merge the
+      two existing fixtures ([design brief](spikes/m/dashboard-design/brief/fixtures/workspace.json)
+      and [web-ui](spikes/m/web-ui/fixtures/workspace.mjs)) into one synthetic set that also
+      holds a crew pipeline run, its lease approval and its human gate
+      ([prd_n](prd_n.md#delivery-order)). Keep the hostile strings. This is a Wave 0 blocker in
+      the [delivery order](prd_m.md#delivery-order).
+- [ ] **Gap M3.7 — Settings, change review and operator-only secret entry:** implement
+      [§7](#7-settings-proposed-changes-and-operator-only-secret-entry) in three steps: the
+      read-only settings view and change review (Wave 2), then secret entry and the form editor
+      (Wave 3). Screens come from the [design supplement](prd_m3a1.md#design-supplement).
+
+The order these gaps are delivered in is in [prd_m](prd_m.md#delivery-order).
