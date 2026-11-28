@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -62,7 +63,9 @@ class ManagedQualityTests(unittest.TestCase):
         inherited = dict.fromkeys((
             'MISE_DATA_DIR', 'MISE_ENV', 'MISE_GLOBAL_CONFIG_FILE', 'MISE_TRUSTED_CONFIG_PATHS',
             'MISE_INSTALLS_DIR', 'MISE_SHARED_INSTALL_DIRS', 'MISE_CEILING_PATHS', 'HOME', 'XDG_CONFIG_HOME',
-            'GITHUB_TOKEN', 'GH_TOKEN', 'https_proxy', 'LD_PRELOAD', 'BASH_ENV', 'PYTHONPATH', 'CURL_HOME',
+            'GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_API_TOKEN', 'MISE_GITHUB_TOKEN',
+            'MISE_GITHUB_ATTESTATIONS', 'MISE_GITHUB_GITHUB_ATTESTATIONS',
+            'https_proxy', 'LD_PRELOAD', 'BASH_ENV', 'PYTHONPATH', 'CURL_HOME',
         ), '/inherited/authority')
         with patch.object(tc, 'bootstrap_mise', side_effect=bootstrap), patch.object(ci, 'run', side_effect=fake.call), \
                 patch.dict(os.environ, inherited, clear=True):
@@ -183,6 +186,15 @@ class PrerequisiteAndBootstrapTests(unittest.TestCase):
                 self.assertEqual(validated.call_count, int(message == 'checked inputs'))
                 bootstrap.assert_not_called()
 
+    def test_shellcheck_pin_uses_the_public_asset_without_an_attestation_lookup(self):
+        files = tc.validated_inputs()
+        manifest = tomllib.loads(files['mise.toml'].decode())
+        self.assertEqual(manifest['tools'][tc.BACKEND],
+                         {'version': tc.SHELLCHECK, 'github_attestations': False})
+        lock = tomllib.loads(files['mise.lock'].decode())
+        platform = lock['tools'][tc.BACKEND][0][f'platforms.{tc.PLATFORM}']
+        self.assertEqual(platform, {'url': tc.SHELLCHECK_URL, 'checksum': tc.SHELLCHECK_CHECKSUM})
+
     def test_input_pins_and_no_follow_before_bootstrap(self):
         files = tc.validated_inputs()
         with tempfile.TemporaryDirectory() as scratch, patch.object(ci, 'ROOT', Path(scratch)), \
@@ -192,9 +204,20 @@ class PrerequisiteAndBootstrapTests(unittest.TestCase):
             for name, content in files.items():
                 (directory / name).write_bytes(content)
             for name, old, new in (('mise.toml', b'lockfile = true', b'lockfile = 1'),
+                                   ('mise.toml', b'lockfile = true',
+                                    b'lockfile = true\ngithub_attestations = false'),
                                    ('mise.toml', b'0.9.0', b'0.10.0'),
+                                   ('mise.toml', b', github_attestations = false', b''),
+                                   ('mise.toml', b'github_attestations = false', b'github_attestations = true'),
+                                   ('mise.toml', b'github_attestations = false', b'github_attestations = "false"'),
+                                   ('mise.toml', b'github_attestations = false', b'github_attestations = 0'),
                                    ('mise.lock', b'github.com', b'example.invalid'),
                                    ('mise.lock', tc.SHELLCHECK_CHECKSUM.encode(), b'sha256:wrong'),
+                                   ('mise.lock', b'checksum = ',
+                                    b'url_api = "https://api.github.com/repos/koalaman/shellcheck/releases/assets/88000708"\n'
+                                    b'checksum = '),
+                                   ('mise.lock', b'checksum = ',
+                                    b'provenance = "github-attestations"\nchecksum = '),
                                    ('mise.lock', b'linux-x64', b'linux-arm64')):
                 with self.subTest(name=name, new=new):
                     path = directory / name

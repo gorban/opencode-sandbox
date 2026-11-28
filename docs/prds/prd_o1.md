@@ -108,6 +108,14 @@ Why this happens:
   - **Cons:** Requires updating `tools/ci/toolchain.py` and its unit tests (`tests/test_ci_toolchain.py`)
     to accept a read-only verified cache directory without trusting cached bytes before hashing.
   - **Effort:** ~0.5 day.
+
+The ShellCheck 0.9.0 cold-install slice of B1 uses the public release URL and the existing
+SHA-256, with attestation lookup disabled only for that pin. The asset's attestation lookup
+returned 404. In a cold run with an allowlisted network path, the previous pin attempted the
+GitHub API and failed, while the new pin installed from the public release hosts alone.
+A blocked public download failed without an API fallback. A wrong digest was rejected before
+execution, even when mise's mismatch diagnostic could not reach its metadata service.
+
 - **Option B3 (Alternative for future attestation-bearing tools):** Run any authenticated GitHub
   API attestation fetch strictly inside a **trusted `main`-only seeder job** (using read-only
   `GITHUB_TOKEN` on reviewed `main` code only) and save only the verified archive bytes into
@@ -176,7 +184,9 @@ isolation** — never `ThreadPoolExecutor` inside one supervised process.
   (`2026-11-21..2026-11-23`, `origin/main` `9b608f43`).
 - [ ] `(decision needed)` Select Option O1-A1 vs O1-A2 (decouple `quality` + add PR `concurrency`).
 - [ ] `(decision needed)` Select Option O1-B1 vs O1-B3 (`mise` 403 rate-limit elimination without
-  exposing `GITHUB_TOKEN` on PR jobs).
+  exposing `GITHUB_TOKEN` on PR jobs). The remaining choice covers verified caching and seeding.
+- [x] Remove the GitHub API dependency from the normal locked ShellCheck 0.9.0 install
+  (`codex/ci-shellcheck-direct-download`). Cold download and failure controls verified locally.
 - [ ] `(decision needed)` Select Option O1-C1, O1-C2, or O1-C3 (`tools/ci/run.py` process-isolated
   parallelism / `security.sh` sharding).
 - [ ] `(decision needed)` Decide whether to adopt Option O1-D (`push` to `main` +

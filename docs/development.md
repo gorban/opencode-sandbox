@@ -23,7 +23,11 @@ verify that the suite's children exited.
 Quality uses Bash syntax checks, in-memory Python compilation, and ShellCheck at error severity.
 The toolchain command requires Linux x86-64, `curl`, and internet access. It verifies a pinned mise
 release and installs **ShellCheck 0.9.0** from the [shared lockfile](../tools/ci/mise.lock) in
-private scratch. It then runs the shared checks through mise. The command uses a fresh toolchain
+private scratch. The locked install verifies the SHA-256 of ShellCheck's public release archive.
+This pin has no published GitHub attestation, so its manifest skips that lookup for this tool
+version and the lock contains only the public download URL. GitHub tokens stay out of the private
+toolchain environment. Recheck provenance and the download policy when updating the pin.
+It then runs the shared checks through mise. The command uses a fresh toolchain
 for each run. The launcher and the portable test command have their existing platform prerequisites.
 The quality checker covers active runtime, tests and CI tool sources. Retained probes and source
 text embedded in test fixtures are outside the top-level lint scope.
