@@ -72,7 +72,7 @@ class NativeService:
                 or fields.get(b"Description") != self.description.encode("ascii")
                 or re.fullmatch(rb"/[A-Za-z0-9_/ .@:-]{1,1023}", group) is None or b".." in group.split(b"/")
                 or group.rsplit(b"/", 1)[-1] != unit or re.fullmatch(rb"[a-f0-9]{32}", invocation) is None
-                or re.fullmatch(rb"[1-9][0-9]{0,9}", pid) is None or self.process.poll() is not None):
+                or re.fullmatch(rb"[1-9]\d{0,9}", pid) is None or self.process.poll() is not None):
             raise NativeNamespaceError("Google native control group does not match the invocation")
         return NativeInvocation(self.unit, invocation.decode("ascii"), group, int(pid))
 
@@ -199,9 +199,7 @@ def _confirm_no_spawn(custody, replica, failure):
         retain_cleanup_failure(failure, uncertainty, cleanup)
 
 
-@contextmanager
-def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_spawn=None, fence=None,
-                 replica=None, custody=None, authorized=None):
+def _launch_service(namespace, *, reserve_spawn, fence, replica, custody, authorized):
     with nullcontext() if fence is None else fence:
         if reserve_spawn is not None:
             reserve_spawn()
@@ -218,6 +216,14 @@ def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_s
         except OSError as failure:
             _confirm_no_spawn(custody, replica, failure)
             raise
+    return process
+
+
+@contextmanager
+def _run_service(namespace, after_stop=None, *, enrollment_scope=None, reserve_spawn=None, fence=None,
+                 replica=None, custody=None, authorized=None):
+    process = _launch_service(namespace, reserve_spawn=reserve_spawn, fence=fence, replica=replica,
+                              custody=custody, authorized=authorized)
     service = NativeService(namespace.unit, process, namespace.description, enrollment_scope)
     try:
         identity, fd = _pin(service)

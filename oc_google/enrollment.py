@@ -41,7 +41,7 @@ _INELIGIBLE_STRINGS = {
     "reasonMessage", "tierName", "validationErrorMessage", "validationUrlLinkText", "validationUrl",
     "validationLearnMoreLinkText", "validationLearnMoreUrl",
 }
-_ENUM = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+_ENUM = re.compile(r"[A-Za-z_]\w{0,127}", re.ASCII)
 
 
 class EnrollmentMetadataError(ValueError):
@@ -106,26 +106,34 @@ def _observe_load_reply(body):
 
 def _rich_bound_failure(value, depth=1):
     if type(value) is dict:
-        if depth > 6 or len(value) > 24:
-            return LoadBodyReason.STRUCTURE_LIMITS
-        for key, item in value.items():
-            failure = _rich_bound_failure(key) or _rich_bound_failure(item, depth + 1)
-            if failure is not None:
-                return failure
-        return None
+        return _rich_object_bound_failure(value, depth)
     if type(value) is list:
-        if depth > 6 or len(value) > 16:
-            return LoadBodyReason.STRUCTURE_LIMITS
-        for item in value:
-            failure = _rich_bound_failure(item, depth + 1)
-            if failure is not None:
-                return failure
-        return None
+        return _rich_list_bound_failure(value, depth)
     if type(value) is str:
         return None if len(value.encode("utf-8")) <= 1024 else LoadBodyReason.STRUCTURE_LIMITS
     if type(value) is float:
         return None if math.isfinite(value) else LoadBodyReason.JSON_OBJECT
     return None if value is None or type(value) in (bool, int) else LoadBodyReason.STRUCTURE_LIMITS
+
+
+def _rich_object_bound_failure(value, depth):
+    if depth > 6 or len(value) > 24:
+        return LoadBodyReason.STRUCTURE_LIMITS
+    for key, item in value.items():
+        failure = _rich_bound_failure(key) or _rich_bound_failure(item, depth + 1)
+        if failure is not None:
+            return failure
+    return None
+
+
+def _rich_list_bound_failure(value, depth):
+    if depth > 6 or len(value) > 16:
+        return LoadBodyReason.STRUCTURE_LIMITS
+    for item in value:
+        failure = _rich_bound_failure(item, depth + 1)
+        if failure is not None:
+            return failure
+    return None
 
 
 def _printable(value):
@@ -157,21 +165,25 @@ def _nonpersonal_tier(tier):
     return type(tier) is dict and any(tier.get(key, False) is not False for key in _PERSONAL_FLAGS)
 
 
+def _valid_allowed_tiers(allowed, active):
+    if type(allowed) is not list or not all(_rich_tier(tier) for tier in allowed):
+        return False
+    if len({tier["id"] for tier in allowed}) != len(allowed):
+        return False
+    return not any(
+        alternative["id"] == retained["id"] and (
+            alternative.get("name", retained["name"]) != retained["name"]
+            or alternative.get("usesGcpTos", False) is True
+            or alternative.get("userDefinedCloudaicompanionProject", False) is True
+        )
+        for alternative in allowed
+        for retained in active
+    )
+
+
 def _valid_alternatives(allowed, ineligible, active):
-    if allowed is not None:
-        if type(allowed) is not list or not all(_rich_tier(tier) for tier in allowed):
-            return False
-        ids = {tier["id"] for tier in allowed}
-        if len(ids) != len(allowed):
-            return False
-        for alternative in allowed:
-            for retained in active:
-                if alternative["id"] == retained["id"] and (
-                    alternative.get("name", retained["name"]) != retained["name"]
-                    or alternative.get("usesGcpTos", False) is True
-                    or alternative.get("userDefinedCloudaicompanionProject", False) is True
-                ):
-                    return False
+    if allowed is not None and not _valid_allowed_tiers(allowed, active):
+        return False
     if ineligible is None:
         return True
     if type(ineligible) is not list:

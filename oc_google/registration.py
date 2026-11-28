@@ -38,6 +38,9 @@ _LOCK_TIME = .5
 _RUNTIME_PARENT = Path("/run/user")
 
 
+_STORAGE_UNAVAILABLE = "Google registration storage is unavailable"
+
+
 class RegistrationUnavailable(RuntimeError):
     """The local enrollment authority cannot advance or be verified."""
 
@@ -280,6 +283,37 @@ def _file_identity(values):
     return identity
 
 
+def _validate_stored_credential(values, phase, nonce, credential):
+    cold = phase in (Phase.COLD_PENDING, Phase.COLD_CHECKING)
+    if (cold and not _hex(nonce, 32)) or (not cold and nonce is not None):
+        raise ValueError
+    has_cold_profile = cold or phase == Phase.COLD_RETIREMENT_OBSERVED
+    digest = values["subject_digest"]
+    observed = values["cold_subject_observed"]
+    has_credential = phase == Phase.ENROLLMENT_RETIRED or has_cold_profile
+    if ((credential is not None) != has_credential
+            or (digest is not None and not _hex(digest, 64))
+            or (digest is None and has_cold_profile)
+            or (digest is not None and phase == Phase.PENDING)
+            or type(observed) is not bool or (observed and phase != Phase.COLD_CHECKING)):
+        raise ValueError
+    return digest, observed
+
+
+def _validate_stored_admission(values, phase):
+    enroll_spent, cold_spent = values["enrollment_metadata_spent"], values["cold_metadata_spent"]
+    pending = values["metadata_pending"]
+    if (type(enroll_spent) is not int or not 0 <= enroll_spent <= len(_ENROLLMENT_ROUTES)
+            or type(cold_spent) is not int or not 0 <= cold_spent <= len(_COLD_ROUTES)
+            or (enroll_spent and phase == Phase.PENDING)
+            or (cold_spent and phase not in (Phase.COLD_CHECKING, Phase.COLD_RETIREMENT_OBSERVED))
+            or type(pending) is not bool
+            or (pending and not ((phase == Phase.ENROLLING and enroll_spent)
+                                 or (phase == Phase.COLD_CHECKING and cold_spent)))):
+        raise ValueError
+    return enroll_spent, cold_spent, pending
+
+
 def _decode(raw):
     try:
         values = json.loads(raw, object_pairs_hook=_unique)
@@ -296,29 +330,8 @@ def _decode(raw):
         if (not is_valid_instance_label(enrollment.label) or not _hex(enrollment.build_digest, 64)
                 or not all(_hex(field, 32) for field in (enrollment.registration_id, enrollment.generation, enrollment.attempt))):
             raise ValueError
-        cold = phase in (Phase.COLD_PENDING, Phase.COLD_CHECKING)
-        if (cold and not _hex(nonce, 32)) or (not cold and nonce is not None):
-            raise ValueError
-        has_cold_profile = cold or phase == Phase.COLD_RETIREMENT_OBSERVED
-        digest = values["subject_digest"]
-        observed = values["cold_subject_observed"]
-        has_credential = phase == Phase.ENROLLMENT_RETIRED or has_cold_profile
-        if ((credential is not None) != has_credential
-                or (digest is not None and not _hex(digest, 64))
-                or (digest is None and has_cold_profile)
-                or (digest is not None and phase == Phase.PENDING)
-                or type(observed) is not bool or (observed and phase != Phase.COLD_CHECKING)):
-            raise ValueError
-        enroll_spent, cold_spent = values["enrollment_metadata_spent"], values["cold_metadata_spent"]
-        pending = values["metadata_pending"]
-        if (type(enroll_spent) is not int or not 0 <= enroll_spent <= len(_ENROLLMENT_ROUTES)
-                or type(cold_spent) is not int or not 0 <= cold_spent <= len(_COLD_ROUTES)
-                or (enroll_spent and phase == Phase.PENDING)
-                or (cold_spent and phase not in (Phase.COLD_CHECKING, Phase.COLD_RETIREMENT_OBSERVED))
-                or type(pending) is not bool
-                or (pending and not ((phase == Phase.ENROLLING and enroll_spent)
-                                     or (phase == Phase.COLD_CHECKING and cold_spent)))):
-            raise ValueError
+        digest, observed = _validate_stored_credential(values, phase, nonce, credential)
+        enroll_spent, cold_spent, pending = _validate_stored_admission(values, phase)
         return _Record(1, enrollment, _file_identity(values["lock_identity"]), phase, nonce,
                        None if credential is None else _file_identity(credential), digest, observed,
                        enroll_spent, cold_spent, pending)
@@ -1032,11 +1045,11 @@ class RegistrationJournal:
                 directory, new = _child(pins, registrations, self.label, create=create, private=True)
             except FileNotFoundError:
                 if create:
-                    raise RegistrationUnavailable("Google registration storage is unavailable") from None
+                    raise RegistrationUnavailable(_STORAGE_UNAVAILABLE) from None
                 yield None
                 return
             except (OSError, ProviderConfigError):
-                raise RegistrationUnavailable("Google registration storage is unavailable") from None
+                raise RegistrationUnavailable(_STORAGE_UNAVAILABLE) from None
 
             try:
                 flags = os.O_RDWR | _FILE | (os.O_CREAT | os.O_EXCL if new else 0)
@@ -1054,7 +1067,7 @@ class RegistrationJournal:
                     raise RegistrationUnavailable("Google registration requires inspection after an interrupted write")
                 yield slot
             except (OSError, ProviderConfigError):
-                raise RegistrationUnavailable("Google registration storage is unavailable") from None
+                raise RegistrationUnavailable(_STORAGE_UNAVAILABLE) from None
 
     def status(self):
         """Return redacted enrollment metadata, or None when the registration is absent."""

@@ -15,7 +15,7 @@ _CONNECTOR = "/run/oc-transport/browser.sock"
 _OFFER_LIMIT = 8192
 _CALLBACK_LIMIT = 8192
 _CALLBACK_SECONDS = 180
-_REDIRECT = re.compile(r"http://127[.]0[.]0[.]1:([1-9][0-9]{3,4})/\Z", re.ASCII)
+_REDIRECT = re.compile(r"http://127[.]0[.]0[.]1:([1-9]\d{3,4})/\Z", re.ASCII)
 
 
 def callback_port(link):

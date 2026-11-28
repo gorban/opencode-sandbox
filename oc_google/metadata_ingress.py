@@ -21,7 +21,7 @@ _COMMON_HEADERS = frozenset({
 _TOKEN_HEADERS = _COMMON_HEADERS | {b"accept"}
 _REFRESH_HEADERS = (_TOKEN_HEADERS - {b"authorization"}) | {b"x-goog-api-client"}
 _INITIAL_ROUTES = frozenset({MetadataRoute.TOKEN, MetadataRoute.LOAD_CODE_ASSIST})
-_LENGTH = re.compile(rb"[1-9][0-9]{0,4}")
+_LENGTH = re.compile(rb"[1-9]\d{0,4}")
 
 
 class MetadataIngressError(ValueError):
@@ -99,7 +99,9 @@ def _read_request(connection, route, deadline, *, refresh=False):
     if target_line != method + b" " + target + b" HTTP/1.1":
         raise MetadataIngressError("Unexpected native metadata request route")
     token = route is MetadataRoute.TOKEN
-    expected = _REFRESH_HEADERS if refresh else (_TOKEN_HEADERS if token else _COMMON_HEADERS)
+    expected = _TOKEN_HEADERS if token else _COMMON_HEADERS
+    if refresh:
+        expected = _REFRESH_HEADERS
     fields = _fields(lines, expected)
     connection_modes = (b"close", b"keep-alive") if token else (b"close",)
     if (fields[b"host"] != host.encode("ascii") or fields[b"content-type"] != media

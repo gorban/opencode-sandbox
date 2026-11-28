@@ -1,6 +1,6 @@
 """In-memory categories for one attended initial token exchange."""
 
-from contextlib import contextmanager, suppress
+from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable
@@ -162,7 +162,7 @@ class ScopedPostTokenDiagnostic:
     """Record the failure only under the exact operation's authority fence."""
 
     _attempt: PostTokenDiagnostic = field(repr=False)
-    _fence: object = field(repr=False)
+    _fence: AbstractContextManager = field(repr=False)
     _active: Callable[[], bool] = field(repr=False)
 
     def mark(self, error, stage):

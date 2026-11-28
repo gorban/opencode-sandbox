@@ -86,7 +86,7 @@ def _run_metadata(mode):
     failed = Event()
     with open_loopback_proxy() as listener:
         proxy = f"http://127.0.0.1:{listener.getsockname()[1]}"
-        environment = os.environ | {key: proxy for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")}
+        environment = os.environ | dict.fromkeys(("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"), proxy)
         process = subprocess.Popen([_ENTRYPOINT, "--uid="], env=environment, close_fds=True, stderr=subprocess.DEVNULL)
         worker = Thread(target=_serve_loopback, args=(listener, deadline, exchanges, failed), daemon=True)
         worker.start()

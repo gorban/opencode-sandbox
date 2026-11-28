@@ -1,5 +1,6 @@
 """Single-connection HTTP/1.1 transport for the four Google metadata routes."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 import ipaddress
@@ -17,6 +18,7 @@ from .oauth_exchange import _valid_client
 from .token_diagnostic import TokenStage
 
 
+_INVALID_RESPONSE_FRAMING = "Invalid Google metadata response framing"
 _HEADER_LIMIT = 8192
 _ADDRESS_LIMIT = 32
 _MAX_OPERATION_SECONDS = 30
@@ -24,7 +26,7 @@ _JSON = b"application/json"
 _FORM = b"application/x-www-form-urlencoded"
 _DELIMITER = b"\r\n\r\n"
 _HEADER_NAME = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-_LENGTH = re.compile(rb"[1-9][0-9]{0,5}")
+_LENGTH = re.compile(rb"[1-9]\d{0,5}")
 _CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,8}")
 _CHUNK_LINE_LIMIT = 10
 _CHUNK_HEADER_LIMIT = 2048
@@ -187,7 +189,7 @@ def _recv(connection, count, deadline):
 
 
 def _status_stage(status):
-    match = re.fullmatch(rb"HTTP/1\.1 ([0-9]{3}) [ -~]*", status)
+    match = re.fullmatch(rb"HTTP/1\.1 (\d{3}) [ -~]*", status)
     if match is not None:
         code = match[1]
         if code == b"400":
@@ -288,7 +290,7 @@ def _check_response_end(connection, deadline):
         raise _ResponseRefused("Unexpected bytes after Google metadata response", TokenStage.TRAILING)
 
 
-def _response(connection, limit, deadline):
+def _response_head(connection, deadline):
     buffer = bytearray()
     while _DELIMITER not in buffer:
         if len(buffer) == _HEADER_LIMIT:
@@ -297,7 +299,10 @@ def _response(connection, limit, deadline):
         if not chunk:
             raise _ResponseRefused("Incomplete Google metadata response", TokenStage.FRAMING)
         buffer.extend(chunk)
-    head, _, body = buffer.partition(_DELIMITER)
+    return buffer.partition(_DELIMITER)
+
+
+def _response_fields(head):
     status, *lines = bytes(head).split(b"\r\n")
     if not re.fullmatch(rb"HTTP/1\.1 200 [ -~]*", status):
         raise _ResponseRefused("Unexpected Google metadata HTTP status", _status_stage(status))
@@ -312,26 +317,36 @@ def _response(connection, limit, deadline):
         if name in fields:
             raise _ResponseRefused("Duplicate Google metadata response header", TokenStage.DUPLICATE_HEADER)
         fields[name] = value.strip(b" ")
-    length = fields.get(b"content-length", b"")
-    transfer = fields.get(b"transfer-encoding")
     if ({b"trailer", b"upgrade"} & fields.keys()
             or fields.get(b"content-encoding", b"identity").lower() != b"identity"
             or fields.get(b"connection", b"close").lower() != b"close"
             or fields.get(b"content-type", b"").lower() not in {_JSON, _JSON + b"; charset=utf-8"}):
-        raise _ResponseRefused("Invalid Google metadata response framing", TokenStage.FRAMING)
+        raise _ResponseRefused(_INVALID_RESPONSE_FRAMING, TokenStage.FRAMING)
+    return fields
+
+
+def _read_sized_body(connection, body, length, limit, deadline):
+    if not _LENGTH.fullmatch(length) or not len(body) <= int(length) <= limit:
+        raise _ResponseRefused(_INVALID_RESPONSE_FRAMING, TokenStage.FRAMING)
+    size = int(length)
+    while len(body) < size:
+        chunk = _recv(connection, min(4096, size - len(body)), deadline)
+        if not chunk:
+            raise _ResponseRefused("Incomplete Google metadata response", TokenStage.FRAMING)
+        body.extend(chunk)
+
+
+def _response(connection, limit, deadline):
+    head, _, body = _response_head(connection, deadline)
+    fields = _response_fields(head)
+    length = fields.get(b"content-length", b"")
+    transfer = fields.get(b"transfer-encoding")
     if transfer is not None:
         if transfer.lower() != b"chunked" or b"content-length" in fields:
-            raise _ResponseRefused("Invalid Google metadata response framing", TokenStage.FRAMING)
+            raise _ResponseRefused(_INVALID_RESPONSE_FRAMING, TokenStage.FRAMING)
         body = _chunked_body(connection, body, limit, deadline)
     else:
-        if not _LENGTH.fullmatch(length) or not len(body) <= int(length) <= limit:
-            raise _ResponseRefused("Invalid Google metadata response framing", TokenStage.FRAMING)
-        size = int(length)
-        while len(body) < size:
-            chunk = _recv(connection, min(4096, size - len(body)), deadline)
-            if not chunk:
-                raise _ResponseRefused("Incomplete Google metadata response", TokenStage.FRAMING)
-            body.extend(chunk)
+        _read_sized_body(connection, body, length, limit, deadline)
     _check_response_end(connection, deadline)
     return bytes(body)
 
@@ -365,6 +380,28 @@ def _send_under_gate(connection, packet, deadline, deliver):
         raise MetadataDestinationError("Google metadata request was not sent")
 
 
+@contextmanager
+def _metadata_connection(host, deadline):
+    family, address = _resolve(host, deadline)
+    context = _system_tls_context()
+    with socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP) as plain:
+        plain.settimeout(_remaining(deadline))
+        plain.connect(address)
+        plain.settimeout(_remaining(deadline))
+        with context.wrap_socket(plain, server_hostname=host, suppress_ragged_eofs=False) as connection:
+            if connection.selected_alpn_protocol() not in (None, "http/1.1"):
+                raise _MetadataSetupError("Unexpected Google metadata TLS protocol")
+            yield connection
+
+
+def _delivery_observation(route, authorization, deliver):
+    observed = deliver if type(deliver) in (_ObservedDelivery, _ObservedPostDelivery) and route is deliver.route else None
+    observe_token = type(observed) is _ObservedDelivery and route is MetadataRoute.TOKEN and authorization is not None
+    observe_userinfo = type(observed) is _ObservedDelivery and route is MetadataRoute.USERINFO and authorization is not None
+    observe_post_reply = type(observed) is _ObservedPostDelivery
+    return observed, observe_token, observe_userinfo, observe_post_reply
+
+
 def exchange(
     route: MetadataRoute, *, authorization: bytes | None, body: bytes = b"", deadline: float,
     deliver: Callable[[Callable[[], None]], None],
@@ -378,10 +415,7 @@ def exchange(
     fence while invoking its one-use send closure synchronously. Any uncertain
     write remains the caller's blocking receipt. No automatic retry is made.
     """
-    observed = deliver if type(deliver) in (_ObservedDelivery, _ObservedPostDelivery) and route is deliver.route else None
-    observe_token = type(observed) is _ObservedDelivery and route is MetadataRoute.TOKEN and authorization is not None
-    observe_userinfo = type(observed) is _ObservedDelivery and route is MetadataRoute.USERINFO and authorization is not None
-    observe_post_reply = type(observed) is _ObservedPostDelivery
+    observed, observe_token, observe_userinfo, observe_post_reply = _delivery_observation(route, authorization, deliver)
     post_reply_error = None
     admission_started = False
     written = False
@@ -395,51 +429,58 @@ def exchange(
         if _remaining(deadline) > _MAX_OPERATION_SECONDS:
             raise _MetadataSetupError("Google metadata deadline exceeds the operation limit")
         host, packet, limit = _request(route, authorization, body)
-        family, address = _resolve(host, deadline)
-        context = _system_tls_context()
-        with socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP) as plain:
-            plain.settimeout(_remaining(deadline))
-            plain.connect(address)
-            plain.settimeout(_remaining(deadline))
-            with context.wrap_socket(plain, server_hostname=host, suppress_ragged_eofs=False) as connection:
-                if connection.selected_alpn_protocol() not in (None, "http/1.1"):
-                    raise _MetadataSetupError("Unexpected Google metadata TLS protocol")
-                _send_under_gate(connection, packet, deadline, admit if observe_userinfo else deliver)
-                written = True
-                try:
-                    reply = _response(connection, limit, deadline)
-                except (MetadataDestinationError, OSError) as error:
-                    if observe_post_reply:
-                        post_reply_error = error
-                    raise
+        with _metadata_connection(host, deadline) as connection:
+            _send_under_gate(connection, packet, deadline, admit if observe_userinfo else deliver)
+            written = True
+            try:
+                reply = _response(connection, limit, deadline)
+            except (MetadataDestinationError, OSError) as error:
+                if observe_post_reply:
+                    post_reply_error = error
+                raise
     except (_ResponseRefused, _MetadataDeadlineError, _MetadataSetupError) as error:
-        if error is post_reply_error:
-            observed._observe(error)
-        elif observe_token and written and type(error) is not _MetadataSetupError:
-            if type(error) is _MetadataDeadlineError:
-                error.token_stage = TokenStage.TRANSPORT
-            observed._observe(error)
-        elif observe_userinfo and not admission_started and type(error) is not _ResponseRefused:
-            error.token_stage = TokenStage.USERINFO_PRE_WRITE
-            observed._observe(error)
+        _observe_destination_failure(
+            error, observed=observed, post_reply=error is post_reply_error,
+            token_written=observe_token and written, userinfo_pre_write=observe_userinfo and not admission_started,
+        )
         raise
     except OSError as error:
         stage = TokenStage.TLS_EOF if isinstance(error, ssl.SSLEOFError) else TokenStage.TRANSPORT
         post_reply_io_failure = error is post_reply_error
     else:
-        if observe_token or observe_post_reply:
-            observed._observe(reply)
-        return reply
+        return _observed_reply(reply, observed, observe_token, observe_post_reply)
+    raise _transport_failure(
+        stage, observed=observed, post_reply=post_reply_io_failure,
+        token_written=observe_token and written, userinfo_pre_write=observe_userinfo and not admission_started,
+    )
+
+
+def _observed_reply(reply, observed, observe_token, observe_post_reply):
+    if observe_token or observe_post_reply:
+        observed._observe(reply)
+    return reply
+
+
+def _observe_destination_failure(error, *, observed, post_reply, token_written, userinfo_pre_write):
+    if post_reply:
+        observed._observe(error)
+    elif token_written and type(error) is not _MetadataSetupError:
+        if type(error) is _MetadataDeadlineError:
+            error.token_stage = TokenStage.TRANSPORT
+        observed._observe(error)
+    elif userinfo_pre_write and type(error) is not _ResponseRefused:
+        error.token_stage = TokenStage.USERINFO_PRE_WRITE
+        observed._observe(error)
+
+
+def _transport_failure(stage, *, observed, post_reply, token_written, userinfo_pre_write):
     message = "Google metadata transport did not settle"
-    if observe_userinfo and not admission_started:
+    if userinfo_pre_write:
         error = _ResponseRefused(message, TokenStage.USERINFO_PRE_WRITE)
-        observed._observe(error)
-        raise error
-    if observe_token and written:
+    elif token_written:
         error = _ResponseRefused(message, stage)
+    else:
+        error = MetadataDestinationError(message)
+    if userinfo_pre_write or token_written or post_reply:
         observed._observe(error)
-        raise error
-    error = MetadataDestinationError(message)
-    if post_reply_io_failure:
-        observed._observe(error)
-    raise error
+    return error

@@ -11,7 +11,7 @@ _DOMAIN = b"oc-sandbox/google/account-subject/v1\x00"
 _ISSUER = b"https://www.googleapis.com/oauth2/v2/userinfo"
 _MAX_SUBJECT_BODY = 1024
 _MAX_BEARER = 8192
-_SUBJECT = re.compile(r"[0-9]{1,64}")
+_SUBJECT = re.compile(r"\d{1,64}", re.ASCII)
 _BEARER = re.compile(rb"[A-Za-z0-9._~+/\-]+=*")
 
 

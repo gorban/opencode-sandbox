@@ -180,23 +180,31 @@ def _write_enrollment_detail(owner, error, token_diagnostic, post_diagnostic):
         if stage is not None:
             detail = "Google sign-in token reply: " + _TOKEN_DETAILS[stage]
         else:
-            stage = post_diagnostic.stage(error)
-            if stage is None or needs_custody_inspection(error, include_context=True):
+            detail = _post_token_detail(post_diagnostic, error)
+            if detail is None:
                 return
-            detail = "Google enrollment metadata: " + _POST_TOKEN_DETAILS[stage]
-            if stage is PostTokenStage.LOAD_BODY:
-                reasons = post_diagnostic.load_body_reasons(error)
-                if reasons:
-                    detail += " Failed checks include " + ", ".join(_LOAD_BODY_DETAILS[reason] for reason in reasons) + "."
-                account = post_diagnostic.load_account_details(error)
-                if account is not None:
-                    tier, project = account
-                    detail += (f" Current tier check found {_CURRENT_TIER_DETAILS[tier]}."
-                               f" Original project check found {_ORIGINAL_PROJECT_DETAILS[project]}.")
     else:
         return
     with suppress(OSError, ConnectError):
         owner.write_once(detail + "\n")
+
+
+def _post_token_detail(post_diagnostic, error):
+    stage = post_diagnostic.stage(error)
+    if stage is None or needs_custody_inspection(error, include_context=True):
+        return None
+    detail = "Google enrollment metadata: " + _POST_TOKEN_DETAILS[stage]
+    if stage is not PostTokenStage.LOAD_BODY:
+        return detail
+    reasons = post_diagnostic.load_body_reasons(error)
+    if reasons:
+        detail += " Failed checks include " + ", ".join(_LOAD_BODY_DETAILS[reason] for reason in reasons) + "."
+    account = post_diagnostic.load_account_details(error)
+    if account is not None:
+        tier, project = account
+        detail += (f" Current tier check found {_CURRENT_TIER_DETAILS[tier]}."
+                   f" Original project check found {_ORIGINAL_PROJECT_DETAILS[project]}.")
+    return detail
 
 
 class _TerminalOwner:

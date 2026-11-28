@@ -13,6 +13,9 @@ from .registration import RegistrationUnavailable
 from .token_diagnostic import PostTokenStage, scoped_post_token, observe_post_token
 
 
+_OWNER_RETIRED = "Google enrollment owner retired"
+
+
 class EnrollmentSessionError(RuntimeError):
     """The active enrollment supervisor could not complete the metadata phase."""
 
@@ -68,6 +71,47 @@ def serve_cold_metadata(*, profile, deadline, accept, fence, authorized, destina
     )
 
 
+def _publish_io(operation, argument, route, live_diagnostic):
+    try:
+        operation(argument)
+    except OSError:
+        try:
+            raise EnrollmentSessionError("Google native metadata reply did not settle") from None
+        except EnrollmentSessionError as error:
+            if route is MetadataRoute.LOAD_CODE_ASSIST and live_diagnostic is not None:
+                live_diagnostic.mark(error, PostTokenStage.LOAD_NATIVE_REPLY)
+            raise
+
+
+def _publish_reply(connection, body, *, fence, deadline, check_owner, active_authority, publish_io):
+    packet = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Cache-Control: no-store\r\nConnection: close\r\nContent-Length: "
+        + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+    )
+    with fence:
+        check_owner()
+        try:
+            publish_io(connection.settimeout, min(2, _remaining(deadline)))
+            if not active_authority():
+                raise EnrollmentSessionError(_OWNER_RETIRED)
+            publish_io(connection.sendall, packet)
+        except OSError:
+            raise EnrollmentSessionError("Google native metadata reply did not settle") from None
+        check_owner()
+
+
+def _check_owner(profile, deadline, cold, active_authority):
+    _remaining(deadline)
+    if not active_authority():
+        raise EnrollmentSessionError(_OWNER_RETIRED)
+    if cold:
+        profile.verify_cold_source()
+    profile.verify_native_invocation(authorized=active_authority)
+    if not active_authority():
+        raise EnrollmentSessionError(_OWNER_RETIRED)
+
+
 def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, authorized, destination, cold,
                     diagnostic=None, post_diagnostic=None):
     channel_in_use = None
@@ -81,15 +125,7 @@ def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, a
                 and (channel_in_use is None or channel_in_use.active() is True)
                 and authorized() is True and time.monotonic() < deadline)
 
-    def check_owner():
-        _remaining(deadline)
-        if not active_authority():
-            raise EnrollmentSessionError("Google enrollment owner retired")
-        if cold:
-            profile.verify_cold_source()
-        profile.verify_native_invocation(authorized=active_authority)
-        if not active_authority():
-            raise EnrollmentSessionError("Google enrollment owner retired")
+    check_owner = partial(_check_owner, profile, deadline, cold, active_authority)
 
     def diagnostic_authority(channel):
         if channel_in_use is not channel:
@@ -116,34 +152,6 @@ def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, a
                                     OAuthExchangeError, RegistrationUnavailable):
                 return profile.refresh_form(form)
 
-    def publish_io(operation, argument, route):
-        try:
-            operation(argument)
-        except OSError:
-            try:
-                raise EnrollmentSessionError("Google native metadata reply did not settle") from None
-            except EnrollmentSessionError as error:
-                if route is MetadataRoute.LOAD_CODE_ASSIST and live_diagnostic is not None:
-                    live_diagnostic.mark(error, PostTokenStage.LOAD_NATIVE_REPLY)
-                raise
-
-    def publish_reply(connection, body, *, route):
-        packet = (
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-            b"Cache-Control: no-store\r\nConnection: close\r\nContent-Length: "
-            + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
-        )
-        with fence:
-            check_owner()
-            try:
-                publish_io(connection.settimeout, min(2, _remaining(deadline)), route)
-                if not active_authority():
-                    raise EnrollmentSessionError("Google enrollment owner retired")
-                publish_io(connection.sendall, packet, route)
-            except OSError:
-                raise EnrollmentSessionError("Google native metadata reply did not settle") from None
-            check_owner()
-
     def verified_token(connection):
         if cold:
             with observe_post_token(live_diagnostic, PostTokenStage.COLD_REFRESH, MetadataIngressError):
@@ -161,7 +169,6 @@ def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, a
 
     def native_round_trip(route, handle):
         nonlocal channel_in_use, live_diagnostic
-        publish = partial(publish_reply, route=route)
         with fence:
             check_owner()
         with accept(route, deadline) as channel:
@@ -173,7 +180,11 @@ def _serve_metadata(*, offer, callback_gate, profile, deadline, accept, fence, a
                     )
                     check_owner()
                 reply = handle(channel.stream)
-                publish(channel.stream, reply.body)
+                _publish_reply(
+                    channel.stream, reply.body, fence=fence, deadline=deadline, check_owner=check_owner,
+                    active_authority=active_authority,
+                    publish_io=partial(_publish_io, route=route, live_diagnostic=live_diagnostic),
+                )
             finally:
                 with fence:
                     live_diagnostic = None

@@ -12,6 +12,7 @@ from .metadata_destination import _remaining
 
 _FRAME_LIMIT = 256 * 1024
 _USAGE_LIMIT = 2048
+_UNEXPECTED_REPLY = "Unexpected standalone Google ACP reply"
 _SESSION_ID = re.compile(r"[A-Za-z0-9._:-]{1,256}\Z", re.ASCII)
 _WORKSPACE = "/run/oc-proof/empty"
 
@@ -86,7 +87,7 @@ class NativeEnrollmentAcp:
         except (OSError, ValueError, RecursionError):
             raise NativeAcpError("Standalone Google ACP reply is invalid") from None
         if self._authorized() is not True:
-            raise NativeAcpError("Unexpected standalone Google ACP reply")
+            raise NativeAcpError(_UNEXPECTED_REPLY)
         return _parse_frame(frame), len(frame)
 
     def _reply(self, request, *, allow_usage=False):
@@ -97,7 +98,7 @@ class NativeEnrollmentAcp:
             reply, _ = self._frame()
         if (type(reply.get("id")) is not int or reply["id"] != request
                 or set(reply) not in ({"jsonrpc", "id", "result"}, {"jsonrpc", "id", "error"})):
-            raise NativeAcpError("Unexpected standalone Google ACP reply")
+            raise NativeAcpError(_UNEXPECTED_REPLY)
         if usage_session is not None:
             result = reply.get("result")
             if type(result) is not dict or result.get("sessionId") != usage_session:
@@ -210,7 +211,7 @@ def _parse_frame(frame):
     except (ValueError, RecursionError):
         raise NativeAcpError("Standalone Google ACP reply is invalid") from None
     if type(reply) is not dict or reply.get("jsonrpc") != "2.0":
-        raise NativeAcpError("Unexpected standalone Google ACP reply")
+        raise NativeAcpError(_UNEXPECTED_REPLY)
     return reply
 
 

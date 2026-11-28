@@ -38,7 +38,8 @@ _CALLBACK_SECONDS = 2
 _STATE = re.compile(r"[A-Za-z0-9_-]{30}")
 _CHALLENGE = re.compile(r"[A-Za-z0-9_-]{43}")
 _CODE = re.compile(r"[a-zA-Z0-9_./~-]{8,2048}")
-_AUTHUSER = re.compile(r"[0-9]{1,3}")
+_AUTHUSER = re.compile(r"\d{1,3}", re.ASCII)
+_INVALID_CALLBACK_PARAMETERS = "invalid callback parameters"
 _ERROR_DESCRIPTION_LIMIT = 256
 _BAD_ESCAPE = re.compile(rb"%(?![0-9a-fA-F]{2})")
 _SUCCESS_FIELDS = {"state", "code"}
@@ -121,7 +122,7 @@ def _query_fields(query, count):
     try:
         entries = parse_qsl(query, strict_parsing=True, max_num_fields=count, keep_blank_values=True,
                             errors="strict")
-    except (UnicodeError, ValueError):
+    except ValueError:
         raise Refused("invalid authorization parameters") from None
     fields = dict(entries)
     if len(fields) != len(entries):
@@ -200,11 +201,11 @@ def _read_request(connection, deadline):
 
 def _decode_component(raw):
     if _BAD_ESCAPE.search(raw) or any(not 33 <= byte <= 126 for byte in raw):
-        raise Refused("invalid callback parameters")
+        raise Refused(_INVALID_CALLBACK_PARAMETERS)
     try:
         return unquote_to_bytes(raw).decode("utf-8", "strict")
     except UnicodeError:
-        raise Refused("invalid callback parameters") from None
+        raise Refused(_INVALID_CALLBACK_PARAMETERS) from None
 
 
 def _callback_fields(query):
@@ -215,7 +216,7 @@ def _callback_fields(query):
     for pair in pairs:
         raw_name, separator, raw_value = pair.partition(b"=")
         if not separator or not raw_name or b"=" in raw_value:
-            raise Refused("invalid callback parameters")
+            raise Refused(_INVALID_CALLBACK_PARAMETERS)
         name = _decode_component(raw_name)
         if name in fields:
             raise Refused("duplicate callback parameters")
@@ -247,16 +248,22 @@ def _states_from_rejected_request(head):
         # The final field may only be a prefix cut off by the read bound.
         pairs.pop()
     for pair in pairs:
-        name, separator, value = pair.partition(b"=")
-        if not separator:
-            continue
-        try:
-            if _decode_component(name) == "state":
-                state = _decode_component(value)
-                if _STATE.fullmatch(state):
-                    yield state
-        except Refused:
-            continue
+        state = _rejected_state_pair(pair)
+        if state is not None:
+            yield state
+
+
+def _rejected_state_pair(pair):
+    name, separator, value = pair.partition(b"=")
+    if not separator:
+        return None
+    try:
+        if _decode_component(name) != "state":
+            return None
+        state = _decode_component(value)
+    except Refused:
+        return None
+    return state if _STATE.fullmatch(state) else None
 
 
 def _safe_description(value):
@@ -267,6 +274,22 @@ def _callback_scopes(parameters):
     scope = parameters.get("scope")
     return (scope is None or _exact_scopes(scope)
             or (parameters.get("iss") == _ISSUER and _exact_scopes(scope, _BROWSER_SCOPES)))
+
+
+def _check_callback_headers(lines, port):
+    fields = {}
+    for line in lines:
+        name, separator, value = line.partition(b":")
+        key = name.lower()
+        if (not separator or key not in _HEADERS or key in fields
+                or any(not 32 <= char <= 126 for char in value)):
+            diagnostic = (CallbackDiagnostic.HEADER_DUPLICATE if key in fields
+                          else _HEADER_DIAGNOSTICS.get(key, CallbackDiagnostic.HEADER_OTHER))
+            raise _CallbackRefused("invalid callback header", diagnostic)
+        # Keep only these names so duplicate fields are still refused.
+        fields[key] = None if key in (b"cookie", b"referer") else value.strip(b" ")
+    if fields.get(b"host") != f"{HOST}:{port}".encode("ascii"):
+        raise _CallbackRefused("invalid callback host", CallbackDiagnostic.TARGET)
 
 
 def parse_callback(head, port):
@@ -280,19 +303,7 @@ def parse_callback(head, port):
     if (len(parts) != 3 or parts[0] != b"GET" or parts[2] != b"HTTP/1.1"
             or not parts[1] or any(not 33 <= value <= 126 for value in parts[1])):
         raise _CallbackRefused("invalid callback request", CallbackDiagnostic.TARGET)
-    fields = {}
-    for line in lines[1:]:
-        name, separator, value = line.partition(b":")
-        key = name.lower()
-        if (not separator or key not in _HEADERS or key in fields
-                or any(not 32 <= char <= 126 for char in value)):
-            diagnostic = (CallbackDiagnostic.HEADER_DUPLICATE if key in fields
-                          else _HEADER_DIAGNOSTICS.get(key, CallbackDiagnostic.HEADER_OTHER))
-            raise _CallbackRefused("invalid callback header", diagnostic)
-        # Keep only these names so duplicate fields are still refused.
-        fields[key] = None if key in (b"cookie", b"referer") else value.strip(b" ")
-    if fields.get(b"host") != f"{HOST}:{port}".encode("ascii"):
-        raise _CallbackRefused("invalid callback host", CallbackDiagnostic.TARGET)
+    _check_callback_headers(lines[1:], port)
     path, separator, query = parts[1].partition(b"?")
     if path != CALLBACK_PATH.encode("ascii") or not separator or b"#" in query:
         raise _CallbackRefused("invalid callback path", CallbackDiagnostic.TARGET)
@@ -300,6 +311,10 @@ def parse_callback(head, port):
         parameters = _callback_fields(query)
     except Refused as error:
         raise _CallbackRefused(str(error), CallbackDiagnostic.PARAMETERS) from None
+    return _validate_callback_parameters(parameters)
+
+
+def _validate_callback_parameters(parameters):
     state = parameters.get("state", "")
     if not _STATE.fullmatch(state):
         raise _CallbackRefused("invalid callback state", CallbackDiagnostic.PARAMETERS)
@@ -540,14 +555,17 @@ class CallbackGate:
                 pass
             with suppress(OSError):
                 connection.settimeout(.2)
-                if accepted:
-                    with self._fence, self._lock:
-                        accepted = (self._authority_alive()
-                                    and (self._outcome is Outcome.DENIED or self._forwarded is not None))
-                        if not accepted and self._outcome is Outcome.FORWARDED:
-                            self._forwarded = None
-                            self._outcome = Outcome.UNCERTAIN
-                            self._diagnostic = CallbackDiagnostic.HANDOFF_UNCONFIRMED
-                        connection.sendall(acknowledgement(accepted))
-                else:
-                    connection.sendall(acknowledgement(False))
+                self._acknowledge(connection, accepted)
+
+    def _acknowledge(self, connection, accepted):
+        if not accepted:
+            connection.sendall(acknowledgement(False))
+            return
+        with self._fence, self._lock:
+            accepted = (self._authority_alive()
+                        and (self._outcome is Outcome.DENIED or self._forwarded is not None))
+            if not accepted and self._outcome is Outcome.FORWARDED:
+                self._forwarded = None
+                self._outcome = Outcome.UNCERTAIN
+                self._diagnostic = CallbackDiagnostic.HANDOFF_UNCONFIRMED
+            connection.sendall(acknowledgement(accepted))

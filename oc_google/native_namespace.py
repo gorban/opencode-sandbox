@@ -194,7 +194,7 @@ def _native_command(root, mounts):
         if mounts.mount_source is not None:
             source, device, inode = mounts.mount_source
             pinned = source.stat()
-            if (re.fullmatch(r"/proc/[1-9][0-9]*/fd/[0-9]+", str(source)) is None
+            if (re.fullmatch(r"/proc/[1-9]\d*/fd/\d+", str(source), re.ASCII) is None
                     or not os.path.samestat(profile.lstat(), pinned) or (pinned.st_dev, pinned.st_ino) != (device, inode)):
                 raise NativeNamespaceError("Google native metadata mount is not the pinned profile")
         public_ca = root / "native-public-ca.pem"

@@ -307,24 +307,28 @@ def reopen_metadata(journal, enrollment, runtime, *, runtime_scope, destination,
                     ColdObservation(check, True, 0, True), completion=completion, service=service,
                     acp=acp, authorized=owner.authorized,
                 )
-            if not owner.authorized():
-                raise MetadataWorkflowError("Google cold metadata owner retired before projection")
-            profile.verify_cold_source()
-            if not owner.authorized():
-                raise MetadataWorkflowError("Google cold metadata owner retired before projection")
-            if (type(enrollment) is not Enrollment or type(committed) is not RegistrationStatus
-                    or committed != RegistrationStatus(enrollment.label, enrollment.registration_id,
-                                                       enrollment.generation, Phase.COLD_RETIREMENT_OBSERVED)
-                    or enrollment.label != journal.label or enrollment.build_digest != runtime.build.digest
-                    or type(observed) is not ColdMetadataObservation):
-                raise MetadataWorkflowError("Google cold metadata projection changed")
-            models = ("gemini-2.5-flash",) if "gemini-2.5-flash" in observed.gemini_models else ()
+            models = _cold_projection_models(owner, profile, enrollment, committed, journal, runtime, observed)
             binding = (f"google/{enrollment.label}", committed.registration_id, committed.generation,
                        enrollment.build_digest, models)
     with owner.fence:
         if not owner.authorized():
             raise MetadataWorkflowError("Google cold metadata owner retired before completion")
         return BoundGoogleCatalog(*binding) if models else None
+
+
+def _cold_projection_models(owner, profile, enrollment, committed, journal, runtime, observed):
+    if not owner.authorized():
+        raise MetadataWorkflowError("Google cold metadata owner retired before projection")
+    profile.verify_cold_source()
+    if not owner.authorized():
+        raise MetadataWorkflowError("Google cold metadata owner retired before projection")
+    if (type(enrollment) is not Enrollment or type(committed) is not RegistrationStatus
+            or committed != RegistrationStatus(enrollment.label, enrollment.registration_id,
+                                               enrollment.generation, Phase.COLD_RETIREMENT_OBSERVED)
+            or enrollment.label != journal.label or enrollment.build_digest != runtime.build.digest
+            or type(observed) is not ColdMetadataObservation):
+        raise MetadataWorkflowError("Google cold metadata projection changed")
+    return ("gemini-2.5-flash",) if "gemini-2.5-flash" in observed.gemini_models else ()
 
 
 def _retire_replica(replica, service, fence, custody):

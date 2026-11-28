@@ -22,6 +22,9 @@ _DELIMITER = b"\r\n\r\n"
 _ESTABLISHED = b"HTTP/1.1 200 Connection established\r\n\r\n"
 
 
+_SIGN_IN_OWNER_RETIRED = "Google native sign-in owner retired"
+
+
 class NativeTransportError(RuntimeError):
     """The private connector did not present an expected metadata tunnel."""
 
@@ -137,10 +140,10 @@ def open_native_browser_listener(directory, *, expected_group, read_cgroup, auth
             nonlocal spent
             with claim:
                 if spent:
-                    raise NativeTransportError("Google native sign-in owner retired")
+                    raise NativeTransportError(_SIGN_IN_OWNER_RETIRED)
                 spent = True
             if authorized() is not True:
-                raise NativeTransportError("Google native sign-in owner retired")
+                raise NativeTransportError(_SIGN_IN_OWNER_RETIRED)
             group = expected_group()
             connection = _accept_owned(listener, deadline, authorized)
             with connection, admit_native_peer(connection, expected_group=group, read_cgroup=read_cgroup) as peer:
@@ -148,7 +151,7 @@ def open_native_browser_listener(directory, *, expected_group, read_cgroup, auth
                     return _peer_authorized(peer, authorized, deadline)
 
                 if not active():
-                    raise NativeTransportError("Google native sign-in owner retired")
+                    raise NativeTransportError(_SIGN_IN_OWNER_RETIRED)
                 raw, port = _read_offer(connection, deadline)
                 with bind_callback(port) as callback:
                     gate = CallbackGate(callback, connection, native_port=port, authorized=active, deadline=deadline,
