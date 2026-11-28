@@ -118,3 +118,12 @@ acceptance independent. The combined live sandbox test follows individual qualif
 - [ ] Verify the common pytest opt-in and source pin using fake transport before subscription use.
 - [ ] Integrate reviewed lane outputs, rerun the affected checks, and obtain reciprocal reviews
       on the exact integration head.
+
+### Isolated holder spike
+
+- [x] Exercise the [controller receipts and inherited channels](spikes/i4/isolated-authority-r3/WALKTHROUGH.md)
+  in scratch. Verify that lost acknowledgments and uncertain publication block reuse, a retained
+  socket cannot prolong the original peer's authority, and an invalid local lock cannot hang the
+  bounded transaction. See `codex/openai-isolated-holder-r3`.
+- [ ] Verify independent holder and controller identities in the sealed guest against the exact
+  legacy OpenAI paths, with a separate rollback domain and an actual pre-write scope check.
