@@ -164,6 +164,7 @@ class PortableTests(unittest.TestCase):
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_connection_job.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_connection_transport.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_exposure.py'),
+            ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_scoped_exposure.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_live.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_recovery.py'),
             ('python3', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_openai_profile_backend.py'),
