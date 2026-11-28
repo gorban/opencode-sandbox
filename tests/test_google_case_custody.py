@@ -577,6 +577,74 @@ class OwnedChildCleanupTest(unittest.TestCase):
         waitpid.assert_not_called()
         kill.assert_not_called()
 
+    def test_failed_term_after_pty_output_closes_still_attempts_bounded_retirement(self):
+        for outcome in ("reaped", "unconfirmed", "ownership lost", "natural exit"):
+            with self.subTest(outcome=outcome):
+                self.failed_term_after_output(outcome)
+
+    def test_failed_term_is_secondary_to_active_pty_failure(self):
+        self.failed_term_after_output("reaped", active_error=OSError(errno.EIO, "synthetic output failure"))
+        self.failed_term_after_output("unconfirmed", active_error=OSError(errno.EIO, "synthetic output failure"))
+
+    def failed_term_after_output(self, outcome, *, active_error=None):
+        pid, master, clock = 3011, 4022, 0.0
+        term_error = PermissionError(errno.EPERM, "synthetic TERM failure")
+        sent, after_signal_probes = [], []
+
+        def pause(seconds):
+            nonlocal clock
+            clock += seconds
+
+        def probe(_pid, _flags):
+            if not sent:
+                return 0, 0
+            after_signal_probes.append(clock)
+            if outcome == "ownership lost":
+                raise ChildProcessError()
+            if outcome == "natural exit" or (outcome == "reaped" and signal.SIGKILL in sent):
+                return pid, 0
+            return 0, 0
+
+        def send(_pid, signum):
+            sent.append(signum)
+            if signum == signal.SIGTERM:
+                raise term_error
+            if outcome == "unconfirmed":
+                raise PermissionError(errno.EPERM, "synthetic KILL failure")
+
+        home, launcher = Path("/scratch/home"), Path("/scratch/fixture.py")
+        initial = Mock()
+        expected_error = term_error if active_error is None else active_error
+        with (
+            patch.object(fixture.pty, "fork", return_value=(pid, master)) as spawn,
+            patch.object(fixture.os, "close") as close,
+            patch.object(fixture.os, "waitpid", side_effect=probe) as waitpid,
+            patch.object(fixture.os, "kill", side_effect=send) as kill,
+            patch.object(fixture.time, "monotonic", side_effect=lambda: clock),
+            patch.object(fixture.time, "sleep", side_effect=pause),
+            patch.object(fixture, "observe_pty", return_value=(b"", False, False), side_effect=active_error) as observe,
+            self.assertRaises(OSError) as caught,
+        ):
+            fixture.launch(home, launcher, "fixture-alpha", 73, initial)
+        self.assertIs(caught.exception, expected_error)
+        notes = getattr(expected_error, "__notes__", ())
+        self.assertIn(f"Synthetic PTY SIGTERM failed (errno {errno.EPERM}).", notes)
+        self.assertEqual(fixture.PTY_UNCONFIRMED in notes,
+                         outcome in ("unconfirmed", "ownership lost"))
+        self.assertLessEqual(clock, 5)
+        if outcome == "unconfirmed":
+            self.assertEqual(clock, 5)
+        expected = [signal.SIGTERM, signal.SIGKILL] if outcome in ("reaped", "unconfirmed") else [signal.SIGTERM]
+        self.assertEqual(sent, expected)
+        self.assertTrue(after_signal_probes)
+        self.assertGreater(waitpid.call_count, 1)
+        self.assertTrue(all(call.args == (pid, os.WNOHANG) for call in waitpid.call_args_list))
+        self.assertTrue(all(call.args[0] == pid for call in kill.call_args_list))
+        self.assertEqual(initial.close.call_count, 1 if active_error is None else 2)
+        spawn.assert_called_once_with()
+        close.assert_called_once_with(master)
+        observe.assert_called_once_with(master)
+
     def test_projection_and_pty_close_faults_preserve_the_primary_error(self):
         pid, master, descriptor = 3011, 4022, 73
         primary = OSError(errno.EIO, "synthetic PTY closure")

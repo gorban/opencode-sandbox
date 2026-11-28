@@ -152,11 +152,11 @@ def launch(home, launcher, label, descriptor, start_input):
     except BaseException as error:
         close_start_input(start_input, error)
         try:
-            retire_pty(pid, master, failed=True)
-        except BaseException:
-            error.add_note(PTY_UNCONFIRMED)
+            retire_pty(pid, master, active_error=error)
+        except BaseException as cleanup_error:
+            note_pty_cleanup_failure(error, cleanup_error)
         raise
-    status = retire_pty(pid, master, failed=False)
+    status = retire_pty(pid, master)
     if os.waitstatus_to_exitcode(status) or not consent or not offered or (
         f"Verified Google registration {label} for workstation metadata.".encode("ascii") not in output
     ):
@@ -217,43 +217,77 @@ def poll_pty_child(pid, deadline):
         time.sleep(min(remaining, 0.025))
 
 
-def signal_pty_child(pid, signum):
+def signal_pty_child(pid, signum, errors):
     try:
         os.kill(pid, signum)
     except ProcessLookupError:
         pass  # An owned child can exit between the probe and the signal.
+    except OSError as error:
+        errors.append((signum, error))
 
 
-def retire_pty_child(pid, deadline, *, failed):
+def note_pty_cleanup_failure(error, cleanup_error):
+    for note in getattr(cleanup_error, "__notes__", ()):
+        if note != PTY_UNCONFIRMED:
+            error.add_note(note)
+    error.add_note(PTY_UNCONFIRMED)
+
+
+def note_pty_signal_failures(error, signal_errors):
+    for signum, failure in signal_errors:
+        error.add_note(f"Synthetic PTY {signum.name} failed (errno {failure.errno}).")
+
+
+def retire_pty_child(pid, deadline, *, active_error=None):
     now = time.monotonic()
-    grace = now if failed else min(deadline, now + 1)
+    grace = now if active_error is not None else min(deadline, now + 1)
     status = poll_pty_child(pid, grace)
     if status is not None:
         return status
-    if time.monotonic() < deadline:
-        signal_pty_child(pid, signal.SIGTERM)
-        status = poll_pty_child(pid, min(deadline, time.monotonic() + 1))
-        if status is None and time.monotonic() < deadline:
-            signal_pty_child(pid, signal.SIGKILL)
-            status = poll_pty_child(pid, deadline)
-    if status is None:
-        raise PtyRetirementUnconfirmed(PTY_UNCONFIRMED)
-    if not failed:
+    signal_errors = []
+    try:
+        if time.monotonic() < deadline:
+            signal_pty_child(pid, signal.SIGTERM, signal_errors)
+            status = poll_pty_child(pid, min(deadline, time.monotonic() + 1))
+            if status is None and time.monotonic() < deadline:
+                signal_pty_child(pid, signal.SIGKILL, signal_errors)
+                status = poll_pty_child(pid, deadline)
+        if status is None:
+            raise PtyRetirementUnconfirmed(PTY_UNCONFIRMED)
+    except (OSError, PtyRetirementUnconfirmed) as reap_error:
+        if not signal_errors:
+            raise
+        first_signal_error = signal_errors[0][1]
+        note_pty_signal_failures(first_signal_error, signal_errors)
+        first_signal_error.add_note(PTY_UNCONFIRMED)
+        raise first_signal_error from reap_error
+    if signal_errors:
+        if active_error is None:
+            first_signal_error = signal_errors[0][1]
+            note_pty_signal_failures(first_signal_error, signal_errors)
+            raise first_signal_error
+        note_pty_signal_failures(active_error, signal_errors)
+    if active_error is None:
         raise RuntimeError("Synthetic PTY child failed to exit after output closed.")
     return status
 
 
-def retire_pty(pid, master, *, failed):
+def retire_pty(pid, master, *, active_error=None):
     deadline = time.monotonic() + 5
     try:
         os.close(master)
     except BaseException as error:
+        primary = error if active_error is None else active_error
+        if active_error is not None:
+            active_error.add_note("Synthetic PTY master closure was not confirmed.")
         try:
-            retire_pty_child(pid, deadline, failed=True)
-        except BaseException:
-            error.add_note(PTY_UNCONFIRMED)
-        raise
-    return retire_pty_child(pid, deadline, failed=failed)
+            retire_pty_child(pid, deadline, active_error=primary)
+        except BaseException as cleanup_error:
+            note_pty_cleanup_failure(primary, cleanup_error)
+        if active_error is None:
+            raise
+        return
+    return retire_pty_child(pid, deadline, active_error=active_error)
 
 
 def observe_bound_catalog(root, source):
