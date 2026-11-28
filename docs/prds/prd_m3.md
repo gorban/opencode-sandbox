@@ -101,9 +101,9 @@ Sidebar Tree (3-Level Hierarchy)
 ### 3. Shared SvelteKit frontend, loopback web auth, and Tauri v2 UDS bridge
 
 - **One static SPA, two authenticated shells:** Reach initial acceptance in the shell the
-  [control-plane decision](prd_m.md#control-plane-decision) selects: M3b if the tech-stack
-  spike passes, M3a first if it fails. Both use the same client. M3b gives it a typed native
-  transport.
+  [control-plane decision](prd_m.md#control-plane-decision) selects: M3b if Tauri
+  qualification passes, M3a first if it fails. Both use the same client, and both need the
+  shared frontend qualification first. M3b gives the client a typed native transport.
   - **Tauri v2 Native Desktop App (M3b):** zero browser
      extensions. A minimal Rust backend opens `oc_daemon`'s host-only `0o600` UDS directly
      (`SO_PEERCRED` UID verified) to proxy API/SSE/PTY/Browser streams to the WebView without

@@ -7,9 +7,10 @@ Package the qualified SvelteKit static SPA in Tauri v2. Reuse the same views and
 contract. The desktop client uses a narrow native transport to the daemon's host-only socket,
 with peer identity enforced on the daemon side. The loopback build remains independently usable.
 
-On 2026-11-28 the operator chose Tauri as the only shipping shell, taking effect if the spike
-below passes ([control-plane decision](prd_m.md#control-plane-decision)). Loopback then serves
-fixtures for tests and carries no real authority. Delivery order:
+On 2026-11-28 the operator chose Tauri as the only shipping shell. It takes effect if the
+[Tauri qualification](#tauri-qualification) below passes, after the shared frontend
+qualification has passed ([control-plane decision](prd_m.md#control-plane-decision)). Loopback
+then serves fixtures for tests and carries no real authority. Delivery order:
 [prd_m](prd_m.md#delivery-order).
 
 ## Tech-stack spike
@@ -17,16 +18,29 @@ fixtures for tests and carries no real authority. Delivery order:
 A throwaway probe under `docs/prds/spikes/`, following the spike rules in
 [`AGENTS.md`](../../AGENTS.md#branches). It uses synthetic data and a fixture daemon only.
 
-- [ ] Build the probe on the stock skeleton from [prd_m3a3](prd_m3a3.md#skeleton), with async
-      Svelte on, and answer the
-      [foundation's open questions](prd_m3a3.md#qualification-in-the-tech-stack-spike) here.
+It runs as step 3 of [Wave 0](prd_m.md#wave-0-prove-and-decide), after the code home and pins
+are decided and the skeleton is seeded. It has two sets of checks with different consequences.
+
+- [ ] Generate the probe's skeleton from the command recorded when the skeleton was seeded
+      ([prd_m3a3](prd_m3a3.md#skeleton)), with async Svelte on. The probe never edits the seeded
+      skeleton. Its findings are applied there afterwards, in step 4.
+- [ ] Run the [shared frontend qualification](prd_m3a3.md#shared-frontend-qualification) first.
+      It does not depend on the shell, and both shells need it. If it fails, stop and return to
+      the operator. Do not run the Tauri checks, and do not fall back to loopback.
+
+### Tauri qualification
+
+Run only after the shared frontend qualification passes. A failure here, and only here, selects
+loopback first ([control-plane decision](prd_m.md#control-plane-decision)).
 
 - [ ] Package the SvelteKit static build in Tauri v2 on Linux WebKitGTK under the strict
       desktop CSP. Record which CSS the [locked design](spikes/m/dashboard-design/DESIGN.md#engine-notes)
       relies on that this engine lacks.
 - [ ] Mount one [UI SDK](prd_m3a2.md) primitive and check its styles load without
       `unsafe-inline` or style attributes. This is the
-      [M3a2 qualification](prd_m3a2.md#qualification) question, answered for WebKitGTK.
+      [M3a2 qualification](prd_m3a2.md#qualification) question, answered for WebKitGTK. A
+      failure here selects another option in the
+      [UI SDK decision](prd_m3a2.md#open-decision). It does not fail Tauri qualification.
 - [ ] Call a fixture daemon through a typed Rust bridge over a host-only socket with the peer
       check. Confirm the WebView has no filesystem, shell, HTTP or clipboard access.
 - [ ] Paint one observe-only sandbox browser frame on a canvas inside a null-origin confined
@@ -41,9 +55,11 @@ A throwaway probe under `docs/prds/spikes/`, following the spike rules in
       developer extras. Whether that build offers any Chrome DevTools Protocol endpoint is an
       open question until it is checked on the pinned version. Do not carry an assumption either
       way into the design.
+- [ ] Check that async Svelte works in the client-rendered static build inside the packaged
+      WebView.
 - [ ] Measure cold launch to the first populated sandbox list.
-- [ ] Record the result and the resulting decisions: the shell order in
-      [prd_m](prd_m.md#control-plane-decision) and the UI SDK choice in
+- [ ] Record the result of each set of checks separately, and the resulting decisions: the
+      shell order in [prd_m](prd_m.md#control-plane-decision) and the UI SDK choice in
       [prd_m3a2](prd_m3a2.md#open-decision).
 
 ## Packaging and qualification

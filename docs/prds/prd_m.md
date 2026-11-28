@@ -200,30 +200,46 @@ Direction recorded:
   for look and feel, not an implementation guide ([prd_m3a3](prd_m3a3.md#direction-recorded)).
 - Lock the frontend's conventions before any UI stream starts: the stock skeleton, the style
   guide and the test pyramid ([prd_m3a3](prd_m3a3.md)).
-- Tauri becomes the only shipping shell if the tech-stack spike passes. See the
-  [control-plane decision](#control-plane-decision).
+- Tauri becomes the only shipping shell if Tauri qualification passes, once the shared frontend
+  qualification has passed. See the [control-plane decision](#control-plane-decision).
 - The first end-to-end example is a minimal crew pipeline ([prd_n](prd_n.md#delivery-order)).
 - Assumption, not yet confirmed by the operator: the slice uses a synthetic model route first, as
   the [local proof](spikes/m/local/README.md) does, so it does not wait on live providers.
 
 ### Wave 0: prove and decide
 
-These unblock every later stream. They can run in parallel with each other.
+These unblock every later stream. The four frontend steps run in order, because each needs the
+one before it. The other items run in parallel with them.
 
-- [ ] **Frontend foundation** ([prd_m3a3](prd_m3a3.md)): the `sv create` skeleton with its
-      add-ons, async Svelte enabled, the style guide with rule IDs, and the test harness in two
-      browser engines. Every UI stream builds on it and is reviewed against it.
-- [ ] **Tech-stack spike** ([prd_m3b](prd_m3b.md#tech-stack-spike)), built on that skeleton.
-      Decides the shell order and the [UI SDK decision](prd_m3a2.md#open-decision), and answers
-      the [foundation's open questions](prd_m3a3.md#qualification-in-the-tech-stack-spike).
+In order:
+
+- [ ] **Step 1: production code home and toolchain pins.** Decide where the frontend, the Tauri
+      shell and the daemon modules live outside `docs/prds/spikes/`
+      ([prd_k](prd_k.md#later-runtime-layout)), and pin Node and Rust ([prd_f](prd_f.md)).
+- [ ] **Step 2: seed the skeleton** ([prd_m3a3](prd_m3a3.md#skeleton)). Generate the stock
+      `sv create` skeleton with its add-ons in that home, with async Svelte on, and record the
+      exact command and versions. Nothing is built on it yet.
+- [ ] **Step 3: tech-stack spike** ([prd_m3b](prd_m3b.md#tech-stack-spike)). It generates the
+      same skeleton from the recorded command under `docs/prds/spikes/` and runs two sets of
+      checks: the [shared frontend qualification](prd_m3a3.md#shared-frontend-qualification),
+      then the [Tauri qualification](prd_m3b.md#tauri-qualification). It feeds the
+      [shell order](#control-plane-decision) and the
+      [UI SDK decision](prd_m3a2.md#open-decision).
+- [ ] **Step 4: finish the frontend foundation** ([prd_m3a3](prd_m3a3.md#order-of-work)). Apply
+      the spike's findings to the seeded skeleton: the chosen Storybook setup, the test harness
+      in two browser engines, and the style guide with rule IDs.
+
+No UI implementation stream starts before step 4 is done, and that includes the conversion
+lane. Drafting the style guide can begin during steps 2 and 3. It is finished in step 4.
+
+In parallel with those steps:
+
 - [ ] **Shared UI contract and one fixture set**
       ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)). Every view stream builds against the
       fixtures and every host stream against the contract.
 - [ ] **Design supplement** ([prd_m3a1](prd_m3a1.md#design-supplement)) for the screens the
       locked design lacks. [Reserved: Dashboard design.]
-- [ ] **Production code home and toolchain pins.** Decide where the frontend, the Tauri shell and
-      the daemon modules live outside `docs/prds/spikes/`
-      ([prd_k](prd_k.md#later-runtime-layout)), and pin Node and Rust ([prd_f](prd_f.md)).
+- The workflow-side Wave 0 items in [prd_n](prd_n.md#wave-0-prove-and-decide).
 
 ### Wave 1: thin live slice
 
@@ -243,20 +259,25 @@ Parallel once Wave 0 lands. Workflow-side items for this wave are in
 - [ ] Read-only thread view with provenance badges.
 - [ ] Tier A Approval Inbox wired to `oc_controller`, at least for the run lease the pipeline
       needs.
-- [ ] The shell, chosen by the outcome of the
-      [tech-stack spike](prd_m3b.md#tech-stack-spike):
-  - **If the spike passes:** the Tauri bridge, packaging and the session-generation fence
-    ([prd_m3b](prd_m3b.md)).
-  - **If the spike fails:** the loopback dashboard with its web sign-in qualification, including
-    the cookie port-sharing item ([prd_m3a](prd_m3a.md)). Tauri then follows loopback, as in the
-    earlier order.
+- [ ] The shell. This wave starts only after the
+      [shared frontend qualification](prd_m3a3.md#shared-frontend-qualification) has passed,
+      since both shells need it. The [Tauri qualification](prd_m3b.md#tauri-qualification) then
+      chooses the shell:
+  - **If Tauri qualification passes:** the Tauri bridge, packaging and the session-generation
+    fence ([prd_m3b](prd_m3b.md)).
+  - **If Tauri qualification fails:** the loopback dashboard with its web sign-in
+    qualification, including the cookie port-sharing item ([prd_m3a](prd_m3a.md)). Tauri then
+    follows loopback, as in the earlier order.
 
 Finish line, shared with prd_n. The steps are the same for either shell: on a synthetic model,
 the operator starts a crew pipeline run, approves its lease, watches the ship lane work, sees the
 verification pass, resolves the human gate and sees the run complete.
 
-- **If the spike passes,** the operator does this in the packaged Tauri app.
-- **If the spike fails,** the operator does this in the authenticated loopback dashboard.
+- **If Tauri qualification passes,** the operator does this in the packaged Tauri app.
+- **If Tauri qualification fails,** the operator does this in the authenticated loopback
+  dashboard.
+- **If the shared frontend qualification fails,** there is no finish line yet. Work stops for
+  the operator's decision, as the [control-plane decision](#control-plane-decision) says.
 
 Either way the slice is local and synthetic. It needs no live provider route and no SSH worker,
 provided the operator confirms the synthetic route recorded above as an assumption. Without that
@@ -321,10 +342,18 @@ Dependencies owned elsewhere:
       [loopback dashboard](prd_m3a.md) before packaging the shared frontend for
       [Tauri v2](prd_m3b.md). Reuse the documented T3Code architectural patterns.
 - [ ] **Shell order.** The operator chose Tauri only on 2026-11-28, and approved changing the
-      order across these PRDs to match. The choice takes effect when the
-      [tech-stack spike](prd_m3b.md#tech-stack-spike) passes. Until then, and if it fails, the
-      loopback-first order above stands. This item is the one place the order is set. Every
-      other mention of shell order in the PRDs defers to it. Time estimates are rough.
+      order across these PRDs to match. This item is the one place the order is set. Every
+      other mention of shell order in the PRDs defers to it. Until the
+      [tech-stack spike](prd_m3b.md#tech-stack-spike) reports, the loopback-first order above
+      stands. The spike runs two sets of checks, and they lead to different results:
+
+      | [Shared frontend qualification](prd_m3a3.md#shared-frontend-qualification) | [Tauri qualification](prd_m3b.md#tauri-qualification) | Result |
+      |---|---|---|
+      | Fails | Not run | Stop and return to the operator. A failure here affects loopback as much as Tauri, so loopback-first is not a remedy. No UI stream starts. |
+      | Passes | Passes | Tauri only. The choice takes effect. |
+      | Passes | Fails | Loopback first, then Tauri, as in the earlier order. |
+
+      Time estimates below are rough.
   - **Tauri only; loopback serves fixtures for tests (chosen).** The dashboard has no TCP
     listener. The web sign-in work and the cookie port-sharing problem in
     [prd_m3a](prd_m3a.md) are not needed. Each stream surface is qualified once. No access from a

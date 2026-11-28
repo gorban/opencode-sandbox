@@ -15,7 +15,8 @@ Chromium launches into the app (embedded browser views and the Browser Wall) is 
 this phase.
 
 On 2026-11-28 the operator chose Tauri as the only shipping shell, taking effect if the
-[tech-stack spike](prd_m3b.md#tech-stack-spike) passes
+[Tauri qualification](prd_m3b.md#tauri-qualification) passes, after the shared frontend
+qualification that both shells need
 ([control-plane decision](prd_m.md#control-plane-decision)). In that case this phase keeps the
 static SPA, its view rules and a loopback fixture server for tests. The loopback sign-in
 qualification and the cookie port-sharing item below wait until loopback is asked to carry real

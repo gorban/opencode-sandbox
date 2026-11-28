@@ -106,6 +106,25 @@ Re-verify at Gate 1.
 
 ## Requirements
 
+### Order of work
+
+The foundation is built in two parts, with the tech-stack spike between them. This is steps 2
+to 4 of [Wave 0](prd_m.md#wave-0-prove-and-decide).
+
+1. **Seed.** After the code home and toolchain pins are decided, generate the skeleton there and
+   record the command. This covers the [skeleton](#skeleton) items up to the static adapter,
+   and turning the async flag on.
+2. **Spike.** The [tech-stack spike](prd_m3b.md#tech-stack-spike) generates the same skeleton
+   from the recorded command under `docs/prds/spikes/` and runs the
+   [shared frontend qualification](#shared-frontend-qualification). It does not edit the seeded
+   skeleton.
+3. **Finish.** Apply the spike's findings to the seeded skeleton: the chosen Storybook setup,
+   the two-engine harness, the rebuilt client and the style guide. The style guide can be
+   drafted during the first two parts. It is finished here.
+
+No UI implementation stream, including the [conversion lane](#conversion-lane), starts before
+the third part is done.
+
 ### Skeleton
 
 - [ ] Generate the project with `sv create` (the `minimal` template, TypeScript) and the add-ons
@@ -229,8 +248,8 @@ by default. These rules make it hold.
 
 ### Conversion lane
 
-A parallel lane that can start as soon as the skeleton and the style guide exist. It does not
-wait for the daemon or the Tauri bridge.
+A parallel lane that can start as soon as the foundation is finished
+([order of work](#order-of-work)). It does not wait for the daemon or the Tauri bridge.
 
 - [ ] Rebuild the mockup's components as stories, in tier order: tokens, then primitives, then
       composites, then screens. Reuse the mockup's token values, since they define the look.
@@ -243,19 +262,27 @@ wait for the daemon or the Tauri bridge.
 - [ ] A component is accepted when it matches the mockup by the comparison above, passes the
       story review checklist and has its component tests.
 
-## Qualification in the tech-stack spike
+## Shared frontend qualification
 
-The [tech-stack spike](prd_m3b.md#tech-stack-spike) builds on this skeleton and answers these.
+The first set of checks in the [tech-stack spike](prd_m3b.md#tech-stack-spike). None of them
+depends on the shell, and both shells need all of them, so they are a prerequisite for either
+one. They run in Chromium and WebKit as browser engines, not in the packaged app.
 
+If any of these fails, stop and return to the operator. The Tauri checks are not run and no UI
+stream starts. Loopback-first is not a remedy, because a failure here affects loopback as much
+as Tauri ([control-plane decision](prd_m.md#control-plane-decision)).
+
+- [ ] The seeded skeleton builds as a static, client-rendered app.
 - [ ] Choose the Storybook setup. Storybook's documentation does not mention SvelteKit 3, which
       dropped the config file, so check both setups the add-on offers on the pinned SvelteKit 3
       and Svelte 5 with the async flag on: "Storybook for SvelteKit" and "Storybook for Svelte &
       Vite". The rule against SvelteKit modules below routes means the second is enough. Prefer
       whichever shares the app's Vite configuration with the fewest departures from stock.
 - [ ] Run the stories as tests in Chromium and in WebKit under the chosen setup.
-- [ ] If neither setup works, stop and return the choice to the operator. There is no standing
-      fallback.
-- [ ] Async Svelte works in a client-rendered static build inside the Tauri WebView.
+- [ ] If neither setup works, this qualification has failed. There is no standing fallback.
+- [ ] Async Svelte works in a client-rendered static build in both engines. Whether it works
+      inside the packaged WebView is a
+      [Tauri qualification](prd_m3b.md#tauri-qualification) check.
 - [ ] Coverage can be measured on logic modules at the 100% threshold, and reported for
       components.
 - [ ] Lint rules exist for the banned waits and the selector rule. Record their exact names, or

@@ -218,7 +218,8 @@ desktop surfaces explicitly depend on completing the open upstream slices:
 - SSH remote worker onboarding (`REMOTE / NAME`, [prd_i2](prd_i2.md))
 - Trusted Host Chrome, in the shell the
   [control-plane decision](prd_m.md#control-plane-decision) selects: [M3b Tauri desktop](prd_m3b.md)
-  if the tech-stack spike passes, [M3a loopback](prd_m3a.md) first if it fails
+  if Tauri qualification passes, [M3a loopback](prd_m3a.md) first if it fails. Either shell needs
+  the shared frontend qualification first
 
 Wave 1 of the [delivery order](#delivery-order) is a local, synthetic slice. From the list above
 it needs the joint local transport proof and Trusted Host Chrome. It does not need live provider
@@ -304,9 +305,10 @@ before the wave that uses it:
 ### Wave 1: thin live slice
 
 Parallel once Wave 0 lands. Control-plane items for this wave are in
-[prd_m](prd_m.md#wave-1-thin-live-slice), with the shared finish line. That finish line is
-defined for both outcomes of the tech-stack spike: the Tauri app if it passes, the authenticated
-loopback dashboard if it fails. The items below are the same either way.
+[prd_m](prd_m.md#wave-1-thin-live-slice), with the shared finish line. This wave starts only
+after the shared frontend qualification has passed. The finish line is then defined for both
+outcomes of the Tauri qualification: the Tauri app if it passes, the authenticated loopback
+dashboard if it fails. The items below are the same either way.
 
 - [ ] A minimal statechart kernel: the part of [N1](prd_n1.md) the pipeline needs. That is the
       schema and pure compile for `deterministic`, `ship_lane` and `human_gate_async` stages,
