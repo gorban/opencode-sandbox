@@ -160,9 +160,9 @@ host chrome.
       primitive ([prd_m3a2](prd_m3a2.md)), with states and keyboard behaviour.
 - [x] Static prototypes of the screens in scope, using synthetic fixtures and the
       [reference CSP](spikes/m/dashboard-design/README.md#view-and-rebuild).
-      `claude/m3a-design-selection` records the selected `out/`.
+      `claude/m3a-design-selection` records the generator and checksums for the selected screens.
 - [ ] A states sheet, a hostile-content sheet, and the WCAG 2.2 AA report.
-      - The states sheet (`out/states.html`) and the audit findings (`audit/`) are in the
+      - The generated states sheet (`out/states.html`) and the audit findings (`audit/`) are in the
         [reference design](spikes/m/dashboard-design/README.md). There's no separate hostile-content
         sheet. The states sheet includes an escape and containment specimen for all five
         hostile fixture strings.

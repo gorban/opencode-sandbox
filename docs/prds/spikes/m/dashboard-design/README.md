@@ -10,12 +10,20 @@ tokens, components and behaviour; don't ship these files.
 | Path | What |
 |---|---|
 | [`DESIGN.md`](DESIGN.md) | The locked design system: direction, tokens, type, components, states and the reasons for each choice. Read it before building M3a views. |
-| `out/` | The prototype: one page per screen in the brief, plus `tokens.css`, `app.css`, `app.js` and `assets/`. Open [`out/index.html`](out/index.html) for the list. |
+| `out/` | The prototype assets and, after rebuilding, one HTML page per screen. Open `out/index.html` for the list. |
 | `build/` | The generator. `node build/build.mjs` writes `out/*.html`, `out/tokens.css` and the icons from the fixture. `build/tokens.mjs` is the token source of truth, and `build/contrast.mjs` checks token contrast. `out/app.css` and `out/app.js` are written by hand. |
+| [`html.sha256`](html.sha256) | Checksums for the 16 generated screens in the locked reference. |
 | `brief/` | The design input: `DESIGN_BRIEF.md` and the synthetic `fixtures/workspace.json`. |
 | `audit/` | Machine-readable WCAG 2.2 AA findings from the final audits. |
 
 ## View and rebuild
+
+From this directory, build and verify the locked screens.
+
+```sh
+node build/build.mjs
+sha256sum -c html.sha256
+```
 
 Serve `out/` over loopback with the reference CSP below, for example with
 `tools/serve-csp.py out 8765` from design-starter-kit, and open `/fleet.html`.
@@ -28,8 +36,9 @@ Direct page loads work with `connect-src` omitted. In-place navigation fetches H
 the same origin and needs `connect-src 'self'` to keep theme, density and drafts in memory.
 The reference uses external stylesheets and scripts throughout.
 
-To rebuild after a change: run `node build/build.mjs`, and commit `build/`, `out/` and
-`DESIGN.md` together.
+Keep generated HTML local. The generator and tracked assets remain available for source
+analysis. If the reference design changes intentionally, regenerate the pages and update
+the checksums with `LC_ALL=C sha256sum out/*.html > html.sha256` in the same commit.
 
 ## How it was chosen
 
@@ -60,10 +69,9 @@ The brief was synced to this repository at `3d3f408`.
 
 The selected artifact is attempt `a1-hallmark` at commit
 `26d81cf58435e6660023b993c7f45891ebdc1bb3`, tagged `design-final` in the design lab's attempt
-repository, which isn't published. `DESIGN.md` and the files in `out/` are byte-identical
-to that commit. The lab's empty `out/.gitkeep` was omitted.
-The generator and fixture include source cleanup after selection. Rebuilding from
-`build/` reproduces the committed `out/` byte for byte.
+repository, which isn't published. `DESIGN.md`, the tracked assets in `out/` and the
+rebuilt pages are byte-identical to that commit. The generator and fixture include source
+cleanup after selection.
 
 ## Accessibility (WCAG 2.2 AA)
 
