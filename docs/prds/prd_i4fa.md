@@ -83,6 +83,16 @@ configuration and policy. One provider can reach this milestone while the others
   canceled change leaves the binding intact, an approved switch fences in-flight writes
   on the previous route, and `A → B → A` rejects a replay of the original A epoch.
 
+### Standing approval for named subscription profiles
+
+- [x] Implemented and tested the host-only [approval transaction](../../oc_providers/standing_approval.py)
+  against overlapping writers, stale configuration and authority evidence, foreground loss, and
+  publication durability. The helper and its scratch-filesystem tests were reviewed at tree
+  `43deb597c2212aadca1bd153d4cda7c0a3f42650` on `codex/named-standing-approval`.
+- [ ] After G1 and placement qualification, wire the transaction into trusted configuration and
+  the bare named Full launch. Verify the real foreground owner, registry lineages, and placement
+  policy under the existing fences, then test admission and cancellation through the public launcher.
+
 ### Provider qualification before live dispatch
 
 - OpenAI shell acceptance uses the normal public launch and reads the operator's
