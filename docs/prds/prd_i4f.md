@@ -60,6 +60,15 @@ routing, exposure or revocation goes through both reviews before use by another 
    revocation, wrong incarnation and provider failure. Prove the model cannot use host tools or
    read the workstation login. Keep that provider text-only until this gate clears.
 
+## Offline stock tool proof
+
+- [x] Exercise the OpenAI broker through bare `oc-sandbox` with pinned stock OpenCode and
+  synthetic upstream data (`codex/stock-worker-tools-proof`). In a sealed SELinux-enforcing
+  Podman guest, OpenCode completed a patch, a file read, and a shell command with three
+  continuations. The fixture checked the exact file bytes, worker credential isolation,
+  refused tool responses, held-stream closure, and owned worker and relay retirement.
+  See the [sealed guest runbook](../../tests/e2e/stock_worker_tools_guest.md).
+
 ## Opt-in live e2e pytest milestones
 
 Keep temporary canary and smoke harnesses out of the public `oc-sandbox` CLI. Automate each
