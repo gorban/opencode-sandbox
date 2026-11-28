@@ -1,6 +1,7 @@
 """Multi-turn streaming pod-loopback relay for interactive provider sessions."""
 
 import contextlib
+import hmac
 import os
 from pathlib import Path
 import re
@@ -28,6 +29,7 @@ REQUEST_TIMEOUT = 15
 STREAM_TIMEOUT = 330
 CHUNK = 16 * 1024
 REQUEST_LENGTH = struct.Struct("!I")
+READY_MARKER = b"OC_RELAY_READY"
 
 _END = b"\r\n\r\n"
 _REQUEST_LINE = re.compile(rb"(?:GET|POST) [!-~]+ HTTP/1\.1\Z")
@@ -232,7 +234,22 @@ def _run_accept_loop(
                 _spawn_peer(listener, lease, slots, peers, peers_lock, handle)
 
 
-def serve(lease: relay.Lease, proof: bytes, port: int = 8401, *, defer_bind: bool = False) -> None:
+def readiness_mac(proof: bytes, active_record: bytes, port: int, process_label: bytes) -> bytes:
+    scope = b"oc-sandbox relay readiness v1\0" + active_record + b"\0" + str(port).encode("ascii") + b"\0"
+    return hmac.digest(proof, scope + process_label, "sha256")
+
+
+def _notify_bound(lease: relay.Lease, proof: bytes, port: int) -> None:
+    with Path("/proc/self/attr/current").open("rb") as source:
+        label = source.read(128).removesuffix(b"\0")
+    if not label or len(label) >= 128 or lease.status() != "pending":
+        raise RelayError("No pending verified relay readiness")
+    record = readiness_mac(proof, lease.active_record, port, label).hex()
+    print(READY_MARKER.decode("ascii"), record, flush=True)
+
+
+def serve(lease: relay.Lease, proof: bytes, port: int = 8401, *, defer_bind: bool = False,
+          verify_ready: bool = False) -> None:
     if type(port) is not int or not RELAY_PORT_MIN <= port <= RELAY_PORT_MAX:
         raise RelayError("invalid relay port")
     os.umask(0o077)
@@ -245,6 +262,8 @@ def serve(lease: relay.Lease, proof: bytes, port: int = 8401, *, defer_bind: boo
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((PROVIDER[0], port))
         listener.listen(8)
+        if verify_ready:
+            _notify_bound(lease, proof, port)
         slots = threading.BoundedSemaphore(8)
         peers: set[socket.socket] = set()
         peers_lock = threading.Lock()
@@ -273,20 +292,19 @@ if __name__ == "__main__":
     if len(sys.argv) not in (4, 5, 6):
         sys.exit("Invalid session relay arguments")
     bind_port = 8401
-    defer_bind = False
+    flags = sys.argv[5:]
     if len(sys.argv) >= 5:
         if not sys.argv[4].isdecimal():
             sys.exit("Invalid session relay port")
         bind_port = int(sys.argv[4])
         if not RELAY_PORT_MIN <= bind_port <= RELAY_PORT_MAX:
             sys.exit("Invalid session relay port")
-    if len(sys.argv) == 6:
-        if sys.argv[5] != "--defer-bind":
-            sys.exit("Invalid session relay arguments")
-        defer_bind = True
+    if flags not in ([], ["--defer-bind"], ["--verify-ready"]):
+        sys.exit("Invalid session relay arguments")
     active = relay.grant_record(sys.argv[1], int(sys.argv[2]), True)
     with relay.PROOF.open("rb") as file:
         secret = file.read(relay.PROOF_SIZE + 1)
     if len(secret) != relay.PROOF_SIZE:
         sys.exit("Relay proof is missing or invalid")
-    serve(relay.Lease(relay.GRANT, active, int(sys.argv[3])), secret, port=bind_port, defer_bind=defer_bind)
+    serve(relay.Lease(relay.GRANT, active, int(sys.argv[3])), secret, port=bind_port,
+          defer_bind=flags == ["--defer-bind"], verify_ready=flags == ["--verify-ready"])

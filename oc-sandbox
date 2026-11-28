@@ -907,6 +907,123 @@ release_setup_lock() { exec {SETUP_LOCK_FD}>&-; wait "$SETUP_LOCK_PID" || die "s
 release_lifecycle_lock() { exec {LIFECYCLE_LOCK_FD}>&-; wait "$LIFECYCLE_LOCK_PID" || die "lifecycle lock helper failed"; }
 release_worktree_lock() { exec {WORKTREE_LOCK_FD}>&-; wait "$WORKTREE_LOCK_PID" || die "worktree lock helper failed"; }
 
+managed_pipe_is_current() {  # Bash can recycle a dead coprocess's descriptor numbers.
+  [[ -n ${MANAGED_PID:-} && ${OC_MANAGED_SESSION_PID:-} == "$MANAGED_PID" &&
+     -n ${MANAGED_READ_FD:-} && ${OC_MANAGED_SESSION[0]:-} == "$MANAGED_READ_FD" &&
+     -n ${MANAGED_WRITE_FD:-} && ${OC_MANAGED_SESSION[1]:-} == "$MANAGED_WRITE_FD" ]]
+}
+
+close_managed_pipes() {
+  if managed_pipe_is_current; then
+    exec {MANAGED_WRITE_FD}>&- {MANAGED_READ_FD}<&-
+  fi
+  MANAGED_WRITE_FD= MANAGED_READ_FD=
+}
+
+wait_for_managed_exit() {
+  local pid=$MANAGED_PID
+  # A pidfd prevents escalation against another process if the numeric PID is reused.
+  /usr/bin/python3 -I -c '
+import os, select, signal, sys
+pid, parent = map(int, sys.argv[1:3])
+try:
+    fd = os.pidfd_open(pid)
+except ProcessLookupError:
+    sys.exit(0)
+with os.fdopen(fd, "rb", closefd=True) as owner:
+    if select.select([owner], [], [], 0)[0]:
+        sys.exit(0)
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as stat_file:
+            observed_parent = int(stat_file.read().rpartition(") ")[2].split()[1])
+        if observed_parent != parent:
+            sys.exit(1)
+        # Allow the in-flight host command (up to 16s) and a fresh 25s cleanup window.
+        if select.select([owner], [], [], 45)[0]:
+            sys.exit(0)
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+        if select.select([owner], [], [], 2)[0]:
+            sys.exit(0)
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+        sys.exit(0 if select.select([owner], [], [], 2)[0] else 1)
+    except ProcessLookupError:
+        sys.exit(0)
+' "$pid" "$$" >/dev/null || return 1
+  wait "$pid"
+} 2>/dev/null
+
+retire_managed_supervisor() {
+  local status=$?
+  trap - EXIT
+  close_managed_pipes
+  if [[ -n ${MANAGED_PID:-} ]]; then wait_for_managed_exit || true; fi
+  exit "$status"
+}
+
+expect_managed_phase() {
+  local expected=$1$'\n' timeout=$2 reply= extra= eof=0
+  if managed_pipe_is_current && LC_ALL=C IFS= read -r -d '' -n "${#expected}" -t "$timeout" \
+      -u "$MANAGED_READ_FD" reply && [[ $reply == "$expected" ]]; then
+    if [[ $1 == ADMITTED ]]; then
+      managed_response_idle && return 0
+    else
+      LC_ALL=C IFS= read -r -d '' -n 1 -t 1 -u "$MANAGED_READ_FD" extra || eof=$?
+      (( eof == 1 )) && return 0
+    fi
+  fi
+  fail_managed_phase "managed provider session did not confirm $1"
+}
+
+fail_managed_phase() {
+  local status=0
+  close_managed_pipes
+  wait_for_managed_exit || status=$?
+  MANAGED_PID=
+  if [[ -n ${LIFECYCLE_LOCK_FD:-} ]]; then
+    exec {LIFECYCLE_LOCK_FD}>&-
+    wait "$LIFECYCLE_LOCK_PID" || true
+  fi
+  if (( status == 0 )); then die "$1"; fi
+  exit "$status"
+}
+
+managed_response_idle() {
+  managed_pipe_is_current && ! IFS= read -r -t 0 -u "$MANAGED_READ_FD"
+}
+
+admit_managed_session() {
+  local helper intent workspace_mode=automatic terminal_in terminal_out
+  helper=$SCRIPT_DIR/oc-openai-session.py
+  verify_openai_helper "$helper"
+  [[ -z $CWD_ARG ]] || workspace_mode=explicit
+  intent=$(/usr/bin/python3 -I -c '
+import json, sys
+keys = ("instance", "cwd", "provider_filter", "cli_ui_mode", "workspace_mode", "caller_cwd",
+        "lifecycle_dir", "sandbox", "worktree_repo", "worktree_branch")
+print(json.dumps(dict(zip(keys, sys.argv[1:], strict=True))))
+' "$ILABEL" "$CWD" "$PROVIDER" "$CLI_UI_MODE" "$workspace_mode" "$CALLER_PHYSICAL" \
+  "$STATE" "$SB" "$WT_REPO" "$WT_BRANCH")
+  trap retire_managed_supervisor EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  trap 'exit 141' PIPE
+  exec {terminal_in}<&0 {terminal_out}>&1
+  coproc OC_MANAGED_SESSION {
+    cd -- "$SCRIPT_DIR" || exit 2
+    exec /usr/bin/env -i HOME="$HOME" TERM="${TERM:-xterm-256color}" PATH=/usr/bin:/bin \
+      /usr/bin/python3 -IB "$helper" --admission \
+      3<&0 4>&1 0<&"$terminal_in" 1>&"$terminal_out" {terminal_in}<&- {terminal_out}>&-
+  }
+  MANAGED_PID=$!
+  MANAGED_READ_FD=${OC_MANAGED_SESSION[0]}
+  MANAGED_WRITE_FD=${OC_MANAGED_SESSION[1]}
+  exec {terminal_in}<&- {terminal_out}>&-
+  managed_pipe_is_current || die "managed provider admission channel disappeared"
+  printf '%s\n' "$intent" >&"$MANAGED_WRITE_FD"
+  expect_managed_phase ADMITTED 300
+}
+
 # Host-owned metadata: directory and records are opened relative to a no-follow
 # directory fd, and never trusted if a symlink, hard link or unsafe mode is found.
 worktree_state() {  # create | read NAME | drop NAME | write NAME CWD REPO BRANCH
@@ -1636,6 +1753,8 @@ if [[ $CHROMIUM_MODE == wayland ]]; then
 fi
 "${H[@]}" test -x "$BC_BIN"   || echo "warning: $BC_BIN not found; 'bcompare' bridge will do nothing" >&2
 "${H[@]}" test -x "$CODE_BIN" || echo "warning: $CODE_BIN not found; 'code' bridge will do nothing" >&2
+
+if (( MANAGED_MODE && !NOLAUNCH )); then admit_managed_session; fi
 
 # ---- directories / config -----------------------------------------------------
 # Hold the shared lifecycle barrier through instance creation; teardown takes it exclusively.
@@ -2640,20 +2759,30 @@ if [[ -n $recreate ]]; then
   log "Recreating pod '$POD' ($recreate)"
   pm pod rm -f "$POD" >/dev/null
 fi
+prepared_pod_id=
 if ! pod_exists; then
   log "Creating pod '$POD'${PORTS[*]:+ (ports: $(ports_label))}"
   podargs=()
   for p in "${PORTS[@]}"; do podargs+=(-p "127.0.0.1:$p"); done
-  pm pod create --name "$POD" --label oc.sandbox=1 --label "oc.instance=$ILABEL" \
+  prepared_pod_id=$(pm pod create --name "$POD" --label oc.sandbox=1 --label "oc.instance=$ILABEL" \
     --label "oc.podcfg=$want_podcfg" --label "oc.ports=$(ports_label)" \
     --network pasta:--host-lo-to-ns-lo --sysctl net.ipv4.ip_unprivileged_port_start=0 \
-    "${podargs[@]}" >/dev/null
+    "${podargs[@]}")
+elif (( MANAGED_MODE && !NOLAUNCH )); then
+  prepared_pod_id=$(pm pod inspect --format '{{.Id}}' "$POD") || die "could not verify prepared pod '$POD'"
+fi
+if (( MANAGED_MODE && !NOLAUNCH )); then
+  [[ $prepared_pod_id =~ ^[0-9a-f]{64}$ ]] || die "Podman did not return a complete pod ID"
 fi
 
 # ---- Chromium ---------------------------------------------------------------------------------------
 want_id=$(pm image inspect --format '{{.Id}}' "$CHROME_IMG")
 have_id=$(pm container inspect --format '{{.Image}}' "$CHROME" 2>/dev/null || true)
 have_cfg=$(pm container inspect --format '{{index .Config.Labels "oc.cfg"}}' "$CHROME" 2>/dev/null || true)
+if (( MANAGED_MODE && !NOLAUNCH )) && [[ -n $have_id ]]; then
+  [[ $(pm container inspect --format '{{.Pod}}' "$CHROME") == "$prepared_pod_id" ]] ||
+    die "Chromium does not belong to the prepared pod '$POD'"
+fi
 # Security keys: pass only FIDO hidraw nodes to desktop Chromium when enabled.
 display_args=()
 browser_mode=(--headless)
@@ -2761,22 +2890,29 @@ if (( MANAGED_MODE )); then
   if (( agent_pg )); then pg_secret_arg=$PGPASSSECRET pg_container_arg=$PGC; fi
   relay_image_id=$(pm image inspect --format '{{.Id}}' "$RELAY_IMG") || die "missing relay image '$RELAY_IMG'"
   agent_image_id=$(pm image inspect --format '{{.Id}}' "$AGENT_IMG") || die "missing agent image '$AGENT_IMG'"
-  session_helper=$SCRIPT_DIR/oc-openai-session.py
-  verify_openai_helper "$session_helper"
+  [[ $(pm pod inspect --format '{{.Id}}' "$POD") == "$prepared_pod_id" ]] ||
+    die "prepared pod '$POD' changed during setup"
+  [[ $(pm container inspect --format '{{.Pod}}' "$CHROME") == "$prepared_pod_id" ]] ||
+    die "Chromium does not belong to the prepared pod '$POD'"
   session_spec=$(/usr/bin/python3 -I -c '
 import json, sys
 keys = ("instance", "pod", "agent", "relay", "relay_image", "agent_image", "agent_mem",
         "level", "sandbox", "cwd", "home_vol", "chromium", "postgres", "pg_secret", "dind", "dind_run",
         "provider_filter", "cli_ui_mode")
-print(json.dumps(dict(zip(keys, sys.argv[1:]))))
-' "$ILABEL" "$POD" "$AGENT" "$RELAY" "$relay_image_id" "$agent_image_id" "$AGENT_MEM" \
+print(json.dumps({"spec": dict(zip(keys, sys.argv[3:], strict=True)), "pod_id": sys.argv[1],
+                  "lifecycle_pid": int(sys.argv[2])}))
+' "$prepared_pod_id" "$LIFECYCLE_LOCK_PID" \
+  "$ILABEL" "$POD" "$AGENT" "$RELAY" "$relay_image_id" "$agent_image_id" "$AGENT_MEM" \
   "$LEVEL" "$SB" "$CWD" "$OPENAI_HOMEVOL" "$CHROME" "$pg_container_arg" "$pg_secret_arg" "$dind_container_arg" "$dind_run_arg" \
   "$PROVIDER" "$CLI_UI_MODE")
+  managed_response_idle || fail_managed_phase "managed provider sent an unexpected preparation response"
+  printf '%s\n' "$session_spec" >&"$MANAGED_WRITE_FD"
+  expect_managed_phase CREATED 150
   release_lifecycle_lock
-  cd -- "$SCRIPT_DIR"
-  log "Launching managed OpenCode (instance '$ILABEL') in /sandbox/$CWD"
-  exec /usr/bin/env -i HOME="$HOME" TERM="${TERM:-xterm-256color}" PATH=/usr/bin:/bin \
-    /usr/bin/python3 -IB "$session_helper" 3<<<"$session_spec"
+  managed_status=0
+  wait "$MANAGED_PID" || managed_status=$?
+  MANAGED_PID=
+  exit "$managed_status"
 fi
 if any_relay_running "$POD"; then
   release_lifecycle_lock

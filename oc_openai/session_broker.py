@@ -37,10 +37,13 @@ from oc_providers.contracts import (
 )
 from .cli import Reason, RouteUnavailable, StreamTerminal, report_failure
 from .connection import ConnectionError
+from .connection_state import decode_json
 from .exposure import ExposureError, ExposureLedger
 from .live import make_backend
 from .profiles import ProfileError
 from .proof_gate import ProofGateError
+from .session_attach import filtered_attach_evidence, private_shared_file, verify_shared_file
+from .session_relay import READY_MARKER, readiness_mac
 from .managed import relay as relay_mod
 from .managed.runtime import (
     HOST_SPAWN,
@@ -55,6 +58,7 @@ from .managed.runtime import (
     check_host,
     host_output,
     inspected,
+    limited_operation_wait,
     podman,
 )
 from .responses import INTERACTIVE_STREAM_LIMITS, StreamFailure
@@ -84,10 +88,15 @@ _LEVEL_RE = re.compile(r"s0:c(\d+),c(\d+)\Z", re.ASCII)
 _MEM_RE = re.compile(r"[1-9]\d{0,5}[kmgKMG]?\Z", re.ASCII)
 _REL_SEG_RE = re.compile(r"[A-Za-z0-9._@+-]+\Z")
 _TERM_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}\Z")
+_ATTACH_REAP_SECONDS = 2
 _PORT_KEY_RE = re.compile(r"(\d+)/tcp\Z", re.ASCII)
 _PORT_LABEL_RE = re.compile(r"\d+:\d+\Z", re.ASCII)
 _RELAY_MODULE = "relay.py"
 _SESSION_RELAY_MODULE = "session_relay.py"
+_IMAGE_DIGEST_PREFIX = "sha256:"
+_SANDBOX_LABEL = "oc.sandbox"
+_INSTANCE_LABEL = "oc.instance"
+_ROLE_LABEL = "oc.role"
 _RESERVED_INSTANCES = frozenset({
     "agent", "chromium", "chrome", "postgres", "pg", "dind", "home",
     "openai-relay", "openai-home", "relay",
@@ -614,12 +623,12 @@ class SessionBroker:
                 self._listener.close()
         current = threading.current_thread()
         if self._accept_thread is not None and self._accept_thread is not current:
-            self._accept_thread.join(timeout=1.5)
+            self._accept_thread.join(timeout=limited_operation_wait(1.5))
         if self._watch_thread is not None and self._watch_thread is not current:
-            self._watch_thread.join(timeout=1.5)
+            self._watch_thread.join(timeout=limited_operation_wait(1.5))
         with self._lock:
             threads = list(self._clients.values())
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + limited_operation_wait(2)
         for thread in threads:
             if thread is not current:
                 thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -690,6 +699,8 @@ class _SessionJob:
         self.generation = generation
         self.grant = root / "grant"
         self.provider_socket = root / "provider" / "provider.sock"
+        self.ready_path = root / "relay-ready.log"
+        self.ready_fd: int | None = None
         self.proof_file = root / "proof" / "relay"
         self.source_dir = root / "source"
         self.opencode_config = root / "opencode" / "opencode.json"
@@ -697,6 +708,15 @@ class _SessionJob:
         self.lease: relay_mod.Lease | None = None
         self._lifetime_fd: int | None = None
         self._terminal = False
+
+    @contextmanager
+    def relay_ready_log(self):
+        with private_shared_file(self.ready_path) as fd:
+            self.ready_fd = fd
+            try:
+                yield
+            finally:
+                self.ready_fd = None
 
     def prepare(self, config_payload: dict | None = None) -> None:
         self.root.chmod(0o700)
@@ -728,10 +748,12 @@ class _SessionJob:
         active = relay_mod.grant_record(self.incarnation, self.generation, True)
         self.lease = relay_mod.Lease(self.grant, active, deadline_ns)
 
-    def activate(self) -> None:
+    def activate(self, verify=None) -> None:
         with self.lease.fence():
             if self.lease.status() != "pending":
                 raise RuntimeError("session grant is no longer pending")
+            if verify is not None:
+                verify()
             atomic_write(self.grant / "state", self.lease.active_record)
             (self.grant / "state").chmod(0o600)
 
@@ -814,8 +836,8 @@ def _verify_pod_with_containers(spec: dict) -> tuple[str, list[dict]]:
     labels = pod_info.get("Labels") or {}
     if (type(pod_id) is not str or not IMAGE_ID.fullmatch(pod_id)
             or type(labels) is not dict
-            or labels.get("oc.sandbox") != "1"
-            or labels.get("oc.instance") != spec["instance"]):
+            or labels.get(_SANDBOX_LABEL) != "1"
+            or labels.get(_INSTANCE_LABEL) != spec["instance"]):
         raise RuntimeError("Pod failed ownership verification")
     port_label = labels.get("oc.ports", "")
     if type(port_label) is not str:
@@ -855,11 +877,12 @@ def _verify_relay_mounts(details: dict, job: _SessionJob) -> None:
             raise RuntimeError("Relay bind mount failed verification")
 
 
-def _verify_relay_labels(relay_id: str, details: dict, job: _SessionJob) -> None:
-    expected_proc = (details.get("ProcessLabel") or "").encode("ascii")
-    effective_proc = podman("exec", relay_id, "cat", "/proc/self/attr/current").stdout.removesuffix(b"\0")
-    if effective_proc != expected_proc:
-        raise RuntimeError("Unexpected effective relay SELinux process label")
+def _verify_relay_labels(relay_id: str, details: dict, job: _SessionJob, *, prepared=False) -> None:
+    if not prepared:
+        expected_proc = (details.get("ProcessLabel") or "").encode("ascii")
+        effective_proc = podman("exec", relay_id, "cat", "/proc/self/attr/current").stdout.removesuffix(b"\0")
+        if effective_proc != expected_proc:
+            raise RuntimeError("Unexpected effective relay SELinux process label")
     expected_mount = (details.get("MountLabel") or "").encode("ascii")
     paths = (
         job.source_dir,
@@ -902,17 +925,17 @@ def _verify_sibling_mcs(other_containers: list[str], relay_mcs: set[int]) -> Non
 
 
 def _verify_relay_isolation(relay_id: str, relay_image: str, pod_id: str, agent_level: str,
-                            job: _SessionJob, other_containers: list[str]) -> None:
+                            job: _SessionJob, other_containers: list[str], *, prepared=False) -> bytes:
     details = inspected("container", "inspect", relay_id)
     host = details["HostConfig"]
     config = details["Config"]
     relay_mcs = _mcs_pair(details.get("ProcessLabel") or "")
     mount_label = details.get("MountLabel") or ""
-    if (not relay_mcs
+    if ((prepared and details.get("Id") != relay_id) or not relay_mcs
             or not MOUNT_LABEL.fullmatch(mount_label)
             or (details.get("ProcessLabel") or "").split(":", 3)[-1] != mount_label.split(":", 3)[-1]
             or details.get("Pod") != pod_id
-            or details.get("Image", "").removeprefix("sha256:") != relay_image.removeprefix("sha256:")
+            or details.get("Image", "").removeprefix(_IMAGE_DIGEST_PREFIX) != relay_image.removeprefix(_IMAGE_DIGEST_PREFIX)
             or not host.get("ReadonlyRootfs") or host.get("Privileged")
             or host.get("IpcMode") != "private" or host.get("PidMode") != "private"
             or host.get("CgroupMode") != "private" or config.get("User") != "0:0"
@@ -921,9 +944,12 @@ def _verify_relay_isolation(relay_id: str, relay_image: str, pod_id: str, agent_
     agent_match = _LEVEL_RE.fullmatch(agent_level)
     if not agent_match or set(map(int, agent_match.groups())) == relay_mcs:
         raise RuntimeError("Relay MCS collided with agent level")
+    if prepared:
+        _verify_prepared_relay_log(details, job.ready_path)
     _verify_relay_mounts(details, job)
-    _verify_relay_labels(relay_id, details, job)
+    _verify_relay_labels(relay_id, details, job, prepared=prepared)
     _verify_sibling_mcs(other_containers, relay_mcs)
+    return details["ProcessLabel"].encode("ascii")
 
 
 def _remove_container_verified(container_id: str) -> None:
@@ -931,6 +957,46 @@ def _remove_container_verified(container_id: str) -> None:
     exists = podman("container", "exists", container_id, check=False, timeout=4)
     if exists.returncode != 1:
         raise RuntimeError(f"Could not confirm container removal ({container_id[:12]})")
+
+
+def _id_filter(container_id: str) -> str:
+    if not IMAGE_ID.fullmatch(container_id):
+        raise RuntimeError("Invalid full container identity")
+    return f"id=^{container_id}$"
+
+
+def _owned_container_selector(container_id: str, instance: str, name: str, role=None, marker=None):
+    filters = [
+        _id_filter(container_id), "label=oc.sandbox=1", f"label=oc.instance={instance}",
+        f"name=^{re.escape(name)}$",
+    ]
+    if role:
+        filters.append(f"label=oc.role={role}")
+    if marker is not None:
+        filters.append(f"label=oc.session.create={marker}")
+    return tuple(arg for expr in filters for arg in ("--filter", expr))
+
+
+def _filtered_container_exists(container_id: str) -> bool:
+    result = podman("ps", "-a", "--no-trunc", "--filter", _id_filter(container_id),
+                    "--format", "json", check=False, timeout=4)
+    if result.returncode == 0:
+        try:
+            rows = decode_json(result.stdout)
+        except ValueError:
+            raise RuntimeError("Malformed filtered container inventory") from None
+        if rows == []:
+            return False
+        if type(rows) is list and len(rows) == 1 and type(rows[0]) is dict and rows[0].get("Id") == container_id:
+            return True
+    raise RuntimeError("Could not confirm filtered container inventory")
+
+
+def _remove_filtered_container(container_id: str, selector: tuple[str, ...], *, force=False) -> None:
+    args = ("rm", "-f") if force else ("rm",)
+    result = podman(*args, *selector, check=False, timeout=8)
+    if result.returncode != 0 or _filtered_container_exists(container_id):
+        raise RuntimeError("Could not confirm removal by the exact container selector")
 
 
 def _open_instance_lock(state_dir: Path, instance: str):
@@ -979,6 +1045,44 @@ def _wait_relay_bound(relay_id: str, port: int = RELAY_PORT_MIN) -> None:
     raise RuntimeError(f"Interactive provider relay did not bind 127.0.0.1:{port}")
 
 
+def _verify_prepared_relay_log(details: dict, path: Path) -> None:
+    log = details["HostConfig"].get("LogConfig") or {}
+    if log.get("Type") != "k8s-file" or log.get("Path") != str(path) or details["State"].get("Running") is not True:
+        raise RuntimeError("Prepared provider relay log or running state is unverified")
+
+
+def _require_relay_ready_record(job: _SessionJob, process_label: bytes, port: int) -> None:
+    fd = job.ready_fd
+    if fd is None:
+        raise RuntimeError("Missing prepared provider relay readiness file")
+    mac = readiness_mac(job.relay_proof, job.lease.active_record, port, process_label).hex().encode("ascii")
+    expected = b"stdout F " + READY_MARKER + b" " + mac + b"\n"
+    received = os.pread(fd, 257, 0)
+    info = os.fstat(fd)
+    if (
+        len(received) > 256 or received.count(b"\n") != 1 or info.st_size != len(received)
+        or not os.path.samestat(info, job.ready_path.lstat())
+    ):
+        raise RuntimeError("Invalid prepared provider relay readiness")
+    stamp, _, record = received.partition(b" ")
+    if not re.fullmatch(rb"[!-~]+", stamp) or not hmac.compare_digest(record, expected):
+        raise RuntimeError("Invalid prepared provider relay readiness")
+
+
+def _wait_prepared_relay_bound(job: _SessionJob, process_label: bytes, port: int, cancelled) -> None:
+    fd = job.ready_fd
+    if fd is None:
+        raise RuntimeError("Missing prepared provider relay readiness file")
+    deadline = time.monotonic() + limited_operation_wait(8)
+    while time.monotonic() < deadline and not cancelled.is_set() and job.lease.status() == "pending":
+        if os.fstat(fd).st_size:
+            verify_shared_file(job.ready_path, fd)
+            _require_relay_ready_record(job, process_label, port)
+            return
+        cancelled.wait(0.05)
+    raise RuntimeError("Prepared provider relay did not confirm readiness")
+
+
 def _valid_sandbox_path(path: str) -> bool:
     if not path.startswith("/") or any(ch in path for ch in ":, \t\r\n\x00"):
         return False
@@ -1015,6 +1119,15 @@ def _validate_spec_options(spec: dict) -> dict:
     return normalized
 
 
+def _validate_session_instance(instance: str) -> None:
+    if (
+        not _INSTANCE_NAME.fullmatch(instance)
+        or instance in _RESERVED_INSTANCES
+        or _RELAY_INSTANCE_RE.fullmatch(instance) is not None
+    ):
+        raise ValueError("Malformed instance name")
+
+
 def _validate_spec(spec: dict) -> dict:
     if (
         type(spec) is not dict
@@ -1023,12 +1136,7 @@ def _validate_spec(spec: dict) -> dict:
     ):
         raise ValueError("Invalid launch spec")
     instance = spec["instance"]
-    if (
-        not _INSTANCE_NAME.fullmatch(instance)
-        or instance in _RESERVED_INSTANCES
-        or _RELAY_INSTANCE_RE.fullmatch(instance) is not None
-    ):
-        raise ValueError("Malformed instance name")
+    _validate_session_instance(instance)
     expected_pod = "oc" if instance == "default" else f"oc-{instance}"
     level_match = _LEVEL_RE.fullmatch(spec["level"])
     level_ok = level_match is not None and len(set(map(int, level_match.groups()))) == 2
@@ -1077,7 +1185,8 @@ def _inspect_existing_container(cname: str) -> dict | None:
 
 
 def _verify_stopped_container_owner(
-    details: dict, cname: str, instance: str, expected_roles: tuple[str | None, ...]
+    details: dict, cname: str, instance: str, expected_roles: tuple[str | None, ...],
+    *, expected_pod: str | None = None, expected_id: str | None = None,
 ) -> str:
     cid = details.get("Id") or ""
     state = details.get("State") or {}
@@ -1086,28 +1195,94 @@ def _verify_stopped_container_owner(
         raise RuntimeError(f"Malformed inspect metadata for container {cname}")
     if state.get("Running") is True or state.get("Status") in ("running", "paused", "restarting", "stopping"):
         raise RuntimeError(f"Container {cname} is already running")
-    role = labels.get("oc.role")
+    role = labels.get(_ROLE_LABEL)
     normalized_role = None if role in (None, "") else role
     if (type(cid) is not str or not IMAGE_ID.fullmatch(cid)
-            or labels.get("oc.sandbox") != "1"
-            or labels.get("oc.instance") != instance
-            or normalized_role not in expected_roles):
+            or labels.get(_SANDBOX_LABEL) != "1"
+            or labels.get(_INSTANCE_LABEL) != instance
+            or normalized_role not in expected_roles
+            or (expected_pod is not None and details.get("Pod") != expected_pod)
+            or (expected_pod is not None and state.get("Status") not in {
+                "exited", "stopped", "created", "configured", "initialized",
+            })
+            or (expected_id is not None and cid != expected_id)):
         raise RuntimeError(f"Refusing to remove unowned stopped container {cname}")
     return cid
 
 
 def _ensure_single_container_idle(
-    cname: str, instance: str, expected_roles: tuple[str | None, ...]
+    cname: str, instance: str, expected_roles: tuple[str | None, ...],
+    *, expected_pod: str | None = None,
 ) -> None:
     details = _inspect_existing_container(cname)
     if details is None:
         return
-    cid = _verify_stopped_container_owner(details, cname, instance, expected_roles)
-    _remove_stopped_owned_container(cid)
+    cid = _verify_stopped_container_owner(details, cname, instance, expected_roles, expected_pod=expected_pod)
+    _remove_verified_predecessor(details, cid, instance, cname, expected_pod)
+
+
+def _remove_verified_predecessor(details, cid, instance, name, expected_pod):
+    if expected_pod is None:
+        _remove_stopped_owned_container(cid)
+        return
+    actual_name = (details.get("Name") or "").lstrip("/")
+    if actual_name != name:
+        raise RuntimeError("Stopped container name changed before removal")
+    role = details["Config"]["Labels"].get(_ROLE_LABEL)
+    _remove_filtered_container(cid, _owned_container_selector(cid, instance, name, role))
+
+
+def _prepared_create_args(args: list[str], spec: dict) -> tuple[list[str], str | None]:
+    if "_prepared_pod" not in spec:
+        return args, None
+    marker = secrets.token_hex(16)
+    return [args[0], "--label", f"oc.session.create={marker}", *args[1:]], marker
+
+
+@dataclass(frozen=True)
+class _PreparedCreateReceipt:
+    container_id: str
+    instance: str
+    pod_id: str
+    name: str
+    role: str | None
+    image: str
+    marker: str
+
+    @property
+    def selector(self) -> tuple[str, ...]:
+        return _owned_container_selector(self.container_id, self.instance, self.name, self.role, self.marker)
+
+
+def _inspect_prepared_identity(receipt: _PreparedCreateReceipt) -> dict:
+    details = inspected("container", "inspect", receipt.container_id)
+    name_on_host = details.get("Name")
+    image_on_host = details.get("Image")
+    labels = (details.get("Config") or {}).get("Labels") or {}
+    role = labels.get(_ROLE_LABEL) if isinstance(labels, dict) else None
+    if (
+        details.get("Id") != receipt.container_id or details.get("Pod") != receipt.pod_id
+        or type(name_on_host) is not str or name_on_host.lstrip("/") != receipt.name
+        or type(image_on_host) is not str or image_on_host.removeprefix(_IMAGE_DIGEST_PREFIX) != receipt.image
+        or type(labels) is not dict or labels.get(_SANDBOX_LABEL) != "1"
+        or labels.get(_INSTANCE_LABEL) != receipt.instance or (role or None) != receipt.role
+        or labels.get("oc.session.create") != receipt.marker
+    ):
+        raise RuntimeError("Created container failed placement and ownership verification")
+    return details
+
+
+def _verify_prepared_create(receipt: _PreparedCreateReceipt) -> None:
+    details = _inspect_prepared_identity(receipt)
+    _verify_stopped_container_owner(
+        details, receipt.name, receipt.instance, (receipt.role,),
+        expected_pod=receipt.pod_id, expected_id=receipt.container_id,
+    )
 
 
 def _ensure_pod_attached_idle(
-    pod_containers: list[dict], instance: str, sidecar_names: set[str]
+    pod_containers: list[dict], instance: str, sidecar_names: set[str],
+    *, expected_pod: str | None = None,
 ) -> None:
     for entry in pod_containers:
         cid = entry.get("Id")
@@ -1121,9 +1296,10 @@ def _ensure_pod_attached_idle(
         if actual_name in sidecar_names:
             continue
         verified_id = _verify_stopped_container_owner(
-            details, actual_name or cname, instance, (None, "openai-relay", "provider-relay")
+            details, actual_name or cname, instance, (None, "openai-relay", "provider-relay"),
+            expected_pod=expected_pod, expected_id=cid if expected_pod is not None else None,
         )
-        _remove_stopped_owned_container(verified_id)
+        _remove_verified_predecessor(details, verified_id, instance, actual_name or cname, expected_pod)
 
 
 def _ensure_containers_idle(
@@ -1134,13 +1310,14 @@ def _ensure_containers_idle(
     extra_relays: tuple[str, ...] = (),
     pod_containers: list[dict] | None = None,
     sidecar_names: set[str] | None = None,
+    expected_pod: str | None = None,
 ) -> None:
     if pod_containers:
-        _ensure_pod_attached_idle(pod_containers, instance, sidecar_names or set())
-    _ensure_single_container_idle(agent_name, instance, (None,))
-    _ensure_single_container_idle(relay_name, instance, ("openai-relay",))
+        _ensure_pod_attached_idle(pod_containers, instance, sidecar_names or set(), expected_pod=expected_pod)
+    _ensure_single_container_idle(agent_name, instance, (None,), expected_pod=expected_pod)
+    _ensure_single_container_idle(relay_name, instance, ("openai-relay",), expected_pod=expected_pod)
     for slot_relay in extra_relays:
-        _ensure_single_container_idle(slot_relay, instance, ("provider-relay",))
+        _ensure_single_container_idle(slot_relay, instance, ("provider-relay",), expected_pod=expected_pod)
 
 
 def _build_relay_args(
@@ -1167,11 +1344,17 @@ def _build_relay_args(
             "--label", f"oc.provider={provider_label}",
         ]
         port_args = [str(port), "--defer-bind"] if defer_bind else [str(port)]
+    log_args = ["--log-driver=none"]
+    if "_prepared_pod" in spec:
+        if defer_bind:
+            raise ValueError("Prepared relay readiness requires listen while pending")
+        port_args = [str(port), "--verify-ready"]
+        log_args = ["--log-driver=k8s-file", "--log-opt", f"path={job.ready_path}", "--log-opt", "max-size=64kb"]
     return [
-        "create", "--pull=never", "--name", relay_name, "--pod", spec["pod"],
+        "create", "--pull=never", "--name", relay_name, "--pod", spec.get("_prepared_pod", spec["pod"]),
         "--label", "oc.sandbox=1", "--label", f"oc.instance={spec['instance']}",
         *role_labels,
-        "--http-proxy=false", "--image-volume=ignore", "--log-driver=none", "--restart=no",
+        "--http-proxy=false", "--image-volume=ignore", *log_args, "--restart=no",
         "--user=0:0", "--ipc=private", "--pid=private", "--cgroupns=private",
         "--cap-drop=ALL", "--security-opt=no-new-privileges",
         "--read-only", "--pids-limit=64", "--memory=128m", "--memory-swap=128m",
@@ -1196,7 +1379,8 @@ def _build_agent_args(
         raise ValueError("Invalid ui_mode")
     config_path = config_source.opencode_config if isinstance(config_source, _SessionJob) else Path(config_source)
     args = [
-        "create", "-it", "--rm", "--pull=never", "--name", spec["agent"], "--pod", spec["pod"],
+        "create", "-it", "--rm", "--pull=never", "--name", spec["agent"],
+        "--pod", spec.get("_prepared_pod", spec["pod"]),
         "--label", "oc.sandbox=1", "--label", f"oc.instance={spec['instance']}",
         "--label", f"oc.provider={provider_label}",
         "--label", f"oc.ui_mode={ui_mode}",
@@ -1239,7 +1423,49 @@ def _sanitized_term() -> str:
     return raw if _TERM_RE.fullmatch(raw) else "xterm-256color"
 
 
-def _launch_agent_tty(agent_id: str, stop_event: threading.Event) -> int:
+class _AgentTransportUnverified(JobRuntimeError):
+    """The owned local attach process could not be reaped."""
+
+
+class _AgentAttachUnverified(JobRuntimeError):
+    """The reaped transport supplied no positive attached-selection evidence."""
+
+
+def _reap_agent_transport(child: subprocess.Popen) -> int:
+    try:
+        try:
+            return child.wait(timeout=_ATTACH_REAP_SECONDS)
+        except subprocess.TimeoutExpired:
+            with suppress(OSError):
+                child.kill()
+            return child.wait(timeout=_ATTACH_REAP_SECONDS)
+    except (subprocess.TimeoutExpired, OSError):
+        raise _AgentTransportUnverified("Could not reap the managed worker attach transport.") from None
+
+
+def _cancel_agent_attach(child: subprocess.Popen, selector: tuple[str, ...]) -> int:
+    with suppress(OSError):
+        child.terminate()
+    try:
+        stopped = podman("stop", "-t", "2", *selector, check=False, timeout=6)
+    finally:
+        status = _reap_agent_transport(child)
+    if stopped.returncode != 0:
+        raise JobRuntimeError("Podman did not confirm worker stop")
+    return status
+
+
+def _poll_agent_exit(child: subprocess.Popen, stop_event: threading.Event) -> int | None:
+    while (status := child.poll()) is None:
+        if stop_event.wait(0.2):
+            return None
+    return status
+
+
+def _launch_agent_tty(
+    agent_id: str, stop_event: threading.Event, *, container_selector: tuple[str, ...] | None = None,
+    attach_evidence=None,
+) -> int:
     uid = os.getuid()
     runtime_dir = f"/run/user/{uid}"
     home_dir = str(account_home())
@@ -1257,20 +1483,35 @@ def _launch_agent_tty(agent_id: str, stop_event: threading.Event) -> int:
         "TERM": term,
         "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/host{runtime_dir}/bus",
     }
+    if attach_evidence is not None:
+        host_env.update(attach_evidence.variables)
+    selector = container_selector if container_selector is not None else (agent_id,)
+    options = () if attach_evidence is None else attach_evidence.options
     cmd = [
         HOST_SPAWN, "--env=", "/usr/bin/env", "-i",
         *(f"{k}={v}" for k, v in host_env.items()),
         "/usr/bin/podman", "--remote=false", "--default-mounts-file=/dev/null",
-        "start", "-ai", agent_id,
+        *options, "start", "-ai", *selector,
     ]
+    if stop_event.is_set():
+        raise ConnectionError("connection_retired")
     child_proc = subprocess.Popen(cmd, env=spawn_env)
-    while child_proc.poll() is None:
-        if stop_event.wait(0.2):
-            with suppress(OSError):
-                child_proc.terminate()
-            podman("stop", "-t", "2", agent_id, check=False, timeout=6)
-            break
-    return child_proc.wait()
+    try:
+        status = _poll_agent_exit(child_proc, stop_event)
+    except KeyboardInterrupt:
+        _cancel_agent_attach(child_proc, selector)
+        raise
+    if status is None:
+        cancelled_status = _cancel_agent_attach(child_proc, selector)
+        if cancelled_status == 0 and attach_evidence is not None:
+            raise ConnectionError("connection_retired")
+        return cancelled_status
+    if status == 0 and attach_evidence is not None:
+        try:
+            attach_evidence.verify()
+        except (ValueError, OSError, JobRuntimeError):
+            raise _AgentAttachUnverified("Could not verify the attached worker selection.") from None
+    return status
 
 
 class _SlotState:
@@ -1299,8 +1540,12 @@ class _SessionSlotCoordinator:
         self._slot_root_fds: dict[Path, tuple[int, int]] = {}
         self._created_containers: list[str] = []
         self._removed_containers: set[str] = set()
+        self._pending_creates: dict[_PreparedCreateReceipt, int | None] = {}
+        self._verified_creates: dict[str, _PreparedCreateReceipt] = {}
         self._retire_threads: list[threading.Thread] = []
         self._cleanup_error: Exception | None = None
+        self.guarded_creation = False
+        self.prepared_scope = False
 
     def _close_slot_root_fd(self, slot_root: Path) -> None:
         fds = self._slot_root_fds.pop(slot_root, None)
@@ -1387,7 +1632,7 @@ class _SessionSlotCoordinator:
     def begin_relay_create(self, slot_index: int) -> bool:
         with self._lock:
             state = self._slots.get(slot_index)
-            if state is None or state.retiring:
+            if state is None or state.retiring or (self.guarded_creation and self._stop_event.is_set()):
                 return False
             state.creating_relay = True
             if state.handle.mark_relay_created is not None:
@@ -1411,6 +1656,49 @@ class _SessionSlotCoordinator:
                     "Podman relay create did not complete with a verified container ID"
                 )
             return False
+
+    def verify_create_receipt(self, receipt: _PreparedCreateReceipt, *, slot_index: int | None = None) -> None:
+        with self._lock:
+            self._pending_creates[receipt] = slot_index
+        _verify_prepared_create(receipt)
+        with self._lock:
+            del self._pending_creates[receipt]
+            self._verified_creates[receipt.container_id] = receipt
+
+    def _recover_pending_creates(self) -> None:
+        # The guarded create may return a full ID just as its budget is cancelled.
+        # Retry only read-only inspection with the separate cleanup budget.
+        with self._lock:
+            pending = tuple(self._pending_creates.items())
+        for receipt, slot_index in pending:
+            try:
+                _verify_prepared_create(receipt)
+            except Exception as exc:
+                self._record_error(exc)
+                if slot_index is not None:
+                    self.finish_relay_create(slot_index, None)
+                continue
+            with self._lock:
+                del self._pending_creates[receipt]
+                self._verified_creates[receipt.container_id] = receipt
+            if slot_index is None:
+                self.record_container(receipt.container_id)
+            else:
+                self.finish_relay_create(slot_index, receipt.container_id)
+
+    def verified_receipt(self, container_id: str) -> _PreparedCreateReceipt | None:
+        with self._lock:
+            return self._verified_creates.get(container_id)
+
+    def remove_created_container(self, container_id: str) -> None:
+        receipt = self.verified_receipt(container_id)
+        if receipt is None:
+            if self.prepared_scope:
+                raise RuntimeError("Prepared cleanup is missing the verified create receipt")
+            _remove_container_verified(container_id)
+        elif _filtered_container_exists(container_id):
+            _inspect_prepared_identity(receipt)
+            _remove_filtered_container(container_id, receipt.selector, force=True)
 
     def record_container(self, container_id: str, *, slot_index: int | None = None) -> bool:
         with self._lock:
@@ -1464,7 +1752,7 @@ class _SessionSlotCoordinator:
         relay_removed = True
         if relay_id is not None:
             try:
-                _remove_container_verified(relay_id)
+                self.remove_created_container(relay_id)
                 with self._lock:
                     self._removed_containers.add(relay_id)
                 if state.handle.confirm_relay_removed is not None:
@@ -1485,6 +1773,11 @@ class _SessionSlotCoordinator:
 
     def _start_slot_retirement(self, slot_index: int, *, stop_if_last: bool) -> None:
         with self._lock:
+            if self.guarded_creation:
+                # Before attach, cancel instead of starting effects in another thread
+                # that could outlive the launcher's bounded lifecycle guard.
+                self._stop_event.set()
+                return
             state = self._slots.get(slot_index)
             if state is None:
                 self._pre_revoked.add(slot_index)
@@ -1532,7 +1825,7 @@ class _SessionSlotCoordinator:
 
     def _remove_leftover_container(self, cid: str, slot: _SlotState | None) -> None:
         try:
-            _remove_container_verified(cid)
+            self.remove_created_container(cid)
             with self._lock:
                 self._removed_containers.add(cid)
             if slot is None:
@@ -1554,6 +1847,8 @@ class _SessionSlotCoordinator:
                 if not s.exited and s.relay_id is None and not s.creating_relay
             ]
         for slot in unexited:
+            if not limited_operation_wait(1):
+                break
             with self._lock:
                 if slot.exited:
                     continue
@@ -1568,9 +1863,10 @@ class _SessionSlotCoordinator:
             self._record_error(RuntimeError("Slot relay state remained unconfirmed during teardown"))
 
     def teardown_all(self, agent_id: str | None) -> Exception | None:
+        self._recover_pending_creates()
         if agent_id is not None:
             try:
-                _remove_container_verified(agent_id)
+                self.remove_created_container(agent_id)
                 with self._lock:
                     self._removed_containers.add(agent_id)
             except Exception as exc:
@@ -1583,17 +1879,23 @@ class _SessionSlotCoordinator:
                 state.retiring = True
 
         for thread in threads:
-            thread.join(timeout=15)
+            thread.join(timeout=limited_operation_wait(15))
             if thread.is_alive():
                 self._record_error(RuntimeError(f"Slot retirement thread '{thread.name}' did not finish"))
 
         for state in remaining_slots:
+            if not limited_operation_wait(1):
+                self._record_error(RuntimeError("Provider session cleanup deadline expired"))
+                break
             self._finish_slot_retirement(state)
 
         with self._lock:
             leftover = [cid for cid in self._created_containers if cid not in self._removed_containers]
             slots_by_relay = {state.relay_id: state for state in self._slots.values() if state.relay_id is not None}
         for cid in reversed(leftover):
+            if not limited_operation_wait(1):
+                self._record_error(RuntimeError("Provider session cleanup deadline expired"))
+                break
             self._remove_leftover_container(cid, slots_by_relay.get(cid))
 
         self._exit_uncreated_slots()
@@ -1624,32 +1926,41 @@ def _start_slot_relay_deferred(
     """Create, start, and verify a deferred-bind relay before activation or TCP bind."""
     if not coordinator.begin_relay_create(handle.slot_index):
         raise ConnectionError("connection_retired")
+    receipt = None
     try:
-        res = podman(*handle.build_relay_args(spec), check=False)
+        args, marker = _prepared_create_args(handle.build_relay_args(spec), spec)
+        res = podman(*args, check=False)
+        if res.returncode != 0:
+            raise JobRuntimeError(f"Podman create failed ({res.returncode})")
+        relay_id = res.stdout.decode("ascii").strip()
+        if not IMAGE_ID.fullmatch(relay_id):
+            raise RuntimeError("Podman did not return a complete relay container ID")
+        if marker is not None:
+            receipt = _PreparedCreateReceipt(
+                relay_id, spec["instance"], spec["_prepared_pod"], f"{spec['pod']}-relay-{handle.slot_index}",
+                "provider-relay", spec["relay_image"], marker,
+            )
+            coordinator.verify_create_receipt(receipt, slot_index=handle.slot_index)
     except BaseException:
-        # Host create outcome is unknown (timeout / lost ack / interrupt): retain lease and grant dir.
-        coordinator.finish_relay_create(handle.slot_index, None)
+        # A lost or unverified receipt cannot confer permission to start or remove the ID.
+        # Retain the lease and grant directory for a host-side outcome that may still exist.
+        if receipt is None:
+            coordinator.finish_relay_create(handle.slot_index, None)
         raise
-    if res.returncode != 0:
-        # Return code comes from the host-spawn wrapper and does not prove the host-side
-        # podman create finished; retain durable lease and grant dir without trusting name absence.
-        coordinator.finish_relay_create(handle.slot_index, None)
-        raise JobRuntimeError(f"Podman create failed ({res.returncode})")
-    relay_id = res.stdout.decode("ascii").strip()
-    if not IMAGE_ID.fullmatch(relay_id):
-        coordinator.finish_relay_create(handle.slot_index, None)
-        raise RuntimeError("Podman did not return a complete relay container ID")
     if not coordinator.finish_relay_create(handle.slot_index, relay_id):
         raise ConnectionError("connection_retired")
-    podman("start", relay_id)
-    _verify_relay_isolation(
+    _start_verified_relay(relay_id, receipt)
+    process_label = _verify_relay_isolation(
         relay_id,
         spec["relay_image"],
         pod_id,
         spec["level"],
         handle.job,
         [*siblings, *started_relay_ids],
+        **({"prepared": True} if receipt is not None else {}),
     )
+    if receipt is not None:
+        _wait_prepared_relay_bound(handle.job, process_label, handle.port, stop_event)
     if (
         stop_event.is_set()
         or handle.broker._revoked.is_set()
@@ -1658,6 +1969,40 @@ def _start_slot_relay_deferred(
     ):
         raise ConnectionError("connection_retired")
     return relay_id
+
+
+def _start_verified_relay(relay_id: str, receipt: _PreparedCreateReceipt | None) -> None:
+    if receipt is None:
+        podman("start", relay_id)
+        return
+    _verify_prepared_create(receipt)
+    started = podman("start", *receipt.selector)
+    if started.stdout.splitlines() != [relay_id.encode("ascii")]:
+        raise RuntimeError("Podman did not confirm the verified relay start")
+
+
+def _check_relay_activation(handle: SlotHandle, stop_event: threading.Event) -> None:
+    if (
+        stop_event.is_set()
+        or handle.broker._revoked.is_set()
+        or handle.job.lease.status() != "pending"
+        or time.monotonic_ns() >= handle.job.lease.deadline_ns
+    ):
+        raise ConnectionError("connection_retired")
+
+
+def _activate_prepared_relay(handle: SlotHandle, receipt: _PreparedCreateReceipt, stop_event) -> None:
+    job = handle.job
+    details = _inspect_prepared_identity(receipt)
+    _verify_prepared_relay_log(details, job.ready_path)
+    verify_shared_file(job.ready_path, job.ready_fd)
+    process_label = details["ProcessLabel"].encode("ascii")
+
+    def verify():
+        _require_relay_ready_record(job, process_label, handle.port)
+        _check_relay_activation(handle, stop_event)
+
+    job.activate(verify)
 
 
 def _start_and_verify_slot_relay(
@@ -1669,18 +2014,21 @@ def _start_and_verify_slot_relay(
     started_relay_ids: list[str],
     stop_event: threading.Event,
 ) -> str:
-    relay_id = _start_slot_relay_deferred(
-        spec, pod_id, handle, coordinator, siblings, started_relay_ids, stop_event,
-    )
-    _wait_relay_bound(relay_id, port=handle.port)
-    if (
-        stop_event.is_set()
-        or handle.broker._revoked.is_set()
-        or handle.job.lease.status() != "pending"
-        or time.monotonic_ns() >= handle.job.lease.deadline_ns
-    ):
-        raise ConnectionError("connection_retired")
-    handle.job.activate()
+    prepared = "_prepared_pod" in spec
+    guard = handle.job.relay_ready_log() if prepared else nullcontext()
+    with guard:
+        relay_id = _start_slot_relay_deferred(
+            spec, pod_id, handle, coordinator, siblings, started_relay_ids, stop_event,
+        )
+        if prepared:
+            receipt = coordinator.verified_receipt(relay_id)
+            if receipt is None:
+                raise RuntimeError("Prepared relay has no verified create receipt")
+            _activate_prepared_relay(handle, receipt, stop_event)
+        else:
+            _wait_relay_bound(relay_id, port=handle.port)
+            _check_relay_activation(handle, stop_event)
+            handle.job.activate()
     return relay_id
 
 
@@ -1892,11 +2240,23 @@ def _start_session_agent(
         else "multi"
     )
     _notify_slot_begin(proof_options, "agent", container_name=spec["agent"])
-    agent_id = podman(
-        *_build_agent_args(spec, config_path, ui_mode=plan.ui_mode, provider_label=provider_label)
-    ).stdout.decode("ascii").strip()
-    if not IMAGE_ID.fullmatch(agent_id):
-        raise RuntimeError("Podman did not return a complete agent container ID")
+    receipt = None
+    try:
+        args, marker = _prepared_create_args(
+            _build_agent_args(spec, config_path, ui_mode=plan.ui_mode, provider_label=provider_label), spec,
+        )
+        agent_id = podman(*args).stdout.decode("ascii").strip()
+        if not IMAGE_ID.fullmatch(agent_id):
+            raise RuntimeError("Podman did not return a complete agent container ID")
+        if marker is not None:
+            receipt = _PreparedCreateReceipt(
+                agent_id, spec["instance"], spec["_prepared_pod"], spec["agent"], None, spec["agent_image"], marker,
+            )
+            coordinator.verify_create_receipt(receipt)
+    except Exception:
+        if "_prepared_pod" in spec and receipt is None:
+            coordinator._record_error(RuntimeError("Podman worker create outcome is unverified"))
+        raise
     coordinator.record_container(agent_id)
     _notify_slot_finish(proof_options, "agent", agent_id)
     return agent_id
@@ -1946,6 +2306,48 @@ def _finalize_session_teardown(
     return True
 
 
+def _spec_for_verified_pod(spec, pod_id, prepared_pod):
+    if prepared_pod is None:
+        return spec
+    if pod_id != prepared_pod:
+        raise LaunchRefusedError("prepared_pod_changed", "The prepared pod changed. Start a fresh launch.")
+    return {**spec, "_prepared_pod": prepared_pod}
+
+
+def _release_session_creation_guard(coordinator, stop_event, cleanup_state):
+    created = cleanup_state.get("created")
+    if created is not None:
+        created()
+        with coordinator._lock:
+            coordinator.guarded_creation = False
+        checkpoint = cleanup_state["checkpoint"]
+        checkpoint()
+        if stop_event.is_set():
+            raise ConnectionError("connection_retired")
+
+
+def _attach_session_worker(agent_id, coordinator, stop_event, root, cleanup_state, cutover):
+    proof_options = cleanup_state.get("proof_options")
+    if stop_event.is_set() or not coordinator.any_active():
+        raise ConnectionError("connection_retired")
+    if proof_options is not None and proof_options.agent_runner is not None:
+        _release_session_creation_guard(coordinator, stop_event, cleanup_state)
+        return proof_options.agent_runner(agent_id, stop_event, cutover.arm_turn_route)
+    try:
+        if cleanup_state.get("prepared_pod") is None:
+            return _launch_agent_tty(agent_id, stop_event)
+        receipt = coordinator.verified_receipt(agent_id)
+        if receipt is None:
+            raise RuntimeError("Prepared worker has no verified launch receipt")
+        with filtered_attach_evidence(root, agent_id) as evidence:
+            _verify_prepared_create(receipt)
+            _release_session_creation_guard(coordinator, stop_event, cleanup_state)
+            return _launch_agent_tty(agent_id, stop_event, container_selector=receipt.selector, attach_evidence=evidence)
+    except _AgentTransportUnverified as error:
+        coordinator._record_error(error)
+        raise
+
+
 def _run_multi_slot_session(
     spec: dict,
     plan,
@@ -1957,11 +2359,20 @@ def _run_multi_slot_session(
 ) -> int:
     coordinator = _SessionSlotCoordinator(stop_event)
     proof_options = cleanup_state.get("proof_options")
+    prepared_pod = cleanup_state.get("prepared_pod")
+    if prepared_pod is not None:
+        coordinator.guarded_creation = True
+        coordinator.prepared_scope = True
+    checkpoint = cleanup_state.get("checkpoint") or (lambda: None)
+    before_lease = cleanup_state.get("before_lease") or (lambda: None)
+    cleanup_budget = cleanup_state.get("cleanup_budget") or nullcontext
     cutover: _ProofTurnCutover | None = None
     agent_id: str | None = None
     rc = 1
     try:
+        checkpoint()
         pod_id, pod_containers = _verify_pod_with_containers(spec)
+        spec = _spec_for_verified_pod(spec, pod_id, prepared_pod)
         slot_ports = {item.spec.scoped_id: RELAY_PORT_MIN + idx for idx, item in enumerate(plan.admitted)}
         slot_tokens = {item.spec.scoped_id: secrets.token_urlsafe(32) for item in plan.admitted}
         slot_names = [f"{spec['pod']}-relay-{idx}" for idx in range(len(plan.admitted))]
@@ -1974,9 +2385,11 @@ def _run_multi_slot_session(
         config_path = _write_session_opencode_config(root, config_payload)
 
         sidecars = [name for name in (spec["chromium"], spec["postgres"], spec["dind"]) if name]
+        checkpoint()
         _ensure_containers_idle(
             spec["agent"], spec["relay"], spec["instance"],
             extra_relays=tuple(slot_names), pod_containers=pod_containers, sidecar_names=set(sidecars),
+            **({"expected_pod": prepared_pod} if prepared_pod is not None else {}),
         )
 
         started_relay_ids: list[str] = []
@@ -2000,23 +2413,23 @@ def _run_multi_slot_session(
             "slot_tokens": slot_tokens,
         }
         for idx, item in enumerate(plan.admitted):
+            checkpoint()
+            before_lease()
+            checkpoint()
             _open_single_admitted_slot(idx, item, session_ctx)
 
+        checkpoint()
         if stop_event.is_set() or not coordinator.any_active():
             raise ConnectionError("connection_retired")
         agent_id = _start_session_agent(spec, plan, config_path, coordinator, proof_options)
 
-        if stop_event.is_set() or not coordinator.any_active():
-            raise ConnectionError("connection_retired")
-        if proof_options is not None and proof_options.agent_runner is not None:
-            rc = proof_options.agent_runner(agent_id, stop_event, cutover.arm_turn_route)
-        else:
-            rc = _launch_agent_tty(agent_id, stop_event)
+        rc = _attach_session_worker(agent_id, coordinator, stop_event, root, cleanup_state, cutover)
     finally:
-        if not _finalize_session_teardown(
-            coordinator, agent_id, cutover, proof_options, cleanup_state, root, terminal,
-        ):
-            rc = 1
+        with cleanup_budget():
+            if not _finalize_session_teardown(
+                coordinator, agent_id, cutover, proof_options, cleanup_state, root, terminal,
+            ):
+                rc = 1
     return rc
 
 
@@ -2120,6 +2533,19 @@ def _resolve_adapters_and_lock_dir(
     return adapters, (lock_dir if lock_dir is not None else make_backend()._state)
 
 
+def _qualify_session(terminal: StreamTerminal) -> int:
+    if not terminal.attended():
+        terminal.error("An attended foreground workstation terminal is required for managed provider sessions.")
+        return 2
+    try:
+        check_devbox()
+        check_host()
+    except Exception:
+        terminal.error("Interactive managed provider sessions require the qualified devbox host with SELinux enforcing.")
+        return 1
+    return 0
+
+
 def run_interactive_session(
     spec: dict,
     terminal: StreamTerminal,
@@ -2131,15 +2557,9 @@ def run_interactive_session(
 ) -> int:
     """Supervise one interactive multi-provider oc-sandbox OpenCode session."""
     spec = _validate_spec(spec)
-    if not terminal.attended():
-        terminal.error("An attended foreground workstation terminal is required for managed provider sessions.")
-        return 2
-    try:
-        check_devbox()
-        check_host()
-    except Exception:
-        terminal.error("Interactive managed provider sessions require the qualified devbox host with SELinux enforcing.")
-        return 1
+    qualification_error = _qualify_session(terminal)
+    if qualification_error:
+        return qualification_error
 
     try:
         config, live_config_digest = _load_session_config(config_dir, proof_options)
@@ -2155,8 +2575,27 @@ def run_interactive_session(
     except Exception as error:
         return _report_session_error(terminal, error)
 
+    stop_event = threading.Event()
+    prev_term = signal.signal(signal.SIGTERM, lambda _s, _f: stop_event.set())
+    prev_hup = signal.signal(signal.SIGHUP, lambda _s, _f: stop_event.set())
     try:
-        instance_lock_fd = _open_instance_lock(resolved_lock_dir, spec["instance"])
+        return _run_admitted_session(
+            spec, plan, active_adapters, resolved_lock_dir, terminal, proof_options,
+            stop_event=stop_event,
+        )
+    finally:
+        signal.signal(signal.SIGTERM, prev_term)
+        signal.signal(signal.SIGHUP, prev_hup)
+
+
+def _run_admitted_session(
+    spec, plan, adapters, lock_dir, terminal, proof_options, *,
+    stop_event, prepared_pod=None, checkpoint=None, before_lease=None, created=None, cleanup_budget=None,
+):
+    try:
+        if checkpoint is not None:
+            checkpoint()
+        instance_lock_fd = _open_instance_lock(lock_dir, spec["instance"])
     except BlockingIOError:
         terminal.error(f"Instance '{spec['instance']}' already has an active provider session launch.")
         return 1
@@ -2164,29 +2603,29 @@ def run_interactive_session(
         terminal.error(f"Could not acquire instance session lock: {error}")
         return 1
 
-    root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir=SHARED_TMP))
     owner_removes_session_root = proof_options is not None and proof_options.on_session_root_created is not None
-    stop_event = threading.Event()
-    prev_term = signal.signal(signal.SIGTERM, lambda _s, _f: stop_event.set())
-    prev_hup = signal.signal(signal.SIGHUP, lambda _s, _f: stop_event.set())
+    root = None
     rc = 1
-    cleanup_state = {"clean": False, "proof_options": proof_options}
+    cleanup_state = {
+        "clean": False, "proof_options": proof_options, "prepared_pod": prepared_pod,
+        "checkpoint": checkpoint, "before_lease": before_lease,
+        "created": created, "cleanup_budget": cleanup_budget,
+    }
     try:
+        root = Path(tempfile.mkdtemp(prefix="oc-chat-", dir=SHARED_TMP))
         if owner_removes_session_root:
             proof_options.on_session_root_created(str(root))
         rc = _run_multi_slot_session(
-            spec, plan, active_adapters, root, stop_event, terminal, cleanup_state,
+            spec, plan, adapters, root, stop_event, terminal, cleanup_state,
         )
     except KeyboardInterrupt:
         rc = 130
     except Exception as error:
         return _report_session_error(terminal, error)
     finally:
-        signal.signal(signal.SIGTERM, prev_term)
-        signal.signal(signal.SIGHUP, prev_hup)
         with suppress(OSError):
             os.close(instance_lock_fd)
-        if cleanup_state["clean"] and not owner_removes_session_root:
+        if root is not None and cleanup_state["clean"] and not owner_removes_session_root:
             with suppress(OSError):
                 shutil.rmtree(root)
     return rc

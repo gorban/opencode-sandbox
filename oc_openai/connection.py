@@ -933,9 +933,11 @@ class Connection:
             self._current(binding)(self._store.read(directory))
             yield
 
-    def models(self, binding):
-        access = self._refresh(binding)
-        with self._operation(binding.generation, self._current(binding)) as cancellation:
+    def models(self, binding, *, deadline=None, cancelled=None):
+        access = self._refresh(binding, deadline=deadline, cancelled=cancelled)
+        with self._operation(
+            binding.generation, self._current(binding), deadline=deadline, cancelled=cancelled
+        ) as cancellation:
             return self._models(binding, access, cancellation)
 
     @contextlib.contextmanager
