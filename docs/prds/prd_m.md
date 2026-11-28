@@ -25,7 +25,8 @@ a cohesive, zero-trust multi-model control plane covering three tightly linked a
    parallel Codex implementors each paired with an adversarial Claude reviewer), and host-enrolled
    external top-level peer streams, all addressed unambiguously as `"NAME"` (local),
    `"REMOTE / NAME"` (remote), or `"@PEER"` (external harness).
-3. **Shared SvelteKit control plane (hardened loopback web first, then Tauri v2)**
+3. **Shared SvelteKit control plane (Tauri v2 or hardened loopback web, in the order the
+   [control-plane decision](#control-plane-decision) sets)**
    ([prd_m3](prd_m3.md)) replacing per-sandbox Chrome windows and terminals with a single
    `Project -> Sandbox -> Thread` workspace where both the human operator and the root orchestrator
    message the same targets, alongside confined embedded terminal emulation (`opencode-tui` and
@@ -170,10 +171,10 @@ merged M command/event contract. M3a frontend implementation follows the project
 - [ ] **M3 — Unified Tauri v2 + hardened web control plane, confined PTY, and opt-in embedded
       browser views** ([prd_m3](prd_m3.md)): build `oc_daemon.py` (`$STATE/registry.sqlite`
       Command/Event/Projection + Outbox, auto-importing host-trusted `$STATE/worktrees/<NAME>` via
-      `O_NOFOLLOW`), a SvelteKit static SPA served first through hardened
-      [loopback web mode](prd_m3a.md) (bootstrap-code exchange + `HttpOnly` cookie + CSRF +
-      single-use WS tickets), followed by [Tauri v2](prd_m3b.md) with a minimal Rust UDS
-      bridge, full-key write-ahead provenance receipts, Trusted Chrome Approval Inbox + 5h/7d
+      `O_NOFOLLOW`), a SvelteKit static SPA in the shell the
+      [control-plane decision](#control-plane-decision) selects: [Tauri v2](prd_m3b.md) with a
+      minimal Rust UDS bridge, or hardened [loopback web mode](prd_m3a.md) (bootstrap-code
+      exchange + `HttpOnly` cookie + CSRF + single-use WS tickets) first, full-key write-ahead provenance receipts, Trusted Chrome Approval Inbox + 5h/7d
       quota bar, zero-network null-origin `xterm.js` iframe behind an allowlist host VT/UTF-8
       scrubber + non-blocking PTY relay, opt-in per-sandbox `Browser` view + fleet PiP Browser Wall
       (backed by `builtin/chromium-managed`, [prd_d](prd_d.md)/[prd_e](prd_e.md) internal HTTPS,
@@ -181,11 +182,192 @@ merged M command/event contract. M3a frontend implementation follows the project
       and Pattern 4 in `orchestrator_skills/oc-sandbox-authoring/SKILL.md`.
       *(Estimated: 10–15 days including M3 browser views & arbiter.)*
 
+## Delivery order
+
+Operator direction from the 2026-11-28 planning session. This section orders the control-plane
+side. The workflow side is ordered in [prd_n](prd_n.md#delivery-order). The two lists share wave
+numbers and the same [shared blockers and decisions](#shared-blockers-and-decisions). Change both
+in one PR when a wave moves.
+
+A `[ ]` below tracks delivery in this plan. It does not open or release a
+[reservation](README.md#workstream-reservations). An item inside a reserved scope keeps its
+owner, named in brackets where the index reserves it.
+
+Direction recorded:
+
+- Prove the tech stack on a thin live slice before rebuilding the whole
+  [locked design](spikes/m/dashboard-design/DESIGN.md). That design is a UX mockup: the target
+  for look and feel, not an implementation guide ([prd_m3a3](prd_m3a3.md#direction-recorded)).
+- Lock the frontend's conventions before any UI stream starts: the stock skeleton, the style
+  guide and the test pyramid ([prd_m3a3](prd_m3a3.md)).
+- Tauri becomes the only shipping shell if Tauri qualification passes, once the shared frontend
+  qualification has passed. See the [control-plane decision](#control-plane-decision).
+- The first end-to-end example is a minimal crew pipeline ([prd_n](prd_n.md#delivery-order)).
+- Assumption, not yet confirmed by the operator: the slice uses a synthetic model route first, as
+  the [local proof](spikes/m/local/README.md) does, so it does not wait on live providers.
+
+### Wave 0: prove and decide
+
+These unblock every later stream. The four frontend steps run in order, because each needs the
+one before it. The other items run in parallel with them.
+
+In order:
+
+- [ ] **Step 1: production code home and toolchain pins.** Decide where the frontend, the Tauri
+      shell and the daemon modules live outside `docs/prds/spikes/`
+      ([prd_k](prd_k.md#later-runtime-layout)), and pin Node and Rust ([prd_f](prd_f.md)).
+- [ ] **Step 2: seed the skeleton** ([prd_m3a3](prd_m3a3.md#skeleton)). Generate the stock
+      `sv create` skeleton with its add-ons in that home, with async Svelte on, and record the
+      exact command and versions. Nothing is built on it yet.
+- [ ] **Step 3: tech-stack spike** ([prd_m3b](prd_m3b.md#tech-stack-spike)). It generates the
+      same skeleton from the recorded command under `docs/prds/spikes/` and runs two sets of
+      checks: the [shared frontend qualification](prd_m3a3.md#shared-frontend-qualification),
+      then the [Tauri qualification](prd_m3b.md#tauri-qualification). It feeds the
+      [shell order](#control-plane-decision) and the
+      [UI SDK decision](prd_m3a2.md#open-decision).
+- [ ] **Step 4: finish the frontend foundation** ([prd_m3a3](prd_m3a3.md#order-of-work)). Apply
+      the spike's findings to the seeded skeleton: the chosen Storybook setup, the test harness
+      in two browser engines, and the style guide with rule IDs.
+
+No UI implementation stream starts before step 4 is done, and that includes the conversion
+lane. Drafting the style guide can begin during steps 2 and 3. It is finished in step 4.
+
+In parallel with those steps:
+
+- [ ] **Shared UI contract and one fixture set**
+      ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)). Every view stream builds against the
+      fixtures and every host stream against the contract.
+- [ ] **Design supplement** ([prd_m3a1](prd_m3a1.md#design-supplement)) for the screens the
+      locked design lacks. [Reserved: Dashboard design.]
+- The workflow-side Wave 0 items in [prd_n](prd_n.md#wave-0-prove-and-decide).
+
+### Wave 1: thin live slice
+
+Parallel once Wave 0 lands. Workflow-side items for this wave are in
+[prd_n](prd_n.md#wave-1-thin-live-slice).
+
+- [ ] Port the daemon core: registry, hub and the read projection, served over the host-only
+      socket ([Gap M3.1](prd_m3.md#concrete-gaps-and-checkboxes),
+      [M2](prd_m2.md#concrete-gaps-and-checkboxes)). [Reserved: PRD M coordination.]
+- [ ] Port the local worker transport: one OpenCode job with the synthetic broker
+      ([first PoC split](#first-poc-split)).
+- [ ] Rebuild the design system and shell to match the mockup: tokens, trust primitives, header
+      and footer bands, stage, sidebar and drawer ([prd_m3a1](prd_m3a1.md)). The
+      [conversion lane](prd_m3a3.md#conversion-lane) can start on the presentational pieces as
+      soon as the frontend foundation exists, ahead of the rest of this wave.
+- [ ] Fleet overview and sidebar tree.
+- [ ] Read-only thread view with provenance badges.
+- [ ] Tier A Approval Inbox wired to `oc_controller`, at least for the run lease the pipeline
+      needs.
+- [ ] The shell. This wave starts only after the
+      [shared frontend qualification](prd_m3a3.md#shared-frontend-qualification) has passed,
+      since both shells need it. The [Tauri qualification](prd_m3b.md#tauri-qualification) then
+      chooses the shell:
+  - **If Tauri qualification passes:** the Tauri bridge, packaging and the session-generation
+    fence ([prd_m3b](prd_m3b.md)).
+  - **If Tauri qualification fails:** the loopback dashboard with its web sign-in
+    qualification, including the cookie port-sharing item ([prd_m3a](prd_m3a.md)). Tauri then
+    follows loopback, as in the earlier order.
+
+Finish line, shared with prd_n. The steps are the same for either shell: on a synthetic model,
+the operator starts a crew pipeline run, approves its lease, watches the ship lane work, sees the
+verification pass, resolves the human gate and sees the run complete.
+
+- **If Tauri qualification passes,** the operator does this in the packaged Tauri app.
+- **If Tauri qualification fails,** the operator does this in the authenticated loopback
+  dashboard.
+- **If the shared frontend qualification fails,** there is no finish line yet. Work stops for
+  the operator's decision, as the [control-plane decision](#control-plane-decision) says.
+
+Either way the slice is local and synthetic. It needs no live provider route and no SSH worker,
+provided the operator confirms the synthetic route recorded above as an assumption. Without that
+confirmation Wave 1 also waits on a live route ([prd_i4](prd_i4.md)). Live and remote
+qualification of the same pipeline stays in Wave 3.
+
+### Wave 2: widen
+
+- [ ] Composer, target picker and message sending
+      ([M3 §2](prd_m3.md#2-symmetric-human--root-orchestrator-messaging--full-key-write-ahead-provenance)).
+- [ ] Diff drawer and checkpoints.
+- [ ] Health Ribbon and account usage strip ([prd_m1](prd_m1.md)).
+- [ ] Settings view and review of orchestrator-proposed changes
+      ([Gap M3.7](prd_m3.md#concrete-gaps-and-checkboxes)).
+- [ ] Observe-only browser view over the Chromium each pod already runs, with headless as the
+      default mode. This removes the separate desktop Chromium window. It is a subset of
+      [Gap M3.4](prd_m3.md#concrete-gaps-and-checkboxes) and takes no input.
+
+### Wave 3: later
+
+- [ ] Operator-only secret entry and the form editor
+      ([Gap M3.7](prd_m3.md#concrete-gaps-and-checkboxes)).
+- [ ] Confined terminals ([Gap M3.3](prd_m3.md#concrete-gaps-and-checkboxes)).
+- [ ] Hardened interactive browser view ([Gap M3.4](prd_m3.md#concrete-gaps-and-checkboxes)),
+      which needs [prd_d](prd_d.md) and [prd_e](prd_e.md).
+- [ ] Agent bridge runtime ([Gap M3.5](prd_m3.md#concrete-gaps-and-checkboxes),
+      [prd_m3a2](prd_m3a2.md)).
+- [ ] Live providers and remote workers ([prd_i4](prd_i4.md), [prd_i2](prd_i2.md)).
+      [Reserved: Outside-in integrations.]
+
+### Shared blockers and decisions
+
+[prd_n](prd_n.md#shared-blockers-and-decisions) carries the same list. Keep the two in step.
+
+Decisions:
+
+- Shell order: [control-plane decision](#control-plane-decision), settled by the
+  [tech-stack spike](prd_m3b.md#tech-stack-spike).
+- How much of the UI is built on UI SDK primitives: [prd_m3a2](prd_m3a2.md#open-decision).
+- Process for the design supplement: [prd_m3a1](prd_m3a1.md#design-supplement).
+- Frontend conventions and development add-ons: [prd_m3a3](prd_m3a3.md#open-decisions).
+- Workflow authoring surface and authored deterministic steps:
+  [prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps).
+- Configuration editing interface: [prd_j](prd_j.md#later-configuration-and-editor).
+- Secret storage and broker integration: [prd_i3](prd_i3.md#open-choices).
+- Loopback cookie port-sharing ([prd_m3a](prd_m3a.md)) matters only if loopback ever carries real
+  authority again.
+
+Dependencies owned elsewhere:
+
+- Credential brokering for sandboxes: [prd_i3](prd_i3.md), [prd_i3a](prd_i3a.md),
+  [prd_i4](prd_i4.md) and [prd_l1](prd_l1.md). The dashboard's part is the Approval Inbox and
+  grant revocation.
+- Sandbox profiles and the config tools the orchestrator uses: the
+  [prd_l](prd_l.md) production port.
+- Named workstream [reservations](README.md#workstream-reservations). Take an epic by reserving it
+  there.
+
 ## Control-plane decision
 
 - [x] Use SvelteKit with the static adapter and a client-rendered SPA. Qualify the
       [loopback dashboard](prd_m3a.md) before packaging the shared frontend for
       [Tauri v2](prd_m3b.md). Reuse the documented T3Code architectural patterns.
+- [ ] **Shell order.** The operator chose Tauri only on 2026-11-28, and approved changing the
+      order across these PRDs to match. This item is the one place the order is set. Every
+      other mention of shell order in the PRDs defers to it. Until the
+      [tech-stack spike](prd_m3b.md#tech-stack-spike) reports, the loopback-first order above
+      stands. The spike runs two sets of checks, and they lead to different results:
+
+      | [Shared frontend qualification](prd_m3a3.md#shared-frontend-qualification) | [Tauri qualification](prd_m3b.md#tauri-qualification) | Result |
+      |---|---|---|
+      | Fails | Not run | Stop and return to the operator. A failure here affects loopback as much as Tauri, so loopback-first is not a remedy. No UI stream starts. |
+      | Passes | Passes | Tauri only. The choice takes effect. |
+      | Passes | Fails | Loopback first, then Tauri, as in the earlier order. |
+
+      Time estimates below are rough.
+  - **Tauri only; loopback serves fixtures for tests (chosen).** The dashboard has no TCP
+    listener. The web sign-in work and the cookie port-sharing problem in
+    [prd_m3a](prd_m3a.md) are not needed. Each stream surface is qualified once. No access from a
+    browser or another device. WebKitGTK becomes the only production engine on Linux, and Rust
+    and desktop packaging become foundations. Saves roughly 4–6 days of loopback sign-in work and
+    adds roughly 3–5 days of packaging and bridge work up front.
+  - **Both shells, Tauri first.** Browser access stays possible. Two sign-in surfaces to review
+    and keep in step, and cookie port-sharing still has to be solved before loopback ships. The
+    full cost of both.
+  - **Loopback first, then Tauri (the earlier order).** Mature Chromium test tooling and direct
+    reuse of the web-host and web-ui spikes. Consolidating the sandbox browser waits, and cookie
+    port-sharing blocks the first shippable build.
+  - Under every option the typed client stays transport-neutral, so a second shell can be added
+    later without reworking views.
 
 ## Open decisions
 

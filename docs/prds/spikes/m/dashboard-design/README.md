@@ -1,9 +1,10 @@
 # M3a dashboard reference design
 
 The locked product design for the M3a operator dashboard ([prd_m3a1](../../../prd_m3a1.md)). It's
-a static, clickable prototype with synthetic data, and the reference that the SvelteKit
-implementation in [`../web-ui`](../web-ui) follows. It isn't production code. Port its
-tokens, components and behaviour; don't ship these files.
+a static, clickable prototype with synthetic data. It isn't production code, and it isn't an
+implementation guide. Treat it as a UX mockup: the build matches its look, feel and behaviour,
+reuses its token values, and copies its code only where that is the sensible way to match it
+([prd_m3a3](../../../prd_m3a3.md#conversion-lane)). Don't ship these files.
 
 ## What's here
 

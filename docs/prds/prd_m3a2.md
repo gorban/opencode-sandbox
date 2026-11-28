@@ -181,6 +181,11 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
 
 ## Open decision
 
+The [tech-stack spike](prd_m3b.md#tech-stack-spike) answers the CSP question for WebKitGTK and
+feeds this decision. It is a Wave 0 blocker in the [delivery order](prd_m.md#delivery-order),
+because every view builds on the chosen primitive layer. The primitives tier and the selector
+rule it must satisfy are in the [style guide requirements](prd_m3a3.md#style-guide).
+
 - [ ] (decision needed) **How much of the dashboard is built on UI SDK primitives.**
   - **UI SDK primitives for interactive controls, behind a thin local adapter (recommended,
     if the CSP qualification passes).** Agent visibility and accessible keyboard behaviour come

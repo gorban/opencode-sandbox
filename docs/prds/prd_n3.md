@@ -168,16 +168,73 @@ host-owned `0o700`/`0o600` source, 0 base tokens until invoked). The skill teach
    and continue driving sibling lanes while checking `inbox_list` asynchronously.
 5. How to run the human-triggered calibration/replay workflow when asked to tune classifier drift.
 
+### 4. Workflow views and change review
+
+Added on 2026-11-28, after the Gate 1 clearance recorded in [prd_n](prd_n.md). It needs design
+and security review before implementation. The `oc-ui@1` surfaces in §2 show a run's status and
+health. They do not show what a workflow is, where a run stands in it, or what a proposed change
+would do. The locked dashboard design has only a specimen sheet of the eight surfaces
+([prd_m3a1](prd_m3a1.md#design-supplement)).
+
+All of these views are host-rendered Trusted Host Chrome. Host rendering establishes who drew a
+view. It does not establish who wrote each string in it. A workflow can be proposed by `-o`, and
+a run's log can carry sandbox output, so text an agent wrote reaches these views. Compiling or
+approving a workflow does not turn its text into host text.
+
+- **Host-derived, in the host's voice:** stage kind, effect names, security triggers, limits,
+  digests, lease and approval state, and action labels. These come from closed enumerations and
+  the compiled effect manifest, never from an authored field.
+- **Authored or agent-originated, always inert and labelled:** workflow and stage names and
+  descriptions, surface titles, rubric and template text, skill names, step-log text, and every
+  field of a proposed revision. Render these as escaped plain text in the bounded untrusted
+  container, with a label naming the source: built-in, operator-authored, proposed by `-o`, or
+  sandbox output. They follow the anti-spoofing rules in
+  [prd_m3a1](prd_m3a1.md#trusted-chrome-visual-language-anti-spoofing).
+- **Kept distinct.** An authored label never stands in for an effect or approval label, and
+  never takes the reserved glyphs, shapes or colours. In a diagram, the host draws each node's
+  kind marker and the authored name sits beside it as labelled text.
+- Add workflow names, templates and log lines to the hostile fixtures, and check they cannot
+  imitate a host label in the list, the diagram, the run view or the change review.
+
+- **Workflow list.** Available workflows and active runs, with owner (operator or `-o`), mode,
+  autonomy level, status and lease state.
+- **Workflow definition.** A diagram the host generates from the compiled plan
+  ([prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps)): stages, lanes, gates
+  and transitions. Each stage is marked as an LLM lane, a deterministic host action or a human
+  gate. Beside it sit the reachable effects, the limits and the plan digest.
+- **Workflow run.** The same diagram with the run's current position, per-lane state and the
+  step log. Each lane links to its sandbox thread, each gate to its Human Inbox item or
+  approval. `oc-ui@1` surfaces for the run appear here with their provenance pills.
+- **Change review.** A proposed workflow revision arrives as a Tier A approval from
+  `config_propose_revision`. Show what changed in the workflow's own terms: stages, transitions,
+  effects, limits and templates added, removed or altered. Show the security triggers it raises
+  ([prd_n1 §1](prd_n1.md#1-storage-mutability-and-oc_config_mcp-authoring-prd_l-parity)) and the
+  diagram before and after, with changed elements marked by shape and label as well as colour.
+  The approval binds to the exact revision and digest shown. The shared flow for other
+  configuration kinds is in
+  [M3 §7](prd_m3.md#7-settings-proposed-changes-and-operator-only-secret-entry).
+
 ---
 
 ## Concrete checkboxes and open decisions
+
+The order these are delivered in is in [prd_n](prd_n.md#delivery-order). The Human Inbox and the
+minimal crew pipeline come first.
+
+- [ ] Build the [workflow list, definition and run views](#4-workflow-views-and-change-review)
+      (Wave 1) and the change review (Wave 2), from the
+      [design supplement](prd_m3a1.md#design-supplement).
 
 - [ ] Add `human_inbox_items` and `dashboard_surfaces` tables + TOCTOU fingerprint verification +
       `HumanDecisionReceipt` audit trail in `oc_registry.py` / `oc_daemon.py`.
 - [ ] Expose `workflow_*`, `metrics_*`, `fleet_bearings_snapshot`, `inbox_*`, `dashboard_*`, and
       `calibration_*` MCP tools on `-o`'s private UDS RPC server (`oc_coord_rpc.py` /
       `oc_config_mcp.py`).
-- [ ] Build Trusted Host Chrome views for [M3a loopback](prd_m3a.md), then [M3b Tauri](prd_m3b.md):
+- [ ] Build Trusted Host Chrome views in the shell the
+      [control-plane decision](prd_m.md#control-plane-decision) selects: the
+      [M3b Tauri](prd_m3b.md) app if Tauri qualification passes, the
+      [M3a loopback](prd_m3a.md) dashboard first if it fails. Either needs the shared frontend
+      qualification first. The views are:
       `Tier B Human Inbox` drawer (strictly separate from `Tier A Approval Inbox`), `Tier C Health
       Ribbon`, `Workflows` panel, and closed `oc-ui@1` Svelte component catalog with provenance pills.
 - [ ] Author `builtin/prd-delivery-pipeline.toml` + `SKILL.md` demonstrating parallel implementor /

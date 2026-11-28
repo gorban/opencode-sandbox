@@ -1,11 +1,13 @@
 # prd_m3a1: Dashboard product design, design system, and accessibility
 
-Parent: [prd_m3a](prd_m3a.md) · sibling: [prd_m3a2 UI SDK agent bridge](prd_m3a2.md) ·
+Parent: [prd_m3a](prd_m3a.md) · siblings: [prd_m3a2 UI SDK agent bridge](prd_m3a2.md),
+[prd_m3a3 frontend foundation and style guide](prd_m3a3.md) ·
 related: [M3 control plane](prd_m3.md), [M3b Tauri desktop](prd_m3b.md),
 [N3 Human Inbox and `oc-ui@1` surfaces](prd_n3.md), [I1 operator dashboard](prd_i1.md)
 
-Design the shared SvelteKit static SPA once, for the loopback dashboard first and the Tauri
-WebView later. This PRD owns screens, interaction patterns, the visual language, design tokens,
+Design the shared SvelteKit static SPA once, for both the loopback dashboard and the Tauri
+WebView. Which shell ships first is set by the
+[control-plane decision](prd_m.md#control-plane-decision). This PRD owns screens, interaction patterns, the visual language, design tokens,
 accessibility and the design selection process. It does not change protocols, authority or
 the M3 security design. Where a design need appears to conflict with a security requirement,
 the security requirement wins and the conflict is recorded here as an open item.
@@ -192,6 +194,56 @@ host chrome.
 - [x] A locked `DESIGN.md` describing the chosen system and the reasons for it, which
       implementation agents read before building M3a views.
       `claude/m3a-design-selection`: [`DESIGN.md`](spikes/m/dashboard-design/DESIGN.md).
+
+## Design supplement
+
+Added on 2026-11-28. The [locked design](spikes/m/dashboard-design/DESIGN.md) covers 16 screens.
+The operator treats that design as a UX mockup: the target for look and feel, not an
+implementation guide. The build matches it and follows the
+[style guide](prd_m3a3.md#style-guide) for how.
+The screens below are missing. They extend the locked system: its tokens, trust vocabulary, tiers
+and components stay as they are. This is a Wave 0 item in the
+[delivery order](prd_m.md#delivery-order).
+
+- [ ] **Workflow list.** Available workflows and active runs, with owner, status and the run
+      lease state. The locked "Workflows" page is a specimen sheet of the eight `oc-ui@1`
+      surfaces. It stays as the catalog and does not stand in for this.
+- [ ] **Workflow definition.** The host-generated diagram of stages, lanes and gates, with the
+      effect summary and limits beside it. Mark which stages are LLM lanes, which are
+      deterministic host actions and which are human gates
+      ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
+- [ ] **Workflow run.** Where a run is now on that diagram, per-lane state, the step log, and
+      links to the lanes' threads, inbox items and approvals.
+- [ ] **Change review.** A proposed configuration or workflow revision as a Tier A approval:
+      field-level differences, security triggers, and for workflows the diagram before and after
+      ([M3 §7](prd_m3.md#7-settings-proposed-changes-and-operator-only-secret-entry)).
+- [ ] **Settings.** Effective values with their source, provider instances and their state, and
+      the form editor for non-secret settings.
+- [ ] **Secret entry.** The operator-only surface for entering a secret, with the slot it fills,
+      who asked, and the set or not-set state afterwards. It uses the security frame and is
+      hidden from the agent bridge.
+- [ ] In the workflow and change-review screens, show authored and agent-originated text
+      (names, descriptions, templates, log lines, proposed values) in the untrusted container
+      with a source label, and keep host-derived effect and approval labels visibly distinct
+      from it ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
+- [ ] Add each new screen to the states sheet and the hostile-content specimen, and run the
+      WCAG 2.2 AA audit on it.
+- [ ] (decision needed) **Process for the supplement.** Time estimates are rough.
+  - **One design extending the locked system, with operator review and an audit
+    (recommended).** The visual language is already chosen, so the open questions are layout and
+    content. Fast, and consistent with the lock. No independent alternatives to compare.
+    ~2–3 days.
+  - **A full council round for the workflow screens only.** Independent attempts where the
+    design is least settled. More operator time, and a risk that attempts drift from the locked
+    system. ~4–6 days.
+  - **A full council round for every new screen.** The most alternatives. The slowest, and most
+    of the settings and secret-entry layout follows from existing components. ~1–2 weeks.
+  - **Design the new screens directly as Storybook stories**, once the
+    [frontend foundation](prd_m3a3.md) exists. The designed artifact is then the one that is
+    tested and integrated, with no second mockup to rebuild
+    ([consistency rules](prd_m3a3.md#stories-match-the-app)). It cannot start until the
+    foundation and the presentational primitives exist, and it gives no independent attempts to
+    compare. It can be combined with the first option. ~2–4 days after the foundation.
 
 ## Design selection process
 

@@ -42,12 +42,26 @@ reservation explicitly in this index.
   ([N milestones](prd_n.md#phased-milestones-and-ownership)) — **PRD N workflows & supervision**
   *(builds on `[*] PRD M coordination` and open PRD I/L/M prerequisites; re-coordinate ownership
   at the start of the next phase)*.
-- [*] Dashboard product design and requirements for the shared SvelteKit static SPA (loopback
-  first, Tauri-ready): [M3a](prd_m3a.md), [M3a1](prd_m3a1.md) design system and
+- [*] Dashboard product design and requirements for the shared SvelteKit static SPA (for both
+  shells; the order is set by the [control-plane decision](prd_m.md#control-plane-decision)):
+  [M3a](prd_m3a.md), [M3a1](prd_m3a1.md) design system and
   accessibility, [M3a2](prd_m3a2.md) UI SDK bridge and markup, and the visual design of the
   [N3](prd_n3.md) Trusted Chrome views — **Dashboard design** (`codex/m3a-dashboard-design`).
   Excludes moving Chromium launches into the app ([Gap M3.4](prd_m3.md#concrete-gaps-and-checkboxes)),
   the M3.1 projection and N3 backend work.
+
+- [*] Delivery order for the dashboard and workflows: the wave plan in
+  [prd_m](prd_m.md#delivery-order) and [prd_n](prd_n.md#delivery-order), the new
+  [M3a3](prd_m3a3.md) frontend foundation, and the sections it added to M3, M3a1, M3b, N1, N3
+  and J — **Delivery planning** (`spike-prd-n3-workflow-poc`).
+  This reserves the plan text only. A `[ ]` in a wave list tracks delivery order. It does not
+  open or release a reservation. Scope already reserved above keeps its owner when a wave list
+  repeats it as an unchecked task, including N0–N2, the M first PoC and M3 projection, the
+  dashboard design, and the Outside-in integrations. Epics that no entry above reserves stay
+  open `[ ]` until a workstream reserves them here. The additions to PRDs reserved above were
+  made at the operator's direction and wait for those owners' reciprocal review.
+  Acknowledgments still open: **Dashboard design**, **PRD M coordination**, **PRD N workflows &
+  supervision**.
 
 Coordinate SSH fixtures and remote acceptance with **Warm worker seeding**
 (`codex/warm-worker-seeding`). That workstream owns [I5](prd_i5.md) warm-start
@@ -87,8 +101,8 @@ These gates are in addition to the [Human review gate](../../AGENTS.md#human-rev
 | [prd_j](prd_j.md) | Host configuration and bridge merge tool preferences | proposed; TOML and editor design deferred |
 | [prd_k](prd_k.md) | Contributor checks and repository layout | local CI and documentation PoCs human-approved; hosted qualification and final review open |
 | [prd_l](prd_l.md) | Composable sandbox config, host providers, comm adapters, and orchestrator config MCP | offline spike PoC slice human-approved; external secret isolation ([prd_l1](prd_l1.md)), production port, and final review open |
-| [prd_m](prd_m.md) | Model telemetry, cross-model orchestration, and a shared SvelteKit control plane | local hub and worker proof merged; [loopback UI first](prd_m3a.md), then [Tauri desktop](prd_m3b.md); final review open |
-| [prd_n](prd_n.md) | First-class long-running workflows (`workflow@1`), host metrics, zero-authority System-1 + blind-check supervision, non-blocking Human Inbox, and declarative `oc-ui@1` dashboard surfaces | proposed; Rank #1 direction selected; initial Gate 1 external security & PR-style review cleared (`e155caf2`); reciprocal review, open decisions & human review pending |
+| [prd_m](prd_m.md) | Model telemetry, cross-model orchestration, and a shared SvelteKit control plane | local hub and worker proof merged; [delivery order](prd_m.md#delivery-order) proposed; [Tauri desktop](prd_m3b.md) only if its Tauri qualification passes, otherwise [loopback UI first](prd_m3a.md), and either only after the shared frontend qualification; final review open |
+| [prd_n](prd_n.md) | First-class long-running workflows (`workflow@1`), host metrics, zero-authority System-1 + blind-check supervision, non-blocking Human Inbox, and declarative `oc-ui@1` dashboard surfaces | proposed; Rank #1 direction selected; initial Gate 1 external security & PR-style review cleared (`e155caf2`); [delivery order](prd_n.md#delivery-order) proposed with a minimal crew pipeline first; reciprocal review, open decisions & human review pending |
 | [prd_o](prd_o.md) | CI build & test duration trends, test-scope expansion (spikes, integration, secret-gated live inference smoke), and deterministic content-hashed GitHub Actions caching | proposed; empirical CI baseline measured (`9b608f43`); open decisions & human review pending |
 
 The imported findings are evidence, not production implementation:

@@ -98,5 +98,13 @@ Git documents [merge tool selection](https://git-scm.com/docs/git-mergetool) and
       inspired by `api-agent` (field help and live validation, more UI and dependency review,
       roughly 3–5 days). Recommend TOML and validation as the shared core. Review terminal
       libraries, licensing, transitive dependencies and packaging before choosing a TUI.
+  - Added on 2026-11-28: a third option is a **form in the dashboard generated from the declared
+    setting schema**, with secrets entered on a separate operator-only surface
+    ([M3 §7](prd_m3.md#7-settings-proposed-changes-and-operator-only-secret-entry)). The
+    operator never escapes values by hand, and it reuses the dashboard's trusted chrome. It
+    arrives only with the dashboard, in Wave 3 of the
+    [delivery order](prd_m.md#delivery-order), and needs the same validated store underneath.
+    Roughly 4–6 days after the settings view exists. It sits on top of the TOML and validation
+    core and does not replace it.
 
 - [ ] **Human review**: checked only when the user says so

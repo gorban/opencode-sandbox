@@ -314,7 +314,108 @@ single-writer ACID transactions as `oc_hub` outbox & revocation tombstones):
 
 ---
 
+## Authoring surface and authored deterministic steps
+
+Added on 2026-11-28, after the Gate 1 clearance recorded in [prd_n](prd_n.md). The first wave
+builds the reviewed design above as it stands. Every item below that changes the `workflow@1`
+schema, the compiled plan or what runs returns this PRD to Gate 1 before implementation. That
+includes the typed stage contracts and bindings, which decide which stages receive which data.
+Delivery order: [prd_n](prd_n.md#delivery-order).
+
+### What the operator's `api-agent` workflow format offers
+
+`api-agent` (`github.com/gorban/api-agent`) declares a flow in Markdown tables and runs it as a
+graph. These ideas carry over without its Python node functions or its graph runtime:
+
+- A table-based declaration that agents write and people read and compare easily.
+- A typed input and output contract for every node.
+- Bindings and edges written out as tables, so the data each step receives is visible.
+- A diagram generated from the declaration, which also gives a before-and-after picture for
+  reviewing a change ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
+
+- [ ] Propose a typed input and output contract for each stage, and explicit bindings between
+      stages, for the `workflow@1` schema. This changes the reviewed schema: the compiled plan
+      holds the effect manifest today, and bindings add the data each stage is handed. Before
+      implementation, Gate 1 reviews:
+  - **The binding rules.** Which sources a binding may name, and how each bound value is typed
+    and bounded.
+  - **The permitted recipients.** Which stage kinds may receive which data. In particular, what
+    may reach an LLM lane, a `/decisions/*` or blind-check route, a template or a dashboard
+    surface, and how that fits the `excerpt_disclosure` policy above.
+  - **The binding to the approved plan.** How every contract and binding enters the effect
+    manifest and `workflow_plan_digest`, so the approval covers them, a changed binding raises a
+    security trigger, and a run cannot receive a binding its approved digest does not contain.
+
+  The Wave 1 crew pipeline does not wait for this. It uses only the bindings the reviewed
+  design already defines, such as the commit and sequence pins on a human gate.
+- [ ] Generate the workflow diagram on the host from the compiled plan. An agent never supplies
+      diagram markup. Labels taken from authored fields stay inert, provenance-labelled text
+      ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
+- [ ] (decision needed) **Authoring surface.** Time estimates are rough.
+  - **Keep TOML as the one stored form, and generate the tables and diagram as a view
+    (recommended).** Matches every other config kind in [prd_l](prd_l.md) and the reviewed
+    store, journal and approval path. The readable form is always derived from what runs, so
+    the two cannot disagree. Agents author TOML rather than tables. ~2–3 days for the generated
+    view.
+  - **Markdown tables as the stored form, compiled to the same plan.** The format agents and
+    people read is the format that is stored. Needs a second parser with its own hostile-input
+    review, and differs from the other config kinds. ~1–2 weeks, and a Gate 1 return.
+  - **Both, with a converter.** Flexible. Two forms to keep in step, and the approval must bind
+    to one canonical form anyway. ~2 weeks, and a Gate 1 return.
+
+### Where deterministic work runs
+
+| Kind of work | Where | Authored code? |
+|---|---|---|
+| Host effects: launch a sandbox, post to the Human Inbox, request an approval, send a templated nudge | The host, as closed built-in actions | Never |
+| Anything that touches a workspace: tests, lint, git | A throwaway `safe_run` container on the worker | The repository's own commands, inside the container |
+| A pure transform or routing choice over agreed inputs | The workstation, in a runtime with no authority | Only if the option below is adopted |
+
+The first waves use the first two rows only.
+
+### Authored deterministic steps (roadmap, not a foundation)
+
+Treat authored step code as untrusted whether or not anyone reviewed it. Source can grow large,
+and a reviewer or an agent can miss something, so review is not the control. The control is the
+envelope the code runs in. A mistake in the code can then produce a wrong value, never a new
+capability.
+
+- The operator approves the envelope, which stays small however large the source is: the inputs
+  the step is handed, its output schema, the effects the surrounding workflow can reach, and its
+  time, memory and call limits.
+- The code has no file, network, clock or environment access. It receives only its bound inputs.
+- Its output is untrusted data. It is checked against the schema and bounded, it never gains
+  host or operator provenance, and it is never placed into a message sent to a sandbox.
+- An output can only select among edges and targets the approved workflow already declares.
+  Effects stay closed host actions.
+- Run it in a separate confined process, outside `oc_daemon`.
+- What remains possible inside the envelope: a wrong choice among allowed branches or targets,
+  copying its inputs into its outputs (so binding an input is a disclosure decision, like
+  `excerpt_disclosure` above), and using up its resource budget.
+
+This is the stance [prd_n2](prd_n2.md) already takes for the System-1 classifier: no authority,
+trigger only.
+
+- [ ] Run a spike before committing to this. Settle the runtime, where code is built, how the
+      running artifact is pinned to the reviewed source in `workflow_plan_digest`, and a new
+      `workflow_step_code_changed` security trigger. Then return this PRD to Gate 1.
+- [ ] (decision needed) **Runtime for authored steps.** Time estimates are rough.
+  - **No authored code; widen the bounded predicate and expression language when a real need
+    appears (recommended until a workflow needs more).** No new runtime, dependency or
+    review surface. Cannot express larger transforms. ~1–2 days per extension.
+  - **A pinned interpreter for a hermetic language, itself inside WebAssembly, in a confined
+    process.** The source the operator sees is the source that runs, with no build step. An
+    interpreter flaw is held by the WebAssembly runtime, and a runtime flaw by the process
+    confinement. Adds a native runtime dependency to a daemon that uses only the standard
+    library today ([prd_f](prd_f.md)). ~1–2 weeks after the spike.
+  - **Compiled WebAssembly modules.** Any source language. The reviewed source must provably
+    match the module that runs, which needs a reproducible or host-run build, and the same
+    runtime dependency. ~2–3 weeks after the spike.
+
 ## Concrete checkboxes and open decisions
+
+The [delivery order](prd_n.md#delivery-order) builds a minimal subset of the items below first,
+for the crew pipeline.
 
 - [ ] Extend `oc_schema.py`, `oc_store.py`, and `oc_config_mcp.py` for `workflow@1` storage,
       `SECURITY_DELTA_TRIGGERS`, and human-gated authoring.

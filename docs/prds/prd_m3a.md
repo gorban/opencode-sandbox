@@ -1,13 +1,26 @@
 # prd_m3a: SvelteKit loopback dashboard
 
 Parent: [prd_m3](prd_m3.md) · follows: [M3.1 read-only projection](prd_m3.md#concrete-gaps-and-checkboxes) ·
-next: [prd_m3b Tauri desktop](prd_m3b.md) · children:
+other shell: [prd_m3b Tauri desktop](prd_m3b.md) · order:
+[control-plane decision](prd_m.md#control-plane-decision) · children:
 [prd_m3a1 product design, design system and accessibility](prd_m3a1.md),
-[prd_m3a2 UI SDK agent bridge and markup](prd_m3a2.md)
+[prd_m3a2 UI SDK agent bridge and markup](prd_m3a2.md),
+[prd_m3a3 frontend foundation, style guide and test pyramid](prd_m3a3.md)
+
+The skeleton, conventions and tests every view follows are in [prd_m3a3](prd_m3a3.md). Views
+start from that foundation, not from the hand-built [web-ui spike](spikes/m/web-ui/README.md).
 
 Design work for this SPA runs ahead of implementation in [prd_m3a1](prd_m3a1.md). Moving
 Chromium launches into the app (embedded browser views and the Browser Wall) is not part of
 this phase.
+
+On 2026-11-28 the operator chose Tauri as the only shipping shell, taking effect if the
+[Tauri qualification](prd_m3b.md#tauri-qualification) passes, after the shared frontend
+qualification that both shells need
+([control-plane decision](prd_m.md#control-plane-decision)). In that case this phase keeps the
+static SPA, its view rules and a loopback fixture server for tests. The loopback sign-in
+qualification and the cookie port-sharing item below wait until loopback is asked to carry real
+authority again. Delivery order: [prd_m](prd_m.md#delivery-order).
 
 Ship the first dashboard as a SvelteKit static single-page application. Use the static adapter for
 build output and client-side rendering for live routes. The host daemon serves static assets and
