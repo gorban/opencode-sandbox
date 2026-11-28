@@ -74,6 +74,11 @@ routing, exposure or revocation goes through both reviews before use by another 
   produced no additional claims or sends.
 - [ ] Verify the cumulative tool loop through the sealed public launcher and qualify it against
   live provider grants. The earlier sealed run exercised the original broker behavior.
+  On #107 at commit `1a7e42955204181a2b630d1ba44effec55f484be` (tree `e993cf51`), the
+  sealed public launcher completed patch, read, and shell with three continuations using
+  an entirely synthetic TLS peer. Independent cleanup checks found only the baseline
+  devbox and confirmed removal of the test pods, volumes, and secrets.
+  Redacted summary SHA-256 `6b2e5a94bb6f4891b53bbb9956b70bf0b4f683a02259af1c2340be9dd6abce4e`.
 
 ## Opt-in live e2e pytest milestones
 

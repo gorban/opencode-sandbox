@@ -346,6 +346,7 @@ class CaptureGuardTests(unittest.TestCase):
             authorize = scratch.authorize_first_write
             verify = scratch.verify
             upstream = MagicMock()
+            history = self.first_turn()
 
             def enter_final_authorization(**options):
                 nonlocal authorizing
@@ -361,7 +362,7 @@ class CaptureGuardTests(unittest.TestCase):
             with patch.object(scratch, "authorize_first_write", side_effect=enter_final_authorization), \
                     patch.object(scratch, "verify", side_effect=slow_verification):
                 with self.assertRaisesRegex(FixtureMismatch, "Stale or expired"):
-                    turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), upstream)
+                    turns.dispatch(AUTHORITY, "ses_capture", history, upstream)
             upstream.assert_not_called()
             with closing(sqlite3.connect(ledger)) as db:
                 self.assertEqual(db.execute("SELECT sequence, actual_input FROM exposure").fetchall(), [(1, None)])
@@ -377,8 +378,9 @@ class CaptureGuardTests(unittest.TestCase):
             replacement.write_bytes((moved / ledger_name).read_bytes())
             sentinel = replacement.read_bytes()
             upstream = MagicMock()
+            history = self.first_turn()
             with self.assertRaisesRegex(FixtureMismatch, "Capture exposure directory changed"):
-                turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), upstream)
+                turns.dispatch(AUTHORITY, "ses_capture", history, upstream)
             upstream.assert_not_called()
             self.assertEqual(replacement.read_bytes(), sentinel)
             with closing(sqlite3.connect(moved / ledger_name)) as db:
@@ -396,16 +398,17 @@ class CaptureGuardTests(unittest.TestCase):
             ledger = scratch.root / "test-exposure.sqlite"
             turns = FixtureTurns(ledger, AUTHORITY, ledger=PinnedLedger(ledger.name, scratch))
             upstream = MagicMock()
+            history = self.first_turn()
             with patch("stock_worker_tools_turns.os.replace", side_effect=replace_then_raise):
                 with self.assertRaises(OSError) as raised:
-                    turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), upstream)
+                    turns.dispatch(AUTHORITY, "ses_capture", history, upstream)
             self.assertIs(raised.exception, primary)
             upstream.assert_not_called()
             claim, = turns.verified_records()
             self.assertEqual((claim["sequence"], claim["parent"], claim["actual_input"], claim["actual_output"]),
                              (1, None, None, None))
             with self.assertRaisesRegex(FixtureMismatch, "Stale or expired"):
-                turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), upstream)
+                turns.dispatch(AUTHORITY, "ses_capture", history, upstream)
 
     def test_claim_retirement_checks_the_published_ledger_at_sync_and_final_authorization(self):
         sync = os.fsync
