@@ -16,7 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +44,7 @@ MUSL_PINS = {
     "libgcc_s.so.1": "5ea51dd885b6fc691eccc569d0bda739204204f6161e97075b26dc9c050d1ca1",
 }
 PORT = 8401
+OBSERVER_STOP_SECONDS = 10
 FIXTURE_BEARER = "stock-tools-synthetic-only"
 WORKSPACE = Path("/sandbox/construct")
 AUTHORITY = Authority("synthetic-job", "harbor", "capture-generation", "/v1/responses", MODEL)
@@ -145,8 +146,9 @@ class FakeUpstream:
 
 
 class Observer(ThreadingHTTPServer):
-    # server_close joins request handlers before the failure snapshot.
-    daemon_threads = False
+    # Track handlers ourselves so closing the listener never waits without a deadline.
+    block_on_close = False
+    timeout = .1
 
     def __init__(self, case, ledger):
         self.case = case
@@ -159,7 +161,35 @@ class Observer(ThreadingHTTPServer):
         self.prefix_refusals = 0
         self.error = None
         self.lock = Lock()
+        self._stop_serving = Event()
+        self._handlers = []
         super().__init__(("127.0.0.1", PORT), WireHandler)
+
+    def serve_until_stopped(self):
+        while not self._stop_serving.is_set():
+            self.handle_request()
+
+    def process_request(self, request, client_address):
+        if self._stop_serving.is_set():
+            self.shutdown_request(request)
+            return
+        handler = Thread(target=self.process_request_thread, args=(request, client_address), daemon=True)
+        self._handlers = [thread for thread in self._handlers if thread.is_alive()]
+        self._handlers.append(handler)
+        handler.start()
+
+    def stop(self, serving, deadline):
+        self._stop_serving.set()
+        if serving is not None and serving.is_alive():
+            serving.join(max(0, deadline - time.monotonic()))
+            if serving.is_alive():
+                raise TimeoutError("Capture observer serving thread did not stop")
+        # Only the serving thread adds handlers. The list is stable once it exits.
+        for handler in self._handlers:
+            if handler.is_alive():
+                handler.join(max(0, deadline - time.monotonic()))
+                if handler.is_alive():
+                    raise TimeoutError("Capture observer request handlers did not stop")
 
     def dispatch(self, body, outbound):
         history = classify(body)
@@ -314,13 +344,31 @@ def verify_scope():
     require(WORKSPACE.is_dir() and not any(WORKSPACE.iterdir()), "Use an empty synthetic stock workspace")
 
 
-def write_capture_evidence(path, data):
-    payload = json.dumps(data, allow_nan=False) + "\n"
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+@contextmanager
+def private_evidence_root(path):
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     with preserving_cleanup(lambda: os.close(directory), "evidence directory close"):
         info = os.fstat(directory)
         require(info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o077,
                 "Capture evidence directory must be private and owned")
+        yield directory
+
+
+def make_exposure_scratch(evidence_root):
+    with private_evidence_root(evidence_root) as directory:
+        created = Path(tempfile.mkdtemp(prefix=".oc-tools-exposure-", dir=f"/proc/self/fd/{directory}"))
+        root = evidence_root.absolute() / created.name
+        try:
+            require(os.path.samestat(created.lstat(), root.lstat()), "Capture evidence directory changed")
+        except BaseException:
+            with preserving_cleanup(created.rmdir, "uninitialized exposure scratch cleanup"):
+                raise
+        return root
+
+
+def write_capture_evidence(path, data):
+    payload = json.dumps(data, allow_nan=False) + "\n"
+    with private_evidence_root(path.parent) as directory:
         fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
         try:
             with preserving_cleanup(lambda: os.close(fd), "evidence descriptor close"):
@@ -359,33 +407,60 @@ def save_failed_capture(path, observer, stopped, primary):
         evidence["claims"] = claims
     else:
         primary.add_note(f"Synthetic exposure evidence {status}")
-    write_capture_evidence(path, {"requests": observer.requests, "phase": "failed", "exposure": evidence})
-    print(json.dumps(summarize(observer.requests)), file=sys.stderr)
+    report = {"phase": "failed", "exposure": evidence}
+    if stopped:
+        report["requests"] = observer.requests
+    write_capture_evidence(path, report)
+    if stopped:
+        print(json.dumps(summarize(observer.requests)), file=sys.stderr)
 
 
 def capture(command, evidence_path, case):
-    scratch = tempfile.TemporaryDirectory(prefix="oc-tools-")
-    with preserving_cleanup(scratch.cleanup, "capture scratch cleanup"):
-        root = Path(scratch.name)
-        observer = Observer(case, root / "synthetic-exposure.sqlite")
-        term = thread = None
-        primary = None
+    root = make_exposure_scratch(evidence_path.parent)
+    local_root = None
+    stopped = True
+
+    def remove_exposure_scratch():
+        if stopped:
+            shutil.rmtree(root)
+
+    def remove_local_scratch():
+        if stopped and local_root is not None:
+            shutil.rmtree(local_root)
+
+    with preserving_cleanup(remove_exposure_scratch, "exposure scratch cleanup"), \
+            preserving_cleanup(remove_local_scratch, "capture scratch cleanup"):
+        ledger = root / "synthetic-exposure.sqlite"
+        observer = Observer(case, ledger)
+        thread = None
+
+        def stop_observer():
+            nonlocal stopped
+            with preserving_cleanup(observer.server_close, "observer close"):
+                observer.stop(thread, time.monotonic() + OBSERVER_STOP_SECONDS)
+            stopped = True
+
         try:
-            home = root / "home"
-            home.mkdir(mode=0o700)
-            config = root / "opencode.json"
-            config.write_text(json.dumps(stock_config()))
-            env = {**JOB_ENV, "HOME": str(home), "OPENCODE_CONFIG": str(config)}
-            term = Terminal(root, env)
-            thread = Thread(target=observer.serve_forever)
-            thread.start()
-            term.start(*command, str(WORKSPACE))
-            term.await_screen(lambda screen: "Ask anything" in screen, "ordinary stock input", observer)
-            term.type_line(PROMPT)
-            if case == "tools":
-                term.await_screen(lambda screen: any(line.strip(" │┃▏●") == REPLY for line in screen.splitlines()),
-                                  "exact final reply", observer)
-            exported = await_idle(lambda: session_export(command, env), observer=observer)
+            with preserving_cleanup(stop_observer, "observer shutdown"):
+                local_root = Path(tempfile.mkdtemp(prefix="oc-tools-"))
+                local_identity = local_root.lstat()
+                home = local_root / "home"
+                home.mkdir(mode=0o700)
+                config = local_root / "opencode.json"
+                config.write_text(json.dumps(stock_config()))
+                env = {**JOB_ENV, "HOME": str(home), "OPENCODE_CONFIG": str(config)}
+                term = Terminal(local_root, env)
+                with preserving_cleanup(lambda: term.run("kill-server", check=False), "terminal cleanup"):
+                    thread = Thread(target=observer.serve_until_stopped, daemon=True)
+                    stopped = False
+                    thread.start()
+                    term.start(*command, str(WORKSPACE))
+                    term.await_screen(lambda screen: "Ask anything" in screen, "ordinary stock input", observer)
+                    term.type_line(PROMPT)
+                    if case == "tools":
+                        term.await_screen(lambda screen: any(line.strip(" │┃▏●") == REPLY for line in screen.splitlines()),
+                                          "exact final reply", observer)
+                    exported = await_idle(lambda: session_export(command, env), observer=observer)
             if case == "tools":
                 script = observer.upstream.script
                 records = observer.turns.records()
@@ -411,40 +486,46 @@ def capture(command, evidence_path, case):
                       "requests": summarize(observer.requests), "stock_export": exported, "abort": observer.abort,
                       "synthetic_claims": records, "synthetic_writes": observer.upstream.writes,
                       "local_titles": observer.local_titles, "earlier_prefix_refusals": observer.prefix_refusals}
-        except BaseException as error:
-            primary = error
+        except BaseException as primary:
+            if not stopped:
+                save_recovery_receipt(ledger, local_root, local_identity, primary)
+            try:
+                save_failed_capture(evidence_path, observer, stopped, primary)
+            except BaseException as evidence_error:
+                primary.add_note(f"Unable to save secondary evidence: {type(evidence_error).__name__}")
             raise
-        finally:
-            cleanup_primary = None
-            actions = []
-            if term is not None:
-                actions.append(("terminal cleanup", lambda: term.run("kill-server", check=False)))
-            if thread is not None and thread.ident is not None:
-                actions.extend((("observer shutdown", observer.shutdown),
-                                ("observer thread", lambda: thread.join(timeout=10))))
-            actions.append(("observer close", observer.server_close))
-            stopped = True
-            for description, action in actions:
-                try:
-                    action()
-                    if description == "observer thread":
-                        require(not thread.is_alive(), "Capture observer thread did not stop")
-                except BaseException as cleanup_error:
-                    if description != "terminal cleanup":
-                        stopped = False
-                    if primary is None:
-                        primary = cleanup_primary = cleanup_error
-                    else:
-                        primary.add_note(f"Unable to finish {description}: {type(cleanup_error).__name__}")
-            if primary is not None:
-                try:
-                    save_failed_capture(evidence_path, observer, stopped, primary)
-                except BaseException as evidence_error:
-                    primary.add_note(f"Unable to save secondary evidence: {type(evidence_error).__name__}")
-                if cleanup_primary is not None:
-                    raise cleanup_primary
         write_capture_evidence(evidence_path, {"requests": observer.requests, "report": report})
         print(json.dumps({key: value for key, value in report.items() if key != "stock_export"}))
+
+
+def terminal_socket_identity(local_root, local_identity):
+    with private_evidence_root(local_root) as directory:
+        if not os.path.samestat(os.fstat(directory), local_identity):
+            return None
+        info = os.stat("t", dir_fd=directory, follow_symlinks=False)
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
+        return None
+    return {"path": str(local_root / "t"), "device": info.st_dev, "inode": info.st_ino}
+
+
+def save_recovery_receipt(ledger, local_root, local_identity, primary):
+    root = ledger.parent
+    primary.add_note(f"Private synthetic exposure journal retained in {root}")
+    terminal_socket = {"status": "unavailable"}
+    try:
+        terminal_socket = terminal_socket_identity(local_root, local_identity) or terminal_socket
+    except BaseException:
+        # Volatile socket inspection cannot prevent the durable receipt.
+        pass
+    try:
+        write_capture_evidence(root / "recovery.json", {
+            "run_id": root.name,
+            "exposure_ledger": ledger.name,
+            "terminal_scratch": {"path": str(local_root), "device": local_identity.st_dev, "inode": local_identity.st_ino},
+            "terminal_socket": terminal_socket,
+        })
+    except BaseException as receipt_error:
+        primary.add_note(f"Unable to save private recovery receipt: {type(receipt_error).__name__}")
 
 
 def main():

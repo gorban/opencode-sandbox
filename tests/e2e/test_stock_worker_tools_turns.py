@@ -436,6 +436,20 @@ class FixtureTurnsTests(unittest.TestCase):
         self.assert_refused("Stale or expired")
         self.assertEqual(self.sent, [])
 
+    def test_unresolved_claim_rejects_equal_sqlite_real_reservation(self):
+        self.dispatch()
+        (original,) = self.turns.verified_records()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("ALTER TABLE exposure RENAME TO original_exposure")
+            db.execute("""CREATE TABLE exposure AS
+                SELECT sequence, authority, turn, parent, suffix, CAST(reserved_input AS REAL) AS reserved_input,
+                       reserved_output, actual_input, actual_output FROM original_exposure""")
+            self.assertEqual(db.execute("SELECT typeof(reserved_input) FROM exposure").fetchone(), ("real",))
+        self.assertEqual(self.turns.records(), [original])
+        with self.assertRaisesRegex(FixtureMismatch, "needs reconciliation"):
+            self.turns.verified_records()
+        self.assert_refused("Stale or expired")
+
     def test_overage_is_recorded_and_closes_grant(self):
         request = self.dispatch()
         pair = call_and_result("a")

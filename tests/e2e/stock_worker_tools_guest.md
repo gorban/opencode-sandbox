@@ -42,12 +42,23 @@ python3 -IB tests/e2e/test_stock_worker_tools_turns.py
 The capture writes a new mode 0600 evidence file in a private directory owned by the
 capture user. If the capture fails, it stops the observer and snapshots the bounded
 synthetic journal before removing scratch. An unresolved claim retains null usage
-only when the settled prefix and the exact claim match, including when SQLite
-commits before reporting an error. Cleanup errors accompany the original failure
-as exception notes. A missing or invalid journal produces an unavailable or corrupt
-status. Record the evidence SHA-256 and the source revision. The capture is a loopback proof with a
-synthetic accounting store. The public launcher, production broker and TLS peer are exercised by
-the separate sealed guest procedure below.
+only when the settled prefix and the exact claim values and SQLite types match,
+including when SQLite commits before reporting an error. Observer serving and
+request handlers share one shutdown deadline. If their exit cannot be confirmed,
+the capture retains the journal and an owner-only recovery receipt in a private
+child of the persistent evidence directory. The raised diagnostic gives that
+location and the requested failure evidence gives only the unavailable status.
+On the host, the same run directory is under the evidence bind's source path.
+Terminal scratch uses the namespace's short local path while it may still be
+in use. It can disappear with the namespace while the journal and receipt
+survive. The receipt records the run and local scratch identity. It includes the
+tmux socket identity when verified and records it as unavailable otherwise.
+Cleanup errors accompany the original failure as
+exception notes. A missing or invalid journal produces an unavailable or
+corrupt status. Record the evidence SHA-256 and the source revision. The
+capture is a loopback proof with a synthetic accounting store. The separate
+sealed guest procedure below exercises the public launcher, production broker
+and TLS peer.
 
 ## Pinned built-in inventory
 

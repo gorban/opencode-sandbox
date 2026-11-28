@@ -138,8 +138,13 @@ class FixtureTurns:
 
     def _verify_journal(self, rows, *, request=None):
         try:
-            matched = (digest(rows) == self._anchor if request is None
-                       else bool(rows) and digest(rows[:-1]) == self._anchor and rows[-1] == self._claimed_row(request))
+            if request is None:
+                matched = digest(rows) == self._anchor
+            else:
+                matched = bool(rows) and digest(rows[:-1]) == self._anchor and all(
+                    type(value) is type(expected) and value == expected
+                    for value, expected in zip(rows[-1], self._claimed_row(request), strict=True)
+                )
         except (TypeError, ValueError):
             matched = False
         if not matched:

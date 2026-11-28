@@ -1,17 +1,21 @@
 """Inert guards for the offline worker-tools proof fixtures."""
 
-from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, nullcontext
 from copy import deepcopy
 from io import StringIO
 import json
 import os
 from pathlib import Path
 import runpy
+import shutil
+import socket
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+from threading import Event
 import unittest
 from unittest.mock import MagicMock, call, patch
 
@@ -20,7 +24,7 @@ sys.path[:0] = [str(ROOT), str(Path(__file__).resolve().parent)]
 
 from oc_openai.session_broker import SessionBroker
 from oc_openai.session_protocol import ReasoningVault, SessionStreamProjector, StreamAborted
-from stock_worker_tools_capture import AUTHORITY, Observer, Terminal, await_idle, capture, verify_scope
+from stock_worker_tools_capture import AUTHORITY, Observer, Terminal, WireHandler, await_idle, capture, verify_scope
 from stock_worker_tools_history import stock_history
 from stock_worker_tools_guest import (
     HOLD_READER, TCP_CONNECT, WIRE, broker_exchange, confirm_foreground, reap_held_child, run_cleanup,
@@ -102,15 +106,15 @@ class CaptureGuardTests(unittest.TestCase):
             self.assertEqual((row["sequence"], row["actual_input"], row["actual_output"]), (1, None, None))
 
     def test_failed_capture_preserves_primary_when_scratch_cleanup_raises(self):
-        cleanup = tempfile.TemporaryDirectory.cleanup
+        cleanup = shutil.rmtree
 
-        def fail_cleanup(scratch):
-            cleanup(scratch)
+        def fail_cleanup(path, *args, **kwargs):
+            cleanup(path, *args, **kwargs)
             raise OSError("synthetic scratch cleanup failure")
 
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "failure.json"
-            with patch.object(tempfile.TemporaryDirectory, "cleanup", fail_cleanup):
+            with patch.object(shutil, "rmtree", fail_cleanup):
                 primary, observed = self.capture_with_failed_send(evidence)
             self.assertEqual(json.loads(evidence.read_text())["exposure"],
                              {"status": "verified", "claims": observed["rows"]})
@@ -131,6 +135,161 @@ class CaptureGuardTests(unittest.TestCase):
             with patch.object(Observer, "server_close", fail_second_close):
                 _, observed = self.capture_with_failed_send(evidence)
             self.assertEqual(closed, [observed["observer"]])
+
+    def test_capture_deadline_retains_journal_while_observer_may_still_write(self):
+        for stalled_in in ("serving", "handler"):
+            with self.subTest(stalled_in=stalled_in), tempfile.TemporaryDirectory() as directory:
+                self.assert_stalled_observer_retains_journal(stalled_in, Path(directory) / "failure.json")
+
+    def test_observer_joins_serving_and_handlers_with_one_remaining_budget(self):
+        with tempfile.TemporaryDirectory() as directory, patch("stock_worker_tools_capture.PORT", 0), \
+                patch("stock_worker_tools_capture.time.monotonic", side_effect=[10, 13, 14]):
+            observer = Observer("tools", Path(directory) / "exposure.sqlite")
+            self.addCleanup(observer.server_close)
+            serving, first, second = [MagicMock() for _ in range(3)]
+            for thread in (serving, first, second):
+                thread.is_alive.side_effect = [True, False]
+            observer._handlers = [first, second]
+            observer.stop(serving, deadline=15)
+        serving.join.assert_called_once_with(5)
+        first.join.assert_called_once_with(2)
+        second.join.assert_called_once_with(1)
+
+    def test_private_recovery_survives_fixture_scope_and_volatile_scratch_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            durable = Path(directory) / "evidence"
+            volatile = Path(directory) / "volatile"
+            for folder in (durable, volatile):
+                folder.mkdir(mode=0o700)
+            evidence = durable / "failure.json"
+            result = subprocess.run((sys.executable, "-B", "-c",
+                                     "from pathlib import Path\n"
+                                     "from sys import argv\n"
+                                     "from test_stock_worker_tools_guards import CaptureGuardTests\n"
+                                     "CaptureGuardTests().assert_stalled_observer_retains_journal('handler', Path(argv[1]))",
+                                     str(evidence)),
+                                    cwd=Path(__file__).resolve().parent, env={"TMPDIR": str(volatile)},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            shutil.rmtree(volatile)
+            (journal,) = durable.glob("*/synthetic-exposure.sqlite")
+            self.assertEqual(stat.S_IMODE(journal.parent.stat().st_mode), 0o700)
+            with closing(sqlite3.connect(journal)) as db:
+                self.assertEqual(db.execute("SELECT sequence, actual_input FROM exposure").fetchall(), [(1, None)])
+            receipt = journal.parent / "recovery.json"
+            self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
+            details = json.loads(receipt.read_text())
+            self.assertEqual(details["run_id"], journal.parent.name)
+            self.assertEqual(details["exposure_ledger"], journal.name)
+            scratch = details["terminal_scratch"]
+            self.assertFalse(Path(scratch["path"]).exists())
+            self.assertTrue(Path(scratch["path"]).is_relative_to(volatile))
+            self.assertTrue(type(scratch["device"]) is int and type(scratch["inode"]) is int)
+            socket_identity = details["terminal_socket"]
+            self.assertEqual(Path(socket_identity["path"]), Path(scratch["path"]) / "t")
+            self.assertTrue(type(socket_identity["device"]) is int and type(socket_identity["inode"]) is int)
+            self.assertEqual(json.loads(evidence.read_text()),
+                             {"phase": "failed", "exposure": {"status": "unavailable"}})
+
+    def test_private_recovery_receipt_survives_unavailable_socket_probe(self):
+        cases = (
+            ("scratch mode changed", lambda root: root.chmod(0o750), nullcontext()),
+            ("socket probe failed", None, patch("stock_worker_tools_capture.terminal_socket_identity",
+                                               side_effect=OSError("synthetic private socket probe failure"))),
+        )
+        for reason, change_scratch, probe in cases:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory, probe:
+                observed = self.assert_stalled_observer_retains_journal(
+                    "handler", Path(directory) / "failure.json", change_scratch=change_scratch,
+                )
+                ledger = observed["ledger"]
+                with closing(sqlite3.connect(ledger)) as db:
+                    self.assertEqual(db.execute("SELECT sequence, actual_input FROM exposure").fetchall(), [(1, None)])
+                scratch = observed["terminal_scratch"]
+                identity = scratch.stat()
+                receipt = ledger.parent / "recovery.json"
+                self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
+                self.assertEqual(json.loads(receipt.read_text()), {
+                    "run_id": ledger.parent.name,
+                    "exposure_ledger": ledger.name,
+                    "terminal_scratch": {"path": str(scratch), "device": identity.st_dev, "inode": identity.st_ino},
+                    "terminal_socket": {"status": "unavailable"},
+                })
+
+    def assert_stalled_observer_retains_journal(self, stalled_in, evidence, *, change_scratch=None):
+        entered = Event()
+        released = Event()
+        finished = Event()
+        primary = RuntimeError("synthetic terminal failure")
+        observed = {}
+        accept = Observer.get_request
+
+        def wait_for_release():
+            entered.set()
+            try:
+                self.assertTrue(released.wait(5))
+            finally:
+                finished.set()
+
+        def stall_serving(observer):
+            client, address = accept(observer)
+            wait_for_release()
+            return client, address
+
+        def stall_handler(handler):
+            handler.server.requests.append({"synthetic_private_marker": "unsettled request"})
+            wait_for_release()
+
+        def start_terminal(term, *_args):
+            socket_path = Path(term.command[4])
+            observed["terminal_scratch"] = socket_path.parent
+            with closing(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as listener:
+                listener.bind(str(socket_path))
+
+        def fail_terminal(_predicate, _description, observer):
+            observed["ledger"] = observer.turns._path
+            observed["observer"] = observer
+            observed["snapshot"] = MagicMock(wraps=observer.turns.verified_records)
+            observer.turns.verified_records = observed["snapshot"]
+            history = stock_history([{"type": "message", "role": "user",
+                                      "content": [{"type": "input_text", "text": PROMPT}]}])
+            observer.turns.dispatch(AUTHORITY, "ses_capture", history, lambda _request: None)
+            with socket.create_connection(observer.server_address, timeout=2) as client:
+                client.sendall(b"GET /fixture HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                self.assertTrue(entered.wait(2))
+            if change_scratch is not None:
+                change_scratch(observed["terminal_scratch"])
+            raise primary
+
+        fixture = "stock_worker_tools_capture"
+        stall = (patch.object(Observer, "get_request", stall_serving) if stalled_in == "serving"
+                 else patch.object(WireHandler, "do_GET", stall_handler, create=True))
+        with stall, patch(f"{fixture}.PORT", 0), patch(f"{fixture}.OBSERVER_STOP_SECONDS", .2, create=True), \
+                patch(f"{fixture}.stock_config", return_value={}), patch.object(Terminal, "start", start_terminal), \
+                patch.object(Terminal, "run"), patch.object(Terminal, "await_screen", side_effect=fail_terminal), \
+                patch("sys.stderr", StringIO()) as stderr, ThreadPoolExecutor() as pool:
+            result = pool.submit(capture, ("/unused-stock-fixture",), evidence, "tools")
+            try:
+                with self.assertRaisesRegex(RuntimeError, "synthetic terminal failure") as raised:
+                    result.result(timeout=2)
+                self.assertIs(raised.exception, primary)
+                ledger = observed["ledger"]
+                self.assertTrue(ledger.is_file())
+                self.assertEqual(stat.S_IMODE(ledger.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(ledger.stat().st_mode), 0o600)
+                self.assertEqual(observed["observer"].socket.fileno(), -1)
+                self.assertTrue(any(str(ledger.parent) in note for note in primary.__notes__))
+                self.assertFalse(finished.is_set())
+                observed["snapshot"].assert_not_called()
+                self.assertEqual(json.loads(evidence.read_text()),
+                                 {"phase": "failed", "exposure": {"status": "unavailable"}})
+                self.assertEqual(stderr.getvalue(), "")
+            finally:
+                released.set()
+                self.assertTrue(finished.wait(2))
+                for root in {observed["ledger"].parent, observed["terminal_scratch"]}:
+                    self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        return observed
 
     def test_failed_capture_marks_damaged_journal_without_inventing_claims(self):
         def alter_ledger(path):
