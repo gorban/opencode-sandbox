@@ -23,11 +23,18 @@ import time
 _SCRIPT = Path(__file__).resolve(strict=True)
 _SOURCE = Path("/opt/oc-r3/appliance")
 _SEALED_RUNNER = _SOURCE / "custody" / "run.py"
+_POSIX_STARTUP = {"LC_ALL": "C"}
+
+
+def _sealed_environment(pin):
+    return {**_POSIX_STARTUP, "OC_R3_PREIMPORT": pin}
+
+
 if __name__ == "__main__":
     sealed_entry = sys.argv[1:2] in (["sealed"], ["restart"])
     if sealed_entry or os.geteuid() == 0:
         if (not sealed_entry or os.geteuid() != 0 or _SCRIPT != _SEALED_RUNNER
-                or len(sys.argv) < 3 or os.environ != {"OC_R3_PREIMPORT": sys.argv[2]}):
+                or len(sys.argv) < 3 or os.environ != _sealed_environment(sys.argv[2])):
             if sys.argv[1:2] != ["role"]:
                 print('{"result":"sealed_unavailable"}')
             sys.exit(2)
@@ -100,7 +107,7 @@ def _sealed_preflight(pin, evidence):
             or not sys.flags.isolated or not sys.flags.no_site or not sys.flags.dont_write_bytecode
             or not fingerprint(pin) or not fingerprint(evidence)):
         raise Unavailable("sealed service preconditions unavailable")
-    if os.environ != {"OC_R3_PREIMPORT": pin}:
+    if os.environ != _sealed_environment(pin):
         raise Unavailable("independent pre-import measurement required")
     if not {name for _, name in socket.if_nameindex()} <= {"lo"}:
         raise Unavailable("guest network adapter must be detached")
@@ -294,8 +301,8 @@ class Appliance:
         if len(encoded) > 8192:
             raise CustodyRefused("role config exceeds limit")
         home = self.homes["legacy" if role in ("legacy-probe", "sibling") else role]
-        return _spawn_report(_role_command(uid, gid, role), {"HOME": str(home), "OC_R3_ROLE": encoded},
-                             inherited.values(), self.children)
+        environment = {**_POSIX_STARTUP, "HOME": str(home), "OC_R3_ROLE": encoded}
+        return _spawn_report(_role_command(uid, gid, role), environment, inherited.values(), self.children)
 
     def count(self):
         files = sorted(self.scope.glob("send-*"))
@@ -563,7 +570,8 @@ def _restart(pin, evidence, handle):
 def _role_main(role, report):
     if os.geteuid() == 0 or _SCRIPT != _SEALED_RUNNER or not sys.flags.isolated:
         raise Unavailable("measured child entry unavailable")
-    if set(os.environ) != {"HOME", "OC_R3_ROLE"} or len(os.environ["OC_R3_ROLE"]) > 8192:
+    if (set(os.environ) != {"LC_ALL", "HOME", "OC_R3_ROLE"} or os.environ["LC_ALL"] != _POSIX_STARTUP["LC_ALL"]
+            or len(os.environ["OC_R3_ROLE"]) > 8192):
         raise Unavailable("invalid measured child environment")
     config = json.loads(os.environ["OC_R3_ROLE"])
     if role == "legacy":

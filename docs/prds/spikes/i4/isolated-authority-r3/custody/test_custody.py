@@ -185,6 +185,161 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(command[-2:], ["role", "holder"])
 
 
+class StartupEnvironmentTests(unittest.TestCase):
+    pin = "1" * 64
+    evidence = "2" * 64
+    posix = {"LC_ALL": "C"}
+    controller = {**posix, "OC_R3_PREIMPORT": pin}
+
+    def probe(self, source, environment, *arguments):
+        return subprocess.run(
+            ["/usr/bin/python3", "-I", "-S", "-B", "-c", source, str(ROOT), self.pin, self.evidence, *arguments],
+            env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
+        )
+
+    def test_bootstrap_exact_environment_and_actual_exec(self):
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        entry = scratch / "inert-entry.py"
+        entry.write_text("import json, os, sys\nprint(json.dumps([dict(os.environ), sys.argv[1]]))\n")
+        source = r"""
+from contextlib import nullcontext
+from pathlib import Path
+import sys
+root, pin, evidence, scratch = sys.argv[1:]
+sys.path.insert(0, root)
+import preflight
+preflight.BOOTSTRAP = Path(preflight.__file__).resolve()
+preflight.os.getuid = preflight.os.geteuid = lambda: 0
+preflight._install_pins = lambda _pin: None
+preflight._run_checked = lambda _root, _pin, args, activate, sealed: activate(Path(scratch), args)
+with open("/dev/null", "rb") as dummy:
+    preflight._proc_self = lambda **_flags: nullcontext(dummy.fileno())
+    raise SystemExit(preflight.main(["sealed", pin, evidence]))
+"""
+        # On Fedora the former empty env was already nonempty by this point.
+        observed = self.probe("import json, os; print(json.dumps(dict(os.environ)))", {})
+        self.assertIn(json.loads(observed.stdout), ({}, {"LC_CTYPE": "C.UTF-8"}))
+        accepted = self.probe(source, self.posix, str(entry.resolve()))
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(json.loads(accepted.stdout), [self.controller, "sealed"])
+        for environment in ({}, {"LC_ALL": "C.UTF-8"},
+                            {**self.posix, "LC_CTYPE": "C.UTF-8"}, {**self.posix, "HOME": "/fixture"}):
+            with self.subTest(environment=environment):
+                rejected = self.probe(source, environment, str(entry.resolve()))
+                self.assertEqual(rejected.returncode, 2, rejected.stderr)
+                self.assertEqual(json.loads(rejected.stdout), {"result": "preimport_refused"})
+
+    def test_measured_controller_import_gate_checks_the_same_environment(self):
+        source = r"""
+from pathlib import Path
+from types import ModuleType
+from unittest.mock import patch
+import runpy, sys
+root, pin, evidence = sys.argv[1:]
+entry = Path(root) / "run.py"
+real_resolve = Path.resolve
+class ImportReached(Exception):
+    pass
+
+class Tripwire(ModuleType):
+    def __getattr__(self, name):
+        raise ImportReached
+
+def resolve(path, **kwargs):
+    if path == entry:
+        return Path("/opt/oc-r3/appliance/custody/run.py")
+    return real_resolve(path, **kwargs)
+sys.argv = [str(entry), "sealed", pin, evidence]
+sys.modules["bootstrap"] = Tripwire("bootstrap")
+with patch("os.geteuid", return_value=0), patch.object(Path, "resolve", resolve):
+    try:
+        runpy.run_path(str(entry), run_name="__main__")
+    except ImportReached:
+        print("candidate import reached")
+"""
+        accepted = self.probe(source, self.controller)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(accepted.stdout, "candidate import reached\n")
+        for environment in (self.posix, {"OC_R3_PREIMPORT": self.pin},
+                            {**self.controller, "OC_R3_PREIMPORT": "0" * 64},
+                            {**self.controller, "LC_CTYPE": "C.UTF-8"}):
+            with self.subTest(environment=environment):
+                rejected = self.probe(source, environment)
+                self.assertEqual(rejected.returncode, 2, rejected.stderr)
+                self.assertEqual(json.loads(rejected.stdout), {"result": "sealed_unavailable"})
+
+    def test_controller_preflight_refuses_wrong_or_additional_environment(self):
+        source = r"""
+from contextlib import nullcontext
+from pathlib import Path
+import json, sys
+root, pin, evidence = sys.argv[1:]
+sys.path[:0] = [root, str(Path(root).parent / "spike"), str(Path(root).parent)]
+import run
+run.os.geteuid = lambda: 0
+run._SCRIPT = Path("/opt/oc-r3/appliance/custody/run.py")
+run.socket.if_nameindex = lambda: [(1, "lo")]
+run.os.listdir = lambda _path: ["lo"]
+run._private_root = lambda *_args: None
+run.proc_self = lambda **_flags: nullcontext(0)
+run._mount_identity = lambda path, _proc: (path.name, len(path.name) if path.name == "r3h" else 11)
+run.verify_bundle = lambda *_args, **_kwargs: {"overlay": run.CORRECTED_OVERLAY}
+run.role_accounts = lambda: {}
+try:
+    run._sealed_preflight(pin, evidence)
+except run.Unavailable:
+    print("refused")
+else:
+    print(json.dumps(dict(run.os.environ)))
+"""
+        accepted = self.probe(source, self.controller)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(json.loads(accepted.stdout), self.controller)
+        for environment in (self.posix, {"OC_R3_PREIMPORT": self.pin},
+                            {**self.controller, "OC_R3_PREIMPORT": "0" * 64},
+                            {**self.controller, "LC_ALL": "C.UTF-8"},
+                            {**self.controller, "LC_CTYPE": "C.UTF-8"},
+                            {**self.controller, "HOME": "/fixture"}):
+            with self.subTest(environment=environment):
+                rejected = self.probe(source, environment)
+                self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                self.assertEqual(rejected.stdout, "refused\n")
+
+    def test_spawned_role_observes_exact_environment_and_rejects_variations(self):
+        source = r"""
+from pathlib import Path
+import json, os, sys
+root = sys.argv[1]
+sys.path[:0] = [root, str(Path(root).parent / "spike"), str(Path(root).parent)]
+import run
+run._SCRIPT = Path("/opt/oc-r3/appliance/custody/run.py")
+run.run_role = lambda role, config, report: {"role": role, "config": config, "environment": dict(os.environ)}
+try:
+    print(json.dumps(run._role_main("worker", (0, 0))))
+except run.Unavailable:
+    print("refused")
+"""
+        from run import _read_report, _retire_role
+
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        fixture = SimpleNamespace(identities={"worker": (1000, 1000)}, homes={"worker": home}, children=[])
+        with patch("run._role_command", return_value=["/usr/bin/python3", "-I", "-S", "-B", "-c", source, str(ROOT)]):
+            process = Appliance.spawn(fixture, "worker", {})
+        self.addCleanup(_retire_role, process)
+        accepted = _read_report(process)
+        config = {"uid": 1000, "gid": 1000, "fds": {}}
+        expected = {**self.posix, "HOME": str(home), "OC_R3_ROLE": json.dumps(config, separators=(",", ":"))}
+        self.assertEqual(accepted, {"role": "worker", "config": config, "environment": expected})
+        for environment in ({**expected, "LC_ALL": "C.UTF-8"},
+                            {**expected, "LC_CTYPE": "C.UTF-8"}, {**expected, "PYTHONCOERCECLOCALE": "0"},
+                            *(dict((key, value) for key, value in expected.items() if key != unset)
+                              for unset in expected)):
+            with self.subTest(environment=environment):
+                rejected = self.probe(source, environment)
+                self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                self.assertEqual(rejected.stdout, "refused\n")
+
+
 class IndependentPreflightTests(unittest.TestCase):
     def setUp(self):
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()

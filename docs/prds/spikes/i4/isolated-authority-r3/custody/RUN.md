@@ -90,8 +90,12 @@ library. It opens the candidate through no-follow descriptors, checks the
 kernel mount and superblock read-only flags and rejects any nested or aliased
 mount before measuring and executing candidate code.
 
-The root service uses a cleared environment, standard descriptors, fixed
-working directory and the independently pinned bundle digest. Preserve the
+The root service clears the environment and sets only `LC_ALL=C` before
+bootstrap. The fixed POSIX locale keeps CPython from adding `LC_CTYPE` during
+startup. The bootstrap also passes the pinned bundle digest to the measured
+controller. Each role receives only the fixed locale, its private `HOME`
+and its bounded role frame. The service uses standard descriptors and a
+fixed working directory. Preserve the
 storage evidence outside the holder's rollback domain. The two service
 executions use the same evidence that restoring the holder leaves the
 external controller volume intact. The runner checks different kernel
@@ -99,9 +103,9 @@ devices and mount identities. The operator's external evidence establishes
 which snapshots the controller and holder can restore.
 
 ```sh
-/usr/bin/python3 -I -S -B /usr/libexec/oc-r3-preflight.py sealed "$manifest_sha256" "$storage_evidence_sha256"
+/usr/bin/env -i LC_ALL=C /usr/bin/python3 -I -S -B /usr/libexec/oc-r3-preflight.py sealed "$manifest_sha256" "$storage_evidence_sha256"
 # After service exit and verified original process retirement, use the returned handle.
-/usr/bin/python3 -I -S -B /usr/libexec/oc-r3-preflight.py restart "$manifest_sha256" "$storage_evidence_sha256" "$restart_handle"
+/usr/bin/env -i LC_ALL=C /usr/bin/python3 -I -S -B /usr/libexec/oc-r3-preflight.py restart "$manifest_sha256" "$storage_evidence_sha256" "$restart_handle"
 ```
 
 The first process returns `sealed_synthetic_retained` with an opaque handle.

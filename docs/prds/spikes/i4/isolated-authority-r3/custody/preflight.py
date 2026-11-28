@@ -15,6 +15,7 @@ SOURCE = Path("/opt/oc-r3/appliance")
 INSTALLATION = Path("/etc/oc-r3/service.json")
 BOOTSTRAP = Path("/usr/libexec/oc-r3-preflight.py")
 PYTHON = "/usr/bin/python3"
+_POSIX_STARTUP = {"LC_ALL": "C"}
 LEGACY = "fa6d7f4f807ddda140eadb2e98a285a4133753b8"
 PLAN_OVERLAY = "0f196987923eefe25d7dc9b971b990d7e0ed8f6d"
 CORRECTED_OVERLAY = "6f8b05686e38730c8245ee41afc3e14ba9ad8873"
@@ -309,14 +310,15 @@ def _check_entry_descriptors(proc, proc_root):
 
 def _exec(entry, args):
     os.chdir("/")
-    os.execve(PYTHON, [PYTHON, "-I", "-S", "-B", str(entry), *args], {"OC_R3_PREIMPORT": args[1]})
+    os.execve(PYTHON, [PYTHON, "-I", "-S", "-B", str(entry), *args],
+              {**_POSIX_STARTUP, "OC_R3_PREIMPORT": args[1]})
 
 
 def main(args):
     try:
         if (os.getuid() != 0 or os.geteuid() != 0 or Path(__file__).resolve() != BOOTSTRAP
                 or not sys.flags.isolated or not sys.flags.no_site or not sys.flags.dont_write_bytecode
-                or os.environ or len(args) not in (3, 4) or args[0] not in ("sealed", "restart")
+                or os.environ != _POSIX_STARTUP or len(args) not in (3, 4) or args[0] not in ("sealed", "restart")
                 or bool(len(args) == 4) != (args[0] == "restart")
                 or not all(_DIGEST.fullmatch(value) for value in args[1:3])
                 or (len(args) == 4 and not _HANDLE.fullmatch(args[3]))):
