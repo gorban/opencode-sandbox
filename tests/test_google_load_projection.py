@@ -1,0 +1,274 @@
+"""Keep legacy LOAD bytes and project only the pinned native early-return shape."""
+
+from copy import deepcopy
+import json
+import time
+import unittest
+
+from oc_google.account_binding import bind_subject
+from oc_google.enrollment import EnrollmentMetadataError, LoadObservation, _LoadCodeAssist
+from oc_google.metadata_destination import MetadataRoute
+from oc_google.token_diagnostic import CurrentTierDetail, LoadBodyReason, OriginalProjectDetail
+
+
+PROJECT = "synthetic-projection-project"
+BEARER = b"synthetic-load-bearer"
+CURRENT = {"id": "free-tier", "name": "Synthetic current", "usesGcpTos": False}
+PAID = {"id": "paid-tier", "name": "Synthetic paid"}
+PROJECTED = {"currentTier": CURRENT, "paidTier": PAID, "cloudaicompanionProject": PROJECT}
+
+
+def rich_load():
+    return {
+        "currentTier": {**CURRENT, "description": "Fixture description",
+                        "privacyNotice": {"showNotice": True}, "availableCredits": [{"label": "fixture"}],
+                        "upgradeSubscriptionType": "UPGRADE", "userDefinedCloudaicompanionProject": False},
+        "cloudaicompanionProject": PROJECT,
+        "paidTier": {**PAID, "referralInviteUri": "https://fixture.invalid/invite", "upgradeSubscriptionType": 1},
+        "allowedTiers": [{"id": "free-tier", "name": "Synthetic current", "usesGcpTos": False},
+                         {"id": "paid-tier"}, {"id": "managed-other", "usesGcpTos": True,
+                                              "userDefinedCloudaicompanionProject": True}],
+        "ineligibleTiers": [{"tierId": "negative-other", "reasonCode": 1, "reasonMessage": "Synthetic not offered"}],
+        "projectValidationError": None,
+        "gcpManaged": False,
+        "releaseChannel": {"type": "STABLE", "name": "fixture"},
+        "manageSubscriptionUri": "https://fixture.invalid/manage",
+        "upgradeSubscriptionUri": None,
+        "g1Tier": "fixture",
+    }
+
+
+def encode(fields):
+    return json.dumps(fields, separators=(",", ":")).encode("ascii")
+
+
+class LoadProjectionTests(unittest.TestCase):
+    def load(self, body):
+        proof = bind_subject(b"x" * 32, BEARER, b'{"id":"2898"}')
+        writes = []
+
+        def destination(route, *, authorization, deadline, deliver, **kwargs):
+            self.assertIs(route, MetadataRoute.LOAD_CODE_ASSIST)
+            self.assertEqual(authorization, b"Bearer " + BEARER)
+            deliver(lambda: writes.append(route))
+            return body
+
+        load = _LoadCodeAssist(proof, time.monotonic() + 3, lambda _route, send: send(), destination)
+        try:
+            return load(authorization=b"Bearer " + BEARER, body=b'{"metadata":{"ideType":"ANTIGRAVITY"}}')
+        finally:
+            self.assertEqual(writes, [MetadataRoute.LOAD_CODE_ASSIST])
+
+    def test_legacy_replies_are_forwarded_byte_for_byte(self):
+        variants = (
+            (b' { }\n', False, False),
+            (b'{ "cloudaicompanionProject" : "project-one" }', False, True),
+            (b'{"currentTier" : {"name":"Plan", "id":"free"}}\r\n', True, False),
+            (b'{ "cloudaicompanionProject": "project-one", "currentTier":{"name":"Plan","id":"free"} }', True, True),
+        )
+        for raw, tier, project in variants:
+            with self.subTest(tier=tier, project=project):
+                reply = self.load(raw)
+                self.assertIs(reply.body, raw)
+                self.assertEqual(reply.observation, LoadObservation(tier, project))
+
+    def test_rich_reply_projects_exact_active_tier_project_and_policy(self):
+        raw = encode(rich_load())
+        reply = self.load(raw)
+        self.assertEqual(json.loads(reply.body), PROJECTED)
+        self.assertEqual(reply.observation, LoadObservation(True, True))
+        self.assertNotIn(b"fixture.invalid", reply.body)
+
+    def test_null_paid_and_missing_family_flag_do_not_synthesize_fields(self):
+        value = rich_load()
+        value["paidTier"] = None
+        del value["currentTier"]["usesGcpTos"]
+        value["allowedTiers"] = None
+        value["ineligibleTiers"] = None
+        expected = {"currentTier": {"id": CURRENT["id"], "name": CURRENT["name"]},
+                    "cloudaicompanionProject": PROJECT}
+        self.assertEqual(json.loads(self.load(encode(value)).body), expected)
+
+    def test_non_personal_or_missing_original_branch_is_refused(self):
+        matrix = (
+            ("currentTier", None, True), ("cloudaicompanionProject", None, True),
+            ("cloudaicompanionProject", "", False), ("currentTier", {"name": "Plan"}, False),
+            ("gcpManaged", True, False), ("gcpManaged", None, False),
+            ("projectValidationError", {}, False), ("projectValidationError", False, False),
+            ("paidTier", {"id": "paid"}, False), ("unexpected", True, False),
+        )
+        for key, invalid, missing in matrix:
+            with self.subTest(key=key, missing=missing, invalid=invalid):
+                fields = rich_load()
+                if missing:
+                    fields.pop(key)
+                else:
+                    fields[key] = invalid
+                raw = encode(fields)
+                with self.assertRaises(EnrollmentMetadataError):
+                    self.load(raw)
+        for tier in ("paidTier", "currentTier"):
+            for key in ("usesGcpTos", "userDefinedCloudaicompanionProject"):
+                for invalid in (True, None, 0, "false"):
+                    with self.subTest(tier=tier, key=key, invalid=invalid):
+                        fields = rich_load()
+                        fields[tier][key] = invalid
+                        raw = encode(fields)
+                        with self.assertRaises(EnrollmentMetadataError):
+                            self.load(raw)
+
+    def test_contradictory_active_alternatives_and_negative_entries_are_refused(self):
+        alternatives = [
+            {"id": "free-tier", "name": "Different"},
+            {"id": "paid-tier", "usesGcpTos": True},
+            {"id": "free-tier", "userDefinedCloudaicompanionProject": True},
+            {"id": "paid-tier", "isDefault": 1},
+        ]
+        for row in alternatives:
+            with self.subTest(row=row):
+                fields = rich_load()
+                fields["allowedTiers"] = [row]
+                raw = encode(fields)
+                with self.assertRaises(EnrollmentMetadataError):
+                    self.load(raw)
+        for key, invalid in (
+            ("allowedTiers", [{"id": "other"}, {"id": "other"}]),
+            ("allowedTiers", [{"name": "No ID"}]),
+            ("ineligibleTiers", [{"tierId": "free-tier"}]),
+            ("ineligibleTiers", [{"tierId": "paid-tier"}]),
+            ("ineligibleTiers", [{"tierId": "other"}, {"tierId": "other"}]),
+            ("ineligibleTiers", [{"tierId": "other", "otherReason": "fixture"}]),
+            ("ineligibleTiers", [{"tierId": "other", "reasonCode": -1}]),
+            ("ineligibleTiers", [{"tierId": "other", "reasonMessage": True}]),
+        ):
+            with self.subTest(key=key, invalid=invalid):
+                fields = rich_load()
+                fields[key] = invalid
+                raw = encode(fields)
+                with self.assertRaises(EnrollmentMetadataError):
+                    self.load(raw)
+
+    def test_rich_schema_checks_types_nulls_and_bounds(self):
+        for key, invalid in (
+            ("description", None), ("description", "\n"), ("name", "a" * 257), ("privacyNotice", []),
+            ("availableCredits", {}), ("availableCredits", [1]), ("isDefault", "false"),
+            ("upgradeSubscriptionType", 2 ** 31), ("upgradeSubscriptionType", -1),
+            ("upgradeSubscriptionType", "with space"), ("arbitrary", "not a descriptor field"),
+        ):
+            with self.subTest(key=key, invalid=invalid):
+                fields = rich_load()
+                fields["currentTier"][key] = invalid
+                raw = encode(fields)
+                with self.assertRaises(EnrollmentMetadataError):
+                    self.load(raw)
+        for key, invalid in (
+            ("releaseChannel", []), ("releaseChannel", None),
+            ("releaseChannel", {"rows": [0] * 17}),
+            ("releaseChannel", {"rows": {str(i): False for i in range(25)}}),
+            ("releaseChannel", {"a": {"b": {"c": {"d": {"e": {"too": "deep"}}}}}}),
+            ("releaseChannel", {"long": "é" * 513}), ("manageSubscriptionUri", 1), ("g1Tier", "\n"),
+            ("releaseChannel", {str(i): "x" * 1024 for i in range(16)}),
+        ):
+            with self.subTest(key=key):
+                fields = rich_load()
+                fields[key] = invalid
+                raw = encode(fields)
+                with self.assertRaises(EnrollmentMetadataError):
+                    self.load(raw)
+
+    def test_rich_json_refuses_duplicates_nonfinite_and_surrogate(self):
+        value = deepcopy(rich_load())
+        for literal in (b'{"key":1,"key":2}', b'{"key":NaN}', b'{"key":1e999}', b'{"key":"\\ud800"}'):
+            with self.subTest(literal=literal):
+                value["releaseChannel"] = "PLACEHOLDER"
+                raw = encode(value).replace(b'"PLACEHOLDER"', literal)
+                with self.assertRaises(EnrollmentMetadataError):
+                    self.load(raw)
+
+    def test_bounded_body_reports_independent_failed_groups_in_order(self):
+        fields = rich_load()
+        del fields["cloudaicompanionProject"]
+        fields.update({
+            "synthetic-unapproved-key": "synthetic-private-value",
+            "currentTier": {"id": "synthetic-tier-id", "name": 3, "usesGcpTos": True},
+            "paidTier": {"name": "Synthetic incomplete paid"},
+            "releaseChannel": None,
+            "allowedTiers": [{"id": "repeat"}, {"id": "repeat"}],
+        })
+        raw = encode(fields)
+        with self.assertRaises(EnrollmentMetadataError) as refusal:
+            self.load(raw)
+        self.assertEqual(refusal.exception.load_body_reasons, (
+            LoadBodyReason.TOP_LEVEL_FIELDS, LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT,
+            LoadBodyReason.PAID_TIER, LoadBodyReason.CONSUMER_PROJECT_POLICY, LoadBodyReason.OPTIONAL_METADATA,
+            LoadBodyReason.ALTERNATIVE_TIER_POLICY,
+        ))
+        self.assertEqual(str(refusal.exception), "Invalid Google enrollment metadata response")
+
+    def test_size_json_and_structure_failures_report_one_group(self):
+        cases = (
+            (LoadBodyReason.SIZE, b""),
+            (LoadBodyReason.SIZE, b"x" * 16385),
+            (LoadBodyReason.JSON_OBJECT, b"[]"),
+            (LoadBodyReason.JSON_OBJECT, b"\xff"),
+            (LoadBodyReason.JSON_OBJECT, b'{"secret":1,"secret":2}'),
+            (LoadBodyReason.JSON_OBJECT, b'{"secret":NaN}'),
+            (LoadBodyReason.JSON_OBJECT, b'{"secret":1e999}'),
+            (LoadBodyReason.JSON_OBJECT, b'{"secret":"\\ud800"}'),
+            (LoadBodyReason.STRUCTURE_LIMITS, encode({"secret": "x" * 1025})),
+            (LoadBodyReason.STRUCTURE_LIMITS, encode({"secret": [None] * 17})),
+            (LoadBodyReason.STRUCTURE_LIMITS, encode({str(i): True for i in range(25)})),
+            (LoadBodyReason.STRUCTURE_LIMITS, b'{"secret":' + b"[" * 7 + b"0" + b"]" * 7 + b"}"),
+        )
+        for reason, raw in cases:
+            with self.subTest(reason=reason), self.assertRaises(EnrollmentMetadataError) as refusal:
+                self.load(raw)
+            self.assertEqual(refusal.exception.load_body_reasons, (reason,))
+            self.assertFalse(hasattr(refusal.exception, "load_account_details"))
+            self.assertNotIn("secret", str(refusal.exception))
+
+    def test_both_account_groups_distinguish_every_closed_pair(self):
+        tier_cases = (
+            ({}, CurrentTierDetail.ABSENT),
+            ({"currentTier": None}, CurrentTierDetail.NULL),
+            ({"currentTier": ["synthetic-tier-marker"]}, CurrentTierDetail.NON_OBJECT),
+            ({"currentTier": {}}, CurrentTierDetail.EMPTY_OBJECT),
+            ({"currentTier": {"synthetic-tier-marker": 1}}, CurrentTierDetail.UNSUPPORTED_FIELDS),
+            ({"currentTier": {"id": "synthetic tier marker", "name": "Synthetic"}}, CurrentTierDetail.IDENTIFIER),
+            ({"currentTier": {"id": "synthetic-tier-marker"}}, CurrentTierDetail.DISPLAY_NAME),
+            ({"currentTier": {"id": "valid", "name": "Synthetic", "privacyNotice": []}}, CurrentTierDetail.OTHER_SHAPE),
+        )
+        project_cases = (
+            ({}, OriginalProjectDetail.ABSENT),
+            ({"cloudaicompanionProject": None}, OriginalProjectDetail.NULL),
+            ({"cloudaicompanionProject": ""}, OriginalProjectDetail.EMPTY_STRING),
+            ({"cloudaicompanionProject": ["synthetic-project-marker"]}, OriginalProjectDetail.WRONG_TYPE),
+            ({"cloudaicompanionProject": "synthetic project marker"}, OriginalProjectDetail.IDENTIFIER_SHAPE),
+        )
+        for tier, tier_detail in tier_cases:
+            for project, project_detail in project_cases:
+                with self.subTest(tier=tier_detail, project=project_detail):
+                    raw = encode({"releaseChannel": {}} | tier | project)
+                    with self.assertRaises(EnrollmentMetadataError) as refusal:
+                        self.load(raw)
+                    self.assertEqual(refusal.exception.load_body_reasons, (
+                        LoadBodyReason.CURRENT_TIER, LoadBodyReason.ORIGINAL_PROJECT,
+                    ))
+                    self.assertEqual(refusal.exception.load_account_details, (tier_detail, project_detail))
+                    self.assertEqual(str(refusal.exception), "Invalid Google enrollment metadata response")
+
+    def test_a_single_account_group_has_no_pair(self):
+        for fields, reason in (
+            ({"cloudaicompanionProject": PROJECT}, LoadBodyReason.CURRENT_TIER),
+            ({"currentTier": CURRENT}, LoadBodyReason.ORIGINAL_PROJECT),
+        ):
+            with self.subTest(reason=reason):
+                raw = encode({"releaseChannel": {}} | fields)
+                with self.assertRaises(EnrollmentMetadataError) as refusal:
+                    self.load(raw)
+                self.assertEqual(refusal.exception.load_body_reasons, (reason,))
+                self.assertFalse(hasattr(refusal.exception, "load_account_details"))
+
+
+if __name__ == "__main__":
+    unittest.main()

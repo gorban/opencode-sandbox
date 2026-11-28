@@ -73,3 +73,138 @@ The readiness-only check and production launch commands retain their existing sc
   scope and first live prompt separately before enabling Antigravity in a managed worker.
 
 [Antigravity ACP authentication](https://antigravity.google/docs/ide/extensions/acp/#authentication)
+
+## Sealed offline cold-catalog fixture
+
+The fixture exercises metadata enrollment and cold reopen with synthetic identities and the
+exact standalone editor ACP 1.5.2 pair. The ordinary launcher remains unchanged.
+
+- [x] Run the sealed offline catalog fixture from source tree
+  `b29cb18440b3481338262133ebaaabde18d23968`. Verify three named catalogs, two Flash candidates,
+  zero prompts, six native retirements, and an empty scoped native inventory. A separate root
+  observer verified that all 65,966 ordinary-home metadata entries matched. The paired result
+  SHA-256 is `e3e6b463d2d5877b05536e7b91a9ca601bceed324e227aa5173a75a9ef72c6e2`.
+- [x] Repeat the sealed catalog fixture at `4a4c4b8ee54c89a7eeaf303ff914a57c14f477c8`
+  with the protected allocator handoff and bounded PTY retirement. The controller verified all
+  three catalogs, two Flash candidates, zero inference prompts, six retired native runtimes,
+  and an unchanged dedicated home across 66,264 metadata entries. The synthetic result SHA-256
+  is `c1a828a2b19b198d179745e696b994067bf59e258fab2359578176625bb9220b`.
+
+Prepare a disposable QEMU/KVM Fedora guest with SELinux enforcing, a dedicated
+`oc-gemini-proof` account with no provider state, its working user systemd manager,
+and the qualified guest Distrobox with `/usr/bin/host-spawn`, shared host PID and
+network namespaces, and a shared owner-only `/run/user/UID`. Provide protected `/usr/bin/xdg-open` on the guest from the distro's
+`xdg-utils` package. Allow space for at least three copies of the pinned artifact pair
+and account for any retained failed fixtures. Pass no workstation filesystems or
+services through to the guest. Restrict guest egress with this root-owned nftables table.
+
+```nft
+table inet oc_gemini_fixture {
+    chain output {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        ct direction reply tcp sport 22 ct state established accept
+    }
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+}
+```
+
+Grant the disposable account read-only inspection of that exact table. Validate the
+sudoers entry using `visudo -cf`.
+
+```sudoers
+oc-gemini-proof ALL=(root) NOPASSWD: /usr/sbin/nft -j list table inet oc_gemini_fixture
+```
+
+Transfer the exact reviewed `source` archive and controller pair into the protected
+guest capsule `/home/.oc-gemini-cold-proof`. Extract only the source inventory under
+`source/`, and place the two controller files `google_home_controller.py` and
+`controller-manifest.json` alongside it. Set all files to root ownership and 0444.
+Use root-owned directories without group or other write access. Place both pinned
+vendor artifacts at the reviewed `vendor/` paths as root-owned 0444 files. Require
+canonical capsule paths and make the same protected projection visible to the devbox.
+The capsule, including its source inventory, must be fresh.
+During trusted guest provisioning, prepare a root-owned, 0444
+`capsule-binding.json` in the capsule. Its version 1 fields are `capsule` (a fresh
+32-character lowercase hexadecimal ID), `boot` (the actual Linux boot ID),
+`tree` and `manifest_sha256` (the reviewed source pins), and `capsule_id` (the
+protected capsule directory's device and inode). Keep the binding digest
+independently of the capsule. The same boot needs a root-owned, 0700
+`/run/oc-gemini-fixture-leases` directory on the ordinary `/run` tmpfs.
+Do not recreate or empty the lease directory during the boot.
+
+Before running any fixture code as root, verify the protected controller file against the
+independently reviewed controller hash. Use the separate reviewed manifest hash when
+starting the controller. Both pins come from source review.
+
+```sh
+printf '%s  %s\n' REVIEWED_CONTROLLER_SHA256 /home/.oc-gemini-cold-proof/google_home_controller.py \
+  | /usr/bin/sha256sum --strict --check - &&
+  /usr/bin/python3 -IBS /home/.oc-gemini-cold-proof/google_home_controller.py \
+    REVIEWED_MANIFEST_SHA256 PROVISIONED_BINDING_SHA256
+```
+
+The controller verifies its protected bytes and every fixed source against that
+reviewed manifest before loading driver code. It verifies the independent
+binding and consumes its one-use boot lease before syncing the exclusive
+allocation marker. A lost marker cannot renew the lease. A different boot
+requires a freshly prepared capsule. It starts a
+fixed, isolated allocator with the dedicated fixture UID and primary GID, no supplementary
+groups and a bounded result channel. The attempt binds the exact root controller,
+boot, source, deployment pins and account to a one-use allocation digest. The
+allocator consumes and closes the anonymous startup descriptor before checking
+the protected attempt and the live immediate root parent through procfs and a
+pidfd. The unprivileged allocator creates and pins the
+three case homes. Root independently verifies their exact anchored identities before and
+after preparing the protected config projections, then publishes the new seal. Root only
+reads the dedicated user's runtime tree. Seal, config and evidence files begin at 0600
+and reach 0444 only after writing and syncing the complete bytes. A final file or parent
+sync failure withholds acceptance and requires a fresh capsule. The controller checks
+the named running rootless `oc-proof-devbox` container for the dedicated account,
+starts one fixed interactive exec with the measured unprivileged supervisor in that
+exact container. The supervisor waits at the first barrier while root records the
+whole ordinary-home baseline with a digest of a fresh 32-byte start value.
+Root stages the record privately, syncs it and verifies the published bytes
+before sending the single bounded start frame. The supervisor validates the
+frame and runs exactly one dedicated child with anonymous stdin carrying only
+that start value:
+`/usr/bin/python3 -IBS /home/.oc-gemini-cold-proof/source/tests/google-connect-fixture.py --bound-catalog`.
+The controller binds the dedicated UID and HOME and bounds the held session to
+900 seconds. The supervisor waits for the actual child, caps captured output at
+4 KiB, verifies no descendants or scoped native runtime remain, and then holds the
+exec at the second barrier with the typed outcome.
+
+The unprivileged fixture consumes and closes the start descriptor and verifies
+the measured supervisor, guest policy, boot, UID, source and root baseline
+before enrollment. The before record also commits separate derived values for
+the three fixed labels. Each case child consumes its unique value from an
+anonymous descriptor before opening its case. The original value stays in the
+catalog child. Both types of descriptor are closed before native startup.
+The fixture verifies child retirement on failure within a bounded cleanup window
+and retains uncertain case evidence for inspection.
+The fixture checks the three ordinary provider paths are absent and uses a
+separately sealed synthetic HOME for config, artifacts and enrollment. The controller
+independently checks the exact positive output for all three named catalogs, two Flash
+bindings, zero prompts, six retired native runtimes and an empty scoped native inventory.
+Root repeats the whole-home metadata snapshot at that second barrier, before releasing
+the exec. This puts Podman exec creation and release outside the observed interval,
+which still includes the full persistent graphroot. The snapshot covers up to
+131,072 entries and 64 levels without opening file contents or changing permissions.
+Keep other account workloads stopped throughout. Root releases the exec only after
+capturing the in-window snapshot, then requires the exact retirement acknowledgement,
+end-of-stream and successful local client wait before persisting the paired result.
+A local client timeout or exit alone establishes no guest retirement.
+
+Keep the root-owned `home-before.json`, `native-result.json` and `home-result.json`
+as one acceptance record. Acceptance requires the matching digests, exact positive
+child evidence, exact transport retirement and equal before/after home fingerprints.
+An ambiguous or incomplete run records after evidence as unavailable, distinct from a
+checked mismatch. Either condition withholds acceptance. Preserve remaining private case paths for inspection and verify
+native retirement before reprovisioning. A new run requires a fresh guest capsule
+and case roots.
+
+The native gate here covers the three named cases. The earlier native OIDC and LOAD
+variant runners remain with their separately measured source trees. The portable
+suites still cover OIDC, LOAD projection and their rejection paths.
