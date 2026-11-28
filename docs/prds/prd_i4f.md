@@ -92,6 +92,12 @@ calls, and verified container/scratch cleanup.
   Claude launch topology clears qualification and security review (remains open while PR #72's
   project launcher is synthetic), verifying exact `ok` delivery, `0` unintended tool calls, intact
   fail-closed checks, and clean teardown.
+  - [x] Exercise the bounded Claude text protocol and synthetic subprocess in CI. The
+    fixture pins the workspace, passes one request to the inert child, verifies exact
+    retirement, and protects uncertain workspace bindings for the controller lifetime.
+    See `codex/claude-bounded-text-fixture`.
+  - [ ] Verify credential and process custody through the stock public launcher, then
+    qualify the real subscription route and its usage evidence.
 - [ ] **Combined multi-provider default + `--mini` e2e** — once OpenAI and Claude qualify in the
   sandbox, test both `oc-sandbox` and `oc-sandbox --mini` using the same trusted provider
   configuration. Pick a model from each instance through trusted confirmation and send
