@@ -20,7 +20,7 @@ from oc_providers.catalog import (
     revalidate_interactive_launch,
     snapshot_launch_selections,
 )
-from oc_providers.config import load_provider_config_with_digest
+from oc_providers.config import load_admission_provider_config
 
 from .cli import StreamTerminal
 from .connection_state import decode_json
@@ -403,7 +403,14 @@ def _run_admission_session(channel, terminal):
         return qualification_error
 
     channel.checkpoint()
-    config, digest = load_provider_config_with_digest()
+    snapshot = load_admission_provider_config()
+    if not intent["provider_filter"] and snapshot is not None and snapshot.profile_sets.selected is not None:
+        raise LaunchRefusedError(
+            "named_profile_set_unavailable",
+            "The selected provider profile set is unavailable for managed sandbox launches.",
+        )
+    channel.checkpoint()
+    config = snapshot.providers if snapshot is not None else None
     adapters, lock_dir = broker._resolve_adapters_and_lock_dir(None, None, None)
     selection = snapshot_launch_selections(intent["provider_filter"], adapters)
     workspace = (
@@ -419,7 +426,7 @@ def _run_admission_session(channel, terminal):
         ),
     )
     def verify_config_and_selection():
-        if load_provider_config_with_digest() != (config, digest) or snapshot_launch_selections(
+        if load_admission_provider_config() != snapshot or snapshot_launch_selections(
             intent["provider_filter"], adapters
         ) != selection:
             raise LaunchRefusedError("launch_config_drift", "Provider configuration or selection changed. Start a fresh launch.")

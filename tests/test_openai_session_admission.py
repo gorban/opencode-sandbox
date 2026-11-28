@@ -2,15 +2,18 @@
 
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import replace
+import errno
 import fcntl
 from functools import partial
 import io
 import json
 import os
 from pathlib import Path
+import pty
 import select
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -29,6 +32,226 @@ from oc_providers.contracts import ExposureHoldSummary, InstancePreflight, Provi
 
 
 POD_ID = "a" * 64
+SOURCE = Path(__file__).resolve().parents[1]
+
+_NAMED_PROVIDERS = """
+[provider_defaults]
+openai = "ordinary"
+[providers.openai.ordinary]
+enabled = true
+auth_mode = "subscription"
+default_model = "ordinary-model"
+[providers.openai.named]
+enabled = true
+auth_mode = "subscription"
+"""
+
+_NAMED_SET = """
+[profile_sets.subscriptions]
+default_provider = "openai/named"
+default_model = "set-model"
+[profile_sets.subscriptions.members]
+"openai/named" = ["set-model"]
+"""
+_SELECTED_SET = '\n[launch]\nprofile_set = "subscriptions"\n'
+
+
+class PublicAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="oc-public-admission-")))
+        self.home = self.root / "home"
+        self.config = self.home / ".config/oc-sandbox/providers.toml"
+        self.config.parent.mkdir(parents=True)
+        self.checkout = self.root / "source"
+        self.checkout.mkdir()
+        self.launcher = self.checkout / "oc-sandbox"
+        original = (SOURCE / self.launcher.name).read_text()
+        account_lookup = "account_home = pwd.getpwuid(os.geteuid()).pw_dir"
+        self.assertEqual(original.count(account_lookup), 1)
+        # Confine the shell's config presence probe to the scratch account as well.
+        self.launcher.write_text(original.replace(account_lookup, "account_home = sys.argv[1]"))
+        self.launcher.chmod(0o700)
+        for name in ("oc-bridge.py", "oc-openai-session.py"):
+            shutil.copy2(SOURCE / name, self.checkout / name)
+        for package in ("oc_providers", "oc_openai"):
+            shutil.copytree(SOURCE / package, self.checkout / package, ignore=shutil.ignore_patterns("__pycache__"))
+        with (self.checkout / "oc_providers/config.py").open("a") as module:
+            module.write("\n\ndef _account_home():\n    return Path(os.environ['HOME'])\n")
+        self.effects = self.root / "effects"
+        self.selection = self.root / "selection"
+        self.selection.write_text("unset")
+        with (self.checkout / "oc_openai/session_broker.py").open("a") as module:
+            module.write(f"""
+
+from oc_providers.contracts import InstancePreflight, PersistedSelection, ReadinessState, SelectionState
+
+def _fixture_effect(message):
+    with Path({str(self.effects)!r}).open("a") as log:
+        print(message, file=log)
+
+class _FixtureAdapter:
+    def selection_state(self):
+        _fixture_effect("selection")
+        mode = Path({str(self.selection)!r}).read_text()
+        if mode == "selected":
+            return PersistedSelection(SelectionState.SELECTED, "ordinary")
+        if mode == "missing":
+            return PersistedSelection(SelectionState.SELECTED, "absent")
+        if mode == "withdrawn":
+            return PersistedSelection(SelectionState.DISCONNECTED)
+        return PersistedSelection(SelectionState.UNSET)
+
+    def is_qualified(self, *_args):
+        return True
+
+    def active_label(self):
+        return "ordinary"
+
+    def preflight_instance(self, spec):
+        _fixture_effect("preflight " + spec.qualified_name)
+        return InstancePreflight(spec, ReadinessState.READY, ("set-model", "ordinary-model"), None, "subscription", "fixture")
+
+    def discover_instances(self):
+        _fixture_effect("discover")
+        return ()
+
+    def open_slot(self, *_args, **_kwargs):
+        _fixture_effect("lease")
+        raise AssertionError("Public pre-admission fixture reached lease creation")
+
+def _resolve_adapters_and_lock_dir(*_args):
+    _fixture_effect("adapter")
+    return {{"openai": _FixtureAdapter()}}, Path({str(self.home)!r})
+
+def check_devbox():
+    pass
+
+def check_host():
+    pass
+""")
+        self.stubs = self.root / "stubs"
+        self.stubs.mkdir()
+        for name in ("podman", "systemctl", "distrobox-host-exec", "pkexec", "xdg-open", "curl"):
+            stub = self.stubs / name
+            stub.write_text(
+                "#!/usr/bin/bash -p\n"
+                '[[ ${0##*/} != podman || ${1:-} != --version ]] || exit 0\n'
+                f'printf "%s\n" "host ${{0##*/}} $*" >> "{self.effects}"\n'
+                "exit 99\n"
+            )
+            stub.chmod(0o700)
+
+    def launch(self, config, *args, replace_at_confirmation=None):
+        self.config.write_text(config)
+        self.config.chmod(0o600)
+        self.effects.unlink(missing_ok=True)
+        master, slave = pty.openpty()
+        child_code = (
+            "import fcntl, os, sys, termios\n"
+            "os.setsid()\n"
+            "fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
+            "os.execv(sys.argv[1], sys.argv[1:])\n"
+        )
+        env = {
+            "HOME": str(self.home), "PATH": f"{self.stubs}:/usr/bin:/bin",
+            "TERM": "xterm", "LC_ALL": "C.UTF-8", "OC_CHROMIUM_MODE": "headless",
+        }
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-IB", "-c", child_code, str(self.launcher), *args],
+                stdin=slave, stdout=slave, stderr=slave, cwd=self.home, env=env,
+            )
+        finally:
+            os.close(slave)
+        output = bytearray()
+        sent = False
+        deadline = time.monotonic() + 10
+        try:
+            while (remaining := deadline - time.monotonic()) > 0 and select.select([master], [], [], remaining)[0]:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if not sent and b"[y/N]" in output:
+                    if replace_at_confirmation is not None:
+                        self.config.write_text(replace_at_confirmation)
+                    os.write(master, b"y\n" if replace_at_confirmation is not None else b"n\n")
+                    sent = True
+            status = child.wait(timeout=2)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=3)
+            os.close(master)
+        rendered = output.decode("utf-8", errors="replace")
+        self.assertEqual(status, 1, rendered)
+        self.assertFalse((self.home / ".local/share/oc-sandbox").exists(), rendered)
+        self.assertFalse((self.home / "opencode-sandbox").exists(), rendered)
+        effects = self.effects.read_text().splitlines() if self.effects.exists() else []
+        self.assertFalse([event for event in effects if event.startswith("host ") or event == "lease"], effects)
+        return rendered, effects
+
+    def test_named_selection_refuses_full_and_mini_before_legacy_planning(self):
+        config = _NAMED_PROVIDERS + _NAMED_SET + _SELECTED_SET
+        for args in ((), ("--no-mini",), ("--mini",)):
+            with self.subTest(args=args):
+                output, effects = self.launch(config, *args)
+                self.assertEqual(effects, [])
+                self.assertIn("The selected provider profile set is unavailable", output)
+                self.assertNotIn("Initial active model", output)
+        output, effects = self.launch(config + "mini = true\n")
+        self.assertEqual(effects, [])
+        self.assertIn("The selected provider profile set is unavailable", output)
+
+    def test_invalid_named_set_refuses_even_an_explicit_filter(self):
+        config = _NAMED_PROVIDERS + _NAMED_SET.replace('["set-model"]', "[]") + _SELECTED_SET
+        output, effects = self.launch(config, "--provider", "openai/ordinary")
+        self.assertEqual(effects, [])
+        self.assertIn("profile set member requires", output)
+
+    def test_exact_and_kind_filters_keep_independent_legacy_selection(self):
+        config = _NAMED_PROVIDERS + _NAMED_SET + _SELECTED_SET
+        for mode, selector in (("withdrawn", "openai/ordinary"), ("selected", "openai"), ("unset", "openai")):
+            with self.subTest(mode=mode, selector=selector):
+                self.selection.write_text(mode)
+                output, effects = self.launch(config, "--provider", selector)
+                self.assertIn("Initial active model: openai--ordinary/ordinary-model", output)
+                self.assertEqual([item for item in effects if item.startswith("preflight")], ["preflight openai/ordinary"])
+                self.assertEqual("selection" in effects, selector == "openai")
+        self.selection.write_text("withdrawn")
+        output, effects = self.launch(config, "--provider", "openai")
+        self.assertIn("registration was disconnected", output)
+        self.assertEqual(effects, ["adapter", "selection", "selection"])
+        self.selection.write_text("missing")
+        output, effects = self.launch(config, "--provider", "openai")
+        self.assertIn("openai/absent' is not declared", output)
+        self.assertEqual(effects, ["adapter", "selection", "selection"])
+
+    def test_exact_config_bytes_are_rechecked_after_public_confirmation(self):
+        config = _NAMED_PROVIDERS + _NAMED_SET + _SELECTED_SET
+        output, effects = self.launch(
+            config, "--provider", "openai/ordinary", replace_at_confirmation=config + "# changed bytes\n",
+        )
+        self.assertIn("Initial active model: openai--ordinary/ordinary-model", output)
+        self.assertIn("Provider configuration or selection changed", output)
+        self.assertEqual(effects, ["adapter", "preflight openai/ordinary"])
+
+    def test_ordinary_and_unselected_sets_keep_the_configured_default(self):
+        launch = '\n[launch]\ndefault_provider = "openai/ordinary"\ndefault_model = "ordinary-model"\n'
+        for sets in ("", _NAMED_SET):
+            with self.subTest(named_definitions=bool(sets)):
+                output, effects = self.launch(_NAMED_PROVIDERS + launch + sets)
+                self.assertIn("Initial active model: openai--ordinary/ordinary-model", output)
+                self.assertIn("Cancelled.", output)
+                self.assertIn("preflight openai/ordinary", effects)
+        output, effects = self.launch("")
+        self.assertIn("No enabled, qualified provider instances are ready", output)
+        self.assertEqual(effects, ["adapter", "selection"])
 
 
 @contextmanager
@@ -207,8 +430,8 @@ class AdmissionTests(unittest.TestCase):
 
     def test_qualification_and_config_drift_gate_before_session_effects(self):
         for qualification, configs, should_admit in (
-            (2, [(None, None)], False),
-            (0, [(None, None), (None, None), (None, "changed")], True),
+            (2, [None], False),
+            (0, [None, None, "changed"], True),
         ):
             with self.subTest(qualification=qualification), make_channel() as (channel, send, receive):
                 events = []
@@ -224,7 +447,7 @@ class AdmissionTests(unittest.TestCase):
                 owner.start()
                 with (
                     patch.object(broker, "_qualify_session", return_value=qualification),
-                    patch.object(admission, "load_provider_config_with_digest", side_effect=configs),
+                    patch.object(admission, "load_admission_provider_config", side_effect=configs),
                     patch.object(broker, "_resolve_adapters_and_lock_dir", return_value=({}, self.state)),
                     patch.object(admission, "plan_interactive_launch", return_value=object()) as planner,
                     patch.object(admission, "_lifecycle_guard", return_value=nullcontext()),
@@ -321,7 +544,7 @@ class AdmissionTests(unittest.TestCase):
             owner.start()
             with (
                 patch.object(broker, "_qualify_session", return_value=0),
-                patch.object(admission, "load_provider_config_with_digest", return_value=(None, None)),
+                patch.object(admission, "load_admission_provider_config", return_value=None),
                 patch.object(broker, "_resolve_adapters_and_lock_dir", return_value=({}, self.state)),
                 patch.object(admission, "plan_interactive_launch", return_value=plan),
                 patch.object(admission, "revalidate_interactive_launch"),
@@ -412,7 +635,7 @@ class AdmissionTests(unittest.TestCase):
         owner.start()
         with (
             patch.object(broker, "_qualify_session", return_value=0),
-            patch.object(admission, "load_provider_config_with_digest", return_value=(None, None)),
+            patch.object(admission, "load_admission_provider_config", return_value=None),
             patch.object(broker, "_resolve_adapters_and_lock_dir", return_value=({"openai": adapter}, self.state)),
             patch.object(admission, "plan_interactive_launch", return_value=plan),
             patch.object(admission, "_lifecycle_guard", return_value=nullcontext()),
