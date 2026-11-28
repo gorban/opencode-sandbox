@@ -3,4 +3,5 @@ lockfile = true
 lockfile_platforms = ["linux-x64"]
 
 [tools]
-"github:koalaman/shellcheck" = "0.9.0"
+# This release has no attestation. Its archive digest is pinned in mise.lock.
+"github:koalaman/shellcheck" = { version = "0.9.0", github_attestations = false }

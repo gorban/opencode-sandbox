@@ -26,7 +26,6 @@ PLATFORM = 'linux-x64'
 SHELLCHECK = ci.SHELLCHECK_VERSION
 SHELLCHECK_URL = (f'https://github.com/koalaman/shellcheck/releases/download/v{SHELLCHECK}/'
                   f'shellcheck-v{SHELLCHECK}.linux.x86_64.tar.xz')
-SHELLCHECK_API = 'https://api.github.com/repos/koalaman/shellcheck/releases/assets/88000708'
 SHELLCHECK_CHECKSUM = 'sha256:700324c6dd0ebea0117591c6cc9d7350d9c7c5c287acbad7630fa17b1d4d9e2f'
 MISE_URL = 'https://github.com/jdx/mise/releases/download/v2026.10.21/mise-v2026.10.21-linux-x64.tar.xz'
 MISE_ARCHIVE_SHA = 'e1743bb7628927f93d4ffb2c4e2c4f71186307612f59ebc7f85d52e3a7f42461'
@@ -97,8 +96,12 @@ def config_bytes(path):
 def validated_inputs():
     files = {name: config_bytes(ci.ROOT / 'tools/ci' / name) for name in (MANIFEST_NAME, 'mise.lock')}
     manifest = tomllib.loads(files[MANIFEST_NAME].decode())
-    if manifest != {'settings': {'lockfile': True, 'lockfile_platforms': [PLATFORM]},
-                    'tools': {BACKEND: SHELLCHECK}} or manifest['settings']['lockfile'] is not True:
+    expected_manifest = {
+        'settings': {'lockfile': True, 'lockfile_platforms': [PLATFORM]},
+        'tools': {BACKEND: {'version': SHELLCHECK, 'github_attestations': False}},
+    }
+    if (manifest != expected_manifest or manifest['settings']['lockfile'] is not True
+            or manifest['tools'][BACKEND]['github_attestations'] is not False):
         raise ci.CheckError('Invalid CI mise manifest')
 
     lock = tomllib.loads(files['mise.lock'].decode())
@@ -106,8 +109,6 @@ def validated_inputs():
     tool = {'version': SHELLCHECK, 'backend': BACKEND, 'specifiers': [SHELLCHECK],
             f'platforms.{PLATFORM}': asset}
     expected = {'lockfile_version': 3, 'tools': {BACKEND: [tool]}}
-    if lock != expected:
-        asset['url_api'] = SHELLCHECK_API
     if lock != expected or type(lock['lockfile_version']) is not int:
         raise ci.CheckError('Invalid CI mise lockfile')
     return files
