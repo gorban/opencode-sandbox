@@ -390,6 +390,18 @@ def run_admission_session(channel: AdmissionChannel, terminal: StreamTerminal) -
             signal.signal(signum, handler)
 
 
+def _read_admission_config(channel, provider_filter):
+    channel.checkpoint()
+    snapshot = load_admission_provider_config()
+    if not provider_filter and snapshot is not None and snapshot.profile_sets.selected is not None:
+        raise LaunchRefusedError(
+            "named_profile_set_unavailable",
+            "The selected provider profile set is unavailable for managed sandbox launches.",
+        )
+    channel.checkpoint()
+    return snapshot, snapshot.providers if snapshot is not None else None
+
+
 def _run_admission_session(channel, terminal):
     deadline = time.monotonic() + ADMISSION_SECONDS
     intent = _validate_intent(channel.read_frame(deadline))
@@ -402,15 +414,7 @@ def _run_admission_session(channel, terminal):
     if qualification_error:
         return qualification_error
 
-    channel.checkpoint()
-    snapshot = load_admission_provider_config()
-    if not intent["provider_filter"] and snapshot is not None and snapshot.profile_sets.selected is not None:
-        raise LaunchRefusedError(
-            "named_profile_set_unavailable",
-            "The selected provider profile set is unavailable for managed sandbox launches.",
-        )
-    channel.checkpoint()
-    config = snapshot.providers if snapshot is not None else None
+    snapshot, config = _read_admission_config(channel, intent["provider_filter"])
     adapters, lock_dir = broker._resolve_adapters_and_lock_dir(None, None, None)
     selection = snapshot_launch_selections(intent["provider_filter"], adapters)
     workspace = (

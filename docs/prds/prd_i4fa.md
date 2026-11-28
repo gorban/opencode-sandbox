@@ -63,8 +63,9 @@ configuration and policy. One provider can reach this milestone while the others
 - [x] Validate named subscription sets in the offline [config parser](../../oc_providers/config.py).
   The parser checks model membership against the exact chosen provider instance and produces
   distinct canonical declaration and exact config-byte digests. See `codex/named-provider-set-schema`.
-- [ ] Wire the tested schema into the trusted production config reader and pre-admission checks
-  together. A selected set that cannot launch must refuse before provider discovery or resources.
+- [x] Wire the tested schema into the trusted production config reader and pre-admission checks
+  together. A selected set that cannot launch refuses before provider discovery or resource
+  creation. [PR #109](https://github.com/gorban/opencode-sandbox/pull/109)
 
 ### First inference and model switches
 
