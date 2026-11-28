@@ -84,6 +84,11 @@ exact standalone editor ACP 1.5.2 pair. The ordinary launcher remains unchanged.
   zero prompts, six native retirements, and an empty scoped native inventory. A separate root
   observer verified that all 65,966 ordinary-home metadata entries matched. The paired result
   SHA-256 is `e3e6b463d2d5877b05536e7b91a9ca601bceed324e227aa5173a75a9ef72c6e2`.
+- [x] Repeat the sealed catalog fixture at `4a4c4b8ee54c89a7eeaf303ff914a57c14f477c8`
+  with the protected allocator handoff and bounded PTY retirement. The controller verified all
+  three catalogs, two Flash candidates, zero inference prompts, six retired native runtimes,
+  and an unchanged dedicated home across 66,264 metadata entries. The synthetic result SHA-256
+  is `c1a828a2b19b198d179745e696b994067bf59e258fab2359578176625bb9220b`.
 
 Prepare a disposable QEMU/KVM Fedora guest with SELinux enforcing, a dedicated
 `oc-gemini-proof` account with no provider state, its working user systemd manager,
