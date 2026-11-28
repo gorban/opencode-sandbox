@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 import fcntl
 import json
@@ -373,6 +373,7 @@ class StandingApprovalStore:
                     with _prepare(held.state_dir, receipt.encode()) as (temporary, identity):
                         _compare(expected, self._snapshot(held))
                         _checkpoint(checkpoint)
+                        _compare(expected, self._snapshot(held))
                         publication = Publication.UNCERTAIN
                         os.replace(temporary, _RECEIPT, src_dir_fd=held.state_dir, dst_dir_fd=held.state_dir)
                         os.fsync(held.state_dir)
@@ -381,7 +382,15 @@ class StandingApprovalStore:
                         if (installed.receipt != receipt or installed._receipt is None
                                 or installed._receipt.identity != identity):
                             raise StandingApprovalError("approval_snapshot_changed")
-                        _compare(replace(expected, _receipt=installed._receipt, receipt=receipt), installed)
+                        expected_install = ApprovalSnapshot(
+                            _config=expected._config,
+                            _receipt=installed._receipt,
+                            _config_dir=expected._config_dir,
+                            _state_dir=expected._state_dir,
+                            _lock=expected._lock,
+                            receipt=receipt,
+                        )
+                        _compare(expected_install, installed)
                         _checkpoint(checkpoint)
                         _compare(installed, self._snapshot(held))
                         return installed
@@ -437,7 +446,15 @@ class StandingApprovalStore:
                     if (installed._config is None or installed.config_bytes != data
                             or installed._config.identity != identity):
                         raise StandingApprovalError("approval_snapshot_changed")
-                    _compare(replace(expected, _config=installed._config), installed)
+                    expected_install = ApprovalSnapshot(
+                        _config=installed._config,
+                        _receipt=expected._receipt,
+                        _config_dir=expected._config_dir,
+                        _state_dir=expected._state_dir,
+                        _lock=expected._lock,
+                        receipt=expected.receipt,
+                    )
+                    _compare(expected_install, installed)
                     _checkpoint(checkpoint)
                     _compare(installed, self._snapshot(held))
                     return installed

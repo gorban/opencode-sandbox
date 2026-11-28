@@ -189,18 +189,15 @@ class StandingApprovalTests(unittest.TestCase):
         self.assertEqual(self.receipt.read_bytes(), raw)
         self.config.write_bytes(ORIGINAL_CONFIG)
         fresh = self.store.observe()
-        checks = 0
+        real_replace = os.replace
 
-        def checkpoint():
-            nonlocal checks
-            checks += 1
-            if checks == 1:
-                # Simulate the last race an external editor can win outside the shared lock.
-                self.config.write_bytes(NEW_CONFIG)
-            return Foreground.LIVE
+        def edit_after_replace(source, destination, **kwargs):
+            real_replace(source, destination, **kwargs)
+            self.config.write_bytes(NEW_CONFIG)
 
-        self.assert_refusal(lambda: self.commit(fresh, checkpoint=checkpoint),
-                            "approval_snapshot_changed", Publication.PUBLISHED)
+        with patch.object(approval.os, "replace", side_effect=edit_after_replace):
+            self.assert_refusal(lambda: self.commit(fresh),
+                                "approval_snapshot_changed", Publication.PUBLISHED)
         self.assertFalse(self.store.observe().covers(AUTHORITY))
         self.assertEqual(self.store.observe().receipt.config_digest, fresh.config_digest)
 
@@ -230,6 +227,21 @@ class StandingApprovalTests(unittest.TestCase):
         self.assertEqual(original, before)
         self.assertEqual(self.config.read_bytes(), data)
         self.assertTrue(os.path.samestat(self.config.stat(), info))
+
+    def test_commit_preserves_prior_receipt_during_prepublication_checkpoint(self):
+        for replace_file in (False, True):
+            with self.subTest(replace_file=replace_file):
+                self.config.write_bytes(ORIGINAL_CONFIG)
+                approved = self.commit(self.store.observe())
+                prior = self.receipt.read_bytes()
+                prior_info = self.receipt.stat()
+                checkpoint, edited = self.config_edit_checkpoint(on_check=1, replace_file=replace_file)
+                self.assert_refusal(lambda: self.commit(approved, CHANGED_DELEGATION, checkpoint=checkpoint),
+                                    "approval_snapshot_changed", Publication.UNCHANGED)
+                self.assert_external_config_preserved(edited)
+                self.assertEqual(self.receipt.read_bytes(), prior)
+                self.assertTrue(os.path.samestat(self.receipt.stat(), prior_info))
+                self.assertEqual(list(self.state_dir.glob(".standing-*")), [])
 
     def test_commit_refuses_config_drift_during_final_checkpoint(self):
         for replace_file in (False, True):
