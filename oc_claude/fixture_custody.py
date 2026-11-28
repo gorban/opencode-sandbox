@@ -13,7 +13,9 @@ import time
 from .fixture_protocol import ACCOUNT, MODEL, FixtureError, encode, require, valid_id
 
 
-ANCHOR = Path("/dev/shm")
+_ANCHOR_PARENT = Path("/dev")
+_ANCHOR_CHILD = "shm"
+ANCHOR = _ANCHOR_PARENT / _ANCHOR_CHILD
 _MARKER = ".claude-fixture-custody"
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _NAMES = set()
@@ -36,11 +38,7 @@ def _open_private_dir(name, parent):
         raise
 
 
-def _verify_anchor(fd):
-    info = os.fstat(fd)
-    parent = os.stat(ANCHOR.parent, follow_symlinks=False)
-    require(stat.S_ISDIR(parent.st_mode) and not parent.st_mode & 0o022)
-    require(stat.S_ISDIR(info.st_mode) and info.st_uid == parent.st_uid and info.st_mode & stat.S_ISVTX)
+def _verify_anchor_mount(fd):
     fdinfo = Path(f"/proc/self/fdinfo/{fd}").read_text().splitlines()
     ids = [line.split()[1] for line in fdinfo if line.startswith("mnt_id:")]
     require(len(ids) == 1)
@@ -49,8 +47,33 @@ def _verify_anchor(fd):
         fields = before.split()
         if fields[0] == ids[0]:
             require(fields[4] == str(ANCHOR) and after.split()[0] == "tmpfs")
-            return info.st_dev
+            return
     raise FixtureError("integrity_error")
+
+
+def _same_directory(opened, named):
+    return stat.S_ISDIR(named.st_mode) and (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino)
+
+
+def _open_anchor():
+    parent = os.open(_ANCHOR_PARENT, _DIR_FLAGS)
+    try:
+        info = os.fstat(parent)
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+        require(_same_directory(info, os.stat(_ANCHOR_PARENT, follow_symlinks=False)))
+        anchor = os.open(_ANCHOR_CHILD, _DIR_FLAGS, dir_fd=parent)
+        try:
+            info = os.fstat(anchor)
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
+            named = os.stat(_ANCHOR_CHILD, dir_fd=parent, follow_symlinks=False)
+            require(_same_directory(info, named))
+            _verify_anchor_mount(anchor)
+            return anchor, info.st_dev
+        except BaseException:
+            os.close(anchor)
+            raise
+    finally:
+        os.close(parent)
 
 
 def _new_name():
@@ -255,9 +278,9 @@ class FixtureCustody:
         self._pending_recovery = {}
         self._now, self._wall = now, wall
         self._root_fd = None
-        self._anchor_fd = os.open(ANCHOR, _DIR_FLAGS)
+        self._anchor_fd = None
         try:
-            device = _verify_anchor(self._anchor_fd)
+            self._anchor_fd, device = _open_anchor()
             self._root_name = _new_name()
             require(self._root_name.startswith("oc-claude-") and valid_id(self._root_name.removeprefix("oc-claude-")))
             with _NAMES_LOCK:
@@ -272,7 +295,8 @@ class FixtureCustody:
         except BaseException as error:
             if self._root_fd is not None:
                 os.close(self._root_fd)
-            os.close(self._anchor_fd)
+            if self._anchor_fd is not None:
+                os.close(self._anchor_fd)
             if isinstance(error, OSError):
                 raise FixtureError("integrity_error") from None
             raise

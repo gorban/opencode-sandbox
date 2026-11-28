@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -30,6 +31,7 @@ DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 FILE = os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 _SEALS = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
 _PROFILE_FILES = ("registration.json", "credential")
+_MKDIR_REFUSED = {errno.EACCES, errno.EPERM, errno.EROFS}
 _WRITE = ctypes.CDLL(None, use_errno=True).write
 _WRITE.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t)
 _WRITE.restype = ctypes.c_ssize_t
@@ -288,21 +290,33 @@ class _Cgroup:
         scratch.require_reachable()
         self.delegated = delegated
         self.parent = os.open(delegated, DIR)
+        self.parent_identity = None
         self.root = None
         self.identity = None
         self.scratch = scratch
         self.record = None
         self.record_fd = None
         self.evidence_fd = None
+        self.evidence_identity = None
+        self.receipt = None
         self.name = "occlaude-" + secrets.token_hex(12)
         self.events = self.kill = self.procs = None
+        self._unit_may_exist = self._record_may_exist = False
         self._claimed = False
         self._closed = False
         try:
             self.receipt = scratch.expect_recovery(self.name)
             parent_info = os.fstat(self.parent)
             require(parent_info.st_uid == os.geteuid())
-            os.mkdir(self.name, mode=0o700, dir_fd=self.parent)
+            self.parent_identity = _identity(parent_info)
+            self._verify_parent()
+            self._unit_may_exist = True
+            try:
+                os.mkdir(self.name, mode=0o700, dir_fd=self.parent)
+            except OSError as error:
+                self._unit_may_exist = error.errno not in _MKDIR_REFUSED
+                raise
+
             leaf_info = os.stat(self.name, dir_fd=self.parent, follow_symlinks=False)
             self.identity = _identity(leaf_info)
             self.root = os.open(self.name, DIR, dir_fd=self.parent)
@@ -316,31 +330,80 @@ class _Cgroup:
             self.events = self._file("cgroup.events", os.O_RDONLY)
             self.kill = self._file("cgroup.kill", os.O_WRONLY)
             self.procs = self._file("cgroup.procs", os.O_RDWR)
-            scratch.require_reachable()
-            os.mkdir(self.name, mode=0o700, dir_fd=scratch.fd)
-            self.record_fd, self.record_identity = _open_private_dir(self.name, scratch.fd)
-            self.record = scratch.path / self.name
-            self.evidence = json.dumps(
-                {"cgroup": self.name, "parent": str(delegated), "identity": self.identity,
-                 "scratch_identity": self.record_identity, "uid": os.geteuid()},
-            ).encode("ascii")
-            self.evidence_fd = os.open("recovery.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY | FILE,
-                                       0o600, dir_fd=self.record_fd)
-            require(os.write(self.evidence_fd, self.evidence) == len(self.evidence))
-            self.evidence_identity = _identity(os.fstat(self.evidence_fd))
+            self._prepare_record()
         except BaseException:
-            # No process can have joined this unexposed leaf during setup.
             try:
-                if self.identity is not None:
-                    self._remove_leaf()
+                if self.receipt is not None:
+                    self._abort_prelaunch()
+            except (OSError, FixtureError):
+                raise FixtureError("retirement_unverified") from None
             finally:
                 self._close_files()
                 os.close(self.parent)
             raise
 
-    def _verify_recovery(self):
+    def _prepare_record(self):
         self.scratch.require_reachable()
-        self._verify_leaf()
+        self._record_may_exist = True
+        try:
+            os.mkdir(self.name, mode=0o700, dir_fd=self.scratch.fd)
+        except OSError as error:
+            self._record_may_exist = error.errno not in _MKDIR_REFUSED
+            raise
+        self.record_fd, self.record_identity = _open_private_dir(self.name, self.scratch.fd)
+        self.record = self.scratch.path / self.name
+        self.evidence = json.dumps(
+            {"cgroup": self.name, "parent": str(self.delegated), "identity": self.identity,
+             "scratch_identity": self.record_identity, "uid": os.geteuid()},
+        ).encode("ascii")
+        self.evidence_fd = os.open("recovery.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY | FILE,
+                                   0o600, dir_fd=self.record_fd)
+        require(os.write(self.evidence_fd, self.evidence) == len(self.evidence))
+        self.evidence_identity = _identity(os.fstat(self.evidence_fd))
+
+    def _verify_parent(self):
+        info = os.stat(self.delegated, follow_symlinks=False)
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+                and _identity(info) == self.parent_identity)
+
+    def _require_absent(self, parent):
+        try:
+            os.stat(self.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise FixtureError("retirement_unverified")
+
+    def _abort_prelaunch(self):
+        # Only the constructor uses this path. A claimed unit needs the normal
+        # child retirement proof, even if the gated executable never started.
+        require(not self._claimed)
+        self._verify_parent()
+        self.scratch.require_reachable()
+        if self._unit_may_exist:
+            require(self.events is not None)
+            self._verify_leaf()
+            require(self.empty())
+        else:
+            self._require_absent(self.parent)
+        if self._record_may_exist:
+            require(self.evidence_identity is not None)
+            self._verify_record()
+            require(os.listdir(self.record_fd) == ["recovery.json"])
+        else:
+            self._require_absent(self.scratch.fd)
+
+        if self._unit_may_exist:
+            self._remove_leaf()
+        if self._record_may_exist:
+            self._verify_record()
+            self._remove_record()
+        self._verify_parent()
+        self.scratch.require_reachable()
+        self._require_absent(self.parent)
+        self._require_absent(self.scratch.fd)
+        self.scratch.confirm_recovery(self.name, self.receipt)
+
+    def _verify_record(self):
         require(_same_private_dir(self.name, self.scratch.fd, self.record_identity))
         record = os.open("recovery.json", os.O_RDONLY | FILE, dir_fd=self.record_fd)
         try:
@@ -351,6 +414,16 @@ class _Cgroup:
             require(os.read(record, len(self.evidence) + 1) == self.evidence)
         finally:
             os.close(record)
+
+    def _verify_recovery(self):
+        self.scratch.require_reachable()
+        self._verify_leaf()
+        self._verify_record()
+
+    def _remove_record(self):
+        os.unlink("recovery.json", dir_fd=self.record_fd)
+        require(_same_private_dir(self.name, self.scratch.fd, self.record_identity))
+        os.rmdir(self.name, dir_fd=self.scratch.fd)
 
     def claim(self, delegated, scratch):
         require(not self._closed and not self._claimed and self.delegated == delegated and self.scratch is scratch)
@@ -429,9 +502,7 @@ class _Cgroup:
                 time.sleep(min(remaining, .01))
             self._verify_recovery()
             self._remove_leaf()
-            os.unlink("recovery.json", dir_fd=self.record_fd)
-            require(_same_private_dir(self.name, self.scratch.fd, self.record_identity))
-            os.rmdir(self.name, dir_fd=self.scratch.fd)
+            self._remove_record()
             self.scratch.confirm_recovery(self.name, self.receipt)
             confirmed = True
         except (OSError, FixtureError):

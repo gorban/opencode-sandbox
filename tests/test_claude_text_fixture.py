@@ -2,15 +2,19 @@ from contextlib import ExitStack
 import errno
 import os
 import secrets
+import stat
+import tempfile
 from pathlib import Path
 from threading import Event, Thread
+from types import SimpleNamespace
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from oc_claude.fixture import (
     FixtureAuthority, Unavailable, probe_fixture, run_fixture_text,
 )
+from oc_claude import fixture_custody
 from oc_claude.fixture_custody import ANCHOR, FixtureCustody, _rename_without_replacing, _same_private_dir
 from oc_claude.fixture_protocol import FixtureError, decode, encode
 
@@ -117,12 +121,124 @@ def _updated(**values):
     return update
 
 
-class ClaudeFixtureTest(unittest.TestCase):
+class PortableScratchTest(unittest.TestCase):
     def setUp(self):
+        # Portable state tests own this tmpfs parent. They do not depend on how
+        # the devbox maps the host root uid. Production anchor checks are tested
+        # independently and used unmocked in the delegated kernel fixture.
+        self.portable_anchor = Path(self.enterContext(tempfile.TemporaryDirectory(dir=ANCHOR)))
+
+    def new_custody(self, **kwargs):
+        def open_test_anchor():
+            fd = os.open(self.portable_anchor, fixture_custody._DIR_FLAGS)
+            try:
+                info = os.fstat(fd)
+                self.assertEqual(info.st_uid, os.geteuid())
+                self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
+                return fd, info.st_dev
+            except BaseException:
+                os.close(fd)
+                raise
+
+        with patch.object(fixture_custody, "ANCHOR", self.portable_anchor), \
+                patch.object(fixture_custody, "_open_anchor", side_effect=open_test_anchor):
+            return FixtureCustody(**kwargs)
+
+
+class AnchorCustodyTest(unittest.TestCase):
+    def test_live_anchor_requires_visible_root(self):
+        parent = os.stat(ANCHOR.parent, follow_symlinks=False)
+        child = os.stat(ANCHOR, follow_symlinks=False)
+        if parent.st_uid == child.st_uid == 0:
+            fd, device = fixture_custody._open_anchor()
+            self.addCleanup(os.close, fd)
+            info = os.fstat(fd)
+            self.assertEqual((device, info.st_ino), (child.st_dev, child.st_ino))
+        else:
+            with self.assertRaisesRegex(FixtureError, "^integrity_error$"):
+                fixture_custody._open_anchor()
+
+    def test_anchor_uses_verified_parent_and_closes_on_success(self):
+        parent = self._info(1, 0o755)
+        child = self._info(2, 0o1777)
+        with patch.object(fixture_custody.os, "open", side_effect=(41, 42)) as open_fd, \
+                patch.object(fixture_custody.os, "fstat", side_effect=(parent, child)), \
+                patch.object(fixture_custody.os, "stat", side_effect=(parent, child)) as stat_name, \
+                patch.object(fixture_custody.os, "close") as close, \
+                patch.object(fixture_custody, "_verify_anchor_mount") as check_mount:
+            self.assertEqual(fixture_custody._open_anchor(), (42, child.st_dev))
+        self.assertEqual(open_fd.call_args_list, [
+            call(ANCHOR.parent, fixture_custody._DIR_FLAGS),
+            call(ANCHOR.name, fixture_custody._DIR_FLAGS, dir_fd=41),
+        ])
+        self.assertEqual(stat_name.call_args_list, [
+            call(ANCHOR.parent, follow_symlinks=False),
+            call(ANCHOR.name, dir_fd=41, follow_symlinks=False),
+        ])
+        self.assertTrue(fixture_custody._DIR_FLAGS & os.O_NOFOLLOW)
+        close.assert_called_once_with(41)
+        check_mount.assert_called_once_with(42)
+
+    def test_anchor_refusals_close_exact_open_descriptors(self):
+        parent = self._info(1, 0o755)
+        child = self._info(2, 0o1777)
+        parent_cases = (
+            (self._info(1, 0o755, uid=1000), parent),
+            (self._info(1, 0o775), parent),
+            (parent, self._info(3, 0o755)),
+            (parent, self._info(1, 0o755, kind=stat.S_IFLNK)),
+        )
+        child_cases = (
+            (self._info(2, 0o1777, uid=1000), child),
+            (self._info(2, 0o777), child),
+            (child, self._info(3, 0o1777)),
+            (child, self._info(2, 0o1777, kind=stat.S_IFLNK)),
+        )
+        for opened, named in parent_cases:
+            with self.subTest(parent=opened, named=named):
+                self._assert_anchor_refused((opened,), (named,), [call(41)])
+        for opened, named in child_cases:
+            with self.subTest(child=opened, named=named):
+                self._assert_anchor_refused((parent, opened), (parent, named), [call(42), call(41)])
+        self._assert_anchor_refused((parent, child), (parent, child), [call(42), call(41)],
+                                    invalid_mount=True)
+
+    def test_anchor_never_follows_a_parent_or_child_symlink(self):
+        parent = self._info(1, 0o755)
+        error = OSError(errno.ELOOP, "synthetic symlink")
+        for opening, expected in (((error,), []), ((41, error), [call(41)])):
+            with self.subTest(opening=opening), \
+                    patch.object(fixture_custody.os, "open", side_effect=opening), \
+                    patch.object(fixture_custody.os, "fstat", return_value=parent), \
+                    patch.object(fixture_custody.os, "stat", return_value=parent), \
+                    patch.object(fixture_custody.os, "close") as close:
+                with self.assertRaises(OSError):
+                    fixture_custody._open_anchor()
+                self.assertEqual(close.call_args_list, expected)
+
+    def _assert_anchor_refused(self, opened, named, expected, *, invalid_mount=False):
+        mount_error = FixtureError("integrity_error") if invalid_mount else None
+        with patch.object(fixture_custody.os, "open", side_effect=(41, 42)), \
+                patch.object(fixture_custody.os, "fstat", side_effect=opened), \
+                patch.object(fixture_custody.os, "stat", side_effect=named), \
+                patch.object(fixture_custody.os, "close") as close, \
+                patch.object(fixture_custody, "_verify_anchor_mount", side_effect=mount_error):
+            with self.assertRaisesRegex(FixtureError, "^integrity_error$"):
+                fixture_custody._open_anchor()
+        self.assertEqual(close.call_args_list, expected)
+
+    @staticmethod
+    def _info(inode, permissions, *, uid=0, kind=stat.S_IFDIR):
+        return SimpleNamespace(st_dev=11, st_ino=inode, st_uid=uid, st_mode=kind | permissions)
+
+
+class ClaudeFixtureTest(PortableScratchTest):
+    def setUp(self):
+        super().setUp()
         self.stack = self.enterContext(ExitStack())
         self.monotonic = time.monotonic
         self.wall = lambda: 1000
-        custody = FixtureCustody(now=lambda: self.monotonic(), wall=lambda: self.wall())
+        custody = self.new_custody(now=lambda: self.monotonic(), wall=lambda: self.wall())
         self.root = custody.root
         scratch = self.stack.enter_context(custody.pin_scratch())
         self.stack.callback(scratch.remove)
@@ -304,28 +420,28 @@ class ClaudeFixtureTest(unittest.TestCase):
 
     def test_preexisting_and_retired_scratch_cannot_be_adopted(self):
         name = "oc-claude-" + secrets.token_hex(16)
-        existing = ANCHOR / name
+        existing = self.portable_anchor / name
         existing.mkdir(mode=0o700)
         try:
             sentinel = existing / "untouched"
             sentinel.write_text("fixture-sentinel")
             with patch("oc_claude.fixture_custody._new_name", return_value=name):
-                self.assert_failure("integrity_error", FixtureCustody)
+                self.assert_failure("integrity_error", self.new_custody)
             self.assertEqual(list(existing.iterdir()), [sentinel])
             self.assertEqual(sentinel.read_text(), "fixture-sentinel")
         finally:
             (existing / "untouched").unlink()
             existing.rmdir()
 
-        with FixtureCustody() as other:
+        with self.new_custody() as other:
             retired = other.root
             cleanup = self.enterContext(other.pin_scratch())
         (retired / ".claude-fixture-custody").unlink()
         with patch("oc_claude.fixture_custody._new_name", return_value=retired.name):
-            self.assert_failure("integrity_error", FixtureCustody)
+            self.assert_failure("integrity_error", self.new_custody)
             self.assertEqual(list(retired.iterdir()), [])
             cleanup.remove()
-            self.assert_failure("integrity_error", FixtureCustody)
+            self.assert_failure("integrity_error", self.new_custody)
             self.assertFalse(retired.exists())
 
     def test_revocation_and_claim_are_ordered(self):
@@ -503,9 +619,9 @@ class ClaudeFixtureTest(unittest.TestCase):
                 self.assertTrue(marker.is_file())
 
 
-class ScratchRetirementTest(unittest.TestCase):
+class ScratchRetirementTest(PortableScratchTest):
     def test_substituted_scratch_is_neither_read_nor_removed(self):
-        with FixtureCustody() as custody:
+        with self.new_custody() as custody:
             scratch = self.enterContext(custody.pin_scratch())
             root = scratch.path
             (root / "owner-sentinel").write_text("owner")
@@ -528,7 +644,7 @@ class ScratchRetirementTest(unittest.TestCase):
         self.assertFalse(root.exists())
 
     def test_swap_during_quarantine_move_restores_foreign_without_reading_it(self):
-        with FixtureCustody() as custody:
+        with self.new_custody() as custody:
             scratch = self.enterContext(custody.pin_scratch())
             root = scratch.path
             (root / "owner-sentinel").write_text("owner")
@@ -566,7 +682,7 @@ class ScratchRetirementTest(unittest.TestCase):
             scratch.remove()
 
     def test_pending_retirement_refuses_removal_even_without_a_record(self):
-        with FixtureCustody() as custody:
+        with self.new_custody() as custody:
             scratch = self.enterContext(custody.pin_scratch())
             sentinel = scratch.path / "expected-owner"
             sentinel.write_text("retained")
@@ -588,8 +704,106 @@ class ScratchRetirementTest(unittest.TestCase):
             scratch.confirm_recovery("occlaude-expected", receipt)
             scratch.remove()
 
+    def test_refused_prelaunch_mkdir_releases_reserved_scratch(self):
+        from fixtures.claude_kernel import _Cgroup
+
+        with tempfile.TemporaryDirectory() as delegation:
+            delegated = Path(delegation)
+            with self.new_custody() as custody:
+                scratch = self.enterContext(custody.pin_scratch())
+            with patch("fixtures.claude_kernel.os.mkdir", side_effect=PermissionError(errno.EACCES, "fixture")):
+                with self.assertRaises(PermissionError):
+                    _Cgroup(delegated, scratch)
+            self.assertEqual(list(delegated.iterdir()), [])
+            self.assertEqual(scratch.recovery_names(), ())
+            scratch.remove()
+            self.assertFalse(scratch.path.exists())
+
+    def test_unowned_or_uncertain_prelaunch_mkdir_preserves_scratch(self):
+        from fixtures.claude_kernel import _Cgroup
+
+        for error in (errno.EIO, errno.EEXIST):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as delegation:
+                delegated = Path(delegation)
+                with self.new_custody() as custody:
+                    scratch = self.enterContext(custody.pin_scratch())
+                marker = scratch.path / "scratch-sentinel"
+                marker.write_text("retained")
+                expected = []
+                original_expect = scratch.expect_recovery
+                original_mkdir = os.mkdir
+
+                def reserve(name):
+                    receipt = original_expect(name)
+                    expected.append((name, receipt))
+                    return receipt
+
+                def refused_mkdir(name, mode, *, dir_fd):
+                    if error == errno.EEXIST:
+                        original_mkdir(name, mode, dir_fd=dir_fd)
+                        (delegated / name / "other-sentinel").write_text("untouched")
+                    raise OSError(error, "fixture")
+
+                with patch.object(scratch, "expect_recovery", side_effect=reserve), \
+                        patch("fixtures.claude_kernel.os.mkdir", side_effect=refused_mkdir):
+                    with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                        _Cgroup(delegated, scratch)
+                try:
+                    with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                        scratch.remove()
+                    self.assertEqual(marker.read_text(), "retained")
+                    if error == errno.EEXIST:
+                        name, _receipt = expected[0]
+                        self.assertEqual((delegated / name / "other-sentinel").read_text(), "untouched")
+                    else:
+                        self.assertEqual(list(delegated.iterdir()), [])
+                finally:
+                    # The test injected the failure without creating a kernel unit.
+                    # It can settle this synthetic reservation after checking that fact.
+                    for name, receipt in expected:
+                        scratch.confirm_recovery(name, receipt)
+                    scratch.remove()
+
+    def test_prelaunch_parent_provenance_mismatch_preserves_scratch(self):
+        from fixtures.claude_kernel import _Cgroup
+
+        with tempfile.TemporaryDirectory() as root:
+            delegated = Path(root) / "delegated"
+            foreign = Path(root) / "foreign"
+            delegated.mkdir()
+            foreign.mkdir()
+            with self.new_custody() as custody:
+                scratch = self.enterContext(custody.pin_scratch())
+            expected = []
+            original_expect = scratch.expect_recovery
+            original_stat = os.stat
+
+            def reserve(name):
+                receipt = original_expect(name)
+                expected.append((name, receipt))
+                return receipt
+
+            def displaced_parent(path, *args, **kwargs):
+                return original_stat(foreign if path == delegated else path, *args, **kwargs)
+
+            with patch.object(scratch, "expect_recovery", side_effect=reserve), \
+                    patch("fixtures.claude_kernel.os.stat", side_effect=displaced_parent), \
+                    patch("fixtures.claude_kernel.os.mkdir") as mkdir:
+                with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                    _Cgroup(delegated, scratch)
+            try:
+                mkdir.assert_not_called()
+                with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                    scratch.remove()
+                self.assertFalse(list(delegated.iterdir()) or list(foreign.iterdir()))
+            finally:
+                # Both paths were inert test directories and mkdir was never called.
+                for name, receipt in expected:
+                    scratch.confirm_recovery(name, receipt)
+                scratch.remove()
+
     def test_held_entry_is_retained_without_reading_its_contents(self):
-        with FixtureCustody() as custody:
+        with self.new_custody() as custody:
             scratch = self.enterContext(custody.pin_scratch())
             held = scratch.path / "occlaude-held"
             held.mkdir(mode=0o700)
@@ -638,6 +852,7 @@ class LinuxClaudeFixtureTest(unittest.TestCase):
             self.assertEqual(path.read_text(), "known-present-synthetic")
         launcher = KernelLauncher(root, scratch_pin, (*denied, root / "cgroup.procs"))
         self.addCleanup(launcher.close)
+        self._check_owned_prelaunch_errors(root)
 
         profile = scratch / _A
         profile.mkdir(mode=0o700)
@@ -672,6 +887,66 @@ class LinuxClaudeFixtureTest(unittest.TestCase):
             self.assertFalse((root / child.unit.name).exists())
             self.assertFalse(child.unit.record.exists())
 
+    def _check_owned_prelaunch_errors(self, delegated):
+        import stat
+
+        from fixtures.claude_kernel import DIR, FILE, _Cgroup
+
+        prepare_record = _Cgroup._prepare_record
+        for missing_evidence in (False, True):
+            with self.subTest(missing_evidence=missing_evidence):
+                with FixtureCustody() as custody:
+                    scratch = self.enterContext(custody.pin_scratch())
+                marker = scratch.path / "scratch-sentinel"
+                marker.write_text("retained")
+                units = []
+
+                def fail_after_prepare(unit):
+                    prepare_record(unit)
+                    units.append(unit)
+                    if missing_evidence:
+                        os.unlink("recovery.json", dir_fd=unit.record_fd)
+                    raise OSError(errno.EIO, "synthetic failure after complete allocation")
+
+                with patch.object(_Cgroup, "_prepare_record", autospec=True, side_effect=fail_after_prepare):
+                    if not missing_evidence:
+                        with self.assertRaises(OSError) as error:
+                            _Cgroup(delegated, scratch)
+                        self.assertEqual(error.exception.errno, errno.EIO)
+                    else:
+                        with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                            _Cgroup(delegated, scratch)
+
+                [unit] = units
+                leaf = delegated / unit.name
+                if missing_evidence:
+                    with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
+                        scratch.remove()
+                    self.assertEqual(marker.read_text(), "retained")
+                    self.assertEqual(scratch.recovery_names(), (unit.name,))
+                    # Independent test cleanup has the original fixture identities
+                    # and knows no launch took place. Never discover a substitute.
+                    with ExitStack() as fds:
+                        parent = os.open(delegated, DIR)
+                        fds.callback(os.close, parent)
+                        fd = os.open(unit.name, DIR, dir_fd=parent)
+                        fds.callback(os.close, fd)
+                        info = os.fstat(fd)
+                        self.assertTrue(stat.S_ISDIR(info.st_mode))
+                        self.assertEqual((info.st_dev, info.st_ino), unit.identity)
+                        self.assertEqual(info.st_uid, os.geteuid())
+                        events = os.open("cgroup.events", os.O_RDONLY | FILE, dir_fd=fd)
+                        fds.callback(os.close, events)
+                        self.assertIn(b"populated 0", os.read(events, 1024).splitlines())
+                        self.assertTrue(_same_private_dir(unit.name, scratch.fd, unit.record_identity))
+                        os.rmdir(unit.name, dir_fd=parent)
+                        os.rmdir(unit.name, dir_fd=scratch.fd)
+                    scratch.confirm_recovery(unit.name, unit.receipt)
+                self.assertFalse(leaf.exists())
+                self.assertEqual(scratch.recovery_names(), ())
+                scratch.remove()
+                self.assertFalse(scratch.path.exists())
+
     def _check_sealing_failure(self, launcher, profile, cancellation, *, binding=None):
         import fcntl
 
@@ -685,12 +960,14 @@ class LinuxClaudeFixtureTest(unittest.TestCase):
                 return 0
             return original(fd, operation, *args)
 
-        with patch.object(fcntl, "fcntl", refuse), self.assertRaises(FixtureError) as error:
+        with patch.object(fcntl, "fcntl", refuse):
             if binding is None:
-                probe_fixture(profile, launcher, cancellation)
+                with self.assertRaises(FixtureError) as error:
+                    probe_fixture(profile, launcher, cancellation)
             else:
-                run_fixture_text(binding, "haiku", _PROMPT, launcher,
-                                 FixtureAuthority(binding, "haiku", _PROMPT), cancellation)
+                authority = FixtureAuthority(binding, "haiku", _PROMPT)
+                with self.assertRaises(FixtureError) as error:
+                    run_fixture_text(binding, "haiku", _PROMPT, launcher, authority, cancellation)
         self.assertEqual(error.exception.reason, "integrity_error")
         self.assertFalse(error.exception.possible_send)
         self.assertEqual(len(launcher.children), children)
@@ -825,8 +1102,9 @@ class LinuxClaudeFixtureTest(unittest.TestCase):
                 notice = os.read(read_fd, 64)
                 self.assertEqual(notice, b"R" + unit.name.encode("ascii"))
                 # A ready child is not evidence of a dead supervisor.
+                deadline = time.monotonic() + 2
                 with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
-                    unit.recover(pidfd, notice, time.monotonic() + 2)
+                    unit.recover(pidfd, notice, deadline)
             finally:
                 poller.unregister(read_fd)
                 poller.register(pidfd, select.POLLIN)
@@ -835,8 +1113,9 @@ class LinuxClaudeFixtureTest(unittest.TestCase):
                 _pid, status = os.waitpid(supervisor, os.WNOHANG)
                 self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL)
             self.assertEqual(os.read(read_fd, 1), b"")
+            deadline = time.monotonic() + 2
             with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
-                unit.recover(pidfd, b"", time.monotonic() + 2)
+                unit.recover(pidfd, b"", deadline)
             self._check_missing_or_substituted_recovery(launcher, unit, pidfd, notice)
             unit.recover(pidfd, notice, time.monotonic() + 2)
             self.assertEqual(launcher.scratch.recovery_names(), ())
@@ -857,8 +1136,9 @@ class LinuxClaudeFixtureTest(unittest.TestCase):
         def must_refuse():
             with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
                 scratch.remove()
+            deadline = time.monotonic() + 2
             with self.assertRaisesRegex(FixtureError, "^retirement_unverified$"):
-                unit.recover(pidfd, notice, time.monotonic() + 2)
+                unit.recover(pidfd, notice, deadline)
             self.assertEqual(sentinel.read_text(), "retain expected scratch")
             self.assertTrue((launcher.delegated / unit.name).is_dir())
 
