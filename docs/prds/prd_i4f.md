@@ -60,6 +60,26 @@ routing, exposure or revocation goes through both reviews before use by another 
    revocation, wrong incarnation and provider failure. Prove the model cannot use host tools or
    read the workstation login. Keep that provider text-only until this gate clears.
 
+## Offline stock tool proof
+
+- [x] Exercise the OpenAI broker through bare `oc-sandbox` with pinned stock OpenCode and
+  synthetic upstream data (`codex/stock-worker-tools-proof`). In a sealed SELinux-enforcing
+  Podman guest, OpenCode completed a patch, a file read, and a shell command with three
+  continuations. The fixture checked the exact file bytes, worker credential isolation,
+  refused tool responses, held-stream closure, and owned worker and relay retirement.
+  See the [sealed guest runbook](../../tests/e2e/stock_worker_tools_guest.md).
+- [x] Exercise the cumulative tool history and bounded turn loop with pinned stock OpenCode
+  through the synthetic loopback fixture (`codex/stock-tool-loop-r3-fixture`). Three linked
+  continuations settled, the title stayed local, and changes to already accepted history
+  produced no additional claims or sends.
+- [ ] Verify the cumulative tool loop through the sealed public launcher and qualify it against
+  live provider grants. The earlier sealed run exercised the original broker behavior.
+  On #107 at commit `1a7e42955204181a2b630d1ba44effec55f484be` (tree `e993cf51`), the
+  sealed public launcher completed patch, read, and shell with three continuations using
+  an entirely synthetic TLS peer. Independent cleanup checks found only the baseline
+  devbox and confirmed removal of the test pods, volumes, and secrets.
+  Redacted summary SHA-256 `6b2e5a94bb6f4891b53bbb9956b70bf0b4f683a02259af1c2340be9dd6abce4e`.
+
 ## Opt-in live e2e pytest milestones
 
 Keep temporary canary and smoke harnesses out of the public `oc-sandbox` CLI. Automate each
