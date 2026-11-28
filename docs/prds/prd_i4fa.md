@@ -125,5 +125,10 @@ acceptance independent. The combined live sandbox test follows individual qualif
   in scratch. Verify that lost acknowledgments and uncertain publication block reuse, a retained
   socket cannot prolong the original peer's authority, and an invalid local lock cannot hang the
   bounded transaction. See `codex/openai-isolated-holder-r3`.
-- [ ] Verify independent holder and controller identities in the sealed guest against the exact
-  legacy OpenAI paths, with a separate rollback domain and an actual pre-write scope check.
+- [x] In a disconnected enforcing guest, verify independent holder and controller identities,
+  the exact legacy paths, a holder-only rewind that preserves the controller volume, and the
+  pre-write scope check. Source `745d5159981b04c8fd37b83b49fa431eded3bcbc`.
+  The worker could read its job data and recorded zero protected reads. A fresh controller
+  refused reuse with zero new authorizations or holder sends, and all owned scratch retired.
+  The synthetic result SHA-256 is
+  `11d051540389851f013e80be24caae1bfde1d9b426ef5fff96c695d6e74c470a`.
