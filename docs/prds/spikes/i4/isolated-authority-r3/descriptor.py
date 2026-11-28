@@ -53,7 +53,7 @@ def decode(packet):
         value = json.loads(packet.decode("ascii"))
         if type(value) is list and canonical(value) == packet:
             return value
-    except (UnicodeError, ValueError, RecursionError):
+    except (ValueError, RecursionError):
         pass
     raise Denied(Refusal.BAD_MESSAGE)
 

@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -215,7 +216,8 @@ class ReceiptTests(unittest.TestCase):
 
     @staticmethod
     def allowed():
-        pass
+        """Supply successful owner authorization in tests focused on receipts."""
+        return None
 
     @contextmanager
     def connected(self, *, reply_fault=None, store=None):
@@ -433,6 +435,44 @@ class ReceiptTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - start, 1.5)
         self.assertEqual(self.store.head(), self.initial)
 
+    def test_external_lock_replaced_while_waiting_cannot_change_receipt(self):
+        path = self.external / "installation.lock"
+        receipt = self.external / "continuity.json"
+        evidence = receipt.read_bytes()
+        waiting = threading.Event()
+        replaced = threading.Event()
+        actual_flock = fcntl.flock
+
+        def observe_contention(descriptor, operation):
+            try:
+                actual_flock(descriptor, operation)
+            except BlockingIOError:
+                waiting.set()
+                if not replaced.wait(1):
+                    raise AssertionError("lock replacement did not complete")
+                raise
+
+        with path.open("rb") as holder, ThreadPoolExecutor(max_workers=1) as pool:
+            actual_flock(holder, fcntl.LOCK_EX)
+            with (patch("receipt.fcntl.flock", side_effect=observe_contention),
+                  patch("receipt._LOCK_WAIT_SECONDS", 2)):
+                result = pool.submit(self.store.commit, self.initial, self.claim)
+                try:
+                    self.assertTrue(waiting.wait(1), "controller did not wait on the original lock")
+                    path.rename(path.with_name("detached.lock"))
+                    path.touch(mode=0o600)
+                finally:
+                    actual_flock(holder, fcntl.LOCK_UN)
+                    replaced.set()
+                with self.assertRaises(Denied) as refusal:
+                    result.result(timeout=3)
+
+        self.assertEqual(refusal.exception.reason, Refusal.INVALID_RECEIPT)
+        self.assertEqual(receipt.read_bytes(), evidence)
+        with self.assertRaises(Denied) as refusal:
+            self.store.head()
+        self.assertEqual(refusal.exception.reason, Refusal.RECONCILIATION_REQUIRED)
+
     def test_local_scope_fifo_refused_in_bounded_child(self):
         self.local_lock.unlink()
         os.mkfifo(self.local_lock, mode=0o600)
@@ -637,15 +677,15 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(denial.exception.reason, Refusal.LOST_ENDPOINT)
 
     def test_wrong_grant_role_cross_slot_and_replay_fail(self):
-        for role, slot, reason in (("worker", SLOT, Refusal.WRONG_GRANT),
-                                   ("owner", OTHER_SLOT, Refusal.WRONG_GRANT)):
-            with self.subTest(role=role, slot=slot), self.assertRaises(Denied) as denial:
+        for role, slot in (("worker", SLOT), ("owner", OTHER_SLOT)):
+            with self.subTest(role=role, slot=slot):
                 left, right = descriptor_pair()
                 with right, current_channel(left) as owner:
                     grant = OwnerGrant(owner, SLOT, INTENT)
                     right.send(canonical([role, "launch", slot, INTENT]))
-                    grant.admit()
-            self.assertEqual(denial.exception.reason, reason)
+                    with self.assertRaises(Denied) as denial:
+                        grant.admit()
+                self.assertEqual(denial.exception.reason, Refusal.WRONG_GRANT)
         left, right = descriptor_pair()
         with right, current_channel(left) as owner:
             grant = OwnerGrant(owner, SLOT, INTENT)

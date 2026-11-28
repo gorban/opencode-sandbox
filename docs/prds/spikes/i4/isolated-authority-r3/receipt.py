@@ -99,8 +99,9 @@ class ReceiptStore:
                     flags |= os.O_CREAT | os.O_EXCL
                 lock = os.open(_LOCK, flags, 0o600, dir_fd=root)
                 try:
-                    lock_info = self._require_private_file(lock)
+                    lock_info = self._require_private_info(os.fstat(lock))
                     acquire_exclusive(lock)
+                    self._require_current_lock(root, lock, lock_info)
                     installation = (info.st_dev, info.st_ino, lock_info.st_dev, lock_info.st_ino)
                     if not provisioning:
                         self._require_active()
@@ -124,17 +125,29 @@ class ReceiptStore:
             raise Denied(Refusal.STORAGE_UNCERTAIN) from None
 
     @staticmethod
-    def _require_private_file(descriptor):
-        info = os.fstat(descriptor)
+    def _require_private_info(info):
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
                 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
             raise Denied(Refusal.INVALID_RECEIPT)
         return info
 
+    def _require_current_lock(self, root, lock, opened):
+        # A waiter can acquire a detached lock whose old descriptor is still
+        # valid. Verify that the permanent name still identifies its inode.
+        try:
+            held = self._require_private_info(os.fstat(lock))
+            named = self._require_private_info(os.stat(_LOCK, dir_fd=root, follow_symlinks=False))
+            original = opened.st_dev, opened.st_ino
+            if (held.st_dev, held.st_ino) != original or (named.st_dev, named.st_ino) != original:
+                raise Denied(Refusal.INVALID_RECEIPT)
+        except Denied:
+            self._uncertain = True
+            raise
+
     def _read(self, root):
         descriptor = os.open(_RECEIPT, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root)
         with os.fdopen(descriptor, "rb") as reader:
-            self._require_private_file(reader.fileno())
+            self._require_private_info(os.fstat(reader.fileno()))
             raw = reader.read(_MAX_RECORD + 1)
         try:
             if len(raw) > _MAX_RECORD:
@@ -219,6 +232,25 @@ class ReceiptStore:
             self._publish_verified(root, "witnessed", head)
 
 
+def _receipt_response(store, command, prior_acknowledgment):
+    if command == ["head"]:
+        return ["head", store.head().wire()], None
+    if len(command) != 3:
+        raise Denied(Refusal.BAD_MESSAGE)
+    if command[0] == "commit":
+        expected, proposed = map(Commitment.parse, command[1:])
+        committed = store.commit(expected, proposed)
+        challenge = secrets.token_hex(32)
+        return ["committed", committed.wire(), challenge], (committed, challenge)
+    if command[0] == "witness":
+        witnessed = Commitment.parse(command[1])
+        if (witnessed, command[2]) != prior_acknowledgment:
+            raise Denied(Refusal.RECONCILIATION_REQUIRED)
+        store.witness(witnessed)
+        return None, None
+    raise Denied(Refusal.BAD_MESSAGE)
+
+
 def serve_receipts(channel, store):
     """One measured controller endpoint. A witness has no success response."""
     expected_witness = None
@@ -227,31 +259,18 @@ def serve_receipts(channel, store):
         command = None
         try:
             command = channel.receive()
-            if command == ["head"]:
-                response = ["head", store.head().wire()]
-            elif len(command) == 3 and command[0] == "commit":
-                expected, proposed = map(Commitment.parse, command[1:])
-                committed = store.commit(expected, proposed)
-                challenge = secrets.token_hex(32)
-                response = ["committed", committed.wire(), challenge]
-            elif len(command) == 3 and command[0] == "witness":
-                witnessed = Commitment.parse(command[1])
-                if (witnessed, command[2]) != prior_acknowledgment:
-                    raise Denied(Refusal.RECONCILIATION_REQUIRED)
-                store.witness(witnessed)
-                continue
-            else:
-                raise Denied(Refusal.BAD_MESSAGE)
+            response, next_witness = _receipt_response(store, command, prior_acknowledgment)
         except Denied as failure:
             if failure.reason in (Refusal.LOST_ENDPOINT, Refusal.WRONG_PEER):
                 return
-            response = ["denied", failure.reason.value]
+            response, next_witness = ["denied", failure.reason.value], None
+        if response is None:
+            continue
         try:
             channel.send(response)
         except Denied:
             return
-        if response[0] == "committed":
-            expected_witness = committed, challenge
+        expected_witness = next_witness
         if command and command[0] == "witness":
             return
 
