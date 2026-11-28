@@ -410,9 +410,10 @@ class ExposureScratch:
         with self._descriptor_lock:
             require(not self._revoked, "Capture exposure directory retired")
 
-    def authorize_first_write(self, *, deadline, clock):
-        with self.borrow() as (_directory, verify):
+    def authorize_first_write(self, *, deadline, clock, verify_ledger):
+        with self.borrow() as (directory, verify):
             verify()
+            verify_ledger(directory)
         # The deadline and revocation must both be current after filesystem
         # verification, without holding this lock across I/O or the callback.
         with self._descriptor_lock:
@@ -447,13 +448,22 @@ class ExposureScratch:
 
     def discard(self, ledger=None):
         self.verify()
-        with os.scandir(self.directory) as entries:
-            entry = next(entries, None)
-            if entry is not None:
-                require(ledger is not None and entry.name == ledger.name and next(entries, None) is None
-                        and ledger.owns(entry.stat(follow_symlinks=False)),
-                        "Unexpected capture exposure artifacts")
+        # A fresh file description sees entries published after the held
+        # descriptor was opened, without sharing its enumeration position.
+        scanner = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.directory)
+        with preserving_cleanup(lambda: os.close(scanner), "exposure enumeration close"):
+            require(os.path.samestat(self.identity, os.fstat(scanner)), "Capture exposure enumeration changed")
+            with os.scandir(scanner) as entries:
+                entry = next(entries, None)
+                if entry is not None:
+                    require(ledger is not None and entry.name == ledger.name and next(entries, None) is None
+                            and ledger.owns(entry.stat(follow_symlinks=False)),
+                            "Unexpected capture exposure artifacts")
+                    identified = entry.stat(follow_symlinks=False)
         if entry is not None:
+            named = os.stat(ledger.name, dir_fd=self.directory, follow_symlinks=False)
+            require(ledger.owns(named) and os.path.samestat(identified, named),
+                    "Capture exposure ledger changed before cleanup")
             os.unlink(ledger.name, dir_fd=self.directory)
         self.verify()
         os.rmdir(self.root.name, dir_fd=self.parent)
@@ -566,7 +576,7 @@ def capture_report(observer, case, exported):
 
 def record_capture_failure(scratch, evidence_name, observer, stopped, primary, ledger, local):
     turns = observer.turns if observer is not None else None
-    publication_uncertain = ledger.publication_uncertain if turns is None else turns.settlement_uncertain
+    publication_uncertain = ledger.publication_uncertain or (turns is not None and turns.settlement_uncertain)
     retain = not (stopped and not publication_uncertain and scratch.still_named())
     if retain:
         scratch.revoke()
@@ -578,7 +588,8 @@ def record_capture_failure(scratch, evidence_name, observer, stopped, primary, l
     retain = retain or not named
     if retain:
         scratch.revoke()
-        save_recovery_receipt(scratch, ledger.name, *local, primary, named=named)
+        identities = ledger.recovery_identities() if stopped and ledger.publication_uncertain else ()
+        save_recovery_receipt(scratch, ledger.name, *local, primary, named=named, identities=identities)
     return retain
 
 
@@ -669,7 +680,7 @@ def terminal_socket_identity(local_root, local_identity):
     return {"path": str(local_root / "t"), "device": info.st_dev, "inode": info.st_ino}
 
 
-def save_recovery_receipt(scratch, ledger_name, local_root, local_identity, primary, *, named):
+def save_recovery_receipt(scratch, ledger_name, local_root, local_identity, primary, *, named, identities):
     if named:
         primary.add_note(f"Private synthetic exposure journal retained in {scratch.root}")
     else:
@@ -687,12 +698,15 @@ def save_recovery_receipt(scratch, ledger_name, local_root, local_identity, prim
         verify_private_directory(os.fstat(scratch.directory))
         terminal_scratch = ({"path": str(local_root), "device": local_identity.st_dev, "inode": local_identity.st_ino}
                             if local_identity is not None else {"status": "unavailable"})
-        write_capture_evidence(scratch.directory, "recovery.json", {
+        receipt = {
             "run_id": scratch.root.name,
             "exposure_ledger": ledger_name,
             "terminal_scratch": terminal_scratch,
             "terminal_socket": terminal_socket,
-        })
+        }
+        if identities:
+            receipt["owned_ledger_identities"] = identities
+        write_capture_evidence(scratch.directory, "recovery.json", receipt)
     except BaseException as receipt_error:
         primary.add_note(f"Unable to save private recovery receipt: {type(receipt_error).__name__}")
 

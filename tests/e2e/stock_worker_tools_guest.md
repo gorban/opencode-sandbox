@@ -47,7 +47,7 @@ including when SQLite commits before reporting an error. Observer serving and
 request handlers share one shutdown deadline. Capture commands require the
 existing foreground tmux server. Terminal teardown checks its shutdown command
 and observes the exact child exit within a separate deadline. If either teardown,
-initial journal publication, or settlement cannot be confirmed,
+journal publication, or settlement cannot be confirmed,
 the capture retains the journal and an owner-only recovery receipt in a private
 child of the persistent evidence directory. The raised diagnostic gives that
 location and the requested failure evidence gives only the unavailable status.
@@ -59,9 +59,11 @@ tmux socket identity when verified and records it as unavailable otherwise.
 The capture holds private directory descriptors and verifies their visible names
 before publishing evidence or removing scratch. It syncs the evidence parent
 before starting and persists bounded SQLite snapshots through the held run
-directory before authorizing synthetic sends. If a name has moved, preserve
-the original directory and use the private diagnostic's run and inode to locate
-it after retirement. This fixture assumes exclusive same-UID access to the
+directory before authorizing synthetic sends. It checks the published ledger
+after synchronization and again before final first-write authorization. The
+receipt records the known owned ledger inodes when publication is uncertain.
+If a name has moved, use the private diagnostic and receipt to locate the
+retained evidence after retirement. This fixture assumes exclusive same-UID access to the
 evidence bind and terminal scratch during capture. Peers with the same UID can
 mutate directory names, and POSIX checks inode identity and removes a name in
 separate calls.

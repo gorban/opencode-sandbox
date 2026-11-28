@@ -56,7 +56,7 @@ class PinnedLedger:
     def __init__(self, name, scratch):
         self.name = name
         self.scratch = scratch
-        self._identity = self._candidate = None
+        self._identity = self._candidate = self._published = None
         self.publication_uncertain = False
 
     def owns(self, info):
@@ -67,6 +67,12 @@ class PinnedLedger:
                     for identity in (self._identity, self._candidate))
         )
 
+    def recovery_identities(self):
+        return [
+            {"device": identity.st_dev, "inode": identity.st_ino}
+            for identity in (self._identity, self._candidate) if identity is not None
+        ]
+
     def read(self, directory):
         fd = os.open(self.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         with os.fdopen(fd, "rb") as stream:
@@ -75,12 +81,27 @@ class PinnedLedger:
             require(0 < before.st_size <= _MAX_LEDGER_BYTES, "Wrong capture exposure ledger size")
             payload = stream.read(_MAX_LEDGER_BYTES + 1)
             after = os.stat(self.name, dir_fd=directory, follow_symlinks=False)
-            require(self.owns(after) and os.path.samestat(before, after)
-                    and (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-                    == (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            require(self.owns(after) and self._same_version(before, after)
                     and len(payload) == before.st_size,
                     "Capture exposure ledger changed during read")
         return payload, before
+
+    @staticmethod
+    def _same_version(first, second):
+        return (
+            os.path.samestat(first, second)
+            and (first.st_size, first.st_mtime_ns, first.st_ctime_ns)
+            == (second.st_size, second.st_mtime_ns, second.st_ctime_ns)
+        )
+
+    def verify_published(self, directory):
+        try:
+            current = os.stat(self.name, dir_fd=directory, follow_symlinks=False)
+            require(self._published is not None and self.owns(current) and self._same_version(self._published, current),
+                    "Published capture exposure ledger changed")
+        except BaseException:
+            self.publication_uncertain = True
+            raise
 
     def publish(self, db, directory, verify, previous):
         self.scratch.require_active()
@@ -99,10 +120,19 @@ class PinnedLedger:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(fd)
+                staged_identity = os.fstat(fd)
             verify()
             self._install_snapshot(directory, staged, staged_identity, previous)
+            installed = os.stat(self.name, dir_fd=directory, follow_symlinks=False)
+            # Installing the file may change its ctime. Establish the published
+            # version from the exact staged inode before syncing the directory.
+            require(self.owns(installed) and os.path.samestat(staged_identity, installed)
+                    and (installed.st_size, installed.st_mtime_ns) == (staged_identity.st_size, staged_identity.st_mtime_ns),
+                    "Published capture exposure ledger changed")
+            self._published = installed
             os.fsync(directory)
             verify()
+            self.verify_published(directory)
             self.scratch.require_active()
         except BaseException as primary:
             self._remove_staging(directory, staged, staged_identity, primary)
@@ -110,7 +140,7 @@ class PinnedLedger:
 
     def _install_snapshot(self, directory, staged, staged_identity, previous):
         named = os.stat(staged, dir_fd=directory, follow_symlinks=False)
-        require(os.path.samestat(staged_identity, named), "Capture exposure staging identity changed")
+        require(self._same_version(staged_identity, named), "Capture exposure staging identity changed")
         if previous is None:
             self.scratch.require_active()
             self._candidate = staged_identity
@@ -120,9 +150,7 @@ class PinnedLedger:
             os.unlink(staged, dir_fd=directory)
             return
         named = os.stat(self.name, dir_fd=directory, follow_symlinks=False)
-        require(self.owns(named) and os.path.samestat(named, previous)
-                and (named.st_size, named.st_mtime_ns, named.st_ctime_ns)
-                == (previous.st_size, previous.st_mtime_ns, previous.st_ctime_ns),
+        require(self.owns(named) and self._same_version(named, previous),
                 "Capture exposure ledger changed before replacement")
         self.scratch.require_active()
         # Either known inode may be present if replacement persists before raising.
@@ -315,7 +343,8 @@ class FixtureTurns:
                 self._eligible = None
                 self._require_current(authority)
                 if self._ledger is not None:
-                    self._ledger.scratch.authorize_first_write(deadline=self._deadline, clock=self._clock)
+                    self._ledger.scratch.authorize_first_write(deadline=self._deadline, clock=self._clock,
+                                                               verify_ledger=self._ledger.verify_published)
                 return request, start(request)
             except BaseException:
                 self._owner_current = False

@@ -407,6 +407,125 @@ class CaptureGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(FixtureMismatch, "Stale or expired"):
                 turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), upstream)
 
+    def test_claim_retirement_checks_the_published_ledger_at_sync_and_final_authorization(self):
+        sync = os.fsync
+        for phase in ("directory sync", "final authorization"):
+            for replacement in (False, True):
+                with self.subTest(phase=phase, replacement=replacement), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+
+                    def displace(ledger):
+                        ledger.rename(ledger.with_name("owned-pending.sqlite"))
+                        if replacement:
+                            ledger.write_bytes(b"unrelated synthetic file")
+                            ledger.chmod(0o600)
+
+                    def fault(observer, ledger):
+                        if phase == "directory sync":
+                            def move_after_sync(fd):
+                                result = sync(fd)
+                                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                                    displace(ledger)
+                                return result
+
+                            return patch("stock_worker_tools_turns.os.fsync", side_effect=move_after_sync)
+                        scratch = observer.turns._ledger.scratch
+                        authorize = scratch.authorize_first_write
+
+                        def move_before_authorization(**options):
+                            displace(ledger)
+                            return authorize(**options)
+
+                        return patch.object(scratch, "authorize_first_write", side_effect=move_before_authorization)
+
+                    expected = FixtureMismatch if replacement else FileNotFoundError
+                    ledger, receipt, _ = self.assert_claim_fault_preserves_recovery(root, fault, expected)
+                    owned = ledger.with_name("owned-pending.sqlite")
+                    self.assert_unresolved_claim(owned)
+                    info = owned.stat()
+                    self.assertEqual(receipt["owned_ledger_identities"], [{"device": info.st_dev, "inode": info.st_ino}])
+                    if replacement:
+                        self.assertEqual(ledger.read_bytes(), b"unrelated synthetic file")
+                    else:
+                        self.assertFalse(ledger.exists())
+
+    def test_failed_claim_publication_retains_private_claim_and_redacts_report(self):
+        sync = os.fsync
+        replace = os.replace
+        for failure in ("replace then error", "directory sync"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                primary = OSError(f"synthetic claim publication {failure}")
+
+                def fault(_observer, _ledger):
+                    if failure == "replace then error":
+                        def replace_then_raise(*args, **kwargs):
+                            replace(*args, **kwargs)
+                            raise primary
+
+                        return patch("stock_worker_tools_turns.os.replace", side_effect=replace_then_raise)
+
+                    def fail_directory_sync(fd):
+                        if stat.S_ISDIR(os.fstat(fd).st_mode):
+                            raise primary
+                        return sync(fd)
+
+                    return patch("stock_worker_tools_turns.os.fsync", side_effect=fail_directory_sync)
+
+                ledger, receipt, error = self.assert_claim_fault_preserves_recovery(Path(directory), fault, OSError)
+                self.assertIs(error, primary)
+                self.assert_unresolved_claim(ledger)
+                info = ledger.stat()
+                self.assertIn({"device": info.st_dev, "inode": info.st_ino}, receipt["owned_ledger_identities"])
+
+    def assert_claim_fault_preserves_recovery(self, root, fault, expected_error):
+        upstream = MagicMock()
+        observed = {}
+
+        def start_terminal(term, *_args):
+            self.addCleanup(shutil.rmtree, Path(term.command[4]).parent, ignore_errors=True)
+
+        def issue_claim(_predicate, _description, observer):
+            observed["ledger"] = observer.turns._path
+            with fault(observer, observed["ledger"]):
+                observer.turns.dispatch(AUTHORITY, "ses_capture", self.first_turn(), upstream)
+            self.fail("An ambiguous claim reached the synthetic upstream")
+
+        terminal_server = MagicMock()
+        terminal_server.poll.return_value = None
+        evidence = root / "failure.json"
+        with patch("stock_worker_tools_capture.PORT", 0), \
+                patch("stock_worker_tools_capture.stock_config", return_value={}), patch("sys.stderr", StringIO()), \
+                patch.object(Terminal, "launch_server", return_value=terminal_server), \
+                patch.object(Terminal, "await_server"), patch.object(Terminal, "start", start_terminal), \
+                patch.object(Terminal, "await_screen", side_effect=issue_claim), patch.object(Terminal, "run"):
+            with self.assertRaises(expected_error) as raised:
+                capture(("/unused-stock-fixture",), evidence, "tools")
+        upstream.assert_not_called()
+        terminal_server.wait.assert_called_once()
+        ledger = observed["ledger"]
+        receipt = json.loads((ledger.parent / "recovery.json").read_text())
+        self.assertEqual(receipt["run_id"], ledger.parent.name)
+        self.assertEqual(receipt["exposure_ledger"], ledger.name)
+        self.assertTrue(any(str(ledger.parent) in note for note in raised.exception.__notes__))
+        self.assertEqual(json.loads(evidence.read_text()), {"phase": "failed", "exposure": {"status": "unavailable"}})
+        return ledger, receipt, raised.exception
+
+    def assert_unresolved_claim(self, ledger):
+        with closing(sqlite3.connect(ledger)) as db:
+            self.assertEqual(db.execute("SELECT sequence, parent, actual_input, actual_output FROM exposure").fetchall(),
+                             [(1, None, None, None)])
+
+    def test_exposure_cleanup_enumerates_fresh_without_changing_held_position(self):
+        with tempfile.TemporaryDirectory() as directory, capture_fixture.make_exposure_scratch(Path(directory)) as scratch:
+            ledger = PinnedLedger("test-exposure.sqlite", scratch)
+            FixtureTurns(scratch.root / ledger.name, AUTHORITY, ledger=ledger)
+            with os.scandir(scratch.directory) as stale:
+                self.assertEqual(next(stale).name, ledger.name)
+                offset = os.lseek(scratch.directory, 0, os.SEEK_CUR)
+                scratch.discard(ledger)
+                self.assertEqual(os.lseek(scratch.directory, 0, os.SEEK_CUR), offset)
+            self.assertFalse(scratch.root.exists())
+
     def test_settlement_sync_uncertainty_retains_exact_usage_and_receipt(self):
         primary = OSError("synthetic settlement directory sync failed")
         sync = os.fsync
