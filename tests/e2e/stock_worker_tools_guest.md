@@ -19,10 +19,44 @@ python3 -IB tests/e2e/stock_worker_tools_capture.py /oc-bin/opencode \
 python3 -IB tests/e2e/test_stock_worker_tools_guards.py
 ```
 
-The capture uses the real request validator and stream projector with a local fixture.
-It checks actual tool execution independently with the stock session export and file bytes.
-It does not exercise public launch or the TLS fixture. The evidence file contains only
-synthetic traffic and has mode 0600. Record its SHA-256 and the source revision.
+The capture applies the stock request validator, pins the measured tool declarations and
+uses the strict stream parser and projector against a fake upstream. It answers the
+exact measured title envelope with a fixed local stream. The independent upstream
+counter and private scratch exposure ledger must show exactly four writes and three
+distinct continuation claims. Each continuation must repeat the ordered accepted
+tool history and add exactly the batch handed off by its predecessor. The fixture
+replays five mutations to the earlier prefix of the third continuation and checks that
+each reaches neither claim nor send. It verifies native execution with the stock
+session export and exact file bytes.
+
+Run again with a fresh namespace, workspace and evidence file for each refusal:
+
+```sh
+python3 -IB tests/e2e/stock_worker_tools_capture.py /oc-bin/opencode \
+  --musl-libraries /musl --case hosted --evidence /evidence/stock-hosted.json
+python3 -IB tests/e2e/stock_worker_tools_capture.py /oc-bin/opencode \
+  --musl-libraries /musl --case undeclared --evidence /evidence/stock-undeclared.json
+python3 -IB tests/e2e/test_stock_worker_tools_turns.py
+```
+
+The capture's evidence file contains only synthetic traffic and has mode 0600. Record
+its SHA-256 and the source revision. The capture is a loopback proof with a synthetic
+accounting store. The public launcher, production broker and TLS peer are exercised by
+the separate sealed guest procedure below.
+
+## Pinned built-in inventory
+
+The first chat request advertised these 11 tools. Match each qualification to the same
+stock binary and exact declared schema.
+
+| Tools | Evidence or next qualification |
+| --- | --- |
+| `patch`, `read`, `shell` | Positive loopback runs verify the resulting bytes, readback, and shell output. |
+| `glob`, `grep` | Verify workspace searches and denial of their access to host files. |
+| `question`, `skill` | Verify the stock terminal question flow and reads from approved in-job skills. |
+| `subagent` | Verify the child stays in the job and inherits only permitted model routes and budgets. |
+| `webfetch`, `websearch` | Verify use of the intended job egress, denial of provider login routes, and no access to host credentials. |
+| `execute` | Verify the confined JavaScript runtime cannot escape the job's tool or HTTP permissions. |
 
 ## Sealed guest
 

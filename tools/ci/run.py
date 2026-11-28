@@ -83,6 +83,8 @@ SUITES = (
     discover('OpenAI interactive shell e2e harness', 'test_openai_shell_e2e_harness.py'),
     script('Offline stock worker tool fixture guards', 'tests/e2e/test_stock_worker_tools_guards.py',
            'python3', '-IB', unittest=True),
+    script('Offline stock worker tool-loop turns', 'tests/e2e/test_stock_worker_tools_turns.py',
+           'python3', '-IB', unittest=True),
     discover('Supply-chain pinning and image age invariants', 'test_supply_chain_pins.py'),
 )
 
@@ -168,7 +170,11 @@ PYTHON_FILES = (
     'tests/e2e/stock_worker_tools_peer.py',
     'tests/e2e/stock_worker_tools_projection.py',
     'tests/e2e/stock_worker_tools_protocol.py',
+    'tests/e2e/stock_worker_tools_history.py',
+    'tests/e2e/stock_worker_tools_stream.py',
+    'tests/e2e/stock_worker_tools_turns.py',
     'tests/e2e/test_stock_worker_tools_guards.py',
+    'tests/e2e/test_stock_worker_tools_turns.py',
     'tests/host_state_leaves.py',
     'tests/orchestrator-owner-loss.py',
     'tests/parallel-isolated-test.py',

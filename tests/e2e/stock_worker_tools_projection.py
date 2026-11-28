@@ -43,6 +43,9 @@ FIXTURE_PATHS = (
     Path("tests/e2e/stock_worker_tools_host.py"),
     Path("tests/e2e/stock_worker_tools_capture.py"),
     Path("tests/e2e/stock_worker_tools_protocol.py"),
+    Path("tests/e2e/stock_worker_tools_history.py"),
+    Path("tests/e2e/stock_worker_tools_stream.py"),
+    Path("tests/e2e/stock_worker_tools_turns.py"),
     Path("tests/e2e/stock_worker_tools_guest.py"),
     Path("tests/test_openai_connection.py"),
 )

@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import contextmanager
+from copy import deepcopy
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -22,12 +23,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from oc_openai.connection_state import decode_json
 from oc_openai.session_adapter import OpenAISessionAdapter
-from oc_openai.session_protocol import MAX_INTERACTIVE_BODY, ReasoningVault, SessionStreamProjector, StreamAborted, parse_worker_request
+from oc_openai.session_protocol import ReasoningVault, StreamAborted, encode_chunk, parse_worker_request
 from oc_providers.catalog import ResolvedLaunchPlan, build_multi_provider_opencode_config
 from oc_providers.contracts import InstancePreflight, ProviderInstanceSpec, ReadinessState
-from stock_worker_tools_protocol import (FILE_NAME, FILE_TEXT, LABEL, MODEL, PROMPT, PROVIDER, REPLY,
-                                         REFUSED_FILE, TITLE, TITLE_PROMPT, TOOL_NAMES, ToolScript, output_text, refused_events,
-                                         require, response_events, validate_export, validate_refused_export)
+from stock_worker_tools_history import MAX_OUTPUT, MAX_WIRE, classify, upstream_body
+from stock_worker_tools_protocol import (
+    FILE_NAME, FILE_TEXT, LABEL, MODEL, PROMPT, PROVIDER, REPLY, REFUSED_FILE, TITLE, TOOL_NAMES,
+    FixtureMismatch, ToolScript, refused_events, require, response_events, validate_export,
+    validate_refused_export,
+)
+from stock_worker_tools_stream import project_stream, scripted_response, terminal_output
+from stock_worker_tools_turns import HANDOFF_END, Authority, FixtureTurns
 
 STOCK_SHA256 = "9e0cb0e096666f955c3f72d1b517fd2cb5cca65c2876e1012492d955fc974a7b"
 MUSL_LOADER_SHA256 = "095b047c631447e4fa50401fa7ffce01f678587040d65ba18c574981dc630de5"
@@ -38,6 +44,7 @@ MUSL_PINS = {
 PORT = 8401
 FIXTURE_BEARER = "stock-tools-synthetic-only"
 WORKSPACE = Path("/sandbox/construct")
+AUTHORITY = Authority("synthetic-job", "harbor", "capture-generation", "/v1/responses", MODEL)
 JOB_ENV = {
     "PATH": "/usr/bin:/bin",
     "TERM": "xterm-256color",
@@ -103,19 +110,72 @@ class Terminal:
         raise RuntimeError(f"Did not observe {description} in the stock terminal")
 
 
+class FakeUpstream:
+    def __init__(self, case):
+        self.case = case
+        self.script = ToolScript(str(WORKSPACE))
+        self.writes = 0
+
+    def start(self, body):
+        self.writes += 1
+        require(body["max_output_tokens"] == MAX_OUTPUT and {tool["name"] for tool in body["tools"]} == set(TOOL_NAMES),
+                "Unexpected synthetic upstream output budget or tools")
+        if self.case == "tools":
+            events = self.script.respond(body)
+        else:
+            events = refused_events(self.case, body, str(WORKSPACE))
+        return scripted_response(events)
+
+
 class Observer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, case):
+    def __init__(self, case, ledger):
         super().__init__(("127.0.0.1", PORT), WireHandler)
         self.case = case
         self.abort = None
-        self.initial_refused = None
-        self.script = ToolScript(str(WORKSPACE))
+        self.upstream = FakeUpstream(case)
+        self.turns = FixtureTurns(ledger, AUTHORITY)
         self.vault = ReasoningVault()
         self.requests = []
+        self.local_titles = 0
+        self.prefix_refusals = 0
         self.error = None
         self.lock = Lock()
+
+    def dispatch(self, body, outbound):
+        history = classify(body)
+        require(history is not None, "Local title reached first-write boundary")
+        return self.turns.dispatch(AUTHORITY, body["prompt_cache_key"], history,
+                                   lambda _request: self.upstream.start(outbound))
+
+    def check_prior_prefix(self, body, outbound):
+        """Give each changed old prefix the exact genuine stock newest batch."""
+        before = self.turns.records(), self.upstream.writes
+        for change in ("output", "arguments", "call_id", "omission", "order"):
+            altered = deepcopy(body)
+            items = altered["input"]
+            if change == "output":
+                items[2]["output"] += " "
+            elif change == "arguments":
+                args = decode_json(items[1]["arguments"])
+                args["patchText"] += " "
+                items[1]["arguments"] = json.dumps(args)
+            elif change == "call_id":
+                items[1]["call_id"] = items[2]["call_id"] = "changed_earlier_call"
+            elif change == "omission":
+                del items[1:3]
+            else:
+                items[1:5] = items[3:5] + items[1:3]
+            try:
+                self.dispatch(altered, outbound)
+            except FixtureMismatch as error:
+                require(str(error) == "Earlier stock tool history differs", "Wrong earlier-prefix refusal")
+            else:
+                raise FixtureMismatch("Changed earlier stock history was accepted")
+            require((self.turns.records(), self.upstream.writes) == before,
+                    "Earlier-prefix refusal reached a claim or send")
+            self.prefix_refusals += 1
 
 
 class WireHandler(BaseHTTPRequestHandler):
@@ -128,55 +188,66 @@ class WireHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
+    def _stream_headers(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _send_frame(self, frame):
+        self.wfile.write(frame)
+        self.wfile.flush()
+
     def do_POST(self):
+        request = None
         try:
             length = int(self.headers["Content-Length"])
-            require(self.path == "/v1/responses" and 0 < length <= MAX_INTERACTIVE_BODY, "Unexpected stock route")
-            require(self.headers.get("Authorization") == f"Bearer {FIXTURE_BEARER}", "Unexpected test bearer")
+            require(self.path == AUTHORITY.route and 0 < length <= MAX_WIRE, "Unexpected stock route")
             wire = self.rfile.read(length)
-            body = decode_json(wire)
             raw = (self.requestline.encode("ascii") + b"\r\n" + self.headers.as_bytes().replace(b"\n", b"\r\n") + wire)
+            parsed = parse_worker_request(raw, expected_token=FIXTURE_BEARER, allowed_models=frozenset({MODEL}),
+                                          vault=self.server.vault, expected_port=PORT)
+            body = decode_json(wire)
+            history = classify(body)
             with self.server.lock:
                 self.server.requests.append(body)
-                parsed = parse_worker_request(raw, expected_token=FIXTURE_BEARER, allowed_models=frozenset({MODEL}),
-                                              vault=self.server.vault, expected_port=PORT)
-                content = parsed.body["input"][0]["content"]
-                is_negative = self.server.case != "tools" and output_text(content) != TITLE_PROMPT
-                if self.server.case == "tools":
-                    events = self.server.script.respond(parsed.body)
-                elif is_negative:
-                    if self.server.initial_refused is not None:
-                        require(self.server.initial_refused == parsed.body, "Stock retry changed the initial prompt")
-                        self.send_error(401)
-                        return
-                    self.server.initial_refused = parsed.body
-                    events = refused_events(self.server.case, parsed.body, str(WORKSPACE))
-                else:
-                    events = tuple(response_events("title", reply=TITLE))
-                projector = SessionStreamProjector(model=MODEL, local_response_id=f"resp_local_{len(self.server.requests)}",
-                                                   allowed_tools=parsed.allowed_tools, vault=self.server.vault)
-                frames = []
-                try:
-                    for event in events:
-                        frames.extend(projector.feed(event))
-                    frames.extend(projector.finalize())
-                except StreamAborted as error:
-                    if not is_negative:
-                        raise
-                    self.server.abort = error.code
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            for frame in frames:
-                self.wfile.write(f"{len(frame):x}\r\n".encode("ascii") + frame + b"\r\n")
-            if not is_negative:
-                self.wfile.write(b"0\r\n\r\n")
-        except Exception as error:
-            if self.server.error is None:
+            if history is None:
+                frames, _ = project_stream(scripted_response(response_events("title", reply=TITLE)),
+                                           ReasoningVault(), (), "resp_local_title")
+                self._stream_headers()
+                for frame in frames:
+                    self._send_frame(encode_chunk(frame))
+                self._send_frame(HANDOFF_END)
+                with self.server.lock:
+                    self.server.local_titles += 1
+                return
+
+            if self.server.case != "tools" and self.server.abort is not None:
+                self.send_error(401)
+                return
+            outbound = upstream_body(parsed)
+            if self.server.case == "tools" and len(history.pairs) == 3:
+                self.server.check_prior_prefix(body, outbound)
+            request, upstream = self.server.dispatch(body, outbound)
+            frames, usage = project_stream(upstream, self.server.vault, (tool["name"] for tool in outbound["tools"]),
+                                           f"resp_local_{request.sequence}")
+            calls, message = terminal_output(frames[-1])
+            pending = self.server.turns.settle(AUTHORITY, request, calls=calls, completed_message=message, usage=usage)
+            self._stream_headers()
+            self.server.turns.deliver(AUTHORITY, request, pending, self._send_frame,
+                                      (*map(encode_chunk, frames), HANDOFF_END))
+        except StreamAborted as error:
+            self.server.turns.fail(request)
+            if self.server.case == "tools":
                 self.server.error = error
-            self.send_error(400)
+            else:
+                self.server.abort = error.code
+            self.send_error(401)
+        except Exception as error:
+            self.server.turns.fail(request)
+            self.server.error = error
+            self.close_connection = True
 
 
 def stock_config():
@@ -226,7 +297,7 @@ def verify_scope():
 
 
 def capture(command, evidence_path, case):
-    with tempfile.TemporaryDirectory(prefix="oc-tools-") as scratch, Observer(case) as observer:
+    with tempfile.TemporaryDirectory(prefix="oc-tools-") as scratch, Observer(case, Path(scratch) / "synthetic-exposure.sqlite") as observer:
         root = Path(scratch)
         home = root / "home"
         home.mkdir(mode=0o700)
@@ -245,16 +316,30 @@ def capture(command, evidence_path, case):
                                   "exact final reply", observer)
             exported = await_idle(lambda: session_export(command, env), observer=observer)
             if case == "tools":
-                observer.script.verify_done()
+                script = observer.upstream.script
+                records = observer.turns.records()
+                require(len(script.requests) == len(records) == observer.upstream.writes == 4
+                        and len(script.outputs) == 3 and observer.local_titles == 1
+                        and observer.prefix_refusals == 5 and script.title_requests == 0,
+                        "Wrong synthetic claim, send, tool or local title counts")
+                require(records[0]["parent"] is None and all(record["parent"] for record in records[1:])
+                        and all((record["actual_input"], record["actual_output"]) == (2, 3) for record in records),
+                        "Synthetic exposure does not link and settle every write")
                 require((WORKSPACE / FILE_NAME).read_bytes() == FILE_TEXT.encode(), "Independent workspace bytes differ")
-                validate_export(exported, observer.script)
+                validate_export(exported, script)
             else:
                 verify_abort = {"hosted": "unsupported_event", "undeclared": "unauthorized_tool_call"}[case]
                 require(not (WORKSPACE / REFUSED_FILE).exists() and observer.abort == verify_abort,
                         "Refused stock tool crossed the execution boundary")
                 validate_refused_export(exported)
+                records = observer.turns.records()
+                require(len(records) == observer.upstream.writes == observer.local_titles == 1
+                        and records[0]["actual_input"] is None and records[0]["parent"] is None,
+                        "A refused upstream tool acquired extra synthetic exposure")
             report = {"binary_sha256": STOCK_SHA256, "model": f"{PROVIDER}/{MODEL}", "tools": TOOL_NAMES,
-                      "requests": summarize(observer.requests), "stock_export": exported, "abort": observer.abort}
+                      "requests": summarize(observer.requests), "stock_export": exported, "abort": observer.abort,
+                      "synthetic_claims": records, "synthetic_writes": observer.upstream.writes,
+                      "local_titles": observer.local_titles, "earlier_prefix_refusals": observer.prefix_refusals}
             with os.fdopen(os.open(evidence_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600),
                            "w") as out:
                 json.dump({"requests": observer.requests, "report": report}, out)

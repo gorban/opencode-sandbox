@@ -68,6 +68,12 @@ routing, exposure or revocation goes through both reviews before use by another 
   continuations. The fixture checked the exact file bytes, worker credential isolation,
   refused tool responses, held-stream closure, and owned worker and relay retirement.
   See the [sealed guest runbook](../../tests/e2e/stock_worker_tools_guest.md).
+- [x] Exercise the cumulative tool history and bounded turn loop with pinned stock OpenCode
+  through the synthetic loopback fixture (`codex/stock-tool-loop-r3-fixture`). Three linked
+  continuations settled, the title stayed local, and changes to already accepted history
+  produced no additional claims or sends.
+- [ ] Verify the cumulative tool loop through the sealed public launcher and qualify it against
+  live provider grants. The earlier sealed run exercised the original broker behavior.
 
 ## Opt-in live e2e pytest milestones
 
