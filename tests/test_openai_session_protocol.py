@@ -1,8 +1,11 @@
 """Tests for interactive Responses request sanitizer, reasoning vault, and fail-closed SSE projector."""
 
 import json
+import re
 import unittest
+from unittest.mock import patch
 
+from oc_openai import session_protocol
 from oc_openai.session_protocol import (
     HANDLE_PREFIX,
     ReasoningVault,
@@ -33,6 +36,41 @@ class SessionProtocolTests(unittest.TestCase):
     def setUp(self):
         self.models = frozenset({"gpt-6.2-sol", "gpt-6.2-mini"})
         self.vault = ReasoningVault()
+
+    def test_header_name_token_alphabet_matches_previous_parser(self):
+        old_name_pattern = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
+        names = [bytes([byte]) for byte in range(256)]
+        names.extend((b"", b"X-Session-ID", b"!#$%&'*+-.^_`|~", b"X-\xff", b"X Y", b"X\n"))
+        # Admit all candidates at the separate header allowlist to exercise the lexer.
+        with patch.object(session_protocol, "_ALLOWED_HEADERS", {name.lower() for name in names}):
+            for name in names:
+                with self.subTest(name=name):
+                    if old_name_pattern.fullmatch(name):
+                        self.assertEqual(session_protocol._parse_headers([name + b": v"]), {name.lower(): b"v"})
+                    else:
+                        with self.assertRaises(RequestRefused) as error:
+                            session_protocol._parse_headers([name + b": v"])
+                        self.assertEqual((error.exception.status, error.exception.code), (400, "invalid_request"))
+
+    def test_header_name_classification_order_and_normalization(self):
+        self.assertEqual(
+            session_protocol._parse_headers([b"HoSt:\t127.0.0.1:8401  ", b"X-Session-ID: abc"]),
+            {b"host": b"127.0.0.1:8401", b"x-session-id": b"abc"},
+        )
+        for lines, expected in (
+            ([b"OrIgIn: \xff"], (403, "forbidden_header")),
+            ([b"Sec-Fetch-Site: local"], (403, "forbidden_header")),
+            ([b"sEc-Ch-Ua: client"], (403, "forbidden_header")),
+            ([b"Sec-Fetch-\xff: local"], (400, "invalid_request")),
+            ([b"Host: first", b"hOsT: second"], (400, "invalid_request")),
+            ([b"Origin"], (400, "invalid_request")),
+            ([b": origin"], (400, "invalid_request")),
+            ([b"Unknown: value"], (400, "invalid_request")),
+        ):
+            with self.subTest(lines=lines):
+                with self.assertRaises(RequestRefused) as error:
+                    session_protocol._parse_headers(lines)
+                self.assertEqual((error.exception.status, error.exception.code), expected)
 
     def test_rejects_csrf_bad_host_bad_auth_and_forbidden_fields(self):
         base = {"model": "gpt-6.2-sol", "stream": True, "store": False,

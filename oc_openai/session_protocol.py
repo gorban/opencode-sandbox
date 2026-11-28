@@ -22,7 +22,10 @@ MAX_SCAN_NODES = 16_384
 HANDLE_PREFIX = "oc_rs_"
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _EVENT_LABEL = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){0,4}\Z")
-_HEADER_NAME = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
+_HEADER_NAME_BYTES = (
+    b"!#$%&'*+-.^_`|~0123456789"
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
 _JSON_CONTENT_TYPE = re.compile(rb"application/json(?:[ \t]*;[ \t]*charset=utf-8)?\Z")
 
 _ALLOWED_HEADERS = frozenset({
@@ -346,7 +349,8 @@ def _parse_headers(header_lines: list[bytes]) -> dict[bytes, bytes]:
     headers: dict[bytes, bytes] = {}
     for line in header_lines:
         name, sep, value = line.partition(b":")
-        _require_req(bool(sep) and bool(_HEADER_NAME.fullmatch(name)))
+        # Deleting the token alphabet leaves only invalid name bytes.
+        _require_req(bool(sep and name) and not name.translate(None, _HEADER_NAME_BYTES))
         low = name.lower()
         if low in _FORBIDDEN_HEADERS or any(low.startswith(prefix) for prefix in _FORBIDDEN_HEADER_PREFIXES):
             raise RequestRefused(403, "forbidden_header", "Browser or hop-by-hop header rejected.")
