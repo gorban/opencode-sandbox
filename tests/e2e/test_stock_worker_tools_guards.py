@@ -3,7 +3,9 @@
 from copy import deepcopy
 from io import StringIO
 import json
+import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -13,15 +15,17 @@ from unittest.mock import MagicMock, call, patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(Path(__file__).resolve().parent)]
 
+from oc_openai.session_broker import SessionBroker
 from oc_openai.session_protocol import ReasoningVault, SessionStreamProjector, StreamAborted
 from stock_worker_tools_capture import Terminal, await_idle, verify_scope
 from stock_worker_tools_guest import (
-    HOLD_READER, TCP_CONNECT, WIRE, reap_held_child, run_cleanup, verify_loopback_listener, verify_relay_mcs,
+    HOLD_READER, TCP_CONNECT, WIRE, broker_exchange, confirm_foreground, reap_held_child, run_cleanup,
+    verify_direct_broker, verify_loopback_listener, verify_outside_candidates, verify_relay_mcs,
 )
 from stock_worker_tools_host import firewall_shape
 from stock_worker_tools_projection import capsule, describe_source, project_sources
 from stock_worker_tools_protocol import (
-    MODEL, PROMPT, REFUSED_FILE, TITLE, TITLE_PROMPT, TOOL_NAMES, FixtureMismatch, ToolScript, call_id,
+    LABEL, MODEL, PROMPT, PROVIDER, REFUSED_FILE, TITLE, TITLE_PROMPT, TOOL_NAMES, FixtureMismatch, ToolScript, call_id,
     expected_result, refused_events, response_events,
 )
 
@@ -103,6 +107,73 @@ class DriverGuardTests(unittest.TestCase):
         self.assertEqual(child.mock_calls, [
             call.poll(), call.terminate(), call.wait(timeout=2), call.kill(), call.wait(timeout=2),
         ])
+
+    def test_outside_tcp_connection_without_http_headers_is_still_reachable(self):
+        request = {"host": "192.0.2.1", "port": 8401, "method": "GET",
+                   "path": "/v1/models", "body": None, "token": "test"}
+        stdout = StringIO()
+        with patch("http.client.HTTPConnection") as connection, patch("sys.stdout", stdout), \
+                patch("sys.stdin", StringIO(json.dumps(request))):
+            connection.return_value.getresponse.side_effect = ConnectionResetError()
+            exec(WIRE, {})
+        self.assertIsNone(json.loads(stdout.getvalue())["status"])  # The earlier predicate accepted this.
+        host, sibling = object(), object()
+        with patch("stock_worker_tools_guest.tcp_connect", side_effect=[False, False, False, True]) as connect:
+            with self.assertRaisesRegex(FixtureMismatch, "independently networked container connected"):
+                verify_outside_candidates(host, sibling, ("192.0.2.1",))
+        self.assertEqual(connect.call_args_list, [
+            call(host, "127.0.0.1", 8401), call(sibling, "127.0.0.1", 8401),
+            call(host, "192.0.2.1", 8401), call(sibling, "192.0.2.1", 8401),
+        ])
+
+    def test_direct_broker_control_authenticates_the_exact_private_frame(self):
+        support = runpy.run_path(str(ROOT / "tests/test_openai_session_broker.py"))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        lease, fd = support["_make_lease"](root)
+        self.addCleanup(os.close, fd)
+        (root / "provider").mkdir()
+        (root / "proof").mkdir()
+        proof = os.urandom(32)
+        (root / "proof/relay").write_bytes(proof)
+        upstream = MagicMock(side_effect=AssertionError("Local model catalog must not dispatch upstream"))
+        broker = SessionBroker(socket_path=root / "provider/provider.sock", relay_proof=proof,
+                               worker_token="test-token", lease=lease, connection=support["_FakeConn"](upstream),
+                               binding=object(), models=(MODEL,), profile_label=LABEL)
+        broker.start()
+        self.addCleanup(broker.close)
+        # The earlier unframed probe closes regardless of whether the caller knows the actual proof.
+        raw = (b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:8401\r\n"
+               b"Authorization: Bearer test-token\r\n\r\n")
+        self.assertEqual(broker_exchange(broker.socket_path, raw), b"")
+        verify_direct_broker(root, "test-token")
+        with patch("stock_worker_tools_guest.broker_exchange", return_value=b""):
+            with self.assertRaisesRegex(FixtureMismatch, "framed private relay control"):
+                verify_direct_broker(root, "test-token")
+        upstream.assert_not_called()
+
+    def test_foreground_checks_complete_disclosure_before_sending_yes(self):
+        provider = (f"Provider openai/{LABEL} [{PROVIDER}]: auth=subscription, "
+                    f"policy=subscription (no verified spending ceiling) (models: {MODEL})")
+        launch = (f"Initial active model: {PROVIDER}/{MODEL} | UI: OpenCode (default) | "
+                  "Workspace: /sandbox/construct")
+        prompt = "Start interactive OpenCode session for instance 'default'? [y/N]"
+        term = MagicMock()
+        for altered in (launch.replace(MODEL, MODEL + "-unexpected"), launch + "/unexpected"):
+            with self.subTest(altered=altered), patch("stock_worker_tools_guest.assert_no_slot") as no_slot:
+                term.await_screen.return_value = "\n".join(
+                    (provider, altered, "No API-key fallback will be forwarded.", prompt))
+                # Both prefixes matched the earlier launcher predicate.
+                self.assertIn(f"Initial active model: {PROVIDER}/{MODEL}", altered)
+                self.assertIn("Workspace: /sandbox/construct", altered)
+                with self.assertRaisesRegex(FixtureMismatch, "differs from the approved launch"):
+                    confirm_foreground(term, approve=True)
+                term.type_line.assert_not_called()
+                no_slot.assert_not_called()
+        term.await_screen.return_value = "\n".join((provider, launch, "No API-key fallback will be forwarded.", prompt))
+        with patch("stock_worker_tools_guest.assert_no_slot") as no_slot:
+            confirm_foreground(term, approve=True)
+        no_slot.assert_called_once_with()
+        term.type_line.assert_called_once_with("y")
 
     def test_idle_requires_the_final_title(self):
         pending = {"messages": [{"type": "idle"}], "info": {"title": "pending"}}

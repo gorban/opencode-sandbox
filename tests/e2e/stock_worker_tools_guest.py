@@ -18,9 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from oc_openai.connection import Connection
 from oc_openai.live import make_backend
-from oc_openai.managed.relay import Lease, grant_record
+from oc_openai.managed.relay import Lease, PROOF_PREFIX, PROOF_SIZE, grant_record
 from oc_openai.managed.runtime import atomic_write
 from oc_openai.profile_backend import ProfileBackend
+from oc_openai.session_protocol import format_models_response
+from oc_openai.session_relay import REQUEST_LENGTH
 from stock_worker_tools_capture import PORT, STOCK_SHA256, Terminal, await_idle
 from stock_worker_tools_host import bridge_host, inventory, verify
 from stock_worker_tools_peer import SYNTHETIC_CIPHERTEXT, SYNTHETIC_REASONING_ID
@@ -324,6 +326,46 @@ print(json.dumps(sorted(set(addresses))))
 """
 
 
+def verify_outside_candidates(host_runner, sibling_runner, addresses):
+    for target in ("127.0.0.1", *addresses):
+        require(not tcp_connect(host_runner, target, PORT), "The guest host connected to a measured IPv4 relay candidate")
+        require(not tcp_connect(sibling_runner, target, PORT),
+                "An independently networked container connected to a measured IPv4 relay candidate")
+
+
+def broker_exchange(path, packet):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(4)
+        client.connect(str(path))
+        client.sendall(packet)
+        received = bytearray()
+        while True:
+            try:
+                chunk = client.recv(4096)
+            except ConnectionResetError:
+                break
+            if not chunk:
+                break
+            received.extend(chunk)
+            require(len(received) <= 4096, "Direct broker control exceeded the expected response bound")
+        return bytes(received)
+
+
+def verify_direct_broker(scratch, token):
+    path = scratch / "provider/provider.sock"
+    with (scratch / "proof/relay").open("rb") as stream:
+        actual = stream.read(PROOF_SIZE + 1)
+    require(len(actual) == PROOF_SIZE, "Missing private relay proof for the framed control")
+    wrong = bytes((actual[0] ^ 1,)) + actual[1:]
+    raw = (f"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n"
+           f"Authorization: Bearer {token}\r\n\r\n").encode("ascii")
+    payload = REQUEST_LENGTH.pack(len(raw)) + raw
+    require(broker_exchange(path, PROOF_PREFIX + actual + payload) == format_models_response((MODEL,)),
+            "The framed private relay control did not reach the admitted model route")
+    require(broker_exchange(path, PROOF_PREFIX + wrong + payload) == b"",
+            "Direct broker client with wrong relay proof received a response")
+
+
 def inside_denials(wid, token, scratch):
     runner = lambda *args, **kwargs: run_worker(wid, *args, **kwargs)
     initial_generations = sum(entry["op"] == "generation" for entry in events())
@@ -336,23 +378,12 @@ def inside_denials(wid, token, scratch):
         "run", "--rm", "-i", "--pull=never", "--network=pasta", "--http-proxy=false",
         "--cap-drop=ALL", "--security-opt=no-new-privileges", "--entrypoint", args[0], image, *args[1:], **kwargs,
     )
-    for target in ("127.0.0.1", *addresses):
-        require(wire(host, token, target=target)["status"] is None,
-                "The guest host reached a measured IPv4 relay candidate")
-        require(wire(outside, token, target=target)["status"] is None,
-                "An independently networked container reached a measured IPv4 relay candidate")
+    verify_outside_candidates(host, outside, addresses)
     require(not tcp_connect(runner, "192.0.2.1", 443),
             "The worker had direct egress in the sealed offline guest")
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(4)
-        client.connect(str(scratch / "provider/provider.sock"))
-        raw = f"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nAuthorization: Bearer {token}\r\n\r\n"
-        client.sendall(raw.encode())
-        try:
-            direct = client.recv(32)
-        except ConnectionResetError:
-            direct = b""
-        require(direct == b"", "Direct broker client lacking relay proof received a response")
+    direct_offset = len(events())
+    verify_direct_broker(scratch, token)
+    require(len(events()) == direct_offset, "The direct framed controls reached the synthetic upstream")
     for native_type in ("mcp", "web_search", "code_interpreter", "unknown_hosted"):
         response = wire(runner, token, body={**ordinary_body(), "tools": [{"type": native_type}]})
         require(response["status"] == 400, "Provider-native tool declaration crossed broker")
@@ -390,18 +421,22 @@ def fresh_export(worker, existing):
     raise RuntimeError("Stock session and exact title did not settle")
 
 
-def foreground(terminal):
-    expected = "Start interactive OpenCode session for instance 'default'? [y/N]"
-    screen = terminal.await_screen(lambda page: any(line.strip() == expected for line in page.splitlines()),
+def confirm_foreground(terminal, *, approve):
+    prompt = "Start interactive OpenCode session for instance 'default'? [y/N]"
+    screen = terminal.await_screen(lambda page: any(line.strip() == prompt for line in page.splitlines()),
                                    "the exact foreground launch confirmation")
-    provider_rows = [line.strip() for line in screen.splitlines() if line.lstrip().startswith("Provider ")]
-    require(len(provider_rows) == 1 and provider_rows[0].startswith(
-        f"Provider openai/{LABEL} [{PROVIDER}]: auth=subscription, policy=subscription (no verified spending ceiling)")
-        and f"Initial active model: {PROVIDER}/{MODEL}" in screen and "UI: OpenCode" in screen
-        and f"Workspace: {WORKSPACE}" in screen and "No API-key fallback will be forwarded." in screen,
-        "Foreground route, billing, model or workspace differs from the approved launch")
-    require(not any(line.strip().endswith("[y/N]") and line.strip() != expected for line in screen.splitlines()),
+    lines = [line.strip() for line in screen.splitlines()]
+    provider = (f"Provider openai/{LABEL} [{PROVIDER}]: auth=subscription, "
+                f"policy=subscription (no verified spending ceiling) (models: {MODEL})")
+    launch = f"Initial active model: {PROVIDER}/{MODEL} | UI: OpenCode (default) | Workspace: {WORKSPACE}"
+    require([line for line in lines if line.startswith("Provider ")] == [provider]
+            and [line for line in lines if line.startswith("Initial active model:")] == [launch]
+            and any(line.startswith("No API-key fallback will be forwarded.") for line in lines),
+            "Foreground route, billing, model or workspace differs from the approved launch")
+    require([line for line in lines if line.endswith("[y/N]")] == [prompt],
             "An unapproved foreground confirmation was displayed")
+    assert_no_slot()
+    terminal.type_line("y" if approve else "n")
 
 
 def prove_tools(terminal, worker, offset):
@@ -465,9 +500,7 @@ def launch(state, case, verify_active=None, *, verify_inventory=None):
         try:
             terminal.start(str(PROJECTED_TREE / "oc-sandbox"), width=160)
             register(int(terminal.run("display-message", "-p", "-t", "stock", "#{pane_pid}")))
-            foreground(terminal)
-            assert_no_slot()
-            terminal.type_line("n" if case == "decline" else "y")
+            confirm_foreground(terminal, approve=case != "decline")
             if case == "decline":
                 terminal.await_screen(lambda screen: "Fixture exit" in screen, "the foreground decline")
                 require(not any(entry["op"] == "generation" for entry in events()[offset:]),
