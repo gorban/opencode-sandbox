@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import secrets
 import selectors
 import signal
 import stat
@@ -21,6 +22,10 @@ CAPSULE = Path("/home/.oc-gemini-cold-proof")
 SOURCE = CAPSULE / "source"
 CONTROLLER = CAPSULE / "google_home_controller.py"
 MANIFEST = CAPSULE / "controller-manifest.json"
+BINDING = CAPSULE / "capsule-binding.json"
+BOOT_RUNTIME = Path("/run")
+BOOT_LEASES = BOOT_RUNTIME / "oc-gemini-fixture-leases"
+ATTEMPT = "allocation-attempt.json"
 DRIVER = "tests/google_connect_driver.py"
 ACCOUNT = "oc-gemini-proof"
 HOME = "/home/oc-gemini-proof"
@@ -32,6 +37,7 @@ POSITIVE = (b"Verified three named offline catalogs, two Flash candidates, zero 
 FRAME_LIMIT = 4098
 READY = b"R"
 START = b"S"
+START_BYTES = 32
 OUTCOME = b"O"
 RELEASE = b"L"
 RETIRED = b"D"
@@ -65,6 +71,85 @@ def protected_bytes(path, limit):
                 and original.st_mtime_ns == current.st_mtime_ns and original.st_ctime_ns == current.st_ctime_ns
                 and os.path.samestat(current, path.lstat()))
     return payload
+
+
+def directory_id(info):
+    return [info.st_dev, info.st_ino]
+
+
+def current_boot():
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    require(re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot))
+    return boot
+
+
+def deployment_binding(binding_pin, manifest_pin, manifest):
+    require(hex_text(binding_pin, 64))
+    raw = protected_bytes(BINDING, 4096)
+    require(sha256(raw).hexdigest() == binding_pin)
+    binding = exact_json(raw)
+    require(binding.keys() == {"version", "capsule", "boot", "tree", "manifest_sha256", "capsule_id"})
+    require(type(binding["version"]) is int and binding["version"] == 1 and hex_text(binding["capsule"], 32))
+    require(binding["tree"] == manifest["tree"] and binding["manifest_sha256"] == manifest_pin)
+    protected_directory(CAPSULE)
+    identity = binding["capsule_id"]
+    require(type(identity) is list and len(identity) == 2 and all(type(value) is int for value in identity))
+    require(identity == directory_id(CAPSULE.lstat()) and binding["boot"] == current_boot())
+    return binding
+
+
+def boot_mount(path):
+    argv = ("/usr/bin/findmnt", "-rn", "-o", "TARGET,FSTYPE,FSROOT", "--target", str(path))
+    status, output = bounded_run(argv, seconds=5, limit=256)
+    require(status == 0 and output.split() == [os.fsencode(BOOT_RUNTIME), b"tmpfs", b"/"])
+
+
+def consume_boot_lease(binding, payload):
+    require(os.getuid() == os.geteuid() == 0 and hex_text(binding["capsule"], 32))
+    require(current_boot() == binding["boot"] and BOOT_LEASES.parent == BOOT_RUNTIME)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    protected_directory(BOOT_LEASES)
+    runtime = os.open(BOOT_RUNTIME, flags)
+    try:
+        leases = os.open(BOOT_LEASES.name, flags, dir_fd=runtime)
+        try:
+            runtime_info, leases_info = os.fstat(runtime), os.fstat(leases)
+            require(os.path.samestat(runtime_info, BOOT_RUNTIME.lstat()) and runtime_info.st_uid == 0
+                    and not runtime_info.st_mode & 0o022 and leases_info.st_uid == 0
+                    and stat.S_IMODE(leases_info.st_mode) == 0o700 and leases_info.st_dev == runtime_info.st_dev)
+            boot_mount(BOOT_RUNTIME)
+            boot_mount(BOOT_LEASES)
+            verify_lease_directory(runtime, leases_info)
+            write_boot_lease(leases, binding["capsule"], payload)
+            verify_lease_directory(runtime, leases_info)
+            require(os.path.samestat(runtime_info, BOOT_RUNTIME.lstat()) and current_boot() == binding["boot"])
+        finally:
+            os.close(leases)
+    finally:
+        os.close(runtime)
+
+
+def verify_lease_directory(runtime, expected):
+    named = os.stat(BOOT_LEASES.name, dir_fd=runtime, follow_symlinks=False)
+    require(os.path.samestat(expected, named) and os.path.samestat(named, BOOT_LEASES.lstat())
+            and named.st_uid == 0 and stat.S_IMODE(named.st_mode) == 0o700)
+
+
+def write_boot_lease(directory, name, payload):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(name, flags, 0o600, dir_fd=directory)
+    try:
+        opened = os.fstat(fd)
+        require(stat.S_ISREG(opened.st_mode) and opened.st_uid == 0
+                and stat.S_IMODE(opened.st_mode) == 0o600 and opened.st_nlink == 1)
+        require(os.write(fd, payload) == len(payload))
+        os.fsync(fd)
+        os.fsync(directory)
+        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        require(os.path.samestat(opened, named) and named.st_uid == 0
+                and stat.S_IMODE(named.st_mode) == 0o600 and named.st_nlink == 1 and named.st_size == len(payload))
+    finally:
+        os.close(fd)
 
 
 def exact_json(payload):
@@ -142,11 +227,22 @@ def dedicated_command(prefix, user, identity, pin):
             PYTHON, "-IBS", str(CONTROLLER), "--held-exec", pin)
 
 
-def bounded_run(argv, *, seconds, limit, env=ENV):
+def bounded_run(argv, *, seconds, limit, env=ENV, run_as=None, stdin=subprocess.DEVNULL):
     deadline = time.monotonic() + seconds
     output = bytearray()
-    child = subprocess.Popen(argv, cwd="/", env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, start_new_session=True)
+    credentials = {}
+    stderr = subprocess.STDOUT
+    if run_as is not None:
+        uid, gid = run_as
+        require(uid > 0 and gid > 0)
+        credentials = {"user": uid, "group": gid, "extra_groups": ()}
+        stderr = subprocess.DEVNULL
+    try:
+        child = subprocess.Popen(argv, cwd="/", env=env, stdin=stdin, stdout=subprocess.PIPE,
+                                 stderr=stderr, close_fds=True, start_new_session=True, **credentials)
+    finally:
+        if stdin != subprocess.DEVNULL:
+            stdin.close()
     try:
         with selectors.DefaultSelector() as ready:
             ready.register(child.stdout, selectors.EVENT_READ)
@@ -242,6 +338,18 @@ def no_children():
     raise ControllerRefused("Unexpected fixture descendant remains.")
 
 
+@contextmanager
+def start_pipe(value):
+    require(type(value) is bytes and len(value) == START_BYTES)
+    reader, writer = os.pipe2(os.O_CLOEXEC)
+    with os.fdopen(reader, "rb", buffering=0) as stream:
+        try:
+            require(os.write(writer, value) == START_BYTES)
+        finally:
+            os.close(writer)
+        yield stream
+
+
 def run_held_supervisor(pin):
     driver, manifest = pinned_driver(pin)
     seal = driver["guest"]()
@@ -253,11 +361,15 @@ def run_held_supervisor(pin):
     channel = Frames(sys.stdin.fileno(), sys.stdout.fileno(), time.monotonic() + 900)
     channel.require_quiet()
     channel.write(READY)
-    require(channel.read() == START)
+    frame = channel.read()
+    require(len(frame) == START_BYTES + 1 and frame[:1] == START)
     channel.require_quiet()
-    driver["check_home_before"](seal)
-    status, output = bounded_run(fixture_command(), seconds=channel.remaining(), limit=4096,
-                                 env=ENV | {"HOME": HOME})
+    value = frame[1:]
+    driver["authorize_home_start"](seal, value)
+    with start_pipe(value) as stdin:
+        del frame, value
+        status, output = bounded_run(fixture_command(), seconds=channel.remaining(), limit=4096,
+                                     env=ENV | {"HOME": HOME}, stdin=stdin)
     no_children()
     driver["private_inventory"](seal["uid"])
     channel.require_quiet()
@@ -299,9 +411,11 @@ def observe_run(driver, argv):
             require(channel.read() == READY)
             channel.require_quiet()
             phase = "baseline"
-            driver["begin_home_attestation"]()
+            value = secrets.token_bytes(START_BYTES)
+            driver["begin_home_attestation"](value)
             phase = "child"
-            channel.write(START)
+            channel.write(START + value)
+            del value
             frame = channel.read()
             require(len(frame) >= 2 and frame[:1] == OUTCOME)
             status, output = frame[1], frame[2:]
@@ -326,18 +440,45 @@ def observe_run(driver, argv):
         return 1
 
 
-def run_controller(manifest_digest):
+def allocate_case_process(pin, user):
+    argv = (PYTHON, "-IBS", str(CONTROLLER), "--allocate-cases", pin)
+    status, output = bounded_run(argv, seconds=10, limit=4096, run_as=(user.pw_uid, user.pw_gid))
+    require(status == 0)
+    return exact_json(output)
+
+
+def run_case_allocator(pin):
+    driver, _ = pinned_driver(pin)
+    records = driver["allocate_cases"]()
+    print(json.dumps(records, sort_keys=True))
+    return 0
+
+
+def run_controller(manifest_digest, binding_digest):
     driver, manifest = pinned_driver(manifest_digest)
+    binding = deployment_binding(binding_digest, manifest_digest, manifest)
+    user = pwd.getpwnam(ACCOUNT)
+    prefix = account_podman(user)
     seal_path = CAPSULE / "seal.json"
-    if driver["absent"](seal_path):
-        driver["install_seal"](manifest["tree"])
+    prior = (seal_path, CAPSULE / "case-config", CAPSULE / ATTEMPT, CAPSULE / driver["HOME_BEFORE_STAGE"],
+             *(CAPSULE / driver[name] for name in ("HOME_BEFORE", "HOME_RESULT", "NATIVE_RESULT")))
+    require(all(driver["absent"](path) for path in prior))
+    attempt = {"version": 1, "binding": binding_digest, "capsule": binding["capsule"],
+               "boot": binding["boot"], "tree": manifest["tree"]}
+    payload = json.dumps(attempt, sort_keys=True).encode("ascii")
+    consume_boot_lease(binding, payload)
+    require(directory_id(CAPSULE.lstat()) == binding["capsule_id"])
+    attempt_path = CAPSULE / ATTEMPT
+    driver["write_protected"](attempt_path, payload)
+    require(protected_bytes(attempt_path, 4096) == payload)
+    require(directory_id(CAPSULE.lstat()) == binding["capsule_id"])
+    driver["install_seal"](manifest["tree"], lambda: allocate_case_process(manifest_digest, user))
     seal = driver["proof_file"](seal_path)
     driver["validate_seal"](seal)
-    require(seal["tree"] == manifest["tree"] and seal["source"] == manifest["source"])
+    require(seal["tree"] == manifest["tree"] and seal["source"] == manifest["source"]
+            and seal["boot"] == binding["boot"])
     require(all(driver["absent"](CAPSULE / driver[name]) for name in ("HOME_BEFORE", "HOME_RESULT", "NATIVE_RESULT")))
-    user = pwd.getpwnam(ACCOUNT)
     require(user.pw_uid == seal["uid"])
-    prefix = account_podman(user)
     identity = inspect_devbox(prefix)
     return observe_run(driver, dedicated_command(prefix, user, identity, manifest_digest))
 
@@ -348,13 +489,15 @@ def main():
         require(sys.executable == PYTHON and sys.flags.isolated and sys.flags.dont_write_bytecode and sys.flags.no_site)
         require(all(Path(item).is_relative_to("/usr/lib") or Path(item).is_relative_to("/usr/lib64")
                     for item in sys.path))
-        if len(sys.argv) == 3:
+        if os.getuid() == os.geteuid() > 0:
             _, action, pin = sys.argv
-            require(action == "--held-exec" and os.getuid() == os.geteuid() > 0)
+            if action == "--allocate-cases":
+                return run_case_allocator(pin)
+            require(action == "--held-exec")
             return run_held_supervisor(pin)
         require(os.getuid() == os.geteuid() == 0)
-        _, pin = sys.argv
-        return run_controller(pin)
+        _, pin, binding = sys.argv
+        return run_controller(pin, binding)
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt):
         print("Protected offline Google controller did not complete.", file=sys.stderr)
         return 1

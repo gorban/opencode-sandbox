@@ -122,13 +122,17 @@ def forward_fixture_offer(raw):
             raise AssertionError("Synthetic browser callback was refused")
 
 
-def launch(home, launcher, label, descriptor):
+def launch(home, launcher, label, descriptor, start_input):
     pid, master = pty.fork()
     if pid == 0:
         os.chdir(launcher.parent)
-        os.execve("/usr/bin/python3", ["/usr/bin/python3", "-IBS", str(launcher), "--fixture", label, str(descriptor)],
+        start_descriptor = start_input.fileno()
+        os.set_inheritable(start_descriptor, True)
+        os.execve("/usr/bin/python3", ["/usr/bin/python3", "-IBS", str(launcher), "--fixture", label,
+                                        str(descriptor), str(start_descriptor)],
                   {"HOME": str(home), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
 
+    start_input.close()
     output = bytearray()
     consent = False
     offered = False
@@ -244,7 +248,7 @@ def verify_bound_catalog(home, log, label, candidate_log, acp_log, expected_mode
     return registration["registration_id"], registration["generation"]
 
 
-def run_bound_catalog_cases(guard, vendor, seal):
+def run_bound_catalog_cases(guard, vendor, seal, scope, start):
     flash = "gemini-2.5-flash"
     decoy = "gemini-2.5-pro"
     cases = (
@@ -253,6 +257,7 @@ def run_bound_catalog_cases(guard, vendor, seal):
         ("fixture-no-flash", b'{"id":"1040000003"}', (decoy,), None),
     )
     registrations, generations = set(), set()
+    sent = set()
     for label, subject, models, expected in cases:
         guard["require"](guard["guest"]() == seal)
         guard["check_home_before"](seal)
@@ -266,7 +271,8 @@ def run_bound_catalog_cases(guard, vendor, seal):
             source.chmod(0o500)
             descriptor = guard["prepare_descriptor"](case, label, seal)
             try:
-                launch(home, launcher, label, descriptor)
+                with guard["one_case_start"](scope, label, start, sent) as start_input:
+                    launch(home, launcher, label, descriptor, start_input)
             finally:
                 os.close(descriptor)
             registration, generation = verify_bound_catalog(home, log, label, candidate_log, acp_log, expected)
@@ -300,12 +306,15 @@ def main():
                 raise RuntimeError("Unsafe offline fixture source")
         guard = runpy.run_path(str(loader))
         guard["isolated"]()
+        guard["verify_start_parent"]()
+        start = guard["read_catalog_start"]()
         seal = guard["guest"]()
-        guard["check_home_before"](seal)
+        scope = guard["authorize_home_start"](seal, start)
         vendor = guard["vendor_pair"]()
         guard["private_inventory"](seal["uid"])
         sys.path.extend((str(private_source), str(private_source / "tests")))
-        run_bound_catalog_cases(guard, vendor, seal)
+        run_bound_catalog_cases(guard, vendor, seal, scope, start)
+        del start
         guard["private_inventory"](seal["uid"])
     except (OSError, ValueError, TypeError, KeyError, AssertionError, RuntimeError, subprocess.SubprocessError):
         print("Sealed offline Google fixture did not complete.", file=sys.stderr)

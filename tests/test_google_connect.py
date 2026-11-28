@@ -317,7 +317,8 @@ class OfflineGuestGuardTest(unittest.TestCase):
 
     def test_unbound_home_before_refuses_before_targeted_walk(self):
         scope = {"uid": 1000, "tree": "1" * 40, "boot": "0" * 36, "home_id": [2, 6], "seal": "2" * 64}
-        before = {"version": 1, "scope": scope, "entries": 65_956, "sha256": "3" * 64}
+        before = {"version": 2, "scope": scope, "entries": 65_956, "sha256": "3" * 64, "start_sha256": "5" * 64,
+                  "case_start_sha256": dict.fromkeys(offline.LABELS, "a" * 64)}
         for case, changed in (
             ("valid", before), ("wrong seal", before | {"scope": scope | {"seal": "4" * 64}}),
             ("wrong tree", before | {"scope": scope | {"tree": "4" * 40}}),
@@ -343,8 +344,10 @@ class OfflineGuestGuardTest(unittest.TestCase):
     def test_root_controller_binds_before_and_requires_real_completion(self):
         uid = max(os.getuid(), 1)
         seal = self.seal(uid)
-        scope = {"uid": uid, "tree": seal["tree"], "boot": seal["boot"], "home_id": [2, 6], "seal": "2" * 64}
+        scope = {"uid": uid, "tree": seal["tree"], "boot": seal["boot"], "home_id": [2, 6],
+                 "seal": "2" * 64, "attempt": "5" * 64}
         evidence = {"entries": 65_956, "sha256": "3" * 64}
+        start = b"s" * controller.START_BYTES
         with TemporaryDirectory() as temporary:
             capsule = Path(temporary)
             case, home = capsule / "case", capsule / "case/home"
@@ -353,13 +356,16 @@ class OfflineGuestGuardTest(unittest.TestCase):
             with patch.object(offline, "CAPSULE", capsule), \
                     patch.object(offline, "root_home_scope", return_value=(seal, scope)), \
                     patch.object(offline, "case_paths", return_value=nullcontext((case, home, sandbox))), \
+                    patch.object(offline, "proof_file", side_effect=lambda path: json.loads(path.read_bytes())), \
                     patch.object(offline, "capture_home_evidence", return_value=evidence):
-                offline.begin_home_attestation()
+                offline.begin_home_attestation(start)
                 before = json.loads((capsule / offline.HOME_BEFORE).read_text())
-                self.assertEqual(before, {"version": 1, "scope": scope, **evidence})
+                self.assertEqual(before, {"version": 2, "scope": scope, **evidence,
+                                          "start_sha256": offline.start_digest(scope, start),
+                                          "case_start_sha256": offline.case_start_commitments(scope, start)})
                 self.assertEqual(stat.S_IMODE((capsule / offline.HOME_BEFORE).stat().st_mode), 0o444)
                 with self.assertRaises(offline.Refused):
-                    offline.begin_home_attestation()
+                    offline.begin_home_attestation(start)
 
             captured = {"scope": scope, "home_before_sha256": "6" * 64, "after": evidence}
             for after, complete in ((evidence, True), (evidence | {"sha256": "4" * 64}, False)):
@@ -459,19 +465,24 @@ class OfflineGuestGuardTest(unittest.TestCase):
                     controller.pinned_driver("0" * 64)
 
     def test_controller_owns_exact_held_exec_vector(self):
-        seal = {"uid": 1000, "tree": "1" * 40, "source": {}}
+        seal = {"uid": 1000, "tree": "1" * 40, "source": {}, "boot": "test-boot"}
         user = SimpleNamespace(pw_uid=1000, pw_gid=1001, pw_name="oc-gemini-proof",
                                pw_dir="/home/oc-gemini-proof")
-        driver = {"absent": Mock(return_value=False), "proof_file": Mock(return_value=seal),
-                  "validate_seal": Mock(), "HOME_BEFORE": "home-before", "HOME_RESULT": "home-result",
-                  "NATIVE_RESULT": "native-result"}
-        driver["absent"].side_effect = lambda path: path.name != "seal.json"
-        with patch.object(controller, "pinned_driver", return_value=(driver, seal)), \
+        driver = {"absent": Mock(return_value=True), "proof_file": Mock(return_value=seal),
+                  "install_seal": Mock(), "validate_seal": Mock(), "HOME_BEFORE": "home-before",
+                  "HOME_BEFORE_STAGE": "stage", "HOME_RESULT": "home-result", "NATIVE_RESULT": "native-result",
+                  "write_protected": Mock()}
+        with TemporaryDirectory() as tmp, patch.object(controller, "CAPSULE", Path(tmp)), \
+                patch.object(controller, "pinned_driver", return_value=(driver, seal)), \
+                patch.object(controller, "deployment_binding", return_value={
+                    "capsule": "d" * 32, "capsule_id": controller.directory_id(Path(tmp).stat()), "boot": "test-boot",
+                }), patch.object(controller, "consume_boot_lease"), \
+                patch.object(controller, "protected_bytes", side_effect=lambda *_: driver["write_protected"].call_args.args[1]), \
                 patch.object(controller.pwd, "getpwnam", return_value=user), \
                 patch.object(controller, "inspect_devbox", return_value="a" * 64) as inspect, \
                 patch.object(controller, "observe_run", return_value=0) as owned:
             pin = "c" * 64
-            self.assertEqual(controller.run_controller(pin), 0)
+            self.assertEqual(controller.run_controller(pin, "e" * 64), 0)
             args = owned.call_args.args[1]
             prefix, = inspect.call_args.args
             self.assertEqual(args, (*prefix, "exec", "-i", "--user", "1000:1001", "a" * 64,
@@ -535,10 +546,17 @@ class OfflineGuestGuardTest(unittest.TestCase):
             with self.subTest(unexpected=unexpected):
                 owner = Mock()
                 driver = {"guest": Mock(return_value=seal), "private_inventory": owner.inventory,
-                          "check_home_before": owner.before}
+                          "authorize_home_start": owner.before}
                 channel = owner.channel
-                channel.read.side_effect = (controller.START, controller.RELEASE)
+                value = b"s" * controller.START_BYTES
+                channel.read.side_effect = (controller.START + value, controller.RELEASE)
                 child_check = [None, controller.ControllerRefused()] if unexpected else [None] * 3
+
+                def run_child(*_args, stdin, **_kwargs):
+                    self.assertEqual(stdin.read(controller.START_BYTES + 1), value)
+                    self.assertEqual(stdin.read(1), b"")
+                    return 0, controller.POSITIVE
+
                 with patch.object(controller, "pinned_driver", return_value=(driver, seal)), \
                         patch.object(controller.os, "getuid", return_value=uid), \
                         patch.object(controller.os, "geteuid", return_value=uid), \
@@ -546,7 +564,7 @@ class OfflineGuestGuardTest(unittest.TestCase):
                         patch.object(controller, "subreaper", owner.subreaper), \
                         patch.object(controller, "no_children", side_effect=child_check), \
                         patch.object(controller, "Frames", return_value=channel), \
-                        patch.object(controller, "bounded_run", return_value=(0, controller.POSITIVE)) as child:
+                        patch.object(controller, "bounded_run", side_effect=run_child) as child:
                     if unexpected:
                         with self.assertRaises(controller.ControllerRefused):
                             controller.run_held_supervisor("pin")
@@ -557,8 +575,10 @@ class OfflineGuestGuardTest(unittest.TestCase):
                                          [controller.READY, controller.OUTCOME + b"\0" + controller.POSITIVE,
                                           controller.RETIRED])
                         self.assertEqual(owner.inventory.call_count, 3)
-                    child.assert_called_once_with(controller.fixture_command(), seconds=channel.remaining.return_value,
-                                                   limit=4096, env=controller.ENV | {"HOME": controller.HOME})
+                    child.assert_called_once()
+                    self.assertEqual(child.call_args.args, (controller.fixture_command(),))
+                    self.assertEqual(child.call_args.kwargs["env"], controller.ENV | {"HOME": controller.HOME})
+                    owner.before.assert_called_once_with(seal, value)
 
     def test_real_pipe_transport_holds_creation_and_release_outside_observation(self):
         import textwrap
@@ -574,7 +594,9 @@ class OfflineGuestGuardTest(unittest.TestCase):
                 assert os.read(0, size) == expected
             store.write_text("exec open")
             send(b"R")
-            receive(b"S")
+            size, = struct.unpack("!H", os.read(0, 2))
+            start = os.read(0, size)
+            assert len(start) == 33 and start[:1] == b"S"
             send(b"O" + bytes((0,)) + bytes.fromhex(sys.argv[2]))
             receive(b"L")
             assert os.read(0, 1) == b""
@@ -586,7 +608,8 @@ class OfflineGuestGuardTest(unittest.TestCase):
             store.write_text("exec not created")
             window = []
 
-            def begin():
+            def begin(value):
+                self.assertEqual(len(value), controller.START_BYTES)
                 window.append(store.read_text())
 
             def capture():

@@ -121,6 +121,14 @@ Use root-owned directories without group or other write access. Place both pinne
 vendor artifacts at the reviewed `vendor/` paths as root-owned 0444 files. Require
 canonical capsule paths and make the same protected projection visible to the devbox.
 The capsule, including its source inventory, must be fresh.
+During trusted guest provisioning, prepare a root-owned, 0444
+`capsule-binding.json` in the capsule. Its version 1 fields are `capsule` (a fresh
+32-character lowercase hexadecimal ID), `boot` (the actual Linux boot ID),
+`tree` and `manifest_sha256` (the reviewed source pins), and `capsule_id` (the
+protected capsule directory's device and inode). Keep the binding digest
+independently of the capsule. The same boot needs a root-owned, 0700
+`/run/oc-gemini-fixture-leases` directory on the ordinary `/run` tmpfs.
+Do not recreate or empty the lease directory during the boot.
 
 Before running any fixture code as root, verify the protected controller file against the
 independently reviewed controller hash. Use the separate reviewed manifest hash when
@@ -129,24 +137,43 @@ starting the controller. Both pins come from source review.
 ```sh
 printf '%s  %s\n' REVIEWED_CONTROLLER_SHA256 /home/.oc-gemini-cold-proof/google_home_controller.py \
   | /usr/bin/sha256sum --strict --check - &&
-  /usr/bin/python3 -IBS /home/.oc-gemini-cold-proof/google_home_controller.py REVIEWED_MANIFEST_SHA256
+  /usr/bin/python3 -IBS /home/.oc-gemini-cold-proof/google_home_controller.py \
+    REVIEWED_MANIFEST_SHA256 PROVISIONED_BINDING_SHA256
 ```
 
 The controller verifies its protected bytes and every fixed source against that
-reviewed manifest before loading driver code. It validates or creates the seal, checks
+reviewed manifest before loading driver code. It verifies the independent
+binding and consumes its one-use boot lease before syncing the exclusive
+allocation marker. A lost marker cannot renew the lease. A different boot
+requires a freshly prepared capsule. It starts a
+fixed, isolated allocator with the dedicated fixture UID and primary GID, no supplementary
+groups and a bounded result channel. The unprivileged allocator creates and pins the
+three case homes. Root independently verifies their exact anchored identities before and
+after preparing the protected config projections, then publishes the new seal. Root only
+reads the dedicated user's runtime tree. Seal, config and evidence files begin at 0600
+and reach 0444 only after writing and syncing the complete bytes. A final file or parent
+sync failure withholds acceptance and requires a fresh capsule. The controller checks
 the named running rootless `oc-proof-devbox` container for the dedicated account,
 starts one fixed interactive exec with the measured unprivileged supervisor in that
 exact container. The supervisor waits at the first barrier while root records the
-whole ordinary-home baseline. When root releases the start barrier, the supervisor
-runs exactly one dedicated child with no stdin:
+whole ordinary-home baseline with a digest of a fresh 32-byte start value.
+Root stages the record privately, syncs it and verifies the published bytes
+before sending the single bounded start frame. The supervisor validates the
+frame and runs exactly one dedicated child with anonymous stdin carrying only
+that start value:
 `/usr/bin/python3 -IBS /home/.oc-gemini-cold-proof/source/tests/google-connect-fixture.py --bound-catalog`.
 The controller binds the dedicated UID and HOME and bounds the held session to
 900 seconds. The supervisor waits for the actual child, caps captured output at
 4 KiB, verifies no descendants or scoped native runtime remain, and then holds the
 exec at the second barrier with the typed outcome.
 
-The unprivileged fixture verifies the guest policy, boot, UID, source and root baseline
-before enrollment. It checks the three ordinary provider paths are absent and uses a
+The unprivileged fixture consumes and closes the start descriptor and verifies
+the measured supervisor, guest policy, boot, UID, source and root baseline
+before enrollment. The before record also commits separate derived values for
+the three fixed labels. Each case child consumes its unique value from an
+anonymous descriptor before opening its case. The original value stays in the
+catalog child. Both types of descriptor are closed before native startup.
+The fixture checks the three ordinary provider paths are absent and uses a
 separately sealed synthetic HOME for config, artifacts and enrollment. The controller
 independently checks the exact positive output for all three named catalogs, two Flash
 bindings, zero prompts, six retired native runtimes and an empty scoped native inventory.

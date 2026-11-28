@@ -3,15 +3,18 @@
 from contextlib import ExitStack, contextmanager
 import fcntl
 from hashlib import file_digest, sha256
+from hmac import compare_digest, digest as hmac_digest
 import json
 import os
 from pathlib import Path
 import pwd
 import re
+import select
 import stat
 import subprocess
 import sys
-import tempfile
+import time
+from secrets import token_hex
 from types import ModuleType
 
 
@@ -69,8 +72,11 @@ SHARED_FS = {"9p", "virtiofs", "vboxsf", "fuse.sshfs", "cifs", "nfs", "nfs4", "v
 SEALED = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
 MAX_PROOF = 32768
 HOME_BEFORE = "home-before.json"
+HOME_BEFORE_STAGE = ".home-before-staging"
 HOME_RESULT = "home-result.json"
 NATIVE_RESULT = "native-result.json"
+ALLOCATION_ATTEMPT = "allocation-attempt.json"
+START_BYTES = 32
 NATIVE_POSITIVE = (b"Verified three named offline catalogs, two Flash candidates, zero prompts and six retired runtimes.\n"
                    b"Scoped native inventory empty.\n")
 HOME_ENTRY_LIMIT = 131072
@@ -382,19 +388,28 @@ def ordinary_provider_roots(uid, expected_id):
 def home_evidence_scope(seal):
     seal_file = CAPSULE / "seal.json"
     require(proof_file(seal_file) == seal)
+    attempt_path = CAPSULE / ALLOCATION_ATTEMPT
+    attempt = proof_file(attempt_path)
+    require(attempt.keys() == {"version", "binding", "capsule", "boot", "tree"}
+            and type(attempt["version"]) is int and attempt["version"] == 1
+            and hex_text(attempt["binding"], 64) and hex_text(attempt["capsule"], 32)
+            and attempt["boot"] == seal["boot"] and attempt["tree"] == seal["tree"])
     home = checked_node(TEST_HOME, seal["uid"], directory=True)
-    return {"seal": digest(seal_file), "tree": seal["tree"], "boot": seal["boot"],
+    return {"seal": digest(seal_file), "attempt": digest(attempt_path), "tree": seal["tree"], "boot": seal["boot"],
             "uid": seal["uid"], "home_id": identity(home)}
 
 
 def verified_home_before(scope):
     require(absent(CAPSULE / HOME_RESULT) and absent(CAPSULE / NATIVE_RESULT))
     before = proof_file(CAPSULE / HOME_BEFORE)
-    require(before.keys() == {"version", "scope", "entries", "sha256"})
-    require(type(before["version"]) is int and before["version"] == 1 and before["scope"] == scope)
+    require(before.keys() == {"version", "scope", "entries", "sha256", "start_sha256", "case_start_sha256"})
+    require(type(before["version"]) is int and before["version"] == 2 and before["scope"] == scope)
     require(type(before["scope"]["uid"]) is int and all(type(item) is int for item in before["scope"]["home_id"]))
     require(type(before["entries"]) is int and 1 <= before["entries"] <= HOME_ENTRY_LIMIT)
-    require(hex_text(before["sha256"], 64))
+    require(hex_text(before["sha256"], 64) and hex_text(before["start_sha256"], 64))
+    cases = before["case_start_sha256"]
+    require(type(cases) is dict and set(cases) == set(LABELS))
+    require(all(hex_text(checksum, 64) for checksum in cases.values()))
     return before
 
 
@@ -402,6 +417,120 @@ def check_home_before(seal):
     scope = home_evidence_scope(seal)
     verified_home_before(scope)
     ordinary_provider_roots(scope["uid"], scope["home_id"])
+
+
+def start_digest(scope, value):
+    require(type(value) is bytes and len(value) == START_BYTES)
+    encoded = json.dumps(scope, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return sha256(b"oc-gemini-fixture:start:v1\0" + encoded + b"\0" + value).hexdigest()
+
+
+def case_start_binding(scope, label):
+    require(label in LABELS)
+    binding = {"seal": scope["seal"], "attempt": scope["attempt"], "uid": scope["uid"], "label": label}
+    return json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+
+def derive_case_start(scope, label, start):
+    require(type(start) is bytes and len(start) == START_BYTES)
+    return hmac_digest(start, b"oc-gemini-fixture:derive-case-start:v1\0" + case_start_binding(scope, label), "sha256")
+
+
+def case_start_digest(scope, label, value):
+    require(type(value) is bytes and len(value) == START_BYTES)
+    binding = case_start_binding(scope, label)
+    return sha256(b"oc-gemini-fixture:case-start:v1\0" + binding + b"\0" + value).hexdigest()
+
+
+def case_start_commitments(scope, start):
+    return {label: case_start_digest(scope, label, derive_case_start(scope, label, start)) for label in LABELS}
+
+
+def authorize_home_start(seal, value):
+    scope = home_evidence_scope(seal)
+    before = verified_home_before(scope)
+    require(compare_digest(before["start_sha256"], start_digest(scope, value)))
+    require(before["case_start_sha256"] == case_start_commitments(scope, value))
+    ordinary_provider_roots(scope["uid"], scope["home_id"])
+    return scope
+
+
+def authorize_case_start(seal, label, value):
+    scope = home_evidence_scope(seal)
+    before = verified_home_before(scope)
+    expected = case_start_digest(scope, label, value)
+    require(compare_digest(before["case_start_sha256"][label], expected))
+    ordinary_provider_roots(scope["uid"], scope["home_id"])
+
+
+def read_catalog_start(fd=0):
+    """Consume the anonymous one-way startup descriptor before case or vendor access."""
+    deadline = time.monotonic() + 2
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISFIFO(info.st_mode) and fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY)
+        # Linux renders unnamed pipefs descriptors differently from named FIFOs,
+        # including named FIFOs whose directory entry was removed after opening.
+        require(os.readlink(f"/proc/self/fd/{fd}") == f"pipe:[{info.st_ino}]")
+        os.set_blocking(fd, False)
+        value = bytearray()
+        while len(value) <= START_BYTES:
+            remaining = deadline - time.monotonic()
+            require(remaining > 0 and select.select([fd], [], [], remaining)[0])
+            piece = os.read(fd, START_BYTES + 1 - len(value))
+            if not piece:
+                require(len(value) == START_BYTES)
+                return bytes(value)
+            value.extend(piece)
+        raise Refused("Offline Google fixture start descriptor refused.")
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def one_case_start(scope, label, start, sent):
+    require(label not in sent)
+    sent.add(label)
+    value = derive_case_start(scope, label, start)
+    reader, writer = os.pipe2(os.O_CLOEXEC)
+    with os.fdopen(reader, "rb", buffering=0) as stream:
+        try:
+            require(os.write(writer, value) == START_BYTES)
+        finally:
+            os.close(writer)
+        del value
+        yield stream
+
+
+def measured_parent(pid, argv, *, supervisor=False):
+    require(pid > 1)
+    process = Path(f"/proc/{pid}")
+    original = process.stat()
+    require(original.st_uid == os.getuid() and os.path.samefile(process / "exe", "/usr/bin/python3"))
+    with (process / "cmdline").open("rb") as stream:
+        expected = b"\0".join(os.fsencode(part) for part in argv) + b"\0"
+        suffix = 65 if supervisor else 0
+        observed = stream.read(len(expected) + suffix + 1)
+    if supervisor:
+        require(observed.startswith(expected) and re.fullmatch(rb"[a-f0-9]{64}\x00", observed[len(expected):]))
+    else:
+        require(observed == expected)
+    with (process / "stat").open("rb") as stream:
+        fields = stream.read(4096).rpartition(b") ")[2].split()
+    require(len(fields) >= 20 and os.path.samestat(original, process.stat()))
+    return int(fields[1])
+
+
+def verify_start_parent(*, case_child=False):
+    parent = os.getppid()
+    interpreter = ("/usr/bin/python3", "-IBS")
+    supervisor = parent
+    if case_child:
+        entry = SOURCE / "tests/google-connect-fixture.py"
+        supervisor = measured_parent(parent, (*interpreter, entry, "--bound-catalog"))
+    controller = CAPSULE / "google_home_controller.py"
+    measured_parent(supervisor, (*interpreter, controller, "--held-exec"), supervisor=True)
+    require(os.getppid() == parent)
 
 
 def root_home_scope():
@@ -424,14 +553,18 @@ def capture_home_evidence(scope):
     return {"entries": entries, "sha256": checksum}
 
 
-def begin_home_attestation():
+def begin_home_attestation(value):
     seal, scope = root_home_scope()
     require(all(absent(CAPSULE / name) for name in (HOME_BEFORE, HOME_RESULT, NATIVE_RESULT)))
     for label in LABELS:
         with case_paths(seal, label, pristine=True):
             pass
-    before = {"version": 1, "scope": scope, **capture_home_evidence(scope)}
-    write_protected(CAPSULE / HOME_BEFORE, json.dumps(before, sort_keys=True).encode("ascii"))
+    before = {"version": 2, "scope": scope, "start_sha256": start_digest(scope, value),
+              "case_start_sha256": case_start_commitments(scope, value),
+              **capture_home_evidence(scope)}
+    payload = json.dumps(before, sort_keys=True).encode("ascii")
+    publish_home_before(payload)
+    require(verified_home_before(scope) == before and digest(CAPSULE / HOME_BEFORE) == sha256(payload).hexdigest())
 
 
 def capture_home_after():
@@ -499,75 +632,232 @@ def project_config(original, home):
 
 
 def write_protected(path, payload):
-    with path.open("xb") as stream:
-        stream.write(payload)
-        os.fchmod(stream.fileno(), 0o444)
+    require(type(payload) is bytes and 0 < len(payload) <= MAX_PROOF)
+    uid = os.geteuid()
+    parent_info = checked_node(path.parent, uid, directory=True)
+    with ExitStack() as pins:
+        parent = os.open(path.parent, DIRECTORY)
+        pins.callback(os.close, parent)
+        require(os.path.samestat(parent_info, os.fstat(parent)))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(path.name, flags, 0o600, dir_fd=parent)
+        pins.callback(os.close, fd)
+
+        def verify(mode, size):
+            node = os.fstat(fd)
+            named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            require(stat.S_ISREG(node.st_mode) and node.st_uid == uid and node.st_nlink == 1
+                    and stat.S_IMODE(node.st_mode) == mode and node.st_size == size)
+            require(metadata(node) == metadata(named)
+                    and os.path.samestat(parent_info, path.parent.lstat()))
+
+        verify(0o600, 0)
+        data = memoryview(payload)
+        while data:
+            length = os.write(fd, data)
+            require(length > 0)
+            data = data[length:]
+        verify(0o600, len(payload))
+        os.fsync(fd)
+        try:
+            os.fchmod(fd, 0o444)
+            verify(0o444, len(payload))
+            os.fsync(fd)
+            os.fsync(parent)
+            verify(0o444, len(payload))
+        except BaseException:
+            try:
+                os.fchmod(fd, 0o600)
+                os.fsync(fd)
+                os.fsync(parent)
+            except OSError:
+                pass
+            raise
 
 
-def install_seal(tree):
-    """Create fixed case bindings inside the disposable guest as root."""
-    require(os.getuid() == os.geteuid() == 0 and re.fullmatch(r"[a-f0-9]{40}", tree))
-    user = account()
+def publish_home_before(payload):
+    """Sync the finalized record privately, then publish it under the pinned capsule."""
+    uid = os.geteuid()
+    original = checked_node(CAPSULE, uid, directory=True)
+    with ExitStack() as pins:
+        parent = os.open(CAPSULE, DIRECTORY)
+        pins.callback(os.close, parent)
+        require(os.path.samestat(original, os.fstat(parent)))
+        os.mkdir(HOME_BEFORE_STAGE, mode=0o700, dir_fd=parent)
+        staged = os.open(HOME_BEFORE_STAGE, DIRECTORY, dir_fd=parent)
+        pins.callback(os.close, staged)
+        stage_info = private_dir_identity(os.fstat(staged), uid)
+        path = CAPSULE / HOME_BEFORE_STAGE / HOME_BEFORE
+        require(stage_info == identity(path.parent.lstat()))
+        write_protected(path, payload)
+        fd = os.open(HOME_BEFORE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=staged)
+        pins.callback(os.close, fd)
+        node = os.fstat(fd)
+        require(stat.S_ISREG(node.st_mode) and node.st_uid == uid and node.st_nlink == 1
+                and stat.S_IMODE(node.st_mode) == 0o444 and node.st_size == len(payload)
+                and os.pread(fd, len(payload) + 1, 0) == payload)
+        require(os.path.samestat(original, CAPSULE.lstat())
+                and stage_info == identity(os.stat(HOME_BEFORE_STAGE, dir_fd=parent, follow_symlinks=False)))
+        os.link(HOME_BEFORE, HOME_BEFORE, src_dir_fd=staged, dst_dir_fd=parent, follow_symlinks=False)
+        try:
+            os.unlink(HOME_BEFORE, dir_fd=staged)
+            os.fsync(staged)
+            os.rmdir(HOME_BEFORE_STAGE, dir_fd=parent)
+            os.fsync(parent)
+            named = os.stat(HOME_BEFORE, dir_fd=parent, follow_symlinks=False)
+            require(os.path.samestat(node, named) and named.st_nlink == 1 and named.st_uid == uid
+                    and stat.S_IMODE(named.st_mode) == 0o444 and named.st_size == len(payload)
+                    and os.path.samestat(original, CAPSULE.lstat()))
+        except BaseException:
+            try:
+                os.fchmod(fd, 0o600)
+                os.fsync(fd)
+                os.fsync(parent)
+            except OSError:
+                pass
+            raise
+
+
+def private_dir_identity(info, uid):
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == uid and stat.S_IMODE(info.st_mode) == 0o700)
+    return identity(info)
+
+
+@contextmanager
+def runtime_directory(uid):
+    path = USER_RUNTIME / str(uid)
+    expected = private_dir_identity(checked_node(path, uid, directory=True), uid)
+    fd = os.open(path, DIRECTORY)
+    try:
+        require(private_dir_identity(os.fstat(fd), uid) == expected)
+        yield fd
+        require(private_dir_identity(os.fstat(fd), uid) == private_dir_identity(path.lstat(), uid) == expected)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def pinned_case_tree(runtime, name, uid, *, create=False, pristine=False, identities=None):
+    require(type(name) is str and re.fullmatch(r"oc-g-connect-fixture-[a-z0-9_]{8}", name))
+    with ExitStack() as pins:
+        parent = runtime
+        links = []
+        if create:
+            user = account()
+            require(uid == user.pw_uid)
+            require_unprivileged_allocator(user)
+        for child, expected_children in ((name, ("home",)), ("home", ("opencode-sandbox",)), ("opencode-sandbox", ())):
+            if create:
+                os.mkdir(child, 0o700, dir_fd=parent)
+            expected = private_dir_identity(os.stat(child, dir_fd=parent, follow_symlinks=False), uid)
+            if identities is not None:
+                require(expected == identities[len(links)])
+            fd = os.open(child, DIRECTORY, dir_fd=parent)
+            pins.callback(os.close, fd)
+            require(private_dir_identity(os.fstat(fd), uid) == expected)
+            links.append((parent, child, fd, expected, expected_children))
+            parent = fd
+
+        def verify():
+            for directory, child, fd, expected, expected_children in reversed(links):
+                require(private_dir_identity(os.fstat(fd), uid)
+                        == private_dir_identity(os.stat(child, dir_fd=directory, follow_symlinks=False), uid)
+                        == expected)
+                if pristine or not expected_children:
+                    exact_children(fd, expected_children)
+
+        verify()
+        yield tuple(expected for _, _, _, expected, _ in links)
+        verify()
+
+
+def require_unprivileged_allocator(user):
     uid, gid = user.pw_uid, user.pw_gid
+    require(uid > 0 and gid > 0 and os.getresuid() == (uid, uid, uid)
+            and os.getresgid() == (gid, gid, gid) and os.getgroups() == [])
+
+
+def allocate_cases():
+    user = account()
+    uid = user.pw_uid
+    require_unprivileged_allocator(user)
+    os.umask(0o077)
+    records = {}
+    with runtime_directory(uid) as runtime:
+        for label in LABELS:
+            name = "oc-g-connect-fixture-" + token_hex(4)
+            with pinned_case_tree(runtime, name, uid, create=True, pristine=True) as identities:
+                root, home, sandbox = identities
+                records[label] = {"case": str(USER_RUNTIME / str(uid) / name),
+                                  "root_id": root, "home_id": home, "sandbox_id": sandbox}
+    return records
+
+
+def install_seal(tree, allocator):
+    """Verify unprivileged case bindings and write only protected guest capsule files."""
+    require(os.getuid() == os.geteuid() == 0 and re.fullmatch(r"[a-f0-9]{40}", tree))
+    uid = account().pw_uid
     boot = topology(root_host)
     policy = firewall(root_host(*NFT))
     source = source_inventory()
     vendor_pair()
     home_snapshot(uid)
     cases = CAPSULE / "case-config"
-    cases.mkdir(mode=0o755)
+    require(absent(cases) and absent(CAPSULE / "seal.json"))
+    allocations = allocator()
+    require(type(allocations) is dict and set(allocations) == set(LABELS))
     records = {}
-    runtime = USER_RUNTIME / str(uid)
-    checked_node(runtime, uid, directory=True, private=True)
-    for label in LABELS:
-        case = Path(tempfile.mkdtemp(prefix="oc-g-connect-fixture-", dir=runtime))
-        home = case / "home"
-        sandbox = home / "opencode-sandbox"
-        home.mkdir(mode=0o700)
-        sandbox.mkdir(mode=0o700)
-        for directory in (sandbox, home, case):
-            os.chown(directory, uid, gid)
-        leaf = cases / label / "config.py"
-        leaf.parent.mkdir(mode=0o755)
-        code = project_config((SOURCE / CONFIG).read_text(encoding="utf-8"), home)
-        write_protected(leaf, code.encode("utf-8"))
-        records[label] = {"case": str(case), "root_id": identity(case.stat()), "home_id": identity(home.stat()),
-                          "sandbox_id": identity(sandbox.stat()), "config": digest(leaf)}
+    for label, allocation in allocations.items():
+        require(type(allocation) is dict and allocation.keys() == {"case", "root_id", "home_id", "sandbox_id"})
+        records[label] = {**allocation, "config": "0" * 64}
     proof = {"version": 1, "uid": uid, "boot": boot, "tree": tree, "source": source,
              "firewall": policy, "cases": records}
     validate_seal(proof)
+    for label in LABELS:
+        with case_paths(proof, label, pristine=True):
+            pass
+    cases.mkdir(mode=0o755)
+    original = (SOURCE / CONFIG).read_text(encoding="utf-8")
+    for label, record in records.items():
+        leaf = cases / label / "config.py"
+        leaf.parent.mkdir(mode=0o755)
+        home = sealed_case(record, uid) / "home"
+        code = project_config(original, home)
+        write_protected(leaf, code.encode("utf-8"))
+        record["config"] = digest(leaf)
+    for label in LABELS:
+        with case_paths(proof, label, pristine=True):
+            pass
     write_protected(CAPSULE / "seal.json", json.dumps(proof, sort_keys=True).encode("ascii"))
 
 
 def exact_children(fd, expected):
     original = metadata(os.fstat(fd))
     pending = set(expected)
-    with os.scandir(fd) as children:
-        for child in children:
-            require(child.name in pending)
-            pending.remove(child.name)
+    # A fresh open of the held directory avoids consuming or reusing its offsets.
+    scan = os.open(".", DIRECTORY, dir_fd=fd)
+    try:
+        require(metadata(os.fstat(scan)) == original)
+        with os.scandir(scan) as children:
+            for child in children:
+                require(child.name in pending)
+                pending.remove(child.name)
+    finally:
+        os.close(scan)
     require(not pending and metadata(os.fstat(fd)) == original)
 
 
 @contextmanager
 def case_paths(seal, label, *, pristine=False):
     require(label in LABELS)
+    uid = seal["uid"]
     record = seal["cases"][label]
-    case = sealed_case(record, seal["uid"])
-    home, sandbox = case / "home", case / "home/opencode-sandbox"
-    with ExitStack() as pins:
-        parent = None
-        for path, key in ((case, "root_id"), (home, "home_id"), (sandbox, "sandbox_id")):
-            info = checked_node(path, seal["uid"], directory=True, private=True)
-            fd = os.open(str(path) if parent is None else path.name, DIRECTORY, dir_fd=parent)
-            pins.callback(os.close, fd)
-            require(identity(info) == identity(os.fstat(fd)) == record[key])
-            if key == "sandbox_id":
-                exact_children(fd, ())
-            elif pristine:
-                exact_children(fd, ("home",) if key == "root_id" else ("opencode-sandbox",))
-            parent = fd
-        yield case, home, sandbox
+    case = sealed_case(record, uid)
+    expected = tuple(record[key] for key in ("root_id", "home_id", "sandbox_id"))
+    with runtime_directory(uid) as runtime, pinned_case_tree(
+        runtime, case.name, uid, pristine=pristine, identities=expected,
+    ):
+        yield case, case / "home", case / "home/opencode-sandbox"
 
 
 def copied_source(path, uid, files):
@@ -682,19 +972,23 @@ def isolated():
 def main():
     try:
         isolated()
-        _, action, label, descriptor = sys.argv
+        _, action, label, descriptor, start_descriptor = sys.argv
         driver = Path(__file__).absolute()
         require(driver.name == DRIVER and driver.parent.name == "source"
                 and driver.parent.parent.parent == USER_RUNTIME / str(os.getuid()))
-        require(action == "--fixture" and label in LABELS and descriptor.isascii() and descriptor.isdecimal())
-        fd = int(descriptor)
+        require(action == "--fixture" and label in LABELS)
+        require(all(raw.isascii() and raw.isdecimal() and len(raw) <= 9 for raw in (descriptor, start_descriptor)))
+        fd, start_fd = int(descriptor), int(start_descriptor)
+        require(fd >= 3 and start_fd >= 3 and fd != start_fd)
+        verify_start_parent(case_child=True)
+        start = read_catalog_start(start_fd)
+        seal = guest()
+        authorize_case_start(seal, label, start)
+        del start
         try:
             projection = read_descriptor(fd)
         finally:
-            if fd >= 3:
-                os.close(fd)
-        seal = guest()
-        check_home_before(seal)
+            os.close(fd)
         with case_paths(seal, label) as (case, home, sandbox):
             source = case / "source"
             require(Path(__file__).absolute() == source / DRIVER)
