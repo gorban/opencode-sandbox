@@ -27,4 +27,10 @@ docker-in-docker, implemented in PR #2).
       retains the installation binding when legacy storage or an incomplete inventory needs manual
       attention. New Postgres secrets carry ownership labels (`fix/global-teardown-status`).
 
+- [ ] Run managed provider admission before Chromium or instance setup.
+      See [G1](prd_g1.md) for the walkthrough and observed failure.
+- [ ] Roll back resources owned by a launch that fails after admission.
+      Stop only the verified startup incarnation if no worker has adopted it.
+      Preserve existing resources, profiles and unresolved cleanup receipts.
+
 - [ ] **Human review**: checked only when the user says so

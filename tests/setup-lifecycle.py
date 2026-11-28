@@ -534,7 +534,7 @@ class ChromiumModeTests(unittest.TestCase):
         fixture = r'''
 set -euo pipefail
 CHROME=chrome CHROME_IMG=chrome-image CHROME_MEM=1g CHROMEVOL=retained-profile
-POD=retained-pod POLDIR=$PWD SCRIPT_REAL=$1 WL=$PWD/test-wayland INST=test ILABEL=test NOKEY=0
+POD=retained-pod POLDIR=$PWD SCRIPT_REAL=$1 WL=$PWD/test-wayland INST=test ILABEL=test NOKEY=0 MANAGED_MODE=0
 log() { :; }
 cstate() { printf 'running\n'; }
 detect_keys() { printf '/dev/hidraw-fixture|test-key|test-id\n'; printf 'detect\n' >> trace; }

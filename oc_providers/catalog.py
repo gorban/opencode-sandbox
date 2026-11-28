@@ -147,6 +147,7 @@ def _preflight_narrowed(
     provider_filter: str,
     config: ProviderConfig | None,
     adapters: Mapping[str, ProviderSessionAdapter],
+    preflight,
 ) -> tuple[list[InstancePreflight], list[ExcludedInstance]]:
     kind, label = parse_provider_filter(provider_filter)
     adapter = adapters.get(kind)
@@ -156,13 +157,13 @@ def _preflight_narrowed(
             "route_unqualified",
             f"Provider instance '{spec.qualified_name}' ({spec.auth_mode}) is not qualified for sandbox launch.",
         )
-    preflight = adapter.preflight_instance(spec)
-    if preflight.readiness is not ReadinessState.READY or not preflight.models:
+    checked = preflight(adapter, spec)
+    if checked.readiness is not ReadinessState.READY or not checked.models:
         raise LaunchRefusedError(
-            f"provider_{preflight.readiness.value}",
-            f"Provider instance '{spec.qualified_name}' is not ready ({preflight.readiness.value}).",
+            f"provider_{checked.readiness.value}",
+            f"Provider instance '{spec.qualified_name}' is not ready ({checked.readiness.value}).",
         )
-    return [preflight], []
+    return [checked], []
 
 
 def _collect_default_specs(
@@ -182,6 +183,7 @@ def _collect_default_specs(
 def _preflight_default_catalog(
     config: ProviderConfig | None,
     adapters: Mapping[str, ProviderSessionAdapter],
+    preflight,
 ) -> tuple[list[InstancePreflight], list[ExcludedInstance]]:
     ready: list[InstancePreflight] = []
     excluded: list[ExcludedInstance] = []
@@ -200,12 +202,12 @@ def _preflight_default_catalog(
                 )
             )
             continue
-        preflight = adapter.preflight_instance(spec)
-        if preflight.readiness is ReadinessState.READY and preflight.models:
-            ready.append(preflight)
+        checked = preflight(adapter, spec)
+        if checked.readiness is ReadinessState.READY and checked.models:
+            ready.append(checked)
         else:
             excluded.append(
-                ExcludedInstance(spec.kind, spec.label, preflight.readiness.value, preflight.readiness.value)
+                ExcludedInstance(spec.kind, spec.label, checked.readiness.value, checked.readiness.value)
             )
     if len(ready) > MAX_PROVIDER_SLOTS:
         raise ProviderIntegrityError(
@@ -378,14 +380,18 @@ def plan_interactive_launch(
     config: ProviderConfig | None,
     adapters: Mapping[str, ProviderSessionAdapter],
     terminal: LaunchTerminal,
+    workspace_description: str | None = None,
+    preflight=None,
 ) -> ResolvedLaunchPlan:
     """Resolve candidates, disclose exclusions/holds/models, and confirm an interactive launch."""
     ui_mode, ui_source = resolve_ui_mode(cli_ui_mode, config)
+    if preflight is None:
+        preflight = lambda adapter, spec: adapter.preflight_instance(spec)
     narrowed = bool(provider_filter)
     if narrowed:
-        candidates, excluded = _preflight_narrowed(provider_filter, config, adapters)
+        candidates, excluded = _preflight_narrowed(provider_filter, config, adapters, preflight)
     else:
-        candidates, excluded = _preflight_default_catalog(config, adapters)
+        candidates, excluded = _preflight_default_catalog(config, adapters, preflight)
 
     _report_excluded(excluded, terminal)
     if not candidates:
@@ -410,9 +416,10 @@ def plan_interactive_launch(
             f"auth={item.spec.auth_mode}, policy={item.route_policy} (models: {preview})"
         )
     ui_label = "OpenCode Mini" if ui_mode == "mini" else "OpenCode"
+    workspace = workspace_description if workspace_description is not None else f"/sandbox/{cwd}"
     terminal.write(
         f"Initial active model: {initial_provider_id}/{initial_model} | "
-        f"UI: {ui_label} ({ui_source}) | Workspace: /sandbox/{cwd}"
+        f"UI: {ui_label} ({ui_source}) | Workspace: {workspace}"
     )
     terminal.write(
         "No API-key fallback will be forwarded. Provider tokens stay on the workstation behind "
@@ -432,6 +439,58 @@ def plan_interactive_launch(
         ui_mode=ui_mode,
         ui_source=ui_source,
     )
+
+
+def snapshot_launch_selections(
+    provider_filter: str, adapters: Mapping[str, ProviderSessionAdapter]
+) -> dict:
+    """Capture selections that can affect routing or the default model shown for approval."""
+    if provider_filter:
+        kind, label = parse_provider_filter(provider_filter)
+        return {kind: adapters[kind].selection_state()} if label is None and kind in adapters else {}
+    return {kind: adapter.selection_state() for kind, adapter in adapters.items()}
+
+
+def preflight_admission_route(adapter, spec, *, deadline, cancelled):
+    refresh = getattr(adapter, "preflight_for_admission", None)
+    if refresh is not None:
+        return refresh(spec, deadline=deadline, cancelled=cancelled)
+    return adapter.preflight_instance(spec)
+
+
+def revalidate_interactive_launch(
+    plan: ResolvedLaunchPlan,
+    adapters: Mapping[str, ProviderSessionAdapter],
+    *,
+    deadline: float,
+    cancelled,
+    checkpoint,
+) -> None:
+    """Check the routes the operator approved and keep their original handles."""
+    for approved in plan.admitted:
+        checkpoint()
+        spec = approved.spec
+        adapter = adapters[spec.kind]
+        current = preflight_admission_route(adapter, spec, deadline=deadline, cancelled=cancelled)
+        compare_handles = getattr(adapter, "same_admission_target", None)
+        same_target = (
+            compare_handles(approved.handle, current.handle)
+            if compare_handles is not None else approved.handle == current.handle
+        )
+        if (
+            not adapter.is_qualified(spec.auth_mode, "sandbox")
+            or current.spec != spec
+            or current.readiness is not ReadinessState.READY
+            or current.models != approved.models
+            or current.route_policy != approved.route_policy
+            or current.exposure_hold != approved.exposure_hold
+            or not same_target
+        ):
+            raise LaunchRefusedError(
+                "launch_approval_drift",
+                f"The approved route for {spec.qualified_name} changed during setup. Start a fresh launch.",
+            )
+    checkpoint()
 
 
 CHROME_DEVTOOLS_MCP_COMMAND: tuple[str, ...] = (

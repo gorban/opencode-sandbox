@@ -261,15 +261,8 @@ class StreamTerminal:
             termios.tcflush(fd, termios.TCIFLUSH)
             self.write(f"{message} [y/N]")
             # TextIO may read ahead into the next approval. Read this line directly.
-            answer = b""
-            while len(answer) < 4:
-                char = os.read(fd, 1)
-                if not char:
-                    return False
-                answer += char
-                if char == b"\n":
-                    return answer.lower() in (b"y\n", b"yes\n") and self.attended()
-            termios.tcflush(fd, termios.TCIFLUSH)
+            answer = self._read_bounded_line(fd, 4)
+            return answer is not None and answer.lower() in (b"y\n", b"yes\n") and self.attended()
         except (OSError, termios.error, ValueError):
             return False
         return False

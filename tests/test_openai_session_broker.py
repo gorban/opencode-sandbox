@@ -2,6 +2,7 @@
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import shlex
@@ -2129,9 +2130,7 @@ class SessionBrokerTests(unittest.TestCase):
         self.assertEqual(slot0_exits, [0])
         self.assertTrue(cleanup_state["clean"])
 
-    def test_gate4_launcher_mini_managed_mode_symlink_config_and_pod_relays(self):
-        repo = Path(__file__).resolve().parents[1]
-        script = repo / "oc-sandbox"
+    def _managed_launcher_fixture(self, script=SOURCE / "oc-sandbox"):
         stub_dir = self.root / "stubs"
         stub_dir.mkdir(mode=0o700)
         podman_log = self.root / "podman.log"
@@ -2142,7 +2141,7 @@ class SessionBrokerTests(unittest.TestCase):
         fake_editor.chmod(0o755)
 
         fake_systemctl = stub_dir / "systemctl"
-        manager_fixture = repo / "tests/bridge-manager-fixture.sh"
+        manager_fixture = SOURCE / "tests/bridge-manager-fixture.sh"
         fake_systemctl.write_text(
             "#!/bin/sh\n" + shlex.join(("/usr/bin/bash", str(manager_fixture))) + ' "$@"\n',
             encoding="utf-8",
@@ -2154,10 +2153,28 @@ class SessionBrokerTests(unittest.TestCase):
             f"""#!/usr/bin/bash
 echo "podman $*" >> "{podman_log}"
 case "$1 $2" in
+  "pod create"|"exec oc-chromium")
+    if [[ -f "$HOME/supervisor-pipes" ]]; then
+      mapfile -t private_pipes < "$HOME/supervisor-pipes"
+      for fd in /proc/$$/fd/*; do
+        target=$(/usr/bin/readlink "$fd") || continue
+        if [[ $target == "${{private_pipes[0]}}" || $target == "${{private_pipes[1]}}" ]]; then
+          echo "Podman inherited a supervisor control descriptor" >&2
+          exit 99
+        fi
+      done
+    fi ;;
+esac
+case "$1 $2" in
   "--version "*) echo "podman version 5.0.0"; exit 0 ;;
   "image inspect")
     if [[ "$*" == *"oc.hash"* ]]; then echo ""; exit 1; fi
-    echo "{('d' * 64)}"; exit 0 ;;
+    case "${{@: -1}}" in
+      oc-agent) echo "{('a' * 64)}" ;;
+      oc-openai-relay) echo "{('b' * 64)}" ;;
+      *) echo "{('d' * 64)}" ;;
+    esac
+    exit 0 ;;
   "build "*) exit 0 ;;
   "volume exists") exit 0 ;;
   "pod exists")
@@ -2165,12 +2182,27 @@ case "$1 $2" in
     if [[ -n "${{STUB_POD_PRESENT:-}}" && "$3" == "oc" ]]; then exit 0; fi
     exit 1 ;;
   "pod inspect")
+    if [[ "$*" == *"{{{{.Id}}}}"* ]]; then
+      if [[ -f "$HOME/pod-replaced" ]]; then echo "{('9' * 64)}"; else echo "{('c' * 64)}"; fi
+      exit 0
+    fi
     if [[ "$*" == *"oc.ports"* ]]; then echo ""; exit 0; fi
     if [[ "$*" == *"PortBindings"* ]]; then echo "{{}}"; exit 0; fi
     if [[ "$*" == *"oc.podcfg"* ]]; then echo "v1|"; exit 0; fi
     if [[ "$*" == *".Containers"* ]]; then printf '%b' "${{STUB_POD_CONTAINERS:-}}"; exit 0; fi
     exit 0 ;;
-  "pod create"|"pod rm"|"pod ls") exit 0 ;;
+  "pod create")
+    if [[ -n "${{STUB_POD_CREATE_RC:-}}" ]]; then exit "$STUB_POD_CREATE_RC"; fi
+    if [[ -f "$HOME/duplicate-admission" ]]; then
+      : > "$HOME/duplicate-ready"
+      for ((i=0; i<100; i++)); do
+        [[ -f "$HOME/duplicate-sent" ]] && break
+        /usr/bin/sleep .02
+      done
+      [[ -f "$HOME/duplicate-sent" ]] || exit 98
+    fi
+    echo "{('c' * 64)}"; exit 0 ;;
+  "pod rm"|"pod ls") exit 0 ;;
   "volume ls"|"secret ls") exit 0 ;;
   "container exists")
     target="${{@: -1}}"
@@ -2193,9 +2225,22 @@ case "$1 $2" in
       if [[ "$target" == "oc-chromium" ]]; then echo "running"; exit 0; fi
       exit 1
     fi
-    if [[ "$*" == *".Image"* && "$target" == "oc-chromium" ]]; then echo "{('d' * 64)}"; exit 0; fi
+    if [[ "$target" == "oc-chromium" ]]; then
+      if [[ "$*" == *"{{{{.Pod}}}}"* ]]; then
+        echo "${{STUB_CHROMIUM_POD:-{('c' * 64)}}}"; exit 0
+      fi
+      if [[ "$*" == *".Image"* ]]; then
+        [[ -z "${{STUB_NEW_BROWSER:-}}" ]] || exit 1
+        echo "{('d' * 64)}"; exit 0
+      fi
+      if [[ "$*" == *"oc.cfg"* && -n "${{STUB_BROWSER_CONFIG:-}}" ]]; then
+        echo "$STUB_BROWSER_CONFIG"; exit 0
+      fi
+    fi
     exit 1 ;;
-  "exec oc-chromium") exit 0 ;;
+  "exec oc-chromium")
+    if [[ -n "${{STUB_REPLACE_POD_AFTER_CHROMIUM_READY:-}}" ]]; then : > "$HOME/pod-replaced"; fi
+    exit 0 ;;
   "run "*) exit 0 ;;
   "create "*) echo "{('e' * 64)}"; exit 0 ;;
   *) exit 0 ;;
@@ -2213,12 +2258,15 @@ esac
             pol_dir = state_dir / "policy"
             pol_dir.mkdir(parents=True, mode=0o700)
             # Pre-seed policy installed digest so pkexec/sudo is never invoked.
-            cil_text = script.read_text(encoding="utf-8")
-            start = cil_text.index("; SELinux type for the sandboxed Chromium container only")
-            end = cil_text.index("\nPOL\n", start)
-            import hashlib
-            pol_hash = hashlib.sha256((cil_text[start:end] + "\n").encode("utf-8")).hexdigest()[:16]
+            source = script.read_text(encoding="utf-8")
+            start = source.index("; SELinux type for the sandboxed Chromium container only")
+            end = source.index("\nPOL\n", start)
+            policy = source[start:end] + "\n"
+            pol_hash = hashlib.sha256(policy.encode()).hexdigest()[:16]
             (pol_dir / "installed").write_text(pol_hash + "\n", encoding="utf-8")
+            start = source.index("# >>>chromium-run\n")
+            end = source.index("# <<<chromium-run\n", start) + len("# <<<chromium-run\n")
+            browser_config = hashlib.sha256((source[start:end] + "headless\n\n" + policy).encode()).hexdigest()[:16]
             env = {
                 "PATH": f"{stub_dir}:/usr/bin:/bin",
                 "HOME": str(h),
@@ -2226,9 +2274,16 @@ esac
                 "OC_CODE_BIN": str(fake_editor),
                 "OC_BCOMPARE_BIN": str(fake_editor),
                 "OPENAI_API_KEY": "sk-test-never-forward",
+                "STUB_BROWSER_CONFIG": browser_config,
+                "TERM": "xterm-256color",
             }
             return h, env
 
+        return _prepare_home, podman_log
+
+    def test_gate4_launcher_mini_managed_mode_symlink_config_and_pod_relays(self):
+        script = SOURCE / "oc-sandbox"
+        _prepare_home, podman_log = self._managed_launcher_fixture()
         # 1. Bare `--mini` with zero provider config/state MUST enter managed mode (no updater, no ambient API key).
         podman_log.write_text("", encoding="utf-8")
         _, env1 = _prepare_home("mini_clean_home")
@@ -2241,7 +2296,7 @@ esac
         log1 = podman_log.read_text(encoding="utf-8")
         self.assertNotIn("OPENAI_API_KEY", log1)
         self.assertNotIn("oc-opencode-update", log1)
-        self.assertIn("oc-openai-relay", log1)
+        self.assertEqual(log1.splitlines(), ["podman --version"])
 
         # 2. Symlinked $HOME/.config/oc-sandbox pointing outside $SB MUST enter managed mode (never silent legacy fallback).
         podman_log.write_text("", encoding="utf-8")
@@ -2256,6 +2311,7 @@ esac
         )
         self.assertEqual(res2.returncode, 2, res2.stderr)
         self.assertIn("attended foreground workstation terminal", res2.stderr)
+        self.assertEqual(podman_log.read_text().splitlines(), ["podman --version"])
 
         # 3. pod_relays / any_relay_running: running `oc-relay-0` blocks `-r -n`, and exact `pod inspect` is used.
         podman_log.write_text("", encoding="utf-8")
@@ -2289,6 +2345,241 @@ esac
             capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(check_rc.returncode, 0, "any_relay_running must fail closed (return 0) on pod exists error")
+
+    def _managed_launcher_with_supervisor_fixture(self):
+        checkout = self.root / "checkout"
+        checkout.mkdir(mode=0o700)
+        for filename in (
+            "oc-sandbox", "oc-setup-lock.py", "oc-bridge.py", "oc-bridge-unit.py",
+            "oc-opencode-update.py", "oc-opencode-run.py",
+        ):
+            shutil.copyfile(SOURCE / filename, checkout / filename)
+        (checkout / "oc-openai-session.py").write_text(
+            """import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+home = Path.home()
+trace = home.parent / "podman.log"
+with os.fdopen(3) as requests:
+    request = json.loads(requests.readline())
+    if request["provider_filter"] == "openai/missing":
+        print("No admitted provider", file=sys.stderr)
+        sys.exit(2)
+
+    assert sys.argv[1:] == ["--admission"]
+    assert "OPENAI_API_KEY" not in os.environ
+    assert "OC_CHROMIUM_MODE" not in os.environ
+    assert sys.stdin.readline().strip() == "operator input"
+    print("operator output", flush=True)
+
+    (home / "supervisor-pipes").write_text(
+        os.readlink("/proc/self/fd/3") + "\\n" + os.readlink("/proc/self/fd/4") + "\\n"
+    )
+    with trace.open("a") as log:
+        print("supervisor ADMITTED", file=log)
+    with os.fdopen(4, "w", buffering=1) as replies:
+        fixture = home / "admission-reply"
+        os.write(replies.fileno(), fixture.read_bytes() if fixture.exists() else b"ADMITTED\\n")
+        if (home / "duplicate-admission").exists():
+            deadline = time.monotonic() + 5
+            while not (home / "duplicate-ready").exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            assert (home / "duplicate-ready").exists()
+            print("ADMITTED", file=replies)
+            (home / "duplicate-sent").touch()
+        frame = requests.readline()
+        if not frame:
+            with trace.open("a") as log:
+                print("supervisor observed owner pipe close", file=log)
+            sys.exit(0)
+        placement = json.loads(frame)
+        (home / "handoff.json").write_text(json.dumps([request, placement]))
+        with (Path(request["lifecycle_dir"]) / "lifecycle.lock").open("rb") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                raise AssertionError("Bash released the lifecycle lock before creation")
+            with trace.open("a") as log:
+                print("supervisor CREATED", file=log)
+            print("CREATED", file=replies)
+            if (home / "keep-creation-pipe-open").exists():
+                assert not requests.readline()
+                sys.exit(0)
+            replies.close()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    time.sleep(.02)
+                else:
+                    sys.exit(57)
+            raise AssertionError("Bash did not release the lifecycle lock after creation")
+""",
+            encoding="utf-8",
+        )
+        script = checkout / "oc-sandbox"
+        prepare_home, podman_log = self._managed_launcher_fixture(script)
+        return script, prepare_home, podman_log
+
+    def test_managed_launcher_refusal_precedes_pod_and_chromium_setup(self):
+        script, prepare_home, podman_log = self._managed_launcher_with_supervisor_fixture()
+        home, env = prepare_home("refused_home")
+        result = subprocess.run(
+            ["bash", str(script), "--provider", "openai/missing"],
+            env={**env, "STUB_NEW_BROWSER": "1"}, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("No admitted provider", result.stderr)
+        trace = podman_log.read_text().splitlines()
+        setup_calls = [line for line in trace if line.startswith(("podman pod create ", "podman run -d "))]
+        self.assertEqual(trace, ["podman --version"], "\n".join(setup_calls))
+        self.assertFalse((home / "opencode-sandbox").exists())
+        self.assertFalse((home / ".local/share/oc-sandbox/lifecycle.lock").exists())
+
+    def test_managed_launcher_admits_before_preparing_and_keeps_launch_context(self):
+        script, prepare_home, podman_log = self._managed_launcher_with_supervisor_fixture()
+        home, env = prepare_home("admitted_home")
+        caller = self.root / "caller"
+        caller.mkdir()
+        result = subprocess.run(
+            ["bash", str(script), "--mini", "--provider", "openai/work", "-C", "explicit/work"],
+            cwd=caller, env={**env, "STUB_NEW_BROWSER": "1"}, input="operator input\n",
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 57, result.stderr)
+        self.assertIn("operator output", result.stdout)
+        trace = podman_log.read_text().splitlines()
+        self.assertEqual(trace[:2], ["podman --version", "supervisor ADMITTED"])
+        self.assertTrue(any(line.startswith("podman pod create --name oc ") for line in trace))
+        chromium = next(line for line in trace if line.startswith("podman run -d --name oc-chromium "))
+        self.assertIn("chromium-browser --headless ", chromium)
+        self.assertEqual(trace[-1], "supervisor CREATED")
+        request, placement = json.loads((home / "handoff.json").read_text())
+        self.assertEqual(request["caller_cwd"], str(caller))
+        self.assertEqual(request["workspace_mode"], "explicit")
+        self.assertEqual(placement["pod_id"], "c" * 64)
+        self.assertEqual(placement["spec"]["sandbox"], str(home / "opencode-sandbox"))
+        self.assertEqual(placement["spec"]["chromium"], "oc-chromium")
+        self.assertEqual(placement["spec"]["agent_image"], "a" * 64)
+        self.assertEqual(placement["spec"]["relay_image"], "b" * 64)
+        for key, value in {
+            "cwd": "explicit/work", "instance": "default",
+            "provider_filter": "openai/work", "cli_ui_mode": "mini",
+        }.items():
+            self.assertEqual(request[key], value)
+            self.assertEqual(placement["spec"][key], value)
+
+    def test_managed_launcher_admission_reuses_matching_chromium(self):
+        script, prepare_home, podman_log = self._managed_launcher_with_supervisor_fixture()
+        _, env = prepare_home("admitted_home")
+        result = subprocess.run(
+            ["bash", str(script), "--provider", "openai/work"],
+            env={**env, "STUB_POD_PRESENT": "1"}, input="operator input\n",
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 57, result.stderr)
+        trace = podman_log.read_text().splitlines()
+        self.assertIn("podman exec oc-chromium curl -sf http://127.0.0.1:9222/json/version", trace)
+        for command in ("podman pod create ", "podman pod rm ", "podman run -d --name oc-chromium ",
+                        "podman rm -f oc-chromium", "podman start oc-chromium"):
+            self.assertFalse(any(line.startswith(command) for line in trace), command)
+
+    def test_managed_launcher_closes_supervisor_channel_on_setup_failure(self):
+        script, prepare_home, podman_log = self._managed_launcher_with_supervisor_fixture()
+        home, env = prepare_home("failed_setup_home")
+        result = subprocess.run(
+            ["bash", str(script), "--provider", "openai/work"],
+            env={**env, "STUB_POD_CREATE_RC": "23"}, input="operator input\n",
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 23, result.stderr)
+        trace = podman_log.read_text().splitlines()
+        self.assertEqual(trace[:2], ["podman --version", "supervisor ADMITTED"])
+        self.assertEqual(trace[-1], "supervisor observed owner pipe close")
+        self.assertFalse((home / "handoff.json").exists())
+
+    def test_managed_launcher_rejects_replaced_pod_after_chromium_readiness(self):
+        script, prepare_home, podman_log = self._managed_launcher_with_supervisor_fixture()
+        home, env = prepare_home("replaced_pod_home")
+        result = subprocess.run(
+            ["bash", str(script), "--provider", "openai/work"],
+            env={**env, "STUB_NEW_BROWSER": "1", "STUB_REPLACE_POD_AFTER_CHROMIUM_READY": "1"},
+            input="operator input\n", capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("prepared pod 'oc' changed during setup", result.stderr)
+        self.assertIn("Chromium ready.", result.stdout)
+        self.assertFalse((home / "handoff.json").exists())
+        self.assertEqual(podman_log.read_text().splitlines()[-1], "supervisor observed owner pipe close")
+
+    def test_managed_launcher_rejects_chromium_in_a_different_pod(self):
+        script, prepare_home, podman_log = self._managed_launcher_with_supervisor_fixture()
+        home, env = prepare_home("unrelated_chromium_home")
+        result = subprocess.run(
+            ["bash", str(script), "--provider", "openai/work"],
+            env={**env, "STUB_POD_PRESENT": "1", "STUB_CHROMIUM_POD": "9" * 64},
+            input="operator input\n", capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Chromium does not belong to the prepared pod 'oc'", result.stderr)
+        self.assertNotIn("podman exec oc-chromium", podman_log.read_text())
+        self.assertFalse((home / "handoff.json").exists())
+
+    def test_managed_launcher_rejects_malformed_admission_acknowledgements(self):
+        script, prepare_home, podman_log = self._managed_launcher_with_supervisor_fixture()
+        for kind, reply in {
+            "unknown": b"REJECTED\n",
+            "nul": b"AD\x00MITTED\n",
+            "duplicate": b"ADMITTED\nADMITTED\n",
+        }.items():
+            with self.subTest(kind=kind):
+                podman_log.write_text("")
+                home, env = prepare_home(f"bad_admission_{kind}")
+                (home / "admission-reply").write_bytes(reply)
+                result = subprocess.run(
+                    ["bash", str(script), "--provider", "openai/work"],
+                    env=env, input="operator input\n", capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("managed provider session did not confirm ADMITTED", result.stderr)
+                self.assertEqual(podman_log.read_text().splitlines(), [
+                    "podman --version", "supervisor ADMITTED", "supervisor observed owner pipe close",
+                ])
+                self.assertFalse((home / "handoff.json").exists())
+
+    def test_managed_launcher_rejects_duplicate_admission_sent_during_setup(self):
+        script, prepare_home, _ = self._managed_launcher_with_supervisor_fixture()
+        home, env = prepare_home("duplicate_admission_home")
+        (home / "duplicate-admission").touch()
+        result = subprocess.run(
+            ["bash", str(script), "--provider", "openai/work"],
+            env={**env, "STUB_NEW_BROWSER": "1"}, input="operator input\n",
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("managed provider sent an unexpected preparation response", result.stderr)
+        self.assertFalse((home / "handoff.json").exists())
+
+    def test_managed_launcher_requires_end_of_stream_after_creation_ack(self):
+        script, prepare_home, _ = self._managed_launcher_with_supervisor_fixture()
+        home, env = prepare_home("unclosed_creation_pipe_home")
+        (home / "keep-creation-pipe-open").touch()
+        result = subprocess.run(
+            ["bash", str(script), "--provider", "openai/work"],
+            env={**env, "STUB_POD_PRESENT": "1"}, input="operator input\n",
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("managed provider session did not confirm CREATED", result.stderr)
+        self.assertTrue((home / "handoff.json").exists())
 
     def test_gate4_r2_swapped_credential_client_id_refused_with_zero_provider_calls(self):
         import pwd
