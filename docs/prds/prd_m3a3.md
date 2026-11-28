@@ -18,14 +18,15 @@ Implementing the skeleton and harness is code, so the
   the project inherits the integration that the Svelte team tests. Every departure from stock is
   listed with its reason.
 - **Add-ons.** Take `eslint`, `prettier`, `vitest` (unit and component usage), `playwright`,
-  `storybook` and `sveltekit-adapter` with the `static` adapter. Storybook is set up by its own
-  pinned initialiser, which is what the add-on runs, for the reason given under
-  [skeleton](#skeleton). Leave out `tailwindcss`
+  `storybook` and `sveltekit-adapter` with the `static` adapter. Storybook joins after the
+  spike has chosen its framework, through its own pinned initialiser
+  ([order of work](#order-of-work)). Leave out `tailwindcss`
   (styling is already decided in [prd_m3a1](prd_m3a1.md#open-decisions)), `drizzle` and
   `better-auth` (server-side), `mdsvex` (it compiles Markdown into components, against the inert
   Markdown rule), `paraglide` (translation is not planned) and `enhanced-img`.
-- **Development add-ons.** Take `ai-tools` and `devtools` as well, set up as the
-  [decision below](#open-decisions) records.
+- **Development add-ons.** Take `ai-tools` for Claude Code, and `devtools` if it qualifies, set
+  up as the [decisions below](#open-decisions) record. How OpenCode agents get the same help is
+  still open there.
 - **Async Svelte, now.** Enable it for its architectural benefits. The style guide says it is
   experimental. Watch for Svelte 6 and remove the flag then. Reconsider only if a critical issue
   appears. If it fails for one specific case, convert that case to conventional code, record the
@@ -36,11 +37,15 @@ Implementing the skeleton and harness is code, so the
   [prd_m3a1](prd_m3a1.md#open-decisions).
 - **The locked design is a UX mockup.** It is the target for look and feel, not an
   implementation guide. Copy its code only where that is the sensible way to match it.
-- **Content Security Policy mechanics are out of scope here.** They are an implementation detail
-  solved as issues arise, and are not expected to limit the architecture. If the mechanism ends
-  up differing from the policy recorded in [prd_m3a](prd_m3a.md) and
-  [prd_m3a1](prd_m3a1.md#platform-and-security-constraints-on-the-design), for example by using
-  nonces, record that change and have it security-reviewed then.
+- **Content Security Policy.** The operator's direction is that the mechanics are an
+  implementation detail, solved as issues arise, and are not expected to limit the
+  architecture. The policy itself is not optional. The foundation's build and tests enforce the
+  one recorded in [prd_m3a](prd_m3a.md) and
+  [prd_m3a1](prd_m3a1.md#platform-and-security-constraints-on-the-design), and the
+  [shared frontend qualification](#shared-frontend-qualification) checks it. A different
+  mechanism, such as nonces, needs something that sets a fresh value on each response, which a
+  static file cannot do. If one is adopted, record the serving layer that does it and have it
+  security-reviewed.
 - **Selectors.** One strategy, role and accessible name, shared by tests, accessibility and the
   [agent bridge markup rules](prd_m3a2.md#markup-rules-for-every-dashboard-view-needed-even-before-the-bridge-ships).
 - **Tests.** A pyramid: full unit coverage on logic, component tests for every state, end-to-end
@@ -48,7 +53,7 @@ Implementing the skeleton and harness is code, so the
 - **Storybook, committed.** Storybook is where components are designed, reviewed and
   component-tested. This is decided, not left to the spike. What is designed and tested there
   must be what is integrated, so the [consistency rules](#stories-match-the-app) below apply.
-  The spike settles which Storybook setup to use, not whether to use it.
+  The spike settles which Storybook framework to use, not whether to use it.
 - **Review.** Every Storybook story is reviewed against the style guide.
 
 ## What the stack offers today (checked 2026-11-28)
@@ -142,8 +147,21 @@ Decided by the operator on 2026-11-28.
 - The shared UI contract lives in `apps/dashboard/src/lib/contract/` and the shared fixture set
   in `apps/dashboard/src/lib/fixtures/` ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)).
   Both are plain data, a JSON Schema and JSON fixtures, so the host side reads the same files.
-- Fixtures are imported only by stories and tests. A lint rule enforces this, so a production
-  route cannot ship a fixture.
+- The typed client lives in `apps/dashboard/src/lib/client/` and belongs to the foundation
+  lane. The contract lane owns the contract and the fixtures. The client is built on them in
+  the join step of the [order of work](#order-of-work).
+- Fixtures reach the app through a development and test path only. Stories and tests import
+  them. The development server and the end-to-end tests get them from a loopback fixture server
+  or from development-only server middleware that reads the same JSON files. No shipped module
+  imports a fixture.
+- The fixture transport is chosen at build time, for development and test builds only. A
+  release build cannot select it and does not contain it.
+- Three things keep fixtures out of a release. A lint rule on imports, which also covers
+  aliases, dynamic imports and glob imports. A check of the built artifacts for fixture data and
+  the fixture transport: the static build in the
+  [shared frontend qualification](#shared-frontend-qualification), and the Tauri release
+  artifacts in [prd_m3b](prd_m3b.md#packaging-and-qualification). And the build-time choice
+  above, checked by trying to select the fixture transport in a release configuration.
 - Tests sit beside the code they test, under the file names the add-ons generate: `*.spec.ts`
   for unit tests, `*.svelte.spec.ts` for component tests and `*.e2e.ts` for end-to-end tests.
   There is no separate test directory.
@@ -157,64 +175,101 @@ Decided by the operator on 2026-11-28.
 
 ### Order of work
 
-The foundation is built in two parts, with the tech-stack spike between them. This is steps 2
-to 4 of [Wave 0](prd_m.md#wave-0-prove-and-decide).
+The foundation is built in three parts, which are steps 2 to 4 of
+[Wave 0](prd_m.md#wave-0-prove-and-decide). Step 5 then joins it to the contract.
 
-1. **Seed.** After the toolchain pins are set, generate the skeleton in the
-   [code home](#code-home) and record the pinned command sequence, the lockfile and the
-   manifest of generated files. This covers the [skeleton](#skeleton) items up to the static
-   adapter, and turning the async flag on.
-2. **Spike.** The [tech-stack spike](prd_m3b.md#tech-stack-spike) runs the same pinned command
-   sequence under `docs/prds/spikes/`, checks its result against the seed's manifest, installs
-   from the seed's lockfile and runs the
-   [shared frontend qualification](#shared-frontend-qualification). It does not edit the seeded
-   skeleton.
-3. **Finish.** Apply the spike's findings to the seeded skeleton: the chosen Storybook setup,
-   the two-engine harness, the rebuilt client and the style guide. The style guide can be
-   drafted during the first two parts. It is finished here.
+1. **Seed the common base.** After the toolchain pins are set, generate the project in the
+   [code home](#code-home) with only what is settled: the template, `eslint`, `prettier`,
+   `vitest`, `playwright`, the static adapter and `ai-tools` for Claude Code. Storybook and
+   `devtools` are not in the base, because the spike has yet to choose a Storybook framework
+   and to qualify `devtools`. The [skeleton](#skeleton) items say how the base is generated,
+   recorded, reviewed and locked.
+2. **Spike.** The [tech-stack spike](prd_m3b.md#tech-stack-spike) works under
+   `docs/prds/spikes/` and never edits the seeded base. It reruns the generation commands and
+   checks the result against the seed's manifest. It then copies the base as committed and
+   builds scratch variants on that copy, each with its own frozen lockfile: one for each
+   Storybook framework, and one with `devtools`. It runs the
+   [shared frontend qualification](#shared-frontend-qualification) on them.
+3. **Finish.** Promote what qualified into the code home: the winning Storybook framework, and
+   each add-on that passed, added with the pinned commands the spike recorded. Review the
+   promoted dependency tree under [prd_f](prd_f.md), resolve once and commit the production
+   lockfile. Rerun the shared frontend qualification's "must pass" checks on the promoted
+   project, because it is not a tree the spike tested. Then add the two-engine harness and
+   finish the style guide, which can be drafted during the first two parts.
+4. **Join.** Build the typed client on the merged contract and fixtures
+   ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)), with the session-generation fence.
+   This needs part 3 and that lane's merge, whichever comes later.
 
-No UI implementation stream, including the [conversion lane](#conversion-lane), starts before
-the third part is done.
+Who may start, and when:
+
+- The contract lane drafts from the start, in its own branch. It does not wait for any spike
+  result. It merges into the code home only after the base is seeded, so the generator runs in
+  an empty directory and the manifest covers generator-owned files only.
+- The [conversion lane](#conversion-lane) starts when part 3 is done. It builds presentational
+  components, which read no data.
+- Every other UI stream starts when part 4 is done.
+- Host and backend streams do not wait for any of this
+  ([prd_m](prd_m.md#wave-1-thin-live-slice)).
+- If the shared frontend qualification fails, UI work stops. Contract and fixture work is plain
+  data and stays valid.
 
 ### Skeleton
 
-- [ ] Generate the project in the [code home](#code-home) with a recorded sequence of commands:
-      `sv create` (the `minimal` template, TypeScript) with the add-ons listed above. Every
-      command in the sequence names its tool at an exact version and gives every answer on the
-      command line. None may resolve `@latest` or a version range, and none may prompt.
-- [ ] **Storybook is initialised by its own pinned command, not through the add-on.** At `sv`
-      1.7.1 the `storybook` add-on takes no version and always runs `create-storybook@latest`,
-      so a second run can produce a different setup. Leave `storybook` out of the `sv create`
-      call. Run the Storybook initialiser directly at an exact version, with the flags the
-      add-on passes, and add the Node types package the add-on adds. Drop this departure when
-      the add-on accepts a version.
+- [ ] **Generate without installing.** Generate the base in the [code home](#code-home) with a
+      recorded sequence of commands: `sv create` (the `minimal` template, TypeScript) with the
+      base add-ons. Every command names its tool at an exact version, gives every answer on the
+      command line, and passes the option that skips installation, which is `--no-install` for
+      `sv create`. None may resolve `@latest` or a version range, none may prompt, and none may
+      install. Installing is always a separate, explicit step.
 - [ ] **`ai-tools` is answered for Claude Code only**: individual tools, the local MCP setup, the
-      instruction file, and no opt-in skill. No other client is selected. In particular the
-      OpenCode client is never selected by the seed or the spike, because selecting it writes a
-      project configuration that loads its plugin
-      ([decision below](#open-decisions)).
-- [ ] **One lockfile.** Commit the lockfile the seed produces. Every later install is a frozen
-      install from it: the seed's own checks, the spike and CI. Nothing resolves versions again.
+      instruction file, and no opt-in skill. No other client is selected. The OpenCode client is
+      never selected, because selecting it writes a project configuration that loads its plugin
+      ([decisions below](#open-decisions)).
+- [ ] **Capture the generator manifest.** Straight after generation and before any edit, record
+      a manifest of the generated files with their hashes, beside the command sequence. It
+      covers generator-owned files only. The spike reruns the commands and compares against it.
+- [ ] **Apply the recorded departures.** Then make the changes the deviation register lists.
+      They include exact version pins in `package.json` and the locally installed MCP package,
+      so the lockfile is produced from the project as it will be committed.
+- [ ] **Review, then lock.** Review the base dependency tree under [prd_f](prd_f.md) before
+      anything is committed. Resolve once and commit the base lockfile. From then on every
+      install of the base is a frozen install: the seed's own checks, the spike's copy and CI.
       Browser binaries come from the locked Playwright version.
-- [ ] **Record what was generated.** Alongside the command sequence, record the resolved
-      versions and a manifest of the generated files with their hashes, taken before any
-      departure from stock is applied. The spike compares its own run against this manifest.
-- [ ] **Check the generated tree for agent configuration.** It holds configuration for Claude
-      Code only. A check fails if the tree contains an OpenCode or Pi project configuration, a
-      Cursor, Gemini or VS Code agent directory or MCP file, or a setting that enables the
-      self-updating Svelte plugin. The check stays in the project, so a later change cannot add
-      one unnoticed.
+- [ ] **Storybook and `devtools` join in the finish step, not in the base.** At `sv` 1.7.1 the
+      `storybook` add-on takes no version and always runs `create-storybook@latest`, so
+      Storybook is initialised by its own command at an exact version, with installation
+      skipped and no prompts, plus the Node types package the add-on adds. The spike runs that
+      command once for each framework, in scratch. The finish step runs it for the winner in
+      the code home. `devtools` is added the same way, and only if it qualified. Drop the direct
+      initialiser when the add-on accepts a version.
+- [ ] **One production lockfile.** The finish step reviews the promoted dependency tree under
+      [prd_f](prd_f.md), resolves once and commits the production lockfile, which replaces the
+      base lockfile. It records a second manifest for the files the promoted commands
+      generated. The spike's scratch lockfiles stay in the spike.
+- [ ] **Check agent configuration against an allowlist.** The check covers committed files at
+      the repository root and in `apps/dashboard/`. It stays in the project, so a later change
+      cannot slip past it.
+  - Allowed in `apps/dashboard/`: `AGENTS.md`, `.claude/CLAUDE.md`, `.claude/skills/`,
+    `.claude/agents/` and `.mcp.json`. Allowed at the root: `AGENTS.md`.
+  - Anything else that configures an agent fails the check in either place. That includes
+    `opencode.json`, `opencode.jsonc`, `.opencode/`, `.pi/`, `.cursor/`, `.gemini/`,
+    `GEMINI.md`, `.vscode/mcp.json`, `.github/agents/`, `.github/skills/`, a root `.mcp.json`,
+    and a Claude setting that enables the self-updating Svelte plugin.
+  - The MCP configuration may start only the reviewed binary installed from the lockfile, named
+    by its path inside the project. The check fails on a package runner such as `npx` or `dlx`,
+    on a package name or version in the command, and on a hosted address.
 - [ ] Keep a deviation register beside the project: every change to a generated file or default,
-      with its reason. A reviewer can ask for any unlisted departure to be removed. Four entries
-      are known in advance: the async flag, a WebKit instance beside the generated
-      Chromium-only component test project, the directly pinned Storybook initialiser, and the
-      pinned MCP package.
+      with its reason. A reviewer can ask for any unlisted departure to be removed. These
+      entries are known in advance: the async flag, server rendering off with the static
+      fallback, a WebKit instance beside the generated Chromium-only component test project,
+      the directly pinned Storybook initialiser, the locally installed MCP package and its
+      command, and the precedence line added to the generated `AGENTS.md`.
 - [ ] Turn server rendering off at the root and use the static adapter with a fallback page, as
       Tauri's guide describes. Check that guide's steps against SvelteKit 3's config location.
-- [ ] Rebuild on the skeleton what the web-ui spike proved: the typed, transport-neutral client
-      and the session-generation fence ([prd_m3a](prd_m3a.md)).
-- [ ] Pin exact versions and review the dependency tree under [prd_f](prd_f.md). Storybook brings
-      the largest addition.
+- [ ] In the join step, rebuild what the web-ui spike proved: the typed, transport-neutral client
+      and the session-generation fence ([prd_m3a](prd_m3a.md)), on the merged contract.
+- [ ] Pin exact versions. The dependency reviews above are under [prd_f](prd_f.md). Storybook
+      brings the largest addition, which is one reason it is reviewed before it is promoted.
 
 ### Async Svelte
 
@@ -347,87 +402,151 @@ The first set of checks in the [tech-stack spike](prd_m3b.md#tech-stack-spike). 
 depends on the shell, and both shells need all of them, so they are a prerequisite for either
 one. They run in Chromium and WebKit as browser engines, not in the packaged app.
 
-If any of these fails, stop and return to the operator. The Tauri checks are not run and no UI
-stream starts. Loopback-first is not a remedy, because a failure here affects loopback as much
-as Tauri ([control-plane decision](prd_m.md#control-plane-decision)).
+Contract, fixture, design and host work continues while these are pending. The checks fall
+into three groups with different outcomes.
 
-- [ ] The seeded skeleton builds as a static, client-rendered app.
-- [ ] Choose the Storybook setup. Storybook's documentation does not mention SvelteKit 3, which
-      dropped the config file, so check both setups the pinned initialiser offers on the pinned
-      SvelteKit 3 and Svelte 5 with the async flag on: "Storybook for SvelteKit" and "Storybook
-      for Svelte & Vite". The rule against SvelteKit modules below routes means the second is enough. Prefer
+### Must pass
+
+If any of these fails, stop UI work and return to the operator. The Tauri checks are not run
+and no UI stream starts. Loopback-first is not a remedy, because a failure here affects loopback
+as much as Tauri ([control-plane decision](prd_m.md#control-plane-decision)).
+
+- [ ] The spike's rerun of the generation commands matches the seed's
+      [generator manifest](#skeleton), and its copy of the base installs frozen from the base
+      lockfile. A difference is reported as a finding. It is not worked around.
+- [ ] The base builds as a static, client-rendered app.
+- [ ] **Content Security Policy.** The built app starts and changes routes under the enforcing
+      policy recorded in [prd_m3a](prd_m3a.md), with `style-src 'self'` and no inline styles, in
+      Chromium and in WebKit, with no violation reported. This includes SvelteKit's route
+      announcer, which the [web-ui spike](spikes/m/web-ui/WALKTHROUGH.md) had to transform.
+      Record any such transform in the deviation register.
+- [ ] **Choose the Storybook framework.** Storybook's documentation does not mention SvelteKit
+      3, which dropped the config file, so compare both frameworks the pinned initialiser
+      offers, on the pinned SvelteKit 3 and Svelte 5 with the async flag on: "Storybook for
+      SvelteKit" and "Storybook for Svelte & Vite". Build one scratch variant for each on a
+      copy of the base. Each is resolved once into its own lockfile and frozen for its tests.
+      The rule against SvelteKit modules below routes means the second is enough. Prefer
       whichever shares the app's Vite configuration with the fewest departures from stock.
-- [ ] Run the stories as tests in Chromium and in WebKit under the chosen setup.
-- [ ] If neither setup works, this qualification has failed. There is no standing fallback.
+- [ ] Run the stories as tests in Chromium and in WebKit under the chosen framework.
+- [ ] If neither framework works, this qualification has failed. There is no standing fallback.
 - [ ] Async Svelte works in a client-rendered static build in both engines. Whether it works
       inside the packaged WebView is a
       [Tauri qualification](prd_m3b.md#tauri-qualification) check.
 - [ ] Coverage can be measured on logic modules at the 100% threshold, and reported for
       components.
-- [ ] Lint rules exist for the banned waits and the selector rule. Record their exact names, or
-      write the rule if none exists.
-- [ ] The dependency tree the add-ons bring passes the [prd_f](prd_f.md) review.
-- [ ] The spike's generated tree matches the seed's [manifest](#skeleton), and its install is a
-      frozen install from the seed's lockfile. A difference is reported as a finding. It is not
-      worked around.
-- [ ] The generated tree holds agent configuration for Claude Code only, by the
-      [check](#skeleton) the skeleton carries.
-- [ ] The pinned local MCP server starts from the committed configuration without fetching
-      anything at run time.
-- [ ] The production build contains no `devtools` code and opens no development endpoint.
-- [ ] `devtools` passes all of these on the development server, with the evidence recorded:
-  - **Fixture data only.** The development server runs on the fixture transport. It has no
-    connection to a real daemon and holds no private state.
-  - **Loopback only.** Record the address and port every `devtools` endpoint listens on,
-    including its diagnostics endpoint, and what each exposes. Each listens on loopback only.
-  - **Not reachable from a sandbox.** None of those ports is one a sandbox publishes or can
-    reach. Show it with a connection attempt from inside a throwaway container, which fails.
-  - **Unauthenticated access is refused.** A client with no token is refused every protected
-    call, including the diagnostics endpoint. Show the refusal.
-  - **Authorization cannot be switched off unnoticed.** No committed file or script turns
-    client authorization off, lists a static token or registers a remote dock, and the checks
-    do not set the environment variable that disables it. A check in the project fails if one
-    appears.
-- [ ] If `devtools` cannot pass those, leave it out of the skeleton and return that part of the
-      [add-ons decision](#open-decisions) to the operator. This does not fail the qualification,
-      because nothing in the product depends on `devtools`.
+- [ ] Lint rules exist for the banned waits, the selector rule and the fixture import rule.
+      Record their exact names, or write the rule if none exists.
+- [ ] The dependency tree of the winning variant passes the [prd_f](prd_f.md) review. The base
+      tree passed it before it was locked.
+- [ ] **Fixtures stay out of the build.** The development server and the end-to-end tests get
+      fixtures through the development and test path only ([code home](#code-home)). The static
+      build output contains no fixture data, no fixture module and no fixture transport. Check
+      it by searching the built files for a marker string that every fixture file carries, and
+      for the transport's module. A release configuration that tries to select the fixture
+      transport fails to build. These checks stay in the project.
+- [ ] Agent configuration passes the [allowlist check](#skeleton) at the repository root and in
+      `apps/dashboard/`.
+- [ ] The MCP server starts from the committed configuration with the network unavailable,
+      which shows it fetches nothing at run time.
+
+### Feeds the UI SDK decision only
+
+- [ ] Mount one [UI SDK](prd_m3a2.md) primitive under the same enforcing policy in Chromium, and
+      check that its styles load without `unsafe-inline` or style attributes. This is the
+      [M3a2 qualification](prd_m3a2.md#qualification) question for Chromium. Its WebKitGTK half
+      is in the [Tauri qualification](prd_m3b.md#tauri-qualification). A failure selects
+      another option in the [UI SDK decision](prd_m3a2.md#open-decision). It does not fail this
+      qualification.
+
+### `devtools`
+
+`devtools` is qualified on its own scratch variant. It joins the project in the finish step
+only if every check below passes, with the evidence recorded. If any fails, `devtools` is not
+added and that part of the [add-ons decision](#open-decisions) returns to the operator. Nothing
+has to be removed, because the project that goes forward is the one qualified without it. This
+outcome does not fail the shared frontend qualification, because nothing in the product depends
+on `devtools`.
+
+- [ ] **Refuses real daemon state.** A development server with `devtools` active runs on the
+      fixture transport only. It refuses to start when pointed at a real `$STATE` or at the real
+      daemon socket, and the Tauri development mode runs with `devtools` off when it is given a
+      real daemon. A negative test points it at each and expects the refusal.
+- [ ] **Loopback only.** The development server's host is pinned to loopback in the committed
+      configuration. Record the address and port of every `devtools` endpoint, HTTP, WebSocket
+      and diagnostics, and what each exposes. Each listens on IPv4 and IPv6 loopback only.
+- [ ] **Refuses unauthorized and cross-origin access.** On every one of those endpoints, a
+      client with no token is refused each protected call, a request with a foreign `Origin` is
+      refused, and a request with a `Host` that is not loopback is refused. The last is the DNS
+      rebinding case.
+- [ ] **Not reachable from a sandbox.** Test from a container started with the network
+      configuration `oc-sandbox` gives a pod. From inside it, try IPv4 loopback, IPv6 loopback,
+      the gateway address and the host alias the container runtime provides. Every attempt
+      fails. Include a positive control: the same probe reaches a listener it is meant to
+      reach, which shows a failure means blocked and not a broken probe.
+- [ ] **Private discovery and token storage.** Any discovery, token or cache file `devtools`
+      writes is readable by the operator's user only, and sits outside the sandbox home and
+      outside every path a sandbox mounts.
+- [ ] **Authorization cannot be switched off unnoticed.** No committed file or script turns
+      client authorization off, lists a static token or registers a remote dock, and the checks
+      do not set the environment variable that disables it. A check in the project fails if one
+      appears.
+- [ ] **Absent everywhere else.** The production build, the preview server the end-to-end tests
+      run against, Storybook and the Tauri release build contain no `devtools` code and open no
+      `devtools` endpoint, including when its environment variables are set. This check stays in
+      the project.
 
 ## Open decisions
 
-- [x] **`ai-tools` and `devtools` add-ons.** Decided by the operator on 2026-11-28: both go
-      in the repository. Both are development aids and do not ship in the product. What each
-      does is recorded [above](#what-the-stack-offers-today-checked-2026-11-28). The options
-      considered were neither, documentation lookup kept outside the repository, `devtools`
-      added later, and both. The setup below was read from the add-ons' source at `sv` 1.7.1.
+- [x] **`ai-tools` for Claude Code, and `devtools`.** Decided by the operator on 2026-11-28:
+      both go in the repository. Both are development aids and do not ship in the product. What
+      each does is recorded [above](#what-the-stack-offers-today-checked-2026-11-28). The
+      options considered were neither, documentation lookup kept outside the repository,
+      `devtools` added later, and both. The setup below was read from the add-ons' source at
+      `sv` 1.7.1.
   - **`ai-tools` for Claude Code, as committed files.** Answer "Individual tools", not the
     Svelte plugin, so the skills, the sub-agent and the MCP configuration are files a reviewer
     can read and nothing updates itself. Skip the opt-in feedback skill, which reports
     corrections to an outside repository.
-  - **MCP server, local.** Choose the local setup, which runs over stdio, so no code goes to the
-    hosted endpoint. The generated configuration fetches an unpinned package each time. Replace
-    that with an exact pinned version reviewed under [prd_f](prd_f.md), and list the change in
-    the deviation register.
+  - **MCP server, local and installed.** Choose the local setup, which runs over stdio, so no
+    code goes to the hosted endpoint. The generated configuration starts the server through a
+    package runner, which fetches it. Replace that: add the package as a development dependency
+    at an exact version, reviewed under [prd_f](prd_f.md) and held in the lockfile, and make the
+    configuration start that installed binary by its path. A pinned version passed to a package
+    runner is not enough, because a runner still fetches when its cache is cold.
   - **Instruction file.** The add-on writes `apps/dashboard/AGENTS.md`. It covers the frontend
     only. The root [`AGENTS.md`](../../AGENTS.md) stays as it is and wins where the two differ.
     Add a line to the generated file saying so, and pointing to the style guide.
-  - **`ai-tools` for OpenCode.** OpenCode has no committed-files mode. The add-on writes a
-    project configuration that loads the `@sveltejs/opencode` plugin. A sandboxed OpenCode agent
-    working in this repository would then load an npm plugin that the repository names. Pin it
-    to an exact version, and get it reviewed by the owners of the sandbox configuration and
-    OpenCode runtime ([prd_l](prd_l.md), [prd_b](prd_b.md)) before it is committed. Seeding
-    does not wait for that review. The OpenCode part lands as its own change after it. Until
-    then the seed and the spike do not select the OpenCode client, and the
-    [tree check](#skeleton) fails if its configuration appears. That change updates the check.
   - **`devtools`.** Take the add-on's default plugins. It configures itself for the development
-    server only, with client authorization on. It stays in the skeleton only if it passes the
-    development-time checks in the
-    [shared frontend qualification](#shared-frontend-qualification): fixture data only,
-    loopback only, unreachable from a sandbox, and unauthenticated access refused. The
-    production build must contain none of it.
+    server only, with client authorization on. It joins the project only if it passes every
+    check under [`devtools`](#devtools) in the shared frontend qualification.
   - **The style guide wins.** One of the bundled best-practice notes is already wrong for
     SvelteKit 3: it places the async flag in a config file SvelteKit 3 rejects. Where a bundled
     note and the style guide differ, the style guide applies. Record each such difference in
     the style guide's tooling area.
+- [ ] (decision needed) **How OpenCode agents get the Svelte tooling.** The operator asked on
+      2026-11-28 for OpenCode agents to have it too. How is open, and it is for the owners of
+      the OpenCode runtime ([prd_b](prd_b.md)) and the sandbox configuration
+      ([prd_l](prd_l.md)) to review before anything is committed. Until this closes, no
+      OpenCode configuration is committed and the [allowlist check](#skeleton) enforces that.
+      Time estimates are rough.
+  - Fixed, whichever option is chosen: the managed-tier workspace lockout in
+    [prd_l](prd_l.md) stays. A managed OpenCode ignores a workspace `opencode.json` and
+    `.opencode/` plugins, so a repository cannot change broker routing, MCP permissions or
+    persona rules. Nothing here may weaken that.
+  - The review also covers what a sandboxed OpenCode agent picks up by itself from committed
+    files: `apps/dashboard/AGENTS.md`, and `.claude/skills/` on versions that read it.
+  - **A host-trusted bundle (recommended).** Deliver the tooling as a pinned, reviewed bundle
+    through the sandbox configuration, not through the repository. It works in the managed tier
+    and leaves the lockout untouched. It needs the bundle built and reviewed by those owners.
+    ~1–2 days.
+  - **Instruction files only.** OpenCode agents read the committed instruction file and get no
+    plugin and no documentation lookup. Nothing loads and nothing is fetched. SvelteKit 3 and
+    async Svelte are newer than most models know, so agents work from the style guide alone.
+    ~0 days.
+  - **A repository plugin configuration.** What the add-on generates: a project file that loads
+    `@sveltejs/opencode`. A managed OpenCode ignores it by design, so it would help only an
+    unmanaged run, and it puts an npm plugin named by the repository in front of any OpenCode
+    that does read workspace configuration. Not recommended. ~0.5 day plus review.
 
 Rough estimates for the foundation itself: the skeleton and two-engine harness, 2 to 3 days;
 the first style guide, 1 to 2 days. The conversion lane's size depends on the mockup and is not

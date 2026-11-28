@@ -218,7 +218,12 @@ and components stay as they are. This is a Wave 0 item in the
       field-level differences, security triggers, and for workflows the diagram before and after
       ([M3 §7](prd_m3.md#7-settings-proposed-changes-and-operator-only-secret-entry)).
 - [ ] **Settings.** Effective values with their source, provider instances and their state, and
-      the form editor for non-secret settings.
+      the form editor for non-secret settings, if the
+      [configuration editing decision](prd_j.md#later-configuration-and-editor) chooses it.
+- [ ] **Browser view.** The observe-only view of a sandbox's browser: the confined frame, the
+      sanitised address, and the connection badge while internal HTTPS is not in place
+      ([M3 §5](prd_m3.md#5-unified-embedded-sandbox-browser-views-opt-in-zero-separate-chrome-windows)).
+      It is a Wave 2 gate in the [delivery order](prd_m.md#wave-2-widen).
 - [ ] **Secret entry.** The operator-only surface for entering a secret, with the slot it fills,
       who asked, and the set or not-set state afterwards. It uses the security frame and is
       hidden from the agent bridge.
@@ -234,9 +239,9 @@ and components stay as they are. This is a Wave 0 item in the
     attempts where the design is least settled. Every attempt extends the locked system and may
     not change its tokens, trust vocabulary, tiers or components, which guards against drift.
     These three screens are the ones Wave 1 needs, so this round runs first. ~4–6 days.
-  - **Change review, settings and secret entry: one design extending the locked system**, with
-    operator review and an audit. Their layout mostly follows from existing components. They
-    are needed in Waves 2 and 3. ~2–3 days.
+  - **Change review, settings, secret entry and the browser view: one design extending the
+    locked system**, with operator review and an audit. Their layout mostly follows from
+    existing components. They are needed in Waves 2 and 3. ~2–4 days.
   - Considered and not chosen: one design for every screen, a council round for every screen,
     and designing the screens directly as Storybook stories.
 

@@ -441,9 +441,12 @@ The pieces exist in other PRDs. This section joins them into one dashboard flow.
   whether it is set, never the value. The surface is outside the agent bridge's registry and
   marked `data-agent-hidden` ([prd_m3a2](prd_m3a2.md)). It is never opened by an agent action
   alone: the operator opens it from a host-rendered request.
-- **Form editor.** Non-secret settings are edited through a form generated from the declared
-  setting schema, so the operator never escapes values for TOML, JSON or an environment file by
-  hand. The form writes through the same validated store as the CLI and the config tools
+- **Form editor.** This applies if the
+  [configuration editing decision](prd_j.md#later-configuration-and-editor), which is still
+  open, chooses the dashboard form. Non-secret settings are edited through a form generated
+  from the declared setting schema, so the operator never escapes values for TOML, JSON or an
+  environment file by hand. The form writes through the same validated store as the CLI and
+  the config tools
   ([prd_j](prd_j.md#later-configuration-and-editor), [prd_l](prd_l.md)). Editing the file
   directly stays supported.
 - **Read-only settings view first.** Show the effective value and source of each setting, and
@@ -646,8 +649,9 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
 - [ ] **Gap M3.1 — `oc_daemon.py` & `$STATE/registry.sqlite` projection (`oc_daemon.py`):** evolve
       `OperatorControlServer` into SQLite Command/Event/Projection + Outbox under `$STATE`,
       auto-importing host-trusted `$STATE/worktrees/<NAME>` via `O_NOFOLLOW` (zero host `git` in
-      `~/opencode-sandbox`), with full 5-tuple write-ahead provenance receipts and bootstrap-code +
-      cookie + CSRF + single-use WS-ticket auth.
+      `~/opencode-sandbox`), with full 5-tuple write-ahead provenance receipts. Bootstrap-code +
+      cookie + CSRF + single-use WS-ticket auth is part of this gap only where loopback carries
+      real authority, which the [control-plane decision](prd_m.md#control-plane-decision) sets.
 - [ ] **Gap M3.2 — frontend in the shell the
       [control-plane decision](prd_m.md#control-plane-decision) selects ([M3b Tauri shell](prd_m3b.md),
       or [M3a loopback frontend](prd_m3a.md) first):** implement
@@ -681,20 +685,26 @@ function handle_agent_cdp_arbiter_command(job_lease, sandbox, cdp_req):
       authorization in `oc_daemon` / `oc_controller` / Tauri Rust IPC. Current UI SDK
       capabilities, limits and markup rules: [prd_m3a2](prd_m3a2.md).
 - [ ] **Gap M3.6 — Shared UI contract and one fixture set:** define one versioned, typed contract
-      between the dashboard and `oc_daemon` for projection reads, events and commands, with a
-      transport-neutral client (native bridge in the app, fixture transport in tests). Shape the
-      client as awaitable queries, commands and a live event stream
-      ([prd_m3a3](prd_m3a3.md#async-svelte)). Merge the
+      between the dashboard and `oc_daemon` for projection reads, events and commands, for a
+      transport-neutral client with three transports: the native bridge in the Tauri app, the
+      authenticated loopback transport where loopback carries real authority, and the fixture
+      transport in development and tests. Shape the client as awaitable queries, commands and a
+      live event stream ([prd_m3a3](prd_m3a3.md#async-svelte)). This gap's lane owns the
+      contract and the fixtures. The client itself is built on them by the foundation lane in
+      step 5 of [Wave 0](prd_m.md#wave-0-prove-and-decide). Merge the
       two existing fixtures ([design brief](spikes/m/dashboard-design/brief/fixtures/workspace.json)
       and [web-ui](spikes/m/web-ui/fixtures/workspace.mjs)) into one synthetic set that also
       holds a crew pipeline run, its lease approval and its human gate
       ([prd_n](prd_n.md#delivery-order)). Keep the hostile strings. The contract and the fixture
-      set live inside the frontend project, as plain data the host side also reads
+      set live inside the frontend project, as plain data the host side also reads. Fixtures
+      and the fixture transport never reach a release build
       ([prd_m3a3](prd_m3a3.md#code-home)). This is a Wave 0 blocker in
       the [delivery order](prd_m.md#delivery-order).
 - [ ] **Gap M3.7 — Settings, change review and operator-only secret entry:** implement
       [§7](#7-settings-proposed-changes-and-operator-only-secret-entry) in three steps: the
       read-only settings view and change review (Wave 2), then secret entry and the form editor
-      (Wave 3). Screens come from the [design supplement](prd_m3a1.md#design-supplement).
+      (Wave 3). The form editor is built only if the
+      [configuration editing decision](prd_j.md#later-configuration-and-editor) chooses it.
+      Screens come from the [design supplement](prd_m3a1.md#design-supplement).
 
 The order these gaps are delivered in is in [prd_m](prd_m.md#delivery-order).

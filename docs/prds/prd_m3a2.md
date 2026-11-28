@@ -1,6 +1,7 @@
 # prd_m3a2: UI SDK agent bridge and agent-readable dashboard markup
 
-Parent: [prd_m3a](prd_m3a.md) · sibling: [prd_m3a1 dashboard design](prd_m3a1.md) ·
+Parent: [prd_m3a](prd_m3a.md) · siblings: [prd_m3a1 dashboard design](prd_m3a1.md),
+[prd_m3a3 frontend foundation](prd_m3a3.md) ·
 detail for: [Gap M3.5](prd_m3.md#concrete-gaps-and-checkboxes) ·
 packaged by: [prd_m3b](prd_m3b.md)
 
@@ -181,10 +182,13 @@ Sources: [UI SDK docs](https://ui-sdk.dev), [agent reference](https://ui-sdk.dev
 
 ## Open decision
 
-The [tech-stack spike](prd_m3b.md#tech-stack-spike) answers the CSP question for WebKitGTK and
-feeds this decision. It is a Wave 0 blocker in the [delivery order](prd_m.md#delivery-order),
-because every view builds on the chosen primitive layer. The primitives tier and the selector
-rule it must satisfy are in the [style guide requirements](prd_m3a3.md#style-guide).
+The [tech-stack spike](prd_m3b.md#tech-stack-spike) answers the CSP question for both engines
+and feeds this decision: Chromium in the
+[shared frontend qualification](prd_m3a3.md#feeds-the-ui-sdk-decision-only) and WebKitGTK in the
+[Tauri qualification](prd_m3b.md#tauri-qualification). It is a Wave 0 blocker in the
+[delivery order](prd_m.md#delivery-order), because every view builds on the chosen primitive
+layer. The primitives tier and the selector rule it must satisfy are in the
+[style guide requirements](prd_m3a3.md#style-guide).
 
 - [ ] (decision needed) **How much of the dashboard is built on UI SDK primitives.**
   - **UI SDK primitives for interactive controls, behind a thin local adapter (recommended,

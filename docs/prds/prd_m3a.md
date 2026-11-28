@@ -23,11 +23,13 @@ qualification and the cookie port-sharing item below wait until loopback is aske
 authority again. Delivery order: [prd_m](prd_m.md#delivery-order).
 
 Ship the first dashboard as a SvelteKit static single-page application. Use the static adapter for
-build output and client-side rendering for live routes. The host daemon serves static assets and
-the authenticated API on one loopback origin. Node is build tooling. The packaged app has no
-SvelteKit server, server routes, server actions or runtime SSR. Load live state through a typed
-client whose web implementation uses the daemon's existing authority boundaries. Route fallbacks
-serve the dashboard only for UI paths. API and event paths have explicit handlers.
+build output and client-side rendering for live routes. Where loopback carries real authority,
+which the [control-plane decision](prd_m.md#control-plane-decision) sets, the host daemon serves
+static assets and the authenticated API on one loopback origin. Node is build tooling. The
+packaged app has no SvelteKit server, server routes, server actions or runtime SSR. Load live
+state through a typed client whose web implementation uses the daemon's existing authority
+boundaries. Route fallbacks serve the dashboard only for UI paths. API and event paths have
+explicit handlers.
 
 - [ ] Build the read-only `Project → Sandbox → Thread` view against synthetic projection data
       first. Show bounded status, mailbox and provenance entries. Render agent-supplied text as
