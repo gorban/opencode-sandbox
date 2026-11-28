@@ -58,6 +58,14 @@ configuration and policy. One provider can reach this milestone while the others
    fixed `Reply with exactly: ok` prompt. Verify exact `ok`, route attribution, zero tool calls,
    and zero requests through other admitted instances. Document which frontends actually passed.
 
+### Named provider sets
+
+- [x] Validate named subscription sets in the offline [config parser](../../oc_providers/config.py).
+  The parser checks model membership against the exact chosen provider instance and produces
+  distinct canonical declaration and exact config-byte digests. See `codex/named-provider-set-schema`.
+- [ ] Wire the tested schema into the trusted production config reader and pre-admission checks
+  together. A selected set that cannot launch must refuse before provider discovery or resources.
+
 ### First inference and model switches
 
 - For a fixed live proof, the operator approves one exact instance, upstream model ID, placement

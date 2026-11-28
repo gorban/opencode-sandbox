@@ -1,6 +1,8 @@
 """Trusted operator TOML configuration loader for ~/.config/oc-sandbox/providers.toml."""
 
 from dataclasses import dataclass
+from hashlib import sha256
+import json
 import os
 from pathlib import Path
 import pwd
@@ -20,10 +22,13 @@ from .contracts import (
 
 CONFIG_FILENAME = "providers.toml"
 MAX_CONFIG_BYTES = 64 * 1024
+MAX_PROFILE_SETS = 16
+MAX_PROFILE_SET_MODELS_PER_MEMBER = 64
 
 _TOP_LEVEL_KEYS = frozenset({"provider_defaults", "providers", "launch"})
 _INSTANCE_KEYS = frozenset({"enabled", "auth_mode", "credential_ref", "cli_path", "default_model"})
 _LAUNCH_KEYS = frozenset({"default_provider", "default_model", "mini"})
+_PROFILE_SET_KEYS = frozenset({"default_provider", "default_model", "members"})
 _CRED_REF_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z", re.ASCII)
 _SECRET_PREFIXES = (
     "sk-", "sk_", "pk-", "pk_", "ghp_", "github_pat_", "xox", "aiza", "eyj", "akia", "asia",
@@ -58,6 +63,53 @@ class ProviderConfig:
             if item.kind == kind and item.label == label:
                 return item
         return None
+
+
+@dataclass(frozen=True)
+class ProfileSetMember:
+    """Declared model allowlist and separate operator-enabled metadata."""
+
+    provider: tuple[ProviderId, str]
+    models: tuple[str, ...]
+    enabled: bool
+
+    @property
+    def qualified_name(self) -> str:
+        kind, label = self.provider
+        return f"{kind}/{label}"
+
+
+@dataclass(frozen=True)
+class ProfileSet:
+    """A validated declaration over locally configured subscription instances."""
+
+    name: str
+    default_provider: tuple[ProviderId, str]
+    default_model: str
+    members: tuple[ProfileSetMember, ...]
+
+    def canonical_bytes(self) -> bytes:
+        """Serialize only the declared delegation, independent of TOML layout."""
+        kind, label = self.default_provider
+        declaration = {
+            "default_provider": f"{kind}/{label}",
+            "default_model": self.default_model,
+            "members": {member.qualified_name: member.models for member in self.members},
+        }
+        return json.dumps(declaration, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+    @property
+    def declaration_digest(self) -> str:
+        return sha256(b"oc-sandbox:profile-set:v1\0" + self.canonical_bytes()).hexdigest()
+
+
+@dataclass(frozen=True)
+class ProfileSetConfig:
+    """Pure named declaration projection and separate exact TOML digest."""
+
+    selected: ProfileSet | None
+    sets: tuple[ProfileSet, ...]
+    config_digest: str
 
 
 def _account_home() -> Path:
@@ -290,19 +342,28 @@ def _parse_provider_defaults(
     return defaults
 
 
+def _parse_provider_reference(raw_value: object, field: str) -> tuple[ProviderId, str]:
+    if type(raw_value) is not str or raw_value.count("/") != 1:
+        raise ProviderConfigError(_ERR_INVALID, f"{field} must be 'kind/label'")
+    kind, label = raw_value.split("/", 1)
+    if kind not in PROVIDER_DESCRIPTORS or not is_valid_instance_label(label):
+        raise ProviderConfigError(
+            _ERR_INVALID, f"{field} must reference a declared provider instance"
+        )
+    return PROVIDER_DESCRIPTORS[kind].kind, label
+
+
 def _parse_default_provider(
     raw_value: object, known: set[tuple[str, str]]
 ) -> tuple[ProviderId, str] | None:
     if raw_value is None:
         return None
-    if type(raw_value) is not str or raw_value.count("/") != 1:
-        raise ProviderConfigError(_ERR_INVALID, "[launch].default_provider must be 'kind/label'")
-    kind, label = raw_value.split("/", 1)
-    if kind not in PROVIDER_DESCRIPTORS or not is_valid_instance_label(label) or (kind, label) not in known:
+    provider = _parse_provider_reference(raw_value, "[launch].default_provider")
+    if provider not in known:
         raise ProviderConfigError(
             _ERR_INVALID, "[launch].default_provider must reference a declared provider instance"
         )
-    return (kind, label)  # type: ignore[return-value]
+    return provider
 
 
 def _parse_launch_defaults(raw_launch: object, known: set[tuple[str, str]]) -> LaunchDefaults:
@@ -323,11 +384,17 @@ def _parse_launch_defaults(raw_launch: object, known: set[tuple[str, str]]) -> L
     return LaunchDefaults(default_provider=default_provider, default_model=default_model, mini=mini)
 
 
-def _parse_provider_config_bytes(raw: bytes, *, sandbox: Path) -> ProviderConfig:
+def _decode_provider_config_bytes(raw: bytes) -> dict:
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ProviderConfigError(_ERR_INVALID, "providers.toml exceeds size limit")
     try:
-        parsed = tomllib.loads(raw.decode("utf-8"))
+        return tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError):
         raise ProviderConfigError(_ERR_INVALID, "malformed providers.toml") from None
+
+
+def _parse_provider_config_bytes(raw: bytes, *, sandbox: Path) -> ProviderConfig:
+    parsed = _decode_provider_config_bytes(raw)
     if type(parsed) is not dict or not set(parsed) <= _TOP_LEVEL_KEYS:
         raise ProviderConfigError(_ERR_INVALID, "unexpected top-level section in providers.toml")
     instances = _parse_providers(parsed.get("providers"), sandbox=sandbox)
@@ -339,9 +406,101 @@ def _parse_provider_config_bytes(raw: bytes, *, sandbox: Path) -> ProviderConfig
 
 def hash_providers_config_bytes(raw: bytes) -> str:
     """Return the canonical domain-separated SHA-256 digest of trusted providers.toml bytes."""
-    from hashlib import sha256
-
     return sha256(b"PRESENT\0" + raw).hexdigest()
+
+
+def _parse_profile_set_models(raw_models: object) -> tuple[str, ...]:
+    if type(raw_models) is not list or not 1 <= len(raw_models) <= MAX_PROFILE_SET_MODELS_PER_MEMBER:
+        raise ProviderConfigError(
+            _ERR_INVALID, f"profile set member requires 1 to {MAX_PROFILE_SET_MODELS_PER_MEMBER} models"
+        )
+    if not all(is_valid_model_slug(model) for model in raw_models):
+        raise ProviderConfigError(_ERR_INVALID, "invalid profile set member model ID")
+    if len(set(raw_models)) != len(raw_models):
+        raise ProviderConfigError(_ERR_INVALID, "duplicate profile set member model ID")
+    return tuple(sorted(raw_models))
+
+
+def _parse_profile_set_member(
+    raw_provider: str, raw_models: object, instances: dict[tuple[ProviderId, str], ProviderInstanceSpec]
+) -> ProfileSetMember:
+    provider = _parse_provider_reference(raw_provider, "profile set member")
+    instance = instances.get(provider)
+    if instance is None:
+        raise ProviderConfigError("unknown_profile_set_member", "profile set member is an undeclared provider instance")
+    if instance.auth_mode != "subscription":
+        raise ProviderConfigError(_ERR_INVALID, "profile set member must use subscription auth_mode")
+    return ProfileSetMember(provider, _parse_profile_set_models(raw_models), instance.enabled)
+
+
+def _parse_profile_set(
+    name: str, table: object, instances: dict[tuple[ProviderId, str], ProviderInstanceSpec]
+) -> ProfileSet:
+    if not is_valid_instance_label(name) or type(table) is not dict or set(table) != _PROFILE_SET_KEYS:
+        raise ProviderConfigError(_ERR_INVALID, "invalid name or fields in profile set")
+    raw_members = table["members"]
+    if type(raw_members) is not dict or not 1 <= len(raw_members) <= MAX_PROVIDER_SLOTS:
+        raise ProviderConfigError(_ERR_INVALID, f"profile set requires 1 to {MAX_PROVIDER_SLOTS} members")
+    members = tuple(
+        _parse_profile_set_member(raw_provider, models, instances)
+        for raw_provider, models in sorted(raw_members.items())
+    )
+    default_provider = _parse_provider_reference(table["default_provider"], "profile set default_provider")
+    default_model = table["default_model"]
+    if not is_valid_model_slug(default_model):
+        raise ProviderConfigError(_ERR_INVALID, "invalid profile set default_model")
+    allowed_models = {member.provider: member.models for member in members}
+    if default_model not in allowed_models.get(default_provider, ()):
+        raise ProviderConfigError(_ERR_INVALID, "profile set default must be a declared member and its allowed model")
+    return ProfileSet(name, default_provider, default_model, members)
+
+
+def _parse_profile_set_launch(raw_launch: object, known: set[tuple[str, str]]) -> str | None:
+    if raw_launch is None:
+        return None
+    if type(raw_launch) is not dict:
+        raise ProviderConfigError(_ERR_INVALID, "invalid fields in [launch]")
+    launch = dict(raw_launch)
+    selector = launch.pop("profile_set", None)
+    if selector is not None:
+        if not is_valid_instance_label(selector):
+            raise ProviderConfigError(_ERR_INVALID, "invalid [launch].profile_set")
+        if "default_provider" in launch or "default_model" in launch:
+            raise ProviderConfigError(_ERR_INVALID, "[launch].profile_set conflicts with launch defaults")
+    _parse_launch_defaults(launch, known)
+    return selector
+
+
+def parse_profile_set_config(
+    raw: bytes, *, expected_instances: tuple[ProviderInstanceSpec, ...]
+) -> ProfileSetConfig:
+    """Project profile sets from bytes and provider instances validated by the caller.
+
+    The caller must supply instances from the same configuration snapshot. This
+    helper does not read or trust a file, parse provider instance tables, or
+    determine deployment readiness.
+    """
+    try:
+        parsed = _decode_provider_config_bytes(raw)
+    except (RecursionError, ValueError):
+        raise ProviderConfigError(_ERR_INVALID, "malformed providers.toml") from None
+    if not set(parsed) <= _TOP_LEVEL_KEYS | {"profile_sets"}:
+        raise ProviderConfigError(_ERR_INVALID, "unexpected top-level section in providers.toml")
+    instances = {(item.kind, item.label): item for item in expected_instances}
+    known = set(instances)
+    _parse_provider_defaults(parsed.get("provider_defaults"), known)
+    selector = _parse_profile_set_launch(parsed.get("launch"), known)
+    raw_sets = parsed.get("profile_sets", {})
+    if type(raw_sets) is not dict or len(raw_sets) > MAX_PROFILE_SETS:
+        raise ProviderConfigError(_ERR_INVALID, f"[profile_sets] must be a table with at most {MAX_PROFILE_SETS} sets")
+    sets = {
+        name: _parse_profile_set(name, table, instances)
+        for name, table in sorted(raw_sets.items())
+    }
+    selected = sets.get(selector) if selector is not None else None
+    if selector is not None and selected is None:
+        raise ProviderConfigError(_ERR_INVALID, "[launch].profile_set must reference a declared profile set")
+    return ProfileSetConfig(selected, tuple(sets.values()), hash_providers_config_bytes(raw))
 
 
 def load_provider_config_with_digest(
