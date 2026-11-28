@@ -79,6 +79,17 @@ def _over_budget(claim, usage):
     return usage.input_tokens > claim.max_input or usage.output_tokens > claim.max_output
 
 
+def _validate_entry_usage(claim, record, *, is_last):
+    if record is None:
+        if not is_last:
+            raise ValueError
+        return
+    usage = VerifiedUsage(**record)
+    if (not _valid_usage(usage) or usage.operation != claim.operation
+            or (_over_budget(claim, usage) and not is_last)):
+        raise ValueError
+
+
 class ScopedExposure:
     """Offline primitive for one scope and a host-attested compatible writer cohort."""
 
@@ -139,15 +150,7 @@ class ScopedExposure:
                     raise ValueError
                 slots.add(slot)
                 operations.add(claim.operation)
-                is_last = index == len(entries) - 1
-                if entry["usage"] is None:
-                    if not is_last:
-                        raise ValueError
-                    continue
-                usage = VerifiedUsage(**entry["usage"])
-                if (not _valid_usage(usage) or usage.operation != claim.operation
-                        or (_over_budget(claim, usage) and not is_last)):
-                    raise ValueError
+                _validate_entry_usage(claim, entry["usage"], is_last=index == len(entries) - 1)
         except (TypeError, ValueError):
             raise ExposureError("invalid_shared_exposure") from None
 

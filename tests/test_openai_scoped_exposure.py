@@ -144,11 +144,13 @@ class ScopedExposureTest(unittest.TestCase):
     def test_cancel_before_claim_has_no_effect_after_claim_keeps_scope_blocked(self):
         self.scope.activate()
         write = Mock()
+        cancel_before_claim = Mock(side_effect=RuntimeError("cancel"))
         with self.assertRaisesRegex(RuntimeError, "cancel"):
-            self.first(check=Mock(side_effect=RuntimeError("cancel")), write=write)
+            self.first(check=cancel_before_claim, write=write)
         self.assertEqual(self.journal()["claims"], [])
+        cancel_after_claim = Mock(side_effect=[None, RuntimeError("cancel")])
         with self.assertRaisesRegex(RuntimeError, "cancel"):
-            self.first(check=Mock(side_effect=[None, RuntimeError("cancel")]), write=write)
+            self.first(check=cancel_after_claim, write=write)
         self.assertIsNone(self.journal()["claims"][0]["usage"])
         with self.assertRaisesRegex(ExposureError, "unsettled_exposure"):
             self.first(OTHER, write=write)
