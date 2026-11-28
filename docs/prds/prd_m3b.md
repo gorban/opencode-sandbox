@@ -21,9 +21,12 @@ A throwaway probe under `docs/prds/spikes/`, following the spike rules in
 It runs as step 3 of [Wave 0](prd_m.md#wave-0-prove-and-decide), after the code home and pins
 are decided and the skeleton is seeded. It has two sets of checks with different consequences.
 
-- [ ] Generate the probe's skeleton from the command recorded when the skeleton was seeded
-      ([prd_m3a3](prd_m3a3.md#skeleton)), with async Svelte on. The probe never edits the seeded
-      skeleton. Its findings are applied there afterwards, in step 4.
+- [ ] Generate the probe's skeleton by running the pinned command sequence recorded when the
+      skeleton was seeded ([prd_m3a3](prd_m3a3.md#skeleton)), with async Svelte on. Check the
+      result against the seed's manifest and install from the seed's lockfile, so the probe
+      tests the same Storybook setup and the same dependency versions as the seed. The OpenCode
+      client is not selected. The probe never edits the seeded skeleton. Its findings are
+      applied there afterwards, in step 4.
 - [ ] Run the [shared frontend qualification](prd_m3a3.md#shared-frontend-qualification) first.
       It does not depend on the shell, and both shells need it. If it fails, stop and return to
       the operator. Do not run the Tauri checks, and do not fall back to loopback.

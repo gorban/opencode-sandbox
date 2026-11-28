@@ -18,7 +18,9 @@ Implementing the skeleton and harness is code, so the
   the project inherits the integration that the Svelte team tests. Every departure from stock is
   listed with its reason.
 - **Add-ons.** Take `eslint`, `prettier`, `vitest` (unit and component usage), `playwright`,
-  `storybook` and `sveltekit-adapter` with the `static` adapter. Leave out `tailwindcss`
+  `storybook` and `sveltekit-adapter` with the `static` adapter. Storybook is set up by its own
+  pinned initialiser, which is what the add-on runs, for the reason given under
+  [skeleton](#skeleton). Leave out `tailwindcss`
   (styling is already decided in [prd_m3a1](prd_m3a1.md#open-decisions)), `drizzle` and
   `better-auth` (server-side), `mdsvex` (it compiles Markdown into components, against the inert
   Markdown rule), `paraglide` (translation is not planned) and `enhanced-img`.
@@ -78,8 +80,11 @@ Re-verify at Gate 1.
   `vite.config.ts`: `*.svelte.spec.ts` in a real browser, Chromium only, and other `*.spec.ts`
   in Node. `playwright` adds `playwright.config.ts`, which matches `*.e2e.ts` anywhere and runs
   against the built preview. `sveltekit-adapter` sets the adapter in `vite.config.ts`.
-  `storybook` runs `create-storybook@latest`, and what that writes is not in the CLI's
-  snapshots. [sveltejs/cli](https://github.com/sveltejs/cli)
+  `storybook` runs `create-storybook@latest` with no way to name a version, and what that
+  writes is not in the CLI's snapshots. `ai-tools` asks which clients to configure. For
+  OpenCode it writes `.opencode/opencode.json`, which loads the `@sveltejs/opencode` plugin. Its
+  local MCP setup writes a command that fetches `@sveltejs/mcp` without a version.
+  [sveltejs/cli](https://github.com/sveltejs/cli)
 - **Tauri.** Its SvelteKit guide requires `adapter-static`, recommends SPA mode with server
   rendering off, and says "Tauri doesn't support server-based solutions". The guide was written
   for SvelteKit 2 and its older config file.
@@ -105,6 +110,14 @@ Re-verify at Gate 1.
   with component, reactivity, routing and performance inspection, and "an MCP endpoint for
   development-time Svelte diagnostics". The page does not say where that endpoint listens or
   what it exposes. [devtools add-on](https://svelte.dev/docs/cli/devtools)
+- **Vite DevTools client authorization.** The add-on turns client authorization on and applies
+  the plugin to the development server only. With it on, every remote call except the sign-in
+  handshake needs a trusted client, and an untrusted one is refused. A client becomes trusted
+  with a one-time code the development server prints, or with a static token listed in the
+  Vite configuration. Authorization is off in build mode, or when the configuration or an
+  environment variable turns it off. The pages read do not state a listening address or port.
+  [Unauthorized access error](https://devtools.vite.dev/errors/dtk0013) ·
+  [Remote client](https://devtools.vite.dev/kit/remote-client)
 - **Svelte's testing guidance.** Vitest for unit tests, Storybook with Vitest browser mode for
   component tests, and Playwright for end-to-end tests.
   [Testing](https://svelte.dev/docs/svelte/testing)
@@ -148,10 +161,12 @@ The foundation is built in two parts, with the tech-stack spike between them. Th
 to 4 of [Wave 0](prd_m.md#wave-0-prove-and-decide).
 
 1. **Seed.** After the toolchain pins are set, generate the skeleton in the
-   [code home](#code-home) and record the command. This covers the [skeleton](#skeleton) items
-   up to the static adapter, and turning the async flag on.
-2. **Spike.** The [tech-stack spike](prd_m3b.md#tech-stack-spike) generates the same skeleton
-   from the recorded command under `docs/prds/spikes/` and runs the
+   [code home](#code-home) and record the pinned command sequence, the lockfile and the
+   manifest of generated files. This covers the [skeleton](#skeleton) items up to the static
+   adapter, and turning the async flag on.
+2. **Spike.** The [tech-stack spike](prd_m3b.md#tech-stack-spike) runs the same pinned command
+   sequence under `docs/prds/spikes/`, checks its result against the seed's manifest, installs
+   from the seed's lockfile and runs the
    [shared frontend qualification](#shared-frontend-qualification). It does not edit the seeded
    skeleton.
 3. **Finish.** Apply the spike's findings to the seeded skeleton: the chosen Storybook setup,
@@ -163,14 +178,37 @@ the third part is done.
 
 ### Skeleton
 
-- [ ] Generate the project with `sv create` (the `minimal` template, TypeScript) and the add-ons
-      listed above, in the [code home](#code-home). Record the exact command and the resolved
-      versions. The `storybook` add-on runs `create-storybook@latest`, so the command alone does
-      not reproduce the result. Record what it resolved to as well.
+- [ ] Generate the project in the [code home](#code-home) with a recorded sequence of commands:
+      `sv create` (the `minimal` template, TypeScript) with the add-ons listed above. Every
+      command in the sequence names its tool at an exact version and gives every answer on the
+      command line. None may resolve `@latest` or a version range, and none may prompt.
+- [ ] **Storybook is initialised by its own pinned command, not through the add-on.** At `sv`
+      1.7.1 the `storybook` add-on takes no version and always runs `create-storybook@latest`,
+      so a second run can produce a different setup. Leave `storybook` out of the `sv create`
+      call. Run the Storybook initialiser directly at an exact version, with the flags the
+      add-on passes, and add the Node types package the add-on adds. Drop this departure when
+      the add-on accepts a version.
+- [ ] **`ai-tools` is answered for Claude Code only**: individual tools, the local MCP setup, the
+      instruction file, and no opt-in skill. No other client is selected. In particular the
+      OpenCode client is never selected by the seed or the spike, because selecting it writes a
+      project configuration that loads its plugin
+      ([decision below](#open-decisions)).
+- [ ] **One lockfile.** Commit the lockfile the seed produces. Every later install is a frozen
+      install from it: the seed's own checks, the spike and CI. Nothing resolves versions again.
+      Browser binaries come from the locked Playwright version.
+- [ ] **Record what was generated.** Alongside the command sequence, record the resolved
+      versions and a manifest of the generated files with their hashes, taken before any
+      departure from stock is applied. The spike compares its own run against this manifest.
+- [ ] **Check the generated tree for agent configuration.** It holds configuration for Claude
+      Code only. A check fails if the tree contains an OpenCode or Pi project configuration, a
+      Cursor, Gemini or VS Code agent directory or MCP file, or a setting that enables the
+      self-updating Svelte plugin. The check stays in the project, so a later change cannot add
+      one unnoticed.
 - [ ] Keep a deviation register beside the project: every change to a generated file or default,
-      with its reason. A reviewer can ask for any unlisted departure to be removed. Two entries
-      are known in advance: the async flag, and a WebKit instance beside the generated
-      Chromium-only component test project.
+      with its reason. A reviewer can ask for any unlisted departure to be removed. Four entries
+      are known in advance: the async flag, a WebKit instance beside the generated
+      Chromium-only component test project, the directly pinned Storybook initialiser, and the
+      pinned MCP package.
 - [ ] Turn server rendering off at the root and use the static adapter with a fallback page, as
       Tauri's guide describes. Check that guide's steps against SvelteKit 3's config location.
 - [ ] Rebuild on the skeleton what the web-ui spike proved: the typed, transport-neutral client
@@ -315,9 +353,9 @@ as Tauri ([control-plane decision](prd_m.md#control-plane-decision)).
 
 - [ ] The seeded skeleton builds as a static, client-rendered app.
 - [ ] Choose the Storybook setup. Storybook's documentation does not mention SvelteKit 3, which
-      dropped the config file, so check both setups the add-on offers on the pinned SvelteKit 3
-      and Svelte 5 with the async flag on: "Storybook for SvelteKit" and "Storybook for Svelte &
-      Vite". The rule against SvelteKit modules below routes means the second is enough. Prefer
+      dropped the config file, so check both setups the pinned initialiser offers on the pinned
+      SvelteKit 3 and Svelte 5 with the async flag on: "Storybook for SvelteKit" and "Storybook
+      for Svelte & Vite". The rule against SvelteKit modules below routes means the second is enough. Prefer
       whichever shares the app's Vite configuration with the fewest departures from stock.
 - [ ] Run the stories as tests in Chromium and in WebKit under the chosen setup.
 - [ ] If neither setup works, this qualification has failed. There is no standing fallback.
@@ -329,10 +367,30 @@ as Tauri ([control-plane decision](prd_m.md#control-plane-decision)).
 - [ ] Lint rules exist for the banned waits and the selector rule. Record their exact names, or
       write the rule if none exists.
 - [ ] The dependency tree the add-ons bring passes the [prd_f](prd_f.md) review.
-- [ ] The production build contains no `devtools` code and opens no development endpoint. Record
-      where the `devtools` endpoint listens on the development server and what it exposes.
+- [ ] The spike's generated tree matches the seed's [manifest](#skeleton), and its install is a
+      frozen install from the seed's lockfile. A difference is reported as a finding. It is not
+      worked around.
+- [ ] The generated tree holds agent configuration for Claude Code only, by the
+      [check](#skeleton) the skeleton carries.
 - [ ] The pinned local MCP server starts from the committed configuration without fetching
       anything at run time.
+- [ ] The production build contains no `devtools` code and opens no development endpoint.
+- [ ] `devtools` passes all of these on the development server, with the evidence recorded:
+  - **Fixture data only.** The development server runs on the fixture transport. It has no
+    connection to a real daemon and holds no private state.
+  - **Loopback only.** Record the address and port every `devtools` endpoint listens on,
+    including its diagnostics endpoint, and what each exposes. Each listens on loopback only.
+  - **Not reachable from a sandbox.** None of those ports is one a sandbox publishes or can
+    reach. Show it with a connection attempt from inside a throwaway container, which fails.
+  - **Unauthenticated access is refused.** A client with no token is refused every protected
+    call, including the diagnostics endpoint. Show the refusal.
+  - **Authorization cannot be switched off unnoticed.** No committed file or script turns
+    client authorization off, lists a static token or registers a remote dock, and the checks
+    do not set the environment variable that disables it. A check in the project fails if one
+    appears.
+- [ ] If `devtools` cannot pass those, leave it out of the skeleton and return that part of the
+      [add-ons decision](#open-decisions) to the operator. This does not fail the qualification,
+      because nothing in the product depends on `devtools`.
 
 ## Open decisions
 
@@ -357,11 +415,15 @@ as Tauri ([control-plane decision](prd_m.md#control-plane-decision)).
     working in this repository would then load an npm plugin that the repository names. Pin it
     to an exact version, and get it reviewed by the owners of the sandbox configuration and
     OpenCode runtime ([prd_l](prd_l.md), [prd_b](prd_b.md)) before it is committed. Seeding
-    does not wait for that review. The OpenCode part lands as its own change after it.
+    does not wait for that review. The OpenCode part lands as its own change after it. Until
+    then the seed and the spike do not select the OpenCode client, and the
+    [tree check](#skeleton) fails if its configuration appears. That change updates the check.
   - **`devtools`.** Take the add-on's default plugins. It configures itself for the development
-    server only, with client authentication on. Before relying on it, record where its endpoint
-    listens and what it exposes, and confirm that the production build contains none of it
-    ([shared frontend qualification](#shared-frontend-qualification)).
+    server only, with client authorization on. It stays in the skeleton only if it passes the
+    development-time checks in the
+    [shared frontend qualification](#shared-frontend-qualification): fixture data only,
+    loopback only, unreachable from a sandbox, and unauthenticated access refused. The
+    production build must contain none of it.
   - **The style guide wins.** One of the bundled best-practice notes is already wrong for
     SvelteKit 3: it places the async flag in a config file SvelteKit 3 rejects. Where a bundled
     note and the style guide differ, the style guide applies. Record each such difference in

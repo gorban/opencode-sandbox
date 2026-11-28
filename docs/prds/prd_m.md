@@ -222,11 +222,12 @@ In order:
       [prd_k](prd_k.md#later-runtime-layout) and is needed before the Wave 1 daemon port, not
       before steps 2 to 4.
 - [ ] **Step 2: seed the skeleton** ([prd_m3a3](prd_m3a3.md#skeleton)). Generate the stock
-      `sv create` skeleton with its add-ons in that home, with async Svelte on, and record the
-      exact command and versions. Nothing is built on it yet.
-- [ ] **Step 3: tech-stack spike** ([prd_m3b](prd_m3b.md#tech-stack-spike)). It generates the
-      same skeleton from the recorded command under `docs/prds/spikes/` and runs two sets of
-      checks: the [shared frontend qualification](prd_m3a3.md#shared-frontend-qualification),
+      `sv create` skeleton with its add-ons in that home, with async Svelte on. Record the
+      pinned command sequence, the lockfile and a manifest of what was generated. Nothing is
+      built on it yet.
+- [ ] **Step 3: tech-stack spike** ([prd_m3b](prd_m3b.md#tech-stack-spike)). It runs the same
+      pinned sequence under `docs/prds/spikes/`, installs from the seed's lockfile and runs two
+      sets of checks: the [shared frontend qualification](prd_m3a3.md#shared-frontend-qualification),
       then the [Tauri qualification](prd_m3b.md#tauri-qualification). It feeds the
       [shell order](#control-plane-decision) and the
       [UI SDK decision](prd_m3a2.md#open-decision).
