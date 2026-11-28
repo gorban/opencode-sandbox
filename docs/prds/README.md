@@ -52,9 +52,14 @@ reservation explicitly in this index.
 - [*] Delivery order for the dashboard and workflows: the wave plan in
   [prd_m](prd_m.md#delivery-order) and [prd_n](prd_n.md#delivery-order), and the sections it
   added to M3, M3a1, M3b, N1, N3 and J — **Delivery planning** (`spike-prd-n3-workflow-poc`).
-  This reserves the plan text only. The epics it lists stay open `[ ]` until a workstream
-  reserves them here. The additions to PRDs reserved above were made at the operator's direction
-  and wait for those owners' reciprocal review.
+  This reserves the plan text only. A `[ ]` in a wave list tracks delivery order. It does not
+  open or release a reservation. Scope already reserved above keeps its owner when a wave list
+  repeats it as an unchecked task, including N0–N2, the M first PoC and M3 projection, the
+  dashboard design, and the Outside-in integrations. Epics that no entry above reserves stay
+  open `[ ]` until a workstream reserves them here. The additions to PRDs reserved above were
+  made at the operator's direction and wait for those owners' reciprocal review.
+  Acknowledgments still open: **Dashboard design**, **PRD M coordination**, **PRD N workflows &
+  supervision**.
 
 Coordinate SSH fixtures and remote acceptance with **Warm worker seeding**
 (`codex/warm-worker-seeding`). That workstream owns [I5](prd_i5.md) warm-start

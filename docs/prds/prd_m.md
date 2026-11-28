@@ -188,6 +188,10 @@ side. The workflow side is ordered in [prd_n](prd_n.md#delivery-order). The two 
 numbers and the same [shared blockers and decisions](#shared-blockers-and-decisions). Change both
 in one PR when a wave moves.
 
+A `[ ]` below tracks delivery in this plan. It does not open or release a
+[reservation](README.md#workstream-reservations). An item inside a reserved scope keeps its
+owner, named in brackets where the index reserves it.
+
 Direction recorded:
 
 - Prove the tech stack on a thin live slice before porting the whole
@@ -208,7 +212,7 @@ These unblock every later stream. They can run in parallel with each other.
       ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)). Every view stream builds against the
       fixtures and every host stream against the contract.
 - [ ] **Design supplement** ([prd_m3a1](prd_m3a1.md#design-supplement)) for the screens the
-      locked design lacks.
+      locked design lacks. [Reserved: Dashboard design.]
 - [ ] **Production code home and toolchain pins.** Decide where the frontend, the Tauri shell and
       the daemon modules live outside `docs/prds/spikes/`
       ([prd_k](prd_k.md#later-runtime-layout)), and pin Node and Rust ([prd_f](prd_f.md)).
@@ -220,7 +224,7 @@ Parallel once Wave 0 lands. Workflow-side items for this wave are in
 
 - [ ] Port the daemon core: registry, hub and the read projection, served over the host-only
       socket ([Gap M3.1](prd_m3.md#concrete-gaps-and-checkboxes),
-      [M2](prd_m2.md#concrete-gaps-and-checkboxes)).
+      [M2](prd_m2.md#concrete-gaps-and-checkboxes)). [Reserved: PRD M coordination.]
 - [ ] Port the local worker transport: one OpenCode job with the synthetic broker
       ([first PoC split](#first-poc-split)).
 - [ ] Port the design system and shell: tokens, trust primitives, header and footer bands, stage,
@@ -229,11 +233,25 @@ Parallel once Wave 0 lands. Workflow-side items for this wave are in
 - [ ] Read-only thread view with provenance badges.
 - [ ] Tier A Approval Inbox wired to `oc_controller`, at least for the run lease the pipeline
       needs.
-- [ ] Tauri bridge, packaging and the session-generation fence ([prd_m3b](prd_m3b.md)).
+- [ ] The shell, chosen by the outcome of the
+      [tech-stack spike](prd_m3b.md#tech-stack-spike):
+  - **If the spike passes:** the Tauri bridge, packaging and the session-generation fence
+    ([prd_m3b](prd_m3b.md)).
+  - **If the spike fails:** the loopback dashboard with its web sign-in qualification, including
+    the cookie port-sharing item ([prd_m3a](prd_m3a.md)). Tauri then follows loopback, as in the
+    earlier order.
 
-Finish line, shared with prd_n: in the Tauri app, on a synthetic model, the operator starts a crew
-pipeline run, approves its lease, watches the ship lane work, sees the verification pass, resolves
-the human gate and sees the run complete.
+Finish line, shared with prd_n. The steps are the same for either shell: on a synthetic model,
+the operator starts a crew pipeline run, approves its lease, watches the ship lane work, sees the
+verification pass, resolves the human gate and sees the run complete.
+
+- **If the spike passes,** the operator does this in the packaged Tauri app.
+- **If the spike fails,** the operator does this in the authenticated loopback dashboard.
+
+Either way the slice is local and synthetic. It needs no live provider route and no SSH worker,
+provided the operator confirms the synthetic route recorded above as an assumption. Without that
+confirmation Wave 1 also waits on a live route ([prd_i4](prd_i4.md)). Live and remote
+qualification of the same pipeline stays in Wave 3.
 
 ### Wave 2: widen
 
@@ -257,6 +275,7 @@ the human gate and sees the run complete.
 - [ ] Agent bridge runtime ([Gap M3.5](prd_m3.md#concrete-gaps-and-checkboxes),
       [prd_m3a2](prd_m3a2.md)).
 - [ ] Live providers and remote workers ([prd_i4](prd_i4.md), [prd_i2](prd_i2.md)).
+      [Reserved: Outside-in integrations.]
 
 ### Shared blockers and decisions
 

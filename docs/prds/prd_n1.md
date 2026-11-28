@@ -316,9 +316,11 @@ single-writer ACID transactions as `oc_hub` outbox & revocation tombstones):
 
 ## Authoring surface and authored deterministic steps
 
-Added on 2026-11-28, after the Gate 1 clearance recorded in [prd_n](prd_n.md). Nothing here
-changes the reviewed design above. Any option that does returns this PRD to Gate 1. Delivery
-order: [prd_n](prd_n.md#delivery-order).
+Added on 2026-11-28, after the Gate 1 clearance recorded in [prd_n](prd_n.md). The first wave
+builds the reviewed design above as it stands. Every item below that changes the `workflow@1`
+schema, the compiled plan or what runs returns this PRD to Gate 1 before implementation. That
+includes the typed stage contracts and bindings, which decide which stages receive which data.
+Delivery order: [prd_n](prd_n.md#delivery-order).
 
 ### What the operator's `api-agent` workflow format offers
 
@@ -331,11 +333,24 @@ graph. These ideas carry over without its Python node functions or its graph run
 - A diagram generated from the declaration, which also gives a before-and-after picture for
   reviewing a change ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
 
-- [ ] Add a typed input and output contract to each stage, and explicit bindings between stages,
-      to the `workflow@1` schema. The compiled plan already holds the effect manifest. This adds
-      the data each stage is handed.
+- [ ] Propose a typed input and output contract for each stage, and explicit bindings between
+      stages, for the `workflow@1` schema. This changes the reviewed schema: the compiled plan
+      holds the effect manifest today, and bindings add the data each stage is handed. Before
+      implementation, Gate 1 reviews:
+  - **The binding rules.** Which sources a binding may name, and how each bound value is typed
+    and bounded.
+  - **The permitted recipients.** Which stage kinds may receive which data. In particular, what
+    may reach an LLM lane, a `/decisions/*` or blind-check route, a template or a dashboard
+    surface, and how that fits the `excerpt_disclosure` policy above.
+  - **The binding to the approved plan.** How every contract and binding enters the effect
+    manifest and `workflow_plan_digest`, so the approval covers them, a changed binding raises a
+    security trigger, and a run cannot receive a binding its approved digest does not contain.
+
+  The Wave 1 crew pipeline does not wait for this. It uses only the bindings the reviewed
+  design already defines, such as the commit and sequence pins on a human gate.
 - [ ] Generate the workflow diagram on the host from the compiled plan. An agent never supplies
-      diagram markup.
+      diagram markup. Labels taken from authored fields stay inert, provenance-labelled text
+      ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
 - [ ] (decision needed) **Authoring surface.** Time estimates are rough.
   - **Keep TOML as the one stored form, and generate the tables and diagram as a view
     (recommended).** Matches every other config kind in [prd_l](prd_l.md) and the reviewed

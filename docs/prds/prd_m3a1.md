@@ -217,6 +217,10 @@ and components stay as they are. This is a Wave 0 item in the
 - [ ] **Secret entry.** The operator-only surface for entering a secret, with the slot it fills,
       who asked, and the set or not-set state afterwards. It uses the security frame and is
       hidden from the agent bridge.
+- [ ] In the workflow and change-review screens, show authored and agent-originated text
+      (names, descriptions, templates, log lines, proposed values) in the untrusted container
+      with a source label, and keep host-derived effect and approval labels visibly distinct
+      from it ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
 - [ ] Add each new screen to the states sheet and the hostile-content specimen, and run the
       WCAG 2.2 AA audit on it.
 - [ ] (decision needed) **Process for the supplement.** Time estimates are rough.

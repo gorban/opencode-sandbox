@@ -429,7 +429,9 @@ The pieces exist in other PRDs. This section joins them into one dashboard flow.
   changed. Show a field-level difference in the configuration's own terms, the security triggers
   it raises, and the exact revision and digest the approval binds to. Workflow revisions also
   show the host-generated diagram before and after
-  ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)).
+  ([prd_n3](prd_n3.md#4-workflow-views-and-change-review)). The values in a proposed revision
+  are written by whoever proposed it. Show them as inert text labelled with that source, and
+  keep the host-derived security triggers, effect names and approval labels visibly separate.
 - **Secret entry.** When a setting needs a secret, Trusted Host Chrome opens an operator-only
   entry surface. The value goes straight to the host secret store. Configuration keeps a
   reference only ([prd_i4d](prd_i4d.md#named-instances-and-credentials),

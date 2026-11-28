@@ -176,8 +176,25 @@ health. They do not show what a workflow is, where a run stands in it, or what a
 would do. The locked dashboard design has only a specimen sheet of the eight surfaces
 ([prd_m3a1](prd_m3a1.md#design-supplement)).
 
-All of these views are host-rendered Trusted Host Chrome. They read the compiled plan and the
-run's event log, never text an agent supplied.
+All of these views are host-rendered Trusted Host Chrome. Host rendering establishes who drew a
+view. It does not establish who wrote each string in it. A workflow can be proposed by `-o`, and
+a run's log can carry sandbox output, so text an agent wrote reaches these views. Compiling or
+approving a workflow does not turn its text into host text.
+
+- **Host-derived, in the host's voice:** stage kind, effect names, security triggers, limits,
+  digests, lease and approval state, and action labels. These come from closed enumerations and
+  the compiled effect manifest, never from an authored field.
+- **Authored or agent-originated, always inert and labelled:** workflow and stage names and
+  descriptions, surface titles, rubric and template text, skill names, step-log text, and every
+  field of a proposed revision. Render these as escaped plain text in the bounded untrusted
+  container, with a label naming the source: built-in, operator-authored, proposed by `-o`, or
+  sandbox output. They follow the anti-spoofing rules in
+  [prd_m3a1](prd_m3a1.md#trusted-chrome-visual-language-anti-spoofing).
+- **Kept distinct.** An authored label never stands in for an effect or approval label, and
+  never takes the reserved glyphs, shapes or colours. In a diagram, the host draws each node's
+  kind marker and the authored name sits beside it as labelled text.
+- Add workflow names, templates and log lines to the hostile fixtures, and check they cannot
+  imitate a host label in the list, the diagram, the run view or the change review.
 
 - **Workflow list.** Available workflows and active runs, with owner (operator or `-o`), mode,
   autonomy level, status and lease state.

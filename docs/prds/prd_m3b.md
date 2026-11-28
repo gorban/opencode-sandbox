@@ -29,8 +29,13 @@ A throwaway probe under `docs/prds/spikes/`, following the spike rules in
       ([Gate 2 reminder 3](prd_m.md#review-record)).
 - [ ] Drive the packaged app from an agent through WebDriver, and drive the same static bundle
       in Chromium on a loopback fixture server with a DevTools client. Record what each can and
-      cannot observe. Confirm whether the Linux WebView offers any Chrome DevTools Protocol
-      endpoint. The planning session assumed it does not.
+      cannot observe.
+- [ ] Record every remote-control endpoint the pinned WebView build can expose. Tauri documents
+      WebDriver on Linux. WebKitGTK has its own remote inspector, started by
+      `WEBKIT_INSPECTOR_SERVER` or `WEBKIT_INSPECTOR_HTTP_SERVER` when the application enables
+      developer extras. Whether that build offers any Chrome DevTools Protocol endpoint is an
+      open question until it is checked on the pinned version. Do not carry an assumption either
+      way into the design.
 - [ ] Measure cold launch to the first populated sandbox list.
 - [ ] Record the result and the resulting decisions: the shell order in
       [prd_m](prd_m.md#control-plane-decision) and the UI SDK choice in
@@ -73,6 +78,15 @@ A throwaway probe under `docs/prds/spikes/`, following the spike rules in
       through WebDriver or a DevTools client counts as genuine user input, so a control port on
       the live app could press Approve in the Tier A inbox. There is no runtime flag for this.
       For full DevTools tooling, run the same static bundle in Chromium against fixtures.
+- [ ] Qualify release isolation on the release build itself. This check stands whatever the
+      spike finds about Chrome DevTools Protocol support.
+  - No WebDriver server and no inspector endpoint is reachable, including when the inspector
+    environment variables are set and when debugging settings are present in configuration.
+    Developer extras are off and the `devtools` feature is absent.
+  - Repeat the check on every release artifact and after each Tauri or WebView upgrade.
+- [ ] Qualify the automation build's confinement. It connects only to the fixture daemon: it
+      refuses a real `$STATE` and the real daemon socket, and it carries no real daemon
+      credential. Add a negative test that points it at each and expects a refusal.
 
 [Tauri WebView engines](https://v2.tauri.app/reference/webview-versions/) ·
 [UI SDK](https://ui-sdk.dev)

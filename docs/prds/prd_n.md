@@ -218,6 +218,11 @@ desktop surfaces explicitly depend on completing the open upstream slices:
 - SSH remote worker onboarding (`REMOTE / NAME`, [prd_i2](prd_i2.md))
 - Trusted Host Chrome ([M3a loopback first](prd_m3a.md), [M3b Tauri desktop](prd_m3b.md))
 
+Wave 1 of the [delivery order](#delivery-order) is a local, synthetic slice. From the list above
+it needs the joint local transport proof and Trusted Host Chrome. It does not need live provider
+routes or SSH onboarding, provided the operator confirms the synthetic route. Live and remote
+qualification of the same pipeline still depends on every item above.
+
 - [*] **N0 — PRD N Gate 1 design & security review** (`prd_n.md`, `prd_n1.md`, `prd_n2.md`,
       `prd_n3.md`): resolve `(decision needed)` items with the user, clear Gate 1 external security
       and architecture review, and lock the `workflow@1` / `/decisions/*` / `human_inbox_items` /
@@ -249,6 +254,11 @@ The control-plane side is ordered in [prd_m](prd_m.md#delivery-order). The two l
 numbers and the same [shared blockers and decisions](#shared-blockers-and-decisions). Change both
 in one PR when a wave moves.
 
+A `[ ]` below tracks delivery in this plan. It does not open or release a
+[reservation](README.md#workstream-reservations). An item inside a reserved scope keeps its
+owner, named in brackets where the index reserves it. N0 to N2 stay reserved to PRD N workflows &
+supervision.
+
 Direction recorded:
 
 - The first end-to-end example is our own interpretation of `kunchenguid/firstmate`, starting
@@ -268,18 +278,39 @@ Direction recorded:
 - [ ] Add a synthetic crew pipeline run, its lease approval and its human gate to the shared
       fixture set ([Gap M3.6](prd_m3.md#concrete-gaps-and-checkboxes)).
 - [ ] Design the missing workflow screens ([prd_m3a1](prd_m3a1.md#design-supplement)).
-- [ ] Decide the [authoring surface](prd_n1.md#authoring-surface-and-authored-deterministic-steps)
-      before any workflow other than a built-in is authored.
-- [ ] Finish N0: reciprocal review and the open decisions in this PRD and its children.
+      [Reserved: Dashboard design.]
+- [ ] Reciprocal review of this PRD and its children, the open part of N0.
+      [Reserved: PRD N workflows & supervision.]
+- [ ] Settle the decisions the built-in crew pipeline needs, and only those:
+  - the [initial slice scope](#open-top-level-decisions);
+  - the [restart behaviour](prd_n1.md#concrete-checkboxes-and-open-decisions) for active runs,
+    because the pipeline holds a run lease;
+  - the operator's confirmation of the synthetic model route for Wave 1;
+  - design and security review of the workflow list, definition and run views
+    ([prd_n3 §4](prd_n3.md#4-workflow-views-and-change-review)).
+
+The other open decisions in this PRD and its children do not block Wave 1. Each is settled
+before the wave that uses it:
+
+- Wave 2: the [authoring surface](prd_n1.md#authoring-surface-and-authored-deterministic-steps)
+  and the typed stage contracts and bindings, which return N1 to Gate 1; the blind-check model
+  tier and audit sampling ([prd_n2](prd_n2.md#concrete-checkboxes-and-open-decisions)); overlays
+  outside a run ([prd_n3](prd_n3.md#concrete-checkboxes-and-open-decisions)).
+- Wave 3: the runtime for
+  [authored steps](prd_n1.md#authoring-surface-and-authored-deterministic-steps).
 
 ### Wave 1: thin live slice
 
 Parallel once Wave 0 lands. Control-plane items for this wave are in
-[prd_m](prd_m.md#wave-1-thin-live-slice), with the shared finish line.
+[prd_m](prd_m.md#wave-1-thin-live-slice), with the shared finish line. That finish line is
+defined for both outcomes of the tech-stack spike: the Tauri app if it passes, the authenticated
+loopback dashboard if it fails. The items below are the same either way.
 
 - [ ] A minimal statechart kernel: the part of [N1](prd_n1.md) the pipeline needs. That is the
       schema and pure compile for `deterministic`, `ship_lane` and `human_gate_async` stages,
-      the run lease, and the event-sourced engine with awakeables.
+      the run lease, and the event-sourced engine with awakeables. It uses the reviewed schema
+      as it stands, with only the bindings that design already defines.
+      [Reserved: PRD N workflows & supervision.]
 - [ ] The minimal `builtin/prd-delivery-pipeline` and its skill ([prd_n3](prd_n3.md)). On the
       synthetic route the reviewer can share the implementor's route.
 - [ ] The Human Inbox store, read projection and resolve path with the display-bound checks
@@ -291,7 +322,9 @@ Parallel once Wave 0 lands. Control-plane items for this wave are in
 
 - [ ] The fleet supervisor, observe-only first: host metrics, the classifier route, the
       throttler and the blind check ([prd_n2](prd_n2.md)).
+      [Reserved: PRD N workflows & supervision.]
 - [ ] Parallel lanes, the scout lane and the full delivery pipeline ([prd_n1](prd_n1.md)).
+      [Reserved: PRD N workflows & supervision.]
 - [ ] Orchestrator overlays and the orchestrator's tool surface
       ([prd_n3 §2 and §3](prd_n3.md#2-declarative-dashboard-surfaces-oc-ui1--zero-untrusted-js-in-trusted-host-chrome)).
 - [ ] Workflow change review ([prd_n3 §4](prd_n3.md#4-workflow-views-and-change-review)).
@@ -300,6 +333,7 @@ Parallel once Wave 0 lands. Control-plane items for this wave are in
 
 - [ ] Bounded nudging on live routes, calibration and replay ([prd_n2](prd_n2.md)).
 - [ ] Live providers and remote workers ([prd_i4](prd_i4.md), [prd_i2](prd_i2.md)).
+      [Reserved: Outside-in integrations.]
 - [ ] The spike for authored deterministic steps
       ([prd_n1](prd_n1.md#authoring-surface-and-authored-deterministic-steps)).
 
