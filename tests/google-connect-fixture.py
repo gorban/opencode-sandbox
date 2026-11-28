@@ -2,6 +2,7 @@
 """Check sealed named Google enrollment using synthetic metadata."""
 
 import argparse
+from contextlib import contextmanager
 import errno
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import signal
 import shutil
 import socket
 import runpy
@@ -28,6 +30,11 @@ BROWSER_SCOPE = " ".join((
     "email",
     "openid",
 ))
+PTY_UNCONFIRMED = "Synthetic PTY child retirement was not confirmed."
+
+
+class PtyRetirementUnconfirmed(RuntimeError):
+    """The exact owned PTY child could not be verified retired."""
 
 
 def catalog(*models):
@@ -123,51 +130,130 @@ def forward_fixture_offer(raw):
 
 
 def launch(home, launcher, label, descriptor, start_input):
-    pid, master = pty.fork()
-    if pid == 0:
-        os.chdir(launcher.parent)
-        start_descriptor = start_input.fileno()
-        os.set_inheritable(start_descriptor, True)
-        os.execve("/usr/bin/python3", ["/usr/bin/python3", "-IBS", str(launcher), "--fixture", label,
-                                        str(descriptor), str(start_descriptor)],
-                  {"HOME": str(home), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
-
-    start_input.close()
-    output = bytearray()
-    consent = False
-    offered = False
-    deadline = time.monotonic() + 220
     try:
-        while time.monotonic() < deadline:
-            if not select.select([master], [], [], .1)[0]:
-                continue
-            try:
-                chunk = os.read(master, 16384)
-            except OSError as error:
-                if error.errno == errno.EIO:
-                    break
-                raise
-            if not chunk:
-                break
-            output.extend(chunk)
-            if len(output) > 16384:
-                raise AssertionError("Synthetic enrollment exceeded terminal output bound")
-            if not consent and b"Continue? [y/N] " in output:
-                os.write(master, b"y\n")
-                consent = True
-            if not offered and (match := re.search(AUTH_URL + rb"(?=\r?\n)", output)):
-                forward_fixture_offer(match.group())
-                offered = True
-        else:
-            raise AssertionError("Synthetic offline enrollment exceeded its terminal deadline")
-    finally:
-        os.close(master)
-        _, status = os.waitpid(pid, 0)
+        pid, master = pty.fork()
+    except BaseException as error:
+        close_start_input(start_input, error)
+        raise
+    if pid == 0:
+        try:
+            os.chdir(launcher.parent)
+            start_descriptor = start_input.fileno()
+            os.set_inheritable(start_descriptor, True)
+            os.execve("/usr/bin/python3", ["/usr/bin/python3", "-IBS", str(launcher), "--fixture", label,
+                                            str(descriptor), str(start_descriptor)],
+                      {"HOME": str(home), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
+        except BaseException:
+            os._exit(1)
+
+    try:
+        start_input.close()
+        output, consent, offered = observe_pty(master)
+    except BaseException as error:
+        close_start_input(start_input, error)
+        try:
+            retire_pty(pid, master, failed=True)
+        except BaseException:
+            error.add_note(PTY_UNCONFIRMED)
+        raise
+    status = retire_pty(pid, master, failed=False)
     if os.waitstatus_to_exitcode(status) or not consent or not offered or (
         f"Verified Google registration {label} for workstation metadata.".encode("ascii") not in output
     ):
         error = next((line for line in bytes(output).splitlines() if line.startswith(b"oc-sandbox google: ")), b"")
         raise AssertionError(f"Synthetic offline enrollment did not complete {error.decode('ascii', 'replace')}")
+
+
+def close_start_input(start_input, error):
+    try:
+        start_input.close()
+    except BaseException:
+        error.add_note("Synthetic PTY startup descriptor closure was not confirmed.")
+
+
+def observe_pty(master):
+    output = bytearray()
+    consent = False
+    offered = False
+    deadline = time.monotonic() + 220
+    while time.monotonic() < deadline:
+        if not select.select([master], [], [], .1)[0]:
+            continue
+        try:
+            chunk = os.read(master, 16384)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        output.extend(chunk)
+        if len(output) > 16384:
+            raise AssertionError("Synthetic enrollment exceeded terminal output bound")
+        if not consent and b"Continue? [y/N] " in output:
+            os.write(master, b"y\n")
+            consent = True
+        if not offered and (match := re.search(AUTH_URL + rb"(?=\r?\n)", output)):
+            forward_fixture_offer(match.group())
+            offered = True
+    else:
+        raise AssertionError("Synthetic offline enrollment exceeded its terminal deadline")
+    return output, consent, offered
+
+
+def poll_pty_child(pid, deadline):
+    while True:
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            raise PtyRetirementUnconfirmed(PTY_UNCONFIRMED) from None
+        if waited == pid:
+            return status
+        if waited != 0:
+            raise PtyRetirementUnconfirmed(PTY_UNCONFIRMED)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(remaining, 0.025))
+
+
+def signal_pty_child(pid, signum):
+    try:
+        os.kill(pid, signum)
+    except ProcessLookupError:
+        pass  # An owned child can exit between the probe and the signal.
+
+
+def retire_pty_child(pid, deadline, *, failed):
+    now = time.monotonic()
+    grace = now if failed else min(deadline, now + 1)
+    status = poll_pty_child(pid, grace)
+    if status is not None:
+        return status
+    if time.monotonic() < deadline:
+        signal_pty_child(pid, signal.SIGTERM)
+        status = poll_pty_child(pid, min(deadline, time.monotonic() + 1))
+        if status is None and time.monotonic() < deadline:
+            signal_pty_child(pid, signal.SIGKILL)
+            status = poll_pty_child(pid, deadline)
+    if status is None:
+        raise PtyRetirementUnconfirmed(PTY_UNCONFIRMED)
+    if not failed:
+        raise RuntimeError("Synthetic PTY child failed to exit after output closed.")
+    return status
+
+
+def retire_pty(pid, master, *, failed):
+    deadline = time.monotonic() + 5
+    try:
+        os.close(master)
+    except BaseException as error:
+        try:
+            retire_pty_child(pid, deadline, failed=True)
+        except BaseException:
+            error.add_note(PTY_UNCONFIRMED)
+        raise
+    return retire_pty_child(pid, deadline, failed=failed)
 
 
 def observe_bound_catalog(root, source):
@@ -248,6 +334,20 @@ def verify_bound_catalog(home, log, label, candidate_log, acp_log, expected_mode
     return registration["registration_id"], registration["generation"]
 
 
+@contextmanager
+def owned_projection(descriptor):
+    try:
+        yield
+    except BaseException as error:
+        try:
+            os.close(descriptor)
+        except BaseException:
+            error.add_note("Synthetic case projection descriptor closure was not confirmed.")
+        raise
+    else:
+        os.close(descriptor)
+
+
 def run_bound_catalog_cases(guard, vendor, seal, scope, start):
     flash = "gemini-2.5-flash"
     decoy = "gemini-2.5-pro"
@@ -270,11 +370,9 @@ def run_bound_catalog_cases(guard, vendor, seal, scope, start):
                 item.chmod(0o500 if item.is_dir() else 0o400)
             source.chmod(0o500)
             descriptor = guard["prepare_descriptor"](case, label, seal)
-            try:
+            with owned_projection(descriptor):
                 with guard["one_case_start"](scope, label, start, sent) as start_input:
                     launch(home, launcher, label, descriptor, start_input)
-            finally:
-                os.close(descriptor)
             registration, generation = verify_bound_catalog(home, log, label, candidate_log, acp_log, expected)
         guard["private_inventory"](seal["uid"])
         if registration in registrations or generation in generations:
@@ -316,7 +414,9 @@ def main():
         run_bound_catalog_cases(guard, vendor, seal, scope, start)
         del start
         guard["private_inventory"](seal["uid"])
-    except (OSError, ValueError, TypeError, KeyError, AssertionError, RuntimeError, subprocess.SubprocessError):
+    except (OSError, ValueError, TypeError, KeyError, AssertionError, RuntimeError, subprocess.SubprocessError) as error:
+        if isinstance(error, PtyRetirementUnconfirmed) or PTY_UNCONFIRMED in getattr(error, "__notes__", ()):
+            print(PTY_UNCONFIRMED, file=sys.stderr)
         print("Sealed offline Google fixture did not complete.", file=sys.stderr)
         return 1
     print("Verified three named offline catalogs, two Flash candidates, zero prompts and six retired runtimes.")

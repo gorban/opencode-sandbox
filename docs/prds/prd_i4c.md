@@ -147,7 +147,11 @@ binding and consumes its one-use boot lease before syncing the exclusive
 allocation marker. A lost marker cannot renew the lease. A different boot
 requires a freshly prepared capsule. It starts a
 fixed, isolated allocator with the dedicated fixture UID and primary GID, no supplementary
-groups and a bounded result channel. The unprivileged allocator creates and pins the
+groups and a bounded result channel. The attempt binds the exact root controller,
+boot, source, deployment pins and account to a one-use allocation digest. The
+allocator consumes and closes the anonymous startup descriptor before checking
+the protected attempt and the live immediate root parent through procfs and a
+pidfd. The unprivileged allocator creates and pins the
 three case homes. Root independently verifies their exact anchored identities before and
 after preparing the protected config projections, then publishes the new seal. Root only
 reads the dedicated user's runtime tree. Seal, config and evidence files begin at 0600
@@ -173,6 +177,8 @@ before enrollment. The before record also commits separate derived values for
 the three fixed labels. Each case child consumes its unique value from an
 anonymous descriptor before opening its case. The original value stays in the
 catalog child. Both types of descriptor are closed before native startup.
+The fixture verifies child retirement on failure within a bounded cleanup window
+and retains uncertain case evidence for inspection.
 The fixture checks the three ordinary provider paths are absent and uses a
 separately sealed synthetic HOME for config, artifacts and enrollment. The controller
 independently checks the exact positive output for all three named catalogs, two Flash

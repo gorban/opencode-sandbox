@@ -472,11 +472,14 @@ class OfflineGuestGuardTest(unittest.TestCase):
                   "install_seal": Mock(), "validate_seal": Mock(), "HOME_BEFORE": "home-before",
                   "HOME_BEFORE_STAGE": "stage", "HOME_RESULT": "home-result", "NATIVE_RESULT": "native-result",
                   "write_protected": Mock()}
+        driver["install_seal"].side_effect = lambda _tree, allocate: allocate()
         with TemporaryDirectory() as tmp, patch.object(controller, "CAPSULE", Path(tmp)), \
                 patch.object(controller, "pinned_driver", return_value=(driver, seal)), \
                 patch.object(controller, "deployment_binding", return_value={
                     "capsule": "d" * 32, "capsule_id": controller.directory_id(Path(tmp).stat()), "boot": "test-boot",
                 }), patch.object(controller, "consume_boot_lease"), \
+                patch.object(controller, "controller_identity", return_value={"pid": 102}), \
+                patch.object(controller, "allocate_case_process"), \
                 patch.object(controller, "protected_bytes", side_effect=lambda *_: driver["write_protected"].call_args.args[1]), \
                 patch.object(controller.pwd, "getpwnam", return_value=user), \
                 patch.object(controller, "inspect_devbox", return_value="a" * 64) as inspect, \

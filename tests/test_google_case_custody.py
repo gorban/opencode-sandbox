@@ -3,19 +3,29 @@
 from contextlib import nullcontext
 import errno
 from hashlib import sha256
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import google_connect_driver as driver
 import google_home_controller as controller
+
+
+_FIXTURE_SPEC = importlib.util.spec_from_file_location(
+    "google_connect_fixture", Path(__file__).with_name("google-connect-fixture.py"),
+)
+fixture = importlib.util.module_from_spec(_FIXTURE_SPEC)
+_FIXTURE_SPEC.loader.exec_module(fixture)
 
 
 class CapsulePublicationTest(unittest.TestCase):
@@ -126,6 +136,9 @@ class BootLeaseTest(unittest.TestCase):
         ))
         self.manifest = {"tree": self.tree, "source": {}}
         self.user = SimpleNamespace(pw_uid=1000, pw_gid=1001, pw_name=controller.ACCOUNT, pw_dir=controller.HOME)
+        self.value = b"r" * controller.START_BYTES
+        self.enterContext(patch.object(controller.secrets, "token_bytes", return_value=self.value))
+        self.enterContext(patch.object(controller, "controller_identity", return_value={"pid": 193}))
         self.allocator = self.enterContext(patch.object(controller, "allocate_case_process"))
         self.start = self.enterContext(patch.object(controller, "observe_run", return_value=0))
         self.enterContext(patch.object(controller, "inspect_devbox", return_value="a" * 64))
@@ -188,8 +201,23 @@ class BootLeaseTest(unittest.TestCase):
         self.assertEqual(controller.run_controller(self.pin, new_binding), 0)
         with self.assertRaises(controller.ControllerRefused):
             controller.run_controller(self.pin, new_binding)
-        self.allocator.assert_called_once_with(self.pin, self.user)
+        self.allocator.assert_called_once_with(self.pin, new_binding, self.user, self.value)
         self.start.assert_called_once()
+        self.assertNotIn(self.value, (self.capsule / controller.ATTEMPT).read_bytes())
+        self.assertNotIn(self.value, (self.leases / ("d" * 32)).read_bytes())
+
+    def test_root_callback_can_issue_only_one_allocation(self):
+        binding = self.prepare("a" * 32)
+
+        def repeated_callback(_tree, allocate):
+            allocate()
+            allocate()
+
+        self.hooks["install_seal"].side_effect = repeated_callback
+        with self.assertRaises(controller.ControllerRefused):
+            controller.run_controller(self.pin, binding)
+        self.allocator.assert_called_once_with(self.pin, binding, self.user, self.value)
+        self.start.assert_not_called()
 
     def test_lease_uncertainty_and_wrong_mount_or_origin_precede_allocation(self):
         binding = self.prepare("e" * 32, manifest="f" * 64)
@@ -254,6 +282,440 @@ class BootLeaseTest(unittest.TestCase):
         self.start.assert_not_called()
         self.assertTrue((self.capsule / controller.ATTEMPT).is_file())
         self.assertFalse((self.capsule / "case-config").exists())
+
+
+class AllocationAuthorityTest(unittest.TestCase):
+    def setUp(self):
+        self.user = SimpleNamespace(pw_uid=1000, pw_gid=1001, pw_name=controller.ACCOUNT, pw_dir=controller.HOME)
+        self.pins = ("a" * 64, "b" * 64)
+        self.value = b"r" * controller.START_BYTES
+        self.manifest = {"tree": "c" * 40, "controller": "d" * 64}
+        self.binding = {"tree": self.manifest["tree"], "capsule": "e" * 32,
+                        "boot": "00000000-0000-0000-0000-000000000001"}
+        self.owner = {"pid": 912, "start_ticks": 768, "interpreter": controller.directory_id(os.stat(controller.PYTHON)),
+                      "script": self.manifest["controller"],
+                      "argv": controller.argument_digest(controller.controller_arguments(*self.pins))}
+        self.attempt = {"version": 2, **self.binding, "manifest": self.pins[0], "binding": self.pins[1],
+                        "controller": self.owner, "account": {"uid": 1000, "gid": 1001}}
+        self.attempt["allocation"] = controller.allocation_digest(self.attempt, self.value)
+        self.allocate = Mock(return_value={"synthetic": {}})
+        hooks = {"read_catalog_start": lambda: driver.read_catalog_start(),
+                 "require_unprivileged_allocator": driver.require_unprivileged_allocator,
+                 "validate_allocation_attempt": driver.validate_allocation_attempt, "allocate_cases": self.allocate}
+        self.enterContext(patch.object(controller, "pinned_driver", return_value=(hooks, self.manifest)))
+        self.enterContext(patch.object(controller, "deployment_binding", return_value=self.binding))
+        self.boot = self.enterContext(patch.object(controller, "current_boot", return_value=self.binding["boot"]))
+        self.enterContext(patch.object(controller.pwd, "getpwnam", return_value=self.user))
+        self.enterContext(patch.object(os, "getresuid", return_value=(1000,) * 3))
+        self.uid = self.enterContext(patch.object(os, "getresgid", return_value=(1001,) * 3))
+        self.enterContext(patch.object(os, "getgroups", return_value=[]))
+        self.parent = self.enterContext(patch.object(os, "getppid", return_value=self.owner["pid"]))
+        self.enterContext(patch.object(controller, "protected_bytes", side_effect=lambda *_: json.dumps(self.attempt).encode()))
+        self.enterContext(patch.object(controller, "process_directory", return_value=nullcontext(456)))
+        self.status = b"Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n"
+        self.ticks = self.owner["start_ticks"]
+        self.proc = self.enterContext(patch.object(controller, "proc_bytes", side_effect=self.proc_observation))
+        self.display = self.enterContext(patch("builtins.print"))
+
+    def proc_observation(self, process, leaf, _limit):
+        self.assertEqual(process, 456)
+        if leaf == "status":
+            return self.status
+        self.assertEqual(leaf, "stat")
+        return f'{self.owner["pid"]} (synthetic parent) S {"0 " * 18}{self.ticks} 0\n'.encode()
+
+    def attempt_with_pipe(self, data, *, named=False):
+        with TemporaryDirectory() as tmp:
+            if named:
+                leaf = Path(tmp) / "named.fifo"
+                os.mkfifo(leaf, 0o600)
+                read = os.open(leaf, os.O_RDONLY | os.O_NONBLOCK)
+                write = os.open(leaf, os.O_WRONLY | os.O_NONBLOCK)
+            else:
+                read, write = os.pipe2(os.O_CLOEXEC)
+            try:
+                os.write(write, data)
+            finally:
+                os.close(write)
+            # An inert open pipe models a live pidfd. Parent observations use only status/stat.
+            pidfd, alive = os.pipe2(os.O_CLOEXEC)
+            try:
+                with (
+                    patch.object(os, "pidfd_open", return_value=pidfd) as pid_open,
+                    patch.object(driver, "read_catalog_start", side_effect=lambda: self.original_read(read)),
+                ):
+                    return controller.run_case_allocator(*self.pins)
+            finally:
+                os.close(alive)
+                if not pid_open.called:
+                    os.close(pidfd)
+
+    original_read = staticmethod(driver.read_catalog_start)
+
+    def test_direct_repeated_and_replaced_descriptor_refuse_without_allocation(self):
+        for data, named in ((b"", False), (self.value[:-1], False), (self.value + b"!", False),
+                            (b"x" * len(self.value), False), (self.value, True)):
+            with self.subTest(size=len(data), named=named), self.assertRaises((controller.ControllerRefused, driver.Refused)):
+                self.attempt_with_pipe(data, named=named)
+        self.allocate.assert_not_called()
+
+    def test_valid_parent_without_executable_link_and_exact_one_use_delivery(self):
+        original = os.stat
+
+        def no_root_exe(path, *args, **kwargs):
+            if str(path).endswith("/exe") or path == "exe":
+                raise PermissionError("synthetic protected root executable link")
+            return original(path, *args, **kwargs)
+
+        with patch.object(os, "stat", side_effect=no_root_exe):
+            self.assertEqual(self.attempt_with_pipe(self.value), 0)
+        with self.assertRaises(driver.Refused):
+            self.attempt_with_pipe(b"")
+        self.allocate.assert_called_once()
+        self.display.assert_called_once_with('{"synthetic": {}}')
+        self.assertEqual([call.args[1] for call in self.proc.call_args_list], ["status", "stat", "status", "stat"])
+
+    def test_wrong_boot_attempt_account_and_kernel_ids_refuse(self):
+        original = dict(self.attempt)
+        for case, changed in (
+            ("boot", {"boot": "00000000-0000-0000-0000-000000000002"}),
+            ("binding", {"binding": "f" * 64}),
+            ("account", {"account": {"uid": 1002, "gid": 1001}}),
+            ("malformed pid", {"controller": self.owner | {"pid": False}}),
+        ):
+            self.attempt = original | changed
+            self.attempt["allocation"] = controller.allocation_digest(self.attempt, self.value)
+            with self.subTest(case=case), self.assertRaises((controller.ControllerRefused, driver.Refused)):
+                self.attempt_with_pipe(self.value)
+        self.attempt = original
+        self.uid.return_value = (1001, 1001, 0)
+        with self.assertRaises(driver.Refused):
+            self.attempt_with_pipe(self.value)
+        self.allocate.assert_not_called()
+
+    def test_changed_parent_status_ticks_boot_and_parent_death_refuse_at_last_check(self):
+        good_status, good_ticks = self.status, self.ticks
+        for case in ("bad uid", "malformed status", "bad ticks", "changed parent", "changed boot", "dead before allocate"):
+            with self.subTest(case=case):
+                self.status, self.ticks = good_status, good_ticks
+                self.parent.side_effect = None
+                self.boot.return_value = self.binding["boot"]
+                context = nullcontext()
+                if case == "bad uid":
+                    self.status = self.status.replace(b"Uid:\t0", b"Uid:\t1000")
+                elif case == "malformed status":
+                    self.status += b"Uid:\t0\t0\t0\t0\n"
+                elif case == "bad ticks":
+                    self.ticks += 1
+                elif case == "changed parent":
+                    self.parent.side_effect = [self.owner["pid"], self.owner["pid"], self.owner["pid"], 913]
+                elif case == "changed boot":
+                    self.boot.return_value = "different boot"
+                else:
+                    context = patch.object(controller.select, "select", side_effect=[
+                        ([0], [], []), ([0], [], []), ([], [], []), ([], [], []), ([0], [], []),
+                    ])
+                with context, self.assertRaises((controller.ControllerRefused, driver.Refused)):
+                    self.attempt_with_pipe(self.value)
+        self.allocate.assert_not_called()
+
+
+class RootControllerIdentityTest(unittest.TestCase):
+    def test_root_pins_executable_script_arguments_and_kernel_start(self):
+        manifest_pin, binding_pin = "a" * 64, "b" * 64
+        script = b"inert synthetic controller bytes"
+        manifest = {"controller": sha256(script).hexdigest()}
+        binding = {"boot": "synthetic boot"}
+        pid = 430
+        executable = SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | 0o755, st_dev=24, st_ino=88)
+        argv = b"\0".join(os.fsencode(item) for item in controller.controller_arguments(manifest_pin, binding_pin)) + b"\0"
+        status = b"Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n"
+        good_stat = f'{pid} (synthetic controller) S {"0 " * 18}991 0\n'.encode("ascii")
+        for case in ("valid", "wrong args", "wrong script", "wrong inode", "wrong root ID", "malformed stat"):
+            with self.subTest(case=case):
+                observed = {"status": status,
+                            "cmdline": argv if case != "wrong args" else argv + b"new argument\0",
+                            "stat": good_stat if case != "malformed stat" else b"invalid"}
+                named_exe = executable if case != "wrong inode" else SimpleNamespace(**(vars(executable) | {"st_ino": 89}))
+                effective = (0, 0, 0) if case != "wrong root ID" else (0, 0, 1000)
+                with (
+                    patch.object(controller, "current_boot", return_value=binding["boot"]),
+                    patch.object(controller, "process_directory", return_value=nullcontext(721)),
+                    patch.object(controller, "proc_bytes", side_effect=lambda _, leaf, _limit: observed[leaf]),
+                    patch.object(controller, "protected_bytes", return_value=script if case != "wrong script" else b"changed"),
+                    patch.object(controller.os, "getpid", return_value=pid),
+                    patch.object(controller.os, "getresuid", return_value=effective),
+                    patch.object(controller.os, "getresgid", return_value=(0, 0, 0)),
+                    patch.object(controller.os, "stat", side_effect=[executable, named_exe]),
+                ):
+                    if case == "valid":
+                        self.assertEqual(controller.controller_identity(binding, manifest, manifest_pin, binding_pin), {
+                            "pid": pid, "start_ticks": 991, "interpreter": [24, 88], "script": manifest["controller"],
+                            "argv": sha256(argv).hexdigest(),
+                        })
+                    else:
+                        with self.assertRaises(controller.ControllerRefused):
+                            controller.controller_identity(binding, manifest, manifest_pin, binding_pin)
+
+    def test_ordinary_directory_is_not_accepted_as_procfs(self):
+        with TemporaryDirectory() as temporary:
+            ordinary = Path(temporary)
+            (ordinary / "430").mkdir()
+            with patch.object(controller, "PROC", ordinary):
+                untrusted = controller.process_directory(430)
+                with self.assertRaises(controller.ControllerRefused):
+                    self.enterContext(untrusted)
+
+
+class OwnedChildCleanupTest(unittest.TestCase):
+    def test_catalog_close_failure_reaps_child_and_preserves_primary_error(self):
+        primary = OSError(errno.EIO, "synthetic parent close")
+        initial = Mock()
+        initial.close.side_effect = [primary, OSError(errno.EIO, "synthetic repeat close")]
+        child = Mock(pid=4124)
+        child.wait.side_effect = subprocess.TimeoutExpired(("fixture",), 5)
+        command = ("fixture",)
+        with (
+            patch.object(controller.subprocess, "Popen", return_value=child) as spawn,
+            patch.object(controller.os, "killpg") as kill,
+            self.assertRaises(OSError) as outcome,
+        ):
+            controller.bounded_run(command, seconds=10, limit=4096, stdin=initial)
+        self.assertIs(outcome.exception, primary)
+        self.assertEqual(initial.close.call_count, 2)
+        spawn.assert_called_once()
+        kill.assert_called_once_with(child.pid, signal.SIGKILL)
+        child.wait.assert_called_once_with(timeout=5)
+        child.stdout.close.assert_called_once_with()
+        self.assertTrue(any("not confirmed" in note for note in primary.__notes__))
+
+    def test_catalog_spawn_and_pre_spawn_pipe_failure_close_the_owned_input(self):
+        primary = OSError(errno.EIO, "synthetic missing fixture child")
+        initial = Mock()
+        command = ("fixture",)
+        with (
+            patch.object(controller.subprocess, "Popen", side_effect=primary),
+            patch.object(controller.os, "killpg") as kill,
+            self.assertRaises(OSError) as outcome,
+        ):
+            controller.bounded_run(command, seconds=10, limit=4096, stdin=initial)
+        self.assertIs(outcome.exception, primary)
+        initial.close.assert_called_once_with()
+        kill.assert_not_called()
+        fds = os.pipe2(os.O_CLOEXEC)
+        value = b"x" * controller.START_BYTES
+        with (
+            patch.object(os, "pipe2", return_value=fds),
+            patch.object(os, "write", side_effect=primary),
+            patch.object(controller.subprocess, "Popen") as spawn,
+            self.assertRaises(OSError) as outcome,
+        ):
+            controller.open_start_input(value)
+        self.assertIs(outcome.exception, primary)
+        spawn.assert_not_called()
+        for fd in fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_pty_parent_close_failure_is_bounded_and_only_signals_the_owned_child(self):
+        for retired, missing in ((True, False), (False, False), (False, True)):
+            with self.subTest(retired=retired, missing=missing):
+                self.pty_close_failure(retired=retired, missing=missing)
+
+    def pty_close_failure(self, *, retired, missing):
+        pid, master, clock = 3011, 4022, 0.0
+        sent = []
+
+        def pause(seconds):
+            nonlocal clock
+            clock += seconds
+
+        def probe(_pid, _flags):
+            if missing:
+                raise ChildProcessError()
+            return (pid, signal.SIGKILL) if retired and signal.SIGKILL in sent else (0, 0)
+
+        primary = OSError(errno.EIO, "synthetic PTY parent close")
+        initial = Mock()
+        initial.close.side_effect = [primary, None]
+        home, launcher = Path("/scratch/home"), Path("/scratch/fixture.py")
+        with (
+            patch.object(fixture.pty, "fork", return_value=(pid, master)) as spawn,
+            patch.object(fixture.os, "close") as close,
+            patch.object(fixture.os, "waitpid", side_effect=probe) as waitpid,
+            patch.object(fixture.os, "kill", side_effect=lambda _, signum: sent.append(signum)) as kill,
+            patch.object(fixture.time, "monotonic", side_effect=lambda: clock),
+            patch.object(fixture.time, "sleep", side_effect=pause),
+            patch.object(fixture, "observe_pty") as observe,
+            self.assertRaises(OSError) as outcome,
+        ):
+            fixture.launch(home, launcher, "fixture-alpha", 73, initial)
+        self.assertIs(outcome.exception, primary)
+        self.assertLessEqual(clock, 5)
+        self.assertEqual(initial.close.call_count, 2)
+        spawn.assert_called_once_with()
+        close.assert_called_once_with(master)
+        observe.assert_not_called()
+        self.assertTrue(all(call.args == (pid, os.WNOHANG) for call in waitpid.call_args_list))
+        self.assertTrue(all(call.args[0] == pid for call in kill.call_args_list))
+        self.assertEqual(sent, [] if missing else [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(bool(getattr(primary, "__notes__", ())), not retired)
+
+    def test_pty_spawn_failure_closes_input_without_reaping_or_signalling(self):
+        failure = OSError(errno.EIO, "synthetic failed fork")
+        initial = Mock()
+        home, launcher = Path("/scratch/home"), Path("/scratch/fixture.py")
+        with (
+            patch.object(fixture.pty, "fork", side_effect=failure),
+            patch.object(fixture.os, "waitpid") as waitpid,
+            patch.object(fixture.os, "kill") as kill,
+            self.assertRaises(OSError) as outcome,
+        ):
+            fixture.launch(home, launcher, "fixture-alpha", 73, initial)
+        self.assertIs(outcome.exception, failure)
+        initial.close.assert_called_once_with()
+        waitpid.assert_not_called()
+        kill.assert_not_called()
+
+    def test_projection_and_pty_close_faults_preserve_the_primary_error(self):
+        pid, master, descriptor = 3011, 4022, 73
+        primary = OSError(errno.EIO, "synthetic PTY closure")
+        secondary = OSError(errno.EBADF, "synthetic projection closure")
+        initial = Mock()
+        seal = {"uid": 1000}
+        scope, value = {}, b"x" * driver.START_BYTES
+        with TemporaryDirectory() as directory:
+            case = Path(directory)
+            home = case / "home"
+            source = case / "source"
+            source.mkdir()
+            launcher = source / "fixture.py"
+            guard = {"guest": Mock(return_value=seal), "check_home_before": Mock(), "private_inventory": Mock(),
+                     "require": driver.require, "case_paths": Mock(return_value=nullcontext((case, home, None))),
+                     "prepare_descriptor": Mock(return_value=descriptor),
+                     "one_case_start": Mock(return_value=nullcontext(initial))}
+            try:
+                with (
+                    patch.object(fixture, "copy_fixture", return_value=(home, launcher, None)),
+                    patch.object(fixture, "observe_bound_catalog", return_value=(None, None)),
+                    patch.object(fixture, "observe_pty", return_value=(b"", False, False)),
+                    patch.object(fixture.pty, "fork", return_value=(pid, master)) as spawn,
+                    patch.object(fixture.os, "close", side_effect=[primary, secondary]) as close,
+                    patch.object(fixture.os, "waitpid", return_value=(pid, 0)) as waitpid,
+                    patch.object(fixture.os, "kill") as kill,
+                    self.assertRaises(OSError) as outcome,
+                ):
+                    fixture.run_bound_catalog_cases(guard, (), seal, scope, value)
+                self.assertIs(outcome.exception, primary)
+                self.assertEqual(primary.__notes__, ["Synthetic case projection descriptor closure was not confirmed."])
+                self.assertEqual([call.args for call in close.call_args_list], [(master,), (descriptor,)])
+                initial.close.assert_called_once_with()
+                spawn.assert_called_once_with()
+                waitpid.assert_called_once_with(pid, os.WNOHANG)
+                kill.assert_not_called()
+            finally:
+                source.chmod(0o700)
+
+    def test_real_case_directory_close_faults_keep_the_pty_diagnostic_and_stop_startup(self):
+        uid = os.getuid()
+        pid, master, descriptor = 3011, 4022, 4073
+        primary = OSError(errno.EIO, "synthetic startup close")
+        initial = Mock()
+        initial.close.side_effect = [primary, None]
+        captured, closed = [], []
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / str(uid)
+            case = runtime / "oc-g-connect-fixture-deadbeef"
+            home = case / "home"
+            sandbox = home / "opencode-sandbox"
+            source = case / "source"
+            for path in (runtime, case, home, sandbox, source):
+                path.mkdir(mode=0o700)
+            launcher = source / "fixture.py"
+            label = driver.LABELS[0]
+            seal = {"uid": uid, "cases": {label: {
+                "case": str(case), "root_id": driver.identity(case.stat()), "home_id": driver.identity(home.stat()),
+                "sandbox_id": driver.identity(sandbox.stat()), "config": "0" * 64,
+            }}}
+            directory_ids = {tuple(driver.identity(path.stat())): path for path in (runtime, case, home, sandbox)}
+            original_close = os.close
+
+            def fail_after_directory_close(fd):
+                if fd in (master, descriptor):
+                    return
+                path = directory_ids.get(tuple(driver.identity(os.fstat(fd)))) if fd in pinned else None
+                original_close(fd)
+                pinned.discard(fd)
+                if path is not None:
+                    closed.append(path)
+                    raise OSError(errno.EIO, "synthetic case directory close")
+
+            original_open, pinned = os.open, set()
+
+            def track_case_open(path, *args, **kwargs):
+                fd = original_open(path, *args, **kwargs)
+                if path in (runtime, case.name, "home", sandbox.name):
+                    pinned.add(fd)
+                return fd
+
+            guard = {
+                "isolated": Mock(), "verify_start_parent": Mock(), "read_catalog_start": Mock(return_value=b"x" * 32),
+                "guest": Mock(return_value=seal), "authorize_home_start": Mock(return_value={}), "vendor_pair": Mock(),
+                "private_inventory": Mock(), "require": driver.require, "check_home_before": Mock(),
+                "case_paths": driver.case_paths, "prepare_descriptor": Mock(return_value=descriptor),
+                "one_case_start": Mock(return_value=nullcontext(initial)),
+            }
+            run_cases = fixture.run_bound_catalog_cases
+
+            def capture(*args):
+                try:
+                    return run_cases(*args)
+                except BaseException as error:
+                    captured.append(error)
+                    raise
+
+            # Substitute the capsule bootstrap only. The real case owner opens scratch directories.
+            entry, loader, private_source = Mock(), Mock(), MagicMock()
+            entry.resolve.return_value = entry
+            loader.resolve.return_value = loader
+            loader.parents = ()
+            loader.lstat.return_value = SimpleNamespace(st_uid=0, st_mode=0o444)
+            private_source.__truediv__.side_effect = (entry, loader, root / "tests")
+            terminal = io.StringIO()
+            fixture_sys = SimpleNamespace(flags=SimpleNamespace(isolated=True, dont_write_bytecode=True, no_site=True),
+                                          path=[], stderr=terminal)
+            try:
+                with (
+                    patch.object(driver, "USER_RUNTIME", root),
+                    patch.object(fixture, "sys", fixture_sys),
+                    patch.object(fixture, "Path", side_effect=[private_source, Mock(absolute=Mock(return_value=entry))]),
+                    patch.object(fixture.argparse.ArgumentParser, "parse_args"),
+                    patch.object(fixture.os, "umask"),
+                    patch.object(fixture.runpy, "run_path", return_value=guard),
+                    patch.object(fixture, "run_bound_catalog_cases", side_effect=capture),
+                    patch.object(fixture, "copy_fixture", return_value=(home, launcher, None)) as copy_case,
+                    patch.object(fixture, "observe_bound_catalog", return_value=(None, None)),
+                    patch.object(fixture, "verify_bound_catalog") as verify,
+                    patch.object(fixture.pty, "fork", return_value=(pid, master)) as spawn,
+                    patch.object(os, "open", side_effect=track_case_open),
+                    patch.object(os, "close", side_effect=fail_after_directory_close),
+                    patch.object(os, "waitpid", side_effect=ChildProcessError()) as waitpid,
+                    patch.object(os, "kill") as kill,
+                ):
+                    self.assertEqual(fixture.main(), 1)
+                self.assertEqual(captured, [primary])
+                self.assertEqual(closed, [sandbox, home, case, runtime])
+                self.assertIn(fixture.PTY_UNCONFIRMED, primary.__notes__)
+                self.assertIn(fixture.PTY_UNCONFIRMED, terminal.getvalue())
+                self.assertTrue(case.exists())
+                copy_case.assert_called_once()
+                spawn.assert_called_once_with()
+                waitpid.assert_called_once_with(pid, os.WNOHANG)
+                kill.assert_not_called()
+                verify.assert_not_called()
+            finally:
+                source.chmod(0o700)
 
 
 class LiveStartTest(unittest.TestCase):
@@ -448,17 +910,24 @@ class CaseStartTest(unittest.TestCase):
     def test_case_consumes_label_before_spawn_and_retains_spent_state_after_failure(self):
         sent = set()
         first, second, _ = driver.LABELS
-        with self.assertRaises(OSError):
-            with driver.one_case_start(self.scope, first, self.start, sent) as reader:
+
+        def fail_spawn(attempt):
+            nonlocal fd
+            with attempt as reader:
                 fd = reader.fileno()
                 self.assertIn(first, sent)
                 self.assertFalse(os.get_inheritable(fd))
                 raise OSError(errno.EIO, "synthetic spawn failure")
+
+        fd = None
+        first_attempt = driver.one_case_start(self.scope, first, self.start, sent)
+        with self.assertRaises(OSError):
+            fail_spawn(first_attempt)
         with self.assertRaises(OSError):
             os.fstat(fd)
+        retry = driver.one_case_start(self.scope, first, self.start, sent)
         with self.assertRaises(driver.Refused):
-            with driver.one_case_start(self.scope, first, self.start, sent):
-                self.fail("spent case startup reopened")
+            self.enterContext(retry)
         with driver.one_case_start(self.scope, second, self.start, sent) as reader:
             self.assertEqual(driver.read_catalog_start(os.dup(reader.fileno())), self.values[second])
 
@@ -613,21 +1082,21 @@ class CaseCustodyTest(unittest.TestCase):
                 path = Path(record["case"]) / level
                 extra = path / "unexpected"
                 extra.touch()
+                unexpected = driver.case_paths(seal, label, pristine=True)
                 with self.assertRaises(driver.Refused):
-                    with driver.case_paths(seal, label, pristine=True):
-                        self.fail("unexpected leaf was accepted")
+                    self.enterContext(unexpected)
                 extra.unlink()
                 original = path.with_name(path.name + "-old")
                 path.rename(original)
                 path.symlink_to(original)
+                symlink = driver.case_paths(seal, label, pristine=True)
                 with self.assertRaises(driver.Refused):
-                    with driver.case_paths(seal, label, pristine=True):
-                        self.fail("symlink was accepted")
+                    self.enterContext(symlink)
                 path.unlink()
                 path.mkdir(mode=0o700)
+                replacement = driver.case_paths(seal, label, pristine=True)
                 with self.assertRaises(driver.Refused):
-                    with driver.case_paths(seal, label, pristine=True):
-                        self.fail("replacement inode was accepted")
+                    self.enterContext(replacement)
 
     def test_root_does_not_allocate_or_adopt_case_on_raw_allocator_failure(self):
         allocator = Mock(side_effect=driver.Refused())
@@ -714,20 +1183,24 @@ class CaseCustodyTest(unittest.TestCase):
                 driver.install_seal("1" * 40, allocator)
         allocator.assert_not_called()
         with driver.runtime_directory(self.uid) as fd:
+            outside = driver.pinned_case_tree(fd, "../outside", self.uid, create=True)
             with self.assertRaises(driver.Refused):
-                with driver.pinned_case_tree(fd, "../outside", self.uid, create=True):
-                    self.fail("arbitrary case path accepted")
+                self.enterContext(outside)
 
     def test_root_launcher_rejects_bad_or_blocked_allocator_results(self):
         user = SimpleNamespace(pw_uid=1000, pw_gid=1001)
-        expected = (controller.PYTHON, "-IBS", str(controller.CONTROLLER), "--allocate-cases", "pin")
+        expected = (controller.PYTHON, "-IBS", str(controller.CONTROLLER), "--allocate-cases", "pin", "binding")
+        value = b"s" * controller.START_BYTES
         for failure in ((1, b"{}"), (0, b"["), (0, b"[]"), subprocess.TimeoutExpired(expected, 10)):
             with self.subTest(failure=failure), patch.object(controller, "bounded_run", side_effect=[failure]) as child:
                 with self.assertRaises((ValueError, controller.ControllerRefused, subprocess.TimeoutExpired)):
-                    controller.allocate_case_process("pin", user)
-                child.assert_called_once_with(expected, seconds=10, limit=4096, run_as=(1000, 1001))
+                    controller.allocate_case_process("pin", "binding", user, value)
+                child.assert_called_once()
+                self.assertEqual(child.call_args.args, (expected,))
+                self.assertEqual(child.call_args.kwargs["run_as"], (1000, 1001))
+                self.assertTrue(child.call_args.kwargs["stdin"].closed)
         with patch.object(controller, "bounded_run", return_value=(0, json.dumps({"fixture": {}}).encode())):
-            self.assertEqual(controller.allocate_case_process("pin", user), {"fixture": {}})
+            self.assertEqual(controller.allocate_case_process("pin", "binding", user, value), {"fixture": {}})
 
 
 if __name__ == "__main__":

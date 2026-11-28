@@ -385,15 +385,36 @@ def ordinary_provider_roots(uid, expected_id):
         os.close(fd)
 
 
+def validate_allocation_attempt(attempt):
+    require(attempt.keys() == {
+        "version", "binding", "capsule", "boot", "tree", "manifest", "account", "controller", "allocation",
+    })
+    require(type(attempt["version"]) is int and attempt["version"] == 2)
+    require(all(hex_text(attempt[name], 64) for name in ("binding", "manifest", "allocation"))
+            and hex_text(attempt["capsule"], 32) and hex_text(attempt["tree"], 40)
+            and type(attempt["boot"]) is str
+            and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", attempt["boot"]))
+    account_record = attempt["account"]
+    require(type(account_record) is dict and account_record.keys() == {"uid", "gid"}
+            and all(type(number) is int and number > 0 for number in account_record.values()))
+    owner = attempt["controller"]
+    require(type(owner) is dict and owner.keys() == {"pid", "start_ticks", "interpreter", "script", "argv"})
+    require(type(owner["pid"]) is int and owner["pid"] > 1
+            and type(owner["start_ticks"]) is int and owner["start_ticks"] > 0
+            and hex_text(owner["script"], 64) and hex_text(owner["argv"], 64))
+    interpreter = owner["interpreter"]
+    require(type(interpreter) is list and len(interpreter) == 2 and all(type(part) is int for part in interpreter))
+    require(interpreter[0] >= 0 and interpreter[1] > 0)
+
+
 def home_evidence_scope(seal):
     seal_file = CAPSULE / "seal.json"
     require(proof_file(seal_file) == seal)
     attempt_path = CAPSULE / ALLOCATION_ATTEMPT
     attempt = proof_file(attempt_path)
-    require(attempt.keys() == {"version", "binding", "capsule", "boot", "tree"}
-            and type(attempt["version"]) is int and attempt["version"] == 1
-            and hex_text(attempt["binding"], 64) and hex_text(attempt["capsule"], 32)
-            and attempt["boot"] == seal["boot"] and attempt["tree"] == seal["tree"])
+    validate_allocation_attempt(attempt)
+    require(attempt["boot"] == seal["boot"] and attempt["tree"] == seal["tree"]
+            and attempt["account"]["uid"] == seal["uid"])
     home = checked_node(TEST_HOME, seal["uid"], directory=True)
     return {"seal": digest(seal_file), "attempt": digest(attempt_path), "tree": seal["tree"], "boot": seal["boot"],
             "uid": seal["uid"], "home_id": identity(home)}
@@ -465,8 +486,8 @@ def authorize_case_start(seal, label, value):
 
 def read_catalog_start(fd=0):
     """Consume the anonymous one-way startup descriptor before case or vendor access."""
-    deadline = time.monotonic() + 2
-    try:
+    with owned_case_fd(fd):
+        deadline = time.monotonic() + 2
         info = os.fstat(fd)
         require(stat.S_ISFIFO(info.st_mode) and fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY)
         # Linux renders unnamed pipefs descriptors differently from named FIFOs,
@@ -483,8 +504,6 @@ def read_catalog_start(fd=0):
                 return bytes(value)
             value.extend(piece)
         raise Refused("Offline Google fixture start descriptor refused.")
-    finally:
-        os.close(fd)
 
 
 @contextmanager
@@ -493,13 +512,32 @@ def one_case_start(scope, label, start, sent):
     sent.add(label)
     value = derive_case_start(scope, label, start)
     reader, writer = os.pipe2(os.O_CLOEXEC)
-    with os.fdopen(reader, "rb", buffering=0) as stream:
+    try:
         try:
             require(os.write(writer, value) == START_BYTES)
-        finally:
-            os.close(writer)
-        del value
+        except BaseException as error:
+            close_start_preserving(error, os.close, writer)
+            raise
+        os.close(writer)
+        stream = os.fdopen(reader, "rb", buffering=0)
+    except BaseException as error:
+        close_start_preserving(error, os.close, reader)
+        raise
+    del value
+    try:
         yield stream
+    except BaseException as error:
+        close_start_preserving(error, stream.close)
+        raise
+    else:
+        stream.close()
+
+
+def close_start_preserving(error, close, *args):
+    try:
+        close(*args)
+    except BaseException:
+        error.add_note("Protected fixture start descriptor closure was not confirmed.")
 
 
 def measured_parent(pid, argv, *, supervisor=False):
@@ -723,17 +761,32 @@ def private_dir_identity(info, uid):
     return identity(info)
 
 
+def close_case_preserving(error, fd):
+    try:
+        os.close(fd)
+    except BaseException:
+        error.add_note("Protected fixture case descriptor closure was not confirmed.")
+
+
+@contextmanager
+def owned_case_fd(fd):
+    try:
+        yield fd
+    except BaseException as error:
+        close_case_preserving(error, fd)
+        raise
+    else:
+        os.close(fd)
+
+
 @contextmanager
 def runtime_directory(uid):
     path = USER_RUNTIME / str(uid)
     expected = private_dir_identity(checked_node(path, uid, directory=True), uid)
-    fd = os.open(path, DIRECTORY)
-    try:
+    with owned_case_fd(os.open(path, DIRECTORY)) as fd:
         require(private_dir_identity(os.fstat(fd), uid) == expected)
         yield fd
         require(private_dir_identity(os.fstat(fd), uid) == private_dir_identity(path.lstat(), uid) == expected)
-    finally:
-        os.close(fd)
 
 
 @contextmanager
@@ -752,8 +805,7 @@ def pinned_case_tree(runtime, name, uid, *, create=False, pristine=False, identi
             expected = private_dir_identity(os.stat(child, dir_fd=parent, follow_symlinks=False), uid)
             if identities is not None:
                 require(expected == identities[len(links)])
-            fd = os.open(child, DIRECTORY, dir_fd=parent)
-            pins.callback(os.close, fd)
+            fd = pins.enter_context(owned_case_fd(os.open(child, DIRECTORY, dir_fd=parent)))
             require(private_dir_identity(os.fstat(fd), uid) == expected)
             links.append((parent, child, fd, expected, expected_children))
             parent = fd
@@ -835,15 +887,12 @@ def exact_children(fd, expected):
     original = metadata(os.fstat(fd))
     pending = set(expected)
     # A fresh open of the held directory avoids consuming or reusing its offsets.
-    scan = os.open(".", DIRECTORY, dir_fd=fd)
-    try:
+    with owned_case_fd(os.open(".", DIRECTORY, dir_fd=fd)) as scan:
         require(metadata(os.fstat(scan)) == original)
         with os.scandir(scan) as children:
             for child in children:
                 require(child.name in pending)
                 pending.remove(child.name)
-    finally:
-        os.close(scan)
     require(not pending and metadata(os.fstat(fd)) == original)
 
 
@@ -890,8 +939,8 @@ def prepare_descriptor(case, label, seal):
         fcntl.fcntl(fd, fcntl.F_ADD_SEALS, SEALED)
         os.set_inheritable(fd, True)
         return fd
-    except BaseException:
-        os.close(fd)
+    except BaseException as error:
+        close_case_preserving(error, fd)
         raise
 
 
@@ -985,10 +1034,8 @@ def main():
         seal = guest()
         authorize_case_start(seal, label, start)
         del start
-        try:
+        with owned_case_fd(fd):
             projection = read_descriptor(fd)
-        finally:
-            os.close(fd)
         with case_paths(seal, label) as (case, home, sandbox):
             source = case / "source"
             require(Path(__file__).absolute() == source / DRIVER)

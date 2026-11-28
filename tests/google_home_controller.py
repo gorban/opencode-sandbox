@@ -3,12 +3,14 @@
 from contextlib import contextmanager
 import ctypes
 from hashlib import sha256
+from hmac import compare_digest
 import json
 import os
 from pathlib import Path
 import pwd
 import re
 import secrets
+import select
 import selectors
 import signal
 import stat
@@ -25,6 +27,9 @@ MANIFEST = CAPSULE / "controller-manifest.json"
 BINDING = CAPSULE / "capsule-binding.json"
 BOOT_RUNTIME = Path("/run")
 BOOT_LEASES = BOOT_RUNTIME / "oc-gemini-fixture-leases"
+PROC = Path("/proc")
+PROC_MAGIC = 0x9FA0
+DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 ATTEMPT = "allocation-attempt.json"
 DRIVER = "tests/google_connect_driver.py"
 ACCOUNT = "oc-gemini-proof"
@@ -77,10 +82,102 @@ def directory_id(info):
     return [info.st_dev, info.st_ino]
 
 
+def require_procfs(fd):
+    # fstatfs's first Linux field is the native filesystem magic word.
+    data = (ctypes.c_long * 32)()
+    require(ctypes.CDLL(None, use_errno=True).fstatfs(fd, ctypes.byref(data)) == 0 and data[0] == PROC_MAGIC)
+
+
+@contextmanager
+def process_directory(pid):
+    require(type(pid) is int and pid > 1)
+    root = os.open(PROC, DIRECTORY)
+    try:
+        require_procfs(root)
+        process = os.open(str(pid), DIRECTORY, dir_fd=root)
+        try:
+            require_procfs(process)
+            require(os.fstat(root).st_dev == os.fstat(process).st_dev)
+            yield process
+        finally:
+            os.close(process)
+    finally:
+        os.close(root)
+
+
+def proc_bytes(process, leaf, limit):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    with os.fdopen(os.open(leaf, flags, dir_fd=process), "rb") as stream:
+        require_procfs(stream.fileno())
+        raw = stream.read(limit + 1)
+    require(0 < len(raw) <= limit)
+    return raw
+
+
+def process_start_ticks(process, pid):
+    raw = proc_bytes(process, "stat", 4096)
+    header, separator, tail = raw.rpartition(b") ")
+    fields = tail.split()
+    require(separator and header.startswith(str(pid).encode("ascii") + b" (") and len(fields) >= 20)
+    require(fields[19].isdigit() and 0 < int(fields[19]))
+    return int(fields[19])
+
+
+def require_root_status(process):
+    raw = proc_bytes(process, "status", 16384)
+    for name in (b"Uid:", b"Gid:"):
+        records = [line.split() for line in raw.splitlines() if line.startswith(name)]
+        require(records == [[name, b"0", b"0", b"0", b"0"]])
+
+
+def controller_arguments(manifest_pin, binding_pin):
+    return (PYTHON, "-IBS", str(CONTROLLER), manifest_pin, binding_pin)
+
+
+def argument_digest(argv):
+    return sha256(b"\0".join(os.fsencode(arg) for arg in argv) + b"\0").hexdigest()
+
+
+def controller_identity(binding, manifest, manifest_pin, binding_pin):
+    require(os.getresuid() == os.getresgid() == (0, 0, 0) and current_boot() == binding["boot"])
+    pid = os.getpid()
+    with process_directory(pid) as process:
+        require_root_status(process)
+        interpreter = os.stat(PYTHON)
+        require(stat.S_ISREG(interpreter.st_mode) and interpreter.st_uid == 0 and not interpreter.st_mode & 0o022)
+        require(os.path.samestat(interpreter, os.stat("exe", dir_fd=process)))
+        script = sha256(protected_bytes(CONTROLLER, 131072)).hexdigest()
+        require(script == manifest["controller"])
+        argv = controller_arguments(manifest_pin, binding_pin)
+        arguments = sha256(proc_bytes(process, "cmdline", 4096)).hexdigest()
+        require(compare_digest(arguments, argument_digest(argv)))
+        return {"pid": pid, "start_ticks": process_start_ticks(process, pid),
+                "interpreter": directory_id(interpreter), "script": script, "argv": arguments}
+
+
+def verify_allocator_parent(owner, pidfd):
+    pid = owner["pid"]
+    require(os.getppid() == pid and not select.select([pidfd], [], [], 0)[0])
+    with process_directory(pid) as process:
+        require_root_status(process)
+        require(process_start_ticks(process, pid) == owner["start_ticks"])
+    require(os.getppid() == pid and not select.select([pidfd], [], [], 0)[0])
+
+
 def current_boot():
-    boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    with os.fdopen(os.open(PROC / "sys/kernel/random/boot_id", flags), "rb") as stream:
+        require_procfs(stream.fileno())
+        boot = stream.read(38).decode("ascii").removesuffix("\n")
     require(re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot))
     return boot
+
+
+def allocation_digest(attempt, value):
+    require(type(value) is bytes and len(value) == START_BYTES)
+    encoded = json.dumps({key: field for key, field in attempt.items() if key != "allocation"},
+                         sort_keys=True, separators=(",", ":")).encode("ascii")
+    return sha256(b"oc-gemini-fixture:allocation:v1\0" + encoded + b"\0" + value).hexdigest()
 
 
 def deployment_binding(binding_pin, manifest_pin, manifest):
@@ -201,8 +298,12 @@ def pinned_driver(manifest_digest):
     return scope, manifest
 
 
-def account_podman(user):
+def require_fixture_account(user):
     require(user.pw_name == ACCOUNT and user.pw_uid > 0 and user.pw_gid > 0 and user.pw_dir == HOME)
+
+
+def account_podman(user):
+    require_fixture_account(user)
     runtime = f"/run/user/{user.pw_uid}"
     return ("/usr/sbin/runuser", "-u", ACCOUNT, "--", "/usr/bin/env", "-i", f"HOME={HOME}",
             "PATH=/usr/bin:/bin", "LANG=C.UTF-8", f"XDG_RUNTIME_DIR={runtime}",
@@ -232,18 +333,21 @@ def bounded_run(argv, *, seconds, limit, env=ENV, run_as=None, stdin=subprocess.
     output = bytearray()
     credentials = {}
     stderr = subprocess.STDOUT
-    if run_as is not None:
-        uid, gid = run_as
-        require(uid > 0 and gid > 0)
-        credentials = {"user": uid, "group": gid, "extra_groups": ()}
-        stderr = subprocess.DEVNULL
     try:
+        if run_as is not None:
+            uid, gid = run_as
+            require(uid > 0 and gid > 0)
+            credentials = {"user": uid, "group": gid, "extra_groups": ()}
+            stderr = subprocess.DEVNULL
         child = subprocess.Popen(argv, cwd="/", env=env, stdin=stdin, stdout=subprocess.PIPE,
                                  stderr=stderr, close_fds=True, start_new_session=True, **credentials)
-    finally:
+    except BaseException as error:
+        if stdin != subprocess.DEVNULL:
+            cleanup_preserving(error, stdin.close)
+        raise
+    try:
         if stdin != subprocess.DEVNULL:
             stdin.close()
-    try:
         with selectors.DefaultSelector() as ready:
             ready.register(child.stdout, selectors.EVENT_READ)
             while True:
@@ -259,16 +363,30 @@ def bounded_run(argv, *, seconds, limit, env=ENV, run_as=None, stdin=subprocess.
         if remaining <= 0:
             raise subprocess.TimeoutExpired(argv, seconds)
         status = child.wait(timeout=remaining)
-    except BaseException:
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        child.wait(timeout=5)
+    except BaseException as error:
+        if stdin != subprocess.DEVNULL:
+            cleanup_preserving(error, stdin.close)
+        cleanup_preserving(error, reap_subprocess, child)
+        cleanup_preserving(error, child.stdout.close)
         raise
-    finally:
-        child.stdout.close()
+    child.stdout.close()
     return status if status >= 0 else 128 - status, bytes(output)
+
+
+def cleanup_preserving(error, action, *args):
+    try:
+        action(*args)
+    except BaseException:
+        error.add_note("Protected fixture child or descriptor cleanup was not confirmed.")
+
+
+def reap_subprocess(child):
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    finally:
+        child.wait(timeout=5)
 
 
 class Frames:
@@ -341,13 +459,29 @@ def no_children():
 @contextmanager
 def start_pipe(value):
     require(type(value) is bytes and len(value) == START_BYTES)
+    stream = open_start_input(value)
+    try:
+        yield stream
+    except BaseException as error:
+        cleanup_preserving(error, stream.close)
+        raise
+    else:
+        stream.close()
+
+
+def open_start_input(value):
     reader, writer = os.pipe2(os.O_CLOEXEC)
-    with os.fdopen(reader, "rb", buffering=0) as stream:
+    try:
         try:
             require(os.write(writer, value) == START_BYTES)
-        finally:
-            os.close(writer)
-        yield stream
+        except BaseException as error:
+            cleanup_preserving(error, os.close, writer)
+            raise
+        os.close(writer)
+        return os.fdopen(reader, "rb", buffering=0)
+    except BaseException as error:
+        cleanup_preserving(error, os.close, reader)
+        raise
 
 
 def run_held_supervisor(pin):
@@ -440,16 +574,42 @@ def observe_run(driver, argv):
         return 1
 
 
-def allocate_case_process(pin, user):
-    argv = (PYTHON, "-IBS", str(CONTROLLER), "--allocate-cases", pin)
-    status, output = bounded_run(argv, seconds=10, limit=4096, run_as=(user.pw_uid, user.pw_gid))
+def allocate_case_process(pin, binding_pin, user, value):
+    argv = (PYTHON, "-IBS", str(CONTROLLER), "--allocate-cases", pin, binding_pin)
+    with start_pipe(value) as stdin:
+        status, output = bounded_run(argv, seconds=10, limit=4096, run_as=(user.pw_uid, user.pw_gid), stdin=stdin)
     require(status == 0)
     return exact_json(output)
 
 
-def run_case_allocator(pin):
-    driver, _ = pinned_driver(pin)
-    records = driver["allocate_cases"]()
+def run_case_allocator(pin, binding_pin):
+    driver, manifest = pinned_driver(pin)
+    value = driver["read_catalog_start"]()
+    binding = deployment_binding(binding_pin, pin, manifest)
+    user = pwd.getpwnam(ACCOUNT)
+    require_fixture_account(user)
+    driver["require_unprivileged_allocator"](user)
+    raw = protected_bytes(CAPSULE / ATTEMPT, 4096)
+    attempt = exact_json(raw)
+    driver["validate_allocation_attempt"](attempt)
+    owner = attempt["controller"]
+    require(attempt["binding"] == binding_pin and attempt["manifest"] == pin
+            and all(attempt[field] == binding[field] for field in ("capsule", "boot", "tree"))
+            and attempt["account"] == {"uid": user.pw_uid, "gid": user.pw_gid})
+    require(owner["script"] == manifest["controller"]
+            and owner["argv"] == argument_digest(controller_arguments(pin, binding_pin))
+            and owner["interpreter"] == directory_id(os.stat(PYTHON)))
+    require(owner["pid"] == os.getppid())
+    pidfd = os.pidfd_open(owner["pid"])
+    try:
+        verify_allocator_parent(owner, pidfd)
+        require(compare_digest(attempt["allocation"], allocation_digest(attempt, value)))
+        del value
+        require(protected_bytes(CAPSULE / ATTEMPT, 4096) == raw and current_boot() == binding["boot"])
+        verify_allocator_parent(owner, pidfd)
+        records = driver["allocate_cases"]()
+    finally:
+        os.close(pidfd)
     print(json.dumps(records, sort_keys=True))
     return 0
 
@@ -463,8 +623,12 @@ def run_controller(manifest_digest, binding_digest):
     prior = (seal_path, CAPSULE / "case-config", CAPSULE / ATTEMPT, CAPSULE / driver["HOME_BEFORE_STAGE"],
              *(CAPSULE / driver[name] for name in ("HOME_BEFORE", "HOME_RESULT", "NATIVE_RESULT")))
     require(all(driver["absent"](path) for path in prior))
-    attempt = {"version": 1, "binding": binding_digest, "capsule": binding["capsule"],
-               "boot": binding["boot"], "tree": manifest["tree"]}
+    owner = controller_identity(binding, manifest, manifest_digest, binding_digest)
+    value = secrets.token_bytes(START_BYTES)
+    attempt = {"version": 2, "binding": binding_digest, "capsule": binding["capsule"], "boot": binding["boot"],
+               "tree": manifest["tree"], "manifest": manifest_digest,
+               "account": {"uid": user.pw_uid, "gid": user.pw_gid}, "controller": owner}
+    attempt["allocation"] = allocation_digest(attempt, value)
     payload = json.dumps(attempt, sort_keys=True).encode("ascii")
     consume_boot_lease(binding, payload)
     require(directory_id(CAPSULE.lstat()) == binding["capsule_id"])
@@ -472,7 +636,17 @@ def run_controller(manifest_digest, binding_digest):
     driver["write_protected"](attempt_path, payload)
     require(protected_bytes(attempt_path, 4096) == payload)
     require(directory_id(CAPSULE.lstat()) == binding["capsule_id"])
-    driver["install_seal"](manifest["tree"], lambda: allocate_case_process(manifest_digest, user))
+    def allocate_once():
+        nonlocal value
+        require(value is not None)
+        start, value = value, None
+        require(deployment_binding(binding_digest, manifest_digest, manifest) == binding)
+        require(controller_identity(binding, manifest, manifest_digest, binding_digest) == owner)
+        require(protected_bytes(attempt_path, 4096) == payload)
+        return allocate_case_process(manifest_digest, binding_digest, user, start)
+
+    driver["install_seal"](manifest["tree"], allocate_once)
+    require(value is None)
     seal = driver["proof_file"](seal_path)
     driver["validate_seal"](seal)
     require(seal["tree"] == manifest["tree"] and seal["source"] == manifest["source"]
@@ -490,15 +664,18 @@ def main():
         require(all(Path(item).is_relative_to("/usr/lib") or Path(item).is_relative_to("/usr/lib64")
                     for item in sys.path))
         if os.getuid() == os.geteuid() > 0:
-            _, action, pin = sys.argv
+            action = sys.argv[1]
             if action == "--allocate-cases":
-                return run_case_allocator(pin)
+                _, _, pin, binding = sys.argv
+                return run_case_allocator(pin, binding)
+            _, _, pin = sys.argv
             require(action == "--held-exec")
             return run_held_supervisor(pin)
         require(os.getuid() == os.geteuid() == 0)
         _, pin, binding = sys.argv
         return run_controller(pin, binding)
-    except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt):
+    except (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError,
+            subprocess.SubprocessError, KeyboardInterrupt):
         print("Protected offline Google controller did not complete.", file=sys.stderr)
         return 1
 
