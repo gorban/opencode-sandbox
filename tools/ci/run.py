@@ -47,6 +47,7 @@ def script(name, path, *interpreter, unittest=False, stub_security=False):
 SUITES = (
     discover('Controller core', 'test_controller_core.py'),
     discover('Restricted orchestrator text proof', 'test_orchestrator_text.py'),
+    discover('Synthetic named Claude text fixture', 'test_claude_text_fixture.py'),
     discover('Bridge merge core', 'bridge_merge_core.py'),
     script('Launcher and setup lifecycle', 'tests/setup-lifecycle.py', 'python3', '-B', unittest=True),
     script('Host state leaves', 'tests/host_state_leaves.py', 'python3', '-B'),
@@ -105,6 +106,10 @@ PYTHON_FILES = (
     'oc_controller.py',
     'oc-openai.py',
     'oc-openai-session.py',
+    'oc_claude/__init__.py',
+    'oc_claude/fixture.py',
+    'oc_claude/fixture_custody.py',
+    'oc_claude/fixture_protocol.py',
     'oc_orchestrator/__init__.py',
     'oc_orchestrator/capture.py',
     'oc_orchestrator/claude.py',
@@ -160,6 +165,8 @@ PYTHON_FILES = (
     'tests/e2e/live/test_openai_canary_e2e.py',
     'tests/e2e/live/test_openai_proof.py',
     'tests/e2e/live/test_openai_shell_e2e.py',
+    'tests/fixtures/claude_kernel.py',
+    'tests/fixtures/claude_native_fixture.py',
     'tests/host_state_leaves.py',
     'tests/orchestrator-owner-loss.py',
     'tests/parallel-isolated-test.py',
@@ -169,6 +176,7 @@ PYTHON_FILES = (
     'tests/test_ci.py',
     'tests/test_ci_supervisor.py',
     'tests/test_ci_toolchain.py',
+    'tests/test_claude_text_fixture.py',
     'tests/test_controller_core.py',
     'tests/test_openai_canary.py',
     'tests/test_openai_cli.py',
@@ -329,7 +337,7 @@ def validate_scope():
     # Keep additions to the active source directories visible without scanning archived probes.
     declared = set(SHELL_FILES + PYTHON_FILES)
     scopes = ((ROOT, ''), (ROOT / 'tests', '**/'), (ROOT / 'tools/ci', '**/'),
-              (ROOT / 'oc_openai', '**/'), (ROOT / 'oc_providers', '**/'))
+              (ROOT / 'oc_claude', '**/'), (ROOT / 'oc_openai', '**/'), (ROOT / 'oc_providers', '**/'))
     for directory, prefix in scopes:
         for pattern in ('*.sh', '*.py'):
             for path in sorted(directory.glob(prefix + pattern)):

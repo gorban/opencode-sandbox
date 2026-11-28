@@ -36,6 +36,13 @@ open.
   holder in separate namespaces in the local synthetic proof. The stock OpenCode
   CLI returned the distinct fixture reply. Killing the launcher while the native
   child was active retired both placements and their private scratch with no reply.
+- [x] Exercise an offline named Claude holder in a delegated Linux cgroup
+  (`codex/named-claude-holder`). Both native phases read the same sealed synthetic
+  snapshot. Contended pathname changes refuse before dispatch, expiry survives
+  clock rollback, and owner EOF triggers verified retirement. The separate
+  supervisor-crash test holds recovery state until ownership and quiescence are
+  proven. The [fixture tests](../../tests/test_claude_text_fixture.py) use synthetic
+  credentials and have no live provider traffic.
 - [ ] Qualify the project's exact live topology and registration placement before
   enabling subscription inference through that launcher.
 
